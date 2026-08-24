@@ -12,8 +12,9 @@
 ;;;; Constants
 
 (defconstant +max-block-sigops-cost+ 80000)  ; BIP 141: max weighted sigops cost
-(defconstant +witness-scale-factor+ 4)       ; BIP 141: legacy sigops weight multiplier
-(defconstant +max-block-weight+ 4000000)     ; BIP 141: max block weight in weight units
+;; +max-block-weight+ and +witness-scale-factor+ are defined in
+;; transaction.lisp, which compiles first and needs both for
+;; CheckTransaction's per-transaction size limit.
 (defconstant +max-disconnected-tx-pool-bytes+ 20000000
   "Cap on the transactions held for mempool re-add while a reorg is in flight
 (Core MAX_DISCONNECTED_TX_POOL_BYTES, kernel/disconnected_transactions.h:18).")

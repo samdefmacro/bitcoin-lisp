@@ -1084,6 +1084,9 @@
    #:validate-transaction-contextual
    #:validate-transaction-scripts
    #:validate-transaction-for-mempool
+   ;; Core's reject-reason vocabulary (keyword -> state.GetRejectReason())
+   #:tx-reject-reason-string
+   #:*tx-reject-reasons*
    ;; Package relay (submitpackage + opportunistic 1p1c)
    #:validate-package-for-mempool
    #:package-hash

@@ -744,6 +744,52 @@ NULL_DATA (standard)."
     ;; ...but any NULL_DATA output overdraws the zero budget.
     (is (eq :datacarrier (%datacarrier-validate '(3))))))
 
+(test mempool-says-already-known-for-a-confirmed-tx
+  "\"Are inputs missing because we already have the tx?\" (Core
+validation.cpp:857-866). A transaction that is already CONFIRMED presents
+exactly as one with missing inputs — it spent its own inputs — so before
+reporting that, Core looks for any of the transaction's own outputs among the
+coins and reports txn-already-known when it finds one. Without this, resubmitting
+a mined transaction answers missing-inputs, which sends a client looking for a
+reorg that did not happen."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (tx (make-mempool-test-tx :input-id 91))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (out0 (elt (bitcoin-lisp.serialization:transaction-outputs tx) 0)))
+    ;; Inputs absent and no output of ours among the coins: genuinely missing.
+    (is (eq :missing-input
+            (nth-value 1 (bitcoin-lisp.validation:validate-transaction-for-mempool
+                          tx utxo mempool 100))))
+    ;; Now the coins hold OUR output, which is what a block containing this
+    ;; transaction leaves behind. The inputs are still absent — that is the
+    ;; whole point — so the only thing that can change the answer is the check.
+    (bitcoin-lisp.storage:add-utxo
+     utxo txid 0
+     (bitcoin-lisp.serialization:tx-out-value out0)
+     (bitcoin-lisp.serialization:tx-out-script-pubkey out0)
+     99 :coinbase nil)
+    (is (eq :already-known
+            (nth-value 1 (bitcoin-lisp.validation:validate-transaction-for-mempool
+                          tx utxo mempool 100))))))
+
+(defun %tx-with-output-script (script &key (value 100000))
+  "A minimal one-in one-out transaction paying SCRIPT, for standardness checks.
+The scriptSig is empty, which is push-only, so the only standardness question
+the transaction raises is the output's."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element 3)
+                                      :index 0)
+                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                    :sequence #xFFFFFFFF))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value value :script-pubkey script))
+   :lock-time 0))
+
 (test bare-multisig-policy-knob
   "Bare multisig is standard by default (DEFAULT_PERMIT_BAREMULTISIG=true) and
 non-standard under *permit-bare-multisig* nil (1<=m<=n<=3, 33/65-byte keys)."
@@ -755,16 +801,33 @@ non-standard under *permit-bare-multisig* nil (1<=m<=n<=3, 33/65-byte keys)."
          (ms4 (concatenate '(vector (unsigned-byte 8))
                            (vector #x51 33) k (vector 33) k (vector 33) k (vector 33) k
                            (vector #x54 #xae))))
-    ;; standard by default; non-standard only when the knob is disabled
+    ;; STANDARD-OUTPUT-SCRIPT-P is Core's IsStandard, which does NOT consult
+    ;; -permitbaremultisig: that gate lives in IsStandardTx (policy.cpp:151-153)
+    ;; so the two can report different reasons. The knob is asserted through
+    ;; the battery below; here the shape cap is what IsStandard owns.
     (is (bitcoin-lisp.validation::standard-output-script-p ms))
     (let ((bitcoin-lisp:*permit-bare-multisig* nil))
-      (is (not (bitcoin-lisp.validation::standard-output-script-p ms))))
+      (is (bitcoin-lisp.validation::standard-output-script-p ms)))
     (let ((bitcoin-lisp:*permit-bare-multisig* t))
       (is (bitcoin-lisp.validation::standard-output-script-p ms))
       (is (not (bitcoin-lisp.validation::standard-output-script-p ms4)))
       ;; a truncated/garbage multisig is rejected even when permitted
       (is (not (bitcoin-lisp.validation::standard-output-script-p
-                (coerce #(#x51 #xae) '(vector (unsigned-byte 8)))))))))
+                (coerce #(#x51 #xae) '(vector (unsigned-byte 8)))))))
+    ;; The knob, through the battery, with Core's two distinct reasons:
+    ;; :bare-multisig for a permitted SHAPE refused by the knob, and
+    ;; :non-standard-output ("scriptpubkey") for a shape IsStandard refuses on
+    ;; its own. mempool_accept.py:304,311 asserts both, one after the other.
+    (let ((tx-ms (%tx-with-output-script ms))
+          (tx-ms4 (%tx-with-output-script ms4)))
+      (let ((bitcoin-lisp:*permit-bare-multisig* nil))
+        (is (eq :bare-multisig
+                (nth-value 1 (bitcoin-lisp.validation::%is-standard-tx tx-ms)))))
+      (let ((bitcoin-lisp:*permit-bare-multisig* t))
+        (is (eq t (nth-value 0 (bitcoin-lisp.validation::%is-standard-tx tx-ms))))
+        ;; n>3 is IsStandard's own cap, so the knob cannot excuse it
+        (is (eq :non-standard-output
+                (nth-value 1 (bitcoin-lisp.validation::%is-standard-tx tx-ms4))))))))
 
 ;;;; Fee estimation tests
 
@@ -2128,20 +2191,43 @@ minimum."
   "A transaction smaller than 65 non-witness bytes is rejected (CVE-2017-12842)."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
          (utxo (bitcoin-lisp.storage:make-utxo-set))
-         ;; 1 non-coinbase input (empty scriptSig) + 1 empty-scriptPubKey output
-         ;; serializes to ~60 non-witness bytes.
+         ;; 1 non-coinbase input (empty scriptSig) + 1 output whose
+         ;; scriptPubKey is a bare OP_RETURN serializes to 61 non-witness
+         ;; bytes. The output script has to be STANDARD, or the standardness
+         ;; battery answers first and this test stops being about the size:
+         ;; Core checks IsStandardTx at validation.cpp:808 and the size only at
+         ;; :813. A single OP_RETURN is NULL_DATA, which is standard, fits the
+         ;; -datacarriersize budget, and is never dust (an unspendable output's
+         ;; dust threshold is 0).
          (input (bitcoin-lisp.serialization:make-tx-in
                  :previous-output (bitcoin-lisp.serialization:make-outpoint
                                    :hash (%zbytes 32 7) :index 0)
                  :script-sig (%zbytes 0) :sequence #xFFFFFFFF))
-         (output (bitcoin-lisp.serialization:make-tx-out :value 1000 :script-pubkey (%zbytes 0)))
+         (op-return (coerce #(#x6a) '(vector (unsigned-byte 8))))
+         (output (bitcoin-lisp.serialization:make-tx-out :value 1000
+                                                        :script-pubkey op-return))
          (tx (bitcoin-lisp.serialization:make-transaction
               :version 1 :inputs (vector input) :outputs (vector output) :lock-time 0)))
     (is (< (length (bitcoin-lisp.serialization:serialize-transaction tx)) 65))
     (multiple-value-bind (valid err)
         (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
       (is (null valid))
-      (is (eq err :tx-size-small)))))
+      (is (eq err :tx-size-small)))
+    ;; The order itself, pinned: the SAME tiny transaction with a non-standard
+    ;; output reports the standardness reason, because Core's IsStandardTx runs
+    ;; first. This test used to use an empty scriptPubKey and so asserted the
+    ;; inverted order without saying so — mempool_accept.py:302 reads the
+    ;; difference.
+    (let ((tiny-nonstandard
+            (bitcoin-lisp.serialization:make-transaction
+             :version 1 :inputs (vector input)
+             :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                               :value 1000 :script-pubkey (%zbytes 0)))
+             :lock-time 0)))
+      (is (< (length (bitcoin-lisp.serialization:serialize-transaction tiny-nonstandard)) 65))
+      (is (eq :non-standard-output
+              (nth-value 1 (bitcoin-lisp.validation:validate-transaction-for-mempool
+                            tiny-nonstandard utxo mempool 100)))))))
 
 (defun %witness-tx (witness-stack spk)
   "Single-input tx carrying WITNESS-STACK (a list of byte vectors). Returns
@@ -2747,9 +2833,16 @@ is still standard, so the two must not share one predicate."
     (let ((bitcoin-lisp:*permit-bare-multisig* t))
       (is-true (bitcoin-lisp.validation::standard-output-script-p (ms 2 3)))
       (is-false (bitcoin-lisp.validation::standard-output-script-p (ms 4 4))))
-    ;; -permitbaremultisig=0 rejects even the small ones.
+    ;; -permitbaremultisig=0 rejects even the small ones — but through
+    ;; IsStandardTx, not IsStandard: Core applies that gate in the output loop
+    ;; (policy.cpp:151-153) so it can report "bare-multisig" rather than
+    ;; "scriptpubkey". STANDARD-OUTPUT-SCRIPT-P is IsStandard alone and so
+    ;; keeps answering for the SHAPE regardless of the knob.
     (let ((bitcoin-lisp:*permit-bare-multisig* nil))
-      (is-false (bitcoin-lisp.validation::standard-output-script-p (ms 2 3))))))
+      (is-true (bitcoin-lisp.validation::standard-output-script-p (ms 2 3)))
+      (is (eq :bare-multisig
+              (nth-value 1 (bitcoin-lisp.validation::%is-standard-tx
+                            (%tx-with-output-script (ms 2 3)))))))))
 
 (test g7-12-nonstandard-and-unknown-witness-inputs-rejected
   "G7-12 (Core AreInputsStandard, policy.cpp:224-232): spending a NONSTANDARD
