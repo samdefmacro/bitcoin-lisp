@@ -592,6 +592,47 @@ block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
           (bitcoin-lisp::node-mempool node) (bitcoin-lisp.mempool:make-mempool))
     node))
 
+(test the-coinbase-witness-waits-for-segwit-activation
+  "Core gates the commitment OUTPUT and the coinbase WITNESS separately.
+GenerateCoinbaseCommitment appends the output with no deployment check at all
+(validation.cpp:4029-4050); UpdateUncommittedBlockStructures adds the reserved
+witness value only under DeploymentActiveAfter(..., DEPLOYMENT_SEGWIT) (:4021).
+
+Ours tied the witness to the commitment, so a template built for a height where
+segwit is NOT yet active carried witness data — and contextual validation
+rejects exactly that as :UNEXPECTED-WITNESS. VALIDATE-WITNESS-COMMITMENT is
+correct and said so; the assembler was handing it a block it was right to
+refuse, so the node could not mine at all under -testactivationheight=segwit@N.
+That is how Core's feature_nulldummy.py found it: 'TestBlockValidity failed on
+assembled block at height 1: UNEXPECTED-WITNESS'.
+
+Invisible on every network this node runs by default, because segwit is active
+from genesis on all of them."
+  (let ((script (bitcoin-lisp.mining::build-witness-commitment-script
+                 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))))
+    (flet ((coinbase (active)
+             (bitcoin-lisp.mining:build-coinbase-transaction
+              1 5000000000 :witness-commitment-script script :segwit-active active)))
+      ;; Active: witness present.
+      (is-true (bitcoin-lisp.serialization:transaction-has-witness-p (coinbase t)))
+      ;; Inactive: no witness anywhere — this is the assertion that fails
+      ;; against the bug.
+      (is-false (bitcoin-lisp.serialization:transaction-has-witness-p (coinbase nil))
+                "the coinbase carried witness data on a chain where segwit is ~
+not active; contextual validation rejects that block as :unexpected-witness")
+      ;; The commitment OUTPUT is present either way, as Core's is.
+      (dolist (active '(t nil))
+        (is (= 2 (length (bitcoin-lisp.serialization:transaction-outputs
+                          (coinbase active))))
+            "commitment output missing with segwit-active ~A" active))
+      ;; And a block built from the inactive coinbase passes the very check
+      ;; that was rejecting it.
+      (let ((blk (bitcoin-lisp.serialization:make-bitcoin-block
+                  :header (bitcoin-lisp.serialization:make-block-header)
+                  :transactions (list (coinbase nil)))))
+        (is-true (bitcoin-lisp.validation:validate-witness-commitment blk nil)
+                 "a pre-segwit block still fails the witness check")))))
+
 (test build-coinbase-transaction-shape
   (%with-regtest
    (let* ((spk (%p2sh-optrue-spk))
