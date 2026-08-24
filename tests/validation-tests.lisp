@@ -320,6 +320,106 @@ re-resolved them from the coins view"))
       (is (null valid))
       (is (eq :no-inputs error)))))
 
+(test transaction-oversize-beats-duplicate-inputs
+  "CheckTransaction's consensus size limit, in Core's position.
+Core rejects a transaction whose NON-WITNESS serialization times
+WITNESS_SCALE_FACTOR exceeds MAX_BLOCK_WEIGHT (tx_check.cpp:17-20), and it
+reaches that check BEFORE the duplicate-input check at :44. The distinction is
+not academic: the only cheap way to build an oversize transaction is to repeat
+one input, which is how mempool_accept.py:235 builds it, so a tree that checked
+duplicates first would answer bad-txns-inputs-duplicate where Core answers
+bad-txns-oversize and no reading of either tree would notice."
+  (let* ((one-input (bitcoin-lisp.serialization:make-tx-in
+                     :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                       :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                            :initial-element 7)
+                                       :index 0)
+                     :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                     :sequence #xFFFFFFFF))
+         ;; 41 bytes per input serialized; MAX_BLOCK_WEIGHT/4 = 1,000,000 bytes.
+         (n (ceiling 1000000 41))
+         (inputs (make-array n :initial-element one-input))
+         (output (bitcoin-lisp.serialization:make-tx-out
+                  :value 1000
+                  :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 1 :inputs inputs :outputs (vector output) :lock-time 0)))
+    (multiple-value-bind (valid error)
+        (bitcoin-lisp.validation:validate-transaction-structure tx)
+      (is (null valid))
+      (is (eq :tx-oversize error)
+          "an oversize transaction built from repeated inputs must report ~
+oversize, as Core does, not duplicate inputs"))
+    ;; Positive control: the same duplicate inputs UNDER the ceiling still
+    ;; report duplicates, so the assertion above is about order, not about
+    ;; having broken the duplicate check.
+    (let ((small (bitcoin-lisp.serialization:make-transaction
+                  :version 1
+                  :inputs (vector one-input one-input)
+                  :outputs (vector output)
+                  :lock-time 0)))
+      (is (eq :duplicate-inputs
+              (nth-value 1 (bitcoin-lisp.validation:validate-transaction-structure small)))))))
+
+(test tx-reject-reasons-cover-every-keyword
+  "Every reject keyword a validation site can return has a Core string.
+TX-REJECT-REASON-STRING falls back to the downcased keyword name, which is how
+this codebase used to render ALL of them — a fallback that silently invents a
+vocabulary Core does not speak. Rather than trust the table to stay complete,
+scan the source for the keywords the sites actually return, the same way
+RPC-ARG-CONVERSIONS-MATCH-CORE re-parses Core's client.cpp every battery."
+  (let ((path (merge-pathnames "src/validation/transaction.lisp"
+                               (asdf:system-source-directory :bitcoin-lisp)))
+        (found '())
+        (missing '()))
+    (with-open-file (in path :if-does-not-exist nil)
+      (is-true in "src/validation/transaction.lisp is unreadable")
+      (when in
+        (loop for line = (read-line in nil) while line
+              do (let ((at (search "(values nil :" line)))
+                   (when at
+                     (let* ((start (+ at (length "(values nil :")))
+                            (end (or (position-if-not
+                                      (lambda (c) (or (alphanumericp c) (char= c #\-)))
+                                      line :start start)
+                                     (length line))))
+                       (pushnew (intern (string-upcase (subseq line start end)) :keyword)
+                                found)))))))
+    ;; The scan must actually find things, or an empty result would pass.
+    (is (> (length found) 20)
+        "the scan found ~D keywords, which is too few to be the real set"
+        (length found))
+    (dolist (kw found)
+      (unless (assoc kw bitcoin-lisp.validation:*tx-reject-reasons*)
+        (push kw missing)))
+    (is (null missing)
+        "these reject keywords have no Core reject-reason string: ~{~A~^, ~}"
+        missing)))
+
+(test tx-reject-reason-strings-match-core
+  "The renamings, spot-checked against the Core site each one cites.
+These are the keywords whose downcased name is NOT Core's string, which is
+exactly the set the old mechanical rendering got wrong."
+  (flet ((r (kw) (bitcoin-lisp.validation:tx-reject-reason-string kw)))
+    ;; validation.cpp PreChecks
+    (is (string= "txn-already-in-mempool" (r :already-in-mempool)))
+    (is (string= "txn-already-known" (r :already-known)))
+    (is (string= "bad-txns-inputs-missingorspent" (r :missing-input)))
+    (is (string= "coinbase" (r :coinbase-not-allowed)))
+    ;; Core's casing, which a downcase destroys
+    (is (string= "non-BIP68-final" (r :non-bip68-final)))
+    ;; consensus/tx_check.cpp
+    (is (string= "bad-txns-oversize" (r :tx-oversize)))
+    (is (string= "bad-txns-vout-empty" (r :no-outputs)))
+    (is (string= "bad-txns-inputs-duplicate" (r :duplicate-inputs)))
+    (is (string= "bad-cb-length" (r :bad-coinbase-length)))
+    ;; policy/policy.cpp IsStandardTx — note the two size rules are distinct
+    (is (string= "version" (r :version-non-standard)))
+    (is (string= "tx-size" (r :tx-weight-too-large)))
+    (is (string= "scriptsig-size" (r :scriptsig-too-large)))
+    (is (string= "scriptpubkey" (r :non-standard-output)))
+    (is (string= "bare-multisig" (r :bare-multisig)))))
+
 (test transaction-no-outputs
   "Transaction without outputs should fail validation."
   (let ((tx (bitcoin-lisp.serialization:make-transaction

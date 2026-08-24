@@ -1015,6 +1015,29 @@ RPC_DESERIALIZATION_ERROR (-22), matching Core."
       (bitcoin-lisp.rpc::rpc-error (e)
         (is (= -22 (bitcoin-lisp.rpc::rpc-error-code e)))))))
 
+(test rpc-sendrawtransaction-rejection-speaks-core
+  "The rejection carries Core's reject reason and Core's split of codes.
+BroadcastTransaction sets err_string to state.ToString() and the RPC prints
+exactly that, with no prefix of its own (node/transaction.cpp:21,
+rpc/util.cpp:408-414). The CODE splits on the result: TX_MISSING_INPUTS becomes
+RPC_TRANSACTION_ERROR, which IS RPC_VERIFY_ERROR = -25 (protocol.h:54), and
+everything else RPC_TRANSACTION_REJECTED = -26. rpc_rawtransaction.py:354 pins
+the pair. Ours answered -26 \"Transaction rejected: MISSING-INPUT\" — the wrong
+code, carrying an uppercased Lisp keyword no client can match on."
+  (let* ((node (make-test-node))
+         (tx (make-mempool-test-tx :input-id 211))
+         (hex (bitcoin-lisp.crypto:bytes-to-hex
+               (bitcoin-lisp.serialization:serialize-transaction tx))))
+    (handler-case
+        (progn (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex))
+               (fail "expected rpc-error"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        ;; Note this surface says bad-txns-inputs-missingorspent, NOT
+        ;; testmempoolaccept's "missing-inputs".
+        (is (= -25 (bitcoin-lisp.rpc::rpc-error-code e)))
+        (is (string= "bad-txns-inputs-missingorspent"
+                     (bitcoin-lisp.rpc::rpc-error-message e)))))))
+
 ;;; --- sendrawtransaction broadcast (unbroadcast set + peer announcement) ---
 ;;;
 ;;; Uses the P2SH(OP_TRUE) fixture from package-tests.lisp (%pkg-fixture /
@@ -4141,7 +4164,12 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
     (let ((r (first result)))
       ;; Empty UTXO set => missing input => not allowed, with a reason.
       (is (eq 'yason:false (cdr (assoc "allowed" r :test #'string=))))
-      (is (string= "missing-input" (cdr (assoc "reject-reason" r :test #'string=)))))
+      ;; PLURAL, and this surface only: testmempoolaccept substitutes
+      ;; "missing-inputs" for the TX_MISSING_INPUTS result
+      ;; (rpc/mempool.cpp:399-400), where sendrawtransaction reports the
+      ;; state's own "bad-txns-inputs-missingorspent". This test used to pin
+      ;; "missing-input", which was neither — it was our keyword downcased.
+      (is (string= "missing-inputs" (cdr (assoc "reject-reason" r :test #'string=)))))
     ;; Nothing was added to the mempool.
     (is (= 0 (bitcoin-lisp.mempool:mempool-count (bitcoin-lisp::node-mempool node))))))
 

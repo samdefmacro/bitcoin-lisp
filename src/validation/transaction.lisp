@@ -17,6 +17,14 @@
 (defconstant +max-block-size+ 1000000)       ; 1 MB
 (defconstant +coinbase-maturity+ 100)        ; Blocks before coinbase spendable
 
+;; BIP 141's two block-weight constants. Core keeps them in
+;; consensus/consensus.h, where both CheckTransaction and the block checks
+;; include them; here they have to live in the file the validation module loads
+;; FIRST, because VALIDATE-TRANSACTION-STRUCTURE needs them and
+;; transaction.lisp compiles ahead of block.lisp (bitcoin-lisp.asd:78,80).
+(defconstant +max-block-weight+ 4000000)     ; BIP 141: max block weight in weight units
+(defconstant +witness-scale-factor+ 4)       ; BIP 141: legacy sigops weight multiplier
+
 ;; Typed constant for max money
 (defvar *max-money-satoshi* nil)
 (defun max-money-satoshi ()
@@ -41,6 +49,22 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
     (when (zerop (length outputs))
       (return-from validate-transaction-structure
         (values nil :no-outputs)))
+
+    ;; Consensus size limit, in Core's position: CheckTransaction rejects a
+    ;; transaction whose NON-WITNESS serialization exceeds the block weight
+    ;; ceiling (tx_check.cpp:17-20), before it looks at values or duplicate
+    ;; inputs. The witness is deliberately excluded — at this point it has not
+    ;; been checked for malleability, so it cannot be trusted to bound size.
+    ;;
+    ;; ORDER MATTERS and is pinned by test: Core reaches this at :18 and the
+    ;; duplicate-input check only at :44, so an oversize transaction built by
+    ;; repeating one input — which is exactly how mempool_accept.py:235 builds
+    ;; it — must report oversize, not duplicate inputs.
+    (when (> (* +witness-scale-factor+
+                (length (bitcoin-lisp.serialization:serialize-transaction tx)))
+             +max-block-weight+)
+      (return-from validate-transaction-structure
+        (values nil :tx-oversize)))
 
     ;; Check for duplicate inputs
     (let ((seen-outpoints (make-hash-table :test 'equalp)))
@@ -89,10 +113,10 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
             (return-from validate-transaction-structure
               (values nil :bad-prevout-null)))))
 
-    ;; Note: there is no consensus-level transaction size limit independent of
-    ;; the block weight limit (4M weight units). Bitcoin Core only enforces
-    ;; MAX_STANDARD_TX_WEIGHT (400,000 wu) as mempool policy, not consensus.
-    ;; The block-weight ceiling is checked at block validation time.
+    ;; The two size limits above and in %IS-STANDARD-TX are Core's two, and
+    ;; they are separate rules with separate reasons: the consensus one here
+    ;; (bad-txns-oversize, non-witness size against the block ceiling) and the
+    ;; policy one (tx-size, full weight against MAX_STANDARD_TX_WEIGHT).
 
     (values t nil)))
 
@@ -547,18 +571,17 @@ match, so an OP_RETURN or witness program can never be read as a key script."
 
 (defun standard-output-script-p (script-pubkey)
   "Whether SCRIPT-PUBKEY is a standard OUTPUT script type (Core IsStandard,
-policy.cpp:79-97): everything Solver classifies except NONSTANDARD, plus the
-bare-multisig limits.
+policy.cpp:79-97): everything Solver classifies except NONSTANDARD, plus
+bare multisig's n<=3 cap.
 
-NB bare multisig folds BOTH of Core's output-only restrictions in here — the
-n<=3 cap from IsStandard and the -permitbaremultisig gate that IsStandardTx
-applies separately (policy.cpp:151-153). Core reports the latter as its own
-\"bare-multisig\" reason; we report :non-standard-output for both, which is a
-pre-existing reason-code difference and not a relay difference."
+This is Core's IsStandard exactly, which means the -permitbaremultisig gate is
+NOT here: Core applies that separately, in IsStandardTx's output loop
+(policy.cpp:151-153), and reports it as its own \"bare-multisig\" reason rather
+than \"scriptpubkey\". Folding the two together here reported one reason for
+both, which mempool_accept.py:311 reads as a divergence."
   (case (classify-output-script script-pubkey)
     (:nonstandard nil)
-    (:multisig (and bitcoin-lisp:*permit-bare-multisig*
-                    (bare-multisig-standard-p script-pubkey)))
+    (:multisig (bare-multisig-standard-p script-pubkey))
     (t t)))
 
 (defun bare-multisig-standard-p (script)
@@ -787,8 +810,10 @@ transaction is refused even on a node told to relay non-standard ones."
       (return-from %is-standard-tx
         (values nil :version-non-standard))))
 
-  ;; Policy: max standard transaction weight (Bitcoin Core's only size limit;
-  ;; the old serialized-size cap was removed upstream).
+  ;; Policy: max standard transaction weight (policy.cpp:110-113, Core's
+  ;; "tx-size"). This is the POLICY limit and it is not the only size limit —
+  ;; CheckTransaction's consensus ceiling is checked in
+  ;; VALIDATE-TRANSACTION-STRUCTURE, on the non-witness serialization.
   (when (> (bitcoin-lisp.serialization:transaction-weight tx) +max-standard-tx-weight+)
     (return-from %is-standard-tx
       (values nil :tx-weight-too-large)))
@@ -821,11 +846,19 @@ transaction is refused even on a node told to relay non-standard ones."
         (unless (standard-output-script-p spk)
           (return-from %is-standard-tx
             (values nil :non-standard-output)))
-        (when (null-data-script-p spk)
-          (when (> (length spk) datacarrier-bytes-left)
-            (return-from %is-standard-tx
-              (values nil :datacarrier)))
-          (decf datacarrier-bytes-left (length spk))))))
+        ;; Core's if/else-if over the classified type (policy.cpp:145-154):
+        ;; a NULL_DATA output draws on the shared budget, and ONLY an output
+        ;; that is not NULL_DATA can be the bare multisig this gate refuses.
+        (cond
+          ((null-data-script-p spk)
+           (when (> (length spk) datacarrier-bytes-left)
+             (return-from %is-standard-tx
+               (values nil :datacarrier)))
+           (decf datacarrier-bytes-left (length spk)))
+          ((and (eq (classify-output-script spk) :multisig)
+                (not bitcoin-lisp:*permit-bare-multisig*))
+           (return-from %is-standard-tx
+             (values nil :bare-multisig)))))))
 
   ;; EPHEMERAL DUST (Core policy.cpp:157-161 + policy/ephemeral_policy.cpp).
   ;; Dust is no longer rejected on sight. Core permits up to
@@ -841,6 +874,80 @@ transaction is refused even on a node told to relay non-standard ones."
       (return-from %is-standard-tx
         (values nil :dust))))
   (values t nil))
+
+;;;; Core's reject-reason vocabulary
+;;;
+;;; Core carries the reject reason as a STRING inside TxValidationState, so the
+;;; string an RPC prints is the same one the validation site chose. Here the
+;;; sites choose a keyword, and every RPC that reported one used to render it
+;;; mechanically with STRING-DOWNCASE. That is right only where our keyword
+;;; happens to spell Core's string, and it silently invented a vocabulary
+;;; wherever it did not: "already-in-mempool" for Core's
+;;; "txn-already-in-mempool", "missing-input" for "bad-txns-inputs-missingorspent",
+;;; "non-bip68-final" for "non-BIP68-final", "scriptsig-too-large" for
+;;; "scriptsig-size". Clients that match on the reason — Core's functional
+;;; suite among them — read every one of those as a divergence.
+;;;
+;;; The table is explicit for that reason: a rename here is visible, and the
+;;; structural test TX-REJECT-REASONS-COVER-EVERY-KEYWORD fails when a
+;;; validation site introduces a keyword nothing maps.
+
+(defparameter *tx-reject-reasons*
+  ;; keyword -> Core's state.GetRejectReason(), with the site Core sets it at.
+  '((:no-inputs                . "bad-txns-vin-empty")               ; tx_check.cpp:15
+    (:no-outputs               . "bad-txns-vout-empty")              ; :17
+    (:tx-oversize              . "bad-txns-oversize")                ; :20
+    (:negative-output          . "bad-txns-vout-negative")           ; :28
+    (:output-too-large         . "bad-txns-vout-toolarge")           ; :30
+    (:total-output-too-large   . "bad-txns-txouttotal-toolarge")     ; :33
+    (:duplicate-inputs         . "bad-txns-inputs-duplicate")        ; :44
+    (:bad-coinbase-length      . "bad-cb-length")                    ; :50
+    (:bad-prevout-null         . "bad-txns-prevout-null")            ; :56
+    (:coinbase-not-mature      . "bad-txns-premature-spend-of-coinbase") ; tx_verify.cpp:180
+    (:insufficient-funds       . "bad-txns-in-belowout")             ; :197
+    (:coinbase-not-allowed     . "coinbase")                         ; validation.cpp:804
+    (:tx-size-small            . "tx-size-small")                    ; :814
+    (:non-final                . "non-final")                        ; :820
+    (:already-in-mempool       . "txn-already-in-mempool")           ; :825
+    (:already-known            . "txn-already-known")                ; :862
+    (:missing-input            . "bad-txns-inputs-missingorspent")   ; :866
+    (:non-bip68-final          . "non-BIP68-final")                  ; :888
+    (:nonstandard-inputs       . "bad-txns-nonstandard-inputs")      ; :897
+    (:bad-witness-nonstandard  . "bad-witness-nonstandard")          ; :902
+    (:too-many-sigops          . "bad-txns-too-many-sigops")         ; :939
+    (:version-non-standard     . "version")                          ; policy.cpp:102
+    (:tx-weight-too-large      . "tx-size")                          ; :112
+    (:scriptsig-too-large      . "scriptsig-size")                   ; :127
+    (:scriptsig-not-pushonly   . "scriptsig-not-pushonly")           ; :131
+    (:non-standard-output      . "scriptpubkey")                     ; :140
+    (:datacarrier              . "datacarrier")                      ; :147
+    (:bare-multisig            . "bare-multisig")                    ; :152
+    (:dust                     . "dust")                             ; :159
+    (:missing-ephemeral-spends . "missing-ephemeral-spends")         ; ephemeral_policy.cpp
+    ;; Both script passes carry a "(ScriptErrorString)" parenthetical in Core
+    ;; (validation.cpp:2117,2119) that our sites do not produce yet, so these
+    ;; render as the bare prefix.
+    (:mempool-script-verify-flag-failed . "mempool-script-verify-flag-failed")
+    (:block-script-verify-flag-failed   . "block-script-verify-flag-failed")
+    ;; A witness stripped from a spend of a witness program is not its own
+    ;; reason in Core: the script pass fails and reports itself. Ours pre-gates
+    ;; the doomed execution, so it reports what that pass would have.
+    (:witness-stripped         . "mempool-script-verify-flag-failed")
+    ;; UNSPLIT: Core has two fee reasons — "mempool min fee not met" when the
+    ;; pool's dynamic floor rejects (validation.cpp:705) and this one against
+    ;; the static relay floor (:709). Our single check compares against the
+    ;; effective rate, which is the max of the two, so it cannot say which
+    ;; term bound it. Splitting the check is the fix; naming the common case
+    ;; is the honest rendering until then.
+    (:insufficient-fee         . "min relay fee not met"))
+  "Our validation keywords in Core's reject-reason vocabulary.")
+
+(defun tx-reject-reason-string (reason)
+  "REASON as Core's state.GetRejectReason() spells it.
+An unmapped keyword falls back to its downcased name and is caught by test
+rather than by a client: see TX-REJECT-REASONS-COVER-EVERY-KEYWORD."
+  (or (cdr (assoc reason *tx-reject-reasons*))
+      (string-downcase (symbol-name reason))))
 
 (defun validate-transaction-for-mempool (tx utxo-set mempool current-height
                                          &key package-coins skip-fee-check chain-state
@@ -893,36 +1000,43 @@ contexts, validation.cpp:487-497) lets a TRUC descendant-limit failure fall
 through to the RBF path when SINGLE-TRUC-CHECKS identifies an evictable
 sibling: the sibling is added to the conflict set and replacement economics
 decide (Core PreChecks, validation.cpp:950-970)."
-  ;; Must not be coinbase
-  (when (and (= (length (bitcoin-lisp.serialization:transaction-inputs tx)) 1)
-             (bitcoin-lisp.serialization:coinbase-input-p
-              (aref (bitcoin-lisp.serialization:transaction-inputs tx) 0)))
-    (return-from validate-transaction-for-mempool
-      (values nil :coinbase-not-allowed nil)))
-
-  ;; Structure validation (consensus)
+  ;; PRECHECK ORDER IS CORE'S ORDER (validation.cpp:798-815), and it is
+  ;; observable: each of these rejects a transaction the next one would also
+  ;; reject, so whichever runs first is the reason the client is told. The
+  ;; functional suite reads those reasons, and mempool_accept.py:302 is a
+  ;; transaction that is BOTH non-standard and under 65 bytes.
+  ;;
+  ;; 1. CheckTransaction (:798) — consensus structure.
   (multiple-value-bind (valid error)
       (validate-transaction-structure tx)
     (unless valid
       (return-from validate-transaction-for-mempool
         (values nil error nil))))
 
-  ;; Policy: minimum non-witness size (Bitcoin Core MIN_STANDARD_TX_NONWITNESS_SIZE).
-  ;; serialize-transaction emits the legacy (non-witness) encoding, so its length
-  ;; is the stripped size — rejecting 64-byte txs (CVE-2017-12842).
-  (when (< (length (bitcoin-lisp.serialization:serialize-transaction tx))
-           +min-standard-tx-nonwitness-size+)
+  ;; 2. Coinbase is only valid in a block (:802-804), and AFTER
+  ;;    CheckTransaction: a malformed coinbase is reported as malformed.
+  (when (and (= (length (bitcoin-lisp.serialization:transaction-inputs tx)) 1)
+             (bitcoin-lisp.serialization:coinbase-input-p
+              (aref (bitcoin-lisp.serialization:transaction-inputs tx) 0)))
     (return-from validate-transaction-for-mempool
-      (values nil :tx-size-small nil)))
+      (values nil :coinbase-not-allowed nil)))
 
-
-  ;; Policy: the standardness battery, behind Core's single require_standard
-  ;; flag (-acceptnonstdtxn, validation.cpp:808). Everything it covers lives in
-  ;; %IS-STANDARD-TX; the check above it does not, because Core's does not.
+  ;; 3. The standardness battery, behind Core's single require_standard flag
+  ;;    (-acceptnonstdtxn, :807-810). Everything it covers lives in
+  ;;    %IS-STANDARD-TX; the size check below does not, because Core's does not.
   (when *require-standard*
     (multiple-value-bind (ok reason) (%is-standard-tx tx)
       (unless ok
         (return-from validate-transaction-for-mempool (values nil reason nil)))))
+
+  ;; 4. Minimum non-witness size (:813-815, CVE-2017-12842). LAST of the four,
+  ;;    and outside require_standard so it holds even for a node told to relay
+  ;;    non-standard transactions. SERIALIZE-TRANSACTION emits the legacy
+  ;;    (non-witness) encoding, so its length is the stripped size Core measures.
+  (when (< (length (bitcoin-lisp.serialization:serialize-transaction tx))
+           +min-standard-tx-nonwitness-size+)
+    (return-from validate-transaction-for-mempool
+      (values nil :tx-size-small nil)))
 
   ;; Check for duplicate in mempool
   (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
@@ -939,6 +1053,25 @@ decide (Core PreChecks, validation.cpp:950-970)."
   (multiple-value-bind (extra-coins inputs-ok)
       (mempool-extra-coins tx utxo-set mempool (1+ current-height) package-coins)
     (unless inputs-ok
+      ;; "Are inputs missing because we already have the tx?" (Core
+      ;; validation.cpp:857-866). A transaction that is ALREADY CONFIRMED
+      ;; presents as one with missing inputs — its own inputs were spent by
+      ;; itself — so before reporting that, Core looks for any of this
+      ;; transaction's OWN outputs among the coins. Finding one means the
+      ;; transaction is already known, and it says so.
+      ;;
+      ;; DIVERGENCE, deliberate: Core consults only the coins CACHE
+      ;; ("Optimistically just do efficient check of cache for outputs",
+      ;; :860), so a confirmed transaction whose outputs are not cached gets
+      ;; Core's missing-inputs instead. We ask the view, which answers the
+      ;; question the check exists to ask in every case rather than most of
+      ;; them. Both paths reject; only the reason differs.
+      (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+            (outputs (bitcoin-lisp.serialization:transaction-outputs tx)))
+        (dotimes (i (length outputs))
+          (when (bitcoin-lisp.storage:get-utxo utxo-set txid i)
+            (return-from validate-transaction-for-mempool
+              (values nil :already-known nil)))))
       (return-from validate-transaction-for-mempool
         (values nil :missing-input nil)))
 

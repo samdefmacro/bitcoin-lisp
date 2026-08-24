@@ -1571,11 +1571,44 @@ anything to the mempool. Each tx is checked independently against current state
                                 ("wtxid" . ,(hash-to-hex wtxid))
                                 ("allowed" . t)
                                 ("vsize" . ,vsize)
-                                ("fees" . (("base" . ,(/ (or fee 0) 100000000.0d0))))))))
+                                ("fees"
+                                 . (("base" . ,(%btc (or fee 0)))
+                                    ;; The feerate the acceptance decision
+                                    ;; actually used: CFeeRate(m_modified_fees,
+                                    ;; m_vsize).GetFeePerK() for a single
+                                    ;; transaction (validation.cpp:1383,1387),
+                                    ;; i.e. MODIFIED fees — base plus any
+                                    ;; prioritisetransaction delta — over the
+                                    ;; sigop-adjusted vsize, truncated to
+                                    ;; satoshis per kvB (feerate.cpp) and
+                                    ;; rendered in BTC.
+                                    ("effective-feerate"
+                                     . ,(%btc (let ((modified
+                                                      (+ (or fee 0)
+                                                         (gethash txid (bitcoin-lisp.mempool:mempool-deltas mempool) 0))))
+                                                (if (plusp vsize)
+                                                    (truncate (* modified 1000) vsize)
+                                                    0))))
+                                    ;; Which transactions' fees that rate
+                                    ;; covers. For a single transaction it is
+                                    ;; its own wtxid and nothing else
+                                    ;; (validation.cpp:1320,1387); a package
+                                    ;; feerate would list every member.
+                                    ("effective-includes"
+                                     . ,(vector (hash-to-hex wtxid)))))))))
                          `(("txid" . ,(hash-to-hex txid))
                            ("wtxid" . ,(hash-to-hex wtxid))
                            ("allowed" . ,+json-false+)
-                           ("reject-reason" . ,(string-downcase (symbol-name error))))))))
+                           ;; This RPC substitutes its own string for the
+                           ;; missing-inputs result and prints the state's
+                           ;; reason for everything else (rpc/mempool.cpp:
+                           ;; 399-402). Note the plural: it is this surface
+                           ;; only — sendrawtransaction reports the state's
+                           ;; "bad-txns-inputs-missingorspent" instead.
+                           ("reject-reason"
+                            . ,(if (eq error :missing-input)
+                                   "missing-inputs"
+                                   (bitcoin-lisp.validation:tx-reject-reason-string error))))))))
              results)))))))
 
 (defun rpc-sendrawtransaction (node params)
@@ -1629,8 +1662,21 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                 (bitcoin-lisp::broadcast-transaction-to-peers node txid)
                 (return-from rpc-sendrawtransaction (hash-to-hex txid)))
               (unless valid
-                (error 'rpc-error :code +rpc-transaction-rejected+
-                                  :message (format nil "Transaction rejected: ~A" error)))
+                ;; Core reports the state's own reject reason, with no prefix
+                ;; of its own: BroadcastTransaction sets err_string to
+                ;; state.ToString() (node/transaction.cpp:21) and the RPC
+                ;; prints exactly that (rpc/util.cpp:408-414). The CODE splits
+                ;; on the result: TX_MISSING_INPUTS becomes
+                ;; TransactionError::MISSING_INPUTS (:23-25), which maps to
+                ;; RPC_TRANSACTION_ERROR = RPC_VERIFY_ERROR = -25
+                ;; (rpc/util.cpp:391-401, protocol.h:54), and everything else
+                ;; to -26. rpc_rawtransaction.py:354 pins the pair: -25 with
+                ;; "bad-txns-inputs-missingorspent".
+                (error 'rpc-error
+                       :code (if (eq error :missing-input)
+                                 +rpc-verify-error+
+                                 +rpc-transaction-rejected+)
+                       :message (bitcoin-lisp.validation:tx-reject-reason-string error)))
               ;; Core runs ATMP with test_accept FIRST and only submits for real
               ;; once the fee is under the rail (node/transaction.cpp:74-84), so
               ;; an over-paying transaction never enters the mempool and is
@@ -1693,7 +1739,9 @@ per-wtxid object. Status drives which fields are present."
         ((:invalid :not-validated)
          (append base
                  `(("error" . ,(let ((e (bitcoin-lisp.validation:package-tx-result-error r)))
-                                 (if e (string-downcase (symbol-name e)) "rejected"))))))))))
+                                 (if e
+                                     (bitcoin-lisp.validation:tx-reject-reason-string e)
+                                     "rejected"))))))))))
 
 (defun rpc-submitpackage (node params)
   "Submit a package of raw transactions (a child with its unconfirmed parents)
