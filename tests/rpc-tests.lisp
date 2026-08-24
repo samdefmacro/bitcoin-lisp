@@ -6828,3 +6828,26 @@ on the wire gets back."
                        "application/x-www-form-urlencoded" "__cookie__:wrong")))
                (is (= 401 (%http-status r)))))
         (bitcoin-lisp.rpc:stop-rpc-server)))))
+
+(test getdeploymentinfo-buried-active-is-reported-one-block-early
+  "Core reports a buried softfork active from ONE BLOCK BELOW its activation
+height, and says so in a comment beside the call: getdeploymentinfo uses
+DeploymentActiveAfter (rpc/blockchain.cpp:1301-1303), which is
+`pindexPrev->nHeight + 1 >= DeploymentHeight' (deploymentstatus.h:14-18) —
+i.e. it answers for the block AFTER the one queried.
+
+We compared the height directly, so for exactly one block we answered false
+where every Core node answers true. A one-block window is precisely the kind of
+divergence a conformance test catches and a human never does."
+  (flet ((active (tip activation)
+           (cdr (assoc "active" (bitcoin-lisp.rpc::%buried-deployment activation tip)
+                       :test #'string=))))
+    ;; Two below: not yet.
+    (is (eq bitcoin-lisp.rpc::+json-false+ (active 498 500)))
+    ;; ONE below: Core says active. This is the case that was wrong.
+    (is (eq t (active 499 500)))
+    ;; At and above: active.
+    (is (eq t (active 500 500)))
+    (is (eq t (active 501 500)))
+    ;; An always-active deployment (height 0) is active even at height 0.
+    (is (eq t (active 0 0)))))

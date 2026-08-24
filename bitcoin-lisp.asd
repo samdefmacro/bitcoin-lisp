@@ -69,6 +69,7 @@
                                (:file "reindex")
                                (:file "migrate-blocks")
                                (:file "txindex")
+                               (:file "txospenderindex")
                                (:file "blockfilter")
                                (:file "blockfilterindex")
                                (:file "coinstatsindex")))
@@ -78,6 +79,7 @@
                                (:file "transaction")
                                (:file "packages")
                                (:file "block")
+                               (:file "versionbits")
                                (:file "signet")))
                  (:module "mempool"
                   :components ((:file "feefrac")
@@ -242,6 +244,8 @@
                              (:file "muhash-tests")
                              ;; coinstatsindex tests
                              (:file "coinstatsindex-tests")
+                             (:file "txospenderindex-tests")
+                             (:file "versionbits-tests")
                              ;; -reindex-chainstate tests
                              (:file "reindex-tests")
                              ;; Connection types (block-relay-only + feeler)

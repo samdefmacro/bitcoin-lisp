@@ -374,6 +374,7 @@ start-node via automatic-inbound-capacity; the default is Core's 125 - 11.")
   (tx-index nil)  ; Transaction index (optional, for getrawtransaction)
   (blockfilterindex nil)  ; BIP158 basic block filter index (optional)
   (coinstatsindex nil)  ; per-height UTXO stats + MuHash index (optional)
+  (txospenderindex nil)  ; outpoint -> spending tx index (optional, -txospenderindex)
   ;; Wallet manager (bitcoin-lisp.rpc:wallet-manager) fanning RPCs out to
   ;; loaded wallets by name; NIL when wallet support is disabled (mainnet
   ;; default). Wallet P1, docs/wallet-plan.md §4.
@@ -2331,7 +2332,54 @@ snapshot base; the promoted chainstate carries the full chain past the base,
 so this resumes indexing from where each index left off. A no-op when no
 index is enabled."
   (when (node-blockfilterindex node) (%catch-up-blockfilterindex node))
-  (when (node-coinstatsindex node) (%catch-up-coinstatsindex node)))
+  (when (node-coinstatsindex node) (%catch-up-coinstatsindex node))
+  (when (node-txospenderindex node) (%catch-up-txospenderindex node)))
+
+(defun %catch-up-txospenderindex (node)
+  "Backfill the spender index from where it left off to the validated tip.
+
+⚠️ Without this, turning -txospenderindex on for an existing node would index
+NOTHING historical — only blocks connected from that moment on — and every
+lookup for an already-confirmed spend would answer `not found'. That is exactly
+the shape of the -txindex defect this project already shipped once, where
+BUILD-TX-INDEX existed and had no caller, so the flag indexed nothing.
+
+Walks forward from the best indexed height, because the entries are keyed by
+outpoint rather than by height and so must be written in some order but not
+necessarily this one; forward simply keeps the best marker meaningful if the
+walk is interrupted."
+  (let* ((idx (node-txospenderindex node))
+         (cs (node-validated-chainstate node))
+         (store (node-block-store node))
+         (tip (bitcoin-lisp.storage:current-height cs))
+         (from (1+ (bitcoin-lisp.storage:txospenderindex-height idx)))
+         (done 0))
+    (when (> from tip)
+      (return-from %catch-up-txospenderindex 0))
+    (when (plusp (- tip from))
+      (log-info "Spender index: backfilling heights ~D..~D" from tip))
+    (loop for h from from to tip
+          for entry = (bitcoin-lisp.storage:get-block-at-height cs h)
+          while entry
+          do (when (bitcoin-lisp:interrupt-requested-p)
+               (log-warn "Spender index backfill stopped at height ~D" h)
+               (return))
+             (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+                    (block (and store (bitcoin-lisp.storage:get-block store hash))))
+               (cond
+                 (block
+                  (bitcoin-lisp.storage:txospenderindex-add-block idx block hash)
+                  (bitcoin-lisp.storage:txospenderindex-set-best-block idx hash h)
+                  (incf done))
+                 (t
+                  ;; A pruned or missing body cannot be indexed, and skipping it
+                  ;; while advancing the marker would leave a permanent hole the
+                  ;; next start could never notice. Stop instead.
+                  (log-warn "Spender index backfill stopped at height ~D: block body unavailable" h)
+                  (return)))))
+    (when (plusp done)
+      (log-info "Spender index: indexed ~D block~:P" done))
+    done))
 
 ;;; -stopatheight / disk-space / periodic peers.dat dump support
 
@@ -2632,6 +2680,7 @@ case ever exercised) has genesis for a root."
                         (test-activation-heights nil)
                         (v2transport nil)
                         (coinstatsindex nil)
+                        (txospenderindex nil)
                         (reindex-chainstate nil)
                         (force-compact-db nil)
                         (peer-block-filters nil)
@@ -2811,6 +2860,12 @@ txindex ~D MiB, per-index ~D MiB"
       (error "Invalid prune target: ~A MiB. Must be 1 (manual-only) or >= 550." prune))
     (when (and prune txindex)
       (error "Cannot enable both pruning and txindex. Pruned blocks cannot be looked up."))
+    ;; Core refuses the same pair for the spender index, and for the same
+    ;; reason: answering a lookup means READING the spending transaction back
+    ;; from its block, which a pruned node no longer has (init.cpp, the
+    ;; -txospenderindex prune check).
+    (when (and prune txospenderindex)
+      (error "Cannot enable both pruning and txospenderindex. Pruned blocks cannot be looked up."))
     ;; Bitcoin Core init.cpp: -prune is incompatible with -reindex-chainstate --
     ;; the wipe leaves the UTXO set to be replayed from stored blocks, but early
     ;; blocks are pruned, so a pruned reindex-chainstate wedges at the first gap.
@@ -3387,6 +3442,15 @@ to move them (the node must be stopped)."
   ;; hook advances it. Its running MuHash must be contiguous from genesis, so a
   ;; pruned node (missing early undo data) can only build it if its stored
   ;; history reaches genesis -- otherwise the backfill stops at the first gap.
+  (when txospenderindex
+    (log-info "Initializing spender index...")
+    (setf (node-txospenderindex *node*)
+          (bitcoin-lisp.storage:init-txospender-index (node-data-directory *node*)
+                                                      :enabled t))
+    (let ((best (bitcoin-lisp.storage:txospenderindex-best-block
+                 (node-txospenderindex *node*))))
+      (log-info "Spender index loaded: best block ~A"
+                (if best (bitcoin-lisp.crypto:bytes-to-hex best) "none"))))
   (when coinstatsindex
     (log-info "Initializing coinstats index...")
     (setf (node-coinstatsindex *node*)
@@ -4430,6 +4494,51 @@ best-indexed height ~D; the startup backfill will heal it on next restart"
           (log-warn "Block filter index failed at height ~D: ~A" height e)
           nil)))))
 
+(defun index-block-txospenders (chainstate block block-hash height)
+  "Connect-time hook: record which transaction in BLOCK spent each output it
+consumes, if the spender index is enabled.
+
+Same shape and same guarantees as INDEX-BLOCK-FILTER above — bound to the
+VALIDATED chainstate so a snapshot chainstate's tip-range connects are ignored,
+and wrapped so an index failure can never abort a block connect."
+  (let ((idx (and *node* (node-txospenderindex *node*))))
+    (when (and idx (bitcoin-lisp.storage:txospender-index-enabled idx)
+               (eq chainstate (node-validated-chainstate *node*)))
+      (handler-case
+          (progn
+            (bitcoin-lisp.storage:txospenderindex-add-block idx block block-hash)
+            (bitcoin-lisp.storage:txospenderindex-set-best-block idx block-hash height))
+        (error (e)
+          (log-warn "Spender index failed to add block ~A: ~A"
+                    (bitcoin-lisp.crypto:bytes-to-hex block-hash) e)
+          nil)))))
+
+(defun unindex-block-txospenders (chainstate block block-hash)
+  "Disconnect-time hook: erase what INDEX-BLOCK-TXOSPENDERS wrote for BLOCK.
+
+⚠️ THIS IS THE FIRST DISCONNECT HOOK IN THIS TREE, and the spender index is the
+first index that needs one. The others key their records on HEIGHT — a
+reconnect overwrites a disconnected block's record and a stale one is never
+read (see the coinstatsindex rewind note above, which says outright that there
+is no disconnect hook). A spender key carries no height: it is
+hash(outpoint) | block hash | offset. After a reorg the disconnected block is
+still on disk, so an entry left behind resolves to a spending transaction from
+an ABANDONED chain — a wrong answer, not a stale one. Core erases through
+CustomRemove for the same reason (index/txospenderindex.cpp:135-139).
+
+The erase is exact rather than approximate because Core builds the same
+outpoint list for the connect and the disconnect side from the block alone
+(BuildSpenderPositions, :110-127), and so do we."
+  (let ((idx (and *node* (node-txospenderindex *node*))))
+    (when (and idx (bitcoin-lisp.storage:txospender-index-enabled idx)
+               (eq chainstate (node-validated-chainstate *node*)))
+      (handler-case
+          (bitcoin-lisp.storage:txospenderindex-remove-block idx block block-hash)
+        (error (e)
+          (log-warn "Spender index failed to remove block ~A: ~A"
+                    (bitcoin-lisp.crypto:bytes-to-hex block-hash) e)
+          nil)))))
+
 (defun do-reindex-chainstate ()
   "Rebuild the UTXO set from already-stored blocks (Bitcoin Core
 -reindex-chainstate): wipe the coins view, reset the chainstate to genesis,
@@ -4937,6 +5046,13 @@ thread; see the shutdown-coordination section above."
   (when (node-coinstatsindex *node*)
     (log-info "Closing coinstats index...")
     (bitcoin-lisp.storage:close-coinstatsindex (node-coinstatsindex *node*)))
+
+  ;; Close the spender index. Its LevelDB handle is no different from the
+  ;; others' — leaving it open on shutdown leaks the handle and leaves the
+  ;; database without a clean close.
+  (when (node-txospenderindex *node*)
+    (log-info "Closing spender index...")
+    (bitcoin-lisp.storage:close-txospender-index (node-txospenderindex *node*)))
 
   ;; Cleanup secp256k1
   (bitcoin-lisp.crypto:cleanup-secp256k1)
