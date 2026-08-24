@@ -862,6 +862,41 @@ generous +RECEIVE-STALL-TIMEOUT-SECONDS+ instead."
         (error () (return (%receive-gave-up conn)))))))
 
 (defun data-available-p (conn &key (timeout 0))
-  "Check if data is available to read on the connection."
+  "Check if data is available to read on the connection's SOCKET.
+
+Strictly the kernel's answer — poll(2) on the fd. It is what the EOF test in
+RECEIVE-BYTES-RESUMABLE needs (\"the socket said readable, yet a drain came
+back empty\"), and it is NOT the right question for \"is there another message
+to process\": see CONNECTION-INPUT-PENDING-P."
   (when (and (connection-socket conn) (connection-connected conn))
     (socket-input-ready-p (connection-socket conn) :timeout timeout)))
+
+(defun connection-input-pending-p (conn)
+  "T if another message could be read from CONN right now without blocking.
+
+The distinction from DATA-AVAILABLE-P is not academic. The readers pull bytes
+with LISTEN on the Lisp STREAM (DRAIN-AVAILABLE-BYTES), and a Lisp stream
+buffers: bytes the kernel handed over live in userspace, where poll(2) on the
+fd cannot see them. So two messages arriving in ONE TCP segment both land in
+the stream buffer, the first is read and dispatched, and a socket-only
+readiness check then says \"nothing more\" — leaving the second message sitting
+in a buffer we own until unrelated traffic happens to wake the socket again.
+
+Measured: Core's sync_with_ping deliberately sends two pings back to back
+(\"requires that the node calls ProcessMessage twice\"), and this node logged
+ELEVEN SECONDS between processing the first and the second. Any two messages
+that share a segment pay that, real peers included; it is not a test artefact.
+
+Ordered cheapest first, and deliberately does NOT include an in-progress
+partial read: a resumable receive with no bytes available must let the pump
+move on, or the drain loop spins."
+  (and (connection-socket conn)
+       (connection-connected conn)
+       (or
+        ;; Sniffed-ahead bytes from inbound v1/v2 detection, not yet served.
+        (and (connection-pushback conn) t)
+        ;; Bytes the kernel already handed to the stream.
+        (let ((stream (connection-stream conn)))
+          (and stream (ignore-errors (listen stream)) t))
+        ;; Bytes still in the kernel.
+        (data-available-p conn))))
