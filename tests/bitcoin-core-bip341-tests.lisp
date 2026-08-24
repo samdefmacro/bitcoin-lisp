@@ -541,3 +541,38 @@ Core accepts. No existing test covers budget initialisation: the tests above bin
     ;; Control: one sigop cheaper fits without any annex, so the rejection above
     ;; is the budget and not the script mechanics.
     (is (eq t (tapscript-leaf-spend (tapscript-weight-probe-script 2))))))
+
+(test discourage-op-success-is-policy-and-is-actually-read
+  "SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS was declared in +standard-policy-flags+
+and read by NOTHING, so we accepted into the mempool and RELAYED a tapscript
+containing OP_SUCCESSx that every Core node refuses as non-standard
+(interpreter.cpp:1845-1850).
+
+The flag is POLICY, not consensus — STANDARD_SCRIPT_VERIFY_FLAGS carries it
+(policy/policy.h:130) and MANDATORY_SCRIPT_VERIFY_FLAGS does not (:104-110).
+Getting that backwards would be a consensus bug: a block containing such a
+tapscript is VALID and must stay valid. Both directions are asserted here."
+  (let ((op-success #xbb))              ; OP_SUCCESS187 (BIP 342)
+    ;; Consensus: the block flag set has no DISCOURAGE_* at all, so
+    ;; OP_SUCCESSx still short-circuits to success. This must not change.
+    (let ((bitcoin-lisp.coalton.interop:*script-flags*
+            (let ((bitcoin-lisp:*network* :mainnet))
+              (bitcoin-lisp.validation:block-script-flags nil 900000))))
+      (is (eq t (tapscript-leaf-spend (tap-bytes op-success)))
+          "a block containing an OP_SUCCESS tapscript must stay valid"))
+    ;; Policy: the standard flag set carries DISCOURAGE_OP_SUCCESS, so the
+    ;; mempool refuses it.
+    (let ((bitcoin-lisp.coalton.interop:*script-flags*
+            bitcoin-lisp.validation:+standard-script-verify-flags+))
+      (multiple-value-bind (ok err) (tapscript-leaf-spend (tap-bytes op-success))
+        (is (null ok) "an OP_SUCCESS tapscript was accepted under policy flags")
+        (is (eq :discourage-op-success err)))))
+  ;; And the flag really is in the standard set and absent from the block set —
+  ;; a test that only exercised the interpreter would pass even if the two sets
+  ;; had been swapped.
+  (is-true (search "DISCOURAGE_OP_SUCCESS"
+                   bitcoin-lisp.validation:+standard-script-verify-flags+))
+  (let ((bitcoin-lisp:*network* :mainnet))
+    (is-false (member "DISCOURAGE_OP_SUCCESS"
+                      (bitcoin-lisp.validation:block-script-flags-list nil 900000)
+                      :test #'string=))))

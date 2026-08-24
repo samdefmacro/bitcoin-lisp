@@ -2977,3 +2977,186 @@ would strand children with missing inputs."
       (is (= 1 (length kept)))
       (is (= (* 2 cap) bytes))
       (is (= 0 dropped)))))
+
+;;;; --- mempool.dat interoperability with Bitcoin Core ----------------------
+
+(defun %mp-key8 (&rest bytes)
+  "An 8-byte obfuscation key as the typed vector OBFUSCATE! requires — a bare
+#(...) literal is a SIMPLE-VECTOR and fails its declared key type."
+  (make-array (length bytes) :element-type '(unsigned-byte 8)
+                             :initial-contents bytes))
+
+(defun %core-mempool-fixture-bytes (tx-bytes &key (key (%mp-key8 1 2 3 4 5 6 7 8))
+                                                  (entry-time 1700000000)
+                                                  (fee-delta 0))
+  "A one-transaction Core mempool.dat, assembled BYTE BY BYTE from the layout
+in node/mempool_persist.cpp rather than by calling our own writer.
+
+A round-trip against our own writer proves nothing about interoperability — it
+would pass just as happily if both halves were wrong together. This is the
+oracle: if Core's layout is what this function builds, and our reader parses
+it, then a Core dump loads here."
+  (let* ((payload
+           (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+             ;; u64 transaction count
+             (bitcoin-lisp.serialization:write-uint64-le s 1)
+             (write-sequence tx-bytes s)
+             (bitcoin-lisp.serialization:write-int64-le s entry-time)
+             (bitcoin-lisp.serialization:write-int64-le s fee-delta)
+             ;; compact-size mapDeltas count, then the unbroadcast set
+             (bitcoin-lisp.serialization:write-compact-size s 0)
+             (bitcoin-lisp.serialization:write-compact-size s 0)))
+         (obfuscated (copy-seq payload)))
+    ;; ⚠️ The key offset is the ABSOLUTE file position (streams.cpp:25-27), and
+    ;; the header is 8 bytes of version plus 9 bytes for the key's VECTOR
+    ;; serialization — a compact-size 0x08 then the 8 bytes. 17 is not a
+    ;; multiple of 8, so the first payload byte pairs with key byte 1.
+    (bitcoin-lisp.storage:obfuscate! obfuscated key :key-offset 17)
+    (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+      (bitcoin-lisp.serialization:write-uint64-le s 2)   ; MEMPOOL_DUMP_VERSION
+      (bitcoin-lisp.serialization:write-compact-size s 8)
+      (write-sequence key s)
+      (write-sequence obfuscated s))))
+
+(test mempool-dat-reads-a-file-laid-out-the-way-core-lays-one-out
+  "importmempool exists to move a mempool between nodes, and could not: we wrote
+a format of our own, so a Core dump was unreadable here and ours unreadable
+there.
+
+The fixture is assembled from Core's source layout, not from our writer."
+  (let* ((tx (make-mempool-test-tx))
+         (tx-bytes (bitcoin-lisp.serialization:transaction-wire-bytes tx))
+         (data (%core-mempool-fixture-bytes tx-bytes :entry-time 1700000000
+                                                     :fee-delta 1234)))
+    (multiple-value-bind (entries residual ok unbroadcast)
+        (bitcoin-lisp.mempool::read-core-mempool-file-bytes data)
+      (is-true ok "a Core-format mempool.dat did not parse")
+      (is (= 1 (length entries)))
+      (is (null residual))
+      (is (null unbroadcast))
+      (destructuring-bind (parsed time delta) (first entries)
+        (is (equalp (bitcoin-lisp.serialization:transaction-hash tx)
+                    (bitcoin-lisp.serialization:transaction-hash parsed)))
+        (is (= 1700000000 time))
+        (is (= 1234 delta))))))
+
+(test mempool-dat-header-is-exactly-cores-header
+  "The three header facts that decide interoperability, asserted on the bytes:
+a u64 version of 2, then the key as a VECTOR — a compact-size 0x08 and 8 bytes,
+nine on disk, not eight — and payload starting at absolute offset 17."
+  (let* ((tx-bytes (bitcoin-lisp.serialization:transaction-wire-bytes
+                    (make-mempool-test-tx)))
+         (data (%core-mempool-fixture-bytes tx-bytes)))
+    ;; u64 LE version 2
+    (is (equalp #(2 0 0 0 0 0 0 0) (subseq data 0 8)))
+    ;; compact-size 8, then the key itself, unobfuscated
+    (is (= 8 (aref data 8)))
+    (is (equalp (%mp-key8 1 2 3 4 5 6 7 8) (subseq data 9 17)))
+    ;; And the first payload byte is XORed with key byte 1, not key byte 0:
+    ;; the transaction count's low byte is 1, and 1 XOR key[1] = 1 XOR 2 = 3.
+    (is (= 3 (aref data 17))
+        "the payload is obfuscated from the wrong key offset")))
+
+(test mempool-dat-round-trips-through-our-own-writer
+  "And what we write is what we read — with the same key, byte-identical to the
+hand-built fixture, so the writer is pinned to the same layout as the reader."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (entry (make-mempool-entry-for-tx tx)))
+    (bitcoin-lisp.mempool:mempool-add mempool txid entry)
+    (let* ((key (%mp-key8 1 2 3 4 5 6 7 8))
+           (written (bitcoin-lisp.mempool::core-mempool-file-bytes mempool :key key)))
+      (is (equalp #(2 0 0 0 0 0 0 0) (subseq written 0 8)))
+      (is (= 8 (aref written 8)))
+      (is (equalp key (subseq written 9 17)))
+      (multiple-value-bind (entries residual ok) 
+          (bitcoin-lisp.mempool::read-core-mempool-file-bytes written)
+        (declare (ignore residual))
+        (is-true ok)
+        (is (= 1 (length entries)))
+        (is (equalp (bitcoin-lisp.serialization:transaction-hash tx)
+                    (bitcoin-lisp.serialization:transaction-hash
+                     (first (first entries)))))))))
+
+(test legacy-mempool-dat-still-loads-after-the-format-change
+  "The migration guarantee, and the reason the legacy reader is kept.
+
+Two live nodes have a mempool.dat on disk in the format this node used to
+write. If the reader only understood Core's, the first restart after this
+change would drop the entire mempool — and mempool reload logs nothing until it
+finishes, so on a large file that is a long outage indistinguishable from a
+wedge (the 2026-08-16 deploy: an 83 MB testnet4 dump, ~45 minutes of silence).
+
+The fixture writes the OLD layout by hand, because nothing writes it any more:
+  magic u32 | version u8 | count u32 |
+  [tx-len u32 | tx bytes | time u64 | delta i64]* |
+  residual u32 | [txid | delta]* | unbroadcast u32 | [txid]* | CRC32"
+  (let* ((tx (make-mempool-test-tx))
+         (tx-bytes (bitcoin-lisp.serialization:transaction-wire-bytes tx))
+         (path (merge-pathnames "legacy-mempool-test.dat" (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp.storage:save-file-with-crc32
+            path
+            (lambda (s)
+              (bitcoin-lisp.serialization:write-uint32-le
+               s bitcoin-lisp.mempool::+mempool-dat-magic+)
+              (bitcoin-lisp.serialization:write-uint8 s 2)
+              (bitcoin-lisp.serialization:write-uint32-le s 1)
+              (bitcoin-lisp.serialization:write-uint32-le s (length tx-bytes))
+              (write-sequence tx-bytes s)
+              (bitcoin-lisp.serialization:write-uint64-le s 1700000001)
+              (bitcoin-lisp.serialization:write-int64-le s 4321)
+              (bitcoin-lisp.serialization:write-uint32-le s 0)
+              (bitcoin-lisp.serialization:write-uint32-le s 0)))
+           (multiple-value-bind (entries residual ok)
+               (bitcoin-lisp.mempool:read-mempool-file path)
+             (declare (ignore residual))
+             (is-true ok "an existing legacy mempool.dat no longer loads")
+             (is (= 1 (length entries)))
+             (destructuring-bind (parsed time delta) (first entries)
+               (is (equalp (bitcoin-lisp.serialization:transaction-hash tx)
+                           (bitcoin-lisp.serialization:transaction-hash parsed)))
+               (is (= 1700000001 time))
+               (is (= 4321 delta)))))
+      (ignore-errors (delete-file path)))))
+
+(test mempool-dat-format-is-chosen-by-the-file-not-by-configuration
+  "The two formats are told apart by their first four bytes: the legacy magic is
+0x4d504c01, and a Core file opens with a u64 version of 1 or 2, so its first
+four bytes are 01 00 00 00 or 02 00 00 00 and can never collide."
+  (let* ((tx-bytes (bitcoin-lisp.serialization:transaction-wire-bytes
+                    (make-mempool-test-tx)))
+         (core-file (%core-mempool-fixture-bytes tx-bytes)))
+    ;; Core's first four bytes read as the version, never as our magic.
+    (is (/= bitcoin-lisp.mempool::+mempool-dat-magic+
+            (logior (aref core-file 0) (ash (aref core-file 1) 8)
+                    (ash (aref core-file 2) 16) (ash (aref core-file 3) 24))))
+    ;; An unknown version is refused rather than guessed at, as Core refuses it
+    ;; (node/mempool_persist.cpp:69).
+    (let ((bogus (copy-seq core-file)))
+      (setf (aref bogus 0) 99)
+      (is-false (nth-value 2 (bitcoin-lisp.mempool::read-core-mempool-file-bytes bogus))))))
+
+(test empty-mempool-dat-round-trips
+  "The case the live mainnet node actually hits: it relays nothing, so its
+mempool is empty and every shutdown writes an empty mempool.dat. An empty file
+must still be a WELL-FORMED one — 8 bytes of version, 9 for the key record, an
+8-byte zero count and two zero compact-sizes — or the next start reads a
+truncated file, decides it is corrupt, and logs a scary line about it forever."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (path (merge-pathnames "empty-mempool-test.dat" (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (is (= 0 (bitcoin-lisp.mempool:save-mempool-file mempool path)))
+           (multiple-value-bind (entries residual ok unbroadcast)
+               (bitcoin-lisp.mempool:read-mempool-file path)
+             (is-true ok "an empty mempool.dat did not read back")
+             (is (null entries))
+             (is (null residual))
+             (is (null unbroadcast)))
+           ;; 8 + 9 + 8 + 1 + 1: nothing optional is omitted.
+           (with-open-file (in path :element-type '(unsigned-byte 8))
+             (is (= 27 (file-length in)))))
+      (ignore-errors (delete-file path)))))

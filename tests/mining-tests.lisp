@@ -10,6 +10,26 @@
 
 (defun %zeros (n) (make-array n :element-type '(unsigned-byte 8) :initial-element 0))
 
+(defun %gbt-params (&rest extra)
+  "getblocktemplate params declaring segwit support, shaped the way the WIRE
+shapes them.
+
+Core REFUSES a template request whose \"rules\" array does not name segwit
+(rpc/mining.cpp:854), and every real miner and every one of Core's own
+functional tests sends {\"rules\": [\"segwit\"]}. Tests that called this RPC
+with NIL were exercising a request Core rejects.
+
+⚠️ Routed through %NORMALIZE-RPC-PARAMS deliberately. yason parses a JSON array
+as a vector, but the normalizer turns every NESTED one back into a LIST
+(rpc/server.lisp:338-356) before any handler sees it. A test that stuffs a
+vector straight into the request hash-table therefore exercises a shape no real
+client can send — which is exactly how a rules check that understood only
+vectors passed this entire suite while answering every real miner -8."
+  (let ((req (make-hash-table :test 'equal)))
+    (setf (gethash "rules" req) (vector "segwit"))
+    (loop for (k v) on extra by #'cddr do (setf (gethash k req) v))
+    (bitcoin-lisp.rpc::%normalize-rpc-params (vector req))))
+
 ;;;; Regtest network parameters
 
 (test regtest-network-params
@@ -358,7 +378,7 @@ chunk feerate diagram, not boundary knapsack optimality."
         (setf (bitcoin-lisp::node-chain-state node) cs
               (bitcoin-lisp::node-mempool node) mp
               (bitcoin-lisp::node-utxo-set node) (bitcoin-lisp.storage:make-utxo-set))
-        (let ((r (bitcoin-lisp.rpc::rpc-getblocktemplate node nil)))
+        (let ((r (bitcoin-lisp.rpc::rpc-getblocktemplate node (%gbt-params))))
           (is (= 1 (cdr (assoc "height" r :test #'string=))))
           (is (stringp (cdr (assoc "previousblockhash" r :test #'string=))))
           (is (= (bitcoin-lisp.validation:calculate-block-subsidy 1)
@@ -392,7 +412,7 @@ mempool churn, which is most of what a new template exists to report."
         (setf (bitcoin-lisp::node-chain-state node) cs
               (bitcoin-lisp::node-mempool node) mp
               (bitcoin-lisp::node-utxo-set node) (bitcoin-lisp.storage:make-utxo-set))
-        (let* ((r (bitcoin-lisp.rpc::rpc-getblocktemplate node nil))
+        (let* ((r (bitcoin-lisp.rpc::rpc-getblocktemplate node (%gbt-params)))
                (id (cdr (assoc "longpollid" r :test #'string=))))
           (is (= (+ 64 (length (princ-to-string
                                 (bitcoin-lisp.mempool:mempool-transactions-updated mp))))
@@ -527,8 +547,8 @@ which is what stops a busy mempool from reassembling a block on every call."
               (bitcoin-lisp::node-mempool node) mp
               (bitcoin-lisp::node-utxo-set node) (bitcoin-lisp.storage:make-utxo-set)
               bitcoin-lisp.rpc::*gbt-cache* nil)
-        (let ((a (bitcoin-lisp.rpc::rpc-getblocktemplate node nil))
-              (b (bitcoin-lisp.rpc::rpc-getblocktemplate node nil)))
+        (let ((a (bitcoin-lisp.rpc::rpc-getblocktemplate node (%gbt-params)))
+              (b (bitcoin-lisp.rpc::rpc-getblocktemplate node (%gbt-params))))
           (is (eq a b) "getblocktemplate reassembled an unchanged template"))))))
 
 (test rpc-getmininginfo-shape
@@ -1082,7 +1102,7 @@ the generate* paths pass the UTXO set, so all live templates are dry-run
         :coinbase-script-pubkey (%p2sh-optrue-spk)
         :utxo-set (bitcoin-lisp::node-utxo-set node)))
      ;; getblocktemplate takes the same guarded path.
-     (signals error (bitcoin-lisp.rpc::rpc-getblocktemplate node nil))
+     (signals error (bitcoin-lisp.rpc::rpc-getblocktemplate node (%gbt-params)))
      ;; generatetoaddress refuses to mine it.
      (signals error
        (bitcoin-lisp.rpc::rpc-generatetoaddress
@@ -1154,7 +1174,7 @@ because a proposal is by definition unmined."
       ;; A template this node just produced must validate as a proposal —
       ;; anything else means getblocktemplate is handing miners work the node
       ;; would itself reject.
-      (let* ((tmpl (bitcoin-lisp.rpc::rpc-getblocktemplate node nil))
+      (let* ((tmpl (bitcoin-lisp.rpc::rpc-getblocktemplate node (%gbt-params)))
              (prev (cdr (assoc "previousblockhash" tmpl :test #'string=))))
         (is-true prev "the template has no previousblockhash"))
       ;; Missing data is Core's type error, not a crash.
@@ -1172,3 +1192,169 @@ because a proposal is by definition unmined."
                    (bitcoin-lisp.serialization:serialize-witness-block stray))))
         (is (equal "inconclusive-not-best-prevblk" (propose hex))))))))
 
+
+;;;; --- getblocktemplate's contract with a real miner -----------------------
+
+(defun %gbt-norm (req)
+  "REQ as the params list a handler receives over the wire — through the same
+normalizer the server applies (rpc/server.lisp:825-826, :942-943), so a nested
+array arrives as the LIST a real client produces rather than the vector a test
+would otherwise hand it."
+  (bitcoin-lisp.rpc::%normalize-rpc-params (vector req)))
+
+(defun %gbt-node (&optional (network :regtest))
+  "A node with just enough state for getblocktemplate on NETWORK."
+  (multiple-value-bind (cs mp) (%mining-fixture)
+    (let ((node (bitcoin-lisp::make-node :network network)))
+      (setf (bitcoin-lisp::node-chain-state node) cs
+            (bitcoin-lisp::node-mempool node) mp
+            (bitcoin-lisp::node-utxo-set node) (bitcoin-lisp.storage:make-utxo-set))
+      node)))
+
+(defun %gbt-error-message (node params)
+  "The rpc-error message getblocktemplate signals for PARAMS, or NIL."
+  (handler-case (progn (bitcoin-lisp.rpc::rpc-getblocktemplate node params) nil)
+    (bitcoin-lisp.rpc::rpc-error (e) (bitcoin-lisp.rpc::rpc-error-message e))))
+
+(test gbt-requires-the-client-to-declare-segwit
+  "Core refuses a template request whose \"rules\" array does not name segwit,
+with this exact message (rpc/mining.cpp:853-855). We never read the array at
+all, so a pre-segwit miner was handed a segwit template instead of the error —
+it would have mined a block it could not have built correctly."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (expected "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})"))
+    (let ((node (%gbt-node)))
+      ;; No request object at all.
+      (is (equal expected (%gbt-error-message node nil)))
+      ;; A request object with no "rules" key.
+      (is (equal expected (%gbt-error-message node (list (make-hash-table :test 'equal)))))
+      ;; "rules" naming something else.
+      (let ((req (make-hash-table :test 'equal)))
+        (setf (gethash "rules" req) (vector "csv"))
+        (is (equal expected (%gbt-error-message node (%gbt-norm req)))))
+      ;; ⚠️ A BARE STRING is not an array. Core reads the rules only when
+      ;; isArray() (rpc/mining.cpp:753), and in CL a string IS a vector, so
+      ;; this is the shape that would wrongly read as ["segwit"] if the check
+      ;; were a plain vectorp.
+      (let ((req (make-hash-table :test 'equal)))
+        (setf (gethash "rules" req) "segwit")
+        (is (equal expected (%gbt-error-message node (%gbt-norm req)))))
+      ;; And declaring it works.
+      (is (null (%gbt-error-message node (%gbt-params)))))))
+
+(test gbt-requires-the-signet-rule-on-signet
+  "On a signet chain Core additionally requires \"signet\" in the rules, and
+checks it BEFORE segwit (rpc/mining.cpp:848-855)."
+  (let ((bitcoin-lisp:*network* :signet))
+    (let ((node (%gbt-node :signet))
+          (expected "getblocktemplate must be called with the signet rule set (call with {\"rules\": [\"segwit\", \"signet\"]})"))
+      ;; segwit alone is not enough on signet, and the SIGNET message is the
+      ;; one that comes back — the order matters.
+      (is (equal expected (%gbt-error-message node (%gbt-params))))
+      (is (equal expected (%gbt-error-message node nil))))
+    ;; Neither rule is required on a non-signet chain.
+    (let ((bitcoin-lisp:*network* :regtest))
+      (is (null (%gbt-error-message (%gbt-node :regtest) (%gbt-params)))))))
+
+(test gbt-signet-template-carries-the-challenge
+  "Core emits signet_challenge on a signet chain and nowhere else
+(rpc/mining.cpp:1017-1019). Without it a signet miner cannot construct the
+block's signet solution, so signet mining against this node could not work.
+The output \"rules\" array must also carry \"!signet\" (rpc/mining.cpp:951-955)."
+  (let* ((bitcoin-lisp:*network* :signet)
+         (node (%gbt-node :signet))
+         (req (make-hash-table :test 'equal)))
+    (setf (gethash "rules" req) (vector "segwit" "signet"))
+    (let* ((r (bitcoin-lisp.rpc::rpc-getblocktemplate node (%gbt-norm req)))
+           (challenge (cdr (assoc "signet_challenge" r :test #'string=)))
+           (rules (cdr (assoc "rules" r :test #'string=))))
+      (is-true (stringp challenge) "no signet_challenge in a signet template")
+      (is-true (plusp (length challenge)))
+      ;; It is the raw challenge script in hex — the same bytes getmininginfo
+      ;; reports, since both read signet-challenge-for-network.
+      (is (string= (bitcoin-lisp.crypto:bytes-to-hex
+                    (bitcoin-lisp.validation:signet-challenge-for-network :signet))
+                   challenge))
+      (is-true (member "!signet" rules :test #'string=))))
+  ;; And nowhere else.
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (r (bitcoin-lisp.rpc::rpc-getblocktemplate (%gbt-node) (%gbt-params))))
+    (is-false (assoc "signet_challenge" r :test #'string=))
+    (is-false (member "!signet" (cdr (assoc "rules" r :test #'string=)) :test #'string=))))
+
+(test gbt-refuses-a-mode-it-does-not-know
+  "Core accepts exactly \"template\" and \"proposal\" and throws \"Invalid mode\"
+otherwise (rpc/mining.cpp:762-763), and for a mode that is not a string at all
+(:717-726). We built a template for anything that was not the word proposal, so
+a miner that misspelled the mode silently got work it never asked for."
+  (let ((bitcoin-lisp:*network* :regtest))
+    (let ((node (%gbt-node)))
+      (dolist (bad (list "Template" "propose" "" "getwork"))
+        (let ((req (make-hash-table :test 'equal)))
+          (setf (gethash "rules" req) (vector "segwit")
+                (gethash "mode" req) bad)
+          (is (equal "Invalid mode" (%gbt-error-message node (%gbt-norm req)))
+              "mode ~S was accepted" bad)))
+      ;; A non-string mode is refused before anything else looks at it.
+      (let ((req (make-hash-table :test 'equal)))
+        (setf (gethash "rules" req) (vector "segwit")
+              (gethash "mode" req) 7)
+        (is (equal "Invalid mode" (%gbt-error-message node (%gbt-norm req)))))
+      ;; The two Core knows still work; an absent mode means "template".
+      (let ((req (make-hash-table :test 'equal)))
+        (setf (gethash "rules" req) (vector "segwit")
+              (gethash "mode" req) "template")
+        (is (null (%gbt-error-message node (%gbt-norm req))))))))
+
+(test gbt-output-rules-match-cores-base-list
+  "Core pushes \"csv\" UNCONDITIONALLY (rpc/mining.cpp:949), not gated on its
+activation height, and taproot carries NO \"!\" prefix because its
+VersionBitsDeploymentInfo sets gbt_optional_rule = true
+(deploymentinfo.cpp:17-18, gbt_rule_value at rpc/mining.cpp:605-611)."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (r (bitcoin-lisp.rpc::rpc-getblocktemplate (%gbt-node) (%gbt-params)))
+         (rules (cdr (assoc "rules" r :test #'string=))))
+    (is-true (member "csv" rules :test #'string=)
+             "csv must be present even at a height below its activation")
+    (is-false (member "!taproot" rules :test #'string=)
+              "taproot is an optional rule and takes no ! prefix")))
+
+(test gbt-rules-arrive-as-the-wire-delivers-them
+  "The regression guard for the shape a real miner actually sends.
+
+yason parses a JSON array as a vector, but %NORMALIZE-JSON-VALUE recurses into
+every request object and turns each nested non-empty vector back into a LIST
+(rpc/server.lisp:338-356). A rules check written against vectors therefore read
+NIL from every wire client and answered all of them -8, while passing a suite
+whose fixtures stuffed vectors straight into the hash-table.
+
+This test starts from the JSON text and goes through the real parser and the
+real normalizer, so it cannot be satisfied by a shape no client can send."
+  (let ((bitcoin-lisp:*network* :regtest))
+    (flet ((wire-params (json)
+             (let* ((req (let ((yason:*parse-json-booleans-as-symbols* t)
+                               (yason:*parse-json-arrays-as-vectors* t))
+                           (yason:parse json)))
+                    (raw (gethash "params" req)))
+               (bitcoin-lisp.rpc::%normalize-rpc-params raw))))
+      ;; What contrib/signet/miner and every Core functional test send.
+      (let ((params (wire-params "{\"params\":[{\"rules\":[\"segwit\"]}]}")))
+        (is (equal '("segwit") (bitcoin-lisp.rpc::%gbt-client-rules params))
+            "the wire shape of a rules array was not understood")
+        (is (null (%gbt-error-message (%gbt-node) params))))
+      ;; Several rules, as a signet miner sends.
+      (let ((params (wire-params "{\"params\":[{\"rules\":[\"segwit\",\"signet\"]}]}")))
+        (is (equal '("segwit" "signet") (bitcoin-lisp.rpc::%gbt-client-rules params))))
+      ;; A bare string is not an array, in Core or here.
+      (let ((params (wire-params "{\"params\":[{\"rules\":\"segwit\"}]}")))
+        (is (null (bitcoin-lisp.rpc::%gbt-client-rules params)))
+        (is-true (%gbt-error-message (%gbt-node) params)))
+      ;; An empty array folds to NIL, which is what an absent key gives — and
+      ;; that matches Core, where both leave setClientRules empty.
+      (let ((params (wire-params "{\"params\":[{\"rules\":[]}]}")))
+        (is (null (bitcoin-lisp.rpc::%gbt-client-rules params)))
+        (is-true (%gbt-error-message (%gbt-node) params)))
+      ;; A non-string element is a type error, as Core's get_str() makes it.
+      (let ((params (wire-params "{\"params\":[{\"rules\":[7]}]}")))
+        (is-true (search "not of expected type string"
+                         (or (%gbt-error-message (%gbt-node) params) "")))))))
