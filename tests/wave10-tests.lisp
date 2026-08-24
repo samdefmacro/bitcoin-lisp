@@ -246,9 +246,20 @@ maximum, and the reserve may not fall below MINIMUM_BLOCK_RESERVED_WEIGHT."
            bitcoin-lisp.mining:*block-reserved-weight*))))
 
 (test wave10-testmempoolaccept-count-limits
-  "testmempoolaccept enforces Core's 1..25 batch bound with -8."
+  "testmempoolaccept enforces Core's 1..25 batch bound with -8.
+
+The EMPTY-array case earns -8; a NULL rawtxs earns -3 instead, and the two
+were the same value here until the decoder could tell them apart. Core's
+RPCArg::MatchesType returns early for a null only when the argument is
+OPTIONAL (rpc/util.cpp:903); rawtxs is required, so null falls through to the
+type comparison and answers \"JSON value of type null is not of expected type
+array\". This test asserted -8 for NIL, which was our merged representation
+rather than either of Core's answers."
   (let ((node (make-test-node)))
     (is (= -8 (wave10-rpc-code
+               (lambda () (bitcoin-lisp.rpc::rpc-testmempoolaccept
+                           node (list bitcoin-lisp.rpc::+json-empty-array+))))))
+    (is (= -3 (wave10-rpc-code
                (lambda () (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list '()))))))
     (is (= -8 (wave10-rpc-code
                (lambda () (bitcoin-lisp.rpc::rpc-testmempoolaccept

@@ -458,7 +458,7 @@ key hash-set + a single append."
 (defun rpc-combinepsbt (node params)
   "Combine PSBTs for the same unsigned tx into one. PARAMS: (txs). Mirrors Core."
   (declare (ignore node))
-  (let ((b64s (first params)))
+  (let ((b64s (%positional-array (first params))))
     (unless (and (listp b64s) (>= (length b64s) 1))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "txs must be an array of base64 PSBTs"))
@@ -486,7 +486,7 @@ key hash-set + a single append."
 Mirrors Core joinpsbts (version=max, locktime=min, concatenated inputs/outputs;
 we do not shuffle indices)."
   (declare (ignore node))
-  (let ((b64s (first params)))
+  (let ((b64s (%positional-array (first params))))
     (unless (and (listp b64s) (>= (length b64s) 2))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "At least two PSBTs are required"))
     (let ((psbts (mapcar #'%psbt-decode-arg b64s))
@@ -809,7 +809,7 @@ return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
 and witness per input (prevout script types come from the UTXO set / mempool).
 PARAMS: (txs). Mirrors Core combinerawtransaction."
   (declare (ignore node))
-  (let ((hexes (first params)))
+  (let ((hexes (%positional-array (first params))))
     (unless (and (listp hexes) (>= (length hexes) 1))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "txs must be a non-empty array of hex transactions"))
