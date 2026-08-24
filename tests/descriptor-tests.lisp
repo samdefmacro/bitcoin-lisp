@@ -762,3 +762,62 @@ the reason a multipath import cannot carry a label (:203-206)."
     (let ((result (bitcoin-lisp.rpc::%process-multipath-import
                    :fake data 1 '("a" "b" "c"))))
       (is-false (cdr (assoc "success" result :test #'string=))))))
+
+;;;; --- Key expression order, and inference of wsh(<miniscript>) ------------
+
+(defun %dt-expand-pairs (desc-string)
+  "(values desc scripts pairs) for DESC-STRING at index 0, the way
+%SPKM-EXPANSION-PAIRS builds them for the wallet."
+  (let ((d (bitcoin-lisp.rpc::parse-descriptor desc-string :mainnet)))
+    (multiple-value-bind (scripts pubkeys)
+        (bitcoin-lisp.rpc::%out-desc-expand-cached d 0)
+      (values d scripts
+              (mapcar #'cons (bitcoin-lisp.rpc::out-desc-ordered-keys d) pubkeys)))))
+
+(test expansion-pubkeys-come-back-in-key-expression-order
+  "%SPKM-EXPANSION-PAIRS zips the expansion's pubkey list against
+OUT-DESC-ORDERED-KEYS, which is PARSE order, so the expansion must return parse
+order too.
+
+Script generation does not visit key expressions in parse order: andor(X,Y,Z)
+compiles to `X NOTIF Z ELSE Y ENDIF', so a collector that pushes in keyfn call
+order transposes Y and Z. The wallet then attributes a pubkey to the wrong key
+expression — the wrong origin in an inferred descriptor, and the wrong provider
+consulted when signing."
+  (let* ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
+         (b "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
+         (c "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
+    (multiple-value-bind (desc scripts pairs)
+        (%dt-expand-pairs (format nil "wsh(andor(pk(~A),pk(~A),pk(~A)))" a b c))
+      (declare (ignore desc scripts))
+      ;; Every pair must hold a key and the pubkey that key derives to.
+      (dolist (pair pairs)
+        (is (equalp (bitcoin-lisp.rpc::desc-key-pubkey (car pair)) (cdr pair))
+            "key expression paired with another expression's pubkey")))))
+
+(test wsh-miniscript-can-be-inferred-instead-of-crashing
+  "The subscript of wsh(<miniscript>) is an out-desc of kind :MINISCRIPT and the
+:WSH clause of %INFER-DESC-BODY recurses into it. With no :MINISCRIPT clause
+that recursion was an ECASE failure, i.e. RPC -32603 Internal error, reachable
+from getaddressinfo and listunspent for any wallet holding a policy descriptor."
+  (let* ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
+         (b "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
+         (c "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
+    (multiple-value-bind (desc scripts pairs)
+        (%dt-expand-pairs (format nil "wsh(and_v(v:pk(~A),older(42)))" a))
+      (let ((body (bitcoin-lisp.rpc::%infer-desc-body desc (first scripts) scripts pairs 0)))
+        (is-true (stringp body) "inference returned ~S" body)
+        (is-true (search "wsh(and_v(v:pk(" body))
+        (is-true (search "older(42))" body))
+        (is-true (search a body) "the concrete key is not in the inferred body")))
+    ;; And the andor case names each key in its own position, which is the
+    ;; whole point of the ordering fix above: an inferred descriptor with two
+    ;; keys transposed is a backup that restores a different wallet.
+    (multiple-value-bind (desc scripts pairs)
+        (%dt-expand-pairs (format nil "wsh(andor(pk(~A),pk(~A),pk(~A)))" a b c))
+      (let ((body (bitcoin-lisp.rpc::%infer-desc-body desc (first scripts) scripts pairs 0)))
+        (is-true (stringp body))
+        (let ((pa (search a body)) (pb (search b body)) (pc (search c body)))
+          (is-true (and pa pb pc) "not every key appears in the inferred body")
+          (is-true (< pa pb pc)
+                   "inferred keys are out of parse order: ~S" body))))))

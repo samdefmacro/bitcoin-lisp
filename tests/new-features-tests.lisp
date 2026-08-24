@@ -194,12 +194,145 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
 
 ;;;; Taproot Activation Height Tests
 
-(test taproot-flag-below-activation
-  "TAPROOT flag should not be present below activation height."
+(test p2sh-witness-taproot-are-on-for-every-block
+  "Core sets P2SH|WITNESS|TAPROOT for EVERY block and overrides only for the
+block hashes in script_flag_exceptions (GetBlockScriptFlags,
+validation.cpp:2259). It does NOT gate them on activation height.
+
+Gating them, as this node did until now, is a consensus divergence in the
+permissive direction: below segwit activation a spend of a v0 witness program
+with an empty scriptSig and no witness is WITNESS_PROGRAM_WITNESS_EMPTY to Core
+and anyone-can-spend to a node with WITNESS off. The proof that Core means
+always-on is its own comment at validation.cpp:2256-2257 — `For simplicity,
+always leave P2SH+WITNESS+TAPROOT on except for the two violating blocks.'"
+  (dolist (network '(:mainnet :testnet3 :testnet4 :signet :regtest))
+    (let ((bitcoin-lisp:*network* network))
+      (dolist (height '(0 1 100 170060 692261 709631 709632 900000))
+        (let ((flags (bitcoin-lisp.validation:block-script-flags-list nil height)))
+          (dolist (always '("P2SH" "WITNESS" "TAPROOT"))
+            (is-true (member always flags :test #'string=)
+                     "~A missing at ~A height ~D: ~S" always network height flags)))))))
+
+(test height-gated-flags-are-only-dersig-cltv-csv-nulldummy
+  "The four Core actually gates on height (validation.cpp:2266-2285). Each must
+be absent one block below its activation and present at it."
+  (let ((bitcoin-lisp:*network* :mainnet))
+    (flet ((has (height flag)
+             (and (member flag (bitcoin-lisp.validation:block-script-flags-list nil height)
+                          :test #'string=)
+                  t)))
+      ;; mainnet: BIP66 363725, BIP65 388381, CSV 419328, segwit 481824
+      (is-false (has 363724 "DERSIG"))
+      (is-true  (has 363725 "DERSIG"))
+      (is-false (has 388380 "CHECKLOCKTIMEVERIFY"))
+      (is-true  (has 388381 "CHECKLOCKTIMEVERIFY"))
+      (is-false (has 419327 "CHECKSEQUENCEVERIFY"))
+      (is-true  (has 419328 "CHECKSEQUENCEVERIFY"))
+      ;; BIP147 keys on the SEGWIT deployment, not one of its own.
+      (is-false (has 481823 "NULLDUMMY"))
+      (is-true  (has 481824 "NULLDUMMY")))))
+
+(test script-flag-exception-replaces-the-base-set-and-keeps-the-height-gated-ones
+  "Core does `flags = it->second' — the exception REPLACES the always-on set —
+and then still ORs the height-gated flags on top (validation.cpp:2260-2285).
+So the mainnet taproot exception block is verified with SIX flags, not the two
+in its table entry: at height 692,261 DERSIG, CLTV, CSV and NULLDUMMY are all
+long active. Substituting a bare \"P2SH,WITNESS\", as this node did, dropped
+four consensus rules for that block."
+  (let* ((bitcoin-lisp:*network* :mainnet)
+         (flags (bitcoin-lisp.validation:block-script-flags-list
+                 bitcoin-lisp.validation::*taproot-exception-mainnet* 692261)))
+    (is (equal '("CHECKLOCKTIMEVERIFY" "CHECKSEQUENCEVERIFY" "DERSIG"
+                 "NULLDUMMY" "P2SH" "WITNESS")
+               flags))
+    (is-false (member "TAPROOT" flags :test #'string=)
+              "the exception must disable TAPROOT and nothing else")))
+
+(test bip16-exception-blocks-are-script-verify-none-not-skipped
+  "Core maps both BIP16 exception blocks to SCRIPT_VERIFY_NONE
+(kernel/chainparams.cpp:85-86 mainnet, :218-219 testnet3). NONE means run every
+script with no flags — the scripts must still evaluate true. It does NOT mean
+skip validation, which is what this node did: it returned success without
+executing anything, accepting blocks Core rejects.
+
+At their heights no deployment has activated, so nothing is ORed back on and
+the flag set really is empty."
+  ;; The table entry itself, independent of any height — each on its OWN chain,
+  ;; because the table is per-chain consensus data.
+  (dolist (pair (list (cons :mainnet bitcoin-lisp.validation::*bip16-exception-mainnet*)
+                      (cons :testnet3 bitcoin-lisp.validation::*bip16-exception-testnet*)))
+    (let ((bitcoin-lisp:*network* (car pair)))
+      (multiple-value-bind (flags found)
+          (bitcoin-lisp.validation:script-flag-exception (cdr pair))
+        (is-true found "~A did not recognise its own BIP16 exception" (car pair))
+        (is (null flags) "the entry is SCRIPT_VERIFY_NONE"))))
+  ;; And at the mainnet block's height (170,060) no deployment has activated,
+  ;; so nothing is ORed back on and the effective set really is empty.
+  (let ((bitcoin-lisp:*network* :mainnet))
+    (is (null (bitcoin-lisp.validation:block-script-flags-list
+               bitcoin-lisp.validation::*bip16-exception-mainnet* 170060)))
+    (is (string= "" (bitcoin-lisp.validation:block-script-flags
+                     bitcoin-lisp.validation::*bip16-exception-mainnet* 170060)))))
+
+(test the-exception-table-is-per-chain-consensus-data
+  "script_flag_exceptions is a member of Consensus::Params (params.h:93) and is
+populated per chain: mainnet emplaces two (chainparams.cpp:85,87, inside
+CMainParams at :78), testnet3 one (:218, inside CTestNetParams at :211), and
+CTestNet4Params (:320), SigNetParams (:433) and CRegTestParams (:559) emplace
+NOTHING.
+
+A network-blind lookup would hand a regtest or signet block an exemption its
+own chain never granted — which on regtest is reachable by anyone who can mine,
+since the hash is the only thing being matched."
+  ;; Each chain sees only its own entries.
+  (let ((bitcoin-lisp:*network* :mainnet))
+    (is-true (nth-value 1 (bitcoin-lisp.validation:script-flag-exception
+                           bitcoin-lisp.validation::*bip16-exception-mainnet*)))
+    (is-true (nth-value 1 (bitcoin-lisp.validation:script-flag-exception
+                           bitcoin-lisp.validation::*taproot-exception-mainnet*)))
+    ;; testnet3's entry is not mainnet's.
+    (is-false (nth-value 1 (bitcoin-lisp.validation:script-flag-exception
+                            bitcoin-lisp.validation::*bip16-exception-testnet*))))
   (let ((bitcoin-lisp:*network* :testnet3))
-    (let ((flags (bitcoin-lisp.validation:compute-script-flags-for-height 100)))
-      (is (or (null flags)
-              (not (search "TAPROOT" flags)))))))
+    (is-true (nth-value 1 (bitcoin-lisp.validation:script-flag-exception
+                           bitcoin-lisp.validation::*bip16-exception-testnet*)))
+    (is-false (nth-value 1 (bitcoin-lisp.validation:script-flag-exception
+                            bitcoin-lisp.validation::*taproot-exception-mainnet*))))
+  ;; And the three chains with no table grant nothing to any hash.
+  (dolist (network '(:testnet4 :signet :regtest))
+    (let ((bitcoin-lisp:*network* network))
+      (dolist (hash (list bitcoin-lisp.validation::*bip16-exception-mainnet*
+                          bitcoin-lisp.validation::*bip16-exception-testnet*
+                          bitcoin-lisp.validation::*taproot-exception-mainnet*))
+        (is-false (nth-value 1 (bitcoin-lisp.validation:script-flag-exception hash))
+                  "~A has no exception table but granted one" network))))
+  (let ((bitcoin-lisp:*network* :mainnet))
+    (multiple-value-bind (flags found)
+        (bitcoin-lisp.validation:script-flag-exception
+         (bitcoin-lisp.crypto:hex-to-bytes
+          "00000000000000000000000000000000000000000000000000000000deadbeef"))
+      (is-false found "an unrelated hash must not be an exception")
+      (is (null flags)))
+    ;; Same height as the taproot exception, different block: full seven.
+    (is (equal '("CHECKLOCKTIMEVERIFY" "CHECKSEQUENCEVERIFY" "DERSIG"
+                 "NULLDUMMY" "P2SH" "TAPROOT" "WITNESS")
+               (bitcoin-lisp.validation:block-script-flags-list nil 692261)))))
+
+(test getdeploymentinfo-script-flags-is-an-array-even-when-empty
+  "Core's GetScriptFlagNames returns an empty vector for SCRIPT_VERIFY_NONE
+(interpreter.cpp:2200-2203) and blockchain.cpp:1530-1533 pushes it into a
+UniValue::VARR, so the field is `[]', never null.
+
+Making the always-on set exception-overridable is what made an EMPTY list
+reachable here for the first time, and a bare NIL renders as JSON null
+(see JSON-ARRAY, rpc/accessors.lisp:184)."
+  (let* ((bitcoin-lisp:*network* :mainnet)
+         (empty (bitcoin-lisp.validation:block-script-flags-list
+                 bitcoin-lisp.validation::*bip16-exception-mainnet* 170060)))
+    (is (null empty))
+    (is (equalp #() (bitcoin-lisp.rpc::json-array empty)))
+    (is (string= "[]" (with-output-to-string (s)
+                        (yason:encode (bitcoin-lisp.rpc::json-array empty) s))))))
 
 (test taproot-flag-at-activation
   "TAPROOT flag should be present at activation height."
@@ -214,17 +347,6 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
     (let ((flags (bitcoin-lisp.validation:compute-script-flags-for-height 800000)))
       (is (not (null flags)))
       (is (search "TAPROOT" flags)))))
-
-(test taproot-mainnet-activation-height
-  "Mainnet taproot activation should be at block 709632."
-  (let ((bitcoin-lisp:*network* :mainnet))
-    ;; One below: no TAPROOT
-    (let ((flags-below (bitcoin-lisp.validation:compute-script-flags-for-height 709631)))
-      (is (or (null flags-below)
-              (not (search "TAPROOT" flags-below)))))
-    ;; At activation: TAPROOT present
-    (let ((flags-at (bitcoin-lisp.validation:compute-script-flags-for-height 709632)))
-      (is (search "TAPROOT" flags-at)))))
 
 ;;;; BIP 30 Duplicate TXID Check Tests
 

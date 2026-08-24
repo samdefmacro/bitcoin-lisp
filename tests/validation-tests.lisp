@@ -1725,19 +1725,33 @@ block path accepted both."
     ;; same thing and must also fail.
     (is (null (%w8d-block-valid-p p2wpkh empty '() 800000)))))
 
-(test block-witnessless-v0-spend-legacy-pass-pre-segwit
-  "The same witnessless v0-program spends in a PRE-segwit-activation block
-(no WITNESS flag) are ordinary legacy scripts: the scriptPubKey pushes the
-program, top-of-stack is truthy, anyone-can-spend. Blanket rejection here
-would be the opposite consensus bug — mainnet IBD rejecting historical
-blocks (witness-program-shaped outputs were spendable pre-481824)."
+(test block-witnessless-v0-spend-rejected-below-segwit-activation-too
+  "The WITNESS flag is not height-gated, so this fails at 400,000 exactly as it
+fails at 800,000.
+
+This test asserted the opposite until the flags were aligned with Core, on the
+reasoning that rejecting here would break mainnet IBD because
+witness-program-shaped outputs were spendable before 481,824. That reasoning
+describes the network rules of 2016, not how Core validates history today.
+Core's GetBlockScriptFlags leaves P2SH+WITNESS+TAPROOT on for EVERY block and
+says why in as many words (validation.cpp:2250-2257): `only one historical
+block violated the P2SH rules ... For simplicity, always leave
+P2SH+WITNESS+TAPROOT on except for the two violating blocks.' Mainnet history
+is therefore already known to contain no such spend — if it did, Core would
+need a third exception entry and every Core node would fail IBD.
+
+Leaving WITNESS off below activation was the permissive half of a consensus
+split: this spend is WITNESS_PROGRAM_WITNESS_EMPTY (P2WSH) or
+WITNESS_PROGRAM_MISMATCH (P2WPKH) to Core and anyone-can-spend to us."
   (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
         (p2wpkh (%w8d-script #x00 #x14 (make-array 20 :element-type '(unsigned-byte 8)
                                                       :initial-element 7)))
         (p2wsh (%w8d-script #x00 #x20 (make-array 32 :element-type '(unsigned-byte 8)
                                                      :initial-element 9))))
-    (is (eq t (%w8d-block-valid-p p2wpkh empty nil 400000)))
-    (is (eq t (%w8d-block-valid-p p2wsh empty nil 400000)))))
+    (is (null (%w8d-block-valid-p p2wpkh empty nil 400000)))
+    (is (null (%w8d-block-valid-p p2wsh empty nil 400000)))
+    ;; And at a height where not one deployment has activated.
+    (is (null (%w8d-block-valid-p p2wsh empty nil 1)))))
 
 (test block-native-witness-nonempty-scriptsig-malleated
   "A native witness program spend with a NON-empty scriptSig fails under the
@@ -1758,8 +1772,7 @@ exactly empty (SCRIPT_ERR_WITNESS_MALLEATED, interpreter.cpp:2038-2041)."
 consensus-PASS with no witness (interpreter.cpp:1993-1998, upgradeable;
 DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM is policy-only and absent from block
 flags). Covers v2 programs, pay-to-anchor (interpreter.cpp:1991-1992), and
-v1 with a non-32/non-P2A length; also v1-taproot-shaped under WITNESS-only
-flags (TAPROOT not yet active, interpreter.cpp:1949)."
+v1 with a non-32/non-P2A length."
   (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
         (v2-prog (%w8d-script #x52 #x14 (make-array 20 :element-type '(unsigned-byte 8)
                                                        :initial-element 3)))
@@ -1771,10 +1784,37 @@ flags (TAPROOT not yet active, interpreter.cpp:1949)."
     (is (eq t (%w8d-block-valid-p v2-prog empty nil 800000)))
     (is (eq t (%w8d-block-valid-p p2a empty nil 800000)))
     (is (eq t (%w8d-block-valid-p v1-20 empty nil 800000)))
-    ;; v1/32 (taproot-shaped) WITHOUT the TAPROOT flag: upgradeable pass.
-    (is (eq t (%w8d-block-valid-p p2tr empty nil 500000)))
-    ;; v1/32 WITH the TAPROOT flag and no witness: WITNESS_EMPTY, fails.
-    (is (null (%w8d-block-valid-p p2tr empty nil 800000)))))
+    ;; v1/32 with no witness fails at EVERY height, because TAPROOT is not
+    ;; height-gated: WITNESS_EMPTY (interpreter.cpp:1949).
+    (is (null (%w8d-block-valid-p p2tr empty nil 800000)))
+    (is (null (%w8d-block-valid-p p2tr empty nil 500000)))))
+
+(test taproot-shaped-output-is-upgradeable-under-the-exception-blocks-flags
+  "v1/32 with no witness is an upgradeable pass when TAPROOT is off
+(interpreter.cpp:1948 returns success before the empty-stack check).
+
+Core reaches that flag combination in exactly one way — the mainnet taproot
+exception block, whose table entry is P2SH|WITNESS (chainparams.cpp:87-88) —
+and never by height, so this drives the flags directly rather than pretending
+some height produces them. It is the reason the exception exists: that block
+contains a witness-v1 spend that fails full BIP341 verification."
+  (let* ((bitcoin-lisp:*network* :mainnet)
+         (utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (prev-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element #xC6))
+         (p2tr (%w8d-script #x51 #x20 (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 2)))
+         (tx (%w8d-spend-tx prev-txid (make-array 0 :element-type '(unsigned-byte 8)) nil)))
+    (bitcoin-lisp.storage:add-utxo utxo-set prev-txid 0 1000000 p2tr 5)
+    ;; The exception block's own flag set: upgradeable, passes.
+    (is (eq t (bitcoin-lisp.validation:validate-transaction-scripts
+               tx utxo-set :height 692261
+               :flags (bitcoin-lisp.validation:block-script-flags
+                       bitcoin-lisp.validation::*taproot-exception-mainnet* 692261))))
+    ;; Any other block at that height has TAPROOT on: rejected.
+    (is (null (bitcoin-lisp.validation:validate-transaction-scripts
+               tx utxo-set :height 692261
+               :flags (bitcoin-lisp.validation:block-script-flags nil 692261))))))
 
 (test block-p2sh-wrapped-witness-program
   "P2SH-wrapped witness programs on the block path. The old path executed
@@ -1807,10 +1847,10 @@ is_p2sh (interpreter.cpp:1947 '!is_p2sh') and consensus-passes."
     (is (null (%w8d-block-valid-p p2sh-of-p2wsh p2wsh-sig nil 800000)))
     ;; Wrapped P2WPKH with NO witness: fails (WITNESS_PROGRAM_MISMATCH).
     (is (null (%w8d-block-valid-p p2sh-of-p2wpkh p2wpkh-sig nil 800000)))
-    ;; Pre-segwit flags: both are plain P2SH spends (redeem script pushes
-    ;; the program, truthy) and pass.
-    (is (eq t (%w8d-block-valid-p p2sh-of-p2wsh p2wsh-sig nil 400000)))
-    (is (eq t (%w8d-block-valid-p p2sh-of-p2wpkh p2wpkh-sig nil 400000)))
+    ;; Below segwit activation the answer is the SAME: WITNESS is not
+    ;; height-gated, so a wrapped v0 with no witness fails there too.
+    (is (null (%w8d-block-valid-p p2sh-of-p2wsh p2wsh-sig nil 400000)))
+    (is (null (%w8d-block-valid-p p2sh-of-p2wpkh p2wpkh-sig nil 400000)))
     ;; Wrapped v1/32, TAPROOT active, no witness: UNKNOWN version under
     ;; is_p2sh -> upgradeable, consensus-PASSES (the is-p2sh regression guard).
     (is (eq t (%w8d-block-valid-p p2sh-of-v1 v1-sig nil 800000)))))
@@ -1818,14 +1858,13 @@ is_p2sh (interpreter.cpp:1947 '!is_p2sh') and consensus-passes."
 (test block-witness-on-legacy-input-unexpected
   "Witness data attached to an input whose scriptPubKey is NOT a witness
 program (native or wrapped) fails under the WITNESS flag
-(SCRIPT_ERR_WITNESS_UNEXPECTED, interpreter.cpp:2110-2121); without the
-flag it is ignored at the input level (the block-level BIP144 commitment
-rule handles pre-activation blocks separately)."
+(SCRIPT_ERR_WITNESS_UNEXPECTED, interpreter.cpp:2110-2121). WITNESS is on for
+every block, so the height makes no difference."
   (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
         (op-true (%w8d-script #x51))
         (witness (list (%w8d-script #x01))))
     (is (null (%w8d-block-valid-p op-true empty witness 800000)))
-    (is (eq t (%w8d-block-valid-p op-true empty witness 400000)))
+    (is (null (%w8d-block-valid-p op-true empty witness 400000)))
     ;; IsNull() is stack.empty(): a witness of one ZERO-LENGTH item is
     ;; still "unexpected" (script.h CScriptWitness::IsNull).
     (is (null (%w8d-block-valid-p op-true empty
@@ -1859,8 +1898,48 @@ agreement underneath that gate."
     (bitcoin-lisp.storage:add-utxo utxo-set prev-txid 0 1000000 p2wpkh 5)
     (is (null (bitcoin-lisp.validation:validate-transaction-scripts
                tx utxo-set :height 800000)))
-    (is (eq t (bitcoin-lisp.validation:validate-transaction-scripts
+    ;; Same answer below segwit activation: WITNESS is not height-gated, and
+    ;; on the mempool path Core does not even consult the height — it uses the
+    ;; constant STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:118), which
+    ;; contains WITNESS and TAPROOT unconditionally.
+    (is (null (bitcoin-lisp.validation:validate-transaction-scripts
                tx utxo-set :height 400000)))))
+
+(test bip16-exception-flags-run-the-scripts-they-do-not-skip-them
+  "SCRIPT_VERIFY_NONE is a flag set, not a bypass. Under the two BIP16
+exception blocks' entry (chainparams.cpp:85-86, :218-219) Core still executes
+every script and still requires a true top-of-stack; it merely stops applying
+P2SH — so the scriptSig's push of the redeem script and the scriptPubKey's
+HASH160/EQUAL run as ordinary legacy opcodes.
+
+`validate-block-scripts' used to return success for these blocks without
+executing anything, which accepts blocks Core rejects."
+  (let* ((bitcoin-lisp:*network* :mainnet)
+         (none (bitcoin-lisp.validation:block-script-flags
+                bitcoin-lisp.validation::*bip16-exception-mainnet* 170060))
+         (op-true (%w8d-script #x51))
+         (op-false (%w8d-script #x00))
+         (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (is (string= "" none))
+    ;; The script-execution cache is keyed on (wtxid, flags), and the spent
+    ;; scriptPubKey is deliberately NOT in that key — in production an outpoint
+    ;; has exactly one scriptPubKey. Here the two cases differ ONLY in the
+    ;; scriptPubKey, so they build a byte-identical transaction and the second
+    ;; would silently inherit the first's verdict. Turn the cache off rather
+    ;; than rely on picking a prevout no other test happens to use.
+    (flet ((spends-p (spk sig)
+             (let* ((bitcoin-lisp.coalton.interop::*script-execution-cache-enabled* nil)
+                    (utxo-set (bitcoin-lisp.storage:make-utxo-set))
+                    (prev-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                              :initial-element #xC7))
+                    (tx (%w8d-spend-tx prev-txid sig nil)))
+               (bitcoin-lisp.storage:add-utxo utxo-set prev-txid 0 1000000 spk 5)
+               (bitcoin-lisp.validation:validate-transaction-scripts
+                tx utxo-set :height 170060 :flags none))))
+      ;; A satisfiable script still has to be satisfied.
+      (is (eq t (spends-p op-true empty)))
+      ;; And a false top-of-stack is still EVAL_FALSE, flags or no flags.
+      (is (null (spends-p op-false empty))))))
 
 ;;;; ==================================================================
 ;;;; GA9 S1-2 / S1-3: two consensus gates that accepted what Core rejects

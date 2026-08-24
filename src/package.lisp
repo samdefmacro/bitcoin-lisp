@@ -1178,6 +1178,10 @@
    #:header-time-too-old-p
    #:check-sequence-locks
    #:compute-script-flags-for-height
+   #:block-script-flags-list
+   #:block-script-flags
+   #:script-flag-exception
+   #:+always-on-block-script-flags+
    #:+standard-script-verify-flags+
    #:get-segwit-activation-height
    ;; Difficulty validation

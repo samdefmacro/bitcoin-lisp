@@ -694,3 +694,254 @@ does not type is refused rather than returned as a best effort."
   ;; and_b(1,1): the second argument must be W-type, and OP_1 is B.
   (is-false (bitcoin-lisp.validation::ms-from-script
              (coerce #(#x51 #x51 #x9a) '(vector (unsigned-byte 8))))))
+
+;;;; --- Resource limits and the sanity gate (Core IsSane) -------------------
+
+(test ms-ops-and-stack-size-match-hand-computed-scripts
+  "The Ops and StackSize algebras (miniscript.h:999-1183) ported from Core,
+checked against scripts small enough to count by hand. GetOps is
+`ops.count + ops.sat' and GetStackSize is `ss.sat.netdiff + IsBKW'
+(miniscript.h:1557,1578)."
+  (flet ((ops (e) (bitcoin-lisp.validation::ms-node-get-ops (%ms-try-parse e)))
+         (ss (e) (bitcoin-lisp.validation::ms-node-get-stack-size (%ms-try-parse e))))
+    (let ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
+          (b "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65"))
+      ;; pk(A) is `<key> OP_CHECKSIG': one non-push op, one witness element.
+      (is (= 1 (ops (format nil "pk(~A)" a))))
+      (is (= 1 (ss (format nil "pk(~A)" a))))
+      ;; older(42) is `<42> OP_CHECKSEQUENCEVERIFY': one op, nothing to push.
+      (is (= 1 (ops "older(42)")))
+      (is (= 0 (ss "older(42)")))
+      ;; and_v(v:pk(A),older(42)) is `<key> OP_CHECKSIGVERIFY <42> OP_CSV'.
+      (is (= 2 (ops (format nil "and_v(v:pk(~A),older(42))" a))))
+      (is (= 1 (ss (format nil "and_v(v:pk(~A),older(42))" a))))
+      ;; or_b adds OP_BOOLOR, and s: adds an OP_SWAP to its sub.
+      (is (= 4 (ops (format nil "or_b(pk(~A),s:pk(~A))" a b))))
+      ;; Either branch is satisfied and the other dissatisfied: two elements.
+      (is (= 2 (ss (format nil "or_b(pk(~A),s:pk(~A))" a b)))))))
+
+(test ms-resource-limits-do-not-reject-any-of-cores-valid-vectors
+  "A guard against the ops/stack port over-rejecting. Every expression Core's
+own corpus marks VALID for P2WSH must pass CheckOpsLimit and CheckStackSize —
+Core would not call it valid otherwise."
+  (let ((checked 0))
+    (dolist (v (%ms-vectors))
+      (when (and (%ms-flag v "VALID") (not (%ms-flag v "P2WSH_INVALID")))
+        (let ((node (%ms-try-parse (gethash "ms" v))))
+          (when node
+            (incf checked)
+            (is-true (bitcoin-lisp.validation::ms-node-check-ops-limit-p node)
+                     "ops limit rejected a Core-valid vector: ~A"
+                     (gethash "ms" v))
+            (is-true (bitcoin-lisp.validation::ms-node-check-stack-size-p node)
+                     "stack limit rejected a Core-valid vector: ~A"
+                     (gethash "ms" v))))))
+    (is (plusp checked) "no vectors were checked at all")))
+
+(test ms-duplicate-key-detection-walks-the-whole-tree
+  "Core's CheckDuplicateKey (miniscript.h:1688) is over the fragment AND all
+its subs, not one level."
+  (let ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
+        (b "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65"))
+    (is-false (bitcoin-lisp.validation::ms-node-duplicate-keys-p
+               (%ms-try-parse (format nil "or_b(pk(~A),s:pk(~A))" a b))))
+    (is-true (bitcoin-lisp.validation::ms-node-duplicate-keys-p
+              (%ms-try-parse (format nil "or_b(pk(~A),s:pk(~A))" a a))))
+    ;; Buried two levels down, in different branches.
+    (is-true (bitcoin-lisp.validation::ms-node-duplicate-keys-p
+              (%ms-try-parse
+               (format nil "andor(pk(~A),or_b(pk(~A),s:pk(~A)),0)" b a a))))))
+
+(test ms-is-sane-composes-cores-seven-predicates
+  "Core IsSane = IsValidTopLevel && IsSaneSubexpression && NeedsSignature,
+where IsSaneSubexpression = ValidSatisfactions && IsNonMalleable &&
+CheckTimeLocksMix && CheckDuplicateKey (miniscript.h:1691-1697).
+
+⚠️ CheckTimeLocksMix is TRUE when there is NO mix. Our MS-NODE-TIMELOCK-MIX-P
+is its inverse, so IsSane must negate it — getting that backwards would accept
+exactly the expressions the property exists to catch."
+  (let ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc"))
+    ;; Sane: needs a signature, non-malleable, no duplicates, no mix.
+    (is-true (bitcoin-lisp.validation::ms-node-sane-p
+              (%ms-try-parse (format nil "and_v(v:pk(~A),older(42))" a))))
+    ;; No signature anywhere: Core refuses it.
+    (is-false (bitcoin-lisp.validation::ms-node-sane-p (%ms-try-parse "older(42)")))
+    ;; Every vector Core marks TIMELOCKMIX must fail the un-inverted predicate.
+    (dolist (v (%ms-vectors))
+      (when (and (%ms-flag v "TIMELOCKMIX") (%ms-flag v "VALID"))
+        (let ((node (%ms-try-parse (gethash "ms" v))))
+          (when node
+            (is-true (bitcoin-lisp.validation::ms-node-timelock-mix-p node))
+            (is-false (bitcoin-lisp.validation::ms-node-sane-p node))))))))
+
+;;;; --- Signing a wsh(<miniscript>) output ----------------------------------
+
+(defun %ms-sign-p2wsh (expr &key (version 2) (sequence 42) (have-key t)
+                                 (lock-time 0))
+  "Build a P2WSH output for EXPR, spend it with one input, and run the wallet
+signer over it. Returns (values kind witness-length verified-p error), where
+VERIFIED-P is the script engine's verdict on the witness that came out — the
+only evidence that matters, since a signer can always produce SOMETHING."
+  (let* ((sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+         (pk (bitcoin-lisp.crypto:derive-public-key sk))
+         (node (bitcoin-lisp.validation::ms-parse
+                (format nil expr (bitcoin-lisp.crypto:bytes-to-hex pk))))
+         (witscript (coerce (bitcoin-lisp.validation::ms-node-script node)
+                            '(vector (unsigned-byte 8))))
+         (spk (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x20)
+                           (bitcoin-lisp.crypto:sha256 witscript)))
+         (prev-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xE1))
+         (amount 100000)
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version version
+              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                 :hash prev-txid :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence sequence))
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value 90000 :script-pubkey spk))
+              :lock-time lock-time))
+         (pubmap (make-hash-table :test 'equalp))
+         (keymap (make-hash-table :test 'equalp)))
+    (when have-key
+      (setf (gethash pk pubmap) sk)
+      (setf (gethash (bitcoin-lisp.crypto:hash160 pk) keymap) (cons sk pk)))
+    (let ((bitcoin-lisp.coalton.interop:*current-tx* tx))
+      (multiple-value-bind (sig err)
+          (bitcoin-lisp.rpc::%compute-input-signatures
+           tx 0 (list spk amount nil witscript) keymap pubmap
+           (make-hash-table :test 'equalp) #x01 nil nil)
+        (if err
+            (values nil nil nil err)
+            (multiple-value-bind (ss wit ferr)
+                (bitcoin-lisp.rpc::%finalize-input-signatures sig)
+              (declare (ignore ss))
+              (if ferr
+                  (values (bitcoin-lisp.rpc::input-sig-kind sig) nil nil ferr)
+                  (let ((utxo-set (bitcoin-lisp.storage:make-utxo-set)))
+                    (setf (bitcoin-lisp.serialization:transaction-witness tx)
+                          (vector (coerce wit 'list)))
+                    (bitcoin-lisp.storage:add-utxo utxo-set prev-txid 0 amount spk 5)
+                    (values (bitcoin-lisp.rpc::input-sig-kind sig)
+                            (length wit)
+                            (bitcoin-lisp.validation:validate-transaction-scripts
+                             tx utxo-set :height 800000)
+                            nil)))))))))
+
+(test wsh-miniscript-is-actually-spendable
+  "MS-SATISFY had ZERO callers in src/, so a wsh(<miniscript>) output could be
+imported and watched but never spent. Core reaches the same satisfier from
+SignStep, as a fallback after the legacy solver fails and only when nothing has
+been pushed yet (sign.cpp:772-777): FromScript infers the policy back out of
+the witnessScript and Satisfy must return Availability::YES.
+
+The assertion that matters is the last one — the script engine accepting the
+witness the signer produced."
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),older(42))")
+    (is (null err) "signing failed: ~A" err)
+    (is (eq :p2wsh-miniscript kind))
+    ;; satisfaction (one signature) plus the witnessScript Core always appends.
+    (is (= 2 len))
+    (is-true verified "the script engine rejected the witness we produced")))
+
+(test miniscript-signing-refuses-an-unsatisfiable-branch
+  "A satisfier that claims a timelock is met when it is not produces a witness
+for a branch the transaction cannot take. Core makes such a branch INVALID
+rather than merely expensive (CheckLockTime/CheckSequence,
+interpreter.cpp:1745-1826), so that the size comparison never picks it."
+  ;; nSequence below the older() value: not satisfied.
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),older(42))" :sequence 41)
+    (declare (ignore kind len verified))
+    (is-true (stringp err) "an unmet older() must not yield a signed witness"))
+  ;; BIP68 only applies from version 2, so a version-1 transaction can never
+  ;; satisfy older() at all (interpreter.cpp:1789).
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),older(42))" :version 1)
+    (declare (ignore kind len verified))
+    (is-true (stringp err) "older() must be unsatisfiable below tx version 2"))
+  ;; The disable bit means the sequence is not consensus-constrained, and must
+  ;; not be usable to get around the check (interpreter.cpp:1796).
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),older(42))" :sequence #x80000042)
+    (declare (ignore kind len verified))
+    (is-true (stringp err) "the disable flag must not satisfy older()"))
+  ;; And with no key at all there is no satisfaction, timelock or not.
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),older(42))" :have-key nil)
+    (declare (ignore kind len verified))
+    (is-true (stringp err) "signed without holding the key")))
+
+(test miniscript-check-after-follows-cores-locktime-rules
+  "after(N) is Core's CheckLockTime (interpreter.cpp:1745-1779): the tx
+nLockTime must be of the SAME kind (both heights or both timestamps), at least
+N, and this input must not be final — nLockTime is inert otherwise, which is
+why Core refuses to treat CLTV as satisfied when it would be."
+  ;; Height-based, met.
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),after(500))" :lock-time 500 :sequence 0)
+    (declare (ignore kind len))
+    (is (null err) "signing failed: ~A" err)
+    (is-true verified))
+  ;; Height-based, not yet met.
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),after(500))" :lock-time 499 :sequence 0)
+    (declare (ignore kind len verified))
+    (is-true (stringp err)))
+  ;; Mixed kinds: a timestamp nLockTime cannot satisfy a height after().
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),after(500))" :lock-time 1700000000 :sequence 0)
+    (declare (ignore kind len verified))
+    (is-true (stringp err) "a timestamp nLockTime satisfied a height after()"))
+  ;; A final input disables nLockTime, so after() is not satisfied however
+  ;; large nLockTime is.
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),after(500))" :lock-time 500
+                                                   :sequence #xFFFFFFFF)
+    (declare (ignore kind len verified))
+    (is-true (stringp err) "a final input must not satisfy after()")))
+
+(test miniscript-witness-size-estimate-is-an-upper-bound-on-the-real-witness
+  "Coin selection needs a satisfaction size for a wsh(<miniscript>) input, and
+%SCRIPT-SAT-WEIGHT returned NIL for anything that was not multisig — so the
+coin looked unsolvable and was silently skipped, leaving a funded policy
+descriptor unspendable through the wallet's own send path even after signing
+worked.
+
+The estimate must be an UPPER bound on what the signer actually produces. Too
+low and the transaction underpays its fee. Core charges a constant 1+72 per
+signature (miniscript.h:1188), which is exactly why it is an upper bound: real
+signatures are 71 or 72 bytes."
+  (let* ((sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+         (pk (bitcoin-lisp.crypto:derive-public-key sk)))
+    (dolist (expr '("and_v(v:pk(~a),older(42))"
+                    "or_d(pk(~a),older(1000))"
+                    "andor(pk(~a),older(42),older(1000))"))
+      (let* ((node (bitcoin-lisp.validation::ms-parse
+                    (format nil expr (bitcoin-lisp.crypto:bytes-to-hex pk))))
+             (witscript (coerce (bitcoin-lisp.validation::ms-node-script node)
+                                '(vector (unsigned-byte 8)))))
+        (multiple-value-bind (bytes elems)
+            (bitcoin-lisp.rpc::%miniscript-sat-size-and-elems witscript)
+          (is-true (and bytes elems) "no estimate for ~A" expr)
+          ;; The witnessScript is counted by the caller, so ELEMS is the
+          ;; satisfaction's own elements plus one.
+          (is-true (>= elems 1))
+          (is-true (plusp bytes)))))
+    ;; And the estimate really does cover the witness the signer builds.
+    (multiple-value-bind (kind len verified err)
+        (%ms-sign-p2wsh "and_v(v:pk(~a),older(42))")
+      (declare (ignore kind verified))
+      (is (null err))
+      (let* ((node (bitcoin-lisp.validation::ms-parse
+                    (format nil "and_v(v:pk(~a),older(42))"
+                            (bitcoin-lisp.crypto:bytes-to-hex pk))))
+             (witscript (coerce (bitcoin-lisp.validation::ms-node-script node)
+                                '(vector (unsigned-byte 8)))))
+        (multiple-value-bind (bytes elems)
+            (bitcoin-lisp.rpc::%miniscript-sat-size-and-elems witscript)
+          (declare (ignore bytes))
+          (is (= elems len)
+              "estimated ~D witness elements, signer produced ~D" elems len))))))

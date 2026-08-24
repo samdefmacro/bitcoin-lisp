@@ -3696,8 +3696,19 @@ taproot) using this node's per-network activation heights."
                         (bitcoin-lisp.storage:best-block-hash chain-state))))
     `(("hash" . ,(if best-hash (hash-to-hex best-hash) ""))
       ("height" . ,height)
-      ;; Script-verify flags active for a block at the tip (Core script_flags).
-      ("script_flags" . ,(bitcoin-lisp.validation::mandatory-script-flags-list height))
+      ;; Core reports GetScriptFlagNames(GetBlockScriptFlags(*blockindex, ...))
+      ;; (rpc/blockchain.cpp:1530-1533) — the flags for THAT BLOCK, so the
+      ;; script_flag_exceptions table applies and this must be keyed by hash,
+      ;; not by height. An exception block reports the shorter list, and the
+      ;; two BIP16 blocks report an empty array, exactly as GetScriptFlagNames
+      ;; returns {} for SCRIPT_VERIFY_NONE (interpreter.cpp:2201-2203).
+      ;; json-array, because SCRIPT_VERIFY_NONE is now REACHABLE here: an
+      ;; exception block's list is empty, and a bare NIL renders as JSON null
+      ;; where Core returns an empty array (GetScriptFlagNames returns an empty
+      ;; vector for NONE, interpreter.cpp:2200-2203, pushed into a VARR).
+      ("script_flags" . ,(json-array
+                          (bitcoin-lisp.validation:block-script-flags-list
+                           best-hash height)))
       ("deployments"
        . (("bip34" . ,(%buried-deployment (bitcoin-lisp.validation:get-bip34-activation-height network) height))
           ("bip66" . ,(%buried-deployment (bitcoin-lisp.validation:get-bip66-activation-height network) height))
@@ -5083,7 +5094,11 @@ REDEEM/WITNESS-SCRIPT are the P2SH/P2WSH sub-scripts to reveal."
   (tap nil)
   (needed 0 :type fixnum)
   (redeem nil)
-  (witness-script nil))
+  (witness-script nil)
+  ;; A finished witness stack, for kinds whose satisfaction is not m-of-n and
+  ;; so cannot be described by ECDSA + NEEDED: miniscript, where the satisfier
+  ;; chooses which branch to take and what to push for it.
+  (stack nil :type list))
 
 (defun %compute-input-signatures (tx i prev keymap pubmap tr-keymap sighash-byte
                                   precomp spent-utxos &optional (tap-sighash-type #x00))
@@ -5134,7 +5149,35 @@ must be bound by the caller."
                             (bitcoin-lisp.coalton.interop::compute-bip143-sighash
                              witscript amount sighash-byte)
                             pubmap pubkeys m sighash-byte)
-                           m))))
+                           m)))
+               (miniscript-stack (witscript)
+                 ;; Core's P2WSH miniscript arm (sign.cpp:772-777): only after
+                 ;; the legacy solver has failed, inferring the policy back out
+                 ;; of the witnessScript with FromScript and demanding a
+                 ;; COMPLETE satisfaction (Availability::YES). A partial one is
+                 ;; not a smaller witness, it is an unspendable one.
+                 ;;
+                 ;; A malleable satisfaction is refused outright. MS-SATISFY's
+                 ;; second value says a third party could rewrite the witness
+                 ;; into another equally valid one, which changes the txid of a
+                 ;; transaction already in flight.
+                 (let ((node (bitcoin-lisp.validation::ms-from-script witscript)))
+                   (when node
+                     (multiple-value-bind (stack malleable)
+                         (bitcoin-lisp.validation::ms-satisfy
+                          node
+                          (bitcoin-lisp.validation::make-ms-satisfier
+                           :sign-fn
+                           (lambda (pubkey)
+                             (let ((sk (gethash pubkey pubmap)))
+                               (when sk (bip143-sig witscript sk))))
+                           ;; No preimage source exists on this path; a hash
+                           ;; branch is simply unavailable rather than faked.
+                           :check-older-fn
+                           (lambda (v) (bitcoin-lisp.validation::ms-check-older tx i v))
+                           :check-after-fn
+                           (lambda (v) (bitcoin-lisp.validation::ms-check-after tx i v))))
+                       (and stack (not malleable) stack))))))
         (cond
           ((string= type "pubkeyhash")
            (let ((entry (gethash (subseq spk 3 23) keymap)))
@@ -5195,7 +5238,16 @@ must be bound by the caller."
                 ((null witness-script) (fail "P2SH-P2WSH requires witnessScript"))
                 ((not (equalp (bitcoin-lisp.crypto:sha256 witness-script) (subseq redeem 2 34)))
                  (fail "witnessScript hash mismatch (P2SH-P2WSH)"))
-                ((not (%parse-multisig witness-script)) (fail "witnessScript is not multisig"))
+                ;; Not multisig: Core's fallback is miniscript, not a refusal.
+                ((not (%parse-multisig witness-script))
+                 (cond
+                   ((null amount) (fail "P2WSH requires amount"))
+                   (t (let ((stack (miniscript-stack witness-script)))
+                        (if stack
+                            (values (%make-input-sig
+                                     :kind :p2sh-p2wsh-miniscript :redeem redeem
+                                     :witness-script witness-script :stack stack))
+                            (fail "witnessScript is not multisig"))))))
                 ((null amount) (fail "P2WSH requires amount"))
                 (t (multiple-value-bind (pairs m) (bip143-multisig witness-script)
                      (values (%make-input-sig :kind :p2sh-p2wsh :needed m :redeem redeem
@@ -5211,7 +5263,16 @@ must be bound by the caller."
              ((null witness-script) (fail "P2WSH requires witnessScript"))
              ((not (equalp (bitcoin-lisp.crypto:sha256 witness-script) (subseq spk 2 34)))
               (fail "witnessScript hash mismatch"))
-             ((not (%parse-multisig witness-script)) (fail "witnessScript is not multisig"))
+             ;; Not multisig: Core's fallback is miniscript, not a refusal.
+             ((not (%parse-multisig witness-script))
+              (cond
+                ((null amount) (fail "P2WSH requires amount"))
+                (t (let ((stack (miniscript-stack witness-script)))
+                     (if stack
+                         (values (%make-input-sig
+                                  :kind :p2wsh-miniscript
+                                  :witness-script witness-script :stack stack))
+                         (fail "witnessScript is not multisig"))))))
              ((null amount) (fail "P2WSH requires amount"))
              (t (multiple-value-bind (pairs m) (bip143-multisig witness-script)
                   (values (%make-input-sig :kind :p2wsh :needed m
@@ -5258,6 +5319,18 @@ error here (a missing key already failed in %compute-input-signatures)."
                                    (concatenate 'list (list empty) (sigs)
                                                 (list (input-sig-witness-script sig)))
                                    nil))))
+        ;; Miniscript: the satisfier already produced the whole stack, and there
+        ;; is no CHECKMULTISIG dummy to prepend. Core appends the witnessScript
+        ;; after the satisfaction unconditionally (sign.cpp:777).
+        (:p2wsh-miniscript
+         (values nil (append (input-sig-stack sig)
+                             (list (input-sig-witness-script sig)))
+                 nil))
+        (:p2sh-p2wsh-miniscript
+         (values (%script-push (input-sig-redeem sig))
+                 (append (input-sig-stack sig)
+                         (list (input-sig-witness-script sig)))
+                 nil))
         (:multisig (let ((err (threshold-error "")))
                      (if err
                          (values nil nil err)
