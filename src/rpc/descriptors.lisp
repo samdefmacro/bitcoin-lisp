@@ -587,11 +587,57 @@ refuses it elsewhere for the same reason."
                  ;; which is far more useful for the common typo.
                  (bitcoin-lisp.validation::miniscript-parse-error ()
                    (%desc-error "A function is needed within P2WSH")))))
-    (unless (bitcoin-lisp.validation::ms-node-valid-p node)
-      (%desc-error "Miniscript expression is not valid: '~A'" expr))
-    (unless (bitcoin-lisp.validation::ms-node-valid-top-level-p node)
-      (%desc-error "Miniscript expression is not valid at top level: '~A'" expr))
+    (%check-miniscript-sane node)
     (make-out-desc :kind :miniscript :node node :keys (nreverse keys))))
+
+(defun %check-miniscript-sane (node)
+  "Core's acceptance gate for a miniscript descriptor (descriptor.cpp:2604-2628):
+refuse unless `IsSane() && !IsNotSatisfiable()', and report which property
+failed, naming the first insane subexpression.
+
+We checked only IsValid and IsValidTopLevel, which is two of the seven things
+IsSane composes. The other five were reachable but unenforced, so
+importdescriptors accepted policies Core refuses: malleable ones (a third party
+can rewrite the witness and change the txid), ones satisfiable with NO
+signature at all, ones mixing block- and time-based locks in a single spend
+path (which does not mean what its author thinks), ones repeating a key, and
+ones whose satisfaction cannot fit the P2WSH resource limits.
+
+The branch ORDER is Core's and is load-bearing: malleability is reported ahead
+of the missing signature, and NeedsSignature is only ever blamed on the TOP
+node (`insane_node == &node.value()'), because a sub that needs no signature is
+fine as long as the whole expression does."
+  (let ((v (bitcoin-lisp.validation::ms-node-sane-p node))
+        (satisfiable (not (bitcoin-lisp.validation::ms-node-not-satisfiable-p node))))
+    (when (and v satisfiable)
+      (return-from %check-miniscript-sane node))
+    (let* ((sub (bitcoin-lisp.validation::ms-find-insane-sub node))
+           (blamed (or sub node))
+           (text (bitcoin-lisp.validation::ms-node-to-string
+                  blamed (lambda (k) (desc-key-string k :public)))))
+      (%desc-error
+       "~A"
+       (concatenate
+        'string text
+        (cond
+          ((not (bitcoin-lisp.validation::ms-node-valid-p blamed)) " is invalid")
+          ((not v)
+           (concatenate
+            'string " is not sane"
+            (cond
+              ((not (bitcoin-lisp.validation::ms-node-non-malleable-p blamed))
+               ": malleable witnesses exist")
+              ((and (null sub)
+                    (not (bitcoin-lisp.validation::ms-node-needs-signature-p blamed)))
+               ": witnesses without signature exist")
+              ((bitcoin-lisp.validation::ms-node-timelock-mix-p blamed)
+               ": contains mixes of timelocks expressed in blocks and seconds")
+              ((bitcoin-lisp.validation::ms-node-duplicate-keys-p blamed)
+               ": contains duplicate public keys")
+              ((not (bitcoin-lisp.validation::ms-node-valid-satisfactions-p blamed))
+               ": needs witnesses that may exceed resource limits")
+              (t ""))))
+          (t " is not satisfiable")))))))
 
 ;;; --- Multipath descriptors, BIP389 (Core descriptor.cpp:1802-1851) ---
 ;;;
@@ -1062,17 +1108,27 @@ derived / last-hardened xpubs exactly as Core caches them."
 expression, in expression order (feeds the SPKM's pubkey map). Signals
 descriptor-derivation-error when a needed cache entry or private key is
 missing (Core Expand/ExpandFromCache returning false)."
-  (let ((indexes (out-desc-key-indexes desc))
-        (pubkeys '()))
-    (let ((scripts (%out-desc-expand-1
-                    desc pos
-                    (lambda (key)
-                      (let ((pk (%desc-key-pubkey-at-cached
-                                 key (gethash key indexes) pos
+  (let* ((indexes (out-desc-key-indexes desc))
+         ;; Indexed by EXPRESSION index, not filled in call order. Script
+         ;; generation does not visit key expressions in parse order —
+         ;; `andor(X,Y,Z)' emits X NOTIF Z ELSE Y ENDIF
+         ;; (miniscript.lisp, the :ANDOR arm of the script builder) — so a
+         ;; push/nreverse here returned Y's and Z's pubkeys transposed, while
+         ;; %SPKM-EXPANSION-PAIRS zips this list against OUT-DESC-ORDERED-KEYS,
+         ;; which IS parse order. The wallet then believed a pubkey belonged to
+         ;; the wrong key expression: wrong origin in an inferred descriptor,
+         ;; wrong provider consulted when signing.
+         (slots (make-array (hash-table-count indexes) :initial-element nil))
+         (scripts (%out-desc-expand-1
+                   desc pos
+                   (lambda (key)
+                     (let* ((i (gethash key indexes))
+                            (pk (%desc-key-pubkey-at-cached
+                                 key i pos
                                  read-cache write-cache privkey-provider)))
-                        (push pk pubkeys)
-                        pk)))))
-      (values scripts (nreverse pubkeys)))))
+                       (when i (setf (aref slots i) pk))
+                       pk)))))
+    (values scripts (coerce slots 'list))))
 
 (defun out-desc-expand-from-cache (desc pos cache)
   "Expand DESC at POS strictly from CACHE (Core ExpandFromCache). Returns

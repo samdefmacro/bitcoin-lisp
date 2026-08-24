@@ -518,6 +518,23 @@ expression order. NIL when the descriptor kind cannot be inferred."
              (and sub (format nil "sh(~A)" sub))))
       (:wsh (let ((sub (%infer-desc-body (out-desc-sub desc) nil scripts pairs pos)))
               (and sub (format nil "wsh(~A)" sub))))
+      ;; The subscript of wsh(<miniscript>) is an out-desc of kind :MINISCRIPT
+      ;; (descriptors.lisp, %PARSE-MINISCRIPT-DESCRIPTOR), and the :WSH clause
+      ;; above recurses straight into it. Without this clause that recursion was
+      ;; an ECASE failure — RPC -32603 "Internal error" — reachable from
+      ;; getaddressinfo and listunspent for any wallet holding a policy
+      ;; descriptor. The miniscript renders itself with each key expression
+      ;; replaced by its concrete inferred key, which is what every other kind
+      ;; here does.
+      (:miniscript
+       (let ((solved t))
+         (let ((text (bitcoin-lisp.validation::ms-node-to-string
+                      (out-desc-node desc)
+                      (lambda (key)
+                        (let ((pair (assoc key pairs :test #'eq)))
+                          (cond (pair (key-string pair))
+                                (t (setf solved nil) "")))))))
+           (and solved text))))
       (:tr (format nil "tr(~A)" (key-string (first pairs) :xonly t)))
       (:rawtr (format nil "rawtr(~A)" (key-string (first pairs) :xonly t))))))
 

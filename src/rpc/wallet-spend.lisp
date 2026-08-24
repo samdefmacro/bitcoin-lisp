@@ -460,6 +460,28 @@ SCRIPT's position, or the coin control's external solving data."
   (multiple-value-bind (m) (%parse-multisig script)
     (when m (+ 1 (* (+ 1 +ecdsa-max-sig-size+) m)))))
 
+(defun %miniscript-sat-size-and-elems (witness-script)
+  "(values sat-bytes elems) for a miniscript WITNESS-SCRIPT, or NIL.
+
+Core's MiniscriptDescriptor answers these from m_node.GetWitnessSize() and
+m_node.GetStackSize() (descriptor.cpp:1684-1693), where m_node is the
+descriptor's own parse-time node. This estimator is reached with a SCRIPT
+rather than a descriptor, so it infers the node back out. The BYTE COUNT is
+identical either way — CalcWitnessSize charges a constant 1+72 per signature
+and 1+33 per pubkey rather than measuring the actual key (miniscript.h:1188).
+The one difference is that inference can fail where a descriptor's node cannot,
+and that errs conservative: the coin looks unsolvable and is skipped, never
+mis-sized.
+
+ELEMS adds one for the witnessScript itself, which the caller pushes and which
+GetWitnessSize deliberately excludes."
+  (let ((node (bitcoin-lisp.validation::ms-from-script witness-script)))
+    (when node
+      (let ((bytes (bitcoin-lisp.validation::ms-node-get-witness-size node))
+            (stack (bitcoin-lisp.validation::ms-node-get-stack-size node)))
+        (when (and bytes stack)
+          (values bytes (1+ stack)))))))
+
 (defun %script-sat-weight (wallet cc script)
   "(values sat-weight segwit-p elems) for the maximum satisfaction of
 SCRIPT, mirroring the descriptor MaxSatisfactionWeight arithmetic on the
@@ -510,12 +532,23 @@ descriptor InferDescriptor would produce; NIL when not solvable."
       (:witness-v0-scripthash
        (multiple-value-bind (redeem witness) (%known-sub-scripts wallet cc script)
          (declare (ignore redeem))
-         (let ((sat (and witness (%multisig-sat-size witness))))
-           (when sat
-             (multiple-value-bind (m) (%parse-multisig witness)
-               (values (+ (%compact-size-size (length witness))
-                          (length witness) sat)
-                       t (+ 2 m)))))))
+         (when witness
+           (let ((sat (%multisig-sat-size witness)))
+             (if sat
+                 (multiple-value-bind (m) (%parse-multisig witness)
+                   (values (+ (%compact-size-size (length witness))
+                              (length witness) sat)
+                           t (+ 2 m)))
+                 ;; Not multisig: try miniscript, or the coin looks unsolvable
+                 ;; and coin selection silently skips it — which is what kept a
+                 ;; funded policy descriptor unspendable through the wallet's
+                 ;; own send path even once signing worked.
+                 (multiple-value-bind (msat elems)
+                     (%miniscript-sat-size-and-elems witness)
+                   (when msat
+                     (values (+ (%compact-size-size (length witness))
+                                (length witness) msat)
+                             t elems))))))))
       (t nil))))
 
 (defun %max-input-weight (wallet cc script &key (tx-is-segwit t))

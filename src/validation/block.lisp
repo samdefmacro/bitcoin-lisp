@@ -335,28 +335,64 @@ plus every policy flag. This is what MemPoolAccept::PolicyScriptChecks runs
 the mempool only ever validates against the current tip where every
 deployment is active.")
 
-(defun mandatory-script-flags-list (height)
-  "Mandatory consensus flags active at HEIGHT, as a list of strings.
-   P2SH is included unconditionally; DERSIG/CLTV/CSV/WITNESS/NULLDUMMY/TAPROOT
-   gate on their activation heights for the current network."
-  (let ((flags (list "P2SH"))
-        (network bitcoin-lisp:*network*))
+(defparameter +always-on-block-script-flags+
+  '("P2SH" "WITNESS" "TAPROOT")
+  "The flags Core turns on for EVERY block, whatever its height
+(GetBlockScriptFlags, validation.cpp:2259).
+
+Gating these on activation height — which this did until now — is a consensus
+divergence, and not a theoretical one: a block below segwit activation that
+spends a v0 witness program with an empty scriptSig and no witness is
+WITNESS_PROGRAM_WITNESS_EMPTY to Core and ANYONE-CAN-SPEND to a node that
+leaves WITNESS off. The same argument applies to TAPROOT below 709,632.
+
+Core can afford to leave them on because it carries a table of the handful of
+historic blocks that break a rule (SCRIPT-FLAG-EXCEPTION below), and it says so
+outright: `For simplicity, always leave P2SH+WITNESS+TAPROOT on except for the
+two violating blocks' (validation.cpp:2256-2257).
+
+That comment is the citation. A second argument is that the mainnet taproot
+exception block sits below taproot activation, so the entry would be
+unreachable under height-gating — but note that the height is a property of the
+chain, not of Core's source: chainparams.cpp records only the block HASH for
+all three entries, never a height.")
+
+(defun %or-height-gated-script-flags (flags height)
+  "OR onto FLAGS the deployments that have activated at HEIGHT
+(GetBlockScriptFlags, validation.cpp:2266-2285).
+
+Core applies these AFTER any script_flag_exceptions override, which is the
+whole reason this is a separate step: an exception replaces the base set and
+still gets every rule its height has activated.
+
+Returns the list sorted, because Core's GetScriptFlagNames walks a std::map
+keyed by name and so reports flags alphabetically (interpreter.cpp:2168-2211);
+`getdeploymentinfo' hands that array straight to the caller."
+  (let ((network bitcoin-lisp:*network*))
     (when (>= height (get-bip66-activation-height network))
       (push "DERSIG" flags))
     (when (>= height (get-bip65-activation-height network))
       (push "CHECKLOCKTIMEVERIFY" flags))
     (when (>= height (get-csv-activation-height network))
       (push "CHECKSEQUENCEVERIFY" flags))
+    ;; BIP147 activated simultaneously with segwit, and Core keys it on the
+    ;; SEGWIT deployment rather than on a NULLDUMMY one (validation.cpp:2283).
     (when (>= height (get-segwit-activation-height network))
-      (push "WITNESS" flags)
       (push "NULLDUMMY" flags))
-    (when (>= height (get-taproot-activation-height network))
-      (push "TAPROOT" flags))
-    (nreverse flags)))
+    (sort flags #'string<)))
+
+(defun mandatory-script-flags-list (height)
+  "Block script flags at HEIGHT for a block with no script-flag exception:
+the always-on set plus whatever HEIGHT has activated.
+
+Callers that HAVE the block hash must use BLOCK-SCRIPT-FLAGS-LIST instead —
+this one cannot see the exception table."
+  (%or-height-gated-script-flags
+   (copy-list +always-on-block-script-flags+) height))
 
 (defun compute-script-flags-for-height (height)
-  "Comma-separated MANDATORY script verification flags for block validation at HEIGHT
-   (Bitcoin Core: MANDATORY_SCRIPT_VERIFY_FLAGS)."
+  "Comma-separated block script verification flags at HEIGHT, for a block with
+no script-flag exception (Bitcoin Core GetBlockScriptFlags)."
   (format nil "~{~A~^,~}" (mandatory-script-flags-list height)))
 
 
@@ -383,6 +419,68 @@ deployment is active.")
   (bitcoin-lisp.crypto:reverse-bytes
    (bitcoin-lisp.crypto:hex-to-bytes "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"))
   "Block hash validated with P2SH|WITNESS only on mainnet (little-endian).")
+
+(defun script-flag-exception (block-hash)
+  "Core's consensus.script_flag_exceptions for BLOCK-HASH
+(kernel/chainparams.cpp:85-88 mainnet, :218-219 testnet3; testnet4, signet and
+regtest have no entries).
+
+Returns (VALUES FLAGS FOUND-P). FLAGS is the BASE flag set that REPLACES the
+always-on set — NIL means SCRIPT_VERIFY_NONE, which is exactly why the second
+value has to exist: an empty list and `no entry' are the same object in CL.
+
+Two things about how Core uses this table are easy to get backwards, and both
+were wrong here before:
+
+  - the entry REPLACES the base set and is then still ORed with the height-gated
+    flags (validation.cpp:2260-2285). The mainnet taproot exception is
+    P2SH|WITNESS, but the block sits at height 692,261, where DERSIG, CLTV, CSV
+    and NULLDUMMY are all long active — so it is verified with SIX flags, not
+    two. An exception disables the rule the block broke, not every rule.
+  - SCRIPT_VERIFY_NONE means run every script with no flags. It does NOT mean
+    skip validation: the scripts must still evaluate true, and a block whose
+    scripts are outright invalid is still rejected."
+  (ecase bitcoin-lisp:*network*
+    (:mainnet
+     (cond ((equalp block-hash *bip16-exception-mainnet*) (values '() t))
+           ((equalp block-hash *taproot-exception-mainnet*)
+            (values (list "P2SH" "WITNESS") t))
+           (t (values nil nil))))
+    (:testnet3
+     (if (equalp block-hash *bip16-exception-testnet*)
+         (values '() t)
+         (values nil nil)))
+    ;; testnet4, signet and regtest emplace nothing (chainparams.cpp:320, :433,
+    ;; :559 have no script_flag_exceptions at all). The table is per-chain
+    ;; consensus data, so matching a mainnet hash on regtest would hand a
+    ;; block an exemption its own chain never granted.
+    ((:testnet4 :signet :regtest) (values nil nil))))
+
+(defun block-script-flags-list (block-hash height)
+  "Script verification flags for the block BLOCK-HASH names at HEIGHT, as a
+sorted list of strings. This is Core's GetBlockScriptFlags
+(validation.cpp:2255-2287) in full:
+
+    base = P2SH | WITNESS | TAPROOT              ; every block
+    if hash in script_flag_exceptions: base = that entry   ; REPLACES
+    then OR DERSIG / CLTV / CSV / NULLDUMMY that are active at HEIGHT
+
+Every consensus caller that has the block hash must use this rather than
+MANDATORY-SCRIPT-FLAGS-LIST, and that means the sigop counter as well as the
+script checker: Core feeds the same GetBlockScriptFlags result into
+GetTransactionSigOpCost (validation.cpp ConnectBlock), so the exception has to
+reach sigop accounting too or the BIP16 exception block is counted with P2SH
+sigops Core does not count."
+  (multiple-value-bind (exception found) (script-flag-exception block-hash)
+    (%or-height-gated-script-flags
+     (copy-list (if found exception +always-on-block-script-flags+))
+     height)))
+
+(defun block-script-flags (block-hash height)
+  "BLOCK-SCRIPT-FLAGS-LIST as the comma-separated string the script engine
+consumes. An empty string is SCRIPT_VERIFY_NONE: PARSE-FLAGS-TO-SET splits it
+into one empty token, which matches no flag name."
+  (format nil "~{~A~^,~}" (block-script-flags-list block-hash height)))
 
 ;;;; Difficulty adjustment validation
 
@@ -671,13 +769,6 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
   (values t nil))
 
 ;;;; Block script validation
-
-(defun block-is-bip16-exception-p (block)
-  "Check if this block is a BIP 16 exception that should skip script validation."
-  (let ((block-hash (bitcoin-lisp.serialization:block-header-hash
-                     (bitcoin-lisp.serialization:bitcoin-block-header block))))
-    (or (equalp block-hash *bip16-exception-testnet*)
-        (equalp block-hash *bip16-exception-mainnet*))))
 
 (defparameter +parallel-validation-min-txs+ 16
   "Below this tx count we validate sequentially — thread-spawn overhead
@@ -978,24 +1069,20 @@ read and is not synchronized."
   "Validate all non-coinbase transaction scripts in BLOCK via Coalton interop.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
 Uses validate-input-script for each input (shared with transaction validation).
-Blocks matching BIP 16 exception hashes skip all script validation.
-HEIGHT is used to determine which script verification flags to enable.
+The block's HASH and HEIGHT together choose the flags, via BLOCK-SCRIPT-FLAGS.
 EXTRA-COINS is the block's intra-block coin overlay — the outputs created by
 its own earlier transactions, which the confirmed UTXO set does not hold.
 Core has already applied them to its coins view by the time it script-checks
-a chained spend (UpdateCoins, validation.cpp:2597)."
-  ;; Check for BIP 16 exception block - skip ALL script validation
-  (when (block-is-bip16-exception-p block)
-    (return-from validate-block-scripts (values t nil)))
+a chained spend (UpdateCoins, validation.cpp:2597).
 
+An exception block is NOT skipped. Core runs its scripts under the exception's
+flag set — SCRIPT_VERIFY_NONE for the two BIP16 blocks — so the scripts must
+still evaluate true. Returning success without executing them, as this did
+until now, accepts blocks Core rejects."
   (let ((script-flags
-          ;; Taproot script-flag exception (Core script_flag_exceptions): that
-          ;; one mainnet block validates with P2SH|WITNESS only.
-          (if (equalp (bitcoin-lisp.serialization:block-header-hash
-                       (bitcoin-lisp.serialization:bitcoin-block-header block))
-                      *taproot-exception-mainnet*)
-              "P2SH,WITNESS"
-              (compute-script-flags-for-height height)))
+          (block-script-flags (bitcoin-lisp.serialization:block-header-hash
+                               (bitcoin-lisp.serialization:bitcoin-block-header block))
+                              height))
         (transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
     ;; For non-tiny blocks, parallelize tx-script validation across workers
     ;; — but ONLY when explicitly enabled. The per-block worker threads are
@@ -1711,8 +1798,14 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
            (spent-outpoints (make-hash-table :test 'equalp))
            ;; Gate P2SH/witness sigop counting on the block's active flags,
            ;; exactly as Bitcoin Core passes GetBlockScriptFlags into
-           ;; GetTransactionSigOpCost. Same source of truth as script validation.
-           (active-flags (mandatory-script-flags-list current-height))
+           ;; GetTransactionSigOpCost. Same source of truth as script validation,
+           ;; and that means BY BLOCK HASH: the exception table has to reach here
+           ;; too. The BIP16 exception block is SCRIPT_VERIFY_NONE, so Core does
+           ;; not count its P2SH sigops, and a height-only lookup would.
+           (active-flags (block-script-flags-list
+                          (bitcoin-lisp.serialization:block-header-hash
+                           (bitcoin-lisp.serialization:bitcoin-block-header block))
+                          current-height))
            (count-p2sh (and (member "P2SH" active-flags :test #'string=) t))
            (count-witness (and (member "WITNESS" active-flags :test #'string=) t)))
 

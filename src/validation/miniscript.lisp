@@ -103,6 +103,67 @@ measured in 512-second units rather than blocks.")
 
 (defconstant +ms-max-pubkeys-per-multisig+ 20)
 
+(defconstant +ms-sequence-final+ #xFFFFFFFF
+  "Core CTxIn::SEQUENCE_FINAL.")
+
+(defconstant +ms-sequence-locktime-disable-flag+ #x80000000
+  "Core CTxIn::SEQUENCE_LOCKTIME_DISABLE_FLAG.")
+
+(defconstant +ms-sequence-locktime-mask+ #x0000FFFF
+  "Core CTxIn::SEQUENCE_LOCKTIME_MASK.")
+
+(defun ms-check-after (tx input-index value)
+  "Core's CheckLockTime (interpreter.cpp:1745-1779), which is what a satisfier
+answers for `after(VALUE)': is this absolute timelock ALREADY satisfied by the
+transaction being built?
+
+A satisfier that says yes when it is not produces a witness for a branch the
+transaction cannot yet take — Core makes such a branch INVALID rather than
+merely expensive, so that the size comparison never picks it."
+  (let ((tx-locktime (bitcoin-lisp.serialization:transaction-lock-time tx))
+        (inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
+    (and
+     ;; Compare apples to apples: both heights, or both timestamps.
+     (or (and (< tx-locktime +ms-locktime-threshold+)
+              (< value +ms-locktime-threshold+))
+         (and (>= tx-locktime +ms-locktime-threshold+)
+              (>= value +ms-locktime-threshold+)))
+     (<= value tx-locktime)
+     ;; nLockTime is inert unless this input is non-final, so Core refuses to
+     ;; treat CLTV as satisfied when the input would disable it.
+     (< input-index (length inputs))
+     (/= +ms-sequence-final+
+         (bitcoin-lisp.serialization:tx-in-sequence (aref inputs input-index)))
+     t)))
+
+(defun ms-check-older (tx input-index value)
+  "Core's CheckSequence (interpreter.cpp:1781-1826), which is what a satisfier
+answers for `older(VALUE)': is this relative timelock already satisfied by the
+input's own nSequence?"
+  (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
+    (and
+     (< input-index (length inputs))
+     ;; BIP68 only applies from version 2.
+     (>= (bitcoin-lisp.serialization:transaction-version tx) 2)
+     (let ((seq (bitcoin-lisp.serialization:tx-in-sequence
+                 (aref inputs input-index))))
+       (and
+        ;; A sequence with the disable bit set is not consensus-constrained,
+        ;; and must not be usable to get around a CHECKSEQUENCEVERIFY.
+        (zerop (logand seq +ms-sequence-locktime-disable-flag+))
+        (let* ((mask (logior +ms-sequence-locktime-type-flag+
+                             +ms-sequence-locktime-mask+))
+               (seq-masked (logand seq mask))
+               (value-masked (logand value mask)))
+          (and
+           ;; Both block-based, or both time-based.
+           (or (and (< seq-masked +ms-sequence-locktime-type-flag+)
+                    (< value-masked +ms-sequence-locktime-type-flag+))
+               (and (>= seq-masked +ms-sequence-locktime-type-flag+)
+                    (>= value-masked +ms-sequence-locktime-type-flag+)))
+           (<= value-masked seq-masked)
+           t)))))))
+
 (defun ms-sanitize-type (type)
   "Core SanitizeType (miniscript.cpp:19-37): zero unless exactly one base type
 is present, and check the properties that cannot coexist.
@@ -458,9 +519,28 @@ is how every rule violation surfaces — there is no separate error channel."
               (handler-case (length (ms-node-script node)) (error () 0))))
     node))
 
+(defconstant +ms-max-p2wsh-script-size+ 3600
+  "Core MAX_STANDARD_P2WSH_SCRIPT_SIZE (policy/policy.h:51), which is what
+internal::MaxScriptSize returns outside tapscript (miniscript.h:293).")
+
+(defconstant +ms-max-p2wsh-stack-items+ 100
+  "Core MAX_STANDARD_P2WSH_STACK_ITEMS (policy/policy.h:53).")
+
+(defconstant +ms-max-ops-per-script+ 201
+  "Core MAX_OPS_PER_SCRIPT (script/script.h:31).")
+
 (defun ms-node-valid-p (node)
-  "T when NODE typed successfully."
-  (and node (plusp (ms-node-node-type node))))
+  "Core Node::IsValid (miniscript.h:1670): the expression typed successfully
+AND its script fits the context's size limit.
+
+The size half was missing here. Core's IsValid is `GetType() != \"\" &&
+ScriptSize() <= MaxScriptSize(ctx)', and outside tapscript MaxScriptSize is
+MAX_STANDARD_P2WSH_SCRIPT_SIZE (miniscript.h:293). Without it every predicate
+built on IsValid — IsValidTopLevel, ValidSatisfactions, IsSane — was weaker
+than Core's."
+  (and node
+       (plusp (ms-node-node-type node))
+       (<= (ms-node-script-size node) +ms-max-p2wsh-script-size+)))
 
 (defun ms-node-valid-top-level-p (node)
   "Core Node::IsValidTopLevel: the outermost expression must be a B."
@@ -478,8 +558,356 @@ is how every rule violation surfaces — there is no separate error channel."
 (defun ms-node-timelock-mix-p (node)
   "T when the expression mixes height and time locks in one spend path — the
 absence of property 'k'. Such a miniscript does not mean what its author
-expects, which is the whole reason the property is tracked."
+expects, which is the whole reason the property is tracked.
+
+NOTE THE POLARITY: this is the INVERSE of Core's CheckTimeLocksMix
+(miniscript.h:1685), which is true when there is NO mix. Callers composing
+Core's IsSane must negate it."
   (and node (not (mst-subset-p (ms-node-node-type node) (mst "k")))))
+
+;;;; --- Resource limits: ops and stack size (miniscript.h internal::) --------
+;;;;
+;;;; Core computes these once in the Node constructor and caches them in the
+;;;; `ops' and `ss' members. We recompute by walking the tree, because caching
+;;;; them would mean new MS-NODE slots and this project's FASL volume outlives
+;;;; a fresh container, so a defstruct layout change breaks even a clean build.
+;;;; The gate that needs them runs once per descriptor parse, never on a hot
+;;;; path, so the walk costs nothing that matters.
+
+;;; MaxInt<uint32_t> (miniscript.h:363-385). NIL is Core's invalid — "no such
+;;; satisfaction exists" — and an integer is a present value.
+
+(defun ms-mi+ (a b)
+  "Core MaxInt operator+: absence propagates."
+  (and a b (+ a b)))
+
+(defun ms-mi-or (a b)
+  "Core MaxInt operator|: whichever is present, the larger when both are."
+  (cond ((null a) b) ((null b) a) (t (max a b))))
+
+;;; SatInfo (miniscript.h:439-502) is a set of execution traces, represented as
+;;; NIL for the empty set or (NETDIFF . EXEC) for a non-empty one. NETDIFF is
+;;; how much higher the stack can be at the start than at the end; EXEC is how
+;;; much higher it can get anywhere during execution than at the end.
+;;;
+;;; Note that Core's SatInfo::Empty() is (0 . 0) — a set containing the empty
+;;; script — and is NOT the same thing as the empty set SatInfo{}, which is
+;;; NIL here. THRESH's accumulator starts at Empty(), not at NIL.
+
+(defun ms-si (netdiff exec) (cons netdiff exec))
+(defun ms-si-netdiff (s) (car s))
+(defun ms-si-exec (s) (cdr s))
+
+(defun ms-si-or (a b)
+  "Core SatInfo operator|, set union: componentwise max."
+  (cond ((null a) b)
+        ((null b) a)
+        (t (ms-si (max (car a) (car b)) (max (cdr a) (cdr b))))))
+
+(defun ms-si+ (a b)
+  "Core SatInfo operator+, concatenation with A running FIRST. Not commutative:
+`OP_1 OP_DROP' has exec 1 and `OP_DROP OP_1' has exec 0."
+  (when (and a b)
+    (ms-si (+ (car a) (car b))
+           (max (cdr b) (+ (car b) (cdr a))))))
+
+(defmacro %ms-si-cat (&rest parts)
+  "Left-to-right concatenation of PARTS, preserving execution order."
+  (reduce (lambda (acc p) `(ms-si+ ,acc ,p)) (rest parts) :initial-value (first parts)))
+
+;;; The named single-opcode scripts (miniscript.h:481-501).
+(defun ms-si-empty ()   (ms-si 0 0))
+(defun ms-si-push ()    (ms-si -1 0))
+(defun ms-si-hash ()    (ms-si 0 0))
+(defun ms-si-nop ()     (ms-si 0 0))
+(defun ms-si-if ()      (ms-si 1 1))
+(defun ms-si-binop ()   (ms-si 1 1))
+(defun ms-si-dup ()     (ms-si -1 0))
+(defun ms-si-ifdup (nonzero) (ms-si (if nonzero -1 0) 0))
+(defun ms-si-equalverify () (ms-si 2 2))
+(defun ms-si-equal ()   (ms-si 1 1))
+(defun ms-si-size ()    (ms-si -1 0))
+(defun ms-si-checksig () (ms-si 1 1))
+(defun ms-si-0notequal () (ms-si 0 0))
+(defun ms-si-verify ()  (ms-si 1 1))
+
+(defun ms-node-ops (node)
+  "Core Node::CalcOps (miniscript.h:999-1071) as (COUNT SAT DSAT): the static
+non-push opcode count, and the MaxInt number of additional ops in a
+satisfaction and a dissatisfaction."
+  (let* ((subs (ms-node-subs node))
+         (o (mapcar #'ms-node-ops subs))
+         (c (mapcar #'first o))
+         (s (mapcar #'second o))
+         (d (mapcar #'third o))
+         (nkeys (length (ms-node-keys node))))
+    (macrolet ((c (i) `(nth ,i c)) (s (i) `(nth ,i s)) (d (i) `(nth ,i d)))
+      (ecase (ms-node-fragment node)
+        (:just-1 (list 0 0 nil))
+        (:just-0 (list 0 nil 0))
+        (:pk-k (list 0 0 0))
+        (:pk-h (list 3 0 0))
+        ((:older :after) (list 1 0 nil))
+        ((:sha256 :ripemd160 :hash256 :hash160) (list 4 0 nil))
+        (:and-v (list (+ (c 0) (c 1)) (ms-mi+ (s 0) (s 1)) nil))
+        (:and-b (list (+ 1 (c 0) (c 1)) (ms-mi+ (s 0) (s 1)) (ms-mi+ (d 0) (d 1))))
+        (:or-b (list (+ 1 (c 0) (c 1))
+                     (ms-mi-or (ms-mi+ (s 0) (d 1)) (ms-mi+ (s 1) (d 0)))
+                     (ms-mi+ (d 0) (d 1))))
+        (:or-d (list (+ 3 (c 0) (c 1))
+                     (ms-mi-or (s 0) (ms-mi+ (s 1) (d 0)))
+                     (ms-mi+ (d 0) (d 1))))
+        (:or-c (list (+ 2 (c 0) (c 1))
+                     (ms-mi-or (s 0) (ms-mi+ (s 1) (d 0)))
+                     nil))
+        (:or-i (list (+ 3 (c 0) (c 1))
+                     (ms-mi-or (s 0) (s 1))
+                     (ms-mi-or (d 0) (d 1))))
+        (:andor (list (+ 3 (c 0) (c 1) (c 2))
+                      (ms-mi-or (ms-mi+ (s 1) (s 0)) (ms-mi+ (d 0) (s 2)))
+                      (ms-mi+ (d 0) (d 2))))
+        (:multi (list 1 nkeys nkeys))
+        (:multi-a (list (1+ nkeys) 0 0))
+        ((:wrap-s :wrap-c :wrap-n) (list (+ 1 (c 0)) (s 0) (d 0)))
+        (:wrap-a (list (+ 2 (c 0)) (s 0) (d 0)))
+        (:wrap-d (list (+ 3 (c 0)) (s 0) 0))
+        (:wrap-j (list (+ 4 (c 0)) (s 0) 0))
+        (:wrap-v (list (+ (c 0) (if (mst-subset-p (ms-node-node-type (first subs)) (mst "x")) 1 0))
+                       (s 0) nil))
+        (:thresh
+         (let ((count 0)
+               (sats (vector 0)))
+           (loop for sub-ops in o
+                 do (incf count (1+ (first sub-ops)))
+                    (let* ((ssat (second sub-ops))
+                           (sdsat (third sub-ops))
+                           (next (make-array (1+ (length sats)))))
+                      (setf (aref next 0) (ms-mi+ (aref sats 0) sdsat))
+                      (loop for j from 1 below (length sats)
+                            do (setf (aref next j)
+                                     (ms-mi-or (ms-mi+ (aref sats j) sdsat)
+                                               (ms-mi+ (aref sats (1- j)) ssat))))
+                      (setf (aref next (length sats))
+                            (ms-mi+ (aref sats (1- (length sats))) ssat))
+                      (setf sats next)))
+           (list count (aref sats (ms-node-k node)) (aref sats 0))))))))
+
+(defun ms-node-stack-size (node)
+  "Core Node::CalcStackSize (miniscript.h:1073-1183) as (SAT . DSAT), each a
+SatInfo."
+  (let* ((subs (ms-node-subs node))
+         (ss (mapcar #'ms-node-stack-size subs))
+         (nkeys (length (ms-node-keys node)))
+         (k (ms-node-k node)))
+    (macrolet ((sat (i) `(car (nth ,i ss))) (dsat (i) `(cdr (nth ,i ss))))
+      (flet ((both (x) (cons x x)))
+        (ecase (ms-node-fragment node)
+          (:just-0 (cons nil (ms-si-push)))
+          (:just-1 (cons (ms-si-push) nil))
+          ((:older :after) (cons (%ms-si-cat (ms-si-push) (ms-si-nop)) nil))
+          (:pk-k (both (ms-si-push)))
+          (:pk-h (both (%ms-si-cat (ms-si-dup) (ms-si-hash) (ms-si-push) (ms-si-equalverify))))
+          ((:sha256 :ripemd160 :hash256 :hash160)
+           (cons (%ms-si-cat (ms-si-size) (ms-si-push) (ms-si-equalverify)
+                             (ms-si-hash) (ms-si-push) (ms-si-equal))
+                 nil))
+          (:andor (cons (ms-si-or (%ms-si-cat (sat 0) (ms-si-if) (sat 1))
+                                  (%ms-si-cat (dsat 0) (ms-si-if) (sat 2)))
+                        (%ms-si-cat (dsat 0) (ms-si-if) (dsat 2))))
+          (:and-v (cons (ms-si+ (sat 0) (sat 1)) nil))
+          (:and-b (cons (%ms-si-cat (sat 0) (sat 1) (ms-si-binop))
+                        (%ms-si-cat (dsat 0) (dsat 1) (ms-si-binop))))
+          (:or-b (cons (ms-si+ (ms-si-or (ms-si+ (sat 0) (dsat 1))
+                                         (ms-si+ (dsat 0) (sat 1)))
+                               (ms-si-binop))
+                       (%ms-si-cat (dsat 0) (dsat 1) (ms-si-binop))))
+          (:or-c (cons (ms-si-or (ms-si+ (sat 0) (ms-si-if))
+                                 (%ms-si-cat (dsat 0) (ms-si-if) (sat 1)))
+                       nil))
+          (:or-d (cons (ms-si-or (%ms-si-cat (sat 0) (ms-si-ifdup t) (ms-si-if))
+                                 (%ms-si-cat (dsat 0) (ms-si-ifdup nil) (ms-si-if) (sat 1)))
+                       (%ms-si-cat (dsat 0) (ms-si-ifdup nil) (ms-si-if) (dsat 1))))
+          (:or-i (cons (ms-si+ (ms-si-if) (ms-si-or (sat 0) (sat 1)))
+                       (ms-si+ (ms-si-if) (ms-si-or (dsat 0) (dsat 1)))))
+          ;; multi starts with k+1 elements, reaches n+k+3 after pushing the n
+          ;; keys plus k and n, and ends with 1 (miniscript.h:1135-1138).
+          (:multi (both (ms-si k (+ k nkeys 2))))
+          (:multi-a (both (ms-si (1- nkeys) nkeys)))
+          ((:wrap-a :wrap-n :wrap-s) (first ss))
+          (:wrap-c (cons (ms-si+ (sat 0) (ms-si-checksig))
+                         (ms-si+ (dsat 0) (ms-si-checksig))))
+          (:wrap-d (cons (%ms-si-cat (ms-si-dup) (ms-si-if) (sat 0))
+                         (%ms-si-cat (ms-si-dup) (ms-si-if))))
+          (:wrap-v (cons (ms-si+ (sat 0) (ms-si-verify)) nil))
+          (:wrap-j (cons (%ms-si-cat (ms-si-size) (ms-si-0notequal) (ms-si-if) (sat 0))
+                         (%ms-si-cat (ms-si-size) (ms-si-0notequal) (ms-si-if))))
+          (:thresh
+           (let ((sats (vector (ms-si-empty))))
+             (loop for sub in ss
+                   for i from 0
+                   do (let* ((add (if (plusp i) (ms-si-binop) (ms-si-empty)))
+                             (next (make-array (1+ (length sats)))))
+                        (setf (aref next 0)
+                              (%ms-si-cat (aref sats 0) (cdr sub) add))
+                        (loop for j from 1 below (length sats)
+                              do (setf (aref next j)
+                                       (ms-si+ (ms-si-or (ms-si+ (aref sats j) (cdr sub))
+                                                         (ms-si+ (aref sats (1- j)) (car sub)))
+                                               add)))
+                        (setf (aref next (length sats))
+                              (%ms-si-cat (aref sats (1- (length sats))) (car sub) add))
+                        (setf sats next)))
+             (cons (%ms-si-cat (aref sats k) (ms-si-push) (ms-si-equal))
+                   (%ms-si-cat (aref sats 0) (ms-si-push) (ms-si-equal))))))))))
+
+(defun ms-node-bkw-p (node)
+  "Core Node::IsBKW (miniscript.h:1573): the node is a B, K or W — anything but
+a V. An INTERSECTION test, not a subset one: any of the three qualifies."
+  (/= 0 (logand (ms-node-node-type node) (mst "BKW"))))
+
+(defun ms-node-get-ops (node)
+  "Core Node::GetOps (miniscript.h:1557): total ops to satisfy non-malleably,
+or NIL when no satisfaction exists."
+  (destructuring-bind (count sat dsat) (ms-node-ops node)
+    (declare (ignore dsat))
+    (and sat (+ count sat))))
+
+(defun ms-node-check-ops-limit-p (node)
+  "Core Node::CheckOpsLimit (miniscript.h:1566). A node with no satisfaction
+passes — IsNotSatisfiable is what rejects that, separately."
+  (let ((ops (ms-node-get-ops node)))
+    (or (null ops) (<= ops +ms-max-ops-per-script+))))
+
+(defconstant +ms-p2wsh-sig-size+ 73
+  "Core CalcWitnessSize's sig_size outside tapscript: 1 length byte + a 72-byte
+signature (miniscript.h:1188).")
+
+(defconstant +ms-p2wsh-pubkey-size+ 34
+  "Core CalcWitnessSize's pubkey_size outside tapscript: 1 + 33.")
+
+(defun ms-node-witness-size (node)
+  "Core Node::CalcWitnessSize (miniscript.h:1187-1237) as (SAT . DSAT), each a
+MaxInt: the maximum witness bytes to satisfy and to dissatisfy NODE
+non-malleably. Excludes the witnessScript push, exactly as Core's does."
+  (let* ((subs (ms-node-subs node))
+         (w (mapcar #'ms-node-witness-size subs))
+         (nkeys (length (ms-node-keys node)))
+         (k (ms-node-k node))
+         (sig +ms-p2wsh-sig-size+)
+         (pub +ms-p2wsh-pubkey-size+))
+    (macrolet ((sat (i) `(car (nth ,i w))) (dsat (i) `(cdr (nth ,i w))))
+      (ecase (ms-node-fragment node)
+        (:just-0 (cons nil 0))
+        ((:just-1 :older :after) (cons 0 nil))
+        (:pk-k (cons sig 1))
+        (:pk-h (cons (+ sig pub) (+ 1 pub)))
+        ((:sha256 :ripemd160 :hash256 :hash160) (cons (+ 1 32) nil))
+        (:andor (cons (ms-mi-or (ms-mi+ (sat 0) (sat 1))
+                                (ms-mi+ (dsat 0) (sat 2)))
+                      (ms-mi+ (dsat 0) (dsat 2))))
+        (:and-v (cons (ms-mi+ (sat 0) (sat 1)) nil))
+        (:and-b (cons (ms-mi+ (sat 0) (sat 1)) (ms-mi+ (dsat 0) (dsat 1))))
+        (:or-b (cons (ms-mi-or (ms-mi+ (dsat 0) (sat 1))
+                               (ms-mi+ (sat 0) (dsat 1)))
+                     (ms-mi+ (dsat 0) (dsat 1))))
+        (:or-c (cons (ms-mi-or (sat 0) (ms-mi+ (dsat 0) (sat 1))) nil))
+        (:or-d (cons (ms-mi-or (sat 0) (ms-mi+ (dsat 0) (sat 1)))
+                     (ms-mi+ (dsat 0) (dsat 1))))
+        ;; The +1/+2 are the branch selector pushed for OP_IF.
+        (:or-i (cons (ms-mi-or (ms-mi+ (sat 0) 2) (ms-mi+ (sat 1) 1))
+                     (ms-mi-or (ms-mi+ (dsat 0) 2) (ms-mi+ (dsat 1) 1))))
+        (:multi (cons (+ (* k sig) 1) (+ k 1)))
+        (:multi-a (cons (+ (* k sig) (- nkeys k)) nkeys))
+        ((:wrap-a :wrap-n :wrap-s :wrap-c) (first w))
+        (:wrap-d (cons (ms-mi+ 2 (sat 0)) 1))
+        (:wrap-v (cons (sat 0) nil))
+        (:wrap-j (cons (sat 0) 1))
+        (:thresh
+         (let ((sats (vector 0)))
+           (dolist (sub w)
+             (let ((next (make-array (1+ (length sats)))))
+               (setf (aref next 0) (ms-mi+ (aref sats 0) (cdr sub)))
+               (loop for j from 1 below (length sats)
+                     do (setf (aref next j)
+                              (ms-mi-or (ms-mi+ (aref sats j) (cdr sub))
+                                        (ms-mi+ (aref sats (1- j)) (car sub)))))
+               (setf (aref next (length sats))
+                     (ms-mi+ (aref sats (1- (length sats))) (car sub)))
+               (setf sats next)))
+           (cons (aref sats k) (aref sats 0))))))))
+
+(defun ms-node-get-witness-size (node)
+  "Core Node::GetWitnessSize (miniscript.h:1606): witness bytes to satisfy NODE
+non-malleably, or NIL when no satisfaction exists. Does NOT include the
+witnessScript push."
+  (car (ms-node-witness-size node)))
+
+(defun ms-node-get-stack-size (node)
+  "Core Node::GetStackSize (miniscript.h:1578): stack elements needed to
+satisfy non-malleably, or NIL when no satisfaction exists."
+  (let ((sat (car (ms-node-stack-size node))))
+    (and sat (+ (ms-si-netdiff sat) (if (ms-node-bkw-p node) 1 0)))))
+
+(defun ms-node-check-stack-size-p (node)
+  "Core Node::CheckStackSize (miniscript.h:1589), P2WSH branch: we do not parse
+miniscript in a tapscript context, so the MAX_STACK_SIZE branch is unreachable
+here and is deliberately not ported."
+  (let ((ss (ms-node-get-stack-size node)))
+    (or (null ss) (<= ss +ms-max-p2wsh-stack-items+))))
+
+(defun ms-node-not-satisfiable-p (node)
+  "Core Node::IsNotSatisfiable (miniscript.h:1602)."
+  (null (ms-node-get-stack-size node)))
+
+(defun ms-node-duplicate-keys-p (node)
+  "T when any public key appears more than once anywhere in the expression —
+the negation of Core's CheckDuplicateKey (miniscript.h:1688).
+
+Core computes this with a bottom-up merge of per-subtree key sets
+(miniscript.h:1505-1547) so it can share work across a parse; one flat walk is
+the same answer for a single expression."
+  (let ((seen (make-hash-table :test 'equalp))
+        (dup nil))
+    (labels ((walk (n)
+               (when (and n (not dup))
+                 (dolist (key (ms-node-keys n))
+                   (let ((id key))
+                     (when (gethash id seen) (setf dup t) (return))
+                     (setf (gethash id seen) t)))
+                 (mapc #'walk (ms-node-subs n)))))
+      (walk node))
+    dup))
+
+(defun ms-node-valid-satisfactions-p (node)
+  "Core Node::ValidSatisfactions (miniscript.h:1691)."
+  (and (ms-node-valid-p node)
+       (ms-node-check-ops-limit-p node)
+       (ms-node-check-stack-size-p node)))
+
+(defun ms-node-sane-subexpression-p (node)
+  "Core Node::IsSaneSubexpression (miniscript.h:1694)."
+  (and (ms-node-valid-satisfactions-p node)
+       (ms-node-non-malleable-p node)
+       (not (ms-node-timelock-mix-p node))   ; Core's CheckTimeLocksMix, un-inverted
+       (not (ms-node-duplicate-keys-p node))))
+
+(defun ms-node-sane-p (node)
+  "Core Node::IsSane (miniscript.h:1697): safe as a script on its own."
+  (and (ms-node-valid-top-level-p node)
+       (ms-node-sane-subexpression-p node)
+       (ms-node-needs-signature-p node)))
+
+(defun ms-find-insane-sub (node)
+  "Core Node::FindInsaneSub (miniscript.h:1618): the first subexpression, in
+Core's post-order traversal, that is not a sane subexpression. NIL when every
+sub is sane and the insanity is a property of NODE itself."
+  (labels ((walk (n)
+             (dolist (sub (ms-node-subs n))
+               (let ((found (walk sub)))
+                 (when found (return-from walk found))))
+             (unless (ms-node-sane-subexpression-p n) n)))
+    (let ((found (walk node)))
+      (and found (not (eq found node)) found))))
 
 ;;;; --- Parsing (miniscript.h FromString) -----------------------------------
 ;;;;
