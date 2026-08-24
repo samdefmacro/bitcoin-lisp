@@ -783,6 +783,16 @@
    #:txindex-count
    #:txindex-set-best-block
    #:txindex-best-block
+   #:init-txospender-index
+   #:close-txospender-index
+   #:txospender-index-enabled
+   #:txospenderindex-add-block
+   #:txospenderindex-remove-block
+   #:txospenderindex-locators
+   #:txospenderindex-set-best-block
+   #:txospenderindex-best-block
+   #:txospenderindex-height
+   #:txospenderindex-db-path
    #:load-tx-index
    #:txindex-add-block
    #:txindex-remove-block
@@ -1178,6 +1188,23 @@
    #:header-time-too-old-p
    #:check-sequence-locks
    #:compute-script-flags-for-height
+   ;; BIP9 / versionbits (reporting only; activation stays height-based)
+   #:versionbits-deployments
+   #:versionbits-state
+   #:with-versionbits-cache
+   #:versionbits-state-name
+   #:versionbits-since-height
+   #:versionbits-statistics
+   #:vb-deployment-name
+   #:vb-deployment-bit
+   #:vb-deployment-start-time
+   #:vb-deployment-timeout
+   #:vb-deployment-min-activation-height
+   #:vb-deployment-threshold
+   #:vb-deployment-period
+   #:+vb-always-active+
+   #:+vb-never-active+
+   #:+vb-no-timeout+
    #:block-script-flags-list
    #:block-script-flags
    #:script-flag-exception
@@ -1709,6 +1736,8 @@
    #:listen-port
    #:index-block-filter
    #:index-block-coinstats
+   #:index-block-txospenders
+   #:unindex-block-txospenders
    ;; Wallet chain-tracking hooks (wallet P2; defined in node.lisp, called
    ;; from connect-block / perform-reorg / the mempool like the index hooks)
    #:wallet-notify-block-connected

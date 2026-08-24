@@ -1441,14 +1441,35 @@ weight; ours is BIP141 virtual bytes (~ Core / 4)."
     (nreverse points)))
 
 (defun rpc-gettxspendingprevout (node params)
-  "For each {txid, vout} outpoint in the array PARAM, report the mempool
-transaction spending it, if any (Bitcoin Core gettxspendingprevout). Returns an
-array of {txid, vout, spendingtxid?}."
-  (let ((outpoints (%positional-array (first params)))
-        (mempool (rpc-get-mempool node)))
+  "For each {txid, vout} outpoint in the array PARAM, report the transaction
+spending it, if any (Bitcoin Core gettxspendingprevout). Returns an array of
+{txid, vout, spendingtxid?, spendingtx?}.
+
+The mempool is always consulted. A CONFIRMED spend is answered from the
+txospenderindex, which is the only reason that index exists — without it this
+RPC could only ever say `not found\' for an output spent in a block, which is
+what this node did until the index landed.
+
+OPTIONS mirror Core (rpc/mempool.cpp:912-916):
+  mempool_only        default: true when the spender index is unavailable,
+                      false when it is — so the answer improves by enabling the
+                      index rather than by changing the call.
+  return_spending_tx  default false; adds the full spending transaction as hex."
+  (let* ((outpoints (%positional-array (first params)))
+         (options (second params))
+         (mempool (rpc-get-mempool node))
+         (index (bitcoin-lisp::node-txospenderindex node))
+         (index-live (and index (bitcoin-lisp.storage:txospender-index-enabled index)))
+         (mempool-only (if (and (hash-table-p options)
+                                (nth-value 1 (gethash "mempool_only" options)))
+                           (and (gethash "mempool_only" options) t)
+                           (not index-live)))
+         (return-tx (and (hash-table-p options)
+                         (gethash "return_spending_tx" options)
+                         t)))
     (unless (and (listp outpoints) outpoints)
       (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "First parameter must be a non-empty array of outpoints"))
+                        :message "Invalid parameter, outputs are missing"))
     ;; Node lock: one consistent spent-map snapshot across all queried
     ;; outpoints (Core gettxspendingprevout takes pool.cs once).
     (with-node-lock (node)
@@ -1459,12 +1480,93 @@ array of {txid, vout, spendingtxid?}."
                (txid (and (stringp txid-hex) (parse-hex-hash txid-hex))))
           (unless (and txid (integerp vout))
             (error 'rpc-error :code +rpc-invalid-parameter+
-                              :message "Each outpoint needs a txid (hex) and vout (integer)"))
-          (let ((spender (and mempool (bitcoin-lisp.mempool:mempool-spending-tx mempool txid vout))))
-            `(("txid" . ,txid-hex)
-              ("vout" . ,vout)
-              ,@(when spender `(("spendingtxid" . ,(hash-to-hex spender))))))))
+                              :message "Invalid parameter, outputs are missing"))
+          (when (minusp vout)
+            (error 'rpc-error :code +rpc-invalid-parameter+
+                              :message "Invalid parameter, vout cannot be negative"))
+          (let* ((mem (and mempool
+                           (bitcoin-lisp.mempool:mempool-spending-tx mempool txid vout)))
+                 (spender-tx (and (not mem) (not mempool-only)
+                                  (%txospender-confirmed-spender node index txid vout))))
+            (cond
+              (mem `(("txid" . ,txid-hex)
+                     ("vout" . ,vout)
+                     ("spendingtxid" . ,(hash-to-hex mem))
+                     ,@(when return-tx
+                         (let* ((e (and mempool (bitcoin-lisp.mempool:mempool-get mempool mem)))
+                                (tx (and e (bitcoin-lisp.mempool:mempool-entry-transaction e))))
+                           (when tx
+                             `(("spendingtx"
+                                . ,(bitcoin-lisp.crypto:bytes-to-hex
+                                    (bitcoin-lisp.serialization:transaction-wire-bytes tx))))))))) 
+              (spender-tx
+               `(("txid" . ,txid-hex)
+                 ("vout" . ,vout)
+                 ("spendingtxid"
+                  . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-hash spender-tx)))
+                 ,@(when return-tx
+                     `(("spendingtx"
+                        . ,(bitcoin-lisp.crypto:bytes-to-hex
+                            (bitcoin-lisp.serialization:transaction-wire-bytes spender-tx)))))))
+              ;; Not in the mempool. Core answers "unspent" only when the caller
+              ;; asked for the mempool alone; otherwise not having the index is
+              ;; an ERROR, because silence would be indistinguishable from a
+              ;; genuine answer (rpc/mempool.cpp:1010-1011).
+              (mempool-only `(("txid" . ,txid-hex) ("vout" . ,vout)))
+              ((not index-live)
+               (error 'rpc-error :code +rpc-misc-error+
+                                 :message (format nil "No spending tx for the outpoint ~A:~D in mempool, and txospenderindex is unavailable."
+                                                  txid-hex vout)))
+              (t `(("txid" . ,txid-hex) ("vout" . ,vout)))))))
       outpoints))))
+
+(defun %txospender-confirmed-spender (node index txid vout)
+  "The confirmed transaction that spent TXID:VOUT, from the spender index, or
+NIL.
+
+The index key is a SALTED HASH of the outpoint, so two different outpoints can
+land under one key. Every candidate is read back from its block and checked
+before it is believed — Core does the same for the same reason
+(index/txospenderindex.cpp:141-156). A candidate that does not really spend the
+outpoint is a hash collision; one whose block is no longer on the active chain
+is a reorg the index has not been told about, and both are skipped."
+  (let ((chain-state (rpc-get-chain-state node))
+        (block-store (bitcoin-lisp::node-block-store node)))
+    (dolist (locator (bitcoin-lisp.storage:txospenderindex-locators index txid vout))
+      (destructuring-bind (block-hash . position) locator
+        (let ((block (and block-store
+                          (bitcoin-lisp.storage:get-block block-store block-hash))))
+          ;; ⚠️ ACTIVE chain, not merely known. An index entry left behind by
+          ;; a reorg names a block that is still on disk and still spends the
+          ;; outpoint, so believing it would answer with a spender from an
+          ;; abandoned chain. The disconnect hook erases those entries; this is
+          ;; the belt to its braces. Reuses the %BLOCK-ON-ACTIVE-CHAIN-P this
+          ;; file already had rather than adding a second one.
+          (when (and block
+                     (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                                   chain-state block-hash)))
+                       (and entry (%block-on-active-chain-p entry chain-state))))
+            (let ((tx (%tx-at-block-position block position)))
+              (when (and tx (%tx-spends-outpoint-p tx txid vout))
+                (return-from %txospender-confirmed-spender tx)))))))
+    nil))
+
+(defun %tx-at-block-position (block position)
+  "The transaction at byte offset POSITION within BLOCK's transaction list, or
+NIL when the offset does not land on one — which is what a stale index entry
+looks like."
+  (let ((offset 0))
+    (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+      (when (= offset position) (return-from %tx-at-block-position tx))
+      (incf offset (length (bitcoin-lisp.serialization:transaction-wire-bytes tx))))
+    nil))
+
+(defun %tx-spends-outpoint-p (tx txid vout)
+  (some (lambda (input)
+          (let ((op (bitcoin-lisp.serialization:tx-in-previous-output input)))
+            (and (equalp (bitcoin-lisp.serialization:outpoint-hash op) txid)
+                 (= (bitcoin-lisp.serialization:outpoint-index op) vout))))
+        (bitcoin-lisp.serialization:transaction-inputs tx)))
 
 ;;;; Raw-transaction safety rails (Core node/transaction.h:28-34)
 ;;;;
@@ -3654,7 +3756,8 @@ rpc_help.py uses to check this node against Core's client.cpp."
 
 (defun rpc-getindexinfo (node params)
   "Report the status of optional indexes (Bitcoin Core getindexinfo): txindex,
-the basic block filter index, and coinstatsindex -- each reported only when
+the basic block filter index, coinstatsindex and txospenderindex -- each
+reported only when
 enabled. An optional index-name argument filters to a single index (empty object
 if it is not an enabled index). Every index is maintained inline as blocks
 connect, so a present index normally tracks the tip; \"synced\" reflects whether
@@ -3664,6 +3767,7 @@ its best indexed block has reached the current tip."
          (tx-index (rpc-get-tx-index node))
          (bfi (rpc-get-blockfilterindex node))
          (csi (rpc-get-coinstatsindex node))
+         (tsi (bitcoin-lisp::node-txospenderindex node))
          (entries '()))
     (flet ((add (key enabled-p height)
              (when (and enabled-p (or (null name) (string= name key)))
@@ -3679,15 +3783,33 @@ its best indexed block has reached the current tip."
            (if bfi (bitcoin-lisp.storage:blockfilterindex-height bfi) -1))
       (add "coinstatsindex"
            (and csi (bitcoin-lisp.storage:coinstatsindex-enabled csi))
-           (if csi (bitcoin-lisp.storage:coinstatsindex-height csi) -1)))
+           (if csi (bitcoin-lisp.storage:coinstatsindex-height csi) -1))
+      ;; Core names it "txospenderindex" (index/txospenderindex.cpp:64, the
+      ;; BaseIndex name argument), which is the string getindexinfo's optional
+      ;; filter argument matches on.
+      (add "txospenderindex"
+           (and tsi (bitcoin-lisp.storage:txospender-index-enabled tsi))
+           (if tsi (bitcoin-lisp.storage:txospenderindex-height tsi) -1)))
     ;; No matching active index -> empty JSON object.
     (if entries (nreverse entries) (make-hash-table :test 'equal))))
 
 (defun %buried-deployment (active-height tip-height)
-  "A buried-softfork deployment object: active once TIP-HEIGHT reaches
-ACTIVE-HEIGHT."
+  "A buried-softfork deployment object for the block at TIP-HEIGHT.
+
+⚠️ ACTIVE is reported for the block AFTER this one, so it turns true one block
+BEFORE the activation height — which is not a slip but Core's stated contract.
+getdeploymentinfo calls DeploymentActiveAfter (rpc/blockchain.cpp:1303) with
+the comment `getdeploymentinfo reports the softfork as active from when the
+chain height is one below the activation height' (:1301-1302), and
+DeploymentActiveAfter is `pindexPrev->nHeight + 1 >= DeploymentHeight'
+(deploymentstatus.h:14-18).
+
+We compared the height directly, so for exactly one block — the one at
+activation height minus one — we answered false where every Core node answers
+true. Purely a reporting helper: its six callers are all this RPC's output, and
+nothing here decides when a rule actually activates."
   `(("type" . "buried")
-    ("active" . ,(json-bool (>= tip-height active-height)))
+    ("active" . ,(json-bool (>= (1+ tip-height) active-height)))
     ("height" . ,active-height)))
 
 (defun rpc-getzmqnotifications (node params)
@@ -3724,7 +3846,16 @@ taproot) using this node's per-network activation heights."
                      (bitcoin-lisp.storage:current-height chain-state)))
          (best-hash (if entry
                         (bitcoin-lisp.storage:block-index-entry-hash entry)
-                        (bitcoin-lisp.storage:best-block-hash chain-state))))
+                        (bitcoin-lisp.storage:best-block-hash chain-state)))
+         ;; With no blockhash argument Core still has a blockindex — the tip —
+         ;; and the BIP9 objects are computed from it. Resolving it here rather
+         ;; than leaving ENTRY nil is what keeps the deployments in the answer
+         ;; for the no-argument call, which is how the RPC is almost always
+         ;; used.
+         (at-entry (or entry
+                       (and best-hash
+                            (bitcoin-lisp.storage:get-block-index-entry
+                             chain-state best-hash)))))
     `(("hash" . ,(if best-hash (hash-to-hex best-hash) ""))
       ("height" . ,height)
       ;; Core reports GetScriptFlagNames(GetBlockScriptFlags(*blockindex, ...))
@@ -3746,7 +3877,81 @@ taproot) using this node's per-network activation heights."
           ("bip65" . ,(%buried-deployment (bitcoin-lisp.validation:get-bip65-activation-height network) height))
           ("csv" . ,(%buried-deployment (bitcoin-lisp.validation:get-csv-activation-height network) height))
           ("segwit" . ,(%buried-deployment (bitcoin-lisp.validation:get-segwit-activation-height network) height))
-          ("taproot" . ,(%buried-deployment (bitcoin-lisp.validation:get-taproot-activation-height network) height)))))))
+          ;; taproot is a BIP9 deployment in every one of Core's five chain
+          ;; parameter sets (kernel/chainparams.cpp:110-115 and the four
+          ;; others), so Core reports it with a bip9 object and we reported it
+          ;; as "buried" — a caller reading this to learn the bit, the window or
+          ;; the signalling count got nothing from us at all.
+          ,@(%bip9-deployments chain-state at-entry network))))))
+
+(defun %bip9-deployment (chain-state entry deployment)
+  "One BIP9 softfork object (Core SoftForkDescPushBack, rpc/blockchain.cpp:1307-1359).
+
+⚠️ The two states are for DIFFERENT blocks. Core's `status' is
+GetStateFor(blockindex->pprev) — the state OF this block — and `status_next' is
+GetStateFor(blockindex), the state of the NEXT one (versionbits.cpp:202-203).
+Reporting one value twice is the easy mistake here."
+  (let* ((prev (and entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+         (height (if entry (bitcoin-lisp.storage:block-index-entry-height entry) 0))
+         (current (bitcoin-lisp.validation:versionbits-state chain-state prev deployment))
+         (next (bitcoin-lisp.validation:versionbits-state chain-state entry deployment))
+         (since (bitcoin-lisp.validation:versionbits-since-height chain-state prev deployment))
+         ;; Statistics exist only while the window is being counted
+         ;; (versionbits.cpp:210-212).
+         (counting (member current '(:started :locked-in)))
+         ;; ⚠️ Core has TWO ways a deployment is active-since
+         ;; (versionbits.cpp:219-223): the state IS active, or the NEXT block's
+         ;; state is. Dropping the second is the same off-by-one that
+         ;; %BURIED-DEPLOYMENT had — for the block one below the activation
+         ;; height Core emits a height and active:true where we emitted
+         ;; neither. Reachable on the live mainnet node, which holds the header
+         ;; at taproot's activation height minus one.
+         (active-since (cond ((eq current :active) since)
+                             ((eq next :active) (1+ height))))
+         (bip9
+           `(,@(when counting
+                 `(("bit" . ,(bitcoin-lisp.validation:vb-deployment-bit deployment))))
+             ("start_time" . ,(bitcoin-lisp.validation:vb-deployment-start-time deployment))
+             ("timeout" . ,(bitcoin-lisp.validation:vb-deployment-timeout deployment))
+             ("min_activation_height"
+              . ,(bitcoin-lisp.validation:vb-deployment-min-activation-height deployment))
+             ("status" . ,(bitcoin-lisp.validation:versionbits-state-name current))
+             ("since" . ,since)
+             ("status_next" . ,(bitcoin-lisp.validation:versionbits-state-name next))
+             ,@(when counting
+                 (multiple-value-bind (period threshold elapsed count possible)
+                     (bitcoin-lisp.validation:versionbits-statistics chain-state entry deployment)
+                   `(("statistics"
+                      . (("period" . ,period)
+                         ("elapsed" . ,elapsed)
+                         ("count" . ,count)
+                         ,@(when (or (plusp threshold) possible)
+                             `(("threshold" . ,threshold)
+                               ("possible" . ,(json-bool possible)))))))))))) 
+    `(,@(when active-since `(("height" . ,active-since)))
+      ;; Core: active_since <= blockindex->nHeight + 1 (blockchain.cpp:1355).
+      ("active" . ,(json-bool (and active-since (<= active-since (1+ height)))))
+      ("type" . "bip9")
+      ("bip9" . ,bip9))))
+
+(defun %bip9-deployments (chain-state entry network)
+  "Every BIP9 deployment defined for NETWORK, as (name . object) pairs.
+
+Core skips a deployment that is not enabled on this chain
+(blockchain.cpp:1310). Its `blockindex == nullptr' guard on the line below is
+not reproduced: Core always has one, because genesis is always in its index,
+whereas a node here can be asked before any block exists — and dropping the
+deployments entirely for that node would be a worse answer than reporting them
+in their initial state."
+  (bitcoin-lisp.validation:with-versionbits-cache
+    (let ((bitcoin-lisp:*network* network))
+      (loop for d in (bitcoin-lisp.validation:versionbits-deployments network)
+            ;; NEVER_ACTIVE is Core's DeploymentEnabled = false: the deployment
+            ;; exists in the table but is not reported at all.
+            unless (= (bitcoin-lisp.validation:vb-deployment-start-time d)
+                      bitcoin-lisp.validation:+vb-never-active+)
+              collect (cons (bitcoin-lisp.validation:vb-deployment-name d)
+                            (%bip9-deployment chain-state entry d))))))
 
 ;;; --- Mining RPCs ---
 

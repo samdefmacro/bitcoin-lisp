@@ -61,17 +61,22 @@ headerindex.dat at the root. Returns (values path legacy-p)."
 (defparameter +core-index-subdirectories+
   '((:txindex . "indexes/txindex/")
     (:blockfilter . "indexes/blockfilter/basic/")
-    (:coinstats . "indexes/coinstatsindex/"))
+    (:coinstats . "indexes/coinstatsindex/")
+    ;; Core nests this one a level deeper than the others — the DB lives at
+    ;; indexes/txospenderindex/db (index/txospenderindex.cpp:64).
+    (:txospenderindex . "indexes/txospenderindex/db/"))
   "Core doc/files.md's index paths.")
 
 (defparameter +legacy-index-subdirectories+
   '((:txindex . "txindex/")
     (:blockfilter . "blockfilterindex/")
-    (:coinstats . "coinstatsindex/"))
+    (:coinstats . "coinstatsindex/")
+    (:txospenderindex . "txospenderindex/"))
   "The flat layout this tree used before.")
 
 (defun datadir-index-path (data-dir which)
-  "Where index WHICH (:txindex, :blockfilter or :coinstats) lives. Returns
+  "Where index WHICH (:txindex, :blockfilter, :coinstats or
+:txospenderindex) lives. Returns
  (values path legacy-p)."
   (let ((core (merge-pathnames (cdr (assoc which +core-index-subdirectories+))
                                data-dir))

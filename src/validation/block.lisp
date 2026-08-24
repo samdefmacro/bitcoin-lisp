@@ -2650,6 +2650,9 @@ Handles chain reorganizations when a competing chain has more work."
              ;; coinstatsindex: fold this block into the running UTXO stats
              ;; (no-op unless enabled; never signals).
              (bitcoin-lisp:index-block-coinstats chain-state block hash new-height spent-utxos)
+             ;; txospenderindex: record which tx here spent each output it
+             ;; consumes (no-op unless enabled; never signals).
+             (bitcoin-lisp:index-block-txospenders chain-state block hash new-height)
              ;; Record fee statistics for fee estimation
              (when fee-estimator
                (let ((stats (bitcoin-lisp.mempool:compute-block-fee-stats
@@ -3449,7 +3452,15 @@ comment above."
             ;; being undone learns that from the 'D' instead.
             (bitcoin-lisp:zmq-notify-block-disconnected
              (car pair) (bitcoin-lisp.serialization:block-header-hash
-                         (bitcoin-lisp.serialization:bitcoin-block-header (car pair)))))
+                         (bitcoin-lisp.serialization:bitcoin-block-header (car pair))))
+            ;; txospenderindex: erase this block's spender entries. Deferred to
+            ;; PHASE C with every other side effect, so an INTERRUPTED reorg —
+            ;; which rolls back and leaves these blocks connected — never
+            ;; erases entries for blocks that are still on the chain.
+            (bitcoin-lisp:unindex-block-txospenders
+             chain-state (car pair)
+             (bitcoin-lisp.serialization:block-header-hash
+              (bitcoin-lisp.serialization:bitcoin-block-header (car pair)))))
           (dolist (item (reverse connected))
             (destructuring-bind (entry block height spent-utxos) item
               (when fee-estimator
@@ -3471,7 +3482,11 @@ comment above."
                 (bitcoin-lisp:index-block-filter chain-state block hash height spent-utxos)
                 ;; coinstatsindex: reconnected oldest-to-newest, so each block
                 ;; loads its (already-reindexed) parent's running state.
-                (bitcoin-lisp:index-block-coinstats chain-state block hash height spent-utxos))
+                (bitcoin-lisp:index-block-coinstats chain-state block hash height spent-utxos)
+                ;; txospenderindex: the erase for the disconnected side already
+                ;; ran earlier in this phase, so these writes cannot be undone
+                ;; by it.
+                (bitcoin-lisp:index-block-txospenders chain-state block hash height))
               (when mempool
                 (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)
                 (bitcoin-lisp.mempool:orphan-erase-for-block

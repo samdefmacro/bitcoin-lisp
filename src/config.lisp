@@ -894,6 +894,7 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ("txindex"           :txindex            :bool)
     ("blockfilterindex"  :blockfilterindex   :bool)
     ("coinstatsindex"    :coinstatsindex     :bool)
+    ("txospenderindex"   :txospenderindex    :bool)
     ("prune"             :prune              :int)
     ("dbcache"           :dbcache-mib        :int)
     ;; Core's -mocktime: the startup form of the setmocktime RPC, for tests
@@ -1023,7 +1024,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "rpcworkqueue" "settings" "shrinkdebugfile"
     "signer" "signetseednode"
     "stopafterblockimport" "test" "timeout"
-    "txospenderindex" "unsafesqlitesync" "vbparams"
+    "unsafesqlitesync" "vbparams"
     "version" "walletbroadcast" "walletcrosschain"
     )
   "Options bitcoind accepts that this node recognises but does NOT implement,
