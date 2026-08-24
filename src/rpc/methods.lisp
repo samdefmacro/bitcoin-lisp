@@ -193,8 +193,39 @@ the bool branch). Explicit false arrives as the +json-false+ sentinel."
               ((or (eq v t) (eq v +json-false+))
                (error 'rpc-error :code +rpc-type-error+
                                  :message "Verbosity was boolean but only integer allowed"))
-              (t (error 'rpc-error :code +rpc-type-error+
-                                   :message "JSON value is not an integer as expected"))))))
+              (t (%json-type-error v "number"))))))
+
+(defun %json-type-name (value)
+  "Core's uvTypeName (univalue.cpp:217-226) for VALUE as our decoder represents
+it: null, bool, object, array, string, number.
+
+NIL is reported as \"null\". It is genuinely ambiguous — our decoder gives NIL
+for both JSON null and an empty array — but a type error on an EMPTY array is
+vanishingly rare next to one on null, and guessing the other way would misname
+the common case."
+  (cond ((null value) "null")
+        ((eq value t) "bool")
+        ((eq value +json-false+) "bool")
+        ((stringp value) "string")
+        ((numberp value) "number")
+        ((hash-table-p value) "object")
+        ((or (listp value) (vectorp value)) "array")
+        (t "null")))
+
+(defun %json-type-error (value expected)
+  "Signal Core's canonical UniValue type error for VALUE where EXPECTED was
+wanted: \"JSON value of type <actual> is not of expected type <expected>\"
+(univalue.cpp:210-214).
+
+One shape, because Core has one shape. Its functional tests match on this
+string — rpc_rawtransaction.py looks for \"not of expected type number\",
+mempool_accept.py for \"JSON value of type string is not of expected type
+array\" — and each hand-written message here (\"First parameter must be an
+array of tx hex\", \"JSON value is not an integer as expected\") was a
+different sentence saying the same thing, so no caller could match any of them."
+  (error 'rpc-error :code +rpc-type-error+
+                    :message (format nil "JSON value of type ~A is not of expected type ~A"
+                                     (%json-type-name value) expected)))
 
 (defun rpc-getblock (node params)
   "Return block data (Bitcoin Core getblock). Verbosity <= 0 (or false) returns
@@ -1478,8 +1509,7 @@ anything to the mempool. Each tx is checked independently against current state
         (mempool (rpc-get-mempool node))
         (chain-state (rpc-get-chain-state node)))
     (unless (listp txs)
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "First parameter must be an array of tx hex"))
+      (%json-type-error txs "array"))
     ;; Core caps the batch at package size (rpc/mempool.cpp:322).
     (when (or (null txs) (> (length txs) bitcoin-lisp.validation:+max-package-count+))
       (error 'rpc-error :code +rpc-invalid-parameter+
