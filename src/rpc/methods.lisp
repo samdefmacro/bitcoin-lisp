@@ -5349,13 +5349,21 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
                      (bitcoin-lisp.crypto:derive-xonly-pubkey sk))))
             (when qx (setf (gethash qx tr-keymap) sk)))))
       ;; Prevout map from prevtxs (carries optional redeemScript / witnessScript).
+      ;; %OBJ-GET, not ASSOC: each element is a JSON object, which arrives as a
+      ;; HASH-TABLE from a real client and an ALIST from these tests, and ASSOC
+      ;; on a hash-table is a type error. That error escaped as
+      ;; "-32603 Internal error: The value #<HASH-TABLE ...> is not of type
+      ;; LIST" — signrawtransactionwithkey could not be called with prevtxs by
+      ;; any real client (rpc_signrawtransactionwithkey.py:71 does exactly
+      ;; that), while every unit test passed by handing it alists. Same defect
+      ;; and same fix as createrawtransaction's inputs in #491.
       (dolist (pt (and (listp prevtxs) prevtxs))
-        (let ((txid (cdr (assoc "txid" pt :test #'string=)))
-              (vout (cdr (assoc "vout" pt :test #'string=)))
-              (spk-hex (cdr (assoc "scriptPubKey" pt :test #'string=)))
-              (amount (cdr (assoc "amount" pt :test #'string=)))
-              (redeem-hex (cdr (assoc "redeemScript" pt :test #'string=)))
-              (ws-hex (cdr (assoc "witnessScript" pt :test #'string=))))
+        (let ((txid (%obj-get pt "txid"))
+              (vout (%obj-get pt "vout"))
+              (spk-hex (%obj-get pt "scriptPubKey"))
+              (amount (%obj-get pt "amount"))
+              (redeem-hex (%obj-get pt "redeemScript"))
+              (ws-hex (%obj-get pt "witnessScript")))
           (when (and (stringp txid) (valid-hex-hash-p txid) (integerp vout) (stringp spk-hex))
             (setf (gethash (cons (parse-hex-hash txid) vout) prevmap)
                   (list (bitcoin-lisp.crypto:hex-to-bytes spk-hex)
@@ -5412,40 +5420,28 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
                                              :index vout)
                            :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                            :sequence sequence)))
-          (tx-outputs '()))
-      ;; Build transaction outputs
-      (cond
-        ;; Object format: {"address": amount, ...} — hash-table from the
-        ;; decoder, alist from the tests; %OBJ-PAIRS flattens both.
-        ((or (hash-table-p outputs)
-             (and (listp outputs) outputs (every #'consp outputs)))
-         (loop for (addr . amount) in (%obj-pairs outputs)
-               do (unless (and (stringp addr) (numberp amount))
-                    (error 'rpc-error :code +rpc-invalid-parameter+
-                                      :message "Invalid output format"))
-                  (when (< amount 0)
-                    (error 'rpc-error :code +rpc-invalid-amount+
-                                      :message "Invalid amount (negative)"))
-                  (when (> amount 21000000)
-                    (error 'rpc-error :code +rpc-invalid-amount+
-                                      :message "Invalid amount (exceeds max)"))
-                  (multiple-value-bind (type script-pubkey)
-                      (bitcoin-lisp.crypto:decode-address addr network)
-                    (unless type
-                      (error 'rpc-error :code +rpc-invalid-address-or-key+
-                                        :message (format nil "Invalid address: ~A" addr)))
-                    (push (bitcoin-lisp.serialization:make-tx-out
-                           :value (round (* amount 100000000))  ; BTC to satoshis
-                           :script-pubkey script-pubkey)
-                          tx-outputs))))
-        (t
-         (error 'rpc-error :code +rpc-invalid-parameter+
-                           :message "Invalid outputs format")))
+          ;; Core parses this argument in ONE place — NormalizeOutputs then
+          ;; ParseOutputs (rawtransaction_util.cpp:74-99,101+) — and every RPC
+          ;; taking outputs goes through it. %PARSE-OUTPUTS is that function
+          ;; here, and createrawtransaction was the one caller not using it:
+          ;; it had its own loop accepting the OBJECT form only. So Core's
+          ;; ARRAY-of-single-key-objects form — the order-preserving spelling,
+          ;; which rpc_createmultisig.py:117 and much of the suite use — was
+          ;; answered "Invalid outputs format", as was every "data" OP_RETURN
+          ;; output, and duplicate addresses went unnoticed. Sharing the
+          ;; function is also what keeps the amount and address errors from
+          ;; drifting into a second dialect.
+          (tx-outputs
+            (mapcar (lambda (r)
+                      (bitcoin-lisp.serialization:make-tx-out
+                       :value (recipient-amount r)
+                       :script-pubkey (recipient-script r)))
+                    (%parse-outputs network outputs))))
       ;; Create transaction
       (let ((tx (bitcoin-lisp.serialization:make-transaction
                  :version 2
                  :inputs (coerce tx-inputs 'simple-vector)
-                 :outputs (coerce (nreverse tx-outputs) 'simple-vector)
+                 :outputs (coerce tx-outputs 'simple-vector)
                  :lock-time locktime)))
         (bitcoin-lisp.crypto:bytes-to-hex
          (bitcoin-lisp.serialization:transaction-wire-bytes tx))))))

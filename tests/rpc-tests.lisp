@@ -2110,6 +2110,101 @@ makes the tests meaningful again."
         "the two JSON shapes produced different transactions:~%  ~A~%  ~A"
         as-alist as-hash)))
 
+(test createrawtransaction-takes-cores-outputs-forms
+  "Core parses this argument in ONE place and accepts TWO spellings.
+NormalizeOutputs (rawtransaction_util.cpp:74-99) takes either an object
+{address: amount} or an ARRAY of single-key objects, and merges the array into
+a dict — the array form exists because it preserves ORDER, which is why the
+functional suite uses it (rpc_createmultisig.py:117). ParseOutputs then handles
+the \"data\" key as an OP_RETURN and refuses duplicate keys.
+
+%PARSE-OUTPUTS is that function here, and createrawtransaction was the one
+caller not using it: its own loop took the object form only, so the array form
+answered \"Invalid outputs format\", a data output was impossible, and duplicate
+addresses passed silently. The twelfth time this wave that the code existed and
+the caller that needed it did not use it."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (node (bitcoin-lisp::make-node :network :regtest))
+         (txid "0000000000000000000000000000000000000000000000000000000000000001")
+         (addr "bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy")
+         (addr2 "bcrt1qqurswpc8qurswpc8qurswpc8qurswpc8dxm0gk"))
+    (flet ((obj (&rest pairs)
+             (let ((h (make-hash-table :test 'equal)))
+               (loop for (k v) on pairs by #'cddr do (setf (gethash k h) v))
+               h))
+           (ins () (list (list (cons "txid" txid) (cons "vout" 0)))))
+      ;; The two spellings of the same single output agree.
+      (let ((as-object (bitcoin-lisp.rpc::rpc-createrawtransaction
+                        node (list (ins) (obj addr 0.5d0))))
+            (as-array (bitcoin-lisp.rpc::rpc-createrawtransaction
+                       node (list (ins) (list (obj addr 0.5d0))))))
+        (is (stringp as-array) "the array-of-objects form did not produce a transaction")
+        (is (equal as-object as-array)
+            "the object and array spellings produced different transactions:~%  ~A~%  ~A"
+            as-object as-array))
+      ;; The array form keeps its ORDER, which is the reason Core has it. Two
+      ;; distinct addresses with distinct amounts pin which output came first.
+      (let* ((hex (bitcoin-lisp.rpc::rpc-createrawtransaction
+                   node (list (ins) (list (obj addr 0.5d0) (obj addr2 0.25d0)))))
+             (tx (flexi-streams:with-input-from-sequence
+                     (s (bitcoin-lisp.crypto:hex-to-bytes hex))
+                   (bitcoin-lisp.serialization:read-transaction s)))
+             (outs (bitcoin-lisp.serialization:transaction-outputs tx)))
+        (is (= 2 (length outs)))
+        (is (= 50000000 (bitcoin-lisp.serialization:tx-out-value (aref outs 0))))
+        (is (= 25000000 (bitcoin-lisp.serialization:tx-out-value (aref outs 1)))))
+      ;; A "data" key is an OP_RETURN output carrying zero value, not an address.
+      (let* ((hex (bitcoin-lisp.rpc::rpc-createrawtransaction
+                   node (list (ins) (list (obj "data" "deadbeef")))))
+             (tx (flexi-streams:with-input-from-sequence
+                     (s (bitcoin-lisp.crypto:hex-to-bytes hex))
+                   (bitcoin-lisp.serialization:read-transaction s)))
+             (out (aref (bitcoin-lisp.serialization:transaction-outputs tx) 0))
+             (spk (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
+        (is (= 0 (bitcoin-lisp.serialization:tx-out-value out)))
+        (is (= #x6a (aref spk 0)) "a data output must be an OP_RETURN"))
+      ;; Duplicates are refused, where the old loop accepted them silently.
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-createrawtransaction
+         node (list (ins) (list (obj addr 0.5d0) (obj addr 0.25d0))))))))
+
+(test signrawtransactionwithkey-takes-real-json-prevtxs
+  "prevtxs is an ARRAY OF OBJECTS, and each object arrives as a HASH-TABLE from
+a real client. This handler read them with ASSOC, which is a type error on a
+hash-table, and the error escaped to the client as \"-32603 Internal error: The
+value #<HASH-TABLE ...> is not of type LIST\" — so the method could not be
+called with prevtxs at all, which is how
+rpc_signrawtransactionwithkey.py:71 calls it. Every unit test passed by handing
+it alists. Same defect as createrawtransaction's inputs in #491, one file over.
+
+Signing needs a key we do not have here; what this pins is that the prevout map
+is BUILT from either shape, so the two must fail identically and never with an
+internal error."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (node (bitcoin-lisp::make-node :network :regtest))
+         (txid "0000000000000000000000000000000000000000000000000000000000000001")
+         (spk "76a91460baa0f494b38ce3c940dea67f3804dc52d1fb9488ac")
+         (raw (bitcoin-lisp.rpc::rpc-createrawtransaction
+               node (list (list (list (cons "txid" txid) (cons "vout" 0)))
+                          (let ((h (make-hash-table :test 'equal)))
+                            (setf (gethash "bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy" h) 0.5d0)
+                            h))))
+         (as-hash (let ((h (make-hash-table :test 'equal)))
+                    (setf (gethash "txid" h) txid
+                          (gethash "vout" h) 0
+                          (gethash "scriptPubKey" h) spk)
+                    h))
+         (as-alist (list (cons "txid" txid) (cons "vout" 0)
+                         (cons "scriptPubKey" spk))))
+    (let ((from-hash (bitcoin-lisp.rpc::rpc-signrawtransactionwithkey
+                      node (list raw '() (list as-hash))))
+          (from-alist (bitcoin-lisp.rpc::rpc-signrawtransactionwithkey
+                       node (list raw '() (list as-alist)))))
+      ;; No internal error, and the same answer from both shapes.
+      (is (equal from-alist from-hash)
+          "the two JSON shapes produced different results:~%  ~A~%  ~A"
+          from-alist from-hash))))
+
 (test deriveaddresses-expands-a-multipath-descriptor
   "A multipath descriptor denotes SEVERAL descriptors, and Core's
 deriveaddresses returns one address array per expansion — an array of arrays
