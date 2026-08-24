@@ -1276,7 +1276,7 @@ queues. Returns T when the tx was found in the mempool and queued."
 
 (defun load-mempool-from-disk
     (node &optional (path (bitcoin-lisp.mempool:mempool-dat-path (node-data-directory node)))
-     &key (apply-unbroadcast t))
+     &key (apply-unbroadcast t) (apply-fee-delta-priority t) (use-current-time nil))
   "Load a mempool.dat-format file through the normal acceptance path (Core
 LoadMempool): prioritisation deltas first (so fee policy sees them), then per-tx
 validation against the current UTXO set — stale entries (spent inputs, reorged
@@ -1286,7 +1286,23 @@ connection anyway. Residual deltas (txs not in the saved pool) are re-applied
 last, then the saved unbroadcast set for txs that made it back into the pool
 (Core node/mempool_persist.cpp:134-141) — unless APPLY-UNBROADCAST is NIL,
 which is the importmempool RPC's default (Core apply_unbroadcast_set,
-rpc/mempool.cpp:1115). PATH defaults to the node's mempool.dat. Returns
+rpc/mempool.cpp:1115).
+
+⚠️ The defaults here are the STARTUP ones, and all three are the OPPOSITE of
+importmempool's. Core keeps two sets (node/mempool_persist.h:20-25 for the boot
+load, rpc/mempool.cpp:1138-1141 for the RPC):
+
+              startup   importmempool
+  use_current_time          NIL         T
+  apply_fee_delta_priority   T          NIL
+  apply_unbroadcast_set      T          NIL
+
+The reasoning is that a boot load is restoring THIS node's own mempool — it
+wants the original entry times so expiry still means something, and it wants
+its own prioritisation back — while importmempool is ingesting someone else's
+file, where a foreign fee delta is not this operator's policy and a foreign
+timestamp would misdate the entry. PATH defaults to the node's mempool.dat.
+Returns
 (values accepted failed residual-count) on success, or NIL if the file is
 missing or corrupt."
   (when (and path (probe-file path))
@@ -1329,9 +1345,13 @@ missing or corrupt."
                           pct tried (- total tried))))
             (incf tried)
             (destructuring-bind (tx entry-time delta) rec
+              ;; Core overwrites the saved time with now BEFORE the fee delta
+              ;; and the acceptance (mempool_persist.cpp:95-97).
+              (when use-current-time
+                (setf entry-time (bitcoin-lisp.serialization:get-unix-time)))
               (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
                     (height (bitcoin-lisp.storage:current-height chain-state)))
-                (unless (zerop delta)
+                (when (and apply-fee-delta-priority (not (zerop delta)))
                   (bitcoin-lisp.mempool:mempool-prioritise mempool txid delta))
                 ;; CHAIN-STATE gates the finality/BIP68 checks — a saved tx
                 ;; that is no longer minable in the next block must not
@@ -1356,8 +1376,12 @@ missing or corrupt."
                          (incf accepted)
                          (incf failed)))
                     (t (incf failed)))))))
-          (dolist (pair residual)
-            (bitcoin-lisp.mempool:mempool-prioritise mempool (car pair) (cdr pair)))
+          ;; The residual map is gated on the same option as the per-entry
+          ;; deltas (mempool_persist.cpp:128-132) — importmempool must not
+          ;; import a foreign node's prioritisation by either route.
+          (when apply-fee-delta-priority
+            (dolist (pair residual)
+              (bitcoin-lisp.mempool:mempool-prioritise mempool (car pair) (cdr pair))))
           ;; Restore the unbroadcast set for txs that were re-accepted; ids
           ;; whose tx failed to reload are dropped (mempool-add-unbroadcast's
           ;; membership gate) — Core node/mempool_persist.cpp:136-142.

@@ -3186,10 +3186,26 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
           (if (= leaf-version #xc0)
               ;; Leaf version 0xc0 = Tapscript (BIP 342)
               (progn
-                ;; 1. Pre-scan for OP_SUCCESS
-                ;; If any OP_SUCCESS opcode is found, script succeeds immediately
+                ;; 1. Pre-scan for OP_SUCCESS. An OP_SUCCESSx opcode makes the
+                ;; script succeed immediately — unless DISCOURAGE_OP_SUCCESS is
+                ;; set, in which case it is an error
+                ;; (interpreter.cpp:1845-1850).
+                ;;
+                ;; The flag is POLICY, not consensus: it is in
+                ;; STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:130) and NOT in
+                ;; MANDATORY_SCRIPT_VERIFY_FLAGS (:104-110), and our block flag
+                ;; set (BLOCK-SCRIPT-FLAGS-LIST) does not carry it either. So a
+                ;; block containing such a tapscript stays valid; what changes is
+                ;; that we stop accepting one into the mempool and RELAYING it,
+                ;; which every Core node refuses as non-standard.
+                ;;
+                ;; The flag was declared in +standard-policy-flags+ and read by
+                ;; nothing until now.
                 (when (scan-for-op-success script)
-                  (return-from validate-taproot-script-path (values t nil)))
+                  (return-from validate-taproot-script-path
+                    (if (flag-enabled-p "DISCOURAGE_OP_SUCCESS")
+                        (values nil :discourage-op-success)
+                        (values t nil))))
 
                 ;; 2. Initial witness stack limits. ExecuteWitnessScript
                 ;; (interpreter.cpp:1854-1861) applies them in this order, and

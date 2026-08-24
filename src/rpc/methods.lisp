@@ -86,6 +86,19 @@ matching Bitcoin Core's uint256::GetHex."
                         ("prune_target_size" . ,(if (bitcoin-lisp:automatic-pruning-p)
                                                     (* bitcoin-lisp:*prune-target-mib* 1048576)
                                                     0)))))))
+    ;; Core reports the signet challenge here too, on a signet chain and
+    ;; nowhere else (rpc/blockchain.cpp:1436-1440); feature_signet.py asserts
+    ;; it. This is the third place the challenge belongs — getmininginfo had
+    ;; it, getblocktemplate now does, and a client that only reads chain info
+    ;; had no way to learn it.
+    (when (eq (bitcoin-lisp::node-network node) :signet)
+      (let ((challenge (bitcoin-lisp.validation:signet-challenge-for-network
+                        (bitcoin-lisp::node-network node))))
+        (when challenge
+          (setf result
+                (append result
+                        `(("signet_challenge"
+                           . ,(bitcoin-lisp.crypto:bytes-to-hex challenge))))))))
     result))
 
 (defun %getchainstates-entry (chain-state syncing)
@@ -2960,17 +2973,32 @@ acceptance path (Bitcoin Core importmempool). PARAMS: (filepath [options]).
 Entries are validated against the current UTXO set; their prioritisation deltas
 are applied. The options object supports apply_unbroadcast_set (default false,
 Core rpc/mempool.cpp:1115-1116: only restore the file's unbroadcast set when
-asked — unlike the startup load, where it defaults on);
-apply_fee_delta_priority/use_current_time remain no-ops. Returns an empty
-object."
+asked — unlike the startup load, where it defaults on), and now
+apply_fee_delta_priority (default false) and use_current_time (default true),
+both of which were accepted and ignored. Returns an empty object.
+
+All three RPC defaults are the OPPOSITE of the startup load's
+(node/mempool_persist.h:20-25 vs rpc/mempool.cpp:1138-1141), because this RPC
+ingests someone else's file: a foreign fee delta is not this operator's policy,
+and a foreign timestamp would misdate the entry.
+
+⚠️ use_current_time defaults to TRUE, so absence and an explicit false must be
+told apart — and a nested JSON false folds to NIL exactly like an absent key
+(rpc/server.lisp:333-337). GETHASH's second value is the only thing that
+separates them."
   (let ((filepath (first params))
         (options (second params)))
     (unless (and (stringp filepath) (plusp (length filepath)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "filepath must be a string"))
+    (flet ((opt (name default)
+             (if (hash-table-p options)
+                 (multiple-value-bind (v present) (gethash name options)
+                   (if present (and v t) default))
+                 default)))
     (let ((path (probe-file filepath))
-          (apply-unbroadcast (and (hash-table-p options)
-                                  (gethash "apply_unbroadcast_set" options)
-                                  t)))
+          (apply-unbroadcast (opt "apply_unbroadcast_set" nil))
+          (apply-fee-delta (opt "apply_fee_delta_priority" nil))
+          (use-current-time (opt "use_current_time" t)))
       (unless path
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message (format nil "Can't open mempool file ~A" filepath)))
@@ -2980,9 +3008,12 @@ object."
       ;; LoadMempool, rpc/mempool.cpp:1130).
       (unless (with-node-lock (node)
                 (bitcoin-lisp::load-mempool-from-disk
-                 node path :apply-unbroadcast apply-unbroadcast))
+                 node path
+                 :apply-unbroadcast apply-unbroadcast
+                 :apply-fee-delta-priority apply-fee-delta
+                 :use-current-time use-current-time))
         (error 'rpc-error :code +rpc-misc-error+
-                          :message "Unable to import mempool file (unreadable or corrupt)")))
+                          :message "Unable to import mempool file (unreadable or corrupt)"))))
     ;; Core returns an empty object; an empty hash-table serializes as {}.
     (make-hash-table :test 'equal)))
 
@@ -3777,20 +3808,92 @@ selected tx with data/txid/hash/depends/fee/sigops/weight. `depends` holds the
                     ("sigops" . ,(bitcoin-lisp.mempool:mempool-entry-sigops e))
                     ("weight" . ,(bitcoin-lisp.serialization:transaction-weight tx))))))
 
-(defun %gbt-rules (height)
-  "Active versionbits soft-fork rule names for a block at HEIGHT, as Bitcoin
-Core's getblocktemplate \"rules\" array. segwit carries the \"!\" prefix
+(defun %gbt-rules (network height)
+  "Active versionbits soft-fork rule names for a block at HEIGHT on NETWORK, as
+Bitcoin Core's getblocktemplate \"rules\" array. segwit carries the \"!\" prefix
 (mandatory: a miner that doesn't understand it must not build the template),
 mirroring Core. Without this array, segwit/taproot-aware miners reject the
-template outright."
-  (let ((net bitcoin-lisp:*network*) (rules '()))
-    (when (>= height (bitcoin-lisp.validation:get-csv-activation-height net))
-      (push "csv" rules))
+template outright.
+
+NETWORK is a parameter rather than a read of the global `*network*' because the
+other two places in this same response that depend on the chain — the
+signet_challenge field and the client-rules check — read the NODE's network.
+Two sources of truth for one consensus fact inside one reply can disagree the
+moment `*network*' is dynamically bound, which tests do routinely, and the
+template cache is keyed on the node."
+  (let ((net network) (rules '()))
+    ;; Core pushes "csv" UNCONDITIONALLY (rpc/mining.cpp:949), not gated on its
+    ;; activation height.
+    (push "csv" rules)
     (when (>= height (bitcoin-lisp.validation:get-segwit-activation-height net))
       (push "!segwit" rules))
+    ;; "!signet" tells the miner it must understand signet rules to mine this
+    ;; template at all (rpc/mining.cpp:951-955). Without it a signet miner has
+    ;; no way to know, which is half of why signet mining could not work here.
+    (when (eq net :signet)
+      (push "!signet" rules))
+    ;; taproot carries NO "!" prefix: its VersionBitsDeploymentInfo sets
+    ;; gbt_optional_rule = true (deploymentinfo.cpp:17-18), and gbt_rule_value
+    ;; only prefixes the mandatory ones (rpc/mining.cpp:605-611).
     (when (>= height (bitcoin-lisp.validation:get-taproot-activation-height net))
       (push "taproot" rules))
     (nreverse rules)))
+
+(defun %gbt-client-rules (params)
+  "The rule names the caller declared support for, as a list of strings.
+
+Core reads them only when \"rules\" is an ARRAY (rpc/mining.cpp:752-758). Any
+other shape — a bare string, a number, or the key being absent altogether —
+leaves the set EMPTY, which is exactly what makes the segwit check below fire.
+
+⚠️ A NESTED array does NOT reach a handler as a vector. yason parses arrays as
+vectors, but %NORMALIZE-JSON-VALUE recurses into every request object and turns
+each nested non-empty vector back into a LIST (rpc/server.lisp:338-356), on both
+the single-request and the batch path. So over the wire `{\"rules\":[\"segwit\"]}'
+arrives here as the LIST (\"segwit\"). A vector-only test read NIL from every
+real miner and answered all of them -8 — while a unit test that stuffed a vector
+straight into the request hash-table passed, because it never went through the
+normalizer. Both shapes are accepted here, and the tests now build their
+requests through the normalizer so that gap cannot reopen.
+
+A string is excluded explicitly: in Common Lisp a string is a vector, so
+`{\"rules\": \"segwit\"}' would otherwise read as the one-element array Core
+refuses to see.
+
+A nested EMPTY array folds to NIL (server.lisp:355), which is indistinguishable
+from an absent key — and that is correct, because in Core both leave
+setClientRules empty."
+  (let ((req (first params)))
+    (when (hash-table-p req)
+      (let ((v (gethash "rules" req)))
+        (let ((elements (cond ((stringp v) nil)
+                              ((listp v) v)
+                              ((vectorp v) (coerce v 'list))
+                              (t nil))))
+          ;; Core calls get_str() on each element, so a non-string one is a
+          ;; type error rather than a rule that silently does not match
+          ;; (rpc/mining.cpp:756-757, univalue type_error).
+          (dolist (e elements)
+            (unless (stringp e) (%json-type-error e "string")))
+          elements)))))
+
+(defun %gbt-check-client-rules (node params)
+  "Refuse a template request from a miner that has not declared the rules it
+must understand to mine what we are about to hand it (rpc/mining.cpp:845-856).
+
+Both messages and their ORDER are Core's: signet is checked first. Neither is
+reachable from mode=\"proposal\", because Core parses the rules array only
+AFTER the proposal branch has already returned (rpc/mining.cpp:729-758) — a
+proposal is a validation request, not a request for work."
+  (let ((rules (%gbt-client-rules params)))
+    (flet ((declared-p (name) (and (member name rules :test #'string=) t)))
+      (when (and (eq (bitcoin-lisp::node-network node) :signet)
+                 (not (declared-p "signet")))
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message "getblocktemplate must be called with the signet rule set (call with {\"rules\": [\"segwit\", \"signet\"]})"))
+      (unless (declared-p "segwit")
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})")))))
 
 (defun %gbt-proposal (node data)
   "Validate a submitted block template (Core getblocktemplate mode=\"proposal\",
@@ -3939,19 +4042,24 @@ scriptDummy) and dry-run through TestBlockValidity (Core CreateNewBlock,
 node/miner.cpp:227-231) — an invalid template errors here instead of reaching a
 miner."
   ;; mode="proposal" answers before anything is assembled: it is a VALIDATION
-  ;; request, not a request for work (rpc/mining.cpp:729-751).
+  ;; request, not a request for work (rpc/mining.cpp:729-751). A mode that is
+  ;; neither of the two Core knows is an error, not a silent template
+  ;; (rpc/mining.cpp:717-726 for a non-string mode, :762-763 for an unknown
+  ;; one) — a miner that misspells it was getting work it never asked for.
   (multiple-value-bind (mode data) (%gbt-request-mode params)
+    (unless (or (null mode) (stringp mode))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid mode"))
     (when (and (stringp mode) (string= mode "proposal"))
-      (return-from rpc-getblocktemplate (%gbt-proposal node data))))
-  ;; longpoll: wait BEFORE the connectivity checks and the assembly, as Core
-  ;; does — the caller is asking us to hold the request open until there is
-  ;; something new to say.
-  (let ((id (%gbt-longpoll-id params)))
-    (when id (%gbt-wait-for-change node id)))
-  ;; Core rpc/mining.cpp:767-772: on a non-test chain (mainnet only — all
+      (return-from rpc-getblocktemplate (%gbt-proposal node data)))
+    (unless (or (null mode) (string= mode "template"))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid mode")))
+  ;; Core rpc/mining.cpp:765-774: on a non-test chain (mainnet only — all
   ;; test networks have m_is_test_chain), refuse while unconnected (-9,
   ;; RPC_CLIENT_NOT_CONNECTED) or in initial block download (-10,
-  ;; RPC_CLIENT_IN_INITIAL_DOWNLOAD).
+  ;; RPC_CLIENT_IN_INITIAL_DOWNLOAD). These come BEFORE the longpoll wait:
+  ;; holding a request open for a node that cannot mine anyway is exactly what
+  ;; Core avoids by checking first. This file previously did the reverse and
+  ;; said it was Core's order.
   (when (eq (bitcoin-lisp::node-network node) :mainnet)
     (when (zerop (length (rpc-get-peers node)))
       (error 'rpc-error :code +rpc-client-not-connected+
@@ -3959,6 +4067,13 @@ miner."
     (when (rpc-is-syncing node)
       (error 'rpc-error :code +rpc-client-in-initial-download+
                         :message "Bitcoin is in initial sync and waiting for blocks...")))
+  ;; longpoll: hold the request open until there is something new to say.
+  (let ((id (%gbt-longpoll-id params)))
+    (when id (%gbt-wait-for-change node id)))
+  ;; The client's declared rules are checked AFTER the longpoll wait, as Core
+  ;; does, and BEFORE the cache is consulted — a cached template must never be
+  ;; handed to a caller whose request should have been refused.
+  (%gbt-check-client-rules node params)
   (let* ((chain-state (rpc-get-chain-state node))
          (mempool (rpc-get-mempool node))
          (tip-hex (hash-to-hex (bitcoin-lisp.storage:best-block-hash chain-state)))
@@ -4030,13 +4145,25 @@ cache above wraps exactly the expensive part and nothing else."
       ("curtime" . ,(bitcoin-lisp.mining:block-template-curtime template))
       ("bits" . ,(%bits-hex bits))
       ("height" . ,(bitcoin-lisp.mining:block-template-height template))
+      ;; Core emits signet_challenge on a signet chain and nowhere else
+      ;; (rpc/mining.cpp:1017-1019), as the raw challenge script in hex. A
+      ;; signet miner cannot build the block's signet solution without it, so
+      ;; omitting it made signet mining against this node impossible; we
+      ;; reported the challenge from getmininginfo only, which no miner reads.
+      ,@(when (eq (bitcoin-lisp::node-network node) :signet)
+          (let ((challenge (bitcoin-lisp.validation:signet-challenge-for-network
+                            (bitcoin-lisp::node-network node))))
+            (when challenge
+              (list (cons "signet_challenge"
+                          (bitcoin-lisp.crypto:bytes-to-hex challenge))))))
       ("default_witness_commitment"
        . ,(bitcoin-lisp.crypto:bytes-to-hex
            (bitcoin-lisp.mining:block-template-default-witness-commitment-script template)))
       ;; Active soft-fork rules + versionbits signaling state. No BIP9
       ;; deployment is currently pending on any of our networks, so
       ;; vbavailable is empty and vbrequired is 0.
-      ("rules" . ,(%gbt-rules (bitcoin-lisp.mining:block-template-height template)))
+      ("rules" . ,(%gbt-rules (bitcoin-lisp::node-network node)
+                              (bitcoin-lisp.mining:block-template-height template)))
       ("vbavailable" . ,(make-hash-table :test 'equal))
       ("vbrequired" . 0)
       ;; longpoll id: <best chain hash><nTransactionsUpdatedLast> (Core

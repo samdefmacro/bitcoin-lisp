@@ -1378,9 +1378,51 @@ further)."
 ;;;; empty unbroadcast set.
 
 (defconstant +mempool-dat-magic+ #x4d504c01
-  "Magic identifying a mempool.dat file (\"MPL\" + 0x01).")
+  "Magic identifying a LEGACY mempool.dat file (\"MPL\" + 0x01), the format this
+node wrote before it learned Core's. Still read, never written — see
+READ-MEMPOOL-FILE.")
 
 (defconstant +mempool-dat-version+ 2)
+
+;;;; --- Core's mempool.dat (node/mempool_persist.cpp) ----------------------
+;;;;
+;;;; importmempool exists to move a mempool between nodes, and it could not:
+;;;; our own format meant a Core dump was unreadable here and ours unreadable
+;;;; there. Core's layout, derived from DumpMempool/LoadMempool:
+;;;;
+;;;;   u64 LE  version                  ; 1 = no key, 2 = obfuscated
+;;;;   [v2] the obfuscation key, serialized as a VECTOR — a compact-size 0x08
+;;;;        followed by 8 key bytes, so 9 bytes on disk, not 8
+;;;;   ---- everything past this point is XORed ----
+;;;;   u64 LE  transaction count
+;;;;   per tx: the witness-form transaction (self-delimiting, no length prefix)
+;;;;           i64 LE entry time
+;;;;           i64 LE fee delta
+;;;;   compact-size mapDeltas count, then [txid 32B | i64 LE delta]*
+;;;;   compact-size unbroadcast count, then [txid 32B]*
+;;;;
+;;;; ⚠️ The XOR key offset is the ABSOLUTE FILE POSITION, not an offset into
+;;;; the obfuscated region: AutoFile passes its own m_position to the
+;;;; obfuscator (streams.cpp:25-27). Version (8) plus the key record (9) is 17
+;;;; bytes, and 17 is not a multiple of 8, so the FIRST payload byte is XORed
+;;;; with key byte 1 — not key byte 0. Getting that wrong produces a file Core
+;;;; reads as garbage while our own round-trip passes.
+;;;;
+;;;; Core has no checksum here; a truncated or corrupt file simply fails to
+;;;; parse and the mempool starts empty, which is what LoadMempool does too.
+
+(defconstant +core-mempool-dump-version-no-xor-key+ 1
+  "Core MEMPOOL_DUMP_VERSION_NO_XOR_KEY (node/mempool_persist.cpp:40).")
+
+(defconstant +core-mempool-dump-version+ 2
+  "Core MEMPOOL_DUMP_VERSION (node/mempool_persist.cpp:41).")
+
+(defconstant +core-mempool-obfuscation-key-size+ 8
+  "Core Obfuscation::KEY_SIZE = sizeof(uint64_t) (util/obfuscation.h:22-23).")
+
+(defconstant +core-mempool-payload-offset+ 17
+  "Absolute file offset of the first obfuscated byte: 8 for the version plus 9
+for the key's vector serialization.")
 
 (defun mempool-dat-path (data-directory)
   "Path of the mempool persistence file under DATA-DIRECTORY, or NIL."
@@ -1402,52 +1444,222 @@ than any of its parents)."
     (mapcar (lambda (triple) (cons (first triple) (second triple)))
             (sort pairs #'< :key #'third))))
 
-(defun save-mempool-file (mempool path)
-  "Persist MEMPOOL (entries + prioritisation deltas + the unbroadcast txid
-set) to PATH atomically. Returns the number of entries written."
+(defun %bytes-lessp (a b)
+  "Lexicographic order on byte vectors, which is how std::map<uint256,...> and
+std::set<uint256> order their keys and therefore the order Core serializes
+them in."
+  (let ((n (min (length a) (length b))))
+    (dotimes (i n (< (length a) (length b)))
+      (let ((x (aref a i)) (y (aref b i)))
+        (cond ((< x y) (return t))
+              ((> x y) (return nil)))))))
+
+(defun %core-mempool-payload (mempool)
+  "The obfuscated region of a Core mempool.dat, before obfuscation is applied.
+Returns (values bytes entry-count) — the count so the caller does not have to
+recompute the parents-first ordering, which on a large mempool is not cheap."
   (let ((ordered (%mempool-entries-parents-first mempool))
         (residual '())
-        (unbroadcast (mempool-unbroadcast-txids mempool)))
+        (unbroadcast (copy-list (mempool-unbroadcast-txids mempool))))
     (maphash (lambda (txid delta)
                (unless (mempool-has mempool txid)
                  (push (cons txid delta) residual)))
              (mempool-deltas mempool))
-    (bitcoin-lisp.storage:save-file-with-crc32
-     path
-     (lambda (s)
-       (bitcoin-lisp.serialization:write-uint32-le s +mempool-dat-magic+)
-       (bitcoin-lisp.serialization:write-uint8 s +mempool-dat-version+)
-       (bitcoin-lisp.serialization:write-uint32-le s (length ordered))
-       (loop for (txid . entry) in ordered
-             for bytes = (bitcoin-lisp.serialization:transaction-wire-bytes
-                          (mempool-entry-transaction entry))
-             do (bitcoin-lisp.serialization:write-uint32-le s (length bytes))
-                (write-sequence bytes s)
-                (bitcoin-lisp.serialization:write-uint64-le s (mempool-entry-entry-time entry))
-                (bitcoin-lisp.serialization:write-int64-le
-                 s (gethash txid (mempool-deltas mempool) 0)))
-       (bitcoin-lisp.serialization:write-uint32-le s (length residual))
-       (loop for (txid . delta) in residual
-             do (write-sequence txid s)
-                (bitcoin-lisp.serialization:write-int64-le s delta))
-       ;; v2: the unbroadcast set, trailing like Core's
-       ;; (node/mempool_persist.cpp:205-206, after mapDeltas).
-       (bitcoin-lisp.serialization:write-uint32-le s (length unbroadcast))
-       (dolist (txid unbroadcast)
-         (write-sequence txid s))))
-    (length ordered)))
+    ;; Core's mapDeltas is a std::map and its unbroadcast set a std::set, so
+    ;; both come out of the serializer in key order. Sorting makes our file
+    ;; byte-identical to the one Core would write for the same mempool.
+    (setf residual (sort residual #'%bytes-lessp :key #'car)
+          unbroadcast (sort unbroadcast #'%bytes-lessp))
+    (values
+     (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+      (bitcoin-lisp.serialization:write-uint64-le s (length ordered))
+      (loop for (txid . entry) in ordered
+            do (write-sequence (bitcoin-lisp.serialization:transaction-wire-bytes
+                                (mempool-entry-transaction entry))
+                               s)
+               (bitcoin-lisp.serialization:write-int64-le
+                s (mempool-entry-entry-time entry))
+               (bitcoin-lisp.serialization:write-int64-le
+                s (gethash txid (mempool-deltas mempool) 0)))
+      (bitcoin-lisp.serialization:write-compact-size s (length residual))
+      (loop for (txid . delta) in residual
+            do (write-sequence txid s)
+               (bitcoin-lisp.serialization:write-int64-le s delta))
+      (bitcoin-lisp.serialization:write-compact-size s (length unbroadcast))
+      (dolist (txid unbroadcast)
+        (write-sequence txid s)))
+     (length ordered))))
+
+(defun core-mempool-file-bytes (mempool &key key)
+  "MEMPOOL as a complete Core-format mempool.dat. Returns (values bytes count).
+
+COUNT rides out with the bytes so the caller does not have to recompute the
+parents-first ordering just to report how many entries it wrote — on a large
+mempool that walk is not cheap, and the shutdown save is on the critical path
+of a restart.
+
+KEY is the 8-byte obfuscation key; a fresh random one is generated when it is
+not supplied. Passing it is what lets a test assert an exact byte layout."
+  (let* ((key (or key
+                  (let ((k (make-array +core-mempool-obfuscation-key-size+
+                                       :element-type '(unsigned-byte 8))))
+                    (dotimes (i (length k) k)
+                      (setf (aref k i) (random 256))))))
+         (count 0)
+         (payload (multiple-value-bind (bytes n) (%core-mempool-payload mempool)
+                    (setf count n)
+                    bytes)))
+    (assert (= (length key) +core-mempool-obfuscation-key-size+))
+    ;; The key offset is the ABSOLUTE file position of each byte, so the
+    ;; payload starts at 17 and its first byte pairs with key byte 1.
+    (let ((obfuscated (copy-seq payload)))
+      (bitcoin-lisp.storage:obfuscate! obfuscated key
+                                       :key-offset +core-mempool-payload-offset+)
+      (values
+       (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+        (bitcoin-lisp.serialization:write-uint64-le s +core-mempool-dump-version+)
+        ;; The key is serialized as a VECTOR: a compact-size length then the
+        ;; bytes (util/obfuscation.h:61-68). Nine bytes, not eight.
+        (bitcoin-lisp.serialization:write-compact-size
+         s +core-mempool-obfuscation-key-size+)
+        (write-sequence key s)
+        (write-sequence obfuscated s))
+       count))))
+
+(defun read-core-mempool-file-bytes (data)
+  "Parse DATA as a Core mempool.dat. Returns
+(values entries residual-deltas ok-p unbroadcast-txids), the same shape
+READ-MEMPOOL-FILE returns, or (values nil nil nil nil) when DATA is not one.
+
+Core returns false for any version it does not know (mempool_persist.cpp:69)
+and starts with an empty mempool; so do we."
+  (handler-case
+      (let* ((br (bitcoin-lisp.serialization:make-byte-reader-from data))
+             (version (bitcoin-lisp.serialization:br-read-u64-le br))
+             (payload-offset 8)
+             (key nil))
+        (cond
+          ((= version +core-mempool-dump-version-no-xor-key+))
+          ((= version +core-mempool-dump-version+)
+           (let ((n (bitcoin-lisp.serialization:br-read-compact-size br)))
+             (unless (= n +core-mempool-obfuscation-key-size+)
+               (return-from read-core-mempool-file-bytes (values nil nil nil nil)))
+             (setf key (bitcoin-lisp.serialization:br-read-bytes br n)
+                   ;; 8 for the version, 1 for the compact size, 8 for the key.
+                   payload-offset +core-mempool-payload-offset+)))
+          (t (return-from read-core-mempool-file-bytes (values nil nil nil nil))))
+        (let ((payload (subseq data payload-offset)))
+          (when key
+            (bitcoin-lisp.storage:obfuscate! payload key :key-offset payload-offset))
+          (let* ((pr (bitcoin-lisp.serialization:make-byte-reader-from payload))
+                 (count (bitcoin-lisp.serialization:br-read-u64-le pr))
+                 (entries '()))
+            (dotimes (i count)
+              (let* ((tx (bitcoin-lisp.serialization:br-read-transaction pr))
+                     (time (bitcoin-lisp.serialization:br-read-i64-le pr))
+                     (delta (bitcoin-lisp.serialization:br-read-i64-le pr)))
+                (push (list tx time delta) entries)))
+            (let ((residual '())
+                  (unbroadcast '()))
+              (dotimes (i (bitcoin-lisp.serialization:br-read-compact-size pr))
+                (let ((txid (bitcoin-lisp.serialization:br-read-bytes pr 32)))
+                  (push (cons txid (bitcoin-lisp.serialization:br-read-i64-le pr))
+                        residual)))
+              (dotimes (i (bitcoin-lisp.serialization:br-read-compact-size pr))
+                (push (bitcoin-lisp.serialization:br-read-bytes pr 32) unbroadcast))
+              (values (nreverse entries) (nreverse residual) t
+                      (nreverse unbroadcast))))))
+    (error () (values nil nil nil nil))))
+
+(defun %save-bytes-atomically (path bytes)
+  "Write BYTES to PATH via a temp file, fsync and rename — the same crash-safe
+shape SAVE-FILE-WITH-CRC32 uses, without appending a checksum Core would not
+understand."
+  (ensure-directories-exist path)
+  (let ((tmp (make-pathname :defaults path
+                            :type (concatenate 'string
+                                               (or (pathname-type path) "dat")
+                                               ".tmp"))))
+    (with-open-file (out tmp :direction :output :if-exists :supersede
+                             :element-type '(unsigned-byte 8))
+      (write-sequence bytes out)
+      (finish-output out))
+    (bitcoin-lisp.storage::fsync-file tmp)
+    (rename-file tmp path)
+    (bitcoin-lisp.storage::fsync-directory path)))
+
+(defun save-mempool-file (mempool path)
+  "Persist MEMPOOL (entries + prioritisation deltas + the unbroadcast txid
+set) to PATH atomically, in CORE'S format. Returns the number of entries
+written.
+
+This used to write a format of our own, which meant importmempool — an RPC
+whose entire purpose is moving a mempool between nodes — could not read a Core
+dump or produce one Core could read. READ-MEMPOOL-FILE still accepts the old
+format, so an existing on-disk mempool survives the upgrade and is rewritten in
+Core's format on the next save."
+  (multiple-value-bind (bytes count) (core-mempool-file-bytes mempool)
+    (%save-bytes-atomically path bytes)
+    count))
+
+(defun %read-file-bytes (path &optional limit)
+  "The file at PATH as a byte vector — the whole of it, or its first LIMIT
+bytes. NIL when it is missing or unreadable.
+
+LIMIT exists so format detection does not have to read the file: a live
+mempool.dat can be tens of megabytes, and reading it once to look at four bytes
+and then again to parse it is a cost with nothing to show for it."
+  (handler-case
+      (with-open-file (in path :direction :input :element-type '(unsigned-byte 8)
+                               :if-does-not-exist nil)
+        (when in
+          (let* ((n (if limit (min limit (file-length in)) (file-length in)))
+                 (buf (make-array n :element-type '(unsigned-byte 8))))
+            (read-sequence buf in)
+            buf)))
+    (error () nil)))
+
+(defun %legacy-mempool-file-p (path)
+  "T when PATH opens with the legacy magic. Reads four bytes, not the file.
+
+Core's mempool.dat opens with a u64 version of 1 or 2, so its first four bytes
+are 01 00 00 00 or 02 00 00 00 and can never be mistaken for 0x4d504c01."
+  (let ((head (%read-file-bytes path 4)))
+    (and head (= 4 (length head))
+         (= (logior (aref head 0) (ash (aref head 1) 8)
+                    (ash (aref head 2) 16) (ash (aref head 3) 24))
+            +mempool-dat-magic+))))
 
 (defun read-mempool-file (path)
-  "Read a mempool.dat written by save-mempool-file. Returns
+  "Read a mempool.dat. Returns
 (values entries residual-deltas ok-p unbroadcast-txids) where ENTRIES is a
 list of (tx entry-time fee-delta) in file (parents-first) order,
 RESIDUAL-DELTAS is an alist of (txid . delta), and UNBROADCAST-TXIDS is a
-list of txids awaiting initial broadcast (always NIL for version-1 files,
-which predate the set). OK-P is NIL when the file is missing, corrupt, or
-an unknown version — callers continue with an empty mempool, like Core."
+list of txids awaiting initial broadcast. OK-P is NIL when the file is
+missing, corrupt, or an unknown version — callers continue with an empty
+mempool, like Core.
+
+BOTH formats are accepted: Core's, which we now write, and the legacy one this
+node used to write. The two are told apart by their first four bytes — the
+legacy magic is 0x4d504c01, and Core's file opens with a u64 version of 1 or 2,
+so its first four bytes can never collide.
+
+Dropping the legacy reader instead would turn the first restart after this
+change into a silent loss of the whole mempool, which on a node with a large
+mempool.dat is a long outage that logs nothing."
+  (if (%legacy-mempool-file-p path)
+      (%read-legacy-mempool-file path)
+      (let ((raw (%read-file-bytes path)))
+        (if raw
+            (read-core-mempool-file-bytes raw)
+            (values nil nil nil nil)))))
+
+(defun %read-legacy-mempool-file (path)
+  "Read a mempool.dat in the format this node wrote before it learned Core's.
+Kept so an existing on-disk mempool survives the upgrade; nothing writes it."
   (let ((data (bitcoin-lisp.storage:load-file-with-crc32 path 13)))
     (unless data
-      (return-from read-mempool-file (values nil nil nil nil)))
+      (return-from %read-legacy-mempool-file (values nil nil nil nil)))
     (handler-case
         ;; The byte-reader spans the full verified buffer; parsing reads
         ;; exactly the declared counts, so the trailing CRC bytes (already
@@ -1457,7 +1669,7 @@ an unknown version — callers continue with an empty mempool, like Core."
           (unless (and (= (bitcoin-lisp.serialization:br-read-u32-le br) +mempool-dat-magic+)
                        (<= 1 (setf version (bitcoin-lisp.serialization:br-read-u8 br))
                            +mempool-dat-version+))
-            (return-from read-mempool-file (values nil nil nil nil)))
+            (return-from %read-legacy-mempool-file (values nil nil nil nil)))
           (let* ((count (bitcoin-lisp.serialization:br-read-u32-le br))
                  (entries
                    (loop repeat count
