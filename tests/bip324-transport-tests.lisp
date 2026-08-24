@@ -30,6 +30,46 @@ it, and run BODY with both connection structs bound. Closes everything after."
                   (bitcoin-lisp.networking:close-connection ,server-conn))))
          (bitcoin-lisp.networking::close-listener ,listener)))))
 
+(test buffered-input-is-visible-to-the-drain-loop
+  "The readers pull bytes with LISTEN on the Lisp STREAM, and a Lisp stream
+BUFFERS: bytes the kernel handed over live in userspace, where poll(2) on the
+fd cannot see them. So two messages arriving in ONE TCP segment both land in
+the stream buffer, the first is read, and a socket-only readiness check then
+says \"nothing more\" — leaving the second parked in a buffer we own until
+unrelated traffic happens to wake the socket.
+
+Measured before the fix: Core's sync_with_ping deliberately sends two pings
+back to back, and this node logged ELEVEN SECONDS between processing them.
+After: the same millisecond. Any two messages sharing a segment paid that,
+real peers included.
+
+The test reproduces the exact shape — write two messages' worth, take the
+first, then ask both questions. DATA-AVAILABLE-P is allowed to say either
+thing (whether the kernel still holds bytes is a scheduling detail); what must
+hold is that CONNECTION-INPUT-PENDING-P sees the buffered remainder."
+  (%with-loopback-pair (client server)
+    (is-true (and client server) "loopback pair did not come up")
+    (when (and client server)
+      (let ((payload (make-array 64 :element-type '(unsigned-byte 8)
+                                    :initial-element 7)))
+        ;; One write, so both halves have every chance to share a segment.
+        (bitcoin-lisp.networking:send-bytes client payload)
+        (%v2t-drain client)
+        ;; Let the bytes land.
+        (loop repeat 50
+              until (bitcoin-lisp.networking::data-available-p server :timeout 0.1)
+              do (sleep 0.02))
+        ;; Take the FIRST half through the reader, which drains via LISTEN and
+        ;; so pulls whatever the stream is holding into userspace.
+        (let ((first-half (bitcoin-lisp.networking::receive-bytes-resumable server 32)))
+          (is (not (eq first-half :incomplete))
+              "the first half never completed; the fixture proves nothing"))
+        ;; The remainder is now in OUR buffer. This is the assertion that
+        ;; fails against the bug.
+        (is-true (bitcoin-lisp.networking::connection-input-pending-p server)
+                 "buffered input is invisible to the drain loop — the second ~
+message of any pair sharing a TCP segment waits for unrelated traffic")))))
+
 (defun %v2t-drain (conn &key (seconds 10))
   "Push CONN's queued unsent bytes onto the wire, or give up after SECONDS.
 

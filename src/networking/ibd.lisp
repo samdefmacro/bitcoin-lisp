@@ -1859,8 +1859,13 @@ disconnects it so replace-disconnected-peers can refill the slot."
               ;; disconnect the peer (rate-limit, oversized payload), NILing
               ;; the connection or flipping connection-connected — both of
               ;; which data-available-p folds in (non-blocking, :timeout 0).
+              ;; INPUT-PENDING, not DATA-AVAILABLE: the readers drain through
+              ;; the Lisp stream, which buffers, so a second message sharing a
+              ;; TCP segment with the first is invisible to poll(2) on the fd.
+              ;; Asking the socket left it parked until unrelated traffic woke
+              ;; the connection — eleven seconds, measured.
               while (and (peer-connection peer)
-                         (data-available-p (peer-connection peer))
+                         (connection-input-pending-p (peer-connection peer))
                          ;; Byte fairness, checked between messages: a peer
                          ;; with plenty to say costs one turn, not the pass
                          ;; (see +max-recv-bytes-per-peer-per-cycle+).
