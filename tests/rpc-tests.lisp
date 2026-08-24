@@ -2016,6 +2016,43 @@ this a real oracle: the day Core adds an argument, this test notices."
                               (push row json))))))))))
     (values (nreverse json) (nreverse strings))))
 
+(test json-type-errors-use-cores-one-shape
+  "Core reports every argument type mismatch with ONE sentence, built in one
+place: \"JSON value of type <actual> is not of expected type <expected>\"
+(univalue.cpp:210-214), with uvTypeName's six names (:217-226).
+
+Ours wrote a different sentence at each site — \"First parameter must be an
+array of tx hex\", \"JSON value is not an integer as expected\" — all saying
+the same thing in words no caller can predict. Core's tests match on the
+canonical string: rpc_rawtransaction.py looks for \"not of expected type
+number\" and mempool_accept.py for \"JSON value of type string is not of
+expected type array\".
+
+The type NAMES are Core's, not Lisp's, which is the part that would rot
+silently: a list is an \"array\", a hash-table an \"object\", and the false
+sentinel a \"bool\"."
+  (flet ((message (value expected)
+           (handler-case (progn (bitcoin-lisp.rpc::%json-type-error value expected) nil)
+             (bitcoin-lisp.rpc::rpc-error (e)
+               (bitcoin-lisp.rpc::rpc-error-message e))))
+         (code (value expected)
+           (handler-case (progn (bitcoin-lisp.rpc::%json-type-error value expected) nil)
+             (bitcoin-lisp.rpc::rpc-error (e)
+               (bitcoin-lisp.rpc::rpc-error-code e)))))
+    (is (equal "JSON value of type string is not of expected type array"
+               (message "abc" "array")))
+    (is (equal "JSON value of type number is not of expected type string"
+               (message 5 "string")))
+    (is (equal "JSON value of type array is not of expected type number"
+               (message (list 1 2) "number")))
+    (is (equal "JSON value of type object is not of expected type array"
+               (message (make-hash-table :test 'equal) "array")))
+    (is (equal "JSON value of type bool is not of expected type number"
+               (message bitcoin-lisp.rpc::+json-false+ "number"))
+        "the false sentinel must name itself bool, not null")
+    ;; Core answers RPC_TYPE_ERROR (-3) for these, not a generic parameter error.
+    (is (eql bitcoin-lisp.rpc::+rpc-type-error+ (code "abc" "array")))))
+
 (test createrawtransaction-accepts-real-json-objects
   "A JSON object reaches an RPC handler as a HASH-TABLE from the decoder and as
 an ALIST from the unit tests. createrawtransaction read both its inputs and its
