@@ -5312,11 +5312,16 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid locktime"))
     ;; Build transaction inputs
+    ;; %OBJ-GET, not ASSOC. A JSON object reaches us as a HASH-TABLE from the
+    ;; decoder and as an ALIST from the unit tests, and ASSOC on a hash-table is
+    ;; a type error — so createrawtransaction failed for every real JSON-RPC
+    ;; client while the suite stayed green. The helper already existed, with a
+    ;; docstring naming this exact split; it just had the wrong callers.
     (let ((tx-inputs
             (loop for inp in inputs
-                  for txid-str = (cdr (assoc "txid" inp :test #'string=))
-                  for vout = (cdr (assoc "vout" inp :test #'string=))
-                  for sequence = (or (cdr (assoc "sequence" inp :test #'string=)) #xffffffff)
+                  for txid-str = (%obj-get inp "txid")
+                  for vout = (%obj-get inp "vout")
+                  for sequence = (or (%obj-get inp "sequence") #xffffffff)
                   do (unless (valid-hex-hash-p txid-str)
                        (error 'rpc-error :code +rpc-invalid-parameter+
                                          :message "Invalid input txid"))
@@ -5332,9 +5337,11 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
           (tx-outputs '()))
       ;; Build transaction outputs
       (cond
-        ;; Object format: {"address": amount, ...}
-        ((and (listp outputs) (every #'consp outputs))
-         (loop for (addr . amount) in outputs
+        ;; Object format: {"address": amount, ...} — hash-table from the
+        ;; decoder, alist from the tests; %OBJ-PAIRS flattens both.
+        ((or (hash-table-p outputs)
+             (and (listp outputs) outputs (every #'consp outputs)))
+         (loop for (addr . amount) in (%obj-pairs outputs)
                do (unless (and (stringp addr) (numberp amount))
                     (error 'rpc-error :code +rpc-invalid-parameter+
                                       :message "Invalid output format"))

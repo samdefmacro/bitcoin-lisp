@@ -2016,6 +2016,40 @@ this a real oracle: the day Core adds an argument, this test notices."
                               (push row json))))))))))
     (values (nreverse json) (nreverse strings))))
 
+(test createrawtransaction-accepts-real-json-objects
+  "A JSON object reaches an RPC handler as a HASH-TABLE from the decoder and as
+an ALIST from the unit tests. createrawtransaction read both its inputs and its
+outputs as alists, and ASSOC on a hash-table is a type error — so it failed for
+every real JSON-RPC client while this suite stayed green, because the suite
+passes alists.
+
+%OBJ-GET and %OBJ-PAIRS already existed for exactly this, with a docstring
+naming the split (\"alist (from tests / JSON-RPC 1.x) or a hash-table (from
+yason)\"). They just had the wrong callers — the eleventh time this wave that
+the correct code was present and unused.
+
+Both shapes must produce the SAME transaction, which is the property that
+makes the tests meaningful again."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (node (bitcoin-lisp::make-node :network :regtest))
+         (txid "0000000000000000000000000000000000000000000000000000000000000001")
+         (addr "bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy")
+         (as-hash (bitcoin-lisp.rpc::rpc-createrawtransaction
+                   node (list (list (let ((h (make-hash-table :test 'equal)))
+                                      (setf (gethash "txid" h) txid
+                                            (gethash "vout" h) 0)
+                                      h))
+                              (let ((h (make-hash-table :test 'equal)))
+                                (setf (gethash addr h) 0.5d0)
+                                h))))
+         (as-alist (bitcoin-lisp.rpc::rpc-createrawtransaction
+                    node (list (list (list (cons "txid" txid) (cons "vout" 0)))
+                               (list (cons addr 0.5d0))))))
+    (is (stringp as-hash) "the hash-table form did not produce a transaction")
+    (is (equal as-alist as-hash)
+        "the two JSON shapes produced different transactions:~%  ~A~%  ~A"
+        as-alist as-hash)))
+
 (test deriveaddresses-expands-a-multipath-descriptor
   "A multipath descriptor denotes SEVERAL descriptors, and Core's
 deriveaddresses returns one address array per expansion — an array of arrays

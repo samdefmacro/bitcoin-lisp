@@ -12,12 +12,27 @@
 
 (defun build-coinbase-transaction (height value &key script-pubkey
                                                      witness-commitment-script
+                                                     (segwit-active t)
                                                      (extranonce 0))
   "Build the coinbase for a block at HEIGHT paying VALUE to SCRIPT-PUBKEY. The
 scriptSig is the BIP34 height push followed by a 4-byte EXTRANONCE (so it is
 always >= 2 bytes). When WITNESS-COMMITMENT-SCRIPT is given, a zero-value output
-carrying it is appended and the coinbase gets the BIP141 reserved witness value
-(a single 32-byte zero item)."
+carrying it is appended; the BIP141 reserved witness value (a single 32-byte
+zero item) is added only when SEGWIT-ACTIVE.
+
+Those two are gated SEPARATELY, and that is Core's split rather than a
+refinement of it. GenerateCoinbaseCommitment appends the commitment output with
+no deployment check at all (validation.cpp:4029-4050); the coinbase WITNESS is
+added by UpdateUncommittedBlockStructures only under
+`DeploymentActiveAfter(pindexPrev, DEPLOYMENT_SEGWIT)` (:4021).
+
+Tying the witness to the commitment instead — which is what this did — builds a
+block carrying witness data on a chain where segwit is not yet active, and
+CONTEXTUAL block validation rejects exactly that as :UNEXPECTED-WITNESS. Our own
+VALIDATE-WITNESS-COMMITMENT is correct and says so; the assembler was handing it
+a block it was right to refuse, so the node could not mine at all under
+`-testactivationheight=segwit@N`. Invisible whenever segwit is active from
+genesis, which is every default network this node runs on."
   (let* ((bip34 (bitcoin-lisp.validation:encode-bip34-height height))
          (extra (let ((b (make-array 4 :element-type '(unsigned-byte 8))))
                   (dotimes (i 4) (setf (aref b i) (logand (ash extranonce (* -8 i)) #xff)))
@@ -44,8 +59,10 @@ carrying it is appended and the coinbase gets the BIP141 reserved witness value
      :version 1
      :inputs (vector in)
      :outputs (coerce outputs 'simple-vector)
-     ;; BIP141 reserved witness value (one 32-byte zero item).
-     :witness (when witness-commitment-script
+     ;; BIP141 reserved witness value (one 32-byte zero item) — only once
+     ;; segwit is active, or the block carries witness data a pre-segwit chain
+     ;; rejects. See the docstring.
+     :witness (when (and witness-commitment-script segwit-active)
                 (vector (list (bitcoin-lisp.validation:witness-reserved-value))))
      ;; Core node/miner.cpp:196: the coinbase commits to its height a second
      ;; way, nLockTime = height - 1 (BIP54), final because of the sequence.
@@ -72,7 +89,14 @@ assembly against synthetic chain states with no coins view)."
                     (block-template-coinbase-value template)
                     :script-pubkey coinbase-script-pubkey
                     :witness-commitment-script
-                    (block-template-default-witness-commitment-script template)))
+                    (block-template-default-witness-commitment-script template)
+                    ;; The same expression validation uses, so assembly and
+                    ;; consensus cannot disagree about the regime this block
+                    ;; is being built for.
+                    :segwit-active
+                    (>= (block-template-height template)
+                        (bitcoin-lisp.validation:get-segwit-activation-height
+                         bitcoin-lisp:*network*))))
          (txs (cons coinbase
                     (mapcar #'bitcoin-lisp.mempool:mempool-entry-transaction
                             (block-template-transactions template))))
