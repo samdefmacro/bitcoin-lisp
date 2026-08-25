@@ -3212,3 +3212,50 @@ turn a deep rollback into a flush storm."
     (is (search "maybe-critical-flush" src)
         "perform-reorg must reference the check; a flush function nothing calls
          is exactly the bug this fixes")))
+
+(test txindex-resume-rewinds-to-the-fork-instead-of-genesis
+  "A marker left on a disconnected block must resume at the FORK POINT, not at
+genesis.
+
+The sibling tests above fix the causes of an off-chain marker; this fixes its
+COST. Core rewinds the index to the fork (BaseIndex::Rewind, index/base.cpp:290);
+answering 0 rescans the whole chain. Observed live on testnet4 2026-08-25: a
+restart that happened to follow a reorg rebuilt a 149k-block index from height
+0, and testnet4 reorgs often. On mainnet that is hours.
+
+The marker is planted on the LOSING branch deliberately — that is the only
+state that produced the full rescan, and no amount of fixing the reorg drive
+sites removes it, since a crash between disconnect and marker update recreates
+it."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "txindex-rewind")
+     (let* ((txdir (ensure-directories-exist
+                    (merge-pathnames (format nil "test-txidx-rewind-~D/"
+                                             (get-internal-real-time))
+                                     (uiop:temporary-directory))))
+            (txindex (bitcoin-lisp.storage:init-tx-index txdir)))
+       (unwind-protect
+            (progn
+              ;; Two blocks on the original branch, then a heavier fork that
+              ;; replaces them.
+              (%build-and-connect chain-state block-store utxo-set genesis-hash
+                                  (make-test-chain-hashes #xA0 2))
+              (let ((losing-tip (bitcoin-lisp.storage:best-block-hash chain-state)))
+                (%stage-heavier-downloaded-fork chain-state block-store genesis-hash)
+                (let ((bitcoin-lisp.networking::*ibd-context*
+                        (bitcoin-lisp.networking::make-ibd-context)))
+                  (bitcoin-lisp.networking::run-ibd
+                   nil chain-state utxo-set block-store :tx-index nil))
+                ;; The marker names a block the reorg disconnected.
+                (bitcoin-lisp.storage::txindex-set-best-block txindex losing-tip)
+                (multiple-value-bind (height reason)
+                    (bitcoin-lisp.storage::%txindex-resume-height txindex chain-state)
+                  (is (eq :rewound-to-fork reason)
+                      "resumed with ~S, wanted :rewound-to-fork" reason)
+                  (is (plusp height)
+                      "rewound to height ~D — that is a full rescan from genesis"
+                      height))))
+         (bitcoin-lisp.storage:close-tx-index txindex)
+         (uiop:delete-directory-tree txdir :validate t :if-does-not-exist :ignore)))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
