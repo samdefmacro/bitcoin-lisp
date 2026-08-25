@@ -24,7 +24,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE=bitcoin-lisp-sbcl:2.6.5-3
+IMAGE=bitcoin-lisp-sbcl:2.6.5-4
 BIN="$REPO/build/bitcoin-lisp-node"
 TMPDIR_REL="build/conformance-tmp"
 

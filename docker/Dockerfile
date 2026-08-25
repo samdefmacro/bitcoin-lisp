@@ -19,9 +19,12 @@
 #   2.6.5-3  -> + libzmq (the node's ZMQ notification publishers) and
 #               python3-zmq, so those publishers can be tested against an
 #               INDEPENDENT ZeroMQ implementation rather than only themselves
+#   2.6.5-4  -> libsecp256k1 v0.5.1 -> v0.7.1 + the musig module, which is
+#               what MuSig2 (BIP327) key aggregation needs and which no
+#               release before 0.6.0 has at all
 #
 # Build (from the repo root):
-#   docker build -f docker/Dockerfile -t bitcoin-lisp-sbcl:2.6.5-3 .
+#   docker build -f docker/Dockerfile -t bitcoin-lisp-sbcl:2.6.5-4 .
 
 FROM debian:trixie-slim AS build
 
@@ -37,16 +40,38 @@ COPY scripts/setup-sbcl.sh /tmp/setup-sbcl.sh
 RUN PREFIX=/opt/sbcl HOPS="2.6.5" WORKDIR=/tmp/sbcl-build \
     bash /tmp/setup-sbcl.sh
 
-# libsecp256k1 v0.5.1 — the exact tag the production nodes run. Module set
-# mirrors what the node's FFI uses: ECDSA (core), recovery, extrakeys +
-# schnorrsig (taproot), ellswift (BIP324), ecdh.
-RUN git clone --depth 1 --branch v0.5.1 \
+# libsecp256k1 v0.7.1 — the newest TAGGED release at or below what Bitcoin Core
+# d3056bc vendors. Core's subtree calls itself 0.7.2 (CMakeLists.txt:10) but
+# with _PKG_VERSION_IS_RELEASE=false (configure.ac:9): it is master after
+# v0.7.1, and no v0.7.2 tag exists to clone. v0.8.0 does exist, and is
+# deliberately NOT used — for consensus-critical code, at-or-behind the
+# reference implementation beats ahead of it.
+#
+# Module set mirrors what the node's FFI uses: ECDSA (core), recovery,
+# extrakeys + schnorrsig (taproot), ellswift (BIP324), ecdh, and now musig.
+#
+# ⚠️ This is the library the node validates CONSENSUS with, so the bump is not
+# a free "add a module". What bounds the risk, checked before making it:
+#   - musig exists only from 0.6.0 (CHANGELOG "New module `musig`"), so there
+#     is no smaller step that gets it;
+#   - 0.7.0 REMOVED three deprecated aliases — ec_privkey_negate,
+#     ec_privkey_tweak_add, ec_privkey_tweak_mul. Our FFI binds 32 symbols and
+#     none of them is one of those, so nothing breaks at load;
+#   - every other 0.6.0/0.7.x change is build, visibility, or secret-clearing.
+#     No cryptographic behaviour of the functions we call changed. 0.7.1 in
+#     particular is ABI backward compatible with 0.7.0 (CHANGELOG).
+# The empirical answer is the cold battery plus Core's own script/sighash/
+# BIP341/key_io vectors run against this image.
+#
+# Core itself forces this module on (cmake/secp256k1.cmake:19).
+RUN git clone --depth 1 --branch v0.7.1 \
       https://github.com/bitcoin-core/secp256k1 /tmp/secp256k1 \
  && cd /tmp/secp256k1 \
  && ./autogen.sh \
  && ./configure --enable-module-recovery --enable-module-extrakeys \
       --enable-module-schnorrsig --enable-module-ellswift \
-      --enable-module-ecdh --disable-benchmark --disable-tests \
+      --enable-module-ecdh --enable-module-musig \
+      --disable-benchmark --disable-tests \
  && make -j"$(nproc)" \
  && make install DESTDIR=/tmp/secp-install
 

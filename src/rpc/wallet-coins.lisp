@@ -483,6 +483,27 @@ hardened markers as 'h' (apostrophe=false)."
             (bitcoin-lisp.crypto:bytes-to-hex
              (if xonly (%key-xonly-bytes pubkey) pubkey)))))
 
+(defun %pairs-splitter (pairs)
+  "A closure that returns the slice of PAIRS belonging to each descriptor it is
+handed, advancing a cursor.
+
+PAIRS is flat across the whole descriptor and %INFER-DESC-BODY addresses it
+POSITIONALLY, so a sub-descriptor needs its own slice. OUT-DESC-ORDERED-KEYS
+lays a node's own keys down before its children's, in child order, so a walk
+that visits children in that same order only has to advance a cursor.
+
+A cursor and not an ASSOC per key: that would be O(K^2) in the descriptor's
+total key count, and %WALLET-INFERRED-DESCRIPTOR runs once per coin in
+listunspent, with multi_a leaves allowed up to 999 keys each.
+
+Returns NIL once PAIRS runs short, which %INFER-DESC-BODY turns into an
+unrenderable descriptor rather than one built from misaligned keys."
+  (lambda (desc)
+    (let ((n (length (out-desc-ordered-keys desc))))
+      (when (<= n (length pairs))
+        (prog1 (subseq pairs 0 n)
+          (setf pairs (nthcdr n pairs)))))))
+
 (defun %infer-desc-body (desc script scripts pairs pos)
   "The inferred descriptor body for SCRIPT owned by DESC at POS. SCRIPTS is
 DESC's expansion at POS, PAIRS the (desc-key . derived-pubkey) list in
@@ -491,7 +512,13 @@ expression order. NIL when the descriptor kind cannot be inferred."
            (%inferred-key-string (car pair) (cdr pair) pos :xonly xonly)))
     (ecase (out-desc-kind desc)
       ((:addr :raw) nil)
-      (:pk (format nil "pk(~A)" (key-string (first pairs))))
+      ;; Core builds the inferred pk() with the same m_xonly it parsed with
+      ;; (descriptor.cpp:2695 passes /*xonly=*/true for a tapscript leaf), so a
+      ;; leaf reports its key as 32-byte x-only hex and a top-level pk() does
+      ;; not.
+      (:pk (format nil "pk(~A)"
+                   (key-string (first pairs)
+                               :xonly (out-desc-xonly-script-p desc))))
       (:pkh (format nil "pkh(~A)" (key-string (first pairs))))
       (:wpkh (format nil "wpkh(~A)" (key-string (first pairs))))
       (:combo
@@ -505,15 +532,20 @@ expression order. NIL when the descriptor kind cannot be inferred."
            (2 (format nil "wpkh(~A)" ks))
            (3 (format nil "sh(wpkh(~A))" ks))
            (t nil))))
-      ((:multi :sortedmulti)
-       ;; Core infers the expanded script, so sortedmulti() reports multi()
-       ;; with the keys in script (BIP67-sorted) order.
-       (let ((ordered (if (eq (out-desc-kind desc) :sortedmulti)
-                          (sort (copy-list pairs) #'%pubkey-lessp :key #'cdr)
-                          pairs)))
-         (format nil "multi(~D~{,~A~})"
+      ((:multi :sortedmulti :multi-a :sortedmulti-a)
+       ;; Core infers the EXPANDED script, which no longer records that the
+       ;; keys were sorted for it, so sortedmulti() reports as multi() with the
+       ;; keys in script (BIP67-sorted) order -- and sortedmulti_a() likewise
+       ;; as multi_a(). The tapscript pair pushes its keys x-only.
+       (let* ((kind (out-desc-kind desc))
+              (tap (and (member kind '(:multi-a :sortedmulti-a)) t))
+              (ordered (if (member kind '(:sortedmulti :sortedmulti-a))
+                           (sort (copy-list pairs) #'%pubkey-lessp :key #'cdr)
+                           pairs)))
+         (format nil "~A(~D~{,~A~})"
+                 (if tap "multi_a" "multi")
                  (out-desc-threshold desc)
-                 (mapcar (lambda (pair) (key-string pair)) ordered))))
+                 (mapcar (lambda (pair) (key-string pair :xonly tap)) ordered))))
       (:sh (let ((sub (%infer-desc-body (out-desc-sub desc) nil scripts pairs pos)))
              (and sub (format nil "sh(~A)" sub))))
       (:wsh (let ((sub (%infer-desc-body (out-desc-sub desc) nil scripts pairs pos)))
@@ -535,7 +567,27 @@ expression order. NIL when the descriptor kind cannot be inferred."
                           (cond (pair (key-string pair))
                                 (t (setf solved nil) "")))))))
            (and solved text))))
-      (:tr (format nil "tr(~A)" (key-string (first pairs) :xonly t)))
+      (:tr
+       ;; The internal key is the FIRST pair — OUT-DESC-ORDERED-KEYS numbers it
+       ;; before the tree's leaves — and the leaves render through the same
+       ;; brace reconstruction the descriptor printer uses.
+       (let ((internal (key-string (first pairs) :xonly t)))
+         (if (null (out-desc-tree desc))
+             (format nil "tr(~A)" internal)
+             ;; Each leaf gets ITS OWN pairs. The clauses here address PAIRS
+             ;; positionally -- (first pairs) means "this descriptor's key" --
+             ;; which holds only while the descriptor owns every pair. A tree
+             ;; breaks that: hand every leaf the whole list and they all render
+             ;; the tr() INTERNAL key, because that is the pair ORDERED-KEYS
+             ;; numbers first. The splitter starts AFTER the internal key.
+             (let* ((next (%pairs-splitter (rest pairs)))
+                    (tree (tr-tree-string
+                           (out-desc-tree desc)
+                           (lambda (leaf)
+                             (let ((own (funcall next leaf)))
+                               (and own (%infer-desc-body leaf nil scripts
+                                                          own pos)))))))
+               (and tree (format nil "tr(~A,~A)" internal tree))))))
       (:rawtr (format nil "rawtr(~A)" (key-string (first pairs) :xonly t))))))
 
 (defun %spkm-expansion-pairs (spkm pos)
@@ -901,7 +953,13 @@ key-path-only P2TR."
                  (:p2sh (or (and (eq kind :sh)
                                  (eq (out-desc-kind (out-desc-sub desc)) :wpkh))
                             (eq kind :combo)))
-                 (:p2tr (eq kind :tr))
+                 ;; Key-path-ONLY tr(). Core requires spenddata.merkle_root
+                 ;; .IsNull() here (signingprovider.cpp:290): a taproot output
+                 ;; with a script tree maps to no single key, so getaddressinfo
+                 ;; reports no hdkeypath/hdmasterfingerprint for it. Without the
+                 ;; tree test we would report the INTERNAL key's origin, which
+                 ;; names a key that cannot by itself spend the output.
+                 (:p2tr (and (eq kind :tr) (null (out-desc-tree desc))))
                  (t nil)))
       (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
         (declare (ignore scripts))
