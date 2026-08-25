@@ -1727,3 +1727,71 @@ the broken entry is listed FIRST here, so this fails if the loop aborts."
     (bitcoin-lisp.rpc:load-wallets-on-startup node)
     (is (equal '("good") (%loaded-wallet-names node))
         "a wallet listed before a broken one must still load")))
+
+;;;; --- tr() script trees through the WALLET signer -------------------------
+
+(test wallet-signs-a-tr-script-path
+  "The wallet drive site for tr() script-path spending.
+
+%SPKM-TR-SCRIPT-LEAVES is reached only from %WALLET-SIGN-MAPS, and a signer that
+never receives its map fails every tr()-with-tree input with 'no key for P2TR'
+while every unit test of the machinery below it stays green — the shape this
+project has shipped fourteen times. This imports such a descriptor into a real
+wallet and signs through %WALLET-SIGN-TRANSACTION.
+
+The internal key is a bare pubkey the wallet holds no secret for, so the key
+path is unavailable by construction and only a script path can spend."
+  (with-wallet-test-node (node :network :mainnet :keypool 2)
+    (let* ((manager (%node-manager node))
+           (internal "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
+           (leaf-wif "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1")
+           (desc-str (bitcoin-lisp.rpc::descriptor-add-checksum
+                      (format nil "tr(~A,pk(~A))" internal leaf-wif))))
+      (bitcoin-lisp.rpc::create-wallet manager "trtree" :blank t)
+      (let ((bitcoin-lisp.rpc::*rpc-wallet-name* "trtree"))
+        (let ((results (bitcoin-lisp.rpc::rpc-importdescriptors
+                        ;; Not "active": Core requires an active descriptor to
+                        ;; be ranged, and a fixed tree has no range.
+                        node (list (list (%ht "desc" desc-str
+                                              "timestamp" "now"))))))
+          (is (eq t (%aval "success" (first results)))
+              "import failed: ~A"
+              (let ((err (%aval "error" (first results))))
+                (if err (%aval "message" err) (first results))))))
+      (let* ((wallet (gethash "trtree" (bitcoin-lisp.rpc::wallet-manager-wallets manager)))
+             (desc (bitcoin-lisp.rpc::parse-descriptor
+                    (format nil "tr(~A,pk(~A))" internal leaf-wif) :mainnet))
+             (spk (first (bitcoin-lisp.rpc::out-desc-expand desc 0)))
+             (amount 100000)
+             (empty (make-array 0 :element-type '(unsigned-byte 8)))
+             (prev-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                      :initial-element 9))
+             (tx (bitcoin-lisp.serialization:make-transaction
+                  :version 2
+                  :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                   :previous-output
+                                   (bitcoin-lisp.serialization:make-outpoint
+                                    :hash prev-txid :index 0)
+                                   :script-sig empty :sequence #xffffffff))
+                  :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                    :value (- amount 1000)
+                                    :script-pubkey
+                                    (coerce (bitcoin-lisp.crypto:hex-to-bytes
+                                             "0014751e76e8199196d454941c45d1b3a323f1433bd6")
+                                            '(simple-array (unsigned-byte 8) (*)))))))
+             (coins (make-hash-table :test 'equalp)))
+        ;; The wallet must recognise the output before it can sign it.
+        (is-true (bitcoin-lisp.rpc::%wallet-owning-spkm wallet spk)
+                 "the wallet does not recognise its own tr() tree output")
+        (setf (gethash (cons prev-txid 0) coins) (list spk amount nil nil))
+        (let ((errs (bitcoin-lisp.rpc::%wallet-sign-transaction wallet tx coins)))
+          (is (null errs) "wallet signing reported ~S" errs))
+        (let* ((witness (bitcoin-lisp.serialization:transaction-witness tx))
+               (stack (and witness (plusp (length witness)) (aref witness 0))))
+          (is-true stack "no witness was installed")
+          ;; signature, leaf script, control block — a script path, not a key path.
+          (is (= 3 (length stack))
+              "witness has ~D elements, wanted 3 (sig, script, control block)"
+              (length stack)))
+        (is-true (nth-value 0 (bitcoin-lisp.rpc::%verify-tx-scripts tx coins))
+                 "the wallet-signed script-path spend does not verify")))))

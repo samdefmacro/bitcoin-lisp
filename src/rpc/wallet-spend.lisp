@@ -1803,15 +1803,62 @@ full-point check."
          "wallet-sign: derived key does not match expected pubkey at index ~D; key skipped"
          pos))))
 
+(defun %spkm-tr-script-leaves (spkm script pos)
+  "For a tr()-with-tree SPKM whose expansion at range position POS is SCRIPT,
+the list of (SCRIPT LEAF-HASH CONTROL-BLOCK LEAF-DESC LEAF-PUBKEYS) that
+%TR-SCRIPT-PATH-WITNESS consumes, or NIL for anything else.
+
+The leaf pubkeys are sliced out of the descriptor's flat expansion the same way
+%INFER-DESC-BODY slices them, and for the same reason: ORDERED-KEYS numbers the
+tr() internal key first, so a leaf handed the whole list would be signing with
+the wrong keys."
+  (let ((desc (desc-spkm-desc spkm)))
+    (when (and (eq (out-desc-kind desc) :tr) (out-desc-tree desc))
+      (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
+        (declare (ignore scripts))
+        ;; Resolve keys out of PAIRS, which %SPKM-EXPANSION-PAIRS already
+        ;; derived through the SPKM's xpub cache. Handing TR-SPEND-DATA a bare
+        ;; %DESC-KEY-PUBKEY-AT would redo the whole descriptor's BIP32
+        ;; derivation, uncached, for every taproot input signed.
+        (multiple-value-bind (output-key leaves)
+            (tr-spend-data desc pos
+                           (lambda (k) (cdr (assoc k pairs :test #'eq))))
+          ;; ⚠️ The spend data must be for the output we are actually spending.
+          ;; Core cannot get this wrong -- it looks TaprootSpendData UP BY the
+          ;; output key -- while we rebuild it and would otherwise file it under
+          ;; the script's key unconditionally. Its sibling %SIGN-MAP-ADD-KEY!
+          ;; verifies priv->pub for the same reason: a derivation bug must
+          ;; surface as a missing-key signing error, never as a witness built
+          ;; for a different output.
+          (unless (equalp output-key (subseq script 2 34))
+            (bitcoin-lisp:log-warn
+             "wallet-sign: tr() spend data derives ~A but the output is ~A; skipped"
+             (bitcoin-lisp.crypto:bytes-to-hex output-key)
+             (bitcoin-lisp.crypto:bytes-to-hex (subseq script 2 34)))
+            (return-from %spkm-tr-script-leaves nil))
+          (let ((next (%pairs-splitter (rest pairs))))
+            (loop for (script leaf-hash control) in leaves
+                  for (nil . leaf) in (out-desc-tree desc)
+                  for own = (funcall next leaf)
+                  when own
+                    collect (list script leaf-hash control leaf
+                                  (mapcar #'cdr own)))))))))
+
 (defun %wallet-sign-maps (wallet tx coins)
-  "(values keymap pubmap tr-keymap) covering every input of TX whose spent
-script belongs to a wallet SPKM. Each derived private key is verified to
+  "(values keymap pubmap tr-keymap tr-scripts) covering every input of TX whose
+spent script belongs to a wallet SPKM. Each derived private key is verified to
 reproduce its expected pubkey before it is trusted (funds-critical: a
 derivation bug must surface as a missing-key signing error, never as a
-wrong-key signature)."
+wrong-key signature).
+
+TR-SCRIPTS maps a taproot output key to its spendable script paths, which is
+the only route by which a tr() descriptor WITH a script tree can be spent: its
+output key is the internal key tweaked by the merkle root, so it is absent from
+TR-KEYMAP (keyed on the BIP86 untweaked-root form) by construction."
   (let ((keymap (make-hash-table :test 'equalp))
         (pubmap (make-hash-table :test 'equalp))
-        (tr-keymap (make-hash-table :test 'equalp)))
+        (tr-keymap (make-hash-table :test 'equalp))
+        (tr-scripts (make-hash-table :test 'equalp)))
     (bitcoin-lisp.serialization:dovector
         (input (bitcoin-lisp.serialization:transaction-inputs tx))
       (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
@@ -1829,16 +1876,20 @@ wrong-key signature)."
                         for priv = (%desc-key-priv-at key pos provider)
                         do (when priv
                              (%sign-map-add-key! keymap pubmap tr-keymap
-                                                 key pubkey priv pos))))))))))
-    (values keymap pubmap tr-keymap)))
+                                                 key pubkey priv pos))))
+                (let ((leaves (%spkm-tr-script-leaves spkm script pos)))
+                  (when leaves
+                    (setf (gethash (subseq script 2 34) tr-scripts) leaves)))))))))
+    (values keymap pubmap tr-keymap tr-scripts)))
 
 (defun %wallet-sign-transaction (wallet tx coins &key (sighash-byte 1))
   "Core CWallet::SignTransaction: sign every input COINS covers with keys
 from the wallet's SPKMs. COINS: (txid . vout) -> (script-pubkey amount
 redeem-script witness-script). Returns the (index . message) error list;
 NIL = complete."
-  (multiple-value-bind (keymap pubmap tr-keymap) (%wallet-sign-maps wallet tx coins)
-    (%sign-tx-inputs tx coins keymap pubmap tr-keymap sighash-byte)))
+  (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
+      (%wallet-sign-maps wallet tx coins)
+    (%sign-tx-inputs tx coins keymap pubmap tr-keymap sighash-byte tr-scripts)))
 
 (defun %wallet-input-coins (node wallet tx &optional cc)
   "The signing/verification coins map for TX: (txid . vout) ->

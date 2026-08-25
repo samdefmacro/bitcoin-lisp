@@ -5432,8 +5432,64 @@ REDEEM/WITNESS-SCRIPT are the P2SH/P2WSH sub-scripts to reveal."
   ;; chooses which branch to take and what to push for it.
   (stack nil :type list))
 
+(defun %tap-sig (privkey sighash tap-sighash-type)
+  "A BIP341 signature: 64 bytes for SIGHASH_DEFAULT, else 65 with the sighash
+byte appended (Core's CreateSchnorrSig, sign.cpp:340)."
+  (let ((sig64 (bitcoin-lisp.crypto:sign-schnorr privkey sighash)))
+    (if (zerop tap-sighash-type)
+        sig64
+        (concatenate '(vector (unsigned-byte 8)) sig64 (vector tap-sighash-type)))))
+
+(defun %tr-script-path-witness (leaves amount tap-sighash-type pubmap)
+  "The complete witness stack for a taproot SCRIPT-path spend, or NIL when no
+leaf can be satisfied. LEAVES is a list of
+(SCRIPT LEAF-HASH CONTROL-BLOCK LEAF-DESC LEAF-PUBKEYS) -- what TR-SPEND-DATA
+produced for this output, each entry extended with the parsed leaf descriptor
+and its pubkeys at this range index.
+
+Core tries every leaf and keeps the SMALLEST serialized result
+(sign.cpp:601-612); so do we, because which leaf is cheapest depends on both
+its script and its merkle depth and neither dominates.
+
+*current-tx* / *current-spent-utxos* / *current-input-index* must be bound by
+the caller -- the sighash commits to all of them."
+  (let ((best nil) (best-size nil))
+    (dolist (entry leaves best)
+      (destructuring-bind (script leaf-hash control leaf pubkeys) entry
+        (progn
+          (let* (;; BIP341 script-path tail: the tapleaf hash, key version 0,
+                 ;; and the codeseparator position. Signing always commits to
+                 ;; "no codeseparator executed" -- our tapscript leaves contain
+                 ;; none, and a leaf that did would need the position it
+                 ;; actually reached at execution time.
+                 (bitcoin-lisp.coalton.interop::*tapscript-codesep-pos* #xFFFFFFFF)
+                 (sighash (bitcoin-lisp.coalton.interop::compute-bip341-sighash
+                           amount tap-sighash-type leaf-hash 0)))
+            (when sighash
+              (let ((satisfaction
+                      (tr-leaf-satisfaction
+                       leaf pubkeys
+                       (lambda (xonly)
+                         ;; PUBMAP is keyed by the 33-byte pubkey and an x-only
+                         ;; key names both parities, so both are tried. SIGN-
+                         ;; SCHNORR builds a keypair, which negates the secret
+                         ;; for an odd-Y key itself.
+                         (let ((sk (or (gethash (concatenate '(vector (unsigned-byte 8))
+                                                             #(2) xonly)
+                                                pubmap)
+                                       (gethash (concatenate '(vector (unsigned-byte 8))
+                                                             #(3) xonly)
+                                                pubmap))))
+                           (when sk (%tap-sig sk sighash tap-sighash-type)))))))
+                (when satisfaction
+                  (let* ((stack (append satisfaction (list script control)))
+                         (size (reduce #'+ stack :key #'length)))
+                    (when (or (null best-size) (< size best-size))
+                      (setf best stack best-size size))))))))))))
+
 (defun %compute-input-signatures (tx i prev keymap pubmap tr-keymap sighash-byte
-                                  precomp spent-utxos &optional (tap-sighash-type #x00))
+                                  precomp spent-utxos &optional (tap-sighash-type #x00)
+                                                                tr-scripts)
   "Compute the signature material for input I of TX spending PREV
 = (script-pubkey amount redeem witness-script), using the key maps. Returns
 (values input-sig error-string): the funds-critical sighash + sign dispatch
@@ -5528,26 +5584,35 @@ must be bound by the caller."
                                               (bip143-sig (p2wpkh-scriptcode (subseq spk 2 22))
                                                           (car entry))))))))))
           ((string= type "witness_v1_taproot")
-           (let ((sk (gethash (subseq spk 2 34) tr-keymap)))
+           (let* ((output-key (subseq spk 2 34))
+                  (sk (gethash output-key tr-keymap))
+                  (leaves (and tr-scripts (gethash output-key tr-scripts))))
              (cond
-               ((null sk) (fail "no key for P2TR (key path)"))
+               ((and (null sk) (null leaves)) (fail "no key for P2TR (key path)"))
                ((null spent-utxos)
                 (fail "P2TR requires prevtx amounts for all inputs"))
-               (t (let ((sighash (bitcoin-lisp.coalton.interop::compute-bip341-sighash
-                                  amount tap-sighash-type nil nil)))
-                    ;; No sighash is defined for SIGHASH_SINGLE at an input
-                    ;; index with no matching output. Signing the
-                    ;; omitted-field preimage would hand back a transaction
-                    ;; Core rejects, so fail loudly instead.
-                    (unless sighash
-                      (fail "P2TR SIGHASH_SINGLE has no output at this input index"))
-                    (let* ((tsk (bitcoin-lisp.crypto:taproot-tweak-private-key sk))
-                           (sig64 (bitcoin-lisp.crypto:sign-schnorr tsk sighash))
-                           (sig (if (zerop tap-sighash-type)
-                                    sig64
-                                    (concatenate '(vector (unsigned-byte 8))
-                                                 sig64 (vector tap-sighash-type)))))
-                      (values (%make-input-sig :kind :p2tr :needed 1 :tap sig))))))))
+               ;; Core tries the key path first and only then the script paths
+               ;; (sign.cpp:558-608): a key-path spend is both cheaper and
+               ;; smaller, and reveals nothing about the tree.
+               (sk
+                (let ((sighash (bitcoin-lisp.coalton.interop::compute-bip341-sighash
+                                amount tap-sighash-type nil nil)))
+                  ;; No sighash is defined for SIGHASH_SINGLE at an input
+                  ;; index with no matching output. Signing the
+                  ;; omitted-field preimage would hand back a transaction
+                  ;; Core rejects, so fail loudly instead.
+                  (unless sighash
+                    (fail "P2TR SIGHASH_SINGLE has no output at this input index"))
+                  (let ((sig (%tap-sig (bitcoin-lisp.crypto:taproot-tweak-private-key sk)
+                                       sighash tap-sighash-type)))
+                    (values (%make-input-sig :kind :p2tr :needed 1 :tap sig)))))
+               (t
+                (let ((stack (%tr-script-path-witness leaves amount tap-sighash-type
+                                                      pubmap)))
+                  (unless stack
+                    (fail "no satisfiable script path for P2TR"))
+                  (values (%make-input-sig :kind :p2tr-script :needed 1
+                                           :stack stack)))))))
           ((string= type "scripthash")   ; P2SH (wrapped)
            (cond
              ((null redeem) (fail "P2SH requires redeemScript"))
@@ -5635,6 +5700,10 @@ error here (a missing key already failed in %compute-input-signatures)."
         (:p2wpkh (let ((s (first (input-sig-ecdsa sig))))
                    (values nil (list (cdr s) (car s)) nil)))
         (:p2tr (values nil (list (input-sig-tap sig)) nil))
+        ;; A script-path spend: the satisfaction, then the leaf script, then
+        ;; the control block (BIP341). %TR-SCRIPT-PATH-WITNESS already appended
+        ;; the last two, so there is nothing to assemble here.
+        (:p2tr-script (values nil (input-sig-stack sig) nil))
         (:p2sh-p2wpkh (let ((s (first (input-sig-ecdsa sig))))
                         (values (%script-push (input-sig-redeem sig))
                                 (list (cdr s) (car s)) nil)))
@@ -5697,7 +5766,8 @@ if any input lacks a prevout-with-amount."
                :value (second prev)
                :script-pubkey (coerce (first prev) '(simple-array (unsigned-byte 8) (*)))))))))
 
-(defun %sign-tx-inputs (tx prevmap keymap pubmap tr-keymap sighash-byte)
+(defun %sign-tx-inputs (tx prevmap keymap pubmap tr-keymap sighash-byte
+                        &optional tr-scripts)
   "Sign every input of TX the key maps can satisfy, in place: scriptSigs are
 set on TX's inputs, witness stacks installed on TX (existing witness entries
 of inputs we do not touch are preserved). Shared by signrawtransactionwithkey
@@ -5713,6 +5783,9 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                         (copy-seq existing)
                         (make-array n :initial-element '()))))
          (any-witness nil)
+         ;; Which inputs this call actually produced signatures for — the
+         ;; VerifyScript rail below checks those and leaves the rest alone.
+         (signed (make-array n :initial-element nil))
          (errors '()))
     ;; Precompute is built once for the whole tx; pass spent-utxos (all
     ;; inputs' outputs) so the BIP341 amount/scriptPubKey commitments are
@@ -5734,19 +5807,44 @@ Returns a list of (input-index . error-message), NIL when every input signed."
               (push (cons i "no prevtx scriptPubKey provided") errors)
               (multiple-value-bind (sig err)
                   (%compute-input-signatures tx i prev keymap pubmap tr-keymap
-                                             sighash-byte precomp spent-utxos)
+                                             sighash-byte precomp spent-utxos
+                                             #x00 tr-scripts)
                 (if err
                     (push (cons i err) errors)
                     (multiple-value-bind (ss wit ferr) (%finalize-input-signatures sig)
                       (cond
                         (ferr (push (cons i ferr) errors))
-                        (t (when ss
+                        (t (setf (aref signed i) t)
+                           (when ss
                              (setf (bitcoin-lisp.serialization:tx-in-script-sig in) ss))
                            (when wit
                              (setf (aref witness i) wit)
                              (setf any-witness t))))))))))
       (when (or any-witness (bitcoin-lisp.serialization:transaction-witness tx))
-        (setf (bitcoin-lisp.serialization:transaction-witness tx) witness)))
+        (setf (bitcoin-lisp.serialization:transaction-witness tx) witness))
+      ;; Core's ProduceSignature does not take "no error" for complete: it ENDS
+      ;; by running VerifyScript over the scriptSig/witness it just built, with
+      ;; a real signature checker, and reports complete only if that passes
+      ;; (sign.cpp:799). Without it "complete" here means no more than "the
+      ;; assembler raised nothing", and a witness whose ELEMENT ORDER is wrong
+      ;; is well-formed, signed, and unspendable -- exactly the failure a
+      ;; taproot script path can have, since its stack order is derived rather
+      ;; than dictated by a fixed template.
+      ;;
+      ;; Inputs we did not touch are skipped: this rail is about what WE built,
+      ;; and a partially-signed transaction must still come back with only the
+      ;; inputs it could not sign reported.
+      (when spent-utxos
+        (dotimes (i n)
+          (when (and (aref signed i) (not (assoc i errors)))
+            (unless (handler-case
+                        (let ((bitcoin-lisp.coalton.interop:*script-flags*
+                                bitcoin-lisp.validation:+standard-script-verify-flags+))
+                          (bitcoin-lisp.validation:validate-input-script
+                           tx i (aref spent-utxos i)))
+                      (error () nil))
+              (push (cons i "signing produced a script that does not verify")
+                    errors))))))
     (nreverse errors)))
 
 (defun rpc-signrawtransactionwithkey (node params)
