@@ -1218,3 +1218,53 @@ re-sorted would not round-trip to what its owner typed."
     ;; Derivation needs xpubs.
     (%check-unparsable "" (format nil "tr(musig(~A,~A)/0)" a b)
                        "tr(): musig(): derivation requires all participants to be xpubs or xprvs")))
+
+;;;; --- Miniscript in a tapscript context -----------------------------------
+
+(test tr-leaf-miniscript-matches-core-vector
+  "Core descriptor_tests.cpp:1143 — a tr() whose tree holds a MINISCRIPT leaf
+and a multi_a leaf.
+
+Miniscript's rules are stated per CONTEXT, and this vector exercises every way
+the two differ at once: multi_a exists only under tapscript (BIP342 removed
+CHECKMULTISIG), keys serialize x-only, and `d:'/size/stack limits all change.
+A port that assumed P2WSH would build a different leaf script, hence a
+different merkle root, hence a different ADDRESS — while still type-checking."
+  (%check-desc
+   "tr(a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd,{and_v(and_v(v:hash256(ae253ca2a54debcac7ecf414f6734f48c56421a08bb59182ff9f39a6fffdb588),v:pk(KykUPmR5967F4URzMUeCv9kNMU9CNRWycrPmx3ZvfkWoQLabbimL)),older(42)),multi_a(2,adf586a32ad4b0674a86022b000348b681b4c97a811f67eefe4a6e066e55080c,KztMyyi1pXUtuZfJSB7JzVdmJMAz7wfGVFoSRUR5CVZxXxULXuGR)})"
+   "tr(a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd,{and_v(and_v(v:hash256(ae253ca2a54debcac7ecf414f6734f48c56421a08bb59182ff9f39a6fffdb588),v:pk(1c9bc926084382e76da33b5a52d17b1fa153c072aae5fb5228ecc2ccf89d79d5)),older(42)),multi_a(2,adf586a32ad4b0674a86022b000348b681b4c97a811f67eefe4a6e066e55080c,14fa4ad085cdee1e2fc73d491b36a96c192382b1d9a21108eb3533f630364f9f)})"
+   '(("51209a3d79db56fbe3ba4d905d827b62e1ed31cd6df1198b8c759d589c0f4efc27bd"))))
+
+(test miniscript-fragments-are-gated-by-context
+  "multi is P2WSH-only and multi_a tapscript-only. Accepting either in the
+wrong context is not a cosmetic error: `multi' under tapscript compiles to
+CHECKMULTISIG, which BIP342 made an OP_SUCCESS-free failure, so the output
+would be unspendable while the descriptor looked fine."
+  (let ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
+        (b "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
+        (i "a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd"))
+    ;; multi_a inside wsh(): rejected.
+    (signals bitcoin-lisp.rpc::rpc-error
+      (%desc-parse (format nil "wsh(multi_a(1,~A,~A))" a b)))
+    ;; multi inside a tr() leaf: rejected.
+    (signals bitcoin-lisp.rpc::rpc-error
+      (%desc-parse (format nil "tr(~A,multi(1,~A,~A))" i a b)))
+    ;; And each in its own context parses.
+    (finishes (%desc-parse (format nil "wsh(multi(1,~A,~A))" a b)))
+    (finishes (%desc-parse (format nil "tr(~A,multi_a(1,~A,~A))" i a b)))))
+
+(test miniscript-tapscript-keys-are-x-only-in-the-script
+  "Core: `In Tapscript keys always serialize as x-only, whether an x-only key
+was used in the descriptor or not' (descriptor.cpp:1569). The leaf script of a
+miniscript fragment must push 32 bytes, and pk_h must hash the 32-byte form —
+the same split that produced a wrong address twice in the tr() work."
+  (let* ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
+         (i "a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd")
+         (d (%desc-parse (format nil "tr(~A,and_v(v:pk(~A),older(42)))" i a)))
+         (leaf (cdr (first (bitcoin-lisp.rpc::out-desc-tree d))))
+         (script (first (bitcoin-lisp.rpc::out-desc-expand leaf 0))))
+    ;; <32> <x> CHECKSIGVERIFY <42> CHECKSEQUENCEVERIFY
+    (is (= 32 (aref script 0))
+        "leaf pushes ~D bytes, wanted 32 (x-only)" (aref script 0))
+    (is-false (search (bitcoin-lisp.crypto:hex-to-bytes a) script)
+              "the 33-byte key appears verbatim in a tapscript leaf")))

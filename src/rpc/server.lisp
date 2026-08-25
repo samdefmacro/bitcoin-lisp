@@ -504,6 +504,31 @@ that file and compares. Editing an entry here by hand without changing Core is
 how the two drift apart, so the test exists to make that impossible to do
 quietly.")
 
+(defparameter *rpc-named-only-args*
+  '(
+    ("createwalletdescriptor" "internal" "hdkey")
+    ("dumptxoutset" "rollback")
+    ("fundrawtransaction" "add_inputs" "include_unsafe" "minconf" "maxconf" "change_type" "fee_rate" "vout_index" "input_weights" "txid" "vout" "weight" "max_tx_weight")
+    ("gethdkeys" "active_only" "private")
+    ("gettxspendingprevout" "mempool_only" "return_spending_tx")
+    ("importmempool" "use_current_time" "apply_fee_delta_priority" "apply_unbroadcast_set")
+    ("listunspent" "include_immature_coinbase")
+    ("scanblocks" "filter_false_positives")
+    ("send" "add_inputs" "include_unsafe" "minconf" "maxconf" "add_to_wallet" "change_address" "change_position" "change_type" "fee_rate" "include_watching" "inputs" "txid" "vout" "sequence" "weight" "locktime" "lock_unspents" "psbt" "subtract_fee_from_outputs" "vout_index" "max_tx_weight")
+    ("sendall" "add_to_wallet" "fee_rate" "include_watching" "inputs" "txid" "vout" "sequence" "locktime" "lock_unspents" "psbt" "send_max" "minconf" "maxconf" "version")
+    ("simulaterawtransaction" "include_watchonly")
+    ("walletcreatefundedpsbt" "add_inputs" "include_unsafe" "minconf" "maxconf" "change_type" "fee_rate" "vout_index" "max_tx_weight"))
+  "Members of an RPC\'s OBJ_NAMED_PARAMS options object, which Core lets a
+client pass as TOP-LEVEL named arguments.
+
+RPCHelpMan::GetArgNames emits these with named_only=true (rpc/util.cpp:750) and
+transformNamedArguments collects them into a fresh options object which it
+pushes at the options slot (rpc/server.cpp:408-415). Without them the server
+answers \"Unknown named parameter fee_rate\" to a call every Core client can
+make — nine of Core\'s functional tests do exactly that.
+
+GENERATED from Core\'s RPCHelpMan declarations. Do not hand-edit.")
+
 (defparameter *rpc-named-arg-names*
   '(
     ("abandontransaction" "txid")
@@ -744,6 +769,32 @@ argument already reaches every handler."
               (error 'rpc-error :code +rpc-invalid-parameter+
                                 :message "Parameter args must be an array"))
             (setf positional (coerce args 'list))))
+        ;; Named-only members of the method's options object, collected out
+        ;; before the positional slots are matched. Core does this inline in
+        ;; the same loop (rpc/server.cpp:408); pulling it out first is the same
+        ;; thing, because a named-only name can never also be a positional one.
+        (let ((options '())
+              (option-names (cdr (assoc method *rpc-named-only-args*
+                                        :test #'string=))))
+          (dolist (opt option-names)
+            (multiple-value-bind (v present) (gethash opt remaining)
+              (when present
+                (remhash opt remaining)
+                (push (cons opt v) options))))
+          (setf options (nreverse options))
+          (when options
+            ;; Core pushes the accumulated object at the OPTIONS slot, which is
+            ;; the one positional argument of type OBJ_NAMED_PARAMS. Finding it
+            ;; by name is enough: every method that has one calls it "options",
+            ;; except send/sendall/walletcreatefundedpsbt, where Core's own
+            ;; help calls it "options" too.
+            (let ((slot (position-if (lambda (n) (%named-arg-slot n "options"))
+                                     names)))
+              (when (and slot (not (gethash "options" remaining)))
+                (setf (gethash "options" remaining)
+                      (let ((h (make-hash-table :test 'equal)))
+                        (dolist (kv options h)
+                          (setf (gethash (car kv) h) (cdr kv)))))))))
         (let ((slots '()))
           (loop for name-spec in names
                 for index from 0

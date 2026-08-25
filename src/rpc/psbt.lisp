@@ -305,7 +305,74 @@ tr() script-path signing means anything."
   (let ((mr (bitcoin-lisp.serialization:psbt-map-find
              map bitcoin-lisp.serialization:+psbt-in-tap-merkle-root+)))
     (when mr (funcall add "taproot_merkle_root"
-                      (bitcoin-lisp.crypto:bytes-to-hex mr)))))
+                      (bitcoin-lisp.crypto:bytes-to-hex mr))))
+  (%psbt-musig2-json map add))
+
+(defun %psbt-musig2-keydata-json (keydata)
+  "The (participant, aggregate, leaf-hash) a MuSig2 nonce or partial-signature
+keydata names, or NIL when it is malformed.
+
+⚠️ The LEAF HASH is what says which spend path this belongs to: present for a
+script path, absent for a key path (Core psbt.h:428-430). Its presence is
+encoded only in the keydata LENGTH — 66 bytes or 98 — so a reader that ignores
+the length attributes a script-path nonce to the key path."
+  (let ((n (length keydata)))
+    (when (or (= n 66) (= n 98))
+      `(("participant_pubkey" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                                  (subseq keydata 0 33)))
+        ("aggregate_pubkey" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                                (subseq keydata 33 66)))
+        ,@(when (= n 98)
+            `(("leaf_hash" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                               (subseq keydata 66 98)))))))))
+
+(defun %psbt-musig2-json (map add)
+  "The BIP373 MuSig2 records of MAP, for decodepsbt.
+
+DECODING only. A MuSig2 signing session needs nonce state this node does not
+keep, and inventing one would be worse than useless: reusing a MuSig2 nonce
+across two messages leaks the private key outright. What a signer's user needs
+first is to SEE what a PSBT is asking of them, which is what this gives."
+  ;; PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS: keydata is the aggregate, value is the
+  ;; participants concatenated.
+  (let ((parts (bitcoin-lisp.serialization:psbt-map-collect
+                map bitcoin-lisp.serialization:+psbt-in-musig2-participant-pubkeys+)))
+    (when parts
+      (funcall add "musig2_participant_pubkeys"
+               (json-array
+                (loop for (agg . value) in parts
+                      when (and (= (length agg) 33)
+                                (zerop (mod (length value) 33))
+                                (plusp (length value)))
+                        collect `(("aggregate_pubkey"
+                                   . ,(bitcoin-lisp.crypto:bytes-to-hex agg))
+                                  ("participant_pubkeys"
+                                   . ,(json-array
+                                       (loop for i from 0 below (length value) by 33
+                                             collect (bitcoin-lisp.crypto:bytes-to-hex
+                                                      (subseq value i (+ i 33)))))))))))) 
+  (let ((nonces (bitcoin-lisp.serialization:psbt-map-collect
+                 map bitcoin-lisp.serialization:+psbt-in-musig2-pub-nonce+)))
+    (when nonces
+      (funcall add "musig2_pubnonces"
+               (json-array
+                (loop for (keydata . value) in nonces
+                      for parsed = (%psbt-musig2-keydata-json keydata)
+                      when parsed
+                        collect (append parsed
+                                        `(("pubnonce"
+                                           . ,(bitcoin-lisp.crypto:bytes-to-hex value)))))))))
+  (let ((psigs (bitcoin-lisp.serialization:psbt-map-collect
+                map bitcoin-lisp.serialization:+psbt-in-musig2-partial-sig+)))
+    (when psigs
+      (funcall add "musig2_partial_sigs"
+               (json-array
+                (loop for (keydata . value) in psigs
+                      for parsed = (%psbt-musig2-keydata-json keydata)
+                      when parsed
+                        collect (append parsed
+                                        `(("partial_sig"
+                                           . ,(bitcoin-lisp.crypto:bytes-to-hex value))))))))))
 
 (defun %psbt-tap-bip32-json (xonly value)
   "One PSBT_*_TAP_BIP32_DERIVATION record: keydata is the 32-byte x-only

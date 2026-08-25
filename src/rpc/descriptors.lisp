@@ -880,34 +880,47 @@ ParseScriptContext::P2TR."
       ;; expressible at all (Core descriptor.cpp ParseScript).
       (case ctx
         (:wsh (return-from %parse-descriptor-body
-                (%parse-miniscript-descriptor expr network)))
+                (%parse-miniscript-descriptor expr network :p2wsh)))
+        ;; A taproot leaf reaches miniscript too (Core gates the branch on
+        ;; P2WSH || P2TR, descriptor.cpp:2601), in TAPSCRIPT context: different
+        ;; legal fragments, different key serialization, different limits.
+        (:tr-script (return-from %parse-descriptor-body
+                      (%parse-miniscript-descriptor expr network :tapscript)))
         (:sh (%desc-error "A function is needed within P2SH"))
         (t (%desc-error "'~A' is not a valid descriptor function" expr))))))
 
-(defun %parse-miniscript-descriptor (expr network)
+(defun %parse-miniscript-descriptor (expr network ms-ctx)
   "Parse EXPR as a miniscript whose key arguments are descriptor key
 expressions. Returns an :miniscript out-desc.
 
-Only inside wsh(): miniscript's type rules and its resource limits are stated
-for a specific script context, and P2WSH is the one this implements. Core
-refuses it elsewhere for the same reason."
+MS-CTX is :P2WSH (inside wsh()) or :TAPSCRIPT (a tr() leaf). Miniscript's type
+rules, its legal fragments and its resource limits are all stated per context,
+which is why the context travels with the node rather than being assumed."
   (let* ((keys '())
          (node (handler-case
                    (let ((bitcoin-lisp.validation::*ms-key-parser*
                            (lambda (text)
                              (let ((key (%with-desc-error-prefix
                                          "miniscript: "
-                                         (lambda () (%parse-desc-key text :wsh network)))))
+                                         (lambda ()
+                                           ;; The KEY context follows the script
+                                           ;; context: a tapscript leaf accepts
+                                           ;; 32-byte x-only keys, wsh() does not.
+                                           (%parse-desc-key
+                                            text
+                                            (if (eq ms-ctx :tapscript) :tr :wsh)
+                                            network)))))
                                (push key keys)
                                key))))
-                     (bitcoin-lisp.validation::ms-parse expr))
+                     (bitcoin-lisp.validation::ms-parse expr :ctx ms-ctx))
                  ;; Not a miniscript expression at all -- a bare pubkey, say.
                  ;; Core only reports a miniscript error when the expression
                  ;; PARSED and then failed its rules (descriptor.cpp:2600);
                  ;; an unparseable one falls through to the generic message,
                  ;; which is far more useful for the common typo.
                  (bitcoin-lisp.validation::miniscript-parse-error ()
-                   (%desc-error "A function is needed within P2WSH")))))
+                   (%desc-error "A function is needed within ~A"
+                                (if (eq ms-ctx :tapscript) "P2TR" "P2WSH"))))))
     (%check-miniscript-sane node)
     (make-out-desc :kind :miniscript :node node :keys (nreverse keys))))
 

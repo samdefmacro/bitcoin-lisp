@@ -44,6 +44,15 @@
 (defconstant +psbt-in-tap-bip32+ #x16)
 (defconstant +psbt-in-tap-internal-key+ #x17)
 (defconstant +psbt-in-tap-merkle-root+ #x18)
+;;; MuSig2 (BIP373). Keydata layouts, from Core psbt.h:414-445:
+;;;   PARTICIPANT_PUBKEYS  <33-byte aggregate>            value: n * 33 bytes
+;;;   PUB_NONCE            <33 participant><33 aggregate>[<32 leaf hash>]
+;;;   PARTIAL_SIG          <33 participant><33 aggregate>[<32 leaf hash>]
+;;; The leaf hash is present for a script-path signature and absent for a key
+;;; path, which is what makes the keydata length the discriminator.
+(defconstant +psbt-in-musig2-participant-pubkeys+ #x1a)
+(defconstant +psbt-in-musig2-pub-nonce+ #x1b)
+(defconstant +psbt-in-musig2-partial-sig+ #x1c)
 (defconstant +psbt-in-proprietary+ #xfc)
 
 ;; Output key types.
@@ -53,6 +62,7 @@
 (defconstant +psbt-out-tap-internal-key+ #x05)
 (defconstant +psbt-out-tap-tree+ #x06)
 (defconstant +psbt-out-tap-bip32+ #x07)
+(defconstant +psbt-out-musig2-participant-pubkeys+ #x08)
 (defconstant +psbt-out-proprietary+ #xfc)
 
 (defstruct psbt-map

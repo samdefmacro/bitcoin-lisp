@@ -190,3 +190,94 @@ mistake."
         parsed)
     (is (null bad) "~D parsed transactions did not re-serialize to their input; first ~S"
         (length bad) (first (last bad)))))
+
+;;;; --- More of Core's targets, as properties -------------------------------
+
+(test fuzz-bech32-roundtrips-both-variants
+  "Core bech32.cpp FUZZ_TARGET(bech32_roundtrip): an encoding must decode back
+to the same HRP, data and variant.
+
+Both variants are exercised because they differ only in the checksum constant,
+and a decoder that ignores the variant accepts a bech32 checksum on a bech32m
+address — which is how a segwit v1 output gets paid to a v0-looking address."
+  (let ((bad '()))
+    (%fuzz-seed 8)
+    (dotimes (i 2000)
+      (let* ((bytes (%fuzz-bytes 40))
+             ;; 5-bit groups, which is the alphabet bech32 encodes.
+             (data (map 'list (lambda (b) (ldb (byte 5 0) b)) bytes))
+             (hrp (if (evenp (%fuzz-u64)) "bc" "tb")))
+        (dolist (variant '(:bech32 :bech32m))
+          (let ((encoded (ignore-errors
+                          (bitcoin-lisp.crypto:bech32-encode hrp data variant))))
+            (when encoded
+              (multiple-value-bind (dhrp ddata dvariant)
+                  (ignore-errors (bitcoin-lisp.crypto:bech32-decode encoded))
+                (unless (and dhrp
+                             (string= dhrp hrp)
+                             (equal ddata data)
+                             (eq dvariant variant))
+                  (push (list i variant encoded) bad))))))))
+    (is (null bad) "~D of 4000 bech32 roundtrips lost data; first ~S"
+        (length bad) (first (last bad)))))
+
+(test fuzz-hex-roundtrips-and-rejects-garbage
+  "Core hex.cpp FUZZ_TARGET(hex). BYTES-TO-HEX must roundtrip, and HEX-TO-BYTES
+must not invent data for a string that is not hex — the decoder sits in front
+of every hex RPC argument."
+  (let ((bad '()))
+    (%fuzz-seed 9)
+    (dotimes (i 3000)
+      (let* ((bytes (%fuzz-bytes 64))
+             (hex (bitcoin-lisp.crypto:bytes-to-hex bytes))
+             (back (ignore-errors (bitcoin-lisp.crypto:hex-to-bytes hex))))
+        (unless (and back (equalp (coerce back 'list) (coerce bytes 'list)))
+          (push (list :roundtrip i hex) bad))))
+    ;; Arbitrary text must decode or fail, never half-decode.
+    (%fuzz-seed 10)
+    (dotimes (i 3000)
+      (let* ((s (map 'string #'code-char (%fuzz-bytes 40)))
+             (out (ignore-errors (bitcoin-lisp.crypto:hex-to-bytes s))))
+        (when (and out (oddp (length s)))
+          (push (list :odd-length i s) bad))))
+    (is (null bad) "~D hex properties failed; first ~S"
+        (length bad) (first (last bad)))))
+
+(test fuzz-block-header-deserialisation-is-total
+  "Core block_header.cpp. Headers arrive unauthenticated and in bulk — a
+`headers' message carries up to 2000 of them — so this parser sees more hostile
+bytes than any other."
+  (%fuzz-total ("read-block-header" 11 4000 bytes :max-len 200)
+    (bitcoin-lisp.serialization::br-read-block-header
+     (bitcoin-lisp.serialization:make-byte-reader-from bytes))))
+
+(test fuzz-descriptor-parsing-never-escapes
+  "Core descriptor_parse.cpp. Descriptors reach us from RPC and from wallet
+files, and the parser is recursive — an unbounded nesting is a stack overflow,
+which is a SERIOUS-CONDITION rather than an ERROR and would not be caught by a
+handler written for the latter."
+  (let ((bad '()))
+    (%fuzz-seed 12)
+    (dotimes (i 1500)
+      (let* ((s (map 'string #'code-char (%fuzz-bytes 96)))
+             (caught (handler-case
+                         (progn (bitcoin-lisp.rpc::parse-descriptor s :mainnet) nil)
+                       (error () nil)
+                       (serious-condition (c) c))))
+        (when caught (push (list i s (type-of caught)) bad))))
+    ;; And deliberately deep nesting, which random bytes will not produce.
+    (dolist (depth '(50 200 1000))
+      (let* ((s (concatenate 'string
+                             (with-output-to-string (o)
+                               (dotimes (n depth)
+                                 (declare (ignore n))
+                                 (write-string "sh(" o)))
+                             "1"
+                             (make-string depth :initial-element #\))))
+             (caught (handler-case
+                         (progn (bitcoin-lisp.rpc::parse-descriptor s :mainnet) nil)
+                       (error () nil)
+                       (serious-condition (c) c))))
+        (when caught (push (list :nesting depth (type-of caught)) bad))))
+    (is (null bad) "~D descriptor inputs escaped; first ~S"
+        (length bad) (first (last bad)))))
