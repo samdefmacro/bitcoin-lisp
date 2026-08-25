@@ -478,3 +478,56 @@ inventing a shape a client would not recognise."
         (is (equal "09090909" (cdr (assoc "master_fingerprint" d :test #'string=))))
         ;; A zero leaf-hash count is legal: the key is used for key-path only.
         (is (zerop (length (cdr (assoc "leaf_hashes" d :test #'string=)))))))))
+
+(test decodepsbt-reports-bip373-musig2-fields
+  "BIP373's MuSig2 records, so a signer's user can SEE what a PSBT asks of them.
+
+DECODING only. A MuSig2 signing session needs nonce state this node does not
+keep, and inventing one would be worse than useless: reusing a nonce across two
+messages leaks the private key outright.
+
+⚠️ The keydata LENGTH is the discriminator between a key-path record (66 bytes:
+participant + aggregate) and a script-path one (98: plus the leaf hash). A
+reader that ignores it files every script-path nonce under the key path."
+  (let* ((agg (%tap-bytes 33 #x02))
+         (p1 (%tap-bytes 33 #x03))
+         (p2 (%tap-bytes 33 #x04))
+         (leaf-hash (%tap-bytes 32 #xEE))
+         (nonce (%tap-bytes 66 #xAA))
+         (psig (%tap-bytes 32 #xBB))
+         (cat (lambda (&rest vs)
+                (apply #'concatenate '(vector (unsigned-byte 8)) vs)))
+         (map (bitcoin-lisp.serialization:make-psbt-map
+               :records
+               (list (%tap-record
+                      bitcoin-lisp.serialization:+psbt-in-musig2-participant-pubkeys+
+                      agg (funcall cat p1 p2))
+                     ;; Key path: no leaf hash.
+                     (%tap-record bitcoin-lisp.serialization:+psbt-in-musig2-pub-nonce+
+                                  (funcall cat p1 agg) nonce)
+                     ;; Script path: leaf hash present.
+                     (%tap-record bitcoin-lisp.serialization:+psbt-in-musig2-partial-sig+
+                                  (funcall cat p2 agg leaf-hash) psig)))))
+    (let* ((json (bitcoin-lisp.rpc::%psbt-input-json map :mainnet))
+           (parts (cdr (assoc "musig2_participant_pubkeys" json :test #'string=)))
+           (nonces (cdr (assoc "musig2_pubnonces" json :test #'string=)))
+           (sigs (cdr (assoc "musig2_partial_sigs" json :test #'string=))))
+      (is-true parts "no musig2_participant_pubkeys in ~S" (mapcar #'car json))
+      (is-true nonces "no musig2_pubnonces")
+      (is-true sigs "no musig2_partial_sigs")
+      (when (and parts nonces sigs)
+        (let ((entry (first (coerce parts 'list))))
+          (is (string= (bitcoin-lisp.crypto:bytes-to-hex agg)
+                       (cdr (assoc "aggregate_pubkey" entry :test #'string=))))
+          (is (= 2 (length (coerce (cdr (assoc "participant_pubkeys" entry
+                                               :test #'string=))
+                                   'list)))
+              "the participant list did not split into two 33-byte keys"))
+        ;; The key-path nonce has NO leaf hash; the script-path sig has one.
+        (let ((n (first (coerce nonces 'list)))
+              (sg (first (coerce sigs 'list))))
+          (is-false (assoc "leaf_hash" n :test #'string=)
+                    "a key-path nonce reported a leaf hash")
+          (is (string= (bitcoin-lisp.crypto:bytes-to-hex leaf-hash)
+                       (cdr (assoc "leaf_hash" sg :test #'string=)))
+              "the script-path partial sig lost its leaf hash"))))))

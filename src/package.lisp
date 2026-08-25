@@ -357,6 +357,8 @@
    #:+psbt-in-tap-key-sig+ #:+psbt-in-tap-internal-key+ #:+psbt-in-proprietary+
    #:+psbt-in-tap-script-sig+ #:+psbt-in-tap-leaf-script+
    #:+psbt-in-tap-bip32+ #:+psbt-in-tap-merkle-root+
+   #:+psbt-in-musig2-participant-pubkeys+ #:+psbt-in-musig2-pub-nonce+
+   #:+psbt-in-musig2-partial-sig+ #:+psbt-out-musig2-participant-pubkeys+
    #:+psbt-out-redeem-script+ #:+psbt-out-witness-script+ #:+psbt-out-bip32+
    #:+psbt-out-tap-internal-key+ #:+psbt-out-proprietary+
    #:+psbt-out-tap-tree+ #:+psbt-out-tap-bip32+

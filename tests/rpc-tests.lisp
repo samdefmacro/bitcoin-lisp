@@ -6851,3 +6851,33 @@ divergence a conformance test catches and a human never does."
     (is (eq t (active 501 500)))
     ;; An always-active deployment (height 0) is active even at height 0.
     (is (eq t (active 0 0)))))
+
+(test named-only-options-members-are-accepted-as-top-level-arguments
+  "Core's dispatcher lets a member of an OBJ_NAMED_PARAMS options object be
+passed as a TOP-LEVEL named argument: RPCHelpMan::GetArgNames emits them with
+named_only=true (rpc/util.cpp:750) and transformNamedArguments collects them
+into a fresh options object pushed at the options slot (rpc/server.cpp:408).
+
+Without it the node answers `Unknown named parameter fee_rate' to a call every
+Core client can make — nine of Core's functional tests do exactly that, and the
+table is GENERATED from Core so it cannot drift into a hand-maintained
+approximation."
+  (flet ((call (method &rest kvs)
+           (let ((h (make-hash-table :test 'equal)))
+             (loop for (k v) on kvs by #'cddr do (setf (gethash k h) v))
+             (bitcoin-lisp.rpc::%named-params-to-positional method h))))
+    ;; send: outputs is positional 0, options is positional 4.
+    (let ((out (call "send" "outputs" 1 "fee_rate" 2 "add_to_wallet" 3)))
+      (is (= 5 (length out)) "send produced ~D slots, wanted 5" (length out))
+      (is (eql 1 (first out)))
+      (let ((options (fifth out)))
+        (is-true (hash-table-p options) "the options slot is ~S" options)
+        (when (hash-table-p options)
+          (is (eql 2 (gethash "fee_rate" options)))
+          (is (eql 3 (gethash "add_to_wallet" options))))))
+    ;; gettxspendingprevout's member, which is not a wallet RPC.
+    (let ((out (call "gettxspendingprevout" "outputs" 1 "mempool_only" t)))
+      (is-true (hash-table-p (second out))
+               "mempool_only did not reach the options slot: ~S" out))
+    ;; A name that is neither positional nor a member is still unknown.
+    (signals bitcoin-lisp.rpc::rpc-error (call "send" "outputs" 1 "nonesuch" 2))))

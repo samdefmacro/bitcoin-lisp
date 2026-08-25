@@ -91,7 +91,27 @@ fragments of their own, and so does this."
   (data nil)
   ;; Computed once at construction.
   (node-type 0 :type (unsigned-byte 32))
-  (script-size 0 :type (unsigned-byte 32)))
+  (script-size 0 :type (unsigned-byte 32))
+  ;; :P2WSH or :TAPSCRIPT (Core MiniscriptContext, miniscript.h:251). The
+  ;; context is not decoration: it changes which FRAGMENTS are legal (multi
+  ;; versus multi_a), how a key SERIALIZES (33 bytes versus 32), what `d:'
+  ;; types as, the script size ceiling, and the signature size the satisfier
+  ;; costs a branch at. A node carries its own so a tree cannot be half of
+  ;; each.
+  (ctx :p2wsh :type (member :p2wsh :tapscript)))
+
+(defun ms-tapscript-p (ctx)
+  "Core IsTapscript (miniscript.h:257)."
+  (eq ctx :tapscript))
+
+(defvar *ms-context* :p2wsh
+  "The miniscript context the current parse is in.
+
+A special rather than a parameter threaded through all fifty-four node
+constructions: threading it by hand is exactly the shape that gets forgotten at
+one call site, and a tree half in each context would still TYPE-CHECK while
+producing a script for neither. MS-PARSE binds it; MAKE-MS-NODE defaults from
+it; nothing else has to remember.")
 
 (defconstant +ms-locktime-threshold+ 500000000
   "Core LOCKTIME_THRESHOLD: below this an nLockTime is a height, at or above it
@@ -102,6 +122,10 @@ a Unix time.")
 measured in 512-second units rather than blocks.")
 
 (defconstant +ms-max-pubkeys-per-multisig+ 20)
+
+(defconstant +ms-max-pubkeys-per-multi-a+ 999
+  "Core MAX_PUBKEYS_PER_MULTI_A (script.h:37). A CHECKSIGADD chain has no
+CHECKMULTISIG-style ceiling; only the script size limit bounds it.")
 
 (defconstant +ms-sequence-final+ #xFFFFFFFF
   "Core CTxIn::SEQUENCE_FINAL.")
@@ -208,9 +232,11 @@ reason it exists: such a miniscript cannot mean what its author expects."
 ;;;; (o=o_x*z_y+z_x*o_y and so on); those are kept because they, not the code,
 ;;;; are the specification.
 
-(defun ms-compute-type (fragment x y z sub-types k data-size n-subs n-keys)
+(defun ms-compute-type (fragment x y z sub-types k data-size n-subs n-keys
+                        &optional (ctx :p2wsh))
   "Core ComputeType. X, Y and Z are the first three sub-expression types (0 when
-absent); SUB-TYPES is every sub-type, needed only by THRESH."
+absent); SUB-TYPES is every sub-type, needed only by THRESH. CTX is the
+miniscript context, which one rule depends on — see :WRAP-D."
   (declare (ignorable data-size n-keys))
   (macrolet ((m (s) `(mst ,s)))
     (ecase fragment
@@ -242,8 +268,9 @@ absent); SUB-TYPES is every sub-type, needed only by THRESH."
                        (logand x (m "ghijk"))
                        (logand x (m "ms"))
                        ;; 'd:' is 'u' under Tapscript but NOT under P2WSH,
-                       ;; where MINIMALIF is only a policy rule. This port is
-                       ;; P2WSH, so the bit is never set here.
+                       ;; where MINIMALIF is only a policy rule
+                       ;; (miniscript.cpp:125-126).
+                       (mst-if (ms-tapscript-p ctx) (m "u"))
                        (m "ndx")))
       (:wrap-v (logior (mst-if (mst-subset-p x (m "B")) (m "V"))
                        (logand x (m "ghijk"))
@@ -402,6 +429,21 @@ interpreter requires (Core's CScript::operator<<(int64_t))."
                (setf bytes (append bytes (list 0))))
              (concatenate 'vector (vector (length bytes)) bytes)))))
 
+(defconstant +ms-op-checksigadd+ #xba
+  "BIP342 OP_CHECKSIGADD. Only reachable in a tapscript context: under P2WSH it
+is OP_SUCCESS-adjacent and multi_a does not exist there at all.")
+
+(defun %ms-key-bytes (key ctx)
+  "How KEY serializes into a script in CTX.
+
+Core: `In Tapscript keys always serialize as x-only, whether an x-only key was
+used in the descriptor or not' (descriptor.cpp:1569). The 33-byte form in a
+tapscript leaf is a different script, a different leaf hash and a different
+ADDRESS — the same trap the tr() descriptor work hit twice."
+  (if (and (ms-tapscript-p ctx) (= (length key) 33))
+      (subseq key 1 33)
+      key))
+
 (defun %ms-push-data (bytes)
   "Script bytes pushing BYTES as data, minimally encoded."
   (let ((n (length bytes)))
@@ -441,7 +483,12 @@ has to travel INTO the sub for that, which is why it is a parameter here and
 not something applied afterwards."
   (let ((subs (ms-node-subs node)))
     (flet ((sub (i &optional v) (ms-node-script (nth i subs) v key-fn))
-           (pk (k) (funcall key-fn k)))
+           ;; Core's ToPKBytes is context-aware: a tapscript node serializes
+           ;; every key x-only regardless of how it was written
+           ;; (descriptor.cpp:1568). Doing it HERE rather than at the two
+           ;; fragments that push keys means pk_k, pk_h and multi_a cannot
+           ;; disagree about it.
+           (pk (k) (%ms-key-bytes (funcall key-fn k) (ms-node-ctx node))))
       (ecase (ms-node-fragment node)
         (:just-0 (%ms-cat +op-0+))
         (:just-1 (%ms-cat +op-1+))
@@ -484,6 +531,17 @@ not something applied afterwards."
                                  (ms-node-keys node))
                          (%ms-push-number (length (ms-node-keys node)))
                          (if verify +op-checkmultisigverify+ +op-checkmultisig+)))
+        ;; <x0> CHECKSIG (<xi> CHECKSIGADD)* <k> NUMEQUAL — BIP342's
+        ;; replacement for CHECKMULTISIG, which tapscript removed.
+        (:multi-a
+         (let ((keys (ms-node-keys node)))
+           (%ms-cat (%ms-push-data (pk (first keys)))
+                    +op-checksig+
+                    (mapcar (lambda (k)
+                              (list (%ms-push-data (pk k)) +ms-op-checksigadd+))
+                            (rest keys))
+                    (%ms-push-number (ms-node-k node))
+                    (if verify +ms-op-numequalverify+ +ms-op-numequal+))))
         (:thresh (%ms-cat (sub 0)
                           (loop for i from 1 below (length subs)
                                 collect (list (sub i) +op-add+))
@@ -492,9 +550,12 @@ not something applied afterwards."
 
 ;;;; --- Construction --------------------------------------------------------
 
-(defun make-ms-node (fragment &key subs keys (k 0) data)
+(defun make-ms-node (fragment &key subs keys (k 0) data (ctx *ms-context*))
   "Build a node and compute its type. A node whose type is 0 is INVALID, which
-is how every rule violation surfaces — there is no separate error channel."
+is how every rule violation surfaces — there is no separate error channel.
+
+CTX defaults to the *MS-CONTEXT* the parse is running in, so no construction
+site has to pass it and none can disagree with its siblings."
   (let* ((sub-types (mapcar #'ms-node-node-type subs))
          (x (or (first sub-types) 0))
          (y (or (second sub-types) 0))
@@ -506,9 +567,10 @@ is how every rule violation surfaces — there is no separate error channel."
                    0
                    (ms-sanitize-type
                     (ms-compute-type fragment x y z sub-types k
-                                     (length data) (length subs) (length keys)))))
+                                     (length data) (length subs) (length keys)
+                                     ctx))))
          (node (%make-ms-node :fragment fragment :subs subs :keys keys
-                              :k k :data data :node-type type)))
+                              :k k :data data :node-type type :ctx ctx)))
     ;; The script size is only computable when the keys are already bytes; a
     ;; descriptor's key expressions have no size until they are derived, and a
     ;; node built from them reports 0 rather than guessing.
@@ -522,6 +584,24 @@ is how every rule violation surfaces — there is no separate error channel."
 (defconstant +ms-max-p2wsh-script-size+ 3600
   "Core MAX_STANDARD_P2WSH_SCRIPT_SIZE (policy/policy.h:51), which is what
 internal::MaxScriptSize returns outside tapscript (miniscript.h:293).")
+
+(defconstant +ms-max-tapscript-script-size+ 329482
+  "Core MaxScriptSize under tapscript (miniscript.h:284-292). A tapscript leaf
+has no explicit size limit; Core derives a conservative one from what a
+standard spending transaction can still carry:
+
+  MAX_STANDARD_TX_WEIGHT (400000) - TX_BODY_LEEWAY_WEIGHT (378)
+    - MAX_TAPSCRIPT_SAT_SIZE (70135) = 329487, less its own compact-size (5).
+
+Written out rather than recomputed because every input is a Core constant and
+the arithmetic is Core's, not ours — a recomputation here could drift from it
+silently while looking principled.")
+
+(defun ms-max-script-size (ctx)
+  "Core internal::MaxScriptSize (miniscript.h:282)."
+  (if (ms-tapscript-p ctx)
+      +ms-max-tapscript-script-size+
+      +ms-max-p2wsh-script-size+))
 
 (defconstant +ms-max-p2wsh-stack-items+ 100
   "Core MAX_STANDARD_P2WSH_STACK_ITEMS (policy/policy.h:53).")
@@ -540,7 +620,7 @@ built on IsValid — IsValidTopLevel, ValidSatisfactions, IsSane — was weaker
 than Core's."
   (and node
        (plusp (ms-node-node-type node))
-       (<= (ms-node-script-size node) +ms-max-p2wsh-script-size+)))
+       (<= (ms-node-script-size node) (ms-max-script-size (ms-node-ctx node)))))
 
 (defun ms-node-valid-top-level-p (node)
   "Core Node::IsValidTopLevel: the outermost expression must be a B."
@@ -780,10 +860,16 @@ passes — IsNotSatisfiable is what rejects that, separately."
 
 (defconstant +ms-p2wsh-sig-size+ 73
   "Core CalcWitnessSize's sig_size outside tapscript: 1 length byte + a 72-byte
-signature (miniscript.h:1188).")
+signature (miniscript.h:1189).")
 
 (defconstant +ms-p2wsh-pubkey-size+ 34
   "Core CalcWitnessSize's pubkey_size outside tapscript: 1 + 33.")
+
+(defconstant +ms-tapscript-sig-size+ 66
+  "1 + 65: a BIP340 signature with a sighash-type byte (miniscript.h:1189).")
+
+(defconstant +ms-tapscript-pubkey-size+ 33
+  "1 + 32: keys are x-only under tapscript (miniscript.h:1190).")
 
 (defun ms-node-witness-size (node)
   "Core Node::CalcWitnessSize (miniscript.h:1187-1237) as (SAT . DSAT), each a
@@ -793,8 +879,9 @@ non-malleably. Excludes the witnessScript push, exactly as Core's does."
          (w (mapcar #'ms-node-witness-size subs))
          (nkeys (length (ms-node-keys node)))
          (k (ms-node-k node))
-         (sig +ms-p2wsh-sig-size+)
-         (pub +ms-p2wsh-pubkey-size+))
+         (tap (ms-tapscript-p (ms-node-ctx node)))
+         (sig (if tap +ms-tapscript-sig-size+ +ms-p2wsh-sig-size+))
+         (pub (if tap +ms-tapscript-pubkey-size+ +ms-p2wsh-pubkey-size+)))
     (macrolet ((sat (i) `(car (nth ,i w))) (dsat (i) `(cdr (nth ,i w))))
       (ecase (ms-node-fragment node)
         (:just-0 (cons nil 0))
@@ -848,12 +935,30 @@ satisfy non-malleably, or NIL when no satisfaction exists."
   (let ((sat (car (ms-node-stack-size node))))
     (and sat (+ (ms-si-netdiff sat) (if (ms-node-bkw-p node) 1 0)))))
 
+(defconstant +ms-max-stack-size+ 1000
+  "Core MAX_STACK_SIZE (script.h:43) — the CONSENSUS stack limit, which is what
+bounds a tapscript, since tapscript has no standardness limit on script or
+witness size to bound it earlier.")
+
+(defun ms-node-exec-stack-size (node)
+  "Core Node::GetExecStackSize (miniscript.h:1584): the deepest the stack gets
+while EXECUTING, as opposed to the number of witness items handed in."
+  (let ((sat (car (ms-node-stack-size node))))
+    (and sat (+ (ms-si-exec sat) (if (ms-node-bkw-p node) 1 0)))))
+
 (defun ms-node-check-stack-size-p (node)
-  "Core Node::CheckStackSize (miniscript.h:1589), P2WSH branch: we do not parse
-miniscript in a tapscript context, so the MAX_STACK_SIZE branch is unreachable
-here and is deliberately not ported."
-  (let ((ss (ms-node-get-stack-size node)))
-    (or (null ss) (<= ss +ms-max-p2wsh-stack-items+))))
+  "Core Node::CheckStackSize (miniscript.h:1590).
+
+The two contexts check different things and it is worth seeing why: under
+P2WSH the WITNESS ITEM COUNT is what standardness caps, so the input side is
+the binding constraint. Under tapscript neither script nor witness size is
+capped by standardness, so nothing stops execution from reaching the CONSENSUS
+stack limit — which is the thing Core checks there instead."
+  (if (ms-tapscript-p (ms-node-ctx node))
+      (let ((exec (ms-node-exec-stack-size node)))
+        (or (null exec) (<= exec +ms-max-stack-size+)))
+      (let ((ss (ms-node-get-stack-size node)))
+        (or (null ss) (<= ss +ms-max-p2wsh-stack-items+)))))
 
 (defun ms-node-not-satisfiable-p (node)
   "Core Node::IsNotSatisfiable (miniscript.h:1602)."
@@ -992,11 +1097,16 @@ EXPRESSIONS -- xpubs with origins and ranges -- instead.")
             (#\u (make-ms-node :or-i :subs (list node (make-ms-node :just-0))))
             (t (%ms-fail "unknown miniscript wrapper ~S" w))))))
 
-(defun ms-parse (string)
+(defun ms-parse (string &key (ctx *ms-context*))
   "Parse a miniscript expression. Returns an MS-NODE, whose type is zero when
 the expression is well-formed but does not satisfy the type rules. Signals
-MINISCRIPT-PARSE-ERROR when it is not well-formed at all."
-  (let ((wrappers '()) (i 0))
+MINISCRIPT-PARSE-ERROR when it is not well-formed at all.
+
+CTX is :P2WSH (the default, and what wsh() asks for) or :TAPSCRIPT (what a tr()
+leaf asks for). It is bound for the whole recursive parse, so every node of one
+expression shares it."
+  (let ((*ms-context* ctx)
+        (wrappers '()) (i 0))
     ;; Leading wrappers, up to the colon. A colon can only appear here, so the
     ;; search is unambiguous: find it before the first '(' if there is one.
     (let ((colon (position #\: string))
@@ -1076,14 +1186,29 @@ MINISCRIPT-PARSE-ERROR when it is not well-formed at all."
                   (if (and (>= k 1) (<= k (length subs)))
                       (make-ms-node :thresh :k k :subs subs)
                       (%make-ms-node :fragment :thresh :k 0 :node-type 0))))
+               ;; multi is P2WSH-only and multi_a tapscript-only: BIP342
+               ;; removed CHECKMULTISIG and introduced CHECKSIGADD in its place
+               ;; (miniscript.cpp, Fragment::MULTI / MULTI_A). A fragment used
+               ;; in the wrong context is INVALID rather than unknown, so it
+               ;; reports a zero type like every other rule violation.
                ((string= name "multi")
                 (unless (>= (length args) 2) (%ms-fail "multi needs a threshold and keys"))
                 (let ((k (%ms-parse-number (first args) "multi"))
                       (keys (mapcar #'%ms-parse-key (rest args))))
-                  (if (and (>= k 1) (<= k (length keys))
+                  (if (and (not (ms-tapscript-p *ms-context*))
+                           (>= k 1) (<= k (length keys))
                            (<= (length keys) +ms-max-pubkeys-per-multisig+))
                       (make-ms-node :multi :k k :keys keys)
                       (%make-ms-node :fragment :multi :k 0 :node-type 0))))
+               ((string= name "multi_a")
+                (unless (>= (length args) 2) (%ms-fail "multi_a needs a threshold and keys"))
+                (let ((k (%ms-parse-number (first args) "multi_a"))
+                      (keys (mapcar #'%ms-parse-key (rest args))))
+                  (if (and (ms-tapscript-p *ms-context*)
+                           (>= k 1) (<= k (length keys))
+                           (<= (length keys) +ms-max-pubkeys-per-multi-a+))
+                      (make-ms-node :multi-a :k k :keys keys)
+                      (%make-ms-node :fragment :multi-a :k 0 :node-type 0))))
                (t (%ms-fail "unknown miniscript fragment ~S" name)))))
       (%ms-apply-wrappers wrappers node))))
 
