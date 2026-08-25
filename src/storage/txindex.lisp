@@ -250,8 +250,38 @@ testnet4 node."
                 (cond
                   ((null on-chain) (values 0 :height-above-tip))
                   ((not (equalp (block-index-entry-hash on-chain) best))
-                   (values 0 :marker-off-chain))
+                   ;; The marker sits on a block a reorg disconnected. Core
+                   ;; REWINDS the index to the fork point (BaseIndex::Rewind,
+                   ;; index/base.cpp:290) rather than starting over; answering
+                   ;; 0 here rescans from GENESIS, which on the live testnet4
+                   ;; node is a full rebuild of a 149k-block index on a restart
+                   ;; that happened to follow a reorg — and testnet4 reorgs
+                   ;; often. Observed 2026-08-25.
+                   ;;
+                   ;; Walking the marker's own ancestry finds that fork point:
+                   ;; the first ancestor that IS the active chain's block at
+                   ;; its height. Entries above it were indexed for a branch
+                   ;; that lost, and %TXINDEX-BLOCK-INDEXED-P re-checks each
+                   ;; block as the scan reaches it, so resuming there is safe
+                   ;; rather than merely cheaper.
+                   (%txindex-fork-point chain-state entry))
                   (t (values (1+ height) :resumed)))))))))
+
+(defun %txindex-fork-point (chain-state entry)
+  "(values NEXT-HEIGHT REASON) for a marker ENTRY that is not on the active
+chain: resume just after its deepest ancestor that is."
+  (loop for e = (block-index-entry-prev-entry entry)
+          then (block-index-entry-prev-entry e)
+        while e
+        do (let* ((h (block-index-entry-height e))
+                  (on-chain (get-block-at-height chain-state h)))
+             (when (and on-chain
+                        (equalp (block-index-entry-hash on-chain)
+                                (block-index-entry-hash e)))
+               (return (values (1+ h) :rewound-to-fork))))
+        ;; No common ancestor reachable — the only honest answer is a full
+        ;; rescan, which is what this used to do unconditionally.
+        finally (return (values 0 :marker-off-chain))))
 
 (defun build-tx-index (txindex chain-state block-store
                        &key progress-callback from-genesis)
