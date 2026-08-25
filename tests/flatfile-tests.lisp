@@ -1134,3 +1134,32 @@ its operator would have had a -prune node that silently stopped reclaiming."
                "each pruned block must be reported so its undo data goes too")
            (is (= 3 (bitcoin-lisp.storage::chain-state-pruned-height cs))
                "the prune horizon did not advance to the file's last height")))))))
+
+(test get-block-serves-the-genesis-body-nobody-stores
+  "The genesis block is never RECEIVED, so nothing ever calls STORE-BLOCK for
+it — but Core has it on disk from initialisation and every Core reader can
+fetch it. getblock(getbestblockhash()) on a fresh node IS genesis, which is how
+Core's functional tests open: p2p_invalid_block.py:45 and p2p_invalid_tx.py:54
+both did, and both died on -5 'Block not found'.
+
+Rebuilt in GET-BLOCK rather than at the twelve RPC/REST sites that want a block
+body — one of them would have been missed."
+  (dolist (network '(:regtest :testnet4 :mainnet))
+    (let ((bitcoin-lisp:*network* network))
+      (%with-flat-store (store dir)
+        (declare (ignore dir))
+        (let* ((hash (bitcoin-lisp.storage:network-genesis-hash network))
+               (block (bitcoin-lisp.storage:get-block store hash)))
+          (is-true block "~A: genesis body not served" network)
+          (when block
+            (is (equalp hash
+                        (bitcoin-lisp.serialization:block-header-hash
+                         (bitcoin-lisp.serialization:bitcoin-block-header block)))
+                "~A: served a block that is not genesis" network))))))
+  ;; A hash that is nobody's genesis is still absent.
+  (let ((bitcoin-lisp:*network* :regtest))
+    (%with-flat-store (store dir)
+      (declare (ignore dir))
+      (is-false (bitcoin-lisp.storage:get-block
+                 store (make-array 32 :element-type '(unsigned-byte 8)
+                                      :initial-element 42))))))

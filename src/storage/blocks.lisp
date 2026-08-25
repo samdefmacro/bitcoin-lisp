@@ -446,8 +446,13 @@ as absent, so none relies on the raise."
              (bitcoin-lisp.crypto:bytes-to-hex hash) e)
             (remhash hash (block-store-index store))
             nil)))))
-  (let ((path (block-file-path store hash)))
-    (when (probe-file path)
+  ;; ⚠️ OR, not two statements. Appending a form after this LET would DISCARD
+  ;; its value, so a block read successfully from the legacy per-block file
+  ;; would be thrown away and the function would answer with the genesis
+  ;; fallback below — i.e. NIL for almost every block. Cost 33 red tests.
+  (or
+   (let ((path (block-file-path store hash)))
+     (when (probe-file path)
       (handler-case
           (with-open-file (stream path
                                   :direction :input
@@ -464,7 +469,45 @@ as absent, so none relies on the raise."
            "CORRUPT BLOCK file for ~A (~A) — pruning for re-download"
            (bitcoin-lisp.crypto:bytes-to-hex hash) e)
           (ignore-errors (prune-block store hash))
-          nil)))))
+          nil))))
+   ;; The genesis block is never RECEIVED, so nothing ever stores its body — but
+  ;; Core has it on disk from initialisation (BlockManager writes it before the
+  ;; first sync), so every Core reader can fetch it. getblock(getbestblockhash())
+  ;; on a fresh node is genesis, and Core's functional tests open with exactly
+  ;; that: p2p_invalid_block.py:45 and p2p_invalid_tx.py:54 both did, and both
+  ;; died on "Block not found".
+  ;;
+  ;; Rebuilt rather than stored, and rebuilt HERE rather than at the twelve
+  ;; RPC/REST call sites that want a block body: one of them would have been
+  ;; missed. MAKE-GENESIS-BLOCK is self-verifying (it recomputes the merkle root
+  ;; and checks the header hash against the network's known genesis), so this
+   ;; cannot answer with the wrong block.
+   (%genesis-block-body hash)))
+
+(defvar *genesis-body-cache* (make-hash-table :test 'eq :synchronized t)
+  "network -> its genesis block, so repeated lookups do not re-derive it.
+
+SYNCHRONIZED because GET-BLOCK is reachable from the parallel script-check
+workers, and this is written on first use rather than at load time. There are
+at most five entries and they are written once each, so the lock is never
+contended — it is here so the table cannot be the next *FLAG-SET-CACHE*.")
+
+(defun %genesis-block-body (hash)
+  "The genesis block when HASH is this network's genesis hash, else NIL.
+
+⚠️ Total by construction. GET-BLOCK's MISS is the ordinary case — every
+download decision asks it about a block it does not have — so this must answer
+NIL and never signal. NETWORK-GENESIS-HASH is an ECASE and MAKE-GENESIS-BLOCK
+raises when construction does not reproduce the known hash; letting either
+escape turns `absent' into an error on a path that has no handler for one, and
+takes the reorg, migration and filter-index tests down with it."
+  (let ((network bitcoin-lisp:*network*))
+    (let ((genesis (ignore-errors (network-genesis-hash network))))
+      (when (and genesis (equalp hash genesis))
+        (or (gethash network *genesis-body-cache*)
+            (let ((block (ignore-errors (make-genesis-block network))))
+              (when block
+                (setf (gethash network *genesis-body-cache*) block))))))))
 
 (defun block-exists-p (store hash)
   "Check if a block with HASH exists in storage, in either form."

@@ -298,6 +298,9 @@
                              (:file "wave10-tests")
                              ;; GA8 W1-A: intra-block coin overlay (chained-spend
                              ;; script validation + same-block double spends)
-                             (:file "intrablock-coins-tests"))))
+                             (:file "intrablock-coins-tests")
+                             ;; Randomised totality/roundtrip properties over
+                             ;; the parsers a hostile peer reaches
+                             (:file "fuzz-property-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
