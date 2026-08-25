@@ -585,9 +585,17 @@ ParseScriptContext::P2TR."
                                       "pk(): "
                                       (lambda () (%parse-desc-key inner ctx network)))))))
       ;; pkh(KEY)
+      ;;
+      ;; ⚠️ Core gates the pkh() DESCRIPTOR on TOP/P2SH/P2WSH only
+      ;; (descriptor.cpp:2290) — but a taproot leaf then reaches the miniscript
+      ;; branch, where `pkh' is a fragment (c:pk_h), so Core accepts
+      ;; tr(K,pkh(K2)) after all and hashes the 32-BYTE x-only key. Same script
+      ;; either way; we get there without a miniscript parser, and the x-only
+      ;; flag is what keeps the leaf hash — and so the ADDRESS — Core's.
       (with-inner (inner "pkh")
         (return-from %parse-descriptor-body
           (make-out-desc :kind :pkh
+                         :xonly-script-p (%xonly-context-p ctx)
                          :keys (list (%with-desc-error-prefix
                                       "pkh(): "
                                       (lambda () (%parse-desc-key inner ctx network)))))))
@@ -1016,11 +1024,26 @@ Consumers that slice this list positionally depend on the order — see
   (concatenate '(vector (unsigned-byte 8)) #(#x51 #x20) output-key32))
 
 (defun %script-num (n)
-  "Push of small number N in a multisig script: OP_1..OP_16 opcodes, else a
-minimal 1-byte push (CScript << int64_t for the 1..20 range used here)."
+  "The push a script builds for the positive integer N with `CScript << n'
+(Core CScript::push_int64, script.h:433): OP_1..OP_16 for 1..16, otherwise a
+minimal-length little-endian push of CScriptNum::serialize.
+
+⚠️ The SIGN BYTE is what a one-byte-per-number shortcut gets wrong, and it is
+reachable: multi_a allows a threshold up to MAX_PUBKEYS_PER_MULTI_A, and
+CScriptNum::serialize(128) is 0x80 0x00 -- the trailing zero marks it positive,
+because 0x80 alone reads as negative zero. Above 255 a single byte cannot hold
+the value at all. Either way the leaf script differs from Core's, which means a
+different leaf hash, a different merkle root and a different ADDRESS."
   (if (<= 1 n 16)
       (vector (+ #x50 n))
-      (vector 1 n)))
+      (let ((bytes (loop with v = n
+                         while (plusp v)
+                         collect (logand v #xff)
+                         do (setf v (ash v -8)))))
+        (when (logbitp 7 (car (last bytes)))
+          (setf bytes (append bytes (list 0))))
+        (coerce (cons (length bytes) bytes)
+                '(vector (unsigned-byte 8))))))
 
 (defun %pubkey-lessp (a b)
   "Lexicographic pubkey compare (CPubKey operator<; BIP67 sort order)."
@@ -1042,6 +1065,14 @@ minimal 1-byte push (CScript << int64_t for the 1..20 range used here)."
   "The 32-byte x-only form of a 33-byte compressed pubkey."
   (subseq pubkey 1 33))
 
+(defun %desc-script-pubkey (desc keyfn)
+  "The pubkey DESC's script should embed: 32-byte x-only inside a taproot leaf
+\(Core's m_xonly), the full 33/65-byte form everywhere else."
+  (let ((pubkey (funcall keyfn (first (out-desc-keys desc)))))
+    (if (out-desc-xonly-script-p desc)
+        (%key-xonly-bytes pubkey)
+        pubkey)))
+
 (defun %script-multi-a (threshold xkeys)
   "The tapscript k-of-n script (Core MultiADescriptor::MakeScripts,
 descriptor.cpp:1325-1337):
@@ -1062,72 +1093,222 @@ is pushed x-only, so 32 bytes and not 33."
 (defconstant +tapleaf-version-tapscript+ #xc0
   "BIP342's leaf version. The only one a descriptor can express.")
 
-(defun %taproot-merkle-root (leaf-hashes)
-  "The merkle root of a taproot script tree, from LEAF-HASHES — a list of
-(DEPTH . 32-byte tapleaf hash) in the order tr()'s tree argument names them.
+(defun %tap-combine (a b)
+  "Core TaprootBuilder::Combine (script/signingprovider.cpp:352). A and B are
+(HASH . LEAVES) where LEAVES is a list of (INDEX . PATH-SO-FAR).
 
-Core's TaprootBuilder::Insert (script/signingprovider.cpp), and it is worth
-seeing why no tree object is needed: M-BRANCH holds at most one pending hash
-per depth. Inserting at depth D combines with whatever is already pending at D
-— that is D's left sibling, which by the parse order must already be there —
-and the combined node moves up one level, repeating while a sibling waits.
-A well-formed tree therefore ends with exactly one pending hash at depth 0.
+Each side's leaves gain the OTHER side's hash: that sibling is precisely the
+next element of their merkle path. PATH is accumulated by PUSH, so it comes out
+outermost-first and is reversed once at the end rather than appended to L
+times."
+  (flet ((extend (leaves sibling)
+           (loop for (index . path) in leaves
+                 collect (cons index (cons sibling path)))))
+    (cons (bitcoin-lisp.crypto:tap-branch-hash (car a) (car b))
+          (append (extend (cdr a) (car b))
+                  (extend (cdr b) (car a))))))
 
-TAP-BRANCH-HASH already sorts the pair lexicographically (BIP341), which is
-what makes the root independent of left/right ordering."
+(defun %taproot-tree (leaf-hashes &optional track-paths)
+  "(values MERKLE-ROOT BRANCHES) for the taproot script tree described by
+LEAF-HASHES — a list of (DEPTH . 32-byte tapleaf hash) in the order tr()'s tree
+argument names them.
+
+BRANCHES is one merkle path per leaf, in the same order: the sibling hashes
+from the leaf upwards, which is exactly what a control block carries after its
+internal key. It is NIL unless TRACK-PATHS — deriving an ADDRESS needs only the
+root, and %TR-OUTPUT-KEY sits on the keypool derivation path, which walks a
+whole range. With tracking off the per-leaf lists stay empty and %TAP-COMBINE's
+loops over them cost nothing, so there is still one implementation of the fold.
+
+Core's TaprootBuilder::Insert (script/signingprovider.cpp:384), and it is worth
+seeing why no tree object is needed: M-BRANCH holds at most one pending node per
+depth. Inserting at depth D combines with whatever is already pending at D —
+that is D's left sibling, which by the parse order must already be there — and
+the combined node moves up one level, repeating while a sibling waits. A
+well-formed tree therefore ends with exactly one pending node at depth 0.
+
+⚠️ TAP-BRANCH-HASH sorts each pair lexicographically (BIP341), so the ROOT does
+not depend on left/right — but a PATH does. The path is built by the combine
+step from the actual sibling, never re-derived from the root, which is what
+keeps a leaf out of its own path."
   (let ((branch (make-array (1+ (reduce #'max leaf-hashes :key #'car :initial-value 0))
                             :initial-element nil))
-        (size 0))
-    (dolist (entry leaf-hashes)
-      (let ((depth (car entry))
-            (node (cdr entry)))
-        (loop while (and (> size depth) (aref branch depth))
-              do (setf node (bitcoin-lisp.crypto:tap-branch-hash node (aref branch depth))
-                       (aref branch depth) nil)
-                 (decf size)
-                 (when (zerop depth) (return))
-                 (decf depth))
-        (setf (aref branch depth) node
-              size (max size (1+ depth)))))
-    ;; Anything other than a single pending hash at depth 0 means the depth
-    ;; sequence did not describe a tree (Core asserts ValidDepths before
-    ;; building, descriptor.cpp:2517).
-    (unless (and (= size 1) (aref branch 0))
+        (size 0)
+        (valid t))
+    (loop for entry in leaf-hashes
+          for index from 0
+          while valid
+          do (let ((depth (car entry))
+                   (node (cons (cdr entry)
+                               (when track-paths (list (cons index '()))))))
+               ;; Core's first guard: a leaf cannot be inserted ABOVE an
+               ;; unfinished deeper branch, because the Add() calls would then
+               ;; not be a DFS traversal (signingprovider.cpp:390).
+               (if (< (1+ depth) size)
+                   (setf valid nil)
+                   (progn
+                     (loop while (and valid (> size depth) (aref branch depth))
+                           do (setf node (%tap-combine node (aref branch depth))
+                                    (aref branch depth) nil)
+                              (decf size)
+                              ;; Nothing propagates above the root. Core sets
+                              ;; m_valid here and its `if (m_valid)' then skips
+                              ;; the store; dropping out of the loop and storing
+                              ;; anyway would leave exactly one node at depth 0
+                              ;; and pass the completeness test below, so
+                              ;; e.g. depths (1 1 0) would silently build a tree
+                              ;; Core refuses.
+                              (if (zerop depth)
+                                  (setf valid nil)
+                                  (decf depth)))
+                     (when valid
+                       (setf (aref branch depth) node
+                             size (max size (1+ depth))))))))
+    ;; Core asserts ValidDepths before building (descriptor.cpp:2517); reaching
+    ;; here with anything but a single pending node at depth 0 means the depth
+    ;; sequence did not describe a tree.
+    (unless (and valid (= size 1) (aref branch 0))
       (%desc-error "tr(): malformed script tree"))
-    (aref branch 0)))
+    (let ((root (aref branch 0)))
+      (values (car root)
+              (when track-paths
+                (let ((by-index (cdr root)))
+                  (loop for i from 0 below (length leaf-hashes)
+                        collect (reverse (cdr (assoc i by-index))))))))))
+
+(defun %taproot-control-block (leaf-version parity internal-key path)
+  "The BIP341 control block for one leaf (Core TaprootBuilder::GetSpendData,
+script/signingprovider.cpp:481): leaf version with the output key's parity in
+its low bit, the 32-byte internal key, then the merkle path leaf-upwards."
+  (apply #'concatenate '(vector (unsigned-byte 8))
+         (vector (logior leaf-version parity))
+         internal-key
+         path))
+
+(defun tr-leaf-satisfaction (leaf pubkeys sigfn)
+  "The witness elements that satisfy the taproot script LEAF, or NIL when the
+available keys cannot satisfy it.
+
+PUBKEYS is the leaf's 33-byte pubkeys in LEAF's own key-expression order (what
+the expansion produced for this range index). SIGFN is called with one 32-byte
+x-only key and returns its 64/65-byte Schnorr signature, or NIL when that key is
+not available for signing.
+
+⚠️ Core reaches every leaf through miniscript::Satisfy on the leaf SCRIPT
+(sign.cpp:529-540). We have no tapscript miniscript, so the leaf kinds our
+tr() grammar can actually build are satisfied directly here, and anything else
+reports UNSATISFIABLE rather than guessing at a witness.
+
+⚠️ The multi_a stack is REVERSED against key order, and it is worth deriving
+rather than trusting: the script is
+    <x1> CHECKSIG <x2> CHECKSIGADD ... <xn> CHECKSIGADD <k> NUMEQUAL
+and OP_CHECKSIG/OP_CHECKSIGADD each pop the signature from the TOP of the
+stack. The witness elements go on bottom-first, so x1 -- checked first --
+consumes the LAST element. A stack in key order spends nothing and, if it did,
+would spend it with the wrong signatures against the wrong keys."
+  (let ((xonly (mapcar #'%key-xonly-bytes pubkeys)))
+    ;; CASE and not ECASE: an unknown leaf kind is UNSATISFIABLE, which the
+    ;; signer already reports, and not a type error surfacing as RPC -32603
+    ;; in the middle of signing. This is also the single place the satisfiable
+    ;; kinds are named -- a second list to keep in step is a leaf that becomes
+    ;; either silently unspendable or an unhandled ECASE.
+    (case (out-desc-kind leaf)
+      ;; <x> CHECKSIG
+      (:pk (let ((sig (funcall sigfn (first xonly))))
+             (when sig (list sig))))
+      ;; DUP HASH160 <hash160(x)> EQUALVERIFY CHECKSIG.
+      ;;
+      ;; ⚠️ The key goes on TOP, i.e. LAST in the element list: DUP acts on the
+      ;; stack top, so the script reads the key before the signature. Witness
+      ;; elements are pushed bottom-first, so "revealed key, then signature"
+      ;; reads the right way round in prose and the wrong way round here.
+      (:pkh (let ((sig (funcall sigfn (first xonly))))
+              (when sig (list sig (first xonly)))))
+      ((:multi-a :sortedmulti-a)
+       (let* ((keys (if (eq (out-desc-kind leaf) :sortedmulti-a)
+                        (sort (copy-list xonly) #'%pubkey-lessp)
+                        xonly))
+              (threshold (out-desc-threshold leaf))
+              (empty (make-array 0 :element-type '(unsigned-byte 8)))
+              (taken 0)
+              (elements
+                (loop for key in keys
+                      collect (let ((sig (and (< taken threshold)
+                                              (funcall sigfn key))))
+                                (cond (sig (incf taken) sig)
+                                      (t empty))))))
+         ;; Exactly THRESHOLD signatures: OP_NUMEQUAL tests equality, so an
+         ;; extra valid signature fails the script just as a missing one does.
+         (when (= taken threshold)
+           (reverse elements)))))))
+
+(defun %tr-tree-parts (desc pos keyfn track-paths)
+  "The shared taproot computation behind %TR-OUTPUT-KEY and TR-SPEND-DATA, as
+(values OUTPUT-KEY PARITY INTERNAL-KEY LEAVES PATHS), where LEAVES is one
+(SCRIPT . LEAF-HASH) per leaf in tr()'s parse order. One walk of the tree, so
+the address a descriptor DERIVES and the address its spend data is built for
+can never disagree, and the leaf hashes the tree was folded from are handed
+back rather than recomputed by the signer.
+
+PATHS is NIL unless TRACK-PATHS — see %TAPROOT-TREE."
+  (let* ((internal (%key-xonly-bytes (funcall keyfn (first (out-desc-keys desc)))))
+         (leaves (loop for entry in (out-desc-tree desc)
+                       for script = (first (%out-desc-expand-1 (cdr entry) pos keyfn))
+                       collect (cons script
+                                     (bitcoin-lisp.crypto:tap-leaf-hash
+                                      +tapleaf-version-tapscript+ script))))
+         (leaf-hashes (loop for entry in (out-desc-tree desc)
+                            for leaf in leaves
+                            collect (cons (car entry) (cdr leaf)))))
+    (multiple-value-bind (root paths)
+        (if leaf-hashes
+            (%taproot-tree leaf-hashes track-paths)
+            (values nil nil))
+      (multiple-value-bind (output-key parity)
+          (bitcoin-lisp.crypto:tweak-xonly-pubkey
+           internal (bitcoin-lisp.crypto:tap-tweak-hash internal root))
+        (unless output-key
+          (error 'descriptor-derivation-error))
+        (values output-key parity internal leaves paths)))))
+
+(defun tr-spend-data (desc pos keyfn)
+  "What it takes to SPEND the tr() descriptor DESC at range position POS
+(Core's TaprootSpendData, script/signingprovider.h:31), as two values:
+
+  OUTPUT-KEY  the 32-byte tweaked key, i.e. the witness program;
+  LEAVES      one (SCRIPT LEAF-HASH CONTROL-BLOCK) per leaf, in tr()'s parse
+              order; empty when there is no tree.
+
+The output key's Y PARITY goes into each control block's first byte and is not
+derivable from OUTPUT-KEY, which is x-only — it is consumed here rather than
+returned, since no caller needs it on its own."
+  (multiple-value-bind (output-key parity internal leaves paths)
+      (%tr-tree-parts desc pos keyfn t)
+    (values output-key
+            (loop for (script . leaf-hash) in leaves
+                  for path in paths
+                  collect (list script leaf-hash
+                                (%taproot-control-block
+                                 +tapleaf-version-tapscript+ parity
+                                 internal path))))))
 
 (defun %tr-output-key (desc pos keyfn)
   "The 32-byte taproot output key for a tr() descriptor: the internal key
 tweaked by the tree's merkle root, or by nothing at all when the descriptor is
 key-path only."
-  (let* ((internal (%key-xonly-bytes (funcall keyfn (first (out-desc-keys desc)))))
-         (root (when (out-desc-tree desc)
-                 (%taproot-merkle-root
-                  (mapcar (lambda (entry)
-                            (cons (car entry)
-                                  (bitcoin-lisp.crypto:tap-leaf-hash
-                                   +tapleaf-version-tapscript+
-                                   (first (%out-desc-expand-1 (cdr entry) pos keyfn)))))
-                          (out-desc-tree desc)))))
-         (output-key (bitcoin-lisp.crypto:tweak-xonly-pubkey
-                      internal (bitcoin-lisp.crypto:tap-tweak-hash internal root))))
-    (unless output-key
-      (error 'descriptor-derivation-error))
-    output-key))
+  (values (%tr-tree-parts desc pos keyfn nil)))
 
 (defun %out-desc-expand-1 (desc pos keyfn)
   "Expand DESC at range position POS into its scriptPubKey list (Core Expand),
 resolving each key expression's pubkey via (KEYFN desc-key)."
   (ecase (out-desc-kind desc)
     ((:addr :raw) (list (out-desc-script desc)))
-    (:pk (let ((pubkey (funcall keyfn (first (out-desc-keys desc)))))
-           ;; Core's PKDescriptor::MakeScripts branches on m_xonly: inside a
-           ;; taproot leaf pk() pushes the 32-byte x-only key, everywhere else
-           ;; the full 33/65-byte one.
-           (list (%script-p2pk (if (out-desc-xonly-script-p desc)
-                                   (%key-xonly-bytes pubkey)
-                                   pubkey)))))
-    (:pkh (list (%script-p2pkh (funcall keyfn (first (out-desc-keys desc))))))
+    ;; Core's PKDescriptor::MakeScripts branches on m_xonly: inside a taproot
+    ;; leaf the key is the 32-byte x-only form, everywhere else the full
+    ;; 33/65-byte one. pkh() reaches the same split through miniscript's
+    ;; c:pk_h fragment, so both go through %DESC-SCRIPT-PUBKEY.
+    (:pk (list (%script-p2pk (%desc-script-pubkey desc keyfn))))
+    (:pkh (list (%script-p2pkh (%desc-script-pubkey desc keyfn))))
     (:wpkh (list (%script-p2wpkh (funcall keyfn (first (out-desc-keys desc))))))
     (:combo
      (let ((key (funcall keyfn (first (out-desc-keys desc)))))

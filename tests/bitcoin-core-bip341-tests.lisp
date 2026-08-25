@@ -576,3 +576,70 @@ tapscript is VALID and must stay valid. Both directions are asserted here."
     (is-false (member "DISCOURAGE_OP_SUCCESS"
                       (bitcoin-lisp.validation:block-script-flags-list nil 900000)
                       :test #'string=))))
+
+;;;; --- Control blocks: TaprootBuilder::GetSpendData ------------------------
+
+(test bip341-script-path-control-blocks
+  "Core bip341_wallet_vectors.json scriptPubKey[*].expected.scriptPathControlBlocks.
+
+The merkle ROOT is order-independent (TapBranch sorts each pair), so a builder
+that gets the tree shape wrong can still produce the right ADDRESS and only
+reveal it here — a control block names the actual siblings, leaf upwards. These
+vectors are the only oracle that separates the two."
+  (let ((path (merge-pathnames "refs/bitcoin/src/test/data/bip341_wallet_vectors.json"
+                               (asdf:system-source-directory :bitcoin-lisp))))
+    (if (not (probe-file path))
+        (skip "bip341_wallet_vectors.json not present")
+        (let* ((data (with-open-file (in path) (yason:parse in)))
+               (cases (gethash "scriptPubKey" data))
+               (checked 0))
+          (loop for c in cases
+                for given = (gethash "given" c)
+                for tree = (gethash "scriptTree" given)
+                when tree
+                  do (let* ((leaves '()))
+                       ;; Depth-first flatten, exactly the order tr() names them.
+                       (labels ((walk (node depth)
+                                  (if (listp node)
+                                      (dolist (child node) (walk child (1+ depth)))
+                                      (push (list depth
+                                                  (bitcoin-lisp.crypto:hex-to-bytes
+                                                   (gethash "script" node))
+                                                  (truncate (gethash "leafVersion" node)))
+                                            leaves))))
+                         (walk tree 0))
+                       (setf leaves (nreverse leaves))
+                       (let* ((internal (bitcoin-lisp.crypto:hex-to-bytes
+                                         (gethash "internalPubkey" given)))
+                              (leaf-hashes
+                                (loop for (depth script version) in leaves
+                                      collect (cons depth
+                                                    (bitcoin-lisp.crypto:tap-leaf-hash
+                                                     version script))))
+                              (expected (gethash "scriptPathControlBlocks"
+                                                 (gethash "expected" c))))
+                         (multiple-value-bind (root paths)
+                             ;; T: merkle PATHS are spend data and %TAPROOT-TREE
+                             ;; only tracks them on request — address derivation
+                             ;; walks whole ranges and needs the root alone.
+                             (bitcoin-lisp.rpc::%taproot-tree leaf-hashes t)
+                           (is (string= (gethash "merkleRoot" (gethash "intermediary" c))
+                                        (bitcoin-lisp.crypto:bytes-to-hex root)))
+                           (multiple-value-bind (output-key parity)
+                               (bitcoin-lisp.crypto:tweak-xonly-pubkey
+                                internal (bitcoin-lisp.crypto:tap-tweak-hash internal root))
+                             (declare (ignore output-key))
+                             (loop for (nil nil version) in leaves
+                                   for p in paths
+                                   for want in expected
+                                   do (incf checked)
+                                      (is (string= want
+                                                   (bitcoin-lisp.crypto:bytes-to-hex
+                                                    (bitcoin-lisp.rpc::%taproot-control-block
+                                                     version parity internal p)))
+                                          "control block mismatch: got ~A wanted ~A"
+                                          (bitcoin-lisp.crypto:bytes-to-hex
+                                           (bitcoin-lisp.rpc::%taproot-control-block
+                                            version parity internal p))
+                                          want)))))))
+          (is (= 12 checked) "checked ~D control blocks, expected 12" checked)))))

@@ -980,3 +980,176 @@ wallet backup is identified by."
                              (bitcoin-lisp.rpc::rpc-getdescriptorinfo
                               node (list reported))
                              :test #'string=))))))
+
+;;;; --- tr() script-path spending -------------------------------------------
+
+(defun %tr-sign-and-verify (desc-str held-wifs)
+  "Sign a spend of DESC-STR's output at index 0 holding only HELD-WIFS, through
+the real signer (%SIGN-TX-INPUTS), and verify the result with our own script
+interpreter under STANDARD flags.
+
+Returns (values error-messages witness-element-sizes verified-p).
+
+The interpreter is the oracle here: it is held to Core's script/sighash/BIP341
+vectors by the rest of this battery, so a witness it accepts under standard
+flags is one Core accepts. A hand-written expected witness would only re-assert
+whatever the signer happened to build."
+  (let* ((desc (bitcoin-lisp.rpc::parse-descriptor desc-str :mainnet))
+         (spk (first (bitcoin-lisp.rpc::out-desc-expand desc 0)))
+         (amount 100000)
+         (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (multiple-value-bind (output-key leaves)
+        (bitcoin-lisp.rpc::tr-spend-data
+         desc 0 (lambda (k) (bitcoin-lisp.rpc::%desc-key-pubkey-at k 0)))
+      (let* ((prev-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 7))
+             (tx (bitcoin-lisp.serialization:make-transaction
+                  :version 2
+                  :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                   :previous-output
+                                   (bitcoin-lisp.serialization:make-outpoint
+                                    :hash prev-txid :index 0)
+                                   :script-sig empty :sequence #xffffffff))
+                  :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                    :value (- amount 1000)
+                                    :script-pubkey
+                                    (coerce (bitcoin-lisp.crypto:hex-to-bytes
+                                             "0014751e76e8199196d454941c45d1b3a323f1433bd6")
+                                            '(simple-array (unsigned-byte 8) (*)))))))
+             (prevmap (make-hash-table :test 'equalp))
+             (keymap (make-hash-table :test 'equalp))
+             (pubmap (make-hash-table :test 'equalp))
+             (tr-keymap (make-hash-table :test 'equalp))
+             (tr-scripts (make-hash-table :test 'equalp))
+             (pairs (mapcar (lambda (k)
+                              (cons k (bitcoin-lisp.rpc::%desc-key-pubkey-at k 0)))
+                            (bitcoin-lisp.rpc::out-desc-ordered-keys desc)))
+             (next (bitcoin-lisp.rpc::%pairs-splitter (rest pairs))))
+        (setf (gethash (cons prev-txid 0) prevmap) (list spk amount nil nil))
+        (dolist (wif held-wifs)
+          (let* ((sk (bitcoin-lisp.crypto:wif-to-private-key wif))
+                 (pub (bitcoin-lisp.crypto:derive-public-key sk :compressed t)))
+            (setf (gethash pub pubmap) sk)
+            (setf (gethash (bitcoin-lisp.crypto:hash160 pub) keymap) (cons sk pub))))
+        (setf (gethash output-key tr-scripts)
+              (loop for (script leaf-hash control) in leaves
+                    for (nil . leaf) in (bitcoin-lisp.rpc::out-desc-tree desc)
+                    for own = (funcall next leaf)
+                    collect (list script leaf-hash control leaf
+                                  (mapcar #'cdr own))))
+        (let ((errs (bitcoin-lisp.rpc::%sign-tx-inputs
+                     tx prevmap keymap pubmap tr-keymap 1 tr-scripts)))
+          (values (mapcar #'cdr errs)
+                  (map 'list (lambda (st) (mapcar #'length st))
+                       (or (bitcoin-lisp.serialization:transaction-witness tx) #()))
+                  (nth-value 0 (bitcoin-lisp.rpc::%verify-tx-scripts tx prevmap))))))))
+
+(test tr-script-path-spends-verify
+  "A tr() output whose INTERNAL key we do not hold can only be spent through a
+script path, and the spend must verify under standard flags.
+
+Every element order here is one a green signer gets wrong silently: the multi_a
+stack runs opposite to key order (CHECKSIGADD pops from the top), and pkh()
+puts the revealed key ABOVE its signature (DUP reads the stack top). Both
+produce a well-formed witness that simply does not spend."
+  (let ((i "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
+        (a "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1")
+        (b "KzoAz5CanayRKex3fSLQ2BwJpN7U52gZvxMyk78nDMHuqrUxuSJy")
+        (c "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S"))
+    (flet ((spends (label desc held &optional sizes)
+             (multiple-value-bind (errs witness verified)
+                 (%tr-sign-and-verify desc held)
+               (is (null errs) "~A: signing reported ~S" label errs)
+               (is-true verified "~A: the signed spend does not verify" label)
+               (when sizes
+                 (is (equal sizes (first witness))
+                     "~A: witness element sizes ~S, wanted ~S"
+                     label (first witness) sizes)))))
+      ;; sig, 34-byte <x> CHECKSIG leaf, 33-byte control block (depth 0).
+      (spends "pk leaf" (format nil "tr(~A,pk(~A))" i a) (list a) '(64 34 33))
+      ;; sig, revealed 32-byte key, 25-byte pkh leaf, control block.
+      (spends "pkh leaf" (format nil "tr(~A,pkh(~A))" i a) (list a) '(64 32 25 33))
+      ;; Two signatures and one empty placeholder, in REVERSE key order.
+      (spends "multi_a 2-of-3"
+              (format nil "tr(~A,multi_a(2,~A,~A,~A))" i a b c) (list a b c)
+              '(0 64 64 104 33))
+      (spends "sortedmulti_a 1-of-2"
+              (format nil "tr(~A,sortedmulti_a(1,~A,~A))" i a b) (list b))
+      ;; A depth-2 leaf: the control block carries two merkle path elements,
+      ;; 33 + 2*32 = 97 bytes. This is what a wrong merkle PATH breaks while
+      ;; the address stays right, since TapBranch sorts each pair.
+      (spends "nested tree, depth-2 leaf"
+              (format nil "tr(~A,{multi_a(2,~A,~A),{pk(~A),pk(~A)}})" i a b c a)
+              (list c) '(64 34 97)))))
+
+(test tr-script-path-fails-loudly-without-the-keys
+  "A leaf we cannot satisfy must report itself, never emit a witness. multi_a
+below the threshold is the interesting one: signatures ARE produced, just not
+enough, and a signer that shipped them would broadcast an unspendable input."
+  (let ((i "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
+        (a "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1")
+        (b "KzoAz5CanayRKex3fSLQ2BwJpN7U52gZvxMyk78nDMHuqrUxuSJy")
+        (c "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S"))
+    (flet ((cannot (label desc held)
+             (multiple-value-bind (errs witness verified)
+                 (%tr-sign-and-verify desc held)
+               (is (equal '("no satisfiable script path for P2TR") errs)
+                   "~A: reported ~S" label errs)
+               (is (null (first witness)) "~A: emitted a witness anyway" label)
+               (is-false verified label))))
+      (cannot "wrong key" (format nil "tr(~A,pk(~A))" i a) (list b))
+      (cannot "multi_a below threshold"
+              (format nil "tr(~A,multi_a(2,~A,~A,~A))" i a b c) (list a)))))
+
+(test script-num-serializes-like-cscriptnum
+  "Core's CScript << int64_t (script.h:433) pushes CScriptNum::serialize, which
+appends a 0x00 sign byte whenever the top bit of the last byte is set.
+
+Reachable: multi_a allows a threshold up to MAX_PUBKEYS_PER_MULTI_A, so a
+128-of-N tapscript leaf is a legal descriptor. A one-byte-per-number shortcut
+builds a different leaf script there, hence a different leaf hash, merkle root
+and ADDRESS — and above 255 it cannot hold the value at all."
+  (flet ((hex (n) (bitcoin-lisp.crypto:bytes-to-hex
+                   (coerce (bitcoin-lisp.rpc::%script-num n)
+                           '(vector (unsigned-byte 8))))))
+    ;; 1..16 are the OP_1..OP_16 opcodes.
+    (is (string= "51" (hex 1)))
+    (is (string= "60" (hex 16)))
+    ;; 17..127 fit one byte with the top bit clear.
+    (is (string= "0111" (hex 17)))
+    (is (string= "017f" (hex 127)))
+    ;; 128..255 need the sign byte: 0x80 alone is negative zero.
+    (is (string= "028000" (hex 128)))
+    (is (string= "02ff00" (hex 255)))
+    ;; Beyond a byte, little-endian, sign byte only when the top one is set.
+    (is (string= "020001" (hex 256)))
+    (is (string= "02e703" (hex 999)))))
+
+(test taproot-tree-rejects-a-depth-sequence-core-refuses
+  "Core's TaprootBuilder::Insert clears m_valid rather than storing, in two
+places we originally skipped: inserting above an unfinished deeper branch
+(signingprovider.cpp:390), and propagating past the root (:399).
+
+Both leave exactly one node pending at depth 0, so a builder that stores anyway
+passes its own completeness test and returns a root for a tree Core asserts
+against. No tr() STRING can produce these — brace nesting cannot — which is
+precisely why the guard needs a test of its own rather than a caller."
+  (let ((h (lambda (b) (make-array 32 :element-type '(unsigned-byte 8)
+                                      :initial-element b))))
+    ;; A well-formed tree still works.
+    (is (= 32 (length (bitcoin-lisp.rpc::%taproot-tree
+                       (list (cons 1 (funcall h 1)) (cons 1 (funcall h 2)))))))
+    ;; Propagating past the root.
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::%taproot-tree
+       (list (cons 1 (funcall h 1)) (cons 1 (funcall h 2)) (cons 0 (funcall h 3)))))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::%taproot-tree
+       (list (cons 0 (funcall h 1)) (cons 0 (funcall h 2)))))
+    ;; A leaf above an unfinished deeper branch.
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::%taproot-tree
+       (list (cons 2 (funcall h 1)) (cons 1 (funcall h 2)))))
+    ;; And an incomplete tree is still incomplete.
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::%taproot-tree (list (cons 1 (funcall h 1)))))))
