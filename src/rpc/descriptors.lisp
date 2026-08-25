@@ -7,14 +7,19 @@
 ;;;   pk(KEY)  pkh(KEY)  wpkh(KEY)  combo(KEY)
 ;;;   multi(k,KEY,...)  sortedmulti(k,KEY,...)
 ;;;   sh(SCRIPT)  wsh(SCRIPT)  sh(wsh(SCRIPT))
-;;;   tr(KEY)  rawtr(KEY)          [key-path only; no tapscript trees]
+;;;   tr(KEY)  tr(KEY,TREE)  rawtr(KEY)
+;;;   multi_a(k,KEY,...)  sortedmulti_a(k,KEY,...)   [inside tr() only]
 ;;; where KEY is a hex pubkey (33/65 bytes; 32-byte x-only inside tr/rawtr),
 ;;; a WIF private key, or an xpub/xprv (tpub/tprv on test networks) with an
 ;;; optional [fingerprint/path] origin prefix, a derivation path using h or '
-;;; hardened markers, and an optional ranged terminal /* or /*h.
-;;; Out of scope at P0 (match Core error text where Core has one, otherwise a
-;;; clear "not supported"): tapscript trees, miniscript, multipath <a;b>,
-;;; multi_a/sortedmulti_a, musig.
+;;; hardened markers, and an optional ranged terminal /* or /*h; and TREE is a
+;;; brace-nested taproot script tree.
+;;;
+;;; tr() trees are WATCH-ONLY: they parse, print, derive the right bech32m
+;;; address and recognise their own outputs, but nothing here can produce a
+;;; script-path spend. Still out of scope (match Core error text where Core has
+;;; one, otherwise a clear "not supported"): multipath <a;b>, musig, and
+;;; miniscript in a tapscript context.
 ;;;
 ;;; Nesting/context rules, key-count limits, and error messages follow Core's
 ;;; ParseScript/ParsePubkey exactly (descriptor.cpp:1745-2673).
@@ -147,6 +152,19 @@ optional origin + const pubkey / WIF key / BIP32 extended key)."
   (derive :none)                    ; :none | :unhardened (/*) | :hardened (/*h)
   (apostrophe nil :type boolean))   ; hardened marker style for printing
 
+(defun %xonly-context-p (ctx)
+  "T in a context whose keys are 32-byte x-only: the internal key of tr() and
+every key inside a taproot script leaf.
+
+Core has ONE context for both (ParseScriptContext::P2TR); we split it into :TR
+and :TR-SCRIPT because the two differ in which FUNCTIONS they accept, not in
+how they encode keys. Testing (eq ctx :tr) alone made every key in a tree leaf
+fail to parse.
+
+Returns T rather than the MEMBER tail: DESC-KEY's XONLY-P slot is declared
+BOOLEAN, so a list there is a type error at construction."
+  (and (member ctx '(:tr :tr-script)) t))
+
 (defun %hex-string-p (s)
   "Core's IsHex: non-empty, even length, all hex digits."
   (and (plusp (length s))
@@ -240,7 +258,7 @@ CTX is the surrounding context: :top :sh :wsh :wpkh :tr."
                      (return-from %parse-desc-key-inner
                        (make-desc-key :pubkey bytes :xonly-p nil))
                      (%desc-error "Uncompressed keys are not allowed")))
-                ((and (= len 32) (eq ctx :tr))
+                ((and (= len 32) (%xonly-context-p ctx))
                  (let ((full (concatenate '(vector (unsigned-byte 8)) #(2) bytes)))
                    (when (bitcoin-lisp.crypto:public-key-valid-p full)
                      (return-from %parse-desc-key-inner
@@ -255,7 +273,7 @@ CTX is the surrounding context: :top :sh :wsh :wpkh :tr."
           (return-from %parse-desc-key-inner
             (make-desc-key :pubkey (bitcoin-lisp.crypto:derive-public-key
                                     priv :compressed compressed)
-                           :xonly-p (eq ctx :tr)
+                           :xonly-p (%xonly-context-p ctx)
                            :privkey priv
                            :compressed-p compressed)))))
     ;; Extended key (with optional derivation path and ranged terminal).
@@ -405,18 +423,56 @@ optional caches); keep the two derivation paths in sync."
   (kind nil)          ; :addr :raw :pk :pkh :wpkh :combo :multi :sortedmulti :sh :wsh :tr :rawtr
   (keys nil)          ; list of desc-key
   (threshold nil)     ; integer for multi/sortedmulti
-  (sub nil)           ; out-desc for sh/wsh
+  (sub nil)           ; out-desc for sh/wsh — exactly ONE, by grammar
+  ;; The taproot script tree of tr(KEY,TREE): a list of (DEPTH . out-desc) in
+  ;; Core's parse order, or NIL for a key-path-only tr().
+  ;;
+  ;; A separate slot rather than making SUB a list, on purpose: a tree is a
+  ;; list of (depth . desc), not the single subscript sh()/wsh() has by
+  ;; grammar, and conflating them would make every existing OUT-DESC-SUB site
+  ;; handle a list it can never receive. %OUT-DESC-CHILDREN is where the two
+  ;; become one thing for walkers.
+  (tree nil)
   (script nil)        ; script bytes for raw/addr
   (address nil)       ; address string for addr
   ;; The parsed MS-NODE for :miniscript. Its keys are desc-keys, so one node
   ;; serves the whole range: the script is generated per index by handing the
   ;; generator a converter that derives at that index.
-  (node nil))
+  (node nil)
+  ;; :PK only — Core's PKDescriptor::m_xonly (descriptor.cpp:1143), set when the
+  ;; pk() sits inside a taproot leaf, where it pushes 32 bytes and not 33.
+  ;;
+  ;; It lives on the DESCRIPTOR and not on the key, which is Core's shape and
+  ;; not an accident: DESC-KEY's XONLY-P governs how a key PRINTS, and the two
+  ;; disagree for an xpub in a tapscript leaf.  Core prints that leaf as
+  ;; pk(xpub.../1/*) -- an xpub, not x-only hex -- while still pushing the
+  ;; 32-byte form into the script (descriptor_tests.cpp:640).
+  (xonly-script-p nil :type boolean))
+
+(defconstant +max-pubkeys-per-multisig+ 20
+  "Core MAX_PUBKEYS_PER_MULTISIG (script/script.h:36): CHECKMULTISIG's limit.")
+
+(defconstant +max-pubkeys-per-multi-a+ 999
+  "Core MAX_PUBKEYS_PER_MULTI_A (script/script.h:37). Far above the 20 of a
+legacy CHECKMULTISIG because a tapscript CHECKSIGADD chain has no such limit —
+the script is only bounded by what a spending transaction can carry.")
 
 (defun %parse-multi-keys (inner ctx network name)
-  "Parse \"k,KEY,KEY,...\" for multi/sortedmulti. Returns (values threshold keys)."
+  "Parse \"k,KEY,KEY,...\" for multi/sortedmulti/multi_a/sortedmulti_a.
+Returns (values threshold keys kind).
+
+The four differ only in their key ceiling and in two checks specific to
+contexts multi_a never appears in, so they share this parser rather than having
+a near-copy each (descriptor.cpp:2347-2364 branches the same way). NAME alone
+says which is which, so nothing else needs to be passed in."
   (multiple-value-bind (thres-str rest) (%split-expr inner)
-    (let ((threshold (and (plusp (length thres-str))
+    (let* ((kind (cond ((string= name "sortedmulti_a") :sortedmulti-a)
+                       ((string= name "multi_a") :multi-a)
+                       ((string= name "sortedmulti") :sortedmulti)
+                       (t :multi)))
+           (multi-a (member kind '(:multi-a :sortedmulti-a)))
+           (limit (if multi-a +max-pubkeys-per-multi-a+ +max-pubkeys-per-multisig+))
+           (threshold (and (plusp (length thres-str))
                           (every #'digit-char-p thres-str)
                           (ignore-errors (parse-integer thres-str)))))
       (unless (and threshold (<= threshold #xffffffff))
@@ -432,8 +488,11 @@ optional caches); keep the two derivation paths in sync."
                    (setf rest new-rest)))
         (setf keys (nreverse keys))
         (let ((n (length keys)))
-          (when (or (zerop n) (> n 20))
-            (%desc-error "Cannot have ~D keys in multisig; must have between 1 and 20 keys, inclusive" n))
+          (when (or (zerop n) (> n limit))
+            ;; Core writes "multi_a" for the tapscript form and "multisig" for
+            ;; the legacy one (descriptor.cpp:2350,2354); byte-identical text.
+            (%desc-error "Cannot have ~D keys in ~A; must have between 1 and ~D keys, inclusive"
+                         n (if multi-a "multi_a" "multisig") limit))
           (when (< threshold 1)
             (%desc-error "Multisig threshold cannot be ~D, must be at least 1" threshold))
           (when (> threshold n)
@@ -448,10 +507,67 @@ optional caches); keep the two derivation paths in sync."
               (when (> script-size 520)
                 (%desc-error "P2SH script is too large, ~D bytes is larger than 520 bytes"
                              script-size))))
-          (values threshold keys (if (string= name "sortedmulti") :sortedmulti :multi)))))))
+          (values threshold keys kind))))))
+
+(defconstant +taproot-control-max-node-count+ 128
+  "Core TAPROOT_CONTROL_MAX_NODE_COUNT (script/interpreter.h:245): the deepest
+a taproot script tree may nest, because the control block carries one 32-byte
+merkle path element per level.")
+
+(defun %parse-tr-tree (expr network)
+  "Parse the TREE argument of tr(KEY,TREE) into a list of (DEPTH . out-desc) in
+Core's parse order (descriptor.cpp:2474-2515).
+
+The algorithm is Core's exactly, and it is worth reading rather than
+reinventing: BRANCHES is the path from the root to whatever is being parsed,
+one boolean per level — NIL for `we are in the left branch here', T for the
+right. An open brace pushes a new left branch, a parsed leaf records the
+current depth, a closing brace pops every level whose right branch is finished,
+and a comma flips the innermost level from left to right. The whole tree is
+consumed exactly when BRANCHES empties again.
+
+Depth is what a leaf needs: TaprootBuilder combines a leaf with its sibling
+purely from the depth sequence, so no explicit tree object is ever built."
+  (let ((branches '())          ; innermost first; NIL = left, T = right
+        (leaves '())
+        (rest expr))
+    (flet ((take (ch)
+             "Consume CH from the front of REST if it is there."
+             (when (and (plusp (length rest)) (char= (char rest 0) ch))
+               (setf rest (subseq rest 1))
+               t)))
+      (loop
+        ;; Every open brace we can see opens a new left branch.
+        (loop while (take #\{)
+              do (push nil branches)
+                 (when (> (length branches) +taproot-control-max-node-count+)
+                   (%desc-error "tr() supports at most ~D nesting levels"
+                                +taproot-control-max-node-count+)))
+        ;; Exactly one leaf per iteration.
+        (multiple-value-bind (leaf remainder) (%split-expr rest)
+          (setf rest remainder)
+          (push (cons (length branches)
+                      (%parse-descriptor-body leaf :tr-script network))
+                leaves))
+        ;; Close out every level whose right branch we have just finished.
+        (loop while (and branches (first branches))
+              do (unless (take #\})
+                   (%desc-error "tr(): expected '}' after script expression"))
+                 (pop branches))
+        ;; Still in a left branch: a comma moves us to its right sibling.
+        (when (and branches (not (first branches)))
+          (unless (take #\,)
+            (%desc-error "tr(): expected ',' after script expression"))
+          (setf (first branches) t))
+        (unless branches (return)))
+      (unless (zerop (length rest))
+        (%desc-error "tr(): expected ')' after script expression")))
+    (nreverse leaves)))
 
 (defun %parse-descriptor-body (body ctx network)
-  "Parse one script expression (Core's ParseScript). CTX is :top, :sh or :wsh."
+  "Parse one script expression (Core's ParseScript). CTX is :top, :sh, :wsh or
+:tr-script — the last being a leaf of a taproot script tree, Core's
+ParseScriptContext::P2TR."
   (multiple-value-bind (expr rest) (%split-expr body)
     (unless (zerop (length rest))
       (%desc-error "'~A' is not a valid descriptor" body))
@@ -462,6 +578,9 @@ optional caches); keep the two derivation paths in sync."
       (with-inner (inner "pk")
         (return-from %parse-descriptor-body
           (make-out-desc :kind :pk
+                         ;; Core: ParseScript builds PKDescriptor(prov, /*xonly=*/
+                         ;; ctx == ParseScriptContext::P2TR) (descriptor.cpp:2286).
+                         :xonly-script-p (%xonly-context-p ctx)
                          :keys (list (%with-desc-error-prefix
                                       "pk(): "
                                       (lambda () (%parse-desc-key inner ctx network)))))))
@@ -481,15 +600,30 @@ optional caches); keep the two derivation paths in sync."
                          :keys (list (%with-desc-error-prefix
                                       "combo(): "
                                       (lambda () (%parse-desc-key inner ctx network)))))))
-      ;; multi(k,...) / sortedmulti(k,...)
+      ;; multi(k,...) / sortedmulti(k,...) — NOT in a taproot leaf, where
+      ;; BIP342 removed CHECKMULTISIG and multi_a() takes over. Core gates
+      ;; these on TOP/P2SH/P2WSH and then names the failure explicitly
+      ;; (descriptor.cpp:2402) rather than letting it reach the generic
+      ;; "is not a valid descriptor function".
       (dolist (name '("multi" "sortedmulti"))
         (with-inner (inner name)
+          (when (eq ctx :tr-script)
+            (%desc-error
+             "Can only have multi/sortedmulti at top level, in sh(), or in wsh()"))
           (multiple-value-bind (threshold keys kind)
               (%parse-multi-keys inner ctx network name)
             (return-from %parse-descriptor-body
               (make-out-desc :kind kind :threshold threshold :keys keys)))))
-      (when (or (%func-inner "multi_a" expr) (%func-inner "sortedmulti_a" expr))
-        (%desc-error "Can only have multi_a/sortedmulti_a inside tr()"))
+      ;; multi_a/sortedmulti_a live only in a taproot script leaf — Core gates
+      ;; them on ParseScriptContext::P2TR (descriptor.cpp:2320).
+      (dolist (name '("multi_a" "sortedmulti_a"))
+        (with-inner (inner name)
+          (unless (eq ctx :tr-script)
+            (%desc-error "Can only have multi_a/sortedmulti_a inside tr()"))
+          (multiple-value-bind (threshold keys kind)
+              (%parse-multi-keys inner ctx network name)
+            (return-from %parse-descriptor-body
+              (make-out-desc :kind kind :threshold threshold :keys keys)))))
       ;; wpkh(KEY) — top level or inside sh()
       (with-inner (inner "wpkh")
         (unless (member ctx '(:top :sh))
@@ -521,18 +655,26 @@ optional caches); keep the two derivation paths in sync."
             (%desc-error "Address is not valid"))
           (return-from %parse-descriptor-body
             (make-out-desc :kind :addr :address inner :script script-pubkey))))
-      ;; tr(KEY) — top level only, key path only (no tapscript trees at P0)
+      ;; tr(KEY) or tr(KEY,TREE) — top level only.
       (with-inner (inner "tr")
         (unless (eq ctx :top)
           (%desc-error "Can only have tr at top level"))
         (multiple-value-bind (arg tr-rest) (%split-expr inner)
-          (unless (zerop (length tr-rest))
-            (%desc-error "tr(): script trees are not supported"))
-          (return-from %parse-descriptor-body
-            (make-out-desc :kind :tr
-                           :keys (list (%with-desc-error-prefix
-                                        "tr(): "
-                                        (lambda () (%parse-desc-key arg :tr network))))))))
+          (let ((internal (%with-desc-error-prefix
+                           "tr(): "
+                           (lambda () (%parse-desc-key arg :tr network)))))
+            (return-from %parse-descriptor-body
+              (if (zerop (length tr-rest))
+                  (make-out-desc :kind :tr :keys (list internal))
+                  ;; Core expects the comma itself here, and its message for a
+                  ;; missing one says `tr:' with no parentheses where every
+                  ;; other message in this function says `tr():'
+                  ;; (descriptor.cpp:2470-2472). Matched as written.
+                  (progn
+                    (unless (char= (char tr-rest 0) #\,)
+                      (%desc-error "tr: expected ',', got '~C'" (char tr-rest 0)))
+                    (make-out-desc :kind :tr :keys (list internal)
+                                   :tree (%parse-tr-tree (subseq tr-rest 1) network))))))))
       ;; rawtr(KEY) — top level only
       (with-inner (inner "rawtr")
         (unless (eq ctx :top)
@@ -709,22 +851,36 @@ rpc-error with Core's messages on any problem."
 
 ;;; --- Descriptor predicates + printing ---
 
+(defun %out-desc-children (desc)
+  "Every sub-descriptor of DESC: the single subscript of sh()/wsh(), or the
+leaves of a tr() script tree.
+
+One accessor so the walkers below cannot disagree about what a child is —
+which is exactly how tr(KEY,TREE) would otherwise slip past every predicate
+that only knew about SUB."
+  (cond ((out-desc-tree desc) (mapcar #'cdr (out-desc-tree desc)))
+        ((out-desc-sub desc) (list (out-desc-sub desc)))))
+
 (defun out-desc-ranged-p (desc)
   (or (some #'desc-key-ranged-p (out-desc-keys desc))
-      (and (out-desc-sub desc) (out-desc-ranged-p (out-desc-sub desc)))))
+      (some #'out-desc-ranged-p (%out-desc-children desc))))
 
 (defun out-desc-solvable-p (desc)
-  "Core IsSolvable: false for addr()/raw(), true for everything we can expand."
-  (case (out-desc-kind desc)
-    ((:addr :raw) nil)
-    ((:sh :wsh) (out-desc-solvable-p (out-desc-sub desc)))
-    (t t)))
+  "Core IsSolvable: false for addr()/raw(), true for everything we can expand.
+
+Recursing through %OUT-DESC-CHILDREN rather than listing the container kinds:
+EVERY over no children is already T, so a leaf answers T without a special
+case, and a container added later cannot report itself solvable while holding
+an addr()/raw() child."
+  (if (member (out-desc-kind desc) '(:addr :raw))
+      nil
+      (every #'out-desc-solvable-p (%out-desc-children desc))))
 
 (defun out-desc-has-privkeys-p (desc)
   "Whether the descriptor contained at least one private key (WIF or xprv);
 Core getdescriptorinfo's hasprivatekeys (provider.keys non-empty)."
   (or (some #'desc-key-has-privkey-p (out-desc-keys desc))
-      (and (out-desc-sub desc) (out-desc-has-privkeys-p (out-desc-sub desc)))))
+      (some #'out-desc-has-privkeys-p (%out-desc-children desc))))
 
 (defun %out-desc-string-walk (desc keyfn)
   "The descriptor body of DESC with each key expression rendered by
@@ -734,11 +890,23 @@ by StringType, descriptor.cpp:909)."
   (ecase (out-desc-kind desc)
     (:addr (format nil "addr(~A)" (out-desc-address desc)))
     (:raw (format nil "raw(~A)" (bitcoin-lisp.crypto:bytes-to-hex (out-desc-script desc))))
-    ((:pk :pkh :wpkh :combo :tr :rawtr)
+    ((:pk :pkh :wpkh :combo :rawtr)
      (format nil "~(~A~)(~A)" (out-desc-kind desc)
              (funcall keyfn (first (out-desc-keys desc)))))
-    ((:multi :sortedmulti)
-     (format nil "~(~A~)(~D~{,~A~})" (out-desc-kind desc) (out-desc-threshold desc)
+    (:tr
+     (let ((internal (funcall keyfn (first (out-desc-keys desc)))))
+       (if (null (out-desc-tree desc))
+           (format nil "tr(~A)" internal)
+           (format nil "tr(~A,~A)" internal
+                   (tr-tree-string (out-desc-tree desc)
+                                   (lambda (leaf)
+                                     (%out-desc-string-walk leaf keyfn)))))))
+    ((:multi :sortedmulti :multi-a :sortedmulti-a)
+     ;; The kind keywords carry a hyphen where the descriptor name has an
+     ;; underscore, so the name is repaired before ~( ~) lowercases it.
+     (format nil "~(~A~)(~D~{,~A~})"
+             (substitute #\_ #\- (symbol-name (out-desc-kind desc)))
+             (out-desc-threshold desc)
              (mapcar keyfn (out-desc-keys desc))))
     ((:sh :wsh)
      (format nil "~(~A~)(~A)" (out-desc-kind desc)
@@ -749,6 +917,39 @@ by StringType, descriptor.cpp:909)."
     ;; descriptor's do.
     (:miniscript
      (bitcoin-lisp.validation::ms-node-to-string (out-desc-node desc) keyfn))))
+
+(defun tr-tree-string (tree render-leaf)
+  "Re-emit a taproot script tree's braces from its depth sequence — the inverse
+of %PARSE-TR-TREE, transcribed from Core's TRDescriptor::ToStringSubScriptHelper
+(descriptor.cpp:1492-1507). RENDER-LEAF turns one leaf out-desc into a string;
+NIL from it means the whole tree cannot be rendered.
+
+⚠️ Note the two asymmetries, which are what make a single leaf print as
+`tr(KEY,pk(A))' with no braces at all: the FIRST push emits no `{'
+(`if (path.size())'), and the LAST pop emits no `}' (`if (path.size() > 1)').
+
+Parameterized by the leaf renderer rather than duplicated, because the brace
+reconstruction is the error-prone half and the descriptor printer and the
+wallet's InferDescriptor need the same one over different leaf renderings."
+  (let ((path '())          ; innermost first, mirroring Core's vector back()
+        (n 0)               ; (length path), maintained rather than recomputed
+        (out (make-string-output-stream)))
+    (loop for (depth . leaf) in tree
+          for first = t then nil
+          do (unless first (write-char #\, out))
+             (loop while (<= n depth)
+                   do (when path (write-char #\{ out))
+                      (push nil path)
+                      (incf n))
+             (let ((text (funcall render-leaf leaf)))
+               (unless text (return-from tr-tree-string nil))
+               (write-string text out))
+             (loop while (and path (first path))
+                   do (when (> n 1) (write-char #\} out))
+                      (pop path)
+                      (decf n))
+             (when path (setf (first path) t)))
+    (get-output-stream-string out)))
 
 (defun out-desc-string (desc &optional (style :public))
   "The canonical public descriptor body (no checksum): private keys replaced
@@ -770,11 +971,16 @@ then CSHA256 over the string). Keys wallet records for this descriptor."
 
 (defun out-desc-ordered-keys (desc)
   "All desc-keys of DESC in parse order — the order Core assigns m_expr_index
-to PubkeyProviders. Our grammar never mixes keys and subscripts in one node,
-so this is simply the node's keys or its subscript's."
-  (if (out-desc-sub desc)
-      (out-desc-ordered-keys (out-desc-sub desc))
-      (out-desc-keys desc)))
+to PubkeyProviders: a node's own keys first, then each child's in turn.
+
+⚠️ tr(KEY,TREE) is the one shape carrying BOTH its own key and subexpressions,
+and the own-keys-then-children order is what makes it come out right. This used
+to be `keys OR the subscript's keys', which silently dropped every tree leaf.
+Consumers that slice this list positionally depend on the order — see
+%INFER-DESC-BODY."
+  (append (out-desc-keys desc)
+          (loop for child in (%out-desc-children desc)
+                append (out-desc-ordered-keys child))))
 
 (defun out-desc-key-indexes (desc)
   "EQ map from each desc-key of DESC to its key expression index."
@@ -836,12 +1042,91 @@ minimal 1-byte push (CScript << int64_t for the 1..20 range used here)."
   "The 32-byte x-only form of a 33-byte compressed pubkey."
   (subseq pubkey 1 33))
 
+(defun %script-multi-a (threshold xkeys)
+  "The tapscript k-of-n script (Core MultiADescriptor::MakeScripts,
+descriptor.cpp:1325-1337):
+
+    <x0> OP_CHECKSIG  (<xi> OP_CHECKSIGADD)*  <k> OP_NUMEQUAL
+
+A CHECKSIGADD chain rather than CHECKMULTISIG, which BIP342 removed. Each key
+is pushed x-only, so 32 bytes and not 33."
+  (apply #'concatenate '(vector (unsigned-byte 8))
+         (concatenate '(vector (unsigned-byte 8))
+                      (vector 32) (first xkeys) (vector #xac))   ; OP_CHECKSIG
+         (append (mapcar (lambda (k)
+                           (concatenate '(vector (unsigned-byte 8))
+                                        (vector 32) k (vector #xba))) ; OP_CHECKSIGADD
+                         (rest xkeys))
+                 (list (%script-num threshold) #(#x9c)))))       ; OP_NUMEQUAL
+
+(defconstant +tapleaf-version-tapscript+ #xc0
+  "BIP342's leaf version. The only one a descriptor can express.")
+
+(defun %taproot-merkle-root (leaf-hashes)
+  "The merkle root of a taproot script tree, from LEAF-HASHES — a list of
+(DEPTH . 32-byte tapleaf hash) in the order tr()'s tree argument names them.
+
+Core's TaprootBuilder::Insert (script/signingprovider.cpp), and it is worth
+seeing why no tree object is needed: M-BRANCH holds at most one pending hash
+per depth. Inserting at depth D combines with whatever is already pending at D
+— that is D's left sibling, which by the parse order must already be there —
+and the combined node moves up one level, repeating while a sibling waits.
+A well-formed tree therefore ends with exactly one pending hash at depth 0.
+
+TAP-BRANCH-HASH already sorts the pair lexicographically (BIP341), which is
+what makes the root independent of left/right ordering."
+  (let ((branch (make-array (1+ (reduce #'max leaf-hashes :key #'car :initial-value 0))
+                            :initial-element nil))
+        (size 0))
+    (dolist (entry leaf-hashes)
+      (let ((depth (car entry))
+            (node (cdr entry)))
+        (loop while (and (> size depth) (aref branch depth))
+              do (setf node (bitcoin-lisp.crypto:tap-branch-hash node (aref branch depth))
+                       (aref branch depth) nil)
+                 (decf size)
+                 (when (zerop depth) (return))
+                 (decf depth))
+        (setf (aref branch depth) node
+              size (max size (1+ depth)))))
+    ;; Anything other than a single pending hash at depth 0 means the depth
+    ;; sequence did not describe a tree (Core asserts ValidDepths before
+    ;; building, descriptor.cpp:2517).
+    (unless (and (= size 1) (aref branch 0))
+      (%desc-error "tr(): malformed script tree"))
+    (aref branch 0)))
+
+(defun %tr-output-key (desc pos keyfn)
+  "The 32-byte taproot output key for a tr() descriptor: the internal key
+tweaked by the tree's merkle root, or by nothing at all when the descriptor is
+key-path only."
+  (let* ((internal (%key-xonly-bytes (funcall keyfn (first (out-desc-keys desc)))))
+         (root (when (out-desc-tree desc)
+                 (%taproot-merkle-root
+                  (mapcar (lambda (entry)
+                            (cons (car entry)
+                                  (bitcoin-lisp.crypto:tap-leaf-hash
+                                   +tapleaf-version-tapscript+
+                                   (first (%out-desc-expand-1 (cdr entry) pos keyfn)))))
+                          (out-desc-tree desc)))))
+         (output-key (bitcoin-lisp.crypto:tweak-xonly-pubkey
+                      internal (bitcoin-lisp.crypto:tap-tweak-hash internal root))))
+    (unless output-key
+      (error 'descriptor-derivation-error))
+    output-key))
+
 (defun %out-desc-expand-1 (desc pos keyfn)
   "Expand DESC at range position POS into its scriptPubKey list (Core Expand),
 resolving each key expression's pubkey via (KEYFN desc-key)."
   (ecase (out-desc-kind desc)
     ((:addr :raw) (list (out-desc-script desc)))
-    (:pk (list (%script-p2pk (funcall keyfn (first (out-desc-keys desc))))))
+    (:pk (let ((pubkey (funcall keyfn (first (out-desc-keys desc)))))
+           ;; Core's PKDescriptor::MakeScripts branches on m_xonly: inside a
+           ;; taproot leaf pk() pushes the 32-byte x-only key, everywhere else
+           ;; the full 33/65-byte one.
+           (list (%script-p2pk (if (out-desc-xonly-script-p desc)
+                                   (%key-xonly-bytes pubkey)
+                                   pubkey)))))
     (:pkh (list (%script-p2pkh (funcall keyfn (first (out-desc-keys desc))))))
     (:wpkh (list (%script-p2wpkh (funcall keyfn (first (out-desc-keys desc))))))
     (:combo
@@ -858,14 +1143,16 @@ resolving each key expression's pubkey via (KEYFN desc-key)."
        (list (%script-multisig (out-desc-threshold desc) pubkeys))))
     (:sh (list (%script-p2sh (first (%out-desc-expand-1 (out-desc-sub desc) pos keyfn)))))
     (:wsh (list (%script-p2wsh (first (%out-desc-expand-1 (out-desc-sub desc) pos keyfn)))))
-    (:tr
-     (let* ((internal (%key-xonly-bytes
-                       (funcall keyfn (first (out-desc-keys desc)))))
-            (tweak (bitcoin-lisp.crypto:tap-tweak-hash internal))
-            (output-key (bitcoin-lisp.crypto:tweak-xonly-pubkey internal tweak)))
-       (unless output-key
-         (error 'descriptor-derivation-error))
-       (list (%script-p2tr output-key))))
+    (:tr (list (%script-p2tr (%tr-output-key desc pos keyfn))))
+    ;; A tapscript leaf: <x0> CHECKSIG (<xi> CHECKSIGADD)* <k> NUMEQUAL
+    ;; (descriptor.cpp:1325-1337). sortedmulti_a sorts the X-ONLY keys, after
+    ;; the conversion, not the 33-byte forms.
+    ((:multi-a :sortedmulti-a)
+     (let ((xkeys (mapcar (lambda (k) (%key-xonly-bytes (funcall keyfn k)))
+                          (out-desc-keys desc))))
+       (when (eq (out-desc-kind desc) :sortedmulti-a)
+         (setf xkeys (sort (copy-list xkeys) #'%pubkey-lessp)))
+       (list (%script-multi-a (out-desc-threshold desc) xkeys))))
     (:rawtr
      (list (%script-p2tr (%key-xonly-bytes
                           (funcall keyfn (first (out-desc-keys desc)))))))
@@ -896,8 +1183,7 @@ resolving each key expression's pubkey via (KEYFN desc-key)."
 
 (defun %out-desc-needs-missing-privkey-p (desc)
   (or (some #'%desc-key-needs-missing-privkey-p (out-desc-keys desc))
-      (and (out-desc-sub desc)
-           (%out-desc-needs-missing-privkey-p (out-desc-sub desc)))))
+      (some #'%out-desc-needs-missing-privkey-p (%out-desc-children desc))))
 
 (defun out-desc-expand (desc pos)
   "Expand DESC at POS, with caching keyed on the canonical public body (which

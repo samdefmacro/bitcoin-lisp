@@ -441,10 +441,17 @@ own checksums on both forms."
                      "rawtr(): only one key expected."))
 
 (test desc-tr-key-path-only
-  "tr() stays key-path-only at P0: script trees are rejected."
-  (%check-unparsable ""
-                     "tr(a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd,pk(669b8afcec803a0d323e9a17f3ea8e68e8abe5a278020a929adbec52421adbd0))"
-                     "tr(): script trees are not supported")
+  "A key-path-only tr(), and where its x-only keys may appear.
+
+The tree rejection this test used to assert is gone: tr(KEY,TREE) parses, and
+TR-SCRIPT-TREES-MATCH-CORE-VECTORS below holds it to Core's vectors."
+  ;; A single leaf needs no braces. No expected script is asserted here on
+  ;; purpose -- Core has no vector for this exact string, and an expectation
+  ;; read back out of our own expander would prove nothing. Core's ranged
+  ;; vector in TR-SCRIPT-TREES-MATCH-CORE-VECTORS is a braceless single leaf
+  ;; and pins the same path against a real oracle.
+  (finishes
+    (%desc-parse "tr(a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd,pk(669b8afcec803a0d323e9a17f3ea8e68e8abe5a278020a929adbec52421adbd0))"))
   ;; x-only keys only valid inside tr()/rawtr()
   (%check-unparsable ""
                      "pk(a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd)"
@@ -821,3 +828,155 @@ from getaddressinfo and listunspent for any wallet holding a policy descriptor."
           (is-true (and pa pb pc) "not every key appears in the inferred body")
           (is-true (< pa pb pc)
                    "inferred keys are out of parse order: ~S" body))))))
+
+;;;; --- descriptor_tests.cpp: tr() script trees -----------------------------
+
+(defparameter +tr-xonly+
+  "03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5"
+  "Core's x-only test key. 32 bytes whose first byte happens to be 0x03, which
+is why it reads like a compressed key and is not one.")
+
+(defparameter +tr-xpub+
+  "xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL")
+
+(defparameter +tr-xprv+
+  "xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc")
+
+(test tr-script-trees-match-core-vectors
+  "Core descriptor_tests.cpp Check() vectors for tr(KEY,TREE). The output key is
+the internal key tweaked by the tree's merkle root, so a wrong leaf script, a
+wrong depth or a wrong combine order all land on a DIFFERENT address rather
+than on an error — only the vectors catch it."
+  ;; descriptor_tests.cpp:625 — a nested tree mixing an x-only hex key with a
+  ;; WIF one, which the public form prints as 32-byte x-only hex.
+  (%check-desc
+   (format nil "tr(~A,{pk(~A),{pk(L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1),pk(~A)}})"
+           +tr-xonly+ +tr-xonly+ +tr-xonly+)
+   (format nil "tr(~A,{pk(~A),{pk(a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd),pk(~A)}})"
+           +tr-xonly+ +tr-xonly+ +tr-xonly+)
+   '(("51201497ae16f30dacb88523ed9301bff17773b609e8a90518a3f96ea328a47d1500")))
+  ;; descriptor_tests.cpp:993 — a single leaf that is multi_a(), i.e. the
+  ;; CHECKSIGADD chain BIP342 replaced CHECKMULTISIG with.
+  (%check-desc
+   "tr(L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1,multi_a(1,KzoAz5CanayRKex3fSLQ2BwJpN7U52gZvxMyk78nDMHuqrUxuSJy))"
+   "tr(a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd,multi_a(1,669b8afcec803a0d323e9a17f3ea8e68e8abe5a278020a929adbec52421adbd0))"
+   '(("5120eb5bd3894327d75093891cc3a62506df7d58ec137fcd104cdd285d67816074f3")))
+  ;; descriptor_tests.cpp:640 — a RANGED tree. The leaf key stays an xpub in the
+  ;; descriptor string while its script push is 32 bytes: see the regression
+  ;; test below for why those two must be decided separately.
+  (%check-desc
+   (format nil "tr(~A/0/*,pk(~A/1/*))" +tr-xprv+ +tr-xprv+)
+   (format nil "tr(~A/0/*,pk(~A/1/*))" +tr-xpub+ +tr-xpub+)
+   '(("512078bc707124daa551b65af74de2ec128b7525e10f374dc67b64e00ce0ab8b3e12")
+     ("512001f0a02a17808c20134b78faab80ef93ffba82261ccef0a2314f5d62b6438f11")
+     ("512021024954fcec88237a9386fce80ef2ced5f1e91b422b26c59ccfc174c8d1ad25"))
+   :range t))
+
+(test tr-script-tree-parse-errors-match-core
+  "The tree grammar's error messages, verbatim from descriptor.cpp:2474-2515."
+  ;; descriptor_tests.cpp:1006
+  (%check-unparsable
+   "" "tr(a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd,multi_a(1))"
+   "Cannot have 0 keys in multi_a; must have between 1 and 999 keys, inclusive")
+  ;; A left branch that never gets its sibling.
+  (%check-unparsable
+   "" (format nil "tr(~A,{pk(~A)})" +tr-xonly+ +tr-xonly+)
+   "tr(): expected ',' after script expression")
+  ;; A right branch that never gets closed.
+  (%check-unparsable
+   "" (format nil "tr(~A,{pk(~A),pk(~A))" +tr-xonly+ +tr-xonly+ +tr-xonly+)
+   "tr(): expected '}' after script expression")
+  ;; A finished tree with something after it.
+  (%check-unparsable
+   "" (format nil "tr(~A,{pk(~A),pk(~A)},pk(~A))"
+              +tr-xonly+ +tr-xonly+ +tr-xonly+ +tr-xonly+)
+   "tr(): expected ')' after script expression")
+  ;; multi/sortedmulti are not tapscript: BIP342 removed CHECKMULTISIG.
+  (%check-unparsable
+   "" (format nil "tr(~A,multi(1,~A))" +tr-xonly+ +tr-xonly+)
+   "Can only have multi/sortedmulti at top level, in sh(), or in wsh()")
+  ;; ...and multi_a is ONLY tapscript.
+  (%check-unparsable
+   "" "wsh(multi_a(1,03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd))"
+   "Can only have multi_a/sortedmulti_a inside tr()"))
+
+(test tr-leaf-pk-pushes-the-x-only-key-even-for-an-xpub
+  "Core's PKDescriptor carries m_xonly (descriptor.cpp:1143), set from the
+PARSE CONTEXT, and pk() inside a taproot leaf pushes 32 bytes.
+
+The flag belongs to the DESCRIPTOR, not to the key, and an xpub leaf is what
+proves it: DESC-KEY's XONLY-P decides how a key PRINTS, and Core prints this
+leaf as pk(xpub.../1/*) while pushing the 32-byte form into the script. Deciding
+the script from the print flag silently gives a 33-byte push here — a different
+leaf hash, a different merkle root, and therefore a different ADDRESS."
+  (let* ((d (%desc-parse (format nil "tr(~A/0/*,pk(~A/1/*))" +tr-xpub+ +tr-xpub+)))
+         (leaf (cdr (first (bitcoin-lisp.rpc::out-desc-tree d))))
+         (script (first (bitcoin-lisp.rpc::out-desc-expand leaf 0))))
+    (is (= 34 (length script))
+        "leaf script is ~D bytes, wanted 34 (push32 + CHECKSIG)" (length script))
+    (is (= 32 (aref script 0)) "leaf pushes ~D bytes, wanted 32" (aref script 0))
+    (is (= #xac (aref script 33)))
+    ;; And the key still prints as an xpub, which is the half that must NOT
+    ;; follow the script.
+    (is-true (search +tr-xpub+ (bitcoin-lisp.rpc::out-desc-string d))
+             "the leaf key stopped printing as an xpub")))
+
+(test tr-tree-inference-names-each-leafs-own-key
+  "%INFER-DESC-BODY addresses PAIRS positionally — (first pairs) means `this
+descriptor's key' — which holds only while the descriptor owns every pair. A
+tr() tree breaks that: OUT-DESC-ORDERED-KEYS numbers the INTERNAL key first, so
+handing every leaf the whole list makes all of them report the internal key.
+An inferred descriptor is what a backup restores from, so a leaf naming the
+wrong key restores a different wallet."
+  (let* ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
+         (b "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
+         (x-a (subseq a 2))
+         (x-b (subseq b 2)))
+    (multiple-value-bind (desc scripts pairs)
+        (%dt-expand-pairs (format nil "tr(~A,{pk(~A),pk(~A)})" +tr-xonly+ a b))
+      (let ((body (bitcoin-lisp.rpc::%infer-desc-body desc (first scripts)
+                                                      scripts pairs 0)))
+        (is-true (stringp body) "inference returned ~S" body)
+        ;; Each leaf reports its OWN key, x-only (Core builds the inferred
+        ;; leaf as PKDescriptor(..., /*xonly=*/true), descriptor.cpp:2695).
+        (let ((pa (search x-a body)) (pb (search x-b body)))
+          (is-true pa "leaf key ~A missing from ~S" x-a body)
+          (is-true pb "leaf key ~A missing from ~S" x-b body)
+          (is-true (and pa pb (< pa pb))
+                   "inferred leaves are out of parse order: ~S" body))
+        (is-false (search a body)
+                  "a leaf reported its key in 33-byte form: ~S" body)
+        ;; The internal key appears exactly once — as the internal key.
+        (is (= 1 (count-if (lambda (i) (declare (ignore i)) t)
+                           (loop with start = 0
+                                 for p = (search +tr-xonly+ body :start2 start)
+                                 while p collect p do (setf start (1+ p)))))
+            "the internal key appears more than once in ~S" body)))))
+
+(test tr-tree-survives-the-checksum-and-the-string-forms
+  "Braces are part of BIP380's INPUT_CHARSET, and all three string forms
+(public, private, normalized) go through %OUT-DESC-STRING-WALK, so a tree that
+prints wrong prints wrong everywhere at once — including in the checksum a
+wallet backup is identified by."
+  (let* ((node (make-test-node))          ; :testnet3
+         (body (format nil "tr(~A,{pk(~A),multi_a(1,~A)})"
+                       +tr-xonly+ +tr-xonly+ +tr-xonly+))
+         (r (bitcoin-lisp.rpc::rpc-getdescriptorinfo node (list body)))
+         (reported (cdr (assoc "descriptor" r :test #'string=))))
+    (is (string= (bitcoin-lisp.rpc::descriptor-checksum body)
+                 (cdr (assoc "checksum" r :test #'string=))))
+    (is (eq t (cdr (assoc "issolvable" r :test #'string=))))
+    ;; JSON false is a SENTINEL OBJECT, which is true in Lisp: IS-FALSE here
+    ;; would pass on any value the RPC could ever return.
+    (is (eq bitcoin-lisp.rpc::+json-false+
+            (cdr (assoc "isrange" r :test #'string=))))
+    (is (eq bitcoin-lisp.rpc::+json-false+
+            (cdr (assoc "hasprivatekeys" r :test #'string=))))
+    ;; The reported form keeps the tree and round-trips to itself.
+    (is-true (search "{pk(" reported) "the tree vanished from ~S" reported)
+    (is-true (search "multi_a(1," reported))
+    (is (string= reported
+                 (cdr (assoc "descriptor"
+                             (bitcoin-lisp.rpc::rpc-getdescriptorinfo
+                              node (list reported))
+                             :test #'string=))))))
