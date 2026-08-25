@@ -685,7 +685,14 @@ witness-stack) on success (either may be nil/empty), or (values nil nil)."
         (:witness-v1-taproot
          (let ((ks (bitcoin-lisp.serialization:psbt-map-find
                     map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+)))
-           (when ks (values empty (list ks)))))
+           (if ks
+               ;; Key path: the whole witness is the one signature.
+               (values empty (list ks))
+               ;; Script path, assembled from the parts a PSBT stores rather
+               ;; than from a witness nobody could have put there — Core's
+               ;; PSBTInput::FillSignatureData + ProduceSignature.
+               (let ((wit (%psbt-taproot-script-witness map)))
+                 (when wit (values empty wit))))))
         (:scripthash
          (when rs
            (case (bitcoin-lisp.validation:classify-script rs)
@@ -1027,7 +1034,122 @@ and non_witness_utxo is absent."
        (not (bitcoin-lisp.serialization:psbt-map-find
              map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))))
 
-(defun %psbt-record-signatures (psbt coins keymap pubmap tr-keymap user-sighash)
+(defun %psbt-taproot-script-witness (map)
+  "The witness for a taproot SCRIPT-path spend assembled from MAP's
+PSBT_IN_TAP_LEAF_SCRIPT and PSBT_IN_TAP_SCRIPT_SIG records, or NIL when no leaf
+is fully signed.
+
+A leaf is finalizable only when every key its script names has a signature, and
+the only way to know how many that is -- without a tapscript miniscript parser
+-- is to read the leaf script itself. So this counts the 32-byte pushes the
+script contains and requires that many signatures for pk()/pkh(), or the
+CHECKSIGADD threshold for multi_a(). A leaf we cannot read stays unfinalized,
+which is the safe direction: an under-signed witness is an unspendable
+transaction that reports itself complete.
+
+Signature order follows the script, and the multi_a stack runs OPPOSITE to key
+order -- see TR-LEAF-SATISFACTION, which derives why."
+  (let ((leaves (bitcoin-lisp.serialization:psbt-map-collect
+                 map bitcoin-lisp.serialization:+psbt-in-tap-leaf-script+))
+        (sigs (bitcoin-lisp.serialization:psbt-map-collect
+               map bitcoin-lisp.serialization:+psbt-in-tap-script-sig+))
+        (best nil) (best-size nil))
+    (dolist (leaf leaves best)
+      (destructuring-bind (control . value) leaf
+        (when (plusp (length value))
+          (let* ((script (subseq value 0 (1- (length value))))
+                 (leaf-hash (bitcoin-lisp.crypto:tap-leaf-hash
+                             (aref value (1- (length value))) script))
+                 (satisfaction (%tapscript-satisfaction script leaf-hash sigs)))
+            (when satisfaction
+              (let* ((stack (append satisfaction (list script control)))
+                     (size (reduce #'+ stack :key #'length)))
+                (when (or (null best-size) (< size best-size))
+                  (setf best stack best-size size))))))))))
+
+(defun %tapscript-satisfaction (script leaf-hash sigs)
+  "The witness elements satisfying the tapscript SCRIPT from SIGS -- a list of
+(keydata . sig) where keydata is <32-byte xonly><32-byte leaf hash> -- or NIL.
+
+Only the shapes our tr() grammar builds are recognised, the same set
+TR-LEAF-SATISFACTION handles; anything else is left unfinalized."
+  (flet ((sig-for (xonly)
+           (cdr (find-if (lambda (rec)
+                           (let ((kd (car rec)))
+                             (and (>= (length kd) 64)
+                                  (equalp (subseq kd 0 32) xonly)
+                                  (equalp (subseq kd 32 64) leaf-hash))))
+                         sigs))))
+    (let ((n (length script)))
+      (cond
+        ;; <32> <x> CHECKSIG
+        ((and (= n 34) (= (aref script 0) 32) (= (aref script 33) #xac))
+         (let ((sig (sig-for (subseq script 1 33))))
+           (when sig (list sig))))
+        ;; DUP HASH160 <20> <h> EQUALVERIFY CHECKSIG -- the key is not in the
+        ;; script, only its hash, so it has to come from the signature records.
+        ((and (= n 25) (= (aref script 0) #x76) (= (aref script 1) #xa9)
+              (= (aref script 2) 20) (= (aref script 23) #x88)
+              (= (aref script 24) #xac))
+         (let* ((hash (subseq script 3 23))
+                (rec (find-if (lambda (r)
+                                (let ((kd (car r)))
+                                  (and (>= (length kd) 64)
+                                       (equalp (subseq kd 32 64) leaf-hash)
+                                       (equalp (bitcoin-lisp.crypto:hash160
+                                                (subseq kd 0 32))
+                                               hash))))
+                              sigs)))
+           (when rec (list (cdr rec) (subseq (car rec) 0 32)))))
+        ;; <x0> CHECKSIG (<xi> CHECKSIGADD)* <k> NUMEQUAL
+        (t (%multi-a-satisfaction script #'sig-for))))))
+
+(defun %multi-a-satisfaction (script sig-for)
+  "Satisfy a multi_a tapscript from SIG-FOR, or NIL if SCRIPT is not one or
+too few of its keys have signed."
+  (let ((keys '()) (i 0) (n (length script)))
+    (loop
+      (unless (and (< (+ i 34) n) (= (aref script i) 32)) (return))
+      (let ((op (aref script (+ i 33))))
+        (unless (or (and (null keys) (= op #xac))
+                    (and keys (= op #xba)))
+          (return))
+        (push (subseq script (1+ i) (+ i 33)) keys)
+        (incf i 34)))
+    (setf keys (nreverse keys))
+    (when (and keys (< i n) (= (aref script (1- n)) #x9c))
+      (let ((threshold (%script-num-value (subseq script i (1- n)))))
+        (when threshold
+          (let* ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+                 (taken 0)
+                 (elements (loop for key in keys
+                                 collect (let ((sig (and (< taken threshold)
+                                                         (funcall sig-for key))))
+                                           (cond (sig (incf taken) sig)
+                                                 (t empty))))))
+            (when (= taken threshold)
+              (reverse elements))))))))
+
+(defun %script-num-value (bytes)
+  "The integer a %SCRIPT-NUM push encodes, or NIL if BYTES is not one."
+  (cond ((and (= (length bytes) 1) (<= #x51 (aref bytes 0) #x60))
+         (- (aref bytes 0) #x50))
+        ((and (plusp (length bytes)) (= (aref bytes 0) (1- (length bytes))))
+         (loop with v = 0
+               for i from 1 below (length bytes)
+               do (setf v (logior v (ash (aref bytes i) (* 8 (1- i)))))
+               finally (return v)))))
+
+(defun %psbt-record-present-p (map keytype keydata)
+  "Whether MAP already holds a KEYTYPE record under exactly KEYDATA.
+PSBT-MAP-FIND matches on the key TYPE alone, which is right for the singleton
+fields and wrong for the taproot ones — a script-path input carries one
+TAP_SCRIPT_SIG per (key, leaf) and one TAP_LEAF_SCRIPT per control block."
+  (loop for (kd . nil) in (bitcoin-lisp.serialization:psbt-map-collect map keytype)
+        thereis (equalp kd keydata)))
+
+(defun %psbt-record-signatures (psbt coins keymap pubmap tr-keymap user-sighash
+                                &optional tr-scripts)
   "Compute + record partial signatures on every non-final input of PSBT the key
 maps can satisfy, sourcing prevouts from COINS. ECDSA partial sigs go into
 +psbt-in-partial-sig+ (keyed by pubkey), taproot key-path sigs into
@@ -1061,7 +1183,7 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
               (multiple-value-bind (sig err)
                   (%compute-input-signatures tx i prev keymap pubmap tr-keymap
                                              (if (zerop eff) #x01 eff)
-                                             precomp spent-utxos eff)
+                                             precomp spent-utxos eff tr-scripts)
                 ;; Core SignPSBTInput's require_witness_sig gate: never record a
                 ;; legacy (non-witness) signature for an input sourced only from
                 ;; the witness_utxo — Core refuses it (a witness_utxo cannot
@@ -1099,7 +1221,35 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                                    map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+)))
                     (bitcoin-lisp.serialization:psbt-map-set
                      map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+ empty
-                     (input-sig-tap sig))))))))))))
+                     (input-sig-tap sig)))
+                  ;; A taproot SCRIPT path is recorded in parts, never as the
+                  ;; finished witness: PSBT_IN_TAP_SCRIPT_SIG keyed by
+                  ;; <xonly><leaf hash>, plus the PSBT_IN_TAP_LEAF_SCRIPT the
+                  ;; next signer needs to reach the same leaf. Storing the
+                  ;; assembled stack instead would finalize the input and lock
+                  ;; every other participant out of a k-of-n leaf.
+                  (dolist (entry (input-sig-tap-script-sigs sig))
+                    (destructuring-bind (xonly leaf-hash tap-sig) entry
+                      (let ((keydata (concatenate '(vector (unsigned-byte 8))
+                                                  xonly leaf-hash)))
+                        (unless (%psbt-record-present-p
+                                 map bitcoin-lisp.serialization:+psbt-in-tap-script-sig+
+                                 keydata)
+                          (bitcoin-lisp.serialization:psbt-map-set
+                           map bitcoin-lisp.serialization:+psbt-in-tap-script-sig+
+                           keydata tap-sig)))))
+                  (let ((leaf (input-sig-tap-leaf sig)))
+                    (when leaf
+                      (destructuring-bind (script . control) leaf
+                        (unless (%psbt-record-present-p
+                                 map bitcoin-lisp.serialization:+psbt-in-tap-leaf-script+
+                                 control)
+                          (bitcoin-lisp.serialization:psbt-map-set
+                           map bitcoin-lisp.serialization:+psbt-in-tap-leaf-script+
+                           control
+                           (concatenate '(vector (unsigned-byte 8))
+                                        script
+                                        (vector +tapleaf-version-tapscript+))))))))))))))))
 
 (defun %psbt-add-map-derivs (map spk pos pairs)
   "Add +psbt-in-bip32+ (ECDSA) / +psbt-in-tap-internal-key+ (taproot) records to
@@ -1234,9 +1384,10 @@ Returns {psbt, complete, hex?}."
               (%psbt-add-wallet-input-derivs psbt coins wallet)
               (%psbt-add-wallet-output-derivs psbt wallet))
             (when sign
-              (multiple-value-bind (keymap pubmap tr-keymap)
+              (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
                   (%wallet-sign-maps wallet (bitcoin-lisp.serialization:psbt-tx psbt) coins)
-                (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash)))
+                (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash
+                                         tr-scripts)))
             (%psbt-signer-result psbt finalize)))))))
 
 ;;; --- descriptorprocesspsbt (rpc/rawtransaction.cpp:1992) ---

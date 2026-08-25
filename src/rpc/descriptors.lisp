@@ -144,6 +144,12 @@ optional origin + const pubkey / WIF key / BIP32 extended key)."
   (origin-path nil)                 ; list of uint32 (high bit = hardened)
   (pubkey nil)                      ; const pubkey bytes (33/65), NIL for BIP32 keys
   (xonly-p nil :type boolean)       ; print PUBKEY as 32-byte x-only hex
+  ;; musig(K,K,...): the participant key expressions, in the order written.
+  ;; Their AGGREGATE is this expression's pubkey — see %MUSIG-KEY-PUBKEY-AT.
+  ;; PATH/DERIVE below then apply to the BIP328 synthetic xpub built from it,
+  ;; which is why the aggregate lives on the key rather than being a descriptor
+  ;; kind: musig() is a KEY expression, usable anywhere tr() takes a key.
+  (musig-participants nil)
   (privkey nil)                     ; 32-byte WIF secret, or NIL
   (compressed-p t :type boolean)    ; WIF compression flag
   (extkey nil)                      ; public (neutered) root ext-key, or NIL
@@ -233,7 +239,10 @@ plus key-material sanity."
 
 (defun %parse-desc-key-inner (str ctx network apostrophe-box)
   "Parse a key expression without origin info (Core's ParsePubkeyInner).
-CTX is the surrounding context: :top :sh :wsh :wpkh :tr."
+CTX is the surrounding context: :top :sh :wsh :wpkh :tr :tr-script :musig.
+
+:MUSIG is a musig() participant. It is deliberately NOT an x-only context —
+see %XONLY-CONTEXT-P — because only the aggregate is x-only."
   (let* ((permit-uncompressed (member ctx '(:top :sh)))
          (elems (uiop:split-string str :separator "/"))
          (key-str (first elems))
@@ -299,8 +308,109 @@ CTX is the surrounding context: :top :sh :wsh :wpkh :tr."
                              :path path :derive derive)
               (make-desc-key :extkey k :path path :derive derive)))))))
 
+(defparameter *musig-chaincode-hex*
+  "868087ca02a6f974c4598924c36b57762d32cb45717167e300622c7167e38965"
+  "DEFPARAMETER and not DEFCONSTANT: SBCL compares a constant's old and new
+values with EQL, and two string literals with identical contents are not EQL,
+so a DEFCONSTANT string signals DEFCONSTANT-UNEQL on every reload — which
+aborts a cold build outright.
+
+BIP328's fixed chaincode for the synthetic xpub built over a MuSig2
+aggregate key (Core MUSIG_CHAINCODE, musig.cpp:12). A real xpub's chaincode
+carries entropy from its parent; an aggregate key has no parent, so BIP328
+fixes one so every implementation derives the same children.")
+
+(defun %musig-synthetic-xpub (aggregate-pubkey network)
+  "The BIP328 synthetic xpub over AGGREGATE-PUBKEY: depth 0, zero fingerprint,
+child 0, the fixed MuSig2 chaincode (Core CreateMuSig2SyntheticXpub,
+musig.cpp:71). It is a derivation ROOT, not a key anyone published."
+  (bitcoin-lisp.crypto:make-ext-key
+   :version (if (eq network :mainnet)
+                bitcoin-lisp.crypto:+xpub-mainnet+
+                bitcoin-lisp.crypto:+xpub-testnet+)
+   :depth 0
+   :parent-fingerprint 0
+   :child-number 0
+   :chain-code (bitcoin-lisp.crypto:hex-to-bytes *musig-chaincode-hex*)
+   :key (coerce aggregate-pubkey '(simple-array (unsigned-byte 8) (*)))
+   :privatep nil))
+
+(defun %parse-musig-key (str ctx network)
+  "Parse a musig(KEY,KEY,...) key expression, with an optional /PATH suffix
+(Core ParsePubkey's musig branch, descriptor.cpp:1964-2044). Returns a DESC-KEY
+whose MUSIG-PARTICIPANTS are the participant expressions in the order written.
+
+Every error message here is Core's, verbatim."
+  (unless (%xonly-context-p ctx)
+    (%desc-error "musig() is only allowed in tr() and rawtr()"))
+  ;; Core splits on ')' keeping the separator, so at most two pieces: the
+  ;; musig(...) call and whatever derivation follows it.
+  (let ((close (position #\) str)))
+    (when (null close)
+      (%desc-error "Invalid musig() expression"))
+    (let ((call (subseq str 0 (1+ close)))
+          (rest (subseq str (1+ close))))
+      (when (find #\) rest)
+        (%desc-error "Too many ')' in musig() expression"))
+      (let ((inner (%func-inner "musig" call)))
+        (unless inner
+          (%desc-error "Invalid musig() expression"))
+        ;; Participants. Core parses them in ParseScriptContext::MUSIG, which
+        ;; differs from P2TR only in refusing a nested musig().
+        (let ((participants '())
+              (remaining inner))
+          (loop
+            (when (zerop (length remaining)) (return))
+            (when participants
+              (unless (char= (char remaining 0) #\,)
+                (%desc-error "musig(): expected ',', got '~C'" (char remaining 0)))
+              (setf remaining (subseq remaining 1)))
+            (multiple-value-bind (arg tail) (%split-expr remaining)
+              (setf remaining tail)
+              (when (%func-inner "musig" arg)
+                (%desc-error "musig(): musig() is not allowed in musig()"))
+              ;; Core parses participants in ParseScriptContext::MUSIG, NOT
+              ;; P2TR (descriptor.cpp:1994). The difference is real: MUSIG is
+              ;; not an x-only context, so a participant is written and printed
+              ;; as a 33-byte key, and a bare 32-byte one is refused. Only the
+              ;; AGGREGATE is ever x-only.
+              (push (%with-desc-error-prefix
+                     "musig(): "
+                     (lambda () (%parse-desc-key arg :musig network)))
+                    participants)))
+          (setf participants (nreverse participants))
+          (unless participants
+            (%desc-error "musig(): Must contain key expressions"))
+          (let ((key (make-desc-key :musig-participants participants :xonly-p t)))
+            (when (plusp (length rest))
+              (unless (char= (char rest 0) #\/)
+                (%desc-error "musig(): expected ',', got '~C'" (char rest 0)))
+              (unless (every (lambda (p)
+                               (or (desc-key-extkey p) (desc-key-ext-privkey p)))
+                             participants)
+                (%desc-error "musig(): derivation requires all participants to be xpubs or xprvs"))
+              (when (some #'desc-key-ranged-p participants)
+                (%desc-error "musig(): Cannot have ranged participant keys if musig() also has derivation"))
+              (let ((elems (rest (uiop:split-string rest :separator "/")))
+                    (apostrophe-box (list nil)))
+                (let ((last (car (last elems))))
+                  (cond ((equal last "*")
+                         (setf (desc-key-derive key) :unhardened
+                               elems (butlast elems)))
+                        ((or (equal last "*'") (equal last "*h"))
+                         (%desc-error "musig(): Cannot have hardened child derivation"))))
+                (let ((path (%parse-key-path elems t apostrophe-box)))
+                  (when (some (lambda (i) (logbitp 31 i)) path)
+                    (%desc-error "musig(): cannot have hardened derivation steps"))
+                  (setf (desc-key-path key) path))))
+            key))))))
+
 (defun %parse-desc-key (str ctx network)
   "Parse a key expression with optional [origin] prefix (Core's ParsePubkey)."
+  ;; musig() cannot be nested inside an origin, so it is recognised before the
+  ;; ']' split (Core descriptor.cpp:1962).
+  (when (and (>= (length str) 6) (string= "musig(" (subseq str 0 6)))
+    (return-from %parse-desc-key (%parse-musig-key str ctx network)))
   (let* ((parts (uiop:split-string str :separator "]"))
          (apostrophe-box (list nil)))
     (when (> (length parts) 2)
@@ -332,11 +442,18 @@ CTX is the surrounding context: :top :sh :wsh :wpkh :tr."
               key))))))
 
 (defun desc-key-ranged-p (key)
-  (not (eq (desc-key-derive key) :none)))
+  ;; ⚠️ musig(A/0/*,B) is ranged through its PARTICIPANTS even when the musig()
+  ;; expression itself has no /* — Core's MuSigPubkeyProvider::IsRange is
+  ;; IsRangedDerivation() || m_ranged_participants (descriptor.cpp:696).
+  (or (not (eq (desc-key-derive key) :none))
+      (some #'desc-key-ranged-p (desc-key-musig-participants key))))
 
 (defun desc-key-has-privkey-p (key)
+  ;; A musig() expression holds no secret of its own; the participants do, and
+  ;; a descriptor written with one WIF participant DOES have private keys.
   (and (or (desc-key-privkey key)
-           (desc-key-ext-privkey key))
+           (desc-key-ext-privkey key)
+           (some #'desc-key-has-privkey-p (desc-key-musig-participants key)))
        t))
 
 (defun %desc-key-size (key)
@@ -358,6 +475,21 @@ CTX is the surrounding context: :top :sh :wsh :wpkh :tr."
 xpub, WIF as its hex pubkey, hardened markers in the style used on input.
 STYLE :compat forces apostrophe hardened markers (Core's StringType::COMPAT,
 used only for DescriptorID stability across versions)."
+  ;; musig() prints its participants in the order they were WRITTEN, not the
+  ;; sorted order aggregation uses (Core MuSigPubkeyProvider::ToString,
+  ;; descriptor.cpp:700). A descriptor that came back re-sorted would not
+  ;; round-trip to the string the user handed in.
+  (when (desc-key-musig-participants key)
+    (return-from desc-key-string
+      (format nil "musig(~{~A~^,~})~A~A"
+              (mapcar (lambda (p) (desc-key-string p style))
+                      (desc-key-musig-participants key))
+              (%format-key-path (desc-key-path key)
+                                (if (eq style :compat) t (desc-key-apostrophe key)))
+              (ecase (desc-key-derive key)
+                (:none "")
+                (:unhardened "/*")
+                (:hardened "/*h")))))
   (let ((apostrophe (if (eq style :compat) t (desc-key-apostrophe key))))
     (concatenate
      'string
@@ -387,6 +519,43 @@ used only for DescriptorID stability across versions)."
   (:documentation "Expansion needs private keys (hardened derivation from a
 public-only descriptor) or hit an invalid BIP32 child."))
 
+(defun %musig-key-pubkey-at (key pos)
+  "The pubkey a musig() key expression produces at POS (Core
+MuSigPubkeyProvider::GetPubKey, descriptor.cpp:633).
+
+Two shapes, and they aggregate at different moments:
+
+  musig(A,B)/0/*   — the participants are fixed, so the aggregate is fixed too;
+                     POS derives from the BIP328 SYNTHETIC XPUB built over it.
+  musig(A/0/*,B/0/*) — the participants derive first and the aggregate is a
+                     different key at every POS.
+
+Core forbids both at once, which is what makes the two exclusive here.
+
+⚠️ The participants are SORTED before aggregating (descriptor.cpp:648), which is
+BIP328's KeySort. BIP327 aggregation is order-sensitive, so without the sort the
+same descriptor written two ways would be two different ADDRESSES."
+  (let* ((participants (desc-key-musig-participants key))
+         (ranged (some #'desc-key-ranged-p participants))
+         (pubkeys (mapcar (lambda (p) (%desc-key-pubkey-at p (if ranged pos 0)))
+                          participants))
+         (aggregate (bitcoin-lisp.crypto:musig-aggregate-pubkeys
+                     (sort (copy-list pubkeys) #'%pubkey-lessp))))
+    (unless aggregate
+      (error 'descriptor-derivation-error))
+    (if (and (null (desc-key-path key)) (eq (desc-key-derive key) :none))
+        aggregate
+        (let ((root (%musig-synthetic-xpub aggregate
+                                           (if (= (bitcoin-lisp.crypto:ext-key-version
+                                                   (or (desc-key-extkey (first participants))
+                                                       (desc-key-ext-privkey (first participants))))
+                                                  bitcoin-lisp.crypto:+xpub-mainnet+)
+                                               :mainnet :testnet3))))
+          (let ((k (bitcoin-lisp.crypto:bip32-derive-path root (desc-key-path key))))
+            (when (eq (desc-key-derive key) :unhardened)
+              (setf k (bitcoin-lisp.crypto:bip32-derive-child k pos)))
+            (bitcoin-lisp.crypto:ext-key-key k))))))
+
 (defun %desc-key-pubkey-at (key pos)
   "The pubkey bytes KEY produces at range position POS (Core GetPubKey).
 Signals descriptor-derivation-error when hardened derivation is required but
@@ -395,6 +564,8 @@ only public key material is available.
 Note: %desc-key-pubkey-at-cached below performs the same derivation through
 the wallet's persistent xpub cache (Core folds both into one GetPubKey with
 optional caches); keep the two derivation paths in sync."
+  (when (desc-key-musig-participants key)
+    (return-from %desc-key-pubkey-at (%musig-key-pubkey-at key pos)))
   (if (desc-key-pubkey key)
       (desc-key-pubkey key)
       (let* ((hardened (or (eq (desc-key-derive key) :hardened)
@@ -1357,10 +1528,13 @@ resolving each key expression's pubkey via (KEYFN desc-key)."
 (defparameter *descriptor-cache-max-entries* 100000)
 
 (defun %desc-key-needs-missing-privkey-p (key)
-  (and (desc-key-extkey key)
-       (not (desc-key-ext-privkey key))
-       (or (eq (desc-key-derive key) :hardened)
-           (some (lambda (i) (logbitp 31 i)) (desc-key-path key)))))
+  ;; musig() itself cannot derive hardened (Core rejects it at parse), but its
+  ;; PARTICIPANTS are ordinary key expressions and can.
+  (or (some #'%desc-key-needs-missing-privkey-p (desc-key-musig-participants key))
+      (and (desc-key-extkey key)
+           (not (desc-key-ext-privkey key))
+           (or (eq (desc-key-derive key) :hardened)
+               (some (lambda (i) (logbitp 31 i)) (desc-key-path key))))))
 
 (defun %out-desc-needs-missing-privkey-p (desc)
   (or (some #'%desc-key-needs-missing-privkey-p (out-desc-keys desc))

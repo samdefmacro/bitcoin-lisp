@@ -128,6 +128,7 @@
    ;; Schnorr / x-only pubkeys (BIP 340)
    #:verify-schnorr-signature
    #:sign-schnorr
+   #:musig-aggregate-pubkeys
    #:derive-xonly-pubkey
    #:parse-xonly-pubkey
    #:xonly-pubkey-valid-p

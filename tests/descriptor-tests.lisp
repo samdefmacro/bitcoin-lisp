@@ -1153,3 +1153,68 @@ precisely why the guard needs a test of its own rather than a caller."
     ;; And an incomplete tree is still incomplete.
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::%taproot-tree (list (cons 1 (funcall h 1)))))))
+
+;;;; --- musig() key aggregation (BIP327/BIP328) -----------------------------
+
+(test musig-aggregation-matches-bip327-vectors
+  "libsecp256k1's own BIP327 key-agg vectors (modules/musig/vectors.h:55).
+
+Both orders are pinned on purpose: BIP327 aggregation is NOT symmetric, so the
+same three keys in a different order are a different aggregate and therefore a
+different ADDRESS. The primitive stays order-sensitive; BIP328's KeySort is
+applied one level up, by the descriptor."
+  (let ((x1 (bitcoin-lisp.crypto:hex-to-bytes
+             "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"))
+        (x2 (bitcoin-lisp.crypto:hex-to-bytes
+             "03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659"))
+        (x3 (bitcoin-lisp.crypto:hex-to-bytes
+             "023590a94e768f8e1815c2f24b4d80a8e3149316c3518ce7b7ad338368d038ca66")))
+    (flet ((agg-xonly (keys)
+             (let ((a (bitcoin-lisp.crypto:musig-aggregate-pubkeys keys)))
+               (and a (bitcoin-lisp.crypto:bytes-to-hex (subseq a 1))))))
+      (is (string= "90539eede565f5d054f32cc0c220126889ed1e5d193baf15aef344fe59d4610c"
+                   (agg-xonly (list x1 x2 x3))))
+      (is (string= "6204de8b083426dc6eaf9502d27024d53fc826bf7d2012148a0575435df54b2b"
+                   (agg-xonly (list x3 x2 x1))))
+      (is (string= "b436e3bad62b8cd409969a224731c193d051162d8c5ae8b109306127da3aa935"
+                   (agg-xonly (list x1 x1 x1))))
+      (is (string= "69bc22bfa5d106306e48a20679de1d7389386124d07571d0d872686028c26a3e"
+                   (agg-xonly (list x1 x1 x2 x2)))))))
+
+(test musig-descriptors-match-core-vectors
+  "Core descriptor_tests.cpp:1160-1161. rawtr() takes the aggregate x-only key
+directly; tr() tweaks it by BIP86's empty merkle root, so the two differ and
+pin both halves.
+
+The string round-trip pins the other half of BIP328: participants PRINT in the
+order written, while aggregation SORTS them. A descriptor that came back
+re-sorted would not round-trip to what its owner typed."
+  (let ((body "musig(KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S,03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659,023590a94e768f8e1815c2f24b4d80a8e3149316c3518ce7b7ad338368d038ca66)")
+        (pub "musig(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9,03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659,023590a94e768f8e1815c2f24b4d80a8e3149316c3518ce7b7ad338368d038ca66)"))
+    (%check-desc (format nil "rawtr(~A)" body) (format nil "rawtr(~A)" pub)
+                 '(("5120789d937bade6673538f3e28d8368dda4d0512f94da44cf477a505716d26a1575")))
+    (%check-desc (format nil "tr(~A)" body) (format nil "tr(~A)" pub)
+                 '(("512079e6c3e628c9bfbce91de6b7fb28e2aec7713d377cf260ab599dcbc40e542312")))))
+
+(test musig-parse-errors-match-core
+  "descriptor.cpp:1964-2044, verbatim."
+  (let ((a "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9")
+        (b "03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659"))
+    ;; Only inside tr()/rawtr().
+    ;; Core prefixes with the function that asked for the key, as it does for
+    ;; every other key-expression error (descriptor_tests.cpp:1260).
+    (%check-unparsable "" (format nil "wsh(pk(musig(~A,~A)))" a b)
+                       "pk(): musig() is only allowed in tr() and rawtr()")
+    (%check-unparsable "" (format nil "pkh(musig(~A,~A))" a b)
+                       "pkh(): musig() is only allowed in tr() and rawtr()")
+    ;; No participants at all.
+    (%check-unparsable "" "tr(musig()/0)" "tr(): musig(): Must contain key expressions")
+    ;; Stray parentheses.
+    ;; descriptor_tests.cpp:1279 verbatim — a fuzz-derived string, which is
+    ;; exactly the kind that reaches this branch.
+    (%check-unparsable
+     "" "tr(musig(tuus(oldepk(gg)ggggfgg)<,z(((((((((((((((((((((st)"
+     "tr(): Too many ')' in musig() expression")
+    ;; Derivation needs xpubs.
+    (%check-unparsable "" (format nil "tr(musig(~A,~A)/0)" a b)
+                       "tr(): musig(): derivation requires all participants to be xpubs or xprvs")))

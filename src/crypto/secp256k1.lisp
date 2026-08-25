@@ -979,3 +979,88 @@ secret, or NIL if SECKEY is invalid."
                                                (%ellswift-bip324-hashfp)
                                                (cffi:null-pointer)))
               output)))))))
+
+;;; --- MuSig2 key aggregation (BIP327) — libsecp256k1 musig module ------------
+;;;
+;;; AGGREGATION ONLY, on purpose. BIP327 splits into a public half (combine n
+;;; pubkeys into one) and a signing half (nonce generation, exchange, partial
+;;; signatures). The public half is deterministic, has no secret state, and is
+;;; all a descriptor needs to produce an address.
+;;;
+;;; ⚠️ The signing half is NOT here and must not be bolted on casually: MuSig2
+;;; nonce reuse across two different messages LEAKS THE PRIVATE KEY outright.
+;;; libsecp guards this by making the secnonce single-use and zeroing it in
+;;; secp256k1_musig_partial_sign, which is a contract any binding has to carry
+;;; through to its callers. That deserves its own review pass.
+
+(defconstant +secp256k1-musig-keyagg-cache-size+ 197
+  "sizeof(secp256k1_musig_keyagg_cache) (secp256k1_musig.h:44). Opaque: the
+library reserves the right to change the layout, so it is only ever handed back
+to libsecp, never inspected here.")
+
+(cffi:defcfun ("secp256k1_musig_pubkey_agg" secp256k1-musig-pubkey-agg) :int
+  (ctx :pointer)
+  (agg-pk :pointer)          ; secp256k1_xonly_pubkey*, may be NULL
+  (keyagg-cache :pointer)
+  (pubkeys :pointer)         ; const secp256k1_pubkey* const*
+  (n-pubkeys :size))
+
+(cffi:defcfun ("secp256k1_musig_pubkey_get" secp256k1-musig-pubkey-get) :int
+  (ctx :pointer)
+  (agg-pk :pointer)          ; secp256k1_pubkey*
+  (keyagg-cache :pointer))
+
+(defun musig-aggregate-pubkeys (pubkeys)
+  "The BIP327 aggregate of PUBKEYS — a list of 33-byte compressed keys — as a
+33-byte compressed key, or NIL if any key is invalid.
+
+Core's MuSig2AggregatePubkeys (musig.cpp:65): pubkey_agg into a keyagg cache,
+then pubkey_get for the PLAIN (not x-only) aggregate. The plain form is what
+Core keeps, because a musig() key expression can still be BIP32-derived from
+before it is finally x-only'd by tr().
+
+⚠️ Order matters, and this function does NOT impose one. BIP327 aggregation is
+not symmetric — each key is weighted by a coefficient derived from the whole
+ordered list — so the same set in a different order is a different aggregate,
+hence a different address. libsecp's own vectors pin both orders separately
+(modules/musig/vectors.h: {0,1,2} and {2,1,0} have different answers).
+
+The ORDERING is BIP328's business, not BIP327's: Core sorts the participants
+before aggregating (descriptor.cpp:648, MuSigPubkeyProvider::GetPubKey), so
+musig() is order-insensitive as a DESCRIPTOR while the primitive underneath
+stays order-sensitive. Sorting here instead would leave the primitive
+untestable against BIP327's vectors."
+  (ensure-secp256k1-loaded)
+  (let ((n (length pubkeys)))
+    (when (zerop n) (return-from musig-aggregate-pubkeys nil))
+    (cffi:with-foreign-objects ((parsed :uint8 (* n +secp256k1-pubkey-size+))
+                                (ptrs :pointer n)
+                                (cache :uint8 +secp256k1-musig-keyagg-cache-size+)
+                                (agg :uint8 +secp256k1-pubkey-size+)
+                                (out :uint8 33)
+                                (outlen :size))
+      ;; Parse each key into its own slot of one block, and build the array of
+      ;; pointers libsecp wants.
+      (loop for key in pubkeys
+            for i from 0
+            for slot = (cffi:inc-pointer parsed (* i +secp256k1-pubkey-size+))
+            do (cffi:with-foreign-object (input :uint8 (length key))
+                 (loop for j from 0 below (length key)
+                       do (setf (cffi:mem-aref input :uint8 j) (aref key j)))
+                 (unless (= 1 (secp256k1-ec-pubkey-parse
+                               *secp256k1-context* slot input (length key)))
+                   (return-from musig-aggregate-pubkeys nil)))
+               (setf (cffi:mem-aref ptrs :pointer i) slot))
+      (unless (= 1 (secp256k1-musig-pubkey-agg
+                    *secp256k1-context* (cffi:null-pointer) cache ptrs n))
+        (return-from musig-aggregate-pubkeys nil))
+      (unless (= 1 (secp256k1-musig-pubkey-get *secp256k1-context* agg cache))
+        (return-from musig-aggregate-pubkeys nil))
+      (setf (cffi:mem-ref outlen :size) 33)
+      (unless (= 1 (secp256k1-ec-pubkey-serialize
+                    *secp256k1-context* out outlen agg +secp256k1-ec-compressed+))
+        (return-from musig-aggregate-pubkeys nil))
+      (let ((result (make-array 33 :element-type '(unsigned-byte 8))))
+        (loop for i from 0 below 33
+              do (setf (aref result i) (cffi:mem-aref out :uint8 i)))
+        result))))

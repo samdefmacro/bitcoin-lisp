@@ -5430,7 +5430,13 @@ REDEEM/WITNESS-SCRIPT are the P2SH/P2WSH sub-scripts to reveal."
   ;; A finished witness stack, for kinds whose satisfaction is not m-of-n and
   ;; so cannot be described by ECDSA + NEEDED: miniscript, where the satisfier
   ;; chooses which branch to take and what to push for it.
-  (stack nil :type list))
+  (stack nil :type list)
+  ;; :P2TR-SCRIPT only. A PSBT cannot store the finished witness above — it has
+  ;; to store the PARTS, so another signer can add its own signature to the same
+  ;; leaf: PSBT_IN_TAP_SCRIPT_SIG keyed by <xonly><leaf hash>, and
+  ;; PSBT_IN_TAP_LEAF_SCRIPT keyed by the control block.
+  (tap-script-sigs nil :type list)   ; list of (xonly leaf-hash sig)
+  (tap-leaf nil))                    ; (script . control-block) of the leaf used
 
 (defun %tap-sig (privkey sighash tap-sighash-type)
   "A BIP341 signature: 64 bytes for SIGHASH_DEFAULT, else 65 with the sighash
@@ -5453,10 +5459,11 @@ its script and its merkle depth and neither dominates.
 
 *current-tx* / *current-spent-utxos* / *current-input-index* must be bound by
 the caller -- the sighash commits to all of them."
-  (let ((best nil) (best-size nil))
-    (dolist (entry leaves best)
+  (let ((best nil) (best-size nil) (best-leaf nil) (best-sigs nil) (signed-by nil))
+    (dolist (entry leaves)
       (destructuring-bind (script leaf-hash control leaf pubkeys) entry
         (progn
+          (setf signed-by nil)
           (let* (;; BIP341 script-path tail: the tapleaf hash, key version 0,
                  ;; and the codeseparator position. Signing always commits to
                  ;; "no codeseparator executed" -- our tapscript leaves contain
@@ -5480,12 +5487,19 @@ the caller -- the sighash commits to all of them."
                                        (gethash (concatenate '(vector (unsigned-byte 8))
                                                              #(3) xonly)
                                                 pubmap))))
-                           (when sk (%tap-sig sk sighash tap-sighash-type)))))))
+                           (when sk
+                             (let ((sig (%tap-sig sk sighash tap-sighash-type)))
+                               (push (list xonly leaf-hash sig) signed-by)
+                               sig)))))))
                 (when satisfaction
                   (let* ((stack (append satisfaction (list script control)))
                          (size (reduce #'+ stack :key #'length)))
                     (when (or (null best-size) (< size best-size))
-                      (setf best stack best-size size))))))))))))
+                      (setf best stack
+                            best-size size
+                            best-leaf (cons script control)
+                            best-sigs (reverse signed-by)))))))))))
+    (values best best-sigs best-leaf)))
 
 (defun %compute-input-signatures (tx i prev keymap pubmap tr-keymap sighash-byte
                                   precomp spent-utxos &optional (tap-sighash-type #x00)
@@ -5607,12 +5621,14 @@ must be bound by the caller."
                                        sighash tap-sighash-type)))
                     (values (%make-input-sig :kind :p2tr :needed 1 :tap sig)))))
                (t
-                (let ((stack (%tr-script-path-witness leaves amount tap-sighash-type
-                                                      pubmap)))
+                (multiple-value-bind (stack leaf-sigs leaf)
+                    (%tr-script-path-witness leaves amount tap-sighash-type pubmap)
                   (unless stack
                     (fail "no satisfiable script path for P2TR"))
                   (values (%make-input-sig :kind :p2tr-script :needed 1
-                                           :stack stack)))))))
+                                           :stack stack
+                                           :tap-script-sigs leaf-sigs
+                                           :tap-leaf leaf)))))))
           ((string= type "scripthash")   ; P2SH (wrapped)
            (cond
              ((null redeem) (fail "P2SH requires redeemScript"))

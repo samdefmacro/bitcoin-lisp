@@ -532,9 +532,23 @@ witness data — see store-block, which persists blocks witness-complete."
                          (serialize block))))
 
 (defun parse-tx-payload (payload)
-  "Parse a tx message payload into a transaction."
+  "Parse a tx message PAYLOAD into a transaction.
+
+⚠️ PAYLOAD must be consumed WHOLE. Core's DecodeTx only accepts a decoding that
+leaves the reader empty (core_io.cpp:180, `if (ssData.empty()) ok_extended =
+true`), so trailing bytes make the transaction undecodable there. Ignoring them
+means sendrawtransaction accepts hex Core rejects, and two nodes disagree about
+whether a message is well formed — over a transaction whose txid does not
+mention the trailing bytes at all.
+
+Found by FUZZ-TRANSACTION-ROUNDTRIPS-WHAT-IT-PARSES: a mutant whose script
+length shrank parsed happily and re-serialized shorter than its input."
   (flexi-streams:with-input-from-sequence (stream payload)
-    (read-transaction stream)))
+    (let ((tx (read-transaction stream)))
+      (unless (= (file-position stream) (length payload))
+        (error "tx payload has ~D trailing byte(s)"
+               (- (length payload) (file-position stream))))
+      tx)))
 
 ;;;; Message parsing
 
