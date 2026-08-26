@@ -1517,6 +1517,7 @@
    #:parse-subnet
    ;; -asmap
    #:load-asmap-file
+   #:asmap-version
    #:asmap-interpret
    #:asmap-asn
    ;; Net permissions (-whitelist / -whitebind)
