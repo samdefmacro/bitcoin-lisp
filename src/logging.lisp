@@ -304,6 +304,33 @@ usage\" (util/log.h:91-113)."
 (defvar *debug-categories* (make-hash-table :test 'equal)
   "Set of currently-enabled debug log categories (category-string -> T).")
 
+(defvar *category-log-levels* (make-hash-table :test 'equal :synchronized t)
+  "category -> the level threshold for that category alone (Core
+-loglevel=<category>:<level>, BCLog::Logger::SetCategoryLogLevel).
+
+Separate from *DEBUG-CATEGORIES*, which is -debug and answers whether this
+category is on at all. This answers how verbose it is, and a category with an
+entry here is emitted at that level whether or not -debug named it — which is
+Core's behaviour and the point of having both options.
+
+SYNCHRONIZED: written once at start-up and by the logging RPC, read from every
+thread that logs.")
+
+(defun category-log-level (category)
+  "CATEGORY's own threshold, or NIL when it has none."
+  (and category (gethash category *category-log-levels*)))
+
+(defun set-category-log-level (category level)
+  "Give CATEGORY its own threshold. Returns NIL for an unknown category, which
+is what makes -loglevel=<bad>:<level> a fatal init error rather than a typo the
+operator never hears about."
+  (when (log-category-known-p category)
+    (setf (gethash category *category-log-levels*) level)
+    t))
+
+(defun clear-category-log-levels ()
+  (clrhash *category-log-levels*))
+
 (defun log-category-known-p (category)
   (and (stringp category) (member category +log-categories+ :test #'string=)))
 
@@ -347,16 +374,28 @@ an operator staring at a log that will never contain what they asked for.
 
 "1", "all" and the empty string (a bare -debug) enable everything; "0" and
 "none" disable everything, and Core lets a later -debug re-enable after them."
-  (dolist (cat include)
-    (cond ((member cat '("" "1" "all") :test #'string=)
-           (dolist (c +log-categories+) (enable-log-category c)))
-          ((member cat '("0" "none") :test #'string=)
-           (dolist (c +log-categories+) (disable-log-category c)))
-          ((enable-log-category cat))
-          (t (error "Unknown logging category in -debug: ~A" cat))))
+  ;; Everything before the LAST -debug=0/none is disregarded entirely, invalid
+  ;; names included (Core SetLoggingCategories, init/common.cpp:82-88: it finds
+  ;; the last negation and processes only the tail from it). Validating the
+  ;; whole list made `-debug=abc -debug=none -debug=net` a fatal error over a
+  ;; category the operator had already cancelled.
+  (let* ((last-negation (position-if (lambda (c)
+                                       (member c '("0" "none") :test #'string=))
+                                     include :from-end t))
+         (effective (if last-negation (nthcdr last-negation include) include)))
+    (dolist (cat effective)
+      (cond ((member cat '("" "1" "all") :test #'string=)
+             (dolist (c +log-categories+) (enable-log-category c)))
+            ((member cat '("0" "none") :test #'string=)
+             (dolist (c +log-categories+) (disable-log-category c)))
+            ((enable-log-category cat))
+            ;; Core's wording verbatim (init/common.cpp:91): feature_logging.py
+            ;; matches it as a FULL regex, so the old "Unknown logging category
+            ;; in -debug: abc" could never match.
+            (t (error "Unsupported logging category -debug=~A." cat)))))
   (dolist (cat exclude)
     (unless (disable-log-category cat)
-      (error "Unknown logging category in -debugexclude: ~A" cat)))
+      (error "Unsupported logging category -debugexclude=~A." cat)))
   (remove-if-not #'log-category-enabled-p +log-categories+))
 
 (defun node-log-category (category format-string &rest args)
@@ -364,8 +403,14 @@ an operator staring at a log that will never contain what they asked for.
 global level already includes :debug. Never rate-limited — Core's
 detail_LogIfCategoryAndLevelEnabled asserts should_ratelimit is false for every
 level it is reached at (util/log.h:104-111)."
-  (when (or (log-category-enabled-p category)
-            (>= (log-level-value :debug) (log-level-value *current-log-level*)))
+  (when (let ((threshold (category-log-level category)))
+          (if threshold
+              ;; A category with its own threshold is judged only by it — Core
+              ;; consults the category level and never falls back to the global
+              ;; one for that category (LogAcceptCategory).
+              (>= (log-level-value :debug) (log-level-value threshold))
+              (or (log-category-enabled-p category)
+                  (>= (log-level-value :debug) (log-level-value *current-log-level*)))))
     ;; The category reaches the line now. Core tags a categorized debug line
     ;; with the category alone — `[net] ` — and dropping it here meant every
     ;; log-cat line was indistinguishable from any other debug line, which is

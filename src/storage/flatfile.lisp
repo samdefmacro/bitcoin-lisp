@@ -142,40 +142,59 @@ vector, which is the only thing SAFETY 0 would otherwise have cost us."
 (defun zero-obfuscation-key ()
   (make-array +obfuscation-key-size+ :element-type '(unsigned-byte 8) :initial-element 0))
 
-(defun read-or-create-xor-key (dir &key (create t))
-  "The blocksdir's obfuscation key (Core InitBlocksdirXorKey,
-blockstorage.cpp:1167-1222).
+(defun %blocksdir-first-run-p (dir)
+  "T when DIR holds no block data of either form.
 
-A pre-existing file always wins, so a directory written with one key keeps it.
-A key is generated only for a FRESH blocksdir — one with no block files in it —
-because turning obfuscation on for a directory that already holds plaintext
-data would make every existing byte unreadable. When CREATE is false, or the
-directory already holds data, the all-zero (inactive) key is returned."
+Core's test is \"the blocksdir contains only hidden files\", with a comment
+saying a fully-empty check would be too aggressive because a .lock may already
+be there (blockstorage.cpp:1173-1183). The files that are not hidden and not
+block data are exactly the ones we also create — so naming the block data
+directly says the same thing and does not depend on how SBCL's DIRECTORY treats
+dotfiles."
+  (and (null (directory (merge-pathnames "blk*.dat" dir)))
+       (null (directory (merge-pathnames "rev*.dat" dir)))
+       (null (directory (merge-pathnames "*.blk" dir)))))
+
+(defun %write-xor-key (path key)
+  "Write KEY to PATH durably and return it."
+  (ensure-directories-exist path)
+  (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
+                          :if-exists :error :if-does-not-exist :create)
+    (write-sequence key s))
+  (fsync-file path)
+  key)
+
+(defun read-or-create-xor-key (dir &key (use-xor t))
+  "The blocksdir's obfuscation key (Core InitBlocksdirXorKey,
+blockstorage.cpp:1167-1222). Core's shape exactly:
+
+- A RANDOM key only when USE-XOR and this is the first run — a directory that
+  already holds block data must not acquire one, or every byte already in it
+  becomes unreadable.
+- A PRE-EXISTING xor.dat always wins, whatever USE-XOR now says: a directory
+  written with a key has to keep being read with it.
+- Otherwise the file is CREATED, holding whatever key was chosen — all zeros
+  when obfuscation is off or this is not a first run. Core creates it
+  unconditionally when it is missing, and feature_blocksxor.py checks exactly
+  that: delete xor.dat, restart with -blocksxor=0, and the file must come back
+  holding the null key.
+
+Returns the key. The caller decides what a stored NON-ZERO key means when
+USE-XOR is off — that is a fatal init error, and it needs the path to say so."
   (let ((path (merge-pathnames "xor.dat" dir)))
-    (cond
-      ((probe-file path)
-       (let ((key (make-array +obfuscation-key-size+ :element-type '(unsigned-byte 8))))
-         (with-open-file (s path :element-type '(unsigned-byte 8))
-           (unless (= +obfuscation-key-size+ (read-sequence key s))
-             (error "xor.dat must be exactly ~D bytes" +obfuscation-key-size+))
-           ;; Core rejects a longer file too: the key is fixed-size.
-           (when (read-byte s nil nil)
-             (error "xor.dat must be exactly ~D bytes" +obfuscation-key-size+)))
-         key))
-      ;; "Fresh" means no FLAT data yet, which is what the key applies to.
-      ;; Legacy per-block .blk files in the same directory are read without the
-      ;; obfuscation layer, so their presence neither needs nor forbids a key —
-      ;; but an existing blk?????.dat written without one must never acquire
-      ;; one, or every record already in it becomes unreadable.
-      ((and create (null (directory (merge-pathnames "blk*.dat" dir))))
-       (ensure-directories-exist dir)
-       (let ((key (make-obfuscation-key)))
-         (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
-                                 :if-exists :error :if-does-not-exist :create)
-           (write-sequence key s))
-         (fsync-file path)
-         key))
-      (t (zero-obfuscation-key)))))
+    (if (probe-file path)
+        (let ((key (make-array +obfuscation-key-size+ :element-type '(unsigned-byte 8))))
+          (with-open-file (s path :element-type '(unsigned-byte 8))
+            (unless (= +obfuscation-key-size+ (read-sequence key s))
+              (error "xor.dat must be exactly ~D bytes" +obfuscation-key-size+))
+            ;; Core rejects a longer file too: the key is fixed-size.
+            (when (read-byte s nil nil)
+              (error "xor.dat must be exactly ~D bytes" +obfuscation-key-size+)))
+          key)
+        (%write-xor-key path
+                        (if (and use-xor (%blocksdir-first-run-p dir))
+                            (make-obfuscation-key)
+                            (zero-obfuscation-key))))))
 
 ;;;; --- FlatFileSeq --------------------------------------------------------
 

@@ -43,6 +43,20 @@ if [ ! -e "$REPO/refs/coalton" ]; then
   exit 1
 fi
 
+# The daemon, before anything that needs it. Without this check the first
+# failing call is `docker image ls` inside a command substitution, whose
+# non-zero status `set -e` does NOT propagate — so an unreachable daemon
+# announced itself as "Image not found — building (one-time, ~20-30 min)",
+# which is a confusing thing to read when the real problem is that Docker is
+# not running.
+if ! docker info >/dev/null 2>&1; then
+  echo "ERROR: the Docker daemon is not reachable." >&2
+  echo "       Every build, test and eval in this project runs inside the" >&2
+  echo "       pinned container; there is no host fallback. Start Docker" >&2
+  echo "       Desktop and re-run." >&2
+  exit 1
+fi
+
 # `docker image inspect NAME` fails to resolve short names on some
 # containerd-store daemons even when the image exists; `image ls -q` does.
 if [ -z "$(docker image ls -q "$IMAGE")" ]; then

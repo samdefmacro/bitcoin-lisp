@@ -115,14 +115,62 @@ unreadable, which is why the second case here matters more than the first."
       (is (probe-file (merge-pathnames "xor.dat" dir)))
       ;; Second call returns the same key, not a new one.
       (is (equalp key (bitcoin-lisp.storage:read-or-create-xor-key dir)))))
-  ;; A directory that already holds block data gets the inactive key.
+  ;; A directory that already holds block data gets the INACTIVE key — and the
+  ;; file is still written. Core creates xor.dat whenever it is missing,
+  ;; whatever key it chose (blockstorage.cpp:1195-1206); its presence holding
+  ;; zeros is what records that obfuscation was considered and declined here.
   (%with-flat-dir (dir)
     (with-open-file (s (merge-pathnames "blk00000.dat" dir)
                        :direction :output :element-type '(unsigned-byte 8))
       (write-sequence (%ff-bytes 1 2 3) s))
     (let ((key (bitcoin-lisp.storage:read-or-create-xor-key dir)))
       (is-false (bitcoin-lisp.storage:obfuscation-key-active-p key))
-      (is-false (probe-file (merge-pathnames "xor.dat" dir))))))
+      (is-true (probe-file (merge-pathnames "xor.dat" dir))))))
+
+(test a-blocksdir-that-already-holds-blocks-is-not-a-first-run
+  "Core's first-run test is \"the blocksdir holds only hidden files\"
+(blockstorage.cpp:1173-1183), so a directory that already has block data — in
+EITHER form — gets the null key rather than a random one. Reaching this state
+means an older node wrote blocks before xor.dat existed; generating a key now
+would make every one of them unreadable."
+  (dolist (name '("blk00000.dat" "rev00000.dat"
+                  "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff.blk"))
+    (%with-flat-dir (dir)
+      (with-open-file (s (merge-pathnames name dir)
+                         :direction :output :element-type '(unsigned-byte 8))
+        (write-sequence (%ff-bytes 1 2 3) s))
+      (let ((key (bitcoin-lisp.storage:read-or-create-xor-key dir)))
+        (is-false (bitcoin-lisp.storage:obfuscation-key-active-p key)
+                  "~A in the blocksdir must prevent a random key" name)
+        (is-true (probe-file (merge-pathnames "xor.dat" dir))
+                 "the null key is still written to disk"))))
+  ;; And a genuinely fresh one does get a random key.
+  (%with-flat-dir (dir)
+    (is-true (bitcoin-lisp.storage:obfuscation-key-active-p
+              (bitcoin-lisp.storage:read-or-create-xor-key dir)))))
+
+(test blocksxor-zero-over-a-stored-random-key-is-refused
+  "Core refuses rather than honouring -blocksxor=0 on a blocksdir that already
+has a random key (blockstorage.cpp:1213-1219): reading those files without the
+key returns garbage, and a node that started anyway would conclude its whole
+block store was corrupt. Now that a fresh datadir gets a key by default, this
+is the ordinary way an operator meets it."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+            (store (bitcoin-lisp.storage:init-block-store dir)))
+       (is-true (bitcoin-lisp.storage:obfuscation-key-active-p
+                 (bitcoin-lisp.storage::block-store-xor-key store))))
+     (let ((bitcoin-lisp.storage:*blocks-xor* nil))
+       (signals error (bitcoin-lisp.storage:init-block-store dir)))
+     ;; With the key gone it is allowed again, and the null key is recorded —
+     ;; which is exactly what feature_blocksxor.py deletes and then checks for.
+     (delete-file (merge-pathnames "blocks/xor.dat" dir))
+     (let* ((bitcoin-lisp.storage:*blocks-xor* nil)
+            (store (bitcoin-lisp.storage:init-block-store dir)))
+       (is-false (bitcoin-lisp.storage:obfuscation-key-active-p
+                  (bitcoin-lisp.storage::block-store-xor-key store)))
+       (is-true (probe-file (merge-pathnames "blocks/xor.dat" dir)))))))
 
 (test a-wrong-sized-xor-key-is-refused
   "Reading a truncated key and padding it would silently decrypt every block
@@ -426,14 +474,21 @@ every record already in it becomes unreadable."
          (setf first-hash (bitcoin-lisp.storage:store-block store (%ff-test-block 130)))
          (let ((raw (%ff-read-file (merge-pathnames "blocks/blk00000.dat" dir))))
            (is (equalp (bitcoin-lisp:network-magic :mainnet) (subseq raw 0 4)))))
-       ;; Reopening must NOT generate a key, or the record above is lost.
+       ;; Reopening must not generate an ACTIVE key, or the record above is
+       ;; lost. Core does write the file — holding zeros — which changes
+       ;; nothing about how the existing record reads.
        (let* ((bitcoin-lisp.storage:*flat-block-files* t)
               (store (bitcoin-lisp.storage:init-block-store dir)))
-         (is-false (probe-file (merge-pathnames "blocks/xor.dat" dir)))
+         (is-false (bitcoin-lisp.storage:obfuscation-key-active-p
+                    (bitcoin-lisp.storage::block-store-xor-key store)))
          (is-true (bitcoin-lisp.storage:get-block store first-hash)
                   "the unobfuscated record must still be readable"))))
-   ;; Legacy per-block files do not block a key: they are read without the
-   ;; obfuscation layer, so new flat records can still be obfuscated.
+   ;; Legacy and flat records coexisting under one key. The key here is the
+   ;; RANDOM one: the directory was empty when the store first opened, so that
+   ;; start was a first run and Core would have generated one too — the key is
+   ;; chosen before any block exists, not after. What matters is that adding
+   ;; flat records later does not disturb the legacy file, and that both forms
+   ;; still read back.
    (%with-flat-dir (dir)
      (let (legacy)
        (let* ((bitcoin-lisp.storage:*flat-block-files* nil)
@@ -442,7 +497,7 @@ every record already in it becomes unreadable."
        (let* ((bitcoin-lisp.storage:*flat-block-files* t)
               (store (bitcoin-lisp.storage:init-block-store dir))
               (flat (bitcoin-lisp.storage:store-block store (%ff-test-block 140))))
-         (is (probe-file (merge-pathnames "blocks/xor.dat" dir)))
+         (is-true (probe-file (merge-pathnames "blocks/xor.dat" dir)))
          (is-true (bitcoin-lisp.storage:get-block store legacy))
          (is-true (bitcoin-lisp.storage:get-block store flat)))))))
 

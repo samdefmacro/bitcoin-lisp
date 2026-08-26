@@ -1650,6 +1650,12 @@
    #:unknown-config-file-keys
    #:known-config-option-p
    #:defer-log
+   #:*category-log-levels*
+   #:category-log-level
+   #:set-category-log-level
+   #:clear-category-log-levels
+   #:log-categories-string
+   #:parse-loglevel-spec
    #:flush-deferred-log-lines
    #:*deferred-log-lines*
    #:parse-settings-json
