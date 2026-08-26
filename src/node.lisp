@@ -3794,14 +3794,25 @@ to move them (the node must be stopped)."
                (error () nil)))
            :name "bitcoin-sync-thread")))
 
-  ;; ⚠️ Logged at STARTUP, which is Core's placement: the line goes where the
-  ;; DNS thread is started, or declined (net.cpp:3524-3525). It first sat in
-  ;; CONNECT-TO-PEERS behind a "do we want more addresses" test, so a node with
-  ;; a full address book — or one that never got that far, which is every node
-  ;; the test framework starts with -connect — stayed silent about -dnsseed=0.
-  ;; p2p_dns_seeds.py greps the log for it.
-  (unless *dns-seed-enabled*
-    (log-info "DNS seeding disabled (-dnsseed=0)"))
+  ;; DNS seeding, at Core's place in the sequence: ThreadDNSAddressSeed is
+  ;; started (or declined) here, with connman, and is INDEPENDENT of -connect
+  ;; (net.cpp:3520-3527). Ours used to live inside CONNECT-TO-PEERS, behind a
+  ;; "do we want more addresses" test, which had two consequences:
+  ;;
+  ;;   - the `disabled' line never reached a node that had enough addresses,
+  ;;     or one that never got that far — which is every node the test
+  ;;     framework starts, since it passes -connect;
+  ;;   - a node running -connect WITH an explicit -dnsseed=1 never queried the
+  ;;     seeds at all, because under -connect that path only dials the
+  ;;     configured peers.
+  ;;
+  ;; The soft-set rule already makes -dnsseed=0 the default under -connect
+  ;; (config.lisp), so the only nodes this reaches are the ones that asked.
+  ;; Results go into the ADDRESS BOOK, which is what Core's thread does — not
+  ;; into one dial's candidate list, which is what the old placement did.
+  (if *dns-seed-enabled*
+      (%seed-address-book-from-dns *node*)
+      (log-info "DNS seeding disabled (-dnsseed=0)"))
 
   ;; Inbound listening (depends on the sync thread to merge accepted peers).
   (when (and sync listen)
@@ -5317,6 +5328,41 @@ not penalise addresses that work."
            (bitcoin-lisp.networking:address-book-attempt
             address-book ip-bytes port :count-failure t :net net)))))))
 
+(defun %seed-address-book-from-dns (node)
+  "Query the DNS seeds and put what they return into the address book, the way
+Core's ThreadDNSAddressSeed does (net.cpp:2340-2360).
+
+Runs in its own thread so start-up is not blocked on DNS, which is also why
+Core makes it a thread. Failures are logged and dropped: a node that cannot
+reach a seed still has its address book, its -connect peers and its fixed
+seeds."
+  (let ((book (node-address-book node))
+        ;; PEER-ADDRESS's PORT slot is an (unsigned-byte 16); a DNS seed
+        ;; answers with bare addresses, so they take the network's default
+        ;; port, exactly as Core's ThreadDNSAddressSeed does.
+        (port (network-port (node-network node))))
+    (when book
+      (bt:make-thread
+       (lambda ()
+         (handler-case
+             (let ((added 0))
+               (dolist (addr (bitcoin-lisp.networking:discover-peers))
+                 (multiple-value-bind (net ip-bytes)
+                     (bitcoin-lisp.networking:parse-network-address addr)
+                   (when (and net
+                              (not (bitcoin-lisp.networking:address-book-lookup
+                                    book ip-bytes port net)))
+                     (when (bitcoin-lisp.networking:address-book-add
+                            book
+                            (bitcoin-lisp.networking:make-peer-address
+                             :net net :ip ip-bytes :port port :services 0
+                             :last-seen (bitcoin-lisp.serialization:get-unix-time)))
+                       (incf added)))))
+               (log-info "DNS seeds contributed ~D new address~:P" added))
+           (error (e)
+             (log-warn "DNS seeding failed: ~A" e))))
+       :name "bitcoin-dnsseed-thread"))))
+
 (defun %record-outbound-result (address-book addr port peer success)
   "Record an outbound dial outcome for ADDR:PORT in ADDRESS-BOOK, adding the
 entry if new (network-typed, so IPv6/onion/cjdns peers get addrman credit
@@ -5392,14 +5438,16 @@ Returns the number of peers connected."
                   (setf (gethash str seen) t)
                   (push (cons str (and (plusp port) port)) picks))))))
         (setf addresses (nreverse picks))))
-    ;; Fall back to DNS seeds if not enough candidates (-dnsseed=0 forbids
-    ;; the query entirely, Core DEFAULT_DNSSEED/ThreadDNSAddressSeed).
-    ;; -forcednsseed queries them regardless of how full the address book is
-    ;; (Core DEFAULT_FORCEDNSSEED, net.h:97 — "Always query for peer addresses
-    ;; via DNS lookup"); it does NOT override -dnsseed=0, which is the same
-    ;; precedence Core's ThreadDNSAddressSeed has.
-    (let ((want-dns (or *force-dns-seed* (< (length addresses) 8))))
-    (when (and want-dns *dns-seed-enabled*)
+    ;; ⚠️ The DNS query used to live HERE, gated on "not enough candidates". It
+    ;; is now a start-up step that feeds the ADDRESS BOOK
+    ;; (%SEED-ADDRESS-BOOK-FROM-DNS), which is Core's shape: ThreadDNSAddressSeed
+    ;; runs with connman and is independent of how any one dial is going.
+    ;;
+    ;; -forcednsseed still belongs here, because it means "query even though the
+    ;; address book looks full" — a statement about this decision, not about
+    ;; start-up (Core DEFAULT_FORCEDNSSEED, net.h:97). It does NOT override
+    ;; -dnsseed=0, the same precedence Core's thread has.
+    (when (and *force-dns-seed* *dns-seed-enabled*)
       (log-info "Discovering peers from DNS seeds...")
       (let* ((dns-addrs (bitcoin-lisp.networking:discover-peers))
              (usable (%reachable-seed-addresses dns-addrs)))
@@ -5408,7 +5456,7 @@ Returns the number of peers connected."
                   (and (/= (length usable) (length dns-addrs)) (length usable)))
         (setf addresses (append addresses
                                 (mapcar (lambda (a) (cons a nil)) usable)))
-        (setf addresses (remove-duplicates addresses :key #'car :test #'string=)))))
+        (setf addresses (remove-duplicates addresses :key #'car :test #'string=))))
 
     ;; Fixed-seed fallback for testnet4: even after DNS, the candidate pool
     ;; may have only one /16 group (sprovoost.nl seed has been dark since
