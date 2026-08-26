@@ -76,6 +76,7 @@ else
            --tmpdir=/workspace/$OUT/$name; \
          rc=\$?; \
          if [ \$rc = 0 ]; then echo 'RESULT $name PASS'; \
+         elif [ \$rc = 77 ]; then echo 'RESULT $name SKIP'; \
          elif [ \$rc = 124 ] || [ \$rc = 137 ]; then echo 'RESULT $name TIMEOUT'; \
          else echo \"RESULT $name FAIL(\$rc)\"; fi;"
   done
