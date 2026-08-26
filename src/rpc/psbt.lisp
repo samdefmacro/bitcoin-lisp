@@ -109,7 +109,13 @@ when locktime>0, else 0xffffffff."
 (defun rpc-createpsbt (node params)
   "Create a PSBT with no inputs/outputs metadata (Creator role).
 PARAMS: (inputs outputs [locktime] [replaceable]). Mirrors Core createpsbt."
-  (let ((tx (%psbt-build-unsigned-tx (first params) (second params)
+  ;; ⚠️ %POSITIONAL-ARRAY, not (first params): an empty JSON array arrives as
+  ;; the +json-empty-array+ SENTINEL, not as NIL, so that a handler can tell
+  ;; `[]' from a missing argument (server.lisp:349). Passing the sentinel on
+  ;; reaches code expecting a LIST and surfaces as RPC -32603 Internal error —
+  ;; which is what `createpsbt([], {...})' did, and rpc_psbt.py opens with it.
+  (let ((tx (%psbt-build-unsigned-tx (%positional-array (first params))
+                                     (second params)
                                      (or (third params) 0)
                                      (%positional-bool-or (fourth params) t)
                                      (rpc-get-network node))))
@@ -1617,7 +1623,9 @@ array-of-objects form when output order matters."
                         (and (%opt options "replaceable") t)
                         *wallet-signal-rbf*))
                (locktime (or (nth 2 params) 0))
-               (inputs (%parse-rpc-inputs (or (first params) '())))
+               ;; Same sentinel: walletcreatefundedpsbt([], ...) is the very
+               ;; first call rpc_psbt.py makes.
+               (inputs (%parse-rpc-inputs (or (%positional-array (first params)) '())))
                (bip32derivs (%positional-bool-or (nth 4 params) t))
                (cc (make-wcc :version version)))
           (unless (and (integerp locktime) (<= 0 locktime #xffffffff))

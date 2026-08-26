@@ -531,3 +531,30 @@ reader that ignores it files every script-path nonce under the key path."
           (is (string= (bitcoin-lisp.crypto:bytes-to-hex leaf-hash)
                        (cdr (assoc "leaf_hash" sg :test #'string=)))
               "the script-path partial sig lost its leaf hash"))))))
+
+(test empty-input-array-reaches-psbt-creators-as-nil
+  "An empty JSON array arrives as the +JSON-EMPTY-ARRAY+ SENTINEL, not as NIL,
+so a handler can tell `[]' from a missing argument (server.lisp:349). Passing
+the sentinel through reaches code that expects a LIST and surfaces as RPC
+-32603 Internal error.
+
+`createpsbt([], {...})' and `walletcreatefundedpsbt([], {...})' both did that,
+and the latter is the FIRST call rpc_psbt.py makes — so the sentinel took the
+whole test out before it asserted anything."
+  (let* ((addr "bcrt1qs758ursh4q9z627kt3pp5yysm78ddny6txaqgw")
+         (outputs (%ht addr 1)))
+    ;; The sentinel must behave exactly like an omitted/empty input list.
+    (let ((with-sentinel
+            (handler-case
+                (bitcoin-lisp.rpc::rpc-createpsbt
+                 (make-test-node)
+                 (list bitcoin-lisp.rpc::+json-empty-array+ outputs))
+              (error (e) (format nil "ERR: ~A" e))))
+          (with-nil
+            (handler-case
+                (bitcoin-lisp.rpc::rpc-createpsbt (make-test-node) (list nil outputs))
+              (error (e) (format nil "ERR: ~A" e)))))
+      (is-true (stringp with-sentinel)
+               "createpsbt([]) raised instead of building: ~A" with-sentinel)
+      (is (equal with-nil with-sentinel)
+          "createpsbt([]) and createpsbt(null) disagree"))))
