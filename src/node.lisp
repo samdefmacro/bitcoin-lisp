@@ -3794,6 +3794,15 @@ to move them (the node must be stopped)."
                (error () nil)))
            :name "bitcoin-sync-thread")))
 
+  ;; ⚠️ Logged at STARTUP, which is Core's placement: the line goes where the
+  ;; DNS thread is started, or declined (net.cpp:3524-3525). It first sat in
+  ;; CONNECT-TO-PEERS behind a "do we want more addresses" test, so a node with
+  ;; a full address book — or one that never got that far, which is every node
+  ;; the test framework starts with -connect — stayed silent about -dnsseed=0.
+  ;; p2p_dns_seeds.py greps the log for it.
+  (unless *dns-seed-enabled*
+    (log-info "DNS seeding disabled (-dnsseed=0)"))
+
   ;; Inbound listening (depends on the sync thread to merge accepted peers).
   (when (and sync listen)
     (start-inbound-listener *node* listen-bind))
@@ -5390,8 +5399,6 @@ Returns the number of peers connected."
     ;; via DNS lookup"); it does NOT override -dnsseed=0, which is the same
     ;; precedence Core's ThreadDNSAddressSeed has.
     (let ((want-dns (or *force-dns-seed* (< (length addresses) 8))))
-    (when (and want-dns (not *dns-seed-enabled*))
-      (log-info "DNS seeding disabled (-dnsseed=0)"))
     (when (and want-dns *dns-seed-enabled*)
       (log-info "Discovering peers from DNS seeds...")
       (let* ((dns-addrs (bitcoin-lisp.networking:discover-peers))

@@ -360,6 +360,10 @@ Returns NIL if the host is banned or discouraged (never dial either)."
                              :address host
                              :connect-time (get-internal-real-time))))
         (init-peer-rate-limiters peer)
+        ;; Core logs this on every CNode it constructs, outbound and inbound
+        ;; alike (net.cpp:4005-4007), and p2p_add_connections.py greps for it.
+        (bitcoin-lisp:log-cat "net" "Added connection to ~A peer=~A"
+                              host (peer-id peer))
         peer))))
 
 (defun peer-live-p (peer)
@@ -1293,6 +1297,8 @@ on the local onion-service listener (Tor forwarding), whose true network is
                          :inbound-onion (and inbound-onion t)
                          :connect-time (get-internal-real-time))))
     (init-peer-rate-limiters peer)
+    ;; Core's inbound branch has no address in the line (net.cpp:4009).
+    (bitcoin-lisp:log-cat "net" "Added connection peer=~A" (peer-id peer))
     peer))
 
 ;;; --- BIP133 feefilter (Core MaybeSendFeefilter + FeeFilterRounder) ---
@@ -1834,6 +1840,14 @@ a failed dump only logs (Core LogError in DumpBanlist)."
   "Load the manual ban list from PATH (Core BanMan ctor LoadBanlist),
 dropping already-expired entries (Core SweepBanned). Returns the number of
 active bans loaded; NIL when the file is absent/unreadable."
+  ;; Core logs "Recreating the banlist database" whenever CBanDB::Read fails
+  ;; (banman.cpp:41), and an ABSENT file is one of those failures — a fresh
+  ;; datadir has no banlist.json. Returning NIL silently was the gap:
+  ;; p2p_disconnect_ban.py greps for the line on a node that has never banned
+  ;; anyone.
+  (unless (and path (probe-file path))
+    (bitcoin-lisp:log-info "Recreating the banlist database")
+    (return-from load-banlist nil))
   (when (and path (probe-file path))
     (handler-case
         (let* ((json (with-open-file (in path) (yason:parse in)))
@@ -1852,6 +1866,11 @@ active bans loaded; NIL when the file is absent/unreadable."
                         (incf count))))))))
           count)
       (error (e)
+        ;; Core logs this exact line and starts from an empty list rather than
+        ;; failing (banman.cpp:42). p2p_disconnect_ban.py greps for it, which is
+        ;; the whole point of matching the wording: Core's own tests are the
+        ;; behavioural oracle, and they read the log.
+        (bitcoin-lisp:log-info "Recreating the banlist database")
         (bitcoin-lisp:log-warn "Could not read banlist ~A: ~A" path e)
         nil))))
 
