@@ -133,6 +133,17 @@ FEE-ESTIMATOR is optional; when provided, fee stats are recorded for blocks.
 ADDRESS-BOOK is optional; when provided, addr messages update the peer database.
 RECENT-REJECTS is optional; when provided, recently rejected txs are cached.
 Returns T if message was handled, NIL otherwise."
+  ;; Core logs EVERY inbound message here, before dispatch
+  ;; (net_processing.cpp:3582). It is not a debugging nicety: several functional
+  ;; tests assert on the exact line — p2p_addr_relay.py waits for
+  ;; "received: addr (301 bytes) peer=1" to know the message was taken in at all,
+  ;; because the observable effect it is really testing (relay to two peers)
+  ;; happens later and asynchronously.
+  ;;
+  ;; The BYTE COUNT is the payload's, not the framed message's, matching
+  ;; vRecv.size() at that point.
+  (bitcoin-lisp:log-cat "net" "received: ~A (~D bytes) peer=~A"
+                        command (length payload) (peer-id peer))
   ;; Check per-peer rate limit before processing
   (unless (check-peer-rate-limit peer command)
     (bitcoin-lisp:log-warn "Rate limit exceeded for peer ~A on ~A messages"
