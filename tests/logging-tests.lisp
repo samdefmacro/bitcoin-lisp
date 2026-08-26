@@ -155,3 +155,61 @@ assumed to accept the volume."
                                               :initial-element #\z)))))
       (is (null (search "Excessive logging detected" (get-output-stream-string file)))))
     (is (zerop (hash-table-count bitcoin-lisp::*log-rate-locations*)))))
+
+;;;; --- Core's [category:level] prefix (BCLog::LogPrefix) ---
+
+(test log-prefix-matches-core-for-every-shape
+  "Core's LogPrefix (logging.cpp:343-367) decides the tag on every log line,
+and the functional tests match on the rendered result — feature_config_args.py
+looks for the literal '[warning] Parsed potentially confusing double-negative'.
+
+The uncategorized-INFO case is the one that changes most lines: Core prints NO
+tag there, where this used to print `INFO: `."
+  (flet ((p (cat level) (bitcoin-lisp::log-category-level-prefix cat level)))
+    (is (string= "" (p nil :info))
+        "an uncategorized info line carries no tag in Core")
+    (is (string= "[warning] " (p nil :warn)))
+    (is (string= "[error] " (p nil :error)))
+    (is (string= "[debug] " (p nil :debug)))
+    ;; A category implies debug, so Core prints the category alone.
+    (is (string= "[net] " (p "net" :debug)))
+    (is (string= "[net:warning] " (p "net" :warn)))
+    (is (string= "[net:error] " (p "net" :error)))
+    ;; "all" is Core's LogFlags::ALL, which is the no-category case.
+    (is (string= "" (p "all" :info)))
+    (is (string= "[warning] " (p "all" :warn)))))
+
+(test log-level-names-are-cores-spelling
+  ":WARN prints as \"warning\". Core's LogLevelToStr has no \"warn\", and a
+test matching Core's word would never fire on ours."
+  (is (string= "warning" (bitcoin-lisp::log-level-name :warn)))
+  (is (string= "error" (bitcoin-lisp::log-level-name :error)))
+  (is (string= "info" (bitcoin-lisp::log-level-name :info)))
+  (is (string= "debug" (bitcoin-lisp::log-level-name :debug)))
+  (is (string= "trace" (bitcoin-lisp::log-level-name :trace))))
+
+(test log-entry-renders-the-prefix
+  "The whole line, not just the prefix helper: a warning must contain Core's
+tag immediately before the message, and an info line must have no tag between
+the timestamp and the message."
+  (let ((warn (bitcoin-lisp::format-log-entry :warn "hello ~A" '("world")))
+        (info (bitcoin-lisp::format-log-entry :info "hello ~A" '("world")))
+        (net (bitcoin-lisp::format-log-entry :debug "hello ~A" '("world") "net")))
+    (is-true (search "[warning] hello world" warn))
+    (is-true (search "] hello world" info))
+    (is-false (search "[warning]" info))
+    (is-false (search "INFO:" info))
+    (is-true (search "[net] hello world" net))))
+
+(test log-cat-tags-the-line-with-its-category
+  "log-cat's category used to be consulted for the enabled/disabled decision
+and then DROPPED, so every categorized line came out as an untagged debug line
+— there was no way to tell from the log which subsystem wrote it."
+  (let ((bitcoin-lisp::*current-log-level* :debug)
+        (bitcoin-lisp::*log-file-stream* nil))
+    (bitcoin-lisp:log-cat "net" "a categorized line")
+    (let ((entry (find-if (lambda (e) (and e (search "a categorized line" e)))
+                          bitcoin-lisp::*log-buffer*)))
+      (is-true entry "the line reached the buffer")
+      (when entry
+        (is-true (search "[net] a categorized line" entry))))))

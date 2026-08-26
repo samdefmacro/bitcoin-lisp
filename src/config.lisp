@@ -684,7 +684,10 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
 (defparameter *repeatable-config-options*
   '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip" "bind"
     "testactivationheight" "debug" "debugexclude" "shutdownnotify"
-    "startupnotify" "connect" "seednode" "whitelist" "whitebind")
+    "startupnotify" "connect" "seednode" "whitelist" "whitebind"
+    ;; Core reads both with GetArgs: every -loadblock= is imported in order,
+    ;; and every -wallet=<name> is loaded.
+    "loadblock" "wallet")
   "Option names whose every occurrence is meaningful (Core GetArgs
 list-options); all other repeated command-line options collapse to their
 LAST occurrence (Core GetArg on the command line takes span.end()[-1],
@@ -973,7 +976,12 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ("webui"             :webui              :bool)
     ("webuipath"         :webui-path         :string)
     ("webuiopen"         :webui-open         :bool)
-    ("wallet"            :wallet             :bool)
+    ;; -wallet is deliberately NOT a :bool row. It is Core's list of wallets to
+    ;; LOAD (read with GetArgs, wallet/load.cpp:81), collected into
+    ;; :WALLET-NAMES below; the subsystem switch is -disablewallet. As a :bool
+    ;; row, `-nowallet` — which Core defines as "load no wallets" — turned the
+    ;; whole wallet RPC surface off, and wallet_multiwallet.py starts a node
+    ;; with exactly that and then calls wallet RPCs on it.
     ;; Core's -disablewallet is the negation of our -wallet; it is inverted
     ;; where the plist is assembled, since the spec scan has no notion of a
     ;; flag that means the opposite of its key.
@@ -1012,7 +1020,7 @@ specially in config-alist->start-node-plist.")
   '(;; network selection + entry-point specials
     "regtest" "signet" "testnet4" "testnet" "chain" "server" "debug" "conf"
     "includeconf"
-    "datadir" "settings"
+    "datadir" "settings" "loadblock" "wallet"
     ;; apply-config-globals options
     "datacarrier" "datacarriersize" "permitbaremultisig"
     "limitclustercount" "limitclustersize" "signetchallenge"
@@ -1060,7 +1068,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "discover" "dns"
     "help" "i2pacceptincoming" "i2psam"
     "ipcbind" "limitancestorcount" "limitancestorsize"
-    "limitdescendantcount" "limitdescendantsize" "loadblock" "logips"
+    "limitdescendantcount" "limitdescendantsize" "logips"
     "loglevelalways" "logsourcelocations"
     "logtimestamps" "maxreceivebuffer"
 
@@ -1523,6 +1531,13 @@ resolved network. Honors -server (enable RPC on the default port when no
                         ;; -seednode: Core reads it with GetArgs into
                         ;; connOptions.vSeedNodes (init.cpp:2212).
                         ("seednode"       . :seednode)
+                        ;; -loadblock: every file is imported, in the order
+                        ;; given (init.cpp:2022, ImportBlocks).
+                        ("loadblock"      . :load-block)
+                        ;; -wallet=<name>: every name is loaded at startup,
+                        ;; alongside the ones settings.json records
+                        ;; (wallet/load.cpp:81, chain.getSettingsList).
+                        ("wallet"         . :wallet-names)
                         ;; -whitelist / -whitebind: Core reads both with
                         ;; GetArgs (init.cpp), so every occurrence counts.
                         ("whitelist"      . :whitelist)
@@ -1539,6 +1554,20 @@ resolved network. Honors -server (enable RPC on the default port when no
         (remf plist :disable-wallet)
         (when (and disable (not (lookup "wallet")))
           (setf (getf plist :wallet) nil)))
+      ;; -wallet carries two things at once. The NAMES to load are Core's
+      ;; meaning. The second is ours: wallet support is default-OFF on mainnet
+      ;; (docs/wallet-plan.md), and naming a wallet — or a bare -wallet, which
+      ;; INTERPRET-ARG renders as "1" — is the operator's opt-in.
+      ;;
+      ;; `-nowallet` arrives as "0" and means "load no wallets" (Core:
+      ;; "'-nowallet' accepts only '1' to disable all wallets"). It names
+      ;; nothing and it does NOT turn the subsystem off: the wallet RPCs stay
+      ;; registered, which is what wallet_multiwallet.py's first node relies on.
+      (let* ((raw (getf plist :wallet-names))
+             (names (remove-if (lambda (v) (member v '("0" "1") :test #'string=)) raw)))
+        (setf (getf plist :wallet-names) names)
+        (when (or names (member "1" raw :test #'string=))
+          (setf (getf plist :wallet) t)))
       ;; -bind=<addr>[:<port>][=onion] (Core init.cpp; the functional framework
       ;; passes both forms, test_node.py:272-276). The spec scan above already
       ;; took the last plain value into :listen-bind; re-derive it here so the

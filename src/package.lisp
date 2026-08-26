@@ -506,6 +506,8 @@
    #:prune-block
    #:forget-block-body
    #:ensure-genesis-on-disk
+   #:map-external-block-file
+   #:+max-block-serialized-size+
    #:block-store-total-bytes
    #:block-storage-size-mib
    #:prune-old-blocks

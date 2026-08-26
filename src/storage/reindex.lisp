@@ -114,3 +114,64 @@ parent lands, so file order does not matter."
               (let ((left 0))
                 (maphash (lambda (k v) (declare (ignore k)) (incf left (length v))) pending)
                 left)))))
+
+;;;; Reading blocks out of an EXTERNAL file (Core -loadblock)
+;;;;
+;;;; Same framing as a blk file — magic, 4-byte size, block — but nothing else
+;;;; can be assumed. The file was produced by another tool (contrib/linearize
+;;;; writes bootstrap.dat), it carries no xor.dat, and it may hold garbage
+;;;; between records or be truncated mid-block. Core therefore HUNTS the magic
+;;;; a byte at a time and treats any failure as "resume scanning one byte
+;;;; further", which is what makes the reader tolerant of a partial download
+;;;; (LoadExternalBlockFile, validation.cpp:4988-5060).
+
+(defconstant +max-block-serialized-size+ 4000000
+  "Core MAX_BLOCK_SERIALIZED_SIZE. A size field outside [80, this] is not a
+record, so the scan resumes hunting rather than trying to read it.")
+
+(defun map-external-block-file (path fn)
+  "Call FN with each serialized block found in the file at PATH, in file order.
+Returns the number of records handed over.
+
+FN receives the raw bytes; deserializing is the caller's business, and a caller
+that only wants to count or index need not pay for it.
+
+Records are located by hunting the network magic, so leading junk, trailing
+junk, and a record that fails to read all leave the rest of the file readable —
+the property that makes this usable on a bootstrap.dat someone stopped
+downloading halfway."
+  (let ((magic (block-network-magic))
+        (found 0))
+    (with-open-file (in path :direction :input :element-type '(unsigned-byte 8)
+                             :if-does-not-exist nil)
+      (unless in (return-from map-external-block-file 0))
+      (let ((length (file-length in))
+            (window (make-array 8 :element-type '(unsigned-byte 8)))
+            (pos 0))
+        (loop
+          (when (> (+ pos 8) length) (return))
+          (file-position in pos)
+          (read-sequence window in)
+          (cond
+            ((not (loop for i below 4 always (= (aref window i) (aref magic i))))
+             ;; Not a record here. One byte further, as Core does — a record
+             ;; can start at any offset once the file has junk in it.
+             (incf pos))
+            (t
+             (let ((size (logior (aref window 4)
+                                 (ash (aref window 5) 8)
+                                 (ash (aref window 6) 16)
+                                 (ash (aref window 7) 24))))
+               (cond
+                 ((or (< size 80) (> size +max-block-serialized-size+)
+                      (> (+ pos 8 size) length))
+                  ;; A plausible magic with an implausible length is a
+                  ;; coincidence in the data, not a record.
+                  (incf pos))
+                 (t
+                  (let ((bytes (make-array size :element-type '(unsigned-byte 8))))
+                    (read-sequence bytes in)
+                    (funcall fn bytes)
+                    (incf found)
+                    (setf pos (+ pos 8 size)))))))))))
+    found))

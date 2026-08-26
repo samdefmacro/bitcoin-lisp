@@ -1645,7 +1645,7 @@ sequence has exactly one definition."
     (wallet-post-load-resubmit node wallet)
     (values wallet warnings)))
 
-(defun load-wallets-on-startup (node)
+(defun load-wallets-on-startup (node &optional cli-names)
   "Load every wallet recorded for auto-load in settings.json (Core LoadWallets,
 load.cpp:118-160). Called from start-node once the chainstate and mempool are
 up, so each wallet catches up and folds in the mempool exactly as loadwallet
@@ -1658,9 +1658,19 @@ endless restart loop with no node at all — strictly worse than a running node
 whose wallet is missing and loudly logged."
   (let ((manager (bitcoin-lisp::node-wallet-manager node)))
     (when manager
-      (let ((names (wallet-startup-names (wallet-manager-data-directory manager))))
+      ;; -wallet=<name> FIRST, then what settings.json recorded, duplicates
+      ;; dropped. Core merges the two through one settings list
+      ;; (chain.getSettingsList("wallet"), wallet/load.cpp:81), so a wallet
+      ;; named on the command line and also recorded for auto-load is loaded
+      ;; once — and a second load raises "already loaded", which the caller
+      ;; would have reported as a broken wallet.
+      (let ((names (remove-duplicates
+                    (append (remove-if-not #'stringp cli-names)
+                            (wallet-startup-names
+                             (wallet-manager-data-directory manager)))
+                    :test #'string= :from-end t)))
         (when names
-          (bitcoin-lisp:log-info "Loading ~D wallet~:P recorded for startup: ~{~S~^, ~}"
+          (bitcoin-lisp:log-info "Loading ~D wallet~:P at startup: ~{~S~^, ~}"
                                  (length names) names))
         (dolist (name names)
           (handler-case

@@ -2681,6 +2681,7 @@ case ever exercised) has genesis for a root."
                         (pid-file nil)
                         (connect-nodes nil connect-nodes-supplied-p)
                         (seednode nil)
+                        (load-block nil)
                         (asmap nil)
                         (migrate-datadir nil)
                         (whitelist nil)
@@ -2704,6 +2705,7 @@ case ever exercised) has genesis for a root."
                         (webui-path nil)
                         (webui-open nil)
                         (wallet nil wallet-supplied-p)
+                        (wallet-names nil)
                         (port nil)
                         (network-active t)
                         ((:rest rest-enabled) nil)
@@ -3167,6 +3169,8 @@ to move them (the node must be stopped)."
   ;; it on disk from initialisation, which is what makes blk00000.dat start at
   ;; height 0 for every reader that walks the block files from outside the node.
   (bitcoin-lisp.storage:ensure-genesis-on-disk (node-block-store *node*))
+  ;; -loadblock=<file>, once the store and chain state exist. Deferred to
+  ;; %IMPORT-EXTERNAL-BLOCK-FILES below, which runs after validation is ready.
 
   ;; Initialize UTXO storage: LevelDB-backed coins-view-cache.
   ;;
@@ -3581,7 +3585,7 @@ to move them (the node must be stopped)."
       ;; and the mempool (load-mempool-from-disk) are both up, so each wallet
       ;; can catch up from its locator and fold in the mempool; networking has
       ;; not started, so no block can connect underneath the catch-up.
-      (bitcoin-lisp.rpc:load-wallets-on-startup *node*)))
+      (bitcoin-lisp.rpc:load-wallets-on-startup *node* wallet-names)))
 
   (setf (node-running *node*) t)
 
@@ -3933,12 +3937,57 @@ to move them (the node must be stopped)."
          net bytes (listen-port network)
          bitcoin-lisp.networking:+local-manual+))))
 
+  ;; -loadblock=<file>: import external block files before declaring the node
+  ;; up, as Core does (ImportBlocks runs on the init thread and the RPC waits
+  ;; on it). A file that cannot be opened warns and the rest still run.
+  (%import-external-block-files *node* load-block)
+
   ;; Startup is over: a stop arriving from here on has a fully-built node to
   ;; tear down, so the handler's no-watchdog fallback may run stop-node inline
   ;; again (REPL / embedded use).
   (setf *node-starting* nil)
   (log-info "Node started successfully")
   *node*)
+
+(defun %import-external-block-files (node paths)
+  "Import every file in PATHS through the ordinary consensus path (Core
+ImportBlocks' -loadblock loop, node/blockstorage.cpp:1296-1309).
+
+Blocks in such a file are in whatever order the producer wrote them, and Core
+skips one whose parent it does not know yet rather than parking it — the parking
+map is passed only by -reindex, not by -loadblock (validation.cpp:4993-5056).
+A second pass is therefore how an out-of-order file gets fully imported, and
+that is Core's behaviour too; contrib/linearize writes height order, so the
+common case is one pass.
+
+Every block is validated exactly as a network block would be: this imports
+blocks, it does not trust them."
+  (dolist (path (if (listp paths) paths (list paths)))
+    (let ((file (probe-file path)))
+      (cond
+        ((null file)
+         (log-warn "Could not open blocks file ~A" path))
+        (t
+         (log-info "Importing blocks file ~A..." (namestring file))
+         (let ((loaded 0) (accepted 0))
+           (handler-case
+               (bitcoin-lisp.storage:map-external-block-file
+                file
+                (lambda (bytes)
+                  (incf loaded)
+                  (let ((block (handler-case
+                                   (bitcoin-lisp.serialization:br-read-bitcoin-block
+                                    (bitcoin-lisp.serialization:make-byte-reader-from bytes))
+                                 (error () nil))))
+                    (when block
+                      (multiple-value-bind (ok reason)
+                          (bitcoin-lisp.rpc::%activate-submitted-block node block)
+                        (declare (ignore reason))
+                        (when ok (incf accepted)))))))
+             (error (e)
+               (log-warn "Importing blocks file ~A stopped: ~A" (namestring file) e)))
+           (log-info "Imported ~D of ~D block~:P from ~A"
+                     accepted loaded (namestring file))))))))
 
 (defun %check-datadir-option (cli)
   "An explicitly named -datadir that does not exist is FATAL, as it is in Core
