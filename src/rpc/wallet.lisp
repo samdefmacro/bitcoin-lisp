@@ -355,15 +355,28 @@ directory.")
   (merge-pathnames (concatenate 'string name "/") (wallets-directory manager)))
 
 (defun %valid-wallet-name-p (name)
-  "Wallet names name a subdirectory of <datadir>/wallets/. We restrict them
-to a safe character set ([A-Za-z0-9._-], not . or ..) rather than supporting
-Core's create-at-arbitrary-path form."
+  "Wallet names name a subdirectory of <datadir>/wallets/.
+
+The rule is CONTAINMENT, stated positively: any name is fine as long as it
+cannot escape the wallet directory. So no path separator, no NUL, and not the
+traversal names themselves.
+
+⚠️ It used to be an allow-list of [A-Za-z0-9._-], which is much narrower than
+Core and rejected names Core accepts — wallet_multiwallet.py creates one out of
+every printable ASCII character. Widening it does not give up what the
+restriction was actually guaranteeing, because that guarantee is about
+separators and traversal, not about the alphabet.
+
+⚠️ Core additionally accepts an ABSOLUTE PATH and creates the wallet there
+(wallet_crosschain.py uses one). That is deliberately still refused: it is the
+one form that puts wallet files outside the datadir, and it is a widening of
+where this process writes rather than of what it will call a wallet."
   (and (stringp name)
        (plusp (length name))
        (not (member name '("." "..") :test #'string=))
-       (every (lambda (ch)
-                (or (alphanumericp ch) (member ch '(#\. #\_ #\-))))
-              name)))
+       (notany (lambda (ch)
+                 (or (char= ch #\/) (char= ch #\\) (char= ch (code-char 0))))
+               name)))
 
 ;;; --- SPKM key management ---
 

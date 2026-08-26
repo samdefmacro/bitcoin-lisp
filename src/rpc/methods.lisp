@@ -3552,6 +3552,51 @@ whether it is currently enabled. Errors on an unknown category."
     (mapcar (lambda (c) (cons c (json-bool (bitcoin-lisp:log-category-enabled-p c))))
             bitcoin-lisp::+log-categories+)))
 
+(defun rpc-mockscheduler (node params)
+  "Advance the scheduler by DELTA_TIME seconds (Core mockscheduler,
+rpc/node.cpp:86-99). Regtest only.
+
+Our scheduled work is driven off GET-UNIX-TIME rather than a separate scheduler
+thread, so advancing the mock clock IS advancing the scheduler — which is what
+the tests using this actually depend on (mempool_unbroadcast.py forwards past
+the unbroadcast re-announce interval and then asserts the re-announce happened)."
+  (declare (ignore node))
+  (unless (eq bitcoin-lisp:*network* :regtest)
+    (error 'rpc-error :code +rpc-misc-error+
+                      :message "mockscheduler is for regression testing (-regtest mode) only"))
+  (let ((delta (first params)))
+    (unless (integerp delta)
+      (error 'rpc-error :code +rpc-type-error+
+                        :message "Expected type number for delta_time"))
+    ;; Core's bounds, verbatim (rpc/node.cpp:97-99).
+    (when (or (<= delta 0) (> delta 3600))
+      (error 'rpc-error :code +rpc-misc-error+
+                        :message "delta_time must be between 1 and 3600 seconds (1 hr)"))
+    ;; NB the base is GET-UNIX-TIME, not *MOCK-TIME*: Core forwards from "now"
+    ;; whether or not the clock is already mocked, and a test that calls
+    ;; mockscheduler without a prior setmocktime relies on that.
+    (setf bitcoin-lisp.serialization:*mock-time*
+          (+ (bitcoin-lisp.serialization:get-unix-time) delta))
+    :null))
+
+(defun rpc-echo (node params)
+  "Return the arguments unchanged (Core echo, rpc/node.cpp:279). It exists for
+the test framework to check argument marshalling end to end, which is exactly
+what rpc_misc.py uses it for."
+  (declare (ignore node))
+  (or params '()))
+
+(defun rpc-generate (node params)
+  "Core keeps `generate' registered ONLY so that calling it explains itself
+(rpc/mining.cpp:258-261): it throws RPC_METHOD_NOT_FOUND with the help text.
+
+An unregistered method would answer `Method not found' with no explanation, and
+rpc_generate.py asserts on the message — it is a deprecation notice, not an
+absence."
+  (declare (ignore node params))
+  (error 'rpc-error :code +rpc-method-not-found+
+                    :message "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"))
+
 (defun rpc-getrpcinfo (node params)
   "Report RPC server state (Bitcoin Core getrpcinfo): the commands currently
 executing, with each one's running time in MICROSECONDS, and the log file path.

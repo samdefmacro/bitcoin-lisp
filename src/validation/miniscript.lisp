@@ -1286,6 +1286,13 @@ run of wrappers needs only one colon."
            (:or-d (format nil "~Aor_d(~A,~A)" prefix (sub 0) (sub 1)))
            (:multi (format nil "~Amulti(~D~{,~A~})" prefix (ms-node-k node)
                            (mapcar #'key (ms-node-keys node))))
+           ;; The tapscript sibling. Adding the FRAGMENT without adding its
+           ;; rendering left a node that parses, types and compiles but cannot
+           ;; be printed — and a descriptor is printed on every listdescriptors,
+           ;; getaddressinfo and wallet backup, so the gap surfaced as RPC
+           ;; -32603 rather than as anything about miniscript.
+           (:multi-a (format nil "~Amulti_a(~D~{,~A~})" prefix (ms-node-k node)
+                             (mapcar #'key (ms-node-keys node))))
            (:thresh (format nil "~Athresh(~D~{,~A~})" prefix (ms-node-k node)
                             (loop for i from 0 below (length subs) collect (sub i))))
            (t (error "cannot render miniscript fragment ~S"
