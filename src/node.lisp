@@ -11,6 +11,21 @@
 
 ;;;; Network Configuration
 
+(defconstant +sync-ticks-per-second+ 5
+  "How finely the sync thread's between-cycle wait is sliced.
+
+The wait exists to pump peer messages while nothing else is due, and the SLEEP
+runs before the pump — so the tick length is the floor on how fast an announced
+block can be noticed, and a propagation spans two ticks. At one tick per second
+diag/propagation_probe.py measured a flat 2s on regtest for a block that takes
+0.01s to mine.
+
+Five is a bound, not a tuning: everything in that loop which wants a per-second
+cadence is gated on the derived SECOND rather than on the tick, so shortening
+the tick cannot make the trickle, ping or dump work run more often. Core's
+ProcessMessages runs continuously; this moves in that direction without giving
+up the loop's shape.")
+
 (defconstant +testnet3+ :testnet3)
 (defconstant +testnet4+ :testnet4)
 (defconstant +signet+ :signet)
@@ -3615,9 +3630,27 @@ to move them (the node must be stopped)."
                                ;; Periodic peers.dat dump (Core DumpAddresses
                                ;; every 15 min); cadence-gated inside.
                                (maybe-dump-peer-addresses *node*)
-                               (loop for second from 1 to 30
+                               ;; ⚠️ The SLEEP runs BEFORE the pump, so a message
+                               ;; that arrives just after one pass waits out the
+                               ;; whole tick before anything reads it. At one
+                               ;; second a tick that is the floor on how fast an
+                               ;; announced block can be noticed, and a
+                               ;; propagation spans two of them — which is the
+                               ;; flat 2s diag/propagation_probe.py still
+                               ;; measures after #507 removed the header round
+                               ;; trip.
+                               ;;
+                               ;; Sub-second ticks, with the same 30s ceiling and
+                               ;; the same per-second cadence for everything that
+                               ;; wants one: the trickle, ping and dump work below
+                               ;; is gated on SECOND changing, so it keeps its
+                               ;; period while the pump gets to run sooner.
+                               ;; Core's ProcessMessages runs continuously; this
+                               ;; is the same direction, bounded.
+                               (loop for tick from 1 to (* 30 +sync-ticks-per-second+)
+                                     for second = (ceiling tick +sync-ticks-per-second+)
                                      while (node-running *node*)
-                                     do (sleep 1)
+                                     do (sleep (/ 1 +sync-ticks-per-second+))
                                         ;; Retry buffered unsent bytes on
                                         ;; every peer (non-blocking) — the
                                         ;; periodic half of Core's
