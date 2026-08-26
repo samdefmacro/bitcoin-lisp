@@ -1028,7 +1028,10 @@ than on the flags, since the flag existing is not the feature."
   (let ((plain (let ((bitcoin-lisp::*log-time-micros* nil)
                      (bitcoin-lisp::*log-thread-names* nil))
                  (bitcoin-lisp::format-log-entry :info "hello ~A" '(1)))))
-    (is-true (search "INFO: hello 1" plain))
+    ;; No level tag: Core prints none on an uncategorized info line
+    ;; (BCLog::LogPrefix). The message follows the timestamp directly.
+    (is-true (search "] hello 1" plain))
+    (is-false (search "INFO" plain))
     ;; [YYYY-MM-DD HH:MM:SS] with no fraction
     (is-false (search "." (subseq plain 0 (1+ (position #\] plain))))))
   (let ((micros (let ((bitcoin-lisp::*log-time-micros* t)
@@ -1039,8 +1042,17 @@ than on the flags, since the flag existing is not the feature."
   (let ((named (let ((bitcoin-lisp::*log-time-micros* nil)
                      (bitcoin-lisp::*log-thread-names* t))
                  (bitcoin-lisp::format-log-entry :info "hello" '()))))
-    ;; A second bracketed field appears between the timestamp and the level.
-    (is (= 2 (count #\[ named)) "thread name missing from ~S" named)))
+    ;; A second bracketed field appears after the timestamp. Two, not three:
+    ;; an info line carries no level tag of its own.
+    (is (= 2 (count #\[ named)) "thread name missing from ~S" named))
+  ;; And with a level that DOES print a tag, the thread name sits between the
+  ;; timestamp and it — Core's order.
+  (let ((named-warn (let ((bitcoin-lisp::*log-time-micros* nil)
+                          (bitcoin-lisp::*log-thread-names* t))
+                      (bitcoin-lisp::format-log-entry :warn "hello" '()))))
+    (is (= 3 (count #\[ named-warn)) "expected timestamp, thread and level in ~S"
+        named-warn)
+    (is-true (search "[warning] hello" named-warn))))
 
 (test relay-policy-knobs-take-effect
   "-dustrelayfee, -incrementalrelayfee and -bytespersigop are relay POLICY, not
@@ -1891,3 +1903,62 @@ drives all six shapes below and requires the node to refuse each one."
     (is-false (err "{\"wallet\": false}"))
     ;; No wallet key at all is obviously fine.
     (is-false (err "{\"prune\": \"550\"}"))))
+
+;;;; --- -wallet=<name> and -loadblock=<file> as Core reads them ---
+
+(test wallet-option-names-wallets-rather-than-switching-the-subsystem
+  "Core's -wallet=<name> is the list of wallets to LOAD (wallet/load.cpp:81);
+the subsystem switch is -disablewallet. Ours treated -wallet as a boolean, so
+`-wallet=w1` said nothing about w1 — it just meant \"true\"."
+  (multiple-value-bind (plist)
+      (bitcoin-lisp::args->start-node-plist '("-regtest" "-wallet=w1" "-wallet=w2"))
+    (is (equal '("w1" "w2") (getf plist :wallet-names)))
+    ;; Naming a wallet is also the opt-in to wallet support, which matters on
+    ;; mainnet where the default is off.
+    (is-true (getf plist :wallet))))
+
+(test wallet-option-is-repeatable
+  "Core reads it with GetArgs, so a repeated -wallet does not collapse to the
+last one the way an ordinary option does."
+  (is (equal '("a" "b" "c")
+             (getf (bitcoin-lisp::args->start-node-plist
+                    '("-regtest" "-wallet=a" "-wallet=b" "-wallet=c"))
+                   :wallet-names))))
+
+(test nowallet-loads-no-wallets-but-keeps-the-rpcs
+  "Core defines -nowallet as \"disable all wallets\" — meaning load none — and
+its own message says so: \"'-nowallet' accepts only '1' to disable all
+wallets\". The wallet RPC surface stays up; -disablewallet is what removes it.
+
+Treating -nowallet as a subsystem switch made wallet_multiwallet.py fail on its
+FIRST call: it starts node0 with exactly -nowallet and then calls wallet RPCs
+on it, and got 'Method not found (wallet support is disabled)'."
+  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest" "-nowallet"))))
+    (is (null (getf plist :wallet-names)) "-nowallet names no wallet")
+    ;; Not present at all, so START-NODE's network default decides — which on
+    ;; regtest means wallet support stays ON.
+    (is (eq :unset (getf plist :wallet :unset))
+        "-nowallet must not decide whether the subsystem runs"))
+  ;; -disablewallet is the one that does turn it off, and it says so explicitly.
+  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest" "-disablewallet"))))
+    (is (null (getf plist :wallet :unset)))))
+
+(test bare-wallet-flag-is-the-mainnet-opt-in
+  "Wallet support is default-OFF on mainnet here (docs/wallet-plan.md), so a
+bare -wallet has to keep meaning \"turn it on\" even though -wallet is now a
+name list. INTERPRET-ARG renders a bare flag as \"1\", which names nothing."
+  (let ((plist (bitcoin-lisp::args->start-node-plist '("-mainnet" "-wallet"))))
+    (is (null (getf plist :wallet-names)))
+    (is-true (getf plist :wallet))))
+
+(test loadblock-is-repeatable-and-implemented
+  "Every -loadblock= is imported in order (init.cpp:2022). It used to sit in
+the accepted-but-unimplemented table, so passing one started the node and
+imported nothing."
+  (is (equal '("/a/one.dat" "/b/two.dat")
+             (getf (bitcoin-lisp::args->start-node-plist
+                    '("-regtest" "-loadblock=/a/one.dat" "-loadblock=/b/two.dat"))
+                   :load-block)))
+  (is-false (bitcoin-lisp::core-only-option-p "loadblock")
+            "-loadblock is implemented now and must not be reported as ignored")
+  (is-true (bitcoin-lisp:known-config-option-p "loadblock")))

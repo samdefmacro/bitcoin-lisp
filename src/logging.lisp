@@ -65,7 +65,42 @@ carriage return or a terminal escape sequence into a file an operator reads."
                        (write-char ch out)
                        (format out "\\x~(~2,'0X~)" (char-code ch))))))))
 
-(defun format-log-entry (level format-string args)
+(defun log-level-name (level)
+  "Core's spelling of LEVEL (BCLog::Logger::LogLevelToStr, logging.cpp:234).
+Note :WARN prints as \"warning\" — the functional tests match on Core's word."
+  (ecase level
+    (:trace "trace")
+    (:debug "debug")
+    (:info "info")
+    (:warn "warning")
+    (:error "error")))
+
+(defun log-category-level-prefix (category level)
+  "Core's `[category:level] ` tag for a log line, or \"\" where Core prints none
+ (BCLog::LogPrefix, logging.cpp:343-367).
+
+Three rules, all Core's, and all load-bearing for the functional tests, which
+match on the rendered line:
+
+- An UNCATEGORIZED INFO line gets NO tag at all. That is the common case, so
+  most lines lose the `INFO: ` this used to print.
+- A CATEGORIZED DEBUG line is tagged with the category alone — `[net] ` — since
+  a category implies debug. Categories were dropped entirely before this; every
+  `log-cat` line came out as a bare debug line with no way to tell which
+  subsystem wrote it.
+- Anything else is `[level] ` or `[category:level] `, with :WARN spelled
+  Core's way."
+  (let* ((has-category (and category (stringp category)
+                            (plusp (length category))
+                            (not (string= category "all")))))
+    (cond ((and (not has-category) (eq level :info)) "")
+          (t (format nil "[~@[~A~]~:[~;~:*~A~]] "
+                     (and has-category category)
+                     (unless (and has-category (eq level :debug))
+                       (concatenate 'string (if has-category ":" "")
+                                    (log-level-name level))))))))
+
+(defun format-log-entry (level format-string args &optional category)
   "Format a log entry and return the string.
 
 *PRINT-PRETTY* is bound OFF. With it on, a `~A' of a multi-line object — an
@@ -92,11 +127,11 @@ for the message returned nothing usable."
                                  year month day hour min sec)))))
     (%log-escape-message
      (let ((*print-pretty* nil))
-       (format nil "[~A] ~@[[~A] ~]~A: ~?"
+       (format nil "[~A] ~@[[~A] ~]~A~?"
                timestamp
                (when *log-thread-names*
                  (ignore-errors (bt:thread-name (bt:current-thread))))
-               (string-upcase (symbol-name level))
+               (log-category-level-prefix category level)
                format-string args)))))
 
 (defun add-to-log-buffer (entry)
@@ -201,12 +236,12 @@ byte counts they carry are the same. Caller holds *LOG-LOCK*."
            (list (car cell) (cdr cell) +log-ratelimit-window-seconds+)
            nil))))))
 
-(defun %log-emit-locked (level format-string args ratelimit)
+(defun %log-emit-locked (level format-string args ratelimit &optional category)
   "Emit one entry with *LOG-LOCK* held (Core LogPrintStr_, which is likewise the
 lock-held, self-recursive half of the pair). RATELIMIT nil is Core's
 should_ratelimit=false: used for the limiter's own notices, which must never be
 suppressed by the limiter."
-  (let ((entry (format-log-entry level format-string args))
+  (let ((entry (format-log-entry level format-string args category))
         (to-file t))
     (when (and ratelimit *log-rate-limit*)
       (%log-maybe-reset-window)
@@ -233,10 +268,10 @@ suppressed by the limiter."
         (format *log-file-stream* "~A~%" line)
         (finish-output *log-file-stream*)))))
 
-(defun %log-emit (level format-string args &optional (ratelimit t))
+(defun %log-emit (level format-string args &optional (ratelimit t) category)
   "Format and write a log ENTRY unconditionally (buffer + console + file)."
   (bt:with-lock-held (*log-lock*)
-    (%log-emit-locked level format-string args ratelimit)))
+    (%log-emit-locked level format-string args ratelimit category)))
 
 (defun node-log (level format-string &rest args)
   "Log a message at LEVEL.
@@ -331,7 +366,11 @@ detail_LogIfCategoryAndLevelEnabled asserts should_ratelimit is false for every
 level it is reached at (util/log.h:104-111)."
   (when (or (log-category-enabled-p category)
             (>= (log-level-value :debug) (log-level-value *current-log-level*)))
-    (%log-emit :debug format-string args nil)))
+    ;; The category reaches the line now. Core tags a categorized debug line
+    ;; with the category alone — `[net] ` — and dropping it here meant every
+    ;; log-cat line was indistinguishable from any other debug line, which is
+    ;; the whole point of having categories.
+    (%log-emit :debug format-string args nil category)))
 
 (defmacro log-cat (category format-string &rest args)
   "Debug-log under CATEGORY (a string): shown only when that category is enabled

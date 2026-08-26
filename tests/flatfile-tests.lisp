@@ -1333,3 +1333,87 @@ either."
            (bitcoin-lisp.storage:clear-prune-locks)
            (is (= 3 (bitcoin-lisp.storage:prune-blocks-to-height store cs 100)))
            (is-false (probe-file path))))))))
+
+;;;; --- reading blocks out of an external file (Core -loadblock) ---
+
+(defun %ff-external-file (dir records &key (junk 0))
+  "Write RECORDS (serialized blocks) into a bootstrap-style file under DIR,
+each framed as Core frames them: magic, 4-byte LE size, block. JUNK bytes of
+garbage are written first, to prove the reader hunts rather than assuming the
+file starts on a record."
+  (let ((path (merge-pathnames "bootstrap.dat" dir))
+        (magic (bitcoin-lisp.storage::block-network-magic)))
+    (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                              :if-exists :supersede :if-does-not-exist :create)
+      (dotimes (i junk) (write-byte (mod (+ 17 i) 256) out))
+      (dolist (bytes records)
+        (write-sequence magic out)
+        (let ((n (length bytes)))
+          (write-byte (ldb (byte 8 0) n) out)
+          (write-byte (ldb (byte 8 8) n) out)
+          (write-byte (ldb (byte 8 16) n) out)
+          (write-byte (ldb (byte 8 24) n) out))
+        (write-sequence bytes out)))
+    path))
+
+(test external-block-file-reads-every-record
+  "The framing Core's contrib/linearize writes into bootstrap.dat, which is the
+same framing a blk file uses minus the XOR."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((blocks (loop for h from 1 to 3
+                          collect (bitcoin-lisp.serialization:serialize-witness-block
+                                   (%ff-test-block (+ 30 h)))))
+            (path (%ff-external-file dir blocks))
+            (seen '()))
+       (is (= 3 (bitcoin-lisp.storage:map-external-block-file
+                 path (lambda (b) (push b seen)))))
+       (is (= 3 (length seen)))
+       (is (equalp (first blocks) (first (last seen))))))))
+
+(test external-block-file-hunts-past-junk
+  "Leading garbage must not cost the file: Core scans for the magic a byte at a
+time so a partially-downloaded or concatenated bootstrap.dat still yields every
+whole record in it."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((blocks (loop for h from 1 to 2
+                          collect (bitcoin-lisp.serialization:serialize-witness-block
+                                   (%ff-test-block (+ 60 h)))))
+            (path (%ff-external-file dir blocks :junk 37))
+            (count 0))
+       (is (= 2 (bitcoin-lisp.storage:map-external-block-file
+                 path (lambda (b) (declare (ignore b)) (incf count)))))
+       (is (= 2 count))))))
+
+(test external-block-file-stops-at-a-truncated-record
+  "A record whose length runs past the end of the file is not a record. Core
+treats it as a coincidence in the data and keeps hunting, which is what lets a
+half-downloaded file still deliver the blocks that ARE complete."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((blocks (loop for h from 1 to 2
+                          collect (bitcoin-lisp.serialization:serialize-witness-block
+                                   (%ff-test-block (+ 90 h)))))
+            (path (%ff-external-file dir blocks)))
+       ;; Chop the last record in half.
+       (let ((all (with-open-file (in path :element-type '(unsigned-byte 8))
+                    (let ((b (make-array (file-length in)
+                                         :element-type '(unsigned-byte 8))))
+                      (read-sequence b in) b))))
+         (with-open-file (out path :direction :output :element-type '(unsigned-byte 8)
+                                   :if-exists :supersede)
+           (write-sequence all out :end (- (length all) 20))))
+       (let ((count 0))
+         (bitcoin-lisp.storage:map-external-block-file
+          path (lambda (b) (declare (ignore b)) (incf count)))
+         (is (= 1 count) "the complete record survives a truncated one after it"))))))
+
+(test external-block-file-that-does-not-exist-reads-nothing
+  "Core warns and moves on to the next -loadblock rather than refusing to
+start (blockstorage.cpp:1306)."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (is (= 0 (bitcoin-lisp.storage:map-external-block-file
+               (merge-pathnames "no-such-file.dat" dir)
+               (lambda (b) (declare (ignore b)) (error "must not be called"))))))))
