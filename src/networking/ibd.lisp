@@ -2836,7 +2836,28 @@ threads read/write under the same lock."
                           (bitcoin-lisp.storage:block-index-entry-chain-work tip)))
               (credit-block-announcement peer)))))
       (when (> added 0)
-        (bitcoin-lisp:log-info "~A: ~D headers, ~D new" label (length headers) added))
+        (bitcoin-lisp:log-info "~A: ~D headers, ~D new" label (length headers) added)
+        ;; Core's progress line, emitted only DURING IBD and only for the last
+        ;; accepted header (validation.cpp:4292-4298). The estimate is
+        ;; deliberately crude and Core's arithmetic is copied rather than
+        ;; improved: blocks_left is how many target-spacings the header's own
+        ;; timestamp is behind now, so progress is height/(height+left).
+        ;; feature_* tests grep for it to tell header sync from block sync.
+        (when (and last-entry
+                   (bitcoin-lisp.storage:block-index-entry-header last-entry)
+                   (member (ibd-state) '(:syncing-headers :syncing-blocks)))
+          (let* ((height (bitcoin-lisp.storage:block-index-entry-height last-entry))
+                 (stamp (bitcoin-lisp.serialization:block-header-timestamp
+                         (bitcoin-lisp.storage:block-index-entry-header last-entry)))
+                 (behind (max 0 (- (bitcoin-lisp.serialization:get-unix-time) stamp)))
+                 ;; 600s is Core's nPowTargetSpacing for every network this node
+                 ;; serves; regtest shares it.
+                 (left (max 0 (floor behind 600))))
+            (bitcoin-lisp:log-info "Synchronizing blockheaders, height: ~D (~,2F%)"
+                                   height
+                                   (if (plusp (+ height left))
+                                       (/ (* 100.0 height) (+ height left))
+                                       0.0)))))
       ;; Second value: Core's pindexLast as an index ENTRY. The follow-up
       ;; getheaders must be built from it, not from our own header tip — see
       ;; %maybe-request-more-headers.

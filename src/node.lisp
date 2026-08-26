@@ -2985,8 +2985,15 @@ to move them (the node must be stopped)."
                     asmap
                     (merge-pathnames asmap (uiop:ensure-directory-pathname
                                             (or data-directory "./"))))))
-      (let ((size (bitcoin-lisp.networking:load-asmap-file path)))
-        (log-info "Using asmap file ~A (~D bytes) for peer bucketing" path size))))
+      (bitcoin-lisp.networking:load-asmap-file path)
+      (log-info "Using asmap version ~A for IP bucketing"
+                (bitcoin-lisp.networking:asmap-version))))
+  ;; ⚠️ Core logs BOTH branches (init.cpp:1628,1631) — the /16 case is not a
+  ;; silent default there, and feature_asmap.py greps for it to tell a node
+  ;; that fell back apart from one that never had a map. We logged only the
+  ;; success side, so the interesting case said nothing.
+  (unless bitcoin-lisp.networking::*asmap*
+    (log-info "Using /16 prefix for IP bucketing"))
   ;; -whitelist / -whitebind: permission grants by address range. Applied
   ;; before any peer can connect. A malformed spec is fatal, as Core's is
   ;; (init.cpp fails on the first entry NetWhitelistPermissions::TryParse

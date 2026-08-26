@@ -925,4 +925,24 @@ would have exactly the eclipse exposure the operator was trying to close."
         (error "Could not parse asmap file ~A" path))
       (read-sequence buf in)
       (setf *asmap* buf)
+      ;; Core logs the OPEN here, inside the reader, with the path quoted and
+      ;; the size (util/asmap.cpp:331); the "Using asmap version" line comes
+      ;; later, from init. feature_asmap.py greps for both, which is why they
+      ;; are two lines and not one.
+      (bitcoin-lisp:log-info "Opened asmap file \"~A\" (~D bytes) from disk"
+                             (namestring path) size)
       size)))
+
+(defun asmap-version ()
+  "Core AsmapVersion (util/asmap.cpp:348): SHA256d over the asmap bytes, or NIL
+when no map is loaded. It identifies WHICH map a node is bucketing with, which
+is the thing an operator comparing two nodes actually needs."
+  ;; ⚠️ REVERSED for display. Core's AsmapVersion returns a uint256, which
+  ;; prints big-endian while the hash is computed and stored little-endian —
+  ;; the same convention as every block hash and txid. Printing the raw digest
+  ;; gives the right bytes in the wrong order, which reads as a completely
+  ;; different version and matches nothing an operator can compare against.
+  (when (and *asmap* (plusp (length *asmap*)))
+    (bitcoin-lisp.crypto:bytes-to-hex
+     (bitcoin-lisp.crypto:reverse-bytes
+      (bitcoin-lisp.crypto:hash256 *asmap*)))))

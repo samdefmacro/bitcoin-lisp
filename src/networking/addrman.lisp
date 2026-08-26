@@ -749,7 +749,13 @@ only bucket NUMBERS need persisting."
   "Load BOOK from PATH. On a missing/corrupt/incompatible file, rename it to
 PATH.bak and leave BOOK empty (Bitcoin Core LoadAddrman). Returns T if entries
 were loaded, NIL otherwise."
+  ;; ⚠️ Core reports a count even when there is nothing to load: DeserializeFileDB
+  ;; throwing DbNotFoundError leaves an empty addrman and the line still says
+  ;; "Loaded 0 addresses from peers.dat" (addrdb.cpp:207-211). A fresh datadir is
+  ;; the ordinary case and feature_addrman.py greps for exactly that. Same shape
+  ;; as the banlist gap: absence is a RESULT, not a reason to say nothing.
   (unless (probe-file path)
+    (bitcoin-lisp:log-info "Loaded 0 addresses from peers.dat")
     (return-from load-address-book nil))
   (flet ((backup ()
            (ignore-errors
@@ -811,8 +817,15 @@ were loaded, NIL otherwise."
                           (ab-load-entry book tried-p net ip port services last-seen
                                          last-attempt last-success n-attempts sg
                                          new-buckets)))))
-                  (bitcoin-lisp:log-info "Loaded ~D peer addresses (~D tried) from peers.dat"
-                                         (address-book-count book)
+                  ;; ⚠️ Core's wording exactly: "Loaded %i addresses from
+                  ;; peers.dat" (addrdb.cpp:207). Core's tests match this as a
+                  ;; SUBSTRING, and our extra word "peer" broke the match — the
+                  ;; count is the same, the sentence was not. The tried count
+                  ;; moves to its own line rather than being dropped: it is
+                  ;; genuinely useful and Core simply does not report it.
+                  (bitcoin-lisp:log-info "Loaded ~D addresses from peers.dat"
+                                         (address-book-count book))
+                  (bitcoin-lisp:log-cat "net" "  (~D of them tried)"
                                          (address-book-n-tried book))
                   (> count 0)))))))
       (error (c)
