@@ -113,6 +113,10 @@ AddAddrFetch peer dials instead of getaddrinfo lookups (net.cpp:2353-2358)."
       (copy-list seeds)
       (let ((addresses '()))
         (dolist (seed seeds)
+          ;; Per seed, before the lookup, exactly as Core does (net.cpp:2353).
+          ;; p2p_dns_seeds.py greps for this line to tell which seeds a node
+          ;; actually tried — a summary after the fact cannot answer that.
+          (bitcoin-lisp:log-info "Loading addresses from DNS seed ~A" seed)
           (let ((resolved (resolve-dns-seed seed)))
             (when resolved
               (setf addresses (nconc addresses resolved)))))
@@ -233,6 +237,15 @@ Returns T if message was handled, NIL otherwise."
 
     ((string= command "getcfcheckpt")
      (handle-getcfcheckpt peer payload chain-state)
+     t)
+
+    ((string= command "verack")
+     ;; A second verack, after the handshake already completed. Core ignores it
+     ;; with this exact line rather than disconnecting (net_processing.cpp:3822)
+     ;; — and p2p_handshake.py greps the log for it, so the wording is part of
+     ;; the behaviour, not decoration.
+     (bitcoin-lisp:log-cat "net" "ignoring redundant verack message from peer=~A"
+                           (peer-id peer))
      t)
 
     ((string= command "sendaddrv2")
