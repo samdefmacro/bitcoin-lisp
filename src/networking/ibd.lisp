@@ -1983,6 +1983,17 @@ a second download cursor for its [tip .. snapshot-base] range."
                 :historical-chainstate historical-chainstate)
     (setf *ibd-context* nil)))
 
+(defun %headers-already-ahead-p (chain-state ctx)
+  "T when the header chain already reaches past the block tip, so Phase 1 has
+nothing to fetch and Phase 2 has work waiting.
+
+This is the state an ANNOUNCEMENT leaves behind: the header arrived, connected
+and raised the header tip, and the only thing outstanding is the block itself.
+Asking a peer for headers here returns zero and costs a full round trip."
+  (and ctx
+       (> (ibd-context-header-tip-height ctx)
+          (bitcoin-lisp.storage:current-height chain-state))))
+
 (defun run-ibd (peers chain-state utxo-set block-store
                 &key fee-estimator recent-rejects mempool address-book
                   historical-chainstate tx-index)
@@ -2037,13 +2048,32 @@ a second download cursor for its [tip .. snapshot-base] range."
       (setf (ibd-context-header-tip-height ctx) best-header-height
             (ibd-context-best-header-work ctx) best-header-work))
 
-    ;; Phase 1: Download headers
-    (set-ibd-state :syncing-headers)
-    (sync-headers-with-failover peers chain-state ctx
-                                :recent-rejects recent-rejects
-                                :utxo-set utxo-set
-                                :block-store block-store
-                                :fee-estimator fee-estimator)
+    ;; Phase 1: Download headers — unless the headers we need are already in.
+    ;;
+    ;; ⚠️ Running this unconditionally cost a FLAT FOUR SECONDS per announced
+    ;; block on regtest, against 0.01s to mine one. An announcement arrives, its
+    ;; header is ingested, and the node then asks a peer for headers it already
+    ;; has, waits out the reply (0 ingested), and only afterwards downloads the
+    ;; block. Measured by diag/propagation_probe.py; it is the shared root cause
+    ;; of ~25 functional-test timeouts, which cluster in the categories that mine
+    ;; repeatedly.
+    ;;
+    ;; Core's rule is the same shape and lives at the other end: it asks for more
+    ;; headers only when the headers message was MAXIMALLY SIZED, i.e. the peer
+    ;; may have more (net_processing.cpp:3105-3112). A single announced header
+    ;; never triggers another getheaders. Here the equivalent question is whether
+    ;; our header tip is already ahead of our block tip — if it is, the block
+    ;; download in Phase 2 is exactly what is wanted and a header round trip can
+    ;; only wait.
+    (if (%headers-already-ahead-p chain-state ctx)
+        (set-ibd-state :syncing-blocks)
+        (progn
+          (set-ibd-state :syncing-headers)
+          (sync-headers-with-failover peers chain-state ctx
+                                      :recent-rejects recent-rejects
+                                      :utxo-set utxo-set
+                                      :block-store block-store
+                                      :fee-estimator fee-estimator)))
 
     ;; Phase 2: Download and validate blocks
     (set-ibd-state :syncing-blocks)
