@@ -3186,7 +3186,11 @@ comment above."
               (bitcoin-lisp:log-warn
                "REORG: stored block at height ~D is witness-stripped; pruning for witness-complete re-download"
                (bitcoin-lisp.storage:block-index-entry-height entry))
-              (bitcoin-lisp.storage:prune-block block-store block-hash)
+              ;; FORGET, not prune: a flat record cannot be deleted on its
+              ;; own, and PRUNE-BLOCK refuses for one — which would leave
+              ;; GET-BLOCK serving the same witness-stripped body to every
+              ;; later retry of this reorg.
+              (bitcoin-lisp.storage:forget-block-body block-store block-hash)
               ;; Header stays in the index; mark it needing a body so the normal
               ;; download path re-fetches it.
               (setf (bitcoin-lisp.storage:block-index-entry-status entry) :header-valid))))

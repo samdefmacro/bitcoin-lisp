@@ -471,6 +471,11 @@
    #:make-block-store
    #:init-block-store
    #:*flat-block-files*
+   #:*prune-locks*
+   #:+prune-lock-buffer+
+   #:register-prune-lock
+   #:clear-prune-locks
+   #:prune-lock-ceiling
    #:*fast-prune*
    #:*blocks-xor*
    #:max-blockfile-size
@@ -499,6 +504,8 @@
    #:block-exists-p
    ;; Block pruning
    #:prune-block
+   #:forget-block-body
+   #:ensure-genesis-on-disk
    #:block-store-total-bytes
    #:block-storage-size-mib
    #:prune-old-blocks
@@ -1640,6 +1647,18 @@
    #:cli-parse-error
    #:unknown-config-file-keys
    #:known-config-option-p
+   #:defer-log
+   #:flush-deferred-log-lines
+   #:*deferred-log-lines*
+   #:parse-settings-json
+   #:render-settings-json
+   #:render-json-value
+   #:settings-file-warning
+   #:settings-alist->config-alist
+   #:unknown-settings-keys
+   #:validate-settings-values
+   #:+settings-warning-key+
+   #:+client-name+
    #:conf-parse-money
    #:conf-parse-user-hex
    #:ua-comment-safe-p

@@ -226,8 +226,13 @@ success and moves nothing is the failure mode this project has already hit once
 guard, read-bitcoin-block's raise escaped the reorg/download paths to the
 sync-thread top level and killed it (a live-but-wedged zombie). get-block now
 returns NIL (treated as absent) AND prunes the file so the normal download path
-re-fetches it (store-block :supersede overwrites)."
-  (let* ((dir (merge-pathnames "test-corrupt-block/" (uiop:temporary-directory)))
+re-fetches it (store-block :supersede overwrites).
+
+Legacy per-block files specifically — hence the binding. A store on the flat
+format keeps many blocks in one blk file and cannot delete it for one bad
+record; that path is covered by GET-BLOCK-TREATS-CORRUPT-FLAT-RECORD-AS-ABSENT."
+  (let* ((bitcoin-lisp.storage:*flat-block-files* nil)
+         (dir (merge-pathnames "test-corrupt-block/" (uiop:temporary-directory)))
          (store (bitcoin-lisp.storage:init-block-store dir))
          (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
          (tx (bitcoin-lisp.serialization:make-transaction
@@ -262,6 +267,66 @@ re-fetches it (store-block :supersede overwrites)."
              (is (null (bitcoin-lisp.storage:get-block store hash)))
              (is (null (probe-file path))
                  "corrupt block file must be pruned so re-download can self-heal")))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
+(test get-block-treats-corrupt-flat-record-as-absent
+  "The flat-format counterpart. A corrupt record inside a blk file must also
+return NIL rather than raise — but it must NOT take the file with it: one
+blk?????.dat holds many blocks, and deleting it for one bad record would
+discard every good block beside it. Core does the same, failing the single read
+(ReadBlock returns false) and leaving the file alone."
+  (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+         (dir (merge-pathnames "test-corrupt-flat/" (uiop:temporary-directory)))
+         (store (bitcoin-lisp.storage:init-block-store dir))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (blk (lambda (prev-byte)
+                (bitcoin-lisp.serialization:make-bitcoin-block
+                 :header (bitcoin-lisp.serialization:make-block-header
+                          :version 1
+                          :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element prev-byte)
+                          :merkle-root zeros :timestamp 1700000000
+                          :bits #x207fffff :nonce 0)
+                 :transactions
+                 (list (bitcoin-lisp.serialization:make-transaction
+                        :version 1
+                        :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                         :previous-output
+                                         (bitcoin-lisp.serialization:make-outpoint
+                                          :hash zeros :index #xffffffff)
+                                         :script-sig (make-array 1 :element-type '(unsigned-byte 8)
+                                                                   :initial-element 0)
+                                         :sequence #xffffffff))
+                        :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                          :value 5000000000
+                                          :script-pubkey
+                                          (make-array 1 :element-type '(unsigned-byte 8)
+                                                        :initial-element #x51)))
+                        :lock-time 0))))))
+    (unwind-protect
+         (let ((victim (bitcoin-lisp.storage:store-block store (funcall blk 7)))
+               (bystander (bitcoin-lisp.storage:store-block store (funcall blk 9))))
+           (is-true (bitcoin-lisp.storage:get-block store victim))
+           (is-true (bitcoin-lisp.storage:get-block store bystander))
+           ;; Scribble over the first record's framing header in place.
+           (let* ((pos (gethash victim (bitcoin-lisp.storage::block-store-index store)))
+                  (path (bitcoin-lisp.storage::flat-file-name
+                         (bitcoin-lisp.storage::%blk-seq store) pos)))
+             (is-true (bitcoin-lisp.storage::flat-file-pos-p pos)
+                      "the flat default did not put the block in a blk file")
+             (with-open-file (s path :direction :io :element-type '(unsigned-byte 8)
+                                     :if-exists :overwrite)
+               (file-position s (- (bitcoin-lisp.storage::flat-file-pos-pos pos)
+                                   bitcoin-lisp.storage::+storage-header-bytes+))
+               (write-sequence (make-array 8 :element-type '(unsigned-byte 8)
+                                             :initial-element #xff)
+                               s))
+             (is (null (bitcoin-lisp.storage:get-block store victim))
+                 "a corrupt flat record must read as absent, not raise")
+             (is-true (probe-file path)
+                      "the blk file must survive one bad record")
+             (is-true (bitcoin-lisp.storage:get-block store bystander)
+                      "the other blocks in the same file must still be readable")))
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
 (test store-block-preserves-witness

@@ -1679,3 +1679,215 @@ would pass even if no struct ever consulted it."
   (dolist (name '("keypool" "walletdir"))
     (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
     (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
+
+;;;; --- settings.json (Core's read-write settings file) ---
+
+(test settings-json-parses-every-json-type
+  "Core stores arbitrary JSON in settings.json and re-renders it verbatim in
+its `Setting file arg:` lines, so both halves have to survive a round trip
+(feature_settings.py asserts on the rendered form)."
+  (multiple-value-bind (alist errors)
+      (bitcoin-lisp:parse-settings-json
+       "{\"string\": \"string\", \"num\": 5, \"bool\": true, \"null\": null, \"list\": [6,7]}"
+       "/d/settings.json")
+    (is (null errors))
+    (is (= 5 (length alist)))
+    (flet ((rendered (name)
+             (bitcoin-lisp:render-json-value
+              (cdr (assoc name alist :test #'string=)))))
+      (is (string= "\"string\"" (rendered "string")))
+      (is (string= "5" (rendered "num")))
+      (is (string= "true" (rendered "bool")))
+      (is (string= "null" (rendered "null")))
+      (is (string= "[6,7]" (rendered "list"))))))
+
+(test settings-json-strips-the-warning-key
+  "_warning_ is Core's own comment, not a setting: ReadSettings erases it from
+the map it hands back (settings.cpp:117). Leaving it in would make the node
+warn about an unknown option it wrote itself."
+  (multiple-value-bind (alist errors)
+      (bitcoin-lisp:parse-settings-json
+       (format nil "{\"~A\": \"blah\", \"prune\": \"550\"}"
+               bitcoin-lisp:+settings-warning-key+)
+       "/d/settings.json")
+    (is (null errors))
+    (is (equal '("prune") (mapcar #'car alist)))))
+
+(test settings-json-rejects-invalid-json
+  "Core's exact wording — feature_settings.py matches on it."
+  (let ((errors (nth-value 1 (bitcoin-lisp:parse-settings-json
+                              "invalid json" "/d/settings.json"))))
+    (is (= 1 (length errors)))
+    (is-true (search "does not contain valid JSON. This is probably caused by disk corruption or a crash"
+                     (first errors)))))
+
+(test settings-json-rejects-a-non-object
+  (let ((errors (nth-value 1 (bitcoin-lisp:parse-settings-json
+                              "\"string\"" "/d/settings.json"))))
+    (is (= 1 (length errors)))
+    (is-true (search "Found non-object value \"string\" in settings file"
+                     (first errors)))))
+
+(test settings-json-rejects-a-json-array
+  "An array parses to a LIST, which is shaped like an alist of nothing — so
+the object check cannot be emptiness alone."
+  (let ((errors (nth-value 1 (bitcoin-lisp:parse-settings-json
+                              "[1,2]" "/d/settings.json"))))
+    (is (= 1 (length errors)))
+    (is-true (search "Found non-object value" (first errors)))))
+
+(test settings-json-rejects-duplicate-keys
+  "yason keeps both cells for a duplicate key when parsing as an alist, which
+is what makes this detectable at all — a hash-table parse silently keeps the
+last and the node would start with a setting the operator never sees."
+  (let ((errors (nth-value 1 (bitcoin-lisp:parse-settings-json
+                              "{\"key\": 1, \"key\": 2}" "/d/settings.json"))))
+    (is (= 1 (length errors)))
+    (is-true (search "Found duplicate key key in settings file" (first errors)))))
+
+(test settings-json-empty-object-is-valid-and-empty
+  (multiple-value-bind (alist errors)
+      (bitcoin-lisp:parse-settings-json "{}" "/d/settings.json")
+    (is (null errors))
+    (is (null alist))))
+
+(test settings-json-round-trips-through-render
+  "What RENDER-SETTINGS-JSON writes must parse back to what went in — that is
+the whole contract of a file the node rewrites on every start."
+  (let* ((text "{\"string\": \"string\", \"num\": 5, \"bool\": true, \"null\": null, \"list\": [6,7]}")
+         (alist (bitcoin-lisp:parse-settings-json text "/d/settings.json"))
+         (written (bitcoin-lisp:render-settings-json alist)))
+    (multiple-value-bind (again errors)
+        (bitcoin-lisp:parse-settings-json written "/d/settings.json")
+      (is (null errors))
+      (is (equal (mapcar #'car alist) (mapcar #'car again)))
+      (is (equal (mapcar (lambda (c) (bitcoin-lisp:render-json-value (cdr c))) alist)
+                 (mapcar (lambda (c) (bitcoin-lisp:render-json-value (cdr c))) again))))))
+
+(test settings-json-default-file-holds-only-the-warning
+  "feature_settings.py asserts a fresh datadir's settings.json equals exactly
+{_warning_: ...} after one start and stop."
+  (let ((text (bitcoin-lisp:render-settings-json nil)))
+    (let ((parsed (let ((yason:*parse-object-as* :alist)) (yason:parse text))))
+      (is (= 1 (length parsed)))
+      (is (string= bitcoin-lisp:+settings-warning-key+ (car (first parsed))))
+      (is (string= (bitcoin-lisp:settings-file-warning) (cdr (first parsed)))))))
+
+(test settings-json-warning-names-the-client
+  "The framework interpolates CLIENT_NAME from config.ini into the string it
+compares against, and scripts/conformance-config.sh publishes bitcoin-lisp."
+  (is-true (search bitcoin-lisp:+client-name+ (bitcoin-lisp:settings-file-warning)))
+  (is (string= "bitcoin-lisp" bitcoin-lisp:+client-name+)))
+
+(test settings-json-false-becomes-a-negation
+  "A JSON false is how Core stores -nofoo, so it has to reach the config layer
+as the \"0\" the option readers understand — not as the string \"false\"."
+  (let ((cells (bitcoin-lisp:settings-alist->config-alist
+                (bitcoin-lisp:parse-settings-json
+                 "{\"listen\": false, \"prune\": \"550\", \"txindex\": true}"
+                 "/d/settings.json"))))
+    (is (string= "0" (cdr (assoc "listen" cells :test #'string=))))
+    (is (string= "550" (cdr (assoc "prune" cells :test #'string=))))
+    (is (string= "1" (cdr (assoc "txindex" cells :test #'string=))))))
+
+(test settings-json-unknown-keys-are-reported
+  "Core logs one `Ignoring unknown rw_settings value` per unrecognized key and
+carries on (args.cpp:420-423) — unknown settings never abort startup."
+  (let ((unknown (bitcoin-lisp:unknown-settings-keys
+                  (bitcoin-lisp:parse-settings-json
+                   "{\"prune\": \"550\", \"zzznotanoption\": 1}" "/d/settings.json"))))
+    (is (equal '("zzznotanoption") unknown))))
+
+;;;; --- negated options in bitcoin.conf ---
+
+(test conf-file-negation-strips-the-no-prefix
+  "Core runs InterpretKey over config-file keys exactly as over command-line
+ones (config.cpp:63), so `nolisten=1` in bitcoin.conf is -listen=0. Without
+this the file set an option named \"nolisten\" that nothing reads, and
+bitcoin.conf could not negate anything at all."
+  (let ((cells (bitcoin-lisp::parse-bitcoin-conf-sections
+                (format nil "regtest=1~%[regtest]~%nolisten=1~%nosettings=1~%")
+                :regtest)))
+    (is (string= "0" (cdr (assoc "listen" cells :test #'string=))))
+    (is (string= "0" (cdr (assoc "settings" cells :test #'string=))))
+    (is-false (assoc "nolisten" cells :test #'string=))))
+
+(test conf-file-double-negative-means-true
+  "`nofoo=0` is a double negative and means -foo=1, which Core supports and
+warns about (args.cpp:114-118)."
+  (let ((cells (bitcoin-lisp::parse-bitcoin-conf-sections
+                (format nil "[regtest]~%nolisten=0~%") :regtest)))
+    (is (string= "1" (cdr (assoc "listen" cells :test #'string=))))))
+
+(test conf-file-negation-is-unconditional-like-core
+  "Core's InterpretKey strips `no` without consulting any option table
+(args.cpp:86-89), and so does INTERPRET-ARG. Gating the strip on the remainder
+being a known option would make what a line in bitcoin.conf MEANS depend on the
+contents of a lookup table — adding an option would silently change the meaning
+of config files already on disk. An unknown result is warned about and ignored,
+which is also what Core does with it."
+  (let ((cells (bitcoin-lisp::parse-bitcoin-conf-sections
+                (format nil "[regtest]~%nodetour=5~%") :regtest)))
+    ;; `5' is truthy, so the negation stands: -detour=0.
+    (is (string= "0" (cdr (assoc "detour" cells :test #'string=))))
+    (is-false (assoc "nodetour" cells :test #'string=))
+    (is (equal '("detour") (bitcoin-lisp:unknown-config-file-keys cells)))))
+
+(test one-interpreter-for-the-command-line-and-the-config-file
+  "INTERPRET-ARG is the single home for Core's InterpretKey/InterpretValue. It
+used to be written out three times — parse-cli-args, the config-file parser and
+the arg-log renderer — and the copies had already drifted apart on whether the
+`no` prefix was stripped at all, so the same string meant different things
+depending on which parser saw it."
+  (flet ((cli (&rest args) (bitcoin-lisp::parse-cli-args args))
+         (conf (text) (bitcoin-lisp::parse-bitcoin-conf-sections text :regtest)))
+    ;; Same option, same meaning, from either source.
+    (is (equal (cdr (assoc "listen" (cli "-nolisten") :test #'string=))
+               (cdr (assoc "listen" (conf (format nil "[regtest]~%nolisten=1~%"))
+                           :test #'string=))))
+    ;; And the same double-negative rule.
+    (is (equal (cdr (assoc "listen" (cli "-nolisten=0") :test #'string=))
+               (cdr (assoc "listen" (conf (format nil "[regtest]~%nolisten=0~%"))
+                           :test #'string=))))))
+
+(test cli-arg-log-renders-the-json-core-stored
+  "Core logs the JSON VALUE it stored, not the string the option readers see:
+a negation is `false`, a bare -flag is the empty string, and -flag=x is the
+string \"x\" (args.cpp:105-126, 880-884)."
+  (let ((cells (bitcoin-lisp::%cli-arg-log-cells
+                (list "-nolisten" "-prune=550" "-txindex"))))
+    (is (string= "false" (cdr (assoc "listen" cells :test #'string=))))
+    (is (string= "\"550\"" (cdr (assoc "prune" cells :test #'string=))))
+    (is (string= "\"\"" (cdr (assoc "txindex" cells :test #'string=))))))
+
+(test conf-file-negation-works-in-the-global-area-too
+  "The global area is parsed by the same loop, so a negation before any
+[section] header has to behave the same way."
+  (let ((globals (bitcoin-lisp::conf-global-entries
+                  (format nil "nolisten=1~%regtest=1~%"))))
+    (is (string= "0" (cdr (assoc "listen" globals :test #'string=))))))
+
+(test settings-json-wallet-must-be-strings
+  "Core validates the JSON TYPE of the wallet list rather than coercing it
+(wallet/load.cpp:81-86): every element must be a string. feature_settings.py
+drives all six shapes below and requires the node to refuse each one."
+  (flet ((err (json)
+           (bitcoin-lisp:validate-settings-values
+            (bitcoin-lisp:parse-settings-json json "/d/settings.json"))))
+    (dolist (bad '("{\"wallet\": [10]}"
+                   "{\"wallet\": [true]}"
+                   "{\"wallet\": [[]]}"
+                   "{\"wallet\": [{}]}"
+                   "{\"wallet\": [\"w1\", 10]}"
+                   "{\"wallet\": [\"w1\", false]}"))
+      (is-true (err bad) "~A must be refused" bad)
+      (when (err bad)
+        (is-true (search "'-wallet' requires a string value" (err bad)))))
+    ;; And the valid shapes are not refused.
+    (is-false (err "{\"wallet\": [\"w1\"]}"))
+    (is-false (err "{\"wallet\": [\"w1\", \"w2\"]}"))
+    (is-false (err "{\"wallet\": \"w1\"}"))
+    ;; A JSON false is -nowallet, which is how Core disables all wallets.
+    (is-false (err "{\"wallet\": false}"))
+    ;; No wallet key at all is obviously fine.
+    (is-false (err "{\"prune\": \"550\"}"))))

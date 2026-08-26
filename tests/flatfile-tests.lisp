@@ -1163,3 +1163,173 @@ body — one of them would have been missed."
       (is-false (bitcoin-lisp.storage:get-block
                  store (make-array 32 :element-type '(unsigned-byte 8)
                                       :initial-element 42))))))
+
+;;;; --- prune locks (Core BlockManager::m_prune_locks) ---
+
+(defmacro %with-clean-prune-locks (&body body)
+  "Run BODY with a private prune-lock table, so a test can never leave a lock
+behind for the next one.
+
+:SYNCHRONIZED like the real one — a test that exercised a plain table would not
+be exercising what production runs, and the synchronization is the whole reason
+that variable is allowed to be global."
+  `(let ((bitcoin-lisp.storage:*prune-locks*
+           (make-hash-table :test 'equal :synchronized t)))
+     ,@body))
+
+(test prune-lock-ceiling-with-no-locks-is-the-chain-height
+  "With nothing registered, pruning is unconstrained — the ceiling is the tip."
+  (%with-clean-prune-locks
+    (is (= 1000 (bitcoin-lisp.storage:prune-lock-ceiling 1000)))))
+
+(test prune-lock-ceiling-subtracts-the-buffer-and-one
+  "Core: lock_height = height_first - PRUNE_LOCK_BUFFER - 1
+\(validation.cpp:2727). An index at height 500 protects 489 upward."
+  (%with-clean-prune-locks
+    (bitcoin-lisp.storage:register-prune-lock "idx" (lambda () 500))
+    (is (= (- 500 bitcoin-lisp.storage:+prune-lock-buffer+ 1)
+           (bitcoin-lisp.storage:prune-lock-ceiling 1000)))
+    (is (= 489 (bitcoin-lisp.storage:prune-lock-ceiling 1000)))))
+
+(test prune-lock-ceiling-takes-the-lowest-lock
+  "Several locks: the most-behind index wins, because pruning past it would
+destroy undo data it still has to read."
+  (%with-clean-prune-locks
+    (bitcoin-lisp.storage:register-prune-lock "fast" (lambda () 900))
+    (bitcoin-lisp.storage:register-prune-lock "slow" (lambda () 300))
+    (is (= 289 (bitcoin-lisp.storage:prune-lock-ceiling 1000)))))
+
+(test prune-lock-ceiling-never-exceeds-the-chain-height
+  "A lock ahead of the tip does not RAISE the ceiling — Core seeds last_prune
+with the chain height and only ever lowers it."
+  (%with-clean-prune-locks
+    (bitcoin-lisp.storage:register-prune-lock "ahead" (lambda () 5000))
+    (is (= 100 (bitcoin-lisp.storage:prune-lock-ceiling 100)))))
+
+(test prune-lock-ceiling-floors-at-one
+  "Core floors last_prune at 1 (max(1, min(...))), so an index near genesis
+cannot drive the ceiling negative."
+  (%with-clean-prune-locks
+    (bitcoin-lisp.storage:register-prune-lock "new" (lambda () 3))
+    (is (= 1 (bitcoin-lisp.storage:prune-lock-ceiling 1000)))))
+
+(test prune-lock-with-no-height-does-not-constrain
+  "A registered-but-empty index is Core's height_first == INT_MAX: it imposes
+no constraint. Reading -1 as a height instead would clamp the ceiling to 1 and
+stop a pruned node from ever reclaiming space."
+  (%with-clean-prune-locks
+    (bitcoin-lisp.storage:register-prune-lock "empty" (lambda () nil))
+    (is (= 1000 (bitcoin-lisp.storage:prune-lock-ceiling 1000)))))
+
+(test prune-lock-registration-replaces-by-name
+  "Re-registering the same name replaces, so a node restart cannot stack two
+locks for one index."
+  (%with-clean-prune-locks
+    (bitcoin-lisp.storage:register-prune-lock "idx" (lambda () 300))
+    (bitcoin-lisp.storage:register-prune-lock "idx" (lambda () 900))
+    (is (= 889 (bitcoin-lisp.storage:prune-lock-ceiling 1000)))
+    (bitcoin-lisp.storage:clear-prune-locks)
+    (is (= 1000 (bitcoin-lisp.storage:prune-lock-ceiling 1000)))))
+
+(test prune-lock-signalling-thunk-does-not-break-pruning
+  "A thunk that errors (a closed index DB after shutdown, say) is treated as
+absent rather than taking the node's pruning down with it."
+  (%with-clean-prune-locks
+    (bitcoin-lisp.storage:register-prune-lock
+     "broken" (lambda () (error "index closed")))
+    (is (= 1000 (bitcoin-lisp.storage:prune-lock-ceiling 1000)))))
+
+(test prune-lock-stops-a-real-flat-file-prune
+  "The seam for prune locks: PRUNE-LOCK-CEILING being right is worthless if
+PRUNE-OLD-BLOCKS never consults it. Drive the real entry point with usage far
+over target and an index parked at height 1, and require the file to SURVIVE —
+then drop the lock and require the same call to delete it.
+
+Without this, a filter index that had not caught up would have its undo data
+deleted out from under it, and the only symptom would be the index failing to
+build much later."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+            (bitcoin-lisp.storage:*prune-locks*
+              (make-hash-table :test 'equal :synchronized t))
+            (store (bitcoin-lisp.storage:init-block-store dir))
+            (cs (bitcoin-lisp.storage:init-chain-state dir))
+            (genesis (bitcoin-lisp.storage:best-block-hash cs))
+            (prev (bitcoin-lisp.storage:make-block-index-entry
+                   :hash genesis :height 0 :chain-work 1 :status :valid)))
+       (bitcoin-lisp.storage:add-block-index-entry cs prev)
+       (let ((tip-height (+ bitcoin-lisp:+min-blocks-to-keep+ 40)))
+         (loop for h from 1 to 3
+               do (let* ((b (%ff-test-block (+ 100 h)))
+                         (hash (bitcoin-lisp.storage:store-block store b :height h))
+                         (entry (bitcoin-lisp.storage:make-block-index-entry
+                                 :hash hash :height h :chain-work (1+ h)
+                                 :status :valid :prev-entry prev)))
+                    (bitcoin-lisp.storage:add-block-index-entry cs entry)
+                    (setf prev entry)))
+         (bitcoin-lisp.storage:update-chain-tip
+          cs (bitcoin-lisp.storage:block-index-entry-hash prev) tip-height)
+         (let ((path (merge-pathnames "blocks/blk00000.dat" dir))
+               (bitcoin-lisp:*prune-target-mib* 550)
+               (bitcoin-lisp:*prune-after-height* 0))
+           (is-true (probe-file path))
+           (setf (bitcoin-lisp.storage:block-store-total-bytes store)
+                 (* 600 1024 1024))
+           ;; An index at height 1 protects everything from 1 - 10 - 1 = -10
+           ;; upward, floored at 1 — so nothing at all may be pruned.
+           (bitcoin-lisp.storage:register-prune-lock "slowindex" (lambda () 1))
+           (is (= 0 (bitcoin-lisp.storage:prune-old-blocks store cs))
+               "a lagging index must hold the whole prune off")
+           (is-true (probe-file path) "the blk file must survive the lock")
+           ;; And the HORIZON must not move either. It used to: the legacy
+           ;; per-block walk ran over the same heights, PRUNE-BLOCK refused
+           ;; each one for being in a flat file, and the walk advanced
+           ;; PRUNED-HEIGHT anyway — which both claims a prune that never
+           ;; happened and pushes the walk start past the file's first height,
+           ;; after which %PRUNABLE-FLAT-FILES never offers the file again and
+           ;; the node stops reclaiming space permanently.
+           (is (= 0 (bitcoin-lisp.storage::chain-state-pruned-height cs))
+               "the prune horizon must not advance over blocks still on disk")
+           ;; The same call, with the lock gone, deletes it — which is what
+           ;; proves the survival above came from the lock and not from some
+           ;; unrelated refusal.
+           (bitcoin-lisp.storage:clear-prune-locks)
+           (is (= 3 (bitcoin-lisp.storage:prune-old-blocks store cs)))
+           (is-false (probe-file path))))))))
+
+(test prune-lock-stops-a-manual-prune-too
+  "Core caps FindFilesToPruneManual by the same lock-limited last_prune
+(validation.cpp:2740-2745), so pruneblockchain cannot step around an index
+either."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+            (bitcoin-lisp.storage:*prune-locks*
+              (make-hash-table :test 'equal :synchronized t))
+            (store (bitcoin-lisp.storage:init-block-store dir))
+            (cs (bitcoin-lisp.storage:init-chain-state dir))
+            (genesis (bitcoin-lisp.storage:best-block-hash cs))
+            (prev (bitcoin-lisp.storage:make-block-index-entry
+                   :hash genesis :height 0 :chain-work 1 :status :valid)))
+       (bitcoin-lisp.storage:add-block-index-entry cs prev)
+       (let ((tip-height (+ bitcoin-lisp:+min-blocks-to-keep+ 40)))
+         (loop for h from 1 to 3
+               do (let* ((b (%ff-test-block (+ 150 h)))
+                         (hash (bitcoin-lisp.storage:store-block store b :height h))
+                         (entry (bitcoin-lisp.storage:make-block-index-entry
+                                 :hash hash :height h :chain-work (1+ h)
+                                 :status :valid :prev-entry prev)))
+                    (bitcoin-lisp.storage:add-block-index-entry cs entry)
+                    (setf prev entry)))
+         (bitcoin-lisp.storage:update-chain-tip
+          cs (bitcoin-lisp.storage:block-index-entry-hash prev) tip-height)
+         (let ((path (merge-pathnames "blocks/blk00000.dat" dir))
+               (bitcoin-lisp:*prune-target-mib* 1))   ; manual-only mode
+           (bitcoin-lisp.storage:register-prune-lock "slowindex" (lambda () 1))
+           (is (= 0 (bitcoin-lisp.storage:prune-blocks-to-height store cs 100))
+               "pruneblockchain must respect the lock as well")
+           (is-true (probe-file path))
+           (bitcoin-lisp.storage:clear-prune-locks)
+           (is (= 3 (bitcoin-lisp.storage:prune-blocks-to-height store cs 100)))
+           (is-false (probe-file path))))))))

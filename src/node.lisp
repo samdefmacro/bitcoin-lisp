@@ -2655,7 +2655,7 @@ case ever exercised) has genesis for a root."
                         (log-level :info)
                         (log-file nil)
                         (log-rate-limit t)
-                        (flat-block-files nil)
+                        (flat-block-files bitcoin-lisp.storage:*flat-block-files*)
                         (reindex nil)
                         (console-log t)
                         (max-peers 8)
@@ -2789,6 +2789,16 @@ Returns the node instance."
       ;; later — and the first log line is emitted before that.
       (ensure-directories-exist path)
       (start-file-logging path)))
+  ;; The level BEFORE the flush below, not 270 lines further down where it used
+  ;; to be set: a deferred line is filtered when it is emitted, so flushing
+  ;; first would judge every queued line against whatever level the image
+  ;; happened to hold — the load-time default in a fresh process, and in a REPL
+  ;; or test image whatever the PREVIOUS start-node left behind.
+  (setf *current-log-level* log-level)
+  ;; Everything config parsing queued before the file existed. Core logs its
+  ;; args after InitLogging for the same reason (init.cpp), and its functional
+  ;; tests read those lines back out of debug.log.
+  (flush-deferred-log-lines)
 
   ;; Operator hooks (Core -blocknotify / -shutdownnotify). Set before anything
   ;; can fire them.
@@ -3062,15 +3072,19 @@ to move them (the node must be stopped)."
   (install-shutdown-handler)
   ;; Periodic peers.dat dump baseline (first dump 15 min from now).
   (setf *last-peers-dump-time* (get-universal-time))
-  (setf *current-log-level* log-level)
   ;; Core DEFAULT_LOGRATELIMIT / -logratelimit (logging.h:65): on by default, so
   ;; no single log location can fill an operator's disk.
   (setf *log-rate-limit* (and log-rate-limit t)
         *log-rate-window-start* (get-universal-time)
         *log-suppressions-active* nil)
   (clrhash *log-rate-locations*)
-  ;; Transitional; see *FLAT-BLOCK-FILES*. Set before the block store is
-  ;; opened, since the store decides then whether to create an xor.dat.
+  ;; Set before the block store is opened, since the store decides then whether
+  ;; to create an xor.dat. The keyword's DEFAULT FORM reads the variable, and a
+  ;; &key default form is evaluated at call time — so an omitted argument round
+  ;; -trips the variable's own value and only an explicit -flatblockfiles=0/1
+  ;; changes it. A literal NIL default here would have pinned every real node to
+  ;; the per-block format no matter what the variable said, since this SETF runs
+  ;; unconditionally on every start.
   (setf bitcoin-lisp.storage:*flat-block-files* (and flat-block-files t))
   (log-info "Bitcoin-Lisp Node v~A" (bitcoin-lisp.serialization:client-version-string))
   (log-info "Network: ~A" network)
@@ -3149,6 +3163,10 @@ to move them (the node must be stopped)."
   (log-info "Initializing block storage...")
   (setf (node-block-store *node*)
         (bitcoin-lisp.storage:init-block-store (node-data-directory *node*)))
+  ;; Genesis is never RECEIVED, so nothing else ever writes its body. Core has
+  ;; it on disk from initialisation, which is what makes blk00000.dat start at
+  ;; height 0 for every reader that walks the block files from outside the node.
+  (bitcoin-lisp.storage:ensure-genesis-on-disk (node-block-store *node*))
 
   ;; Initialize UTXO storage: LevelDB-backed coins-view-cache.
   ;;
@@ -3444,6 +3462,12 @@ to move them (the node must be stopped)."
     (log-info "Transaction index loaded: ~D entries"
               (bitcoin-lisp.storage:txindex-count (node-tx-index *node*))))
 
+  ;; Prune locks are re-registered from scratch on every start: registration is
+  ;; by name, so a re-init replaces rather than accumulates, but an index that
+  ;; was enabled last run and is disabled this one would otherwise leave a lock
+  ;; behind holding the prune horizon down forever.
+  (bitcoin-lisp.storage:clear-prune-locks)
+
   ;; Initialize BIP158 block filter index (optional)
   (when blockfilterindex
     (log-info "Initializing block filter index...")
@@ -3453,6 +3477,18 @@ to move them (the node must be stopped)."
                                                        :enabled t))
     (log-info "Block filter index loaded: indexed to height ~D"
               (bitcoin-lisp.storage:blockfilterindex-height (node-blockfilterindex *node*)))
+    ;; The filter index needs each block's undo data to build its filter, so
+    ;; pruning must not run ahead of it (Core blockfilterindex AllowPrune() ->
+    ;; true, and BaseIndex::SetBestBlockIndex takes a lock at its best height).
+    (let ((bfi (node-blockfilterindex *node*)))
+      (bitcoin-lisp.storage:register-prune-lock
+       "blockfilterindex"
+       (lambda ()
+         ;; -1 is "nothing indexed yet", which is Core's height_first ==
+         ;; INT_MAX: no height to protect, so no constraint. Returning it
+         ;; verbatim would drive the ceiling to 1 and stop pruning outright.
+         (let ((h (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+           (and (plusp h) h)))))
     ;; One-time catch-up over already-stored blocks, before the sync thread
     ;; starts (single-threaded here, so no writer races). Fresh-from-genesis
     ;; nodes have nothing to do; the connect-time hook then indexes forward.
@@ -3480,6 +3516,14 @@ to move them (the node must be stopped)."
                                                     :enabled t))
     (log-info "Coinstats index loaded: indexed to height ~D"
               (bitcoin-lisp.storage:coinstatsindex-height (node-coinstatsindex *node*)))
+    ;; Same reasoning as the filter index (Core coinstatsindex AllowPrune() ->
+    ;; true): its per-block statistics are derived from undo data.
+    (let ((csi (node-coinstatsindex *node*)))
+      (bitcoin-lisp.storage:register-prune-lock
+       "coinstatsindex"
+       (lambda ()
+         (let ((h (bitcoin-lisp.storage:coinstatsindex-height csi)))
+           (and (plusp h) h)))))
     ;; A chainstate reindex may have changed UTXO-set contents (e.g. dropping
     ;; unspendable outputs), so the coinstats records must be rebuilt to stay
     ;; consistent. Clear the best marker to force a full rebuild below.
@@ -4018,6 +4062,97 @@ is visible rather than inherited by accident."
        legacy-path)
       (t core-path))))
 
+(defun %settings-file-path (scope datadir network)
+  "Where the read-write settings file lives, or NIL when -nosettings turned it
+off (Core ArgsManager::GetSettingsPath).
+
+Default is settings.json in the NETWORK directory, not the datadir root — on
+regtest that is <datadir>/regtest/settings.json, which is the path the
+functional tests compute as `node.chain_path / \"settings.json\"`. An explicit
+-settings= is taken relative to the DATADIR, as Core does.
+
+SCOPE is the command line followed by the config file's sections and globals,
+in precedence order — -settings is an ordinary option and can be set in
+bitcoin.conf like any other (feature_settings.py drives exactly that with a
+`nosettings=1` appended to the [regtest] section). It cannot come from the
+settings file itself, which is why SCOPE is assembled here rather than taken
+from the merged config."
+  (let ((value (cdr (assoc "settings" scope :test #'string=))))
+    (cond
+      ;; -nosettings arrives as "0" from PARSE-CLI-ARGS' negation handling.
+      ((and value (string= value "0")) nil)
+      ((and value (not (string= value "1")))
+       (merge-pathnames value (pathname datadir)))
+      (t (merge-pathnames "settings.json"
+                          (network-data-path (pathname datadir) network))))))
+
+(defun %read-settings-file (path)
+  "The settings file at PATH as an alist, or NIL when there is none.
+
+A malformed file ABORTS startup, exactly as Core does (common/init.cpp:99-108
+turns a failed ReadSettingsFile into a fatal ConfigError). Starting anyway with
+the file ignored would run the node on settings the operator cannot see in it."
+  (unless (probe-file path)
+    (return-from %read-settings-file nil))
+  (multiple-value-bind (alist errors)
+      (bitcoin-lisp:parse-settings-json
+       (handler-case (alexandria:read-file-into-string path)
+         (error (e)
+           (error "Settings file could not be read: ~A. Please check permissions." e)))
+       (namestring path))
+    (when errors
+      (error "Settings file could not be read: ~{~A~^; ~}" errors))
+    (let ((invalid (bitcoin-lisp:validate-settings-values alist)))
+      (when invalid (error "~A" invalid)))
+    (dolist (name (bitcoin-lisp:unknown-settings-keys alist))
+      (defer-log :warn "Ignoring unknown rw_settings value ~A" name))
+    alist))
+
+(defun %write-settings-file (path alist)
+  "Rewrite PATH with ALIST plus Core's warning comment.
+
+Temp file, fsync, rename, fsync the directory — the same discipline
+BITCOIN-LISP.RPC::%WRITE-SETTINGS uses for the wallet half of this very file.
+Core writes it through a temp and a rename too (args.cpp:429-460). Without the
+fsyncs a crash can leave the renamed file empty or revert the rename, and this
+is now rewritten on EVERY start, so it is the crash window an operator hits
+most often. A truncated settings file refuses the next start outright.
+
+The wallet layer is the other writer: it reads the whole object and replaces
+only the "wallet" key, and this reader keeps every key it did not put there,
+so the two compose rather than clobbering each other."
+  (handler-case
+      (let ((tmp (make-pathname :type "json.tmp" :defaults path)))
+        (ensure-directories-exist path)
+        (with-open-file (out tmp :direction :output :external-format :utf-8
+                                 :if-exists :supersede :if-does-not-exist :create)
+          (write-string (bitcoin-lisp:render-settings-json alist) out))
+        (bitcoin-lisp.storage::fsync-file tmp)
+        (rename-file tmp path)
+        (bitcoin-lisp.storage::fsync-directory path))
+    (error (e)
+      (error "Settings file could not be written: ~A" e))))
+
+(defun %log-args (args conf-texts settings-cells network)
+  "Core's LogArgs(): every option that actually took effect, tagged with where
+it came from and rendered as the JSON value that was stored.
+
+Only KNOWN options are logged for the config file and the command line — Core
+skips anything GetArgFlags does not recognise (args.cpp:880-884) — while EVERY
+settings-file entry is logged, known or not."
+  (dolist (text conf-texts)
+    (dolist (cell (bitcoin-lisp::%config-arg-log-cells text network))
+      (destructuring-bind (section name json) cell
+        (when (known-config-option-p name)
+          (defer-log :info "Config file arg: ~:[~;[~:*~A] ~]~A=~A"
+                     (and (plusp (length section)) section) name json)))))
+  (dolist (cell settings-cells)
+    (defer-log :info "Setting file arg: ~A = ~A"
+               (car cell) (bitcoin-lisp:render-json-value (cdr cell))))
+  (dolist (cell (bitcoin-lisp::%cli-arg-log-cells args))
+    (when (known-config-option-p (car cell))
+      (defer-log :info "Command-line arg: ~A=~A" (car cell) (cdr cell)))))
+
 (defun start-node-from-args (&optional (args (rest sb-ext:*posix-argv*)))
   "Start the node from Bitcoin Core-style options: a list of CLI ARGS
  (-key=value, -key, -nokey) plus a bitcoin.conf read from the data directory.
@@ -4055,10 +4190,31 @@ file location."
          (conf-text (progn
                       (%check-datadir-option cli)
                       (when (probe-file conf-path)
-                        (log-info "Reading config file ~A" conf-path)
+                        (defer-log :info "Reading config file ~A" conf-path)
                         (alexandria:read-file-into-string conf-path))))
-         (conf-texts (%read-config-includes conf-text cli datadir)))
-    (multiple-value-bind (plist merged) (args->start-node-plist args conf-texts)
+         (conf-texts (%read-config-includes conf-text cli datadir))
+         ;; The settings file lives inside the NETWORK directory, so the
+         ;; network has to be resolved first — from the command line and the
+         ;; config file's global area only, which is where Core reads its chain
+         ;; selectors (args.cpp:825-829). Resolving it from the merged config
+         ;; instead would let settings.json choose the directory it is read
+         ;; from.
+         (conf-globals (loop for text in conf-texts
+                             append (conf-global-entries text)))
+         (settings-network (resolve-network-from-config (append cli conf-globals)))
+         ;; CLI, then the [network] section, then the global area — the same
+         ;; order ARGS->START-NODE-PLIST uses, minus the settings file itself.
+         (settings-scope
+           (append cli
+                   (loop for text in conf-texts
+                         append (parse-bitcoin-conf-sections text settings-network))
+                   conf-globals))
+         (settings-path (%settings-file-path settings-scope datadir settings-network))
+         (settings-cells (and settings-path (%read-settings-file settings-path))))
+    (multiple-value-bind (plist merged)
+        (args->start-node-plist args conf-texts
+                                (bitcoin-lisp:settings-alist->config-alist
+                                 settings-cells))
       ;; Unknown CONFIG-FILE keys only warn (Core ReadConfigFiles with
       ;; ignore_invalid_keys=true, common/init.cpp:38: "Ignoring unknown
       ;; configuration value") — unlike unknown CLI options, which error.
@@ -4066,16 +4222,26 @@ file location."
       ;; included file is exactly as worth reporting.
       (dolist (k (unknown-config-file-keys
                   (loop for text in conf-texts append (parse-bitcoin-conf text))))
-        (log-warn "Ignoring unknown configuration value ~A" k))
+        (defer-log :warn "Ignoring unknown configuration value ~A" k))
       ;; Options bitcoind accepts that this node does not implement. They are
       ;; accepted so an ordinary Core command line starts us at all, but every
       ;; one that was actually SUPPLIED is named here — an operator who passes
       ;; -asmap or -whitelist must not be left believing it took effect.
       (let ((ignored (supplied-core-only-options merged)))
         (when ignored
-          (log-warn "Accepted but NOT implemented by this node, so ~
+          (defer-log :warn "Accepted but NOT implemented by this node, so ~
 ~:[this option has~;these options have~] no effect: ~{-~A~^ ~}"
-                    (rest ignored) ignored)))
+                     (rest ignored) ignored)))
+      ;; Core's LogArgs(), in Core's order: config file, then settings file,
+      ;; then command line (args.cpp:889-900). The functional tests read these
+      ;; back to check how an option was actually resolved, so both the wording
+      ;; and the JSON rendering of the value are part of the contract.
+      (%log-args args conf-texts settings-cells settings-network)
+      ;; Rewriting it on every start is what makes a datadir that has ever been
+      ;; started always have one, which is what Core does (common/init.cpp:111)
+      ;; and what feature_settings.py asserts.
+      (when settings-path
+        (%write-settings-file settings-path settings-cells))
       ;; Apply the process-global config specials (options with no start-node
       ;; keyword) from the same merged config, before launching.
       (apply-config-globals merged)
@@ -5096,6 +5262,13 @@ thread; see the shutdown-coordination section above."
   (when (node-tx-index *node*)
     (log-info "Closing transaction index...")
     (bitcoin-lisp.storage:close-tx-index (node-tx-index *node*)))
+
+  ;; Drop the prune locks before the DBs they read close. Each lock is a thunk
+  ;; holding the index object, so leaving them registered keeps a stopped
+  ;; node's indexes reachable AND leaves the thunks callable against closed
+  ;; LevelDB handles — a live hazard in a test image that starts several nodes,
+  ;; since the next PRUNE-LOCK-CEILING would consult the previous node's index.
+  (bitcoin-lisp.storage:clear-prune-locks)
 
   ;; Close block filter index
   (when (node-blockfilterindex *node*)

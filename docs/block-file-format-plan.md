@@ -1,11 +1,36 @@
 # Core Block-File Format (blk/rev + XOR) — Implementation Plan
 
-Date: 2026-07-10. Status (2026-08-20): **P0-P5 BUILT.** P0 undo codec, P1 flat-file
-engine, P2 index integration + dual read, P3 file-granular pruning, P4 migration
-(`migrateblocks` RPC), P5 `reindex-block-index`. Live on testnet4 for NEW blocks
-(`:flat-block-files t`); mainnet stays off until the testnet4 soak and the migration
-have both been exercised there. P4 deliberately deviates from the plan's "one-shot
-offline converter": see below.
+Date: 2026-07-10. Status (2026-08-26): **P0-P5 BUILT AND DEFAULT ON.** P0 undo
+codec, P1 flat-file engine, P2 index integration + dual read, P3 file-granular
+pruning **+ prune locks**, P4 migration (`migrateblocks` RPC), P5
+`reindex-block-index`. P4 deliberately deviates from the plan's "one-shot offline
+converter": see below.
+
+`*flat-block-files*` now defaults to **T** — a fresh datadir is Core-shaped from
+the first byte (`blocks/blk00000.dat`, `rev00000.dat`, `xor.dat`,
+`blocks/index/`), which is what Core's functional tests read and delete by name.
+`-flatblockfiles=0` still selects the per-block format, and dual read means a
+datadir in either form, or both, stays fully readable whichever way the flag is
+set. An EXISTING datadir is untouched: its old per-block files keep being read,
+and only new blocks go into blk files.
+
+Two things had to land with the flip, both found by flipping it:
+
+- **Prune locks** (Core `BlockManager::m_prune_locks`, `PRUNE_LOCK_BUFFER` 10).
+  The two prunable indexes — blockfilterindex and coinstatsindex, matching Core's
+  `AllowPrune() == true` — register a lock at startup, and both prune drivers cap
+  their horizon at `height_first - 10 - 1`. Without it a lagging index has the
+  undo data it still needs deleted underneath it.
+- **`forget-block-body`** (storage/blocks.lisp). `prune-block` REFUSES for a
+  block inside a flat file, because a blk file cannot have a block cut out of the
+  middle of it. The reorg path's witness-stripped self-heal wanted "make this
+  copy unreadable", not "reclaim space", and calling `prune-block` there left
+  `get-block` serving the same stripped body to every retry. The same refusal
+  also meant the legacy per-block walk inside both prune drivers advanced
+  `chain-state-pruned-height` over blocks it had not pruned — which on a
+  flat-format store marches the walk start past the file's own first height and
+  stops a pruned node reclaiming space permanently. Both drivers now skip flat
+  records in that walk.
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (v30-dev). Researched via 2 agents
 (Core block/undo storage byte-level; our storage architecture).
 
@@ -101,7 +126,7 @@ and drains recursively after each accept (validation.cpp:4988-5155).
 | **P0** | TxOutCompression codec (**shared with assumeutxo-plan P0**) + Core CBlockUndo serializer/deserializer; byte-exact tests vs Core vectors | S |
 | **P1** | Flat-file engine, standalone: FlatFileSeq (naming, chunked preallocate, truncate-finalize, fsync discipline incl. checked close), record framing (magic+len), undo checksum, XOR AutoFile layer + xor.dat lifecycle; unit tests incl. offset-mod-8 XOR and magic-hunting reader | M |
 | **P2** | Index integration: `block-index-entry` gains file/data-pos/undo-pos + have-data/have-undo bits; headerindex.dat **v3**; per-file `CBlockFileInfo`-equivalent tracking persisted (into headerindex.dat trailer or a small side file); `store-block`/`get-block`/undo rewired behind the unchanged API; **dual-read**: legacy per-block files remain readable | M-L |
-| **P3** | Pruning → file-granular (whole blk+rev pairs; keep monotone pruned-height semantics + `pruneblockchain` RPC; add a blockfilterindex prune-lock equivalent with the 10-block buffer) | M |
+| **P3** | Pruning → file-granular (whole blk+rev pairs; keep monotone pruned-height semantics + `pruneblockchain` RPC; add a blockfilterindex prune-lock equivalent with the 10-block buffer) | M | ✅ — the prune-lock half landed 2026-08-26, six days after the rest of P3 was marked built. Registration is a THUNK per index rather than a stored height: Core updates its lock inside `SetBestBlockIndex`, the one funnel every index passes through, and we have no such funnel — both prunable indexes write their meta record from several places, so a remembered height would silently go stale the next time a write site was added. |
 | **P4** | **Migration**: `migrateblocks` RPC — an incremental, resumable, budgeted converter that runs ON the live node instead of offline. See §4.1. | M |
 | **P5** | *(optional)* Full `-reindex`: ImportBlocks scan + unknown-parent multimap + `'R'`-equivalent resume flag; `-loadblock=` | M |
 
