@@ -65,17 +65,25 @@ case "$NETWORK" in
     # exercise the LevelDB txindex from GA9 S2-13 against a real chain -- the
     # previous in-memory implementation could not run at mainnet scale at all,
     # so this path has never had production exposure.
-    # :flat-block-files on testnet4 ONLY. New blocks go into Core's numbered
+    # :flat-block-files is the LIBRARY DEFAULT since 2026-08-26 (PR #513), so
+    # this is now redundant here and kept only because it states the intent at
+    # the place an operator reads. New blocks go into Core's numbered
     # blk?????.dat instead of one file per block; the existing per-block files
     # stay readable (dual read), and turning the flag back off leaves the flat
-    # records readable too, so this is reversible in both directions. Mainnet
-    # stays off until this has soaked here -- it is the pruned node, and
-    # pruning a flat file is all-or-nothing.
+    # records readable too, so this is reversible in both directions.
     START_OPTS=':blockfilterindex t :v2transport t :coinstatsindex t :txindex t :flat-block-files t' ;;
   mainnet)
     HEAP=5120; RPC_PORT=8332
     DATA_DIR="$BL_DATA_ROOT/mainnet-prune/"; LOG="$BL_LOG_ROOT/mainnet.log"
-    START_OPTS=':prune 4096 :listen nil :max-peers 16 :dbcache-mib 2048 :blockfilterindex t :v2transport t' ;;
+    # :flat-block-files EXPLICITLY OFF. It became the library default in PR
+    # #513, and this line said nothing about it — so that change would have
+    # switched mainnet's on-disk format on its next restart, silently, with no
+    # line in this file to say so. Mainnet is the PRUNED node and the one
+    # carrying years of per-block files; the block-file plan stages it behind a
+    # testnet4 soak and the `migrateblocks` RPC for exactly that reason.
+    # Turning it on here is a deliberate one-word change, not a default nobody
+    # re-read.
+    START_OPTS=':prune 4096 :listen nil :max-peers 16 :dbcache-mib 2048 :blockfilterindex t :v2transport t :flat-block-files nil' ;;
   regtest)
     HEAP=4096; RPC_PORT=18443
     DATA_DIR="$BL_DATA_ROOT/regtest/"; LOG="$BL_LOG_ROOT/regtest.log"
