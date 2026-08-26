@@ -289,6 +289,7 @@ what matters is the object the workers actually share."
     "BITCOIN-LISP.SERIALIZATION::*ADDRV2-ADDR-SIZES*"
     "BITCOIN-LISP.STORAGE::*LEVELDB-OWNED-RESOURCES*"
     "BITCOIN-LISP.VALIDATION::*BLOCK-UNDO-DATA*"
+    "BITCOIN-LISP.VALIDATION::*MOST-RECENT-BLOCK-TXS*"
     "BITCOIN-LISP.VALIDATION::*OPCODE-NAMES*"
     "BITCOIN-LISP.VALIDATION::*TEST-ACTIVATION-HEIGHTS*"
     "BITCOIN-LISP.VALIDATION::*UNDO-CACHE-HEIGHTS*"
@@ -300,7 +301,15 @@ Each is either populated once at load or start-up and read-only afterwards
 (*OPCODE-NAMES*, *ADDRV2-ADDR-SIZES*, *DEBUG-CATEGORIES*,
 *TEST-ACTIVATION-HEIGHTS*), or written under an explicit lock
 (*BANNED-PEERS* under *BAN-LOCK*, *LOG-RATE-LOCATIONS* under *LOG-LOCK*), or
-touched only by the single sync/validation thread.
+touched only by the single sync/validation thread, or REPLACED WHOLESALE rather
+than mutated (*MOST-RECENT-BLOCK-TXS*: the validation thread fills a fresh table
+and only then assigns it, so a net thread serving a compact block reads a table
+nobody is still writing to).
+
+*MOST-RECENT-BLOCK-TXS* is NIL until the first block connects, so whether it
+appears here at all depends on what ran before this test in the same image. It
+is listed rather than left to chance — an entry that is absent costs a
+trim-the-list failure, which is the cheaper direction to be wrong in.
 
 The list is the audit. It exists so that ADDING an unsynchronized global is a
 decision someone makes on purpose rather than a default nobody looked at --
@@ -328,12 +337,28 @@ worker path the way *FLAG-SET-CACHE* did."
                        (not (sb-ext:hash-table-synchronized-p (symbol-value sym))))
               (pushnew (format nil "~A::~A" pkg (symbol-name sym))
                        found :test #'equal))))))
-    (let ((new (sort (set-difference found +known-unsynchronized-globals+
-                                     :test #'equal)
-                     #'string<))
-          (gone (sort (set-difference +known-unsynchronized-globals+ found
+    (let* ((new (sort (set-difference found +known-unsynchronized-globals+
                                       :test #'equal)
-                      #'string<)))
+                      #'string<))
+           ;; A baseline entry counts as GONE only if its symbol is a hash
+           ;; table right now and that table is synchronized. Some of these
+           ;; start life as NIL and only become tables once the node has done
+           ;; something (*MOST-RECENT-BLOCK-TXS* needs a block to connect), so
+           ;; a symbol that is not a table says nothing about whether the entry
+           ;; is stale — and reading it as "gone" made this test pass or fail
+           ;; on which suites happened to run before it in the same image.
+           (gone (sort (remove-if-not
+                        (lambda (name)
+                          (let* ((colons (search "::" name))
+                                 (sym (and colons
+                                           (find-symbol (subseq name (+ colons 2))
+                                                        (subseq name 0 colons)))))
+                            (and sym (boundp sym)
+                                 (hash-table-p (symbol-value sym))
+                                 (sb-ext:hash-table-synchronized-p (symbol-value sym)))))
+                        (set-difference +known-unsynchronized-globals+ found
+                                        :test #'equal))
+                       #'string<)))
       (is (null new)
           "~D new unsynchronized global hash table~:P — classify each, and if a ~
 parallel script-check worker can reach it, synchronize it: ~S"

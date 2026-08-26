@@ -49,8 +49,17 @@
 
 (defun setup-pruning-test-store (n-blocks)
   "Set up a block store with N-BLOCKS for pruning tests.
-Returns (VALUES base-path block-store chain-state block-hashes)."
-  (let* ((base-path (ensure-directories-exist
+Returns (VALUES base-path block-store chain-state block-hashes).
+
+Blocks go into LEGACY per-block files, whatever the current default is. This
+suite asserts per-BLOCK prune semantics — \"prune to height 90 deletes 61..89\"
+— and those exist only in that format: a blk?????.dat prunes whole, so a store
+holding all 400 of these tiny blocks in one file can only prune all of them or
+none, which is Core's behaviour too. File-granular pruning has its own coverage
+in flatfile-tests.lisp (PRUNE-OLD-BLOCKS-ACTUALLY-PRUNES-A-FLAT-FILE,
+PRUNEBLOCKCHAIN-PRUNES-A-FLAT-FILE, PRUNE-LOCK-*)."
+  (let* ((bitcoin-lisp.storage:*flat-block-files* nil)
+         (base-path (ensure-directories-exist
                      (merge-pathnames (format nil "test-pruning-~A/" (get-universal-time))
                                       (uiop:temporary-directory))))
          (block-store (bitcoin-lisp.storage:init-block-store base-path))
@@ -466,8 +475,12 @@ and survive an init-block-store rescan."
           (is (> total 0))
           (let ((store2 (bitcoin-lisp.storage:init-block-store base-path)))
             (is (= total (bitcoin-lisp.storage:block-store-total-bytes store2))))
-          ;; Overwriting an existing block must not double-count
-          (let ((block (make-pruning-test-block (second block-hashes)
+          ;; Overwriting an existing block must not double-count. The binding
+          ;; keeps the rewrite in the same format the store already holds:
+          ;; appending it to a blk file instead would not be an overwrite at
+          ;; all, it would be a second copy, and the counter would rightly grow.
+          (let ((bitcoin-lisp.storage:*flat-block-files* nil)
+                (block (make-pruning-test-block (second block-hashes)
                                                 (third block-hashes) 2)))
             (bitcoin-lisp.storage:store-block block-store block)
             (is (= total (bitcoin-lisp.storage:block-store-total-bytes block-store))))

@@ -22,18 +22,22 @@ when its entire range lies inside the prunable window."
   (height-first nil :type (or null (unsigned-byte 32)))
   (height-last nil :type (or null (unsigned-byte 32))))
 
-(defvar *flat-block-files* nil
+(defvar *flat-block-files* t
   "Write new blocks into Core's numbered blk?????.dat files instead of one file
 per block.
 
-Transitional, and default OFF, for one reason: pruning is still per-block
-deletion, and a flat file cannot have a block cut out of the middle of it. A
-pruned node — which is what our mainnet node is — would silently stop reclaiming
-space the moment its new blocks went into flat files. File-granular pruning is
-P3 of docs/block-file-format-plan.md; this flag goes away with P4's migration.
+Default ON since 2026-08-26. It was OFF while pruning was per-block deletion,
+because a flat file cannot have a block cut out of the middle of it and a pruned
+node would have silently stopped reclaiming space the moment its new blocks went
+into flat files. That is no longer the case: PRUNE-OLD-BLOCKS and
+PRUNE-BLOCKS-TO-HEIGHT both select whole blk/rev pairs whose entire height range
+lies inside the prune window (Core FindFilesToPrune), and PRUNE-LOCK-CEILING
+keeps them off the tail an index still needs — P3 of
+docs/block-file-format-plan.md, complete.
 
-READING is not gated: a store always reads whichever form each block is in, so
-turning the flag on and off again leaves every block reachable.")
+Turning it off is still supported and still safe. READING is not gated: a store
+always reads whichever form each block is in, so a datadir written in either
+form, or in both, stays fully readable whichever way the flag is set.")
 
 (defstruct block-store
   "Block storage manager."
@@ -584,6 +588,15 @@ zero tail of the file currently being appended to looks like."
               (or (read-or-create-xor-key (merge-pathnames "blocks/" base-path)
                                           :create nil)
                   (zero-obfuscation-key))))
+    ;; blocks/index/ eagerly, even though nothing is written into it until the
+    ;; first index flush. Core opens its block-index LevelDB in BlockManager's
+    ;; constructor, so the directory exists from the moment the node is up — and
+    ;; the functional tests treat it as a fixture, deleting it by name to force
+    ;; a reindex (feature_reindex_init.py). Here rather than in
+    ;; ENSURE-DIRECTORIES, which STORE-BLOCK calls for every block written: the
+    ;; directory needs creating once per store, and ENSURE-DIRECTORIES-EXIST
+    ;; stats every path component each time it is asked.
+    (ensure-directories-exist (datadir-block-index-path base-path))
     ;; Scan for existing blocks (the only full-directory scan — from here
     ;; on, total-bytes is maintained incrementally)
     (let ((blocks-dir (merge-pathnames "blocks/" base-path))
@@ -604,6 +617,36 @@ zero tail of the file currently being appended to looks like."
       (setf (block-store-total-bytes store) total-bytes))
     store))
 
+(defun ensure-genesis-on-disk (store)
+  "Write the genesis block into STORE if it is not already there.
+
+Core has genesis on disk from initialisation, before the first sync, so
+blk00000.dat begins with it and every reader that walks the block files finds
+the chain from height 0. We never RECEIVE genesis, so nothing else ever stores
+it, and GET-BLOCK answered from a rebuilt in-memory copy instead — enough for
+the RPCs, but it left the block FILES starting at height 1.
+
+That gap is invisible from inside the node and fatal to anything outside it.
+Core's contrib/linearize walks blk?????.dat looking for each hash its RPC
+listed; missing height 0 it matches none of the rest either (it emits in height
+order), scans the preallocated zero tail a byte at a time hunting for the magic,
+and never finishes — feature_loadblock.py went from failing in seconds to not
+terminating at all the moment we started writing real blk files.
+
+Called from node start-up, next to the rest of chain initialisation, and NOT
+from INIT-BLOCK-STORE: Core writes genesis while initialising the CHAIN, not in
+the storage constructor, and a store opened for a migration, a test fixture or
+an offline tool has no business acquiring a block it was not given.
+
+Best effort by construction: a datadir that cannot be written (read-only, full
+disk) is a problem for whoever actually needs to write, not for start-up."
+  (ignore-errors
+   (let ((hash (ignore-errors (network-genesis-hash bitcoin-lisp:*network*))))
+     (when (and hash (not (gethash hash (block-store-index store))))
+       (let ((block (%genesis-block-body hash)))
+         (when block
+           (store-block store block :height 0)))))))
+
 ;;; Block Pruning
 
 (defun prune-block (store hash)
@@ -616,7 +659,8 @@ Returns the size in bytes of the deleted file, or NIL if the file didn't exist."
   (when (flat-file-pos-p (gethash hash (block-store-index store)))
     (bitcoin-lisp:log-warn
      "Cannot prune ~A: it is inside a flat block file, which prunes per FILE ~
-      (block-file-format P3). Pruning is why *FLAT-BLOCK-FILES* is off by default."
+      (block-file-format P3). Callers that only need the body to become ~
+      unreadable want FORGET-BLOCK-BODY."
      (bitcoin-lisp.crypto:bytes-to-hex hash))
     (return-from prune-block nil))
   (let* ((path (block-file-path store hash))
@@ -628,6 +672,32 @@ Returns the size in bytes of the deleted file, or NIL if the file didn't exist."
       (remhash hash (block-store-index store))
       (decf (block-store-total-bytes store) size)
       size)))
+
+(defun forget-block-body (store hash)
+  "Make HASH's body unreadable so the normal download path re-fetches it, and
+return T when there was one to forget.
+
+This is NOT pruning. Pruning reclaims space and is therefore file-granular on
+the flat format; this is the narrower \"this copy is unusable, get another\"
+operation the reorg path needs when it finds a witness-stripped body. A legacy
+per-block file is deleted outright. A flat record cannot be — one blk file holds
+many blocks — so the store simply stops pointing at it: GET-BLOCK then reports
+the block absent, and the re-downloaded copy is appended as a new record. The
+superseded bytes stay in the file as dead space until the whole file prunes,
+which is what Core also leaves behind when a block is written twice.
+
+Calling PRUNE-BLOCK here instead would REFUSE for a flat record and leave
+GET-BLOCK still serving the witness-stripped body, so the reorg that asked for a
+fresh copy would find the same stripped one on every retry, forever."
+  (let ((located (gethash hash (block-store-index store))))
+    (cond ((flat-file-pos-p located)
+           (remhash hash (block-store-index store))
+           ;; TOTAL-BYTES is deliberately untouched: the record is still on
+           ;; disk and still counts against the prune target until its file
+           ;; goes. Decrementing here would walk the total below what the
+           ;; filesystem holds and stop a pruned node reclaiming space.
+           t)
+          (t (and (prune-block store hash) t)))))
 
 (defun rebuild-block-file-info (store chain-state)
   "Recover per-file accounting by joining the store's hash -> position map with
@@ -682,6 +752,52 @@ file is all or nothing."
                    (push file files))))
              (block-store-file-info store))
     (sort files #'<)))
+
+(defconstant +prune-lock-buffer+ 10
+  "Blocks kept below a prune lock's floor, on top of the floor itself (Core
+PRUNE_LOCK_BUFFER, validation.cpp:113).")
+
+(defvar *prune-locks* (make-hash-table :test 'equal :synchronized t)
+  "Name -> a thunk returning that subsystem's earliest height that must survive
+pruning, or NIL when it has none yet (Core BlockManager::m_prune_locks).
+
+A THUNK rather than a stored height, deliberately. Core updates its lock inside
+SetBestBlockIndex, the one funnel every index passes through; we have no such
+funnel — blockfilterindex and coinstatsindex each write their meta record from
+several places, and a lock that is only as fresh as the last remembered write
+is a lock that silently stops protecting the index the moment a new write site
+is added. Asking the index for its height AT PRUNE TIME cannot go stale, and it
+makes registration (one site per index) the only thing that can be forgotten.
+
+Synchronized because the two ends run on different threads: registration is on
+the startup thread and PRUNE-LOCK-CEILING is called from the validation thread
+after every connected block.")
+
+(defun register-prune-lock (name height-fn)
+  "Register HEIGHT-FN under NAME as a prune lock. Re-registering replaces."
+  (setf (gethash name *prune-locks*) height-fn))
+
+(defun clear-prune-locks ()
+  "Forget every registered prune lock."
+  (clrhash *prune-locks*))
+
+(defun prune-lock-ceiling (chain-height)
+  "The highest block pruning may delete, given the registered locks.
+
+Core: last_prune starts at the chain height and each lock lowers it to
+height_first - PRUNE_LOCK_BUFFER - 1, floored at 1 (validation.cpp:2722-2732).
+A lock whose subsystem has no height yet does not constrain — that is Core's
+height_first == INT_MAX case."
+  (let ((ceiling chain-height))
+    (maphash (lambda (name height-fn)
+               (declare (ignore name))
+               (let ((height (ignore-errors (funcall height-fn))))
+                 (when height
+                   (setf ceiling
+                         (max 1 (min ceiling
+                                     (- height +prune-lock-buffer+ 1)))))))
+             *prune-locks*)
+    ceiling))
 
 (defun prune-flat-block-file (store file &key on-prune)
   "Delete the blk/rev pair FILE and forget every block in it (Core
@@ -739,9 +855,23 @@ Returns the number of blocks pruned."
       (when (<= (block-store-total-bytes store) target-bytes)
         (return-from prune-old-blocks 0))
       ;; Calculate the allowed prune window: (floor, min-keep-height].
-      (let* ((min-keep-height (max 0 (- current-height bitcoin-lisp:+min-blocks-to-keep+)))
+      ;; MIN of the retention window and the prune-lock ceiling: an index that
+      ;; still needs a block's undo data holds the horizon down until it has
+      ;; caught up (Core caps last_prune by every lock before calling
+      ;; FindFilesToPrune, validation.cpp:2722-2732).
+      (let* ((min-keep-height (min (max 0 (- current-height
+                                             bitcoin-lisp:+min-blocks-to-keep+))
+                                   (prune-lock-ceiling current-height)))
              (start (chain-state-prune-walk-start chain-state))
              (pruned 0))
+        ;; Nothing left in the window. PRUNE-BLOCKS-TO-HEIGHT has always had
+        ;; this guard; without it here a prune lock that drives MIN-KEEP-HEIGHT
+        ;; below START — an index parked near genesis on a node that has
+        ;; already pruned far — hands ACTIVE-CHAIN-ENTRIES-FROM a NEGATIVE
+        ;; count, and that walks prev-entry from the tip all the way down
+        ;; before returning nothing. Once per connected block.
+        (when (<= min-keep-height start)
+          (return-from prune-old-blocks 0))
         ;; Flat files first, whole pairs at a time (Core FindFilesToPrune).
         ;; A blk file cannot have a block cut out of it, so the unit is the
         ;; file and the test is that its ENTIRE height range sits inside the
@@ -767,18 +897,29 @@ Returns the number of blocks pruned."
                             chain-state (1+ start)
                             (- min-keep-height start))
               while (> (block-store-total-bytes store) target-bytes)
-              do (when (prune-block store (block-index-entry-hash entry))
-                   (incf pruned))
-                 ;; The undo file goes with the block (Core deletes rev
-                 ;; files alongside blk files): a pruned node can't reorg
-                 ;; below its window, so undo there is dead weight.
-                 (when on-prune
-                   (funcall on-prune (block-index-entry-hash entry)))
-                 ;; Advance even when the file was already gone — the block
-                 ;; is off disk either way, and a permanent gap would force
-                 ;; every later call to re-walk from the same height.
-                 (setf (chain-state-pruned-height chain-state)
-                       (block-index-entry-height entry)))
+              ;; A block inside a blk file is the FLAT pass's business and
+              ;; nobody else's. Letting it through here would call PRUNE-BLOCK,
+              ;; which refuses for a flat record — and the horizon below would
+              ;; then advance PAST a block that is still on disk. On a store in
+              ;; the flat format (the default) that is every block: the walk
+              ;; start marches up, the file's own first height falls below it,
+              ;; %PRUNABLE-FLAT-FILES stops offering the file, and the node
+              ;; silently stops reclaiming space for good while reporting a
+              ;; prune height it never reached.
+              unless (flat-file-pos-p (gethash (block-index-entry-hash entry)
+                                               (block-store-index store)))
+                do (when (prune-block store (block-index-entry-hash entry))
+                     (incf pruned))
+                   ;; The undo file goes with the block (Core deletes rev
+                   ;; files alongside blk files): a pruned node can't reorg
+                   ;; below its window, so undo there is dead weight.
+                   (when on-prune
+                     (funcall on-prune (block-index-entry-hash entry)))
+                   ;; Advance even when the file was already gone — the block
+                   ;; is off disk either way, and a permanent gap would force
+                   ;; every later call to re-walk from the same height.
+                   (setf (chain-state-pruned-height chain-state)
+                         (block-index-entry-height entry)))
         pruned))))
 
 (defun prune-blocks-to-height (store chain-state target-height &key on-prune)
@@ -791,7 +932,10 @@ Returns the number of blocks pruned."
     (return-from prune-blocks-to-height 0))
   (let* ((current-height (chain-state-best-height chain-state))
          (max-prune-height (max 0 (- current-height bitcoin-lisp:+min-blocks-to-keep+)))
-         (effective-target (min target-height max-prune-height))
+         ;; The locks bound a manual prune too — Core passes the same
+         ;; lock-capped last_prune into FindFilesToPruneManual.
+         (effective-target (min target-height max-prune-height
+                                (prune-lock-ceiling current-height)))
          (start (chain-state-prune-walk-start chain-state))
          (pruned 0))
     (when (<= effective-target start)
@@ -819,15 +963,23 @@ Returns the number of blocks pruned."
     (dolist (entry (active-chain-entries-from
                     chain-state (1+ start)
                     (- effective-target start 1)))
-      (when (prune-block store (block-index-entry-hash entry))
-        (incf pruned))
-      (when on-prune
-        (funcall on-prune (block-index-entry-hash entry)))
-      ;; MAX, not a plain assignment: the flat pass above may already have
-      ;; advanced the horizon past this walk's range, and overwriting it with
-      ;; the last legacy height would move the horizon BACKWARDS — re-exposing
-      ;; heights whose files are gone.
-      (setf (chain-state-pruned-height chain-state)
-            (max (chain-state-pruned-height chain-state)
-                 (block-index-entry-height entry))))
+      ;; Same guard as PRUNE-OLD-BLOCKS: a block in a blk file belongs to the
+      ;; flat pass, and the flat pass may deliberately have LEFT its file alone
+      ;; (its range reaches above the target, or a prune lock capped it).
+      ;; Advancing the horizon over it here would claim heights that are still
+      ;; on disk and push the walk start past the file's own first height,
+      ;; after which the file can never be offered for pruning again.
+      (unless (flat-file-pos-p (gethash (block-index-entry-hash entry)
+                                        (block-store-index store)))
+        (when (prune-block store (block-index-entry-hash entry))
+          (incf pruned))
+        (when on-prune
+          (funcall on-prune (block-index-entry-hash entry)))
+        ;; MAX, not a plain assignment: the flat pass above may already have
+        ;; advanced the horizon past this walk's range, and overwriting it with
+        ;; the last legacy height would move the horizon BACKWARDS — re-exposing
+        ;; heights whose files are gone.
+        (setf (chain-state-pruned-height chain-state)
+              (max (chain-state-pruned-height chain-state)
+                   (block-index-entry-height entry)))))
     pruned))

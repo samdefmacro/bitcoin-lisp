@@ -398,6 +398,41 @@ placeholder: a block hash cannot smuggle in a %w."
                    (progn (write-char (char command i) out) (incf i)))))
     (get-output-stream-string out)))
 
+;;; --- Deferred startup logging ---
+
+(defvar *deferred-log-lines* nil
+  "Log lines produced BEFORE the log file exists, held until it does.
+
+Config parsing runs before START-FILE-LOGGING: the datadir, the network and the
+log path itself are all decisions made from the very options being logged. A
+LOG-INFO issued there reaches the console and nothing else, so every
+`Command-line arg:`/`Config file arg:`/`Setting file arg:` line — the exact
+lines Core's functional tests read back out of debug.log to check how an option
+resolved — was invisible in the file. Kept newest-last; FLUSH-DEFERRED-LOG-LINES
+empties it.")
+
+(defun defer-log (level format-string &rest args)
+  "Queue one log line for FLUSH-DEFERRED-LOG-LINES. LEVEL is :info or :warn."
+  (push (list level (apply #'format nil format-string args)) *deferred-log-lines*)
+  nil)
+
+(defun flush-deferred-log-lines ()
+  "Emit everything DEFER-LOG queued, in the order it was queued, and forget it.
+
+Identical lines are emitted ONCE. The config text is parsed several times on the
+way up — once to resolve the network, once for the merged settings, once for the
+unknown-key scan, once more to render the arg log — and a warning raised inside
+the parser would otherwise appear once per pass. Startup config lines are
+statements about the configuration, so a repeat is always an artifact of how
+many times we looked at it."
+  (let ((lines (remove-duplicates (nreverse *deferred-log-lines*)
+                                  :test #'equal :from-end t)))
+    (setf *deferred-log-lines* nil)
+    (dolist (line lines)
+      (ecase (first line)
+        (:info (log-info "~A" (second line)))
+        (:warn (log-warn "~A" (second line)))))))
+
 (defun run-notify-command (command &key value substitutions (wait nil))
   "Run COMMAND through the shell. VALUE is shorthand for a single %s
 substitution; SUBSTITUTIONS is the general (CHAR . VALUE) form.

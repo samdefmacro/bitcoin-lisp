@@ -300,9 +300,13 @@ contiguous."
                        (bitcoin-lisp.storage:compute-block-filter-header
                         filter gheader))))
          (bitcoin-lisp.storage:close-blockfilterindex bfi)
-         ;; Prune block 3's body and rebuild from scratch: the backfill seeds
-         ;; genesis + 1..2, then STOPS at the gap rather than skipping past it.
-         (bitcoin-lisp.storage:prune-block
+         ;; Make block 3's body unreadable and rebuild from scratch: the
+         ;; backfill seeds genesis + 1..2, then STOPS at the gap rather than
+         ;; skipping past it. FORGET-BLOCK-BODY, not PRUNE-BLOCK: what the test
+         ;; needs is a missing body, and PRUNE-BLOCK refuses for a block inside
+         ;; a flat file (which is where the default format puts it), leaving no
+         ;; gap and the test asserting against a chain with none.
+         (bitcoin-lisp.storage:forget-block-body
           store (bitcoin-lisp.storage:block-index-entry-hash
                  (bitcoin-lisp.storage:get-block-at-height cs 3)))
          (let* ((idxbase2 (merge-pathnames

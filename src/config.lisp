@@ -691,6 +691,55 @@ LAST occurrence (Core GetArg on the command line takes span.end()[-1],
 settings.cpp:193 — a repeated config-FILE key instead keeps the FIRST,
 which parse-bitcoin-conf's in-order alist gives assoc for free).")
 
+(defun split-option-token (arg)
+  "Split one -key / -key=value / --key=value token. Returns (VALUES raw-key
+value), where VALUE is NIL when the token carried none and RAW-KEY is
+lower-cased and still carries any `no` prefix. NIL raw-key for a bare - or --."
+  (let* ((s (string-left-trim "-" arg))
+         (eq-pos (position #\= s)))
+    (if (zerop (length s))
+        (values nil nil)
+        (values (string-downcase (if eq-pos (subseq s 0 eq-pos) s))
+                (and eq-pos (subseq s (1+ eq-pos)))))))
+
+(defun interpret-arg (raw-key value)
+  "Core's InterpretKey + InterpretValue for one option (common/args.cpp:86-126).
+Returns (VALUES name string-value json-value).
+
+NAME is RAW-KEY with any `no` prefix stripped. STRING-VALUE is what the option
+readers here consume; JSON-VALUE is the JSON Core would have stored, which is
+what its `Command-line arg:` / `Config file arg:` lines print — the two differ
+exactly on a negation, where the readers want \"0\" and the log wants `false`.
+
+One function for the command line AND the config file, because Core applies the
+same two steps to both (config.cpp:63 calls InterpretKey). It used to be written
+out three times — twice for the command line, once for the file — and the copies
+had already drifted apart on whether the `no` prefix was stripped at all.
+
+Stripping is UNCONDITIONAL, as Core's is. Gating it on the remainder being a
+known option looks safer and is not: it makes what a line in bitcoin.conf MEANS
+depend on the contents of a lookup table, so adding an option would silently
+change the meaning of existing config files. No option in any of this tree's
+tables begins with `no`, so the two rules agree today anyway — and where they
+would not, Core's is the one whose behaviour is documented."
+  (let ((negated (and (> (length raw-key) 2)
+                      (string= "no" (subseq raw-key 0 2)))))
+    (if negated
+        (let ((name (subseq raw-key 2)))
+          ;; Double negatives like -nofoo=0 are supported but discouraged
+          ;; (args.cpp:114-118), and they mean TRUE.
+          (if (and value (not (conf-parse-bool value)))
+              (progn
+                ;; DEFER-LOG, not LOG-WARN: config parsing runs before the log
+                ;; file exists. See FLUSH-DEFERRED-LOG-LINES.
+                (defer-log :warn "Parsed potentially confusing double-negative -~A=~A"
+                  name value)
+                (values name "1" "true"))
+              (values name "0" "false")))
+        ;; A bare -flag is the empty string to Core, and truthy to InterpretBool.
+        (values raw-key (or value "1")
+                (render-json-value (or value ""))))))
+
 (defun parse-cli-args (args)
   "Parse Bitcoin Core-style CLI ARGS (a list of strings) into an alist of
  (lower-case-key . value-string), in order. Accepts -key=value and
@@ -702,35 +751,12 @@ check-cli-args rejects them up front."
   (let ((out nil))
     (dolist (arg args)
       (when (and (stringp arg) (plusp (length arg)) (char= (char arg 0) #\-))
-        (let* ((s (string-left-trim "-" arg))
-               (eq-pos (position #\= s)))
-          (cond
-            ((zerop (length s)))                                   ; bare "-" / "--"
-            (t
-             (let* ((raw-key (string-downcase (if eq-pos (subseq s 0 eq-pos) s)))
-                    (value (and eq-pos (subseq s (1+ eq-pos))))
-                    (negated (and (> (length raw-key) 2)
-                                  (string= "no" (subseq raw-key 0 2))))
-                    (key (if negated (subseq raw-key 2) raw-key)))
-               ;; Core's InterpretKey strips a "no" prefix unconditionally and
-               ;; InterpretValue then turns the negation into a value
-               ;; (common/args.cpp:105-126). The VALUED negated form was
-               ;; missing here: a "=" took the branch that kept the key as
-               ;; "nolisten", so -nolisten=0 set an option nothing reads
-               ;; instead of setting -listen.
-               (push (cons key
-                           (cond
-                             ((not negated) (or value "1"))
-                             ;; Double negatives like -nofoo=0 are supported
-                             ;; but warned about (args.cpp:114-118), and they
-                             ;; mean TRUE.
-                             ((and value (not (conf-parse-bool value)))
-                              (bitcoin-lisp:log-warn
-                               "Parsed potentially confusing double-negative -~A=~A"
-                               key value)
-                              "1")
-                             (t "0")))
-                     out)))))))
+        (multiple-value-bind (raw-key value) (split-option-token arg)
+          (when raw-key                            ; NIL for a bare "-" / "--"
+            ;; One interpreter for the command line AND the config file, so
+            ;; Core's InterpretKey/InterpretValue rule has a single home.
+            (multiple-value-bind (key string-value) (interpret-arg raw-key value)
+              (push (cons key string-value) out))))))
     ;; OUT is reversed (last arg first): keep the FIRST cell seen per
     ;; non-repeatable key = the LAST command-line occurrence, then restore
     ;; command-line order.
@@ -766,8 +792,10 @@ rather than refused, a silent resync from genesis into a junk directory."
         (values line nil))))
 
 (defun parse-bitcoin-conf-sections (text &optional network)
-  "Parse bitcoin.conf TEXT into (values section-entries global-entries), each an
-in-order alist of (lower-case-key . value-string).
+  "Parse bitcoin.conf TEXT into (values section-entries global-entries
+section-json global-json). The first two are in-order alists of
+ (lower-case-key . value-string); the last two are the same keys paired with
+the JSON rendering Core would have stored, for LogArgs.
 
 GLOBAL-ENTRIES are the keys before any [section]; SECTION-ENTRIES are the keys
 in the [section] matching NETWORK (all sections when NETWORK is NIL). Core keeps
@@ -779,6 +807,13 @@ Signals CONFIG-PARSE-ERROR on the three lines Core refuses:
 a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword."
   (let ((sections nil)
         (globals nil)
+        ;; The same cells again, but carrying the JSON rendering Core stored
+        ;; rather than the string the config layer wants. They differ exactly
+        ;; where a negation happened — `nolisten=1` is the string "0" to an
+        ;; option reader and `false` in a `Config file arg:` line — and the log
+        ;; wording is a contract Core's functional tests read back.
+        (sections-json nil)
+        (globals-json nil)
         (in-section nil)
         (active t)
         (want (and network (conf-section-name network)))
@@ -814,9 +849,18 @@ a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword."
                                            (format nil ", if you intended to specify a ~
                                                         negated option, use ~A=1 instead"
                                                    line)))))
-                        (let ((key (string-downcase
-                                    (string-trim '(#\Space #\Tab) (subseq line 0 eq-pos))))
-                              (value (string-trim '(#\Space #\Tab) (subseq line (1+ eq-pos)))))
+                        ;; Core runs InterpretKey/InterpretValue over
+                        ;; config-file keys exactly as over command-line ones
+                        ;; (common/config.cpp:63 calls InterpretKey), so this is
+                        ;; the same INTERPRET-ARG the command line uses. Without
+                        ;; it, `nolisten=1` in bitcoin.conf set an option called
+                        ;; "nolisten" that nothing reads, so the file could not
+                        ;; negate anything at all.
+                        (multiple-value-bind (key value json)
+                            (interpret-arg
+                             (string-downcase
+                              (string-trim '(#\Space #\Tab) (subseq line 0 eq-pos)))
+                             (string-trim '(#\Space #\Tab) (subseq line (1+ eq-pos))))
                           (when (and used-hash (search "rpcpassword" key))
                             (error 'config-parse-error
                                    :message
@@ -825,9 +869,12 @@ a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword."
                                                 be avoided" linenr)))
                           (when active
                             (if in-section
-                                (push (cons key value) sections)
-                                (push (cons key value) globals)))))))))))
-    (values (nreverse sections) (nreverse globals))))
+                                (progn (push (cons key value) sections)
+                                       (push (cons key json) sections-json))
+                                (progn (push (cons key value) globals)
+                                       (push (cons key json) globals-json))))))))))))
+    (values (nreverse sections) (nreverse globals)
+            (nreverse sections-json) (nreverse globals-json))))
 
 (defun parse-bitcoin-conf (text &optional network)
   "Parse bitcoin.conf TEXT into a single in-order alist, ordered so that ASSOC
@@ -965,7 +1012,7 @@ specially in config-alist->start-node-plist.")
   '(;; network selection + entry-point specials
     "regtest" "signet" "testnet4" "testnet" "chain" "server" "debug" "conf"
     "includeconf"
-    "datadir"
+    "datadir" "settings"
     ;; apply-config-globals options
     "datacarrier" "datacarriersize" "permitbaremultisig"
     "limitclustercount" "limitclustersize" "signetchallenge"
@@ -1021,7 +1068,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "persistmempoolv1" "printpriority"
     "privatebroadcast" "rpcdoccheck"
     "rpcwhitelist" "rpcwhitelistdefault"
-    "rpcworkqueue" "settings" "shrinkdebugfile"
+    "rpcworkqueue" "shrinkdebugfile"
     "signer" "signetseednode"
     "stopafterblockimport" "test" "timeout"
     "unsafesqlitesync" "vbparams"
@@ -1146,6 +1193,189 @@ warning per key (Core LogWarning \"Ignoring unknown configuration value\")
          unless (known-config-option-p k)
            collect k)
    :test #'string= :from-end t))
+
+
+;;; --- settings.json (Core's read-write settings file) ---
+;;;
+;;; Core keeps a JSON object of "read-write" settings in the network directory,
+;;; between the command line and the config file in precedence
+;;; (common/settings.cpp:36). It is read AND rewritten on every start
+;;; (common/init.cpp:98-115), which is how a datadir that has ever been started
+;;; always has one.
+
+(defparameter +settings-warning-key+ "_warning_"
+  "Core SETTINGS_WARN_MSG_KEY. Stripped on read, re-added on write, and never
+visible as a setting.")
+
+(defparameter +client-name+ "bitcoin-lisp"
+  "Core's CLIENT_NAME. Named here rather than derived from the user agent
+because it is the value scripts/conformance-config.sh publishes to Core's test
+framework as CLIENT_NAME, and the framework compares strings with it.")
+
+(defun settings-file-warning ()
+  "Core's auto-generated comment, verbatim (common/settings.cpp:129-130)."
+  (format nil "This file is automatically generated and updated by ~A. Please ~
+do not edit this file while the node is running, as any changes might be ~
+ignored or overwritten."
+          +client-name+))
+
+(defun render-json-value (value)
+  "VALUE as compact JSON, matching UniValue::write() — which is what Core
+interpolates into its `Setting file arg:` lines, so the rendering is part of
+the log contract rather than a detail.
+
+yason's encoder already produces that form byte for byte, including \\uXXXX for
+control characters and `null` for NIL; the values here come straight from
+yason's parser, so nothing needs re-tagging on the way in either. Reading a
+settings file with PARSE-SETTINGS-JSON and writing it back is a pure round trip
+through one library."
+  (with-output-to-string (out) (yason:encode value out)))
+
+(defun %json-escape (string)
+  "STRING as a JSON string literal, quotes included."
+  (render-json-value string))
+
+(defun parse-settings-json (text path-string)
+  "Parse settings-file TEXT. Returns (VALUES alist errors), where ALIST maps
+setting name to its parsed JSON value and ERRORS is a list of Core's own
+message strings — the functional tests match on their wording
+(feature_settings.py).
+
+TEXT is parsed TWICE, which is worth the two passes on a file this size. The
+:alist pass is the only one that can see a DUPLICATE KEY (a hash-table parse
+silently keeps the last, and the node would start on a setting the operator
+cannot see in the file) and it preserves the key ORDER Core writes back. The
+default pass supplies the VALUES, because only there are the JSON types
+unambiguous: as an alist a nested object and an array of pairs are the same
+list, and an empty array is NIL, which is also how null arrives.
+
+An error yields NO settings rather than partial ones: Core clears the map on a
+duplicate key and returns nothing on a parse failure, and a node that started
+with half a settings file applied is worse than one that refused to start."
+  (flet ((invalid ()
+           (return-from parse-settings-json
+             (values nil (list (format nil "Settings file ~A does not contain valid ~
+JSON. This is probably caused by disk corruption or a crash, and can be fixed ~
+by removing the file, which will reset settings to default values." path-string))))))
+    (let ((keyed (handler-case
+                     (let ((yason:*parse-object-as* :alist)
+                           (yason:*parse-json-booleans-as-symbols* t))
+                       (yason:parse text))
+                   (error () (invalid))))
+          (table nil))
+    ;; An alist parse of a non-object gives back the scalar itself, and a JSON
+    ;; array parses to a LIST — shaped exactly like an alist of nothing, so
+    ;; emptiness alone cannot tell them apart. The test is that every element
+    ;; is a (string . value) cons.
+    (unless (and (listp keyed)
+                 (every (lambda (c) (and (consp c) (stringp (car c)))) keyed))
+      (return-from parse-settings-json
+        (values nil (list (format nil "Found non-object value ~A in settings file ~A"
+                                  (render-json-value keyed) path-string)))))
+    ;; Duplicate keys BEFORE the second parse: yason's hash-table parser
+    ;; signals on one, and the handler would report it as invalid JSON —
+    ;; losing the message Core prints and the test matches on.
+    (let ((seen (make-hash-table :test 'equal)))
+      (dolist (cell keyed)
+        (when (gethash (car cell) seen)
+          (return-from parse-settings-json
+            (values nil (list (format nil "Found duplicate key ~A in settings file ~A"
+                                      (car cell) path-string)))))
+        (setf (gethash (car cell) seen) t)))
+    (setf table (handler-case
+                    (let ((yason:*parse-json-arrays-as-vectors* t)
+                          (yason:*parse-json-booleans-as-symbols* t))
+                      (yason:parse text))
+                  (error () (invalid))))
+    (let ((out nil))
+      (dolist (cell keyed)
+        (unless (string= (car cell) +settings-warning-key+)
+          (push (cons (car cell) (gethash (car cell) table)) out)))
+      (values (nreverse out) nil)))))
+
+(defun render-settings-json (alist)
+  "ALIST as the text of a settings file: the warning comment first, then every
+setting in the order given (Core WriteSettings, common/settings.cpp:123-142)."
+  (with-output-to-string (out)
+    (format out "{~%    ~A: ~A"
+            (%json-escape +settings-warning-key+)
+            (%json-escape (settings-file-warning)))
+    (dolist (cell alist)
+      (format out ",~%    ~A: ~A"
+              (%json-escape (car cell)) (render-json-value (cdr cell))))
+    (format out "~%}~%")))
+
+(defun settings-alist->config-alist (settings)
+  "SETTINGS (name -> parsed JSON value) as the (name . string) cells the rest
+of the config layer speaks. A JSON false is Core's negation, i.e. \"0\"."
+  (loop for (name . value) in settings
+        collect (cons name
+                      (cond ((eq value 'yason:false) "0")
+                            ((eq value 'yason:true) "1")
+                            ((null value) "0")
+                            ((stringp value) value)
+                            (t (render-json-value value))))))
+
+(defun validate-settings-values (settings)
+  "The Core-worded init error a settings file's VALUES earn, or NIL.
+
+Only -wallet is checked, because it is the only setting whose JSON TYPE Core
+validates rather than coercing: every element of the wallet list must be a
+string, and anything else is a fatal init error (wallet/load.cpp:81-86,
+121-126). A settings file is written by software, so a wrong type there is not
+a typo — it is a corrupted or hand-edited file, and loading a wallet named
+`true` is worse than refusing to start."
+  (let ((cell (assoc "wallet" settings :test #'string=)))
+    (when cell
+      (let* ((value (cdr cell))
+             (elements (cond
+                         ;; A JSON false is -nowallet: no names at all, valid.
+                         ((eq value 'yason:false) nil)
+                         ((stringp value) (list value))
+                         ((or (vectorp value) (and (listp value) value))
+                          (coerce value 'list))
+                         (t (list value)))))
+        (unless (every #'stringp elements)
+          "Invalid value detected for '-wallet' or '-nowallet'. '-wallet' requires a string value, while '-nowallet' accepts only '1' to disable all wallets")))))
+
+(defun unknown-settings-keys (settings)
+  "The settings-file keys no option table recognizes. Core logs one warning
+each and carries on (args.cpp:420-423) — unknown settings never abort startup."
+  (unknown-config-file-keys settings))
+
+;;; --- Core's LogArgs() ---
+
+(defun %cli-arg-log-cells (args)
+  "The (name . json-text) pairs Core's `Command-line arg:` lines carry.
+
+Re-walks the raw ARGS rather than reading PARSE-CLI-ARGS' output, because that
+output is normalized to \"1\"/\"0\" strings and Core logs the JSON value it
+actually stored: a negation is `false`, a bare -flag is `\"\"`, and -flag=x is
+the string \"x\". INTERPRET-ARG returns both forms from one reading of the
+token, so the log and the option readers cannot disagree about what it meant."
+  (let ((out nil))
+    (dolist (arg args (nreverse out))
+      (when (and (stringp arg) (plusp (length arg)) (char= (char arg 0) #\-))
+        (multiple-value-bind (raw-key value) (split-option-token arg)
+          (when raw-key
+            (multiple-value-bind (key string-value json) (interpret-arg raw-key value)
+              (declare (ignore string-value))
+              (push (cons key json) out))))))))
+
+(defun %config-arg-log-cells (text network)
+  "The (section name json-text) triples Core's `Config file arg:` lines carry.
+
+The JSON comes from the parser, not from re-rendering the string it produced:
+a negated key is stored as `false`, and the string the option readers see for
+it is \"0\", which would render as the string \"0\" instead."
+  (multiple-value-bind (sections globals sections-json globals-json)
+      (parse-bitcoin-conf-sections text network)
+    (declare (ignore sections globals))
+    (append
+     (loop for (name . json) in sections-json
+           collect (list (conf-section-name network) name json))
+     (loop for (name . json) in globals-json
+           collect (list "" name json)))))
 
 (defun parse-bind-option (spec)
   "Parse one -bind value into (VALUES host port onion-p), or NIL when it is
@@ -1752,15 +1982,22 @@ start-node-from-args."
               (*dns-seed-enabled*
                (error "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6")))))))
 
-(defun args->start-node-plist (args &optional conf-text)
+(defun args->start-node-plist (args &optional conf-text settings-cells)
   ;; CONF-TEXT is the main bitcoin.conf, or a LIST of texts when -includeconf
   ;; pulled in more (main file first). See the docstring below.
   "Pure assembly of a start-node keyword plist from Bitcoin Core-style CLI ARGS
  (a list of strings) and CONF-TEXT — one bitcoin.conf's contents, or a LIST of
 them (main file first) when -includeconf pulled in more.
 
-Precedence is Core's (settings.cpp:36): command line, then the [network]
-section of any config file, then the global area of any config file.
+Precedence is Core's (settings.cpp:36): command line, then SETTINGS-CELLS
+ (the read-write settings file, already flattened to (name . string) cells by
+SETTINGS-ALIST->CONFIG-ALIST), then the [network] section of any config file,
+then the global area of any config file.
+
+SETTINGS-CELLS deliberately does NOT take part in resolving the network: Core
+reads its chain selectors from the command line and the config file's global
+area only, and the settings file lives INSIDE the network directory — letting it
+choose the network would make its own location depend on its contents.
 Returns (VALUES plist merged-alist network); start-node-from-args (node.lisp)
 wraps this with the file I/O, apply-config-globals, and launch."
   (let* ((cli (parse-cli-args args))
@@ -1782,7 +2019,8 @@ wraps this with the file I/O, apply-config-globals, and launch."
          (conf (append (loop for text in texts
                              append (parse-bitcoin-conf-sections text network))
                        globals))
-         ;; CLI > [network] section > global area (Core settings.cpp:36), which
+         ;; CLI > settings.json > [network] section > global area (Core
+         ;; settings.cpp:36, MergeSettings' Source order), which
          ;; PARSE-BITCOIN-CONF has already ordered; first ASSOC wins.
-         (merged (append cli conf)))
+         (merged (append cli settings-cells conf)))
     (values (config-alist->start-node-plist merged network) merged network)))
