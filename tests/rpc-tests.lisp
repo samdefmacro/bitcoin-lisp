@@ -2821,11 +2821,18 @@ rpc_help.py passing."
       (let* ((core-methods (remove-duplicates
                             (mapcar #'first (append core-json core-strings))
                             :test #'string=))
+             ;; ⚠️ REGISTER FIRST. *RPC-METHODS* is populated by
+             ;; REGISTER-ALL-METHODS at node start-up, so a battery that has not
+             ;; started a node sees an EMPTY table and reports every Core method
+             ;; as missing — which is how this assertion failed after four
+             ;; methods were ADDED. Whether it has already run does not matter:
+             ;; registration is idempotent.
+             (ignore-errors (bitcoin-lisp.rpc::register-all-methods))
              (missing (remove-if (lambda (m) (gethash m bitcoin-lisp.rpc::*rpc-methods*))
                                  core-methods)))
         ;; Not an assertion of zero — these are tracked, and the list moving is
         ;; what matters. It IS an assertion that the list has not GROWN.
-        (is (<= (length missing) 3)
+        (is (<= (length missing) 2)
             "Core methods with typed arguments that this node does not serve ~
 grew to ~D: ~S" (length missing) (sort missing #'string<))))))
 

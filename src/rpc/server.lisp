@@ -197,6 +197,10 @@ than "no such method" for a method that does exist."
   (register-rpc-method "stop" #'rpc-stop)
   (register-rpc-method "help" #'rpc-help)
   (register-rpc-method "getrpcinfo" #'rpc-getrpcinfo)
+  (register-rpc-method "mockscheduler" #'rpc-mockscheduler)
+  (register-rpc-method "echo" #'rpc-echo)
+  (register-rpc-method "echojson" #'rpc-echo)
+  (register-rpc-method "generate" #'rpc-generate)
   (register-rpc-method "getmemoryinfo" #'rpc-getmemoryinfo)
   (register-rpc-method "getnetworkhashps" #'rpc-getnetworkhashps)
   (register-rpc-method "logging" #'rpc-logging)
@@ -467,6 +471,7 @@ stops being applied."
     ("sendtoaddress" (0 "address" . t) (1 "amount" . nil) (2 "comment" . t) (3 "comment_to" . t) (4 "subtractfeefromamount" . nil) (5 "replaceable" . nil) (6 "conf_target" . nil) (7 "estimate_mode" . t) (8 "avoid_reuse" . nil) (9 "fee_rate" . nil) (10 "verbose" . nil))
     ("setban" (2 "bantime" . nil) (3 "absolute" . nil))
     ("setlabel" (1 "label" . t))
+    ("mockscheduler" (0 "delta_time" . nil))
     ("setmocktime" (0 "timestamp" . nil))
     ("setnetworkactive" (0 "state" . nil))
     ("setwalletflag" (1 "value" . nil))
@@ -506,6 +511,7 @@ quietly.")
 
 (defparameter *rpc-named-only-args*
   '(
+    ("bumpfee" "conf_target" "fee_rate" "replaceable" "estimate_mode" "outputs" "original_change_index")
     ("createwalletdescriptor" "internal" "hdkey")
     ("dumptxoutset" "rollback")
     ("fundrawtransaction" "add_inputs" "include_unsafe" "minconf" "maxconf" "change_type" "fee_rate" "vout_index" "input_weights" "txid" "vout" "weight" "max_tx_weight")
@@ -513,21 +519,27 @@ quietly.")
     ("gettxspendingprevout" "mempool_only" "return_spending_tx")
     ("importmempool" "use_current_time" "apply_fee_delta_priority" "apply_unbroadcast_set")
     ("listunspent" "include_immature_coinbase")
+    ("psbtbumpfee" "conf_target" "fee_rate" "replaceable" "estimate_mode" "outputs" "original_change_index")
     ("scanblocks" "filter_false_positives")
     ("send" "add_inputs" "include_unsafe" "minconf" "maxconf" "add_to_wallet" "change_address" "change_position" "change_type" "fee_rate" "include_watching" "inputs" "txid" "vout" "sequence" "weight" "locktime" "lock_unspents" "psbt" "subtract_fee_from_outputs" "vout_index" "max_tx_weight")
     ("sendall" "add_to_wallet" "fee_rate" "include_watching" "inputs" "txid" "vout" "sequence" "locktime" "lock_unspents" "psbt" "send_max" "minconf" "maxconf" "version")
     ("simulaterawtransaction" "include_watchonly")
     ("walletcreatefundedpsbt" "add_inputs" "include_unsafe" "minconf" "maxconf" "change_type" "fee_rate" "vout_index" "max_tx_weight"))
-  "Members of an RPC\'s OBJ_NAMED_PARAMS options object, which Core lets a
+  "Members of an RPC's OBJ_NAMED_PARAMS options object, which Core lets a
 client pass as TOP-LEVEL named arguments.
 
 RPCHelpMan::GetArgNames emits these with named_only=true (rpc/util.cpp:750) and
 transformNamedArguments collects them into a fresh options object which it
 pushes at the options slot (rpc/server.cpp:408-415). Without them the server
 answers \"Unknown named parameter fee_rate\" to a call every Core client can
-make — nine of Core\'s functional tests do exactly that.
+make.
 
-GENERATED from Core\'s RPCHelpMan declarations. Do not hand-edit.")
+⚠️ Covers BOTH declaration forms. Matching only `RPCHelpMan{\"name\"` misses
+every RPC declared through a helper that takes the name as a PARAMETER —
+bumpfee and psbtbumpfee are declared that way (wallet/rpc/spend.cpp:960,
+1166-1167), so both were absent and wallet_bumpfee.py died on fee_rate.
+
+GENERATED from Core's RPCHelpMan declarations. Do not hand-edit.")
 
 (defparameter *rpc-named-arg-names*
   '(
