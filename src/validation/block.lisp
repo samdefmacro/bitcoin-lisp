@@ -2031,10 +2031,24 @@ store and the index even though all any of them has is a block hash.")
 directory. BLOCK-STORE and CHAIN-STATE enable Core's rev-file format: without
 them every read and write uses the legacy files, which is also what a store
 with *FLAT-BLOCK-FILES* off does."
-  (ensure-directories-exist base-path)
+  ;; The directory is NOT created here. It is the LEGACY per-block undo
+  ;; location, and a node writing Core's rev files never puts anything in it —
+  ;; so creating it eagerly leaves an empty `undo/` in every fresh datadir, a
+  ;; directory Core does not have. That is not cosmetic: Core's functional-test
+  ;; framework builds its shared cache datadir and then deletes every entry it
+  ;; does not recognise with os.remove, which raises on a DIRECTORY. An empty
+  ;; undo/ therefore broke the cache build for the whole suite.
+  ;;
+  ;; %ENSURE-UNDO-DIRECTORY creates it on the first legacy write instead, which
+  ;; is the only time it can be needed; an existing one keeps working untouched.
   (setf *undo-base-path* base-path
         *undo-block-store* block-store
         *undo-chain-state* chain-state))
+
+(defun %ensure-undo-directory ()
+  "Create the legacy undo directory, just before something is written into it."
+  (when *undo-base-path*
+    (ensure-directories-exist *undo-base-path*)))
 
 (defun undo-file-path (block-hash)
   "Return the path for an undo data file given BLOCK-HASH."
@@ -2124,6 +2138,9 @@ flexi-streams path's Gray-stream dispatch was ~8% of mainnet-IBD CPU at h~280k
 (sb-sprof) once blocks carried 500+ spent inputs each."
   (let ((path (undo-file-path block-hash)))
     (when path
+      ;; The directory is created here rather than at start-up, so a node that
+      ;; only ever writes Core's rev files leaves no empty undo/ behind.
+      (%ensure-undo-directory)
       (bitcoin-lisp.storage:save-file-with-crc32-bb
        path
        (lambda (bb)

@@ -213,3 +213,88 @@ and then DROPPED, so every categorized line came out as an untagged debug line
       (is-true entry "the line reached the buffer")
       (when entry
         (is-true (search "[net] a categorized line" entry))))))
+
+(test unsupported-logging-category-uses-cores-wording
+  "feature_logging.py matches this as a FULL regex, so the wording is the
+contract: 'Error: Unsupported logging category -debug=abc.' — trailing period
+included. Ours said 'Unknown logging category in -debug: abc', which could
+never match however correct the behaviour was."
+  (let ((e (handler-case (bitcoin-lisp::apply-log-categories '("abc") nil)
+             (error (c) (princ-to-string c)))))
+    (is (string= "Unsupported logging category -debug=abc." e)))
+  (let ((e (handler-case (bitcoin-lisp::apply-log-categories nil '("xyz"))
+             (error (c) (princ-to-string c)))))
+    (is (string= "Unsupported logging category -debugexclude=xyz." e)))
+  ;; A known category still applies without complaint.
+  (is-true (bitcoin-lisp::apply-log-categories '("net") nil)))
+
+;;;; --- -loglevel=<category>:<level> (Core SetLoggingLevel) ---
+
+(test loglevel-spec-tells-a-category-from-a-global-level
+  "Core splits on the first ':' at index 3 or later (init/common.cpp:63) — a
+level name is never long enough to contain one there, so that is how
+`-loglevel=net:debug` is told from a bare `-loglevel=trace`."
+  (is (equal '(nil :debug) (multiple-value-list
+                            (bitcoin-lisp:parse-loglevel-spec "trace"))))
+  (is (equal '(nil :info) (multiple-value-list
+                           (bitcoin-lisp:parse-loglevel-spec "info"))))
+  (is (equal '("net" :debug) (multiple-value-list
+                              (bitcoin-lisp:parse-loglevel-spec "net:debug")))))
+
+(test loglevel-spec-rejects-an-unknown-half-with-cores-wording
+  "Both halves must be known and the message is matched by feature_logging.py.
+An option that silently does nothing is how an operator ends up staring at a
+log that will never contain what they asked for."
+  (dolist (bad '("nosuch:debug" "net:abc"))
+    (let ((e (handler-case (progn (bitcoin-lisp:parse-loglevel-spec bad) nil)
+               (error (c) (princ-to-string c)))))
+      (is-true e "~A must be refused" bad)
+      (when e
+        (is-true (search (format nil "Unsupported category-specific logging level -loglevel=~A." bad) e))
+        (is-true (search "Expected -loglevel=<category>:<loglevel>." e))
+        (is-true (search "Valid loglevels: info, debug, trace." e))))))
+
+(test a-category-threshold-overrides-the-global-level
+  "Core judges a categorized line by that category's own threshold and does not
+fall back to the global one for it (LogAcceptCategory). Setting
+-loglevel=net:debug therefore surfaces net lines on a node whose global level
+is info, without -debug=net."
+  (let ((bitcoin-lisp::*category-log-levels* (make-hash-table :test 'equal :synchronized t))
+        (bitcoin-lisp::*debug-categories* (make-hash-table :test 'equal))
+        (bitcoin-lisp::*current-log-level* :info)
+        (bitcoin-lisp::*log-file-stream* nil))
+    ;; Without a threshold and without -debug=net, a net line is suppressed.
+    (bitcoin-lisp:log-cat "net" "suppressed line one")
+    (is-false (find-if (lambda (e) (and e (search "suppressed line one" e)))
+                       bitcoin-lisp::*log-buffer*))
+    ;; With one, it is emitted — and carries the category tag.
+    (is-true (bitcoin-lisp:set-category-log-level "net" :debug))
+    (bitcoin-lisp:log-cat "net" "visible line two")
+    (let ((entry (find-if (lambda (e) (and e (search "visible line two" e)))
+                          bitcoin-lisp::*log-buffer*)))
+      (is-true entry)
+      (when entry (is-true (search "[net] visible line two" entry))))
+    ;; An unknown category cannot be given one.
+    (is-false (bitcoin-lisp:set-category-log-level "nosuch" :debug))))
+
+(test debug-categories-before-the-last-negation-are-disregarded
+  "Core finds the LAST -debug=0/none and processes only the categories after it
+(init/common.cpp:82-88), so everything before it is disregarded — invalid names
+included. feature_logging.py drives exactly
+`-debug=http -debug=abc -debug=none -debug=rpc -debug=net` and requires the
+node to start, with http off and the invalid `abc` never mentioned.
+
+Validating the whole list made that a fatal error over a category the operator
+had already cancelled."
+  (let ((bitcoin-lisp::*debug-categories* (make-hash-table :test 'equal)))
+    (bitcoin-lisp::apply-log-categories '("http" "abc" "none" "rpc" "net") nil)
+    (is-false (bitcoin-lisp:log-category-enabled-p "http")
+              "a category named before the negation must not survive it")
+    (is-true (bitcoin-lisp:log-category-enabled-p "rpc"))
+    (is-true (bitcoin-lisp:log-category-enabled-p "net")))
+  ;; An invalid name AFTER the last negation is still fatal.
+  (let ((bitcoin-lisp::*debug-categories* (make-hash-table :test 'equal)))
+    (signals error (bitcoin-lisp::apply-log-categories '("none" "abc") nil)))
+  ;; And with no negation at all, the whole list is validated as before.
+  (let ((bitcoin-lisp::*debug-categories* (make-hash-table :test 'equal)))
+    (signals error (bitcoin-lisp::apply-log-categories '("net" "abc") nil))))

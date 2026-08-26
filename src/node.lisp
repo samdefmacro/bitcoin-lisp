@@ -295,6 +295,21 @@ point and answers -28 for every method until FINISH-RPC-WARMUP."
       (bitcoin-lisp.rpc:open-browser-to-ui rpc-port))
     server))
 
+(defun %ensure-wallets-subdirectory (data-directory network)
+  "Create wallets/ under a datadir that did not exist yet (Core
+common/init.cpp:45-63).
+
+Both the base path and the network path, and only when the path itself is
+being created — an existing datadir keeps whatever layout it has, which is the
+backwards-compatibility rule Core states in that comment."
+  (flet ((claim (dir)
+           (let ((path (uiop:ensure-directory-pathname dir)))
+             (unless (probe-file path)
+               (ensure-directories-exist (merge-pathnames "wallets/" path))))))
+    (let ((base (uiop:ensure-directory-pathname data-directory)))
+      (claim base)
+      (claim (network-data-path base network)))))
+
 (defun %resolve-log-file (log-file data-directory &optional network)
   "The path to log to, or NIL for no file log.
 
@@ -2706,6 +2721,7 @@ case ever exercised) has genesis for a root."
                         (webui-open nil)
                         (wallet nil wallet-supplied-p)
                         (wallet-names nil)
+                        (log-level-specs nil)
                         (port nil)
                         (network-active t)
                         ((:rest rest-enabled) nil)
@@ -2770,6 +2786,27 @@ Returns the node instance."
     (log-warn "Node already running, stopping first")
     (stop-node))
 
+  ;; A NEW datadir gets a wallets/ subdirectory, whether or not the wallet is
+  ;; enabled (Core common/init.cpp:45-63, base path and network path both). Core
+  ;; makes it only at creation time, so an existing datadir's layout is never
+  ;; changed underneath its owner, and wallet code then USES the subdirectory
+  ;; only if it is already there.
+  ;;
+  ;; FIRST, before anything else in this function: the very next thing that
+  ;; happens is the log file being opened, and ENSURE-DIRECTORIES-EXIST on
+  ;; <datadir>/<network>/debug.log CREATES the network directory. Run after
+  ;; that, the "did this exist?" test is answered by our own side effect and is
+  ;; always false.
+  ;;
+  ;; Small, and it was blocking the whole functional-test corpus: the framework
+  ;; builds a shared 199-block cache datadir once and copies it per test, and
+  ;; its cleanup does `os.rmdir(cache/regtest/wallets)`. With no such directory
+  ;; that raises, the cache build FAILS, and every run then falls back on
+  ;; whatever cache was last built successfully — which here was one written in
+  ;; the pre-Core per-block format, months old. Every non-clean-chain test in
+  ;; the suite was running against it.
+  (%ensure-wallets-subdirectory data-directory network)
+
   ;; Real time, not the mockable clock: uptime must keep measuring real elapsed
   ;; seconds while a functional test drives setmocktime, exactly as Core's
   ;; GetUptime uses SteadyClock rather than GetTime (common/system.cpp:134).
@@ -2789,14 +2826,31 @@ Returns the node instance."
     (when path
       ;; The network directory may not exist yet — the block store creates it
       ;; later — and the first log line is emitted before that.
+      ;;
+      ;; A path we cannot open is a fatal init error, with Core's wording
+      ;; (init/common.cpp:116-119). `-debuglogfile=foo/foo.log` names a
+      ;; subdirectory Core does NOT create, and it refuses to start rather than
+      ;; run a node whose operator believes it is logging somewhere it is not.
+      ;; ENSURE-DIRECTORIES-EXIST alone would have created `foo/` and started
+      ;; happily, which is the opposite of what the option means.
+      (unless (probe-file (make-pathname :name nil :type nil :defaults path))
+        (error "Could not open debug log file ~A" (namestring path)))
       (ensure-directories-exist path)
-      (start-file-logging path)))
+      (handler-case (start-file-logging path)
+        (error ()
+          (error "Could not open debug log file ~A" (namestring path))))))
   ;; The level BEFORE the flush below, not 270 lines further down where it used
   ;; to be set: a deferred line is filtered when it is emitted, so flushing
   ;; first would judge every queued line against whatever level the image
   ;; happened to hold — the load-time default in a fresh process, and in a REPL
   ;; or test image whatever the PREVIOUS start-node left behind.
   (setf *current-log-level* log-level)
+  ;; Per-category thresholds from -loglevel=<category>:<level>. Cleared first,
+  ;; so a restart in the same image does not inherit the previous node's.
+  (clear-category-log-levels)
+  (dolist (spec log-level-specs)
+    (multiple-value-bind (category level) (parse-loglevel-spec spec)
+      (when category (set-category-log-level category level))))
   ;; Everything config parsing queued before the file existed. Core logs its
   ;; args after InitLogging for the same reason (init.cpp), and its functional
   ;; tests read those lines back out of debug.log.
@@ -4286,6 +4340,12 @@ file location."
       ;; back to check how an option was actually resolved, so both the wording
       ;; and the JSON rendering of the value are part of the contract.
       (%log-args args conf-texts settings-cells settings-network)
+      ;; BEFORE the settings file is written, because writing it creates the
+      ;; network directory and %ENSURE-WALLETS-SUBDIRECTORY only acts on a
+      ;; directory that does not exist yet. START-NODE calls it too, for callers
+      ;; that come in that way (scripts/run-node.sh does); the call is
+      ;; idempotent, and whichever runs first is the one that decides.
+      (%ensure-wallets-subdirectory datadir settings-network)
       ;; Rewriting it on every start is what makes a datadir that has ever been
       ;; started always have one, which is what Core does (common/init.cpp:111)
       ;; and what feature_settings.py asserts.

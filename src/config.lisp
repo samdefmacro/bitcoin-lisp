@@ -539,6 +539,40 @@ Core's — a silent, opposite-direction divergence on a security-relevant flag."
     (handler-case (parse-integer v)
       (error () (error "Invalid integer config value: ~S" value)))))
 
+(defun log-categories-string ()
+  "Core's LogCategoriesString: every category name, comma-separated, for the
+-loglevel error message."
+  (format nil "~{~A~^, ~}" (sort (copy-list bitcoin-lisp::+log-categories+) #'string<)))
+
+(defun parse-loglevel-spec (value)
+  "Parse one -loglevel value. Returns (VALUES category level), with CATEGORY NIL
+for the global form.
+
+Core splits on the first ':' at index 3 or later (init/common.cpp:63), which is
+how `-loglevel=net:debug` is told from a bare level; a level name is never long
+enough to contain one there. Both halves must be known, and an unknown one is a
+fatal init error — the option silently doing nothing is how an operator ends up
+staring at a log that will never contain what they asked for."
+  (let ((colon (position #\: value :start (min 3 (length value)))))
+    (if (null colon)
+        (values nil (conf-parse-loglevel value))
+        (let ((category (string-downcase (subseq value 0 colon)))
+              (level (subseq value (1+ colon))))
+          (unless (and (bitcoin-lisp::log-category-known-p category)
+                       (member (string-downcase level)
+                               '("info" "debug" "trace" "warn" "warning" "error")
+                               :test #'string=))
+            (error "Unsupported category-specific logging level -loglevel=~A. ~
+Expected -loglevel=<category>:<loglevel>. Valid categories: ~A. ~
+Valid loglevels: info, debug, trace." value (log-categories-string)))
+          (values category (conf-parse-loglevel level))))))
+
+(defun conf-parse-loglevel-global (value)
+  "The GLOBAL threshold a -loglevel value implies, or NIL when it names a
+category instead. A category-specific spec leaves the global level alone."
+  (multiple-value-bind (category level) (parse-loglevel-spec value)
+    (and (null category) level)))
+
 (defun conf-parse-loglevel (value)
   "Map a -loglevel value to one of :debug :info :warn :error."
   (let ((v (string-downcase (string-trim '(#\Space #\Tab) value))))
@@ -546,7 +580,14 @@ Core's — a silent, opposite-direction divergence on a security-relevant flag."
           ((string= v "info") :info)
           ((member v '("warn" "warning") :test #'string=) :warn)
           ((member v '("error" "none") :test #'string=) :error)
-          (t (error "Invalid loglevel: ~S (want debug/info/warn/error)" value)))))
+          ;; Core's wording verbatim, list included (init/common.cpp:66,
+          ;; LogLevelsString). feature_logging.py matches it as a FULL regex.
+          ;; Core's settable levels are exactly info, debug and trace — warn and
+          ;; error exist as LEVELS but are not offered as a global threshold, so
+          ;; they are accepted here (nothing should start refusing a config that
+          ;; worked) and simply not named among the valid values.
+          (t (error "Unsupported global logging level -loglevel=~A. ~
+Valid values: info, debug, trace." value)))))
 
 (defun conf-parse-money (value)
   "Parse a config VALUE as a BTC amount string into satoshis (Bitcoin Core
@@ -687,7 +728,7 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
     "startupnotify" "connect" "seednode" "whitelist" "whitebind"
     ;; Core reads both with GetArgs: every -loadblock= is imported in order,
     ;; and every -wallet=<name> is loaded.
-    "loadblock" "wallet")
+    "loadblock" "wallet" "loglevel")
   "Option names whose every occurrence is meaningful (Core GetArgs
 list-options); all other repeated command-line options collapse to their
 LAST occurrence (Core GetArg on the command line takes span.end()[-1],
@@ -1002,7 +1043,12 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ("printtoconsole"    :console-log        :bool)
     ;; Core's own spelling of the same thing; -debuglogfile=0 disables it.
     ("debuglogfile"      :log-file           :string)
-    ("loglevel"          :log-level          :loglevel)
+    ;; The SCALAR row still feeds :LOG-LEVEL, the global threshold. It has to
+    ;; tolerate the <category>:<level> form, which is not a global level at all
+    ;; and is applied from :LOG-LEVEL-SPECS instead — otherwise a bare
+    ;; `-loglevel=net:debug` would be rejected as an invalid global level, which
+    ;; is how this option was broken for that form entirely.
+    ("loglevel"          :log-level          :loglevel-global)
     ("logratelimit"      :log-rate-limit     :bool)
     ("flatblockfiles"    :flat-block-files   :bool)
     ("reindex"           :reindex            :bool)
@@ -1504,7 +1550,8 @@ resolved network. Honors -server (enable RPC on the default port when no
                         (:string raw)
                         (:bool (conf-parse-bool raw))
                         (:int (conf-parse-int raw))
-                        (:loglevel (conf-parse-loglevel raw)))))))))
+                        (:loglevel (conf-parse-loglevel raw))
+                        (:loglevel-global (conf-parse-loglevel-global raw)))))))))
       ;; -port must be a real port number (Core init.cpp InitError
       ;; "Invalid port specified in -port").
       (let ((port (getf plist :port)))
@@ -1538,6 +1585,10 @@ resolved network. Honors -server (enable RPC on the default port when no
                         ;; alongside the ones settings.json records
                         ;; (wallet/load.cpp:81, chain.getSettingsList).
                         ("wallet"         . :wallet-names)
+                        ;; -loglevel: Core reads it with GetArgs, so a command
+                        ;; line can carry a global level AND per-category ones
+                        ;; (init/common.cpp:62-75).
+                        ("loglevel"       . :log-level-specs)
                         ;; -whitelist / -whitebind: Core reads both with
                         ;; GetArgs (init.cpp), so every occurrence counts.
                         ("whitelist"      . :whitelist)
@@ -1554,6 +1605,12 @@ resolved network. Honors -server (enable RPC on the default port when no
         (remf plist :disable-wallet)
         (when (and disable (not (lookup "wallet")))
           (setf (getf plist :wallet) nil)))
+      ;; A category-specific -loglevel names no global level, so the scalar
+      ;; parse yields NIL. Drop the key rather than passing NIL through: an
+      ;; explicit NIL overrides START-NODE's :INFO default, and it only happens
+      ;; to behave because LOG-LEVEL-VALUE's fallback is also 1.
+      (when (and (member :log-level plist) (null (getf plist :log-level)))
+        (remf plist :log-level))
       ;; -wallet carries two things at once. The NAMES to load are Core's
       ;; meaning. The second is ours: wallet support is default-OFF on mainnet
       ;; (docs/wallet-plan.md), and naming a wallet — or a bare -wallet, which

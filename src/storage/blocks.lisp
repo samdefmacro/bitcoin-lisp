@@ -578,16 +578,20 @@ zero tail of the file currently being appended to looks like."
     ;; record header would look like garbage and the scan would find nothing.
     ;; A key is only CREATED for a directory with no block data in it.
     (setf (block-store-xor-key store)
-          ;; -blocksxor=0 keeps the obfuscation key all-zero, which is how
-          ;; Core disables it (kernel/blockmanager_opts.h:18,26). Reading an
-          ;; EXISTING key is unconditional: a directory already written with a
-          ;; key must keep being read with it, whatever the flag now says.
-          (if *blocks-xor*
-              (read-or-create-xor-key (merge-pathnames "blocks/" base-path)
-                                      :create *flat-block-files*)
-              (or (read-or-create-xor-key (merge-pathnames "blocks/" base-path)
-                                          :create nil)
-                  (zero-obfuscation-key))))
+          (let* ((blocks-dir (merge-pathnames "blocks/" base-path))
+                 (key (read-or-create-xor-key blocks-dir :use-xor *blocks-xor*)))
+            ;; -blocksxor=0 on a blocksdir that already holds a random key is
+            ;; REFUSED, not silently honoured (Core InitBlocksdirXorKey,
+            ;; blockstorage.cpp:1213-1219). Reading those files without the key
+            ;; returns garbage, and a node that started anyway would conclude
+            ;; its whole block store was corrupt. Now that a fresh datadir gets
+            ;; a key by default, this is the ordinary way an operator meets it.
+            (when (and (not *blocks-xor*) (notevery #'zerop key))
+              (error "The blocksdir XOR-key can not be disabled when a random ~
+key was already stored! Stored key: '~A', stored path: '~A'."
+                     (bitcoin-lisp.crypto:bytes-to-hex key)
+                     (namestring (merge-pathnames "xor.dat" blocks-dir))))
+            key))
     ;; blocks/index/ eagerly, even though nothing is written into it until the
     ;; first index flush. Core opens its block-index LevelDB in BlockManager's
     ;; constructor, so the directory exists from the moment the node is up — and
