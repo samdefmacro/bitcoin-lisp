@@ -499,7 +499,7 @@ and such a wallet needs the truncated form to open."
                           (t
                            "Error: The wallet passphrase entered is incorrect. It contains a null character (ie - a zero byte). If the passphrase was set with a version of this software prior to 25.0, please try again with only the characters up to — but not including — the first null character. If this is successful, please set a new passphrase to avoid this issue in the future."))))
 
-(defun rpc-encryptwallet (node params)
+(define-rpc "encryptwallet" (node params)
   "Encrypt an unencrypted wallet (Bitcoin Core encryptwallet).
 PARAMS: (passphrase). Returns the instruction string.
 
@@ -524,7 +524,7 @@ no longer covers the addresses the wallet will hand out next."
                             :message "Error: Failed to encrypt the wallet."))))
     "wallet encrypted; The keypool has been flushed and a new HD seed was generated. You need to make a new backup with the backupwallet RPC."))
 
-(defun rpc-walletpassphrase (node params)
+(define-rpc "walletpassphrase" (node params)
   "Unlock the wallet for TIMEOUT seconds (Bitcoin Core walletpassphrase).
 PARAMS: (passphrase timeout). Returns null.
 
@@ -568,7 +568,7 @@ Calling it on an already-unlocked wallet succeeds and re-arms the timer."
     (ensure-relock-sweeper manager)
     nil))
 
-(defun rpc-walletpassphrasechange (node params)
+(define-rpc "walletpassphrasechange" (node params)
   "Change the wallet passphrase (Bitcoin Core walletpassphrasechange).
 PARAMS: (oldpassphrase newpassphrase). Returns null."
   (let ((wallet (wallet-for-request node))
@@ -587,7 +587,7 @@ PARAMS: (oldpassphrase newpassphrase). Returns null."
           (%passphrase-incorrect-error old :oldp t))))
     nil))
 
-(defun rpc-walletlock (node params)
+(define-rpc "walletlock" (node params)
   "Relock the wallet (Bitcoin Core walletlock). Returns null."
   (declare (ignore params))
   (let ((wallet (wallet-for-request node)))
@@ -767,7 +767,7 @@ directory\" and then land right inside it."
     (and (<= (length base-dir) (length path-dir))
          (equal base-dir (subseq path-dir 0 (length base-dir))))))
 
-(defun rpc-backupwallet (node params)
+(define-rpc "backupwallet" (node params)
   "Write a portable backup of the wallet to DESTINATION (Bitcoin Core
 backupwallet). PARAMS: (destination). Returns null.
 
@@ -810,7 +810,7 @@ none of our business."
                 (null (uiop:subdirectories path)))
        (uiop:delete-empty-directory path)))))
 
-(defun rpc-restorewallet (node params)
+(define-rpc "restorewallet" (node params)
   "Restore a wallet from a backup file and load it (Bitcoin Core
 restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
   (let* ((manager (node-wallet-manager-checked node))

@@ -158,7 +158,7 @@ vBits serialization)."
 
 ;;; --- RPCs ---
 
-(defun rpc-gettxoutproof (node params)
+(define-rpc "gettxoutproof" (node params)
   "Build a merkle proof that the given TXIDs are in a block (Bitcoin Core
 gettxoutproof). PARAMS: (txids [blockhash]). On this pruned node the block
 must be locatable: pass BLOCKHASH, or have txindex enabled. Returns the
@@ -212,7 +212,7 @@ hex-encoded CMerkleBlock."
               (bl.crypto:bytes-to-hex
                (serialize-merkle-block header-bytes (length txids-vec) hashes bits)))))))))
 
-(defun rpc-verifytxoutproof (node params)
+(define-rpc "verifytxoutproof" (node params)
   "Verify a merkle proof from gettxoutproof and return the txids it proves,
 provided the proof's block is on the active chain (Bitcoin Core
 verifytxoutproof). PARAMS: (proof-hex). Returns the list of txid hex

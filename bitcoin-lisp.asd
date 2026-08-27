@@ -130,6 +130,7 @@
                                (:file "ibd")))
                  (:module "rpc"
                   :components ((:file "package")
+                               (:file "define-rpc")
                                (:file "accessors")
                                (:file "descriptors")
                                (:file "methods")

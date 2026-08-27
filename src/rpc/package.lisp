@@ -28,6 +28,7 @@
 
    ;; Method registry
    #:register-rpc-method
+   #:define-rpc
    #:dispatch-rpc-method
 
    ;; Wallet manager (wallet P1; owned by the node)

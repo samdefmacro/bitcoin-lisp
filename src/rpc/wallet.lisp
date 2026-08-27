@@ -869,7 +869,7 @@ cannot recover from their backup of the other one."
                          :message "Unable to determine which HD key to use from active descriptors. Please specify with 'hdkey'"))
       (t (bl.crypto:bip32-parse (first roots))))))
 
-(defun rpc-createwalletdescriptor (node params)
+(define-rpc "createwalletdescriptor" (node params)
   "Create the wallet's descriptor for an address type it does not yet have
  (Core createwalletdescriptor, wallet/rpc/wallet.cpp:745-836).
 
@@ -1553,7 +1553,7 @@ back to wall-clock time when there is no tip."
 
 ;;; --- Wallet management RPCs (Core wallet/rpc/wallet.cpp) ---
 
-(defun rpc-createwallet (node params)
+(define-rpc "createwallet" (node params)
   "Create and load a new wallet (Bitcoin Core createwallet). PARAMS:
  (wallet_name disable_private_keys blank passphrase avoid_reuse descriptors
   load_on_startup external_signer). Only descriptor wallets can be created.
@@ -1680,7 +1680,7 @@ whose wallet is missing and loudly logged."
               (bl:log-warn "Could not load wallet ~S at startup, skipping it: ~A"
                                      name e))))))))
 
-(defun rpc-loadwallet (node params)
+(define-rpc "loadwallet" (node params)
   "Load a wallet from the wallet directory (Bitcoin Core loadwallet).
 PARAMS: (filename load_on_startup). After the records load, the wallet is
 caught up from its stored best-block locator (Core AttachChain: fork lookup +
@@ -1700,7 +1700,7 @@ settings.json so the next node start loads it automatically."
         (setf warnings (append warnings (list (%load-on-startup-warning action)))))
       (%push-warnings warnings `(("name" . ,(wallet-name wallet)))))))
 
-(defun rpc-unloadwallet (node params)
+(define-rpc "unloadwallet" (node params)
   "Unload the wallet named by the endpoint or the wallet_name argument
 (Bitcoin Core unloadwallet); both given must match. PARAMS:
  (wallet_name load_on_startup) — load_on_startup false removes the wallet from
@@ -1730,7 +1730,7 @@ settings.json so the next node start no longer loads it."
             (make-hash-table :test 'equal)
             `(("warnings" . ,(list (%load-on-startup-warning action)))))))))
 
-(defun rpc-listwallets (node params)
+(define-rpc "listwallets" (node params)
   "Names of the currently loaded wallets, in load order (Bitcoin Core
 listwallets)."
   (declare (ignore params))
@@ -1738,7 +1738,7 @@ listwallets)."
     (bt:with-recursive-lock-held ((wallet-manager-lock manager))
       (or (copy-list (wallet-manager-wallet-order manager)) #()))))
 
-(defun rpc-listwalletdir (node params)
+(define-rpc "listwalletdir" (node params)
   "Wallets present in the wallet directory (Bitcoin Core listwalletdir)."
   (declare (ignore params))
   (let ((manager (node-wallet-manager-checked node)))
@@ -1748,7 +1748,7 @@ listwallets)."
                                 (sort (list-wallet-dir manager) #'string<))
                         #())))))
 
-(defun rpc-getwalletinfo (node params)
+(define-rpc "getwalletinfo" (node params)
   "Wallet state info (Bitcoin Core getwalletinfo); format reports our storage
 backend (leveldb, where Core says sqlite)."
   (declare (ignore params))
@@ -1818,7 +1818,7 @@ backend (leveldb, where Core says sqlite)."
           (error 'rpc-error :code +rpc-invalid-address-or-key+
                             :message (format nil "Unknown address type '~A'" value)))))
 
-(defun rpc-getnewaddress (node params)
+(define-rpc "getnewaddress" (node params)
   "A new receiving address (Bitcoin Core getnewaddress). PARAMS:
  (label address_type); default address type bech32 (wallet.h
 DEFAULT_ADDRESS_TYPE)."
@@ -1840,7 +1840,7 @@ DEFAULT_ADDRESS_TYPE)."
           (wallet-write-address-book-entry wallet address label "receive")
           address)))))
 
-(defun rpc-getrawchangeaddress (node params)
+(define-rpc "getrawchangeaddress" (node params)
   "A new change address from the internal SPKMs (Bitcoin Core
 getrawchangeaddress). PARAMS: (address_type)."
   (let ((wallet (wallet-for-request node)))
@@ -1885,7 +1885,7 @@ SPKMs (Core IsInternalScriptPubKeyMan's optional bool)."
           ((active-in-p (wallet-internal-spkms wallet)) (values t t))
           (t (values nil nil)))))
 
-(defun rpc-listdescriptors (node params)
+(define-rpc "listdescriptors" (node params)
   "All wallet descriptors, sorted by string (Bitcoin Core listdescriptors).
 PARAMS: (private)."
   (let ((wallet (wallet-for-request node))
@@ -1979,7 +1979,7 @@ which is the whole point of the RPC."
                                       descs)
                               #())))))))
 
-(defun rpc-gethdkeys (node params)
+(define-rpc "gethdkeys" (node params)
   "List the wallet's BIP32 HD keys and the descriptors that use them (Core
 gethdkeys). PARAMS: ([{active_only, private}]).
 
@@ -2014,7 +2014,7 @@ retrofitted.")
      . "You need to rescan the blockchain in order to correctly mark used destinations in the past. Until this is done, some destinations may be considered unused, even if the opposite is the case."))
   "Core wallet/rpc/wallet.cpp:27-32 WALLET_FLAG_CAVEATS.")
 
-(defun rpc-setwalletflag (node params)
+(define-rpc "setwalletflag" (node params)
   "Turn a mutable wallet flag on or off (Core setwalletflag). PARAMS:
  (flag [value]), value defaulting TRUE.
 
@@ -2324,7 +2324,7 @@ as Core returns one result per REQUEST rather than per expansion."
         ("error" . (("code" . ,(rpc-error-code e))
                     ("message" . ,(rpc-error-message e))))))))
 
-(defun rpc-importdescriptors (node params)
+(define-rpc "importdescriptors" (node params)
   "Import descriptors into the wallet (Bitcoin Core importdescriptors), then
 rescan the chain from the lowest request timestamp (backup.cpp:302-462): a
 successful import triggers RescanFromTime(lowest_timestamp), and any request

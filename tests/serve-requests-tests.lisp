@@ -405,7 +405,7 @@ frozen for a day. Guard against 'helpfully' routing it through the cache."
                                                  (asdf:system-source-directory :bitcoin-lisp)))
                (let ((text (make-string (file-length s))))
                  (subseq text 0 (read-sequence text s))))))
-    (let ((start (search "defun rpc-getnodeaddresses" src)))
+    (let ((start (search "define-rpc \"getnodeaddresses\"" src)))
       (is (integerp start) "rpc-getnodeaddresses must exist")
       (when start
         (let ((body (subseq src start (min (length src) (+ start 2000)))))

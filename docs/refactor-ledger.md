@@ -35,6 +35,7 @@ src/; cold = cold-battery check count / failures.
 | 2026-08-28 | P2b-1 | messages.lisp (P2P) on byte-reader/byte-buf; nickname installer self-heals warm reloads | 0 | 13 | 62 | 42 | 8 | 199 | 15 | 6,783 | 34,420 / 0 (fresh) |
 | 2026-08-28 | P2b-2 | define-message: 6 struct+reader+writer triples → 6 field lists (src/serialization/message-macro.lisp) | 0 | 13 | 62 | 42 | 8 | 202 | 15 | 6,783 | 34,420 / 0 (fresh) |
 | 2026-08-28 | P2c | node-context: every P2P handler and the IBD pump take (peer payload ctx) instead of up to 8 params | 0 | 12 | 62 | 42 | 8 | 202 | 15 | 6,783 | 34,420 / 0 (fresh) |
+| 2026-08-28 | P2d-1 | define-rpc: 161 handlers register themselves; register-all-methods 197 → 6 lines | 0 | 12 | 61 | 42 | 8 | 202 | 15 | 6,783 | 34,424 / 0 (fresh) |
 
 ## Notes
 
