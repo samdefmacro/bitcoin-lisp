@@ -27,6 +27,10 @@
   :components ((:module "src"
                 :components
                 ((:file "package")
+                 ;; util first: byte I/O that the script interpreter's
+                 ;; sighash code inlines must be loaded before src/coalton/.
+                 (:module "util"
+                  :components ((:file "bytes")))
                  (:file "logging")
                  (:file "config")
                  (:file "zmq")

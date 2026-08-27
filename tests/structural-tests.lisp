@@ -44,6 +44,10 @@
     ;; API that coins-view-cache replaced, REQUEST-HEADERS beside the live
     ;; REQUEST-HEADERS-FOR-IBD, and BAN-PEER, which nothing calls because
     ;; misbehaviour discourages and setban bans by address.
+    ;; The u16 member of the byte-buf writer family (src/util/bytes.lisp):
+    ;; the CompactSize writer goes through buf-set-u16-le directly, so nothing
+    ;; in src/ calls this one. Kept for the family's completeness.
+    "bitcoin-lisp.bytes:bb-write-u16-le"
     "bitcoin-lisp.crypto:bip324-cipher-initialized-p"
     "bitcoin-lisp.crypto:ellswift-decode"
     "bitcoin-lisp.crypto:muhash-combine"
@@ -502,15 +506,14 @@ closing paren, which would count as a line."
 
 (defparameter +duplicate-definition-baseline+
   '("%script-push"
-    "bb-ensure" "bb-finish" "bb-write-bytes" "bb-write-u16-le" "bb-write-u32-le"
-    "bb-write-u64-le" "bb-write-u8" "bb-write-varint"
     "fsync-directory" "satoshi+" "satoshi>" "tagged-hash"
     "unwrap-block-height" "unwrap-satoshi" "with-node-lock"
     "wrap-block-height" "wrap-satoshi")
   "Names defined by DEFUN or DEFMACRO in more than one file under src/, as of
-the start of the cleanup. Two of everything is how the byte-buffer family came
-to exist twice (serialization/binary.lisp and coalton/interop.lisp), and how
-WITH-NODE-LOCK came to be two macros with different lambda lists.")
+the start of the cleanup, minus the eight byte-buf writers that existed twice
+(serialization/binary.lisp and coalton/interop.lisp) until src/util/bytes.lisp
+became the one copy. WITH-NODE-LOCK is two macros with different lambda
+lists.")
 
 (defun %duplicate-definition-names ()
   "Names with a top-level DEFUN/DEFMACRO in two or more distinct files."
@@ -607,13 +610,13 @@ retires them in favour of the byte-reader.")
 
 (defparameter +retiring-serialization-family-baseline+
   '((:stream-io . 88)
-    (:interop-buf . 54)
     (:compact-size-definitions . 12))
   "Call-site counts, at the start of the cleanup, of the byte-I/O families the
-plan retires (§4 P1). The byte-reader (br-read-*, 70 sites) and byte-buf
-(bb-write-*, 102 sites) are the ones that stay and are not pinned.
+plan retires (§4 P1). The byte-reader (br-read-*, 70 sites), the byte-buf
+(bb-write-*, 102 sites) and the positional buf-set-* writers underneath them
+are the one implementation that stays (src/util/bytes.lisp) and are not
+pinned.
   :stream-io     the patterns above
-  :interop-buf   (buf-set-...)  coalton/interop.lisp's second byte buffer
   :compact-size-definitions  distinct DEFUN names containing compact-size or
                  varint, core-varint excluded (a different encoding)")
 
@@ -621,7 +624,6 @@ plan retires (§4 P1). The byte-reader (br-read-*, 70 sites) and byte-buf
   (ecase family
     (:stream-io (reduce #'+ +stream-io-call-patterns+
                         :key (lambda (p) (%count-occurrences p text))))
-    (:interop-buf (%count-occurrences "(buf-set-" text))
     (:compact-size-definitions
      (length (remove-duplicates
               (loop for d in (%toplevel-definitions)
@@ -652,8 +654,9 @@ byte-buf; the stream codecs and interop's private buffer only lose call sites."
     ("src/networking/" . 4)
     ("src/node.lisp" . 36)
     ("src/rpc/" . 14)
-    ("src/serialization/" . 49)
+    ("src/serialization/" . 44)
     ("src/storage/" . 17)
+    ("src/util/" . 5)
     ("src/validation/" . 3)
     ("src/zmq.lisp" . 1))
   "Count of (error \"...\") -- a string where a condition type belongs -- per
@@ -712,11 +715,11 @@ counted as upward. That is a blind spot this test accepts, not a claim."
 
 (defun %package-references (lines)
   "The bitcoin-lisp.* packages LINES name with an explicit prefix: only
-bitcoin-lisp.foo followed by a colon counts; a mention in a comment or
-docstring does not."
+bitcoin-lisp.foo followed by a colon counts, and only outside a ; comment. A
+prefix quoted in a docstring still counts; the sources do not do that."
   (let ((found '()))
     (loop for raw across lines
-          for line = (string-downcase raw)
+          for line = (string-downcase (subseq raw 0 (position #\; raw)))
           do (loop with i = 0
                    while (setf i (search "bitcoin-lisp." line :start2 i))
                    do (let* ((end (or (position-if-not
@@ -791,7 +794,7 @@ the measuring functions must measure a known shape correctly."
   (is (equal '("bitcoin-lisp.storage")
              (%package-references
               (vector ";; bitcoin-lisp.validation in a comment does not count"
-                      "(bitcoin-lisp.storage:current-height x)")))
+                      "(bitcoin-lisp.storage:current-height x) ; nor bitcoin-lisp.rpc:here")))
       "a package prefix counts, a mention in a comment does not")
   (let ((order (%load-order)))
     (is (< (%package-layer "bitcoin-lisp.crypto" order)
