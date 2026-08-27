@@ -4280,7 +4280,12 @@ file location."
       (when settings-path
         (%write-settings-file settings-path settings-cells))
       ;; Apply the process-global config specials (options with no start-node
-      ;; keyword) from the same merged config, before launching.
+      ;; keyword) from the same merged config, before launching. *NETWORK* is
+      ;; set first: -acceptnonstdtxn's refusal on mainnet reads it, and until
+      ;; this line it still held the default while init-node set it later --
+      ;; so the "not currently supported for main chain" error Core's
+      ;; feature_config_args.py expects could never fire.
+      (setf *network* settings-network)
       (apply-config-globals merged)
       ;; The RPC half, which config.lisp cannot express (see
       ;; APPLY-RPC-CONFIG-GLOBALS).

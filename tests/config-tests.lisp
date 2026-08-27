@@ -1970,3 +1970,22 @@ option without a :type has no parser in the scalar scan."
   (signals bl::option-definition-error
     (macroexpand-1 '(bl::define-option "probe" :key :probe)))
   (finishes (macroexpand-1 '(bl::define-option "probe" :key :probe :type :bool))))
+
+(test network-is-set-before-the-config-globals-are-applied
+  "-acceptnonstdtxn on mainnet is an init error (Core mempool_args.cpp:102-104,
+asserted by feature_config_args.py); the check reads *NETWORK*. start-node-
+from-args resolved the network but left *NETWORK* at its default until
+init-node, which runs after apply-config-globals -- so on a mainnet command
+line the check compared against the default network and never fired. Pinned
+on the source, as the alternative is starting a node: the setf must precede
+the apply inside start-node-from-args."
+  (let* ((src (uiop:read-file-string
+               (merge-pathnames "src/node.lisp"
+                                (asdf:system-source-directory :bitcoin-lisp))))
+         (start (search "(defun start-node-from-args" src))
+         (end (search "(defun " src :start2 (1+ start)))
+         (body (subseq src start end))
+         (set-pos (search "(setf *network* settings-network)" body))
+         (apply-pos (search "(apply-config-globals merged)" body)))
+    (is (and set-pos apply-pos (< set-pos apply-pos))
+        "start-node-from-args must set *network* before apply-config-globals")))
