@@ -2152,48 +2152,6 @@ nothing to do."
               (bl.store:current-height snap))
     t))
 
-(defun %catch-up-blockfilterindex (node)
-  "Catch the block-filter index up to the node's validated chainstate tip.
-Indexes bind the validated chainstate (Core ValidatedChainstate) and index
-blocks in order from genesis — identical to the current chainstate while only
-the primary exists, and the promoted snapshot chainstate after assumeutxo
-completion. Repairs a best marker left above the tip (e.g. after
-invalidateblock), then backfills any shortfall. Shared by startup and the
-post-promotion index rebind."
-  (let* ((bfi (node-blockfilterindex node))
-         (cs (node-validated-chainstate node))
-         (tip (bl.store:current-height cs)))
-    ;; BIP157 genesis-anchor migration: an index built before genesis indexing
-    ;; existed seeded its header chain at the first STORED block, so every
-    ;; absolute cfheaders/cfcheckpt/getblockfilter header it serves diverges
-    ;; from Core and BIP157 light clients ban us. Detect and wipe it here; the
-    ;; backfill below then rebuilds the whole index from height 0 (the genesis
-    ;; filter is computed from chain parameters). No-op on fresh and healthy
-    ;; indexes; on a pruned node a bad index is kept (rebuild impossible) with
-    ;; a warning.
-    (when (eq :rebuilt (bl.store:blockfilterindex-ensure-genesis-anchor bfi cs))
-      (log-info "Block filter index wiped; rebuilding from genesis"))
-    (when (> (bl.store:blockfilterindex-height bfi) tip)
-      (log-warn "Block filter index best above tip (~D > ~D); repairing"
-                (bl.store:blockfilterindex-height bfi) tip)
-      (loop for h from tip downto 0
-            for e = (bl.store:get-block-at-height cs h)
-            when (and e (bl.store:blockfilterindex-has-block-p
-                         bfi (bl.store:block-index-entry-hash e)))
-              do (bl.store:blockfilterindex-set-best
-                  bfi h (bl.store:block-index-entry-hash e))
-                 (return)
-            finally (bl.store:blockfilterindex-clear-best bfi)))
-    (when (< (bl.store:blockfilterindex-height bfi) tip)
-      (log-info "Building block filter index to height ~D..." tip)
-      (let ((n (bl.store:build-blockfilterindex
-                bfi cs (node-block-store node)
-                #'bl.val:get-undo-data
-                :progress-callback
-                (lambda (h pct)
-                  (log-info "Block filter index: height ~D (~,1F%)" h pct)))))
-        (log-info "Block filter index build complete: ~D block~:P indexed" n)))))
-
 ;;; coinstatsindex rewind (Core BaseIndex::Rewind, index/base.cpp:239/290)
 ;;;
 ;;; coinstats records are keyed by HEIGHT with no block hash, there is no
@@ -2213,6 +2171,111 @@ post-promotion index rebind."
 before giving up and rebuilding from genesis. Far deeper than any plausible
 reorg; the cheap header-index walk is tried first and has no such bound.")
 
+(defmethod bl.store:index-prepare-sync ((bfi bl.store:blockfilterindex) cs store)
+  "BIP157 genesis-anchor migration, then repair a best marker left above the
+tip (e.g. after invalidateblock): an index built before genesis indexing
+existed seeded its header chain at the first STORED block, so every absolute
+cfheaders/cfcheckpt/getblockfilter header it serves diverges from Core and
+BIP157 light clients ban us. Detect and wipe it here; the backfill then
+rebuilds from height 0 (the genesis filter is computed from chain
+parameters). No-op on fresh and healthy indexes; on a pruned node a bad
+index is kept (rebuild impossible) with a warning."
+  (declare (ignore store))
+  (let ((tip (bl.store:current-height cs)))
+    (when (eq :rebuilt (bl.store:blockfilterindex-ensure-genesis-anchor bfi cs))
+      (log-info "Block filter index wiped; rebuilding from genesis"))
+    (when (> (bl.store:blockfilterindex-height bfi) tip)
+      (log-warn "Block filter index best above tip (~D > ~D); repairing"
+                (bl.store:blockfilterindex-height bfi) tip)
+      (loop for h from tip downto 0
+            for e = (bl.store:get-block-at-height cs h)
+            when (and e (bl.store:blockfilterindex-has-block-p
+                         bfi (bl.store:block-index-entry-hash e)))
+              do (bl.store:blockfilterindex-set-best
+                  bfi h (bl.store:block-index-entry-hash e))
+                 (return)
+            finally (bl.store:blockfilterindex-clear-best bfi)))))
+
+(defmethod bl.store:index-prepare-sync ((csi bl.store:coinstatsindex) cs store)
+  "Rewind a best marker that is not on the active chain (including one left
+above the tip) before backfilling on top of it -- see %REWIND-COINSTATSINDEX."
+  (%rewind-coinstatsindex csi cs store))
+
+(defmethod bl.store:index-sync ((bfi bl.store:blockfilterindex) cs store &key undo-fn subsidy-fn progress)
+  (declare (ignore subsidy-fn))
+  (bl.store:build-blockfilterindex bfi cs store undo-fn :progress-callback progress))
+
+(defmethod bl.store:index-sync ((csi bl.store:coinstatsindex) cs store &key undo-fn subsidy-fn progress)
+  (bl.store:build-coinstatsindex csi cs store undo-fn subsidy-fn :progress-callback progress))
+
+(defmethod bl.store:index-sync ((idx bl.store:txospender-index) cs store &key undo-fn subsidy-fn progress)
+  "Walk forward from the best indexed height: the entries are keyed by
+outpoint rather than by height, so they must be written in some order but
+not necessarily this one; forward keeps the best marker meaningful if the
+walk is interrupted. Stops, with a warning, at the first block whose body is
+unavailable."
+  (declare (ignore undo-fn subsidy-fn progress))
+  (let* ((tip (bl.store:current-height cs))
+         (from (1+ (bl.store:txospenderindex-height idx)))
+         (done 0))
+    (when (> from tip)
+      (return-from bl.store:index-sync 0))
+    (loop for h from from to tip
+          for entry = (bl.store:get-block-at-height cs h)
+          while entry
+          do (when (bl:interrupt-requested-p)
+               (log-warn "Spender index backfill stopped at height ~D" h)
+               (return))
+             (let* ((hash (bl.store:block-index-entry-hash entry))
+                    (block (and store (bl.store:get-block store hash))))
+               (cond
+                 (block
+                  (bl.store:txospenderindex-add-block idx block hash)
+                  (bl.store:txospenderindex-set-best-block idx hash h)
+                  (incf done))
+                 (t
+                  (log-warn "Spender index backfill stopped at height ~D: block body unavailable" h)
+                  (return)))))
+    done))
+
+(defun catch-up-index (node index)
+  "Catch INDEX up to NODE's validated chainstate tip (Core BaseIndex::Sync):
+make its best marker trustworthy (INDEX-PREPARE-SYNC), then backfill the
+shortfall (INDEX-SYNC), logging progress and the final height. Indexes bind
+the validated chainstate (Core ValidatedChainstate) and index blocks in order
+from genesis -- identical to the current chainstate while only the primary
+exists, and the promoted snapshot chainstate after assumeutxo completion.
+Shared by startup and the post-promotion index rebind. Synchronous, unlike
+Core's background BaseIndex thread. Returns what INDEX-SYNC returned, or NIL
+when there was nothing to do."
+  (let* ((cs (node-validated-chainstate node))
+         (tip (bl.store:current-height cs))
+         (name (bl.store:index-name index)))
+    (bl.store:index-prepare-sync index cs (node-block-store node))
+    (when (< (bl.store:index-height index) tip)
+      (log-info "Building ~A to height ~D..." name tip)
+      (let ((n (bl.store:index-sync index cs (node-block-store node)
+                                    :undo-fn #'bl.val:get-undo-data
+                                    :subsidy-fn #'bl.val:calculate-block-subsidy
+                                    :progress (lambda (h pct)
+                                                (log-info "~A: height ~D (~,1F%)" name h pct)))))
+        (log-info "~A build complete: ~D block~:P indexed" name n)
+        (when (< (bl.store:index-height index) tip)
+          (log-warn "~A stopped at height ~D of ~D (missing block/undo data ~
+below the pruned horizon; the index needs genesis-contiguous history)"
+                    name (bl.store:index-height index) tip))
+        n))))
+
+(defun restart-indexes-for-validated-chainstate (node)
+  "Rebind every index onto the node's (now promoted) validated chainstate and
+catch it up to its tip (Core restarts all indexes on background-sync
+completion, init.cpp:1367-1383). During the background sync the indexes
+tracked the historical chainstate up to the snapshot base; the promoted
+chainstate carries the full chain past the base, so this resumes indexing
+from where each index left off. A no-op when no index is enabled."
+  (dolist (index (node-indexes node))
+    (catch-up-index node index)))
+
 (defun %coinstatsindex-fork-height (cs best-hash)
   "The height of the last block common to the active chain and the branch
 BEST-HASH sits on (Core walks pprev in Rewind / FindForkInGlobalIndex). NIL
@@ -2229,7 +2292,7 @@ it names — or when the two chains do not actually meet."
     (when (and fork (bl.store:entry-on-active-chain-p cs fork))
       (bl.store:block-index-entry-height fork))))
 
-(defun %coinstatsindex-verified-height (node from)
+(defun %coinstatsindex-verified-height (csi cs store from)
   "The highest height at or below FROM whose stored record provably belongs to
 the ACTIVE chain, found by recomputing it from its stored parent and the active
 block at that height (see coinstatsindex-record-matches-block-p). This is the
@@ -2238,25 +2301,22 @@ what keeps an ordinary unclean shutdown — index a few blocks ahead of the last
 flushed tip, same chain — from costing a rebuild from genesis: the record at
 the restored tip verifies on the first try. NIL if nothing verifies within
 +coinstatsindex-max-rewind+."
-  (let ((csi (node-coinstatsindex node))
-        (cs (node-validated-chainstate node))
-        (store (node-block-store node)))
-    (loop for h from from downto (max 0 (- from +coinstatsindex-max-rewind+))
-          do (when (zerop h)
-               ;; Genesis is on every chain; its record is synthesized, not
-               ;; folded from a parent, so presence is the whole check.
-               (return (and (bl.store:coinstatsindex-get-stats csi 0) 0)))
-             (let* ((entry (bl.store:get-block-at-height cs h))
-                    (hash (and entry (bl.store:block-index-entry-hash entry)))
-                    (block (and hash (bl.store:get-block store hash))))
-               (when (and block
-                          (bl.store:coinstatsindex-record-matches-block-p
-                           csi block hash h
-                           (bl.val:get-undo-data hash)
-                           (bl.val:calculate-block-subsidy h)))
-                 (return h))))))
+  (loop for h from from downto (max 0 (- from +coinstatsindex-max-rewind+))
+        do (when (zerop h)
+             ;; Genesis is on every chain; its record is synthesized, not
+             ;; folded from a parent, so presence is the whole check.
+             (return (and (bl.store:coinstatsindex-get-stats csi 0) 0)))
+           (let* ((entry (bl.store:get-block-at-height cs h))
+                  (hash (and entry (bl.store:block-index-entry-hash entry)))
+                  (block (and hash (bl.store:get-block store hash))))
+             (when (and block
+                        (bl.store:coinstatsindex-record-matches-block-p
+                         csi block hash h
+                         (bl.val:get-undo-data hash)
+                         (bl.val:calculate-block-subsidy h)))
+               (return h)))))
 
-(defun %rewind-coinstatsindex (node)
+(defun %rewind-coinstatsindex (csi cs store)
   "Make the coinstats index's best marker name a block on the ACTIVE chain
 before anything backfills on top of it, moving it back to the last common
 ancestor when it does not (Core BaseIndex::Rewind). Records above the new best
@@ -2266,9 +2326,7 @@ Returns NIL when the index was already consistent — the common case, and it
 costs one hash comparison: a rewind that always rebuilt would be a severe
 performance regression. Otherwise returns the height rewound to, or -1 when no
 trustworthy record could be identified and the index must be rebuilt."
-  (let* ((csi (node-coinstatsindex node))
-         (cs (node-validated-chainstate node))
-         (tip (bl.store:current-height cs)))
+  (let ((tip (bl.store:current-height cs)))
     (multiple-value-bind (best-height best-hash)
         (bl.store:coinstatsindex-best csi)
       (when (minusp best-height)
@@ -2287,7 +2345,7 @@ trustworthy record could be identified and the index must be rebuilt."
                               (<= fork tip)
                               (bl.store:coinstatsindex-get-stats csi fork)
                               fork)
-                         (%coinstatsindex-verified-height node (min best-height tip))))
+                         (%coinstatsindex-verified-height csi cs store (min best-height tip))))
              (entry (and target (bl.store:get-block-at-height cs target))))
         (cond
           (entry
@@ -2301,90 +2359,6 @@ trustworthy record could be identified and the index must be rebuilt."
                      (min best-height tip))
            (bl.store:coinstatsindex-clear-best csi)
            -1))))))
-
-(defun %catch-up-coinstatsindex (node)
-  "Catch the coinstats index up to the node's validated chainstate tip. Its
-running MuHash must be contiguous from genesis, so a pruned node (missing
-early undo data) can only build it if its stored history reaches genesis —
-otherwise the backfill stops at the first gap. Rewinds a best marker that is
-not on the active chain (including one left above the tip) before backfilling.
-Shared by startup and the post-promotion index rebind."
-  (let* ((csi (node-coinstatsindex node))
-         (cs (node-validated-chainstate node))
-         (tip (bl.store:current-height cs)))
-    (%rewind-coinstatsindex node)
-    (when (< (bl.store:coinstatsindex-height csi) tip)
-      (log-info "Building coinstats index to height ~D..." tip)
-      (let ((n (bl.store:build-coinstatsindex
-                csi cs (node-block-store node)
-                #'bl.val:get-undo-data
-                #'bl.val:calculate-block-subsidy
-                :progress-callback
-                (lambda (h pct)
-                  (log-info "Coinstats index: height ~D (~,1F%)" h pct)))))
-        (log-info "Coinstats index build complete: ~D block~:P indexed" n)
-        (when (< (bl.store:coinstatsindex-height csi) tip)
-          (log-warn "Coinstats index stopped at height ~D of ~D (missing block/undo ~
-data below the pruned horizon; the index needs genesis-contiguous history)"
-                    (bl.store:coinstatsindex-height csi) tip))))))
-
-(defun restart-indexes-for-validated-chainstate (node)
-  "Rebind the block-filter and coinstats indexes onto the node's (now
-promoted) validated chainstate and catch them up to its tip (Core restarts
-all indexes on background-sync completion, init.cpp:1367-1383). During the
-background sync the indexes tracked the historical chainstate up to the
-snapshot base; the promoted chainstate carries the full chain past the base,
-so this resumes indexing from where each index left off. A no-op when no
-index is enabled."
-  (when (node-blockfilterindex node) (%catch-up-blockfilterindex node))
-  (when (node-coinstatsindex node) (%catch-up-coinstatsindex node))
-  (when (node-txospenderindex node) (%catch-up-txospenderindex node)))
-
-(defun %catch-up-txospenderindex (node)
-  "Backfill the spender index from where it left off to the validated tip.
-
-⚠️ Without this, turning -txospenderindex on for an existing node would index
-NOTHING historical — only blocks connected from that moment on — and every
-lookup for an already-confirmed spend would answer `not found'. That is exactly
-the shape of the -txindex defect this project already shipped once, where
-BUILD-TX-INDEX existed and had no caller, so the flag indexed nothing.
-
-Walks forward from the best indexed height, because the entries are keyed by
-outpoint rather than by height and so must be written in some order but not
-necessarily this one; forward simply keeps the best marker meaningful if the
-walk is interrupted."
-  (let* ((idx (node-txospenderindex node))
-         (cs (node-validated-chainstate node))
-         (store (node-block-store node))
-         (tip (bl.store:current-height cs))
-         (from (1+ (bl.store:txospenderindex-height idx)))
-         (done 0))
-    (when (> from tip)
-      (return-from %catch-up-txospenderindex 0))
-    (when (plusp (- tip from))
-      (log-info "Spender index: backfilling heights ~D..~D" from tip))
-    (loop for h from from to tip
-          for entry = (bl.store:get-block-at-height cs h)
-          while entry
-          do (when (bl:interrupt-requested-p)
-               (log-warn "Spender index backfill stopped at height ~D" h)
-               (return))
-             (let* ((hash (bl.store:block-index-entry-hash entry))
-                    (block (and store (bl.store:get-block store hash))))
-               (cond
-                 (block
-                  (bl.store:txospenderindex-add-block idx block hash)
-                  (bl.store:txospenderindex-set-best-block idx hash h)
-                  (incf done))
-                 (t
-                  ;; A pruned or missing body cannot be indexed, and skipping it
-                  ;; while advancing the marker would leave a permanent hole the
-                  ;; next start could never notice. Stop instead.
-                  (log-warn "Spender index backfill stopped at height ~D: block body unavailable" h)
-                  (return)))))
-    (when (plusp done)
-      (log-info "Spender index: indexed ~D block~:P" done))
-    done))
 
 ;;; -stopatheight / disk-space / periodic peers.dat dump support
 
@@ -2639,6 +2613,133 @@ case ever exercised) has genesis for a root."
           :chain-work 0
           :status :valid
           :tx-count 1)))))   ; genesis carries exactly its coinbase
+
+(defun %start-txindex ()
+  "Open the transaction index on *NODE* and catch it up to the tip. Still on
+its own path rather than CATCH-UP-INDEX (P2e-2 folds it in): its marker is a
+hash without a height, and BUILD-TX-INDEX resolves that itself."
+  (log-info "Initializing transaction index...")
+  (setf (node-tx-index *node*)
+        (bl.store:init-tx-index (node-data-directory *node*)
+                                             :enabled t))
+  ;; CATCH UP to the tip. Without this, -txindex indexed only blocks
+  ;; connected AFTER startup: BUILD-TX-INDEX existed, was complete, was
+  ;; idempotent -- and had no caller anywhere in the tree. Enabling the flag
+  ;; on a synced node therefore produced an index of 0 entries and
+  ;; getrawtransaction answered -5 "No such mempool or blockchain
+  ;; transaction" for every historical txid, which is the entire purpose of
+  ;; the option. Observed on testnet4 2026-08-19 immediately after enabling
+  ;; it, at height 149088.
+  ;;
+  ;; Safe to run unconditionally: the scan skips blocks already indexed at
+  ;; their active-chain location (%txindex-block-indexed-p checks the block's
+  ;; LAST transaction, so it also re-points entries left stale by a reorg
+  ;; that happened while the index was offline), so a caught-up node pays one
+  ;; pass over the block index and writes nothing.
+  ;;
+  ;; Synchronous, unlike Core's background BaseIndex thread. Acceptable
+  ;; because pruning and txindex are mutually exclusive here, so the only
+  ;; chains this can run over are ones we hold in full; a background thread
+  ;; is the better shape and is left for the same change that gives the index
+  ;; its own catch-up worker.
+  (bl.rpc:set-rpc-warmup-status "Catching up transaction index...")
+  (let ((chainstate (node-current-chainstate *node*))
+        (store (node-block-store *node*)))
+    (when (and chainstate store)
+      (let ((added (bl.store:build-tx-index
+                    (node-tx-index *node*) chainstate store
+                    :progress-callback
+                    (lambda (height pct)
+                      (log-info "Transaction index: height ~D (~,1F%)" height pct)))))
+        (when (plusp added)
+          (log-info "Transaction index catch-up added ~D transactions" added)))))
+  (log-info "Transaction index loaded: ~D entries"
+            (bl.store:txindex-count (node-tx-index *node*))))
+
+(defun %start-indexes (blockfilterindex txospenderindex coinstatsindex
+                       reindex-chainstate)
+  "Open every enabled BaseIndex-shaped index on *NODE* and catch it up to the
+tip (Core init.cpp \"Step 8: start indexers\" -- our catch-ups are
+synchronous, see CATCH-UP-INDEX). Prune locks are re-registered from scratch."
+  ;; Prune locks are re-registered from scratch on every start: registration is
+  ;; by name, so a re-init replaces rather than accumulates, but an index that
+  ;; was enabled last run and is disabled this one would otherwise leave a lock
+  ;; behind holding the prune horizon down forever.
+  (bl.store:clear-prune-locks)
+  ;; Likewise the once-per-run stall latch of the connect-time index hook.
+  (setf *index-stall-logged* '())
+
+  ;; Initialize BIP158 block filter index (optional)
+  (when blockfilterindex
+    (log-info "Initializing block filter index...")
+    (setf (node-blockfilterindex *node*)
+          (bl.store:init-blockfilterindex (node-data-directory *node*)
+                                                       :enabled t))
+    (log-info "Block filter index loaded: indexed to height ~D"
+              (bl.store:blockfilterindex-height (node-blockfilterindex *node*)))
+    ;; The filter index needs each block's undo data to build its filter, so
+    ;; pruning must not run ahead of it (Core blockfilterindex AllowPrune() ->
+    ;; true, and BaseIndex::SetBestBlockIndex takes a lock at its best height).
+    (let ((bfi (node-blockfilterindex *node*)))
+      (bl.store:register-prune-lock
+       "blockfilterindex"
+       (lambda ()
+         ;; -1 is "nothing indexed yet", which is Core's height_first ==
+         ;; INT_MAX: no height to protect, so no constraint. Returning it
+         ;; verbatim would drive the ceiling to 1 and stop pruning outright.
+         (let ((h (bl.store:blockfilterindex-height bfi)))
+           (and (plusp h) h)))))
+    ;; One-time catch-up over already-stored blocks, before the sync thread
+    ;; starts (single-threaded here, so no writer races). Fresh-from-genesis
+    ;; nodes have nothing to do; the connect-time hook then indexes forward.
+    (bl.rpc:set-rpc-warmup-status "Catching up block filter index...")
+    (catch-up-index *node* (node-blockfilterindex *node*)))
+
+  ;; Initialize txospenderindex (optional). Core starts every index's
+  ;; background sync from init, so enabling -txospenderindex on a synced node
+  ;; indexes history; until P2e-1 this index was only ever caught up on
+  ;; assumeutxo promotion, and the flag indexed nothing historical (the same
+  ;; no-caller shape as ga9-txindex-startup-catch-up-is-wired).
+  (when txospenderindex
+    (log-info "Initializing spender index...")
+    (setf (node-txospenderindex *node*)
+          (bl.store:init-txospender-index (node-data-directory *node*)
+                                                      :enabled t))
+    (let ((best (bl.store:txospenderindex-best-block
+                 (node-txospenderindex *node*))))
+      (log-info "Spender index loaded: best block ~A"
+                (if best (bl.crypto:bytes-to-hex best) "none")))
+    (bl.rpc:set-rpc-warmup-status "Catching up txospender index...")
+    (catch-up-index *node* (node-txospenderindex *node*)))
+
+  ;; Initialize coinstatsindex (optional). Like the filter index, catch up over
+  ;; already-stored blocks before the sync thread starts, then the connect-time
+  ;; hook advances it. Its running MuHash must be contiguous from genesis, so a
+  ;; pruned node (missing early undo data) can only build it if its stored
+  ;; history reaches genesis -- otherwise the backfill stops at the first gap.
+  (when coinstatsindex
+    (log-info "Initializing coinstats index...")
+    (setf (node-coinstatsindex *node*)
+          (bl.store:init-coinstatsindex (node-data-directory *node*)
+                                                    :enabled t))
+    (log-info "Coinstats index loaded: indexed to height ~D"
+              (bl.store:coinstatsindex-height (node-coinstatsindex *node*)))
+    ;; Same reasoning as the filter index (Core coinstatsindex AllowPrune() ->
+    ;; true): its per-block statistics are derived from undo data.
+    (let ((csi (node-coinstatsindex *node*)))
+      (bl.store:register-prune-lock
+       "coinstatsindex"
+       (lambda ()
+         (let ((h (bl.store:coinstatsindex-height csi)))
+           (and (plusp h) h)))))
+    ;; A chainstate reindex may have changed UTXO-set contents (e.g. dropping
+    ;; unspendable outputs), so the coinstats records must be rebuilt to stay
+    ;; consistent. Clear the best marker to force a full rebuild below.
+    (when reindex-chainstate
+      (bl.store:coinstatsindex-clear-best (node-coinstatsindex *node*))
+      (log-info "Coinstats index: rebuilding after chainstate reindex"))
+    (bl.rpc:set-rpc-warmup-status "Catching up coinstats index...")
+    (catch-up-index *node* (node-coinstatsindex *node*))))
 
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
                         (network :testnet3)
@@ -3455,116 +3556,11 @@ to move them (the node must be stopped)."
     (log-error "Recover by reindexing from the block files, or restore a backup.")
     (error "Unplaceable UTXO set in ~A" (node-data-directory *node*)))
 
-  ;; Initialize transaction index (optional)
-  (when txindex
-    (log-info "Initializing transaction index...")
-    (setf (node-tx-index *node*)
-          (bl.store:init-tx-index (node-data-directory *node*)
-                                               :enabled t))
-    ;; CATCH UP to the tip. Without this, -txindex indexed only blocks
-    ;; connected AFTER startup: BUILD-TX-INDEX existed, was complete, was
-    ;; idempotent -- and had no caller anywhere in the tree. Enabling the flag
-    ;; on a synced node therefore produced an index of 0 entries and
-    ;; getrawtransaction answered -5 "No such mempool or blockchain
-    ;; transaction" for every historical txid, which is the entire purpose of
-    ;; the option. Observed on testnet4 2026-08-19 immediately after enabling
-    ;; it, at height 149088.
-    ;;
-    ;; Safe to run unconditionally: the scan skips blocks already indexed at
-    ;; their active-chain location (%txindex-block-indexed-p checks the block's
-    ;; LAST transaction, so it also re-points entries left stale by a reorg
-    ;; that happened while the index was offline), so a caught-up node pays one
-    ;; pass over the block index and writes nothing.
-    ;;
-    ;; Synchronous, unlike Core's background BaseIndex thread. Acceptable
-    ;; because pruning and txindex are mutually exclusive here, so the only
-    ;; chains this can run over are ones we hold in full; a background thread
-    ;; is the better shape and is left for the same change that gives the index
-    ;; its own catch-up worker.
-    (bl.rpc:set-rpc-warmup-status "Catching up transaction index...")
-    (let ((chainstate (node-current-chainstate *node*))
-          (store (node-block-store *node*)))
-      (when (and chainstate store)
-        (let ((added (bl.store:build-tx-index
-                      (node-tx-index *node*) chainstate store
-                      :progress-callback
-                      (lambda (height pct)
-                        (log-info "Transaction index: height ~D (~,1F%)" height pct)))))
-          (when (plusp added)
-            (log-info "Transaction index catch-up added ~D transactions" added)))))
-    (log-info "Transaction index loaded: ~D entries"
-              (bl.store:txindex-count (node-tx-index *node*))))
-
-  ;; Prune locks are re-registered from scratch on every start: registration is
-  ;; by name, so a re-init replaces rather than accumulates, but an index that
-  ;; was enabled last run and is disabled this one would otherwise leave a lock
-  ;; behind holding the prune horizon down forever.
-  (bl.store:clear-prune-locks)
-
-  ;; Initialize BIP158 block filter index (optional)
-  (when blockfilterindex
-    (log-info "Initializing block filter index...")
-    (setf *blockfilterindex-stall-logged* nil)
-    (setf (node-blockfilterindex *node*)
-          (bl.store:init-blockfilterindex (node-data-directory *node*)
-                                                       :enabled t))
-    (log-info "Block filter index loaded: indexed to height ~D"
-              (bl.store:blockfilterindex-height (node-blockfilterindex *node*)))
-    ;; The filter index needs each block's undo data to build its filter, so
-    ;; pruning must not run ahead of it (Core blockfilterindex AllowPrune() ->
-    ;; true, and BaseIndex::SetBestBlockIndex takes a lock at its best height).
-    (let ((bfi (node-blockfilterindex *node*)))
-      (bl.store:register-prune-lock
-       "blockfilterindex"
-       (lambda ()
-         ;; -1 is "nothing indexed yet", which is Core's height_first ==
-         ;; INT_MAX: no height to protect, so no constraint. Returning it
-         ;; verbatim would drive the ceiling to 1 and stop pruning outright.
-         (let ((h (bl.store:blockfilterindex-height bfi)))
-           (and (plusp h) h)))))
-    ;; One-time catch-up over already-stored blocks, before the sync thread
-    ;; starts (single-threaded here, so no writer races). Fresh-from-genesis
-    ;; nodes have nothing to do; the connect-time hook then indexes forward.
-    (bl.rpc:set-rpc-warmup-status "Catching up block filter index...")
-    (%catch-up-blockfilterindex *node*))
-
-  ;; Initialize coinstatsindex (optional). Like the filter index, catch up over
-  ;; already-stored blocks before the sync thread starts, then the connect-time
-  ;; hook advances it. Its running MuHash must be contiguous from genesis, so a
-  ;; pruned node (missing early undo data) can only build it if its stored
-  ;; history reaches genesis -- otherwise the backfill stops at the first gap.
-  (when txospenderindex
-    (log-info "Initializing spender index...")
-    (setf (node-txospenderindex *node*)
-          (bl.store:init-txospender-index (node-data-directory *node*)
-                                                      :enabled t))
-    (let ((best (bl.store:txospenderindex-best-block
-                 (node-txospenderindex *node*))))
-      (log-info "Spender index loaded: best block ~A"
-                (if best (bl.crypto:bytes-to-hex best) "none"))))
-  (when coinstatsindex
-    (log-info "Initializing coinstats index...")
-    (setf (node-coinstatsindex *node*)
-          (bl.store:init-coinstatsindex (node-data-directory *node*)
-                                                    :enabled t))
-    (log-info "Coinstats index loaded: indexed to height ~D"
-              (bl.store:coinstatsindex-height (node-coinstatsindex *node*)))
-    ;; Same reasoning as the filter index (Core coinstatsindex AllowPrune() ->
-    ;; true): its per-block statistics are derived from undo data.
-    (let ((csi (node-coinstatsindex *node*)))
-      (bl.store:register-prune-lock
-       "coinstatsindex"
-       (lambda ()
-         (let ((h (bl.store:coinstatsindex-height csi)))
-           (and (plusp h) h)))))
-    ;; A chainstate reindex may have changed UTXO-set contents (e.g. dropping
-    ;; unspendable outputs), so the coinstats records must be rebuilt to stay
-    ;; consistent. Clear the best marker to force a full rebuild below.
-    (when reindex-chainstate
-      (bl.store:coinstatsindex-clear-best (node-coinstatsindex *node*))
-      (log-info "Coinstats index: rebuilding after chainstate reindex"))
-    (bl.rpc:set-rpc-warmup-status "Catching up coinstats index...")
-    (%catch-up-coinstatsindex *node*))
+  ;; Step 8 of Core's init (indexes): open every enabled index and catch it
+  ;; up over the blocks already on disk before the sync thread starts.
+  (when txindex (%start-txindex))
+  (%start-indexes blockfilterindex txospenderindex coinstatsindex
+                  reindex-chainstate)
 
   ;; -forcecompactdb: once every LevelDB is open (and any reindex/backfill has
   ;; run), full-compact them to reclaim tombstone space -- e.g. the ~24M delete
@@ -4761,83 +4757,64 @@ durable if it does flush (atomic temp+fsync+rename inside save-*)."
       #+sbcl (sb-ext:gc :full t)
       (log-memory-snapshot "post-flush"))))
 
-(defvar *blockfilterindex-stall-logged* nil
-  "One-shot latch so a stalled block filter index (non-contiguous connect
-refused) logs a single warning instead of one per block until restart.")
+(defvar *index-stall-logged* '()
+  "Names of indexes whose non-contiguous refusal has been logged: once per
+index per process, not once per block.")
 
-(defun index-block-filter (chainstate block block-hash height spent-utxos)
-  "Connect-time hook: add BLOCK's BIP158 basic filter to the running node's
-block filter index, if one is enabled. CHAINSTATE is the chainstate the
-block connected to; signals from any chainstate other than the node's
-VALIDATED one are dropped — indexes index blocks in order from genesis, so
-they bind Core's ValidatedChainstate (init.cpp:1367-1383) and must ignore
-an unvalidated snapshot chainstate's tip-range connects. SPENT-UTXOS is the
-undo list the UTXO apply produced. Never signals -- a filter-index failure
-must not abort a block connect -- so consensus is unaffected whether the
-index is on or off."
-  (let ((bfi (and *node* (node-blockfilterindex *node*))))
-    (when (and bfi (bl.store:blockfilterindex-enabled bfi)
-               (eq chainstate (node-validated-chainstate *node*)))
+(defun node-indexes (node)
+  "NODE's enabled indexes -- the block filter, coinstats and spender indexes
+-- in the order they are driven. (The txindex is written through connect-
+block's :tx-index argument and caught up in start-node; folding it in here
+is the next step.)"
+  (remove-if-not #'bl.store:base-index-enabled
+                 (remove nil (list (node-blockfilterindex node)
+                                   (node-coinstatsindex node)
+                                   (node-txospenderindex node)))))
+
+(defun index-block-connected (chainstate block block-hash height spent-utxos)
+  "Connect-time hook (Core BaseIndex::BlockConnected): fold BLOCK, connected
+at HEIGHT with SPENT-UTXOS as its undo list, into every enabled index.
+CHAINSTATE is the chainstate the block connected to; signals from any
+chainstate other than the node's VALIDATED one are dropped -- indexes index
+blocks in order from genesis, so they bind Core's ValidatedChainstate
+(init.cpp:1367-1383) and must ignore an unvalidated snapshot chainstate's
+tip-range connects. Never signals: an index failure must not abort a block
+connect, so consensus is unaffected whether an index is on or off."
+  (when (and *node* (eq chainstate (node-validated-chainstate *node*)))
+    (dolist (index (node-indexes *node*))
+      (let ((name (bl.store:index-name index)))
+        (handler-case
+            (multiple-value-bind (result status)
+                (bl.store:index-write-block index chainstate block block-hash height spent-utxos)
+              (declare (ignore result))
+              (when (and (eq status :noncontiguous)
+                         (not (member name *index-stall-logged* :test #'string=)))
+                (push name *index-stall-logged*)
+                (log-warn "~A stalled at height ~D: gap below best-indexed height ~D; ~
+the startup backfill will heal it on next restart"
+                          name height (bl.store:index-height index))))
+          (error (e)
+            (log-warn "~A failed at height ~D: ~A" name height e)))))))
+
+(defun index-block-disconnected (chainstate block block-hash height)
+  "Disconnect-time hook (Core BaseIndex's rewind): erase what
+INDEX-BLOCK-CONNECTED wrote for BLOCK (at HEIGHT) in every enabled index.
+Same chainstate rule and same never-signals rule as the connect hook."
+  (when (and *node* (eq chainstate (node-validated-chainstate *node*)))
+    (dolist (index (node-indexes *node*))
       (handler-case
-          (multiple-value-bind (filter status)
-              (bl.store:blockfilterindex-add-block
-               bfi block block-hash height spent-utxos)
-            (when (and (eq status :noncontiguous)
-                       (not *blockfilterindex-stall-logged*))
-              (setf *blockfilterindex-stall-logged* t)
-              (log-warn "Block filter index stalled at height ~D: gap below ~
-best-indexed height ~D; the startup backfill will heal it on next restart"
-                        height
-                        (bl.store:blockfilterindex-height bfi)))
-            filter)
+          (bl.store:index-rewind-block index chainstate block block-hash height)
         (error (e)
-          (log-warn "Block filter index failed at height ~D: ~A" height e)
-          nil)))))
+          (log-warn "~A failed to rewind ~A: ~A"
+                    (bl.store:index-name index) (bl.crypto:bytes-to-hex block-hash) e))))))
 
-(defun index-block-txospenders (chainstate block block-hash height)
-  "Connect-time hook: record which transaction in BLOCK spent each output it
-consumes, if the spender index is enabled.
-
-Same shape and same guarantees as INDEX-BLOCK-FILTER above — bound to the
-VALIDATED chainstate so a snapshot chainstate's tip-range connects are ignored,
-and wrapped so an index failure can never abort a block connect."
-  (let ((idx (and *node* (node-txospenderindex *node*))))
-    (when (and idx (bl.store:txospender-index-enabled idx)
-               (eq chainstate (node-validated-chainstate *node*)))
-      (handler-case
-          (progn
-            (bl.store:txospenderindex-add-block idx block block-hash)
-            (bl.store:txospenderindex-set-best-block idx block-hash height))
-        (error (e)
-          (log-warn "Spender index failed to add block ~A: ~A"
-                    (bl.crypto:bytes-to-hex block-hash) e)
-          nil)))))
-
-(defun unindex-block-txospenders (chainstate block block-hash)
-  "Disconnect-time hook: erase what INDEX-BLOCK-TXOSPENDERS wrote for BLOCK.
-
-⚠️ THIS IS THE FIRST DISCONNECT HOOK IN THIS TREE, and the spender index is the
-first index that needs one. The others key their records on HEIGHT — a
-reconnect overwrites a disconnected block's record and a stale one is never
-read (see the coinstatsindex rewind note above, which says outright that there
-is no disconnect hook). A spender key carries no height: it is
-hash(outpoint) | block hash | offset. After a reorg the disconnected block is
-still on disk, so an entry left behind resolves to a spending transaction from
-an ABANDONED chain — a wrong answer, not a stale one. Core erases through
-CustomRemove for the same reason (index/txospenderindex.cpp:135-139).
-
-The erase is exact rather than approximate because Core builds the same
-outpoint list for the connect and the disconnect side from the block alone
-(BuildSpenderPositions, :110-127), and so do we."
-  (let ((idx (and *node* (node-txospenderindex *node*))))
-    (when (and idx (bl.store:txospender-index-enabled idx)
-               (eq chainstate (node-validated-chainstate *node*)))
-      (handler-case
-          (bl.store:txospenderindex-remove-block idx block block-hash)
-        (error (e)
-          (log-warn "Spender index failed to remove block ~A: ~A"
-                    (bl.crypto:bytes-to-hex block-hash) e)
-          nil)))))
+(defmethod bl.store:index-write-block ((csi bl.store:coinstatsindex) chainstate block block-hash height spent-utxos)
+  "The coinstats fold needs the block subsidy, which is consensus; that is
+why this method lives here rather than in storage."
+  (declare (ignore chainstate))
+  (values (bl.store:coinstatsindex-add-block csi block block-hash height spent-utxos
+                                             (bl.val:calculate-block-subsidy height))
+          nil))
 
 (defun do-reindex-chainstate ()
   "Rebuild the UTXO set from already-stored blocks (Bitcoin Core
@@ -4954,28 +4931,6 @@ database it opens. Synchronous and potentially slow on a large chainstate."
         (log-info "Finished database compaction of chainstate"))
       (when bfi (compact "blockfilterindex" (bl.store:blockfilterindex-db bfi)))
       (when csi (compact "coinstatsindex" (bl.store:coinstatsindex-db csi))))))
-
-(defun index-block-coinstats (chainstate block block-hash height spent-utxos)
-  "Connect-time hook: fold BLOCK into the running node's coinstatsindex, if
-one is enabled. CHAINSTATE is the chainstate the block connected to; like
-index-block-filter, only the node's VALIDATED chainstate's connects are
-indexed — the running MuHash must be contiguous from genesis, which an
-unvalidated snapshot chainstate's tip-range blocks are not. SPENT-UTXOS is
-the undo list the UTXO apply produced; the block subsidy is derived from
-HEIGHT. Never signals -- an index failure must not abort a block connect --
-so consensus is unaffected whether the index is on or off. Returns NIL (and
-stalls quietly) if the parent height's record is missing (non-contiguous);
-the startup backfill heals such gaps on restart."
-  (let ((csi (and *node* (node-coinstatsindex *node*))))
-    (when (and csi (bl.store:coinstatsindex-enabled csi)
-               (eq chainstate (node-validated-chainstate *node*)))
-      (handler-case
-          (bl.store:coinstatsindex-add-block
-           csi block block-hash height spent-utxos
-           (bl.val:calculate-block-subsidy height))
-        (error (e)
-          (log-warn "Coinstats index failed at height ~D: ~A" height e)
-          nil)))))
 
 ;;; Wallet chain-tracking hooks (wallet P2). Hardcoded call sites like the
 ;;; index hooks above: connect-block / perform-reorg call the block pair,

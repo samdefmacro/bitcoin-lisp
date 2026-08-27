@@ -165,10 +165,10 @@
    #:*interrupt-check*
    #:interrupt-requested-p
    #:listen-port
-   #:index-block-filter
-   #:index-block-coinstats
-   #:index-block-txospenders
-   #:unindex-block-txospenders
+   #:index-block-connected
+   #:index-block-disconnected
+   #:node-indexes
+   #:catch-up-index
    ;; Wallet chain-tracking hooks (wallet P2; defined in node.lisp, called
    ;; from connect-block / perform-reorg / the mempool like the index hooks)
    #:wallet-notify-block-connected

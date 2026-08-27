@@ -26,11 +26,19 @@
 (defconstant +csi-key-stat+ #x53 "LevelDB key prefix ('S') for per-height records.")
 (defconstant +csi-key-meta+ #x42 "LevelDB key ('B') for the best-indexed metadata.")
 
-(defstruct coinstatsindex
-  "coinstatsindex state (open LevelDB handle + enabled flag)."
-  (base-path nil :type (or null pathname))
-  (db nil)
-  (enabled nil :type boolean))
+(defstruct (coinstatsindex (:include base-index))
+  "coinstatsindex state (open LevelDB handle + enabled flag).")
+
+(defmethod index-name ((index coinstatsindex)) "coinstatsindex")
+(defmethod index-height ((index coinstatsindex)) (coinstatsindex-height index))
+(defmethod index-best-block ((index coinstatsindex))
+  (multiple-value-bind (height hash) (coinstatsindex-best index)
+    (and hash (values hash height))))
+(defmethod index-set-best ((index coinstatsindex) block-hash height)
+  (coinstatsindex-set-best index height block-hash))
+(defmethod index-clear-best ((index coinstatsindex)) (coinstatsindex-clear-best index))
+;; index-write-block for the coinstatsindex lives in src/node.lisp: the block
+;; subsidy it folds in is consensus (validation), which loads after storage.
 
 (defstruct coinstats
   "The running UTXO statistics at one height (Core CCoinsStats subset). MUHASH

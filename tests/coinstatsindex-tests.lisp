@@ -289,7 +289,7 @@ BaseIndex::Rewind)."
        (is (not (equalp (cdr (assoc tip correct)) (%csi-raw-record csi tip))))
        ;; Drive the shipped startup entry point: it must rewind and rebuild
        ;; every record above the fork, exactly.
-       (bl::%catch-up-coinstatsindex node)
+       (bl::catch-up-index node (bl::node-coinstatsindex node))
        (is (= tip (bl.store:coinstatsindex-height csi)))
        (dolist (entry correct)
          (is (equalp (cdr entry) (%csi-raw-record csi (car entry)))
@@ -306,7 +306,7 @@ BaseIndex::Rewind)."
        (%csi-divergent-state csi fork tip branch)
        (%csi-counting-calls
            (verifications 'bl.store:coinstatsindex-record-matches-block-p)
-         (is (eql fork (bl::%rewind-coinstatsindex node)))
+         (is (eql fork (bl::%rewind-coinstatsindex (bl::node-coinstatsindex node) (bl::node-validated-chainstate node) (bl::node-block-store node))))
          (is (= 0 verifications)
              "the header-index ancestor walk did not resolve the fork (~D recomputations)"
              verifications))
@@ -328,7 +328,7 @@ parent and the active block at that height."
             (correct (%csi-divergent-state csi fork tip unknown)))
        (is (null (bl.store:get-block-index-entry cs unknown)))
        ;; The shipped entry point rewinds and rebuilds, as above.
-       (bl::%catch-up-coinstatsindex node)
+       (bl::catch-up-index node (bl::node-coinstatsindex node))
        (is (= tip (bl.store:coinstatsindex-height csi)))
        (dolist (entry correct)
          (is (equalp (cdr entry) (%csi-raw-record csi (car entry)))
@@ -339,7 +339,7 @@ parent and the active block at that height."
        (%csi-divergent-state csi fork tip unknown)
        (%csi-counting-calls
            (verifications 'bl.store:coinstatsindex-record-matches-block-p)
-         (is (eql fork (bl::%rewind-coinstatsindex node)))
+         (is (eql fork (bl::%rewind-coinstatsindex (bl::node-coinstatsindex node) (bl::node-validated-chainstate node) (bl::node-block-store node))))
          (is (= 3 verifications)
              "expected one recomputation per height from the tip down to the fork, got ~D"
              verifications))
@@ -355,14 +355,14 @@ by re-running against a divergent index."
        (%csi-fixture (format nil "csictl~D" (get-internal-real-time)) 5)
      (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
        ;; Consistent: no rewind, no work at all.
-       (is (null (bl::%rewind-coinstatsindex node)))
-       (bl::%catch-up-coinstatsindex node)
+       (is (null (bl::%rewind-coinstatsindex (bl::node-coinstatsindex node) (bl::node-validated-chainstate node) (bl::node-block-store node))))
+       (bl::catch-up-index node (bl::node-coinstatsindex node))
        (is (= 0 adds) "a consistent index re-indexed ~D block(s)" adds)
        (is (= tip (bl.store:coinstatsindex-height csi)))
        ;; Positive control: the counter does move when there IS work.
        (let ((fork (- tip 2)))
          (%csi-divergent-state csi fork tip (%csi-fake-branch cs fork tip 100))
-         (bl::%catch-up-coinstatsindex node)
+         (bl::catch-up-index node (bl::node-coinstatsindex node))
          (is (= 2 adds) "divergent index re-indexed ~D block(s)" adds)))
      (bl.store:close-coinstatsindex csi))))
 
@@ -383,8 +383,8 @@ move to the tip — not a rebuild from genesis."
         csi (+ tip 2) (make-array 32 :element-type '(unsigned-byte 8)
                                      :initial-element #xC3))
        (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
-         (is (eql tip (bl::%rewind-coinstatsindex node)))
-         (bl::%catch-up-coinstatsindex node)
+         (is (eql tip (bl::%rewind-coinstatsindex (bl::node-coinstatsindex node) (bl::node-validated-chainstate node) (bl::node-block-store node))))
+         (bl::catch-up-index node (bl::node-coinstatsindex node))
          (is (= 0 adds) "an index merely ahead of the tip re-indexed ~D block(s)" adds))
        ;; Marker back on the active tip, its record untouched.
        (multiple-value-bind (h hash) (bl.store:coinstatsindex-best csi)

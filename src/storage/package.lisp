@@ -334,6 +334,7 @@
    #:txindex-count
    #:txindex-set-best-block
    #:txindex-best-block
+   #:txospender-index
    #:init-txospender-index
    #:close-txospender-index
    #:txospender-index-enabled
@@ -348,6 +349,20 @@
    #:txindex-add-block
    #:txindex-remove-block
    #:build-tx-index
+   ;; index-base.lisp: the protocol every index implements
+   #:base-index
+   #:base-index-enabled
+   #:base-index-db
+   #:base-index-base-path
+   #:index-name
+   #:index-height
+   #:index-best-block
+   #:index-set-best
+   #:index-clear-best
+   #:index-write-block
+   #:index-rewind-block
+   #:index-prepare-sync
+   #:index-sync
    ;; BIP158 block filters (basic filter)
    #:+basic-filter-type+
    #:+basic-filter-p+
