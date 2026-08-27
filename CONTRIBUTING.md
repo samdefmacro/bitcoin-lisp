@@ -33,7 +33,9 @@ needs the FASL volumes dropped).
   without the fix. Where the change is about something *not* happening, include
   a positive control so the assertion cannot pass vacuously.
 - **The cold battery, green.** `cl-workbench validation run cold-unit`
-  (`scripts/docker-test.sh`) is the verification of record. Confirm the check
+  (`scripts/docker-test.sh`) is the verification of record — and for a change
+  to a macro or a defstruct, `cold-unit-fresh` (`--fresh-fasl`), because the
+  ordinary lane's FASL volume keeps stale macro expansions. Confirm the check
   count is in the expected range (~32,000) as well as the exit code — a battery
   that aborts early can otherwise look like a pass.
 - **One logical change per pull request**, with a commit message that explains
