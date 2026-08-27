@@ -290,7 +290,7 @@ handle-addrv2 ignore its addresses entirely (Core SetupAddressRelay)."
                      :with-timestamp t
                      :timestamp (bl.ser:get-unix-time)))
                   '(simple-array (unsigned-byte 8) (*)))))
-    (is (= 0 (bl.net:handle-addr p payload book)))
+    (is (= 0 (bl.net:handle-addr p payload (bl.ctx:make-node-context :address-book book))))
     (is (= 0 (bl.net:address-book-count book)))))
 
 (test handle-addr-oversized-is-misbehavior
@@ -304,7 +304,7 @@ nothing is stored."
                   (bl.bytes:with-byte-buf (s)
                     (bl.bytes:bb-write-varint s 1001))
                   '(simple-array (unsigned-byte 8) (*)))))
-    (is (= 0 (bl.net:handle-addr p payload book)))
+    (is (= 0 (bl.net:handle-addr p payload (bl.ctx:make-node-context :address-book book))))
     (is (eq :disconnected (bl.net:peer-state p)))
     (is (= 0 (bl.net:address-book-count book)))))
 
@@ -369,8 +369,7 @@ which is why the live node accumulated ~1,600 addrman entries in 2.5 months."
             "stored with Core's 2h gossip time penalty")))))
 
 (test handle-addr-stores-aged-address-end-to-end
-  "The same thing through the real message path (handle-addr ->
-%process-gossiped-addresses -> ingestion): a week-old address in an addr
+  "The same thing through the real message path (handle-addr -> %process-gossiped-addresses (bl.ctx:make-node-context :peers ingestion :address-book ->)): a week-old address in an addr
 message reaches addrman, penalised by 2h and by nothing else."
   (let* ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
          (book (%addr-test-book))
@@ -383,7 +382,7 @@ message reaches addrman, penalised by 2h and by nothing else."
                       s (%gossip-net-addr ip)
                       :with-timestamp t :timestamp old))
                    '(simple-array (unsigned-byte 8) (*)))))
-    (is (= 1 (bl.net:handle-addr nil payload book)))
+    (is (= 1 (bl.net:handle-addr nil payload (bl.ctx:make-node-context :address-book book))))
     (is (= 1 (bl.net:address-book-count book)))
     (is (eql (- old (* 2 60 60)) (%gossip-last-seen book ip)))))
 
@@ -737,9 +736,7 @@ turn a link they meant to keep block-only into a tx firehose."
     (flet ((dropped-p (address conn-type)
              (let ((p (%g718-peer :conn-type conn-type :inbound t)))
                (setf (bl.net:peer-address p) address)
-               (bl.net::handle-tx
-                p (make-array 0 :element-type '(unsigned-byte 8))
-                nil nil nil nil)
+               (bl.net::handle-tx p (make-array 0 :element-type '(unsigned-byte 8)) (bl.ctx:make-node-context))
                (eq :disconnected (bl.net:peer-state p)))))
       (%with-whitelist (:entries '("relay@10.0.0.0/8"))
         ;; Control: without the permission, -blocksonly drops the sender.
@@ -793,10 +790,8 @@ actually goes out."
                (values (%cbp-capture-sends
                         (lambda ()
                           (%with-whitelist (:entries entries)
-                            (bl.net:handle-message
-                             p "mempool" (make-array 0 :element-type
-                                                       '(unsigned-byte 8))
-                             nil nil nil :mempool mp))))
+                            (bl.net:handle-message p "mempool" (make-array 0 :element-type
+                                                       '(unsigned-byte 8)) (bl.ctx:make-node-context :mempool mp)))))
                        (bl.net:peer-state p)))))
       ;; Without the permission: no inv, and the peer is dropped.
       (multiple-value-bind (sent state) (ask "11.1.2.3" '("noban@10.0.0.0/8"))

@@ -217,7 +217,7 @@ thread mutates it."
   ;; best-block marker pointing at a block that is no longer on the chain.
   (tx-index nil)
   ;; Live peer list and address book for the generic message path
-  ;; (handle-message :peers / :address-book). Without these, tx
+  ;; (handle-message's node-context: peers / address-book). Without these, tx
   ;; ingestion/serving, tx-inv getdata, compact-block relay, and addr
   ;; gossip were all inert outside unit tests — the live loop passed
   ;; only :fee-estimator/:recent-rejects (wiring bug, fixed 2026-07-10).
@@ -1645,11 +1645,11 @@ was disconnected (handler-case yielded successfully)."
     (handler-case (progn (disconnect-peer peer) t)
       (error () nil))))
 
-(defun dispatch-ibd-message (peer command payload chain-state utxo-set block-store ctx
-                             &key fee-estimator recent-rejects)
+(defun dispatch-ibd-message (peer command payload node-ctx ctx)
   "Process one wire message from PEER during IBD: connect a received
 block, ingest announced headers, or hand anything else to the generic
 handler. Shared by the block-download drain and the at-tip reap pass."
+  (bl.ctx:with-node-context (chain-state utxo-set block-store fee-estimator recent-rejects) node-ctx
   (cond
     ((string= command "block")
      (let* ((block (bl.ser:parse-block-payload payload))
@@ -1748,28 +1748,19 @@ handler. Shared by the block-download drain and the at-tip reap pass."
     ;; threaded off the IBD ctx. handle-message silently disables tx
     ;; ingestion/serving, tx-inv getdata, compact blocks, and addr gossip
     ;; when :mempool/:peers/:address-book are nil — which is exactly what
-    ;; happened here until 2026-07-10 (only the two keywords below were
+    ;; happened here until 2026-07-10 (the dispatch passed two of the eight
     ;; passed, so those paths never ran outside unit tests and RPC).
-    (t (handle-message peer command payload
-                       chain-state utxo-set block-store
-                       :mempool (and ctx (ibd-context-mempool ctx))
-                       :peers (and ctx (ibd-context-peers ctx))
-                       :address-book (and ctx (ibd-context-address-book ctx))
-                       :fee-estimator fee-estimator
-                       :recent-rejects recent-rejects))))
+    (t (handle-message peer command payload node-ctx)))))
 
-(defun safely-dispatch-peer-message (peer command payload chain-state utxo-set
-                                     block-store ctx &key fee-estimator recent-rejects)
+(defun safely-dispatch-peer-message (peer command payload node-ctx ctx)
   "Dispatch one already-read message from PEER, isolating failures: a
 malformed/oversized/unprocessable message raises an error that is caught here
 and disconnects only this peer (Bitcoin Core's misbehaving-peer posture), so one
 bad message can neither tear down the drain loop nor escape to the sync thread.
 Returns T if the peer is still connected afterward, NIL if it was disconnected."
-  (handler-case
+    (handler-case
       (progn
-        (dispatch-ibd-message peer command payload chain-state utxo-set block-store ctx
-                              :fee-estimator fee-estimator
-                              :recent-rejects recent-rejects)
+        (dispatch-ibd-message peer command payload node-ctx ctx)
         t)
     (error (c)
       (bl:log-warn
@@ -1778,8 +1769,7 @@ Returns T if the peer is still connected afterward, NIL if it was disconnected."
       (handler-case (disconnect-peer peer) (error () nil))
       nil)))
 
-(defun drain-and-reap-peer (peer chain-state utxo-set block-store ctx
-                            &key fee-estimator recent-rejects)
+(defun drain-and-reap-peer (peer node-ctx ctx)
   "Pump every currently-readable message from PEER, then reap it if its
 connection has gone dead. Mirrors the per-peer branch of Bitcoin Core's
 CConnman::SocketHandlerConnected (net.cpp:2204): drain readable data,
@@ -1793,7 +1783,7 @@ error escaped run-ibd and killed the sync thread — incident 2026-05-09).
 Draining a peer whose remote has FIN'd eventually hits a zero-progress
 read, which flips connection-connected to NIL; handle-peer-fin then
 disconnects it so replace-disconnected-peers can refill the slot."
-  ;; Read the connection ONCE. An RPC-thread disconnect (disconnectnode, setban)
+    ;; Read the connection ONCE. An RPC-thread disconnect (disconnectnode, setban)
   ;; between two reads of the slot would hand (connection-connected NIL) a NIL —
   ;; a TYPE-ERROR outside the handler-case below, which aborts the whole sync
   ;; cycle. Latent before; header sync now runs this several times a second.
@@ -1841,10 +1831,7 @@ disconnects it so replace-disconnected-peers can refill the slot."
               ;; this peer (see safely-dispatch-peer-message); the next
               ;; liveness check then ends the drain. The outer handler-case
               ;; below remains the backstop for I/O errors from receive-message.
-              do (safely-dispatch-peer-message peer command payload chain-state
-                                               utxo-set block-store ctx
-                                               :fee-estimator fee-estimator
-                                               :recent-rejects recent-rejects)))
+              do (safely-dispatch-peer-message peer command payload node-ctx ctx)))
       ((or stream-error usocket:socket-condition end-of-file) (c)
         (bl:log-warn
          "Peer ~A I/O error during message drain — disconnecting: ~A"
@@ -1879,9 +1866,7 @@ disconnects it so replace-disconnected-peers can refill the slot."
       (handler-case (disconnect-peer peer) (error () nil))))
   (handle-peer-fin peer)))
 
-(defun pump-peer-messages (peers chain-state utxo-set block-store
-                           &key mempool address-book fee-estimator
-                                recent-rejects ctx tx-index)
+(defun pump-peer-messages (peers node-ctx ctx)
   "Drain every peer's currently-readable messages once, with the FULL node
 context — the steady-state receive pump. Called ~1x/second from the sync
 thread's between-cycles wait: without it the node had a ~30s window per
@@ -1891,29 +1876,28 @@ unanswered until the next sync cycle (Core has no such window: each peer's
 ProcessMessages/SendMessages runs continuously). Returns the pump's
 ibd-context so the caller can inspect counters (e.g. headers-received > 0
 means a new block was announced and a sync cycle should start now)."
+  (bl.ctx:with-node-context (mempool address-book tx-index) node-ctx
   (let ((ctx (or ctx (make-ibd))))
     (setf (ibd-context-mempool ctx) mempool
           (ibd-context-tx-index ctx) tx-index
           (ibd-context-peers ctx) peers
-          (ibd-context-address-book ctx) address-book)
+          (ibd-context-address-book ctx) address-book
+          ;; the handlers relay through node-ctx's peers: keep it the live list
+          (bl.ctx:node-context-peers node-ctx) peers)
     ;; process-received-block and the block-activation path read the ambient
     ;; *ibd-context*; bind it to the pump's context for the drain (thread-
     ;; local, so concurrent RPC readers are unaffected).
     (let ((*ibd-context* ctx))
       (dolist (peer peers)
-        (drain-and-reap-peer peer chain-state utxo-set block-store ctx
-                             :fee-estimator fee-estimator
-                             :recent-rejects recent-rejects)))
-    ctx))
+        (drain-and-reap-peer peer node-ctx ctx)))
+    ctx)))
 
-(defun start-ibd (peers chain-state utxo-set block-store target-height
-                   &key fee-estimator recent-rejects mempool address-book
-                     historical-chainstate tx-index)
+(defun start-ibd (peers node-ctx target-height)
   "Start Initial Block Download.
-Returns the number of blocks downloaded. HISTORICAL-CHAINSTATE, when
+Returns the number of blocks downloaded. NODE-CTX's historical-chainstate, when
 non-NIL, is the assumeutxo background-validation chainstate — run-ibd adds
 a second download cursor for its [tip .. snapshot-base] range."
-  (setf *ibd-context* (make-ibd))
+    (setf *ibd-context* (make-ibd))
   ;; TARGET-HEIGHT arrives as a peer's advertised start height, which is a
   ;; SIGNED int32 on the wire and whose "unknown" value is -1 (Core's
   ;; CNode::nStartingHeight initialises to -1, and its own P2PInterface test
@@ -1936,13 +1920,7 @@ a second download cursor for its [tip .. snapshot-base] range."
         (compute-block-download-timeout (length peers)))
 
   (unwind-protect
-       (run-ibd peers chain-state utxo-set block-store
-                :fee-estimator fee-estimator
-                :recent-rejects recent-rejects
-                :mempool mempool
-                :address-book address-book
-                :tx-index tx-index
-                :historical-chainstate historical-chainstate)
+       (run-ibd peers node-ctx)
     (setf *ibd-context* nil)))
 
 (defun %headers-already-ahead-p (chain-state ctx)
@@ -1956,10 +1934,9 @@ Asking a peer for headers here returns zero and costs a full round trip."
        (> (ibd-context-header-tip-height ctx)
           (bl.store:current-height chain-state))))
 
-(defun run-ibd (peers chain-state utxo-set block-store
-                &key fee-estimator recent-rejects mempool address-book
-                  historical-chainstate tx-index)
+(defun run-ibd (peers node-ctx)
   "Main IBD loop."
+  (bl.ctx:with-node-context (chain-state utxo-set block-store fee-estimator recent-rejects mempool address-book historical-chainstate tx-index) node-ctx
   (let ((ctx *ibd-context*)
         (start-height (bl.store:current-height chain-state)))
     ;; Make the mempool reachable from the block-activation path (which reads
@@ -1971,6 +1948,7 @@ Asking a peer for headers here returns zero and costs a full round trip."
             (ibd-context-tx-index ctx) tx-index
             (ibd-context-peers ctx) peers
             (ibd-context-address-book ctx) address-book))
+    (setf (bl.ctx:node-context-peers node-ctx) peers)
 
     ;; Assumeutxo dual-cursor setup: resolve the historical chainstate's
     ;; target (the snapshot base) and whether the CURRENT chainstate is an
@@ -2127,7 +2105,8 @@ Asking a peer for headers here returns zero and costs a full round trip."
                  (setf peers (remove-if-not
                               (lambda (p) (eq (peer-state p) :ready))
                               peers))
-                 (setf (ibd-context-peers ctx) peers)
+                 (setf (ibd-context-peers ctx) peers
+                       (bl.ctx:node-context-peers node-ctx) peers)
 
                  ;; Handle no-peer condition: exit after a few seconds
                  ;; (caller is responsible for reconnecting and retrying)
@@ -2155,9 +2134,7 @@ Asking a peer for headers here returns zero and costs a full round trip."
                  ;; outer-loop iteration so kernel TCP buffers don't fill up
                  ;; while we're busy validating an earlier (heavy) block.
                  (dolist (peer peers)
-                   (drain-and-reap-peer peer chain-state utxo-set block-store ctx
-                                        :fee-estimator fee-estimator
-                                        :recent-rejects recent-rejects)
+                   (drain-and-reap-peer peer node-ctx ctx)
                    ;; Core-style pipeline top-up (SendMessages tops every
                    ;; peer up to MAX_BLOCKS_IN_TRANSIT_PER_PEER on each
                    ;; event-loop pass, net_processing.cpp:6164): re-feed
@@ -2251,9 +2228,7 @@ Asking a peer for headers here returns zero and costs a full round trip."
     ;; Bitcoin Core's SocketHandlerConnected running on every event-loop
     ;; pass, not only during block download (net.cpp:2204).
     (dolist (peer peers)
-      (drain-and-reap-peer peer chain-state utxo-set block-store ctx
-                           :fee-estimator fee-estimator
-                           :recent-rejects recent-rejects))
+      (drain-and-reap-peer peer node-ctx ctx))
 
     ;; Activate the best chain we can actually reach, whether or not a block
     ;; arrived this pass (Core ActivateBestChain runs from ProcessNewBlock AND
@@ -2303,7 +2278,7 @@ Asking a peer for headers here returns zero and costs a full round trip."
               at-tip)
           (set-ibd-state :synced)
           (set-ibd-state :idle)))
-    (ibd-context-blocks-received ctx)))
+    (ibd-context-blocks-received ctx))))
 
 (defun %best-header-entry (chain-state)
   "The highest-height entry in the block index (the header tip)."
@@ -3231,12 +3206,14 @@ keeping. Core has no header-sync loop at all for the same reason."
       ;; getdata, pong) are flushed in the same pass, or a partially-written
       ;; request would sit until the next send to that peer and read as a stall.
       (pump-peer-messages (or (and ctx (ibd-context-peers ctx)) (list peer))
-                          chain-state utxo-set block-store
-                          :ctx ctx
-                          :mempool (and ctx (ibd-context-mempool ctx))
-                          :address-book (and ctx (ibd-context-address-book ctx))
-                          :fee-estimator fee-estimator
-                          :recent-rejects recent-rejects)
+                          (bl.ctx:make-node-context
+                           :chain-state chain-state :utxo-set utxo-set :block-store block-store
+                           :peers (or (and ctx (ibd-context-peers ctx)) (list peer))
+                           :mempool (and ctx (ibd-context-mempool ctx))
+                           :address-book (and ctx (ibd-context-address-book ctx))
+                           :tx-index (and ctx (ibd-context-tx-index ctx))
+                           :fee-estimator fee-estimator :recent-rejects recent-rejects)
+                          ctx)
       (let ((answer (%peer-headers-bytes peer)))
         (if (/= answer last-answer)
             (setf last-answer answer

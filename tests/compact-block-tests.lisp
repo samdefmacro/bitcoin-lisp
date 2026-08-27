@@ -429,9 +429,7 @@ BLOCK_MISSING_PREV punishment (:1938-1944) is unreachable via the compact path."
           (cb (%cbp-one-tx-compact-block (%cbp-hash #xAA) 0 (make-simple-tx #x11)))
           (sent (%cbp-capture-sends
                  (lambda ()
-                   (bl.net::handle-cmpctblock
-                    peer (%cbp-payload cb) state utxo nil
-                    (bl.mp:make-mempool))))))
+                   (bl.net::handle-cmpctblock peer (%cbp-payload cb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
      (is (equal '("getheaders") sent)
          "unknown-parent cmpctblock must send exactly one getheaders, sent: ~S" sent)
      (is-false (bl.net:peer-discouraged-p addr)
@@ -456,9 +454,7 @@ gated getheaders from an ungated one."
           (cb (%cbp-one-tx-compact-block (%cbp-hash #xAB) 0 (make-simple-tx #x14)))
           (sent (%cbp-capture-sends
                  (lambda ()
-                   (bl.net::handle-cmpctblock
-                    peer (%cbp-payload cb) state utxo nil
-                    (bl.mp:make-mempool))))))
+                   (bl.net::handle-cmpctblock peer (%cbp-payload cb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
      (is-true bl.net::*cached-is-ibd*
               "fixture must still be in IBD or this test asserts nothing")
      (is (null sent)
@@ -496,9 +492,7 @@ reconstruction -- otherwise this test would see a getheaders here."
           (cb (%cbp-one-tx-compact-block parent 0 (make-simple-tx #x12)))
           (sent (%cbp-capture-sends
                  (lambda ()
-                   (bl.net::handle-cmpctblock
-                    peer (%cbp-payload cb) state utxo nil
-                    (bl.mp:make-mempool))))))
+                   (bl.net::handle-cmpctblock peer (%cbp-payload cb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
      (is (= 1 bl.net::*compact-block-success-count*)
          "the compact block must have been reconstructed (parent guard too broad?)")
      (is (equal '("getdata") sent)
@@ -527,9 +521,7 @@ a polite full-block getdata instead."
           (cb (%cbp-one-tx-compact-block parent 3 (make-simple-tx #x13)))
           (sent (%cbp-capture-sends
                  (lambda ()
-                   (bl.net::handle-cmpctblock
-                    peer (%cbp-payload cb) state utxo nil
-                    (bl.mp:make-mempool))))))
+                   (bl.net::handle-cmpctblock peer (%cbp-payload cb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
      (is-true (bl.net:peer-discouraged-p addr)
               "a structurally malformed cmpctblock must still discourage the sender")
      (is (eq :disconnected (bl.net:peer-state peer)))
@@ -559,12 +551,9 @@ right above it), so it gets a full-block refetch, not a discouragement."
             :use-wtxid t))
      (let ((sent (%cbp-capture-sends
                   (lambda ()
-                    (bl.net::handle-blocktxn
-                     peer
-                     (subseq (bl.ser:make-blocktxn-message
+                    (bl.net::handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message
                               block-hash (list (make-simple-tx #x21)))
-                             24)
-                     state utxo nil (bl.mp:make-mempool))))))
+                             24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
        (is (equal '("getdata") sent)
            "an invalid completed block must be refetched in full, sent: ~S" sent)
        (is-false (bl.net:peer-discouraged-p addr)
@@ -593,12 +582,9 @@ Previously we treated it as a mere reconstruction miss and sent a getdata."
             :use-wtxid t))
      (let ((sent (%cbp-capture-sends
                   (lambda ()
-                    (bl.net::handle-blocktxn
-                     peer
-                     (subseq (bl.ser:make-blocktxn-message
+                    (bl.net::handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message
                               block-hash (list (make-simple-tx #x22)))  ; got ONE
-                             24)
-                     state utxo nil (bl.mp:make-mempool))))))
+                             24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
        (is-true (bl.net:peer-discouraged-p addr)
                 "a non-matching blocktxn must discourage the sender")
        (is (eq :disconnected (bl.net:peer-state peer)))
@@ -623,9 +609,7 @@ not mutation evidence."
           (blk (bl.ser:make-bitcoin-block
                 :header (%cbp-grind (%cbp-header (%cbp-hash #xCC) 1296688700))
                 :transactions (list (make-simple-tx #x31)))))
-     (bl.net::handle-block
-      peer (subseq (bl.ser:make-block-message blk) 24)
-      state utxo nil)
+     (bl.net::handle-block peer (subseq (bl.ser:make-block-message blk) 24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo))
      (is-true (bl.net:peer-discouraged-p addr)
               "the BLOCK path must keep punishing :ORPHAN-BLOCK (Core parity)")
      (is (eq :disconnected (bl.net:peer-state peer))))))
@@ -691,8 +675,7 @@ end proves the counter is wired to something real (it goes to exactly 1)."
             (%cbp-capture-sends
              (lambda ()
                (dotimes (i 5)
-                 (bl.net::handle-cmpctblock
-                  peer payload state utxo nil mempool))))))
+                 (bl.net::handle-cmpctblock peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool)))))))
        (is-true (bl.net:peer-discouraged-p addr)
                 "an invalid-PoW cmpctblock header must discourage its sender (Core BLOCK_INVALID_HEADER)")
        (is (eq :disconnected (bl.net:peer-state peer)))
@@ -712,8 +695,7 @@ end proves the counter is wired to something real (it goes to exactly 1)."
             (lambda ()
               (%cbp-capture-sends
                (lambda ()
-                 (bl.net::handle-cmpctblock
-                  ok-peer (%cbp-payload ok-cb) state utxo nil mempool)))))
+                 (bl.net::handle-cmpctblock ok-peer (%cbp-payload ok-cb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool))))))
          (is (= 1 passes)
              "control: a valid header must still reach BUILD-SHORTID-MAP, passes: ~D" passes)
          (is (equal '("getdata") sent)
@@ -744,9 +726,7 @@ unconditional Misbehaving. The header's PoW is mined, so nothing pre-empts it."
           (lambda ()
             (%cbp-capture-sends
              (lambda ()
-               (bl.net::handle-cmpctblock
-                peer (%cbp-payload cb) state utxo nil
-                (bl.mp:make-mempool))))))
+               (bl.net::handle-cmpctblock peer (%cbp-payload cb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
        (is-true (bl.net:peer-discouraged-p addr)
                 "a time-too-old cmpctblock header must discourage its sender")
        (is (eq :disconnected (bl.net:peer-state peer)))
@@ -770,9 +750,7 @@ BLOCK_INVALID_HEADER and equally exempt from the via_compact_block amnesty."
           (lambda ()
             (%cbp-capture-sends
              (lambda ()
-               (bl.net::handle-cmpctblock
-                peer (%cbp-payload cb) state utxo nil
-                (bl.mp:make-mempool))))))
+               (bl.net::handle-cmpctblock peer (%cbp-payload cb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
        (is-true (bl.net:peer-discouraged-p addr)
                 "a cmpctblock extending a known-invalid block must discourage its sender")
        (is (eq :disconnected (bl.net:peer-state peer)))
@@ -805,9 +783,7 @@ later."
           (lambda ()
             (%cbp-capture-sends
              (lambda ()
-               (bl.net::handle-cmpctblock
-                peer (%cbp-payload cb) state utxo nil
-                (bl.mp:make-mempool))))))
+               (bl.net::handle-cmpctblock peer (%cbp-payload cb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
        (is-false (bl.net:peer-discouraged-p addr)
                  "BLOCK_TIME_FUTURE must not discourage (our clock, not their fault)")
        (is (eq :ready (bl.net:peer-state peer)))
@@ -840,9 +816,7 @@ before the parent lookup, mirroring AcceptBlockHeader (validation.cpp:4229-4237)
           (lambda ()
             (%cbp-capture-sends
              (lambda ()
-               (bl.net::handle-cmpctblock
-                peer (%cbp-payload cb) state utxo nil
-                (bl.mp:make-mempool))))))
+               (bl.net::handle-cmpctblock peer (%cbp-payload cb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
        (is-false (bl.net:peer-discouraged-p addr)
                  "BLOCK_CACHED_INVALID is exempt for compact-block senders")
        (is (eq :ready (bl.net:peer-state peer)))
@@ -1109,8 +1083,7 @@ through the cap-of-3 eviction could demote an honest HB peer at will."
        ;; DEFECT: an invalid delivery earns nothing.
        (%g716-with-fresh-hb
         (let ((peer (%g716-delivering-peer "198.51.100.16")))
-          (bl.net::handle-cmpctblock
-           peer (%g716-cmpctblock-payload bad) cs utxo store mp)
+          (bl.net::handle-cmpctblock peer (%g716-cmpctblock-payload bad) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 0 (bl.store:current-height cs))
               "the bogus block must not have connected")
           (is (null bl.net::*hb-announcing-peers*)
@@ -1120,8 +1093,7 @@ through the cap-of-3 eviction could demote an honest HB peer at will."
        ;; assertion above would hold even if promotion were deleted outright.
        (%g716-with-fresh-hb
         (let ((peer (%g716-delivering-peer "198.51.100.17")))
-          (bl.net::handle-cmpctblock
-           peer (%g716-cmpctblock-payload good) cs utxo store mp)
+          (bl.net::handle-cmpctblock peer (%g716-cmpctblock-payload good) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 1 (bl.store:current-height cs))
               "the good block connected")
           (is (equal (list peer) bl.net::*hb-announcing-peers*)
@@ -1187,12 +1159,10 @@ for old blocks has no mempool that could reconstruct one (:2463-2476)."
          (flet ((serve (hash type)
                   (%cbp-capture-sends
                    (lambda ()
-                     (bl.net::handle-getdata
-                      peer (subseq (bl.ser:make-getdata-message
+                     (bl.net::handle-getdata peer (subseq (bl.ser:make-getdata-message
                                     (list (bl.ser:make-inv-vector
                                            :type type :hash hash)))
-                                   24)
-                      cs nil store)))))
+                                   24) (bl.ctx:make-node-context :chain-state cs :block-store store))))))
            (is (equal '("cmpctblock")
                       (serve tip bl.ser:+inv-type-cmpct-block+))
                "MSG_CMPCT_BLOCK at the tip is answered compactly")
@@ -1230,12 +1200,9 @@ fix on half the compact traffic without failing the cmpctblock test."
                      :missing-indexes (loop for i below (length txs) collect i)
                      :request-time (get-internal-real-time)
                      :use-wtxid t))
-              (bl.net::handle-blocktxn
-               peer
-               (subseq (bl.ser:make-blocktxn-message
+              (bl.net::handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message
                         hash txs :witness t)
-                       24)
-               cs utxo store mp)))
+                       24) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))))
        (%g716-quiet
          ;; DEFECT: the completed block does not validate — no promotion.
          (%g716-with-fresh-hb
@@ -1275,16 +1242,14 @@ dispatch-ibd-message's `block' branch (the block-download path)."
        ;; shape) — so the promotion assertions below cannot pass vacuously.
        (%g716-with-fresh-hb
         (let ((peer (%g716-delivering-peer "198.51.100.18")))
-          (bl.net::handle-block
-           peer (%g716-block-payload (%g716-corrupt-block b1)) cs utxo store mp)
+          (bl.net::handle-block peer (%g716-block-payload (%g716-corrupt-block b1)) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 0 (bl.store:current-height cs)))
           (is (null bl.net::*hb-announcing-peers*)
               "an invalid full block must not earn high bandwidth")))
        ;; handle-block with a VALID block: promoted.
        (%g716-with-fresh-hb
         (let ((peer (%g716-delivering-peer "198.51.100.19")))
-          (bl.net::handle-block
-           peer (%g716-block-payload b1) cs utxo store mp)
+          (bl.net::handle-block peer (%g716-block-payload b1) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 1 (bl.store:current-height cs))
               "the full block connected")
           (is (equal (list peer) bl.net::*hb-announcing-peers*)
@@ -1307,9 +1272,7 @@ dispatch-ibd-message's `block' branch (the block-download path)."
          (%g716-with-fresh-hb
           (let ((bl.net::*ibd-context* (bl.net::make-ibd))
                 (peer (%g716-delivering-peer "198.51.100.20")))
-            (bl.net::dispatch-ibd-message
-             peer "block" (%g716-block-payload b2) cs utxo store
-             bl.net::*ibd-context*)
+            (bl.net::dispatch-ibd-message peer "block" (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store) bl.net::*ibd-context*)
             (is (= 2 (bl.store:current-height cs))
                 "the downloaded block connected")
             (is (equal (list peer) bl.net::*hb-announcing-peers*)
@@ -1346,10 +1309,7 @@ none of the block's transactions, then feed the blocktxn carrying TXS."
            :missing-indexes (loop for i below (length txs) collect i)
            :request-time (get-internal-real-time)
            :use-wtxid t))
-    (bl.net::handle-blocktxn
-     peer
-     (subseq (bl.ser:make-blocktxn-message hash txs :witness t) 24)
-     cs utxo store mp)))
+    (bl.net::handle-blocktxn peer (subseq (bl.ser:make-blocktxn-message hash txs :witness t) 24) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))))
 
 (test cmpctblock-replay-never-hashes-the-mempool
   "Core returns EARLY from the CMPCTBLOCK handler when
@@ -1392,8 +1352,7 @@ why the hole survived this long."
                ;; Control: the FIRST delivery is new to us, so it is
                ;; reconstructed — the gate must not swallow real work.
                (let ((a (%g716-delivering-peer "198.51.100.60")))
-                 (bl.net::handle-cmpctblock
-                  a (%g716-cmpctblock-payload b1) cs utxo store mp))
+                 (bl.net::handle-cmpctblock a (%g716-cmpctblock-payload b1) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp)))
                (is (= 1 (bl.store:current-height cs))
                    "control: the first delivery of b1 connected")
                (is (plusp builds)
@@ -1402,8 +1361,7 @@ why the hole survived this long."
                (let ((after-first builds)
                      (b (%g716-delivering-peer "198.51.100.61")))
                  (dotimes (i 10)
-                   (bl.net::handle-cmpctblock
-                    b (%g716-cmpctblock-payload b1) cs utxo store mp))
+                   (bl.net::handle-cmpctblock b (%g716-cmpctblock-payload b1) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp)))
                  (is (= after-first builds)
                      "a replayed cmpctblock rebuilt the shortid map ~D time(s)"
                      (- builds after-first))
@@ -1452,16 +1410,14 @@ same path must promote."
        ;;; --- cmpctblock ------------------------------------------------
        (%g716-with-fresh-hb
         (let ((a (%g716-delivering-peer "198.51.100.30")))
-          (bl.net::handle-cmpctblock
-           a (%g716-cmpctblock-payload b1) cs utxo store mp)
+          (bl.net::handle-cmpctblock a (%g716-cmpctblock-payload b1) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 1 (bl.store:current-height cs))
               "control: the first delivery of b1 connected")
           (is (equal (list a) bl.net::*hb-announcing-peers*)
               "control: a genuinely-connecting cmpctblock delivery promotes")))
        (%g716-with-fresh-hb
         (let ((b (%g716-delivering-peer "198.51.100.31")))
-          (bl.net::handle-cmpctblock
-           b (%g716-cmpctblock-payload b1) cs utxo store mp)
+          (bl.net::handle-cmpctblock b (%g716-cmpctblock-payload b1) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 1 (bl.store:current-height cs))
               "the replay connected nothing")
           (is (eq :ready (bl.net::peer-state b))
@@ -1473,16 +1429,14 @@ same path must promote."
        (let ((b2 (%g716-mine-on node spk)))
          (%g716-with-fresh-hb
           (let ((c (%g716-delivering-peer "198.51.100.32")))
-            (bl.net::handle-block
-             c (%g716-block-payload b2) cs utxo store mp)
+            (bl.net::handle-block c (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
             (is (= 2 (bl.store:current-height cs))
                 "control: the first delivery of b2 connected")
             (is (equal (list c) bl.net::*hb-announcing-peers*)
                 "control: a genuinely-connecting full block promotes")))
          (%g716-with-fresh-hb
           (let ((d (%g716-delivering-peer "198.51.100.33")))
-            (bl.net::handle-block
-             d (%g716-block-payload b2) cs utxo store mp)
+            (bl.net::handle-block d (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
             (is (= 2 (bl.store:current-height cs))
                 "the replay connected nothing")
             (is (eq :ready (bl.net::peer-state d))
@@ -1534,16 +1488,14 @@ the connection gate on its own."
      (%g716-quiet
        (%g716-with-fresh-hb
         (let ((a (%g716-delivering-peer "198.51.100.40")))
-          (bl.net::handle-block
-           a (%g716-block-payload main) cs utxo store mp)
+          (bl.net::handle-block a (%g716-block-payload main) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 1 (bl.store:current-height cs))
               "control: the first sibling connected")
           (is (equal (list a) bl.net::*hb-announcing-peers*)
               "control: the connecting sibling's deliverer is promoted")))
        (%g716-with-fresh-hb
         (let ((b (%g716-delivering-peer "198.51.100.41")))
-          (bl.net::handle-block
-           b (%g716-block-payload sibling) cs utxo store mp)
+          (bl.net::handle-block b (%g716-block-payload sibling) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 1 (bl.store:current-height cs))
               "the side branch did not become the tip")
           (is (equalp (bl.store:best-block-hash cs) (%g716-block-hash main))

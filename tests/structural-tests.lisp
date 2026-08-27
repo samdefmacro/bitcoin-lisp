@@ -540,19 +540,18 @@ to make on purpose, so the set is pinned."
   "Above this a definition counts against +LONGISH-FUNCTION-CEILING+.")
 
 (defparameter +long-function-baseline+
-  '(("start-node" . 1337)                        ; node.lisp
+  '(("start-node" . 1332)                        ; node.lisp
     ("perform-reorg" . 465)                      ; validation/block.lisp
     ("%create-transaction-internal" . 442)       ; rpc/wallet-spend.lisp
     ("apply-config-globals" . 387)               ; config.lisp
     ("validate-transaction-for-mempool" . 358)   ; validation/transaction.lisp
-    ("run-ibd" . 348)                            ; networking/ibd.lisp
+    ("run-ibd" . 345)                            ; networking/ibd.lisp (+2: keeps node-context peers live, P2c)
     ("validate-block" . 307)                     ; validation/block.lisp
     ("process-received-block" . 300)             ; networking/ibd.lisp
     ("rpc-sendall" . 289)                        ; rpc/wallet-spend.lisp
     ("ms-from-script" . 243)                     ; validation/miniscript.lisp
     ("connect-block" . 215)                      ; validation/block.lisp
-    ("activate-block" . 214)                     ; validation/block.lisp
-    ("handle-message" . 206))                    ; networking/protocol.lisp
+    ("activate-block" . 214))                    ; validation/block.lisp
   "(name . lines) of every top-level definition over +LONG-FUNCTION-LINES+ at
 the start of the cleanup. Each is a phase-3 target
 (docs/refactoring-plan-2026-08-27.md §4 P3): START-NODE becomes Core's
@@ -654,7 +653,7 @@ byte-buf; the stream codecs and interop's private buffer only lose call sites."
     ("src/rpc/" . 14)
     ("src/serialization/" . 49)   ; 4 are macroexpansion-time errors in message-macro.lisp
     ("src/storage/" . 16)
-    ("src/util/" . 6)
+    ("src/util/" . 7)
     ("src/validation/" . 3)
     ("src/zmq.lisp" . 1))
   "Count of (error \"...\") -- a string where a condition type belongs -- per

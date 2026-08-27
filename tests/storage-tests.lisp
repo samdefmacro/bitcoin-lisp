@@ -2193,8 +2193,7 @@ to pass it cannot reintroduce the bug."
                "a fresh context carries no index")
            ;; run-ibd with no peers does nothing but thread its arguments in.
            (let ((bl.net::*ibd-context* ctx))
-             (bl.net::run-ibd
-              '() (bl.store:make-chain-state) nil nil :tx-index txindex))
+             (bl.net::run-ibd '() (bl.ctx:make-node-context :chain-state (bl.store:make-chain-state) :peers '() :tx-index txindex)))
            (is (eq txindex (bl.net::ibd-context-tx-index ctx))
                "run-ibd must put the node's transaction index into the context"))
       (bl.store:close-tx-index txindex)))

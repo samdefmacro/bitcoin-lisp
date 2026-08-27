@@ -297,7 +297,7 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
                 :host "10.0.0.4" :port 48333 :connected nil :socket nil))
          (peer (bl.net:make-peer
                 :connection conn :state :ready :address "10.0.0.4")))
-    (bl.net::drain-and-reap-peer peer nil nil nil ctx)
+    (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) ctx)
     (is (eq :disconnected (bl.net:peer-state peer)))
     (is (null (bl.net::peer-connection peer)))))
 
@@ -306,7 +306,7 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
   (let* ((ctx (bl.net::make-ibd))
          (peer (bl.net:make-peer
                 :connection nil :state :disconnected :address "10.0.0.5")))
-    (bl.net::drain-and-reap-peer peer nil nil nil ctx)
+    (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) ctx)
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
 ;;;; Timeout Tests
@@ -782,7 +782,7 @@ the median-time-past, which fails the timestamp>MTP rule deterministically."
                                   (vector 1)  ; header-count varint
                                   (bl.ser:serialize-block-header bad-hdr)
                                   (vector 0)))) ; per-header tx-count varint
-        (bl.net::handle-headers nil payload state)
+        (bl.net::handle-headers nil payload (bl.ctx:make-node-context :chain-state state))
         (is (null (bl.store:get-block-index-entry state bad-hash))
             "invalid header must not be admitted by handle-headers")))))
 
@@ -1135,7 +1135,7 @@ instead of cycling the no-peer grace (~6s) or downloading."
             :hash hash :height 10 :chain-work 100 :status :header-valid))
     (let ((bl.net::*ibd-stop-requested* t)
           (start (get-internal-real-time)))
-      (bl.net::run-ibd '() state nil nil)
+      (bl.net::run-ibd '() (bl.ctx:make-node-context :chain-state state :peers '()))
       (is (< (- (get-internal-real-time) start)
              (* 2 internal-time-units-per-second))))))
 
@@ -1312,7 +1312,7 @@ getdata is attempted (Core net_processing.cpp:4176-4180)."
     (bl.net:reset-tx-requests)
     ;; With the announcer's peer having no connection, a getdata attempt
     ;; would error — the gate must short-circuit before any of that.
-    (finishes (bl.net::handle-inv announcer payload state mempool))
+    (finishes (bl.net::handle-inv announcer payload (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     ;; Nothing was recorded for the hash: a fresh request from another
     ;; peer is still "wanted" (no outstanding in-flight entry).
     (is-true (bl.net::tx-request-wanted-p tx-hash probe))
@@ -1352,16 +1352,12 @@ announcement from a wtxidrelay peer was silently dropped."
     ;; of handle-inv errors — but the tracker recording happens first, which
     ;; is the observable we assert on.
     (ignore-errors
-      (bl.net::handle-inv
-       wtx-announcer (funcall inv-payload bl.ser:+inv-type-wtx+ wtxid)
-       state mempool))
+      (bl.net::handle-inv wtx-announcer (funcall inv-payload bl.ser:+inv-type-wtx+ wtxid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     ;; Recorded: a probe from another peer sees the request outstanding.
     (is-false (bl.net::tx-request-wanted-p wtxid probe))
     ;; MSG_TX (txid) announcements keep working alongside.
     (ignore-errors
-      (bl.net::handle-inv
-       tx-announcer (funcall inv-payload bl.ser:+inv-type-tx+ txid)
-       state mempool))
+      (bl.net::handle-inv tx-announcer (funcall inv-payload bl.ser:+inv-type-tx+ txid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     (is-false (bl.net::tx-request-wanted-p txid probe))
     (bl.net:reset-tx-requests)))
 
@@ -1390,16 +1386,12 @@ net_processing.cpp:4145-4152)."
     (bl.net:reset-tx-requests)
     ;; MSG_TX from a wtxidrelay peer: ignored, nothing recorded.
     (finishes
-      (bl.net::handle-inv
-       wtx-peer (funcall inv-payload bl.ser:+inv-type-tx+ h1)
-       state mempool))
+      (bl.net::handle-inv wtx-peer (funcall inv-payload bl.ser:+inv-type-tx+ h1) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     (is-true (bl.net::tx-request-wanted-p h1 probe))
     ;; MSG_WTX from a non-wtxidrelay peer: ignored too.
     (bl.net:reset-tx-requests)
     (finishes
-      (bl.net::handle-inv
-       legacy-peer (funcall inv-payload bl.ser:+inv-type-wtx+ h2)
-       state mempool))
+      (bl.net::handle-inv legacy-peer (funcall inv-payload bl.ser:+inv-type-wtx+ h2) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     (is-true (bl.net::tx-request-wanted-p h2 probe))
     (bl.net:reset-tx-requests)))
 
@@ -1443,8 +1435,7 @@ since wtxid = txid there."
     ;; Sanity: this is a witness tx, ids differ.
     (is-false (equalp txid wtxid))
     (bl.net:reset-tx-requests)
-    (bl.net::handle-tx peer payload nil mempool state nil
-                                        :recent-rejects rejects)
+    (bl.net::handle-tx peer payload (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects))
     (is-true (bl:recent-reject-p rejects wtxid))
     (is-false (bl:recent-reject-p rejects txid))))
 
@@ -1580,8 +1571,7 @@ parents', txdownloadman_impl.cpp:422-436)."
     (is-false (equalp txid wtxid))
     ;; The missing parent was recently rejected.
     (bl:add-recent-reject rejects parent-txid)
-    (bl.net::handle-tx peer payload utxo mempool state nil
-                                        :recent-rejects rejects)
+    (bl.net::handle-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
     ;; Rejected under both ids; never admitted to the orphan pool; the
     ;; parent was NOT re-requested.
     (is-true (bl:recent-reject-p rejects txid))
@@ -1606,8 +1596,7 @@ and the tx itself is not cached as a reject."
          (parent-txid (make-array 32 :element-type '(unsigned-byte 8)
                                      :initial-element #xB3))
          (payload (subseq (bl.ser:make-tx-message tx :witness t) 24)))
-    (bl.net::handle-tx peer payload utxo mempool state nil
-                                        :recent-rejects rejects)
+    (bl.net::handle-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
     ;; The orphanage is wtxid-keyed (Core TxOrphanage).
     (is-true (bl.mp:orphan-tx
               (bl.mp:mempool-orphan-pool mempool)
@@ -1654,12 +1643,8 @@ genuinely failing non-witness-program spend IS still cached (wtxid-keyed)."
      0 100000000 (%wave8-p2pkh-script) 0)
     ;; Sanity: wtxid == txid for both (no witness), the poisoning precondition.
     (is (equalp stripped-id (bl.ser:transaction-wtxid stripped)))
-    (bl.net::handle-tx
-     peer (subseq (bl.ser:make-tx-message stripped) 24)
-     utxo mempool state nil :recent-rejects rejects)
-    (bl.net::handle-tx
-     peer (subseq (bl.ser:make-tx-message failing) 24)
-     utxo mempool state nil :recent-rejects rejects)
+    (bl.net::handle-tx peer (subseq (bl.ser:make-tx-message stripped) 24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+    (bl.net::handle-tx peer (subseq (bl.ser:make-tx-message failing) 24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
     ;; The plain script failure IS cached (proves this fixture reaches the
     ;; reject-insert path)...
     (is-true (bl:recent-reject-p rejects failing-id))
@@ -1671,7 +1656,7 @@ genuinely failing non-witness-program spend IS still cached (wtxid-keyed)."
   "BIP35 'mempool' requests get a disconnect: we never advertise
 NODE_BLOOM, matching Core's no-bloom path (net_processing.cpp:4940-4951)."
   (let ((peer (bl.net:make-peer :state :ready)))
-    (is-true (bl.net::handle-message peer "mempool" #() nil nil nil))
+    (is-true (bl.net::handle-message peer "mempool" #() (bl.ctx:make-node-context)))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
 (test getaddr-message-format
@@ -1763,10 +1748,10 @@ net_processing.cpp:2550). An unrelated getdata leaves the set alone."
                              :hash hash)))
                      24)))
       ;; A request for some OTHER tx (not served) doesn't clear ours.
-      (bl.net::handle-getdata peer (getdata-payload other) nil mempool)
+      (bl.net::handle-getdata peer (getdata-payload other) (bl.ctx:make-node-context :mempool mempool))
       (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))
       ;; A request for the unbroadcast tx clears it.
-      (bl.net::handle-getdata peer (getdata-payload txid) nil mempool)
+      (bl.net::handle-getdata peer (getdata-payload txid) (bl.ctx:make-node-context :mempool mempool))
       (is (= 0 (bl.mp:mempool-unbroadcast-count mempool))))))
 
 (test reattempt-initial-broadcast-relays-only-in-mempool
@@ -2008,13 +1993,11 @@ disconnect when -txreconciliation is on (net_processing.cpp:3969-3973);
 ignored when it is off (:3964-3967)."
   (let ((bl:*tx-reconciliation* nil)
         (peer (bl.net:make-peer :state :ready)))
-    (is-true (bl.net::handle-message
-              peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) nil nil nil))
+    (is-true (bl.net::handle-message peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) (bl.ctx:make-node-context)))
     (is (eq :ready (bl.net:peer-state peer))))
   (let ((bl:*tx-reconciliation* t)
         (peer (bl.net:make-peer :state :ready)))
-    (is-true (bl.net::handle-message
-              peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) nil nil nil))
+    (is-true (bl.net::handle-message peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) (bl.ctx:make-node-context)))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
 (test txreconciliation-config-flag-wiring
@@ -2085,7 +2068,7 @@ RejectIncomingTxs in the TX handler, net_processing.cpp:4474-4479)."
   (let* ((bl:*network* :mainnet)
          (bl:*mainnet-relay-enabled* nil)
          (peer (bl.net:make-peer :state :ready)))
-    (bl.net::handle-tx peer #() nil nil nil nil)
+    (bl.net::handle-tx peer #() (bl.ctx:make-node-context))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
 (test handle-inv-disconnects-tx-inv-when-relay-disabled
@@ -2101,7 +2084,7 @@ RejectIncomingTxs in the TX handler, net_processing.cpp:4474-4479)."
                                   :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                        :initial-element 92))))
                           24)))
-    (bl.net::handle-inv peer payload state nil)
+    (bl.net::handle-inv peer payload (bl.ctx:make-node-context :chain-state state))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
 (test blocksonly-rejects-incoming-txs-any-network
@@ -2115,7 +2098,7 @@ otherwise always on."
     ;; tx message in violation of our fRelay=0 -> disconnect
     ;; (Core net_processing.cpp:4474-4479).
     (let ((peer (bl.net:make-peer :state :ready)))
-      (bl.net::handle-tx peer #() nil nil nil nil)
+      (bl.net::handle-tx peer #() (bl.ctx:make-node-context))
       (is (eq :disconnected (bl.net:peer-state peer))))
     ;; tx inv in violation -> disconnect (net_processing.cpp:4168-4172).
     (let ((state (bl.store:make-chain-state))
@@ -2126,7 +2109,7 @@ otherwise always on."
                                    :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                         :initial-element 94))))
                            24)))
-      (bl.net::handle-inv peer payload state nil)
+      (bl.net::handle-inv peer payload (bl.ctx:make-node-context :chain-state state))
       (is (eq :disconnected (bl.net:peer-state peer)))))
   ;; Default off: regtest relays normally.
   (let* ((bl:*network* :regtest)
@@ -2320,7 +2303,7 @@ AlreadyHaveTx's recent-confirmed check, txdownloadman_impl.cpp:144)."
         (progn
           (bl.net:reset-tx-requests)
           (bl.val:note-block-connected (%w9-block-with-tx tx))
-          (finishes (bl.net::handle-inv announcer payload state mempool))
+          (finishes (bl.net::handle-inv announcer payload (bl.ctx:make-node-context :chain-state state :mempool mempool)))
           ;; Nothing recorded: a fresh probe still gets an immediate request.
           (is-true (bl.net::tx-request-wanted-p wtxid probe t)))
       (bl.net:reset-tx-requests)
@@ -2361,12 +2344,12 @@ info_for_relay): the unbroadcast set keeps the tx, proving no serve fired."
     (%add-tx mempool tx)
     (bl.mp:mempool-add-unbroadcast mempool txid)
     ;; Peer's last flush predates the tx (default sequence snapshot 1).
-    (bl.net::handle-getdata peer payload nil mempool)
+    (bl.net::handle-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
     (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))
     ;; After a flush-time snapshot, the same request is served.
     (setf (bl.net:peer-last-inv-sequence peer)
           (bl.mp:mempool-sequence mempool))
-    (bl.net::handle-getdata peer payload nil mempool)
+    (bl.net::handle-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
     (is (= 0 (bl.mp:mempool-unbroadcast-count mempool)))))
 
 (test getdata-serves-most-recent-block-tx
@@ -2390,7 +2373,7 @@ observed via the unbroadcast-set removal that fires on every serve."
           ;; Track it as unbroadcast via the raw table (the public adder
           ;; requires pool membership) so the serve signal is observable.
           (setf (gethash txid (bl.mp:mempool-unbroadcast mempool)) t)
-          (bl.net::handle-getdata peer payload nil mempool)
+          (bl.net::handle-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
           (is (= 0 (bl.mp:mempool-unbroadcast-count mempool))))
       (bl.val:reset-recent-confirmed)
       (setf bl.val::*most-recent-block-txs* nil))))
@@ -2414,7 +2397,7 @@ the tx even though it is old enough to serve."
     (bl.mp:mempool-add-unbroadcast mempool txid)
     (setf (bl.net:peer-last-inv-sequence peer)
           (bl.mp:mempool-sequence mempool))
-    (bl.net::handle-getdata peer payload nil mempool)
+    (bl.net::handle-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
     (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))))
 
 ;;;; Orphan resolution candidates via MSG_WTX announcements
@@ -2449,8 +2432,7 @@ AddTxAnnouncement's orphan branch + MaybeAddOrphanResolutionCandidate)."
     ;; Orphan stored from p1, parents never requested (direct pool add).
     (bl.mp:orphan-add pool orphan p1)
     (finishes
-      (bl.net::handle-inv p2 payload state mempool
-                                           :utxo-set utxo))
+      (bl.net::handle-inv p2 payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool)))
     ;; p2 became an announcer of the orphan...
     (is-true (bl.mp:orphan-have-from-peer pool owtxid p2))
     ;; ...and the missing parent is in flight to p2 (txid-based entry).
@@ -2461,6 +2443,21 @@ AddTxAnnouncement's orphan branch + MaybeAddOrphanResolutionCandidate)."
     (bl.net:reset-tx-requests)))
 
 ;;;; Steady-state drain serves mempool txs end-to-end (loopback)
+
+(test pump-peer-messages-keeps-node-context-peers-live
+  "The handlers relay through the node-context's PEERS slot, and the IBD loop
+rewrites that list as peers disconnect. The pump must therefore write the
+list it was given into the context it hands the handlers -- a context built
+without :peers (as sync-blockchain's tick and sync-headers used to) would
+otherwise relay to nobody, silently: the 2026-07-10 wiring bug in a new
+shape. Positive control: the slot is NIL before and the pump's list after."
+  (let* ((p1 (bl.net:make-peer :connection nil :state :disconnected :address "10.0.0.7"))
+         (p2 (bl.net:make-peer :connection nil :state :disconnected :address "10.0.0.8"))
+         (peers (list p1 p2))
+         (node-ctx (bl.ctx:make-node-context :chain-state (bl.store:make-chain-state))))
+    (is (null (bl.ctx:node-context-peers node-ctx)))
+    (bl.net:pump-peer-messages peers node-ctx (bl.net::make-ibd))
+    (is (eq peers (bl.ctx:node-context-peers node-ctx)))))
 
 (test pump-peer-messages-serves-getdata-loopback
   "The steady-state pump answers a peer's tx getdata from the mempool with a
@@ -2502,10 +2499,7 @@ get notfound). Runs over a loopback socket pair."
                              :hash txid))))
                     (sleep 0.2)
                     ;; ...the pump drains and serves it with full context.
-                    (bl.net:pump-peer-messages
-                     (list server-peer) state
-                     (bl.store:make-utxo-set) nil
-                     :mempool mempool)
+                    (bl.net:pump-peer-messages (list server-peer) (bl.ctx:make-node-context :chain-state state :utxo-set (bl.store:make-utxo-set) :mempool mempool :peers (list server-peer)) nil)
                     ;; The client receives a tx message. Blocking variant: the
                     ;; plain reader is resumable and would answer :incomplete if
                     ;; the payload had not fully landed yet, making this timing-
@@ -2818,8 +2812,7 @@ messages and check the drain leaves some behind for the next pass."
              (write-sequence msg (usocket:socket-stream client)))
            (force-output (usocket:socket-stream client))
            (sleep 0.3)
-           (bl.net::drain-and-reap-peer
-            peer state (bl.store:make-utxo-set) nil ctx)
+           (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context :chain-state state :utxo-set (bl.store:make-utxo-set)) ctx)
            (let ((took (bl.net::connection-bytes-received
                         (bl.net::peer-connection peer))))
              (is (plusp took) "the drain served this peer")
@@ -3016,14 +3009,18 @@ tip advance turns a legitimate request into a disconnect."
 
 (test the-getdata-handler-is-given-the-chain-state-it-needs-to-check
   "The seam. Every guard above reads the chain state, and HANDLE-GETDATA used
-to `(declare (ignore chain-state))` — so a version of this that forgot to pass
-it would compile, run, and silently serve everything. Assert the dispatch
-passes it."
+to `(declare (ignore chain-state))` -- so a version of this that forgot to pass
+it would compile, run, and silently serve everything. The dispatch now hands
+every handler the whole node context (bl.ctx:node-context), so the check is
+that handle-getdata reads chain-state out of it and nobody ignores it."
   (let ((src (uiop:read-file-string
               (merge-pathnames "src/networking/protocol.lisp"
                                (asdf:system-source-directory :bitcoin-lisp)))))
-    (is (search "(handle-getdata peer payload chain-state mempool block-store)" src)
-        "the message dispatch no longer passes chain-state to handle-getdata")
+    (is (search "(handle-getdata peer payload ctx)" src)
+        "the message dispatch no longer hands handle-getdata the node context")
+    (let ((start (search "(defun handle-getdata " src)))
+      (is (and start (search "(bl.ctx:with-node-context (chain-state" src :start2 start))
+          "handle-getdata no longer reads chain-state from the context"))
     (is (null (search "(declare (ignore chain-state))" src))
         "handle-getdata ignores chain-state again, which disables every guard")))
 

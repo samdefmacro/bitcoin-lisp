@@ -34,6 +34,7 @@ call it.")
   '(("BL" . "BITCOIN-LISP")
     ("BL.BYTES" . "BITCOIN-LISP.BYTES")
     ("BL.CHAIN" . "BITCOIN-LISP.CHAINPARAMS")
+    ("BL.CTX" . "BITCOIN-LISP.CONTEXT")
     ("BL.CRYPTO" . "BITCOIN-LISP.CRYPTO")
     ("BL.SER" . "BITCOIN-LISP.SERIALIZATION")
     ("BL.STORE" . "BITCOIN-LISP.STORAGE")
@@ -169,6 +170,27 @@ FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
    #:chain-params-assumeutxo
    #:chain-params-prune-after-height
    #:chain-params-bech32-hrp))
+
+(defpackage #:bitcoin-lisp.context
+  (:documentation "node-context (Core NodeContext): the references a message
+handler or sync pass acts on, as one value. src/util/context.lisp.")
+  (:use #:cl)
+  (:export
+   #:node-context
+   #:make-node-context
+   #:copy-node-context
+   #:node-context-p
+   #:node-context-chain-state
+   #:node-context-utxo-set
+   #:node-context-block-store
+   #:node-context-mempool
+   #:node-context-peers
+   #:node-context-fee-estimator
+   #:node-context-address-book
+   #:node-context-recent-rejects
+   #:node-context-tx-index
+   #:node-context-historical-chainstate
+   #:with-node-context))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

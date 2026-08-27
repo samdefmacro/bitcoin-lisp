@@ -358,7 +358,7 @@ be dropped before delivering anything useful."
               (bl.bytes:bb-write-bytes s (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA))
               (bl.bytes:bb-write-u8 s 0) (bl.bytes:bb-write-u8 s 80))  ; port 80
             '(simple-array (unsigned-byte 8) (*)))))
-    (let ((added (bl.net:handle-addrv2 nil payload book)))
+    (let ((added (bl.net:handle-addrv2 nil payload (bl.ctx:make-node-context :address-book book))))
       ;; Only IPv4 and IPv6 should be added (TorV3 skipped)
       (is (= 2 added))
       (is (= 2 (bl.net:address-book-count book))))))
@@ -379,7 +379,7 @@ be dropped before delivering anything useful."
                  :port 8333)
                bl.ser:+addrv2-net-ipv4+ now))
             '(simple-array (unsigned-byte 8) (*)))))
-    (bl.net:handle-addrv2 nil payload book)
+    (bl.net:handle-addrv2 nil payload (bl.ctx:make-node-context :address-book book))
     (is (= 1 (bl.net:address-book-count book)))
     ;; Look up with the mapped IPv6 address
     (let* ((mapped-ip (bl.net:ipv4-to-mapped-ipv6 172 16 0 5))
@@ -525,7 +525,7 @@ lands in addrman as a typed record, keyed and retrievable by (net,bytes,port)."
               (bl.bytes:bb-write-bytes s (make-addrv2-entry-bytes now 1 4 pubkey 8333))
               (bl.bytes:bb-write-bytes s (make-addrv2-entry-bytes now 1 1 #(10 0 0 1) 8333)))
             '(simple-array (unsigned-byte 8) (*)))))
-    (is (= 2 (bl.net:handle-addrv2 nil payload book)))
+    (is (= 2 (bl.net:handle-addrv2 nil payload (bl.ctx:make-node-context :address-book book))))
     (is (= 2 (bl.net:address-book-count book)))
     (let ((entry (bl.net:address-book-lookup book pubkey 8333 :torv3)))
       (is (not (null entry)))
@@ -555,7 +555,7 @@ cjdns-flip-on-ingress), this covers every fc00 ingress point."
             '(simple-array (unsigned-byte 8) (*)))))
     ;; (handle-addr's return counts plausible+reachable entries for the log;
     ;; the routability drop happens inside address-book-add — assert the book.)
-    (bl.net::handle-addr nil v1-payload book)
+    (bl.net::handle-addr nil v1-payload (bl.ctx:make-node-context :address-book book))
     (is (= 0 (bl.net:address-book-count book)))
     (is (null (bl.net:address-book-lookup book fc 8333 :cjdns)))
     (is (null (bl.net:address-book-lookup book fc 8333 :ipv6)))
@@ -567,7 +567,7 @@ cjdns-flip-on-ingress), this covers every fc00 ingress point."
                                 now 1 bl.ser:+addrv2-net-cjdns+
                                 fc 8333)))
              '(simple-array (unsigned-byte 8) (*)))))
-      (is (= 1 (bl.net:handle-addrv2 nil v2-payload book)))
+      (is (= 1 (bl.net:handle-addrv2 nil v2-payload (bl.ctx:make-node-context :address-book book))))
       (let ((entry (bl.net:address-book-lookup book fc 8333 :cjdns)))
         (is (not (null entry)))
         (is (eq :cjdns (bl.net:peer-address-network entry)))))))

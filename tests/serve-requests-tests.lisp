@@ -217,15 +217,15 @@ Returns (VALUES chain-state entries) with ENTRIES ascending (genesis first)."
   (let ((bl::*node* nil))    ; book resolves to NIL: gating only, no send
     ;; Outbound peer: never marked as answered.
     (let ((outbound (bl.net:make-peer :inbound nil)))
-      (bl.net::handle-getaddr outbound)
+      (bl.net::handle-getaddr outbound #() (bl.ctx:make-node-context))
       (is (null (bl.net:peer-getaddr-sent outbound))))
     ;; Inbound peer: answered exactly once (flag latches on first call).
     (let ((inbound (bl.net:make-peer :inbound t)))
       (is (null (bl.net:peer-getaddr-sent inbound)))
-      (bl.net::handle-getaddr inbound)
+      (bl.net::handle-getaddr inbound #() (bl.ctx:make-node-context))
       (is-true (bl.net:peer-getaddr-sent inbound))
       ;; Second call is a no-op; flag stays set.
-      (bl.net::handle-getaddr inbound)
+      (bl.net::handle-getaddr inbound #() (bl.ctx:make-node-context))
       (is-true (bl.net:peer-getaddr-sent inbound)))))
 
 (test build-addrv2-response-round-trips
@@ -438,9 +438,9 @@ stored, where it would silently suppress every announcement to the peer."
         (ok (%message-payload (bl.ser:make-feefilter-message 1000)))
         (absurd (%message-payload (bl.ser:make-feefilter-message
                                    (1+ bl.val:+max-money+)))))
-    (bl.net::handle-message peer "feefilter" ok nil nil nil)
+    (bl.net::handle-message peer "feefilter" ok (bl.ctx:make-node-context))
     (is (= 1000 (bl.net:peer-feefilter-rate peer)))
-    (bl.net::handle-message peer "feefilter" absurd nil nil nil)
+    (bl.net::handle-message peer "feefilter" absurd (bl.ctx:make-node-context))
     (is (= 1000 (bl.net:peer-feefilter-rate peer)))))
 
 (test automatic-inbound-capacity-follows-core
