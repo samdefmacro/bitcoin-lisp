@@ -44,7 +44,8 @@
                  ;; sighash code inlines must be loaded before src/coalton/.
                  (:module "util"
                   :components ((:file "bytes")
-                               (:file "chainparams")))
+                               (:file "chainparams")
+                               (:file "context")))
                  (:file "logging")
                  (:file "config")
                  (:file "zmq")

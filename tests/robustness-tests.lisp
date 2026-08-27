@@ -152,8 +152,7 @@ connection — enough to drive dispatch + disconnect without a real socket."
   (let ((peer (%fake-ready-peer))
         (ctx (bl.net::make-ibd)))
     (let ((still-connected
-            (bl.net::safely-dispatch-peer-message
-             peer "inv" (%bytes #xfe #x51 #xc3 0 0) nil nil nil ctx)))
+            (bl.net::safely-dispatch-peer-message peer "inv" (%bytes #xfe #x51 #xc3 0 0) (bl.ctx:make-node-context) ctx)))
       (is (null still-connected))
       (is (eq :disconnected (bl.net:peer-state peer)))
       (is (null (bl.net::peer-connection peer))))))
@@ -165,8 +164,7 @@ connection — enough to drive dispatch + disconnect without a real socket."
   (let ((peer (%fake-ready-peer))
         (ctx (bl.net::make-ibd)))
     (let ((still-connected
-            (bl.net::safely-dispatch-peer-message
-             peer "xyzzy" (%bytes) nil nil nil ctx)))
+            (bl.net::safely-dispatch-peer-message peer "xyzzy" (%bytes) (bl.ctx:make-node-context) ctx)))
       (is (eq t still-connected))
       (is (eq :ready (bl.net:peer-state peer)))
       (is-true (bl.net::peer-connection peer)))))

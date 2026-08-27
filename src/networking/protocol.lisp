@@ -125,14 +125,14 @@ AddAddrFetch peer dials instead of getaddrinfo lookups (net.cpp:2353-2358)."
 
 ;;; Message handling
 
-(defun handle-message (peer command payload chain-state utxo-set block-store
-                       &key mempool peers fee-estimator address-book recent-rejects)
+(defun handle-message (peer command payload ctx)
   "Handle an incoming message from a peer.
-MEMPOOL and PEERS are optional; when provided, transaction relay is enabled.
-FEE-ESTIMATOR is optional; when provided, fee stats are recorded for blocks.
-ADDRESS-BOOK is optional; when provided, addr messages update the peer database.
-RECENT-REJECTS is optional; when provided, recently rejected txs are cached.
+CTX is the node-context; a NIL slot disables the path that needs it:
+no mempool or peers, no transaction relay;
+no fee-estimator, no fee stats from blocks; no address-book, no peer
+database updates from addr messages; no recent-rejects, no reject cache.
 Returns T if message was handled, NIL otherwise."
+  (bl.ctx:with-node-context (mempool peers) ctx
   ;; Core logs EVERY inbound message here, before dispatch
   ;; (net_processing.cpp:3582). It is not a debugging nicety: several functional
   ;; tests assert on the exact line — p2p_addr_relay.py waits for
@@ -166,41 +166,36 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "inv")
-     (handle-inv peer payload chain-state mempool
-                 :recent-rejects recent-rejects
-                 :peers peers
-                 :utxo-set utxo-set)
+     (handle-inv peer payload ctx)
      t)
 
     ((string= command "headers")
-     (handle-headers peer payload chain-state)
+     (handle-headers peer payload ctx)
      t)
 
     ((string= command "block")
-     (handle-block peer payload chain-state utxo-set block-store mempool fee-estimator
-                   :recent-rejects recent-rejects :peers peers)
+     (handle-block peer payload ctx)
      t)
 
     ((string= command "tx")
      (when mempool
-       (handle-tx peer payload utxo-set mempool chain-state peers
-                  :recent-rejects recent-rejects))
+       (handle-tx peer payload ctx))
      t)
 
     ((string= command "getdata")
-     (handle-getdata peer payload chain-state mempool block-store)
+     (handle-getdata peer payload ctx)
      t)
 
     ((string= command "getheaders")
-     (handle-getheaders peer payload chain-state)
+     (handle-getheaders peer payload ctx)
      t)
 
     ((string= command "getblocks")
-     (handle-getblocks peer payload chain-state)
+     (handle-getblocks peer payload ctx)
      t)
 
     ((string= command "getaddr")
-     (handle-getaddr peer address-book)
+     (handle-getaddr peer payload ctx)
      t)
 
     ((string= command "mempool")
@@ -223,7 +218,7 @@ Returns T if message was handled, NIL otherwise."
          (peer-address peer))
         (unless (peer-has-permission-p peer +perm-noban+)
           (disconnect-peer peer)))
-       (t (handle-mempool-request peer mempool)))
+       (t (handle-mempool-request peer payload ctx)))
      t)
 
     ((string= command "notfound")
@@ -231,23 +226,23 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "addr")
-     (handle-addr peer payload address-book peers)
+     (handle-addr peer payload ctx)
      t)
 
     ((string= command "addrv2")
-     (handle-addrv2 peer payload address-book peers)
+     (handle-addrv2 peer payload ctx)
      t)
 
     ((string= command "getcfilters")
-     (handle-getcfilters peer payload chain-state)
+     (handle-getcfilters peer payload ctx)
      t)
 
     ((string= command "getcfheaders")
-     (handle-getcfheaders peer payload chain-state)
+     (handle-getcfheaders peer payload ctx)
      t)
 
     ((string= command "getcfcheckpt")
-     (handle-getcfcheckpt peer payload chain-state)
+     (handle-getcfcheckpt peer payload ctx)
      t)
 
     ((string= command "verack")
@@ -316,21 +311,19 @@ Returns T if message was handled, NIL otherwise."
 
     ((string= command "cmpctblock")
      (when mempool
-       (handle-cmpctblock peer payload chain-state utxo-set block-store mempool
-                          fee-estimator :recent-rejects recent-rejects))
+       (handle-cmpctblock peer payload ctx))
      t)
 
     ((string= command "blocktxn")
      (when mempool
-       (handle-blocktxn peer payload chain-state utxo-set block-store mempool
-                        fee-estimator :recent-rejects recent-rejects))
+       (handle-blocktxn peer payload ctx))
      t)
 
     ((string= command "getblocktxn")
-     (handle-getblocktxn peer payload block-store chain-state)
+     (handle-getblocktxn peer payload ctx)
      t)
 
-    (t nil)))  ; Unknown message
+    (t nil))))  ; Unknown message
 
 ;;; Inventory handling
 
@@ -796,8 +789,7 @@ lives in request-orphan-parents) and record PEER as an additional announcer."
           (when (request-orphan-parents peer parents num-wtxid-peers)
             (bl.mp:orphan-add pool otx peer)))))))
 
-(defun handle-inv (peer payload chain-state &optional mempool
-                   &key recent-rejects peers utxo-set)
+(defun handle-inv (peer payload ctx)
   "Handle an inv message.
 
 For block invs we DO NOT request the block directly via getdata — under
@@ -811,6 +803,7 @@ once headers connect, the IBD/follow-tip path issues the actual getdata.
 Mirrors Bitcoin Core net_processing.cpp:4126-4214 (reject_tx_invs,
 wtxidrelay-mismatch skip, AddTxAnnouncement, best_block tracking plus a
 single MaybeSendGetHeaders after the inv vector is fully scanned)."
+  (bl.ctx:with-node-context (chain-state mempool recent-rejects peers utxo-set) ctx
   (let ((inv-vectors (bl.ser:parse-inv-payload payload))
         (reject-tx-invs (or (ignore-incoming-txs-p)
                             (not (peer-relays-txs-p peer))))
@@ -893,7 +886,7 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
     (when wanted
       (send-message peer
                     (bl.ser:make-getdata-message
-                     (nreverse wanted))))))
+                     (nreverse wanted)))))))
 
 ;;; Notfound handling
 
@@ -925,7 +918,7 @@ handled by the block-download timeout like any other stalled request."
 
 ;;; Headers handling
 
-(defun handle-headers (peer payload chain-state)
+(defun handle-headers (peer payload ctx)
   "Handle a headers message: validate the announced headers (PoW, MTP,
 difficulty, checkpoint) and admit only the valid ones to the block index,
 queueing them for block download. This is the generic message-loop path (the
@@ -938,12 +931,13 @@ adds the low-work anti-DoS presync gate this path previously lacked: during a
 from-genesis IBD the validated tip sits below the work floor, so
 process-headers' own gate is off and unbounded cheap headers could be
 committed to the index from announcements."
+  (bl.ctx:with-node-context (chain-state) ctx
   (let ((headers (bl.ser:parse-headers-payload payload)))
     ;; Node lock: process-headers (inside ingest-headers-from-peer) mutates
     ;; the block index, which the RPC threads (submitheader, chain queries)
     ;; also touch under this lock — the same discipline handle-block follows.
     (with-current-node-lock
-      (ingest-headers-from-peer peer headers chain-state))))
+      (ingest-headers-from-peer peer headers chain-state)))))
 
 ;;; Block handling
 
@@ -1071,15 +1065,15 @@ sells an HB slot."
   (and (not (equalp tip-before hash))
        (equalp (bl.store:best-block-hash chain-state) hash)))
 
-(defun handle-block (peer payload chain-state utxo-set block-store
-                     &optional mempool fee-estimator &key recent-rejects peers)
-  "Handle a block message. When PEERS is supplied and the block becomes the new
+(defun handle-block (peer payload ctx)
+  "Handle a block message. When CTX carries peers and the block becomes the new
 active tip, announce it onward (BIP 130 headers / inv), so the node propagates
 blocks instead of being a sink. A peer that delivers a block that CONNECTS
 earns consideration for high-bandwidth compact-block announcements — Core
 drives that off mapBlockSource (net_processing.cpp:2202, 2218-2223), which is
 filled for plain block messages exactly as it is for reconstructed compact
 ones, so promotion must not be a compact-block-only privilege."
+  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool fee-estimator recent-rejects peers) ctx
   (let ((block (bl.ser:parse-block-payload payload)))
     (when block
       (let ((connected
@@ -1110,7 +1104,7 @@ ones, so promotion must not be a compact-block-only privilege."
                        nil)))))))
         ;; Outside the node lock: promotion writes sendcmpct to up to two peers.
         (when connected
-          (maybe-promote-block-deliverer peer chain-state))))))
+          (maybe-promote-block-deliverer peer chain-state)))))))
 
 ;;; Address handling
 
@@ -1353,8 +1347,8 @@ the number stored."
               do (relay-address pa peer peers :now now :max-targets max-targets)))
       added)))
 
-(defun handle-addr (peer payload &optional address-book peers)
-  "Handle an addr message. When ADDRESS-BOOK is provided, add the addresses on
+(defun handle-addr (peer payload ctx)
+  "Handle an addr message. When CTX carries an address-book, add the addresses on
 reachable networks to the address book regardless of age (absurd timestamps are
 rewritten, not dropped — see %ingest-gossiped-address), keyed to the gossiping
 PEER as their source (addrman source-group spreading), subject to the
@@ -1362,6 +1356,7 @@ per-address token bucket (see %process-gossiped-addresses). Ignored entirely
 from a block-relay-only peer (Core SetupAddressRelay,
 net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
 (net_processing.cpp:4046-4050)."
+  (bl.ctx:with-node-context (address-book peers) ctx
   (when (and peer (eq (peer-conn-type peer) :block-relay))
     (bl:log-cat "net" "ignoring addr message from block-relay-only peer ~A"
                           (peer-address peer))
@@ -1386,12 +1381,12 @@ net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
                                               address-book peers)))
       (when (and address-book (> added 0))
         (bl:log-cat "net" "Added ~D peer addresses from addr message" added))
-      added)))
+      added))))
 
 ;;; ADDRv2 handling (BIP 155)
 
-(defun handle-addrv2 (peer payload &optional address-book peers)
-  "Handle an addrv2 message (BIP 155). When ADDRESS-BOOK is provided, add
+(defun handle-addrv2 (peer payload ctx)
+  "Handle an addrv2 message (BIP 155). When CTX carries an address-book, add
 addresses of any representable network (IPv4/IPv6/TORv3/I2P/CJDNS) to the
 address book regardless of age (absurd timestamps are rewritten, not dropped —
 see %ingest-gossiped-address) — non-IP networks only when reachable (-onlynet
@@ -1400,6 +1395,7 @@ see %ingest-gossiped-address) — non-IP networks only when reachable (-onlynet
 already skipped by the codec; a count above 1000 fails parsing (Core
 Misbehaving path — the caller disconnects). Ignored entirely from a
 block-relay-only peer (Core SetupAddressRelay)."
+  (bl.ctx:with-node-context (address-book peers) ctx
   (when (and peer (eq (peer-conn-type peer) :block-relay))
     (bl:log-cat "net" "ignoring addrv2 message from block-relay-only peer ~A"
                           (peer-address peer))
@@ -1419,7 +1415,7 @@ block-relay-only peer (Core SetupAddressRelay)."
                   announced-count address-book peers)))
       (when (and address-book (> added 0))
         (bl:log-cat "net" "Added ~D peer addresses from addrv2 message" added))
-      added)))
+      added))))
 
 ;;; Transaction handling
 
@@ -1721,10 +1717,10 @@ mempool, which subsumes Core's `!m_opts.m_mempool.exists(parent_txid)` guard."
              (when (> (incf reconsiderable) 1)
                (return t)))))))
 
-(defun handle-tx (peer payload utxo-set mempool chain-state peers
-                  &key recent-rejects)
+(defun handle-tx (peer payload ctx)
   "Handle a tx message. Validate, add to mempool, and relay.
-RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
+CTX's recent-rejects, when present, caches recently rejected txs."
+  (bl.ctx:with-node-context (utxo-set mempool chain-state peers recent-rejects) ctx
   ;; A tx sent where we advertised fRelay=0 (-blocksonly / relay-disabled
   ;; mainnet default, block-relay/feeler conns) violates the protocol:
   ;; disconnect (Core RejectIncomingTxs gate in the TX handler,
@@ -1859,7 +1855,7 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                                             recent-rejects)))))))))))
     (error (c)
       (declare (ignore c))
-      nil)))
+      nil))))
 
 (defconstant +stale-relay-age-limit+ (* 30 24 60 60)
   "Core STALE_RELAY_AGE_LIMIT (net_processing.cpp:117): a block NOT on the
@@ -1974,13 +1970,14 @@ form would waste the construction on both ends."
 the -maxuploadtarget serving limit (Core HISTORICAL_BLOCK_AGE,
 net_processing.cpp:120).")
 
-(defun handle-getdata (peer payload chain-state &optional mempool block-store)
+(defun handle-getdata (peer payload ctx)
   "Handle a getdata message. Respond with requested transactions or blocks.
 Does not respond to transaction requests when relay is disabled (mainnet default).
 Blocks are served from BLOCK-STORE — MSG_BLOCK legacy, MSG_WITNESS_BLOCK with
 witness — so the node is a serving peer, not just a leech. A requested block we
 do not have on disk (pruned or unknown) is silently skipped, like Bitcoin Core's
 handling of unavailable blocks."
+  (bl.ctx:with-node-context (chain-state mempool block-store) ctx
   (let ((inv-vectors (bl.ser:parse-inv-payload payload))
         (blocks-served 0)
         (not-found '())
@@ -2147,7 +2144,7 @@ handling of unavailable blocks."
     ;; only, never blocks).
     (when not-found
       (send-message peer (bl.ser:make-notfound-message
-                          (nreverse not-found)))))))
+                          (nreverse not-found))))))))
 
 (defconstant +max-getcfilters-size+ 1000
   "Max filters per getcfilters request (Core MAX_GETCFILTERS_SIZE).")
@@ -2183,10 +2180,11 @@ blocks via GetAncestor; we serve the active chain only -- the light-client case.
                    (< (- stop-height start-height) max-diff))
           stop-height)))))
 
-(defun handle-getcfilters (peer payload chain-state)
+(defun handle-getcfilters (peer payload ctx)
   "Serve a BIP157 getcfilters: one cfilter message per block in the requested
 range, from the block filter index. Silently ignored when serving is disabled
 or the request is invalid (Core disconnects; we drop the request)."
+  (bl.ctx:with-node-context (chain-state) ctx
   (let ((bfi (%cf-serving-index)))
     (when bfi
       (multiple-value-bind (ftype start-height stop-hash)
@@ -2202,11 +2200,12 @@ or the request is invalid (Core disconnects; we drop the request)."
                     while filter
                     do (send-message
                         peer (bl.ser:make-cfilter-message
-                              0 bh filter))))))))))
+                              0 bh filter)))))))))))
 
-(defun handle-getcfheaders (peer payload chain-state)
+(defun handle-getcfheaders (peer payload ctx)
   "Serve a BIP157 getcfheaders: the previous filter header at START-1 (zeros at
 genesis) plus the per-block filter HASHES for the range, in one cfheaders."
+  (bl.ctx:with-node-context (chain-state) ctx
   (let ((bfi (%cf-serving-index)))
     (when bfi
       (multiple-value-bind (ftype start-height stop-hash)
@@ -2231,11 +2230,12 @@ genesis) plus the per-block filter HASHES for the range, in one cfheaders."
                            (push (bl.crypto:hash256 filter) hashes))
                   (send-message
                    peer (bl.ser:make-cfheaders-message
-                         0 stop-hash prev-header (nreverse hashes))))))))))))
+                         0 stop-hash prev-header (nreverse hashes)))))))))))))
 
-(defun handle-getcfcheckpt (peer payload chain-state)
+(defun handle-getcfcheckpt (peer payload ctx)
   "Serve a BIP157 getcfcheckpt: the filter header at every 1000th block up to
 the stop hash."
+  (bl.ctx:with-node-context (chain-state) ctx
   (let ((bfi (%cf-serving-index)))
     (when bfi
       (multiple-value-bind (ftype stop-hash)
@@ -2252,13 +2252,13 @@ the stop hash."
                          (push hdr headers))
                 (send-message
                  peer (bl.ser:make-cfcheckpt-message
-                       0 stop-hash (nreverse headers)))))))))))
+                       0 stop-hash (nreverse headers))))))))))))
 
 (defconstant +max-blocktxn-depth+ 10
   "Core MAX_BLOCKTXN_DEPTH (net_processing.cpp:140). Deeper than this we refuse
 to build a blocktxn and send the whole block instead.")
 
-(defun handle-getblocktxn (peer payload block-store &optional chain-state)
+(defun handle-getblocktxn (peer payload ctx)
   "Serve a BIP152 getblocktxn: reply with a blocktxn carrying the requested
 transactions (by index, witness-serialized) from the named block. This is the
 serve side of compact-block relay — without it a peer reconstructing one of our
@@ -2286,6 +2286,7 @@ for blocks is self-limiting because the sender must push the bytes.
 The test must run BEFORE GET-BLOCK, or the read it exists to prevent has
 already happened. With no CHAIN-STATE we cannot judge depth, so we fall back to
 sending the whole block — never to a free deep read."
+  (bl.ctx:with-node-context (block-store chain-state) ctx
   (when block-store
     (let* ((req (bl.ser:parse-getblocktxn-payload payload))
            (block-hash (bl.ser:block-txn-request-block-hash req))
@@ -2327,7 +2328,7 @@ sending the whole block — never to a free deep read."
                              block-hash
                              (mapcar (lambda (i) (aref txs i)) indexes)
                              :witness t))
-              (record-misbehavior peer "getblocktxn with out-of-bounds tx indices"))))))))
+              (record-misbehavior peer "getblocktxn with out-of-bounds tx indices")))))))))
 
 ;;; Serving headers / blocks / addresses to peers
 ;;;
@@ -2385,10 +2386,11 @@ Mirrors Bitcoin Core's GETHEADERS handler."
                           (truncate-entries-at-stop entries stop-hash t))))))
       (bl.ser:make-headers-message headers))))
 
-(defun handle-getheaders (peer payload chain-state)
+(defun handle-getheaders (peer payload ctx)
   "Serve a peer's getheaders by sending the headers message built from PAYLOAD
 against our active chain (see getheaders-response-message)."
-  (send-message peer (getheaders-response-message payload chain-state)))
+  (bl.ctx:with-node-context (chain-state) ctx
+  (send-message peer (getheaders-response-message payload chain-state))))
 
 (defun getblocks-response-message (payload chain-state)
   "Build the inv message answering a getblocks PAYLOAD: up to
@@ -2412,12 +2414,13 @@ announce. Mirrors Bitcoin Core's GETBLOCKS handler (legacy blocks-first peers)."
                     :hash (bl.store:block-index-entry-hash entry)))
                  chosen))))))
 
-(defun handle-getblocks (peer payload chain-state)
+(defun handle-getblocks (peer payload ctx)
   "Serve a peer's getblocks by sending the inv built from PAYLOAD, if any (see
 getblocks-response-message)."
+  (bl.ctx:with-node-context (chain-state) ctx
   (let ((msg (getblocks-response-message payload chain-state)))
     (when msg
-      (send-message peer msg))))
+      (send-message peer msg)))))
 
 (defun peer-address->net-addr (peer-addr)
   "Build a net-addr (wire address) from a stored PEER-ADDRESS record."
@@ -2513,13 +2516,15 @@ for up to 27h after banning it; that is Core-identical and intended."
                                (random (1+ +addr-response-cache-jitter-seconds+)))))
           addrs))))
 
-(defun handle-getaddr (peer &optional address-book)
+(defun handle-getaddr (peer payload ctx)
   "Serve a peer's getaddr: reply once per connection, and only to inbound peers,
 with up to +max-addr-count+ known addresses from ADDRESS-BOOK (defaulting to the
 node's). The inbound-only + once-per-connection rules mirror Bitcoin Core's
 GETADDR handler (anti-fingerprinting and anti-spam) — the once flag latches as
 soon as the request arrives, before we build any response, so a peer can never
 elicit more than one reply regardless of whether we had addresses to send."
+  (declare (ignore payload))
+  (bl.ctx:with-node-context (address-book) ctx
   ;; getaddr is an addr-related message: it enables address relay with the
   ;; peer unless the connection never does addr relay (block-relay-only) —
   ;; Core SetupAddressRelay from the GETADDR handler.
@@ -2543,7 +2548,7 @@ elicit more than one reply regardless of whether we had addresses to send."
                ;; NIL when the peer is v1-only and every address was non-IP.
                (msg (and addrs (build-addr-response peer addrs))))
           (when msg
-            (send-message peer msg)))))))
+            (send-message peer msg))))))))
 
 ;;; Local-address self-advertisement (Core MaybeSendAddr's local-address half,
 ;;; net_processing.cpp:5530-5567 + GetLocalAddrForPeer, net.cpp:240-267)
@@ -2882,7 +2887,7 @@ BIP339: wtxidrelay peers get MSG_WTX + wtxid, others MSG_TX + txid
       (setf (peer-last-inv-sequence peer)
             (bl.mp:mempool-sequence mempool)))))
 
-(defun handle-mempool-request (peer mempool)
+(defun handle-mempool-request (peer payload ctx)
   "BIP35: announce the whole mempool to a peer holding the \"mempool\"
 permission (Core sets m_send_mempool and the next inv flush sends the pool,
 net_processing.cpp).
@@ -2892,6 +2897,8 @@ BIP133 feefilter, and its wtxid-relay preference for the inv type. Sent as one
 batch — Core caps an inv message at MAX_INV_SZ and so do we, which for a pool
 larger than that means the rest waits for ordinary relay, exactly as a peer
 that connected mid-flush would see it."
+  (declare (ignore payload))
+  (bl.ctx:with-node-context (mempool) ctx
   (unless (and mempool (peer-tx-relay-p peer))
     (return-from handle-mempool-request nil))
   (let ((invs '())
@@ -2929,7 +2936,7 @@ that connected mid-flush would see it."
     ;; As in the ordinary flush: everything in the pool now was announceable.
     (setf (peer-last-inv-sequence peer)
           (bl.mp:mempool-sequence mempool))
-    count))
+    count)))
 
 (defun flush-tx-announcements (peers mempool)
   "Flush due per-peer tx announcement queues (call ~1x/second from the
@@ -3572,8 +3579,7 @@ does the IO (getheaders / getdata / disconnect) outside."
                                (bl.store:block-index-entry-chain-work tip)))))
              (values :reject reason)))))))
 
-(defun handle-cmpctblock (peer payload chain-state utxo-set block-store mempool
-                          &optional fee-estimator &key recent-rejects)
+(defun handle-cmpctblock (peer payload ctx)
   "Handle a cmpctblock message: validate the announced header, then attempt
 reconstruction from the mempool.
 
@@ -3587,6 +3593,7 @@ a peer may relay a compact block having validated only the header, and
 reconstruction can substitute our own mempool transactions, so a
 consensus-invalid result earns a full-block getdata instead. A structurally
 malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
+  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool fee-estimator recent-rejects) ctx
   (let* ((compact-block (bl.ser:parse-cmpctblock-payload payload))
          (header (bl.ser:compact-block-header compact-block))
          (block-hash (bl.ser:block-header-hash header))
@@ -3715,10 +3722,9 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
          ;; Send getblocktxn request
          (send-message peer
                        (bl.ser:make-getblocktxn-message
-                        block-hash missing-indexes)))))))
+                        block-hash missing-indexes))))))))
 
-(defun handle-blocktxn (peer payload chain-state utxo-set block-store mempool
-                        &optional fee-estimator &key recent-rejects)
+(defun handle-blocktxn (peer payload ctx)
   "Handle a blocktxn message. Complete pending block reconstruction.
 
 Same per-reason punishment rule as HANDLE-CMPCTBLOCK: the completed block is a
@@ -3730,6 +3736,7 @@ would still punish (it cannot normally arrive here: HANDLE-CMPCTBLOCK gated the
 same header before sending the getblocktxn). A blocktxn that does not answer
 the getblocktxn we sent — Core's READ_STATUS_INVALID from FillBlock — is
 punished outright (:3487-3491)."
+  (bl.ctx:with-node-context (chain-state utxo-set block-store mempool fee-estimator recent-rejects) ctx
   (let ((response (bl.ser:parse-blocktxn-payload payload))
         (pending (peer-pending-compact-block peer)))
 
@@ -3794,7 +3801,7 @@ punished outright (:3487-3491)."
             ;; BlockChecked's valid state is emitted from ConnectTip), never on
             ;; delivery or bare acceptance.
             (when connected
-              (maybe-promote-block-deliverer peer chain-state))))))))
+              (maybe-promote-block-deliverer peer chain-state)))))))))
 
 (defun request-full-block (peer block-hash)
   "Request a full block (fallback from compact block)."

@@ -3755,13 +3755,8 @@ to move them (the node must be stopped)."
                                         (let* ((cs (node-current-chainstate *node*))
                                                (pump (bl.net:pump-peer-messages
                                                       (node-peers *node*)
-                                                      cs
-                                                      (bl.store:chain-state-coins-view cs)
-                                                      (node-block-store *node*)
-                                                      :mempool (node-mempool *node*)
-                                                      :address-book (node-address-book *node*)
-                                                      :fee-estimator (node-fee-estimator *node*)
-                                                      :recent-rejects (node-recent-rejects *node*))))
+                                                      (node->context *node* cs)
+                                                      nil)))
                                           ;; Tx-request scheduler: send
                                           ;; delayed announcements now due,
                                           ;; and re-route requests that
@@ -6439,6 +6434,24 @@ eviction sweep."
 
 ;;;; Blockchain Synchronization
 
+(defun node->context (node chainstate)
+  "The node-context (bl.ctx) a sync pass or receive pump acts on: CHAINSTATE
+(the current one) with its coins view, and the node's shared pieces. One
+builder for the sync pass and the between-cycles tick, so the two cannot
+drift -- the first review of the node-context change found the tick still
+calling the old signature and no production path filling PEERS."
+  (bl.ctx:make-node-context
+   :chain-state chainstate
+   :utxo-set (bl.store:chain-state-coins-view chainstate)
+   :block-store (node-block-store node)
+   :mempool (node-mempool node)
+   :peers (node-peers node)
+   :fee-estimator (node-fee-estimator node)
+   :address-book (node-address-book node)
+   :recent-rejects (node-recent-rejects node)
+   :tx-index (node-tx-index node)
+   :historical-chainstate (node-historical-chainstate node)))
+
 (defun sync-blockchain (node)
   "Run one IBD/follow-tip cycle against connected peers.
 
@@ -6478,19 +6491,8 @@ phase exits quickly when there's nothing new to fetch."
                  peer-height)
       (bl.net::start-ibd
        (node-peers node)
-       chainstate
-       (bl.store:chain-state-coins-view chainstate)
-       (node-block-store node)
-       peer-height
-       :historical-chainstate (node-historical-chainstate node)
-       :fee-estimator (node-fee-estimator node)
-       :recent-rejects (node-recent-rejects node)
-       :mempool (node-mempool node)
-       ;; Without this the transaction index is maintained ONLY by the
-       ;; startup catch-up: blocks arriving from the network go unindexed
-       ;; until the next restart. The runtime hooks existed and got NIL.
-       :tx-index (node-tx-index node)
-       :address-book (node-address-book node)))))
+       (node->context node chainstate)
+       peer-height))))
 
 
 (defun find-best-peer (node)

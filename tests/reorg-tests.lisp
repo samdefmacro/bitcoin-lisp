@@ -902,7 +902,7 @@ move the tip) and require that the heavier downloaded fork gets activated."
        ;; from the activation pass.
        (let ((bl.net::*ibd-context*
                (bl.net::make-ibd-context)))
-         (bl.net::run-ibd nil chain-state utxo-set block-store))
+         (bl.net::run-ibd nil (bl.ctx:make-node-context :chain-state chain-state :utxo-set utxo-set :block-store block-store)))
        (is (= 3 (bl.store:current-height chain-state)))
        (is (equalp fork-tip (bl.store:best-block-hash chain-state))))
      (clrhash bl.val::*block-undo-data*))))
@@ -940,8 +940,7 @@ Assert the marker, not the call: the marker is the thing that was wrong."
                                  (bl.store:txindex-best-block txindex))))
                 (let ((bl.net::*ibd-context*
                         (bl.net::make-ibd-context)))
-                  (bl.net::run-ibd
-                   nil chain-state utxo-set block-store :tx-index txindex))
+                  (bl.net::run-ibd nil (bl.ctx:make-node-context :chain-state chain-state :utxo-set utxo-set :block-store block-store :tx-index txindex)))
                 (is (equalp fork-tip (bl.store:best-block-hash chain-state)))
                 ;; THE assertion: the reorg carried the index with it.
                 (is (equalp fork-tip
@@ -3245,8 +3244,7 @@ it."
                 (%stage-heavier-downloaded-fork chain-state block-store genesis-hash)
                 (let ((bl.net::*ibd-context*
                         (bl.net::make-ibd-context)))
-                  (bl.net::run-ibd
-                   nil chain-state utxo-set block-store :tx-index nil))
+                  (bl.net::run-ibd nil (bl.ctx:make-node-context :chain-state chain-state :utxo-set utxo-set :block-store block-store)))
                 ;; The marker names a block the reorg disconnected.
                 (bl.store::txindex-set-best-block txindex losing-tip)
                 (multiple-value-bind (height reason)

@@ -116,21 +116,18 @@ step 3 to the mempool."
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
         ;; 1. The parent on its own: below the floor, reconsiderable.
-        (bl.net::handle-tx
-         peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+        (bl.net::handle-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
         (is-false (bl.mp:mempool-has mempool pid))
         (is-true (bl.val:reconsiderable-reject-p
                   (bl.ser:transaction-wtxid parent)))
         (is-false (bl:recent-reject-p
                    rejects (bl.ser:transaction-wtxid parent)))
         ;; 2. The child: an orphan, not a reject.
-        (bl.net::handle-tx
-         peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
+        (bl.net::handle-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
         (is-true (%pr-orphan-p mempool child))
         (is-false (bl:recent-reject-p rejects cid))
         ;; 3. The parent again: accepted as a package with the orphan child.
-        (bl.net::handle-tx
-         peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+        (bl.net::handle-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
         (is-true (bl.mp:mempool-has mempool pid))
         (is-true (bl.mp:mempool-has mempool cid))
         ;; The child left the orphanage when it entered the mempool
@@ -150,11 +147,9 @@ txdownloadman_impl.cpp:460-465). No re-announcement is needed."
            (cid (bl.ser:transaction-hash child))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
-        (bl.net::handle-tx
-         peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
+        (bl.net::handle-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
         (is-true (%pr-orphan-p mempool child))
-        (bl.net::handle-tx
-         peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+        (bl.net::handle-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
         (is-true (bl.mp:mempool-has mempool pid))
         (is-true (bl.mp:mempool-has mempool cid))
         (is-false (%pr-orphan-p mempool child))))))
@@ -168,10 +163,8 @@ re-arriving low-fee parent is still not accepted. The fee floor is intact —
            (pid (bl.ser:transaction-hash parent))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
-        (bl.net::handle-tx
-         peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-        (bl.net::handle-tx
-         peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+        (bl.net::handle-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (bl.net::handle-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
         (is-false (bl.mp:mempool-has mempool pid))
         (is (zerop (bl.mp:mempool-count mempool)))))))
 
@@ -188,13 +181,10 @@ comes from peer B, the parent from peer A: no package is formed."
            (peer-a (%pr-peer))
            (peer-b (%pr-peer)))
       (%with-fresh-rejects (rejects)
-        (bl.net::handle-tx
-         peer-a (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-        (bl.net::handle-tx
-         peer-b (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
+        (bl.net::handle-tx peer-a (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (bl.net::handle-tx peer-b (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
         (is-true (%pr-orphan-p mempool child))
-        (bl.net::handle-tx
-         peer-a (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+        (bl.net::handle-tx peer-a (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
         (is-false (bl.mp:mempool-has mempool pid))
         (is-false (bl.mp:mempool-has mempool cid))))))
 
@@ -216,10 +206,8 @@ blacklisted under both of its own ids — permanently, until the next block."
       ;; The precondition that makes this case distinct.
       (is (equalp pid (bl.ser:transaction-wtxid parent)))
       (%with-fresh-rejects (rejects)
-        (bl.net::handle-tx
-         peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-        (bl.net::handle-tx
-         peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
+        (bl.net::handle-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (bl.net::handle-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
         (is-true (%pr-orphan-p mempool child))
         (is-false (bl:recent-reject-p rejects cid))
         (is-false (bl:recent-reject-p
@@ -246,15 +234,12 @@ rejects the child under both ids rather than holding it in the orphanage."
                           (- (* 2 (- 100000000 5)) 50000)))
            (cid (bl.ser:transaction-hash child)))
       (%with-fresh-rejects (rejects)
-        (bl.net::handle-tx
-         peer (%pr-payload pa) utxo mempool state nil :recent-rejects rejects)
-        (bl.net::handle-tx
-         peer (%pr-payload pb) utxo mempool state nil :recent-rejects rejects)
+        (bl.net::handle-tx peer (%pr-payload pa) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (bl.net::handle-tx peer (%pr-payload pb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
         ;; Both parents are reconsiderable — the precondition.
         (is-true (bl.val:reconsiderable-reject-p paid))
         (is-true (bl.val:reconsiderable-reject-p pbid))
-        (bl.net::handle-tx
-         peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
+        (bl.net::handle-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
         (is-false (%pr-orphan-p mempool child))
         (is-true (bl:recent-reject-p rejects cid))
         (is-true (bl:recent-reject-p
@@ -277,14 +262,12 @@ zero on the second would prove nothing."
            (bad-id (bl.ser:transaction-hash bad)))
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
-          (bl.net::handle-tx
-           peer (%pr-payload bad) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload bad) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           (is (= 1 calls) "first arrival must reach validation" calls)
           (is-true (bl:recent-reject-p rejects bad-id))
           (is-false (bl.val:reconsiderable-reject-p bad-id))
           ;; Re-announced: dropped at the precheck, never re-validated.
-          (bl.net::handle-tx
-           peer (%pr-payload bad) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload bad) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           (is (= 1 calls) "re-arrival must not be re-validated" calls)
           (is-false (bl.mp:mempool-has mempool bad-id)))))))
 
@@ -308,14 +291,12 @@ carry it — and be dropped before validation on re-arrival."
            (txid (bl.ser:transaction-hash tx)))
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
-          (bl.net::handle-tx
-           peer (%pr-payload tx) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload tx) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           (is (= 1 calls) "first arrival must reach validation" calls)
           (is-false (bl.mp:mempool-has mempool txid))
           (is-true (bl.val:reconsiderable-reject-p txid))
           (is-false (bl:recent-reject-p rejects txid))
-          (bl.net::handle-tx
-           peer (%pr-payload tx) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload tx) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           (is (= 1 calls) "re-arrival must not be re-validated" calls))))))
 
 ;;;; (e) A FAILED 1p1c package must not black-hole its members
@@ -405,20 +386,16 @@ one."
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
           ;; RIVAL wins the outpoint honestly.
-          (bl.net::handle-tx
-           peer (%pr-payload rival) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload rival) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           (is-true (bl.mp:mempool-has mempool rid))
           ;; The sub-floor double-spending PARENT: reconsiderable, not main.
-          (bl.net::handle-tx
-           peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           (is-true (bl.val:reconsiderable-reject-p pwtxid))
           ;; The CHILD: held as an orphan (one reconsiderable parent is fine).
-          (bl.net::handle-tx
-           peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           (is-true (%pr-orphan-p mempool child))
           ;; The parent again — this forms the package, and it FAILS.
-          (bl.net::handle-tx
-           peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           ;; The package path really ran and really failed as a package.
           (is-true (bl.val:reconsiderable-reject-p
                     (bl.val:package-hash (list parent child)))
@@ -448,9 +425,7 @@ one."
           ;; ...and the re-sent child must reach validation instead of being
           ;; dropped at handle-tx's precheck, and be held as an orphan again.
           (let ((before calls))
-            (bl.net::handle-tx
-             peer (%pr-payload child) utxo mempool state nil
-             :recent-rejects rejects)
+            (bl.net::handle-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
             (is (= (1+ before) calls)
                 "re-sent child must reach validation, not the reject precheck"
                 before calls))
@@ -461,8 +436,7 @@ one."
           (bl.mp:mempool-remove mempool rid)
           (bl:clear-recent-rejects rejects)
           (bl.val:clear-reconsiderable-rejects)
-          (bl.net::handle-tx
-           peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           (is-true (bl.mp:mempool-has mempool pid))
           (is-true (bl.mp:mempool-has mempool cid)))))))
 
@@ -503,17 +477,14 @@ goes to the reconsiderable filter — CONTROL (b) again, on this path."
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
-          (bl.net::handle-tx
-           peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           (is-true (bl.val:reconsiderable-reject-p pwtxid))
-          (bl.net::handle-tx
-           peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           (is-true (%pr-orphan-p mempool child)
                    "the bad child must be an orphan first, or the package
 never forms and this control asserts nothing")
           ;; Form the package; the child fails hard inside it.
-          (bl.net::handle-tx
-           peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+          (bl.net::handle-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
           (is (zerop (bl.mp:mempool-count mempool)))
           (is-true (bl:recent-reject-p rejects cwtxid)
                    "a hard package failure must still be cached")
@@ -525,9 +496,7 @@ never forms and this control asserts nothing")
           (is-false (bl:recent-reject-p rejects pwtxid))
           ;; Re-announced: dropped at the precheck, never re-validated.
           (let ((before calls))
-            (bl.net::handle-tx
-             peer (%pr-payload child) utxo mempool state nil
-             :recent-rejects rejects)
+            (bl.net::handle-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
             (is (= before calls)
                 "a cached hard failure must not be re-validated" before calls))
           (is-false (%pr-orphan-p mempool child))
@@ -589,15 +558,11 @@ with the filter empty, which IS requested."
     (%with-fresh-rejects (rejects)
       (bl.val:add-reconsiderable-reject blocked)
       (ignore-errors
-       (bl.net::handle-inv
-        announcer (funcall inv-payload blocked) state mempool
-        :recent-rejects rejects))
+       (bl.net::handle-inv announcer (funcall inv-payload blocked) (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects)))
       ;; Nothing recorded: a probe from another peer still wants it.
       (is-true (bl.net::tx-request-wanted-p blocked probe t))
       (bl.net:reset-tx-requests)
       ;; Control: an unknown wtxid from the same announcer IS requested.
       (ignore-errors
-       (bl.net::handle-inv
-        announcer (funcall inv-payload fresh) state mempool
-        :recent-rejects rejects))
+       (bl.net::handle-inv announcer (funcall inv-payload fresh) (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects)))
       (is-false (bl.net::tx-request-wanted-p fresh probe t)))))
