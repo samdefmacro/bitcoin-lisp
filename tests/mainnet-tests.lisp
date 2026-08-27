@@ -11,22 +11,24 @@
   "network-genesis-hash should return testnet genesis for :testnet3"
   (let ((genesis (bl.store:network-genesis-hash :testnet3)))
     (is (= 32 (length genesis)))
-    ;; Testnet genesis hash (little-endian)
-    (is (equalp genesis bl.store:\*testnet3-genesis-hash\*))))
+    ;; Testnet genesis hash (little-endian), as the chain-params table spells it
+    (is (equalp genesis (bl.chain:chain-params-genesis-hash
+                         (bl.chain:find-chain-params :testnet3))))))
 
 (test network-genesis-hash-mainnet
   "network-genesis-hash should return mainnet genesis for :mainnet."
   (let ((genesis (bl.store:network-genesis-hash :mainnet)))
     (is (= 32 (length genesis)))
     ;; Mainnet genesis hash (little-endian)
-    (is (equalp genesis bl.store:*mainnet-genesis-hash*))
+    (is (equalp genesis (bl.chain:chain-params-genesis-hash
+                         (bl.chain:find-chain-params :mainnet))))
     ;; Verify it's different from testnet
-    (is (not (equalp genesis bl.store:\*testnet3-genesis-hash\*)))))
+    (is (not (equalp genesis (bl.store:network-genesis-hash :testnet3))))))
 
 (test mainnet-genesis-hash-value
   "Mainnet genesis hash should match known value."
   ;; Display format (big-endian): 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
-  (let* ((genesis bl.store:*mainnet-genesis-hash*)
+  (let* ((genesis (bl.store:network-genesis-hash :mainnet))
          (reversed (reverse genesis))
          (hex (bl.crypto:bytes-to-hex reversed)))
     (is (string= "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f" hex))))
@@ -93,7 +95,7 @@
 
 (test mainnet-genesis-hash-valid
   "Mainnet genesis hash should be a valid 32-byte hash."
-  (let ((genesis bl.store:*mainnet-genesis-hash*))
+  (let ((genesis (bl.store:network-genesis-hash :mainnet)))
     (is (typep genesis '(simple-array (unsigned-byte 8) (32))))
     ;; Genesis hash should not be all zeros
     (is-false (every #'zerop genesis))))

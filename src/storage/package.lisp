@@ -81,10 +81,6 @@
    #:init-chain-state
    #:network-genesis-hash
    #:make-genesis-block
-   #:*testnet3-genesis-hash*
-   #:*testnet4-genesis-hash*
-   #:*signet-genesis-hash*
-   #:*mainnet-genesis-hash*
    #:block-index-entry
    #:make-block-index-entry
    #:block-index-entry-hash

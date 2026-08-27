@@ -44,33 +44,6 @@ entries most likely to still be valid. Never trims to empty."
 be timestamped more than this many seconds before the previous block.
 Bitcoin Core MAX_TIMEWARP (consensus/consensus.h:35).")
 
-;;; Locktime activation heights (BIPs 65/68/112/113)
-
-(defconstant +bip66-activation-height-mainnet+ 363725
-  "BIP 66 (DERSIG/strict DER) activation height on mainnet.")
-(defconstant +bip66-activation-height-testnet3+ 330776
-  "BIP 66 (DERSIG/strict DER) activation height on testnet.")
-
-(defconstant +bip65-activation-height-mainnet+ 388381
-  "BIP 65 (CLTV) activation height on mainnet.")
-(defconstant +bip65-activation-height-testnet3+ 581885
-  "BIP 65 (CLTV) activation height on testnet.")
-
-(defconstant +csv-activation-height-mainnet+ 419328
-  "BIP 68/112/113 (CSV soft fork) activation height on mainnet.")
-(defconstant +csv-activation-height-testnet3+ 770112
-  "BIP 68/112/113 (CSV soft fork) activation height on testnet.")
-
-(defconstant +segwit-activation-height-mainnet+ 481824
-  "BIP 141 (SegWit) activation height on mainnet.")
-(defconstant +segwit-activation-height-testnet3+ 834624
-  "BIP 141 (SegWit) activation height on testnet3.")
-
-(defconstant +taproot-activation-height-mainnet+ 709632
-  "BIP 341 (Taproot) activation height on mainnet.")
-(defconstant +taproot-activation-height-testnet3+ 2346882
-  "BIP 341 (Taproot) activation height on testnet3.")
-
 ;;; P2SH is active from block 173805 (mainnet) but enforced from genesis on testnet.
 ;;; BIP 66 (DERSIG) and BIP 147 (NULLDUMMY) activate with SegWit on most networks.
 
@@ -257,45 +230,26 @@ name is one of ~{~A~^, ~} and height is a non-negative integer."
 (defun get-bip66-activation-height (network)
   "Return the BIP 66 (DERSIG) activation height for NETWORK."
   (%activation-height "dersig"
-   (ecase network
-    (:testnet3 +bip66-activation-height-testnet3+)
-    ((:testnet4 :signet :regtest) 1)
-    (:mainnet +bip66-activation-height-mainnet+))))
+   (bl.chain:chain-params-bip66-height (bl.chain:find-chain-params network))))
 
 (defun get-bip65-activation-height (network)
   "Return the BIP 65 (CLTV) activation height for NETWORK."
   (%activation-height "cltv"
-   (ecase network
-    (:testnet3 +bip65-activation-height-testnet3+)
-    ((:testnet4 :signet :regtest) 1)
-    (:mainnet +bip65-activation-height-mainnet+))))
+   (bl.chain:chain-params-bip65-height (bl.chain:find-chain-params network))))
 
 (defun get-csv-activation-height (network)
   "Return the BIP 68/112/113 (CSV) activation height for NETWORK."
   (%activation-height "csv"
-   (ecase network
-    (:testnet3 +csv-activation-height-testnet3+)
-    ((:testnet4 :signet :regtest) 1)
-    (:mainnet +csv-activation-height-mainnet+))))
+   (bl.chain:chain-params-csv-height (bl.chain:find-chain-params network))))
 
 (defun get-taproot-activation-height (network)
   "Return the BIP 341 (Taproot) activation height for NETWORK."
-  (ecase network
-    (:testnet3 +taproot-activation-height-testnet3+)
-    ((:testnet4 :signet) 1)
-    ;; Regtest activates Taproot from genesis (Core ALWAYS_ACTIVE).
-    (:regtest 0)
-    (:mainnet +taproot-activation-height-mainnet+)))
+  (bl.chain:chain-params-taproot-height (bl.chain:find-chain-params network)))
 
 (defun get-segwit-activation-height (network)
   "Return the BIP 141 (SegWit) activation height for NETWORK."
   (%activation-height "segwit"
-   (ecase network
-    (:testnet3 +segwit-activation-height-testnet3+)
-    ((:testnet4 :signet) 1)
-    ;; Regtest activates SegWit from genesis (Core SegwitHeight = 0).
-    (:regtest 0)
-    (:mainnet +segwit-activation-height-mainnet+))))
+   (bl.chain:chain-params-segwit-height (bl.chain:find-chain-params network))))
 
 ;;; Policy vs Consensus Flag Separation
 ;;;
@@ -1242,19 +1196,10 @@ witness is not covered by the header/merkle root), so callers must treat this as
 
 ;;;; BIP 34 Coinbase Height Validation
 
-(defconstant +bip34-activation-height-testnet3+ 21111
-  "BIP 34 activation height on testnet.")
-
-(defconstant +bip34-activation-height-mainnet+ 227931
-  "BIP 34 activation height on mainnet.")
-
 (defun get-bip34-activation-height (network)
   "Return the BIP 34 activation height for NETWORK."
   (%activation-height "bip34"
-   (ecase network
-     (:testnet3 +bip34-activation-height-testnet3+)
-     ((:testnet4 :signet :regtest) 1)
-     (:mainnet +bip34-activation-height-mainnet+))))
+   (bl.chain:chain-params-bip34-height (bl.chain:find-chain-params network))))
 
 (defconstant +bip34-implies-bip30-limit+ 1983702
   "BIP 30 is re-enforced unconditionally at this height and above: past

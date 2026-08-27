@@ -274,65 +274,11 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
 
 ;;; Network parameters
 
-(defvar *testnet3-port* 18333)
-(defvar *testnet4-port* 48333)
-(defvar *signet-port* 38333)
-(defvar *mainnet-port* 8333)
-(defvar *current-port* *testnet4-port*)
+(defvar *current-port* (bl.chain:chain-params-port (bl.chain:find-chain-params :testnet4))
+  "The P2P port the node dials and listens on; init-node sets it per chain.")
 
-(defvar *testnet3-dns-seeds*
-  '("testnet-seed.bitcoin.jonasschnelli.ch"
-    "seed.tbtc.petertodd.org"
-    "seed.testnet.bitcoin.sprovoost.nl"
-    "testnet-seed.bluematt.me"))
-
-(defvar *testnet4-dns-seeds*
-  '("seed.testnet4.bitcoin.sprovoost.nl"
-    "seed.testnet4.wiz.biz"))
-
-(defvar *testnet4-fixed-seeds*
-  '("2.59.134.244" "2.110.106.102" "5.182.4.106" "31.220.30.248"
-    "34.232.194.104" "35.201.167.154" "38.102.86.40" "45.41.204.8"
-    "45.50.223.112" "45.94.168.5" "51.158.61.33" "52.6.23.153"
-    "54.76.27.166" "54.78.49.45" "62.84.190.200" "65.108.143.22"
-    "67.81.240.18" "67.213.127.87" "69.26.129.172" "70.95.111.216"
-    "71.13.92.62" "71.183.49.199" "74.133.9.162" "80.253.94.252"
-    "82.67.102.15" "89.58.9.219" "94.183.188.204" "95.141.35.117"
-    "95.182.100.206" "96.79.5.26" "103.69.87.64" "103.99.169.203"
-    "103.99.169.204" "103.165.192.201" "103.165.192.210" "103.232.248.31"
-    "104.237.131.138" "109.123.236.96" "121.98.22.147" "135.180.99.74"
-    "142.160.218.208" "144.172.110.246" "148.51.196.40" "158.69.118.2"
-    "158.69.211.155" "158.220.90.103" "162.220.166.82" "168.119.11.220"
-    "173.53.122.49" "174.177.47.73" "176.169.208.187" "181.174.165.116"
-    "185.254.97.76" "193.30.123.70" "195.154.199.2" "198.58.102.18"
-    "203.51.4.72" "203.132.94.196" "208.68.4.50" "208.68.4.71"
-    "208.73.202.78" "217.31.57.128" "222.66.94.2")
-  "Hardcoded testnet4 IPv4 fallback peers (63 nodes across 59 distinct /16
-groups), extracted from Bitcoin Core's contrib/seeds/nodes_testnet4.txt
-(makeseeds.py output). Used by connect-to-peers when DNS discovery
-returns too few diverse netgroups — testnet4's two DNS seeds are
-sprovoost.nl (currently dark/unresponsive 2026-05-11) and wiz.biz
-(returns only its own /24 cluster), so without this fallback the node
-ends up 8-of-8 connected to one operator and stalls when that operator
-slows down. Mirrors Bitcoin Core's vFixedSeeds in chainparams.cpp
-which is populated from chainparams_seed_testnet4 (the same
-nodes_testnet4.txt source).")
-
-(defvar *signet-dns-seeds*
-  '("seed.signet.bitcoin.sprovoost.nl"
-    "seed.signet.achownodes.xyz"))
-
-(defvar *mainnet-dns-seeds*
-  '("seed.bitcoin.sipa.be"
-    "dnsseed.bluematt.me"
-    "dnsseed.bitcoin.dashjr.org"
-    "seed.bitcoinstats.com"
-    "seed.bitcoin.jonasschnelli.ch"))
-
-(defvar *regtest-dns-seeds* '()
-  "Regtest has no DNS seeds — it is an isolated local chain with no peers.")
-
-(defvar *dns-seeds* *testnet4-dns-seeds*)
+(defvar *dns-seeds* (bl.chain:chain-params-dns-seeds (bl.chain:find-chain-params :testnet4))
+  "The DNS seeds the node queries; init-node sets them per chain.")
 
 ;;; Peer connection
 

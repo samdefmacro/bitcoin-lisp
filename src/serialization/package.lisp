@@ -138,11 +138,6 @@
    #:serialize-message
    #:compute-checksum
    #:*network-magic*
-   #:+testnet3-magic+
-   #:+testnet4-magic+
-   #:+signet-magic+
-   #:+regtest-magic+
-   #:+mainnet-magic+
    ;; Service bit constants
    #:+node-network+
    #:+node-witness+

@@ -24,19 +24,14 @@
 ;;;;
 ;;;; This module is the state machine; the driver lives in sync-headers (ibd).
 
-;;; Per-network HeadersSyncParams, from Core kernel/chainparams.cpp
-;;; m_headers_sync_params (tuned by contrib/devtools/headerssync-params.py for a
-;;; fixed memory/security target). CAR = commitment period (store 1 bit per this
-;;; many headers in presync); CDR = redownload buffer size (release a header to
-;;; the index only once this many sit on top of it, i.e. ~buffer/period verified
-;;; commitments).
 (defun headers-sync-params (network)
-  (ecase network
-    (:mainnet  '(641 . 15218))
-    (:testnet3 '(673 . 14460))
-    (:testnet4 '(606 . 16092))
-    (:signet   '(620 . 15724))
-    (:regtest  '(275 . 7017))))
+  "NETWORK's HeadersSyncParams (Core kernel/chainparams.cpp
+m_headers_sync_params, tuned by contrib/devtools/headerssync-params.py for a
+fixed memory/security target). CAR = commitment period (store 1 bit per this
+many headers in presync); CDR = redownload buffer size (release a header to
+the index only once this many sit on top of it, i.e. ~buffer/period verified
+commitments)."
+  (bl.chain:chain-params-headers-sync-params (bl.chain:find-chain-params network)))
 
 ;; Fastest block rate a consensus-valid chain can sustain given the median-time-
 ;; past rule (Core assumes 6 blocks/second); used to bound presync memory.

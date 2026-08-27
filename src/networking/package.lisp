@@ -296,23 +296,9 @@
    #:init-peer-rate-limiters
    #:peer-connect-time
    ;; Network params
-   #:*testnet3-port*
-   #:*testnet4-port*
-   #:*signet-port*
-   #:*mainnet-port*
    #:*current-port*
    #:*dns-seeds*
-   #:*testnet3-dns-seeds*
-   #:*testnet4-dns-seeds*
-   #:*testnet4-fixed-seeds*
-   #:*signet-dns-seeds*
-   #:*regtest-dns-seeds*
-   #:*mainnet-dns-seeds*
    ;; Checkpoints
-   #:*testnet3-checkpoints*
-   #:*testnet4-checkpoints*
-   #:*signet-checkpoints*
-   #:*mainnet-checkpoints*
    #:network-checkpoints
    #:get-checkpoint-hash
    #:last-checkpoint-height

@@ -9,10 +9,10 @@
 
 (test checkpoint-data-exists
   "Test that testnet checkpoint data is defined."
-  (is (not (null bl.net::\*testnet3-checkpoints\*)))
-  (is (listp bl.net::\*testnet3-checkpoints\*))
+  (is (not (null (bl.net::network-checkpoints :testnet3))))
+  (is (listp (bl.net::network-checkpoints :testnet3)))
   ;; Check first checkpoint at height 546
-  (let ((first (first bl.net::\*testnet3-checkpoints\*)))
+  (let ((first (first (bl.net::network-checkpoints :testnet3))))
     (is (= 546 (car first)))
     (is (stringp (cdr first)))))
 

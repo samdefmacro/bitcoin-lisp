@@ -37,22 +37,12 @@ up the loop's shape.")
   "Current network mode (:testnet3, :testnet4, :signet, :regtest, or :mainnet).")
 
 (defun network-magic (network)
-  "Return the network magic bytes for NETWORK."
-  (ecase network
-    (:testnet3 bl.ser:+testnet3-magic+)
-    (:testnet4 bl.ser:+testnet4-magic+)
-    (:signet bl.ser:+signet-magic+)
-    (:regtest bl.ser:+regtest-magic+)
-    (:mainnet bl.ser:+mainnet-magic+)))
+  "NETWORK's message-start bytes (chain-params-magic)."
+  (bl.chain:chain-params-magic (bl.chain:find-chain-params network)))
 
 (defun network-port (network)
-  "Return the default port for NETWORK."
-  (ecase network
-    (:testnet3 18333)
-    (:testnet4 48333)
-    (:signet 38333)
-    (:regtest 18444)
-    (:mainnet 8333)))
+  "NETWORK's default P2P port (chain-params-port)."
+  (bl.chain:chain-params-port (bl.chain:find-chain-params network)))
 
 (defun %normalize-datadir (datadir)
   "DATADIR as a string that names a DIRECTORY, whatever spelling it arrived in.
@@ -362,22 +352,12 @@ Core's -port only moves the listening/advertised side."
   (or *p2p-port-override* (network-port network)))
 
 (defun network-dns-seeds (network)
-  "Return the DNS seeds for NETWORK."
-  (ecase network
-    (:testnet3 bl.net:*testnet3-dns-seeds*)
-    (:testnet4 bl.net:*testnet4-dns-seeds*)
-    (:signet bl.net:*signet-dns-seeds*)
-    (:regtest bl.net:*regtest-dns-seeds*)
-    (:mainnet bl.net:*mainnet-dns-seeds*)))
+  "NETWORK's DNS seeds (chain-params-dns-seeds)."
+  (bl.chain:chain-params-dns-seeds (bl.chain:find-chain-params network)))
 
 (defun network-rpc-port (network)
-  "Return the default RPC port for NETWORK."
-  (ecase network
-    (:testnet3 18332)
-    (:testnet4 48332)
-    (:signet 38332)
-    (:regtest 18443)
-    (:mainnet 8332)))
+  "NETWORK's default RPC port (chain-params-rpc-port)."
+  (bl.chain:chain-params-rpc-port (bl.chain:find-chain-params network)))
 
 (defvar *mainnet-relay-enabled* nil
   "Whether transaction relay is enabled on mainnet. Default NIL for safety.")
@@ -800,18 +780,13 @@ For testnet, data stays at the base directory (backward compatible)."
   ;; Set global network variable
   (setf *network* network)
 
-  ;; Network-aware PoW limit: regtest's trivial limit, the standard limit
-  ;; otherwise. derive-target / check-proof-of-work reject targets above it.
-  ;; Each network's own powLimit (Core params.powLimit). Signet's is EASIER
-  ;; than mainnet's minimum (00000377ae...), so running it against the mainnet
-  ;; limit made derive-target reject every real signet nBits — including
-  ;; signet's own genesis, whose 0x1e0377ae we already record in chain.lisp.
+  ;; Each chain's own powLimit (Core params.powLimit) from the table;
+  ;; derive-target / check-proof-of-work reject targets above it. Signet's is
+  ;; EASIER than mainnet's minimum (00000377ae...), so running it against the
+  ;; mainnet limit rejected every real signet nBits, genesis included.
   (setf bl.store:*pow-limit-target*
-        (ecase network
-          (:regtest bl.store:+regtest-pow-limit-target+)
-          (:signet  bl.store:+signet-pow-limit-target+)
-          ((:mainnet :testnet3 :testnet4)
-           bl.store:+pow-limit-target+)))
+        (bl.store:bits-to-target
+         (bl.chain:chain-params-pow-limit-bits (bl.chain:find-chain-params network))))
 
   ;; Calculate data path — each network uses its own subdirectory, and WHICH
   ;; subdirectory is Core's (chainparamsbase.cpp:40-55). See NETWORK-DATA-PATH.
@@ -4129,12 +4104,7 @@ Ours used to be the INVERSE for exactly the two that matter: mainnet in
 `mainnet/` and testnet3 at the root. Pointing our node at a Core datadir with
 the default network therefore wrote testnet3 data into Core's MAINNET
 directory, and pointing Core at ours found nothing and started a fresh sync."
-  (ecase network
-    (:mainnet nil)
-    (:testnet3 "testnet3/")
-    (:testnet4 "testnet4/")
-    (:signet "signet/")
-    (:regtest "regtest/")))
+  (bl.chain:chain-params-data-subdirectory (bl.chain:find-chain-params network)))
 
 (defun network-data-path (base-path network)
   "Where NETWORK's data lives under BASE-PATH.
@@ -4149,7 +4119,7 @@ is visible rather than inherited by accident."
          (core-path (if subdir (merge-pathnames subdir base-path) base-path))
          ;; The layout this tree used before: mainnet under mainnet/, testnet3
          ;; at the root. Every other network already agreed with Core.
-         (legacy-subdir (case network (:mainnet "mainnet/") (:testnet3 nil)))
+         (legacy-subdir (and (eq network :mainnet) "mainnet/"))
          (legacy-path (if legacy-subdir
                           (merge-pathnames legacy-subdir base-path)
                           base-path)))
@@ -5785,30 +5755,29 @@ Returns the number of peers connected."
     ;; ~2026-05; wiz.biz returns its own /24 cluster only). Mirrors Bitcoin
     ;; Core's vFixedSeeds population in chainparams.cpp — used as a
     ;; last-resort source so we always have netgroup diversity available.
-    (when (and (eq (node-network node) :testnet4)
-               ;; -fixedseeds=0 forbids the hardcoded fallback (Core
-               ;; net.cpp:2571-2572 "Fixed seeds are disabled").
-               *fixed-seeds-enabled*
-               (let ((groups (remove-duplicates
-                              (remove nil (mapcar (lambda (c)
-                                                    (bl.net:ip-netgroup
-                                                     (car c)))
-                                                  addresses))
-                              :test #'string=)))
-                 (< (length groups) 8)))
-      (log-info "Merging testnet4 fixed-seed list (~D peers, ~D /16 groups)"
-                (length bl.net:*testnet4-fixed-seeds*)
-                (length (remove-duplicates
-                         (mapcar #'bl.net:ip-netgroup
-                                 bl.net:*testnet4-fixed-seeds*)
-                         :test #'string=)))
-      (setf addresses
-            (remove-duplicates
-             (append addresses
-                     (mapcar (lambda (a) (cons a nil))
-                             (%reachable-seed-addresses
-                              bl.net:*testnet4-fixed-seeds*)))
-             :key #'car :test #'string=)))
+    (let ((fixed (bl.chain:chain-params-fixed-seeds
+                  (bl.chain:find-chain-params (node-network node)))))
+      (when (and fixed
+                 ;; -fixedseeds=0 forbids the hardcoded fallback (Core
+                 ;; net.cpp:2571-2572 "Fixed seeds are disabled").
+                 *fixed-seeds-enabled*
+                 (let ((groups (remove-duplicates
+                                (remove nil (mapcar (lambda (c)
+                                                      (bl.net:ip-netgroup
+                                                       (car c)))
+                                                    addresses))
+                                :test #'string=)))
+                   (< (length groups) 8)))
+        (log-info "Merging ~A fixed-seed list (~D peers, ~D /16 groups)"
+                  (node-network node) (length fixed)
+                  (length (remove-duplicates (mapcar #'bl.net:ip-netgroup fixed)
+                                             :test #'string=)))
+        (setf addresses
+              (remove-duplicates
+               (append addresses
+                       (mapcar (lambda (a) (cons a nil))
+                               (%reachable-seed-addresses fixed)))
+               :key #'car :test #'string=))))
 
     ;; Diversify by /16 netgroup so the first 8 connection attempts spread
     ;; across distinct operators (incident 2026-05-11: 8-of-8 peers were

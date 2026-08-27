@@ -88,7 +88,7 @@ creates its chainstate_snapshot/ LevelDB there."
 
 (defun %snap-write-file (path &key (magic #(#x75 #x74 #x78 #x6F #xFF))
                                    (version 2)
-                                   (netmagic bl.ser:+testnet3-magic+)
+                                   (netmagic (bl.chain:chain-params-magic (bl.chain:find-chain-params :testnet3)))
                                    base-hash count groups (trailing #()))
   "Craft an arbitrary snapshot file. GROUPS is a list of (txid . coins),
 each coin (vout height coinbase value script)."

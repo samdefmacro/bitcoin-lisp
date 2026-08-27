@@ -33,7 +33,7 @@ vectors passed this entire suite while answering every real miner -8."
 ;;;; Regtest network parameters
 
 (test regtest-network-params
-  (is (equalp bl.ser:+regtest-magic+
+  (is (equalp (bl.chain:chain-params-magic (bl.chain:find-chain-params :regtest))
               (bl::network-magic :regtest)))
   (is (= 18444 (bl::network-port :regtest)))
   (is (= 18443 (bl::network-rpc-port :regtest)))

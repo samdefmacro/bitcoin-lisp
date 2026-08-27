@@ -52,3 +52,42 @@ compile against them. src/util/bytes.lisp.")
    #:br-read-bytes
    #:br-read-compact-size
    #:br-read-var-bytes))
+
+(defpackage #:bitcoin-lisp.chainparams
+  (:documentation "Per-chain parameters (Core CChainParams): one
+DEFINE-CHAIN-PARAMS form per chain in src/util/chainparams.lisp, read through
+FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
+  (:use #:cl)
+  (:export
+   #:chain-params
+   #:define-chain-params
+   #:find-chain-params
+   #:chain-names
+   #:chain-params-p
+   #:chain-params-name
+   #:chain-params-core-name
+   #:chain-params-data-subdirectory
+   #:chain-params-magic
+   #:chain-params-port
+   #:chain-params-rpc-port
+   #:chain-params-dns-seeds
+   #:chain-params-fixed-seeds
+   #:chain-params-genesis-hash
+   #:chain-params-genesis-timestamp
+   #:chain-params-genesis-bits
+   #:chain-params-genesis-nonce
+   #:chain-params-genesis-timestamp-message
+   #:chain-params-pow-limit-bits
+   #:chain-params-bip34-height
+   #:chain-params-bip65-height
+   #:chain-params-bip66-height
+   #:chain-params-csv-height
+   #:chain-params-segwit-height
+   #:chain-params-taproot-height
+   #:chain-params-checkpoints
+   #:chain-params-headers-sync-params
+   #:chain-params-minimum-chain-work
+   #:chain-params-assumevalid-hex
+   #:chain-params-assumeutxo
+   #:chain-params-prune-after-height
+   #:chain-params-bech32-hrp))
