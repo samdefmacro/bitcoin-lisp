@@ -1,0 +1,129 @@
+(in-package #:bitcoin-lisp)
+
+;;;; The option registry (Core ArgsManager::AddArg, init.cpp / common/args.cpp)
+;;;
+;;; The mechanism behind src/config-options.lisp, which registers one
+;;; DEFINE-OPTION per option bitcoind accepts. The table answers the
+;;; questions config.lisp used to answer from four separate lists that had
+;;; drifted apart (two options were in two of them at once): is this name
+;;; known at all (CHECK-CLI-ARGS), does every occurrence count
+;;; (PARSE-CLI-ARGS, Core GetArgs), which start-node keyword does it feed
+;;; and how is the value parsed (CONFIG-ALIST->START-NODE-PLIST), which
+;;; process-global special does it set (APPLY-CONFIG-GLOBALS), and is it
+;;; accepted-but-unimplemented (SUPPLIED-CORE-ONLY-OPTIONS).
+;;;
+;;; This file loads before config.lisp (which reads the table); the table
+;;; itself loads after it, so a row's :APPLY function can name any special
+;;; or parser without a forward reference.
+
+(defstruct (config-option (:constructor %make-config-option))
+  (name "" :type string)
+  (key nil :type (or null keyword))        ; start-node keyword of a scalar
+  (type nil :type (or null keyword))       ; see PARSE-OPTION-VALUE
+  (min nil :type (or null integer))        ; lower bound of an :int
+  (collect nil :type (or null keyword))    ; start-node keyword of a list
+  (repeatable nil :type boolean)
+  (kind :start-node :type keyword)
+  (global nil :type symbol)                ; the special a :global row sets
+  (apply nil :type (or null function))     ; the function a :apply row calls
+  (core nil :type (or null string)))       ; Core reference, documentation only
+
+(defparameter *config-options* '()
+  "Every registered option, in definition order (the order the scalar scan
+walks, which is what lets a later alias -- -debuglogfile after -logfile --
+win when both are given). src/config-options.lisp resets it before its
+rows, so a reload of the table rebuilds the list in file order; the in-place
+replacement in REGISTER-CONFIG-OPTION is for a single re-evaluated form.")
+
+(defun register-config-option (option)
+  "Add OPTION to *CONFIG-OPTIONS*, replacing an earlier definition of the
+same name in place so a warm reload never duplicates a row."
+  (let ((cell (member (config-option-name option) *config-options*
+                      :key #'config-option-name :test #'string=)))
+    (if cell
+        (setf (car cell) option)
+        (setf *config-options* (append *config-options* (list option))))
+    option))
+
+(define-condition option-definition-error (program-error)
+  ((name :initarg :name :reader option-definition-error-name)
+   (detail :initarg :detail :reader option-definition-error-detail))
+  (:report (lambda (c stream)
+             (format stream "define-option ~A: ~A"
+                     (option-definition-error-name c)
+                     (option-definition-error-detail c))))
+  (:documentation "A DEFINE-OPTION form that contradicts itself, signalled
+at macroexpansion time."))
+
+(defmacro define-option (name &key key type min collect repeatable (kind nil kind-p)
+                                   global apply core)
+  "Register the option NAME (lower-case, as it appears after the dash).
+
+KEY/TYPE: the start-node keyword and value type of a scalar option, MIN the
+lower bound of an :int. COLLECT: the keyword under which every occurrence
+is listed (implies REPEATABLE). GLOBAL: the special APPLY-CONFIG-GLOBALS
+sets to the parsed value when the option is present; APPLY: a function it
+calls instead -- with the parsed value (the raw string when there is no
+TYPE) for a scalar option, with the list of every raw value, present or
+not, for a repeatable one. KIND defaults to :START-NODE when KEY or COLLECT
+is given, :GLOBAL otherwise."
+  (check-type name string)
+  (flet ((bad (detail) (error 'option-definition-error :name name :detail detail)))
+    (when (and collect (not repeatable)) (bad "a :collect option must be :repeatable"))
+    (when (and key (null type)) (bad "a :key option needs a :type"))
+    (when (and global apply) (bad ":global and :apply are alternatives"))
+    (when (and min (not (eq type :int))) (bad ":min needs :type :int"))
+    (when (and repeatable global) (bad "a repeatable option sets its special through :apply"))
+    (when (and (or global apply) key) (bad "a :key option is applied by start-node, not here")))
+  `(register-config-option
+    (%make-config-option :name ,name :key ,key :type ,type :min ,min :collect ,collect
+                         :repeatable ,(and repeatable t)
+                         :kind ,(if kind-p kind (if (or key collect) :start-node :global))
+                         :global ',global
+                         :apply ,apply
+                         :core ,core)))
+
+(defmacro define-core-only-options (&rest names)
+  "Register NAMES as options bitcoind accepts that this node recognises but
+does NOT implement. They exist so an unknown-option HARD ERROR does not stop
+a node started with an ordinary Core command line -- Core's functional test
+framework passes -logtimemicros, -logthreadnames, -logsourcelocations,
+-debugexclude and -loglevel to EVERY node it starts (test_node.py:68-108),
+and 128 more flags across individual tests. Accepting is not implementing:
+SUPPLIED-CORE-ONLY-OPTIONS reports which of these an operator actually
+passed so startup can say so out loud."
+  `(progn ,@(loop for n in names
+                  collect `(define-option ,n :kind :core-only))))
+
+(defun find-config-option (name)
+  "The registered option called NAME (lower-case, no dashes), or NIL."
+  (find name *config-options* :key #'config-option-name :test #'string=))
+
+(defun config-option-repeatable-p (name)
+  "T when every occurrence of NAME is meaningful (Core GetArgs list-options);
+all other repeated command-line options collapse to their LAST occurrence
+(Core GetArg on the command line takes span.end()[-1], settings.cpp:193 -- a
+repeated config-FILE key instead keeps the FIRST, which parse-bitcoin-conf's
+in-order alist gives assoc for free)."
+  (let ((o (find-config-option name)))
+    (and o (config-option-repeatable o))))
+
+(defun core-only-option-p (name)
+  "T when NAME is an option bitcoind accepts and we do not implement."
+  (let ((o (find-config-option (string-downcase name))))
+    (and o (eq (config-option-kind o) :core-only))))
+
+(defun scalar-key-options ()
+  "The options that feed a start-node keyword from their last occurrence, in
+definition order."
+  (remove-if-not #'config-option-key *config-options*))
+
+(defun collected-key-options ()
+  "The options whose every occurrence is listed under a start-node keyword."
+  (remove-if-not #'config-option-collect *config-options*))
+
+(defun global-options ()
+  "The options APPLY-CONFIG-GLOBALS applies: every row with a :global
+special or an :apply function, in definition order."
+  (remove-if-not (lambda (o) (or (config-option-global o) (config-option-apply o)))
+                 *config-options*))

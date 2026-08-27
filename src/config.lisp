@@ -1284,14 +1284,8 @@ resolved network. Honors -server (enable RPC on the default port when no
       (dolist (option (scalar-key-options))
         (let ((cell (lookup (config-option-name option))))
           (when cell
-            (let ((raw (cdr cell)))
-              (setf (getf plist (config-option-key option))
-                    (ecase (config-option-type option)
-                      (:string raw)
-                      (:bool (conf-parse-bool raw))
-                      (:int (conf-parse-int raw))
-                      (:loglevel (conf-parse-loglevel raw))
-                      (:loglevel-global (conf-parse-loglevel-global raw))))))))
+            (setf (getf plist (config-option-key option))
+                  (parse-option-value option (cdr cell))))))
       ;; -port must be a real port number (Core init.cpp InitError
       ;; "Invalid port specified in -port").
       (let ((port (getf plist :port)))
@@ -1389,310 +1383,85 @@ resolved network. Honors -server (enable RPC on the default port when no
           (setf (getf plist :listen-onion) nil))))
     plist))
 
+(defun parse-option-value (option raw)
+  "RAW, the string value of OPTION, parsed by the option's :TYPE. The error
+texts are Core's: \"Invalid amount for -x=v\" for a fee that ParseMoney
+rejects, \"Invalid value for -x=v (must be a positive integer)\" for an
+:int below its :MIN."
+  (let ((name (config-option-name option)))
+    (ecase (config-option-type option)
+      ((nil :string) raw)
+      (:bool (conf-parse-bool raw))
+      (:int (let ((n (conf-parse-int raw))
+                  (min (config-option-min option)))
+              (when (and min (< n min))
+                (error "Invalid value for -~A=~A (must be a ~A integer)"
+                       name raw (if (zerop min) "non-negative" "positive")))
+              n))
+      (:money (or (conf-parse-money raw)
+                  (error "Invalid amount for -~A=~A" name raw)))
+      (:hex (bl.crypto:hex-to-bytes raw))
+      (:byte-units (conf-parse-byte-units raw))
+      (:loglevel (conf-parse-loglevel raw))
+      (:loglevel-global (conf-parse-loglevel-global raw)))))
+
+(defun apply-option-globals (merged)
+  "Apply every :GLOBAL / :APPLY row of the option table to the MERGED config
+alist, in table order: a present scalar option sets its special (or is
+handed to its function) parsed by PARSE-OPTION-VALUE; a repeatable option's
+function always runs, with the list of every raw value."
+  (dolist (option (global-options))
+    (let ((name (config-option-name option)))
+      (if (config-option-repeatable option)
+          (funcall (config-option-apply option)
+                   (loop for (k . v) in merged when (string= k name) collect v))
+          (let ((cell (assoc name merged :test #'string=)))
+            (when cell
+              (let ((value (parse-option-value option (cdr cell))))
+                (if (config-option-global option)
+                    (setf (symbol-value (config-option-global option)) value)
+                    (funcall (config-option-apply option) value)))))))))
+
 (defun apply-config-globals (merged)
-  "Set the process-global policy/consensus config specials from the MERGED config
-alist. These options have no start-node keyword because they configure global
-specials directly: -datacarrier, -datacarriersize, -permitbaremultisig,
--limitclustercount/-limitclustersize (cluster mempool acceptance limits),
--signetchallenge (a custom signet block-challenge), the SOCKS5 proxy
-options -proxy/-onion/-proxyrandomize (networking's *proxy*/*onion-proxy*),
-the network-reachability options -onlynet (repeatable)/-cjdnsreachable
-(networking's *reachable-networks*/*cjdns-reachable*), plus the Wave-10
-wires: -assumevalid/-minimumchainwork (consensus overrides), -mempoolexpiry,
--maxmempool, -minrelaytxfee, -blockmintxfee, -blockmaxweight,
--blockreservedweight, -bantime, -uacomment (repeatable),
--dnsseed/-fixedseeds, -stopatheight, -port, and -externalip (repeatable).
+  "Set the process-global policy/consensus config specials from the MERGED
+config alist: first every option that stands alone (the :GLOBAL / :APPLY
+rows of src/config-options.lisp -- policy, consensus overrides, networking
+and mempool limits, in table order), then the options whose effect depends
+on another option, in Core's order (APPLY-PARAMETER-INTERACTIONS).
 CLI-over-file precedence is already applied in MERGED. Called at startup by
 start-node-from-args."
+  (apply-option-globals merged)
+  (apply-parameter-interactions merged))
+
+(defun apply-parameter-interactions (merged)
+  "The options whose value depends on ANOTHER option (Core init.cpp Step 2
+\"parameter interactions\" and the proxy / reachability block of Step 6),
+applied after APPLY-OPTION-GLOBALS so each present-case row has already
+run and only the soft-set and consistency halves remain, in this order:
+the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
+-connect / -maxconnections, -proxy / -onion / -proxyrandomize,
+-cjdnsreachable, and -onlynet with its clearnet privacy check."
   (flet ((lk (k) (let ((c (assoc k merged :test #'string=))) (and c (cdr c)))))
-    (let ((v (lk "datacarrier")))
-      (when v (setf *accept-datacarrier* (conf-parse-bool v))))
-    (let ((v (lk "datacarriersize")))
-      (when v (setf *max-datacarrier-bytes* (conf-parse-int v))))
-    (let ((v (lk "permitbaremultisig")))
-      (when v (setf *permit-bare-multisig* (conf-parse-bool v))))
-    ;; Cluster mempool limits: -limitclustercount (transactions, hard-capped
-    ;; at 64) and -limitclustersize (kvB) bound every connected component of
-    ;; unconfirmed transactions (Core mempool_args.cpp:35-37 + the cap check
-    ;; at :110-112, init.cpp:658-659). Read by make-mempool, which is created
-    ;; after this runs at startup.
-    (let ((v (lk "limitclustercount")))
-      (when v
-        (let ((n (conf-parse-int v)))
-          (unless (<= 1 n 64)
-            (error "limitclustercount must be between 1 and 64"))
-          (setf bl.mp:*cluster-count-limit* n))))
-    (let ((v (lk "limitclustersize")))
-      (when v
-        (let ((kvb (conf-parse-int v)))
-          (unless (plusp kvb)
-            (error "limitclustersize must be a positive number of kvB"))
-          (setf bl.mp:*cluster-size-limit* (* kvb 1000)))))
-    (let ((v (lk "signetchallenge")))
-      (when v (setf bl.val:*signet-challenge*
-                    (bl.crypto:hex-to-bytes v))))
-    ;; -assumevalid: a block hash (up to 64 hex digits, Core FromUserHex
-    ;; left-pads) below which block scripts are assumed valid, or 0 to
-    ;; disable the skip entirely (Core chainstatemanager_args.cpp:40-46).
-    ;; Stored in WIRE byte order (the block-index key form).
-    (let ((v (lk "assumevalid")))
-      (when v
-        (let ((display (conf-parse-user-hex v)))
-          (unless display
-            (error "Invalid assumevalid block hash specified (~A), must be up to 64 hex digits (or 0 to disable)" v))
-          (setf *assumevalid-override*
-                (if (every #'zerop display)
-                    nil                              ; assumevalid=0: always verify
-                    (bl.crypto:reverse-bytes display))))))
-    ;; -minimumchainwork: hex work floor overriding the per-network
-    ;; nMinimumChainWork (Core chainstatemanager_args.cpp:32-38).
-    (let ((v (lk "minimumchainwork")))
-      (when v
-        (let ((display (conf-parse-user-hex v)))
-          (unless display
-            (error "Invalid minimum work specified (~A), must be up to 64 hex digits" v))
-          (setf *minimum-chain-work-override*
-                (loop with acc = 0
-                      for b across display
-                      do (setf acc (+ (ash acc 8) b))
-                      finally (return acc))))))
-    ;; -mempoolexpiry: hours before an untouched mempool entry is dropped
-    ;; (Core mempool_args.cpp:57, default DEFAULT_MEMPOOL_EXPIRY_HOURS 336).
-    (let ((v (lk "mempoolexpiry")))
-      (when v (setf bl.mp:*mempool-expiry-hours* (conf-parse-int v))))
     ;; -zmqpub<topic>=<address> [+ -zmqpub<topic>hwm]: recorded now, bound by
     ;; start-node. Nothing is loaded or opened here, so a node with no ZMQ
     ;; options never touches libzmq at all.
     (setf *zmq-publisher-specs* (zmq-specs-from-config merged))
-    ;; -maxmempool: megabytes of mempool MEMORY usage (Core mempool_args.cpp,
-    ;; DEFAULT_MAX_MEMPOOL_SIZE_MB = 300). Under -blocksonly Core soft-sets it
-    ;; to DEFAULT_BLOCKSONLY_MAX_MEMPOOL_SIZE_MB = 5 (init.cpp:826) -- "soft",
-    ;; so an explicit -maxmempool still wins. Read by make-mempool.
-    (let ((v (lk "maxmempool")))
-      (cond
-        (v (let ((mb (conf-parse-int v)))
-             (when (minusp mb)
-               (error "Invalid value for -maxmempool=~A" v))
-             (setf bl.mp:*max-mempool-bytes* (* mb 1000 1000))))
-        ((let ((b (lk "blocksonly"))) (and b (conf-parse-bool b)))
-         (setf bl.mp:*max-mempool-bytes* (* 5 1000 1000)))))
-    ;; -minrelaytxfee: BTC/kvB (Core ParseMoney, mempool_args.cpp:69-81).
-    ;; Read at MAKE-MEMPOOL time like the cluster limits.
-    (let ((v (lk "minrelaytxfee")))
-      (when v
-        (let ((sats (conf-parse-money v)))
-          (unless sats
-            (error "Invalid amount for -minrelaytxfee=~A" v))
-          (setf bl.mp:*min-relay-fee-rate* sats))))
-    ;; -blockmintxfee: BTC/kvB floor for block-template selection (Core
-    ;; miner.cpp:102-104, default DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/kvB).
-    (let ((v (lk "blockmintxfee")))
-      (when v
-        (let ((sats (conf-parse-money v)))
-          (unless sats
-            (error "Invalid amount for -blockmintxfee=~A" v))
-          (setf bl.mining:*block-min-tx-fee-rate* sats))))
-    ;; -blockmaxweight / -blockreservedweight: block-template SELECTION budgets
-    ;; (Core init.cpp:1079-1093). Neither relaxes consensus -- a block we build
-    ;; is still validated against +max-block-weight+ like any other -- so the
-    ;; only checks are Core's: never above the consensus maximum, and never
-    ;; reserve less than MINIMUM_BLOCK_RESERVED_WEIGHT, which could not fit a
-    ;; header plus a realistic coinbase.
-    (let ((v (lk "blockmaxweight")))
-      (when v
-        (let ((w (conf-parse-int v)))
-          (when (> w bl.val:+max-block-weight+)
-            (error "Specified -blockmaxweight (~D) exceeds consensus maximum block weight (~D)"
-                   w bl.val:+max-block-weight+))
-          (setf bl.mining:*block-max-weight* w))))
-    (let ((v (lk "blockreservedweight")))
-      (when v
-        (let ((w (conf-parse-int v)))
-          (when (> w bl.val:+max-block-weight+)
-            (error "Specified -blockreservedweight (~D) exceeds consensus maximum block weight (~D)"
-                   w bl.val:+max-block-weight+))
-          (when (< w bl.mining:+minimum-block-reserved-weight+)
-            (error "Specified -blockreservedweight (~D) is lower than minimum safety value of (~D)"
-                   w bl.mining:+minimum-block-reserved-weight+))
-          (setf bl.mining:*block-reserved-weight* w))))
-    ;; -maxtxfee: BTC, absolute cap on any wallet tx fee (Core init: BTC via
-    ;; ParseMoney, default DEFAULT_TRANSACTION_MAXFEE = 0.1 BTC).
-    (let ((v (lk "maxtxfee")))
-      (when v
-        (let ((sats (conf-parse-money v)))
-          (unless sats
-            (error "Invalid amount for -maxtxfee=~A" v))
-          (setf *wallet-max-tx-fee* sats))))
-    ;; -fallbackfee: BTC/kvB used when fee estimation has no data (Core
-    ;; wallet.cpp:3005-3014); 0 keeps the fallback disabled.
-    (let ((v (lk "fallbackfee")))
-      (when v
-        (let ((sats (conf-parse-money v)))
-          (unless sats
-            (error "Invalid amount for -fallbackfee=~A" v))
-          (setf *wallet-fallback-fee* sats))))
-    ;; -dustrelayfee: BTC/kvB below which an output is dust (Core
-    ;; DUST_RELAY_TX_FEE). Relay policy, not consensus, which is why the value
-    ;; it sets is a DEFPARAMETER rather than a DEFCONSTANT.
-    (let ((v (lk "dustrelayfee")))
-      (when v
-        (let ((sats (conf-parse-money v)))
-          (unless sats
-            (error "Invalid amount for -dustrelayfee=~A" v))
-          (setf bl.val::+dust-relay-fee-rate+ sats))))
-    ;; -incrementalrelayfee: BTC/kvB a replacement must beat the original by
-    ;; (Core DEFAULT_INCREMENTAL_RELAY_FEE).
-    (let ((v (lk "incrementalrelayfee")))
-      (when v
-        (let ((sats (conf-parse-money v)))
-          (unless sats
-            (error "Invalid amount for -incrementalrelayfee=~A" v))
-          (setf bl.mp::+incremental-relay-fee-rate+ sats))))
-    ;; -bytespersigop: equivalent bytes charged per weighted sigop (Core
-    ;; DEFAULT_BYTES_PER_SIGOP, policy.h:49).
-    (let ((v (lk "bytespersigop")))
-      (when v
-        (let ((n (conf-parse-int v)))
-          (unless (and n (plusp n))
-            (error "Invalid value for -bytespersigop=~A (must be a positive integer)" v))
-          (setf bl.mp::+bytes-per-sigop+ n))))
-    ;; -whitelistrelay / -whitelistforcerelay (Core net_permissions.h:20-22).
-    (let ((v (lk "whitelistrelay")))
-      (when v (setf bl.net::*whitelist-relay* (conf-parse-bool v))))
-    (let ((v (lk "whitelistforcerelay")))
-      (when v
-        (setf bl.net::*whitelist-force-relay* (conf-parse-bool v))))
-    ;; -par: how many script-check worker threads. Core's semantics —
-    ;; 0 means one per core, a NEGATIVE value leaves that many cores free, and
-    ;; the result is clamped to MAX_SCRIPTCHECK_THREADS. Reading the negative
-    ;; form as an absolute value would oversubscribe the very box the operator
-    ;; asked to leave headroom on.
-    (let ((v (lk "par")))
-      (when v
-        (let ((n (bl.val::parse-par-threads (conf-parse-int v))))
-          (setf bl.val::+parallel-validation-workers+ n)
-          ;; Core: -par=1 means no extra threads at all.
-          (setf *parallel-block-validation* (> n 1)))))
-    ;; -acceptnonstdtxn: relay and mine transactions this node would otherwise
-    ;; refuse as non-standard. Core REFUSES TO START with it on a non-test
-    ;; chain (mempool_args.cpp:102-104); an error here, not a warning, because
-    ;; a mainnet node quietly relaying non-standard transactions has its
-    ;; transactions dropped by every peer and does not find out.
-    (let ((v (lk "acceptnonstdtxn")))
-      (when v
-        (let ((accept (conf-parse-bool v)))
-          (when (and accept (member *network* '(:mainnet)))
-            (error "acceptnonstdtxn is not currently supported for ~(~A~) chain"
-                   *network*))
-          (setf bl.val::*require-standard* (not accept)))))
-    ;; -forcednsseed: query the DNS seeds even with a full address book. It
-    ;; does NOT override -dnsseed=0, which is Core's precedence too.
-    (let ((v (lk "forcednsseed")))
-      (when v (setf *force-dns-seed* (conf-parse-bool v))))
-    ;; -maxuploadtarget: the 24h outbound budget. Core parses it with
-    ;; ParseByteUnits defaulting to M, so a bare number is MEBIbytes — reading
-    ;; it as bytes would silence the option on every ordinary command line.
-    (let ((v (lk "maxuploadtarget")))
-      (when v
-        (setf bl.net::*max-upload-target*
-              (conf-parse-byte-units v))))
-    ;; -peertimeout: seconds a peer has to complete the version handshake
-    ;; (Core DEFAULT_PEER_CONNECT_TIMEOUT, net.h:87).
-    (let ((v (lk "peertimeout")))
-      (when v
-        (let ((n (conf-parse-int v)))
-          (unless (and n (plusp n))
-            (error "Invalid value for -peertimeout=~A (must be a positive integer)" v))
-          (setf +handshake-timeout-seconds+ n))))
-    ;; -maxsendbuffer: per-connection cap on buffered unsent bytes. Core's
-    ;; value is in KILOBYTES and it multiplies by 1000, not 1024
-    ;; (init.cpp:2105, DEFAULT_MAXSENDBUFFER = 1000 -> 1,000,000 bytes).
-    (let ((v (lk "maxsendbuffer")))
-      (when v
-        (let ((n (conf-parse-int v)))
-          (unless (and n (plusp n))
-            (error "Invalid value for -maxsendbuffer=~A (must be a positive integer)" v))
-          (setf bl.net::+max-send-buffer-bytes+ (* n 1000)))))
-    ;; -maxtipage: how old the tip may be before the node still calls itself in
-    ;; IBD (Core DEFAULT_MAX_TIP_AGE, kernel/chainstatemanager_opts.h:24).
-    (let ((v (lk "maxtipage")))
-      (when v
-        (let ((n (conf-parse-int v)))
-          (unless (and n (>= n 0))
-            (error "Invalid value for -maxtipage=~A (must be a non-negative integer)" v))
-          (setf bl.net::+max-tip-age-seconds+ n))))
-    ;; -maxsigcachesize: MiB of signature cache (Core's knob is bytes split
-    ;; across two caches; ours is one, counted in ENTRIES). A cache entry is a
-    ;; 32-byte key, which is what Core's CuckooCache element is too, so the
-    ;; conversion is bytes/32 — the real heap cost is higher because a Lisp
-    ;; hash table is not a cuckoo table, and the option is a bound on entries
-    ;; rather than a promise about memory.
-    (let ((v (lk "maxsigcachesize")))
-      (when v
-        (let ((n (conf-parse-int v)))
-          (unless (and n (plusp n))
-            (error "Invalid value for -maxsigcachesize=~A (must be a positive integer)" v))
-          ;; Resolved at RUNTIME: this file compiles before the Coalton
-          ;; module, so the package does not exist at read time and a
-          ;; package-qualified symbol here is a READ error.
-          (let ((sym (find-symbol "+SIGNATURE-CACHE-MAX-ENTRIES+"
-                                  "BITCOIN-LISP.COALTON.INTEROP")))
-            (unless sym
-              (error "-maxsigcachesize: the signature cache is unavailable"))
-            (setf (symbol-value sym) (max 1 (floor (* n 1024 1024) 32)))))))
-    ;; -fastprune: tiny block files so a pruning test can produce many of them
-    ;; without mining a real chain (Core blockstorage.cpp:857-862). Test-only.
-    (let ((v (lk "fastprune")))
-      (when v
-        (setf bl.store:*fast-prune* (conf-parse-bool v))))
-    ;; -blocksxor: obfuscate blocksdir contents (Core DEFAULT_XOR_BLOCKSDIR).
-    (let ((v (lk "blocksxor")))
-      (when v
-        (setf bl.store:*blocks-xor* (conf-parse-bool v))))
-    ;; -bantime: default setban duration in seconds (Core banman.h:19
-    ;; DEFAULT_MISBEHAVING_BANTIME = 86400, applied when setban gets no time).
-    (let ((v (lk "bantime")))
-      (when v (setf bl.net:*default-ban-time-seconds*
-                    (conf-parse-int v))))
-    ;; -uacomment (repeatable): BIP14 subversion comments. Unsafe characters
-    ;; or an over-long result are init ERRORS (Core init.cpp:1676-1686).
-    (let ((comments (loop for (k . v) in merged
-                          when (string= k "uacomment")
-                            collect v)))
-      (dolist (cmt comments)
-        (unless (ua-comment-safe-p cmt)
-          (error "User Agent comment (~A) contains unsafe characters." cmt)))
-      (when comments
-        (let ((subversion (bl.ser:subversion-with-build-rev comments)))
-          (when (> (length subversion) +max-subversion-length+)
-            (error "Total length of network version string (~D) exceeds maximum length (~D). Reduce the number or size of uacomments."
-                   (length subversion) +max-subversion-length+))
-          (setf bl.ser:*user-agent* subversion))))
-    ;; -dnsseed / -fixedseeds: peer-discovery source gates (Core net.h:96-97).
-    (let ((v (lk "dnsseed")))
-      (cond (v (setf *dns-seed-enabled* (conf-parse-bool v)))
-            ;; The other half of the -connect interaction above: with only
-            ;; trusted nodes to dial (or connections disabled outright) there is
-            ;; nothing for a DNS seed to feed. Soft — an explicit -dnsseed=1 is
-            ;; the branch above and still wins.
-            ((or (lk "connect")
-                 (let ((m (lk "maxconnections")))
-                   (and m (<= (conf-parse-int m) 0))))
-             (setf *dns-seed-enabled* nil))))
-    (let ((v (lk "fixedseeds")))
-      (when v (setf *fixed-seeds-enabled* (conf-parse-bool v))))
-    ;; -stopatheight: shut down once the tip reaches this height (Core
-    ;; kernel_notifications.cpp:61-66).
-    (let ((v (lk "stopatheight")))
-      (when v (setf *stop-at-height* (conf-parse-int v))))
-    ;; -externalip (repeatable): addresses to advertise as our own (Core
-    ;; init.cpp:1803-1808, AddLocal LOCAL_MANUAL). Raw strings here; start-node
-    ;; resolves them once the network (and thus the listen port) is known, and
-    ;; errors on unparseable input like Core's ResolveErrMsg.
-    (setf bl.net:*external-ips*
-          (loop for (k . v) in merged
-                when (string= k "externalip")
-                  collect v))
+    ;; -maxmempool under -blocksonly: Core soft-sets it to
+    ;; DEFAULT_BLOCKSONLY_MAX_MEMPOOL_SIZE_MB = 5 (init.cpp:826) -- "soft",
+    ;; so an explicit -maxmempool (applied by its row above) still wins.
+    (unless (lk "maxmempool")
+      (let ((b (lk "blocksonly")))
+        (when (and b (conf-parse-bool b))
+          (setf bl.mp:*max-mempool-bytes* (* 5 1000 1000)))))
+    ;; -dnsseed under -connect / -maxconnections<=0: with only trusted nodes
+    ;; to dial (or connections disabled outright) there is nothing for a DNS
+    ;; seed to feed. Soft -- an explicit -dnsseed=1 was applied by its row
+    ;; and still wins.
+    (unless (lk "dnsseed")
+      (when (or (lk "connect")
+                (let ((m (lk "maxconnections")))
+                  (and m (<= (conf-parse-int m) 0))))
+        (setf *dns-seed-enabled* nil)))
     ;; -proxy: run ALL outbound P2P connections through a SOCKS5 proxy
     ;; (Bitcoin Core init.cpp:1698-1762 sets it for every network).
     ;; -noproxy / -proxy=0 clears it. -proxyrandomize (default on) enables

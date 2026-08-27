@@ -608,7 +608,6 @@ to make on purpose, so the set is pinned."
   '(("start-node" . 1227)                        ; node.lisp
     ("perform-reorg" . 465)                      ; validation/block.lisp
     ("%create-transaction-internal" . 442)       ; rpc/wallet-spend.lisp
-    ("apply-config-globals" . 387)               ; config.lisp
     ("validate-transaction-for-mempool" . 358)   ; validation/transaction.lisp
     ("run-ibd" . 345)                            ; networking/ibd.lisp (+2: keeps node-context peers live, P2c)
     ("validate-block" . 307)                     ; validation/block.lisp
@@ -708,7 +707,8 @@ byte-buf; the stream codecs and interop's private buffer only lose call sites."
 ;;; --- bare error strings -------------------------------------------------
 
 (defparameter +bare-error-baseline+
-  '(("src/config.lisp" . 36)
+  '(("src/config-options.lisp" . 11)  ; the option rows' own validations
+    ("src/config.lisp" . 15)
     ("src/crypto/" . 28)
     ("src/logging.lisp" . 3)
     ("src/mempool/" . 7)
@@ -815,11 +815,7 @@ a docstring still counts; the sources do not do that."
     ("src/coalton/interop.lisp" . "bitcoin-lisp.storage")
     ("src/config.lisp" . "bitcoin-lisp.crypto")
     ("src/config.lisp" . "bitcoin-lisp.mempool")
-    ("src/config.lisp" . "bitcoin-lisp.mining")
     ("src/config.lisp" . "bitcoin-lisp.networking")
-    ("src/config.lisp" . "bitcoin-lisp.serialization")
-    ("src/config.lisp" . "bitcoin-lisp.storage")
-    ("src/config.lisp" . "bitcoin-lisp.validation")
     ("src/validation/block.lisp" . "bitcoin-lisp.mempool")
     ("src/validation/packages.lisp" . "bitcoin-lisp.mempool")
     ("src/validation/transaction.lisp" . "bitcoin-lisp.mempool")
@@ -829,7 +825,8 @@ LATER, at the start of the cleanup. They compile because src/package.lisp
 defines every package up front, so the reader interns the symbol and the call
 resolves at run time -- which is exactly why nothing has ever flagged them.
 This is also the plan's \"which file reaches which package\" table (§4 P4):
-config.lisp loads second and names seven later packages.")
+config.lisp loads early and still names three later packages (crypto,
+mempool, networking); the option table that names the rest loads after them.")
 
 (defun %layering-violations ()
   (let ((order (%load-order)))

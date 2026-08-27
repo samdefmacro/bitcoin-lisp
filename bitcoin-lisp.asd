@@ -26,8 +26,8 @@
   :serial t
   :components ((:module "src"
                 :components
-                (;; Packages first, all of them: config.lisp (third) already
-                 ;; names most later packages, and src/package.lisp -- last,
+                (;; Packages first, all of them: config.lisp (fourth) already
+                 ;; names later packages, and src/package.lisp -- last,
                  ;; because its top package :USEs the others -- installs the
                  ;; bl.* nicknames on every package that exists by then.
                  ;; Each module's package lives next to its code.
@@ -47,7 +47,7 @@
                                (:file "chainparams")
                                (:file "context")))
                  (:file "logging")
-                 (:file "config-options")
+                 (:file "option-registry")
                  (:file "config")
                  (:file "zmq")
                  (:module "coalton"
@@ -147,6 +147,9 @@
                                (:file "rest")
                                (:file "ui")
                                (:file "server")))
+                 ;; The option table: after every module whose specials its
+                 ;; :global / :apply rows name, before the node that reads it.
+                 (:file "config-options")
                  (:file "node"))))
   :in-order-to ((test-op (test-op "bitcoin-lisp/tests"))))
 

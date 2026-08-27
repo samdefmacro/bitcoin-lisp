@@ -1,115 +1,20 @@
 (in-package #:bitcoin-lisp)
 
+;; A (re)load of this file rebuilds the whole table in file order: order is
+;; load-bearing (a later alias wins the scalar scan; APPLY-OPTION-GLOBALS
+;; walks it), and a row deleted from the file must not linger in the image.
+(setf *config-options* '())
+
 ;;;; The option table (Core ArgsManager::AddArg, init.cpp / common/args.cpp)
 ;;;
-;;; One DEFINE-OPTION per option bitcoind accepts. The table answers the
-;;; questions the rest of config.lisp used to answer from four separate
-;;; lists that had drifted apart (two options were in two of them at once):
-;;; is this name known at all (CHECK-CLI-ARGS), does every occurrence count
-;;; (PARSE-CLI-ARGS, Core GetArgs), which start-node keyword does it feed
-;;; and how is the value parsed (CONFIG-ALIST->START-NODE-PLIST), and is it
-;;; accepted-but-unimplemented (SUPPLIED-CORE-ONLY-OPTIONS).
-;;;
-;;; :KEY is the start-node keyword a scalar option feeds (its LAST command
-;;; line occurrence wins, Core GetArg); :COLLECT the keyword under which every
-;;; occurrence is gathered into a list (Core GetArgs); :REPEATABLE says the
-;;; parser must keep every occurrence at all. :KIND is where the value is
-;;; consumed when it is not a start-node keyword: :GLOBAL by
-;;; APPLY-CONFIG-GLOBALS or START-NODE-FROM-ARGS straight from the merged
-;;; alist, :SELECTOR by the network / entry-point logic, :CORE-ONLY nowhere.
-
-(defstruct (config-option (:constructor %make-config-option))
-  (name "" :type string)
-  (key nil :type (or null keyword))
-  (type nil :type (or null keyword))       ; :string :bool :int :loglevel-global
-  (collect nil :type (or null keyword))
-  (repeatable nil :type boolean)
-  (kind :start-node :type keyword)
-  (core nil :type (or null string)))       ; Core reference, documentation only
-
-(defparameter *config-options* '()
-  "Every registered option, in definition order (the order the scalar scan
-walks, which is what lets a later alias -- -debuglogfile after -logfile --
-win when both are given). DEFPARAMETER, so reloading this file rebuilds the
-list in file order; the in-place replacement in REGISTER-CONFIG-OPTION is
-for a single re-evaluated form.")
-
-(defun register-config-option (option)
-  "Add OPTION to *CONFIG-OPTIONS*, replacing an earlier definition of the
-same name in place so a warm reload never duplicates a row."
-  (let ((cell (member (config-option-name option) *config-options*
-                      :key #'config-option-name :test #'string=)))
-    (if cell
-        (setf (car cell) option)
-        (setf *config-options* (append *config-options* (list option))))
-    option))
-
-(define-condition option-definition-error (program-error)
-  ((name :initarg :name :reader option-definition-error-name)
-   (detail :initarg :detail :reader option-definition-error-detail))
-  (:report (lambda (c stream)
-             (format stream "define-option ~A: ~A"
-                     (option-definition-error-name c)
-                     (option-definition-error-detail c))))
-  (:documentation "A DEFINE-OPTION form that contradicts itself, signalled
-at macroexpansion time."))
-
-(defmacro define-option (name &key key type collect repeatable (kind nil kind-p) core)
-  "Register the option NAME (lower-case, as it appears after the dash).
-KEY/TYPE: the start-node keyword and value type of a scalar option; COLLECT:
-the keyword under which every occurrence is listed (implies REPEATABLE);
-KIND defaults to :START-NODE when KEY or COLLECT is given, :GLOBAL otherwise."
-  (check-type name string)
-  (when (and collect (not repeatable))
-    (error 'option-definition-error :name name
-                                    :detail "a :collect option must be :repeatable"))
-  (when (and key (null type))
-    (error 'option-definition-error :name name
-                                    :detail "a :key option needs a :type"))
-  `(register-config-option
-    (%make-config-option :name ,name :key ,key :type ,type :collect ,collect
-                         :repeatable ,(and repeatable t)
-                         :kind ,(if kind-p kind (if (or key collect) :start-node :global))
-                         :core ,core)))
-
-(defmacro define-core-only-options (&rest names)
-  "Register NAMES as options bitcoind accepts that this node recognises but
-does NOT implement. They exist so an unknown-option HARD ERROR does not stop
-a node started with an ordinary Core command line -- Core's functional test
-framework passes -logtimemicros, -logthreadnames, -logsourcelocations,
--debugexclude and -loglevel to EVERY node it starts (test_node.py:68-108),
-and 128 more flags across individual tests. Accepting is not implementing:
-SUPPLIED-CORE-ONLY-OPTIONS reports which of these an operator actually
-passed so startup can say so out loud."
-  `(progn ,@(loop for n in names
-                  collect `(define-option ,n :kind :core-only))))
-
-(defun find-config-option (name)
-  "The registered option called NAME (lower-case, no dashes), or NIL."
-  (find name *config-options* :key #'config-option-name :test #'string=))
-
-(defun config-option-repeatable-p (name)
-  "T when every occurrence of NAME is meaningful (Core GetArgs list-options);
-all other repeated command-line options collapse to their LAST occurrence
-(Core GetArg on the command line takes span.end()[-1], settings.cpp:193 -- a
-repeated config-FILE key instead keeps the FIRST, which parse-bitcoin-conf's
-in-order alist gives assoc for free)."
-  (let ((o (find-config-option name)))
-    (and o (config-option-repeatable o))))
-
-(defun core-only-option-p (name)
-  "T when NAME is an option bitcoind accepts and we do not implement."
-  (let ((o (find-config-option (string-downcase name))))
-    (and o (eq (config-option-kind o) :core-only))))
-
-(defun scalar-key-options ()
-  "The options that feed a start-node keyword from their last occurrence, in
-definition order."
-  (remove-if-not #'config-option-key *config-options*))
-
-(defun collected-key-options ()
-  "The options whose every occurrence is listed under a start-node keyword."
-  (remove-if-not #'config-option-collect *config-options*))
+;;; One DEFINE-OPTION per option bitcoind accepts; the mechanism and the
+;;; questions the table answers are in src/option-registry.lisp. Rows with
+;;; :KEY / :COLLECT feed start-node keywords; rows with :GLOBAL / :APPLY set
+;;; process-global specials from APPLY-CONFIG-GLOBALS; :KIND :SELECTOR rows
+;;; are consumed by the network / entry-point logic and :CORE-ONLY rows
+;;; nowhere. Options whose effect depends on ANOTHER option (Core init.cpp
+;;; Step 2 "parameter interactions") keep their present-case row here and
+;;; their soft-set / consistency half in APPLY-PARAMETER-INTERACTIONS.
 
 ;;; --- Network selection and entry-point specials -------------------------
 ;;; Handled before and around the spec scan (RESOLVE-NETWORK-FROM-CONFIG,
@@ -245,43 +150,169 @@ definition order."
 (define-option "whitebind" :collect :whitebind :repeatable t)
 
 ;;; --- Process-global options -----------------------------------------------
-;;; Read by name from the merged alist: APPLY-CONFIG-GLOBALS for the policy,
-;;; consensus and networking specials, START-NODE-FROM-ARGS for the RPC and
-;;; wallet knobs.
+;;; Applied by APPLY-CONFIG-GLOBALS: a :GLOBAL row sets its special to the
+;;; parsed value when the option is present; an :APPLY row's function gets
+;;; the parsed value (the raw string without a :TYPE). PARSE-OPTION-VALUE
+;;; owns the shared error texts ("Invalid amount for -x=v", "Invalid value
+;;; for -x=v (must be a positive integer)"); a row whose text Core words
+;;; differently keeps its own. The RPC and wallet knobs at the end are read
+;;; by name in START-NODE-FROM-ARGS.
 
-(define-option "datacarrier")
-(define-option "datacarriersize")
-(define-option "permitbaremultisig")
-(define-option "limitclustercount")
-(define-option "limitclustersize")
-(define-option "signetchallenge")
+(define-option "datacarrier" :type :bool :global *accept-datacarrier*)
+(define-option "datacarriersize" :type :int :global *max-datacarrier-bytes*)
+(define-option "permitbaremultisig" :type :bool :global *permit-bare-multisig*)
+;; Cluster mempool limits: -limitclustercount (transactions, hard-capped at
+;; 64) and -limitclustersize (kvB) bound every connected component of
+;; unconfirmed transactions (Core mempool_args.cpp:35-37 + the cap check at
+;; :110-112, init.cpp:658-659). Read by make-mempool, which is created after
+;; this runs at startup.
+(define-option "limitclustercount" :type :int
+  :apply (lambda (n)
+           (unless (<= 1 n 64)
+             (error "limitclustercount must be between 1 and 64"))
+           (setf bl.mp:*cluster-count-limit* n)))
+(define-option "limitclustersize" :type :int
+  :apply (lambda (kvb)
+           (unless (plusp kvb)
+             (error "limitclustersize must be a positive number of kvB"))
+           (setf bl.mp:*cluster-size-limit* (* kvb 1000))))
+;; -signetchallenge: a custom signet block-challenge script.
+(define-option "signetchallenge" :type :hex :global bl.val:*signet-challenge*)
+;; -proxy / -onion / -proxyrandomize / -onlynet / -cjdnsreachable form one
+;; interaction (each reads the others): APPLY-PARAMETER-INTERACTIONS.
 (define-option "proxy")
 (define-option "onion")
 (define-option "proxyrandomize")
 (define-option "onlynet" :repeatable t)
 (define-option "cjdnsreachable")
-(define-option "assumevalid")
-(define-option "minimumchainwork")
-(define-option "mempoolexpiry")
-(define-option "maxmempool")
-(define-option "minrelaytxfee")
-(define-option "blockmintxfee")
-(define-option "blockmaxweight")
-(define-option "blockreservedweight")
-(define-option "maxtxfee")
-(define-option "fallbackfee")
-(define-option "bantime")
-(define-option "uacomment" :repeatable t)
-(define-option "dustrelayfee")
-(define-option "incrementalrelayfee")
-(define-option "bytespersigop")
-(define-option "maxtipage")
-(define-option "maxsigcachesize")
-(define-option "fastprune")
-(define-option "blocksxor")
-(define-option "peertimeout")
-(define-option "maxsendbuffer")
-(define-option "maxuploadtarget")
+;; -assumevalid: a block hash (up to 64 hex digits, Core FromUserHex
+;; left-pads) below which block scripts are assumed valid, or 0 to disable
+;; the skip entirely (Core chainstatemanager_args.cpp:40-46). Stored in WIRE
+;; byte order (the block-index key form).
+(define-option "assumevalid"
+  :apply (lambda (v)
+           (let ((display (conf-parse-user-hex v)))
+             (unless display
+               (error "Invalid assumevalid block hash specified (~A), must be up to 64 hex digits (or 0 to disable)" v))
+             (setf *assumevalid-override*
+                   (if (every #'zerop display)
+                       nil                     ; assumevalid=0: always verify
+                       (bl.crypto:reverse-bytes display))))))
+;; -minimumchainwork: hex work floor overriding the per-network
+;; nMinimumChainWork (Core chainstatemanager_args.cpp:32-38).
+(define-option "minimumchainwork"
+  :apply (lambda (v)
+           (let ((display (conf-parse-user-hex v)))
+             (unless display
+               (error "Invalid minimum work specified (~A), must be up to 64 hex digits" v))
+             (setf *minimum-chain-work-override*
+                   (loop with acc = 0
+                         for b across display
+                         do (setf acc (+ (ash acc 8) b))
+                         finally (return acc))))))
+;; -mempoolexpiry: hours before an untouched mempool entry is dropped (Core
+;; mempool_args.cpp:57, default DEFAULT_MEMPOOL_EXPIRY_HOURS 336).
+(define-option "mempoolexpiry" :type :int :global bl.mp:*mempool-expiry-hours*)
+;; -maxmempool: megabytes of mempool MEMORY usage (Core mempool_args.cpp,
+;; DEFAULT_MAX_MEMPOOL_SIZE_MB = 300). Read by make-mempool. Under
+;; -blocksonly Core soft-sets it to 5 MB -- the absent case, in
+;; APPLY-PARAMETER-INTERACTIONS.
+(define-option "maxmempool"
+  :apply (lambda (v)
+           (let ((mb (conf-parse-int v)))
+             (when (minusp mb)
+               (error "Invalid value for -maxmempool=~A" v))
+             (setf bl.mp:*max-mempool-bytes* (* mb 1000 1000)))))
+;; -minrelaytxfee: BTC/kvB (Core ParseMoney, mempool_args.cpp:69-81). Read
+;; at MAKE-MEMPOOL time like the cluster limits.
+(define-option "minrelaytxfee" :type :money :global bl.mp:*min-relay-fee-rate*)
+;; -blockmintxfee: BTC/kvB floor for block-template selection (Core
+;; miner.cpp:102-104, default DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/kvB).
+(define-option "blockmintxfee" :type :money :global bl.mining:*block-min-tx-fee-rate*)
+;; -blockmaxweight / -blockreservedweight: block-template SELECTION budgets
+;; (Core init.cpp:1079-1093). Neither relaxes consensus -- a block we build
+;; is still validated against +max-block-weight+ like any other -- so the
+;; only checks are Core's: never above the consensus maximum, and never
+;; reserve less than MINIMUM_BLOCK_RESERVED_WEIGHT, which could not fit a
+;; header plus a realistic coinbase.
+(define-option "blockmaxweight" :type :int
+  :apply (lambda (w)
+           (when (> w bl.val:+max-block-weight+)
+             (error "Specified -blockmaxweight (~D) exceeds consensus maximum block weight (~D)"
+                    w bl.val:+max-block-weight+))
+           (setf bl.mining:*block-max-weight* w)))
+(define-option "blockreservedweight" :type :int
+  :apply (lambda (w)
+           (when (> w bl.val:+max-block-weight+)
+             (error "Specified -blockreservedweight (~D) exceeds consensus maximum block weight (~D)"
+                    w bl.val:+max-block-weight+))
+           (when (< w bl.mining:+minimum-block-reserved-weight+)
+             (error "Specified -blockreservedweight (~D) is lower than minimum safety value of (~D)"
+                    w bl.mining:+minimum-block-reserved-weight+))
+           (setf bl.mining:*block-reserved-weight* w)))
+;; -maxtxfee: BTC, absolute cap on any wallet tx fee (Core init: BTC via
+;; ParseMoney, default DEFAULT_TRANSACTION_MAXFEE = 0.1 BTC).
+(define-option "maxtxfee" :type :money :global *wallet-max-tx-fee*)
+;; -fallbackfee: BTC/kvB used when fee estimation has no data (Core
+;; wallet.cpp:3005-3014); 0 keeps the fallback disabled.
+(define-option "fallbackfee" :type :money :global *wallet-fallback-fee*)
+;; -bantime: default setban duration in seconds (Core banman.h:19
+;; DEFAULT_MISBEHAVING_BANTIME = 86400, applied when setban gets no time).
+(define-option "bantime" :type :int :global bl.net:*default-ban-time-seconds*)
+;; -uacomment (repeatable): BIP14 subversion comments. Unsafe characters or
+;; an over-long result are init ERRORS (Core init.cpp:1676-1686).
+(define-option "uacomment" :repeatable t
+  :apply (lambda (comments)
+           (dolist (cmt comments)
+             (unless (ua-comment-safe-p cmt)
+               (error "User Agent comment (~A) contains unsafe characters." cmt)))
+           (when comments
+             (let ((subversion (bl.ser:subversion-with-build-rev comments)))
+               (when (> (length subversion) +max-subversion-length+)
+                 (error "Total length of network version string (~D) exceeds maximum length (~D). Reduce the number or size of uacomments."
+                        (length subversion) +max-subversion-length+))
+               (setf bl.ser:*user-agent* subversion)))))
+;; -dustrelayfee: BTC/kvB below which an output is dust (Core
+;; DUST_RELAY_TX_FEE). Relay policy, not consensus, which is why the value it
+;; sets is a DEFPARAMETER rather than a DEFCONSTANT.
+(define-option "dustrelayfee" :type :money :global bl.val::+dust-relay-fee-rate+)
+;; -incrementalrelayfee: BTC/kvB a replacement must beat the original by
+;; (Core DEFAULT_INCREMENTAL_RELAY_FEE).
+(define-option "incrementalrelayfee" :type :money :global bl.mp::+incremental-relay-fee-rate+)
+;; -bytespersigop: equivalent bytes charged per weighted sigop (Core
+;; DEFAULT_BYTES_PER_SIGOP, policy.h:49).
+(define-option "bytespersigop" :type :int :min 1 :global bl.mp::+bytes-per-sigop+)
+;; -maxtipage: how old the tip may be before the node still calls itself in
+;; IBD (Core DEFAULT_MAX_TIP_AGE, kernel/chainstatemanager_opts.h:24).
+(define-option "maxtipage" :type :int :min 0 :global bl.net::+max-tip-age-seconds+)
+;; -maxsigcachesize: MiB of signature cache (Core's knob is bytes split
+;; across two caches; ours is one, counted in ENTRIES). A cache entry is a
+;; 32-byte key, which is what Core's CuckooCache element is too, so the
+;; conversion is bytes/32 -- the real heap cost is higher because a Lisp hash
+;; table is not a cuckoo table, and the option is a bound on entries rather
+;; than a promise about memory.
+(define-option "maxsigcachesize" :type :int :min 1
+  :apply (lambda (n)
+           (setf bl.interop::+signature-cache-max-entries+
+                 (max 1 (floor (* n 1024 1024) 32)))))
+;; -fastprune: tiny block files so a pruning test can produce many of them
+;; without mining a real chain (Core blockstorage.cpp:857-862). Test-only.
+(define-option "fastprune" :type :bool :global bl.store:*fast-prune*)
+;; -blocksxor: obfuscate blocksdir contents (Core DEFAULT_XOR_BLOCKSDIR).
+(define-option "blocksxor" :type :bool :global bl.store:*blocks-xor*)
+;; -peertimeout: seconds a peer has to complete the version handshake (Core
+;; DEFAULT_PEER_CONNECT_TIMEOUT, net.h:87).
+(define-option "peertimeout" :type :int :min 1 :global +handshake-timeout-seconds+)
+;; -maxsendbuffer: per-connection cap on buffered unsent bytes. Core's value
+;; is in KILOBYTES and it multiplies by 1000, not 1024 (init.cpp:2105,
+;; DEFAULT_MAXSENDBUFFER = 1000 -> 1,000,000 bytes).
+(define-option "maxsendbuffer" :type :int :min 1
+  :apply (lambda (n) (setf bl.net::+max-send-buffer-bytes+ (* n 1000))))
+;; -maxuploadtarget: the 24h outbound budget. Core parses it with
+;; ParseByteUnits defaulting to M, so a bare number is MEBIbytes -- reading it
+;; as bytes would silence the option on every ordinary command line.
+(define-option "maxuploadtarget" :type :byte-units :global bl.net::*max-upload-target*)
+;; RPC server and wallet knobs, read by name in START-NODE-FROM-ARGS.
 (define-option "rpccookiefile")
 (define-option "rpccookieperms")
 (define-option "rpcthreads")
@@ -297,15 +328,49 @@ definition order."
 (define-option "keypool")
 (define-option "walletdir")
 (define-option "walletnotify")
-(define-option "dnsseed")
-(define-option "fixedseeds")
-(define-option "forcednsseed")
-(define-option "acceptnonstdtxn")
-(define-option "par")
-(define-option "whitelistrelay")
-(define-option "whitelistforcerelay")
-(define-option "stopatheight")
-(define-option "externalip" :repeatable t)
+;; -dnsseed / -fixedseeds: peer-discovery source gates (Core net.h:96-97).
+;; -dnsseed's soft-set half (-connect, -maxconnections<=0, a -onlynet with
+;; no clearnet) is in APPLY-PARAMETER-INTERACTIONS.
+(define-option "dnsseed" :type :bool :global *dns-seed-enabled*)
+(define-option "fixedseeds" :type :bool :global *fixed-seeds-enabled*)
+;; -forcednsseed: query the DNS seeds even with a full address book. It does
+;; NOT override -dnsseed=0, which is Core's precedence too.
+(define-option "forcednsseed" :type :bool :global *force-dns-seed*)
+;; -acceptnonstdtxn: relay and mine transactions this node would otherwise
+;; refuse as non-standard. Core REFUSES TO START with it on a non-test chain
+;; (mempool_args.cpp:102-104); an error here, not a warning, because a
+;; mainnet node quietly relaying non-standard transactions has its
+;; transactions dropped by every peer and does not find out.
+(define-option "acceptnonstdtxn" :type :bool
+  :apply (lambda (accept)
+           (when (and accept (member *network* '(:mainnet)))
+             (error "acceptnonstdtxn is not currently supported for ~(~A~) chain"
+                    *network*))
+           (setf bl.val::*require-standard* (not accept))))
+;; -par: how many script-check worker threads. Core's semantics -- 0 means
+;; one per core, a NEGATIVE value leaves that many cores free, and the
+;; result is clamped to MAX_SCRIPTCHECK_THREADS. Reading the negative form
+;; as an absolute value would oversubscribe the very box the operator asked
+;; to leave headroom on.
+(define-option "par" :type :int
+  :apply (lambda (v)
+           (let ((n (bl.val::parse-par-threads v)))
+             (setf bl.val::+parallel-validation-workers+ n)
+             ;; Core: -par=1 means no extra threads at all.
+             (setf *parallel-block-validation* (> n 1)))))
+;; -whitelistrelay / -whitelistforcerelay (Core net_permissions.h:20-22).
+(define-option "whitelistrelay" :type :bool :global bl.net::*whitelist-relay*)
+(define-option "whitelistforcerelay" :type :bool :global bl.net::*whitelist-force-relay*)
+;; -stopatheight: shut down once the tip reaches this height (Core
+;; kernel_notifications.cpp:61-66).
+(define-option "stopatheight" :type :int :global *stop-at-height*)
+;; -externalip (repeatable): addresses to advertise as our own (Core
+;; init.cpp:1803-1808, AddLocal LOCAL_MANUAL). Raw strings here; start-node
+;; resolves them once the network (and thus the listen port) is known, and
+;; errors on unparseable input like Core's ResolveErrMsg. Always applied, so
+;; an absent option leaves an empty list, not a previous run's.
+(define-option "externalip" :repeatable t
+  :apply (lambda (ips) (setf bl.net:*external-ips* ips)))
 
 ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, since each topic
 ;; contributes two options and they produce a list of publishers rather than

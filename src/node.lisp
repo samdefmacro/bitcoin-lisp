@@ -170,10 +170,10 @@ init.cpp:263-265): a detached command racing process exit may not run at all."
 (defun apply-rpc-config-globals (alist)
   "Apply the process-global RPC options from a merged config ALIST.
 
-Separate from APPLY-CONFIG-GLOBALS purely because of load order: config.lisp
-compiles BEFORE src/rpc/package.lisp, so a package-qualified reference to
-BITCOIN-LISP.RPC there is a READ error, not a link error. Called from
-START-NODE-FROM-ARGS immediately after its sibling."
+Kept apart from the option table for now (its rows for these names are
+name-only): they fold into src/config-options.lisp as :global / :apply rows
+when node.lisp is split (refactoring plan P3). Called from
+START-NODE-FROM-ARGS immediately after APPLY-CONFIG-GLOBALS."
   (flet ((lk (k) (let ((c (assoc k alist :test #'string=))) (and c (cdr c)))))
     ;; -rpccookiefile: where the auth cookie goes (Core init.cpp:710). A
     ;; relative path hangs off the data directory.
@@ -208,9 +208,8 @@ START-NODE-FROM-ARGS immediately after its sibling."
     ;; Every one of these has a special with Core's name and default already;
     ;; what was missing was the option that sets it.
     ;;
-    ;; They live here rather than in APPLY-CONFIG-GLOBALS for the same load-order
-    ;; reason the RPC ones do: these specials are in BITCOIN-LISP.RPC, whose
-    ;; package config.lisp compiles before.
+    ;; They live here rather than in the option table for now, with the RPC
+    ;; knobs above (see the docstring).
     (macrolet ((fee-knob (option place)
                  ;; Core's fee options are BTC/kvB on the command line and
                  ;; satoshis internally, as -maxtxfee and -fallbackfee already
