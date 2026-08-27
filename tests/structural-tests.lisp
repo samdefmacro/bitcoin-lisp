@@ -449,10 +449,12 @@ baseline can follow it."
 ;;; --- top-level definitions ------------------------------------------------
 
 (defparameter +definition-prefixes+
-  '((:defun . "(defun ") (:defmacro . "(defmacro ") (:defun . "(define-rpc "))
+  '((:defun . "(defun ") (:defmacro . "(defmacro ") (:defun . "(define-rpc ")
+    (:defun . "(define-option "))
   "A definition is a line that starts with one of these. A DEFINE-RPC form is
 the DEFUN of its handler (named rpc-<method> here, as the function is), so
-the RPC handlers stay on the long-function ratchet. Coalton's DEFINEs sit
+the RPC handlers stay on the long-function ratchet; a DEFINE-OPTION row is
+option-<name>, so a name registered twice is a duplicate definition. Coalton's DEFINEs sit
 inside COALTON-TOPLEVEL at indentation 2 and are therefore not counted, on
 purpose: the interpreter is a deliberate port of one Core file.")
 
@@ -472,10 +474,13 @@ its alias list) becomes rpc-<method>, the handler's function name."
                                     line :start start))))
          (token (and start (string-downcase (subseq line start end)))))
     (cond ((null token) nil)
-          ((string= prefix "(define-rpc ")
+          ((member prefix '("(define-rpc " "(define-option ") :test #'string=)
            (let* ((q (position #\" token))
                   (q2 (and q (position #\" token :start (1+ q)))))
-             (if (and q q2) (format nil "rpc-~A" (subseq token (1+ q) q2)) token)))
+             (if (and q q2)
+                 (format nil "~A~A" (if (string= prefix "(define-rpc ") "rpc-" "option-")
+                         (subseq token (1+ q) q2))
+                 token)))
           (t token))))
 
 (defun %form-line-count (text start)
@@ -532,6 +537,57 @@ that warning; this test catches the cross-package case the warning cannot.")
                (when (> (length files) 1) (push name found)))
              files-by-name)
     (sort found #'string<)))
+
+(defun %config-option-names (forms)
+  "Every option name FORMS (the top-level forms of src/config-options.lisp)
+register: the string of each DEFINE-OPTION, every string of a
+DEFINE-CORE-ONLY-OPTIONS, and both names of each ZMQ topic in the DOLIST
+that registers -zmqpub<topic> / -zmqpub<topic>hwm."
+  (loop for form in forms
+        when (consp form)
+          append (case (car form)
+                   (bl::define-option (list (second form)))
+                   (bl::define-core-only-options (rest form))
+                   (dolist (let ((topics (second (second form))))
+                             (when (and (consp topics) (eq (car topics) 'quote))
+                               (loop for topic in (second topics)
+                                     collect (format nil "zmqpub~A" topic)
+                                     collect (format nil "zmqpub~Ahwm" topic)))))
+                   (t '()))))
+
+(defun %config-option-name-duplicates (forms)
+  "The option names FORMS register more than once, sorted."
+  (let ((names (%config-option-names forms)))
+    (sort (remove-duplicates
+           (remove-if (lambda (n) (= 1 (count n names :test #'string=))) names)
+           :test #'string=)
+          #'string<)))
+
+(test config-option-names-are-registered-once
+  "REGISTER-CONFIG-OPTION replaces an earlier row of the same name in place
+(so a warm reload never duplicates a row), which means a name that is
+DEFINED twice in src/config-options.lisp -- say once as a scalar row and
+once inside DEFINE-CORE-ONLY-OPTIONS -- would silently become whichever
+came last, with no redefinition warning from SBCL and no way for the
+duplicate-definition ratchet (which needs two FILES) to notice. Read the
+file and require every name once. The positive control feeds the same
+walker a form list with one repeat."
+  (let ((forms (with-open-file (in (merge-pathnames "src/config-options.lisp"
+                                                    (asdf:system-source-directory :bitcoin-lisp)))
+                 (let ((*package* (find-package "BITCOIN-LISP")))
+                   (loop for form = (read in nil :eof)
+                         until (eq form :eof) collect form)))))
+    (is (< 150 (length (%config-option-names forms)))
+        "the walker must see the whole table, not a handful of rows")
+    (is (equal '() (%config-option-name-duplicates forms))
+        "an option is defined twice in src/config-options.lisp; the later
+         row silently replaces the earlier one"))
+  (is (equal '("txindex")
+             (%config-option-name-duplicates
+              '((bl::define-option "txindex" :key :txindex :type :bool)
+                (bl::define-core-only-options "help" "txindex")
+                (dolist (topic '("hashtx")) nil))))
+      "positive control: the walker must report a repeated name"))
 
 (test no-new-duplicate-definitions
   "A DEFUN or DEFMACRO name defined in two files is one implementation too

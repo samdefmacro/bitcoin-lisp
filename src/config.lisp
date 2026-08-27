@@ -643,19 +643,6 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
 (chain-params-core-name: main, test, testnet4, signet, regtest)."
   (bl.chain:chain-params-core-name (bl.chain:find-chain-params network)))
 
-(defparameter *repeatable-config-options*
-  '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip" "bind"
-    "testactivationheight" "debug" "debugexclude" "shutdownnotify"
-    "startupnotify" "connect" "seednode" "whitelist" "whitebind"
-    ;; Core reads both with GetArgs: every -loadblock= is imported in order,
-    ;; and every -wallet=<name> is loaded.
-    "loadblock" "wallet" "loglevel")
-  "Option names whose every occurrence is meaningful (Core GetArgs
-list-options); all other repeated command-line options collapse to their
-LAST occurrence (Core GetArg on the command line takes span.end()[-1],
-settings.cpp:193 — a repeated config-FILE key instead keeps the FIRST,
-which parse-bitcoin-conf's in-order alist gives assoc for free).")
-
 (defun split-option-token (arg)
   "Split one -key / -key=value / --key=value token. Returns (VALUES raw-key
 value), where VALUE is NIL when the token carried none and RAW-KEY is
@@ -710,7 +697,7 @@ would not, Core's is the one whose behaviour is documented."
  (lower-case-key . value-string), in order. Accepts -key=value and
 --key=value; a bare -key means key=1 and -nokey means key=0 (Core
 InterpretKey/InterpretValue). A repeated non-repeatable key keeps only its
-LAST occurrence (see *repeatable-config-options*), so an assoc lookup
+LAST occurrence (see CONFIG-OPTION-REPEATABLE-P), so an assoc lookup
 matches Core's command-line GetArg. Non-flag tokens are ignored here;
 check-cli-args rejects them up front."
   (let ((out nil))
@@ -728,7 +715,7 @@ check-cli-args rejects them up front."
     (let ((kept nil) (seen (make-hash-table :test 'equal)))
       (dolist (cell out (copy-list kept))
         (let ((key (car cell)))
-          (if (member key *repeatable-config-options* :test #'string=)
+          (if (config-option-repeatable-p key)
               (push cell kept)
               (unless (gethash key seen)
                 (setf (gethash key seen) t)
@@ -901,173 +888,6 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
                (t (error "Unknown -chain value: ~S" c)))))
       (t default))))
 
-(defparameter *cli-option-spec*
-  '(("datadir"           :data-directory     :string)
-    ("txindex"           :txindex            :bool)
-    ("blockfilterindex"  :blockfilterindex   :bool)
-    ("coinstatsindex"    :coinstatsindex     :bool)
-    ("txospenderindex"   :txospenderindex    :bool)
-    ("prune"             :prune              :int)
-    ("dbcache"           :dbcache-mib        :int)
-    ;; Core's -mocktime: the startup form of the setmocktime RPC, for tests
-    ;; that need a fixed clock before the first RPC can be made.
-    ("mocktime"          :mocktime           :int)
-    ("logtimemicros"     :log-time-micros    :bool)
-    ;; -blocknotify: one command, %s replaced by the new best block's hash.
-    ("blocknotify"       :block-notify       :string)
-    ("logthreadnames"    :log-thread-names   :bool)
-    ("maxconnections"    :max-connections    :int)
-    ("rpcport"           :rpc-port           :int)
-    ("rpcbind"           :rpc-bind           :string)
-    ("rpcuser"           :rpc-user           :string)
-    ("rpcpassword"       :rpc-password       :string)
-    ("listen"            :listen             :bool)
-    ;; -bind is scanned for its LAST occurrence here (the single address we
-     ;; actually bind); every occurrence is also collected below, so a
-     ;; multi-bind command line is reported rather than silently reduced.
-     ("bind"              :listen-bind        :string)
-    ("listenonion"       :listen-onion       :bool)
-    ("torcontrol"        :tor-control        :string)
-    ("torpassword"       :tor-password       :string)
-    ("v2transport"       :v2transport        :bool)
-    ("reindexchainstate" :reindex-chainstate :bool)
-    ("reindex-chainstate" :reindex-chainstate :bool)
-    ("forcecompactdb"    :force-compact-db   :bool)
-    ("peerblockfilters"  :peer-block-filters :bool)
-    ("txreconciliation"  :tx-reconciliation  :bool)
-    ("webui"             :webui              :bool)
-    ("webuipath"         :webui-path         :string)
-    ("webuiopen"         :webui-open         :bool)
-    ;; -wallet is deliberately NOT a :bool row. It is Core's list of wallets to
-    ;; LOAD (read with GetArgs, wallet/load.cpp:81), collected into
-    ;; :WALLET-NAMES below; the subsystem switch is -disablewallet. As a :bool
-    ;; row, `-nowallet` — which Core defines as "load no wallets" — turned the
-    ;; whole wallet RPC surface off, and wallet_multiwallet.py starts a node
-    ;; with exactly that and then calls wallet RPCs on it.
-    ;; Core's -disablewallet is the negation of our -wallet; it is inverted
-    ;; where the plist is assembled, since the spec scan has no notion of a
-    ;; flag that means the opposite of its key.
-    ("disablewallet"     :disable-wallet     :bool)
-    ("logfile"           :log-file           :string)
-    ;; -asmap=<file>: ASN-based netgroup bucketing. A relative path hangs off
-    ;; the datadir, as Core's does.
-    ("asmap"             :asmap              :string)
-    ;; -migratedatadir: move a pre-Core datadir to Core's layout at startup,
-    ;; before any database is opened. No Core counterpart — Core has only ever
-    ;; had this layout, so it has never needed a migration.
-    ("migratedatadir"    :migrate-datadir    :bool)
-    ;; -pid: a supervisor's handle on this process. -nopid parses to "0", which
-    ;; PID-FILE-PATH reads as Core reads IsArgNegated.
-    ("pid"               :pid-file           :string)
-    ;; -printtoconsole: Core defaults it to (not -daemon); we never daemonize,
-    ;; so ours defaults on and this is the way to turn it off.
-    ("printtoconsole"    :console-log        :bool)
-    ;; Core's own spelling of the same thing; -debuglogfile=0 disables it.
-    ("debuglogfile"      :log-file           :string)
-    ;; The SCALAR row still feeds :LOG-LEVEL, the global threshold. It has to
-    ;; tolerate the <category>:<level> form, which is not a global level at all
-    ;; and is applied from :LOG-LEVEL-SPECS instead — otherwise a bare
-    ;; `-loglevel=net:debug` would be rejected as an invalid global level, which
-    ;; is how this option was broken for that form entirely.
-    ("loglevel"          :log-level          :loglevel-global)
-    ("logratelimit"      :log-rate-limit     :bool)
-    ("flatblockfiles"    :flat-block-files   :bool)
-    ("reindex"           :reindex            :bool)
-    ("port"              :port               :int)
-    ("networkactive"     :network-active     :bool)
-    ("rest"              :rest               :bool)
-    ("blocksonly"        :blocksonly         :bool)
-    ("acceptstalefeeestimates" :accept-stale-fee-estimates :bool)
-    ("sync"              :sync               :bool))
-  "Maps a Bitcoin Core-style option name to a start-node keyword and its value
-type. Network selection (-chain/-testnet/...) and -server/-debug are handled
-specially in config-alist->start-node-plist.")
-
-(defparameter *known-config-options*
-  '(;; network selection + entry-point specials
-    "regtest" "signet" "testnet4" "testnet" "chain" "server" "debug" "conf"
-    "includeconf"
-    "datadir" "settings" "loadblock" "wallet"
-    ;; apply-config-globals options
-    "datacarrier" "datacarriersize" "permitbaremultisig"
-    "limitclustercount" "limitclustersize" "signetchallenge"
-    "proxy" "onion" "proxyrandomize" "onlynet" "cjdnsreachable"
-    "assumevalid" "minimumchainwork" "mempoolexpiry" "maxmempool" "minrelaytxfee"
-    "blockmintxfee" "blockmaxweight" "blockreservedweight"
-    "maxtxfee" "fallbackfee" "bantime" "uacomment"
-    "dustrelayfee" "incrementalrelayfee" "bytespersigop"
-    "maxtipage" "maxsigcachesize" "fastprune" "blocksxor"
-    "peertimeout" "maxsendbuffer" "maxuploadtarget"
-    "rpccookiefile" "rpccookieperms" "rpcthreads" "rpcservertimeout"
-    "mintxfee" "discardfee" "consolidatefeerate" "maxapsfee" "txconfirmtarget"
-    "walletrbf" "spendzeroconfchange" "walletrejectlongchains"
-    "keypool" "walletdir" "walletnotify"
-    "dnsseed" "fixedseeds" "forcednsseed" "acceptnonstdtxn" "migratedatadir"
-    "par"
-    "whitelistrelay" "whitelistforcerelay"
-    "stopatheight" "externalip"
-    ;; repeatable start-node options collected outside the spec scan
-    "addnode" "connect" "seednode" "whitelist" "whitebind"
-    "rpcauth" "rpcallowip" "testactivationheight"
-    "debugexclude" "shutdownnotify" "startupnotify"
-    ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, not the spec
-    ;; scan, since each topic contributes two options and they produce a list
-    ;; of publishers rather than a start-node keyword.
-    "zmqpubhashblock" "zmqpubhashblockhwm"
-    "zmqpubhashtx" "zmqpubhashtxhwm"
-    "zmqpubrawblock" "zmqpubrawblockhwm"
-    "zmqpubrawtx" "zmqpubrawtxhwm"
-    "zmqpubsequence" "zmqpubsequencehwm")
-  "Config option names recognized OUTSIDE *cli-option-spec* (network flags,
-entry-point specials, and the process-global options apply-config-globals
-consumes). check-cli-args unions this with the spec to reject unknown
-command-line options at startup, like Core ArgsManager::ParseParameters
-(common/args.cpp:229-238).")
-
-(defparameter *core-only-config-options*
-  '(
-    "addresstype" "alertnotify" "allowignoredconf"
-    "avoidpartialspends" "blockreconstructionextratxn"
-    "blocksdir" "blockversion" "capturemessages"
-    "changetype" "checkaddrman" "checkblockindex" "checkblocks" "checklevel"
-    "checkmempool" "checkpoints" "daemon"
-    "daemonwait" "dbbatchsize" "deprecatedrpc"
-    "discover" "dns"
-    "help" "i2pacceptincoming" "i2psam"
-    "ipcbind" "limitancestorcount" "limitancestorsize"
-    "limitdescendantcount" "limitdescendantsize" "logips"
-    "loglevelalways" "logsourcelocations"
-    "logtimestamps" "maxreceivebuffer"
-
-    "natpmp" "peerbloomfilters" "persistmempool"
-    "persistmempoolv1" "printpriority"
-    "privatebroadcast" "rpcdoccheck"
-    "rpcwhitelist" "rpcwhitelistdefault"
-    "rpcworkqueue" "shrinkdebugfile"
-    "signer" "signetseednode"
-    "stopafterblockimport" "test" "timeout"
-    "unsafesqlitesync" "vbparams"
-    "version" "walletbroadcast" "walletcrosschain"
-    )
-  "Options bitcoind accepts that this node recognises but does NOT implement,
-extracted from Core's AddArg registrations (init.cpp, common/args.cpp,
-init/common.cpp, chainparamsbase.cpp, the wallet/index/zmq/rpc modules).
-
-They exist so an unknown-option HARD ERROR does not stop a node that was
-started with an ordinary Core command line — Core's functional test framework
-passes -logtimemicros, -logthreadnames, -logsourcelocations, -debugexclude and
--loglevel to EVERY node it starts (test_node.py:68-108), and 128 more flags
-across individual tests. Rejecting those meant the framework could not launch
-us at all.
-
-Accepting is not implementing: SUPPLIED-CORE-ONLY-OPTIONS reports which of
-these an operator actually passed so startup can say so out loud. Silently
-swallowing -asmap or -whitelist would be worse than refusing them.")
-
-(defun core-only-option-p (name)
-  "T when NAME is an option bitcoind accepts and we do not implement."
-  (member (string-downcase name) *core-only-config-options* :test #'string=))
-
 (defun supplied-core-only-options (alist)
   "The core-only options actually present in ALIST, deduplicated and in order.
 The caller warns about each, so accepting them never passes for implementing
@@ -1078,17 +898,17 @@ them."
    :test #'string= :from-end t))
 
 (defun known-config-option-p (name)
-  "T if NAME (lower-case, no dashes) is a recognized config option."
-  (and (or (member name *known-config-options* :test #'string=)
-           (assoc name *cli-option-spec* :test #'string=)
+  "T if NAME (lower-case, no dashes) is a recognized config option: any
+DEFINE-OPTION row, including the recognised-but-unimplemented Core options
+(accepted so an ordinary bitcoind command line starts this node, warned
+about at startup so nobody mistakes that for support). check-cli-args uses
+this to reject unknown command-line options at startup, like Core
+ArgsManager::ParseParameters (common/args.cpp:229-238)."
+  (and (or (find-config-option name)
            ;; -nokey negation of a known key parses to key=0 before this
            ;; check, but tolerate the raw \"noKEY\" spelling too.
            (and (> (length name) 2) (string-equal (subseq name 0 2) "no")
-                (known-config-option-p (subseq name 2)))
-           ;; Recognised-but-unimplemented Core options: accepted so an
-           ;; ordinary bitcoind command line starts this node, warned about at
-           ;; startup so nobody mistakes that for support.
-           (core-only-option-p name))
+                (known-config-option-p (subseq name 2))))
        t))
 
 (define-condition cli-parse-error (error)
@@ -1456,68 +1276,36 @@ contradiction -listen=0 -listenonion=1 is an init ERROR (:1022-1024)."
 
 (defun config-alist->start-node-plist (alist network)
   "Convert a merged config ALIST (CLI over file) into a plist of start-node
-keyword arguments, coercing each value by its spec type. NETWORK is the already-
+keyword arguments, coercing each value by its option-table type. NETWORK is the already-
 resolved network. Honors -server (enable RPC on the default port when no
 -rpcport is given) and -debug (=> loglevel debug unless -loglevel is set)."
   (let ((plist (list :network network)))
     (flet ((lookup (k) (assoc k alist :test #'string=)))
-      (dolist (spec *cli-option-spec*)
-        (destructuring-bind (name keyword type) spec
-          (let ((cell (lookup name)))
-            (when cell
-              (let ((raw (cdr cell)))
-                (setf (getf plist keyword)
-                      (ecase type
-                        (:string raw)
-                        (:bool (conf-parse-bool raw))
-                        (:int (conf-parse-int raw))
-                        (:loglevel (conf-parse-loglevel raw))
-                        (:loglevel-global (conf-parse-loglevel-global raw)))))))))
+      (dolist (option (scalar-key-options))
+        (let ((cell (lookup (config-option-name option))))
+          (when cell
+            (let ((raw (cdr cell)))
+              (setf (getf plist (config-option-key option))
+                    (ecase (config-option-type option)
+                      (:string raw)
+                      (:bool (conf-parse-bool raw))
+                      (:int (conf-parse-int raw))
+                      (:loglevel (conf-parse-loglevel raw))
+                      (:loglevel-global (conf-parse-loglevel-global raw))))))))
       ;; -port must be a real port number (Core init.cpp InitError
       ;; "Invalid port specified in -port").
       (let ((port (getf plist :port)))
         (when (and port (not (<= 1 port 65535)))
           (error "Invalid port specified in -port: '~A'" port)))
       ;; Repeatable options whose value is just the string: keep every
-      ;; occurrence, CLI and config file, the way Core's GetArgs does for
-      ;; -addnode (m_added_node_params, init.cpp:2107), -rpcauth (g_rpcauth,
-      ;; httprpc.cpp:289) and -rpcallowip (rpc_allow_subnets,
-      ;; httpserver.cpp:153). Each is validated where it is used, not here.
-      (dolist (option '(("addnode"    . :addnode)
-                        ("rpcauth"    . :rpc-auth)
-                        ("rpcallowip" . :rpc-allow-ip)
-                        ("testactivationheight" . :test-activation-heights)
-                        ("debug"        . :debug-categories)
-                        ("debugexclude" . :debug-exclude)
-                        ;; Core reads both with GetArgs, so every occurrence
-                        ;; runs (init.cpp:257-265 joins them all).
-                        ("shutdownnotify" . :shutdown-notify)
-                        ("startupnotify"  . :startup-notify)
-                        ;; -connect: Core reads it with GetArgs and dials every
-                        ;; one as a MANUAL connection (net.cpp ThreadOpenConnections).
-                        ("connect"        . :connect-nodes)
-                        ;; -seednode: Core reads it with GetArgs into
-                        ;; connOptions.vSeedNodes (init.cpp:2212).
-                        ("seednode"       . :seednode)
-                        ;; -loadblock: every file is imported, in the order
-                        ;; given (init.cpp:2022, ImportBlocks).
-                        ("loadblock"      . :load-block)
-                        ;; -wallet=<name>: every name is loaded at startup,
-                        ;; alongside the ones settings.json records
-                        ;; (wallet/load.cpp:81, chain.getSettingsList).
-                        ("wallet"         . :wallet-names)
-                        ;; -loglevel: Core reads it with GetArgs, so a command
-                        ;; line can carry a global level AND per-category ones
-                        ;; (init/common.cpp:62-75).
-                        ("loglevel"       . :log-level-specs)
-                        ;; -whitelist / -whitebind: Core reads both with
-                        ;; GetArgs (init.cpp), so every occurrence counts.
-                        ("whitelist"      . :whitelist)
-                        ("whitebind"      . :whitebind)))
+      ;; occurrence, CLI and config file, the way Core's GetArgs does (the
+      ;; :COLLECT rows of the option table). Each is validated where it is
+      ;; used, not here.
+      (dolist (option (collected-key-options))
         (let ((values (loop for (k . v) in alist
-                            when (string= k (car option))
+                            when (string= k (config-option-name option))
                               collect v)))
-          (when values (setf (getf plist (cdr option)) values))))
+          (when values (setf (getf plist (config-option-collect option)) values))))
       ;; -disablewallet turns the wallet OFF (Core init.cpp). Inverted into
       ;; :wallet, and only when -wallet was not given explicitly: an operator
       ;; who wrote both said something contradictory, and Core lets the
@@ -1547,7 +1335,7 @@ resolved network. Honors -server (enable RPC on the default port when no
         (when (or names (member "1" raw :test #'string=))
           (setf (getf plist :wallet) t)))
       ;; -bind=<addr>[:<port>][=onion] (Core init.cpp; the functional framework
-      ;; passes both forms, test_node.py:272-276). The spec scan above already
+      ;; passes both forms, test_node.py:272-276). The scalar scan above already
       ;; took the last plain value into :listen-bind; re-derive it here so the
       ;; address is separated from its port, and so an =onion entry — which
       ;; names a Tor-only listener, not an address to bind — is not mistaken

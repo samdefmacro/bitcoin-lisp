@@ -4287,7 +4287,7 @@ file location."
       ;; APPLY-RPC-CONFIG-GLOBALS).
       (apply-rpc-config-globals merged)
       ;; datadir only comes from the CLI/default (locating the conf needs it), so
-      ;; make sure it reaches start-node even if it wasn't in the spec scan.
+      ;; make sure it reaches start-node even if it wasn't in the scalar scan.
       (unless (getf plist :data-directory)
         (setf (getf plist :data-directory) datadir))
       (setf (getf plist :data-directory)
