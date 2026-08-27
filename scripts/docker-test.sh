@@ -58,4 +58,18 @@ if grep -q "WARNING: redefining BITCOIN-LISP" "$TRANSCRIPT"; then
   grep "WARNING: redefining BITCOIN-LISP" "$TRANSCRIPT" >&2
   exit 1
 fi
+
+# ASDF's compilation unit defers SBCL's "undefined variable" warnings past
+# compile-file's failure-p, so a from-scratch build passes with them buried in
+# the transcript: 2026-08-28 found 157 such lines in a green run, four of them
+# docstrings cut short by an unescaped quote whose remaining prose had become
+# code, plus a setf of a defvar that had been deleted. The checker tolerates
+# only earmuffed names that are defined somewhere in the tree (forward
+# references across load order); it self-tests first so it cannot pass
+# vacuously.
+"$(dirname "$0")/check-undefined-variables.sh" --self-test "$(dirname "$0")/.." >&2 || exit 1
+if ! "$(dirname "$0")/check-undefined-variables.sh" "$TRANSCRIPT" "$(dirname "$0")/.." >&2; then
+  echo "ERROR: the load referenced variables that do not exist (see above)" >&2
+  exit 1
+fi
 exit "$rc"

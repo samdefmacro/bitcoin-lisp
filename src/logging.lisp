@@ -372,8 +372,8 @@ Core applies them in (-debug then -debugexclude, init/common.cpp). Signals on an
 unknown name — Core logs a warning there, but a silently-ignored -debug=nett is
 an operator staring at a log that will never contain what they asked for.
 
-"1", "all" and the empty string (a bare -debug) enable everything; "0" and
-"none" disable everything, and Core lets a later -debug re-enable after them."
+\"1\", \"all\" and the empty string (a bare -debug) enable everything; \"0\" and
+\"none\" disable everything, and Core lets a later -debug re-enable after them."
   ;; Everything before the LAST -debug=0/none is disregarded entirely, invalid
   ;; names included (Core SetLoggingCategories, init/common.cpp:82-88: it finds
   ;; the last negation and processes only the tail from it). Validating the

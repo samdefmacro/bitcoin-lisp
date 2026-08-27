@@ -138,8 +138,8 @@ network, so GetProxy(NET_UNROUTABLE, ...) always fails and the dial goes
 direct.
 
 That is not a corner case. Core's rpc_net.py starts every node with
--proxy=127.0.0.1:1 — a deliberately dead proxy, "to make sure no actual
-connections to public IPs are attempted" — and then expects the nodes to
+-proxy=127.0.0.1:1 — a deliberately dead proxy, \"to make sure no actual
+connections to public IPs are attempted\" — and then expects the nodes to
 connect to EACH OTHER over loopback anyway. A node that proxies its loopback
 dials cannot be tested that way, and on a private network it cannot reach its
 own peers at all.

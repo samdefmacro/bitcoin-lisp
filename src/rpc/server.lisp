@@ -106,8 +106,8 @@ whichever came first and leave the other listed forever."
 Warmup is checked FIRST, before the method is even looked up — the position
 Core checks it in (CRPCTable::execute, rpc/server.cpp:484-489) — and with no
 exemptions, also as in Core. That ordering is deliberate: during warmup the
-node cannot answer anything honestly, so "still starting" is a better reply
-than "no such method" for a method that does exist."
+node cannot answer anything honestly, so \"still starting\" is a better reply
+than \"no such method\" for a method that does exist."
   (let ((warmup *rpc-warmup-status*))
     (when warmup
       (error 'rpc-error :code +rpc-in-warmup+ :message warmup)))

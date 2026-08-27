@@ -153,8 +153,8 @@ That is exactly what happened on 2026-08-17/18: past the mmap threshold the
 chainstate held ~3100 REAL descriptors, every new socket was allocated above
 fd 1023, and usocket's select-based readiness check signalled
 `The value <fd+1> is not of type (UNSIGNED-BYTE 10)' on each one until the node
-sat at zero peers. The accompanying comment claimed 64 was "leveldb's default"
-and that Core "pairs 64 with a large block cache"; both are wrong, and the
+sat at zero peers. The accompanying comment claimed 64 was \"leveldb's default\"
+and that Core \"pairs 64 with a large block cache\"; both are wrong, and the
 mistake is what made 4096 look like a free win.
 
 The original tuning problem was real — at 64 the table cache thrashes

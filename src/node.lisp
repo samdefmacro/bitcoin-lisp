@@ -4183,7 +4183,7 @@ is now rewritten on EVERY start, so it is the crash window an operator hits
 most often. A truncated settings file refuses the next start outright.
 
 The wallet layer is the other writer: it reads the whole object and replaces
-only the "wallet" key, and this reader keeps every key it did not put there,
+only the \"wallet\" key, and this reader keeps every key it did not put there,
 so the two compose rather than clobbering each other."
   (handler-case
       (let ((tmp (make-pathname :type "json.tmp" :defaults path)))
