@@ -39,14 +39,14 @@ distinguishable from a seeded one."
   (let* ((before (sb-ext:seed-random-state 20260726))
          ;; What the stream WOULD have produced had the seeding not run.
          (would-have (%entropy-draws 8 (sb-ext:seed-random-state 20260726)))
-         (bitcoin-lisp::*random-state-seed* nil)
+         (bl::*random-state-seed* nil)
          (*random-state* before)
-         (seed (bitcoin-lisp::seed-global-random-state)))
+         (seed (bl::seed-global-random-state)))
     ;; The seeding ran and left evidence: a recorded integer seed.
-    (is-true (integerp bitcoin-lisp::*random-state-seed*)
+    (is-true (integerp bl::*random-state-seed*)
              "*random-state-seed* is ~S, so the seeding never ran"
-             bitcoin-lisp::*random-state-seed*)
-    (is (eql seed bitcoin-lisp::*random-state-seed*))
+             bl::*random-state-seed*)
+    (is (eql seed bl::*random-state-seed*))
     ;; 32 bytes off the CSPRNG: a value under 2^192 has probability 2^-64.
     (is-true (> (integer-length seed) 192)
              "seed has only ~D bits; a 32-byte OS draw was expected"
@@ -59,11 +59,11 @@ distinguishable from a seeded one."
   "Two independently seeded nodes must not share a stream. Two re-seeds in one
 image is the same operation two fresh starts perform (each start's seed comes
 from the OS CSPRNG, never from the previous state)."
-  (let* ((bitcoin-lisp::*random-state-seed* nil)
+  (let* ((bl::*random-state-seed* nil)
          (*random-state* (sb-ext:seed-random-state 1))
-         (seed-a (bitcoin-lisp::seed-global-random-state))
+         (seed-a (bl::seed-global-random-state))
          (draws-a (%entropy-draws 8))
-         (seed-b (bitcoin-lisp::seed-global-random-state))
+         (seed-b (bl::seed-global-random-state))
          (draws-b (%entropy-draws 8)))
     (is (/= seed-a seed-b))
     (is (not (equal draws-a draws-b)))))
@@ -73,10 +73,10 @@ from the OS CSPRNG, never from the previous state)."
 the whole range with a mean near 127.5. Catches a seeding that installs a
 degenerate state (all-zero key, constant output) rather than a working one.
 Tolerances are ~13 sigma, so this does not flake."
-  (let* ((bitcoin-lisp::*random-state-seed* nil)
+  (let* ((bl::*random-state-seed* nil)
          (*random-state* (sb-ext:seed-random-state 7))
          (n 4096))
-    (bitcoin-lisp::seed-global-random-state)
+    (bl::seed-global-random-state)
     (let ((seen (make-array 256 :element-type 'bit :initial-element 0))
           (total 0))
       (dotimes (i n)
@@ -96,19 +96,19 @@ process RNG. Without the call the node runs on SBCL's build-time stream."
     (unwind-protect
          ;; init-node also assigns the network globals; bind them so this test
          ;; hands the suite back exactly the environment it found.
-         (let* ((bitcoin-lisp::*network* bitcoin-lisp::*network*)
-                (bitcoin-lisp.storage:*pow-limit-target* bitcoin-lisp.storage:*pow-limit-target*)
-                (bitcoin-lisp.serialization:*network-magic* bitcoin-lisp.serialization:*network-magic*)
-                (bitcoin-lisp.networking:*current-port* bitcoin-lisp.networking:*current-port*)
-                (bitcoin-lisp.networking:*dns-seeds* bitcoin-lisp.networking:*dns-seeds*)
-                (bitcoin-lisp::*random-state-seed* nil)
+         (let* ((bl::*network* bl::*network*)
+                (bl.store:*pow-limit-target* bl.store:*pow-limit-target*)
+                (bl.ser:*network-magic* bl.ser:*network-magic*)
+                (bl.net:*current-port* bl.net:*current-port*)
+                (bl.net:*dns-seeds* bl.net:*dns-seeds*)
+                (bl::*random-state-seed* nil)
                 (would-have (%entropy-draws 8 (sb-ext:seed-random-state 424242)))
                 (*random-state* (sb-ext:seed-random-state 424242))
-                (node (bitcoin-lisp::init-node dir :network :regtest)))
-           (is-true (bitcoin-lisp::node-p node))
-           (is-true (integerp bitcoin-lisp::*random-state-seed*)
+                (node (bl::init-node dir :network :regtest)))
+           (is-true (bl::node-p node))
+           (is-true (integerp bl::*random-state-seed*)
                     "init-node left *random-state-seed* ~S: it never seeded the RNG"
-                    bitcoin-lisp::*random-state-seed*)
+                    bl::*random-state-seed*)
            (is (not (equal would-have (%entropy-draws 8)))))
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
@@ -118,7 +118,7 @@ freshly started thread reads (dynamic bindings do not cross MAKE-THREAD). The
 peer threads that draw the relay jitter are such threads, so a seeding visible
 only to the starter thread would fix nothing."
   (let ((saved-state (sb-ext:symbol-global-value 'cl:*random-state*))
-        (saved-seed bitcoin-lisp::*random-state-seed*))
+        (saved-seed bl::*random-state-seed*))
     (unwind-protect
          (progn
            ;; Deliberately NOT a dynamic binding: seed-global-random-state must
@@ -126,7 +126,7 @@ only to the starter thread would fix nothing."
            (setf (sb-ext:symbol-global-value 'cl:*random-state*)
                  (sb-ext:seed-random-state 4242))
            (let ((would-have (%entropy-draws 4 (sb-ext:seed-random-state 4242))))
-             (bitcoin-lisp::seed-global-random-state)
+             (bl::seed-global-random-state)
              (let ((from-thread :thread-never-ran))
                (bt:join-thread
                 (bt:make-thread (lambda () (setf from-thread (%entropy-draws 4)))
@@ -134,4 +134,4 @@ only to the starter thread would fix nothing."
                (is (not (eq from-thread :thread-never-ran)))
                (is (not (equal would-have from-thread))))))
       (setf (sb-ext:symbol-global-value 'cl:*random-state*) saved-state
-            bitcoin-lisp::*random-state-seed* saved-seed))))
+            bl::*random-state-seed* saved-seed))))

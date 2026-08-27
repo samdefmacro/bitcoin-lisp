@@ -21,19 +21,19 @@ flag string), via the shared run-script-test harness."
 (defun %sf-context-tx (version sequence locktime)
   "A minimal single-input tx supplying the locktime/sequence context that
 CLTV/CSV read."
-  (bitcoin-lisp.serialization:make-transaction
+  (bl.ser:make-transaction
    :version version
-   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                  :previous-output (bitcoin-lisp.serialization:make-outpoint)
+   :inputs (vector (bl.ser:make-tx-in
+                  :previous-output (bl.ser:make-outpoint)
                   :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                   :sequence sequence))
-   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bl.ser:make-tx-out
                    :value 0 :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
    :lock-time locktime))
 
 (defmacro %sf-with-tx ((tx) &body body)
-  `(let ((bitcoin-lisp.coalton.interop:*current-tx* ,tx)
-         (bitcoin-lisp.coalton.interop:*current-input-index* 0))
+  `(let ((bl.interop:*current-tx* ,tx)
+         (bl.interop:*current-input-index* 0))
      ,@body))
 
 ;;;; Per-flag gating (signature-free)

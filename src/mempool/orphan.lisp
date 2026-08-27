@@ -65,7 +65,7 @@ validation layer, which loads after this file.")
 
 (defstruct orphan-entry
   "An orphan transaction awaiting a missing parent, with its announcers."
-  (transaction nil :type bitcoin-lisp.serialization:transaction)
+  (transaction nil :type bl.ser:transaction)
   (txid nil :type (or null (simple-array (unsigned-byte 8) (32))))
   (wtxid nil :type (or null (simple-array (unsigned-byte 8) (32))))
   ;; Usage metric: the transaction weight (Core Announcement::GetMemUsage).
@@ -143,7 +143,7 @@ with fake children of PARENT-TX cannot crowd out the real child supplied by
 the honest peer, because we only ever pair a parent with children from the
 same announcer. Newest-first matters when children replace one another — the
 most recent is usually the highest-feerate one."
-  (let ((ptxid (bitcoin-lisp.serialization:transaction-hash parent-tx))
+  (let ((ptxid (bl.ser:transaction-hash parent-tx))
         (found '()))
     (dolist (wtxid (gethash ptxid (orphan-pool-by-prev pool)))
       (let ((entry (gethash wtxid (orphan-pool-by-wtxid pool))))
@@ -208,7 +208,7 @@ entries (Core MaxGlobalUsage, txorphanage.cpp:769)."
 
 (defun %orphan-latency-score (tx)
   "1 + floor(inputs/10) (Core Announcement::GetLatencyScore)."
-  (1+ (floor (length (bitcoin-lisp.serialization:transaction-inputs tx)) 10)))
+  (1+ (floor (length (bl.ser:transaction-inputs tx)) 10)))
 
 (defun %orphan-peer-info-add (pool peer entry)
   (let ((info (or (gethash peer (orphan-pool-peer-info pool))
@@ -231,11 +231,11 @@ record entirely at count 0 (Core Erase, txorphanage.cpp:240-246)."
 (defun %orphan-deindex (pool entry)
   "Remove ENTRY's wtxid from every by-prev bucket of its input parents."
   (let ((wtxid (orphan-entry-wtxid entry)))
-    (bitcoin-lisp.serialization:dovector
-        (in (bitcoin-lisp.serialization:transaction-inputs
+    (bl.ser:dovector
+        (in (bl.ser:transaction-inputs
              (orphan-entry-transaction entry)))
-      (let* ((ptxid (bitcoin-lisp.serialization:outpoint-hash
-                     (bitcoin-lisp.serialization:tx-in-previous-output in)))
+      (let* ((ptxid (bl.ser:outpoint-hash
+                     (bl.ser:tx-in-previous-output in)))
              (bucket (gethash ptxid (orphan-pool-by-prev pool))))
         (when bucket
           (let ((rest (remove wtxid bucket :test #'equalp)))
@@ -306,7 +306,7 @@ another's orphans. Returns the number of announcements evicted."
                  (%orphan-remove-announcement pool entry ann)
                  (incf evicted))))
     (when (plusp evicted)
-      (bitcoin-lisp:log-cat "mempool" "orphanage overflow, removed ~D announcement~:P"
+      (bl:log-cat "mempool" "orphanage overflow, removed ~D announcement~:P"
                             evicted))
     evicted))
 
@@ -318,11 +318,11 @@ is stored and indexed under each input's parent txid; an orphan already
 present gains PEER as an additional announcer. Oversized (> max standard
 weight) transactions and duplicate (wtxid, peer) announcements are ignored.
 Returns T iff TX was newly stored (Core AddTx's brand_new)."
-  (let ((weight (bitcoin-lisp.serialization:transaction-weight tx)))
+  (let ((weight (bl.ser:transaction-weight tx)))
     (when (> weight +orphan-max-tx-weight+)
-      (bitcoin-lisp:log-cat "mempool" "ignoring large orphan tx (weight ~D)" weight)
+      (bl:log-cat "mempool" "ignoring large orphan tx (weight ~D)" weight)
       (return-from orphan-add nil))
-    (let* ((wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))
+    (let* ((wtxid (bl.ser:transaction-wtxid tx))
            (entry (gethash wtxid (orphan-pool-by-wtxid pool)))
            (brand-new (null entry)))
       ;; Duplicate (wtxid, peer) announcement: nothing to do.
@@ -333,7 +333,7 @@ Returns T iff TX was newly stored (Core AddTx's brand_new)."
       (when brand-new
         (setf entry (make-orphan-entry
                      :transaction tx
-                     :txid (bitcoin-lisp.serialization:transaction-hash tx)
+                     :txid (bl.ser:transaction-hash tx)
                      :wtxid wtxid
                      :weight weight
                      :latency-score (%orphan-latency-score tx)))
@@ -341,10 +341,10 @@ Returns T iff TX was newly stored (Core AddTx's brand_new)."
         (incf (orphan-pool-unique-usage pool) weight)
         (incf (orphan-pool-unique-input-score pool)
               (1- (orphan-entry-latency-score entry)))
-        (bitcoin-lisp.serialization:dovector
-            (in (bitcoin-lisp.serialization:transaction-inputs tx))
-          (let ((ptxid (bitcoin-lisp.serialization:outpoint-hash
-                        (bitcoin-lisp.serialization:tx-in-previous-output in))))
+        (bl.ser:dovector
+            (in (bl.ser:transaction-inputs tx))
+          (let ((ptxid (bl.ser:outpoint-hash
+                        (bl.ser:tx-in-previous-output in))))
             (pushnew wtxid (gethash ptxid (orphan-pool-by-prev pool))
                      :test #'equalp))))
       (push (make-orphan-announcement
@@ -398,25 +398,25 @@ number of orphans erased."
   (when (zerop (orphan-pool-count pool))
     (return-from orphan-erase-for-block 0))
   (let ((to-erase '()))
-    (dolist (block-tx (coerce (bitcoin-lisp.serialization:bitcoin-block-transactions
+    (dolist (block-tx (coerce (bl.ser:bitcoin-block-transactions
                                block)
                               'list))
-      (bitcoin-lisp.serialization:dovector
-          (in (bitcoin-lisp.serialization:transaction-inputs block-tx))
-        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output in))
-               (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
-               (pidx (bitcoin-lisp.serialization:outpoint-index prevout)))
+      (bl.ser:dovector
+          (in (bl.ser:transaction-inputs block-tx))
+        (let* ((prevout (bl.ser:tx-in-previous-output in))
+               (ptxid (bl.ser:outpoint-hash prevout))
+               (pidx (bl.ser:outpoint-index prevout)))
           (dolist (wtxid (gethash ptxid (orphan-pool-by-prev pool)))
             (let ((entry (gethash wtxid (orphan-pool-by-wtxid pool))))
               ;; The by-prev bucket is parent-txid-granular; confirm the
               ;; orphan spends this exact outpoint (Core's outpoint keying).
               (when (and entry
                          (some (lambda (oin)
-                                 (let ((op (bitcoin-lisp.serialization:tx-in-previous-output oin)))
-                                   (and (= (bitcoin-lisp.serialization:outpoint-index op) pidx)
-                                        (equalp (bitcoin-lisp.serialization:outpoint-hash op)
+                                 (let ((op (bl.ser:tx-in-previous-output oin)))
+                                   (and (= (bl.ser:outpoint-index op) pidx)
+                                        (equalp (bl.ser:outpoint-hash op)
                                                 ptxid))))
-                               (coerce (bitcoin-lisp.serialization:transaction-inputs
+                               (coerce (bl.ser:transaction-inputs
                                         (orphan-entry-transaction entry))
                                        'list)))
                 (pushnew wtxid to-erase :test #'equalp)))))))
@@ -424,7 +424,7 @@ number of orphans erased."
       (let ((entry (gethash wtxid (orphan-pool-by-wtxid pool))))
         (when entry (%orphan-erase-entry pool entry))))
     (when to-erase
-      (bitcoin-lisp:log-cat "mempool"
+      (bl:log-cat "mempool"
                             "Erased ~D orphan transaction~:P included or conflicted by block"
                             (length to-erase))
       (%limit-orphans pool))

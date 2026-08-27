@@ -104,7 +104,7 @@ each character instead — latin-1 — and so could not express this test at all
   "Test parsing valid JSON-RPC request"
   (let ((body "{\"jsonrpc\":\"2.0\",\"method\":\"getblockcount\",\"params\":[],\"id\":1}"))
     (multiple-value-bind (type method params id)
-        (bitcoin-lisp.rpc::parse-json-rpc-request body)
+        (bl.rpc::parse-json-rpc-request body)
       (is (eq type :single))
       (is (string= method "getblockcount"))
       (is (null params))
@@ -114,7 +114,7 @@ each character instead — latin-1 — and so could not express this test at all
   "Test parsing request with params"
   (let ((body "{\"jsonrpc\":\"2.0\",\"method\":\"getblockhash\",\"params\":[100],\"id\":\"test\"}"))
     (multiple-value-bind (type method params id)
-        (bitcoin-lisp.rpc::parse-json-rpc-request body)
+        (bl.rpc::parse-json-rpc-request body)
       (is (eq type :single))
       (is (string= method "getblockhash"))
       (is (= (first params) 100))
@@ -124,7 +124,7 @@ each character instead — latin-1 — and so could not express this test at all
   "Test parsing batch request"
   (let ((body "[{\"jsonrpc\":\"2.0\",\"method\":\"getblockcount\",\"id\":1},{\"jsonrpc\":\"2.0\",\"method\":\"getbestblockhash\",\"id\":2}]"))
     (multiple-value-bind (type requests)
-        (bitcoin-lisp.rpc::parse-json-rpc-request body)
+        (bl.rpc::parse-json-rpc-request body)
       (is (eq type :batch))
       (is (= (length requests) 2)))))
 
@@ -139,12 +139,12 @@ differently is a top-level empty array: the +json-empty-array+ sentinel.
 
 The nesting rule is the one explicit false already follows — top level only."
   (flet ((params-of (json)
-           (nth-value 2 (bitcoin-lisp.rpc::parse-json-rpc-request
+           (nth-value 2 (bl.rpc::parse-json-rpc-request
                          (format nil "{\"method\":\"m\",\"params\":~A,\"id\":1}" json)))))
     ;; The two that used to be indistinguishable.
     (let ((empty (second (params-of "[\"a\",[]]")))
           (null- (second (params-of "[\"a\",null]"))))
-      (is (eq bitcoin-lisp.rpc::+json-empty-array+ empty)
+      (is (eq bl.rpc::+json-empty-array+ empty)
           "an empty array argument did not survive as the sentinel")
       (is (null null-) "an explicit null argument must stay NIL")
       (is (not (eq empty null-)) "`[]` and null are still the same value"))
@@ -161,9 +161,9 @@ The nesting rule is the one explicit false already follows — top level only."
     (is (null (params-of "[]")))
     ;; The accessors: an empty array IS an array, null is not, and both
     ;; iterate as the empty list.
-    (is-true (bitcoin-lisp.rpc::%positional-array-p bitcoin-lisp.rpc::+json-empty-array+))
-    (is-false (bitcoin-lisp.rpc::%positional-array-p nil))
-    (is (null (bitcoin-lisp.rpc::%positional-array bitcoin-lisp.rpc::+json-empty-array+)))))
+    (is-true (bl.rpc::%positional-array-p bl.rpc::+json-empty-array+))
+    (is-false (bl.rpc::%positional-array-p nil))
+    (is (null (bl.rpc::%positional-array bl.rpc::+json-empty-array+)))))
 
 (test rpc-empty-array-argument-reaches-core-behaviour
   "What the distinction is FOR, at the two methods Core's suite checks.
@@ -178,37 +178,37 @@ empty array, so it earns the COUNT error, not a type error
         (txid "0000000000000000000000000000000000000000000000000000000000000001"))
     ;; -3, and it names the type it actually got.
     (handler-case
-        (progn (bitcoin-lisp.rpc::rpc-getrawtransaction
-                node (list txid bitcoin-lisp.rpc::+json-empty-array+))
+        (progn (bl.rpc::rpc-getrawtransaction
+                node (list txid bl.rpc::+json-empty-array+))
                (fail "an empty array verbosity raised nothing"))
-      (bitcoin-lisp.rpc::rpc-error (e)
-        (is (= -3 (bitcoin-lisp.rpc::rpc-error-code e)))
+      (bl.rpc::rpc-error (e)
+        (is (= -3 (bl.rpc::rpc-error-code e)))
         (is (search "not of expected type number"
-                    (bitcoin-lisp.rpc::rpc-error-message e))
-            "message was: ~A" (bitcoin-lisp.rpc::rpc-error-message e))))
+                    (bl.rpc::rpc-error-message e))
+            "message was: ~A" (bl.rpc::rpc-error-message e))))
     ;; Null still means the default verbosity, so it gets past the check and
     ;; fails on the transaction being absent instead.
     (handler-case
-        (progn (bitcoin-lisp.rpc::rpc-getrawtransaction node (list txid nil))
+        (progn (bl.rpc::rpc-getrawtransaction node (list txid nil))
                (fail "expected a lookup failure"))
-      (bitcoin-lisp.rpc::rpc-error (e)
-        (is (/= -3 (bitcoin-lisp.rpc::rpc-error-code e))
+      (bl.rpc::rpc-error (e)
+        (is (/= -3 (bl.rpc::rpc-error-code e))
             "null verbosity must not be read as a type error")))
     ;; The other direction: empty is an array, so the count error.
     (handler-case
-        (progn (bitcoin-lisp.rpc::rpc-testmempoolaccept
-                node (list bitcoin-lisp.rpc::+json-empty-array+))
+        (progn (bl.rpc::rpc-testmempoolaccept
+                node (list bl.rpc::+json-empty-array+))
                (fail "expected the count error"))
-      (bitcoin-lisp.rpc::rpc-error (e)
-        (is (= -8 (bitcoin-lisp.rpc::rpc-error-code e)))
+      (bl.rpc::rpc-error (e)
+        (is (= -8 (bl.rpc::rpc-error-code e)))
         (is (search "Array must contain between"
-                    (bitcoin-lisp.rpc::rpc-error-message e)))))
+                    (bl.rpc::rpc-error-message e)))))
     ;; And null is not an array at all.
     (handler-case
-        (progn (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list nil))
+        (progn (bl.rpc::rpc-testmempoolaccept node (list nil))
                (fail "expected a type error"))
-      (bitcoin-lisp.rpc::rpc-error (e)
-        (is (= -3 (bitcoin-lisp.rpc::rpc-error-code e)))))))
+      (bl.rpc::rpc-error (e)
+        (is (= -3 (bl.rpc::rpc-error-code e)))))))
 
 (test getrawtransaction-not-found-speaks-cores-sentence
   "Core selects one of four not-found messages and appends the same sentence to
@@ -218,26 +218,26 @@ advice in a spelling no caller matching Core could find."
   (let ((node (make-test-node))
         (txid "0000000000000000000000000000000000000000000000000000000000000009"))
     (handler-case
-        (progn (bitcoin-lisp.rpc::rpc-getrawtransaction node (list txid))
+        (progn (bl.rpc::rpc-getrawtransaction node (list txid))
                (fail "expected a not-found error"))
-      (bitcoin-lisp.rpc::rpc-error (e)
-        (is (= -5 (bitcoin-lisp.rpc::rpc-error-code e)))
+      (bl.rpc::rpc-error (e)
+        (is (= -5 (bl.rpc::rpc-error-code e)))
         (is (string= (concatenate 'string
                                   "No such mempool transaction. Use -txindex or provide a block "
                                   "hash to enable blockchain transaction queries. Use "
                                   "gettransaction for wallet transactions.")
-                     (bitcoin-lisp.rpc::rpc-error-message e))
-            "message was: ~A" (bitcoin-lisp.rpc::rpc-error-message e))))))
+                     (bl.rpc::rpc-error-message e))
+            "message was: ~A" (bl.rpc::rpc-error-message e))))))
 
 (test json-rpc-parse-invalid-json
   "Test parsing invalid JSON returns parse error"
-  (signals bitcoin-lisp.rpc::rpc-error
-    (bitcoin-lisp.rpc::parse-json-rpc-request "not valid json")))
+  (signals bl.rpc::rpc-error
+    (bl.rpc::parse-json-rpc-request "not valid json")))
 
 (test json-rpc-parse-missing-method
   "Test parsing request without method returns error"
-  (signals bitcoin-lisp.rpc::rpc-error
-    (bitcoin-lisp.rpc::parse-json-rpc-request "{\"jsonrpc\":\"2.0\",\"id\":1}")))
+  (signals bl.rpc::rpc-error
+    (bl.rpc::parse-json-rpc-request "{\"jsonrpc\":\"2.0\",\"id\":1}")))
 
 ;;; --- Hash Hex Helper Tests ---
 
@@ -246,13 +246,13 @@ advice in a spelling no caller matching Core could find."
   (let* ((bytes (make-array 32 :element-type '(unsigned-byte 8)
                                :initial-contents (loop for i from 0 below 32
                                                        collect (+ #xe0 (mod i 16)))))
-         (hex (bitcoin-lisp.rpc::hash-to-hex bytes)))
+         (hex (bl.rpc::hash-to-hex bytes)))
     (is (string= hex (string-downcase hex)))
     ;; Reversed: last byte (#xef) prints first.
     (is (string= "ef" (subseq hex 0 2)))
     ;; Round-trips through parse-hex-hash, which accepts either case.
-    (is (equalp bytes (bitcoin-lisp.rpc::parse-hex-hash hex)))
-    (is (equalp bytes (bitcoin-lisp.rpc::parse-hex-hash (string-upcase hex))))))
+    (is (equalp bytes (bl.rpc::parse-hex-hash hex)))
+    (is (equalp bytes (bl.rpc::parse-hex-hash (string-upcase hex))))))
 
 ;;; --- savemempool RPC Test ---
 
@@ -261,11 +261,11 @@ advice in a spelling no caller matching Core could find."
   (let* ((dir (merge-pathnames (format nil "savemempool-test-~D/" (get-universal-time))
                                (uiop:temporary-directory)))
          (node (make-test-node)))
-    (setf (bitcoin-lisp::node-data-directory node) dir)
+    (setf (bl::node-data-directory node) dir)
     (unwind-protect
-         (let ((r (bitcoin-lisp.rpc::rpc-savemempool node nil)))
+         (let ((r (bl.rpc::rpc-savemempool node nil)))
            (is (stringp (cdr (assoc "filename" r :test #'string=))))
-           (is (not (null (probe-file (bitcoin-lisp.mempool:mempool-dat-path dir))))))
+           (is (not (null (probe-file (bl.mp:mempool-dat-path dir))))))
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
 (test rpc-getdescriptorinfo
@@ -273,7 +273,7 @@ advice in a spelling no caller matching Core could find."
 the no-wallet/no-range constants; bad descriptors error."
   (let* ((node (make-test-node))
          (body "raw(76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac)")
-         (r (bitcoin-lisp.rpc::rpc-getdescriptorinfo node (list body))))
+         (r (bl.rpc::rpc-getdescriptorinfo node (list body))))
     (is (string= (concatenate 'string body "#fm24fxxy")
                  (cdr (assoc "descriptor" r :test #'string=))))
     (is (string= "fm24fxxy" (cdr (assoc "checksum" r :test #'string=))))
@@ -284,13 +284,13 @@ the no-wallet/no-range constants; bad descriptors error."
     ;; accepts a correct input checksum, rejects a wrong one and junk
     (is (string= (concatenate 'string body "#fm24fxxy")
                  (cdr (assoc "descriptor"
-                             (bitcoin-lisp.rpc::rpc-getdescriptorinfo
+                             (bl.rpc::rpc-getdescriptorinfo
                               node (list (concatenate 'string body "#fm24fxxy")))
                              :test #'string=))))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getdescriptorinfo node (list (concatenate 'string body "#deadbeef"))))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getdescriptorinfo node (list "sh(multi(2,03aa,03bb))")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getdescriptorinfo node (list (concatenate 'string body "#deadbeef"))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getdescriptorinfo node (list "sh(multi(2,03aa,03bb))")))))
 
 (test rpc-deriveaddresses
   "deriveaddresses returns the address(es) a descriptor's scriptPubKey
@@ -298,30 +298,30 @@ encodes to (checksum required); combo() yields several (P2PK skipped);
 address-less scripts error; range on an unranged descriptor rejected."
   (let* ((node (make-test-node))   ; make-test-node is :testnet3
          (pk "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-         (keyhash (bitcoin-lisp.crypto:hash160 (bitcoin-lisp.crypto:hex-to-bytes pk))))
-    (flet ((descsum (body) (bitcoin-lisp.rpc::descriptor-add-checksum body)))
+         (keyhash (bl.crypto:hash160 (bl.crypto:hex-to-bytes pk))))
+    (flet ((descsum (body) (bl.rpc::descriptor-add-checksum body)))
       ;; checksum is required (Core: "Missing checksum")
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-deriveaddresses node (list (format nil "pkh(~A)" pk))))
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-deriveaddresses node (list (format nil "pkh(~A)" pk))))
       ;; pkh -> single P2PKH address; matches the direct encoder.
-      (let ((addrs (bitcoin-lisp.rpc::rpc-deriveaddresses
+      (let ((addrs (bl.rpc::rpc-deriveaddresses
                     node (list (descsum (format nil "pkh(~A)" pk))))))
         (is (= 1 (length addrs)))
-        (is (string= (bitcoin-lisp.crypto:encode-p2pkh-address keyhash :testnet3)
+        (is (string= (bl.crypto:encode-p2pkh-address keyhash :testnet3)
                      (first addrs))))
       ;; wpkh -> single bech32 address.
-      (is (= 1 (length (bitcoin-lisp.rpc::rpc-deriveaddresses
+      (is (= 1 (length (bl.rpc::rpc-deriveaddresses
                         node (list (descsum (format nil "wpkh(~A)" pk)))))))
       ;; combo emits pk+pkh+wpkh+sh(wpkh); the address-less P2PK script is
       ;; skipped (Core DeriveAddresses), leaving 3 addresses.
-      (is (= 3 (length (bitcoin-lisp.rpc::rpc-deriveaddresses
+      (is (= 3 (length (bl.rpc::rpc-deriveaddresses
                         node (list (descsum (format nil "combo(~A)" pk)))))))
       ;; raw() non-standard script -> no address -> error
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-deriveaddresses node (list (descsum "raw(51)"))))
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-deriveaddresses node (list (descsum "raw(51)"))))
       ;; range argument rejected for an unranged descriptor
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-deriveaddresses
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-deriveaddresses
          node (list (descsum (format nil "wpkh(~A)" pk)) 5))))))
 
 ;;; --- Prioritisation RPC Tests ---
@@ -330,34 +330,34 @@ address-less scripts error; range on an unranged descriptor rejected."
   "prioritisetransaction adjusts the mempool delta map; getprioritisedtransactions
 reports fee_delta/in_mempool/modified_fee; getmempoolentry exposes fees.modified."
   (let* ((node (make-test-node))
-         (mempool (bitcoin-lisp::node-mempool node))
+         (mempool (bl::node-mempool node))
          (txid-hex (make-string 64 :initial-element #\a)))
     ;; dummy must be 0/null; fee_delta must be an integer
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-prioritisetransaction node (list txid-hex 1 1000)))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-prioritisetransaction node (list txid-hex 0 "x")))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-prioritisetransaction node (list "nothex" 0 1000)))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-prioritisetransaction node (list txid-hex 1 1000)))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-prioritisetransaction node (list txid-hex 0 "x")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-prioritisetransaction node (list "nothex" 0 1000)))
     ;; Delta for a not-in-mempool tx is recorded and reported
-    (is (eq t (bitcoin-lisp.rpc::rpc-prioritisetransaction node (list txid-hex 0 2500))))
-    (let* ((r (bitcoin-lisp.rpc::rpc-getprioritisedtransactions node nil))
+    (is (eq t (bl.rpc::rpc-prioritisetransaction node (list txid-hex 0 2500))))
+    (let* ((r (bl.rpc::rpc-getprioritisedtransactions node nil))
            (row (cdr (assoc txid-hex r :test #'string=))))
       (is (= 2500 (cdr (assoc "fee_delta" row :test #'string=))))
       ;; A Core boolean: JSON false, never null (wave-10 false/null fix).
       (is (eq 'yason:false (cdr (assoc "in_mempool" row :test #'string=)))))
     ;; Net-zero clears it; empty map encodes as an object
-    (is (eq t (bitcoin-lisp.rpc::rpc-prioritisetransaction node (list txid-hex nil -2500))))
-    (is (hash-table-p (bitcoin-lisp.rpc::rpc-getprioritisedtransactions node nil)))
-    (is (zerop (hash-table-count (bitcoin-lisp.mempool:mempool-deltas mempool))))))
+    (is (eq t (bl.rpc::rpc-prioritisetransaction node (list txid-hex nil -2500))))
+    (is (hash-table-p (bl.rpc::rpc-getprioritisedtransactions node nil)))
+    (is (zerop (hash-table-count (bl.mp:mempool-deltas mempool))))))
 
 (test rest-interface-routing-and-content-types
   "REST router: content-type negotiation, JSON reuse of RPC bodies, and
 error mapping (400 bad request / 404 not found / unknown endpoint)."
   (let ((node (make-test-node))
         (hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
-    (setf (bitcoin-lisp::node-block-store node)
-          (bitcoin-lisp.storage:init-block-store
+    (setf (bl::node-block-store node)
+          (bl.store:init-block-store
            (ensure-directories-exist
             (merge-pathnames (format nil "rest-test-~D/" (get-universal-time))
                              (uiop:temporary-directory)))))
@@ -365,35 +365,35 @@ error mapping (400 bad request / 404 not found / unknown endpoint)."
            (ctype () (hunchentoot:content-type*)))
       ;; chaininfo.json -> 200 application/json, parseable, reuses
       ;; rpc-getblockchaininfo (so has its keys).
-      (let ((body (bitcoin-lisp.rpc::rest-handle node "/rest/chaininfo.json")))
+      (let ((body (bl.rpc::rest-handle node "/rest/chaininfo.json")))
         (is (= 200 (status)))
         (is (string= "application/json" (ctype)))
         (let ((parsed (yason:parse body)))
           (is (hash-table-p parsed))
           (is (integerp (gethash "blocks" parsed)))))
       ;; mempool/info.json -> 200 json
-      (is (= 200 (progn (bitcoin-lisp.rpc::rest-handle node "/rest/mempool/info.json")
+      (is (= 200 (progn (bl.rpc::rest-handle node "/rest/mempool/info.json")
                         (status))))
       ;; chaininfo only supports .json -> unknown format is Core's 404
       ;; "output format not found"
-      (bitcoin-lisp.rpc::rest-handle node "/rest/chaininfo.hex")
+      (bl.rpc::rest-handle node "/rest/chaininfo.hex")
       (is (= 404 (status)))
       ;; malformed block hash -> 400
-      (bitcoin-lisp.rpc::rest-handle node "/rest/block/nothex.json")
+      (bl.rpc::rest-handle node "/rest/block/nothex.json")
       (is (= 400 (status)))
       ;; well-formed but absent block -> 404
-      (bitcoin-lisp.rpc::rest-handle
+      (bl.rpc::rest-handle
        node (format nil "/rest/block/~A.json" (make-string 64 :initial-element #\a)))
       (is (= 404 (status)))
       ;; absent tx -> 404
-      (bitcoin-lisp.rpc::rest-handle
+      (bl.rpc::rest-handle
        node (format nil "/rest/tx/~A.hex" (make-string 64 :initial-element #\b)))
       (is (= 404 (status)))
       ;; unknown endpoint -> 404
-      (bitcoin-lisp.rpc::rest-handle node "/rest/frobnicate.json")
+      (bl.rpc::rest-handle node "/rest/frobnicate.json")
       (is (= 404 (status)))
       ;; getutxos with a bad outpoint -> 400
-      (bitcoin-lisp.rpc::rest-handle node "/rest/getutxos/notanoutpoint.json")
+      (bl.rpc::rest-handle node "/rest/getutxos/notanoutpoint.json")
       (is (= 400 (status))))))
 
 (test rest-getutxos-reports-absence
@@ -402,7 +402,7 @@ error mapping (400 bad request / 404 not found / unknown endpoint)."
   (let ((node (make-test-node))
         (hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
     (let* ((txid (make-string 64 :initial-element #\c))
-           (body (bitcoin-lisp.rpc::rest-handle
+           (body (bl.rpc::rest-handle
                   node (format nil "/rest/getutxos/~A-0.json" txid)))
            (parsed (yason:parse body)))
       (is (= 200 (hunchentoot:return-code*)))
@@ -425,15 +425,15 @@ recovers exactly the matched leaves, across tree sizes and match sets."
   (dolist (ntx '(1 2 3 4 5 7 8 16))
     (let* ((txids (%proof-hashes ntx))
            (txid-vec (coerce txids 'vector))
-           (root (bitcoin-lisp.validation:compute-merkle-root txids))
+           (root (bl.val:compute-merkle-root txids))
            ;; Match the first and last leaf (and the middle for larger trees).
            (want (remove-duplicates (list 0 (1- ntx) (floor ntx 2))))
            (match (make-array ntx :initial-element nil)))
       (dolist (i want) (setf (aref match i) t))
       (multiple-value-bind (bits hashes)
-          (bitcoin-lisp.rpc::build-partial-merkle-tree txid-vec match)
+          (bl.rpc::build-partial-merkle-tree txid-vec match)
         (multiple-value-bind (xroot xmatched xindices)
-            (bitcoin-lisp.rpc::extract-partial-merkle-tree ntx bits hashes)
+            (bl.rpc::extract-partial-merkle-tree ntx bits hashes)
           (is (equalp root xroot) "ntx=~D root mismatch" ntx)
           (is (equal (sort (copy-list want) #'<) xindices) "ntx=~D indices" ntx)
           (is (= (length want) (length xmatched)))
@@ -449,71 +449,71 @@ recovers exactly the matched leaves, across tree sizes and match sets."
          (match (make-array ntx :initial-element nil)))
     (setf (aref match 2) t)
     (multiple-value-bind (bits hashes)
-        (bitcoin-lisp.rpc::build-partial-merkle-tree txid-vec match)
+        (bl.rpc::build-partial-merkle-tree txid-vec match)
       (let* ((header (make-array 80 :element-type '(unsigned-byte 8) :initial-element 7))
-             (bytes (bitcoin-lisp.rpc::serialize-merkle-block header ntx hashes bits)))
+             (bytes (bl.rpc::serialize-merkle-block header ntx hashes bits)))
         (multiple-value-bind (h2 ntx2 hashes2 bits2)
-            (bitcoin-lisp.rpc::parse-merkle-block bytes)
+            (bl.rpc::parse-merkle-block bytes)
           (is (equalp header h2))
           (is (= ntx ntx2))
           (is (equalp hashes hashes2))
           ;; bits round-trip up to the byte padding zeros
           (is (equal bits (subseq bits2 0 (length bits))))
           ;; and re-extract gives the same root
-          (is (equalp (bitcoin-lisp.rpc::extract-partial-merkle-tree ntx bits hashes)
-                      (bitcoin-lisp.rpc::extract-partial-merkle-tree ntx2 bits2 hashes2))))))))
+          (is (equalp (bl.rpc::extract-partial-merkle-tree ntx bits hashes)
+                      (bl.rpc::extract-partial-merkle-tree ntx2 bits2 hashes2))))))))
 
 (test txoutproof-tamper-detected
   "Flipping a hash in the partial tree changes the recomputed root."
   (let* ((ntx 8)
          (txids (%proof-hashes ntx))
          (txid-vec (coerce txids 'vector))
-         (root (bitcoin-lisp.validation:compute-merkle-root txids))
+         (root (bl.val:compute-merkle-root txids))
          (match (make-array ntx :initial-element nil)))
     (setf (aref match 3) t)
     (multiple-value-bind (bits hashes)
-        (bitcoin-lisp.rpc::build-partial-merkle-tree txid-vec match)
+        (bl.rpc::build-partial-merkle-tree txid-vec match)
       (let ((tampered (mapcar #'copy-seq hashes)))
         (setf (aref (first tampered) 0) (logxor (aref (first tampered) 0) #xff))
-        (is (not (equalp root (bitcoin-lisp.rpc::extract-partial-merkle-tree
+        (is (not (equalp root (bl.rpc::extract-partial-merkle-tree
                                ntx bits tampered))))))))
 
 (test rpc-txoutproof-roundtrip
   "gettxoutproof builds a proof a real block, verifytxoutproof confirms it
 when the block is on the active chain and rejects a root-mismatched proof."
   (let* ((node (make-test-node))
-         (chain-state (bitcoin-lisp::node-chain-state node))
+         (chain-state (bl::node-chain-state node))
          (dir (ensure-directories-exist
                (merge-pathnames (format nil "txoutproof-~D/" (get-universal-time))
                                 (uiop:temporary-directory))))
-         (block-store (bitcoin-lisp.storage:init-block-store dir)))
-    (setf (bitcoin-lisp::node-block-store node) block-store)
+         (block-store (bl.store:init-block-store dir)))
+    (setf (bl::node-block-store node) block-store)
     ;; Build a 4-tx block (distinct coinbase-shaped txs).
     (let* ((txs (loop for i from 0 below 4
-                      collect (bitcoin-lisp.serialization:make-transaction
+                      collect (bl.ser:make-transaction
                                :version 1
-                               :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                                                :previous-output (bitcoin-lisp.serialization:make-outpoint
+                               :inputs (vector (bl.ser:make-tx-in
+                                                :previous-output (bl.ser:make-outpoint
                                                                   :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                                                                   :index #xffffffff)
                                                 :script-sig (make-array 2 :element-type '(unsigned-byte 8) :initial-element i)
                                                 :sequence #xffffffff))
-                               :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                               :outputs (vector (bl.ser:make-tx-out
                                                  :value 1000 :script-pubkey (make-array 4 :element-type '(unsigned-byte 8) :initial-element #x6a)))
                                :lock-time 0)))
-           (txids (mapcar #'bitcoin-lisp.serialization:transaction-hash txs))
-           (root (bitcoin-lisp.validation:compute-merkle-root txids))
-           (header (bitcoin-lisp.serialization:make-block-header
+           (txids (mapcar #'bl.ser:transaction-hash txs))
+           (root (bl.val:compute-merkle-root txids))
+           (header (bl.ser:make-block-header
                     :version 1
                     :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                     :merkle-root root :timestamp 1700000000 :bits #x207fffff :nonce 0))
-           (block (bitcoin-lisp.serialization:make-bitcoin-block :header header :transactions txs))
-           (block-hash (bitcoin-lisp.serialization:block-header-hash header)))
+           (block (bl.ser:make-bitcoin-block :header header :transactions txs))
+           (block-hash (bl.ser:block-header-hash header)))
       (unwind-protect
            (progn
-             (bitcoin-lisp.storage:store-block block-store block)
-             (bitcoin-lisp.storage:add-block-index-entry
-              chain-state (bitcoin-lisp.storage:make-block-index-entry
+             (bl.store:store-block block-store block)
+             (bl.store:add-block-index-entry
+              chain-state (bl.store:make-block-index-entry
                            :hash block-hash :height 0 :header header
                            ;; TX-COUNT is what verifytxoutproof compares the
                            ;; proof's claimed count against (Core
@@ -524,16 +524,16 @@ when the block is on the active chain and rejects a root-mismatched proof."
                            ;; for nTx == 0 just as we now do.
                            :tx-count 4
                            :chain-work 1 :status :valid))
-             (bitcoin-lisp.storage:update-chain-tip chain-state block-hash 0)
-             (let* ((target (bitcoin-lisp.rpc::hash-to-hex (second txids)))
-                    (proof (bitcoin-lisp.rpc::rpc-gettxoutproof
-                            node (list (list target) (bitcoin-lisp.rpc::hash-to-hex block-hash))))
-                    (verified (bitcoin-lisp.rpc::rpc-verifytxoutproof node (list proof))))
+             (bl.store:update-chain-tip chain-state block-hash 0)
+             (let* ((target (bl.rpc::hash-to-hex (second txids)))
+                    (proof (bl.rpc::rpc-gettxoutproof
+                            node (list (list target) (bl.rpc::hash-to-hex block-hash))))
+                    (verified (bl.rpc::rpc-verifytxoutproof node (list proof))))
                (is (stringp proof))
                (is (equal (list target) verified))
                ;; Corrupt the proof's last hex nibble -> root/parse mismatch -> error.
-               (signals bitcoin-lisp.rpc::rpc-error
-                 (bitcoin-lisp.rpc::rpc-verifytxoutproof
+               (signals bl.rpc::rpc-error
+                 (bl.rpc::rpc-verifytxoutproof
                   node (list (concatenate 'string (subseq proof 0 (- (length proof) 2)) "ff"))))
                ;; Same proof once its block is off the active chain. Core
                ;; THROWS RPC_INVALID_ADDRESS_OR_KEY "Block not found in chain"
@@ -548,13 +548,13 @@ when the block is on the active chain and rejects a root-mismatched proof."
                ;; (Control: the (equal (list target) verified) assertion above
                ;; is the same proof while the block IS on the active chain.)
                (let ((sibling (make-32-byte-hash 200)))
-                 (bitcoin-lisp.storage:add-block-index-entry
-                  chain-state (bitcoin-lisp.storage:make-block-index-entry
+                 (bl.store:add-block-index-entry
+                  chain-state (bl.store:make-block-index-entry
                                :hash sibling :height 0 :header header
                                :chain-work 2 :status :valid))
-                 (bitcoin-lisp.storage:update-chain-tip chain-state sibling 0)
-                 (signals bitcoin-lisp.rpc::rpc-error
-                   (bitcoin-lisp.rpc::rpc-verifytxoutproof node (list proof))))))
+                 (bl.store:update-chain-tip chain-state sibling 0)
+                 (signals bl.rpc::rpc-error
+                   (bl.rpc::rpc-verifytxoutproof node (list proof))))))
         (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
 
 ;;; dumptxoutset / loadtxoutset (Core snapshot v2 format) tests live in
@@ -566,14 +566,14 @@ when the block is on the active chain and rejects a root-mismatched proof."
   "descriptor-checksum matches Bitcoin Core's documented example
 (descriptor.cpp's EXAMPLE_DESCRIPTOR_RAW), and validation round-trips."
   (let ((body "raw(76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac)"))
-    (is (string= "fm24fxxy" (bitcoin-lisp.rpc::descriptor-checksum body)))
+    (is (string= "fm24fxxy" (bl.rpc::descriptor-checksum body)))
     (is (string= (concatenate 'string body "#fm24fxxy")
-                 (bitcoin-lisp.rpc::descriptor-add-checksum body)))
+                 (bl.rpc::descriptor-add-checksum body)))
     ;; Correct checksum accepted, wrong checksum rejected.
-    (finishes (bitcoin-lisp.rpc::parse-output-descriptor
+    (finishes (bl.rpc::parse-output-descriptor
                (concatenate 'string body "#fm24fxxy") :mainnet))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::parse-output-descriptor
+    (signals bl.rpc::rpc-error
+      (bl.rpc::parse-output-descriptor
        (concatenate 'string body "#fm24fxxx") :mainnet))))
 
 (test descriptor-parse-forms
@@ -581,81 +581,81 @@ when the block is on the active chain and rejects a root-mismatched proof."
 Cross-checked against Core: addr(12cbQLTFMXRnSzktFkuoG3eHoMeFtpTu3S) is
 documented in descriptor.cpp as the address of the raw() example script."
   (let* ((pubkey-hex "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-         (pubkey (bitcoin-lisp.crypto:hex-to-bytes pubkey-hex))
-         (keyhash (bitcoin-lisp.crypto:hash160 pubkey)))
+         (pubkey (bl.crypto:hex-to-bytes pubkey-hex))
+         (keyhash (bl.crypto:hash160 pubkey)))
     ;; addr() == Core's raw() example script
-    (let ((pairs (bitcoin-lisp.rpc::parse-output-descriptor
+    (let ((pairs (bl.rpc::parse-output-descriptor
                   "addr(12cbQLTFMXRnSzktFkuoG3eHoMeFtpTu3S)" :mainnet)))
       (is (= 1 (length pairs)))
       (is (string= "76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac"
-                   (bitcoin-lisp.crypto:bytes-to-hex (car (first pairs))))))
+                   (bl.crypto:bytes-to-hex (car (first pairs))))))
     ;; raw() passes bytes through
-    (let ((pairs (bitcoin-lisp.rpc::parse-output-descriptor "raw(51)" :mainnet)))
+    (let ((pairs (bl.rpc::parse-output-descriptor "raw(51)" :mainnet)))
       (is (equalp #(#x51) (car (first pairs)))))
     ;; pkh(): OP_DUP OP_HASH160 <h160> OP_EQUALVERIFY OP_CHECKSIG
-    (let ((script (car (first (bitcoin-lisp.rpc::parse-output-descriptor
+    (let ((script (car (first (bl.rpc::parse-output-descriptor
                                (format nil "pkh(~A)" pubkey-hex) :mainnet)))))
       (is (= 25 (length script)))
       (is (equalp keyhash (subseq script 3 23))))
     ;; wpkh(): OP_0 <h160>
-    (let ((script (car (first (bitcoin-lisp.rpc::parse-output-descriptor
+    (let ((script (car (first (bl.rpc::parse-output-descriptor
                                (format nil "wpkh(~A)" pubkey-hex) :mainnet)))))
       (is (= 22 (length script)))
       (is (= #x00 (aref script 0)))
       (is (equalp keyhash (subseq script 2))))
     ;; sh(wpkh()): P2SH of the wpkh script
-    (let ((script (car (first (bitcoin-lisp.rpc::parse-output-descriptor
+    (let ((script (car (first (bl.rpc::parse-output-descriptor
                                (format nil "sh(wpkh(~A))" pubkey-hex) :mainnet)))))
       (is (= 23 (length script)))
       (is (= #xa9 (aref script 0))))
     ;; combo(): 4 scripts for a compressed key, 2 for uncompressed
-    (is (= 4 (length (bitcoin-lisp.rpc::parse-output-descriptor
+    (is (= 4 (length (bl.rpc::parse-output-descriptor
                       (format nil "combo(~A)" pubkey-hex) :mainnet))))
     ;; rawtr(): OP_1 <32-byte key as-is>
     (let* ((xonly-hex (subseq pubkey-hex 2))
-           (script (car (first (bitcoin-lisp.rpc::parse-output-descriptor
+           (script (car (first (bl.rpc::parse-output-descriptor
                                 (format nil "rawtr(~A)" xonly-hex) :mainnet)))))
       (is (= 34 (length script)))
       (is (= #x51 (aref script 0)))
-      (is (equalp (bitcoin-lisp.crypto:hex-to-bytes xonly-hex)
+      (is (equalp (bl.crypto:hex-to-bytes xonly-hex)
                   (subseq script 2))))
     ;; tr(): tweaked output key differs from the internal key
     (let* ((xonly-hex (subseq pubkey-hex 2))
-           (script (car (first (bitcoin-lisp.rpc::parse-output-descriptor
+           (script (car (first (bl.rpc::parse-output-descriptor
                                 (format nil "tr(~A)" xonly-hex) :mainnet)))))
       (is (= 34 (length script)))
       (is (= #x51 (aref script 0)))
-      (is (not (equalp (bitcoin-lisp.crypto:hex-to-bytes xonly-hex)
+      (is (not (equalp (bl.crypto:hex-to-bytes xonly-hex)
                        (subseq script 2)))))
     ;; Unsupported / invalid forms signal rpc-error
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::parse-output-descriptor "sh(multi(2,03aa,03bb))" :mainnet))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::parse-output-descriptor "addr(notanaddress)" :mainnet))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::parse-output-descriptor
+    (signals bl.rpc::rpc-error
+      (bl.rpc::parse-output-descriptor "sh(multi(2,03aa,03bb))" :mainnet))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::parse-output-descriptor "addr(notanaddress)" :mainnet))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::parse-output-descriptor
        (format nil "wpkh(04~A)" (subseq pubkey-hex 2)) :mainnet))))
 
 (test rpc-scantxoutset-start-status-abort
   "scantxoutset start scans the UTXO set against descriptor needles;
 status with no scan running returns null; abort with no scan is a no-op."
   (let* ((node (make-test-node))
-         (utxo (bitcoin-lisp::node-utxo-set node))
+         (utxo (bl::node-utxo-set node))
          (keyhash (make-array 20 :element-type '(unsigned-byte 8)
                                  :initial-element 7))
-         (address (bitcoin-lisp.crypto:encode-p2pkh-address keyhash :testnet3))
+         (address (bl.crypto:encode-p2pkh-address keyhash :testnet3))
          (p2pkh (concatenate '(vector (unsigned-byte 8))
                              #(#x76 #xa9 #x14) keyhash #(#x88 #xac)))
          (txid-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
          (txid-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))
          (txid-c (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)))
     ;; Two matching coins (addr + raw needles) and one non-matching.
-    (bitcoin-lisp.storage:add-utxo utxo txid-a 0 150000000 p2pkh 0)
-    (bitcoin-lisp.storage:add-utxo utxo txid-b 1 50000000
+    (bl.store:add-utxo utxo txid-a 0 150000000 p2pkh 0)
+    (bl.store:add-utxo utxo txid-b 1 50000000
                                    (coerce #(#x51) '(vector (unsigned-byte 8))) 0)
-    (bitcoin-lisp.storage:add-utxo utxo txid-c 0 1000
+    (bl.store:add-utxo utxo txid-c 0 1000
                                    (make-array 25 :element-type '(unsigned-byte 8)) 0)
-    (let ((r (bitcoin-lisp.rpc::rpc-scantxoutset
+    (let ((r (bl.rpc::rpc-scantxoutset
               node (list "start" (list (format nil "addr(~A)" address) "raw(51)")))))
       (is (eq t (cdr (assoc "success" r :test #'string=))))
       (is (= 3 (cdr (assoc "txouts" r :test #'string=))))
@@ -667,26 +667,26 @@ status with no scan running returns null; abort with no scan is a no-op."
       (is (= 2.0 (cdr (assoc "total_amount" r :test #'string=)))))
     ;; No scan running: status -> null (Core NullUniValue); abort -> a bare
     ;; JSON false (nothing to abort).
-    (is (null (bitcoin-lisp.rpc::rpc-scantxoutset node (list "status"))))
-    (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-scantxoutset node (list "abort"))))
+    (is (null (bl.rpc::rpc-scantxoutset node (list "status"))))
+    (is (eq 'yason:false (bl.rpc::rpc-scantxoutset node (list "abort"))))
     ;; Bad action / missing scanobjects -> errors.
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-scantxoutset node (list "frobnicate")))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-scantxoutset node (list "start")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-scantxoutset node (list "frobnicate")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-scantxoutset node (list "start")))))
 
 ;;; --- Response Formatting Tests ---
 
 (test json-rpc-response-success
   "Test successful response format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-response 42 "test-id" :v2)))
+  (let ((response (bl.rpc::make-rpc-response 42 "test-id" :v2)))
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (= (gethash "result" response) 42))
     (is (string= (gethash "id" response) "test-id"))))
 
 (test json-rpc-response-error
   "Test error response format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" "test-id" :v2)))
+  (let ((response (bl.rpc::make-rpc-error-response -32601 "Method not found" "test-id" :v2)))
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (string= (gethash "id" response) "test-id"))
     (let ((error-obj (gethash "error" response)))
@@ -697,55 +697,55 @@ status with no scan running returns null; abort with no scan is a no-op."
 
 (test valid-hex-hash
   "Test hex hash validation"
-  (is (bitcoin-lisp.rpc::valid-hex-hash-p
+  (is (bl.rpc::valid-hex-hash-p
        "0000000000000000000000000000000000000000000000000000000000000000"))
-  (is (bitcoin-lisp.rpc::valid-hex-hash-p
+  (is (bl.rpc::valid-hex-hash-p
        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"))
-  (is (not (bitcoin-lisp.rpc::valid-hex-hash-p "tooshort")))
-  (is (not (bitcoin-lisp.rpc::valid-hex-hash-p
+  (is (not (bl.rpc::valid-hex-hash-p "tooshort")))
+  (is (not (bl.rpc::valid-hex-hash-p
             "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))
-  (is (not (bitcoin-lisp.rpc::valid-hex-hash-p nil))))
+  (is (not (bl.rpc::valid-hex-hash-p nil))))
 
 ;;; --- Method Registry Tests ---
 
 (test method-dispatch-unknown
   "Test dispatching unknown method returns error"
-  (signals bitcoin-lisp.rpc::rpc-error
-    (bitcoin-lisp.rpc:dispatch-rpc-method nil "unknownmethod" nil)))
+  (signals bl.rpc::rpc-error
+    (bl.rpc:dispatch-rpc-method nil "unknownmethod" nil)))
 
 ;;; --- Integration Tests ---
 
 (test rpc-server-lifecycle
   "Test RPC server start/stop"
   ;; Make sure no server is running
-  (bitcoin-lisp.rpc:stop-rpc-server)
-  (is (null bitcoin-lisp.rpc:*rpc-server*))
+  (bl.rpc:stop-rpc-server)
+  (is (null bl.rpc:*rpc-server*))
 
   ;; Start on an unusual port to avoid conflicts
   (with-rpc-test-datadir (dir)
     (let ((node (make-test-node)))
-      (setf (bitcoin-lisp::node-data-directory node) dir)
-      (bitcoin-lisp.rpc:start-rpc-server node :port 19999)
-      (is (not (null bitcoin-lisp.rpc:*rpc-server*)))
+      (setf (bl::node-data-directory node) dir)
+      (bl.rpc:start-rpc-server node :port 19999)
+      (is (not (null bl.rpc:*rpc-server*)))
 
       ;; Stop server
-      (bitcoin-lisp.rpc:stop-rpc-server)
-      (is (null bitcoin-lisp.rpc:*rpc-server*)))))
+      (bl.rpc:stop-rpc-server)
+      (is (null bl.rpc:*rpc-server*)))))
 
 ;;; --- Helper to create initialized test node ---
 
 (defun make-test-node ()
   "Create a node with minimal initialized state for testing."
-  (let ((node (bitcoin-lisp::make-node :network :testnet3)))
+  (let ((node (bl::make-node :network :testnet3)))
     ;; Initialize chain-state
-    (setf (bitcoin-lisp::node-chain-state node)
-          (bitcoin-lisp.storage:make-chain-state))
+    (setf (bl::node-chain-state node)
+          (bl.store:make-chain-state))
     ;; Initialize UTXO set
-    (setf (bitcoin-lisp::node-utxo-set node)
-          (bitcoin-lisp.storage:make-utxo-set))
+    (setf (bl::node-utxo-set node)
+          (bl.store:make-utxo-set))
     ;; Initialize mempool
-    (setf (bitcoin-lisp::node-mempool node)
-          (bitcoin-lisp.mempool:make-mempool))
+    (setf (bl::node-mempool node)
+          (bl.mp:make-mempool))
     node))
 
 ;;; --- Blockchain Query Method Tests (3.11) ---
@@ -753,7 +753,7 @@ status with no scan running returns null; abort with no scan is a no-op."
 (test rpc-getblockchaininfo
   "Test getblockchaininfo returns expected fields"
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-getblockchaininfo node nil)))
+         (result (bl.rpc::rpc-getblockchaininfo node nil)))
     ;; Check required fields exist
     (is (assoc "chain" result :test #'string=))
     (is (assoc "blocks" result :test #'string=))
@@ -773,12 +773,12 @@ status with no scan running returns null; abort with no scan is a no-op."
     (is (= 8 (length (cdr (assoc "bits" result :test #'string=)))))
     ;; encodes cleanly through yason (warnings is an empty JSON array, etc.)
     (is (stringp (with-output-to-string (s)
-                   (yason:encode (bitcoin-lisp.rpc::make-rpc-response result "id" :v2) s))))))
+                   (yason:encode (bl.rpc::make-rpc-response result "id" :v2) s))))))
 
 (test rpc-getblockcount
   "Test getblockcount returns integer"
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-getblockcount node nil)))
+         (result (bl.rpc::rpc-getblockcount node nil)))
     (is (integerp result))
     (is (>= result 0))))
 
@@ -786,31 +786,31 @@ status with no scan running returns null; abort with no scan is a no-op."
   "Test getblockhash with invalid height returns error"
   (let ((node (make-test-node)))
     ;; Negative height
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockhash node '(-1)))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockhash node '(-1)))
     ;; Non-integer height
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockhash node '("abc")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockhash node '("abc")))))
 
 (test rpc-getblock-invalid-hash
   "Test getblock with invalid hash returns error"
   (let ((node (make-test-node)))
     ;; Too short
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblock node '("abc")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblock node '("abc")))
     ;; Invalid characters
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblock node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblock node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))
     ;; Non-integer/non-bool verbosity (Core: type error; any integer is valid)
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblock node
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblock node
         '("0000000000000000000000000000000000000000000000000000000000000000" "5")))))
 
 (test rpc-getblockheader-invalid-hash
   "Test getblockheader with invalid hash returns error"
   (let ((node (make-test-node)))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockheader node '("tooshort")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockheader node '("tooshort")))))
 
 ;;; --- getrawtransaction verbosity + witness-complete hex ---
 
@@ -820,35 +820,35 @@ EncodeHexTx — and the verbosity argument follows Core ParseVerbosity: 0, false
 and absent return hex (verbosity 0 is Core's default but was truthy in Lisp);
 1, true and 2 return the decoded object; a string errors."
   (let* ((node (make-test-node))
-         (mempool (bitcoin-lisp::node-mempool node))
+         (mempool (bl::node-mempool node))
          (raw (make-witness-test-tx-bytes))
          (tx (flexi-streams:with-input-from-sequence (s raw)
-               (bitcoin-lisp.serialization:read-transaction s)))
-         (txid (bitcoin-lisp.serialization:transaction-hash tx))
-         (txid-hex (bitcoin-lisp.rpc::hash-to-hex txid)))
-    (is (eq :ok (bitcoin-lisp.mempool:mempool-add
-                 mempool txid (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))))
+               (bl.ser:read-transaction s)))
+         (txid (bl.ser:transaction-hash tx))
+         (txid-hex (bl.rpc::hash-to-hex txid)))
+    (is (eq :ok (bl.mp:mempool-add
+                 mempool txid (bl.mp:make-entry-from-tx tx 1000 0))))
     ;; Hex-returning verbosities: absent, 0, false (NIL).
     (dolist (params (list (list txid-hex)
                           (list txid-hex 0)
                           (list txid-hex nil)))
-      (let ((hex (bitcoin-lisp.rpc::rpc-getrawtransaction node params)))
+      (let ((hex (bl.rpc::rpc-getrawtransaction node params)))
         (is (stringp hex))
         ;; Byte-exact wire bytes: witnesses intact through a round-trip.
-        (is (equalp raw (bitcoin-lisp.crypto:hex-to-bytes hex)))))
+        (is (equalp raw (bl.crypto:hex-to-bytes hex)))))
     ;; Object-returning verbosities: 1, true, 2.
     (dolist (params (list (list txid-hex 1)
                           (list txid-hex t)
                           (list txid-hex 2)))
-      (let ((r (bitcoin-lisp.rpc::rpc-getrawtransaction node params)))
+      (let ((r (bl.rpc::rpc-getrawtransaction node params)))
         (is (consp r))
         (is (string= txid-hex (cdr (assoc "txid" r :test #'string=))))
         ;; The object's hex field is the wire encoding too.
-        (is (equalp raw (bitcoin-lisp.crypto:hex-to-bytes
+        (is (equalp raw (bl.crypto:hex-to-bytes
                          (cdr (assoc "hex" r :test #'string=)))))))
     ;; Non-integer/non-bool verbosity → type error (Core getInt<int> throw).
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getrawtransaction node (list txid-hex "abc")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getrawtransaction node (list txid-hex "abc")))))
 
 ;;; --- getorphantxs wire hex + verbosity validation ---
 
@@ -858,20 +858,20 @@ OrphanToJSON's ComputeTotalSize/EncodeHexTx — and getorphantxs rejects
 out-of-range or boolean verbosity like Core (ParseVerbosity allow_bool=false)."
   (let* ((raw (make-witness-test-tx-bytes))
          (tx (flexi-streams:with-input-from-sequence (s raw)
-               (bitcoin-lisp.serialization:read-transaction s)))
-         (o (bitcoin-lisp.rpc::%orphan-tx-json tx nil t)))
+               (bl.ser:read-transaction s)))
+         (o (bl.rpc::%orphan-tx-json tx nil t)))
     (is (= (length raw) (cdr (assoc "bytes" o :test #'string=))))
-    (is (equalp raw (bitcoin-lisp.crypto:hex-to-bytes
+    (is (equalp raw (bl.crypto:hex-to-bytes
                      (cdr (assoc "hex" o :test #'string=))))))
   (let ((node (make-test-node)))
     ;; An empty orphanage is Core's empty VARR. This used to assert
     ;; (null ...), i.e. the bug: NIL encodes as JSON null, not [].
-    (is (equalp #() (bitcoin-lisp.rpc::rpc-getorphantxs node nil)))
-    (is (equalp #() (bitcoin-lisp.rpc::rpc-getorphantxs node (list 2))))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getorphantxs node (list 3)))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getorphantxs node (list t)))))
+    (is (equalp #() (bl.rpc::rpc-getorphantxs node nil)))
+    (is (equalp #() (bl.rpc::rpc-getorphantxs node (list 2))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getorphantxs node (list 3)))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getorphantxs node (list t)))))
 
 ;;; --- Empty collections render [] / {} , never null ---
 
@@ -881,39 +881,39 @@ encoder the RPC server uses (rpc-result->json, then yason). Asserting on the
 Lisp value alone would not catch this bug: NIL is a perfectly good empty list
 in CL and only becomes wrong at the encoder."
   (with-output-to-string (s)
-    (yason:encode (bitcoin-lisp.rpc::rpc-result->json result) s)))
+    (yason:encode (bl.rpc::rpc-result->json result) s)))
 
 (test rpc-empty-collections-encode-as-array-or-object
   "Core builds every collection as a UniValue VARR/VOBJ, so an EMPTY one
 renders [] (or {}), never null. Our encoder maps CL NIL to JSON null, so each
 producing site coerces with json-array / json-object. Verified live before the
 fix: listbanned and getaddednodeinfo answered result:null."
-  (bitcoin-lisp.networking:clear-ban-list)
+  (bl.net:clear-ban-list)
   (let* ((node (make-test-node))
-         (mempool (bitcoin-lisp::node-mempool node)))
+         (mempool (bl::node-mempool node)))
     ;; The premise: a bare NIL really does encode as null. Without this the
     ;; assertions below could pass for the wrong reason.
     (is (string= "null" (%encode-rpc-result nil)))
     ;; Arrays (Core VARR).
-    (dolist (site (list (cons "getpeerinfo" (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
-                        (cons "listbanned" (bitcoin-lisp.rpc::rpc-listbanned node nil))
-                        (cons "getorphantxs" (bitcoin-lisp.rpc::rpc-getorphantxs node nil))
+    (dolist (site (list (cons "getpeerinfo" (bl.rpc::rpc-getpeerinfo node nil))
+                        (cons "listbanned" (bl.rpc::rpc-listbanned node nil))
+                        (cons "getorphantxs" (bl.rpc::rpc-getorphantxs node nil))
                         (cons "getnodeaddresses"
-                              (bitcoin-lisp.rpc::rpc-getnodeaddresses node (list 0)))
+                              (bl.rpc::rpc-getnodeaddresses node (list 0)))
                         (cons "getaddednodeinfo"
-                              (bitcoin-lisp.rpc::rpc-getaddednodeinfo node nil))
+                              (bl.rpc::rpc-getaddednodeinfo node nil))
                         (cons "getrawmempool"
-                              (bitcoin-lisp.rpc::rpc-getrawmempool node nil))
+                              (bl.rpc::rpc-getrawmempool node nil))
                         (cons "getmempoolancestors"
-                              (bitcoin-lisp.rpc::%mempool-set->result
+                              (bl.rpc::%mempool-set->result
                                mempool (make-hash-table :test 'equalp) nil))
                         (cons "getnetworkinfo.localaddresses"
                               (cdr (assoc "localaddresses"
-                                          (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
+                                          (bl.rpc::rpc-getnetworkinfo node nil)
                                           :test #'string=)))
                         (cons "scantxoutset.unspents"
                               (cdr (assoc "unspents"
-                                          (bitcoin-lisp.rpc::rpc-scantxoutset
+                                          (bl.rpc::rpc-scantxoutset
                                            node (list "start" (list "raw(51)")))
                                           :test #'string=)))))
       (is (string= "[]" (%encode-rpc-result (cdr site)))
@@ -922,39 +922,39 @@ fix: listbanned and getaddednodeinfo answered result:null."
     ;; Objects (Core VOBJ): getrawmempool's VERBOSE form is a txid-keyed
     ;; object, so its empty case is {} and NOT [].
     (dolist (site (list (cons "getrawmempool verbose"
-                              (bitcoin-lisp.rpc::rpc-getrawmempool node (list t)))
+                              (bl.rpc::rpc-getrawmempool node (list t)))
                         (cons "getmempooldescendants verbose"
-                              (bitcoin-lisp.rpc::%mempool-set->result
+                              (bl.rpc::%mempool-set->result
                                mempool (make-hash-table :test 'equalp) t))))
       (is (string= "{}" (%encode-rpc-result (cdr site)))
           "~A must render {} when empty, got ~A"
           (car site) (%encode-rpc-result (cdr site))))
     ;; A node with no mempool at all takes getrawmempool's other early branch,
     ;; which must still pick the shape by verbosity.
-    (setf (bitcoin-lisp::node-mempool node) nil)
-    (is (string= "[]" (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getrawmempool node nil))))
-    (is (string= "{}" (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getrawmempool node (list t))))))
+    (setf (bl::node-mempool node) nil)
+    (is (string= "[]" (%encode-rpc-result (bl.rpc::rpc-getrawmempool node nil))))
+    (is (string= "{}" (%encode-rpc-result (bl.rpc::rpc-getrawmempool node (list t))))))
   ;; CONTROL 1 — populated collections keep their existing shape: an array of
   ;; JSON objects, not a vector of unencodable dotted pairs.
   (let ((node (make-test-node)))
-    (setf (bitcoin-lisp::node-peers node)
-          (list (bitcoin-lisp::make-peer :address "1.2.3.4:48333" :user-agent "/t/" :state :ready)))
-    (bitcoin-lisp.rpc::rpc-addnode node (list "192.0.2.10:48333" "add"))
-    (bitcoin-lisp.rpc::rpc-setban node (list "1.2.3.4" "add"))
-    (let ((peers (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getpeerinfo node nil)))
-          (bans (%encode-rpc-result (bitcoin-lisp.rpc::rpc-listbanned node nil)))
-          (added (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getaddednodeinfo node nil))))
+    (setf (bl::node-peers node)
+          (list (bl::make-peer :address "1.2.3.4:48333" :user-agent "/t/" :state :ready)))
+    (bl.rpc::rpc-addnode node (list "192.0.2.10:48333" "add"))
+    (bl.rpc::rpc-setban node (list "1.2.3.4" "add"))
+    (let ((peers (%encode-rpc-result (bl.rpc::rpc-getpeerinfo node nil)))
+          (bans (%encode-rpc-result (bl.rpc::rpc-listbanned node nil)))
+          (added (%encode-rpc-result (bl.rpc::rpc-getaddednodeinfo node nil))))
       (is (eql 0 (search "[{" peers)))
       (is (eql 0 (search "[{" bans)))
       (is (search "\"address\":\"1.2.3.4\"" bans))
       (is (eql 0 (search "[{" added)))
       ;; ... and a populated row's own empty nested array is [] too.
       (is (search "\"addresses\":[]" added)))
-    (bitcoin-lisp.networking:clear-ban-list))
+    (bl.net:clear-ban-list))
   ;; CONTROL 2 — NIL must still mean null where Core returns null. This is why
   ;; the fix is per-site and not a global normalizer in rpc-result->json.
   (is (string= "null" (%encode-rpc-result
-                       (bitcoin-lisp.rpc::rpc-scantxoutset (make-test-node) (list "status"))))))
+                       (bl.rpc::rpc-scantxoutset (make-test-node) (list "status"))))))
 
 ;;; --- UTXO Query Method Tests (4.3) ---
 
@@ -962,28 +962,28 @@ fix: listbanned and getaddednodeinfo answered result:null."
   "Test gettxout with invalid txid returns error"
   (let ((node (make-test-node)))
     ;; Too short txid
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-gettxout node '("abc" 0)))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-gettxout node '("abc" 0)))
     ;; Invalid characters
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-gettxout node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" 0)))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-gettxout node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" 0)))))
 
 (test rpc-gettxout-invalid-vout
   "Test gettxout with invalid vout returns error"
   (let ((node (make-test-node)))
     ;; Negative vout
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-gettxout node
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-gettxout node
         '("0000000000000000000000000000000000000000000000000000000000000000" -1)))
     ;; Non-integer vout
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-gettxout node
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-gettxout node
         '("0000000000000000000000000000000000000000000000000000000000000000" "abc")))))
 
 (test rpc-gettxout-nonexistent
   "Test gettxout with nonexistent UTXO returns nil"
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-gettxout node
+         (result (bl.rpc::rpc-gettxout node
                    '("0000000000000000000000000000000000000000000000000000000000000000" 0))))
     ;; Nonexistent UTXO should return nil
     (is (null result))))
@@ -995,14 +995,14 @@ fix: listbanned and getaddednodeinfo answered result:null."
 Regression: peer-version holds the version *message* struct, and getpeerinfo
 used to emit it verbatim, which yason cannot encode."
   (let* ((node (make-test-node))
-         (vmsg (bitcoin-lisp.serialization::make-version-message
+         (vmsg (bl.ser::make-version-message
                 :version 70016 :start-height 42 :user-agent "/test/"))
-         (peer (bitcoin-lisp::make-peer :address "1.2.3.4:48333" :state :ready
+         (peer (bl::make-peer :address "1.2.3.4:48333" :state :ready
                                         :version vmsg
                                         :user-agent "/test/"
                                         :start-height 42)))
-    (setf (bitcoin-lisp::node-peers node) (list peer))
-    (let* ((result (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+    (setf (bl::node-peers node) (list peer))
+    (let* ((result (bl.rpc::rpc-getpeerinfo node nil))
            (entry (first result)))
       (is (listp result))
       (is (= (length result) 1))
@@ -1010,21 +1010,21 @@ used to emit it verbatim, which yason cannot encode."
       (is (integerp (cdr (assoc "version" entry :test #'string=))))
       (is (= (cdr (assoc "version" entry :test #'string=)) 70016))
       ;; full result must serialize without error
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2)))
+      (let ((response (bl.rpc::make-rpc-response result "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-getnetworkinfo
   "Test getnetworkinfo returns expected fields"
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)))
+         (result (bl.rpc::rpc-getnetworkinfo node nil)))
     ;; Check required fields exist
     (is (assoc "version" result :test #'string=))
     ;; One client version: Core's CLIENT_VERSION integer form of OUR version
     ;; (clientversion.h:26-29), not a hard-coded literal.
-    (is (= bitcoin-lisp.serialization:+client-version+
+    (is (= bl.ser:+client-version+
            (cdr (assoc "version" result :test #'string=))))
-    (is (= 100 bitcoin-lisp.serialization:+client-version+))
-    (is (search (bitcoin-lisp.serialization:client-version-string)
+    (is (= 100 bl.ser:+client-version+))
+    (is (search (bl.ser:client-version-string)
                 (cdr (assoc "subversion" result :test #'string=))))
     (is (assoc "subversion" result :test #'string=))
     (is (assoc "protocolversion" result :test #'string=))
@@ -1035,21 +1035,21 @@ used to emit it verbatim, which yason cannot encode."
   "localrelay = !IgnoresIncomingTxs (Core): true on a test network by
 default, json-false under -blocksonly."
   (let ((node (make-test-node)))
-    (let ((bitcoin-lisp:*network* :regtest)
-          (bitcoin-lisp:*blocksonly* nil))
+    (let ((bl:*network* :regtest)
+          (bl:*blocksonly* nil))
       (is (eq t (cdr (assoc "localrelay"
-                            (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
+                            (bl.rpc::rpc-getnetworkinfo node nil)
                             :test #'string=)))))
-    (let ((bitcoin-lisp:*network* :regtest)
-          (bitcoin-lisp:*blocksonly* t))
+    (let ((bl:*network* :regtest)
+          (bl:*blocksonly* t))
       (is (eq 'yason:false (cdr (assoc "localrelay"
-                                       (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
+                                       (bl.rpc::rpc-getnetworkinfo node nil)
                                        :test #'string=)))))))
 
 (test rpc-getconnectioncount
   "Test getconnectioncount returns integer"
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-getconnectioncount node nil)))
+         (result (bl.rpc::rpc-getconnectioncount node nil)))
     (is (integerp result))
     (is (>= result 0))))
 
@@ -1058,7 +1058,7 @@ default, json-false under -blocksonly."
 (test rpc-getmempoolinfo
   "Test getmempoolinfo returns expected fields"
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)))
+         (result (bl.rpc::rpc-getmempoolinfo node nil)))
     ;; Check required fields exist
     (is (assoc "loaded" result :test #'string=))
     (is (assoc "size" result :test #'string=))
@@ -1074,32 +1074,32 @@ default, json-false under -blocksonly."
   "getrawmempool non-verbose returns a JSON array of txids — [] for a new
 node, not null (it used to assert only LISTP, which NIL satisfies)."
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-getrawmempool node '(nil))))
+         (result (bl.rpc::rpc-getrawmempool node '(nil))))
     (is (equalp #() result))))
 
 (test rpc-getrawmempool-verbose
   "getrawmempool verbose returns a per-tx detail alist (txid -> fields) that the
 RPC layer normalizes into a JSON object."
   (let* ((node (make-test-node))
-         (mempool (bitcoin-lisp::node-mempool node))
+         (mempool (bl::node-mempool node))
          (tx (make-mempool-test-tx :input-id 200))
-         (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+         (txid (bl.ser:transaction-hash tx)))
     ;; Empty mempool -> Core's empty VOBJ, i.e. an empty JSON object, not
     ;; null (this used to assert (null ...), the bug).
-    (let ((empty (bitcoin-lisp.rpc::rpc-getrawmempool node '(t))))
+    (let ((empty (bl.rpc::rpc-getrawmempool node '(t))))
       (is (hash-table-p empty))
       (is (zerop (hash-table-count empty))))
     ;; Populate and check the entry + a couple of fields.
-    (bitcoin-lisp.mempool:mempool-add
-     mempool txid (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))
-    (let* ((result (bitcoin-lisp.rpc::rpc-getrawmempool node '(t)))
-           (entry (cdr (assoc (bitcoin-lisp.rpc::hash-to-hex txid) result :test #'string=))))
+    (bl.mp:mempool-add
+     mempool txid (bl.mp:make-entry-from-tx tx 1000 0))
+    (let* ((result (bl.rpc::rpc-getrawmempool node '(t)))
+           (entry (cdr (assoc (bl.rpc::hash-to-hex txid) result :test #'string=))))
       (is (listp result))
       (is (not (null entry)))
       (is (assoc "vsize" entry :test #'string=))
       (is (= 1 (cdr (assoc "ancestorcount" entry :test #'string=))))
       ;; serializes cleanly through the RPC response normalizer
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2)))
+      (let ((response (bl.rpc::make-rpc-response result "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-sendrawtransaction-invalid
@@ -1107,14 +1107,14 @@ RPC layer normalizes into a JSON object."
 RPC_DESERIALIZATION_ERROR (-22), matching Core."
   (let ((node (make-test-node)))
     ;; Empty string
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-sendrawtransaction node '("")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-sendrawtransaction node '("")))
     ;; Invalid hex -> deserialization error code -22
     (handler-case
-        (progn (bitcoin-lisp.rpc::rpc-sendrawtransaction node '("not-valid-hex"))
+        (progn (bl.rpc::rpc-sendrawtransaction node '("not-valid-hex"))
                (fail "expected rpc-error"))
-      (bitcoin-lisp.rpc::rpc-error (e)
-        (is (= -22 (bitcoin-lisp.rpc::rpc-error-code e)))))))
+      (bl.rpc::rpc-error (e)
+        (is (= -22 (bl.rpc::rpc-error-code e)))))))
 
 (test rpc-sendrawtransaction-rejection-speaks-core
   "The rejection carries Core's reject reason and Core's split of codes.
@@ -1127,17 +1127,17 @@ the pair. Ours answered -26 \"Transaction rejected: MISSING-INPUT\" — the wron
 code, carrying an uppercased Lisp keyword no client can match on."
   (let* ((node (make-test-node))
          (tx (make-mempool-test-tx :input-id 211))
-         (hex (bitcoin-lisp.crypto:bytes-to-hex
-               (bitcoin-lisp.serialization:serialize-transaction tx))))
+         (hex (bl.crypto:bytes-to-hex
+               (bl.ser:serialize-transaction tx))))
     (handler-case
-        (progn (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex))
+        (progn (bl.rpc::rpc-sendrawtransaction node (list hex))
                (fail "expected rpc-error"))
-      (bitcoin-lisp.rpc::rpc-error (e)
+      (bl.rpc::rpc-error (e)
         ;; Note this surface says bad-txns-inputs-missingorspent, NOT
         ;; testmempoolaccept's "missing-inputs".
-        (is (= -25 (bitcoin-lisp.rpc::rpc-error-code e)))
+        (is (= -25 (bl.rpc::rpc-error-code e)))
         (is (string= "bad-txns-inputs-missingorspent"
-                     (bitcoin-lisp.rpc::rpc-error-message e)))))))
+                     (bl.rpc::rpc-error-message e)))))))
 
 ;;; --- sendrawtransaction broadcast (unbroadcast set + peer announcement) ---
 ;;;
@@ -1146,11 +1146,11 @@ code, carrying an uppercased Lisp keyword no client can match on."
 
 (defun %broadcast-test-node (utxo-set mempool chain-state peer)
   "A test node wired to the fixture state with one ready relay peer."
-  (let ((node (bitcoin-lisp::make-node :network :testnet3)))
-    (setf (bitcoin-lisp::node-chain-state node) chain-state
-          (bitcoin-lisp::node-utxo-set node) utxo-set
-          (bitcoin-lisp::node-mempool node) mempool
-          (bitcoin-lisp::node-peers node) (list peer))
+  (let ((node (bl::make-node :network :testnet3)))
+    (setf (bl::node-chain-state node) chain-state
+          (bl::node-utxo-set node) utxo-set
+          (bl::node-mempool node) mempool
+          (bl::node-peers node) (list peer))
     node))
 
 (test rpc-sendrawtransaction-broadcasts
@@ -1160,42 +1160,42 @@ node/transaction.cpp:100-135); resubmitting the same tx is NOT an error and
 re-announces (already-in-mempool branch, :63-72) without re-adding to the
 unbroadcast set."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
-    (let* ((peer (bitcoin-lisp.networking:make-peer :state :ready))
+    (let* ((peer (bl.net:make-peer :state :ready))
            (node (%broadcast-test-node utxo-set mempool chain-state peer))
            (tx (%pkg-tx funding-txid 0 (- 100000000 10000)))
-           (txid (bitcoin-lisp.serialization:transaction-hash tx))
-           (hex (bitcoin-lisp.crypto:bytes-to-hex
-                 (bitcoin-lisp.serialization:serialize-transaction tx))))
-      (let ((r (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex))))
-        (is (string= (bitcoin-lisp.rpc::hash-to-hex txid) r)))
-      (is-true (bitcoin-lisp.mempool:mempool-has mempool txid))
+           (txid (bl.ser:transaction-hash tx))
+           (hex (bl.crypto:bytes-to-hex
+                 (bl.ser:serialize-transaction tx))))
+      (let ((r (bl.rpc::rpc-sendrawtransaction node (list hex))))
+        (is (string= (bl.rpc::hash-to-hex txid) r)))
+      (is-true (bl.mp:mempool-has mempool txid))
       ;; Tracked for initial broadcast...
-      (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
-      (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool)))
+      (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))
+      (is-true (gethash txid (bl.mp:mempool-unbroadcast mempool)))
       ;; ...and queued to the relay peer (flushed later by the Poisson timer).
-      (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
-      (is (equalp txid (first (first (bitcoin-lisp.networking::peer-tx-inv-queue peer)))))
+      (is (= 1 (length (bl.net::peer-tx-inv-queue peer))))
+      (is (equalp txid (first (first (bl.net::peer-tx-inv-queue peer)))))
       ;; Resubmission: same txid returned, another announcement queued,
       ;; unbroadcast set unchanged.
-      (let ((r2 (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex))))
-        (is (string= (bitcoin-lisp.rpc::hash-to-hex txid) r2)))
-      (is (= 2 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
-      (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))))))
+      (let ((r2 (bl.rpc::rpc-sendrawtransaction node (list hex))))
+        (is (string= (bl.rpc::hash-to-hex txid) r2)))
+      (is (= 2 (length (bl.net::peer-tx-inv-queue peer))))
+      (is (= 1 (bl.mp:mempool-unbroadcast-count mempool))))))
 
 (test rpc-testmempoolaccept-does-not-broadcast
   "testmempoolaccept is a dry run: nothing enters the mempool, nothing joins
 the unbroadcast set, and no announcement is queued."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
-    (let* ((peer (bitcoin-lisp.networking:make-peer :state :ready))
+    (let* ((peer (bl.net:make-peer :state :ready))
            (node (%broadcast-test-node utxo-set mempool chain-state peer))
            (tx (%pkg-tx funding-txid 0 (- 100000000 10000)))
-           (hex (bitcoin-lisp.crypto:bytes-to-hex
-                 (bitcoin-lisp.serialization:serialize-transaction tx))))
-      (let ((r (first (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list (list hex))))))
+           (hex (bl.crypto:bytes-to-hex
+                 (bl.ser:serialize-transaction tx))))
+      (let ((r (first (bl.rpc::rpc-testmempoolaccept node (list (list hex))))))
         (is (eq t (cdr (assoc "allowed" r :test #'string=)))))
-      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))
-      (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
-      (is (null (bitcoin-lisp.networking::peer-tx-inv-queue peer))))))
+      (is (= 0 (bl.mp:mempool-count mempool)))
+      (is (= 0 (bl.mp:mempool-unbroadcast-count mempool)))
+      (is (null (bl.net::peer-tx-inv-queue peer))))))
 
 (test rpc-testmempoolaccept-policy-script-reject-reason
   "A consensus-valid but policy-invalid spend (CLEANSTACK: extra scriptSig
@@ -1209,11 +1209,11 @@ validation.cpp:2117) through testmempoolaccept."
        :input-id 140)
     (let ((node (%broadcast-test-node
                  utxo mempool
-                 (bitcoin-lisp.storage:make-chain-state :best-height 100)
-                 (bitcoin-lisp.networking:make-peer :state :ready)))
-          (hex (bitcoin-lisp.crypto:bytes-to-hex
-                (bitcoin-lisp.serialization:serialize-transaction tx))))
-      (let ((r (first (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list (list hex))))))
+                 (bl.store:make-chain-state :best-height 100)
+                 (bl.net:make-peer :state :ready)))
+          (hex (bl.crypto:bytes-to-hex
+                (bl.ser:serialize-transaction tx))))
+      (let ((r (first (bl.rpc::rpc-testmempoolaccept node (list (list hex))))))
         (is (eq 'yason:false (cdr (assoc "allowed" r :test #'string=))))
         (is (string= "mempool-script-verify-flag-failed"
                      (cdr (assoc "reject-reason" r :test #'string=))))))))
@@ -1229,20 +1229,20 @@ validation.cpp:2117) through testmempoolaccept."
 (defun %rails-error (thunk)
   "(values code message) of the rpc-error THUNK signals, or NIL if it returns."
   (handler-case (progn (funcall thunk) nil)
-    (bitcoin-lisp.rpc::rpc-error (e)
-      (values (bitcoin-lisp.rpc::rpc-error-code e)
-              (bitcoin-lisp.rpc::rpc-error-message e)))))
+    (bl.rpc::rpc-error (e)
+      (values (bl.rpc::rpc-error-code e)
+              (bl.rpc::rpc-error-message e)))))
 
 (defun %burn-tx (funding-txid value)
   "A P2SH(OP_TRUE) spend paying VALUE to a provably-unspendable OP_RETURN."
-  (bitcoin-lisp.serialization:make-transaction
+  (bl.ser:make-transaction
    :version 2
-   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
                                       :hash funding-txid :index 0)
                     :script-sig (%p2sh-optrue-scriptsig)
                     :sequence #xffffffff))
-   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bl.ser:make-tx-out
                      :value value
                      :script-pubkey (make-array 2 :element-type '(unsigned-byte 8)
                                                   :initial-contents '(#x6a #x51))))
@@ -1254,56 +1254,56 @@ neither enters the mempool nor gets announced — Core runs ATMP with
 test_accept first and only submits once the fee is under the rail
 (node/transaction.cpp:74-84). maxfeerate=0 switches the rail off."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
-    (let* ((peer (bitcoin-lisp.networking:make-peer :state :ready))
+    (let* ((peer (bl.net:make-peer :state :ready))
            (node (%broadcast-test-node utxo-set mempool chain-state peer))
            ;; 1 BTC in, 0.01 BTC out: a 0.99 BTC fee on 85 vbytes, far over the
            ;; 0.1 BTC/kvB default (85 vbytes buys a 0.0085 BTC cap).
            (tx (%pkg-tx funding-txid 0 1000000))
-           (hex (bitcoin-lisp.crypto:bytes-to-hex
-                 (bitcoin-lisp.serialization:serialize-transaction tx))))
+           (hex (bl.crypto:bytes-to-hex
+                 (bl.ser:serialize-transaction tx))))
       (multiple-value-bind (code msg)
           (%rails-error (lambda ()
-                          (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex))))
+                          (bl.rpc::rpc-sendrawtransaction node (list hex))))
         (is (= -25 code))
         (is-true (search "Fee exceeds maximum" msg)))
       ;; The control that matters: the rail ran BEFORE submission.
-      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))
-      (is (null (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
+      (is (= 0 (bl.mp:mempool-count mempool)))
+      (is (null (bl.net::peer-tx-inv-queue peer)))
       ;; Disabled explicitly -> the very same tx is accepted and announced.
-      (is (string= (bitcoin-lisp.rpc::hash-to-hex
-                    (bitcoin-lisp.serialization:transaction-hash tx))
-                   (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex 0))))
-      (is (= 1 (bitcoin-lisp.mempool:mempool-count mempool)))
-      (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer)))))))
+      (is (string= (bl.rpc::hash-to-hex
+                    (bl.ser:transaction-hash tx))
+                   (bl.rpc::rpc-sendrawtransaction node (list hex 0))))
+      (is (= 1 (bl.mp:mempool-count mempool)))
+      (is (= 1 (length (bl.net::peer-tx-inv-queue peer)))))))
 
 (test rpc-sendrawtransaction-maxfeerate-rejects-one-btc
   "ParseFeeRate refuses a rate at or above 1 BTC/kvB with -8
 (rpc/util.cpp:110-115)."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
-                                       (bitcoin-lisp.networking:make-peer :state :ready)))
-           (hex (bitcoin-lisp.crypto:bytes-to-hex
-                 (bitcoin-lisp.serialization:serialize-transaction
+                                       (bl.net:make-peer :state :ready)))
+           (hex (bl.crypto:bytes-to-hex
+                 (bl.ser:serialize-transaction
                   (%pkg-tx funding-txid 0 99990000)))))
       (is (= -8 (%rails-error
-                 (lambda () (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex 1))))))
+                 (lambda () (bl.rpc::rpc-sendrawtransaction node (list hex 1))))))
       ;; Just under the bound is fine.
       (is (null (%rails-error
                  (lambda ()
-                   (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex 0.99d0)))))))))
+                   (bl.rpc::rpc-sendrawtransaction node (list hex 0.99d0)))))))))
 
 (test rpc-sendrawtransaction-maxburnamount-rail
   "Value sent to a provably-unspendable output is refused with Core's
 MAX_BURN_EXCEEDED (-25), and the default cap is 0 (rpc/mempool.cpp:92-103)."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
-                                       (bitcoin-lisp.networking:make-peer :state :ready)))
+                                       (bl.net:make-peer :state :ready)))
            (tx (%burn-tx funding-txid 99900000))
-           (hex (bitcoin-lisp.crypto:bytes-to-hex
-                 (bitcoin-lisp.serialization:serialize-transaction tx))))
+           (hex (bl.crypto:bytes-to-hex
+                 (bl.ser:serialize-transaction tx))))
       (multiple-value-bind (code msg)
           (%rails-error (lambda ()
-                          (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex))))
+                          (bl.rpc::rpc-sendrawtransaction node (list hex))))
         (is (= -25 code))
         (is-true (search "maxburnamount" msg)))
       ;; Raising the cap clears THIS rail: the tx now gets as far as ordinary
@@ -1311,10 +1311,10 @@ MAX_BURN_EXCEEDED (-25), and the default cap is 0 (rpc/mempool.cpp:92-103)."
       ;; check was the only thing stopping it, and that it ran first.
       (multiple-value-bind (code msg)
           (%rails-error (lambda ()
-                          (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex nil 1))))
+                          (bl.rpc::rpc-sendrawtransaction node (list hex nil 1))))
         (is (= -26 code))
         (is-false (search "maxburnamount" msg)))
-      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool))))))
+      (is (= 0 (bl.mp:mempool-count mempool))))))
 
 (test rpc-testmempoolaccept-max-fee-exceeded
   "Over the rail, testmempoolaccept reports allowed=false with reject-reason
@@ -1323,24 +1323,24 @@ carries txid and wtxid only, because a descendant's verdict is meaningless
 once an ancestor would not be submitted (rpc/mempool.cpp:352-355,381)."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
-                                       (bitcoin-lisp.networking:make-peer :state :ready)))
+                                       (bl.net:make-peer :state :ready)))
            (parent (%pkg-tx funding-txid 0 1000000))
-           (child (%pkg-tx (bitcoin-lisp.serialization:transaction-hash parent) 0 900000))
-           (ph (bitcoin-lisp.crypto:bytes-to-hex
-                (bitcoin-lisp.serialization:serialize-transaction parent)))
-           (ch (bitcoin-lisp.crypto:bytes-to-hex
-                (bitcoin-lisp.serialization:serialize-transaction child)))
-           (r (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list (list ph ch)))))
+           (child (%pkg-tx (bl.ser:transaction-hash parent) 0 900000))
+           (ph (bl.crypto:bytes-to-hex
+                (bl.ser:serialize-transaction parent)))
+           (ch (bl.crypto:bytes-to-hex
+                (bl.ser:serialize-transaction child)))
+           (r (bl.rpc::rpc-testmempoolaccept node (list (list ph ch)))))
       (is (eq 'yason:false (cdr (assoc "allowed" (first r) :test #'string=))))
       (is (string= "max-fee-exceeded"
                    (cdr (assoc "reject-reason" (first r) :test #'string=))))
       ;; Unfinished: no verdict at all on the child.
       (is (equal '("txid" "wtxid") (mapcar #'car (second r))))
       ;; Rail off -> the parent is allowed again.
-      (let ((off (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list (list ph) 0))))
+      (let ((off (bl.rpc::rpc-testmempoolaccept node (list (list ph) 0))))
         (is (eq t (cdr (assoc "allowed" (first off) :test #'string=)))))
       ;; Still a dry run either way.
-      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool))))))
+      (is (= 0 (bl.mp:mempool-count mempool))))))
 
 (test package-client-maxfeerate-aborts-package
   "A member over submitpackage's maxfeerate aborts the WHOLE package before
@@ -1348,24 +1348,24 @@ submission: that member is invalid with :max-feerate-exceeded, later members
 are :not-validated, and nothing enters the mempool (validation.cpp:1365-1368)."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
     (let* ((parent (%pkg-tx funding-txid 0 1000000))
-           (child (%pkg-tx (bitcoin-lisp.serialization:transaction-hash parent) 0 900000)))
+           (child (%pkg-tx (bl.ser:transaction-hash parent) 0 900000)))
       (multiple-value-bind (msg results)
-          (bitcoin-lisp.validation:validate-package-for-mempool
+          (bl.val:validate-package-for-mempool
            (list parent child) utxo-set mempool chain-state
            :client-maxfeerate 10000000)
         (is (eq :transaction-failed msg))
-        (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status
+        (is (eq :invalid (bl.val:package-tx-result-status
                           (%result-for results parent))))
-        (is (eq :max-feerate-exceeded (bitcoin-lisp.validation:package-tx-result-error
+        (is (eq :max-feerate-exceeded (bl.val:package-tx-result-error
                                        (%result-for results parent))))
-        (is (eq :not-validated (bitcoin-lisp.validation:package-tx-result-status
+        (is (eq :not-validated (bl.val:package-tx-result-status
                                 (%result-for results child)))))
-      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))
+      (is (= 0 (bl.mp:mempool-count mempool)))
       ;; NIL cap (what maxfeerate=0 becomes) leaves the package alone.
-      (multiple-value-bind (msg2) (bitcoin-lisp.validation:validate-package-for-mempool
+      (multiple-value-bind (msg2) (bl.val:validate-package-for-mempool
                                    (list parent child) utxo-set mempool chain-state)
         (is (eq :success msg2)))
-      (is (= 2 (bitcoin-lisp.mempool:mempool-count mempool))))))
+      (is (= 2 (bl.mp:mempool-count mempool))))))
 
 (test script-has-valid-ops-p-matches-core
   "CScript::HasValidOps: a truncated push, an over-long push, and an undefined
@@ -1374,19 +1374,19 @@ opcode above MAX_OPCODE all make a script unparseable (script.cpp)."
            (make-array (length bytes) :element-type '(unsigned-byte 8)
                                       :initial-contents bytes)))
     ;; OP_RETURN OP_1, and a well-formed 2-byte push: both parse.
-    (is-true (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x6a #x51)))
-    (is-true (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x02 #xaa #xbb)))
-    (is-true (bitcoin-lisp.storage:script-has-valid-ops-p (spk)))
+    (is-true (bl.store:script-has-valid-ops-p (spk #x6a #x51)))
+    (is-true (bl.store:script-has-valid-ops-p (spk #x02 #xaa #xbb)))
+    (is-true (bl.store:script-has-valid-ops-p (spk)))
     ;; Direct push running off the end.
-    (is-false (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x05 #xaa)))
+    (is-false (bl.store:script-has-valid-ops-p (spk #x05 #xaa)))
     ;; OP_PUSHDATA1 with a truncated length byte, then a truncated payload.
-    (is-false (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x4c)))
-    (is-false (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x4c #x03 #xaa)))
+    (is-false (bl.store:script-has-valid-ops-p (spk #x4c)))
+    (is-false (bl.store:script-has-valid-ops-p (spk #x4c #x03 #xaa)))
     ;; OP_PUSHDATA2 declaring 521 bytes: over MAX_SCRIPT_ELEMENT_SIZE.
-    (is-false (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x4d #x09 #x02)))
+    (is-false (bl.store:script-has-valid-ops-p (spk #x4d #x09 #x02)))
     ;; 0xba is the first byte above MAX_OPCODE (OP_NOP10 = 0xb9).
-    (is-true (bitcoin-lisp.storage:script-has-valid-ops-p (spk #xb9)))
-    (is-false (bitcoin-lisp.storage:script-has-valid-ops-p (spk #xba)))))
+    (is-true (bl.store:script-has-valid-ops-p (spk #xb9)))
+    (is-false (bl.store:script-has-valid-ops-p (spk #xba)))))
 
 ;;; --- Wave 9D: RPC/mempool locking discipline ---
 
@@ -1399,11 +1399,11 @@ unlocked RPC mutation would interleave with them.)"
          (txid-hex (format nil "~64,'0d" 1))
          (done (cons nil nil))
          (thread nil))
-    (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+    (bt:with-recursive-lock-held ((bl::node-lock node))
       (setf thread
             (bt:make-thread
              (lambda ()
-               (bitcoin-lisp.rpc::rpc-prioritisetransaction
+               (bl.rpc::rpc-prioritisetransaction
                 node (list txid-hex 0 12345))
                (setf (car done) t))
              :name "rpc-lock-test"))
@@ -1415,9 +1415,9 @@ unlocked RPC mutation would interleave with them.)"
     ;; Lock released — the handler must now complete and take effect.
     (bt:join-thread thread)
     (is (eq t (car done)))
-    (is (= 12345 (gethash (bitcoin-lisp.rpc::parse-hex-hash txid-hex)
-                          (bitcoin-lisp.mempool:mempool-deltas
-                           (bitcoin-lisp::node-mempool node))
+    (is (= 12345 (gethash (bl.rpc::parse-hex-hash txid-hex)
+                          (bl.mp:mempool-deltas
+                           (bl::node-mempool node))
                           0)))))
 
 (test rpc-concurrent-mempool-smoke
@@ -1426,11 +1426,11 @@ rpc-sendrawtransaction while reader threads hammer getrawmempool (verbose),
 getmempoolinfo, and getprioritisedtransactions, and a prioritiser thread
 mutates the deltas table. With the node lock on every path this must finish
 with zero thread errors and every submitted tx in the pool exactly once."
-  (let* ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
-         (mempool (bitcoin-lisp.mempool:make-mempool))
-         (chain-state (bitcoin-lisp.storage:make-chain-state :best-height 200))
+  (let* ((utxo-set (bl.store:make-utxo-set))
+         (mempool (bl.mp:make-mempool))
+         (chain-state (bl.store:make-chain-state :best-height 200))
          (node (%broadcast-test-node utxo-set mempool chain-state
-                                     (bitcoin-lisp.networking:make-peer :state :ready)))
+                                     (bl.net:make-peer :state :ready)))
          (n-txs 24)
          (hexes '())
          (txids '())
@@ -1440,13 +1440,13 @@ with zero thread errors and every submitted tx in the pool exactly once."
     (dotimes (i n-txs)
       (let ((funding (make-array 32 :element-type '(unsigned-byte 8)
                                     :initial-element (+ 50 i))))
-        (bitcoin-lisp.storage:add-utxo utxo-set funding 0 100000000
+        (bl.store:add-utxo utxo-set funding 0 100000000
                                        (%p2sh-optrue-spk) 1 :coinbase nil)
         (let ((tx (%pkg-tx funding 0 99990000)))
-          (push (bitcoin-lisp.crypto:bytes-to-hex
-                 (bitcoin-lisp.serialization:serialize-transaction tx))
+          (push (bl.crypto:bytes-to-hex
+                 (bl.ser:serialize-transaction tx))
                 hexes)
-          (push (bitcoin-lisp.serialization:transaction-hash tx) txids))))
+          (push (bl.ser:transaction-hash tx) txids))))
     (flet ((guarded (fn)
              (lambda ()
                (handler-case (funcall fn)
@@ -1462,7 +1462,7 @@ with zero thread errors and every submitted tx in the pool exactly once."
                          (let ((batch batch))
                            (lambda ()
                              (dolist (hex batch)
-                               (bitcoin-lisp.rpc::rpc-sendrawtransaction
+                               (bl.rpc::rpc-sendrawtransaction
                                 node (list hex))))))
                         :name "smoke-writer")
                        threads))
@@ -1472,9 +1472,9 @@ with zero thread errors and every submitted tx in the pool exactly once."
                  (guarded
                   (lambda ()
                     (dotimes (j 40)
-                      (bitcoin-lisp.rpc::rpc-getrawmempool node (list t))
-                      (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)
-                      (bitcoin-lisp.rpc::rpc-getprioritisedtransactions node nil))))
+                      (bl.rpc::rpc-getrawmempool node (list t))
+                      (bl.rpc::rpc-getmempoolinfo node nil)
+                      (bl.rpc::rpc-getprioritisedtransactions node nil))))
                  :name "smoke-reader")
                 threads))
         ;; 1 prioritiser mutating the deltas table under the readers.
@@ -1482,63 +1482,63 @@ with zero thread errors and every submitted tx in the pool exactly once."
                (guarded
                 (lambda ()
                   (dotimes (j 40)
-                    (bitcoin-lisp.rpc::rpc-prioritisetransaction
+                    (bl.rpc::rpc-prioritisetransaction
                      node (list (format nil "~64,'0x" (+ j 1)) 0 100)))))
                :name "smoke-prioritiser")
               threads)
         (mapc #'bt:join-thread threads)))
     (is (null (car errors))
         "concurrent RPC calls signalled: ~A" (car errors))
-    (is (= n-txs (bitcoin-lisp.mempool:mempool-count mempool)))
+    (is (= n-txs (bl.mp:mempool-count mempool)))
     (dolist (txid txids)
-      (is-true (bitcoin-lisp.mempool:mempool-has mempool txid)))
-    (is (= n-txs (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))))
+      (is-true (bl.mp:mempool-has mempool txid)))
+    (is (= n-txs (bl.mp:mempool-unbroadcast-count mempool)))))
 
 (test rpc-getmempoolinfo-unbroadcastcount
   "getmempoolinfo reports the live unbroadcast set size (Core
 rpc/mempool.cpp:1047)."
   (let* ((node (make-test-node))
-         (mempool (bitcoin-lisp::node-mempool node))
+         (mempool (bl::node-mempool node))
          (tx (make-mempool-test-tx :input-id 201))
-         (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+         (txid (bl.ser:transaction-hash tx)))
     (is (= 0 (cdr (assoc "unbroadcastcount"
-                         (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)
+                         (bl.rpc::rpc-getmempoolinfo node nil)
                          :test #'string=))))
-    (is (eq :ok (bitcoin-lisp.mempool:mempool-add
-                 mempool txid (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))))
-    (is-true (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid))
+    (is (eq :ok (bl.mp:mempool-add
+                 mempool txid (bl.mp:make-entry-from-tx tx 1000 0))))
+    (is-true (bl.mp:mempool-add-unbroadcast mempool txid))
     (is (= 1 (cdr (assoc "unbroadcastcount"
-                         (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)
+                         (bl.rpc::rpc-getmempoolinfo node nil)
                          :test #'string=))))))
 
 (defun %mempool-node (&optional (funding-outputs 1))
   "A test node on a fresh %pkg-fixture whose UTXO set holds FUNDING-OUTPUTS
 confirmed spendable coins (vouts 0..n-1 of the fixture's funding txid), so a
-saved mempool can be reloaded against it. Use (bitcoin-lisp::node-mempool node)
+saved mempool can be reloaded against it. Use (bl::node-mempool node)
 for the pool."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
     (declare (ignore mempool))
     (loop for i from 1 below funding-outputs
-          do (bitcoin-lisp.storage:add-utxo utxo-set funding-txid i 100000000
+          do (bl.store:add-utxo utxo-set funding-txid i 100000000
                                             (%p2sh-optrue-spk) 1 :coinbase nil))
     (values (%broadcast-test-node utxo-set mempool chain-state
-                                  (bitcoin-lisp.networking:make-peer :state :ready))
+                                  (bl.net:make-peer :state :ready))
             funding-txid)))
 
 (defun %write-mempool-file (path)
   "Write a mempool.dat holding three INDEPENDENT txs (so reload order cannot
 matter), one of them unbroadcast. Returns the list of txids."
   (multiple-value-bind (node funding-txid) (%mempool-node 3)
-    (let ((mempool (bitcoin-lisp::node-mempool node))
+    (let ((mempool (bl::node-mempool node))
           (txids '()))
       (dotimes (i 3)
         (let* ((tx (%pkg-tx funding-txid i (- 100000000 10000)))
-               (txid (bitcoin-lisp.serialization:transaction-hash tx)))
-          (bitcoin-lisp.mempool:mempool-add
-           mempool txid (bitcoin-lisp.mempool:make-entry-from-tx tx 10000 200))
+               (txid (bl.ser:transaction-hash tx)))
+          (bl.mp:mempool-add
+           mempool txid (bl.mp:make-entry-from-tx tx 10000 200))
           (push txid txids)))
-      (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool (first txids))
-      (bitcoin-lisp.mempool:save-mempool-file mempool path)
+      (bl.mp:mempool-add-unbroadcast mempool (first txids))
+      (bl.mp:save-mempool-file mempool path)
       txids)))
 
 (test mempool-import-abandons-the-load-on-a-stop-request
@@ -1556,27 +1556,27 @@ restored for transactions that never came back."
          (let ((txids (%write-mempool-file path)))
            ;; Interrupted: fires once the first tx is in, so exactly one loads.
            (let* ((node (%mempool-node 3))
-                  (mempool (bitcoin-lisp::node-mempool node))
-                  (bitcoin-lisp:*interrupt-check*
-                    (lambda () (plusp (bitcoin-lisp.mempool:mempool-count mempool)))))
+                  (mempool (bl::node-mempool node))
+                  (bl:*interrupt-check*
+                    (lambda () (plusp (bl.mp:mempool-count mempool)))))
              (multiple-value-bind (accepted failed residual)
-                 (bitcoin-lisp::load-mempool-from-disk node path)
+                 (bl::load-mempool-from-disk node path)
                (declare (ignore failed))
                (is (= 1 accepted) "the load stops at the first boundary after the flag")
                (is (= 0 residual)))
-             (is (= 1 (bitcoin-lisp.mempool:mempool-count mempool)))
-             (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))
+             (is (= 1 (bl.mp:mempool-count mempool)))
+             (is (= 0 (bl.mp:mempool-unbroadcast-count mempool))
                  "an abandoned load restores no unbroadcast set"))
            ;; CONTROL: the same file, uninterrupted, loads completely — without
            ;; this the assertions above would also pass on a file that never
            ;; had three loadable txs in it.
            (let* ((node (%mempool-node 3))
-                  (mempool (bitcoin-lisp::node-mempool node)))
-             (is (= 3 (bitcoin-lisp::load-mempool-from-disk node path)))
-             (is (= 3 (bitcoin-lisp.mempool:mempool-count mempool)))
-             (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+                  (mempool (bl::node-mempool node)))
+             (is (= 3 (bl::load-mempool-from-disk node path)))
+             (is (= 3 (bl.mp:mempool-count mempool)))
+             (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))
              (dolist (txid txids)
-               (is-true (bitcoin-lisp.mempool:mempool-has mempool txid)))))
+               (is-true (bl.mp:mempool-has mempool txid)))))
       (ignore-errors (delete-file path)))))
 
 (test stop-signal-during-startup-only-registers-the-request
@@ -1587,23 +1587,23 @@ the mempool import, an index backfill or a wallet rescan killed the process
 outright. Arriving mid-startup it must only REGISTER: there is no built node to
 tear down, and running stop-node there would race the construction it undoes.
 Registering is also what lets the polling loops abandon their work."
-  (let ((bitcoin-lisp::*node-starting* t)
-        (bitcoin-lisp::*shutdown-watchdog-running* nil)
-        (bitcoin-lisp::*shutdown-request* nil))
-    (is-true (bitcoin-lisp::%handle-stop-signal)
+  (let ((bl::*node-starting* t)
+        (bl::*shutdown-watchdog-running* nil)
+        (bl::*shutdown-request* nil))
+    (is-true (bl::%handle-stop-signal)
              "mid-startup: register only, never tear down")
-    (is (equal "SIGTERM/SIGINT" (bitcoin-lisp::node-shutdown-requested-p)))
+    (is (equal "SIGTERM/SIGINT" (bl::node-shutdown-requested-p)))
     ;; …and that registration is exactly what the cooperative loops poll.
-    (is-true (bitcoin-lisp:interrupt-requested-p)))
+    (is-true (bl:interrupt-requested-p)))
   ;; The other branch — neither latch set, so the handler tears down inline —
   ;; is deliberately not exercised: it ends in sb-ext:exit and would take the
   ;; test image with it.
-  (let ((bitcoin-lisp::*node-starting* t)
-        (bitcoin-lisp::*shutdown-watchdog-running* nil)
-        (bitcoin-lisp::*shutdown-request* nil))
+  (let ((bl::*node-starting* t)
+        (bl::*shutdown-watchdog-running* nil)
+        (bl::*shutdown-request* nil))
     ;; The startup latch alone is enough; the test above must not be passing
     ;; only because some other run left the watchdog latch set.
-    (is-true (bitcoin-lisp::%handle-stop-signal))))
+    (is-true (bl::%handle-stop-signal))))
 
 (test mempool-import-reports-its-size-and-progress
   "The import used to log nothing between 'Loaded N fee stats entries' and its
@@ -1617,8 +1617,8 @@ the total and reports every 10% (mempool_persist.cpp:77-86)."
            (%write-mempool-file path)
            (let* ((node (%mempool-node 3))
                   (logged (with-output-to-string (out)
-                            (let ((bitcoin-lisp:*log-stream* out))
-                              (bitcoin-lisp::load-mempool-from-disk node path)))))
+                            (let ((bl:*log-stream* out))
+                              (bl::load-mempool-from-disk node path)))))
              (is (search "Loading 3 mempool transactions" logged)
                  "the size is announced before the work starts")
              (is (search "Progress loading mempool transactions" logged)
@@ -1640,32 +1640,32 @@ rpc/mempool.cpp:1115-1116)."
            (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
              (declare (ignore utxo-set chain-state))
              (let ((tx (%pkg-tx funding-txid 0 (- 100000000 10000))))
-               (setf txid (bitcoin-lisp.serialization:transaction-hash tx))
-               (is (eq :ok (bitcoin-lisp.mempool:mempool-add
+               (setf txid (bl.ser:transaction-hash tx))
+               (is (eq :ok (bl.mp:mempool-add
                             mempool txid
-                            (bitcoin-lisp.mempool:make-entry-from-tx tx 10000 200))))
-               (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
-               (bitcoin-lisp.mempool:save-mempool-file mempool path)))
+                            (bl.mp:make-entry-from-tx tx 10000 200))))
+               (bl.mp:mempool-add-unbroadcast mempool txid)
+               (bl.mp:save-mempool-file mempool path)))
            ;; importmempool default: entries load, unbroadcast NOT applied.
            (let* ((node (%mempool-node))
-                  (mempool (bitcoin-lisp::node-mempool node)))
-             (bitcoin-lisp.rpc::rpc-importmempool node (list (namestring path)))
-             (is-true (bitcoin-lisp.mempool:mempool-has mempool txid))
-             (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))))
+                  (mempool (bl::node-mempool node)))
+             (bl.rpc::rpc-importmempool node (list (namestring path)))
+             (is-true (bl.mp:mempool-has mempool txid))
+             (is (= 0 (bl.mp:mempool-unbroadcast-count mempool))))
            ;; importmempool with apply_unbroadcast_set=true restores the set.
            (let* ((node (%mempool-node))
-                  (mempool (bitcoin-lisp::node-mempool node))
+                  (mempool (bl::node-mempool node))
                   (opts (make-hash-table :test 'equal)))
              (setf (gethash "apply_unbroadcast_set" opts) t)
-             (bitcoin-lisp.rpc::rpc-importmempool node (list (namestring path) opts))
-             (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
-             (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool))))
+             (bl.rpc::rpc-importmempool node (list (namestring path) opts))
+             (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))
+             (is-true (gethash txid (bl.mp:mempool-unbroadcast mempool))))
            ;; Startup path (load-mempool-from-disk) applies it by default.
            (let* ((node (%mempool-node))
-                  (mempool (bitcoin-lisp::node-mempool node)))
-             (bitcoin-lisp::load-mempool-from-disk node path)
-             (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
-             (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool)))))
+                  (mempool (bl::node-mempool node)))
+             (bl::load-mempool-from-disk node path)
+             (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))
+             (is-true (gethash txid (bl.mp:mempool-unbroadcast mempool)))))
       (ignore-errors (delete-file path)))))
 
 (test rpc-getblockheader-confirmations
@@ -1673,10 +1673,10 @@ rpc/mempool.cpp:1115-1116)."
 a hardcoded 1."
   (multiple-value-bind (cs entries) (%make-served-chain 5)  ; genesis..height 5
     (let ((node (make-test-node)))
-      (setf (bitcoin-lisp::node-chain-state node) cs)
+      (setf (bl::node-chain-state node) cs)
       ;; height 3 -> 5 - 3 + 1 = 3 confirmations, plus the shared chain-header fields
-      (let ((r (bitcoin-lisp.rpc::rpc-getblockheader
-                node (list (bitcoin-lisp.rpc::hash-to-hex (%entry-hash entries 3))))))
+      (let ((r (bl.rpc::rpc-getblockheader
+                node (list (bl.rpc::hash-to-hex (%entry-hash entries 3))))))
         (is (= 3 (cdr (assoc "height" r :test #'string=))))
         (is (= 3 (cdr (assoc "confirmations" r :test #'string=))))
         (is (= 8 (length (cdr (assoc "versionHex" r :test #'string=)))))
@@ -1688,8 +1688,8 @@ a hardcoded 1."
         ;; a non-tip active-chain block carries nextblockhash
         (is (assoc "nextblockhash" r :test #'string=)))
       ;; tip (height 5) -> 1 confirmation, no nextblockhash
-      (let ((r (bitcoin-lisp.rpc::rpc-getblockheader
-                node (list (bitcoin-lisp.rpc::hash-to-hex (%entry-hash entries 5))))))
+      (let ((r (bl.rpc::rpc-getblockheader
+                node (list (bl.rpc::hash-to-hex (%entry-hash entries 5))))))
         (is (= 1 (cdr (assoc "confirmations" r :test #'string=))))
         (is (null (assoc "nextblockhash" r :test #'string=)))))))
 
@@ -1697,15 +1697,15 @@ a hardcoded 1."
 
 (defun %hdrfields-tx (tag &key witness)
   "A coinbase-shaped transaction, distinct per TAG (its 3-byte scriptSig)."
-  (bitcoin-lisp.serialization:make-transaction
+  (bl.ser:make-transaction
    :version 2
-   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
                                       :hash (make-32-byte-hash 0) :index #xffffffff)
                     :script-sig (make-array 3 :element-type '(unsigned-byte 8)
                                               :initial-element tag)
                     :sequence #xfffffffe))
-   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bl.ser:make-tx-out
                      :value 5000 :script-pubkey (make-array 4 :element-type '(unsigned-byte 8)
                                                               :initial-element #x6a)))
    :witness (when witness (vector (list witness)))
@@ -1713,12 +1713,12 @@ a hardcoded 1."
 
 (defun %hdrfields-block (txs prev-hash time)
   "A block over TXS with a real merkle root and PREV-HASH."
-  (let* ((root (bitcoin-lisp.validation:compute-merkle-root
-                (mapcar #'bitcoin-lisp.serialization:transaction-hash txs)))
-         (header (bitcoin-lisp.serialization:make-block-header
+  (let* ((root (bl.val:compute-merkle-root
+                (mapcar #'bl.ser:transaction-hash txs)))
+         (header (bl.ser:make-block-header
                   :version 1 :prev-block prev-hash :merkle-root root
                   :timestamp time :bits #x207fffff :nonce 0)))
-    (bitcoin-lisp.serialization:make-bitcoin-block :header header :transactions txs)))
+    (bl.ser:make-bitcoin-block :header header :transactions txs)))
 
 (defmacro %with-hdrfields-chain ((node store g a b) &body body)
   "Bind NODE to a test node whose block store holds a 1-tx block G at height 0
@@ -1729,38 +1729,38 @@ active tip). G, A and B are bound to (block . hash) conses."
             (,dir (ensure-directories-exist
                    (merge-pathnames (format nil "hdrfields-~D/" (get-internal-real-time))
                                     (uiop:temporary-directory))))
-            (,store (bitcoin-lisp.storage:init-block-store ,dir)))
-       (setf (bitcoin-lisp::node-block-store ,node) ,store)
+            (,store (bl.store:init-block-store ,dir)))
+       (setf (bl::node-block-store ,node) ,store)
        (unwind-protect
             (let* ((gb (%hdrfields-block (list (%hdrfields-tx 1)) (make-32-byte-hash 0) 1700000000))
-                   (gh (bitcoin-lisp.serialization:block-header-hash
-                        (bitcoin-lisp.serialization:bitcoin-block-header gb)))
+                   (gh (bl.ser:block-header-hash
+                        (bl.ser:bitcoin-block-header gb)))
                    (ab (%hdrfields-block (list (%hdrfields-tx 2) (%hdrfields-tx 3)) gh 1700000600))
-                   (ah (bitcoin-lisp.serialization:block-header-hash
-                        (bitcoin-lisp.serialization:bitcoin-block-header ab)))
+                   (ah (bl.ser:block-header-hash
+                        (bl.ser:bitcoin-block-header ab)))
                    (bb (%hdrfields-block (list (%hdrfields-tx 4)) ah 1700001200))
-                   (bh (bitcoin-lisp.serialization:block-header-hash
-                        (bitcoin-lisp.serialization:bitcoin-block-header bb)))
+                   (bh (bl.ser:block-header-hash
+                        (bl.ser:bitcoin-block-header bb)))
                    (,g (cons gb gh)) (,a (cons ab ah)) (,b (cons bb bh))
-                   (cs (bitcoin-lisp::node-chain-state ,node)))
+                   (cs (bl::node-chain-state ,node)))
               (declare (ignorable ,g ,a ,b))
-              (setf (bitcoin-lisp.storage::chain-state-genesis-hash cs) gh)
+              (setf (bl.store::chain-state-genesis-hash cs) gh)
               ;; B is header-only on purpose: its body is never stored.
-              (bitcoin-lisp.storage:store-block ,store gb)
-              (bitcoin-lisp.storage:store-block ,store ab)
-              (let* ((ge (bitcoin-lisp.storage:make-block-index-entry
+              (bl.store:store-block ,store gb)
+              (bl.store:store-block ,store ab)
+              (let* ((ge (bl.store:make-block-index-entry
                           :hash gh :height 0 :chain-work 1 :status :valid
-                          :header (bitcoin-lisp.serialization:bitcoin-block-header gb)))
-                     (ae (bitcoin-lisp.storage:make-block-index-entry
+                          :header (bl.ser:bitcoin-block-header gb)))
+                     (ae (bl.store:make-block-index-entry
                           :hash ah :height 1 :chain-work 2 :status :valid :prev-entry ge
-                          :header (bitcoin-lisp.serialization:bitcoin-block-header ab)))
-                     (be (bitcoin-lisp.storage:make-block-index-entry
+                          :header (bl.ser:bitcoin-block-header ab)))
+                     (be (bl.store:make-block-index-entry
                           :hash bh :height 2 :chain-work 3 :status :valid :prev-entry ae
-                          :header (bitcoin-lisp.serialization:bitcoin-block-header bb))))
-                (bitcoin-lisp.storage:add-block-index-entry cs ge)
-                (bitcoin-lisp.storage:add-block-index-entry cs ae)
-                (bitcoin-lisp.storage:add-block-index-entry cs be)
-                (bitcoin-lisp.storage:update-chain-tip cs bh 2))
+                          :header (bl.ser:bitcoin-block-header bb))))
+                (bl.store:add-block-index-entry cs ge)
+                (bl.store:add-block-index-entry cs ae)
+                (bl.store:add-block-index-entry cs be)
+                (bl.store:update-chain-tip cs bh 2))
               ,@body)
          (uiop:delete-directory-tree ,dir :validate t :if-does-not-exist :ignore)))))
 
@@ -1771,8 +1771,8 @@ than reporting 64 zeros — a client walking the chain backwards terminates on t
 missing key; given the all-zero hash it asks for a block nobody has and errors."
   (%with-hdrfields-chain (node store g a b)
     (flet ((hdr (hash)
-             (bitcoin-lisp.rpc::rpc-getblockheader
-              node (list (bitcoin-lisp.rpc::hash-to-hex hash)))))
+             (bl.rpc::rpc-getblockheader
+              node (list (bl.rpc::hash-to-hex hash)))))
       (let ((gj (hdr (cdr g))) (aj (hdr (cdr a))) (bj (hdr (cdr b))))
         ;; nTx is always present. Genesis carries its coinbase; A's index entry
         ;; predates the tx-count field and is backfilled from the block store;
@@ -1785,9 +1785,9 @@ missing key; given the all-zero hash it asks for a block nobody has and errors."
         (is (not (search "previousblockhash" (%encode-rpc-result gj))))
         ;; ...CONTROL: every other header still carries it, naming the real
         ;; parent (so the omission is genesis-specific, not a blanket drop).
-        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr g))
+        (is (string= (bl.rpc::hash-to-hex (cdr g))
                      (cdr (assoc "previousblockhash" aj :test #'string=))))
-        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr a))
+        (is (string= (bl.rpc::hash-to-hex (cdr a))
                      (cdr (assoc "previousblockhash" bj :test #'string=))))
         ;; The fields survive the encoder.
         (is (search "\"nTx\":2" (%encode-rpc-result aj)))))))
@@ -1800,8 +1800,8 @@ its header fields to blockheaderToJSON, so genesis omits previousblockhash here
 too."
   (%with-hdrfields-chain (node store g a b)
     (flet ((blk (hash &optional (verbosity 1))
-             (bitcoin-lisp.rpc::rpc-getblock
-              node (list (bitcoin-lisp.rpc::hash-to-hex hash) verbosity))))
+             (bl.rpc::rpc-getblock
+              node (list (bl.rpc::hash-to-hex hash) verbosity))))
       (let* ((gj (blk (cdr g)))
              (cb (cdr (assoc "coinbase_tx" gj :test #'string=))))
         (is (not (null cb)) "getblock must emit coinbase_tx")
@@ -1816,7 +1816,7 @@ too."
         ;; Genesis omits previousblockhash here as well...
         (is (null (assoc "previousblockhash" gj :test #'string=)))
         ;; ...CONTROL: a non-genesis block still reports it.
-        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr g))
+        (is (string= (bl.rpc::hash-to-hex (cdr g))
                      (cdr (assoc "previousblockhash" (blk (cdr a)) :test #'string=))))
         ;; Verbosity 2 (full tx detail) carries coinbase_tx too; verbosity 0 is
         ;; untouched raw hex.
@@ -1830,22 +1830,22 @@ reserved value), matching Core's `if (!witness_stack.empty())`."
          (dir (ensure-directories-exist
                (merge-pathnames (format nil "cbwitness-~D/" (get-internal-real-time))
                                 (uiop:temporary-directory))))
-         (store (bitcoin-lisp.storage:init-block-store dir)))
-    (setf (bitcoin-lisp::node-block-store node) store)
+         (store (bl.store:init-block-store dir)))
+    (setf (bl::node-block-store node) store)
     (unwind-protect
          (let* ((reserved (make-32-byte-hash 0))
                 (blk (%hdrfields-block (list (%hdrfields-tx 8 :witness reserved))
                                        (make-32-byte-hash 0) 1700000000))
-                (hash (bitcoin-lisp.serialization:block-header-hash
-                       (bitcoin-lisp.serialization:bitcoin-block-header blk))))
-           (bitcoin-lisp.storage:store-block store blk)
+                (hash (bl.ser:block-header-hash
+                       (bl.ser:bitcoin-block-header blk))))
+           (bl.store:store-block store blk)
            (let ((cb (cdr (assoc "coinbase_tx"
-                                 (bitcoin-lisp.rpc::rpc-getblock
-                                  node (list (bitcoin-lisp.rpc::hash-to-hex hash) 1))
+                                 (bl.rpc::rpc-getblock
+                                  node (list (bl.rpc::hash-to-hex hash) 1))
                                  :test #'string=))))
              (is (not (null cb)))
              (when cb
-               (is (string= (bitcoin-lisp.crypto:bytes-to-hex reserved)
+               (is (string= (bl.crypto:bytes-to-hex reserved)
                             (cdr (assoc "witness" cb :test #'string=))))
                (is (string= "080808" (cdr (assoc "coinbase" cb :test #'string=)))))))
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
@@ -1857,7 +1857,7 @@ reserved value), matching Core's `if (!witness_stack.empty())`."
 one salted-and-hashed entry, as Core's InitRPCAuthentication pushes onto
 g_rpcauth (httprpc.cpp:275-287). Tests bind this rather than a plaintext pair
 because the plaintext pair is not what the server keeps."
-  (list (bitcoin-lisp.rpc::hash-rpc-credential user password)))
+  (list (bl.rpc::hash-rpc-credential user password)))
 
 (test rpc-auth-check-no-credentials
   "A request carrying no Authorization header is never authorized, in every
@@ -1866,44 +1866,44 @@ before looking at any configuration (HTTPReq_JSONRPC, httprpc.cpp:112-117);
 this test used to assert the opposite for the default deployment, which left
 the whole RPC surface — loaded wallet included — open to any local process."
   ;; default startup: the .cookie pair is the credential
-  (let ((bitcoin-lisp.rpc::*rpc-credentials*
-          (%plaintext-credentials bitcoin-lisp.rpc::+rpc-cookie-user+ "deadbeef")))
-    (is (not (bitcoin-lisp.rpc::check-auth nil)))
-    (is (not (bitcoin-lisp.rpc::check-auth ""))))
+  (let ((bl.rpc::*rpc-credentials*
+          (%plaintext-credentials bl.rpc::+rpc-cookie-user+ "deadbeef")))
+    (is (not (bl.rpc::check-auth nil)))
+    (is (not (bl.rpc::check-auth ""))))
   ;; -rpcuser/-rpcpassword startup
-  (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
-    (is (not (bitcoin-lisp.rpc::check-auth nil))))
+  (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
+    (is (not (bl.rpc::check-auth nil))))
   ;; no credential installed at all: nothing authorizes, not even an empty one
-  (let ((bitcoin-lisp.rpc::*rpc-credentials* '()))
-    (is (not (bitcoin-lisp.rpc::check-auth nil)))
-    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header ":"))))))
+  (let ((bl.rpc::*rpc-credentials* '()))
+    (is (not (bl.rpc::check-auth nil)))
+    (is (not (bl.rpc::check-auth (%basic-auth-header ":"))))))
 
 (test rpc-auth-header-parsing
   "check-auth parses the HTTP Basic header the way Core's RPCAuthorized does
 (httprpc.cpp:84-101): \"Basic \" prefix, base64, split on the FIRST colon, so a
 password may contain colons. Anything malformed is rejected, never accepted."
-  (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
+  (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
     ;; base64 of "testuser:testpass"
-    (is (bitcoin-lisp.rpc::check-auth "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
-    (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpass")))
+    (is (bl.rpc::check-auth "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
+    (is (bl.rpc::check-auth (%basic-auth-header "testuser:testpass")))
     ;; scheme name is case-insensitive, surrounding space is trimmed (Core
     ;; TrimStringView)
-    (is (bitcoin-lisp.rpc::check-auth "basic dGVzdHVzZXI6dGVzdHBhc3M="))
-    (is (bitcoin-lisp.rpc::check-auth "Basic  dGVzdHVzZXI6dGVzdHBhc3M= "))
+    (is (bl.rpc::check-auth "basic dGVzdHVzZXI6dGVzdHBhc3M="))
+    (is (bl.rpc::check-auth "Basic  dGVzdHVzZXI6dGVzdHBhc3M= "))
     ;; malformed shapes
-    (is (not (bitcoin-lisp.rpc::check-auth "dGVzdHVzZXI6dGVzdHBhc3M=")))
-    (is (not (bitcoin-lisp.rpc::check-auth "Bearer dGVzdHVzZXI6dGVzdHBhc3M=")))
-    (is (not (bitcoin-lisp.rpc::check-auth "Basic ")))
-    (is (not (bitcoin-lisp.rpc::check-auth "Basic not-base64!!")))
+    (is (not (bl.rpc::check-auth "dGVzdHVzZXI6dGVzdHBhc3M=")))
+    (is (not (bl.rpc::check-auth "Bearer dGVzdHVzZXI6dGVzdHBhc3M=")))
+    (is (not (bl.rpc::check-auth "Basic ")))
+    (is (not (bl.rpc::check-auth "Basic not-base64!!")))
     ;; no colon in the decoded credential
-    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testusertestpass"))))
+    (is (not (bl.rpc::check-auth (%basic-auth-header "testusertestpass"))))
     ;; near misses
-    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpas"))))
-    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpassX"))))
-    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "TESTUSER:testpass")))))
+    (is (not (bl.rpc::check-auth (%basic-auth-header "testuser:testpas"))))
+    (is (not (bl.rpc::check-auth (%basic-auth-header "testuser:testpassX"))))
+    (is (not (bl.rpc::check-auth (%basic-auth-header "TESTUSER:testpass")))))
   ;; the split is on the first colon, so the password keeps the rest
-  (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "u" "a:b:c")))
-    (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:a:b:c")))))
+  (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "u" "a:b:c")))
+    (is (bl.rpc::check-auth (%basic-auth-header "u:a:b:c")))))
 
 (test rpc-timing-resistant-equal
   "%timing-resistant-equal decides exactly what STRING= decides (Core
@@ -1914,7 +1914,7 @@ constant-time but wrong would hand out access."
     (dolist (a cases)
       (dolist (b cases)
         (is (eq (and (string= a b) t)
-                (and (bitcoin-lisp.rpc::%timing-resistant-equal a b) t))
+                (and (bl.rpc::%timing-resistant-equal a b) t))
             "~S vs ~S" a b)))))
 
 ;;; --- -rpcauth / -rpcallowip (7.4b) ---
@@ -1925,16 +1925,16 @@ exactly two fields and splits the second on #\\$ demanding exactly two more
 (InitRPCAuthentication, httprpc.cpp:289-300), so a spec with an extra separator
 is rejected rather than silently truncated into a credential nobody can use."
   (flet ((fields (spec)
-           (let ((c (bitcoin-lisp.rpc::parse-rpcauth-entry spec)))
-             (and c (list (bitcoin-lisp.rpc::rpc-credential-user c)
-                          (bitcoin-lisp.rpc::rpc-credential-salt c)
-                          (bitcoin-lisp.rpc::rpc-credential-hash c))))))
+           (let ((c (bl.rpc::parse-rpcauth-entry spec)))
+             (and c (list (bl.rpc::rpc-credential-user c)
+                          (bl.rpc::rpc-credential-salt c)
+                          (bl.rpc::rpc-credential-hash c))))))
     (is (equal '("alice" "deadbeef" "cafe") (fields "alice:deadbeef$cafe")))
     ;; an empty user, salt or hash is still well-formed to Core's splitter
     (is (equal '("" "s" "h") (fields ":s$h"))))
   (dolist (bad '("alice:nohash" "alice" "" "a:b:c$d" "alice:a$b$c" "alice$s:h"))
-    (is (not (bitcoin-lisp.rpc::parse-rpcauth-entry bad)) "accepted ~S" bad))
-  (is (not (bitcoin-lisp.rpc::parse-rpcauth-entry nil))))
+    (is (not (bl.rpc::parse-rpcauth-entry bad)) "accepted ~S" bad))
+  (is (not (bl.rpc::parse-rpcauth-entry nil))))
 
 (test rpc-auth-rpcauth-hmac-vector
   "The digest matches share/rpcauth/rpcauth.py, which is what generates the
@@ -1942,8 +1942,8 @@ config line: HMAC-SHA256 keyed by the salt's own CHARACTERS (not its hex value)
 over the UTF-8 password, lowercase hex (rpcauth.py:20-22). Keying the decoded
 salt instead would produce a hash no operator-generated line ever matches."
   (flet ((hmac (salt password)
-           (bitcoin-lisp.rpc::%rpcauth-hmac-hex (bitcoin-lisp.rpc::%credential-bytes salt)
-                                (bitcoin-lisp.rpc::%credential-bytes password))))
+           (bl.rpc::%rpcauth-hmac-hex (bl.rpc::%credential-bytes salt)
+                                (bl.rpc::%credential-bytes password))))
     (is (string= "5d253745d78b945827c12a708d3267f495f3eabb5a3f755f5ccd8c5831f350e7"
                  (hmac "a1b2c3d4" "swordfish")))
     ;; non-ASCII password: UTF-8, the encoding %credential-bytes fixed for the
@@ -1960,26 +1960,26 @@ salt instead would produce a hash no operator-generated line ever matches."
 Core checks the single -rpcuser/cookie pair first and falls through to the
 g_rpcauth set (RPCAuthorized, httprpc.cpp:84-102), so both must work — and
 must keep working when the other is absent."
-  (let ((entry (bitcoin-lisp.rpc::make-rpc-credential
+  (let ((entry (bl.rpc::make-rpc-credential
                 "alice" "a1b2c3d4"
                 "5d253745d78b945827c12a708d3267f495f3eabb5a3f755f5ccd8c5831f350e7")))
     ;; alongside the cookie pair
-    (let ((bitcoin-lisp.rpc::*rpc-credentials*
-            (append (%plaintext-credentials bitcoin-lisp.rpc::+rpc-cookie-user+ "deadbeef")
+    (let ((bl.rpc::*rpc-credentials*
+            (append (%plaintext-credentials bl.rpc::+rpc-cookie-user+ "deadbeef")
                     (list entry))))
-      (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:swordfish")))
-      (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "__cookie__:deadbeef")))
-      (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:swordfisH"))))
-      (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "Alice:swordfish"))))
-      (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:")))))
+      (is (bl.rpc::check-auth (%basic-auth-header "alice:swordfish")))
+      (is (bl.rpc::check-auth (%basic-auth-header "__cookie__:deadbeef")))
+      (is (not (bl.rpc::check-auth (%basic-auth-header "alice:swordfisH"))))
+      (is (not (bl.rpc::check-auth (%basic-auth-header "Alice:swordfish"))))
+      (is (not (bl.rpc::check-auth (%basic-auth-header "alice:")))))
     ;; -rpcauth as the ONLY credential: Core allows -rpcauth without -rpcuser
-    (let ((bitcoin-lisp.rpc::*rpc-credentials* (list entry)))
-      (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:swordfish")))
-      (is (not (bitcoin-lisp.rpc::check-auth nil)))
-      (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:wrong")))))
+    (let ((bl.rpc::*rpc-credentials* (list entry)))
+      (is (bl.rpc::check-auth (%basic-auth-header "alice:swordfish")))
+      (is (not (bl.rpc::check-auth nil)))
+      (is (not (bl.rpc::check-auth (%basic-auth-header "alice:wrong")))))
     ;; and no entries means no fallback path opens up
-    (let ((bitcoin-lisp.rpc::*rpc-credentials* '()))
-      (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:swordfish")))))))
+    (let ((bl.rpc::*rpc-credentials* '()))
+      (is (not (bl.rpc::check-auth (%basic-auth-header "alice:swordfish")))))))
 
 (test rpc-allowip-acl-matching
   "The RPC ACL matches the way Core's CSubNet does: only within the same
@@ -1987,40 +1987,40 @@ network, bytewise under the netmask (netaddress.cpp CSubNet::Match), over a list
 that always starts with 127.0.0.0/8 and ::1 (InitHTTPAllowList,
 httpserver.cpp:148-165)."
   (flet ((acl (&rest specs)
-           (let ((subnets (bitcoin-lisp.rpc::%parse-rpc-acl specs)))
+           (let ((subnets (bl.rpc::%parse-rpc-acl specs)))
              (is-true subnets "rejected ~S" specs)
              subnets)))
     ;; loopback is allowed with no -rpcallowip at all, and nothing else is
-    (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl)))
-      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "127.0.0.1"))
-      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "127.9.9.9"))
-      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "::1"))
-      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "192.168.1.5")))
-      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "::2")))
+    (let ((bl.rpc::*rpc-allow-subnets* (acl)))
+      (is (bl.rpc::rpc-client-allowed-p "127.0.0.1"))
+      (is (bl.rpc::rpc-client-allowed-p "127.9.9.9"))
+      (is (bl.rpc::rpc-client-allowed-p "::1"))
+      (is (not (bl.rpc::rpc-client-allowed-p "192.168.1.5")))
+      (is (not (bl.rpc::rpc-client-allowed-p "::2")))
       ;; an address we cannot parse is refused, never defaulted in
-      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "example.com")))
-      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "")))
-      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p nil))))
+      (is (not (bl.rpc::rpc-client-allowed-p "example.com")))
+      (is (not (bl.rpc::rpc-client-allowed-p "")))
+      (is (not (bl.rpc::rpc-client-allowed-p nil))))
     ;; CIDR, dotted-quad netmask and a bare address are the three accepted forms
     (dolist (spec '("192.168.1.0/24" "192.168.1.0/255.255.255.0" "192.168.1.77/24"))
-      (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl spec)))
-        (is (bitcoin-lisp.rpc::rpc-client-allowed-p "192.168.1.5") "~A" spec)
-        (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "192.168.2.5")) "~A" spec)
-        (is (bitcoin-lisp.rpc::rpc-client-allowed-p "127.0.0.1") "~A" spec)))
-    (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl "10.0.0.7")))
-      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "10.0.0.7"))
-      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "10.0.0.8"))))
+      (let ((bl.rpc::*rpc-allow-subnets* (acl spec)))
+        (is (bl.rpc::rpc-client-allowed-p "192.168.1.5") "~A" spec)
+        (is (not (bl.rpc::rpc-client-allowed-p "192.168.2.5")) "~A" spec)
+        (is (bl.rpc::rpc-client-allowed-p "127.0.0.1") "~A" spec)))
+    (let ((bl.rpc::*rpc-allow-subnets* (acl "10.0.0.7")))
+      (is (bl.rpc::rpc-client-allowed-p "10.0.0.7"))
+      (is (not (bl.rpc::rpc-client-allowed-p "10.0.0.8"))))
     ;; the two wildcards are per-network, which is the whole point of Core
     ;; comparing m_net before the netmask: 0.0.0.0/0 does not open IPv6
-    (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl "0.0.0.0/0")))
-      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "8.8.8.8"))
-      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "2001:db8::1"))))
-    (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl "::/0")))
-      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "2001:db8::1"))
-      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "8.8.8.8"))))
-    (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl "2001:db8::/32")))
-      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "2001:db8:1::9"))
-      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "2001:dead::9"))))))
+    (let ((bl.rpc::*rpc-allow-subnets* (acl "0.0.0.0/0")))
+      (is (bl.rpc::rpc-client-allowed-p "8.8.8.8"))
+      (is (not (bl.rpc::rpc-client-allowed-p "2001:db8::1"))))
+    (let ((bl.rpc::*rpc-allow-subnets* (acl "::/0")))
+      (is (bl.rpc::rpc-client-allowed-p "2001:db8::1"))
+      (is (not (bl.rpc::rpc-client-allowed-p "8.8.8.8"))))
+    (let ((bl.rpc::*rpc-allow-subnets* (acl "2001:db8::/32")))
+      (is (bl.rpc::rpc-client-allowed-p "2001:db8:1::9"))
+      (is (not (bl.rpc::rpc-client-allowed-p "2001:dead::9"))))))
 
 (test rpc-allowip-rejects-bad-specs
   "An unparseable -rpcallowip stops the RPC server rather than being dropped:
@@ -2029,10 +2029,10 @@ startup (httpserver.cpp:155-160). Dropping it would leave an operator believing
 a subnet is allowed when it is not."
   (dolist (bad '("1.2.3.4/33" "::1/129" "example.com" "1.2.3.4/abc" "1.2.3.4/"
                  "" "1.2.3.4/255.255.255.0/8" "::1/255.255.255.0"))
-    (is (not (bitcoin-lisp.networking:parse-subnet bad)) "accepted ~S" bad)
-    (is-false (bitcoin-lisp.rpc::%parse-rpc-acl (list bad)) "%parse-rpc-acl accepted ~S" bad))
+    (is (not (bl.net:parse-subnet bad)) "accepted ~S" bad)
+    (is-false (bl.rpc::%parse-rpc-acl (list bad)) "%parse-rpc-acl accepted ~S" bad))
   ;; a good list still parses, on top of the loopback floor
-  (is-true (bitcoin-lisp.rpc::%parse-rpc-acl '("10.0.0.0/8" "::/0"))))
+  (is-true (bl.rpc::%parse-rpc-acl '("10.0.0.0/8" "::/0"))))
 
 (test rpc-acl-gates-every-surface-not-just-jsonrpc
   "The ACL runs in the ACCEPTOR, so it covers /rest/ and /ui/ as well as \"/\".
@@ -2044,9 +2044,9 @@ This is the test that would have caught the ACL living inside rpc-handler: with
 it there, a blocked client got 403 on \"/\" while GET /rest/mempool/contents.json
 and the whole /ui/ SPA answered normally — and -rpcbind is what makes a remote
 client reach them at all."
-  (let ((acceptor (make-instance 'bitcoin-lisp.rpc::rpc-acceptor :port 0))
-        (bitcoin-lisp.rpc::*rpc-allow-subnets*
-          (bitcoin-lisp.rpc::%parse-rpc-acl '("10.0.0.0/8"))))
+  (let ((acceptor (make-instance 'bl.rpc::rpc-acceptor :port 0))
+        (bl.rpc::*rpc-allow-subnets*
+          (bl.rpc::%parse-rpc-acl '("10.0.0.0/8"))))
     (flet ((acl-refusal-p (body)
              ;; A helper, not an inline (and (stringp body) (search ...)): the
              ;; `is` macro evaluates the argument forms of a compound predicate
@@ -2091,8 +2091,8 @@ client reach them at all."
                       uri allowed))))
       ;; 127.0.0.2 above is admitted by the floor, not by 10.0.0.0/8 — so it
       ;; must still get through with no -rpcallowip configured at all
-      (let ((bitcoin-lisp.rpc::*rpc-allow-subnets*
-              (bitcoin-lisp.rpc::%parse-rpc-acl '())))
+      (let ((bl.rpc::*rpc-allow-subnets*
+              (bl.rpc::%parse-rpc-acl '())))
         (multiple-value-bind (status body) (dispatch "/rest/chaininfo.json" "127.0.0.2")
           (declare (ignore status))
           (is-false (acl-refusal-p body)
@@ -2156,13 +2156,13 @@ The type NAMES are Core's, not Lisp's, which is the part that would rot
 silently: a list is an \"array\", a hash-table an \"object\", and the false
 sentinel a \"bool\"."
   (flet ((message (value expected)
-           (handler-case (progn (bitcoin-lisp.rpc::%json-type-error value expected) nil)
-             (bitcoin-lisp.rpc::rpc-error (e)
-               (bitcoin-lisp.rpc::rpc-error-message e))))
+           (handler-case (progn (bl.rpc::%json-type-error value expected) nil)
+             (bl.rpc::rpc-error (e)
+               (bl.rpc::rpc-error-message e))))
          (code (value expected)
-           (handler-case (progn (bitcoin-lisp.rpc::%json-type-error value expected) nil)
-             (bitcoin-lisp.rpc::rpc-error (e)
-               (bitcoin-lisp.rpc::rpc-error-code e)))))
+           (handler-case (progn (bl.rpc::%json-type-error value expected) nil)
+             (bl.rpc::rpc-error (e)
+               (bl.rpc::rpc-error-code e)))))
     (is (equal "JSON value of type string is not of expected type array"
                (message "abc" "array")))
     (is (equal "JSON value of type number is not of expected type string"
@@ -2172,10 +2172,10 @@ sentinel a \"bool\"."
     (is (equal "JSON value of type object is not of expected type array"
                (message (make-hash-table :test 'equal) "array")))
     (is (equal "JSON value of type bool is not of expected type number"
-               (message bitcoin-lisp.rpc::+json-false+ "number"))
+               (message bl.rpc::+json-false+ "number"))
         "the false sentinel must name itself bool, not null")
     ;; Core answers RPC_TYPE_ERROR (-3) for these, not a generic parameter error.
-    (is (eql bitcoin-lisp.rpc::+rpc-type-error+ (code "abc" "array")))))
+    (is (eql bl.rpc::+rpc-type-error+ (code "abc" "array")))))
 
 (test createrawtransaction-accepts-real-json-objects
   "A JSON object reaches an RPC handler as a HASH-TABLE from the decoder and as
@@ -2191,11 +2191,11 @@ the correct code was present and unused.
 
 Both shapes must produce the SAME transaction, which is the property that
 makes the tests meaningful again."
-  (let* ((bitcoin-lisp:*network* :regtest)
-         (node (bitcoin-lisp::make-node :network :regtest))
+  (let* ((bl:*network* :regtest)
+         (node (bl::make-node :network :regtest))
          (txid "0000000000000000000000000000000000000000000000000000000000000001")
          (addr "bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy")
-         (as-hash (bitcoin-lisp.rpc::rpc-createrawtransaction
+         (as-hash (bl.rpc::rpc-createrawtransaction
                    node (list (list (let ((h (make-hash-table :test 'equal)))
                                       (setf (gethash "txid" h) txid
                                             (gethash "vout" h) 0)
@@ -2203,7 +2203,7 @@ makes the tests meaningful again."
                               (let ((h (make-hash-table :test 'equal)))
                                 (setf (gethash addr h) 0.5d0)
                                 h))))
-         (as-alist (bitcoin-lisp.rpc::rpc-createrawtransaction
+         (as-alist (bl.rpc::rpc-createrawtransaction
                     node (list (list (list (cons "txid" txid) (cons "vout" 0)))
                                (list (cons addr 0.5d0))))))
     (is (stringp as-hash) "the hash-table form did not produce a transaction")
@@ -2224,8 +2224,8 @@ caller not using it: its own loop took the object form only, so the array form
 answered \"Invalid outputs format\", a data output was impossible, and duplicate
 addresses passed silently. The twelfth time this wave that the code existed and
 the caller that needed it did not use it."
-  (let* ((bitcoin-lisp:*network* :regtest)
-         (node (bitcoin-lisp::make-node :network :regtest))
+  (let* ((bl:*network* :regtest)
+         (node (bl::make-node :network :regtest))
          (txid "0000000000000000000000000000000000000000000000000000000000000001")
          (addr "bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy")
          (addr2 "bcrt1qqurswpc8qurswpc8qurswpc8qurswpc8dxm0gk"))
@@ -2235,9 +2235,9 @@ the caller that needed it did not use it."
                h))
            (ins () (list (list (cons "txid" txid) (cons "vout" 0)))))
       ;; The two spellings of the same single output agree.
-      (let ((as-object (bitcoin-lisp.rpc::rpc-createrawtransaction
+      (let ((as-object (bl.rpc::rpc-createrawtransaction
                         node (list (ins) (obj addr 0.5d0))))
-            (as-array (bitcoin-lisp.rpc::rpc-createrawtransaction
+            (as-array (bl.rpc::rpc-createrawtransaction
                        node (list (ins) (list (obj addr 0.5d0))))))
         (is (stringp as-array) "the array-of-objects form did not produce a transaction")
         (is (equal as-object as-array)
@@ -2245,28 +2245,28 @@ the caller that needed it did not use it."
             as-object as-array))
       ;; The array form keeps its ORDER, which is the reason Core has it. Two
       ;; distinct addresses with distinct amounts pin which output came first.
-      (let* ((hex (bitcoin-lisp.rpc::rpc-createrawtransaction
+      (let* ((hex (bl.rpc::rpc-createrawtransaction
                    node (list (ins) (list (obj addr 0.5d0) (obj addr2 0.25d0)))))
              (tx (flexi-streams:with-input-from-sequence
-                     (s (bitcoin-lisp.crypto:hex-to-bytes hex))
-                   (bitcoin-lisp.serialization:read-transaction s)))
-             (outs (bitcoin-lisp.serialization:transaction-outputs tx)))
+                     (s (bl.crypto:hex-to-bytes hex))
+                   (bl.ser:read-transaction s)))
+             (outs (bl.ser:transaction-outputs tx)))
         (is (= 2 (length outs)))
-        (is (= 50000000 (bitcoin-lisp.serialization:tx-out-value (aref outs 0))))
-        (is (= 25000000 (bitcoin-lisp.serialization:tx-out-value (aref outs 1)))))
+        (is (= 50000000 (bl.ser:tx-out-value (aref outs 0))))
+        (is (= 25000000 (bl.ser:tx-out-value (aref outs 1)))))
       ;; A "data" key is an OP_RETURN output carrying zero value, not an address.
-      (let* ((hex (bitcoin-lisp.rpc::rpc-createrawtransaction
+      (let* ((hex (bl.rpc::rpc-createrawtransaction
                    node (list (ins) (list (obj "data" "deadbeef")))))
              (tx (flexi-streams:with-input-from-sequence
-                     (s (bitcoin-lisp.crypto:hex-to-bytes hex))
-                   (bitcoin-lisp.serialization:read-transaction s)))
-             (out (aref (bitcoin-lisp.serialization:transaction-outputs tx) 0))
-             (spk (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
-        (is (= 0 (bitcoin-lisp.serialization:tx-out-value out)))
+                     (s (bl.crypto:hex-to-bytes hex))
+                   (bl.ser:read-transaction s)))
+             (out (aref (bl.ser:transaction-outputs tx) 0))
+             (spk (bl.ser:tx-out-script-pubkey out)))
+        (is (= 0 (bl.ser:tx-out-value out)))
         (is (= #x6a (aref spk 0)) "a data output must be an OP_RETURN"))
       ;; Duplicates are refused, where the old loop accepted them silently.
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-createrawtransaction
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-createrawtransaction
          node (list (ins) (list (obj addr 0.5d0) (obj addr 0.25d0))))))))
 
 (test signrawtransactionwithkey-takes-real-json-prevtxs
@@ -2281,11 +2281,11 @@ it alists. Same defect as createrawtransaction's inputs in #491, one file over.
 Signing needs a key we do not have here; what this pins is that the prevout map
 is BUILT from either shape, so the two must fail identically and never with an
 internal error."
-  (let* ((bitcoin-lisp:*network* :regtest)
-         (node (bitcoin-lisp::make-node :network :regtest))
+  (let* ((bl:*network* :regtest)
+         (node (bl::make-node :network :regtest))
          (txid "0000000000000000000000000000000000000000000000000000000000000001")
          (spk "76a91460baa0f494b38ce3c940dea67f3804dc52d1fb9488ac")
-         (raw (bitcoin-lisp.rpc::rpc-createrawtransaction
+         (raw (bl.rpc::rpc-createrawtransaction
                node (list (list (list (cons "txid" txid) (cons "vout" 0)))
                           (let ((h (make-hash-table :test 'equal)))
                             (setf (gethash "bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy" h) 0.5d0)
@@ -2297,9 +2297,9 @@ internal error."
                     h))
          (as-alist (list (cons "txid" txid) (cons "vout" 0)
                          (cons "scriptPubKey" spk))))
-    (let ((from-hash (bitcoin-lisp.rpc::rpc-signrawtransactionwithkey
+    (let ((from-hash (bl.rpc::rpc-signrawtransactionwithkey
                       node (list raw '() (list as-hash))))
-          (from-alist (bitcoin-lisp.rpc::rpc-signrawtransactionwithkey
+          (from-alist (bl.rpc::rpc-signrawtransactionwithkey
                        node (list raw '() (list as-alist)))))
       ;; No internal error, and the same answer from both shapes.
       (is (equal from-alist from-hash)
@@ -2319,14 +2319,14 @@ and the caller that needed it not using it.
 The checksum is validated ONCE, on the multipath form it actually covers; the
 expansions carry none by construction, so requiring one per expansion answers
 \"Missing checksum\" for a descriptor whose checksum was correct."
-  (let* ((bitcoin-lisp:*network* :regtest)
-         (node (bitcoin-lisp::make-node :network :regtest))
+  (let* ((bl:*network* :regtest)
+         (node (bl::make-node :network :regtest))
          (body (concatenate 'string
                             "wpkh(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZ"
                             "mbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRv"
                             "mDUjyEmNUWwx8UbK/1/<0;1>/*)"))
-         (desc (format nil "~A#~A" body (bitcoin-lisp.rpc::descriptor-checksum body)))
-         (result (bitcoin-lisp.rpc::rpc-deriveaddresses node (list desc (list 1 2)))))
+         (desc (format nil "~A#~A" body (bl.rpc::descriptor-checksum body)))
+         (result (bl.rpc::rpc-deriveaddresses node (list desc (list 1 2)))))
     ;; Core's own expected value, verbatim from the test.
     (is (equalp #(#("bcrt1q7c8mdmdktrzs8xgpjmqw90tjn65j5a3yj04m3n"
                     "bcrt1qs6n37uzu0v0qfzf0r0csm0dwa7prc0v5uavgy0")
@@ -2337,16 +2337,16 @@ expansions carry none by construction, so requiring one per expansion answers
     ;; A bad checksum on the multipath form is still refused — validating once
     ;; must not mean validating never.
     (signals error
-      (bitcoin-lisp.rpc::rpc-deriveaddresses
+      (bl.rpc::rpc-deriveaddresses
        node (list (format nil "~A#00000000" body) (list 1 2))))
     ;; And an ordinary descriptor still returns a flat list.
     (let* ((single (concatenate 'string
                                 "wpkh(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZ"
                                 "mbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRv"
                                 "mDUjyEmNUWwx8UbK/1/1/*)"))
-           (flat (bitcoin-lisp.rpc::rpc-deriveaddresses
+           (flat (bl.rpc::rpc-deriveaddresses
                   node (list (format nil "~A#~A" single
-                                     (bitcoin-lisp.rpc::descriptor-checksum single))
+                                     (bl.rpc::descriptor-checksum single))
                              (list 1 2)))))
       (is (listp flat) "an ordinary descriptor must not become an array of arrays")
       (is (= 2 (length flat))))))
@@ -2361,7 +2361,7 @@ Ours took a relative path as given, so the log landed wherever the process
 happened to be started from — for a supervised service, /. #478 moved the
 DEFAULT debug.log into the network directory and stopped there; this is the
 other half of the same rule."
-  (flet ((resolve (log-file) (bitcoin-lisp::%resolve-log-file log-file "/tmp/dd/" :regtest)))
+  (flet ((resolve (log-file) (bl::%resolve-log-file log-file "/tmp/dd/" :regtest)))
     (is (equal "/tmp/dd/regtest/foo.log" (resolve "foo.log")))
     (is (equal "/tmp/dd/regtest/debug.log" (resolve nil)))
     ;; Absolute stays absolute — feature_logging's second case writes outside
@@ -2372,7 +2372,7 @@ other half of the same rule."
     ;; No network: the base directory, which is what the pre-Core callers and
     ;; the unit tests pass.
     (is (equal "/tmp/dd/foo.log"
-               (bitcoin-lisp::%resolve-log-file "foo.log" "/tmp/dd/")))))
+               (bl::%resolve-log-file "foo.log" "/tmp/dd/")))))
 
 (test an-unknown-peer-height-does-not-break-the-sync-thread
   "A peer's advertised start height is a SIGNED int32 whose \"unknown\" value
@@ -2391,25 +2391,25 @@ sync_with_ping, because the node never answered a ping.
 CONSIDER-PEER-EVICTION read -1 as a height 1001 behind, so any node past height
 999 disconnected such peers on sight. Core has no height-based eviction at all;
 this rule is ours, and it has to mean what it says."
-  (let ((unknown (bitcoin-lisp.networking:make-peer :address "10.2.2.2" :state :ready
+  (let ((unknown (bl.net:make-peer :address "10.2.2.2" :state :ready
                                                     :start-height -1))
-        (behind (bitcoin-lisp.networking:make-peer :address "10.2.2.3" :state :ready
+        (behind (bl.net:make-peer :address "10.2.2.3" :state :ready
                                                    :start-height 5)))
     ;; Unknown is not "behind", at any height of ours.
-    (is-false (bitcoin-lisp.networking::consider-peer-eviction unknown 100000)
+    (is-false (bl.net::consider-peer-eviction unknown 100000)
               "a peer advertising an unknown height was evicted as if it were behind")
     ;; A peer that really is far behind still goes.
-    (is-true (bitcoin-lisp.networking::consider-peer-eviction behind 100000))
+    (is-true (bl.net::consider-peer-eviction behind 100000))
     ;; ...and one that is only a little behind stays.
-    (is-false (bitcoin-lisp.networking::consider-peer-eviction behind 500)))
+    (is-false (bl.net::consider-peer-eviction behind 500)))
   ;; The hazard is real: the slot is (UNSIGNED-BYTE 32), so a raw -1 signals.
   ;; Asserted rather than assumed, because if the slot type ever widened this
   ;; test would otherwise keep passing while testing nothing.
-  (let ((ctx (bitcoin-lisp.networking::make-ibd)))
+  (let ((ctx (bl.net::make-ibd)))
     (signals error
-      (setf (bitcoin-lisp.networking::ibd-context-target-height ctx) -1))
+      (setf (bl.net::ibd-context-target-height ctx) -1))
     (finishes
-      (setf (bitcoin-lisp.networking::ibd-context-target-height ctx) 0)))
+      (setf (bl.net::ibd-context-target-height ctx) 0)))
   ;; And START-IBD clamps before it stores, so the sync thread never gets
   ;; there. Driving START-IBD itself would need a whole node fixture; what
   ;; matters is that the clamp is on the line that writes the slot.
@@ -2435,14 +2435,14 @@ multi-node tests on the edge.
 per-pass and gone by the time the wait starts, so the header tip has to outlive
 it. Monotone, and a hint only — it shortens a wait and decides nothing about
 the chain."
-  (is (= 5 bitcoin-lisp::+behind-retry-seconds+)
+  (is (= 5 bl::+behind-retry-seconds+)
       "the bound is what keeps an unservable chain from spinning; it is not a poll interval")
-  (is (< bitcoin-lisp::+behind-retry-seconds+ 30)
+  (is (< bl::+behind-retry-seconds+ 30)
       "a bound at or above the wait itself would make the whole thing inert")
   ;; Monotone: a lower header tip from a later pass must not lower it.
-  (let ((bitcoin-lisp.networking:*highest-header-seen* 0))
-    (setf bitcoin-lisp.networking:*highest-header-seen* 900)
-    (is (= 900 bitcoin-lisp.networking:*highest-header-seen*))))
+  (let ((bl.net:*highest-header-seen* 0))
+    (setf bl.net:*highest-header-seen* 900)
+    (is (= 900 bl.net:*highest-header-seen*))))
 
 (test manual-peers-report-connection-type-manual
   "ConnectionType::MANUAL is a first-class member of Core's enum
@@ -2454,16 +2454,16 @@ We keep it as a flag internally on purpose: the outbound-slot budgets are
 written against the automatic types, and a manual peer occupies none of them in
 Core either. What has to agree is the report."
   (let ((node (make-test-node))
-        (manual (bitcoin-lisp::make-peer :address "10.1.1.1" :state :ready))
-        (auto (bitcoin-lisp::make-peer :address "10.1.1.2" :state :ready
+        (manual (bl::make-peer :address "10.1.1.1" :state :ready))
+        (auto (bl::make-peer :address "10.1.1.2" :state :ready
                                        :conn-type :outbound-full-relay))
-        (inbound (bitcoin-lisp::make-peer :address "10.1.1.3" :state :ready :inbound t)))
-    (setf (bitcoin-lisp.networking:peer-manual manual) t)
+        (inbound (bl::make-peer :address "10.1.1.3" :state :ready :inbound t)))
+    (setf (bl.net:peer-manual manual) t)
     ;; An INBOUND peer is never "manual", whatever flags it carries: Core's
     ;; inbound connections are ConnectionType::INBOUND, full stop.
-    (setf (bitcoin-lisp.networking:peer-manual inbound) t)
-    (setf (bitcoin-lisp::node-peers node) (list manual auto inbound))
-    (let* ((rows (bitcoin-lisp.rpc::%peerinfo-rows node))
+    (setf (bl.net:peer-manual inbound) t)
+    (setf (bl::node-peers node) (list manual auto inbound))
+    (let* ((rows (bl.rpc::%peerinfo-rows node))
            (types (mapcar (lambda (r) (cdr (assoc "connection_type" r :test #'string=)))
                           rows)))
       (is (equal '("manual" "outbound-full-relay" "inbound") types)
@@ -2484,11 +2484,11 @@ tip, timed out against a node working perfectly in isolation.
 Two halves, because either alone would pass against the bug: that a NIL source
 peer excludes nobody (a locally mined block has no source to skip), and that
 the submitblock path actually makes the call."
-  (let ((peer (bitcoin-lisp::make-peer :address "10.9.9.9" :state :ready)))
+  (let ((peer (bl::make-peer :address "10.9.9.9" :state :ready)))
     ;; A ready peer with no connection: SEND-MESSAGE is a no-op on it, so the
     ;; count is taken from the relay target list instead.
     (is (equal (list peer)
-               (bitcoin-lisp.networking::block-relay-targets nil (list peer)))
+               (bl.net::block-relay-targets nil (list peer)))
         "a NIL source peer must not exclude anybody — a locally mined block has no source")
     ;; And the production call site passes NIL, rather than only the P2P one
     ;; having a call at all. This is the half that was missing, so it is the
@@ -2515,11 +2515,11 @@ different connections."
         (peers '()))
     (dolist (addr '("10.0.0.1" "10.0.0.2" "10.0.0.3"))
       ;; PUSH, which is how the sync thread builds the list.
-      (push (bitcoin-lisp::make-peer :address addr :state :ready) peers))
-    (setf (bitcoin-lisp::node-peers node) peers)
-    (let* ((ids (mapcar (lambda (p) (bitcoin-lisp.networking::peer-id p))
-                        (bitcoin-lisp::node-peers node)))
-           (rows (bitcoin-lisp.rpc::%peerinfo-rows node))
+      (push (bl::make-peer :address addr :state :ready) peers))
+    (setf (bl::node-peers node) peers)
+    (let* ((ids (mapcar (lambda (p) (bl.net::peer-id p))
+                        (bl::node-peers node)))
+           (rows (bl.rpc::%peerinfo-rows node))
            (row-ids (mapcar (lambda (r) (cdr (assoc "id" r :test #'string=))) rows)))
       ;; The precondition: the stored list really is newest-first, so this test
       ;; is not asserting a sort that was already trivially true.
@@ -2537,20 +2537,20 @@ connection by comparing one node's `addrbind` against the other's `addr`
 (rpc_net.py:116-117), and a bare host can never equal an \"ip:port\"; and two
 peers behind one address are indistinguishable in the output without it, which
 on regtest is every peer."
-  (let ((peer (bitcoin-lisp.networking:make-peer :address "203.0.113.4" :state :ready)))
+  (let ((peer (bl.net:make-peer :address "203.0.113.4" :state :ready)))
     ;; No connection at all: the host alone is all there is, and that must not
     ;; become \"host:0\" or an error.
-    (is (string= "203.0.113.4" (bitcoin-lisp.rpc::%peer-addr peer)))
-    (setf (bitcoin-lisp.networking::peer-connection peer)
-          (bitcoin-lisp.networking::make-connection
+    (is (string= "203.0.113.4" (bl.rpc::%peer-addr peer)))
+    (setf (bl.net::peer-connection peer)
+          (bl.net::make-connection
            :host "203.0.113.4" :port 8333 :connected t))
-    (is (string= "203.0.113.4:8333" (bitcoin-lisp.rpc::%peer-addr peer)))
+    (is (string= "203.0.113.4:8333" (bl.rpc::%peer-addr peer)))
     ;; A v6 literal is bracketed before the port, as CService::ToStringAddrPort
     ;; does — an unbracketed \"::1:8333\" is a different, valid v6 address.
-    (let ((v6 (bitcoin-lisp.networking:make-peer :address "::1" :state :ready)))
-      (setf (bitcoin-lisp.networking::peer-connection v6)
-            (bitcoin-lisp.networking::make-connection :host "::1" :port 8333 :connected t))
-      (is (string= "[::1]:8333" (bitcoin-lisp.rpc::%peer-addr v6))))))
+    (let ((v6 (bl.net:make-peer :address "::1" :state :ready)))
+      (setf (bl.net::peer-connection v6)
+            (bl.net::make-connection :host "::1" :port 8333 :connected t))
+      (is (string= "[::1]:8333" (bl.rpc::%peer-addr v6))))))
 
 (test dial-dedup-compares-the-endpoint-not-just-the-host
   "Core has two dedup guards and applies them to different dials
@@ -2573,27 +2573,27 @@ m_addr_name carrying the ephemeral SOURCE port; ours from an accepted
 connection recording port 0 while a dialed one records the port it dialed."
   (let ((node (make-test-node)))
     (flet ((peer-at (host port &key inbound)
-             (let ((p (bitcoin-lisp.networking:make-peer :address host :state :ready
+             (let ((p (bl.net:make-peer :address host :state :ready
                                                          :inbound inbound)))
-               (setf (bitcoin-lisp.networking::peer-connection p)
-                     (bitcoin-lisp.networking::make-connection
+               (setf (bl.net::peer-connection p)
+                     (bl.net::make-connection
                       :host host :port port :connected t))
                p)))
       ;; An INBOUND peer from 127.0.0.1 (source port recorded as 0).
-      (setf (bitcoin-lisp::node-peers node) (list (peer-at "127.0.0.1" 0 :inbound t)))
-      (is-true (bitcoin-lisp::peer-connected-to-host-p node "127.0.0.1")
+      (setf (bl::node-peers node) (list (peer-at "127.0.0.1" 0 :inbound t)))
+      (is-true (bl::peer-connected-to-host-p node "127.0.0.1")
                "the address-only guard should still see it")
-      (is-false (bitcoin-lisp::peer-connected-to-endpoint-p node "127.0.0.1" 11133)
+      (is-false (bl::peer-connected-to-endpoint-p node "127.0.0.1" 11133)
                 "an inbound peer blocked an outbound dial to the same host")
       ;; An OUTBOUND peer to a DIFFERENT port on the same host.
-      (setf (bitcoin-lisp::node-peers node) (list (peer-at "127.0.0.1" 11132)))
-      (is-false (bitcoin-lisp::peer-connected-to-endpoint-p node "127.0.0.1" 11133)
+      (setf (bl::node-peers node) (list (peer-at "127.0.0.1" 11132)))
+      (is-false (bl::peer-connected-to-endpoint-p node "127.0.0.1" 11133)
                 "a peer on another port of the same host blocked the dial")
       ;; The same endpoint IS deduped — the guard still does its job.
-      (is-true (bitcoin-lisp::peer-connected-to-endpoint-p node "127.0.0.1" 11132))
+      (is-true (bl::peer-connected-to-endpoint-p node "127.0.0.1" 11132))
       ;; And the addrman guard keeps Core's address-only semantics, which is
       ;; what makes the two functions worth having separately.
-      (is-true (bitcoin-lisp::peer-connected-to-host-p node "127.0.0.1")))))
+      (is-true (bl::peer-connected-to-host-p node "127.0.0.1")))))
 
 (test disconnectnode-selects-by-address-or-id-as-core-does
   "Core's disconnectnode takes EITHER address OR nodeid, and the by-id form is
@@ -2607,33 +2607,33 @@ The combination rule is Core's (rpc/net.cpp:471-479), empty string included —
 `disconnectnode \"\" 1` is how Core's own help says to disconnect by id
 positionally."
   (let* ((node (make-test-node))
-         (peer (bitcoin-lisp.networking:make-peer :address "203.0.113.9" :state :ready)))
-    (setf (bitcoin-lisp.networking::peer-id peer) 4242)
-    (setf (bitcoin-lisp::node-peers node) (list peer))
+         (peer (bl.net:make-peer :address "203.0.113.9" :state :ready)))
+    (setf (bl.net::peer-id peer) 4242)
+    (setf (bl::node-peers node) (list peer))
     ;; Both given: Core's exact refusal.
     (handler-case
-        (progn (bitcoin-lisp.rpc::rpc-disconnectnode node '("203.0.113.9" 4242))
+        (progn (bl.rpc::rpc-disconnectnode node '("203.0.113.9" 4242))
                (is-true nil "address+nodeid was accepted"))
-      (bitcoin-lisp.rpc::rpc-error (e)
+      (bl.rpc::rpc-error (e)
         (is (string= "Only one of address and nodeid should be provided."
-                     (bitcoin-lisp.rpc::rpc-error-message e)))
-        (is (= bitcoin-lisp.rpc::+rpc-invalid-params+
-               (bitcoin-lisp.rpc::rpc-error-code e)))))
+                     (bl.rpc::rpc-error-message e)))
+        (is (= bl.rpc::+rpc-invalid-params+
+               (bl.rpc::rpc-error-code e)))))
     ;; Unknown id: Core's not-connected code, not a type error.
     (handler-case
-        (progn (bitcoin-lisp.rpc::rpc-disconnectnode node '(nil 999))
+        (progn (bl.rpc::rpc-disconnectnode node '(nil 999))
                (is-true nil "an unknown nodeid was accepted"))
-      (bitcoin-lisp.rpc::rpc-error (e)
-        (is (= bitcoin-lisp.rpc::+rpc-client-node-not-connected+
-               (bitcoin-lisp.rpc::rpc-error-code e)))))
+      (bl.rpc::rpc-error (e)
+        (is (= bl.rpc::+rpc-client-node-not-connected+
+               (bl.rpc::rpc-error-code e)))))
     ;; By id, the framework's spelling: named nodeid only.
-    (is (null (bitcoin-lisp.rpc::rpc-disconnectnode node '(nil 4242))))
+    (is (null (bl.rpc::rpc-disconnectnode node '(nil 4242))))
     ;; And Core's positional spelling for the same thing.
-    (setf (bitcoin-lisp::node-peers node) (list peer))
-    (is (null (bitcoin-lisp.rpc::rpc-disconnectnode node '("" 4242))))
+    (setf (bl::node-peers node) (list peer))
+    (is (null (bl.rpc::rpc-disconnectnode node '("" 4242))))
     ;; By address still works.
-    (setf (bitcoin-lisp::node-peers node) (list peer))
-    (is (null (bitcoin-lisp.rpc::rpc-disconnectnode node '("203.0.113.9"))))))
+    (setf (bl::node-peers node) (list peer))
+    (is (null (bl.rpc::rpc-disconnectnode node '("203.0.113.9"))))))
 
 (test rpcservertimeout-reaches-the-acceptor
   "-rpcservertimeout is only worth having if it changes the socket. It used to
@@ -2650,21 +2650,21 @@ a broken pipe polling the second node ~50s after its previous call.
 
 Assert against the acceptor's own slot — the thing the socket actually uses —
 not against the special."
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
   (with-rpc-test-datadir (dir)
     (let ((node (make-test-node)))
-      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (setf (bl::node-data-directory node) dir)
       ;; Core's default, not hunchentoot's.
-      (is (= 30 bitcoin-lisp.rpc:*rpc-server-timeout*))
-      (let ((bitcoin-lisp.rpc:*rpc-server-timeout* 99000))
+      (is (= 30 bl.rpc:*rpc-server-timeout*))
+      (let ((bl.rpc:*rpc-server-timeout* 99000))
         (unwind-protect
              (progn
-               (bitcoin-lisp.rpc:start-rpc-server node :port 19998)
+               (bl.rpc:start-rpc-server node :port 19998)
                (is (= 99000 (hunchentoot:acceptor-read-timeout
-                             bitcoin-lisp.rpc:*rpc-server*)))
+                             bl.rpc:*rpc-server*)))
                (is (= 99000 (hunchentoot:acceptor-write-timeout
-                             bitcoin-lisp.rpc:*rpc-server*))))
-          (bitcoin-lisp.rpc:stop-rpc-server)))
+                             bl.rpc:*rpc-server*))))
+          (bl.rpc:stop-rpc-server)))
       ;; The positive control: without the initargs the acceptor would carry
       ;; hunchentoot's own default, so a test that only checked "not nil"
       ;; would have passed against the bug.
@@ -2706,7 +2706,7 @@ distinction is written down here.
             ;; 1. arity
             (dolist (row rows)
               (destructuring-bind (method position name) row
-                (let ((entry (assoc method bitcoin-lisp.rpc::*rpc-named-arg-names*
+                (let ((entry (assoc method bl.rpc::*rpc-named-arg-names*
                                     :test #'string=)))
                   (when entry
                     (incf checked)
@@ -2715,14 +2715,14 @@ distinction is written down here.
                                   (length (rest entry)))
                             short))))))
             ;; 2. position of our own names
-            (dolist (entry bitcoin-lisp.rpc::*rpc-named-arg-names*)
+            (dolist (entry bl.rpc::*rpc-named-arg-names*)
               (let ((method (first entry)))
                 (loop for name-spec in (rest entry)
                       for index from 0
                       do (let ((core-positions
                                  (loop for row in rows
                                        when (and (string= method (first row))
-                                                 (bitcoin-lisp.rpc::%named-arg-slot
+                                                 (bl.rpc::%named-arg-slot
                                                   name-spec (third row)))
                                          collect (second row))))
                            (when (and core-positions
@@ -2751,10 +2751,10 @@ is Core's full set."
   (let ((missing '()))
     (maphash (lambda (method fn)
                (declare (ignore fn))
-               (unless (assoc method bitcoin-lisp.rpc::*rpc-named-arg-names*
+               (unless (assoc method bl.rpc::*rpc-named-arg-names*
                               :test #'string=)
                  (push method missing)))
-             bitcoin-lisp.rpc::*rpc-methods*)
+             bl.rpc::*rpc-methods*)
     ;; Ours-only methods (the web UI helpers and such) have no Core declaration
     ;; to take names from; they are named here so the exemption is a list
     ;; someone can read rather than a silent pass.
@@ -2778,14 +2778,14 @@ rpc_help.py passing."
   (multiple-value-bind (core-json core-strings) (%parse-core-client-cpp)
     (if (null core-json)
         (skip "refs/bitcoin not present")
-        (let* ((dump (bitcoin-lisp.rpc::%dump-all-command-conversions))
+        (let* ((dump (bl.rpc::%dump-all-command-conversions))
                (ours (loop for row across dump
                            collect (list (aref row 0) (aref row 1) (aref row 2)
                                          (eq t (aref row 3)))))
                (our-methods (let ((h (make-hash-table :test 'equal)))
                               (maphash (lambda (k v) (declare (ignore v))
                                          (setf (gethash k h) t))
-                                       bitcoin-lisp.rpc::*rpc-methods*)
+                                       bl.rpc::*rpc-methods*)
                               h))
                ;; Core's rows, restricted to what we serve.
                (want-json (remove-if-not (lambda (r) (gethash (first r) our-methods))
@@ -2827,8 +2827,8 @@ rpc_help.py passing."
              ;; as missing — which is how this assertion failed after four
              ;; methods were ADDED. Whether it has already run does not matter:
              ;; registration is idempotent.
-             (ignore-errors (bitcoin-lisp.rpc::register-all-methods))
-             (missing (remove-if (lambda (m) (gethash m bitcoin-lisp.rpc::*rpc-methods*))
+             (ignore-errors (bl.rpc::register-all-methods))
+             (missing (remove-if (lambda (m) (gethash m bl.rpc::*rpc-methods*))
                                  core-methods)))
         ;; Not an assertion of zero — these are tracked, and the list moving is
         ;; what matters. It IS an assertion that the list has not GROWN.
@@ -2845,11 +2845,11 @@ API, and reporting a bare feerate would defeat the point.
 A horizon that does not track the requested target is OMITTED rather than
 reported as zero: absence and \"no answer\" mean different things to whoever is
 reading the output."
-  (let ((bitcoin-lisp.mempool:*block-policy-estimator*
-          (bitcoin-lisp.mempool:make-block-policy-estimator)))
+  (let ((bl.mp:*block-policy-estimator*
+          (bl.mp:make-block-policy-estimator)))
     ;; A fresh estimator has no history, so every horizon that TRACKS the
     ;; target still answers — with a zero rate and Core's errors array.
-    (let ((r (bitcoin-lisp.rpc::rpc-estimaterawfee nil '(2))))
+    (let ((r (bl.rpc::rpc-estimaterawfee nil '(2))))
       (is (consp r) "no horizon answered for a target every horizon tracks")
       (let ((short (cdr (assoc "short" r :test #'string=))))
         (is-true short "the short horizon did not answer for conf_target 2")
@@ -2857,108 +2857,108 @@ reading the output."
         (is-true (assoc "errors" short :test #'string=)
                  "an estimator with no history must say so")))
     ;; A target only the long horizon tracks omits the shorter ones entirely.
-    (let* ((long-max (bitcoin-lisp.mempool:horizon-max-confirms :long))
-           (short-max (bitcoin-lisp.mempool:horizon-max-confirms :short))
-           (r (bitcoin-lisp.rpc::rpc-estimaterawfee
+    (let* ((long-max (bl.mp:horizon-max-confirms :long))
+           (short-max (bl.mp:horizon-max-confirms :short))
+           (r (bl.rpc::rpc-estimaterawfee
                nil (list (min long-max (1+ short-max))))))
       (is-false (assoc "short" r :test #'string=)
                 "the short horizon answered for a target it does not track"))
     ;; Range and type checks.
-    (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
-           (%rpc-error-code (lambda () (bitcoin-lisp.rpc::rpc-estimaterawfee nil '(0))))))
-    (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
-           (%rpc-error-code (lambda () (bitcoin-lisp.rpc::rpc-estimaterawfee nil '(2 1.5))))))
-    (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
-           (%rpc-error-code (lambda () (bitcoin-lisp.rpc::rpc-estimaterawfee nil '(2 -0.1))))))
-    (is (= bitcoin-lisp.rpc::+rpc-type-error+
-           (%rpc-error-code (lambda () (bitcoin-lisp.rpc::rpc-estimaterawfee nil '("2"))))))))
+    (is (= bl.rpc::+rpc-invalid-parameter+
+           (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '(0))))))
+    (is (= bl.rpc::+rpc-invalid-parameter+
+           (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '(2 1.5))))))
+    (is (= bl.rpc::+rpc-invalid-parameter+
+           (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '(2 -0.1))))))
+    (is (= bl.rpc::+rpc-type-error+
+           (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '("2"))))))))
 
 (test addconnection-opens-the-named-connection-type
   "addconnection (Core rpc/net.cpp). The functional framework uses it to attach
 its own P2P connections of a CHOSEN type — a block-relay or feeler slot a test
 cannot ask for any other way — so the type reaching the dial is the point, not
 just that something connected."
-  (let ((bitcoin-lisp::*pending-test-connections* '()))
+  (let ((bl::*pending-test-connections* '()))
     ;; Regtest only, with Core's exact text.
     (dolist (network '(:mainnet :testnet4 :signet))
-      (let ((bitcoin-lisp:*network* network))
+      (let ((bl:*network* network))
         (handler-case
-            (progn (bitcoin-lisp.rpc::rpc-addconnection
+            (progn (bl.rpc::rpc-addconnection
                     nil '("1.2.3.4:1" "outbound-full-relay" t))
                    (is-true nil "addconnection was accepted on ~A" network))
-          (bitcoin-lisp.rpc::rpc-error (e)
+          (bl.rpc::rpc-error (e)
             (is (string= "addconnection is for regression testing (-regtest mode) only."
-                         (bitcoin-lisp.rpc::rpc-error-message e))
+                         (bl.rpc::rpc-error-message e))
                 "~A" network)))))
-    (is-false bitcoin-lisp::*pending-test-connections*
+    (is-false bl::*pending-test-connections*
               "a refused addconnection still queued a dial")
-    (let* ((bitcoin-lisp:*network* :regtest)
-           (node (bitcoin-lisp::make-node :network :regtest)))
+    (let* ((bl:*network* :regtest)
+           (node (bl::make-node :network :regtest)))
       ;; Each of Core's four types maps to a peer conn-type and is queued for
       ;; the sync thread, newest LAST (the queue is drained in request order).
       (dolist (pair '(("outbound-full-relay" . :outbound-full-relay)
                       ("block-relay-only"    . :block-relay)
                       ("addr-fetch"          . :addr-fetch)
                       ("feeler"              . :feeler)))
-        (setf bitcoin-lisp::*pending-test-connections* '())
-        (let ((result (bitcoin-lisp.rpc::rpc-addconnection
+        (setf bl::*pending-test-connections* '())
+        (let ((result (bl.rpc::rpc-addconnection
                        node (list "1.2.3.4:1" (car pair) nil))))
           (is (equal (car pair) (cdr (assoc "connection_type" result :test #'string=))))
           (is (equal "1.2.3.4:1" (cdr (assoc "address" result :test #'string=))))
           (is (equal (list (cons "1.2.3.4:1" (cdr pair)))
-                     bitcoin-lisp::*pending-test-connections*)
+                     bl::*pending-test-connections*)
               "~A did not queue its own connection type" (car pair))))
-      (setf bitcoin-lisp::*pending-test-connections* '())
+      (setf bl::*pending-test-connections* '())
       ;; Core trims the type before matching.
       (is (equal "outbound-full-relay"
                  (cdr (assoc "connection_type"
-                             (bitcoin-lisp.rpc::rpc-addconnection
+                             (bl.rpc::rpc-addconnection
                               node '("1.2.3.4:1" "  outbound-full-relay  " nil))
                              :test #'string=))))
       ;; MANUAL and INBOUND are not offerable — Core's AddConnection returns
       ;; false for them, because addconnection exists for the AUTOMATIC kinds.
       (dolist (bad '("manual" "inbound" "" "outbound" "block-relay"))
-        (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
+        (is (= bl.rpc::+rpc-invalid-parameter+
                (%rpc-error-code
-                (lambda () (bitcoin-lisp.rpc::rpc-addconnection
+                (lambda () (bl.rpc::rpc-addconnection
                             node (list "1.2.3.4:1" bad nil))))))))
     ;; v2transport=true without -v2transport is refused rather than silently
     ;; dialing v1 (Core rpc/net.cpp).
-    (let ((bitcoin-lisp:*network* :regtest)
-          (bitcoin-lisp.networking:*v2-transport-enabled* nil)
-          (node (bitcoin-lisp::make-node :network :regtest)))
-      (setf bitcoin-lisp::*pending-test-connections* '())
+    (let ((bl:*network* :regtest)
+          (bl.net:*v2-transport-enabled* nil)
+          (node (bl::make-node :network :regtest)))
+      (setf bl::*pending-test-connections* '())
       (handler-case
-          (progn (bitcoin-lisp.rpc::rpc-addconnection
+          (progn (bl.rpc::rpc-addconnection
                   node '("1.2.3.4:1" "outbound-full-relay" t))
                  (is-true nil "a v2 addconnection was accepted with v2 disabled"))
-        (bitcoin-lisp.rpc::rpc-error (e)
-          (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
-                 (bitcoin-lisp.rpc::rpc-error-code e)))
+        (bl.rpc::rpc-error (e)
+          (is (= bl.rpc::+rpc-invalid-parameter+
+                 (bl.rpc::rpc-error-code e)))
           (is (string= "Error: Adding v2transport connections requires -v2transport init flag to be set."
-                       (bitcoin-lisp.rpc::rpc-error-message e)))))
-      (is-false bitcoin-lisp::*pending-test-connections*))
+                       (bl.rpc::rpc-error-message e)))))
+      (is-false bl::*pending-test-connections*))
     ;; Capacity: the outbound full-relay and block-relay types are capped, the
     ;; other two are not (Core: none for addr-fetch, since -seednode has none,
     ;; and none for feeler, since feelers are short-lived).
-    (let* ((bitcoin-lisp:*network* :regtest)
-           (node (bitcoin-lisp::make-node :network :regtest :max-peers 0)))
-      (setf bitcoin-lisp::*pending-test-connections* '())
-      (is (= bitcoin-lisp.rpc::+rpc-client-node-capacity-reached+
+    (let* ((bl:*network* :regtest)
+           (node (bl::make-node :network :regtest :max-peers 0)))
+      (setf bl::*pending-test-connections* '())
+      (is (= bl.rpc::+rpc-client-node-capacity-reached+
              (%rpc-error-code
-              (lambda () (bitcoin-lisp.rpc::rpc-addconnection
+              (lambda () (bl.rpc::rpc-addconnection
                           node '("1.2.3.4:1" "outbound-full-relay" nil))))))
       (dolist (uncapped '("addr-fetch" "feeler"))
-        (is-true (bitcoin-lisp.rpc::rpc-addconnection
+        (is-true (bl.rpc::rpc-addconnection
                   node (list "1.2.3.4:1" uncapped nil))
                  "~A was capacity-limited" uncapped)))
-    (setf bitcoin-lisp::*pending-test-connections* '()))
+    (setf bl::*pending-test-connections* '()))
   ;; And the queue is actually drained where peers are dialed — a request that
   ;; is only ever queued is exactly the shape of bug this repo keeps finding.
-  (is-true (member 'bitcoin-lisp::connect-added-nodes
+  (is-true (member 'bl::connect-added-nodes
                    (mapcar #'car
                            (sb-introspect:who-sets
-                            'bitcoin-lisp::*pending-test-connections*)))))
+                            'bl::*pending-test-connections*)))))
 
 (test setmocktime-is-regtest-only
   "Core gates setmocktime on IsMockableChain, which only regtest sets
@@ -2966,33 +2966,33 @@ just that something connected."
 RPC_MISC_ERROR with this exact text (rpc/node.cpp:52-54). The text is what the
 functional framework and operators actually see, so it is asserted verbatim."
   (dolist (network '(:mainnet :testnet4 :signet))
-    (let ((bitcoin-lisp:*network* network)
-          (bitcoin-lisp.serialization:*mock-time* nil))
+    (let ((bl:*network* network)
+          (bl.ser:*mock-time* nil))
       (handler-case
-          (progn (bitcoin-lisp.rpc::rpc-setmocktime nil '(1000))
+          (progn (bl.rpc::rpc-setmocktime nil '(1000))
                  (is-true nil "setmocktime was accepted on ~A" network))
-        (bitcoin-lisp.rpc::rpc-error (e)
+        (bl.rpc::rpc-error (e)
           (is (string= "setmocktime is for regression testing (-regtest mode) only"
-                       (bitcoin-lisp.rpc::rpc-error-message e))
+                       (bl.rpc::rpc-error-message e))
               "~A" network)))
-      (is-false bitcoin-lisp.serialization:*mock-time*
+      (is-false bl.ser:*mock-time*
                 "the refused call still moved the clock on ~A" network))))
 
 (test setmocktime-sets-and-clears-the-clock
   "0 means \"stop mocking\", not \"the epoch\": Core's GetTime falls back to the
 system clock when g_mock_time is zero. Reading 0 as a literal timestamp would
 freeze every node that ran setmocktime 0 at 1970."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp.serialization:*mock-time* nil))
-    (bitcoin-lisp.rpc::rpc-setmocktime nil '(1700000000))
-    (is (eql 1700000000 bitcoin-lisp.serialization:*mock-time*))
-    (is (eql 1700000000 (bitcoin-lisp.serialization:get-unix-time)))
+  (let ((bl:*network* :regtest)
+        (bl.ser:*mock-time* nil))
+    (bl.rpc::rpc-setmocktime nil '(1700000000))
+    (is (eql 1700000000 bl.ser:*mock-time*))
+    (is (eql 1700000000 (bl.ser:get-unix-time)))
     ;; and the real clock is still real
-    (is (> (bitcoin-lisp.serialization:get-real-unix-time) 1700000000))
-    (bitcoin-lisp.rpc::rpc-setmocktime nil '(0))
-    (is-false bitcoin-lisp.serialization:*mock-time*)
-    (is (= (bitcoin-lisp.serialization:get-unix-time)
-           (bitcoin-lisp.serialization:get-real-unix-time)))))
+    (is (> (bl.ser:get-real-unix-time) 1700000000))
+    (bl.rpc::rpc-setmocktime nil '(0))
+    (is-false bl.ser:*mock-time*)
+    (is (= (bl.ser:get-unix-time)
+           (bl.ser:get-real-unix-time)))))
 
 (test setmocktime-reaches-the-node-clock
   "setmocktime is only worth having if the decisions it exists to control
@@ -3006,28 +3006,28 @@ GET-NODE-TIME is the universal-time counterpart, and it is what the
 wall-clock decisions now read. Ban expiry is the check here because it is the
 one a test can drive end to end: ban, jump the clock past the expiry, observe
 the ban gone — no sleeping, exactly as rpc_setban.py does it."
-  (let ((bitcoin-lisp.serialization:*mock-time* nil))
+  (let ((bl.ser:*mock-time* nil))
     ;; The offset arithmetic, in both directions.
-    (is (= (bitcoin-lisp.serialization:get-node-time)
-           (+ (bitcoin-lisp.serialization:get-unix-time)
-              bitcoin-lisp.serialization:+universal-unix-epoch-offset+)))
-    (let ((bitcoin-lisp.serialization:*mock-time* 1700000000))
-      (is (= (+ 1700000000 bitcoin-lisp.serialization:+universal-unix-epoch-offset+)
-             (bitcoin-lisp.serialization:get-node-time)))))
+    (is (= (bl.ser:get-node-time)
+           (+ (bl.ser:get-unix-time)
+              bl.ser:+universal-unix-epoch-offset+)))
+    (let ((bl.ser:*mock-time* 1700000000))
+      (is (= (+ 1700000000 bl.ser:+universal-unix-epoch-offset+)
+             (bl.ser:get-node-time)))))
   ;; And the decision itself moves with it.
-  (bitcoin-lisp.networking::clear-ban-list)
+  (bl.net::clear-ban-list)
   (unwind-protect
-       (let ((bitcoin-lisp.serialization:*mock-time* 1700000000))
-         (bitcoin-lisp.networking::ban-address "203.0.113.7" 3600)
-         (is-true (bitcoin-lisp.networking::peer-banned-p "203.0.113.7")
+       (let ((bl.ser:*mock-time* 1700000000))
+         (bl.net::ban-address "203.0.113.7" 3600)
+         (is-true (bl.net::peer-banned-p "203.0.113.7")
                   "the ban did not take under a mocked clock")
-         (is (= 1 (length (bitcoin-lisp.networking::list-bans))))
+         (is (= 1 (length (bl.net::list-bans))))
          ;; Core's tests never sleep an hour; they move the clock.
-         (let ((bitcoin-lisp.serialization:*mock-time* (+ 1700000000 3601)))
-           (is-false (bitcoin-lisp.networking::peer-banned-p "203.0.113.7")
+         (let ((bl.ser:*mock-time* (+ 1700000000 3601)))
+           (is-false (bl.net::peer-banned-p "203.0.113.7")
                      "the ban outlived its expiry when the clock was moved past it")
-           (is (= 0 (length (bitcoin-lisp.networking::list-bans))))))
-    (bitcoin-lisp.networking::clear-ban-list)))
+           (is (= 0 (length (bl.net::list-bans))))))
+    (bl.net::clear-ban-list)))
 
 (test the-node-clock-split-matches-cores
   "Core splits its clocks and the split is the point: NodeClock returns the
@@ -3067,23 +3067,23 @@ onto the node clock:
 (test setmocktime-range-and-type-are-corecs
   "Core rejects a negative or over-large timestamp with an exact message built
 from max_time = Ticks<seconds>(nanoseconds::max()) (rpc/node.cpp:63-69)."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp.serialization:*mock-time* nil))
-    (dolist (bad (list -1 (1+ bitcoin-lisp.rpc::+max-mock-time+)))
+  (let ((bl:*network* :regtest)
+        (bl.ser:*mock-time* nil))
+    (dolist (bad (list -1 (1+ bl.rpc::+max-mock-time+)))
       (handler-case
-          (progn (bitcoin-lisp.rpc::rpc-setmocktime nil (list bad))
+          (progn (bl.rpc::rpc-setmocktime nil (list bad))
                  (is-true nil "accepted out-of-range ~D" bad))
-        (bitcoin-lisp.rpc::rpc-error (e)
+        (bl.rpc::rpc-error (e)
           (is (string= (format nil "Mocktime must be in the range [0, ~D], not ~D."
-                               bitcoin-lisp.rpc::+max-mock-time+ bad)
-                       (bitcoin-lisp.rpc::rpc-error-message e))
+                               bl.rpc::+max-mock-time+ bad)
+                       (bl.rpc::rpc-error-message e))
               "~D" bad))))
     ;; the boundary itself is accepted
-    (bitcoin-lisp.rpc::rpc-setmocktime nil (list bitcoin-lisp.rpc::+max-mock-time+))
-    (is (eql bitcoin-lisp.rpc::+max-mock-time+ bitcoin-lisp.serialization:*mock-time*))
+    (bl.rpc::rpc-setmocktime nil (list bl.rpc::+max-mock-time+))
+    (is (eql bl.rpc::+max-mock-time+ bl.ser:*mock-time*))
     ;; a non-integer is a type error, not a range error
-    (signals bitcoin-lisp.rpc::rpc-error (bitcoin-lisp.rpc::rpc-setmocktime nil '("now")))
-    (setf bitcoin-lisp.serialization:*mock-time* nil)))
+    (signals bl.rpc::rpc-error (bl.rpc::rpc-setmocktime nil '("now")))
+    (setf bl.ser:*mock-time* nil)))
 
 (test uptime-does-not-follow-the-mock-clock
   "Core's uptime is SteadyClock::now() minus a steady startup stamp
@@ -3092,34 +3092,34 @@ MOCKABLE clock, which meant a test setting the clock backwards — the ordinary
 case, since the framework picks a fixed timestamp — made uptime clamp to 0, and
 one setting it forward made the node claim years of uptime. rpc_uptime.py is a
 first-wave target, so this had to be right before the harness could use it."
-  (let* ((bitcoin-lisp:*network* :regtest)
-         (bitcoin-lisp.serialization:*mock-time* nil)
-         (bitcoin-lisp::*node-start-time*
-           (- (bitcoin-lisp.serialization:get-real-unix-time) 42))
-         (before (bitcoin-lisp.rpc::rpc-uptime nil nil)))
+  (let* ((bl:*network* :regtest)
+         (bl.ser:*mock-time* nil)
+         (bl::*node-start-time*
+           (- (bl.ser:get-real-unix-time) 42))
+         (before (bl.rpc::rpc-uptime nil nil)))
     (is (<= 42 before 44))
     ;; A mock clock far in the past must not clamp uptime to zero...
-    (bitcoin-lisp.rpc::rpc-setmocktime nil '(1000))
-    (is (<= 42 (bitcoin-lisp.rpc::rpc-uptime nil nil) 44)
+    (bl.rpc::rpc-setmocktime nil '(1000))
+    (is (<= 42 (bl.rpc::rpc-uptime nil nil) 44)
         "uptime followed the mock clock backwards")
     ;; ...and one far in the future must not inflate it.
-    (bitcoin-lisp.rpc::rpc-setmocktime nil (list (+ 100000000
-                                                    (bitcoin-lisp.serialization:get-real-unix-time))))
-    (is (<= 42 (bitcoin-lisp.rpc::rpc-uptime nil nil) 44)
+    (bl.rpc::rpc-setmocktime nil (list (+ 100000000
+                                                    (bl.ser:get-real-unix-time))))
+    (is (<= 42 (bl.rpc::rpc-uptime nil nil) 44)
         "uptime followed the mock clock forwards")
-    (setf bitcoin-lisp.serialization:*mock-time* nil)))
+    (setf bl.ser:*mock-time* nil)))
 
 (test syncwithvalidationinterfacequeue-exists-and-answers-null
   "The framework calls it after generate* in many tests. It is a no-op here —
 our validation notifications dispatch inline on the connecting thread — but it
 has to EXIST, and it has to answer JSON null rather than erroring."
-  (is (eq :null (bitcoin-lisp.rpc::rpc-syncwithvalidationinterfacequeue nil nil)))
+  (is (eq :null (bl.rpc::rpc-syncwithvalidationinterfacequeue nil nil)))
   ;; The dispatch table is populated by start-rpc-server, not at load time, so
   ;; build it here — the point of the assertion is that register-all-methods
   ;; names these two, which is what makes them reachable over JSON-RPC at all.
-  (bitcoin-lisp.rpc::register-all-methods)
+  (bl.rpc::register-all-methods)
   (dolist (method '("syncwithvalidationinterfacequeue" "setmocktime"))
-    (is-true (nth-value 1 (gethash method bitcoin-lisp.rpc::*rpc-methods*))
+    (is-true (nth-value 1 (gethash method bl.rpc::*rpc-methods*))
              "~A is not registered" method)))
 
 ;;; --- Named parameters (track B P0) ---
@@ -3129,9 +3129,9 @@ has to EXIST, and it has to answer JSON null rather than erroring."
 (:error <message>)."
   (let ((h (make-hash-table :test 'equal)))
     (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
-    (handler-case (bitcoin-lisp.rpc::%named-params-to-positional method h)
-      (bitcoin-lisp.rpc::rpc-error (e)
-        (list :error (bitcoin-lisp.rpc::rpc-error-message e))))))
+    (handler-case (bl.rpc::%named-params-to-positional method h)
+      (bl.rpc::rpc-error (e)
+        (list :error (bl.rpc::rpc-error-message e))))))
 
 (test named-params-map-onto-core-s-argument-names
   "Core's own client sends named parameters for every call
@@ -3150,9 +3150,9 @@ positional ones. The names come from Core's RPCHelpMan declarations."
   ;; Trailing absent arguments are simply not passed.
   (is (equal '("aa") (%named-params "gettxout" "txid" "aa")))
   ;; A params ARRAY is untouched.
-  (is (equal '(5) (bitcoin-lisp.rpc::%named-params-to-positional
+  (is (equal '(5) (bl.rpc::%named-params-to-positional
                    "getblockhash" '(5))))
-  (is (equal '() (bitcoin-lisp.rpc::%named-params-to-positional
+  (is (equal '() (bl.rpc::%named-params-to-positional
                   "getblockcount" '()))))
 
 (test named-params-honour-core-s-alias-slots
@@ -3211,7 +3211,7 @@ must be in the table, or it accepts no named parameters.
 What is left here is the spot-check: the arguments Core's framework leans on
 hardest, spelled out, so a regeneration that silently dropped or reordered them
 is caught by name rather than by count."
-  (bitcoin-lisp.rpc::register-all-methods)
+  (bl.rpc::register-all-methods)
   (dolist (expected '(("getblockhash" "height")
                       ("getblock" "blockhash" "verbosity|verbose")
                       ("generatetoaddress" "nblocks" "address" "maxtries")
@@ -3221,7 +3221,7 @@ is caught by name rather than by count."
                       ("invalidateblock" "blockhash")
                       ("reconsiderblock" "blockhash")))
     (is (equal expected (assoc (first expected)
-                               bitcoin-lisp.rpc::*rpc-named-arg-names*
+                               bl.rpc::*rpc-named-arg-names*
                                :test #'string=))
         "~A's argument names drifted" (first expected))))
 
@@ -3237,39 +3237,39 @@ This is what lets the RPC server be REACHABLE before the node is usable. An
 83 MB mempool.dat used to turn a restart into a ~45-minute window in which the
 node was alive, working and answering nothing — bitcoin-cli got connection
 refused and monitoring saw a dead node."
-  (let ((bitcoin-lisp.rpc::*rpc-warmup-status* "Replaying mempool..."))
+  (let ((bl.rpc::*rpc-warmup-status* "Replaying mempool..."))
     (dolist (method '("getblockcount" "uptime" "help" "stop" "nosuchmethod"))
       (handler-case
-          (progn (bitcoin-lisp.rpc::dispatch-rpc-method nil method '())
+          (progn (bl.rpc::dispatch-rpc-method nil method '())
                  (is-true nil "~A was dispatched during warmup" method))
-        (bitcoin-lisp.rpc::rpc-error (e)
-          (is (= bitcoin-lisp.rpc::+rpc-in-warmup+
-                 (bitcoin-lisp.rpc::rpc-error-code e))
+        (bl.rpc::rpc-error (e)
+          (is (= bl.rpc::+rpc-in-warmup+
+                 (bl.rpc::rpc-error-code e))
               "~A did not answer -28" method)
           (is (string= "Replaying mempool..."
-                       (bitcoin-lisp.rpc::rpc-error-message e))
+                       (bl.rpc::rpc-error-message e))
               "~A did not report the current status" method)))))
   ;; Cleared, dispatch resumes — including the honest "no such method".
-  (let ((bitcoin-lisp.rpc::*rpc-warmup-status* nil))
+  (let ((bl.rpc::*rpc-warmup-status* nil))
     (handler-case
-        (progn (bitcoin-lisp.rpc::dispatch-rpc-method nil "nosuchmethod" '())
+        (progn (bl.rpc::dispatch-rpc-method nil "nosuchmethod" '())
                (is-true nil "an unknown method was accepted"))
-      (bitcoin-lisp.rpc::rpc-error (e)
-        (is (= bitcoin-lisp.rpc::+rpc-method-not-found+
-               (bitcoin-lisp.rpc::rpc-error-code e)))))))
+      (bl.rpc::rpc-error (e)
+        (is (= bl.rpc::+rpc-method-not-found+
+               (bl.rpc::rpc-error-code e)))))))
 
 (test warmup-status-tracks-startup-and-clears
   "-28's message is whatever startup is currently doing (Core wires
 SetRPCWarmupStatus to InitMessage, init.cpp:1559), so a client waiting on a
 restart can see progress rather than one opaque string."
-  (let ((bitcoin-lisp.rpc::*rpc-warmup-status* nil))
-    (bitcoin-lisp.rpc:set-rpc-warmup-status "Loading...")
-    (is (string= "Loading..." bitcoin-lisp.rpc::*rpc-warmup-status*))
-    (bitcoin-lisp.rpc:set-rpc-warmup-status "Catching up transaction index...")
+  (let ((bl.rpc::*rpc-warmup-status* nil))
+    (bl.rpc:set-rpc-warmup-status "Loading...")
+    (is (string= "Loading..." bl.rpc::*rpc-warmup-status*))
+    (bl.rpc:set-rpc-warmup-status "Catching up transaction index...")
     (is (string= "Catching up transaction index..."
-                 bitcoin-lisp.rpc::*rpc-warmup-status*))
-    (bitcoin-lisp.rpc:finish-rpc-warmup)
-    (is-false bitcoin-lisp.rpc::*rpc-warmup-status*)))
+                 bl.rpc::*rpc-warmup-status*))
+    (bl.rpc:finish-rpc-warmup)
+    (is-false bl.rpc::*rpc-warmup-status*)))
 
 (test warmup-is-off-unless-the-caller-asks-for-it
   "Core's flag is true at static init because its only caller is AppInitMain.
@@ -3278,18 +3278,18 @@ is the honest answer — so warmup is opt-in, and stop-rpc-server clears it.
 
 Leaving it armed after a stop is not hypothetical: an earlier draft re-armed it
 in stop-node, and every subsequent request in the image answered -28."
-  (is-false bitcoin-lisp.rpc::*rpc-warmup-status*
+  (is-false bl.rpc::*rpc-warmup-status*
             "the default must be ready, not warming up")
-  (let ((bitcoin-lisp.rpc::*rpc-warmup-status* "Loading..."))
-    (is-true bitcoin-lisp.rpc::*rpc-warmup-status*))
+  (let ((bl.rpc::*rpc-warmup-status* "Loading..."))
+    (is-true bl.rpc::*rpc-warmup-status*))
   ;; stop-rpc-server clears it even when no server is running.
-  (let ((bitcoin-lisp.rpc::*rpc-warmup-status* "Loading...")
-        (bitcoin-lisp.rpc::*rpc-server* nil))
-    (bitcoin-lisp.rpc:stop-rpc-server)
+  (let ((bl.rpc::*rpc-warmup-status* "Loading...")
+        (bl.rpc::*rpc-server* nil))
+    (bl.rpc:stop-rpc-server)
     ;; With no server the teardown is a no-op, so the binding is untouched;
     ;; what matters is the RUNNING case, asserted by the live test below.
     (is-true t))
-  (is-false bitcoin-lisp.rpc::*rpc-warmup-status*))
+  (is-false bl.rpc::*rpc-warmup-status*))
 
 (test rest-routes-cover-core-s-endpoint-table
   "Core registers fifteen /rest/ prefixes (rest.cpp:1143-1158). A route that is
@@ -3299,7 +3299,7 @@ answer that is not the unknown-endpoint 404."
   (let ((node (make-test-node)))
     (flet ((routed-p (uri)
              (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
-               (let ((body (handler-case (bitcoin-lisp.rpc::rest-handle node uri)
+               (let ((body (handler-case (bl.rpc::rest-handle node uri)
                              (error () :signalled))))
                  (not (and (stringp body)
                            (search "Unknown REST endpoint" body)))))))
@@ -3329,7 +3329,7 @@ by the blockfilter handler, which then reads the filter type as
     ;; A blockfilterheaders URI must not reach the blockfilter handler's
     ;; \"expected /rest/blockfilter/<filtertype>/<blockhash>\" complaint.
     (let ((body (handler-case
-                    (bitcoin-lisp.rpc::rest-handle
+                    (bl.rpc::rest-handle
                      node "/rest/blockfilterheaders/basic/notahash.json")
                   (error () ""))))
       (is-false (search "Expected /rest/blockfilter/" body)
@@ -3341,7 +3341,7 @@ serving something wrong or signalling out of the handler."
   (let ((node (make-test-node)))
     (flet ((body-of (uri)
              (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
-               (handler-case (bitcoin-lisp.rpc::rest-handle node uri)
+               (handler-case (bl.rpc::rest-handle node uri)
                  (error () :signalled)))))
       ;; A bad hash is a 400, not a crash.
       (dolist (uri '("/rest/spenttxouts/nothex.json"
@@ -3365,23 +3365,23 @@ whenever it has the coins — but the `prevout` OBJECT only at verbosity 3
 gated by different conditions in Core, so folding them together would give a
 verbosity-2 caller prevout objects Core does not send."
   (let* ((tx (make-mempool-test-tx :input-id 77))
-         (coins (list (bitcoin-lisp.storage:make-utxo-entry
+         (coins (list (bl.store:make-utxo-entry
                        :value 5000
                        :script-pubkey (coerce #(#x51) '(simple-array (unsigned-byte 8) (*)))
                        :height 12 :coinbase nil))))
     ;; No coins: neither field, exactly as before this change.
-    (let ((j (bitcoin-lisp.rpc::tx-to-json tx :regtest)))
+    (let ((j (bl.rpc::tx-to-json tx :regtest)))
       (is-false (assoc "fee" j :test #'string=))
       (is-false (assoc "prevout" (first (cdr (assoc "vin" j :test #'string=)))
                        :test #'string=)))
     ;; Verbosity 2: fee, no prevout.
-    (let* ((j (bitcoin-lisp.rpc::tx-to-json tx :regtest :spent-coins coins))
+    (let* ((j (bl.rpc::tx-to-json tx :regtest :spent-coins coins))
            (vin0 (first (cdr (assoc "vin" j :test #'string=)))))
       (is-true (assoc "fee" j :test #'string=) "verbosity 2 must report the fee")
       (is-false (assoc "prevout" vin0 :test #'string=)
                 "verbosity 2 must NOT carry prevout objects"))
     ;; Verbosity 3: both, and the prevout carries Core's four fields.
-    (let* ((j (bitcoin-lisp.rpc::tx-to-json tx :regtest :spent-coins coins :prevouts t))
+    (let* ((j (bl.rpc::tx-to-json tx :regtest :spent-coins coins :prevouts t))
            (vin0 (first (cdr (assoc "vin" j :test #'string=))))
            (p (cdr (assoc "prevout" vin0 :test #'string=))))
       (is-true (assoc "fee" j :test #'string=))
@@ -3391,8 +3391,8 @@ verbosity-2 caller prevout objects Core does not send."
       (is-true (assoc "generated" p :test #'string=))
       (is-true (assoc "scriptPubKey" p :test #'string=))
       ;; The fee is inputs minus outputs, from the coins.
-      (let ((out-total (loop for o across (bitcoin-lisp.serialization:transaction-outputs tx)
-                             sum (bitcoin-lisp.serialization:tx-out-value o))))
+      (let ((out-total (loop for o across (bl.ser:transaction-outputs tx)
+                             sum (bl.ser:tx-out-value o))))
         (is (= (/ (- 5000 out-total) 100000000.0d0)
                (cdr (assoc "fee" j :test #'string=))))))))
 
@@ -3402,25 +3402,25 @@ inside the non-coinbase branch's sibling and vprevout has one entry per
 NON-coinbase transaction). Handing a coinbase input a prevout would invent a
 coin that never existed."
   (let* ((coinbase
-           (bitcoin-lisp.serialization:make-transaction
+           (bl.ser:make-transaction
             :version 1
-            :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+            :inputs (vector (bl.ser:make-tx-in
                              :previous-output
-                             (bitcoin-lisp.serialization:make-outpoint
+                             (bl.ser:make-outpoint
                               :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                    :initial-element 0)
                               :index #xFFFFFFFF)
                              :script-sig (coerce #(1 2) '(simple-array (unsigned-byte 8) (*)))
                              :sequence #xFFFFFFFF))
-            :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+            :outputs (vector (bl.ser:make-tx-out
                               :value 5000000000
                               :script-pubkey (coerce #(#x51)
                                                      '(simple-array (unsigned-byte 8) (*)))))
             :lock-time 0))
-         (coins (list (bitcoin-lisp.storage:make-utxo-entry
+         (coins (list (bl.store:make-utxo-entry
                        :value 1 :script-pubkey (coerce #(#x51) '(simple-array (unsigned-byte 8) (*)))
                        :height 1 :coinbase t)))
-         (j (bitcoin-lisp.rpc::tx-to-json coinbase :regtest :spent-coins coins :prevouts t))
+         (j (bl.rpc::tx-to-json coinbase :regtest :spent-coins coins :prevouts t))
          (vin0 (first (cdr (assoc "vin" j :test #'string=)))))
     (is-true (assoc "coinbase" vin0 :test #'string=) "not a coinbase input")
     (is-false (assoc "prevout" vin0 :test #'string=)
@@ -3431,37 +3431,37 @@ coin that never existed."
 client learns a long-running call is still running, and Core's own
 feature_shutdown.py waits for TWO concurrent commands before attempting a
 shutdown — so a node reporting none hangs that test forever."
-  (let ((bitcoin-lisp.rpc::*active-rpc-commands* '()))
-    (is-false (bitcoin-lisp.rpc::active-rpc-commands) "idle must report nothing")
+  (let ((bl.rpc::*active-rpc-commands* '()))
+    (is-false (bl.rpc::active-rpc-commands) "idle must report nothing")
     ;; Two concurrent calls to the SAME method are two indistinguishable
     ;; entries. Removing by value would drop whichever came first and leave the
     ;; other listed forever, so removal is by IDENTITY.
-    (bitcoin-lisp.rpc::with-active-rpc-command ("getblockcount")
-      (is (= 1 (length (bitcoin-lisp.rpc::active-rpc-commands))))
-      (bitcoin-lisp.rpc::with-active-rpc-command ("getblockcount")
-        (is (= 2 (length (bitcoin-lisp.rpc::active-rpc-commands)))))
-      (is (= 1 (length (bitcoin-lisp.rpc::active-rpc-commands)))
+    (bl.rpc::with-active-rpc-command ("getblockcount")
+      (is (= 1 (length (bl.rpc::active-rpc-commands))))
+      (bl.rpc::with-active-rpc-command ("getblockcount")
+        (is (= 2 (length (bl.rpc::active-rpc-commands)))))
+      (is (= 1 (length (bl.rpc::active-rpc-commands)))
           "an identical concurrent command was removed twice"))
-    (is-false (bitcoin-lisp.rpc::active-rpc-commands))
+    (is-false (bl.rpc::active-rpc-commands))
     ;; A command that SIGNALS must still be removed, or one failing call leaks
     ;; an entry that never goes away.
     (ignore-errors
-     (bitcoin-lisp.rpc::with-active-rpc-command ("boom") (error "x")))
-    (is-false (bitcoin-lisp.rpc::active-rpc-commands)
+     (bl.rpc::with-active-rpc-command ("boom") (error "x")))
+    (is-false (bl.rpc::active-rpc-commands)
               "a signalling command leaked its entry")
     ;; Duration is MICROSECONDS, as Core reports it.
-    (bitcoin-lisp.rpc::with-active-rpc-command ("slow")
-      (let ((d (cdr (first (bitcoin-lisp.rpc::active-rpc-commands)))))
+    (bl.rpc::with-active-rpc-command ("slow")
+      (let ((d (cdr (first (bl.rpc::active-rpc-commands)))))
         (is-true (integerp d))
         (is-true (>= d 0))))))
 
 (test getrpcinfo-shape-is-core-s
   "Each entry is {method, duration}; logpath is the debug.log the node is
 actually writing."
-  (let ((bitcoin-lisp.rpc::*active-rpc-commands* '())
-        (bitcoin-lisp::*log-file-path* #P"/tmp/bl-test/debug.log"))
-    (bitcoin-lisp.rpc::with-active-rpc-command ("getblockcount")
-      (let* ((info (bitcoin-lisp.rpc::rpc-getrpcinfo nil nil))
+  (let ((bl.rpc::*active-rpc-commands* '())
+        (bl::*log-file-path* #P"/tmp/bl-test/debug.log"))
+    (bl.rpc::with-active-rpc-command ("getblockcount")
+      (let* ((info (bl.rpc::rpc-getrpcinfo nil nil))
              (cmds (cdr (assoc "active_commands" info :test #'string=)))
              (one (elt cmds 0)))
         (is (= 1 (length cmds)))
@@ -3475,19 +3475,19 @@ actually writing."
 individual handlers — otherwise it reports only the methods someone remembered
 to annotate. This drives the real dispatcher and looks for the command in
 active_commands from INSIDE the handler."
-  (let ((bitcoin-lisp.rpc::*active-rpc-commands* '())
-        (bitcoin-lisp.rpc::*rpc-warmup-status* nil)
+  (let ((bl.rpc::*active-rpc-commands* '())
+        (bl.rpc::*rpc-warmup-status* nil)
         (seen nil))
-    (let ((bitcoin-lisp.rpc::*rpc-methods* (make-hash-table :test 'equal)))
-      (setf (gethash "peekself" bitcoin-lisp.rpc::*rpc-methods*)
+    (let ((bl.rpc::*rpc-methods* (make-hash-table :test 'equal)))
+      (setf (gethash "peekself" bl.rpc::*rpc-methods*)
             (lambda (node params)
               (declare (ignore node params))
-              (setf seen (bitcoin-lisp.rpc::active-rpc-commands))
+              (setf seen (bl.rpc::active-rpc-commands))
               42))
-      (is (= 42 (bitcoin-lisp.rpc::dispatch-rpc-method nil "peekself" '()))))
+      (is (= 42 (bl.rpc::dispatch-rpc-method nil "peekself" '()))))
     (is (equal '("peekself") (mapcar #'car seen))
         "the running command was not visible from inside its own handler")
-    (is-false (bitcoin-lisp.rpc::active-rpc-commands)
+    (is-false (bl.rpc::active-rpc-commands)
               "the entry outlived the dispatch")))
 
 (test rest-blockpart-serves-a-byte-range
@@ -3509,7 +3509,7 @@ shorter route would swallow every blockpart request and try to read
                       (progn
                         (setf (symbol-function 'hunchentoot:get-parameter)
                               (lambda (name) (cdr (assoc name params :test #'string=))))
-                        (handler-case (bitcoin-lisp.rpc::rest-handle node uri)
+                        (handler-case (bl.rpc::rest-handle node uri)
                           (error () :signalled)))
                    (setf (symbol-function 'hunchentoot:get-parameter) original))))))
       ;; Routed at all — an unrouted URI answers "Unknown REST endpoint".
@@ -3547,7 +3547,7 @@ wrapping past the check; Lisp integers do not wrap, so a plain + is already the
 safe version — asserted here with a size large enough to have overflowed a
 64-bit sum."
   (let* ((block (%bu-test-block '(1)))
-         (bytes (bitcoin-lisp.serialization:serialize-witness-block block))
+         (bytes (bl.ser:serialize-witness-block block))
          (n (length bytes)))
     ;; The check itself, exercised directly: these are the four boundary cases.
     (flet ((ok-p (offset size)
@@ -3573,9 +3573,9 @@ safe version — asserted here with a size large enough to have overflowed a
         (push (bt:make-thread
                (lambda ()
                  ;; Call various accessors
-                 (bitcoin-lisp.rpc::rpc-get-chain-state node)
-                 (bitcoin-lisp.rpc::rpc-get-utxo-set node)
-                 (bitcoin-lisp.rpc::rpc-get-peers node)
+                 (bl.rpc::rpc-get-chain-state node)
+                 (bl.rpc::rpc-get-utxo-set node)
+                 (bl.rpc::rpc-get-peers node)
                  (setf (aref results idx) t)))
               threads)))
     ;; Wait for all threads to complete
@@ -3596,10 +3596,10 @@ safe version — asserted here with a size large enough to have overflowed a
              (lambda ()
                (handler-case
                    (progn
-                     (bitcoin-lisp.rpc::rpc-getblockchaininfo node nil)
-                     (bitcoin-lisp.rpc::rpc-getblockcount node nil)
-                     (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
-                     (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil))
+                     (bl.rpc::rpc-getblockchaininfo node nil)
+                     (bl.rpc::rpc-getblockcount node nil)
+                     (bl.rpc::rpc-getnetworkinfo node nil)
+                     (bl.rpc::rpc-getmempoolinfo node nil))
                  (error (e)
                    (declare (ignore e))
                    (bt:with-lock-held (error-lock)
@@ -3616,17 +3616,17 @@ safe version — asserted here with a size large enough to have overflowed a
 (test rpc-error-codes-match-bitcoin-core
   "Test that error codes match Bitcoin Core specification"
   ;; Standard JSON-RPC 2.0 error codes
-  (is (= bitcoin-lisp.rpc::+rpc-parse-error+ -32700))
-  (is (= bitcoin-lisp.rpc::+rpc-invalid-request+ -32600))
-  (is (= bitcoin-lisp.rpc::+rpc-method-not-found+ -32601))
-  (is (= bitcoin-lisp.rpc::+rpc-internal-error+ -32603))
+  (is (= bl.rpc::+rpc-parse-error+ -32700))
+  (is (= bl.rpc::+rpc-invalid-request+ -32600))
+  (is (= bl.rpc::+rpc-method-not-found+ -32601))
+  (is (= bl.rpc::+rpc-internal-error+ -32603))
   ;; Bitcoin Core specific error codes
-  (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+ -8))  ; RPC_INVALID_PARAMETER
-  (is (= bitcoin-lisp.rpc::+rpc-misc-error+ -1)))
+  (is (= bl.rpc::+rpc-invalid-parameter+ -8))  ; RPC_INVALID_PARAMETER
+  (is (= bl.rpc::+rpc-misc-error+ -1)))
 
 (test rpc-error-response-format
   "Test error response matches Bitcoin Core format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" 123 :v2)))
+  (let ((response (bl.rpc::make-rpc-error-response -32601 "Method not found" 123 :v2)))
     ;; Must have jsonrpc, error, and id fields
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (gethash "error" response))
@@ -3649,7 +3649,7 @@ safe version — asserted here with a size large enough to have overflowed a
          ;; This is a minimal valid transaction structure
          (tx-hex "01000000000000000000")
          (result (handler-case
-                     (bitcoin-lisp.rpc::rpc-decoderawtransaction node (list tx-hex))
+                     (bl.rpc::rpc-decoderawtransaction node (list tx-hex))
                    (error () nil))))
     ;; May fail to parse minimal tx, but should not crash
     (is (or result (not result)))))
@@ -3658,11 +3658,11 @@ safe version — asserted here with a size large enough to have overflowed a
   "Test decoderawtransaction with invalid hex returns error"
   (let ((node (make-test-node)))
     ;; Empty string
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-decoderawtransaction node '("")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-decoderawtransaction node '("")))
     ;; Invalid hex characters
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-decoderawtransaction node '("zzzz")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-decoderawtransaction node '("zzzz")))))
 
 ;;; getrawtransaction tests
 
@@ -3670,18 +3670,18 @@ safe version — asserted here with a size large enough to have overflowed a
   "Test getrawtransaction with invalid txid returns error"
   (let ((node (make-test-node)))
     ;; Too short
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getrawtransaction node '("abc")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getrawtransaction node '("abc")))
     ;; Invalid characters
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getrawtransaction node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getrawtransaction node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))))
 
 (test rpc-getrawtransaction-not-found
   "Test getrawtransaction for unknown txid returns error"
   (let ((node (make-test-node)))
     ;; Valid txid but not in mempool
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getrawtransaction node
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getrawtransaction node
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
 
 ;;; estimatesmartfee tests
@@ -3692,27 +3692,27 @@ safe version — asserted here with a size large enough to have overflowed a
                                       &body body)
   "Run BODY with the fee estimator answering RATE sat/vB (or ERROR-MSG), and
 with MODE-OUT — a symbol naming a place — receiving the mode the RPC passed."
-  `(let ((real-ready (fdefinition 'bitcoin-lisp.mempool:fee-estimator-ready-p))
-         (real-est (fdefinition 'bitcoin-lisp.mempool:estimate-fee-rate))
+  `(let ((real-ready (fdefinition 'bl.mp:fee-estimator-ready-p))
+         (real-est (fdefinition 'bl.mp:estimate-fee-rate))
          ;; A test node has no estimator, and the RPC's first gate is its
          ;; presence — without one the stub below is never reached and every
          ;; assertion silently measures the no-estimate path instead.
-         (real-getter (fdefinition 'bitcoin-lisp:node-fee-estimator)))
+         (real-getter (fdefinition 'bl:node-fee-estimator)))
      (unwind-protect
           (progn
-            (setf (fdefinition 'bitcoin-lisp:node-fee-estimator)
+            (setf (fdefinition 'bl:node-fee-estimator)
                   (lambda (&rest args) (declare (ignore args)) :stub-estimator))
-            (setf (fdefinition 'bitcoin-lisp.mempool:fee-estimator-ready-p)
+            (setf (fdefinition 'bl.mp:fee-estimator-ready-p)
                   (lambda (&rest args) (declare (ignore args)) t))
-            (setf (fdefinition 'bitcoin-lisp.mempool:estimate-fee-rate)
+            (setf (fdefinition 'bl.mp:estimate-fee-rate)
                   (lambda (estimator conf-target &key mode)
                     (declare (ignore estimator))
                     ,@(when mode-out `((setf ,mode-out mode)))
                     (values ,rate ,error-msg (or ,returned-target conf-target))))
             ,@body)
-       (setf (fdefinition 'bitcoin-lisp.mempool:fee-estimator-ready-p) real-ready
-             (fdefinition 'bitcoin-lisp.mempool:estimate-fee-rate) real-est
-             (fdefinition 'bitcoin-lisp:node-fee-estimator) real-getter))))
+       (setf (fdefinition 'bl.mp:fee-estimator-ready-p) real-ready
+             (fdefinition 'bl.mp:estimate-fee-rate) real-est
+             (fdefinition 'bl:node-fee-estimator) real-getter))))
 
 (test estimatesmartfee-omits-feerate-when-there-is-no-estimate
   "Core returns ONLY errors and blocks when the estimator has nothing
@@ -3722,8 +3722,8 @@ sat/vB) fallback, so a wallet reading \"feerate\" got a made-up number instead
 of noticing there was no estimate, and built a transaction at 1 sat/vB that
 would not confirm."
   (let* ((node (make-test-node))
-         (bitcoin-lisp::*syncing* nil)
-         (result (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6))))
+         (bl::*syncing* nil)
+         (result (bl.rpc::rpc-estimatesmartfee node '(6))))
     (is-false (assoc "feerate" result :test #'string=)
               "a fabricated feerate is reported where Core reports none")
     (is-true (assoc "errors" result :test #'string=))
@@ -3734,17 +3734,17 @@ would not confirm."
 Ours defaulted to conservative, which returns a HIGHER number — so every caller
 that did not name a mode was quietly told to overpay."
   (let ((node (make-test-node))
-        (bitcoin-lisp::*syncing* nil)
+        (bl::*syncing* nil)
         (seen nil))
     (%with-stubbed-fee-estimate (:rate 10 :mode-out seen)
-      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6))
+      (bl.rpc::rpc-estimatesmartfee node '(6))
       (is (eq :economical seen) "default mode was ~S" seen)
-      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6 "conservative"))
+      (bl.rpc::rpc-estimatesmartfee node '(6 "conservative"))
       (is (eq :conservative seen))
-      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6 "economical"))
+      (bl.rpc::rpc-estimatesmartfee node '(6 "economical"))
       (is (eq :economical seen))
       ;; Core's FeeModeMap has three names; "unset" means the default.
-      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6 "unset"))
+      (bl.rpc::rpc-estimatesmartfee node '(6 "unset"))
       (is (eq :economical seen)))))
 
 (test estimatesmartfee-clamps-up-to-the-nodes-own-floors
@@ -3753,17 +3753,17 @@ that did not name a mode was quietly told to overpay."
 risen recommends a fee BELOW its own acceptance threshold: it rejects the very
 transaction it just priced."
   (let ((node (make-test-node))
-        (bitcoin-lisp::*syncing* nil))
+        (bl::*syncing* nil))
     (%with-stubbed-fee-estimate (:rate 10)   ; 10 sat/vB = 10000 sat/kvB
       ;; Floor below the estimate: the estimate stands.
-      (let ((result (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6))))
+      (let ((result (bl.rpc::rpc-estimatesmartfee node '(6))))
         (is (= (/ 10000 100000000.0d0)
                (cdr (assoc "feerate" result :test #'string=)))))
       ;; Floor above the estimate: the floor wins.
-      (let ((mempool (bitcoin-lisp.rpc::rpc-get-mempool node)))
+      (let ((mempool (bl.rpc::rpc-get-mempool node)))
         (when mempool
-          (setf (bitcoin-lisp.mempool::mempool-min-fee-rate mempool) 50000)
-          (let ((result (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6))))
+          (setf (bl.mp::mempool-min-fee-rate mempool) 50000)
+          (let ((result (bl.rpc::rpc-estimatesmartfee node '(6))))
             (is (= (/ 50000 100000000.0d0)
                    (cdr (assoc "feerate" result :test #'string=)))
                 "the answer was below the node's own acceptance floor")))))))
@@ -3774,9 +3774,9 @@ requested target: the estimator substitutes 2 for a 1-block target and clamps
 to what its history can justify. Echoing the request tells a caller the answer
 covers a horizon it does not."
   (let ((node (make-test-node))
-        (bitcoin-lisp::*syncing* nil))
+        (bl::*syncing* nil))
     (%with-stubbed-fee-estimate (:rate 10 :returned-target 100)
-      (let ((result (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(1008))))
+      (let ((result (bl.rpc::rpc-estimatesmartfee node '(1008))))
         (is (= 100 (cdr (assoc "blocks" result :test #'string=)))
             "blocks echoed the request instead of the estimator's answer")))))
 
@@ -3785,19 +3785,19 @@ covers a horizon it does not."
 fixed constant (ParseConfirmTarget, rpc/util.cpp:369-377), and its message
 names the range."
   (let ((node (make-test-node)))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(0)))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(-1)))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-estimatesmartfee node
-                                              (list (1+ (bitcoin-lisp.mempool:highest-target-tracked)))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-estimatesmartfee node '(0)))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-estimatesmartfee node '(-1)))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-estimatesmartfee node
+                                              (list (1+ (bl.mp:highest-target-tracked)))))
     ;; And an unknown mode names the three Core accepts.
-    (handler-case (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6 "cheap"))
-      (bitcoin-lisp.rpc::rpc-error (e)
-        (is (search "unset" (bitcoin-lisp.rpc::rpc-error-message e))
+    (handler-case (bl.rpc::rpc-estimatesmartfee node '(6 "cheap"))
+      (bl.rpc::rpc-error (e)
+        (is (search "unset" (bl.rpc::rpc-error-message e))
             "the invalid-mode message should list Core's three modes: ~A"
-            (bitcoin-lisp.rpc::rpc-error-message e))))))
+            (bl.rpc::rpc-error-message e))))))
 
 ;;; validateaddress tests
 
@@ -3805,7 +3805,7 @@ names the range."
   "Test validateaddress with valid testnet P2PKH address"
   (let* ((node (make-test-node))
          ;; Valid testnet P2PKH address (starts with m or n)
-         (result (bitcoin-lisp.rpc::rpc-validateaddress node '("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"))))
+         (result (bl.rpc::rpc-validateaddress node '("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"))))
     (is (eq t (cdr (assoc "isvalid" result :test #'string=))))
     (is (assoc "address" result :test #'string=))
     (is (assoc "scriptPubKey" result :test #'string=))
@@ -3817,7 +3817,7 @@ names the range."
   "Test validateaddress with valid testnet bech32 address"
   (let* ((node (make-test-node))
          ;; Valid testnet P2WPKH address
-         (result (bitcoin-lisp.rpc::rpc-validateaddress node '("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"))))
+         (result (bl.rpc::rpc-validateaddress node '("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"))))
     (is (eq t (cdr (assoc "isvalid" result :test #'string=))))
     (is (eq t (cdr (assoc "iswitness" result :test #'string=))))
     (is (= 0 (cdr (assoc "witness_version" result :test #'string=))))))
@@ -3825,7 +3825,7 @@ names the range."
 (test rpc-validateaddress-invalid
   "Test validateaddress with invalid address"
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-validateaddress node '("not-an-address"))))
+         (result (bl.rpc::rpc-validateaddress node '("not-an-address"))))
     (is (eq 'yason:false (cdr (assoc "isvalid" result :test #'string=))))
     ;; Core's invalid shape carries error + error_locations.
     (is (stringp (cdr (assoc "error" result :test #'string=))))))
@@ -3835,24 +3835,24 @@ names the range."
 to return a list of keyword symbols for script types, which serialized as a JSON
 array / could error."
   (let* ((node (make-test-node))
-         (addr (bitcoin-lisp.crypto:encode-p2sh-address
+         (addr (bl.crypto:encode-p2sh-address
                 (make-array 20 :element-type '(unsigned-byte 8) :initial-element 7)
                 :testnet3))
-         (result (bitcoin-lisp.rpc::rpc-validateaddress node (list addr))))
+         (result (bl.rpc::rpc-validateaddress node (list addr))))
     (is (eq t (cdr (assoc "isvalid" result :test #'string=))))
     (is (eq t (cdr (assoc "isscript" result :test #'string=))))))
 
 (test rpc-validateaddress-empty
   "Test validateaddress with empty string"
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-validateaddress node '(""))))
+         (result (bl.rpc::rpc-validateaddress node '(""))))
     (is (eq 'yason:false (cdr (assoc "isvalid" result :test #'string=))))))
 
 (test rpc-validateaddress-wrong-network
   "Test validateaddress with mainnet address on testnet"
   (let* ((node (make-test-node))
          ;; Mainnet P2PKH address (starts with 1)
-         (result (bitcoin-lisp.rpc::rpc-validateaddress node '("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"))))
+         (result (bl.rpc::rpc-validateaddress node '("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"))))
     ;; Should be invalid on testnet node
     (is (eq 'yason:false (cdr (assoc "isvalid" result :test #'string=))))))
 
@@ -3863,7 +3863,7 @@ array / could error."
   (let* ((node (make-test-node))
          ;; P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
          (script-hex "76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac")
-         (result (bitcoin-lisp.rpc::rpc-decodescript node (list script-hex))))
+         (result (bl.rpc::rpc-decodescript node (list script-hex))))
     (is (string= (cdr (assoc "type" result :test #'string=)) "pubkeyhash"))
     (is (assoc "asm" result :test #'string=))
     (is (assoc "p2sh" result :test #'string=))))
@@ -3873,7 +3873,7 @@ array / could error."
   (let* ((node (make-test-node))
          ;; P2SH: OP_HASH160 <20 bytes> OP_EQUAL
          (script-hex "a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba87")
-         (result (bitcoin-lisp.rpc::rpc-decodescript node (list script-hex))))
+         (result (bl.rpc::rpc-decodescript node (list script-hex))))
     (is (string= (cdr (assoc "type" result :test #'string=)) "scripthash"))))
 
 (test rpc-decodescript-p2wpkh
@@ -3881,22 +3881,22 @@ array / could error."
   (let* ((node (make-test-node))
          ;; P2WPKH: OP_0 <20 bytes>
          (script-hex "001489abcdefabbaabbaabbaabbaabbaabbaabbaabba")
-         (result (bitcoin-lisp.rpc::rpc-decodescript node (list script-hex))))
+         (result (bl.rpc::rpc-decodescript node (list script-hex))))
     (is (string= (cdr (assoc "type" result :test #'string=)) "witness_v0_keyhash"))
     (is (assoc "segwit" result :test #'string=))))
 
 (test rpc-decodescript-empty
   "Test decodescript with empty script"
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-decodescript node '(""))))
+         (result (bl.rpc::rpc-decodescript node '(""))))
     (is (string= (cdr (assoc "type" result :test #'string=)) "nonstandard"))
     (is (string= (cdr (assoc "asm" result :test #'string=)) ""))))
 
 (test rpc-decodescript-invalid-hex
   "Test decodescript with invalid hex returns error"
   (let ((node (make-test-node)))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-decodescript node '("xyz")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-decodescript node '("xyz")))))
 
 ;;; createrawtransaction tests
 
@@ -3906,7 +3906,7 @@ array / could error."
          (inputs `((("txid" . "0000000000000000000000000000000000000000000000000000000000000001")
                     ("vout" . 0))))
          (outputs '(("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" . 0.01)))
-         (result (bitcoin-lisp.rpc::rpc-createrawtransaction node (list inputs outputs))))
+         (result (bl.rpc::rpc-createrawtransaction node (list inputs outputs))))
     ;; Should return hex string
     (is (stringp result))
     (is (> (length result) 0))
@@ -3916,16 +3916,16 @@ array / could error."
 (test rpc-createrawtransaction-invalid-txid
   "Test createrawtransaction with invalid input txid"
   (let ((node (make-test-node)))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-createrawtransaction node
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-createrawtransaction node
         '(((("txid" . "invalid") ("vout" . 0)))
           (("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" . 0.01)))))))
 
 (test rpc-createrawtransaction-invalid-address
   "Test createrawtransaction with invalid output address"
   (let ((node (make-test-node)))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-createrawtransaction node
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-createrawtransaction node
         '(((("txid" . "0000000000000000000000000000000000000000000000000000000000000001")
             ("vout" . 0)))
           (("invalid-address" . 0.01)))))))
@@ -3933,8 +3933,8 @@ array / could error."
 (test rpc-createrawtransaction-negative-amount
   "Test createrawtransaction with negative amount"
   (let ((node (make-test-node)))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-createrawtransaction node
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-createrawtransaction node
         '(((("txid" . "0000000000000000000000000000000000000000000000000000000000000001")
             ("vout" . 0)))
           (("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" . -0.01)))))))
@@ -3944,7 +3944,7 @@ array / could error."
 (test rpc-gettxoutsetinfo-empty-utxo-set
   "Test gettxoutsetinfo with empty UTXO set"
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node nil)))
+         (result (bl.rpc::rpc-gettxoutsetinfo node nil)))
     ;; Check required fields exist
     (is (assoc "height" result :test #'string=))
     (is (assoc "bestblock" result :test #'string=))
@@ -3960,15 +3960,15 @@ array / could error."
 (test rpc-gettxoutsetinfo-with-utxos
   "Test gettxoutsetinfo with UTXOs in set"
   (let* ((node (make-test-node))
-         (utxo-set (bitcoin-lisp::node-utxo-set node))
+         (utxo-set (bl::node-utxo-set node))
          (txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
          (txid2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))
          (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element 0)))
     ;; Add some UTXOs
-    (bitcoin-lisp.storage:add-utxo utxo-set txid1 0 100000000 script 1) ; 1 BTC
-    (bitcoin-lisp.storage:add-utxo utxo-set txid1 1 50000000 script 1)  ; 0.5 BTC
-    (bitcoin-lisp.storage:add-utxo utxo-set txid2 0 25000000 script 2)  ; 0.25 BTC
-    (let ((result (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node nil)))
+    (bl.store:add-utxo utxo-set txid1 0 100000000 script 1) ; 1 BTC
+    (bl.store:add-utxo utxo-set txid1 1 50000000 script 1)  ; 0.5 BTC
+    (bl.store:add-utxo utxo-set txid2 0 25000000 script 2)  ; 0.25 BTC
+    (let ((result (bl.rpc::rpc-gettxoutsetinfo node nil)))
       ;; Should have 3 UTXOs from 2 transactions
       (is (= (cdr (assoc "txouts" result :test #'string=)) 3))
       (is (= (cdr (assoc "transactions" result :test #'string=)) 2))
@@ -3984,16 +3984,16 @@ array / could error."
 distinct from hash_serialized_3), and inserting then removing a coin restores
 the value."
   (let* ((node (make-test-node))
-         (utxo-set (bitcoin-lisp::node-utxo-set node))
+         (utxo-set (bl::node-utxo-set node))
          (txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
          (txid2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))
          (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (bitcoin-lisp.storage:add-utxo utxo-set txid1 0 100000000 script 1)
-    (bitcoin-lisp.storage:add-utxo utxo-set txid2 0 25000000 script 2)
-    (let* ((mh (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "muhash")))
+    (bl.store:add-utxo utxo-set txid1 0 100000000 script 1)
+    (bl.store:add-utxo utxo-set txid2 0 25000000 script 2)
+    (let* ((mh (bl.rpc::rpc-gettxoutsetinfo node (list "muhash")))
            (muhash (cdr (assoc "muhash" mh :test #'string=)))
            (h3 (cdr (assoc "hash_serialized_3"
-                           (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "hash_serialized_3"))
+                           (bl.rpc::rpc-gettxoutsetinfo node (list "hash_serialized_3"))
                            :test #'string=))))
       (is (stringp muhash))
       (is (= 64 (length muhash)))
@@ -4003,15 +4003,15 @@ the value."
       (is (not (string= muhash h3)))
       ;; Order-independence / add-remove inverse: add a coin, then delete it,
       ;; and the muhash returns to its prior value.
-      (bitcoin-lisp.storage:add-utxo utxo-set txid2 1 7 script 3)
-      (bitcoin-lisp.storage:remove-utxo utxo-set txid2 1)
+      (bl.store:add-utxo utxo-set txid2 1 7 script 3)
+      (bl.store:remove-utxo utxo-set txid2 1)
       (is (string= muhash
                    (cdr (assoc "muhash"
-                               (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "muhash"))
+                               (bl.rpc::rpc-gettxoutsetinfo node (list "muhash"))
                                :test #'string=)))))
     ;; An unknown hash_type still errors.
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "bogus")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-gettxoutsetinfo node (list "bogus")))))
 
 ;;; --- getblockstats Tests ---
 
@@ -4019,21 +4019,21 @@ the value."
   "Test getblockstats with invalid parameters"
   (let ((node (make-test-node)))
     ;; Missing parameter
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockstats node nil))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockstats node nil))
     ;; Invalid hash format
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockstats node '("invalid")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockstats node '("invalid")))
     ;; Negative height
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockstats node '(-1)))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockstats node '(-1)))))
 
 (test rpc-getblockstats-block-not-found
   "Test getblockstats with non-existent block"
   (let ((node (make-test-node)))
     ;; Valid hash format but block doesn't exist
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockstats node
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockstats node
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
 
 ;;; getblockstats against an exact fixture: coinbase + one witness tx.
@@ -4050,30 +4050,30 @@ the value."
   "A 3-byte OP_RETURN scriptPubKey (provably unspendable).")
 
 (defun %gbs-coinbase ()
-  (bitcoin-lisp.serialization:make-transaction
+  (bl.ser:make-transaction
    :version 1
-   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
                                       :hash (make-32-byte-hash 0) :index #xffffffff)
                     :script-sig (coerce #(#x01 #x64) '(vector (unsigned-byte 8)))
                     :sequence #xffffffff))
-   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bl.ser:make-tx-out
                      :value 5000030000 :script-pubkey *gbs-p2pkh*))
    :lock-time 0))
 
 (defun %gbs-spender (prev-txid)
   "A segwit transaction spending PREV-TXID:0 (100000 sat) into 40000 + 30000,
 so its fee is exactly 30000 sat. Its second output is unspendable."
-  (bitcoin-lisp.serialization:make-transaction
+  (bl.ser:make-transaction
    :version 2
-   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
                                       :hash prev-txid :index 0)
                     :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                     :sequence #xfffffffd))
-   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bl.ser:make-tx-out
                      :value 40000 :script-pubkey *gbs-p2pkh*)
-                    (bitcoin-lisp.serialization:make-tx-out
+                    (bl.ser:make-tx-out
                      :value 30000 :script-pubkey *gbs-opreturn*))
    :witness (vector (list (make-array 72 :element-type '(unsigned-byte 8) :initial-element 9)
                           (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2)))
@@ -4089,34 +4089,34 @@ COINBASE-ONLY) with its undo data, and bind NODE / HASH-HEX / SPENDER."
             (,dir (ensure-directories-exist
                    (merge-pathnames (format nil "gbs-~D/" (get-internal-real-time))
                                     (uiop:temporary-directory))))
-            (,store (bitcoin-lisp.storage:init-block-store ,dir))
+            (,store (bl.store:init-block-store ,dir))
             (,prev (make-32-byte-hash 77))
             (,spender (%gbs-spender ,prev))
             (%gbs-txs (if ,coinbase-only
                           (list (%gbs-coinbase))
                           (list (%gbs-coinbase) ,spender)))
             (%gbs-blk (%hdrfields-block %gbs-txs (make-32-byte-hash 5) 1700000000))
-            (,hash (bitcoin-lisp.serialization:block-header-hash
-                    (bitcoin-lisp.serialization:bitcoin-block-header %gbs-blk)))
-            (,hash-hex (bitcoin-lisp.rpc::hash-to-hex ,hash)))
+            (,hash (bl.ser:block-header-hash
+                    (bl.ser:bitcoin-block-header %gbs-blk)))
+            (,hash-hex (bl.rpc::hash-to-hex ,hash)))
        (declare (ignorable ,spender))
-       (setf (bitcoin-lisp::node-block-store ,node) ,store)
+       (setf (bl::node-block-store ,node) ,store)
        (unwind-protect
             (progn
-              (bitcoin-lisp.storage:store-block ,store %gbs-blk)
-              (bitcoin-lisp.storage:add-block-index-entry
-               (bitcoin-lisp::node-chain-state ,node)
-               (bitcoin-lisp.storage:make-block-index-entry
+              (bl.store:store-block ,store %gbs-blk)
+              (bl.store:add-block-index-entry
+               (bl::node-chain-state ,node)
+               (bl.store:make-block-index-entry
                 :hash ,hash :height 100 :chain-work 1 :status :valid
-                :header (bitcoin-lisp.serialization:bitcoin-block-header %gbs-blk)))
+                :header (bl.ser:bitcoin-block-header %gbs-blk)))
               (when ,with-undo
-                (setf (gethash ,hash bitcoin-lisp.validation::*block-undo-data*)
+                (setf (gethash ,hash bl.val::*block-undo-data*)
                       (list (list ,prev 0
-                                  (bitcoin-lisp.storage:make-utxo-entry
+                                  (bl.store:make-utxo-entry
                                    :value 100000 :script-pubkey *gbs-p2pkh*
                                    :height 50 :coinbase nil)))))
               ,@body)
-         (remhash ,hash bitcoin-lisp.validation::*block-undo-data*)
+         (remhash ,hash bl.val::*block-undo-data*)
          (uiop:delete-directory-tree ,dir :validate t :if-does-not-exist :ignore)))))
 
 (test rpc-getblockstats-excludes-coinbase-and-uses-witness-tx-sizes
@@ -4128,15 +4128,15 @@ and avgtxsize divides by vtx.size()-1 (:2143). We previously used
 (length (serialize block)) — the LEGACY whole-block form — over ntx, and
 summed the coinbase's outputs into total_out."
   (%with-gbs-block (node hex spender)
-    (let* ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))
+    (let* ((r (bl.rpc::rpc-getblockstats node (list hex)))
            (stat (lambda (k) (cdr (assoc k r :test #'string=))))
-           (wire (length (bitcoin-lisp.serialization:transaction-wire-bytes spender)))
-           (stripped (length (bitcoin-lisp.serialization:serialize-transaction spender)))
-           (weight (bitcoin-lisp.serialization:transaction-weight spender))
-           (whole-block (length (bitcoin-lisp.serialization:serialize
-                                 (bitcoin-lisp.storage:get-block
-                                  (bitcoin-lisp::node-block-store node)
-                                  (bitcoin-lisp.rpc::parse-hex-hash hex))))))
+           (wire (length (bl.ser:transaction-wire-bytes spender)))
+           (stripped (length (bl.ser:serialize-transaction spender)))
+           (weight (bl.ser:transaction-weight spender))
+           (whole-block (length (bl.ser:serialize
+                                 (bl.store:get-block
+                                  (bl::node-block-store node)
+                                  (bl.rpc::parse-hex-hash hex))))))
       ;; --- sizes ---
       (is (= wire (funcall stat "total_size")))
       ;; ...which is witness-INCLUSIVE (the stripped form is strictly smaller)
@@ -4188,7 +4188,7 @@ summed the coinbase's outputs into total_out."
       (is (= 1700000000 (funcall stat "time")))
       (is (= 1700000000 (funcall stat "mediantime")))
       (is (string= hex (funcall stat "blockhash")))
-      (is (= (bitcoin-lisp.validation:calculate-block-subsidy 100)
+      (is (= (bl.val:calculate-block-subsidy 100)
              (funcall stat "subsidy")))
       ;; Core's full key set is 31 keys.
       (is (= 31 (length r))))))
@@ -4199,7 +4199,7 @@ a coinbase has zero total_size / total_out / total_weight / fees and a zero
 average (Core divides by vtx.size()-1 only `if (block.vtx.size() > 1)`), while
 its output is still counted in outs."
   (%with-gbs-block (node hex spender :with-undo nil :coinbase-only t)
-    (let* ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))
+    (let* ((r (bl.rpc::rpc-getblockstats node (list hex)))
            (stat (lambda (k) (cdr (assoc k r :test #'string=)))))
       (is (= 1 (funcall stat "txs")))
       (is (= 1 (funcall stat "outs")))
@@ -4220,18 +4220,18 @@ selected statistic' (rpc/blockchain.cpp:2183-2186); we used to drop it
 silently, so a typo read as 'that statistic is unavailable for this block'."
   (%with-gbs-block (node hex spender)
     (let ((code (handler-case
-                    (progn (bitcoin-lisp.rpc::rpc-getblockstats
+                    (progn (bl.rpc::rpc-getblockstats
                             node (list hex (list "totalfee" "bogus")))
                            :no-error)
-                  (bitcoin-lisp.rpc::rpc-error (e) (bitcoin-lisp.rpc::rpc-error-code e)))))
+                  (bl.rpc::rpc-error (e) (bl.rpc::rpc-error-code e)))))
       (is (eql -8 code)))
     ;; CONTROL: a known name still selects exactly that key.
-    (let ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex (list "totalfee")))))
+    (let ((r (bl.rpc::rpc-getblockstats node (list hex (list "totalfee")))))
       (is (= 1 (length r)))
       (is (= 30000 (cdr (assoc "totalfee" r :test #'string=)))))
     ;; A non-array stats argument is Core's type error.
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockstats node (list hex "totalfee")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockstats node (list hex "totalfee")))))
 
 (test rpc-getblockstats-requires-undo-data
   "The fee statistics come from undo data, and Core's GetUndoChecked
@@ -4239,21 +4239,21 @@ silently, so a typo read as 'that statistic is unavailable for this block'."
 whose undo data is missing is an error, never a silently wrong fee total.
 CONTROL: the identical block WITH its undo data answers (previous test)."
   (%with-gbs-block (node hex spender :with-undo nil)
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockstats node (list hex)))))
 
 (test rpc-calculate-block-subsidy
   "Test block subsidy calculation"
   ;; Initial subsidy: 50 BTC = 5000000000 satoshis
-  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 0) 5000000000))
-  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 209999) 5000000000))
+  (is (= (bl.val:calculate-block-subsidy 0) 5000000000))
+  (is (= (bl.val:calculate-block-subsidy 209999) 5000000000))
   ;; First halving at 210000
-  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 210000) 2500000000))
-  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 419999) 2500000000))
+  (is (= (bl.val:calculate-block-subsidy 210000) 2500000000))
+  (is (= (bl.val:calculate-block-subsidy 419999) 2500000000))
   ;; Second halving
-  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 420000) 1250000000))
+  (is (= (bl.val:calculate-block-subsidy 420000) 1250000000))
   ;; Third halving
-  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 630000) 625000000)))
+  (is (= (bl.val:calculate-block-subsidy 630000) 625000000)))
 
 ;;; --- Extended getrawtransaction Tests ---
 
@@ -4261,16 +4261,16 @@ CONTROL: the identical block WITH its undo data answers (previous test)."
   "Test getrawtransaction with invalid blockhash parameter"
   (let ((node (make-test-node)))
     ;; Valid txid but invalid blockhash format
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getrawtransaction node
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getrawtransaction node
         '("0000000000000000000000000000000000000000000000000000000000000001" nil "invalid-hash")))))
 
 (test rpc-getrawtransaction-txindex-disabled
   "Test getrawtransaction returns error when txindex needed but disabled"
   (let ((node (make-test-node)))
     ;; Node has no txindex, looking for non-mempool tx should fail
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getrawtransaction node
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getrawtransaction node
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
 
 ;;; --- JSON Result Normalization (regression) ---
@@ -4278,36 +4278,36 @@ CONTROL: the identical block WITH its undo data answers (previous test)."
 (test rpc-result->json-shapes
   "rpc-result->json converts object-alists to hash-tables, leaves arrays as lists."
   ;; object-alist -> hash-table
-  (let ((obj (bitcoin-lisp.rpc::rpc-result->json (list (cons "a" 1) (cons "b" "x")))))
+  (let ((obj (bl.rpc::rpc-result->json (list (cons "a" 1) (cons "b" "x")))))
     (is (hash-table-p obj))
     (is (= (gethash "a" obj) 1))
     (is (string= (gethash "b" obj) "x")))
   ;; array of objects -> list of hash-tables
-  (let ((arr (bitcoin-lisp.rpc::rpc-result->json
+  (let ((arr (bl.rpc::rpc-result->json
               (list (list (cons "k" 1)) (list (cons "k" 2))))))
     (is (listp arr))
     (is (= (length arr) 2))
     (is (hash-table-p (first arr)))
     (is (= (gethash "k" (first arr)) 1)))
   ;; nested object value
-  (let ((obj (bitcoin-lisp.rpc::rpc-result->json
+  (let ((obj (bl.rpc::rpc-result->json
               (list (cons "outer" (list (cons "inner" 7)))))))
     (is (hash-table-p (gethash "outer" obj)))
     (is (= (gethash "inner" (gethash "outer" obj)) 7)))
   ;; array of strings is unchanged; atoms pass through
-  (is (equal (bitcoin-lisp.rpc::rpc-result->json (list "a" "b")) (list "a" "b")))
-  (is (= (bitcoin-lisp.rpc::rpc-result->json 42) 42)))
+  (is (equal (bl.rpc::rpc-result->json (list "a" "b")) (list "a" "b")))
+  (is (= (bl.rpc::rpc-result->json 42) 42)))
 
 (test rpc-object-results-encode-to-json
   "Object-returning RPC results must serialize through yason without error.
 Regression: handlers build alists, but yason's default list encoder treated
 them as arrays and choked on the dotted pairs, so every object RPC errored."
   (let ((node (make-test-node)))
-    (dolist (result (list (bitcoin-lisp.rpc::rpc-getblockchaininfo node nil)
-                          (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
-                          (bitcoin-lisp.rpc::rpc-getpeerinfo node nil)
-                          (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)))
-      (let* ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2))
+    (dolist (result (list (bl.rpc::rpc-getblockchaininfo node nil)
+                          (bl.rpc::rpc-getnetworkinfo node nil)
+                          (bl.rpc::rpc-getpeerinfo node nil)
+                          (bl.rpc::rpc-getmempoolinfo node nil)))
+      (let* ((response (bl.rpc::make-rpc-response result "id" :v2))
              (json (with-output-to-string (s) (yason:encode response s)))
              (parsed (yason:parse json)))
         (is (hash-table-p parsed))
@@ -4322,21 +4322,21 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
 (test rpc-getchaintips
   "getchaintips reports the active tip (branchlen 0) and side branches."
   (let* ((node (make-test-node))
-         (chain-state (bitcoin-lisp::node-chain-state node))
+         (chain-state (bl::node-chain-state node))
          (g-hash (make-32-byte-hash 0))
          (a-hash (make-32-byte-hash 1))
          (b-hash (make-32-byte-hash 2))
-         (genesis (bitcoin-lisp.storage:make-block-index-entry
+         (genesis (bl.store:make-block-index-entry
                    :hash g-hash :height 0 :status :valid))
-         (a (bitcoin-lisp.storage:make-block-index-entry
+         (a (bl.store:make-block-index-entry
              :hash a-hash :height 1 :prev-entry genesis :status :valid))
-         (b (bitcoin-lisp.storage:make-block-index-entry
+         (b (bl.store:make-block-index-entry
              :hash b-hash :height 1 :prev-entry genesis :status :valid)))
-    (bitcoin-lisp.storage:add-block-index-entry chain-state genesis)
-    (bitcoin-lisp.storage:add-block-index-entry chain-state a)
-    (bitcoin-lisp.storage:add-block-index-entry chain-state b)
-    (bitcoin-lisp.storage:update-chain-tip chain-state a-hash 1)
-    (let* ((tips (bitcoin-lisp.rpc::rpc-getchaintips node nil))
+    (bl.store:add-block-index-entry chain-state genesis)
+    (bl.store:add-block-index-entry chain-state a)
+    (bl.store:add-block-index-entry chain-state b)
+    (bl.store:update-chain-tip chain-state a-hash 1)
+    (let* ((tips (bl.rpc::rpc-getchaintips node nil))
            (active (find "active" tips
                          :key (lambda (tip) (cdr (assoc "status" tip :test #'string=)))
                          :test #'string=))
@@ -4352,16 +4352,16 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       ;; B is a side branch one block off the active chain.
       (is (= (cdr (assoc "branchlen" fork :test #'string=)) 1))
       ;; full result serializes cleanly.
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response tips "id" :v2)))
+      (let ((response (bl.rpc::make-rpc-response tips "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-testmempoolaccept-missing-input
   "testmempoolaccept dry-runs validation without mutating the mempool."
   (let* ((node (make-test-node))
          (tx (make-mempool-test-tx :input-id 210))
-         (hex (bitcoin-lisp.crypto:bytes-to-hex
-               (bitcoin-lisp.serialization:serialize-transaction tx)))
-         (result (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list (list hex)))))
+         (hex (bl.crypto:bytes-to-hex
+               (bl.ser:serialize-transaction tx)))
+         (result (bl.rpc::rpc-testmempoolaccept node (list (list hex)))))
     (is (listp result))
     (is (= 1 (length result)))
     (let ((r (first result)))
@@ -4374,7 +4374,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       ;; "missing-input", which was neither — it was our keyword downcased.
       (is (string= "missing-inputs" (cdr (assoc "reject-reason" r :test #'string=)))))
     ;; Nothing was added to the mempool.
-    (is (= 0 (bitcoin-lisp.mempool:mempool-count (bitcoin-lisp::node-mempool node))))))
+    (is (= 0 (bl.mp:mempool-count (bl::node-mempool node))))))
 
 ;;; --- Mempool introspection RPCs ---
 
@@ -4382,28 +4382,28 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
   ;; A parent + chained child in the mempool exercise getmempoolentry,
   ;; getmempoolancestors/descendants, and gettxspendingprevout.
   (let* ((node (make-test-node))
-         (mempool (bitcoin-lisp::node-mempool node))
+         (mempool (bl::node-mempool node))
          (funding (%txid-array 99))
          (parent (%mp-spending-tx funding :vout 0 :value 50000000))
-         (pid (bitcoin-lisp.serialization:transaction-hash parent))
+         (pid (bl.ser:transaction-hash parent))
          (child (%mp-spending-tx pid :vout 0 :value 40000000))
-         (cid (bitcoin-lisp.serialization:transaction-hash child))
-         (pid-hex (bitcoin-lisp.rpc::hash-to-hex pid))
-         (cid-hex (bitcoin-lisp.rpc::hash-to-hex cid)))
+         (cid (bl.ser:transaction-hash child))
+         (pid-hex (bl.rpc::hash-to-hex pid))
+         (cid-hex (bl.rpc::hash-to-hex cid)))
     (%add-tx mempool parent :fee 1000)
     (%add-tx mempool child :fee 2000)
     ;; getmempoolentry: parent has 2 descendants (self+child), 1 ancestor (self)
-    (let ((r (bitcoin-lisp.rpc::rpc-getmempoolentry node (list pid-hex))))
+    (let ((r (bl.rpc::rpc-getmempoolentry node (list pid-hex))))
       (is (= 2 (cdr (assoc "descendantcount" r :test #'string=))))
       (is (= 1 (cdr (assoc "ancestorcount" r :test #'string=)))))
     ;; getmempoolancestors child -> [parent]
-    (let ((r (bitcoin-lisp.rpc::rpc-getmempoolancestors node (list cid-hex))))
+    (let ((r (bl.rpc::rpc-getmempoolancestors node (list cid-hex))))
       (is (equal (list pid-hex) r)))
     ;; getmempooldescendants parent -> [child]
-    (let ((r (bitcoin-lisp.rpc::rpc-getmempooldescendants node (list pid-hex))))
+    (let ((r (bl.rpc::rpc-getmempooldescendants node (list pid-hex))))
       (is (equal (list cid-hex) r)))
     ;; verbose form -> alist (txid-hex . fields)
-    (let ((r (bitcoin-lisp.rpc::rpc-getmempooldescendants node (list pid-hex t))))
+    (let ((r (bl.rpc::rpc-getmempooldescendants node (list pid-hex t))))
       (is (= 1 (length r)))
       (is (string= cid-hex (car (first r))))
       (is (assoc "vsize" (cdr (first r)) :test #'string=)))
@@ -4411,51 +4411,51 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
     (flet ((op (txid-hex vout)
              (let ((h (make-hash-table :test 'equal)))
                (setf (gethash "txid" h) txid-hex (gethash "vout" h) vout) h)))
-      (let ((r (bitcoin-lisp.rpc::rpc-gettxspendingprevout
-                node (list (list (op (bitcoin-lisp.rpc::hash-to-hex funding) 0))))))
+      (let ((r (bl.rpc::rpc-gettxspendingprevout
+                node (list (list (op (bl.rpc::hash-to-hex funding) 0))))))
         (is (= 1 (length r)))
         (is (string= pid-hex (cdr (assoc "spendingtxid" (first r) :test #'string=)))))
       ;; an unspent outpoint -> no spendingtxid key
-      (let ((r (bitcoin-lisp.rpc::rpc-gettxspendingprevout
-                node (list (list (op (bitcoin-lisp.rpc::hash-to-hex (%txid-array 200)) 0))))))
+      (let ((r (bl.rpc::rpc-gettxspendingprevout
+                node (list (list (op (bl.rpc::hash-to-hex (%txid-array 200)) 0))))))
         (is (null (assoc "spendingtxid" (first r) :test #'string=)))))
     ;; getmempoolentry for an absent tx -> error
     (signals error
-      (bitcoin-lisp.rpc::rpc-getmempoolentry
-       node (list (bitcoin-lisp.rpc::hash-to-hex (%txid-array 201)))))))
+      (bl.rpc::rpc-getmempoolentry
+       node (list (bl.rpc::hash-to-hex (%txid-array 201)))))))
 
 ;;; --- Node / chain info RPCs ---
 
 (test rpc-node-info
   (let* ((node (make-test-node))
-         (net (bitcoin-lisp::node-network node)))
+         (net (bl::node-network node)))
     ;; getdifficulty: a positive number (no tip -> fallback bits 0x1d00ffff -> 1.0)
-    (let ((d (bitcoin-lisp.rpc::rpc-getdifficulty node nil)))
+    (let ((d (bl.rpc::rpc-getdifficulty node nil)))
       (is (numberp d))
       (is (plusp d)))
     ;; uptime: 0 when start-time unset; >= elapsed when set
-    (let ((bitcoin-lisp::*node-start-time* nil))
-      (is (= 0 (bitcoin-lisp.rpc::rpc-uptime node nil))))
-    (let ((bitcoin-lisp::*node-start-time*
-            (- (bitcoin-lisp.serialization:get-unix-time) 5)))
-      (is (>= (bitcoin-lisp.rpc::rpc-uptime node nil) 5)))
+    (let ((bl::*node-start-time* nil))
+      (is (= 0 (bl.rpc::rpc-uptime node nil))))
+    (let ((bl::*node-start-time*
+            (- (bl.ser:get-unix-time) 5)))
+      (is (>= (bl.rpc::rpc-uptime node nil) 5)))
     ;; getindexinfo: no active index -> empty JSON object (hash-table)
-    (is (hash-table-p (bitcoin-lisp.rpc::rpc-getindexinfo node nil)))
+    (is (hash-table-p (bl.rpc::rpc-getindexinfo node nil)))
     ;; With block-filter + coinstats indexes present, both are reported (bare
     ;; structs have a nil db -> height -1); an index-name arg filters to one.
-    (setf (bitcoin-lisp::node-blockfilterindex node)
-          (bitcoin-lisp.storage:make-blockfilterindex :enabled t)
-          (bitcoin-lisp::node-coinstatsindex node)
-          (bitcoin-lisp.storage::make-coinstatsindex :enabled t))
-    (let ((all (bitcoin-lisp.rpc::rpc-getindexinfo node nil)))
+    (setf (bl::node-blockfilterindex node)
+          (bl.store:make-blockfilterindex :enabled t)
+          (bl::node-coinstatsindex node)
+          (bl.store::make-coinstatsindex :enabled t))
+    (let ((all (bl.rpc::rpc-getindexinfo node nil)))
       (is (assoc "basic block filter index" all :test #'string=))
       (is (assoc "coinstatsindex" all :test #'string=)))
-    (let ((one (bitcoin-lisp.rpc::rpc-getindexinfo node (list "coinstatsindex"))))
+    (let ((one (bl.rpc::rpc-getindexinfo node (list "coinstatsindex"))))
       (is (assoc "coinstatsindex" one :test #'string=))
       (is (null (assoc "basic block filter index" one :test #'string=))))
     ;; getdeploymentinfo: buried deployments present; segwit reports the
     ;; network's activation height and matches the active/height contract.
-    (let* ((r (bitcoin-lisp.rpc::rpc-getdeploymentinfo node nil))
+    (let* ((r (bl.rpc::rpc-getdeploymentinfo node nil))
            (deps (cdr (assoc "deployments" r :test #'string=)))
            (segwit (cdr (assoc "segwit" deps :test #'string=))))
       (is (assoc "bip34" deps :test #'string=))
@@ -4463,12 +4463,12 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       ;; script_flags is a list of active script-verify flag names (P2SH at h=0)
       (is (member "P2SH" (cdr (assoc "script_flags" r :test #'string=)) :test #'string=))
       (is (string= "buried" (cdr (assoc "type" segwit :test #'string=))))
-      (is (= (bitcoin-lisp.validation:get-segwit-activation-height net)
+      (is (= (bl.val:get-segwit-activation-height net)
              (cdr (assoc "height" segwit :test #'string=))))
       ;; height 0 < testnet segwit activation -> not active (a JSON boolean,
       ;; so inactive is false rather than null)
-      (is (eq (bitcoin-lisp.rpc:json-bool
-               (>= 0 (bitcoin-lisp.validation:get-segwit-activation-height net)))
+      (is (eq (bl.rpc:json-bool
+               (>= 0 (bl.val:get-segwit-activation-height net)))
               (cdr (assoc "active" segwit :test #'string=)))))))
 
 ;;; --- Peer / address RPCs ---
@@ -4476,29 +4476,29 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
 (test rpc-peer-address
   (let ((node (make-test-node)))
     ;; getnodeaddresses: seed the address book with one IPv4 entry
-    (let ((book (bitcoin-lisp.networking:make-address-book)))
-      (bitcoin-lisp.networking:address-book-add
-       book (bitcoin-lisp.networking:make-peer-address
-             :ip (bitcoin-lisp.networking::ipv4-to-mapped-ipv6 1 2 3 4)
+    (let ((book (bl.net:make-address-book)))
+      (bl.net:address-book-add
+       book (bl.net:make-peer-address
+             :ip (bl.net::ipv4-to-mapped-ipv6 1 2 3 4)
              :port 48333 :services 9
              ;; recent so getnodeaddresses (GetAddr) doesn't filter it as terrible
-             :last-seen (bitcoin-lisp.serialization:get-unix-time)))
-      (setf (bitcoin-lisp::node-address-book node) book)
-      (let ((r (bitcoin-lisp.rpc::rpc-getnodeaddresses node (list 0))))  ; 0 = all
+             :last-seen (bl.ser:get-unix-time)))
+      (setf (bl::node-address-book node) book)
+      (let ((r (bl.rpc::rpc-getnodeaddresses node (list 0))))  ; 0 = all
         (is (= 1 (length r)))
         (is (string= "1.2.3.4" (cdr (assoc "address" (first r) :test #'string=))))
         (is (= 48333 (cdr (assoc "port" (first r) :test #'string=))))
         (is (= 9 (cdr (assoc "services" (first r) :test #'string=))))))
     ;; disconnectnode: a connected peer is disconnected by address
-    (let ((peer (bitcoin-lisp.networking:make-peer
-                 :connection (bitcoin-lisp.networking::make-connection
+    (let ((peer (bl.net:make-peer
+                 :connection (bl.net::make-connection
                               :host "5.6.7.8" :port 48333 :connected t)
                  :state :ready :address "5.6.7.8")))
-      (setf (bitcoin-lisp::node-peers node) (list peer))
-      (is (null (bitcoin-lisp.rpc::rpc-disconnectnode node (list "5.6.7.8"))))
-      (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+      (setf (bl::node-peers node) (list peer))
+      (is (null (bl.rpc::rpc-disconnectnode node (list "5.6.7.8"))))
+      (is (eq :disconnected (bl.net:peer-state peer)))
       ;; an unknown address errors
-      (signals error (bitcoin-lisp.rpc::rpc-disconnectnode node (list "9.9.9.9"))))))
+      (signals error (bl.rpc::rpc-disconnectnode node (list "9.9.9.9"))))))
 
 ;;; --- Chain control RPCs (error paths; full reorg behavior in reorg-tests) ---
 
@@ -4506,98 +4506,98 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
   (let ((node (make-test-node)))
     ;; a well-formed but unknown block hash -> error
     (signals error
-      (bitcoin-lisp.rpc::rpc-invalidateblock
+      (bl.rpc::rpc-invalidateblock
        node (list "00000000000000000000000000000000000000000000000000000000deadbeef")))
     ;; a malformed hash -> error
     (signals error
-      (bitcoin-lisp.rpc::rpc-reconsiderblock node (list "not-a-hash")))))
+      (bl.rpc::rpc-reconsiderblock node (list "not-a-hash")))))
 
 ;;; --- setban / listbanned / clearbanned / getnettotals / verifychain ---
 
 (test rpc-setban-add-list-remove-clear
   "setban add/remove + listbanned + clearbanned manage the manual ban list."
-  (bitcoin-lisp.networking:clear-ban-list)
+  (bl.net:clear-ban-list)
   (let ((node (make-test-node)))
-    (is (null (bitcoin-lisp.rpc::rpc-setban node (list "1.2.3.4" "add"))))
-    (is-true (bitcoin-lisp.networking:peer-banned-p "1.2.3.4"))
-    (let ((banned (bitcoin-lisp.rpc::rpc-listbanned node nil)))
+    (is (null (bl.rpc::rpc-setban node (list "1.2.3.4" "add"))))
+    (is-true (bl.net:peer-banned-p "1.2.3.4"))
+    (let ((banned (bl.rpc::rpc-listbanned node nil)))
       (is (= 1 (length banned)))
       (is (string= "1.2.3.4" (cdr (assoc "address" (first banned) :test #'string=))))
       (is (integerp (cdr (assoc "banned_until" (first banned) :test #'string=)))))
-    (is (null (bitcoin-lisp.rpc::rpc-setban node (list "1.2.3.4" "remove"))))
-    (is (not (bitcoin-lisp.networking:peer-banned-p "1.2.3.4")))
+    (is (null (bl.rpc::rpc-setban node (list "1.2.3.4" "remove"))))
+    (is (not (bl.net:peer-banned-p "1.2.3.4")))
     ;; remove a non-existent ban / bad command -> error
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-setban node (list "9.9.9.9" "remove")))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-setban node (list "1.2.3.4" "bogus")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-setban node (list "9.9.9.9" "remove")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-setban node (list "1.2.3.4" "bogus")))
     ;; clearbanned empties the list
-    (bitcoin-lisp.rpc::rpc-setban node (list "5.6.7.8" "add"))
-    (is (null (bitcoin-lisp.rpc::rpc-clearbanned node nil)))
-    (is (= 0 (length (bitcoin-lisp.rpc::rpc-listbanned node nil))))))
+    (bl.rpc::rpc-setban node (list "5.6.7.8" "add"))
+    (is (null (bl.rpc::rpc-clearbanned node nil)))
+    (is (= 0 (length (bl.rpc::rpc-listbanned node nil))))))
 
 (test rpc-setban-absolute-bantime
   "setban add with absolute=true sets banned_until to the given Unix time."
-  (bitcoin-lisp.networking:clear-ban-list)
+  (bl.net:clear-ban-list)
   (let ((node (make-test-node))
-        (future (+ (bitcoin-lisp.serialization:get-unix-time) 3600)))
-    (bitcoin-lisp.rpc::rpc-setban node (list "10.0.0.1" "add" future t))
-    (let ((banned (bitcoin-lisp.rpc::rpc-listbanned node nil)))
+        (future (+ (bl.ser:get-unix-time) 3600)))
+    (bl.rpc::rpc-setban node (list "10.0.0.1" "add" future t))
+    (let ((banned (bl.rpc::rpc-listbanned node nil)))
       (is (<= (abs (- future (cdr (assoc "banned_until" (first banned) :test #'string=)))) 2)))
-    (bitcoin-lisp.networking:clear-ban-list)))
+    (bl.net:clear-ban-list)))
 
 (test rpc-setban-add-disconnects-connected-peer
   "setban add disconnects every connected peer with the banned address itself
 (Core rpc/net.cpp:803-810 -> CConnman::DisconnectNode) — the peers UI no
 longer needs to chain a disconnectnode. Other peers are untouched."
-  (bitcoin-lisp.networking:clear-ban-list)
+  (bl.net:clear-ban-list)
   (let* ((node (make-test-node))
-         (conn (bitcoin-lisp.networking::make-connection
+         (conn (bl.net::make-connection
                 :host "203.0.113.9" :port 8333 :connected t))
-         (target (bitcoin-lisp::make-peer :address "203.0.113.9" :state :ready
+         (target (bl::make-peer :address "203.0.113.9" :state :ready
                                           :connection conn))
-         (other (bitcoin-lisp::make-peer :address "198.51.100.3" :state :ready)))
-    (setf (bitcoin-lisp::node-peers node) (list target other))
-    (is (null (bitcoin-lisp.rpc::rpc-setban node (list "203.0.113.9" "add"))))
-    (is-true (bitcoin-lisp.networking:peer-banned-p "203.0.113.9"))
-    (is (eq :disconnected (bitcoin-lisp.networking:peer-state target)))
-    (is (null (bitcoin-lisp.networking::peer-connection target)))
-    (is (eq :ready (bitcoin-lisp.networking:peer-state other)))
-    (bitcoin-lisp.networking:clear-ban-list)))
+         (other (bl::make-peer :address "198.51.100.3" :state :ready)))
+    (setf (bl::node-peers node) (list target other))
+    (is (null (bl.rpc::rpc-setban node (list "203.0.113.9" "add"))))
+    (is-true (bl.net:peer-banned-p "203.0.113.9"))
+    (is (eq :disconnected (bl.net:peer-state target)))
+    (is (null (bl.net::peer-connection target)))
+    (is (eq :ready (bl.net:peer-state other)))
+    (bl.net:clear-ban-list)))
 
 (test inbound-connection-admission-gate
   "The inbound accept path consults the ban list BEFORE any handshake work
 (Core CConnman::CreateNodeFromAcceptedSocket, net.cpp:1801-1813): banned
 addresses are always dropped; discouraged addresses only when the inbound
 slots are (almost) full."
-  (bitcoin-lisp.networking:clear-ban-list)
-  (bitcoin-lisp.networking:clear-discouraged)
+  (bl.net:clear-ban-list)
+  (bl.net:clear-discouraged)
   (let ((node (make-test-node)))
-    (is-true (bitcoin-lisp::inbound-connection-allowed-p node "203.0.113.77"))
+    (is-true (bl::inbound-connection-allowed-p node "203.0.113.77"))
     ;; Banned: dropped regardless of slot pressure.
-    (bitcoin-lisp.networking:ban-address "203.0.113.77")
+    (bl.net:ban-address "203.0.113.77")
     (multiple-value-bind (ok reason)
-        (bitcoin-lisp::inbound-connection-allowed-p node "203.0.113.77")
+        (bl::inbound-connection-allowed-p node "203.0.113.77")
       (is (null ok))
       (is (eq :banned reason)))
     ;; Discouraged with free slots: still admitted.
-    (bitcoin-lisp.networking:discourage-peer "198.51.100.77")
-    (is-true (bitcoin-lisp::inbound-connection-allowed-p node "198.51.100.77"))
+    (bl.net:discourage-peer "198.51.100.77")
+    (is-true (bl::inbound-connection-allowed-p node "198.51.100.77"))
     ;; Discouraged at inbound capacity: dropped.
-    (setf (bitcoin-lisp::node-peers node)
-          (loop for i from 1 to bitcoin-lisp::*max-inbound-connections*
-                collect (bitcoin-lisp::make-peer
+    (setf (bl::node-peers node)
+          (loop for i from 1 to bl::*max-inbound-connections*
+                collect (bl::make-peer
                          :address (format nil "10.~D.1.1" i) :inbound t)))
     (multiple-value-bind (ok reason)
-        (bitcoin-lisp::inbound-connection-allowed-p node "198.51.100.77")
+        (bl::inbound-connection-allowed-p node "198.51.100.77")
       (is (null ok))
       (is (eq :discouraged reason)))
-    (bitcoin-lisp.networking:clear-ban-list)
-    (bitcoin-lisp.networking:clear-discouraged)))
+    (bl.net:clear-ban-list)
+    (bl.net:clear-discouraged)))
 
 (test rpc-getnettotals-fields
   "getnettotals returns integer byte totals + timemillis + an uploadtarget object."
-  (let ((r (bitcoin-lisp.rpc::rpc-getnettotals (make-test-node) nil)))
+  (let ((r (bl.rpc::rpc-getnettotals (make-test-node) nil)))
     (is (integerp (cdr (assoc "totalbytesrecv" r :test #'string=))))
     (is (integerp (cdr (assoc "totalbytessent" r :test #'string=))))
     (is (integerp (cdr (assoc "timemillis" r :test #'string=))))
@@ -4606,7 +4606,7 @@ slots are (almost) full."
 (test rpc-verifychain-empty-node-returns-false
   "verifychain on a node with no stored blocks returns JSON false (a bare
 Core boolean — never null)."
-  (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-verifychain (make-test-node) (list 0 1)))))
+  (is (eq 'yason:false (bl.rpc::rpc-verifychain (make-test-node) (list 0 1)))))
 
 ;;; --- waitfornewblock / dumptxoutset ---
 
@@ -4614,46 +4614,46 @@ Core boolean — never null)."
   "waitfornewblock returns on timeout, rejects negative timeouts, and returns
 early when the tip changes."
   (let ((node (make-test-node)))
-    (setf (bitcoin-lisp::node-running node) t)
+    (setf (bl::node-running node) t)
     ;; Timeout path: the tip never changes; returns after ~300ms.
-    (let ((r (bitcoin-lisp.rpc::rpc-waitfornewblock node (list 300))))
+    (let ((r (bl.rpc::rpc-waitfornewblock node (list 300))))
       (is (integerp (cdr (assoc "height" r :test #'string=)))))
     ;; Negative timeout errors (Core).
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-waitfornewblock node (list -1)))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-waitfornewblock node (list -1)))
     ;; Change path: a thread advances the tip; the wait returns the new height.
-    (let ((cs (bitcoin-lisp::node-chain-state node))
+    (let ((cs (bl::node-chain-state node))
           (new-hash (make-array 32 :element-type '(unsigned-byte 8)
                                    :initial-element 9)))
       (bt:make-thread (lambda ()
                         (sleep 0.3)
-                        (bitcoin-lisp.storage:update-chain-tip cs new-hash 7)))
-      (let ((r (bitcoin-lisp.rpc::rpc-waitfornewblock node (list 5000))))
+                        (bl.store:update-chain-tip cs new-hash 7)))
+      (let ((r (bl.rpc::rpc-waitfornewblock node (list 5000))))
         (is (= 7 (cdr (assoc "height" r :test #'string=))))))))
 
 (test rpc-dumptxoutset-writes-snapshot
   "dumptxoutset streams the UTXO set to a new file and refuses to overwrite."
   (let* ((node (make-test-node))
-         (utxo (bitcoin-lisp::node-utxo-set node))
+         (utxo (bl::node-utxo-set node))
          (path (namestring (merge-pathnames
                             (format nil "txoutset-~D.dat" (get-universal-time))
                             (uiop:temporary-directory)))))
-    (bitcoin-lisp.storage:update-chain-tip
-     (bitcoin-lisp::node-chain-state node)
+    (bl.store:update-chain-tip
+     (bl::node-chain-state node)
      (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9) 1)
     (dotimes (i 3)
-      (bitcoin-lisp.storage:add-utxo
+      (bl.store:add-utxo
        utxo
        (make-array 32 :element-type '(unsigned-byte 8) :initial-element (1+ i))
        0 1000 (make-array 25 :element-type '(unsigned-byte 8)) 1))
     (unwind-protect
          (progn
-           (let ((r (bitcoin-lisp.rpc::rpc-dumptxoutset node (list path "latest"))))
+           (let ((r (bl.rpc::rpc-dumptxoutset node (list path "latest"))))
              (is (= 3 (cdr (assoc "coins_written" r :test #'string=))))
              (is (not (null (probe-file path)))))
            ;; Existing path -> error (Core).
-           (signals bitcoin-lisp.rpc::rpc-error
-             (bitcoin-lisp.rpc::rpc-dumptxoutset node (list path "latest"))))
+           (signals bl.rpc::rpc-error
+             (bl.rpc::rpc-dumptxoutset node (list path "latest"))))
       (ignore-errors (delete-file path)))))
 
 ;;;; RPC auth + JSON-RPC version (T3b: stock bitcoin-cli compatibility)
@@ -4662,12 +4662,12 @@ early when the tip changes."
   "parse-json-rpc-request accepts a 1.0 (and version-less) envelope — stock
 bitcoin-cli sends those; rejecting non-2.0 made it unusable."
   (multiple-value-bind (kind method)
-      (bitcoin-lisp.rpc::parse-json-rpc-request
+      (bl.rpc::parse-json-rpc-request
        "{\"jsonrpc\":\"1.0\",\"method\":\"getblockcount\",\"params\":[],\"id\":1}")
     (is (eq :single kind))
     (is (string= "getblockcount" method)))
   (multiple-value-bind (kind method)
-      (bitcoin-lisp.rpc::parse-json-rpc-request "{\"method\":\"uptime\",\"id\":1}")
+      (bl.rpc::parse-json-rpc-request "{\"method\":\"uptime\",\"id\":1}")
     (is (eq :single kind))
     (is (string= "uptime" method))))
 
@@ -4678,49 +4678,49 @@ InitRPCAuthentication pushes exactly one entry into g_rpcauth
 (httprpc.cpp:262-288): the .cookie pair when no rpcuser/rpcpassword is given,
 that pair otherwise. Binding user, password AND cookie secret at once — what
 this test used to do — describes no reachable configuration."
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
   (with-rpc-test-datadir (dir)
     (let ((node (make-test-node))
           (cookie-file (merge-pathnames ".cookie" dir)))
-      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (setf (bl::node-data-directory node) dir)
       (unwind-protect
            (progn
              ;; (a) no rpcuser/rpcpassword: the cookie is the credential
-             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port 19994))))
-             (is (string= bitcoin-lisp.rpc::+rpc-cookie-user+
-                          (bitcoin-lisp.rpc::rpc-credential-user
-                           (first bitcoin-lisp.rpc::*rpc-credentials*))))
+             (is (not (null (bl.rpc:start-rpc-server node :port 19994))))
+             (is (string= bl.rpc::+rpc-cookie-user+
+                          (bl.rpc::rpc-credential-user
+                           (first bl.rpc::*rpc-credentials*))))
              (let ((cookie (alexandria:read-file-into-string cookie-file)))
-               (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header cookie)))
-               (is (not (bitcoin-lisp.rpc::check-auth
+               (is (bl.rpc::check-auth (%basic-auth-header cookie)))
+               (is (not (bl.rpc::check-auth
                          (%basic-auth-header "__cookie__:bad"))))
-               (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:p")))))
+               (is (not (bl.rpc::check-auth (%basic-auth-header "u:p")))))
              ;; shutdown removes the cookie it generated (Core DeleteAuthCookie)
-             (bitcoin-lisp.rpc:stop-rpc-server)
+             (bl.rpc:stop-rpc-server)
              (is (null (probe-file cookie-file)))
              ;; (b) rpcuser/rpcpassword: that pair is the credential, no cookie
              ;; is written, and the cookie user is not a way in
-             (is (not (null (bitcoin-lisp.rpc:start-rpc-server
+             (is (not (null (bl.rpc:start-rpc-server
                              node :port 19994 :user "u" :password "p"))))
              (is (null (probe-file cookie-file)))
-             (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:p")))
-             (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:wrong"))))
-             (is (not (bitcoin-lisp.rpc::check-auth
+             (is (bl.rpc::check-auth (%basic-auth-header "u:p")))
+             (is (not (bl.rpc::check-auth (%basic-auth-header "u:wrong"))))
+             (is (not (bl.rpc::check-auth
                        (%basic-auth-header "__cookie__:p")))))
-        (bitcoin-lisp.rpc:stop-rpc-server)))))
+        (bl.rpc:stop-rpc-server)))))
 
 (test rpc-cookie-file-is-owner-only
   "The generated .cookie is the RPC credential, so no other local user may read
 it: Core creates it under umask 0077 (GenerateAuthCookie, request.cpp:99-146).
 Ours was 0664 on the live testnet4 and mainnet datadirs, which would have left
 the credential readable node-wide even with auth enforced."
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
   (with-rpc-test-datadir (dir)
     (let ((node (make-test-node)))
-      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (setf (bl::node-data-directory node) dir)
       (unwind-protect
            (progn
-             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port 19995))))
+             (is (not (null (bl.rpc:start-rpc-server node :port 19995))))
              (let ((path (merge-pathnames ".cookie" dir)))
                (is (not (null (probe-file path))))
                (is (= #o600
@@ -4729,7 +4729,7 @@ the credential readable node-wide even with auth enforced."
                                (sb-posix:stat (namestring (truename path)))))))
                ;; the file is renamed into place, never left half-written
                (is (null (probe-file (merge-pathnames ".cookie.tmp" dir))))))
-        (bitcoin-lisp.rpc:stop-rpc-server)))))
+        (bl.rpc:stop-rpc-server)))))
 
 (defun %file-mode (path)
   "The permission bits of PATH."
@@ -4754,7 +4754,7 @@ process umask, so the mode must be passed to open. The live host runs umask
                    "test premise: under umask 002 an ordinary file is 0664, got ~O"
                    (%file-mode control)))
              (multiple-value-bind (path secret)
-                 (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+                 (bl.rpc::generate-rpc-cookie dir)
                (is (not (null path)))
                (is (= #o600 (%file-mode path))
                    "the cookie must be 0600 whatever the umask, got ~O" (%file-mode path))
@@ -4777,7 +4777,7 @@ EXISTING inode with O_TRUNC, and follows a symlink to do it."
         (write-string "" s))
       (sb-posix:chmod (namestring tmp) #o666)
       (with-open-file (spy tmp :direction :input)
-        (multiple-value-bind (path secret) (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+        (multiple-value-bind (path secret) (bl.rpc::generate-rpc-cookie dir)
           (is (not (null path)))
           (is (not (null secret)))
           (let ((seen (progn (file-position spy 0) (or (read-line spy nil nil) ""))))
@@ -4793,7 +4793,7 @@ still holds open: ~S" seen))))
           (write-string "" s))
         (handler-case (sb-posix:unlink (namestring tmp)) (error () nil))
         (sb-posix:symlink (namestring target) (namestring tmp))
-        (multiple-value-bind (path secret) (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+        (multiple-value-bind (path secret) (bl.rpc::generate-rpc-cookie dir)
           (is (not (null path)))
           ;; NB: keep this out of a 3-element (and a b) inside IS — FiveAM
           ;; treats any 3-element form as (predicate expected actual) and
@@ -4818,42 +4818,42 @@ happened here: restart-node.sh's pkill marker missed the live supervisor)
 overwrites .cookie with a secret matching nothing and then exits. The healthy
 node keeps serving with the old secret, so every client that re-reads the file
 gets 401 from a node that is perfectly fine, and nothing logs anything."
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
   (with-rpc-test-datadir (dir)
     (let* ((port 19993)
            (node (make-test-node))
            (cookie-file (merge-pathnames ".cookie" dir)))
-      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (setf (bl::node-data-directory node) dir)
       (unwind-protect
            (progn
              ;; the healthy node: bound, cookie written, credential live
-             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
+             (is (not (null (bl.rpc:start-rpc-server node :port port))))
              (let ((live-cookie (alexandria:read-file-into-string cookie-file))
-                   (live-credentials bitcoin-lisp.rpc::*rpc-credentials*)
+                   (live-credentials bl.rpc::*rpc-credentials*)
                    (live-dispatch hunchentoot:*dispatch-table*))
-               (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header live-cookie)))
+               (is (bl.rpc::check-auth (%basic-auth-header live-cookie)))
                ;; the second process: same data directory, same port. The
                ;; "already running" guard is per-process, so unbind it to reach
                ;; the code a second process would run.
-               (let ((bitcoin-lisp.rpc::*rpc-server* nil))
-                 (is (null (bitcoin-lisp.rpc:start-rpc-server node :port port))
+               (let ((bl.rpc::*rpc-server* nil))
+                 (is (null (bl.rpc:start-rpc-server node :port port))
                      "the second start must fail: the port is taken"))
                ;; nothing about the running node changed
                (let ((on-disk (and (probe-file cookie-file)
                                    (alexandria:read-file-into-string cookie-file))))
                  (is (equal live-cookie on-disk)
                      "the failed start rewrote or removed .cookie under a live node")
-                 (is (eq live-credentials bitcoin-lisp.rpc::*rpc-credentials*)
+                 (is (eq live-credentials bl.rpc::*rpc-credentials*)
                      "the failed start replaced the live node's credentials")
                  (is (eq live-dispatch hunchentoot:*dispatch-table*)
                      "the failed start leaked a dispatcher into hunchentoot:*dispatch-table*")
-                 (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header live-cookie)))
+                 (is (bl.rpc::check-auth (%basic-auth-header live-cookie)))
                  ;; and a client reading .cookie off disk still gets in
                  (let ((r (%http-post-rpc port "{\"method\":\"getblockcount\",\"id\":1}"
                                           :auth (or on-disk "__cookie__:gone"))))
                    (is (= 200 (%http-status r))
                        "a client re-reading .cookie was locked out of a live node")))))
-        (bitcoin-lisp.rpc:stop-rpc-server)))))
+        (bl.rpc:stop-rpc-server)))))
 
 (test rpc-requires-credentials-end-to-end
   "Live acceptor through rpc-handler: no Authorization header answers 401 with
@@ -4861,15 +4861,15 @@ a WWW-Authenticate challenge, a wrong credential answers 401, and the generated
 cookie answers 200 (Core HTTPReq_JSONRPC, httprpc.cpp:112-133). Proven live
 against the running testnet4 node before this fix: an unauthenticated
 getblockcount returned 200, and so did a wrong Basic credential."
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
   (with-rpc-test-datadir (dir)
     (let ((port 19996)
           (node (make-test-node))
           (body "{\"method\":\"getblockcount\",\"id\":1}"))
-      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (setf (bl::node-data-directory node) dir)
       (unwind-protect
            (progn
-             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
+             (is (not (null (bl.rpc:start-rpc-server node :port port))))
              ;; no credential at all
              (let ((r (%http-post-rpc port body)))
                (is (= 401 (%http-status r)))
@@ -4891,22 +4891,22 @@ getblockcount returned 200, and so did a wrong Basic credential."
                               (merge-pathnames ".cookie" dir)))))
                (is (= 200 (%http-status r)))
                (is (search "\"result\"" r))))
-        (bitcoin-lisp.rpc:stop-rpc-server)))))
+        (bl.rpc:stop-rpc-server)))))
 
 (test rpc-start-refuses-without-any-credential
   "With no rpcuser/rpcpassword and nowhere to write a .cookie there is no way
 to authorize a request, so the server does not start — Core aborts startup when
 InitRPCAuthentication fails (httprpc.cpp:300-302). Starting anyway would leave
 a listener that 401s everything."
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
   (let ((node (make-test-node)))
-    (is (null (bitcoin-lisp::node-data-directory node))
+    (is (null (bl::node-data-directory node))
         "fixture must have nowhere to write a cookie, or this test is vacuous")
     (unwind-protect
          (progn
-           (is (null (bitcoin-lisp.rpc:start-rpc-server node :port 19997)))
-           (is (null bitcoin-lisp.rpc:*rpc-server*)))
-      (bitcoin-lisp.rpc:stop-rpc-server))))
+           (is (null (bl.rpc:start-rpc-server node :port 19997)))
+           (is (null bl.rpc:*rpc-server*)))
+      (bl.rpc:stop-rpc-server))))
 
 (test rpc-aborted-start-releases-the-listening-socket
   "Binding before the credential means a start can now abort with a socket
@@ -4914,22 +4914,22 @@ already open, so the abort path has to give the port back — otherwise one
 failed start would cost RPC until the process restarts. (Regression guard for
 the reorder, not a test of the pre-existing bug: the old order never reached a
 bind before giving up.)"
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
   (let ((port 19992)
         (no-datadir-node (make-test-node)))
-    (is (null (bitcoin-lisp::node-data-directory no-datadir-node))
+    (is (null (bl::node-data-directory no-datadir-node))
         "fixture must have nowhere to write a cookie, or this test is vacuous")
     (unwind-protect
          (progn
            ;; binds, then finds it has no credential to install, then aborts
-           (is (null (bitcoin-lisp.rpc:start-rpc-server no-datadir-node :port port)))
-           (is (null bitcoin-lisp.rpc:*rpc-server*))
+           (is (null (bl.rpc:start-rpc-server no-datadir-node :port port)))
+           (is (null bl.rpc:*rpc-server*))
            (with-rpc-test-datadir (dir)
              (let ((node (make-test-node)))
-               (setf (bitcoin-lisp::node-data-directory node) dir)
-               (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port)))
+               (setf (bl::node-data-directory node) dir)
+               (is (not (null (bl.rpc:start-rpc-server node :port port)))
                    "the aborted start leaked its listening socket"))))
-      (bitcoin-lisp.rpc:stop-rpc-server))))
+      (bl.rpc:stop-rpc-server))))
 
 (test rpc-bind-non-loopback-refused
   "-rpcbind is honoured only together with -rpcallowip; either flag alone falls
@@ -4938,18 +4938,18 @@ a single -rpcbind would put the whole RPC surface on the public internet."
   ;; loopback binds are kept whatever -rpcallowip says
   (dolist (loopback '("127.0.0.1" "127.0.0.2" "::1" "[::1]" "localhost"))
     (dolist (allow-ip '(nil ("10.0.0.0/8")))
-      (is (string= loopback (bitcoin-lisp.rpc::%rpc-bind-address loopback allow-ip))
+      (is (string= loopback (bl.rpc::%rpc-bind-address loopback allow-ip))
           "~S is loopback and must be kept (allow-ip ~S)" loopback allow-ip)))
   ;; a non-loopback bind with no -rpcallowip falls back
   (dolist (exposed '("0.0.0.0" "" "192.168.1.5" "::" "1.2.3.4" "127acme.example"))
-    (is (string= "127.0.0.1" (bitcoin-lisp.rpc::%rpc-bind-address exposed nil))
+    (is (string= "127.0.0.1" (bl.rpc::%rpc-bind-address exposed nil))
         "~S is not loopback and must fall back" exposed))
-  (is (string= "127.0.0.1" (bitcoin-lisp.rpc::%rpc-bind-address nil nil)))
+  (is (string= "127.0.0.1" (bl.rpc::%rpc-bind-address nil nil)))
   ;; with -rpcallowip the operator's address is used as given
   (is (string= "10.0.0.5"
-               (bitcoin-lisp.rpc::%rpc-bind-address "10.0.0.5" '("10.0.0.0/8"))))
+               (bl.rpc::%rpc-bind-address "10.0.0.5" '("10.0.0.0/8"))))
   (is (string= "0.0.0.0"
-               (bitcoin-lisp.rpc::%rpc-bind-address "0.0.0.0" '("0.0.0.0/0")))))
+               (bl.rpc::%rpc-bind-address "0.0.0.0" '("0.0.0.0/0")))))
 
 ;;;; tx JSON field completeness (T3c)
 
@@ -4957,7 +4957,7 @@ a single -rpcbind would put the whole RPC surface on the public internet."
   "tx-to-json emits the size/weight/hex/wtxid fields and per-output type +
 address (with network), and per-input sequence — the fields explorers expect."
   (let* ((tx (make-mempool-test-tx :input-id 50))
-         (j (bitcoin-lisp.rpc::tx-to-json tx :regtest)))
+         (j (bl.rpc::tx-to-json tx :regtest)))
     (is (stringp (cdr (assoc "hash" j :test #'string=))))
     (is (integerp (cdr (assoc "vsize" j :test #'string=))))
     (is (integerp (cdr (assoc "weight" j :test #'string=))))
@@ -4982,32 +4982,32 @@ address (with network), and per-input sequence — the fields explorers expect."
 
 (test regtest-subsidy-halving-interval
   "calculate-block-subsidy halves at 150 on regtest (Core), 210000 elsewhere."
-  (let ((bitcoin-lisp:*network* :regtest))
-    (is (= 5000000000 (bitcoin-lisp.validation:calculate-block-subsidy 149)))
-    (is (= 2500000000 (bitcoin-lisp.validation:calculate-block-subsidy 150))))
-  (let ((bitcoin-lisp:*network* :mainnet))
-    (is (= 5000000000 (bitcoin-lisp.validation:calculate-block-subsidy 150)))
-    (is (= 2500000000 (bitcoin-lisp.validation:calculate-block-subsidy 210000)))))
+  (let ((bl:*network* :regtest))
+    (is (= 5000000000 (bl.val:calculate-block-subsidy 149)))
+    (is (= 2500000000 (bl.val:calculate-block-subsidy 150))))
+  (let ((bl:*network* :mainnet))
+    (is (= 5000000000 (bl.val:calculate-block-subsidy 150)))
+    (is (= 2500000000 (bl.val:calculate-block-subsidy 210000)))))
 
 (test rpc-help-lists-methods
   "help with no argument lists registered methods, including the new ones."
-  (bitcoin-lisp.rpc::register-all-methods)
-  (let ((h (bitcoin-lisp.rpc::rpc-help nil nil)))
+  (bl.rpc::register-all-methods)
+  (let ((h (bl.rpc::rpc-help nil nil)))
     (is (stringp h))
     (is (search "stop" h))
     (is (search "getnetworkhashps" h)))
   ;; A known method echoes its name; an unknown one reports so.
-  (is (string= "uptime" (bitcoin-lisp.rpc::rpc-help nil (list "uptime"))))
-  (is (search "unknown" (bitcoin-lisp.rpc::rpc-help nil (list "nope-xyz")))))
+  (is (string= "uptime" (bl.rpc::rpc-help nil (list "uptime"))))
+  (is (search "unknown" (bl.rpc::rpc-help nil (list "nope-xyz")))))
 
 (test rpc-getmemoryinfo-and-getrpcinfo-shape
   "getmemoryinfo reports the heap under \"locked\"; getrpcinfo reports
 active_commands + logpath."
-  (let ((mi (bitcoin-lisp.rpc::rpc-getmemoryinfo nil nil)))
+  (let ((mi (bl.rpc::rpc-getmemoryinfo nil nil)))
     (is (assoc "locked" mi :test #'string=))
     (is (integerp (cdr (assoc "total" (cdr (assoc "locked" mi :test #'string=))
                               :test #'string=)))))
-  (let ((ri (bitcoin-lisp.rpc::rpc-getrpcinfo nil nil)))
+  (let ((ri (bl.rpc::rpc-getrpcinfo nil nil)))
     (is (assoc "active_commands" ri :test #'string=))
     (is (assoc "logpath" ri :test #'string=))))
 
@@ -5017,50 +5017,50 @@ hash; waitforblockheight returns immediately when the tip is already at/above th
 target. Both return {hash,height}; an unreached height with a short timeout
 returns the current tip; bad inputs error."
   (let* ((node (make-test-node))
-         (cs (bitcoin-lisp.rpc::rpc-get-chain-state node))
+         (cs (bl.rpc::rpc-get-chain-state node))
          (tip-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
          (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
     ;; make-test-node's chain-state has no tip; plant one at height 5.
-    (bitcoin-lisp.storage:add-block-index-entry
-     cs (bitcoin-lisp.storage:make-block-index-entry
+    (bl.store:add-block-index-entry
+     cs (bl.store:make-block-index-entry
          :hash tip-hash :height 5 :chain-work 100 :status :valid
-         :header (bitcoin-lisp.serialization:make-block-header
+         :header (bl.ser:make-block-header
                   :version 1 :prev-block zeros :merkle-root zeros
                   :timestamp 1296688600 :bits #x207fffff :nonce 0 :cached-hash tip-hash)))
-    (bitcoin-lisp.storage:update-chain-tip cs tip-hash 5)
-    (let ((tip-hex (bitcoin-lisp.rpc::hash-to-hex tip-hash)))
+    (bl.store:update-chain-tip cs tip-hash 5)
+    (let ((tip-hex (bl.rpc::hash-to-hex tip-hash)))
       ;; waitforblock with the current tip hash -> immediate match.
-      (let ((r (bitcoin-lisp.rpc::rpc-waitforblock node (list tip-hex))))
+      (let ((r (bl.rpc::rpc-waitforblock node (list tip-hex))))
         (is (string= tip-hex (cdr (assoc "hash" r :test #'string=))))
         (is (= 5 (cdr (assoc "height" r :test #'string=)))))
       ;; waitforblockheight at/below the tip -> immediate.
-      (let ((r (bitcoin-lisp.rpc::rpc-waitforblockheight node (list 5))))
+      (let ((r (bl.rpc::rpc-waitforblockheight node (list 5))))
         (is (= 5 (cdr (assoc "height" r :test #'string=)))))
       ;; unreached height + short timeout -> returns the current (lower) tip.
-      (let ((r (bitcoin-lisp.rpc::rpc-waitforblockheight node (list 1005 50))))
+      (let ((r (bl.rpc::rpc-waitforblockheight node (list 1005 50))))
         (is (= 5 (cdr (assoc "height" r :test #'string=)))))
       ;; bad inputs error.
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-waitforblock node (list "not-a-valid-hash")))
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-waitforblockheight node (list -1))))))
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-waitforblock node (list "not-a-valid-hash")))
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-waitforblockheight node (list -1))))))
 
 (test rpc-gettxout-scriptpubkey-fields
   "gettxout's scriptPubKey now carries asm/hex/type and (for address-bearing
 scripts) address — previously only hex."
   (let* ((node (make-test-node))   ; testnet3
-         (utxo-set (bitcoin-lisp.rpc::rpc-get-utxo-set node))
+         (utxo-set (bl.rpc::rpc-get-utxo-set node))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
          (keyhash (make-array 20 :element-type '(unsigned-byte 8) :initial-element 7))
          ;; P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
          (spk (concatenate '(vector (unsigned-byte 8))
                            (vector #x76 #xa9 #x14) keyhash (vector #x88 #xac))))
-    (bitcoin-lisp.storage:add-utxo utxo-set txid 0 50000 spk 0)
-    (let* ((r (bitcoin-lisp.rpc::rpc-gettxout
-               node (list (bitcoin-lisp.rpc::hash-to-hex txid) 0)))
+    (bl.store:add-utxo utxo-set txid 0 50000 spk 0)
+    (let* ((r (bl.rpc::rpc-gettxout
+               node (list (bl.rpc::hash-to-hex txid) 0)))
            (sp (cdr (assoc "scriptPubKey" r :test #'string=))))
       (is (string= "pubkeyhash" (cdr (assoc "type" sp :test #'string=))))
-      (is (string= (bitcoin-lisp.crypto:encode-p2pkh-address keyhash :testnet3)
+      (is (string= (bl.crypto:encode-p2pkh-address keyhash :testnet3)
                    (cdr (assoc "address" sp :test #'string=))))
       (is (assoc "asm" sp :test #'string=))
       (is (assoc "hex" sp :test #'string=)))))
@@ -5069,21 +5069,21 @@ scripts) address — previously only hex."
   "decodescript fills the addresses array for bare multisig — one P2PKH address
 per key (previously empty)."
   (let* ((node (make-test-node))
-         (pk1 (bitcoin-lisp.crypto:hex-to-bytes
+         (pk1 (bl.crypto:hex-to-bytes
                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
-         (pk2 (bitcoin-lisp.crypto:hex-to-bytes
+         (pk2 (bl.crypto:hex-to-bytes
                "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"))
          ;; 2-of-2 bare multisig: OP_2 <33pk1> <33pk2> OP_2 OP_CHECKMULTISIG
          (script (concatenate '(vector (unsigned-byte 8))
                               (vector #x52 #x21) pk1 (vector #x21) pk2 (vector #x52 #xae)))
-         (r (bitcoin-lisp.rpc::rpc-decodescript
-             node (list (bitcoin-lisp.crypto:bytes-to-hex script))))
+         (r (bl.rpc::rpc-decodescript
+             node (list (bl.crypto:bytes-to-hex script))))
          (addrs (cdr (assoc "addresses" r :test #'string=))))
     (is (string= "multisig" (cdr (assoc "type" r :test #'string=))))
     (is (= 2 (cdr (assoc "reqSigs" r :test #'string=))))
     (is (= 2 (length addrs)))
-    (is (string= (bitcoin-lisp.crypto:encode-p2pkh-address
-                  (bitcoin-lisp.crypto:hash160 pk1) :testnet3)
+    (is (string= (bl.crypto:encode-p2pkh-address
+                  (bl.crypto:hash160 pk1) :testnet3)
                  (first addrs)))))
 
 (test rpc-getnetworkinfo-completeness
@@ -5093,16 +5093,16 @@ localservices is the SAME composition the version message advertises
 (peer.lisp local-services) — Core keeps NODE_NETWORK_LIMITED set alongside
 NODE_NETWORK on a full node (init.cpp:863,1946), so both names appear."
   (let* ((node (make-test-node))
-         (bitcoin-lisp::*node* node)
-         (bitcoin-lisp::*prune-target-mib* nil)
-         (r (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil))
+         (bl::*node* node)
+         (bl::*prune-target-mib* nil)
+         (r (bl.rpc::rpc-getnetworkinfo node nil))
          (names (cdr (assoc "localservicesnames" r :test #'string=))))
     (is (= 16 (length (cdr (assoc "localservices" r :test #'string=)))))
     (is (member "WITNESS" names :test #'string=))
     (is (member "NETWORK" names :test #'string=))
     (is (member "NETWORK_LIMITED" names :test #'string=))
     ;; And the hex field decodes to exactly the wire bits.
-    (is (= (bitcoin-lisp.networking::local-services)
+    (is (= (bl.net::local-services)
            (parse-integer (cdr (assoc "localservices" r :test #'string=))
                           :radix 16)))
     (is (assoc "localrelay" r :test #'string=))
@@ -5111,7 +5111,7 @@ NODE_NETWORK on a full node (init.cpp:863,1946), so both names appear."
     (is (integerp (cdr (assoc "connections_in" r :test #'string=))))
     (is (integerp (cdr (assoc "connections_out" r :test #'string=))))
     (is (assoc "warnings" r :test #'string=))
-    (let ((resp (bitcoin-lisp.rpc::make-rpc-response r "id" :v2)))
+    (let ((resp (bl.rpc::make-rpc-response r "id" :v2)))
       (finishes (with-output-to-string (s) (yason:encode resp s))))))
 
 (test rpc-getpeerinfo-fields
@@ -5122,13 +5122,13 @@ to \"block-relay-only\" with relaytxes false. synced_headers/synced_blocks are
 -1 while unknown (Core), and pingtime is absent until a pong arrived (Core
 emits it conditionally)."
   (let* ((node (make-test-node))
-         (peer (bitcoin-lisp::make-peer :address "1.2.3.4:8333" :state :ready
+         (peer (bl::make-peer :address "1.2.3.4:8333" :state :ready
                                         :inbound t :start-height 99 :services #x409))
-         (br (bitcoin-lisp::make-peer :address "5.6.7.8:8333" :state :ready
+         (br (bl::make-peer :address "5.6.7.8:8333" :state :ready
                                       :conn-type :block-relay))
          (ct (lambda (r) (cdr (assoc "connection_type" r :test #'string=)))))
-    (setf (bitcoin-lisp::node-peers node) (list peer br))
-    (let* ((rows (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+    (setf (bl::node-peers node) (list peer br))
+    (let* ((rows (bl.rpc::rpc-getpeerinfo node nil))
            (e (find "inbound" rows :key ct :test #'string=))
            (b (find "block-relay-only" rows :key ct :test #'string=)))
       (is-true e)
@@ -5150,10 +5150,10 @@ emits it conditionally)."
       ;; transport_protocol_type (Core TransportTypeAsString): "v1" without a
       ;; BIP324 session, "v2" when the connection carries one.
       (is (string= "v1" (cdr (assoc "transport_protocol_type" e :test #'string=))))
-      (setf (bitcoin-lisp.networking::peer-connection br)
-            (bitcoin-lisp.networking::make-connection :host "5.6.7.8" :port 8333
+      (setf (bl.net::peer-connection br)
+            (bl.net::make-connection :host "5.6.7.8" :port 8333
                                                       :transport t))
-      (let* ((rows2 (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+      (let* ((rows2 (bl.rpc::rpc-getpeerinfo node nil))
              (b2 (find "block-relay-only" rows2 :key ct :test #'string=)))
         (is (string= "v2" (cdr (assoc "transport_protocol_type" b2
                                       :test #'string=))))))))
@@ -5165,35 +5165,35 @@ per-message byte maps, addr_relay_enabled, bip152 flags, timeoffset/conntime,
 inv queue counters, permissions, session_id — and the whole row must encode
 through yason."
   (let* ((node (make-test-node))
-         (vmsg (bitcoin-lisp.serialization::make-version-message
+         (vmsg (bl.ser::make-version-message
                 :version 70016 :start-height 42 :user-agent "/parity/"))
-         (conn (bitcoin-lisp.networking::make-connection
+         (conn (bl.net::make-connection
                 :host "203.0.113.5" :port 8333 :connected t))
-         (peer (bitcoin-lisp::make-peer :address "203.0.113.5" :state :ready
+         (peer (bl::make-peer :address "203.0.113.5" :state :ready
                                         :version vmsg
                                         :services #x409
                                         :connection conn)))
     ;; Simulate live state: one pong observed, one ping outstanding, a
     ;; feefilter received, a queued announcement, addr relay set up, and
     ;; some per-command traffic.
-    (setf (bitcoin-lisp.networking::peer-ping-latency peer)
+    (setf (bl.net::peer-ping-latency peer)
           internal-time-units-per-second        ; 1.0s last ping
-          (bitcoin-lisp.networking::peer-min-ping-latency peer)
+          (bl.net::peer-min-ping-latency peer)
           (floor internal-time-units-per-second 2) ; 0.5s best
-          (bitcoin-lisp.networking::peer-ping-nonce peer) 7
-          (bitcoin-lisp.networking::peer-last-ping-time peer)
+          (bl.net::peer-ping-nonce peer) 7
+          (bl.net::peer-last-ping-time peer)
           (get-internal-real-time)
-          (bitcoin-lisp.networking::peer-feefilter-rate peer) 1000
-          (bitcoin-lisp.networking::peer-time-offset peer) -3
-          (bitcoin-lisp.networking::peer-addr-relay-enabled peer) t
-          (bitcoin-lisp.networking::peer-tx-inv-queue peer)
+          (bl.net::peer-feefilter-rate peer) 1000
+          (bl.net::peer-time-offset peer) -3
+          (bl.net::peer-addr-relay-enabled peer) t
+          (bl.net::peer-tx-inv-queue peer)
           (let ((txid (make-array 32 :element-type '(unsigned-byte 8))))
             (list (list txid txid 0)))
-          (bitcoin-lisp.networking::connection-last-send-time conn)
+          (bl.net::connection-last-send-time conn)
           (get-universal-time))
-    (incf (gethash "ping" (bitcoin-lisp.networking::peer-sent-per-msg peer) 0) 32)
-    (setf (bitcoin-lisp::node-peers node) (list peer))
-    (let* ((rows (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+    (incf (gethash "ping" (bl.net::peer-sent-per-msg peer) 0) 32)
+    (setf (bl::node-peers node) (list peer))
+    (let* ((rows (bl.rpc::rpc-getpeerinfo node nil))
            (e (first rows))
            (f (lambda (k) (cdr (assoc k e :test #'string=)))))
       (is (string= "ipv4" (funcall f "network")))
@@ -5236,23 +5236,23 @@ through yason."
       (is (null (assoc "addrbind" e :test #'string=)))
       (is (null (assoc "mapped_as" e :test #'string=)))
       ;; full row encodes through yason.
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response rows "id" :v2)))
+      (let ((response (bl.rpc::make-rpc-response rows "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-getpeerinfo-synced-headers-from-best-known
   "synced_headers reports the height of the peer's best known block (Core
 pindexBestKnownBlock -> nSyncHeight) once an announcement recorded one."
   (let* ((node (make-test-node))
-         (chain-state (bitcoin-lisp.rpc::rpc-get-chain-state node))
+         (chain-state (bl.rpc::rpc-get-chain-state node))
          (bhash (make-array 32 :element-type '(unsigned-byte 8)
                                :initial-element 33))
-         (peer (bitcoin-lisp::make-peer :address "198.51.100.9" :state :ready)))
-    (bitcoin-lisp.storage:add-block-index-entry
-     chain-state (bitcoin-lisp.storage:make-block-index-entry
+         (peer (bl::make-peer :address "198.51.100.9" :state :ready)))
+    (bl.store:add-block-index-entry
+     chain-state (bl.store:make-block-index-entry
                   :hash bhash :height 7 :status :valid))
-    (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer) bhash)
-    (setf (bitcoin-lisp::node-peers node) (list peer))
-    (let ((e (first (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))))
+    (setf (bl.net::peer-best-known-block-hash peer) bhash)
+    (setf (bl::node-peers node) (list peer))
+    (let ((e (first (bl.rpc::rpc-getpeerinfo node nil))))
       (is (= 7 (cdr (assoc "synced_headers" e :test #'string=))))
       (is (= -1 (cdr (assoc "synced_blocks" e :test #'string=)))))))
 
@@ -5261,38 +5261,38 @@ pindexBestKnownBlock -> nSyncHeight) once an announcement recorded one."
 detail objects (txid/wtxid/bytes/vsize/weight/from); 2 -> details plus raw hex.
 The single announcer peer's id appears in \"from\"."
   (let* ((node (make-test-node))
-         (peer (bitcoin-lisp::make-peer :address "9.9.9.9:8333"))
+         (peer (bl::make-peer :address "9.9.9.9:8333"))
          (txid0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
-         (tx (bitcoin-lisp.serialization:make-transaction
+         (tx (bl.ser:make-transaction
               :version 2
-              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint
                                                  :hash txid0 :index 0)
                                :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                                :sequence #xffffffff))
-              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+              :outputs (vector (bl.ser:make-tx-out
                                 :value 90000
                                 :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
               :lock-time 0))
-         (mempool (bitcoin-lisp.rpc::rpc-get-mempool node))
-         (pool (bitcoin-lisp.mempool:mempool-orphan-pool mempool))
-         (txid-hex (bitcoin-lisp.rpc::hash-to-hex
-                    (bitcoin-lisp.serialization:transaction-hash tx))))
-    (bitcoin-lisp.mempool:orphan-add pool tx peer)
+         (mempool (bl.rpc::rpc-get-mempool node))
+         (pool (bl.mp:mempool-orphan-pool mempool))
+         (txid-hex (bl.rpc::hash-to-hex
+                    (bl.ser:transaction-hash tx))))
+    (bl.mp:orphan-add pool tx peer)
     ;; verbosity 0 (default): array of txid hex strings
-    (is (equal (list txid-hex) (bitcoin-lisp.rpc::rpc-getorphantxs node nil)))
+    (is (equal (list txid-hex) (bl.rpc::rpc-getorphantxs node nil)))
     ;; verbosity 1: detail object with the expected keys + announcer peer id
-    (let ((v1 (first (bitcoin-lisp.rpc::rpc-getorphantxs node (list 1)))))
+    (let ((v1 (first (bl.rpc::rpc-getorphantxs node (list 1)))))
       (is (string= txid-hex (cdr (assoc "txid" v1 :test #'string=))))
       (is (assoc "wtxid" v1 :test #'string=))
       (is (plusp (cdr (assoc "bytes" v1 :test #'string=))))
       (is (plusp (cdr (assoc "vsize" v1 :test #'string=))))
       (is (plusp (cdr (assoc "weight" v1 :test #'string=))))
-      (is (equal (list (bitcoin-lisp.networking::peer-id peer))
+      (is (equal (list (bl.net::peer-id peer))
                  (cdr (assoc "from" v1 :test #'string=))))
       (is (null (assoc "hex" v1 :test #'string=))))
     ;; verbosity 2: adds the raw hex
-    (let ((v2 (first (bitcoin-lisp.rpc::rpc-getorphantxs node (list 2)))))
+    (let ((v2 (first (bl.rpc::rpc-getorphantxs node (list 2)))))
       (is (stringp (cdr (assoc "hex" v2 :test #'string=)))))))
 
 (test rpc-sign-verify-message
@@ -5302,30 +5302,30 @@ address, and a malformed signature all fail. The signature is deterministic."
   (let* ((node (make-test-node))   ; testnet3
          (k1 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
                (setf (aref k 31) 1) k))
-         (wif (bitcoin-lisp.crypto:private-key-to-wif k1 :network :mainnet :compressed t))
+         (wif (bl.crypto:private-key-to-wif k1 :network :mainnet :compressed t))
          (msg "hello world")
-         (pub (bitcoin-lisp.crypto:derive-public-key k1))   ; compressed
-         (addr (bitcoin-lisp.crypto:encode-p2pkh-address
-                (bitcoin-lisp.crypto:hash160 pub) :testnet3))
-         (sig (bitcoin-lisp.rpc::rpc-signmessagewithprivkey node (list wif msg))))
+         (pub (bl.crypto:derive-public-key k1))   ; compressed
+         (addr (bl.crypto:encode-p2pkh-address
+                (bl.crypto:hash160 pub) :testnet3))
+         (sig (bl.rpc::rpc-signmessagewithprivkey node (list wif msg))))
     (is (stringp sig))
-    (is (string= sig (bitcoin-lisp.rpc::rpc-signmessagewithprivkey node (list wif msg))))
-    (is (eq t (bitcoin-lisp.rpc::rpc-verifymessage node (list addr sig msg))))
+    (is (string= sig (bl.rpc::rpc-signmessagewithprivkey node (list wif msg))))
+    (is (eq t (bl.rpc::rpc-verifymessage node (list addr sig msg))))
     ;; Bare Core booleans: failures are JSON false, never null (wave 10).
-    (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-verifymessage node (list addr sig "tampered"))))
+    (is (eq 'yason:false (bl.rpc::rpc-verifymessage node (list addr sig "tampered"))))
     (let* ((k2 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
                  (setf (aref k 31) 2) k))
-           (addr2 (bitcoin-lisp.crypto:encode-p2pkh-address
-                   (bitcoin-lisp.crypto:hash160 (bitcoin-lisp.crypto:derive-public-key k2))
+           (addr2 (bl.crypto:encode-p2pkh-address
+                   (bl.crypto:hash160 (bl.crypto:derive-public-key k2))
                    :testnet3)))
-      (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-verifymessage node (list addr2 sig msg)))))
+      (is (eq 'yason:false (bl.rpc::rpc-verifymessage node (list addr2 sig msg)))))
     ;; Malformed base64 is an ERROR in Core (-5 "Malformed base64 encoding"),
     ;; not a false result (rpc/signmessage.cpp ERR_MALFORMED_SIGNATURE).
     (handler-case
-        (progn (bitcoin-lisp.rpc::rpc-verifymessage node (list addr "not-a-valid-sig" msg))
+        (progn (bl.rpc::rpc-verifymessage node (list addr "not-a-valid-sig" msg))
                (fail "malformed base64 should signal"))
-      (bitcoin-lisp.rpc::rpc-error (e)
-        (is (= -5 (bitcoin-lisp.rpc::rpc-error-code e)))))))
+      (bl.rpc::rpc-error (e)
+        (is (= -5 (bl.rpc::rpc-error-code e)))))))
 
 (test rpc-signrawtransactionwithkey-p2pkh-p2wpkh
   "signrawtransactionwithkey signs a P2WPKH input (input 0) and a P2PKH input
@@ -5334,64 +5334,64 @@ verifies under the SAME sighash the validator computes (legacy + BIP143)."
   (let* ((node (make-test-node))
          (k1 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
                (setf (aref k 31) 1) k))
-         (wif (bitcoin-lisp.crypto:private-key-to-wif k1 :network :mainnet :compressed t))
-         (pub (bitcoin-lisp.crypto:derive-public-key k1))
-         (pkh (bitcoin-lisp.crypto:hash160 pub))
+         (wif (bl.crypto:private-key-to-wif k1 :network :mainnet :compressed t))
+         (pub (bl.crypto:derive-public-key k1))
+         (pkh (bl.crypto:hash160 pub))
          (p2wpkh (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x14) pkh))
          (p2pkh (concatenate '(vector (unsigned-byte 8)) (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
          (p2pkh-code (concatenate '(vector (unsigned-byte 8))
                                   (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
          (txid0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 10))
          (txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 11))
-         (tx (bitcoin-lisp.serialization:make-transaction
+         (tx (bl.ser:make-transaction
               :version 2
-              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint
                                                  :hash txid0 :index 0)
                                :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                                :sequence #xffffffff)
-                              (bitcoin-lisp.serialization:make-tx-in
-                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+                              (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint
                                                  :hash txid1 :index 0)
                                :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                                :sequence #xffffffff))
-              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+              :outputs (vector (bl.ser:make-tx-out
                                 :value 90000 :script-pubkey p2pkh))
               :lock-time 0))
-         (tx-hex (bitcoin-lisp.crypto:bytes-to-hex
-                  (bitcoin-lisp.serialization:serialize-transaction tx)))
-         (prevtxs (list (list (cons "txid" (bitcoin-lisp.rpc::hash-to-hex txid0))
+         (tx-hex (bl.crypto:bytes-to-hex
+                  (bl.ser:serialize-transaction tx)))
+         (prevtxs (list (list (cons "txid" (bl.rpc::hash-to-hex txid0))
                               (cons "vout" 0)
-                              (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex p2wpkh))
+                              (cons "scriptPubKey" (bl.crypto:bytes-to-hex p2wpkh))
                               (cons "amount" 0.001d0))   ; 100000 sats
-                        (list (cons "txid" (bitcoin-lisp.rpc::hash-to-hex txid1))
+                        (list (cons "txid" (bl.rpc::hash-to-hex txid1))
                               (cons "vout" 0)
-                              (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex p2pkh)))))
-         (result (bitcoin-lisp.rpc::rpc-signrawtransactionwithkey
+                              (cons "scriptPubKey" (bl.crypto:bytes-to-hex p2pkh)))))
+         (result (bl.rpc::rpc-signrawtransactionwithkey
                   node (list tx-hex (list wif) prevtxs))))
     (is (eq t (cdr (assoc "complete" result :test #'string=))))
-    (let* ((tx2 (bitcoin-lisp.serialization:parse-tx-payload
-                 (bitcoin-lisp.crypto:hex-to-bytes (cdr (assoc "hex" result :test #'string=)))))
-           (ins (bitcoin-lisp.serialization:transaction-inputs tx2))
-           (wit (bitcoin-lisp.serialization:transaction-witness tx2)))
+    (let* ((tx2 (bl.ser:parse-tx-payload
+                 (bl.crypto:hex-to-bytes (cdr (assoc "hex" result :test #'string=)))))
+           (ins (bl.ser:transaction-inputs tx2))
+           (wit (bl.ser:transaction-witness tx2)))
       ;; Input 0 (P2WPKH): witness = [sig pubkey]; sig verifies under BIP143 sighash.
       (let* ((stack (aref wit 0))
              (sig (first stack))
              (der (subseq sig 0 (1- (length sig))))
-             (sighash (let ((bitcoin-lisp.coalton.interop::*current-tx* tx2)
-                            (bitcoin-lisp.coalton.interop::*current-input-index* 0)
-                            (bitcoin-lisp.coalton.interop::*precomputed-sighash*
-                             (bitcoin-lisp.coalton.interop::init-precomputed-sighash tx2)))
-                        (bitcoin-lisp.coalton.interop::compute-bip143-sighash p2pkh-code 100000 1))))
+             (sighash (let ((bl.interop::*current-tx* tx2)
+                            (bl.interop::*current-input-index* 0)
+                            (bl.interop::*precomputed-sighash*
+                             (bl.interop::init-precomputed-sighash tx2)))
+                        (bl.interop::compute-bip143-sighash p2pkh-code 100000 1))))
         (is (equalp pub (second stack)))
-        (is-true (bitcoin-lisp.crypto:verify-signature sighash der pub)))
+        (is-true (bl.crypto:verify-signature sighash der pub)))
       ;; Input 1 (P2PKH): scriptSig = push(sig) push(pubkey); sig verifies under legacy sighash.
-      (let* ((ss (bitcoin-lisp.serialization:tx-in-script-sig (aref ins 1)))
+      (let* ((ss (bl.ser:tx-in-script-sig (aref ins 1)))
              (siglen (aref ss 0))
              (sig (subseq ss 1 (1+ siglen)))
              (der (subseq sig 0 (1- (length sig))))
-             (sighash (bitcoin-lisp.coalton.interop::compute-legacy-sighash tx2 1 p2pkh 1)))
-        (is-true (bitcoin-lisp.crypto:verify-signature sighash der pub))))))
+             (sighash (bl.interop::compute-legacy-sighash tx2 1 p2pkh 1)))
+        (is-true (bl.crypto:verify-signature sighash der pub))))))
 
 (test rpc-signrawtransactionwithkey-p2tr-keypath
   "signrawtransactionwithkey signs a P2TR key-path input; complete=t, the witness
@@ -5400,67 +5400,67 @@ key-path verifier (validate-taproot-key-path) for the recomputed BIP341 sighash.
   (let* ((node (make-test-node))
          (sk (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
                (setf (aref k 31) 1) k))
-         (wif (bitcoin-lisp.crypto:private-key-to-wif sk :network :mainnet :compressed t))
-         (pxonly (bitcoin-lisp.crypto:derive-xonly-pubkey sk))
-         (qx (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey pxonly))
+         (wif (bl.crypto:private-key-to-wif sk :network :mainnet :compressed t))
+         (pxonly (bl.crypto:derive-xonly-pubkey sk))
+         (qx (bl.interop:compute-tweaked-pubkey pxonly))
          (p2tr (concatenate '(vector (unsigned-byte 8)) (vector #x51 #x20) qx))
          (txid0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
-         (tx (bitcoin-lisp.serialization:make-transaction
+         (tx (bl.ser:make-transaction
               :version 2
-              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint
                                                  :hash txid0 :index 0)
                                :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                                :sequence #xffffffff))
-              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+              :outputs (vector (bl.ser:make-tx-out
                                 :value 90000 :script-pubkey p2tr))
               :lock-time 0))
-         (tx-hex (bitcoin-lisp.crypto:bytes-to-hex
-                  (bitcoin-lisp.serialization:serialize-transaction tx)))
-         (prevtxs (list (list (cons "txid" (bitcoin-lisp.rpc::hash-to-hex txid0))
+         (tx-hex (bl.crypto:bytes-to-hex
+                  (bl.ser:serialize-transaction tx)))
+         (prevtxs (list (list (cons "txid" (bl.rpc::hash-to-hex txid0))
                               (cons "vout" 0)
-                              (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex p2tr))
+                              (cons "scriptPubKey" (bl.crypto:bytes-to-hex p2tr))
                               (cons "amount" 0.001d0))))   ; 100000 sats
-         (result (bitcoin-lisp.rpc::rpc-signrawtransactionwithkey
+         (result (bl.rpc::rpc-signrawtransactionwithkey
                   node (list tx-hex (list wif) prevtxs))))
     (is (eq t (cdr (assoc "complete" result :test #'string=))))
-    (let* ((tx2 (bitcoin-lisp.serialization:parse-tx-payload
-                 (bitcoin-lisp.crypto:hex-to-bytes (cdr (assoc "hex" result :test #'string=)))))
-           (stack (aref (bitcoin-lisp.serialization:transaction-witness tx2) 0))
+    (let* ((tx2 (bl.ser:parse-tx-payload
+                 (bl.crypto:hex-to-bytes (cdr (assoc "hex" result :test #'string=)))))
+           (stack (aref (bl.ser:transaction-witness tx2) 0))
            (sig (first stack)))
       (is (= 1 (length stack)))
       (is (= 64 (length sig)))
       ;; The consensus key-path verifier accepts the signature.
-      (let* ((spent (vector (bitcoin-lisp.storage:make-utxo-entry
+      (let* ((spent (vector (bl.store:make-utxo-entry
                              :value 100000
                              :script-pubkey (coerce p2tr '(simple-array (unsigned-byte 8) (*))))))
-             (bitcoin-lisp.coalton.interop::*current-tx* tx2)
-             (bitcoin-lisp.coalton.interop::*current-input-index* 0)
-             (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent)
-             (bitcoin-lisp.coalton.interop::*precomputed-sighash*
-              (bitcoin-lisp.coalton.interop::init-precomputed-sighash tx2 spent)))
-        (is-true (bitcoin-lisp.coalton.interop::validate-taproot-key-path stack qx 100000))))))
+             (bl.interop::*current-tx* tx2)
+             (bl.interop::*current-input-index* 0)
+             (bl.interop::*current-spent-utxos* spent)
+             (bl.interop::*precomputed-sighash*
+              (bl.interop::init-precomputed-sighash tx2 spent)))
+        (is-true (bl.interop::validate-taproot-key-path stack qx 100000))))))
 
 (defun %verify-tx-input (tx index spent-vec flags)
   "Run the full consensus interpreter (verify-script) on input INDEX of TX, with
 SPENT-VEC supplying amounts/scriptPubKeys. Returns verify-script's result."
   (let* ((utxo (aref spent-vec index))
-         (amount (bitcoin-lisp.storage:utxo-entry-value utxo))
-         (spk (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
-         (input (elt (bitcoin-lisp.serialization:transaction-inputs tx) index))
-         (sig-bytes (bitcoin-lisp.serialization:tx-in-script-sig input))
-         (wit (bitcoin-lisp.serialization:transaction-witness tx))
+         (amount (bl.store:utxo-entry-value utxo))
+         (spk (bl.store:utxo-entry-script-pubkey utxo))
+         (input (elt (bl.ser:transaction-inputs tx) index))
+         (sig-bytes (bl.ser:tx-in-script-sig input))
+         (wit (bl.ser:transaction-witness tx))
          (witness-stack (when (and wit (< index (length wit))) (elt wit index)))
-         (bitcoin-lisp.coalton.interop:*current-tx* tx)
-         (bitcoin-lisp.coalton.interop:*current-input-index* index)
-         (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent-vec)
-         (bitcoin-lisp.coalton.interop::*precomputed-sighash* nil)
-         (bitcoin-lisp.coalton.interop:*witness-input-amount* amount))
-    (bitcoin-lisp.coalton.interop:set-script-flags flags)
+         (bl.interop:*current-tx* tx)
+         (bl.interop:*current-input-index* index)
+         (bl.interop::*current-spent-utxos* spent-vec)
+         (bl.interop::*precomputed-sighash* nil)
+         (bl.interop:*witness-input-amount* amount))
+    (bl.interop:set-script-flags flags)
     (unwind-protect
-         (bitcoin-lisp.coalton.interop:verify-script
+         (bl.interop:verify-script
           sig-bytes spk :witness witness-stack :amount amount)
-      (bitcoin-lisp.coalton.interop:set-script-flags nil))))
+      (bl.interop:set-script-flags nil))))
 
 (defun %multisig-script (m pubs)
   "OP_m <pub>... OP_n OP_CHECKMULTISIG for the list of compressed PUBS."
@@ -5481,76 +5481,76 @@ DERSIG+LOW_S)."
                (setf (aref k 31) 1) k))
          (kb (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
                (setf (aref k 31) 2) k))
-         (wa (bitcoin-lisp.crypto:private-key-to-wif ka :network :mainnet :compressed t))
-         (wb (bitcoin-lisp.crypto:private-key-to-wif kb :network :mainnet :compressed t))
-         (pa (bitcoin-lisp.crypto:derive-public-key ka))
-         (pb (bitcoin-lisp.crypto:derive-public-key kb))
-         (pkha (bitcoin-lisp.crypto:hash160 pa))
+         (wa (bl.crypto:private-key-to-wif ka :network :mainnet :compressed t))
+         (wb (bl.crypto:private-key-to-wif kb :network :mainnet :compressed t))
+         (pa (bl.crypto:derive-public-key ka))
+         (pb (bl.crypto:derive-public-key kb))
+         (pkha (bl.crypto:hash160 pa))
          (ms22 (%multisig-script 2 (list pa pb)))    ; 2-of-2 A,B
          (ms11 (%multisig-script 1 (list pa)))       ; 1-of-1 A
          ;; redeem/witness + scriptPubKeys
          (rd-p2wpkh (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x14) pkha))
          (rd-p2wsh (concatenate '(vector (unsigned-byte 8))
-                                (vector #x00 #x20) (bitcoin-lisp.crypto:sha256 ms22)))
+                                (vector #x00 #x20) (bl.crypto:sha256 ms22)))
          (spk-sh-wpkh (concatenate '(vector (unsigned-byte 8))
-                                   (vector #xa9 #x14) (bitcoin-lisp.crypto:hash160 rd-p2wpkh) (vector #x87)))
+                                   (vector #xa9 #x14) (bl.crypto:hash160 rd-p2wpkh) (vector #x87)))
          (spk-sh-ms (concatenate '(vector (unsigned-byte 8))
-                                 (vector #xa9 #x14) (bitcoin-lisp.crypto:hash160 ms22) (vector #x87)))
+                                 (vector #xa9 #x14) (bl.crypto:hash160 ms22) (vector #x87)))
          (spk-wsh (concatenate '(vector (unsigned-byte 8))
-                               (vector #x00 #x20) (bitcoin-lisp.crypto:sha256 ms22)))
+                               (vector #x00 #x20) (bl.crypto:sha256 ms22)))
          (spk-sh-wsh (concatenate '(vector (unsigned-byte 8))
-                                  (vector #xa9 #x14) (bitcoin-lisp.crypto:hash160 rd-p2wsh) (vector #x87)))
+                                  (vector #xa9 #x14) (bl.crypto:hash160 rd-p2wsh) (vector #x87)))
          (spks (vector spk-sh-wpkh spk-sh-ms spk-wsh spk-sh-wsh ms11))
          (inputs (loop for j below 5
-                       collect (bitcoin-lisp.serialization:make-tx-in
-                                :previous-output (bitcoin-lisp.serialization:make-outpoint
+                       collect (bl.ser:make-tx-in
+                                :previous-output (bl.ser:make-outpoint
                                                   :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                        :initial-element (+ 20 j))
                                                   :index 0)
                                 :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                                 :sequence #xffffffff)))
-         (tx (bitcoin-lisp.serialization:make-transaction
+         (tx (bl.ser:make-transaction
               :version 2 :inputs (coerce inputs 'vector)
-              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+              :outputs (vector (bl.ser:make-tx-out
                                 :value 400000 :script-pubkey spk-sh-wpkh))
               :lock-time 0))
-         (tx-hex (bitcoin-lisp.crypto:bytes-to-hex
-                  (bitcoin-lisp.serialization:serialize-transaction tx)))
-         (h2 (lambda (j) (bitcoin-lisp.rpc::hash-to-hex
+         (tx-hex (bl.crypto:bytes-to-hex
+                  (bl.ser:serialize-transaction tx)))
+         (h2 (lambda (j) (bl.rpc::hash-to-hex
                           (make-array 32 :element-type '(unsigned-byte 8) :initial-element (+ 20 j)))))
          (prevtxs (list
                    ;; 0 P2SH-P2WPKH
                    (list (cons "txid" (funcall h2 0)) (cons "vout" 0)
-                         (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex spk-sh-wpkh))
+                         (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk-sh-wpkh))
                          (cons "amount" 0.001d0)
-                         (cons "redeemScript" (bitcoin-lisp.crypto:bytes-to-hex rd-p2wpkh)))
+                         (cons "redeemScript" (bl.crypto:bytes-to-hex rd-p2wpkh)))
                    ;; 1 P2SH-multisig (legacy)
                    (list (cons "txid" (funcall h2 1)) (cons "vout" 0)
-                         (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex spk-sh-ms))
-                         (cons "redeemScript" (bitcoin-lisp.crypto:bytes-to-hex ms22)))
+                         (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk-sh-ms))
+                         (cons "redeemScript" (bl.crypto:bytes-to-hex ms22)))
                    ;; 2 P2WSH-multisig
                    (list (cons "txid" (funcall h2 2)) (cons "vout" 0)
-                         (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex spk-wsh))
+                         (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk-wsh))
                          (cons "amount" 0.001d0)
-                         (cons "witnessScript" (bitcoin-lisp.crypto:bytes-to-hex ms22)))
+                         (cons "witnessScript" (bl.crypto:bytes-to-hex ms22)))
                    ;; 3 P2SH-P2WSH-multisig
                    (list (cons "txid" (funcall h2 3)) (cons "vout" 0)
-                         (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex spk-sh-wsh))
+                         (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk-sh-wsh))
                          (cons "amount" 0.001d0)
-                         (cons "redeemScript" (bitcoin-lisp.crypto:bytes-to-hex rd-p2wsh))
-                         (cons "witnessScript" (bitcoin-lisp.crypto:bytes-to-hex ms22)))
+                         (cons "redeemScript" (bl.crypto:bytes-to-hex rd-p2wsh))
+                         (cons "witnessScript" (bl.crypto:bytes-to-hex ms22)))
                    ;; 4 bare multisig 1-of-1
                    (list (cons "txid" (funcall h2 4)) (cons "vout" 0)
-                         (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex ms11)))))
-         (result (bitcoin-lisp.rpc::rpc-signrawtransactionwithkey
+                         (cons "scriptPubKey" (bl.crypto:bytes-to-hex ms11)))))
+         (result (bl.rpc::rpc-signrawtransactionwithkey
                   node (list tx-hex (list wa wb) prevtxs))))
     (is (eq t (cdr (assoc "complete" result :test #'string=))))
-    (let* ((tx2 (bitcoin-lisp.serialization:parse-tx-payload
-                 (bitcoin-lisp.crypto:hex-to-bytes (cdr (assoc "hex" result :test #'string=)))))
+    (let* ((tx2 (bl.ser:parse-tx-payload
+                 (bl.crypto:hex-to-bytes (cdr (assoc "hex" result :test #'string=)))))
            (spent (make-array 5)))
       (dotimes (j 5)
         (setf (aref spent j)
-              (bitcoin-lisp.storage:make-utxo-entry
+              (bl.store:make-utxo-entry
                :value 100000
                :script-pubkey (coerce (aref spks j) '(simple-array (unsigned-byte 8) (*))))))
       (dotimes (j 5)
@@ -5569,13 +5569,13 @@ DERSIG+LOW_S)."
     (and pos
          (= 8 (- (length descriptor) pos 1))
          (string= (subseq descriptor (1+ pos))
-                  (bitcoin-lisp.rpc::descriptor-checksum (subseq descriptor 0 pos))))))
+                  (bl.rpc::descriptor-checksum (subseq descriptor 0 pos))))))
 
 (test rpc-createmultisig-legacy-2of2
   "createmultisig legacy: bare-multisig redeemScript + P2SH address round-trip."
   (multiple-value-bind (k1 k2) (%cms-keys)
     (let* ((node (make-test-node))
-           (r (bitcoin-lisp.rpc::rpc-createmultisig node (list 2 (list k1 k2))))
+           (r (bl.rpc::rpc-createmultisig node (list 2 (list k1 k2))))
            (redeem-hex (cdr (assoc "redeemScript" r :test #'string=)))
            (address (cdr (assoc "address" r :test #'string=)))
            (descriptor (cdr (assoc "descriptor" r :test #'string=))))
@@ -5585,10 +5585,10 @@ DERSIG+LOW_S)."
       (is-true (%valid-descriptor-checksum-p descriptor))
       ;; address decodes to P2SH(hash160(redeemScript))
       (multiple-value-bind (type spk)
-          (bitcoin-lisp.crypto:decode-address address :testnet3)
+          (bl.crypto:decode-address address :testnet3)
         (is (not (null type)))
         (is (equalp (subseq spk 2 22)
-                    (bitcoin-lisp.crypto:hash160 (bitcoin-lisp.crypto:hex-to-bytes redeem-hex)))))
+                    (bl.crypto:hash160 (bl.crypto:hex-to-bytes redeem-hex)))))
       ;; compressed keys -> no warnings
       (is (null (assoc "warnings" r :test #'string=))))))
 
@@ -5596,35 +5596,35 @@ DERSIG+LOW_S)."
   "createmultisig bech32: address is P2WSH(sha256(redeemScript))."
   (multiple-value-bind (k1 k2) (%cms-keys)
     (let* ((node (make-test-node))
-           (r (bitcoin-lisp.rpc::rpc-createmultisig node (list 2 (list k1 k2) "bech32")))
+           (r (bl.rpc::rpc-createmultisig node (list 2 (list k1 k2) "bech32")))
            (redeem-hex (cdr (assoc "redeemScript" r :test #'string=)))
            (address (cdr (assoc "address" r :test #'string=)))
            (descriptor (cdr (assoc "descriptor" r :test #'string=))))
       (is (eql 0 (search "wsh(multi(2," descriptor)))
       (is-true (%valid-descriptor-checksum-p descriptor))
       (multiple-value-bind (type spk)
-          (bitcoin-lisp.crypto:decode-address address :testnet3)
+          (bl.crypto:decode-address address :testnet3)
         (is (not (null type)))
         (is (equalp (subseq spk 2 34)
-                    (bitcoin-lisp.crypto:sha256 (bitcoin-lisp.crypto:hex-to-bytes redeem-hex))))))))
+                    (bl.crypto:sha256 (bl.crypto:hex-to-bytes redeem-hex))))))))
 
 (test rpc-createmultisig-p2sh-segwit
   "createmultisig p2sh-segwit: address is P2SH(P2WSH(redeemScript))."
   (multiple-value-bind (k1 k2) (%cms-keys)
     (let* ((node (make-test-node))
-           (r (bitcoin-lisp.rpc::rpc-createmultisig node (list 2 (list k1 k2) "p2sh-segwit")))
+           (r (bl.rpc::rpc-createmultisig node (list 2 (list k1 k2) "p2sh-segwit")))
            (redeem-hex (cdr (assoc "redeemScript" r :test #'string=)))
            (address (cdr (assoc "address" r :test #'string=)))
            (descriptor (cdr (assoc "descriptor" r :test #'string=))))
       (is (eql 0 (search "sh(wsh(multi(2," descriptor)))
       (is-true (%valid-descriptor-checksum-p descriptor))
       (multiple-value-bind (type spk)
-          (bitcoin-lisp.crypto:decode-address address :testnet3)
+          (bl.crypto:decode-address address :testnet3)
         (is (not (null type)))
-        (let* ((redeem (bitcoin-lisp.crypto:hex-to-bytes redeem-hex))
+        (let* ((redeem (bl.crypto:hex-to-bytes redeem-hex))
                (p2wsh (concatenate '(vector (unsigned-byte 8))
-                                   #(#x00 #x20) (bitcoin-lisp.crypto:sha256 redeem))))
-          (is (equalp (subseq spk 2 22) (bitcoin-lisp.crypto:hash160 p2wsh))))))))
+                                   #(#x00 #x20) (bl.crypto:sha256 redeem))))
+          (is (equalp (subseq spk 2 22) (bl.crypto:hash160 p2wsh))))))))
 
 (test rpc-createmultisig-uncompressed-forces-legacy
   "An uncompressed key forces legacy output + a warning when bech32 was asked."
@@ -5635,12 +5635,12 @@ DERSIG+LOW_S)."
                           "04"
                           "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
                           "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"))
-         (r (bitcoin-lisp.rpc::rpc-createmultisig node (list 1 (list kc ku) "bech32")))
+         (r (bl.rpc::rpc-createmultisig node (list 1 (list kc ku) "bech32")))
          (address (cdr (assoc "address" r :test #'string=)))
          (warnings (cdr (assoc "warnings" r :test #'string=))))
     ;; Forced to legacy -> P2SH address, and a warning is present.
     (is (not (null warnings)))
-    (multiple-value-bind (type) (bitcoin-lisp.crypto:decode-address address :testnet3)
+    (multiple-value-bind (type) (bl.crypto:decode-address address :testnet3)
       (is (not (null type))))))
 
 (test rpc-createmultisig-errors
@@ -5648,30 +5648,30 @@ DERSIG+LOW_S)."
   (multiple-value-bind (k1 k2) (%cms-keys)
     (let ((node (make-test-node)))
       ;; not enough keys for the threshold
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-createmultisig node (list 3 (list k1 k2))))
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-createmultisig node (list 3 (list k1 k2))))
       ;; nrequired < 1
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-createmultisig node (list 0 (list k1))))
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-createmultisig node (list 0 (list k1))))
       ;; too many keys (> 20)
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-createmultisig node (list 1 (make-list 21 :initial-element k1))))
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-createmultisig node (list 1 (make-list 21 :initial-element k1))))
       ;; bech32m explicitly rejected
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-createmultisig node (list 2 (list k1 k2) "bech32m")))
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-createmultisig node (list 2 (list k1 k2) "bech32m")))
       ;; unknown address type
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-createmultisig node (list 2 (list k1 k2) "p2tr")))
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-createmultisig node (list 2 (list k1 k2) "p2tr")))
       ;; invalid public key
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-createmultisig node (list 1 (list "00")))))))
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-createmultisig node (list 1 (list "00")))))))
 
 ;;; --- ping (Bitcoin Core ping) ---
 
 (test rpc-ping-no-peers
   "ping with no connected peers returns null and does not error."
   (let ((node (make-test-node)))
-    (is (null (bitcoin-lisp.rpc::rpc-ping node nil)))))
+    (is (null (bl.rpc::rpc-ping node nil)))))
 
 ;;; --- getaddrmaninfo (Bitcoin Core getaddrmaninfo) ---
 
@@ -5679,7 +5679,7 @@ DERSIG+LOW_S)."
   "getaddrmaninfo lists every standard network + all_networks, all zero when the
 node has no address book."
   (let* ((node (make-test-node))
-         (r (bitcoin-lisp.rpc::rpc-getaddrmaninfo node nil)))
+         (r (bl.rpc::rpc-getaddrmaninfo node nil)))
     (dolist (n '("ipv4" "ipv6" "onion" "i2p" "cjdns" "all_networks"))
       (let ((obj (cdr (assoc n r :test #'string=))))
         (is (not (null obj)) "network ~A present" n)
@@ -5691,16 +5691,16 @@ node has no address book."
   "Added routable IPv4 addresses land in the ipv4 new table and the
 all_networks aggregate; counts stay consistent with the address book."
   (let* ((node (make-test-node))
-         (book (bitcoin-lisp.networking::make-address-book)))
-    (setf (bitcoin-lisp::node-address-book node) book)
-    (bitcoin-lisp.networking::address-book-add
-     book (bitcoin-lisp.networking::make-peer-address
-           :ip (bitcoin-lisp.networking::string-to-ip-bytes "1.2.3.4") :port 8333))
-    (bitcoin-lisp.networking::address-book-add
-     book (bitcoin-lisp.networking::make-peer-address
-           :ip (bitcoin-lisp.networking::string-to-ip-bytes "5.6.7.8") :port 8333))
-    (let* ((n-new (bitcoin-lisp.networking::address-book-n-new book))
-           (r (bitcoin-lisp.rpc::rpc-getaddrmaninfo node nil))
+         (book (bl.net::make-address-book)))
+    (setf (bl::node-address-book node) book)
+    (bl.net::address-book-add
+     book (bl.net::make-peer-address
+           :ip (bl.net::string-to-ip-bytes "1.2.3.4") :port 8333))
+    (bl.net::address-book-add
+     book (bl.net::make-peer-address
+           :ip (bl.net::string-to-ip-bytes "5.6.7.8") :port 8333))
+    (let* ((n-new (bl.net::address-book-n-new book))
+           (r (bl.rpc::rpc-getaddrmaninfo node nil))
            (ipv4 (cdr (assoc "ipv4" r :test #'string=)))
            (all (cdr (assoc "all_networks" r :test #'string=))))
       (is (>= n-new 1))
@@ -5719,13 +5719,13 @@ all_networks aggregate; counts stay consistent with the address book."
 
 (defun %rpc-fake-peer (address &key inbound)
   "A peer struct usable in node-peers for RPC tests (no live connection)."
-  (bitcoin-lisp.networking::make-peer
+  (bl.net::make-peer
    :address address :state :ready :connection nil :inbound inbound))
 
 (test parse-node-endpoint-forms
   "parse-node-endpoint splits host/host:port/[ipv6]:port, defaulting the port."
   (let ((node (make-test-node)))               ; testnet3 default P2P port 18333
-    (flet ((p (spec) (multiple-value-list (bitcoin-lisp::parse-node-endpoint node spec))))
+    (flet ((p (spec) (multiple-value-list (bl::parse-node-endpoint node spec))))
       (is (equal (p "1.2.3.4") '("1.2.3.4" 18333)))
       (is (equal (p "1.2.3.4:8333") '("1.2.3.4" 8333)))
       (is (equal (p "seed.example.com") '("seed.example.com" 18333)))
@@ -5738,35 +5738,35 @@ all_networks aggregate; counts stay consistent with the address book."
   "addnode mutates the node's added-nodes / pending-onetry state machine."
   (let ((node (make-test-node)))
     ;; add
-    (is (null (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4:18333" "add"))))
-    (is (member "1.2.3.4:18333" (bitcoin-lisp::node-added-nodes node) :test #'string=))
+    (is (null (bl.rpc::rpc-addnode node '("1.2.3.4:18333" "add"))))
+    (is (member "1.2.3.4:18333" (bl::node-added-nodes node) :test #'string=))
     ;; duplicate add errors
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4:18333" "add")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-addnode node '("1.2.3.4:18333" "add")))
     ;; onetry queues a one-shot dial without touching added-nodes
-    (is (null (bitcoin-lisp.rpc::rpc-addnode node '("9.9.9.9" "onetry"))))
-    (is (member "9.9.9.9" (bitcoin-lisp::node-pending-onetry node) :test #'string=))
-    (is (not (member "9.9.9.9" (bitcoin-lisp::node-added-nodes node) :test #'string=)))
+    (is (null (bl.rpc::rpc-addnode node '("9.9.9.9" "onetry"))))
+    (is (member "9.9.9.9" (bl::node-pending-onetry node) :test #'string=))
+    (is (not (member "9.9.9.9" (bl::node-added-nodes node) :test #'string=)))
     ;; remove
-    (is (null (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4:18333" "remove"))))
-    (is (not (member "1.2.3.4:18333" (bitcoin-lisp::node-added-nodes node) :test #'string=)))
+    (is (null (bl.rpc::rpc-addnode node '("1.2.3.4:18333" "remove"))))
+    (is (not (member "1.2.3.4:18333" (bl::node-added-nodes node) :test #'string=)))
     ;; remove of a node never added errors
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4:18333" "remove")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-addnode node '("1.2.3.4:18333" "remove")))
     ;; bad command + non-string node error
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4" "frobnicate")))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-addnode node '(42 "add")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-addnode node '("1.2.3.4" "frobnicate")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-addnode node '(42 "add")))))
 
 (test rpc-getaddednodeinfo-reports-state
   "getaddednodeinfo reports each added node + whether a matching peer is live."
   (let ((node (make-test-node)))
-    (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4" "add"))
-    (bitcoin-lisp.rpc::rpc-addnode node '("5.6.7.8:18333" "add"))
+    (bl.rpc::rpc-addnode node '("1.2.3.4" "add"))
+    (bl.rpc::rpc-addnode node '("5.6.7.8:18333" "add"))
     ;; Mark 1.2.3.4 connected with an outbound peer.
-    (push (%rpc-fake-peer "1.2.3.4") (bitcoin-lisp::node-peers node))
-    (let ((r (bitcoin-lisp.rpc::rpc-getaddednodeinfo node nil)))
+    (push (%rpc-fake-peer "1.2.3.4") (bl::node-peers node))
+    (let ((r (bl.rpc::rpc-getaddednodeinfo node nil)))
       (is (= 2 (length r)))
       (let ((a (find "1.2.3.4" r :key (lambda (e) (cdr (assoc "addednode" e :test #'string=)))
                      :test #'string=))
@@ -5783,28 +5783,28 @@ all_networks aggregate; counts stay consistent with the address book."
         ;; [] rather than null (this used to assert (null ...), the bug).
         (is (equalp #() (cdr (assoc "addresses" b :test #'string=))))))
     ;; filtering for a never-added node errors
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getaddednodeinfo node '("10.0.0.1")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getaddednodeinfo node '("10.0.0.1")))))
 
 (test rpc-setnetworkactive-toggles-and-drops-peers
   "setnetworkactive flips node-network-active and drops peers when disabling."
   (let ((node (make-test-node))
         (peer (%rpc-fake-peer "1.2.3.4")))
-    (push peer (bitcoin-lisp::node-peers node))
-    (is (bitcoin-lisp::node-network-active node))      ; default enabled
+    (push peer (bl::node-peers node))
+    (is (bl::node-network-active node))      ; default enabled
     ;; disable
-    (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-setnetworkactive node '(nil))))
-    (is (null (bitcoin-lisp::node-network-active node)))
-    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+    (is (eq 'yason:false (bl.rpc::rpc-setnetworkactive node '(nil))))
+    (is (null (bl::node-network-active node)))
+    (is (eq :disconnected (bl.net:peer-state peer)))
     ;; getnetworkinfo reflects the disabled state
     (is (eq 'yason:false (cdr (assoc "networkactive"
-                          (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil) :test #'string=))))
+                          (bl.rpc::rpc-getnetworkinfo node nil) :test #'string=))))
     ;; re-enable
-    (is (eq t (bitcoin-lisp.rpc::rpc-setnetworkactive node '(t))))
-    (is (bitcoin-lisp::node-network-active node))
+    (is (eq t (bl.rpc::rpc-setnetworkactive node '(t))))
+    (is (bl::node-network-active node))
     ;; missing state errors
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-setnetworkactive node '()))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-setnetworkactive node '()))))
 
 ;;; --- getchainstates ---
 
@@ -5812,7 +5812,7 @@ all_networks aggregate; counts stay consistent with the address book."
   "getchainstates reports exactly one fully-validated chainstate with Core's
 field shape."
   (let* ((node (make-test-node))
-         (r (bitcoin-lisp.rpc::rpc-getchainstates node nil))
+         (r (bl.rpc::rpc-getchainstates node nil))
          (states (cdr (assoc "chainstates" r :test #'string=))))
     (is (assoc "headers" r :test #'string=))
     (is (= 1 (length states)))
@@ -5837,115 +5837,115 @@ field shape."
 missing file or non-string path errors."
   (let* ((node (make-test-node))
          (path (merge-pathnames "bl-importmempool-test.dat" (uiop:temporary-directory))))
-    (bitcoin-lisp.mempool:save-mempool-file (bitcoin-lisp::node-mempool node) path)
+    (bl.mp:save-mempool-file (bl::node-mempool node) path)
     (unwind-protect
-         (let ((r (bitcoin-lisp.rpc::rpc-importmempool node (list (namestring path)))))
+         (let ((r (bl.rpc::rpc-importmempool node (list (namestring path)))))
            (is (hash-table-p r))                 ; serializes as {}
            (is (= 0 (hash-table-count r))))
       (ignore-errors (delete-file path)))
     ;; nonexistent file
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-importmempool node (list "/no/such/bl-mempool-file.dat")))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-importmempool node (list "/no/such/bl-mempool-file.dat")))
     ;; non-string filepath
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-importmempool node (list 123)))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-importmempool node (list 123)))))
 
 ;;; --- peer id (getpeerinfo) + getblockfrompeer ---
 
 (test rpc-getpeerinfo-includes-id
   "getpeerinfo exposes a numeric peer id (Bitcoin Core's CNode::id)."
   (let ((node (make-test-node)))
-    (push (%rpc-fake-peer "1.2.3.4") (bitcoin-lisp::node-peers node))
-    (let ((info (first (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))))
+    (push (%rpc-fake-peer "1.2.3.4") (bl::node-peers node))
+    (let ((info (first (bl.rpc::rpc-getpeerinfo node nil))))
       (is (integerp (cdr (assoc "id" info :test #'string=)))))))
 
 (test rpc-getblockfrompeer-paths
   "getblockfrompeer validates header/peer and dispatches a witness-block getdata."
-  (let* ((bitcoin-lisp::*prune-target-mib* nil)   ; deterministic: pruning off
+  (let* ((bl::*prune-target-mib* nil)   ; deterministic: pruning off
          (node (make-test-node))
-         (cs (bitcoin-lisp::node-chain-state node))
+         (cs (bl::node-chain-state node))
          (store-dir (ensure-directories-exist
                      (merge-pathnames "bl-gbfp-test/" (uiop:temporary-directory))))
-         (store (bitcoin-lisp.storage:init-block-store store-dir))
-         (hdr (bitcoin-lisp.serialization:make-block-header
+         (store (bl.store:init-block-store store-dir))
+         (hdr (bl.ser:make-block-header
                :version 1
                :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                :timestamp 1 :bits #x1d00ffff :nonce 0))
-         (hash (bitcoin-lisp.serialization:block-header-hash hdr))
-         (hash-hex (bitcoin-lisp.rpc::hash-to-hex hash)))
-    (setf (bitcoin-lisp::node-block-store node) store)
+         (hash (bl.ser:block-header-hash hdr))
+         (hash-hex (bl.rpc::hash-to-hex hash)))
+    (setf (bl::node-block-store node) store)
     ;; header not in index yet → "Block header missing"
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockfrompeer node (list hash-hex 1)))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockfrompeer node (list hash-hex 1)))
     ;; register the header
-    (bitcoin-lisp.storage:add-block-index-entry
-     cs (bitcoin-lisp.storage:make-block-index-entry
+    (bl.store:add-block-index-entry
+     cs (bl.store:make-block-index-entry
          :hash hash :height 1 :header hdr :status :header-valid :chain-work 1))
     ;; no peer with that id → "Peer does not exist"
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockfrompeer node (list hash-hex 999999)))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockfrompeer node (list hash-hex 999999)))
     ;; connected peer by id → returns {} (empty hash-table); send is a no-op on
     ;; the fake peer's nil connection.
     (let ((peer (%rpc-fake-peer "1.2.3.4")))
-      (push peer (bitcoin-lisp::node-peers node))
-      (let ((r (bitcoin-lisp.rpc::rpc-getblockfrompeer
-                node (list hash-hex (bitcoin-lisp.networking::peer-id peer)))))
+      (push peer (bl::node-peers node))
+      (let ((r (bl.rpc::rpc-getblockfrompeer
+                node (list hash-hex (bl.net::peer-id peer)))))
         (is (hash-table-p r))
         (is (= 0 (hash-table-count r)))))
     ;; bad peer_id type → error
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getblockfrompeer node (list hash-hex "notanint")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getblockfrompeer node (list hash-hex "notanint")))))
 
 ;;; --- logging (Bitcoin Core logging) ---
 
 (test rpc-logging-toggles-categories
   "logging reports every category and enables/disables via include/exclude, with
 all/none and unknown-category handling."
-  (clrhash bitcoin-lisp::*debug-categories*)
+  (clrhash bl::*debug-categories*)
   (unwind-protect
        (let ((node (make-test-node)))
          ;; default: all categories present, none enabled
-         (let ((r (bitcoin-lisp.rpc::rpc-logging node nil)))
-           (is (= (length bitcoin-lisp::+log-categories+) (length r)))
+         (let ((r (bl.rpc::rpc-logging node nil)))
+           (is (= (length bl::+log-categories+) (length r)))
            (is (assoc "net" r :test #'string=))
            ;; category states are JSON booleans — false, never null (wave 10)
            (is (eq 'yason:false (cdr (assoc "net" r :test #'string=)))))
          ;; include enables, leaving others off
-         (let ((r (bitcoin-lisp.rpc::rpc-logging node (list (list "net") nil))))
+         (let ((r (bl.rpc::rpc-logging node (list (list "net") nil))))
            (is (eq t (cdr (assoc "net" r :test #'string=))))
            (is (eq 'yason:false (cdr (assoc "mempool" r :test #'string=)))))
          ;; exclude disables
-         (let ((r (bitcoin-lisp.rpc::rpc-logging node (list nil (list "net")))))
+         (let ((r (bl.rpc::rpc-logging node (list nil (list "net")))))
            (is (eq 'yason:false (cdr (assoc "net" r :test #'string=)))))
          ;; "all" enables every category
-         (let ((r (bitcoin-lisp.rpc::rpc-logging node (list (list "all") nil))))
+         (let ((r (bl.rpc::rpc-logging node (list (list "all") nil))))
            (is (every (lambda (pair) (eq t (cdr pair))) r)))
          ;; exclude "all" disables every category
-         (let ((r (bitcoin-lisp.rpc::rpc-logging node (list nil (list "all")))))
+         (let ((r (bl.rpc::rpc-logging node (list nil (list "all")))))
            (is (every (lambda (pair) (eq 'yason:false (cdr pair))) r)))
          ;; unknown category errors
-         (signals bitcoin-lisp.rpc::rpc-error
-           (bitcoin-lisp.rpc::rpc-logging node (list (list "boguscat") nil))))
-    (clrhash bitcoin-lisp::*debug-categories*)))
+         (signals bl.rpc::rpc-error
+           (bl.rpc::rpc-logging node (list (list "boguscat") nil))))
+    (clrhash bl::*debug-categories*)))
 
 (test log-cat-respects-category-state
   "log-cat emits a debug line only when its category is enabled (independent of
 the global level threshold)."
-  (clrhash bitcoin-lisp::*debug-categories*)
+  (clrhash bl::*debug-categories*)
   (unwind-protect
        (let ((s (make-string-output-stream)))
-         (let ((bitcoin-lisp::*log-stream* s)
-               (bitcoin-lisp::*current-log-level* :info))  ; debug normally hidden
-           (bitcoin-lisp:log-cat "net" "MARKER-DISABLED-~D" 1)   ; off -> nothing
-           (bitcoin-lisp::enable-log-category "net")
-           (bitcoin-lisp:log-cat "net" "MARKER-ENABLED-~D" 2)    ; on -> emitted
-           (bitcoin-lisp:log-cat "mempool" "MARKER-OTHER-~D" 3)) ; still off
+         (let ((bl::*log-stream* s)
+               (bl::*current-log-level* :info))  ; debug normally hidden
+           (bl:log-cat "net" "MARKER-DISABLED-~D" 1)   ; off -> nothing
+           (bl::enable-log-category "net")
+           (bl:log-cat "net" "MARKER-ENABLED-~D" 2)    ; on -> emitted
+           (bl:log-cat "mempool" "MARKER-OTHER-~D" 3)) ; still off
          (let ((out (get-output-stream-string s)))
            (is (null (search "MARKER-DISABLED" out)))
            (is (search "MARKER-ENABLED" out))
            (is (null (search "MARKER-OTHER" out)))))
-    (clrhash bitcoin-lisp::*debug-categories*)))
+    (clrhash bl::*debug-categories*)))
 
 ;;; --- Cluster mempool RPCs (P9: entry chunk fields, getmempoolcluster,
 ;;; getmempoolfeeratediagram — Core rpc/mempool.cpp:413-506/609-650/829-862) ---
@@ -5955,17 +5955,17 @@ the global level threshold)."
 diagram, over a CPFP pair that shares one chunk. Sizes are in vB (our
 txgraph unit; Core uses sigops-adjusted weight)."
   (let* ((node (make-test-node))
-         (mempool (bitcoin-lisp::node-mempool node))
+         (mempool (bl::node-mempool node))
          (parent (%mp-spending-tx (%txid-array 210) :vout 0 :value 50000000))
-         (pid (bitcoin-lisp.serialization:transaction-hash parent))
-         (pid-hex (bitcoin-lisp.rpc::hash-to-hex pid))
+         (pid (bl.ser:transaction-hash parent))
+         (pid-hex (bl.rpc::hash-to-hex pid))
          (child (%mp-spending-tx pid :vout 0 :value 40000000))
-         (cid (bitcoin-lisp.serialization:transaction-hash child))
-         (cid-hex (bitcoin-lisp.rpc::hash-to-hex cid))
-         (pvsize (bitcoin-lisp.serialization:transaction-vsize parent))
-         (cvsize (bitcoin-lisp.serialization:transaction-vsize child)))
+         (cid (bl.ser:transaction-hash child))
+         (cid-hex (bl.rpc::hash-to-hex cid))
+         (pvsize (bl.ser:transaction-vsize parent))
+         (cvsize (bl.ser:transaction-vsize child)))
     ;; Empty mempool: the diagram is just the (0, 0) origin.
-    (let ((r (bitcoin-lisp.rpc::rpc-getmempoolfeeratediagram node nil)))
+    (let ((r (bl.rpc::rpc-getmempoolfeeratediagram node nil)))
       (is (= 1 (length r)))
       (is (= 0 (cdr (assoc "weight" (first r) :test #'string=))))
       (is (zerop (cdr (assoc "fee" (first r) :test #'string=)))))
@@ -5973,12 +5973,12 @@ txgraph unit; Core uses sigops-adjusted weight)."
     (%add-tx mempool parent :fee 100)
     (%add-tx mempool child :fee 20000)
     ;; getmempoolentry chunk fields (fees.chunk in BTC, chunkweight in vB).
-    (let* ((r (bitcoin-lisp.rpc::rpc-getmempoolentry node (list pid-hex)))
+    (let* ((r (bl.rpc::rpc-getmempoolentry node (list pid-hex)))
            (fees (cdr (assoc "fees" r :test #'string=))))
       (is (= (+ pvsize cvsize) (cdr (assoc "chunkweight" r :test #'string=))))
       (is (= 20100 (round (* 100000000 (cdr (assoc "chunk" fees :test #'string=)))))))
     ;; getmempoolcluster: one cluster, one chunk, txs in mining order.
-    (let* ((r (bitcoin-lisp.rpc::rpc-getmempoolcluster node (list cid-hex)))
+    (let* ((r (bl.rpc::rpc-getmempoolcluster node (list cid-hex)))
            (chunks (cdr (assoc "chunks" r :test #'string=))))
       (is (= 2 (cdr (assoc "txcount" r :test #'string=))))
       (is (= (+ pvsize cvsize) (cdr (assoc "clusterweight" r :test #'string=))))
@@ -5988,35 +5988,35 @@ txgraph unit; Core uses sigops-adjusted weight)."
         (is (= (+ pvsize cvsize) (cdr (assoc "chunkweight" chunk :test #'string=))))
         (is (equal (list pid-hex cid-hex) (cdr (assoc "txs" chunk :test #'string=))))))
     ;; The diagram now has the origin plus one cumulative chunk point.
-    (let ((r (bitcoin-lisp.rpc::rpc-getmempoolfeeratediagram node nil)))
+    (let ((r (bl.rpc::rpc-getmempoolfeeratediagram node nil)))
       (is (= 2 (length r)))
       (is (= (+ pvsize cvsize) (cdr (assoc "weight" (second r) :test #'string=))))
       (is (= 20100 (round (* 100000000 (cdr (assoc "fee" (second r) :test #'string=)))))))
     ;; A standalone lower-feerate tx appends a second, later diagram point.
     (let ((solo (make-mempool-test-tx :input-id 211)))
       (%add-tx mempool solo :fee 50)
-      (let ((r (bitcoin-lisp.rpc::rpc-getmempoolfeeratediagram node nil)))
+      (let ((r (bl.rpc::rpc-getmempoolfeeratediagram node nil)))
         (is (= 3 (length r)))
         (is (= 20150 (round (* 100000000 (cdr (assoc "fee" (third r) :test #'string=))))))))
     ;; getmempoolcluster on an absent txid errors like getmempoolentry.
     (signals error
-      (bitcoin-lisp.rpc::rpc-getmempoolcluster
-       node (list (bitcoin-lisp.rpc::hash-to-hex (%txid-array 212)))))))
+      (bl.rpc::rpc-getmempoolcluster
+       node (list (bl.rpc::hash-to-hex (%txid-array 212)))))))
 
 (test rpc-mempool-cluster-two-chunks
   "A cluster whose child does NOT absorb its parent reports two chunks in
 mining order (parent's first)."
   (let* ((node (make-test-node))
-         (mempool (bitcoin-lisp::node-mempool node))
+         (mempool (bl::node-mempool node))
          (parent (%mp-spending-tx (%txid-array 213) :vout 0 :value 50000000))
-         (pid (bitcoin-lisp.serialization:transaction-hash parent))
-         (pid-hex (bitcoin-lisp.rpc::hash-to-hex pid))
+         (pid (bl.ser:transaction-hash parent))
+         (pid-hex (bl.rpc::hash-to-hex pid))
          (child (%mp-spending-tx pid :vout 0 :value 40000000))
-         (cid-hex (bitcoin-lisp.rpc::hash-to-hex
-                   (bitcoin-lisp.serialization:transaction-hash child))))
+         (cid-hex (bl.rpc::hash-to-hex
+                   (bl.ser:transaction-hash child))))
     (%add-tx mempool parent :fee 20000)
     (%add-tx mempool child :fee 100)
-    (let* ((r (bitcoin-lisp.rpc::rpc-getmempoolcluster node (list pid-hex)))
+    (let* ((r (bl.rpc::rpc-getmempoolcluster node (list pid-hex)))
            (chunks (cdr (assoc "chunks" r :test #'string=))))
       (is (= 2 (length chunks)))
       (is (equal (list pid-hex) (cdr (assoc "txs" (first chunks) :test #'string=))))
@@ -6055,28 +6055,28 @@ structural."
     (let* ((node (make-test-node))
            (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
            (genesis (first entries))
-           (genesis-hex (bitcoin-lisp.rpc::hash-to-hex
-                         (bitcoin-lisp.storage:block-index-entry-hash genesis)))
+           (genesis-hex (bl.rpc::hash-to-hex
+                         (bl.store:block-index-entry-hash genesis)))
            ;; A competing block at height 1, off the active chain.
-           (fork-header (bitcoin-lisp.serialization:make-block-header
+           (fork-header (bl.ser:make-block-header
                          :version 1
-                         :prev-block (bitcoin-lisp.storage:block-index-entry-hash genesis)
+                         :prev-block (bl.store:block-index-entry-hash genesis)
                          :merkle-root (make-32-byte-hash 99)
                          :timestamp 1700000500 :bits #x1d00ffff :nonce 4242))
-           (fork-hash (bitcoin-lisp.serialization:block-header-hash fork-header))
-           (fork-hex (bitcoin-lisp.rpc::hash-to-hex fork-hash)))
-      (setf (bitcoin-lisp::node-chain-state node) cs)
-      (bitcoin-lisp.storage:add-block-index-entry
-       cs (bitcoin-lisp.storage:make-block-index-entry
+           (fork-hash (bl.ser:block-header-hash fork-header))
+           (fork-hex (bl.rpc::hash-to-hex fork-hash)))
+      (setf (bl::node-chain-state node) cs)
+      (bl.store:add-block-index-entry
+       cs (bl.store:make-block-index-entry
            :hash fork-hash :height 1 :header fork-header
            :prev-entry genesis :chain-work 2 :status :valid))
       ;; The fork block really is known to the index but not on the active
       ;; chain — otherwise the assertions below would pass for the wrong reason.
-      (is-true (bitcoin-lisp.storage:get-block-index-entry cs fork-hash))
-      (is-false (bitcoin-lisp.storage:entry-on-active-chain-p
-                 cs (bitcoin-lisp.storage:get-block-index-entry cs fork-hash)))
+      (is-true (bl.store:get-block-index-entry cs fork-hash))
+      (is-false (bl.store:entry-on-active-chain-p
+                 cs (bl.store:get-block-index-entry cs fork-hash)))
       (flet ((rest-get (hex ext)
-               (bitcoin-lisp.rpc::rest-handle
+               (bl.rpc::rest-handle
                 node (format nil "/rest/headers/~A.~A" hex ext))))
         (%with-rest-count ("3")
           ;; Fork start: empty, in every representation. Before the fix this
@@ -6104,35 +6104,35 @@ structural."
 (test rest-health-decision-logic
   "health-ok-p feeds /rest/health: HTTP 200 only when the sync thread is alive
 AND the tip advanced within the staleness threshold; HTTP 503 otherwise."
-  (let ((threshold bitcoin-lisp::*health-max-tip-staleness-seconds*))
+  (let ((threshold bl::*health-max-tip-staleness-seconds*))
     ;; Alive + recent tip -> healthy (HTTP 200).
-    (is-true (bitcoin-lisp::health-ok-p t 5))
-    (is-true (bitcoin-lisp::health-ok-p t 0))
+    (is-true (bl::health-ok-p t 5))
+    (is-true (bl::health-ok-p t 0))
     ;; Boundary: exactly at the threshold is still healthy (<=).
-    (is-true (bitcoin-lisp::health-ok-p t threshold))
+    (is-true (bl::health-ok-p t threshold))
     ;; Stale tip -> unhealthy (HTTP 503) even though the thread is alive.
-    (is-false (bitcoin-lisp::health-ok-p t (1+ threshold)))
-    (is-false (bitcoin-lisp::health-ok-p t (* threshold 100)))
+    (is-false (bl::health-ok-p t (1+ threshold)))
+    (is-false (bl::health-ok-p t (* threshold 100)))
     ;; Dead / absent sync thread -> unhealthy regardless of tip recency.
-    (is-false (bitcoin-lisp::health-ok-p nil 5))
-    (is-false (bitcoin-lisp::health-ok-p nil (1+ threshold)))
+    (is-false (bl::health-ok-p nil 5))
+    (is-false (bl::health-ok-p nil (1+ threshold)))
     ;; An explicit THRESHOLD argument is honored.
-    (is-true (bitcoin-lisp::health-ok-p t 30 60))
-    (is-false (bitcoin-lisp::health-ok-p t 90 60))))
+    (is-true (bl::health-ok-p t 30 60))
+    (is-false (bl::health-ok-p t 90 60))))
 
 (test rest-health-liveness-report
   "node-tip-liveness on a fresh, unstarted node: no sync thread -> unhealthy,
 and a never-advanced tip reads as a large seconds-since-tip."
-  (let ((node (bitcoin-lisp::make-node :network :testnet4)))
+  (let ((node (bl::make-node :network :testnet4)))
     (multiple-value-bind (healthy seconds synced)
-        (bitcoin-lisp::node-tip-liveness node)
+        (bl::node-tip-liveness node)
       (declare (ignore synced))
       ;; No sync thread has been started, so the probe reports unhealthy.
       (is-false healthy)
       ;; The tip has never advanced (last-tip-advance-time = 0), so
       ;; seconds-since-tip is well past the staleness threshold.
       (is (integerp seconds))
-      (is (>= seconds bitcoin-lisp::*health-max-tip-staleness-seconds*)))))
+      (is (>= seconds bl::*health-max-tip-staleness-seconds*)))))
 
 ;;;; ---------------------------------------------------------------------
 ;;;; JSON-RPC reply shape by request version (GA8 wave 6, item 1)
@@ -6152,11 +6152,11 @@ and a never-advanced tip reads as a large seconds-since-tip."
 (defun call-with-jsonrpc-shape-method (thunk)
   "Register an always-succeeding dispatch target, run THUNK, then remove it so
 the global method registry (which the /ui help test enumerates) is unchanged."
-  (bitcoin-lisp.rpc::register-rpc-method
+  (bl.rpc::register-rpc-method
    *jsonrpc-shape-method*
    (lambda (node params) (declare (ignore node params)) 42))
   (unwind-protect (funcall thunk)
-    (remhash *jsonrpc-shape-method* bitcoin-lisp.rpc::*rpc-methods*)))
+    (remhash *jsonrpc-shape-method* bl.rpc::*rpc-methods*)))
 
 (defmacro with-jsonrpc-shape-method (&body body)
   `(call-with-jsonrpc-shape-method (lambda () ,@body)))
@@ -6173,12 +6173,12 @@ handle-single-request -> yason:encode) and return (values parsed-reply
 json-text). Returns (values :no-reply nil) for a 2.0 notification, which
 rpc-handler answers with HTTP 204 and no body."
   (multiple-value-bind (kind method params id version id-present)
-      (bitcoin-lisp.rpc::parse-json-rpc-request body)
+      (bl.rpc::parse-json-rpc-request body)
     (unless (eq kind :single)
       (error "jsonrpc-shape-reply: expected a single request, got ~S" kind))
     (if (and (eq version :v2) (not id-present))
         (values :no-reply nil)
-        (let* ((response (bitcoin-lisp.rpc::handle-single-request
+        (let* ((response (bl.rpc::handle-single-request
                           nil method params id version :id-present id-present))
                (json (with-output-to-string (s) (yason:encode response s))))
           (values (yason:parse json) json)))))
@@ -6236,7 +6236,7 @@ response[\"error\"] must EXIST and be null on success."
           (let ((err (gethash "error" reply)))
             (is (hash-table-p err) "expected an error object, got ~S" err)
             (when (hash-table-p err)
-              (is (eql bitcoin-lisp.rpc::+rpc-method-not-found+
+              (is (eql bl.rpc::+rpc-method-not-found+
                        (gethash "code" err)))
               (is (equal "Method not found" (gethash "message" err)))))
           (is (eql 7 (gethash "id" reply))))))))
@@ -6311,7 +6311,7 @@ a 2.0 member gets the strict shape, a 2.0 notification contributes no reply at
 all (:207-209), and a 1.x member without an id gets a reply with no \"id\"."
   (with-jsonrpc-shape-method
     (multiple-value-bind (kind requests)
-        (bitcoin-lisp.rpc::parse-json-rpc-request
+        (bl.rpc::parse-json-rpc-request
          (format nil "[{\"jsonrpc\":\"1.0\",\"method\":\"~A\",\"id\":1},~
                        {\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"id\":2},~
                        {\"jsonrpc\":\"2.0\",\"method\":\"~A\"},~
@@ -6319,7 +6319,7 @@ all (:207-209), and a 1.x member without an id gets a reply with no \"id\"."
                  *jsonrpc-shape-method* *jsonrpc-shape-method*
                  *jsonrpc-shape-method* *jsonrpc-shape-method*))
       (is (eq :batch kind))
-      (let ((replies (bitcoin-lisp.rpc::handle-batch-request nil requests)))
+      (let ((replies (bl.rpc::handle-batch-request nil requests)))
         (is (= 3 (length replies))
             "the 2.0 notification must contribute no reply; got ~S replies"
             (length replies))
@@ -6342,8 +6342,8 @@ all (:207-209), and a 1.x member without an id gets a reply with no \"id\"."
 and the HTTP-level refusals rpc-json-error builds — take Core's default
 V1_LEGACY/null-id JSONRPCRequest (httprpc.cpp:41-59, request.h:55,63), so they
 carry result+error and no \"jsonrpc\"."
-  (let* ((response (bitcoin-lisp.rpc::make-rpc-error-response
-                    bitcoin-lisp.rpc::+rpc-parse-error+ "Parse error" nil :v1))
+  (let* ((response (bl.rpc::make-rpc-error-response
+                    bl.rpc::+rpc-parse-error+ "Parse error" nil :v1))
          (json (with-output-to-string (s) (yason:encode response s)))
          (reply (yason:parse json)))
     (is-false (jsonrpc-shape-key-present-p reply "jsonrpc") "~A" json)
@@ -6354,7 +6354,7 @@ carry result+error and no \"jsonrpc\"."
     (let ((err (gethash "error" reply)))
       (is (hash-table-p err))
       (when (hash-table-p err)
-        (is (eql bitcoin-lisp.rpc::+rpc-parse-error+ (gethash "code" err)))))))
+        (is (eql bl.rpc::+rpc-parse-error+ (gethash "code" err)))))))
 
 ;;;; ---------------------------------------------------------------------
 ;;;; The same rules, asserted at the HTTP HANDLER — the call site the bug
@@ -6413,15 +6413,15 @@ everything a method itself signals.")
 (defun call-with-jsonrpc-handler-methods (thunk)
   "Register the handler tests' throwaway dispatch targets, run THUNK, then
 remove them so the global method registry is unchanged."
-  (bitcoin-lisp.rpc::register-rpc-method
+  (bl.rpc::register-rpc-method
    *jsonrpc-shape-method*
    (lambda (node params) (declare (ignore node params)) 42))
-  (bitcoin-lisp.rpc::register-rpc-method
+  (bl.rpc::register-rpc-method
    *jsonrpc-handler-dotted-method*
    (lambda (node params) (declare (ignore node params)) (cons 1 2)))
   (unwind-protect (funcall thunk)
-    (remhash *jsonrpc-shape-method* bitcoin-lisp.rpc::*rpc-methods*)
-    (remhash *jsonrpc-handler-dotted-method* bitcoin-lisp.rpc::*rpc-methods*)))
+    (remhash *jsonrpc-shape-method* bl.rpc::*rpc-methods*)
+    (remhash *jsonrpc-handler-dotted-method* bl.rpc::*rpc-methods*)))
 
 (defmacro with-jsonrpc-handler-methods (&body body)
   `(call-with-jsonrpc-handler-methods (lambda () ,@body)))
@@ -6477,21 +6477,21 @@ the client presents (see jsonrpc-handler-request). RATE-LIMITER, when given as
          (request-args (loop for (k v) on request-args by #'cddr
                              unless (eq k :rate-limiter)
                                append (list k v)))
-         (bitcoin-lisp.rpc::*rpc-credentials*
+         (bl.rpc::*rpc-credentials*
            (%plaintext-credentials *jsonrpc-handler-rpc-user*
                                    *jsonrpc-handler-rpc-password*))
          ;; A server that never went through start-node is in WARMUP by
          ;; default, and would answer -28 to everything. These tests are about
          ;; what a READY node replies.
-         (bitcoin-lisp.rpc::*rpc-warmup-status* nil)
+         (bl.rpc::*rpc-warmup-status* nil)
          (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
          (hunchentoot:*request* (apply #'jsonrpc-handler-request body request-args))
-         (bitcoin-lisp.rpc::*rpc-node* nil)
-         (bitcoin-lisp.rpc::*rpc-rate-limiter* rate-limiter))
+         (bl.rpc::*rpc-node* nil)
+         (bl.rpc::*rpc-rate-limiter* rate-limiter))
     ;; A fresh reply starts at 200; reset explicitly so a request-construction
     ;; hiccup could not pre-seed the status the assertions read back.
     (setf (hunchentoot:return-code*) hunchentoot:+http-ok+)
-    (let ((out (bitcoin-lisp.rpc::rpc-handler)))
+    (let ((out (bl.rpc::rpc-handler)))
       (values (hunchentoot:return-code*) out (hunchentoot:content-type*)))))
 
 (defun jsonrpc-handler-check (body expected-status expected-json &rest request-args)
@@ -6539,7 +6539,7 @@ wave repairs — changes these bytes."
          (format nil "{~A\"method\":\"ga8shapenosuchmethod\",\"id\":7}" version-member)
          404
          (format nil "{\"result\":null,\"error\":{\"code\":~D,\"message\":\"Method not found\"},\"id\":7}"
-                 bitcoin-lisp.rpc::+rpc-method-not-found+)))
+                 bl.rpc::+rpc-method-not-found+)))
       ;; --- 2.0 control: unchanged, and always HTTP 200 even for an error. ---
       (jsonrpc-handler-check
        (format nil "{\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"params\":[],\"id\":7}" echo)
@@ -6548,7 +6548,7 @@ wave repairs — changes these bytes."
        "{\"jsonrpc\":\"2.0\",\"method\":\"ga8shapenosuchmethod\",\"id\":7}"
        200
        (format nil "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":~D,\"message\":\"Method not found\"},\"id\":7}"
-               bitcoin-lisp.rpc::+rpc-method-not-found+))
+               bl.rpc::+rpc-method-not-found+))
       ;; --- The reply is the same on a /wallet/<name> endpoint. ---
       (jsonrpc-handler-check
        (format nil "{\"method\":\"~A\",\"id\":7}" echo)
@@ -6591,7 +6591,7 @@ null, so the empty array has to be spelled #(). Batch replies are per member."
       (jsonrpc-handler-check
        "[7]" 200
        (format nil "[~A]"
-               (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-invalid-request+
+               (jsonrpc-legacy-error-json bl.rpc::+rpc-invalid-request+
                                           "Invalid request format"))))))
 
 (test jsonrpc-handler-pre-dispatch-errors-use-the-legacy-shape
@@ -6608,24 +6608,24 @@ content-type guard in that chain; see the last case."
     ;; Malformed JSON -> -32700, HTTP 500.
     (jsonrpc-handler-check
      "not valid json" 500
-     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-parse-error+ "Parse error"))
+     (jsonrpc-legacy-error-json bl.rpc::+rpc-parse-error+ "Parse error"))
     ;; Missing method -> -32600, HTTP 400. Note the request says 2.0 and still
     ;; gets the legacy shape: pre-dispatch failures carry no version (the
     ;; documented deviation from Core, which has already recorded V2 here).
     (jsonrpc-handler-check
      "{\"jsonrpc\":\"2.0\",\"id\":1}" 400
-     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-invalid-request+
+     (jsonrpc-legacy-error-json bl.rpc::+rpc-invalid-request+
                                 "Missing or invalid method"))
     ;; A result yason cannot encode reaches the handler's outermost clause.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-handler-dotted-method*)
      500
-     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-internal-error+ "Internal error"))
+     (jsonrpc-legacy-error-json bl.rpc::+rpc-internal-error+ "Internal error"))
     ;; Oversized body (Content-Length over the 32 MiB cap) -> 400.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 400
-     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+ "Request body too large")
-     :content-length (princ-to-string (1+ bitcoin-lisp:+max-rpc-body-size+)))
+     (jsonrpc-legacy-error-json bl.rpc::+rpc-misc-error+ "Request body too large")
+     :content-length (princ-to-string (1+ bl:+max-rpc-body-size+)))
     ;; A credential that does not match -> 401 with an empty body, decided
     ;; before the body is even looked at. This assertion is also what keeps
     ;; every other check in this section honest: they reach the paths they name
@@ -6639,7 +6639,7 @@ content-type guard in that chain; see the last case."
     ;; 401 here and this check would fail.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 403
-     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+
+     (jsonrpc-legacy-error-json bl.rpc::+rpc-misc-error+
                                 "Origin does not match Host")
      :auth nil
      :headers (list (cons :origin "http://evil.example")))
@@ -6651,9 +6651,9 @@ content-type guard in that chain; see the last case."
     ;; An exhausted bucket (rate 0, burst 0) with a BAD credential -> 429.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 429
-     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+ "Rate limit exceeded")
+     (jsonrpc-legacy-error-json bl.rpc::+rpc-misc-error+ "Rate limit exceeded")
      :auth (concatenate 'string *jsonrpc-handler-rpc-user* ":wrong")
-     :rate-limiter (bitcoin-lisp:make-rate-limiter 0 0))
+     :rate-limiter (bl:make-rate-limiter 0 0))
     ;; The same exhausted bucket with a VALID credential is served. This is the
     ;; check that would have caught the original placement: an authenticated
     ;; admin client was throttled at 100 requests/second, which is fewer than
@@ -6662,7 +6662,7 @@ content-type guard in that chain; see the last case."
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 200
      "{\"result\":42,\"error\":null,\"id\":1}"
-     :rate-limiter (bitcoin-lisp:make-rate-limiter 0 0))
+     :rate-limiter (bl:make-rate-limiter 0 0))
     ;; An unusual Content-Type is NOT a refusal. This used to assert 415 with a
     ;; comment claiming "Core answers 415 too" — Core's HTTPReq_JSONRPC
     ;; (httprpc.cpp:104-165) never inspects the request Content-Type at all,
@@ -6676,11 +6676,11 @@ content-type guard in that chain; see the last case."
   "rpc-json-error is the single builder behind those HTTP-level refusals: it
 sets the status and application/json, and its body is the V1_LEGACY shape."
   (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
-    (let ((json (bitcoin-lisp.rpc::rpc-json-error
-                 429 bitcoin-lisp.rpc::+rpc-misc-error+ "Rate limit exceeded")))
+    (let ((json (bl.rpc::rpc-json-error
+                 429 bl.rpc::+rpc-misc-error+ "Rate limit exceeded")))
       (is (eql 429 (hunchentoot:return-code*)))
       (is (equal "application/json" (hunchentoot:content-type*)))
-      (is (string= (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+
+      (is (string= (jsonrpc-legacy-error-json bl.rpc::+rpc-misc-error+
                                               "Rate limit exceeded")
                    json)
           "rpc-json-error body: ~S" json))))
@@ -6701,11 +6701,11 @@ Core's comparison of the claimed count against the block's own
 genuine root — if it ever stops doing so this test is no longer testing
 anything — and that the count comparison rejects it."
   (let* ((txids (%proof-hashes 4))
-         (real-root (bitcoin-lisp.validation:compute-merkle-root txids))
+         (real-root (bl.val:compute-merkle-root txids))
          ;; The two internal nodes of the real 4-leaf tree.
-         (a (bitcoin-lisp.crypto:hash256
+         (a (bl.crypto:hash256
              (concatenate '(vector (unsigned-byte 8)) (first txids) (second txids))))
-         (b (bitcoin-lisp.crypto:hash256
+         (b (bl.crypto:hash256
              (concatenate '(vector (unsigned-byte 8)) (third txids) (fourth txids)))))
     (multiple-value-bind (forged-root forged-matched)
         ;; Claim 2 transactions; hand over the internal nodes as if they were
@@ -6713,7 +6713,7 @@ anything — and that the count comparison rejects it."
         ;; matched, so all three bits are set (Core TraverseAndExtract reads a
         ;; bit per visited node, and at height 0 a set bit means a matched
         ;; leaf whose hash is consumed).
-        (bitcoin-lisp.rpc::extract-partial-merkle-tree 2 (list t t t) (list a b))
+        (bl.rpc::extract-partial-merkle-tree 2 (list t t t) (list a b))
       (is (equalp real-root forged-root)
           "the forged 2-tx proof must reproduce the REAL 4-tx root — that is
            what makes the root check useless here")
@@ -6732,11 +6732,11 @@ anything — and that the count comparison rejects it."
 transactions'): the count drives the tree shape, so it must be bounded first.
 MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT = 4000000 / 240 = 16666."
   (let ((h (first (%proof-hashes 1))))
-    (is-false (bitcoin-lisp.rpc::extract-partial-merkle-tree 16667 (list t) (list h))
+    (is-false (bl.rpc::extract-partial-merkle-tree 16667 (list t) (list h))
               "one over the cap must be refused")
     ;; And the cap must not reject a legitimate small proof.
     (multiple-value-bind (root matched)
-        (bitcoin-lisp.rpc::extract-partial-merkle-tree 1 (list t) (list h))
+        (bl.rpc::extract-partial-merkle-tree 1 (list t) (list h))
       (declare (ignore matched))
       (is (equalp h root) "a single-transaction proof still works"))))
 
@@ -6750,30 +6750,30 @@ external format is latin-1, while the configured password came from a config
 file read as UTF-8. For any non-ASCII byte the two disagree, so a correct
 non-ASCII -rpcpassword produced 401 forever, with nothing in the log to say the
 credential had been mangled rather than mistyped."
-  (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "üser" "pässwörd")))
-    (is-true (bitcoin-lisp.rpc::check-auth
+  (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "üser" "pässwörd")))
+    (is-true (bl.rpc::check-auth
               (%basic-auth-header-utf8 "üser:pässwörd"))
              "a UTF-8 credential that matches the configuration was refused")
     ;; A near miss is still refused — the fix must not have made it permissive.
-    (is-false (bitcoin-lisp.rpc::check-auth
+    (is-false (bl.rpc::check-auth
                (%basic-auth-header-utf8 "üser:pässwörX")))
     ;; And the latin-1 encoding of the same characters is a DIFFERENT byte
     ;; string, so it must not authorize.
-    (is-false (bitcoin-lisp.rpc::check-auth
+    (is-false (bl.rpc::check-auth
                (%basic-auth-header "üser:pässwörd")))))
 
 (test ascii-credentials-are-unchanged-by-the-byte-comparison
   "The byte comparison must be a strict generalization: every ASCII case that
 worked before still works, and every near miss is still refused."
-  (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
-    (is-true (bitcoin-lisp.rpc::check-auth "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
+  (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
+    (is-true (bl.rpc::check-auth "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
     ;; A password containing colons still splits on the FIRST colon.
-    (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "a:b:c")))
-      (is-true (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:a:b:c"))))
-    (is-false (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpas")))
-    (is-false (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuse:testpass")))
+    (let ((bl.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "a:b:c")))
+      (is-true (bl.rpc::check-auth (%basic-auth-header "testuser:a:b:c"))))
+    (is-false (bl.rpc::check-auth (%basic-auth-header "testuser:testpas")))
+    (is-false (bl.rpc::check-auth (%basic-auth-header "testuse:testpass")))
     ;; Length differences must not short-circuit: an empty password never matches.
-    (is-false (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:")))))
+    (is-false (bl.rpc::check-auth (%basic-auth-header "testuser:")))))
 
 (test the-rpc-server-does-not-inspect-the-request-content-type
   "Core's HTTPReq_JSONRPC (httprpc.cpp:104-165) never looks at the request's
@@ -6785,15 +6785,15 @@ refused by us and worked against Core.
 
 Driven through the live acceptor, because the whole point is what a real client
 on the wire gets back."
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
   (with-rpc-test-datadir (dir)
     (let ((port 19987)
           (node (make-test-node))
           (cookie nil))
-      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (setf (bl::node-data-directory node) dir)
       (unwind-protect
            (progn
-             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
+             (is (not (null (bl.rpc:start-rpc-server node :port port))))
              (setf cookie (alexandria:read-file-into-string
                            (merge-pathnames ".cookie" dir)))
              (let ((json "{\"method\":\"getblockcount\",\"id\":1}"))
@@ -6834,7 +6834,7 @@ on the wire gets back."
                        port "{\"method\":\"getblockcount\",\"id\":1}"
                        "application/x-www-form-urlencoded" "__cookie__:wrong")))
                (is (= 401 (%http-status r)))))
-        (bitcoin-lisp.rpc:stop-rpc-server)))))
+        (bl.rpc:stop-rpc-server)))))
 
 (test getdeploymentinfo-buried-active-is-reported-one-block-early
   "Core reports a buried softfork active from ONE BLOCK BELOW its activation
@@ -6847,10 +6847,10 @@ We compared the height directly, so for exactly one block we answered false
 where every Core node answers true. A one-block window is precisely the kind of
 divergence a conformance test catches and a human never does."
   (flet ((active (tip activation)
-           (cdr (assoc "active" (bitcoin-lisp.rpc::%buried-deployment activation tip)
+           (cdr (assoc "active" (bl.rpc::%buried-deployment activation tip)
                        :test #'string=))))
     ;; Two below: not yet.
-    (is (eq bitcoin-lisp.rpc::+json-false+ (active 498 500)))
+    (is (eq bl.rpc::+json-false+ (active 498 500)))
     ;; ONE below: Core says active. This is the case that was wrong.
     (is (eq t (active 499 500)))
     ;; At and above: active.
@@ -6872,7 +6872,7 @@ approximation."
   (flet ((call (method &rest kvs)
            (let ((h (make-hash-table :test 'equal)))
              (loop for (k v) on kvs by #'cddr do (setf (gethash k h) v))
-             (bitcoin-lisp.rpc::%named-params-to-positional method h))))
+             (bl.rpc::%named-params-to-positional method h))))
     ;; send: outputs is positional 0, options is positional 4.
     (let ((out (call "send" "outputs" 1 "fee_rate" 2 "add_to_wallet" 3)))
       (is (= 5 (length out)) "send produced ~D slots, wanted 5" (length out))
@@ -6887,4 +6887,4 @@ approximation."
       (is-true (hash-table-p (second out))
                "mempool_only did not reach the options slot: ~S" out))
     ;; A name that is neither positional nor a member is still unknown.
-    (signals bitcoin-lisp.rpc::rpc-error (call "send" "outputs" 1 "nonesuch" 2))))
+    (signals bl.rpc::rpc-error (call "send" "outputs" 1 "nonesuch" 2))))

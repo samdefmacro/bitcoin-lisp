@@ -117,7 +117,7 @@ when it has expired (Core CConnman::RecordBytesSent, net.cpp:3855-3872).
 
 Counts unconditionally, even with no target set, so that turning a target on
 does not start from a cycle that pretends nothing has been sent."
-  (let ((now (bitcoin-lisp.serialization:get-unix-time)))
+  (let ((now (bl.ser:get-unix-time)))
     (when (or (zerop *max-outbound-cycle-start*)
               (< (+ *max-outbound-cycle-start* +max-upload-timeframe-seconds+) now))
       (setf *max-outbound-cycle-start* now
@@ -130,7 +130,7 @@ GetMaxOutboundTimeLeftInCycle_)."
   (cond ((zerop *max-upload-target*) 0)
         ((zerop *max-outbound-cycle-start*) +max-upload-timeframe-seconds+)
         (t (max 0 (- (+ *max-outbound-cycle-start* +max-upload-timeframe-seconds+)
-                     (bitcoin-lisp.serialization:get-unix-time))))))
+                     (bl.ser:get-unix-time))))))
 
 (defun outbound-target-bytes-left ()
   "Bytes still available this cycle, 0 with no target (Core
@@ -171,7 +171,7 @@ in-flight socket reads.")
   *ibd-stop-requested*)
 
 ;;; This flag reaches layers that cannot see networking through
-;;; bitcoin-lisp:*interrupt-check* (config.lisp), installed by node.lisp — the
+;;; bl:*interrupt-check* (config.lisp), installed by node.lisp — the
 ;;; only file that also sees *shutdown-request*.
 
 (defun join-thread-or-destroy (thread &key (timeout 5) deadline)
@@ -245,7 +245,7 @@ so callers (including the v1-fallback re-dial in peer.lisp) re-dial through
 the right proxy transparently."
   (multiple-value-bind (proxy refusal) (proxy-for-target host)
     (when refusal
-      (bitcoin-lisp:log-debug "Not dialing ~A:~D: ~A" host port refusal)
+      (bl:log-debug "Not dialing ~A:~D: ~A" host port refusal)
       (return-from make-tcp-connection nil))
     (handler-case
       (let* ((socket (usocket:socket-connect (if proxy (proxy-host proxy) host)
@@ -261,7 +261,7 @@ the right proxy transparently."
                                     :username credentials :password credentials))
                   (socks5-connect socket host port))
             (error (e)
-              (bitcoin-lisp:log-debug "SOCKS5 connect to ~A:~D via ~A:~D failed: ~A"
+              (bl:log-debug "SOCKS5 connect to ~A:~D via ~A:~D failed: ~A"
                                       host port (proxy-host proxy) (proxy-port proxy) e)
               (ignore-errors (usocket:socket-close socket))
               (return-from make-tcp-connection nil))))
@@ -272,7 +272,7 @@ the right proxy transparently."
                          :host host
                          :port port
                          :connected t
-                         :last-activity (bitcoin-lisp.serialization:get-node-time)))
+                         :last-activity (bl.ser:get-node-time)))
       (usocket:socket-error (e)
         (declare (ignore e))
         nil)
@@ -321,7 +321,7 @@ error. The timeout lets the accept loop poll a shutdown flag between waits."
                                :host host
                                :port port
                                :connected t
-                               :last-activity (bitcoin-lisp.serialization:get-node-time))))))
+                               :last-activity (bl.ser:get-node-time))))))
     (error () nil)))
 
 (defun close-connection (conn)
@@ -407,8 +407,8 @@ full write through the stream."
   (incf (connection-bytes-sent conn) n)
   (incf *total-bytes-sent* n)
   (%record-outbound-cycle-bytes n)
-  (setf (connection-last-activity conn) (bitcoin-lisp.serialization:get-node-time)
-        (connection-last-send-time conn) (bitcoin-lisp.serialization:get-node-time)
+  (setf (connection-last-activity conn) (bl.ser:get-node-time)
+        (connection-last-send-time conn) (bl.ser:get-node-time)
         (connection-last-send-progress conn) (get-internal-real-time)))
 
 (defun %flush-send-queue-locked (conn)
@@ -737,7 +737,7 @@ healthy peers whenever a pump cycle ran long."
           ;; More bytes in hand than the caller now says it wants means two reads
           ;; got mixed — a framing bug here, not a peer fault.
           (when (> filled count)
-            (bitcoin-lisp:log-error
+            (bl:log-error
              "Receive state mismatch: ~D bytes in progress, asked for ~D — dropping connection"
              filled count)
             (return-from receive-bytes-resumable (%abandon-receive conn)))
@@ -786,8 +786,8 @@ healthy peers whenever a pump cycle ran long."
              ;; Read finished: clear the accumulator so the next one starts
              ;; clean. RECV-HEADER belongs to the caller's framing and is
              ;; cleared there, so %END-RECEIVE is not what we want here.
-             (setf (connection-last-activity conn) (bitcoin-lisp.serialization:get-node-time)
-                   (connection-last-recv-time conn) (bitcoin-lisp.serialization:get-node-time)
+             (setf (connection-last-activity conn) (bl.ser:get-node-time)
+                   (connection-last-recv-time conn) (bl.ser:get-node-time)
                    (connection-recv-buffer conn) nil
                    (connection-recv-filled conn) 0)
              buffer)
@@ -798,7 +798,7 @@ healthy peers whenever a pump cycle ran long."
     ;; once; say so instead of hiding it.
     (error (c)
       (when (%recv-error-diagnosable-p c)
-        (bitcoin-lisp:log-warn
+        (bl:log-warn
          "Receive failed on ~A:~D with a non-I/O error: ~A~@[~%Backtrace:~%~A~]"
          (connection-host conn) (connection-port conn) c backtrace))
       (%abandon-receive conn)))))

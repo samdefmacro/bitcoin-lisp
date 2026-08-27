@@ -131,7 +131,7 @@ file does not exist."
   (if (member (hunchentoot:request-method*) '(:get :head))
       (handler-case (ui-handle (hunchentoot:script-name*))
         (error (e)
-          (bitcoin-lisp::node-log :error "UI handler error: ~A" e)
+          (bl::node-log :error "UI handler error: ~A" e)
           (%ui-error 500 "Internal error")))
       (progn
         (setf (hunchentoot:return-code*) hunchentoot:+http-method-not-allowed+)
@@ -158,9 +158,9 @@ are logged and never signal: a headless box just keeps starting."
           (cond
             (command
              (uiop:launch-program command)
-             (bitcoin-lisp::node-log :info "Opened browser at ~A" url))
+             (bl::node-log :info "Opened browser at ~A" url))
             (t
-             (bitcoin-lisp::node-log
+             (bl::node-log
               :warn "No browser opener for this platform; web UI is at ~A" url))))
       (error (e)
-        (bitcoin-lisp::node-log :warn "Could not open browser at ~A: ~A" url e)))))
+        (bl::node-log :warn "Could not open browser at ~A: ~A" url e)))))

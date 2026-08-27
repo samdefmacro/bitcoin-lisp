@@ -37,8 +37,8 @@ blocks to rebuild an index would read the entire chain into memory."
                         :key-offset (flat-file-pos-pos pos))
             (handler-case
                 (let ((header (flexi-streams:with-input-from-sequence (hs bytes)
-                                (bitcoin-lisp.serialization::read-block-header hs))))
-                  (values header (bitcoin-lisp.crypto:hash256 bytes)))
+                                (bl.ser::read-block-header hs))))
+                  (values header (bl.crypto:hash256 bytes)))
               (error () nil))))))))
 
 (defun reindex-block-index (store chain-state)
@@ -72,7 +72,7 @@ parent lands, so file order does not matter."
             ;; (UpdateBlockInfo, blockstorage.cpp:923-940, called from
             ;; AcceptBlock's reindex branch, validation.cpp:4402-4403).
             (push (list hash header (cdr record))
-                  (gethash (bitcoin-lisp.serialization:block-header-prev-block header)
+                  (gethash (bl.ser:block-header-prev-block header)
                            pending))))))
     ;; Drain from every parent already in the index, adding children and then
     ;; their children. A queue rather than recursion: a chain is hundreds of
@@ -97,7 +97,7 @@ parent lands, so file order does not matter."
                                        :header header
                                        :prev-entry parent
                                        :chain-work (calculate-chain-work
-                                                    (bitcoin-lisp.serialization:block-header-bits
+                                                    (bl.ser:block-header-bits
                                                      header)
                                                     (block-index-entry-chain-work parent))
                                        ;; The body is on disk but nothing has

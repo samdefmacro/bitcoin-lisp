@@ -7,8 +7,8 @@
 (defun make-legacy-test-tx (&key (inputs 1) (outputs 1) (script-sig-size 10) (script-pubkey-size 25))
   "Create a legacy test transaction (no witness)."
   (let ((tx-inputs (loop for i below inputs
-                         collect (bitcoin-lisp.serialization:make-tx-in
-                                  :previous-output (bitcoin-lisp.serialization:make-outpoint
+                         collect (bl.ser:make-tx-in
+                                  :previous-output (bl.ser:make-outpoint
                                                     :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                       :initial-element (1+ i))
                                                     :index 0)
@@ -16,11 +16,11 @@
                                                           :initial-element #x00)
                                   :sequence #xFFFFFFFF)))
         (tx-outputs (loop for i below outputs
-                          collect (bitcoin-lisp.serialization:make-tx-out
+                          collect (bl.ser:make-tx-out
                                    :value 50000000
                                    :script-pubkey (make-array script-pubkey-size :element-type '(unsigned-byte 8)
                                                               :initial-element #x76)))))
-    (bitcoin-lisp.serialization:make-transaction
+    (bl.ser:make-transaction
      :version 1
      :inputs (coerce tx-inputs 'simple-vector)
      :outputs (coerce tx-outputs 'simple-vector)
@@ -30,8 +30,8 @@
                                (script-pubkey-size 25) (witness-item-size 72))
   "Create a witness test transaction."
   (let ((tx-inputs (loop for i below inputs
-                         collect (bitcoin-lisp.serialization:make-tx-in
-                                  :previous-output (bitcoin-lisp.serialization:make-outpoint
+                         collect (bl.ser:make-tx-in
+                                  :previous-output (bl.ser:make-outpoint
                                                     :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                       :initial-element (1+ i))
                                                     :index 0)
@@ -39,14 +39,14 @@
                                                           :initial-element #x00)
                                   :sequence #xFFFFFFFF)))
         (tx-outputs (loop for i below outputs
-                          collect (bitcoin-lisp.serialization:make-tx-out
+                          collect (bl.ser:make-tx-out
                                    :value 50000000
                                    :script-pubkey (make-array script-pubkey-size :element-type '(unsigned-byte 8)
                                                               :initial-element #x76))))
         (witness (loop for i below inputs
                        collect (list (make-array witness-item-size :element-type '(unsigned-byte 8)
                                                                    :initial-element #xAB)))))
-    (bitcoin-lisp.serialization:make-transaction
+    (bl.ser:make-transaction
      :version 1
      :inputs (coerce tx-inputs 'simple-vector)
      :outputs (coerce tx-outputs 'simple-vector)
@@ -58,27 +58,27 @@
 (test legacy-tx-weight-is-4x-size
   "Legacy transaction weight = serialized_size * 4."
   (let* ((tx (make-legacy-test-tx))
-         (size (length (bitcoin-lisp.serialization:serialize-transaction tx)))
-         (weight (bitcoin-lisp.serialization:transaction-weight tx)))
+         (size (length (bl.ser:serialize-transaction tx)))
+         (weight (bl.ser:transaction-weight tx)))
     (is (= weight (* 4 size)))))
 
 (test witness-tx-weight-formula
   "Witness transaction weight = 3 * base_size + total_size."
   (let* ((tx (make-witness-test-tx))
-         (base-size (length (bitcoin-lisp.serialization:serialize-transaction tx)))
-         (total-size (length (bitcoin-lisp.serialization:serialize-witness-transaction tx)))
-         (weight (bitcoin-lisp.serialization:transaction-weight tx)))
+         (base-size (length (bl.ser:serialize-transaction tx)))
+         (total-size (length (bl.ser:serialize-witness-transaction tx)))
+         (weight (bl.ser:transaction-weight tx)))
     (is (= weight (+ (* 3 base-size) total-size)))))
 
 (test weight-vsize-relationship
   "Weight = vsize * 4 for legacy; weight <= vsize * 4 for witness (due to ceiling)."
   (let* ((legacy-tx (make-legacy-test-tx))
-         (legacy-weight (bitcoin-lisp.serialization:transaction-weight legacy-tx))
-         (legacy-vsize (bitcoin-lisp.serialization:transaction-vsize legacy-tx)))
+         (legacy-weight (bl.ser:transaction-weight legacy-tx))
+         (legacy-vsize (bl.ser:transaction-vsize legacy-tx)))
     (is (= legacy-weight (* 4 legacy-vsize))))
   (let* ((witness-tx (make-witness-test-tx))
-         (witness-weight (bitcoin-lisp.serialization:transaction-weight witness-tx))
-         (witness-vsize (bitcoin-lisp.serialization:transaction-vsize witness-tx)))
+         (witness-weight (bl.ser:transaction-weight witness-tx))
+         (witness-vsize (bl.ser:transaction-vsize witness-tx)))
     ;; vsize = ceiling(weight / 4), so weight <= vsize * 4
     (is (<= witness-weight (* 4 witness-vsize)))
     ;; and vsize = ceiling(weight/4)
@@ -87,8 +87,8 @@
 (test witness-discount
   "Witness data should make weight less than 4x total_size."
   (let* ((tx (make-witness-test-tx))
-         (total-size (length (bitcoin-lisp.serialization:serialize-witness-transaction tx)))
-         (weight (bitcoin-lisp.serialization:transaction-weight tx)))
+         (total-size (length (bl.ser:serialize-witness-transaction tx)))
+         (weight (bl.ser:transaction-weight tx)))
     ;; Weight should be less than 4 * total_size because witness gets discount
     (is (< weight (* 4 total-size)))))
 
@@ -109,10 +109,10 @@ pinned in place by a test that agreed with it."
          (tx2 (make-legacy-test-tx :inputs 2 :outputs 2))
          (tx3 (make-witness-test-tx :inputs 1 :outputs 1))
          (transactions (list tx1 tx2 tx3))
-         (sum (+ (bitcoin-lisp.serialization:transaction-weight tx1)
-                 (bitcoin-lisp.serialization:transaction-weight tx2)
-                 (bitcoin-lisp.serialization:transaction-weight tx3)))
-         (actual (bitcoin-lisp.validation:calculate-block-weight transactions)))
+         (sum (+ (bl.ser:transaction-weight tx1)
+                 (bl.ser:transaction-weight tx2)
+                 (bl.ser:transaction-weight tx3)))
+         (actual (bl.val:calculate-block-weight transactions)))
     (is (= (+ (* 4 (+ 80 1)) sum) actual)
         "3 transactions: prefix is 4*(80+1) = 324 weight units")
     (is (> actual sum)
@@ -125,9 +125,9 @@ pinned in place by a test that agreed with it."
 324 -> 332. Tested because the two magnitudes are the whole content of the bug
 and a fix that hard-coded 324 would look right on every small block."
   (let* ((tx (make-legacy-test-tx :inputs 1 :outputs 1))
-         (w (bitcoin-lisp.serialization:transaction-weight tx)))
+         (w (bl.ser:transaction-weight tx)))
     (flet ((prefix (n)
-             (- (bitcoin-lisp.validation:calculate-block-weight
+             (- (bl.val:calculate-block-weight
                  (make-list n :initial-element tx))
                 (* n w))))
       (is (= 324 (prefix 252)) "252 txs: 1-byte varint")
@@ -136,17 +136,17 @@ and a fix that hard-coded 324 would look right on every small block."
 (test empty-block-weight-is-the-prefix-alone
   "An empty transaction list still serializes as header + a zero varint, so its
 weight is 4*(80+1) = 324, not 0. The old test asserted 0."
-  (is (= 324 (bitcoin-lisp.validation:calculate-block-weight '()))))
+  (is (= 324 (bl.val:calculate-block-weight '()))))
 
 ;;; Task 4.3: Integration tests for block weight limit
 
 (test block-within-weight-limit-accepted
   "Block within +max-block-weight+ should pass weight validation."
   (let* ((tx (make-legacy-test-tx))
-         (weight (bitcoin-lisp.validation:calculate-block-weight (list tx))))
+         (weight (bl.val:calculate-block-weight (list tx))))
     ;; A single small tx is well under 4M weight units
-    (is (< weight bitcoin-lisp.validation:+max-block-weight+))))
+    (is (< weight bl.val:+max-block-weight+))))
 
 (test max-block-weight-constant
   "Max block weight constant is 4,000,000."
-  (is (= 4000000 bitcoin-lisp.validation:+max-block-weight+)))
+  (is (= 4000000 bl.val:+max-block-weight+)))

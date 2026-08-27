@@ -72,7 +72,7 @@
 
 (defun compute-checksum (payload)
   "Compute message checksum (first 4 bytes of Hash256)."
-  (let ((hash (bitcoin-lisp.crypto:hash256 payload)))
+  (let ((hash (bl.crypto:hash256 payload)))
     (subseq hash 0 4)))
 
 (defun read-message-header (stream)
@@ -352,16 +352,16 @@ wallet's creation-version record all derive from it.")
           +client-version-build+))
 
 (defun format-user-agent (comments)
-  "BIP14 subversion \"/bitcoin-lisp:<version>(c1; c2)/\" (Core FormatSubVersion,
+  "BIP14 subversion \"/bl:<version>(c1; c2)/\" (Core FormatSubVersion,
 clientversion.cpp:67-72), with no parenthesised block when COMMENTS is empty."
   (if comments
-      (format nil "/bitcoin-lisp:~A(~{~A~^; ~})/" (client-version-string) comments)
-      (format nil "/bitcoin-lisp:~A/" (client-version-string))))
+      (format nil "/bl:~A(~{~A~^; ~})/" (client-version-string) comments)
+      (format nil "/bl:~A/" (client-version-string))))
 
 (defvar *user-agent* (format-user-agent nil)
   "The BIP14 subversion string this node advertises (Core strSubVersion,
 init.cpp:1683 FormatSubVersion). -uacomment appends sanitized comments:
-\"/bitcoin-lisp:<version>(comment1; comment2)/\".")
+\"/bl:<version>(comment1; comment2)/\".")
 
 (defparameter *build-git-rev* "unknown"
   "Short git revision of the running build. The launcher (scripts/run-node.sh)
@@ -389,9 +389,9 @@ one, prepended as its leading \"g<rev>\" comment — the one place that rule liv
 
 (defun stamp-build-git-rev (rev)
   "Record REV as the running build's git revision and fold it into *user-agent*
-as a leading BIP14 comment (\"/bitcoin-lisp:0.1.0(g<rev>)/\"). The launcher
+as a leading BIP14 comment (\"/bl:0.1.0(g<rev>)/\"). The launcher
 calls this once, after load and before start-node. A NIL, empty, or \"unknown\"
-REV leaves the plain \"/bitcoin-lisp:0.1.0/\" subversion. Assumes no -uacomment
+REV leaves the plain \"/bl:0.1.0/\" subversion. Assumes no -uacomment
 is in play (the supervisor path); config parsing of -uacomment re-derives
 *user-agent* via FORMAT-SUBVERSION, which also folds in the stamped rev."
   (when (and rev (plusp (length rev)) (not (string= rev "unknown")))
@@ -737,12 +737,12 @@ the header bytes and the nonce. Version 2, so the ids are over WTXIDs (BIP152
          ;; different SipHash keys for the same header.
          (header-bytes (serialize-block-header header)))
     (multiple-value-bind (k0 k1)
-        (bitcoin-lisp.crypto:compute-siphash-key header-bytes nonce)
+        (bl.crypto:compute-siphash-key header-bytes nonce)
       (make-compact-block
        :header header
        :nonce nonce
        :short-ids (loop for tx in (rest txs)
-                        collect (bitcoin-lisp.crypto:compute-short-txid
+                        collect (bl.crypto:compute-short-txid
                                  k0 k1 (transaction-wtxid tx)))
        ;; Core prefills the coinbase only: a peer's mempool never holds it, so
        ;; without it every reconstruction would need a getblocktxn round trip.

@@ -21,13 +21,13 @@
 
 ;;;; Helpers
 
-(defun %shp-hash (tx) (bitcoin-lisp.serialization:transaction-hash tx))
+(defun %shp-hash (tx) (bl.ser:transaction-hash tx))
 
-(defun %shp-graph (mempool) (bitcoin-lisp.mempool:mempool-graph mempool))
+(defun %shp-graph (mempool) (bl.mp:mempool-graph mempool))
 
 (defun %shp-handle (mempool txid)
-  (bitcoin-lisp.mempool:mempool-entry-graph-handle
-   (bitcoin-lisp.mempool:mempool-get mempool txid)))
+  (bl.mp:mempool-entry-graph-handle
+   (bl.mp:mempool-get mempool txid)))
 
 (defun %shp-outpoint-hash (n)
   "A 32-byte outpoint hash derived from integer N (supports N > 255)."
@@ -45,18 +45,18 @@
 
 (defun %shp-tx (outpoints &key (value 40000000))
   "A tx spending OUTPOINTS, a list of (hash . index) conses."
-  (bitcoin-lisp.serialization:make-transaction
+  (bl.ser:make-transaction
    :version 1
    :inputs (map 'vector
                 (lambda (op)
-                  (bitcoin-lisp.serialization:make-tx-in
-                   :previous-output (bitcoin-lisp.serialization:make-outpoint
+                  (bl.ser:make-tx-in
+                   :previous-output (bl.ser:make-outpoint
                                      :hash (car op) :index (cdr op))
                    :script-sig (make-array 10 :element-type '(unsigned-byte 8)
                                               :initial-element 0)
                    :sequence #xFFFFFFFF))
                 outpoints)
-   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bl.ser:make-tx-out
                      :value value :script-pubkey (%shp-spk)))
    :lock-time 0))
 
@@ -65,14 +65,14 @@
   (%shp-tx (list (cons (%shp-outpoint-hash n) 0)) :value value))
 
 (defun %shp-add (mempool tx &key (fee 10000))
-  (bitcoin-lisp.mempool:mempool-add
+  (bl.mp:mempool-add
    mempool (%shp-hash tx)
-   (bitcoin-lisp.mempool:make-entry-from-tx tx fee 0 :entry-time 1000000)))
+   (bl.mp:make-entry-from-tx tx fee 0 :entry-time 1000000)))
 
 (defun %shp-block (txs)
   "A block containing TXS, sufficient for mempool-remove-for-block."
-  (bitcoin-lisp.serialization:make-bitcoin-block
-   :header (bitcoin-lisp.serialization:make-block-header
+  (bl.ser:make-bitcoin-block
+   :header (bl.ser:make-block-header
             :version 1
             :prev-block (make-array 32 :element-type '(unsigned-byte 8)
                                        :initial-element 0)
@@ -83,7 +83,7 @@
 
 (defun %shp-verify (mempool)
   "Run the full shadow verification directly; T if it did not error."
-  (bitcoin-lisp.mempool::%mempool-graph-verify mempool)
+  (bl.mp::%mempool-graph-verify mempool)
   t)
 
 (defun %shp-equiv-p (mempool txid)
@@ -92,19 +92,19 @@ independently of the mempool's own shadow asserts."
   (let* ((graph (%shp-graph mempool))
          (handle (%shp-handle mempool txid)))
     (flet ((graph-txids (handles)
-             (sort (mapcar #'bitcoin-lisp.mempool:tx-handle-data handles)
+             (sort (mapcar #'bl.mp:tx-handle-data handles)
                    #'%shp-txid<))
            (bfs-txids (set)
              (let ((ids (list txid)))
                (maphash (lambda (k v) (declare (ignore v)) (push k ids)) set)
                (sort ids #'%shp-txid<))))
-      (and (equalp (graph-txids (bitcoin-lisp.mempool:txgraph-get-ancestors
+      (and (equalp (graph-txids (bl.mp:txgraph-get-ancestors
                                  graph handle))
-                   (bfs-txids (bitcoin-lisp.mempool:mempool-ancestors
+                   (bfs-txids (bl.mp:mempool-ancestors
                                mempool txid)))
-           (equalp (graph-txids (bitcoin-lisp.mempool:txgraph-get-descendants
+           (equalp (graph-txids (bl.mp:txgraph-get-descendants
                                  graph handle))
-                   (bfs-txids (bitcoin-lisp.mempool:mempool-descendants
+                   (bfs-txids (bl.mp:mempool-descendants
                                mempool txid)))))))
 
 (defun %shp-txid< (a b)
@@ -118,30 +118,30 @@ independently of the mempool's own shadow asserts."
 (test shadow-add-builds-clusters
   "Adds mirror into the graph: handles live, dependencies wired, clusters
 formed."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+  (let* ((mempool (bl.mp:make-mempool))
          (graph (%shp-graph mempool))
          (a (%shp-root-tx 1))
          (b (%shp-tx (list (cons (%shp-hash a) 0))))
          (c (%shp-tx (list (cons (%shp-hash b) 0))))
          (lone (%shp-root-tx 2)))
     (is (eq :ok (%shp-add mempool a)))
-    (is (= 1 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
-    (is (bitcoin-lisp.mempool:txgraph-exists-p
+    (is (= 1 (bl.mp:txgraph-tx-count graph)))
+    (is (bl.mp:txgraph-exists-p
          graph (%shp-handle mempool (%shp-hash a))))
     (is (equalp (%shp-hash a)
-                (bitcoin-lisp.mempool:tx-handle-data
+                (bl.mp:tx-handle-data
                  (%shp-handle mempool (%shp-hash a)))))
     (is (eq :ok (%shp-add mempool b)))
     (is (eq :ok (%shp-add mempool c)))
     (is (eq :ok (%shp-add mempool lone)))
-    (is (= 4 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
+    (is (= 4 (bl.mp:txgraph-tx-count graph)))
     ;; c's ancestors are the whole chain; the chain is one cluster, the
     ;; lone root another.
-    (is (= 3 (length (bitcoin-lisp.mempool:txgraph-get-ancestors
+    (is (= 3 (length (bl.mp:txgraph-get-ancestors
                       graph (%shp-handle mempool (%shp-hash c))))))
-    (is (= 3 (length (bitcoin-lisp.mempool:txgraph-get-cluster
+    (is (= 3 (length (bl.mp:txgraph-get-cluster
                       graph (%shp-handle mempool (%shp-hash a))))))
-    (is (= 2 (bitcoin-lisp.mempool:txgraph-count-distinct-clusters
+    (is (= 2 (bl.mp:txgraph-count-distinct-clusters
               graph (list (%shp-handle mempool (%shp-hash a))
                           (%shp-handle mempool (%shp-hash lone))))))
     (is (%shp-equiv-p mempool (%shp-hash c)))))
@@ -149,7 +149,7 @@ formed."
 (test shadow-remove-and-replace
   "Leaf removal, recursive removal, and an RBF-style replacement all keep
 the graph in step."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+  (let* ((mempool (bl.mp:make-mempool))
          (graph (%shp-graph mempool))
          (a (%shp-root-tx 3))
          (b (%shp-tx (list (cons (%shp-hash a) 0)) :value 30000000))
@@ -159,50 +159,50 @@ the graph in step."
     (%shp-add mempool c)
     ;; Plain removal of the childless leaf.
     (let ((c-handle (%shp-handle mempool (%shp-hash c))))
-      (bitcoin-lisp.mempool:mempool-remove mempool (%shp-hash c))
-      (is (not (bitcoin-lisp.mempool:txgraph-exists-p graph c-handle)))
-      (is (= 2 (bitcoin-lisp.mempool:txgraph-tx-count graph))))
+      (bl.mp:mempool-remove mempool (%shp-hash c))
+      (is (not (bl.mp:txgraph-exists-p graph c-handle)))
+      (is (= 2 (bl.mp:txgraph-tx-count graph))))
     ;; RBF-style replacement of b by b2 (same outpoint, higher fee) through
     ;; the shared acceptance tail.
     (let ((b-handle (%shp-handle mempool (%shp-hash b)))
           (b2 (%shp-tx (list (cons (%shp-hash a) 0)) :value 20000000)))
       (multiple-value-bind (result entry)
-          (bitcoin-lisp.mempool:accept-validated-tx
+          (bl.mp:accept-validated-tx
            mempool (%shp-hash b2) b2 15000 0 :replaced (list (%shp-hash b)))
         (is (eq :ok result))
-        (is (not (bitcoin-lisp.mempool:txgraph-exists-p graph b-handle)))
-        (is (= 2 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
+        (is (not (bl.mp:txgraph-exists-p graph b-handle)))
+        (is (= 2 (bl.mp:txgraph-tx-count graph)))
         ;; b2 is wired under a.
-        (is (= 2 (length (bitcoin-lisp.mempool:txgraph-get-ancestors
-                          graph (bitcoin-lisp.mempool:mempool-entry-graph-handle
+        (is (= 2 (length (bl.mp:txgraph-get-ancestors
+                          graph (bl.mp:mempool-entry-graph-handle
                                  entry)))))))
     ;; Recursive removal from the root clears the graph.
-    (is (= 2 (bitcoin-lisp.mempool:mempool-remove-recursive
+    (is (= 2 (bl.mp:mempool-remove-recursive
               mempool (%shp-hash a))))
-    (is (zerop (bitcoin-lisp.mempool:txgraph-tx-count graph)))))
+    (is (zerop (bl.mp:txgraph-tx-count graph)))))
 
 ;;;; Block confirmation
 
 (test shadow-block-confirmation-splits-clusters
   "Confirming part of a cluster splits the remainder into components."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+  (let* ((mempool (bl.mp:make-mempool))
          (graph (%shp-graph mempool))
          (a (%shp-root-tx 4))
          (b (%shp-tx (list (cons (%shp-hash a) 0))))
          (c (%shp-tx (list (cons (%shp-hash b) 0))))
          (d (%shp-tx (list (cons (%shp-hash a) 1)))))
     (dolist (tx (list a b c d)) (%shp-add mempool tx))
-    (is (= 4 (length (bitcoin-lisp.mempool:txgraph-get-cluster
+    (is (= 4 (length (bl.mp:txgraph-get-cluster
                       graph (%shp-handle mempool (%shp-hash a))))))
     ;; A block confirms a and b: c and d remain, now unrelated singletons.
-    (bitcoin-lisp.mempool:mempool-remove-for-block mempool (%shp-block (list a b)))
-    (is (= 2 (bitcoin-lisp.mempool:mempool-count mempool)))
-    (is (= 2 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
+    (bl.mp:mempool-remove-for-block mempool (%shp-block (list a b)))
+    (is (= 2 (bl.mp:mempool-count mempool)))
+    (is (= 2 (bl.mp:txgraph-tx-count graph)))
     (let ((c-handle (%shp-handle mempool (%shp-hash c)))
           (d-handle (%shp-handle mempool (%shp-hash d))))
-      (is (= 1 (length (bitcoin-lisp.mempool:txgraph-get-ancestors graph c-handle))))
-      (is (= 1 (length (bitcoin-lisp.mempool:txgraph-get-ancestors graph d-handle))))
-      (is (= 2 (bitcoin-lisp.mempool:txgraph-count-distinct-clusters
+      (is (= 1 (length (bl.mp:txgraph-get-ancestors graph c-handle))))
+      (is (= 1 (length (bl.mp:txgraph-get-ancestors graph d-handle))))
+      (is (= 2 (bl.mp:txgraph-count-distinct-clusters
                 graph (list c-handle d-handle)))))
     (is (%shp-equiv-p mempool (%shp-hash c)))
     (is (%shp-equiv-p mempool (%shp-hash d)))))
@@ -211,7 +211,7 @@ the graph in step."
   "A block conflict evicts the conflicting tx AND its descendants (Core
 removeForBlock -> removeConflicts -> removeRecursive): the descendants
 spend outputs that no longer exist."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+  (let* ((mempool (bl.mp:make-mempool))
          (graph (%shp-graph mempool))
          (w (%shp-root-tx 5))
          ;; y spends w's output plus a contested outpoint.
@@ -221,11 +221,11 @@ spend outputs that no longer exist."
          ;; The block tx double-spends the contested outpoint.
          (block-tx (%shp-tx (list contested) :value 1000)))
     (dolist (tx (list w y z)) (%shp-add mempool tx))
-    (bitcoin-lisp.mempool:mempool-remove-for-block mempool (%shp-block (list block-tx)))
-    (is (bitcoin-lisp.mempool:mempool-has mempool (%shp-hash w)))
-    (is (not (bitcoin-lisp.mempool:mempool-has mempool (%shp-hash y))))
-    (is (not (bitcoin-lisp.mempool:mempool-has mempool (%shp-hash z))))
-    (is (= 1 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
+    (bl.mp:mempool-remove-for-block mempool (%shp-block (list block-tx)))
+    (is (bl.mp:mempool-has mempool (%shp-hash w)))
+    (is (not (bl.mp:mempool-has mempool (%shp-hash y))))
+    (is (not (bl.mp:mempool-has mempool (%shp-hash z))))
+    (is (= 1 (bl.mp:txgraph-tx-count graph)))
     (is (%shp-equiv-p mempool (%shp-hash w)))))
 
 ;;;; Reorg cycle
@@ -233,23 +233,23 @@ spend outputs that no longer exist."
 (test shadow-reorg-cycle-rebuilds-graph
   "Disconnect re-adds go through the normal acceptance tail, so the graph
 is rebuilt with its dependencies re-wired."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+  (let* ((mempool (bl.mp:make-mempool))
          (graph (%shp-graph mempool))
          (a (%shp-root-tx 7))
          (b (%shp-tx (list (cons (%shp-hash a) 0)))))
     (%shp-add mempool a)
     (%shp-add mempool b)
     ;; Connect: a block confirms both.
-    (bitcoin-lisp.mempool:mempool-remove-for-block mempool (%shp-block (list a b)))
-    (is (zerop (bitcoin-lisp.mempool:txgraph-tx-count graph)))
+    (bl.mp:mempool-remove-for-block mempool (%shp-block (list a b)))
+    (is (zerop (bl.mp:txgraph-tx-count graph)))
     ;; Disconnect: re-add in block order, as readd-disconnected-txs-to-mempool
     ;; does (src/validation/block.lisp) via accept-validated-tx.
-    (is (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
+    (is (eq :ok (bl.mp:accept-validated-tx
                  mempool (%shp-hash a) a 10000 0)))
-    (is (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
+    (is (eq :ok (bl.mp:accept-validated-tx
                  mempool (%shp-hash b) b 8000 0)))
-    (is (= 2 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
-    (is (= 2 (length (bitcoin-lisp.mempool:txgraph-get-ancestors
+    (is (= 2 (bl.mp:txgraph-tx-count graph)))
+    (is (= 2 (length (bl.mp:txgraph-get-ancestors
                       graph (%shp-handle mempool (%shp-hash b))))))
     (is (%shp-equiv-p mempool (%shp-hash b)))))
 
@@ -258,7 +258,7 @@ is rebuilt with its dependencies re-wired."
 (test shadow-mempool-dat-roundtrip-rebuilds-graph
   "Reloading mempool.dat replays acceptance, rebuilding the graph with
 dependencies and prioritisation deltas intact."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+  (let* ((mempool (bl.mp:make-mempool))
          (parent (%shp-root-tx 8))
          (child (%shp-tx (list (cons (%shp-hash parent) 0))))
          (path (merge-pathnames
@@ -266,32 +266,32 @@ dependencies and prioritisation deltas intact."
                 (uiop:temporary-directory))))
     (%shp-add mempool parent :fee 5000)
     (%shp-add mempool child :fee 7000)
-    (bitcoin-lisp.mempool:mempool-prioritise mempool (%shp-hash child) 1234)
+    (bl.mp:mempool-prioritise mempool (%shp-hash child) 1234)
     (unwind-protect
          (progn
-           (is (= 2 (bitcoin-lisp.mempool:save-mempool-file mempool path)))
+           (is (= 2 (bl.mp:save-mempool-file mempool path)))
            (multiple-value-bind (entries residual ok)
-               (bitcoin-lisp.mempool:read-mempool-file path)
+               (bl.mp:read-mempool-file path)
              (declare (ignore residual))
              (is-true ok)
              ;; Replay into a fresh mempool the way load-mempool-from-disk
              ;; does (src/node.lisp): delta first, then the acceptance tail.
-             (let* ((mempool2 (bitcoin-lisp.mempool:make-mempool))
+             (let* ((mempool2 (bl.mp:make-mempool))
                     (graph2 (%shp-graph mempool2)))
                (loop for (tx entry-time delta) in entries
                      for txid = (%shp-hash tx)
                      do (unless (zerop delta)
-                          (bitcoin-lisp.mempool:mempool-prioritise
+                          (bl.mp:mempool-prioritise
                            mempool2 txid delta))
-                        (is (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
+                        (is (eq :ok (bl.mp:accept-validated-tx
                                      mempool2 txid tx 5000 0
                                      :entry-time entry-time))))
-               (is (= 2 (bitcoin-lisp.mempool:txgraph-tx-count graph2)))
-               (is (= 2 (length (bitcoin-lisp.mempool:txgraph-get-ancestors
+               (is (= 2 (bl.mp:txgraph-tx-count graph2)))
+               (is (= 2 (length (bl.mp:txgraph-get-ancestors
                                  graph2 (%shp-handle mempool2 (%shp-hash child))))))
                ;; The delta rode along: the graph sees the modified fee.
-               (is (= 6234 (bitcoin-lisp.mempool:feefrac-fee
-                            (bitcoin-lisp.mempool:txgraph-get-individual-feerate
+               (is (= 6234 (bl.mp:feefrac-fee
+                            (bl.mp:txgraph-get-individual-feerate
                              graph2 (%shp-handle mempool2 (%shp-hash child))))))
                (is (%shp-equiv-p mempool2 (%shp-hash child))))))
       (ignore-errors (delete-file path)))))
@@ -301,23 +301,23 @@ dependencies and prioritisation deltas intact."
 (test shadow-prioritise-updates-graph-fee
   "prioritisetransaction reaches the graph: at add time for pre-existing
 deltas, via set-transaction-fee for in-mempool entries."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+  (let* ((mempool (bl.mp:make-mempool))
          (graph (%shp-graph mempool))
          (a (%shp-root-tx 9))
          (b (%shp-root-tx 10)))
     (flet ((graph-fee (txid)
-             (bitcoin-lisp.mempool:feefrac-fee
-              (bitcoin-lisp.mempool:txgraph-get-individual-feerate
+             (bl.mp:feefrac-fee
+              (bl.mp:txgraph-get-individual-feerate
                graph (%shp-handle mempool txid)))))
       ;; Post-add prioritisation.
       (%shp-add mempool a :fee 10000)
-      (bitcoin-lisp.mempool:mempool-prioritise mempool (%shp-hash a) 500)
+      (bl.mp:mempool-prioritise mempool (%shp-hash a) 500)
       (is (= 10500 (graph-fee (%shp-hash a))))
       ;; Negative delta.
-      (bitcoin-lisp.mempool:mempool-prioritise mempool (%shp-hash a) -700)
+      (bl.mp:mempool-prioritise mempool (%shp-hash a) -700)
       (is (= 9800 (graph-fee (%shp-hash a))))
       ;; Pre-add prioritisation is applied by mempool-add.
-      (bitcoin-lisp.mempool:mempool-prioritise mempool (%shp-hash b) 300)
+      (bl.mp:mempool-prioritise mempool (%shp-hash b) 300)
       (%shp-add mempool b :fee 10000)
       (is (= 10300 (graph-fee (%shp-hash b)))))))
 
@@ -329,7 +329,7 @@ tx well within the old 25/25 limits) is fine until the bridge that would
 fuse it into a 65-tx cluster, which is rejected with :too-large-cluster and
 its staged graph addition rolled back - the graph never stays oversized,
 mempool and graph agree throughout, and the pool remains fully usable."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+  (let* ((mempool (bl.mp:make-mempool))
          (graph (%shp-graph mempool))
          (roots (loop for i from 1 to 33
                       collect (%shp-root-tx (+ 100 i)))))
@@ -344,14 +344,14 @@ mempool and graph agree throughout, and the pool remains fully usable."
                                       (cons (%shp-hash r2) 0)))
           do (is (eq (if (<= k 31) :ok :too-large-cluster)
                      (%shp-add mempool bridge))))
-    (is (= 64 (bitcoin-lisp.mempool:mempool-count mempool)))
-    (is (= 64 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
-    (is-false (bitcoin-lisp.mempool:txgraph-oversized-p graph))
+    (is (= 64 (bl.mp:mempool-count mempool)))
+    (is (= 64 (bl.mp:txgraph-tx-count graph)))
+    (is-false (bl.mp:txgraph-oversized-p graph))
     ;; The pool stays fully usable after the rejection.
     (let ((extra (%shp-root-tx 200)))
       (is (eq :ok (%shp-add mempool extra)))
-      (is (= 65 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
-      (bitcoin-lisp.mempool:mempool-remove mempool (%shp-hash extra)))
+      (is (= 65 (bl.mp:txgraph-tx-count graph)))
+      (bl.mp:mempool-remove mempool (%shp-hash extra)))
     (is (%shp-verify mempool))
     (is (%shp-equiv-p mempool (%shp-hash (first roots))))))
 
@@ -363,14 +363,14 @@ block confirmations, with the per-mutation shadow asserts doing the heavy
 checking; explicit spot checks at the end."
   (dolist (seed '(88172645463325252 3141592653589793))
     (let ((rng (%cl-make-rng seed))
-          (mempool (bitcoin-lisp.mempool:make-mempool))
+          (mempool (bl.mp:make-mempool))
           (all-txs (make-hash-table :test 'equalp))   ; txid -> tx
           (next-vout (make-hash-table :test 'equalp)) ; txid -> next free vout
           (next-root 0))
       (flet ((live-txids ()
                (let ((ids '()))
                  (maphash (lambda (txid tx) (declare (ignore tx))
-                            (when (bitcoin-lisp.mempool:mempool-has mempool txid)
+                            (when (bl.mp:mempool-has mempool txid)
                               (push txid ids)))
                           all-txs)
                  ;; Deterministic order for reproducible seeding.
@@ -406,7 +406,7 @@ checking; explicit spot checks at the end."
                    (%shp-add mempool tx :fee (+ 1000 (funcall rng 20000))))))
               (5                           ; recursive removal
                (when (plusp n)
-                 (bitcoin-lisp.mempool:mempool-remove-recursive
+                 (bl.mp:mempool-remove-recursive
                   mempool (nth (funcall rng n) live))))
               (6                           ; confirm a random ancestor-closed set
                (when (plusp n)
@@ -414,27 +414,27 @@ checking; explicit spot checks at the end."
                         (txids (let ((ids (list target)))
                                  (maphash (lambda (k v) (declare (ignore v))
                                             (push k ids))
-                                          (bitcoin-lisp.mempool:mempool-ancestors
+                                          (bl.mp:mempool-ancestors
                                            mempool target))
                                  ids)))
-                   (bitcoin-lisp.mempool:mempool-remove-for-block
+                   (bl.mp:mempool-remove-for-block
                     mempool
                     (%shp-block (mapcar (lambda (id) (gethash id all-txs))
                                         txids))))))
               (7                           ; prioritise
                (when (plusp n)
-                 (bitcoin-lisp.mempool:mempool-prioritise
+                 (bl.mp:mempool-prioritise
                   mempool (nth (funcall rng n) live)
                   (- (funcall rng 5000) 2500))))))
           (when (zerop (mod step 20))
-            (is (= (bitcoin-lisp.mempool:txgraph-tx-count (%shp-graph mempool))
-                   (bitcoin-lisp.mempool:mempool-count mempool)))))
+            (is (= (bl.mp:txgraph-tx-count (%shp-graph mempool))
+                   (bl.mp:mempool-count mempool)))))
         ;; Final explicit spot equivalence, independent of the hooks.
         (is (%shp-verify mempool))
         (let ((live (live-txids)))
           (is (= (length live)
-                 (bitcoin-lisp.mempool:txgraph-tx-count (%shp-graph mempool))))
-          (unless (bitcoin-lisp.mempool:txgraph-oversized-p (%shp-graph mempool))
+                 (bl.mp:txgraph-tx-count (%shp-graph mempool))))
+          (unless (bl.mp:txgraph-oversized-p (%shp-graph mempool))
             (dolist (txid live)
               (is (%shp-equiv-p mempool txid)))))))))
 
@@ -445,26 +445,26 @@ checking; explicit spot checks at the end."
   "A re-added disconnected tx whose outputs a pre-existing pool entry spends
 gets the parent->child link wired by MEMPOOL-UPDATE-FOR-REORG, in both the
 BFS links and the txgraph, with the shadow checks green throughout."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+  (let* ((mempool (bl.mp:make-mempool))
          (graph (%shp-graph mempool))
          (p (%shp-root-tx 40))               ; the disconnected tx
          (ptxid (%shp-hash p))
          ;; The pool child entered while P was confirmed: standalone.
          (c (%shp-tx (list (cons ptxid 0)))))
     (%shp-add mempool c :fee 9000)
-    (is (= 1 (length (bitcoin-lisp.mempool:txgraph-get-cluster
+    (is (= 1 (length (bl.mp:txgraph-get-cluster
                       graph (%shp-handle mempool (%shp-hash c))))))
     ;; Reorg re-add (the bypass-limits acceptance tail): P is unlinked so far.
-    (is (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
+    (is (eq :ok (bl.mp:accept-validated-tx
                  mempool ptxid p 10000 0 :defer-trim t)))
-    (is (= 1 (length (bitcoin-lisp.mempool:txgraph-get-ancestors
+    (is (= 1 (length (bl.mp:txgraph-get-ancestors
                       graph (%shp-handle mempool (%shp-hash c))))))
     ;; Bulk repair: wires P -> C; the trim is a no-op within limits.
-    (is (zerop (bitcoin-lisp.mempool:mempool-update-for-reorg
+    (is (zerop (bl.mp:mempool-update-for-reorg
                 mempool (list ptxid))))
-    (is (= 2 (length (bitcoin-lisp.mempool:txgraph-get-ancestors
+    (is (= 2 (length (bl.mp:txgraph-get-ancestors
                       graph (%shp-handle mempool (%shp-hash c))))))
-    (is (= 2 (length (bitcoin-lisp.mempool:txgraph-get-cluster
+    (is (= 2 (length (bl.mp:txgraph-get-cluster
                       graph (%shp-handle mempool ptxid)))))
     (is (%shp-equiv-p mempool (%shp-hash c)))
     (is (%shp-verify mempool))))
@@ -474,8 +474,8 @@ BFS links and the txgraph, with the shadow checks green throughout."
 are resolved by ONE trim keeping the best chunks (Core m_txgraph->Trim()
 after UpdateTransactionsFromBlock): the worst tail tx is evicted and the
 graph ends within limits, shadow-consistent."
-  (let* ((bitcoin-lisp.mempool:*cluster-count-limit* 3)
-         (mempool (bitcoin-lisp.mempool:make-mempool))
+  (let* ((bl.mp:*cluster-count-limit* 3)
+         (mempool (bl.mp:make-mempool))
          (graph (%shp-graph mempool))
          (a (%shp-root-tx 41))               ; the disconnected tx (high fee)
          (atxid (%shp-hash a))
@@ -486,15 +486,15 @@ graph ends within limits, shadow-consistent."
     (%shp-add mempool b :fee 10000)
     (%shp-add mempool c :fee 10000)
     (%shp-add mempool d :fee 10)             ; the worst chunk
-    (is (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
+    (is (eq :ok (bl.mp:accept-validated-tx
                  mempool atxid a 50000 0 :defer-trim t)))
     ;; Wiring A -> B would form a 4-tx cluster over the 3-tx limit: the one
     ;; trim drops D (the worst chunk's tail) and keeps {A, B, C}.
-    (is (= 1 (bitcoin-lisp.mempool:mempool-update-for-reorg
+    (is (= 1 (bl.mp:mempool-update-for-reorg
               mempool (list atxid))))
-    (is (not (bitcoin-lisp.mempool:mempool-has mempool (%shp-hash d))))
-    (is (not (bitcoin-lisp.mempool:txgraph-oversized-p graph)))
-    (is (= 3 (length (bitcoin-lisp.mempool:txgraph-get-cluster
+    (is (not (bl.mp:mempool-has mempool (%shp-hash d))))
+    (is (not (bl.mp:txgraph-oversized-p graph)))
+    (is (= 3 (length (bl.mp:txgraph-get-cluster
                       graph (%shp-handle mempool atxid)))))
     (is (%shp-equiv-p mempool (%shp-hash c)))
     (is (%shp-verify mempool))))
@@ -503,13 +503,13 @@ graph ends within limits, shadow-consistent."
   "A disconnected tx that fails re-acceptance drags down the pool entries
 spending its outputs, recursively (Core removeRecursive on a not-in-pool
 origin, txmempool.cpp:333-359)."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+  (let* ((mempool (bl.mp:make-mempool))
          (ptxid (%shp-outpoint-hash 42))     ; the failed tx's txid (not in pool)
          (c (%shp-tx (list (cons ptxid 0)))) ; pool spender of its output 0
          (g (%shp-tx (list (cons (%shp-hash c) 0)))))
     (%shp-add mempool c :fee 9000)
     (%shp-add mempool g :fee 9000)
-    (is (= 2 (bitcoin-lisp.mempool:mempool-remove-spenders mempool ptxid 1)))
-    (is (zerop (bitcoin-lisp.mempool:mempool-count mempool)))
-    (is (zerop (bitcoin-lisp.mempool:txgraph-tx-count (%shp-graph mempool))))
+    (is (= 2 (bl.mp:mempool-remove-spenders mempool ptxid 1)))
+    (is (zerop (bl.mp:mempool-count mempool)))
+    (is (zerop (bl.mp:txgraph-tx-count (%shp-graph mempool))))
     (is (%shp-verify mempool))))

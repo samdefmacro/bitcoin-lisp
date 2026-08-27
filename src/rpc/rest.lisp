@@ -74,7 +74,7 @@ repeated across the hex-capable endpoints."
 response. Caller has already validated EXT is one of those."
   (if (string= ext "bin")
       (%rest-respond 200 "application/octet-stream"
-                     (bitcoin-lisp.crypto:hex-to-bytes hex))
+                     (bl.crypto:hex-to-bytes hex))
       (%rest-respond 200 "text/plain" (format nil "~A~%" hex))))
 
 ;;; --- Endpoint handlers. Each takes the path remainder after the route
@@ -138,7 +138,7 @@ hash it does not know at all (LookupBlockIndex returns nullptr); we keep the
   (let* ((count (let ((q (hunchentoot:get-parameter "count")))
                   (or (and q (parse-integer q :junk-allowed t)) 5)))
          (chain-state (rpc-get-chain-state node))
-         (start (bitcoin-lisp.storage:get-block-index-entry
+         (start (bl.store:get-block-index-entry
                  chain-state (parse-hex-hash body))))
     (when (or (< count 1) (> count +rest-max-headers+))
       (return-from %rest-headers (%rest-error 400 "Invalid count")))
@@ -146,27 +146,27 @@ hash it does not know at all (LookupBlockIndex returns nullptr); we keep the
       (return-from %rest-headers (%rest-error 404 "Block not found")))
     ;; Walk forward via active-chain successors by height.
     (let ((entries
-            (when (bitcoin-lisp.storage:entry-on-active-chain-p chain-state start)
-              (loop with h = (bitcoin-lisp.storage:block-index-entry-height start)
+            (when (bl.store:entry-on-active-chain-p chain-state start)
+              (loop with h = (bl.store:block-index-entry-height start)
                     for i from 0 below count
-                    for e = start then (bitcoin-lisp.storage:get-block-at-height
+                    for e = start then (bl.store:get-block-at-height
                                         chain-state (+ h i))
                     while e collect e))))
       (%rest-by-ext ext
         :json (%rest-json (json-array
                            (mapcar (lambda (e)
                                      (block-header-entry-to-json
-                                      e (hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash e))
+                                      e (hash-to-hex (bl.store:block-index-entry-hash e))
                                       chain-state (rpc-get-block-store node)))
                                    entries)))
-        :hex/bin (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+        :hex/bin (let ((bb (bl.ser:make-byte-buf)))
                    (dolist (e entries)
-                     (bitcoin-lisp.serialization:bb-write-bytes
-                      bb (bitcoin-lisp.serialization:serialize-block-header
-                          (bitcoin-lisp.storage:block-index-entry-header e))))
+                     (bl.ser:bb-write-bytes
+                      bb (bl.ser:serialize-block-header
+                          (bl.store:block-index-entry-header e))))
                    (%rest-hex-or-bin
-                    ext (bitcoin-lisp.crypto:bytes-to-hex
-                         (bitcoin-lisp.serialization:bb-finish bb))))))))
+                    ext (bl.crypto:bytes-to-hex
+                         (bl.ser:bb-finish bb))))))))
 
 (defun %rest-mempool (node body ext)
   (unless (string= ext "json")
@@ -204,18 +204,18 @@ mempool spends and plus mempool-created outputs when MEMPOOL is non-NIL
 (Core's CCoinsViewMemPool + mempool.isSpent path, rest.cpp:1003-1024).
 Mempool coins carry +mempool-coin-height+."
   (cond
-    ((and mempool (bitcoin-lisp.mempool:mempool-spending-tx mempool txid vout))
+    ((and mempool (bl.mp:mempool-spending-tx mempool txid vout))
      nil)
-    (t (or (bitcoin-lisp.storage:get-utxo (rpc-get-utxo-set node) txid vout)
+    (t (or (bl.store:get-utxo (rpc-get-utxo-set node) txid vout)
            (and mempool (%mempool-view-coin mempool txid vout))))))
 
 (defun %getutxos-spk-json (spk network)
   "The scriptPubKey object of a getutxos JSON coin (Core ScriptToUniv with
 include_hex + include_address)."
   (let ((addr (%script->address spk network)))
-    `(("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
+    `(("asm" . ,(bl.val:disassemble-script spk))
       ("desc" . ,(scriptpubkey-desc spk network))
-      ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
+      ("hex" . ,(bl.crypto:bytes-to-hex spk))
       ("type" . ,(%script-type spk))
       ,@(when addr `(("address" . ,addr))))))
 
@@ -225,7 +225,7 @@ height, 32-byte tip hash (internal order), CompactSize+bitmap (LSB-first
 bit per outpoint), CompactSize(coin count) then per hit coin the CCoin wire
 form (rest.cpp:56-68): u32 dummy version 0, u32 LE height, i64 LE value,
 CompactSize+scriptPubKey."
-  (let ((bb (bitcoin-lisp.serialization:make-byte-buf))
+  (let ((bb (bl.ser:make-byte-buf))
         (bitmap (make-array (ceiling (length hits) 8)
                             :element-type '(unsigned-byte 8) :initial-element 0)))
     (loop for hit in hits
@@ -233,21 +233,21 @@ CompactSize+scriptPubKey."
           when hit
             do (setf (aref bitmap (floor i 8))
                      (logior (aref bitmap (floor i 8)) (ash 1 (mod i 8)))))
-    (bitcoin-lisp.serialization:bb-write-u32-le bb height)
-    (bitcoin-lisp.serialization:bb-write-bytes bb tip-hash)
-    (bitcoin-lisp.serialization:bb-write-varint bb (length bitmap))
-    (bitcoin-lisp.serialization:bb-write-bytes bb bitmap)
-    (bitcoin-lisp.serialization:bb-write-varint bb (length coins))
+    (bl.ser:bb-write-u32-le bb height)
+    (bl.ser:bb-write-bytes bb tip-hash)
+    (bl.ser:bb-write-varint bb (length bitmap))
+    (bl.ser:bb-write-bytes bb bitmap)
+    (bl.ser:bb-write-varint bb (length coins))
     (dolist (coin coins)
-      (bitcoin-lisp.serialization:bb-write-u32-le bb 0) ; nTxVerDummy
-      (bitcoin-lisp.serialization:bb-write-u32-le
-       bb (bitcoin-lisp.storage:utxo-entry-height coin))
-      (bitcoin-lisp.serialization:bb-write-i64-le
-       bb (bitcoin-lisp.storage:utxo-entry-value coin))
-      (let ((spk (bitcoin-lisp.storage:utxo-entry-script-pubkey coin)))
-        (bitcoin-lisp.serialization:bb-write-varint bb (length spk))
-        (bitcoin-lisp.serialization:bb-write-bytes bb spk)))
-    (bitcoin-lisp.serialization:bb-finish bb)))
+      (bl.ser:bb-write-u32-le bb 0) ; nTxVerDummy
+      (bl.ser:bb-write-u32-le
+       bb (bl.store:utxo-entry-height coin))
+      (bl.ser:bb-write-i64-le
+       bb (bl.store:utxo-entry-value coin))
+      (let ((spk (bl.store:utxo-entry-script-pubkey coin)))
+        (bl.ser:bb-write-varint bb (length spk))
+        (bl.ser:bb-write-bytes bb spk)))
+    (bl.ser:bb-finish bb)))
 
 (defun %rest-getutxos (node body ext)
   "BIP64 /rest/getutxos[/checkmempool]/<txid>-<n>/... (Core rest.cpp:
@@ -286,10 +286,10 @@ outpoints come from the URI."
               (let ((coin (%getutxos-coin node mempool (car op) (cdr op))))
                 (push (and coin t) hits)
                 (when coin (push coin coins))))
-            (values (bitcoin-lisp.storage:current-height chain-state)
+            (values (bl.store:current-height chain-state)
                     ;; A tipless (fresh) chainstate reports the zero hash —
                     ;; Core always has genesis, so this only affects tests.
-                    (or (bitcoin-lisp.storage:best-block-hash chain-state)
+                    (or (bl.store:best-block-hash chain-state)
                         (make-array 32 :element-type '(unsigned-byte 8)
                                        :initial-element 0))
                     (nreverse hits)
@@ -303,17 +303,17 @@ outpoints come from the URI."
               ("bitmap" . ,(map 'string (lambda (h) (if h #\1 #\0)) hits))
               ("utxos" . ,(mapcar
                            (lambda (coin)
-                             `(("height" . ,(bitcoin-lisp.storage:utxo-entry-height coin))
-                               ("value" . ,(/ (bitcoin-lisp.storage:utxo-entry-value coin)
+                             `(("height" . ,(bl.store:utxo-entry-height coin))
+                               ("value" . ,(/ (bl.store:utxo-entry-value coin)
                                               100000000.0d0))
                                ("scriptPubKey"
                                 . ,(%getutxos-spk-json
-                                    (bitcoin-lisp.storage:utxo-entry-script-pubkey coin)
+                                    (bl.store:utxo-entry-script-pubkey coin)
                                     network))))
                            coins))))))
         (t
          (%rest-hex-or-bin
-          ext (bitcoin-lisp.crypto:bytes-to-hex
+          ext (bl.crypto:bytes-to-hex
                (%getutxos-binary height tip-hash hits coins))))))))
 
 ;;; --- Liveness probe (bitcoin-lisp extension, not a Core REST endpoint) ---
@@ -325,7 +325,7 @@ AND the active chain tip advanced within the staleness threshold; else HTTP
 node-tip-liveness read is lock-free and side-effect-free, so the probe stays
 responsive (and correctly reports 503) even when the node is wedged."
   (multiple-value-bind (healthy seconds-since-tip synced)
-      (bitcoin-lisp::node-tip-liveness node)
+      (bl::node-tip-liveness node)
     (%rest-respond (if healthy 200 503)
                    "application/json"
                    (with-output-to-string (s)
@@ -370,16 +370,16 @@ not wrap, so a plain + is already the safe version."
       (t
        (let* ((hash (parse-hex-hash body))
               (store (rpc-get-block-store node))
-              (block (and store (bitcoin-lisp.storage:get-block store hash))))
+              (block (and store (bl.store:get-block store hash))))
          (cond
            ((null block) (%rest-error 404 (format nil "~A not found" body)))
            (t
-            (let ((bytes (bitcoin-lisp.serialization:serialize-witness-block block)))
+            (let ((bytes (bl.ser:serialize-witness-block block)))
               (if (or (zerop size) (> (+ offset size) (length bytes)))
                   (%rest-error 400 (format nil "Bad block part offset/size ~D/~D for ~A"
                                            offset size body))
                   (%rest-hex-or-bin
-                   ext (bitcoin-lisp.crypto:bytes-to-hex
+                   ext (bl.crypto:bytes-to-hex
                         (subseq bytes offset (+ offset size)))))))))))))
 
 (defun %rest-size-parameter (name)
@@ -449,18 +449,18 @@ sequence that never existed."
        (%rest-error 400 "Invalid count"))
       (t
        (let* ((chain-state (rpc-get-chain-state node))
-              (start (bitcoin-lisp.storage:get-block-index-entry
+              (start (bl.store:get-block-index-entry
                       chain-state (parse-hex-hash hash))))
          (cond
            ((null start) (%rest-error 404 "Block not found"))
            (t
             (handler-case
                 (let* ((entries
-                         (when (bitcoin-lisp.storage:entry-on-active-chain-p
+                         (when (bl.store:entry-on-active-chain-p
                                 chain-state start)
-                           (loop with h = (bitcoin-lisp.storage:block-index-entry-height start)
+                           (loop with h = (bl.store:block-index-entry-height start)
                                  for i from 0 below count
-                                 for e = start then (bitcoin-lisp.storage:get-block-at-height
+                                 for e = start then (bl.store:get-block-at-height
                                                      chain-state (+ h i))
                                  while e collect e)))
                        (headers
@@ -468,8 +468,8 @@ sequence that never existed."
                           (lambda (e)
                             (let ((result (rpc-getblockfilter
                                            node
-                                           (list (bitcoin-lisp.crypto:bytes-to-hex
-                                                  (bitcoin-lisp.storage:block-index-entry-hash e))
+                                           (list (bl.crypto:bytes-to-hex
+                                                  (bl.store:block-index-entry-hash e))
                                                  filtertype))))
                               (cdr (assoc "header" result :test #'string=))))
                           entries)))
@@ -491,19 +491,19 @@ input order, as BlockUndoToJSON produces."
     (return-from %rest-spenttxouts (%rest-error 400 "Invalid block hash")))
   (let* ((hash (parse-hex-hash body))
          (store (and hash (rpc-get-block-store node)))
-         (block (and store (bitcoin-lisp.storage:get-block store hash))))
+         (block (and store (bl.store:get-block store hash))))
     (cond
       ((null block) (%rest-error 404 (format nil "~A not found" body)))
       (t
-       (let ((undo (bitcoin-lisp.validation:get-undo-data hash)))
+       (let ((undo (bl.val:get-undo-data hash)))
          (handler-case
-             (let ((tx-undos (bitcoin-lisp.storage:block-undo-from-spent-utxos
+             (let ((tx-undos (bl.store:block-undo-from-spent-utxos
                               block (or undo '()))))
                (%rest-by-ext ext
                  :json (%rest-json (json-array (%block-undo-json tx-undos node)))
                  :hex/bin (%rest-hex-or-bin
-                           ext (bitcoin-lisp.crypto:bytes-to-hex
-                                (bitcoin-lisp.storage:serialize-block-undo tx-undos)))))
+                           ext (bl.crypto:bytes-to-hex
+                                (bl.store:serialize-block-undo tx-undos)))))
            (error ()
              ;; block-undo-from-spent-utxos refuses undo data that does not
              ;; account for exactly this block's inputs, which is what a pruned
@@ -519,8 +519,8 @@ each a list of the coins that transaction's inputs spent."
        (json-array
         (mapcar
          (lambda (entry)
-           (let ((spk (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
-             `(("value" . ,(/ (bitcoin-lisp.storage:utxo-entry-value entry)
+           (let ((spk (bl.store:utxo-entry-script-pubkey entry)))
+             `(("value" . ,(/ (bl.store:utxo-entry-value entry)
                               100000000.0d0))
                ;; Core's ScriptToUniv with include_hex and
                ;; include_address, which is the shape OUTPUT-TO-JSON already
@@ -528,8 +528,8 @@ each a list of the coins that transaction's inputs spent."
                ("scriptPubKey"
                 . ,(let ((addr (and network (%script->address spk network))))
                      (append
-                      `(("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
-                        ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
+                      `(("asm" . ,(bl.val:disassemble-script spk))
+                        ("hex" . ,(bl.crypto:bytes-to-hex spk))
                         ("type" . ,(%script-type spk)))
                       (when addr `(("address" . ,addr)))))))))
          tx-undo)))
@@ -602,7 +602,7 @@ to its handler. Returns the response body; sets status/content-type."
   (if (eq (hunchentoot:request-method*) :get)
       (handler-case (rest-handle *rpc-node* (hunchentoot:script-name*))
         (error (e)
-          (bitcoin-lisp::node-log :error "REST handler error: ~A" e)
+          (bl::node-log :error "REST handler error: ~A" e)
           (%rest-error 500 "Internal error")))
       (progn
         (setf (hunchentoot:return-code*) hunchentoot:+http-method-not-allowed+)

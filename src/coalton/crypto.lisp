@@ -10,40 +10,40 @@
 
 (coalton-toplevel
 
-  (declare compute-sha256 ((Vector U8) -> bitcoin-lisp.coalton.types:Hash256))
+  (declare compute-sha256 ((Vector U8) -> bl.ctypes:Hash256))
   (define (compute-sha256 data)
     "Compute SHA-256 hash. Returns Hash256 (32 bytes)."
-    (bitcoin-lisp.coalton.types:Hash256
+    (bl.ctypes:Hash256
      (lisp (Vector U8) (data)
        (cl:let* ((cl-data (cl:coerce data '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                 (result (bitcoin-lisp.crypto:sha256 cl-data)))
+                 (result (bl.crypto:sha256 cl-data)))
          (cl:map 'cl:vector #'cl:identity result)))))
 
-  (declare compute-hash256 ((Vector U8) -> bitcoin-lisp.coalton.types:Hash256))
+  (declare compute-hash256 ((Vector U8) -> bl.ctypes:Hash256))
   (define (compute-hash256 data)
     "Compute double SHA-256 hash (Bitcoin standard). Returns Hash256."
-    (bitcoin-lisp.coalton.types:Hash256
+    (bl.ctypes:Hash256
      (lisp (Vector U8) (data)
        (cl:let* ((cl-data (cl:coerce data '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                 (result (bitcoin-lisp.crypto:hash256 cl-data)))
+                 (result (bl.crypto:hash256 cl-data)))
          (cl:map 'cl:vector #'cl:identity result)))))
 
-  (declare compute-ripemd160 ((Vector U8) -> bitcoin-lisp.coalton.types:Hash160))
+  (declare compute-ripemd160 ((Vector U8) -> bl.ctypes:Hash160))
   (define (compute-ripemd160 data)
     "Compute RIPEMD-160 hash. Returns Hash160 (20 bytes)."
-    (bitcoin-lisp.coalton.types:Hash160
+    (bl.ctypes:Hash160
      (lisp (Vector U8) (data)
        (cl:let* ((cl-data (cl:coerce data '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                 (result (bitcoin-lisp.crypto:ripemd160 cl-data)))
+                 (result (bl.crypto:ripemd160 cl-data)))
          (cl:map 'cl:vector #'cl:identity result)))))
 
-  (declare compute-hash160 ((Vector U8) -> bitcoin-lisp.coalton.types:Hash160))
+  (declare compute-hash160 ((Vector U8) -> bl.ctypes:Hash160))
   (define (compute-hash160 data)
     "Compute Hash160: RIPEMD160(SHA256(data)). Used for addresses."
-    (bitcoin-lisp.coalton.types:Hash160
+    (bl.ctypes:Hash160
      (lisp (Vector U8) (data)
        (cl:let* ((cl-data (cl:coerce data '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                 (result (bitcoin-lisp.crypto:hash160 cl-data)))
+                 (result (bl.crypto:hash160 cl-data)))
          (cl:map 'cl:vector #'cl:identity result)))))
 
   (declare bytes-to-hex ((Vector U8) -> String))
@@ -51,4 +51,4 @@
     "Convert a byte vector to a hexadecimal string."
     (lisp String (bytes)
       (cl:let ((cl-bytes (cl:coerce bytes '(cl:simple-array (cl:unsigned-byte 8) (cl:*)))))
-        (bitcoin-lisp.crypto:bytes-to-hex cl-bytes)))))
+        (bl.crypto:bytes-to-hex cl-bytes)))))

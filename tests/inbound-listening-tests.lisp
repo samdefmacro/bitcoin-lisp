@@ -11,7 +11,7 @@
 (in-suite :inbound-listening-tests)
 
 (test inbound-handshake-loopback
-  (let ((srv (bitcoin-lisp.networking:open-listener "127.0.0.1" 0)))
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
     (is-true srv)
     (when srv
       (unwind-protect
@@ -31,38 +31,38 @@
                       ;; thread-local, so this cannot affect the dialing side.
                       ;; The refusal itself is asserted by
                       ;; inbound-handshake-refuses-self-connection below.
-                      (let ((bitcoin-lisp.networking::*outbound-nonces*
+                      (let ((bl.net::*outbound-nonces*
                               (make-hash-table :test 'eql)))
-                        (let ((conn (bitcoin-lisp.networking:accept-connection srv :timeout 10)))
+                        (let ((conn (bl.net:accept-connection srv :timeout 10)))
                           (when conn
-                            (let ((p (bitcoin-lisp.networking:make-inbound-peer conn "127.0.0.1")))
-                              (when (bitcoin-lisp.networking:perform-inbound-handshake p)
+                            (let ((p (bl.net:make-inbound-peer conn "127.0.0.1")))
+                              (when (bl.net:perform-inbound-handshake p)
                                 (setf server-peer p)))))))
                     :name "test-inbound-accept")))
             ;; Give the accept thread a moment to block on accept, then dial in.
             (sleep 0.3)
-            (let ((client (bitcoin-lisp.networking:connect-peer "127.0.0.1" port)))
+            (let ((client (bl.net:connect-peer "127.0.0.1" port)))
               (is-true client)
               (when client
-                (is-true (bitcoin-lisp.networking:perform-handshake client))
-                (is (eq :ready (bitcoin-lisp.networking:peer-state client)))
+                (is-true (bl.net:perform-handshake client))
+                (is (eq :ready (bl.net:peer-state client)))
                 ;; Wait for the inbound side to finish (handshake timeouts bound this).
                 (bt:join-thread server-thread)
                 (is-true server-peer)
                 (when server-peer
-                  (is (eq :ready (bitcoin-lisp.networking:peer-state server-peer)))
-                  (is-true (bitcoin-lisp.networking:peer-inbound server-peer))
+                  (is (eq :ready (bl.net:peer-state server-peer)))
+                  (is-true (bl.net:peer-inbound server-peer))
                   ;; The inbound side recorded the dialer's version/user-agent.
-                  (is-true (bitcoin-lisp.networking:peer-version server-peer))
-                  (bitcoin-lisp.networking:disconnect-peer server-peer))
-                (bitcoin-lisp.networking:disconnect-peer client))))
-        (bitcoin-lisp.networking:close-listener srv)))))
+                  (is-true (bl.net:peer-version server-peer))
+                  (bl.net:disconnect-peer server-peer))
+                (bl.net:disconnect-peer client))))
+        (bl.net:close-listener srv)))))
 
 (test open-listener-unbindable-returns-nil
   ;; Binding a non-local address (TEST-NET-1, never a local interface) fails
   ;; gracefully — open-listener returns NIL, not an error (the contract callers
   ;; like start-inbound-listener rely on).
-  (is (null (bitcoin-lisp.networking:open-listener "192.0.2.1" 0))))
+  (is (null (bl.net:open-listener "192.0.2.1" 0))))
 
 ;;;; ============================================================
 ;;;; G7-19: self-connection detection (Core CheckIncomingNonce)
@@ -74,13 +74,13 @@ we send VERSION, released when the handshake ends — SUCCESS OR FAILURE. Core
 matches only against !fSuccessfullyConnected nodes; a leaked entry would stay
 armed forever and refuse an unrelated future peer that happened to reuse the
 value."
-  (let ((bitcoin-lisp.networking::*outbound-nonces* (make-hash-table :test 'eql)))
-    (let ((n (bitcoin-lisp.networking::%fresh-local-nonce)))
-      (is-false (bitcoin-lisp.networking::self-connection-nonce-p n))
-      (bitcoin-lisp.networking::%register-outbound-nonce n)
-      (is-true (bitcoin-lisp.networking::self-connection-nonce-p n))
-      (bitcoin-lisp.networking::%release-outbound-nonce n)
-      (is-false (bitcoin-lisp.networking::self-connection-nonce-p n)
+  (let ((bl.net::*outbound-nonces* (make-hash-table :test 'eql)))
+    (let ((n (bl.net::%fresh-local-nonce)))
+      (is-false (bl.net::self-connection-nonce-p n))
+      (bl.net::%register-outbound-nonce n)
+      (is-true (bl.net::self-connection-nonce-p n))
+      (bl.net::%release-outbound-nonce n)
+      (is-false (bl.net::self-connection-nonce-p n)
                 "release must clear the entry"))))
 
 (test self-connection-nonce-is-per-connection
@@ -89,7 +89,7 @@ than reusing a node-wide value. A stable nonce would travel in cleartext in the
 first message of every connection — a permanent unique fingerprint linking our
 clearnet, Tor and I2P identities and every reconnect."
   (let ((nonces (loop repeat 50
-                      collect (bitcoin-lisp.networking::%fresh-local-nonce))))
+                      collect (bl.net::%fresh-local-nonce))))
     (is (= 50 (length (remove-duplicates nonces)))
         "nonces must not repeat across connections")
     (is (every (lambda (n) (typep n '(unsigned-byte 64))) nonces))
@@ -101,14 +101,14 @@ clearnet, Tor and I2P identities and every reconnect."
   "The VERSION we push must carry THIS connection's nonce, not a fresh
 throwaway — otherwise the registry holds a value that never goes on the wire
 and self-connection is undetectable while every test still passes."
-  (let* ((peer (bitcoin-lisp.networking::make-peer))
-         (nonce (bitcoin-lisp.networking::%fresh-local-nonce)))
-    (setf (bitcoin-lisp.networking::peer-local-nonce peer) nonce)
-    (let* ((payload (bitcoin-lisp.serialization:make-version-message-bytes
-                     :nonce (bitcoin-lisp.networking::peer-local-nonce peer)))
+  (let* ((peer (bl.net::make-peer))
+         (nonce (bl.net::%fresh-local-nonce)))
+    (setf (bl.net::peer-local-nonce peer) nonce)
+    (let* ((payload (bl.ser:make-version-message-bytes
+                     :nonce (bl.net::peer-local-nonce peer)))
            (parsed (flexi-streams:with-input-from-sequence (s payload)
-                     (bitcoin-lisp.serialization:read-version-message s))))
-      (is (= nonce (bitcoin-lisp.serialization::version-message-nonce parsed))
+                     (bl.ser:read-version-message s))))
+      (is (= nonce (bl.ser::version-message-nonce parsed))
           "the nonce on the wire must be the peer's own"))))
 
 (test inbound-handshake-refuses-self-connection
@@ -120,7 +120,7 @@ Here the inbound side keeps the SHARED registry, so the loopback dial is seen
 for what it is — a self-connection — and refused. Contrast
 inbound-handshake-loopback, which rebinds the registry in the server thread to
 stand in for a distinct node."
-  (let ((srv (bitcoin-lisp.networking:open-listener "127.0.0.1" 0)))
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
     (is-true srv)
     (when srv
       (unwind-protect
@@ -129,26 +129,26 @@ stand in for a distinct node."
                   (server-thread
                     (bt:make-thread
                      (lambda ()
-                       (let ((conn (bitcoin-lisp.networking:accept-connection srv :timeout 10)))
+                       (let ((conn (bl.net:accept-connection srv :timeout 10)))
                          (when conn
-                           (let ((p (bitcoin-lisp.networking:make-inbound-peer conn "127.0.0.1")))
+                           (let ((p (bl.net:make-inbound-peer conn "127.0.0.1")))
                              ;; Shared registry on purpose: this IS us.
                              (setf accepted
-                                   (bitcoin-lisp.networking:perform-inbound-handshake p))
+                                   (bl.net:perform-inbound-handshake p))
                              (ignore-errors
-                              (bitcoin-lisp.networking:disconnect-peer p))))))
+                              (bl.net:disconnect-peer p))))))
                      :name "test-selfconn-accept")))
              (sleep 0.3)
-             (let ((client (bitcoin-lisp.networking:connect-peer "127.0.0.1" port)))
+             (let ((client (bl.net:connect-peer "127.0.0.1" port)))
                (is-true client)
                (when client
                  ;; The dial itself may fail once the far side hangs up; what
                  ;; matters is that the inbound side refused the handshake.
-                 (ignore-errors (bitcoin-lisp.networking:perform-handshake client))
+                 (ignore-errors (bl.net:perform-handshake client))
                  (bt:join-thread server-thread)
                  (is (null accepted)
                      "the inbound side must refuse a connection carrying our own nonce")
                  ;; Always close the client socket, or the suite can hang on a
                  ;; lingering connection.
-                 (ignore-errors (bitcoin-lisp.networking:disconnect-peer client)))))
-        (bitcoin-lisp.networking:close-listener srv)))))
+                 (ignore-errors (bl.net:disconnect-peer client)))))
+        (bl.net:close-listener srv)))))

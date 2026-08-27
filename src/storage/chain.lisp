@@ -258,26 +258,26 @@ validation.cpp:6379-6388). O(index size) — fine for its callers
 
 ;;; Testnet genesis block hash (little-endian, as on wire)
 (defvar *testnet3-genesis-hash*
-  (bitcoin-lisp.crypto:hex-to-bytes
+  (bl.crypto:hex-to-bytes
    "43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000"))
 
 (defvar *testnet4-genesis-hash*
-  (bitcoin-lisp.crypto:hex-to-bytes
+  (bl.crypto:hex-to-bytes
    "43f08bdab050e35b567c864b91f47f50ae725ae2de53bcfbbaf284da00000000"))
 
 (defvar *signet-genesis-hash*
-  (bitcoin-lisp.crypto:hex-to-bytes
+  (bl.crypto:hex-to-bytes
    "f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e973988108000000"))
 
 ;;; Mainnet genesis block hash (little-endian, as on wire)
 (defvar *mainnet-genesis-hash*
-  (bitcoin-lisp.crypto:hex-to-bytes
+  (bl.crypto:hex-to-bytes
    "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000"))
 
 ;;; Regtest genesis block hash (little-endian). Big-endian display:
 ;;; 0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
 (defvar *regtest-genesis-hash*
-  (bitcoin-lisp.crypto:hex-to-bytes
+  (bl.crypto:hex-to-bytes
    "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"))
 
 (defun network-genesis-hash (network)
@@ -304,7 +304,7 @@ validation.cpp:6379-6388). O(index size) — fine for its callers
   (map '(simple-array (unsigned-byte 8) (*)) #'char-code string))
 
 (defparameter *genesis-output-pubkey*
-  (bitcoin-lisp.crypto:hex-to-bytes
+  (bl.crypto:hex-to-bytes
    "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f")
   "Satoshi's genesis coinbase pubkey (kernel/chainparams.cpp:71), used by
 mainnet, testnet3, signet and regtest. Verified by the genesis-hash check in
@@ -330,26 +330,26 @@ the timestamp message; one 50 BTC output to <pubkey> OP_CHECKSIG (testnet4:
          ;; CScript() << 486604799: minimal CScriptNum bytes of 0x1d00ffff,
          ;; little-endian -> ff ff 00 1d, pushed as data.
          (script-sig (concatenate '(simple-array (unsigned-byte 8) (*))
-                                  (bitcoin-lisp.serialization:script-push-data (vector #xff #xff #x00 #x1d))
-                                  (bitcoin-lisp.serialization:script-push-data (vector #x04))
-                                  (bitcoin-lisp.serialization:script-push-data message)))
+                                  (bl.ser:script-push-data (vector #xff #xff #x00 #x1d))
+                                  (bl.ser:script-push-data (vector #x04))
+                                  (bl.ser:script-push-data message)))
          (pubkey (if testnet4-p
                      (make-array 33 :element-type '(unsigned-byte 8)
                                     :initial-element 0)
                      *genesis-output-pubkey*))
          (script-pubkey (concatenate '(simple-array (unsigned-byte 8) (*))
-                                     (bitcoin-lisp.serialization:script-push-data pubkey)
+                                     (bl.ser:script-push-data pubkey)
                                      (vector #xac)))) ; OP_CHECKSIG
-    (bitcoin-lisp.serialization:make-transaction
+    (bl.ser:make-transaction
      :version 1
-     :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                      :previous-output (bitcoin-lisp.serialization:make-outpoint
+     :inputs (vector (bl.ser:make-tx-in
+                      :previous-output (bl.ser:make-outpoint
                                         :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                              :initial-element 0)
                                         :index #xffffffff)
                       :script-sig script-sig
                       :sequence #xffffffff))
-     :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+     :outputs (vector (bl.ser:make-tx-out
                        :value 5000000000
                        :script-pubkey script-pubkey))
      :lock-time 0)))
@@ -362,7 +362,7 @@ constructed coinbase — testnet4's differs from the other networks' — and the
 header hash is checked against the known genesis hash, so a wrong construction
 signals an error instead of returning a corrupt block."
   (let* ((coinbase (%genesis-coinbase network))
-         (merkle-root (bitcoin-lisp.serialization:transaction-hash coinbase))
+         (merkle-root (bl.ser:transaction-hash coinbase))
          (header
            (multiple-value-bind (timestamp bits nonce)
                (ecase network
@@ -371,27 +371,27 @@ signals an error instead of returning a corrupt block."
                  (:testnet4 (values 1714777860 #x1d00ffff 393743547))
                  (:signet   (values 1598918400 #x1e0377ae 52613770))
                  (:regtest  (values 1296688602 #x207fffff 2)))
-             (bitcoin-lisp.serialization:make-block-header
+             (bl.ser:make-block-header
               :version 1
               :prev-block (make-array 32 :element-type '(unsigned-byte 8)
                                          :initial-element 0)
               :merkle-root (copy-seq merkle-root)
               :timestamp timestamp :bits bits :nonce nonce)))
-         (hash (bitcoin-lisp.serialization:block-header-hash header)))
+         (hash (bl.ser:block-header-hash header)))
     (unless (equalp hash (network-genesis-hash network))
       (error "make-genesis-block: constructed ~A genesis hashes to ~A, expected ~A"
              network
-             (bitcoin-lisp.crypto:bytes-to-hex (bitcoin-lisp.crypto:reverse-bytes hash))
-             (bitcoin-lisp.crypto:bytes-to-hex
-              (bitcoin-lisp.crypto:reverse-bytes (network-genesis-hash network)))))
-    (bitcoin-lisp.serialization:make-bitcoin-block
+             (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash))
+             (bl.crypto:bytes-to-hex
+              (bl.crypto:reverse-bytes (network-genesis-hash network)))))
+    (bl.ser:make-bitcoin-block
      :header header
      :transactions (list coinbase))))
 
 (defun init-chain-state (base-path &key genesis-hash network)
   "Initialize chain state at BASE-PATH.
-NETWORK defaults to bitcoin-lisp:*network* if not specified."
-  (let ((net (or network bitcoin-lisp:*network*)))
+NETWORK defaults to bl:*network* if not specified."
+  (let ((net (or network bl:*network*)))
     (make-chain-state
      :base-path (pathname base-path)
      :genesis-hash (or genesis-hash (network-genesis-hash net))
@@ -964,14 +964,14 @@ data actually is, so a running node is untouched until it is migrated."
 (declaim (inline bb-write-chainwork))
 (defun bb-write-chainwork (bb value)
   "byte-buf variant of serialize-chainwork: 32 big-endian bytes."
-  (declare (type bitcoin-lisp.serialization::byte-buf bb)
+  (declare (type bl.ser::byte-buf bb)
            (optimize (speed 3) (safety 1)))
   (let ((bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
     (declare (type (simple-array (unsigned-byte 8) (32)) bytes))
     (loop for i fixnum from 0 below 32
           do (setf (aref bytes (- 31 i))
                    (logand (ash value (the fixnum (* -8 i))) #xFF)))
-    (bitcoin-lisp.serialization:bb-write-bytes bb bytes)))
+    (bl.ser:bb-write-bytes bb bytes)))
 
 (defun deserialize-chainwork (stream)
   "Read a 32-byte big-endian integer for chain-work."
@@ -987,13 +987,13 @@ data actually is, so a running node is untouched until it is migrated."
   "byte-buf variant: write 80-byte block header (zero-padded if short)."
   (declare (optimize (speed 3) (safety 1)))
   (if header
-      (let* ((header-bytes (bitcoin-lisp.serialization::serialize-block-header header))
+      (let* ((header-bytes (bl.ser::serialize-block-header header))
              (len (length header-bytes)))
         (declare (type fixnum len))
-        (bitcoin-lisp.serialization:bb-write-bytes bb header-bytes)
+        (bl.ser:bb-write-bytes bb header-bytes)
         (loop repeat (- 80 len)
-              do (bitcoin-lisp.serialization:bb-write-u8 bb 0)))
-      (loop repeat 80 do (bitcoin-lisp.serialization:bb-write-u8 bb 0))))
+              do (bl.ser:bb-write-u8 bb 0)))
+      (loop repeat 80 do (bl.ser:bb-write-u8 bb 0))))
 
 (defun bb-write-single-header-entry (bb entry)
   "byte-buf variant of write-single-header-entry. Writes 197 bytes (v3):
@@ -1006,22 +1006,22 @@ offsets. Neither is a reachable real value: file numbers are non-negative and
 a position that far into a file exceeds MAX_BLOCKFILE_SIZE by three orders of
 magnitude."
   (declare (optimize (speed 3) (safety 1)))
-  (bitcoin-lisp.serialization:bb-write-bytes bb (block-index-entry-hash entry))
-  (bitcoin-lisp.serialization:bb-write-u32-le bb (block-index-entry-height entry))
+  (bl.ser:bb-write-bytes bb (block-index-entry-hash entry))
+  (bl.ser:bb-write-u32-le bb (block-index-entry-height entry))
   (bb-write-header-bytes bb (block-index-entry-header entry))
   (bb-write-chainwork bb (block-index-entry-chain-work entry))
-  (bitcoin-lisp.serialization:bb-write-u8 bb
+  (bl.ser:bb-write-u8 bb
    (ecase (block-index-entry-status entry)
      (:unknown 0) (:header-valid 1) (:valid 2) (:invalid 3)))
   (let ((prev-entry (block-index-entry-prev-entry entry)))
     (if prev-entry
-        (bitcoin-lisp.serialization:bb-write-bytes bb (block-index-entry-hash prev-entry))
-        (loop repeat 32 do (bitcoin-lisp.serialization:bb-write-u8 bb 0))))
-  (bitcoin-lisp.serialization:bb-write-u32-le bb (block-index-entry-tx-count entry))
-  (bitcoin-lisp.serialization:bb-write-i32-le bb (or (block-index-entry-file entry) -1))
-  (bitcoin-lisp.serialization:bb-write-u32-le
+        (bl.ser:bb-write-bytes bb (block-index-entry-hash prev-entry))
+        (loop repeat 32 do (bl.ser:bb-write-u8 bb 0))))
+  (bl.ser:bb-write-u32-le bb (block-index-entry-tx-count entry))
+  (bl.ser:bb-write-i32-le bb (or (block-index-entry-file entry) -1))
+  (bl.ser:bb-write-u32-le
    bb (or (block-index-entry-data-pos entry) #xFFFFFFFF))
-  (bitcoin-lisp.serialization:bb-write-u32-le
+  (bl.ser:bb-write-u32-le
    bb (or (block-index-entry-undo-pos entry) #xFFFFFFFF)))
 
 (defun %write-header-index-snapshot (state)
@@ -1034,12 +1034,12 @@ rebinds the (now empty) delta to the NEW snapshot's CRC."
     ;; Core's blocks/index/ may not exist yet on a fresh datadir, and the
     ;; atomic temp+rename below writes into that directory.
     (ensure-directories-exist path)
-    (bitcoin-lisp.storage:save-file-with-crc32-bb
+    (bl.store:save-file-with-crc32-bb
      path
      (lambda (bb)
-       (bitcoin-lisp.serialization:bb-write-bytes bb *header-index-magic*)
-       (bitcoin-lisp.serialization:bb-write-u32-le bb +header-index-format-version+)
-       (bitcoin-lisp.serialization:bb-write-u32-le
+       (bl.ser:bb-write-bytes bb *header-index-magic*)
+       (bl.ser:bb-write-u32-le bb +header-index-format-version+)
+       (bl.ser:bb-write-u32-le
         bb (hash-table-count (chain-state-block-index state)))
        (maphash (lambda (hash entry)
                   (declare (ignore hash))
@@ -1083,21 +1083,21 @@ a crash mid-append leaves behind."
     (unless crc
       (return-from %append-header-index-delta nil))
     (handler-case
-        (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+        (let ((bb (bl.ser:make-byte-buf)))
           ;; A brand-new log opens with the identity of the snapshot it extends.
           (when fresh
-            (bitcoin-lisp.serialization:bb-write-bytes bb *header-index-delta-magic*)
-            (bitcoin-lisp.serialization:bb-write-u32-le bb +header-index-delta-version+)
-            (bitcoin-lisp.serialization:bb-write-bytes bb crc))
-          (let ((payload (bitcoin-lisp.serialization:make-byte-buf)))
-            (bitcoin-lisp.serialization:bb-write-u32-le payload (length entries))
+            (bl.ser:bb-write-bytes bb *header-index-delta-magic*)
+            (bl.ser:bb-write-u32-le bb +header-index-delta-version+)
+            (bl.ser:bb-write-bytes bb crc))
+          (let ((payload (bl.ser:make-byte-buf)))
+            (bl.ser:bb-write-u32-le payload (length entries))
             (dolist (e entries)
               (bb-write-single-header-entry payload e))
-            (let ((bytes (bitcoin-lisp.serialization:bb-finish payload)))
-              (bitcoin-lisp.serialization:bb-write-bytes bb bytes)
-              (bitcoin-lisp.serialization:bb-write-bytes
-               bb (bitcoin-lisp.storage:compute-crc32 bytes))))
-          (let ((all (bitcoin-lisp.serialization:bb-finish bb)))
+            (let ((bytes (bl.ser:bb-finish payload)))
+              (bl.ser:bb-write-bytes bb bytes)
+              (bl.ser:bb-write-bytes
+               bb (bl.store:compute-crc32 bytes))))
+          (let ((all (bl.ser:bb-finish bb)))
             (with-open-file (out path :direction :output
                                       :element-type '(unsigned-byte 8)
                                       :if-exists :append
@@ -1227,7 +1227,7 @@ shape of a crash mid-append — and keeps everything before it."
                       (return))
                     (let ((payload (subseq bytes pos (+ pos payload-len)))
                           (crc (subseq bytes (+ pos payload-len) frame-end)))
-                      (unless (equalp crc (bitcoin-lisp.storage:compute-crc32 payload))
+                      (unless (equalp crc (bl.store:compute-crc32 payload))
                         (return))
                       (let ((batch (make-hash-table :test 'equalp))
                             (prevs (make-hash-table :test 'equalp)))
@@ -1304,7 +1304,7 @@ loading block database\" rather than an empty index (init.cpp)."
 (defun load-header-index-legacy (state file-bytes)
   "Load header index from old format (no magic, no checksum)."
   (flexi-streams:with-input-from-sequence (stream file-bytes)
-    (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
+    (let ((count (bl.ser:read-uint32-le stream))
           (entries-by-hash (make-hash-table :test 'equalp))
           (prev-hash-map (make-hash-table :test 'equalp)))
       (dotimes (i count)
@@ -1335,13 +1335,13 @@ loading block database\" rather than an empty index (init.cpp)."
       (read-sequence magic stream))
     ;; Check version: v1 entries lack the trailing tx-count (read as 0,
     ;; backfilled lazily); v2 includes it.
-    (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
+    (let ((version (bl.ser:read-uint32-le stream)))
       (unless (member version '(1 2 3))
         (return-from load-header-index-v1
           (values nil (format nil "unsupported format version ~D (this build writes ~D)"
                               version +header-index-format-version+))))
       ;; Read entries
-      (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
+      (let ((count (bl.ser:read-uint32-le stream))
             (entries-by-hash (make-hash-table :test 'equalp))
             (prev-hash-map (make-hash-table :test 'equalp))
             (with-tx-count (>= version 2))
@@ -1365,7 +1365,7 @@ per-block file named by its hash. That is what makes the dual-read of P2
 possible, and why the position is nullable rather than defaulted."
   (let ((hash (make-array 32 :element-type '(unsigned-byte 8))))
     (read-sequence hash stream)
-    (let* ((height (bitcoin-lisp.serialization:read-uint32-le stream))
+    (let* ((height (bl.ser:read-uint32-le stream))
            (header-bytes (make-array 80 :element-type '(unsigned-byte 8))))
       (read-sequence header-bytes stream)
       (let* ((chainwork (deserialize-chainwork stream))
@@ -1375,17 +1375,17 @@ possible, and why the position is nullable rather than defaulted."
              (prev-hash (make-array 32 :element-type '(unsigned-byte 8))))
         (read-sequence prev-hash stream)
         (let ((tx-count (if with-tx-count
-                            (bitcoin-lisp.serialization:read-uint32-le stream)
+                            (bl.ser:read-uint32-le stream)
                             0))
               (header (handler-case
                           (flexi-streams:with-input-from-sequence (hs header-bytes)
-                            (bitcoin-lisp.serialization::read-block-header hs))
+                            (bl.ser::read-block-header hs))
                         (error () nil))))
           (multiple-value-bind (file data-pos undo-pos)
               (if with-position
-                  (let ((f (bitcoin-lisp.serialization:read-int32-le stream))
-                        (d (bitcoin-lisp.serialization:read-uint32-le stream))
-                        (u (bitcoin-lisp.serialization:read-uint32-le stream)))
+                  (let ((f (bl.ser:read-int32-le stream))
+                        (d (bl.ser:read-uint32-le stream))
+                        (u (bl.ser:read-uint32-le stream)))
                     (values (unless (minusp f) f)
                             (unless (= d #xFFFFFFFF) d)
                             (unless (= u #xFFFFFFFF) u)))

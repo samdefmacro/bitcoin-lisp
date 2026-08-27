@@ -25,7 +25,7 @@ start rather than hand out templates that cannot be completed.")
   "Effective -blockreservedweight. Space held back for the header and the
 coinbase the mining client will add (Core DEFAULT_BLOCK_RESERVED_WEIGHT).")
 
-(defparameter *block-max-weight* bitcoin-lisp.validation:+max-block-weight+
+(defparameter *block-max-weight* bl.val:+max-block-weight+
   "Effective -blockmaxweight: the weight this node fills templates up to. Core
 defaults it to MAX_BLOCK_WEIGHT (policy.h:24) and refuses anything above it.
 SELECTION ONLY -- it never relaxes the consensus limit, which
@@ -87,11 +87,11 @@ BIP94 floor). Shared by the template assembler and getmininginfo's \"next\"
 block so the two cannot disagree on the next block's bits."
   (let ((mtp-floor (1+ mtp)))
     (if (and tip
-             (zerop (mod height bitcoin-lisp.storage:+difficulty-adjustment-interval+)))
+             (zerop (mod height bl.store:+difficulty-adjustment-interval+)))
         (max mtp-floor
-             (- (bitcoin-lisp.serialization:block-header-timestamp
-                 (bitcoin-lisp.storage:block-index-entry-header tip))
-                bitcoin-lisp.validation:+max-timewarp+))
+             (- (bl.ser:block-header-timestamp
+                 (bl.store:block-index-entry-header tip))
+                bl.val:+max-timewarp+))
         mtp-floor)))
 
 (defun next-block-required-bits (chain-state prev-entry block-time)
@@ -99,14 +99,14 @@ block so the two cannot disagree on the next block's bits."
 Bitcoin Core's GetNextWorkRequired. Reuses the consensus get-expected-bits and
 falls back to the testnet min-difficulty / walk-back rule when it is
 non-definitive (testnet non-boundary)."
-  (let* ((height (1+ (bitcoin-lisp.storage:block-index-entry-height prev-entry)))
-         (expected (bitcoin-lisp.validation:get-expected-bits height prev-entry)))
+  (let* ((height (1+ (bl.store:block-index-entry-height prev-entry)))
+         (expected (bl.val:get-expected-bits height prev-entry)))
     (or expected
-        (let ((prev-time (bitcoin-lisp.serialization:block-header-timestamp
-                          (bitcoin-lisp.storage:block-index-entry-header prev-entry))))
-          (if (bitcoin-lisp.validation:testnet-min-difficulty-allowed-p block-time prev-time)
-              bitcoin-lisp.storage:+pow-limit-bits+
-              (bitcoin-lisp.validation:testnet-walk-back-bits prev-entry))))))
+        (let ((prev-time (bl.ser:block-header-timestamp
+                          (bl.store:block-index-entry-header prev-entry))))
+          (if (bl.val:testnet-min-difficulty-allowed-p block-time prev-time)
+              bl.store:+pow-limit-bits+
+              (bl.val:testnet-walk-back-bits prev-entry))))))
 
 (defun build-witness-commitment-script (commitment)
   "The 38-byte coinbase witness-commitment scriptPubKey for COMMITMENT (a
@@ -123,14 +123,14 @@ whose coinbase wtxid is zero and whose other txs are SELECTED (mempool-entries),
 with the all-zero reserved value. Mirrors GenerateCoinbaseCommitment."
   (let* ((wtxids (cons (%zeros32)
                        (mapcar (lambda (e)
-                                 (bitcoin-lisp.serialization:transaction-wtxid
-                                  (bitcoin-lisp.mempool:mempool-entry-transaction e)))
+                                 (bl.ser:transaction-wtxid
+                                  (bl.mp:mempool-entry-transaction e)))
                                selected)))
-         (witness-root (bitcoin-lisp.validation:compute-merkle-root wtxids))
+         (witness-root (bl.val:compute-merkle-root wtxids))
          ;; commitment = hash256(witness-root || 32 zero reserved bytes)
          (combined (make-array 64 :element-type '(unsigned-byte 8) :initial-element 0)))
     (replace combined witness-root :start1 0)
-    (let ((commitment (bitcoin-lisp.crypto:hash256 combined)))
+    (let ((commitment (bl.crypto:hash256 combined)))
       (values commitment (build-witness-commitment-script commitment)))))
 
 (defmacro %with-mempool-lock (&body body)
@@ -141,9 +141,9 @@ forbids concurrent txgraph mutation, so the walk must exclude the network
 and sync threads' mempool writes. Outside a running node (unit tests,
 direct calls) there is nothing to lock. Mirrors networking's WITH-NODE-LOCK
 (protocol.lisp:7), duplicated because mining loads before networking."
-  `(let ((node bitcoin-lisp::*node*))
+  `(let ((node bl::*node*))
      (if node
-         (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+         (bt:with-recursive-lock-held ((bl::node-lock node))
            ,@body)
          (progn ,@body))))
 
@@ -160,9 +160,9 @@ later chunks pay less), or after +MAX-CONSECUTIVE-FAILURES+ skips once the
 block is nearly full. Returns (values entries fees weight sigops), ENTRIES
 in block (topological) order, WEIGHT/SIGOPS including the coinbase reserve."
   (%with-mempool-lock
-    (let ((builder (bitcoin-lisp.mempool:make-block-builder
-                    (bitcoin-lisp.mempool:mempool-graph mempool)))
-          (min-feerate (bitcoin-lisp.mempool:make-feefrac *block-min-tx-fee-rate* 1000))
+    (let ((builder (bl.mp:make-block-builder
+                    (bl.mp:mempool-graph mempool)))
+          (min-feerate (bl.mp:make-feefrac *block-min-tx-fee-rate* 1000))
           (selected '())
           (weight *block-reserved-weight*)
           (sigops +coinbase-reserved-sigops+)
@@ -171,24 +171,24 @@ in block (topological) order, WEIGHT/SIGOPS including the coinbase reserve."
       (unwind-protect
            (loop
            (multiple-value-bind (handles feerate)
-               (bitcoin-lisp.mempool:block-builder-current-chunk builder)
+               (bl.mp:block-builder-current-chunk builder)
              (when (null handles) (return))
              ;; blockMinFeeRate early-out (miner.cpp:299-303): everything
              ;; else the builder would offer has a lower feerate.
-             (when (bitcoin-lisp.mempool:feefrac<< feerate min-feerate)
+             (when (bl.mp:feefrac<< feerate min-feerate)
                (return))
              (let ((entries (mapcar (lambda (h)
-                                      (bitcoin-lisp.mempool:mempool-get
-                                       mempool (bitcoin-lisp.mempool:tx-handle-data h)))
+                                      (bl.mp:mempool-get
+                                       mempool (bl.mp:tx-handle-data h)))
                                     handles))
                    (chunk-weight 0)
                    (chunk-sigops 0)
                    (chunk-fees 0))
                (dolist (e entries)
-                 (incf chunk-weight (bitcoin-lisp.serialization:transaction-weight
-                                     (bitcoin-lisp.mempool:mempool-entry-transaction e)))
-                 (incf chunk-sigops (bitcoin-lisp.mempool:mempool-entry-sigops e))
-                 (incf chunk-fees (bitcoin-lisp.mempool:mempool-entry-fee e)))
+                 (incf chunk-weight (bl.ser:transaction-weight
+                                     (bl.mp:mempool-entry-transaction e)))
+                 (incf chunk-sigops (bl.mp:mempool-entry-sigops e))
+                 (incf chunk-fees (bl.mp:mempool-entry-fee e)))
                (cond
                  ;; Core rejects on >= for both budgets (miner.cpp:244-253);
                  ;; its weight test uses the graph's sigops-adjusted weight
@@ -197,10 +197,10 @@ in block (topological) order, WEIGHT/SIGOPS including the coinbase reserve."
                  ((and (< (+ weight chunk-weight)
                           *block-max-weight*)
                        (< (+ sigops chunk-sigops)
-                          bitcoin-lisp.validation:+max-block-sigops-cost+)
+                          bl.val:+max-block-sigops-cost+)
                        (every (lambda (e)
-                                (bitcoin-lisp.validation:check-transaction-final
-                                 (bitcoin-lisp.mempool:mempool-entry-transaction e)
+                                (bl.val:check-transaction-final
+                                 (bl.mp:mempool-entry-transaction e)
                                  height lock-time-cutoff))
                               entries))
                   (dolist (e entries) (push e selected))
@@ -208,15 +208,15 @@ in block (topological) order, WEIGHT/SIGOPS including the coinbase reserve."
                   (incf sigops chunk-sigops)
                   (incf fees chunk-fees)
                   (setf consecutive-failures 0)
-                  (bitcoin-lisp.mempool:block-builder-include builder))
+                  (bl.mp:block-builder-include builder))
                  (t
-                  (bitcoin-lisp.mempool:block-builder-skip builder)
+                  (bl.mp:block-builder-skip builder)
                   (when (and (> (incf consecutive-failures)
                                 +max-consecutive-failures+)
                              (> (+ weight +block-full-enough-weight-delta+)
                                 *block-max-weight*))
                     (return)))))))
-        (bitcoin-lisp.mempool:block-builder-finish builder))
+        (bl.mp:block-builder-finish builder))
       (values (nreverse selected) fees weight sigops))))
 
 (defun assemble-block-template (chain-state mempool &key block-time)
@@ -234,14 +234,14 @@ each tested against their own consensus budget instead - equally safe,
 marginally less conservative for sigops-dense chunks. Chunk feerates order
 by fee/adjusted-vsize, matching Core's fee/adjusted-weight ordering up to
 the per-tx ceiling."
-  (let* ((tip (bitcoin-lisp.storage:get-block-index-entry
-               chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
-         (prev-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-         (height (if tip (1+ (bitcoin-lisp.storage:block-index-entry-height tip)) 0))
-         (now (or block-time (bitcoin-lisp.serialization:get-unix-time)))
+  (let* ((tip (bl.store:get-block-index-entry
+               chain-state (bl.store:best-block-hash chain-state)))
+         (prev-hash (bl.store:best-block-hash chain-state))
+         (height (if tip (1+ (bl.store:block-index-entry-height tip)) 0))
+         (now (or block-time (bl.ser:get-unix-time)))
          ;; Median-time-past: the locktime cutoff for tx finality (Core
          ;; m_lock_time_cutoff, miner.cpp:150) and, +1, the header floor.
-         (mtp (or (bitcoin-lisp.validation:compute-median-time-past-from-entry tip) 0))
+         (mtp (or (bl.val:compute-median-time-past-from-entry tip) 0))
          ;; Header time floor (Core GetMinimumTime, miner.cpp:36-47): MTP+1,
          ;; raised at retarget heights to the previous block's ACTUAL time
          ;; minus MAX_TIMEWARP — the BIP94 timewarp rule, applied on ALL
@@ -256,7 +256,7 @@ the per-tx ceiling."
          (curtime (max now mintime))
          (bits (if tip
                    (next-block-required-bits chain-state tip curtime)
-                   bitcoin-lisp.storage:+pow-limit-bits+)))
+                   bl.store:+pow-limit-bits+)))
     (multiple-value-bind (selected fees weight sigops)
         (%select-chunks mempool height mtp)
       (multiple-value-bind (commitment script) (%default-witness-commitment selected)
@@ -265,6 +265,6 @@ the per-tx ceiling."
                :height height :prev-hash prev-hash :bits bits
                :curtime curtime :mintime mintime
                :transactions selected :total-fees fees :total-weight weight :total-sigops sigops
-               :coinbase-value (+ (bitcoin-lisp.validation:calculate-block-subsidy height) fees)
+               :coinbase-value (+ (bl.val:calculate-block-subsidy height) fees)
                :witness-commitment commitment
                :default-witness-commitment-script script))))))

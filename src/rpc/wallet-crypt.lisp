@@ -53,18 +53,18 @@ NUL-in-passphrase error message the RPCs emit."
 Note GetHash is the double-SHA256, NOT the Hash160 that GetID (the map key)
 uses, and the bytes are taken in natural digest order — never reversed, and
 never via a display-hex round trip."
-  (subseq (bitcoin-lisp.crypto:hash256 pubkey) 0 16))
+  (subseq (bl.crypto:hash256 pubkey) 0 16))
 
 (defun encrypt-secret (master-key32 secret32 pubkey)
   "Core EncryptSecret: AES-256-CBC the bare 32-byte secret scalar under the
 master key, keyed by the pubkey-derived IV. Note it is the raw scalar, not
 the DER CPrivKey our plaintext records store."
-  (bitcoin-lisp.crypto:aes-256-cbc-encrypt master-key32 (%secret-iv pubkey)
+  (bl.crypto:aes-256-cbc-encrypt master-key32 (%secret-iv pubkey)
                                            secret32))
 
 (defun decrypt-secret (master-key32 ciphertext pubkey)
   "Core DecryptSecret. NIL on any failure."
-  (bitcoin-lisp.crypto:aes-256-cbc-decrypt master-key32 (%secret-iv pubkey)
+  (bl.crypto:aes-256-cbc-decrypt master-key32 (%secret-iv pubkey)
                                            ciphertext))
 
 (defun decrypt-key (master-key32 pubkey ciphertext)
@@ -79,8 +79,8 @@ DERIVE-PUBLIC-KEY signals on an out-of-range scalar."
   (let ((secret (decrypt-secret master-key32 ciphertext pubkey)))
     (when (and secret
                (= (length secret) 32)
-               (bitcoin-lisp.crypto:valid-private-key-p secret)
-               (equalp (bitcoin-lisp.crypto:derive-public-key
+               (bl.crypto:valid-private-key-p secret)
+               (equalp (bl.crypto:derive-public-key
                         secret :compressed (= (length pubkey) 33))
                        pubkey))
       secret)))
@@ -89,7 +89,7 @@ DERIVE-PUBLIC-KEY signals on an out-of-range scalar."
 
 (defun %derive-master-key-parts (passphrase mk)
   "(values key32 iv16) for MK's KDF parameters, or (values NIL NIL)."
-  (bitcoin-lisp.crypto:crypter-derive-key
+  (bl.crypto:crypter-derive-key
    (passphrase-octets passphrase)
    (wallet-master-key-salt mk)
    (wallet-master-key-derive-iterations mk)
@@ -103,17 +103,17 @@ A wrong passphrase yields a random block whose chance of unpadding to
 exactly 32 bytes is negligible, so this doubles as the passphrase check."
   (multiple-value-bind (key iv) (%derive-master-key-parts passphrase mk)
     (when key
-      (let ((plain (bitcoin-lisp.crypto:aes-256-cbc-decrypt
+      (let ((plain (bl.crypto:aes-256-cbc-decrypt
                     key iv (wallet-master-key-crypted-key mk))))
         (when (and plain (= (length plain)
-                            bitcoin-lisp.crypto:+wallet-crypto-key-size+))
+                            bl.crypto:+wallet-crypto-key-size+))
           plain)))))
 
 (defun %time-derivation (passphrase salt iterations)
   "Milliseconds one KDF run of ITERATIONS takes, at least 1 (Core divides by
 this, and a zero duration would be a division by zero)."
   (let ((start (get-internal-real-time)))
-    (bitcoin-lisp.crypto:crypter-derive-key (passphrase-octets passphrase)
+    (bl.crypto:crypter-derive-key (passphrase-octets passphrase)
                                             salt iterations 0)
     (max 1 (round (* 1000 (- (get-internal-real-time) start))
                   internal-time-units-per-second))))
@@ -136,16 +136,16 @@ Core's two-measurement average is kept verbatim; the ceiling is ours."
                     2))
     (setf iterations (max iterations +master-key-default-derive-iterations+))
     (when (> iterations +master-key-max-derive-iterations+)
-      (bitcoin-lisp:log-warn
+      (bl:log-warn
        "KDF calibration produced ~D iterations (the machine was probably loaded); clamping to ~D"
        iterations +master-key-max-derive-iterations+)
       (setf iterations +master-key-max-derive-iterations+))
     (multiple-value-bind (key iv)
-        (bitcoin-lisp.crypto:crypter-derive-key (passphrase-octets passphrase)
+        (bl.crypto:crypter-derive-key (passphrase-octets passphrase)
                                                 salt iterations 0)
       (when key
         (make-wallet-master-key
-         :crypted-key (bitcoin-lisp.crypto:aes-256-cbc-encrypt
+         :crypted-key (bl.crypto:aes-256-cbc-encrypt
                        key iv plain-master32)
          :salt salt
          :derivation-method 0
@@ -178,7 +178,7 @@ check is a handful of AES blocks."
                                      (return-from spkm-keys))))
                         (desc-spkm-crypted-keys spkm))))
     (when (and any-pass any-fail)
-      (bitcoin-lisp:log-warn
+      (bl:log-warn
        "The wallet is probably corrupted: Some keys decrypt but not all.")
       (error 'rpc-error :code +rpc-wallet-error+
                         :message "Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt."))
@@ -220,7 +220,7 @@ because it is what getwalletinfo reports; RELOCK-DEADLINE is monotonic
 because it is what actually fires — a backward clock step must never extend
 an unlock window."
   (setf (wallet-relock-time wallet)
-        (+ (bitcoin-lisp.serialization:get-unix-time) timeout)
+        (+ (bl.ser:get-unix-time) timeout)
         (wallet-relock-deadline wallet)
         (+ (get-internal-real-time)
            (* timeout internal-time-units-per-second))))
@@ -265,7 +265,7 @@ to re-prove the passphrase."
               ;; Persist before mutating memory: Core ignores the write
               ;; result here and can end up with memory and disk disagreeing
               ;; about which passphrase works.
-              (bitcoin-lisp.storage:leveldb-put
+              (bl.store:leveldb-put
                (wallet-db wallet) (wdb-key-mkey id)
                (wdb-mkey-value (wallet-master-key-crypted-key new-mk)
                                (wallet-master-key-salt new-mk)
@@ -274,7 +274,7 @@ to re-prove the passphrase."
                                (wallet-master-key-other-params new-mk))
                :sync t)
               (setf (gethash id (wallet-master-keys wallet)) new-mk)
-              (bitcoin-lisp:log-info
+              (bl:log-info
                "Wallet passphrase changed to an nDeriveIterations of ~D"
                (wallet-master-key-derive-iterations new-mk))
               (when was-unlocked
@@ -304,7 +304,7 @@ point leaves both the file and the in-memory maps exactly as they were."
              (maphash
               (lambda (keyid entry)
                 (destructuring-bind (priv32 . compressed-p) entry
-                  (let* ((pubkey (bitcoin-lisp.crypto:derive-public-key
+                  (let* ((pubkey (bl.crypto:derive-public-key
                                   priv32 :compressed compressed-p))
                          (ciphertext (encrypt-secret plain-master priv32 pubkey)))
                     (unless (equalp priv32
@@ -339,20 +339,20 @@ consistent encrypted wallet that merely kept its old seed."
   (when (wallet-has-encryption-keys-p wallet)
     (return-from encrypt-wallet nil))
   (let* ((plain-master (ironclad:random-data
-                        bitcoin-lisp.crypto:+wallet-crypto-key-size+))
+                        bl.crypto:+wallet-crypto-key-size+))
          (salt (ironclad:random-data
-                bitcoin-lisp.crypto:+wallet-crypto-salt-size+))
+                bl.crypto:+wallet-crypto-salt-size+))
          (mk (encrypt-master-key passphrase plain-master salt
                                  +master-key-default-derive-iterations+)))
     (unless (and mk (equalp plain-master (decrypt-master-key passphrase mk)))
       (error 'rpc-error :code +rpc-wallet-encryption-failed+
                         :message "Error: Failed to encrypt the wallet."))
-    (bitcoin-lisp:log-info "Encrypting Wallet with an nDeriveIterations of ~D"
+    (bl:log-info "Encrypting Wallet with an nDeriveIterations of ~D"
                            (wallet-master-key-derive-iterations mk))
     (with-wallet-lock (wallet)
       (let ((staged (%wallet-staged-encryptions wallet plain-master)))
-        (bitcoin-lisp.storage:with-leveldb-writebatch (batch)
-          (bitcoin-lisp.storage:leveldb-writebatch-put
+        (bl.store:with-leveldb-writebatch (batch)
+          (bl.store:leveldb-writebatch-put
            batch (wdb-key-mkey 1)
            (wdb-mkey-value (wallet-master-key-crypted-key mk)
                            (wallet-master-key-salt mk)
@@ -362,16 +362,16 @@ consistent encrypted wallet that merely kept its old seed."
           (dolist (entry staged)
             (destructuring-bind (spkm keyid pubkey ciphertext) entry
               (declare (ignore keyid))
-              (bitcoin-lisp.storage:leveldb-writebatch-put
+              (bl.store:leveldb-writebatch-put
                batch
                (wdb-key-descriptor-key +wdb-key-walletdescriptorckey+
                                        (desc-spkm-id spkm) pubkey)
                (wdb-vector-value ciphertext))
-              (bitcoin-lisp.storage:leveldb-writebatch-delete
+              (bl.store:leveldb-writebatch-delete
                batch
                (wdb-key-descriptor-key +wdb-key-walletdescriptorkey+
                                        (desc-spkm-id spkm) pubkey))))
-          (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t))
+          (bl.store:leveldb-write (wallet-db wallet) batch :sync t))
         ;; The write landed; only now does memory follow.
         (setf (gethash 1 (wallet-master-keys wallet)) mk
               (wallet-master-key-max-id wallet) 1)
@@ -403,9 +403,9 @@ consistent encrypted wallet that merely kept its old seed."
     ;; only a tombstone, so the plaintext DER bytes survive in the SST files
     ;; until a compaction drops them. This is NOT an erasure guarantee,
     ;; which is exactly why the RPC tells the user to take a fresh backup.
-    (handler-case (bitcoin-lisp.storage:leveldb-compact (wallet-db wallet))
+    (handler-case (bl.store:leveldb-compact (wallet-db wallet))
       (error (e)
-        (bitcoin-lisp:log-warn "wallet compaction after encryption failed: ~A" e)))
+        (bl:log-warn "wallet compaction after encryption failed: ~A" e)))
     t))
 
 ;;; --- The relock sweeper (wallet P6) ---
@@ -440,7 +440,7 @@ consistent encrypted wallet that merely kept its old seed."
                            (wallet-relock-deadline wallet)))
               (lock-wallet wallet))))
       (error (e)
-        (bitcoin-lisp:log-warn "relock sweep failed for wallet ~A: ~A"
+        (bl:log-warn "relock sweep failed for wallet ~A: ~A"
                                (wallet-name wallet) e)))))
 
 (defun ensure-relock-sweeper (manager)
@@ -458,7 +458,7 @@ successful unlock; idempotent."
                         ;; silently end all future sweeps.
                         (handler-case (%relock-sweep manager)
                           (error (e)
-                            (bitcoin-lisp:log-warn "relock sweep pass failed: ~A" e)))))
+                            (bl:log-warn "relock sweep pass failed: ~A" e)))))
              :name "wallet-relock")))))
 
 (defun stop-relock-sweeper (manager)
@@ -468,7 +468,7 @@ successful unlock; idempotent."
     (when thread
       ;; The loop polls the flag every second, so this returns promptly and
       ;; never reaches the destroy fallback.
-      (bitcoin-lisp.networking:join-thread-or-destroy thread)
+      (bl.net:join-thread-or-destroy thread)
       (setf (wallet-manager-relock-thread manager) nil))))
 
 ;;; --- Encryption RPCs (Core wallet/rpc/encrypt.cpp) ---
@@ -564,7 +564,7 @@ Calling it on an already-unlocked wallet succeeds and re-arms the timer."
                 (loop for spkm being the hash-values of (wallet-internal-spkms wallet)
                       do (spkm-top-up wallet spkm)))
             (error (e)
-              (bitcoin-lisp:log-warn "keypool top-up after unlock failed: ~A" e))))))
+              (bl:log-warn "keypool top-up after unlock failed: ~A" e))))))
     (ensure-relock-sweeper manager)
     nil))
 
@@ -622,7 +622,7 @@ PARAMS: (oldpassphrase newpassphrase). Returns null."
 (defconstant +wallet-dump-version+ 1)
 
 (defun %hex-encode (bytes)
-  (string-downcase (bitcoin-lisp.crypto:bytes-to-hex bytes)))
+  (string-downcase (bl.crypto:bytes-to-hex bytes)))
 
 (defun %wallet-dump-lines (wallet)
   "The dump's header and record lines, in LevelDB key order."
@@ -651,7 +651,7 @@ user asked for."
                 (dolist (line (%wallet-dump-lines wallet))
                   (write-string line s)
                   (write-char #\Newline s)))))
-    (let ((checksum (bitcoin-lisp.crypto:hash256
+    (let ((checksum (bl.crypto:hash256
                      (flexi-streams:string-to-octets body
                                                      :external-format :latin-1))))
       (unwind-protect
@@ -673,7 +673,7 @@ user asked for."
              ;; POSIX does not make the rename itself durable until the
              ;; containing directory is synced (storage/utxo.lisp does the
              ;; same for the same reason).
-             (bitcoin-lisp.storage::fsync-directory path)
+             (bl.store::fsync-directory path)
              (setf temp nil))
         ;; A failed dump must not leave a partial file that looks like a
         ;; backup (Core dump.cpp:104-106 removes its temp the same way).
@@ -716,9 +716,9 @@ and the checksum over the whole file — BEFORE the caller creates anything."
                          (write-char #\Newline s)))))
           (unless (and (> (length checksum-line) 9)
                        (string= "checksum," checksum-line :end2 9)
-                       (equalp (bitcoin-lisp.crypto:hex-to-bytes
+                       (equalp (bl.crypto:hex-to-bytes
                                 (subseq checksum-line 9))
-                               (bitcoin-lisp.crypto:hash256
+                               (bl.crypto:hash256
                                 (flexi-streams:string-to-octets
                                  body :external-format :latin-1))))
             (return-from %parse-wallet-dump nil))
@@ -736,9 +736,9 @@ and the checksum over the whole file — BEFORE the caller creates anything."
           (loop for line in (cdddr body-lines)
                 for comma = (position #\, line)
                 unless comma do (return-from %parse-wallet-dump nil)
-                collect (cons (bitcoin-lisp.crypto:hex-to-bytes
+                collect (cons (bl.crypto:hex-to-bytes
                                (subseq line 0 comma))
-                              (bitcoin-lisp.crypto:hex-to-bytes
+                              (bl.crypto:hex-to-bytes
                                (subseq line (1+ comma)))))))
     (error () nil)))
 
@@ -791,7 +791,7 @@ ciphertext."
             (wallet-write-best-block wallet)
             (%write-wallet-dump wallet path)))
       (error (e)
-        (bitcoin-lisp:log-warn "backupwallet failed: ~A" e)
+        (bl:log-warn "backupwallet failed: ~A" e)
         (error 'rpc-error :code +rpc-wallet-error+
                           :message "Error: Wallet backup failed!")))
     nil))
@@ -801,7 +801,7 @@ ciphertext."
 if this call created it — a pre-existing directory may hold files that are
 none of our business."
   (ignore-errors
-   (bitcoin-lisp.storage:leveldb-destroy-db
+   (bl.store:leveldb-destroy-db
     (namestring (uiop:ensure-directory-pathname path))))
   (unless existed
     (ignore-errors
@@ -854,15 +854,15 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
               (unwind-protect
                    ;; One batch: the restored database is either complete
                    ;; or absent, never half-written.
-                   (bitcoin-lisp.storage:with-leveldb-writebatch (batch)
+                   (bl.store:with-leveldb-writebatch (batch)
                      (dolist (record records)
-                       (bitcoin-lisp.storage:leveldb-writebatch-put
+                       (bl.store:leveldb-writebatch-put
                         batch (car record) (cdr record)))
-                     (bitcoin-lisp.storage:leveldb-write db batch :sync t))
-                (bitcoin-lisp.storage:leveldb-close db)))
+                     (bl.store:leveldb-write db batch :sync t))
+                (bl.store:leveldb-close db)))
           (error (e)
             (%restore-cleanup path existed)
-            (bitcoin-lisp:log-warn "restorewallet: writing ~A failed: ~A" name e)
+            (bl:log-warn "restorewallet: writing ~A failed: ~A" name e)
             (error 'rpc-error :code +rpc-wallet-error+
                               :message (format nil "Wallet loading failed. ~A" e)))))
       (handler-case

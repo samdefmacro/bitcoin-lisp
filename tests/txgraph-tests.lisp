@@ -21,44 +21,44 @@
 
 ;;;; Shorthands
 
-(defun %tg-new (&rest args) (apply #'bitcoin-lisp.mempool:make-txgraph args))
-(defun %tg-add (g fee size) (bitcoin-lisp.mempool:txgraph-add-transaction g fee size))
-(defun %tg-dep (g p c) (bitcoin-lisp.mempool:txgraph-add-dependency g p c))
-(defun %tg-rm (g h) (bitcoin-lisp.mempool:txgraph-remove-transaction g h))
-(defun %tg-setfee (g h fee) (bitcoin-lisp.mempool:txgraph-set-transaction-fee g h fee))
-(defun %tg-exists (g h) (bitcoin-lisp.mempool:txgraph-exists-p g h))
-(defun %tg-count (g) (bitcoin-lisp.mempool:txgraph-tx-count g))
-(defun %tg-oversized (g) (bitcoin-lisp.mempool:txgraph-oversized-p g))
-(defun %tg-feerate (g h) (bitcoin-lisp.mempool:txgraph-get-individual-feerate g h))
-(defun %tg-chunk-feerate (g h) (bitcoin-lisp.mempool:txgraph-get-main-chunk-feerate g h))
-(defun %tg-cluster (g h) (bitcoin-lisp.mempool:txgraph-get-cluster g h))
-(defun %tg-anc (g h) (bitcoin-lisp.mempool:txgraph-get-ancestors g h))
-(defun %tg-desc (g h) (bitcoin-lisp.mempool:txgraph-get-descendants g h))
-(defun %tg-anc-union (g hs) (bitcoin-lisp.mempool:txgraph-get-ancestors-union g hs))
-(defun %tg-desc-union (g hs) (bitcoin-lisp.mempool:txgraph-get-descendants-union g hs))
-(defun %tg-cmp (g a b) (bitcoin-lisp.mempool:txgraph-compare-main-order g a b))
-(defun %tg-distinct (g hs) (bitcoin-lisp.mempool:txgraph-count-distinct-clusters g hs))
-(defun %tg-worst (g) (bitcoin-lisp.mempool:txgraph-get-worst-main-chunk g))
-(defun %tg-trim (g) (bitcoin-lisp.mempool:txgraph-trim g))
-(defun %tg-sane (g) (bitcoin-lisp.mempool:txgraph-sanity-check g))
-(defun %tg-id (h) (bitcoin-lisp.mempool:tx-handle-id h))
+(defun %tg-new (&rest args) (apply #'bl.mp:make-txgraph args))
+(defun %tg-add (g fee size) (bl.mp:txgraph-add-transaction g fee size))
+(defun %tg-dep (g p c) (bl.mp:txgraph-add-dependency g p c))
+(defun %tg-rm (g h) (bl.mp:txgraph-remove-transaction g h))
+(defun %tg-setfee (g h fee) (bl.mp:txgraph-set-transaction-fee g h fee))
+(defun %tg-exists (g h) (bl.mp:txgraph-exists-p g h))
+(defun %tg-count (g) (bl.mp:txgraph-tx-count g))
+(defun %tg-oversized (g) (bl.mp:txgraph-oversized-p g))
+(defun %tg-feerate (g h) (bl.mp:txgraph-get-individual-feerate g h))
+(defun %tg-chunk-feerate (g h) (bl.mp:txgraph-get-main-chunk-feerate g h))
+(defun %tg-cluster (g h) (bl.mp:txgraph-get-cluster g h))
+(defun %tg-anc (g h) (bl.mp:txgraph-get-ancestors g h))
+(defun %tg-desc (g h) (bl.mp:txgraph-get-descendants g h))
+(defun %tg-anc-union (g hs) (bl.mp:txgraph-get-ancestors-union g hs))
+(defun %tg-desc-union (g hs) (bl.mp:txgraph-get-descendants-union g hs))
+(defun %tg-cmp (g a b) (bl.mp:txgraph-compare-main-order g a b))
+(defun %tg-distinct (g hs) (bl.mp:txgraph-count-distinct-clusters g hs))
+(defun %tg-worst (g) (bl.mp:txgraph-get-worst-main-chunk g))
+(defun %tg-trim (g) (bl.mp:txgraph-trim g))
+(defun %tg-sane (g) (bl.mp:txgraph-sanity-check g))
+(defun %tg-id (h) (bl.mp:tx-handle-id h))
 (defun %tg-ids (handles) (sort (mapcar #'%tg-id handles) #'<))
 (defun %tg-ff= (f fee size)
-  (bitcoin-lisp.mempool:feefrac= f (bitcoin-lisp.mempool:make-feefrac fee size)))
-(defun %tg-empty-ff-p (f) (bitcoin-lisp.mempool:feefrac-empty-p f))
+  (bl.mp:feefrac= f (bl.mp:make-feefrac fee size)))
+(defun %tg-empty-ff-p (f) (bl.mp:feefrac-empty-p f))
 
 (defun %tg-chunks (g)
   "The full mining-order chunk walk (include everything) as a list of
 (handles . feerate)."
-  (let ((builder (bitcoin-lisp.mempool:make-block-builder g))
+  (let ((builder (bl.mp:make-block-builder g))
         (out '()))
     (unwind-protect
          (loop (multiple-value-bind (txs feerate)
-                   (bitcoin-lisp.mempool:block-builder-current-chunk builder)
+                   (bl.mp:block-builder-current-chunk builder)
                  (unless txs (return))
                  (push (cons txs feerate) out)
-                 (bitcoin-lisp.mempool:block-builder-include builder)))
-      (bitcoin-lisp.mempool:block-builder-finish builder))
+                 (bl.mp:block-builder-include builder)))
+      (bl.mp:block-builder-finish builder))
     (nreverse out)))
 
 ;;;; Brute-force model
@@ -106,7 +106,7 @@
         (to-add (ash 1 i)))
     (loop
       (let ((old ret))
-        (bitcoin-lisp.mempool:do-bits (j to-add)
+        (bl.mp:do-bits (j to-add)
           (let ((tx (aref model j)))
             (setf ret (logior ret (%tgm-tx-anc tx) (%tgm-tx-desc tx)))))
         (setf to-add (logandc2 ret old))
@@ -126,14 +126,14 @@
 (defun %tgm-set-ids (model bits)
   "Sorted handle ids for the model indices in bitset BITS."
   (let ((ids '()))
-    (bitcoin-lisp.mempool:do-bits (i bits)
+    (bl.mp:do-bits (i bits)
       (push (%tg-id (%tgm-tx-handle (aref model i))) ids))
     (sort ids #'<)))
 
 (defun %tgm-comp-stats (model comp)
   "(values tx-count total-size) of component bitset COMP."
   (let ((count 0) (size 0))
-    (bitcoin-lisp.mempool:do-bits (i comp)
+    (bl.mp:do-bits (i comp)
       (incf count)
       (incf size (%tgm-tx-size (aref model i))))
     (values count size)))
@@ -210,7 +210,7 @@ when G is not oversized)."
         ;; txgraph.cpp:3100-3109).
         (loop for ((nil . fa) (nil . fb)) on chunks
               while fb
-              do (is-false (bitcoin-lisp.mempool:feefrac>> fb fa)))
+              do (is-false (bl.mp:feefrac>> fb fa)))
         ;; Concatenating a cluster's chunks in emitted order must equal its
         ;; GetCluster (linearization) order.
         (let ((by-comp (make-hash-table :test 'eql)))
@@ -226,7 +226,7 @@ when G is not oversized)."
           (if chunks
               (let ((last-chunk (car (last chunks))))
                 (is (equal worst (reverse (car last-chunk))))
-                (is (bitcoin-lisp.mempool:feefrac= wf (cdr last-chunk))))
+                (is (bl.mp:feefrac= wf (cdr last-chunk))))
               (progn (is (null worst))
                      (is (%tg-empty-ff-p wf)))))
         ;; CompareMainOrder agrees with the emitted per-transaction order
@@ -244,14 +244,14 @@ when G is not oversized)."
                 (is (= (%tg-cmp g a b) (- (%tg-cmp g b a)))))))
           (loop for (txs . feerate) in chunks
                 do (dolist (h txs)
-                     (is (bitcoin-lisp.mempool:feefrac= (%tg-chunk-feerate g h) feerate)))))))))
+                     (is (bl.mp:feefrac= (%tg-chunk-feerate g h) feerate)))))))))
 
 ;;;; Unit tests: basics
 
 (test txgraph-constants
   "Cluster limits are Core-exact (txgraph.h:18, policy 101 kvB)."
-  (is (= 64 bitcoin-lisp.mempool:+max-cluster-count+))
-  (is (= 101000 bitcoin-lisp.mempool:+max-cluster-size+)))
+  (is (= 64 bl.mp:+max-cluster-count+))
+  (is (= 101000 bl.mp:+max-cluster-size+)))
 
 (test txgraph-empty-graph
   (let ((g (%tg-new)))
@@ -263,9 +263,9 @@ when G is not oversized)."
       (is (%tg-empty-ff-p wf)))
     (is (null (%tg-anc-union g '())))
     (is (= 0 (%tg-distinct g '())))
-    (let ((b (bitcoin-lisp.mempool:make-block-builder g)))
-      (is (null (bitcoin-lisp.mempool:block-builder-current-chunk b)))
-      (bitcoin-lisp.mempool:block-builder-finish b))))
+    (let ((b (bl.mp:make-block-builder g)))
+      (is (null (bl.mp:block-builder-current-chunk b)))
+      (bl.mp:block-builder-finish b))))
 
 (test txgraph-add-exists-remove
   "AddTransaction / Exists / RemoveTransaction basics; removal is a no-op
@@ -513,36 +513,36 @@ remainder of the skipped chunk's cluster (Core txgraph.cpp:3241-3251)."
     (is (equal (list (list x1) (list s) (list x2))
                (mapcar #'car (%tg-chunks g))))
     ;; Skip x1's chunk: s is offered, x2 is suppressed.
-    (let ((b (bitcoin-lisp.mempool:make-block-builder g))
+    (let ((b (bl.mp:make-block-builder g))
           (emitted '()))
       (unwind-protect
            (progn
              (multiple-value-bind (txs feerate)
-                 (bitcoin-lisp.mempool:block-builder-current-chunk b)
+                 (bl.mp:block-builder-current-chunk b)
                (is (equal (list x1) txs))
                (is (%tg-ff= feerate 30 1)))
-             (bitcoin-lisp.mempool:block-builder-skip b)
+             (bl.mp:block-builder-skip b)
              (loop (multiple-value-bind (txs nil-feerate)
-                       (bitcoin-lisp.mempool:block-builder-current-chunk b)
+                       (bl.mp:block-builder-current-chunk b)
                      (declare (ignore nil-feerate))
                      (unless txs (return))
                      (push txs emitted)
-                     (bitcoin-lisp.mempool:block-builder-include b))))
-        (bitcoin-lisp.mempool:block-builder-finish b))
+                     (bl.mp:block-builder-include b))))
+        (bl.mp:block-builder-finish b))
       (is (equal (list (list s)) (nreverse emitted))))
     ;; Skipping the singleton instead leaves cluster X complete.
-    (let ((b (bitcoin-lisp.mempool:make-block-builder g))
+    (let ((b (bl.mp:make-block-builder g))
           (emitted '()))
       (unwind-protect
            (loop (multiple-value-bind (txs nil-feerate)
-                     (bitcoin-lisp.mempool:block-builder-current-chunk b)
+                     (bl.mp:block-builder-current-chunk b)
                    (declare (ignore nil-feerate))
                    (unless txs (return))
                    (if (equal txs (list s))
-                       (bitcoin-lisp.mempool:block-builder-skip b)
+                       (bl.mp:block-builder-skip b)
                        (progn (push txs emitted)
-                              (bitcoin-lisp.mempool:block-builder-include b)))))
-        (bitcoin-lisp.mempool:block-builder-finish b))
+                              (bl.mp:block-builder-include b)))))
+        (bl.mp:block-builder-finish b))
       (is (equal (list (list x1) (list x2)) (nreverse emitted))))))
 
 (test txgraph-block-builder-blocks-mutation
@@ -550,7 +550,7 @@ remainder of the skipped chunk's cluster (Core txgraph.cpp:3241-3251)."
 m_main_chunkindex_observers); after finish they work again."
   (let* ((g (%tg-new))
          (a (%tg-add g 5 5))
-         (b (bitcoin-lisp.mempool:make-block-builder g)))
+         (b (bl.mp:make-block-builder g)))
     (unwind-protect
          (progn
            (signals error (%tg-add g 1 1))
@@ -558,7 +558,7 @@ m_main_chunkindex_observers); after finish they work again."
            (signals error (%tg-setfee g a 6))
            ;; Queries stay available.
            (is-true (%tg-exists g a)))
-      (bitcoin-lisp.mempool:block-builder-finish b))
+      (bl.mp:block-builder-finish b))
     (is (%tg-add g 1 1))
     (is (= 2 (%tg-count g)))))
 
@@ -588,7 +588,7 @@ the always-available queries keep working (txgraph.h:122-134)."
     (signals error (%tg-cmp g a1 b1))
     (signals error (%tg-distinct g (list a1 b1)))
     (signals error (%tg-worst g))
-    (signals error (bitcoin-lisp.mempool:make-block-builder g))
+    (signals error (bl.mp:make-block-builder g))
     ;; Mutators still work while oversized.
     (%tg-setfee g b1 30)
     (is (%tg-ff= (%tg-feerate g b1) 30 1))
@@ -812,19 +812,19 @@ the chunk's cluster."
                         (push (car chunk) expected)))))))
           (setf expected (nreverse expected))
           ;; Drive the real builder with the same decisions.
-          (let ((b (bitcoin-lisp.mempool:make-block-builder g))
+          (let ((b (bl.mp:make-block-builder g))
                 (included '())
                 (ds decisions))
             (unwind-protect
                  (loop (multiple-value-bind (txs nil-feerate)
-                           (bitcoin-lisp.mempool:block-builder-current-chunk b)
+                           (bl.mp:block-builder-current-chunk b)
                          (declare (ignore nil-feerate))
                          (unless txs (return))
                          (if (pop ds)
-                             (bitcoin-lisp.mempool:block-builder-skip b)
+                             (bl.mp:block-builder-skip b)
                              (progn (push txs included)
-                                    (bitcoin-lisp.mempool:block-builder-include b)))))
-              (bitcoin-lisp.mempool:block-builder-finish b))
+                                    (bl.mp:block-builder-include b)))))
+              (bl.mp:block-builder-finish b))
             (is (equal expected (nreverse included)))))))))
 
 (test txgraph-randomized-oversized-and-trim
@@ -870,7 +870,7 @@ graph equivalent to the model."
                      ;; relative to pending dependencies is well-defined).
                      (let* ((i (nth (funcall rng (length live)) live))
                             (victims '()))
-                       (bitcoin-lisp.mempool:do-bits
+                       (bl.mp:do-bits
                            (j (%tgm-tx-desc (aref model i)))
                          (push j victims))
                        (dolist (j victims)
@@ -944,12 +944,12 @@ graph equivalent to the model."
 
 (defun %tg-diag (ffs)
   "A diagram (list of feefracs) as a list of (fee . size) conses."
-  (mapcar (lambda (f) (cons (bitcoin-lisp.mempool:feefrac-fee f)
-                            (bitcoin-lisp.mempool:feefrac-size f)))
+  (mapcar (lambda (f) (cons (bl.mp:feefrac-fee f)
+                            (bl.mp:feefrac-size f)))
           ffs))
 
 (defun %tg-rbf (g removed parents fee size)
-  (bitcoin-lisp.mempool:txgraph-rbf-diagrams g removed parents fee size))
+  (bl.mp:txgraph-rbf-diagrams g removed parents fee size))
 
 (test rbf-diagrams-replace-singleton
   "Replacing a lone tx: old diagram is its chunk, new is the candidate's."
@@ -960,12 +960,12 @@ graph equivalent to the model."
       (is (equal '((100 . 100)) (%tg-diag old)))
       (is (equal '((0 . 100)) (%tg-diag new)))
       ;; Does not improve the diagram.
-      (is (not (eq :greater (bitcoin-lisp.mempool:compare-chunks new old)))))
+      (is (not (eq :greater (bl.mp:compare-chunks new old)))))
     ;; High-fee replacement strictly improves.
     (multiple-value-bind (old new) (%tg-rbf g (list low) '() 10000 100)
       (is (equal '((100 . 100)) (%tg-diag old)))
       (is (equal '((10000 . 100)) (%tg-diag new)))
-      (is (eq :greater (bitcoin-lisp.mempool:compare-chunks new old))))
+      (is (eq :greater (bl.mp:compare-chunks new old))))
     ;; The staging did not mutate the live graph.
     (is-true (%tg-sane g))
     (is (= 1 (%tg-count g)))))
@@ -1047,7 +1047,7 @@ uncalculable (Core CalculateChunksForRBF returning an Error)."
 ;;;; (validation.cpp:1080-1121); these mirror that two-addition staging.
 
 (defun %tg-pkg-rbf (g removed pfee psize cfee csize)
-  (bitcoin-lisp.mempool:txgraph-package-rbf-diagrams g removed pfee psize cfee csize))
+  (bl.mp:txgraph-package-rbf-diagrams g removed pfee psize cfee csize))
 
 (test package-rbf-diagrams-stages-both-as-cpfp-chunk
   "A low-fee parent + high-fee child stage as one CPFP chunk; replacing a
@@ -1058,7 +1058,7 @@ conflicting tx improves the diagram when the pair out-earns it."
       (is (equal '((1000 . 100)) (%tg-diag old)))
       ;; Child feerate 50 > parent 0.1 -> one merged chunk (5010, 200).
       (is (equal '((5010 . 200)) (%tg-diag new)))
-      (is (eq :greater (bitcoin-lisp.mempool:compare-chunks new old))))
+      (is (eq :greater (bl.mp:compare-chunks new old))))
     ;; The staging did not mutate the live graph.
     (is-true (%tg-sane g))
     (is (= 1 (%tg-count g)))))
@@ -1083,7 +1083,7 @@ pair contributes two chunks, parent first."
       (is (equal '((700 . 100) (100 . 100)) (%tg-diag old)))
       ;; KEEP survives; the pair forms its own (5010, 200) chunk.
       (is (equal '((5010 . 200) (700 . 100)) (%tg-diag new)))
-      (is (eq :greater (bitcoin-lisp.mempool:compare-chunks new old))))
+      (is (eq :greater (bl.mp:compare-chunks new old))))
     (is-true (%tg-sane g))
     (is (= 2 (%tg-count g)))))
 

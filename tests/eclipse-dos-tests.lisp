@@ -19,25 +19,25 @@
 ;;; ============================================================
 
 (defun %mk-peer (conn-type inbound &optional (state :ready))
-  (bitcoin-lisp.networking:make-peer :conn-type conn-type
+  (bl.net:make-peer :conn-type conn-type
                                      :inbound inbound
                                      :state state))
 
 (test outbound-full-relay-peer-p-classification
   "Only a ready, non-inbound, outbound-full-relay peer counts as an outbound
 full-relay slot (Core IsFullOutboundConn)."
-  (is-true  (bitcoin-lisp::outbound-full-relay-peer-p
+  (is-true  (bl::outbound-full-relay-peer-p
              (%mk-peer :outbound-full-relay nil)))
   ;; Inbound peers never count, even if mislabeled full-relay.
-  (is-false (bitcoin-lisp::outbound-full-relay-peer-p
+  (is-false (bl::outbound-full-relay-peer-p
              (%mk-peer :outbound-full-relay t)))
   ;; Block-relay and feeler outbound peers are a separate pool.
-  (is-false (bitcoin-lisp::outbound-full-relay-peer-p
+  (is-false (bl::outbound-full-relay-peer-p
              (%mk-peer :block-relay nil)))
-  (is-false (bitcoin-lisp::outbound-full-relay-peer-p
+  (is-false (bl::outbound-full-relay-peer-p
              (%mk-peer :feeler nil)))
   ;; Not-yet-ready peers don't count.
-  (is-false (bitcoin-lisp::outbound-full-relay-peer-p
+  (is-false (bl::outbound-full-relay-peer-p
              (%mk-peer :outbound-full-relay nil :handshaking))))
 
 (test inbound-peers-do-not-satisfy-outbound-target
@@ -53,10 +53,10 @@ dials). Only the two genuine outbound full-relay peers are counted."
                 ;; block-relay + feeler outbound peers (separate pool).
                 (list (%mk-peer :block-relay nil)
                       (%mk-peer :feeler nil)))))
-    (is (= 2 (bitcoin-lisp::count-outbound-full-relay-peers peers)))
+    (is (= 2 (bl::count-outbound-full-relay-peers peers)))
     ;; With max-peers 8, needing replacements is (8 - 2) = 6 despite 12
     ;; total connections — inbound never masks the shortfall.
-    (is (= 6 (- 8 (bitcoin-lisp::count-outbound-full-relay-peers peers))))))
+    (is (= 6 (- 8 (bl::count-outbound-full-relay-peers peers))))))
 
 ;;; ============================================================
 ;;; 2. Non-blocking send path
@@ -65,57 +65,57 @@ dials). Only the two genuine outbound full-relay peers are counted."
 (test send-paused-predicate-tracks-cap
   "connection-send-paused-p flips exactly at the send-buffer cap (Core
 fPauseSend on nSendBufferMaxSize)."
-  (let ((conn (bitcoin-lisp.networking::make-connection)))
-    (setf (bitcoin-lisp.networking::connection-send-queue-bytes conn) 0)
-    (is-false (bitcoin-lisp.networking:connection-send-paused-p conn))
-    (setf (bitcoin-lisp.networking::connection-send-queue-bytes conn)
-          bitcoin-lisp.networking:+max-send-buffer-bytes+)
-    (is-false (bitcoin-lisp.networking:connection-send-paused-p conn))
-    (setf (bitcoin-lisp.networking::connection-send-queue-bytes conn)
-          (1+ bitcoin-lisp.networking:+max-send-buffer-bytes+))
-    (is-true (bitcoin-lisp.networking:connection-send-paused-p conn))))
+  (let ((conn (bl.net::make-connection)))
+    (setf (bl.net::connection-send-queue-bytes conn) 0)
+    (is-false (bl.net:connection-send-paused-p conn))
+    (setf (bl.net::connection-send-queue-bytes conn)
+          bl.net:+max-send-buffer-bytes+)
+    (is-false (bl.net:connection-send-paused-p conn))
+    (setf (bl.net::connection-send-queue-bytes conn)
+          (1+ bl.net:+max-send-buffer-bytes+))
+    (is-true (bl.net:connection-send-paused-p conn))))
 
 (test send-stall-predicate-needs-pending-and-timeout
   "connection-send-stalled-p triggers only when data is buffered AND the socket
 has made no send progress for the stall timeout (Core socket sending timeout)."
-  (let ((conn (bitcoin-lisp.networking::make-connection))
+  (let ((conn (bl.net::make-connection))
         (units internal-time-units-per-second))
     ;; No pending data: never stalled, even with an ancient progress time.
-    (setf (bitcoin-lisp.networking::connection-send-queue-bytes conn) 0
-          (bitcoin-lisp.networking::connection-last-send-progress conn)
+    (setf (bl.net::connection-send-queue-bytes conn) 0
+          (bl.net::connection-last-send-progress conn)
           (- (get-internal-real-time)
-             (* (1+ bitcoin-lisp.networking::+send-stall-timeout-seconds+) units)))
-    (is-false (bitcoin-lisp.networking:connection-send-stalled-p conn))
+             (* (1+ bl.net::+send-stall-timeout-seconds+) units)))
+    (is-false (bl.net:connection-send-stalled-p conn))
     ;; Pending data but recent progress: not stalled.
-    (setf (bitcoin-lisp.networking::connection-send-queue-bytes conn) 500
-          (bitcoin-lisp.networking::connection-last-send-progress conn)
+    (setf (bl.net::connection-send-queue-bytes conn) 500
+          (bl.net::connection-last-send-progress conn)
           (get-internal-real-time))
-    (is-false (bitcoin-lisp.networking:connection-send-stalled-p conn))
+    (is-false (bl.net:connection-send-stalled-p conn))
     ;; Pending data AND stale progress: stalled.
-    (setf (bitcoin-lisp.networking::connection-last-send-progress conn)
+    (setf (bl.net::connection-last-send-progress conn)
           (- (get-internal-real-time)
-             (* (1+ bitcoin-lisp.networking::+send-stall-timeout-seconds+) units)))
-    (is-true (bitcoin-lisp.networking:connection-send-stalled-p conn))))
+             (* (1+ bl.net::+send-stall-timeout-seconds+) units)))
+    (is-true (bl.net:connection-send-stalled-p conn))))
 
 (test close-connection-frees-send-queue
   "Closing a connection releases any buffered unsent bytes."
-  (let ((conn (bitcoin-lisp.networking::make-connection)))
-    (setf (bitcoin-lisp.networking::connection-send-queue-in conn)
+  (let ((conn (bl.net::make-connection)))
+    (setf (bl.net::connection-send-queue-in conn)
           (list #(1 2 3))
-          (bitcoin-lisp.networking::connection-send-queue-out conn)
+          (bl.net::connection-send-queue-out conn)
           (list #(4 5))
-          (bitcoin-lisp.networking::connection-send-queue-bytes conn) 5)
-    (bitcoin-lisp.networking:close-connection conn)
-    (is (null (bitcoin-lisp.networking::connection-send-queue-in conn)))
-    (is (null (bitcoin-lisp.networking::connection-send-queue-out conn)))
-    (is (= 0 (bitcoin-lisp.networking::connection-send-queue-bytes conn)))))
+          (bl.net::connection-send-queue-bytes conn) 5)
+    (bl.net:close-connection conn)
+    (is (null (bl.net::connection-send-queue-in conn)))
+    (is (null (bl.net::connection-send-queue-out conn)))
+    (is (= 0 (bl.net::connection-send-queue-bytes conn)))))
 
 (test send-bytes-buffers-and-never-blocks-on-jammed-socket
   "A peer whose TCP window is jammed must not pin the caller: send-bytes writes
 what the kernel takes, queues the rest, and returns promptly. Once the buffer
 exceeds the cap the peer is send-paused and further messages are dropped
 (returns NIL) instead of blocking the shared thread."
-  (let ((srv (bitcoin-lisp.networking:open-listener "127.0.0.1" 0)))
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
     (is-true srv)
     (when srv
       (unwind-protect
@@ -125,11 +125,11 @@ exceeds the cap the peer is send-paused and further messages are dropped
                                :element-type '(unsigned-byte 8)))
                  ;; Accept the server side but NEVER read from it — jam the pipe.
                  (server-conn (usocket:socket-accept srv :element-type '(unsigned-byte 8)))
-                 (conn (bitcoin-lisp.networking::make-connection
+                 (conn (bl.net::make-connection
                         :socket client-sock :host "127.0.0.1" :port port
                         :connected t)))
             (declare (ignorable server-conn))
-            (bitcoin-lisp.networking::set-socket-non-blocking client-sock)
+            (bl.net::set-socket-non-blocking client-sock)
             ;; Run the sends in a bounded worker so a regression (a blocking
             ;; write) can be caught as a timeout rather than hanging the suite.
             (let* ((chunk (make-array 200000 :element-type '(unsigned-byte 8)
@@ -141,22 +141,22 @@ exceeds the cap the peer is send-paused and further messages are dropped
                               ;; ~4MB total: far past the 1MB cap on a loopback
                               ;; socket whose kernel buffer is well under that.
                               (dotimes (_ 20)
-                                (let ((r (bitcoin-lisp.networking:send-bytes conn chunk)))
+                                (let ((r (bl.net:send-bytes conn chunk)))
                                   (when (null r) (setf dropped t))))
                               (setf sends-done t))
                             :name "eclipse-send-worker")))
               ;; Bounded join: the worker must finish quickly (non-blocking).
-              (bitcoin-lisp.networking:join-thread-or-destroy worker :timeout 10)
+              (bl.net:join-thread-or-destroy worker :timeout 10)
               (is-true sends-done "send-bytes must not block on a jammed socket")
               ;; Data backed up into the per-connection buffer.
-              (is-true (plusp (bitcoin-lisp.networking::connection-send-queue-bytes conn)))
+              (is-true (plusp (bl.net::connection-send-queue-bytes conn)))
               ;; The buffer went over the cap, so the peer is send-paused and at
               ;; least one later message was dropped rather than queued forever.
-              (is-true (bitcoin-lisp.networking:connection-send-paused-p conn))
+              (is-true (bl.net:connection-send-paused-p conn))
               (is-true dropped "over-cap messages must be dropped, not queued")
-              (bitcoin-lisp.networking:close-connection conn)
+              (bl.net:close-connection conn)
               (ignore-errors (usocket:socket-close server-conn))))
-        (bitcoin-lisp.networking:close-listener srv)))))
+        (bl.net:close-listener srv)))))
 
 ;;; ============================================================
 ;;; 3. Per-address addr/addrv2 rate limit
@@ -165,35 +165,35 @@ exceeds the cap the peer is send-paused and further messages are dropped
 (test addr-token-bucket-fresh-value
   "A fresh peer's addr token bucket starts at 1.0 (Core m_addr_token_bucket
 initial value)."
-  (let ((p (bitcoin-lisp.networking:make-peer)))
-    (is (= 1.0d0 (bitcoin-lisp.networking::peer-addr-token-bucket p)))))
+  (let ((p (bl.net:make-peer)))
+    (is (= 1.0d0 (bl.net::peer-addr-token-bucket p)))))
 
 (test addr-token-bucket-refills-at-core-rate
   "The bucket refills at 0.1 tokens/sec (MAX_ADDR_RATE_PER_SECOND), clamped to
 the 1000-token soft cap."
-  (let ((p (bitcoin-lisp.networking:make-peer)))
-    (setf (bitcoin-lisp.networking::peer-addr-token-bucket p) 0.0d0
-          (bitcoin-lisp.networking::peer-addr-token-timestamp p)
+  (let ((p (bl.net:make-peer)))
+    (setf (bl.net::peer-addr-token-bucket p) 0.0d0
+          (bl.net::peer-addr-token-timestamp p)
           (- (get-internal-real-time) (* 100 internal-time-units-per-second)))
-    (bitcoin-lisp.networking::%refill-addr-token-bucket p)
+    (bl.net::%refill-addr-token-bucket p)
     ;; 100s * 0.1/s = 10 tokens.
-    (is (< 9.9d0 (bitcoin-lisp.networking::peer-addr-token-bucket p) 10.1d0)))
+    (is (< 9.9d0 (bl.net::peer-addr-token-bucket p) 10.1d0)))
   ;; Clamp: a huge elapsed time never exceeds the soft cap.
-  (let ((p (bitcoin-lisp.networking:make-peer)))
-    (setf (bitcoin-lisp.networking::peer-addr-token-bucket p) 0.0d0
-          (bitcoin-lisp.networking::peer-addr-token-timestamp p)
+  (let ((p (bl.net:make-peer)))
+    (setf (bl.net::peer-addr-token-bucket p) 0.0d0
+          (bl.net::peer-addr-token-timestamp p)
           (- (get-internal-real-time) (* 10000000 internal-time-units-per-second)))
-    (bitcoin-lisp.networking::%refill-addr-token-bucket p)
-    (is (= (coerce bitcoin-lisp.networking::+max-addr-processing-token-bucket+ 'double-float)
-           (bitcoin-lisp.networking::peer-addr-token-bucket p)))))
+    (bl.net::%refill-addr-token-bucket p)
+    (is (= (coerce bl.net::+max-addr-processing-token-bucket+ 'double-float)
+           (bl.net::peer-addr-token-bucket p)))))
 
 (defun %addr-entries (n &key (base 10))
   "N distinct routable IPv4 net-addr / timestamp conses (fresh timestamps)."
-  (let ((now (bitcoin-lisp.serialization:get-unix-time)))
+  (let ((now (bl.ser:get-unix-time)))
     (loop for i below n
-          collect (cons (bitcoin-lisp.serialization:make-net-addr
+          collect (cons (bl.ser:make-net-addr
                          :services 1
-                         :ip (bitcoin-lisp.networking:ipv4-to-mapped-ipv6
+                         :ip (bl.net:ipv4-to-mapped-ipv6
                               base 0 (floor i 256) (mod i 256))
                          :port 8333)
                         now))))
@@ -203,18 +203,18 @@ the 1000-token soft cap."
 5, exactly 5 of 20 announced addresses are processed and 15 are rate-limited,
 and the counters are surfaced (Core rate_limited branch + m_addr_processed /
 m_addr_rate_limited)."
-  (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
-        (book (bitcoin-lisp.networking:make-address-book))
-        (p (bitcoin-lisp.networking:make-peer :conn-type :outbound-full-relay)))
+  (let ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
+        (book (bl.net:make-address-book))
+        (p (bl.net:make-peer :conn-type :outbound-full-relay)))
     ;; Depleted-ish bucket, timestamp now so refill is ~0.
-    (setf (bitcoin-lisp.networking::peer-addr-token-bucket p) 5.0d0
-          (bitcoin-lisp.networking::peer-addr-token-timestamp p)
+    (setf (bl.net::peer-addr-token-bucket p) 5.0d0
+          (bl.net::peer-addr-token-timestamp p)
           (get-internal-real-time))
-    (let ((added (bitcoin-lisp.networking::%process-gossiped-addresses
+    (let ((added (bl.net::%process-gossiped-addresses
                   p (%addr-entries 20) 20 book nil)))
       (is (= 5 added) "only 5 addresses fit the bucket")
-      (is (= 5 (bitcoin-lisp.networking::peer-addr-processed p)))
-      (is (= 15 (bitcoin-lisp.networking::peer-addr-rate-limited p)))
+      (is (= 5 (bl.net::peer-addr-processed p)))
+      (is (= 15 (bl.net::peer-addr-rate-limited p)))
       ;; Upper bound only: the 20 test addresses share one /16 and one
       ;; source, so addrman maps them all into a single 64-slot new bucket
       ;; (bucket keys on the (addr-group, source-group) pair) and 5 inserts
@@ -222,91 +222,91 @@ m_addr_rate_limited)."
       ;; REPLACES the earlier entry, making exact-count flaky. The rate
       ;; limit's storage-layer guarantee is that no more than 5 ever reach
       ;; the book; placement within addrman is addrman's own contract.
-      (is (<= (bitcoin-lisp.networking:address-book-count book) 5)))))
+      (is (<= (bl.net:address-book-count book) 5)))))
 
 (test addr-full-bucket-processes-all
   "With a full bucket a normal small announcement is fully processed and
 nothing is rate-limited."
-  (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
-        (book (bitcoin-lisp.networking:make-address-book))
-        (p (bitcoin-lisp.networking:make-peer :conn-type :outbound-full-relay)))
-    (setf (bitcoin-lisp.networking::peer-addr-token-bucket p) 1000.0d0
-          (bitcoin-lisp.networking::peer-addr-token-timestamp p)
+  (let ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
+        (book (bl.net:make-address-book))
+        (p (bl.net:make-peer :conn-type :outbound-full-relay)))
+    (setf (bl.net::peer-addr-token-bucket p) 1000.0d0
+          (bl.net::peer-addr-token-timestamp p)
           (get-internal-real-time))
-    (let ((added (bitcoin-lisp.networking::%process-gossiped-addresses
+    (let ((added (bl.net::%process-gossiped-addresses
                   p (%addr-entries 10) 10 book nil)))
       (is (= 10 added))
-      (is (= 10 (bitcoin-lisp.networking::peer-addr-processed p)))
-      (is (= 0 (bitcoin-lisp.networking::peer-addr-rate-limited p))))))
+      (is (= 10 (bl.net::peer-addr-processed p)))
+      (is (= 0 (bl.net::peer-addr-rate-limited p))))))
 
 (test getaddr-solicitation-clears-on-nonfull-message
   "A non-full (<1000) addr message answers our outstanding getaddr (clears
 m_getaddr_sent); a full (1000) one does not."
-  (let ((book (bitcoin-lisp.networking:make-address-book))
-        (p (bitcoin-lisp.networking:make-peer :conn-type :outbound-full-relay)))
-    (setf (bitcoin-lisp.networking::peer-addr-token-bucket p) 1000.0d0
-          (bitcoin-lisp.networking::peer-getaddr-requested p) t)
+  (let ((book (bl.net:make-address-book))
+        (p (bl.net:make-peer :conn-type :outbound-full-relay)))
+    (setf (bl.net::peer-addr-token-bucket p) 1000.0d0
+          (bl.net::peer-getaddr-requested p) t)
     ;; Non-full announced-count clears the flag.
-    (bitcoin-lisp.networking::%process-gossiped-addresses p (%addr-entries 3) 3 book nil)
-    (is-false (bitcoin-lisp.networking::peer-getaddr-requested p))
+    (bl.net::%process-gossiped-addresses p (%addr-entries 3) 3 book nil)
+    (is-false (bl.net::peer-getaddr-requested p))
     ;; A full 1000-count message leaves it set (more may follow).
-    (setf (bitcoin-lisp.networking::peer-getaddr-requested p) t
-          (bitcoin-lisp.networking::peer-addr-token-bucket p) 1000.0d0)
-    (bitcoin-lisp.networking::%process-gossiped-addresses p (%addr-entries 3) 1000 book nil)
-    (is-true (bitcoin-lisp.networking::peer-getaddr-requested p))))
+    (setf (bl.net::peer-getaddr-requested p) t
+          (bl.net::peer-addr-token-bucket p) 1000.0d0)
+    (bl.net::%process-gossiped-addresses p (%addr-entries 3) 1000 book nil)
+    (is-true (bl.net::peer-getaddr-requested p))))
 
 (test getaddr-bump-exempts-solicited-response-from-bucket
   "Sending our getaddr bumps the bucket by MAX_ADDR_TO_SEND (1000), so a full
 solicited response processes despite the ~0.1/s steady-state refill (Core
 net_processing.cpp:3772)."
-  (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
-        (book (bitcoin-lisp.networking:make-address-book))
-        (p (bitcoin-lisp.networking:make-peer :conn-type :outbound-full-relay)))
+  (let ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
+        (book (bl.net:make-address-book))
+        (p (bl.net:make-peer :conn-type :outbound-full-relay)))
     ;; Steady-state bucket, then apply the getaddr bump manually (as
     ;; send-post-handshake-messages does).
-    (setf (bitcoin-lisp.networking::peer-addr-token-bucket p) 1.0d0
-          (bitcoin-lisp.networking::peer-addr-token-timestamp p)
+    (setf (bl.net::peer-addr-token-bucket p) 1.0d0
+          (bl.net::peer-addr-token-timestamp p)
           (get-internal-real-time))
-    (incf (bitcoin-lisp.networking::peer-addr-token-bucket p)
-          (coerce bitcoin-lisp.serialization:+max-addr-count+ 'double-float))
-    (let ((added (bitcoin-lisp.networking::%process-gossiped-addresses
+    (incf (bl.net::peer-addr-token-bucket p)
+          (coerce bl.ser:+max-addr-count+ 'double-float))
+    (let ((added (bl.net::%process-gossiped-addresses
                   p (%addr-entries 500) 500 book nil)))
       (is (= 500 added) "solicited addresses processed under the bump")
-      (is (= 0 (bitcoin-lisp.networking::peer-addr-rate-limited p))))))
+      (is (= 0 (bl.net::peer-addr-rate-limited p))))))
 
 (test handle-addr-ignores-block-relay-peer
   "A block-relay-only peer participates in no addr relay: handle-addr /
 handle-addrv2 ignore its addresses entirely (Core SetupAddressRelay)."
-  (let ((book (bitcoin-lisp.networking:make-address-book))
-        (p (bitcoin-lisp.networking:make-peer :conn-type :block-relay))
+  (let ((book (bl.net:make-address-book))
+        (p (bl.net:make-peer :conn-type :block-relay))
         (payload (coerce
                   (flexi-streams:with-output-to-sequence (s)
-                    (bitcoin-lisp.serialization:write-compact-size s 1)
-                    (bitcoin-lisp.serialization:write-net-addr
-                     s (bitcoin-lisp.serialization:make-net-addr
+                    (bl.ser:write-compact-size s 1)
+                    (bl.ser:write-net-addr
+                     s (bl.ser:make-net-addr
                         :services 1
-                        :ip (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 10 0 0 1)
+                        :ip (bl.net:ipv4-to-mapped-ipv6 10 0 0 1)
                         :port 8333)
                      :with-timestamp t
-                     :timestamp (bitcoin-lisp.serialization:get-unix-time)))
+                     :timestamp (bl.ser:get-unix-time)))
                   '(simple-array (unsigned-byte 8) (*)))))
-    (is (= 0 (bitcoin-lisp.networking:handle-addr p payload book)))
-    (is (= 0 (bitcoin-lisp.networking:address-book-count book)))))
+    (is (= 0 (bl.net:handle-addr p payload book)))
+    (is (= 0 (bl.net:address-book-count book)))))
 
 (test handle-addr-oversized-is-misbehavior
   "An addr message announcing more than 1000 addresses is misbehavior (Core
 Misbehaving on vAddr.size() > MAX_ADDR_TO_SEND): the peer is disconnected and
 nothing is stored."
-  (let ((book (bitcoin-lisp.networking:make-address-book))
-        (p (bitcoin-lisp.networking:make-peer :conn-type :outbound-full-relay
+  (let ((book (bl.net:make-address-book))
+        (p (bl.net:make-peer :conn-type :outbound-full-relay
                                               :address "203.0.113.9"))
         (payload (coerce
                   (flexi-streams:with-output-to-sequence (s)
-                    (bitcoin-lisp.serialization:write-compact-size s 1001))
+                    (bl.ser:write-compact-size s 1001))
                   '(simple-array (unsigned-byte 8) (*)))))
-    (is (= 0 (bitcoin-lisp.networking:handle-addr p payload book)))
-    (is (eq :disconnected (bitcoin-lisp.networking:peer-state p)))
-    (is (= 0 (bitcoin-lisp.networking:address-book-count book)))))
+    (is (= 0 (bl.net:handle-addr p payload book)))
+    (is (eq :disconnected (bl.net:peer-state p)))
+    (is (= 0 (bl.net:address-book-count book)))))
 
 ;;; ============================================================
 ;;; 3b. Gossiped-address ingestion: age never gates STORAGE
@@ -325,26 +325,26 @@ nothing is stored."
 by a per-process CSPRNG secret, which makes exact-content assertions on a book
 holding several addresses flake on random bucket/slot collisions; pin the seed
 through the constructor rather than derandomising production."
-  (bitcoin-lisp.networking:make-address-book
+  (bl.net:make-address-book
    :key (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
 
 (defun %gossip-ip (d)
   "A routable IPv4 (198.51.100.D) as mapped IPv6 bytes."
-  (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 198 51 100 d))
+  (bl.net:ipv4-to-mapped-ipv6 198 51 100 d))
 
-(defun %gossip-net-addr (ip &key (services bitcoin-lisp.serialization:+node-network+)
+(defun %gossip-net-addr (ip &key (services bl.ser:+node-network+)
                                  (port 8333))
-  (bitcoin-lisp.serialization:make-net-addr :services services :ip ip :port port))
+  (bl.ser:make-net-addr :services services :ip ip :port port))
 
 (defun %gossip-ingest (book net-addr timestamp now &key source-net source-ip)
   "One address through the production ingestion path; (VALUES stored relay)."
-  (bitcoin-lisp.networking::%ingest-gossiped-address
+  (bl.net::%ingest-gossiped-address
    net-addr timestamp book nil now source-net source-ip))
 
 (defun %gossip-last-seen (book ip &optional (port 8333))
   "Stored nTime for IP:PORT in BOOK, or NIL when absent."
-  (let ((entry (bitcoin-lisp.networking:address-book-lookup book ip port)))
-    (and entry (bitcoin-lisp.networking:peer-address-last-seen entry))))
+  (let ((entry (bl.net:address-book-lookup book ip port)))
+    (and entry (bl.net:peer-address-last-seen entry))))
 
 (test gossiped-address-age-does-not-gate-storage
   "A 20-day-old gossiped address is STORED -- Core applies no storage-side
@@ -352,7 +352,7 @@ freshness window, leaving stale entries to addrman's 30-day horizon at
 selection time -- but is NOT relayed onward, the 10-minute gate applying to
 relay only (net_processing.cpp:4102). The window this replaces DISCARDED it,
 which is why the live node accumulated ~1,600 addrman entries in 2.5 months."
-  (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+  (let* ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
          (book (%addr-test-book))
          (now 1800000000)
          (ip (%gossip-ip 7))
@@ -361,7 +361,7 @@ which is why the live node accumulated ~1,600 addrman entries in 2.5 months."
         (%gossip-ingest book (%gossip-net-addr ip) old now)
       (is (= 1 stored) "a 20-day-old address is stored")
       (is (null relay) "...and is never relayed onward"))
-    (is (= 1 (bitcoin-lisp.networking:address-book-count book)))
+    (is (= 1 (bl.net:address-book-count book)))
     (let ((last-seen (%gossip-last-seen book ip)))
       (is (not (null last-seen)) "the 20-day-old address is in the book")
       (when last-seen
@@ -372,19 +372,19 @@ which is why the live node accumulated ~1,600 addrman entries in 2.5 months."
   "The same thing through the real message path (handle-addr ->
 %process-gossiped-addresses -> ingestion): a week-old address in an addr
 message reaches addrman, penalised by 2h and by nothing else."
-  (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+  (let* ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
          (book (%addr-test-book))
          (ip (%gossip-ip 11))
-         (old (- (bitcoin-lisp.serialization:get-unix-time) (* 7 24 60 60)))
+         (old (- (bl.ser:get-unix-time) (* 7 24 60 60)))
          (payload (coerce
                    (flexi-streams:with-output-to-sequence (s)
-                     (bitcoin-lisp.serialization:write-compact-size s 1)
-                     (bitcoin-lisp.serialization:write-net-addr
+                     (bl.ser:write-compact-size s 1)
+                     (bl.ser:write-net-addr
                       s (%gossip-net-addr ip)
                       :with-timestamp t :timestamp old))
                    '(simple-array (unsigned-byte 8) (*)))))
-    (is (= 1 (bitcoin-lisp.networking:handle-addr nil payload book)))
-    (is (= 1 (bitcoin-lisp.networking:address-book-count book)))
+    (is (= 1 (bl.net:handle-addr nil payload book)))
+    (is (= 1 (bl.net:address-book-count book)))
     (is (eql (- old (* 2 60 60)) (%gossip-last-seen book ip)))))
 
 (test gossiped-absurd-timestamp-is-rewritten-not-dropped
@@ -392,7 +392,7 @@ message reaches addrman, penalised by 2h and by nothing else."
 of us, is REWRITTEN to now - 5 days and stored anyway (Core
 net_processing.cpp:4090-4092) rather than dropped -- and the rewrite is what
 the relay gate then reads, so a flying-DeLorean timestamp cannot buy relay."
-  (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+  (let* ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
          (now 1800000000)
          ;; rewrite to now-5d, then the 2h storage penalty on top.
          (expected (- now (* 5 24 60 60) (* 2 60 60))))
@@ -421,7 +421,7 @@ the relay gate then reads, so a flying-DeLorean timestamp cannot buy relay."
 past (/*time_penalty=*/2h, net_processing.cpp:4114) and exempts only a peer
 announcing ITSELF (addrman.cpp:559-563, \"Do not set a penalty for a source's
 self-announcement\")."
-  (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+  (let ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
         (now 1800000000))
     ;; Third party: penalised.
     (let ((book (%addr-test-book))
@@ -432,11 +432,11 @@ self-announcement\")."
     ;; Self-announcement, source derived from the peer by the real path.
     (let* ((book (%addr-test-book))
            (ip (%gossip-ip 32))
-           (ts (bitcoin-lisp.serialization:get-unix-time))
-           (p (bitcoin-lisp.networking:make-peer :conn-type :outbound-full-relay
+           (ts (bl.ser:get-unix-time))
+           (p (bl.net:make-peer :conn-type :outbound-full-relay
                                                  :address "198.51.100.32")))
-      (setf (bitcoin-lisp.networking::peer-addr-token-bucket p) 10.0d0)
-      (bitcoin-lisp.networking::%process-gossiped-addresses
+      (setf (bl.net::peer-addr-token-bucket p) 10.0d0)
+      (bl.net::%process-gossiped-addresses
        p (list (cons (%gossip-net-addr ip) ts)) 1 book nil)
       (is (eql ts (%gossip-last-seen book ip))
           "a peer announcing its own address is not time-penalised"))))
@@ -446,15 +446,15 @@ self-announcement\")."
 (net_processing.cpp:4087 / MayHaveUsefulAddressDB): NODE_NETWORK or
 NODE_NETWORK_LIMITED. Anything else is skipped entirely -- neither stored nor
 relayed -- so services=0 junk never becomes a dial candidate."
-  (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+  (let* ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
          (now 1800000000))
     (loop for (services d storedp) in
           (list (list 0 41 nil)                                             ; nothing
-                (list bitcoin-lisp.serialization:+node-witness+ 42 nil)     ; witness only
-                (list bitcoin-lisp.serialization:+node-network+ 43 t)
-                (list bitcoin-lisp.serialization:+node-network-limited+ 44 t)
-                (list (logior bitcoin-lisp.serialization:+node-network+
-                              bitcoin-lisp.serialization:+node-witness+) 45 t))
+                (list bl.ser:+node-witness+ 42 nil)     ; witness only
+                (list bl.ser:+node-network+ 43 t)
+                (list bl.ser:+node-network-limited+ 44 t)
+                (list (logior bl.ser:+node-network+
+                              bl.ser:+node-witness+) 45 t))
           do (let ((book (%addr-test-book))
                    (ip (%gossip-ip d)))
                (multiple-value-bind (stored relay)
@@ -462,7 +462,7 @@ relayed -- so services=0 junk never becomes a dial candidate."
                  (is (= (if storedp 1 0) stored) "services ~D storage" services)
                  (is (eq storedp (not (null relay))) "services ~D relay" services))
                (is (= (if storedp 1 0)
-                      (bitcoin-lisp.networking:address-book-count book))
+                      (bl.net:address-book-count book))
                    "services ~D book count" services)))))
 
 (test gossiped-address-relay-gate-is-ten-minutes
@@ -470,7 +470,7 @@ relayed -- so services=0 junk never becomes a dial candidate."
 10 minutes Core uses (net_processing.cpp:4102). 9m59s old relays; 10m01s old
 does not -- yet BOTH are stored, which is the whole point of separating the
 two gates."
-  (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+  (let* ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
          (now 1800000000))
     (loop for (age d relayp) in (list (list 599 51 t)
                                       (list 601 52 nil)
@@ -488,14 +488,14 @@ two gates."
 
 (defun %regtest-chain-state (dir)
   "A fresh regtest chain-state with a genesis index entry (chain-work 1)."
-  (let* ((state (bitcoin-lisp.storage:init-chain-state
+  (let* ((state (bl.store:init-chain-state
                  (merge-pathnames dir (uiop:temporary-directory))))
-         (genesis-hash (bitcoin-lisp.storage:best-block-hash state))
+         (genesis-hash (bl.store:best-block-hash state))
          (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (bitcoin-lisp.storage:add-block-index-entry
-     state (bitcoin-lisp.storage:make-block-index-entry
+    (bl.store:add-block-index-entry
+     state (bl.store:make-block-index-entry
             :hash genesis-hash :height 0 :chain-work 1 :status :valid
-            :header (bitcoin-lisp.serialization:make-block-header
+            :header (bl.ser:make-block-header
                      :version 1 :prev-block zeros :merkle-root zeros
                      :timestamp 1296688600 :bits #x207fffff :nonce 0
                      :cached-hash genesis-hash)))
@@ -505,13 +505,13 @@ two gates."
   "A regtest header off PREV-HASH ground to a valid PoW nonce."
   (let ((mr (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
     (setf (aref mr 0) (logand merkle #xff))
-    (let ((hdr (bitcoin-lisp.serialization:make-block-header
+    (let ((hdr (bl.ser:make-block-header
                 :version version :prev-block prev-hash :merkle-root mr
                 :timestamp timestamp :bits #x207fffff :nonce 0)))
       (loop for nonce from 0 below 5000
-            do (setf (bitcoin-lisp.serialization:block-header-nonce hdr) nonce
-                     (bitcoin-lisp.serialization:block-header-cached-hash hdr) nil)
-            when (bitcoin-lisp.validation:check-proof-of-work hdr)
+            do (setf (bl.ser:block-header-nonce hdr) nonce
+                     (bl.ser:block-header-cached-hash hdr) nil)
+            when (bl.val:check-proof-of-work hdr)
               do (return hdr)
             finally (return hdr)))))
 
@@ -519,23 +519,23 @@ two gates."
   "maybe-start-presync's second value flags a connecting sub-threshold chain
 even when no sync starts (a non-full batch): the caller must then IGNORE the
 batch rather than storing it. A full batch additionally yields a sync object."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp.storage:*pow-limit-target*
-          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target*
+          bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-presync-lw/")
       ;; Force the anti-DoS threshold sky-high so any real chain is "low work".
-      (let* ((bitcoin-lisp::*minimum-chain-work-override* (expt 2 240))
+      (let* ((bl::*minimum-chain-work-override* (expt 2 240))
              (h1 (%pow-header genesis-hash)))
         ;; Sub-batch (full-batch-p nil): low-work-p T, but no sync started.
         (multiple-value-bind (sync low-work)
-            (bitcoin-lisp.networking::maybe-start-presync (list h1) state nil)
+            (bl.net::maybe-start-presync (list h1) state nil)
           (is (null sync) "a non-full batch must not start a sync")
           (is-true low-work "connecting sub-threshold chain is flagged low-work"))
         ;; Full batch (full-batch-p t): a sync is created.
         (multiple-value-bind (sync low-work)
-            (bitcoin-lisp.networking::maybe-start-presync (list h1) state t)
+            (bl.net::maybe-start-presync (list h1) state t)
           (is-true low-work)
-          (is-true (bitcoin-lisp.networking::headers-sync-state-p sync)
+          (is-true (bl.net::headers-sync-state-p sync)
                    "a full low-work batch starts a presync"))))))
 
 (test generic-path-ignores-sub-batch-low-work-headers
@@ -543,54 +543,54 @@ batch rather than storing it. A full batch additionally yields a sync object."
 for a connecting but sub-threshold, non-full header batch — the from-genesis
 memory-exhaustion DoS this item fixes. Previously such headers were committed
 to the index because the validated-tip work gate was off during IBD."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp.storage:*pow-limit-target*
-          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target*
+          bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-presync-ignore/")
-      (let* ((bitcoin-lisp::*minimum-chain-work-override* (expt 2 240))
-             (p (bitcoin-lisp.networking:make-peer :conn-type :outbound-full-relay))
+      (let* ((bl::*minimum-chain-work-override* (expt 2 240))
+             (p (bl.net:make-peer :conn-type :outbound-full-relay))
              (h1 (%pow-header genesis-hash))
-             (h1-hash (bitcoin-lisp.serialization:block-header-hash h1)))
-        (let ((added (bitcoin-lisp.networking::ingest-headers-from-peer p (list h1) state)))
+             (h1-hash (bl.ser:block-header-hash h1)))
+        (let ((added (bl.net::ingest-headers-from-peer p (list h1) state)))
           (is (= 0 added) "sub-threshold low-work headers must not be stored")
-          (is (null (bitcoin-lisp.storage:get-block-index-entry state h1-hash))
+          (is (null (bl.store:get-block-index-entry state h1-hash))
               "the low-work header must not enter the block index"))))))
 
 (test generic-path-stores-above-threshold-headers
   "Above the work threshold, the generic path validates and stores normally —
 steady-state tip announcements are unaffected by the anti-DoS gate."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp.storage:*pow-limit-target*
-          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target*
+          bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-presync-store/")
       ;; Threshold 0 (regtest default): the genesis-anchored chain meets it.
-      (let* ((bitcoin-lisp::*minimum-chain-work-override* 0)
-             (p (bitcoin-lisp.networking:make-peer :conn-type :outbound-full-relay))
+      (let* ((bl::*minimum-chain-work-override* 0)
+             (p (bl.net:make-peer :conn-type :outbound-full-relay))
              (h1 (%pow-header genesis-hash :timestamp 1296688700))
-             (h1-hash (bitcoin-lisp.serialization:block-header-hash h1)))
-        (let ((added (bitcoin-lisp.networking::ingest-headers-from-peer p (list h1) state)))
+             (h1-hash (bl.ser:block-header-hash h1)))
+        (let ((added (bl.net::ingest-headers-from-peer p (list h1) state)))
           (is (= 1 added) "above-threshold header is stored")
-          (is (not (null (bitcoin-lisp.storage:get-block-index-entry state h1-hash)))
+          (is (not (null (bl.store:get-block-index-entry state h1-hash)))
               "above-threshold header enters the block index"))))))
 
 (test generic-path-unconnecting-headers-store-nothing
   "A header batch that does not connect to our index (unknown prev-block)
 stores nothing and does not error — Core HandleUnconnectingHeaders sends a
 getheaders and stages availability, committing nothing."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp.storage:*pow-limit-target*
-          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target*
+          bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-presync-unconn/")
       (declare (ignore genesis-hash))
-      (let* ((bitcoin-lisp::*minimum-chain-work-override* 0)
-             (p (bitcoin-lisp.networking:make-peer :conn-type :outbound-full-relay))
+      (let* ((bl::*minimum-chain-work-override* 0)
+             (p (bl.net:make-peer :conn-type :outbound-full-relay))
              (orphan-prev (make-array 32 :element-type '(unsigned-byte 8)
                                          :initial-element 99))
              (h1 (%pow-header orphan-prev))
-             (h1-hash (bitcoin-lisp.serialization:block-header-hash h1)))
-        (let ((added (bitcoin-lisp.networking::ingest-headers-from-peer p (list h1) state)))
+             (h1-hash (bl.ser:block-header-hash h1)))
+        (let ((added (bl.net::ingest-headers-from-peer p (list h1) state)))
           (is (= 0 added))
-          (is (null (bitcoin-lisp.storage:get-block-index-entry state h1-hash))
+          (is (null (bl.store:get-block-index-entry state h1-hash))
               "an unconnecting header must not enter the index"))))))
 
 ;;;; ============================================================
@@ -600,20 +600,20 @@ getheaders and stages availability, committing nothing."
 (defun %g718-state-with-work (work)
   "A chain-state holding one header entry with WORK chain-work, and a peer
 whose best-known block is that entry."
-  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+  (let* ((state (bl.store:make-chain-state))
          (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 21)))
-    (bitcoin-lisp.storage:add-block-index-entry
-     state (bitcoin-lisp.storage:make-block-index-entry
+    (bl.store:add-block-index-entry
+     state (bl.store:make-block-index-entry
             :hash hash :height 1 :chain-work work :status :header-valid))
     (values state hash)))
 
 (defun %g718-peer (&key (conn-type :outbound-full-relay) inbound manual best-hash)
-  (let ((p (bitcoin-lisp.networking:make-peer :inbound inbound)))
-    (setf (bitcoin-lisp.networking:peer-conn-type p) conn-type
-          (bitcoin-lisp.networking:peer-manual p) manual
-          (bitcoin-lisp.networking:peer-state p) :ready)
+  (let ((p (bl.net:make-peer :inbound inbound)))
+    (setf (bl.net:peer-conn-type p) conn-type
+          (bl.net:peer-manual p) manual
+          (bl.net:peer-state p) :ready)
     (when best-hash
-      (setf (bitcoin-lisp.networking::peer-best-known-block-hash p) best-hash))
+      (setf (bl.net::peer-best-known-block-hash p) best-hash))
     p))
 
 (defmacro %with-whitelist ((&key entries (whitebind 0)) &body body)
@@ -621,12 +621,12 @@ whose best-known block is that entry."
 installed, and WHITEBIND as the -whitebind flags. Bound, not set: the whitelist
 is global start-up configuration, and a test that leaked it would grant
 permissions to every peer in every later test."
-  `(let ((bitcoin-lisp.networking::*whitelist-entries*
+  `(let ((bl.net::*whitelist-entries*
            (mapcar (lambda (spec)
-                     (or (bitcoin-lisp.networking:parse-whitelist-entry spec)
+                     (or (bl.net:parse-whitelist-entry spec)
                          (error "test fixture: unparseable -whitelist ~S" spec)))
                    ,entries))
-         (bitcoin-lisp.networking::*whitebind-flags* ,whitebind))
+         (bl.net::*whitebind-flags* ,whitebind))
      ,@body))
 
 (test net-permission-flags-parse-as-cores-do
@@ -636,53 +636,53 @@ in Core rather than into the parser: forcerelay implies relay, and noban
 implies download. A parser that treated them as independent bits would grant
 less than the operator asked for, silently."
   (flet ((flags (spec)
-           (nth-value 0 (bitcoin-lisp.networking:parse-permission-flags spec)))
+           (nth-value 0 (bl.net:parse-permission-flags spec)))
          (rest-of (spec)
-           (nth-value 2 (bitcoin-lisp.networking:parse-permission-flags spec))))
+           (nth-value 2 (bl.net:parse-permission-flags spec))))
     ;; No @: implicit permissions, and the whole string is the address.
-    (is (= bitcoin-lisp.networking::+perm-implicit+ (flags "1.2.3.4")))
+    (is (= bl.net::+perm-implicit+ (flags "1.2.3.4")))
     (is (equal "1.2.3.4" (rest-of "1.2.3.4")))
     (is (equal "1.2.3.0/24" (rest-of "noban@1.2.3.0/24")))
     ;; forcerelay implies relay; noban implies download.
     (let ((f (flags "forcerelay@1.2.3.4")))
-      (is (= bitcoin-lisp.networking::+perm-relay+
-             (logand f bitcoin-lisp.networking::+perm-relay+))))
+      (is (= bl.net::+perm-relay+
+             (logand f bl.net::+perm-relay+))))
     (let ((f (flags "noban@1.2.3.4")))
-      (is (= bitcoin-lisp.networking::+perm-download+
-             (logand f bitcoin-lisp.networking::+perm-download+))))
+      (is (= bl.net::+perm-download+
+             (logand f bl.net::+perm-download+))))
     ;; "all" covers every named permission.
     (let ((f (flags "all@1.2.3.4")))
-      (dolist (bit (list bitcoin-lisp.networking::+perm-bloom-filter+
-                         bitcoin-lisp.networking::+perm-relay+
-                         bitcoin-lisp.networking::+perm-force-relay+
-                         bitcoin-lisp.networking::+perm-noban+
-                         bitcoin-lisp.networking::+perm-mempool+
-                         bitcoin-lisp.networking::+perm-download+
-                         bitcoin-lisp.networking::+perm-addr+))
+      (dolist (bit (list bl.net::+perm-bloom-filter+
+                         bl.net::+perm-relay+
+                         bl.net::+perm-force-relay+
+                         bl.net::+perm-noban+
+                         bl.net::+perm-mempool+
+                         bl.net::+perm-download+
+                         bl.net::+perm-addr+))
         (is (= bit (logand f bit)))))
     ;; Core accepts both spellings of bloomfilter.
     (is (= (flags "bloom@1.2.3.4") (flags "bloomfilter@1.2.3.4")))
     ;; Multiple permissions, comma-separated.
     (let ((f (flags "noban,mempool@1.2.3.4")))
-      (is (= bitcoin-lisp.networking::+perm-mempool+
-             (logand f bitcoin-lisp.networking::+perm-mempool+)))
-      (is (= bitcoin-lisp.networking::+perm-noban+
-             (logand f bitcoin-lisp.networking::+perm-noban+))))
+      (is (= bl.net::+perm-mempool+
+             (logand f bl.net::+perm-mempool+)))
+      (is (= bl.net::+perm-noban+
+             (logand f bl.net::+perm-noban+))))
     ;; An unknown permission is refused outright rather than ignored.
     (is-false (flags "nosuchperm@1.2.3.4"))
-    (is-false (bitcoin-lisp.networking:parse-whitelist-entry "nosuchperm@1.2.3.4"))
+    (is-false (bl.net:parse-whitelist-entry "nosuchperm@1.2.3.4"))
     ;; As is an unparseable range.
-    (is-false (bitcoin-lisp.networking:parse-whitelist-entry "noban@not-an-address"))
+    (is-false (bl.net:parse-whitelist-entry "noban@not-an-address"))
     ;; -whitebind refuses "out": a listening socket has no outgoing peers.
-    (is-false (bitcoin-lisp.networking:parse-whitelist-entry
+    (is-false (bl.net:parse-whitelist-entry
                "noban,out@1.2.3.4" :allow-out nil)))
   ;; Rendering back, for getpeerinfo.permissions. "implicit" is not a
   ;; permission and is never listed.
   (is (equal '("noban" "download")
-             (bitcoin-lisp.networking:permission-flag-names
-              bitcoin-lisp.networking::+perm-noban+)))
-  (is (null (bitcoin-lisp.networking:permission-flag-names
-             bitcoin-lisp.networking::+perm-implicit+))))
+             (bl.net:permission-flag-names
+              bl.net::+perm-noban+)))
+  (is (null (bl.net:permission-flag-names
+             bl.net::+perm-implicit+))))
 
 (test net-permissions-apply-by-address-and-direction
   "A range grants permissions only to peers inside it, and only in the
@@ -690,21 +690,21 @@ direction the operator named — \"noban@...,out\" grants nothing to an inbound
 peer from that range. -whitebind's flags reach inbound peers only, since they
 describe a listening socket."
   (%with-whitelist (:entries '("noban@10.0.0.0/8"))
-    (is (= bitcoin-lisp.networking::+perm-noban+
-           (logand (bitcoin-lisp.networking:peer-permission-flags "10.1.2.3" t)
-                   bitcoin-lisp.networking::+perm-noban+)))
+    (is (= bl.net::+perm-noban+
+           (logand (bl.net:peer-permission-flags "10.1.2.3" t)
+                   bl.net::+perm-noban+)))
     ;; Outside the range: nothing.
-    (is (= 0 (bitcoin-lisp.networking:peer-permission-flags "11.1.2.3" t)))
+    (is (= 0 (bl.net:peer-permission-flags "11.1.2.3" t)))
     ;; An address that does not parse is refused, never defaulted in.
-    (is (= 0 (bitcoin-lisp.networking:peer-permission-flags "not-an-address" t))))
+    (is (= 0 (bl.net:peer-permission-flags "not-an-address" t))))
   (%with-whitelist (:entries '("noban,out@10.0.0.0/8"))
-    (is (= 0 (bitcoin-lisp.networking:peer-permission-flags "10.1.2.3" t))
+    (is (= 0 (bl.net:peer-permission-flags "10.1.2.3" t))
         "an out-only grant reached an inbound peer")
-    (is (plusp (bitcoin-lisp.networking:peer-permission-flags "10.1.2.3" nil))))
+    (is (plusp (bl.net:peer-permission-flags "10.1.2.3" nil))))
   ;; -whitebind: inbound only.
-  (%with-whitelist (:entries '() :whitebind bitcoin-lisp.networking::+perm-mempool+)
-    (is (plusp (bitcoin-lisp.networking:peer-permission-flags "10.1.2.3" t)))
-    (is (= 0 (bitcoin-lisp.networking:peer-permission-flags "10.1.2.3" nil)))))
+  (%with-whitelist (:entries '() :whitebind bl.net::+perm-mempool+)
+    (is (plusp (bl.net:peer-permission-flags "10.1.2.3" t)))
+    (is (= 0 (bl.net:peer-permission-flags "10.1.2.3" nil)))))
 
 (test noban-peer-is-neither-discouraged-nor-disconnected
   "Core clears m_should_discourage for a noban peer AND keeps the connection
@@ -714,17 +714,17 @@ dropping the connection would not deliver the option — the point of
 behaviour."
   (%with-whitelist (:entries '("noban@10.0.0.0/8"))
     (let ((p (%g718-peer :inbound t)))
-      (setf (bitcoin-lisp.networking:peer-address p) "10.1.2.3")
-      (is-false (bitcoin-lisp.networking:record-misbehavior p "test"))
-      (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+      (setf (bl.net:peer-address p) "10.1.2.3")
+      (is-false (bl.net:record-misbehavior p "test"))
+      (is (eq :ready (bl.net:peer-state p))
           "a noban peer was disconnected for misbehaviour")
-      (is-false (bitcoin-lisp.networking:peer-discouraged-p "10.1.2.3")))
+      (is-false (bl.net:peer-discouraged-p "10.1.2.3")))
     ;; Control: a peer OUTSIDE the range is punished exactly as before.
     (let ((p (%g718-peer :inbound t)))
-      (setf (bitcoin-lisp.networking:peer-address p) "11.1.2.3")
-      (is-true (bitcoin-lisp.networking:record-misbehavior p "test"))
-      (is (eq :disconnected (bitcoin-lisp.networking:peer-state p)))
-      (is-true (bitcoin-lisp.networking:peer-discouraged-p "11.1.2.3")))))
+      (setf (bl.net:peer-address p) "11.1.2.3")
+      (is-true (bl.net:record-misbehavior p "test"))
+      (is (eq :disconnected (bl.net:peer-state p)))
+      (is-true (bl.net:peer-discouraged-p "11.1.2.3")))))
 
 (test relay-permission-excuses-blocksonly-and-nothing-else
   "Core RejectIncomingTxs (net_processing.cpp:5686-5694): the \"relay\"
@@ -732,15 +732,15 @@ permission excuses the -blocksonly clause and ONLY that clause. A
 block-relay-only or feeler connection may never send us transactions whatever
 its permissions — a permission that also unlocked those would let an operator
 turn a link they meant to keep block-only into a tx firehose."
-  (let ((bitcoin-lisp:*blocksonly* t)
-        (bitcoin-lisp:*network* :regtest))
+  (let ((bl:*blocksonly* t)
+        (bl:*network* :regtest))
     (flet ((dropped-p (address conn-type)
              (let ((p (%g718-peer :conn-type conn-type :inbound t)))
-               (setf (bitcoin-lisp.networking:peer-address p) address)
-               (bitcoin-lisp.networking::handle-tx
+               (setf (bl.net:peer-address p) address)
+               (bl.net::handle-tx
                 p (make-array 0 :element-type '(unsigned-byte 8))
                 nil nil nil nil)
-               (eq :disconnected (bitcoin-lisp.networking:peer-state p)))))
+               (eq :disconnected (bl.net:peer-state p)))))
       (%with-whitelist (:entries '("relay@10.0.0.0/8"))
         ;; Control: without the permission, -blocksonly drops the sender.
         (is-true (dropped-p "11.1.2.3" :outbound-full-relay))
@@ -755,23 +755,23 @@ turn a link they meant to keep block-only into a tx firehose."
 !pfrom.HasPermission(NetPermissionFlags::Addr)`. Such a peer may send us
 unlimited addresses; everyone else spends tokens."
   (flet ((rate-limited-count (address entries)
-           (let* ((book (bitcoin-lisp.networking:make-address-book))
+           (let* ((book (bl.net:make-address-book))
                   (p (%g718-peer :inbound t))
-                  (now (bitcoin-lisp.serialization:get-unix-time))
+                  (now (bl.ser:get-unix-time))
                   (addrs (loop for i below 40
-                               collect (cons (bitcoin-lisp.serialization:make-net-addr
+                               collect (cons (bl.ser:make-net-addr
                                               :services 1
-                                              :ip (bitcoin-lisp.networking:ipv4-to-mapped-ipv6
+                                              :ip (bl.net:ipv4-to-mapped-ipv6
                                                    10 0 0 (1+ i))
                                               :port 8333)
                                              now))))
-             (setf (bitcoin-lisp.networking:peer-address p) address)
+             (setf (bl.net:peer-address p) address)
              ;; An EMPTY bucket, so any processing at all proves the exemption.
-             (setf (bitcoin-lisp.networking::peer-addr-token-bucket p) 0d0)
+             (setf (bl.net::peer-addr-token-bucket p) 0d0)
              (%with-whitelist (:entries entries)
-               (bitcoin-lisp.networking::%process-gossiped-addresses
+               (bl.net::%process-gossiped-addresses
                 p addrs (length addrs) book nil))
-             (bitcoin-lisp.networking::peer-addr-rate-limited p))))
+             (bl.net::peer-addr-rate-limited p))))
     ;; Control: an empty bucket rate-limits every address.
     (is (= 40 (rate-limited-count "11.1.2.3" '("noban@10.0.0.0/8"))))
     ;; With the addr permission, none of them are.
@@ -783,21 +783,21 @@ permission, since it does not advertise NODE_BLOOM (net_processing.cpp:
 4940-4951); everyone else is disconnected. Granting the permission and then
 sending nothing would be worse than the disconnect, so this asserts the inv
 actually goes out."
-  (let ((mp (bitcoin-lisp.mempool:make-mempool)))
+  (let ((mp (bl.mp:make-mempool)))
     (%mine-add mp (make-mempool-test-tx :input-id 61) 10000)
     (flet ((ask (address entries)
              (let ((p (%g718-peer :inbound t)))
-               (setf (bitcoin-lisp.networking:peer-address p) address)
+               (setf (bl.net:peer-address p) address)
                ;; A peer with no stored version counts as tx-relaying, which
                ;; is what %g718-peer leaves behind.
                (values (%cbp-capture-sends
                         (lambda ()
                           (%with-whitelist (:entries entries)
-                            (bitcoin-lisp.networking:handle-message
+                            (bl.net:handle-message
                              p "mempool" (make-array 0 :element-type
                                                        '(unsigned-byte 8))
                              nil nil nil :mempool mp))))
-                       (bitcoin-lisp.networking:peer-state p)))))
+                       (bl.net:peer-state p)))))
       ;; Without the permission: no inv, and the peer is dropped.
       (multiple-value-bind (sent state) (ask "11.1.2.3" '("noban@10.0.0.0/8"))
         (is (null sent) "an unpermitted mempool request was answered: ~S" sent)
@@ -814,48 +814,48 @@ INCLUDE :block-relay, and it must EXCLUDE manual (-addnode) peers — ours are
 typed :outbound-full-relay, and connect-added-nodes redials them every ~30s, so
 a plain not-inbound test would loop connect/disconnect against a peer the
 operator pinned."
-  (is-true (bitcoin-lisp.networking:peer-outbound-or-block-relay-p
+  (is-true (bl.net:peer-outbound-or-block-relay-p
             (%g718-peer :conn-type :outbound-full-relay)))
-  (is-true (bitcoin-lisp.networking:peer-outbound-or-block-relay-p
+  (is-true (bl.net:peer-outbound-or-block-relay-p
             (%g718-peer :conn-type :block-relay))
            ":block-relay must be included")
-  (is-false (bitcoin-lisp.networking:peer-outbound-or-block-relay-p
+  (is-false (bl.net:peer-outbound-or-block-relay-p
              (%g718-peer :conn-type :outbound-full-relay :manual t))
             "manual -addnode peers must be excluded")
-  (is-false (bitcoin-lisp.networking:peer-outbound-or-block-relay-p
+  (is-false (bl.net:peer-outbound-or-block-relay-p
              (%g718-peer :conn-type :feeler)))
-  (is-false (bitcoin-lisp.networking:peer-outbound-or-block-relay-p
+  (is-false (bl.net:peer-outbound-or-block-relay-p
              (%g718-peer :inbound t))))
 
 (test g7-18-low-work-outbound-disconnected-in-ibd
   "G7-18: we refused to DOWNLOAD from a sub-minchainwork peer but never
 disconnected it, so a toy-chain peer could pin an outbound slot for the whole
 of IBD — a step toward IBD eclipse."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp:*minimum-chain-work-override* 1000))
+  (let ((bl:*network* :regtest)
+        (bl:*minimum-chain-work-override* 1000))
     (multiple-value-bind (state hash) (%g718-state-with-work 10)
       ;; Low work + non-full batch + outbound + IBD => dropped.
       (let ((p (%g718-peer :best-hash hash)))
-        (is-true (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+        (is-true (bl.net::maybe-disconnect-low-work-outbound
                   p state nil))
-        (is (eq :disconnected (bitcoin-lisp.networking:peer-state p))))
+        (is (eq :disconnected (bl.net:peer-state p))))
       ;; A FULL batch means more headers may follow — we have not seen their
       ;; tip yet, so we must not judge them.
       (let ((p (%g718-peer :best-hash hash)))
-        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+        (is-false (bl.net::maybe-disconnect-low-work-outbound
                    p state t)
                   "a full batch must not trigger the drop"))
       ;; Manual and inbound peers are exempt.
       (let ((p (%g718-peer :best-hash hash :manual t)))
-        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+        (is-false (bl.net::maybe-disconnect-low-work-outbound
                    p state nil)
                   "manual peers must never be auto-dropped"))
       (let ((p (%g718-peer :best-hash hash :inbound t)))
-        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+        (is-false (bl.net::maybe-disconnect-low-work-outbound
                    p state nil)))
       ;; A peer that never announced anything is never judged (Core :2930).
       (let ((p (%g718-peer)))
-        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+        (is-false (bl.net::maybe-disconnect-low-work-outbound
                    p state nil)
                   "a peer with no best-known block must not be judged")))))
 
@@ -864,32 +864,32 @@ of IBD — a step toward IBD eclipse."
 exactly meets the floor is kept. (The obvious version of this test — pointing a
 FRESH peer at a raised floor — asserts nothing, because a fresh peer has no
 best-known block and is skipped for that reason rather than the work one.)"
-  (let ((bitcoin-lisp:*network* :regtest))
+  (let ((bl:*network* :regtest))
     ;; Work exactly equal to the floor: kept.
     (multiple-value-bind (state hash) (%g718-state-with-work 1000)
-      (let ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+      (let ((bl:*minimum-chain-work-override* 1000)
             (p (%g718-peer :best-hash hash)))
-        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+        (is-false (bl.net::maybe-disconnect-low-work-outbound
                    p state nil)
                   "equal work must be kept, not dropped")
-        (is (eq :ready (bitcoin-lisp.networking:peer-state p)))))
+        (is (eq :ready (bl.net:peer-state p)))))
     ;; One unit below the floor: dropped.
     (multiple-value-bind (state hash) (%g718-state-with-work 999)
-      (let ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+      (let ((bl:*minimum-chain-work-override* 1000)
             (p (%g718-peer :best-hash hash)))
-        (is-true (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+        (is-true (bl.net::maybe-disconnect-low-work-outbound
                   p state nil))))))
 
 (test g7-18-not-applied-outside-ibd
   "Past IBD the rule does not apply — a peer on a short chain is no longer
 occupying a slot we need for syncing."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp:*minimum-chain-work-override* 1000))
+  (let ((bl:*network* :regtest)
+        (bl:*minimum-chain-work-override* 1000))
     (multiple-value-bind (state hash) (%g718-state-with-work 10)
       ;; Force the IBD latch off for this check.
-      (let ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+      (let ((bl.net::*cached-is-ibd* nil)
             (p (%g718-peer :best-hash hash)))
-        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+        (is-false (bl.net::maybe-disconnect-low-work-outbound
                    p state nil)
                   "outside IBD the peer must be kept")))))
 
@@ -900,27 +900,27 @@ occupying a slot we need for syncing."
 (defun %g708-chain (tip-work)
   "A chain-state whose tip has TIP-WORK, plus a lower-work entry a peer can
 claim as its best-known."
-  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+  (let* ((state (bl.store:make-chain-state))
          (tip-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8))
          (low-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
-    (bitcoin-lisp.storage:add-block-index-entry
-     state (bitcoin-lisp.storage:make-block-index-entry
+    (bl.store:add-block-index-entry
+     state (bl.store:make-block-index-entry
             :hash tip-hash :height 100 :chain-work tip-work :status :valid))
-    (bitcoin-lisp.storage:add-block-index-entry
-     state (bitcoin-lisp.storage:make-block-index-entry
+    (bl.store:add-block-index-entry
+     state (bl.store:make-block-index-entry
             :hash low-hash :height 50 :chain-work (floor tip-work 2) :status :valid))
-    (bitcoin-lisp.storage:update-chain-tip state tip-hash 100)
+    (bl.store:update-chain-tip state tip-hash 100)
     (values state tip-hash low-hash)))
 
 (defun %g708-peer (&key (conn-type :outbound-full-relay) inbound manual best-hash protect
                         (address "test"))
-  (let ((p (bitcoin-lisp.networking:make-peer :inbound inbound :address address)))
-    (setf (bitcoin-lisp.networking:peer-conn-type p) conn-type
-          (bitcoin-lisp.networking:peer-manual p) manual
-          (bitcoin-lisp.networking:peer-state p) :ready
-          (bitcoin-lisp.networking::peer-chain-sync-protect p) protect)
+  (let ((p (bl.net:make-peer :inbound inbound :address address)))
+    (setf (bl.net:peer-conn-type p) conn-type
+          (bl.net:peer-manual p) manual
+          (bl.net:peer-state p) :ready
+          (bl.net::peer-chain-sync-protect p) protect)
     (when best-hash
-      (setf (bitcoin-lisp.networking::peer-best-known-block-hash p) best-hash))
+      (setf (bl.net::peer-best-known-block-hash p) best-hash))
     p))
 
 (test g7-08-chain-sync-arms-probes-then-disconnects
@@ -933,39 +933,39 @@ pins us on a stale tip indefinitely."
     (declare (ignore tip-hash))
     (let ((peer (%g708-peer :best-hash low-hash))
           (sent 0))
-      (let ((real (fdefinition 'bitcoin-lisp.networking::send-message)))
+      (let ((real (fdefinition 'bl.net::send-message)))
         (unwind-protect
              (progn
-               (setf (fdefinition 'bitcoin-lisp.networking::send-message)
+               (setf (fdefinition 'bl.net::send-message)
                      (lambda (p m) (declare (ignore p m)) (incf sent)))
                ;; First sweep arms the timer.
-               (is (eq :armed (bitcoin-lisp.networking:consider-chain-sync-eviction
+               (is (eq :armed (bl.net:consider-chain-sync-eviction
                                peer state 1000)))
                (is (= 0 sent) "arming must not send anything")
                ;; Before the deadline: nothing happens (still armed, no re-arm).
-               (is (null (bitcoin-lisp.networking:consider-chain-sync-eviction
+               (is (null (bl.net:consider-chain-sync-eviction
                           peer state 1500)))
                ;; Past 20 minutes: probe with a getheaders, do NOT disconnect.
-               (is (eq :probed (bitcoin-lisp.networking:consider-chain-sync-eviction
+               (is (eq :probed (bl.net:consider-chain-sync-eviction
                                 peer state (+ 1000 1201))))
                (is (= 1 sent) "the probe must send exactly one getheaders")
-               (is (eq :ready (bitcoin-lisp.networking:peer-state peer))
+               (is (eq :ready (bl.net:peer-state peer))
                    "the probe must not disconnect")
                ;; A further 2 minutes with no improvement: drop it.
-               (is (eq :disconnected (bitcoin-lisp.networking:consider-chain-sync-eviction
+               (is (eq :disconnected (bl.net:consider-chain-sync-eviction
                                       peer state (+ 1000 1201 121))))
-               (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer))))
-          (setf (fdefinition 'bitcoin-lisp.networking::send-message) real))))))
+               (is (eq :disconnected (bl.net:peer-state peer))))
+          (setf (fdefinition 'bl.net::send-message) real))))))
 
 (test g7-08-good-chain-clears-the-timer
   "A peer whose best-known work reaches our tip clears its timer entirely — it
 has answered for itself."
   (multiple-value-bind (state tip-hash) (%g708-chain 1000)
     (let ((peer (%g708-peer :best-hash tip-hash)))
-      (setf (bitcoin-lisp.networking::peer-chain-sync-timeout peer) 500)
-      (is (eq :cleared (bitcoin-lisp.networking:consider-chain-sync-eviction
+      (setf (bl.net::peer-chain-sync-timeout peer) 500)
+      (is (eq :cleared (bl.net:consider-chain-sync-eviction
                         peer state 1000)))
-      (is (zerop (bitcoin-lisp.networking::peer-chain-sync-timeout peer))))))
+      (is (zerop (bl.net::peer-chain-sync-timeout peer))))))
 
 (test g7-08-exempt-peers-are-never-evicted
   "Manual, inbound and protected peers are outside the eviction logic. Manual
@@ -977,31 +977,31 @@ would loop forever against a peer the operator pinned."
                         (%g708-peer :best-hash low-hash :inbound t)
                         (%g708-peer :best-hash low-hash :protect t)
                         (%g708-peer :best-hash low-hash :conn-type :feeler)))
-      (is (null (bitcoin-lisp.networking:consider-chain-sync-eviction
+      (is (null (bl.net:consider-chain-sync-eviction
                  peer state 1000))
           "exempt peers must not even be armed"))
     ;; A block-relay peer IS a candidate (Core keeps them subject to the logic).
-    (is (eq :armed (bitcoin-lisp.networking:consider-chain-sync-eviction
+    (is (eq :armed (bl.net:consider-chain-sync-eviction
                     (%g708-peer :best-hash low-hash :conn-type :block-relay)
                     state 1000)))))
 
 (test g7-08-protection-is-capped-at-four-and-released
   "Core protects at most MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT (4)
 outbound FULL-RELAY peers; block-relay peers are deliberately never protected."
-  (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
+  (let ((bl.net::*protected-outbound-count* 0))
     (let ((peers (loop repeat 6 collect (%g708-peer))))
-      (dolist (p peers) (bitcoin-lisp.networking:maybe-protect-outbound-peer p))
-      (is (= 4 (count-if #'bitcoin-lisp.networking::peer-chain-sync-protect peers))
+      (dolist (p peers) (bl.net:maybe-protect-outbound-peer p))
+      (is (= 4 (count-if #'bl.net::peer-chain-sync-protect peers))
           "at most 4 peers may hold protection")
-      (is (= 4 bitcoin-lisp.networking::*protected-outbound-count*))
+      (is (= 4 bl.net::*protected-outbound-count*))
       ;; Releasing frees a slot for another peer.
-      (bitcoin-lisp.networking:release-outbound-protection (first peers))
-      (is (= 3 bitcoin-lisp.networking::*protected-outbound-count*))
-      (is (bitcoin-lisp.networking:maybe-protect-outbound-peer (%g708-peer))
+      (bl.net:release-outbound-protection (first peers))
+      (is (= 3 bl.net::*protected-outbound-count*))
+      (is (bl.net:maybe-protect-outbound-peer (%g708-peer))
           "a freed slot must be reusable"))
     ;; Block-relay peers are not eligible.
-    (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
-      (is (null (bitcoin-lisp.networking:maybe-protect-outbound-peer
+    (let ((bl.net::*protected-outbound-count* 0))
+      (is (null (bl.net:maybe-protect-outbound-peer
                  (%g708-peer :conn-type :block-relay)))
           "block-relay peers must stay subject to the eviction logic"))))
 
@@ -1013,27 +1013,27 @@ ever increments, so the first 4 outbound full-relay peers claim every slot withi
 minutes of startup (during IBD a caught-up peer trivially satisfies best-known >=
 tip) and, once they churn out, NO later peer can ever be protected. That inverts
 P2 into a guarantee that every outbound peer is evictable."
-  (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
+  (let ((bl.net::*protected-outbound-count* 0))
     (let ((peers (loop repeat 4 collect (%g708-peer))))
       (dolist (p peers)
-        (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer p)))
-      (is (= 4 bitcoin-lisp.networking::*protected-outbound-count*))
+        (is-true (bl.net:maybe-protect-outbound-peer p)))
+      (is (= 4 bl.net::*protected-outbound-count*))
       ;; All slots spent: a fifth peer cannot be protected yet.
-      (is-false (bitcoin-lisp.networking:maybe-protect-outbound-peer (%g708-peer))
+      (is-false (bl.net:maybe-protect-outbound-peer (%g708-peer))
                 "the cap must hold while all 4 slots are occupied")
       ;; Normal churn: every peer retires through the real disconnect path.
-      (dolist (p peers) (bitcoin-lisp.networking:disconnect-peer p))
-      (is (= 0 bitcoin-lisp.networking::*protected-outbound-count*)
+      (dolist (p peers) (bl.net:disconnect-peer p))
+      (is (= 0 bl.net::*protected-outbound-count*)
           "disconnect-peer must give every slot back")
-      (is (= 0 (count-if #'bitcoin-lisp.networking::peer-chain-sync-protect peers))
+      (is (= 0 (count-if #'bl.net::peer-chain-sync-protect peers))
           "no retired peer may still claim protection")
       ;; The point of the whole exercise: peers dialed after the churn can still
       ;; earn protection.
       (let ((fresh (loop repeat 4 collect (%g708-peer))))
         (dolist (p fresh)
-          (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer p)
+          (is-true (bl.net:maybe-protect-outbound-peer p)
                    "a post-churn peer must still be able to earn protection"))
-        (is (= 4 bitcoin-lisp.networking::*protected-outbound-count*))))))
+        (is (= 4 bl.net::*protected-outbound-count*))))))
 
 (test g7-08-repeated-release-decrements-exactly-once
   "A peer can be retired by more than one path (disconnected, then reaped; or
@@ -1041,20 +1041,20 @@ misbehaving, then disconnected). The per-peer flag is the source of truth, so
 only the first release decrements — a double decrement would let us hand out
 more than the 4 slots Core allows, which is the same uncapped state the leak
 produced, only from the other direction."
-  (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
+  (let ((bl.net::*protected-outbound-count* 0))
     (let ((a (%g708-peer))
           (b (%g708-peer)))
-      (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer a))
-      (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer b))
-      (is (= 2 bitcoin-lisp.networking::*protected-outbound-count*))
+      (is-true (bl.net:maybe-protect-outbound-peer a))
+      (is-true (bl.net:maybe-protect-outbound-peer b))
+      (is (= 2 bl.net::*protected-outbound-count*))
       ;; Retire A three times over, two of them through the production path.
-      (bitcoin-lisp.networking:disconnect-peer a)
-      (bitcoin-lisp.networking:disconnect-peer a)
-      (bitcoin-lisp.networking:release-outbound-protection a)
+      (bl.net:disconnect-peer a)
+      (bl.net:disconnect-peer a)
+      (bl.net:release-outbound-protection a)
       ;; B still holds its slot: the count is 1, not 0 and not negative.
-      (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*)
+      (is (= 1 bl.net::*protected-outbound-count*)
           "releasing one peer repeatedly must decrement exactly once")
-      (is-true (bitcoin-lisp.networking::peer-chain-sync-protect b)
+      (is-true (bl.net::peer-chain-sync-protect b)
                "the other peer must keep its protection"))))
 
 (test g7-08-misbehavior-releases-the-protection-slot
@@ -1063,16 +1063,16 @@ closes the connection and sets :disconnected itself), so it owes the slot back
 too — Core's FinalizeNode runs for every removal whatever the reason. Leaving
 this path out would leak a slot on every protected outbound peer that trips a
 protocol rule."
-  (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
+  (let ((bl.net::*protected-outbound-count* 0))
     ;; A dedicated address: record-misbehavior writes to the global discourage
     ;; filter, and "test" is shared with the other helpers here.
     (let ((peer (%g708-peer :address "198.51.100.77")))
-      (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer peer))
-      (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*))
-      (bitcoin-lisp.networking:record-misbehavior peer "g7-08 slot release")
-      (is (= 0 bitcoin-lisp.networking::*protected-outbound-count*)
+      (is-true (bl.net:maybe-protect-outbound-peer peer))
+      (is (= 1 bl.net::*protected-outbound-count*))
+      (bl.net:record-misbehavior peer "g7-08 slot release")
+      (is (= 0 bl.net::*protected-outbound-count*)
           "record-misbehavior must give the slot back")
-      (is-false (bitcoin-lisp.networking::peer-chain-sync-protect peer)))))
+      (is-false (bl.net::peer-chain-sync-protect peer)))))
 
 (test g7-08-retired-peers-are-never-granted-protection
   "Core guards the grant with `!pfrom.fDisconnect` (net_processing.cpp:2951):
@@ -1085,40 +1085,40 @@ straight out of node-peers with no release, and never reaps :banned peers at
 all — so a slot granted AFTER the retirement is never given back. Four of them
 exhaust every slot for the life of the process and no peer can be protected
 again, which is precisely the state P2 exists to prevent."
-  (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
+  (let ((bl.net::*protected-outbound-count* 0))
     ;; Control: an identical, still-live peer IS granted.
     (let ((live (%g708-peer)))
-      (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer live)
+      (is-true (bl.net:maybe-protect-outbound-peer live)
                "a live outbound full-relay peer must still be granted")
-      (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*)))
+      (is (= 1 bl.net::*protected-outbound-count*)))
     ;; Retired through the real DISCONNECT-PEER.
     (let ((dead (%g708-peer)))
-      (bitcoin-lisp.networking:disconnect-peer dead)
-      (is (eq :disconnected (bitcoin-lisp.networking:peer-state dead))
+      (bl.net:disconnect-peer dead)
+      (is (eq :disconnected (bl.net:peer-state dead))
           "precondition: the peer really is retired")
-      (is-false (bitcoin-lisp.networking:peer-live-p dead))
-      (is-false (bitcoin-lisp.networking:maybe-protect-outbound-peer dead)
+      (is-false (bl.net:peer-live-p dead))
+      (is-false (bl.net:maybe-protect-outbound-peer dead)
                 "a :disconnected peer must never be granted a slot")
-      (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*)
+      (is (= 1 bl.net::*protected-outbound-count*)
           "a refused grant must leave the counter untouched")
-      (is-false (bitcoin-lisp.networking::peer-chain-sync-protect dead)
+      (is-false (bl.net::peer-chain-sync-protect dead)
                 "and must not set the per-peer flag"))
     ;; Retired through the real BAN-PEER. Worse than :disconnected: nothing
     ;; ever reaps a banned peer, so a slot granted here is lost outright.
     (let ((banned (%g708-peer :address "198.51.100.78")))
       (unwind-protect
            (progn
-             (bitcoin-lisp.networking:ban-peer banned)
-             (is (eq :banned (bitcoin-lisp.networking:peer-state banned))
+             (bl.net:ban-peer banned)
+             (is (eq :banned (bl.net:peer-state banned))
                  "precondition: the peer really is banned")
-             (is-false (bitcoin-lisp.networking:peer-live-p banned))
-             (is-false (bitcoin-lisp.networking:maybe-protect-outbound-peer banned)
+             (is-false (bl.net:peer-live-p banned))
+             (is-false (bl.net:maybe-protect-outbound-peer banned)
                        "a :banned peer must never be granted a slot")
-             (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*)
+             (is (= 1 bl.net::*protected-outbound-count*)
                  "a refused grant must leave the counter untouched")
-             (is-false (bitcoin-lisp.networking::peer-chain-sync-protect banned)))
+             (is-false (bl.net::peer-chain-sync-protect banned)))
         ;; ban-peer writes the process-global ban list; put it back.
-        (bitcoin-lisp.networking:unban-address "198.51.100.78")))))
+        (bl.net:unban-address "198.51.100.78")))))
 
 (test g7-08-headers-from-a-retired-peer-do-not-grant-protection
   "The same refusal through the PRODUCTION path — ingest-headers-from-peer ->
@@ -1136,48 +1136,48 @@ protectable.
 
 The header batch is byte-identical in all three runs and every run stores it,
 so the only thing that differs is the peer's liveness."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp.storage:*pow-limit-target*
-          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target*
+          bl.store:+regtest-pow-limit-target+))
     (flet ((ingest (dir peer)
              ;; A fresh genesis-only regtest index, one valid header off it.
              ;; Its chain-work lands above the tip's, so the grant condition
              ;; (best-known >= tip) holds for whichever peer delivers it.
              (multiple-value-bind (state genesis-hash) (%regtest-chain-state dir)
-               (let ((bitcoin-lisp::*minimum-chain-work-override* 0))
-                 (bitcoin-lisp.networking::ingest-headers-from-peer
+               (let ((bl::*minimum-chain-work-override* 0))
+                 (bl.net::ingest-headers-from-peer
                   peer (list (%pow-header genesis-hash)) state)))))
       ;; Control: a live peer earns protection from this batch.
-      (let ((bitcoin-lisp.networking::*protected-outbound-count* 0)
+      (let ((bl.net::*protected-outbound-count* 0)
             (peer (%g708-peer)))
         (is (= 1 (ingest "test-g708-live/" peer))
             "control: the batch must actually be stored")
-        (is-true (bitcoin-lisp.networking::peer-chain-sync-protect peer)
+        (is-true (bl.net::peer-chain-sync-protect peer)
                  "a live peer delivering a chain at least as good as our tip is protected")
-        (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*)))
+        (is (= 1 bl.net::*protected-outbound-count*)))
       ;; Same batch, peer already retired by disconnect-peer.
-      (let ((bitcoin-lisp.networking::*protected-outbound-count* 0)
+      (let ((bl.net::*protected-outbound-count* 0)
             (peer (%g708-peer)))
-        (bitcoin-lisp.networking:disconnect-peer peer)
+        (bl.net:disconnect-peer peer)
         (is (= 1 (ingest "test-g708-dead/" peer))
             "the batch is still processed — the peer is what changed")
-        (is-false (bitcoin-lisp.networking::peer-chain-sync-protect peer)
+        (is-false (bl.net::peer-chain-sync-protect peer)
                   "a retired peer must not be protected by the headers path")
-        (is (= 0 bitcoin-lisp.networking::*protected-outbound-count*)
+        (is (= 0 bl.net::*protected-outbound-count*)
             "and the counter must not move"))
       ;; Same batch, peer already banned.
-      (let ((bitcoin-lisp.networking::*protected-outbound-count* 0)
+      (let ((bl.net::*protected-outbound-count* 0)
             (peer (%g708-peer :address "198.51.100.79")))
         (unwind-protect
              (progn
-               (bitcoin-lisp.networking:ban-peer peer)
+               (bl.net:ban-peer peer)
                (is (= 1 (ingest "test-g708-banned/" peer))
                    "the batch is still processed — the peer is what changed")
-               (is-false (bitcoin-lisp.networking::peer-chain-sync-protect peer)
+               (is-false (bl.net::peer-chain-sync-protect peer)
                          "a banned peer must not be protected by the headers path")
-               (is (= 0 bitcoin-lisp.networking::*protected-outbound-count*)
+               (is (= 0 bl.net::*protected-outbound-count*)
                    "and the counter must not move"))
-          (bitcoin-lisp.networking:unban-address "198.51.100.79"))))))
+          (bl.net:unban-address "198.51.100.79"))))))
 ;;;; GA8 W3: the low-work drop must fire only where Core evaluates it
 ;;;;
 ;;;; Core reaches the disconnect solely through
@@ -1195,10 +1195,10 @@ so the only thing that differs is the peer's liveness."
   "Regtest network + regtest PoW limit + the IBD latch forced ON, so these
 assertions cannot be made vacuous by whatever an earlier test left in the
 globals."
-  `(let ((bitcoin-lisp:*network* :regtest)
-         (bitcoin-lisp.storage:*pow-limit-target*
-           bitcoin-lisp.storage:+regtest-pow-limit-target+)
-         (bitcoin-lisp.networking::*cached-is-ibd* t))
+  `(let ((bl:*network* :regtest)
+         (bl.store:*pow-limit-target*
+           bl.store:+regtest-pow-limit-target+)
+         (bl.net::*cached-is-ibd* t))
      ,@body))
 
 (defun %w3-stored-header (dir)
@@ -1207,10 +1207,10 @@ off genesis via the production ingest path at a zero work floor. Returns
 (values state genesis-hash h1 h1-hash). H1's chain-work is tiny (regtest block
 proof), so raising the floor afterwards makes it sub-minchainwork."
   (multiple-value-bind (state genesis-hash) (%regtest-chain-state dir)
-    (let* ((bitcoin-lisp:*minimum-chain-work-override* 0)
+    (let* ((bl:*minimum-chain-work-override* 0)
            (h1 (%pow-header genesis-hash))
-           (h1-hash (bitcoin-lisp.serialization:block-header-hash h1)))
-      (bitcoin-lisp.networking::ingest-headers-from-peer
+           (h1-hash (bl.ser:block-header-hash h1)))
+      (bl.net::ingest-headers-from-peer
        (%g718-peer) (list h1) state)
       (values state genesis-hash h1 h1-hash))))
 
@@ -1227,18 +1227,18 @@ could be churned this way during the most eclipse-sensitive phase."
   (%w3-with-regtest
     (multiple-value-bind (state genesis-hash)
         (%regtest-chain-state "test-w3-unconn-nodrop/")
-      (let* ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+      (let* ((bl:*minimum-chain-work-override* 1000)
              ;; Genesis carries chain-work 1, three orders below the floor.
              (p (%g718-peer :best-hash genesis-hash))
              (orphan-prev (make-array 32 :element-type '(unsigned-byte 8)
                                          :initial-element 77))
              (announced (%pow-header orphan-prev)))
-        (is-true (bitcoin-lisp.networking:initial-block-download-p state)
+        (is-true (bl.net:initial-block-download-p state)
                  "fixture must be in IBD, or the whole assertion is vacuous")
-        (is (= 0 (bitcoin-lisp.networking::ingest-headers-from-peer
+        (is (= 0 (bl.net::ingest-headers-from-peer
                   p (list announced) state))
             "an unconnecting header stores nothing")
-        (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+        (is (eq :ready (bl.net:peer-state p))
             "a BIP130 announcement with an unknown parent must NOT drop the peer")))))
 
 (test w3-empty-headers-message-does-not-disconnect-outbound
@@ -1248,10 +1248,10 @@ peer answering \"I have nothing more\" during IBD was dropped on the spot."
   (%w3-with-regtest
     (multiple-value-bind (state genesis-hash)
         (%regtest-chain-state "test-w3-empty-nodrop/")
-      (let ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+      (let ((bl:*minimum-chain-work-override* 1000)
             (p (%g718-peer :best-hash genesis-hash)))
-        (is (= 0 (bitcoin-lisp.networking::ingest-headers-from-peer p nil state)))
-        (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+        (is (= 0 (bl.net::ingest-headers-from-peer p nil state)))
+        (is (eq :ready (bl.net:peer-state p))
             "an empty headers message must NOT drop the peer")))))
 
 (test w3-low-work-diverted-batch-does-not-disconnect-outbound
@@ -1263,15 +1263,15 @@ pindexLast to judge the peer on."
   (%w3-with-regtest
     (multiple-value-bind (state genesis-hash)
         (%regtest-chain-state "test-w3-lowwork-nodrop/")
-      (let* ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+      (let* ((bl:*minimum-chain-work-override* 1000)
              (p (%g718-peer :best-hash genesis-hash))
              (h1 (%pow-header genesis-hash))
-             (h1-hash (bitcoin-lisp.serialization:block-header-hash h1)))
-        (is (= 0 (bitcoin-lisp.networking::ingest-headers-from-peer
+             (h1-hash (bl.ser:block-header-hash h1)))
+        (is (= 0 (bl.net::ingest-headers-from-peer
                   p (list h1) state)))
-        (is (null (bitcoin-lisp.storage:get-block-index-entry state h1-hash))
+        (is (null (bl.store:get-block-index-entry state h1-hash))
             "the low-work header must not enter the index")
-        (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+        (is (eq :ready (bl.net:peer-state p))
             "an ignored low-work batch must NOT drop the peer")))))
 
 (test w3-low-work-outbound-still-dropped-on-stored-batch
@@ -1284,16 +1284,16 @@ below the floor IS dropped. Deleting the check outright would redden this."
     (multiple-value-bind (state genesis-hash h1 h1-hash)
         (%w3-stored-header "test-w3-stored-drop/")
       (declare (ignore genesis-hash))
-      (is (not (null (bitcoin-lisp.storage:get-block-index-entry state h1-hash)))
+      (is (not (null (bl.store:get-block-index-entry state h1-hash)))
           "fixture must have stored H1, or the already-known branch is not taken")
-      (let ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+      (let ((bl:*minimum-chain-work-override* 1000)
             (p (%g718-peer)))
-        (is (= 0 (bitcoin-lisp.networking::ingest-headers-from-peer
+        (is (= 0 (bl.net::ingest-headers-from-peer
                   p (list h1) state))
             "an already-known header adds nothing to the index")
-        (is (equalp h1-hash (bitcoin-lisp.networking::peer-best-known-block-hash p))
+        (is (equalp h1-hash (bl.net::peer-best-known-block-hash p))
             "the stored path must have refreshed availability first")
-        (is (eq :disconnected (bitcoin-lisp.networking:peer-state p))
+        (is (eq :disconnected (bl.net:peer-state p))
             "a stored non-full batch leaving best-known below the floor must drop")))))
 
 (test w3-solicited-phase1-path-drops-low-work-outbound
@@ -1308,24 +1308,24 @@ TryLowWorkHeadersSync and reaching the disconnect."
     (multiple-value-bind (state genesis-hash h1 h1-hash)
         (%w3-stored-header "test-w3-phase1-drop/")
       (declare (ignore genesis-hash h1-hash))
-      (let ((bitcoin-lisp:*minimum-chain-work-override* 1000))
+      (let ((bl:*minimum-chain-work-override* 1000))
         (let* ((p (%g718-peer))
                (added 0)
-               (done (bitcoin-lisp.networking::handle-header-batch
+               (done (bl.net::handle-header-batch
                       p state (list h1) nil (lambda (n) (incf added n)))))
           (is-true done "a non-full batch ends header sync with this peer")
           (is (= 0 added) "an already-known batch adds nothing")
-          (is (eq :disconnected (bitcoin-lisp.networking:peer-state p))
+          (is (eq :disconnected (bl.net:peer-state p))
               "the solicited path must drop a sub-minchainwork outbound peer"))
         ;; Same batch declared FULL: may_have_more_headers, so the peer is kept
         ;; (Core's !may_have_more_headers guard) — but sync still ends, because
         ;; nothing entered the index and our locator is built from our own
         ;; header tip, so re-asking would fetch this very batch again.
         (let ((p (%g718-peer)))
-          (is-true (bitcoin-lisp.networking::handle-header-batch
+          (is-true (bl.net::handle-header-batch
                     p state (list h1) t (lambda (n) (declare (ignore n))))
                    "an all-known batch ends sync even when the message was full")
-          (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+          (is (eq :ready (bl.net:peer-state p))
               "a full batch must not drop the peer"))))))
 
 ;;;; ============================================================
@@ -1354,24 +1354,24 @@ chain, so Core's m_best_header — and a shorter fork B1..B2, in the index but o
 neither the best-header chain nor the active chain. Returns (values state
 a-headers b-headers)."
   (multiple-value-bind (state genesis-hash) (%regtest-chain-state dir)
-    (let* ((bitcoin-lisp:*minimum-chain-work-override* 0)
+    (let* ((bl:*minimum-chain-work-override* 0)
            (a1 (%pow-header genesis-hash :timestamp 1296688700 :merkle 1))
-           (a2 (%pow-header (bitcoin-lisp.serialization:block-header-hash a1)
+           (a2 (%pow-header (bl.ser:block-header-hash a1)
                             :timestamp 1296689300 :merkle 2))
-           (a3 (%pow-header (bitcoin-lisp.serialization:block-header-hash a2)
+           (a3 (%pow-header (bl.ser:block-header-hash a2)
                             :timestamp 1296689900 :merkle 3))
            (b1 (%pow-header genesis-hash :timestamp 1296688701 :merkle 11))
-           (b2 (%pow-header (bitcoin-lisp.serialization:block-header-hash b1)
+           (b2 (%pow-header (bl.ser:block-header-hash b1)
                             :timestamp 1296689301 :merkle 12)))
-      (bitcoin-lisp.networking::ingest-headers-from-peer
+      (bl.net::ingest-headers-from-peer
        (%g718-peer) (list a1 a2 a3) state)
-      (bitcoin-lisp.networking::ingest-headers-from-peer
+      (bl.net::ingest-headers-from-peer
        (%g718-peer) (list b1 b2) state)
       (values state (list a1 a2 a3) (list b1 b2)))))
 
 (defun %w3-entry (state header)
-  (bitcoin-lisp.storage:get-block-index-entry
-   state (bitcoin-lisp.serialization:block-header-hash header)))
+  (bl.store:get-block-index-entry
+   state (bl.ser:block-header-hash header)))
 
 (test w3-ancestor-of-best-header-or-tip-predicate
   "Core PeerManagerImpl::IsAncestorOfBestHeaderOrTip (net_processing.cpp:2813-
@@ -1385,24 +1385,24 @@ was about: a header we HOLD is not thereby a header on our chain."
             (b2 (%w3-entry state (second b-headers))))
         (is (not (null a3)) "fixture must have stored the A branch")
         (is (not (null b2)) "fixture must have stored the B fork")
-        (is-false (bitcoin-lisp.networking::%ancestor-of-best-header-or-tip-p
+        (is-false (bl.net::%ancestor-of-best-header-or-tip-p
                    state nil)
                   "a header we do not have at all is an ancestor of nothing")
-        (is-true (bitcoin-lisp.networking::%ancestor-of-best-header-or-tip-p
+        (is-true (bl.net::%ancestor-of-best-header-or-tip-p
                   state a3)
                  "m_best_header itself qualifies")
-        (is-true (bitcoin-lisp.networking::%ancestor-of-best-header-or-tip-p
+        (is-true (bl.net::%ancestor-of-best-header-or-tip-p
                   state a1)
                  "an ancestor of m_best_header qualifies (GetAncestor arm)")
-        (is-false (bitcoin-lisp.networking::%ancestor-of-best-header-or-tip-p
+        (is-false (bl.net::%ancestor-of-best-header-or-tip-p
                    state b2)
                   "a header held only on a FORK does NOT qualify")
         ;; Third arm: ActiveChain().Contains(). Move the active tip onto the
         ;; fork, as a reorg does; B2 is then on the active chain even though it
         ;; is still off the best-header branch.
-        (bitcoin-lisp.storage:update-chain-tip
-         state (bitcoin-lisp.storage:block-index-entry-hash b2) 2)
-        (is-true (bitcoin-lisp.networking::%ancestor-of-best-header-or-tip-p
+        (bl.store:update-chain-tip
+         state (bl.store:block-index-entry-hash b2) 2)
+        (is-true (bl.net::%ancestor-of-best-header-or-tip-p
                   state b2)
                  "a header on the ACTIVE chain qualifies even off the best-header branch")))))
 
@@ -1421,20 +1421,20 @@ starts a presync whose own locator anchors on the peer's chain and advances."
     (multiple-value-bind (state a-headers b-headers)
         (%w3-fork-fixture "test-w3-fork-presync/")
       (declare (ignore a-headers))
-      (let* ((bitcoin-lisp:*minimum-chain-work-override* 1000)
-             (b-last-hash (bitcoin-lisp.serialization:block-header-hash
+      (let* ((bl:*minimum-chain-work-override* 1000)
+             (b-last-hash (bl.ser:block-header-hash
                            (car (last b-headers))))
              (p (%g718-peer)))
         ;; Preconditions: the batch really is all-known, and really is off our
         ;; best-header/active chain — else the assertions below are vacuous.
-        (is (not (null (bitcoin-lisp.storage:get-block-index-entry
+        (is (not (null (bl.store:get-block-index-entry
                         state b-last-hash)))
             "fixture must already hold the whole fork batch")
-        (is-false (bitcoin-lisp.networking::%ancestor-of-best-header-or-tip-p
-                   state (bitcoin-lisp.storage:get-block-index-entry
+        (is-false (bl.net::%ancestor-of-best-header-or-tip-p
+                   state (bl.store:get-block-index-entry
                           state b-last-hash))
                   "the fork tip must be off our best-header/active chain")
-        (let ((done (bitcoin-lisp.networking::handle-header-batch
+        (let ((done (bl.net::handle-header-batch
                      p state b-headers t (lambda (n) (declare (ignore n))))))
           (is-false done
                     "an all-known FULL batch on a fork must NOT end header sync"))
@@ -1444,12 +1444,12 @@ starts a presync whose own locator anchors on the peer's chain and advances."
         ;; request from the one that produced this batch. Guarded, so that a
         ;; regression reads as failed assertions rather than an error inside
         ;; hss-locator-hashes.
-        (let ((hss (bitcoin-lisp.networking::peer-headers-sync p)))
+        (let ((hss (bl.net::peer-headers-sync p)))
           (is (not (null hss))
               "it must divert into a presync, as Core's TryLowWorkHeadersSync does")
           (when hss
-            (let ((next (bitcoin-lisp.networking::hss-locator-hashes hss))
-                  (ours (bitcoin-lisp.networking::build-header-locator state)))
+            (let ((next (bl.net::hss-locator-hashes hss))
+                  (ours (bl.net::build-header-locator state)))
               (is (equalp b-last-hash (first next))
                   "the presync locator anchors on the peer's fork, advancing into its chain")
               (is-false (equalp (first next) (first ours))
@@ -1465,16 +1465,16 @@ instead and dropped an outbound peer Core keeps."
     (multiple-value-bind (state a-headers b-headers)
         (%w3-fork-fixture "test-w3-fork-nonfull/")
       (declare (ignore a-headers))
-      (let ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+      (let ((bl:*minimum-chain-work-override* 1000)
             (p (%g718-peer)))
-        (is-true (bitcoin-lisp.networking:initial-block-download-p state)
+        (is-true (bl.net:initial-block-download-p state)
                  "fixture must be in IBD, or the drop could not fire either way")
-        (is-true (bitcoin-lisp.networking::handle-header-batch
+        (is-true (bl.net::handle-header-batch
                   p state b-headers nil (lambda (n) (declare (ignore n))))
                  "an ignored low-work batch ends header sync with this peer")
-        (is (null (bitcoin-lisp.networking::peer-best-known-block-hash p))
+        (is (null (bl.net::peer-best-known-block-hash p))
             "an ignored batch must not update availability (Core never gets there)")
-        (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+        (is (eq :ready (bl.net:peer-state p))
             "and must NOT drop the peer")))))
 
 (test w3-all-known-batch-on-our-own-chain-still-ends-sync
@@ -1488,21 +1488,21 @@ at us)."
     (multiple-value-bind (state a-headers b-headers)
         (%w3-fork-fixture "test-w3-own-chain-stop/")
       (declare (ignore b-headers))
-      (let* ((bitcoin-lisp:*minimum-chain-work-override* 1000)
-             (a-last-hash (bitcoin-lisp.serialization:block-header-hash
+      (let* ((bl:*minimum-chain-work-override* 1000)
+             (a-last-hash (bl.ser:block-header-hash
                            (car (last a-headers))))
              (p (%g718-peer))
              (added 0))
-        (is-true (bitcoin-lisp.networking::handle-header-batch
+        (is-true (bl.net::handle-header-batch
                   p state a-headers t (lambda (n) (incf added n)))
                  "an all-known FULL batch on our own chain must still end sync")
-        (is (null (bitcoin-lisp.networking::peer-headers-sync p))
+        (is (null (bl.net::peer-headers-sync p))
             "and must NOT start a presync — that is the suppression's whole point")
         (is (= 0 added) "an already-known batch adds nothing to the index")
         (is (equalp a-last-hash
-                    (bitcoin-lisp.networking::peer-best-known-block-hash p))
+                    (bl.net::peer-best-known-block-hash p))
             "the store path still ran, refreshing availability")
-        (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+        (is (eq :ready (bl.net:peer-state p))
             "a full batch must not drop the peer")))))
 
 (test w3-known-ancestor-batch-still-drops-low-work-outbound
@@ -1516,18 +1516,18 @@ peer that has nothing more to give."
     (multiple-value-bind (state a-headers b-headers)
         (%w3-fork-fixture "test-w3-ancestor-drop/")
       (declare (ignore b-headers))
-      (let* ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+      (let* ((bl:*minimum-chain-work-override* 1000)
              (a1 (first a-headers))
-             (a1-hash (bitcoin-lisp.serialization:block-header-hash a1))
+             (a1-hash (bl.ser:block-header-hash a1))
              (p (%g718-peer)))
-        (is-true (bitcoin-lisp.networking:initial-block-download-p state)
+        (is-true (bl.net:initial-block-download-p state)
                  "fixture must be in IBD, or the whole assertion is vacuous")
-        (is (= 0 (bitcoin-lisp.networking::ingest-headers-from-peer
+        (is (= 0 (bl.net::ingest-headers-from-peer
                   p (list a1) state))
             "an already-known header adds nothing to the index")
-        (is (equalp a1-hash (bitcoin-lisp.networking::peer-best-known-block-hash p))
+        (is (equalp a1-hash (bl.net::peer-best-known-block-hash p))
             "the store path must have refreshed availability from the known ancestor")
-        (is (eq :disconnected (bitcoin-lisp.networking:peer-state p))
+        (is (eq :disconnected (bl.net:peer-state p))
             "a sub-minchainwork outbound peer with nothing more to give is dropped")))))
 
 ;;;; ============================================================
@@ -1540,14 +1540,14 @@ peer that has nothing more to give."
 (defun %p3-peer (&key (conn-type :outbound-full-relay) (address "1.2.3.4")
                       (announcement 0) (last-block 0) (connected 0)
                       protect manual)
-  (let ((p (bitcoin-lisp.networking:make-peer :address address)))
-    (setf (bitcoin-lisp.networking:peer-conn-type p) conn-type
-          (bitcoin-lisp.networking:peer-state p) :ready
-          (bitcoin-lisp.networking:peer-manual p) manual
-          (bitcoin-lisp.networking::peer-chain-sync-protect p) protect
-          (bitcoin-lisp.networking:peer-last-block-announcement p) announcement
-          (bitcoin-lisp.networking::peer-last-block-time p) last-block
-          (bitcoin-lisp.networking::peer-connected-at p) connected)
+  (let ((p (bl.net:make-peer :address address)))
+    (setf (bl.net:peer-conn-type p) conn-type
+          (bl.net:peer-state p) :ready
+          (bl.net:peer-manual p) manual
+          (bl.net::peer-chain-sync-protect p) protect
+          (bl.net:peer-last-block-announcement p) announcement
+          (bl.net::peer-last-block-time p) last-block
+          (bl.net::peer-connected-at p) connected)
     p))
 
 (test g7-08-p3-full-relay-rotation-picks-the-stalest-announcer
@@ -1560,7 +1560,7 @@ us about the chain."
          (stale (%p3-peer :address "1.0.0.2" :announcement 1000))
          (mid   (%p3-peer :address "1.0.0.3" :announcement 3000))
          (peers (list fresh stale mid)))
-    (is (eq stale (bitcoin-lisp.networking:select-extra-full-relay-eviction peers)))))
+    (is (eq stale (bl.net:select-extra-full-relay-eviction peers)))))
 
 (test g7-08-p3-rotation-never-takes-a-protected-or-manual-peer
   "Two exemptions, both of which invert the feature if dropped.
@@ -1579,10 +1579,10 @@ evicting operator-pinned peers as a design-breaking regression."
          (manual    (%p3-peer :address "1.0.0.2" :announcement 2 :manual t))
          (ordinary  (%p3-peer :address "1.0.0.3" :announcement 9000))
          (peers (list protected manual ordinary)))
-    (is (eq ordinary (bitcoin-lisp.networking:select-extra-full-relay-eviction peers))
+    (is (eq ordinary (bl.net:select-extra-full-relay-eviction peers))
         "the only evictable peer is the ordinary one, stale or not")
     ;; And with nothing but exempt peers, nobody is chosen at all.
-    (is (null (bitcoin-lisp.networking:select-extra-full-relay-eviction
+    (is (null (bl.net:select-extra-full-relay-eviction
                (list protected manual))))))
 
 (test g7-08-p3-rotation-keeps-our-only-connection-on-a-network
@@ -1595,13 +1595,13 @@ partition the whole subsystem exists to prevent, arrived at from the inside."
          (v4a (%p3-peer :address "1.0.0.1" :announcement 8000))
          (v4b (%p3-peer :address "1.0.0.2" :announcement 9000))
          (peers (list onion v4a v4b)))
-    (is (eq v4a (bitcoin-lisp.networking:select-extra-full-relay-eviction peers))
+    (is (eq v4a (bl.net:select-extra-full-relay-eviction peers))
         "the sole onion peer is protected despite being the stalest by far")
     ;; With a second onion peer the protection lifts for both of them.
     (let* ((onion2 (%p3-peer :address "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion"
                              :announcement 2))
            (peers2 (list onion onion2 v4a v4b)))
-      (is (eq onion (bitcoin-lisp.networking:select-extra-full-relay-eviction peers2))
+      (is (eq onion (bl.net:select-extra-full-relay-eviction peers2))
           "two onion peers means neither is our only one, so the stalest wins"))))
 
 (test g7-08-p3-rotation-tie-breaks-toward-the-newer-connection
@@ -1611,14 +1611,14 @@ restart the entire outbound set ties and this comparison IS the policy. Higher
 id = most recently connected = least invested."
   (let* ((older (%p3-peer :address "1.0.0.1"))   ; ids are handed out in order
          (newer (%p3-peer :address "1.0.0.2")))
-    (is (< (bitcoin-lisp.networking::peer-id older)
-           (bitcoin-lisp.networking::peer-id newer))
+    (is (< (bl.net::peer-id older)
+           (bl.net::peer-id newer))
         "sanity: ids really are monotonic in connection order")
     ;; Both at stamp 0, and the list order is deliberately reversed so a
     ;; first-wins reduce would pick the older one.
-    (is (eq newer (bitcoin-lisp.networking:select-extra-full-relay-eviction
+    (is (eq newer (bl.net:select-extra-full-relay-eviction
                    (list older newer))))
-    (is (eq newer (bitcoin-lisp.networking:select-extra-full-relay-eviction
+    (is (eq newer (bl.net:select-extra-full-relay-eviction
                    (list newer older)))
         "and the answer must not depend on the order of the peer list")))
 
@@ -1636,15 +1636,15 @@ delivering blocks is the entire job they are kept for."
          (second (%p3-peer :conn-type :block-relay :address "1.0.0.2" :last-block 100))
          (youngest (%p3-peer :conn-type :block-relay :address "1.0.0.3" :last-block 50))
          (peers (list oldest second youngest)))
-    (is (eq youngest (bitcoin-lisp.networking:select-extra-block-relay-eviction peers))
+    (is (eq youngest (bl.net:select-extra-block-relay-eviction peers))
         "the youngest goes when it has not out-delivered the second-youngest")
     ;; Now make the youngest the more recent deliverer: the second-youngest goes.
-    (setf (bitcoin-lisp.networking::peer-last-block-time youngest) 500)
-    (is (eq second (bitcoin-lisp.networking:select-extra-block-relay-eviction peers))
+    (setf (bl.net::peer-last-block-time youngest) 500)
+    (is (eq second (bl.net:select-extra-block-relay-eviction peers))
         "a youngest peer that is delivering earns its slot; the runner-up pays")
     ;; The announcement stamp must have no influence here at all.
-    (setf (bitcoin-lisp.networking:peer-last-block-announcement second) 999999)
-    (is (eq second (bitcoin-lisp.networking:select-extra-block-relay-eviction peers))
+    (setf (bl.net:peer-last-block-announcement second) 999999)
+    (is (eq second (bl.net:select-extra-block-relay-eviction peers))
         "the announcement stamp is the OTHER half's key and must not leak in")))
 
 (test g7-08-p3-driver-gates-each-half-on-its-own-target
@@ -1661,14 +1661,14 @@ already documents on the dialing side."
          (peers (append full br))
          (now 10000))
     ;; At target on both: nothing moves.
-    (is (null (bitcoin-lisp.networking:evict-extra-outbound-peers peers now 3 2))
+    (is (null (bl.net:evict-extra-outbound-peers peers now 3 2))
         "at target, both halves must be silent")
     ;; Full-relay one over, block-relay still at target: exactly one drop, and
     ;; it must come from the full-relay pool.
-    (let ((dropped (bitcoin-lisp.networking:evict-extra-outbound-peers peers now 2 2)))
+    (let ((dropped (bl.net:evict-extra-outbound-peers peers now 2 2)))
       (is (= 1 (length dropped)))
       (is (eq :outbound-full-relay
-              (bitcoin-lisp.networking:peer-conn-type (first dropped)))
+              (bl.net:peer-conn-type (first dropped)))
           "an over-budget full-relay set must not be paid for by a block-relay peer"))))
 
 (test g7-08-p3-driver-respects-minimum-connect-time-and-in-flight
@@ -1687,23 +1687,23 @@ Core's and is preserved deliberately."
          (peers (list fresh old-a old-b)))
     ;; fresh is the stalest (stamp 0) but was connected 5s ago: nobody goes,
     ;; because the sweep drops at most one peer and fresh is the choice.
-    (is (null (bitcoin-lisp.networking:evict-extra-outbound-peers peers now 2 2))
+    (is (null (bl.net:evict-extra-outbound-peers peers now 2 2))
         "the chosen peer is too new to evict, and the sweep does not fall through
          to the next-stalest — Core drops at most one per half per call")
     ;; Age it past the threshold and it goes.
-    (setf (bitcoin-lisp.networking::peer-connected-at fresh) (- now 31))
-    (is (equal (list fresh) (bitcoin-lisp.networking:evict-extra-outbound-peers
+    (setf (bl.net::peer-connected-at fresh) (- now 31))
+    (is (equal (list fresh) (bl.net:evict-extra-outbound-peers
                              peers now 2 2)))
     ;; With a block in flight from the chosen peer, it stays.
     (let ((fresh2 (%p3-peer :address "1.0.0.4" :connected 0))
-          (ctx (bitcoin-lisp.networking::make-ibd-context)))
+          (ctx (bl.net::make-ibd-context)))
       (setf (gethash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)
-                     (bitcoin-lisp.networking::ibd-context-in-flight ctx))
+                     (bl.net::ibd-context-in-flight ctx))
             (cons fresh2 now))
-      (let ((bitcoin-lisp.networking::*ibd-context* ctx))
-        (is (= 1 (bitcoin-lisp.networking::count-peer-in-flight fresh2))
+      (let ((bl.net::*ibd-context* ctx))
+        (is (= 1 (bl.net::count-peer-in-flight fresh2))
             "sanity: the in-flight seam is actually connected")
-        (is (null (bitcoin-lisp.networking:evict-extra-outbound-peers
+        (is (null (bl.net:evict-extra-outbound-peers
                    (list fresh2 old-a old-b) now 2 2))
             "a peer we are mid-download from must not be rotated out")))))
 
@@ -1718,27 +1718,27 @@ Drop received_new_header and a peer holds its slot forever by echoing back the
 block we just told it about — announcing nothing new, yet always looking like
 our freshest source. The second is the one a green suite misses, because the
 happy path stamps correctly either way."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp.storage:*pow-limit-target*
-          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target*
+          bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-p3-stamp/")
-      (let ((bitcoin-lisp::*minimum-chain-work-override* 0)
+      (let ((bl::*minimum-chain-work-override* 0)
             (peer (%g708-peer))
             (header (%pow-header genesis-hash)))
-        (is (= 0 (bitcoin-lisp.networking:peer-last-block-announcement peer))
+        (is (= 0 (bl.net:peer-last-block-announcement peer))
             "a fresh peer has never announced")
         ;; A header we did not have, on a chain beating our genesis-only tip.
-        (is (= 1 (bitcoin-lisp.networking::ingest-headers-from-peer
+        (is (= 1 (bl.net::ingest-headers-from-peer
                   peer (list header) state))
             "control: the header must actually be stored")
-        (is (plusp (bitcoin-lisp.networking:peer-last-block-announcement peer))
+        (is (plusp (bl.net:peer-last-block-announcement peer))
             "a new header beating our tip credits the announcement")
         ;; Re-announce the SAME header. It is now in the index, so
         ;; received_new_header is false and the stamp must not move — even
         ;; though the work comparison still holds.
-        (setf (bitcoin-lisp.networking:peer-last-block-announcement peer) 12345)
-        (bitcoin-lisp.networking::ingest-headers-from-peer peer (list header) state)
-        (is (= 12345 (bitcoin-lisp.networking:peer-last-block-announcement peer))
+        (setf (bl.net:peer-last-block-announcement peer) 12345)
+        (bl.net::ingest-headers-from-peer peer (list header) state)
+        (is (= 12345 (bl.net:peer-last-block-announcement peer))
             "re-announcing a header we already hold must earn nothing")))))
 
 (test g7-08-p3-cmpctblock-credits-the-announcement-not-the-reconstruct
@@ -1752,23 +1752,23 @@ a block nobody else has relayed yet.
 compact-block-header-verdict returns the credit decision as its third value so
 the `was it new to us' half is answered from the same locked lookup that
 decided :ACCEPT; asked afterwards it would always say `known'."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp.storage:*pow-limit-target*
-          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target*
+          bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-p3-cmpct/")
       (let* ((header (%pow-header genesis-hash))
-             (hash (bitcoin-lisp.serialization:block-header-hash header)))
+             (hash (bl.ser:block-header-hash header)))
         (multiple-value-bind (verdict reason credits)
-            (bitcoin-lisp.networking::compact-block-header-verdict
+            (bl.net::compact-block-header-verdict
              state header hash genesis-hash)
           (declare (ignore reason))
           (is (eq :accept verdict))
           (is-true credits "an unseen header beating our tip credits its announcer"))
         ;; Now we hold it. Same header, same work, still accepted — but no
         ;; longer new, so no credit.
-        (bitcoin-lisp.networking::process-headers (list header) state)
+        (bl.net::process-headers (list header) state)
         (multiple-value-bind (verdict reason credits)
-            (bitcoin-lisp.networking::compact-block-header-verdict
+            (bl.net::compact-block-header-verdict
              state header hash genesis-hash)
           (declare (ignore reason))
           (is (eq :accept verdict) "a header we already hold is still accepted")
@@ -1787,33 +1787,33 @@ outbound set: at a steady tip, every peer relaying the same-height competitor
 looks like a fresh announcer, so the rotation stops discriminating and falls
 through to its tie-break. This test exists because a mutation to >= survived
 the rest of this file."
-  (let ((bitcoin-lisp:*network* :regtest)
-        (bitcoin-lisp.storage:*pow-limit-target*
-          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+  (let ((bl:*network* :regtest)
+        (bl.store:*pow-limit-target*
+          bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-p3-sibling/")
-      (let* ((bitcoin-lisp::*minimum-chain-work-override* 0)
+      (let* ((bl::*minimum-chain-work-override* 0)
              (peer (%g708-peer))
              ;; Our tip: one block off genesis, made the ACTIVE tip so the
              ;; comparison has something real to sit at.
              (mine (%pow-header genesis-hash :merkle 1))
-             (mine-hash (bitcoin-lisp.serialization:block-header-hash mine)))
-        (bitcoin-lisp.networking::process-headers (list mine) state)
-        (bitcoin-lisp.storage:update-chain-tip state mine-hash 1)
-        (let* ((tip (bitcoin-lisp.storage:get-block-index-entry state mine-hash))
-               (tip-work (bitcoin-lisp.storage:block-index-entry-chain-work tip))
+             (mine-hash (bl.ser:block-header-hash mine)))
+        (bl.net::process-headers (list mine) state)
+        (bl.store:update-chain-tip state mine-hash 1)
+        (let* ((tip (bl.store:get-block-index-entry state mine-hash))
+               (tip-work (bl.store:block-index-entry-chain-work tip))
                ;; A sibling off the SAME parent: different block, same height,
                ;; same bits — therefore exactly equal cumulative work.
                (sibling (%pow-header genesis-hash :merkle 2))
-               (sib-hash (bitcoin-lisp.serialization:block-header-hash sibling)))
+               (sib-hash (bl.ser:block-header-hash sibling)))
           (is (not (equalp mine-hash sib-hash)) "sanity: it is a different block")
-          (bitcoin-lisp.networking:credit-block-announcement peer)
-          (setf (bitcoin-lisp.networking:peer-last-block-announcement peer) 12345)
-          (bitcoin-lisp.networking::ingest-headers-from-peer peer (list sibling) state)
-          (let ((sib (bitcoin-lisp.storage:get-block-index-entry state sib-hash)))
+          (bl.net:credit-block-announcement peer)
+          (setf (bl.net:peer-last-block-announcement peer) 12345)
+          (bl.net::ingest-headers-from-peer peer (list sibling) state)
+          (let ((sib (bl.store:get-block-index-entry state sib-hash)))
             (is-true sib "control: the sibling must actually be stored")
-            (is (= tip-work (bitcoin-lisp.storage:block-index-entry-chain-work sib))
+            (is (= tip-work (bl.store:block-index-entry-chain-work sib))
                 "control: the sibling really does tie our tip on work"))
-          (is (= 12345 (bitcoin-lisp.networking:peer-last-block-announcement peer))
+          (is (= 12345 (bl.net:peer-last-block-announcement peer))
               "a same-work competitor is not an improvement and earns nothing")
           ;; Control the other way: a header that genuinely extends past our tip
           ;; DOES credit, proving the harness can reach the credit at all.
@@ -1822,8 +1822,8 @@ the rest of this file."
           ;; reusing it makes the header time-too-old and it never stores —
           ;; which looks exactly like "the credit did not fire".
           (let ((better (%pow-header mine-hash :merkle 3 :timestamp 1296689000)))
-            (bitcoin-lisp.networking::ingest-headers-from-peer peer (list better) state)
-            (is (/= 12345 (bitcoin-lisp.networking:peer-last-block-announcement peer))
+            (bl.net::ingest-headers-from-peer peer (list better) state)
+            (is (/= 12345 (bl.net:peer-last-block-announcement peer))
                 "a header beating our tip must still credit")))))))
 
 ;;;; ------------------------------------------------------------------
@@ -1842,41 +1842,41 @@ lands on five hours if copied literally and makes the check effectively dead."
   ;; this file is written in terms of the constant, so all of them would follow
   ;; a wrong constant happily -- which is precisely how `30 * 600' could have
   ;; shipped. 1800 seconds is thirty minutes; 18000 is five hours.
-  (is (= 1800 bitcoin-lisp::+stale-tip-age-seconds+)
+  (is (= 1800 bl::+stale-tip-age-seconds+)
       "the stale-tip threshold is nPowTargetSpacing * 3 = 1800s, factor THREE")
-  (is (= 600 bitcoin-lisp::+pow-target-spacing-seconds+)
+  (is (= 600 bl::+pow-target-spacing-seconds+)
       "and nPowTargetSpacing is 600s on every network Core ships")
-  (let ((node (bitcoin-lisp::make-node :network :regtest)))
+  (let ((node (bl::make-node :network :regtest)))
     ;; Never advanced: Core stamps the clock and reports fresh rather than
     ;; declaring every freshly started node eclipsed.
-    (is (= 0 (bitcoin-lisp::node-last-tip-advance-time node)))
-    (is-false (bitcoin-lisp::tip-may-be-stale-p node)
+    (is (= 0 (bl::node-last-tip-advance-time node)))
+    (is-false (bl::tip-may-be-stale-p node)
               "a node whose tip has never advanced is not yet stale")
-    (is (plusp (bitcoin-lisp::node-last-tip-advance-time node))
+    (is (plusp (bl::node-last-tip-advance-time node))
         "and the clock must have been stamped, or it is stale forever after")
     ;; Recent advance: fresh.
-    (setf (bitcoin-lisp::node-last-tip-advance-time node) (get-universal-time))
-    (is-false (bitcoin-lisp::tip-may-be-stale-p node))
+    (setf (bl::node-last-tip-advance-time node) (get-universal-time))
+    (is-false (bl::tip-may-be-stale-p node))
     ;; Old enough, nothing in flight: stale.
-    (setf (bitcoin-lisp::node-last-tip-advance-time node)
-          (- (get-universal-time) (1+ bitcoin-lisp::+stale-tip-age-seconds+)))
-    (is-true (bitcoin-lisp::tip-may-be-stale-p node))
+    (setf (bl::node-last-tip-advance-time node)
+          (- (get-universal-time) (1+ bl::+stale-tip-age-seconds+)))
+    (is-true (bl::tip-may-be-stale-p node))
     ;; Same age, but a block is in flight: NOT stale.
-    (let ((ctx (bitcoin-lisp.networking::make-ibd-context))
+    (let ((ctx (bl.net::make-ibd-context))
           (peer (%p3-peer)))
       (setf (gethash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)
-                     (bitcoin-lisp.networking::ibd-context-in-flight ctx))
+                     (bl.net::ibd-context-in-flight ctx))
             (cons peer 1))
-      (let ((bitcoin-lisp.networking::*ibd-context* ctx))
-        (is-true (bitcoin-lisp.networking:any-blocks-in-flight-p)
+      (let ((bl.net::*ibd-context* ctx))
+        (is-true (bl.net:any-blocks-in-flight-p)
                  "sanity: the in-flight seam is actually connected")
-        (is-false (bitcoin-lisp::tip-may-be-stale-p node)
+        (is-false (bl::tip-may-be-stale-p node)
                   "a download in progress means the tip is not stuck")))
     ;; Just under the threshold stays fresh, so the constant is exercised in
     ;; both directions rather than only from far away.
-    (setf (bitcoin-lisp::node-last-tip-advance-time node)
-          (- (get-universal-time) (1- bitcoin-lisp::+stale-tip-age-seconds+)))
-    (is-false (bitcoin-lisp::tip-may-be-stale-p node))))
+    (setf (bl::node-last-tip-advance-time node)
+          (- (get-universal-time) (1- bl::+stale-tip-age-seconds+)))
+    (is-false (bl::tip-may-be-stale-p node))))
 
 (test g7-08-p3-stale-tip-grants-then-releases-the-extra-slot
   "Core :5468-5479. The RELEASE is the half that is easy to omit and the one
@@ -1884,38 +1884,38 @@ that inverts the feature: without it the first stale episode raises the dialing
 budget permanently, and the rotation — which measures against the UNRAISED
 target — then spends every sweep evicting a peer we just dialled. It would
 present as endless outbound churn with no stale tip anywhere in sight."
-  (let ((node (bitcoin-lisp::make-node :network :regtest))
-        (bitcoin-lisp::*try-new-outbound-peer* nil)
-        (bitcoin-lisp::*last-stale-tip-check* 0))
-    (setf (bitcoin-lisp::node-network-active node) t)
+  (let ((node (bl::make-node :network :regtest))
+        (bl::*try-new-outbound-peer* nil)
+        (bl::*last-stale-tip-check* 0))
+    (setf (bl::node-network-active node) t)
     ;; Stale: the slot is granted.
-    (setf (bitcoin-lisp::node-last-tip-advance-time node)
-          (- (get-universal-time) (1+ bitcoin-lisp::+stale-tip-age-seconds+)))
-    (bitcoin-lisp::check-for-stale-tip node 1000)
-    (is-true bitcoin-lisp::*try-new-outbound-peer*)
+    (setf (bl::node-last-tip-advance-time node)
+          (- (get-universal-time) (1+ bl::+stale-tip-age-seconds+)))
+    (bl::check-for-stale-tip node 1000)
+    (is-true bl::*try-new-outbound-peer*)
     ;; The tip advances. The next evaluation must hand the slot back.
-    (setf (bitcoin-lisp::node-last-tip-advance-time node) (get-universal-time))
-    (bitcoin-lisp::check-for-stale-tip node (+ 1000 bitcoin-lisp::+stale-tip-check-interval-seconds+ 1))
-    (is-false bitcoin-lisp::*try-new-outbound-peer*
+    (setf (bl::node-last-tip-advance-time node) (get-universal-time))
+    (bl::check-for-stale-tip node (+ 1000 bl::+stale-tip-check-interval-seconds+ 1))
+    (is-false bl::*try-new-outbound-peer*
               "the extra slot must be released once the tip moves again")))
 
 (test g7-08-p3-stale-check-runs-on-its-own-ten-minute-timer
   "Core gates the stale-tip half on STALE_CHECK_INTERVAL (10 min) INSIDE the 45s
 sweep (:5468). The two cadences are different and both real; collapsing them
 re-evaluates an 1800-second-old condition forty times before it can change."
-  (let ((node (bitcoin-lisp::make-node :network :regtest))
-        (bitcoin-lisp::*try-new-outbound-peer* nil)
-        (bitcoin-lisp::*last-stale-tip-check* 0))
-    (setf (bitcoin-lisp::node-network-active node) t
-          (bitcoin-lisp::node-last-tip-advance-time node)
-          (- (get-universal-time) (1+ bitcoin-lisp::+stale-tip-age-seconds+)))
-    (bitcoin-lisp::check-for-stale-tip node 1000)
-    (is-true bitcoin-lisp::*try-new-outbound-peer* "first evaluation grants")
+  (let ((node (bl::make-node :network :regtest))
+        (bl::*try-new-outbound-peer* nil)
+        (bl::*last-stale-tip-check* 0))
+    (setf (bl::node-network-active node) t
+          (bl::node-last-tip-advance-time node)
+          (- (get-universal-time) (1+ bl::+stale-tip-age-seconds+)))
+    (bl::check-for-stale-tip node 1000)
+    (is-true bl::*try-new-outbound-peer* "first evaluation grants")
     ;; Tip is healthy again, but we are still inside the 10-minute window:
     ;; the state must NOT be re-evaluated yet.
-    (setf (bitcoin-lisp::node-last-tip-advance-time node) (get-universal-time))
-    (bitcoin-lisp::check-for-stale-tip node 1100)
-    (is-true bitcoin-lisp::*try-new-outbound-peer*
+    (setf (bl::node-last-tip-advance-time node) (get-universal-time))
+    (bl::check-for-stale-tip node 1100)
+    (is-true bl::*try-new-outbound-peer*
              "a second call inside the interval must not re-evaluate")))
 
 (test g7-08-p3-the-extra-slot-raises-dialing-but-not-eviction
@@ -1928,14 +1928,14 @@ REPLACEMENT.
 Raise both together — the intuitive reading — and the extra connection becomes
 permanent while the rotation never fires at all, which is the opposite of the
 feature: more peers, none of them ever rotated."
-  (let ((node (bitcoin-lisp::make-node :network :regtest)))
-    (setf (bitcoin-lisp::node-max-peers node) 8)
-    (let ((bitcoin-lisp::*try-new-outbound-peer* nil))
-      (is (= 8 (bitcoin-lisp::outbound-dial-budget node))))
-    (let ((bitcoin-lisp::*try-new-outbound-peer* t))
-      (is (= 9 (bitcoin-lisp::outbound-dial-budget node))
+  (let ((node (bl::make-node :network :regtest)))
+    (setf (bl::node-max-peers node) 8)
+    (let ((bl::*try-new-outbound-peer* nil))
+      (is (= 8 (bl::outbound-dial-budget node))))
+    (let ((bl::*try-new-outbound-peer* t))
+      (is (= 9 (bl::outbound-dial-budget node))
           "the dialing budget rises by exactly one")
-      (is (= 8 (bitcoin-lisp::node-max-peers node))
+      (is (= 8 (bl::node-max-peers node))
           "and the eviction target, which is node-max-peers, does not move")
       ;; Nine full-relay peers against the unraised target of 8 means the
       ;; rotation fires — that is what makes it a replacement.
@@ -1943,8 +1943,8 @@ feature: more peers, none of them ever rotated."
                          collect (%p3-peer :address (format nil "10.0.0.~D" i)
                                            :announcement (* i 100)
                                            :connected 0))))
-        (is (= 1 (length (bitcoin-lisp.networking:evict-extra-outbound-peers
-                          peers 10000 (bitcoin-lisp::node-max-peers node) 2)))
+        (is (= 1 (length (bl.net:evict-extra-outbound-peers
+                          peers 10000 (bl::node-max-peers node) 2)))
             "the extra peer must put us over the eviction target, not under it")))))
 
 ;;;; GA9 S2-4 / S2-5: two addrman and discouragement parity gaps
@@ -1966,7 +1966,7 @@ every present and future onion peer, silently disabling onion reachability."
                   ("8.8.8.8"   nil "an ordinary public peer is still discourageable")
                   ("192.168.1.5" nil "RFC1918 is NOT IsLocal in Core")))
     (destructuring-bind (addr local reason) case
-      (is (eq (and (bitcoin-lisp.networking:loopback-address-p addr) t) (and local t))
+      (is (eq (and (bl.net:loopback-address-p addr) t) (and local t))
           "~A: ~A" addr reason))))
 
 (test ga9-s2-5-every-dial-path-records-an-addrman-attempt
@@ -1985,7 +1985,7 @@ because the alternative is standing up four live dials in a unit test."
                                (asdf:system-source-directory :bitcoin-lisp)))))
     (is (search "%record-dial-attempt" src) "the recorder must exist")
     ;; One definition plus one call per dial path.
-    (is (>= (length (bitcoin-lisp.tests::%count-substring "%record-dial-attempt" src)) 4)
+    (is (>= (length (bl.tests::%count-substring "%record-dial-attempt" src)) 4)
         "every dial path must record: definition + 3 steady-state call sites")))
 
 (defun %count-substring (needle haystack)
@@ -2013,20 +2013,20 @@ is the very thing that collides. Asserted here on the exemption rule itself:
 onion peers are dropped from the candidate set whenever anything else remains,
 and are still evictable when nothing does, so an all-onion inbound set can
 still make room."
-  (flet ((mk (onion) (let ((p (bitcoin-lisp.networking:make-peer :address "127.0.0.1"
+  (flet ((mk (onion) (let ((p (bl.net:make-peer :address "127.0.0.1"
                                                                  :inbound t)))
-                       (setf (bitcoin-lisp.networking:peer-inbound-onion p) onion)
+                       (setf (bl.net:peer-inbound-onion p) onion)
                        p)))
     (let* ((o1 (mk t)) (o2 (mk t)) (clear (mk nil))
            (mixed (list o1 o2 clear)))
       ;; With a clearnet peer present, the onion peers must not be candidates.
-      (let ((non-onion (remove-if #'bitcoin-lisp.networking:peer-inbound-onion mixed)))
+      (let ((non-onion (remove-if #'bl.net:peer-inbound-onion mixed)))
         (is (equal (list clear) non-onion)
             "with any clearnet inbound present, onion peers are exempt"))
       ;; All-onion: the exemption must NOT empty the candidate set, or the node
       ;; could never admit a new inbound at capacity.
       (let* ((all-onion (list o1 o2))
-             (non-onion (remove-if #'bitcoin-lisp.networking:peer-inbound-onion all-onion)))
+             (non-onion (remove-if #'bl.net:peer-inbound-onion all-onion)))
         (is (null non-onion) "control: nothing survives the filter here")
-        (is-true (every #'bitcoin-lisp.networking:peer-inbound-onion all-onion)
+        (is-true (every #'bl.net:peer-inbound-onion all-onion)
                  "so the evictor must fall back to the full set and still evict")))))

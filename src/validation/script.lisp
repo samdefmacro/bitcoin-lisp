@@ -325,21 +325,21 @@ reference a reader reaches for first."
     ((= opcode +op-hash160+)
      (let ((data (stack-pop ctx)))
        (when data
-         (stack-push ctx (bitcoin-lisp.crypto:hash160 data))
+         (stack-push ctx (bl.crypto:hash160 data))
          t)))
 
     ;; OP_HASH256
     ((= opcode +op-hash256+)
      (let ((data (stack-pop ctx)))
        (when data
-         (stack-push ctx (bitcoin-lisp.crypto:hash256 data))
+         (stack-push ctx (bl.crypto:hash256 data))
          t)))
 
     ;; OP_SHA256
     ((= opcode +op-sha256+)
      (let ((data (stack-pop ctx)))
        (when data
-         (stack-push ctx (bitcoin-lisp.crypto:sha256 data))
+         (stack-push ctx (bl.crypto:sha256 data))
          t)))
 
     ;; OP_CHECKSIG
@@ -374,12 +374,12 @@ proper SIGHASH_ALL/NONE/SINGLE/ANYONECANPAY computation."
            (der-sig (subseq sig 0 (1- (length sig))))
            ;; The subscript is the currently executing script (scriptPubKey)
            (subscript (script-context-script ctx))
-           (sighash (bitcoin-lisp.coalton.interop:compute-legacy-sighash
+           (sighash (bl.interop:compute-legacy-sighash
                      (script-context-tx ctx)
                      (script-context-input-index ctx)
                      subscript
                      sighash-type)))
-      (bitcoin-lisp.crypto:verify-signature sighash der-sig pubkey))))
+      (bl.crypto:verify-signature sighash der-sig pubkey))))
 
 ;;;; Main script execution
 
@@ -420,7 +420,7 @@ Witness programs: OP_n <2-40 bytes> where n is 0-16."
 (defun get-input-witness (tx input-idx)
   "Get the witness stack for input INPUT-IDX of TX.
 Returns a list of byte vectors, or NIL if no witness data."
-  (let ((witness (bitcoin-lisp.serialization:transaction-witness tx)))
+  (let ((witness (bl.ser:transaction-witness tx)))
     (when (and witness (< input-idx (length witness)))
       (aref witness input-idx))))
 
@@ -444,18 +444,18 @@ so historical pre-segwit spends of such outputs stay valid.
 
 Binds *current-tx* and *current-input-index* for sighash computation.
 Returns T on success, NIL on failure."
-  (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig
-                     (aref (bitcoin-lisp.serialization:transaction-inputs tx) input-idx)))
-        (script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
-        (amount (bitcoin-lisp.storage:utxo-entry-value utxo))
+  (let ((script-sig (bl.ser:tx-in-script-sig
+                     (aref (bl.ser:transaction-inputs tx) input-idx)))
+        (script-pubkey (bl.store:utxo-entry-script-pubkey utxo))
+        (amount (bl.store:utxo-entry-value utxo))
         (witness (get-input-witness tx input-idx))
-        (bitcoin-lisp.coalton.interop:*current-tx* tx)
-        (bitcoin-lisp.coalton.interop:*current-input-index* input-idx))
+        (bl.interop:*current-tx* tx)
+        (bl.interop:*current-input-index* input-idx))
     (multiple-value-bind (success error)
-        (bitcoin-lisp.coalton.interop:verify-script
+        (bl.interop:verify-script
          script-sig script-pubkey :witness witness :amount amount)
       (unless success
-        (bitcoin-lisp:log-warn
+        (bl:log-warn
          "validate-input-script failed: input-idx=~D error=~A"
          input-idx error))
       success)))
@@ -586,7 +586,7 @@ SCRIPT is a byte vector. Returns a string like 'OP_DUP OP_HASH160 <hex> OP_EQUAL
                  ((<= 1 opcode 75)
                   (if (<= (+ pos opcode) len)
                       (let ((data (subseq script pos (+ pos opcode))))
-                        (push (bitcoin-lisp.crypto:bytes-to-hex data) parts)
+                        (push (bl.crypto:bytes-to-hex data) parts)
                         (incf pos opcode))
                       (progn (push "[error]" parts) (setf pos len))))
                  ;; OP_PUSHDATA1
@@ -596,7 +596,7 @@ SCRIPT is a byte vector. Returns a string like 'OP_DUP OP_HASH160 <hex> OP_EQUAL
                       (incf pos)
                       (if (<= (+ pos n) len)
                           (let ((data (subseq script pos (+ pos n))))
-                            (push (bitcoin-lisp.crypto:bytes-to-hex data) parts)
+                            (push (bl.crypto:bytes-to-hex data) parts)
                             (incf pos n))
                           (progn (push "[error]" parts) (setf pos len))))))
                  ;; OP_PUSHDATA2
@@ -606,7 +606,7 @@ SCRIPT is a byte vector. Returns a string like 'OP_DUP OP_HASH160 <hex> OP_EQUAL
                       (incf pos 2)
                       (if (<= (+ pos n) len)
                           (let ((data (subseq script pos (+ pos n))))
-                            (push (bitcoin-lisp.crypto:bytes-to-hex data) parts)
+                            (push (bl.crypto:bytes-to-hex data) parts)
                             (incf pos n))
                           (progn (push "[error]" parts) (setf pos len))))))
                  ;; OP_PUSHDATA4
@@ -619,7 +619,7 @@ SCRIPT is a byte vector. Returns a string like 'OP_DUP OP_HASH160 <hex> OP_EQUAL
                       (incf pos 4)
                       (if (<= (+ pos n) len)
                           (let ((data (subseq script pos (+ pos n))))
-                            (push (bitcoin-lisp.crypto:bytes-to-hex data) parts)
+                            (push (bl.crypto:bytes-to-hex data) parts)
                             (incf pos n))
                           (progn (push "[error]" parts) (setf pos len))))))
                  ;; Named opcode

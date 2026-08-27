@@ -69,7 +69,7 @@ TorStreamIsolationCredentialsGenerator::Generate, netbase.cpp:761-767)."
     (unless *proxy-credentials-prefix*
       (setf *proxy-credentials-prefix*
             (concatenate 'string
-                         (bitcoin-lisp.crypto:bytes-to-hex (ironclad:random-data 8))
+                         (bl.crypto:bytes-to-hex (ironclad:random-data 8))
                          "-")))
     (prog1 (format nil "~A~D" *proxy-credentials-prefix*
                    *proxy-credentials-counter*)

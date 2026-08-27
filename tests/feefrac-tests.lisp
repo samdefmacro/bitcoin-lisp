@@ -15,13 +15,13 @@
 (in-suite :feefrac-tests)
 
 (defun %ff (fee size)
-  (bitcoin-lisp.mempool:make-feefrac fee size))
+  (bl.mp:make-feefrac fee size))
 
 (defun %ff-down (f at-size)
-  (bitcoin-lisp.mempool:feefrac-evaluate-fee-down f at-size))
+  (bl.mp:feefrac-evaluate-fee-down f at-size))
 
 (defun %ff-up (f at-size)
-  (bitcoin-lisp.mempool:feefrac-evaluate-fee-up f at-size))
+  (bl.mp:feefrac-evaluate-fee-up f at-size))
 
 (test feefrac-evaluate-fee
   "EvaluateFeeDown/EvaluateFeeUp rounding table (feefrac_tests.cpp:20-56)."
@@ -105,74 +105,74 @@
         (sum (%ff 1500 400)) (diff (%ff 500 -200))
         (empty (%ff 0 0))
         (p3 (%ff 2000 200)) (p4 (%ff 3000 300)))
-    (is-true (bitcoin-lisp.mempool:feefrac= empty (bitcoin-lisp.mempool:make-feefrac)))
-    (is-true (bitcoin-lisp.mempool:feefrac-empty-p empty))
-    (is-false (bitcoin-lisp.mempool:feefrac-empty-p p1))
-    (is-true (bitcoin-lisp.mempool:feefrac= p1 p1))
-    (is-true (bitcoin-lisp.mempool:feefrac= (bitcoin-lisp.mempool:feefrac+ p1 p2) sum))
-    (is-true (bitcoin-lisp.mempool:feefrac= (bitcoin-lisp.mempool:feefrac- p1 p2) diff))
+    (is-true (bl.mp:feefrac= empty (bl.mp:make-feefrac)))
+    (is-true (bl.mp:feefrac-empty-p empty))
+    (is-false (bl.mp:feefrac-empty-p p1))
+    (is-true (bl.mp:feefrac= p1 p1))
+    (is-true (bl.mp:feefrac= (bl.mp:feefrac+ p1 p2) sum))
+    (is-true (bl.mp:feefrac= (bl.mp:feefrac- p1 p2) diff))
     ;; feefracs only equal if both fee and size are same
-    (is-false (bitcoin-lisp.mempool:feefrac= p1 p3))
-    (is-false (bitcoin-lisp.mempool:feefrac= p2 p3))
-    (is-true (bitcoin-lisp.mempool:feefrac= p1 (bitcoin-lisp.mempool:feefrac- p4 p3)))
-    (is-true (bitcoin-lisp.mempool:feefrac= (bitcoin-lisp.mempool:feefrac+ p1 p3) p4))))
+    (is-false (bl.mp:feefrac= p1 p3))
+    (is-false (bl.mp:feefrac= p2 p3))
+    (is-true (bl.mp:feefrac= p1 (bl.mp:feefrac- p4 p3)))
+    (is-true (bl.mp:feefrac= (bl.mp:feefrac+ p1 p3) p4))))
 
 (test feefrac-comparisons
   "Full-order and feerate-only comparisons (feefrac_tests.cpp:72-149)."
   (let ((p1 (%ff 1000 100)) (p2 (%ff 500 300)) (p3 (%ff 2000 200))
         (p4 (%ff 3000 300)) (empty (%ff 0 0)))
-    (is-true (bitcoin-lisp.mempool:feefrac> p1 p2))
-    (is-true (bitcoin-lisp.mempool:feefrac>= p1 p2))
-    (is-true (bitcoin-lisp.mempool:feefrac>= p1 (bitcoin-lisp.mempool:feefrac- p4 p3)))
-    (is-false (bitcoin-lisp.mempool:feefrac>> p1 p3)) ; not strictly better
-    (is-true (bitcoin-lisp.mempool:feefrac>> p1 p2))  ; strictly greater feerate
-    (is-true (bitcoin-lisp.mempool:feefrac< p2 p1))
-    (is-true (bitcoin-lisp.mempool:feefrac<= p2 p1))
-    (is-true (bitcoin-lisp.mempool:feefrac<= p1 (bitcoin-lisp.mempool:feefrac- p4 p3)))
-    (is-false (bitcoin-lisp.mempool:feefrac<< p3 p1)) ; not strictly worse
-    (is-true (bitcoin-lisp.mempool:feefrac<< p2 p1))  ; strictly lower feerate
+    (is-true (bl.mp:feefrac> p1 p2))
+    (is-true (bl.mp:feefrac>= p1 p2))
+    (is-true (bl.mp:feefrac>= p1 (bl.mp:feefrac- p4 p3)))
+    (is-false (bl.mp:feefrac>> p1 p3)) ; not strictly better
+    (is-true (bl.mp:feefrac>> p1 p2))  ; strictly greater feerate
+    (is-true (bl.mp:feefrac< p2 p1))
+    (is-true (bl.mp:feefrac<= p2 p1))
+    (is-true (bl.mp:feefrac<= p1 (bl.mp:feefrac- p4 p3)))
+    (is-false (bl.mp:feefrac<< p3 p1)) ; not strictly worse
+    (is-true (bl.mp:feefrac<< p2 p1))  ; strictly lower feerate
     ;; "empty" feerate-only comparisons always result in false
-    (is-false (bitcoin-lisp.mempool:feefrac>> p1 empty))
-    (is-false (bitcoin-lisp.mempool:feefrac<< p1 empty))
-    (is-false (bitcoin-lisp.mempool:feefrac>> empty empty))
-    (is-false (bitcoin-lisp.mempool:feefrac<< empty empty))
+    (is-false (bl.mp:feefrac>> p1 empty))
+    (is-false (bl.mp:feefrac<< p1 empty))
+    (is-false (bl.mp:feefrac>> empty empty))
+    (is-false (bl.mp:feefrac<< empty empty))
     ;; empty is always bigger than everything else in the full order
-    (is-true (bitcoin-lisp.mempool:feefrac> empty p1))
-    (is-true (bitcoin-lisp.mempool:feefrac> empty p2))
-    (is-true (bitcoin-lisp.mempool:feefrac> empty p3))
-    (is-true (bitcoin-lisp.mempool:feefrac>= empty p1))
-    (is-true (bitcoin-lisp.mempool:feefrac>= empty p2))
-    (is-true (bitcoin-lisp.mempool:feefrac>= empty p3))
+    (is-true (bl.mp:feefrac> empty p1))
+    (is-true (bl.mp:feefrac> empty p2))
+    (is-true (bl.mp:feefrac> empty p3))
+    (is-true (bl.mp:feefrac>= empty p1))
+    (is-true (bl.mp:feefrac>= empty p2))
+    (is-true (bl.mp:feefrac>= empty p3))
     ;; "max" values whose cross products exceed 64 bits
     (let ((oversized-1 (%ff 4611686000000 4000000))
           (oversized-2 (%ff 184467440000000 100000)))
-      (is-true (bitcoin-lisp.mempool:feefrac< oversized-1 oversized-2))
-      (is-true (bitcoin-lisp.mempool:feefrac<= oversized-1 oversized-2))
-      (is-true (bitcoin-lisp.mempool:feefrac<< oversized-1 oversized-2))
-      (is-false (bitcoin-lisp.mempool:feefrac= oversized-1 oversized-2)))
+      (is-true (bl.mp:feefrac< oversized-1 oversized-2))
+      (is-true (bl.mp:feefrac<= oversized-1 oversized-2))
+      (is-true (bl.mp:feefrac<< oversized-1 oversized-2))
+      (is-false (bl.mp:feefrac= oversized-1 oversized-2)))
     ;; Paths where Core needs double/int128 arithmetic
     (let ((busted (%ff (1+ #x7fffffff) #x7fffffff)))
-      (is-false (bitcoin-lisp.mempool:feefrac< busted busted)))
+      (is-false (bl.mp:feefrac< busted busted)))
     (let ((max-fee (%ff 2100000000000000 #x7fffffff))
           (max-fee2 (%ff 1 1)))
-      (is-false (bitcoin-lisp.mempool:feefrac< max-fee max-fee))
-      (is-false (bitcoin-lisp.mempool:feefrac> max-fee max-fee))
-      (is-true (bitcoin-lisp.mempool:feefrac<= max-fee max-fee))
-      (is-true (bitcoin-lisp.mempool:feefrac>= max-fee max-fee))
-      (is-true (bitcoin-lisp.mempool:feefrac>= max-fee max-fee2)))
+      (is-false (bl.mp:feefrac< max-fee max-fee))
+      (is-false (bl.mp:feefrac> max-fee max-fee))
+      (is-true (bl.mp:feefrac<= max-fee max-fee))
+      (is-true (bl.mp:feefrac>= max-fee max-fee))
+      (is-true (bl.mp:feefrac>= max-fee max-fee2)))
     ;; Full-order tie-break: equal feerate sorts by DECREASING size
     ;; (feefrac.h:19-31: (2,2) sorts before (1,1); empty sorts last).
-    (is-true (bitcoin-lisp.mempool:feefrac< (%ff 2 2) (%ff 1 1)))
-    (is-true (bitcoin-lisp.mempool:feefrac> (%ff 1 1) (%ff 2 2)))
-    (is (= 0 (bitcoin-lisp.mempool:feerate-compare (%ff 2 2) (%ff 1 1))))
-    (is (= -1 (bitcoin-lisp.mempool:feerate-compare (%ff 1 2) (%ff 2 1))))
-    (is (= 1 (bitcoin-lisp.mempool:feerate-compare (%ff 2 1) (%ff 1 2))))))
+    (is-true (bl.mp:feefrac< (%ff 2 2) (%ff 1 1)))
+    (is-true (bl.mp:feefrac> (%ff 1 1) (%ff 2 2)))
+    (is (= 0 (bl.mp:feerate-compare (%ff 2 2) (%ff 1 1))))
+    (is (= -1 (bl.mp:feerate-compare (%ff 1 2) (%ff 2 1))))
+    (is (= 1 (bl.mp:feerate-compare (%ff 2 1) (%ff 1 2))))))
 
 (test feefrac-compare-chunks
   "CompareChunks diagram comparison (feefrac.cpp:10-73): concave cumulative
 curves from (0,0), extended right with a horizontal line; :unordered when
 each is strictly better somewhere."
-  (flet ((cmp (a b) (bitcoin-lisp.mempool:compare-chunks a b)))
+  (flet ((cmp (a b) (bl.mp:compare-chunks a b)))
     ;; Empty diagrams.
     (is (eq :equal (cmp '() '())))
     (is (eq :less (cmp '() (list (%ff 1 1)))))

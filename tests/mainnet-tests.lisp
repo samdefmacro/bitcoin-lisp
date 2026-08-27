@@ -9,63 +9,63 @@
 
 (test network-genesis-hash-testnet
   "network-genesis-hash should return testnet genesis for :testnet3"
-  (let ((genesis (bitcoin-lisp.storage:network-genesis-hash :testnet3)))
+  (let ((genesis (bl.store:network-genesis-hash :testnet3)))
     (is (= 32 (length genesis)))
     ;; Testnet genesis hash (little-endian)
-    (is (equalp genesis bitcoin-lisp.storage:\*testnet3-genesis-hash\*))))
+    (is (equalp genesis bl.store:\*testnet3-genesis-hash\*))))
 
 (test network-genesis-hash-mainnet
   "network-genesis-hash should return mainnet genesis for :mainnet."
-  (let ((genesis (bitcoin-lisp.storage:network-genesis-hash :mainnet)))
+  (let ((genesis (bl.store:network-genesis-hash :mainnet)))
     (is (= 32 (length genesis)))
     ;; Mainnet genesis hash (little-endian)
-    (is (equalp genesis bitcoin-lisp.storage:*mainnet-genesis-hash*))
+    (is (equalp genesis bl.store:*mainnet-genesis-hash*))
     ;; Verify it's different from testnet
-    (is (not (equalp genesis bitcoin-lisp.storage:\*testnet3-genesis-hash\*)))))
+    (is (not (equalp genesis bl.store:\*testnet3-genesis-hash\*)))))
 
 (test mainnet-genesis-hash-value
   "Mainnet genesis hash should match known value."
   ;; Display format (big-endian): 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
-  (let* ((genesis bitcoin-lisp.storage:*mainnet-genesis-hash*)
+  (let* ((genesis bl.store:*mainnet-genesis-hash*)
          (reversed (reverse genesis))
-         (hex (bitcoin-lisp.crypto:bytes-to-hex reversed)))
+         (hex (bl.crypto:bytes-to-hex reversed)))
     (is (string= "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f" hex))))
 
 ;;; Task 7.2: get-checkpoint-hash tests
 
 (test get-checkpoint-hash-testnet
   "get-checkpoint-hash should return testnet checkpoints when on testnet."
-  (let ((bitcoin-lisp:*network* :testnet3))
+  (let ((bl:*network* :testnet3))
     ;; Height 546 is a testnet checkpoint
-    (let ((hash (bitcoin-lisp.networking:get-checkpoint-hash 546)))
+    (let ((hash (bl.net:get-checkpoint-hash 546)))
       (is-true hash "Testnet checkpoint at 546 should exist")
       (is (= 32 (length hash))))
     ;; Height 11111 is NOT a testnet checkpoint (it's mainnet)
-    (let ((hash (bitcoin-lisp.networking:get-checkpoint-hash 11111)))
+    (let ((hash (bl.net:get-checkpoint-hash 11111)))
       (is-false hash "Height 11111 is not a testnet checkpoint"))))
 
 (test get-checkpoint-hash-mainnet
   "get-checkpoint-hash should return mainnet checkpoints when on mainnet."
-  (let ((bitcoin-lisp:*network* :mainnet))
+  (let ((bl:*network* :mainnet))
     ;; Height 11111 is a mainnet checkpoint
-    (let ((hash (bitcoin-lisp.networking:get-checkpoint-hash 11111)))
+    (let ((hash (bl.net:get-checkpoint-hash 11111)))
       (is-true hash "Mainnet checkpoint at 11111 should exist")
       (is (= 32 (length hash))))
     ;; Height 546 is NOT a mainnet checkpoint (it's testnet)
-    (let ((hash (bitcoin-lisp.networking:get-checkpoint-hash 546)))
+    (let ((hash (bl.net:get-checkpoint-hash 546)))
       (is-false hash "Height 546 is not a mainnet checkpoint"))))
 
 (test last-checkpoint-height-testnet
   "last-checkpoint-height should return testnet's last checkpoint when on testnet."
-  (let ((bitcoin-lisp:*network* :testnet3))
-    (let ((height (bitcoin-lisp.networking:last-checkpoint-height)))
+  (let ((bl:*network* :testnet3))
+    (let ((height (bl.net:last-checkpoint-height)))
       ;; Testnet's last checkpoint is at 2000000
       (is (= 2000000 height)))))
 
 (test last-checkpoint-height-mainnet
   "last-checkpoint-height should return mainnet's last checkpoint when on mainnet."
-  (let ((bitcoin-lisp:*network* :mainnet))
-    (let ((height (bitcoin-lisp.networking:last-checkpoint-height)))
+  (let ((bl:*network* :mainnet))
+    (let ((height (bl.net:last-checkpoint-height)))
       ;; Mainnet's last checkpoint is at 840000 (fourth halving)
       (is (= 840000 height)))))
 
@@ -73,27 +73,27 @@
 
 (test get-bip34-activation-height-testnet
   "get-bip34-activation-height should return 21111 for testnet."
-  (is (= 21111 (bitcoin-lisp.validation:get-bip34-activation-height :testnet3))))
+  (is (= 21111 (bl.val:get-bip34-activation-height :testnet3))))
 
 (test get-bip34-activation-height-mainnet
   "get-bip34-activation-height should return 227931 for mainnet."
-  (is (= 227931 (bitcoin-lisp.validation:get-bip34-activation-height :mainnet))))
+  (is (= 227931 (bl.val:get-bip34-activation-height :mainnet))))
 
 ;;; Task 7.4: network-rpc-port tests
 
 (test network-rpc-port-testnet
   "network-rpc-port should return 18332 for testnet."
-  (is (= 18332 (bitcoin-lisp:network-rpc-port :testnet3))))
+  (is (= 18332 (bl:network-rpc-port :testnet3))))
 
 (test network-rpc-port-mainnet
   "network-rpc-port should return 8332 for mainnet."
-  (is (= 8332 (bitcoin-lisp:network-rpc-port :mainnet))))
+  (is (= 8332 (bl:network-rpc-port :mainnet))))
 
 ;;; Task 7.5: Mainnet genesis block header validation
 
 (test mainnet-genesis-hash-valid
   "Mainnet genesis hash should be a valid 32-byte hash."
-  (let ((genesis bitcoin-lisp.storage:*mainnet-genesis-hash*))
+  (let ((genesis bl.store:*mainnet-genesis-hash*))
     (is (typep genesis '(simple-array (unsigned-byte 8) (32))))
     ;; Genesis hash should not be all zeros
     (is-false (every #'zerop genesis))))
@@ -102,21 +102,21 @@
 
 (test relay-enabled-testnet
   "Relay should always be enabled on testnet."
-  (let ((bitcoin-lisp:*network* :testnet3)
-        (bitcoin-lisp:*mainnet-relay-enabled* nil))
-    (is-true (bitcoin-lisp.networking:relay-enabled-p))))
+  (let ((bl:*network* :testnet3)
+        (bl:*mainnet-relay-enabled* nil))
+    (is-true (bl.net:relay-enabled-p))))
 
 (test relay-disabled-mainnet-default
   "Relay should be disabled on mainnet by default."
-  (let ((bitcoin-lisp:*network* :mainnet)
-        (bitcoin-lisp:*mainnet-relay-enabled* nil))
-    (is-false (bitcoin-lisp.networking:relay-enabled-p))))
+  (let ((bl:*network* :mainnet)
+        (bl:*mainnet-relay-enabled* nil))
+    (is-false (bl.net:relay-enabled-p))))
 
 (test relay-enabled-mainnet-when-flag-set
   "Relay should be enabled on mainnet when flag is set."
-  (let ((bitcoin-lisp:*network* :mainnet)
-        (bitcoin-lisp:*mainnet-relay-enabled* t))
-    (is-true (bitcoin-lisp.networking:relay-enabled-p))))
+  (let ((bl:*network* :mainnet)
+        (bl:*mainnet-relay-enabled* t))
+    (is-true (bl.net:relay-enabled-p))))
 
 ;;; Network parameter consistency tests
 
@@ -124,10 +124,10 @@
   "All network parameter functions should work for both networks."
   (dolist (network '(:testnet3 :mainnet))
     ;; All these should return valid values without error
-    (is-true (bitcoin-lisp:network-magic network))
-    (is-true (bitcoin-lisp:network-port network))
-    (is-true (bitcoin-lisp:network-dns-seeds network))
-    (is-true (bitcoin-lisp:network-rpc-port network))
-    (is-true (bitcoin-lisp.storage:network-genesis-hash network))
-    (is-true (bitcoin-lisp.networking:network-checkpoints network))
-    (is-true (bitcoin-lisp.validation:get-bip34-activation-height network))))
+    (is-true (bl:network-magic network))
+    (is-true (bl:network-port network))
+    (is-true (bl:network-dns-seeds network))
+    (is-true (bl:network-rpc-port network))
+    (is-true (bl.store:network-genesis-hash network))
+    (is-true (bl.net:network-checkpoints network))
+    (is-true (bl.val:get-bip34-activation-height network))))

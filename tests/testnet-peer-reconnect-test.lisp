@@ -21,8 +21,8 @@
 (ensure-directories-exist *test-dir*)
 
 ;; Enable console output
-(setf bitcoin-lisp:*log-stream* *standard-output*)
-(setf bitcoin-lisp::*current-log-level* :info)
+(setf bl:*log-stream* *standard-output*)
+(setf bl::*current-log-level* :info)
 
 (format t "~%========================================~%")
 (format t "Testnet Peer Reconnection Test~%")
@@ -31,26 +31,26 @@
 (force-output)
 
 ;; Start node
-(bitcoin-lisp:start-node :data-directory *test-dir*
+(bl:start-node :data-directory *test-dir*
                           :network :testnet
                           :sync nil
                           :log-level :info)
 
 (format t "Connecting to peers...~%")
 (force-output)
-(bitcoin-lisp::connect-to-peers bitcoin-lisp:*node* 4 :timeout 30 :min-peers 2)
+(bl::connect-to-peers bl:*node* 4 :timeout 30 :min-peers 2)
 
-(defparameter *initial-peers* (copy-list (bitcoin-lisp::node-peers bitcoin-lisp:*node*)))
+(defparameter *initial-peers* (copy-list (bl::node-peers bl:*node*)))
 (defparameter *initial-peer-count* (length *initial-peers*))
 
 (format t "~%Initial peer count: ~D~%" *initial-peer-count*)
 (dolist (peer *initial-peers*)
-  (format t "  - ~A~%" (bitcoin-lisp::peer-address peer)))
+  (format t "  - ~A~%" (bl::peer-address peer)))
 (force-output)
 
 (when (< *initial-peer-count* 2)
   (format t "~%ERROR: Need at least 2 peers for this test. Exiting.~%")
-  (bitcoin-lisp:stop-node)
+  (bl:stop-node)
   (sb-ext:exit :code 1))
 
 ;; Start sync in background
@@ -58,7 +58,7 @@
   (sb-thread:make-thread
    (lambda ()
      (handler-case
-         (bitcoin-lisp::sync-blockchain bitcoin-lisp:*node*)
+         (bl::sync-blockchain bl:*node*)
        (error (e)
          (format t "Sync error: ~A~%" e))))
    :name "sync-thread"))
@@ -69,16 +69,16 @@
 
 (loop
   (sleep 5)
-  (let ((height (bitcoin-lisp.storage:current-height
-                 (bitcoin-lisp::node-chain-state bitcoin-lisp:*node*))))
+  (let ((height (bl.store:current-height
+                 (bl::node-chain-state bl:*node*))))
     (format t "  Height: ~D, Peers: ~D~%"
-            height (length (bitcoin-lisp::node-peers bitcoin-lisp:*node*)))
+            height (length (bl::node-peers bl:*node*)))
     (force-output)
     (when (>= height 50)
       (return))))
 
 ;; Get current peers before disconnect
-(defparameter *peers-before* (copy-list (bitcoin-lisp::node-peers bitcoin-lisp:*node*)))
+(defparameter *peers-before* (copy-list (bl::node-peers bl:*node*)))
 (defparameter *peer-count-before* (length *peers-before*))
 
 (format t "~%=== DISCONNECTING A PEER ===~%")
@@ -88,20 +88,20 @@
 ;; Disconnect the first peer
 (let ((peer-to-disconnect (first *peers-before*)))
   (when peer-to-disconnect
-    (format t "Disconnecting peer: ~A~%" (bitcoin-lisp::peer-address peer-to-disconnect))
+    (format t "Disconnecting peer: ~A~%" (bl::peer-address peer-to-disconnect))
     (force-output)
     ;; Close the socket to simulate disconnect
     (handler-case
         (progn
-          (when (bitcoin-lisp::peer-socket peer-to-disconnect)
-            (usocket:socket-close (bitcoin-lisp::peer-socket peer-to-disconnect)))
+          (when (bl::peer-socket peer-to-disconnect)
+            (usocket:socket-close (bl::peer-socket peer-to-disconnect)))
           ;; Remove from peer list
-          (setf (bitcoin-lisp::node-peers bitcoin-lisp:*node*)
-                (remove peer-to-disconnect (bitcoin-lisp::node-peers bitcoin-lisp:*node*))))
+          (setf (bl::node-peers bl:*node*)
+                (remove peer-to-disconnect (bl::node-peers bl:*node*))))
       (error (e)
         (format t "  (Disconnect error: ~A)~%" e)))))
 
-(defparameter *peers-after-disconnect* (length (bitcoin-lisp::node-peers bitcoin-lisp:*node*)))
+(defparameter *peers-after-disconnect* (length (bl::node-peers bl:*node*)))
 (format t "Peers immediately after disconnect: ~D~%" *peers-after-disconnect*)
 (force-output)
 
@@ -113,14 +113,14 @@
 (defparameter *max-peers-seen* *peers-after-disconnect*)
 (defparameter *sync-continued* nil)
 (defparameter *height-at-disconnect*
-  (bitcoin-lisp.storage:current-height
-   (bitcoin-lisp::node-chain-state bitcoin-lisp:*node*)))
+  (bl.store:current-height
+   (bl::node-chain-state bl:*node*)))
 
 (loop for i from 1 to 12 do  ; 12 * 5 = 60 seconds
   (sleep 5)
-  (let* ((current-peers (length (bitcoin-lisp::node-peers bitcoin-lisp:*node*)))
-         (current-height (bitcoin-lisp.storage:current-height
-                          (bitcoin-lisp::node-chain-state bitcoin-lisp:*node*))))
+  (let* ((current-peers (length (bl::node-peers bl:*node*)))
+         (current-height (bl.store:current-height
+                          (bl::node-chain-state bl:*node*))))
     (format t "  [~2D] Height: ~D, Peers: ~D~%" (* i 5) current-height current-peers)
     (force-output)
 
@@ -137,10 +137,10 @@
       (setf *sync-continued* t))))
 
 ;; Final status
-(defparameter *final-peer-count* (length (bitcoin-lisp::node-peers bitcoin-lisp:*node*)))
+(defparameter *final-peer-count* (length (bl::node-peers bl:*node*)))
 (defparameter *final-height*
-  (bitcoin-lisp.storage:current-height
-   (bitcoin-lisp::node-chain-state bitcoin-lisp:*node*)))
+  (bl.store:current-height
+   (bl::node-chain-state bl:*node*)))
 
 (format t "~%========================================~%")
 (format t "TEST RESULTS~%")
@@ -175,5 +175,5 @@
   (format t "========================================~%")
   (force-output)
 
-  (bitcoin-lisp:stop-node)
+  (bl:stop-node)
   (sb-ext:exit :code (if test-passed 0 1)))

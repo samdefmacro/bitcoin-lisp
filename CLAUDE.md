@@ -17,6 +17,19 @@ Wallet: descriptor-only wallet in progress per docs/wallet-plan.md (no BDB/legac
 wallets, no BIP39). Wallet support is enabled by default on test networks,
 default-OFF on mainnet (config flag `-wallet`); testnet4 first.
 
+## Package prefixes
+
+Cross-package references use the package-local nicknames installed by
+`src/package.lisp` (`bitcoin-lisp::*package-nicknames*`): `bl:` for the top
+package, `bl.bytes`, `bl.crypto`, `bl.ser`, `bl.store`, `bl.val`, `bl.mp`,
+`bl.mining`, `bl.net`, `bl.rpc`, `bl.interop`, `bl.script`, `bl.ctypes`,
+`bl.cser`, `bl.cbin`, `bl.ccrypto`, `bl.tests`. Write `bl.ser:transaction-inputs`,
+never the full name. A branch that predates the nicknames rebases and runs
+`scripts/refactor/apply-nicknames.sh`. A file that DEFINES packages follows
+its DEFPACKAGE forms with `(eval-when (:compile-toplevel :load-toplevel
+:execute) (bitcoin-lisp::install-package-nicknames))`, full name, because
+that form is read in CL-USER.
+
 ## The development loop (cl-workbench managed, containerized warm image)
 
 This is a Common Lisp Workbench managed project (`.cl-workbench/project.toml`,

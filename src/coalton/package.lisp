@@ -292,3 +292,6 @@
    #:script-result-stack
    #:script-result-error
    #:get-ok-stack))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp::install-package-nicknames))

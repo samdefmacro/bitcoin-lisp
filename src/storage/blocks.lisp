@@ -80,7 +80,7 @@ form, or in both, stays fully readable whichever way the flag is set.")
 
 (defun block-file-path (store hash)
   "Get the file path for a block with given HASH."
-  (let ((hash-hex (bitcoin-lisp.crypto:bytes-to-hex hash)))
+  (let ((hash-hex (bl.crypto:bytes-to-hex hash)))
     (merge-pathnames (format nil "blocks/~A.blk" hash-hex)
                      (block-store-base-path store))))
 
@@ -101,7 +101,7 @@ Uses stat on SBCL — one syscall, no file open."
 (defun block-network-magic ()
   "The 4-byte network magic that prefixes every stored record, which is the
 same value the P2P message header uses (Core MessageStart)."
-  (bitcoin-lisp:network-magic bitcoin-lisp:*network*))
+  (bl:network-magic bl:*network*))
 
 (defun %blk-seq (store)
   "The blk file sequence, created on demand."
@@ -180,8 +180,8 @@ the record is missing, mis-framed, or unreadable."
                   ;; of it dispatch. The byte-reader existed and said "hot path
                   ;; (per inbound block)" in its own docstring; the DISK path,
                   ;; which reads every block during a reindex, never used it.
-                  (bitcoin-lisp.serialization:br-read-bitcoin-block
-                   (bitcoin-lisp.serialization:make-byte-reader-from payload)))))))))))
+                  (bl.ser:br-read-bitcoin-block
+                   (bl.ser:make-byte-reader-from payload)))))))))))
 
 (defun %store-file-info (store file)
   (or (gethash file (block-store-file-info store))
@@ -374,8 +374,8 @@ HEIGHT is what lets the block's file be pruned later: pruning a flat file is
 all-or-nothing, so the decision needs the file's height range. Omitting it
 stores the block correctly and makes its file unprunable."
   (ensure-directories store)
-  (let* ((hash (bitcoin-lisp.serialization:block-header-hash
-                (bitcoin-lisp.serialization:bitcoin-block-header block)))
+  (let* ((hash (bl.ser:block-header-hash
+                (bl.ser:bitcoin-block-header block)))
          (path (block-file-path store hash))
          ;; Persist blocks witness-complete (BIP144). The generic SERIALIZE
          ;; writes transactions in legacy form, which DROPS witness data — that
@@ -384,7 +384,7 @@ stores the block correctly and makes its file unprunable."
          ;; one gets rejected) and unusable for witness re-validation on reorg.
          ;; serialize-witness-block writes each tx witness-serialized only when it
          ;; carries witness, so non-segwit blocks are byte-identical to before.
-         (data (bitcoin-lisp.serialization:serialize-witness-block block))
+         (data (bl.ser:serialize-witness-block block))
          ;; If we're overwriting an already-stored block, its old size is
          ;; in total-bytes and must be replaced, not added to.
          ;; Re-storing a block that is already here replaces its contribution
@@ -445,9 +445,9 @@ as absent, so none relies on the raise."
       (return-from get-block
         (handler-case (%read-block-flat store located)
           (error (e)
-            (bitcoin-lisp:log-warn
+            (bl:log-warn
              "CORRUPT BLOCK record for ~A (~A) — dropping from the index"
-             (bitcoin-lisp.crypto:bytes-to-hex hash) e)
+             (bl.crypto:bytes-to-hex hash) e)
             (remhash hash (block-store-index store))
             nil)))))
   ;; ⚠️ OR, not two statements. Appending a form after this LET would DISCARD
@@ -466,12 +466,12 @@ as absent, so none relies on the raise."
               (read-sequence data stream)
               ;; Byte-reader, not a Gray stream — see the note on the flat-file
               ;; read above. This is the legacy per-block file path.
-              (bitcoin-lisp.serialization:br-read-bitcoin-block
-               (bitcoin-lisp.serialization:make-byte-reader-from data))))
+              (bl.ser:br-read-bitcoin-block
+               (bl.ser:make-byte-reader-from data))))
         (error (e)
-          (bitcoin-lisp:log-warn
+          (bl:log-warn
            "CORRUPT BLOCK file for ~A (~A) — pruning for re-download"
-           (bitcoin-lisp.crypto:bytes-to-hex hash) e)
+           (bl.crypto:bytes-to-hex hash) e)
           (ignore-errors (prune-block store hash))
           nil))))
    ;; The genesis block is never RECEIVED, so nothing ever stores its body — but
@@ -505,7 +505,7 @@ NIL and never signal. NETWORK-GENESIS-HASH is an ECASE and MAKE-GENESIS-BLOCK
 raises when construction does not reproduce the known hash; letting either
 escape turns `absent' into an error on a path that has no handler for one, and
 takes the reorg, migration and filter-index tests down with it."
-  (let ((network bitcoin-lisp:*network*))
+  (let ((network bl:*network*))
     (let ((genesis (ignore-errors (network-genesis-hash network))))
       (when (and genesis (equalp hash genesis))
         (or (gethash network *genesis-body-cache*)
@@ -559,7 +559,7 @@ zero tail of the file currently being appended to looks like."
                      (read-sequence hdr80 in)
                      (obfuscate! hdr80 key
                                  :key-offset (+ offset +storage-header-bytes+))
-                     (let ((hash (bitcoin-lisp.crypto:hash256 hdr80)))
+                     (let ((hash (bl.crypto:hash256 hdr80)))
                        (setf (gethash hash (block-store-index store))
                              (make-flat-file-pos file (+ offset +storage-header-bytes+))))
                      (incf bytes (+ +storage-header-bytes+ length))
@@ -589,7 +589,7 @@ zero tail of the file currently being appended to looks like."
             (when (and (not *blocks-xor*) (notevery #'zerop key))
               (error "The blocksdir XOR-key can not be disabled when a random ~
 key was already stored! Stored key: '~A', stored path: '~A'."
-                     (bitcoin-lisp.crypto:bytes-to-hex key)
+                     (bl.crypto:bytes-to-hex key)
                      (namestring (merge-pathnames "xor.dat" blocks-dir))))
             key))
     ;; blocks/index/ eagerly, even though nothing is written into it until the
@@ -608,7 +608,7 @@ key was already stored! Stored key: '~A', stored path: '~A'."
       (when (probe-file blocks-dir)
         (dolist (file (directory (merge-pathnames "*.blk" blocks-dir)))
           (let* ((name (pathname-name file))
-                 (hash (bitcoin-lisp.crypto:hex-to-bytes name)))
+                 (hash (bl.crypto:hex-to-bytes name)))
             (setf (gethash hash (block-store-index store)) file)
             (incf total-bytes (or (file-size-bytes file) 0)))))
       ;; Then the flat files. Both forms are indexed, which is what makes the
@@ -645,7 +645,7 @@ an offline tool has no business acquiring a block it was not given.
 Best effort by construction: a datadir that cannot be written (read-only, full
 disk) is a problem for whoever actually needs to write, not for start-up."
   (ignore-errors
-   (let ((hash (ignore-errors (network-genesis-hash bitcoin-lisp:*network*))))
+   (let ((hash (ignore-errors (network-genesis-hash bl:*network*))))
      (when (and hash (not (gethash hash (block-store-index store))))
        (let ((block (%genesis-block-body hash)))
          (when block
@@ -661,11 +661,11 @@ Returns the size in bytes of the deleted file, or NIL if the file didn't exist."
   ;; rather than returning NIL, which the caller reads as "already gone" and
   ;; would let a pruned node stop reclaiming space in silence.
   (when (flat-file-pos-p (gethash hash (block-store-index store)))
-    (bitcoin-lisp:log-warn
+    (bl:log-warn
      "Cannot prune ~A: it is inside a flat block file, which prunes per FILE ~
       (block-file-format P3). Callers that only need the body to become ~
       unreadable want FORGET-BLOCK-BODY."
-     (bitcoin-lisp.crypto:bytes-to-hex hash))
+     (bl.crypto:bytes-to-hex hash))
     (return-from prune-block nil))
   (let* ((path (block-file-path store hash))
          ;; One stat serves both the existence check and the size — NIL
@@ -829,7 +829,7 @@ callback keeps storage from having to reach into the chain state."
             (incf freed size)))))
     (remhash file (block-store-file-info store))
     (decf (block-store-total-bytes store) (min freed (block-store-total-bytes store)))
-    (bitcoin-lisp:log-info "Pruned block file ~D: ~D blocks, ~D bytes"
+    (bl:log-info "Pruned block file ~D: ~D blocks, ~D bytes"
                            file (length hashes) freed)
     freed))
 
@@ -848,14 +848,14 @@ prune floor (an unvalidated snapshot chainstate never prunes at or below its
 base — Core Chainstate::GetPruneRange).
 Only runs in automatic pruning mode.
 Returns the number of blocks pruned."
-  (unless (bitcoin-lisp:automatic-pruning-p)
+  (unless (bl:automatic-pruning-p)
     (return-from prune-old-blocks 0))
   (let ((current-height (chain-state-best-height chain-state))
-        (prune-after (or bitcoin-lisp:*prune-after-height* 0)))
+        (prune-after (or bl:*prune-after-height* 0)))
     ;; Don't prune until chain reaches prune-after-height
     (when (< current-height prune-after)
       (return-from prune-old-blocks 0))
-    (let ((target-bytes (bitcoin-lisp:effective-prune-target-bytes)))
+    (let ((target-bytes (bl:effective-prune-target-bytes)))
       (when (<= (block-store-total-bytes store) target-bytes)
         (return-from prune-old-blocks 0))
       ;; Calculate the allowed prune window: (floor, min-keep-height].
@@ -864,7 +864,7 @@ Returns the number of blocks pruned."
       ;; caught up (Core caps last_prune by every lock before calling
       ;; FindFilesToPrune, validation.cpp:2722-2732).
       (let* ((min-keep-height (min (max 0 (- current-height
-                                             bitcoin-lisp:+min-blocks-to-keep+))
+                                             bl:+min-blocks-to-keep+))
                                    (prune-lock-ceiling current-height)))
              (start (chain-state-prune-walk-start chain-state))
              (pruned 0))
@@ -932,10 +932,10 @@ Respects +min-blocks-to-keep+ retention and CHAIN-STATE's per-chainstate
 prune floor (Core FindFilesToPruneManual also bounds the manual range by
 GetPruneRange, node/blockstorage.cpp:292-319).
 Returns the number of blocks pruned."
-  (unless (bitcoin-lisp:pruning-enabled-p)
+  (unless (bl:pruning-enabled-p)
     (return-from prune-blocks-to-height 0))
   (let* ((current-height (chain-state-best-height chain-state))
-         (max-prune-height (max 0 (- current-height bitcoin-lisp:+min-blocks-to-keep+)))
+         (max-prune-height (max 0 (- current-height bl:+min-blocks-to-keep+)))
          ;; The locks bound a manual prune too — Core passes the same
          ;; lock-capped last_prune into FindFilesToPruneManual.
          (effective-target (min target-height max-prune-height

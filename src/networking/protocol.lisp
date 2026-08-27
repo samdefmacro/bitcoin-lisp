@@ -8,9 +8,9 @@
   "Execute BODY while holding the node lock for thread-safe state access.
 Guards shared state (chain-state, UTXO set, mempool, peer list) against
 concurrent access from RPC and sync threads."
-  `(let ((node bitcoin-lisp::*node*))
-     (if (and node (bitcoin-lisp::node-lock node))
-         (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+  `(let ((node bl::*node*))
+     (if (and node (bl::node-lock node))
+         (bt:with-recursive-lock-held ((bl::node-lock node))
            ,@body)
          (progn ,@body))))
 
@@ -116,7 +116,7 @@ AddAddrFetch peer dials instead of getaddrinfo lookups (net.cpp:2353-2358)."
           ;; Per seed, before the lookup, exactly as Core does (net.cpp:2353).
           ;; p2p_dns_seeds.py greps for this line to tell which seeds a node
           ;; actually tried — a summary after the fact cannot answer that.
-          (bitcoin-lisp:log-info "Loading addresses from DNS seed ~A" seed)
+          (bl:log-info "Loading addresses from DNS seed ~A" seed)
           (let ((resolved (resolve-dns-seed seed)))
             (when resolved
               (setf addresses (nconc addresses resolved)))))
@@ -142,26 +142,26 @@ Returns T if message was handled, NIL otherwise."
   ;;
   ;; The BYTE COUNT is the payload's, not the framed message's, matching
   ;; vRecv.size() at that point.
-  (bitcoin-lisp:log-cat "net" "received: ~A (~D bytes) peer=~A"
+  (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
                         command (length payload) (peer-id peer))
   ;; Check per-peer rate limit before processing
   (unless (check-peer-rate-limit peer command)
-    (bitcoin-lisp:log-warn "Rate limit exceeded for peer ~A on ~A messages"
+    (bl:log-warn "Rate limit exceeded for peer ~A on ~A messages"
                            (peer-address peer) command)
     (disconnect-peer peer)
     (return-from handle-message nil))
   (cond
     ((string= command "ping")
      (let ((nonce (flexi-streams:with-input-from-sequence (s payload)
-                    (bitcoin-lisp.serialization:read-uint64-le s))))
-       (bitcoin-lisp:log-debug "ping from ~A: ~D payload bytes, nonce ~D"
+                    (bl.ser:read-uint64-le s))))
+       (bl:log-debug "ping from ~A: ~D payload bytes, nonce ~D"
                                (peer-address peer) (length payload) nonce)
        (handle-ping peer nonce))
      t)
 
     ((string= command "pong")
      (let ((nonce (flexi-streams:with-input-from-sequence (s payload)
-                    (bitcoin-lisp.serialization:read-uint64-le s))))
+                    (bl.ser:read-uint64-le s))))
        (handle-pong peer nonce))
      t)
 
@@ -213,12 +213,12 @@ Returns T if message was handled, NIL otherwise."
      ;; (:4953), and does not disconnect a noban peer for it either.
      (cond
        ((not (peer-has-permission-p peer +perm-mempool+))
-        (bitcoin-lisp:log-cat
+        (bl:log-cat
          "net" "mempool request with bloom filters disabled — disconnecting peer ~A"
          (peer-address peer))
         (disconnect-peer peer))
-       ((bitcoin-lisp.networking::outbound-target-reached-p nil)
-        (bitcoin-lisp:log-cat
+       ((bl.net::outbound-target-reached-p nil)
+        (bl:log-cat
          "net" "mempool request with bandwidth limit reached from ~A"
          (peer-address peer))
         (unless (peer-has-permission-p peer +perm-noban+)
@@ -255,7 +255,7 @@ Returns T if message was handled, NIL otherwise."
      ;; with this exact line rather than disconnecting (net_processing.cpp:3822)
      ;; — and p2p_handshake.py greps the log for it, so the wording is part of
      ;; the behaviour, not decoration.
-     (bitcoin-lisp:log-cat "net" "ignoring redundant verack message from peer=~A"
+     (bl:log-cat "net" "ignoring redundant verack message from peer=~A"
                            (peer-id peer))
      t)
 
@@ -273,8 +273,8 @@ Returns T if message was handled, NIL otherwise."
      ;; protocol violation: Core disconnects (net_processing.cpp:3969-3973),
      ;; unlike the sendaddrv2/wtxidrelay no-op stubs above. With
      ;; -txreconciliation off, Core ignores the message instead (:3964-3967).
-     (when bitcoin-lisp:*tx-reconciliation*
-       (bitcoin-lisp:log-cat "net" "sendtxrcncl received after verack — disconnecting peer ~A"
+     (when bl:*tx-reconciliation*
+       (bl:log-cat "net" "sendtxrcncl received after verack — disconnecting peer ~A"
                              (peer-address peer))
        (disconnect-peer peer))
      t)
@@ -304,8 +304,8 @@ Returns T if message was handled, NIL otherwise."
      ;; BIP 133: the peer's minimum fee rate for tx relay. Core applies it
      ;; only when MoneyRange (net_processing.cpp:5126); a rate above
      ;; MAX_MONEY would otherwise silently suppress all relay to this peer.
-     (let ((rate (bitcoin-lisp.serialization:parse-feefilter-payload payload)))
-       (when (<= rate bitcoin-lisp.validation:+max-money+)
+     (let ((rate (bl.ser:parse-feefilter-payload payload)))
+       (when (<= rate bl.val:+max-money+)
          (setf (peer-feefilter-rate peer) rate)))
      t)
 
@@ -336,8 +336,8 @@ Returns T if message was handled, NIL otherwise."
 
 (defun block-inv-type-p (inv-type)
   "T if INV-TYPE is a block inventory type (plain or witness, BIP 144)."
-  (or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
-      (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+)))
+  (or (= inv-type bl.ser:+inv-type-block+)
+      (= inv-type bl.ser:+inv-type-witness-block+)))
 
 ;;; --- Tx-request tracking (Core TxRequestTracker, simplified) ---
 ;;;
@@ -601,7 +601,7 @@ of requests sent."
             do (incf sent (length invs))
                (handler-case
                    (send-message peer
-                                 (bitcoin-lisp.serialization:make-getdata-message
+                                 (bl.ser:make-getdata-message
                                   invs))
                  (error () nil)))
       sent)))
@@ -613,18 +613,18 @@ the peer can serve witnesses, bare MSG_TX otherwise — Core's GetFetchFlags
 services). Requesting a segwit tx with bare MSG_TX returns the
 witness-stripped serialization, which can never pass script validation.
 wtxid-based requests never use this: they are always MSG_WTX."
-  (if (logtest (peer-services peer) bitcoin-lisp.serialization:+node-witness+)
-      bitcoin-lisp.serialization:+inv-type-witness-tx+
-      bitcoin-lisp.serialization:+inv-type-tx+))
+  (if (logtest (peer-services peer) bl.ser:+node-witness+)
+      bl.ser:+inv-type-witness-tx+
+      bl.ser:+inv-type-tx+))
 
 (defun tx-request-inv (hash wtxidp peer)
   "The inv-vector for requesting tracked tx HASH from PEER: MSG_WTX for a
 wtxid-based entry, MSG_TX|witness-flag for a txid-based one — Core's
 \"gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | GetFetchFlags(peer))\"
 (net_processing.cpp:6207)."
-  (bitcoin-lisp.serialization:make-inv-vector
+  (bl.ser:make-inv-vector
    :type (if wtxidp
-             bitcoin-lisp.serialization:+inv-type-wtx+
+             bl.ser:+inv-type-wtx+
              (tx-fetch-inv-type peer))
    :hash hash))
 
@@ -674,7 +674,7 @@ for a tx with no other ready announcer. Returns the number re-requested."
       (destructuring-bind (txid next wtxidp) entry
         (handler-case
             (send-message next
-                          (bitcoin-lisp.serialization:make-getdata-message
+                          (bl.ser:make-getdata-message
                            (list (tx-request-inv txid wtxidp next))))
           (error () nil))))
     (length reroutes)))
@@ -703,12 +703,12 @@ outbounds: ApproximateBestBlockDepth() < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS
 144 block intervals of now. Unlike initial-block-download-p this does not latch
 and has no chain-work term, so a tip gone stale for a day reverts to demanding
 full NODE_NETWORK peers, as Core does."
-  (let* ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-         (tip (and tip-hash (bitcoin-lisp.storage:get-block-index-entry chain-state tip-hash))))
+  (let* ((tip-hash (bl.store:best-block-hash chain-state))
+         (tip (and tip-hash (bl.store:get-block-index-entry chain-state tip-hash))))
     (and tip
-         (> (bitcoin-lisp.serialization:block-header-timestamp
-             (bitcoin-lisp.storage:block-index-entry-header tip))
-            (- (bitcoin-lisp.serialization:get-unix-time) (* 144 600))))))
+         (> (bl.ser:block-header-timestamp
+             (bl.store:block-index-entry-header tip))
+            (- (bl.ser:get-unix-time) (* 144 600))))))
 
 (defun initial-block-download-p (chain-state)
   "Return T while the node is in initial block download.
@@ -718,24 +718,24 @@ within +max-tip-age-seconds+ of now — Core UpdateIBDStatus
 (validation.cpp:3314-3322) + CChain::IsTipRecent (chain.h:431-437)."
   (unless *cached-is-ibd*
     (return-from initial-block-download-p nil))
-  (let* ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+  (let* ((tip-hash (bl.store:best-block-hash chain-state))
          (tip (and tip-hash
-                   (bitcoin-lisp.storage:get-block-index-entry chain-state tip-hash))))
+                   (bl.store:get-block-index-entry chain-state tip-hash))))
     (if (and tip
-             (>= (bitcoin-lisp.storage:block-index-entry-chain-work tip)
-                 (bitcoin-lisp:minimum-chain-work bitcoin-lisp:*network*))
-             (>= (bitcoin-lisp.serialization:block-header-timestamp
-                  (bitcoin-lisp.storage:block-index-entry-header tip))
-                 (- (bitcoin-lisp.serialization:get-unix-time)
+             (>= (bl.store:block-index-entry-chain-work tip)
+                 (bl:minimum-chain-work bl:*network*))
+             (>= (bl.ser:block-header-timestamp
+                  (bl.store:block-index-entry-header tip))
+                 (- (bl.ser:get-unix-time)
                     +max-tip-age-seconds+)))
         (progn
-          (bitcoin-lisp:log-info "Leaving InitialBlockDownload (latching to false)")
+          (bl:log-info "Leaving InitialBlockDownload (latching to false)")
           (setf *cached-is-ibd* nil)
           ;; With an assumeutxo background chainstate in use, leaving IBD
           ;; shifts the coins-cache allocation to the historical chainstate
           ;; (Core ActivateBestChain's exited_ibd -> MaybeRebalanceCaches,
           ;; validation.cpp:3479-3486).
-          (bitcoin-lisp:rebalance-caches-on-ibd-exit)
+          (bl:rebalance-caches-on-ibd-exit)
           nil)
         t)))
 
@@ -763,15 +763,15 @@ a tx that failed reconsiderably must not be re-downloaded to be submitted
 alone. Leave it NIL where the question is \"can this still be resolved?\" —
 notably when filtering an orphan's missing parents, since a low-feerate
 parent is exactly what the orphan may be able to fee-bump (:393-395)."
-  (or (bitcoin-lisp.mempool:orphan-have
-       (bitcoin-lisp.mempool:mempool-orphan-pool mempool) hash)
+  (or (bl.mp:orphan-have
+       (bl.mp:mempool-orphan-pool mempool) hash)
       (and include-reconsiderable
-           (bitcoin-lisp.validation:reconsiderable-reject-p hash))
-      (bitcoin-lisp.validation:recently-confirmed-p hash)
-      (bitcoin-lisp:recent-reject-p recent-rejects hash)
+           (bl.val:reconsiderable-reject-p hash))
+      (bl.val:recently-confirmed-p hash)
+      (bl:recent-reject-p recent-rejects hash)
       (if wtxidp
-          (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash)
-          (bitcoin-lisp.mempool:mempool-has mempool hash))))
+          (bl.mp:mempool-get-by-wtxid mempool hash)
+          (bl.mp:mempool-has mempool hash))))
 
 (defun %maybe-add-orphan-resolution-candidate (peer orphan-wtxid mempool utxo-set
                                                recent-rejects num-wtxid-peers)
@@ -782,9 +782,9 @@ txdownloadman_impl.cpp:172-282): unless PEER already announced this orphan,
 register its still-missing parents with the tx-request tracker as txid-based
 announcements from PEER (with the usual delays; the per-parent cap check
 lives in request-orphan-parents) and record PEER as an additional announcer."
-  (let* ((pool (bitcoin-lisp.mempool:mempool-orphan-pool mempool))
-         (otx (bitcoin-lisp.mempool:orphan-tx pool orphan-wtxid)))
-    (when (and otx (not (bitcoin-lisp.mempool:orphan-have-from-peer
+  (let* ((pool (bl.mp:mempool-orphan-pool mempool))
+         (otx (bl.mp:orphan-tx pool orphan-wtxid)))
+    (when (and otx (not (bl.mp:orphan-have-from-peer
                          pool orphan-wtxid peer)))
       (let ((parents (remove-if
                       (lambda (ptxid)
@@ -794,7 +794,7 @@ lives in request-orphan-parents) and record PEER as an additional announcer."
         ;; to resolve from this peer (the orphan awaits reprocessing).
         (when parents
           (when (request-orphan-parents peer parents num-wtxid-peers)
-            (bitcoin-lisp.mempool:orphan-add pool otx peer)))))))
+            (bl.mp:orphan-add pool otx peer)))))))
 
 (defun handle-inv (peer payload chain-state &optional mempool
                    &key recent-rejects peers utxo-set)
@@ -811,22 +811,22 @@ once headers connect, the IBD/follow-tip path issues the actual getdata.
 Mirrors Bitcoin Core net_processing.cpp:4126-4214 (reject_tx_invs,
 wtxidrelay-mismatch skip, AddTxAnnouncement, best_block tracking plus a
 single MaybeSendGetHeaders after the inv vector is fully scanned)."
-  (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload))
+  (let ((inv-vectors (bl.ser:parse-inv-payload payload))
         (reject-tx-invs (or (ignore-incoming-txs-p)
                             (not (peer-relays-txs-p peer))))
         (num-wtxid-peers (count-wtxid-relay-peers peers))
         (wanted '())
         (unknown-block-hash nil))
     (dolist (inv inv-vectors)
-      (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
-            (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
+      (let ((inv-type (bl.ser:inv-vector-type inv))
+            (hash (bl.ser:inv-vector-hash inv)))
         (cond
           ((block-inv-type-p inv-type)
            ;; Per-peer availability: announcing a block hash counts as
            ;; "peer has it" — update best-known-block (or stage
            ;; hash-last-unknown if we don't have the header yet).
-           (bitcoin-lisp.networking::update-block-availability peer chain-state hash)
-           (unless (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
+           (bl.net::update-block-availability peer chain-state hash)
+           (unless (bl.store:get-block-index-entry chain-state hash)
              (setf unknown-block-hash hash)))
           ;; Transaction announcement. MSG_TX / MSG_WITNESS_TX carry a
           ;; txid; MSG_WTX (BIP339) carries a wtxid. Matching MSG_WTX here
@@ -834,23 +834,23 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
           ;; Core peer — announce txs exclusively under MSG_WTX
           ;; (net_processing.cpp:6009,6065), so without this branch no tx
           ;; announcement from them was ever requested.
-          ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+))
+          ((or (= inv-type bl.ser:+inv-type-tx+)
+               (= inv-type bl.ser:+inv-type-witness-tx+)
+               (= inv-type bl.ser:+inv-type-wtx+))
            ;; Tx invs in violation of our advertised fRelay=0 (blocksonly
            ;; mainnet default, block-relay/feeler conns): disconnect (Core
            ;; net_processing.cpp:4168-4172).
            (when reject-tx-invs
-             (bitcoin-lisp:log-cat "net" "transaction inv sent in violation of protocol — disconnecting peer ~A"
+             (bl:log-cat "net" "transaction inv sent in violation of protocol — disconnecting peer ~A"
                                    (peer-address peer))
              (disconnect-peer peer)
              (return-from handle-inv))
            ;; Ignore invs that don't match the wtxidrelay negotiation: a
            ;; wtxidrelay peer never announces MSG_TX, a non-wtxidrelay peer
            ;; never MSG_WTX (Core net_processing.cpp:4145-4152).
-           (let ((wtxidp (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+)))
+           (let ((wtxidp (= inv-type bl.ser:+inv-type-wtx+)))
              (unless (if (peer-wtxid-relay peer)
-                         (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
+                         (= inv-type bl.ser:+inv-type-tx+)
                          wtxidp)
                (when (and mempool
                           ;; Core requests announced txs only outside IBD —
@@ -863,8 +863,8 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
                    ;; PEER an orphan-resolution candidate: fetch the missing
                    ;; PARENTS from it, not the orphan again.
                    ((and wtxidp utxo-set
-                         (bitcoin-lisp.mempool:orphan-have
-                          (bitcoin-lisp.mempool:mempool-orphan-pool mempool)
+                         (bl.mp:orphan-have
+                          (bl.mp:mempool-orphan-pool mempool)
                           hash))
                     (%maybe-add-orphan-resolution-candidate
                      peer hash mempool utxo-set recent-rejects num-wtxid-peers))
@@ -886,13 +886,13 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
                     ;; (net_processing.cpp:6207).
                     (push (tx-request-inv hash wtxidp peer) wanted))))))))))
     (when unknown-block-hash
-      (bitcoin-lisp:log-cat "net" "inv: unknown block ~A from peer ~A — sending getheaders"
-                              (bitcoin-lisp.crypto:bytes-to-hex unknown-block-hash)
+      (bl:log-cat "net" "inv: unknown block ~A from peer ~A — sending getheaders"
+                              (bl.crypto:bytes-to-hex unknown-block-hash)
                               (peer-address peer))
       (request-headers-for-ibd peer chain-state))
     (when wanted
       (send-message peer
-                    (bitcoin-lisp.serialization:make-getdata-message
+                    (bl.ser:make-getdata-message
                      (nreverse wanted))))))
 
 ;;; Notfound handling
@@ -909,13 +909,13 @@ peer — and no bitcoin-lisp peer, see handle-getdata — ever sends a
 notfound for a block, and a peer that cannot serve one it announced is
 handled by the block-download timeout like any other stalled request."
   (let ((tx-completed nil))
-    (dolist (inv (bitcoin-lisp.serialization:parse-inv-payload payload))
-      (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
-            (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
+    (dolist (inv (bl.ser:parse-inv-payload payload))
+      (let ((inv-type (bl.ser:inv-vector-type inv))
+            (hash (bl.ser:inv-vector-hash inv)))
         (cond
-          ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+))
+          ((or (= inv-type bl.ser:+inv-type-tx+)
+               (= inv-type bl.ser:+inv-type-witness-tx+)
+               (= inv-type bl.ser:+inv-type-wtx+))
            (tx-request-notfound peer hash)
            (setf tx-completed t)))))
     ;; Fail over promptly: re-run the scheduler so another announcer's
@@ -938,7 +938,7 @@ adds the low-work anti-DoS presync gate this path previously lacked: during a
 from-genesis IBD the validated tip sits below the work floor, so
 process-headers' own gate is off and unbounded cheap headers could be
 committed to the index from announcements."
-  (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
+  (let ((headers (bl.ser:parse-headers-payload payload)))
     ;; Node lock: process-headers (inside ingest-headers-from-peer) mutates
     ;; the block index, which the RPC threads (submitheader, chain queries)
     ;; also touch under this lock — the same discipline handle-block follows.
@@ -967,13 +967,13 @@ Tip-validating a fork block was the deep-reorg wedge: its inputs live on its
 own branch, not the active UTXO set (MISSING-INPUT), and its height is not
 tip+1 (BAD-COINBASE-HEIGHT), so it was rejected before storage and PERFORM-REORG
 never received the branch's blocks."
-  (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
-         (current-best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-         (current-time (bitcoin-lisp.serialization:get-unix-time)))
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (prev-hash (bl.ser:block-header-prev-block header))
+         (current-best-hash (bl.store:best-block-hash chain-state))
+         (current-time (bl.ser:get-unix-time)))
     (flet ((%connect ()
              (multiple-value-bind (entry reorg-outcome)
-                 (bitcoin-lisp.validation:connect-block
+                 (bl.val:connect-block
                   block chain-state block-store utxo-set
                   :fee-estimator fee-estimator
                   :recent-rejects recent-rejects
@@ -1005,39 +1005,39 @@ never received the branch's blocks."
       ;; duplicate-invalid (validation.cpp:4231-4235): a block we already hold
       ;; and already marked invalid is refused outright. Without it,
       ;; invalidateblock is undone by one unsolicited block message.
-      (let ((known (bitcoin-lisp.storage:get-block-index-entry
-                    chain-state (bitcoin-lisp.serialization:block-header-hash header))))
+      (let ((known (bl.store:get-block-index-entry
+                    chain-state (bl.ser:block-header-hash header))))
         (when (and known
-                   (eq (bitcoin-lisp.storage:block-index-entry-status known) :invalid))
+                   (eq (bl.store:block-index-entry-status known) :invalid))
           (return-from accept-downloaded-block (values nil :duplicate-invalid))))
       ;; bad-prevblk (validation.cpp:4252-4255): a block building on an invalid
       ;; parent is refused before any work is done on it. This is what stops a
       ;; poisoned subtree being re-offered block by block to force the whole
       ;; doomed reorg to be attempted again -- roughly 1 MB of message buying
       ;; an unmetered amount of our validation.
-      (let ((parent (bitcoin-lisp.storage:get-block-index-entry chain-state prev-hash)))
+      (let ((parent (bl.store:get-block-index-entry chain-state prev-hash)))
         (when (and parent
-                   (eq (bitcoin-lisp.storage:block-index-entry-status parent) :invalid))
+                   (eq (bl.store:block-index-entry-status parent) :invalid))
           (return-from accept-downloaded-block (values nil :bad-prevblk))))
       (if (equalp prev-hash current-best-hash)
           ;; Extends the active tip — full validation at tip+1.
-          (let ((new-height (1+ (bitcoin-lisp.storage:current-height chain-state))))
+          (let ((new-height (1+ (bl.store:current-height chain-state))))
             (multiple-value-bind (valid error)
-                (bitcoin-lisp.validation:validate-block
+                (bl.val:validate-block
                  block chain-state utxo-set new-height current-time)
               (if valid (progn (%connect) (values t nil)) (values nil error))))
           ;; Side branch — context-free validation at the block's own height;
           ;; CONNECT-BLOCK stores it and reorgs (validating fully) when it wins.
-          (let ((prev-entry (bitcoin-lisp.storage:get-block-index-entry
+          (let ((prev-entry (bl.store:get-block-index-entry
                              chain-state prev-hash)))
             (if (null prev-entry)
                 ;; Parent header unknown: can't place the block or check its
                 ;; PoW/difficulty. Drop it (a healthy IBD has the headers first).
                 (values nil :orphan-block)
-                (let ((fork-height (1+ (bitcoin-lisp.storage:block-index-entry-height
+                (let ((fork-height (1+ (bl.store:block-index-entry-height
                                         prev-entry))))
                   (multiple-value-bind (valid error)
-                      (bitcoin-lisp.validation:validate-block
+                      (bl.val:validate-block
                        block chain-state utxo-set fork-height current-time
                        :context-free-only t)
                     (if valid (progn (%connect) (values t nil)) (values nil error))))))))))
@@ -1069,7 +1069,7 @@ reconnects already-stored descendants, the tip lands above it and we do not
 promote where Core would. Failing closed costs a little bandwidth; failing open
 sells an HB slot."
   (and (not (equalp tip-before hash))
-       (equalp (bitcoin-lisp.storage:best-block-hash chain-state) hash)))
+       (equalp (bl.store:best-block-hash chain-state) hash)))
 
 (defun handle-block (peer payload chain-state utxo-set block-store
                      &optional mempool fee-estimator &key recent-rejects peers)
@@ -1080,13 +1080,13 @@ earns consideration for high-bandwidth compact-block announcements — Core
 drives that off mapBlockSource (net_processing.cpp:2202, 2218-2223), which is
 filled for plain block messages exactly as it is for reconstructed compact
 ones, so promotion must not be a compact-block-only privilege."
-  (let ((block (bitcoin-lisp.serialization:parse-block-payload payload)))
+  (let ((block (bl.ser:parse-block-payload payload)))
     (when block
       (let ((connected
               (with-current-node-lock
-                (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-                       (hash (bitcoin-lisp.serialization:block-header-hash header))
-                       (tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
+                (let* ((header (bl.ser:bitcoin-block-header block))
+                       (hash (bl.ser:block-header-hash header))
+                       (tip-before (bl.store:best-block-hash chain-state)))
                   (multiple-value-bind (valid error)
                       (accept-downloaded-block block chain-state utxo-set block-store
                                                :mempool mempool
@@ -1097,15 +1097,15 @@ ones, so promotion must not be a compact-block-only privilege."
                        ;; Announce onward only if this block is now the active
                        ;; tip (accept may have stored a side block or reorged).
                        (when (and peers
-                                  (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+                                  (equalp (bl.store:best-block-hash chain-state)
                                           hash))
                          (relay-block header peer peers))
                        ;; Promotion needs strictly more than acceptance: the
                        ;; block must have CONNECTED (see %block-newly-connected-p).
                        (%block-newly-connected-p chain-state hash tip-before))
                       (t
-                       (bitcoin-lisp:log-warn "Block ~A rejected: ~A"
-                                              (bitcoin-lisp.crypto:bytes-to-hex hash) error)
+                       (bl:log-warn "Block ~A rejected: ~A"
+                                              (bl.crypto:bytes-to-hex hash) error)
                        (record-misbehavior peer "invalid block")
                        nil)))))))
         ;; Outside the node lock: promotion writes sendcmpct to up to two peers.
@@ -1120,7 +1120,7 @@ ones, so promotion must not be a compact-block-only privilege."
                     (peer-address-network peer-addr)))
 
 (defun relay-address (peer-addr source-peer peers
-                      &key (now (bitcoin-lisp.serialization:get-unix-time))
+                      &key (now (bl.ser:get-unix-time))
                            (max-targets 2))
   "Forward a freshly-learned address to up to MAX-TARGETS deterministically-
 chosen peers (Core RelayAddress, net_processing.cpp:2298-2337): eligibility is
@@ -1138,7 +1138,7 @@ source is marked as knowing it too). Returns the number of peers sent to."
          (day (floor now 86400))
          (sent 0))
     (when source-peer
-      (bitcoin-lisp:add-recent-reject (peer-known-addrs source-peer) key))
+      (bl:add-recent-reject (peer-known-addrs source-peer) key))
     (let ((ranked
             (sort
              (loop for p in peers
@@ -1150,13 +1150,13 @@ source is marked as knowing it too). Returns the number of peers sent to."
                              ;; receives no gossip.
                              (peer-addr-relay-enabled p)
                              (or (peer-wants-addrv2 p)
-                                 (bitcoin-lisp.serialization:v1-compatible-network-p
+                                 (bl.ser:v1-compatible-network-p
                                   network)))
                      collect (cons (let* ((material (concatenate '(vector (unsigned-byte 8))
                                                                  key
                                                                  (int-to-le-bytes day 8)
                                                                  (int-to-le-bytes (peer-id p) 8)))
-                                          (h (bitcoin-lisp.crypto:sha256 material)))
+                                          (h (bl.crypto:sha256 material)))
                                      (loop for i below 8 sum (ash (aref h i) (* 8 i))))
                                    p))
              #'> :key #'car)))
@@ -1166,8 +1166,8 @@ source is marked as knowing it too). Returns the number of peers sent to."
       ;; fan-out.
       (loop for (nil . p) in ranked
             while (< sent max-targets)
-            unless (bitcoin-lisp:recent-reject-p (peer-known-addrs p) key)
-              do (bitcoin-lisp:add-recent-reject (peer-known-addrs p) key)
+            unless (bl:recent-reject-p (peer-known-addrs p) key)
+              do (bl:add-recent-reject (peer-known-addrs p) key)
                  (let ((msg (build-addr-response p (list peer-addr))))
                    (when msg (send-message p msg)))
                  (incf sent)))
@@ -1216,8 +1216,8 @@ second test cannot rescue an address the first rejects — the desirable set
 always contains NODE_NETWORK or NODE_NETWORK_LIMITED
 (GetDesirableServiceFlags, net_processing.cpp:1759-1768) — so the pair reduces
 to this one bit test."
-  (logtest services (logior bitcoin-lisp.serialization:+node-network+
-                            bitcoin-lisp.serialization:+node-network-limited+)))
+  (logtest services (logior bl.ser:+node-network+
+                            bl.ser:+node-network-limited+)))
 
 (defun %ingest-gossiped-address (net-addr timestamp address-book source-group now
                                  &optional source-net source-ip)
@@ -1241,17 +1241,17 @@ RELAY-ENTRY a (peer-address . max-targets) cons when the address should be
 gossiped onward."
   (unless (and address-book timestamp
                (may-have-useful-address-db-p
-                (bitcoin-lisp.serialization:net-addr-services net-addr)))
+                (bl.ser:net-addr-services net-addr)))
     (return-from %ingest-gossiped-address (values 0 nil)))
   (let* ((time (if (or (<= timestamp +addr-time-init+)
                        (> timestamp (+ now 600)))
                    (max 0 (- now +addr-absurd-time-replacement-seconds+))
                    timestamp))
          (pa (make-peer-address
-              :net (bitcoin-lisp.serialization:net-addr-net net-addr)
-              :ip (bitcoin-lisp.serialization:net-addr-ip net-addr)
-              :port (bitcoin-lisp.serialization:net-addr-port net-addr)
-              :services (bitcoin-lisp.serialization:net-addr-services net-addr)
+              :net (bl.ser:net-addr-net net-addr)
+              :ip (bl.ser:net-addr-ip net-addr)
+              :port (bl.ser:net-addr-port net-addr)
+              :services (bl.ser:net-addr-services net-addr)
               :last-seen time))
          (network (peer-address-network pa))
          (reachable (reachable-network-p network))
@@ -1301,7 +1301,7 @@ onward; a non-full message marks our outstanding getaddr answered. Returns
 the number stored."
   (multiple-value-bind (source-net source-ip source-group)
       (peer-source-address peer)
-    (let* ((now (bitcoin-lisp.serialization:get-unix-time))
+    (let* ((now (bl.ser:get-unix-time))
            ;; Read before the end-of-message reset below, like Core (the reset
            ;; runs after the loop): a getaddr response never relays onward.
            (unsolicited (not (and peer (peer-getaddr-requested peer))))
@@ -1333,11 +1333,11 @@ the number stored."
         (incf (peer-addr-processed peer) num-proc)
         (incf (peer-addr-rate-limited peer) num-rate-limit)
         (when (plusp num-rate-limit)
-          (bitcoin-lisp:log-cat "net" "addr from peer ~A: ~D processed, ~D rate-limited"
+          (bl:log-cat "net" "addr from peer ~A: ~D processed, ~D rate-limited"
                                 (peer-address peer) num-proc num-rate-limit))
         ;; A non-full message answers our getaddr (Core: "if (vAddr.size() <
         ;; 1000) peer.m_getaddr_sent = false", net_processing.cpp:4116).
-        (when (< announced-count bitcoin-lisp.serialization:+max-addr-count+)
+        (when (< announced-count bl.ser:+max-addr-count+)
           (setf (peer-getaddr-requested peer) nil))
         ;; An addr-fetch connection (-seednode) exists ONLY to collect
         ;; addresses: once it has delivered some, it is done (Core
@@ -1345,7 +1345,7 @@ the number stored."
         ;; so a peer that merely self-announces does not end the fetch.
         (when (and (eq (peer-conn-type peer) :addr-fetch)
                    (> announced-count 1))
-          (bitcoin-lisp:log-cat "net" "addrfetch connection completed, disconnecting ~A"
+          (bl:log-cat "net" "addrfetch connection completed, disconnecting ~A"
                                 (peer-address peer))
           (disconnect-peer peer)))
       (when (and peers unsolicited (<= announced-count 10))
@@ -1363,7 +1363,7 @@ from a block-relay-only peer (Core SetupAddressRelay,
 net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
 (net_processing.cpp:4046-4050)."
   (when (and peer (eq (peer-conn-type peer) :block-relay))
-    (bitcoin-lisp:log-cat "net" "ignoring addr message from block-relay-only peer ~A"
+    (bl:log-cat "net" "ignoring addr message from block-relay-only peer ~A"
                           (peer-address peer))
     (return-from handle-addr 0))
   ;; First addr-related message from an inbound peer enables address relay
@@ -1372,20 +1372,20 @@ net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
   (let ((entries '())
         (msg-count 0))
     (flexi-streams:with-input-from-sequence (stream payload)
-      (let ((count (bitcoin-lisp.serialization:read-compact-size stream)))
-        (when (> count bitcoin-lisp.serialization:+max-addr-count+)
+      (let ((count (bl.ser:read-compact-size stream)))
+        (when (> count bl.ser:+max-addr-count+)
           (when peer
             (record-misbehavior peer (format nil "addr message size = ~D" count)))
           (return-from handle-addr 0))
         (setf msg-count count)
         (loop repeat count
               do (multiple-value-bind (net-addr timestamp)
-                     (bitcoin-lisp.serialization:read-net-addr stream :with-timestamp t)
+                     (bl.ser:read-net-addr stream :with-timestamp t)
                    (push (cons net-addr timestamp) entries)))))
     (let ((added (%process-gossiped-addresses peer (nreverse entries) msg-count
                                               address-book peers)))
       (when (and address-book (> added 0))
-        (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addr message" added))
+        (bl:log-cat "net" "Added ~D peer addresses from addr message" added))
       added)))
 
 ;;; ADDRv2 handling (BIP 155)
@@ -1401,14 +1401,14 @@ already skipped by the codec; a count above 1000 fails parsing (Core
 Misbehaving path — the caller disconnects). Ignored entirely from a
 block-relay-only peer (Core SetupAddressRelay)."
   (when (and peer (eq (peer-conn-type peer) :block-relay))
-    (bitcoin-lisp:log-cat "net" "ignoring addrv2 message from block-relay-only peer ~A"
+    (bl:log-cat "net" "ignoring addrv2 message from block-relay-only peer ~A"
                           (peer-address peer))
     (return-from handle-addrv2 0))
   ;; First addr-related message from an inbound peer enables address relay
   ;; (Core SetupAddressRelay; getpeerinfo addr_relay_enabled).
   (when peer (setf (peer-addr-relay-enabled peer) t))
   (multiple-value-bind (entries announced-count)
-      (bitcoin-lisp.serialization:parse-addrv2-payload payload)
+      (bl.ser:parse-addrv2-payload payload)
     (let ((added (%process-gossiped-addresses
                   peer
                   (mapcar (lambda (entry)
@@ -1418,7 +1418,7 @@ block-relay-only peer (Core SetupAddressRelay)."
                           entries)
                   announced-count address-book peers)))
       (when (and address-book (> added 0))
-        (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addrv2 message" added))
+        (bl:log-cat "net" "Added ~D peer addresses from addrv2 message" added))
       added)))
 
 ;;; Transaction handling
@@ -1468,17 +1468,17 @@ callers this node has (txdownloadman_impl.cpp:350-484):
   - Everything else is cached in the main filter under the WTXID only —
     the witness is malleable (Core issue #8279) — plus the TXID for
     :nonstandard-inputs, a failure that depends only on the txid (:471-484)."
-  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
-        (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+  (let ((txid (bl.ser:transaction-hash tx))
+        (wtxid (bl.ser:transaction-wtxid tx)))
     (cond
       ((eq reason :missing-input) nil)
       ((eq reason :witness-stripped) nil)
       ((%reconsiderable-failure-p reason)
-       (bitcoin-lisp.validation:add-reconsiderable-reject wtxid))
+       (bl.val:add-reconsiderable-reject wtxid))
       (t
-       (bitcoin-lisp:add-recent-reject recent-rejects wtxid)
+       (bl:add-recent-reject recent-rejects wtxid)
        (when (and (eq reason :nonstandard-inputs) (not (equalp wtxid txid)))
-         (bitcoin-lisp:add-recent-reject recent-rejects txid))))))
+         (bl:add-recent-reject recent-rejects txid))))))
 
 (defun process-orphans (accepted-txid utxo-set mempool chain-state peers
                         &key recent-rejects)
@@ -1487,37 +1487,37 @@ orphans that depend on it; accept+relay any now valid, drop those now invalid,
 and recurse on newly-accepted txs so a parent can unblock a whole chain.
 The orphanage is wtxid-keyed (Core TxOrphanage); children reference parents
 by TXID, so the cascade work list carries txids."
-  (let ((pool (bitcoin-lisp.mempool:mempool-orphan-pool mempool))
+  (let ((pool (bl.mp:mempool-orphan-pool mempool))
         (work (list accepted-txid)))
     (loop while work do
       (let ((ptxid (pop work)))
-        (dolist (owtxid (bitcoin-lisp.mempool:orphans-depending-on pool ptxid))
-          (let ((otx (bitcoin-lisp.mempool:orphan-tx pool owtxid)))
+        (dolist (owtxid (bl.mp:orphans-depending-on pool ptxid))
+          (let ((otx (bl.mp:orphan-tx pool owtxid)))
             (when otx
-              (let ((otxid (bitcoin-lisp.serialization:transaction-hash otx))
-                    (current-height (bitcoin-lisp.storage:current-height chain-state)))
+              (let ((otxid (bl.ser:transaction-hash otx))
+                    (current-height (bl.store:current-height chain-state)))
                 (multiple-value-bind (valid error fee replaced sigops)
                     ;; Uncache on rejection (Core validation.cpp:1787-1790).
-                    (bitcoin-lisp.storage:with-coins-to-uncache (utxo-set)
-                      (bitcoin-lisp.validation:validate-transaction-for-mempool
+                    (bl.store:with-coins-to-uncache (utxo-set)
+                      (bl.val:validate-transaction-for-mempool
                        otx utxo-set mempool current-height :chain-state chain-state))
                   (cond
                     (valid
                      (multiple-value-bind (result entry)
-                         (bitcoin-lisp.mempool:accept-validated-tx
+                         (bl.mp:accept-validated-tx
                           mempool otxid otx fee current-height
                           :sigops sigops :replaced replaced)
                        (when (eq :ok result)
-                         (bitcoin-lisp.mempool:orphan-remove pool owtxid)
+                         (bl.mp:orphan-remove pool owtxid)
                          (when peers
-                           (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry)))
+                           (let ((vsize (bl.mp:mempool-entry-vsize entry)))
                              (relay-transaction
                               otxid nil peers
                               :fee-rate (if (plusp vsize) (floor fee vsize) 0)
                               :wtxid owtxid)))
                          (push otxid work))))   ; cascade to this tx's dependents
                     ((eq error :missing-input) nil)   ; still missing another parent
-                    (t (bitcoin-lisp.mempool:orphan-remove pool owtxid)  ; now invalid
+                    (t (bl.mp:orphan-remove pool owtxid)  ; now invalid
                        ;; Same insertion rules as handle-tx — Core routes
                        ;; orphan re-validation failures through the same
                        ;; MempoolRejectedTx. This is Core's
@@ -1532,13 +1532,13 @@ txdownloadman_impl.cpp:333-348, minus the already-have filter its callers
 apply)."
   (let ((seen (make-hash-table :test 'equalp))
         (parents '()))
-    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-             (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
-             (pidx (bitcoin-lisp.serialization:outpoint-index prevout)))
+    (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+      (let* ((prevout (bl.ser:tx-in-previous-output input))
+             (ptxid (bl.ser:outpoint-hash prevout))
+             (pidx (bl.ser:outpoint-index prevout)))
         (unless (or (gethash ptxid seen)
-                    (bitcoin-lisp.storage:get-utxo utxo-set ptxid pidx)
-                    (bitcoin-lisp.mempool:mempool-has mempool ptxid))
+                    (bl.store:get-utxo utxo-set ptxid pidx)
+                    (bl.mp:mempool-has mempool ptxid))
           (setf (gethash ptxid seen) t)
           (push ptxid parents))))
     (nreverse parents)))
@@ -1581,7 +1581,7 @@ over like any other (Core routes them through the same m_txrequest)."
         (push (tx-request-inv ptxid nil peer) invs)))
     (setf invs (nreverse invs))
     (when invs
-      (send-message peer (bitcoin-lisp.serialization:make-getdata-message invs)))
+      (send-message peer (bl.ser:make-getdata-message invs)))
     (or invs t)))
 
 ;;; --- Opportunistic 1-parent-1-child package relay ---
@@ -1602,19 +1602,19 @@ the P2P path (Core ProcessValidTx -> MempoolAcceptedTx,
 txdownloadman_impl.cpp:323-333): forget it as an orphan, relay it, and run
 the de-orphan cascade over the children waiting on it. PEER is the source,
 excluded from relay."
-  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
-        (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+  (let ((txid (bl.ser:transaction-hash tx))
+        (wtxid (bl.ser:transaction-wtxid tx)))
     ;; It may have been in our orphanage (announced by another peer, or held
     ;; while a parent was fetched); Core's EraseTx is a no-op otherwise.
-    (bitcoin-lisp.mempool:orphan-remove
-     (bitcoin-lisp.mempool:mempool-orphan-pool mempool) wtxid)
+    (bl.mp:orphan-remove
+     (bl.mp:mempool-orphan-pool mempool) wtxid)
     ;; The entry carries the fee and the sigop-adjusted vsize the feefilter
     ;; gate needs; read it from the pool rather than threading it, so the
     ;; package path (which has no entry in hand) shares this tail.
-    (let ((entry (and peers (bitcoin-lisp.mempool:mempool-get mempool txid))))
+    (let ((entry (and peers (bl.mp:mempool-get mempool txid))))
       (when entry
-        (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry))
-              (fee (bitcoin-lisp.mempool:mempool-entry-fee entry)))
+        (let ((vsize (bl.mp:mempool-entry-vsize entry))
+              (fee (bl.mp:mempool-entry-fee entry)))
           (relay-transaction txid peer peers
                              :fee-rate (if (plusp vsize) (floor fee vsize) 0)
                              :wtxid wtxid))))
@@ -1627,14 +1627,14 @@ announced BY PEER that spends PARENT-TX and whose pairing with it is not
 already known to fail — the package hash in the reconsiderable filter, or
 the child's TXID in the main rejects filter. Returns the child transaction,
 or NIL when there is no eligible candidate."
-  (let ((pool (bitcoin-lisp.mempool:mempool-orphan-pool mempool)))
-    (dolist (child (bitcoin-lisp.mempool:orphan-children-from-peer
+  (let ((pool (bl.mp:mempool-orphan-pool mempool)))
+    (dolist (child (bl.mp:orphan-children-from-peer
                     pool parent-tx peer))
-      (unless (or (bitcoin-lisp.validation:reconsiderable-reject-p
-                   (bitcoin-lisp.validation:package-hash (list parent-tx child)))
-                  (bitcoin-lisp:recent-reject-p
+      (unless (or (bl.val:reconsiderable-reject-p
+                   (bl.val:package-hash (list parent-tx child)))
+                  (bl:recent-reject-p
                    recent-rejects
-                   (bitcoin-lisp.serialization:transaction-hash child)))
+                   (bl.ser:transaction-hash child)))
         (return child)))))
 
 (defun %try-1p1c-package (peer parent-tx utxo-set mempool chain-state peers
@@ -1660,17 +1660,17 @@ black-hole an honest CPFP child after a single lost package attempt."
     (when child
       (let ((package (list parent-tx child)))
         (multiple-value-bind (msg results)
-            (bitcoin-lisp.validation:validate-package-for-mempool
+            (bl.val:validate-package-for-mempool
              package utxo-set mempool chain-state)
-          (bitcoin-lisp:log-cat "mempool" "1p1c package evaluation: ~A" msg)
+          (bl:log-cat "mempool" "1p1c package evaluation: ~A" msg)
           (unless (eq msg :success)
-            (bitcoin-lisp.validation:add-reconsiderable-reject
-             (bitcoin-lisp.validation:package-hash package)))
+            (bl.val:add-reconsiderable-reject
+             (bl.val:package-hash package)))
           ;; RESULTS is in package order; walk it backwards.
           (loop for tx in (reverse package)
                 for res in (reverse results)
-                do (let ((err (bitcoin-lisp.validation:package-tx-result-error res)))
-                     (case (bitcoin-lisp.validation:package-tx-result-status res)
+                do (let ((err (bl.val:package-tx-result-error res)))
+                     (case (bl.val:package-tx-result-status res)
                        (:valid
                         (%after-mempool-accept tx peer peers utxo-set mempool
                                                chain-state recent-rejects))
@@ -1689,9 +1689,9 @@ black-hole an honest CPFP child after a single lost package attempt."
                         ;; (txdownloadman_impl.cpp:361-364, :489-492).
                         (%cache-tx-rejection tx err recent-rejects)
                         (unless (eq err :missing-input)
-                          (bitcoin-lisp.mempool:orphan-remove
-                           (bitcoin-lisp.mempool:mempool-orphan-pool mempool)
-                           (bitcoin-lisp.serialization:transaction-wtxid tx))))
+                          (bl.mp:orphan-remove
+                           (bl.mp:mempool-orphan-pool mempool)
+                           (bl.ser:transaction-wtxid tx))))
                        ;; :not-validated — a context-free package check
                        ;; (well-formedness, child-with-parents) failed before
                        ;; any member was processed. Core's ProcessNewPackage
@@ -1715,9 +1715,9 @@ PARENT-TXIDS are already the parents missing from both the UTXO set and the
 mempool, which subsumes Core's `!m_opts.m_mempool.exists(parent_txid)` guard."
   (let ((reconsiderable 0))
     (dolist (ptxid parent-txids nil)
-      (cond ((bitcoin-lisp:recent-reject-p recent-rejects ptxid)
+      (cond ((bl:recent-reject-p recent-rejects ptxid)
              (return t))
-            ((bitcoin-lisp.validation:reconsiderable-reject-p ptxid)
+            ((bl.val:reconsiderable-reject-p ptxid)
              (when (> (incf reconsiderable) 1)
                (return t)))))))
 
@@ -1737,17 +1737,17 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
   (when (or (and (ignore-incoming-txs-p)
                  (not (peer-has-permission-p peer +perm-relay+)))
             (not (peer-relays-txs-p peer)))
-    (bitcoin-lisp:log-cat "net" "transaction sent in violation of protocol — disconnecting peer ~A"
+    (bl:log-cat "net" "transaction sent in violation of protocol — disconnecting peer ~A"
                           (peer-address peer))
     (disconnect-peer peer)
     (return-from handle-tx nil))
   (handler-case
-      (let ((tx (bitcoin-lisp.serialization:parse-tx-payload payload)))
+      (let ((tx (bl.ser:parse-tx-payload payload)))
         (when tx
           (with-current-node-lock
-            (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
-                  (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))
-                  (current-height (bitcoin-lisp.storage:current-height chain-state)))
+            (let ((txid (bl.ser:transaction-hash tx))
+                  (wtxid (bl.ser:transaction-wtxid tx))
+                  (current-height (bl.store:current-height chain-state)))
               ;; The requested tx arrived — clear its in-flight/announcer
               ;; tracking. MSG_WTX announcements are tracked under the wtxid,
               ;; so clear that key too (txids and wtxids never collide; for
@@ -1756,17 +1756,17 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
               (unless (equalp wtxid txid)
                 (tx-request-received wtxid))
               ;; Mark as announced by this peer (bounded set)
-              (bitcoin-lisp:add-recent-reject (peer-announced-txs peer) txid)
+              (bl:add-recent-reject (peer-announced-txs peer) txid)
               ;; Check recent rejects and recently-confirmed before expensive
               ;; validation (Core's AlreadyHaveTx at tx receipt). The rejects
               ;; filter is wtxid-keyed (Core m_lazy_recent_rejects); txid
               ;; entries exist only where Core adds them too, so check both
               ;; ids. Freshly-confirmed txs (still relaying through the
               ;; network) are dropped without being treated as rejects.
-              (when (or (bitcoin-lisp:recent-reject-p recent-rejects wtxid)
-                        (bitcoin-lisp:recent-reject-p recent-rejects txid)
-                        (bitcoin-lisp.validation:recently-confirmed-p wtxid)
-                        (bitcoin-lisp.validation:recently-confirmed-p txid))
+              (when (or (bl:recent-reject-p recent-rejects wtxid)
+                        (bl:recent-reject-p recent-rejects txid)
+                        (bl.val:recently-confirmed-p wtxid)
+                        (bl.val:recently-confirmed-p txid))
                 (return-from handle-tx nil))
               ;; Already known to fail RECONSIDERABLY (too-low feerate, RBF
               ;; economics, mempool full): do not submit it alone again — but
@@ -1774,7 +1774,7 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
               ;; an orphan, which is how a CPFP package whose two halves
               ;; arrive separately gets assembled (Core ReceivedTx's second
               ;; branch, txdownloadman_impl.cpp:544-551).
-              (when (bitcoin-lisp.validation:reconsiderable-reject-p wtxid)
+              (when (bl.val:reconsiderable-reject-p wtxid)
                 (%try-1p1c-package peer tx utxo-set mempool chain-state peers
                                    recent-rejects)
                 (return-from handle-tx nil))
@@ -1786,8 +1786,8 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
               ;; amplification is several times the bandwidth and is held for
               ;; a whole inter-block interval (Core validation.cpp:1787-1790).
               (multiple-value-bind (valid error fee replaced sigops)
-                  (bitcoin-lisp.storage:with-coins-to-uncache (utxo-set)
-                    (bitcoin-lisp.validation:validate-transaction-for-mempool
+                  (bl.store:with-coins-to-uncache (utxo-set)
+                    (bl.val:validate-transaction-for-mempool
                      tx utxo-set mempool current-height :chain-state chain-state))
                 (unless valid
                   (cond
@@ -1804,11 +1804,11 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                      (let ((parents (missing-parent-txids tx utxo-set mempool)))
                        (if (%orphan-parents-rejected-p parents recent-rejects)
                            (progn
-                             (bitcoin-lisp:add-recent-reject recent-rejects txid)
-                             (bitcoin-lisp:add-recent-reject recent-rejects wtxid))
+                             (bl:add-recent-reject recent-rejects txid)
+                             (bl:add-recent-reject recent-rejects wtxid))
                            (progn
-                             (bitcoin-lisp.mempool:orphan-add
-                              (bitcoin-lisp.mempool:mempool-orphan-pool mempool) tx peer)
+                             (bl.mp:orphan-add
+                              (bl.mp:mempool-orphan-pool mempool) tx peer)
                              (request-orphan-parents
                               peer parents (count-wtxid-relay-peers peers))))))
                     (t
@@ -1828,7 +1828,7 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                        (%try-1p1c-package peer tx utxo-set mempool chain-state
                                           peers recent-rejects)))))
                 (when valid
-                  (let ((result (bitcoin-lisp.mempool:accept-validated-tx
+                  (let ((result (bl.mp:accept-validated-tx
                                  mempool txid tx fee current-height
                                  :sigops sigops :replaced replaced)))
                     (cond
@@ -1837,7 +1837,7 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                        ;; stamped only on mempool ACCEPTANCE,
                        ;; net_processing.cpp:4540).
                        (setf (peer-last-tx-time peer)
-                             (bitcoin-lisp.serialization:get-unix-time))
+                             (bl.ser:get-unix-time))
                        ;; Relay, de-orphan, cascade.
                        (%after-mempool-accept tx peer peers utxo-set mempool
                                               chain-state recent-rejects))
@@ -1880,10 +1880,10 @@ This is the half of the staleness test that a timestamp cannot forge. A header's
 nTime is attacker-influenced within the median-time-past and 2-hour windows, so
 an age test on timestamps alone can be talked out of; the work difference
 cannot be."
-  (let* ((tip-proof (max 1 (bitcoin-lisp.storage:calculate-chain-work tip-bits 0)))
+  (let* ((tip-proof (max 1 (bl.store:calculate-chain-work tip-bits 0)))
          (sign (if (> to-work from-work) 1 -1))
          (r (abs (- to-work from-work)))
-         (spacing bitcoin-lisp::+pow-target-spacing-seconds+))
+         (spacing bl::+pow-target-spacing-seconds+))
     (* sign (floor (* r spacing) tip-proof))))
 
 (defun %block-request-allowed-p (chain-state entry best-header)
@@ -1892,25 +1892,25 @@ cannot be."
 A block on the ACTIVE chain is always servable. Anything else is servable only
 while it is recent by BOTH measures — wall-clock age and work-equivalent age —
 because an old side-chain block is a fingerprint, not a service."
-  (let* ((height (bitcoin-lisp.storage:block-index-entry-height entry))
-         (active (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+  (let* ((height (bl.store:block-index-entry-height entry))
+         (active (bl.store:get-block-at-height chain-state height)))
     (when (and active
-               (equalp (bitcoin-lisp.storage:block-index-entry-hash active)
-                       (bitcoin-lisp.storage:block-index-entry-hash entry)))
+               (equalp (bl.store:block-index-entry-hash active)
+                       (bl.store:block-index-entry-hash entry)))
       (return-from %block-request-allowed-p t))
-    (let ((header (bitcoin-lisp.storage:block-index-entry-header entry))
+    (let ((header (bl.store:block-index-entry-header entry))
           (best-hdr (and best-header
-                         (bitcoin-lisp.storage:block-index-entry-header best-header))))
+                         (bl.store:block-index-entry-header best-header))))
       (and header best-hdr
            ;; Core also requires BLOCK_VALID_SCRIPTS; :valid is our equivalent.
-           (eq (bitcoin-lisp.storage:block-index-entry-status entry) :valid)
-           (< (- (bitcoin-lisp.serialization:block-header-timestamp best-hdr)
-                 (bitcoin-lisp.serialization:block-header-timestamp header))
+           (eq (bl.store:block-index-entry-status entry) :valid)
+           (< (- (bl.ser:block-header-timestamp best-hdr)
+                 (bl.ser:block-header-timestamp header))
               +stale-relay-age-limit+)
            (< (%block-proof-equivalent-time
-               (bitcoin-lisp.storage:block-index-entry-chain-work best-header)
-               (bitcoin-lisp.storage:block-index-entry-chain-work entry)
-               (bitcoin-lisp.serialization:block-header-bits best-hdr))
+               (bl.store:block-index-entry-chain-work best-header)
+               (bl.store:block-index-entry-chain-work entry)
+               (bl.ser:block-header-bits best-hdr))
               +stale-relay-age-limit+)))))
 
 (defun %below-network-limited-threshold-p (chain-state entry)
@@ -1923,10 +1923,10 @@ node actually kept — which is its prune configuration. Core's two-block buffer
 is kept: without it a race against a tip advance turns a legitimate request
 into a disconnect."
   (let ((services (local-services)))
-    (and (plusp (logand services bitcoin-lisp.serialization:+node-network-limited+))
-         (zerop (logand services bitcoin-lisp.serialization:+node-network+))
-         (let ((tip-height (bitcoin-lisp.storage::chain-state-best-height chain-state))
-               (height (bitcoin-lisp.storage:block-index-entry-height entry)))
+    (and (plusp (logand services bl.ser:+node-network-limited+))
+         (zerop (logand services bl.ser:+node-network+))
+         (let ((tip-height (bl.store::chain-state-best-height chain-state))
+               (height (bl.store:block-index-entry-height entry)))
            (> (- tip-height height) (+ +node-network-limited-min-blocks+ 2))))))
 
 (defconstant +max-blocks-served-per-getdata+ 500
@@ -1948,14 +1948,14 @@ block intervals. The depth rule below is expressed relative to OUR tip, so it
 only means \"a recent block\" while this holds — on a node in IBD or catching
 up, five blocks below a stale tip can be years old, which is exactly the case
 Core refuses to build a compact block for."
-  (let* ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-         (tip (and tip-hash (bitcoin-lisp.storage:get-block-index-entry
+  (let* ((tip-hash (bl.store:best-block-hash chain-state))
+         (tip (and tip-hash (bl.store:get-block-index-entry
                              chain-state tip-hash))))
     (and tip
-         (> (bitcoin-lisp.serialization:block-header-timestamp
-             (bitcoin-lisp.storage:block-index-entry-header tip))
-            (- (bitcoin-lisp.serialization:get-unix-time)
-               (* 20 bitcoin-lisp::+pow-target-spacing-seconds+))))))
+         (> (bl.ser:block-header-timestamp
+             (bl.store:block-index-entry-header tip))
+            (- (bl.ser:get-unix-time)
+               (* 20 bl::+pow-target-spacing-seconds+))))))
 
 (defun %serve-compact-p (chain-state entry)
   "T when a MSG_CMPCT_BLOCK request for ENTRY should be answered compactly:
@@ -1965,8 +1965,8 @@ unable to reconstruct it — its mempool holds nothing that old — so the compa
 form would waste the construction on both ends."
   (and entry
        (%can-direct-fetch-p chain-state)
-       (>= (bitcoin-lisp.storage:block-index-entry-height entry)
-           (- (bitcoin-lisp.storage:current-height chain-state)
+       (>= (bl.store:block-index-entry-height entry)
+           (- (bl.store:current-height chain-state)
               +max-cmpctblock-depth+))))
 
 (defconstant +historical-block-age-seconds+ (* 7 24 60 60)
@@ -1981,7 +1981,7 @@ Blocks are served from BLOCK-STORE — MSG_BLOCK legacy, MSG_WITNESS_BLOCK with
 witness — so the node is a serving peer, not just a leech. A requested block we
 do not have on disk (pruned or unknown) is silently skipped, like Bitcoin Core's
 handling of unavailable blocks."
-  (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload))
+  (let ((inv-vectors (bl.ser:parse-inv-payload payload))
         (blocks-served 0)
         (not-found '())
         ;; Computed at most once per getdata, and only if an off-chain block is
@@ -1992,7 +1992,7 @@ handling of unavailable blocks."
              (when (eq best-header :unset)
                (setf best-header
                      (and chain-state
-                          (bitcoin-lisp.storage:best-header-entry chain-state))))
+                          (bl.store:best-header-entry chain-state))))
              best-header))
     (dolist (inv inv-vectors)
       ;; Stop serving a send-paused peer (its outgoing buffer is over the
@@ -2004,8 +2004,8 @@ handling of unavailable blocks."
       (let ((conn (peer-connection peer)))
         (when (and conn (connection-send-paused-p conn))
           (return)))
-      (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
-            (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
+      (let ((inv-type (bl.ser:inv-vector-type inv))
+            (hash (bl.ser:inv-vector-hash inv)))
         (cond
           ;; Transaction request - only respond if relay is enabled. Resolve the
           ;; hash by the id its inv type implies: MSG_TX by txid (legacy
@@ -2014,9 +2014,9 @@ handling of unavailable blocks."
           ;; wtxid under MSG_WITNESS_TX: our pre-BIP339-fix versions announced
           ;; wtxids under that type, and txids and wtxids never collide, so
           ;; trying both is safe (kept for peers echoing those old requests).
-          ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+))
+          ((or (= inv-type bl.ser:+inv-type-tx+)
+               (= inv-type bl.ser:+inv-type-witness-tx+)
+               (= inv-type bl.ser:+inv-type-wtx+))
            (cond
              ;; No tx-relay state with this peer (its version had fRelay=0, or
              ;; a block-relay/feeler conn): ignore the request entirely — not
@@ -2026,13 +2026,13 @@ handling of unavailable blocks."
              (t
               (let* ((entry (when (and mempool (relay-enabled-p))
                               (cond
-                                ((= inv-type bitcoin-lisp.serialization:+inv-type-wtx+)
-                                 (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash))
-                                ((= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
-                                 (bitcoin-lisp.mempool:mempool-get mempool hash))
+                                ((= inv-type bl.ser:+inv-type-wtx+)
+                                 (bl.mp:mempool-get-by-wtxid mempool hash))
+                                ((= inv-type bl.ser:+inv-type-tx+)
+                                 (bl.mp:mempool-get mempool hash))
                                 (t
-                                 (or (bitcoin-lisp.mempool:mempool-get mempool hash)
-                                     (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash))))))
+                                 (or (bl.mp:mempool-get mempool hash)
+                                     (bl.mp:mempool-get-by-wtxid mempool hash))))))
                      ;; Anti-probing gate (Core FindTxForGetData ->
                      ;; info_for_relay, net_processing.cpp:2496-2505): serve a
                      ;; mempool tx only if it entered the pool BEFORE our last
@@ -2041,27 +2041,27 @@ handling of unavailable blocks."
                      ;; peer is probing mempool contents: notfound.
                      (tx (cond
                            ((and entry
-                                 (< (bitcoin-lisp.mempool:mempool-entry-sequence entry)
+                                 (< (bl.mp:mempool-entry-sequence entry)
                                     (peer-last-inv-sequence peer)))
-                            (bitcoin-lisp.mempool:mempool-entry-transaction entry))
+                            (bl.mp:mempool-entry-transaction entry))
                            ;; Or it might be from the most recent block (Core
                            ;; m_most_recent_block_txs, keyed by txid AND
                            ;; wtxid) — freshly-confirmed txs stay servable.
-                           (t (bitcoin-lisp.validation:most-recent-block-tx hash)))))
+                           (t (bl.val:most-recent-block-tx hash)))))
                 (cond
                   (tx
                    (send-message peer
-                                 (bitcoin-lisp.serialization:make-tx-message
+                                 (bl.ser:make-tx-message
                                   tx
-                                  :witness (/= inv-type bitcoin-lisp.serialization:+inv-type-tx+)))
+                                  :witness (/= inv-type bl.ser:+inv-type-tx+)))
                    ;; A peer requesting the tx is the proof our announcement
                    ;; propagated: drop it from the unbroadcast set (Core
                    ;; ProcessGetData, net_processing.cpp:2550 — on EVERY
                    ;; successful serve, either source).
                    (when mempool
-                     (bitcoin-lisp.mempool:mempool-remove-unbroadcast
+                     (bl.mp:mempool-remove-unbroadcast
                       mempool
-                      (bitcoin-lisp.serialization:transaction-hash tx))))
+                      (bl.ser:transaction-hash tx))))
                   (t
                    ;; Core accumulates vNotFound for txs it can't serve so the
                    ;; requester re-routes immediately instead of timing out.
@@ -2069,12 +2069,12 @@ handling of unavailable blocks."
           ;; Block request — served from disk (witness-aware). MSG_CMPCT_BLOCK
           ;; takes the same path and the same guards, as Core's
           ;; ProcessGetBlockData does, and differs only in what is sent.
-          ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-cmpct-block+))
+          ((or (= inv-type bl.ser:+inv-type-block+)
+               (= inv-type bl.ser:+inv-type-witness-block+)
+               (= inv-type bl.ser:+inv-type-cmpct-block+))
            (when (and block-store (< blocks-served +max-blocks-served-per-getdata+))
              (let ((entry (and chain-state
-                               (bitcoin-lisp.storage:get-block-index-entry
+                               (bl.store:get-block-index-entry
                                 chain-state hash))))
                (cond
                  ;; Unknown to the index: nothing to reason about, and Core's
@@ -2084,7 +2084,7 @@ handling of unavailable blocks."
                  ;; not served at all (Core BlockRequestAllowed).
                  ((and entry (not (%block-request-allowed-p chain-state entry
                                                             (best-header))))
-                  (bitcoin-lisp:log-cat
+                  (bl:log-cat
                    "net" "getdata: ignoring request from ~A for an old block ~
                           that is not on the main chain"
                    (peer-address peer)))
@@ -2096,17 +2096,17 @@ handling of unavailable blocks."
                  ;; following the tip is unaffected, and a peer holding the
                  ;; "download" permission may exceed the target outright.
                  ((and entry
-                       (bitcoin-lisp.networking::outbound-target-reached-p t)
+                       (bl.net::outbound-target-reached-p t)
                        (not (peer-has-permission-p peer +perm-download+))
                        (let ((best (best-header)))
                          (flet ((btime (e)
-                                  (let ((h (bitcoin-lisp.storage:block-index-entry-header e)))
-                                    (and h (bitcoin-lisp.serialization:block-header-timestamp h)))))
+                                  (let ((h (bl.store:block-index-entry-header e)))
+                                    (and h (bl.ser:block-header-timestamp h)))))
                            (let ((bt (and best (btime best)))
                                  (et (btime entry)))
                              (and bt et
                                   (> (- bt et) +historical-block-age-seconds+))))))
-                  (bitcoin-lisp:log-cat
+                  (bl:log-cat
                    "net" "historical block serving limit reached, disconnecting ~A"
                    (peer-address peer))
                   (disconnect-peer peer)
@@ -2115,38 +2115,38 @@ handling of unavailable blocks."
                  ;; a peer left waiting for a block we will never send stalls
                  ;; instead of re-routing the request.
                  ((and entry (%below-network-limited-threshold-p chain-state entry))
-                  (bitcoin-lisp:log-cat
+                  (bl:log-cat
                    "net" "getdata: block request below the NODE_NETWORK_LIMITED ~
                           threshold from ~A; disconnecting"
                    (peer-address peer))
                   (disconnect-peer peer)
                   (return))
                  (t
-                  (let ((block (bitcoin-lisp.storage:get-block block-store hash))
+                  (let ((block (bl.store:get-block block-store hash))
                         ;; Only the legacy MSG_BLOCK is witness-stripped;
                         ;; MSG_WITNESS_BLOCK and the full-block fallback for
                         ;; MSG_CMPCT_BLOCK both carry witnesses (Core
                         ;; ProcessGetBlockData, TX_WITH_WITNESS).
                         (witnessed (/= inv-type
-                                       bitcoin-lisp.serialization:+inv-type-block+)))
+                                       bl.ser:+inv-type-block+)))
                     (when block
                       (incf blocks-served)
                       (send-message
                        peer
                        (if (and (= inv-type
-                                   bitcoin-lisp.serialization:+inv-type-cmpct-block+)
+                                   bl.ser:+inv-type-cmpct-block+)
                                 (%serve-compact-p chain-state entry))
                            ;; Cached when this is the tip we just connected —
                            ;; N peers asking for the same new block cost one
                            ;; construction (Core m_most_recent_compact_block).
-                           (or (bitcoin-lisp.validation:most-recent-cmpctblock hash)
-                               (bitcoin-lisp.serialization:make-cmpctblock-message block))
-                           (bitcoin-lisp.serialization:make-block-message
+                           (or (bl.val:most-recent-cmpctblock hash)
+                               (bl.ser:make-cmpctblock-message block))
+                           (bl.ser:make-block-message
                             block :witness witnessed)))))))))))))
     ;; One notfound for every unserved tx request (Core sends notfound for txs
     ;; only, never blocks).
     (when not-found
-      (send-message peer (bitcoin-lisp.serialization:make-notfound-message
+      (send-message peer (bl.ser:make-notfound-message
                           (nreverse not-found)))))))
 
 (defconstant +max-getcfilters-size+ 1000
@@ -2159,24 +2159,24 @@ handling of unavailable blocks."
 (defun %cf-serving-index ()
   "The block filter index to serve BIP157 requests from, or NIL when serving is
 off (-peerblockfilters absent) or the index is unavailable."
-  (and bitcoin-lisp:*peer-block-filters*
-       bitcoin-lisp::*node*
-       (let ((bfi (bitcoin-lisp::node-blockfilterindex bitcoin-lisp::*node*)))
-         (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi) bfi))))
+  (and bl:*peer-block-filters*
+       bl::*node*
+       (let ((bfi (bl::node-blockfilterindex bl::*node*)))
+         (and bfi (bl.store:blockfilterindex-enabled bfi) bfi))))
 
 (defun %cf-active-hash (chain-state height)
   "Hash of the ACTIVE-chain block at HEIGHT, or NIL."
-  (let ((e (bitcoin-lisp.storage:get-block-at-height chain-state height)))
-    (and e (bitcoin-lisp.storage:block-index-entry-hash e))))
+  (let ((e (bl.store:get-block-at-height chain-state height)))
+    (and e (bl.store:block-index-entry-hash e))))
 
 (defun %cf-request-stop-height (chain-state start-height stop-hash max-diff)
   "Validate a BIP157 request (Core PrepareBlockFilterRequest): STOP-HASH must be
 a known block on the ACTIVE chain, START-HEIGHT <= stop height, and the span
 under MAX-DIFF. Returns the stop height, or NIL. (Core also serves recent fork
 blocks via GetAncestor; we serve the active chain only -- the light-client case.)"
-  (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state stop-hash)))
+  (let ((entry (bl.store:get-block-index-entry chain-state stop-hash)))
     (when entry
-      (let* ((stop-height (bitcoin-lisp.storage:block-index-entry-height entry))
+      (let* ((stop-height (bl.store:block-index-entry-height entry))
              (active (%cf-active-hash chain-state stop-height)))
         (when (and active (equalp active stop-hash)
                    (<= start-height stop-height)
@@ -2190,7 +2190,7 @@ or the request is invalid (Core disconnects; we drop the request)."
   (let ((bfi (%cf-serving-index)))
     (when bfi
       (multiple-value-bind (ftype start-height stop-hash)
-          (bitcoin-lisp.serialization:parse-getcfilters-payload payload)
+          (bl.ser:parse-getcfilters-payload payload)
         (when (and ftype (zerop ftype))   ; type 0 = basic
           (let ((stop-height (%cf-request-stop-height
                               chain-state start-height stop-hash
@@ -2198,10 +2198,10 @@ or the request is invalid (Core disconnects; we drop the request)."
             (when stop-height
               (loop for h from start-height to stop-height
                     for bh = (%cf-active-hash chain-state h)
-                    for filter = (and bh (bitcoin-lisp.storage:blockfilterindex-get-filter bfi bh))
+                    for filter = (and bh (bl.store:blockfilterindex-get-filter bfi bh))
                     while filter
                     do (send-message
-                        peer (bitcoin-lisp.serialization:make-cfilter-message
+                        peer (bl.ser:make-cfilter-message
                               0 bh filter))))))))))
 
 (defun handle-getcfheaders (peer payload chain-state)
@@ -2210,7 +2210,7 @@ genesis) plus the per-block filter HASHES for the range, in one cfheaders."
   (let ((bfi (%cf-serving-index)))
     (when bfi
       (multiple-value-bind (ftype start-height stop-hash)
-          (bitcoin-lisp.serialization:parse-getcfilters-payload payload)
+          (bl.ser:parse-getcfilters-payload payload)
         (when (and ftype (zerop ftype))
           (let ((stop-height (%cf-request-stop-height
                               chain-state start-height stop-hash
@@ -2220,17 +2220,17 @@ genesis) plus the per-block filter HASHES for the range, in one cfheaders."
                                                 :initial-element 0)))
                 (when (plusp start-height)
                   (let* ((ph (%cf-active-hash chain-state (1- start-height)))
-                         (hdr (and ph (bitcoin-lisp.storage:blockfilterindex-get-header bfi ph))))
+                         (hdr (and ph (bl.store:blockfilterindex-get-header bfi ph))))
                     (unless hdr (return-from handle-getcfheaders))
                     (setf prev-header hdr)))
                 (let ((hashes '()))
                   (loop for h from start-height to stop-height
                         for bh = (%cf-active-hash chain-state h)
-                        for filter = (and bh (bitcoin-lisp.storage:blockfilterindex-get-filter bfi bh))
+                        for filter = (and bh (bl.store:blockfilterindex-get-filter bfi bh))
                         do (unless filter (return-from handle-getcfheaders))
-                           (push (bitcoin-lisp.crypto:hash256 filter) hashes))
+                           (push (bl.crypto:hash256 filter) hashes))
                   (send-message
-                   peer (bitcoin-lisp.serialization:make-cfheaders-message
+                   peer (bl.ser:make-cfheaders-message
                          0 stop-hash prev-header (nreverse hashes))))))))))))
 
 (defun handle-getcfcheckpt (peer payload chain-state)
@@ -2239,7 +2239,7 @@ the stop hash."
   (let ((bfi (%cf-serving-index)))
     (when bfi
       (multiple-value-bind (ftype stop-hash)
-          (bitcoin-lisp.serialization:parse-getcfcheckpt-payload payload)
+          (bl.ser:parse-getcfcheckpt-payload payload)
         (when (and ftype (zerop ftype))
           (let ((stop-height (%cf-request-stop-height
                               chain-state 0 stop-hash most-positive-fixnum)))
@@ -2247,11 +2247,11 @@ the stop hash."
               (let ((headers '()))
                 (loop for h from +cfcheckpt-interval+ to stop-height by +cfcheckpt-interval+
                       for bh = (%cf-active-hash chain-state h)
-                      for hdr = (and bh (bitcoin-lisp.storage:blockfilterindex-get-header bfi bh))
+                      for hdr = (and bh (bl.store:blockfilterindex-get-header bfi bh))
                       do (unless hdr (return-from handle-getcfcheckpt))
                          (push hdr headers))
                 (send-message
-                 peer (bitcoin-lisp.serialization:make-cfcheckpt-message
+                 peer (bl.ser:make-cfcheckpt-message
                        0 stop-hash (nreverse headers)))))))))))
 
 (defconstant +max-blocktxn-depth+ 10
@@ -2287,15 +2287,15 @@ The test must run BEFORE GET-BLOCK, or the read it exists to prevent has
 already happened. With no CHAIN-STATE we cannot judge depth, so we fall back to
 sending the whole block — never to a free deep read."
   (when block-store
-    (let* ((req (bitcoin-lisp.serialization:parse-getblocktxn-payload payload))
-           (block-hash (bitcoin-lisp.serialization:block-txn-request-block-hash req))
-           (indexes (bitcoin-lisp.serialization:block-txn-request-indexes req))
+    (let* ((req (bl.ser:parse-getblocktxn-payload payload))
+           (block-hash (bl.ser:block-txn-request-block-hash req))
+           (indexes (bl.ser:block-txn-request-indexes req))
            (entry (and chain-state
-                       (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
-           (tip-height (and chain-state (bitcoin-lisp.storage:current-height chain-state)))
+                       (bl.store:get-block-index-entry chain-state block-hash)))
+           (tip-height (and chain-state (bl.store:current-height chain-state)))
            (within-depth
              (and entry tip-height
-                  (>= (bitcoin-lisp.storage:block-index-entry-height entry)
+                  (>= (bl.store:block-index-entry-height entry)
                       (- tip-height +max-blocktxn-depth+)))))
       (unless within-depth
         ;; Core queues a full MSG_WITNESS_BLOCK on the peer\'s getdata list, so
@@ -2311,19 +2311,19 @@ sending the whole block — never to a free deep read."
         ;; getdata path already relies on.
         (let ((conn (peer-connection peer)))
           (unless (and conn (connection-send-paused-p conn))
-            (let ((block (bitcoin-lisp.storage:get-block block-store block-hash)))
+            (let ((block (bl.store:get-block block-store block-hash)))
               (when block
-                (send-message peer (bitcoin-lisp.serialization:make-block-message
+                (send-message peer (bl.ser:make-block-message
                                     block :witness t))))))
         (return-from handle-getblocktxn nil))
-      (let ((block (bitcoin-lisp.storage:get-block block-store block-hash)))
+      (let ((block (bl.store:get-block block-store block-hash)))
       (when block
-        (let* ((txs (coerce (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+        (let* ((txs (coerce (bl.ser:bitcoin-block-transactions block)
                             'vector))
                (n (length txs)))
           (if (every (lambda (i) (and (>= i 0) (< i n))) indexes)
               (send-message peer
-                            (bitcoin-lisp.serialization:make-blocktxn-message
+                            (bl.ser:make-blocktxn-message
                              block-hash
                              (mapcar (lambda (i) (aref txs i)) indexes)
                              :witness t))
@@ -2350,7 +2350,7 @@ returning ENTRIES whole; a STOP-HASH not present in ENTRIES also returns all."
   (if (or (null stop-hash) (zero-hash-p stop-hash))
       entries
       (let ((tail (member stop-hash entries
-                          :key #'bitcoin-lisp.storage:block-index-entry-hash
+                          :key #'bl.store:block-index-entry-hash
                           :test #'equalp)))
         (cond ((null tail) entries)
               (inclusivep (ldiff entries (cdr tail)))
@@ -2363,27 +2363,27 @@ point — or just the stop block's header when the locator is empty. Always
 returns a serialized headers message (empty when we have nothing to add).
 Mirrors Bitcoin Core's GETHEADERS handler."
   (multiple-value-bind (locator-hashes stop-hash)
-      (bitcoin-lisp.serialization:parse-block-locator-payload payload)
+      (bl.ser:parse-block-locator-payload payload)
     (let ((headers
             (if (null locator-hashes)
                 ;; Null locator: return only the stop block's header, if it is on
                 ;; our active chain.
-                (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                (let ((entry (bl.store:get-block-index-entry
                               chain-state stop-hash)))
                   (when (and entry
-                             (bitcoin-lisp.storage:entry-on-active-chain-p
+                             (bl.store:entry-on-active-chain-p
                               chain-state entry))
-                    (list (bitcoin-lisp.storage:block-index-entry-header entry))))
+                    (list (bl.store:block-index-entry-header entry))))
                 ;; Walk forward from the fork point, stop hash inclusive.
-                (let* ((fork (bitcoin-lisp.storage:find-fork-in-active-chain
+                (let* ((fork (bl.store:find-fork-in-active-chain
                               chain-state locator-hashes))
-                       (entries (bitcoin-lisp.storage:active-chain-entries-from
+                       (entries (bl.store:active-chain-entries-from
                                  chain-state
-                                 (1+ (bitcoin-lisp.storage:block-index-entry-height fork))
-                                 bitcoin-lisp.serialization:+max-headers-count+)))
-                  (mapcar #'bitcoin-lisp.storage:block-index-entry-header
+                                 (1+ (bl.store:block-index-entry-height fork))
+                                 bl.ser:+max-headers-count+)))
+                  (mapcar #'bl.store:block-index-entry-header
                           (truncate-entries-at-stop entries stop-hash t))))))
-      (bitcoin-lisp.serialization:make-headers-message headers))))
+      (bl.ser:make-headers-message headers))))
 
 (defun handle-getheaders (peer payload chain-state)
   "Serve a peer's getheaders by sending the headers message built from PAYLOAD
@@ -2396,20 +2396,20 @@ against our active chain (see getheaders-response-message)."
 fork point, stopping before the stop hash. Returns NIL when there is nothing to
 announce. Mirrors Bitcoin Core's GETBLOCKS handler (legacy blocks-first peers)."
   (multiple-value-bind (locator-hashes stop-hash)
-      (bitcoin-lisp.serialization:parse-block-locator-payload payload)
-    (let* ((fork (bitcoin-lisp.storage:find-fork-in-active-chain
+      (bl.ser:parse-block-locator-payload payload)
+    (let* ((fork (bl.store:find-fork-in-active-chain
                   chain-state locator-hashes))
-           (entries (bitcoin-lisp.storage:active-chain-entries-from
+           (entries (bl.store:active-chain-entries-from
                      chain-state
-                     (1+ (bitcoin-lisp.storage:block-index-entry-height fork))
+                     (1+ (bl.store:block-index-entry-height fork))
                      +getblocks-inv-limit+))
            (chosen (truncate-entries-at-stop entries stop-hash nil)))
       (when chosen
-        (bitcoin-lisp.serialization:make-inv-message
+        (bl.ser:make-inv-message
          (mapcar (lambda (entry)
-                   (bitcoin-lisp.serialization:make-inv-vector
-                    :type bitcoin-lisp.serialization:+inv-type-block+
-                    :hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
+                   (bl.ser:make-inv-vector
+                    :type bl.ser:+inv-type-block+
+                    :hash (bl.store:block-index-entry-hash entry)))
                  chosen))))))
 
 (defun handle-getblocks (peer payload chain-state)
@@ -2421,7 +2421,7 @@ getblocks-response-message)."
 
 (defun peer-address->net-addr (peer-addr)
   "Build a net-addr (wire address) from a stored PEER-ADDRESS record."
-  (bitcoin-lisp.serialization:make-net-addr
+  (bl.ser:make-net-addr
    :services (peer-address-services peer-addr)
    :net (peer-address-net peer-addr)
    :ip (peer-address-ip peer-addr)
@@ -2434,21 +2434,21 @@ IPv4/IPv6: non-v1-compatible addresses are SKIPPED for it, never emitted as
 16-zero-byte garbage (Core IsAddrCompatible gating on PushAddress/relay,
 net_processing.cpp:1117-1136). Returns NIL when nothing remains to announce."
   (if (peer-wants-addrv2 peer)
-      (bitcoin-lisp.serialization:make-addrv2-message
+      (bl.ser:make-addrv2-message
        (mapcar (lambda (pa)
                  (list (peer-address->net-addr pa)
-                       (bitcoin-lisp.serialization:network-bip155-id
+                       (bl.ser:network-bip155-id
                         (peer-address-network pa))
                        (peer-address-last-seen pa)))
                peer-addrs))
       (let ((compatible
               (remove-if-not
                (lambda (pa)
-                 (bitcoin-lisp.serialization:v1-compatible-network-p
+                 (bl.ser:v1-compatible-network-p
                   (peer-address-network pa)))
                peer-addrs)))
         (when compatible
-          (bitcoin-lisp.serialization:make-addr-message
+          (bl.ser:make-addr-message
            (mapcar (lambda (pa)
                      (list (peer-address->net-addr pa) (peer-address-last-seen pa)))
                    compatible))))))
@@ -2529,8 +2529,8 @@ elicit more than one reply regardless of whether we had addresses to send."
              (not (peer-getaddr-sent peer)))
     (setf (peer-getaddr-sent peer) t)
     (let ((book (or address-book
-                    (let ((node bitcoin-lisp::*node*))
-                      (and node (bitcoin-lisp::node-address-book node))))))
+                    (let ((node bl::*node*))
+                      (and node (bl::node-address-book node))))))
       (when book
         ;; Served from the per-network cache: every requestor arriving on this
         ;; network sees the SAME snapshot for 21-27h, so reconnecting harvests
@@ -2539,7 +2539,7 @@ elicit more than one reply regardless of whether we had addresses to send."
         (let* ((addrs (cached-getaddr-response
                        book
                        (peer-connected-through-network peer)
-                       (bitcoin-lisp.serialization:get-unix-time)))
+                       (bl.ser:get-unix-time)))
                ;; NIL when the peer is v1-only and every address was non-IP.
                (msg (and addrs (build-addr-response peer addrs))))
           (when msg
@@ -2591,13 +2591,13 @@ flush) so relay-address won't echo it back."
                   :ip (local-address-bytes la)
                   :port (local-address-port la)
                   :services (local-services)
-                  :last-seen (bitcoin-lisp.serialization:get-unix-time)))
+                  :last-seen (bl.ser:get-unix-time)))
              (msg (build-addr-response peer (list pa))))
         (when msg
-          (bitcoin-lisp:add-recent-reject (peer-known-addrs peer)
+          (bl:add-recent-reject (peer-known-addrs peer)
                                           (%addr-gossip-key pa))
           (when (send-message peer msg)
-            (bitcoin-lisp:log-cat "net" "Advertising address ~A:~D to peer ~A"
+            (bl:log-cat "net" "Advertising address ~A:~D to peer ~A"
                                   (peer-address-string pa)
                                   (peer-address-port pa)
                                   (peer-address peer))
@@ -2707,7 +2707,7 @@ reach here anyway — their senders are disconnected)."
                  (peer-tx-relay-p peer)
                  ;; Skip if already announced to this peer (Core checks the
                  ;; known-filter at queue time too, PushTxInventory).
-                 (not (bitcoin-lisp:recent-reject-p (peer-announced-txs peer) txid)))
+                 (not (bl:recent-reject-p (peer-announced-txs peer) txid)))
         ;; BIP-330: a peer we reconcile with gets the transaction held back in
         ;; its reconciliation set rather than announced — unless this
         ;; transaction is one of the few chosen for immediate fanout, which is
@@ -2733,10 +2733,10 @@ reach here anyway — their senders are disconnected)."
 send it back."
   (handler-case
       (multiple-value-bind (their-size q)
-          (bitcoin-lisp.serialization:parse-reqrecon-payload payload)
+          (bl.ser:parse-reqrecon-payload payload)
         (send-message peer (recon-respond-to-request peer their-size q)))
     (error (e)
-      (bitcoin-lisp:log-cat "txreconciliation" "reqrecon from ~A failed: ~A"
+      (bl:log-cat "txreconciliation" "reqrecon from ~A failed: ~A"
                             (peer-address peer) e))))
 
 (defun %handle-sketch (peer payload)
@@ -2749,25 +2749,25 @@ answer or ask for an extension."
       (return-from %handle-sketch nil))
     (handler-case
         (let ((their-sketch (ms-sketch-deserialize
-                             (bitcoin-lisp.serialization:parse-sketch-payload payload))))
+                             (bl.ser:parse-sketch-payload payload))))
           (multiple-value-bind (ids ok) (recon-round-decode round their-sketch)
             (cond
               (ok
                (multiple-value-bind (ask announce) (recon-finish-round peer ids)
                  (send-message peer
-                               (bitcoin-lisp.serialization:make-reconcildiff-message t ask))
+                               (bl.ser:make-reconcildiff-message t ask))
                  (%announce-wtxids peer announce)))
               ((not (recon-round-extended round))
                ;; One extension is allowed, then the fallback.
                (setf (recon-round-extended round) t
                      (recon-round-state round) :extended)
-               (send-message peer (bitcoin-lisp.serialization:make-reqsketchext-message)))
+               (send-message peer (bl.ser:make-reqsketchext-message)))
               (t
                (send-message peer
-                             (bitcoin-lisp.serialization:make-reconcildiff-message nil '()))
+                             (bl.ser:make-reconcildiff-message nil '()))
                (%announce-wtxids peer (recon-abandon-round peer))))))
       (error (e)
-        (bitcoin-lisp:log-cat "txreconciliation" "sketch from ~A failed: ~A"
+        (bl:log-cat "txreconciliation" "sketch from ~A failed: ~A"
                               (peer-address peer) e)
         (%announce-wtxids peer (recon-abandon-round peer))))))
 
@@ -2779,7 +2779,7 @@ moved since the first sketch would describe something it never saw."
          (ids (and set (or (recon-set-snapshot set) (recon-set-short-ids set)))))
     (when ids
       (send-message peer
-                    (bitcoin-lisp.serialization:make-sketch-message
+                    (bl.ser:make-sketch-message
                      (ms-sketch-serialize
                       (recon-build-sketch ids (* 2 (max 1 (length ids))))))))))
 
@@ -2789,7 +2789,7 @@ the whole snapshot — the flood fallback that keeps a failed round from losing
 transactions."
   (handler-case
       (multiple-value-bind (ok ask)
-          (bitcoin-lisp.serialization:parse-reconcildiff-payload payload)
+          (bl.ser:parse-reconcildiff-payload payload)
         (let ((set (peer-recon-set peer)))
           (if ok
               (%announce-wtxids
@@ -2802,7 +2802,7 @@ transactions."
               (%announce-wtxids peer (recon-abandon-round peer)))
           (when set (recon-set-clear-snapshot set))))
     (error (e)
-      (bitcoin-lisp:log-cat "txreconciliation" "reconcildiff from ~A failed: ~A"
+      (bl:log-cat "txreconciliation" "reconcildiff from ~A failed: ~A"
                             (peer-address peer) e))))
 
 (defun %announce-wtxids (peer wtxids)
@@ -2848,29 +2848,29 @@ BIP339: wtxidrelay peers get MSG_WTX + wtxid, others MSG_TX + txid
                      (< count +inv-broadcast-target+))
           do (destructuring-bind (txid wtxid fee-rate-per-kb)
                  (pop (peer-tx-inv-queue peer))
-               (when (and (not (bitcoin-lisp:recent-reject-p
+               (when (and (not (bl:recent-reject-p
                                 (peer-announced-txs peer) txid))
                           ;; Evicted/confirmed since queueing => nothing to announce.
                           (or (null mempool)
-                              (bitcoin-lisp.mempool:mempool-has mempool txid))
+                              (bl.mp:mempool-has mempool txid))
                           ;; BIP 133 feefilter, evaluated at flush time.
                           (or (zerop (peer-feefilter-rate peer))
                               (>= fee-rate-per-kb (peer-feefilter-rate peer))))
-                 (bitcoin-lisp:add-recent-reject (peer-announced-txs peer) txid)
+                 (bl:add-recent-reject (peer-announced-txs peer) txid)
                  (incf count)
                  (push (if (and (peer-wtxid-relay peer) wtxid)
-                           (bitcoin-lisp.serialization:make-inv-vector
-                            :type bitcoin-lisp.serialization:+inv-type-wtx+
+                           (bl.ser:make-inv-vector
+                            :type bl.ser:+inv-type-wtx+
                             :hash wtxid)
-                           (bitcoin-lisp.serialization:make-inv-vector
-                            :type bitcoin-lisp.serialization:+inv-type-tx+
+                           (bl.ser:make-inv-vector
+                            :type bl.ser:+inv-type-tx+
                             :hash txid))
                        invs))))
     (when invs
       ;; A dead socket raises from the write; the drain/health passes own
       ;; disconnecting — just stop announcing to it this round.
       (handler-case
-          (send-message peer (bitcoin-lisp.serialization:make-inv-message
+          (send-message peer (bl.ser:make-inv-message
                               (nreverse invs)))
         (error () nil)))
     ;; Snapshot the mempool sequence: everything in the pool right now was
@@ -2880,7 +2880,7 @@ BIP339: wtxidrelay peers get MSG_WTX + wtxid, others MSG_TX + txid
     ;; anti-probing gate compares against.
     (when mempool
       (setf (peer-last-inv-sequence peer)
-            (bitcoin-lisp.mempool:mempool-sequence mempool)))))
+            (bl.mp:mempool-sequence mempool)))))
 
 (defun handle-mempool-request (peer mempool)
   "BIP35: announce the whole mempool to a peer holding the \"mempool\"
@@ -2896,14 +2896,14 @@ that connected mid-flush would see it."
     (return-from handle-mempool-request nil))
   (let ((invs '())
         (count 0))
-    (bitcoin-lisp.mempool:mempool-for-each
+    (bl.mp:mempool-for-each
      mempool
      (lambda (txid entry)
-       (when (and entry (< count bitcoin-lisp.serialization:+max-inv-count+))
+       (when (and entry (< count bl.ser:+max-inv-count+))
          (let ((fee-rate-per-kb
-                 (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry)))
+                 (let ((vsize (bl.mp:mempool-entry-vsize entry)))
                    (if (plusp vsize)
-                       (floor (* 1000 (bitcoin-lisp.mempool:mempool-entry-fee entry))
+                       (floor (* 1000 (bl.mp:mempool-entry-fee entry))
                               vsize)
                        0))))
            (when (or (zerop (peer-feefilter-rate peer))
@@ -2911,24 +2911,24 @@ that connected mid-flush would see it."
              (incf count)
              ;; Mark it announced, so the anti-probing gate in
              ;; FindTxForGetData lets the peer fetch what we just offered.
-             (bitcoin-lisp:add-recent-reject (peer-announced-txs peer) txid)
-             (let ((wtxid (bitcoin-lisp.mempool:mempool-entry-wtxid entry)))
+             (bl:add-recent-reject (peer-announced-txs peer) txid)
+             (let ((wtxid (bl.mp:mempool-entry-wtxid entry)))
                (push (if (and (peer-wtxid-relay peer) wtxid)
-                         (bitcoin-lisp.serialization:make-inv-vector
-                          :type bitcoin-lisp.serialization:+inv-type-wtx+
+                         (bl.ser:make-inv-vector
+                          :type bl.ser:+inv-type-wtx+
                           :hash wtxid)
-                         (bitcoin-lisp.serialization:make-inv-vector
-                          :type bitcoin-lisp.serialization:+inv-type-tx+
+                         (bl.ser:make-inv-vector
+                          :type bl.ser:+inv-type-tx+
                           :hash txid))
                      invs)))))))
     (when invs
       (handler-case
-          (send-message peer (bitcoin-lisp.serialization:make-inv-message
+          (send-message peer (bl.ser:make-inv-message
                               (nreverse invs)))
         (error () nil)))
     ;; As in the ordinary flush: everything in the pool now was announceable.
     (setf (peer-last-inv-sequence peer)
-          (bitcoin-lisp.mempool:mempool-sequence mempool))
+          (bl.mp:mempool-sequence mempool))
     count))
 
 (defun flush-tx-announcements (peers mempool)
@@ -2985,13 +2985,13 @@ flush-time filtering. Peers that already had the tx announced are skipped
 by relay-transaction's per-peer known filter, exactly like Core's
 m_tx_inventory_known_filter check. Returns T when the tx was in the pool
 and queued, NIL otherwise."
-  (let ((entry (and mempool (bitcoin-lisp.mempool:mempool-get mempool txid))))
+  (let ((entry (and mempool (bl.mp:mempool-get mempool txid))))
     (when entry
-      (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry))
-            (fee (bitcoin-lisp.mempool:mempool-entry-fee entry)))
+      (let ((vsize (bl.mp:mempool-entry-vsize entry))
+            (fee (bl.mp:mempool-entry-fee entry)))
         (relay-transaction txid nil peers
                            :fee-rate (if (plusp vsize) (floor fee vsize) 0)
-                           :wtxid (bitcoin-lisp.mempool:mempool-entry-wtxid entry)))
+                           :wtxid (bl.mp:mempool-entry-wtxid entry)))
       t)))
 
 (defconstant +initial-broadcast-interval+ 600
@@ -3024,9 +3024,9 @@ relay peers; drop the ids of txs that have left the pool (Core
 PeerManagerImpl::ReattemptInitialBroadcast, net_processing.cpp:1625-1643).
 Because each peer's known filter suppresses re-queueing, this mostly
 reaches peers connected since the original announcement."
-  (dolist (txid (bitcoin-lisp.mempool:mempool-unbroadcast-txids mempool))
+  (dolist (txid (bl.mp:mempool-unbroadcast-txids mempool))
     (unless (announce-mempool-tx peers mempool txid)
-      (bitcoin-lisp.mempool:mempool-remove-unbroadcast mempool txid))))
+      (bl.mp:mempool-remove-unbroadcast mempool txid))))
 
 (defun maybe-reattempt-initial-broadcast (peers mempool)
   "Run the unbroadcast re-announcement pass when due (call ~1x/second from
@@ -3061,11 +3061,11 @@ Deliberately NOT gated on -blocksonly: blocksonly is a TX-relay switch only;
 Core relays blocks normally under it."
   (unless (relay-enabled-p)
     (return-from relay-block nil))
-  (let ((headers-msg (bitcoin-lisp.serialization:make-headers-message (list header)))
-        (inv-msg (bitcoin-lisp.serialization:make-inv-message
-                  (list (bitcoin-lisp.serialization:make-inv-vector
-                         :type bitcoin-lisp.serialization:+inv-type-block+
-                         :hash (bitcoin-lisp.serialization:block-header-hash header))))))
+  (let ((headers-msg (bl.ser:make-headers-message (list header)))
+        (inv-msg (bl.ser:make-inv-message
+                  (list (bl.ser:make-inv-vector
+                         :type bl.ser:+inv-type-block+
+                         :hash (bl.ser:block-header-hash header))))))
     (dolist (peer (block-relay-targets source-peer peers))
       (handler-case
           (if (peer-prefers-headers peer)
@@ -3077,9 +3077,9 @@ Core relays blocks normally under it."
 
 (defun request-headers (peer chain-state)
   "Request headers from a peer starting from our current tip."
-  (let ((locator (bitcoin-lisp.storage:build-block-locator chain-state)))
+  (let ((locator (bl.store:build-block-locator chain-state)))
     (send-message peer
-                  (bitcoin-lisp.serialization:make-getheaders-message locator))))
+                  (bl.ser:make-getheaders-message locator))))
 
 ;;;; ============================================================
 ;;;; Compact Block Relay (BIP 152)
@@ -3141,12 +3141,12 @@ Core grants it only to a peer that has just delivered a new best block
 HB — what we used to do — makes every one of them push an unsolicited
 cmpctblock for every block instead of about three, and misreports
 getpeerinfo's bip152_hb_to."
-  (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message
+  (send-message peer (bl.ser:make-sendcmpct-message
                       nil +compact-blocks-version+)))
 
 (defun %set-peer-hb (peer high-bandwidth)
   (setf (peer-compact-block-high-bandwidth-to peer) high-bandwidth)
-  (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message
+  (send-message peer (bl.ser:make-sendcmpct-message
                       high-bandwidth +compact-blocks-version+)))
 
 (defun %hb-peer-live-p (peer)
@@ -3253,13 +3253,13 @@ any other version is ignored entirely, mirroring Bitcoin Core
 (net_processing.cpp: `if (sendcmpct_version != CMPCTBLOCKS_VERSION) return;`). A
 v1 compact block would deliver a witness-stripped coinbase."
   (multiple-value-bind (high-bandwidth version)
-      (bitcoin-lisp.serialization:parse-sendcmpct-payload payload)
+      (bl.ser:parse-sendcmpct-payload payload)
     (when (= version +compact-blocks-version+)
       (setf (peer-compact-block-version peer) version)
       ;; Track high-bandwidth mode preference
       (when high-bandwidth
         (setf (peer-compact-block-high-bandwidth peer) t)))
-    (bitcoin-lisp:log-debug "Peer ~A sendcmpct v~D (high-bw: ~A)"
+    (bl:log-debug "Peer ~A sendcmpct v~D (high-bw: ~A)"
                             (peer-address peer) version high-bandwidth)))
 
 ;;; Short ID map building
@@ -3271,14 +3271,14 @@ v1 compact block would deliver a witness-stripped coinbase."
    The map stores cons cells of (transaction . full-txid-or-wtxid) for verification."
   (let ((map (make-hash-table :test 'eql))
         (collision nil))
-    (bitcoin-lisp.mempool:mempool-for-each
+    (bl.mp:mempool-for-each
      mempool
      (lambda (txid entry)
-       (let* ((tx (bitcoin-lisp.mempool:mempool-entry-transaction entry))
+       (let* ((tx (bl.mp:mempool-entry-transaction entry))
               (id (if use-wtxid
-                      (bitcoin-lisp.serialization:transaction-wtxid tx)
+                      (bl.ser:transaction-wtxid tx)
                       txid))
-              (short-id (bitcoin-lisp.crypto:compute-short-txid k0 k1 id)))
+              (short-id (bl.crypto:compute-short-txid k0 k1 id)))
          ;; Detect collisions within mempool
          (when (gethash short-id map)
            (setf collision t))
@@ -3306,24 +3306,24 @@ outside the block, fewer short IDs than empty slots) — and Core answers it wit
 Misbehaving (net_processing.cpp:4680-4683). :COLLISION is READ_STATUS_FAILED —
 two of OUR OWN mempool transactions sharing a short ID, which is nobody's
 fault — and Core answers it with a plain full-block getdata (:4683-4694)."
-  (let* ((header (bitcoin-lisp.serialization:compact-block-header compact-block))
-         (nonce (bitcoin-lisp.serialization:compact-block-nonce compact-block))
-         (short-ids-list (bitcoin-lisp.serialization:compact-block-short-ids compact-block))
-         (prefilled (bitcoin-lisp.serialization:compact-block-prefilled-txs compact-block))
+  (let* ((header (bl.ser:compact-block-header compact-block))
+         (nonce (bl.ser:compact-block-nonce compact-block))
+         (short-ids-list (bl.ser:compact-block-short-ids compact-block))
+         (prefilled (bl.ser:compact-block-prefilled-txs compact-block))
          (tx-count (+ (length short-ids-list) (length prefilled)))
-         (header-bytes (bitcoin-lisp.serialization:serialize-block-header header))
+         (header-bytes (bl.ser:serialize-block-header header))
          ;; Convert short-ids list to vector for O(1) access
          (short-ids (coerce short-ids-list 'vector)))
 
     ;; Validate tx-count is reasonable (prevent DoS). Core InitData's first two
     ;; guards, both READ_STATUS_INVALID (blockencodings.cpp:62-66).
     (when (or (zerop tx-count) (> tx-count 100000))
-      (bitcoin-lisp:log-warn "Invalid compact block tx count: ~D" tx-count)
+      (bl:log-warn "Invalid compact block tx count: ~D" tx-count)
       (return-from reconstruct-compact-block (values nil :malformed)))
 
     ;; Compute SipHash keys
     (multiple-value-bind (k0 k1)
-        (bitcoin-lisp.crypto:compute-siphash-key header-bytes nonce)
+        (bl.crypto:compute-siphash-key header-bytes nonce)
 
       ;; Build short ID map from mempool
       (multiple-value-bind (shortid-map collision)
@@ -3332,7 +3332,7 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
         ;; Check for collision within mempool
         (when collision
           (increment-compact-block-collision)
-          (bitcoin-lisp:log-warn "Short ID collision detected in mempool, falling back to full block")
+          (bl:log-warn "Short ID collision detected in mempool, falling back to full block")
           (return-from reconstruct-compact-block (values nil :collision nil)))
 
         (let ((transactions (make-array tx-count :initial-element nil))
@@ -3342,14 +3342,14 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
           ;; Place prefilled transactions at their absolute indexes
           ;; with bounds checking
           (dolist (ptx prefilled)
-            (let ((idx (bitcoin-lisp.serialization:prefilled-tx-index ptx)))
+            (let ((idx (bl.ser:prefilled-tx-index ptx)))
               (if (and (>= idx 0) (< idx tx-count))
                   (setf (aref transactions idx)
-                        (bitcoin-lisp.serialization:prefilled-tx-transaction ptx))
+                        (bl.ser:prefilled-tx-transaction ptx))
                   (progn
                     ;; Core's lastprefilledindex bounds check, READ_STATUS_INVALID
                     ;; (blockencodings.cpp:78-84).
-                    (bitcoin-lisp:log-warn "Prefilled tx index out of bounds: ~D (max ~D)"
+                    (bl:log-warn "Prefilled tx index out of bounds: ~D (max ~D)"
                                            idx (1- tx-count))
                     (return-from reconstruct-compact-block (values nil :malformed nil))))))
 
@@ -3361,7 +3361,7 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
                 ;; More empty slots than short IDs — a slot with neither a
                 ;; prefilled tx nor a short ID. READ_STATUS_INVALID in Core
                 ;; (blockencodings.cpp:80-84).
-                (bitcoin-lisp:log-warn "Short ID count mismatch")
+                (bl:log-warn "Short ID count mismatch")
                 (return-from reconstruct-compact-block (values nil :malformed nil)))
               (let* ((short-id (aref short-ids short-id-idx))
                      (tx-pair (gethash short-id shortid-map)))
@@ -3370,7 +3370,7 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
                           (full-id (cdr tx-pair)))
                       ;; Verify the matched tx produces the expected short ID
                       ;; (guards against hash collisions between mempool and block)
-                      (let ((computed-short-id (bitcoin-lisp.crypto:compute-short-txid
+                      (let ((computed-short-id (bl.crypto:compute-short-txid
                                                 k0 k1 full-id)))
                         (if (= computed-short-id short-id)
                             (setf (aref transactions i) tx)
@@ -3381,7 +3381,7 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
 
           (if missing-indexes
               (values nil (nreverse missing-indexes) transactions)
-              (values (bitcoin-lisp.serialization:make-bitcoin-block
+              (values (bl.ser:make-bitcoin-block
                        :header header
                        :transactions (coerce transactions 'list))
                       nil nil)))))))
@@ -3455,8 +3455,8 @@ discouraging peers just by existing."
 Exactly one compact-block failure is counted on every branch (:REFETCH counts
 its own inside REQUEST-FULL-BLOCK). Returns the action taken."
   (let ((action (compact-block-failure-action reason)))
-    (bitcoin-lisp:log-warn "~A ~A: ~(~A~) — ~(~A~)"
-                           context (bitcoin-lisp.crypto:bytes-to-hex block-hash)
+    (bl:log-warn "~A ~A: ~(~A~) — ~(~A~)"
+                           context (bl.crypto:bytes-to-hex block-hash)
                            reason action)
     (ecase action
       (:punish (increment-compact-block-failure)
@@ -3493,12 +3493,12 @@ attacker's header, so it must not run for a header we are going to reject.
 
 Pure reads of the block index — the caller holds the node lock across it and
 does the IO (getheaders / getdata / disconnect) outside."
-  (let ((known (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash))
-        (prev-entry (bitcoin-lisp.storage:get-block-index-entry chain-state prev-hash)))
+  (let ((known (bl.store:get-block-index-entry chain-state block-hash))
+        (prev-entry (bl.store:get-block-index-entry chain-state prev-hash)))
     (cond
       ;; Already-known header. Core returns true early for it, except when we
       ;; marked it invalid: BLOCK_CACHED_INVALID (validation.cpp:4229-4237).
-      ((and known (eq (bitcoin-lisp.storage:block-index-entry-status known) :invalid))
+      ((and known (eq (bl.store:block-index-entry-status known) :invalid))
        (values :reject :duplicate-invalid))
       ;; Already in the index AND nothing new to gain from it: Core's
       ;; `pindex->nChainWork <= tip->nChainWork || pindex->nTx != 0` early
@@ -3514,14 +3514,14 @@ does the IO (getheaders / getdata / disconnect) outside."
       ;; request here (see the notfound removal in PR #402), so there is
       ;; nothing to send.
       ((and known
-            (let ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
-              (or (plusp (bitcoin-lisp.storage:block-index-entry-tx-count known))
+            (let ((tip-hash (bl.store:best-block-hash chain-state)))
+              (or (plusp (bl.store:block-index-entry-tx-count known))
                   (let ((tip (and tip-hash
-                                  (bitcoin-lisp.storage:get-block-index-entry
+                                  (bl.store:get-block-index-entry
                                    chain-state tip-hash))))
                     (and tip
-                         (<= (bitcoin-lisp.storage:block-index-entry-chain-work known)
-                             (bitcoin-lisp.storage:block-index-entry-chain-work tip)))))))
+                         (<= (bl.store:block-index-entry-chain-work known)
+                             (bl.store:block-index-entry-chain-work tip)))))))
        (values :already-have nil nil))
       ;; Known, but it beats our tip and we have never had the body: worth
       ;; reconstructing. received_new_header is false, so no announcement
@@ -3538,7 +3538,7 @@ does the IO (getheaders / getdata / disconnect) outside."
       ((null prev-entry) (values :no-parent nil))
       ;; Building on a block we rejected: BLOCK_INVALID_PREV (validation.cpp:
       ;; 4251-4255), punished regardless of via_compact_block.
-      ((eq (bitcoin-lisp.storage:block-index-entry-status prev-entry) :invalid)
+      ((eq (bl.store:block-index-entry-status prev-entry) :invalid)
        (values :reject :bad-prevblk))
       (t
        ;; CheckBlockHeader + ContextualCheckBlockHeader at the header's own
@@ -3547,10 +3547,10 @@ does the IO (getheaders / getdata / disconnect) outside."
        ;; runs later, so this rejects nothing we would have accepted; it only
        ;; moves the verdict ahead of the mempool pass and makes it punishable.
        (multiple-value-bind (valid reason)
-           (bitcoin-lisp.validation:validate-block-header
-            header chain-state (bitcoin-lisp.serialization:get-unix-time)
+           (bl.val:validate-block-header
+            header chain-state (bl.ser:get-unix-time)
             :prev-hash prev-hash
-            :height (1+ (bitcoin-lisp.storage:block-index-entry-height prev-entry))
+            :height (1+ (bl.store:block-index-entry-height prev-entry))
             :prev-entry prev-entry)
          (if valid
              (values :accept nil
@@ -3560,16 +3560,16 @@ does the IO (getheaders / getdata / disconnect) outside."
                      ;; reads), so its work is computed the way Core computes
                      ;; it a few lines earlier for the anti-DoS floor (:4578):
                      ;; the parent's work plus this header's own proof.
-                     (let* ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+                     (let* ((tip-hash (bl.store:best-block-hash chain-state))
                             (tip (and tip-hash
-                                      (bitcoin-lisp.storage:get-block-index-entry
+                                      (bl.store:get-block-index-entry
                                        chain-state tip-hash))))
                        (and tip
-                            (> (bitcoin-lisp.storage:calculate-chain-work
-                                (bitcoin-lisp.serialization:block-header-bits header)
-                                (bitcoin-lisp.storage:block-index-entry-chain-work
+                            (> (bl.store:calculate-chain-work
+                                (bl.ser:block-header-bits header)
+                                (bl.store:block-index-entry-chain-work
                                  prev-entry))
-                               (bitcoin-lisp.storage:block-index-entry-chain-work tip)))))
+                               (bl.store:block-index-entry-chain-work tip)))))
              (values :reject reason)))))))
 
 (defun handle-cmpctblock (peer payload chain-state utxo-set block-store mempool
@@ -3587,10 +3587,10 @@ a peer may relay a compact block having validated only the header, and
 reconstruction can substitute our own mempool transactions, so a
 consensus-invalid result earns a full-block getdata instead. A structurally
 malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
-  (let* ((compact-block (bitcoin-lisp.serialization:parse-cmpctblock-payload payload))
-         (header (bitcoin-lisp.serialization:compact-block-header compact-block))
-         (block-hash (bitcoin-lisp.serialization:block-header-hash header))
-         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
+  (let* ((compact-block (bl.ser:parse-cmpctblock-payload payload))
+         (header (bl.ser:compact-block-header compact-block))
+         (block-hash (bl.ser:block-header-hash header))
+         (prev-hash (bl.ser:block-header-prev-block header))
          (use-wtxid (= (peer-compact-block-version peer) 2)))
 
     ;; Header gate, ahead of everything else — including the stale-pending
@@ -3615,15 +3615,15 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
          ;; Not a fault: an honest peer relays what it just accepted, and two
          ;; of them announcing the same block is normal. Debug-level, and no
          ;; punishment.
-         (bitcoin-lisp:log-cat
+         (bl:log-cat
           "net" "cmpctblock ~A from ~A: already known and no better than our tip"
-          (bitcoin-lisp.crypto:bytes-to-hex block-hash) (peer-address peer))
+          (bl.crypto:bytes-to-hex block-hash) (peer-address peer))
          (return-from handle-cmpctblock nil))
         (:no-parent
-         (bitcoin-lisp:log-cat "net"
+         (bl:log-cat "net"
                                "cmpctblock ~A: parent ~A not in index — getheaders to ~A"
-                               (bitcoin-lisp.crypto:bytes-to-hex block-hash)
-                               (bitcoin-lisp.crypto:bytes-to-hex prev-hash)
+                               (bl.crypto:bytes-to-hex block-hash)
+                               (bl.crypto:bytes-to-hex prev-hash)
                                (peer-address peer))
          ;; Core gates the getheaders on !IsInitialBlockDownload(): during IBD
          ;; the header sync owns the locator and an extra request is noise.
@@ -3662,12 +3662,12 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
          ;; A reconstructed compact block is a block delivery from this peer:
          ;; stamps getpeerinfo "last_block" and resets stall tracking.
          (record-block-received-from-peer peer)
-         (bitcoin-lisp:log-debug "Compact block reconstructed successfully")
+         (bl:log-debug "Compact block reconstructed successfully")
          ;; Process like a normal block (fork-aware: a reconstructed block on a
          ;; side branch is stored and reorged, not tip-validated).
          (let ((connected
                  (with-current-node-lock
-                   (let ((tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
+                   (let ((tip-before (bl.store:best-block-hash chain-state)))
                      (multiple-value-bind (valid error)
                          (accept-downloaded-block block chain-state utxo-set block-store
                                                   :mempool mempool
@@ -3701,7 +3701,7 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
 
         ;; Missing transactions - request them
         (missing-indexes
-         (bitcoin-lisp:log-debug "Compact block missing ~D transactions, requesting"
+         (bl:log-debug "Compact block missing ~D transactions, requesting"
                                  (length missing-indexes))
          ;; Store pending state using the partial transactions from reconstruction
          (setf (peer-pending-compact-block peer)
@@ -3714,7 +3714,7 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
                 :use-wtxid use-wtxid))
          ;; Send getblocktxn request
          (send-message peer
-                       (bitcoin-lisp.serialization:make-getblocktxn-message
+                       (bl.ser:make-getblocktxn-message
                         block-hash missing-indexes)))))))
 
 (defun handle-blocktxn (peer payload chain-state utxo-set block-store mempool
@@ -3730,19 +3730,19 @@ would still punish (it cannot normally arrive here: HANDLE-CMPCTBLOCK gated the
 same header before sending the getblocktxn). A blocktxn that does not answer
 the getblocktxn we sent — Core's READ_STATUS_INVALID from FillBlock — is
 punished outright (:3487-3491)."
-  (let ((response (bitcoin-lisp.serialization:parse-blocktxn-payload payload))
+  (let ((response (bl.ser:parse-blocktxn-payload payload))
         (pending (peer-pending-compact-block peer)))
 
     (unless pending
-      (bitcoin-lisp:log-debug "Received blocktxn but no pending reconstruction")
+      (bl:log-debug "Received blocktxn but no pending reconstruction")
       (return-from handle-blocktxn nil))
 
-    (let ((block-hash (bitcoin-lisp.serialization:block-txn-response-block-hash response))
-          (txs (bitcoin-lisp.serialization:block-txn-response-transactions response)))
+    (let ((block-hash (bl.ser:block-txn-response-block-hash response))
+          (txs (bl.ser:block-txn-response-transactions response)))
 
       ;; Verify block hash matches
       (unless (equalp block-hash (pending-compact-block-block-hash pending))
-        (bitcoin-lisp:log-warn "blocktxn hash mismatch")
+        (bl:log-warn "blocktxn hash mismatch")
         (return-from handle-blocktxn nil))
 
       ;; Insert missing transactions
@@ -3754,7 +3754,7 @@ punished outright (:3487-3491)."
         ;; (blockencodings.cpp:198-217) and the peer is punished
         ;; (net_processing.cpp:3487-3491).
         (when (/= (length txs) (length missing-indexes))
-          (bitcoin-lisp:log-warn "blocktxn transaction count mismatch")
+          (bl:log-warn "blocktxn transaction count mismatch")
           (setf (peer-pending-compact-block peer) nil)
           (increment-compact-block-failure)
           (record-misbehavior peer
@@ -3766,7 +3766,7 @@ punished outright (:3487-3491)."
               do (setf (aref transactions idx) tx))
 
         ;; Build complete block
-        (let ((block (bitcoin-lisp.serialization:make-bitcoin-block
+        (let ((block (bl.ser:make-bitcoin-block
                       :header (pending-compact-block-header pending)
                       :transactions (coerce transactions 'list))))
           ;; Clear pending state
@@ -3778,7 +3778,7 @@ punished outright (:3487-3491)."
           (record-block-received-from-peer peer)
           (let ((connected
                   (with-current-node-lock
-                    (let ((tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
+                    (let ((tip-before (bl.store:best-block-hash chain-state)))
                       (multiple-value-bind (valid error)
                           (accept-downloaded-block block chain-state utxo-set block-store
                                                    :mempool mempool
@@ -3800,9 +3800,9 @@ punished outright (:3487-3491)."
   "Request a full block (fallback from compact block)."
   (increment-compact-block-failure)
   (send-message peer
-                (bitcoin-lisp.serialization:make-getdata-message
-                 (list (bitcoin-lisp.serialization:make-inv-vector
-                        :type bitcoin-lisp.serialization:+inv-type-witness-block+
+                (bl.ser:make-getdata-message
+                 (list (bl.ser:make-inv-vector
+                        :type bl.ser:+inv-type-witness-block+
                         :hash block-hash)))))
 
 ;;; Timeout handling
@@ -3816,7 +3816,7 @@ punished outright (:3487-3491)."
              (elapsed-secs (/ (- now (pending-compact-block-request-time pending))
                               internal-time-units-per-second)))
         (when (> elapsed-secs +compact-block-timeout-seconds+)
-          (bitcoin-lisp:log-warn "Compact block reconstruction timed out")
+          (bl:log-warn "Compact block reconstruction timed out")
           (let ((block-hash (pending-compact-block-block-hash pending)))
             (setf (peer-pending-compact-block peer) nil)
             (request-full-block peer block-hash)))))))

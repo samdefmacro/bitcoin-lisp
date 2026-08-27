@@ -31,15 +31,15 @@
                (hash-type-raw (fourth test-case))
                (expected-hex (fifth test-case)))
           (handler-case
-              (let* ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes raw-tx-hex))
-                     (tx (bitcoin-lisp.serialization:parse-tx-payload tx-bytes))
-                     (subscript (bitcoin-lisp.crypto:hex-to-bytes script-hex))
+              (let* ((tx-bytes (bl.crypto:hex-to-bytes raw-tx-hex))
+                     (tx (bl.ser:parse-tx-payload tx-bytes))
+                     (subscript (bl.crypto:hex-to-bytes script-hex))
                      ;; hashType can be negative (signed int32), mask to unsigned
                      (hash-type (logand hash-type-raw #xFFFFFFFF))
-                     (computed (bitcoin-lisp.coalton.interop:compute-legacy-sighash
+                     (computed (bl.interop:compute-legacy-sighash
                                 tx input-index subscript hash-type))
                      ;; sighash.json uses display byte order (reversed from internal)
-                     (expected (reverse (bitcoin-lisp.crypto:hex-to-bytes expected-hex))))
+                     (expected (reverse (bl.crypto:hex-to-bytes expected-hex))))
                 (if (equalp computed expected)
                     (incf passed)
                     (progn
@@ -49,7 +49,7 @@
                                     :input-index input-index
                                     :hash-type hash-type
                                     :expected expected-hex
-                                    :computed (bitcoin-lisp.crypto:bytes-to-hex computed))
+                                    :computed (bl.crypto:bytes-to-hex computed))
                               failures)))))
             (error (e)
               (incf failed)

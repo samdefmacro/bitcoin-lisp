@@ -20,7 +20,7 @@
 inside the coinbase's witness-commitment output.")
 
 (defparameter *default-signet-challenge*
-  (bitcoin-lisp.crypto:hex-to-bytes
+  (bl.crypto:hex-to-bytes
    "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae")
   "Default public signet challenge (Core SigNetParams): a 1-of-2 bare multisig.")
 
@@ -135,10 +135,10 @@ the miner signed). If none is found, return (VALUES #() witness-commitment NIL).
   "Index of the LAST output whose scriptPubKey is a BIP141 witness commitment
 (OP_RETURN, push-36, header 0xaa21a9ed), or NIL. The scriptPubKey may be longer
 than 38 bytes when a signet push is appended."
-  (let ((outputs (bitcoin-lisp.serialization:transaction-outputs coinbase-tx))
+  (let ((outputs (bl.ser:transaction-outputs coinbase-tx))
         (idx nil))
     (dotimes (i (length outputs) idx)
-      (let ((s (bitcoin-lisp.serialization:tx-out-script-pubkey (aref outputs i))))
+      (let ((s (bl.ser:tx-out-script-pubkey (aref outputs i))))
         (when (and (>= (length s) 38)
                    (= (aref s 0) #x6a) (= (aref s 1) #x24)
                    (equalp (subseq s 2 6) *witness-commitment-header*))
@@ -148,28 +148,28 @@ than 38 bytes when a signet push is appended."
   "A copy of COINBASE with output IDX's scriptPubKey replaced by CLEARED-SCRIPT,
 for computing the modified (solution-free) coinbase txid. Witness is irrelevant
 to the txid, so it is dropped."
-  (let* ((outs (bitcoin-lisp.serialization:transaction-outputs coinbase))
+  (let* ((outs (bl.ser:transaction-outputs coinbase))
          (new-outs (make-array (length outs))))
     (dotimes (i (length outs))
       (setf (aref new-outs i)
             (if (= i idx)
-                (bitcoin-lisp.serialization:make-tx-out
-                 :value (bitcoin-lisp.serialization:tx-out-value (aref outs i))
+                (bl.ser:make-tx-out
+                 :value (bl.ser:tx-out-value (aref outs i))
                  :script-pubkey cleared-script)
                 (aref outs i))))
-    (bitcoin-lisp.serialization:make-transaction
-     :version (bitcoin-lisp.serialization:transaction-version coinbase)
-     :inputs (bitcoin-lisp.serialization:transaction-inputs coinbase)
+    (bl.ser:make-transaction
+     :version (bl.ser:transaction-version coinbase)
+     :inputs (bl.ser:transaction-inputs coinbase)
      :outputs new-outs
-     :lock-time (bitcoin-lisp.serialization:transaction-lock-time coinbase))))
+     :lock-time (bl.ser:transaction-lock-time coinbase))))
 
 (defun %compute-modified-signet-merkle (modified-coinbase block)
   "Core ComputeModifiedMerkleRoot: the transaction merkle root using the modified
 (solution-cleared) coinbase's txid in place of the real coinbase's."
-  (let* ((txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-         (leaves (list (bitcoin-lisp.serialization:transaction-hash modified-coinbase))))
+  (let* ((txs (bl.ser:bitcoin-block-transactions block))
+         (leaves (list (bl.ser:transaction-hash modified-coinbase))))
     (dolist (tx (rest txs))
-      (push (bitcoin-lisp.serialization:transaction-hash tx) leaves))
+      (push (bl.ser:transaction-hash tx) leaves))
     (values (compute-merkle-root (nreverse leaves)))))
 
 ;;; --- block_data and the to_spend / to_sign virtual transactions ---
@@ -178,10 +178,10 @@ to the txid, so it is dropped."
   "Core block_data: nVersion (int32 LE) || hashPrevBlock (32) || signet-merkle (32)
 || nTime (uint32 LE) = 72 bytes."
   (let ((out (make-array 72 :element-type '(unsigned-byte 8)))
-        (v (bitcoin-lisp.serialization:block-header-version header))
-        (tm (bitcoin-lisp.serialization:block-header-timestamp header)))
+        (v (bl.ser:block-header-version header))
+        (tm (bl.ser:block-header-timestamp header)))
     (dotimes (i 4) (setf (aref out i) (ldb (byte 8 (* 8 i)) (logand v #xffffffff))))
-    (replace out (bitcoin-lisp.serialization:block-header-prev-block header) :start1 4)
+    (replace out (bl.ser:block-header-prev-block header) :start1 4)
     (replace out signet-merkle :start1 36)
     (dotimes (i 4) (setf (aref out (+ 68 i)) (ldb (byte 8 (* 8 i)) tm)))
     out))
@@ -192,10 +192,10 @@ Core (SpanReader >> scriptSig >> scriptWitness.stack). Returns
 (VALUES script-sig witness-stack) on success, or (VALUES NIL NIL) if it does not
 parse or has trailing bytes."
   (handler-case
-      (let ((br (bitcoin-lisp.serialization:make-byte-reader-from solution)))
-        (let ((script-sig (bitcoin-lisp.serialization:br-read-var-bytes br))
-              (witness (bitcoin-lisp.serialization:br-read-witness-stack br)))
-          (if (bitcoin-lisp.serialization::br-eof-p br)
+      (let ((br (bl.ser:make-byte-reader-from solution)))
+        (let ((script-sig (bl.ser:br-read-var-bytes br))
+              (witness (bl.ser:br-read-witness-stack br)))
+          (if (bl.ser::br-eof-p br)
               (values script-sig witness)
               (values nil nil))))        ; extraneous data
     (error () (values nil nil))))
@@ -205,13 +205,13 @@ parse or has trailing bytes."
 BLOCK under CHALLENGE (a scriptPubKey byte-vector). Returns (VALUES to-spend
 to-sign) or (VALUES NIL NIL) on any failure (no coinbase, no witness commitment,
 or a malformed signet solution)."
-  (let ((txs (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+  (let ((txs (bl.ser:bitcoin-block-transactions block)))
     (when (null txs) (return-from make-signet-txs (values nil nil)))
     (let* ((coinbase (first txs))
            (cidx (%signet-witness-commitment-index coinbase)))
       (when (null cidx) (return-from make-signet-txs (values nil nil)))
-      (let ((commitment (bitcoin-lisp.serialization:tx-out-script-pubkey
-                         (aref (bitcoin-lisp.serialization:transaction-outputs coinbase) cidx)))
+      (let ((commitment (bl.ser:tx-out-script-pubkey
+                         (aref (bl.ser:transaction-outputs coinbase) cidx)))
             (sol-script-sig (make-array 0 :element-type '(unsigned-byte 8)))
             (sol-witness '()))
         (multiple-value-bind (solution cleared found)
@@ -223,32 +223,32 @@ or a malformed signet solution)."
           (let* ((mod-cb (%coinbase-with-cleared-commitment coinbase cidx cleared))
                  (signet-merkle (%compute-modified-signet-merkle mod-cb block))
                  (block-data (%serialize-signet-block-data
-                              (bitcoin-lisp.serialization:bitcoin-block-header block)
+                              (bl.ser:bitcoin-block-header block)
                               signet-merkle))
                  ;; to_spend: scriptSig = OP_0 <block-data>
                  (to-spend-scriptsig (%concat-bytes
                                       (list (make-array 1 :element-type '(unsigned-byte 8)
                                                           :initial-element #x00)
                                             (%minimal-push block-data))))
-                 (to-spend (bitcoin-lisp.serialization:make-transaction
+                 (to-spend (bl.ser:make-transaction
                             :version 0 :lock-time 0
-                            :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                                             :previous-output (bitcoin-lisp.serialization:make-outpoint
+                            :inputs (vector (bl.ser:make-tx-in
+                                             :previous-output (bl.ser:make-outpoint
                                                                :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                                     :initial-element 0)
                                                                :index #xffffffff)
                                              :script-sig to-spend-scriptsig
                                              :sequence 0))
-                            :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                            :outputs (vector (bl.ser:make-tx-out
                                               :value 0 :script-pubkey challenge))))
-                 (to-spend-txid (bitcoin-lisp.serialization:transaction-hash to-spend))
-                 (to-sign (bitcoin-lisp.serialization:make-transaction
+                 (to-spend-txid (bl.ser:transaction-hash to-spend))
+                 (to-sign (bl.ser:make-transaction
                            :version 0 :lock-time 0
-                           :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                                            :previous-output (bitcoin-lisp.serialization:make-outpoint
+                           :inputs (vector (bl.ser:make-tx-in
+                                            :previous-output (bl.ser:make-outpoint
                                                               :hash to-spend-txid :index 0)
                                             :script-sig sol-script-sig :sequence 0))
-                           :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                           :outputs (vector (bl.ser:make-tx-out
                                              :value 0
                                              :script-pubkey (make-array 1 :element-type '(unsigned-byte 8)
                                                                           :initial-element #x6a)))
@@ -258,23 +258,23 @@ or a malformed signet solution)."
 ;;; --- the check ---
 
 (defun check-signet-block-solution (block &optional (challenge *signet-challenge*)
-                                              (genesis-hash bitcoin-lisp.storage:*signet-genesis-hash*))
+                                              (genesis-hash bl.store:*signet-genesis-hash*))
   "Core CheckSignetBlockSolution. Return T iff BLOCK carries a valid signet
 solution for CHALLENGE (or is the signet genesis, whose solution is trivially
 valid). Reconstructs the to_spend/to_sign transactions and runs the script
 interpreter with BLOCK_SCRIPT_VERIFY_FLAGS (P2SH|WITNESS|DERSIG|NULLDUMMY)."
-  (let ((header (bitcoin-lisp.serialization:bitcoin-block-header block)))
-    (when (equalp (bitcoin-lisp.serialization:block-header-hash header) genesis-hash)
+  (let ((header (bl.ser:bitcoin-block-header block)))
+    (when (equalp (bl.ser:block-header-hash header) genesis-hash)
       (return-from check-signet-block-solution t))
     (multiple-value-bind (to-spend to-sign) (make-signet-txs block challenge)
       (when (null to-spend) (return-from check-signet-block-solution nil))
-      (let* ((in0 (aref (bitcoin-lisp.serialization:transaction-inputs to-sign) 0))
-             (script-sig (bitcoin-lisp.serialization:tx-in-script-sig in0))
-             (wit (bitcoin-lisp.serialization:transaction-witness to-sign))
+      (let* ((in0 (aref (bl.ser:transaction-inputs to-sign) 0))
+             (script-sig (bl.ser:tx-in-script-sig in0))
+             (wit (bl.ser:transaction-witness to-sign))
              (witness (when (and wit (plusp (length wit))) (aref wit 0)))
-             (bitcoin-lisp.coalton.interop:*current-tx* to-sign)
-             (bitcoin-lisp.coalton.interop:*current-input-index* 0)
-             (bitcoin-lisp.coalton.interop:*script-flags* "P2SH,WITNESS,DERSIG,NULLDUMMY"))
+             (bl.interop:*current-tx* to-sign)
+             (bl.interop:*current-input-index* 0)
+             (bl.interop:*script-flags* "P2SH,WITNESS,DERSIG,NULLDUMMY"))
         (declare (ignorable to-spend))
-        (values (bitcoin-lisp.coalton.interop:verify-script
+        (values (bl.interop:verify-script
                  script-sig challenge :witness witness :amount 0))))))

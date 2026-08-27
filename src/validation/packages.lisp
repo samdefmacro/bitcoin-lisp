@@ -56,7 +56,7 @@ a COMBINATION — order-independent — so a combination already known to fail
 can be remembered in the reconsiderable-rejects filter and skipped instead of
 re-validated on every re-announcement (MempoolRejectedPackage /
 Find1P1CPackage, txdownloadman_impl.cpp:302-320, 500-502)."
-  (let* ((wtxids (sort (mapcar #'bitcoin-lisp.serialization:transaction-wtxid
+  (let* ((wtxids (sort (mapcar #'bl.ser:transaction-wtxid
                                package)
                        #'%wtxid-lessp))
          (buf (make-array (* 32 (length wtxids))
@@ -64,7 +64,7 @@ Find1P1CPackage, txdownloadman_impl.cpp:302-320, 500-502)."
     (loop for w in wtxids
           for off from 0 by 32
           do (replace buf w :start1 off))
-    (bitcoin-lisp.crypto:sha256 buf)))
+    (bl.crypto:sha256 buf)))
 
 ;;;; Per-transaction result of package validation
 
@@ -103,13 +103,13 @@ appears later), and no two txs spend the same prevout."
        (when (> n 1)
          (let ((total-weight 0))
            (dolist (tx package)
-             (incf total-weight (bitcoin-lisp.serialization:transaction-weight tx)))
+             (incf total-weight (bl.ser:transaction-weight tx)))
            (when (> total-weight +max-package-weight+)
              (return-from package-well-formed (values nil :package-too-large)))))
        ;; No duplicate txids.
        (let ((seen (make-hash-table :test 'equalp)))
          (dolist (tx package)
-           (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+           (let ((txid (bl.ser:transaction-hash tx)))
              (when (gethash txid seen)
                (return-from package-well-formed (values nil :package-contains-duplicates)))
              (setf (gethash txid seen) t))))
@@ -117,21 +117,21 @@ appears later), and no two txs spend the same prevout."
        ;; output of a tx whose txid has not yet been seen (i.e. appears later).
        (let ((later (make-hash-table :test 'equalp)))
          (dolist (tx package)
-           (setf (gethash (bitcoin-lisp.serialization:transaction-hash tx) later) t))
+           (setf (gethash (bl.ser:transaction-hash tx) later) t))
          (dolist (tx package)
-           (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
-             (when (gethash (bitcoin-lisp.serialization:outpoint-hash
-                             (bitcoin-lisp.serialization:tx-in-previous-output in))
+           (bl.ser:dovector (in (bl.ser:transaction-inputs tx))
+             (when (gethash (bl.ser:outpoint-hash
+                             (bl.ser:tx-in-previous-output in))
                             later)
                (return-from package-well-formed (values nil :package-not-sorted))))
-           (remhash (bitcoin-lisp.serialization:transaction-hash tx) later)))
+           (remhash (bl.ser:transaction-hash tx) later)))
        ;; No two txs spend the same prevout.
        (let ((spent (make-hash-table :test 'equalp)))
          (dolist (tx package)
-           (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
-             (let* ((p (bitcoin-lisp.serialization:tx-in-previous-output in))
-                    (key (cons (bitcoin-lisp.serialization:outpoint-hash p)
-                               (bitcoin-lisp.serialization:outpoint-index p))))
+           (bl.ser:dovector (in (bl.ser:transaction-inputs tx))
+             (let* ((p (bl.ser:tx-in-previous-output in))
+                    (key (cons (bl.ser:outpoint-hash p)
+                               (bl.ser:outpoint-index p))))
                (when (gethash key spent)
                  (return-from package-well-formed (values nil :conflict-in-package)))
                (setf (gethash key spent) t)))))
@@ -147,23 +147,23 @@ DAG). Returns (values ok-p reason)."
         (parent-txids (make-hash-table :test 'equalp))
         (child-spends (make-hash-table :test 'equalp)))
     ;; The txids the child spends from.
-    (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs child))
-      (setf (gethash (bitcoin-lisp.serialization:outpoint-hash
-                      (bitcoin-lisp.serialization:tx-in-previous-output in))
+    (bl.ser:dovector (in (bl.ser:transaction-inputs child))
+      (setf (gethash (bl.ser:outpoint-hash
+                      (bl.ser:tx-in-previous-output in))
                      child-spends)
             t))
     ;; Every parent must be spent by the child.
     (dolist (tx parents)
-      (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+      (let ((txid (bl.ser:transaction-hash tx)))
         (setf (gethash txid parent-txids) t)
         (unless (gethash txid child-spends)
           (return-from package-child-with-parents-tree-p
             (values nil :package-not-child-with-parents)))))
     ;; No parent may depend on another parent.
     (dolist (tx parents)
-      (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
-        (when (gethash (bitcoin-lisp.serialization:outpoint-hash
-                        (bitcoin-lisp.serialization:tx-in-previous-output in))
+      (bl.ser:dovector (in (bl.ser:transaction-inputs tx))
+        (when (gethash (bl.ser:outpoint-hash
+                        (bl.ser:tx-in-previous-output in))
                        parent-txids)
           (return-from package-child-with-parents-tree-p
             (values nil :package-parent-depends-on-parent)))))
@@ -180,13 +180,13 @@ real mempool. HEIGHT is the height these unconfirmed outputs are assumed to
 confirm at — the next block (tip+1) — which is what BIP68 evaluates against."
   (let ((coins (make-hash-table :test 'equalp)))
     (dolist (tx package coins)
-      (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-        (loop for out across (bitcoin-lisp.serialization:transaction-outputs tx)
+      (let ((txid (bl.ser:transaction-hash tx)))
+        (loop for out across (bl.ser:transaction-outputs tx)
               for idx from 0
               do (setf (gethash (cons txid idx) coins)
-                       (bitcoin-lisp.storage:make-utxo-entry
-                        :value (bitcoin-lisp.serialization:tx-out-value out)
-                        :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey out)
+                       (bl.store:make-utxo-entry
+                        :value (bl.ser:tx-out-value out)
+                        :script-pubkey (bl.ser:tx-out-script-pubkey out)
                         :height height
                         :coinbase nil)))))))
 
@@ -215,7 +215,7 @@ validate-package-for-mempool re-limits once at the end, like Core's
 AcceptPackage (validation.cpp:1728)."
   (dolist (rt rset)
     (setf (gethash rt replaced) t))
-  (values (bitcoin-lisp.mempool:accept-validated-tx
+  (values (bl.mp:accept-validated-tx
            mempool txid tx fee height :entry-time now :sigops sigops
            :replaced rset :defer-trim t)))
 
@@ -225,10 +225,10 @@ holds for the members processed so far, and a :not-validated placeholder
 carrying REASON for the members Core never got to (its early return leaves
 them absent from m_tx_results)."
   (mapcar (lambda (tx)
-            (let ((wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+            (let ((wtxid (bl.ser:transaction-wtxid tx)))
               (or (gethash wtxid results)
                   (make-package-tx-result
-                   :txid (bitcoin-lisp.serialization:transaction-hash tx)
+                   :txid (bl.ser:transaction-hash tx)
                    :wtxid wtxid
                    :status :not-validated
                    :error reason))))
@@ -239,8 +239,8 @@ them absent from m_tx_results)."
 package check fails before any tx is processed."
   (mapcar (lambda (tx)
             (make-package-tx-result
-             :txid (bitcoin-lisp.serialization:transaction-hash tx)
-             :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)
+             :txid (bl.ser:transaction-hash tx)
+             :wtxid (bl.ser:transaction-wtxid tx)
              :status :not-validated
              :error reason))
           package))
@@ -257,14 +257,14 @@ m_base_fees, m_vsize, m_sigops_cost, m_modified_fees, the replaced set)."
 FindInPackageParents (truc_policy.cpp:18-37). TXNS is topologically sorted,
 so scanning stops at TX itself."
   (let ((possible (make-hash-table :test 'equalp)))
-    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-      (setf (gethash (bitcoin-lisp.serialization:outpoint-hash
-                      (bitcoin-lisp.serialization:tx-in-previous-output input))
+    (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+      (setf (gethash (bl.ser:outpoint-hash
+                      (bl.ser:tx-in-previous-output input))
                      possible)
             t))
     (loop for ptx in txns
           until (eq ptx tx)
-          when (gethash (bitcoin-lisp.serialization:transaction-hash ptx) possible)
+          when (gethash (bl.ser:transaction-hash ptx) possible)
             collect ptx)))
 
 (defun package-truc-checks (mempool tx vsize txns)
@@ -280,61 +280,61 @@ IN-PACKAGE dimension: ancestor counting includes in-package parents, the
 inheritance covers in-package parents, and the one-descendant rule rejects
 a package sibling spending the same parent (with no sibling-eviction escape
 — the sibling is in the same package, truc_policy.cpp:127-136)."
-  (let* ((v3 (= (bitcoin-lisp.serialization:transaction-version tx)
-                bitcoin-lisp.mempool:+truc-version+))
-         (mempool-parents (bitcoin-lisp.mempool:mempool-find-parents mempool tx))
+  (let* ((v3 (= (bl.ser:transaction-version tx)
+                bl.mp:+truc-version+))
+         (mempool-parents (bl.mp:mempool-find-parents mempool tx))
          (in-package-parents (%in-package-parents txns tx)))
     (if v3
         (progn
           ;; Single checks enforced this already; Core keeps it as an Assume
           ;; (truc_policy.cpp:71-75) — keep it as a real check.
-          (when (> vsize bitcoin-lisp.mempool:+truc-max-vsize+)
+          (when (> vsize bl.mp:+truc-max-vsize+)
             (return-from package-truc-checks :truc-tx-too-big))
           ;; Ancestor limit over BOTH parent sets (+ self).
           (when (> (+ (length mempool-parents) (length in-package-parents) 1)
-                   bitcoin-lisp.mempool:+truc-ancestor-limit+)
+                   bl.mp:+truc-ancestor-limit+)
             (return-from package-truc-checks :truc-too-many-ancestors))
           ;; A mempool parent must not have ancestors of its own
           ;; (GetAncestorCount includes self, truc_policy.cpp:82-86).
           (when mempool-parents
-            (when (> (+ (bitcoin-lisp.mempool:mempool-ancestor-stats
+            (when (> (+ (bl.mp:mempool-ancestor-stats
                          mempool (first mempool-parents))
                         (length in-package-parents) 1)
-                     bitcoin-lisp.mempool:+truc-ancestor-limit+)
+                     bl.mp:+truc-ancestor-limit+)
               (return-from package-truc-checks :truc-too-many-ancestors)))
           (when (or mempool-parents in-package-parents)
             ;; A TRUC child cannot be too large.
-            (when (> vsize bitcoin-lisp.mempool:+truc-child-max-vsize+)
+            (when (> vsize bl.mp:+truc-child-max-vsize+)
               (return-from package-truc-checks :truc-child-too-big))
             ;; Exactly 1 parent exists at this point, in mempool or package.
             (multiple-value-bind (parent-txid parent-version parent-has-descendant)
                 (if mempool-parents
                     (let* ((ptxid (first mempool-parents))
-                           (pe (bitcoin-lisp.mempool:mempool-get mempool ptxid)))
+                           (pe (bl.mp:mempool-get mempool ptxid)))
                       (values ptxid
-                              (bitcoin-lisp.serialization:transaction-version
-                               (bitcoin-lisp.mempool:mempool-entry-transaction pe))
+                              (bl.ser:transaction-version
+                               (bl.mp:mempool-entry-transaction pe))
                               ;; GetDescendantCount(parent) > 1 (incl. self).
-                              (> (bitcoin-lisp.mempool:mempool-descendant-stats
+                              (> (bl.mp:mempool-descendant-stats
                                   mempool ptxid)
                                  1)))
                     (let ((ptx (first in-package-parents)))
-                      (values (bitcoin-lisp.serialization:transaction-hash ptx)
-                              (bitcoin-lisp.serialization:transaction-version ptx)
+                      (values (bl.ser:transaction-hash ptx)
+                              (bl.ser:transaction-version ptx)
                               nil)))
               ;; The parent must be TRUC too.
-              (unless (= parent-version bitcoin-lisp.mempool:+truc-version+)
+              (unless (= parent-version bl.mp:+truc-version+)
                 (return-from package-truc-checks :truc-v3-spends-nonv3))
               ;; No other package tx may spend the same parent (an in-package
               ;; sibling — never evictable), and TX cannot have both a parent
               ;; and an in-package child (truc_policy.cpp:122-143).
-              (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+              (let ((txid (bl.ser:transaction-hash tx)))
                 (dolist (ptx txns)
                   (unless (eq ptx tx)
-                    (bitcoin-lisp.serialization:dovector
-                        (input (bitcoin-lisp.serialization:transaction-inputs ptx))
-                      (let ((prev (bitcoin-lisp.serialization:outpoint-hash
-                                   (bitcoin-lisp.serialization:tx-in-previous-output input))))
+                    (bl.ser:dovector
+                        (input (bl.ser:transaction-inputs ptx))
+                      (let ((prev (bl.ser:outpoint-hash
+                                   (bl.ser:tx-in-previous-output input))))
                         (when (equalp prev parent-txid)
                           (return-from package-truc-checks :truc-descendant-limit))
                         (when (equalp prev txid)
@@ -348,15 +348,15 @@ a package sibling spending the same parent (with no sibling-eviction escape
         ;; the package (truc_policy.cpp:150-168).
         (progn
           (dolist (ptxid mempool-parents)
-            (let ((pe (bitcoin-lisp.mempool:mempool-get mempool ptxid)))
+            (let ((pe (bl.mp:mempool-get mempool ptxid)))
               (when (and pe
-                         (= (bitcoin-lisp.serialization:transaction-version
-                             (bitcoin-lisp.mempool:mempool-entry-transaction pe))
-                            bitcoin-lisp.mempool:+truc-version+))
+                         (= (bl.ser:transaction-version
+                             (bl.mp:mempool-entry-transaction pe))
+                            bl.mp:+truc-version+))
                 (return-from package-truc-checks :truc-nonv3-spends-v3))))
           (dolist (ptx in-package-parents)
-            (when (= (bitcoin-lisp.serialization:transaction-version ptx)
-                     bitcoin-lisp.mempool:+truc-version+)
+            (when (= (bl.ser:transaction-version ptx)
+                     bl.mp:+truc-version+)
               (return-from package-truc-checks :truc-nonv3-spends-v3)))
           nil))))
 
@@ -374,13 +374,13 @@ passed and REPLACED-SET (a txid hash-set) is what the package evicts."
      (values :package-rbf-not-1p1c nil))
     ;; Neither transaction may have in-mempool ancestors, keeping the
     ;; resulting cluster <= 2 (validation.cpp:1052-1064).
-    ((some (lambda (tx) (bitcoin-lisp.mempool:mempool-find-parents mempool tx))
+    ((some (lambda (tx) (bl.mp:mempool-find-parents mempool tx))
            txns)
      (values :package-rbf-mempool-ancestors nil))
     (t
      (destructuring-bind (parent child) validated
        (multiple-value-bind (ok reason rset)
-           (bitcoin-lisp.mempool:check-package-rbf-rules
+           (bl.mp:check-package-rbf-rules
             mempool (%pkg-val-modified-fee parent) (%pkg-val-vsize parent)
             (%pkg-val-modified-fee child) (%pkg-val-vsize child) conflicts)
          (if ok
@@ -434,7 +434,7 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
     ;; other tx (validation.cpp:819,886-889), so a non-final member fails
     ;; the whole package instead of riding in on CPFP.
     (dolist (tx txns)
-      (let ((wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+      (let ((wtxid (bl.ser:transaction-wtxid tx)))
         (multiple-value-bind (valid err fee rset sigops modified-fee conflicts)
             (validate-transaction-for-mempool tx utxo-set mempool height
                                               :package-coins pkg-coins
@@ -448,11 +448,11 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
             (dolist (c conflicts) (setf (gethash c conflict-set) t)))
           ;; Package feerate and per-tx records use the sigop-adjusted vsize,
           ;; like Core's ws.m_vsize totals (validation.cpp:1494-1496).
-          (let ((vsize (bitcoin-lisp.mempool:sigop-adjusted-vsize
-                        (bitcoin-lisp.serialization:transaction-weight tx) sigops)))
+          (let ((vsize (bl.mp:sigop-adjusted-vsize
+                        (bl.ser:transaction-weight tx) sigops)))
             (incf total-fee modified-fee)
             (incf total-vsize vsize)
-            (push (%make-pkg-val tx (bitcoin-lisp.serialization:transaction-hash tx)
+            (push (%make-pkg-val tx (bl.ser:transaction-hash tx)
                                  wtxid (or fee 0) vsize sigops rset modified-fee)
                   validated)))))
     (setf validated (nreverse validated))
@@ -471,7 +471,7 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
     ;; package RBF). Failure lands on the CHILD alone, carrying the package
     ;; feerate (Core FeeFailure on workspaces.back()).
     (let ((pkg-feerate (if (zerop total-vsize) 0 (/ total-fee total-vsize)))
-          (min-fee (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
+          (min-fee (bl.mp:mempool-effective-min-fee-rate mempool))
           (includes (mapcar #'%pkg-val-wtxid validated))
           (pkg-replaced nil))
       (when (< (* total-fee 1000) (* min-fee (max total-vsize 1)))
@@ -498,7 +498,7 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
       ;; members have no in-mempool ancestors, so the evictions cannot touch
       ;; the members' would-be cluster.
       (when (and package-eval
-                 (not (bitcoin-lisp.mempool:mempool-package-fits-cluster-limits-p
+                 (not (bl.mp:mempool-package-fits-cluster-limits-p
                        mempool
                        (mapcar (lambda (v) (list (%pkg-val-tx v)
                                                  (%pkg-val-modified-fee v)
@@ -519,10 +519,10 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
       ;; Evict the package-RBF replaced set once, up front — the analogue of
       ;; Core applying the changeset's removals with its additions.
       (when pkg-replaced
-        (let ((bitcoin-lisp.mempool:*mempool-removal-reason* :replaced))
+        (let ((bl.mp:*mempool-removal-reason* :replaced))
           (loop for k being the hash-keys of pkg-replaced
                 do (setf (gethash k replaced) t)
-                   (bitcoin-lisp.mempool:mempool-remove-recursive mempool k))))
+                   (bl.mp:mempool-remove-recursive mempool k))))
       ;; Submit all, parents first. For a multi-tx subset a failure here is
       ;; unreachable (step 5); mirror Core's belt-and-suspenders (SubmitPackage,
       ;; validation.cpp:1255-1277): mark the member, keep submitting the rest.
@@ -538,7 +538,7 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
                                     pkg-feerate includes)
                 (progn
                   (when package-eval
-                    (bitcoin-lisp:log-warn
+                    (bl:log-warn
                      "package submit: staged cluster check passed but ~
                       mempool-add failed (~A) — should be unreachable"
                      add-result))
@@ -574,7 +574,7 @@ mempool, exactly as in Core's early return.
   MSG       — :success, or a package-/tx-level failure reason keyword
   RESULTS   — a list of PACKAGE-TX-RESULT, one per package tx, in package order
   REPLACED  — list of txids (byte vectors) evicted by RBF during acceptance."
-  (let ((height (bitcoin-lisp.storage:current-height chain-state)))
+  (let ((height (bl.store:current-height chain-state)))
     ;; 0. Context-free package checks.
     (multiple-value-bind (ok reason) (package-well-formed package)
       (unless ok
@@ -593,31 +593,31 @@ mempool, exactly as in Core's early return.
     ;;    validating the remaining members individually, and individually-valid
     ;;    ones still enter the mempool (\"some of them may still be valid\",
     ;;    AcceptPackage, validation.cpp:1694-1712).
-    (let ((now (bitcoin-lisp.serialization:get-unix-time))
+    (let ((now (bl.ser:get-unix-time))
           (results (make-hash-table :test 'equalp))   ; wtxid -> package-tx-result
           (replaced (make-hash-table :test 'equalp))   ; txid -> t
           (deferred '())
           (quit-early nil)
           (fail-reason nil))
       (dolist (tx package)
-        (let* ((txid (bitcoin-lisp.serialization:transaction-hash tx))
-               (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))
+        (let* ((txid (bl.ser:transaction-hash tx))
+               (wtxid (bl.ser:transaction-wtxid tx))
                (res (make-package-tx-result :txid txid :wtxid wtxid)))
           (setf (gethash wtxid results) res)
           (cond
             ;; Already in the mempool by wtxid → MEMPOOL_ENTRY (no re-validation).
-            ((gethash wtxid (bitcoin-lisp.mempool:mempool-by-wtxid mempool))
-             (let ((e (bitcoin-lisp.mempool:mempool-get mempool txid)))
+            ((gethash wtxid (bl.mp:mempool-by-wtxid mempool))
+             (let ((e (bl.mp:mempool-get mempool txid)))
                (setf (package-tx-result-status res) :mempool-entry)
                (when e
-                 (setf (package-tx-result-vsize res) (bitcoin-lisp.mempool:mempool-entry-vsize e)
-                       (package-tx-result-fee res) (bitcoin-lisp.mempool:mempool-entry-fee e)))))
+                 (setf (package-tx-result-vsize res) (bl.mp:mempool-entry-vsize e)
+                       (package-tx-result-fee res) (bl.mp:mempool-entry-fee e)))))
             ;; Same txid, different witness already present → DIFFERENT_WITNESS.
-            ((bitcoin-lisp.mempool:mempool-has mempool txid)
-             (let ((e (bitcoin-lisp.mempool:mempool-get mempool txid)))
+            ((bl.mp:mempool-has mempool txid)
+             (let ((e (bl.mp:mempool-get mempool txid)))
                (setf (package-tx-result-status res) :different-witness
                      (package-tx-result-other-wtxid res)
-                     (and e (bitcoin-lisp.mempool:mempool-entry-wtxid e)))))
+                     (and e (bl.mp:mempool-entry-wtxid e)))))
             (t
              ;; CHAIN-STATE keeps the finality/BIP68 checks on (Core PreChecks
              ;; runs them for every package member, validation.cpp:819,886-889).
@@ -631,8 +631,8 @@ mempool, exactly as in Core's early return.
                ;; compares CFeeRate(m_modified_fees, m_vsize), so the
                ;; prioritised fee against the sigop-adjusted size.
                (when (and valid client-maxfeerate)
-                 (let ((vsize (bitcoin-lisp.mempool:sigop-adjusted-vsize
-                               (bitcoin-lisp.serialization:transaction-weight tx)
+                 (let ((vsize (bl.mp:sigop-adjusted-vsize
+                               (bl.ser:transaction-weight tx)
                                sigops)))
                    (when (> (* (or modified-fee fee) 1000)
                             (* client-maxfeerate vsize))
@@ -651,8 +651,8 @@ mempool, exactly as in Core's early return.
                     (if (eq add-result :ok)
                         ;; Reported vsize/feerate use the sigop-adjusted size
                         ;; (Core MempoolAcceptResult carries ws.m_vsize).
-                        (let ((vsize (bitcoin-lisp.mempool:sigop-adjusted-vsize
-                                      (bitcoin-lisp.serialization:transaction-weight tx)
+                        (let ((vsize (bl.mp:sigop-adjusted-vsize
+                                      (bl.ser:transaction-weight tx)
                                       sigops)))
                           (%mark-result-valid res vsize fee
                                               (if (zerop vsize) 0 (/ fee vsize))
@@ -696,15 +696,15 @@ mempool, exactly as in Core's early return.
       ;; the pool — may be evicted by the trim; flip its result to
       ;; :mempool-full, as Core does by re-checking existence
       ;; (validation.cpp:1736-1760).
-      (bitcoin-lisp.mempool:mempool-trim-to-size mempool)
+      (bl.mp:mempool-trim-to-size mempool)
       (loop for res being the hash-values of results
             when (and (member (package-tx-result-status res)
                               '(:valid :mempool-entry :different-witness))
-                      (not (bitcoin-lisp.mempool:mempool-has
+                      (not (bl.mp:mempool-has
                             mempool (package-tx-result-txid res))))
               do (%mark-result-invalid res :mempool-full)
                  (setf fail-reason (or fail-reason :mempool-full)))
       (values (or fail-reason :success)
               (loop for tx in package
-                    collect (gethash (bitcoin-lisp.serialization:transaction-wtxid tx) results))
+                    collect (gethash (bl.ser:transaction-wtxid tx) results))
               (loop for k being the hash-keys of replaced collect k)))))

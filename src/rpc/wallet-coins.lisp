@@ -92,7 +92,7 @@ where a double's nearest representation may be off by up to ~0.4 sat."
                       0))))
             (t (error 'rpc-error :code +rpc-type-error+
                                  :message "Amount is not a number or string")))))
-    (unless (<= 0 satoshis bitcoin-lisp.validation:+max-money+)
+    (unless (<= 0 satoshis bl.val:+max-money+)
       (error 'rpc-error :code +rpc-type-error+ :message "Amount out of range"))
     satoshis))
 
@@ -142,7 +142,7 @@ lockedutxo record when PERSIST."
   (unless (wallet-locked-coin-p wallet txid index)
     (push (list txid index (and persist t)) (wallet-locked-utxos wallet)))
   (when persist
-    (bitcoin-lisp.storage:leveldb-put (wallet-db wallet)
+    (bl.store:leveldb-put (wallet-db wallet)
                                       (wdb-key-lockedutxo txid index)
                                       +wdb-lockedutxo-value+
                                       :sync t))
@@ -152,7 +152,7 @@ lockedutxo record when PERSIST."
   "Core CWallet::UnlockAllCoins: drop every lock, erasing persisted records."
   (dolist (entry (wallet-locked-utxos wallet))
     (when (third entry)
-      (bitcoin-lisp.storage:leveldb-delete
+      (bl.store:leveldb-delete
        (wallet-db wallet) (wdb-key-lockedutxo (first entry) (second entry)))))
   (setf (wallet-locked-utxos wallet) '())
   t)
@@ -172,7 +172,7 @@ the wallet lock."
      (lambda (key entry)
        (let* ((wtx (car entry))
               (index (cdr entry))
-              (output (aref (bitcoin-lisp.serialization:transaction-outputs
+              (output (aref (bl.ser:transaction-outputs
                              (wallet-tx-tx wtx))
                             index))
               (is-trusted (%wallet-tx-trusted-p wallet wtx trusted-parents))
@@ -181,9 +181,9 @@ the wallet lock."
                     (or allow-used
                         (not (wallet-spent-key-script-p
                               wallet
-                              (bitcoin-lisp.serialization:tx-out-script-pubkey
+                              (bl.ser:tx-out-script-pubkey
                                output)))))
-           (let ((credit (bitcoin-lisp.serialization:tx-out-value output)))
+           (let ((credit (bl.ser:tx-out-value output)))
              (cond ((and (wallet-tx-immature-coinbase-p wallet wtx)
                          (eq (wallet-tx-state wtx) :confirmed))
                     (incf immature credit))
@@ -239,7 +239,7 @@ witnessScript fields and getaddressinfo's embedded object."
 (defun %wallet-coin-output-type (wallet script)
   "Core GetOutputType over Solver's class, reclassifying a solvable P2SH
 whose redeem script is a witness program as :p2sh-segwit."
-  (let ((type (bitcoin-lisp.validation:classify-script script)))
+  (let ((type (bl.val:classify-script script)))
     (case type
       ((:witness-v0-keyhash :witness-v0-scripthash) :bech32)
       (:witness-v1-taproot :bech32m)
@@ -252,7 +252,7 @@ whose redeem script is a witness program as :p2sh-segwit."
          (let ((redeem (and spkm (%spkm-solvable-p spkm)
                             (%spkm-sub-scripts spkm script))))
            (if (and redeem
-                    (member (bitcoin-lisp.validation:classify-script redeem)
+                    (member (bl.val:classify-script redeem)
                             '(:witness-v0-keyhash :witness-v0-scripthash)))
                :p2sh-segwit
                :legacy))))
@@ -321,7 +321,7 @@ CHECK-VERSION-TRUCNESS are in play, the node lock outside it)."
          (let* ((wtx (car entry))
                 (index (cdr entry))
                 (txid (wallet-tx-txid wtx))
-                (output (aref (bitcoin-lisp.serialization:transaction-outputs
+                (output (aref (bl.ser:transaction-outputs
                                (wallet-tx-tx wtx))
                               index))
                 (depth (wallet-tx-depth wallet wtx))
@@ -352,16 +352,16 @@ CHECK-VERSION-TRUCNESS are in play, the node lock outside it)."
                  ;; child yet and no unconfirmed parent (2-generation rule);
                  ;; a non-v3 spend never takes unconfirmed v3 coins.
                  (when (and (zerop depth) check-version-trucness)
-                   (let ((v3 (= (bitcoin-lisp.serialization:transaction-version
+                   (let ((v3 (= (bl.ser:transaction-version
                                  (wallet-tx-tx wtx))
-                                bitcoin-lisp.mempool:+truc-version+)))
-                     (if (= tx-version bitcoin-lisp.mempool:+truc-version+)
+                                bl.mp:+truc-version+)))
+                     (if (= tx-version bl.mp:+truc-version+)
                          (progn
                            (unless v3 (return-from skip-coin))
                            (when (wallet-tx-truc-child wtx)
                              (return-from skip-coin))
                            (when (and mempool
-                                      (> (bitcoin-lisp.mempool:mempool-ancestor-stats
+                                      (> (bl.mp:mempool-ancestor-stats
                                           mempool txid)
                                          1))
                              (return-from skip-coin)))
@@ -373,8 +373,8 @@ CHECK-VERSION-TRUCNESS are in play, the node lock outside it)."
                        (cdr checked) safe)))
              (unless (car checked) (return-from skip-coin))
              ;; Per-output checks (spend.cpp:431-446).
-             (let ((value (bitcoin-lisp.serialization:tx-out-value output))
-                   (script (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+             (let ((value (bl.ser:tx-out-value output))
+                   (script (bl.ser:tx-out-script-pubkey output)))
                (when (or (< value min-amount)
                          (and max-amount (> value max-amount)))
                  (return-from skip-coin))
@@ -418,9 +418,9 @@ CHECK-VERSION-TRUCNESS are in play, the node lock outside it)."
                                               (%feerate-fee feerate input-bytes))))
                                :output-type output-type)))
                    (if (and check-version-trucness (zerop depth)
-                            (= (bitcoin-lisp.serialization:transaction-version
+                            (= (bl.ser:transaction-version
                                 (wallet-tx-tx wtx))
-                               bitcoin-lisp.mempool:+truc-version+))
+                               bl.mp:+truc-version+))
                        ;; Bucketed aside; only the highest-value v3 tx's
                        ;; coins join the result (spend.cpp:475-478,498-513).
                        (progn
@@ -458,8 +458,8 @@ plus the range position; a const key's fingerprint is its own keyid prefix
 with an empty path; a declared [origin] prefixes both."
   (multiple-value-bind (base-fpr base-path)
       (if (desc-key-extkey key)
-          (values (subseq (bitcoin-lisp.crypto:hash160
-                           (bitcoin-lisp.crypto:ext-key-public-bytes
+          (values (subseq (bl.crypto:hash160
+                           (bl.crypto:ext-key-public-bytes
                             (desc-key-extkey key)))
                           0 4)
                   (append (desc-key-path key)
@@ -467,7 +467,7 @@ with an empty path; a declared [origin] prefixes both."
                             (:none nil)
                             (:unhardened (list pos))
                             (:hardened (list (logior pos #x80000000))))))
-          (values (subseq (bitcoin-lisp.crypto:hash160 pubkey) 0 4) nil))
+          (values (subseq (bl.crypto:hash160 pubkey) 0 4) nil))
     (if (desc-key-origin-fingerprint key)
         (values (desc-key-origin-fingerprint key)
                 (append (desc-key-origin-path key) base-path))
@@ -478,9 +478,9 @@ with an empty path; a declared [origin] prefixes both."
 hardened markers as 'h' (apostrophe=false)."
   (multiple-value-bind (fpr path) (%desc-key-origin-info key pubkey pos)
     (format nil "[~A~A]~A"
-            (bitcoin-lisp.crypto:bytes-to-hex fpr)
+            (bl.crypto:bytes-to-hex fpr)
             (%format-key-path path nil)
-            (bitcoin-lisp.crypto:bytes-to-hex
+            (bl.crypto:bytes-to-hex
              (if xonly (%key-xonly-bytes pubkey) pubkey)))))
 
 (defun %pairs-splitter (pairs)
@@ -560,7 +560,7 @@ expression order. NIL when the descriptor kind cannot be inferred."
       ;; here does.
       (:miniscript
        (let ((solved t))
-         (let ((text (bitcoin-lisp.validation::ms-node-to-string
+         (let ((text (bl.val::ms-node-to-string
                       (out-desc-node desc)
                       (lambda (key)
                         (let ((pair (assoc key pairs :test #'eq)))
@@ -673,10 +673,10 @@ PARAMS: (dummy minconf include_watchonly avoid_reuse)."
 
 (defun %listunspent-entry (node wallet coin avoid-reuse)
   (let* ((output (wallet-coin-output coin))
-         (script (bitcoin-lisp.serialization:tx-out-script-pubkey output))
+         (script (bl.ser:tx-out-script-pubkey output))
          (address (%script->address script (wallet-network wallet)))
          (txid (wallet-coin-txid coin))
-         (mempool (bitcoin-lisp::node-mempool node)))
+         (mempool (bl::node-mempool node)))
     (multiple-value-bind (spkm) (%wallet-owning-spkm wallet script)
       (multiple-value-bind (redeem witness) (and spkm (%spkm-sub-scripts spkm script))
         `(("txid" . ,(hash-to-hex txid))
@@ -688,17 +688,17 @@ PARAMS: (dummy minconf include_watchonly avoid_reuse)."
                     (declare (ignore purpose))
                     (when found `(("label" . ,label))))
                 ,@(when redeem
-                    `(("redeemScript" . ,(bitcoin-lisp.crypto:bytes-to-hex redeem))))
+                    `(("redeemScript" . ,(bl.crypto:bytes-to-hex redeem))))
                 ,@(when witness
-                    `(("witnessScript" . ,(bitcoin-lisp.crypto:bytes-to-hex witness))))))
-          ("scriptPubKey" . ,(bitcoin-lisp.crypto:bytes-to-hex script))
-          ("amount" . ,(%btc (bitcoin-lisp.serialization:tx-out-value output)))
+                    `(("witnessScript" . ,(bl.crypto:bytes-to-hex witness))))))
+          ("scriptPubKey" . ,(bl.crypto:bytes-to-hex script))
+          ("amount" . ,(%btc (bl.ser:tx-out-value output)))
           ("confirmations" . ,(wallet-coin-depth coin))
           ,@(when (and (zerop (wallet-coin-depth coin))
                        mempool
-                       (bitcoin-lisp.mempool:mempool-has mempool txid))
+                       (bl.mp:mempool-has mempool txid))
               (multiple-value-bind (acount avsize afees)
-                  (bitcoin-lisp.mempool:mempool-ancestor-stats mempool txid)
+                  (bl.mp:mempool-ancestor-stats mempool txid)
                 `(("ancestorcount" . ,acount)
                   ("ancestorsize" . ,avsize)
                   ("ancestorfees" . ,afees))))
@@ -738,7 +738,7 @@ include_unsafe query_options)."
       (dolist (address addresses)
         (multiple-value-bind (type script)
             (and (stringp address)
-                 (bitcoin-lisp.crypto:decode-address address
+                 (bl.crypto:decode-address address
                                                      (wallet-network wallet)))
           (unless type
             (error 'rpc-error :code +rpc-invalid-address-or-key+
@@ -775,7 +775,7 @@ include_unsafe query_options)."
               (avoid-reuse (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+))
               (results '()))
           (dolist (coin coins)
-            (let* ((script (bitcoin-lisp.serialization:tx-out-script-pubkey
+            (let* ((script (bl.ser:tx-out-script-pubkey
                             (wallet-coin-output coin))))
               (when (or (null filter-scripts) (gethash script filter-scripts))
                 (push (%listunspent-entry node wallet coin avoid-reuse)
@@ -817,7 +817,7 @@ include_unsafe query_options)."
                   (error 'rpc-error :code +rpc-invalid-parameter+
                                     :message "Invalid parameter, unknown transaction"))
                 (unless (< vout-value
-                           (length (bitcoin-lisp.serialization:transaction-outputs
+                           (length (bl.ser:transaction-outputs
                                     (wallet-tx-tx wtx))))
                   (error 'rpc-error :code +rpc-invalid-parameter+
                                     :message "Invalid parameter, vout index out of bounds"))
@@ -859,43 +859,43 @@ per destination class."
     (:p2sh `(("isscript" . t) ("iswitness" . ,+json-false+)))
     (:p2wpkh `(("isscript" . ,+json-false+) ("iswitness" . t)
                ("witness_version" . 0)
-               ("witness_program" . ,(bitcoin-lisp.crypto:bytes-to-hex wit-prog))))
+               ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog))))
     (:p2wsh `(("isscript" . t) ("iswitness" . t)
               ("witness_version" . 0)
-              ("witness_program" . ,(bitcoin-lisp.crypto:bytes-to-hex wit-prog))))
+              ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog))))
     (:p2tr `(("isscript" . t) ("iswitness" . t)
              ("witness_version" . 1)
-             ("witness_program" . ,(bitcoin-lisp.crypto:bytes-to-hex wit-prog))))
+             ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog))))
     (t `(("iswitness" . ,(json-bool wit-ver))
          ,@(when wit-ver
              `(("witness_version" . ,wit-ver)
-               ("witness_program" . ,(bitcoin-lisp.crypto:bytes-to-hex wit-prog))))))))
+               ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog))))))))
 
 (defun %expansion-pubkey-by-hash160 (pairs hash)
   (find hash pairs :test #'equalp
-                   :key (lambda (pair) (bitcoin-lisp.crypto:hash160 (cdr pair)))))
+                   :key (lambda (pair) (bl.crypto:hash160 (cdr pair)))))
 
 (defun %process-sub-script (wallet sub-script pairs)
   "Core DescribeWalletAddressVisitor::ProcessSubScript: fields describing a
 known redeem/witness script. Returns (values fields hoisted-pubkey-hex)."
   (multiple-value-bind (type data)
-      (bitcoin-lisp.validation:classify-script sub-script)
+      (bl.val:classify-script sub-script)
     (let ((fields
-            `(("script" . ,(bitcoin-lisp.validation:script-type-to-string type))
-              ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex sub-script))))
+            `(("script" . ,(bl.val:script-type-to-string type))
+              ("hex" . ,(bl.crypto:bytes-to-hex sub-script))))
           (sub-address (%script->address sub-script (wallet-network wallet)))
           (hoisted nil))
       (cond
         (sub-address
          (multiple-value-bind (sub-type sub-spk sub-wv sub-wp)
-             (bitcoin-lisp.crypto:decode-address sub-address (wallet-network wallet))
+             (bl.crypto:decode-address sub-address (wallet-network wallet))
            (declare (ignore sub-spk))
            (let ((detail (%describe-address-fields sub-type sub-wv sub-wp))
                  (wallet-detail
                    (when (and (eq sub-type :p2wpkh) pairs)
                      (let ((pair (%expansion-pubkey-by-hash160 pairs sub-wp)))
                        (when pair
-                         `(("pubkey" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                         `(("pubkey" . ,(bl.crypto:bytes-to-hex
                                          (cdr pair)))))))))
              (when wallet-detail
                (setf hoisted (cdr (assoc "pubkey" wallet-detail :test #'equal))))
@@ -907,13 +907,13 @@ known redeem/witness script. Returns (values fields hoisted-pubkey-hex)."
                                  ,@wallet-detail
                                  ("address" . ,sub-address)
                                  ("scriptPubKey"
-                                  . ,(bitcoin-lisp.crypto:bytes-to-hex
+                                  . ,(bl.crypto:bytes-to-hex
                                       sub-script))))))))))
         ((eq type :multisig)
          (setf fields
                (append fields
                        `(("sigsrequired" . ,(getf data :m))
-                         ("pubkeys" . ,(mapcar #'bitcoin-lisp.crypto:bytes-to-hex
+                         ("pubkeys" . ,(mapcar #'bl.crypto:bytes-to-hex
                                                (getf data :pubkeys))))))))
       (values fields hoisted))))
 
@@ -926,12 +926,12 @@ for a wallet-solvable destination."
        (let ((pair (and pairs (%expansion-pubkey-by-hash160
                                pairs (subseq script 3 23)))))
          (when pair
-           `(("pubkey" . ,(bitcoin-lisp.crypto:bytes-to-hex (cdr pair)))
+           `(("pubkey" . ,(bl.crypto:bytes-to-hex (cdr pair)))
              ("iscompressed" . ,(json-bool (= (length (cdr pair)) 33)))))))
       (:p2wpkh
        (let ((pair (and pairs (%expansion-pubkey-by-hash160 pairs wit-prog))))
          (when pair
-           `(("pubkey" . ,(bitcoin-lisp.crypto:bytes-to-hex (cdr pair)))))))
+           `(("pubkey" . ,(bl.crypto:bytes-to-hex (cdr pair)))))))
       ((:p2sh :p2wsh)
        (multiple-value-bind (redeem witness)
            (and spkm (%spkm-sub-scripts spkm script))
@@ -973,7 +973,7 @@ PARAMS: (address)."
         (address (first params)))
     (multiple-value-bind (type script wit-ver wit-prog)
         (and (stringp address)
-             (bitcoin-lisp.crypto:decode-address address (wallet-network wallet)))
+             (bl.crypto:decode-address address (wallet-network wallet)))
       (unless type
         (error 'rpc-error :code +rpc-invalid-address-or-key+
                           :message "Invalid address"))
@@ -985,7 +985,7 @@ PARAMS: (address)."
                                   (multiple-value-list
                                    (%wallet-dest-key-origin spkm script type)))))
             `(("address" . ,address)
-              ("scriptPubKey" . ,(bitcoin-lisp.crypto:bytes-to-hex script))
+              ("scriptPubKey" . ,(bl.crypto:bytes-to-hex script))
               ("ismine" . ,(json-bool spkm))
               ("solvable" . ,(json-bool solvable))
               ,@(when desc `(("desc" . ,desc)))
@@ -1009,7 +1009,7 @@ PARAMS: (address)."
                         ;; the null id (CKeyMetadata default).
                         ("hdseedid" . ,(make-string 40 :initial-element #\0))
                         ("hdmasterfingerprint"
-                         . ,(bitcoin-lisp.crypto:bytes-to-hex fpr))))))
+                         . ,(bl.crypto:bytes-to-hex fpr))))))
               ("labels" . ,(multiple-value-bind (label purpose found)
                                (wallet-find-address-book-entry wallet address)
                              (declare (ignore purpose))
@@ -1024,7 +1024,7 @@ PARAMS: (address)."
         (address (first params)))
     (multiple-value-bind (type script)
         (and (stringp address)
-             (bitcoin-lisp.crypto:decode-address address (wallet-network wallet)))
+             (bl.crypto:decode-address address (wallet-network wallet)))
       (unless type
         (error 'rpc-error :code +rpc-invalid-address-or-key+
                           :message "Invalid Bitcoin address"))
@@ -1140,12 +1140,12 @@ wallet lock."
                      (and (%wtx-coinbase-p wtx) (< depth 1))
                      (and (wallet-tx-immature-coinbase-p wallet wtx)
                           (not include-immature)))
-           (loop for output across (bitcoin-lisp.serialization:transaction-outputs
+           (loop for output across (bl.ser:transaction-outputs
                                     (wallet-tx-tx wtx))
-                 do (when (gethash (bitcoin-lisp.serialization:tx-out-script-pubkey
+                 do (when (gethash (bl.ser:tx-out-script-pubkey
                                     output)
                                    output-scripts)
-                      (incf amount (bitcoin-lisp.serialization:tx-out-value
+                      (incf amount (bl.ser:tx-out-value
                                     output)))))))
      (wallet-map-wallet wallet))
     amount))
@@ -1169,14 +1169,14 @@ include_immature_coinbase)."
                                   :message "Label not found in wallet"))
               (dolist (address addresses)
                 (multiple-value-bind (type script)
-                    (bitcoin-lisp.crypto:decode-address address
+                    (bl.crypto:decode-address address
                                                         (wallet-network wallet))
                   (declare (ignore type))
                   (when (and script (%wallet-script-mine-p wallet script))
                     (setf (gethash script output-scripts) t)))))
             (multiple-value-bind (type script)
                 (and (stringp (first params))
-                     (bitcoin-lisp.crypto:decode-address (first params)
+                     (bl.crypto:decode-address (first params)
                                                          (wallet-network wallet)))
               (unless type
                 (error 'rpc-error :code +rpc-invalid-address-or-key+
@@ -1221,9 +1221,9 @@ Caller holds the wallet lock."
                      (and (%wtx-coinbase-p wtx) (< depth 1))
                      (and (wallet-tx-immature-coinbase-p wallet wtx)
                           (not include-immature)))
-           (loop for output across (bitcoin-lisp.serialization:transaction-outputs
+           (loop for output across (bl.ser:transaction-outputs
                                     (wallet-tx-tx wtx))
-                 for script = (bitcoin-lisp.serialization:tx-out-script-pubkey
+                 for script = (bl.ser:tx-out-script-pubkey
                                output)
                  for address = (%script->address script (wallet-network wallet))
                  do (when (and address
@@ -1234,7 +1234,7 @@ Caller holds the wallet lock."
                                       (setf (gethash address tally)
                                             (%make-received-tally)))))
                         (incf (received-tally-amount item)
-                              (bitcoin-lisp.serialization:tx-out-value output))
+                              (bl.ser:tx-out-value output))
                         (setf (received-tally-conf item)
                               (min (received-tally-conf item) depth))
                         (push (wallet-tx-txid wtx) (received-tally-txids item))))))))
@@ -1268,7 +1268,7 @@ include_immature_coinbase)."
       (let ((filter-address nil))
         (when (and address-filter (stringp address-filter)
                    (plusp (length address-filter)))
-          (unless (nth-value 0 (bitcoin-lisp.crypto:decode-address
+          (unless (nth-value 0 (bl.crypto:decode-address
                                 address-filter (wallet-network wallet)))
             (error 'rpc-error :code +rpc-wallet-error+
                               :message "address_filter parameter was invalid"))
@@ -1392,18 +1392,18 @@ which yields the same balance_change without touching the chain UTXO set."
             (error 'rpc-error :code +rpc-deserialization-error+
                               :message "Transaction hex string decoding failure."))
           (let ((tx (handler-case
-                        (bitcoin-lisp.serialization:parse-tx-payload
-                         (bitcoin-lisp.crypto:hex-to-bytes raw))
+                        (bl.ser:parse-tx-payload
+                         (bl.crypto:hex-to-bytes raw))
                       (error ()
                         (error 'rpc-error :code +rpc-deserialization-error+
                                           :message "Transaction hex string decoding failure.")))))
             ;; Debit: these inputs are spent when the tx is broadcast.
-            (bitcoin-lisp.serialization:dovector
-                (input (bitcoin-lisp.serialization:transaction-inputs tx))
-              (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+            (bl.ser:dovector
+                (input (bl.ser:transaction-inputs tx))
+              (let* ((prevout (bl.ser:tx-in-previous-output input))
                      (key (%wtx-outpoint-key
-                           (bitcoin-lisp.serialization:outpoint-hash prevout)
-                           (bitcoin-lisp.serialization:outpoint-index prevout))))
+                           (bl.ser:outpoint-hash prevout)
+                           (bl.ser:outpoint-index prevout))))
                 (when (gethash key spent)
                   (error 'rpc-error :code +rpc-invalid-parameter+
                                     :message "Transaction(s) are spending the same output more than once"))
@@ -1414,14 +1414,14 @@ which yields the same balance_change without touching the chain UTXO set."
                       (decf changes (%wallet-input-debit wallet input))))
                 (setf (gethash key spent) t)))
             ;; Credit: outputs the wallet considers mine, also feeding new_utxos.
-            (let ((hash (bitcoin-lisp.serialization:transaction-hash tx)))
+            (let ((hash (bl.ser:transaction-hash tx)))
               (loop for i from 0
-                    for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+                    for output across (bl.ser:transaction-outputs tx)
                     do (let ((value (if (%wallet-script-mine-p
                                          wallet
-                                         (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                         (bl.ser:tx-out-script-pubkey
                                           output))
-                                        (bitcoin-lisp.serialization:tx-out-value output)
+                                        (bl.ser:tx-out-value output)
                                         0)))
                          (setf (gethash (%wtx-outpoint-key hash i) new-utxos) value)
                          (incf changes value))))))
@@ -1439,10 +1439,10 @@ a spent TXO contributes 0. Caller holds the wallet lock."
      (lambda (key entry)
        (let* ((wtx (car entry))
               (index (cdr entry))
-              (output (aref (bitcoin-lisp.serialization:transaction-outputs
+              (output (aref (bl.ser:transaction-outputs
                              (wallet-tx-tx wtx))
                             index))
-              (script (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+              (script (bl.ser:tx-out-script-pubkey output)))
          (when (and (%wallet-tx-trusted-p wallet wtx trusted-parents)
                     (not (wallet-tx-immature-coinbase-p wallet wtx))
                     (>= (wallet-tx-depth wallet wtx)
@@ -1452,22 +1452,22 @@ a spent TXO contributes 0. Caller holds the wallet lock."
                (incf (gethash address balances 0)
                      (if (%wallet-outpoint-key-spent-p wallet key)
                          0
-                         (bitcoin-lisp.serialization:tx-out-value output))))))))
+                         (bl.ser:tx-out-value output))))))))
      (wallet-txos wallet))
     balances))
 
 (defun %tx-input-owned-address (wallet input)
   "The wallet address of INPUT's prevout when the wallet owns that TXO, else
 NIL (Core InputIsMine + ExtractDestination on the mapWallet prevout)."
-  (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+  (let ((prevout (bl.ser:tx-in-previous-output input)))
     (multiple-value-bind (pwtx pindex)
         (wallet-get-txo wallet
-                        (bitcoin-lisp.serialization:outpoint-hash prevout)
-                        (bitcoin-lisp.serialization:outpoint-index prevout))
+                        (bl.ser:outpoint-hash prevout)
+                        (bl.ser:outpoint-index prevout))
       (when pwtx
         (values (%script->address
-                 (bitcoin-lisp.serialization:tx-out-script-pubkey
-                  (aref (bitcoin-lisp.serialization:transaction-outputs
+                 (bl.ser:tx-out-script-pubkey
+                  (aref (bl.ser:transaction-outputs
                          (wallet-tx-tx pwtx))
                         pindex))
                  (wallet-network wallet))
@@ -1484,26 +1484,26 @@ holds the wallet lock."
        (declare (ignore txid))
        (let ((tx (wallet-tx-tx wtx))
              (grouping '()))
-         (when (plusp (length (bitcoin-lisp.serialization:transaction-inputs tx)))
+         (when (plusp (length (bl.ser:transaction-inputs tx)))
            (let ((any-mine nil))
-             (bitcoin-lisp.serialization:dovector
-                 (input (bitcoin-lisp.serialization:transaction-inputs tx))
+             (bl.ser:dovector
+                 (input (bl.ser:transaction-inputs tx))
                (multiple-value-bind (address owned) (%tx-input-owned-address wallet input)
                  (when owned
                    (setf any-mine t)
                    (when address (pushnew address grouping :test #'equal)))))
              (when any-mine
-               (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+               (loop for output across (bl.ser:transaction-outputs tx)
                      do (when (%wallet-output-change-p wallet output)
                           (let ((address (%script->address
-                                          (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                          (bl.ser:tx-out-script-pubkey
                                            output)
                                           (wallet-network wallet))))
                             (when address (pushnew address grouping :test #'equal))))))
              (when grouping (push grouping groupings))))
          ;; lone owned outputs, each its own group
-         (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
-               for script = (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+         (loop for output across (bl.ser:transaction-outputs tx)
+               for script = (bl.ser:tx-out-script-pubkey output)
                do (when (%wallet-script-mine-p wallet script)
                     (let ((address (%script->address script (wallet-network wallet))))
                       (when address (push (list address) groupings)))))))

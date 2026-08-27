@@ -15,7 +15,7 @@
 (test ui-resolve-rejects-traversal
   "Any path component that could escape the UI directory resolves to NIL:
 dot-dot, absolute paths, dotfiles, backslashes, wildcards, empty segments."
-  (let ((bitcoin-lisp.rpc::*ui-directory* #P"/tmp/ui-test/"))
+  (let ((bl.rpc::*ui-directory* #P"/tmp/ui-test/"))
     (dolist (bad '("../src/config.lisp"
                    "js/../../bitcoin-lisp.asd"
                    "js/../rpc.js"
@@ -31,25 +31,25 @@ dot-dot, absolute paths, dotfiles, backslashes, wildcards, empty segments."
                    "js?.js"
                    "c:evil.js"
                    "a b.js"))
-      (is (null (bitcoin-lisp.rpc::%ui-resolve bad))
+      (is (null (bl.rpc::%ui-resolve bad))
           "path ~S must not resolve" bad))))
 
 (test ui-resolve-accepts-safe-paths
   "Safe paths resolve to files under the UI directory; \"\" is index.html."
-  (let ((bitcoin-lisp.rpc::*ui-directory* #P"/tmp/ui-test/"))
-    (let ((index (bitcoin-lisp.rpc::%ui-resolve "")))
+  (let ((bl.rpc::*ui-directory* #P"/tmp/ui-test/"))
+    (let ((index (bl.rpc::%ui-resolve "")))
       (is (equal "index" (pathname-name index)))
       (is (equal "html" (pathname-type index))))
-    (let ((nested (bitcoin-lisp.rpc::%ui-resolve "js/rpc.js")))
+    (let ((nested (bl.rpc::%ui-resolve "js/rpc.js")))
       (is (equal "rpc" (pathname-name nested)))
       (is (equal "js" (pathname-type nested)))
       ;; stays under the UI root, in its js/ subdirectory
       (is (equal "js" (car (last (pathname-directory nested)))))
       (is (alexandria:starts-with-subseq
-           (namestring bitcoin-lisp.rpc::*ui-directory*)
+           (namestring bl.rpc::*ui-directory*)
            (namestring nested))))
     ;; interior dots are fine (app.min.js)
-    (let ((minified (bitcoin-lisp.rpc::%ui-resolve "app.min.js")))
+    (let ((minified (bl.rpc::%ui-resolve "app.min.js")))
       (is (equal "app.min" (pathname-name minified)))
       (is (equal "js" (pathname-type minified))))))
 
@@ -58,24 +58,24 @@ dot-dot, absolute paths, dotfiles, backslashes, wildcards, empty segments."
 (defmacro with-ui-reply ((&key (enabled t) directory) &body body)
   "Run BODY with a fresh hunchentoot reply and the UI specials bound."
   `(let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply))
-         (bitcoin-lisp.rpc::*ui-enabled* ,enabled)
-         (bitcoin-lisp.rpc::*ui-directory* ,directory))
+         (bl.rpc::*ui-enabled* ,enabled)
+         (bl.rpc::*ui-directory* ,directory))
      ,@body))
 
 (test ui-handle-serves-index-and-content-types
   "/ui/ serves index.html as text/html; .js and .css get their types."
   (with-ui-reply ()
-    (let ((body (bitcoin-lisp.rpc::ui-handle "/ui/")))
+    (let ((body (bl.rpc::ui-handle "/ui/")))
       (is (= 200 (hunchentoot:return-code*)))
       (is (alexandria:starts-with-subseq "text/html" (hunchentoot:content-type*)))
       (is (typep body '(vector (unsigned-byte 8))))
       (is (search "<title>" (flexi-streams:octets-to-string body :external-format :utf-8)))))
   (with-ui-reply ()
-    (bitcoin-lisp.rpc::ui-handle "/ui/style.css")
+    (bl.rpc::ui-handle "/ui/style.css")
     (is (= 200 (hunchentoot:return-code*)))
     (is (alexandria:starts-with-subseq "text/css" (hunchentoot:content-type*))))
   (with-ui-reply ()
-    (bitcoin-lisp.rpc::ui-handle "/ui/js/rpc.js")
+    (bl.rpc::ui-handle "/ui/js/rpc.js")
     (is (= 200 (hunchentoot:return-code*)))
     (is (alexandria:starts-with-subseq "text/javascript" (hunchentoot:content-type*)))))
 
@@ -84,13 +84,13 @@ dot-dot, absolute paths, dotfiles, backslashes, wildcards, empty segments."
 shell wires in the explorer views + universal search box."
   (dolist (path '("/ui/js/router.js" "/ui/js/explorer.js"))
     (with-ui-reply ()
-      (let ((body (bitcoin-lisp.rpc::ui-handle path)))
+      (let ((body (bl.rpc::ui-handle path)))
         (is (= 200 (hunchentoot:return-code*)) "~S must be served" path)
         (is (alexandria:starts-with-subseq "text/javascript"
                                            (hunchentoot:content-type*)))
         (is (plusp (length body))))))
   (with-ui-reply ()
-    (let* ((body (bitcoin-lisp.rpc::ui-handle "/ui/index.html"))
+    (let* ((body (bl.rpc::ui-handle "/ui/index.html"))
            (html (flexi-streams:octets-to-string body :external-format :utf-8)))
       (is (search "view-block" html))
       (is (search "view-tx" html))
@@ -104,21 +104,21 @@ method the page calls is a registered dispatcher method. (The page's
 rendering/sort/action behavior is covered by the zero-dependency node
 harness in tests/ui/peers.test.mjs — run: scripts/dev.sh ui-test.)"
   (with-ui-reply ()
-    (let ((body (bitcoin-lisp.rpc::ui-handle "/ui/js/peers.js")))
+    (let ((body (bl.rpc::ui-handle "/ui/js/peers.js")))
       (is (= 200 (hunchentoot:return-code*)))
       (is (alexandria:starts-with-subseq "text/javascript"
                                          (hunchentoot:content-type*)))
       (is (plusp (length body)))))
   (with-ui-reply ()
-    (let* ((body (bitcoin-lisp.rpc::ui-handle "/ui/index.html"))
+    (let* ((body (bl.rpc::ui-handle "/ui/index.html"))
            (html (flexi-streams:octets-to-string body :external-format :utf-8)))
       (is (search "view-peers" html))
       (is (search "#/peers" html))
       (is (search "net-banner" html))))
-  (bitcoin-lisp.rpc::register-all-methods)
+  (bl.rpc::register-all-methods)
   (dolist (method '("getpeerinfo" "listbanned" "setban" "disconnectnode"
                     "setnetworkactive" "getnetworkinfo"))
-    (is (not (null (gethash method bitcoin-lisp.rpc::*rpc-methods*)))
+    (is (not (null (gethash method bl.rpc::*rpc-methods*)))
         "RPC method ~S (called by the peers page) must be registered" method)))
 
 (test ui-handle-serves-console-assets
@@ -129,22 +129,22 @@ list of registered method names the page parses. (The page's parsing/
 autocomplete/history/rendering behavior is covered by the zero-dependency
 node harness in tests/ui/console.test.mjs — run: scripts/dev.sh ui-test.)"
   (with-ui-reply ()
-    (let ((body (bitcoin-lisp.rpc::ui-handle "/ui/js/console.js")))
+    (let ((body (bl.rpc::ui-handle "/ui/js/console.js")))
       (is (= 200 (hunchentoot:return-code*)))
       (is (alexandria:starts-with-subseq "text/javascript"
                                          (hunchentoot:content-type*)))
       (is (plusp (length body)))))
   (with-ui-reply ()
-    (let* ((body (bitcoin-lisp.rpc::ui-handle "/ui/index.html"))
+    (let* ((body (bl.rpc::ui-handle "/ui/index.html"))
            (html (flexi-streams:octets-to-string body :external-format :utf-8)))
       (is (search "view-console" html))
       (is (search "#/console" html))))
-  (bitcoin-lisp.rpc::register-all-methods)
-  (is (not (null (gethash "help" bitcoin-lisp.rpc::*rpc-methods*)))
+  (bl.rpc::register-all-methods)
+  (is (not (null (gethash "help" bl.rpc::*rpc-methods*)))
       "RPC method \"help\" (the console's autocomplete source) must be registered")
   ;; help with no params: one registered method name per line, sorted —
   ;; exactly the format console.js parseHelpText consumes.
-  (let* ((text (bitcoin-lisp.rpc::rpc-help nil nil))
+  (let* ((text (bl.rpc::rpc-help nil nil))
          (lines (uiop:split-string text :separator '(#\Newline))))
     (is (stringp text))
     (is (< 1 (length lines)))
@@ -155,7 +155,7 @@ node harness in tests/ui/console.test.mjs — run: scripts/dev.sh ui-test.)"
                 lines)
         "every help line must be a single bare method name")
     (is (every (lambda (line)
-                 (nth-value 1 (gethash line bitcoin-lisp.rpc::*rpc-methods*)))
+                 (nth-value 1 (gethash line bl.rpc::*rpc-methods*)))
                lines)
         "every help line must be a registered method")
     (is (equal lines (sort (copy-list lines) #'string<)))))
@@ -173,17 +173,17 @@ scripts/dev.sh ui-test.)"
   (dolist (path '("/ui/js/wallet.js" "/ui/js/qr.js" "/ui/js/wallet-crypt.js"
                   "/ui/js/wallet-psbt.js"))
     (with-ui-reply ()
-      (let ((body (bitcoin-lisp.rpc::ui-handle path)))
+      (let ((body (bl.rpc::ui-handle path)))
         (is (= 200 (hunchentoot:return-code*)) "~S must be served" path)
         (is (alexandria:starts-with-subseq "text/javascript"
                                            (hunchentoot:content-type*)))
         (is (plusp (length body))))))
   (with-ui-reply ()
-    (let* ((body (bitcoin-lisp.rpc::ui-handle "/ui/index.html"))
+    (let* ((body (bl.rpc::ui-handle "/ui/index.html"))
            (html (flexi-streams:octets-to-string body :external-format :utf-8)))
       (is (search "view-wallet" html))
       (is (search "#/wallet" html))))
-  (bitcoin-lisp.rpc::register-all-methods)
+  (bl.rpc::register-all-methods)
   (dolist (method '("listwallets" "listwalletdir" "loadwallet"
                     "getbalances" "getwalletinfo" "getblockcount"
                     "getnewaddress" "getaddressinfo"
@@ -198,13 +198,13 @@ scripts/dev.sh ui-test.)"
                     "decodepsbt" "analyzepsbt" "walletprocesspsbt"
                     "finalizepsbt" "sendrawtransaction"
                     "bumpfee" "psbtbumpfee"))
-    (is (not (null (gethash method bitcoin-lisp.rpc::*rpc-methods*)))
+    (is (not (null (gethash method bl.rpc::*rpc-methods*)))
         "RPC method ~S (called by the wallet page) must be registered" method))
   ;; The page pins every wallet RPC to /wallet/<name>; the URI parsing it
   ;; rides must resolve names (and leave the base endpoint wallet-less).
-  (is (equal "w1" (bitcoin-lisp.rpc::wallet-name-from-uri "/wallet/w1")))
-  (is (null (bitcoin-lisp.rpc::wallet-name-from-uri "/")))
-  (is (null (bitcoin-lisp.rpc::wallet-name-from-uri "/wallet/"))))
+  (is (equal "w1" (bl.rpc::wallet-name-from-uri "/wallet/w1")))
+  (is (null (bl.rpc::wallet-name-from-uri "/")))
+  (is (null (bl.rpc::wallet-name-from-uri "/wallet/"))))
 
 (test ui-handle-404s
   "Missing files, traversal attempts, and directories are all 404."
@@ -215,20 +215,20 @@ scripts/dev.sh ui-test.)"
                   "/ui/js/"
                   "/ui/.git"))
     (with-ui-reply ()
-      (bitcoin-lisp.rpc::ui-handle path)
+      (bl.rpc::ui-handle path)
       (is (= 404 (hunchentoot:return-code*)) "~S must 404" path))))
 
 (test ui-handle-disabled-is-404
   "Flag off => /ui/ 404s even if the handler is somehow reached (the
 dispatcher is additionally not registered at all when disabled)."
   (with-ui-reply (:enabled nil)
-    (bitcoin-lisp.rpc::ui-handle "/ui/")
+    (bl.rpc::ui-handle "/ui/")
     (is (= 404 (hunchentoot:return-code*)))))
 
 (test ui-handle-bare-prefix-redirects
   "/ui (no slash) 301s to /ui/ so relative asset URLs resolve."
   (with-ui-reply ()
-    (bitcoin-lisp.rpc::ui-handle "/ui")
+    (bl.rpc::ui-handle "/ui")
     (is (= 301 (hunchentoot:return-code*)))
     (is (string= "/ui/" (hunchentoot:header-out :location)))))
 
@@ -238,41 +238,41 @@ dispatcher is additionally not registered at all when disabled)."
   "Absent Origin always passes; a same-authority Origin passes; anything
 else (foreign authority, \"null\", junk) is rejected."
   ;; curl / bitcoin-cli: no Origin header
-  (is-true (bitcoin-lisp.rpc::rpc-origin-allowed-p nil "localhost:18332"))
-  (is-true (bitcoin-lisp.rpc::rpc-origin-allowed-p nil nil))
+  (is-true (bl.rpc::rpc-origin-allowed-p nil "localhost:18332"))
+  (is-true (bl.rpc::rpc-origin-allowed-p nil nil))
   ;; same-origin browser POST
-  (is-true (bitcoin-lisp.rpc::rpc-origin-allowed-p
+  (is-true (bl.rpc::rpc-origin-allowed-p
             "http://localhost:18332" "localhost:18332"))
-  (is-true (bitcoin-lisp.rpc::rpc-origin-allowed-p
+  (is-true (bl.rpc::rpc-origin-allowed-p
             "http://127.0.0.1:8332" "127.0.0.1:8332"))
   ;; case-insensitive authority
-  (is-true (bitcoin-lisp.rpc::rpc-origin-allowed-p
+  (is-true (bl.rpc::rpc-origin-allowed-p
             "http://LOCALHOST:18332" "localhost:18332"))
   ;; hostile page
-  (is-false (bitcoin-lisp.rpc::rpc-origin-allowed-p
+  (is-false (bl.rpc::rpc-origin-allowed-p
              "http://evil.example" "localhost:18332"))
-  (is-false (bitcoin-lisp.rpc::rpc-origin-allowed-p
+  (is-false (bl.rpc::rpc-origin-allowed-p
              "http://localhost:1234" "localhost:18332"))
   ;; sandboxed iframe / data: URLs send the literal string "null"
-  (is-false (bitcoin-lisp.rpc::rpc-origin-allowed-p "null" "localhost:18332"))
+  (is-false (bl.rpc::rpc-origin-allowed-p "null" "localhost:18332"))
   ;; junk / missing Host
-  (is-false (bitcoin-lisp.rpc::rpc-origin-allowed-p "garbage" "localhost:18332"))
-  (is-false (bitcoin-lisp.rpc::rpc-origin-allowed-p "http://x" nil)))
+  (is-false (bl.rpc::rpc-origin-allowed-p "garbage" "localhost:18332"))
+  (is-false (bl.rpc::rpc-origin-allowed-p "http://x" nil)))
 
 ;;; --- Config plumbing (-webui / -webuipath / -webuiopen) ---
 
 (test webui-config-plumbing
   "-webui/-webuipath/-webuiopen map onto start-node keywords; -nowebui is a
 supplied-but-false :webui; nothing is supplied when the flags are absent."
-  (let ((plist (bitcoin-lisp::args->start-node-plist
+  (let ((plist (bl::args->start-node-plist
                 '("-regtest" "-webui" "-webuiopen" "-webuipath=/x/ui/" "-rpcport=1"))))
     (is (eq t (getf plist :webui)))
     (is (eq t (getf plist :webui-open)))
     (is (string= "/x/ui/" (getf plist :webui-path))))
-  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest" "-nowebui"))))
+  (let ((plist (bl::args->start-node-plist '("-regtest" "-nowebui"))))
     (is (null (getf plist :webui)))
     (is (not (null (member :webui plist)))))
-  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest"))))
+  (let ((plist (bl::args->start-node-plist '("-regtest"))))
     (is (null (member :webui plist)))
     (is (null (member :webui-open plist)))))
 
@@ -285,15 +285,15 @@ supplied-but-false :webui; nothing is supplied when the flags are absent."
   "Live acceptor: /ui/ serves html, traversal 404s, Origin mismatch is 403
 before auth, Origin-absent and same-origin POSTs pass with the cookie
 credential, batch works with it too."
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
   (with-rpc-test-datadir (dir)
     (let ((port 19981)
           (node (make-test-node))
           (cookie nil))
-      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (setf (bl::node-data-directory node) dir)
       (unwind-protect
            (progn
-             (is (not (null (bitcoin-lisp.rpc:start-rpc-server
+             (is (not (null (bl.rpc:start-rpc-server
                              node :port port :ui-enabled t))))
              (setf cookie (alexandria:read-file-into-string
                            (merge-pathnames ".cookie" dir)))
@@ -337,17 +337,17 @@ credential, batch works with it too."
                  (is (= 2 (length parsed)))
                  (is (every (lambda (resp) (nth-value 1 (gethash "result" resp)))
                             parsed)))))
-        (bitcoin-lisp.rpc:stop-rpc-server)))))
+        (bl.rpc:stop-rpc-server)))))
 
 (test ui-server-auth-still-enforced
   "With rpcuser/rpcpassword configured, wrong Basic credentials 401 and
 correct ones pass — the Origin check must not weaken auth."
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
   (let ((port 19982)
         (node (make-test-node)))
     (unwind-protect
          (progn
-           (is (not (null (bitcoin-lisp.rpc:start-rpc-server
+           (is (not (null (bl.rpc:start-rpc-server
                            node :port port :user "u" :password "p"
                                 :ui-enabled t))))
            (let ((r (%http-post-rpc port "{\"method\":\"getblockcount\",\"id\":1}"
@@ -361,22 +361,22 @@ correct ones pass — the Origin check must not weaken auth."
            (let ((r (%http-post-rpc port "{\"method\":\"getblockcount\",\"id\":1}"
                                     :auth "u:p" :origin "http://evil.example")))
              (is (= 403 (%http-status r)))))
-      (bitcoin-lisp.rpc:stop-rpc-server))))
+      (bl.rpc:stop-rpc-server))))
 
 (test ui-server-disabled-not-registered
   "With the UI flag off, no /ui/ dispatcher exists — a GET lands on the
 RPC prefix dispatcher and is refused (405), never served."
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
   (with-rpc-test-datadir (dir)
     (let ((port 19983)
           (node (make-test-node)))
-      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (setf (bl::node-data-directory node) dir)
       (unwind-protect
            (progn
-             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
-             (is (null bitcoin-lisp.rpc::*ui-dispatcher*))
+             (is (not (null (bl.rpc:start-rpc-server node :port port))))
+             (is (null bl.rpc::*ui-dispatcher*))
              (let ((r (%http-get port "/ui/")))
                (is (member (%http-status r) '(404 405))
                    "GET /ui/ with UI off must not serve (got ~A)" (%http-status r))
                (is (not (search "<title>" r)))))
-        (bitcoin-lisp.rpc:stop-rpc-server)))))
+        (bl.rpc:stop-rpc-server)))))

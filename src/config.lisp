@@ -114,8 +114,8 @@ here, and load it back through the full verification gate.")
 strings, reversing both to our internal byte orders."
   (make-assumeutxo-data
    :height height
-   :blockhash (reverse (bitcoin-lisp.crypto:hex-to-bytes blockhash-hex))
-   :hash-serialized (reverse (bitcoin-lisp.crypto:hex-to-bytes hash-serialized-hex))
+   :blockhash (reverse (bl.crypto:hex-to-bytes blockhash-hex))
+   :hash-serialized (reverse (bl.crypto:hex-to-bytes hash-serialized-hex))
    :chain-tx-count chain-tx-count))
 
 (defun network-assumeutxo-data (network)
@@ -270,7 +270,7 @@ src/networking/ibd.lisp loads after src/validation/."
                        (:signet   "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329")
                        (:regtest  nil))))
         (when display
-          (reverse (bitcoin-lisp.crypto:hex-to-bytes display))))))
+          (reverse (bl.crypto:hex-to-bytes display))))))
 
 (defun minimum-chain-work (network)
   "Return NETWORK's nMinimumChainWork — the anti-DoS work floor below which a
@@ -542,7 +542,7 @@ Core's — a silent, opposite-direction divergence on a security-relevant flag."
 (defun log-categories-string ()
   "Core's LogCategoriesString: every category name, comma-separated, for the
 -loglevel error message."
-  (format nil "~{~A~^, ~}" (sort (copy-list bitcoin-lisp::+log-categories+) #'string<)))
+  (format nil "~{~A~^, ~}" (sort (copy-list bl::+log-categories+) #'string<)))
 
 (defun parse-loglevel-spec (value)
   "Parse one -loglevel value. Returns (VALUES category level), with CATEGORY NIL
@@ -558,7 +558,7 @@ staring at a log that will never contain what they asked for."
         (values nil (conf-parse-loglevel value))
         (let ((category (string-downcase (subseq value 0 colon)))
               (level (subseq value (1+ colon))))
-          (unless (and (bitcoin-lisp::log-category-known-p category)
+          (unless (and (bl::log-category-known-p category)
                        (member (string-downcase level)
                                '("info" "debug" "trace" "warn" "warning" "error")
                                :test #'string=))
@@ -627,7 +627,7 @@ NIL for non-hex / over-long input."
       (let ((padded (concatenate 'string
                                  (make-string (- 64 (length v)) :initial-element #\0)
                                  v)))
-        (bitcoin-lisp.crypto:hex-to-bytes padded)))))
+        (bl.crypto:hex-to-bytes padded)))))
 
 ;;; -uacomment / BIP14 subversion (Core init.cpp:1676-1686)
 
@@ -1712,16 +1712,16 @@ start-node-from-args."
         (let ((n (conf-parse-int v)))
           (unless (<= 1 n 64)
             (error "limitclustercount must be between 1 and 64"))
-          (setf bitcoin-lisp.mempool:*cluster-count-limit* n))))
+          (setf bl.mp:*cluster-count-limit* n))))
     (let ((v (lk "limitclustersize")))
       (when v
         (let ((kvb (conf-parse-int v)))
           (unless (plusp kvb)
             (error "limitclustersize must be a positive number of kvB"))
-          (setf bitcoin-lisp.mempool:*cluster-size-limit* (* kvb 1000)))))
+          (setf bl.mp:*cluster-size-limit* (* kvb 1000)))))
     (let ((v (lk "signetchallenge")))
-      (when v (setf bitcoin-lisp.validation:*signet-challenge*
-                    (bitcoin-lisp.crypto:hex-to-bytes v))))
+      (when v (setf bl.val:*signet-challenge*
+                    (bl.crypto:hex-to-bytes v))))
     ;; -assumevalid: a block hash (up to 64 hex digits, Core FromUserHex
     ;; left-pads) below which block scripts are assumed valid, or 0 to
     ;; disable the skip entirely (Core chainstatemanager_args.cpp:40-46).
@@ -1734,7 +1734,7 @@ start-node-from-args."
           (setf *assumevalid-override*
                 (if (every #'zerop display)
                     nil                              ; assumevalid=0: always verify
-                    (bitcoin-lisp.crypto:reverse-bytes display))))))
+                    (bl.crypto:reverse-bytes display))))))
     ;; -minimumchainwork: hex work floor overriding the per-network
     ;; nMinimumChainWork (Core chainstatemanager_args.cpp:32-38).
     (let ((v (lk "minimumchainwork")))
@@ -1750,7 +1750,7 @@ start-node-from-args."
     ;; -mempoolexpiry: hours before an untouched mempool entry is dropped
     ;; (Core mempool_args.cpp:57, default DEFAULT_MEMPOOL_EXPIRY_HOURS 336).
     (let ((v (lk "mempoolexpiry")))
-      (when v (setf bitcoin-lisp.mempool:*mempool-expiry-hours* (conf-parse-int v))))
+      (when v (setf bl.mp:*mempool-expiry-hours* (conf-parse-int v))))
     ;; -zmqpub<topic>=<address> [+ -zmqpub<topic>hwm]: recorded now, bound by
     ;; start-node. Nothing is loaded or opened here, so a node with no ZMQ
     ;; options never touches libzmq at all.
@@ -1764,9 +1764,9 @@ start-node-from-args."
         (v (let ((mb (conf-parse-int v)))
              (when (minusp mb)
                (error "Invalid value for -maxmempool=~A" v))
-             (setf bitcoin-lisp.mempool:*max-mempool-bytes* (* mb 1000 1000))))
+             (setf bl.mp:*max-mempool-bytes* (* mb 1000 1000))))
         ((let ((b (lk "blocksonly"))) (and b (conf-parse-bool b)))
-         (setf bitcoin-lisp.mempool:*max-mempool-bytes* (* 5 1000 1000)))))
+         (setf bl.mp:*max-mempool-bytes* (* 5 1000 1000)))))
     ;; -minrelaytxfee: BTC/kvB (Core ParseMoney, mempool_args.cpp:69-81).
     ;; Read at MAKE-MEMPOOL time like the cluster limits.
     (let ((v (lk "minrelaytxfee")))
@@ -1774,7 +1774,7 @@ start-node-from-args."
         (let ((sats (conf-parse-money v)))
           (unless sats
             (error "Invalid amount for -minrelaytxfee=~A" v))
-          (setf bitcoin-lisp.mempool:*min-relay-fee-rate* sats))))
+          (setf bl.mp:*min-relay-fee-rate* sats))))
     ;; -blockmintxfee: BTC/kvB floor for block-template selection (Core
     ;; miner.cpp:102-104, default DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/kvB).
     (let ((v (lk "blockmintxfee")))
@@ -1782,7 +1782,7 @@ start-node-from-args."
         (let ((sats (conf-parse-money v)))
           (unless sats
             (error "Invalid amount for -blockmintxfee=~A" v))
-          (setf bitcoin-lisp.mining:*block-min-tx-fee-rate* sats))))
+          (setf bl.mining:*block-min-tx-fee-rate* sats))))
     ;; -blockmaxweight / -blockreservedweight: block-template SELECTION budgets
     ;; (Core init.cpp:1079-1093). Neither relaxes consensus -- a block we build
     ;; is still validated against +max-block-weight+ like any other -- so the
@@ -1792,20 +1792,20 @@ start-node-from-args."
     (let ((v (lk "blockmaxweight")))
       (when v
         (let ((w (conf-parse-int v)))
-          (when (> w bitcoin-lisp.validation:+max-block-weight+)
+          (when (> w bl.val:+max-block-weight+)
             (error "Specified -blockmaxweight (~D) exceeds consensus maximum block weight (~D)"
-                   w bitcoin-lisp.validation:+max-block-weight+))
-          (setf bitcoin-lisp.mining:*block-max-weight* w))))
+                   w bl.val:+max-block-weight+))
+          (setf bl.mining:*block-max-weight* w))))
     (let ((v (lk "blockreservedweight")))
       (when v
         (let ((w (conf-parse-int v)))
-          (when (> w bitcoin-lisp.validation:+max-block-weight+)
+          (when (> w bl.val:+max-block-weight+)
             (error "Specified -blockreservedweight (~D) exceeds consensus maximum block weight (~D)"
-                   w bitcoin-lisp.validation:+max-block-weight+))
-          (when (< w bitcoin-lisp.mining:+minimum-block-reserved-weight+)
+                   w bl.val:+max-block-weight+))
+          (when (< w bl.mining:+minimum-block-reserved-weight+)
             (error "Specified -blockreservedweight (~D) is lower than minimum safety value of (~D)"
-                   w bitcoin-lisp.mining:+minimum-block-reserved-weight+))
-          (setf bitcoin-lisp.mining:*block-reserved-weight* w))))
+                   w bl.mining:+minimum-block-reserved-weight+))
+          (setf bl.mining:*block-reserved-weight* w))))
     ;; -maxtxfee: BTC, absolute cap on any wallet tx fee (Core init: BTC via
     ;; ParseMoney, default DEFAULT_TRANSACTION_MAXFEE = 0.1 BTC).
     (let ((v (lk "maxtxfee")))
@@ -1830,7 +1830,7 @@ start-node-from-args."
         (let ((sats (conf-parse-money v)))
           (unless sats
             (error "Invalid amount for -dustrelayfee=~A" v))
-          (setf bitcoin-lisp.validation::+dust-relay-fee-rate+ sats))))
+          (setf bl.val::+dust-relay-fee-rate+ sats))))
     ;; -incrementalrelayfee: BTC/kvB a replacement must beat the original by
     ;; (Core DEFAULT_INCREMENTAL_RELAY_FEE).
     (let ((v (lk "incrementalrelayfee")))
@@ -1838,7 +1838,7 @@ start-node-from-args."
         (let ((sats (conf-parse-money v)))
           (unless sats
             (error "Invalid amount for -incrementalrelayfee=~A" v))
-          (setf bitcoin-lisp.mempool::+incremental-relay-fee-rate+ sats))))
+          (setf bl.mp::+incremental-relay-fee-rate+ sats))))
     ;; -bytespersigop: equivalent bytes charged per weighted sigop (Core
     ;; DEFAULT_BYTES_PER_SIGOP, policy.h:49).
     (let ((v (lk "bytespersigop")))
@@ -1846,13 +1846,13 @@ start-node-from-args."
         (let ((n (conf-parse-int v)))
           (unless (and n (plusp n))
             (error "Invalid value for -bytespersigop=~A (must be a positive integer)" v))
-          (setf bitcoin-lisp.mempool::+bytes-per-sigop+ n))))
+          (setf bl.mp::+bytes-per-sigop+ n))))
     ;; -whitelistrelay / -whitelistforcerelay (Core net_permissions.h:20-22).
     (let ((v (lk "whitelistrelay")))
-      (when v (setf bitcoin-lisp.networking::*whitelist-relay* (conf-parse-bool v))))
+      (when v (setf bl.net::*whitelist-relay* (conf-parse-bool v))))
     (let ((v (lk "whitelistforcerelay")))
       (when v
-        (setf bitcoin-lisp.networking::*whitelist-force-relay* (conf-parse-bool v))))
+        (setf bl.net::*whitelist-force-relay* (conf-parse-bool v))))
     ;; -par: how many script-check worker threads. Core's semantics —
     ;; 0 means one per core, a NEGATIVE value leaves that many cores free, and
     ;; the result is clamped to MAX_SCRIPTCHECK_THREADS. Reading the negative
@@ -1860,8 +1860,8 @@ start-node-from-args."
     ;; asked to leave headroom on.
     (let ((v (lk "par")))
       (when v
-        (let ((n (bitcoin-lisp.validation::parse-par-threads (conf-parse-int v))))
-          (setf bitcoin-lisp.validation::+parallel-validation-workers+ n)
+        (let ((n (bl.val::parse-par-threads (conf-parse-int v))))
+          (setf bl.val::+parallel-validation-workers+ n)
           ;; Core: -par=1 means no extra threads at all.
           (setf *parallel-block-validation* (> n 1)))))
     ;; -acceptnonstdtxn: relay and mine transactions this node would otherwise
@@ -1875,7 +1875,7 @@ start-node-from-args."
           (when (and accept (member *network* '(:mainnet)))
             (error "acceptnonstdtxn is not currently supported for ~(~A~) chain"
                    *network*))
-          (setf bitcoin-lisp.validation::*require-standard* (not accept)))))
+          (setf bl.val::*require-standard* (not accept)))))
     ;; -forcednsseed: query the DNS seeds even with a full address book. It
     ;; does NOT override -dnsseed=0, which is Core's precedence too.
     (let ((v (lk "forcednsseed")))
@@ -1885,7 +1885,7 @@ start-node-from-args."
     ;; it as bytes would silence the option on every ordinary command line.
     (let ((v (lk "maxuploadtarget")))
       (when v
-        (setf bitcoin-lisp.networking::*max-upload-target*
+        (setf bl.net::*max-upload-target*
               (conf-parse-byte-units v))))
     ;; -peertimeout: seconds a peer has to complete the version handshake
     ;; (Core DEFAULT_PEER_CONNECT_TIMEOUT, net.h:87).
@@ -1903,7 +1903,7 @@ start-node-from-args."
         (let ((n (conf-parse-int v)))
           (unless (and n (plusp n))
             (error "Invalid value for -maxsendbuffer=~A (must be a positive integer)" v))
-          (setf bitcoin-lisp.networking::+max-send-buffer-bytes+ (* n 1000)))))
+          (setf bl.net::+max-send-buffer-bytes+ (* n 1000)))))
     ;; -maxtipage: how old the tip may be before the node still calls itself in
     ;; IBD (Core DEFAULT_MAX_TIP_AGE, kernel/chainstatemanager_opts.h:24).
     (let ((v (lk "maxtipage")))
@@ -1911,7 +1911,7 @@ start-node-from-args."
         (let ((n (conf-parse-int v)))
           (unless (and n (>= n 0))
             (error "Invalid value for -maxtipage=~A (must be a non-negative integer)" v))
-          (setf bitcoin-lisp.networking::+max-tip-age-seconds+ n))))
+          (setf bl.net::+max-tip-age-seconds+ n))))
     ;; -maxsigcachesize: MiB of signature cache (Core's knob is bytes split
     ;; across two caches; ours is one, counted in ENTRIES). A cache entry is a
     ;; 32-byte key, which is what Core's CuckooCache element is too, so the
@@ -1935,15 +1935,15 @@ start-node-from-args."
     ;; without mining a real chain (Core blockstorage.cpp:857-862). Test-only.
     (let ((v (lk "fastprune")))
       (when v
-        (setf bitcoin-lisp.storage:*fast-prune* (conf-parse-bool v))))
+        (setf bl.store:*fast-prune* (conf-parse-bool v))))
     ;; -blocksxor: obfuscate blocksdir contents (Core DEFAULT_XOR_BLOCKSDIR).
     (let ((v (lk "blocksxor")))
       (when v
-        (setf bitcoin-lisp.storage:*blocks-xor* (conf-parse-bool v))))
+        (setf bl.store:*blocks-xor* (conf-parse-bool v))))
     ;; -bantime: default setban duration in seconds (Core banman.h:19
     ;; DEFAULT_MISBEHAVING_BANTIME = 86400, applied when setban gets no time).
     (let ((v (lk "bantime")))
-      (when v (setf bitcoin-lisp.networking:*default-ban-time-seconds*
+      (when v (setf bl.net:*default-ban-time-seconds*
                     (conf-parse-int v))))
     ;; -uacomment (repeatable): BIP14 subversion comments. Unsafe characters
     ;; or an over-long result are init ERRORS (Core init.cpp:1676-1686).
@@ -1954,11 +1954,11 @@ start-node-from-args."
         (unless (ua-comment-safe-p cmt)
           (error "User Agent comment (~A) contains unsafe characters." cmt)))
       (when comments
-        (let ((subversion (bitcoin-lisp.serialization:subversion-with-build-rev comments)))
+        (let ((subversion (bl.ser:subversion-with-build-rev comments)))
           (when (> (length subversion) +max-subversion-length+)
             (error "Total length of network version string (~D) exceeds maximum length (~D). Reduce the number or size of uacomments."
                    (length subversion) +max-subversion-length+))
-          (setf bitcoin-lisp.serialization:*user-agent* subversion))))
+          (setf bl.ser:*user-agent* subversion))))
     ;; -dnsseed / -fixedseeds: peer-discovery source gates (Core net.h:96-97).
     (let ((v (lk "dnsseed")))
       (cond (v (setf *dns-seed-enabled* (conf-parse-bool v)))
@@ -1980,7 +1980,7 @@ start-node-from-args."
     ;; init.cpp:1803-1808, AddLocal LOCAL_MANUAL). Raw strings here; start-node
     ;; resolves them once the network (and thus the listen port) is known, and
     ;; errors on unparseable input like Core's ResolveErrMsg.
-    (setf bitcoin-lisp.networking:*external-ips*
+    (setf bl.net:*external-ips*
           (loop for (k . v) in merged
                 when (string= k "externalip")
                   collect v))
@@ -1995,24 +1995,24 @@ start-node-from-args."
       (flet ((parse-proxy (value)
                (multiple-value-bind (host port) (conf-parse-proxy value)
                  (when host
-                   (bitcoin-lisp.networking:make-proxy
+                   (bl.net:make-proxy
                     :host host :port port
                     :randomize-credentials randomize)))))
         (let ((v (lk "proxy")))
           (when v
-            (setf bitcoin-lisp.networking:*proxy* (parse-proxy v))))
+            (setf bl.net:*proxy* (parse-proxy v))))
         (let ((v (lk "onion")))
           ;; The torcontrol client only auto-configures the onion proxy from
           ;; Tor's GETINFO when -onion was never given at all (Core's raw
           ;; GetArg("-onion","") == "" test) — record the raw fact.
-          (setf bitcoin-lisp.networking:*onion-proxy-explicit* (and v t))
-          (cond (v (setf bitcoin-lisp.networking:*onion-proxy* (parse-proxy v)))
+          (setf bl.net:*onion-proxy-explicit* (and v t))
+          (cond (v (setf bl.net:*onion-proxy* (parse-proxy v)))
                 ;; No -onion: onion reachability follows -proxy when one was
                 ;; given (Core init.cpp:1764 "An empty string is used to not
                 ;; override the onion proxy").
                 ((lk "proxy")
-                 (setf bitcoin-lisp.networking:*onion-proxy*
-                       bitcoin-lisp.networking:*proxy*))))))
+                 (setf bl.net:*onion-proxy*
+                       bl.net:*proxy*))))))
     ;; Network reachability. -onlynet (repeatable) replaces the reachable set
     ;; (Core init.cpp:1529-1536 g_reachable_nets.RemoveAll + Add per value);
     ;; it restricts AUTOMATIC outbound selection and gossip storage only —
@@ -2021,20 +2021,20 @@ start-node-from-args."
     ;; -onlynet is an init error (Core init.cpp:1541-1546, 1760-1800,
     ;; 2240-2245): onion needs a Tor proxy, I2P needs -i2psam (which we do
     ;; not support at all yet), CJDNS needs -cjdnsreachable.
-    (setf bitcoin-lisp.networking:*cjdns-reachable*
+    (setf bl.net:*cjdns-reachable*
           (let ((v (lk "cjdnsreachable"))) (and v (conf-parse-bool v))))
     (let* ((onlynets (loop for (k . v) in merged
                            when (string= k "onlynet")
                              collect (conf-parse-network-name v)))
            (nets (or onlynets
-                     (copy-list bitcoin-lisp.networking:+bip155-networks+)))
+                     (copy-list bl.net:+bip155-networks+)))
            ;; Effective -listenonion via the shared soft-set chain.
            (listenonion-p (nth-value 1 (conf-effective-listen-flags merged))))
       ;; Keep the user's raw restriction for later transport arrivals (the
       ;; torcontrol GETINFO-discovered onion proxy re-admits :torv3 iff
       ;; -onlynet allows it — Core get_socks_cb).
-      (setf bitcoin-lisp.networking:*onlynet-networks* onlynets)
-      (unless bitcoin-lisp.networking:*onion-proxy*
+      (setf bl.net:*onlynet-networks* onlynets)
+      (unless bl.net:*onion-proxy*
         (when (member :torv3 onlynets)
           ;; Core init.cpp:1769-1773 / 1788-1798: -onion=0 explicitly forbids
           ;; the Tor route; otherwise -listenonion may still deliver a proxy
@@ -2047,11 +2047,11 @@ start-node-from-args."
       (when (member :i2p onlynets)
         (error "-onlynet=i2p given but I2P (SAM) is not supported"))
       (setf nets (remove :i2p nets))
-      (unless bitcoin-lisp.networking:*cjdns-reachable*
+      (unless bl.net:*cjdns-reachable*
         (when (member :cjdns onlynets)
           (error "-onlynet=cjdns given without -cjdnsreachable"))
         (setf nets (remove :cjdns nets)))
-      (setf bitcoin-lisp.networking:*reachable-networks* nets)
+      (setf bl.net:*reachable-networks* nets)
       ;; PRIVACY: requesting DNS seeds entails clearnet. Resolving a seed
       ;; hostname is a plaintext DNS query to the local resolver, and the
       ;; addresses it returns are dialed directly over IPv4/IPv6 — so a

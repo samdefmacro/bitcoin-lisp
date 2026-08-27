@@ -70,7 +70,7 @@ DEFAULT, so it applies to wallets created after it is set — an already-created
 wallet keeps the size it was made with, which is also Core's behaviour (the
 keypool size is per-wallet state).")
 
-(defconstant +wallet-client-version+ bitcoin-lisp.serialization:+client-version+
+(defconstant +wallet-client-version+ bl.ser:+client-version+
   "Written to the 'version' record on wallet creation: the creating client's
 version, as Core writes its CLIENT_VERSION.")
 
@@ -312,7 +312,7 @@ current time rather than the elapsed one: never a past timestamp while the key
 is live, and it advances as the scan runs, which is exactly the situation."
   (wallet-unlocked-key wallet)                    ; for effect: may relock
   (let ((until (wallet-relock-time wallet))
-        (now (bitcoin-lisp.serialization:get-unix-time)))
+        (now (bl.ser:get-unix-time)))
     (if (and (plusp until)
              (< until now)
              (wallet-scanning-with-passphrase wallet)
@@ -415,7 +415,7 @@ key (locked, or the encryption round-trip failed).
 On an encrypted wallet this writes walletdescriptorckey and never the
 plaintext walletdescriptorkey — the decision is per WALLET, not per SPKM, so
 a fresh SPKM created after encryption is born encrypted."
-  (let ((keyid (bitcoin-lisp.crypto:hash160 pubkey)))
+  (let ((keyid (bl.crypto:hash160 pubkey)))
     (when (or (gethash keyid (desc-spkm-keys spkm))
               (gethash keyid (desc-spkm-crypted-keys spkm)))
       (return-from spkm-add-key t))
@@ -436,12 +436,12 @@ a fresh SPKM created after encryption is born encrypted."
                  (value (wdb-vector-value ciphertext)))
              (if batch
                  (progn
-                   (bitcoin-lisp.storage:leveldb-writebatch-put batch ckey value)
-                   (bitcoin-lisp.storage:leveldb-writebatch-delete batch plain-key))
-                 (bitcoin-lisp.storage:with-leveldb-writebatch (own)
-                   (bitcoin-lisp.storage:leveldb-writebatch-put own ckey value)
-                   (bitcoin-lisp.storage:leveldb-writebatch-delete own plain-key)
-                   (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) own
+                   (bl.store:leveldb-writebatch-put batch ckey value)
+                   (bl.store:leveldb-writebatch-delete batch plain-key))
+                 (bl.store:with-leveldb-writebatch (own)
+                   (bl.store:leveldb-writebatch-put own ckey value)
+                   (bl.store:leveldb-writebatch-delete own plain-key)
+                   (bl.store:leveldb-write (wallet-db wallet) own
                                                        :sync t))))
            (setf (gethash keyid (desc-spkm-crypted-keys spkm))
                  (cons pubkey ciphertext)))))
@@ -452,8 +452,8 @@ a fresh SPKM created after encryption is born encrypted."
              (value (wdb-descriptor-key-value
                      pubkey (privkey-to-der priv32 compressed-p))))
          (if batch
-             (bitcoin-lisp.storage:leveldb-writebatch-put batch key value)
-             (bitcoin-lisp.storage:leveldb-put (wallet-db wallet) key value
+             (bl.store:leveldb-writebatch-put batch key value)
+             (bl.store:leveldb-put (wallet-db wallet) key value
                                                :sync t))))))
   t)
 
@@ -473,15 +473,15 @@ BATCH the write is synchronous+fsynced — GetNewDestination relies on the
 next_index landing on disk BEFORE the address is handed out."
   (multiple-value-bind (key value) (%spkm-descriptor-record spkm)
     (if batch
-        (bitcoin-lisp.storage:leveldb-writebatch-put batch key value)
-        (bitcoin-lisp.storage:leveldb-put (wallet-db wallet) key value :sync t))))
+        (bl.store:leveldb-writebatch-put batch key value)
+        (bl.store:leveldb-put (wallet-db wallet) key value :sync t))))
 
 (defun %spkm-write-cache-diff (spkm diff batch)
   "Queue walletdescriptorcache/-lhcache records for the new entries in DIFF
 (Core WriteDescriptorCacheItems, walletdb.cpp:266-287)."
   (let ((id (desc-spkm-id spkm)))
     (maphash (lambda (expr-index xpub)
-               (bitcoin-lisp.storage:leveldb-writebatch-put
+               (bl.store:leveldb-writebatch-put
                 batch
                 (wdb-key-descriptor-parent-cache +wdb-key-walletdescriptorcache+
                                                  id expr-index)
@@ -489,14 +489,14 @@ next_index landing on disk BEFORE the address is handed out."
              (descriptor-cache-parent-xpubs diff))
     (maphash (lambda (expr-index inner)
                (maphash (lambda (der-index xpub)
-                          (bitcoin-lisp.storage:leveldb-writebatch-put
+                          (bl.store:leveldb-writebatch-put
                            batch
                            (wdb-key-descriptor-derived-cache id expr-index der-index)
                            (wdb-xpub-value xpub)))
                         inner))
              (descriptor-cache-derived-xpubs diff))
     (maphash (lambda (expr-index xpub)
-               (bitcoin-lisp.storage:leveldb-writebatch-put
+               (bl.store:leveldb-writebatch-put
                 batch
                 (wdb-key-descriptor-parent-cache +wdb-key-walletdescriptorlhcache+
                                                  id expr-index)
@@ -543,7 +543,7 @@ pubkey map."
                          ;; failure would otherwise be invisible. The
                          ;; ordinary cause is a locked encrypted wallet
                          ;; whose descriptor needs a private key to expand.
-                         (bitcoin-lisp:log-warn
+                         (bl:log-warn
                           "Topping up keypool for descriptor ~A failed at index ~D~@[ (wallet is locked)~]"
                           (desc-spkm-desc-string spkm) i
                           (wallet-is-locked-p wallet))
@@ -571,9 +571,9 @@ batch is written+fsynced here (Core TopUp). Returns T on success, NIL when
 expansion needs unavailable private keys."
   (if batch
       (%spkm-top-up-into wallet spkm size batch)
-      (bitcoin-lisp.storage:with-leveldb-writebatch (own-batch)
+      (bl.store:with-leveldb-writebatch (own-batch)
         (when (%spkm-top-up-into wallet spkm size own-batch)
-          (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) own-batch
+          (bl.store:leveldb-write (wallet-db wallet) own-batch
                                               :sync t)
           t))))
 
@@ -684,11 +684,11 @@ when PURPOSE is non-NIL, persist the purpose (when given) and name records."
     (setf (addr-book-entry-label entry) label)
     (when purpose
       (setf (addr-book-entry-purpose entry) purpose)
-      (bitcoin-lisp.storage:leveldb-put
+      (bl.store:leveldb-put
        (wallet-db wallet)
        (wdb-key-address-string +wdb-key-purpose+ address)
        (wdb-string-value purpose)))
-    (bitcoin-lisp.storage:leveldb-put
+    (bl.store:leveldb-put
      (wallet-db wallet)
      (wdb-key-address-string +wdb-key-name+ address)
      (wdb-string-value label)
@@ -751,8 +751,8 @@ sh(wpkh) 49h, wpkh 84h, tr 86h; coin 0h mainnet / 1h test chains; account 0h;
           (value (coerce (desc-spkm-id spkm)
                          '(simple-array (unsigned-byte 8) (*)))))
       (if batch
-          (bitcoin-lisp.storage:leveldb-writebatch-put batch key value)
-          (bitcoin-lisp.storage:leveldb-put (wallet-db wallet) key value
+          (bl.store:leveldb-writebatch-put batch key value)
+          (bl.store:leveldb-put (wallet-db wallet) key value
                                             :sync t))))
   (let ((table (if internal (wallet-internal-spkms wallet)
                    (wallet-external-spkms wallet)))
@@ -770,7 +770,7 @@ and erase its record iff SPKM currently holds it."
   (let ((table (if internal (wallet-internal-spkms wallet)
                    (wallet-external-spkms wallet))))
     (when (eq (gethash type table) spkm)
-      (bitcoin-lisp.storage:leveldb-delete
+      (bl.store:leveldb-delete
        (wallet-db wallet)
        (wdb-key-active-spk internal (%output-type-code type)))
       (remhash type table))))
@@ -780,15 +780,15 @@ and erase its record iff SPKM currently holds it."
 {44h, 49h, 84h, 86h} — from MASTER-XPRV (Core SetupDescriptorScriptPubKeyMans,
 wallet.cpp:3594-3602)."
   (let* ((network (wallet-network wallet))
-         (master-xpub (bitcoin-lisp.crypto:bip32-neuter master-xprv))
-         (xpub-string (bitcoin-lisp.crypto:bip32-serialize master-xpub))
-         (master-priv (subseq (bitcoin-lisp.crypto:ext-key-key master-xprv) 1 33))
-         (master-pub (bitcoin-lisp.crypto:ext-key-public-bytes master-xprv))
-         (now (bitcoin-lisp.serialization:get-unix-time)))
+         (master-xpub (bl.crypto:bip32-neuter master-xprv))
+         (xpub-string (bl.crypto:bip32-serialize master-xpub))
+         (master-priv (subseq (bl.crypto:ext-key-key master-xprv) 1 33))
+         (master-pub (bl.crypto:ext-key-public-bytes master-xprv))
+         (now (bl.ser:get-unix-time)))
     ;; All 8 SPKMs' records — keys, descriptors (written by TopUp), caches,
     ;; active mappings — land in ONE atomic fsynced batch, like Core's
     ;; RunWithinTxn around SetupOwnDescriptorScriptPubKeyMans.
-    (bitcoin-lisp.storage:with-leveldb-writebatch (batch)
+    (bl.store:with-leveldb-writebatch (batch)
       (dolist (internal '(nil t))
         (dolist (type +output-types+)
           (let* ((desc-str (generate-wallet-descriptor-string
@@ -814,10 +814,10 @@ wallet.cpp:3594-3602)."
       (when (wallet-flag-set-p wallet +wallet-flag-blank-wallet+)
         (setf (wallet-flags wallet)
               (logandc2 (wallet-flags wallet) +wallet-flag-blank-wallet+))
-        (bitcoin-lisp.storage:leveldb-writebatch-put
+        (bl.store:leveldb-writebatch-put
          batch (wdb-key-simple +wdb-key-flags+)
          (wdb-uint64-value (wallet-flags wallet))))
-      (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t))
+      (bl.store:leveldb-write (wallet-db wallet) batch :sync t))
     (wallet-maybe-update-birth-time wallet now)))
 
 (defun %create-one-descriptor-spkm (wallet xpub-string master-priv master-pub
@@ -858,7 +858,7 @@ cannot recover from their backup of the other one."
                  (let ((xprv (%desc-key-root-xprv
                               key (spkm-privkey-provider wallet spkm))))
                    (when xprv
-                     (pushnew (bitcoin-lisp.crypto:bip32-serialize xprv) roots
+                     (pushnew (bl.crypto:bip32-serialize xprv) roots
                               :test #'string=))))))
     (cond
       ((null roots)
@@ -867,7 +867,7 @@ cannot recover from their backup of the other one."
       ((cdr roots)
        (error 'rpc-error :code +rpc-invalid-address-or-key+
                          :message "Unable to determine which HD key to use from active descriptors. Please specify with 'hdkey'"))
-      (t (bitcoin-lisp.crypto:bip32-parse (first roots))))))
+      (t (bl.crypto:bip32-parse (first roots))))))
 
 (defun rpc-createwalletdescriptor (node params)
   "Create the wallet's descriptor for an address type it does not yet have
@@ -899,25 +899,25 @@ result is an array."
         (with-wallet-lock (wallet)
           (wallet-ensure-unlocked wallet)
           (let* ((root (if hdkey
-                           (or (ignore-errors (bitcoin-lisp.crypto:bip32-parse hdkey))
+                           (or (ignore-errors (bl.crypto:bip32-parse hdkey))
                                (error 'rpc-error :code +rpc-invalid-address-or-key+
                                                  :message "Unable to parse HD key. Please provide a valid xpub"))
                            (%wallet-single-active-root-xprv wallet)))
-                 (xprv (if (bitcoin-lisp.crypto:ext-key-privatep root)
+                 (xprv (if (bl.crypto:ext-key-privatep root)
                            root
                            ;; An xpub was given: we must hold its private half,
                            ;; or the descriptor would be watch-only in a wallet
                            ;; that claims to control it.
                            (error 'rpc-error :code +rpc-invalid-address-or-key+
                                              :message (format nil "Private key for ~A is not known"
-                                                              (bitcoin-lisp.crypto:bip32-serialize root)))))
-                 (xpub-string (bitcoin-lisp.crypto:bip32-serialize
-                               (bitcoin-lisp.crypto:bip32-neuter xprv)))
-                 (master-priv (subseq (bitcoin-lisp.crypto:ext-key-key xprv) 1 33))
-                 (master-pub (bitcoin-lisp.crypto:ext-key-public-bytes xprv))
-                 (now (bitcoin-lisp.serialization:get-unix-time))
+                                                              (bl.crypto:bip32-serialize root)))))
+                 (xpub-string (bl.crypto:bip32-serialize
+                               (bl.crypto:bip32-neuter xprv)))
+                 (master-priv (subseq (bl.crypto:ext-key-key xprv) 1 33))
+                 (master-pub (bl.crypto:ext-key-public-bytes xprv))
+                 (now (bl.ser:get-unix-time))
                  (made '()))
-            (bitcoin-lisp.storage:with-leveldb-writebatch (batch)
+            (bl.store:with-leveldb-writebatch (batch)
               (dolist (internal internals)
                 (let ((spkm (%create-one-descriptor-spkm
                              wallet xpub-string master-priv master-pub
@@ -927,7 +927,7 @@ result is an array."
                 ;; Nothing written; the batch is dropped unapplied.
                 (error 'rpc-error :code +rpc-wallet-error+
                                   :message "Descriptor already exists"))
-              (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t))
+              (bl.store:leveldb-write (wallet-db wallet) batch :sync t))
             `(("descs" . ,(mapcar (lambda (spkm)
                                     (%spkm-descriptor-string wallet spkm nil))
                                   (nreverse made))))))))))
@@ -939,8 +939,8 @@ GenerateRandomKey -> CExtKey::SetSeed over the 32 secret bytes)."
     (let ((seed (ironclad:random-data 32)))
       (let ((n (reduce (lambda (acc b) (logior (ash acc 8) b)) seed
                        :initial-value 0)))
-        (when (< 0 n bitcoin-lisp.crypto:+secp256k1-order+)
-          (return (bitcoin-lisp.crypto:bip32-master-key
+        (when (< 0 n bl.crypto:+secp256k1-order+)
+          (return (bl.crypto:bip32-master-key
                    seed
                    :network (if (eq network :mainnet) :mainnet :testnet))))))))
 
@@ -955,10 +955,10 @@ by callers with chain access; without one (unload/shutdown, where the last
 processed block is on the active chain anyway) a single-hash locator is
 written — fork lookup still succeeds unless that exact block was reorged
 away, in which case the load-time catch-up rescans from genesis (safe)."
-  (bitcoin-lisp.storage:leveldb-put (wallet-db wallet)
+  (bl.store:leveldb-put (wallet-db wallet)
                                     (wdb-key-simple +wdb-key-bestblock+)
                                     (wdb-block-locator-value '()))
-  (bitcoin-lisp.storage:leveldb-put
+  (bl.store:leveldb-put
    (wallet-db wallet)
    (wdb-key-simple +wdb-key-bestblock-nomerkle+)
    (wdb-block-locator-value
@@ -1017,9 +1017,9 @@ left LOCKED."
         (handler-case
             (with-wallet-lock (wallet)
               ;; version record first (CWallet::CreateNew), then flags.
-              (bitcoin-lisp.storage:leveldb-put db (wdb-key-simple +wdb-key-version+)
+              (bl.store:leveldb-put db (wdb-key-simple +wdb-key-version+)
                                                 (wdb-int32-value +wallet-client-version+))
-              (bitcoin-lisp.storage:leveldb-put db (wdb-key-simple +wdb-key-flags+)
+              (bl.store:leveldb-put db (wdb-key-simple +wdb-key-flags+)
                                                 (wdb-uint64-value flags) :sync t)
               (unless (or disable-private-keys blank-flag)
                 (wallet-setup-descriptor-spkms wallet (generate-wallet-master-key
@@ -1042,7 +1042,7 @@ left LOCKED."
           (error (e)
             ;; Creation failed mid-way: close the DB so the directory is not
             ;; left open, then re-signal.
-            (bitcoin-lisp.storage:leveldb-close db)
+            (bl.store:leveldb-close db)
             (error e)))
         (setf (gethash name (wallet-manager-wallets manager)) wallet)
         (setf (wallet-manager-wallet-order manager)
@@ -1114,8 +1114,8 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
            ;; Records on disk are the persistent locks (lockunspent
            ;; persistent=true); memory-only locks never reach the DB.
            (push (%wparse (s fields)
-                   (list (bitcoin-lisp.serialization:read-bytes s 32)
-                         (bitcoin-lisp.serialization:read-uint32-le s)
+                   (list (bl.ser:read-bytes s 32)
+                         (bl.ser:read-uint32-le s)
                          t))
                  (wallet-locked-utxos wallet)))
           ((equal type +wdb-key-tx+)
@@ -1155,7 +1155,7 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                    (unless priv
                      (error 'rpc-error :code +rpc-wallet-error+
                                        :message "Error reading wallet database: descriptor private key checksum mismatch"))
-                   (setf (gethash (bitcoin-lisp.crypto:hash160 pubkey)
+                   (setf (gethash (bl.crypto:hash160 pubkey)
                                   (desc-spkm-keys spkm))
                          (cons priv (= (length pubkey) 33)))))))
           ((equal type +wdb-key-walletdescriptorckey+)
@@ -1173,7 +1173,7 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                 (error 'rpc-error :code +rpc-wallet-error+
                                   :message "Error reading wallet database: descriptor encrypted key CPubKey corrupt"))
                (t
-                (setf (gethash (bitcoin-lisp.crypto:hash160 pubkey)
+                (setf (gethash (bl.crypto:hash160 pubkey)
                                (desc-spkm-crypted-keys spkm))
                       (cons pubkey (wdb-parse-vector-value (cdr rec))))))))
           ((equal type +wdb-key-walletdescriptorcache+)
@@ -1182,11 +1182,11 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                              (setf (gethash id caches) (make-descriptor-cache))))
                   (xpub (wdb-parse-xpub-value (cdr rec) network)))
              (%wparse (s fields)
-               (bitcoin-lisp.serialization:read-bytes s 32)
-               (let ((key-exp (bitcoin-lisp.serialization:read-uint32-le s)))
+               (bl.ser:read-bytes s 32)
+               (let ((key-exp (bl.ser:read-uint32-le s)))
                  (if (= (length fields) 40)      ; id + keyexp + derindex
                      (setf (descriptor-cache-derived
-                            cache key-exp (bitcoin-lisp.serialization:read-uint32-le s))
+                            cache key-exp (bl.ser:read-uint32-le s))
                            xpub)
                      (setf (descriptor-cache-parent cache key-exp) xpub))))))
           ((equal type +wdb-key-walletdescriptorlhcache+)
@@ -1195,9 +1195,9 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                              (setf (gethash id caches) (make-descriptor-cache))))
                   (xpub (wdb-parse-xpub-value (cdr rec) network)))
              (%wparse (s fields)
-               (bitcoin-lisp.serialization:read-bytes s 32)
+               (bl.ser:read-bytes s 32)
                (setf (descriptor-cache-last-hardened
-                      cache (bitcoin-lisp.serialization:read-uint32-le s))
+                      cache (bl.ser:read-uint32-le s))
                      xpub))))
           ((or (equal type +wdb-key-activeexternalspk+)
                (equal type +wdb-key-activeinternalspk+))
@@ -1274,7 +1274,7 @@ RPC after registration, mirroring Core's LoadWallet -> AttachChain split."
               (loop for spkm being the hash-values of (wallet-internal-spkms wallet)
                     do (spkm-top-up wallet spkm)))
           (error (e)
-            (bitcoin-lisp.storage:leveldb-close db)
+            (bl.store:leveldb-close db)
             (error e)))
         (setf (gethash name (wallet-manager-wallets manager)) wallet)
         (setf (wallet-manager-wallet-order manager)
@@ -1294,7 +1294,7 @@ shutdown path — which flags the scan to abort and proceeds."
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (with-wallet-lock (wallet)
       (wallet-write-best-block wallet)
-      (bitcoin-lisp.storage:leveldb-close (wallet-db wallet))
+      (bl.store:leveldb-close (wallet-db wallet))
       (setf (wallet-db wallet) nil)
       ;; Every unload path funnels through here, so this is the one place
       ;; that has to scrub the decrypted master key.
@@ -1356,7 +1356,7 @@ the operator can still repair by hand."
                     (values nil nil))))
             (values (make-hash-table :test 'equal) t))
       (error (e)
-        (bitcoin-lisp:log-warn "settings.json at ~A is unreadable (~A); wallet auto-load is disabled and the load_on_startup setting cannot be updated until it is repaired or removed"
+        (bl:log-warn "settings.json at ~A is unreadable (~A); wallet auto-load is disabled and the load_on_startup setting cannot be updated until it is repaired or removed"
                                path e)
         (values nil nil)))))
 
@@ -1375,12 +1375,12 @@ crash can leave the renamed file empty or revert the rename entirely
                                  :if-exists :supersede :if-does-not-exist :create)
             (yason:encode table s)
             (terpri s))
-          (bitcoin-lisp.storage::fsync-file tmp)
+          (bl.store::fsync-file tmp)
           (rename-file tmp path)
-          (bitcoin-lisp.storage::fsync-directory path)
+          (bl.store::fsync-directory path)
           t)
       (error (e)
-        (bitcoin-lisp:log-warn "could not write ~A: ~A" path e)
+        (bl:log-warn "could not write ~A: ~A" path e)
         (ignore-errors (delete-file tmp))
         nil))))
 
@@ -1471,7 +1471,7 @@ the request came in on the base endpoint. Bound per-request by rpc-handler.")
 (defun node-wallet-manager-checked (node)
   "The node's wallet manager, or the same error a no-wallet Core build gives
 for wallet RPCs: method not found."
-  (or (bitcoin-lisp::node-wallet-manager node)
+  (or (bl::node-wallet-manager node)
       (error 'rpc-error :code +rpc-method-not-found+
                         :message "Method not found (wallet support is disabled)")))
 
@@ -1512,10 +1512,10 @@ relock cannot land between this test and the signing that follows it."
   "(values hash height) of the active chainstate tip, under the node-lock.
 Callers take this BEFORE any wallet lock (lock order)."
   (with-node-lock (node)
-    (let ((cs (bitcoin-lisp::node-current-chainstate node)))
+    (let ((cs (bl::node-current-chainstate node)))
       (if cs
-          (values (bitcoin-lisp.storage:best-block-hash cs)
-                  (max (bitcoin-lisp.storage:current-height cs) 0))
+          (values (bl.store:best-block-hash cs)
+                  (max (bl.store:current-height cs) 0))
           (values nil 0)))))
 
 (defun %wallet-tip-time-and-mtp (node)
@@ -1524,15 +1524,15 @@ of a \"now\" timestamp) is the tip's median-time-past and the lowest-timestamp
 accumulator starts at the tip's block time (Core backup.cpp:385-388), falling
 back to wall-clock time when there is no tip."
   (with-node-lock (node)
-    (let* ((cs (bitcoin-lisp::node-current-chainstate node))
-           (hash (and cs (bitcoin-lisp.storage:best-block-hash cs)))
-           (entry (and hash (bitcoin-lisp.storage:get-block-index-entry cs hash))))
+    (let* ((cs (bl::node-current-chainstate node))
+           (hash (and cs (bl.store:best-block-hash cs)))
+           (entry (and hash (bl.store:get-block-index-entry cs hash))))
       (if entry
-          (values (bitcoin-lisp.serialization:block-header-timestamp
-                   (bitcoin-lisp.storage:block-index-entry-header entry))
-                  (or (bitcoin-lisp.validation:compute-median-time-past-from-entry entry)
+          (values (bl.ser:block-header-timestamp
+                   (bl.store:block-index-entry-header entry))
+                  (or (bl.val:compute-median-time-past-from-entry entry)
                       0))
-          (let ((now (bitcoin-lisp.serialization:get-unix-time)))
+          (let ((now (bl.ser:get-unix-time)))
             (values now now))))))
 
 (defun %label-from-value (value)
@@ -1618,7 +1618,7 @@ sequence has exactly one definition."
   (multiple-value-bind (wallet warnings)
       (with-node-lock (node)
         (load-wallet manager name
-                     :chain-state (bitcoin-lisp::node-current-chainstate node)))
+                     :chain-state (bl::node-current-chainstate node)))
     ;; Catch up from the stored locator OUTSIDE the node-lock hold — the
     ;; scan takes it per segment; blocks connecting meanwhile reach the
     ;; wallet through the hooks (Core registers notifications pre-rescan).
@@ -1630,15 +1630,15 @@ sequence has exactly one definition."
     ;; requestMempoolTransactions); the attach-chain scan only does this
     ;; when the wallet was behind the tip.
     (with-node-lock (node)
-      (let ((mempool (bitcoin-lisp::node-mempool node)))
+      (let ((mempool (bl::node-mempool node)))
         (when mempool
-          (bitcoin-lisp.mempool:mempool-for-each
+          (bl.mp:mempool-for-each
            mempool
            (lambda (txid entry)
              (declare (ignore txid))
              (wallet-transaction-added-to-mempool
               wallet mempool
-              (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))))
+              (bl.mp:mempool-entry-transaction entry)))))))
     ;; Core postInitProcess: push the wallet's own unconfirmed txs back
     ;; into OUR mempool without relaying them (wallet.cpp:3305). Takes
     ;; its own locks — must run outside the node-lock hold above.
@@ -1656,7 +1656,7 @@ listed wallet fails to load. We log it and skip to the next one. The node runs
 under a respawn supervisor, so aborting would turn one corrupt wallet into an
 endless restart loop with no node at all — strictly worse than a running node
 whose wallet is missing and loudly logged."
-  (let ((manager (bitcoin-lisp::node-wallet-manager node)))
+  (let ((manager (bl::node-wallet-manager node)))
     (when manager
       ;; -wallet=<name> FIRST, then what settings.json recorded, duplicates
       ;; dropped. Core merges the two through one settings list
@@ -1670,14 +1670,14 @@ whose wallet is missing and loudly logged."
                              (wallet-manager-data-directory manager)))
                     :test #'string= :from-end t)))
         (when names
-          (bitcoin-lisp:log-info "Loading ~D wallet~:P at startup: ~{~S~^, ~}"
+          (bl:log-info "Loading ~D wallet~:P at startup: ~{~S~^, ~}"
                                  (length names) names))
         (dolist (name names)
           (handler-case
               (progn (%load-and-attach-wallet node manager name)
-                     (bitcoin-lisp:log-info "Loaded wallet ~S" name))
+                     (bl:log-info "Loaded wallet ~S" name))
             (error (e)
-              (bitcoin-lisp:log-warn "Could not load wallet ~S at startup, skipping it: ~A"
+              (bl:log-warn "Could not load wallet ~S at startup, skipping it: ~A"
                                      name e))))))))
 
 (defun rpc-loadwallet (node params)
@@ -1789,7 +1789,7 @@ backend (leveldb, where Core says sqlite)."
           ("avoid_reuse" . ,(json-bool (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+)))
           ("scanning" . ,(let ((since (wallet-scanning-since wallet)))
                            (if since
-                               `(("duration" . ,(- (bitcoin-lisp.serialization:get-unix-time)
+                               `(("duration" . ,(- (bl.ser:get-unix-time)
                                                    since))
                                  ("progress" . ,(wallet-scan-progress wallet)))
                                +json-false+)))
@@ -1954,9 +1954,9 @@ which is the whole point of the RPC."
                    (let* ((xprv (%desc-key-root-xprv
                                  key (spkm-privkey-provider wallet spkm)))
                           (xpub-key (or (desc-key-extkey key)
-                                        (and xprv (bitcoin-lisp.crypto:bip32-neuter xprv)))))
+                                        (and xprv (bl.crypto:bip32-neuter xprv)))))
                      (when xpub-key
-                       (let ((xpub (bitcoin-lisp.crypto:bip32-serialize xpub-key)))
+                       (let ((xpub (bl.crypto:bip32-serialize xpub-key)))
                          (unless (gethash xpub by-xpub)
                            (setf (gethash xpub by-xpub) (list nil nil))
                            (push xpub order))
@@ -1970,7 +1970,7 @@ which is the whole point of the RPC."
                     `(("xpub" . ,xpub)
                       ("has_private" . ,(json-bool (and xprv t)))
                       ,@(when (and private xprv)
-                          `(("xprv" . ,(bitcoin-lisp.crypto:bip32-serialize xprv))))
+                          `(("xprv" . ,(bl.crypto:bip32-serialize xprv))))
                       ("descriptors"
                        . ,(or (mapcar (lambda (pair)
                                         `(("desc" . ,(%spkm-descriptor-string
@@ -2054,11 +2054,11 @@ error, as Core makes it — the caller has misunderstood the state."
   "Write the wallet's flag word (Core WalletBatch::WriteWalletFlags). A flag
 that lived only in memory would come back on the next load, which for
 avoid_reuse means silently resuming address reuse."
-  (bitcoin-lisp.storage:with-leveldb-writebatch (batch)
-    (bitcoin-lisp.storage:leveldb-writebatch-put
+  (bl.store:with-leveldb-writebatch (batch)
+    (bl.store:leveldb-writebatch-put
      batch (wdb-key-simple +wdb-key-flags+)
      (wdb-uint64-value (wallet-flags wallet)))
-    (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t))
+    (bl.store:leveldb-write (wallet-db wallet) batch :sync t))
   t)
 
 (defun %out-desc-embedded-keys (desc)
@@ -2069,8 +2069,8 @@ avoid_reuse means silently resuming address reuse."
       (cond
         ((desc-key-ext-privkey key)
          (let ((xprv (desc-key-ext-privkey key)))
-           (push (list (bitcoin-lisp.crypto:ext-key-public-bytes xprv)
-                       (subseq (bitcoin-lisp.crypto:ext-key-key xprv) 1 33)
+           (push (list (bl.crypto:ext-key-public-bytes xprv)
+                       (subseq (bl.crypto:ext-key-key xprv) 1 33)
                        t)
                  out)))
         ((desc-key-privkey key)
@@ -2252,7 +2252,7 @@ descriptors. Core's rules, all of them load-bearing for a real wallet export:
                      desc range-start
                      (lambda (keyid)
                        (loop for (pubkey priv) in keys
-                             when (equalp keyid (bitcoin-lisp.crypto:hash160 pubkey))
+                             when (equalp keyid (bl.crypto:hash160 pubkey))
                                do (return priv)))
                      (make-descriptor-cache))
                   (descriptor-derivation-error ()

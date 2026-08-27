@@ -51,12 +51,12 @@
 
 (defun %wser-string (s str)
   "std::string: compactsize length + raw bytes."
-  (bitcoin-lisp.serialization:write-var-bytes
+  (bl.ser:write-var-bytes
    s (flexi-streams:string-to-octets str :external-format :ascii)))
 
 (defun %wread-string (s)
   (flexi-streams:octets-to-string
-   (bitcoin-lisp.serialization:read-var-bytes s)
+   (bl.ser:read-var-bytes s)
    :external-format :ascii))
 
 (defmacro %wparse ((stream bytes &key (start 0)) &body body)
@@ -109,7 +109,7 @@
   "Encode a 32-byte secret as Core's CPrivKey DER form (key.cpp
 ec_seckey_export_der): fixed template + secret + serialized public key.
 214 bytes compressed, 279 uncompressed."
-  (let ((pubkey (bitcoin-lisp.crypto:derive-public-key
+  (let ((pubkey (bl.crypto:derive-public-key
                  priv32 :compressed compressed-p)))
     (if compressed-p
         (concatenate '(vector (unsigned-byte 8))
@@ -159,17 +159,17 @@ ec_seckey_import_der), or NIL if malformed."
   "The BIP32_EXTKEY_SIZE encoding: depth(1) fingerprint(4) child(4,BE)
 chaincode(32) pubkey(33)."
   (%wser (s)
-    (bitcoin-lisp.serialization:write-uint8 s (bitcoin-lisp.crypto:ext-key-depth k))
+    (bl.ser:write-uint8 s (bl.crypto:ext-key-depth k))
     (loop for shift in '(-24 -16 -8 0)
-          do (bitcoin-lisp.serialization:write-uint8
-              s (logand (ash (bitcoin-lisp.crypto:ext-key-parent-fingerprint k) shift)
+          do (bl.ser:write-uint8
+              s (logand (ash (bl.crypto:ext-key-parent-fingerprint k) shift)
                         #xff)))
     (loop for shift in '(-24 -16 -8 0)
-          do (bitcoin-lisp.serialization:write-uint8
-              s (logand (ash (bitcoin-lisp.crypto:ext-key-child-number k) shift) #xff)))
-    (bitcoin-lisp.serialization:write-bytes s (bitcoin-lisp.crypto:ext-key-chain-code k))
-    (bitcoin-lisp.serialization:write-bytes
-     s (bitcoin-lisp.crypto:ext-key-public-bytes k))))
+          do (bl.ser:write-uint8
+              s (logand (ash (bl.crypto:ext-key-child-number k) shift) #xff)))
+    (bl.ser:write-bytes s (bl.crypto:ext-key-chain-code k))
+    (bl.ser:write-bytes
+     s (bl.crypto:ext-key-public-bytes k))))
 
 (defun %ext-pubkey-decode (bytes network)
   "Inverse of %ext-pubkey-encode. NETWORK supplies the xpub version prefix
@@ -181,10 +181,10 @@ chaincode(32) pubkey(33)."
                  for i from offset below (+ offset 4)
                  do (setf r (logior (ash r 8) (aref bytes i)))
                  finally (return r))))
-    (bitcoin-lisp.crypto:make-ext-key
+    (bl.crypto:make-ext-key
      :version (if (eq network :mainnet)
-                  bitcoin-lisp.crypto:+xpub-mainnet+
-                  bitcoin-lisp.crypto:+xpub-testnet+)
+                  bl.crypto:+xpub-mainnet+
+                  bl.crypto:+xpub-testnet+)
      :depth (aref bytes 0)
      :parent-fingerprint (be32 1)
      :child-number (be32 5)
@@ -200,32 +200,32 @@ chaincode(32) pubkey(33)."
 
 (defun wdb-key-descriptor (desc-id)
   (%wser (s) (%wser-string s +wdb-key-walletdescriptor+)
-             (bitcoin-lisp.serialization:write-bytes s desc-id)))
+             (bl.ser:write-bytes s desc-id)))
 
 (defun wdb-key-descriptor-key (type desc-id pubkey)
   "Key for walletdescriptorkey / walletdescriptorckey: type + desc id +
 CPubKey (compactsize-prefixed)."
   (%wser (s) (%wser-string s type)
-             (bitcoin-lisp.serialization:write-bytes s desc-id)
-             (bitcoin-lisp.serialization:write-var-bytes s pubkey)))
+             (bl.ser:write-bytes s desc-id)
+             (bl.ser:write-var-bytes s pubkey)))
 
 (defun wdb-key-descriptor-parent-cache (type desc-id key-exp-index)
   "Key for a parent (or last-hardened) xpub cache record."
   (%wser (s) (%wser-string s type)
-             (bitcoin-lisp.serialization:write-bytes s desc-id)
-             (bitcoin-lisp.serialization:write-uint32-le s key-exp-index)))
+             (bl.ser:write-bytes s desc-id)
+             (bl.ser:write-uint32-le s key-exp-index)))
 
 (defun wdb-key-descriptor-derived-cache (desc-id key-exp-index der-index)
   (%wser (s) (%wser-string s +wdb-key-walletdescriptorcache+)
-             (bitcoin-lisp.serialization:write-bytes s desc-id)
-             (bitcoin-lisp.serialization:write-uint32-le s key-exp-index)
-             (bitcoin-lisp.serialization:write-uint32-le s der-index)))
+             (bl.ser:write-bytes s desc-id)
+             (bl.ser:write-uint32-le s key-exp-index)
+             (bl.ser:write-uint32-le s der-index)))
 
 (defun wdb-key-active-spk (internal-p output-type-code)
   (%wser (s) (%wser-string s (if internal-p
                                  +wdb-key-activeinternalspk+
                                  +wdb-key-activeexternalspk+))
-             (bitcoin-lisp.serialization:write-uint8 s output-type-code)))
+             (bl.ser:write-uint8 s output-type-code)))
 
 (defun wdb-key-address-string (type address)
   "Key for the address-book records name/purpose: type + address string."
@@ -247,21 +247,21 @@ receive requests use \"rr<id>\")."
 
 (defun wdb-key-mkey (id)
   (%wser (s) (%wser-string s +wdb-key-mkey+)
-             (bitcoin-lisp.serialization:write-uint32-le s id)))
+             (bl.ser:write-uint32-le s id)))
 
 (defun wdb-parse-mkey-fields (fields)
   "The uint32 nID from an mkey record key's field bytes."
-  (%wparse (s fields) (bitcoin-lisp.serialization:read-uint32-le s)))
+  (%wparse (s fields) (bl.ser:read-uint32-le s)))
 
 (defun wdb-key-lockedutxo (txid n)
   (%wser (s) (%wser-string s +wdb-key-lockedutxo+)
-             (bitcoin-lisp.serialization:write-bytes s txid)
-             (bitcoin-lisp.serialization:write-uint32-le s n)))
+             (bl.ser:write-bytes s txid)
+             (bl.ser:write-uint32-le s n)))
 
 (defun wdb-key-tx (txid)
   "Key for a CWalletTx record (value serialization lands in wallet P2)."
   (%wser (s) (%wser-string s +wdb-key-tx+)
-             (bitcoin-lisp.serialization:write-bytes s txid)))
+             (bl.ser:write-bytes s txid)))
 
 (defun wdb-parse-key (key-bytes)
   "Split a stored record key into (values type-string field-bytes). Every
@@ -280,57 +280,57 @@ with checksum, creation time, next_index, range_start, range_end — note the
 field order)."
   (%wser (s)
     (%wser-string s desc-string)
-    (bitcoin-lisp.serialization:write-uint64-le s creation-time)
-    (bitcoin-lisp.serialization:write-int32-le s next-index)
-    (bitcoin-lisp.serialization:write-int32-le s range-start)
-    (bitcoin-lisp.serialization:write-int32-le s range-end)))
+    (bl.ser:write-uint64-le s creation-time)
+    (bl.ser:write-int32-le s next-index)
+    (bl.ser:write-int32-le s range-start)
+    (bl.ser:write-int32-le s range-end)))
 
 (defun wdb-parse-descriptor-value (bytes)
   "(values desc-string creation-time next-index range-start range-end)."
   (%wparse (s bytes)
     (values (%wread-string s)
-            (bitcoin-lisp.serialization:read-uint64-le s)
-            (bitcoin-lisp.serialization:read-int32-le s)
-            (bitcoin-lisp.serialization:read-int32-le s)
-            (bitcoin-lisp.serialization:read-int32-le s))))
+            (bl.ser:read-uint64-le s)
+            (bl.ser:read-int32-le s)
+            (bl.ser:read-int32-le s)
+            (bl.ser:read-int32-le s))))
 
 (defun wdb-descriptor-key-value (pubkey privkey-der)
   "walletdescriptorkey value: (CPrivKey, Hash(pubkey||privkey)) — the double-
 SHA256 checksum accelerates load-time verification (walletdb.cpp:220-228)."
-  (let ((checksum (bitcoin-lisp.crypto:hash256
+  (let ((checksum (bl.crypto:hash256
                    (concatenate '(vector (unsigned-byte 8)) pubkey privkey-der))))
     (%wser (s)
-      (bitcoin-lisp.serialization:write-var-bytes s privkey-der)
-      (bitcoin-lisp.serialization:write-bytes s checksum))))
+      (bl.ser:write-var-bytes s privkey-der)
+      (bl.ser:write-bytes s checksum))))
 
 (defun wdb-parse-descriptor-key-value (bytes pubkey)
   "(values priv32 nil) — verifies the stored Hash(pubkey||privkey) checksum,
 returning NIL on mismatch or malformed DER."
   (%wparse (s bytes)
-    (let* ((der (bitcoin-lisp.serialization:read-var-bytes s))
-           (checksum (bitcoin-lisp.serialization:read-bytes s 32)))
+    (let* ((der (bl.ser:read-var-bytes s))
+           (checksum (bl.ser:read-bytes s 32)))
       (when (equalp checksum
-                    (bitcoin-lisp.crypto:hash256
+                    (bl.crypto:hash256
                      (concatenate '(vector (unsigned-byte 8)) pubkey der)))
         (der-to-privkey der)))))
 
 (defun wdb-uint64-value (n)
-  (%wser (s) (bitcoin-lisp.serialization:write-uint64-le s n)))
+  (%wser (s) (bl.ser:write-uint64-le s n)))
 
 (defun wdb-parse-uint64-value (bytes)
-  (%wparse (s bytes) (bitcoin-lisp.serialization:read-uint64-le s)))
+  (%wparse (s bytes) (bl.ser:read-uint64-le s)))
 
 (defun wdb-int64-value (n)
-  (%wser (s) (bitcoin-lisp.serialization:write-int64-le s n)))
+  (%wser (s) (bl.ser:write-int64-le s n)))
 
 (defun wdb-parse-int64-value (bytes)
-  (%wparse (s bytes) (bitcoin-lisp.serialization:read-int64-le s)))
+  (%wparse (s bytes) (bl.ser:read-int64-le s)))
 
 (defun wdb-int32-value (n)
-  (%wser (s) (bitcoin-lisp.serialization:write-int32-le s n)))
+  (%wser (s) (bl.ser:write-int32-le s n)))
 
 (defun wdb-parse-int32-value (bytes)
-  (%wparse (s bytes) (bitcoin-lisp.serialization:read-int32-le s)))
+  (%wparse (s bytes) (bl.ser:read-int32-le s)))
 
 (defun wdb-string-value (str)
   (%wser (s) (%wser-string s str)))
@@ -339,10 +339,10 @@ returning NIL on mismatch or malformed DER."
   (%wparse (s bytes) (%wread-string s)))
 
 (defun wdb-vector-value (bytes)
-  (%wser (s) (bitcoin-lisp.serialization:write-var-bytes s bytes)))
+  (%wser (s) (bl.ser:write-var-bytes s bytes)))
 
 (defun wdb-parse-vector-value (bytes)
-  (%wparse (s bytes) (bitcoin-lisp.serialization:read-var-bytes s)))
+  (%wparse (s bytes) (bl.ser:read-var-bytes s)))
 
 (defun wdb-xpub-value (ext-key)
   "Cache record value: the 74-byte extended pubkey as a vector."
@@ -358,17 +358,17 @@ written but never read).")
 (defun wdb-block-locator-value (hashes)
   "CBlockLocator: dummy int32 version + vector<uint256>."
   (%wser (s)
-    (bitcoin-lisp.serialization:write-int32-le s +block-locator-dummy-version+)
-    (bitcoin-lisp.serialization:write-compact-size s (length hashes))
+    (bl.ser:write-int32-le s +block-locator-dummy-version+)
+    (bl.ser:write-compact-size s (length hashes))
     (dolist (h hashes)
-      (bitcoin-lisp.serialization:write-bytes s h))))
+      (bl.ser:write-bytes s h))))
 
 (defun wdb-parse-block-locator-value (bytes)
   "The locator's hash list (dummy version discarded)."
   (%wparse (s bytes)
-    (bitcoin-lisp.serialization:read-int32-le s)
-    (loop repeat (bitcoin-lisp.serialization:read-compact-size s)
-          collect (bitcoin-lisp.serialization:read-bytes s 32))))
+    (bl.ser:read-int32-le s)
+    (loop repeat (bl.ser:read-compact-size s)
+          collect (bl.ser:read-bytes s 32))))
 
 (defstruct wallet-master-key
   "Core CMasterKey (crypter.h:33-60): the wallet's random 32-byte keying
@@ -389,20 +389,20 @@ compiles first — can SETF its slots."
   "CMasterKey (crypter.h:33-60): vchCryptedKey, vchSalt, nDerivationMethod,
 nDeriveIterations, vchOtherDerivationParameters."
   (%wser (s)
-    (bitcoin-lisp.serialization:write-var-bytes s crypted-key)
-    (bitcoin-lisp.serialization:write-var-bytes s salt)
-    (bitcoin-lisp.serialization:write-uint32-le s derivation-method)
-    (bitcoin-lisp.serialization:write-uint32-le s derive-iterations)
-    (bitcoin-lisp.serialization:write-var-bytes s other-params)))
+    (bl.ser:write-var-bytes s crypted-key)
+    (bl.ser:write-var-bytes s salt)
+    (bl.ser:write-uint32-le s derivation-method)
+    (bl.ser:write-uint32-le s derive-iterations)
+    (bl.ser:write-var-bytes s other-params)))
 
 (defun wdb-parse-mkey-value (bytes)
   "(values crypted-key salt derivation-method derive-iterations other-params)."
   (%wparse (s bytes)
-    (values (bitcoin-lisp.serialization:read-var-bytes s)
-            (bitcoin-lisp.serialization:read-var-bytes s)
-            (bitcoin-lisp.serialization:read-uint32-le s)
-            (bitcoin-lisp.serialization:read-uint32-le s)
-            (bitcoin-lisp.serialization:read-var-bytes s))))
+    (values (bl.ser:read-var-bytes s)
+            (bl.ser:read-var-bytes s)
+            (bl.ser:read-uint32-le s)
+            (bl.ser:read-uint32-le s)
+            (bl.ser:read-var-bytes s))))
 
 (alexandria:define-constant +wdb-lockedutxo-value+
     (coerce (vector (char-code #\1)) '(simple-array (unsigned-byte 8) (*)))
@@ -414,9 +414,9 @@ nDeriveIterations, vchOtherDerivationParameters."
 (defun wallet-db-open (path &key create)
   "Open (or with CREATE, create) the wallet LevelDB at directory PATH."
   (ensure-directories-exist (uiop:ensure-directory-pathname path))
-  (bitcoin-lisp.storage:leveldb-open
+  (bl.store:leveldb-open
    (namestring (uiop:ensure-directory-pathname path))
-   (bitcoin-lisp.storage:leveldb-make-options :create-if-missing (and create t))))
+   (bl.store:leveldb-make-options :create-if-missing (and create t))))
 
 (defun wallet-db-exists-p (path)
   "T when PATH holds a LevelDB (its CURRENT file exists)."
@@ -432,12 +432,12 @@ corruption error: a bad block only makes the iterator go invalid, which is
 indistinguishable from reaching the end. Every caller here — wallet load and
 backup — is wrong in a dangerous way if it silently sees a subset."
   (let ((out '()))
-    (bitcoin-lisp.storage:with-leveldb-iterator (iter db)
-      (bitcoin-lisp.storage:leveldb-iter-seek-to-first iter)
-      (loop while (bitcoin-lisp.storage:leveldb-iter-valid-p iter)
-            do (push (cons (bitcoin-lisp.storage:leveldb-iter-key iter)
-                           (bitcoin-lisp.storage:leveldb-iter-value iter))
+    (bl.store:with-leveldb-iterator (iter db)
+      (bl.store:leveldb-iter-seek-to-first iter)
+      (loop while (bl.store:leveldb-iter-valid-p iter)
+            do (push (cons (bl.store:leveldb-iter-key iter)
+                           (bl.store:leveldb-iter-value iter))
                      out)
-               (bitcoin-lisp.storage:leveldb-iter-next iter))
-      (bitcoin-lisp.storage:leveldb-iter-check-error iter))
+               (bl.store:leveldb-iter-next iter))
+      (bl.store:leveldb-iter-check-error iter))
     (nreverse out)))

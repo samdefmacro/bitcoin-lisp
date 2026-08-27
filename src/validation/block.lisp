@@ -105,10 +105,10 @@ block index, such as a header staged earlier in the same batch."
           (e entry))
       (dotimes (i +median-time-span+)
         (unless e (return))
-        (push (bitcoin-lisp.serialization:block-header-timestamp
-               (bitcoin-lisp.storage:block-index-entry-header e))
+        (push (bl.ser:block-header-timestamp
+               (bl.store:block-index-entry-header e))
               timestamps)
-        (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
+        (setf e (bl.store:block-index-entry-prev-entry e)))
       (nth (floor (length timestamps) 2) (sort timestamps #'<)))))
 
 (defun compute-median-time-past (chain-state prev-hash)
@@ -118,7 +118,7 @@ a numeric fallback silently satisfies a consensus comparison such as
 (<= timestamp mtp). Callers on a consensus path must reject on NIL; informational
 callers substitute their own default."
   (compute-median-time-past-from-entry
-   (bitcoin-lisp.storage:get-block-index-entry chain-state prev-hash)))
+   (bl.store:get-block-index-entry chain-state prev-hash)))
 
 ;;;; Transaction finality check (IsFinalTx)
 
@@ -129,7 +129,7 @@ A transaction is final if:
 - All input sequences are SEQUENCE_FINAL (0xFFFFFFFF)
 - nLockTime < block-height (height-based) or nLockTime < block-time (time-based)
 Returns T if final, NIL if not."
-  (let ((locktime (bitcoin-lisp.serialization:transaction-lock-time tx)))
+  (let ((locktime (bl.ser:transaction-lock-time tx)))
     ;; nLockTime == 0 means always final
     (when (zerop locktime)
       (return-from check-transaction-final t))
@@ -141,8 +141,8 @@ Returns T if final, NIL if not."
         (return-from check-transaction-final t)))
     ;; If locktime not satisfied, tx is final only if ALL sequences are final
     (every (lambda (input)
-             (= (bitcoin-lisp.serialization:tx-in-sequence input) +sequence-final+))
-           (bitcoin-lisp.serialization:transaction-inputs tx))))
+             (= (bl.ser:tx-in-sequence input) +sequence-final+))
+           (bl.ser:transaction-inputs tx))))
 
 ;;;; BIP 68 Sequence Lock Enforcement
 
@@ -165,21 +165,21 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
   ;; Reinterpret at the GATE, not in the struct: the slot must stay signed so
   ;; serialization keeps round-tripping, and every other reader of the version
   ;; keeps the value the wire actually carries.
-  (when (< (ldb (byte 32 0) (bitcoin-lisp.serialization:transaction-version tx)) 2)
+  (when (< (ldb (byte 32 0) (bl.ser:transaction-version tx)) 2)
     (return-from check-sequence-locks t))
-  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx) t)
-    (let ((seq (bitcoin-lisp.serialization:tx-in-sequence input)))
+  (bl.ser:dovector (input (bl.ser:transaction-inputs tx) t)
+    (let ((seq (bl.ser:tx-in-sequence input)))
       ;; Skip if disable flag is set
       (unless (logtest seq +sequence-disable-flag+)
-        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-               (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-               (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+        (let* ((prevout (bl.ser:tx-in-previous-output input))
+               (prev-txid (bl.ser:outpoint-hash prevout))
+               (prev-index (bl.ser:outpoint-index prevout))
                (utxo (or (and pending-utxos
                               (gethash (cons prev-txid prev-index) pending-utxos))
-                         (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index))))
+                         (bl.store:get-utxo utxo-set prev-txid prev-index))))
           (unless utxo
             (return-from check-sequence-locks nil))
-          (let ((utxo-height (bitcoin-lisp.storage:utxo-entry-height utxo)))
+          (let ((utxo-height (bl.store:utxo-entry-height utxo)))
             (if (logtest seq +sequence-type-flag+)
                 ;; Time-based relative locktime.
                 ;; Bitcoin Core uses block.GetAncestor(max(nCoinHeight-1, 0))->GetMedianTimePast()
@@ -188,7 +188,7 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
                 (let* ((required-time (* (logand seq +sequence-locktime-mask+)
                                          +sequence-locktime-granularity+))
                        (utxo-prev-height (max 0 (1- utxo-height)))
-                       (utxo-prev-entry (bitcoin-lisp.storage:get-block-at-height
+                       (utxo-prev-entry (bl.store:get-block-at-height
                                          chain-state utxo-prev-height))
                        (utxo-mtp (or (compute-median-time-past-from-entry
                                       utxo-prev-entry)
@@ -364,7 +364,7 @@ still gets every rule its height has activated.
 Returns the list sorted, because Core's GetScriptFlagNames walks a std::map
 keyed by name and so reports flags alphabetically (interpreter.cpp:2168-2211);
 `getdeploymentinfo' hands that array straight to the caller."
-  (let ((network bitcoin-lisp:*network*))
+  (let ((network bl:*network*))
     (when (>= height (get-bip66-activation-height network))
       (push "DERSIG" flags))
     (when (>= height (get-bip65-activation-height network))
@@ -397,14 +397,14 @@ no script-flag exception (Bitcoin Core GetBlockScriptFlags)."
 ;;; See Bitcoin Core's chainparams.cpp: consensus.script_flag_exceptions
 ;;; Note: Block hashes are displayed in big-endian but stored in little-endian (reversed)
 (defvar *bip16-exception-testnet*
-  (bitcoin-lisp.crypto:reverse-bytes
-   (bitcoin-lisp.crypto:hex-to-bytes "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"))
+  (bl.crypto:reverse-bytes
+   (bl.crypto:hex-to-bytes "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"))
   "Block hash that is exempted from BIP 16 script verification on testnet3 (little-endian).")
 
 ;;; BIP 16 (P2SH) exception block hash for mainnet
 (defvar *bip16-exception-mainnet*
-  (bitcoin-lisp.crypto:reverse-bytes
-   (bitcoin-lisp.crypto:hex-to-bytes "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"))
+  (bl.crypto:reverse-bytes
+   (bl.crypto:hex-to-bytes "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"))
   "Block hash that is exempted from BIP 16 script verification on mainnet (little-endian).")
 
 ;;; Taproot script-flag exception block for mainnet (Core chainparams.cpp
@@ -412,8 +412,8 @@ no script-flag exception (Bitcoin Core GetBlockScriptFlags)."
 ;;; witness-v1 spend that fails full BIP341 verification, so Core validates it
 ;;; with P2SH|WITNESS only (taproot disabled for that one block).
 (defvar *taproot-exception-mainnet*
-  (bitcoin-lisp.crypto:reverse-bytes
-   (bitcoin-lisp.crypto:hex-to-bytes "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"))
+  (bl.crypto:reverse-bytes
+   (bl.crypto:hex-to-bytes "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"))
   "Block hash validated with P2SH|WITNESS only on mainnet (little-endian).")
 
 (defun script-flag-exception (block-hash)
@@ -436,7 +436,7 @@ were wrong here before:
   - SCRIPT_VERIFY_NONE means run every script with no flags. It does NOT mean
     skip validation: the scripts must still evaluate true, and a block whose
     scripts are outright invalid is still rejected."
-  (ecase bitcoin-lisp:*network*
+  (ecase bl:*network*
     (:mainnet
      (cond ((equalp block-hash *bip16-exception-mainnet*) (values '() t))
            ((equalp block-hash *taproot-exception-mainnet*)
@@ -494,28 +494,28 @@ Stops at a block that either sits at a retarget boundary (height % 2016 == 0)
 or does not have min-difficulty bits. Returns that block's bits value."
   (let ((current entry))
     (loop while (and current
-                     (bitcoin-lisp.storage:block-index-entry-prev-entry current)
-                     (/= 0 (mod (bitcoin-lisp.storage:block-index-entry-height current)
-                                 bitcoin-lisp.storage:+difficulty-adjustment-interval+))
-                     (= (bitcoin-lisp.serialization:block-header-bits
-                         (bitcoin-lisp.storage:block-index-entry-header current))
-                        bitcoin-lisp.storage:+pow-limit-bits+))
-          do (setf current (bitcoin-lisp.storage:block-index-entry-prev-entry current)))
-    (if (and current (bitcoin-lisp.storage:block-index-entry-header current))
-        (bitcoin-lisp.serialization:block-header-bits
-         (bitcoin-lisp.storage:block-index-entry-header current))
-        bitcoin-lisp.storage:+pow-limit-bits+)))
+                     (bl.store:block-index-entry-prev-entry current)
+                     (/= 0 (mod (bl.store:block-index-entry-height current)
+                                 bl.store:+difficulty-adjustment-interval+))
+                     (= (bl.ser:block-header-bits
+                         (bl.store:block-index-entry-header current))
+                        bl.store:+pow-limit-bits+))
+          do (setf current (bl.store:block-index-entry-prev-entry current)))
+    (if (and current (bl.store:block-index-entry-header current))
+        (bl.ser:block-header-bits
+         (bl.store:block-index-entry-header current))
+        bl.store:+pow-limit-bits+)))
 
 (defun get-retarget-ancestor (entry)
   "Walk back from ENTRY to the block at the start of its retarget period.
 For a block at height H, this returns the entry at height H - (H mod 2016).
 Bitcoin Core's off-by-one: the timespan is measured from this block to ENTRY."
-  (let* ((height (bitcoin-lisp.storage:block-index-entry-height entry))
-         (interval bitcoin-lisp.storage:+difficulty-adjustment-interval+)
+  (let* ((height (bl.store:block-index-entry-height entry))
+         (interval bl.store:+difficulty-adjustment-interval+)
          (blocks-back (mod height interval))
          (current entry))
     (dotimes (i blocks-back)
-      (let ((prev (bitcoin-lisp.storage:block-index-entry-prev-entry current)))
+      (let ((prev (bl.store:block-index-entry-prev-entry current)))
         (unless prev (return))
         (setf current prev)))
     current))
@@ -524,39 +524,39 @@ Bitcoin Core's off-by-one: the timespan is measured from this block to ENTRY."
   "Compute the expected bits for a block at HEIGHT with previous block PREV-ENTRY.
 Handles: first retarget period, retarget boundaries, non-boundaries,
 and testnet min-difficulty exception."
-  (let ((interval bitcoin-lisp.storage:+difficulty-adjustment-interval+))
+  (let ((interval bl.store:+difficulty-adjustment-interval+))
     (cond
       ;; Genesis block or no previous entry
       ((or (zerop height) (null prev-entry))
-       bitcoin-lisp.storage:+pow-limit-bits+)
+       bl.store:+pow-limit-bits+)
 
       ;; Regtest never retargets (Bitcoin Core fPowNoRetargeting): every block
       ;; inherits the previous block's bits, so difficulty stays at the trivial
       ;; regtest pow-limit. Checked before the boundary case to skip retargeting.
-      ((eq bitcoin-lisp:*network* :regtest)
-       (bitcoin-lisp.serialization:block-header-bits
-        (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
+      ((eq bl:*network* :regtest)
+       (bl.ser:block-header-bits
+        (bl.store:block-index-entry-header prev-entry)))
 
       ;; Retarget boundary (height is a multiple of 2016)
       ((zerop (mod height interval))
        (let* ((last-retarget-entry (get-retarget-ancestor prev-entry))
               (last-retarget-time
-                (bitcoin-lisp.serialization:block-header-timestamp
-                 (bitcoin-lisp.storage:block-index-entry-header last-retarget-entry)))
+                (bl.ser:block-header-timestamp
+                 (bl.store:block-index-entry-header last-retarget-entry)))
               (last-block-time
-                (bitcoin-lisp.serialization:block-header-timestamp
-                 (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
+                (bl.ser:block-header-timestamp
+                 (bl.store:block-index-entry-header prev-entry)))
               ;; BIP 94 (testnet4): the new target is computed from the FIRST block
               ;; of the just-ended retarget period rather than the last block. This
               ;; preserves the real difficulty across periods even when the 20-min
               ;; min-difficulty exception was used near a retarget boundary.
-              (basis-entry (if (eq bitcoin-lisp:*network* :testnet4)
+              (basis-entry (if (eq bl:*network* :testnet4)
                                last-retarget-entry
                                prev-entry))
               (basis-bits
-                (bitcoin-lisp.serialization:block-header-bits
-                 (bitcoin-lisp.storage:block-index-entry-header basis-entry))))
-         (bitcoin-lisp.storage:calculate-next-work-required
+                (bl.ser:block-header-bits
+                 (bl.store:block-index-entry-header basis-entry))))
+         (bl.store:calculate-next-work-required
           last-retarget-time last-block-time basis-bits)))
 
       ;; Non-boundary on a chain WITHOUT min-difficulty blocks: inherit the
@@ -568,9 +568,9 @@ and testnet min-difficulty exception."
       ;; testnet min-difficulty branch, which tests only :testnet3/:testnet4 --
       ;; so signet reached the terminal reject and 2015 of every 2016 blocks
       ;; were :bad-difficulty.
-      ((member bitcoin-lisp:*network* '(:mainnet :signet))
-       (bitcoin-lisp.serialization:block-header-bits
-        (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
+      ((member bl:*network* '(:mainnet :signet))
+       (bl.ser:block-header-bits
+        (bl.store:block-index-entry-header prev-entry)))
 
       ;; Non-boundary on testnet: return nil to indicate caller must check
       ;; timestamp-based min-difficulty or walk-back
@@ -580,7 +580,7 @@ and testnet min-difficulty exception."
   "Validate that HEADER's bits field matches expected difficulty at HEIGHT.
 PREV-ENTRY is the block-index-entry for the previous block.
 Returns (VALUES T NIL) on success, (VALUES NIL :bad-difficulty) on failure."
-  (let ((block-bits (bitcoin-lisp.serialization:block-header-bits header))
+  (let ((block-bits (bl.ser:block-header-bits header))
         (expected (get-expected-bits height prev-entry)))
     (cond
       ;; Got a definitive expected value (mainnet, retarget boundary, or first period)
@@ -591,10 +591,10 @@ Returns (VALUES T NIL) on success, (VALUES NIL :bad-difficulty) on failure."
 
       ;; Testnet non-boundary: check min-difficulty or walk-back
       ;; Applies to testnet3 and testnet4 (fPowAllowMinDifficultyBlocks=true)
-      ((member bitcoin-lisp:*network* '(:testnet3 :testnet4))
-       (let* ((prev-header (bitcoin-lisp.storage:block-index-entry-header prev-entry))
-              (prev-timestamp (bitcoin-lisp.serialization:block-header-timestamp prev-header))
-              (block-timestamp (bitcoin-lisp.serialization:block-header-timestamp header))
+      ((member bl:*network* '(:testnet3 :testnet4))
+       (let* ((prev-header (bl.store:block-index-entry-header prev-entry))
+              (prev-timestamp (bl.ser:block-header-timestamp prev-header))
+              (block-timestamp (bl.ser:block-header-timestamp header))
               (min-diff-allowed (testnet-min-difficulty-allowed-p
                                  block-timestamp prev-timestamp)))
          ;; Core GetNextWorkRequired (pow.cpp): on a min-difficulty chain, a
@@ -605,7 +605,7 @@ Returns (VALUES T NIL) on success, (VALUES NIL :bad-difficulty) on failure."
          ;; the walk-back value here, which over-accepts vs Core and could split
          ;; us from the testnet network on a crafted/unusual block.)
          (if min-diff-allowed
-             (if (= block-bits bitcoin-lisp.storage:+pow-limit-bits+)
+             (if (= block-bits bl.store:+pow-limit-bits+)
                  (values t nil)
                  (values nil :bad-difficulty))
              ;; <=20 min gap: must match the walk-back difficulty.
@@ -624,10 +624,10 @@ Returns (VALUES T NIL) on success, (VALUES NIL :bad-difficulty) on failure."
 CheckProofOfWork (pow.cpp:161-171): reject nBits whose target is
 negative, zero, overflowing, or above the PoW limit (derive-target
 returns NIL), then require hash <= target. Returns T if valid."
-  (let ((target (bitcoin-lisp.storage:derive-target
-                 (bitcoin-lisp.serialization:block-header-bits header))))
+  (let ((target (bl.store:derive-target
+                 (bl.ser:block-header-bits header))))
     (when target
-      (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
+      (let* ((hash (bl.ser:block-header-hash header))
              ;; little-endian: byte 0 is least significant
              (hash-value (loop for i from 0 below 32
                                for byte = (aref hash i)
@@ -641,7 +641,7 @@ returns NIL), then require hash <= target. Returns T if valid."
   (let ((combined (make-array 64 :element-type '(unsigned-byte 8))))
     (replace combined a :start1 0)
     (replace combined b :start1 32)
-    (bitcoin-lisp.crypto:hash256 combined)))
+    (bl.crypto:hash256 combined)))
 
 (defun compute-merkle-root (tx-hashes)
   "Compute the Merkle root from a list of transaction hashes.
@@ -680,12 +680,12 @@ multiple of the adjustment interval) must be timestamped no more than
 enforce_BIP94 is true only on testnet4 among our networks. Genesis is
 excluded — it satisfies the modulo but has no predecessor. Mirrors
 Bitcoin Core ContextualCheckBlockHeader (validation.cpp:4129-4136)."
-  (and (eq bitcoin-lisp:*network* :testnet4)
+  (and (eq bl:*network* :testnet4)
        height prev-entry (plusp height)
-       (zerop (mod height bitcoin-lisp.storage:+difficulty-adjustment-interval+))
-       (< (bitcoin-lisp.serialization:block-header-timestamp header)
-          (- (bitcoin-lisp.serialization:block-header-timestamp
-              (bitcoin-lisp.storage:block-index-entry-header prev-entry))
+       (zerop (mod height bl.store:+difficulty-adjustment-interval+))
+       (< (bl.ser:block-header-timestamp header)
+          (- (bl.ser:block-header-timestamp
+              (bl.store:block-index-entry-header prev-entry))
              +max-timewarp+))))
 
 (defun header-time-too-old-p (header prev-entry)
@@ -696,7 +696,7 @@ rule cannot be evaluated, and answering with a neutral time would satisfy the
 comparison for every header."
   (let ((mtp (compute-median-time-past-from-entry prev-entry)))
     (or (null mtp)
-        (<= (bitcoin-lisp.serialization:block-header-timestamp header) mtp))))
+        (<= (bl.ser:block-header-timestamp header) mtp))))
 
 (defun validate-block-header (header chain-state current-time
                                &key prev-hash height prev-entry skip-pow)
@@ -714,7 +714,7 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
       (values nil :bad-proof-of-work)))
 
   ;; Check timestamp not too far in future
-  (let ((timestamp (bitcoin-lisp.serialization:block-header-timestamp header)))
+  (let ((timestamp (bl.ser:block-header-timestamp header)))
     (when (> timestamp (+ current-time +max-future-block-time+))
       (return-from validate-block-header
         (values nil :time-too-new)))
@@ -725,7 +725,7 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
     (when (or prev-entry (and chain-state prev-hash))
       (when (header-time-too-old-p
              header (or prev-entry
-                        (bitcoin-lisp.storage:get-block-index-entry
+                        (bl.store:get-block-index-entry
                          chain-state prev-hash)))
         (return-from validate-block-header
           (values nil :time-too-old))))
@@ -743,14 +743,14 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
   ;; clause rejected real mainnet block 544,085 and halted the first
   ;; mainnet IBD run. Negative versions (signed i32) fail the < 2 clause
   ;; post-BIP34, matching Core's implicit behavior.
-  (let ((version (bitcoin-lisp.serialization:block-header-version header)))
+  (let ((version (bl.ser:block-header-version header)))
     (when (and height
                (or (and (< version 2)
-                        (>= height (get-bip34-activation-height bitcoin-lisp:*network*)))
+                        (>= height (get-bip34-activation-height bl:*network*)))
                    (and (< version 3)
-                        (>= height (get-bip66-activation-height bitcoin-lisp:*network*)))
+                        (>= height (get-bip66-activation-height bl:*network*)))
                    (and (< version 4)
-                        (>= height (get-bip65-activation-height bitcoin-lisp:*network*)))))
+                        (>= height (get-bip65-activation-height bl:*network*)))))
       (return-from validate-block-header
         (values nil :bad-version))))
 
@@ -832,7 +832,7 @@ care in the script interpreter can make that safe."
           for i from 0
           do (setf (aref out i)
                    (collect-spent-utxos
-                    (bitcoin-lisp.serialization:transaction-inputs tx)
+                    (bl.ser:transaction-inputs tx)
                     utxo-set extra-coins)))
     out))
 
@@ -847,13 +847,13 @@ SPENT-UTXOS, when supplied, is this transaction's already-resolved coins from
 PREFETCH-BLOCK-SPENT-COINS. Passing it is what makes a worker thread safe: the
 coins view is never touched here, so its non-synchronized cache is never
 written concurrently."
-  (let* ((tx-inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+  (let* ((tx-inputs (bl.ser:transaction-inputs tx))
          (spent-utxos (or spent-utxos
                           (collect-spent-utxos tx-inputs utxo-set extra-coins)))
-         (bitcoin-lisp.coalton.interop:*script-flags* script-flags)
-         (bitcoin-lisp.coalton.interop:*precomputed-sighash*
-           (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
-         (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent-utxos))
+         (bl.interop:*script-flags* script-flags)
+         (bl.interop:*precomputed-sighash*
+           (bl.interop:init-precomputed-sighash tx spent-utxos))
+         (bl.interop:*current-spent-utxos* spent-utxos))
     (loop for input across tx-inputs
           for input-idx from 0
           for utxo = (and spent-utxos (aref spent-utxos input-idx))
@@ -862,35 +862,35 @@ written concurrently."
                ;; (CheckInputScripts, validation.cpp:2090). An unresolvable
                ;; coin must fail the transaction, never skip its script:
                ;; a skipped input is an unsigned spend.
-               (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
-                 (bitcoin-lisp:log-warn
+               (let ((prevout (bl.ser:tx-in-previous-output input)))
+                 (bl:log-warn
                   "SCRIPT-MISSING-COIN: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D"
                   height tx-idx input-idx
-                  (bitcoin-lisp.crypto:bytes-to-hex
-                   (bitcoin-lisp.serialization:outpoint-hash prevout))
-                  (bitcoin-lisp.serialization:outpoint-index prevout)))
+                  (bl.crypto:bytes-to-hex
+                   (bl.ser:outpoint-hash prevout))
+                  (bl.ser:outpoint-index prevout)))
                (return-from validate-tx-scripts nil))
              (unless (validate-input-script tx input-idx utxo)
                ;; Re-run with debug to capture the preimage for the log line
-               (let ((bitcoin-lisp.coalton.interop:*debug-bip341-sighash* t))
+               (let ((bl.interop:*debug-bip341-sighash* t))
                  (validate-input-script tx input-idx utxo))
-               (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                      (wvec (bitcoin-lisp.serialization:transaction-witness tx))
+               (let* ((prevout (bl.ser:tx-in-previous-output input))
+                      (wvec (bl.ser:transaction-witness tx))
                       (witness (and wvec (aref wvec input-idx))))
-                 (bitcoin-lisp:log-warn
+                 (bl:log-warn
                   "SCRIPT-FAILED: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D scriptpubkey=~A scriptsig=~A witness-items=~D witness=~A flags=~A"
                   height tx-idx input-idx
-                  (bitcoin-lisp.crypto:bytes-to-hex
-                   (bitcoin-lisp.serialization:outpoint-hash prevout))
-                  (bitcoin-lisp.serialization:outpoint-index prevout)
-                  (bitcoin-lisp.crypto:bytes-to-hex
-                   (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
-                  (bitcoin-lisp.crypto:bytes-to-hex
-                   (bitcoin-lisp.serialization:tx-in-script-sig input))
+                  (bl.crypto:bytes-to-hex
+                   (bl.ser:outpoint-hash prevout))
+                  (bl.ser:outpoint-index prevout)
+                  (bl.crypto:bytes-to-hex
+                   (bl.store:utxo-entry-script-pubkey utxo))
+                  (bl.crypto:bytes-to-hex
+                   (bl.ser:tx-in-script-sig input))
                   (length witness)
                   (format nil "[~{~A~^,~}]"
-                          (mapcar #'bitcoin-lisp.crypto:bytes-to-hex witness))
-                  bitcoin-lisp.coalton.interop:*script-flags*))
+                          (mapcar #'bl.crypto:bytes-to-hex witness))
+                  bl.interop:*script-flags*))
                (return-from validate-tx-scripts nil))
           finally (return t))))
 
@@ -958,7 +958,7 @@ on the next block."
                         t
                         (funcall item))
                   (error (e)
-                    (bitcoin-lisp:log-error "script-check worker: ~A" e)
+                    (bl:log-error "script-check worker: ~A" e)
                     nil))))
         (bt:with-lock-held ((script-check-pool-lock pool))
           (unless ok (setf (script-check-pool-failed pool) t))
@@ -1018,7 +1018,7 @@ ever one block being connected."
         (unless item (return))
         (let ((ok (handler-case (if (script-check-pool-failed pool) t (funcall item))
                     (error (e)
-                      (bitcoin-lisp:log-error "script-check master: ~A" e)
+                      (bl:log-error "script-check master: ~A" e)
                       nil))))
           (bt:with-lock-held ((script-check-pool-lock pool))
             (unless ok (setf (script-check-pool-failed pool) t))
@@ -1076,18 +1076,18 @@ flag set — SCRIPT_VERIFY_NONE for the two BIP16 blocks — so the scripts must
 still evaluate true. Returning success without executing them, as this did
 until now, accepts blocks Core rejects."
   (let ((script-flags
-          (block-script-flags (bitcoin-lisp.serialization:block-header-hash
-                               (bitcoin-lisp.serialization:bitcoin-block-header block))
+          (block-script-flags (bl.ser:block-header-hash
+                               (bl.ser:bitcoin-block-header block))
                               height))
-        (transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+        (transactions (bl.ser:bitcoin-block-transactions block)))
     ;; For non-tiny blocks, parallelize tx-script validation across workers
     ;; — but ONLY when explicitly enabled. The per-block worker threads are
-    ;; off by default (bitcoin-lisp:*parallel-block-validation* nil) because at
+    ;; off by default (bl:*parallel-block-validation* nil) because at
     ;; mainnet scale their concurrent libsecp CFFI corrupts SBCL's alien-type
     ;; cache and crashes the node; see that var's docstring. Sequential path is
     ;; the default and is also used for tiny blocks where thread-spawn overhead
     ;; dominates any speedup.
-    (if (and bitcoin-lisp:*parallel-block-validation*
+    (if (and bl:*parallel-block-validation*
              (>= (length (rest transactions)) +parallel-validation-min-txs+)
              (> +parallel-validation-workers+ 1))
         (if (validate-block-scripts-parallel transactions script-flags utxo-set height
@@ -1095,7 +1095,7 @@ until now, accepts blocks Core rejects."
             (values t nil)
             (values nil :script-failed))
         ;; Sequential fallback (kept verbatim from the pre-Phase-3 path).
-        (let ((bitcoin-lisp.coalton.interop:*script-flags* script-flags))
+        (let ((bl.interop:*script-flags* script-flags))
           (loop for tx in (rest transactions)
                 for tx-idx from 1
                 do (unless (validate-tx-scripts tx tx-idx utxo-set
@@ -1117,11 +1117,11 @@ until now, accepts blocks Core rejects."
   "Find the witness commitment in a coinbase transaction's outputs.
 BIP 141: The commitment is in the last OP_RETURN output matching the
 header 0xaa21a9ed. Returns the 32-byte commitment hash or NIL."
-  (let ((outputs (bitcoin-lisp.serialization:transaction-outputs coinbase-tx))
+  (let ((outputs (bl.ser:transaction-outputs coinbase-tx))
         (commitment nil))
     ;; Scan all outputs; use the last matching one (per BIP 141)
-    (bitcoin-lisp.serialization:dovector (output outputs)
-      (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+    (bl.ser:dovector (output outputs)
+      (let ((script (bl.ser:tx-out-script-pubkey output)))
         (when (and (>= (length script) 38)   ; OP_RETURN + push36 + 4-byte header + 32-byte hash
                    (= (aref script 0) #x6a)  ; OP_RETURN
                    (= (aref script 1) #x24)  ; push 36 bytes
@@ -1131,13 +1131,13 @@ header 0xaa21a9ed. Returns the 32-byte commitment hash or NIL."
 
 (defun block-has-witness-data-p (block)
   "Check if any transaction in the block has witness data."
-  (some #'bitcoin-lisp.serialization:transaction-has-witness-p
-        (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+  (some #'bl.ser:transaction-has-witness-p
+        (bl.ser:bitcoin-block-transactions block)))
 
 (defun compute-witness-merkle-root (transactions)
   "Compute the witness merkle root from a list of transactions.
 Uses wtxids for all transactions. The coinbase wtxid is 32 zero bytes (per BIP 141)."
-  (let ((wtxids (mapcar #'bitcoin-lisp.serialization:transaction-wtxid transactions)))
+  (let ((wtxids (mapcar #'bl.ser:transaction-wtxid transactions)))
     (compute-merkle-root wtxids)))
 
 (defun validate-witness-commitment (block segwit-active)
@@ -1157,13 +1157,13 @@ Note: the gate is segwit activation, NOT whether the block happens to
 carry witness data — a pre-segwit block with witness data must be
 rejected, and the no-commitment+witness case is :unexpected-witness
 (Core has no separate \"missing commitment\" error here)."
-  (let ((transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+  (let ((transactions (bl.ser:bitcoin-block-transactions block)))
     (when segwit-active
       (let* ((coinbase-tx (first transactions))
              (commitment (find-witness-commitment coinbase-tx)))
         (when commitment
           ;; Coinbase input-0 witness stack must be exactly one 32-byte item.
-          (let* ((cb-witness (bitcoin-lisp.serialization:transaction-witness
+          (let* ((cb-witness (bl.ser:transaction-witness
                               coinbase-tx))
                  (cb-stack (and cb-witness (plusp (length cb-witness))
                                 (aref cb-witness 0))))
@@ -1176,7 +1176,7 @@ rejected, and the no-commitment+witness case is :unexpected-witness
                    (combined (make-array 64 :element-type '(unsigned-byte 8))))
               (replace combined witness-root :start1 0)
               (replace combined reserved :start1 32)
-              (unless (equalp (bitcoin-lisp.crypto:hash256 combined) commitment)
+              (unless (equalp (bl.crypto:hash256 combined) commitment)
                 (return-from validate-witness-commitment
                   (values nil :bad-witness-merkle-match)))))
           ;; Valid commitment — accept without the unexpected-witness scan.
@@ -1184,7 +1184,7 @@ rejected, and the no-commitment+witness case is :unexpected-witness
     ;; Segwit inactive, or active with no commitment output: no transaction
     ;; may carry witness data.
     (dolist (tx transactions)
-      (when (bitcoin-lisp.serialization:transaction-has-witness-p tx)
+      (when (bl.ser:transaction-has-witness-p tx)
         (return-from validate-witness-commitment
           (values nil :unexpected-witness))))
     (values t nil)))
@@ -1205,18 +1205,18 @@ so a miner that serializes the template's coinbase without its witness is not
 refused with bad-witness-nonce-size. Mutates the coinbase in place and drops its
 cached weight, which the witness changes (mine-block does the same for the
 header's cached hash)."
-  (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-         (prev (bitcoin-lisp.storage:get-block-index-entry
-                chain-state (bitcoin-lisp.serialization:block-header-prev-block header)))
-         (coinbase (first (bitcoin-lisp.serialization:bitcoin-block-transactions block))))
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (prev (bl.store:get-block-index-entry
+                chain-state (bl.ser:block-header-prev-block header)))
+         (coinbase (first (bl.ser:bitcoin-block-transactions block))))
     (when (and prev coinbase
-               (>= (1+ (bitcoin-lisp.storage:block-index-entry-height prev))
-                   (get-segwit-activation-height bitcoin-lisp:*network*))
+               (>= (1+ (bl.store:block-index-entry-height prev))
+                   (get-segwit-activation-height bl:*network*))
                (find-witness-commitment coinbase)
-               (not (bitcoin-lisp.serialization:transaction-has-witness-p coinbase)))
-      (setf (bitcoin-lisp.serialization:transaction-witness coinbase)
+               (not (bl.ser:transaction-has-witness-p coinbase)))
+      (setf (bl.ser:transaction-witness coinbase)
             (vector (list (witness-reserved-value)))
-            (bitcoin-lisp.serialization::transaction-cached-weight coinbase) nil))))
+            (bl.ser::transaction-cached-weight coinbase) nil))))
 
 (defun block-witness-stripped-p (block)
   "T if BLOCK carries a witness commitment in its coinbase outputs but its coinbase
@@ -1231,11 +1231,11 @@ fires on a legitimate block.
 Note the block hash is identical for the stripped and witness-complete copies (the
 witness is not covered by the header/merkle root), so callers must treat this as
 \"don't persist THIS copy\", never as a permanent reject of the hash."
-  (let* ((txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+  (let* ((txs (bl.ser:bitcoin-block-transactions block))
          (coinbase (first txs)))
     (and coinbase
          (find-witness-commitment coinbase)
-         (let* ((cb-witness (bitcoin-lisp.serialization:transaction-witness coinbase))
+         (let* ((cb-witness (bl.ser:transaction-witness coinbase))
                 (cb-stack (and cb-witness (plusp (length cb-witness)) (aref cb-witness 0))))
            (not (and (= (length cb-stack) 1)
                      (= (length (first cb-stack)) 32)))))))
@@ -1271,7 +1271,7 @@ IsBIP30Repeat (validation.cpp:6208). Only mainnet has these. (We match on
 height only, not the block hash Core also checks — forging a pre-BIP34
 mainnet fork to these heights is infeasible, and no other network has
 repeat blocks.)"
-  (and (eq bitcoin-lisp:*network* :mainnet)
+  (and (eq bl:*network* :mainnet)
        (or (= height 91842) (= height 91880))))
 
 (defun bip30-enforced-p (height)
@@ -1283,7 +1283,7 @@ approximate Core's BIP34Hash-ancestor test with a height comparison,
 omitting only the extra enforcement Core applies on a non-canonical fork
 past the BIP 34 height — infeasible to exploit given the PoW required."
   (or (and (not (bip30-repeat-block-p height))
-           (< height (get-bip34-activation-height bitcoin-lisp:*network*)))
+           (< height (get-bip34-activation-height bl:*network*)))
       (>= height +bip34-implies-bip30-limit+)))
 
 (defun encode-bip34-height (height)
@@ -1350,12 +1350,12 @@ prefix of `CScript() << height`). This is a byte-prefix match, not a
 numeric decode, so non-minimal or wrong-form encodings are rejected even
 when they would decode to the right number. Mirrors validation.cpp:4183-4191.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
-  (let ((activation-height (get-bip34-activation-height bitcoin-lisp:*network*)))
+  (let ((activation-height (get-bip34-activation-height bl:*network*)))
     (when (< current-height activation-height)
       (return-from validate-coinbase-height (values t nil))))
-  (let* ((coinbase-tx (first (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
-         (first-input (aref (bitcoin-lisp.serialization:transaction-inputs coinbase-tx) 0))
-         (script-sig (bitcoin-lisp.serialization:tx-in-script-sig first-input))
+  (let* ((coinbase-tx (first (bl.ser:bitcoin-block-transactions block)))
+         (first-input (aref (bl.ser:transaction-inputs coinbase-tx) 0))
+         (script-sig (bl.ser:tx-in-script-sig first-input))
          (expect (encode-bip34-height current-height)))
     (if (and (>= (length script-sig) (length expect))
              (loop for i below (length expect)
@@ -1398,8 +1398,8 @@ per-block paths'. Consulting it here would put an O(index) scan in the connect
 loop. Those three conditions only ever make skipping STRICTER, so omitting them
 is a smaller skip window than Core's, never a larger one; closing them properly
 means maintaining the best header incrementally first."
-  (let* ((av (bitcoin-lisp:network-assumevalid bitcoin-lisp:*network*))
-         (av-entry (and av (bitcoin-lisp.storage:get-block-index-entry chain-state av))))
+  (let* ((av (bl:network-assumevalid bl:*network*))
+         (av-entry (and av (bl.store:get-block-index-entry chain-state av))))
     (and hash av-entry
          ;; The block must BE the assumevalid chain's block at this height.
          ;; Taking a hash and height rather than an index entry is deliberate:
@@ -1408,9 +1408,9 @@ means maintaining the best header incrementally first."
          ;; silently answer NIL there and quietly verify every signature -- safe,
          ;; but it would make the assumevalid optimisation dead on the main IBD
          ;; path rather than merely correct.
-         (let ((ancestor (bitcoin-lisp.storage:entry-ancestor-at-height av-entry height)))
+         (let ((ancestor (bl.store:entry-ancestor-at-height av-entry height)))
            (and ancestor
-                (equalp (bitcoin-lisp.storage:block-index-entry-hash ancestor) hash)
+                (equalp (bl.store:block-index-entry-hash ancestor) hash)
                 t)))))
 
 (defun calculate-block-weight (transactions)
@@ -1439,10 +1439,10 @@ be the number bitcoind reports for the same block.
 
 The base-size check a few lines below already added `80 + compact-size-length\'
 correctly, which is what marks this as an oversight rather than a decision."
-  (+ (* 4 (+ 80 (bitcoin-lisp.serialization:compact-size-length
+  (+ (* 4 (+ 80 (bl.ser:compact-size-length
                  (length transactions))))
      (loop for tx in transactions
-           sum (bitcoin-lisp.serialization:transaction-weight tx))))
+           sum (bl.ser:transaction-weight tx))))
 
 ;;;; Sigops cost calculation
 
@@ -1553,12 +1553,12 @@ walk bails)."
 (defun count-legacy-sigops (tx)
   "Count legacy (inaccurate) sigops across all scriptSigs and scriptPubKeys of TX."
   (let ((count 0))
-    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
+    (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
       (incf count (count-script-sigops
-                   (bitcoin-lisp.serialization:tx-in-script-sig input))))
-    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
+                   (bl.ser:tx-in-script-sig input))))
+    (bl.ser:dovector (output (bl.ser:transaction-outputs tx))
       (incf count (count-script-sigops
-                   (bitcoin-lisp.serialization:tx-out-script-pubkey output))))
+                   (bl.ser:tx-out-script-pubkey output))))
     count))
 
 (defun count-witness-sigops-for-input (script-pubkey witness)
@@ -1585,11 +1585,11 @@ Returns (VALUES p2sh-count witness-count).
 GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey."
   (let ((p2sh-count 0)
         (witness-count 0))
-    (loop for input across (bitcoin-lisp.serialization:transaction-inputs tx)
+    (loop for input across (bl.ser:transaction-inputs tx)
           for input-idx from 0
-          do (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                    (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-                    (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+          do (let* ((prevout (bl.ser:tx-in-previous-output input))
+                    (prev-txid (bl.ser:outpoint-hash prevout))
+                    (prev-index (bl.ser:outpoint-index prevout))
                     (script-pubkey (funcall get-spent-script prev-txid prev-index)))
                (when script-pubkey
                  (cond
@@ -1603,7 +1603,7 @@ GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey."
                    ;; branch (CountWitnessSigOps requires IsPushOnly).
                    ((script-is-p2sh-p script-pubkey)
                     (let ((redeem-script (p2sh-sigop-subscript
-                                          (bitcoin-lisp.serialization:tx-in-script-sig input))))
+                                          (bl.ser:tx-in-script-sig input))))
                       (when redeem-script
                         ;; P2SH sigops from redeemScript
                         (incf p2sh-count (count-script-sigops redeem-script :accurate t))
@@ -1660,17 +1660,17 @@ block-solution check — Core gates both on fCheckPOW) is skipped, while every
 contextual header check still runs: the TEST-BLOCK-VALIDITY dry-run of an
 unmined template (Core TestBlockValidity's check_pow=false).
 Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure."
-  (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-         (transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (transactions (bl.ser:bitcoin-block-transactions block)))
 
     ;; Validate header (with difficulty check when prev-entry is available)
     (unless skip-header
-      (let ((prev-hash (bitcoin-lisp.serialization:block-header-prev-block header)))
+      (let ((prev-hash (bl.ser:block-header-prev-block header)))
         (multiple-value-bind (valid error)
             (validate-block-header header chain-state current-time
                                    :prev-hash prev-hash
                                    :height current-height
-                                   :prev-entry (bitcoin-lisp.storage:get-block-index-entry
+                                   :prev-entry (bl.store:get-block-index-entry
                                                 chain-state prev-hash)
                                    :skip-pow skip-pow)
           (unless valid
@@ -1700,7 +1700,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
     ;; so reorg-connected fork blocks must still be checked) but not under
     ;; SKIP-POW — an unmined template has no solution yet. Core CheckBlock:
     ;;   if (signet_blocks && fCheckPOW && !CheckSignetBlockSolution(...)) reject.
-    (when (and (eq bitcoin-lisp:*network* :signet) (not skip-pow))
+    (when (and (eq bl:*network* :signet) (not skip-pow))
       (unless (check-signet-block-solution block)
         (return-from validate-block (values nil :bad-signet-solution nil))))
 
@@ -1708,9 +1708,9 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
     ;; mirrors Bitcoin Core CheckBlock: a mutated block hashes to the SAME
     ;; root as the original, so the root check passes and the mutated flag is
     ;; what catches it (bad-txns-duplicate).
-    (let* ((tx-hashes (mapcar #'bitcoin-lisp.serialization:transaction-hash
+    (let* ((tx-hashes (mapcar #'bl.ser:transaction-hash
                               transactions))
-           (header-root (bitcoin-lisp.serialization:block-header-merkle-root header)))
+           (header-root (bl.ser:block-header-merkle-root header)))
       (multiple-value-bind (computed-root mutated)
           (compute-merkle-root tx-hashes)
         (unless (equalp computed-root header-root)
@@ -1728,11 +1728,11 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
 
     ;; Legacy block size limit (non-witness serialization must fit in 1 MB)
     (let ((base-size (+ 80  ; header
-                        (bitcoin-lisp.serialization:compact-size-length
+                        (bl.ser:compact-size-length
                          (length transactions))
                         (loop for tx in transactions
                               sum (length
-                                   (bitcoin-lisp.serialization:serialize-transaction tx))))))
+                                   (bl.ser:serialize-transaction tx))))))
       (when (> base-size +max-block-size+)
         (return-from validate-block
           (values nil :block-too-large nil))))
@@ -1773,15 +1773,15 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
     ;; the chainstate outgrew LevelDB's table cache (sb-sprof, 2026-06-06).
     (when (bip30-enforced-p current-height)
       (dolist (tx transactions)
-        (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-          (dotimes (o (length (bitcoin-lisp.serialization:transaction-outputs tx)))
-            (when (bitcoin-lisp.storage:get-utxo utxo-set txid o)
+        (let ((txid (bl.ser:transaction-hash tx)))
+          (dotimes (o (length (bl.ser:transaction-outputs tx)))
+            (when (bl.store:get-utxo utxo-set txid o)
               (return-from validate-block
                 (values nil :duplicate-txid nil)))))))
 
     ;; Validate each transaction and collect fees (using Satoshi type)
     ;; Track outputs from earlier transactions for intra-block spending
-    (let* ((total-fees (bitcoin-lisp.coalton.interop:wrap-satoshi 0))
+    (let* ((total-fees (bl.interop:wrap-satoshi 0))
            (total-sigops-cost 0)
            (pending-utxos (make-hash-table :test 'equalp))
            ;; Outpoints an earlier transaction of this block already consumed.
@@ -1799,8 +1799,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
            ;; too. The BIP16 exception block is SCRIPT_VERIFY_NONE, so Core does
            ;; not count its P2SH sigops, and a height-only lookup would.
            (active-flags (block-script-flags-list
-                          (bitcoin-lisp.serialization:block-header-hash
-                           (bitcoin-lisp.serialization:bitcoin-block-header block))
+                          (bl.ser:block-header-hash
+                           (bl.ser:bitcoin-block-header block))
                           current-height))
            (count-p2sh (and (member "P2SH" active-flags :test #'string=) t))
            (count-witness (and (member "WITNESS" active-flags :test #'string=) t)))
@@ -1808,9 +1808,9 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
       ;; UTXO lookup function for sigops counting
       (flet ((get-spent-script (txid index)
                (let ((utxo (or (gethash (cons txid index) pending-utxos)
-                               (bitcoin-lisp.storage:get-utxo utxo-set txid index))))
+                               (bl.store:get-utxo utxo-set txid index))))
                  (when utxo
-                   (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo)))))
+                   (bl.store:utxo-entry-script-pubkey utxo)))))
 
         ;; Coinbase: per-tx structure (CheckTransaction) already ran in the
         ;; context-free section above; here just accumulate its contextual
@@ -1819,13 +1819,13 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
           ;; Coinbase sigops: legacy only (no inputs to look up), scaled by witness factor
           (incf total-sigops-cost (* (count-legacy-sigops coinbase-tx) +witness-scale-factor+))
           ;; Add coinbase outputs to pending (for intra-block spending)
-          (let ((txid (bitcoin-lisp.serialization:transaction-hash coinbase-tx)))
-            (loop for output across (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
+          (let ((txid (bl.ser:transaction-hash coinbase-tx)))
+            (loop for output across (bl.ser:transaction-outputs coinbase-tx)
                   for idx from 0
                   do (setf (gethash (cons txid idx) pending-utxos)
-                           (bitcoin-lisp.storage::make-utxo-entry
-                            :value (bitcoin-lisp.serialization:tx-out-value output)
-                            :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                           (bl.store::make-utxo-entry
+                            :value (bl.ser:tx-out-value output)
+                            :script-pubkey (bl.ser:tx-out-script-pubkey output)
                             :height current-height
                             :coinbase t)))))
 
@@ -1840,7 +1840,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                    (unless valid
                      (return-from validate-block (values nil error nil)))
                    ;; fee is now a Satoshi type, use typed addition
-                   (setf total-fees (bitcoin-lisp.coalton.interop:satoshi+ total-fees fee)))
+                   (setf total-fees (bl.interop:satoshi+ total-fees fee)))
                  ;; Accumulate sigops cost and check limit (early exit for DoS protection)
                  (incf total-sigops-cost
                        (count-transaction-sigops-cost tx #'get-spent-script
@@ -1853,32 +1853,32 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                  ;; this transaction's inputs spent, THEN add its outputs. Only
                  ;; non-coinbase transactions reach here, so the coinbase's null
                  ;; prevout is never marked (Core's `if (!tx.IsCoinBase())`).
-                 (bitcoin-lisp.serialization:dovector
-                     (input (bitcoin-lisp.serialization:transaction-inputs tx))
-                   (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
-                     (setf (gethash (cons (bitcoin-lisp.serialization:outpoint-hash prevout)
-                                          (bitcoin-lisp.serialization:outpoint-index prevout))
+                 (bl.ser:dovector
+                     (input (bl.ser:transaction-inputs tx))
+                   (let ((prevout (bl.ser:tx-in-previous-output input)))
+                     (setf (gethash (cons (bl.ser:outpoint-hash prevout)
+                                          (bl.ser:outpoint-index prevout))
                                     spent-outpoints)
                            t)))
-                 (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-                   (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+                 (let ((txid (bl.ser:transaction-hash tx)))
+                   (loop for output across (bl.ser:transaction-outputs tx)
                          for idx from 0
                          do (setf (gethash (cons txid idx) pending-utxos)
-                                  (bitcoin-lisp.storage::make-utxo-entry
-                                   :value (bitcoin-lisp.serialization:tx-out-value output)
-                                   :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                                  (bl.store::make-utxo-entry
+                                   :value (bl.ser:tx-out-value output)
+                                   :script-pubkey (bl.ser:tx-out-script-pubkey output)
                                    :height current-height
                                    :coinbase nil))))))
 
       ;; Transaction finality check (IsFinalTx) and BIP 68 sequence locks
-      (let* ((prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
+      (let* ((prev-hash (bl.ser:block-header-prev-block header))
              (mtp (or (compute-median-time-past chain-state prev-hash) 0))
-             (csv-height (get-csv-activation-height bitcoin-lisp:*network*))
+             (csv-height (get-csv-activation-height bl:*network*))
              (csv-active (>= current-height csv-height))
              ;; For IsFinalTx: use MTP after BIP 113 activation, block timestamp before
              (locktime-check-time (if csv-active
                                       mtp
-                                      (bitcoin-lisp.serialization:block-header-timestamp header))))
+                                      (bl.ser:block-header-timestamp header))))
         ;; Finality covers EVERY transaction including the coinbase: Core's
         ;; ContextualCheckBlock iterates block.vtx with no IsCoinBase guard
         ;; (validation.cpp:4176-4181). This skipped vtx[0], so a coinbase with
@@ -1916,7 +1916,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
           (validate-witness-commitment
            block
            (>= current-height
-               (get-segwit-activation-height bitcoin-lisp:*network*)))
+               (get-segwit-activation-height bl:*network*)))
         (unless valid
           (return-from validate-block (values nil error nil))))
 
@@ -1929,11 +1929,11 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
       ;; Validate coinbase value
       (let* ((coinbase-tx (first transactions))
              (coinbase-output-total
-               (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
-                       :key #'bitcoin-lisp.serialization:tx-out-value))
+               (reduce #'+ (bl.ser:transaction-outputs coinbase-tx)
+                       :key #'bl.ser:tx-out-value))
              (block-subsidy (calculate-block-subsidy current-height))
              ;; Convert total-fees to integer for comparison
-             (max-coinbase-value (+ block-subsidy (bitcoin-lisp.coalton.interop:unwrap-satoshi total-fees))))
+             (max-coinbase-value (+ block-subsidy (bl.interop:unwrap-satoshi total-fees))))
         (when (> coinbase-output-total max-coinbase-value)
           (return-from validate-block
             (values nil :coinbase-too-large nil))))
@@ -1943,7 +1943,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
 
 (defun test-block-validity (block chain-state utxo-set
                             &key (current-time
-                                  (bitcoin-lisp.serialization:get-unix-time)))
+                                  (bl.ser:get-unix-time)))
   "Dry-run BLOCK's full validation against CHAIN-STATE's current tip without
 mutating any state — Bitcoin Core's TestBlockValidity (validation.cpp:4495),
 which every created block template runs through (node/miner.cpp:227-231) so
@@ -1959,14 +1959,14 @@ connected, stored, or indexed. Divergence from Core: Core also skips the
 merkle-root check because its template coinbase is a dummy; our callers
 validate the fully assembled block, so the root is checked too.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
-  (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header)))
-    (unless (equalp prev-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (prev-hash (bl.ser:block-header-prev-block header)))
+    (unless (equalp prev-hash (bl.store:best-block-hash chain-state))
       (return-from test-block-validity
         (values nil :inconclusive-not-best-prevblk)))
     (multiple-value-bind (valid error)
         (validate-block block chain-state utxo-set
-                        (1+ (bitcoin-lisp.storage:current-height chain-state))
+                        (1+ (bl.store:current-height chain-state))
                         current-time :skip-pow t)
       (values (and valid t) error))))
 
@@ -1974,16 +1974,16 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 
 (defun is-coinbase-tx (tx)
   "Check if TX is a coinbase transaction."
-  (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
+  (let ((inputs (bl.ser:transaction-inputs tx)))
     (and (= (length inputs) 1)
-         (bitcoin-lisp.serialization:coinbase-input-p (aref inputs 0)))))
+         (bl.ser:coinbase-input-p (aref inputs 0)))))
 
 (defun calculate-block-subsidy (height)
   "Calculate the block subsidy for a given height. Subsidy halves every
 halving interval — 210,000 blocks on mainnet/testnet/signet, 150 on regtest
 (Bitcoin Core CRegTestParams nSubsidyHalvingInterval). The previous hardcoded
 210,000 over-paid regtest coinbases past height 150 vs Core."
-  (let* ((interval (if (eq bitcoin-lisp:*network* :regtest) 150 210000))
+  (let* ((interval (if (eq bl:*network* :regtest) 150 210000))
          (halvings (floor height interval))
          (subsidy (* 50 +coin+)))
     (if (>= halvings 64)
@@ -2050,7 +2050,7 @@ with *FLAT-BLOCK-FILES* off does."
   "Return the path for an undo data file given BLOCK-HASH."
   (when *undo-base-path*
     (merge-pathnames
-     (make-pathname :name (bitcoin-lisp.crypto:bytes-to-hex block-hash)
+     (make-pathname :name (bl.crypto:bytes-to-hex block-hash)
                     :type "dat")
      *undo-base-path*)))
 
@@ -2066,12 +2066,12 @@ nDataPos / nUndoPos all go to zero). Leaving a stale nUndoPos behind persists a
 lie into the header index and makes every later query for this block read a
 rev file that is gone."
   (let ((entry (and *undo-chain-state*
-                    (bitcoin-lisp.storage:get-block-index-entry
+                    (bl.store:get-block-index-entry
                      *undo-chain-state* block-hash))))
     (when entry
-      (setf (bitcoin-lisp.storage:block-index-entry-file entry) nil
-            (bitcoin-lisp.storage:block-index-entry-data-pos entry) nil
-            (bitcoin-lisp.storage:block-index-entry-undo-pos entry) nil)))
+      (setf (bl.store:block-index-entry-file entry) nil
+            (bl.store:block-index-entry-data-pos entry) nil
+            (bl.store:block-index-entry-undo-pos entry) nil)))
   (remhash block-hash *block-undo-data*)
   (let ((path (undo-file-path block-hash)))
     (when (and path (probe-file path))
@@ -2080,7 +2080,7 @@ rev file that is gone."
       t)))
 
 (defun prune-stale-undo-files (chain-state
-                               &key (horizon (bitcoin-lisp.storage:chain-state-pruned-height
+                               &key (horizon (bl.store:chain-state-pruned-height
                                               chain-state)))
   "One-time catch-up: delete undo files for blocks at or below HORIZON
 (default: the chain's pruned-height; they accumulated before undo pruning
@@ -2097,15 +2097,15 @@ deleted."
     (when (and *undo-base-path* (plusp horizon))
       (dolist (file (directory (merge-pathnames "*.dat" *undo-base-path*)))
         (let* ((hash (ignore-errors
-                      (bitcoin-lisp.crypto:hex-to-bytes (pathname-name file))))
+                      (bl.crypto:hex-to-bytes (pathname-name file))))
                (entry (and hash
                            (= (length hash) 32)
-                           (bitcoin-lisp.storage:get-block-index-entry
+                           (bl.store:get-block-index-entry
                             chain-state hash))))
           ;; Delete when the block is at/below the pruned horizon, or when
           ;; the hash is unknown to the index entirely (stale fork remnant).
           (when (or (null entry)
-                    (<= (bitcoin-lisp.storage:block-index-entry-height entry)
+                    (<= (bl.store:block-index-entry-height entry)
                         horizon))
             (ignore-errors (delete-file file))
             (when hash (remhash hash *undo-cache-heights*))
@@ -2120,9 +2120,9 @@ block is not in a flat file (so there is no rev file to pair with).
 The number comes from the STORE, not from the index entry's nFile — see
 BLOCK-FLAT-FILE-NUMBER. The entry is still where nUndoPos is recorded, because
 a rev record carries no block hash and nothing else can find it again."
-  (when (and bitcoin-lisp.storage:*flat-block-files*
+  (when (and bl.store:*flat-block-files*
              *undo-block-store* *undo-chain-state*)
-    (bitcoin-lisp.storage:block-flat-file-number *undo-block-store* block-hash)))
+    (bl.store:block-flat-file-number *undo-block-store* block-hash)))
 
 (defun %save-undo-legacy (block-hash spent-utxos)
   "Write SPENT-UTXOS as the legacy one-file-per-block format: a flat list of
@@ -2137,17 +2137,17 @@ flexi-streams path's Gray-stream dispatch was ~8% of mainnet-IBD CPU at h~280k
       ;; The directory is created here rather than at start-up, so a node that
       ;; only ever writes Core's rev files leaves no empty undo/ behind.
       (%ensure-undo-directory)
-      (bitcoin-lisp.storage:save-file-with-crc32-bb
+      (bl.store:save-file-with-crc32-bb
        path
        (lambda (bb)
-         (bitcoin-lisp.serialization:bb-write-bytes bb *undo-magic*)
-         (bitcoin-lisp.serialization:bb-write-u32-le bb +undo-format-version+)
-         (bitcoin-lisp.serialization:bb-write-u32-le bb (length spent-utxos))
+         (bl.ser:bb-write-bytes bb *undo-magic*)
+         (bl.ser:bb-write-u32-le bb +undo-format-version+)
+         (bl.ser:bb-write-u32-le bb (length spent-utxos))
          (dolist (entry spent-utxos)
            (destructuring-bind (txid index utxo) entry
-             (bitcoin-lisp.serialization:bb-write-bytes bb txid)
-             (bitcoin-lisp.serialization:bb-write-u32-le bb index)
-             (bitcoin-lisp.storage:bb-write-utxo-entry-fields bb utxo)))))))
+             (bl.ser:bb-write-bytes bb txid)
+             (bl.ser:bb-write-u32-le bb index)
+             (bl.store:bb-write-utxo-entry-fields bb utxo)))))))
   nil)
 
 (defun save-undo-data-to-disk (block-hash spent-utxos &key block)
@@ -2172,7 +2172,7 @@ legacy format keeps the block disconnectable instead of losing its undo data to
 a format mismatch."
   (let ((file (%undo-flat-file-number block-hash)))
     (when file
-      (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+      (let ((entry (bl.store:get-block-index-entry
                     *undo-chain-state* block-hash)))
         (when entry
           ;; Undo data is written ONCE per block. Core skips the write outright
@@ -2183,25 +2183,25 @@ a format mismatch."
           ;; bit does not, which the header index's delta log does not notice
           ;; (chain.lisp %entry-persist-key) — so the persisted offset would
           ;; silently stay a generation behind.
-          (if (bitcoin-lisp.storage:block-index-entry-undo-pos entry)
-              (bitcoin-lisp.storage:make-flat-file-pos
-               file (bitcoin-lisp.storage:block-index-entry-undo-pos entry))
+          (if (bl.store:block-index-entry-undo-pos entry)
+              (bl.store:make-flat-file-pos
+               file (bl.store:block-index-entry-undo-pos entry))
               (handler-case
-                  (let* ((tx-undos (bitcoin-lisp.storage:block-undo-from-spent-utxos
+                  (let* ((tx-undos (bl.store:block-undo-from-spent-utxos
                                     block spent-utxos))
-                         (bytes (bitcoin-lisp.storage:serialize-block-undo tx-undos))
-                         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block
-                                     (bitcoin-lisp.serialization:bitcoin-block-header block)))
-                         (pos (bitcoin-lisp.storage:store-undo-flat
+                         (bytes (bl.store:serialize-block-undo tx-undos))
+                         (prev-hash (bl.ser:block-header-prev-block
+                                     (bl.ser:bitcoin-block-header block)))
+                         (pos (bl.store:store-undo-flat
                                *undo-block-store* file prev-hash bytes)))
-                    (setf (bitcoin-lisp.storage:block-index-entry-undo-pos entry)
-                          (bitcoin-lisp.storage:flat-file-pos-pos pos))
+                    (setf (bl.store:block-index-entry-undo-pos entry)
+                          (bl.store:flat-file-pos-pos pos))
                     pos)
                 (error (e)
-                  (bitcoin-lisp:log-warn
+                  (bl:log-warn
                    "Undo data for ~A could not be written in Core's format (~A) — ~
 falling back to the legacy per-block file"
-                   (bitcoin-lisp.crypto:bytes-to-hex block-hash) e)
+                   (bl.crypto:bytes-to-hex block-hash) e)
                   nil))))))))
 
 (defun %load-undo-flat (block-hash &key block)
@@ -2215,28 +2215,28 @@ block should pass it; a full-chain index backfill otherwise reads every block
 twice."
   (let ((file (%undo-flat-file-number block-hash)))
     (when file
-      (let* ((entry (bitcoin-lisp.storage:get-block-index-entry
+      (let* ((entry (bl.store:get-block-index-entry
                      *undo-chain-state* block-hash))
              (undo-pos (and entry
-                            (bitcoin-lisp.storage:block-index-entry-undo-pos entry))))
+                            (bl.store:block-index-entry-undo-pos entry))))
         (when undo-pos
           (handler-case
               (let ((block (or block
-                               (bitcoin-lisp.storage:get-block
+                               (bl.store:get-block
                                 *undo-block-store* block-hash))))
                 (when block
-                  (let* ((pos (bitcoin-lisp.storage:make-flat-file-pos file undo-pos))
-                         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block
-                                     (bitcoin-lisp.serialization:bitcoin-block-header block)))
-                         (bytes (bitcoin-lisp.storage:read-undo-flat
+                  (let* ((pos (bl.store:make-flat-file-pos file undo-pos))
+                         (prev-hash (bl.ser:block-header-prev-block
+                                     (bl.ser:bitcoin-block-header block)))
+                         (bytes (bl.store:read-undo-flat
                                  *undo-block-store* pos prev-hash)))
                     (when bytes
-                      (bitcoin-lisp.storage:spent-utxos-from-block-undo
+                      (bl.store:spent-utxos-from-block-undo
                        block
-                       (bitcoin-lisp.storage:deserialize-block-undo bytes))))))
+                       (bl.store:deserialize-block-undo bytes))))))
             (error (e)
-              (bitcoin-lisp:log-warn "Failed to load flat undo record for ~A: ~A"
-                                     (bitcoin-lisp.crypto:bytes-to-hex block-hash) e)
+              (bl:log-warn "Failed to load flat undo record for ~A: ~A"
+                                     (bl.crypto:bytes-to-hex block-hash) e)
               nil)))))))
 
 (defun %load-undo-legacy (block-hash)
@@ -2247,7 +2247,7 @@ legacy copy SPECIFICALLY — reading through the dual-read path would hand it th
 rev record it just wrote and let it verify that record against itself."
   (let ((path (undo-file-path block-hash)))
     (when path
-      (let ((data (bitcoin-lisp.storage:load-file-with-crc32 path 16)))
+      (let ((data (bl.store:load-file-with-crc32 path 16)))
         (when data
           (handler-case
               (flexi-streams:with-input-from-sequence (stream data)
@@ -2255,21 +2255,21 @@ rev record it just wrote and let it verify that record against itself."
                   (read-sequence magic stream)
                   (unless (equalp magic *undo-magic*)
                     (return-from %load-undo-legacy nil)))
-                (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
+                (let ((version (bl.ser:read-uint32-le stream)))
                   (unless (= version +undo-format-version+)
                     (return-from %load-undo-legacy nil)))
-                (let* ((count (bitcoin-lisp.serialization:read-uint32-le stream))
+                (let* ((count (bl.ser:read-uint32-le stream))
                        (entries '()))
                   (dotimes (i count)
                     (let* ((txid (make-array 32 :element-type '(unsigned-byte 8)))
                            (_ (read-sequence txid stream))
-                           (index (bitcoin-lisp.serialization:read-uint32-le stream))
-                           (utxo (bitcoin-lisp.storage:read-utxo-entry-fields stream)))
+                           (index (bl.ser:read-uint32-le stream))
+                           (utxo (bl.store:read-utxo-entry-fields stream)))
                       (declare (ignore _))
                       (push (list txid index utxo) entries)))
                   (nreverse entries)))
             (error (c)
-              (bitcoin-lisp:log-warn "Failed to load undo data: ~A" c)
+              (bl:log-warn "Failed to load undo data: ~A" c)
               nil)))))))
 
 (defun load-undo-data-from-disk (block-hash &key block)
@@ -2303,8 +2303,8 @@ the only copy until then. A failure keeps it, and dual read keeps serving it."
        ;; OFF: %migrate-one-block forces the same binding for the block itself,
        ;; and without it here every undo record would silently stay legacy
        ;; while migrateblocks reported success.
-       (let* ((bitcoin-lisp.storage:*flat-block-files* t)
-              (block (bitcoin-lisp.storage:get-block *undo-block-store* block-hash))
+       (let* ((bl.store:*flat-block-files* t)
+              (block (bl.store:get-block *undo-block-store* block-hash))
               ;; The LEGACY reader specifically. Going through
               ;; load-undo-data-from-disk would return the rev record once one
               ;; exists, and the read-back check below would then be comparing
@@ -2333,14 +2333,14 @@ the only copy until then. A failure keeps it, and dual read keeps serving it."
                  ;; trustworthy copy and must keep being preferred. Clearing
                  ;; the pointer is what makes that happen, since the read path
                  ;; tries the flat record first.
-                 (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                 (let ((entry (bl.store:get-block-index-entry
                                *undo-chain-state* block-hash)))
                    (when entry
-                     (setf (bitcoin-lisp.storage:block-index-entry-undo-pos entry) nil)))
-                 (bitcoin-lisp:log-error
+                     (setf (bl.store:block-index-entry-undo-pos entry) nil)))
+                 (bl:log-error
                   "Migration: undo data for ~A did not read back from its rev ~
 file; the legacy undo file is kept"
-                  (bitcoin-lisp.crypto:bytes-to-hex block-hash))
+                  (bl.crypto:bytes-to-hex block-hash))
                  nil))))))))))
 
 (defun %undo-lists-equal-p (a b)
@@ -2376,13 +2376,13 @@ blocks' undo files with empty lists, which later stalled the block filter
 backfill. apply-block-to-utxo-set skips missing prevouts silently, so this is
 the one place the condition is visible before a bad undo file hits disk."
   (when (and (null spent-utxos)
-             (> (length (bitcoin-lisp.serialization:bitcoin-block-transactions
+             (> (length (bl.ser:bitcoin-block-transactions
                          block))
                 1))
-    (bitcoin-lisp:log-warn
+    (bl:log-warn
      "Undo data EMPTY for spending block ~A at height ~D — prevouts already ~
 absent from the UTXO view (double-apply?)"
-     (bitcoin-lisp.crypto:bytes-to-hex block-hash) height)))
+     (bl.crypto:bytes-to-hex block-hash) height)))
 
 (defun store-undo-data (block-hash spent-utxos height &key block)
   "Store undo data for a block to disk and in-memory cache.
@@ -2435,7 +2435,7 @@ store-undo-data (the connect path, which does the height bookkeeping) caches."
 ;;;;    reason — it is reset on every active tip change, and that reset
 ;;;;    happens in this file.
 
-(defvar *recent-confirmed-txs* (bitcoin-lisp:make-rejects-filter 48000)
+(defvar *recent-confirmed-txs* (bl:make-rejects-filter 48000)
   "Bounded rolling set of recently-confirmed txids/wtxids (Core
 m_lazy_recent_confirmed_transactions). Reuses the recent-rejects ring
 structure, sized like Core: 48,000 entries covers ~a couple hours of blocks.")
@@ -2468,11 +2468,11 @@ caller answers from disk instead."
     (when (and recent (equalp hash (car recent)))
       (or *most-recent-cmpctblock*
           (setf *most-recent-cmpctblock*
-                (bitcoin-lisp.serialization:make-cmpctblock-message (cdr recent)))))))
+                (bl.ser:make-cmpctblock-message (cdr recent)))))))
 
 (defun recently-confirmed-p (hash)
   "T if HASH (txid or wtxid) was confirmed in a recent block."
-  (and (bitcoin-lisp:recent-reject-p *recent-confirmed-txs* hash) t))
+  (and (bl:recent-reject-p *recent-confirmed-txs* hash) t))
 
 (defun most-recent-block-tx (hash)
   "The most recent block's transaction with txid or wtxid HASH, or NIL."
@@ -2483,11 +2483,11 @@ caller answers from disk instead."
   "Empty the recent-confirmed filter — on block disconnect (Core
 BlockDisconnected: a reorg may return confirmed txs to circulation, and the
 filter would otherwise block their relay) and at node start."
-  (bitcoin-lisp:clear-recent-rejects *recent-confirmed-txs*))
+  (bl:clear-recent-rejects *recent-confirmed-txs*))
 
 ;;;; The reconsiderable rejects filter (Core's SECOND rejects filter)
 
-(defvar *recent-rejects-reconsiderable* (bitcoin-lisp:make-rejects-filter 50000)
+(defvar *recent-rejects-reconsiderable* (bl:make-rejects-filter 50000)
   "Bounded rolling set of wtxids — and 1p1c package hashes — whose last
 failure was TX_RECONSIDERABLE: a policy failure a DIFFERENT package could
 still overcome. Core keeps this as a filter SEPARATE from the main rejects
@@ -2507,19 +2507,19 @@ before networking, and the active-tip-change reset lives in this file.")
   "T if HASH (a wtxid, or a 1p1c package hash) failed reconsiderably and so
 must not be submitted on its own again (Core
 RecentRejectsReconsiderableFilter().contains)."
-  (and (bitcoin-lisp:recent-reject-p *recent-rejects-reconsiderable* hash) t))
+  (and (bl:recent-reject-p *recent-rejects-reconsiderable* hash) t))
 
 (defun add-reconsiderable-reject (hash)
   "Record HASH as a reconsiderable failure (Core
 RecentRejectsReconsiderableFilter().insert)."
-  (bitcoin-lisp:add-recent-reject *recent-rejects-reconsiderable* hash))
+  (bl:add-recent-reject *recent-rejects-reconsiderable* hash))
 
 (defun clear-reconsiderable-rejects ()
   "Empty the reconsiderable rejects filter. Core resets it beside the main
 rejects filter on every active tip change (ActiveTipChange,
 txdownloadman_impl.cpp:91-95): a new block changes both the fee floor and
 which parents exist, so every cached fee failure is stale."
-  (bitcoin-lisp:clear-recent-rejects *recent-rejects-reconsiderable*))
+  (bl:clear-recent-rejects *recent-rejects-reconsiderable*))
 
 (defun note-block-connected (block)
   "Record BLOCK as the new most-recent block: rebuild the getdata-servable
@@ -2527,23 +2527,23 @@ tx map and add every transaction's txid (and distinct wtxid) to the
 recent-confirmed filter (Core BlockConnected, txdownloadman_impl.cpp:98-110,
 + NewPoWValidBlock's most_recent_block_txs rebuild)."
   (let ((map (make-hash-table :test 'equalp)))
-    (dolist (tx (coerce (bitcoin-lisp.serialization:bitcoin-block-transactions
+    (dolist (tx (coerce (bl.ser:bitcoin-block-transactions
                          block)
                         'list))
-      (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
-            (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+      (let ((txid (bl.ser:transaction-hash tx))
+            (wtxid (bl.ser:transaction-wtxid tx)))
         (setf (gethash txid map) tx)
-        (bitcoin-lisp:add-recent-reject *recent-confirmed-txs* txid)
+        (bl:add-recent-reject *recent-confirmed-txs* txid)
         (unless (equalp wtxid txid)
           (setf (gethash wtxid map) tx)
-          (bitcoin-lisp:add-recent-reject *recent-confirmed-txs* wtxid))))
+          (bl:add-recent-reject *recent-confirmed-txs* wtxid))))
     (setf *most-recent-block-txs* map
           ;; Keep the block itself too, and drop any compact form built for
           ;; the block this one replaces (most-recent-cmpctblock rebuilds on
           ;; demand). The transactions are retained by MAP either way, so the
           ;; extra cost is one cons.
-          *most-recent-block* (cons (bitcoin-lisp.serialization:block-header-hash
-                                     (bitcoin-lisp.serialization:bitcoin-block-header block))
+          *most-recent-block* (cons (bl.ser:block-header-hash
+                                     (bl.ser:bitcoin-block-header block))
                                     block)
           *most-recent-cmpctblock* nil)))
 
@@ -2559,18 +2559,18 @@ Optionally clears RECENT-REJECTS on chain reorganization.
 When MEMPOOL is provided, removes the block's confirmed/conflicting txs from it
 (the single removal chokepoint — every connect path, IBD or relay, goes here).
 Handles chain reorganizations when a competing chain has more work."
-  (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-         (hash (bitcoin-lisp.serialization:block-header-hash header))
-         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
-         (prev-entry (bitcoin-lisp.storage:get-block-index-entry chain-state prev-hash))
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (hash (bl.ser:block-header-hash header))
+         (prev-hash (bl.ser:block-header-prev-block header))
+         (prev-entry (bl.store:get-block-index-entry chain-state prev-hash))
          (new-height (if prev-entry
-                         (1+ (bitcoin-lisp.storage:block-index-entry-height prev-entry))
+                         (1+ (bl.store:block-index-entry-height prev-entry))
                          0))
          (prev-work (if prev-entry
-                        (bitcoin-lisp.storage:block-index-entry-chain-work prev-entry)
+                        (bl.store:block-index-entry-chain-work prev-entry)
                         0))
-         (chain-work (bitcoin-lisp.storage:calculate-chain-work
-                      (bitcoin-lisp.serialization:block-header-bits header)
+         (chain-work (bl.store:calculate-chain-work
+                      (bl.ser:block-header-bits header)
                       prev-work))
          ;; Store the block here, in the binding list: the height travels with
          ;; it so the file it lands in can be pruned later (a flat block file
@@ -2582,8 +2582,8 @@ Handles chain reorganizations when a competing chain has more work."
                       ;; a failure as fatal. Writing blocks onto a full disk is
                       ;; how a truncated-but-indexed .blk gets created, which
                       ;; this node has seen.
-                      (bitcoin-lisp::%gate-block-write-on-disk-space)
-                      (nth-value 1 (bitcoin-lisp.storage:store-block
+                      (bl::%gate-block-write-on-disk-space)
+                      (nth-value 1 (bl.store:store-block
                                     block-store block :height new-height)))))
 
     ;; Index entry. Core NEVER rebuilds a CBlockIndex: AddToBlockIndex is a
@@ -2600,33 +2600,33 @@ Handles chain reorganizations when a competing chain has more work."
     ;; manual override), and landed here to be re-created as :valid. The
     ;; operator's node silently returned to the chain they explicitly refused.
     ;; The same erasure cleared the automatic poison on a doomed fork subtree.
-    (let* ((existing (bitcoin-lisp.storage:get-block-index-entry chain-state hash))
+    (let* ((existing (bl.store:get-block-index-entry chain-state hash))
            (entry (or existing
-                      (bitcoin-lisp.storage:make-block-index-entry
+                      (bl.store:make-block-index-entry
                        :hash hash
                        :height new-height
                        :header header
                        :prev-entry prev-entry
                        :chain-work chain-work
                        :status :valid
-                       :tx-count (length (bitcoin-lisp.serialization:bitcoin-block-transactions
+                       :tx-count (length (bl.ser:bitcoin-block-transactions
                                           block))))))
       (when existing
         ;; Refresh what arriving BODY data supplies, in place. Status is RAISED
         ;; only: an :invalid mark is a decision (operator or validator) and
         ;; nothing here is entitled to overrule it.
-        (setf (bitcoin-lisp.storage:block-index-entry-height entry) new-height
-              (bitcoin-lisp.storage:block-index-entry-header entry) header
-              (bitcoin-lisp.storage:block-index-entry-prev-entry entry) prev-entry
-              (bitcoin-lisp.storage:block-index-entry-chain-work entry) chain-work
-              (bitcoin-lisp.storage:block-index-entry-tx-count entry)
-              (length (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
-        (unless (eq (bitcoin-lisp.storage:block-index-entry-status entry) :invalid)
-          (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)))
-      (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
+        (setf (bl.store:block-index-entry-height entry) new-height
+              (bl.store:block-index-entry-header entry) header
+              (bl.store:block-index-entry-prev-entry entry) prev-entry
+              (bl.store:block-index-entry-chain-work entry) chain-work
+              (bl.store:block-index-entry-tx-count entry)
+              (length (bl.ser:bitcoin-block-transactions block)))
+        (unless (eq (bl.store:block-index-entry-status entry) :invalid)
+          (setf (bl.store:block-index-entry-status entry) :valid)))
+      (bl.store:add-block-index-entry chain-state entry)
       ;; nFile/nDataPos, now that the entry is in the index (Core
       ;; ReceivedBlockTransactions).
-      (bitcoin-lisp.storage::%record-block-position entry stored-at)
+      (bl.store::%record-block-position entry stored-at)
 
       ;; Check if we need a reorganization. REORG-OUTCOME captures perform-reorg's
       ;; result so callers can act on a refused reorg: NIL for a tip extension or
@@ -2637,11 +2637,11 @@ Handles chain reorganizations when a competing chain has more work."
       ;; back". Returned as connect-block's second value; existing callers that
       ;; read only the first value (the index entry) are unaffected.
       (let ((reorg-outcome
-      (let* ((current-best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-             (current-best-entry (bitcoin-lisp.storage:get-block-index-entry
+      (let* ((current-best-hash (bl.store:best-block-hash chain-state))
+             (current-best-entry (bl.store:get-block-index-entry
                                   chain-state current-best-hash))
              (current-best-work (if current-best-entry
-                                    (bitcoin-lisp.storage:block-index-entry-chain-work
+                                    (bl.store:block-index-entry-chain-work
                                      current-best-entry)
                                     0)))
 
@@ -2653,52 +2653,52 @@ Handles chain reorganizations when a competing chain has more work."
           ;; "chain advanced but UTXOs not applied" or vice versa.
           ((equalp prev-hash current-best-hash)
            #+sbcl (sb-sys:without-interrupts
-           (let ((spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
+           (let ((spent-utxos (bl.store:apply-block-to-utxo-set
                                utxo-set block new-height)))
              (%warn-if-undo-empty block hash new-height spent-utxos)
              (store-undo-data hash spent-utxos new-height :block block)
              ;; BIP158: add this block's basic filter to the block filter index
              ;; (no-op unless the index is enabled; never signals).
-             (bitcoin-lisp:index-block-filter chain-state block hash new-height spent-utxos)
+             (bl:index-block-filter chain-state block hash new-height spent-utxos)
              ;; coinstatsindex: fold this block into the running UTXO stats
              ;; (no-op unless enabled; never signals).
-             (bitcoin-lisp:index-block-coinstats chain-state block hash new-height spent-utxos)
+             (bl:index-block-coinstats chain-state block hash new-height spent-utxos)
              ;; txospenderindex: record which tx here spent each output it
              ;; consumes (no-op unless enabled; never signals).
-             (bitcoin-lisp:index-block-txospenders chain-state block hash new-height)
+             (bl:index-block-txospenders chain-state block hash new-height)
              ;; Record fee statistics for fee estimation
              (when fee-estimator
-               (let ((stats (bitcoin-lisp.mempool:compute-block-fee-stats
+               (let ((stats (bl.mp:compute-block-fee-stats
                              block spent-utxos new-height)))
                  (when stats
-                   (bitcoin-lisp.mempool:fee-estimator-add-stats fee-estimator stats)
-                   (bitcoin-lisp.mempool:maybe-flush-fee-stats fee-estimator)))))
+                   (bl.mp:fee-estimator-add-stats fee-estimator stats)
+                   (bl.mp:maybe-flush-fee-stats fee-estimator)))))
            ;; Core's fee estimator learns from this block: for every
            ;; transaction it was tracking, how many blocks that feerate waited
            ;; (processBlock). Untracked txids are ignored, so the whole block
            ;; goes in. Runs BEFORE the mempool drops the block's transactions,
            ;; while they are still tracked.
-           (bitcoin-lisp.mempool:bpe-note-block
+           (bl.mp:bpe-note-block
             new-height
-            (map 'list #'bitcoin-lisp.serialization:transaction-hash
-                 (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+            (map 'list #'bl.ser:transaction-hash
+                 (bl.ser:bitcoin-block-transactions block)))
            ;; ZMQ BlockConnected: each transaction, then the block and a
            ;; sequence 'C' (zmqnotificationinterface.cpp:180).
-           (bitcoin-lisp:zmq-notify-block-connected block hash)
+           (bl:zmq-notify-block-connected block hash)
            ;; -blocknotify, detached so an operator hook can never stall block
            ;; connection (Core "thread runs free", init.cpp:2017).
-           (bitcoin-lisp:notify-block-tip hash)
+           (bl:notify-block-tip hash)
            ;; Update transaction index if enabled, and move its best-block
            ;; marker with the tip so the next startup resumes here instead of
            ;; re-reading every block from genesis.
-           (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
-             (bitcoin-lisp.storage:txindex-add-block tx-index block hash)
-             (bitcoin-lisp.storage:txindex-set-best-block tx-index hash))
-           (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height)
+           (when (and tx-index (bl.store:tx-index-enabled tx-index))
+             (bl.store:txindex-add-block tx-index block hash)
+             (bl.store:txindex-set-best-block tx-index hash))
+           (bl.store:update-chain-tip chain-state hash new-height)
            ;; Remove now-confirmed (and conflicting) txs from the mempool,
            ;; inside the same critical section as the tip update.
            (when mempool
-             (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
+             (bl.mp:mempool-remove-for-block mempool block)))
            ;; Tx-relay tip bookkeeping (outside the critical section):
            ;; expire stale mempool entries once per block (Core expire-on-
            ;; block); erase orphans included in/conflicted by this block
@@ -2710,18 +2710,18 @@ Handles chain reorganizations when a competing chain has more work."
            ;; these: its "tip" blocks are ancient, and Core only wires the
            ;; validation-interface tx-relay callbacks to the ACTIVE chainstate
            ;; (BlockConnected checks role, net_processing.cpp:2149-2157).
-           (unless (bitcoin-lisp.storage:chain-state-target-blockhash chain-state)
+           (unless (bl.store:chain-state-target-blockhash chain-state)
              (when mempool
-               (bitcoin-lisp.mempool:mempool-expire mempool)
-               (bitcoin-lisp.mempool:orphan-erase-for-block
-                (bitcoin-lisp.mempool:mempool-orphan-pool mempool) block))
+               (bl.mp:mempool-expire mempool)
+               (bl.mp:orphan-erase-for-block
+                (bl.mp:mempool-orphan-pool mempool) block))
              (note-block-connected block)
              ;; Wallet chain-tracking hook (wallet P2): scan the block for
              ;; wallet-relevant txs (Core CWallet::blockConnected). Runs
              ;; after mempool-remove-for-block, so the wallet sees the
              ;; conflict removals first — Core's signal order. Cheap no-op
              ;; when no wallets are loaded; never signals.
-             (bitcoin-lisp:wallet-notify-block-connected
+             (bl:wallet-notify-block-connected
               chain-state block hash new-height)
              ;; -stopatheight: request shutdown once the ACTIVE tip reaches
              ;; the configured height (Core KernelNotifications::blockTip,
@@ -2729,24 +2729,24 @@ Handles chain reorganizations when a competing chain has more work."
              ;; chainstate's ancient tips never trigger it. After the wallet
              ;; hook — Core's blockTip notification fires after the wallet's
              ;; BlockConnected signals.
-             (bitcoin-lisp:maybe-stop-at-height new-height))
+             (bl:maybe-stop-at-height new-height))
            ;; Core resets the recent-rejects filter on EVERY active tip change,
            ;; not just reorgs: cached failures (non-final, too-low-fee, missing
            ;; inputs) can become valid at the next block (ActiveTipChange,
            ;; net_processing.cpp:2045-2059 -> txdownloadman_impl.cpp:92-96
            ;; RecentRejectsFilter().reset()). Previously only the reorg path
            ;; cleared it. ActiveTipChange resets BOTH filters.
-           (bitcoin-lisp:clear-recent-rejects recent-rejects)
+           (bl:clear-recent-rejects recent-rejects)
            (clear-reconsiderable-rejects)
-           (bitcoin-lisp:maybe-periodic-flush chain-state)
+           (bl:maybe-periodic-flush chain-state)
            ;; Automatic block pruning after connecting a new block; each
            ;; pruned block's undo file goes with it.
-           (when (bitcoin-lisp:automatic-pruning-p)
-             (let ((pruned (bitcoin-lisp.storage:prune-old-blocks
+           (when (bl:automatic-pruning-p)
+             (let ((pruned (bl.store:prune-old-blocks
                             block-store chain-state
                             :on-prune #'delete-undo-file)))
                (when (> pruned 0)
-                 (bitcoin-lisp:log-info "Pruned ~D old block~:P" pruned)))))
+                 (bl:log-info "Pruned ~D old block~:P" pruned)))))
 
           ;; New chain has more work - reorganize. Capture perform-reorg's
           ;; (values ok detail) so the caller can re-queue missing fork blocks
@@ -2772,29 +2772,29 @@ Returns the common ancestor block-index-entry."
   (let ((a entry-a)
         (b entry-b))
     ;; First, align heights
-    (loop while (and a b (> (bitcoin-lisp.storage:block-index-entry-height a)
-                            (bitcoin-lisp.storage:block-index-entry-height b)))
-          do (setf a (bitcoin-lisp.storage:block-index-entry-prev-entry a)))
-    (loop while (and a b (> (bitcoin-lisp.storage:block-index-entry-height b)
-                            (bitcoin-lisp.storage:block-index-entry-height a)))
-          do (setf b (bitcoin-lisp.storage:block-index-entry-prev-entry b)))
+    (loop while (and a b (> (bl.store:block-index-entry-height a)
+                            (bl.store:block-index-entry-height b)))
+          do (setf a (bl.store:block-index-entry-prev-entry a)))
+    (loop while (and a b (> (bl.store:block-index-entry-height b)
+                            (bl.store:block-index-entry-height a)))
+          do (setf b (bl.store:block-index-entry-prev-entry b)))
     ;; Walk both back until they meet
-    (loop while (and a b (not (equalp (bitcoin-lisp.storage:block-index-entry-hash a)
-                                      (bitcoin-lisp.storage:block-index-entry-hash b))))
-          do (setf a (bitcoin-lisp.storage:block-index-entry-prev-entry a))
-             (setf b (bitcoin-lisp.storage:block-index-entry-prev-entry b)))
+    (loop while (and a b (not (equalp (bl.store:block-index-entry-hash a)
+                                      (bl.store:block-index-entry-hash b))))
+          do (setf a (bl.store:block-index-entry-prev-entry a))
+             (setf b (bl.store:block-index-entry-prev-entry b)))
     a))
 
 (defun collect-chain-entries (tip-entry fork-entry)
   "Collect block-index-entries from TIP-ENTRY back to (not including) FORK-ENTRY."
   (let ((entries '())
         (entry tip-entry)
-        (fork-hash (bitcoin-lisp.storage:block-index-entry-hash fork-entry)))
+        (fork-hash (bl.store:block-index-entry-hash fork-entry)))
     (loop while (and entry
-                     (not (equalp (bitcoin-lisp.storage:block-index-entry-hash entry)
+                     (not (equalp (bl.store:block-index-entry-hash entry)
                                   fork-hash)))
           do (push entry entries)
-             (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+             (setf entry (bl.store:block-index-entry-prev-entry entry)))
     (nreverse entries)))
 
 (defun %mempool-entry-invalid-after-reorg-p (mempool entry utxo-set eval-height
@@ -2807,7 +2807,7 @@ no longer final, BIP68 sequence locks no longer satisfied, or spending a
 now-immature coinbase. EVAL-HEIGHT is the next block's height (new tip +
 1); MTP the new tip's median-time-past; LOCKTIME-TIME the BIP113 clock for
 absolute locktimes (MTP once CSV is active, mirroring the acceptance path)."
-  (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
+  (let ((tx (bl.mp:mempool-entry-transaction entry)))
     (or
      ;; The transaction must still be final (Core CheckFinalTxAtTip:
      ;; next-block height + tip MTP, validation.cpp:347-348).
@@ -2830,18 +2830,18 @@ absolute locktimes (MTP once CSV is active, mirroring the acceptance path)."
      ;; the coin exists; we scan the inputs and treat a missing coin as
      ;; invalid (defensive — the re-add path should have removed it).
      (block immature
-       (bitcoin-lisp.serialization:dovector
-           (input (bitcoin-lisp.serialization:transaction-inputs tx))
-         (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
-                (pidx (bitcoin-lisp.serialization:outpoint-index prevout)))
-           (unless (bitcoin-lisp.mempool:mempool-has mempool ptxid)
-             (let ((utxo (bitcoin-lisp.storage:get-utxo utxo-set ptxid pidx)))
+       (bl.ser:dovector
+           (input (bl.ser:transaction-inputs tx))
+         (let* ((prevout (bl.ser:tx-in-previous-output input))
+                (ptxid (bl.ser:outpoint-hash prevout))
+                (pidx (bl.ser:outpoint-index prevout)))
+           (unless (bl.mp:mempool-has mempool ptxid)
+             (let ((utxo (bl.store:get-utxo utxo-set ptxid pidx)))
                (cond ((null utxo)
                       (return-from immature t))
-                     ((and (bitcoin-lisp.storage:utxo-entry-coinbase utxo)
+                     ((and (bl.store:utxo-entry-coinbase utxo)
                            (< (- eval-height
-                                 (bitcoin-lisp.storage:utxo-entry-height utxo))
+                                 (bl.store:utxo-entry-height utxo))
                               +coinbase-maturity+))
                       (return-from immature t)))))))
        nil))))
@@ -2857,18 +2857,18 @@ this pass covers what was already in the pool, whose validity the reorg may
 have silently revoked. HEIGHT is the NEW tip height. Returns the number of
 transactions removed."
   (let* ((eval-height (1+ height))
-         (tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (tip-hash (bl.store:best-block-hash chain-state))
          (mtp (or (compute-median-time-past chain-state tip-hash) 0))
          (csv-active (>= eval-height
-                         (get-csv-activation-height bitcoin-lisp:*network*)))
+                         (get-csv-activation-height bl:*network*)))
          ;; BIP113: same clock the acceptance path uses (transaction.lisp).
          (locktime-time (if csv-active
                             mtp
-                            (bitcoin-lisp.serialization:get-unix-time)))
+                            (bl.ser:get-unix-time)))
          (flagged '()))
     ;; Flag first (Core collects to_remove over all of mapTx), remove after —
     ;; the entries table must not be mutated mid-iteration.
-    (bitcoin-lisp.mempool:mempool-for-each
+    (bl.mp:mempool-for-each
      mempool
      (lambda (txid entry)
        (when (%mempool-entry-invalid-after-reorg-p
@@ -2876,11 +2876,11 @@ transactions removed."
               mtp locktime-time csv-active)
          (push txid flagged))))
     (let ((removed 0)
-          (bitcoin-lisp.mempool:*mempool-removal-reason* :reorg))
+          (bl.mp:*mempool-removal-reason* :reorg))
       (dolist (txid flagged removed)
         ;; May be gone already as an earlier removal's descendant.
-        (when (bitcoin-lisp.mempool:mempool-has mempool txid)
-          (incf removed (bitcoin-lisp.mempool:mempool-remove-recursive
+        (when (bl.mp:mempool-has mempool txid)
+          (incf removed (bl.mp:mempool-remove-recursive
                          mempool txid)))))))
 
 (defun readd-disconnected-txs-to-mempool (mempool txs utxo-set height chain-state)
@@ -2914,7 +2914,7 @@ disconnected blocks."
   (when mempool
     (let ((readded '()))                ; txids, most-recently-confirmed first
       (dolist (tx txs)
-        (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+        (let ((txid (bl.ser:transaction-hash tx)))
           (handler-case
               (multiple-value-bind (valid error fee replaced sigops)
                   (validate-transaction-for-mempool tx utxo-set mempool height
@@ -2922,7 +2922,7 @@ disconnected blocks."
                                                     :chain-state chain-state)
                 (declare (ignore error))
                 (when valid
-                  (bitcoin-lisp.mempool:accept-validated-tx
+                  (bl.mp:accept-validated-tx
                    mempool txid tx fee height
                    :sigops sigops :replaced replaced :defer-trim t)))
             (error () nil))
@@ -2930,14 +2930,14 @@ disconnected blocks."
           ;; validation.cpp:322): a tx that is in the pool now — re-accepted,
           ;; or already there — gets its child links wired below; one that
           ;; isn't drags down its in-pool spenders.
-          (if (bitcoin-lisp.mempool:mempool-has mempool txid)
+          (if (bl.mp:mempool-has mempool txid)
               (push txid readded)
-              (bitcoin-lisp.mempool:mempool-remove-spenders
+              (bl.mp:mempool-remove-spenders
                mempool txid
-               (length (bitcoin-lisp.serialization:transaction-outputs tx))))))
-      (bitcoin-lisp.mempool:mempool-update-for-reorg mempool readded)
+               (length (bl.ser:transaction-outputs tx))))))
+      (bl.mp:mempool-update-for-reorg mempool readded)
       (remove-reorged-nonfinal-mempool-entries mempool utxo-set height chain-state)
-      (bitcoin-lisp.mempool:mempool-trim-to-size mempool))))
+      (bl.mp:mempool-trim-to-size mempool))))
 
 (defun %rollback-partial-reorg (chain-state block-store utxo-set
                                 connected to-disconnect old-tip-entry)
@@ -2959,24 +2959,24 @@ perform-reorg's success phase, so there is nothing to undo here."
     (destructuring-bind (entry block height spent-utxos) item
       ;; HEIGHT enables Core's per-output height comparison in the disconnect
       ;; (validation.cpp:2213-2219); it used to be discarded here.
-      (bitcoin-lisp.storage:disconnect-block-from-utxo-set utxo-set block spent-utxos
+      (bl.store:disconnect-block-from-utxo-set utxo-set block spent-utxos
                                                            :height height)
-      (setf (bitcoin-lisp.storage:block-index-entry-status entry) :header-valid)))
+      (setf (bl.store:block-index-entry-status entry) :header-valid)))
   ;; 2. Re-apply the original chain, fork-first (to-disconnect is tip-first).
   ;;    These blocks were valid when first connected; their undo data is
   ;;    still on disk, so a forward apply restores the exact prior UTXO set.
   (dolist (entry (reverse to-disconnect))
-    (let ((block (bitcoin-lisp.storage:get-block
-                  block-store (bitcoin-lisp.storage:block-index-entry-hash entry))))
+    (let ((block (bl.store:get-block
+                  block-store (bl.store:block-index-entry-hash entry))))
       (when block
-        (bitcoin-lisp.storage:apply-block-to-utxo-set
-         utxo-set block (bitcoin-lisp.storage:block-index-entry-height entry))
-        (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid))))
+        (bl.store:apply-block-to-utxo-set
+         utxo-set block (bl.store:block-index-entry-height entry))
+        (setf (bl.store:block-index-entry-status entry) :valid))))
   ;; 3. Restore the tip.
-  (bitcoin-lisp.storage:update-chain-tip
+  (bl.store:update-chain-tip
    chain-state
-   (bitcoin-lisp.storage:block-index-entry-hash old-tip-entry)
-   (bitcoin-lisp.storage:block-index-entry-height old-tip-entry)))
+   (bl.store:block-index-entry-hash old-tip-entry)
+   (bl.store:block-index-entry-height old-tip-entry)))
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; Deterministic-invalid classification (Core BLOCK_FAILED_VALID / _CHILD)
@@ -3065,7 +3065,7 @@ the deep-reorg candidate scan prunes it (%best-completable-reorg-target), and th
 best-header / best-valid-tip scans skip it. Idempotent. block-index-descendants
 includes ENTRY itself."
   (dolist (e (block-index-descendants chain-state entry))
-    (setf (bitcoin-lisp.storage:block-index-entry-status e) :invalid)))
+    (setf (bl.store:block-index-entry-status e) :invalid)))
 
 ;;;; Cooperative shutdown inside a reorg (plan phase 3b).
 ;;;;
@@ -3083,7 +3083,7 @@ includes ENTRY itself."
 ;;;; interruptible work, while a truncated reorg is simply a shorter (or
 ;;;; partially advanced) valid chain that the next sync pass re-activates.
 ;;;;
-;;;; The predicate is bitcoin-lisp:interrupt-requested-p (config.lisp states the
+;;;; The predicate is bl:interrupt-requested-p (config.lisp states the
 ;;;; contract). It is true for BOTH meanings the node has for "stop": a real
 ;;;; shutdown, and call-with-sync-paused (assumeutxo snapshot activation, after
 ;;;; which the node keeps RUNNING). Covering the pause too is only safe because the
@@ -3124,15 +3124,15 @@ comment above."
     (unless fork-entry
       (return-from perform-reorg nil))
 
-    (let ((old-height (bitcoin-lisp.storage:block-index-entry-height old-tip-entry))
-          (new-height (bitcoin-lisp.storage:block-index-entry-height new-tip-entry))
-          (fork-height (bitcoin-lisp.storage:block-index-entry-height fork-entry)))
+    (let ((old-height (bl.store:block-index-entry-height old-tip-entry))
+          (new-height (bl.store:block-index-entry-height new-tip-entry))
+          (fork-height (bl.store:block-index-entry-height fork-entry)))
 
       ;; Check if reorg requires blocks that have been pruned
-      (when (bitcoin-lisp:pruning-enabled-p)
-        (let ((pruned-height (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
+      (when (bl:pruning-enabled-p)
+        (let ((pruned-height (bl.store:chain-state-pruned-height chain-state)))
           (when (< fork-height pruned-height)
-            (bitcoin-lisp:log-error
+            (bl:log-error
              "REORG IMPOSSIBLE: fork point ~D is below pruned height ~D. Node must re-sync."
              fork-height pruned-height)
             (return-from perform-reorg nil))))
@@ -3183,30 +3183,30 @@ comment above."
         ;; Checked BEFORE anything is mutated, so refusing costs nothing and
         ;; cannot leave the chainstate half-moved.
         (let ((failed (find-if (lambda (e)
-                                 (eq (bitcoin-lisp.storage:block-index-entry-status e)
+                                 (eq (bl.store:block-index-entry-status e)
                                      :invalid))
                                to-connect)))
           (when failed
-            (bitcoin-lisp:log-warn
+            (bl:log-warn
              "REORG refused: block at height ~D on the target branch is marked invalid"
-             (bitcoin-lisp.storage:block-index-entry-height failed))
+             (bl.store:block-index-entry-height failed))
             (return-from perform-reorg (values nil :invalid-branch))))
 
         (dolist (entry to-connect)
-          (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
-                 (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+          (let* ((block-hash (bl.store:block-index-entry-hash entry))
+                 (block (bl.store:get-block block-store block-hash)))
             (when (and block (block-witness-stripped-p block))
-              (bitcoin-lisp:log-warn
+              (bl:log-warn
                "REORG: stored block at height ~D is witness-stripped; pruning for witness-complete re-download"
-               (bitcoin-lisp.storage:block-index-entry-height entry))
+               (bl.store:block-index-entry-height entry))
               ;; FORGET, not prune: a flat record cannot be deleted on its
               ;; own, and PRUNE-BLOCK refuses for one — which would leave
               ;; GET-BLOCK serving the same witness-stripped body to every
               ;; later retry of this reorg.
-              (bitcoin-lisp.storage:forget-block-body block-store block-hash)
+              (bl.store:forget-block-body block-store block-hash)
               ;; Header stays in the index; mark it needing a body so the normal
               ;; download path re-fetches it.
-              (setf (bitcoin-lisp.storage:block-index-entry-status entry) :header-valid))))
+              (setf (bl.store:block-index-entry-status entry) :header-valid))))
 
         ;; Precondition: every block on BOTH sides must be in the
         ;; block-store. If anything is missing (including a stripped block just
@@ -3216,13 +3216,13 @@ comment above."
         ;; download instead of looping forever on the unprocessable incoming tip.
         (let ((missing '()))
           (dolist (entry (append to-disconnect to-connect))
-            (let ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
-              (unless (bitcoin-lisp.storage:get-block block-store block-hash)
+            (let ((block-hash (bl.store:block-index-entry-hash entry)))
+              (unless (bl.store:get-block block-store block-hash)
                 (push (cons block-hash
-                            (bitcoin-lisp.storage:block-index-entry-height entry))
+                            (bl.store:block-index-entry-height entry))
                       missing))))
           (when missing
-            (bitcoin-lisp:log-warn
+            (bl:log-warn
              "REORG REFUSED: ~D blocks missing from store (first: height ~D)"
              (length missing) (cdr (first missing)))
             (return-from perform-reorg (values nil missing))))
@@ -3241,20 +3241,20 @@ comment above."
         ;; is not fixed by fetching fork blocks. Core aborts DisconnectBlock on
         ;; undo-read failure (DISCONNECT_FAILED) for the same reason.
         (dolist (entry to-disconnect)
-          (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
-                 (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+          (let* ((block-hash (bl.store:block-index-entry-hash entry))
+                 (block (bl.store:get-block block-store block-hash)))
             (when (and block
-                       (> (length (bitcoin-lisp.serialization:bitcoin-block-transactions
+                       (> (length (bl.ser:bitcoin-block-transactions
                                    block))
                           1)
                        (null (get-undo-data block-hash)))
-              (bitcoin-lisp:log-error
+              (bl:log-error
                "REORG REFUSED: corrupt/missing undo for spending block ~A at height ~D — refusing rather than corrupting the UTXO set"
-               (bitcoin-lisp.crypto:bytes-to-hex block-hash)
-               (bitcoin-lisp.storage:block-index-entry-height entry))
+               (bl.crypto:bytes-to-hex block-hash)
+               (bl.store:block-index-entry-height entry))
               (return-from perform-reorg (values nil :corrupt-undo)))))
 
-        (bitcoin-lisp:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
+        (bl:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
                                old-height fork-height new-height)
 
         ;; PHASE A — disconnect the old chain (UTXO only), tip-to-fork.
@@ -3270,24 +3270,24 @@ comment above."
           ;; of this iteration the coins are exactly ENTRY's state, so the tip
           ;; update below lands on ENTRY instead of the fork point, and nothing
           ;; needs undoing.
-          (when (bitcoin-lisp:interrupt-requested-p)
+          (when (bl:interrupt-requested-p)
             (setf stop-entry entry
                   interrupted t)
             (return))
-          (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
-                 (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+          (let* ((block-hash (bl.store:block-index-entry-hash entry))
+                 (block (bl.store:get-block block-store block-hash)))
             (when block
               (let ((undo (get-undo-data block-hash)))
-                (bitcoin-lisp.storage:disconnect-block-from-utxo-set
+                (bl.store:disconnect-block-from-utxo-set
                  utxo-set block (or undo '())
-                 :height (bitcoin-lisp.storage:block-index-entry-height entry)))
+                 :height (bl.store:block-index-entry-height entry)))
               ;; Core flushes IF_NEEDED at the end of DisconnectTip
               ;; (validation.cpp:2966). Safe HERE and not a line earlier:
               ;; disconnect-block-from-utxo-set sets the coins-view best-block
               ;; as its last act, so the pointer already names the block whose
               ;; coins are in the cache. Flushing between the two would persist
               ;; a cache and a pointer that disagree.
-              (bitcoin-lisp:maybe-critical-flush chain-state)
+              (bl:maybe-critical-flush chain-state)
               ;; Collect this block's non-coinbase txs (original order) for the
               ;; PHASE C mempool re-add. Pushing whole per-block lists during
               ;; the tip-first loop leaves disconnected-block-txs oldest-first.
@@ -3307,14 +3307,14 @@ comment above."
               ;; oldest-block-first with the tip block at the TAIL, so
               ;; "trim newest" means dropping from the tail.
               (when mempool
-                (let* ((txs (rest (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+                (let* ((txs (rest (bl.ser:bitcoin-block-transactions block)))
                        ;; Serialized size stands in for Core's
                        ;; RecursiveDynamicUsage: same order of magnitude and
                        ;; monotone in the same thing, without walking every
                        ;; input/output allocation.
                        (bytes (let ((n 0))
                                 (dolist (tx txs n)
-                                  (incf n (bitcoin-lisp.serialization:transaction-weight tx))))))
+                                  (incf n (bl.ser:transaction-weight tx))))))
                   (push (cons txs bytes) disconnected-block-txs)
                   (incf disconnected-bytes bytes)
                   (multiple-value-bind (kept left dropped)
@@ -3322,9 +3322,9 @@ comment above."
                     (setf disconnected-block-txs kept
                           disconnected-bytes left)
                     (incf disconnected-dropped dropped))))
-              (push (cons block (bitcoin-lisp.storage:block-index-entry-height entry))
+              (push (cons block (bl.store:block-index-entry-height entry))
                     disconnected-blocks)
-              (setf (bitcoin-lisp.storage:block-index-entry-status entry) :header-valid))))
+              (setf (bl.store:block-index-entry-status entry) :header-valid))))
 
         ;; Tip is now logically at the fork point. Set it so each fork block's
         ;; validate-block sees the fork's active chain for sequence-lock / MTP
@@ -3335,10 +3335,10 @@ comment above."
         ;; makes the in-memory tip agree with them (and with the pointer the
         ;; next flush persists) before we return.
         (let ((landing (or stop-entry fork-entry)))
-          (bitcoin-lisp.storage:update-chain-tip
+          (bl.store:update-chain-tip
            chain-state
-           (bitcoin-lisp.storage:block-index-entry-hash landing)
-           (bitcoin-lisp.storage:block-index-entry-height landing)))
+           (bl.store:block-index-entry-hash landing)
+           (bl.store:block-index-entry-height landing)))
 
         ;; PHASE B — validate + connect the fork, fork-to-tip, with rollback.
         ;; collect-chain-entries returns tip-first, so reverse to oldest-first:
@@ -3346,19 +3346,19 @@ comment above."
         ;; exist), and the incremental tip must end at the new tip, not the
         ;; fork-side block.
         (let ((connected '())          ; (entry block height spent-utxos), newest-first
-              (now (bitcoin-lisp.serialization:get-unix-time)))
+              (now (bl.ser:get-unix-time)))
           ;; A stop request already handled in PHASE A leaves nothing to connect:
           ;; the chain is parked on STOP-ENTRY and must not move further.
           (dolist (entry (if interrupted '() (reverse to-connect)))
             ;; Cooperative stop, as in PHASE A. Here the tip already advanced per
             ;; connected block (below), so this boundary needs no fixing up — and
             ;; no rollback (see the section comment).
-            (when (bitcoin-lisp:interrupt-requested-p)
+            (when (bl:interrupt-requested-p)
               (setf interrupted t)
               (return))
-            (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
-                   (block (bitcoin-lisp.storage:get-block block-store block-hash))
-                   (height (bitcoin-lisp.storage:block-index-entry-height entry)))
+            (let* ((block-hash (bl.store:block-index-entry-hash entry))
+                   (block (bl.store:get-block block-store block-hash))
+                   (height (bl.store:block-index-entry-height entry)))
               ;; Full body validation against the intermediate UTXO + active
               ;; chain. The header was checked at receive time, but a
               ;; competing-fork block stored via the :weaker-chain path had its
@@ -3371,8 +3371,8 @@ comment above."
               ;; VALIDATE-BLOCK's SKIP-HEADER docstring).
               (multiple-value-bind (valid error)
                   (if (header-time-too-old-p
-                       (bitcoin-lisp.serialization:bitcoin-block-header block)
-                       (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
+                       (bl.ser:bitcoin-block-header block)
+                       (bl.store:block-index-entry-prev-entry entry))
                       (values nil :time-too-old)
                       (validate-block block chain-state utxo-set height now
                                       ;; PER BLOCK, not the caller's single
@@ -3394,7 +3394,7 @@ comment above."
                                       ;; ConnectBlock doesn't re-check it.
                                       :skip-header t))
                 (unless valid
-                  (bitcoin-lisp:log-error
+                  (bl:log-error
                    "REORG ABORTED at height ~D: fork block failed validation (~A). Rolling back to original chain."
                    height error)
                   ;; BLOCK_FAILED_VALID / _CHILD: only when this is a DETERMINISTIC
@@ -3415,12 +3415,12 @@ comment above."
                                            connected to-disconnect old-tip-entry)
                   (return-from perform-reorg (values nil error))))
               ;; Apply and advance the tip incrementally.
-              (let ((spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
+              (let ((spent-utxos (bl.store:apply-block-to-utxo-set
                                   utxo-set block height)))
                 (%warn-if-undo-empty block block-hash height spent-utxos)
                 (store-undo-data block-hash spent-utxos height :block block)
-                (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)
-                (bitcoin-lisp.storage:update-chain-tip chain-state block-hash height)
+                (setf (bl.store:block-index-entry-status entry) :valid)
+                (bl.store:update-chain-tip chain-state block-hash height)
                 (push (list entry block height spent-utxos) connected))))
           ;; NOTE: deliberately NO maybe-critical-flush in this loop, unlike
           ;; PHASE A above, even though Core flushes IF_NEEDED at the end of
@@ -3461,60 +3461,60 @@ comment above."
           ;; rolled-back reorg never notified anything. disconnected-blocks
           ;; is oldest-first (PHASE A push order); reverse restores tip-first.
           (dolist (pair (reverse disconnected-blocks))
-            (bitcoin-lisp:wallet-notify-block-disconnected
+            (bl:wallet-notify-block-disconnected
              chain-state (car pair) (cdr pair))
             ;; ZMQ BlockDisconnected: the block's transactions, then a
             ;; sequence 'D'. No hashblock/rawblock -- those announce the tip
             ;; moving FORWARD, and a subscriber that saw one for a block now
             ;; being undone learns that from the 'D' instead.
-            (bitcoin-lisp:zmq-notify-block-disconnected
-             (car pair) (bitcoin-lisp.serialization:block-header-hash
-                         (bitcoin-lisp.serialization:bitcoin-block-header (car pair))))
+            (bl:zmq-notify-block-disconnected
+             (car pair) (bl.ser:block-header-hash
+                         (bl.ser:bitcoin-block-header (car pair))))
             ;; txospenderindex: erase this block's spender entries. Deferred to
             ;; PHASE C with every other side effect, so an INTERRUPTED reorg —
             ;; which rolls back and leaves these blocks connected — never
             ;; erases entries for blocks that are still on the chain.
-            (bitcoin-lisp:unindex-block-txospenders
+            (bl:unindex-block-txospenders
              chain-state (car pair)
-             (bitcoin-lisp.serialization:block-header-hash
-              (bitcoin-lisp.serialization:bitcoin-block-header (car pair)))))
+             (bl.ser:block-header-hash
+              (bl.ser:bitcoin-block-header (car pair)))))
           (dolist (item (reverse connected))
             (destructuring-bind (entry block height spent-utxos) item
               (when fee-estimator
-                (let ((stats (bitcoin-lisp.mempool:compute-block-fee-stats
+                (let ((stats (bl.mp:compute-block-fee-stats
                               block spent-utxos height)))
                   (when stats
-                    (bitcoin-lisp.mempool:fee-estimator-add-stats fee-estimator stats))))
+                    (bl.mp:fee-estimator-add-stats fee-estimator stats))))
               ;; Index under the block-index ENTRY's hash — the block index is
               ;; the canonical identity (Core BaseIndex writes are keyed off
               ;; the CBlockIndex), and BLOCK here was re-read from disk so a
               ;; recomputed header hash is a fresh object, not the one the
               ;; connect path / index entries key by.
-              (let ((hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
-                (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
-                  (bitcoin-lisp.storage:txindex-add-block tx-index block hash)
-                  (bitcoin-lisp.storage:txindex-set-best-block tx-index hash))
+              (let ((hash (bl.store:block-index-entry-hash entry)))
+                (when (and tx-index (bl.store:tx-index-enabled tx-index))
+                  (bl.store:txindex-add-block tx-index block hash)
+                  (bl.store:txindex-set-best-block tx-index hash))
                 ;; BIP158: index the reconnected block's basic filter (oldest-to-
                 ;; newest here, so its header chains off the already-indexed parent).
-                (bitcoin-lisp:index-block-filter chain-state block hash height spent-utxos)
+                (bl:index-block-filter chain-state block hash height spent-utxos)
                 ;; coinstatsindex: reconnected oldest-to-newest, so each block
                 ;; loads its (already-reindexed) parent's running state.
-                (bitcoin-lisp:index-block-coinstats chain-state block hash height spent-utxos)
+                (bl:index-block-coinstats chain-state block hash height spent-utxos)
                 ;; txospenderindex: the erase for the disconnected side already
                 ;; ran earlier in this phase, so these writes cannot be undone
                 ;; by it.
-                (bitcoin-lisp:index-block-txospenders chain-state block hash height))
+                (bl:index-block-txospenders chain-state block hash height))
               (when mempool
-                (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)
-                (bitcoin-lisp.mempool:orphan-erase-for-block
-                 (bitcoin-lisp.mempool:mempool-orphan-pool mempool) block))
+                (bl.mp:mempool-remove-for-block mempool block)
+                (bl.mp:orphan-erase-for-block
+                 (bl.mp:mempool-orphan-pool mempool) block))
               ;; Each reconnected block counts as connected for the tx-relay
               ;; tip structures; the LAST one leaves the map at the new tip.
               (note-block-connected block)
               ;; Wallet hook: the fork's blocks connect oldest-to-newest,
               ;; after that block's mempool conflict removals (Core order).
-              (bitcoin-lisp:wallet-notify-block-connected
-               chain-state block (bitcoin-lisp.storage:block-index-entry-hash entry)
+              (bl:wallet-notify-block-connected
+               chain-state block (bl.store:block-index-entry-hash entry)
                height)))
           ;; The disconnected old chain's txs stay in the tx-index: Core never
           ;; erases txindex entries on disconnect (index/base.h:136 CustomRemove
@@ -3524,19 +3524,19 @@ comment above."
           ;; still-stored stale block (removing them here used to leave re-mined
           ;; txs UNINDEXED, since the old txindex-add skipped existing txids).
           ;; Reorg may change tx validity — clear both rejects caches.
-          (bitcoin-lisp:clear-recent-rejects recent-rejects)
+          (bl:clear-recent-rejects recent-rejects)
           (clear-reconsiderable-rejects)
           ;; Re-add disconnected-block txs (best-effort, against the new tip),
           ;; parents before children. Txs re-confirmed or invalidated by the
           ;; new chain are dropped by re-validation.
           (when (plusp disconnected-dropped)
-            (bitcoin-lisp:log-warn "REORG: disconnect pool over ~D bytes — dropped ~D transaction~:P nearest the old tip; they will not be re-added to the mempool"
+            (bl:log-warn "REORG: disconnect pool over ~D bytes — dropped ~D transaction~:P nearest the old tip; they will not be re-added to the mempool"
                                    +max-disconnected-tx-pool-bytes+
                                    disconnected-dropped))
           ;; Re-validate against the height the chain ACTUALLY reached: equal to
           ;; NEW-HEIGHT on the normal path, and the truncation point when a stop
           ;; request cut the reorg short.
-          (let ((reached (bitcoin-lisp.storage:current-height chain-state)))
+          (let ((reached (bl.store:current-height chain-state)))
             (readd-disconnected-txs-to-mempool
              mempool (loop for entry in disconnected-block-txs append (car entry))
              utxo-set reached chain-state)
@@ -3547,13 +3547,13 @@ comment above."
                ;; chain sits on a block boundary where coins, pointer and tip
                ;; agree, and the next sync pass re-attempts the rest. Callers must
                ;; treat :INTERRUPTED as transient — never as a verdict on the fork.
-               (bitcoin-lisp:log-warn
+               (bl:log-warn
                 "REORG INTERRUPTED by a stop request after disconnecting ~D of ~D and connecting ~D of ~D; chain left at height ~D"
                 (length disconnected-blocks) (length to-disconnect)
                 (length connected) (length to-connect) reached)
                (values nil :interrupted))
               (t
-               (bitcoin-lisp:log-info "REORG complete: disconnected ~D, connected ~D blocks"
+               (bl:log-info "REORG complete: disconnected ~D, connected ~D blocks"
                                       (length to-disconnect) (length to-connect))
                t))))))))
 
@@ -3582,18 +3582,18 @@ test, because load-header-index rebuilds a consistent object graph by hash.
 connect-block no longer replaces entries (GA9 S1-4), so the cause is gone; this
 is the second half, so the invariant stops resting on identity at all. A hash
 comparison is what the block index is keyed by anyway."
-  (let ((found (bitcoin-lisp.storage:entry-ancestor-at-height
-                entry (bitcoin-lisp.storage:block-index-entry-height ancestor-entry))))
+  (let ((found (bl.store:entry-ancestor-at-height
+                entry (bl.store:block-index-entry-height ancestor-entry))))
     (and found
-         (equalp (bitcoin-lisp.storage:block-index-entry-hash found)
-                 (bitcoin-lisp.storage:block-index-entry-hash ancestor-entry)))))
+         (equalp (bl.store:block-index-entry-hash found)
+                 (bl.store:block-index-entry-hash ancestor-entry)))))
 
 (defun block-index-descendants (chain-state entry)
   "All block-index entries that descend from ENTRY, including ENTRY itself."
   (let ((result '()))
     (maphash (lambda (h e) (declare (ignore h))
                (when (block-descends-from-p e entry) (push e result)))
-             (bitcoin-lisp.storage::chain-state-block-index chain-state))
+             (bl.store::chain-state-block-index chain-state))
     result))
 
 (defun best-valid-tip (chain-state block-store &optional (min-work 0))
@@ -3614,14 +3614,14 @@ is zero probes."
   (let ((best nil)
         (best-work min-work))
     (maphash (lambda (h e) (declare (ignore h))
-               (let ((w (bitcoin-lisp.storage:block-index-entry-chain-work e)))
+               (let ((w (bl.store:block-index-entry-chain-work e)))
                  (when (and (> w best-work)
-                            (not (eq (bitcoin-lisp.storage:block-index-entry-status e) :invalid))
-                            (bitcoin-lisp.storage:block-exists-p
-                             block-store (bitcoin-lisp.storage:block-index-entry-hash e)))
+                            (not (eq (bl.store:block-index-entry-status e) :invalid))
+                            (bl.store:block-exists-p
+                             block-store (bl.store:block-index-entry-hash e)))
                    (setf best e
                          best-work w))))
-             (bitcoin-lisp.storage::chain-state-block-index chain-state))
+             (bl.store::chain-state-block-index chain-state))
     best))
 
 (defconstant +activation-step-blocks+ 1000
@@ -3645,14 +3645,14 @@ flush.")
 Walking back from TARGET rather than forward from TIP because the index links
 child -> parent: an entry knows its prev, not its next. The result is always on
 TARGET's chain, so a step is a real move toward it and never sideways."
-  (let* ((tip-height (if tip (bitcoin-lisp.storage:block-index-entry-height tip) 0))
-         (target-height (bitcoin-lisp.storage:block-index-entry-height target))
+  (let* ((tip-height (if tip (bl.store:block-index-entry-height tip) 0))
+         (target-height (bl.store:block-index-entry-height target))
          (want (+ tip-height +activation-step-blocks+)))
     (if (<= target-height want)
         target
         (let ((e target))
-          (loop while (and e (> (bitcoin-lisp.storage:block-index-entry-height e) want))
-                do (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
+          (loop while (and e (> (bl.store:block-index-entry-height e) want))
+                do (setf e (bl.store:block-index-entry-prev-entry e)))
           ;; A gap in prev-entry links (a pruned or partially-reindexed index)
           ;; leaves E nil; fall back to the full target rather than inventing a
           ;; step, and let PERFORM-REORG report what it cannot reach.
@@ -3685,10 +3685,10 @@ backstop against a candidate that reorgs away and reappears."
   (let ((switched nil)
         (missing '()))
     (dotimes (i 4)
-      (let* ((tip (bitcoin-lisp.storage:get-block-index-entry
-                   chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+      (let* ((tip (bl.store:get-block-index-entry
+                   chain-state (bl.store:best-block-hash chain-state)))
              (tip-work (if tip
-                           (bitcoin-lisp.storage:block-index-entry-chain-work tip)
+                           (bl.store:block-index-entry-chain-work tip)
                            0))
              (best (best-valid-tip chain-state block-store tip-work))
              ;; Bounded step, not the absolute best tip: see
@@ -3725,7 +3725,7 @@ backstop against a candidate that reorgs away and reappears."
              ;; slowdown with height is testnet4's own busy zone around
              ;; 51,000-55,000 (the region scripts/profile-regions.sh already
              ;; singles out), not this cache.
-             (bitcoin-lisp:maybe-periodic-flush chain-state)
+             (bl:maybe-periodic-flush chain-state)
              ;; -stopatheight, for the same reason and at the same boundary.
              ;; MAYBE-STOP-AT-HEIGHT is called from CONNECT-BLOCK's
              ;; tip-EXTENSION arm only, so a chain activated through
@@ -3741,12 +3741,12 @@ backstop against a candidate that reorgs away and reappears."
              ;; request. Between steps, never inside the connect loop: the
              ;; step has completed and is committed, and PERFORM-REORG's own
              ;; interrupt check then unwinds the next one on a block boundary.
-             (let ((new-tip (bitcoin-lisp.storage:get-block-index-entry
+             (let ((new-tip (bl.store:get-block-index-entry
                              chain-state
-                             (bitcoin-lisp.storage:best-block-hash chain-state))))
+                             (bl.store:best-block-hash chain-state))))
                (when new-tip
-                 (bitcoin-lisp:maybe-stop-at-height
-                  (bitcoin-lisp.storage:block-index-entry-height new-tip)))))
+                 (bl:maybe-stop-at-height
+                  (bl.store:block-index-entry-height new-tip)))))
             (t
              ;; :interrupted means the node is stopping — not a refusal to
              ;; re-queue against.
@@ -3760,15 +3760,15 @@ backstop against a candidate that reorgs away and reappears."
   "Mark BLOCK-HASH and all its descendants :invalid, reorganizing the active
 chain back to BLOCK-HASH's parent if the active chain contained it. Returns
 (values t nil) on success, (values nil reason-keyword) on failure."
-  (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
+  (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
     (cond
       ((null entry) (values nil :block-not-found))
-      ((zerop (bitcoin-lisp.storage:block-index-entry-height entry))
+      ((zerop (bl.store:block-index-entry-height entry))
        (values nil :cannot-invalidate-genesis))
       (t
-       (let ((tip (bitcoin-lisp.storage:get-block-index-entry
-                   chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
-             (parent (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+       (let ((tip (bl.store:get-block-index-entry
+                   chain-state (bl.store:best-block-hash chain-state)))
+             (parent (bl.store:block-index-entry-prev-entry entry)))
          ;; If the active chain contains the invalidated block, reorg down to its
          ;; parent first. perform-reorg downgrades the disconnected blocks to
          ;; :header-valid, so we mark :invalid AFTER it, making invalidation stick.
@@ -3787,7 +3787,7 @@ chain back to BLOCK-HASH's parent if the active chain contained it. Returns
                (return-from invalidate-block
                  (values nil (if (eq detail :interrupted) :interrupted :reorg-failed))))))
          (dolist (e (block-index-descendants chain-state entry))
-           (setf (bitcoin-lisp.storage:block-index-entry-status e) :invalid))
+           (setf (bl.store:block-index-entry-status e) :invalid))
          (values t nil))))))
 
 (defun reconsider-block (chain-state block-store utxo-set block-hash
@@ -3795,22 +3795,22 @@ chain back to BLOCK-HASH's parent if the active chain contained it. Returns
   "Clear :invalid from BLOCK-HASH plus its ancestors and descendants, then
 reorganize to the best valid chain if it now outweighs the active tip. Returns
 (values t nil) on success, (values nil reason-keyword) on failure."
-  (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
+  (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
     (if (null entry)
         (values nil :block-not-found)
         (progn
           (maphash (lambda (h e) (declare (ignore h))
-                     (when (and (eq (bitcoin-lisp.storage:block-index-entry-status e) :invalid)
+                     (when (and (eq (bl.store:block-index-entry-status e) :invalid)
                                 (or (block-descends-from-p e entry)
                                     (block-descends-from-p entry e)))
-                       (setf (bitcoin-lisp.storage:block-index-entry-status e) :header-valid)))
-                   (bitcoin-lisp.storage::chain-state-block-index chain-state))
-          (let ((tip (bitcoin-lisp.storage:get-block-index-entry
-                      chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+                       (setf (bl.store:block-index-entry-status e) :header-valid)))
+                   (bl.store::chain-state-block-index chain-state))
+          (let ((tip (bl.store:get-block-index-entry
+                      chain-state (bl.store:best-block-hash chain-state)))
                 (target (best-valid-tip chain-state block-store)))
             (when (and target tip
-                       (> (bitcoin-lisp.storage:block-index-entry-chain-work target)
-                          (bitcoin-lisp.storage:block-index-entry-chain-work tip)))
+                       (> (bl.store:block-index-entry-chain-work target)
+                          (bl.store:block-index-entry-chain-work tip)))
               ;; perform-reorg now validates the reactivated chain and rolls
               ;; back (returning NIL) if one of its blocks is invalid — in which
               ;; case the chain correctly stays on TIP. Surface that rather than
@@ -3833,21 +3833,21 @@ competitor that arrives later cannot displace it — which is exactly what
 preciousblock guarantees, with no persistent sequence-id needed (unlike Core's
 candidate-set model). Returns (values t nil) on success (including the no-ops
 where the block is already the tip or weaker), (values nil reason) on failure."
-  (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
+  (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
     (cond
       ((null entry) (values nil :block-not-found))
       (t
-       (let ((tip (bitcoin-lisp.storage:get-block-index-entry
-                   chain-state (bitcoin-lisp.storage:best-block-hash chain-state))))
+       (let ((tip (bl.store:get-block-index-entry
+                   chain-state (bl.store:best-block-hash chain-state))))
          (cond
            ;; Already the tip, or weaker than it — nothing to do.
            ((or (null tip)
                 (eq entry tip)
-                (< (bitcoin-lisp.storage:block-index-entry-chain-work entry)
-                   (bitcoin-lisp.storage:block-index-entry-chain-work tip)))
+                (< (bl.store:block-index-entry-chain-work entry)
+                   (bl.store:block-index-entry-chain-work tip)))
             (values t nil))
            ;; Can only reorg to a block whose data is present.
-           ((not (bitcoin-lisp.storage:block-exists-p block-store block-hash))
+           ((not (bl.store:block-exists-p block-store block-hash))
             (values nil :block-missing))
            (t
             (multiple-value-bind (ok detail)
@@ -3883,10 +3883,10 @@ against the chainparams commitment and, on a match, promotes the snapshot
 chainstate. maybe-validate-snapshot re-checks every precondition and is a
 no-op (:skipped) when they aren't met, so this stays safe for non-snapshot
 chainstates and for tests that drive activate-block directly."
-  (let ((target (bitcoin-lisp.storage:chain-state-target-blockhash chain-state)))
+  (let ((target (bl.store:chain-state-target-blockhash chain-state)))
     (when (and target
-               (equalp (bitcoin-lisp.storage:best-block-hash chain-state) target))
-      (bitcoin-lisp:maybe-validate-snapshot chain-state))))
+               (equalp (bl.store:best-block-hash chain-state) target))
+      (bl:maybe-validate-snapshot chain-state))))
 
 (defun activate-block (block chain-state block-store utxo-set
                        &key current-time skip-scripts tx-index fee-estimator
@@ -3914,32 +3914,32 @@ target (Core TryAddBlockIndexCandidate, validation.cpp:3764-3794). Anything
 off that path (a sibling fork, or any block past the target) is stored for
 the block store's benefit but never activated, so the historical chainstate
 can neither wedge on an equal-work sibling nor advance past the base."
-  (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
-         (current-best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-         (now (or current-time (bitcoin-lisp.serialization:get-unix-time))))
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (prev-hash (bl.ser:block-header-prev-block header))
+         (current-best-hash (bl.store:best-block-hash chain-state))
+         (now (or current-time (bl.ser:get-unix-time))))
     ;; Historical-chainstate target filter. Runs before any dispatch so no
     ;; branch (extend / pre-reorg) can move the chain off the target path.
-    (when (bitcoin-lisp.storage:chain-state-target-blockhash chain-state)
-      (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
-             (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+    (when (bl.store:chain-state-target-blockhash chain-state)
+      (let* ((hash (bl.ser:block-header-hash header))
+             (entry (bl.store:get-block-index-entry chain-state hash)))
         (unless (and entry
-                     (bitcoin-lisp.storage:entry-target-ancestor-p chain-state entry))
+                     (bl.store:entry-target-ancestor-p chain-state entry))
           (unless (block-witness-stripped-p block)
-            (bitcoin-lisp.storage::%record-block-position
+            (bl.store::%record-block-position
              entry
-             (nth-value 1 (bitcoin-lisp.storage:store-block
+             (nth-value 1 (bl.store:store-block
                            block-store block
                            ;; NIL when the header is not indexed yet, which
                            ;; leaves the file unprunable rather than guessing.
                            :height (and entry
-                                        (bitcoin-lisp.storage:block-index-entry-height
+                                        (bl.store:block-index-entry-height
                                          entry))))))
           (return-from activate-block (values nil :weaker-chain)))))
     (cond
       ;; Case 1: extends current tip — normal path.
       ((equalp prev-hash current-best-hash)
-       (let ((height (1+ (bitcoin-lisp.storage:current-height chain-state))))
+       (let ((height (1+ (bl.store:current-height chain-state))))
          (multiple-value-bind (valid error)
              (validate-block block chain-state utxo-set height now
                              :skip-scripts skip-scripts)
@@ -3956,19 +3956,19 @@ can neither wedge on an equal-work sibling nor advance past the base."
 
       (t
        ;; Cases 2 and 3: prev != current best.
-       (let* ((prev-entry (bitcoin-lisp.storage:get-block-index-entry
+       (let* ((prev-entry (bl.store:get-block-index-entry
                            chain-state prev-hash))
-              (current-best-entry (bitcoin-lisp.storage:get-block-index-entry
+              (current-best-entry (bl.store:get-block-index-entry
                                    chain-state current-best-hash))
-              (this-bits (bitcoin-lisp.serialization:block-header-bits header))
+              (this-bits (bl.ser:block-header-bits header))
               (prev-work (and prev-entry
-                              (bitcoin-lisp.storage:block-index-entry-chain-work
+                              (bl.store:block-index-entry-chain-work
                                prev-entry)))
               (new-chain-work (and prev-work
-                                   (bitcoin-lisp.storage:calculate-chain-work
+                                   (bl.store:calculate-chain-work
                                     this-bits prev-work)))
               (current-best-work (and current-best-entry
-                                      (bitcoin-lisp.storage:block-index-entry-chain-work
+                                      (bl.store:block-index-entry-chain-work
                                        current-best-entry))))
          (cond
            ;; Parent unknown — caller should queue and request its parent.
@@ -4014,7 +4014,7 @@ can neither wedge on an equal-work sibling nor advance past the base."
                 ((null reorg-ok)
                  (values nil :reorg-refused))
                 (t
-                 (let ((new-height (1+ (bitcoin-lisp.storage:current-height
+                 (let ((new-height (1+ (bl.store:current-height
                                         chain-state))))
                    (multiple-value-bind (valid error)
                        (validate-block block chain-state utxo-set new-height now
@@ -4037,7 +4037,7 @@ can neither wedge on an equal-work sibling nor advance past the base."
                            ;; rather than sit on a possibly-weaker fork (Core
                            ;; rejects the block and keeps the most-work valid
                            ;; chain).
-                           (bitcoin-lisp:log-error
+                           (bl:log-error
                             "Incoming block failed validation after reorg (~A); reverting to original chain"
                             error)
                            ;; BLOCK_FAILED_VALID / _CHILD: only on a DETERMINISTIC
@@ -4050,15 +4050,15 @@ can neither wedge on an equal-work sibling nor advance past the base."
                            ;; side.
                            (when (%deterministic-consensus-failure-p error)
                              (let ((this-entry
-                                     (bitcoin-lisp.storage:get-block-index-entry
+                                     (bl.store:get-block-index-entry
                                       chain-state
-                                      (bitcoin-lisp.serialization:block-header-hash
+                                      (bl.ser:block-header-hash
                                        header))))
                                (when this-entry
                                  (%mark-block-subtree-invalid chain-state this-entry))))
-                           (let ((fork-tip (bitcoin-lisp.storage:get-block-index-entry
+                           (let ((fork-tip (bl.store:get-block-index-entry
                                             chain-state
-                                            (bitcoin-lisp.storage:best-block-hash
+                                            (bl.store:best-block-hash
                                              chain-state))))
                              (multiple-value-bind (reverted revert-detail)
                                  (perform-reorg chain-state block-store utxo-set
@@ -4074,11 +4074,11 @@ can neither wedge on an equal-work sibling nor advance past the base."
                                  ;; failure — the chain is on a consistent
                                  ;; boundary — so don't log it as one.
                                  ((eq revert-detail :interrupted)
-                                  (bitcoin-lisp:log-warn
+                                  (bl:log-warn
                                    "Revert to original chain truncated by a stop request; chain left at height ~D"
-                                   (bitcoin-lisp.storage:current-height chain-state)))
+                                   (bl.store:current-height chain-state)))
                                  (t
-                                  (bitcoin-lisp:log-error
+                                  (bl:log-error
                                    "Failed to revert to original chain after rejecting post-reorg block")))))
                            (values nil error)))))))))
 
@@ -4091,14 +4091,14 @@ can neither wedge on an equal-work sibling nor advance past the base."
            ;; the target-filter guard above (block.lisp ~2428).
            (t
             (unless (block-witness-stripped-p block)
-              (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+              (let ((entry (bl.store:get-block-index-entry
                             chain-state
-                            (bitcoin-lisp.serialization:block-header-hash header))))
-                (bitcoin-lisp.storage::%record-block-position
+                            (bl.ser:block-header-hash header))))
+                (bl.store::%record-block-position
                  entry
-                 (nth-value 1 (bitcoin-lisp.storage:store-block
+                 (nth-value 1 (bl.store:store-block
                                block-store block
                                :height (and entry
-                                            (bitcoin-lisp.storage:block-index-entry-height
+                                            (bl.store:block-index-entry-height
                                              entry)))))))
             (values nil :weaker-chain))))))))

@@ -32,7 +32,7 @@ testnet4 and signet share testnet's byte prefixes and 'tb' hrp."
 (defun %decodes-as-address-anywhere-p (string)
   "T if STRING decodes as an address on ANY network we support."
   (some (lambda (net)
-          (and (bitcoin-lisp.crypto:decode-address string net) t))
+          (and (bl.crypto:decode-address string net) t))
         '(:mainnet :testnet3 :testnet4 :signet :regtest)))
 
 (test core-key-io-valid-vectors
@@ -44,33 +44,33 @@ compression flag (Core key_io_tests.cpp)."
     (dolist (v vectors)
       (destructuring-bind (encoded hex meta) v
         (let ((network (%key-io-network (gethash "chain" meta)))
-              (expected (bitcoin-lisp.crypto:hex-to-bytes hex)))
+              (expected (bl.crypto:hex-to-bytes hex)))
           (incf checked)
           (if (gethash "isPrivkey" meta)
               ;; WIF: secret bytes and the compression flag must both match.
               (multiple-value-bind (secret compressed)
-                  (bitcoin-lisp.crypto:wif-to-private-key encoded)
+                  (bl.crypto:wif-to-private-key encoded)
                 (is (equalp expected secret)
                     "WIF ~A decoded to ~A, expected ~A"
-                    encoded (and secret (bitcoin-lisp.crypto:bytes-to-hex secret)) hex)
+                    encoded (and secret (bl.crypto:bytes-to-hex secret)) hex)
                 (is (eq (and (gethash "isCompressed" meta) t) (and compressed t))
                     "WIF ~A compression flag mismatch" encoded)
                 ;; Round-trip: re-encoding the decoded secret reproduces it.
                 (when secret
                   (is (string= encoded
-                               (bitcoin-lisp.crypto:private-key-to-wif
+                               (bl.crypto:private-key-to-wif
                                 secret
                                 :network (if (eq network :mainnet) :mainnet :testnet3)
                                 :compressed (and compressed t)))
                       "WIF ~A did not round-trip" encoded)))
               ;; Address: the scriptPubKey it stands for must match exactly.
               (multiple-value-bind (type spk)
-                  (bitcoin-lisp.crypto:decode-address encoded network)
+                  (bl.crypto:decode-address encoded network)
                 (declare (ignore type))
                 (is (equalp expected spk)
                     "address ~A (~A) decoded to ~A, expected ~A"
                     encoded (gethash "chain" meta)
-                    (and spk (bitcoin-lisp.crypto:bytes-to-hex spk)) hex))))))
+                    (and spk (bl.crypto:bytes-to-hex spk)) hex))))))
     (is (= 70 checked) "expected Core's 70 valid vectors, ran ~D" checked)))
 
 (test core-key-io-invalid-vectors
@@ -84,7 +84,7 @@ is merely permissive passes the valid vectors and fails only here."
         (incf checked)
         (is-false (%decodes-as-address-anywhere-p s)
                   "string ~S was accepted as an address but Core rejects it" s)
-        (is-false (bitcoin-lisp.crypto:wif-to-private-key s)
+        (is-false (bl.crypto:wif-to-private-key s)
                   "string ~S was accepted as a WIF but Core rejects it" s)))
     (is (= 70 checked) "expected Core's 70 invalid vectors, ran ~D" checked)))
 
@@ -96,12 +96,12 @@ base58_tests.cpp)."
         (checked 0))
     (dolist (v vectors)
       (destructuring-bind (hex b58) v
-        (let ((bytes (bitcoin-lisp.crypto:hex-to-bytes hex)))
+        (let ((bytes (bl.crypto:hex-to-bytes hex)))
           (incf checked)
-          (is (string= b58 (bitcoin-lisp.crypto:base58-encode bytes))
+          (is (string= b58 (bl.crypto:base58-encode bytes))
               "encoding ~S gave ~S, expected ~S"
-              hex (bitcoin-lisp.crypto:base58-encode bytes) b58)
-          (is (equalp bytes (bitcoin-lisp.crypto:base58-decode b58))
+              hex (bl.crypto:base58-encode bytes) b58)
+          (is (equalp bytes (bl.crypto:base58-decode b58))
               "decoding ~S did not give ~S" b58 hex))))
     (is (= 21 checked) "expected Core's 21 base58 vectors, ran ~D" checked)))
 
@@ -124,11 +124,11 @@ base58_tests.cpp)."
                  "11qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqc8247j"
                  "split1checkupstagehandshakeupstreamerranterredcaperred2y9e3w"
                  "?1ezyfcl"))
-    (multiple-value-bind (hrp data variant) (bitcoin-lisp.crypto:bech32-decode str)
+    (multiple-value-bind (hrp data variant) (bl.crypto:bech32-decode str)
       (is (eq :bech32 variant) "~S decoded as ~S, expected :bech32" str variant)
       (when hrp
         (is-true (%bech32-case-insensitive-equal
-                  str (bitcoin-lisp.crypto:bech32-encode hrp data :bech32))
+                  str (bl.crypto:bech32-encode hrp data :bech32))
                  "~S did not re-encode to itself" str)))))
 
 (test core-bech32m-valid-vectors
@@ -140,11 +140,11 @@ base58_tests.cpp)."
                  "11llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllludsr8"
                  "split1checkupstagehandshakeupstreamerranterredcaperredlc445v"
                  "?1v759aa"))
-    (multiple-value-bind (hrp data variant) (bitcoin-lisp.crypto:bech32-decode str)
+    (multiple-value-bind (hrp data variant) (bl.crypto:bech32-decode str)
       (is (eq :bech32m variant) "~S decoded as ~S, expected :bech32m" str variant)
       (when hrp
         (is-true (%bech32-case-insensitive-equal
-                  str (bitcoin-lisp.crypto:bech32-encode hrp data :bech32m))
+                  str (bl.crypto:bech32-encode hrp data :bech32m))
                  "~S did not re-encode to itself" str)))))
 
 (test core-bech32-invalid-vectors
@@ -188,6 +188,6 @@ checksum."
                   "abcdef1l7aum6echk45nj2s0wdvt2fg8x9yrzpqzd3ryx"
                   "test1zg69v7y60n00qy352euf40x77qcusag6"))))
     (dolist (str cases)
-      (is-false (bitcoin-lisp.crypto:bech32-decode str)
+      (is-false (bl.crypto:bech32-decode str)
                 "~S was accepted but BIP173/BIP350 reject it" str))
     (is (= 32 (length cases)) "expected 32 invalid vectors, had ~D" (length cases))))

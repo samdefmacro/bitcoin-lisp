@@ -28,7 +28,7 @@ another, and cannot grind IDs that collide for everybody.
 
 Zero is remapped to one because 0 has no sketch — its powers are all zero, so
 it would be invisible in the sketch rather than merely unlucky."
-  (let ((id (logand (bitcoin-lisp.crypto:siphash-2-4 k0 k1 wtxid) #xFFFFFFFF)))
+  (let ((id (logand (bl.crypto:siphash-2-4 k0 k1 wtxid) #xFFFFFFFF)))
     (if (zerop id) 1 id)))
 
 (defstruct (recon-set (:constructor %make-recon-set))
@@ -127,7 +127,7 @@ every retry, and unpredictable to anyone who does not know the salt.
 With a single reconciling peer the outbound share is 1, so everything is
 announced — correctly: one destination out of one peer IS that peer, and
 holding transactions back to reconcile with nobody else would only delay them."
-  (let* ((h (bitcoin-lisp.crypto:siphash-2-4 peer-salt 0 wtxid))
+  (let* ((h (bl.crypto:siphash-2-4 peer-salt 0 wtxid))
          (draw (/ (float (logand h #xFFFFFFFF) 1d0) 4294967296d0)))
     (if outbound-p
         (< draw (if (plusp reconciling-peer-count)
@@ -229,7 +229,7 @@ there is nothing to reconcile."
     (when ids
       (setf (peer-recon-round peer)
             (make-recon-round :peer peer :local-ids ids :state :requested))
-      (bitcoin-lisp.serialization:make-reqrecon-message
+      (bl.ser:make-reqrecon-message
        (length ids) +recon-default-q+))))
 
 (defun recon-respond-to-request (peer their-size q)
@@ -238,7 +238,7 @@ and send it."
   (let* ((set (peer-recon-set peer))
          (ids (if set (recon-set-take-snapshot set) '()))
          (capacity (recon-estimate-capacity (length ids) their-size q)))
-    (bitcoin-lisp.serialization:make-sketch-message
+    (bl.ser:make-sketch-message
      (ms-sketch-serialize (recon-build-sketch ids capacity)))))
 
 (defun recon-finish-round (peer decoded-ids)

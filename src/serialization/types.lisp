@@ -422,7 +422,7 @@ reject it with \"Superfluous witness record\"."
   "Compute the transaction hash (txid).
 This is the double-SHA256 of the legacy serialized transaction (no witness)."
   (or (transaction-cached-hash tx)
-      (let ((hash (bitcoin-lisp.crypto:hash256 (serialize-transaction tx))))
+      (let ((hash (bl.crypto:hash256 (serialize-transaction tx))))
         (setf (transaction-cached-hash tx) hash)
         hash)))
 
@@ -440,7 +440,7 @@ For legacy transactions without witness, wtxid equals txid. Cached on the tx."
                (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
               ;; Has witness: hash the witness serialization
               ((transaction-has-witness-p tx)
-               (bitcoin-lisp.crypto:hash256 (serialize-witness-transaction tx)))
+               (bl.crypto:hash256 (serialize-witness-transaction tx)))
               ;; No witness: wtxid = txid
               (t (transaction-hash tx))))))
 
@@ -533,7 +533,7 @@ fires once per block on the IBD validation path."
   "Compute the block hash from the header.
 This is the double-SHA256 of the 80-byte header."
   (or (block-header-cached-hash header)
-      (let ((hash (bitcoin-lisp.crypto:hash256 (serialize-block-header header))))
+      (let ((hash (bl.crypto:hash256 (serialize-block-header header))))
         (setf (block-header-cached-hash header) hash)
         hash)))
 

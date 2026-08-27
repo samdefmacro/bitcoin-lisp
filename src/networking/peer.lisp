@@ -24,7 +24,7 @@ MAX_ADDR_RATE_PER_SECOND). At steady state a peer gets one address through
 every 10 seconds; everything faster is dropped, not queued.")
 
 (defconstant +max-addr-processing-token-bucket+
-  bitcoin-lisp.serialization:+max-addr-count+
+  bl.ser:+max-addr-count+
   "Soft cap of the addr token bucket (Core MAX_ADDR_PROCESSING_TOKEN_BUCKET =
 MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
 +MAX_ADDR_TO_SEND bump after our own getaddr may.")
@@ -93,7 +93,7 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; 3432). 0 = never.
   (last-block-time 0 :type integer)
   ;; Unix time this peer object was created (Core CNode::m_connected).
-  (connected-at (bitcoin-lisp.serialization:get-unix-time) :type integer)
+  (connected-at (bl.ser:get-unix-time) :type integer)
   ;; T once address relay is set up with this peer (Core Peer::
   ;; m_addr_relay_enabled via SetupAddressRelay): at handshake time for
   ;; outbound non-block-relay connections, or on the first addr-related
@@ -113,13 +113,13 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; a per-peer memory leak on long-lived relay connections. Core bounds the
   ;; equivalent m_tx_inventory_known_filter at CRollingBloomFilter{50000}; we use
   ;; the same hash+FIFO-ring bounded set as the recent-rejects filter.
-  (announced-txs (bitcoin-lisp:make-rejects-filter 50000)
-                 :type bitcoin-lisp:recent-rejects)
+  (announced-txs (bl:make-rejects-filter 50000)
+                 :type bl:recent-rejects)
   ;; Bounded set of addresses (ip||port keys) this peer already knows -- either
   ;; it sent them to us or we relayed them to it. Dedup for addr gossip; Core's
   ;; m_addr_known CRollingBloomFilter{5000}.
-  (known-addrs (bitcoin-lisp:make-rejects-filter 5000)
-               :type bitcoin-lisp:recent-rejects)
+  (known-addrs (bl:make-rejects-filter 5000)
+               :type bl:recent-rejects)
   ;; Pending tx announcements, flushed in batches on a Poisson schedule
   ;; instead of per-tx immediate invs (Core m_tx_inventory_to_send +
   ;; m_next_inv_send_time). Entries are (txid wtxid fee-rate-per-kb),
@@ -338,13 +338,13 @@ nodes_testnet4.txt source).")
 
 (defun init-peer-rate-limiters (peer)
   "Initialize per-peer rate limiters from global configuration."
-  (flet ((rl (config) (bitcoin-lisp:make-rate-limiter (car config) (cdr config))))
-    (setf (peer-rate-limit-inv peer) (rl bitcoin-lisp:*rate-limit-inv*))
-    (setf (peer-rate-limit-tx peer) (rl bitcoin-lisp:*rate-limit-tx*))
-    (setf (peer-rate-limit-addr peer) (rl bitcoin-lisp:*rate-limit-addr*))
-    (setf (peer-rate-limit-getdata peer) (rl bitcoin-lisp:*rate-limit-getdata*))
-    (setf (peer-rate-limit-headers peer) (rl bitcoin-lisp:*rate-limit-headers*))
-    (setf (peer-rate-limit-serve peer) (rl bitcoin-lisp:*rate-limit-serve*)))
+  (flet ((rl (config) (bl:make-rate-limiter (car config) (cdr config))))
+    (setf (peer-rate-limit-inv peer) (rl bl:*rate-limit-inv*))
+    (setf (peer-rate-limit-tx peer) (rl bl:*rate-limit-tx*))
+    (setf (peer-rate-limit-addr peer) (rl bl:*rate-limit-addr*))
+    (setf (peer-rate-limit-getdata peer) (rl bl:*rate-limit-getdata*))
+    (setf (peer-rate-limit-headers peer) (rl bl:*rate-limit-headers*))
+    (setf (peer-rate-limit-serve peer) (rl bl:*rate-limit-serve*)))
   peer)
 
 (defun connect-peer (host &optional (port *current-port*))
@@ -362,7 +362,7 @@ Returns NIL if the host is banned or discouraged (never dial either)."
         (init-peer-rate-limiters peer)
         ;; Core logs this on every CNode it constructs, outbound and inbound
         ;; alike (net.cpp:4005-4007), and p2p_add_connections.py greps for it.
-        (bitcoin-lisp:log-cat "net" "Added connection to ~A peer=~A"
+        (bl:log-cat "net" "Added connection to ~A peer=~A"
                               host (peer-id peer))
         peer))))
 
@@ -407,7 +407,7 @@ could hold its slot forever by echoing back what we just told it.
 
 Unix seconds, matching the slot and the sweep that reads it."
   (setf (peer-last-block-announcement peer)
-        (bitcoin-lisp.serialization:get-unix-time)))
+        (bl.ser:get-unix-time)))
 
 (defconstant +max-outbound-peers-to-protect+ 4
   "Core MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT.")
@@ -470,7 +470,7 @@ slot was actually returned."
       ;; negative counter silently uncap protection.
       (if (plusp *protected-outbound-count*)
           (decf *protected-outbound-count*)
-          (bitcoin-lisp:log-warn
+          (bl:log-warn
            "Outbound protection counter underflow releasing peer ~A" (peer-address peer)))
       t)))
 
@@ -495,10 +495,10 @@ a later-loaded file, so a direct call would be a forward reference.")
   (setf (peer-headers-sync peer) nil)
   ;; Drop this peer's orphan ANNOUNCEMENTS (DoS hygiene). Orphans other
   ;; peers also announced survive (Core TxOrphanage::EraseForPeer).
-  (let ((node bitcoin-lisp::*node*))
-    (when (and node (bitcoin-lisp::node-mempool node))
-      (bitcoin-lisp.mempool:orphan-erase-for-peer
-       (bitcoin-lisp.mempool:mempool-orphan-pool (bitcoin-lisp::node-mempool node))
+  (let ((node bl::*node*))
+    (when (and node (bl::node-mempool node))
+      (bl.mp:orphan-erase-for-peer
+       (bl.mp:mempool-orphan-pool (bl::node-mempool node))
        peer)))
   ;; Tx-request tracker cleanup (Core TxDownloadManagerImpl::DisconnectedPeer):
   ;; forget the peer's announcements; its in-flight requests become
@@ -591,7 +591,7 @@ failure."
       ;; transport). The command sits at bytes 4-15 of the v1 frame.
       (%account-message (peer-sent-per-msg peer)
                         (connection-transport conn)
-                        (bitcoin-lisp.serialization:bytes-to-command
+                        (bl.ser:bytes-to-command
                          (subseq message-bytes 4 16))
                         (- (length message-bytes) 24))
       (if (connection-transport conn)
@@ -636,28 +636,28 @@ RECEIVE-MESSAGE-BLOCKING instead."
             (unless bytes
               (return-from receive-message nil))
             (setf header (flexi-streams:with-input-from-sequence (stream bytes)
-                           (bitcoin-lisp.serialization:read-message-header stream)))
+                           (bl.ser:read-message-header stream)))
             ;; Nothing is parked yet, so these two rejections leave no framing
             ;; state behind — but the 24 bytes ARE consumed, so both must drop
             ;; the connection (see %abandon-receive for why).
-            (unless (equalp (bitcoin-lisp.serialization:message-header-magic header)
-                            bitcoin-lisp.serialization:*network-magic*)
-              (bitcoin-lisp:log-warn "Bad message magic from peer ~A, disconnecting"
+            (unless (equalp (bl.ser:message-header-magic header)
+                            bl.ser:*network-magic*)
+              (bl:log-warn "Bad message magic from peer ~A, disconnecting"
                                      (peer-address peer))
               (disconnect-peer peer)
               (return-from receive-message nil))
-            (when (> (bitcoin-lisp.serialization:message-header-payload-length header)
-                     bitcoin-lisp:+max-message-payload+)
-              (bitcoin-lisp:log-warn "Oversized message from peer ~A: ~D bytes (max ~D), disconnecting"
+            (when (> (bl.ser:message-header-payload-length header)
+                     bl:+max-message-payload+)
+              (bl:log-warn "Oversized message from peer ~A: ~D bytes (max ~D), disconnecting"
                                      (peer-address peer)
-                                     (bitcoin-lisp.serialization:message-header-payload-length header)
-                                     bitcoin-lisp:+max-message-payload+)
+                                     (bl.ser:message-header-payload-length header)
+                                     bl:+max-message-payload+)
               (disconnect-peer peer)
               (return-from receive-message nil))
             ;; Park it: the payload read below may span several more passes and
             ;; the framing must survive them.
             (setf (connection-recv-framing conn) header)))
-        (let ((payload-len (bitcoin-lisp.serialization:message-header-payload-length header)))
+        (let ((payload-len (bl.ser:message-header-payload-length header)))
                 ;; Read payload
                 (let ((payload (if (zerop payload-len)
                                    #()
@@ -676,17 +676,17 @@ RECEIVE-MESSAGE-BLOCKING instead."
                     ;; caller's timeout is enough — but the connection is
                     ;; unusable either way, so drop it and let peer maintenance
                     ;; dial a replacement.
-                    (bitcoin-lisp:log-warn "Incomplete ~A message from peer ~A, disconnecting"
-                                           (bitcoin-lisp.serialization:message-header-command header)
+                    (bl:log-warn "Incomplete ~A message from peer ~A, disconnecting"
+                                           (bl.ser:message-header-command header)
                                            (peer-address peer))
                     (disconnect-peer peer)
                     (return-from receive-message nil))
                   ;; Verify checksum
                   (let ((computed-checksum
-                          (bitcoin-lisp.serialization:compute-checksum
+                          (bl.ser:compute-checksum
                            (if (zerop payload-len) #() payload))))
                     (unless (equalp (subseq computed-checksum 0 4)
-                                    (bitcoin-lisp.serialization:message-header-checksum header))
+                                    (bl.ser:message-header-checksum header))
                       ;; Drop the MESSAGE, keep the peer — Core's explicit choice
                       ;; ("Message deserialization failed. Drop the message but
                       ;; don't disconnect the peer.", net.cpp:678-683, reached
@@ -697,11 +697,11 @@ RECEIVE-MESSAGE-BLOCKING instead."
                       ;; our own payload handling into node-wide peer churn.
                       ;; Bad MAGIC is the opposite case and does disconnect
                       ;; above, matching net.cpp:752-755.
-                      (bitcoin-lisp:log-warn "Bad checksum on ~A from peer ~A, dropping message"
-                                             (bitcoin-lisp.serialization:message-header-command header)
+                      (bl:log-warn "Bad checksum on ~A from peer ~A, dropping message"
+                                             (bl.ser:message-header-command header)
                                              (peer-address peer))
                       (return-from receive-message nil))
-                    (let ((command (bitcoin-lisp.serialization:message-header-command header)))
+                    (let ((command (bl.ser:message-header-command header)))
                       (%account-message (peer-recv-per-msg peer) nil
                                         command payload-len)
                       (values command payload)))))))))
@@ -783,8 +783,8 @@ posture stricter than Core's -blocksonly — it also gates block relay and
 local-submission announcements; see relay-block / relay-transaction).
 Returns a strict boolean. The Core-parity incoming-tx switch is
 IGNORE-INCOMING-TXS-P, which this feeds."
-  (and (or (member bitcoin-lisp:*network* '(:testnet3 :testnet4 :signet :regtest))
-           bitcoin-lisp:*mainnet-relay-enabled*)
+  (and (or (member bl:*network* '(:testnet3 :testnet4 :signet :regtest))
+           bl:*mainnet-relay-enabled*)
        t))
 
 (defun ignore-incoming-txs-p ()
@@ -796,7 +796,7 @@ suppression, high-bandwidth compact-block opt-out, and getnetworkinfo's
 localrelay. It does NOT gate block relay or announcing locally-submitted
 txs — a -blocksonly node still relays its OWN transactions (Core
 BroadcastTransaction is unaffected by the flag)."
-  (or bitcoin-lisp:*blocksonly*
+  (or bl:*blocksonly*
       (not (relay-enabled-p))))
 
 (defun peer-tx-relay-p (peer)
@@ -811,7 +811,7 @@ relaying — Core's pre-70001 default is fRelay=true (net_processing.cpp:3597)."
   (and (peer-relays-txs-p peer)
        (let ((v (peer-version peer)))
          (or (null v)
-             (bitcoin-lisp.serialization:version-message-relay v)))))
+             (bl.ser:version-message-relay v)))))
 
 ;;; BIP330 sendtxrcncl handshake (Erlay). Core parity at ref d3056bc is the
 ;;; handshake + salt storage only — no reqtxrcncl/sketch messages exist
@@ -829,7 +829,7 @@ GetUint64(0)/(1)). Returns (VALUES K0 K1)."
     (dotimes (i 8)
       (setf (aref msg i) (ldb (byte 8 (* 8 i)) lo)
             (aref msg (+ 8 i)) (ldb (byte 8 (* 8 i)) hi)))
-    (let ((digest (bitcoin-lisp.crypto:tagged-hash "Tx Relay Salting" msg)))
+    (let ((digest (bl.crypto:tagged-hash "Tx Relay Salting" msg)))
       (flet ((u64-le-at (offset)
                (loop for i below 8
                      sum (ash (aref digest (+ offset i)) (* 8 i)))))
@@ -857,23 +857,23 @@ feeler), and the peer's VERSION set fRelay=1. On send, pre-register a random
 u64 local salt (txreconciliation.cpp:82-94 PreRegisterPeer). Always returns
 T — declining to offer never fails the handshake."
   (let ((version-msg (peer-version peer)))
-    (when (and bitcoin-lisp:*tx-reconciliation*
+    (when (and bl:*tx-reconciliation*
                version-msg
                ;; Negotiated protocol = min(ours, theirs); ours is
                ;; +protocol-version+ = 70016 (WTXID_RELAY_VERSION), so the
                ;; gate reduces to theirs >= 70016.
-               (>= (bitcoin-lisp.serialization:version-message-version version-msg)
-                   bitcoin-lisp.serialization:+protocol-version+)
+               (>= (bl.ser:version-message-version version-msg)
+                   bl.ser:+protocol-version+)
                (peer-relays-txs-p peer)
                ;; Core also skips the offer entirely in blocksonly mode
                ;; (!m_opts.ignore_incoming_txs, net_processing.cpp:3737) —
                ;; reconciliation is pointless when we reject incoming txs.
                (not (ignore-incoming-txs-p))
-               (bitcoin-lisp.serialization:version-message-relay version-msg))
+               (bl.ser:version-message-relay version-msg))
       (let ((salt (random (expt 2 64))))
         (setf (peer-recon-local-salt peer) salt)
         (send-message peer
-                      (bitcoin-lisp.serialization:make-sendtxrcncl-message salt)))))
+                      (bl.ser:make-sendtxrcncl-message salt)))))
   t)
 
 (defun %handle-handshake-sendtxrcncl (peer payload)
@@ -882,26 +882,26 @@ txreconciliation.cpp:97-126 RegisterPeer). Disconnects PEER and returns NIL
 on a protocol violation; returns T otherwise (registered, or benignly
 ignored)."
   (flet ((violation (reason)
-           (bitcoin-lisp:log-cat "net" "sendtxrcncl ~A — disconnecting peer ~A"
+           (bl:log-cat "net" "sendtxrcncl ~A — disconnecting peer ~A"
                                  reason (peer-address peer))
            (disconnect-peer peer)
            nil))
     (cond
       ;; Feature disabled: ignored entirely (net_processing.cpp:3964-3967).
-      ((not bitcoin-lisp:*tx-reconciliation*) t)
+      ((not bl:*tx-reconciliation*) t)
       ;; Our VERSION indicated no tx relay on this connection (block-relay/
       ;; feeler) — Core's RejectIncomingTxs check (:3976-3980).
       ((not (peer-relays-txs-p peer))
        (violation "received to which we indicated no tx relay"))
       ;; The peer's own VERSION had fRelay=0 (:3982-3990).
       ((not (and (peer-version peer)
-                 (bitcoin-lisp.serialization:version-message-relay
+                 (bl.ser:version-message-relay
                   (peer-version peer))))
        (violation "received which indicated no tx relay to us"))
       (t
        (multiple-value-bind (their-version their-salt)
            (handler-case
-               (bitcoin-lisp.serialization:parse-sendtxrcncl-payload payload)
+               (bl.ser:parse-sendtxrcncl-payload payload)
              (error () (values nil nil)))
          (cond
            ;; Truncated payload: Core's deserialize failure drops the peer.
@@ -916,7 +916,7 @@ ignored)."
            ;; below that is a violation — higher-than-ours downgrades fine
            ;; (txreconciliation.cpp:112-119).
            ((< (min their-version
-                    bitcoin-lisp.serialization:+txreconciliation-version+)
+                    bl.ser:+txreconciliation-version+)
                1)
             (violation "with unsupported version"))
            (t
@@ -924,7 +924,7 @@ ignored)."
                 (compute-recon-salt (peer-recon-local-salt peer) their-salt)
               (setf (peer-recon-version peer)
                     (min their-version
-                         bitcoin-lisp.serialization:+txreconciliation-version+)
+                         bl.ser:+txreconciliation-version+)
                     (peer-recon-k0 peer) k0
                     (peer-recon-k1 peer) k1
                     ;; We initiate reconciliation rounds iff we dialed them
@@ -952,18 +952,18 @@ runs, blocks below the snapshot base are not yet locally available, so the
 node runs as NODE_NETWORK_LIMITED until it completes). BIP 324 adds
 NODE_P2P_V2 when the v2 transport is available; BIP 157 adds
 NODE_COMPACT_FILTERS when filter serving is enabled."
-  (let ((node bitcoin-lisp::*node*))
-    (logior bitcoin-lisp.serialization:+node-network-limited+
-            bitcoin-lisp.serialization:+node-witness+
-            (if (or (bitcoin-lisp:pruning-enabled-p)
-                    (and node (bitcoin-lisp::node-historical-chainstate node)))
+  (let ((node bl::*node*))
+    (logior bl.ser:+node-network-limited+
+            bl.ser:+node-witness+
+            (if (or (bl:pruning-enabled-p)
+                    (and node (bl::node-historical-chainstate node)))
                 0
-                bitcoin-lisp.serialization:+node-network+)
+                bl.ser:+node-network+)
             (if (v2-available-p)
-                bitcoin-lisp.serialization:+node-p2p-v2+ 0)
+                bl.ser:+node-p2p-v2+ 0)
             ;; BIP157: advertise filter serving when enabled.
-            (if bitcoin-lisp:*peer-block-filters*
-                bitcoin-lisp.serialization:+node-compact-filters+ 0))))
+            (if bl:*peer-block-filters*
+                bl.ser:+node-compact-filters+ 0))))
 
 (defun %version-addr-recv (peer)
   "The addr_recv (\"addr_you\") field for our version message to PEER: the
@@ -977,14 +977,14 @@ Core's behavior (CNetAddr::V1(CService{}), net_processing.cpp:1585); real
 self-advertisement happens via addr/addrv2 push, not the version message."
   (multiple-value-bind (net bytes) (parse-network-address (peer-address peer))
     (if (and net
-             (bitcoin-lisp.serialization:v1-compatible-network-p net)
+             (bl.ser:v1-compatible-network-p net)
              (address-routable-p bytes net))
-        (bitcoin-lisp.serialization:make-net-addr
+        (bl.ser:make-net-addr
          :services (peer-services peer)
          :ip bytes
          :port (let ((conn (peer-connection peer)))
                  (if conn (connection-port conn) 0)))
-        (bitcoin-lisp.serialization:make-empty-net-addr
+        (bl.ser:make-empty-net-addr
          :services (peer-services peer)))))
 
 ;;; --- Self-connection detection (Core CheckIncomingNonce) ---
@@ -1044,7 +1044,7 @@ guesses a 64-bit CSPRNG value."
   (let ((version (peer-version peer)))
     (and version
          (self-connection-nonce-p
-          (bitcoin-lisp.serialization::version-message-nonce version)))))
+          (bl.ser::version-message-nonce version)))))
 
 (defun %send-version-and-capabilities (peer)
   "Send our version message followed by the post-version capability messages
@@ -1058,16 +1058,16 @@ tx relay on those)."
          ;; pick us as a block-sync source; 0 only if the node isn't up yet.
          ;; The height is the CURRENT (active) chainstate's tip — never a
          ;; historical chainstate's.
-         (node bitcoin-lisp::*node*)
+         (node bl::*node*)
          (start-height (if node
-                           (bitcoin-lisp.storage:current-height
-                            (bitcoin-lisp::node-current-chainstate node))
+                           (bl.store:current-height
+                            (bl::node-current-chainstate node))
                            0))
-         (version-payload (bitcoin-lisp.serialization:make-version-message-bytes
+         (version-payload (bl.ser:make-version-message-bytes
                            :services services
                            :addr-recv (%version-addr-recv peer)
                            :start-height start-height
-                           :timestamp (bitcoin-lisp.serialization:get-unix-time)
+                           :timestamp (bl.ser:get-unix-time)
                            ;; This connection's own nonce, so a peer that is
                            ;; really us can be recognised when it echoes back.
                            :nonce (peer-local-nonce peer)
@@ -1078,14 +1078,14 @@ tx relay on those)."
                            ;; default). With fRelay=0 honest peers stop
                            ;; announcing txs to us.
                            :relay (and relays (not (ignore-incoming-txs-p)))))
-         (version-msg (bitcoin-lisp.serialization:serialize-message
+         (version-msg (bl.ser:serialize-message
                        "version" version-payload)))
     (when (send-message peer version-msg)
       ;; wtxidrelay only makes sense when we relay txs (BIP339); skip it on
       ;; block-relay/feeler connections, as Core does.
       (when relays
-        (send-message peer (bitcoin-lisp.serialization:make-wtxidrelay-message)))
-      (send-message peer (bitcoin-lisp.serialization:make-sendaddrv2-message))
+        (send-message peer (bl.ser:make-wtxidrelay-message)))
+      (send-message peer (bl.ser:make-sendaddrv2-message))
       t)))
 
 (defconstant +min-peer-proto-version+ 31800
@@ -1098,11 +1098,11 @@ an automatic outbound peer must offer — NODE_NETWORK|NODE_WITNESS, or
 NODE_NETWORK_LIMITED|NODE_WITNESS from a limited peer once we are NEAR-TIP
 (Core: best-block depth under NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS)."
   (if (and near-tip
-           (logtest services bitcoin-lisp.serialization:+node-network-limited+))
-      (logior bitcoin-lisp.serialization:+node-network-limited+
-              bitcoin-lisp.serialization:+node-witness+)
-      (logior bitcoin-lisp.serialization:+node-network+
-              bitcoin-lisp.serialization:+node-witness+)))
+           (logtest services bl.ser:+node-network-limited+))
+      (logior bl.ser:+node-network-limited+
+              bl.ser:+node-witness+)
+      (logior bl.ser:+node-network+
+              bl.ser:+node-witness+)))
 
 (defun has-all-desirable-service-flags-p (services near-tip)
   "Core HasAllDesirableServiceFlags (net_processing.cpp:1753-1756)."
@@ -1119,33 +1119,33 @@ desirable set to limited peers, as in Core."
       (receive-message-blocking peer :timeout timeout)
     (when (and command (string= command "version"))
       (flexi-streams:with-input-from-sequence (stream payload)
-        (let* ((version-msg (bitcoin-lisp.serialization:read-version-message stream))
-               (services (bitcoin-lisp.serialization:version-message-services version-msg))
-               (proto (bitcoin-lisp.serialization:version-message-version version-msg)))
+        (let* ((version-msg (bl.ser:read-version-message stream))
+               (services (bl.ser:version-message-services version-msg))
+               (proto (bl.ser:version-message-version version-msg)))
           (setf (peer-version peer) version-msg
                 (peer-services peer) services
                 (peer-start-height peer)
-                (bitcoin-lisp.serialization:version-message-start-height version-msg)
+                (bl.ser:version-message-start-height version-msg)
                 (peer-user-agent peer)
-                (bitcoin-lisp.serialization:version-message-user-agent version-msg)
+                (bl.ser:version-message-user-agent version-msg)
                 ;; Their clock vs ours, captured at receipt (Core Peer::
                 ;; m_time_offset, net_processing.cpp:3646); getpeerinfo
                 ;; "timeoffset".
                 (peer-time-offset peer)
-                (- (bitcoin-lisp.serialization::version-message-timestamp version-msg)
-                   (bitcoin-lisp.serialization:get-unix-time)))
+                (- (bl.ser::version-message-timestamp version-msg)
+                   (bl.ser:get-unix-time)))
           ;; Core's two VERSION-time disconnects (net_processing.cpp:3611-3627).
           ;; The services gate applies to automatic outbounds only — Core
           ;; CNode::ExpectServicesFromConn, which peer-outbound-or-block-relay-p
           ;; already spells out (manual and feeler peers exempt).
           (cond ((and (peer-outbound-or-block-relay-p peer)
                       (not (has-all-desirable-service-flags-p services near-tip)))
-                 (bitcoin-lisp:log-info
+                 (bl:log-info
                   "Peer ~A does not offer the expected services (~8,'0x offered, ~8,'0x expected), disconnecting"
                   (peer-address peer) services (desirable-service-flags services near-tip))
                  nil)
                 ((< proto +min-peer-proto-version+)
-                 (bitcoin-lisp:log-info "Peer ~A using obsolete version ~D, disconnecting"
+                 (bl:log-info "Peer ~A using obsolete version ~D, disconnecting"
                                         (peer-address peer) proto)
                  nil)
                 (t t)))))))
@@ -1201,7 +1201,7 @@ version handshake may proceed (over whichever transport), NIL to give up."
     (cond
       ((v2-transport-p result)
        (setf (connection-transport conn) result)
-       (bitcoin-lisp:log-info "Peer ~A: v2 transport established (outbound)"
+       (bl:log-info "Peer ~A: v2 transport established (outbound)"
                               (peer-address peer))
        t)
       ((eq result :fallback-v1)
@@ -1210,7 +1210,7 @@ version handshake may proceed (over whichever transport), NIL to give up."
          (when fresh
            (close-connection conn)
            (setf (peer-connection peer) fresh)
-           (bitcoin-lisp:log-info "Peer ~A: no v2 response, reconnected as v1"
+           (bl:log-info "Peer ~A: no v2 response, reconnected as v1"
                                   (peer-address peer))
            t)))
       (t nil))))
@@ -1241,7 +1241,7 @@ turns out not to speak it. Returns T on success."
             ;; BIP330 offer goes after their VERSION (it is gated on their fRelay)
             ;; and before our VERACK (Core net_processing.cpp:3728-3744).
             (%maybe-send-sendtxrcncl peer)
-            (send-message peer (bitcoin-lisp.serialization:make-verack-message))
+            (send-message peer (bl.ser:make-verack-message))
             (%await-verack peer))
     (%release-outbound-nonce (peer-local-nonce peer))))
 
@@ -1258,7 +1258,7 @@ stall. Returns T on success."
     (let ((detected (v2-detect-inbound (peer-connection peer) :timeout timeout)))
       (cond ((v2-transport-p detected)
              (setf (connection-transport (peer-connection peer)) detected)
-             (bitcoin-lisp:log-info "Peer ~A: v2 transport established (inbound)"
+             (bl:log-info "Peer ~A: v2 transport established (inbound)"
                                     (peer-address peer)))
             ((eq detected :v1))         ; sniffed bytes pushed back; proceed v1
             (t (return-from perform-inbound-handshake nil)))))
@@ -1272,7 +1272,7 @@ stall. Returns T on success."
        ;; discouragement, no misbehaviour score. Scoring it would be actively
        ;; harmful, since the address being punished is our own.
        (cond ((%detected-self-connection-p peer)
-              (bitcoin-lisp:log-info "Peer ~A: connected to self, disconnecting"
+              (bl:log-info "Peer ~A: connected to self, disconnecting"
                                      (peer-address peer))
               nil)
              (t
@@ -1282,7 +1282,7 @@ stall. Returns T on success."
                    ;; sendaddrv2 → sendtxrcncl → verack,
                    ;; net_processing.cpp:3715-3744).
                    (%maybe-send-sendtxrcncl peer)
-                   (send-message peer (bitcoin-lisp.serialization:make-verack-message))
+                   (send-message peer (bl.ser:make-verack-message))
                    (%await-verack peer :timeout timeout))))))
 
 (defun make-inbound-peer (connection address &key inbound-onion)
@@ -1298,7 +1298,7 @@ on the local onion-service listener (Tor forwarding), whose true network is
                          :connect-time (get-internal-real-time))))
     (init-peer-rate-limiters peer)
     ;; Core's inbound branch has no address in the line (net.cpp:4009).
-    (bitcoin-lisp:log-cat "net" "Added connection peer=~A" (peer-id peer))
+    (bl:log-cat "net" "Added connection peer=~A" (peer-id peer))
     peer))
 
 ;;; --- BIP133 feefilter (Core MaybeSendFeefilter + FeeFilterRounder) ---
@@ -1376,13 +1376,13 @@ periodic tick rather than once at handshake."
              ;; Core gates on the COMMON version; we never negotiate below our
              ;; own, so the peer's advertised version is the common one.
              (let ((v (peer-version peer)))
-               (and v (>= (bitcoin-lisp.serialization:version-message-version v)
+               (and v (>= (bl.ser:version-message-version v)
                           +feefilter-version+)))
              (not (eq (peer-conn-type peer) :block-relay)))
     (let ((current (if (initial-block-download-p chain-state)
                        ;; Tx invs are discarded during IBD, so ask for none.
                        most-positive-fixnum
-                       (bitcoin-lisp.mempool:mempool-decayed-rolling-min-fee-rate
+                       (bl.mp:mempool-decayed-rolling-min-fee-rate
                         mempool now))))
       ;; Leaving IBD must force a resend, or peers keep withholding txs for up
       ;; to another 10 minutes.
@@ -1392,9 +1392,9 @@ periodic tick rather than once at handshake."
       (cond
         ((> now (peer-next-send-feefilter peer))
          (let ((to-send (max (fee-filter-round current)
-                             (bitcoin-lisp.mempool:mempool-min-fee-rate mempool))))
+                             (bl.mp:mempool-min-fee-rate mempool))))
            (unless (eql to-send (peer-fee-filter-sent peer))
-             (send-message peer (bitcoin-lisp.serialization:make-feefilter-message to-send))
+             (send-message peer (bl.ser:make-feefilter-message to-send))
              (setf (peer-fee-filter-sent peer) to-send))
            ;; Advanced UNCONDITIONALLY, even when nothing was sent — otherwise
            ;; the tick re-evaluates every second forever.
@@ -1412,7 +1412,7 @@ periodic tick rather than once at handshake."
 (defun send-post-handshake-messages (peer)
   "Send feature negotiation messages after handshake completes."
   ;; BIP 130: Request header announcements
-  (send-message peer (bitcoin-lisp.serialization:make-sendheaders-message))
+  (send-message peer (bl.ser:make-sendheaders-message))
   ;; BIP133 feefilter is NOT sent here. It is driven entirely by
   ;; maybe-send-feefilter on the periodic tick, which sends the first filter
   ;; within a second of the handshake. Sending from the handshake site as well
@@ -1433,7 +1433,7 @@ periodic tick rather than once at handshake."
   ;; gossip, DNS seeds, and fixed seeds.
   (when (and (not (peer-inbound peer))
              (not (eq (peer-conn-type peer) :block-relay)))
-    (send-message peer (bitcoin-lisp.serialization:make-getaddr-message))
+    (send-message peer (bl.ser:make-getaddr-message))
     ;; Track the solicitation and accept a full MAX_ADDR_TO_SEND response
     ;; beyond the token bucket's cap (Core net_processing.cpp:3769-3772:
     ;; "When requesting a getaddr, accept an additional MAX_ADDR_TO_SEND
@@ -1441,7 +1441,7 @@ periodic tick rather than once at handshake."
     ;; limit)").
     (setf (peer-getaddr-requested peer) t)
     (incf (peer-addr-token-bucket peer)
-          (coerce bitcoin-lisp.serialization:+max-addr-count+ 'double-float))))
+          (coerce bl.ser:+max-addr-count+ 'double-float))))
 
 ;;; Ping/Pong
 
@@ -1450,11 +1450,11 @@ periodic tick rather than once at handshake."
   (let ((nonce (random (expt 2 64))))
     (setf (peer-ping-nonce peer) nonce)
     (setf (peer-last-ping-time peer) (get-internal-real-time))
-    (send-message peer (bitcoin-lisp.serialization:make-ping-message nonce))))
+    (send-message peer (bl.ser:make-ping-message nonce))))
 
 (defun handle-ping (peer nonce)
   "Handle a ping message by sending a pong."
-  (send-message peer (bitcoin-lisp.serialization:make-pong-message nonce)))
+  (send-message peer (bl.ser:make-pong-message nonce)))
 
 (defun handle-pong (peer nonce)
   "Handle a pong message."
@@ -1498,8 +1498,8 @@ Returns :disconnect if the peer should be disconnected, :ok otherwise."
     (let* ((now (get-internal-real-time))
            (elapsed-secs (/ (float (- now (peer-connect-time peer)))
                             (float internal-time-units-per-second))))
-      (when (> elapsed-secs bitcoin-lisp:+handshake-timeout-seconds+)
-        (bitcoin-lisp:log-warn "Handshake timeout for peer ~A (~,1Fs elapsed)"
+      (when (> elapsed-secs bl:+handshake-timeout-seconds+)
+        (bl:log-warn "Handshake timeout for peer ~A (~,1Fs elapsed)"
                                (peer-address peer) elapsed-secs)
         (return-from check-handshake-timeout :disconnect))))
   :ok)
@@ -1522,7 +1522,7 @@ and its age never reset."
     (when (and conn (connection-connected conn))
       (flush-send-buffer conn)
       (when (connection-send-stalled-p conn)
-        (bitcoin-lisp:log-warn "Peer ~A socket sending timeout (~D unsent bytes)"
+        (bl:log-warn "Peer ~A socket sending timeout (~D unsent bytes)"
                                (peer-address peer)
                                (connection-send-queue-bytes conn))
         (return-from check-peer-health :disconnect))))
@@ -1574,7 +1574,7 @@ CNode::m_last_block_time; Core stamps only NEW blocks in ProcessBlock —
 ours stamps every block message, but we request each block once, so
 duplicates are rare)."
   (setf (peer-last-block-received-time peer) (get-internal-real-time))
-  (setf (peer-last-block-time peer) (bitcoin-lisp.serialization:get-unix-time))
+  (setf (peer-last-block-time peer) (bl.ser:get-unix-time))
   (setf (peer-block-timeout-count peer) 0))
 
 (defun consider-peer-eviction (peer our-height)
@@ -1626,7 +1626,7 @@ Set at node startup; every manual-ban mutation dumps the file immediately,
 exactly like Core (banman.cpp:153,170,79 — Ban/Unban/ClearBanned each call
 DumpBanlist).")
 
-(defvar *discouraged-peers* (bitcoin-lisp:make-rejects-filter)
+(defvar *discouraged-peers* (bl:make-rejects-filter)
   "Bounded, ephemeral rolling set of discouraged peer addresses (strings).
 Mirrors Bitcoin Core's BanMan discourage filter: auto-populated on misbehavior,
 never persisted, and bounded (FIFO eviction) so a peer cannot grow it without
@@ -1643,19 +1643,19 @@ node-lock), never the reverse, so it cannot deadlock against node-lock.")
   "Mark ADDRESS as discouraged (bounded rolling filter)."
   (when (and address (plusp (length address)))
     (bt:with-lock-held (*ban-lock*)
-      (bitcoin-lisp:add-recent-reject *discouraged-peers* address))))
+      (bl:add-recent-reject *discouraged-peers* address))))
 
 (defun peer-discouraged-p (address)
   "T if ADDRESS is currently discouraged."
   (and address (plusp (length address))
        (bt:with-lock-held (*ban-lock*)
-         (bitcoin-lisp:recent-reject-p *discouraged-peers* address))
+         (bl:recent-reject-p *discouraged-peers* address))
        t))
 
 (defun clear-discouraged ()
   "Clear the discourage filter."
   (bt:with-lock-held (*ban-lock*)
-    (bitcoin-lisp:clear-recent-rejects *discouraged-peers*)))
+    (bl:clear-recent-rejects *discouraged-peers*)))
 
 (defun loopback-address-p (address)
   "T when ADDRESS is a loopback address — Core CNetAddr::IsLocal
@@ -1695,7 +1695,7 @@ for eviction, not gossiped) and the connection is dropped. REASON, if given, is
 logged. Returns T, or NIL when PEER holds the noban permission and was
 therefore left alone."
   (when reason
-    (bitcoin-lisp:log-cat "net" "Misbehaving peer ~A: ~A"
+    (bl:log-cat "net" "Misbehaving peer ~A: ~A"
                           (peer-address peer) reason))
   ;; NoBan: neither discouraged NOR disconnected (Core
   ;; MaybeDiscourageAndDisconnect, net_processing.cpp — a noban peer's
@@ -1704,7 +1704,7 @@ therefore left alone."
   ;; opinion of its behaviour, so stopping at "not discouraged" while still
   ;; dropping the connection would not deliver the option.
   (when (peer-has-permission-p peer +perm-noban+)
-    (bitcoin-lisp:log-cat "net" "Not punishing whitelisted peer ~A"
+    (bl:log-cat "net" "Not punishing whitelisted peer ~A"
                           (peer-address peer))
     (return-from record-misbehavior nil))
   ;; Core MaybeDiscourageAndDisconnect (net_processing.cpp:5194-5201):
@@ -1738,7 +1738,7 @@ therefore left alone."
     (when (and address (plusp (length address)))
       (bt:with-lock-held (*ban-lock*)
         (setf (gethash address *banned-peers*)
-              (+ (bitcoin-lisp.serialization:get-node-time) *default-ban-time-seconds*)))
+              (+ (bl.ser:get-node-time) *default-ban-time-seconds*)))
       (save-banlist)))
   (when (peer-connection peer)
     (close-connection (peer-connection peer))
@@ -1751,7 +1751,7 @@ Returns T if banned, NIL otherwise. Expired bans are cleaned up."
     (let ((expiry (gethash address *banned-peers*)))
       (cond
         ((null expiry) nil)
-        ((> (bitcoin-lisp.serialization:get-node-time) expiry)
+        ((> (bl.ser:get-node-time) expiry)
          ;; Ban expired, remove it
          (remhash address *banned-peers*)
          nil)
@@ -1769,7 +1769,7 @@ SECONDS defaults to -bantime). Returns T, NIL for an empty address."
   (when (and (stringp address) (plusp (length address)))
     (bt:with-lock-held (*ban-lock*)
       (setf (gethash address *banned-peers*)
-            (+ (bitcoin-lisp.serialization:get-node-time) seconds)))
+            (+ (bl.ser:get-node-time) seconds)))
     (save-banlist)
     t))
 
@@ -1784,7 +1784,7 @@ was banned, NIL otherwise."
 (defun list-bans ()
   "Return a list of (address . banned-until-universal-time) for active bans,
 pruning any that have expired (Bitcoin Core listbanned)."
-  (let ((now (bitcoin-lisp.serialization:get-node-time))
+  (let ((now (bl.ser:get-node-time))
         (result '())
         (expired '()))
     (bt:with-lock-held (*ban-lock*)
@@ -1818,7 +1818,7 @@ a failed dump only logs (Core LogError in DumpBanlist)."
                                    (gethash "ban_created" ht) 0
                                    (gethash "banned_until" ht)
                                    (- (cdr ban)
-                                      bitcoin-lisp.serialization:+universal-unix-epoch-offset+)
+                                      bl.ser:+universal-unix-epoch-offset+)
                                    (gethash "address" ht) (car ban))
                              ht))
                          bans))
@@ -1833,7 +1833,7 @@ a failed dump only logs (Core LogError in DumpBanlist)."
           (rename-file tmp path)
           t)
       (error (e)
-        (bitcoin-lisp:log-warn "Could not write banlist ~A: ~A" path e)
+        (bl:log-warn "Could not write banlist ~A: ~A" path e)
         nil))))
 
 (defun load-banlist (&optional (path *banlist-path*))
@@ -1846,13 +1846,13 @@ active bans loaded; NIL when the file is absent/unreadable."
   ;; p2p_disconnect_ban.py greps for the line on a node that has never banned
   ;; anyone.
   (unless (and path (probe-file path))
-    (bitcoin-lisp:log-info "Recreating the banlist database")
+    (bl:log-info "Recreating the banlist database")
     (return-from load-banlist nil))
   (when (and path (probe-file path))
     (handler-case
         (let* ((json (with-open-file (in path) (yason:parse in)))
                (nets (and (hash-table-p json) (gethash "banned_nets" json)))
-               (now (bitcoin-lisp.serialization:get-node-time))
+               (now (bl.ser:get-node-time))
                (count 0))
           (bt:with-lock-held (*ban-lock*)
             (dolist (entry nets)
@@ -1860,7 +1860,7 @@ active bans loaded; NIL when the file is absent/unreadable."
                 (let ((addr (gethash "address" entry))
                       (until (gethash "banned_until" entry)))
                   (when (and (stringp addr) (integerp until))
-                    (let ((expiry (+ until bitcoin-lisp.serialization:+universal-unix-epoch-offset+)))
+                    (let ((expiry (+ until bl.ser:+universal-unix-epoch-offset+)))
                       (when (> expiry now)
                         (setf (gethash addr *banned-peers*) expiry)
                         (incf count))))))))
@@ -1870,8 +1870,8 @@ active bans loaded; NIL when the file is absent/unreadable."
         ;; failing (banman.cpp:42). p2p_disconnect_ban.py greps for it, which is
         ;; the whole point of matching the wording: Core's own tests are the
         ;; behavioural oracle, and they read the log.
-        (bitcoin-lisp:log-info "Recreating the banlist database")
-        (bitcoin-lisp:log-warn "Could not read banlist ~A: ~A" path e)
+        (bl:log-info "Recreating the banlist database")
+        (bl:log-warn "Could not read banlist ~A: ~A" path e)
         nil))))
 
 ;;; Per-Peer Rate Limiting
@@ -1893,5 +1893,5 @@ Returns T if allowed, NIL if rate limit exceeded."
                   ((string= command "getaddr") (peer-rate-limit-serve peer))
                   (t nil))))  ; No rate limit for other message types
     (if bucket
-        (bitcoin-lisp:token-bucket-allow-p bucket)
+        (bl:token-bucket-allow-p bucket)
         t)))

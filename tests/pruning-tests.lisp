@@ -6,16 +6,16 @@
 
 (defun make-pruning-test-block (prev-hash block-hash height)
   "Create a minimal test block for pruning tests."
-  (let* ((coinbase-tx (bitcoin-lisp.serialization:make-transaction
+  (let* ((coinbase-tx (bl.ser:make-transaction
                        :version 1
-                       :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                                      :previous-output (bitcoin-lisp.serialization:make-outpoint
+                       :inputs (vector (bl.ser:make-tx-in
+                                      :previous-output (bl.ser:make-outpoint
                                                         :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                           :initial-element 0)
                                                         :index #xFFFFFFFF)
                                       :script-sig (make-array 4 :element-type '(unsigned-byte 8)
                                                                 :initial-element 1)))
-                       :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                       :outputs (vector (bl.ser:make-tx-out
                                        :value 5000000000
                                        :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                   :initial-element #x76)))
@@ -27,7 +27,7 @@
                                       (setf (aref txh 2) (aref block-hash 2))
                                       (setf (aref txh 3) #xCC)
                                       txh)))
-         (header (bitcoin-lisp.serialization:make-block-header
+         (header (bl.ser:make-block-header
                   :version 1
                   :prev-block prev-hash
                   :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
@@ -35,7 +35,7 @@
                   :bits #x1d00ffff
                   :nonce 0
                   :cached-hash block-hash)))
-    (bitcoin-lisp.serialization:make-bitcoin-block
+    (bl.ser:make-bitcoin-block
      :header header
      :transactions (list coinbase-tx))))
 
@@ -58,30 +58,30 @@ holding all 400 of these tiny blocks in one file can only prune all of them or
 none, which is Core's behaviour too. File-granular pruning has its own coverage
 in flatfile-tests.lisp (PRUNE-OLD-BLOCKS-ACTUALLY-PRUNES-A-FLAT-FILE,
 PRUNEBLOCKCHAIN-PRUNES-A-FLAT-FILE, PRUNE-LOCK-*)."
-  (let* ((bitcoin-lisp.storage:*flat-block-files* nil)
+  (let* ((bl.store:*flat-block-files* nil)
          (base-path (ensure-directories-exist
                      (merge-pathnames (format nil "test-pruning-~A/" (get-universal-time))
                                       (uiop:temporary-directory))))
-         (block-store (bitcoin-lisp.storage:init-block-store base-path))
-         (chain-state (bitcoin-lisp.storage:init-chain-state base-path))
-         (genesis-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (block-store (bl.store:init-block-store base-path))
+         (chain-state (bl.store:init-chain-state base-path))
+         (genesis-hash (bl.store:best-block-hash chain-state))
          (block-hashes (list genesis-hash)))
     ;; Add genesis entry
-    (let ((genesis-entry (bitcoin-lisp.storage:make-block-index-entry
+    (let ((genesis-entry (bl.store:make-block-index-entry
                           :hash genesis-hash :height 0 :chain-work 1 :status :valid)))
-      (bitcoin-lisp.storage:add-block-index-entry chain-state genesis-entry)
+      (bl.store:add-block-index-entry chain-state genesis-entry)
       ;; Create and store N blocks with proper prev-entry links
       (let ((prev-hash genesis-hash)
             (prev-entry genesis-entry))
         (loop for h from 1 to n-blocks
               for block-hash = (make-test-hash #xAA h)
               do (let ((block (make-pruning-test-block prev-hash block-hash h)))
-                   (bitcoin-lisp.storage:store-block block-store block)
-                   (let ((entry (bitcoin-lisp.storage:make-block-index-entry
+                   (bl.store:store-block block-store block)
+                   (let ((entry (bl.store:make-block-index-entry
                                  :hash block-hash :height h :chain-work (1+ h)
                                  :status :valid :prev-entry prev-entry)))
-                     (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
-                     (bitcoin-lisp.storage:update-chain-tip chain-state block-hash h)
+                     (bl.store:add-block-index-entry chain-state entry)
+                     (bl.store:update-chain-tip chain-state block-hash h)
                      (push block-hash block-hashes)
                      (setf prev-hash block-hash)
                      (setf prev-entry entry))))))
@@ -103,37 +103,37 @@ plus unknown-hash remnants."
   (multiple-value-bind (base-path block-store chain-state block-hashes)
       (setup-pruning-test-store 300)
     (let ((undo-dir (merge-pathnames "undo/" base-path))
-          (bitcoin-lisp:*prune-target-mib* 1)
-          (bitcoin-lisp:*prune-after-height* 0))
+          (bl:*prune-target-mib* 1)
+          (bl:*prune-after-height* 0))
       (unwind-protect
            (progn
-             (bitcoin-lisp.validation:initialize-undo-storage undo-dir)
+             (bl.val:initialize-undo-storage undo-dir)
              ;; Fabricate undo files for the first five blocks + garbage.
              (dolist (hash (subseq block-hashes 1 6))
-               (bitcoin-lisp.validation::save-undo-data-to-disk hash '()))
+               (bl.val::save-undo-data-to-disk hash '()))
              (with-open-file (out (merge-pathnames "nothex.dat" undo-dir)
                                   :direction :output
                                   :element-type '(unsigned-byte 8))
                (write-byte 0 out))
              ;; Manual prune to height 3 deletes blocks 1..2 AND their undo.
-             (let ((pruned (bitcoin-lisp.storage:prune-blocks-to-height
+             (let ((pruned (bl.store:prune-blocks-to-height
                             block-store chain-state 3
-                            :on-prune #'bitcoin-lisp.validation:delete-undo-file)))
+                            :on-prune #'bl.val:delete-undo-file)))
                (is (= 2 pruned)))
              (let ((h1 (second block-hashes))
                    (h5 (sixth block-hashes)))
-               (is (null (probe-file (bitcoin-lisp.validation::undo-file-path h1))))
-               (is (not (null (probe-file (bitcoin-lisp.validation::undo-file-path h5)))))
+               (is (null (probe-file (bl.val::undo-file-path h1))))
+               (is (not (null (probe-file (bl.val::undo-file-path h5)))))
                ;; Re-create one stale undo below the horizon (simulating the
                ;; pre-undo-pruning backlog), then sweep: it and the garbage
                ;; file go; the above-horizon file stays.
-               (bitcoin-lisp.validation::save-undo-data-to-disk h1 '())
-               (let ((swept (bitcoin-lisp.validation:prune-stale-undo-files chain-state)))
+               (bl.val::save-undo-data-to-disk h1 '())
+               (let ((swept (bl.val:prune-stale-undo-files chain-state)))
                  (is (>= swept 2)))
-               (is (null (probe-file (bitcoin-lisp.validation::undo-file-path h1))))
+               (is (null (probe-file (bl.val::undo-file-path h1))))
                (is (null (probe-file (merge-pathnames "nothex.dat" undo-dir))))
-               (is (not (null (probe-file (bitcoin-lisp.validation::undo-file-path h5)))))))
-        (setf bitcoin-lisp.validation::*undo-base-path* nil)
+               (is (not (null (probe-file (bl.val::undo-file-path h5)))))))
+        (setf bl.val::*undo-base-path* nil)
         (uiop:delete-directory-tree base-path :validate t :if-does-not-exist :ignore)))))
 
 (test prune-block-deletes-file
@@ -144,15 +144,15 @@ plus unknown-hash remnants."
     (unwind-protect
         (let ((hash (second block-hashes)))  ; block at height 1
           ;; Block exists before pruning
-          (is (not (null (bitcoin-lisp.storage:block-exists-p block-store hash))))
+          (is (not (null (bl.store:block-exists-p block-store hash))))
           ;; Prune it
-          (let ((deleted-bytes (bitcoin-lisp.storage:prune-block block-store hash)))
+          (let ((deleted-bytes (bl.store:prune-block block-store hash)))
             (is (not (null deleted-bytes)))
             (is (> deleted-bytes 0)))
           ;; Block no longer exists
-          (is (null (bitcoin-lisp.storage:block-exists-p block-store hash)))
+          (is (null (bl.store:block-exists-p block-store hash)))
           ;; get-block returns NIL for pruned block
-          (is (null (bitcoin-lisp.storage:get-block block-store hash))))
+          (is (null (bl.store:get-block block-store hash))))
       (cleanup-test-dir base-path))))
 
 (test prune-block-nonexistent
@@ -162,7 +162,7 @@ plus unknown-hash remnants."
     (declare (ignore chain-state block-hashes))
     (unwind-protect
         (let ((fake-hash (make-test-hash #xFF #xFF)))
-          (is (null (bitcoin-lisp.storage:prune-block block-store fake-hash))))
+          (is (null (bl.store:prune-block block-store fake-hash))))
       (cleanup-test-dir base-path))))
 
 ;;;; Test 5.2: automatic pruning triggers when storage exceeds target
@@ -173,11 +173,11 @@ plus unknown-hash remnants."
       (setup-pruning-test-store 10)
     (declare (ignore block-hashes))
     (unwind-protect
-        (let ((bitcoin-lisp:*prune-target-mib* 550)
-              (bitcoin-lisp:*prune-after-height* 0))
+        (let ((bl:*prune-target-mib* 550)
+              (bl:*prune-after-height* 0))
           ;; Storage is tiny (test blocks), so nothing should be pruned
           ;; since we're well under 550 MiB
-          (let ((pruned (bitcoin-lisp.storage:prune-old-blocks block-store chain-state)))
+          (let ((pruned (bl.store:prune-old-blocks block-store chain-state)))
             (is (= 0 pruned))))
       (cleanup-test-dir base-path))))
 
@@ -189,11 +189,11 @@ plus unknown-hash remnants."
     (unwind-protect
         (progn
           ;; NIL = disabled
-          (let ((bitcoin-lisp:*prune-target-mib* nil))
-            (is (= 0 (bitcoin-lisp.storage:prune-old-blocks block-store chain-state))))
+          (let ((bl:*prune-target-mib* nil))
+            (is (= 0 (bl.store:prune-old-blocks block-store chain-state))))
           ;; 1 = manual-only, no automatic pruning
-          (let ((bitcoin-lisp:*prune-target-mib* 1))
-            (is (= 0 (bitcoin-lisp.storage:prune-old-blocks block-store chain-state)))))
+          (let ((bl:*prune-target-mib* 1))
+            (is (= 0 (bl.store:prune-old-blocks block-store chain-state)))))
       (cleanup-test-dir base-path))))
 
 ;;;; Test 5.3: manual-only mode
@@ -205,19 +205,19 @@ but prune-old-blocks should not."
   (multiple-value-bind (base-path block-store chain-state block-hashes)
       (setup-pruning-test-store 300)
     (unwind-protect
-        (let ((bitcoin-lisp:*prune-target-mib* 1)
-              (bitcoin-lisp:*prune-after-height* 0))
+        (let ((bl:*prune-target-mib* 1)
+              (bl:*prune-after-height* 0))
           ;; Automatic pruning should not run
-          (is (= 0 (bitcoin-lisp.storage:prune-old-blocks block-store chain-state)))
+          (is (= 0 (bl.store:prune-old-blocks block-store chain-state)))
           ;; Manual pruning should work (prune up to height 10)
-          (let ((pruned (bitcoin-lisp.storage:prune-blocks-to-height
+          (let ((pruned (bl.store:prune-blocks-to-height
                          block-store chain-state 10)))
             (is (> pruned 0))
             ;; Pruned blocks should be gone (height 1)
-            (is (null (bitcoin-lisp.storage:block-exists-p
+            (is (null (bl.store:block-exists-p
                        block-store (second block-hashes))))
             ;; Blocks at height 10+ should remain
-            (is (not (null (bitcoin-lisp.storage:block-exists-p
+            (is (not (null (bl.store:block-exists-p
                             block-store (nth 11 block-hashes)))))))
       (cleanup-test-dir base-path))))
 
@@ -229,10 +229,10 @@ but prune-old-blocks should not."
       (setup-pruning-test-store 5)
     (declare (ignore block-hashes))
     (unwind-protect
-        (let ((bitcoin-lisp:*prune-target-mib* 550)
-              (bitcoin-lisp:*prune-after-height* 1000))  ; chain is only at height 5
+        (let ((bl:*prune-target-mib* 550)
+              (bl:*prune-after-height* 1000))  ; chain is only at height 5
           ;; Should skip pruning because chain height (5) < prune-after-height (1000)
-          (is (= 0 (bitcoin-lisp.storage:prune-old-blocks block-store chain-state))))
+          (is (= 0 (bl.store:prune-old-blocks block-store chain-state))))
       (cleanup-test-dir base-path))))
 
 ;;;; Test 5.5: pruned-height persistence
@@ -245,16 +245,16 @@ but prune-old-blocks should not."
     (unwind-protect
         (progn
           ;; Save state with pruned-height
-          (let ((state (bitcoin-lisp.storage:init-chain-state base-path)))
+          (let ((state (bl.store:init-chain-state base-path)))
             (let ((hash (make-test-hash #xBB 1)))
-              (bitcoin-lisp.storage:update-chain-tip state hash 500))
-            (setf (bitcoin-lisp.storage:chain-state-pruned-height state) 200)
-            (bitcoin-lisp.storage:save-state state))
+              (bl.store:update-chain-tip state hash 500))
+            (setf (bl.store:chain-state-pruned-height state) 200)
+            (bl.store:save-state state))
           ;; Load into fresh state
-          (let ((state2 (bitcoin-lisp.storage:init-chain-state base-path)))
-            (is (bitcoin-lisp.storage:load-state state2))
-            (is (= 200 (bitcoin-lisp.storage:chain-state-pruned-height state2)))
-            (is (= 500 (bitcoin-lisp.storage:current-height state2)))))
+          (let ((state2 (bl.store:init-chain-state base-path)))
+            (is (bl.store:load-state state2))
+            (is (= 200 (bl.store:chain-state-pruned-height state2)))
+            (is (= 500 (bl.store:current-height state2)))))
       (cleanup-test-dir base-path))))
 
 (test pruned-height-backward-compat
@@ -278,10 +278,10 @@ but prune-old-blocks should not."
               (write-byte 0 stream)
               (write-byte 0 stream)))
           ;; Load - should succeed with pruned-height = 0
-          (let ((state (bitcoin-lisp.storage:init-chain-state base-path)))
-            (is (bitcoin-lisp.storage:load-state state))
-            (is (= 0 (bitcoin-lisp.storage:chain-state-pruned-height state)))
-            (is (= 100 (bitcoin-lisp.storage:current-height state)))))
+          (let ((state (bl.store:init-chain-state base-path)))
+            (is (bl.store:load-state state))
+            (is (= 0 (bl.store:chain-state-pruned-height state)))
+            (is (= 100 (bl.store:current-height state)))))
       (cleanup-test-dir base-path))))
 
 ;;;; Test 5.6: txindex/prune incompatibility
@@ -289,7 +289,7 @@ but prune-old-blocks should not."
 (test txindex-prune-incompatibility
   "Starting with both txindex and prune should signal an error."
   (signals error
-    (bitcoin-lisp:start-node :data-directory "/tmp/btc-prune-incompat-test/"
+    (bl:start-node :data-directory "/tmp/btc-prune-incompat-test/"
                              :network :testnet
                              :sync nil
                              :txindex t
@@ -301,12 +301,12 @@ but prune-old-blocks should not."
   "Invalid prune targets should signal an error."
   ;; Values between 2 and 549 are invalid
   (signals error
-    (bitcoin-lisp:start-node :data-directory "/tmp/btc-prune-val-test/"
+    (bl:start-node :data-directory "/tmp/btc-prune-val-test/"
                              :network :testnet
                              :sync nil
                              :prune 100))
   (signals error
-    (bitcoin-lisp:start-node :data-directory "/tmp/btc-prune-val-test/"
+    (bl:start-node :data-directory "/tmp/btc-prune-val-test/"
                              :network :testnet
                              :sync nil
                              :prune 549)))
@@ -320,37 +320,37 @@ but prune-old-blocks should not."
       (setup-pruning-test-store 300)
     (declare (ignore block-hashes))
     (unwind-protect
-        (let ((bitcoin-lisp:*prune-target-mib* 1))  ; manual-only
+        (let ((bl:*prune-target-mib* 1))  ; manual-only
           ;; Prune up to height 10
-          (let ((pruned (bitcoin-lisp.storage:prune-blocks-to-height
+          (let ((pruned (bl.store:prune-blocks-to-height
                          block-store chain-state 10)))
             (is (> pruned 0))
             ;; pruned-height should be updated (last pruned block)
-            (is (> (bitcoin-lisp.storage:chain-state-pruned-height chain-state) 0))
-            (is (< (bitcoin-lisp.storage:chain-state-pruned-height chain-state) 10))))
+            (is (> (bl.store:chain-state-pruned-height chain-state) 0))
+            (is (< (bl.store:chain-state-pruned-height chain-state) 10))))
       (cleanup-test-dir base-path))))
 
 ;;;; Test 5.9: getblockchaininfo pruning fields
 
 (test getblockchaininfo-pruning-disabled
   "getblockchaininfo should report pruned=NIL when pruning is disabled."
-  (let ((bitcoin-lisp:*prune-target-mib* nil))
-    (is (not (bitcoin-lisp:pruning-enabled-p)))))
+  (let ((bl:*prune-target-mib* nil))
+    (is (not (bl:pruning-enabled-p)))))
 
 (test getblockchaininfo-pruning-enabled
   "getblockchaininfo should report correct pruning fields."
   ;; Test automatic mode
-  (let ((bitcoin-lisp:*prune-target-mib* 550))
-    (is (bitcoin-lisp:pruning-enabled-p))
-    (is (bitcoin-lisp:automatic-pruning-p)))
+  (let ((bl:*prune-target-mib* 550))
+    (is (bl:pruning-enabled-p))
+    (is (bl:automatic-pruning-p)))
   ;; Test manual-only mode
-  (let ((bitcoin-lisp:*prune-target-mib* 1))
-    (is (bitcoin-lisp:pruning-enabled-p))
-    (is (not (bitcoin-lisp:automatic-pruning-p)))))
+  (let ((bl:*prune-target-mib* 1))
+    (is (bl:pruning-enabled-p))
+    (is (not (bl:automatic-pruning-p)))))
 
 (test prune-target-size-in-bytes
   "prune_target_size should be in bytes (MiB * 1048576)."
-  (let ((bitcoin-lisp:*prune-target-mib* 550))
+  (let ((bl:*prune-target-mib* 550))
     ;; 550 * 1048576 = 576716800
     (is (= (* 550 1048576) 576716800))))
 
@@ -359,32 +359,32 @@ but prune-old-blocks should not."
 (test service-bits-pruning-enabled
   "When pruning is enabled, services should include NODE_NETWORK_LIMITED
 and exclude NODE_NETWORK."
-  (let ((bitcoin-lisp:*prune-target-mib* 550))
-    (let ((services (if (bitcoin-lisp:pruning-enabled-p)
-                        (logior bitcoin-lisp.serialization:+node-network-limited+
-                                bitcoin-lisp.serialization:+node-witness+)
-                        (logior bitcoin-lisp.serialization:+node-network+
-                                bitcoin-lisp.serialization:+node-witness+))))
+  (let ((bl:*prune-target-mib* 550))
+    (let ((services (if (bl:pruning-enabled-p)
+                        (logior bl.ser:+node-network-limited+
+                                bl.ser:+node-witness+)
+                        (logior bl.ser:+node-network+
+                                bl.ser:+node-witness+))))
       ;; NODE_NETWORK_LIMITED should be set
-      (is (not (zerop (logand services bitcoin-lisp.serialization:+node-network-limited+))))
+      (is (not (zerop (logand services bl.ser:+node-network-limited+))))
       ;; NODE_NETWORK should NOT be set
-      (is (zerop (logand services bitcoin-lisp.serialization:+node-network+)))
+      (is (zerop (logand services bl.ser:+node-network+)))
       ;; NODE_WITNESS should be set
-      (is (not (zerop (logand services bitcoin-lisp.serialization:+node-witness+)))))))
+      (is (not (zerop (logand services bl.ser:+node-witness+)))))))
 
 (test service-bits-pruning-disabled
   "When pruning is disabled, services should include NODE_NETWORK
 and exclude NODE_NETWORK_LIMITED."
-  (let ((bitcoin-lisp:*prune-target-mib* nil))
-    (let ((services (if (bitcoin-lisp:pruning-enabled-p)
-                        (logior bitcoin-lisp.serialization:+node-network-limited+
-                                bitcoin-lisp.serialization:+node-witness+)
-                        (logior bitcoin-lisp.serialization:+node-network+
-                                bitcoin-lisp.serialization:+node-witness+))))
+  (let ((bl:*prune-target-mib* nil))
+    (let ((services (if (bl:pruning-enabled-p)
+                        (logior bl.ser:+node-network-limited+
+                                bl.ser:+node-witness+)
+                        (logior bl.ser:+node-network+
+                                bl.ser:+node-witness+))))
       ;; NODE_NETWORK should be set
-      (is (not (zerop (logand services bitcoin-lisp.serialization:+node-network+))))
+      (is (not (zerop (logand services bl.ser:+node-network+))))
       ;; NODE_NETWORK_LIMITED should NOT be set
-      (is (zerop (logand services bitcoin-lisp.serialization:+node-network-limited+))))))
+      (is (zerop (logand services bl.ser:+node-network-limited+))))))
 
 ;;;; Test 5.11: pruned block get-block returns NIL
 
@@ -396,11 +396,11 @@ and exclude NODE_NETWORK_LIMITED."
     (unwind-protect
         (let ((hash (second block-hashes)))  ; height 1
           ;; Block exists
-          (is (not (null (bitcoin-lisp.storage:get-block block-store hash))))
+          (is (not (null (bl.store:get-block block-store hash))))
           ;; Prune it
-          (bitcoin-lisp.storage:prune-block block-store hash)
+          (bl.store:prune-block block-store hash)
           ;; get-block returns NIL
-          (is (null (bitcoin-lisp.storage:get-block block-store hash))))
+          (is (null (bl.store:get-block block-store hash))))
       (cleanup-test-dir base-path))))
 
 ;;;; Test 5.12: reorg past pruned height
@@ -411,36 +411,36 @@ and exclude NODE_NETWORK_LIMITED."
       (setup-pruning-test-store 10)
     (declare (ignore block-hashes))
     (unwind-protect
-        (let ((bitcoin-lisp:*prune-target-mib* 550))
+        (let ((bl:*prune-target-mib* 550))
           ;; Simulate pruned-height at 5
-          (setf (bitcoin-lisp.storage:chain-state-pruned-height chain-state) 5)
+          (setf (bl.store:chain-state-pruned-height chain-state) 5)
           ;; Create old-tip at height 10 and new-tip with fork at height 3
           ;; The fork is below pruned-height (5), so reorg should fail
-          (let* ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
+          (let* ((utxo-set (bl.store:make-utxo-set))
                  ;; Build a fake old tip entry at height 10
                  (fork-hash (make-test-hash #xF0 3))
-                 (fork-entry (bitcoin-lisp.storage:make-block-index-entry
+                 (fork-entry (bl.store:make-block-index-entry
                               :hash fork-hash :height 3 :chain-work 4 :status :valid))
                  ;; Old chain: fork -> ... -> old-tip (height 10)
-                 (old-mid-entry (bitcoin-lisp.storage:make-block-index-entry
+                 (old-mid-entry (bl.store:make-block-index-entry
                                  :hash (make-test-hash #xF1 7) :height 7
                                  :chain-work 8 :status :valid
                                  :prev-entry fork-entry))
-                 (old-tip-entry (bitcoin-lisp.storage:make-block-index-entry
+                 (old-tip-entry (bl.store:make-block-index-entry
                                  :hash (make-test-hash #xF1 10) :height 10
                                  :chain-work 11 :status :valid
                                  :prev-entry old-mid-entry))
                  ;; New chain: fork -> ... -> new-tip (height 12, more work)
-                 (new-mid-entry (bitcoin-lisp.storage:make-block-index-entry
+                 (new-mid-entry (bl.store:make-block-index-entry
                                  :hash (make-test-hash #xF2 8) :height 8
                                  :chain-work 9 :status :valid
                                  :prev-entry fork-entry))
-                 (new-tip-entry (bitcoin-lisp.storage:make-block-index-entry
+                 (new-tip-entry (bl.store:make-block-index-entry
                                  :hash (make-test-hash #xF2 12) :height 12
                                  :chain-work 15 :status :valid
                                  :prev-entry new-mid-entry)))
             ;; Reorg should fail (fork at height 3 < pruned-height 5)
-            (is (null (bitcoin-lisp.validation:perform-reorg
+            (is (null (bl.val:perform-reorg
                        chain-state block-store utxo-set
                        old-tip-entry new-tip-entry)))))
       (cleanup-test-dir base-path))))
@@ -453,7 +453,7 @@ and exclude NODE_NETWORK_LIMITED."
       (setup-pruning-test-store 3)
     (declare (ignore chain-state block-hashes))
     (unwind-protect
-        (let ((size (bitcoin-lisp.storage:block-storage-size-mib block-store)))
+        (let ((size (bl.store:block-storage-size-mib block-store)))
           ;; Should be positive (we stored 3 blocks)
           (is (> size 0))
           ;; Should be small (test blocks are tiny)
@@ -469,27 +469,27 @@ and survive an init-block-store rescan."
       (setup-pruning-test-store 5)
     (declare (ignore chain-state))
     (unwind-protect
-        (let ((total (bitcoin-lisp.storage:block-store-total-bytes block-store)))
+        (let ((total (bl.store:block-store-total-bytes block-store)))
           ;; Counter is positive and matches the directory-scan value of a
           ;; freshly initialized store
           (is (> total 0))
-          (let ((store2 (bitcoin-lisp.storage:init-block-store base-path)))
-            (is (= total (bitcoin-lisp.storage:block-store-total-bytes store2))))
+          (let ((store2 (bl.store:init-block-store base-path)))
+            (is (= total (bl.store:block-store-total-bytes store2))))
           ;; Overwriting an existing block must not double-count. The binding
           ;; keeps the rewrite in the same format the store already holds:
           ;; appending it to a blk file instead would not be an overwrite at
           ;; all, it would be a second copy, and the counter would rightly grow.
-          (let ((bitcoin-lisp.storage:*flat-block-files* nil)
+          (let ((bl.store:*flat-block-files* nil)
                 (block (make-pruning-test-block (second block-hashes)
                                                 (third block-hashes) 2)))
-            (bitcoin-lisp.storage:store-block block-store block)
-            (is (= total (bitcoin-lisp.storage:block-store-total-bytes block-store))))
+            (bl.store:store-block block-store block)
+            (is (= total (bl.store:block-store-total-bytes block-store))))
           ;; Pruning decrements by the deleted size
-          (let ((deleted (bitcoin-lisp.storage:prune-block
+          (let ((deleted (bl.store:prune-block
                           block-store (second block-hashes))))
             (is (> deleted 0))
             (is (= (- total deleted)
-                   (bitcoin-lisp.storage:block-store-total-bytes block-store)))))
+                   (bl.store:block-store-total-bytes block-store)))))
       (cleanup-test-dir base-path))))
 
 (test prune-old-blocks-prunes-down-to-keep-window
@@ -499,22 +499,22 @@ tip - min-blocks-to-keep in one call, advancing pruned-height."
   (multiple-value-bind (base-path block-store chain-state block-hashes)
       (setup-pruning-test-store 300)
     (unwind-protect
-        (let ((bitcoin-lisp:*prune-target-mib* 550)
-              (bitcoin-lisp:*prune-after-height* 0))
+        (let ((bl:*prune-target-mib* 550)
+              (bl:*prune-after-height* 0))
           ;; Fake an over-target counter (real test blocks are tiny); the
           ;; prune loop should then delete everything it's allowed to
-          (setf (bitcoin-lisp.storage:block-store-total-bytes block-store)
+          (setf (bl.store:block-store-total-bytes block-store)
                 (* 600 1048576))
-          (let ((pruned (bitcoin-lisp.storage:prune-old-blocks
+          (let ((pruned (bl.store:prune-old-blocks
                          block-store chain-state)))
             (is (= 12 pruned))
-            (is (= 12 (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
+            (is (= 12 (bl.store:chain-state-pruned-height chain-state)))
             ;; Heights 1 and 12 gone, 13 still present
-            (is (null (bitcoin-lisp.storage:block-exists-p
+            (is (null (bl.store:block-exists-p
                        block-store (nth 1 block-hashes))))
-            (is (null (bitcoin-lisp.storage:block-exists-p
+            (is (null (bl.store:block-exists-p
                        block-store (nth 12 block-hashes))))
-            (is (not (null (bitcoin-lisp.storage:block-exists-p
+            (is (not (null (bl.store:block-exists-p
                             block-store (nth 13 block-hashes)))))))
       (cleanup-test-dir base-path))))
 
@@ -525,16 +525,16 @@ tip - min-blocks-to-keep in one call, advancing pruned-height."
   (multiple-value-bind (base-path block-store chain-state block-hashes)
       (setup-pruning-test-store 10)
     (unwind-protect
-        (let ((bitcoin-lisp:*prune-target-mib* 1))
+        (let ((bl:*prune-target-mib* 1))
           ;; Chain is at height 10, min-blocks-to-keep is 288
           ;; max-prune-height = max(0, 10 - 288) = 0
           ;; So nothing should be prunable
-          (let ((pruned (bitcoin-lisp.storage:prune-blocks-to-height
+          (let ((pruned (bl.store:prune-blocks-to-height
                          block-store chain-state 999)))
             (is (= 0 pruned))
             ;; All blocks should still exist
             (loop for hash in (rest block-hashes)
-                  do (is (not (null (bitcoin-lisp.storage:block-exists-p
+                  do (is (not (null (bl.store:block-exists-p
                                      block-store hash)))))))
       (cleanup-test-dir base-path))))
 
@@ -546,8 +546,8 @@ tip - min-blocks-to-keep in one call, advancing pruned-height."
       (setup-pruning-test-store 5)
     (declare (ignore block-hashes))
     (unwind-protect
-        (let ((bitcoin-lisp:*prune-target-mib* nil))
-          (is (= 0 (bitcoin-lisp.storage:prune-blocks-to-height
+        (let ((bl:*prune-target-mib* nil))
+          (is (= 0 (bl.store:prune-blocks-to-height
                      block-store chain-state 3))))
       (cleanup-test-dir base-path))))
 
@@ -557,7 +557,7 @@ tip - min-blocks-to-keep in one call, advancing pruned-height."
   "large-coins-cache-threshold returns a flush point below the budget and
 rises with it, across the default 450 MiB and the larger -dbcache regimes
 (so a bigger budget really does hold more UTXOs before flushing)."
-  (flet ((thr (mib) (bitcoin-lisp::large-coins-cache-threshold (* mib 1024 1024))))
+  (flet ((thr (mib) (bl::large-coins-cache-threshold (* mib 1024 1024))))
     ;; Always strictly below the budget (cache flushes before exceeding it).
     (dolist (mib '(450 768 1536 2048 4096))
       (is (< (thr mib) (* mib 1024 1024)) "threshold < budget at ~D MiB" mib))
@@ -566,8 +566,8 @@ rises with it, across the default 450 MiB and the larger -dbcache regimes
     (is (< (thr 1536) (thr 4096)))
     ;; Default budget is Core's DEFAULT_DB_CACHE (450 MiB).
     (is (= (* 450 1024 1024)
-           (let ((bitcoin-lisp::*coins-cache-budget-bytes* (* 450 1024 1024)))
-             bitcoin-lisp::*coins-cache-budget-bytes*)))))
+           (let ((bl::*coins-cache-budget-bytes* (* 450 1024 1024)))
+             bl::*coins-cache-budget-bytes*)))))
 
 ;;;; Assumeutxo P6: per-chainstate prune ranges (Core Chainstate::GetPruneRange,
 ;;;; validation.cpp:6366-6391) + halved automatic target while a historical
@@ -584,24 +584,24 @@ index."
     (unwind-protect
          (progn
            ;; Plain chainstate: prunes from genesis.
-           (is (= 0 (bitcoin-lisp.storage:chain-state-prune-floor chain-state)))
+           (is (= 0 (bl.store:chain-state-prune-floor chain-state)))
            ;; Unvalidated snapshot chainstate: floor at the base height.
-           (setf (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+           (setf (bl.store:chain-state-from-snapshot-blockhash chain-state)
                  (nth 3 block-hashes)
-                 (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+                 (bl.store:chain-state-assumeutxo-status chain-state)
                  :unvalidated)
-           (is (= 3 (bitcoin-lisp.storage:chain-state-prune-floor chain-state)))
+           (is (= 3 (bl.store:chain-state-prune-floor chain-state)))
            ;; Promotion (VALIDATED) lifts the floor entirely.
-           (setf (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+           (setf (bl.store:chain-state-assumeutxo-status chain-state)
                  :validated)
-           (is (= 0 (bitcoin-lisp.storage:chain-state-prune-floor chain-state)))
+           (is (= 0 (bl.store:chain-state-prune-floor chain-state)))
            ;; Unknown base header: refuse to prune anything.
-           (setf (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+           (setf (bl.store:chain-state-assumeutxo-status chain-state)
                  :unvalidated
-                 (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+                 (bl.store:chain-state-from-snapshot-blockhash chain-state)
                  (make-test-hash #xEE #xEE))
            (is (= most-positive-fixnum
-                  (bitcoin-lisp.storage:chain-state-prune-floor chain-state))))
+                  (bl.store:chain-state-prune-floor chain-state))))
       (cleanup-test-dir base-path))))
 
 (test effective-prune-target-halved-while-historical-exists
@@ -609,32 +609,32 @@ index."
 number of chainstates — halved while a historical chainstate exists, floored
 at MIN_DISK_SPACE_FOR_BLOCK_FILES (Core node/blockstorage.cpp:330-338)."
   (let* ((base-hash (make-test-hash #xEE 5))
-         (primary (bitcoin-lisp.storage:make-chain-state))
-         (snap (bitcoin-lisp.storage:make-chain-state
+         (primary (bl.store:make-chain-state))
+         (snap (bl.store:make-chain-state
                 :from-snapshot-blockhash base-hash
                 :assumeutxo-status :unvalidated
                 :storage-suffix "_snapshot"))
-         (node (bitcoin-lisp::make-node :network :testnet3)))
+         (node (bl::make-node :network :testnet3)))
     ;; A target-blockhash (and no target-utxohash) makes PRIMARY historical.
-    (setf (bitcoin-lisp.storage:chain-state-target-blockhash primary) base-hash
-          (bitcoin-lisp::node-chainstates node) (list primary snap))
-    (let ((bitcoin-lisp::*node* node))
-      (let ((bitcoin-lisp:*prune-target-mib* 2000))
-        (is (= (* 1000 1048576) (bitcoin-lisp:effective-prune-target-bytes))))
+    (setf (bl.store:chain-state-target-blockhash primary) base-hash
+          (bl::node-chainstates node) (list primary snap))
+    (let ((bl::*node* node))
+      (let ((bl:*prune-target-mib* 2000))
+        (is (= (* 1000 1048576) (bl:effective-prune-target-bytes))))
       ;; Halving never pushes the target below the 550 MiB floor.
-      (let ((bitcoin-lisp:*prune-target-mib* 550))
-        (is (= bitcoin-lisp:+min-disk-space-for-block-files+
-               (bitcoin-lisp:effective-prune-target-bytes)))))
+      (let ((bl:*prune-target-mib* 550))
+        (is (= bl:+min-disk-space-for-block-files+
+               (bl:effective-prune-target-bytes)))))
     ;; No node / no historical chainstate: the full target.
-    (let ((bitcoin-lisp::*node* nil)
-          (bitcoin-lisp:*prune-target-mib* 2000))
-      (is (= (* 2000 1048576) (bitcoin-lisp:effective-prune-target-bytes))))
+    (let ((bl::*node* nil)
+          (bl:*prune-target-mib* 2000))
+      (is (= (* 2000 1048576) (bl:effective-prune-target-bytes))))
     ;; Background completion ends the historical role: full target again.
-    (setf (bitcoin-lisp.storage:chain-state-target-utxohash primary)
+    (setf (bl.store:chain-state-target-utxohash primary)
           (make-test-hash 1 1))
-    (let ((bitcoin-lisp::*node* node)
-          (bitcoin-lisp:*prune-target-mib* 2000))
-      (is (= (* 2000 1048576) (bitcoin-lisp:effective-prune-target-bytes))))))
+    (let ((bl::*node* node)
+          (bl:*prune-target-mib* 2000))
+      (is (= (* 2000 1048576) (bl:effective-prune-target-bytes))))))
 
 (test prune-floor-unvalidated-snapshot-then-promotion
   "Automatic pruning driven by an UNVALIDATED snapshot chainstate never
@@ -646,63 +646,63 @@ rewound cursor lets a later walk reclaim the protected window."
       (setup-pruning-test-store 400)
     (unwind-protect
          (let* ((base-hash (nth 60 block-hashes))
-                (historical (bitcoin-lisp.storage:make-chain-state
-                             :block-index (bitcoin-lisp.storage::chain-state-block-index
+                (historical (bl.store:make-chain-state
+                             :block-index (bl.store::chain-state-block-index
                                            chain-state)))
-                (node (bitcoin-lisp::make-node :network :testnet3)))
+                (node (bl::make-node :network :testnet3)))
            ;; CHAIN-STATE becomes the snapshot chainstate (tip 400, base 60);
            ;; HISTORICAL re-derives history below the base (tip 40).
-           (setf (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+           (setf (bl.store:chain-state-from-snapshot-blockhash chain-state)
                  base-hash
-                 (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+                 (bl.store:chain-state-assumeutxo-status chain-state)
                  :unvalidated)
-           (bitcoin-lisp.storage:update-chain-tip historical (nth 40 block-hashes) 40)
-           (bitcoin-lisp.storage:set-chainstate-target
-            historical (bitcoin-lisp.storage:get-block-index-entry chain-state base-hash))
-           (setf (bitcoin-lisp::node-chainstates node) (list historical chain-state))
-           (let ((bitcoin-lisp::*node* node)
-                 (bitcoin-lisp:*prune-target-mib* 550)
-                 (bitcoin-lisp:*prune-after-height* 0))
-             (is (= 60 (bitcoin-lisp.storage:chain-state-prune-floor chain-state)))
-             (is (= 0 (bitcoin-lisp.storage:chain-state-prune-floor historical)))
+           (bl.store:update-chain-tip historical (nth 40 block-hashes) 40)
+           (bl.store:set-chainstate-target
+            historical (bl.store:get-block-index-entry chain-state base-hash))
+           (setf (bl::node-chainstates node) (list historical chain-state))
+           (let ((bl::*node* node)
+                 (bl:*prune-target-mib* 550)
+                 (bl:*prune-after-height* 0))
+             (is (= 60 (bl.store:chain-state-prune-floor chain-state)))
+             (is (= 0 (bl.store:chain-state-prune-floor historical)))
              ;; Force an over-target prune on the SNAPSHOT chainstate: only
              ;; heights 61..112 may go; the base range 1..60 stays on disk.
-             (setf (bitcoin-lisp.storage:block-store-total-bytes block-store)
+             (setf (bl.store:block-store-total-bytes block-store)
                    (* 600 1048576))
-             (let ((pruned (bitcoin-lisp.storage:prune-old-blocks
+             (let ((pruned (bl.store:prune-old-blocks
                             block-store chain-state)))
                (is (= 52 pruned)))
-             (is (= 112 (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
-             (is (not (null (bitcoin-lisp.storage:block-exists-p
+             (is (= 112 (bl.store:chain-state-pruned-height chain-state)))
+             (is (not (null (bl.store:block-exists-p
                              block-store (nth 1 block-hashes)))))
-             (is (not (null (bitcoin-lisp.storage:block-exists-p
+             (is (not (null (bl.store:block-exists-p
                              block-store (nth 60 block-hashes)))))
-             (is (null (bitcoin-lisp.storage:block-exists-p
+             (is (null (bl.store:block-exists-p
                         block-store (nth 61 block-hashes))))
-             (is (null (bitcoin-lisp.storage:block-exists-p
+             (is (null (bl.store:block-exists-p
                         block-store (nth 112 block-hashes))))
-             (is (not (null (bitcoin-lisp.storage:block-exists-p
+             (is (not (null (bl.store:block-exists-p
                              block-store (nth 113 block-hashes)))))
              ;; The HISTORICAL chainstate (tip 40) has no prunable range of
              ;; its own yet (40 - 288 < 1): nothing deleted.
-             (is (= 0 (bitcoin-lisp.storage:prune-old-blocks
+             (is (= 0 (bl.store:prune-old-blocks
                        block-store historical)))
              ;; Promotion: VALIDATED lifts the floor and the cursor rewinds
              ;; (what %validate-snapshot-against-commitment does), so the
              ;; protected window is reclaimed.
-             (setf (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+             (setf (bl.store:chain-state-assumeutxo-status chain-state)
                    :validated)
-             (bitcoin-lisp.storage:lift-prune-floor-on-promotion
+             (bl.store:lift-prune-floor-on-promotion
               chain-state historical)
-             (is (= 0 (bitcoin-lisp.storage:chain-state-prune-floor chain-state)))
-             (let ((pruned (bitcoin-lisp.storage:prune-old-blocks
+             (is (= 0 (bl.store:chain-state-prune-floor chain-state)))
+             (let ((pruned (bl.store:prune-old-blocks
                             block-store chain-state)))
                (is (= 60 pruned)))
-             (is (null (bitcoin-lisp.storage:block-exists-p
+             (is (null (bl.store:block-exists-p
                         block-store (nth 1 block-hashes))))
-             (is (null (bitcoin-lisp.storage:block-exists-p
+             (is (null (bl.store:block-exists-p
                         block-store (nth 60 block-hashes))))
-             (is (not (null (bitcoin-lisp.storage:block-exists-p
+             (is (not (null (bl.store:block-exists-p
                              block-store (nth 113 block-hashes)))))))
       (cleanup-test-dir base-path))))
 
@@ -717,36 +717,36 @@ chainstate prunes its GetPruneRange; the historical range starts at 0)."
       (setup-pruning-test-store 400)
     (unwind-protect
          (let* ((base-hash (nth 350 block-hashes))
-                (historical (bitcoin-lisp.storage:make-chain-state
-                             :block-index (bitcoin-lisp.storage::chain-state-block-index
+                (historical (bl.store:make-chain-state
+                             :block-index (bl.store::chain-state-block-index
                                            chain-state)))
-                (node (bitcoin-lisp::make-node :network :testnet3)))
-           (setf (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+                (node (bl::make-node :network :testnet3)))
+           (setf (bl.store:chain-state-from-snapshot-blockhash chain-state)
                  base-hash
-                 (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+                 (bl.store:chain-state-assumeutxo-status chain-state)
                  :unvalidated)
-           (bitcoin-lisp.storage:update-chain-tip historical (nth 300 block-hashes) 300)
-           (bitcoin-lisp.storage:set-chainstate-target
-            historical (bitcoin-lisp.storage:get-block-index-entry chain-state base-hash))
-           (setf (bitcoin-lisp::node-chainstates node) (list historical chain-state))
-           (let ((bitcoin-lisp::*node* node)
-                 (bitcoin-lisp:*prune-target-mib* 550)
-                 (bitcoin-lisp:*prune-after-height* 0))
-             (setf (bitcoin-lisp.storage:block-store-total-bytes block-store)
+           (bl.store:update-chain-tip historical (nth 300 block-hashes) 300)
+           (bl.store:set-chainstate-target
+            historical (bl.store:get-block-index-entry chain-state base-hash))
+           (setf (bl::node-chainstates node) (list historical chain-state))
+           (let ((bl::*node* node)
+                 (bl:*prune-target-mib* 550)
+                 (bl:*prune-after-height* 0))
+             (setf (bl.store:block-store-total-bytes block-store)
                    (* 600 1048576))
              ;; Snapshot chainstate: floor 350 > prune ceiling 112 -> nothing.
-             (is (= 0 (bitcoin-lisp.storage:prune-old-blocks
+             (is (= 0 (bl.store:prune-old-blocks
                        block-store chain-state)))
-             (is (not (null (bitcoin-lisp.storage:block-exists-p
+             (is (not (null (bl.store:block-exists-p
                              block-store (nth 1 block-hashes)))))
              ;; Historical chainstate: prunes its own 1..12 (300 - 288).
-             (let ((pruned (bitcoin-lisp.storage:prune-old-blocks
+             (let ((pruned (bl.store:prune-old-blocks
                             block-store historical)))
                (is (= 12 pruned)))
-             (is (= 12 (bitcoin-lisp.storage:chain-state-pruned-height historical)))
-             (is (null (bitcoin-lisp.storage:block-exists-p
+             (is (= 12 (bl.store:chain-state-pruned-height historical)))
+             (is (null (bl.store:block-exists-p
                         block-store (nth 12 block-hashes))))
-             (is (not (null (bitcoin-lisp.storage:block-exists-p
+             (is (not (null (bl.store:block-exists-p
                              block-store (nth 13 block-hashes)))))))
       (cleanup-test-dir base-path))))
 
@@ -758,22 +758,22 @@ between the base and the requested height."
   (multiple-value-bind (base-path block-store chain-state block-hashes)
       (setup-pruning-test-store 400)
     (unwind-protect
-         (let ((bitcoin-lisp:*prune-target-mib* 1))  ; manual-only mode
-           (setf (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+         (let ((bl:*prune-target-mib* 1))  ; manual-only mode
+           (setf (bl.store:chain-state-from-snapshot-blockhash chain-state)
                  (nth 60 block-hashes)
-                 (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+                 (bl.store:chain-state-assumeutxo-status chain-state)
                  :unvalidated)
-           (let ((pruned (bitcoin-lisp.storage:prune-blocks-to-height
+           (let ((pruned (bl.store:prune-blocks-to-height
                           block-store chain-state 90)))
              (is (= 29 pruned)))    ; heights 61..89
-           (is (= 89 (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
-           (is (not (null (bitcoin-lisp.storage:block-exists-p
+           (is (= 89 (bl.store:chain-state-pruned-height chain-state)))
+           (is (not (null (bl.store:block-exists-p
                            block-store (nth 60 block-hashes)))))
-           (is (null (bitcoin-lisp.storage:block-exists-p
+           (is (null (bl.store:block-exists-p
                       block-store (nth 61 block-hashes))))
-           (is (null (bitcoin-lisp.storage:block-exists-p
+           (is (null (bl.store:block-exists-p
                       block-store (nth 89 block-hashes))))
-           (is (not (null (bitcoin-lisp.storage:block-exists-p
+           (is (not (null (bl.store:block-exists-p
                            block-store (nth 90 block-hashes))))))
       (cleanup-test-dir base-path))))
 
@@ -788,26 +788,26 @@ undo window."
     (let ((undo-dir (merge-pathnames "undo/" base-path)))
       (unwind-protect
            (progn
-             (bitcoin-lisp.validation:initialize-undo-storage undo-dir)
+             (bl.val:initialize-undo-storage undo-dir)
              (dolist (hash (subseq block-hashes 1 6))   ; heights 1..5
-               (bitcoin-lisp.validation::save-undo-data-to-disk hash '()))
+               (bl.val::save-undo-data-to-disk hash '()))
              ;; The (snapshot) chainstate's own cursor claims 5, but the
              ;; conservative horizon is 3: only undo 1..3 may go.
-             (setf (bitcoin-lisp.storage:chain-state-pruned-height chain-state) 5)
-             (is (= 3 (bitcoin-lisp.validation:prune-stale-undo-files
+             (setf (bl.store:chain-state-pruned-height chain-state) 5)
+             (is (= 3 (bl.val:prune-stale-undo-files
                        chain-state :horizon 3)))
              (is (null (probe-file (merge-pathnames
-                                    (format nil "~A.dat" (bitcoin-lisp.crypto:bytes-to-hex
+                                    (format nil "~A.dat" (bl.crypto:bytes-to-hex
                                                           (nth 3 block-hashes)))
                                     undo-dir))))
              (is (not (null (probe-file (merge-pathnames
-                                         (format nil "~A.dat" (bitcoin-lisp.crypto:bytes-to-hex
+                                         (format nil "~A.dat" (bl.crypto:bytes-to-hex
                                                                (nth 4 block-hashes)))
                                          undo-dir)))))
              ;; Default horizon = the chainstate's own pruned-height (5).
-             (is (= 2 (bitcoin-lisp.validation:prune-stale-undo-files chain-state)))
+             (is (= 2 (bl.val:prune-stale-undo-files chain-state)))
              (is (null (probe-file (merge-pathnames
-                                    (format nil "~A.dat" (bitcoin-lisp.crypto:bytes-to-hex
+                                    (format nil "~A.dat" (bl.crypto:bytes-to-hex
                                                           (nth 5 block-hashes)))
                                     undo-dir)))))
         (cleanup-test-dir base-path)))))

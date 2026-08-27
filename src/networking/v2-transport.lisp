@@ -89,7 +89,7 @@ expecting a hard deadline."
 (defun %v2-generate-privkey ()
   "A uniformly random valid secp256k1 secret key."
   (loop for candidate = (ironclad:random-data 32)
-        when (bitcoin-lisp.crypto:valid-private-key-p candidate)
+        when (bl.crypto:valid-private-key-p candidate)
           return candidate))
 
 (defun %v2-v1-prefix ()
@@ -97,8 +97,8 @@ expecting a hard deadline."
 followed by the zero-padded \"version\" command."
   (let ((prefix (make-array +v1-prefix-len+ :element-type '(unsigned-byte 8)
                                             :initial-element 0)))
-    (replace prefix bitcoin-lisp.serialization:*network-magic*)
-    (replace prefix (bitcoin-lisp.serialization:command-to-bytes "version")
+    (replace prefix bl.ser:*network-magic*)
+    (replace prefix (bl.ser:command-to-bytes "version")
              :start1 4 :end2 (- +v1-prefix-len+ 4))
     prefix))
 
@@ -113,7 +113,7 @@ followed by the zero-padded \"version\" command."
 lock so encrypt+write is atomic (see the SEND-LOCK slot). Returns T on
 success."
   (bt:with-lock-held ((v2-transport-send-lock transport))
-    (let ((packet (bitcoin-lisp.crypto:bip324-cipher-encrypt
+    (let ((packet (bl.crypto:bip324-cipher-encrypt
                    (v2-transport-cipher transport) contents aad ignore)))
       (and (send-bytes conn packet) t))))
 
@@ -156,21 +156,21 @@ body length is parked on the CONNECTION between passes rather than recomputed."
     ;; Stage 1: the length descriptor, unless an earlier pass already took it.
     (unless (connection-recv-framing conn)
       (let ((len3 (receive-bytes-resumable
-                   conn bitcoin-lisp.crypto:+bip324-length-len+)))
+                   conn bl.crypto:+bip324-length-len+)))
         (when (eq len3 :incomplete) (return :incomplete))
         (unless len3 (return nil))
-        (let ((len (bitcoin-lisp.crypto:bip324-cipher-decrypt-length
+        (let ((len (bl.crypto:bip324-cipher-decrypt-length
                     (v2-transport-cipher transport) len3)))
           (when (> len +v2-max-contents-len+)
-            (bitcoin-lisp:log-warn "V2 transport: packet too large (~D bytes) from ~A, disconnecting"
+            (bl:log-warn "V2 transport: packet too large (~D bytes) from ~A, disconnecting"
                                    len (connection-host conn))
             (setf (connection-connected conn) nil)
             (return nil))
           ;; The cipher has advanced: from here the packet must complete or the
           ;; connection dies.
           (setf (connection-recv-framing conn)
-                (+ len bitcoin-lisp.crypto:+bip324-header-len+
-                   bitcoin-lisp.crypto:+poly1305-taglen+)))))
+                (+ len bl.crypto:+bip324-header-len+
+                   bl.crypto:+poly1305-taglen+)))))
     ;; Stage 2: the body, which may take as many passes as it takes.
     (let ((rest (receive-bytes-resumable conn (connection-recv-framing conn))))
       (when (eq rest :incomplete) (return :incomplete))
@@ -182,11 +182,11 @@ body length is parked on the CONNECTION between passes rather than recomputed."
         (setf (connection-connected conn) nil)
         (return nil))
       (multiple-value-bind (contents ignore)
-          (bitcoin-lisp.crypto:bip324-cipher-decrypt
+          (bl.crypto:bip324-cipher-decrypt
            (v2-transport-cipher transport) rest
            (or (v2-transport-recv-aad transport) *v2-empty-bytes*))
         (unless contents
-          (bitcoin-lisp:log-warn "V2 transport: packet auth failure from ~A, disconnecting"
+          (bl:log-warn "V2 transport: packet auth failure from ~A, disconnecting"
                                  (connection-host conn))
           (setf (connection-connected conn) nil)
           (return nil))
@@ -196,7 +196,7 @@ body length is parked on the CONNECTION between passes rather than recomputed."
           (return contents))
         ;; A decoy. Loop for the real packet — but yield first if this call has
         ;; already done a pump's worth of work (see the budget constant).
-        (incf consumed (+ bitcoin-lisp.crypto:+bip324-length-len+ (length rest)))
+        (incf consumed (+ bl.crypto:+bip324-length-len+ (length rest)))
         (when (> consumed +v2-max-recv-bytes-per-call+)
           (return :incomplete)))))))
 
@@ -224,7 +224,7 @@ packet, which nothing can proceed without. The pump must not use this — see
 message builders produce (magic, 12-byte command, length, checksum) and remap to
 a short ID byte, or 0x00 + the 12 type bytes verbatim, followed by the payload.
 The inverse of %V2-DECODE-MESSAGE."
-  (let* ((command (bitcoin-lisp.serialization:bytes-to-command
+  (let* ((command (bl.ser:bytes-to-command
                    (subseq message-bytes 4 16)))
          (payload-len (- (length message-bytes) 24))
          (short-id (position command *v2-message-ids* :test #'equal))
@@ -287,10 +287,10 @@ resumable one."
 (defun %v2-make-session ()
   "Fresh key material for one connection attempt: (values cipher garbage)."
   (let* ((privkey (%v2-generate-privkey))
-         (cipher (bitcoin-lisp.crypto:make-bip324-cipher
+         (cipher (bl.crypto:make-bip324-cipher
                   privkey :entropy32 (ironclad:random-data 32)))
          ;; Uniform garbage length in [0, 4095].
-         (garbage-len (mod (bitcoin-lisp.crypto:bytes-to-uint64-le
+         (garbage-len (mod (bl.crypto:bytes-to-uint64-le
                             (ironclad:random-data 8))
                            (1+ +v2-max-garbage-len+)))
          (garbage (ironclad:random-data garbage-len)))
@@ -300,10 +300,10 @@ resumable one."
   "Consume the peer's garbage up to and including its garbage terminator.
 Returns the garbage bytes (terminator excluded) or NIL if no terminator
 appears within the 4095+16 byte bound (or the DEADLINE passes)."
-  (let ((terminator (bitcoin-lisp.crypto:bip324-cipher-recv-garbage-terminator
+  (let ((terminator (bl.crypto:bip324-cipher-recv-garbage-terminator
                      cipher))
-        (term-len bitcoin-lisp.crypto:+bip324-garbage-terminator-len+)
-        (head (%v2-read conn bitcoin-lisp.crypto:+bip324-garbage-terminator-len+
+        (term-len bl.crypto:+bip324-garbage-terminator-len+)
+        (head (%v2-read conn bl.crypto:+bip324-garbage-terminator-len+
                         deadline)))
     (unless head (return-from %v2-scan-garbage nil))
     (let ((buf (make-array term-len :element-type '(unsigned-byte 8)
@@ -314,7 +314,7 @@ appears within the 4095+16 byte bound (or the DEADLINE passes)."
           (when (not (mismatch terminator buf :start2 (- n term-len)))
             (return (subseq buf 0 (- n term-len))))
           (when (>= n (+ +v2-max-garbage-len+ term-len))
-            (bitcoin-lisp:log-warn "V2 transport: missing garbage terminator from ~A"
+            (bl:log-warn "V2 transport: missing garbage terminator from ~A"
                                    (connection-host conn))
             (return nil))
           (let ((next (%v2-read conn 1 deadline)))
@@ -328,9 +328,9 @@ our GARBAGE as AAD), scan their garbage, and receive their version packet.
 Returns the ready v2-transport or NIL."
   (let ((terminator+version
           (concatenate '(simple-array (unsigned-byte 8) (*))
-                       (bitcoin-lisp.crypto:bip324-cipher-send-garbage-terminator
+                       (bl.crypto:bip324-cipher-send-garbage-terminator
                         cipher)
-                       (bitcoin-lisp.crypto:bip324-cipher-encrypt
+                       (bl.crypto:bip324-cipher-encrypt
                         cipher *v2-empty-bytes* garbage nil))))
     (unless (send-bytes conn terminator+version)
       (return-from %v2-finish-handshake nil))
@@ -352,7 +352,7 @@ speaks v1), or NIL on a hard failure or shutdown."
     (multiple-value-bind (cipher garbage) (%v2-make-session)
       (unless (send-bytes conn
                           (concatenate '(simple-array (unsigned-byte 8) (*))
-                                       (bitcoin-lisp.crypto:bip324-cipher-our-pubkey
+                                       (bl.crypto:bip324-cipher-our-pubkey
                                         cipher)
                                        garbage))
         (return-from v2-handshake-outbound nil))
@@ -362,8 +362,8 @@ speaks v1), or NIL on a hard failure or shutdown."
           ;; NIL when *ibd-stop-requested* is set.
           (return-from v2-handshake-outbound
             (if (ibd-stop-requested-p) nil :fallback-v1)))
-        (bitcoin-lisp.crypto:bip324-cipher-initialize
-         cipher their-key t bitcoin-lisp.serialization:*network-magic*)
+        (bl.crypto:bip324-cipher-initialize
+         cipher their-key t bl.ser:*network-magic*)
         (%v2-finish-handshake conn cipher garbage deadline)))))
 
 (defun v2-detect-inbound (conn &key (timeout 15))
@@ -384,7 +384,7 @@ peer, or NIL (dead peer, wrong-network v1 peer, or failed v2 handshake)."
       ;; command but the magic doesn't (else the branch above hit). Not a v2
       ;; key; log and drop (Core does the same for the logging value).
       ((not (mismatch first16 v1-prefix :start1 4 :start2 4))
-       (bitcoin-lisp:log-warn "V2 transport: v1 peer with wrong network magic from ~A"
+       (bl:log-warn "V2 transport: v1 peer with wrong network magic from ~A"
                               (connection-host conn))
        nil)
       (t
@@ -392,13 +392,13 @@ peer, or NIL (dead peer, wrong-network v1 peer, or failed v2 handshake)."
        (let ((rest (%v2-read conn 48 deadline)))
          (when rest
            (multiple-value-bind (cipher garbage) (%v2-make-session)
-             (bitcoin-lisp.crypto:bip324-cipher-initialize
+             (bl.crypto:bip324-cipher-initialize
               cipher
               (concatenate '(simple-array (unsigned-byte 8) (*)) first16 rest)
-              nil bitcoin-lisp.serialization:*network-magic*)
+              nil bl.ser:*network-magic*)
              (when (send-bytes conn
                                (concatenate '(simple-array (unsigned-byte 8) (*))
-                                            (bitcoin-lisp.crypto:bip324-cipher-our-pubkey
+                                            (bl.crypto:bip324-cipher-our-pubkey
                                              cipher)
                                             garbage))
                (%v2-finish-handshake conn cipher garbage deadline)))))))))
@@ -406,4 +406,4 @@ peer, or NIL (dead peer, wrong-network v1 peer, or failed v2 handshake)."
 (defun v2-available-p ()
   "T when v2 transport is enabled and the crypto backend supports it."
   (and *v2-transport-enabled*
-       (bitcoin-lisp.crypto:ellswift-available-p)))
+       (bl.crypto:ellswift-available-p)))

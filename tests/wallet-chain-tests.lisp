@@ -31,89 +31,89 @@
          (node (%regtest-node-fixture (format nil "wallet-~A" id)))
          (wallet-dir (merge-pathnames (format nil "wallet-chain-~A/" id)
                                       (uiop:temporary-directory))))
-    (bitcoin-lisp.storage:store-block
-     (bitcoin-lisp::node-block-store node)
-     (bitcoin-lisp.storage:make-genesis-block :regtest))
-    (setf (bitcoin-lisp::node-wallet-manager node)
-          (bitcoin-lisp.rpc::make-wallet-manager
+    (bl.store:store-block
+     (bl::node-block-store node)
+     (bl.store:make-genesis-block :regtest))
+    (setf (bl::node-wallet-manager node)
+          (bl.rpc::make-wallet-manager
            :data-directory wallet-dir :network :regtest :keypool-size keypool))
     node))
 
 (defmacro %with-wallet-chain-node ((node suffix &key (keypool 5)) &body body)
   "Run BODY under regtest bindings with NODE bound to a %wc-fixture and
-bitcoin-lisp::*node* bound so the wallet chain hooks fire."
+bl::*node* bound so the wallet chain hooks fire."
   `(%with-regtest
     (let* ((,node (%wc-fixture ,suffix :keypool ,keypool))
-           (bitcoin-lisp::*node* ,node))
+           (bl::*node* ,node))
       (unwind-protect (progn ,@body)
         (ignore-errors
-         (bitcoin-lisp.rpc:close-wallet-manager
-          (bitcoin-lisp::node-wallet-manager ,node)))))))
+         (bl.rpc:close-wallet-manager
+          (bl::node-wallet-manager ,node)))))))
 
 (defun %wc-wallet (node name)
-  (gethash name (bitcoin-lisp.rpc::wallet-manager-wallets
-                 (bitcoin-lisp::node-wallet-manager node))))
+  (gethash name (bl.rpc::wallet-manager-wallets
+                 (bl::node-wallet-manager node))))
 
 (defun %wc-optrue-address ()
   "P2SH(OP_TRUE) address for regtest — the throwaway coinbase target."
-  (bitcoin-lisp.crypto:encode-p2sh-address
-   (bitcoin-lisp.crypto:hash160 +optrue-redeem+) :regtest))
+  (bl.crypto:encode-p2sh-address
+   (bl.crypto:hash160 +optrue-redeem+) :regtest))
 
 (defun %wc-mine (node n address)
   "Mine N regtest blocks to ADDRESS; returns the block hash hex list."
-  (bitcoin-lisp.rpc::rpc-generatetoaddress node (list n address)))
+  (bl.rpc::rpc-generatetoaddress node (list n address)))
 
 (defun %wc-tip-hex (node)
-  (bitcoin-lisp.rpc::hash-to-hex
-   (bitcoin-lisp.storage:best-block-hash (bitcoin-lisp::node-chain-state node))))
+  (bl.rpc::hash-to-hex
+   (bl.store:best-block-hash (bl::node-chain-state node))))
 
 (defun %wc-coinbase-txid (node block-hash-hex)
   "Txid of the coinbase of the block named by BLOCK-HASH-HEX."
-  (let* ((store (bitcoin-lisp::node-block-store node))
-         (block (bitcoin-lisp.storage:get-block
-                 store (bitcoin-lisp.rpc::parse-hex-hash block-hash-hex))))
-    (bitcoin-lisp.serialization:transaction-hash
-     (first (bitcoin-lisp.serialization:bitcoin-block-transactions block)))))
+  (let* ((store (bl::node-block-store node))
+         (block (bl.store:get-block
+                 store (bl.rpc::parse-hex-hash block-hash-hex))))
+    (bl.ser:transaction-hash
+     (first (bl.ser:bitcoin-block-transactions block)))))
 
 (defun %wc-spend-tx (prev-txid prev-vout value spk &key (sequence #xffffffff))
   "A tx spending a P2SH(OP_TRUE) prevout, paying VALUE satoshis to SPK
 (input value minus VALUE is the fee)."
-  (bitcoin-lisp.serialization:make-transaction
+  (bl.ser:make-transaction
    :version 2
-   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
                                       :hash prev-txid :index prev-vout)
                     :script-sig (%p2sh-optrue-scriptsig)
                     :sequence sequence))
-   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bl.ser:make-tx-out
                      :value value :script-pubkey spk))
    :lock-time 0))
 
 (defun %wc-send (node tx)
   "sendrawtransaction TX; returns its txid."
-  (bitcoin-lisp.rpc::rpc-sendrawtransaction
-   node (list (bitcoin-lisp.crypto:bytes-to-hex
-               (bitcoin-lisp.serialization:transaction-wire-bytes tx))))
-  (bitcoin-lisp.serialization:transaction-hash tx))
+  (bl.rpc::rpc-sendrawtransaction
+   node (list (bl.crypto:bytes-to-hex
+               (bl.ser:transaction-wire-bytes tx))))
+  (bl.ser:transaction-hash tx))
 
 (defun %wc-gettx (node txid)
-  (bitcoin-lisp.rpc::rpc-gettransaction
-   node (list (bitcoin-lisp.rpc::hash-to-hex txid))))
+  (bl.rpc::rpc-gettransaction
+   node (list (bl.rpc::hash-to-hex txid))))
 
 (defun %wc-state-snapshot (wallet)
   "Comparable snapshot of the wallet's tracked tx states: txid-hex ->
 (state height index abandoned order-pos time-smart)."
   (let ((snap '()))
     (maphash (lambda (txid wtx)
-               (push (list (bitcoin-lisp.rpc::hash-to-hex txid)
-                           (bitcoin-lisp.rpc::wallet-tx-state wtx)
-                           (bitcoin-lisp.rpc::wallet-tx-block-height wtx)
-                           (bitcoin-lisp.rpc::wallet-tx-block-index wtx)
-                           (bitcoin-lisp.rpc::wallet-tx-abandoned wtx)
-                           (bitcoin-lisp.rpc::wallet-tx-order-pos wtx)
-                           (bitcoin-lisp.rpc::wallet-tx-time-smart wtx))
+               (push (list (bl.rpc::hash-to-hex txid)
+                           (bl.rpc::wallet-tx-state wtx)
+                           (bl.rpc::wallet-tx-block-height wtx)
+                           (bl.rpc::wallet-tx-block-index wtx)
+                           (bl.rpc::wallet-tx-abandoned wtx)
+                           (bl.rpc::wallet-tx-order-pos wtx)
+                           (bl.rpc::wallet-tx-time-smart wtx))
                      snap))
-             (bitcoin-lisp.rpc::wallet-map-wallet wallet))
+             (bl.rpc::wallet-map-wallet wallet))
     (sort snap #'string< :key #'first)))
 
 (defun %wc-details-category (gettx)
@@ -135,56 +135,56 @@ the block time; live mempool tracking stamps the arrival time — Core too)."
 TxStateInterpretSerialized vectors map to the right states."
   (let* ((prev (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
          (tx (%wc-spend-tx prev 0 12345 (%p2sh-optrue-spk)))
-         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (txid (bl.ser:transaction-hash tx))
          (bhash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
-         (wtx (bitcoin-lisp.rpc::make-wallet-tx :tx tx :txid txid)))
+         (wtx (bl.rpc::make-wallet-tx :tx tx :txid txid)))
     ;; Confirmed state: hash + index serialized, height NOT (reload -> -1).
-    (bitcoin-lisp.rpc::%wtx-apply-state wtx :confirmed bhash 42 2)
-    (setf (bitcoin-lisp.rpc::wallet-tx-time-received wtx) 111
-          (bitcoin-lisp.rpc::wallet-tx-time-smart wtx) 222
-          (bitcoin-lisp.rpc::wallet-tx-order-pos wtx) 5
-          (bitcoin-lisp.rpc::wallet-tx-map-value wtx) '(("comment" . "hi")))
-    (let ((bytes (bitcoin-lisp.rpc::wallet-tx-record-value wtx)))
+    (bl.rpc::%wtx-apply-state wtx :confirmed bhash 42 2)
+    (setf (bl.rpc::wallet-tx-time-received wtx) 111
+          (bl.rpc::wallet-tx-time-smart wtx) 222
+          (bl.rpc::wallet-tx-order-pos wtx) 5
+          (bl.rpc::wallet-tx-map-value wtx) '(("comment" . "hi")))
+    (let ((bytes (bl.rpc::wallet-tx-record-value wtx)))
       ;; Layout: tx wire bytes, then the state hash.
-      (let ((wire (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
+      (let ((wire (bl.ser:transaction-wire-bytes tx)))
         (is (equalp wire (subseq bytes 0 (length wire))))
         (is (equalp bhash (subseq bytes (length wire) (+ (length wire) 32)))))
       (multiple-value-bind (loaded warning)
-          (bitcoin-lisp.rpc::parse-wallet-tx-record bytes)
+          (bl.rpc::parse-wallet-tx-record bytes)
         (is (null warning))
-        (is (equalp txid (bitcoin-lisp.rpc::wallet-tx-txid loaded)))
-        (is (eq :confirmed (bitcoin-lisp.rpc::wallet-tx-state loaded)))
-        (is (equalp bhash (bitcoin-lisp.rpc::wallet-tx-block-hash loaded)))
-        (is (= -1 (bitcoin-lisp.rpc::wallet-tx-block-height loaded)))
-        (is (= 2 (bitcoin-lisp.rpc::wallet-tx-block-index loaded)))
-        (is (= 111 (bitcoin-lisp.rpc::wallet-tx-time-received loaded)))
-        (is (= 222 (bitcoin-lisp.rpc::wallet-tx-time-smart loaded)))
-        (is (= 5 (bitcoin-lisp.rpc::wallet-tx-order-pos loaded)))
+        (is (equalp txid (bl.rpc::wallet-tx-txid loaded)))
+        (is (eq :confirmed (bl.rpc::wallet-tx-state loaded)))
+        (is (equalp bhash (bl.rpc::wallet-tx-block-hash loaded)))
+        (is (= -1 (bl.rpc::wallet-tx-block-height loaded)))
+        (is (= 2 (bl.rpc::wallet-tx-block-index loaded)))
+        (is (= 111 (bl.rpc::wallet-tx-time-received loaded)))
+        (is (= 222 (bl.rpc::wallet-tx-time-smart loaded)))
+        (is (= 5 (bl.rpc::wallet-tx-order-pos loaded)))
         ;; Record-only map fields are stripped back out on load.
         (is (equal '(("comment" . "hi"))
-                   (bitcoin-lisp.rpc::wallet-tx-map-value loaded)))))
+                   (bl.rpc::wallet-tx-map-value loaded)))))
     ;; Block-conflicted: hash + index -1.
-    (bitcoin-lisp.rpc::%wtx-apply-state wtx :block-conflicted bhash 42)
-    (let ((loaded (bitcoin-lisp.rpc::parse-wallet-tx-record
-                   (bitcoin-lisp.rpc::wallet-tx-record-value wtx))))
-      (is (eq :block-conflicted (bitcoin-lisp.rpc::wallet-tx-state loaded)))
-      (is (equalp bhash (bitcoin-lisp.rpc::wallet-tx-block-hash loaded))))
+    (bl.rpc::%wtx-apply-state wtx :block-conflicted bhash 42)
+    (let ((loaded (bl.rpc::parse-wallet-tx-record
+                   (bl.rpc::wallet-tx-record-value wtx))))
+      (is (eq :block-conflicted (bl.rpc::wallet-tx-state loaded)))
+      (is (equalp bhash (bl.rpc::wallet-tx-block-hash loaded))))
     ;; Inactive: ZERO/0. Abandoned: ONE/-1. InMempool serializes as
     ;; inactive — Core relies on exactly that (TxStateSerialized*).
-    (bitcoin-lisp.rpc::%wtx-apply-state wtx :inactive)
-    (is (eq :inactive (bitcoin-lisp.rpc::wallet-tx-state
-                       (bitcoin-lisp.rpc::parse-wallet-tx-record
-                        (bitcoin-lisp.rpc::wallet-tx-record-value wtx)))))
-    (bitcoin-lisp.rpc::%wtx-apply-state wtx :inactive nil -1 -1 t)
-    (let ((loaded (bitcoin-lisp.rpc::parse-wallet-tx-record
-                   (bitcoin-lisp.rpc::wallet-tx-record-value wtx))))
-      (is (eq :inactive (bitcoin-lisp.rpc::wallet-tx-state loaded)))
-      (is (eq t (bitcoin-lisp.rpc::wallet-tx-abandoned loaded))))
-    (bitcoin-lisp.rpc::%wtx-apply-state wtx :in-mempool)
-    (let ((loaded (bitcoin-lisp.rpc::parse-wallet-tx-record
-                   (bitcoin-lisp.rpc::wallet-tx-record-value wtx))))
-      (is (eq :inactive (bitcoin-lisp.rpc::wallet-tx-state loaded)))
-      (is (null (bitcoin-lisp.rpc::wallet-tx-abandoned loaded))))))
+    (bl.rpc::%wtx-apply-state wtx :inactive)
+    (is (eq :inactive (bl.rpc::wallet-tx-state
+                       (bl.rpc::parse-wallet-tx-record
+                        (bl.rpc::wallet-tx-record-value wtx)))))
+    (bl.rpc::%wtx-apply-state wtx :inactive nil -1 -1 t)
+    (let ((loaded (bl.rpc::parse-wallet-tx-record
+                   (bl.rpc::wallet-tx-record-value wtx))))
+      (is (eq :inactive (bl.rpc::wallet-tx-state loaded)))
+      (is (eq t (bl.rpc::wallet-tx-abandoned loaded))))
+    (bl.rpc::%wtx-apply-state wtx :in-mempool)
+    (let ((loaded (bl.rpc::parse-wallet-tx-record
+                   (bl.rpc::wallet-tx-record-value wtx))))
+      (is (eq :inactive (bl.rpc::wallet-tx-state loaded)))
+      (is (null (bl.rpc::wallet-tx-abandoned loaded))))))
 
 ;;; --- Coinbase tracking + maturity ---
 
@@ -193,15 +193,15 @@ TxStateInterpretSerialized vectors map to the right states."
 categories follow Core's maturity rules (immature until depth 101, the
 COINBASE_MATURITY+1 rule)."
   (%with-wallet-chain-node (node "maturity")
-    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
-      (bitcoin-lisp.rpc::rpc-createwallet node '("w"))
-      (let* ((addr (bitcoin-lisp.rpc::rpc-getnewaddress node nil))
+    (let ((bl.rpc::*rpc-wallet-name* nil))
+      (bl.rpc::rpc-createwallet node '("w"))
+      (let* ((addr (bl.rpc::rpc-getnewaddress node nil))
              (hashes (%wc-mine node 1 addr))
              (cb-txid (%wc-coinbase-txid node (first hashes)))
              (wallet (%wc-wallet node "w")))
         ;; Tracked via the hook, confirmed at height 1.
-        (is (= 1 (hash-table-count (bitcoin-lisp.rpc::wallet-map-wallet wallet))))
-        (is (= 1 (%aval "txcount" (bitcoin-lisp.rpc::rpc-getwalletinfo node nil))))
+        (is (= 1 (hash-table-count (bl.rpc::wallet-map-wallet wallet))))
+        (is (= 1 (%aval "txcount" (bl.rpc::rpc-getwalletinfo node nil))))
         (let ((gettx (%wc-gettx node cb-txid)))
           (is (= 1 (%aval "confirmations" gettx)))
           (is (eq t (%aval "generated" gettx)))
@@ -222,13 +222,13 @@ COINBASE_MATURITY+1 rule)."
           (is (string= "generate" (%wc-details-category gettx)))
           (is (< (abs (- (%aval "amount" gettx) 50.0d0)) 1d-9)))
         ;; listtransactions reports the single generate entry.
-        (let ((entries (bitcoin-lisp.rpc::rpc-listtransactions node nil)))
+        (let ((entries (bl.rpc::rpc-listtransactions node nil)))
           (is (= 1 (length entries)))
           (is (string= "generate" (%aval "category" (first entries))))
           (is (string= addr (%aval "address" (first entries)))))
         ;; lastprocessedblock tracks the tip.
         (let ((lpb (%aval "lastprocessedblock"
-                          (bitcoin-lisp.rpc::rpc-getwalletinfo node nil))))
+                          (bl.rpc::rpc-getwalletinfo node nil))))
           (is (= 101 (%aval "height" lpb))))))))
 
 ;;; --- Mempool receive -> confirm -> listsinceblock -> rescan equality ---
@@ -239,10 +239,10 @@ confirms through the connect hook, listsinceblock windows are Core-shaped,
 and a from-genesis rescan (rescanblockchain AND a fresh importdescriptors
 wallet) reproduces exactly the live-tracked state."
   (%with-wallet-chain-node (node "receive")
-    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
-      (bitcoin-lisp.rpc::rpc-createwallet node '("w"))
+    (let ((bl.rpc::*rpc-wallet-name* nil))
+      (bl.rpc::rpc-createwallet node '("w"))
       (let* ((wallet (%wc-wallet node "w"))
-             (addr (bitcoin-lisp.rpc::rpc-getnewaddress node nil))
+             (addr (bl.rpc::rpc-getnewaddress node nil))
              (spk (%address-script addr :regtest))
              (fund-hashes (%wc-mine node 1 (%wc-optrue-address))))
         (%wc-mine node 100 (%wc-optrue-address))   ; tip 101, coinbase@1 mature
@@ -258,8 +258,8 @@ wallet) reproduces exactly the live-tracked state."
             (is (string= "receive" (%wc-details-category gettx)))
             (is (< (abs (- (%aval "amount" gettx) 49.9999d0)) 1d-9))
             (is (string= "no" (%aval "bip125-replaceable" gettx))))
-          (is (eq :in-mempool (bitcoin-lisp.rpc::wallet-tx-state
-                               (bitcoin-lisp.rpc::wallet-get-wallet-tx
+          (is (eq :in-mempool (bl.rpc::wallet-tx-state
+                               (bl.rpc::wallet-get-wallet-tx
                                 wallet txid1))))
           ;; Confirm at height 102.
           (let ((h101 (%wc-tip-hex node)))
@@ -270,47 +270,47 @@ wallet) reproduces exactly the live-tracked state."
               (is (plusp (%aval "blocktime" gettx))))
             ;; listsinceblock from height 101: depth window includes tx1;
             ;; from the tip: excludes it; lastblock respects target_confirms.
-            (let ((since (bitcoin-lisp.rpc::rpc-listsinceblock node (list h101))))
+            (let ((since (bl.rpc::rpc-listsinceblock node (list h101))))
               (is (= 1 (length (%aval "transactions" since))))
               (is (string= (%wc-tip-hex node) (%aval "lastblock" since))))
-            (let ((since (bitcoin-lisp.rpc::rpc-listsinceblock
+            (let ((since (bl.rpc::rpc-listsinceblock
                           node (list (%wc-tip-hex node)))))
               (is (zerop (length (%aval "transactions" since)))))
-            (let ((since (bitcoin-lisp.rpc::rpc-listsinceblock
+            (let ((since (bl.rpc::rpc-listsinceblock
                           node (list nil 2))))
               ;; No filter block: everything listed; lastblock = height 101.
               (is (plusp (length (%aval "transactions" since))))
               (is (string= h101 (%aval "lastblock" since))))
             ;; Unknown blockhash -> Core's -5.
-            (is (= bitcoin-lisp.rpc::+rpc-invalid-address-or-key+
+            (is (= bl.rpc::+rpc-invalid-address-or-key+
                    (%rpc-error-code
                     (lambda ()
-                      (bitcoin-lisp.rpc::rpc-listsinceblock
+                      (bl.rpc::rpc-listsinceblock
                        node (list (make-string 64 :initial-element #\7))))))))
           ;; abortrescan with no scan running: JSON false; not scanning.
-          (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-abortrescan node nil)))
+          (is (eq 'yason:false (bl.rpc::rpc-abortrescan node nil)))
           (is (eq 'yason:false
                   (%aval "scanning"
-                         (bitcoin-lisp.rpc::rpc-getwalletinfo node nil))))
+                         (bl.rpc::rpc-getwalletinfo node nil))))
           ;; rescanblockchain from genesis must reproduce the live state.
           (let ((before (%wc-state-snapshot wallet))
-                (result (bitcoin-lisp.rpc::rpc-rescanblockchain node '(0))))
+                (result (bl.rpc::rpc-rescanblockchain node '(0))))
             (is (= 0 (%aval "start_height" result)))
             (is (= 102 (%aval "stop_height" result)))
             (is (equalp before (%wc-state-snapshot wallet))))
           ;; A second wallet importing the same descriptor with an old
           ;; timestamp rescans to the identical tracked state.
           (let* ((descs (%aval "descriptors"
-                               (bitcoin-lisp.rpc::rpc-listdescriptors node '(t))))
+                               (bl.rpc::rpc-listdescriptors node '(t))))
                  (ext-wpkh (find-if (lambda (d)
                                       (let ((s (%aval "desc" d)))
                                         (and (eql 0 (search "wpkh(" s))
                                              (search "/0/*" s))))
                                     descs)))
             (is (not (null ext-wpkh)))
-            (bitcoin-lisp.rpc::rpc-createwallet node '("w2" nil t)) ; blank
-            (let* ((bitcoin-lisp.rpc::*rpc-wallet-name* "w2")
-                   (results (bitcoin-lisp.rpc::rpc-importdescriptors
+            (bl.rpc::rpc-createwallet node '("w2" nil t)) ; blank
+            (let* ((bl.rpc::*rpc-wallet-name* "w2")
+                   (results (bl.rpc::rpc-importdescriptors
                              node (list (list (%ht "desc" (%aval "desc" ext-wpkh)
                                                    "timestamp" 1
                                                    "active" t
@@ -330,31 +330,31 @@ wallet) reproduces exactly the live-tracked state."
   "Disconnecting the wallet's coinbase block marks it inactive+abandoned
 (orphan category); reconsidering the block reconfirms it."
   (%with-wallet-chain-node (node "cbreorg")
-    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
-      (bitcoin-lisp.rpc::rpc-createwallet node '("w"))
-      (let* ((addr (bitcoin-lisp.rpc::rpc-getnewaddress node nil))
+    (let ((bl.rpc::*rpc-wallet-name* nil))
+      (bl.rpc::rpc-createwallet node '("w"))
+      (let* ((addr (bl.rpc::rpc-getnewaddress node nil))
              (b1 (first (%wc-mine node 1 addr)))
              (cb-txid (%wc-coinbase-txid node b1))
              (wallet (%wc-wallet node "w")))
         (%wc-mine node 1 (%wc-optrue-address))     ; tip 2
         (is (= 2 (%aval "confirmations" (%wc-gettx node cb-txid))))
         ;; Reorg the funding block away.
-        (bitcoin-lisp.rpc::rpc-invalidateblock node (list b1))
-        (let ((wtx (bitcoin-lisp.rpc::wallet-get-wallet-tx wallet cb-txid)))
-          (is (eq :inactive (bitcoin-lisp.rpc::wallet-tx-state wtx)))
-          (is (eq t (bitcoin-lisp.rpc::wallet-tx-abandoned wtx))))
+        (bl.rpc::rpc-invalidateblock node (list b1))
+        (let ((wtx (bl.rpc::wallet-get-wallet-tx wallet cb-txid)))
+          (is (eq :inactive (bl.rpc::wallet-tx-state wtx)))
+          (is (eq t (bl.rpc::wallet-tx-abandoned wtx))))
         (let ((gettx (%wc-gettx node cb-txid)))
           (is (= 0 (%aval "confirmations" gettx)))
           (is (string= "orphan" (%wc-details-category gettx)))
           (is (eq t (%aval "abandoned" (first (%aval "details" gettx))))))
-        (is (= 0 (bitcoin-lisp.rpc::wallet-last-block-height wallet)))
+        (is (= 0 (bl.rpc::wallet-last-block-height wallet)))
         ;; Reconnect: confirmed again at height 1, abandoned cleared.
-        (bitcoin-lisp.rpc::rpc-reconsiderblock node (list b1))
-        (let ((wtx (bitcoin-lisp.rpc::wallet-get-wallet-tx wallet cb-txid)))
-          (is (eq :confirmed (bitcoin-lisp.rpc::wallet-tx-state wtx)))
-          (is (= 1 (bitcoin-lisp.rpc::wallet-tx-block-height wtx))))
+        (bl.rpc::rpc-reconsiderblock node (list b1))
+        (let ((wtx (bl.rpc::wallet-get-wallet-tx wallet cb-txid)))
+          (is (eq :confirmed (bl.rpc::wallet-tx-state wtx)))
+          (is (= 1 (bl.rpc::wallet-tx-block-height wtx))))
         (is (= 2 (%aval "confirmations" (%wc-gettx node cb-txid))))
-        (is (= 2 (bitcoin-lisp.rpc::wallet-last-block-height wallet)))))))
+        (is (= 2 (bl.rpc::wallet-last-block-height wallet)))))))
 
 ;;; --- Reorg across the funding tx + double-spend conflicts ---
 
@@ -365,10 +365,10 @@ block-conflicted (negative confirmations); disconnecting the conflict block
 reverts it to inactive with the double-spend as a mempool conflict; re-mining
 the double-spend re-conflicts it and clears the mempool conflict."
   (%with-wallet-chain-node (node "conflicts")
-    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
-      (bitcoin-lisp.rpc::rpc-createwallet node '("w"))
+    (let ((bl.rpc::*rpc-wallet-name* nil))
+      (bl.rpc::rpc-createwallet node '("w"))
       (let* ((wallet (%wc-wallet node "w"))
-             (addr (bitcoin-lisp.rpc::rpc-getnewaddress node nil))
+             (addr (bl.rpc::rpc-getnewaddress node nil))
              (spk (%address-script addr :regtest))
              (fund1 (first (%wc-mine node 1 (%wc-optrue-address))))   ; h1
              (fund2 (first (%wc-mine node 1 (%wc-optrue-address)))))  ; h2
@@ -379,11 +379,11 @@ the double-spend re-conflicts it and clears the mempool conflict."
                (txid1 (%wc-send node tx1))
                (fblock (first (%wc-mine node 1 (%wc-optrue-address))))) ; h103
           (is (= 1 (%aval "confirmations" (%wc-gettx node txid1))))
-          (bitcoin-lisp.rpc::rpc-invalidateblock node (list fblock))
+          (bl.rpc::rpc-invalidateblock node (list fblock))
           ;; Disconnected -> re-added to the mempool -> wallet sees mempool
           ;; state through the re-add hook.
-          (let ((wtx (bitcoin-lisp.rpc::wallet-get-wallet-tx wallet txid1)))
-            (is (eq :in-mempool (bitcoin-lisp.rpc::wallet-tx-state wtx))))
+          (let ((wtx (bl.rpc::wallet-get-wallet-tx wallet txid1)))
+            (is (eq :in-mempool (bl.rpc::wallet-tx-state wtx))))
           (is (= 0 (%aval "confirmations" (%wc-gettx node txid1))))
           ;; Mine again — to the WALLET address, so the coinbase (and hence
           ;; the block hash) necessarily differs from the invalidated block;
@@ -401,32 +401,32 @@ the double-spend re-conflicts it and clears the mempool conflict."
                ;; Double-spend of the same prevout, NOT paying the wallet.
                (tx2x (%wc-spend-tx cb2 0 (- +wc-subsidy+ 1000000)
                                    (%p2sh-optrue-spk)))
-               (txid2x (bitcoin-lisp.serialization:transaction-hash tx2x)))
+               (txid2x (bl.ser:transaction-hash tx2x)))
           (is (= 0 (%aval "confirmations" (%wc-gettx node txid2))))
           ;; Mine a block containing ONLY the double-spend.
           (let ((conflict-block
                   (%aval "hash"
-                         (bitcoin-lisp.rpc::rpc-generateblock
+                         (bl.rpc::rpc-generateblock
                           node (list (%wc-optrue-address)
-                                     (list (bitcoin-lisp.crypto:bytes-to-hex
-                                            (bitcoin-lisp.serialization:transaction-wire-bytes tx2x))))))))
+                                     (list (bl.crypto:bytes-to-hex
+                                            (bl.ser:transaction-wire-bytes tx2x))))))))
             ;; tx2: removed from the mempool as :conflict, then marked
             ;; block-conflicted by the connect hook's mapTxSpends scan.
-            (let ((wtx (bitcoin-lisp.rpc::wallet-get-wallet-tx wallet txid2)))
-              (is (eq :block-conflicted (bitcoin-lisp.rpc::wallet-tx-state wtx))))
+            (let ((wtx (bl.rpc::wallet-get-wallet-tx wallet txid2)))
+              (is (eq :block-conflicted (bl.rpc::wallet-tx-state wtx))))
             (let ((gettx (%wc-gettx node txid2)))
               (is (= -1 (%aval "confirmations" gettx)))
               (is (eq 'yason:false (%aval "trusted" gettx)))
               (is (zerop (length (%aval "mempoolconflicts" gettx)))))
             ;; Disconnect the conflict block: tx2 reverts to inactive, and
             ;; the re-added double-spend becomes a mempool conflict of tx2.
-            (bitcoin-lisp.rpc::rpc-invalidateblock node (list conflict-block))
-            (let ((wtx (bitcoin-lisp.rpc::wallet-get-wallet-tx wallet txid2)))
-              (is (eq :inactive (bitcoin-lisp.rpc::wallet-tx-state wtx))))
+            (bl.rpc::rpc-invalidateblock node (list conflict-block))
+            (let ((wtx (bl.rpc::wallet-get-wallet-tx wallet txid2)))
+              (is (eq :inactive (bl.rpc::wallet-tx-state wtx))))
             (let* ((gettx (%wc-gettx node txid2))
                    (mconf (%aval "mempoolconflicts" gettx)))
               (is (= 0 (%aval "confirmations" gettx)))
-              (is (equal (list (bitcoin-lisp.rpc::hash-to-hex txid2x)) mconf)))
+              (is (equal (list (bl.rpc::hash-to-hex txid2x)) mconf)))
             ;; Mine the double-spend again (it is back in the mempool):
             ;; blockConnected re-conflicts tx2 AND clears the mempool
             ;; conflict (reason-:block removal runs the erase loop).
@@ -442,10 +442,10 @@ the double-spend re-conflicts it and clears the mempool conflict."
 (records were persisted at hook time), and a wallet unloaded while blocks
 were mined catches up from its stored locator on load."
   (%with-wallet-chain-node (node "crash")
-    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil)
+    (let ((bl.rpc::*rpc-wallet-name* nil)
           (issued '()))
-      (bitcoin-lisp.rpc::rpc-createwallet node '("w"))
-      (let* ((addr (bitcoin-lisp.rpc::rpc-getnewaddress node nil))
+      (bl.rpc::rpc-createwallet node '("w"))
+      (let* ((addr (bl.rpc::rpc-getnewaddress node nil))
              (spk (%address-script addr :regtest))
              (cb-hash (first (%wc-mine node 1 addr)))        ; wallet coinbase h1
              (cb-txid (%wc-coinbase-txid node cb-hash))
@@ -456,45 +456,45 @@ were mined catches up from its stored locator on load."
                                   (- +wc-subsidy+ 10000) spk))
                (txid1 (%wc-send node tx1)))
           (%wc-mine node 1 (%wc-optrue-address))              ; tip 103
-          (push (bitcoin-lisp.rpc::rpc-getnewaddress node nil) issued)
-          (push (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "bech32m")) issued)
+          (push (bl.rpc::rpc-getnewaddress node nil) issued)
+          (push (bl.rpc::rpc-getnewaddress node '("" "bech32m")) issued)
           (let* ((wallet (%wc-wallet node "w"))
                  (before (%wc-state-snapshot wallet)))
             (is (= 2 (length before)))          ; coinbase + tx1
             ;; Crash: close the DB without any graceful-unload writes.
             (%crash-close-wallet node "w")
-            (bitcoin-lisp.rpc::rpc-loadwallet node '("w"))
+            (bl.rpc::rpc-loadwallet node '("w"))
             (let ((wallet2 (%wc-wallet node "w")))
               (is (not (eq wallet wallet2)))
               (is (equalp before (%wc-state-snapshot wallet2)))
-              (is (= 103 (bitcoin-lisp.rpc::wallet-last-block-height wallet2)))
+              (is (= 103 (bl.rpc::wallet-last-block-height wallet2)))
               ;; Confirmed states resolved against the chain on load.
-              (let ((wtx (bitcoin-lisp.rpc::wallet-get-wallet-tx wallet2 txid1)))
-                (is (eq :confirmed (bitcoin-lisp.rpc::wallet-tx-state wtx)))
-                (is (= 103 (bitcoin-lisp.rpc::wallet-tx-block-height wtx))))
+              (let ((wtx (bl.rpc::wallet-get-wallet-tx wallet2 txid1)))
+                (is (eq :confirmed (bl.rpc::wallet-tx-state wtx)))
+                (is (= 103 (bl.rpc::wallet-tx-block-height wtx))))
               (is (= 2 (%aval "txcount"
-                              (bitcoin-lisp.rpc::rpc-getwalletinfo node nil))))
+                              (bl.rpc::rpc-getwalletinfo node nil))))
               ;; Keypool: no previously issued address is reissued.
-              (let ((fresh (list (bitcoin-lisp.rpc::rpc-getnewaddress node nil)
-                                 (bitcoin-lisp.rpc::rpc-getnewaddress
+              (let ((fresh (list (bl.rpc::rpc-getnewaddress node nil)
+                                 (bl.rpc::rpc-getnewaddress
                                   node '("" "bech32m")))))
                 (is (null (intersection issued fresh :test #'string=)))))
             ;; Unload; mine 3 more to the wallet address while unloaded;
             ;; reload catches up from the stored locator.
-            (bitcoin-lisp.rpc::rpc-unloadwallet node '("w"))
+            (bl.rpc::rpc-unloadwallet node '("w"))
             (%wc-mine node 3 addr)                            ; tip 106
-            (bitcoin-lisp.rpc::rpc-loadwallet node '("w"))
+            (bl.rpc::rpc-loadwallet node '("w"))
             (let ((wallet3 (%wc-wallet node "w")))
               (is (= 5 (hash-table-count
-                        (bitcoin-lisp.rpc::wallet-map-wallet wallet3))))
-              (is (= 106 (bitcoin-lisp.rpc::wallet-last-block-height wallet3)))
+                        (bl.rpc::wallet-map-wallet wallet3))))
+              (is (= 106 (bl.rpc::wallet-last-block-height wallet3)))
               ;; The pre-crash coinbase is still tracked and confirmed.
-              (let ((wtx (bitcoin-lisp.rpc::wallet-get-wallet-tx wallet3 cb-txid)))
-                (is (eq :confirmed (bitcoin-lisp.rpc::wallet-tx-state wtx)))
-                (is (= 1 (bitcoin-lisp.rpc::wallet-tx-block-height wtx))))
+              (let ((wtx (bl.rpc::wallet-get-wallet-tx wallet3 cb-txid)))
+                (is (eq :confirmed (bl.rpc::wallet-tx-state wtx)))
+                (is (= 1 (bl.rpc::wallet-tx-block-height wtx))))
               ;; And the catch-up blocks' coinbases are listed too:
               ;; cb@1 (generate) + tx1 (receive) + 3 immature coinbases.
-              (let ((entries (bitcoin-lisp.rpc::rpc-listtransactions node '("*" 20))))
+              (let ((entries (bl.rpc::rpc-listtransactions node '("*" 20))))
                 (is (= 5 (length entries)))))))))))
 
 ;;;; ============================================================
@@ -508,28 +508,28 @@ connect hook does live. Returns the index."
                                        (get-universal-time)
                                        (incf *wallet-chain-counter*))
                                (uiop:temporary-directory)))
-         (bfi (bitcoin-lisp.storage:init-blockfilterindex dir))
-         (state (bitcoin-lisp::node-chain-state node))
-         (store (bitcoin-lisp::node-block-store node)))
-    (loop for h from 0 to (bitcoin-lisp.storage:current-height state)
-          for entry = (bitcoin-lisp.storage:get-block-at-height state h)
+         (bfi (bl.store:init-blockfilterindex dir))
+         (state (bl::node-chain-state node))
+         (store (bl::node-block-store node)))
+    (loop for h from 0 to (bl.store:current-height state)
+          for entry = (bl.store:get-block-at-height state h)
           when entry
-            do (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
-                      (blk (bitcoin-lisp.storage:get-block store hash)))
+            do (let* ((hash (bl.store:block-index-entry-hash entry))
+                      (blk (bl.store:get-block store hash)))
                  (when blk
                    ;; Coinbase-only blocks spend nothing, so an empty
                    ;; spent-utxo set is the correct input here.
-                   (bitcoin-lisp.storage:blockfilterindex-add-block
+                   (bl.store:blockfilterindex-add-block
                     bfi blk hash h '()))))
-    (setf (bitcoin-lisp::node-blockfilterindex node) bfi)
+    (setf (bl::node-blockfilterindex node) bfi)
     bfi))
 
 (defun %wc-total-end-range (wallet)
   "Sum of every spkm's GetEndRange — grows only when scripts are actually
 cached, so a test asserting growth cannot be satisfied by a no-op top-up."
   (let ((total 0))
-    (loop for spkm being the hash-values of (bitcoin-lisp.rpc::wallet-spkms wallet)
-          do (incf total (bitcoin-lisp.rpc::%spkm-end-range spkm)))
+    (loop for spkm being the hash-values of (bl.rpc::wallet-spkms wallet)
+          do (incf total (bl.rpc::%spkm-end-range spkm)))
     total))
 
 (test g7-38-fast-rescan-matches-slow-rescan
@@ -544,20 +544,20 @@ wallet-attach-chain persist a stale best block."
            (wname "g738w"))
       (unwind-protect
            (progn
-             (bitcoin-lisp.rpc::rpc-createwallet node (list wname))
+             (bl.rpc::rpc-createwallet node (list wname))
              (let ((wallet (%wc-wallet node wname)))
                ;; Blocks that have nothing to do with this wallet.
                (%wc-mine node 6 (%wc-optrue-address))
-               (let ((tip (bitcoin-lisp.storage:current-height
-                           (bitcoin-lisp::node-chain-state node))))
+               (let ((tip (bl.store:current-height
+                           (bl::node-chain-state node))))
                  ;; SLOW path first: no filter index on the node.
-                 (setf (bitcoin-lisp::node-blockfilterindex node) nil)
+                 (setf (bl::node-blockfilterindex node) nil)
                  (multiple-value-bind (s-status s-height s-hash s-skipped)
-                     (bitcoin-lisp.rpc::scan-for-wallet-transactions
+                     (bl.rpc::scan-for-wallet-transactions
                       node wallet
-                      (bitcoin-lisp.storage:block-index-entry-hash
-                       (bitcoin-lisp.storage:get-block-at-height
-                        (bitcoin-lisp::node-chain-state node) 0))
+                      (bl.store:block-index-entry-hash
+                       (bl.store:get-block-at-height
+                        (bl::node-chain-state node) 0))
                       0)
                    (is (eq :success s-status))
                    (is (= tip s-height) "slow path must reach the tip")
@@ -565,11 +565,11 @@ wallet-attach-chain persist a stale best block."
                    ;; FAST path: same scan, filters available.
                    (%wc-build-filter-index node)
                    (multiple-value-bind (f-status f-height f-hash f-skipped)
-                       (bitcoin-lisp.rpc::scan-for-wallet-transactions
+                       (bl.rpc::scan-for-wallet-transactions
                         node wallet
-                        (bitcoin-lisp.storage:block-index-entry-hash
-                         (bitcoin-lisp.storage:get-block-at-height
-                          (bitcoin-lisp::node-chain-state node) 0))
+                        (bl.store:block-index-entry-hash
+                         (bl.store:get-block-at-height
+                          (bl::node-chain-state node) 0))
                         0)
                      (is (plusp f-skipped)
                          "the fast path must actually skip blocks, else this test is vacuous")
@@ -579,8 +579,8 @@ wallet-attach-chain persist a stale best block."
                      (is (equalp s-hash f-hash)
                          "last-scanned hash must be identical"))))))
         (ignore-errors
-         (bitcoin-lisp.rpc:close-wallet-manager
-          (bitcoin-lisp::node-wallet-manager node)))))))
+         (bl.rpc:close-wallet-manager
+          (bl::node-wallet-manager node)))))))
 
 (test g7-38-missing-filter-falls-back-per-block
   "G7-38: a block with NO stored filter must be inspected, not skipped (Core
@@ -592,26 +592,26 @@ because our index can contain holes below its best marker."
            (wname "g738bw"))
       (unwind-protect
            (progn
-             (bitcoin-lisp.rpc::rpc-createwallet node (list wname))
+             (bl.rpc::rpc-createwallet node (list wname))
              (let ((wallet (%wc-wallet node wname)))
                (%wc-mine node 3 (%wc-optrue-address))
                (let ((bfi (%wc-build-filter-index node))
-                     (state (bitcoin-lisp::node-chain-state node)))
+                     (state (bl::node-chain-state node)))
                  ;; A height that IS indexed => a real verdict.
-                 (let ((h1 (bitcoin-lisp.storage:block-index-entry-hash
-                            (bitcoin-lisp.storage:get-block-at-height state 1))))
-                   (is (member (bitcoin-lisp.rpc::%rescan-filter-matches-block
-                                bfi (bitcoin-lisp.rpc::%make-wallet-rescan-filter wallet) h1)
+                 (let ((h1 (bl.store:block-index-entry-hash
+                            (bl.store:get-block-at-height state 1))))
+                   (is (member (bl.rpc::%rescan-filter-matches-block
+                                bfi (bl.rpc::%make-wallet-rescan-filter wallet) h1)
                                '(:match :no-match))))
                  ;; A hash with no stored filter => :unknown, so the caller reads it.
                  (is (eq :unknown
-                         (bitcoin-lisp.rpc::%rescan-filter-matches-block
-                          bfi (bitcoin-lisp.rpc::%make-wallet-rescan-filter wallet)
+                         (bl.rpc::%rescan-filter-matches-block
+                          bfi (bl.rpc::%make-wallet-rescan-filter wallet)
                           (make-array 32 :element-type '(unsigned-byte 8)
                                          :initial-element 99)))))))
         (ignore-errors
-         (bitcoin-lisp.rpc:close-wallet-manager
-          (bitcoin-lisp::node-wallet-manager node)))))))
+         (bl.rpc:close-wallet-manager
+          (bl::node-wallet-manager node)))))))
 
 (test g7-38-filter-set-is-the-ismine-set-and-grows-with-topup
   "G7-38: the query set must be exactly the wallet's IsMine script set, and
@@ -623,31 +623,31 @@ range-end and NOT next-index."
            (wname "g738cw"))
       (unwind-protect
            (progn
-             (bitcoin-lisp.rpc::rpc-createwallet node (list wname))
+             (bl.rpc::rpc-createwallet node (list wname))
              (let* ((wallet (%wc-wallet node wname))
-                    (rf (bitcoin-lisp.rpc::%make-wallet-rescan-filter wallet))
-                    (initial (length (bitcoin-lisp.rpc::rescan-filter-scripts rf))))
+                    (rf (bl.rpc::%make-wallet-rescan-filter wallet))
+                    (initial (length (bl.rpc::rescan-filter-scripts rf))))
                (is (plusp initial) "a funded-capable wallet has scripts")
                ;; Every script in the set must be IsMine, and every IsMine
                ;; script must be in the set.
                (let ((ismine-count 0))
                  (loop for spkm being the hash-values
-                         of (bitcoin-lisp.rpc::wallet-spkms wallet)
+                         of (bl.rpc::wallet-spkms wallet)
                        do (incf ismine-count
                                 (hash-table-count
-                                 (bitcoin-lisp.rpc::desc-spkm-script-map spkm))))
+                                 (bl.rpc::desc-spkm-script-map spkm))))
                  (is (= ismine-count initial)
                      "filter set size must equal the IsMine script count"))
                ;; Force real expansion: hand out enough addresses that the
                ;; keypool tops up and max-cached-index grows. A top-up that
                ;; does not grow max-cached-index would make this vacuous.
                (let ((before (%wc-total-end-range wallet)))
-                 (dotimes (i 8) (bitcoin-lisp.rpc::rpc-getnewaddress node '()))
+                 (dotimes (i 8) (bl.rpc::rpc-getnewaddress node '()))
                  (is (> (%wc-total-end-range wallet) before)
                      "precondition: handing out addresses must grow max-cached-index"))
-               (bitcoin-lisp.rpc::%rescan-filter-update-if-needed wallet rf)
-               (is (> (length (bitcoin-lisp.rpc::rescan-filter-scripts rf)) initial)
+               (bl.rpc::%rescan-filter-update-if-needed wallet rf)
+               (is (> (length (bl.rpc::rescan-filter-scripts rf)) initial)
                    "UpdateIfNeeded must fold in the newly cached scripts")))
         (ignore-errors
-         (bitcoin-lisp.rpc:close-wallet-manager
-          (bitcoin-lisp::node-wallet-manager node)))))))
+         (bl.rpc:close-wallet-manager
+          (bl::node-wallet-manager node)))))))

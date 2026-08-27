@@ -144,8 +144,8 @@ transaction being built?
 A satisfier that says yes when it is not produces a witness for a branch the
 transaction cannot yet take — Core makes such a branch INVALID rather than
 merely expensive, so that the size comparison never picks it."
-  (let ((tx-locktime (bitcoin-lisp.serialization:transaction-lock-time tx))
-        (inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
+  (let ((tx-locktime (bl.ser:transaction-lock-time tx))
+        (inputs (bl.ser:transaction-inputs tx)))
     (and
      ;; Compare apples to apples: both heights, or both timestamps.
      (or (and (< tx-locktime +ms-locktime-threshold+)
@@ -157,19 +157,19 @@ merely expensive, so that the size comparison never picks it."
      ;; treat CLTV as satisfied when the input would disable it.
      (< input-index (length inputs))
      (/= +ms-sequence-final+
-         (bitcoin-lisp.serialization:tx-in-sequence (aref inputs input-index)))
+         (bl.ser:tx-in-sequence (aref inputs input-index)))
      t)))
 
 (defun ms-check-older (tx input-index value)
   "Core's CheckSequence (interpreter.cpp:1781-1826), which is what a satisfier
 answers for `older(VALUE)': is this relative timelock already satisfied by the
 input's own nSequence?"
-  (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
+  (let ((inputs (bl.ser:transaction-inputs tx)))
     (and
      (< input-index (length inputs))
      ;; BIP68 only applies from version 2.
-     (>= (bitcoin-lisp.serialization:transaction-version tx) 2)
-     (let ((seq (bitcoin-lisp.serialization:tx-in-sequence
+     (>= (bl.ser:transaction-version tx) 2)
+     (let ((seq (bl.ser:tx-in-sequence
                  (aref inputs input-index))))
        (and
         ;; A sequence with the disable bit set is not consensus-constrained,
@@ -498,7 +498,7 @@ not something applied afterwards."
         ;; so the key itself is not in it. Hashing again would be wrong.
         (:pk-h (%ms-cat +op-dup+ +op-hash160+
                         (%ms-push-data (or (ms-node-data node)
-                                           (bitcoin-lisp.crypto:hash160
+                                           (bl.crypto:hash160
                                             (pk (first (ms-node-keys node))))))
                         +op-equalverify+))
         (:older (%ms-cat (%ms-push-number (ms-node-k node)) +ms-op-checksequenceverify+))
@@ -1059,7 +1059,7 @@ but a node whose type is zero."))
   (unless (and (= (length string) (* 2 expected-bytes))
                (every (lambda (c) (digit-char-p c 16)) string))
     (%ms-fail "~A must be ~D hex characters, got ~S" what (* 2 expected-bytes) string))
-  (bitcoin-lisp.crypto:hex-to-bytes string))
+  (bl.crypto:hex-to-bytes string))
 
 (defun %ms-parse-number (string what)
   (let ((n (handler-case (parse-integer string) (error () nil))))
@@ -1215,7 +1215,7 @@ expression shares it."
 ;;;; --- Rendering (miniscript.h:890-995) ------------------------------------
 
 (defun %ms-identity-key-string (key)
-  (if (stringp key) key (string-downcase (bitcoin-lisp.crypto:bytes-to-hex key))))
+  (if (stringp key) key (string-downcase (bl.crypto:bytes-to-hex key))))
 
 (defun %ms-key-or-hash-string (node key-fn)
   "How to name a pk_h's subject. A parsed node holds the key; an INFERRED one
@@ -1223,7 +1223,7 @@ holds only the 20-byte hash the script committed to, because the key is not in
 the script. Printing the hash is what Core's inference does too — it is the
 most that can honestly be said about the script."
   (if (ms-node-data node)
-      (string-downcase (bitcoin-lisp.crypto:bytes-to-hex (ms-node-data node)))
+      (string-downcase (bl.crypto:bytes-to-hex (ms-node-data node)))
       (funcall key-fn (first (ms-node-keys node)))))
 
 (defun ms-node-to-string (node &optional (key-fn #'%ms-identity-key-string) wrapped)
@@ -1279,7 +1279,7 @@ run of wrappers needs only one colon."
            (:after (format nil "~Aafter(~D)" prefix (ms-node-k node)))
            ((:sha256 :hash256 :ripemd160 :hash160)
             (format nil "~A~(~A~)(~A)" prefix (ms-node-fragment node)
-                    (string-downcase (bitcoin-lisp.crypto:bytes-to-hex (ms-node-data node)))))
+                    (string-downcase (bl.crypto:bytes-to-hex (ms-node-data node)))))
            (:and-b (format nil "~Aand_b(~A,~A)" prefix (sub 0) (sub 1)))
            (:or-b (format nil "~Aor_b(~A,~A)" prefix (sub 0) (sub 1)))
            (:or-c (format nil "~Aor_c(~A,~A)" prefix (sub 0) (sub 1)))

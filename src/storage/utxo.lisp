@@ -227,30 +227,30 @@ hash_serialized_3 — never on the inv/validate hot path."
 
 (defun write-utxo-entry-fields (stream entry)
   "Write the fields of a utxo-entry to STREAM: value, height, coinbase, script."
-  (bitcoin-lisp.serialization:write-int64-le stream (utxo-entry-value entry))
-  (bitcoin-lisp.serialization:write-uint32-le stream (utxo-entry-height entry))
+  (bl.ser:write-int64-le stream (utxo-entry-value entry))
+  (bl.ser:write-uint32-le stream (utxo-entry-height entry))
   (write-byte (if (utxo-entry-coinbase entry) 1 0) stream)
   (let ((script (utxo-entry-script-pubkey entry)))
-    (bitcoin-lisp.serialization:write-uint32-le stream (length script))
+    (bl.ser:write-uint32-le stream (length script))
     (write-sequence script stream)))
 
 (declaim (inline bb-write-utxo-entry-fields))
 (defun bb-write-utxo-entry-fields (bb entry)
   "Write utxo-entry fields directly into byte-buf BB. Hot path: called
 1.2M+ times during save-utxo-set."
-  (bitcoin-lisp.serialization:bb-write-i64-le bb (utxo-entry-value entry))
-  (bitcoin-lisp.serialization:bb-write-u32-le bb (utxo-entry-height entry))
-  (bitcoin-lisp.serialization:bb-write-u8 bb (if (utxo-entry-coinbase entry) 1 0))
+  (bl.ser:bb-write-i64-le bb (utxo-entry-value entry))
+  (bl.ser:bb-write-u32-le bb (utxo-entry-height entry))
+  (bl.ser:bb-write-u8 bb (if (utxo-entry-coinbase entry) 1 0))
   (let ((script (utxo-entry-script-pubkey entry)))
-    (bitcoin-lisp.serialization:bb-write-u32-le bb (length script))
-    (bitcoin-lisp.serialization:bb-write-bytes bb script)))
+    (bl.ser:bb-write-u32-le bb (length script))
+    (bl.ser:bb-write-bytes bb script)))
 
 (defun read-utxo-entry-fields (stream)
   "Read utxo-entry fields from STREAM. Returns a utxo-entry."
-  (let* ((value (bitcoin-lisp.serialization:read-int64-le stream))
-         (height (bitcoin-lisp.serialization:read-uint32-le stream))
+  (let* ((value (bl.ser:read-int64-le stream))
+         (height (bl.ser:read-uint32-le stream))
          (coinbase (= (read-byte stream) 1))
-         (script-len (bitcoin-lisp.serialization:read-uint32-le stream))
+         (script-len (bl.ser:read-uint32-le stream))
          (script (make-array script-len :element-type '(unsigned-byte 8))))
     (read-sequence script stream)
     (make-utxo-entry :value value
@@ -346,16 +346,16 @@ must NOT call bb-finish."
                          :direction :output
                          :if-exists :supersede
                          :element-type '(unsigned-byte 8))
-      (let* ((bb (bitcoin-lisp.serialization:make-byte-buf))
+      (let* ((bb (bl.ser:make-byte-buf))
              (digest (ironclad:make-digest :crc32))
              (flush-fn
                (lambda ()
-                 (let ((n (bitcoin-lisp.serialization:bb-pos bb)))
+                 (let ((n (bl.ser:bb-pos bb)))
                    (when (> n 0)
-                     (let ((data (bitcoin-lisp.serialization:bb-data bb)))
+                     (let ((data (bl.ser:bb-data bb)))
                        (ironclad:update-digest digest data :end n)
                        (write-sequence data out :end n)
-                       (setf (bitcoin-lisp.serialization:bb-pos bb) 0)))))))
+                       (setf (bl.ser:bb-pos bb) 0)))))))
         (funcall bb-fn bb flush-fn)
         (funcall flush-fn)
         (write-sequence (ironclad:produce-digest digest) out)
@@ -373,9 +373,9 @@ that dominated CPU on UTXO/state flushes."
                                  :type (concatenate 'string
                                                     (or (pathname-type path) "dat")
                                                     ".tmp"))))
-    (let* ((bb (bitcoin-lisp.serialization:make-byte-buf))
+    (let* ((bb (bl.ser:make-byte-buf))
            (_ (funcall bb-fn bb))
-           (all-bytes (bitcoin-lisp.serialization:bb-finish bb)))
+           (all-bytes (bl.ser:bb-finish bb)))
       (declare (ignore _))
       (with-open-file (out tmp-path
                            :direction :output
@@ -444,19 +444,19 @@ exhausted the heap during a single contiguous allocation."
   (save-file-with-crc32-streaming-bb
    path
    (lambda (bb flush-fn)
-     (bitcoin-lisp.serialization:bb-write-bytes bb *utxo-magic*)
-     (bitcoin-lisp.serialization:bb-write-u32-le bb +utxo-format-version+)
-     (bitcoin-lisp.serialization:bb-write-u32-le
+     (bl.ser:bb-write-bytes bb *utxo-magic*)
+     (bl.ser:bb-write-u32-le bb +utxo-format-version+)
+     (bl.ser:bb-write-u32-le
       bb (hash-table-count (utxo-set-entries utxo-set)))
      (maphash (lambda (key entry)
                 (declare (type utxo-key key))
-                (bitcoin-lisp.serialization:bb-write-u64-le bb (uk-a key))
-                (bitcoin-lisp.serialization:bb-write-u64-le bb (uk-b key))
-                (bitcoin-lisp.serialization:bb-write-u64-le bb (uk-c key))
-                (bitcoin-lisp.serialization:bb-write-u64-le bb (uk-d key))
-                (bitcoin-lisp.serialization:bb-write-u32-le bb (uk-vout key))
+                (bl.ser:bb-write-u64-le bb (uk-a key))
+                (bl.ser:bb-write-u64-le bb (uk-b key))
+                (bl.ser:bb-write-u64-le bb (uk-c key))
+                (bl.ser:bb-write-u64-le bb (uk-d key))
+                (bl.ser:bb-write-u32-le bb (uk-vout key))
                 (bb-write-utxo-entry-fields bb entry)
-                (when (>= (bitcoin-lisp.serialization:bb-pos bb)
+                (when (>= (bl.ser:bb-pos bb)
                           +utxo-save-flush-threshold+)
                   (funcall flush-fn)))
               (utxo-set-entries utxo-set))))
@@ -502,13 +502,13 @@ Returns T if loaded, NIL if file does not exist or is corrupted."
 (defun load-utxo-set-legacy (utxo-set file-bytes)
   "Load UTXO set from old format (no magic, no checksum)."
   (flexi-streams:with-input-from-sequence (stream file-bytes)
-    (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
+    (let ((count (bl.ser:read-uint32-le stream))
           (entries (utxo-set-entries utxo-set))
           (txid-buf (make-array 32 :element-type '(unsigned-byte 8))))
       (clrhash entries)
       (dotimes (i count)
         (read-sequence txid-buf stream)
-        (let* ((vout (bitcoin-lisp.serialization:read-uint32-le stream))
+        (let* ((vout (bl.ser:read-uint32-le stream))
                (key (make-utxo-key txid-buf vout)))
           (setf (gethash key entries) (read-utxo-entry-fields stream))))))
   (setf (utxo-set-dirty utxo-set) nil)
@@ -534,19 +534,19 @@ Returns T if loaded, NIL if file does not exist or is corrupted."
     (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
       (read-sequence magic stream))
     ;; Check version
-    (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
+    (let ((version (bl.ser:read-uint32-le stream)))
       (unless (= version +utxo-format-version+)
         (format *error-output* "WARNING: UTXO file version ~D not supported (expected ~D)~%"
                 version +utxo-format-version+)
         (return-from load-utxo-set-v1 nil)))
     ;; Read entries
-    (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
+    (let ((count (bl.ser:read-uint32-le stream))
           (entries (utxo-set-entries utxo-set))
           (txid-buf (make-array 32 :element-type '(unsigned-byte 8))))
       (clrhash entries)
       (dotimes (i count)
         (read-sequence txid-buf stream)
-        (let* ((vout (bitcoin-lisp.serialization:read-uint32-le stream))
+        (let* ((vout (bl.ser:read-uint32-le stream))
                (key (make-utxo-key txid-buf vout)))
           (setf (gethash key entries) (read-utxo-entry-fields stream))))))
   (setf (utxo-set-dirty utxo-set) nil)

@@ -21,8 +21,8 @@
 (ensure-directories-exist *test-dir*)
 
 ;; Enable console output
-(setf bitcoin-lisp:*log-stream* *standard-output*)
-(setf bitcoin-lisp::*current-log-level* :info)
+(setf bl:*log-stream* *standard-output*)
+(setf bl::*current-log-level* :info)
 
 (format t "~%========================================~%")
 (format t "Testnet Sync Resume Test~%")
@@ -35,22 +35,22 @@
 (format t "=== PHASE 1: Initial sync to 500 blocks ===~%")
 (force-output)
 
-(bitcoin-lisp:start-node :data-directory *test-dir*
+(bl:start-node :data-directory *test-dir*
                           :network :testnet
                           :sync nil
                           :log-level :info)
 
 (format t "Connecting to peers...~%")
 (force-output)
-(bitcoin-lisp::connect-to-peers bitcoin-lisp:*node* 4 :timeout 30 :min-peers 1)
+(bl::connect-to-peers bl:*node* 4 :timeout 30 :min-peers 1)
 
-(defparameter *peer-count* (length (bitcoin-lisp::node-peers bitcoin-lisp:*node*)))
+(defparameter *peer-count* (length (bl::node-peers bl:*node*)))
 (format t "Connected to ~D peers~%" *peer-count*)
 (force-output)
 
 (when (zerop *peer-count*)
   (format t "~%ERROR: No peers connected. Exiting.~%")
-  (bitcoin-lisp:stop-node)
+  (bl:stop-node)
   (sb-ext:exit :code 1))
 
 ;; Start sync in background thread
@@ -58,7 +58,7 @@
   (sb-thread:make-thread
    (lambda ()
      (handler-case
-         (bitcoin-lisp::sync-blockchain bitcoin-lisp:*node*)
+         (bl::sync-blockchain bl:*node*)
        (error (e)
          (format t "Sync error: ~A~%" e))))
    :name "sync-thread"))
@@ -69,16 +69,16 @@
 
 (loop
   (sleep 5)
-  (let ((height (bitcoin-lisp.storage:current-height
-                 (bitcoin-lisp::node-chain-state bitcoin-lisp:*node*))))
+  (let ((height (bl.store:current-height
+                 (bl::node-chain-state bl:*node*))))
     (format t "  Current height: ~D~%" height)
     (force-output)
     (when (>= height 200)
       (return))))
 
 (defparameter *phase1-height*
-  (bitcoin-lisp.storage:current-height
-   (bitcoin-lisp::node-chain-state bitcoin-lisp:*node*)))
+  (bl.store:current-height
+   (bl::node-chain-state bl:*node*)))
 
 (format t "~%Phase 1 complete. Stopping at height ~D~%" *phase1-height*)
 (force-output)
@@ -86,7 +86,7 @@
 ;; Stop the node (this should persist state)
 (format t "Stopping node...~%")
 (force-output)
-(bitcoin-lisp:stop-node)
+(bl:stop-node)
 
 ;; Wait for sync thread to finish
 (sb-thread:join-thread *sync-thread* :default nil :timeout 5)
@@ -113,14 +113,14 @@
 (format t "Starting node again...~%")
 (force-output)
 
-(bitcoin-lisp:start-node :data-directory *test-dir*
+(bl:start-node :data-directory *test-dir*
                           :network :testnet
                           :sync nil
                           :log-level :info)
 
 (defparameter *phase2-start-height*
-  (bitcoin-lisp.storage:current-height
-   (bitcoin-lisp::node-chain-state bitcoin-lisp:*node*)))
+  (bl.store:current-height
+   (bl::node-chain-state bl:*node*)))
 
 (format t "~%Restart complete. Starting height: ~D~%" *phase2-start-height*)
 (force-output)
@@ -133,7 +133,7 @@
    (format t "Expected to resume from ~D~%" *phase1-height*)
    (format t "========================================~%")
    (force-output)
-   (bitcoin-lisp:stop-node)
+   (bl:stop-node)
    (sb-ext:exit :code 1))
 
   ((< *phase2-start-height* (- *phase1-height* 10))
@@ -143,7 +143,7 @@
    (format t "Phase 2 started at: ~D~%" *phase2-start-height*)
    (format t "========================================~%")
    (force-output)
-   (bitcoin-lisp:stop-node)
+   (bl:stop-node)
    (sb-ext:exit :code 1))
 
   (t
@@ -155,9 +155,9 @@
 ;; Continue syncing to verify we can build on resumed state
 (format t "~%Connecting to peers to continue sync...~%")
 (force-output)
-(bitcoin-lisp::connect-to-peers bitcoin-lisp:*node* 4 :timeout 30 :min-peers 1)
+(bl::connect-to-peers bl:*node* 4 :timeout 30 :min-peers 1)
 
-(setf *peer-count* (length (bitcoin-lisp::node-peers bitcoin-lisp:*node*)))
+(setf *peer-count* (length (bl::node-peers bl:*node*)))
 (format t "Connected to ~D peers~%" *peer-count*)
 (force-output)
 
@@ -170,7 +170,7 @@
     (sb-thread:make-thread
      (lambda ()
        (handler-case
-           (bitcoin-lisp::sync-blockchain bitcoin-lisp:*node*)
+           (bl::sync-blockchain bl:*node*)
          (error (e)
            (format t "Sync error: ~A~%" e))))
      :name "sync-thread-2"))
@@ -178,16 +178,16 @@
   ;; Wait for 100 more blocks
   (loop
     (sleep 5)
-    (let ((height (bitcoin-lisp.storage:current-height
-                   (bitcoin-lisp::node-chain-state bitcoin-lisp:*node*))))
+    (let ((height (bl.store:current-height
+                   (bl::node-chain-state bl:*node*))))
       (format t "  Current height: ~D~%" height)
       (force-output)
       (when (>= height (+ *phase2-start-height* 100))
         (return)))))
 
 (defparameter *final-height*
-  (bitcoin-lisp.storage:current-height
-   (bitcoin-lisp::node-chain-state bitcoin-lisp:*node*)))
+  (bl.store:current-height
+   (bl::node-chain-state bl:*node*)))
 
 (format t "~%========================================~%")
 (format t "TEST PASSED: Sync Resume Verified~%")
@@ -199,5 +199,5 @@
 (format t "========================================~%")
 (force-output)
 
-(bitcoin-lisp:stop-node)
+(bl:stop-node)
 (sb-ext:exit :code 0)

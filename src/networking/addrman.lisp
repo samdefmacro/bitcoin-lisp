@@ -72,7 +72,7 @@ secret, source-group spreading, and test-before-evict tried promotion."
   (dirty nil :type boolean))
 
 (defun ab-now ()
-  (bitcoin-lisp.serialization:get-unix-time))
+  (bl.ser:get-unix-time))
 
 (declaim (inline bucket-slot))
 (defun bucket-slot (bucket pos)
@@ -96,7 +96,7 @@ consistency matters (the key is a per-node secret), not byte-compat with Core."
     (dolist (p parts)
       (replace buf p :start1 off)
       (incf off (length p)))
-    (let ((h (bitcoin-lisp.crypto:hash256 buf)))
+    (let ((h (bl.crypto:hash256 buf)))
       (logior (aref h 0) (ash (aref h 1) 8) (ash (aref h 2) 16) (ash (aref h 3) 24)
               (ash (aref h 4) 32) (ash (aref h 5) 40) (ash (aref h 6) 48)
               (ash (aref h 7) 56)))))
@@ -674,11 +674,11 @@ up to +addrman-new-buckets-per-address+ buckets)."
            (coerce
             (flexi-streams:with-output-to-sequence (s)
               (write-sequence +addrman-magic+ s)
-              (bitcoin-lisp.serialization:write-uint32-le s +addrman-format-version+)
+              (bl.ser:write-uint32-le s +addrman-format-version+)
               (write-sequence (address-book-key book) s)
-              (bitcoin-lisp.serialization:write-uint32-le s (address-book-n-new book))
-              (bitcoin-lisp.serialization:write-uint32-le s (address-book-n-tried book))
-              (bitcoin-lisp.serialization:write-uint32-le
+              (bl.ser:write-uint32-le s (address-book-n-new book))
+              (bl.ser:write-uint32-le s (address-book-n-tried book))
+              (bl.ser:write-uint32-le
                s (hash-table-count (address-book-info book)))
               (let ((id-buckets (%new-table-buckets book)))
               (maphash
@@ -690,11 +690,11 @@ up to +addrman-new-buckets-per-address+ buckets)."
                  (write-sequence (peer-address-ip pa) s)
                  (write-byte (ldb (byte 8 8) (peer-address-port pa)) s)
                  (write-byte (ldb (byte 8 0) (peer-address-port pa)) s)
-                 (bitcoin-lisp.serialization:write-uint64-le s (peer-address-services pa))
-                 (bitcoin-lisp.serialization:write-uint32-le s (peer-address-last-seen pa))
-                 (bitcoin-lisp.serialization:write-uint32-le s (peer-address-last-attempt pa))
-                 (bitcoin-lisp.serialization:write-uint32-le s (peer-address-last-success pa))
-                 (bitcoin-lisp.serialization:write-uint32-le s (peer-address-n-attempts pa))
+                 (bl.ser:write-uint64-le s (peer-address-services pa))
+                 (bl.ser:write-uint32-le s (peer-address-last-seen pa))
+                 (bl.ser:write-uint32-le s (peer-address-last-attempt pa))
+                 (bl.ser:write-uint32-le s (peer-address-last-success pa))
+                 (bl.ser:write-uint32-le s (peer-address-n-attempts pa))
                  (let ((sg (or (peer-address-source-group pa) #())))
                    (write-byte (length sg) s)
                    (write-sequence sg s))
@@ -702,13 +702,13 @@ up to +addrman-new-buckets-per-address+ buckets)."
                  (let ((buckets (gethash id id-buckets)))
                    (write-byte (length buckets) s)
                    (dolist (b buckets)
-                     (bitcoin-lisp.serialization:write-uint16-le s b))))
+                     (bl.ser:write-uint16-le s b))))
                (address-book-info book))))
             '(simple-array (unsigned-byte 8) (*)))))
     (with-open-file (out tmp-path :direction :output :if-exists :supersede
                                   :element-type '(unsigned-byte 8))
       (write-sequence all-bytes out)
-      (write-sequence (bitcoin-lisp.storage:compute-crc32 all-bytes) out))
+      (write-sequence (bl.store:compute-crc32 all-bytes) out))
     (rename-file tmp-path path))
   (setf (address-book-dirty book) nil)
   t)
@@ -755,7 +755,7 @@ were loaded, NIL otherwise."
   ;; the ordinary case and feature_addrman.py greps for exactly that. Same shape
   ;; as the banlist gap: absence is a RESULT, not a reason to say nothing.
   (unless (probe-file path)
-    (bitcoin-lisp:log-info "Loaded 0 addresses from peers.dat")
+    (bl:log-info "Loaded 0 addresses from peers.dat")
     (return-from load-address-book nil))
   (flet ((backup ()
            (ignore-errors
@@ -772,24 +772,24 @@ were loaded, NIL otherwise."
               (backup) (return-from load-address-book nil))
             (let ((payload (subseq data 0 (- file-size 4)))
                   (stored-crc (subseq data (- file-size 4))))
-              (unless (equalp (bitcoin-lisp.storage:compute-crc32 payload) stored-crc)
-                (bitcoin-lisp:log-warn "peers.dat CRC32 mismatch; backing up to .bak")
+              (unless (equalp (bl.store:compute-crc32 payload) stored-crc)
+                (bl:log-warn "peers.dat CRC32 mismatch; backing up to .bak")
                 (backup) (return-from load-address-book nil))
               (flexi-streams:with-input-from-sequence (s payload)
                 (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
                   (read-sequence magic s)
                   (unless (equalp magic +addrman-magic+)
-                    (bitcoin-lisp:log-warn "peers.dat unknown format; backing up to .bak")
+                    (bl:log-warn "peers.dat unknown format; backing up to .bak")
                     (backup) (return-from load-address-book nil)))
-                (let ((version (bitcoin-lisp.serialization:read-uint32-le s)))
+                (let ((version (bl.ser:read-uint32-le s)))
                   (unless (member version '(2 3 4))
-                    (bitcoin-lisp:log-warn "peers.dat version ~D unsupported; backing up to .bak"
+                    (bl:log-warn "peers.dat version ~D unsupported; backing up to .bak"
                                            version)
                     (backup) (return-from load-address-book nil))
                 (read-sequence (address-book-key book) s)
-                (bitcoin-lisp.serialization:read-uint32-le s)  ; n-new (recomputed)
-                (bitcoin-lisp.serialization:read-uint32-le s)  ; n-tried (recomputed)
-                (let ((count (bitcoin-lisp.serialization:read-uint32-le s)))
+                (bl.ser:read-uint32-le s)  ; n-new (recomputed)
+                (bl.ser:read-uint32-le s)  ; n-tried (recomputed)
+                (let ((count (bl.ser:read-uint32-le s)))
                   (dotimes (i count)
                     (let* ((tried-p (= 1 (read-byte s)))
                            ;; v4: net-id + length-prefixed address; v2/v3:
@@ -802,18 +802,18 @@ were loaded, NIL otherwise."
                            (ip (make-array ip-len :element-type '(unsigned-byte 8))))
                       (read-sequence ip s)
                       (let* ((port (logior (ash (read-byte s) 8) (read-byte s)))
-                             (services (bitcoin-lisp.serialization:read-uint64-le s))
-                             (last-seen (bitcoin-lisp.serialization:read-uint32-le s))
-                             (last-attempt (bitcoin-lisp.serialization:read-uint32-le s))
-                             (last-success (bitcoin-lisp.serialization:read-uint32-le s))
-                             (n-attempts (bitcoin-lisp.serialization:read-uint32-le s))
+                             (services (bl.ser:read-uint64-le s))
+                             (last-seen (bl.ser:read-uint32-le s))
+                             (last-attempt (bl.ser:read-uint32-le s))
+                             (last-success (bl.ser:read-uint32-le s))
+                             (n-attempts (bl.ser:read-uint32-le s))
                              (sg-len (read-byte s))
                              (sg (make-array sg-len :element-type '(unsigned-byte 8))))
                         (read-sequence sg s)
                         (let ((new-buckets
                                 (when (>= version 3)
                                   (loop repeat (read-byte s)
-                                        collect (bitcoin-lisp.serialization:read-uint16-le s)))))
+                                        collect (bl.ser:read-uint16-le s)))))
                           (ab-load-entry book tried-p net ip port services last-seen
                                          last-attempt last-success n-attempts sg
                                          new-buckets)))))
@@ -823,12 +823,12 @@ were loaded, NIL otherwise."
                   ;; count is the same, the sentence was not. The tried count
                   ;; moves to its own line rather than being dropped: it is
                   ;; genuinely useful and Core simply does not report it.
-                  (bitcoin-lisp:log-info "Loaded ~D addresses from peers.dat"
+                  (bl:log-info "Loaded ~D addresses from peers.dat"
                                          (address-book-count book))
-                  (bitcoin-lisp:log-cat "net" "  (~D of them tried)"
+                  (bl:log-cat "net" "  (~D of them tried)"
                                          (address-book-n-tried book))
                   (> count 0)))))))
       (error (c)
-        (bitcoin-lisp:log-warn "Failed to load peers.dat (~A); backing up to .bak" c)
+        (bl:log-warn "Failed to load peers.dat (~A); backing up to .bak" c)
         (backup)
         nil))))

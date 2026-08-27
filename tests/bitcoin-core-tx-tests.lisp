@@ -67,21 +67,21 @@ test. Names the engine doesn't query are inert.")
 Uses verify-script which follows Bitcoin Core's VerifyScript flow."
   (let* ((script-pubkey-asm (third prevout-data))
          (amount (if (>= (length prevout-data) 4) (fourth prevout-data) 0))
-         (input (elt (bitcoin-lisp.serialization:transaction-inputs tx) input-index))
+         (input (elt (bl.ser:transaction-inputs tx) input-index))
          (pubkey-bytes (assemble-script (strip-op-prefix script-pubkey-asm)))
-         (sig-bytes (bitcoin-lisp.serialization:tx-in-script-sig input))
-         (witness-stack (when (bitcoin-lisp.serialization:transaction-witness tx)
-                          (elt (bitcoin-lisp.serialization:transaction-witness tx) input-index)))
-         (bitcoin-lisp.coalton.interop:*current-tx* tx)
-         (bitcoin-lisp.coalton.interop:*current-input-index* input-index)
-         (bitcoin-lisp.coalton.interop:*witness-input-amount* (or amount 0)))
-    (bitcoin-lisp.coalton.interop:set-script-flags flags)
+         (sig-bytes (bl.ser:tx-in-script-sig input))
+         (witness-stack (when (bl.ser:transaction-witness tx)
+                          (elt (bl.ser:transaction-witness tx) input-index)))
+         (bl.interop:*current-tx* tx)
+         (bl.interop:*current-input-index* input-index)
+         (bl.interop:*witness-input-amount* (or amount 0)))
+    (bl.interop:set-script-flags flags)
     (unwind-protect
-         (bitcoin-lisp.coalton.interop:verify-script
+         (bl.interop:verify-script
           sig-bytes pubkey-bytes
           :witness witness-stack
           :amount (or amount 0))
-      (bitcoin-lisp.coalton.interop:set-script-flags nil))))
+      (bl.interop:set-script-flags nil))))
 
 (defun validate-tx-inputs (tx prevouts flags)
   "Validate all inputs of TX against PREVOUTS using FLAGS."
@@ -104,8 +104,8 @@ Uses verify-script which follows Bitcoin Core's VerifyScript flow."
           (parse-tx-test-case test-case)
         (when prevouts
           (handler-case
-              (let* ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes tx-hex))
-                     (tx (bitcoin-lisp.serialization:parse-tx-payload tx-bytes)))
+              (let* ((tx-bytes (bl.crypto:hex-to-bytes tx-hex))
+                     (tx (bl.ser:parse-tx-payload tx-bytes)))
                 ;; tx_valid.json flags are EXCLUDED verifyFlags (Core
                 ;; transaction_tests.cpp): the vector must validate under
                 ;; every standard flag except the listed ones — the listed
@@ -134,12 +134,12 @@ Uses verify-script which follows Bitcoin Core's VerifyScript flow."
           (parse-tx-test-case test-case)
         (when prevouts
           (handler-case
-              (let* ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes tx-hex))
-                     (tx (bitcoin-lisp.serialization:parse-tx-payload tx-bytes)))
+              (let* ((tx-bytes (bl.crypto:hex-to-bytes tx-hex))
+                     (tx (bl.ser:parse-tx-payload tx-bytes)))
                 (let ((rejected nil))
                   (when (and flags (search "BADTX" flags))
                     (multiple-value-bind (valid err)
-                        (bitcoin-lisp.validation:validate-transaction-structure tx)
+                        (bl.val:validate-transaction-structure tx)
                       (declare (ignore err))
                       (unless valid
                         (incf passed)

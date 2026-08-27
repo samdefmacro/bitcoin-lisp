@@ -64,3 +64,6 @@
    ;; Empty-collection helpers (Core renders [] / {}, never null)
    #:json-array
    #:json-object))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp::install-package-nicknames))

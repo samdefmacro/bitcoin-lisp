@@ -4,12 +4,15 @@
            #:run-unit-tests
            #:run-integration-tests))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp::install-package-nicknames))
+
 (in-package #:bitcoin-lisp.tests)
 
 ;; Cluster mempool P3 shadow mode: run the WHOLE suite with full
 ;; mempool/txgraph equivalence assertions after every mempool mutation
 ;; (default NIL in production; see src/mempool/mempool.lisp).
-(setf bitcoin-lisp.mempool:*txgraph-shadow-checks* t)
+(setf bl.mp:*txgraph-shadow-checks* t)
 
 (defun %bytes (&rest contents)
   "A (simple-array (unsigned-byte 8)) of CONTENTS. Shared by every test file;

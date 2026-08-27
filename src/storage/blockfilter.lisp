@@ -108,8 +108,8 @@ mapping the 64-bit hash X uniformly into [0, N)."
 (defun block-filter-siphash-keys (block-hash)
   "Derive the GCS SipHash keys (values k0 k1) from a 32-byte BLOCK-HASH in
 internal (little-endian) byte order, as Core does via uint256::GetUint64."
-  (values (bitcoin-lisp.crypto:bytes-to-uint64-le block-hash 0)
-          (bitcoin-lisp.crypto:bytes-to-uint64-le block-hash 8)))
+  (values (bl.crypto:bytes-to-uint64-le block-hash 0)
+          (bl.crypto:bytes-to-uint64-le block-hash 8)))
 
 (defun %gcs-hashed-set (elements k0 k1 f)
   "Hash each ELEMENT (a byte vector) into [0, F) with SipHash-2-4 keyed by
@@ -119,7 +119,7 @@ K0/K1, returning the values sorted ascending (Core BuildHashedSet)."
     (loop for e in elements
           for i from 0
           do (setf (aref hs i)
-                   (gcs-fast-range (bitcoin-lisp.crypto:siphash-2-4 k0 k1 e) f)))
+                   (gcs-fast-range (bl.crypto:siphash-2-4 k0 k1 e) f)))
     (sort hs #'<)))
 
 (defun build-gcs-filter (elements k0 k1 &key (p +basic-filter-p+) (m +basic-filter-m+))
@@ -128,8 +128,8 @@ The result is CompactSize(N) followed by the Golomb-Rice coded delta stream of
 the sorted hashed set. Callers must deduplicate ELEMENTS first (N counts them)."
   (let* ((n (length elements))
          (f (* n m))
-         (out (bitcoin-lisp.bytes:make-byte-buf)))
-    (bitcoin-lisp.bytes:bb-write-varint out n)
+         (out (bl.bytes:make-byte-buf)))
+    (bl.bytes:bb-write-varint out n)
     (when (plusp n)
       (let ((w (%make-gcs-writer))
             (last 0))
@@ -137,8 +137,8 @@ the sorted hashed set. Callers must deduplicate ELEMENTS first (N counts them)."
               do (gcs-golomb-encode w p (- v last))
                  (setf last v))
         (gcs-writer-flush w)
-        (bitcoin-lisp.bytes:bb-write-bytes out (gcs-writer-bytes w))))
-    (bitcoin-lisp.bytes:bb-finish out)))
+        (bl.bytes:bb-write-bytes out (gcs-writer-bytes w))))
+    (bl.bytes:bb-finish out)))
 
 (defun gcs-filter-match-any (encoded k0 k1 elements
                              &key (p +basic-filter-p+) (m +basic-filter-m+))
@@ -150,9 +150,9 @@ May return true on a false positive (rate ~1/M); never a false negative."
   ;; N is read as Core's GCSFilter constructor reads it (blockfilter.cpp,
   ;; VectorReader + ReadCompactSize): a non-canonical or oversized encoding
   ;; is an error, not a filter with a strange N.
-  (let* ((br (bitcoin-lisp.bytes:make-byte-reader-from encoded))
-         (n (bitcoin-lisp.bytes:br-read-compact-size br))
-         (start (bitcoin-lisp.bytes:br-pos br)))
+  (let* ((br (bl.bytes:make-byte-reader-from encoded))
+         (n (bl.bytes:br-read-compact-size br))
+         (start (bl.bytes:br-pos br)))
     (when (zerop n)
       (return-from gcs-filter-match-any nil))
     (let* ((f (* n m))
@@ -196,9 +196,9 @@ is a list of the scriptPubKeys (byte vectors) of the outputs the block spends."
                         (not (gethash script seen)))
                (setf (gethash script seen) t)
                (push (coerce script '(simple-array (unsigned-byte 8) (*))) elements))))
-      (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-        (loop for out across (bitcoin-lisp.serialization:transaction-outputs tx)
-              for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey out)
+      (dolist (tx (bl.ser:bitcoin-block-transactions block))
+        (loop for out across (bl.ser:transaction-outputs tx)
+              for spk = (bl.ser:tx-out-script-pubkey out)
               do (unless (%script-op-return-p spk) (add spk))))
       (dolist (spk spent-scripts) (add spk)))
     (nreverse elements)))
@@ -213,7 +213,7 @@ BASIC-FILTER-ELEMENTS)."
 
 (defun block-filter-hash (encoded-filter)
   "BIP157 filter hash: the double-SHA256 of the encoded filter bytes."
-  (bitcoin-lisp.crypto:hash256 encoded-filter))
+  (bl.crypto:hash256 encoded-filter))
 
 (defparameter +zero-filter-header+
   (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
@@ -221,7 +221,7 @@ BASIC-FILTER-ELEMENTS)."
 
 (defun block-filter-header (filter-hash prev-header)
   "BIP157 filter header: double-SHA256(filter-hash || prev-filter-header)."
-  (bitcoin-lisp.crypto:hash256
+  (bl.crypto:hash256
    (concatenate '(simple-array (unsigned-byte 8) (*)) filter-hash prev-header)))
 
 (defun compute-block-filter-header (encoded-filter prev-header)

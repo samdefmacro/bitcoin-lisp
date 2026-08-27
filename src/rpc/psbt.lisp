@@ -29,7 +29,7 @@ JSON-RPC 1.x) or a hash-table (from yason)."
   (unless (stringp b64)
     (error 'rpc-error :code +rpc-deserialization-error+
                       :message (format nil "~A must be a base64 string" what)))
-  (handler-case (bitcoin-lisp.serialization:decode-psbt b64)
+  (handler-case (bl.ser:decode-psbt b64)
     (rpc-error (e) (error e))
     (error (e)
       (error 'rpc-error :code +rpc-deserialization-error+
@@ -65,8 +65,8 @@ when locktime>0, else 0xffffffff."
                      (unless (and (integerp vout) (>= vout 0))
                        (error 'rpc-error :code +rpc-invalid-parameter+
                                          :message "Invalid input vout"))
-                  collect (bitcoin-lisp.serialization:make-tx-in
-                           :previous-output (bitcoin-lisp.serialization:make-outpoint
+                  collect (bl.ser:make-tx-in
+                           :previous-output (bl.ser:make-outpoint
                                              :hash (parse-hex-hash txid) :index vout)
                            :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                            :sequence seq))))
@@ -81,13 +81,13 @@ when locktime>0, else 0xffffffff."
                     (error 'rpc-error :code +rpc-invalid-parameter+
                                       :message "Duplicate key: data"))
                   (setf data-seen t)
-                  (push (bitcoin-lisp.serialization:make-tx-out
+                  (push (bl.ser:make-tx-out
                          :value 0
                          :script-pubkey (concatenate '(simple-array (unsigned-byte 8) (*))
-                                                      #(#x6a) (bitcoin-lisp.serialization:script-push-data
-                                                               (bitcoin-lisp.crypto:hex-to-bytes val))))
+                                                      #(#x6a) (bl.ser:script-push-data
+                                                               (bl.crypto:hex-to-bytes val))))
                         tx-outputs))
-                (multiple-value-bind (type spk) (bitcoin-lisp.crypto:decode-address key network)
+                (multiple-value-bind (type spk) (bl.crypto:decode-address key network)
                   (unless type
                     (error 'rpc-error :code +rpc-invalid-address-or-key+
                                       :message (format nil "Invalid address: ~A" key)))
@@ -97,10 +97,10 @@ when locktime>0, else 0xffffffff."
                   (setf (gethash key seen-addrs) t)
                   (unless (and (numberp val) (<= 0 val 21000000))
                     (error 'rpc-error :code +rpc-invalid-amount+ :message "Invalid amount"))
-                  (push (bitcoin-lisp.serialization:make-tx-out
+                  (push (bl.ser:make-tx-out
                          :value (round (* val 100000000)) :script-pubkey spk)
                         tx-outputs))))))
-      (bitcoin-lisp.serialization:make-transaction
+      (bl.ser:make-transaction
        :version 2
        :inputs (coerce tx-inputs 'simple-vector)
        :outputs (coerce (nreverse tx-outputs) 'simple-vector)
@@ -119,8 +119,8 @@ PARAMS: (inputs outputs [locktime] [replaceable]). Mirrors Core createpsbt."
                                      (or (third params) 0)
                                      (%positional-bool-or (fourth params) t)
                                      (rpc-get-network node))))
-    (bitcoin-lisp.serialization:encode-psbt
-     (bitcoin-lisp.serialization:make-empty-psbt tx))))
+    (bl.ser:encode-psbt
+     (bl.ser:make-empty-psbt tx))))
 
 ;;; --- converttopsbt ---
 
@@ -133,50 +133,50 @@ PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
     (unless (stringp hexstr)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "hexstring required"))
     (let ((tx (handler-case
-                  (bitcoin-lisp.serialization:br-read-transaction
-                   (bitcoin-lisp.serialization:make-byte-reader-from
-                    (coerce (bitcoin-lisp.crypto:hex-to-bytes hexstr)
+                  (bl.ser:br-read-transaction
+                   (bl.ser:make-byte-reader-from
+                    (coerce (bl.crypto:hex-to-bytes hexstr)
                             '(simple-array (unsigned-byte 8) (*)))))
                 (error () (error 'rpc-error :code +rpc-deserialization-error+
                                             :message "TX decode failed")))))
-      (let ((has-sig (or (bitcoin-lisp.serialization:transaction-has-witness-p tx)
-                         (some (lambda (in) (plusp (length (bitcoin-lisp.serialization:tx-in-script-sig in))))
-                               (bitcoin-lisp.serialization:transaction-inputs tx)))))
+      (let ((has-sig (or (bl.ser:transaction-has-witness-p tx)
+                         (some (lambda (in) (plusp (length (bl.ser:tx-in-script-sig in))))
+                               (bl.ser:transaction-inputs tx)))))
         (when (and has-sig (not permitsigdata))
           (error 'rpc-error :code +rpc-invalid-parameter+
                             :message "Inputs must not have scriptSigs and scriptwitnesses. To convert anyway, permitsigdata must be set to true.")))
-      (let ((stripped (bitcoin-lisp.serialization:make-transaction
-                       :version (bitcoin-lisp.serialization:transaction-version tx)
+      (let ((stripped (bl.ser:make-transaction
+                       :version (bl.ser:transaction-version tx)
                        :inputs (map 'simple-vector
                                     (lambda (in)
-                                      (bitcoin-lisp.serialization:make-tx-in
-                                       :previous-output (bitcoin-lisp.serialization:tx-in-previous-output in)
+                                      (bl.ser:make-tx-in
+                                       :previous-output (bl.ser:tx-in-previous-output in)
                                        :script-sig (make-array 0 :element-type '(unsigned-byte 8))
-                                       :sequence (bitcoin-lisp.serialization:tx-in-sequence in)))
-                                    (bitcoin-lisp.serialization:transaction-inputs tx))
-                       :outputs (bitcoin-lisp.serialization:transaction-outputs tx)
-                       :lock-time (bitcoin-lisp.serialization:transaction-lock-time tx)
+                                       :sequence (bl.ser:tx-in-sequence in)))
+                                    (bl.ser:transaction-inputs tx))
+                       :outputs (bl.ser:transaction-outputs tx)
+                       :lock-time (bl.ser:transaction-lock-time tx)
                        :witness nil)))
-        (bitcoin-lisp.serialization:encode-psbt
-         (bitcoin-lisp.serialization:make-empty-psbt stripped))))))
+        (bl.ser:encode-psbt
+         (bl.ser:make-empty-psbt stripped))))))
 
 ;;; --- decodepsbt helpers ---
 
 (defun %psbt-script-obj (script)
-  `(("asm" . ,(bitcoin-lisp.validation:disassemble-script script))
-    ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex script))))
+  `(("asm" . ,(bl.val:disassemble-script script))
+    ("hex" . ,(bl.crypto:bytes-to-hex script))))
 
 (defun %psbt-spk-obj (spk network)
-  (let ((o `(("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
-             ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
+  (let ((o `(("asm" . ,(bl.val:disassemble-script spk))
+             ("hex" . ,(bl.crypto:bytes-to-hex spk))
              ("type" . ,(%script-type spk))))
         (addr (and network (%script->address spk network))))
     (if addr (append o `(("address" . ,addr))) o)))
 
 (defun %psbt-keypath-json (pubkey value)
   "A bip32_derivs entry from a PUBKEY and a <fingerprint:4><path:4le*> VALUE."
-  `(("pubkey" . ,(bitcoin-lisp.crypto:bytes-to-hex pubkey))
-    ("master_fingerprint" . ,(bitcoin-lisp.crypto:bytes-to-hex (subseq value 0 4)))
+  `(("pubkey" . ,(bl.crypto:bytes-to-hex pubkey))
+    ("master_fingerprint" . ,(bl.crypto:bytes-to-hex (subseq value 0 4)))
     ("path" . ,(with-output-to-string (s)
                  (write-string "m" s)
                  (loop for i from 4 below (length value) by 4
@@ -193,9 +193,9 @@ PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
                  (if acp "|ANYONECANPAY" ""))))
 
 (defun %psbt-parse-witness-stack (value)
-  (map 'list #'bitcoin-lisp.crypto:bytes-to-hex
-       (bitcoin-lisp.serialization:br-read-witness-stack
-        (bitcoin-lisp.serialization:make-byte-reader-from value))))
+  (map 'list #'bl.crypto:bytes-to-hex
+       (bl.ser:br-read-witness-stack
+        (bl.ser:make-byte-reader-from value))))
 
 (defun %psbt-input-prevout (map tx-in)
   "The TX-OUT this input spends, resolved from MAP's utxo fields, or NIL.
@@ -223,31 +223,31 @@ The stock wallet always creates a pkh() SPKM, so this is reachable by default.
 
 The txid check is what makes the preference meaningful, so it is enforced here
 rather than assumed."
-  (let* ((nwu (bitcoin-lisp.serialization:psbt-map-find
-               map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))
-         (prevout (bitcoin-lisp.serialization:tx-in-previous-output tx-in))
-         (vout (bitcoin-lisp.serialization:outpoint-index prevout)))
+  (let* ((nwu (bl.ser:psbt-map-find
+               map bl.ser:+psbt-in-non-witness-utxo+))
+         (prevout (bl.ser:tx-in-previous-output tx-in))
+         (vout (bl.ser:outpoint-index prevout)))
     (or
      ;; Authenticated: the full previous transaction, whose txid must match
      ;; the outpoint (Core psbt.cpp:80-83 returns false when it does not).
      (when nwu
-       (let ((prev (bitcoin-lisp.serialization:br-read-transaction
-                    (bitcoin-lisp.serialization:make-byte-reader-from nwu))))
-         (when (and (equalp (bitcoin-lisp.serialization:transaction-hash prev)
-                            (bitcoin-lisp.serialization:outpoint-hash prevout))
-                    (< vout (length (bitcoin-lisp.serialization:transaction-outputs prev))))
-           (aref (bitcoin-lisp.serialization:transaction-outputs prev) vout))))
+       (let ((prev (bl.ser:br-read-transaction
+                    (bl.ser:make-byte-reader-from nwu))))
+         (when (and (equalp (bl.ser:transaction-hash prev)
+                            (bl.ser:outpoint-hash prevout))
+                    (< vout (length (bl.ser:transaction-outputs prev))))
+           (aref (bl.ser:transaction-outputs prev) vout))))
      ;; Fallback only: an unauthenticated bare TxOut.
-     (let ((wu (bitcoin-lisp.serialization:psbt-map-find
-                map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)))
+     (let ((wu (bl.ser:psbt-map-find
+                map bl.ser:+psbt-in-witness-utxo+)))
        (when wu
-         (bitcoin-lisp.serialization:br-read-tx-out
-          (bitcoin-lisp.serialization:make-byte-reader-from wu)))))))
+         (bl.ser:br-read-tx-out
+          (bl.ser:make-byte-reader-from wu)))))))
 
 (defun %psbt-input-amount (map tx-in)
   "The satoshi amount of the output spent by TX-IN, from MAP's utxo fields, or NIL."
   (let ((out (%psbt-input-prevout map tx-in)))
-    (when out (bitcoin-lisp.serialization:tx-out-value out))))
+    (when out (bl.ser:tx-out-value out))))
 
 (defun %psbt-taproot-input-fields (map add)
   "Report a PSBT input's BIP371 taproot records through ADD (Core decodepsbt,
@@ -257,39 +257,39 @@ Everything here was already carried on the wire — the PSBT layer stores raw
 records, so a taproot PSBT round-tripped correctly before this. What was
 missing was the ability to SEE it, which is what a signer's user needs before
 tr() script-path signing means anything."
-  (let ((ks (bitcoin-lisp.serialization:psbt-map-find
-             map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+)))
+  (let ((ks (bl.ser:psbt-map-find
+             map bl.ser:+psbt-in-tap-key-sig+)))
     (when ks (funcall add "taproot_key_path_sig"
-                      (bitcoin-lisp.crypto:bytes-to-hex ks))))
+                      (bl.crypto:bytes-to-hex ks))))
   ;; PSBT_IN_TAP_SCRIPT_SIG keydata is <32-byte xonly pubkey><32-byte leaf hash>.
-  (let ((sigs (bitcoin-lisp.serialization:psbt-map-collect
-               map bitcoin-lisp.serialization:+psbt-in-tap-script-sig+)))
+  (let ((sigs (bl.ser:psbt-map-collect
+               map bl.ser:+psbt-in-tap-script-sig+)))
     (when sigs
       (funcall add "taproot_script_path_sigs"
                (json-array
                 (loop for (keydata . sig) in sigs
                       when (>= (length keydata) 64)
-                        collect `(("pubkey" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                        collect `(("pubkey" . ,(bl.crypto:bytes-to-hex
                                                 (subseq keydata 0 32)))
-                                  ("leaf_hash" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                                  ("leaf_hash" . ,(bl.crypto:bytes-to-hex
                                                    (subseq keydata 32 64)))
-                                  ("sig" . ,(bitcoin-lisp.crypto:bytes-to-hex sig))))))))
+                                  ("sig" . ,(bl.crypto:bytes-to-hex sig))))))))
   ;; PSBT_IN_TAP_LEAF_SCRIPT keydata is the control block; the value is
   ;; <script><1-byte leaf version>. Core groups by (script, leaf_ver) and lists
   ;; every control block that reaches it.
-  (let ((leaves (bitcoin-lisp.serialization:psbt-map-collect
-                 map bitcoin-lisp.serialization:+psbt-in-tap-leaf-script+)))
+  (let ((leaves (bl.ser:psbt-map-collect
+                 map bl.ser:+psbt-in-tap-leaf-script+)))
     (when leaves
       (let ((groups '()))
         (loop for (control . value) in leaves
               when (plusp (length value))
                 do (let* ((script (subseq value 0 (1- (length value))))
                           (leaf-ver (aref value (1- (length value))))
-                          (key (cons (bitcoin-lisp.crypto:bytes-to-hex script) leaf-ver))
+                          (key (cons (bl.crypto:bytes-to-hex script) leaf-ver))
                           (hit (assoc key groups :test #'equal)))
                      (if hit
-                         (push (bitcoin-lisp.crypto:bytes-to-hex control) (cdr hit))
-                         (push (cons key (list (bitcoin-lisp.crypto:bytes-to-hex control)))
+                         (push (bl.crypto:bytes-to-hex control) (cdr hit))
+                         (push (cons key (list (bl.crypto:bytes-to-hex control)))
                                groups))))
         (funcall add "taproot_scripts"
                  (json-array
@@ -298,20 +298,20 @@ tr() script-path signing means anything."
                                   ("leaf_ver" . ,leaf-ver)
                                   ("control_blocks"
                                    . ,(json-array (nreverse controls))))))))))
-  (let ((derivs (bitcoin-lisp.serialization:psbt-map-collect
-                 map bitcoin-lisp.serialization:+psbt-in-tap-bip32+)))
+  (let ((derivs (bl.ser:psbt-map-collect
+                 map bl.ser:+psbt-in-tap-bip32+)))
     (when derivs
       (funcall add "taproot_bip32_derivs"
                (json-array (mapcar (lambda (d) (%psbt-tap-bip32-json (car d) (cdr d)))
                                    derivs)))))
-  (let ((tk (bitcoin-lisp.serialization:psbt-map-find
-             map bitcoin-lisp.serialization:+psbt-in-tap-internal-key+)))
+  (let ((tk (bl.ser:psbt-map-find
+             map bl.ser:+psbt-in-tap-internal-key+)))
     (when tk (funcall add "taproot_internal_key"
-                      (bitcoin-lisp.crypto:bytes-to-hex tk))))
-  (let ((mr (bitcoin-lisp.serialization:psbt-map-find
-             map bitcoin-lisp.serialization:+psbt-in-tap-merkle-root+)))
+                      (bl.crypto:bytes-to-hex tk))))
+  (let ((mr (bl.ser:psbt-map-find
+             map bl.ser:+psbt-in-tap-merkle-root+)))
     (when mr (funcall add "taproot_merkle_root"
-                      (bitcoin-lisp.crypto:bytes-to-hex mr))))
+                      (bl.crypto:bytes-to-hex mr))))
   (%psbt-musig2-json map add))
 
 (defun %psbt-musig2-keydata-json (keydata)
@@ -324,12 +324,12 @@ encoded only in the keydata LENGTH — 66 bytes or 98 — so a reader that ignor
 the length attributes a script-path nonce to the key path."
   (let ((n (length keydata)))
     (when (or (= n 66) (= n 98))
-      `(("participant_pubkey" . ,(bitcoin-lisp.crypto:bytes-to-hex
+      `(("participant_pubkey" . ,(bl.crypto:bytes-to-hex
                                   (subseq keydata 0 33)))
-        ("aggregate_pubkey" . ,(bitcoin-lisp.crypto:bytes-to-hex
+        ("aggregate_pubkey" . ,(bl.crypto:bytes-to-hex
                                 (subseq keydata 33 66)))
         ,@(when (= n 98)
-            `(("leaf_hash" . ,(bitcoin-lisp.crypto:bytes-to-hex
+            `(("leaf_hash" . ,(bl.crypto:bytes-to-hex
                                (subseq keydata 66 98)))))))))
 
 (defun %psbt-musig2-json (map add)
@@ -341,8 +341,8 @@ across two messages leaks the private key outright. What a signer's user needs
 first is to SEE what a PSBT is asking of them, which is what this gives."
   ;; PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS: keydata is the aggregate, value is the
   ;; participants concatenated.
-  (let ((parts (bitcoin-lisp.serialization:psbt-map-collect
-                map bitcoin-lisp.serialization:+psbt-in-musig2-participant-pubkeys+)))
+  (let ((parts (bl.ser:psbt-map-collect
+                map bl.ser:+psbt-in-musig2-participant-pubkeys+)))
     (when parts
       (funcall add "musig2_participant_pubkeys"
                (json-array
@@ -351,14 +351,14 @@ first is to SEE what a PSBT is asking of them, which is what this gives."
                                 (zerop (mod (length value) 33))
                                 (plusp (length value)))
                         collect `(("aggregate_pubkey"
-                                   . ,(bitcoin-lisp.crypto:bytes-to-hex agg))
+                                   . ,(bl.crypto:bytes-to-hex agg))
                                   ("participant_pubkeys"
                                    . ,(json-array
                                        (loop for i from 0 below (length value) by 33
-                                             collect (bitcoin-lisp.crypto:bytes-to-hex
+                                             collect (bl.crypto:bytes-to-hex
                                                       (subseq value i (+ i 33)))))))))))) 
-  (let ((nonces (bitcoin-lisp.serialization:psbt-map-collect
-                 map bitcoin-lisp.serialization:+psbt-in-musig2-pub-nonce+)))
+  (let ((nonces (bl.ser:psbt-map-collect
+                 map bl.ser:+psbt-in-musig2-pub-nonce+)))
     (when nonces
       (funcall add "musig2_pubnonces"
                (json-array
@@ -367,9 +367,9 @@ first is to SEE what a PSBT is asking of them, which is what this gives."
                       when parsed
                         collect (append parsed
                                         `(("pubnonce"
-                                           . ,(bitcoin-lisp.crypto:bytes-to-hex value)))))))))
-  (let ((psigs (bitcoin-lisp.serialization:psbt-map-collect
-                map bitcoin-lisp.serialization:+psbt-in-musig2-partial-sig+)))
+                                           . ,(bl.crypto:bytes-to-hex value)))))))))
+  (let ((psigs (bl.ser:psbt-map-collect
+                map bl.ser:+psbt-in-musig2-partial-sig+)))
     (when psigs
       (funcall add "musig2_partial_sigs"
                (json-array
@@ -378,18 +378,18 @@ first is to SEE what a PSBT is asking of them, which is what this gives."
                       when parsed
                         collect (append parsed
                                         `(("partial_sig"
-                                           . ,(bitcoin-lisp.crypto:bytes-to-hex value))))))))))
+                                           . ,(bl.crypto:bytes-to-hex value))))))))))
 
 (defun %psbt-tap-bip32-json (xonly value)
   "One PSBT_*_TAP_BIP32_DERIVATION record: keydata is the 32-byte x-only
 pubkey; the value is <compact-size count><32-byte leaf hash>*<4-byte
 fingerprint><path>."
-  (let* ((br (bitcoin-lisp.serialization:make-byte-reader-from value))
-         (count (bitcoin-lisp.serialization:br-read-compact-size br))
+  (let* ((br (bl.ser:make-byte-reader-from value))
+         (count (bl.ser:br-read-compact-size br))
          (leaves (loop repeat count
-                       collect (bitcoin-lisp.crypto:bytes-to-hex
-                                (bitcoin-lisp.serialization:br-read-bytes br 32))))
-         (rest (subseq value (bitcoin-lisp.serialization::br-pos br))))
+                       collect (bl.crypto:bytes-to-hex
+                                (bl.ser:br-read-bytes br 32))))
+         (rest (subseq value (bl.ser::br-pos br))))
     ;; %PSBT-KEYPATH-JSON already renders pubkey/fingerprint/path; the leaf
     ;; hashes are what BIP371 adds on top, so its output is reused rather than
     ;; re-derived.
@@ -399,49 +399,49 @@ fingerprint><path>."
 (defun %psbt-input-json (map network)
   (let ((fields '()))
     (flet ((add (k v) (push (cons k v) fields)))
-      (let ((nwu (bitcoin-lisp.serialization:psbt-map-find
-                  map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+)))
+      (let ((nwu (bl.ser:psbt-map-find
+                  map bl.ser:+psbt-in-non-witness-utxo+)))
         (when nwu
           (add "non_witness_utxo"
-               (tx-to-json (bitcoin-lisp.serialization:br-read-transaction
-                            (bitcoin-lisp.serialization:make-byte-reader-from nwu))
+               (tx-to-json (bl.ser:br-read-transaction
+                            (bl.ser:make-byte-reader-from nwu))
                            network))))
-      (let ((wu (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)))
+      (let ((wu (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-in-witness-utxo+)))
         (when wu
-          (let ((txout (bitcoin-lisp.serialization:br-read-tx-out
-                        (bitcoin-lisp.serialization:make-byte-reader-from wu))))
+          (let ((txout (bl.ser:br-read-tx-out
+                        (bl.ser:make-byte-reader-from wu))))
             (add "witness_utxo"
-                 `(("amount" . ,(/ (bitcoin-lisp.serialization:tx-out-value txout) 100000000.0d0))
-                   ("scriptPubKey" . ,(%psbt-spk-obj (bitcoin-lisp.serialization:tx-out-script-pubkey txout)
+                 `(("amount" . ,(/ (bl.ser:tx-out-value txout) 100000000.0d0))
+                   ("scriptPubKey" . ,(%psbt-spk-obj (bl.ser:tx-out-script-pubkey txout)
                                                      network)))))))
-      (let ((sigs (bitcoin-lisp.serialization:psbt-map-collect
-                   map bitcoin-lisp.serialization:+psbt-in-partial-sig+)))
+      (let ((sigs (bl.ser:psbt-map-collect
+                   map bl.ser:+psbt-in-partial-sig+)))
         (when sigs
           (add "partial_signatures"
                (loop for (pk . sig) in sigs
-                     collect (cons (bitcoin-lisp.crypto:bytes-to-hex pk)
-                                   (bitcoin-lisp.crypto:bytes-to-hex sig))))))
-      (let ((sh (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-in-sighash+)))
+                     collect (cons (bl.crypto:bytes-to-hex pk)
+                                   (bl.crypto:bytes-to-hex sig))))))
+      (let ((sh (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-in-sighash+)))
         (when sh (add "sighash" (%psbt-sighash-name
                                  (loop for j below 4 sum (ash (aref sh j) (* 8 j)))))))
-      (let ((rs (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-in-redeem-script+)))
+      (let ((rs (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-in-redeem-script+)))
         (when rs (add "redeem_script" (%psbt-script-obj rs))))
-      (let ((ws (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-in-witness-script+)))
+      (let ((ws (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-in-witness-script+)))
         (when ws (add "witness_script" (%psbt-script-obj ws))))
-      (let ((keypaths (bitcoin-lisp.serialization:psbt-map-collect
-                       map bitcoin-lisp.serialization:+psbt-in-bip32+)))
+      (let ((keypaths (bl.ser:psbt-map-collect
+                       map bl.ser:+psbt-in-bip32+)))
         (when keypaths
           (add "bip32_derivs"
                (loop for (pk . v) in keypaths collect (%psbt-keypath-json pk v)))))
-      (let ((fs (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)))
+      (let ((fs (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-in-final-scriptsig+)))
         (when fs (add "final_scriptSig" (%psbt-script-obj fs))))
-      (let ((fw (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+)))
+      (let ((fw (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-in-final-scriptwitness+)))
         (when fw (add "final_scriptwitness" (%psbt-parse-witness-stack fw))))
       (%psbt-taproot-input-fields map #'add))
     (or (nreverse fields) (make-hash-table))))
@@ -449,27 +449,27 @@ fingerprint><path>."
 (defun %psbt-output-json (map)
   (let ((fields '()))
     (flet ((add (k v) (push (cons k v) fields)))
-      (let ((rs (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-out-redeem-script+)))
+      (let ((rs (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-out-redeem-script+)))
         (when rs (add "redeem_script" (%psbt-script-obj rs))))
-      (let ((ws (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-out-witness-script+)))
+      (let ((ws (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-out-witness-script+)))
         (when ws (add "witness_script" (%psbt-script-obj ws))))
-      (let ((keypaths (bitcoin-lisp.serialization:psbt-map-collect
-                       map bitcoin-lisp.serialization:+psbt-out-bip32+)))
+      (let ((keypaths (bl.ser:psbt-map-collect
+                       map bl.ser:+psbt-out-bip32+)))
         (when keypaths
           (add "bip32_derivs"
                (loop for (pk . v) in keypaths collect (%psbt-keypath-json pk v)))))
-      (let ((tk (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-out-tap-internal-key+)))
-        (when tk (add "taproot_internal_key" (bitcoin-lisp.crypto:bytes-to-hex tk))))
+      (let ((tk (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-out-tap-internal-key+)))
+        (when tk (add "taproot_internal_key" (bl.crypto:bytes-to-hex tk))))
       ;; PSBT_OUT_TAP_TREE is one opaque blob of (depth, leaf_ver, script)
       ;; tuples; Core reports it as hex rather than expanding it.
-      (let ((tree (bitcoin-lisp.serialization:psbt-map-find
-                   map bitcoin-lisp.serialization:+psbt-out-tap-tree+)))
-        (when tree (add "taproot_tree" (bitcoin-lisp.crypto:bytes-to-hex tree))))
-      (let ((derivs (bitcoin-lisp.serialization:psbt-map-collect
-                     map bitcoin-lisp.serialization:+psbt-out-tap-bip32+)))
+      (let ((tree (bl.ser:psbt-map-find
+                   map bl.ser:+psbt-out-tap-tree+)))
+        (when tree (add "taproot_tree" (bl.crypto:bytes-to-hex tree))))
+      (let ((derivs (bl.ser:psbt-map-collect
+                     map bl.ser:+psbt-out-tap-bip32+)))
         (when derivs
           (add "taproot_bip32_derivs"
                (json-array (mapcar (lambda (d) (%psbt-tap-bip32-json (car d) (cdr d)))
@@ -480,15 +480,15 @@ fingerprint><path>."
   "Decode a PSBT to JSON. PARAMS: (psbt). Mirrors Core decodepsbt."
   (let* ((network (rpc-get-network node))
          (psbt (%psbt-decode-arg (first params)))
-         (tx (bitcoin-lisp.serialization:psbt-tx psbt))
-         (in-maps (bitcoin-lisp.serialization:psbt-inputs psbt))
-         (out-maps (bitcoin-lisp.serialization:psbt-outputs psbt))
-         (tx-ins (bitcoin-lisp.serialization:transaction-inputs tx))
+         (tx (bl.ser:psbt-tx psbt))
+         (in-maps (bl.ser:psbt-inputs psbt))
+         (out-maps (bl.ser:psbt-outputs psbt))
+         (tx-ins (bl.ser:transaction-inputs tx))
          (result `(("tx" . ,(tx-to-json tx network)))))
     ;; version
-    (let ((ver (bitcoin-lisp.serialization:psbt-map-find
-                (bitcoin-lisp.serialization:psbt-global psbt)
-                bitcoin-lisp.serialization:+psbt-global-version+)))
+    (let ((ver (bl.ser:psbt-map-find
+                (bl.ser:psbt-global psbt)
+                bl.ser:+psbt-global-version+)))
       (when ver
         (setf result (append result
                              `(("psbt_version" . ,(loop for j below 4 sum (ash (aref ver j) (* 8 j)))))))))
@@ -505,8 +505,8 @@ fingerprint><path>."
             for amt = (%psbt-input-amount m (aref tx-ins i))
             do (if amt (incf in-total amt) (setf all nil)))
       (when all
-        (let ((out-total (loop for o across (bitcoin-lisp.serialization:transaction-outputs tx)
-                               sum (bitcoin-lisp.serialization:tx-out-value o))))
+        (let ((out-total (loop for o across (bl.ser:transaction-outputs tx)
+                               sum (bl.ser:tx-out-value o))))
           (setf result (append result `(("fee" . ,(/ (- in-total out-total) 100000000.0d0))))))))
     result))
 
@@ -518,15 +518,15 @@ fingerprint><path>."
 key hash-set + a single append."
   (let ((seen (make-hash-table :test 'equalp))
         (new '()))
-    (dolist (rec (bitcoin-lisp.serialization:psbt-map-records dst))
+    (dolist (rec (bl.ser:psbt-map-records dst))
       (setf (gethash (car rec) seen) t))
-    (dolist (rec (bitcoin-lisp.serialization:psbt-map-records src))
+    (dolist (rec (bl.ser:psbt-map-records src))
       (unless (gethash (car rec) seen)
         (setf (gethash (car rec) seen) t)
         (push rec new)))
     (when new
-      (setf (bitcoin-lisp.serialization:psbt-map-records dst)
-            (append (bitcoin-lisp.serialization:psbt-map-records dst) (nreverse new))))))
+      (setf (bl.ser:psbt-map-records dst)
+            (append (bl.ser:psbt-map-records dst) (nreverse new))))))
 
 (defun rpc-combinepsbt (node params)
   "Combine PSBTs for the same unsigned tx into one. PARAMS: (txs). Mirrors Core."
@@ -537,22 +537,22 @@ key hash-set + a single append."
                         :message "txs must be an array of base64 PSBTs"))
     (let* ((psbts (mapcar #'%psbt-decode-arg b64s))
            (base (first psbts))
-           (base-tx (bitcoin-lisp.serialization:serialize-transaction
-                     (bitcoin-lisp.serialization:psbt-tx base))))
+           (base-tx (bl.ser:serialize-transaction
+                     (bl.ser:psbt-tx base))))
       (dolist (p (rest psbts))
-        (unless (equalp base-tx (bitcoin-lisp.serialization:serialize-transaction
-                                 (bitcoin-lisp.serialization:psbt-tx p)))
+        (unless (equalp base-tx (bl.ser:serialize-transaction
+                                 (bl.ser:psbt-tx p)))
           (error 'rpc-error :code +rpc-invalid-parameter+
                             :message "PSBTs not compatible (different transactions)"))
-        (%psbt-merge-map! (bitcoin-lisp.serialization:psbt-global base)
-                          (bitcoin-lisp.serialization:psbt-global p))
-        (dotimes (i (length (bitcoin-lisp.serialization:psbt-inputs base)))
-          (%psbt-merge-map! (aref (bitcoin-lisp.serialization:psbt-inputs base) i)
-                            (aref (bitcoin-lisp.serialization:psbt-inputs p) i)))
-        (dotimes (i (length (bitcoin-lisp.serialization:psbt-outputs base)))
-          (%psbt-merge-map! (aref (bitcoin-lisp.serialization:psbt-outputs base) i)
-                            (aref (bitcoin-lisp.serialization:psbt-outputs p) i))))
-      (bitcoin-lisp.serialization:encode-psbt base))))
+        (%psbt-merge-map! (bl.ser:psbt-global base)
+                          (bl.ser:psbt-global p))
+        (dotimes (i (length (bl.ser:psbt-inputs base)))
+          (%psbt-merge-map! (aref (bl.ser:psbt-inputs base) i)
+                            (aref (bl.ser:psbt-inputs p) i)))
+        (dotimes (i (length (bl.ser:psbt-outputs base)))
+          (%psbt-merge-map! (aref (bl.ser:psbt-outputs base) i)
+                            (aref (bl.ser:psbt-outputs p) i))))
+      (bl.ser:encode-psbt base))))
 
 (defun rpc-joinpsbts (node params)
   "Join distinct PSBTs (different inputs/outputs) into one. PARAMS: (txs).
@@ -566,47 +566,47 @@ we do not shuffle indices)."
           (version 1) (locktime #xffffffff)
           (ins '()) (outs '()) (in-maps '()) (out-maps '())
           (seen (make-hash-table :test 'equalp))
-          (merged-global (bitcoin-lisp.serialization:make-psbt-map)))
+          (merged-global (bl.ser:make-psbt-map)))
       (dolist (p psbts)
-        (let ((tx (bitcoin-lisp.serialization:psbt-tx p)))
-          (setf version (max version (bitcoin-lisp.serialization:transaction-version tx)))
-          (setf locktime (min locktime (bitcoin-lisp.serialization:transaction-lock-time tx)))
-          (loop for in across (bitcoin-lisp.serialization:transaction-inputs tx)
+        (let ((tx (bl.ser:psbt-tx p)))
+          (setf version (max version (bl.ser:transaction-version tx)))
+          (setf locktime (min locktime (bl.ser:transaction-lock-time tx)))
+          (loop for in across (bl.ser:transaction-inputs tx)
                 for i from 0
-                for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
-                for key = (%outpoint-key (bitcoin-lisp.serialization:outpoint-hash op)
-                                         (bitcoin-lisp.serialization:outpoint-index op))
+                for op = (bl.ser:tx-in-previous-output in)
+                for key = (%outpoint-key (bl.ser:outpoint-hash op)
+                                         (bl.ser:outpoint-index op))
                 do (when (gethash key seen)
                      (error 'rpc-error :code +rpc-invalid-parameter+
                                        :message "Input exists in multiple PSBTs"))
                    (setf (gethash key seen) t)
                    (push in ins)
-                   (push (aref (bitcoin-lisp.serialization:psbt-inputs p) i) in-maps))
-          (loop for out across (bitcoin-lisp.serialization:transaction-outputs tx)
+                   (push (aref (bl.ser:psbt-inputs p) i) in-maps))
+          (loop for out across (bl.ser:transaction-outputs tx)
                 for i from 0
                 do (push out outs)
-                   (push (aref (bitcoin-lisp.serialization:psbt-outputs p) i) out-maps))
-          (%psbt-merge-map! merged-global (bitcoin-lisp.serialization:psbt-global p))))
-      (let* ((tx (bitcoin-lisp.serialization:make-transaction
+                   (push (aref (bl.ser:psbt-outputs p) i) out-maps))
+          (%psbt-merge-map! merged-global (bl.ser:psbt-global p))))
+      (let* ((tx (bl.ser:make-transaction
                   :version version
                   :inputs (coerce (nreverse ins) 'simple-vector)
                   :outputs (coerce (nreverse outs) 'simple-vector)
                   :lock-time locktime))
-             (result (bitcoin-lisp.serialization:make-empty-psbt tx)))
-        (setf (bitcoin-lisp.serialization:psbt-inputs result)
+             (result (bl.ser:make-empty-psbt tx)))
+        (setf (bl.ser:psbt-inputs result)
               (coerce (nreverse in-maps) 'simple-vector))
-        (setf (bitcoin-lisp.serialization:psbt-outputs result)
+        (setf (bl.ser:psbt-outputs result)
               (coerce (nreverse out-maps) 'simple-vector))
         ;; carry over non-tx global records (xpubs / version / proprietary)
-        (dolist (rec (bitcoin-lisp.serialization:psbt-map-records merged-global))
-          (unless (= (bitcoin-lisp.serialization:psbt-key-type (car rec))
-                     bitcoin-lisp.serialization:+psbt-global-unsigned-tx+)
-            (setf (bitcoin-lisp.serialization:psbt-map-records
-                   (bitcoin-lisp.serialization:psbt-global result))
-                  (append (bitcoin-lisp.serialization:psbt-map-records
-                           (bitcoin-lisp.serialization:psbt-global result))
+        (dolist (rec (bl.ser:psbt-map-records merged-global))
+          (unless (= (bl.ser:psbt-key-type (car rec))
+                     bl.ser:+psbt-global-unsigned-tx+)
+            (setf (bl.ser:psbt-map-records
+                   (bl.ser:psbt-global result))
+                  (append (bl.ser:psbt-map-records
+                           (bl.ser:psbt-global result))
                           (list rec)))))
-        (bitcoin-lisp.serialization:encode-psbt result)))))
+        (bl.ser:encode-psbt result)))))
 
 ;;; --- utxoupdatepsbt ---
 
@@ -622,32 +622,32 @@ descriptor-based script solving); the UTXO-filling role is implemented.
 Mirrors the no-key part of Core utxoupdatepsbt."
   (let* ((psbt (%psbt-decode-arg (first params)))
          (utxo-set (rpc-get-utxo-set node))
-         (tx (bitcoin-lisp.serialization:psbt-tx psbt)))
+         (tx (bl.ser:psbt-tx psbt)))
     (when utxo-set
-      (loop for in across (bitcoin-lisp.serialization:transaction-inputs tx)
+      (loop for in across (bl.ser:transaction-inputs tx)
             for i from 0
-            for map = (aref (bitcoin-lisp.serialization:psbt-inputs psbt) i)
-            do (unless (or (bitcoin-lisp.serialization:psbt-map-find
-                            map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)
-                           (bitcoin-lisp.serialization:psbt-map-find
-                            map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))
-                 (let* ((op (bitcoin-lisp.serialization:tx-in-previous-output in))
-                        (entry (bitcoin-lisp.storage:get-utxo
+            for map = (aref (bl.ser:psbt-inputs psbt) i)
+            do (unless (or (bl.ser:psbt-map-find
+                            map bl.ser:+psbt-in-witness-utxo+)
+                           (bl.ser:psbt-map-find
+                            map bl.ser:+psbt-in-non-witness-utxo+))
+                 (let* ((op (bl.ser:tx-in-previous-output in))
+                        (entry (bl.store:get-utxo
                                 utxo-set
-                                (bitcoin-lisp.serialization:outpoint-hash op)
-                                (bitcoin-lisp.serialization:outpoint-index op))))
+                                (bl.ser:outpoint-hash op)
+                                (bl.ser:outpoint-index op))))
                    (when (and entry (%psbt-witness-spk-p
-                                     (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
-                     (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
-                       (bitcoin-lisp.serialization:bb-write-tx-out
-                        bb (bitcoin-lisp.serialization:make-tx-out
-                            :value (bitcoin-lisp.storage:utxo-entry-value entry)
-                            :script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
-                       (bitcoin-lisp.serialization:psbt-map-set
-                        map bitcoin-lisp.serialization:+psbt-in-witness-utxo+
+                                     (bl.store:utxo-entry-script-pubkey entry)))
+                     (let ((bb (bl.ser:make-byte-buf)))
+                       (bl.ser:bb-write-tx-out
+                        bb (bl.ser:make-tx-out
+                            :value (bl.store:utxo-entry-value entry)
+                            :script-pubkey (bl.store:utxo-entry-script-pubkey entry)))
+                       (bl.ser:psbt-map-set
+                        map bl.ser:+psbt-in-witness-utxo+
                         (make-array 0 :element-type '(unsigned-byte 8))
-                        (bitcoin-lisp.serialization:bb-finish bb))))))))
-    (bitcoin-lisp.serialization:encode-psbt psbt)))
+                        (bl.ser:bb-finish bb))))))))
+    (bl.ser:encode-psbt psbt)))
 
 ;;; --- analyzepsbt ---
 
@@ -657,22 +657,22 @@ fee when all input amounts are known. PARAMS: (psbt). Note: missing pubkey/sig
 lists and vsize estimation are not computed (no script solving here)."
   (declare (ignore node))
   (let* ((psbt (%psbt-decode-arg (first params)))
-         (tx (bitcoin-lisp.serialization:psbt-tx psbt))
+         (tx (bl.ser:psbt-tx psbt))
          (order '("creator" "updater" "signer" "finalizer" "extractor"))
          (inputs-json '())
          (overall "extractor"))
     (flet ((rank (r) (position r order :test #'string=)))
-      (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
-            do (let* ((final (or (bitcoin-lisp.serialization:psbt-map-find
-                                  map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)
-                                 (bitcoin-lisp.serialization:psbt-map-find
-                                  map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+)))
-                      (has-utxo (or (bitcoin-lisp.serialization:psbt-map-find
-                                     map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)
-                                    (bitcoin-lisp.serialization:psbt-map-find
-                                     map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+)))
-                      (has-sigs (bitcoin-lisp.serialization:psbt-map-collect
-                                 map bitcoin-lisp.serialization:+psbt-in-partial-sig+))
+      (loop for map across (bl.ser:psbt-inputs psbt)
+            do (let* ((final (or (bl.ser:psbt-map-find
+                                  map bl.ser:+psbt-in-final-scriptsig+)
+                                 (bl.ser:psbt-map-find
+                                  map bl.ser:+psbt-in-final-scriptwitness+)))
+                      (has-utxo (or (bl.ser:psbt-map-find
+                                     map bl.ser:+psbt-in-witness-utxo+)
+                                    (bl.ser:psbt-map-find
+                                     map bl.ser:+psbt-in-non-witness-utxo+)))
+                      (has-sigs (bl.ser:psbt-map-collect
+                                 map bl.ser:+psbt-in-partial-sig+))
                       (next (cond (final "extractor")
                                   ((not has-utxo) "updater")
                                   (has-sigs "finalizer")
@@ -684,13 +684,13 @@ lists and vsize estimation are not computed (no script solving here)."
                  (when (< (rank next) (rank overall)) (setf overall next)))))
     (let ((result `(("inputs" . ,(nreverse inputs-json))))
           (in-total 0) (all t))
-      (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
+      (loop for map across (bl.ser:psbt-inputs psbt)
             for i from 0
-            for amt = (%psbt-input-amount map (aref (bitcoin-lisp.serialization:transaction-inputs tx) i))
+            for amt = (%psbt-input-amount map (aref (bl.ser:transaction-inputs tx) i))
             do (if amt (incf in-total amt) (setf all nil)))
       (when all
-        (let ((out-total (loop for o across (bitcoin-lisp.serialization:transaction-outputs tx)
-                               sum (bitcoin-lisp.serialization:tx-out-value o))))
+        (let ((out-total (loop for o across (bl.ser:transaction-outputs tx)
+                               sum (bl.ser:tx-out-value o))))
           (setf result (append result `(("fee" . ,(/ (- in-total out-total) 100000000.0d0)))))))
       (append result `(("next" . ,overall))))))
 
@@ -704,16 +704,16 @@ lists and vsize estimation are not computed (no script solving here)."
 Shares %PSBT-INPUT-PREVOUT with %PSBT-INPUT-AMOUNT so the script and the amount
 can never come from different sources."
   (let ((out (%psbt-input-prevout map tx-in)))
-    (when out (bitcoin-lisp.serialization:tx-out-script-pubkey out))))
+    (when out (bl.ser:tx-out-script-pubkey out))))
 
 (defun %psbt-sig-for (map pubkey)
-  (cdr (assoc pubkey (bitcoin-lisp.serialization:psbt-map-collect
-                      map bitcoin-lisp.serialization:+psbt-in-partial-sig+)
+  (cdr (assoc pubkey (bl.ser:psbt-map-collect
+                      map bl.ser:+psbt-in-partial-sig+)
               :test #'equalp)))
 
 (defun %psbt-first-sig (map)
-  (first (bitcoin-lisp.serialization:psbt-map-collect
-          map bitcoin-lisp.serialization:+psbt-in-partial-sig+)))
+  (first (bl.ser:psbt-map-collect
+          map bl.ser:+psbt-in-partial-sig+)))
 
 (defun %psbt-multisig-sigs (script map)
   "Ordered available signatures for the m-of-n multisig SCRIPT, or NIL if fewer
@@ -729,10 +729,10 @@ than m are present."
 (defun %psbt-finalize (map spk)
   "Try to finalize the input MAP spending SPK. Returns (values scriptsig
 witness-stack) on success (either may be nil/empty), or (values nil nil)."
-  (let ((rs (bitcoin-lisp.serialization:psbt-map-find
-             map bitcoin-lisp.serialization:+psbt-in-redeem-script+))
-        (ws (bitcoin-lisp.serialization:psbt-map-find
-             map bitcoin-lisp.serialization:+psbt-in-witness-script+))
+  (let ((rs (bl.ser:psbt-map-find
+             map bl.ser:+psbt-in-redeem-script+))
+        (ws (bl.ser:psbt-map-find
+             map bl.ser:+psbt-in-witness-script+))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (labels ((ms-witness (script)
                (let ((sigs (%psbt-multisig-sigs script map)))
@@ -740,14 +740,14 @@ witness-stack) on success (either may be nil/empty), or (values nil nil)."
              (ms-scriptsig (script)
                (let ((sigs (%psbt-multisig-sigs script map)))
                  (when sigs (apply #'%psbt-concat #(#x00)
-                                   (mapcar #'bitcoin-lisp.serialization:script-push-data sigs))))))
-      (case (bitcoin-lisp.validation:classify-script spk)
+                                   (mapcar #'bl.ser:script-push-data sigs))))))
+      (case (bl.val:classify-script spk)
         (:pubkeyhash
          (let ((s (%psbt-first-sig map)))
-           (when s (values (%psbt-concat (bitcoin-lisp.serialization:script-push-data (cdr s)) (bitcoin-lisp.serialization:script-push-data (car s))) nil))))
+           (when s (values (%psbt-concat (bl.ser:script-push-data (cdr s)) (bl.ser:script-push-data (car s))) nil))))
         (:pubkey
          (let ((s (%psbt-first-sig map)))
-           (when s (values (bitcoin-lisp.serialization:script-push-data (cdr s)) nil))))
+           (when s (values (bl.ser:script-push-data (cdr s)) nil))))
         (:witness-v0-keyhash
          (let ((s (%psbt-first-sig map)))
            (when s (values empty (list (cdr s) (car s))))))
@@ -756,8 +756,8 @@ witness-stack) on success (either may be nil/empty), or (values nil nil)."
         (:witness-v0-scripthash
          (when ws (let ((wit (ms-witness ws))) (when wit (values empty wit)))))
         (:witness-v1-taproot
-         (let ((ks (bitcoin-lisp.serialization:psbt-map-find
-                    map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+)))
+         (let ((ks (bl.ser:psbt-map-find
+                    map bl.ser:+psbt-in-tap-key-sig+)))
            (if ks
                ;; Key path: the whole witness is the one signature.
                (values empty (list ks))
@@ -768,29 +768,29 @@ witness-stack) on success (either may be nil/empty), or (values nil nil)."
                  (when wit (values empty wit))))))
         (:scripthash
          (when rs
-           (case (bitcoin-lisp.validation:classify-script rs)
+           (case (bl.val:classify-script rs)
              (:witness-v0-keyhash
               (let ((s (%psbt-first-sig map)))
-                (when s (values (bitcoin-lisp.serialization:script-push-data rs) (list (cdr s) (car s))))))
+                (when s (values (bl.ser:script-push-data rs) (list (cdr s) (car s))))))
              (:witness-v0-scripthash
               (when ws (let ((wit (ms-witness ws)))
-                         (when wit (values (bitcoin-lisp.serialization:script-push-data rs) wit)))))
+                         (when wit (values (bl.ser:script-push-data rs) wit)))))
              (:multisig
               (let ((sigs (%psbt-multisig-sigs rs map)))
                 (when sigs
                   (values (apply #'%psbt-concat #(#x00)
-                                 (append (mapcar #'bitcoin-lisp.serialization:script-push-data sigs)
-                                         (list (bitcoin-lisp.serialization:script-push-data rs))))
+                                 (append (mapcar #'bl.ser:script-push-data sigs)
+                                         (list (bl.ser:script-push-data rs))))
                           nil))))
              (:pubkeyhash            ; P2SH-P2PKH: <sig> <pubkey> <redeem>
               (let ((s (%psbt-first-sig map)))
-                (when s (values (%psbt-concat (bitcoin-lisp.serialization:script-push-data (cdr s))
-                                              (bitcoin-lisp.serialization:script-push-data (car s))
-                                              (bitcoin-lisp.serialization:script-push-data rs))
+                (when s (values (%psbt-concat (bl.ser:script-push-data (cdr s))
+                                              (bl.ser:script-push-data (car s))
+                                              (bl.ser:script-push-data rs))
                                 nil))))
              (:pubkey               ; P2SH-P2PK: <sig> <redeem>
               (let ((s (%psbt-first-sig map)))
-                (when s (values (%psbt-concat (bitcoin-lisp.serialization:script-push-data (cdr s)) (bitcoin-lisp.serialization:script-push-data rs)) nil))))
+                (when s (values (%psbt-concat (bl.ser:script-push-data (cdr s)) (bl.ser:script-push-data rs)) nil))))
              (t (values nil nil)))))
         (t (values nil nil))))))
 
@@ -801,60 +801,60 @@ fields (partial sigs, sighash, redeem/witness scripts, derivations)."
   ;; Serialize gates partial sigs / sighash / redeem+witness scripts / key paths
   ;; behind "final scripts empty", so we drop those records here to match its
   ;; on-the-wire output (the utxo fields stay).
-  (dolist (kt (list bitcoin-lisp.serialization:+psbt-in-partial-sig+
-                    bitcoin-lisp.serialization:+psbt-in-sighash+
-                    bitcoin-lisp.serialization:+psbt-in-redeem-script+
-                    bitcoin-lisp.serialization:+psbt-in-witness-script+
-                    bitcoin-lisp.serialization:+psbt-in-bip32+))
-    (bitcoin-lisp.serialization:psbt-map-remove-type map kt))
+  (dolist (kt (list bl.ser:+psbt-in-partial-sig+
+                    bl.ser:+psbt-in-sighash+
+                    bl.ser:+psbt-in-redeem-script+
+                    bl.ser:+psbt-in-witness-script+
+                    bl.ser:+psbt-in-bip32+))
+    (bl.ser:psbt-map-remove-type map kt))
   (when (and scriptsig (plusp (length scriptsig)))
-    (bitcoin-lisp.serialization:psbt-map-set
-     map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+
+    (bl.ser:psbt-map-set
+     map bl.ser:+psbt-in-final-scriptsig+
      (make-array 0 :element-type '(unsigned-byte 8)) scriptsig))
   (when witness
-    (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
-      (bitcoin-lisp.serialization:bb-write-varint bb (length witness))
+    (let ((bb (bl.ser:make-byte-buf)))
+      (bl.ser:bb-write-varint bb (length witness))
       (dolist (item witness)
-        (bitcoin-lisp.serialization:bb-write-varint bb (length item))
-        (when (plusp (length item)) (bitcoin-lisp.serialization:bb-write-bytes bb item)))
-      (bitcoin-lisp.serialization:psbt-map-set
-       map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+
-       (make-array 0 :element-type '(unsigned-byte 8)) (bitcoin-lisp.serialization:bb-finish bb)))))
+        (bl.ser:bb-write-varint bb (length item))
+        (when (plusp (length item)) (bl.ser:bb-write-bytes bb item)))
+      (bl.ser:psbt-map-set
+       map bl.ser:+psbt-in-final-scriptwitness+
+       (make-array 0 :element-type '(unsigned-byte 8)) (bl.ser:bb-finish bb)))))
 
 (defun %psbt-extract-hex (psbt)
   "Extract the fully-signed network transaction from a finalized PSBT as hex."
-  (let* ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
-         (ins (bitcoin-lisp.serialization:transaction-inputs tx))
+  (let* ((tx (bl.ser:psbt-tx psbt))
+         (ins (bl.ser:transaction-inputs tx))
          (nin (length ins))
          (new-ins (make-array nin))
          (witnesses (make-array nin :initial-element nil))
          (any-witness nil))
     (dotimes (i nin)
-      (let* ((map (aref (bitcoin-lisp.serialization:psbt-inputs psbt) i))
+      (let* ((map (aref (bl.ser:psbt-inputs psbt) i))
              (in (aref ins i))
-             (ss (or (bitcoin-lisp.serialization:psbt-map-find
-                      map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)
+             (ss (or (bl.ser:psbt-map-find
+                      map bl.ser:+psbt-in-final-scriptsig+)
                      (make-array 0 :element-type '(unsigned-byte 8))))
-             (fw (bitcoin-lisp.serialization:psbt-map-find
-                  map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+)))
+             (fw (bl.ser:psbt-map-find
+                  map bl.ser:+psbt-in-final-scriptwitness+)))
         (setf (aref new-ins i)
-              (bitcoin-lisp.serialization:make-tx-in
-               :previous-output (bitcoin-lisp.serialization:tx-in-previous-output in)
+              (bl.ser:make-tx-in
+               :previous-output (bl.ser:tx-in-previous-output in)
                :script-sig ss
-               :sequence (bitcoin-lisp.serialization:tx-in-sequence in)))
+               :sequence (bl.ser:tx-in-sequence in)))
         (when fw
           (setf any-witness t
                 (aref witnesses i)
-                (bitcoin-lisp.serialization:br-read-witness-stack
-                 (bitcoin-lisp.serialization:make-byte-reader-from fw))))))
-    (let ((final-tx (bitcoin-lisp.serialization:make-transaction
-                     :version (bitcoin-lisp.serialization:transaction-version tx)
+                (bl.ser:br-read-witness-stack
+                 (bl.ser:make-byte-reader-from fw))))))
+    (let ((final-tx (bl.ser:make-transaction
+                     :version (bl.ser:transaction-version tx)
                      :inputs new-ins
-                     :outputs (bitcoin-lisp.serialization:transaction-outputs tx)
-                     :lock-time (bitcoin-lisp.serialization:transaction-lock-time tx)
+                     :outputs (bl.ser:transaction-outputs tx)
+                     :lock-time (bl.ser:transaction-lock-time tx)
                      :witness (if any-witness witnesses nil))))
-      (bitcoin-lisp.crypto:bytes-to-hex
-       (bitcoin-lisp.serialization:transaction-wire-bytes final-tx)))))
+      (bl.crypto:bytes-to-hex
+       (bl.ser:transaction-wire-bytes final-tx)))))
 
 (defun rpc-finalizepsbt (node params)
   "Finalize every input possible; if all are final and EXTRACT (default true),
@@ -862,15 +862,15 @@ return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
   (declare (ignore node))
   (let* ((psbt (%psbt-decode-arg (first params)))
          (extract (%positional-bool-or (second params) t))
-         (tx (bitcoin-lisp.serialization:psbt-tx psbt))
-         (ins (bitcoin-lisp.serialization:transaction-inputs tx))
+         (tx (bl.ser:psbt-tx psbt))
+         (ins (bl.ser:transaction-inputs tx))
          (complete t))
     (dotimes (i (length ins))
-      (let ((map (aref (bitcoin-lisp.serialization:psbt-inputs psbt) i)))
-        (if (or (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)
-                (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+))
+      (let ((map (aref (bl.ser:psbt-inputs psbt) i)))
+        (if (or (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-in-final-scriptsig+)
+                (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-in-final-scriptwitness+))
             nil                          ; already final
             (let ((spk (%psbt-input-spk map (aref ins i))))
               (multiple-value-bind (ss wit) (if spk (%psbt-finalize map spk) (values nil nil))
@@ -879,7 +879,7 @@ return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
                     (setf complete nil)))))))
     (if (and complete extract)
         `(("hex" . ,(%psbt-extract-hex psbt)) ("complete" . t))
-        `(("psbt" . ,(bitcoin-lisp.serialization:encode-psbt psbt))
+        `(("psbt" . ,(bl.ser:encode-psbt psbt))
           ("complete" . ,(json-bool complete))))))
 
 ;;; --- combinerawtransaction ---
@@ -895,30 +895,30 @@ PARAMS: (txs). Mirrors Core combinerawtransaction."
                         :message "txs must be a non-empty array of hex transactions"))
     (let ((txs (mapcar (lambda (h)
                          (handler-case
-                             (bitcoin-lisp.serialization:br-read-transaction
-                              (bitcoin-lisp.serialization:make-byte-reader-from
-                               (coerce (bitcoin-lisp.crypto:hex-to-bytes h)
+                             (bl.ser:br-read-transaction
+                              (bl.ser:make-byte-reader-from
+                               (coerce (bl.crypto:hex-to-bytes h)
                                        '(simple-array (unsigned-byte 8) (*)))))
                            (error () (error 'rpc-error :code +rpc-deserialization-error+
                                                        :message "TX decode failed"))))
                        hexes)))
       (let* ((base (first txs))
-             (nin (length (bitcoin-lisp.serialization:transaction-inputs base)))
+             (nin (length (bl.ser:transaction-inputs base)))
              (merged-ins (make-array nin))
              (witnesses (make-array nin :initial-element nil))
              (any-witness nil))
         (dolist (tx (rest txs))
-          (unless (= (length (bitcoin-lisp.serialization:transaction-inputs tx)) nin)
+          (unless (= (length (bl.ser:transaction-inputs tx)) nin)
             (error 'rpc-error :code +rpc-deserialization-error+
                               :message "Input count mismatch between transactions")))
         (dotimes (i nin)
-          (let ((best-ss (bitcoin-lisp.serialization:tx-in-script-sig
-                          (aref (bitcoin-lisp.serialization:transaction-inputs base) i)))
+          (let ((best-ss (bl.ser:tx-in-script-sig
+                          (aref (bl.ser:transaction-inputs base) i)))
                 (best-wit nil)
-                (in0 (aref (bitcoin-lisp.serialization:transaction-inputs base) i)))
+                (in0 (aref (bl.ser:transaction-inputs base) i)))
             (dolist (tx txs)
-              (let* ((in (aref (bitcoin-lisp.serialization:transaction-inputs tx) i))
-                     (ss (bitcoin-lisp.serialization:tx-in-script-sig in))
+              (let* ((in (aref (bl.ser:transaction-inputs tx) i))
+                     (ss (bl.ser:tx-in-script-sig in))
                      (w (%tx-input-witness tx i)))
                 (when (> (length ss) (length best-ss)) (setf best-ss ss))
                 (when (and w (plusp (length w))
@@ -926,18 +926,18 @@ PARAMS: (txs). Mirrors Core combinerawtransaction."
                   (setf best-wit w))))
             (when best-wit (setf any-witness t (aref witnesses i) best-wit))
             (setf (aref merged-ins i)
-                  (bitcoin-lisp.serialization:make-tx-in
-                   :previous-output (bitcoin-lisp.serialization:tx-in-previous-output in0)
+                  (bl.ser:make-tx-in
+                   :previous-output (bl.ser:tx-in-previous-output in0)
                    :script-sig best-ss
-                   :sequence (bitcoin-lisp.serialization:tx-in-sequence in0)))))
-        (let ((merged (bitcoin-lisp.serialization:make-transaction
-                       :version (bitcoin-lisp.serialization:transaction-version base)
+                   :sequence (bl.ser:tx-in-sequence in0)))))
+        (let ((merged (bl.ser:make-transaction
+                       :version (bl.ser:transaction-version base)
                        :inputs merged-ins
-                       :outputs (bitcoin-lisp.serialization:transaction-outputs base)
-                       :lock-time (bitcoin-lisp.serialization:transaction-lock-time base)
+                       :outputs (bl.ser:transaction-outputs base)
+                       :lock-time (bl.ser:transaction-lock-time base)
                        :witness (if any-witness witnesses nil))))
-          (bitcoin-lisp.crypto:bytes-to-hex
-           (bitcoin-lisp.serialization:transaction-wire-bytes merged)))))))
+          (bl.crypto:bytes-to-hex
+           (bl.ser:transaction-wire-bytes merged)))))))
 
 ;;;; =====================================================================
 ;;;; Wallet P5 — PSBT SIGNER role: walletprocesspsbt, descriptorprocesspsbt,
@@ -975,23 +975,23 @@ of PSBT whose prevout is known from its OWN witness_utxo / non_witness_utxo —
 the coins map %compute-input-signatures / %wallet-sign-maps consume. redeem /
 witness scripts come from the PSBT input map, else (when WALLET given) from the
 wallet's known sub-scripts. Inputs with no UTXO are absent."
-  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
+  (let ((tx (bl.ser:psbt-tx psbt))
         (coins (make-hash-table :test 'equalp)))
-    (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
-          for in across (bitcoin-lisp.serialization:transaction-inputs tx)
-          for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          for in across (bl.ser:transaction-inputs tx)
+          for op = (bl.ser:tx-in-previous-output in)
           for spk = (%psbt-input-spk map in)
           do (when spk
                (let ((amount (%psbt-input-amount map in))
-                     (redeem (bitcoin-lisp.serialization:psbt-map-find
-                              map bitcoin-lisp.serialization:+psbt-in-redeem-script+))
-                     (witness (bitcoin-lisp.serialization:psbt-map-find
-                               map bitcoin-lisp.serialization:+psbt-in-witness-script+)))
+                     (redeem (bl.ser:psbt-map-find
+                              map bl.ser:+psbt-in-redeem-script+))
+                     (witness (bl.ser:psbt-map-find
+                               map bl.ser:+psbt-in-witness-script+)))
                  (when (and wallet (or (null redeem) (null witness)))
                    (multiple-value-bind (wr ww) (%known-sub-scripts wallet cc spk)
                      (setf redeem (or redeem wr) witness (or witness ww))))
-                 (setf (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
-                                      (bitcoin-lisp.serialization:outpoint-index op))
+                 (setf (gethash (cons (bl.ser:outpoint-hash op)
+                                      (bl.ser:outpoint-index op))
                                 coins)
                        (list spk amount redeem witness)))))
     coins))
@@ -999,10 +999,10 @@ wallet's known sub-scripts. Inputs with no UTXO are absent."
 (defun %psbt-input-signed-p (map)
   "Core PSBTInputSigned (psbt.h): the input already carries a final scriptSig
 or final scriptWitness, so a filler has nothing left to add."
-  (or (bitcoin-lisp.serialization:psbt-map-find
-       map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)
-      (bitcoin-lisp.serialization:psbt-map-find
-       map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+)))
+  (or (bl.ser:psbt-map-find
+       map bl.ser:+psbt-in-final-scriptsig+)
+      (bl.ser:psbt-map-find
+       map bl.ser:+psbt-in-final-scriptwitness+)))
 
 (defun %psbt-fill-wallet-utxos (psbt wallet)
   "For inputs without a non_witness_utxo, add it from the wallet's full
@@ -1021,56 +1021,56 @@ for an input we hold no key for, the ANYONECANPAY guard could not fire and
 the drop would destroy data Core keeps. Our PSBTs are therefore larger than
 Core's for the taproot-only case; that is the safe direction. Settling the
 sighash where Core settles it is the prerequisite for porting the drop."
-  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
+  (let ((tx (bl.ser:psbt-tx psbt))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
-    (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
-          for in across (bitcoin-lisp.serialization:transaction-inputs tx)
-          for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          for in across (bl.ser:transaction-inputs tx)
+          for op = (bl.ser:tx-in-previous-output in)
           do (unless (or (%psbt-input-signed-p map)
-                         (bitcoin-lisp.serialization:psbt-map-find
-                          map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))
+                         (bl.ser:psbt-map-find
+                          map bl.ser:+psbt-in-non-witness-utxo+))
                (let ((wtx (wallet-get-wallet-tx
-                           wallet (bitcoin-lisp.serialization:outpoint-hash op))))
+                           wallet (bl.ser:outpoint-hash op))))
                  (when wtx
-                   (bitcoin-lisp.serialization:psbt-map-set
-                    map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+ empty
-                    (bitcoin-lisp.serialization:transaction-wire-bytes
+                   (bl.ser:psbt-map-set
+                    map bl.ser:+psbt-in-non-witness-utxo+ empty
+                    (bl.ser:transaction-wire-bytes
                      (wallet-tx-tx wtx)))))))))
 
 (defun %psbt-fill-node-utxos (psbt node)
   "For witness inputs with no UTXO field, add witness_utxo from the node's UTXO
 set (descriptorprocesspsbt updates segwit inputs from the UTXO set / mempool)."
-  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
+  (let ((tx (bl.ser:psbt-tx psbt))
         (utxo-set (rpc-get-utxo-set node)))
     (when utxo-set
-      (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
-            for in across (bitcoin-lisp.serialization:transaction-inputs tx)
-            for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
-            do (unless (or (bitcoin-lisp.serialization:psbt-map-find
-                            map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)
-                           (bitcoin-lisp.serialization:psbt-map-find
-                            map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))
-                 (let ((entry (bitcoin-lisp.storage:get-utxo
+      (loop for map across (bl.ser:psbt-inputs psbt)
+            for in across (bl.ser:transaction-inputs tx)
+            for op = (bl.ser:tx-in-previous-output in)
+            do (unless (or (bl.ser:psbt-map-find
+                            map bl.ser:+psbt-in-witness-utxo+)
+                           (bl.ser:psbt-map-find
+                            map bl.ser:+psbt-in-non-witness-utxo+))
+                 (let ((entry (bl.store:get-utxo
                                utxo-set
-                               (bitcoin-lisp.serialization:outpoint-hash op)
-                               (bitcoin-lisp.serialization:outpoint-index op))))
+                               (bl.ser:outpoint-hash op)
+                               (bl.ser:outpoint-index op))))
                    (when (and entry (%psbt-witness-spk-p
-                                     (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
-                     (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
-                       (bitcoin-lisp.serialization:bb-write-tx-out
-                        bb (bitcoin-lisp.serialization:make-tx-out
-                            :value (bitcoin-lisp.storage:utxo-entry-value entry)
-                            :script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
-                       (bitcoin-lisp.serialization:psbt-map-set
-                        map bitcoin-lisp.serialization:+psbt-in-witness-utxo+
+                                     (bl.store:utxo-entry-script-pubkey entry)))
+                     (let ((bb (bl.ser:make-byte-buf)))
+                       (bl.ser:bb-write-tx-out
+                        bb (bl.ser:make-tx-out
+                            :value (bl.store:utxo-entry-value entry)
+                            :script-pubkey (bl.store:utxo-entry-script-pubkey entry)))
+                       (bl.ser:psbt-map-set
+                        map bl.ser:+psbt-in-witness-utxo+
                         (make-array 0 :element-type '(unsigned-byte 8))
-                        (bitcoin-lisp.serialization:bb-finish bb))))))))))
+                        (bl.ser:bb-finish bb))))))))))
 
 ;;; --- Recording signatures + derivations ---
 
 (defun %psbt-input-sighash-stored (map)
-  (let ((sh (bitcoin-lisp.serialization:psbt-map-find
-             map bitcoin-lisp.serialization:+psbt-in-sighash+)))
+  (let ((sh (bl.ser:psbt-map-find
+             map bl.ser:+psbt-in-sighash+)))
     (and sh (loop for j below 4 sum (ash (aref sh j) (* 8 j))))))
 
 (defun %psbt-effective-sighash (spk user-sighash stored-sighash)
@@ -1078,7 +1078,7 @@ set (descriptorprocesspsbt updates segwit inputs from the UTXO set / mempool)."
 param, else SIGHASH_DEFAULT(0) for taproot / SIGHASH_ALL(1) otherwise; a stored
 +psbt-in-sighash+ must match. RECORD-P is true when EFFECTIVE is non-default and
 must be written to the input (taproot: != DEFAULT; else != DEFAULT and != ALL)."
-  (let* ((taproot (eq (bitcoin-lisp.validation:classify-script spk)
+  (let* ((taproot (eq (bl.val:classify-script spk)
                       :witness-v1-taproot))
          (eff (or user-sighash (if taproot #x00 #x01))))
     (when (and stored-sighash (/= stored-sighash eff))
@@ -1102,10 +1102,10 @@ the witness_utxo (no non_witness_utxo) can only be signed with a witness
 signature — witness_utxo alone cannot authenticate a non-witness (legacy) spend,
 so a legacy signature over it must be refused. True when witness_utxo is present
 and non_witness_utxo is absent."
-  (and (bitcoin-lisp.serialization:psbt-map-find
-        map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)
-       (not (bitcoin-lisp.serialization:psbt-map-find
-             map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))))
+  (and (bl.ser:psbt-map-find
+        map bl.ser:+psbt-in-witness-utxo+)
+       (not (bl.ser:psbt-map-find
+             map bl.ser:+psbt-in-non-witness-utxo+))))
 
 (defun %psbt-taproot-script-witness (map)
   "The witness for a taproot SCRIPT-path spend assembled from MAP's
@@ -1122,16 +1122,16 @@ transaction that reports itself complete.
 
 Signature order follows the script, and the multi_a stack runs OPPOSITE to key
 order -- see TR-LEAF-SATISFACTION, which derives why."
-  (let ((leaves (bitcoin-lisp.serialization:psbt-map-collect
-                 map bitcoin-lisp.serialization:+psbt-in-tap-leaf-script+))
-        (sigs (bitcoin-lisp.serialization:psbt-map-collect
-               map bitcoin-lisp.serialization:+psbt-in-tap-script-sig+))
+  (let ((leaves (bl.ser:psbt-map-collect
+                 map bl.ser:+psbt-in-tap-leaf-script+))
+        (sigs (bl.ser:psbt-map-collect
+               map bl.ser:+psbt-in-tap-script-sig+))
         (best nil) (best-size nil))
     (dolist (leaf leaves best)
       (destructuring-bind (control . value) leaf
         (when (plusp (length value))
           (let* ((script (subseq value 0 (1- (length value))))
-                 (leaf-hash (bitcoin-lisp.crypto:tap-leaf-hash
+                 (leaf-hash (bl.crypto:tap-leaf-hash
                              (aref value (1- (length value))) script))
                  (satisfaction (%tapscript-satisfaction script leaf-hash sigs)))
             (when satisfaction
@@ -1169,7 +1169,7 @@ TR-LEAF-SATISFACTION handles; anything else is left unfinalized."
                                 (let ((kd (car r)))
                                   (and (>= (length kd) 64)
                                        (equalp (subseq kd 32 64) leaf-hash)
-                                       (equalp (bitcoin-lisp.crypto:hash160
+                                       (equalp (bl.crypto:hash160
                                                 (subseq kd 0 32))
                                                hash))))
                               sigs)))
@@ -1218,7 +1218,7 @@ too few of its keys have signed."
 PSBT-MAP-FIND matches on the key TYPE alone, which is right for the singleton
 fields and wrong for the taproot ones — a script-path input carries one
 TAP_SCRIPT_SIG per (key, leaf) and one TAP_LEAF_SCRIPT per control block."
-  (loop for (kd . nil) in (bitcoin-lisp.serialization:psbt-map-collect map keytype)
+  (loop for (kd . nil) in (bl.ser:psbt-map-collect map keytype)
         thereis (equalp kd keydata)))
 
 (defun %psbt-record-signatures (psbt coins keymap pubmap tr-keymap user-sighash
@@ -1229,26 +1229,26 @@ maps can satisfy, sourcing prevouts from COINS. ECDSA partial sigs go into
 +psbt-in-tap-key-sig+; a non-default sighash into +psbt-in-sighash+, and the
 P2SH/P2WSH sub-scripts revealed (needed for finalization). Never finalizes. A
 key we do not hold (or an unsourceable prevout) leaves the input untouched."
-  (let* ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
-         (inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+  (let* ((tx (bl.ser:psbt-tx psbt))
+         (inputs (bl.ser:transaction-inputs tx))
          (n (length inputs))
          (spent-utxos (%build-spent-utxos inputs coins))
-         (bitcoin-lisp.coalton.interop::*current-tx* tx)
-         (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent-utxos)
-         (precomp (bitcoin-lisp.coalton.interop::init-precomputed-sighash tx spent-utxos))
+         (bl.interop::*current-tx* tx)
+         (bl.interop::*current-spent-utxos* spent-utxos)
+         (precomp (bl.interop::init-precomputed-sighash tx spent-utxos))
          (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (dotimes (i n)
-      (let* ((map (aref (bitcoin-lisp.serialization:psbt-inputs psbt) i))
+      (let* ((map (aref (bl.ser:psbt-inputs psbt) i))
              (in (aref inputs i))
-             (op (bitcoin-lisp.serialization:tx-in-previous-output in))
-             (prev (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
-                                  (bitcoin-lisp.serialization:outpoint-index op))
+             (op (bl.ser:tx-in-previous-output in))
+             (prev (gethash (cons (bl.ser:outpoint-hash op)
+                                  (bl.ser:outpoint-index op))
                             coins)))
         (unless (or (null prev)
-                    (bitcoin-lisp.serialization:psbt-map-find
-                     map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)
-                    (bitcoin-lisp.serialization:psbt-map-find
-                     map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+))
+                    (bl.ser:psbt-map-find
+                     map bl.ser:+psbt-in-final-scriptsig+)
+                    (bl.ser:psbt-map-find
+                     map bl.ser:+psbt-in-final-scriptwitness+))
           (multiple-value-bind (eff record-p sherr)
               (%psbt-effective-sighash (first prev) user-sighash
                                        (%psbt-input-sighash-stored map))
@@ -1265,20 +1265,20 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                             (and (%psbt-require-witness-sig-p map)
                                  (not (%input-sig-witness-p sig))))
                   (when (and (input-sig-redeem sig)
-                             (not (bitcoin-lisp.serialization:psbt-map-find
-                                   map bitcoin-lisp.serialization:+psbt-in-redeem-script+)))
-                    (bitcoin-lisp.serialization:psbt-map-set
-                     map bitcoin-lisp.serialization:+psbt-in-redeem-script+ empty
+                             (not (bl.ser:psbt-map-find
+                                   map bl.ser:+psbt-in-redeem-script+)))
+                    (bl.ser:psbt-map-set
+                     map bl.ser:+psbt-in-redeem-script+ empty
                      (input-sig-redeem sig)))
                   (when (and (input-sig-witness-script sig)
-                             (not (bitcoin-lisp.serialization:psbt-map-find
-                                   map bitcoin-lisp.serialization:+psbt-in-witness-script+)))
-                    (bitcoin-lisp.serialization:psbt-map-set
-                     map bitcoin-lisp.serialization:+psbt-in-witness-script+ empty
+                             (not (bl.ser:psbt-map-find
+                                   map bl.ser:+psbt-in-witness-script+)))
+                    (bl.ser:psbt-map-set
+                     map bl.ser:+psbt-in-witness-script+ empty
                      (input-sig-witness-script sig)))
                   (when record-p
-                    (bitcoin-lisp.serialization:psbt-map-set
-                     map bitcoin-lisp.serialization:+psbt-in-sighash+ empty
+                    (bl.ser:psbt-map-set
+                     map bl.ser:+psbt-in-sighash+ empty
                      (%psbt-uint32-le eff)))
                   ;; Core CreateSig reuses a signature already present for a key
                   ;; (input.FillSignatureData loads existing partial_sigs) rather
@@ -1286,14 +1286,14 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                   ;; keeps its existing sig. Never overwrite one we already hold.
                   (dolist (pair (input-sig-ecdsa sig))
                     (unless (%psbt-sig-for map (car pair))
-                      (bitcoin-lisp.serialization:psbt-map-set
-                       map bitcoin-lisp.serialization:+psbt-in-partial-sig+
+                      (bl.ser:psbt-map-set
+                       map bl.ser:+psbt-in-partial-sig+
                        (car pair) (cdr pair))))
                   (when (and (input-sig-tap sig)
-                             (not (bitcoin-lisp.serialization:psbt-map-find
-                                   map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+)))
-                    (bitcoin-lisp.serialization:psbt-map-set
-                     map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+ empty
+                             (not (bl.ser:psbt-map-find
+                                   map bl.ser:+psbt-in-tap-key-sig+)))
+                    (bl.ser:psbt-map-set
+                     map bl.ser:+psbt-in-tap-key-sig+ empty
                      (input-sig-tap sig)))
                   ;; A taproot SCRIPT path is recorded in parts, never as the
                   ;; finished witness: PSBT_IN_TAP_SCRIPT_SIG keyed by
@@ -1306,19 +1306,19 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                       (let ((keydata (concatenate '(vector (unsigned-byte 8))
                                                   xonly leaf-hash)))
                         (unless (%psbt-record-present-p
-                                 map bitcoin-lisp.serialization:+psbt-in-tap-script-sig+
+                                 map bl.ser:+psbt-in-tap-script-sig+
                                  keydata)
-                          (bitcoin-lisp.serialization:psbt-map-set
-                           map bitcoin-lisp.serialization:+psbt-in-tap-script-sig+
+                          (bl.ser:psbt-map-set
+                           map bl.ser:+psbt-in-tap-script-sig+
                            keydata tap-sig)))))
                   (let ((leaf (input-sig-tap-leaf sig)))
                     (when leaf
                       (destructuring-bind (script . control) leaf
                         (unless (%psbt-record-present-p
-                                 map bitcoin-lisp.serialization:+psbt-in-tap-leaf-script+
+                                 map bl.ser:+psbt-in-tap-leaf-script+
                                  control)
-                          (bitcoin-lisp.serialization:psbt-map-set
-                           map bitcoin-lisp.serialization:+psbt-in-tap-leaf-script+
+                          (bl.ser:psbt-map-set
+                           map bl.ser:+psbt-in-tap-leaf-script+
                            control
                            (concatenate '(vector (unsigned-byte 8))
                                         script
@@ -1327,28 +1327,28 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
 (defun %psbt-add-map-derivs (map spk pos pairs)
   "Add +psbt-in-bip32+ (ECDSA) / +psbt-in-tap-internal-key+ (taproot) records to
 MAP for the (desc-key . pubkey) PAIRS expanded at POS for scriptPubKey SPK."
-  (let ((taproot (eq (bitcoin-lisp.validation:classify-script spk)
+  (let ((taproot (eq (bl.val:classify-script spk)
                      :witness-v1-taproot))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (loop for (key . pubkey) in pairs
           do (if taproot
-                 (bitcoin-lisp.serialization:psbt-map-set
-                  map bitcoin-lisp.serialization:+psbt-in-tap-internal-key+ empty
+                 (bl.ser:psbt-map-set
+                  map bl.ser:+psbt-in-tap-internal-key+ empty
                   (%key-xonly-bytes pubkey))
                  (multiple-value-bind (fpr path) (%desc-key-origin-info key pubkey pos)
-                   (bitcoin-lisp.serialization:psbt-map-set
-                    map bitcoin-lisp.serialization:+psbt-in-bip32+ pubkey
+                   (bl.ser:psbt-map-set
+                    map bl.ser:+psbt-in-bip32+ pubkey
                     (%psbt-bip32-value fpr path)))))))
 
 (defun %psbt-add-wallet-input-derivs (psbt coins wallet)
   "Add input bip32 derivations / taproot internal keys for wallet-owned inputs
 (Core FillPSBT bip32derivs). Metadata only — helps offline signers."
-  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt)))
-    (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
-          for in across (bitcoin-lisp.serialization:transaction-inputs tx)
-          for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
-          for entry = (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
-                                     (bitcoin-lisp.serialization:outpoint-index op))
+  (let ((tx (bl.ser:psbt-tx psbt)))
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          for in across (bl.ser:transaction-inputs tx)
+          for op = (bl.ser:tx-in-previous-output in)
+          for entry = (gethash (cons (bl.ser:outpoint-hash op)
+                                     (bl.ser:outpoint-index op))
                                coins)
           for spk = (and entry (first entry))
           do (when spk
@@ -1361,33 +1361,33 @@ MAP for the (desc-key . pubkey) PAIRS expanded at POS for scriptPubKey SPK."
 (defun %psbt-add-wallet-output-derivs (psbt wallet)
   "Add output bip32 derivations / redeem / witness scripts for wallet-owned
 outputs so an offline signer can identify change (Core UpdatePSBTOutput)."
-  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
+  (let ((tx (bl.ser:psbt-tx psbt))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
-    (loop for map across (bitcoin-lisp.serialization:psbt-outputs psbt)
-          for out across (bitcoin-lisp.serialization:transaction-outputs tx)
-          for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey out)
+    (loop for map across (bl.ser:psbt-outputs psbt)
+          for out across (bl.ser:transaction-outputs tx)
+          for spk = (bl.ser:tx-out-script-pubkey out)
           do (multiple-value-bind (spkm pos) (%wallet-owning-spkm wallet spk)
                (when spkm
                  (multiple-value-bind (redeem witness) (%spkm-sub-scripts spkm spk)
                    (when redeem
-                     (bitcoin-lisp.serialization:psbt-map-set
-                      map bitcoin-lisp.serialization:+psbt-out-redeem-script+ empty redeem))
+                     (bl.ser:psbt-map-set
+                      map bl.ser:+psbt-out-redeem-script+ empty redeem))
                    (when witness
-                     (bitcoin-lisp.serialization:psbt-map-set
-                      map bitcoin-lisp.serialization:+psbt-out-witness-script+ empty witness)))
+                     (bl.ser:psbt-map-set
+                      map bl.ser:+psbt-out-witness-script+ empty witness)))
                  (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
                    (declare (ignore scripts))
-                   (let ((taproot (eq (bitcoin-lisp.validation:classify-script spk)
+                   (let ((taproot (eq (bl.val:classify-script spk)
                                       :witness-v1-taproot)))
                      (loop for (key . pubkey) in pairs
                            do (if taproot
-                                  (bitcoin-lisp.serialization:psbt-map-set
-                                   map bitcoin-lisp.serialization:+psbt-out-tap-internal-key+
+                                  (bl.ser:psbt-map-set
+                                   map bl.ser:+psbt-out-tap-internal-key+
                                    empty (%key-xonly-bytes pubkey))
                                   (multiple-value-bind (fpr path)
                                       (%desc-key-origin-info key pubkey pos)
-                                    (bitcoin-lisp.serialization:psbt-map-set
-                                     map bitcoin-lisp.serialization:+psbt-out-bip32+ pubkey
+                                    (bl.ser:psbt-map-set
+                                     map bl.ser:+psbt-out-bip32+ pubkey
                                      (%psbt-bip32-value fpr path))))))))))))
 
 ;;; --- Completeness / extract ---
@@ -1395,15 +1395,15 @@ outputs so an offline signer can identify change (Core UpdatePSBTOutput)."
 (defun %psbt-finalize-in-place (psbt)
   "Finalize every finalizable input of PSBT in place (finalizepsbt machinery).
 Returns T when EVERY input is final."
-  (let* ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
-         (ins (bitcoin-lisp.serialization:transaction-inputs tx))
+  (let* ((tx (bl.ser:psbt-tx psbt))
+         (ins (bl.ser:transaction-inputs tx))
          (complete t))
     (dotimes (i (length ins))
-      (let ((map (aref (bitcoin-lisp.serialization:psbt-inputs psbt) i)))
-        (if (or (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)
-                (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+))
+      (let ((map (aref (bl.ser:psbt-inputs psbt) i)))
+        (if (or (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-in-final-scriptsig+)
+                (bl.ser:psbt-map-find
+                 map bl.ser:+psbt-in-final-scriptwitness+))
             nil
             (let ((spk (%psbt-input-spk map (aref ins i))))
               (multiple-value-bind (ss wit)
@@ -1415,8 +1415,8 @@ Returns T when EVERY input is final."
 
 (defun %psbt-copy (psbt)
   "A deep copy of PSBT via its serialization."
-  (bitcoin-lisp.serialization:decode-psbt
-   (bitcoin-lisp.serialization:encode-psbt psbt)))
+  (bl.ser:decode-psbt
+   (bl.ser:encode-psbt psbt)))
 
 (defun %psbt-signer-result (psbt finalize)
   "The {psbt, complete, hex?} object of walletprocesspsbt / descriptorprocesspsbt.
@@ -1426,7 +1426,7 @@ every input can be finalized, even without finalize=true)."
   (when finalize (%psbt-finalize-in-place psbt))
   (let* ((trial (%psbt-copy psbt))
          (complete (%psbt-finalize-in-place trial)))
-    (append `(("psbt" . ,(bitcoin-lisp.serialization:encode-psbt psbt))
+    (append `(("psbt" . ,(bl.ser:encode-psbt psbt))
               ("complete" . ,(json-bool complete)))
             (when complete
               `(("hex" . ,(%psbt-extract-hex trial)))))))
@@ -1458,7 +1458,7 @@ Returns {psbt, complete, hex?}."
               (%psbt-add-wallet-output-derivs psbt wallet))
             (when sign
               (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
-                  (%wallet-sign-maps wallet (bitcoin-lisp.serialization:psbt-tx psbt) coins)
+                  (%wallet-sign-maps wallet (bl.ser:psbt-tx psbt) coins)
                 (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash
                                          tr-scripts)))
             (%psbt-signer-result psbt finalize)))))))
@@ -1512,11 +1512,11 @@ through the shared %sign-map-add-key!."
   (let ((keymap (make-hash-table :test 'equalp))
         (pubmap (make-hash-table :test 'equalp))
         (tr-keymap (make-hash-table :test 'equalp)))
-    (bitcoin-lisp.serialization:dovector
-        (in (bitcoin-lisp.serialization:transaction-inputs tx))
-      (let* ((op (bitcoin-lisp.serialization:tx-in-previous-output in))
-             (entry (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
-                                   (bitcoin-lisp.serialization:outpoint-index op))
+    (bl.ser:dovector
+        (in (bl.ser:transaction-inputs tx))
+      (let* ((op (bl.ser:tx-in-previous-output in))
+             (entry (gethash (cons (bl.ser:outpoint-hash op)
+                                   (bl.ser:outpoint-index op))
                              coins))
              (script (and entry (first entry)))
              (exp (and script (gethash script expansions))))
@@ -1531,12 +1531,12 @@ through the shared %sign-map-add-key!."
     (values keymap pubmap tr-keymap)))
 
 (defun %psbt-add-descriptor-input-derivs (psbt coins expansions)
-  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt)))
-    (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
-          for in across (bitcoin-lisp.serialization:transaction-inputs tx)
-          for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
-          for entry = (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
-                                     (bitcoin-lisp.serialization:outpoint-index op))
+  (let ((tx (bl.ser:psbt-tx psbt)))
+    (loop for map across (bl.ser:psbt-inputs psbt)
+          for in across (bl.ser:transaction-inputs tx)
+          for op = (bl.ser:tx-in-previous-output in)
+          for entry = (gethash (cons (bl.ser:outpoint-hash op)
+                                     (bl.ser:outpoint-index op))
                                coins)
           for spk = (and entry (first entry))
           for exp = (and spk (gethash spk expansions))
@@ -1563,7 +1563,7 @@ PARAMS: (psbt descriptors [sighashtype] [bip32derivs] [finalize])."
         (when bip32derivs
           (%psbt-add-descriptor-input-derivs psbt coins expansions))
         (multiple-value-bind (keymap pubmap tr-keymap)
-            (%descriptor-sign-maps expansions (bitcoin-lisp.serialization:psbt-tx psbt) coins)
+            (%descriptor-sign-maps expansions (bl.ser:psbt-tx psbt) coins)
           (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash))
         (%psbt-signer-result psbt finalize)))))
 
@@ -1574,38 +1574,38 @@ PARAMS: (psbt descriptors [sighashtype] [bip32derivs] [finalize])."
   "Build an UNSIGNED PSBT for the wallet-funded TX: witness_utxo (+ non_witness_utxo
 when the full previous tx is in the wallet) per input, plus, when BIP32DERIVS,
 input/output bip32 derivations. Mirrors Core FillPSBT(sign=false)."
-  (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-         (psbt (bitcoin-lisp.serialization:make-empty-psbt tx))
+  (let* ((inputs (bl.ser:transaction-inputs tx))
+         (psbt (bl.ser:make-empty-psbt tx))
          (coins (%wallet-input-coins node wallet tx))
          (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (dotimes (i (length inputs))
       (let* ((in (aref inputs i))
-             (op (bitcoin-lisp.serialization:tx-in-previous-output in))
-             (txid (bitcoin-lisp.serialization:outpoint-hash op))
-             (vout (bitcoin-lisp.serialization:outpoint-index op))
+             (op (bl.ser:tx-in-previous-output in))
+             (txid (bl.ser:outpoint-hash op))
+             (vout (bl.ser:outpoint-index op))
              (entry (gethash (cons txid vout) coins))
-             (map (aref (bitcoin-lisp.serialization:psbt-inputs psbt) i)))
+             (map (aref (bl.ser:psbt-inputs psbt) i)))
         (when entry
-          (bitcoin-lisp.serialization:psbt-map-set
-           map bitcoin-lisp.serialization:+psbt-in-witness-utxo+ empty
+          (bl.ser:psbt-map-set
+           map bl.ser:+psbt-in-witness-utxo+ empty
            (%serialize-txout-bytes
-            (bitcoin-lisp.serialization:make-tx-out
+            (bl.ser:make-tx-out
              :value (second entry) :script-pubkey (first entry))))
           (when (third entry)
-            (bitcoin-lisp.serialization:psbt-map-set
-             map bitcoin-lisp.serialization:+psbt-in-redeem-script+ empty (third entry)))
+            (bl.ser:psbt-map-set
+             map bl.ser:+psbt-in-redeem-script+ empty (third entry)))
           (when (fourth entry)
-            (bitcoin-lisp.serialization:psbt-map-set
-             map bitcoin-lisp.serialization:+psbt-in-witness-script+ empty (fourth entry)))
+            (bl.ser:psbt-map-set
+             map bl.ser:+psbt-in-witness-script+ empty (fourth entry)))
           (let ((wtx (wallet-get-wallet-tx wallet txid)))
             (when wtx
-              (bitcoin-lisp.serialization:psbt-map-set
-               map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+ empty
-               (bitcoin-lisp.serialization:transaction-wire-bytes (wallet-tx-tx wtx))))))))
+              (bl.ser:psbt-map-set
+               map bl.ser:+psbt-in-non-witness-utxo+ empty
+               (bl.ser:transaction-wire-bytes (wallet-tx-tx wtx))))))))
     (when bip32derivs
       (%psbt-add-wallet-input-derivs psbt coins wallet)
       (%psbt-add-wallet-output-derivs psbt wallet))
-    (bitcoin-lisp.serialization:encode-psbt psbt)))
+    (bl.ser:encode-psbt psbt)))
 
 ;;; --- walletcreatefundedpsbt (wallet/rpc/spend.cpp:1657) ---
 
@@ -1665,21 +1665,21 @@ book entry."
 (defun %all-inputs-mine (node wallet tx)
   "Core AllInputsMine: every input of TX spends a wallet-owned output."
   (block scan
-    (bitcoin-lisp.serialization:dovector
-        (in (bitcoin-lisp.serialization:transaction-inputs tx))
-      (let* ((op (bitcoin-lisp.serialization:tx-in-previous-output in))
+    (bl.ser:dovector
+        (in (bl.ser:transaction-inputs tx))
+      (let* ((op (bl.ser:tx-in-previous-output in))
              (txout (%wallet-input-txout node wallet
-                                         (bitcoin-lisp.serialization:outpoint-hash op)
-                                         (bitcoin-lisp.serialization:outpoint-index op))))
+                                         (bl.ser:outpoint-hash op)
+                                         (bl.ser:outpoint-index op))))
         (unless (and txout (wallet-is-mine
-                            wallet (bitcoin-lisp.serialization:tx-out-script-pubkey txout)))
+                            wallet (bl.ser:tx-out-script-pubkey txout)))
           (return-from scan nil))))
     t))
 
 (defun %wallet-has-spend (wallet tx)
   "Core CWallet::HasWalletSpend: a wallet tx spends one of TX's outputs."
-  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-    (dotimes (n (length (bitcoin-lisp.serialization:transaction-outputs tx)) nil)
+  (let ((txid (bl.ser:transaction-hash tx)))
+    (dotimes (n (length (bl.ser:transaction-outputs tx)) nil)
       (when (gethash (%wtx-outpoint-key txid n) (wallet-tx-spends wallet))
         (return t)))))
 
@@ -1687,12 +1687,12 @@ book entry."
   "Core feebumper::PreconditionChecks. Returns (values ok error-code error-msg).
 Adds the task-mandated BIP125-replaceable requirement on the original tx."
   (let ((tx (wallet-tx-tx wtx))
-        (mempool (bitcoin-lisp::node-mempool node)))
+        (mempool (bl::node-mempool node)))
     (cond
       ((%wallet-has-spend wallet tx)
        (values nil +rpc-invalid-parameter+ "Transaction has descendants in the wallet"))
       ((and mempool (plusp (hash-table-count
-                            (bitcoin-lisp.mempool:mempool-descendants
+                            (bl.mp:mempool-descendants
                              mempool (wallet-tx-txid wtx)))))
        (values nil +rpc-invalid-parameter+ "Transaction has descendants in the mempool"))
       ((/= (wallet-tx-depth wallet wtx) 0)
@@ -1703,7 +1703,7 @@ Adds the task-mandated BIP125-replaceable requirement on the original tx."
                (format nil "Cannot bump transaction ~A which was already bumped by transaction ~A"
                        (hash-to-hex (wallet-tx-txid wtx))
                        (cdr (assoc "replaced_by_txid" (wallet-tx-map-value wtx) :test #'string=)))))
-      ((not (bitcoin-lisp.mempool:tx-signals-rbf-p tx))
+      ((not (bl.mp:tx-signals-rbf-p tx))
        (values nil +rpc-wallet-error+
                "Transaction is not BIP 125 replaceable"))
       ((and require-mine (not (%all-inputs-mine node wallet tx)))
@@ -1715,9 +1715,9 @@ Adds the task-mandated BIP125-replaceable requirement on the original tx."
   "Core feebumper::EstimateFeeRate (sat/kvB): the original feerate + 1 sat/kvB +
 max(node incremental, wallet incremental), floored at GetMinimumFeeRate."
   (declare (ignore wallet))
-  (let* ((txsize (bitcoin-lisp.serialization:transaction-vsize orig))
+  (let* ((txsize (bl.ser:transaction-vsize orig))
          (base (if (plusp txsize) (floor (* old-fee 1000) txsize) 0))
-         (feerate (+ base 1 (max bitcoin-lisp.mempool::+incremental-relay-fee-rate+
+         (feerate (+ base 1 (max bl.mp::+incremental-relay-fee-rate+
                                  +wallet-incremental-relay-fee-rate+)))
          (min-rate (%wallet-minimum-fee-rate node cc)))
     (max feerate min-rate)))
@@ -1732,41 +1732,41 @@ Caller holds node + wallet locks."
       (return-from %create-rate-bump
         (values nil +rpc-invalid-address-or-key+ "Invalid or non-wallet transaction id")))
     (let* ((orig (wallet-tx-tx wtx))
-           (inputs (bitcoin-lisp.serialization:transaction-inputs orig))
+           (inputs (bl.ser:transaction-inputs orig))
            (input-value 0))
       ;; Retrieve every input's coin; select it on the coin control (external
       ;; inputs get their txout preset). A spent input aborts.
-      (bitcoin-lisp.serialization:dovector (in inputs)
-        (let* ((op (bitcoin-lisp.serialization:tx-in-previous-output in))
-               (thash (bitcoin-lisp.serialization:outpoint-hash op))
-               (n (bitcoin-lisp.serialization:outpoint-index op))
+      (bl.ser:dovector (in inputs)
+        (let* ((op (bl.ser:tx-in-previous-output in))
+               (thash (bl.ser:outpoint-hash op))
+               (n (bl.ser:outpoint-index op))
                (txout (%wallet-input-txout node wallet thash n)))
           (unless txout
             (return-from %create-rate-bump
               (values nil +rpc-misc-error+
                       (format nil "~A:~D is already spent" (hash-to-hex thash) n))))
           (let ((preset (wcc-select cc thash n)))
-            (unless (wallet-is-mine wallet (bitcoin-lisp.serialization:tx-out-script-pubkey txout))
+            (unless (wallet-is-mine wallet (bl.ser:tx-out-script-pubkey txout))
               (setf (wcc-preset-txout preset) txout)))
-          (incf input-value (bitcoin-lisp.serialization:tx-out-value txout))))
+          (incf input-value (bl.ser:tx-out-value txout))))
       ;; Preconditions.
       (multiple-value-bind (ok code msg)
           (%bump-precondition-checks node wallet wtx require-mine)
         (unless ok (return-from %create-rate-bump (values nil code msg))))
-      (let* ((output-value (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs orig)
-                                   :key #'bitcoin-lisp.serialization:tx-out-value
+      (let* ((output-value (reduce #'+ (bl.ser:transaction-outputs orig)
+                                   :key #'bl.ser:tx-out-value
                                    :initial-value 0))
              (old-fee (- input-value output-value))
              (network (wallet-network wallet))
              (recipients '()))
         ;; Recipients = original outputs; a single change output becomes destChange.
-        (bitcoin-lisp.serialization:dovector
-            (out (bitcoin-lisp.serialization:transaction-outputs orig))
-          (let ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
+        (bl.ser:dovector
+            (out (bl.ser:transaction-outputs orig))
+          (let ((spk (bl.ser:tx-out-script-pubkey out)))
             (if (%output-is-change wallet spk)
                 (setf (wcc-dest-change cc) spk)
                 (push (make-recipient :script spk
-                                      :amount (bitcoin-lisp.serialization:tx-out-value out)
+                                      :amount (bl.ser:tx-out-value out)
                                       :address (%script->address spk network))
                       recipients))))
         (setf recipients (nreverse recipients))
@@ -1785,10 +1785,10 @@ Caller holds node + wallet locks."
             (setf (wcc-feerate cc) (%bump-estimate-feerate node wallet orig old-fee cc)
                   (wcc-override-feerate cc) t))
         ;; Re-spend all original inputs; may add more; no new unconfirmed inputs.
-        (bitcoin-lisp.serialization:dovector (in inputs)
-          (let ((op (bitcoin-lisp.serialization:tx-in-previous-output in)))
-            (wcc-select cc (bitcoin-lisp.serialization:outpoint-hash op)
-                        (bitcoin-lisp.serialization:outpoint-index op))))
+        (bl.ser:dovector (in inputs)
+          (let ((op (bl.ser:tx-in-previous-output in)))
+            (wcc-select cc (bl.ser:outpoint-hash op)
+                        (bl.ser:outpoint-index op))))
         (setf (wcc-allow-other-inputs cc) t
               (wcc-min-depth cc) 1)
         (multiple-value-bind (new-tx new-fee) (%create-transaction node wallet recipients nil cc nil)
@@ -1802,8 +1802,8 @@ Caller holds node + wallet locks."
           ;; it here so a too-low bump fails BEFORE we sign / mark the original
           ;; replaced (%create-transaction already caps at -maxtxfee).
           (let ((min-total (+ old-fee
-                              (%feerate-fee bitcoin-lisp.mempool::+incremental-relay-fee-rate+
-                                            (bitcoin-lisp.serialization:transaction-vsize new-tx)))))
+                              (%feerate-fee bl.mp::+incremental-relay-fee-rate+
+                                            (bl.ser:transaction-vsize new-tx)))))
             (when (< new-fee min-total)
               (return-from %create-rate-bump
                 (values nil +rpc-invalid-parameter+
@@ -1866,7 +1866,7 @@ estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
                     (multiple-value-bind (ok code2 msg2)
                         (%bump-precondition-checks node wallet old-wtx nil)
                       (unless ok (error 'rpc-error :code code2 :message msg2)))
-                    (let ((new-txid (bitcoin-lisp.serialization:transaction-hash mtx)))
+                    (let ((new-txid (bl.ser:transaction-hash mtx)))
                       (%wallet-commit-transaction
                        node wallet mtx
                        (list (cons "replaces_txid" (hash-to-hex txid))))
