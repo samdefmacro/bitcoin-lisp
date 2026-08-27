@@ -100,43 +100,6 @@ single Write may transiently hold up to 64 bits before draining)."
     (loop while (= (gcs-reader-read-bit r) 1) do (incf q))
     (+ (ash q p) (gcs-reader-read-bits r p))))
 
-;;; --------------------------------------------------------------------------
-;;; CompactSize helpers over adjustable byte vectors
-;;; --------------------------------------------------------------------------
-
-(defun %vec-push-compact-size (out value)
-  "Append VALUE to adjustable byte vector OUT as a Bitcoin CompactSize."
-  (cond
-    ((< value 253) (vector-push-extend value out))
-    ((<= value #xffff)
-     (vector-push-extend 253 out)
-     (dotimes (i 2) (vector-push-extend (logand (ash value (* -8 i)) #xff) out)))
-    ((<= value #xffffffff)
-     (vector-push-extend 254 out)
-     (dotimes (i 4) (vector-push-extend (logand (ash value (* -8 i)) #xff) out)))
-    (t
-     (vector-push-extend 255 out)
-     (dotimes (i 8) (vector-push-extend (logand (ash value (* -8 i)) #xff) out)))))
-
-(defun %read-compact-size-at (bytes pos)
-  "Read a CompactSize from BYTES starting at POS. Returns (values value next-pos)."
-  (let ((first (aref bytes pos)))
-    (cond
-      ((< first 253) (values first (1+ pos)))
-      ((= first 253)
-       (values (logior (aref bytes (+ pos 1)) (ash (aref bytes (+ pos 2)) 8))
-               (+ pos 3)))
-      ((= first 254)
-       (values (loop for i below 4 sum (ash (aref bytes (+ pos 1 i)) (* 8 i)))
-               (+ pos 5)))
-      (t
-       (values (loop for i below 8 sum (ash (aref bytes (+ pos 1 i)) (* 8 i)))
-               (+ pos 9))))))
-
-;;; --------------------------------------------------------------------------
-;;; GCS filter construction and matching (blockfilter.cpp GCSFilter)
-;;; --------------------------------------------------------------------------
-
 (defun gcs-fast-range (x n)
   "FastRange64 (util/fastrange.h): the high 64 bits of the 128-bit product X*N,
 mapping the 64-bit hash X uniformly into [0, N)."
@@ -165,8 +128,8 @@ The result is CompactSize(N) followed by the Golomb-Rice coded delta stream of
 the sorted hashed set. Callers must deduplicate ELEMENTS first (N counts them)."
   (let* ((n (length elements))
          (f (* n m))
-         (out (make-array 32 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
-    (%vec-push-compact-size out n)
+         (out (bitcoin-lisp.bytes:make-byte-buf)))
+    (bitcoin-lisp.bytes:bb-write-varint out n)
     (when (plusp n)
       (let ((w (%make-gcs-writer))
             (last 0))
@@ -174,8 +137,8 @@ the sorted hashed set. Callers must deduplicate ELEMENTS first (N counts them)."
               do (gcs-golomb-encode w p (- v last))
                  (setf last v))
         (gcs-writer-flush w)
-        (loop for b across (gcs-writer-bytes w) do (vector-push-extend b out))))
-    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+        (bitcoin-lisp.bytes:bb-write-bytes out (gcs-writer-bytes w))))
+    (bitcoin-lisp.bytes:bb-finish out)))
 
 (defun gcs-filter-match-any (encoded k0 k1 elements
                              &key (p +basic-filter-p+) (m +basic-filter-m+))
@@ -184,7 +147,12 @@ the sorted hashed set. Callers must deduplicate ELEMENTS first (N counts them)."
 May return true on a false positive (rate ~1/M); never a false negative."
   (when (null elements)
     (return-from gcs-filter-match-any nil))
-  (multiple-value-bind (n start) (%read-compact-size-at encoded 0)
+  ;; N is read as Core's GCSFilter constructor reads it (blockfilter.cpp,
+  ;; VectorReader + ReadCompactSize): a non-canonical or oversized encoding
+  ;; is an error, not a filter with a strange N.
+  (let* ((br (bitcoin-lisp.bytes:make-byte-reader-from encoded))
+         (n (bitcoin-lisp.bytes:br-read-compact-size br))
+         (start (bitcoin-lisp.bytes:br-pos br)))
     (when (zerop n)
       (return-from gcs-filter-match-any nil))
     (let* ((f (* n m))

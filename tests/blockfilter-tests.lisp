@@ -176,6 +176,26 @@ genesis filter from chain parameters before any block connects."
 (defun %bfi-zeros32 ()
   (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
 
+(test gcs-filter-rejects-non-canonical-count
+  "The N prefix of an encoded filter is a CompactSize read the way Core's
+GCSFilter constructor reads it: a non-canonical encoding (here 1 written as
+0xfd 01 00) or one past MAX_SIZE is an error. Positive control: the same N
+written canonically is accepted and, being an empty-looking filter, matches
+nothing."
+  (let ((element (list (make-array 3 :element-type '(unsigned-byte 8)
+                                     :initial-contents '(1 2 3)))))
+    (signals error
+      (bitcoin-lisp.storage:gcs-filter-match-any
+       (coerce #(#xfd #x01 #x00 #x00) '(simple-array (unsigned-byte 8) (*)))
+       1 2 element))
+    (signals error
+      (bitcoin-lisp.storage:gcs-filter-match-any
+       (coerce #(#xfe #x00 #x00 #x00 #x03) '(simple-array (unsigned-byte 8) (*)))
+       1 2 element))
+    (is-false (bitcoin-lisp.storage:gcs-filter-match-any
+               (coerce #(#x00) '(simple-array (unsigned-byte 8) (*)))
+               1 2 element))))
+
 (test blockfilterindex-connect-and-getblockfilter
   "Mining indexes each block; getblockfilter returns filter bytes that match a
 recomputation, and a filter header; unknown type / missing block error."

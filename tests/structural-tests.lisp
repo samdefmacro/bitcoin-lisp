@@ -610,7 +610,7 @@ retires them in favour of the byte-reader.")
 
 (defparameter +retiring-serialization-family-baseline+
   '((:stream-io . 88)
-    (:compact-size-definitions . 12))
+    (:compact-size-definitions . 8))
   "Call-site counts, at the start of the cleanup, of the byte-I/O families the
 plan retires (§4 P1). The byte-reader (br-read-*, 70 sites), the byte-buf
 (bb-write-*, 102 sites) and the positional buf-set-* writers underneath them

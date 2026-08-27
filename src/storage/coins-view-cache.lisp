@@ -986,14 +986,6 @@ contiguously. Memory is now one txid."
                           (setf previous (copy-seq txid)))))
     count))
 
-(defun %compact-size-bytes (n)
-  "The compactsize encoding of N as a byte list (1/3/5/9 bytes)."
-  (cond ((< n 253) (list n))
-        ((< n #x10000) (list #xfd (logand n #xff) (logand (ash n -8) #xff)))
-        ((< n #x100000000)
-         (list* #xfe (loop for i below 4 collect (logand (ash n (* -8 i)) #xff))))
-        (t (list* #xff (loop for i below 8 collect (logand (ash n (* -8 i)) #xff))))))
-
 (defun coin-muhash-element (txid vout height coinbase amount script)
   "Serialize one UTXO into the byte string MuHash hashes (Bitcoin Core
 coinstats.cpp TxOutSer): outpoint (txid || vout LE32), then the packed
@@ -1004,18 +996,17 @@ into a byte vector -- this is per-UTXO on the coinstatsindex backfill, where
 the flexi-streams gray-stream path was measurable overhead."
   (declare (type (simple-array (unsigned-byte 8) (*)) txid script))
   (let* ((slen (length script))
-         (cs (%compact-size-bytes slen))
-         (out (make-array (+ 32 4 4 8 (length cs) slen)
+         (out (make-array (+ 32 4 4 8 (bitcoin-lisp.serialization:compact-size-length slen) slen)
                           :element-type '(unsigned-byte 8)))
          (code (logior (ash height 1) (if coinbase 1 0)))
          (i 0))
     (declare (type fixnum i))
-    (replace out txid) (incf i 32)
-    (dotimes (k 4) (setf (aref out i) (logand (ash vout (* -8 k)) #xff)) (incf i))
-    (dotimes (k 4) (setf (aref out i) (logand (ash code (* -8 k)) #xff)) (incf i))
-    (dotimes (k 8) (setf (aref out i) (logand (ash amount (* -8 k)) #xff)) (incf i))
-    (dolist (b cs) (setf (aref out i) b) (incf i))
-    (replace out script :start1 i)
+    (setf i (bitcoin-lisp.bytes:buf-set-bytes out i txid))
+    (setf i (bitcoin-lisp.bytes:buf-set-u32-le out i vout))
+    (setf i (bitcoin-lisp.bytes:buf-set-u32-le out i code))
+    (setf i (bitcoin-lisp.bytes:buf-set-u64-le out i amount))
+    (setf i (bitcoin-lisp.bytes:buf-set-varint out i slen))
+    (bitcoin-lisp.bytes:buf-set-bytes out i script)
     out))
 
 (defun coin-muhash-element* (txid vout entry)
