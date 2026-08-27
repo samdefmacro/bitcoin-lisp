@@ -64,12 +64,23 @@ ends up stale whichever way that goes:
 
 Either way a test can pass against a value that is not in the source, so
 `dev.sh stop` + `cl-workbench repl start` before trusting any result that
-depends on a changed constant. The cold battery is unaffected (it compiles
-fresh) and stays the verification of record. Consensus-critical work still finishes with
+depends on a changed constant. The cold battery recompiles a changed file,
+so it is unaffected by a constant edit, and it stays the verification of
+record. Consensus-critical work still finishes with
 `cl-workbench validation run cold-unit` (= scripts/docker-test.sh, check count
 recorded) — the warm image is a dev convenience, not the verification of
 record. A suite designator that selects zero tests fails (rc 1); it can never
 pass silently.
+
+**Changing a MACRO (or a defstruct's layout) needs a FRESH FASL volume** —
+the cold lane is not "compiles fresh": it mounts a persistent per-checkout
+volume, and ASDF does not track macro expansions, so every file that USED the
+macro keeps its stale expansion through a warm rebuild, an image restart AND
+an ordinary cold run (observed 2026-08-19: three misdiagnoses including a
+false bisect). `cl-workbench validation run cold-unit-fresh`
+(= `scripts/docker-test.sh --fresh-fasl`) runs the battery on a brand-new
+volume that is removed afterwards; it costs the Coalton build, a few minutes.
+Any PR that changes a macro or a defstruct verifies with it.
 
 Eval exit codes: 0 ok / 1 lisp error (+backtrace) / 2 connection (image down,
 NOT your code — dev.sh start) / 3 timed out+interrupted (image survives;

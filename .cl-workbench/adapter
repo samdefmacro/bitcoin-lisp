@@ -138,6 +138,16 @@ run_validation() {
       }
       run_counted_gate "$CL_WORKBENCH_PROJECT_ROOT/scripts/docker-test.sh"
       ;;
+    cold-unit-fresh)
+      # Same battery on a brand-new FASL volume: the only run that compiles
+      # what the source says after a macro or defstruct change (see
+      # scripts/docker-test.sh --fresh-fasl).
+      [ "$#" -eq 0 ] || {
+        echo "ERROR: cold-unit-fresh accepts no arguments" >&2
+        return 2
+      }
+      run_counted_gate "$CL_WORKBENCH_PROJECT_ROOT/scripts/docker-test.sh" --fresh-fasl
+      ;;
     cold-docs)
       [ "$#" -eq 0 ] || {
         echo "ERROR: cold-docs accepts no arguments" >&2
