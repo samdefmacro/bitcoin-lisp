@@ -57,7 +57,12 @@ refs/
 # Manual/debug test scripts
 tests/manual-sync-test.lisp
 tests/quick-debug-test.lisp
-.claude/
+
+# Claude Code: .claude/settings.json (the cl-workbench paren-hook stanza) is
+# TRACKED so the hook fires in every clone and worktree. Only the local
+# permission overrides (and their backups) and worktree state stay ignored.
+.claude/settings.local.json*
+.claude/worktrees/
 
 # Agent dev-runtime (cl-agent-repl)
 .dev-runtime/
