@@ -8,6 +8,18 @@
 
 ;;;; Helpers for building test chains
 
+(defmacro %with-index-node ((chain-state block-store &rest node-args) &body body)
+  "Bind *NODE* to a node holding CHAIN-STATE (its validated chainstate) and
+BLOCK-STORE plus NODE-ARGS -- e.g. :tx-index -- the way the connect-time
+index hook finds it on a live node. The periodic-flush globals are rebound
+so a validation fixture never flushes because of where it landed in the
+battery."
+  `(let ((bl::*node* (bl::make-node :chainstates (list ,chain-state)
+                                    :block-store ,block-store ,@node-args))
+         (bl::*blocks-since-flush* 0)
+         (bl::*last-flush-universal-time* (get-universal-time)))
+     ,@body))
+
 (defun make-reorg-hash (id)
   "Create a unique 32-byte hash from an integer ID."
   (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -908,19 +920,16 @@ move the tip) and require that the heavier downloaded fork gets activated."
      (clrhash bl.val::*block-undo-data*))))
 
 (test run-ibd-activation-carries-the-txindex
-  "The seam must carry its PAYLOAD, not merely exist. The sibling test above
-proved run-ibd calls activate-best-chain; it did not prove what it hands over,
-and in fact the :tx-index argument was missing from that one call site from the
-day it landed. activate-best-chain threads :tx-index into perform-reorg
-faithfully, so the code read correctly — but its only caller passed NIL, so
-every reorg driven by the periodic activation reconnected blocks with the
-transaction index switched off: their txs never entered the index, and the
-best-block marker stayed on a block the reorg had just disconnected. The next
-startup read `marker-off-chain' and rescanned from genesis (~9 minutes),
-observed live on testnet4 on 2026-08-20 one restart after the ARRIVAL path was
-fixed for the same omission.
-
-Assert the marker, not the call: the marker is the thing that was wrong."
+  "The reorg driven by run-ibd's periodic activation must carry the transaction
+index with it. This used to depend on a :tx-index argument threaded through
+activate-best-chain -> perform-reorg, and that argument was missing from the
+run-ibd call site from the day it landed: every such reorg reconnected blocks
+with the index switched off, so the best-block marker stayed on a block the
+reorg had just disconnected and the next startup rescanned from genesis
+(~9 minutes, observed live on testnet4 on 2026-08-20). Since P2e-2 the index is
+reached through the connect-time hook over the node's index list -- there is
+no argument to forget -- so this binds *NODE* the way a live node has it and
+asserts the marker, which is the thing that was wrong."
   (%with-mainnet-network
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "run-ibd-txindex")
@@ -940,7 +949,8 @@ Assert the marker, not the call: the marker is the thing that was wrong."
                                  (bl.store:txindex-best-block txindex))))
                 (let ((bl.net::*ibd-context*
                         (bl.net::make-ibd-context)))
-                  (bl.net::run-ibd nil (bl.ctx:make-node-context :chain-state chain-state :utxo-set utxo-set :block-store block-store :tx-index txindex)))
+                  (%with-index-node (chain-state block-store :tx-index txindex)
+                    (bl.net::run-ibd nil (bl.ctx:make-node-context :chain-state chain-state :utxo-set utxo-set :block-store block-store))))
                 (is (equalp fork-tip (bl.store:best-block-hash chain-state)))
                 ;; THE assertion: the reorg carried the index with it.
                 (is (equalp fork-tip
@@ -949,43 +959,26 @@ Assert the marker, not the call: the marker is the thing that was wrong."
          (uiop:delete-directory-tree txdir :validate t :if-does-not-exist :ignore)))
      (clrhash bl.val::*block-undo-data*))))
 
-(test every-block-activation-on-the-ibd-path-carries-the-txindex
-  "A structural guard, because the behavioural one above can only cover the
-paths a test happens to drive. src/networking/ibd.lisp reaches the chain
-through five calls — one activate-best-chain and four activate-block — and each
-takes the transaction index as an argument. All five omitted it, so blocks that
-arrived by the drain, retry and reorg paths were connected with the index
-switched off. The failure is silent until a restart, at which point the
-best-block marker names a disconnected block and the whole index is rebuilt
-from genesis.
-
-Read the source and require that every one of those calls passes :tx-index.
-A new call site that forgets is the way this bug returns; it has already
-returned twice."
-  (let* ((src (uiop:read-file-string
-               (merge-pathnames "src/networking/ibd.lisp"
-                                (asdf:system-source-directory :bitcoin-lisp))))
-         (calls '()))
-    ;; Collect each activation call together with the argument list that
-    ;; follows it, up to the next top-level form.
-    (loop with start = 0
-          for pos = (search "bl.val:activate-" src :start2 start)
-          while pos
-          do (let* ((end (or (search "(defun " src :start2 pos) (length src)))
-                    (next (or (search "bl.val:activate-"
-                                      src :start2 (+ pos 10))
-                              end))
-                    (form (subseq src pos (min end next (+ pos 1200)))))
-               (push form calls)
-               (setf start (+ pos 10))))
-    (is (= 5 (length calls))
-        "expected 5 activation call sites in ibd.lisp; if this changed, the
-         new one needs :tx-index too")
-    (dolist (form calls)
-      (is (search ":tx-index" form)
-          "an activate-block/activate-best-chain call in ibd.lisp omits
-           :tx-index, which silently disables the transaction index for every
-           block it connects"))))
+(test no-index-is-an-activation-argument
+  "The structural guard that replaced \"every activation call passes
+:tx-index\". That guard existed because the index was an ARGUMENT, and an
+argument is exactly what a new call site forgets: it happened three separate
+times (the arrival path, the run-ibd activation, and five ibd.lisp sites).
+Now every index is reached through the connect-time hook over the node's
+index list, so the invariant is the opposite one -- no activation function
+takes an index, and both connect sites in block.lisp call the hook."
+  (flet ((src (name)
+           (uiop:read-file-string
+            (merge-pathnames name (asdf:system-source-directory :bitcoin-lisp)))))
+    (dolist (f '("src/validation/block.lisp" "src/networking/ibd.lisp"
+                 "src/networking/protocol.lisp"))
+      (is (null (search ":tx-index" (src f)))
+          "~A still threads :tx-index; indexes reach the chain through
+           index-block-connected, never an argument" f))
+    (let ((block-src (src "src/validation/block.lisp")))
+      (is (= 2 (%count-occurrences "(bl:index-block-connected " block-src))
+          "block.lisp must call the connect hook at exactly its two connect
+           sites (connect-block and perform-reorg's phase C)"))))
 
 (test best-valid-tip-min-work-floor-prunes-the-search
   "best-valid-tip's MIN-WORK floor is what makes it affordable on the sync
@@ -1229,15 +1222,17 @@ semantics and re-points entries left stale by a crash."
             (b-hashes (make-test-chain-hashes #xB6 3)))
        (bl.store:add-utxo utxo-set u-txid 0 100000 (%optrue-spk) 1)
        (unwind-protect
-            (progn
+            ;; The index is reached through the connect hook over *NODE*'s
+            ;; index list, as on a live node.
+            (%with-index-node (chain-state block-store :tx-index txindex)
               ;; Chain A: A1 (coinbase only), A2 = coinbase + T.
               (let* ((a1 (make-reorg-test-block genesis-hash (first a-hashes) 1))
                      (a2 (%make-txindex-test-block (first a-hashes) (second a-hashes)
                                                    2 (list tx-t))))
                 (bl.val:connect-block
-                 a1 chain-state block-store utxo-set :tx-index txindex)
+                 a1 chain-state block-store utxo-set)
                 (bl.val:connect-block
-                 a2 chain-state block-store utxo-set :tx-index txindex))
+                 a2 chain-state block-store utxo-set))
               (is (= 2 (bl.store:current-height chain-state)))
               (let ((loc (bl.store:txindex-lookup txindex t-txid)))
                 (is (equalp (second a-hashes)
@@ -1251,11 +1246,11 @@ semantics and re-points entries left stale by a crash."
                                                    2 (list tx-t)))
                      (b3 (make-reorg-test-block (second b-hashes) (third b-hashes) 3)))
                 (bl.val:connect-block
-                 b1 chain-state block-store utxo-set :tx-index txindex)
+                 b1 chain-state block-store utxo-set)
                 (bl.val:connect-block
-                 b2 chain-state block-store utxo-set :tx-index txindex)
+                 b2 chain-state block-store utxo-set)
                 (bl.val:connect-block
-                 b3 chain-state block-store utxo-set :tx-index txindex))
+                 b3 chain-state block-store utxo-set))
               (is (= 3 (bl.store:current-height chain-state)))
               (is (equalp (third b-hashes) (bl.store:best-block-hash chain-state)))
               ;; (a) T re-mined: indexed at the NEW block.
@@ -1309,6 +1304,35 @@ semantics and re-points entries left stale by a crash."
          (ignore-errors (delete-file (merge-pathnames "txindex.dat" txdir)))
          (clrhash bl.val::*block-undo-data*))))))
 
+(test txindex-marker-rewinds-to-the-parent-on-disconnect
+  "Core BaseIndex::Rewind moves the index's locator back to the fork when
+blocks are disconnected; ours moved nothing, so after an invalidateblock the
+marker named a block above the tip and the next start took
+:height-above-tip -> a rescan from genesis. The disconnect hook now reaches
+the txindex: when the marker names the disconnected block it steps back to
+that block's parent (walked tip-first, it ends at the fork); a marker that
+names some other block is left alone."
+  (let* ((txdir (ensure-directories-exist
+                 (merge-pathnames (format nil "test-txidx-rewind-~D/" (get-internal-real-time))
+                                  (uiop:temporary-directory))))
+         (txindex (bl.store:init-tx-index txdir))
+         (hashes (make-test-chain-hashes #xC1 2))
+         (b1 (make-reorg-test-block (make-reorg-hash 0) (first hashes) 1))
+         (b2 (make-reorg-test-block (first hashes) (second hashes) 2)))
+    (unwind-protect
+         (progn
+           (bl.store:txindex-set-best-block txindex (second hashes))
+           ;; Marker names another block: untouched.
+           (bl.store:index-rewind-block txindex nil b1 (first hashes) 1)
+           (is (equalp (second hashes) (bl.store:txindex-best-block txindex)))
+           ;; Marker names the disconnected block: back to its parent.
+           (bl.store:index-rewind-block txindex nil b2 (second hashes) 2)
+           (is (equalp (first hashes) (bl.store:txindex-best-block txindex)))
+           (bl.store:index-rewind-block txindex nil b1 (first hashes) 1)
+           (is (equalp (make-reorg-hash 0) (bl.store:txindex-best-block txindex))))
+      (bl.store:close-tx-index txindex)
+      (uiop:delete-directory-tree txdir :validate t :if-does-not-exist :ignore))))
+
 (test reorg-getrawtransaction-stale-block-core-semantics
   "getrawtransaction for a tx whose txindex entry points into a stale
 (reorged-away) block matches Core TxToJSON (rpc/rawtransaction.cpp:58-86):
@@ -1325,7 +1349,9 @@ confirmations."
             (a-hashes (make-test-chain-hashes #xA7 2))
             (b-hashes (make-test-chain-hashes #xB7 3)))
        (unwind-protect
-            (progn
+            ;; The index is reached through the connect hook over *NODE*'s
+            ;; index list, as on a live node.
+            (%with-index-node (chain-state block-store :tx-index txindex)
               ;; Chain A then a longer chain B; A2's coinbase ends up stale-only.
               (dolist (spec (list (list genesis-hash (first a-hashes) 1)
                                   (list (first a-hashes) (second a-hashes) 2)
@@ -1334,7 +1360,7 @@ confirmations."
                                   (list (second b-hashes) (third b-hashes) 3)))
                 (bl.val:connect-block
                  (apply #'make-reorg-test-block spec)
-                 chain-state block-store utxo-set :tx-index txindex))
+                 chain-state block-store utxo-set))
               (is (equalp (third b-hashes) (bl.store:best-block-hash chain-state)))
               (let ((node (bl::make-node :network :mainnet)))
                 (setf (bl::node-chain-state node) chain-state

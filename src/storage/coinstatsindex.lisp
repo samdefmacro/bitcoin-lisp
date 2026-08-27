@@ -30,7 +30,9 @@
   "coinstatsindex state (open LevelDB handle + enabled flag).")
 
 (defmethod index-name ((index coinstatsindex)) "coinstatsindex")
-(defmethod index-height ((index coinstatsindex)) (coinstatsindex-height index))
+(defmethod index-height ((index coinstatsindex) chainstate)
+  (declare (ignore chainstate))
+  (coinstatsindex-height index))
 (defmethod index-best-block ((index coinstatsindex))
   (multiple-value-bind (height hash) (coinstatsindex-best index)
     (and hash (values hash height))))

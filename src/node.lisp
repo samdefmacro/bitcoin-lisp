@@ -2252,7 +2252,7 @@ when there was nothing to do."
          (tip (bl.store:current-height cs))
          (name (bl.store:index-name index)))
     (bl.store:index-prepare-sync index cs (node-block-store node))
-    (when (< (bl.store:index-height index) tip)
+    (when (< (bl.store:index-height index cs) tip)
       (log-info "Building ~A to height ~D..." name tip)
       (let ((n (bl.store:index-sync index cs (node-block-store node)
                                     :undo-fn #'bl.val:get-undo-data
@@ -2260,10 +2260,10 @@ when there was nothing to do."
                                     :progress (lambda (h pct)
                                                 (log-info "~A: height ~D (~,1F%)" name h pct)))))
         (log-info "~A build complete: ~D block~:P indexed" name n)
-        (when (< (bl.store:index-height index) tip)
+        (when (< (bl.store:index-height index cs) tip)
           (log-warn "~A stopped at height ~D of ~D (missing block/undo data ~
 below the pruned horizon; the index needs genesis-contiguous history)"
-                    name (bl.store:index-height index) tip))
+                    name (bl.store:index-height index cs) tip))
         n))))
 
 (defun restart-indexes-for-validated-chainstate (node)
@@ -2614,53 +2614,23 @@ case ever exercised) has genesis for a root."
           :status :valid
           :tx-count 1)))))   ; genesis carries exactly its coinbase
 
-(defun %start-txindex ()
-  "Open the transaction index on *NODE* and catch it up to the tip. Still on
-its own path rather than CATCH-UP-INDEX (P2e-2 folds it in): its marker is a
-hash without a height, and BUILD-TX-INDEX resolves that itself."
-  (log-info "Initializing transaction index...")
-  (setf (node-tx-index *node*)
-        (bl.store:init-tx-index (node-data-directory *node*)
-                                             :enabled t))
-  ;; CATCH UP to the tip. Without this, -txindex indexed only blocks
-  ;; connected AFTER startup: BUILD-TX-INDEX existed, was complete, was
-  ;; idempotent -- and had no caller anywhere in the tree. Enabling the flag
-  ;; on a synced node therefore produced an index of 0 entries and
-  ;; getrawtransaction answered -5 "No such mempool or blockchain
-  ;; transaction" for every historical txid, which is the entire purpose of
-  ;; the option. Observed on testnet4 2026-08-19 immediately after enabling
-  ;; it, at height 149088.
-  ;;
-  ;; Safe to run unconditionally: the scan skips blocks already indexed at
-  ;; their active-chain location (%txindex-block-indexed-p checks the block's
-  ;; LAST transaction, so it also re-points entries left stale by a reorg
-  ;; that happened while the index was offline), so a caught-up node pays one
-  ;; pass over the block index and writes nothing.
-  ;;
-  ;; Synchronous, unlike Core's background BaseIndex thread. Acceptable
-  ;; because pruning and txindex are mutually exclusive here, so the only
-  ;; chains this can run over are ones we hold in full; a background thread
-  ;; is the better shape and is left for the same change that gives the index
-  ;; its own catch-up worker.
-  (bl.rpc:set-rpc-warmup-status "Catching up transaction index...")
-  (let ((chainstate (node-current-chainstate *node*))
-        (store (node-block-store *node*)))
-    (when (and chainstate store)
-      (let ((added (bl.store:build-tx-index
-                    (node-tx-index *node*) chainstate store
-                    :progress-callback
-                    (lambda (height pct)
-                      (log-info "Transaction index: height ~D (~,1F%)" height pct)))))
-        (when (plusp added)
-          (log-info "Transaction index catch-up added ~D transactions" added)))))
-  (log-info "Transaction index loaded: ~D entries"
-            (bl.store:txindex-count (node-tx-index *node*))))
-
-(defun %start-indexes (blockfilterindex txospenderindex coinstatsindex
+(defun %start-indexes (txindex blockfilterindex txospenderindex coinstatsindex
                        reindex-chainstate)
-  "Open every enabled BaseIndex-shaped index on *NODE* and catch it up to the
-tip (Core init.cpp \"Step 8: start indexers\" -- our catch-ups are
-synchronous, see CATCH-UP-INDEX). Prune locks are re-registered from scratch."
+  "Open every enabled index on *NODE* and catch it up to the tip (Core
+init.cpp \"Step 8: start indexers\" -- our catch-ups are synchronous, see
+CATCH-UP-INDEX). Prune locks are re-registered from scratch."
+  ;; Transaction index. The catch-up is what makes enabling -txindex on a
+  ;; synced node index history (build-tx-index had no caller until #356);
+  ;; it resumes from the best-block marker, so a current index costs one
+  ;; marker lookup (ga9-txindex-startup-catch-up-is-wired pins the call).
+  (when txindex
+    (log-info "Initializing transaction index...")
+    (setf (node-tx-index *node*)
+          (bl.store:init-tx-index (node-data-directory *node*) :enabled t))
+    (bl.rpc:set-rpc-warmup-status "Catching up transaction index...")
+    (catch-up-index *node* (node-tx-index *node*))
+    (log-info "Transaction index loaded: ~D entries"
+              (bl.store:txindex-count (node-tx-index *node*))))
   ;; Prune locks are re-registered from scratch on every start: registration is
   ;; by name, so a re-init replaces rather than accumulates, but an index that
   ;; was enabled last run and is disabled this one would otherwise leave a lock
@@ -3558,8 +3528,7 @@ to move them (the node must be stopped)."
 
   ;; Step 8 of Core's init (indexes): open every enabled index and catch it
   ;; up over the blocks already on disk before the sync thread starts.
-  (when txindex (%start-txindex))
-  (%start-indexes blockfilterindex txospenderindex coinstatsindex
+  (%start-indexes txindex blockfilterindex txospenderindex coinstatsindex
                   reindex-chainstate)
 
   ;; -forcecompactdb: once every LevelDB is open (and any reindex/backfill has
@@ -3879,7 +3848,6 @@ to move them (the node must be stopped)."
                                          (node-block-store *node*)
                                          (bl.store:chain-state-coins-view
                                           (node-current-chainstate *node*))
-                                         :tx-index (node-tx-index *node*)
                                          :fee-estimator (node-fee-estimator *node*)
                                          :mempool (node-mempool *node*)))))
                                  (cond
@@ -4762,12 +4730,14 @@ durable if it does flush (atomic temp+fsync+rename inside save-*)."
 index per process, not once per block.")
 
 (defun node-indexes (node)
-  "NODE's enabled indexes -- the block filter, coinstats and spender indexes
--- in the order they are driven. (The txindex is written through connect-
-block's :tx-index argument and caught up in start-node; folding it in here
-is the next step.)"
+  "NODE's enabled indexes -- transaction, block filter, coinstats and spender
+-- in the order they are driven. Every connect, disconnect and catch-up
+reaches them through this list, so no call site can switch one off by
+forgetting an argument (the shape of the 3rd, 6th, 7th and 15th no-caller
+bugs, all of them the txindex)."
   (remove-if-not #'bl.store:base-index-enabled
-                 (remove nil (list (node-blockfilterindex node)
+                 (remove nil (list (node-tx-index node)
+                                   (node-blockfilterindex node)
                                    (node-coinstatsindex node)
                                    (node-txospenderindex node)))))
 
@@ -4792,7 +4762,7 @@ connect, so consensus is unaffected whether an index is on or off."
                 (push name *index-stall-logged*)
                 (log-warn "~A stalled at height ~D: gap below best-indexed height ~D; ~
 the startup backfill will heal it on next restart"
-                          name height (bl.store:index-height index))))
+                          name height (bl.store:index-height index chainstate))))
           (error (e)
             (log-warn "~A failed at height ~D: ~A" name height e)))))))
 
@@ -6404,7 +6374,6 @@ calling the old signature and no production path filling PEERS."
    :fee-estimator (node-fee-estimator node)
    :address-book (node-address-book node)
    :recent-rejects (node-recent-rejects node)
-   :tx-index (node-tx-index node)
    :historical-chainstate (node-historical-chainstate node)))
 
 (defun sync-blockchain (node)

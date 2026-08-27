@@ -2118,9 +2118,9 @@ a complete, correct, unreachable function is exactly the shape of this bug."
   (let ((src (uiop:read-file-string
               (merge-pathnames "src/node.lisp"
                                (asdf:system-source-directory :bitcoin-lisp)))))
-    (is (search "build-tx-index" src)
-        "start-node must call build-tx-index, or -txindex indexes nothing
-         historical")))
+    (is (search "(catch-up-index *node* (node-tx-index *node*))" src)
+        "start-node must catch the txindex up over stored blocks, or -txindex
+         indexes nothing historical")))
 
 (test txospenderindex-startup-catch-up-is-wired
   "The same shape for -txospenderindex, found by the P2e-1 review: its only
@@ -2179,50 +2179,33 @@ exactly this and had NO callers, so nothing recorded progress."
                (is (= 0 (bl.store::%txindex-resume-height txindex cs))))
           (bl.store:close-tx-index txindex))))))
 
-(test txindex-reaches-the-network-connect-path
-  "The seam that was missing: only the RPC paths passed :tx-index to
-connect-block. The networking path -- how every block from a peer is connected
--- did not, so on a live node the index was maintained ONLY by the startup
-catch-up: blocks from peers went unindexed until the next restart, and after a
-reorg the best-block marker named a block no longer on the chain, which is what
-the live node reported as marker-off-chain.
-
-Asserted in two halves. The first is behavioural: the node's tx-index must
-actually arrive in the ibd-context, which is the hop that was absent. The
-second is structural, for the same reason the startup-catch-up test above gives
--- the alternative is standing up a full node with real proof-of-work in a unit
-test -- and it pins the part a future caller could silently undo: the value is
-defaulted INSIDE accept-downloaded-block, not at its call sites, so forgetting
-to pass it cannot reintroduce the bug."
-  (let ((ctx (bl.net::make-ibd))
-        (txindex (bl.store:init-tx-index
-                  (merge-pathnames (format nil "txidx-reach-~D/" (get-internal-real-time))
-                                   (uiop:temporary-directory))
-                  :enabled t)))
+(test txindex-is-driven-through-the-node-index-list
+  "The seam that was missing three times over: connect-block took the index
+as an argument, and the networking path, the run-ibd activation and five
+ibd.lisp sites each forgot it in turn, so a live node's index was maintained
+ONLY by the startup catch-up. Since P2e-2 the txindex is one of NODE-INDEXES
+and every connect, disconnect and catch-up reaches it through that list, so
+the property to pin is membership: an enabled index is in the list, a
+disabled one is not, and nothing in the tree passes an index to the chain."
+  (let* ((dir (merge-pathnames (format nil "txidx-reach-~D/" (get-internal-real-time))
+                               (uiop:temporary-directory)))
+         (enabled (bl.store:init-tx-index dir :enabled t))
+         (disabled (bl.store:init-tx-index dir :enabled nil)))
     (unwind-protect
          (progn
-           (is (null (bl.net::ibd-context-tx-index ctx))
-               "a fresh context carries no index")
-           ;; run-ibd with no peers does nothing but thread its arguments in.
-           (let ((bl.net::*ibd-context* ctx))
-             (bl.net::run-ibd '() (bl.ctx:make-node-context :chain-state (bl.store:make-chain-state) :peers '() :tx-index txindex)))
-           (is (eq txindex (bl.net::ibd-context-tx-index ctx))
-               "run-ibd must put the node's transaction index into the context"))
-      (bl.store:close-tx-index txindex)))
-  ;; The connect path must take it from there by DEFAULT.
+           (is (member enabled (bl::node-indexes (bl::make-node :tx-index enabled)))
+               "an enabled txindex must be among the node's driven indexes")
+           (is (null (bl::node-indexes (bl::make-node :tx-index disabled)))
+               "a disabled txindex must not be driven")
+           (is (null (bl::node-indexes (bl::make-node)))
+               "no index, nothing driven"))
+      (bl.store:close-tx-index enabled)))
   (let ((src (uiop:read-file-string
               (merge-pathnames "src/networking/protocol.lisp"
                                (asdf:system-source-directory :bitcoin-lisp)))))
-    (is (search "(tx-index (and *ibd-context*" src)
-        "accept-downloaded-block must default tx-index from the ibd-context")
-    (is (search ":tx-index tx-index" src)
-        "and pass it to connect-block"))
-  ;; And start-node must hand it to start-ibd at all.
-  (let ((src (uiop:read-file-string
-              (merge-pathnames "src/node.lisp"
-                               (asdf:system-source-directory :bitcoin-lisp)))))
-    (is (search ":tx-index (node-tx-index node)" src)
-        "sync-blockchain must pass the node's transaction index into IBD")))
+    (is (null (search ":tx-index" src))
+        "accept-downloaded-block must not thread an index argument; the
+         connect hook reaches it through *node*")))
 
 (test txindex-resume-reports-why-it-chose-a-full-rescan
   "The resume decision must be VISIBLE. A nine-minute startup that silently

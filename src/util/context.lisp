@@ -4,8 +4,9 @@
 ;;;
 ;;; The references a subsystem needs to act on the node -- the active
 ;;; chainstate and its coins view, the block store, the mempool, the peers,
-;;; the fee estimator, the address book, the recent-rejects filter, the
-;;; indexes -- as one value. A message handler used to take up to eight of
+;;; the fee estimator, the address book, the recent-rejects filter -- as
+;;; one value (the indexes are not carried: the connect hook reaches them
+;;; through the node's index list). A message handler used to take up to eight of
 ;;; them as positional and keyword parameters, and every caller had to name
 ;;; each one: the 2026-07-10 wiring bug (tx relay, addr gossip and compact
 ;;; blocks silently disabled outside unit tests) was a dispatch that passed
@@ -30,12 +31,11 @@ background validation)."
   fee-estimator
   address-book
   recent-rejects
-  tx-index
   historical-chainstate) ; assumeutxo background-validation chainstate
 
 (defparameter +node-context-slots+
   '("CHAIN-STATE" "UTXO-SET" "BLOCK-STORE" "MEMPOOL" "PEERS" "FEE-ESTIMATOR"
-    "ADDRESS-BOOK" "RECENT-REJECTS" "TX-INDEX" "HISTORICAL-CHAINSTATE")
+    "ADDRESS-BOOK" "RECENT-REJECTS" "HISTORICAL-CHAINSTATE")
   "The slot names WITH-NODE-CONTEXT accepts; a misspelling is a macroexpansion
 error rather than an undefined accessor at run time.")
 

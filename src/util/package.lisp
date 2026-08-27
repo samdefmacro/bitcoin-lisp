@@ -188,7 +188,6 @@ handler or sync pass acts on, as one value. src/util/context.lisp.")
    #:node-context-fee-estimator
    #:node-context-address-book
    #:node-context-recent-rejects
-   #:node-context-tx-index
    #:node-context-historical-chainstate
    #:with-node-context))
 

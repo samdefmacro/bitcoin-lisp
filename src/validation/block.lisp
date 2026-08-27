@@ -2495,10 +2495,11 @@ recent-confirmed filter (Core BlockConnected, txdownloadman_impl.cpp:98-110,
 ;;;; Block connection
 
 (defun connect-block (block chain-state block-store utxo-set
-                      &key tx-index fee-estimator recent-rejects mempool)
+                      &key fee-estimator recent-rejects mempool)
   "Connect a validated block to the chain.
 Updates chain state and UTXO set.
-Optionally updates TX-INDEX if provided and enabled.
+Every enabled index folds the block in through the connect hook
+(INDEX-BLOCK-CONNECTED over the node's index list; nothing is passed here).
 Optionally updates FEE-ESTIMATOR with block fee statistics.
 Optionally clears RECENT-REJECTS on chain reorganization.
 When MEMPOOL is provided, removes the block's confirmed/conflicting txs from it
@@ -2602,8 +2603,10 @@ Handles chain reorganizations when a competing chain has more work."
                                utxo-set block new-height)))
              (%warn-if-undo-empty block hash new-height spent-utxos)
              (store-undo-data hash spent-utxos new-height :block block)
-             ;; Every enabled index (block filter, coinstats, spender) folds
-             ;; the block in; no-op with none enabled, never signals.
+             ;; Every enabled index (transaction, block filter, coinstats,
+             ;; spender) folds the block in, and the txindex moves its
+             ;; best-block marker with the tip; no-op with none enabled,
+             ;; never signals.
              (bl:index-block-connected chain-state block hash new-height spent-utxos)
              ;; Record fee statistics for fee estimation
              (when fee-estimator
@@ -2627,12 +2630,6 @@ Handles chain reorganizations when a competing chain has more work."
            ;; -blocknotify, detached so an operator hook can never stall block
            ;; connection (Core "thread runs free", init.cpp:2017).
            (bl:notify-block-tip hash)
-           ;; Update transaction index if enabled, and move its best-block
-           ;; marker with the tip so the next startup resumes here instead of
-           ;; re-reading every block from genesis.
-           (when (and tx-index (bl.store:tx-index-enabled tx-index))
-             (bl.store:txindex-add-block tx-index block hash)
-             (bl.store:txindex-set-best-block tx-index hash))
            (bl.store:update-chain-tip chain-state hash new-height)
            ;; Remove now-confirmed (and conflicting) txs from the mempool,
            ;; inside the same critical section as the tip update.
@@ -2694,7 +2691,6 @@ Handles chain reorganizations when a competing chain has more work."
            (multiple-value-list
             (perform-reorg chain-state block-store utxo-set
                            current-best-entry entry
-                           :tx-index tx-index
                            :fee-estimator fee-estimator
                            :recent-rejects recent-rejects
                            :mempool mempool)))
@@ -2890,7 +2886,7 @@ UTXO set). Restores the UTXO set, chain tip, and index-entry statuses
 to exactly the OLD-TIP-ENTRY state, so a rejected fork leaves the node
 on its original chain — never half-reorged.
 
-Side effects (txindex / fee-estimator / mempool) are deferred to
+Side effects (indexes / fee-estimator / mempool) are deferred to
 perform-reorg's success phase, so there is nothing to undo here."
   ;; 1. Disconnect the fork blocks we applied, newest-first (reverse of the
   ;;    application order). spent-utxos is the undo data apply returned.
@@ -3031,7 +3027,7 @@ includes ENTRY itself."
 ;;;; into memory, where no startup check ever looks.
 
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
-                      &key tx-index fee-estimator recent-rejects mempool skip-scripts)
+                      &key fee-estimator recent-rejects mempool skip-scripts)
   "Perform a chain reorganization from OLD-TIP to NEW-TIP.
 Disconnects blocks back to the fork point, then connects blocks on the new chain.
 
@@ -3051,7 +3047,7 @@ Optionally updates FEE-ESTIMATOR with block fee statistics.
 Clears RECENT-REJECTS if provided (reorg may change transaction validity).
 When MEMPOOL is provided, removes connected blocks' txs from it and re-adds the
 disconnected blocks' txs (best-effort, re-validated against the new tip).
-Side effects (tx-index / fee-estimator / mempool / recent-rejects) are applied
+Side effects (indexes / fee-estimator / mempool / recent-rejects) are applied
 only after the whole fork validates, so a rolled-back reorg leaves them untouched.
 
 A stop request (shutdown / sync pause) TRUNCATES the reorg at the next block
@@ -3431,9 +3427,6 @@ comment above."
               ;; recomputed header hash is a fresh object, not the one the
               ;; connect path / index entries key by.
               (let ((hash (bl.store:block-index-entry-hash entry)))
-                (when (and tx-index (bl.store:tx-index-enabled tx-index))
-                  (bl.store:txindex-add-block tx-index block hash)
-                  (bl.store:txindex-set-best-block tx-index hash))
                 ;; Reconnected oldest-to-newest, so a filter header chains off
                 ;; its already-indexed parent and each coinstats record loads
                 ;; its parent's running state; the spender erase for the
@@ -3595,7 +3588,7 @@ TARGET's chain, so a step is a real move toward it and never sideways."
           (or e target)))))
 
 (defun activate-best-chain (chain-state block-store utxo-set
-                            &key tx-index fee-estimator recent-rejects mempool)
+                            &key fee-estimator recent-rejects mempool)
   "Reorganize onto the most-work fully-downloaded valid chain when it beats the
 active tip. Returns (values switched-p missing-blocks), where MISSING-BLOCKS is
 perform-reorg's re-queue list if a switch was refused for want of block bodies.
@@ -3635,7 +3628,7 @@ backstop against a candidate that reorgs away and reappears."
           (return))
         (multiple-value-bind (ok detail)
             (perform-reorg chain-state block-store utxo-set tip target
-                           :tx-index tx-index :fee-estimator fee-estimator
+                           :fee-estimator fee-estimator
                            :recent-rejects recent-rejects :mempool mempool)
           (cond
             (ok
@@ -3692,7 +3685,7 @@ backstop against a candidate that reorgs away and reappears."
     (values switched missing)))
 
 (defun invalidate-block (chain-state block-store utxo-set block-hash
-                         &key tx-index fee-estimator recent-rejects mempool)
+                         &key fee-estimator recent-rejects mempool)
   "Mark BLOCK-HASH and all its descendants :invalid, reorganizing the active
 chain back to BLOCK-HASH's parent if the active chain contained it. Returns
 (values t nil) on success, (values nil reason-keyword) on failure."
@@ -3715,7 +3708,7 @@ chain back to BLOCK-HASH's parent if the active chain contained it. Returns
          (when (and tip parent (block-descends-from-p tip entry))
            (multiple-value-bind (ok detail)
                (perform-reorg chain-state block-store utxo-set tip parent
-                              :tx-index tx-index :fee-estimator fee-estimator
+                              :fee-estimator fee-estimator
                               :recent-rejects recent-rejects :mempool mempool)
              ;; Surface :interrupted as itself — the node is stopping, the reorg
              ;; did not fail — so the RPC reports why nothing was invalidated.
@@ -3727,7 +3720,7 @@ chain back to BLOCK-HASH's parent if the active chain contained it. Returns
          (values t nil))))))
 
 (defun reconsider-block (chain-state block-store utxo-set block-hash
-                         &key tx-index fee-estimator recent-rejects mempool)
+                         &key fee-estimator recent-rejects mempool)
   "Clear :invalid from BLOCK-HASH plus its ancestors and descendants, then
 reorganize to the best valid chain if it now outweighs the active tip. Returns
 (values t nil) on success, (values nil reason-keyword) on failure."
@@ -3753,7 +3746,7 @@ reorganize to the best valid chain if it now outweighs the active tip. Returns
               ;; reporting success for a switch that didn't happen.
               (multiple-value-bind (ok detail)
                   (perform-reorg chain-state block-store utxo-set tip target
-                                 :tx-index tx-index :fee-estimator fee-estimator
+                                 :fee-estimator fee-estimator
                                  :recent-rejects recent-rejects :mempool mempool)
                 (unless ok
                   (return-from reconsider-block
@@ -3761,7 +3754,7 @@ reorganize to the best valid chain if it now outweighs the active tip. Returns
           (values t nil)))))
 
 (defun precious-block (chain-state block-store utxo-set block-hash
-                       &key tx-index fee-estimator recent-rejects mempool)
+                       &key fee-estimator recent-rejects mempool)
   "Treat BLOCK-HASH as preferred (Bitcoin Core preciousblock): if its chain has at
 least as much work as the active tip and it isn't already the tip, reorganize to
 it. Fork choice here is strict greater-than on chain-work, so an equal-work
@@ -3788,7 +3781,7 @@ where the block is already the tip or weaker), (values nil reason) on failure."
            (t
             (multiple-value-bind (ok detail)
                 (perform-reorg chain-state block-store utxo-set tip entry
-                               :tx-index tx-index :fee-estimator fee-estimator
+                               :fee-estimator fee-estimator
                                :recent-rejects recent-rejects :mempool mempool)
               (cond (ok (values t nil))
                     ((eq detail :interrupted) (values nil :interrupted))
@@ -3825,7 +3818,7 @@ chainstates and for tests that drive activate-block directly."
       (bl:maybe-validate-snapshot chain-state))))
 
 (defun activate-block (block chain-state block-store utxo-set
-                       &key current-time skip-scripts tx-index fee-estimator
+                       &key current-time skip-scripts fee-estimator
                             recent-rejects mempool)
   "Validate and activate BLOCK. Three cases:
 
@@ -3882,7 +3875,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
            (if valid
                (progn
                  (connect-block block chain-state block-store utxo-set
-                                :tx-index tx-index
                                 :fee-estimator fee-estimator
                                 :recent-rejects recent-rejects
                                 :mempool mempool)
@@ -3924,7 +3916,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
             (multiple-value-bind (reorg-ok detail)
                 (perform-reorg chain-state block-store utxo-set
                                current-best-entry prev-entry
-                               :tx-index tx-index
                                :fee-estimator fee-estimator
                                :recent-rejects recent-rejects
                                :mempool mempool
@@ -3958,7 +3949,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
                      (if valid
                          (progn
                            (connect-block block chain-state block-store utxo-set
-                                          :tx-index tx-index
                                           :fee-estimator fee-estimator
                                           :recent-rejects recent-rejects
                                           :mempool mempool)
@@ -3999,7 +3989,6 @@ can neither wedge on an equal-work sibling nor advance past the base."
                              (multiple-value-bind (reverted revert-detail)
                                  (perform-reorg chain-state block-store utxo-set
                                                 fork-tip current-best-entry
-                                                :tx-index tx-index
                                                 :fee-estimator fee-estimator
                                                 :recent-rejects recent-rejects
                                                 :mempool mempool
