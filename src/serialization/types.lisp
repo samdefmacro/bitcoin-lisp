@@ -92,6 +92,19 @@ SEQUENCE: Sequence number for replacement/locktime."
 
 ;;;; TxOut - Transaction output
 
+(defun script-push-data (data)
+  "The minimal CScript push of DATA (Core CScript::operator<<(const
+std::vector<unsigned char>&), script.h): a direct push for 0-75 bytes,
+OP_PUSHDATA1 to 255, OP_PUSHDATA2 to 65535, OP_PUSHDATA4 above."
+  (let ((n (length data)))
+    (concatenate '(simple-array (unsigned-byte 8) (*))
+                 (cond ((<= n 75) (vector n))
+                       ((<= n #xff) (vector #x4c n))
+                       ((<= n #xffff) (vector #x4d (logand n #xff) (ash n -8)))
+                       (t (vector #x4e (logand n #xff) (logand (ash n -8) #xff)
+                                  (logand (ash n -16) #xff) (ash n -24))))
+                 data)))
+
 (defstruct tx-out
   "A transaction output.
 VALUE: Amount in satoshis.

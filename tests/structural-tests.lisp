@@ -505,15 +505,14 @@ closing paren, which would count as a line."
 ;;; --- duplicate definitions -------------------------------------------
 
 (defparameter +duplicate-definition-baseline+
-  '("%script-push"
-    "fsync-directory" "satoshi+" "satoshi>" "tagged-hash"
-    "unwrap-block-height" "unwrap-satoshi" "with-node-lock"
-    "wrap-block-height" "wrap-satoshi")
-  "Names defined by DEFUN or DEFMACRO in more than one file under src/, as of
-the start of the cleanup, minus the eight byte-buf writers that existed twice
-(serialization/binary.lisp and coalton/interop.lisp) until src/util/bytes.lisp
-became the one copy. WITH-NODE-LOCK is two macros with different lambda
-lists.")
+  '()
+  "Names defined by DEFUN or DEFMACRO in more than one file under src/. Empty
+since the cleanup's P1.3: the eighteen it started with included two that
+were the SAME package redefining a function -- FSYNC-DIRECTORY, where the
+later copy fsynced a file when the callers of the earlier one meant its
+parent directory, and TAGGED-HASH, a dead pure-Lisp copy -- which SBCL had
+been warning about on every cold run. scripts/docker-test.sh now fails on
+that warning; this test catches the cross-package case the warning cannot.")
 
 (defun %duplicate-definition-names ()
   "Names with a top-level DEFUN/DEFMACRO in two or more distinct files."
@@ -655,7 +654,7 @@ byte-buf; the stream codecs and interop's private buffer only lose call sites."
     ("src/node.lisp" . 36)
     ("src/rpc/" . 14)
     ("src/serialization/" . 44)
-    ("src/storage/" . 17)
+    ("src/storage/" . 16)
     ("src/util/" . 5)
     ("src/validation/" . 3)
     ("src/zmq.lisp" . 1))

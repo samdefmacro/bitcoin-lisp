@@ -11,6 +11,12 @@
 ;; (default NIL in production; see src/mempool/mempool.lisp).
 (setf bitcoin-lisp.mempool:*txgraph-shadow-checks* t)
 
+(defun %bytes (&rest contents)
+  "A (simple-array (unsigned-byte 8)) of CONTENTS. Shared by every test file;
+it used to be defined in two of them, the later silently replacing the first."
+  (make-array (length contents) :element-type '(unsigned-byte 8)
+                                :initial-contents contents))
+
 (def-suite :bitcoin-lisp-tests
   :description "Test suite for bitcoin-lisp")
 

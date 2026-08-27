@@ -300,16 +300,6 @@ validation.cpp:6379-6388). O(index size) — fine for its callers
 ;;; constant) and the resulting header hash must equal the network's known
 ;;; genesis hash, or we signal an error rather than return a wrong block.
 
-(defun %script-push (bytes)
-  "Minimal CScript data push of BYTES: direct push below OP_PUSHDATA1 (76),
-OP_PUSHDATA1 up to 255 (the testnet4 timestamp message is 76 bytes)."
-  (let ((n (length bytes)))
-    (cond ((< n 76)
-           (concatenate '(simple-array (unsigned-byte 8) (*)) (vector n) bytes))
-          ((<= n 255)
-           (concatenate '(simple-array (unsigned-byte 8) (*)) (vector #x4c n) bytes))
-          (t (error "%script-push: ~D bytes unsupported" n)))))
-
 (defun %ascii-bytes (string)
   (map '(simple-array (unsigned-byte 8) (*)) #'char-code string))
 
@@ -340,15 +330,15 @@ the timestamp message; one 50 BTC output to <pubkey> OP_CHECKSIG (testnet4:
          ;; CScript() << 486604799: minimal CScriptNum bytes of 0x1d00ffff,
          ;; little-endian -> ff ff 00 1d, pushed as data.
          (script-sig (concatenate '(simple-array (unsigned-byte 8) (*))
-                                  (%script-push (vector #xff #xff #x00 #x1d))
-                                  (%script-push (vector #x04))
-                                  (%script-push message)))
+                                  (bitcoin-lisp.serialization:script-push-data (vector #xff #xff #x00 #x1d))
+                                  (bitcoin-lisp.serialization:script-push-data (vector #x04))
+                                  (bitcoin-lisp.serialization:script-push-data message)))
          (pubkey (if testnet4-p
                      (make-array 33 :element-type '(unsigned-byte 8)
                                     :initial-element 0)
                      *genesis-output-pubkey*))
          (script-pubkey (concatenate '(simple-array (unsigned-byte 8) (*))
-                                     (%script-push pubkey)
+                                     (bitcoin-lisp.serialization:script-push-data pubkey)
                                      (vector #xac)))) ; OP_CHECKSIG
     (bitcoin-lisp.serialization:make-transaction
      :version 1

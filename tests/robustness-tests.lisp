@@ -10,10 +10,6 @@
 
 (in-suite :robustness-tests)
 
-(defun %bytes (&rest contents)
-  (make-array (length contents) :element-type '(unsigned-byte 8)
-                                :initial-contents contents))
-
 (defun %concat-bytes (&rest seqs)
   (apply #'concatenate '(vector (unsigned-byte 8)) seqs))
 

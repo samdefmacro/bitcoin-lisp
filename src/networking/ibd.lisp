@@ -1777,7 +1777,7 @@ handler. Shared by the block-download drain and the at-tip reap pass."
        ;; (ingest-headers-from-peer, Core ProcessHeadersMessage).
        ;; Node lock: process-headers inside mutates the block index the RPC
        ;; threads read/write under the same lock (see handle-headers).
-       (with-node-lock
+       (with-current-node-lock
          (ingest-headers-from-peer
           peer headers chain-state
           :count-fn (lambda (n) (incf (ibd-context-headers-received ctx) n))))))
@@ -2736,7 +2736,7 @@ received message there too.
 
 Holds the node lock: process-headers mutates the block index the RPC
 threads read/write under the same lock."
-  (with-node-lock
+  (with-current-node-lock
    (multiple-value-bind (valid error) (validate-header-chain headers chain-state)
     (when error
       ;; Core logs every ContextualCheckBlockHeader failure at
@@ -3625,7 +3625,7 @@ candidate activated."
          "Deep-reorg candidate at height ~D outweighs tip ~D with complete bodies; attempting reorg"
          height (bitcoin-lisp.storage:block-index-entry-height tip-entry))
         (multiple-value-bind (activated error missing-blocks)
-            (with-node-lock
+            (with-current-node-lock
               (bitcoin-lisp.validation:activate-block
                blk chain-state block-store utxo-set
                :current-time (bitcoin-lisp.serialization:get-unix-time)
@@ -3737,7 +3737,7 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
             ;; Node lock: activation mutates chainstate/UTXO/mempool state
             ;; the RPC threads access under the same lock.
             (progn
-              (with-node-lock
+              (with-current-node-lock
                 (bitcoin-lisp.storage:note-block-position
                  chain-state hash
                  (nth-value 1 (bitcoin-lisp.storage:store-block
@@ -3750,7 +3750,7 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
               (when *ibd-context*
                 (%rearm-unlinked-reorg-candidates hash chain-state))
               (multiple-value-bind (activated error missing-blocks)
-                  (with-node-lock
+                  (with-current-node-lock
                     (bitcoin-lisp.validation:activate-block
                      block chain-state block-store utxo-set
                      :skip-scripts (bitcoin-lisp.validation:script-checks-skippable-p
@@ -3838,7 +3838,7 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                 ;; Node lock per block connect (drain-block-queue then
                 ;; re-takes it per drained block, so RPC threads interleave
                 ;; between connects instead of stalling for a whole cascade).
-                (with-node-lock
+                (with-current-node-lock
                   (bitcoin-lisp.validation:activate-block
                    block chain-state block-store utxo-set
                    :current-time current-time
@@ -3952,7 +3952,7 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                        (setf (gethash hash (ibd-context-pending-blocks *ibd-context*))
                              height)))))
                 (t
-                 (with-node-lock
+                 (with-current-node-lock
                    (bitcoin-lisp.storage:note-block-position
                     chain-state hash
                     (nth-value 1 (bitcoin-lisp.storage:store-block
@@ -4069,7 +4069,7 @@ the tip is ready to connect."
           (multiple-value-bind (activated error missing-blocks)
               ;; Node lock per connect, released between loop iterations so
               ;; RPC threads aren't starved across a long drain cascade.
-              (with-node-lock
+              (with-current-node-lock
                 (bitcoin-lisp.validation:activate-block
                  block chain-state block-store utxo-set
                  :current-time current-time

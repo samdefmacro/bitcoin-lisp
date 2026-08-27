@@ -1385,9 +1385,6 @@ normal heights until the 1,983,702 re-enable."
 ;;; validate-coinbase-height) — Core compares serialized bytes, not value.
 ;;; ============================================================
 
-(defun %bytes (&rest bs)
-  (make-array (length bs) :element-type '(unsigned-byte 8) :initial-contents bs))
-
 (defun %block-with-coinbase-scriptsig (script-sig)
   "A block whose coinbase input-0 has the given SCRIPT-SIG."
   (let ((coinbase

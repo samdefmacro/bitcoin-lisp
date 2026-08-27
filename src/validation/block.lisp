@@ -5,10 +5,6 @@
 ;;; This module validates Bitcoin blocks according to consensus rules.
 ;;; Uses Coalton types for amounts (Satoshi) and heights (BlockHeight).
 
-;;;; Imports for typed operations (reuse from transaction.lisp, add BlockHeight)
-(defun wrap-block-height (h) (bitcoin-lisp.coalton.interop:wrap-block-height h))
-(defun unwrap-block-height (bh) (bitcoin-lisp.coalton.interop:unwrap-block-height bh))
-
 ;;;; Constants
 
 (defconstant +max-block-sigops-cost+ 80000)  ; BIP 141: max weighted sigops cost
@@ -1785,7 +1781,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
 
     ;; Validate each transaction and collect fees (using Satoshi type)
     ;; Track outputs from earlier transactions for intra-block spending
-    (let* ((total-fees (wrap-satoshi 0))
+    (let* ((total-fees (bitcoin-lisp.coalton.interop:wrap-satoshi 0))
            (total-sigops-cost 0)
            (pending-utxos (make-hash-table :test 'equalp))
            ;; Outpoints an earlier transaction of this block already consumed.
@@ -1844,7 +1840,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                    (unless valid
                      (return-from validate-block (values nil error nil)))
                    ;; fee is now a Satoshi type, use typed addition
-                   (setf total-fees (satoshi+ total-fees fee)))
+                   (setf total-fees (bitcoin-lisp.coalton.interop:satoshi+ total-fees fee)))
                  ;; Accumulate sigops cost and check limit (early exit for DoS protection)
                  (incf total-sigops-cost
                        (count-transaction-sigops-cost tx #'get-spent-script
@@ -1937,7 +1933,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                        :key #'bitcoin-lisp.serialization:tx-out-value))
              (block-subsidy (calculate-block-subsidy current-height))
              ;; Convert total-fees to integer for comparison
-             (max-coinbase-value (+ block-subsidy (unwrap-satoshi total-fees))))
+             (max-coinbase-value (+ block-subsidy (bitcoin-lisp.coalton.interop:unwrap-satoshi total-fees))))
         (when (> coinbase-output-total max-coinbase-value)
           (return-from validate-block
             (values nil :coinbase-too-large nil))))

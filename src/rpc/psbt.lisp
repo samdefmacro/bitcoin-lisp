@@ -84,7 +84,7 @@ when locktime>0, else 0xffffffff."
                   (push (bitcoin-lisp.serialization:make-tx-out
                          :value 0
                          :script-pubkey (concatenate '(simple-array (unsigned-byte 8) (*))
-                                                      #(#x6a) (%script-push
+                                                      #(#x6a) (bitcoin-lisp.serialization:script-push-data
                                                                (bitcoin-lisp.crypto:hex-to-bytes val))))
                         tx-outputs))
                 (multiple-value-bind (type spk) (bitcoin-lisp.crypto:decode-address key network)
@@ -740,14 +740,14 @@ witness-stack) on success (either may be nil/empty), or (values nil nil)."
              (ms-scriptsig (script)
                (let ((sigs (%psbt-multisig-sigs script map)))
                  (when sigs (apply #'%psbt-concat #(#x00)
-                                   (mapcar #'%script-push sigs))))))
+                                   (mapcar #'bitcoin-lisp.serialization:script-push-data sigs))))))
       (case (bitcoin-lisp.validation:classify-script spk)
         (:pubkeyhash
          (let ((s (%psbt-first-sig map)))
-           (when s (values (%psbt-concat (%script-push (cdr s)) (%script-push (car s))) nil))))
+           (when s (values (%psbt-concat (bitcoin-lisp.serialization:script-push-data (cdr s)) (bitcoin-lisp.serialization:script-push-data (car s))) nil))))
         (:pubkey
          (let ((s (%psbt-first-sig map)))
-           (when s (values (%script-push (cdr s)) nil))))
+           (when s (values (bitcoin-lisp.serialization:script-push-data (cdr s)) nil))))
         (:witness-v0-keyhash
          (let ((s (%psbt-first-sig map)))
            (when s (values empty (list (cdr s) (car s))))))
@@ -771,26 +771,26 @@ witness-stack) on success (either may be nil/empty), or (values nil nil)."
            (case (bitcoin-lisp.validation:classify-script rs)
              (:witness-v0-keyhash
               (let ((s (%psbt-first-sig map)))
-                (when s (values (%script-push rs) (list (cdr s) (car s))))))
+                (when s (values (bitcoin-lisp.serialization:script-push-data rs) (list (cdr s) (car s))))))
              (:witness-v0-scripthash
               (when ws (let ((wit (ms-witness ws)))
-                         (when wit (values (%script-push rs) wit)))))
+                         (when wit (values (bitcoin-lisp.serialization:script-push-data rs) wit)))))
              (:multisig
               (let ((sigs (%psbt-multisig-sigs rs map)))
                 (when sigs
                   (values (apply #'%psbt-concat #(#x00)
-                                 (append (mapcar #'%script-push sigs)
-                                         (list (%script-push rs))))
+                                 (append (mapcar #'bitcoin-lisp.serialization:script-push-data sigs)
+                                         (list (bitcoin-lisp.serialization:script-push-data rs))))
                           nil))))
              (:pubkeyhash            ; P2SH-P2PKH: <sig> <pubkey> <redeem>
               (let ((s (%psbt-first-sig map)))
-                (when s (values (%psbt-concat (%script-push (cdr s))
-                                              (%script-push (car s))
-                                              (%script-push rs))
+                (when s (values (%psbt-concat (bitcoin-lisp.serialization:script-push-data (cdr s))
+                                              (bitcoin-lisp.serialization:script-push-data (car s))
+                                              (bitcoin-lisp.serialization:script-push-data rs))
                                 nil))))
              (:pubkey               ; P2SH-P2PK: <sig> <redeem>
               (let ((s (%psbt-first-sig map)))
-                (when s (values (%psbt-concat (%script-push (cdr s)) (%script-push rs)) nil))))
+                (when s (values (%psbt-concat (bitcoin-lisp.serialization:script-push-data (cdr s)) (bitcoin-lisp.serialization:script-push-data rs)) nil))))
              (t (values nil nil)))))
         (t (values nil nil))))))
 

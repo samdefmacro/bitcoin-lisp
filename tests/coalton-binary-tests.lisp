@@ -41,14 +41,6 @@
   "Call Coalton read-bytes from CL."
   (bitcoin-lisp.coalton.binary:read-bytes bytes pos count))
 
-(defun get-read-result-value (rr)
-  "Extract value from ReadResult."
-  (bitcoin-lisp.coalton.binary:read-result-value rr))
-
-(defun get-read-result-position (rr)
-  "Extract position from ReadResult."
-  (bitcoin-lisp.coalton.binary:read-result-position rr))
-
 ;;;; Read tests
 
 (test binary-read-u8

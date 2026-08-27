@@ -271,18 +271,27 @@ hash_serialized_3 — never on the inv/validate hot path."
         (sb-posix:fsync (sb-sys:fd-stream-fd s)))
     (error () nil)))
 
-(defun fsync-directory (path)
-  "fsync the directory containing PATH so a preceding rename into it is durable.
-POSIX does not guarantee a rename survives a crash until the parent directory is
-fsynced — without this, an atomic temp+fsync+rename can still revert to the old
-file (or vanish) after a power loss even though the new data was synced."
+(defun fsync-directory (dir)
+  "fsync directory DIR so newly created or renamed names in it are durable
+(Core DirectoryCommit, util/fs_helpers.cpp). POSIX does not guarantee a
+rename survives a crash until the parent directory is fsynced -- without
+this, an atomic temp+fsync+rename can still revert to the old file (or
+vanish) after a power loss even though the new data was synced."
   #+sbcl
   (handler-case
-      (let* ((dir (directory-namestring path))
-             (fd (sb-posix:open (if (string= dir "") "." dir) sb-posix:o-rdonly)))
+      (let ((fd (sb-posix:open (namestring dir) sb-posix:o-rdonly)))
         (unwind-protect (sb-posix:fsync fd)
           (sb-posix:close fd)))
-    (error () nil)))
+    (error () nil))
+  #-sbcl nil)
+
+(defun fsync-parent-directory (path)
+  "FSYNC-DIRECTORY of the directory containing PATH, for a file just renamed
+into place. This used to be a second FSYNC-DIRECTORY taking a file path; the
+later-loaded directory-taking one silently replaced it (same package, same
+name), so these calls fsynced the file itself and the parent directory never."
+  (let ((dir (directory-namestring path)))
+    (fsync-directory (if (string= dir "") "." dir))))
 
 (defun save-file-with-crc32 (path write-fn)
   "Write data to PATH atomically with CRC32 integrity.
@@ -310,7 +319,7 @@ dispatch — was 18% of total CPU on the May 2 testnet4 profile."
       ;; before any other process (or our crash) sees the rename.
       (fsync-file tmp-path)
       (rename-file tmp-path path)
-      (fsync-directory path))))
+      (fsync-parent-directory path))))
 
 (defun save-file-with-crc32-streaming-bb (path bb-fn &key (flush-threshold (* 4 1024 1024)))
   "Streaming variant of save-file-with-crc32-bb. BB-FN receives
@@ -353,7 +362,7 @@ must NOT call bb-finish."
         (finish-output out)))
     (fsync-file tmp-path)
     (rename-file tmp-path path)
-    (fsync-directory path)))
+    (fsync-parent-directory path)))
 
 (defun save-file-with-crc32-bb (path bb-fn)
   "Like SAVE-FILE-WITH-CRC32 but BB-FN receives a byte-buf and writes
@@ -377,7 +386,7 @@ that dominated CPU on UTXO/state flushes."
         (finish-output out))
       (fsync-file tmp-path)
       (rename-file tmp-path path)
-      (fsync-directory path))))
+      (fsync-parent-directory path))))
 
 (defun load-file-with-crc32 (path min-size)
   "Load and verify a CRC32-protected file at PATH.

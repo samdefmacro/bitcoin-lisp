@@ -13,3 +13,11 @@
 (def-suite coalton-tests
   :description "Tests for Coalton-typed Bitcoin code"
   :in :bitcoin-lisp-tests)
+
+(defun get-read-result-value (rr)
+  "Extract value from ReadResult."
+  (bitcoin-lisp.coalton.binary:read-result-value rr))
+
+(defun get-read-result-position (rr)
+  "Extract position from ReadResult."
+  (bitcoin-lisp.coalton.binary:read-result-position rr))
