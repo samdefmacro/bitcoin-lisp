@@ -9,6 +9,13 @@
 (defpackage #:bitcoin-lisp.coalton.interop
   (:documentation "CL wrapper functions for Coalton Bitcoin types.")
   (:use #:cl)
+  ;; Byte I/O (src/util/bytes.lisp). Loads before this file, so the sighash
+  ;; writers below inline it.
+  (:import-from #:bitcoin-lisp.bytes
+                #:make-byte-buf #:bb-write-u32-le #:bb-write-u64-le #:bb-write-i64-le
+                #:bb-write-bytes #:bb-write-varint #:bb-finish
+                #:buf-set-u8 #:buf-set-u16-le #:buf-set-u32-le #:buf-set-u64-le
+                #:buf-set-bytes #:buf-set-varint)
   (:export
    ;; Satoshi operations
    #:wrap-satoshi
@@ -405,27 +412,27 @@ INPUTS may be any sequence (struct field vector or an ad-hoc list)."
   (map nil
        (lambda (inp)
          (let ((prev (bitcoin-lisp.serialization:tx-in-previous-output inp)))
-           (bitcoin-lisp.serialization:bb-write-bytes
+           (bb-write-bytes
             bb (bitcoin-lisp.serialization:outpoint-hash prev))
-           (bitcoin-lisp.serialization:bb-write-u32-le
+           (bb-write-u32-le
             bb (bitcoin-lisp.serialization:outpoint-index prev))))
        inputs))
 
 (defun bb-write-all-sequences (bb inputs)
   (map nil
        (lambda (inp)
-         (bitcoin-lisp.serialization:bb-write-u32-le
+         (bb-write-u32-le
           bb (bitcoin-lisp.serialization:tx-in-sequence inp)))
        inputs))
 
 (defun bb-write-all-outputs (bb outputs)
   (map nil
        (lambda (out)
-         (bitcoin-lisp.serialization:bb-write-i64-le
+         (bb-write-i64-le
           bb (bitcoin-lisp.serialization:tx-out-value out))
          (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
-           (bitcoin-lisp.serialization:bb-write-varint bb (length script))
-           (bitcoin-lisp.serialization:bb-write-bytes bb script)))
+           (bb-write-varint bb (length script))
+           (bb-write-bytes bb script)))
        outputs))
 
 (defun init-precomputed-sighash (tx &optional spent-utxos)
@@ -442,15 +449,15 @@ INPUTS may be any sequence (struct field vector or an ad-hoc list)."
    even after libcrypto SHA256 made hashing cheap."
   (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
          (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
-         (prevouts-bb (bitcoin-lisp.serialization:make-byte-buf))
-         (sequences-bb (bitcoin-lisp.serialization:make-byte-buf))
-         (outputs-bb (bitcoin-lisp.serialization:make-byte-buf)))
+         (prevouts-bb (make-byte-buf))
+         (sequences-bb (make-byte-buf))
+         (outputs-bb (make-byte-buf)))
     (bb-write-all-prevouts prevouts-bb inputs)
     (bb-write-all-sequences sequences-bb inputs)
     (bb-write-all-outputs outputs-bb outputs)
-    (let* ((prevouts-bytes (bitcoin-lisp.serialization:bb-finish prevouts-bb))
-           (sequences-bytes (bitcoin-lisp.serialization:bb-finish sequences-bb))
-           (outputs-bytes (bitcoin-lisp.serialization:bb-finish outputs-bb))
+    (let* ((prevouts-bytes (bb-finish prevouts-bb))
+           (sequences-bytes (bb-finish sequences-bb))
+           (outputs-bytes (bb-finish outputs-bb))
            (sha-prevouts (bitcoin-lisp.crypto:sha256 prevouts-bytes))
            (sha-sequences (bitcoin-lisp.crypto:sha256 sequences-bytes))
            (sha-outputs (bitcoin-lisp.crypto:sha256 outputs-bytes)))
@@ -463,21 +470,21 @@ INPUTS may be any sequence (struct field vector or an ad-hoc list)."
        :sha-outputs sha-outputs
        :sha-amounts
        (when spent-utxos
-         (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+         (let ((bb (make-byte-buf)))
            (loop for utxo across spent-utxos
-                 do (bitcoin-lisp.serialization:bb-write-i64-le
+                 do (bb-write-i64-le
                      bb (bitcoin-lisp.storage:utxo-entry-value utxo)))
            (bitcoin-lisp.crypto:sha256
-            (bitcoin-lisp.serialization:bb-finish bb))))
+            (bb-finish bb))))
        :sha-script-pubkeys
        (when spent-utxos
-         (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+         (let ((bb (make-byte-buf)))
            (loop for utxo across spent-utxos
                  for script = (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo)
-                 do (bitcoin-lisp.serialization:bb-write-varint bb (length script))
-                    (bitcoin-lisp.serialization:bb-write-bytes bb script))
+                 do (bb-write-varint bb (length script))
+                    (bb-write-bytes bb script))
            (bitcoin-lisp.crypto:sha256
-            (bitcoin-lisp.serialization:bb-finish bb))))))))
+            (bb-finish bb))))))))
 
 (defvar *witness-v0-mode* nil
   "When non-nil, verify-checksig uses BIP 143 sighash instead of legacy.
@@ -1410,192 +1417,6 @@ the table's own structure.")
      (write-byte #xff stream)
      (write-u64-le value stream))))
 
-;;; Buffered writers — for tight loops (sighash preimage construction) that
-;;; previously routed every byte through flexi-streams' CLOS-dispatched
-;;; STREAM-WRITE-BYTE / VECTOR-PUSH-EXTEND. Per profiling, that path accounts
-;;; for ~50% of CPU time during validation. These helpers write directly
-;;; into a pre-sized (simple-array (unsigned-byte 8)) and return the new
-;;; position, ~10x faster than the stream-based equivalents.
-
-;;; Auto-growing byte buffer
-;;;
-;;; A pre-sized preimage buffer works when the upper bound is easy to
-;;; compute (e.g. BIP 143's fixed-layout sighash). For legacy sighash and
-;;; other variable-length payloads the upper bound walk is awkward, so we
-;;; have this small struct with a doubling growth policy. Same single-aref
-;;; per-byte cost as the buf-set-* helpers below; just a check + grow on
-;;; the slow path.
-
-(defstruct (byte-buf (:conc-name bb-))
-  (data (make-array 1024 :element-type '(unsigned-byte 8))
-        :type (simple-array (unsigned-byte 8) (*)))
-  (pos 0 :type fixnum))
-
-(declaim (inline bb-ensure bb-write-u8 bb-write-u16-le bb-write-u32-le
-                 bb-write-u64-le bb-write-bytes bb-write-varint bb-finish))
-
-(defun bb-ensure (buf needed-pos)
-  "Ensure DATA has room to write up to NEEDED-POS. Doubles on overflow."
-  (declare (type byte-buf buf) (type fixnum needed-pos)
-           (optimize (speed 3) (safety 1)))
-  (let ((cur (length (bb-data buf))))
-    (declare (type fixnum cur))
-    (when (> needed-pos cur)
-      (let ((new-size cur))
-        (declare (type fixnum new-size))
-        (loop while (< new-size needed-pos)
-              do (setf new-size (the fixnum (* new-size 2))))
-        (let ((new-data (make-array new-size :element-type '(unsigned-byte 8))))
-          (declare (type (simple-array (unsigned-byte 8) (*)) new-data))
-          (replace new-data (bb-data buf) :end2 (bb-pos buf))
-          (setf (bb-data buf) new-data))))))
-
-(defun bb-write-u8 (buf v)
-  (declare (type byte-buf buf) (type (unsigned-byte 8) v)
-           (optimize (speed 3) (safety 1)))
-  (let ((p (bb-pos buf)))
-    (declare (type fixnum p))
-    (bb-ensure buf (the fixnum (1+ p)))
-    (setf (aref (bb-data buf) p) v)
-    (setf (bb-pos buf) (the fixnum (1+ p)))))
-
-;; Note: bb-write-u{16,32,64}-le accept any integer and mask with logand —
-;; mirrors the historical write-u32-le behavior that callers rely on for
-;; signed-int32 fields like transaction-version. A strict (unsigned-byte 32)
-;; declaration breaks sighash on any tx with a negative version.
-
-(defun bb-write-u16-le (buf v)
-  (declare (type byte-buf buf) (type integer v)
-           (optimize (speed 3) (safety 1)))
-  (let ((p (bb-pos buf))
-        (mv (logand v #xffff)))
-    (declare (type fixnum p) (type (unsigned-byte 16) mv))
-    (bb-ensure buf (the fixnum (+ p 2)))
-    (let ((d (bb-data buf)))
-      (setf (aref d p) (logand mv #xff))
-      (setf (aref d (the fixnum (+ p 1))) (logand (ash mv -8) #xff)))
-    (setf (bb-pos buf) (the fixnum (+ p 2)))))
-
-(defun bb-write-u32-le (buf v)
-  (declare (type byte-buf buf) (type integer v)
-           (optimize (speed 3) (safety 1)))
-  (let ((p (bb-pos buf))
-        (mv (logand v #xffffffff)))
-    (declare (type fixnum p) (type (unsigned-byte 32) mv))
-    (bb-ensure buf (the fixnum (+ p 4)))
-    (setf (bb-pos buf) (buf-set-u32-le (bb-data buf) p mv))))
-
-(defun bb-write-u64-le (buf v)
-  (declare (type byte-buf buf) (type integer v)
-           (optimize (speed 3) (safety 1)))
-  (let ((p (bb-pos buf))
-        (mv (logand v #xffffffffffffffff)))
-    (declare (type fixnum p) (type (unsigned-byte 64) mv))
-    (bb-ensure buf (the fixnum (+ p 8)))
-    (setf (bb-pos buf) (buf-set-u64-le (bb-data buf) p mv))))
-
-(defun bb-write-bytes (buf src)
-  (declare (type byte-buf buf) (type vector src)
-           (optimize (speed 3) (safety 1)))
-  (let ((p (bb-pos buf))
-        (n (length src)))
-    (declare (type fixnum p n))
-    (bb-ensure buf (the fixnum (+ p n)))
-    (replace (bb-data buf) src :start1 p)
-    (setf (bb-pos buf) (the fixnum (+ p n)))))
-
-(defun bb-write-varint (buf v)
-  (declare (type byte-buf buf) (type (unsigned-byte 64) v)
-           (optimize (speed 3) (safety 1)))
-  (let ((p (bb-pos buf)))
-    (declare (type fixnum p))
-    (bb-ensure buf (the fixnum (+ p 9)))
-    (setf (bb-pos buf) (buf-set-varint (bb-data buf) p v))))
-
-(defun bb-finish (buf)
-  "Return a fresh simple-array containing exactly the written bytes."
-  (declare (type byte-buf buf) (optimize (speed 3) (safety 1)))
-  (let* ((n (bb-pos buf))
-         (out (make-array n :element-type '(unsigned-byte 8))))
-    (declare (type fixnum n))
-    (replace out (bb-data buf) :end2 n)
-    out))
-
-(declaim (inline buf-set-u8 buf-set-u16-le buf-set-u32-le buf-set-u64-le
-                 buf-set-bytes buf-set-varint))
-
-(defun buf-set-u8 (buf pos v)
-  (declare (type (simple-array (unsigned-byte 8) (*)) buf)
-           (type fixnum pos)
-           (type (unsigned-byte 8) v)
-           (optimize (speed 3) (safety 1)))
-  (setf (aref buf pos) v)
-  (the fixnum (1+ pos)))
-
-(defun buf-set-u16-le (buf pos v)
-  (declare (type (simple-array (unsigned-byte 8) (*)) buf)
-           (type fixnum pos)
-           (type (unsigned-byte 16) v)
-           (optimize (speed 3) (safety 1)))
-  (setf (aref buf pos)       (logand v #xff))
-  (setf (aref buf (+ pos 1)) (logand (ash v -8) #xff))
-  (the fixnum (+ pos 2)))
-
-(defun buf-set-u32-le (buf pos v)
-  (declare (type (simple-array (unsigned-byte 8) (*)) buf)
-           (type fixnum pos)
-           (type (unsigned-byte 32) v)
-           (optimize (speed 3) (safety 1)))
-  (setf (aref buf pos)       (logand v #xff))
-  (setf (aref buf (+ pos 1)) (logand (ash v -8) #xff))
-  (setf (aref buf (+ pos 2)) (logand (ash v -16) #xff))
-  (setf (aref buf (+ pos 3)) (logand (ash v -24) #xff))
-  (the fixnum (+ pos 4)))
-
-(defun buf-set-u64-le (buf pos v)
-  (declare (type (simple-array (unsigned-byte 8) (*)) buf)
-           (type fixnum pos)
-           (type (unsigned-byte 64) v)
-           (optimize (speed 3) (safety 1)))
-  (setf (aref buf pos)       (logand v #xff))
-  (setf (aref buf (+ pos 1)) (logand (ash v -8) #xff))
-  (setf (aref buf (+ pos 2)) (logand (ash v -16) #xff))
-  (setf (aref buf (+ pos 3)) (logand (ash v -24) #xff))
-  (setf (aref buf (+ pos 4)) (logand (ash v -32) #xff))
-  (setf (aref buf (+ pos 5)) (logand (ash v -40) #xff))
-  (setf (aref buf (+ pos 6)) (logand (ash v -48) #xff))
-  (setf (aref buf (+ pos 7)) (logand (ash v -56) #xff))
-  (the fixnum (+ pos 8)))
-
-(defun buf-set-bytes (buf pos src)
-  "Copy SRC bytes into BUF at POS using REPLACE (single ub8-bash-copy)."
-  (declare (type (simple-array (unsigned-byte 8) (*)) buf)
-           (type fixnum pos)
-           (type vector src)
-           (optimize (speed 3) (safety 1)))
-  (let ((n (length src)))
-    (declare (type fixnum n))
-    (replace buf src :start1 pos)
-    (the fixnum (+ pos n))))
-
-(defun buf-set-varint (buf pos v)
-  (declare (type (simple-array (unsigned-byte 8) (*)) buf)
-           (type fixnum pos)
-           (type (unsigned-byte 64) v)
-           (optimize (speed 3) (safety 1)))
-  (cond
-    ((< v #xfd)
-     (buf-set-u8 buf pos v))
-    ((< v #x10000)
-     (setf (aref buf pos) #xfd)
-     (buf-set-u16-le buf (1+ pos) v))
-    ((< v #x100000000)
-     (setf (aref buf pos) #xfe)
-     (buf-set-u32-le buf (1+ pos) v))
-    (t
-     (setf (aref buf pos) #xff)
-     (buf-set-u64-le buf (1+ pos) v))))
-
 (defun compute-test-sighash (subscript sighash-type)
   "Compute the sighash for Bitcoin Core test transaction format.
    This matches the standardized transaction structure used in script_tests.cpp.
@@ -2015,15 +1836,15 @@ truncate scripts ending in a malformed push."
            (cond
              ((= base-type 2) zero32)                           ; SIGHASH_NONE
              ((and (= base-type 3) (< input-index (length outputs))) ; SIGHASH_SINGLE
-              (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+              (let ((bb (make-byte-buf)))
                 (bb-write-all-outputs bb (list (aref outputs input-index)))
                 (bitcoin-lisp.crypto:hash256
-                 (bitcoin-lisp.serialization:bb-finish bb))))
+                 (bb-finish bb))))
              ((= base-type 3) zero32)                           ; SIGHASH_SINGLE out of range
              (t (precomputed-sighash-data-hash-outputs-all precomp)))))
-    ;; Build BIP 143 preimage with direct buffer writes — see buf-set-* helpers
-    ;; above for rationale. Fixed segments total 156 bytes; variable scriptCode
-    ;; adds varint+bytes.
+    ;; Build BIP 143 preimage with direct buffer writes (buf-set-*,
+    ;; src/util/bytes.lisp). Fixed segments total 156 bytes; variable
+    ;; scriptCode adds varint+bytes.
     (let* ((script-len (length script-code))
            (preimage (make-array
                       (+ 156 9 script-len)  ; 156 fixed + max varint(9) + scriptCode
@@ -3334,10 +3155,10 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
          ;; no path that silently omits it from the preimage.
          (single-output-hash
            (when (= base-type 3)
-             (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+             (let ((bb (make-byte-buf)))
                (bb-write-all-outputs bb (list (aref outputs input-index)))
                (bitcoin-lisp.crypto:sha256
-                (bitcoin-lisp.serialization:bb-finish bb)))))
+                (bb-finish bb)))))
          (ext-flag (if tapleaf-hash 1 0))
          ;; spend_type = (ext_flag << 1) | annex_present  (BIP 341)
          (spend-type (logior (ash ext-flag 1) (if *current-annex* 1 0)))
@@ -3349,7 +3170,7 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
                     (p (buf-set-varint tmp 0 (length a))))
                (setf p (buf-set-bytes tmp p a))
                (bitcoin-lisp.crypto:sha256 (subseq tmp 0 p))))))
-    ;; Build SigMsg with direct buffer writes — see buf-set-* helpers above.
+    ;; Build SigMsg with direct buffer writes — see buf-set-* in src/util/bytes.lisp.
     ;; Max preimage size: 1+1+4+4+128+32+1+(36+8+9+520+4)+32+37 ≈ 820 bytes.
     ;; ANYONECANPAY adds spent scriptPubKey which can be large; use spent
     ;; script length to size precisely.

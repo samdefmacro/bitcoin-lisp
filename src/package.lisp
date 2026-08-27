@@ -1,3 +1,50 @@
+(defpackage #:bitcoin-lisp.bytes
+  (:documentation "Index-based byte I/O: the byte-buf writer, the byte-reader,
+the positional buf-set-* primitives and CompactSize. Loads before every other
+package that does I/O (bitcoin-lisp.asd) so the hot paths that inline these
+compile against them. src/util/bytes.lisp.")
+  (:use #:cl)
+  (:export
+   #:+max-compact-size+
+   ;; positional writers into a pre-sized array
+   #:buf-set-u8
+   #:buf-set-u16-le
+   #:buf-set-u32-le
+   #:buf-set-u64-le
+   #:buf-set-bytes
+   #:buf-set-varint
+   ;; auto-growing writer
+   #:byte-buf
+   #:make-byte-buf
+   #:bb-data
+   #:bb-pos
+   #:bb-ensure
+   #:bb-write-u8
+   #:bb-write-u16-le
+   #:bb-write-u32-le
+   #:bb-write-u64-le
+   #:bb-write-i32-le
+   #:bb-write-i64-le
+   #:bb-write-bytes
+   #:bb-write-varint
+   #:bb-finish
+   ;; zero-copy reader
+   #:byte-reader
+   #:make-byte-reader
+   #:make-byte-reader-from
+   #:br-data
+   #:br-pos
+   #:br-eof-p
+   #:br-read-u8
+   #:br-read-u16-le
+   #:br-read-u32-le
+   #:br-read-u64-le
+   #:br-read-i32-le
+   #:br-read-i64-le
+   #:br-read-bytes
+   #:br-read-compact-size
+   #:br-read-var-bytes))
+
 (defpackage #:bitcoin-lisp.crypto
   (:use #:cl)
   (:export
@@ -156,6 +203,20 @@
 
 (defpackage #:bitcoin-lisp.serialization
   (:use #:cl)
+  ;; The byte-buf / byte-reader live in bitcoin-lisp.bytes (src/util/bytes.lisp)
+  ;; and are re-exported here, so every existing bitcoin-lisp.serialization:bb-*
+  ;; / br-* reference keeps working.
+  (:import-from #:bitcoin-lisp.bytes
+                #:+max-compact-size+
+                #:byte-buf #:make-byte-buf #:bb-data #:bb-pos
+                #:bb-write-u8 #:bb-write-u16-le #:bb-write-u32-le #:bb-write-u64-le
+                #:bb-write-i32-le #:bb-write-i64-le #:bb-write-bytes #:bb-write-varint
+                #:bb-finish
+                #:byte-reader #:make-byte-reader #:make-byte-reader-from
+                #:br-data #:br-pos #:br-eof-p
+                #:br-read-u8 #:br-read-u16-le #:br-read-u32-le #:br-read-u64-le
+                #:br-read-i32-le #:br-read-i64-le #:br-read-bytes
+                #:br-read-compact-size #:br-read-var-bytes)
   (:export
    ;; Binary primitives
    #:read-uint8

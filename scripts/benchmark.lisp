@@ -3,7 +3,8 @@
 ;;;; Run in the project container:
 ;;;;   scripts/benchmark.sh
 ;;;;
-;;;; These are MICRObenchmarks of the paths track C changed. They are not the
+;;;; These are MICRObenchmarks of the validation and serialization hot paths
+;;;; (track C, then the byte-I/O consolidation of the 2026-08-27 cleanup). They are not the
 ;;;; whole of item 2 — the plan's benchmark of record is a -reindex-chainstate
 ;;;; over testnet4 against Core on the same box, which needs that machine's
 ;;;; data and is driven by scripts/benchmark-reindex.sh. What these give is the
@@ -25,11 +26,14 @@
        (finish-output)
        per-op)))
 
+(defun %bytes (n fill)
+  (make-array n :element-type '(unsigned-byte 8) :initial-element fill))
+
 (defun %bench-fixture ()
   "(values sighash der-sig pubkey) — one real secp256k1 signature."
-  (let* ((privkey (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+  (let* ((privkey (%bytes 32 7))
          (pubkey (bitcoin-lisp.crypto:derive-public-key privkey))
-         (sighash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+         (sighash (%bytes 32 9)))
     (values sighash (bitcoin-lisp.crypto:sign-ecdsa privkey sighash) pubkey)))
 
 (defun bench-signature-cache ()
@@ -56,7 +60,7 @@ that hit is key construction~%"
 
 (defun bench-script-execution-cache ()
   (format t "~&~%Script-execution cache (#454)~%")
-  (let ((wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)))
+  (let ((wtxid (%bytes 32 3)))
     (let ((keying (%bench "cache key construction" 20000
                     (bitcoin-lisp.coalton.interop::make-script-execution-cache-key
                      wtxid "P2SH,WITNESS,TAPROOT")))
@@ -74,9 +78,51 @@ that hit is key construction~%"
 
 (defun bench-sha256 ()
   (format t "~&~%Primitives~%")
-  (let ((buf (make-array 1024 :element-type '(unsigned-byte 8) :initial-element 42)))
+  (let ((buf (%bytes 1024 42)))
     (%bench "sha256, 1 KiB" 20000 (bitcoin-lisp.crypto:sha256 buf))
     (%bench "hash256 (double SHA), 1 KiB" 20000 (bitcoin-lisp.crypto:hash256 buf))))
+
+(defun %bench-tx-fixture ()
+  "A 10-in / 10-out transaction with P2PKH-shaped scripts: big enough that
+serialization, not fixed overhead, dominates."
+  (flet ((bytes (n fill) (%bytes n fill)))
+    (bitcoin-lisp.serialization:make-transaction
+     :version 2
+     :inputs (coerce (loop for i below 10
+                           collect (bitcoin-lisp.serialization:make-tx-in
+                                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                      :hash (bytes 32 (1+ i)) :index i)
+                                    :script-sig (bytes 107 #x48)
+                                    :sequence #xFFFFFFFD))
+                     'simple-vector)
+     :outputs (coerce (loop for i below 10
+                            collect (bitcoin-lisp.serialization:make-tx-out
+                                     :value (* 100000 (1+ i))
+                                     :script-pubkey (bytes 25 #x76)))
+                      'simple-vector)
+     :lock-time 0)))
+
+(defun bench-serialization ()
+  "The byte-buf / byte-reader paths (docs/refactoring-plan-2026-08-27.md P1):
+serialize, parse, legacy sighash, and the raw buffer primitives underneath."
+  (format t "~&~%Serialization (byte-buf / byte-reader)~%")
+  (let* ((tx (%bench-tx-fixture))
+         (raw (bitcoin-lisp.serialization:serialize-transaction tx))
+         ;; the scriptCode is a real output script of the fixture
+         (subscript (bitcoin-lisp.serialization:tx-out-script-pubkey
+                     (aref (bitcoin-lisp.serialization:transaction-outputs tx) 0))))
+    (format t "~&  (fixture tx is ~D bytes)~%" (length raw))
+    (%bench "serialize-tx, 10-in/10-out" 200000
+      (bitcoin-lisp.serialization:serialize-transaction tx))
+    (%bench "br-read-transaction, same bytes" 200000
+      (bitcoin-lisp.serialization:br-read-transaction
+       (bitcoin-lisp.serialization:make-byte-reader-from raw)))
+    (%bench "legacy sighash, input 0" 200000
+      (bitcoin-lisp.coalton.interop:compute-legacy-sighash tx 0 subscript 1))
+    (%bench "byte-buf: 256 x u32 + finish" 200000
+      (let ((b (bitcoin-lisp.serialization:make-byte-buf)))
+        (dotimes (i 256) (bitcoin-lisp.serialization:bb-write-u32-le b i))
+        (bitcoin-lisp.serialization:bb-finish b)))))
 
 (defun run-benchmarks ()
   (format t "~&bitcoin-lisp validation microbenchmarks~%~
@@ -92,7 +138,8 @@ measurement to three digits.~%~%"
   (bench-signature-cache)
   (bench-script-execution-cache)
   (bench-sha256)
-  (format t "~&~%Note: these are microbenchmarks of the paths track C changed.~%~
+  (bench-serialization)
+  (format t "~&~%Note: these are microbenchmarks of the validation and serialization hot paths.~%~
              The benchmark of RECORD for IBD is scripts/benchmark-reindex.sh,~%~
              which needs a real chain and, for the Core comparison, the test~%~
              server. Nothing here speaks to end-to-end IBD time.~%")
