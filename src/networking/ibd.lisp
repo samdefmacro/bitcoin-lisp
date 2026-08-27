@@ -210,12 +210,6 @@ thread mutates it."
   ;; re-add reorg-disconnected ones. Threaded in once at run-ibd entry rather
   ;; than through every networking function.
   (mempool nil)
-  ;; Node transaction index, threaded the same way and for the same reason.
-  ;; Without it the connect path runs with TX-INDEX nil, so -txindex is updated
-  ;; ONLY by the startup catch-up: every block arriving from the network goes
-  ;; unindexed until the next restart, and a reorg leaves the index's
-  ;; best-block marker pointing at a block that is no longer on the chain.
-  (tx-index nil)
   ;; Live peer list and address book for the generic message path
   ;; (handle-message's node-context: peers / address-book). Without these, tx
   ;; ingestion/serving, tx-inv getdata, compact-block relay, and addr
@@ -441,20 +435,6 @@ so RPC threads can read while the sync thread mutates."
           #+sbcl (sb-ext:with-locked-hash-table (in-flight) (scan))
           #-sbcl (scan))))
     result))
-
-(defun %context-tx-index ()
-  "The live transaction index, from the IBD context.
-
-Every activate-block / activate-best-chain call on this path takes the index as
-an argument, and each one that omitted it silently disabled the index for the
-blocks it connected: their transactions never entered it, and a reorg left the
-best-block marker naming a block that had just been disconnected, so the next
-startup rescanned from genesis. That omission has now been found three separate
-times (PR #372 on the arrival path, and five more sites here), always the same
-way — from a live log line, never from a test. Read it from the context rather
-than accepting it per-caller, so a new call site cannot reintroduce it by
-forgetting an argument."
-  (and *ibd-context* (ibd-context-tx-index *ibd-context*)))
 
 (defun queue-missing-fork-blocks (missing-blocks)
   "MISSING-BLOCKS is a list of (hash . height) cons cells, returned by
@@ -1876,10 +1856,9 @@ unanswered until the next sync cycle (Core has no such window: each peer's
 ProcessMessages/SendMessages runs continuously). Returns the pump's
 ibd-context so the caller can inspect counters (e.g. headers-received > 0
 means a new block was announced and a sync cycle should start now)."
-  (bl.ctx:with-node-context (mempool address-book tx-index) node-ctx
+  (bl.ctx:with-node-context (mempool address-book) node-ctx
   (let ((ctx (or ctx (make-ibd))))
     (setf (ibd-context-mempool ctx) mempool
-          (ibd-context-tx-index ctx) tx-index
           (ibd-context-peers ctx) peers
           (ibd-context-address-book ctx) address-book
           ;; the handlers relay through node-ctx's peers: keep it the live list
@@ -1936,7 +1915,7 @@ Asking a peer for headers here returns zero and costs a full round trip."
 
 (defun run-ibd (peers node-ctx)
   "Main IBD loop."
-  (bl.ctx:with-node-context (chain-state utxo-set block-store fee-estimator recent-rejects mempool address-book historical-chainstate tx-index) node-ctx
+  (bl.ctx:with-node-context (chain-state utxo-set block-store fee-estimator recent-rejects mempool address-book historical-chainstate) node-ctx
   (let ((ctx *ibd-context*)
         (start-height (bl.store:current-height chain-state)))
     ;; Make the mempool reachable from the block-activation path (which reads
@@ -1945,7 +1924,6 @@ Asking a peer for headers here returns zero and costs a full round trip."
     ;; generic fallthrough so tx relay and addr gossip actually run live.
     (when ctx
       (setf (ibd-context-mempool ctx) mempool
-            (ibd-context-tx-index ctx) tx-index
             (ibd-context-peers ctx) peers
             (ibd-context-address-book ctx) address-book))
     (setf (bl.ctx:node-context-peers node-ctx) peers)
@@ -2247,17 +2225,7 @@ Asking a peer for headers here returns zero and costs a full round trip."
            chain-state block-store utxo-set
            :fee-estimator fee-estimator
            :recent-rejects recent-rejects
-           :mempool mempool
-           ;; From the CONTEXT, never from a caller who might forget: this
-           ;; argument was missing here from the day the function landed, so
-           ;; every reorg driven by the periodic activation — which on testnet4
-           ;; is most of them — reconnected blocks with the txindex switched
-           ;; off. Their transactions never entered the index, and the
-           ;; best-block marker stayed on a block the reorg had just
-           ;; disconnected, so the next startup read `marker-off-chain' and
-           ;; rescanned from genesis. Observed live 2026-08-20, one restart
-           ;; after the arrival path was fixed for the same omission (#372).
-           :tx-index (%context-tx-index))
+           :mempool mempool)
         (when switched
           (bl:log-info "Activated best chain: tip now height ~D"
                                  (bl.store:current-height chain-state)))
@@ -3211,7 +3179,6 @@ keeping. Core has no header-sync loop at all for the same reason."
                            :peers (or (and ctx (ibd-context-peers ctx)) (list peer))
                            :mempool (and ctx (ibd-context-mempool ctx))
                            :address-book (and ctx (ibd-context-address-book ctx))
-                           :tx-index (and ctx (ibd-context-tx-index ctx))
                            :fee-estimator fee-estimator :recent-rejects recent-rejects)
                           ctx)
       (let ((answer (%peer-headers-bytes peer)))
@@ -3575,8 +3542,7 @@ candidate activated."
                               height)
                :fee-estimator fee-estimator
                :recent-rejects recent-rejects
-               :mempool mempool
-               :tx-index (%context-tx-index)))
+               :mempool mempool))
           (cond
             (activated
              (remhash cand-hash (ibd-context-reorg-candidates *ibd-context*))
@@ -3699,8 +3665,7 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                                  height)
                      :fee-estimator fee-estimator
                      :recent-rejects recent-rejects
-                     :mempool mempool
-                     :tx-index (%context-tx-index)))
+                     :mempool mempool))
                 (cond
                   ;; A heavier-shorter fork can win the reorg with its tip at or
                   ;; below our height (real-difficulty fork vs min-difficulty
@@ -3784,8 +3749,7 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                    :skip-scripts skip-scripts
                    :fee-estimator fee-estimator
                    :recent-rejects recent-rejects
-                   :mempool mempool
-                   :tx-index (%context-tx-index)))
+                   :mempool mempool))
               (cond
                 (activated
                  (clear-block-failure hash)
@@ -4015,8 +3979,7 @@ the tip is ready to connect."
                  :skip-scripts skip-scripts
                  :fee-estimator fee-estimator
                  :recent-rejects recent-rejects
-                 :mempool mempool
-                 :tx-index (%context-tx-index)))
+                 :mempool mempool))
             (cond
               (activated
                (note-tip-advanced chain-state)

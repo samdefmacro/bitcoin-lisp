@@ -27,7 +27,9 @@
   "Block filter index state.")
 
 (defmethod index-name ((index blockfilterindex)) "basic block filter index")
-(defmethod index-height ((index blockfilterindex)) (blockfilterindex-height index))
+(defmethod index-height ((index blockfilterindex) chainstate)
+  (declare (ignore chainstate))
+  (blockfilterindex-height index))
 (defmethod index-best-block ((index blockfilterindex))
   (multiple-value-bind (height hash) (blockfilterindex-best index)
     (and hash (values hash height))))

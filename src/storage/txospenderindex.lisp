@@ -57,7 +57,9 @@ no in-memory table and no startup replay."
   (k1 0 :type (unsigned-byte 64)))
 
 (defmethod index-name ((index txospender-index)) "txospenderindex")
-(defmethod index-height ((index txospender-index)) (txospenderindex-height index))
+(defmethod index-height ((index txospender-index) chainstate)
+  (declare (ignore chainstate))
+  (txospenderindex-height index))
 (defmethod index-best-block ((index txospender-index)) (txospenderindex-best-block index))
 (defmethod index-set-best ((index txospender-index) block-hash height)
   (txospenderindex-set-best-block index block-hash height))

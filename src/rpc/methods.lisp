@@ -1959,8 +1959,7 @@ context. Returns null on success; errors otherwise."
                      (rpc-get-block-store node)
                      (rpc-get-utxo-set node)
                      hash
-                     :mempool (rpc-get-mempool node)
-                     :tx-index (rpc-get-tx-index node))
+                     :mempool (rpc-get-mempool node))
           (unless ok
             (error 'rpc-error :code +rpc-misc-error+
                               :message (string-downcase (symbol-name reason))))
@@ -2648,7 +2647,6 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
           (block-store (rpc-get-block-store node))
           (utxo-set (rpc-get-utxo-set node))
           (mempool (rpc-get-mempool node))
-          (tx-index (rpc-get-tx-index node))
           (was-active (bl::node-network-active node)))
       ;; NetworkDisable: skipped when the network is already off, so we don't
       ;; re-enable it behind the user's back at the end.
@@ -2665,7 +2663,7 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
                     (multiple-value-bind (ok reason)
                         (bl.val:invalidate-block
                          chain-state block-store utxo-set invalidate-hash
-                         :mempool mempool :tx-index tx-index)
+                         :mempool mempool)
                       (unless ok
                         (error 'rpc-error :code +rpc-misc-error+
                                           :message (format nil "Could not roll back to requested height. (~A)"
@@ -2683,7 +2681,7 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
              (with-node-lock (node)
                (bl.val:reconsider-block
                 chain-state block-store utxo-set invalidate-hash
-                :mempool mempool :tx-index tx-index)))
+                :mempool mempool)))
         ;; ~NetworkDisable (runs after the rollback is undone, like Core's
         ;; reverse member-destruction order).
         (when was-active
@@ -3808,33 +3806,22 @@ if it is not an enabled index). Every index is maintained inline as blocks
 connect, so a present index normally tracks the tip; \"synced\" reflects whether
 its best indexed block has reached the current tip."
   (let* ((name (and (consp params) (first params)))
-         (tip (bl.store:current-height (rpc-get-chain-state node)))
-         (tx-index (rpc-get-tx-index node))
-         (bfi (rpc-get-blockfilterindex node))
-         (csi (rpc-get-coinstatsindex node))
-         (tsi (bl::node-txospenderindex node))
+         (cs (rpc-get-chain-state node))
+         (tip (bl.store:current-height cs))
          (entries '()))
-    (flet ((add (key enabled-p height)
-             (when (and enabled-p (or (null name) (string= name key)))
-               (push `(,key . (("synced" . ,(json-bool (>= height tip)))
-                               ("best_block_height" . ,height)))
-                     entries))))
-      ;; txindex has no separate best-height accessor; it tracks the tip inline.
-      (add "txindex"
-           (and tx-index (bl.store:tx-index-enabled tx-index))
-           tip)
-      (add "basic block filter index"
-           (and bfi (bl.store:blockfilterindex-enabled bfi))
-           (if bfi (bl.store:blockfilterindex-height bfi) -1))
-      (add "coinstatsindex"
-           (and csi (bl.store:coinstatsindex-enabled csi))
-           (if csi (bl.store:coinstatsindex-height csi) -1))
-      ;; Core names it "txospenderindex" (index/txospenderindex.cpp:64, the
-      ;; BaseIndex name argument), which is the string getindexinfo's optional
-      ;; filter argument matches on.
-      (add "txospenderindex"
-           (and tsi (bl.store:txospender-index-enabled tsi))
-           (if tsi (bl.store:txospenderindex-height tsi) -1)))
+    ;; One row per enabled index, named as Core names them (the BaseIndex
+    ;; name argument, e.g. "txospenderindex" index/txospenderindex.cpp:64),
+    ;; which is the string the optional filter argument matches on. The
+    ;; txindex's height is resolved against the chain (its marker is a
+    ;; hash), so under assumeutxo it reports the validated tip it is really
+    ;; at rather than claiming the snapshot tip.
+    (dolist (index (bl::node-indexes node))
+      (let ((key (bl.store:index-name index))
+            (height (bl.store:index-height index cs)))
+        (when (or (null name) (string= name key))
+          (push `(,key . (("synced" . ,(json-bool (>= height tip)))
+                          ("best_block_height" . ,height)))
+                entries))))
     ;; No matching active index -> empty JSON object.
     (if entries (nreverse entries) (make-hash-table :test 'equal))))
 
@@ -4492,8 +4479,7 @@ agree on a tip, timed out on a node that was working perfectly in isolation."
                      chain-state
                      (rpc-get-block-store node)
                      (rpc-get-utxo-set node)
-                     :mempool (rpc-get-mempool node)
-                     :tx-index (rpc-get-tx-index node)))))
+                     :mempool (rpc-get-mempool node)))))
       (when (first result)
         (let ((header (bl.ser:bitcoin-block-header block))
               (peers (bl::node-peers node)))

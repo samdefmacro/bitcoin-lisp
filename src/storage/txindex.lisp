@@ -39,10 +39,12 @@ marker it never had.")
 height); the height comes from the chain, so it is -1 here."
   (let ((hash (txindex-best-block index)))
     (and hash (values hash -1))))
-(defmethod index-height ((index tx-index))
-  "-1: the txindex marker carries no height; %TXINDEX-RESUME-HEIGHT resolves
-it against the chain when a build resumes."
-  -1)
+(defmethod index-height ((index tx-index) chainstate)
+  "The marker is a hash only (Core TxIndex stores a locator), so resolve it
+against CHAINSTATE: the marker's height while it is still on the active chain
+there, the fork point after a reorg, -1 with no usable marker -- one below
+what %TXINDEX-RESUME-HEIGHT scans from."
+  (1- (%txindex-resume-height index chainstate)))
 (defmethod index-set-best ((index tx-index) block-hash height)
   (declare (ignore height))
   (txindex-set-best-block index block-hash))
@@ -53,6 +55,18 @@ it against the chain when a build resumes."
   (txindex-add-block index block block-hash)
   (txindex-set-best-block index block-hash)
   (values t nil))
+(defmethod index-rewind-block ((index tx-index) chainstate block block-hash height)
+  "Move the best-block marker back to BLOCK's parent when it names BLOCK
+(Core BaseIndex::Rewind moves the locator to the fork; the disconnect hook
+walks the disconnected blocks tip-first, so this lands there). The entries
+stay: Core's TxIndex has no CustomRemove, and a stale-branch tx keeps
+resolving through the still-stored block. Without this the marker sat above
+the tip after invalidateblock and the next start rescanned from genesis."
+  (declare (ignore chainstate height))
+  (let ((best (txindex-best-block index)))
+    (when (and best (equalp best block-hash))
+      (txindex-set-best-block
+       index (bl.ser:block-header-prev-block (bl.ser:bitcoin-block-header block))))))
 (defmethod index-sync ((index tx-index) chainstate block-store &key undo-fn subsidy-fn progress)
   (declare (ignore undo-fn subsidy-fn))
   (build-tx-index index chainstate block-store :progress-callback progress))

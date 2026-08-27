@@ -25,9 +25,10 @@ Never instantiated directly; the indexes :INCLUDE it."
 (defgeneric index-name (index)
   (:documentation "The index's name as Core spells it: \"txindex\", ..."))
 
-(defgeneric index-height (index)
-  (:documentation "Height of the highest indexed block, or -1 when the index
-holds nothing (the shape getindexinfo reports)."))
+(defgeneric index-height (index chainstate)
+  (:documentation "The highest height INDEX has indexed contiguously from
+genesis, or -1. CHAINSTATE lets an index whose marker is a hash only (the
+txindex, like Core's locator) resolve it against the active chain."))
 
 (defgeneric index-best-block (index)
   (:documentation "(values block-hash height) of the highest indexed block,
