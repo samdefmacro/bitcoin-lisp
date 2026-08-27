@@ -18,7 +18,7 @@
 (defvar *interrupt-check* (constantly nil)
   "Predicate of no arguments: T once the node has been asked to stop.
 
-Installed once, by node.lisp (%node-interrupt-requested-p) — the only file that
+Installed once, by node/shutdown.lisp (%node-interrupt-requested-p) — the only file that
 sees both flags that mean stop: *shutdown-request*, set the moment SIGTERM
 arrives, and networking's *ibd-stop-requested*, set later by stop-node and also
 by call-with-sync-paused for the assumeutxo pause, after which the node keeps
@@ -145,7 +145,7 @@ the blockTip notification requests shutdown when nHeight >= m_stop_at_height).")
 (defvar *force-dns-seed* nil
   "-forcednsseed (Core DEFAULT_FORCEDNSSEED = false, net.h:97): query the DNS
 seeds even when the address book already has enough candidates. Here rather
-than in node.lisp, which reads it, because APPLY-CONFIG-GLOBALS sets it and
+than in src/node/, which reads it, because APPLY-CONFIG-GLOBALS sets it and
 config.lisp compiles first — the same reason *dns-seed-enabled* is here.")
 
 (defvar *dns-seed-enabled* t
@@ -415,7 +415,7 @@ every caller reads it as a constant.")
 ;;;;
 ;;;; Bitcoin Core-style configuration: -key=value CLI arguments and a
 ;;;; bitcoin.conf file, both mapped onto start-node's keyword parameters by
-;;;; start-node-from-args (node.lisp). The parsers here are pure string
+;;;; start-node-from-args (node/init.lisp). The parsers here are pure string
 ;;;; functions so they can be unit-tested without launching a node.
 
 (defun locale-independent-atoi (value)
@@ -578,7 +578,7 @@ PORT defaulting to 9050. Returns NIL for \"0\" or the empty string — Core's
 -noproxy / -proxy=0 'remove the proxy' convention (init.cpp:1700-1704).
 Accepts \"[ipv6]:port\" / \"[ipv6]\"; a trailing :port is only honored when it
 is all digits after a single colon, so a bare IPv6 address is host-only
-(same splitting rules as parse-node-endpoint, node.lisp)."
+(same splitting rules as parse-node-endpoint, node/peers.lisp)."
   (let ((v (string-trim '(#\Space #\Tab) value)))
     (cond
       ((or (zerop (length v)) (string= v "0")) nil)
@@ -1562,7 +1562,7 @@ SETTINGS-CELLS deliberately does NOT take part in resolving the network: Core
 reads its chain selectors from the command line and the config file's global
 area only, and the settings file lives INSIDE the network directory — letting it
 choose the network would make its own location depend on its contents.
-Returns (VALUES plist merged-alist network); start-node-from-args (node.lisp)
+Returns (VALUES plist merged-alist network); start-node-from-args (node/init.lisp)
 wraps this with the file I/O, apply-config-globals, and launch."
   (let* ((cli (parse-cli-args args))
          ;; The network is resolved from the CLI plus the config file's GLOBAL

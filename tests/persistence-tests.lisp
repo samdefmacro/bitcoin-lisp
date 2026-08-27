@@ -1892,7 +1892,7 @@ a plain StdMutex. A recursive lock here would hide a genuine re-entrant emit
 instead of deadlocking on it, which is how a logging bug becomes invisible."
   (is (typep bl::*log-lock* 'sb-thread:mutex))
   ;; And no source file may take it recursively again.
-  (dolist (rel '("src/logging.lisp" "src/node.lisp"))
+  (dolist (rel (cons "src/logging.lisp" (%node-source-files)))
     (let ((src (uiop:read-file-string
                 (merge-pathnames rel (asdf:system-source-directory :bitcoin-lisp)))))
       (is (null (search "with-recursive-lock-held (*log-lock*)" src))

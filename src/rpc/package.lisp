@@ -36,7 +36,7 @@
    #:load-wallets-on-startup
    #:close-wallet-manager
 
-   ;; Wallet chain-tracking fan-out (wallet P2; called by node.lisp's
+   ;; Wallet chain-tracking fan-out (wallet P2; called by node/wallet-hooks.lisp's
    ;; wallet-notify-* hooks)
    #:wallet-manager-has-wallets-p
    #:wallets-block-connected
@@ -44,7 +44,7 @@
    #:wallets-mempool-tx-added
    #:wallets-mempool-tx-removed
 
-   ;; Wallet rebroadcast timer (wallet P4; driven by node.lisp's
+   ;; Wallet rebroadcast timer (wallet P4; driven by src/node/'s
    ;; housekeeping loop)
    #:wallets-maybe-resend
 

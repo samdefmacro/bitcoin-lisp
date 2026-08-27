@@ -13,7 +13,7 @@
 ;;; two of the eight. With one argument there is nothing to forget.
 ;;;
 ;;; Data only, so it loads first and every layer can name it; the node
-;;; (src/node.lisp node->context) builds one from its slots for each sync pass
+;;; (src/node/sync.lisp node->context) builds one from its slots for each sync pass
 ;;; and each receive tick, and tests build one with the pieces they have (an
 ;;; absent piece is NIL, which is what a handler used to receive when a keyword
 ;;; was omitted). PEERS is the live list: the IBD loop rewrites it when it

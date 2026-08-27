@@ -40,7 +40,7 @@ in the very file the node's wedges are diagnosed from.
 PLAIN, as Core's StdMutex is. It was recursive for one release because our
 SIGTERM/SIGINT handler logged, so a signal delivered to a thread already inside
 an emit would deadlock on its own lock. The handler is now what Core's is — an
-atomic flag plus a one-byte self-pipe write, nothing else (node.lisp
+atomic flag plus a one-byte self-pipe write, nothing else (node/shutdown.lisp
 %HANDLE-STOP-SIGNAL) — so no emit can re-enter another, and a recursive lock
 would only hide a future one.")
 
@@ -443,8 +443,8 @@ via the logging RPC (or the node is globally at :debug)."
 ;;;; than a hazard. What must NOT reach the shell unexamined is the SUBSTITUTED
 ;;;; value, which is why %NOTIFY-SUBSTITUTE validates every one.
 ;;;;
-;;;; Here rather than in node.lisp because the wallet fires -walletnotify from
-;;;; AddToWallet, and rpc/wallet-tx.lisp compiles long before node.lisp.
+;;;; Here rather than in src/node/ because the wallet fires -walletnotify from
+;;;; AddToWallet, and rpc/wallet-tx.lisp compiles long before src/node/.
 
 (defun %notify-safe-value-p (value)
   "Whether VALUE may be substituted into a shell command.

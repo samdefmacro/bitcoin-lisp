@@ -148,11 +148,7 @@ long as it was left running.
 
 The property is which CALL the no-peer branch makes, so it is asserted against
 the source: a runtime assertion would need a full chain on disk."
-  (let ((src (with-open-file (in (merge-pathnames
-                                  "src/node.lisp"
-                                  (asdf:system-source-directory :bitcoin-lisp)))
-               (let ((text (make-string (file-length in))))
-                 (subseq text 0 (read-sequence text in))))))
+  (let ((src (%node-source-text)))
     (let ((branch (search "No peers available, reconnecting" src)))
       (is-true branch "the no-peers branch is gone; this test needs rewriting")
       ;; The activation must come BEFORE the give-up-and-wait, or it never runs.

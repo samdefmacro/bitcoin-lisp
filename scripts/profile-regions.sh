@@ -3,7 +3,7 @@
 #
 # Tails /data/bitcoin-lisp/logs/node.log and SIGUSR1-toggles sb-sprof at
 # region boundaries during a fresh testnet4 sync. The node's SIGUSR1
-# handler (src/node.lisp:642-668) toggles sb-sprof and writes the report
+# handler (src/node/shutdown.lisp install-shutdown-handler) toggles sb-sprof and writes the report
 # to /data/bitcoin-lisp/logs/profile.txt on the SECOND USR1. We then
 # rename the report so it isn't clobbered by the next region.
 #

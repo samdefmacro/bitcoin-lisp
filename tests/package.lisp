@@ -145,3 +145,23 @@ rejects filter"
 (defun run-integration-tests ()
   "Run integration tests only (requires network)."
   (run! :integration-tests))
+
+(defun %node-source-files ()
+  "The files of src/node/, as repo-relative strings, in name order."
+  (sort (mapcar (lambda (path)
+                  (concatenate 'string "src/node/" (file-namestring path)))
+                (directory (merge-pathnames "src/node/*.lisp"
+                                            (asdf:system-source-directory :bitcoin-lisp))))
+        #'string<))
+
+(defun %node-source-text ()
+  "The text of every src/node/*.lisp, concatenated -- for the source-text
+tests that used to read the one node.lisp. Two things a test compares the
+POSITIONS of must sit in the same file for the order to mean anything; the
+tests that do so compare within one function."
+  (with-output-to-string (out)
+    (dolist (rel (%node-source-files))
+      (write-string (uiop:read-file-string
+                     (merge-pathnames rel (asdf:system-source-directory :bitcoin-lisp)))
+                    out)
+      (terpri out))))

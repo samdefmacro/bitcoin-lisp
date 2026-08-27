@@ -1434,7 +1434,7 @@ sentinel, :TRUE otherwise."
       "Wallet load on startup setting could not be updated, so wallet may still be loaded next node startup."
       "Wallet load on startup setting could not be updated, so wallet may not be loaded next node startup."))
 
-;;; --- Manager lifecycle (called from node.lisp) ---
+;;; --- Manager lifecycle (called from node/init.lisp and node/shutdown.lisp) ---
 
 (defun init-wallet-manager (data-directory network)
   "Create the node's wallet manager. Wallets recorded for auto-load in

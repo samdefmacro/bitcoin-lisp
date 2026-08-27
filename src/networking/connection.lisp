@@ -160,7 +160,7 @@ the hard limit and a node that is still following the tip can keep relaying it."
 ;;; arriving while the sync thread is blocked in a peer read (a message wait OR a
 ;;; handshake) hangs until the full :timeout elapses — which is what made
 ;;; shutdown take minutes (the June-2026 mainnet hangs). The IBD loops (ibd.lisp)
-;;; and replace-disconnected-peers (node.lisp) poll it too.
+;;; and replace-disconnected-peers (node/peers.lisp) poll it too.
 (defvar *ibd-stop-requested* nil
   "T while the node is shutting down; polled by receive-bytes and the IBD/peer
 loops so the sync thread exits within seconds of a TERM instead of blocking on
@@ -171,7 +171,7 @@ in-flight socket reads.")
   *ibd-stop-requested*)
 
 ;;; This flag reaches layers that cannot see networking through
-;;; bl:*interrupt-check* (config.lisp), installed by node.lisp — the
+;;; bl:*interrupt-check* (config.lisp), installed by node/shutdown.lisp — the
 ;;; only file that also sees *shutdown-request*.
 
 (defun join-thread-or-destroy (thread &key (timeout 5) deadline)

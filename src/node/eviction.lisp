@@ -1,0 +1,312 @@
+(in-package #:bitcoin-lisp)
+
+;;;; Inbound eviction (Core eviction.cpp): which connection to drop when
+;;;; the inbound slots are full, and which ones are protected.
+
+(defun count-inbound-peers (node)
+  (count-if #'bl.net:peer-inbound (node-peers node)))
+
+(defun merge-inbound-peers (node)
+  "Move handshaked inbound peers from the lock-guarded hand-off list into the
+node's peer list (capped at *max-inbound-connections*; excess are disconnected). Called
+by the sync thread, so PEERS stays single-writer."
+  (let ((pending (bt:with-recursive-lock-held ((node-lock node))
+                   (prog1 (node-pending-inbound-peers node)
+                     (setf (node-pending-inbound-peers node) nil)))))
+    ;; node-peers is written only by the sync thread, but RPC threads read it
+    ;; under node-lock; hold the lock around the count + push so those reads see
+    ;; a consistent set. Recursive: evict-discouraged-inbound re-takes it.
+    (dolist (peer pending)
+      (bt:with-recursive-lock-held ((node-lock node))
+        (cond
+          ((< (count-inbound-peers node) *max-inbound-connections*)
+           (push peer (node-peers node)))
+          ;; At capacity: a discouraged existing inbound peer is preferred for
+          ;; eviction (Bitcoin Core), so make room for the newcomer if we can.
+          ((evict-discouraged-inbound node)
+           (push peer (node-peers node)))
+          ;; Otherwise evict the least valuable inbound peer (protecting the
+          ;; most valuable) so slots churn toward better peers instead of the
+          ;; newcomer always losing — Core's AttemptToEvictConnection.
+          ((evict-least-valuable-inbound node)
+           (push peer (node-peers node)))
+          (t
+           (log-info "Inbound peer cap reached; dropping ~A"
+                     (bl.net:peer-address peer))
+           (bl.net:disconnect-peer peer)))))))
+
+(defun evict-discouraged-inbound (node)
+  "If any existing inbound peer is discouraged, disconnect it and return T so a
+new inbound connection can take its slot. NIL if none are discouraged."
+  (bt:with-recursive-lock-held ((node-lock node))
+    (let ((victim (find-if (lambda (p)
+                             (and (bl.net:peer-inbound p)
+                                  (bl.net:peer-discouraged-p
+                                   (bl.net:peer-address p))))
+                           (node-peers node))))
+      (when victim
+        (log-info "Evicting discouraged inbound peer ~A to admit a new connection"
+                  (bl.net:peer-address victim))
+        (setf (node-peers node) (remove victim (node-peers node)))
+        (bl.net:disconnect-peer victim)
+        t))))
+
+(defconstant +evict-protect-netgroup+ 4
+  "Core SelectNodeToEvict: 4 peers protected by keyed netgroup
+(eviction.cpp:186-188). Deterministic but unpredictable — an attacker cannot
+tell which netgroups will be protected without the node's key.")
+(defconstant +evict-protect-min-ping+ 8
+  "8 peers with the lowest MINIMUM ping (:189-191). Was 4 here.")
+(defconstant +evict-protect-tx+ 4
+  "4 peers that most recently gave us a novel mempool transaction (:192-194).")
+(defconstant +evict-protect-block-relay-only+ 8
+  "8 NON-tx-relay peers that gave us novel blocks (:195-197). Missing here
+entirely, which meant a block-relay-only peer doing exactly the job it exists
+for was no safer than an idle one.")
+(defconstant +evict-protect-block+ 4
+  "4 peers that most recently gave us a novel block (:199-201).")
+
+(defun %evict-erase-last-k (candidates comparator k &optional filter)
+  "Core EraseLastKElements: sort CANDIDATES by COMPARATOR and REMOVE the last K
+that satisfy FILTER — \"remove\" meaning protect, since this list is the
+eviction pool. Returns the remaining candidates.
+
+The comparator orders WORST-first, so the last K are the best K by that
+measure. FILTER restricts the pass to a subset (Core's block-relay-only pass is
+the only one that uses it) without letting the excluded peers consume slots."
+  (let* ((eligible (if filter (remove-if-not filter candidates) candidates))
+         (sorted (stable-sort (copy-list eligible) comparator))
+         (n (min k (length sorted)))
+         (protected (subseq sorted (- (length sorted) n))))
+    (remove-if (lambda (p) (member p protected)) candidates)))
+
+(defun %evict-keyed-netgroup (peer)
+  "A per-node-secret keying of the peer's netgroup (Core nKeyedNetGroup). The
+SECRET is what makes the netgroup protection unpredictable: without it an
+attacker knows which groups sort first and can arrange to be outside them."
+  (let ((group (or (bl.net:ip-netgroup
+                    (bl.net:peer-address peer))
+                   "_")))
+    (sxhash (cons *eviction-netgroup-secret* group))))
+
+(defvar *eviction-netgroup-secret* (random most-positive-fixnum)
+  "Per-process secret behind %EVICT-KEYED-NETGROUP; Core derives its equivalent
+from the node's own random key.")
+
+(defun %evict-disadvantaged-network (peer)
+  "Which of Core's four disadvantaged networks PEER belongs to, or NIL
+(eviction.cpp:118-119): CJDNS, I2P, localhost, onion. These \"tend to be
+otherwise disadvantaged under our eviction criteria\" — they are higher-latency,
+so they lose the ping pass, and inbound onion peers all share the loopback
+netgroup, so they lose the netgroup pass too."
+  (cond ((bl.net:peer-inbound-onion peer) :onion)
+        (t (multiple-value-bind (net bytes)
+               (bl.net:parse-network-address
+                (bl.net:peer-address peer))
+             (declare (ignore bytes))
+             (case net
+               (:cjdns :cjdns)
+               (:i2p :i2p)
+               (:torv3 :onion)
+               (t (when (bl.net:loopback-address-p
+                         (bl.net:peer-address peer))
+                    :local)))))))
+
+(defun %evict-protect-by-ratio (candidates)
+  "Core ProtectEvictionCandidatesByRatio (eviction.cpp:104-176).
+
+Protects the half of the remaining candidates connected longest, and reserves
+up to half of THAT (a quarter of the candidates) for the four disadvantaged
+networks — giving the network with the FEWEST candidates first claim on unused
+slots, so a single onion peer is not crowded out by a dozen I2P ones.
+
+This replaces an ad-hoc onion exemption that predated it here. The exemption
+worked for the case it was written for — every inbound onion peer shares the
+loopback netgroup, so two of them were automatically the largest group and one
+was evicted on every admission — but it protected onion peers absolutely rather
+than proportionally, so an all-onion inbound set could not make room at all."
+  (let* ((initial (length candidates))
+         (total-protect (floor initial 2))
+         (max-by-network (floor total-protect 2))
+         (num-protected 0)
+         (remaining candidates)
+         ;; Counts per network, fewest first: Core sorts ascending so the
+         ;; scarcest network gets first claim on slots the others leave.
+         (networks (list :cjdns :i2p :local :onion))
+         (counts (mapcar (lambda (net)
+                           (cons net (count net candidates
+                                            :key #'%evict-disadvantaged-network)))
+                         networks)))
+    (setf counts (stable-sort counts #'< :key #'cdr))
+    (loop while (< num-protected max-by-network)
+          do (let ((live (count-if #'plusp counts :key #'cdr)))
+               (when (zerop live) (return))
+               (let* ((left (- max-by-network num-protected))
+                      (per-network (max 1 (floor left live)))
+                      (protected-any nil))
+                 (dolist (entry counts)
+                   (when (plusp (cdr entry))
+                     (let* ((net (car entry))
+                            (before (length remaining))
+                            (after (%evict-erase-last-k
+                                    remaining
+                                    (lambda (a b)
+                                      (< (bl.net:peer-connect-time a)
+                                         (bl.net:peer-connect-time b)))
+                                    per-network
+                                    (lambda (p) (eq net (%evict-disadvantaged-network p))))))
+                       (setf remaining after)
+                       (let ((delta (- before (length remaining))))
+                         (when (plusp delta)
+                           (setf protected-any t)
+                           (incf num-protected delta)
+                           (decf (cdr entry) delta)
+                           (when (>= num-protected max-by-network) (return)))))))
+                 (unless protected-any (return)))))
+    ;; Whatever is left of the half goes to the longest-connected.
+    (%evict-erase-last-k remaining
+                         (lambda (a b)
+                           (> (bl.net:peer-connect-time a)
+                              (bl.net:peer-connect-time b)))
+                         (max 0 (- total-protect num-protected)))))
+
+(defun select-inbound-peer-to-evict (inbound)
+  "Core SelectNodeToEvict (eviction.cpp:178-240), pass for pass. Returns the
+peer to evict, or NIL when every candidate is protected.
+
+The order is load-bearing and is Core's: noban, then the five \"has done
+something useful\" passes with Core's own k values, then the ratio reserve,
+then prefer-evict, then the most-populous netgroup, youngest first.
+
+Ours previously ran four passes at k=4 apiece with no netgroup pass, no
+block-relay-only pass, no noban protection, and an onion exemption standing in
+for the ratio reserve."
+  (let ((candidates inbound))
+    ;; ProtectNoBanConnections (eviction.cpp:181). Only possible since net
+    ;; permissions landed; a noban peer is never evicted for any reason.
+    (setf candidates
+          (remove-if (lambda (p)
+                       (bl.net:peer-has-permission-p
+                        p bl.net:+perm-noban+))
+                     candidates))
+    ;; ProtectOutboundConnections is implicit: INBOUND is inbound-only.
+    (setf candidates (%evict-erase-last-k candidates
+                                          (lambda (a b)
+                                            (< (%evict-keyed-netgroup a)
+                                               (%evict-keyed-netgroup b)))
+                                          +evict-protect-netgroup+))
+    ;; Lowest MINIMUM ping, not the latest sample: an attacker can inflate a
+    ;; recent sample at will but cannot lower a minimum without being closer.
+    (setf candidates (%evict-erase-last-k
+                      candidates
+                      (lambda (a b)
+                        (flet ((ping (p)
+                                 (let ((l (bl.net:peer-min-ping-latency p)))
+                                   (if (plusp l) l most-positive-fixnum))))
+                          (> (ping a) (ping b))))
+                      +evict-protect-min-ping+))
+    (setf candidates (%evict-erase-last-k
+                      candidates
+                      (lambda (a b)
+                        (< (bl.net:peer-last-tx-time a)
+                           (bl.net:peer-last-tx-time b)))
+                      +evict-protect-tx+))
+    ;; Block-relay-only peers that have given us blocks: Core filters this pass
+    ;; to non-tx-relay peers so the slots cannot be taken by ordinary peers
+    ;; that happen to have relayed a block.
+    (setf candidates (%evict-erase-last-k
+                      candidates
+                      (lambda (a b)
+                        (< (bl.net:peer-last-block-time a)
+                           (bl.net:peer-last-block-time b)))
+                      +evict-protect-block-relay-only+
+                      (lambda (p)
+                        (not (bl.net:peer-relays-txs-p p)))))
+    (setf candidates (%evict-erase-last-k
+                      candidates
+                      (lambda (a b)
+                        (< (bl.net:peer-last-block-time a)
+                           (bl.net:peer-last-block-time b)))
+                      +evict-protect-block+))
+    (setf candidates (%evict-protect-by-ratio candidates))
+    (when (null candidates)
+      (return-from select-inbound-peer-to-evict nil))
+    ;; Peers preferred for eviction, if any, are considered alone — but only
+    ;; AFTER the passes above, since a peer that is genuinely the best by other
+    ;; criteria should survive regardless (Core's own comment, :215-217).
+    ;; Core's prefer_evict is set for a discouraged peer, which is exactly what
+    ;; EVICT-DISCOURAGED-INBOUND already drops first; reaching here means none
+    ;; was found, so this arm normally finds none either. It stays because the
+    ;; two paths can disagree: a peer discouraged BETWEEN the two calls is
+    ;; still preferred here.
+    (let ((preferred (remove-if-not
+                      (lambda (p)
+                        (bl.net:peer-discouraged-p
+                         (bl.net:peer-address p)))
+                      candidates)))
+      (when preferred (setf candidates preferred)))
+    ;; Finally: the netgroup with the most connections, youngest member first.
+    (let ((groups (make-hash-table :test 'equal)))
+      (flet ((grp (p) (or (bl.net:ip-netgroup
+                           (bl.net:peer-address p))
+                          "_")))
+        (dolist (p candidates) (incf (gethash (grp p) groups 0)))
+        (first (stable-sort
+                (copy-list candidates)
+                (lambda (a b)
+                  (let ((ga (gethash (grp a) groups 0))
+                        (gb (gethash (grp b) groups 0)))
+                    (if (/= ga gb)
+                        (> ga gb)
+                        (> (bl.net:peer-connect-time a)
+                           (bl.net:peer-connect-time b)))))))))))
+
+(defun evict-least-valuable-inbound (node)
+  "At inbound capacity with no discouraged peer to drop, evict the least
+valuable inbound peer so a new connection can take the slot — stopping an
+attacker from filling inbound slots with cheap, sticky connections. Returns T
+if a peer was evicted.
+
+The selection is SELECT-INBOUND-PEER-TO-EVICT, which is Core's
+AttemptToEvictConnection pass for pass."
+  (bt:with-recursive-lock-held ((node-lock node))
+    (let ((inbound (remove-if-not #'bl.net:peer-inbound
+                                  (node-peers node))))
+      (when (cdr inbound)               ; need >1 so something stays protected
+        (let ((victim (select-inbound-peer-to-evict inbound)))
+          (when victim
+            (log-info "Evicting least-valuable inbound peer ~A to admit a new connection"
+                      (bl.net:peer-address victim))
+            (setf (node-peers node) (remove victim (node-peers node)))
+            (bl.net:disconnect-peer victim)
+            t))))))
+
+(defun inbound-connection-allowed-p (node host)
+  "Admission check for a freshly-accepted inbound connection from HOST,
+before any handshake work (Core CConnman::CreateNodeFromAcceptedSocket,
+net.cpp:1801-1813): a banned address is always dropped; a discouraged
+address is dropped only when the inbound slots are (almost) full; and no
+connection is admitted while the hand-off queue is already full. Returns T,
+or (VALUES NIL REASON) when the connection must be dropped.
+
+The backlog arm matters because *MAX-INBOUND-CONNECTIONS* is otherwise enforced only
+at MERGE time, by the sync thread. Accepted peers hold a socket while they wait
+in PENDING-INBOUND-PEERS, so anything that stalls that thread turns every new
+connection into a leaked descriptor — the live wedge of 2026-08-16 accumulated
+751 sockets in CLOSE-WAIT this way. Counting the queue bounds the damage at
+twice the inbound cap no matter what the rest of the node is doing."
+  ;; Ban check first and lock-free: a connect flood is exactly when the listener
+  ;; must not contend with the sync thread and RPC readers for the node lock.
+  (cond
+    ((bl.net:peer-banned-p host)
+     (values nil :banned))
+    ((>= (bt:with-recursive-lock-held ((node-lock node))
+           (length (node-pending-inbound-peers node)))
+         *max-inbound-connections*)
+     (values nil :backlog))
+    ((and (bl.net:peer-discouraged-p host)
+          (>= (1+ (bt:with-recursive-lock-held ((node-lock node))
+                    (count-inbound-peers node)))
+              *max-inbound-connections*))
+     (values nil :discouraged))
+    (t t)))
