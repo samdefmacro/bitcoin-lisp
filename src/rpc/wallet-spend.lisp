@@ -184,17 +184,6 @@ filters (cluster limits are enforced by the mempool itself).")
 
 ;;; --- Money / feerate helpers (integer satoshis throughout) ---
 
-(defun %compact-size-size (n)
-  "GetSizeOfCompactSize."
-  (cond ((< n 253) 1)
-        ((<= n #xFFFF) 3)
-        ((<= n #xFFFFFFFF) 5)
-        (t 9)))
-
-;; %txout-serialize-size — GetSerializeSize(CTxOut) — lives in methods.lisp,
-;; which is compiled first. It used to be defined here as well, identically;
-;; two same-named defuns in one package meant the later file silently won.
-
 (defun %dust-threshold-at-rate (script rate-sat-kvb)
   "Core GetDustThreshold(txout, feerate) at an arbitrary feerate (the
 validation-layer dust-threshold is specialized to the 3000 sat/kvB dust
@@ -519,7 +508,7 @@ descriptor InferDescriptor would produce; NIL when not solvable."
                 (when sat
                   (multiple-value-bind (m) (%parse-multisig witness)
                     (values (+ (* 4 (+ 1 (length redeem)))
-                               (+ (%compact-size-size (length witness))
+                               (+ (bitcoin-lisp.serialization:compact-size-length (length witness))
                                   (length witness) sat))
                             t (+ 3 m))))))
              ;; sh(multi(...)) — legacy
@@ -536,7 +525,7 @@ descriptor InferDescriptor would produce; NIL when not solvable."
            (let ((sat (%multisig-sat-size witness)))
              (if sat
                  (multiple-value-bind (m) (%parse-multisig witness)
-                   (values (+ (%compact-size-size (length witness))
+                   (values (+ (bitcoin-lisp.serialization:compact-size-length (length witness))
                               (length witness) sat)
                            t (+ 2 m)))
                  ;; Not multisig: try miniscript, or the coin looks unsolvable
@@ -546,7 +535,7 @@ descriptor InferDescriptor would produce; NIL when not solvable."
                  (multiple-value-bind (msat elems)
                      (%miniscript-sat-size-and-elems witness)
                    (when msat
-                     (values (+ (%compact-size-size (length witness))
+                     (values (+ (bitcoin-lisp.serialization:compact-size-length (length witness))
                                 (length witness) msat)
                              t elems))))))))
       (t nil))))
@@ -558,9 +547,9 @@ incl. outpoint/sequence/length prefixes, or NIL when unsolvable."
     (when sat
       (let ((scriptsig-len (if segwit
                                1
-                               (%compact-size-size (floor sat 4))))
+                               (bitcoin-lisp.serialization:compact-size-length (floor sat 4))))
             (witstack-len (if segwit
-                              (%compact-size-size elems)
+                              (bitcoin-lisp.serialization:compact-size-length elems)
                               (if tx-is-segwit 1 0))))
         (+ (* 4 (+ 32 4 4 scriptsig-len)) witstack-len sat)))))
 
@@ -591,8 +580,8 @@ control's explicit input weight or NIL). Returns (values vsize weight) or
   (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
          (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
          (weight (* 4 (+ 4 4
-                         (%compact-size-size (length inputs))
-                         (%compact-size-size (length outputs)))))
+                         (bitcoin-lisp.serialization:compact-size-length (length inputs))
+                         (bitcoin-lisp.serialization:compact-size-length (length outputs)))))
          (is-segwit (some (lambda (txo)
                             (%txout-script-segwit-p wallet cc (car txo)))
                           txouts)))
@@ -1985,7 +1974,7 @@ Caller holds node + wallet locks."
             (setf (csel-params-long-term-feerate params)
                   *wallet-consolidate-feerate*)
             (setf (csel-params-tx-noinputs-size params)
-                  (+ 10 (%compact-size-size (length recipients))))
+                  (+ 10 (bitcoin-lisp.serialization:compact-size-length (length recipients))))
             (let ((recipients-sum 0)
                   (outputs-to-subtract-fee-from 0)
                   (change-type (%transaction-change-type
