@@ -64,12 +64,12 @@ Returns (VALUES chain-state entries) with ENTRIES ascending (genesis first)."
 
 (defun %message-payload (msg)
   "Return the payload bytes of a serialized P2P message (strip 24-byte header)."
-  (flexi-streams:with-input-from-sequence (s msg)
+  (bl.bytes:with-byte-reader (s msg)
     (let ((hdr (bl.ser:read-message-header s)))
       (subseq msg 24 (+ 24 (bl.ser:message-header-payload-length hdr))))))
 
 (defun %message-command (msg)
-  (flexi-streams:with-input-from-sequence (s msg)
+  (bl.bytes:with-byte-reader (s msg)
     (bl.ser:message-header-command
      (bl.ser:read-message-header s))))
 

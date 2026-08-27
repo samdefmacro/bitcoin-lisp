@@ -161,3 +161,6 @@
    #:+p2pkh-version-testnet+
    #:+p2sh-version-mainnet+
    #:+p2sh-version-testnet+))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp.nicknames:install-package-nicknames))

@@ -463,7 +463,7 @@ against a real backfilled index. peer-block-filters gates %cf-serving-index."
          ;; cfcheckpt at interval 1000: none below height 4 -> empty header list, still builds
          (let* ((msg (bl.ser:make-cfcheckpt-message 0 h3 '()))
                 (cmd (bl.ser:message-header-command
-                      (flexi-streams:with-input-from-sequence (s msg)
+                      (bl.bytes:with-byte-reader (s msg)
                         (bl.ser:read-message-header s)))))
            (is (string= "cfcheckpt" cmd))))
        (bl.store:close-blockfilterindex (bl::node-blockfilterindex node))))))

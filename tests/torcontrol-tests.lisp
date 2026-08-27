@@ -503,7 +503,7 @@ dummy; addr_from is always the all-zero dummy, exactly like modern Core."
                 :port 8333))
          (bytes (bl.ser:make-version-message-bytes
                  :services 1033 :addr-recv recv))
-         (msg (flexi-streams:with-input-from-sequence (s bytes)
+         (msg (bl.bytes:with-byte-reader (s bytes)
                 (bl.ser:read-version-message s))))
     (is (equalp (bl.net:ipv4-to-mapped-ipv6 1 2 3 4)
                 (bl.ser:net-addr-ip

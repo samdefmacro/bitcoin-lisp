@@ -19,20 +19,20 @@
   ;; read-bytes used to silently return a zero-padded vector on a short read;
   ;; truncated peer/disk input must error instead.
   (signals error
-    (flexi-streams:with-input-from-sequence (s (%bytes 1 2 3 4))
-      (bl.ser:read-bytes s 1000))))
+    (bl.bytes:with-byte-reader (s (%bytes 1 2 3 4))
+      (bl.bytes:br-read-bytes s 1000))))
 
 (test read-transaction-truncated-errors
   ;; version + a compact-size claiming 65535 inputs, then EOF.
   (signals error
-    (flexi-streams:with-input-from-sequence
+    (bl.bytes:with-byte-reader
         (s (%concat-bytes (%bytes 2 0 0 0) (%bytes 253 255 255)))
       (bl.ser:read-transaction s))))
 
 (test read-bitcoin-block-truncated-errors
   ;; 80-byte zero header + tx-count 1000, no tx bytes.
   (signals error
-    (flexi-streams:with-input-from-sequence
+    (bl.bytes:with-byte-reader
         (s (%concat-bytes (make-array 80 :element-type '(unsigned-byte 8) :initial-element 0)
                           (%bytes 253 232 3)))  ; 0xfd 0x03e8 = 1000
       (bl.ser:read-bitcoin-block s))))
@@ -42,7 +42,7 @@
 (test read-compact-size-rejects-oversized
   ;; 0xff + 8 bytes encoding a value far above +max-compact-size+.
   (signals error
-    (flexi-streams:with-input-from-sequence
+    (bl.bytes:with-byte-reader
         (s (%bytes 255 255 255 255 255 255 255 255 255))
       (bl.ser:read-compact-size s))))
 
@@ -67,13 +67,16 @@
 
 ;;;; Block-relay message count caps (compact block / getblocktxn / blocktxn)
 
-;; compact-size for 50001 (just over +max-block-tx-count+): 0xfe + LE32 0x0000c351
-(defparameter +over-block-tx-count-cs+ (%bytes #xfe #x51 #xc3 0 0))
+;; compact-size for 50001 (just over +max-block-tx-count+), in its CANONICAL
+;; 0xfd + LE16 form. The former 0xfe + LE32 spelling was non-canonical, so the
+;; three tests below were passing on "non-canonical ReadCompactSize" and never
+;; reached the count cap they exist to prove.
+(defparameter +over-block-tx-count-cs+ (%bytes #xfd #x51 #xc3))
 
 (test compact-block-rejects-oversized-shortids
   ;; 80-byte header + 8-byte nonce + an over-limit short-ids count.
   (signals error
-    (flexi-streams:with-input-from-sequence
+    (bl.bytes:with-byte-reader
         (s (%concat-bytes (make-array 88 :element-type '(unsigned-byte 8) :initial-element 0)
                           +over-block-tx-count-cs+))
       (bl.ser:read-compact-block s))))
@@ -81,14 +84,14 @@
 (test getblocktxn-rejects-oversized-count
   ;; 32-byte block hash + an over-limit index count.
   (signals error
-    (flexi-streams:with-input-from-sequence
+    (bl.bytes:with-byte-reader
         (s (%concat-bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                           +over-block-tx-count-cs+))
       (bl.ser::read-block-txn-request s))))
 
 (test blocktxn-rejects-oversized-count
   (signals error
-    (flexi-streams:with-input-from-sequence
+    (bl.bytes:with-byte-reader
         (s (%concat-bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                           +over-block-tx-count-cs+))
       (bl.ser::read-block-txn-response s))))
@@ -121,10 +124,10 @@
                (error () (incf errored)))))
       (dotimes (i 400)
         (let ((bytes (%random-bytes (random 280 state) state)))
-          (try (lambda () (flexi-streams:with-input-from-sequence (s bytes)
-                            (bl.ser:read-transaction s))))
-          (try (lambda () (flexi-streams:with-input-from-sequence (s bytes)
-                            (bl.ser:read-bitcoin-block s))))
+          (try (lambda () (bl.bytes:with-byte-reader (s bytes)
+                            (bl.ser:br-read-transaction s))))
+          (try (lambda () (bl.bytes:with-byte-reader (s bytes)
+                            (bl.ser:br-read-bitcoin-block s))))
           (try (lambda () (bl.ser::br-read-transaction
                            (bl.ser::make-byte-reader-from bytes))))
           (incf done))))

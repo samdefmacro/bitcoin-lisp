@@ -581,7 +581,7 @@ RECEIVE-MESSAGE-BLOCKING instead."
               (return-from receive-message (values nil :incomplete)))
             (unless bytes
               (return-from receive-message nil))
-            (setf header (flexi-streams:with-input-from-sequence (stream bytes)
+            (setf header (bl.bytes:with-byte-reader (stream bytes)
                            (bl.ser:read-message-header stream)))
             ;; Nothing is parked yet, so these two rejections leave no framing
             ;; state behind — but the 24 bytes ARE consumed, so both must drop
@@ -1064,7 +1064,7 @@ desirable set to limited peers, as in Core."
   (multiple-value-bind (command payload)
       (receive-message-blocking peer :timeout timeout)
     (when (and command (string= command "version"))
-      (flexi-streams:with-input-from-sequence (stream payload)
+      (bl.bytes:with-byte-reader (stream payload)
         (let* ((version-msg (bl.ser:read-version-message stream))
                (services (bl.ser:version-message-services version-msg))
                (proto (bl.ser:version-message-version version-msg)))

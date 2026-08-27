@@ -45,10 +45,10 @@
 
 (defun read-message-header (stream)
   "Read a message header from STREAM."
-  (let ((magic (read-bytes stream 4))
-        (command-bytes (read-bytes stream +command-size+))
-        (payload-length (read-uint32-le stream))
-        (checksum (read-bytes stream 4)))
+  (let ((magic (br-read-bytes stream 4))
+        (command-bytes (br-read-bytes stream +command-size+))
+        (payload-length (br-read-u32-le stream))
+        (checksum (br-read-bytes stream 4)))
     (make-message-header :magic magic
                          :command (bytes-to-command command-bytes)
                          :payload-length payload-length
@@ -56,10 +56,10 @@
 
 (defun write-message-header (stream header)
   "Write a message header to STREAM."
-  (write-bytes stream (message-header-magic header))
-  (write-bytes stream (command-to-bytes (message-header-command header)))
-  (write-uint32-le stream (message-header-payload-length header))
-  (write-bytes stream (message-header-checksum header)))
+  (bb-write-bytes stream (message-header-magic header))
+  (bb-write-bytes stream (command-to-bytes (message-header-command header)))
+  (bb-write-u32-le stream (message-header-payload-length header))
+  (bb-write-bytes stream (message-header-checksum header)))
 
 ;;;; Network address structure
 
@@ -112,11 +112,11 @@ CNetAddr::IsAddrV1Compatible, netaddress.cpp:477-494)."
 If WITH-TIMESTAMP is true, read a 4-byte timestamp first (for addr messages).
 Returns (VALUES net-addr timestamp) when WITH-TIMESTAMP, otherwise just net-addr."
   (let ((timestamp (when with-timestamp
-                     (read-uint32-le stream))))
-    (let ((services (read-uint64-le stream))
-          (ip (read-bytes stream 16))
-          (port-high (read-byte stream))
-          (port-low (read-byte stream)))
+                     (br-read-u32-le stream))))
+    (let ((services (br-read-u64-le stream))
+          (ip (br-read-bytes stream 16))
+          (port-high (br-read-u8 stream))
+          (port-low (br-read-u8 stream)))
       (let ((addr (make-net-addr :services services
                                  :ip ip
                                  :port (logior (ash port-high 8) port-low))))
@@ -132,15 +132,15 @@ callers should skip such addresses entirely where possible (Core
 IsAddrCompatible, net_processing.cpp:1117-1119); the zero form is only
 the unavoidable-case fallback."
   (when with-timestamp
-    (write-uint32-le stream (or timestamp (get-unix-time))))
-  (write-uint64-le stream (net-addr-services addr))
+    (bb-write-u32-le stream (or timestamp (get-unix-time))))
+  (bb-write-u64-le stream (net-addr-services addr))
   (if (v1-compatible-network-p (net-addr-network addr))
-      (write-bytes stream (net-addr-ip addr))
-      (write-bytes stream (make-array 16 :element-type '(unsigned-byte 8)
+      (bb-write-bytes stream (net-addr-ip addr))
+      (bb-write-bytes stream (make-array 16 :element-type '(unsigned-byte 8)
                                          :initial-element 0)))
   ;; Port is big-endian
-  (write-byte (ash (net-addr-port addr) -8) stream)
-  (write-byte (logand (net-addr-port addr) #xFF) stream))
+  (bb-write-u8 stream (ash (net-addr-port addr) -8))
+  (bb-write-u8 stream (logand (net-addr-port addr) #xFF)))
 
 (defconstant +universal-unix-epoch-offset+ 2208988800
   "Seconds between the CL universal-time epoch (1900) and the Unix epoch (1970).")
@@ -222,18 +222,18 @@ reach."
 
 (defun read-version-message (stream)
   "Read a version message payload from STREAM."
-  (let* ((version (read-int32-le stream))
-         (services (read-uint64-le stream))
-         (timestamp (read-int64-le stream))
+  (let* ((version (br-read-i32-le stream))
+         (services (br-read-u64-le stream))
+         (timestamp (br-read-i64-le stream))
          (addr-recv (read-net-addr stream))
          (addr-from (read-net-addr stream))
-         (nonce (read-uint64-le stream))
-         (user-agent-bytes (read-var-bytes stream))
+         (nonce (br-read-u64-le stream))
+         (user-agent-bytes (br-read-var-bytes stream))
          (user-agent (map 'string #'code-char user-agent-bytes))
-         (start-height (read-int32-le stream))
+         (start-height (br-read-i32-le stream))
          ;; relay flag may not be present in older versions
          (relay (if (> version 70001)
-                    (= (read-byte stream nil 1) 1)
+                    (= (if (br-eof-p stream) 1 (br-read-u8 stream)) 1)
                     t)))
     (make-version-message :version version
                           :services services
@@ -247,17 +247,17 @@ reach."
 
 (defun write-version-message (stream msg)
   "Write a version message payload to STREAM."
-  (write-int32-le stream (version-message-version msg))
-  (write-uint64-le stream (version-message-services msg))
-  (write-int64-le stream (version-message-timestamp msg))
+  (bb-write-i32-le stream (version-message-version msg))
+  (bb-write-u64-le stream (version-message-services msg))
+  (bb-write-i64-le stream (version-message-timestamp msg))
   (write-net-addr stream (version-message-addr-recv msg))
   (write-net-addr stream (version-message-addr-from msg))
-  (write-uint64-le stream (version-message-nonce msg))
+  (bb-write-u64-le stream (version-message-nonce msg))
   (let ((ua-bytes (map '(vector (unsigned-byte 8)) #'char-code
                        (version-message-user-agent msg))))
-    (write-var-bytes stream ua-bytes))
-  (write-int32-le stream (version-message-start-height msg))
-  (write-byte (if (version-message-relay msg) 1 0) stream))
+    (bb-write-var-bytes stream ua-bytes))
+  (bb-write-i32-le stream (version-message-start-height msg))
+  (bb-write-u8 stream (if (version-message-relay msg) 1 0)))
 
 ;;;; Inventory vector
 
@@ -281,13 +281,13 @@ reach."
 
 (defun read-inv-vector (stream)
   "Read an inventory vector from STREAM."
-  (make-inv-vector :type (read-uint32-le stream)
-                   :hash (read-hash256 stream)))
+  (make-inv-vector :type (br-read-u32-le stream)
+                   :hash (br-read-bytes stream 32)))
 
 (defun write-inv-vector (stream inv)
   "Write an inventory vector to STREAM."
-  (write-uint32-le stream (inv-vector-type inv))
-  (write-hash256 stream (inv-vector-hash inv)))
+  (bb-write-u32-le stream (inv-vector-type inv))
+  (bb-write-hash256 stream (inv-vector-hash inv)))
 
 ;;;; Generic message serialization
 
@@ -298,9 +298,9 @@ reach."
                  :command command
                  :payload-length (length payload-bytes)
                  :checksum (compute-checksum payload-bytes))))
-    (flexi-streams:with-output-to-sequence (stream)
+    (with-byte-buf (stream)
       (write-message-header stream header)
-      (write-bytes stream payload-bytes))))
+      (bb-write-bytes stream payload-bytes))))
 
 (defconstant +client-version-major+ 0)
 (defconstant +client-version-minor+ 1)
@@ -395,7 +395,7 @@ divergence from Core's empty CService.)"
               :user-agent user-agent
               :start-height start-height
               :relay relay)))
-    (flexi-streams:with-output-to-sequence (stream)
+    (with-byte-buf (stream)
       (write-version-message stream msg))))
 
 (defun make-verack-message ()
@@ -404,38 +404,38 @@ divergence from Core's empty CService.)"
 
 (defun make-ping-message (&optional (nonce (random (expt 2 64))))
   "Create a serialized ping message."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-uint64-le stream nonce))))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-u64-le stream nonce))))
     (serialize-message "ping" payload)))
 
 (defun make-pong-message (nonce)
   "Create a serialized pong message."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-uint64-le stream nonce))))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-u64-le stream nonce))))
     (serialize-message "pong" payload)))
 
 (defun make-getblocks-message (block-locator-hashes &optional stop-hash)
   "Create a getblocks message.
 BLOCK-LOCATOR-HASHES is a list of block hashes (most recent first).
 STOP-HASH is the hash to stop at (or zeros to get maximum blocks)."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-uint32-le stream +protocol-version+)
-                   (write-compact-size stream (length block-locator-hashes))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-u32-le stream +protocol-version+)
+                   (bb-write-varint stream (length block-locator-hashes))
                    (dolist (hash block-locator-hashes)
-                     (write-hash256 stream hash))
-                   (write-hash256 stream (or stop-hash
+                     (bb-write-hash256 stream hash))
+                   (bb-write-hash256 stream (or stop-hash
                                              (make-array 32 :element-type '(unsigned-byte 8)
                                                          :initial-element 0))))))
     (serialize-message "getblocks" payload)))
 
 (defun make-getheaders-message (block-locator-hashes &optional stop-hash)
   "Create a getheaders message."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-uint32-le stream +protocol-version+)
-                   (write-compact-size stream (length block-locator-hashes))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-u32-le stream +protocol-version+)
+                   (bb-write-varint stream (length block-locator-hashes))
                    (dolist (hash block-locator-hashes)
-                     (write-hash256 stream hash))
-                   (write-hash256 stream (or stop-hash
+                     (bb-write-hash256 stream hash))
+                   (bb-write-hash256 stream (or stop-hash
                                              (make-array 32 :element-type '(unsigned-byte 8)
                                                          :initial-element 0))))))
     (serialize-message "getheaders" payload)))
@@ -445,25 +445,25 @@ STOP-HASH is the hash to stop at (or zeros to get maximum blocks)."
 Each header is written as the 80-byte header followed by a compact-size 0
 transaction count — the on-wire format Bitcoin Core uses (a headers message
 serializes header-only CBlocks, which append nTx=0)."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-compact-size stream (length headers))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-varint stream (length headers))
                    (dolist (header headers)
-                     (write-block-header stream header)
-                     (write-compact-size stream 0)))))
+                     (bb-write-block-header stream header)
+                     (bb-write-varint stream 0)))))
     (serialize-message "headers" payload)))
 
 (defun make-getdata-message (inv-vectors)
   "Create a getdata message from a list of inv-vectors."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-compact-size stream (length inv-vectors))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-varint stream (length inv-vectors))
                    (dolist (inv inv-vectors)
                      (write-inv-vector stream inv)))))
     (serialize-message "getdata" payload)))
 
 (defun make-inv-message (inv-vectors)
   "Create an inv message from a list of inv-vectors."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-compact-size stream (length inv-vectors))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-varint stream (length inv-vectors))
                    (dolist (inv inv-vectors)
                      (write-inv-vector stream inv)))))
     (serialize-message "inv" payload)))
@@ -471,8 +471,8 @@ serializes header-only CBlocks, which append nTx=0)."
 (defun make-notfound-message (inv-vectors)
   "Create a notfound message (same payload shape as inv): tells a peer we cannot
 serve the objects it requested via getdata."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-compact-size stream (length inv-vectors))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-varint stream (length inv-vectors))
                    (dolist (inv inv-vectors)
                      (write-inv-vector stream inv)))))
     (serialize-message "notfound" payload)))
@@ -511,14 +511,24 @@ mention the trailing bytes at all.
 
 Found by FUZZ-TRANSACTION-ROUNDTRIPS-WHAT-IT-PARSES: a mutant whose script
 length shrank parsed happily and re-serialized shorter than its input."
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (let ((tx (read-transaction stream)))
-      (unless (= (file-position stream) (length payload))
+  (with-byte-reader (stream payload)
+    (let ((tx (br-read-transaction stream)))
+      (unless (= (br-pos stream) (length payload))
         (error "tx payload has ~D trailing byte(s)"
-               (- (length payload) (file-position stream))))
+               (- (length payload) (br-pos stream))))
       tx)))
 
 ;;;; Message parsing
+
+(defun br-read-bounded-count (br max name)
+  "Read a CompactSize count from BR and signal an error if it exceeds MAX.
+NAME labels the field. Rejecting an over-limit count up front -- rather than
+looping/allocating for it -- is Bitcoin Core's misbehaving-peer posture for
+protocol vectors (inv, headers, addr, block txns)."
+  (let ((count (br-read-compact-size br)))
+    (when (> count max)
+      (error "~A count ~D exceeds maximum ~D" name count max))
+    count))
 
 (defconstant +max-inv-count+ 50000
   "Maximum entries in an inv/getdata message (Bitcoin Core MAX_INV_SZ). A peer
@@ -542,29 +552,29 @@ block while bounding the per-message allocation well below the compact-size cap.
 
 (defun parse-inv-payload (payload)
   "Parse an inv or getdata message payload into a list of inv-vectors."
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (let ((count (read-bounded-count stream +max-inv-count+ "inv/getdata")))
+  (with-byte-reader (stream payload)
+    (let ((count (br-read-bounded-count stream +max-inv-count+ "inv/getdata")))
       (loop repeat count collect (read-inv-vector stream)))))
 
 (defun parse-headers-payload (payload)
   "Parse a headers message payload into a list of block headers."
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (let ((count (read-bounded-count stream +max-headers-count+ "headers")))
+  (with-byte-reader (stream payload)
+    (let ((count (br-read-bounded-count stream +max-headers-count+ "headers")))
       (loop repeat count
-            collect (prog1 (read-block-header stream)
+            collect (prog1 (br-read-block-header stream)
                       ;; Headers message includes tx count (always 0) after each header
-                      (read-compact-size stream))))))
+                      (br-read-compact-size stream))))))
 
 (defun parse-block-locator-payload (payload)
   "Parse a getheaders or getblocks payload: a 4-byte protocol version, a
 bounded block-locator hash list (most-recent-first), and a 32-byte stop hash.
 Returns (VALUES locator-hashes stop-hash). A locator longer than
 +max-locator-count+ signals an error (the caller disconnects the peer)."
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (read-uint32-le stream)             ; protocol version (unused)
-    (let* ((count (read-bounded-count stream +max-locator-count+ "block locator"))
-           (hashes (loop repeat count collect (read-hash256 stream)))
-           (stop-hash (read-hash256 stream)))
+  (with-byte-reader (stream payload)
+    (br-read-u32-le stream)             ; protocol version (unused)
+    (let* ((count (br-read-bounded-count stream +max-locator-count+ "block locator"))
+           (hashes (loop repeat count collect (br-read-bytes stream 32)))
+           (stop-hash (br-read-bytes stream 32)))
       (values hashes stop-hash))))
 
 (defun parse-block-payload (payload)
@@ -572,7 +582,7 @@ Returns (VALUES locator-hashes stop-hash). A locator longer than
 
 Hot path: called once per block message received from peers (potentially
 thousands per minute during IBD). Uses byte-reader for direct index-based
-reads instead of flexi-streams' Gray-stream input dispatch."
+reads instead of Gray-stream input dispatch."
   (br-read-bitcoin-block (make-byte-reader-from payload)))
 
 ;;;; ============================================================
@@ -615,21 +625,21 @@ reads instead of flexi-streams' Gray-stream input dispatch."
   "Read a 6-byte short transaction ID from STREAM as a 48-bit integer."
   (let ((result 0))
     (dotimes (i 6)
-      (setf result (logior result (ash (read-byte stream) (* i 8)))))
+      (setf result (logior result (ash (br-read-u8 stream) (* i 8)))))
     result))
 
 (defun write-short-txid (stream short-id)
   "Write a 6-byte short transaction ID to STREAM."
   (dotimes (i 6)
-    (write-byte (logand (ash short-id (- (* i 8))) #xff) stream)))
+    (bb-write-u8 stream (logand (ash short-id (- (* i 8))) #xff))))
 
 ;;; Parse sendcmpct message
 (defun parse-sendcmpct-payload (payload)
   "Parse a sendcmpct message payload.
    Returns (VALUES announce-flag version)."
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (let ((announce (read-byte stream))
-          (version (read-uint64-le stream)))
+  (with-byte-reader (stream payload)
+    (let ((announce (br-read-u8 stream))
+          (version (br-read-u64-le stream)))
       (values (= announce 1) version))))
 
 ;;; Make sendcmpct message
@@ -637,27 +647,27 @@ reads instead of flexi-streams' Gray-stream input dispatch."
   "Create a sendcmpct message.
    HIGH-BANDWIDTH is T for high-bandwidth mode, NIL for low-bandwidth.
    VERSION is 1 or 2."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-byte (if high-bandwidth 1 0) stream)
-                   (write-uint64-le stream version))))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-u8 stream (if high-bandwidth 1 0))
+                   (bb-write-u64-le stream version))))
     (serialize-message "sendcmpct" payload)))
 
 ;;; Read compact block
 (defun read-compact-block (stream)
   "Read a compact block (HeaderAndShortIDs) from STREAM."
-  (let* ((header (read-block-header stream))
-         (nonce (read-uint64-le stream))
-         (shortids-count (read-bounded-count stream +max-block-tx-count+ "compact-block short-ids"))
+  (let* ((header (br-read-block-header stream))
+         (nonce (br-read-u64-le stream))
+         (shortids-count (br-read-bounded-count stream +max-block-tx-count+ "compact-block short-ids"))
          (short-ids (loop repeat shortids-count
                           collect (read-short-txid stream)))
-         (prefilled-count (read-bounded-count stream +max-block-tx-count+ "compact-block prefilled"))
+         (prefilled-count (br-read-bounded-count stream +max-block-tx-count+ "compact-block prefilled"))
          (prefilled-txs '())
          (last-index -1))
     ;; Read prefilled transactions with differential index encoding
     (dotimes (i prefilled-count)
-      (let* ((diff-index (read-compact-size stream))
+      (let* ((diff-index (br-read-compact-size stream))
              (abs-index (+ last-index diff-index 1))
-             (tx (read-transaction stream)))
+             (tx (br-read-transaction stream)))
         (push (make-prefilled-tx :index abs-index :transaction tx)
               prefilled-txs)
         (setf last-index abs-index)))
@@ -669,27 +679,27 @@ reads instead of flexi-streams' Gray-stream input dispatch."
 ;;; Write compact block
 (defun write-compact-block (stream cb)
   "Write a compact block to STREAM."
-  (write-block-header stream (compact-block-header cb))
-  (write-uint64-le stream (compact-block-nonce cb))
-  (write-compact-size stream (length (compact-block-short-ids cb)))
+  (bb-write-block-header stream (compact-block-header cb))
+  (bb-write-u64-le stream (compact-block-nonce cb))
+  (bb-write-varint stream (length (compact-block-short-ids cb)))
   (dolist (sid (compact-block-short-ids cb))
     (write-short-txid stream sid))
   (let ((prefilled (compact-block-prefilled-txs cb)))
-    (write-compact-size stream (length prefilled))
+    (bb-write-varint stream (length prefilled))
     (let ((last-index -1))
       (dolist (ptx prefilled)
         (let ((abs-index (prefilled-tx-index ptx)))
           ;; Write differential index
-          (write-compact-size stream (- abs-index last-index 1))
+          (bb-write-varint stream (- abs-index last-index 1))
           ;; WITNESS serialization: BIP152 v2 prefilled transactions are
           ;; TX_WITH_WITNESS (Core PrefilledTransaction, blockencodings.h:80),
           ;; and the one transaction we ever prefill is the coinbase, whose
           ;; witness carries the BIP141 reserved value. Emitting it stripped
           ;; makes every reconstruction fail bad-witness-nonce-size — the
           ;; witness-stripped-block wedge this project has already hit once.
-          ;; (read-transaction auto-detects the BIP144 marker, so the reading
+          ;; (br-read-transaction auto-detects the BIP144 marker, so the reading
           ;; side needed no change.)
-          (write-witness-transaction stream (prefilled-tx-transaction ptx))
+          (bb-write-bytes stream (serialize-witness-transaction (prefilled-tx-transaction ptx)))
           (setf last-index abs-index))))))
 
 (defun build-compact-block (block &key (nonce (random (expt 2 64))))
@@ -718,7 +728,7 @@ the header bytes and the nonce. Version 2, so the ids are over WTXIDs (BIP152
 
 (defun make-cmpctblock-message (block &key (nonce (random (expt 2 64))))
   "A cmpctblock message carrying BLOCK as a BIP152 compact block."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+  (let ((payload (with-byte-buf (stream)
                    (write-compact-block stream
                                         (build-compact-block block :nonce nonce)))))
     (serialize-message "cmpctblock" payload)))
@@ -726,19 +736,19 @@ the header bytes and the nonce. Version 2, so the ids are over WTXIDs (BIP152
 ;;; Parse cmpctblock payload
 (defun parse-cmpctblock-payload (payload)
   "Parse a cmpctblock message payload into a compact-block."
-  (flexi-streams:with-input-from-sequence (stream payload)
+  (with-byte-reader (stream payload)
     (read-compact-block stream)))
 
 ;;; Read block transactions request
 (defun read-block-txn-request (stream)
   "Read a block transactions request (getblocktxn) from STREAM."
-  (let* ((block-hash (read-hash256 stream))
-         (count (read-bounded-count stream +max-block-tx-count+ "getblocktxn indexes"))
+  (let* ((block-hash (br-read-bytes stream 32))
+         (count (br-read-bounded-count stream +max-block-tx-count+ "getblocktxn indexes"))
          (indexes '())
          (last-index -1))
     ;; Read differentially encoded indexes
     (dotimes (i count)
-      (let* ((diff (read-compact-size stream))
+      (let* ((diff (br-read-compact-size stream))
              (abs-index (+ last-index diff 1)))
         (push abs-index indexes)
         (setf last-index abs-index)))
@@ -748,12 +758,12 @@ the header bytes and the nonce. Version 2, so the ids are over WTXIDs (BIP152
 ;;; Write block transactions request
 (defun write-block-txn-request (stream req)
   "Write a block transactions request to STREAM."
-  (write-hash256 stream (block-txn-request-block-hash req))
+  (bb-write-hash256 stream (block-txn-request-block-hash req))
   (let ((indexes (block-txn-request-indexes req)))
-    (write-compact-size stream (length indexes))
+    (bb-write-varint stream (length indexes))
     (let ((last-index -1))
       (dolist (idx indexes)
-        (write-compact-size stream (- idx last-index 1))
+        (bb-write-varint stream (- idx last-index 1))
         (setf last-index idx)))))
 
 ;;; Make getblocktxn message
@@ -761,7 +771,7 @@ the header bytes and the nonce. Version 2, so the ids are over WTXIDs (BIP152
   "Create a getblocktxn message.
    BLOCK-HASH is the 32-byte block hash.
    INDEXES is a list of absolute transaction indexes to request."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+  (let ((payload (with-byte-buf (stream)
                    (write-block-txn-request
                     stream
                     (make-block-txn-request :block-hash block-hash
@@ -771,31 +781,31 @@ the header bytes and the nonce. Version 2, so the ids are over WTXIDs (BIP152
 ;;; Parse getblocktxn payload
 (defun parse-getblocktxn-payload (payload)
   "Parse a getblocktxn message payload."
-  (flexi-streams:with-input-from-sequence (stream payload)
+  (with-byte-reader (stream payload)
     (read-block-txn-request stream)))
 
 ;;; Read block transactions response
 (defun read-block-txn-response (stream)
   "Read a block transactions response (blocktxn) from STREAM."
-  (let* ((block-hash (read-hash256 stream))
-         (count (read-bounded-count stream +max-block-tx-count+ "blocktxn transactions"))
-         (txs (loop repeat count collect (read-transaction stream))))
+  (let* ((block-hash (br-read-bytes stream 32))
+         (count (br-read-bounded-count stream +max-block-tx-count+ "blocktxn transactions"))
+         (txs (loop repeat count collect (br-read-transaction stream))))
     (make-block-txn-response :block-hash block-hash
                              :transactions txs)))
 
 ;;; Write block transactions response
 (defun write-block-txn-response (stream resp)
   "Write a block transactions response to STREAM."
-  (write-hash256 stream (block-txn-response-block-hash resp))
+  (bb-write-hash256 stream (block-txn-response-block-hash resp))
   (let ((txs (block-txn-response-transactions resp)))
-    (write-compact-size stream (length txs))
+    (bb-write-varint stream (length txs))
     (dolist (tx txs)
-      (write-transaction stream tx))))
+      (bb-write-bytes stream (serialize-transaction tx)))))
 
 ;;; Parse blocktxn payload
 (defun parse-blocktxn-payload (payload)
   "Parse a blocktxn message payload."
-  (flexi-streams:with-input-from-sequence (stream payload)
+  (with-byte-reader (stream payload)
     (read-block-txn-response stream)))
 
 ;;; Make blocktxn message (BIP152 serve side)
@@ -805,13 +815,13 @@ requested TXS (a list) in order. With :WITNESS, each tx that carries witness dat
 is BIP144 witness-serialized — a witness compact-block reconstruction needs it;
 non-witness txs stay legacy either way, matching Core's TX_WITH_WITNESS. (The
 older write-block-txn-response is legacy-only and unsuitable for witness serving.)"
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-hash256 stream block-hash)
-                   (write-compact-size stream (length txs))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-hash256 stream block-hash)
+                   (bb-write-varint stream (length txs))
                    (dolist (tx txs)
                      (if (and witness (transaction-has-witness-p tx))
-                         (write-witness-transaction stream tx)
-                         (write-transaction stream tx))))))
+                         (bb-write-bytes stream (serialize-witness-transaction tx))
+                         (bb-write-bytes stream (serialize-transaction tx)))))))
     (serialize-message "blocktxn" payload)))
 
 ;;; Addr (v1) message building
@@ -820,8 +830,8 @@ older write-block-txn-response is legacy-only and unsuitable for witness serving
   "Create a serialized addr (v1) message from ADDRS-WITH-TIMESTAMPS.
 Each entry is a list (net-addr timestamp)."
   (let ((payload
-          (flexi-streams:with-output-to-sequence (stream)
-            (write-compact-size stream (length addrs-with-timestamps))
+          (with-byte-buf (stream)
+            (bb-write-varint stream (length addrs-with-timestamps))
             (dolist (entry addrs-with-timestamps)
               (destructuring-bind (addr timestamp) entry
                 (write-net-addr stream addr :with-timestamp t :timestamp timestamp))))))
@@ -894,7 +904,7 @@ unknown network ids (maybe from the future), dead TORv2, and IPv6 addresses
 embedding IPv4/TORv2/NET_INTERNAL forms. Signals an error — rejecting the
 whole message, as Core throws — for a recognized network id with the wrong
 address length, or any address longer than +max-addrv2-address-size+."
-  (let* ((timestamp (read-uint32-le stream))
+  (let* ((timestamp (br-read-u32-le stream))
          ;; services is a BIP155 CompactSize-encoded u64 BITMASK, not a
          ;; length — Core deserializes it with CompactSizeFormatter<false>
          ;; (protocol.h:446), i.e. NO range check. The default cap here
@@ -902,9 +912,9 @@ address length, or any address longer than +max-addrv2-address-size+."
          ;; service bit >= 26 as malformed and disconnect it; exposed in
          ;; production when #245's getaddr started soliciting 1000-entry
          ;; addrv2 replies on mainnet (2026-07-12).
-         (services (read-compact-size stream :range-check nil))
-         (network-id (read-uint8 stream))
-         (addr-len (read-compact-size stream)))
+         (services (br-read-compact-size stream :range-check nil))
+         (network-id (br-read-u8 stream))
+         (addr-len (br-read-compact-size stream)))
     (when (> addr-len +max-addrv2-address-size+)
       (error "addrv2 address too long: ~D > ~D" addr-len +max-addrv2-address-size+))
     (let ((expected-len (gethash network-id *addrv2-addr-sizes*)))
@@ -914,9 +924,9 @@ address length, or any address longer than +max-addrv2-address-size+."
         (error "BIP155 network ~D address with length ~D (should be ~D)"
                network-id addr-len expected-len))
       ;; Read address bytes + port regardless (to advance stream position)
-      (let* ((addr-bytes (read-bytes stream addr-len))
-             (port-high (read-byte stream))
-             (port-low (read-byte stream))
+      (let* ((addr-bytes (br-read-bytes stream addr-len))
+             (port-high (br-read-u8 stream))
+             (port-low (br-read-u8 stream))
              (port (logior (ash port-high 8) port-low)))
         (flet ((entry (net ip)
                  (values (make-net-addr :services services :ip ip
@@ -959,19 +969,19 @@ address length, or any address longer than +max-addrv2-address-size+."
 ADDR is a net-addr, NETWORK-ID is the BIP 155 network type,
 TIMESTAMP is the uint32 last-seen time."
   ;; Timestamp
-  (write-uint32-le stream timestamp)
+  (bb-write-u32-le stream timestamp)
   ;; Services (compact-size)
-  (write-compact-size stream (net-addr-services addr))
+  (bb-write-varint stream (net-addr-services addr))
   ;; Network ID
-  (write-uint8 stream network-id)
+  (bb-write-u8 stream network-id)
   ;; Address bytes (network-dependent)
   (let ((ip (net-addr-ip addr)))
     (flet ((emit (bytes required-len)
              (unless (= (length bytes) required-len)
                (error "write-net-addr-v2: network ~D address must be ~D bytes, got ~D"
                       network-id required-len (length bytes)))
-             (write-compact-size stream required-len)
-             (write-bytes stream bytes)))
+             (bb-write-varint stream required-len)
+             (bb-write-bytes stream bytes)))
       (cond
         ((= network-id +addrv2-net-ipv4+)
          ;; Extract 4-byte IPv4 from IPv4-mapped IPv6
@@ -985,8 +995,8 @@ TIMESTAMP is the uint32 last-seen time."
         (t
          (error "write-net-addr-v2: unsupported network ID ~D" network-id)))))
   ;; Port (big-endian)
-  (write-byte (ash (net-addr-port addr) -8) stream)
-  (write-byte (logand (net-addr-port addr) #xFF) stream))
+  (bb-write-u8 stream (ash (net-addr-port addr) -8))
+  (bb-write-u8 stream (logand (net-addr-port addr) #xFF)))
 
 (defun make-sendaddrv2-message ()
   "Create a serialized sendaddrv2 message (empty payload)."
@@ -1013,9 +1023,9 @@ Core node/txreconciliation.h:15 TXRECONCILIATION_VERSION).")
   "Create a sendtxrcncl message (BIP 330): uint32 VERSION + uint64 SALT, both
 LE — 12-byte payload (Core protocol.h:262-266). Must be sent between VERSION
 and VERACK."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-uint32-le stream version)
-                   (write-uint64-le stream salt))))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-u32-le stream version)
+                   (bb-write-u64-le stream salt))))
     (serialize-message "sendtxrcncl" payload)))
 
 (defconstant +recon-q-precision+ 32768
@@ -1032,18 +1042,18 @@ which is why it is a named constant and not a literal.")
 The initiator tells the responder how many transactions it is holding for this
 link, and how much of the smaller set it guesses the two sides do not share.
 Those two numbers are all the responder needs to size a sketch."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-uint32-le stream set-size)
-                   (write-uint16-le stream
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-u32-le stream set-size)
+                   (bb-write-u16-le stream
                                     (min #xFFFF
                                          (round (* q +recon-q-precision+)))))))
     (serialize-message "reqrecon" payload)))
 
 (defun parse-reqrecon-payload (payload)
   "Returns (VALUES set-size q), q as a rational in [0, 2)."
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (let ((set-size (read-uint32-le stream))
-          (q-raw (read-uint16-le stream)))
+  (with-byte-reader (stream payload)
+    (let ((set-size (br-read-u32-le stream))
+          (q-raw (br-read-u16-le stream)))
       (values set-size (/ q-raw +recon-q-precision+)))))
 
 (defun make-sketch-message (sketch-bytes)
@@ -1068,45 +1078,45 @@ SHORT-IDS are the ones it is missing and wants announced. When it did not, the
 list is empty and both sides fall back to announcing their whole sets — the
 flood fallback, which is why a failed reconciliation costs bandwidth but never
 transactions."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-byte (if success 1 0) stream)
-                   (write-compact-size stream (length short-ids))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-u8 stream (if success 1 0))
+                   (bb-write-varint stream (length short-ids))
                    (dolist (id short-ids)
-                     (write-uint32-le stream id)))))
+                     (bb-write-u32-le stream id)))))
     (serialize-message "reconcildiff" payload)))
 
 (defun parse-reconcildiff-payload (payload)
   "Returns (VALUES success-p short-ids)."
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (let* ((success (plusp (read-byte stream)))
-           (count (read-compact-size stream))
-           (ids (loop repeat count collect (read-uint32-le stream))))
+  (with-byte-reader (stream payload)
+    (let* ((success (plusp (br-read-u8 stream)))
+           (count (br-read-compact-size stream))
+           (ids (loop repeat count collect (br-read-u32-le stream))))
       (values success ids))))
 
 (defun parse-sendtxrcncl-payload (payload)
   "Parse a sendtxrcncl message payload (BIP 330).
 Returns (VALUES version salt)."
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (values (read-uint32-le stream)
-            (read-uint64-le stream))))
+  (with-byte-reader (stream payload)
+    (values (br-read-u32-le stream)
+            (br-read-u64-le stream))))
 
 (defun parse-feefilter-payload (payload)
   "Parse a feefilter message payload (BIP 133). Returns fee rate as uint64 (sat/kB)."
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (read-uint64-le stream)))
+  (with-byte-reader (stream payload)
+    (br-read-u64-le stream)))
 
 (defun make-feefilter-message (fee-rate)
   "Create a feefilter message with FEE-RATE in satoshis per 1000 bytes (BIP 133)."
-  (let ((payload (flexi-streams:with-output-to-sequence (stream)
-                   (write-uint64-le stream fee-rate))))
+  (let ((payload (with-byte-buf (stream)
+                   (bb-write-u64-le stream fee-rate))))
     (serialize-message "feefilter" payload)))
 
 (defun make-addrv2-message (entries)
   "Create a serialized addrv2 message from ENTRIES.
 Each entry is a list (net-addr network-id timestamp)."
   (let ((payload
-          (flexi-streams:with-output-to-sequence (stream)
-            (write-compact-size stream (length entries))
+          (with-byte-buf (stream)
+            (bb-write-varint stream (length entries))
             (dolist (entry entries)
               (destructuring-bind (addr network-id timestamp) entry
                 (write-net-addr-v2 stream addr network-id timestamp))))))
@@ -1121,8 +1131,8 @@ count — which can exceed (length entries), since unknown network ids are
 skipped without failing the message (BIP155) yet still count toward Core's
 vAddr.size() gates. A recognized network id with a wrong address length
 signals an error (Core rejects the whole message)."
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (let ((count (read-bounded-count stream +max-addr-count+ "addrv2"))
+  (with-byte-reader (stream payload)
+    (let ((count (br-read-bounded-count stream +max-addr-count+ "addrv2"))
           (results '()))
       (loop repeat count
             do (multiple-value-bind (addr timestamp network-id)
@@ -1157,32 +1167,32 @@ Returns (VALUES filter-type stop-hash), or NIL on truncation."
 (defun make-cfilter-message (filter-type block-hash filter-bytes)
   "Build a cfilter message: filter_type (u8), block_hash (32), then the encoded
 filter as a var-length byte string."
-  (let ((payload (flexi-streams:with-output-to-sequence (s)
-                   (write-uint8 s filter-type)
-                   (write-bytes s block-hash)
-                   (write-compact-size s (length filter-bytes))
-                   (write-bytes s filter-bytes))))
+  (let ((payload (with-byte-buf (s)
+                   (bb-write-u8 s filter-type)
+                   (bb-write-bytes s block-hash)
+                   (bb-write-varint s (length filter-bytes))
+                   (bb-write-bytes s filter-bytes))))
     (serialize-message "cfilter" payload)))
 
 (defun make-cfheaders-message (filter-type stop-hash prev-header filter-hashes)
   "Build a cfheaders message: filter_type (u8), stop_hash (32), previous filter
 header (32), then the vector of per-block filter HASHES (32 each)."
-  (let ((payload (flexi-streams:with-output-to-sequence (s)
-                   (write-uint8 s filter-type)
-                   (write-bytes s stop-hash)
-                   (write-bytes s prev-header)
-                   (write-compact-size s (length filter-hashes))
+  (let ((payload (with-byte-buf (s)
+                   (bb-write-u8 s filter-type)
+                   (bb-write-bytes s stop-hash)
+                   (bb-write-bytes s prev-header)
+                   (bb-write-varint s (length filter-hashes))
                    (dolist (h filter-hashes)
-                     (write-bytes s h)))))
+                     (bb-write-bytes s h)))))
     (serialize-message "cfheaders" payload)))
 
 (defun make-cfcheckpt-message (filter-type stop-hash headers)
   "Build a cfcheckpt message: filter_type (u8), stop_hash (32), then the filter
 HEADERS at each 1000-block checkpoint (32 each)."
-  (let ((payload (flexi-streams:with-output-to-sequence (s)
-                   (write-uint8 s filter-type)
-                   (write-bytes s stop-hash)
-                   (write-compact-size s (length headers))
+  (let ((payload (with-byte-buf (s)
+                   (bb-write-u8 s filter-type)
+                   (bb-write-bytes s stop-hash)
+                   (bb-write-varint s (length headers))
                    (dolist (h headers)
-                     (write-bytes s h)))))
+                     (bb-write-bytes s h)))))
     (serialize-message "cfcheckpt" payload)))

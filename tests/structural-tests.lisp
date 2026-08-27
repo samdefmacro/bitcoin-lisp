@@ -44,13 +44,9 @@
     ;; API that coins-view-cache replaced, REQUEST-HEADERS beside the live
     ;; REQUEST-HEADERS-FOR-IBD, and BAN-PEER, which nothing calls because
     ;; misbehaviour discourages and setban bans by address.
-    ;; The u16 member of the byte-buf writer family (src/util/bytes.lisp):
-    ;; the CompactSize writer goes through buf-set-u16-le directly, so nothing
-    ;; in src/ calls this one. Kept for the family's completeness.
-    "bitcoin-lisp.bytes:bb-write-u16-le"
-    ;; The chain-params table's enumerator: API for tests and tools; no
-    ;; production path iterates over chains.
-    "bitcoin-lisp.chainparams:chain-names"
+    ;; Called only from the top-level EVAL-WHEN form at the end of every
+    ;; package file; xref records calls from named functions only.
+    "bitcoin-lisp.nicknames:install-package-nicknames"
     "bitcoin-lisp.crypto:bip324-cipher-initialized-p"
     "bitcoin-lisp.crypto:ellswift-decode"
     "bitcoin-lisp.crypto:muhash-combine"
@@ -611,7 +607,7 @@ found to be the block-deserialization bottleneck (2026-08-22); the plan
 retires them in favour of the byte-reader.")
 
 (defparameter +retiring-serialization-family-baseline+
-  '((:stream-io . 88)
+  '((:stream-io . 42)
     (:compact-size-definitions . 8))
   "Call-site counts, at the start of the cleanup, of the byte-I/O families the
 plan retires (§4 P1). The byte-reader (br-read-*, 70 sites), the byte-buf
@@ -656,8 +652,8 @@ byte-buf; the stream codecs and interop's private buffer only lose call sites."
     ("src/networking/" . 4)
     ("src/node.lisp" . 36)
     ("src/rpc/" . 14)
-    ("src/serialization/" . 44)
-    ("src/storage/" . 17)
+    ("src/serialization/" . 45)
+    ("src/storage/" . 16)
     ("src/util/" . 6)
     ("src/validation/" . 3)
     ("src/zmq.lisp" . 1))
@@ -718,11 +714,11 @@ spot this test accepts, not a claim."
 
 (defun %resolve-package-prefix (token)
   "The project package TOKEN names as a prefix: a full bitcoin-lisp* name, or
-one of the local nicknames in bitcoin-lisp::*package-nicknames*; NIL for
+one of the local nicknames in bitcoin-lisp.nicknames:*package-nicknames*; NIL for
 anything else (keywords, other packages)."
   (if (uiop:string-prefix-p "bitcoin-lisp" token)
       token
-      (let ((full (cdr (assoc token bitcoin-lisp::*package-nicknames*
+      (let ((full (cdr (assoc token bitcoin-lisp.nicknames:*package-nicknames*
                               :test #'string-equal))))
         (and full (string-downcase full)))))
 
@@ -859,7 +855,7 @@ the measuring functions must measure a known shape correctly."
 and a foreign package do not")
   (is (every (lambda (entry)
                (find-package (cdr entry)))
-             bitcoin-lisp::*package-nicknames*)
+             bitcoin-lisp.nicknames:*package-nicknames*)
       "every nickname in the table must name a package that exists")
   (is (eq (find-package :bitcoin-lisp.serialization)
           (cdr (assoc "bl.ser" (sb-ext:package-local-nicknames :bitcoin-lisp.storage)

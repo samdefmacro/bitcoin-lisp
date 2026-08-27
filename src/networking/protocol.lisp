@@ -152,16 +152,16 @@ Returns T if message was handled, NIL otherwise."
     (return-from handle-message nil))
   (cond
     ((string= command "ping")
-     (let ((nonce (flexi-streams:with-input-from-sequence (s payload)
-                    (bl.ser:read-uint64-le s))))
+     (let ((nonce (bl.bytes:with-byte-reader (s payload)
+                    (bl.bytes:br-read-u64-le s))))
        (bl:log-debug "ping from ~A: ~D payload bytes, nonce ~D"
                                (peer-address peer) (length payload) nonce)
        (handle-ping peer nonce))
      t)
 
     ((string= command "pong")
-     (let ((nonce (flexi-streams:with-input-from-sequence (s payload)
-                    (bl.ser:read-uint64-le s))))
+     (let ((nonce (bl.bytes:with-byte-reader (s payload)
+                    (bl.bytes:br-read-u64-le s))))
        (handle-pong peer nonce))
      t)
 
@@ -1371,8 +1371,8 @@ net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
   (when peer (setf (peer-addr-relay-enabled peer) t))
   (let ((entries '())
         (msg-count 0))
-    (flexi-streams:with-input-from-sequence (stream payload)
-      (let ((count (bl.ser:read-compact-size stream)))
+    (bl.bytes:with-byte-reader (stream payload)
+      (let ((count (bl.bytes:br-read-compact-size stream)))
         (when (> count bl.ser:+max-addr-count+)
           (when peer
             (record-misbehavior peer (format nil "addr message size = ~D" count)))

@@ -117,16 +117,6 @@ Mirrors Bitcoin Core's ReadCompactSize (serialize.h:330-360):
              value +max-compact-size+))
     value))
 
-(defun read-bounded-count (stream max name)
-  "Read a CompactSize count from STREAM and signal an error if it exceeds MAX.
-NAME labels the field. Rejecting an over-limit count up front — rather than
-looping/allocating for it — is Bitcoin Core's misbehaving-peer posture for
-protocol vectors (inv, headers, addr, block txns)."
-  (let ((count (read-compact-size stream)))
-    (when (> count max)
-      (error "~A count ~D exceeds maximum ~D" name count max))
-    count))
-
 (defun write-compact-size (stream value)
   "Write a CompactSize-encoded integer to STREAM."
   (cond

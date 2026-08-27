@@ -66,4 +66,4 @@
    #:json-object))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (bitcoin-lisp::install-package-nicknames))
+  (bitcoin-lisp.nicknames:install-package-nicknames))

@@ -259,3 +259,6 @@
    ;; Fee estimation
    #:estimate-fee-rate
    #:highest-target-tracked))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp.nicknames:install-package-nicknames))

@@ -304,3 +304,6 @@
    #:last-checkpoint-height
    #:relay-enabled-p
    #:ignore-incoming-txs-p))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp.nicknames:install-package-nicknames))

@@ -2577,8 +2577,7 @@ capturing transport so sends can be observed without sockets."
     (setf (bl.net::peer-state p) :ready
           (bl.net::peer-conn-type p) conn-type
           (bl.net::peer-version p)
-          (flexi-streams:with-input-from-sequence
-              (s (bl.ser:make-version-message-bytes :version version))
+          (bl.bytes:with-byte-reader (s (bl.ser:make-version-message-bytes :version version))
             (bl.ser:read-version-message s)))
     p))
 
@@ -2592,7 +2591,7 @@ capturing transport so sends can be observed without sockets."
                     (lambda (peer msg)
                       (declare (ignore peer))
                       (when (string= "feefilter"
-                                     (flexi-streams:with-input-from-sequence (s msg)
+                                     (bl.bytes:with-byte-reader (s msg)
                                        (bl.ser:message-header-command
                                         (bl.ser:read-message-header s))))
                         (push (bl.ser:parse-feefilter-payload

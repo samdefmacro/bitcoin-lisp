@@ -382,3 +382,6 @@
    #:blockfilterindex-wipe
    #:blockfilterindex-ensure-genesis-anchor
    #:build-blockfilterindex))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp.nicknames:install-package-nicknames))

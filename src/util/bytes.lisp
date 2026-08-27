@@ -166,6 +166,17 @@ version."
     (bb-ensure buf (the fixnum (+ p 9)))
     (setf (bb-pos buf) (buf-set-varint (bb-data buf) p v))))
 
+(defun bb-write-var-bytes (buf bytes)
+  "CompactSize length prefix, then BYTES."
+  (bb-write-varint buf (length bytes))
+  (bb-write-bytes buf bytes))
+
+(defun bb-write-hash256 (buf hash)
+  "Write a 32-byte hash, refusing any other length: a hash of the wrong size
+would otherwise silently become a malformed message."
+  (assert (= (length hash) 32) (hash) "bb-write-hash256: ~D bytes, not 32" (length hash))
+  (bb-write-bytes buf hash))
+
 (defun bb-finish (buf)
   "Return a fresh simple-array containing exactly the written bytes."
   (declare (type byte-buf buf) (optimize (speed 3) (safety 1)))
@@ -174,6 +185,13 @@ version."
     (declare (type fixnum n))
     (replace out (bb-data buf) :end2 n)
     out))
+
+(defmacro with-byte-buf ((var) &body body)
+  "Bind VAR to a fresh byte-buf around BODY and return the written bytes.
+The byte-buf counterpart of flexi-streams:with-output-to-sequence."
+  `(let ((,var (make-byte-buf)))
+     ,@body
+     (bb-finish ,var)))
 
 ;;;; Byte-reader (zero-copy index-based input)
 ;;;
@@ -197,6 +215,12 @@ version."
    :data (if (typep bytes '(simple-array (unsigned-byte 8) (*)))
              bytes
              (coerce bytes '(simple-array (unsigned-byte 8) (*))))))
+
+(defmacro with-byte-reader ((var bytes) &body body)
+  "Bind VAR to a byte-reader over BYTES around BODY. The byte-reader
+counterpart of flexi-streams:with-input-from-sequence."
+  `(let ((,var (make-byte-reader-from ,bytes)))
+     ,@body))
 
 (defun br-eof-p (br)
   (declare (type byte-reader br) (optimize (speed 3) (safety 1)))
@@ -254,10 +278,12 @@ ahead of an overrun error."
       (setf (br-pos br) (the fixnum (+ p n)))
       out)))
 
-(defun br-read-compact-size (br)
+(defun br-read-compact-size (br &key (range-check t))
   "Read a CompactSize. Mirrors Bitcoin Core's ReadCompactSize
-(serialize.h:330-360): non-canonical encodings rejected and the value capped
-at +max-compact-size+."
+(serialize.h:330-360): non-canonical encodings rejected and, when RANGE-CHECK
+(the default), the value capped at +max-compact-size+. RANGE-CHECK NIL is for
+the few fields Core reads with range_check=false, such as addrv2 service
+bits."
   (declare (type byte-reader br) (optimize (speed 3) (safety 1)))
   (let* ((first (br-read-u8 br))
          (value
@@ -278,7 +304,7 @@ at +max-compact-size+."
                 (when (< v #x100000000)
                   (error "non-canonical ReadCompactSize"))
                 v)))))
-    (when (> value +max-compact-size+)
+    (when (and range-check (> value +max-compact-size+))
       (error "ReadCompactSize: size too large (~D > ~D)"
              value +max-compact-size+))
     value))

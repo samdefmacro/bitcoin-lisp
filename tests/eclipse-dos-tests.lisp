@@ -280,8 +280,8 @@ handle-addrv2 ignore its addresses entirely (Core SetupAddressRelay)."
   (let ((book (bl.net:make-address-book))
         (p (bl.net:make-peer :conn-type :block-relay))
         (payload (coerce
-                  (flexi-streams:with-output-to-sequence (s)
-                    (bl.ser:write-compact-size s 1)
+                  (bl.bytes:with-byte-buf (s)
+                    (bl.bytes:bb-write-varint s 1)
                     (bl.ser:write-net-addr
                      s (bl.ser:make-net-addr
                         :services 1
@@ -301,8 +301,8 @@ nothing is stored."
         (p (bl.net:make-peer :conn-type :outbound-full-relay
                                               :address "203.0.113.9"))
         (payload (coerce
-                  (flexi-streams:with-output-to-sequence (s)
-                    (bl.ser:write-compact-size s 1001))
+                  (bl.bytes:with-byte-buf (s)
+                    (bl.bytes:bb-write-varint s 1001))
                   '(simple-array (unsigned-byte 8) (*)))))
     (is (= 0 (bl.net:handle-addr p payload book)))
     (is (eq :disconnected (bl.net:peer-state p)))
@@ -377,8 +377,8 @@ message reaches addrman, penalised by 2h and by nothing else."
          (ip (%gossip-ip 11))
          (old (- (bl.ser:get-unix-time) (* 7 24 60 60)))
          (payload (coerce
-                   (flexi-streams:with-output-to-sequence (s)
-                     (bl.ser:write-compact-size s 1)
+                   (bl.bytes:with-byte-buf (s)
+                     (bl.bytes:bb-write-varint s 1)
                      (bl.ser:write-net-addr
                       s (%gossip-net-addr ip)
                       :with-timestamp t :timestamp old))
