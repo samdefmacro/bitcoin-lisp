@@ -23,6 +23,7 @@ CHECKOUT_SHORT="${CHECKOUT_ID:0:12}"
 SESSION_ID="bitcoin-lisp-$CHECKOUT_SHORT"
 CONTAINER="${BITCOIN_LISP_DEV_CONTAINER:-bitcoin-lisp-dev-$CHECKOUT_SHORT}"
 FASL_VOLUME="bitcoin-lisp-fasl-dev-$CHECKOUT_SHORT"
+PROJECT_ID="bitcoin-lisp"          # value of PROJECT_LABEL on everything we own
 PROJECT_LABEL="io.common-lisp-workbench.project"
 CHECKOUT_LABEL="io.common-lisp-workbench.checkout"
 MANAGED_LABEL="io.common-lisp-workbench.managed"
@@ -75,46 +76,66 @@ Cold verification of record stays with scripts/docker-test.sh (full
 USAGE
 }
 
-container_exists() {
-  "$DOCKER" container inspect "$CONTAINER" >/dev/null 2>&1
+# One docker call reads an object's state and ownership labels into
+# INSPECT_STATUS / INSPECT_PROJECT / INSPECT_CHECKOUT / INSPECT_MANAGED.
+# Absence is the exit status, not the output: a missing object still prints
+# an empty line under --format. Fields are `|`-separated, not whitespace,
+# because `read` collapses whitespace runs and an empty label would shift
+# its neighbours.
+inspect_object() { # $1 docker object kind, $2 name, $3 --format template
+  local line
+  line="$("$DOCKER" "$1" inspect --format "$3" "$2" 2>/dev/null)" || return 1
+  IFS='|' read -r INSPECT_STATUS INSPECT_PROJECT INSPECT_CHECKOUT INSPECT_MANAGED <<<"$line"
+}
+
+labels_template() { # $1 label-map path inside the template
+  printf '{{ index %s "%s" }}|{{ index %s "%s" }}|{{ index %s "%s" }}' \
+    "$1" "$PROJECT_LABEL" "$1" "$CHECKOUT_LABEL" "$1" "$MANAGED_LABEL"
+}
+
+inspect_container() {
+  inspect_object container "$CONTAINER" \
+    "{{ .State.Status }}|$(labels_template .Config.Labels)"
+}
+
+inspect_volume() { # volumes have no state; the status field stays empty
+  inspect_object volume "$FASL_VOLUME" "|$(labels_template .Labels)"
+}
+
+# The labels every object we create carries (see the run/create sites); they
+# are the guard against touching another checkout's container or volume on
+# the shared daemon.
+inspected_is_owned() {
+  [ "$INSPECT_PROJECT" = "$PROJECT_ID" ] && \
+    [ "$INSPECT_CHECKOUT" = "$CHECKOUT_ID" ] && \
+    [ "$INSPECT_MANAGED" = "true" ]
+}
+
+refuse_foreign_container() {
+  echo "ERROR: refusing foreign or unlabeled container: $CONTAINER" >&2
+  echo "       expected checkout ownership: $CHECKOUT_ID" >&2
+  return 2
 }
 
 container_owned() {
-  local actual_project actual_checkout actual_managed
-  container_exists || return 1
-  actual_project="$("$DOCKER" inspect \
-    --format '{{ index .Config.Labels "io.common-lisp-workbench.project" }}' \
-    "$CONTAINER")"
-  actual_checkout="$("$DOCKER" inspect \
-    --format '{{ index .Config.Labels "io.common-lisp-workbench.checkout" }}' \
-    "$CONTAINER")"
-  actual_managed="$("$DOCKER" inspect \
-    --format '{{ index .Config.Labels "io.common-lisp-workbench.managed" }}' \
-    "$CONTAINER")"
-  [ "$actual_project" = "bitcoin-lisp" ] && \
-    [ "$actual_checkout" = "$CHECKOUT_ID" ] && \
-    [ "$actual_managed" = "true" ]
+  inspect_container && inspected_is_owned
 }
 
 require_owned_container() {
-  if ! container_owned; then
-    echo "ERROR: refusing foreign or unlabeled container: $CONTAINER" >&2
-    echo "       expected checkout ownership: $CHECKOUT_ID" >&2
-    return 2
-  fi
+  container_owned || refuse_foreign_container
 }
 
 container_state() { # prints running|stopped|absent
-  local state
-  if ! container_exists; then
+  inspect_container || {
     echo absent
     return 0
-  fi
-  require_owned_container || return $?
-  state="$("$DOCKER" inspect --format '{{.State.Status}}' "$CONTAINER")"
-  case "$state" in
+  }
+  inspected_is_owned || {
+    refuse_foreign_container
+    return $?
+  }
+  case "$INSPECT_STATUS" in
     running) echo running ;;
-    "") echo absent ;;
     *) echo stopped ;;
   esac
 }
@@ -133,29 +154,15 @@ ensure_image() {
   fi
 }
 
-volume_exists() {
-  "$DOCKER" volume inspect "$FASL_VOLUME" >/dev/null 2>&1
-}
-
-volume_owned() {
-  local actual_project actual_checkout
-  volume_exists || return 1
-  actual_project="$("$DOCKER" volume inspect --format \
-    '{{ index .Labels "io.common-lisp-workbench.project" }}' "$FASL_VOLUME")"
-  actual_checkout="$("$DOCKER" volume inspect --format \
-    '{{ index .Labels "io.common-lisp-workbench.checkout" }}' "$FASL_VOLUME")"
-  [ "$actual_project" = "bitcoin-lisp" ] && [ "$actual_checkout" = "$CHECKOUT_ID" ]
-}
-
 ensure_volume() {
-  if volume_exists; then
-    volume_owned || {
+  if inspect_volume; then
+    inspected_is_owned || {
       echo "ERROR: refusing foreign FASL volume: $FASL_VOLUME" >&2
       return 2
     }
   else
     "$DOCKER" volume create \
-      --label "$PROJECT_LABEL=bitcoin-lisp" \
+      --label "$PROJECT_LABEL=$PROJECT_ID" \
       --label "$CHECKOUT_LABEL=$CHECKOUT_ID" \
       --label "$MANAGED_LABEL=true" \
       "$FASL_VOLUME" >/dev/null
@@ -179,7 +186,7 @@ start_server() {
   ensure_image
   ensure_volume
   "$DOCKER" run --detach --init --name "$CONTAINER" \
-    --label "$PROJECT_LABEL=bitcoin-lisp" \
+    --label "$PROJECT_LABEL=$PROJECT_ID" \
     --label "$CHECKOUT_LABEL=$CHECKOUT_ID" \
     --label "$MANAGED_LABEL=true" \
     --volume "$ROOT:/workspace" \
@@ -231,8 +238,8 @@ status_server() {
   else
     echo "Dev image $IMAGE: absent (start builds it)"
   fi
-  if volume_exists; then
-    if volume_owned; then
+  if inspect_volume; then
+    if inspected_is_owned; then
       echo "FASL volume $FASL_VOLUME: present (ownership verified)"
     else
       echo "FASL volume $FASL_VOLUME: PRESENT BUT FOREIGN" >&2
@@ -375,7 +382,7 @@ ui_test() {
   [ ${#targets[@]} -eq 0 ] && targets=(tests/ui/)
   exec "$DOCKER" run --rm -i \
     -v "$ROOT:/workspace:ro" -w /workspace \
-    --label "$PROJECT_LABEL=bitcoin-lisp" \
+    --label "$PROJECT_LABEL=$PROJECT_ID" \
     --label "$CHECKOUT_LABEL=$CHECKOUT_SHORT" \
     --label "agent=$SESSION_ID" \
     --entrypoint node "$IMAGE" --test "${targets[@]}"
