@@ -703,9 +703,10 @@ list behind."
 (defun %package-layer (package order)
   "The load position of the module that owns PACKAGE: bitcoin-lisp.NAME and
 bitcoin-lisp.NAME.sub belong to src/NAME/. The top package BITCOIN-LISP is
-placed at src/package.lisp, position 0 -- its files span the whole load
-(logging.lisp is first, node.lisp last), so a reference INTO it is never
-counted as upward. That is a blind spot this test accepts, not a claim."
+placed at src/package.lisp, the last of the package files and still before
+any code -- its files span the whole load (logging.lisp is first, node.lisp
+last), so a reference INTO it is never counted as upward. That is a blind
+spot this test accepts, not a claim."
   (if (string= package "bitcoin-lisp")
       (cdr (assoc "src/package.lisp" order :test #'string=))
       (let* ((start (length "bitcoin-lisp."))

@@ -26,7 +26,20 @@
   :serial t
   :components ((:module "src"
                 :components
-                ((:file "package")
+                (;; Packages first, all of them: config.lisp (third) already
+                 ;; names most later packages, and src/package.lisp -- last,
+                 ;; because its top package :USEs the others -- installs the
+                 ;; bl.* nicknames on every package that exists by then.
+                 ;; Each module's package lives next to its code.
+                 (:file "util/package")
+                 (:file "crypto/package")
+                 (:file "serialization/package")
+                 (:file "storage/package")
+                 (:file "validation/package")
+                 (:file "mempool/package")
+                 (:file "mining/package")
+                 (:file "networking/package")
+                 (:file "package")
                  ;; util first: byte I/O that the script interpreter's
                  ;; sighash code inlines must be loaded before src/coalton/.
                  (:module "util"
