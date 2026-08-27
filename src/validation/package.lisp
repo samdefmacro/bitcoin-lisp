@@ -156,3 +156,6 @@
    ;; Coinbase / subsidy (for the block assembler)
    #:calculate-block-subsidy
    #:encode-bip34-height))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp.nicknames:install-package-nicknames))

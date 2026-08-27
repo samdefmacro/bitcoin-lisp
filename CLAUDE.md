@@ -20,15 +20,16 @@ default-OFF on mainnet (config flag `-wallet`); testnet4 first.
 ## Package prefixes
 
 Cross-package references use the package-local nicknames installed by
-`src/package.lisp` (`bitcoin-lisp::*package-nicknames*`): `bl:` for the top
+`src/util/package.lisp` (`bitcoin-lisp.nicknames:*package-nicknames*`): `bl:` for the top
 package, `bl.bytes`, `bl.crypto`, `bl.ser`, `bl.store`, `bl.val`, `bl.mp`,
 `bl.mining`, `bl.net`, `bl.rpc`, `bl.interop`, `bl.script`, `bl.ctypes`,
 `bl.cser`, `bl.cbin`, `bl.ccrypto`, `bl.tests`. Write `bl.ser:transaction-inputs`,
 never the full name. A branch that predates the nicknames rebases and runs
 `scripts/refactor/apply-nicknames.sh`. A file that DEFINES packages follows
 its DEFPACKAGE forms with `(eval-when (:compile-toplevel :load-toplevel
-:execute) (bitcoin-lisp::install-package-nicknames))`, full name, because
-that form is read in CL-USER.
+:execute) (bitcoin-lisp.nicknames:install-package-nicknames))` — a warm-image
+reload of a package file re-executes its DEFPACKAGE, which DROPS that
+package's nicknames, and this call restores them.
 
 ## The development loop (cl-workbench managed, containerized warm image)
 

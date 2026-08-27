@@ -248,6 +248,12 @@ flexi-streams' Gray-stream input dispatch."
                           (when (< v #x100000000)
                             (error "non-canonical ReadCompactSize"))
                           v))))
+               ;; Core ReadCompactSize's range check (serialize.h:330-360),
+               ;; which the inline decode above skips.
+               (input-count (if (> input-count +max-compact-size+)
+                                (error "ReadCompactSize: size too large (~D > ~D)"
+                                       input-count +max-compact-size+)
+                                input-count))
                (inputs (%read-n-vector input-count (br-read-tx-in br)))
                (output-count (br-read-compact-size br))
                (outputs (%read-n-vector output-count (br-read-tx-out br)))

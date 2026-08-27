@@ -19,45 +19,45 @@
 (defun make-witness-test-tx-bytes ()
   "Build raw bytes for a synthetic BIP 144 witness transaction."
   (coerce
-   (flexi-streams:with-output-to-sequence (s)
+   (bl.bytes:with-byte-buf (s)
      ;; Version = 2
-     (bl.ser:write-int32-le s 2)
+     (bl.bytes:bb-write-i32-le s 2)
      ;; Marker + flag
-     (bl.ser:write-uint8 s #x00)
-     (bl.ser:write-uint8 s #x01)
+     (bl.bytes:bb-write-u8 s #x00)
+     (bl.bytes:bb-write-u8 s #x01)
      ;; 1 input
-     (bl.ser:write-compact-size s 1)
+     (bl.bytes:bb-write-varint s 1)
      ;; prev outpoint: txid (32 bytes of 0x11), index 0
-     (write-sequence (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11) s)
-     (bl.ser:write-uint32-le s 0)
+     (bl.bytes:bb-write-bytes s (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11))
+     (bl.bytes:bb-write-u32-le s 0)
      ;; empty scriptSig
-     (bl.ser:write-compact-size s 0)
+     (bl.bytes:bb-write-varint s 0)
      ;; sequence
-     (bl.ser:write-uint32-le s #xFFFFFFFE)
+     (bl.bytes:bb-write-u32-le s #xFFFFFFFE)
      ;; 1 output
-     (bl.ser:write-compact-size s 1)
+     (bl.bytes:bb-write-varint s 1)
      ;; value: 49999 satoshis
-     (bl.ser:write-int64-le s 49999)
+     (bl.bytes:bb-write-i64-le s 49999)
      ;; 25-byte scriptPubKey (P2PKH placeholder)
-     (bl.ser:write-compact-size s 25)
-     (write-sequence (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76) s)
+     (bl.bytes:bb-write-varint s 25)
+     (bl.bytes:bb-write-bytes s (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76))
      ;; Witness for input 0: 2 items
-     (bl.ser:write-compact-size s 2)
+     (bl.bytes:bb-write-varint s 2)
      ;; Item 1: 72-byte signature placeholder
-     (bl.ser:write-compact-size s 72)
-     (write-sequence (make-array 72 :element-type '(unsigned-byte 8) :initial-element #xAA) s)
+     (bl.bytes:bb-write-varint s 72)
+     (bl.bytes:bb-write-bytes s (make-array 72 :element-type '(unsigned-byte 8) :initial-element #xAA))
      ;; Item 2: 33-byte pubkey placeholder
-     (bl.ser:write-compact-size s 33)
-     (write-sequence (make-array 33 :element-type '(unsigned-byte 8) :initial-element #xBB) s)
+     (bl.bytes:bb-write-varint s 33)
+     (bl.bytes:bb-write-bytes s (make-array 33 :element-type '(unsigned-byte 8) :initial-element #xBB))
      ;; Locktime: 500000
-     (bl.ser:write-uint32-le s 500000))
+     (bl.bytes:bb-write-u32-le s 500000))
    '(simple-array (unsigned-byte 8) (*))))
 
 (test witness-transaction-deserialize
   "A BIP 144 witness transaction should deserialize correctly."
   (let* ((raw (make-witness-test-tx-bytes))
-         (tx (flexi-streams:with-input-from-sequence (s raw)
-               (bl.ser:read-transaction s))))
+         (tx (bl.bytes:with-byte-reader (s raw)
+               (bl.ser:br-read-transaction s))))
     ;; Basic fields
     (is (= 2 (bl.ser:transaction-version tx)))
     (is (= 1 (length (bl.ser:transaction-inputs tx))))
@@ -84,8 +84,8 @@
 (test witness-transaction-round-trip
   "Serializing a witness transaction back should produce identical bytes."
   (let* ((raw (make-witness-test-tx-bytes))
-         (tx (flexi-streams:with-input-from-sequence (s raw)
-               (bl.ser:read-transaction s)))
+         (tx (bl.bytes:with-byte-reader (s raw)
+               (bl.ser:br-read-transaction s)))
          (re-serialized (bl.ser:serialize-witness-transaction tx)))
     (is (equalp raw re-serialized))))
 
@@ -96,15 +96,15 @@ round-trips byte-exact; a witnessless tx serializes in legacy form, with NO
 marker/flag (byte 4, the input count, must be non-zero)."
   ;; Witness tx: wire form == BIP 144 form, byte-exact against the source bytes.
   (let* ((raw (make-witness-test-tx-bytes))
-         (tx (flexi-streams:with-input-from-sequence (s raw)
-               (bl.ser:read-transaction s)))
+         (tx (bl.bytes:with-byte-reader (s raw)
+               (bl.ser:br-read-transaction s)))
          (wire (bl.ser:transaction-wire-bytes tx)))
     (is (equalp raw wire))
     (is (= #x00 (aref wire 4)))         ; marker
     (is (= #x01 (aref wire 5)))         ; flag
     ;; Round-trip: witness survives re-deserialization of the wire bytes.
-    (let ((tx2 (flexi-streams:with-input-from-sequence (s wire)
-                 (bl.ser:read-transaction s))))
+    (let ((tx2 (bl.bytes:with-byte-reader (s wire)
+                 (bl.ser:br-read-transaction s))))
       (is (bl.ser:transaction-has-witness-p tx2))
       (is (equalp (bl.ser:transaction-wtxid tx)
                   (bl.ser:transaction-wtxid tx2)))))
@@ -123,8 +123,8 @@ marker/flag (byte 4, the input count, must be non-zero)."
 (test witness-txid-excludes-witness
   "The txid should be computed from legacy serialization (no witness)."
   (let* ((raw (make-witness-test-tx-bytes))
-         (tx (flexi-streams:with-input-from-sequence (s raw)
-               (bl.ser:read-transaction s)))
+         (tx (bl.bytes:with-byte-reader (s raw)
+               (bl.ser:br-read-transaction s)))
          (txid (bl.ser:transaction-hash tx))
          ;; Manually compute legacy serialization hash
          (legacy-bytes (bl.ser:serialize-transaction tx))
@@ -137,8 +137,8 @@ marker/flag (byte 4, the input count, must be non-zero)."
 (test witness-wtxid-includes-witness
   "The wtxid should be computed from witness serialization."
   (let* ((raw (make-witness-test-tx-bytes))
-         (tx (flexi-streams:with-input-from-sequence (s raw)
-               (bl.ser:read-transaction s)))
+         (tx (bl.bytes:with-byte-reader (s raw)
+               (bl.ser:br-read-transaction s)))
          (wtxid (bl.ser:transaction-wtxid tx))
          (expected-wtxid (bl.crypto:hash256 raw)))
     ;; wtxid should match hash of full witness serialization
@@ -150,27 +150,27 @@ marker/flag (byte 4, the input count, must be non-zero)."
   "Legacy transactions (no witness) should still deserialize correctly."
   (let* ((legacy-bytes
            (coerce
-            (flexi-streams:with-output-to-sequence (s)
-              (bl.ser:write-int32-le s 1)  ; version
-              (bl.ser:write-compact-size s 1) ; 1 input
+            (bl.bytes:with-byte-buf (s)
+              (bl.bytes:bb-write-i32-le s 1)  ; version
+              (bl.bytes:bb-write-varint s 1) ; 1 input
               ;; prev outpoint
-              (write-sequence (make-array 32 :element-type '(unsigned-byte 8)
-                                             :initial-element #x22) s)
-              (bl.ser:write-uint32-le s 0)
+              (bl.bytes:bb-write-bytes s (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element #x22))
+              (bl.bytes:bb-write-u32-le s 0)
               ;; scriptSig (10 bytes)
-              (bl.ser:write-compact-size s 10)
-              (write-sequence (make-array 10 :element-type '(unsigned-byte 8)
-                                             :initial-element #x48) s)
-              (bl.ser:write-uint32-le s #xFFFFFFFF) ; sequence
-              (bl.ser:write-compact-size s 1) ; 1 output
-              (bl.ser:write-int64-le s 100000)
-              (bl.ser:write-compact-size s 25)
-              (write-sequence (make-array 25 :element-type '(unsigned-byte 8)
-                                             :initial-element #x76) s)
-              (bl.ser:write-uint32-le s 0)) ; locktime
+              (bl.bytes:bb-write-varint s 10)
+              (bl.bytes:bb-write-bytes s (make-array 10 :element-type '(unsigned-byte 8)
+                                             :initial-element #x48))
+              (bl.bytes:bb-write-u32-le s #xFFFFFFFF) ; sequence
+              (bl.bytes:bb-write-varint s 1) ; 1 output
+              (bl.bytes:bb-write-i64-le s 100000)
+              (bl.bytes:bb-write-varint s 25)
+              (bl.bytes:bb-write-bytes s (make-array 25 :element-type '(unsigned-byte 8)
+                                             :initial-element #x76))
+              (bl.bytes:bb-write-u32-le s 0)) ; locktime
             '(simple-array (unsigned-byte 8) (*))))
-         (tx (flexi-streams:with-input-from-sequence (s legacy-bytes)
-               (bl.ser:read-transaction s))))
+         (tx (bl.bytes:with-byte-reader (s legacy-bytes)
+               (bl.ser:br-read-transaction s))))
     (is (= 1 (bl.ser:transaction-version tx)))
     (is (= 1 (length (bl.ser:transaction-inputs tx))))
     (is (= 10 (length (bl.ser:tx-in-script-sig
@@ -203,8 +203,8 @@ marker/flag (byte 4, the input count, must be non-zero)."
 (test witness-stack-content-correct
   "Witness stack items should have correct byte content."
   (let* ((raw (make-witness-test-tx-bytes))
-         (tx (flexi-streams:with-input-from-sequence (s raw)
-               (bl.ser:read-transaction s)))
+         (tx (bl.bytes:with-byte-reader (s raw)
+               (bl.ser:br-read-transaction s)))
          (stack (elt (bl.ser:transaction-witness tx) 0)))
     ;; First item: 72 bytes of 0xAA
     (is (every (lambda (b) (= b #xAA)) (first stack)))
@@ -214,35 +214,35 @@ marker/flag (byte 4, the input count, must be non-zero)."
 (test read-uint32-le
   "Read uint32 little-endian should decode correctly."
   (let ((bytes #(#x01 #x02 #x03 #x04)))
-    (flexi-streams:with-input-from-sequence (stream bytes)
-      (is (= (bl.ser:read-uint32-le stream)
+    (bl.bytes:with-byte-reader (stream bytes)
+      (is (= (bl.bytes:br-read-u32-le stream)
              #x04030201)))))
 
 (test write-uint32-le
   "Write uint32 little-endian should encode correctly."
-  (let ((result (flexi-streams:with-output-to-sequence (stream)
-                  (bl.ser:write-uint32-le stream #x04030201))))
+  (let ((result (bl.bytes:with-byte-buf (stream)
+                  (bl.bytes:bb-write-u32-le stream #x04030201))))
     (is (equalp result #(#x01 #x02 #x03 #x04)))))
 
 (test compact-size-small
   "CompactSize encoding for small values (< 253)."
-  (let ((result (flexi-streams:with-output-to-sequence (stream)
-                  (bl.ser:write-compact-size stream 100))))
+  (let ((result (bl.bytes:with-byte-buf (stream)
+                  (bl.bytes:bb-write-varint stream 100))))
     (is (equalp result #(#x64)))))
 
 (test compact-size-medium
   "CompactSize encoding for medium values (253-65535)."
-  (let ((result (flexi-streams:with-output-to-sequence (stream)
-                  (bl.ser:write-compact-size stream 1000))))
+  (let ((result (bl.bytes:with-byte-buf (stream)
+                  (bl.bytes:bb-write-varint stream 1000))))
     (is (equalp result #(#xFD #xE8 #x03)))))
 
 (test compact-size-roundtrip
   "CompactSize encode then decode should return original value."
   (dolist (value '(0 1 100 252 253 1000 65535 65536 1000000))
-    (let* ((encoded (flexi-streams:with-output-to-sequence (stream)
-                      (bl.ser:write-compact-size stream value)))
-           (decoded (flexi-streams:with-input-from-sequence (stream encoded)
-                      (bl.ser:read-compact-size stream))))
+    (let* ((encoded (bl.bytes:with-byte-buf (stream)
+                      (bl.bytes:bb-write-varint stream value)))
+           (decoded (bl.bytes:with-byte-reader (stream encoded)
+                      (bl.bytes:br-read-compact-size stream))))
       (is (= decoded value)))))
 
 ;;;; Compact Block (BIP 152) message serialization tests
@@ -306,10 +306,10 @@ marker/flag (byte 4, the input count, must be non-zero)."
               :short-ids short-ids
               :prefilled-txs (list prefilled-tx)))
          ;; Serialize
-         (bytes (flexi-streams:with-output-to-sequence (s)
+         (bytes (bl.bytes:with-byte-buf (s)
                   (bl.ser:write-compact-block s cb)))
          ;; Deserialize
-         (cb2 (flexi-streams:with-input-from-sequence (s bytes)
+         (cb2 (bl.bytes:with-byte-reader (s bytes)
                 (bl.ser:read-compact-block s))))
     ;; Verify header
     (is (= (bl.ser:block-header-version
@@ -340,9 +340,9 @@ marker/flag (byte 4, the input count, must be non-zero)."
               :nonce 0
               :short-ids '()
               :prefilled-txs prefilled))
-         (bytes (flexi-streams:with-output-to-sequence (s)
+         (bytes (bl.bytes:with-byte-buf (s)
                   (bl.ser:write-compact-block s cb)))
-         (cb2 (flexi-streams:with-input-from-sequence (s bytes)
+         (cb2 (bl.bytes:with-byte-reader (s bytes)
                 (bl.ser:read-compact-block s))))
     ;; After parsing, indexes should be absolute again
     (let ((parsed-prefilled (bl.ser:compact-block-prefilled-txs cb2)))
@@ -371,9 +371,9 @@ marker/flag (byte 4, the input count, must be non-zero)."
               :nonce 0
               :short-ids short-ids
               :prefilled-txs '()))
-         (bytes (flexi-streams:with-output-to-sequence (s)
+         (bytes (bl.bytes:with-byte-buf (s)
                   (bl.ser:write-compact-block s cb)))
-         (cb2 (flexi-streams:with-input-from-sequence (s bytes)
+         (cb2 (bl.bytes:with-byte-reader (s bytes)
                 (bl.ser:read-compact-block s))))
     ;; Short IDs should round-trip correctly
     (is (= (first (bl.ser:compact-block-short-ids cb2))

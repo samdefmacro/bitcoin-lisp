@@ -39,3 +39,6 @@
    #:+minimum-block-reserved-weight+
    #:*block-reserved-weight*
    #:*block-max-weight*))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp.nicknames:install-package-nicknames))

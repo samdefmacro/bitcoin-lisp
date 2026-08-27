@@ -10,15 +10,15 @@
 (defun make-addrv2-entry-bytes (timestamp services network-id addr-bytes port)
   "Build raw bytes for a single addrv2 entry."
   (coerce
-   (flexi-streams:with-output-to-sequence (s)
-     (bl.ser:write-uint32-le s timestamp)
-     (bl.ser:write-compact-size s services)
-     (bl.ser:write-uint8 s network-id)
-     (bl.ser:write-compact-size s (length addr-bytes))
-     (write-sequence addr-bytes s)
+   (bl.bytes:with-byte-buf (s)
+     (bl.bytes:bb-write-u32-le s timestamp)
+     (bl.bytes:bb-write-varint s services)
+     (bl.bytes:bb-write-u8 s network-id)
+     (bl.bytes:bb-write-varint s (length addr-bytes))
+     (bl.bytes:bb-write-bytes s addr-bytes)
      ;; Port big-endian
-     (write-byte (ash port -8) s)
-     (write-byte (logand port #xFF) s))
+     (bl.bytes:bb-write-u8 s (ash port -8))
+     (bl.bytes:bb-write-u8 s (logand port #xFF)))
    '(simple-array (unsigned-byte 8) (*))))
 
 ;;; Task 3.1: Parse addrv2 entry with IPv4 address
@@ -26,7 +26,7 @@
   "Parse an addrv2 entry with IPv4 (network ID 1, 4-byte address)."
   (let* ((addr-bytes #(192 168 1 42))
          (entry (make-addrv2-entry-bytes 1000000 1 1 addr-bytes 8333)))
-    (flexi-streams:with-input-from-sequence (s entry)
+    (bl.bytes:with-byte-reader (s entry)
       (multiple-value-bind (addr timestamp network-id)
           (bl.ser:read-net-addr-v2 s)
         (is (not (null addr)))
@@ -51,7 +51,7 @@
                                                         0 0 0 0 0 0 0 0
                                                         0 0 0 1)))
          (entry (make-addrv2-entry-bytes 2000000 9 2 addr-bytes 18333)))
-    (flexi-streams:with-input-from-sequence (s entry)
+    (bl.bytes:with-byte-reader (s entry)
       (multiple-value-bind (addr timestamp network-id)
           (bl.ser:read-net-addr-v2 s)
         (is (not (null addr)))
@@ -67,7 +67,7 @@
   "Parse an addrv2 entry with TorV3 (network ID 4, 32-byte): a typed net-addr."
   (let* ((addr-bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAB))
          (entry (make-addrv2-entry-bytes 3000000 1 4 addr-bytes 9050)))
-    (flexi-streams:with-input-from-sequence (s entry)
+    (bl.bytes:with-byte-reader (s entry)
       (multiple-value-bind (addr timestamp network-id)
           (bl.ser:read-net-addr-v2 s)
         (is (not (null addr)))
@@ -82,11 +82,11 @@
   "An entry with unknown network ID is skipped without error."
   (let* ((addr-bytes (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0))
          (entry (make-addrv2-entry-bytes 1000000 1 99 addr-bytes 1234)))
-    (flexi-streams:with-input-from-sequence (s entry)
+    (bl.bytes:with-byte-reader (s entry)
       (let ((addr (bl.ser:read-net-addr-v2 s)))
         (is (null addr))
         ;; Stream should be fully consumed
-        (is (= (length entry) (file-position s)))))))
+        (is (= (length entry) (bl.bytes:br-pos s)))))))
 
 ;;; A recognized network id with the wrong length REJECTS the message.
 ;;; Core's SetNetFromBIP155Network throws for founding nets with a bad size
@@ -98,23 +98,23 @@
       (let* ((addr-bytes (make-array len :element-type '(unsigned-byte 8)
                                          :initial-element 0))
              (entry (make-addrv2-entry-bytes 1000000 1 net-id addr-bytes 8333)))
-        (flexi-streams:with-input-from-sequence (s entry)
+        (bl.bytes:with-byte-reader (s entry)
           (signals error (bl.ser:read-net-addr-v2 s)))))))
 
 ;;; Extreme length rejects the message even for an unknown id (Core
 ;;; "Address too long: ... > 512").
 (test parse-addrv2-address-too-long-errors
   (let ((entry (coerce
-                (flexi-streams:with-output-to-sequence (s)
-                  (bl.ser:write-uint32-le s 1000000)
-                  (bl.ser:write-compact-size s 1)
-                  (bl.ser:write-uint8 s #xAA)
-                  (bl.ser:write-compact-size s 513)
-                  (write-sequence (make-array 513 :element-type '(unsigned-byte 8)
-                                                  :initial-element 1) s)
-                  (write-byte 32 s) (write-byte 141 s))
+                (bl.bytes:with-byte-buf (s)
+                  (bl.bytes:bb-write-u32-le s 1000000)
+                  (bl.bytes:bb-write-varint s 1)
+                  (bl.bytes:bb-write-u8 s #xAA)
+                  (bl.bytes:bb-write-varint s 513)
+                  (bl.bytes:bb-write-bytes s (make-array 513 :element-type '(unsigned-byte 8)
+                                                  :initial-element 1))
+                  (bl.bytes:bb-write-u8 s 32) (bl.bytes:bb-write-u8 s 141))
                 '(simple-array (unsigned-byte 8) (*)))))
-    (flexi-streams:with-input-from-sequence (s entry)
+    (bl.bytes:with-byte-reader (s entry)
       (signals error (bl.ser:read-net-addr-v2 s)))))
 
 ;;; Task 3.1: Compact-size services round-trip
@@ -123,7 +123,7 @@
   (let* ((large-services (logior 1 (ash 1 10)))  ; NODE_NETWORK | NODE_NETWORK_LIMITED = 1025
          (addr-bytes #(10 0 0 1))
          (entry (make-addrv2-entry-bytes 1000000 large-services 1 addr-bytes 8333)))
-    (flexi-streams:with-input-from-sequence (s entry)
+    (bl.bytes:with-byte-reader (s entry)
       (multiple-value-bind (addr timestamp network-id)
           (bl.ser:read-net-addr-v2 s)
         (declare (ignore timestamp network-id))
@@ -138,7 +138,7 @@
     ;; Message should be 24 bytes (header only, zero payload)
     (is (= 24 (length msg)))
     ;; Parse the header
-    (flexi-streams:with-input-from-sequence (s msg)
+    (bl.bytes:with-byte-reader (s msg)
       (let ((header (bl.ser:read-message-header s)))
         (is (string= "sendaddrv2" (bl.ser:message-header-command header)))
         (is (= 0 (bl.ser:message-header-payload-length header)))))))
@@ -332,8 +332,8 @@ be dropped before delivering anything useful."
          ;; Build payload with IPv4, IPv6, and TorV3 entries
          (payload
            (coerce
-            (flexi-streams:with-output-to-sequence (s)
-              (bl.ser:write-compact-size s 3)
+            (bl.bytes:with-byte-buf (s)
+              (bl.bytes:bb-write-varint s 3)
               ;; IPv4 entry
               (bl.ser:write-net-addr-v2
                s
@@ -351,12 +351,12 @@ be dropped before delivering anything useful."
                  :port 8333)
                bl.ser:+addrv2-net-ipv6+ now)
               ;; TorV3 entry (should be skipped)
-              (bl.ser:write-uint32-le s now)
-              (bl.ser:write-compact-size s 1)
-              (bl.ser:write-uint8 s bl.ser:+addrv2-net-torv3+)
-              (bl.ser:write-compact-size s 32)
-              (write-sequence (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA) s)
-              (write-byte 0 s) (write-byte 80 s))  ; port 80
+              (bl.bytes:bb-write-u32-le s now)
+              (bl.bytes:bb-write-varint s 1)
+              (bl.bytes:bb-write-u8 s bl.ser:+addrv2-net-torv3+)
+              (bl.bytes:bb-write-varint s 32)
+              (bl.bytes:bb-write-bytes s (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA))
+              (bl.bytes:bb-write-u8 s 0) (bl.bytes:bb-write-u8 s 80))  ; port 80
             '(simple-array (unsigned-byte 8) (*)))))
     (let ((added (bl.net:handle-addrv2 nil payload book)))
       ;; Only IPv4 and IPv6 should be added (TorV3 skipped)
@@ -370,8 +370,8 @@ be dropped before delivering anything useful."
          (now (bl.ser:get-unix-time))
          (payload
            (coerce
-            (flexi-streams:with-output-to-sequence (s)
-              (bl.ser:write-compact-size s 1)
+            (bl.bytes:with-byte-buf (s)
+              (bl.bytes:bb-write-varint s 1)
               (bl.ser:write-net-addr-v2
                s
                (bl.ser:make-net-addr :services 1
@@ -404,7 +404,7 @@ be dropped before delivering anything useful."
   "addrv2 entries with high service bits (>= bit 26) must parse."
   (let* ((services (logior (ash 1 26) (ash 1 30) 1033)) ; > +max-compact-size+
          (entry (make-addrv2-entry-bytes 1720000000 services 1 #(203 0 113 5) 8333)))
-    (flexi-streams:with-input-from-sequence (s entry)
+    (bl.bytes:with-byte-reader (s entry)
       (multiple-value-bind (addr timestamp network-id)
           (bl.ser:read-net-addr-v2 s)
         (declare (ignore timestamp network-id))
@@ -415,10 +415,10 @@ be dropped before delivering anything useful."
   (let* ((e1 (make-addrv2-entry-bytes 1720000000 (ash 1 33) 1 #(1 2 3 4) 8333))
          (e2 (make-addrv2-entry-bytes 1720000001 9 1 #(5 6 7 8) 8334))
          (payload (coerce
-                   (flexi-streams:with-output-to-sequence (s)
-                     (bl.ser:write-compact-size s 2)
-                     (write-sequence e1 s)
-                     (write-sequence e2 s))
+                   (bl.bytes:with-byte-buf (s)
+                     (bl.bytes:bb-write-varint s 2)
+                     (bl.bytes:bb-write-bytes s e1)
+                     (bl.bytes:bb-write-bytes s e2))
                    '(simple-array (unsigned-byte 8) (*))))
          (addrs (bl.ser:parse-addrv2-payload payload)))
     (is (= 2 (length addrs)))))
@@ -444,7 +444,7 @@ be dropped before delivering anything useful."
     (destructuring-bind (net-id addr-hex expected-net expected-ip) case
       (let ((entry (make-addrv2-entry-bytes 1700000000 9 net-id
                                             (%av2-hex addr-hex) 8333)))
-        (flexi-streams:with-input-from-sequence (s entry)
+        (bl.bytes:with-byte-reader (s entry)
           (multiple-value-bind (addr timestamp network-id)
               (bl.ser:read-net-addr-v2 s)
             (is (not (null addr)))
@@ -471,11 +471,11 @@ be dropped before delivering anything useful."
       (let* ((orig (bl.ser:make-net-addr
                     :services 1033 :net net :ip ip :port 18444))
              (bytes (coerce
-                     (flexi-streams:with-output-to-sequence (s)
+                     (bl.bytes:with-byte-buf (s)
                        (bl.ser:write-net-addr-v2
                         s orig net-id 1700000123))
                      '(simple-array (unsigned-byte 8) (*)))))
-        (flexi-streams:with-input-from-sequence (s bytes)
+        (bl.bytes:with-byte-reader (s bytes)
           (multiple-value-bind (addr timestamp network-id)
               (bl.ser:read-net-addr-v2 s)
             (is (not (null addr)))
@@ -506,10 +506,10 @@ prefixes, CJDNS without the fc prefix, and unknown ids with zero length."
                  (list #xAA (make-array 0 :element-type '(unsigned-byte 8)))))
     (destructuring-bind (net-id addr-bytes) case
       (let ((entry (make-addrv2-entry-bytes 1700000000 1 net-id addr-bytes 8333)))
-        (flexi-streams:with-input-from-sequence (s entry)
+        (bl.bytes:with-byte-reader (s entry)
           (is (null (bl.ser:read-net-addr-v2 s)))
           ;; The whole entry was consumed: subsequent entries stay readable.
-          (is (= (length entry) (file-position s))))))))
+          (is (= (length entry) (bl.bytes:br-pos s))))))))
 
 (test handle-addrv2-stores-typed-when-reachable
   "With onion in the reachable set (-proxy configured), a TorV3 addrv2 entry
@@ -520,10 +520,10 @@ lands in addrman as a typed record, keyed and retrievable by (net,bytes,port)."
          (pubkey (%av2-hex "79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f"))
          (payload
            (coerce
-            (flexi-streams:with-output-to-sequence (s)
-              (bl.ser:write-compact-size s 2)
-              (write-sequence (make-addrv2-entry-bytes now 1 4 pubkey 8333) s)
-              (write-sequence (make-addrv2-entry-bytes now 1 1 #(10 0 0 1) 8333) s))
+            (bl.bytes:with-byte-buf (s)
+              (bl.bytes:bb-write-varint s 2)
+              (bl.bytes:bb-write-bytes s (make-addrv2-entry-bytes now 1 4 pubkey 8333))
+              (bl.bytes:bb-write-bytes s (make-addrv2-entry-bytes now 1 1 #(10 0 0 1) 8333)))
             '(simple-array (unsigned-byte 8) (*)))))
     (is (= 2 (bl.net:handle-addrv2 nil payload book)))
     (is (= 2 (bl.net:address-book-count book)))
@@ -546,8 +546,8 @@ cjdns-flip-on-ingress), this covers every fc00 ingress point."
          (fc (%av2-hex "fc000001000200030004000500060007"))
          (v1-payload
            (coerce
-            (flexi-streams:with-output-to-sequence (s)
-              (bl.ser:write-compact-size s 1)
+            (bl.bytes:with-byte-buf (s)
+              (bl.bytes:bb-write-varint s 1)
               (bl.ser:write-net-addr
                s (bl.ser:make-net-addr
                   :services 1 :ip fc :port 8333)
@@ -561,12 +561,11 @@ cjdns-flip-on-ingress), this covers every fc00 ingress point."
     (is (null (bl.net:address-book-lookup book fc 8333 :ipv6)))
     (let ((v2-payload
             (coerce
-             (flexi-streams:with-output-to-sequence (s)
-               (bl.ser:write-compact-size s 1)
-               (write-sequence (make-addrv2-entry-bytes
+             (bl.bytes:with-byte-buf (s)
+               (bl.bytes:bb-write-varint s 1)
+               (bl.bytes:bb-write-bytes s (make-addrv2-entry-bytes
                                 now 1 bl.ser:+addrv2-net-cjdns+
-                                fc 8333)
-                               s))
+                                fc 8333)))
              '(simple-array (unsigned-byte 8) (*)))))
       (is (= 1 (bl.net:handle-addrv2 nil v2-payload book)))
       (let ((entry (bl.net:address-book-lookup book fc 8333 :cjdns)))
@@ -582,7 +581,7 @@ zero bytes (Core SerializeV1Array), never garbage."
                  :services 1 :net :torv3
                  :ip (%av2-hex "79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f")
                  :port 8333))
-         (bytes (coerce (flexi-streams:with-output-to-sequence (s)
+         (bytes (coerce (bl.bytes:with-byte-buf (s)
                           (bl.ser:write-net-addr s onion))
                         '(simple-array (unsigned-byte 8) (*)))))
     ;; services(8) + ip(16) + port(2)
@@ -607,12 +606,12 @@ zero bytes (Core SerializeV1Array), never garbage."
     (let ((msg (bl.net::build-addr-response
                 v1-peer (list onion-pa ip-pa))))
       (is (not (null msg)))
-      (flexi-streams:with-input-from-sequence (s msg)
+      (bl.bytes:with-byte-reader (s msg)
         (let ((header (bl.ser:read-message-header s)))
           (is (string= "addr" (bl.ser:message-header-command header)))))
       ;; payload: count=1 entry only.
-      (flexi-streams:with-input-from-sequence (s (subseq msg 24))
-        (is (= 1 (bl.ser:read-compact-size s)))))
+      (bl.bytes:with-byte-reader (s (subseq msg 24))
+        (is (= 1 (bl.bytes:br-read-compact-size s)))))
     ;; addrv2 peer, onion only: a full typed addrv2 announcement.
     (let ((msg (bl.net::build-addr-response v2-peer (list onion-pa))))
       (is (not (null msg)))

@@ -34,7 +34,7 @@
     ;;          + 8(nonce) + 1+(user-agent varint+string) + 4(start-height) + 1(relay)
     (is (> (length version-bytes) 80))
     ;; Parse it back to verify round-trip
-    (let ((parsed (flexi-streams:with-input-from-sequence (stream version-bytes)
+    (let ((parsed (bl.bytes:with-byte-reader (stream version-bytes)
                     (bl.ser:read-version-message stream))))
       (is (= 70016 (bl.ser:version-message-version parsed)))
       (is (= 100 (bl.ser:version-message-start-height parsed)))

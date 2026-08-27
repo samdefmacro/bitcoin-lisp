@@ -106,7 +106,7 @@ and self-connection is undetectable while every test still passes."
     (setf (bl.net::peer-local-nonce peer) nonce)
     (let* ((payload (bl.ser:make-version-message-bytes
                      :nonce (bl.net::peer-local-nonce peer)))
-           (parsed (flexi-streams:with-input-from-sequence (s payload)
+           (parsed (bl.bytes:with-byte-reader (s payload)
                      (bl.ser:read-version-message s))))
       (is (= nonce (bl.ser::version-message-nonce parsed))
           "the nonce on the wire must be the peer's own"))))

@@ -981,7 +981,7 @@ Announce just under the limit."
     (unwind-protect
          (progn
            (let ((header-bytes
-                   (flexi-streams:with-output-to-sequence (s)
+                   (bl.bytes:with-byte-buf (s)
                      (bl.ser::write-message-header s header))))
              (write-sequence header-bytes (usocket:socket-stream attacker))
              (write-sequence (make-array 3 :element-type '(unsigned-byte 8))
@@ -1059,7 +1059,7 @@ finite, and this makes it nonexistent."
                            :command "block"
                            :payload-length (1- bl:+max-message-payload+)
                            :checksum (make-array 4 :element-type '(unsigned-byte 8))))
-                  (header-bytes (flexi-streams:with-output-to-sequence (s)
+                  (header-bytes (bl.bytes:with-byte-buf (s)
                                   (bl.ser::write-message-header
                                    s header))))
              (write-sequence header-bytes (usocket:socket-stream slow-sender))
@@ -1127,7 +1127,7 @@ consults expiry."
            ;; Peer sends its header and, a moment later, the payload — it is
            ;; never silent for long.
            (let ((header-bytes
-                   (flexi-streams:with-output-to-sequence (s)
+                   (bl.bytes:with-byte-buf (s)
                      (bl.ser::write-message-header s header))))
              (write-sequence header-bytes (usocket:socket-stream sender))
              (force-output (usocket:socket-stream sender)))
@@ -1184,7 +1184,7 @@ payload and left the connection ALIVE and permanently out of frame."
          (progn
            ;; Pass 1: header only.
            (let ((header-bytes
-                   (flexi-streams:with-output-to-sequence (s)
+                   (bl.bytes:with-byte-buf (s)
                      (bl.ser::write-message-header s header))))
              (write-sequence header-bytes (usocket:socket-stream sender))
              (force-output (usocket:socket-stream sender)))
@@ -1241,7 +1241,7 @@ node-wide peer churn. Bad magic is the opposite case and is covered below."
     (unwind-protect
          (progn
            (let ((header-bytes
-                   (flexi-streams:with-output-to-sequence (s)
+                   (bl.bytes:with-byte-buf (s)
                      (bl.ser::write-message-header s header))))
              (write-sequence header-bytes (usocket:socket-stream sender))
              (write-sequence payload (usocket:socket-stream sender))

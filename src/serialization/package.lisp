@@ -16,12 +16,12 @@
                 #:byte-buf #:make-byte-buf #:bb-data #:bb-pos
                 #:bb-write-u8 #:bb-write-u16-le #:bb-write-u32-le #:bb-write-u64-le
                 #:bb-write-i32-le #:bb-write-i64-le #:bb-write-bytes #:bb-write-varint
-                #:bb-finish
+                #:bb-write-var-bytes #:bb-write-hash256 #:bb-finish #:with-byte-buf
                 #:byte-reader #:make-byte-reader #:make-byte-reader-from
                 #:br-data #:br-pos #:br-eof-p
                 #:br-read-u8 #:br-read-u16-le #:br-read-u32-le #:br-read-u64-le
                 #:br-read-i32-le #:br-read-i64-le #:br-read-bytes
-                #:br-read-compact-size #:br-read-var-bytes)
+                #:br-read-compact-size #:br-read-var-bytes #:with-byte-reader)
   (:export
    ;; Binary primitives
    #:read-uint8
@@ -324,3 +324,6 @@
    #:read-compressed-script
    #:read-compressed-tx-out
    #:read-compressed-coin))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp.nicknames:install-package-nicknames))

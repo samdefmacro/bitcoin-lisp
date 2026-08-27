@@ -68,9 +68,9 @@ is what wedged the testnet4 node ~1800 blocks behind the chain."
 versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
   (let ((peer (make-mock-peer)))
     ;; v3 (unknown/future) ignored
-    (let ((payload (flexi-streams:with-output-to-sequence (s)
-                     (write-byte 0 s)  ; low-bandwidth
-                     (bl.ser:write-uint64-le s 3))))  ; version 3
+    (let ((payload (bl.bytes:with-byte-buf (s)
+                     (bl.bytes:bb-write-u8 s 0)  ; low-bandwidth
+                     (bl.bytes:bb-write-u64-le s 3))))  ; version 3
       (bl.net::handle-sendcmpct peer payload))
     (is (= (bl.net:peer-compact-block-version peer) 0))
     ;; v1 ignored too
@@ -358,7 +358,7 @@ passes roughly half of all nonces, so a fixed nonce would flake ~50% of runs on
         finally (return header)))
 
 (defun %cbp-payload (compact-block)
-  (flexi-streams:with-output-to-sequence (s)
+  (bl.bytes:with-byte-buf (s)
     (bl.ser:write-compact-block s compact-block)))
 
 (defun %cbp-state-with-parent (parent-hash parent-timestamp &key (status :valid))
@@ -1053,18 +1053,18 @@ which drops the coinbase witness nonce and makes every reconstructed block fail
 BIP141. It has no production caller (we parse cmpctblock, we never emit one),
 so it is a latent bug in the emitter rather than one this test can assert on."
   (let ((txs (bl.ser:bitcoin-block-transactions block)))
-    (flexi-streams:with-output-to-sequence (s)
-      (bl.ser::write-block-header
+    (bl.bytes:with-byte-buf (s)
+      (bl.ser::bb-write-block-header
        s (bl.ser:bitcoin-block-header block))
-      (bl.ser:write-uint64-le s 0)     ; short-id nonce
-      (bl.ser:write-compact-size s 0)  ; no short ids
-      (bl.ser:write-compact-size s (length txs))
+      (bl.bytes:bb-write-u64-le s 0)     ; short-id nonce
+      (bl.bytes:bb-write-varint s 0)  ; no short ids
+      (bl.bytes:bb-write-varint s (length txs))
       (dolist (tx txs)
         ;; Differential index: consecutive prefilled txs all encode as 0.
-        (bl.ser:write-compact-size s 0)
+        (bl.bytes:bb-write-varint s 0)
         (if (bl.ser:transaction-has-witness-p tx)
-            (bl.ser::write-witness-transaction s tx)
-            (bl.ser::write-transaction s tx))))))
+            (bl.bytes:bb-write-bytes s (bl.ser:serialize-witness-transaction tx))
+            (bl.bytes:bb-write-bytes s (bl.ser:serialize-transaction tx)))))))
 
 (defun %g716-block-payload (block)
   "The wire payload of a plain `block' message carrying BLOCK."
