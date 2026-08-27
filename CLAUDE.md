@@ -30,7 +30,7 @@ identities are checkout-specific, so parallel checkouts never collide.
 
 ```
 scripts/dev.sh start            # warm image in the project container
-scripts/dev.sh eval '(+ 1 2)'   # ~1 s per eval
+scripts/dev.sh eval '(+ 1 2)'   # ~0.3 s per eval
 scripts/dev.sh test :bitcoin-core-script-tests   # one fiveam suite (raw designator)
 scripts/dev.sh test-all         # full :bitcoin-lisp-tests (29k+ checks; long)
 scripts/dev.sh docs-check       # PAX transcripts (docs/manual.lisp), cold container
