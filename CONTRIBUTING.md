@@ -14,7 +14,7 @@ SBCL:
 scripts/dev.sh start                       # warm image
 scripts/dev.sh eval '(+ 1 2)'              # ~0.1s per eval
 scripts/dev.sh test :bitcoin-core-script-tests
-scripts/docker-test.sh                     # the cold battery: verification of record
+cl-workbench validation run cold-unit      # the cold battery: verification of record (docker-test.sh)
 scripts/dev.sh stop
 ```
 
@@ -32,9 +32,10 @@ needs the FASL volumes dropped).
 - **A test that can fail.** Consensus and policy changes need a case that fails
   without the fix. Where the change is about something *not* happening, include
   a positive control so the assertion cannot pass vacuously.
-- **The cold battery, green.** `scripts/docker-test.sh` is the verification of
-  record. Confirm the check count is in the expected range (~32,000) as well as
-  the exit code — a battery that aborts early can otherwise look like a pass.
+- **The cold battery, green.** `cl-workbench validation run cold-unit`
+  (`scripts/docker-test.sh`) is the verification of record. Confirm the check
+  count is in the expected range (~32,000) as well as the exit code — a battery
+  that aborts early can otherwise look like a pass.
 - **One logical change per pull request**, with a commit message that explains
   *why*, not just what.
 
