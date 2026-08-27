@@ -652,7 +652,7 @@ byte-buf; the stream codecs and interop's private buffer only lose call sites."
     ("src/networking/" . 4)
     ("src/node.lisp" . 36)
     ("src/rpc/" . 14)
-    ("src/serialization/" . 45)
+    ("src/serialization/" . 49)   ; 4 are macroexpansion-time errors in message-macro.lisp
     ("src/storage/" . 16)
     ("src/util/" . 6)
     ("src/validation/" . 3)

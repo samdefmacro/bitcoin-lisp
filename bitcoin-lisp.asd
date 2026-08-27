@@ -69,6 +69,7 @@
                   :components ((:file "binary")
                                (:file "compressor")
                                (:file "types")
+                               (:file "message-macro")
                                (:file "messages")
                                (:file "psbt")))
                  (:module "storage"
