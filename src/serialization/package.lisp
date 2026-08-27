@@ -40,6 +40,9 @@
    #:write-compact-size
    #:compact-size-length
    #:script-push-data
+   ;; define-message (message-macro.lisp)
+   #:define-message
+   #:define-message-field-type
    #:read-bytes
    #:write-bytes
    #:read-var-bytes

@@ -18,13 +18,15 @@
 (defconstant +command-size+ 12)
 (defconstant +header-size+ 24)  ; 4 + 12 + 4 + 4
 
-(defstruct message-header
-  "P2P message header."
-  (magic (copy-seq *network-magic*) :type (simple-array (unsigned-byte 8) (4)))
-  (command "" :type string)
-  (payload-length 0 :type (unsigned-byte 32))
-  (checksum (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)
-            :type (simple-array (unsigned-byte 8) (4))))
+(define-message message-header
+    (:documentation "P2P message header (Core CMessageHeader).")
+  (magic (:bytes 4) :default (copy-seq *network-magic*))
+  ;; 12 NUL-padded bytes on the wire, a string in the struct
+  (command :custom :slot-type string
+           :read (bytes-to-command (br-read-bytes br +command-size+))
+           :write (bb-write-bytes bb (command-to-bytes value)))
+  (payload-length :u32)
+  (checksum (:bytes 4)))
 
 (defun command-to-bytes (command)
   "Convert command string to 12-byte null-padded array."
@@ -42,24 +44,6 @@
   "Compute message checksum (first 4 bytes of Hash256)."
   (let ((hash (bl.crypto:hash256 payload)))
     (subseq hash 0 4)))
-
-(defun read-message-header (stream)
-  "Read a message header from STREAM."
-  (let ((magic (br-read-bytes stream 4))
-        (command-bytes (br-read-bytes stream +command-size+))
-        (payload-length (br-read-u32-le stream))
-        (checksum (br-read-bytes stream 4)))
-    (make-message-header :magic magic
-                         :command (bytes-to-command command-bytes)
-                         :payload-length payload-length
-                         :checksum checksum)))
-
-(defun write-message-header (stream header)
-  "Write a message header to STREAM."
-  (bb-write-bytes stream (message-header-magic header))
-  (bb-write-bytes stream (command-to-bytes (message-header-command header)))
-  (bb-write-u32-le stream (message-header-payload-length header))
-  (bb-write-bytes stream (message-header-checksum header)))
 
 ;;;; Network address structure
 
@@ -208,56 +192,22 @@ reach."
 (defconstant +node-p2p-v2+ (ash 1 11))            ; BIP 324: v2 transport support
 (defconstant +node-compact-filters+ (ash 1 6))   ; BIP 157/158: serves cfilters
 
-(defstruct version-message
-  "Version message payload."
-  (version +protocol-version+ :type (signed-byte 32))
-  (services +node-network+ :type (unsigned-byte 64))
-  (timestamp 0 :type (signed-byte 64))
-  (addr-recv (make-net-addr) :type net-addr)
-  (addr-from (make-net-addr) :type net-addr)
-  (nonce 0 :type (unsigned-byte 64))
-  (user-agent (format-user-agent nil) :type string)
-  (start-height 0 :type (signed-byte 32))
-  (relay t :type boolean))
-
-(defun read-version-message (stream)
-  "Read a version message payload from STREAM."
-  (let* ((version (br-read-i32-le stream))
-         (services (br-read-u64-le stream))
-         (timestamp (br-read-i64-le stream))
-         (addr-recv (read-net-addr stream))
-         (addr-from (read-net-addr stream))
-         (nonce (br-read-u64-le stream))
-         (user-agent-bytes (br-read-var-bytes stream))
-         (user-agent (map 'string #'code-char user-agent-bytes))
-         (start-height (br-read-i32-le stream))
-         ;; relay flag may not be present in older versions
-         (relay (if (> version 70001)
-                    (= (if (br-eof-p stream) 1 (br-read-u8 stream)) 1)
-                    t)))
-    (make-version-message :version version
-                          :services services
-                          :timestamp timestamp
-                          :addr-recv addr-recv
-                          :addr-from addr-from
-                          :nonce nonce
-                          :user-agent user-agent
-                          :start-height start-height
-                          :relay relay)))
-
-(defun write-version-message (stream msg)
-  "Write a version message payload to STREAM."
-  (bb-write-i32-le stream (version-message-version msg))
-  (bb-write-u64-le stream (version-message-services msg))
-  (bb-write-i64-le stream (version-message-timestamp msg))
-  (write-net-addr stream (version-message-addr-recv msg))
-  (write-net-addr stream (version-message-addr-from msg))
-  (bb-write-u64-le stream (version-message-nonce msg))
-  (let ((ua-bytes (map '(vector (unsigned-byte 8)) #'char-code
-                       (version-message-user-agent msg))))
-    (bb-write-var-bytes stream ua-bytes))
-  (bb-write-i32-le stream (version-message-start-height msg))
-  (bb-write-u8 stream (if (version-message-relay msg) 1 0)))
+(define-message version-message
+    (:documentation "Version message payload (Core protocol.h / net_processing.cpp
+PushNodeVersion).")
+  (version :i32 :default +protocol-version+)
+  (services :u64 :default +node-network+)
+  (timestamp :i64)
+  (addr-recv (:struct net-addr) :default (make-net-addr))
+  (addr-from (:struct net-addr) :default (make-net-addr))
+  (nonce :u64)
+  (user-agent :var-string :default (format-user-agent nil))
+  (start-height :i32)
+  ;; relay flag may not be present in older versions (BIP 37): absent means T
+  (relay :bool :default t
+         :read (if (> version 70001)
+                   (= (if (br-eof-p br) 1 (br-read-u8 br)) 1)
+                   t)))
 
 ;;;; Inventory vector
 
@@ -273,21 +223,10 @@ reach."
 (defconstant +inv-type-witness-tx+ (logior +inv-type-tx+ (ash 1 30)))
 (defconstant +inv-type-witness-block+ (logior +inv-type-block+ (ash 1 30)))
 
-(defstruct inv-vector
-  "Inventory vector - identifies an object (transaction or block)."
-  (type +inv-type-tx+ :type (unsigned-byte 32))
-  (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
-        :type (simple-array (unsigned-byte 8) (32))))
-
-(defun read-inv-vector (stream)
-  "Read an inventory vector from STREAM."
-  (make-inv-vector :type (br-read-u32-le stream)
-                   :hash (br-read-bytes stream 32)))
-
-(defun write-inv-vector (stream inv)
-  "Write an inventory vector to STREAM."
-  (bb-write-u32-le stream (inv-vector-type inv))
-  (bb-write-hash256 stream (inv-vector-hash inv)))
+(define-message inv-vector
+    (:documentation "Inventory vector - identifies an object (transaction or block).")
+  (type :u32 :default +inv-type-tx+)
+  (hash :hash256))
 
 ;;;; Generic message serialization
 
@@ -599,26 +538,62 @@ reads instead of Gray-stream input dispatch."
   (transaction nil))
 
 ;;; Compact block (HeaderAndShortIDs)
-(defstruct compact-block
-  "BIP 152 compact block (HeaderAndShortIDs)."
-  (header nil)                        ; Block header
-  (nonce 0 :type (unsigned-byte 64))  ; Random nonce for short ID generation
-  (short-ids '() :type list)          ; List of 6-byte short txids (as integers)
-  (prefilled-txs '() :type list))     ; List of prefilled-tx structs
+(define-message-field-type :short-txid (unsigned-byte 48)
+  (read-short-txid br) (write-short-txid bb value))
+
+(define-message compact-block
+    (:documentation "BIP 152 compact block (HeaderAndShortIDs).")
+  (header :block-header)
+  (nonce :u64)                            ; random nonce for short ID generation
+  (short-ids (:list :short-txid :max +max-block-tx-count+ :name "compact-block short-ids"))
+  ;; Prefilled transactions carry DIFFERENTIAL indexes (each index is the gap
+  ;; from the previous absolute index, minus one) and, per BIP152 v2, are
+  ;; serialized WITH witness (Core PrefilledTransaction, blockencodings.h:80):
+  ;; the one transaction we ever prefill is the coinbase, whose witness
+  ;; carries the BIP141 reserved value, and emitting it stripped makes every
+  ;; reconstruction fail bad-witness-nonce-size. br-read-transaction
+  ;; auto-detects the BIP144 marker, so the reading side is symmetric.
+  (prefilled-txs :custom :slot-type list
+    :read (let ((last-index -1))
+            (loop repeat (br-read-bounded-count br +max-block-tx-count+ "compact-block prefilled")
+                  collect (let* ((diff-index (br-read-compact-size br))
+                                 (abs-index (+ last-index diff-index 1))
+                                 (tx (br-read-transaction br)))
+                            (setf last-index abs-index)
+                            (make-prefilled-tx :index abs-index :transaction tx))))
+    :write (let ((last-index -1))
+             (bb-write-varint bb (length value))
+             (dolist (ptx value)
+               (let ((abs-index (prefilled-tx-index ptx)))
+                 (bb-write-varint bb (- abs-index last-index 1))
+                 (bb-write-bytes bb (serialize-witness-transaction (prefilled-tx-transaction ptx)))
+                 (setf last-index abs-index))))))
+
 
 ;;; Block transactions request (getblocktxn)
-(defstruct block-txn-request
-  "BIP 152 block transactions request."
-  (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
-              :type (simple-array (unsigned-byte 8) (32)))
-  (indexes '() :type list))  ; List of absolute indexes
+(define-message block-txn-request
+    (:documentation "BIP 152 block transactions request (getblocktxn).")
+  (block-hash :hash256)
+  ;; absolute indexes, DIFFERENTIALLY encoded on the wire (gap minus one)
+  (indexes :custom :slot-type list
+    :read (let ((last-index -1))
+            (loop repeat (br-read-bounded-count br +max-block-tx-count+ "getblocktxn indexes")
+                  collect (let ((abs-index (+ last-index (br-read-compact-size br) 1)))
+                            (setf last-index abs-index)
+                            abs-index)))
+    :write (let ((last-index -1))
+             (bb-write-varint bb (length value))
+             (dolist (idx value)
+               (bb-write-varint bb (- idx last-index 1))
+               (setf last-index idx)))))
+
 
 ;;; Block transactions response (blocktxn)
-(defstruct block-txn-response
-  "BIP 152 block transactions response."
-  (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
-              :type (simple-array (unsigned-byte 8) (32)))
-  (transactions '() :type list))  ; List of full transactions
+(define-message block-txn-response
+    (:documentation "BIP 152 block transactions response (blocktxn).")
+  (block-hash :hash256)
+  (transactions (:list :transaction :max +max-block-tx-count+ :name "blocktxn transactions")))
+
 
 ;;; Read/write 6-byte short txid (little-endian)
 (defun read-short-txid (stream)
@@ -653,55 +628,7 @@ reads instead of Gray-stream input dispatch."
     (serialize-message "sendcmpct" payload)))
 
 ;;; Read compact block
-(defun read-compact-block (stream)
-  "Read a compact block (HeaderAndShortIDs) from STREAM."
-  (let* ((header (br-read-block-header stream))
-         (nonce (br-read-u64-le stream))
-         (shortids-count (br-read-bounded-count stream +max-block-tx-count+ "compact-block short-ids"))
-         (short-ids (loop repeat shortids-count
-                          collect (read-short-txid stream)))
-         (prefilled-count (br-read-bounded-count stream +max-block-tx-count+ "compact-block prefilled"))
-         (prefilled-txs '())
-         (last-index -1))
-    ;; Read prefilled transactions with differential index encoding
-    (dotimes (i prefilled-count)
-      (let* ((diff-index (br-read-compact-size stream))
-             (abs-index (+ last-index diff-index 1))
-             (tx (br-read-transaction stream)))
-        (push (make-prefilled-tx :index abs-index :transaction tx)
-              prefilled-txs)
-        (setf last-index abs-index)))
-    (make-compact-block :header header
-                        :nonce nonce
-                        :short-ids short-ids
-                        :prefilled-txs (nreverse prefilled-txs))))
-
 ;;; Write compact block
-(defun write-compact-block (stream cb)
-  "Write a compact block to STREAM."
-  (bb-write-block-header stream (compact-block-header cb))
-  (bb-write-u64-le stream (compact-block-nonce cb))
-  (bb-write-varint stream (length (compact-block-short-ids cb)))
-  (dolist (sid (compact-block-short-ids cb))
-    (write-short-txid stream sid))
-  (let ((prefilled (compact-block-prefilled-txs cb)))
-    (bb-write-varint stream (length prefilled))
-    (let ((last-index -1))
-      (dolist (ptx prefilled)
-        (let ((abs-index (prefilled-tx-index ptx)))
-          ;; Write differential index
-          (bb-write-varint stream (- abs-index last-index 1))
-          ;; WITNESS serialization: BIP152 v2 prefilled transactions are
-          ;; TX_WITH_WITNESS (Core PrefilledTransaction, blockencodings.h:80),
-          ;; and the one transaction we ever prefill is the coinbase, whose
-          ;; witness carries the BIP141 reserved value. Emitting it stripped
-          ;; makes every reconstruction fail bad-witness-nonce-size — the
-          ;; witness-stripped-block wedge this project has already hit once.
-          ;; (br-read-transaction auto-detects the BIP144 marker, so the reading
-          ;; side needed no change.)
-          (bb-write-bytes stream (serialize-witness-transaction (prefilled-tx-transaction ptx)))
-          (setf last-index abs-index))))))
-
 (defun build-compact-block (block &key (nonce (random (expt 2 64))))
   "BLOCK as a BIP152 HeaderAndShortIDs (Core CBlockHeaderAndShortTxIDs,
 blockencodings.cpp:17-38): the header, a nonce, the coinbase prefilled at index
@@ -740,32 +667,7 @@ the header bytes and the nonce. Version 2, so the ids are over WTXIDs (BIP152
     (read-compact-block stream)))
 
 ;;; Read block transactions request
-(defun read-block-txn-request (stream)
-  "Read a block transactions request (getblocktxn) from STREAM."
-  (let* ((block-hash (br-read-bytes stream 32))
-         (count (br-read-bounded-count stream +max-block-tx-count+ "getblocktxn indexes"))
-         (indexes '())
-         (last-index -1))
-    ;; Read differentially encoded indexes
-    (dotimes (i count)
-      (let* ((diff (br-read-compact-size stream))
-             (abs-index (+ last-index diff 1)))
-        (push abs-index indexes)
-        (setf last-index abs-index)))
-    (make-block-txn-request :block-hash block-hash
-                            :indexes (nreverse indexes))))
-
 ;;; Write block transactions request
-(defun write-block-txn-request (stream req)
-  "Write a block transactions request to STREAM."
-  (bb-write-hash256 stream (block-txn-request-block-hash req))
-  (let ((indexes (block-txn-request-indexes req)))
-    (bb-write-varint stream (length indexes))
-    (let ((last-index -1))
-      (dolist (idx indexes)
-        (bb-write-varint stream (- idx last-index 1))
-        (setf last-index idx)))))
-
 ;;; Make getblocktxn message
 (defun make-getblocktxn-message (block-hash indexes)
   "Create a getblocktxn message.
@@ -785,23 +687,7 @@ the header bytes and the nonce. Version 2, so the ids are over WTXIDs (BIP152
     (read-block-txn-request stream)))
 
 ;;; Read block transactions response
-(defun read-block-txn-response (stream)
-  "Read a block transactions response (blocktxn) from STREAM."
-  (let* ((block-hash (br-read-bytes stream 32))
-         (count (br-read-bounded-count stream +max-block-tx-count+ "blocktxn transactions"))
-         (txs (loop repeat count collect (br-read-transaction stream))))
-    (make-block-txn-response :block-hash block-hash
-                             :transactions txs)))
-
 ;;; Write block transactions response
-(defun write-block-txn-response (stream resp)
-  "Write a block transactions response to STREAM."
-  (bb-write-hash256 stream (block-txn-response-block-hash resp))
-  (let ((txs (block-txn-response-transactions resp)))
-    (bb-write-varint stream (length txs))
-    (dolist (tx txs)
-      (bb-write-bytes stream (serialize-transaction tx)))))
-
 ;;; Parse blocktxn payload
 (defun parse-blocktxn-payload (payload)
   "Parse a blocktxn message payload."
