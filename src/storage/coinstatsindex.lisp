@@ -39,7 +39,7 @@
 (defmethod index-set-best ((index coinstatsindex) block-hash height)
   (coinstatsindex-set-best index height block-hash))
 (defmethod index-clear-best ((index coinstatsindex)) (coinstatsindex-clear-best index))
-;; index-write-block for the coinstatsindex lives in src/node.lisp: the block
+;; index-write-block for the coinstatsindex lives in src/node/indexes.lisp: the block
 ;; subsidy it folds in is consensus (validation), which loads after storage.
 
 (defstruct coinstats

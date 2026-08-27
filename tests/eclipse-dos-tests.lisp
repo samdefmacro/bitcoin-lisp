@@ -1975,9 +1975,7 @@ nAttempts is addrman's entire quality signal: without it selection cannot age
 out dead addresses, the feeler that exists to prove the tried table can never
 mark anything bad, and we re-dial and re-gossip corpses. Asserted structurally,
 because the alternative is standing up four live dials in a unit test."
-  (let ((src (uiop:read-file-string
-              (merge-pathnames "src/node.lisp"
-                               (asdf:system-source-directory :bitcoin-lisp)))))
+  (let ((src (%node-source-text)))
     (is (search "%record-dial-attempt" src) "the recorder must exist")
     ;; One definition plus one call per dial path.
     (is (>= (length (bl.tests::%count-substring "%record-dial-attempt" src)) 4)

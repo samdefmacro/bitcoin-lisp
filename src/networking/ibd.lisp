@@ -2200,9 +2200,9 @@ Asking a peer for headers here returns zero and costs a full round trip."
     ;; recurred 2026-05-24 because PR #73 wired the reap only into the
     ;; block-download loop). Pump every peer's readable socket once per
     ;; run-ibd invocation — i.e. once per outer 30s sync poll
-    ;; (node.lisp:454-462) — so a dead connection surfaces (zero-progress
+    ;; (node/state.lisp) — so a dead connection surfaces (zero-progress
     ;; read flips connection-connected) and gets reaped; the subsequent
-    ;; replace-disconnected-peers (node.lisp) then refills the slot. Mirrors
+    ;; replace-disconnected-peers (node/peers.lisp) then refills the slot. Mirrors
     ;; Bitcoin Core's SocketHandlerConnected running on every event-loop
     ;; pass, not only during block download (net.cpp:2204).
     (dolist (peer peers)
@@ -2425,7 +2425,7 @@ chain is useless to us, not malicious."
 ;;;; race — the peer worth keeping.
 ;;;;
 ;;;; Lives here rather than in peer.lisp because the release condition needs
-;;;; the in-flight table, and not in node.lisp because that loads later still
+;;;; the in-flight table, and not in src/node/ because that loads later still
 ;;;; and is where the sweep is driven from.
 
 (defconstant +minimum-connect-time-seconds+ 30
@@ -2562,7 +2562,7 @@ conflation replace-disconnected-peers already documents on the dialing side of
 the same two pools.
 
 The targets are arguments rather than reads: the full-relay one is node-scoped
-(node-max-peers, raised by one while the tip looks stale) and node.lisp loads
+(node-max-peers, raised by one while the tip looks stale) and src/node/ loads
 after this file."
   (let ((evicted '()))
     (flet ((live-count (type)

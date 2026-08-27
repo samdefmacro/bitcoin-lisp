@@ -6,7 +6,7 @@
 ;;; -- each keep a LevelDB, a best-block marker, a connect-time write, a
 ;;; disconnect-time erase and a startup catch-up, and until this file each
 ;;; re-implemented that skeleton, with a third and fourth copy of the
-;;; catch-up living in node.lisp. BASE-INDEX is the shared state and the
+;;; catch-up living in node/indexes.lisp. BASE-INDEX is the shared state and the
 ;;; generic functions below are the protocol the node drives them through:
 ;;; one catch-up driver, one connect hook, one disconnect hook, whatever the
 ;;; number of indexes. Adding an index is its file plus its methods.

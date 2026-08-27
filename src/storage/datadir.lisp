@@ -22,7 +22,7 @@
 ;;;; The alternative, adopting Core's layout unconditionally, would present an
 ;;;; EMPTY datadir to a node that has one: on mainnet that means discarding a
 ;;;; synced chain and starting IBD from genesis. The same reasoning already
-;;;; governs the network-subdirectory choice in node.lisp.
+;;;; governs the network-subdirectory choice in node/datadir.lisp.
 
 (defun %dir-has-content-p (path)
   "T when PATH names a directory that actually holds something.

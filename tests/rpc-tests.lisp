@@ -3057,7 +3057,7 @@ onto the node clock:
     ;; Not mockable: these three keep it.
     (is (search "(get-universal-time)" (src "src/mempool/fee-estimator.lisp"))
         "the fee-estimates file age moved onto the mocked clock; its mtime did not")
-    (let ((node (src "src/node.lisp")))
+    (let ((node (%node-source-text)))
       (is (search "(ash (get-universal-time) 32)" node)
           "RNG seeding moved onto the mocked clock, making the seed predictable"))
     (let ((ibd (src "src/networking/ibd.lisp")))

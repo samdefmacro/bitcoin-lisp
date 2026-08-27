@@ -605,7 +605,7 @@ to make on purpose, so the set is pinned."
   "Above this a definition counts against +LONGISH-FUNCTION-CEILING+.")
 
 (defparameter +long-function-baseline+
-  '(("start-node" . 1227)                        ; node.lisp
+  '(("start-node" . 1227)                        ; node/init.lisp
     ("perform-reorg" . 465)                      ; validation/block.lisp
     ("%create-transaction-internal" . 442)       ; rpc/wallet-spend.lisp
     ("validate-transaction-for-mempool" . 358)   ; validation/transaction.lisp
@@ -714,7 +714,7 @@ byte-buf; the stream codecs and interop's private buffer only lose call sites."
     ("src/mempool/" . 7)
     ("src/mining/" . 1)
     ("src/networking/" . 4)
-    ("src/node.lisp" . 36)
+    ("src/node/" . 36)
     ("src/rpc/" . 14)
     ("src/serialization/" . 49)   ; 4 are macroexpansion-time errors in message-macro.lisp
     ("src/storage/" . 16)
@@ -767,8 +767,8 @@ list behind."
   "The load position of the module that owns PACKAGE: bitcoin-lisp.NAME and
 bitcoin-lisp.NAME.sub belong to src/NAME/. The top package BITCOIN-LISP is
 placed at src/package.lisp, the last of the package files and still before
-any code -- its files span the whole load (logging.lisp is first, node.lisp
-last), so a reference INTO it is never counted as upward. That is a blind
+any code -- its files span the whole load (logging.lisp is first, the node/
+module last), so a reference INTO it is never counted as upward. That is a blind
 spot this test accepts, not a claim."
   (if (string= package "bitcoin-lisp")
       (cdr (assoc "src/package.lisp" order :test #'string=))

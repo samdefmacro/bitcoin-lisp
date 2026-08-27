@@ -275,7 +275,7 @@ dependencies and prioritisation deltas intact."
              (declare (ignore residual))
              (is-true ok)
              ;; Replay into a fresh mempool the way load-mempool-from-disk
-             ;; does (src/node.lisp): delta first, then the acceptance tail.
+             ;; does (src/node/mempool-persist.lisp): delta first, then the acceptance tail.
              (let* ((mempool2 (bl.mp:make-mempool))
                     (graph2 (%shp-graph mempool2)))
                (loop for (tx entry-time delta) in entries

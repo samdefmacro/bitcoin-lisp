@@ -1979,9 +1979,7 @@ init-node, which runs after apply-config-globals -- so on a mainnet command
 line the check compared against the default network and never fired. Pinned
 on the source, as the alternative is starting a node: the setf must precede
 the apply inside start-node-from-args."
-  (let* ((src (uiop:read-file-string
-               (merge-pathnames "src/node.lisp"
-                                (asdf:system-source-directory :bitcoin-lisp))))
+  (let* ((src (%node-source-text))
          (start (search "(defun start-node-from-args" src))
          (end (search "(defun " src :start2 (1+ start)))
          (body (subseq src start end))

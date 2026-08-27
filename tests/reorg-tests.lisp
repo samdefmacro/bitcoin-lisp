@@ -2949,7 +2949,7 @@ The reorg must refuse and reconsiderblock report :reorg-failed."
 ;;;; rolling back (minutes of work that is itself interruptible).
 ;;;;
 ;;;; The tests interrupt by binding bl:*interrupt-check* — the same seam
-;;;; node.lisp installs the real stop predicate into — and choose WHERE it
+;;;; node/shutdown.lisp installs the real stop predicate into — and choose WHERE it
 ;;;; fires with a predicate over observable state (UTXO count / coins pointer /
 ;;;; tip) rather than a call counter, so an extra or missing check cannot silently
 ;;;; move the assertion.
@@ -2986,7 +2986,7 @@ post-round-trip one the UTXO set is actually keyed by."
 (test interrupt-check-is-wired-to-the-node-stop-flag
   "The seam must actually be INSTALLED. perform-reorg polls
 bl:interrupt-requested-p, and every truncation test below binds its own
-predicate into *interrupt-check* — so if node.lisp ever stopped installing the
+predicate into *interrupt-check* — so if node/shutdown.lisp ever stopped installing the
 real one, reorgs would silently become uninterruptible again and every other test
 here would stay green."
   (is (null (bl:interrupt-requested-p))

@@ -121,11 +121,7 @@ asserts nothing about the root")
               (bl.store::chain-state-block-index seeded))))
     ;; And the node seeds genesis BEFORE it reindexes — the ordering is the
     ;; whole fix, so assert it structurally rather than trusting the diff.
-    (let ((src (with-open-file (in (merge-pathnames
-                                    "src/node.lisp"
-                                    (asdf:system-source-directory :bitcoin-lisp)))
-                 (let ((text (make-string (file-length in))))
-                   (subseq text 0 (read-sequence text in))))))
+    (let ((src (%node-source-text)))
       (let ((genesis-at (search "(%ensure-genesis-index-entry network)" src))
             (reindex-at (search "Reindex: rebuilding the block index" src)))
         (is-true genesis-at "the genesis seeding call is gone")
@@ -150,8 +146,7 @@ cannot be repeated as a refactor."
                 ;; Read the node's undo-init form back out of the source, since
                 ;; the property is about WHICH PATH the call site passes and
                 ;; there is no runtime handle on that.
-                (with-open-file (in (merge-pathnames "src/node.lisp"
-                                                     (asdf:system-source-directory :bitcoin-lisp)))
+                (with-input-from-string (in (%node-source-text))
                   (loop for line = (read-line in nil) while line
                         do (when (search "(initialize-undo-storage" line)
                              (write-line line out))
@@ -2115,9 +2110,7 @@ purpose of the option. Observed live on testnet4 at height 149088.
 Asserted structurally because the alternative is standing up a full node in a
 unit test. The property that matters is that start-node actually calls it —
 a complete, correct, unreachable function is exactly the shape of this bug."
-  (let ((src (uiop:read-file-string
-              (merge-pathnames "src/node.lisp"
-                               (asdf:system-source-directory :bitcoin-lisp)))))
+  (let ((src (%node-source-text)))
     (is (search "(catch-up-index *node* (node-tx-index *node*))" src)
         "start-node must catch the txindex up over stored blocks, or -txindex
          indexes nothing historical")))
@@ -2128,9 +2121,7 @@ catch-up caller was the assumeutxo-promotion rebind, so an existing node that
 turned the flag on indexed nothing historical and gettxspendingprevout knew
 only spends connected after the restart. Core starts every index's background
 sync from init (init.cpp StartIndexBackgroundSync)."
-  (let ((src (uiop:read-file-string
-              (merge-pathnames "src/node.lisp"
-                               (asdf:system-source-directory :bitcoin-lisp)))))
+  (let ((src (%node-source-text)))
     (is (search "(catch-up-index *node* (node-txospenderindex *node*))" src)
         "start-node must catch the txospenderindex up over stored blocks")))
 

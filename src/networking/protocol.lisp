@@ -2469,7 +2469,7 @@ instant is not predictable.")
 (network, local listening socket) — H(RANDOMIZER_ID_NETWORKKEY, netclass,
 bind addr, bind port), net.cpp:1832-1836. We key by network ALONE. That is a
 deliberate simplification, not byte parity: our two listeners (clearnet and
-onion, node.lisp) already map to distinct network keywords through
+onion, node/listen.lisp) already map to distinct network keywords through
 peer-connected-through-network, so the multi-bind case Core's key exists to
 separate is covered. Two binds on the SAME network would share a cache here.")
 

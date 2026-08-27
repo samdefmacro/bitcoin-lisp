@@ -150,7 +150,33 @@
                  ;; The option table: after every module whose specials its
                  ;; :global / :apply rows name, before the node that reads it.
                  (:file "config-options")
-                 (:file "node"))))
+                 ;; The node itself (Core init.cpp / bitcoind.cpp), one file
+                 ;; per concern; init.lisp (start-node and the executable's
+                 ;; entry point) last, since it drives everything above it.
+                 (:module "node"
+                  :serial t
+                  :components (
+                               (:file "params")
+                               (:file "state")
+                               (:file "notify")
+                               (:file "datadir")
+                               (:file "rpc-config")
+                               (:file "logging")
+                               (:file "entropy")
+                               (:file "housekeeping")
+                               (:file "eviction")
+                               (:file "recovery")
+                               (:file "listen")
+                               (:file "mempool-persist")
+                               (:file "assumeutxo")
+                               (:file "shutdown")
+                               (:file "indexes")
+                               (:file "flush")
+                               (:file "reindex")
+                               (:file "wallet-hooks")
+                               (:file "peers")
+                               (:file "sync")
+                               (:file "init"))))))
   :in-order-to ((test-op (test-op "bitcoin-lisp/tests"))))
 
 (defsystem "bitcoin-lisp/tests"

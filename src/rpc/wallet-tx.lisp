@@ -24,7 +24,7 @@
 ;;;    avoid_reuse previously-spent tracking here; balance rollups, coin
 ;;;    listing, and the coins/address RPCs live in wallet-coins.lisp.
 ;;;
-;;; Delivery: the node's hardcoded hooks (node.lisp wallet-notify-*) call
+;;; Delivery: the node's hardcoded hooks (node/wallet-hooks.lisp wallet-notify-*) call
 ;;; the wallets-* fan-outs below synchronously from connect-block /
 ;;; perform-reorg / mempool-add / mempool-remove, where Core delivers the
 ;;; same events asynchronously on the scheduler thread. Lock order:
@@ -1176,7 +1176,7 @@ single-hash fallback when the entry is unknown."
            (bl.ser:bitcoin-block-header block))
           (wallet-last-block-height wallet) (1- height))))
 
-;;; --- Manager fan-outs (called by node.lisp's wallet-notify-* hooks) ---
+;;; --- Manager fan-outs (called by node/wallet-hooks.lisp's wallet-notify-* hooks) ---
 
 (defun %manager-wallets (manager)
   "The loaded wallets, in load order — the manager's immutable lock-free

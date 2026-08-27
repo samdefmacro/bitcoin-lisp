@@ -169,7 +169,7 @@
    #:index-block-disconnected
    #:node-indexes
    #:catch-up-index
-   ;; Wallet chain-tracking hooks (wallet P2; defined in node.lisp, called
+   ;; Wallet chain-tracking hooks (wallet P2; defined in node/wallet-hooks.lisp, called
    ;; from connect-block / perform-reorg / the mempool like the index hooks)
    #:wallet-notify-block-connected
    #:wallet-notify-block-disconnected
