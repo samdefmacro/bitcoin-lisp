@@ -47,6 +47,7 @@
                                (:file "chainparams")
                                (:file "context")))
                  (:file "logging")
+                 (:file "config-options")
                  (:file "config")
                  (:file "zmq")
                  (:module "coalton"

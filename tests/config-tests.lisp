@@ -681,11 +681,10 @@ rpcallowip=10.0.0.0/8~%rpcallowip=::/0~%"))))
     (is-false (member :rpc-auth plist))
     (is-false (member :rpc-allow-ip plist)))
   ;; and both are known options, so neither trips the unknown-option check
-  (is-true (member "rpcauth" bl::*known-config-options* :test #'string=))
-  (is-true (member "rpcallowip" bl::*known-config-options* :test #'string=))
-  (is-true (member "rpcauth" bl::*repeatable-config-options* :test #'string=))
-  (is-true (member "rpcallowip" bl::*repeatable-config-options*
-                   :test #'string=)))
+  (is-true (bl::known-config-option-p "rpcauth"))
+  (is-true (bl::known-config-option-p "rpcallowip"))
+  (is-true (bl::config-option-repeatable-p "rpcauth"))
+  (is-true (bl::config-option-repeatable-p "rpcallowip")))
 
 ;;; --- Core command-line compatibility (track B P0) ---
 
@@ -1403,8 +1402,7 @@ one Core's ThreadOpenConnections would have taken."
       (setf bl:*dns-seed-enabled* saved)))
   (is-true (bl::known-config-option-p "connect"))
   (is-false (bl::core-only-option-p "connect"))
-  (is-true (member "connect" bl::*repeatable-config-options*
-                   :test #'string=)))
+  (is-true (bl::config-option-repeatable-p "connect")))
 
 (test whitelist-and-whitebind-reach-the-node
   "-whitelist / -whitebind (Core init.cpp + net_permissions.cpp). Both are
@@ -1422,7 +1420,7 @@ Core's is: a typo'd range grants nothing and the operator never finds out."
     (is-true (bl::known-config-option-p name) "~A unknown" name)
     (is-false (bl::core-only-option-p name) "~A still ignored" name))
   (dolist (name '("whitelist" "whitebind"))
-    (is-true (member name bl::*repeatable-config-options* :test #'string=)
+    (is-true (bl::config-option-repeatable-p name)
              "~A is not repeatable" name))
   (let ((saved-relay bl.net::*whitelist-relay*)
         (saved-force bl.net::*whitelist-force-relay*))
@@ -1451,8 +1449,7 @@ become a second -addnode."
               "-forcednsseed=1")
             nil)))
     (is (equal '("1.2.3.4" "5.6.7.8:1234") (getf p :seednode))))
-  (is-true (member "seednode" bl::*repeatable-config-options*
-                   :test #'string=))
+  (is-true (bl::config-option-repeatable-p "seednode"))
   (let ((saved bl::*force-dns-seed*))
     (unwind-protect
          (progn
@@ -1962,3 +1959,14 @@ imported nothing."
   (is-false (bl::core-only-option-p "loadblock")
             "-loadblock is implemented now and must not be reported as ignored")
   (is-true (bl:known-config-option-p "loadblock")))
+
+(test define-option-rejects-a-contradictory-row
+  "The two consistency checks DEFINE-OPTION makes at macroexpansion time
+must actually fire: a :collect option that is not :repeatable would be
+collected from an alist that kept only its last occurrence, and a :key
+option without a :type has no parser in the scalar scan."
+  (signals bl::option-definition-error
+    (macroexpand-1 '(bl::define-option "probe" :collect :probe)))
+  (signals bl::option-definition-error
+    (macroexpand-1 '(bl::define-option "probe" :key :probe)))
+  (finishes (macroexpand-1 '(bl::define-option "probe" :key :probe :type :bool))))
