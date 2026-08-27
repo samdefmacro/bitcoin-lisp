@@ -449,8 +449,10 @@ baseline can follow it."
 ;;; --- top-level definitions ------------------------------------------------
 
 (defparameter +definition-prefixes+
-  '((:defun . "(defun ") (:defmacro . "(defmacro "))
-  "A definition is a line that starts with one of these. Coalton's DEFINEs sit
+  '((:defun . "(defun ") (:defmacro . "(defmacro ") (:defun . "(define-rpc "))
+  "A definition is a line that starts with one of these. A DEFINE-RPC form is
+the DEFUN of its handler (named rpc-<method> here, as the function is), so
+the RPC handlers stay on the long-function ratchet. Coalton's DEFINEs sit
 inside COALTON-TOPLEVEL at indentation 2 and are therefore not counted, on
 purpose: the interpreter is a deliberate port of one Core file.")
 
@@ -459,15 +461,22 @@ purpose: the interpreter is a deliberate port of one Core file.")
 
 (defun %definition-name (line prefix)
   "The name that follows PREFIX on LINE, downcased. A (setf foo) name is kept
-whole, parentheses included."
+whole, parentheses included; a DEFINE-RPC's method string (or the first of
+its alias list) becomes rpc-<method>, the handler's function name."
   (let* ((start (position #\Space line :start (length prefix) :test-not #'char=))
          (end (cond ((null start) nil)
                     ((char= (char line start) #\()
                      (let ((close (position #\) line :start start)))
                        (and close (1+ close))))
                     (t (position-if (lambda (c) (member c '(#\Space #\( #\))))
-                                    line :start start)))))
-    (and start (string-downcase (subseq line start end)))))
+                                    line :start start))))
+         (token (and start (string-downcase (subseq line start end)))))
+    (cond ((null token) nil)
+          ((string= prefix "(define-rpc ")
+           (let* ((q (position #\" token))
+                  (q2 (and q (position #\" token :start (1+ q)))))
+             (if (and q q2) (format nil "rpc-~A" (subseq token (1+ q) q2)) token)))
+          (t token))))
 
 (defun %form-line-count (text start)
   "Lines spanned by the form beginning at character START of TEXT. Read with
@@ -559,7 +568,7 @@ thirteen init steps, PERFORM-REORG becomes DisconnectTip/ConnectTip/
 ActivateBestChainStep, and so on. The line count is pinned too, so an entry
 may shrink but not grow while it waits its turn.")
 
-(defparameter +longish-function-ceiling+ 62
+(defparameter +longish-function-ceiling+ 61
   "How many definitions may exceed +LONGISH-FUNCTION-LINES+ lines. Lower it
 when the count drops; the test says so.")
 
@@ -839,6 +848,8 @@ the measuring functions must measure a known shape correctly."
       "a setf function name must be kept whole")
   (is (string= "foo" (%definition-name "(defun foo (a b)" "(defun ")))
   (is (string= "bar" (%definition-name "(defmacro bar(x)" "(defmacro ")))
+  (is (string= "rpc-getblock" (%definition-name "(define-rpc \"getblock\" (node params)" "(define-rpc ")))
+  (is (string= "rpc-echo" (%definition-name "(define-rpc (\"echo\" \"echojson\") (node params)" "(define-rpc ")))
   (is (= 5 (%form-line-count
             (format nil "(defun f ()~%  \"doc with a line that starts like a form:~%~
 (values a b) and a paren char #\\( and a semicolon ; here\"~%  ~

@@ -29,7 +29,7 @@ matching Bitcoin Core's uint256::GetHex."
 
 ;;; --- Blockchain Query Methods ---
 
-(defun rpc-getblockchaininfo (node params)
+(define-rpc "getblockchaininfo" (node params)
   "Return blockchain state information."
   (declare (ignore params))
   (let* ((chain-state (rpc-get-chain-state node))
@@ -137,7 +137,7 @@ for a snapshot chainstate, and validated reflects its assumeutxo status."
                             chain-state)
                            :validated))))))
 
-(defun rpc-getchainstates (node params)
+(define-rpc "getchainstates" (node params)
   "Report this node's chainstate(s) (Bitcoin Core getchainstates), derived
 from the node's chainstates list in Core's order: the historical chainstate
 first (when assumeutxo background validation is in progress), the current
@@ -159,7 +159,7 @@ first (when assumeutxo background validation is in progress), the current
                         (bl.store:current-height current)))
       ("chainstates" . ,entries))))
 
-(defun rpc-getbestblockhash (node params)
+(define-rpc "getbestblockhash" (node params)
   "Return the hash of the best (tip) block."
   (declare (ignore params))
   (let* ((chain-state (rpc-get-chain-state node))
@@ -168,13 +168,13 @@ first (when assumeutxo background validation is in progress), the current
         (hash-to-hex best-hash)
         (error 'rpc-error :code +rpc-misc-error+ :message "No blocks"))))
 
-(defun rpc-getblockcount (node params)
+(define-rpc "getblockcount" (node params)
   "Return the current block height."
   (declare (ignore params))
   (let ((chain-state (rpc-get-chain-state node)))
     (bl.store:current-height chain-state)))
 
-(defun rpc-getblockhash (node params)
+(define-rpc "getblockhash" (node params)
   "Return the hash of block at given height."
   (let ((height (first params)))
     (unless (and (integerp height) (>= height 0))
@@ -241,7 +241,7 @@ different sentence saying the same thing, so no caller could match any of them."
                     :message (format nil "JSON value of type ~A is not of expected type ~A"
                                      (%json-type-name value) expected)))
 
-(defun rpc-getblock (node params)
+(define-rpc "getblock" (node params)
   "Return block data (Bitcoin Core getblock). Verbosity <= 0 (or false) returns
 the serialized block hex; 1 (or true) a JSON object with txids; 2 the object
 with full transaction details and each transaction's fee; 3 additionally the
@@ -541,7 +541,7 @@ is supplied and the script is addressable) address."
       ("n" . ,index)
       ("scriptPubKey" . ,spk-json))))
 
-(defun rpc-getblockheader (node params)
+(define-rpc "getblockheader" (node params)
   "Return block header data."
   (let ((hash-str (first params))
         (verbose (%positional-bool-or (second params) t)))
@@ -613,7 +613,7 @@ count on the entry."
                 "valid-headers"
                 "headers-only"))))))
 
-(defun rpc-getchaintips (node params)
+(define-rpc "getchaintips" (node params)
   "Return information about all known chain tips (active and side branches)."
   (declare (ignore params))
   (let* ((chain-state (rpc-get-chain-state node))
@@ -687,7 +687,7 @@ CCoinsViewMemPool::GetCoin), or NIL."
              :height +mempool-coin-height+
              :coinbase nil)))))))
 
-(defun rpc-gettxout (node params)
+(define-rpc "gettxout" (node params)
   "Return UTXO info for given outpoint (Core gettxout). PARAMS: (txid n
 [include_mempool]). With include_mempool (the default), an outpoint SPENT by
 a mempool transaction reports null, and an outpoint CREATED by one is
@@ -868,7 +868,7 @@ field is optional in Core and omitted when unknown."
       (- universal bl.ser:+universal-unix-epoch-offset+)
       0))
 
-(defun rpc-getpeerinfo (node params)
+(define-rpc "getpeerinfo" (node params)
   "Return information about connected peers (Bitcoin Core getpeerinfo),
 emitting every Core field we can populate honestly. Deliberate omissions:
 mapped_as (no -asmap support).
@@ -1057,7 +1057,7 @@ whatever the cadence is."
                  (if sid (bl.crypto:bytes-to-hex sid) ""))))))
      peers)))
 
-(defun rpc-getnetworkinfo (node params)
+(define-rpc "getnetworkinfo" (node params)
   "Return network state information (Bitcoin Core getnetworkinfo)."
   (declare (ignore params))
   (let* ((network (rpc-get-network node))
@@ -1103,12 +1103,12 @@ whatever the cadence is."
       ("localaddresses" . #())
       ("warnings" . #()))))
 
-(defun rpc-getconnectioncount (node params)
+(define-rpc "getconnectioncount" (node params)
   "Return the number of connected peers."
   (declare (ignore params))
   (length (rpc-get-peers node)))
 
-(defun rpc-ping (node params)
+(define-rpc "ping" (node params)
   "Queue a ping to every connected peer (Bitcoin Core ping). The round-trip
 result later surfaces in getpeerinfo's pingtime. Returns null. send-ping is a
 no-op on a peer whose connection has dropped, and ignore-errors guards against a
@@ -1139,7 +1139,7 @@ lists every announcer's peer id (Core OrphanInfo::announcers)."
         (append base `(("hex" . ,(bl.crypto:bytes-to-hex ser))))
         base)))
 
-(defun rpc-getorphantxs (node params)
+(define-rpc "getorphantxs" (node params)
   "List the transactions in the orphan pool (Bitcoin Core getorphantxs, hidden).
 PARAMS: ([verbosity]) -- 0 (default) an array of txids, 1 an array of orphan
 detail objects, 2 the detail objects plus each transaction's raw hex."
@@ -1169,7 +1169,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
     ;; Core returns a UniValue VARR: an empty orphanage is [], not null.
     (json-array (nreverse result))))
 
-(defun rpc-getmempoolinfo (node params)
+(define-rpc "getmempoolinfo" (node params)
   "Return mempool statistics."
   (declare (ignore params))
   (let ((mempool (rpc-get-mempool node))
@@ -1224,7 +1224,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           ("fullrbf" . t)
           ("permitbaremultisig" . ,(json-bool bl:*permit-bare-multisig*))))))
 
-(defun rpc-getrawmempool (node params)
+(define-rpc "getrawmempool" (node params)
   "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t)."
   (let ((verbose (%positional-bool (first params)))
         (mempool (rpc-get-mempool node)))
@@ -1332,7 +1332,7 @@ entry), erroring if malformed or not in the mempool."
                             :message "Transaction not in mempool"))
         (values txid entry)))))
 
-(defun rpc-getmempoolentry (node params)
+(define-rpc "getmempoolentry" (node params)
   "Return mempool details for transaction TXID (Bitcoin Core getmempoolentry)."
   (let ((mempool (rpc-get-mempool node)))
     (with-node-lock (node)
@@ -1354,7 +1354,7 @@ Core's empty VARR/VOBJ ([] / {}), never null."
              txid-set)
     (if verbose (json-object result) (json-array result))))
 
-(defun rpc-getmempoolancestors (node params)
+(define-rpc "getmempoolancestors" (node params)
   "Return the in-mempool ancestors of TXID (Bitcoin Core getmempoolancestors).
 PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
   (let ((mempool (rpc-get-mempool node))
@@ -1364,7 +1364,7 @@ PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
         (declare (ignore entry))
         (%mempool-set->result mempool (bl.mp:mempool-ancestors mempool txid) verbose)))))
 
-(defun rpc-getmempooldescendants (node params)
+(define-rpc "getmempooldescendants" (node params)
   "Return the in-mempool descendants of TXID (Bitcoin Core getmempooldescendants).
 PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
   (let ((mempool (rpc-get-mempool node))
@@ -1374,7 +1374,7 @@ PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
         (declare (ignore entry))
         (%mempool-set->result mempool (bl.mp:mempool-descendants mempool txid) verbose)))))
 
-(defun rpc-getmempoolcluster (node params)
+(define-rpc "getmempoolcluster" (node params)
   "Return mempool data for the cluster containing TXID (Bitcoin Core
 getmempoolcluster, rpc/mempool.cpp:829-862 + clusterToJSON :474-506):
 clusterweight, txcount, and the cluster's chunks in mining order, each with
@@ -1408,7 +1408,7 @@ fields here are in vB (~ Core / 4)."
                                             (car c)))))
                       chunks))))))))
 
-(defun rpc-getmempoolfeeratediagram (node params)
+(define-rpc "getmempoolfeeratediagram" (node params)
   "Return the feerate diagram for the whole mempool (Bitcoin Core
 getmempoolfeeratediagram — a hidden RPC, rpc/mempool.cpp:609-650 +
 CTxMemPool::GetFeerateDiagram, txmempool.cpp:1082-1102): the cumulative
@@ -1440,7 +1440,7 @@ weight; ours is BIP141 virtual bytes (~ Core / 4)."
             (bl.mp:block-builder-finish builder)))))
     (nreverse points)))
 
-(defun rpc-gettxspendingprevout (node params)
+(define-rpc "gettxspendingprevout" (node params)
   "For each {txid, vout} outpoint in the array PARAM, report the transaction
 spending it, if any (Bitcoin Core gettxspendingprevout). Returns an array of
 {txid, vout, spendingtxid?, spendingtx?}.
@@ -1615,7 +1615,7 @@ reaches the mempool."
           do (error 'rpc-error :code +rpc-verify-error+
                                :message "Unspendable output exceeds maximum configured by user (maxburnamount)")))
 
-(defun rpc-testmempoolaccept (node params)
+(define-rpc "testmempoolaccept" (node params)
   "Dry-run mempool acceptance for one or more raw transactions (hex). Returns an
 array of {txid, wtxid, allowed, reject-reason?, vsize, fees{base}} without adding
 anything to the mempool. Each tx is checked independently against current state
@@ -1731,7 +1731,7 @@ anything to the mempool. Each tx is checked independently against current state
                                    (bl.val:tx-reject-reason-string error))))))))
              results)))))))
 
-(defun rpc-sendrawtransaction (node params)
+(define-rpc "sendrawtransaction" (node params)
   "Submit a raw transaction to the mempool AND broadcast it: on acceptance the
 txid joins the mempool's unbroadcast set and an announcement is queued to every
 relay-capable peer (Core sendrawtransaction -> BroadcastTransaction,
@@ -1863,7 +1863,7 @@ per-wtxid object. Status drives which fields are present."
                                      (bl.val:tx-reject-reason-string e)
                                      "rejected"))))))))))
 
-(defun rpc-submitpackage (node params)
+(define-rpc "submitpackage" (node params)
   "Submit a package of raw transactions (a child with its unconfirmed parents)
 to the mempool. PARAMS: (package-hex-array [maxfeerate] [maxburnamount]). The
 array is topologically sorted with the child last. Mirrors Bitcoin Core's
@@ -1966,24 +1966,24 @@ context. Returns null on success; errors otherwise."
                               :message (string-downcase (symbol-name reason))))
           nil)))))
 
-(defun rpc-invalidateblock (node params)
+(define-rpc "invalidateblock" (node params)
   "Mark a block (and its descendants) invalid and reorg the active chain away from
 it (Bitcoin Core invalidateblock). PARAMS: (blockhash). Returns null."
   (%chain-control-block node params #'bl.val:invalidate-block))
 
-(defun rpc-reconsiderblock (node params)
+(define-rpc "reconsiderblock" (node params)
   "Clear a previously-invalidated block's status and reconsider the best chain
 (Bitcoin Core reconsiderblock). PARAMS: (blockhash). Returns null."
   (%chain-control-block node params #'bl.val:reconsider-block))
 
-(defun rpc-preciousblock (node params)
+(define-rpc "preciousblock" (node params)
   "Treat a block as preferred over equal-work competitors, reorganizing to it
 (Bitcoin Core preciousblock). PARAMS: (blockhash). Returns null."
   (%chain-control-block node params #'bl.val:precious-block))
 
 ;;; --- Peer / address RPCs ---
 
-(defun rpc-getnodeaddresses (node params)
+(define-rpc "getnodeaddresses" (node params)
   "Return known peer addresses from the address book (Bitcoin Core
 getnodeaddresses). PARAMS: ([count]) — max addresses (default 1; 0 = all)."
   (let* ((count (if (integerp (first params)) (first params) 1))
@@ -2012,7 +2012,7 @@ NIL for an unroutable/empty address."
         (:ipv4 "ipv4") (:ipv6 "ipv6") (:torv3 "onion")
         (:i2p "i2p") (:cjdns "cjdns")))))
 
-(defun rpc-getaddrmaninfo (node params)
+(define-rpc "getaddrmaninfo" (node params)
   "Address-manager new/tried/total counts per network plus an all_networks
 aggregate (Bitcoin Core getaddrmaninfo). Like Core, every standard network key
 is always present (0 when empty); all_networks uses the address book's
@@ -2069,7 +2069,7 @@ none either, the second because feelers are short-lived — so they always fit."
         bl::+target-block-relay-peers+))
     (t t)))
 
-(defun rpc-addconnection (node params)
+(define-rpc "addconnection" (node params)
   "Open one outbound connection of a named type (Core addconnection,
 rpc/net.cpp). Regtest only, and for testing only: it is how the functional
 framework attaches its own P2P connections to a node.
@@ -2111,7 +2111,7 @@ capacity check runs synchronously, because that is the answer the caller needs."
       `(("address" . ,address)
         ("connection_type" . ,trimmed)))))
 
-(defun rpc-addnode (node params)
+(define-rpc "addnode" (node params)
   "Manage manually-added peers (Bitcoin Core addnode). PARAMS:
 (node command [v2transport]). COMMAND is \"add\" (remember the peer and keep it
 connected), \"remove\", or \"onetry\" (dial once now). The actual dialing is
@@ -2143,7 +2143,7 @@ transport is not implemented."
                (remove spec (bl::node-added-nodes node) :test #'string=)))))
     nil))
 
-(defun rpc-getaddednodeinfo (node params)
+(define-rpc "getaddednodeinfo" (node params)
   "Report manually-added peers and their connection state (Bitcoin Core
 getaddednodeinfo). PARAMS: ([node]) — restrict to one added node (errors if it
 was never added). Returns an array of {addednode, connected, addresses}."
@@ -2192,7 +2192,7 @@ rollback-time NetworkDisable. Returns STATE."
       (ignore-errors (bl.net:disconnect-peer peer))))
   state)
 
-(defun rpc-setnetworkactive (node params)
+(define-rpc "setnetworkactive" (node params)
   "Enable or disable all P2P network activity (Bitcoin Core setnetworkactive).
 PARAMS: (state). Disabling drops all current peers and stops new inbound/outbound
 connections until re-enabled. Returns the new state."
@@ -2201,7 +2201,7 @@ connections until re-enabled. Returns the new state."
   ;; Bare JSON boolean result (Core net.cpp:907) — false must not be null.
   (json-bool (%set-network-active node (%positional-bool (first params)))))
 
-(defun rpc-getblockfrompeer (node params)
+(define-rpc "getblockfrompeer" (node params)
   "Request block BLOCKHASH from the connected peer with id PEER-ID (Bitcoin Core
 getblockfrompeer). PARAMS: (blockhash peer_id). We must already have the header,
 the block must not already be downloaded, and the peer must be connected. Sends a
@@ -2241,7 +2241,7 @@ the cross-thread send safe."
       ;; Core returns an empty object; an empty hash-table serializes as {}.
       (make-hash-table :test 'equal))))
 
-(defun rpc-disconnectnode (node params)
+(define-rpc "disconnectnode" (node params)
   "Disconnect a connected peer by ADDRESS or by NODEID (Bitcoin Core
 disconnectnode, rpc/net.cpp:462-486). PARAMS: (address nodeid).
 
@@ -2298,7 +2298,7 @@ parameter the caller never sent."
 ;;; ephemeral discouragement filter (see record-misbehavior); these RPCs only
 ;;; touch manual bans. Addresses are matched exactly (no subnet/CIDR support).
 
-(defun rpc-setban (node params)
+(define-rpc "setban" (node params)
   "Add or remove a manual ban (Bitcoin Core setban). PARAMS:
 (address command [bantime] [absolute]). COMMAND is \"add\" or \"remove\". For add,
 BANTIME is seconds from now (default -bantime, 24h), or an absolute Unix time
@@ -2360,7 +2360,7 @@ subnet syntax is rejected as invalid. Returns null."
       (t (error 'rpc-error :code +rpc-invalid-parameter+
                            :message "command must be \"add\" or \"remove\"")))))
 
-(defun rpc-listbanned (node params)
+(define-rpc "listbanned" (node params)
   "List active manual bans (Bitcoin Core listbanned)."
   (declare (ignore node params))
   ;; Core pushes a VARR: no bans is [], not null.
@@ -2371,7 +2371,7 @@ subnet syntax is rejected as invalid. Returns null."
                                      bl.ser:+universal-unix-epoch-offset+))))
            (bl.net:list-bans))))
 
-(defun rpc-clearbanned (node params)
+(define-rpc "clearbanned" (node params)
   "Clear all manual bans (Bitcoin Core clearbanned). Returns null."
   (declare (ignore node params))
   (bl.net:clear-ban-list)
@@ -2379,7 +2379,7 @@ subnet syntax is rejected as invalid. Returns null."
 
 ;;; --- Network totals (Bitcoin Core getnettotals) ---
 
-(defun rpc-getnettotals (node params)
+(define-rpc "getnettotals" (node params)
   "Cumulative network byte totals since startup (Bitcoin Core getnettotals)."
   (declare (ignore node params))
   `(("totalbytesrecv" . ,bl.net:*total-bytes-received*)
@@ -2402,7 +2402,7 @@ subnet syntax is rejected as invalid. Returns null."
 
 ;;; --- Chain verification (Bitcoin Core verifychain) ---
 
-(defun rpc-verifychain (node params)
+(define-rpc "verifychain" (node params)
   "Re-verify the last NBLOCKS blocks from the block store (Bitcoin Core
 verifychain). PARAMS: ([checklevel] [nblocks]). At checklevel >= 1 each block is
 re-read and its merkle root + proof-of-work re-checked; level 0 only confirms the
@@ -2437,7 +2437,7 @@ block reads back. Returns T if all checks pass, NIL otherwise."
 
 ;;; --- waitfornewblock / dumptxoutset (Bitcoin Core rpc/blockchain.cpp) ---
 
-(defun rpc-waitfornewblock (node params)
+(define-rpc "waitfornewblock" (node params)
   "Wait until the chain tip changes, then return it (Bitcoin Core
 waitfornewblock). PARAMS: ([timeout-ms]) — 0 (the default) waits indefinitely.
 Returns the current tip on change, timeout, or node shutdown. Polls the tip on
@@ -2472,7 +2472,7 @@ the RPC worker thread."
     (+ (get-internal-real-time)
        (floor (* timeout-ms internal-time-units-per-second) 1000))))
 
-(defun rpc-waitforblock (node params)
+(define-rpc "waitforblock" (node params)
   "Wait until the given block hash becomes the chain tip (Bitcoin Core
 waitforblock). PARAMS: (blockhash [timeout-ms]); timeout 0 (default) waits
 indefinitely. Returns the tip on match, timeout, or node shutdown. Polls on the
@@ -2496,7 +2496,7 @@ RPC worker thread."
               do (sleep 0.25))
         (%tip-result chain-state)))))
 
-(defun rpc-waitforblockheight (node params)
+(define-rpc "waitforblockheight" (node params)
   "Wait until the chain tip reaches at least HEIGHT (Bitcoin Core
 waitforblockheight). PARAMS: (height [timeout-ms]); timeout 0 (default) waits
 indefinitely. Returns the tip on reaching the height, timeout, or node shutdown."
@@ -2689,7 +2689,7 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
         (when was-active
           (%set-network-active node t))))))
 
-(defun rpc-dumptxoutset (node params)
+(define-rpc "dumptxoutset" (node params)
   "Write the UTXO set to PATH in Bitcoin Core's snapshot v2 format
 (dumptxoutset, rpc/blockchain.cpp:3052-3323). PARAMS: (path [type]
 [options]) — type \"latest\" dumps at the current tip; \"rollback\" (or an
@@ -2945,7 +2945,7 @@ function of (format-string &rest args) that must signal."
       (unless adopted
         (bl::abort-snapshot-chainstate node snap)))))
 
-(defun rpc-loadtxoutset (node params)
+(define-rpc "loadtxoutset" (node params)
   "Load a Bitcoin Core-format UTXO snapshot (loadtxoutset). PARAMS: (path).
 
 This is Core's ActivateSnapshot + PopulateAndValidateSnapshot flow
@@ -3053,7 +3053,7 @@ chainstate exists (effective-prune-target-bytes)."
 
 ;;; --- Mempool persistence (Bitcoin Core savemempool) ---
 
-(defun rpc-savemempool (node params)
+(define-rpc "savemempool" (node params)
   "Dump the mempool to disk (Bitcoin Core savemempool). Returns the filename.
 The same dump runs automatically on graceful shutdown."
   (declare (ignore params))
@@ -3069,7 +3069,7 @@ The same dump runs automatically on graceful shutdown."
       (bl.mp:save-mempool-file (rpc-get-mempool node) path))
     `(("filename" . ,(namestring path)))))
 
-(defun rpc-importmempool (node params)
+(define-rpc "importmempool" (node params)
   "Load transactions from a mempool.dat-format file at FILEPATH through the normal
 acceptance path (Bitcoin Core importmempool). PARAMS: (filepath [options]).
 Entries are validated against the current UTXO set; their prioritisation deltas
@@ -3121,7 +3121,7 @@ separates them."
 
 ;;; --- Transaction prioritisation (Bitcoin Core prioritisetransaction) ---
 
-(defun rpc-prioritisetransaction (node params)
+(define-rpc "prioritisetransaction" (node params)
   "Adjust TXID's effective fee for mining selection by FEE-DELTA satoshis
 (Bitcoin Core prioritisetransaction). PARAMS: (txid [dummy] fee-delta) —
 dummy must be 0 or null (legacy priority is gone). The delta also counts for
@@ -3159,7 +3159,7 @@ mempool acceptance and RBF scoring; the fee is not actually paid. Returns T."
       (bl.mp:mempool-prioritise mempool txid fee-delta)
       t))))
 
-(defun rpc-getprioritisedtransactions (node params)
+(define-rpc "getprioritisedtransactions" (node params)
   "Map of all prioritisetransaction fee deltas by txid (Bitcoin Core
 getprioritisedtransactions): fee_delta, in_mempool, and modified_fee when the
 tx is currently in the mempool."
@@ -3204,7 +3204,7 @@ already running."
   (bt:with-lock-held (*txoutset-scan-lock*)
     (setf *txoutset-scan-running* nil)))
 
-(defun rpc-scantxoutset (node params)
+(define-rpc "scantxoutset" (node params)
   "Scan the UTXO set for outputs matching descriptors (Bitcoin Core
 scantxoutset). PARAMS: (action [scanobjects]) — action is \"start\",
 \"status\" or \"abort\". Scanobjects are descriptor strings or
@@ -3332,7 +3332,7 @@ unknown (header-only entry whose block isn't readable, e.g. pruned)."
                      (length (bl.ser:bitcoin-block-transactions
                               block)))))))))
 
-(defun rpc-getchaintxstats (node params)
+(define-rpc "getchaintxstats" (node params)
   "Transaction count/rate statistics over a block window (Bitcoin Core
 getchaintxstats). PARAMS: ([nblocks] [blockhash]) — the window is the NBLOCKS
 blocks ending at BLOCKHASH (default one month of blocks ending at the tip); the
@@ -3406,7 +3406,7 @@ omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
 
 ;;; --- Node / chain info RPCs ---
 
-(defun rpc-getdifficulty (node params)
+(define-rpc "getdifficulty" (node params)
   "Return the proof-of-work difficulty of the current best block (Bitcoin Core
 getdifficulty)."
   (declare (ignore params))
@@ -3419,7 +3419,7 @@ getdifficulty)."
                    #x1d00ffff)))
     (%difficulty-from-bits bits)))
 
-(defun rpc-uptime (node params)
+(define-rpc "uptime" (node params)
   "Seconds the node has been running (Bitcoin Core uptime)."
   (declare (ignore node params))
   (if bl::*node-start-time*
@@ -3431,7 +3431,7 @@ getdifficulty)."
                 bl::*node-start-time*))
       0))
 
-(defun rpc-stop (node params)
+(define-rpc "stop" (node params)
   "Request a graceful node shutdown (Bitcoin Core stop, rpc/node.cpp: the RPC
 only calls StartShutdown()). It must not run stop-node on this thread: the
 teardown stops the RPC server serving this very request, and — the reason the
@@ -3448,7 +3448,7 @@ this response flush before the RPC server goes away."
                   :name "rpc-stop")
   "Bitcoin-lisp server stopping")
 
-(defun rpc-getnetworkhashps (node params)
+(define-rpc "getnetworkhashps" (node params)
   "Estimated network hashes/sec over the last N blocks (default 120), from the
 chain-work and time spanned (Bitcoin Core getnetworkhashps)."
   (let* ((nblocks (let ((n (first params))) (if (and (integerp n) (> n 0)) n 120)))
@@ -3477,7 +3477,7 @@ chain-work and time spanned (Bitcoin Core getnetworkhashps)."
 Ticks<seconds>(nanoseconds::max()), i.e. (2^63-1) nanoseconds expressed in
 whole seconds (rpc/node.cpp:64).")
 
-(defun rpc-setmocktime (node params)
+(define-rpc "setmocktime" (node params)
   "Set the clock GET-UNIX-TIME reports (Bitcoin Core setmocktime,
 rpc/node.cpp:38-80). Regtest only, and 0 restores the system clock.
 
@@ -3503,7 +3503,7 @@ sleeping; almost every non-clean test depends on it."
           (if (zerop timestamp) nil timestamp))
     :null))
 
-(defun rpc-syncwithvalidationinterfacequeue (node params)
+(define-rpc "syncwithvalidationinterfacequeue" (node params)
   "Wait for the validation interface queue to drain (Bitcoin Core
 syncwithvalidationinterfacequeue, rpc/node.cpp).
 
@@ -3516,7 +3516,7 @@ the framework calls it after generate* in many tests."
   (declare (ignore node params))
   :null)
 
-(defun rpc-getmemoryinfo (node params)
+(define-rpc "getmemoryinfo" (node params)
   "Report process memory use (Bitcoin Core getmemoryinfo). Reports the SBCL heap
 under the \"locked\" object Core uses."
   (declare (ignore node params))
@@ -3529,7 +3529,7 @@ under the \"locked\" object Core uses."
                    ("chunks_used" . 0)
                    ("chunks_free" . 0))))))
 
-(defun rpc-logging (node params)
+(define-rpc "logging" (node params)
   "Get or set the active debug-logging categories (Bitcoin Core logging). PARAMS:
 ([include] [exclude]) — arrays of category names to enable / disable; \"all\"
 (or \"1\") toggles every category. Returns an object mapping every category to
@@ -3552,7 +3552,7 @@ whether it is currently enabled. Errors on an unknown category."
     (mapcar (lambda (c) (cons c (json-bool (bl:log-category-enabled-p c))))
             bl::+log-categories+)))
 
-(defun rpc-mockscheduler (node params)
+(define-rpc "mockscheduler" (node params)
   "Advance the scheduler by DELTA_TIME seconds (Core mockscheduler,
 rpc/node.cpp:86-99). Regtest only.
 
@@ -3579,14 +3579,14 @@ the unbroadcast re-announce interval and then asserts the re-announce happened).
           (+ (bl.ser:get-unix-time) delta))
     :null))
 
-(defun rpc-echo (node params)
+(define-rpc "echo" (node params)
   "Return the arguments unchanged (Core echo, rpc/node.cpp:279). It exists for
 the test framework to check argument marshalling end to end, which is exactly
 what rpc_misc.py uses it for."
   (declare (ignore node))
   (or params '()))
 
-(defun rpc-generate (node params)
+(define-rpc "generate" (node params)
   "Core keeps `generate' registered ONLY so that calling it explains itself
 (rpc/mining.cpp:258-261): it throws RPC_METHOD_NOT_FOUND with the help text.
 
@@ -3597,7 +3597,7 @@ absence."
   (error 'rpc-error :code +rpc-method-not-found+
                     :message "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"))
 
-(defun rpc-getrpcinfo (node params)
+(define-rpc "getrpcinfo" (node params)
   "Report RPC server state (Bitcoin Core getrpcinfo): the commands currently
 executing, with each one's running time in MICROSECONDS, and the log file path.
 
@@ -3625,7 +3625,7 @@ rounded to whole sat/kvB and the four counters to two decimals."
       ("inmempool" . ,(r2 (getf bucket :in-mempool)))
       ("leftmempool" . ,(r2 (getf bucket :left-mempool))))))
 
-(defun rpc-estimaterawfee (node params)
+(define-rpc "estimaterawfee" (node params)
   "The raw per-horizon fee estimates and the buckets behind them (Core
 estimaterawfee, rpc/fees.cpp:97-190). PARAMS: (conf_target [threshold]).
 
@@ -3673,7 +3673,7 @@ answer\" mean different things to whoever is reading this."
                    result))))))
         (or (nreverse result) (make-hash-table :test 'equal))))))
 
-(defun rpc-addpeeraddress (node params)
+(define-rpc "addpeeraddress" (node params)
   "Add an address to the address manager (Core addpeeraddress, rpc/net.cpp).
 For testing only: it is how a functional test seeds addrman without a peer.
 
@@ -3714,7 +3714,7 @@ collision test), and reporting success for that would misinform the test."
 (defconstant +max-message-type-size+ 12
   "Core CMessageHeader::MESSAGE_TYPE_SIZE.")
 
-(defun rpc-sendmsgtopeer (node params)
+(define-rpc "sendmsgtopeer" (node params)
   "Send a raw P2P message to a connected peer (Core sendmsgtopeer,
 rpc/net.cpp). For testing only: it lets a functional test put an arbitrary
 message on the wire without writing a P2P client.
@@ -3751,7 +3751,7 @@ PARAMS: (peer_id msg_type msg). Returns an empty object."
       ;; Core returns an empty object; an empty hash-table serializes as {}.
       (make-hash-table :test (quote equal)))))
 
-(defun rpc-echojson (node params)
+(define-rpc "echojson" (node params)
   "Return the arguments unchanged (Core echojson, rpc/misc.cpp). For testing
 only; it exists so a test can check the JSON round-trip of every argument type
 without depending on what any real method does with them."
@@ -3778,7 +3778,7 @@ reason the method exists — it is undocumented and for testing only."
               (push (vector method position name (json-bool string-p)) rows))))))
     (coerce (nreverse rows) 'vector)))
 
-(defun rpc-help (node params)
+(define-rpc "help" (node params)
   "List available RPC methods, or echo the name of a known one (Bitcoin Core
 help). A full per-method help text is out of scope.
 
@@ -3799,7 +3799,7 @@ rpc_help.py uses to check this node against Core's client.cpp."
          (maphash (lambda (k v) (declare (ignore v)) (push k names)) *rpc-methods*)
          (format nil "~{~A~^~%~}" (sort names #'string<)))))))
 
-(defun rpc-getindexinfo (node params)
+(define-rpc "getindexinfo" (node params)
   "Report the status of optional indexes (Bitcoin Core getindexinfo): txindex,
 the basic block filter index, coinstatsindex and txospenderindex -- each
 reported only when
@@ -3857,7 +3857,7 @@ nothing here decides when a rule actually activates."
     ("active" . ,(json-bool (>= (1+ tip-height) active-height)))
     ("height" . ,active-height)))
 
-(defun rpc-getzmqnotifications (node params)
+(define-rpc "getzmqnotifications" (node params)
   "Active ZMQ notification publishers (Bitcoin Core getzmqnotifications):
 an array of {type, address, hwm}. Empty when ZMQ is not configured, which is
 also the case on a node whose host has no libzmq -- the library is loaded only
@@ -3871,7 +3871,7 @@ when a -zmqpub* option asks for it."
                  ("hwm" . ,hwm))))
            (bl::zmq-notifications-info))))
 
-(defun rpc-getdeploymentinfo (node params)
+(define-rpc "getdeploymentinfo" (node params)
   "Report soft-fork deployment status at the tip, or at the block named by an
 optional blockhash param (Bitcoin Core getdeploymentinfo, rpc/blockchain.cpp:
 1489-1540). Reports the buried deployments (bip34/bip66/bip65/csv/segwit/
@@ -4278,7 +4278,7 @@ socket timeout."
             (return))
           (sleep 0.25))))))
 
-(defun rpc-getblocktemplate (node params)
+(define-rpc "getblocktemplate" (node params)
   "Return a block template assembled from the mempool (Bitcoin Core
 getblocktemplate). The optional template-request object's mode=\"proposal\"
 (validate a submitted template without mining it) and longpollid (block until a
@@ -4420,7 +4420,7 @@ cache above wraps exactly the expensive part and nothing else."
                                (hash-to-hex (bl.mining:block-template-prev-hash template))
                                txs-updated)))))
 
-(defun rpc-getmininginfo (node params)
+(define-rpc "getmininginfo" (node params)
   "Return mining-related state (Bitcoin Core getmininginfo)."
   (declare (ignore params))
   (with-node-lock (node)                 ; consistent tip + pool count snapshot
@@ -4511,7 +4511,7 @@ agree on a tip, timed out on a node that was working perfectly in isolation."
                 (bl:log-warn "Announcing submitted block failed: ~A" e))))))
       (values-list result))))
 
-(defun rpc-submitblock (node params)
+(define-rpc "submitblock" (node params)
   "Submit a mined block (Bitcoin Core submitblock). PARAMS: (block-hex). Returns
 JSON null on acceptance, \"duplicate\" if already known, \"duplicate-invalid\"
 if already known to be invalid, \"inconclusive\" for a valid block that was
@@ -4561,7 +4561,7 @@ stored without becoming the tip, or a BIP22 reject reason string. Routes through
             ((eq reason :weaker-chain) "inconclusive")
             (t (string-downcase (symbol-name reason))))))))))
 
-(defun rpc-submitheader (node params)
+(define-rpc "submitheader" (node params)
   "Validate and add a block header to the header index (Bitcoin Core
 submitheader). PARAMS: (hexdata) — an 80-byte serialized header. The previous
 header must already be known. Returns null on success (including an already-known
@@ -4627,7 +4627,7 @@ by generatetoaddress and generatetodescriptor."
                               (bl.ser:bitcoin-block-header block)))
                 hashes))))))
 
-(defun rpc-generatetoaddress (node params)
+(define-rpc "generatetoaddress" (node params)
   "Mine NBLOCKS blocks paying to ADDRESS and add them to the chain (Bitcoin Core
 generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
 [maxtries]). Returns an array of the mined block hashes (hex)."
@@ -4648,7 +4648,7 @@ generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
                           :message "Error: Invalid address"))
       (%generate-to-script-pubkey node script-pubkey nblocks maxtries))))
 
-(defun rpc-generatetodescriptor (node params)
+(define-rpc "generatetodescriptor" (node params)
   "Mine NUM-BLOCKS blocks whose coinbase pays the scriptPubKey of DESCRIPTOR
 (Bitcoin Core generatetodescriptor; CPU mining, intended for regtest). PARAMS:
 (num_blocks descriptor [maxtries]). The descriptor must expand to a single
@@ -4713,7 +4713,7 @@ zero and whose remaining transactions are TXS (Core GenerateCoinbaseCommitment).
     (bl.mining:build-witness-commitment-script
      (bl.crypto:hash256 combined))))
 
-(defun rpc-generateblock (node params)
+(define-rpc "generateblock" (node params)
   "Mine a single block containing exactly the given transactions (Bitcoin Core
 generateblock; CPU mining, intended for regtest). PARAMS: (output [tx,...]
 [submit]). OUTPUT is an address or descriptor for the coinbase, which is paid the
@@ -4801,7 +4801,7 @@ and {hash} is returned; otherwise {hash, hex}."
 (defconstant +rpc-invalid-amount+ -3
   "RPC error code for invalid amount.")
 
-(defun rpc-decoderawtransaction (node params)
+(define-rpc "decoderawtransaction" (node params)
   "Decode a raw transaction hex string to JSON."
   (let ((hex-str (first params)))
     (unless (and (stringp hex-str) (> (length hex-str) 0))
@@ -4816,7 +4816,7 @@ and {hash} is returned; otherwise {hash, hex}."
         (error 'rpc-error :code +rpc-deserialization-error+
                           :message (format nil "TX decode failed: ~A" e))))))
 
-(defun rpc-getrawtransaction (node params)
+(define-rpc "getrawtransaction" (node params)
   "Get raw transaction data by txid (Bitcoin Core getrawtransaction).
 Verbosity <= 0 (or false, the default) returns the wire-serialized (witness-
 complete) tx hex — Core's EncodeHexTx; 1 (or true) the decoded object; 2 adds
@@ -4959,7 +4959,7 @@ and NO time fields; an unknown block gets blockhash only."
                        ("blocktime" . ,block-time))))
                   (t '(("confirmations" . 0)))))))
 
-(defun rpc-estimatesmartfee (node params)
+(define-rpc "estimatesmartfee" (node params)
   "Estimate fee rate for confirmation in conf_target blocks.
 PARAMS: [conf_target, estimate_mode]
 Returns: { feerate?: BTC/kvB, blocks: number, errors?: [strings] }
@@ -5068,7 +5068,7 @@ rpc-error otherwise."
                         :message (format nil "Invalid public key: ~A" hex)))
     bytes))
 
-(defun rpc-createmultisig (node params)
+(define-rpc "createmultisig" (node params)
   "Create an m-of-n multisig address (Bitcoin Core createmultisig). PARAMS:
 (nrequired [\"pubkeyhex\",...] [address_type]). address_type is \"legacy\" (P2SH,
 default), \"p2sh-segwit\" (P2SH-P2WSH), or \"bech32\" (P2WSH). Returns
@@ -5152,7 +5152,7 @@ string; none of address/scriptPubKey/isscript/iswitness appear."
     ("error_locations" . #())
     ("error" . "Invalid or unsupported Segwit (Bech32) or Base58 encoding.")))
 
-(defun rpc-validateaddress (node params)
+(define-rpc "validateaddress" (node params)
   "Validate a Bitcoin address and return metadata (Core validateaddress).
 Booleans are real JSON booleans; the invalid shape carries error/
 error_locations like Core's."
@@ -5176,7 +5176,7 @@ error_locations like Core's."
             result)
           (%validateaddress-invalid)))))
 
-(defun rpc-decodescript (node params)
+(define-rpc "decodescript" (node params)
   "Decode a hex-encoded script."
   (let ((hex-str (first params))
         (network (rpc-get-network node)))
@@ -5247,7 +5247,7 @@ compact-size(24) || \"Bitcoin Signed Message:\\n\" || compact-size(len) || messa
                 (write-sequence msg s))))
     (bl.crypto:hash256 buf)))
 
-(defun rpc-signmessagewithprivkey (node params)
+(define-rpc "signmessagewithprivkey" (node params)
   "Sign MESSAGE with the WIF private key (Bitcoin Core signmessagewithprivkey).
 PARAMS: (privkey-wif message). Returns the base64 recoverable signature."
   (declare (ignore node))
@@ -5269,7 +5269,7 @@ PARAMS: (privkey-wif message). Returns the base64 recoverable signature."
                                     compact)))
             (cl-base64:usb8-array-to-base64-string sig65)))))))
 
-(defun rpc-verifymessage (node params)
+(define-rpc "verifymessage" (node params)
   "Verify a Bitcoin signed message (Bitcoin Core verifymessage). PARAMS:
 (address signature-base64 message). Recovers the signing pubkey and checks
 its P2PKH key-id matches ADDRESS. Returns a bare JSON boolean; like Core
@@ -5342,7 +5342,7 @@ holds the wallet lock."
                         priv :network (wallet-network wallet)
                              :compressed (= (length pubkey) 33)))))))))
 
-(defun rpc-signmessage (node params)
+(define-rpc "signmessage" (node params)
   "Sign MESSAGE with the private key of a wallet address (Bitcoin Core wallet
 signmessage). PARAMS: (address message). The address must be a legacy P2PKH
 address the wallet owns; the private key is resolved from the owning
@@ -5892,7 +5892,7 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                     errors))))))
     (nreverse errors)))
 
-(defun rpc-signrawtransactionwithkey (node params)
+(define-rpc "signrawtransactionwithkey" (node params)
   "Sign inputs of a raw transaction with the supplied WIF private keys (Bitcoin
 Core signrawtransactionwithkey). Supports P2PKH, P2WPKH, P2TR key-path, bare
 multisig, P2SH(-P2WPKH / -multisig / -P2WSH), and P2WSH multisig inputs.
@@ -5966,7 +5966,7 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
                                                             (car e) (cdr e)))))
                                     sign-errors))))))))))
 
-(defun rpc-createrawtransaction (node params)
+(define-rpc "createrawtransaction" (node params)
   "Create an unsigned raw transaction."
   (let ((inputs (%positional-array (first params)))
         (outputs (second params))
@@ -6116,7 +6116,7 @@ that block's deltas. Only the muhash hash_type is index-backed."
                     ("scripts" . ,(%csi-amount-btc d-uns-scripts))
                     ("unclaimed_rewards" . ,(%csi-amount-btc d-uns-unclaimed))))))))))))
 
-(defun rpc-gettxoutsetinfo (node params)
+(define-rpc "gettxoutsetinfo" (node params)
   "Return statistics about the UTXO set. With a second argument (height or
 block hash) the stats are served for that historical height from the
 coinstatsindex (Core's use_index path)."
@@ -6246,7 +6246,7 @@ unavailable in this block'."
                               :message (format nil "Invalid selected statistic '~A'" name))))
       stats-filter))))
 
-(defun rpc-getblockstats (node params)
+(define-rpc "getblockstats" (node params)
   "Per-block statistics (Bitcoin Core getblockstats, rpc/blockchain.cpp:1934-2190).
 PARAMS: (hash_or_height [stats]) — STATS selects a subset of the keys; an
 unknown name is an error. All amounts are in satoshis, feerates in sat/vB.
@@ -6405,7 +6405,7 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
 
 ;;; --- Pruning Methods ---
 
-(defun rpc-pruneblockchain (node params)
+(define-rpc "pruneblockchain" (node params)
   "Prune the blockchain up to a given block height.
 PARAMS: [height]
 Returns the height of the last pruned block."
@@ -6431,7 +6431,7 @@ Returns the height of the last pruned block."
       ;; Note: getblockchaininfo.pruneheight returns (1+ this) = first UNpruned block.
       (bl.store:chain-state-pruned-height chain-state)))))
 
-(defun rpc-migrateblocks (node params)
+(define-rpc "migrateblocks" (node params)
   "Convert legacy per-block files into flat blk?????.dat files.
 PARAMS: [nblocks]  (default 1000)
 
@@ -6475,7 +6475,7 @@ block connection for as long as that takes. Prefer several small calls."
 
 ;;; --- BIP157/158 block filter RPCs ---
 
-(defun rpc-getblockfilter (node params)
+(define-rpc "getblockfilter" (node params)
   "Return the BIP157 basic filter and filter header for a block.
 PARAMS: (blockhash [filtertype]). Mirrors Bitcoin Core getblockfilter."
   (let* ((blockhash-hex (first params))
@@ -6525,7 +6525,7 @@ PARAMS: (blockhash [filtertype]). Mirrors Bitcoin Core getblockfilter."
 (defun %hash-table-keys (ht)
   (loop for k being the hash-keys of ht collect k))
 
-(defun rpc-scanblocks (node params)
+(define-rpc "scanblocks" (node params)
   "Return blockhashes relevant to a descriptor set using the block filter index.
 PARAMS: (action [scanobjects] [start_height] [stop_height] [filtertype] [options]).
 ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
@@ -6686,7 +6686,7 @@ common fields (blockhash/height, or nil for mempool). Returns a list of entries.
                      acc))
     (nreverse acc)))
 
-(defun rpc-getdescriptoractivity (node params)
+(define-rpc "getdescriptoractivity" (node params)
   "Return spend/receive activity for descriptors within the given blocks (and
 optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
 [options]). Mirrors Bitcoin Core getdescriptoractivity."

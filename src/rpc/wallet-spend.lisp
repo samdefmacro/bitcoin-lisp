@@ -3126,7 +3126,7 @@ snapshot, so no lock-order inversion is possible; see with-wallet-lock)."
 
 ;;; --- sendtoaddress (rpc/spend.cpp:238-334) ---
 
-(defun rpc-sendtoaddress (node params)
+(define-rpc "sendtoaddress" (node params)
   "Send an amount to an address (Bitcoin Core sendtoaddress). PARAMS:
 (address amount comment comment_to subtractfeefromamount replaceable
 conf_target estimate_mode avoid_reuse fee_rate verbose)."
@@ -3170,7 +3170,7 @@ conf_target estimate_mode avoid_reuse fee_rate verbose)."
 
 ;;; --- sendmany (rpc/spend.cpp:336-428) ---
 
-(defun rpc-sendmany (node params)
+(define-rpc "sendmany" (node params)
   "Send to multiple addresses (Bitcoin Core sendmany). PARAMS:
 (dummy amounts minconf comment subtractfeefrom replaceable conf_target
 estimate_mode fee_rate verbose)."
@@ -3201,7 +3201,7 @@ estimate_mode fee_rate verbose)."
 
 ;;; --- fundrawtransaction (rpc/spend.cpp:706-839) ---
 
-(defun rpc-fundrawtransaction (node params)
+(define-rpc "fundrawtransaction" (node params)
   "Fund a raw transaction from the wallet (Bitcoin Core
 fundrawtransaction). PARAMS: (hexstring options iswitness)."
   (let ((wallet (wallet-for-request node))
@@ -3253,7 +3253,7 @@ fundrawtransaction). PARAMS: (hexstring options iswitness)."
 
 ;;; --- send (rpc/spend.cpp:1169-1291) ---
 
-(defun rpc-send (node params)
+(define-rpc "send" (node params)
   "Send a transaction (Bitcoin Core send). PARAMS: (outputs conf_target
 estimate_mode fee_rate options version). JSON-object outputs arrive as
 hash tables whose key order is not preserved; use the array-of-objects
@@ -3324,7 +3324,7 @@ FundTransaction wrapping (RPC_WALLET_ERROR)."
 
 ;;; --- sendall (rpc/spend.cpp:1293-1571) ---
 
-(defun rpc-sendall (node params)
+(define-rpc "sendall" (node params)
   "Spend the value of all (or specific) confirmed UTXOs to one or more
 recipients (Bitcoin Core sendall). PARAMS: (recipients conf_target
 estimate_mode fee_rate options)."
@@ -3625,7 +3625,7 @@ supported (taproot inputs, until the P5 signer lands sighash plumbing)."
       (values 1 t)
       (values (%parse-sighash-type value) nil)))
 
-(defun rpc-signrawtransactionwithwallet (node params)
+(define-rpc "signrawtransactionwithwallet" (node params)
   "Sign a raw transaction with the wallet's keys (Bitcoin Core
 signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
   (let ((wallet (wallet-for-request node))

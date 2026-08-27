@@ -2082,7 +2082,7 @@ outputs (gettxout, decoderawtransaction, getblock verbosity 2, decodescript)."
 
 ;;; --- Descriptor RPCs (getdescriptorinfo / deriveaddresses) ---
 
-(defun rpc-getdescriptorinfo (node params)
+(define-rpc "getdescriptorinfo" (node params)
   "Analyse a descriptor (Bitcoin Core getdescriptorinfo). PARAMS: (descriptor).
 Reports the canonical public form (private keys stripped to public) with its
 checksum, the checksum of the input as given, and the
@@ -2098,7 +2098,7 @@ isrange/issolvable/hasprivatekeys flags."
         ("issolvable" . ,(json-bool (out-desc-solvable-p desc)))
         ("hasprivatekeys" . ,(json-bool (out-desc-has-privkeys-p desc)))))))
 
-(defun rpc-deriveaddresses (node params)
+(define-rpc "deriveaddresses" (node params)
   "Derive the address(es) for a descriptor (Bitcoin Core deriveaddresses).
 PARAMS: (descriptor [range]). The descriptor must carry a checksum. RANGE is
 required for ranged descriptors (an end N meaning [0,N], or [begin,end]) and

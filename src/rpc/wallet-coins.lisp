@@ -633,7 +633,7 @@ flag errors."
                    (make-string 64 :initial-element #\0)))
     ("height" . ,(wallet-last-block-height wallet))))
 
-(defun rpc-getbalance (node params)
+(define-rpc "getbalance" (node params)
   "The wallet's total available (trusted) balance (Bitcoin Core getbalance).
 PARAMS: (dummy minconf include_watchonly avoid_reuse)."
   (let ((wallet (wallet-for-request node))
@@ -649,7 +649,7 @@ PARAMS: (dummy minconf include_watchonly avoid_reuse)."
         (%btc (wallet-get-balance wallet :min-depth minconf
                                          :avoid-reuse avoid-reuse))))))
 
-(defun rpc-getbalances (node params)
+(define-rpc "getbalances" (node params)
   "All wallet balances (Bitcoin Core getbalances)."
   (declare (ignore params))
   (let ((wallet (wallet-for-request node)))
@@ -712,7 +712,7 @@ PARAMS: (dummy minconf include_watchonly avoid_reuse)."
               `(("reused" . ,(json-bool (wallet-spent-key-script-p wallet script)))))
           ("safe" . ,(json-bool (wallet-coin-safe coin))))))))
 
-(defun rpc-listunspent (node params)
+(define-rpc "listunspent" (node params)
   "Unspent wallet outputs with between minconf and maxconf confirmations
 (Bitcoin Core listunspent). PARAMS: (minconf maxconf addresses
 include_unsafe query_options)."
@@ -784,7 +784,7 @@ include_unsafe query_options)."
 
 ;;; --- lockunspent / listlockunspent (wallet/rpc/coins.cpp:214,347) ---
 
-(defun rpc-lockunspent (node params)
+(define-rpc "lockunspent" (node params)
   "Lock or unlock unspent outputs (Bitcoin Core lockunspent). PARAMS:
 (unlock transactions persistent)."
   (let ((wallet (wallet-for-request node))
@@ -838,7 +838,7 @@ include_unsafe query_options)."
               (wallet-lock-coin wallet (car outpoint) (cdr outpoint) persistent)))
         t))))
 
-(defun rpc-listlockunspent (node params)
+(define-rpc "listlockunspent" (node params)
   "Temporarily unspendable outputs (Bitcoin Core listlockunspent)."
   (declare (ignore params))
   (let ((wallet (wallet-for-request node)))
@@ -966,7 +966,7 @@ key-path-only P2TR."
         (when pairs
           (values (car (first pairs)) (cdr (first pairs)) pos))))))
 
-(defun rpc-getaddressinfo (node params)
+(define-rpc "getaddressinfo" (node params)
   "Information about a bitcoin address (Bitcoin Core getaddressinfo).
 PARAMS: (address)."
   (let ((wallet (wallet-for-request node))
@@ -1017,7 +1017,7 @@ PARAMS: (address)."
 
 ;;; --- setlabel / getaddressesbylabel / listlabels (addresses.cpp:118,515,576) ---
 
-(defun rpc-setlabel (node params)
+(define-rpc "setlabel" (node params)
   "Set the label of an address (Bitcoin Core setlabel). PARAMS:
 (address label)."
   (let ((wallet (wallet-for-request node))
@@ -1036,7 +1036,7 @@ PARAMS: (address)."
                                        "send"))))))
   nil)
 
-(defun rpc-getaddressesbylabel (node params)
+(define-rpc "getaddressesbylabel" (node params)
   "The addresses assigned to LABEL (Bitcoin Core getaddressesbylabel)."
   (let ((wallet (wallet-for-request node))
         (label (%label-from-value (first params))))
@@ -1056,7 +1056,7 @@ PARAMS: (address)."
                             :message (format nil "No addresses with label ~A" label)))
         (sort result #'string< :key #'car)))))
 
-(defun rpc-listlabels (node params)
+(define-rpc "listlabels" (node params)
   "All labels, optionally only those on addresses with PURPOSE (Bitcoin Core
 listlabels). PARAMS: (purpose)."
   (let ((wallet (wallet-for-request node))
@@ -1080,7 +1080,7 @@ listlabels). PARAMS: (purpose)."
 
 ;;; --- abandontransaction (wallet/rpc/transactions.cpp:779) ---
 
-(defun rpc-abandontransaction (node params)
+(define-rpc "abandontransaction" (node params)
   "Mark an in-wallet transaction and its wallet descendants abandoned
 (Bitcoin Core abandontransaction). PARAMS: (txid)."
   (let ((wallet (wallet-for-request node))
@@ -1189,13 +1189,13 @@ include_immature_coinbase)."
         (%btc (%wallet-received-total wallet output-scripts min-depth
                                       include-immature))))))
 
-(defun rpc-getreceivedbyaddress (node params)
+(define-rpc "getreceivedbyaddress" (node params)
   "Total amount received by an address in txs with >= minconf confirmations
 (Bitcoin Core getreceivedbyaddress). PARAMS: (address minconf
 include_immature_coinbase)."
   (%rpc-getreceived node params nil))
 
-(defun rpc-getreceivedbylabel (node params)
+(define-rpc "getreceivedbylabel" (node params)
   "Total amount received across all addresses carrying a label (Bitcoin Core
 getreceivedbylabel). PARAMS: (label minconf include_immature_coinbase)."
   (%rpc-getreceived node params t))
@@ -1253,7 +1253,7 @@ Caller holds the wallet lock."
                       (mapcar #'hash-to-hex (reverse (received-tally-txids item)))
                       #())))))
 
-(defun rpc-listreceivedbyaddress (node params)
+(define-rpc "listreceivedbyaddress" (node params)
   "Balances by receiving address (Bitcoin Core listreceivedbyaddress).
 PARAMS: (minconf include_empty include_watchonly address_filter
 include_immature_coinbase)."
@@ -1294,7 +1294,7 @@ include_immature_coinbase)."
                          (wallet-address-book wallet))))
           (or (nreverse result) #()))))))
 
-(defun rpc-listreceivedbylabel (node params)
+(define-rpc "listreceivedbylabel" (node params)
   "Received amounts by label (Bitcoin Core listreceivedbylabel). PARAMS:
 (minconf include_empty include_watchonly include_immature_coinbase)."
   (let* ((wallet (wallet-for-request node))
@@ -1344,7 +1344,7 @@ SPKMs (one per output type on each side)."
           (loop for spkm being the hash-values of (wallet-internal-spkms wallet)
                 collect spkm)))
 
-(defun rpc-keypoolrefill (node params)
+(define-rpc "keypoolrefill" (node params)
   "Refill each active descriptor keypool up to NEWSIZE new keys (Bitcoin Core
 keypoolrefill). PARAMS: (newsize). 0/omitted uses the wallet's keypool size."
   (let ((wallet (wallet-for-request node))
@@ -1372,7 +1372,7 @@ keypoolrefill). PARAMS: (newsize). 0/omitted uses the wallet's keypool size."
 
 ;;; --- simulaterawtransaction (wallet.cpp:489) ---
 
-(defun rpc-simulaterawtransaction (node params)
+(define-rpc "simulaterawtransaction" (node params)
   "Wallet balance change from signing+broadcasting the given raw txs (Bitcoin
 Core simulaterawtransaction). PARAMS: (rawtxs options). Returns
 {\"balance_change\": <btc>}. DIVERGENCE: Core also runs chain findCoins to
@@ -1531,7 +1531,7 @@ disjoint groups (Core's setmap loop). Returns a list of address-string lists."
                  (push (car holder) result)))
       result)))
 
-(defun rpc-listaddressgroupings (node params)
+(define-rpc "listaddressgroupings" (node params)
   "Groups of addresses whose common ownership is public through shared use as
 inputs or change (Bitcoin Core listaddressgroupings). Each address entry is a
 [address, amount, label?] array — encoded as a Lisp vector so the JSON layer

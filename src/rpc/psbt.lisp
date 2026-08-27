@@ -106,7 +106,7 @@ when locktime>0, else 0xffffffff."
        :outputs (coerce (nreverse tx-outputs) 'simple-vector)
        :lock-time locktime))))
 
-(defun rpc-createpsbt (node params)
+(define-rpc "createpsbt" (node params)
   "Create a PSBT with no inputs/outputs metadata (Creator role).
 PARAMS: (inputs outputs [locktime] [replaceable]). Mirrors Core createpsbt."
   ;; ⚠️ %POSITIONAL-ARRAY, not (first params): an empty JSON array arrives as
@@ -124,7 +124,7 @@ PARAMS: (inputs outputs [locktime] [replaceable]). Mirrors Core createpsbt."
 
 ;;; --- converttopsbt ---
 
-(defun rpc-converttopsbt (node params)
+(define-rpc "converttopsbt" (node params)
   "Convert a raw transaction to a PSBT, stripping signatures.
 PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
   (declare (ignore node))
@@ -476,7 +476,7 @@ fingerprint><path>."
                                    derivs))))))
     (or (nreverse fields) (make-hash-table))))
 
-(defun rpc-decodepsbt (node params)
+(define-rpc "decodepsbt" (node params)
   "Decode a PSBT to JSON. PARAMS: (psbt). Mirrors Core decodepsbt."
   (let* ((network (rpc-get-network node))
          (psbt (%psbt-decode-arg (first params)))
@@ -528,7 +528,7 @@ key hash-set + a single append."
       (setf (bl.ser:psbt-map-records dst)
             (append (bl.ser:psbt-map-records dst) (nreverse new))))))
 
-(defun rpc-combinepsbt (node params)
+(define-rpc "combinepsbt" (node params)
   "Combine PSBTs for the same unsigned tx into one. PARAMS: (txs). Mirrors Core."
   (declare (ignore node))
   (let ((b64s (%positional-array (first params))))
@@ -554,7 +554,7 @@ key hash-set + a single append."
                             (aref (bl.ser:psbt-outputs p) i))))
       (bl.ser:encode-psbt base))))
 
-(defun rpc-joinpsbts (node params)
+(define-rpc "joinpsbts" (node params)
   "Join distinct PSBTs (different inputs/outputs) into one. PARAMS: (txs).
 Mirrors Core joinpsbts (version=max, locktime=min, concatenated inputs/outputs;
 we do not shuffle indices)."
@@ -615,7 +615,7 @@ we do not shuffle indices)."
           '("witness_v0_keyhash" "witness_v0_scripthash" "witness_v1_taproot")
           :test #'string=))
 
-(defun rpc-utxoupdatepsbt (node params)
+(define-rpc "utxoupdatepsbt" (node params)
   "Fill in each input's witness_utxo from the node's UTXO set for witness
 outputs. PARAMS: (psbt [descriptors]). Descriptors are not yet used (no
 descriptor-based script solving); the UTXO-filling role is implemented.
@@ -651,7 +651,7 @@ Mirrors the no-key part of Core utxoupdatepsbt."
 
 ;;; --- analyzepsbt ---
 
-(defun rpc-analyzepsbt (node params)
+(define-rpc "analyzepsbt" (node params)
   "Analyze a PSBT: per-input has_utxo/is_final/next, overall next role, and the
 fee when all input amounts are known. PARAMS: (psbt). Note: missing pubkey/sig
 lists and vsize estimation are not computed (no script solving here)."
@@ -856,7 +856,7 @@ fields (partial sigs, sighash, redeem/witness scripts, derivations)."
       (bl.crypto:bytes-to-hex
        (bl.ser:transaction-wire-bytes final-tx)))))
 
-(defun rpc-finalizepsbt (node params)
+(define-rpc "finalizepsbt" (node params)
   "Finalize every input possible; if all are final and EXTRACT (default true),
 return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
   (declare (ignore node))
@@ -884,7 +884,7 @@ return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
 
 ;;; --- combinerawtransaction ---
 
-(defun rpc-combinerawtransaction (node params)
+(define-rpc "combinerawtransaction" (node params)
   "Combine partially-signed raw transactions, taking the most-complete scriptSig
 and witness per input (prevout script types come from the UTXO set / mempool).
 PARAMS: (txs). Mirrors Core combinerawtransaction."
@@ -1433,7 +1433,7 @@ every input can be finalized, even without finalize=true)."
 
 ;;; --- walletprocesspsbt (wallet/rpc/spend.cpp:1573) ---
 
-(defun rpc-walletprocesspsbt (node params)
+(define-rpc "walletprocesspsbt" (node params)
   "Update a PSBT with wallet input info and sign the inputs we can (Bitcoin Core
 walletprocesspsbt). PARAMS: (psbt [sign] [sighashtype] [bip32derivs] [finalize]).
 Returns {psbt, complete, hex?}."
@@ -1545,7 +1545,7 @@ through the shared %sign-map-add-key!."
                  (declare (ignore desc))
                  (%psbt-add-map-derivs map spk pos pairs))))))
 
-(defun rpc-descriptorprocesspsbt (node params)
+(define-rpc "descriptorprocesspsbt" (node params)
   "Update a PSBT's segwit inputs from output descriptors + the UTXO set, then
 sign the inputs the descriptors can (Bitcoin Core descriptorprocesspsbt).
 PARAMS: (psbt descriptors [sighashtype] [bip32derivs] [finalize])."
@@ -1609,7 +1609,7 @@ input/output bip32 derivations. Mirrors Core FillPSBT(sign=false)."
 
 ;;; --- walletcreatefundedpsbt (wallet/rpc/spend.cpp:1657) ---
 
-(defun rpc-walletcreatefundedpsbt (node params)
+(define-rpc "walletcreatefundedpsbt" (node params)
   "Create + fund a PSBT (Creator + Updater). PARAMS: (inputs outputs [locktime]
 [options] [bip32derivs] [version]). Returns {psbt, fee, changepos}. JSON-object
 outputs arrive as hash tables whose key order is not preserved; use the
@@ -1880,13 +1880,13 @@ estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
                         ("fee" . ,(%btc new-fee))
                         ("errors" . ,#()))))))))))))
 
-(defun rpc-bumpfee (node params)
+(define-rpc "bumpfee" (node params)
   "Bump the fee of an unconfirmed wallet transaction, signing + broadcasting the
 replacement (Bitcoin Core bumpfee). PARAMS: (txid [options]). Returns
 {txid, origfee, fee, errors}."
   (%bumpfee-helper node params nil))
 
-(defun rpc-psbtbumpfee (node params)
+(define-rpc "psbtbumpfee" (node params)
   "Like bumpfee but return an UNSIGNED PSBT of the replacement instead of signing
 and broadcasting (Bitcoin Core psbtbumpfee). PARAMS: (txid [options]). Returns
 {psbt, origfee, fee, errors}."

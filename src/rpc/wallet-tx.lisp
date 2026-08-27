@@ -1868,7 +1868,7 @@ push order."
                       entries))))))
       (nreverse entries))))
 
-(defun rpc-gettransaction (node params)
+(define-rpc "gettransaction" (node params)
   "Detailed information about an in-wallet transaction (Bitcoin Core
 gettransaction). PARAMS: (txid include_watchonly verbose)."
   (let ((wallet (wallet-for-request node))
@@ -1904,7 +1904,7 @@ gettransaction). PARAMS: (txid include_watchonly verbose)."
                                  (make-string 64 :initial-element #\0)))
                   ("height" . ,(wallet-last-block-height wallet)))))))))))
 
-(defun rpc-listtransactions (node params)
+(define-rpc "listtransactions" (node params)
   "Most recent wallet transactions (Bitcoin Core listtransactions). PARAMS:
 (label count skip include_watchonly)."
   (let ((wallet (wallet-for-request node))
@@ -1937,7 +1937,7 @@ gettransaction). PARAMS: (txid include_watchonly verbose)."
             ;; ret is newest-first; the response is oldest-first.
             (or (reverse (subseq ret from (+ from take))) #())))))))
 
-(defun rpc-listsinceblock (node params)
+(define-rpc "listsinceblock" (node params)
   "All wallet transactions in blocks since BLOCKHASH (Bitcoin Core
 listsinceblock). PARAMS: (blockhash target_confirmations include_watchonly
 include_removed include_change label)."
@@ -2032,7 +2032,7 @@ include_removed include_change label)."
                                         lastblock-entry))
                                       (make-string 64 :initial-element #\0))))))))))))
 
-(defun rpc-rescanblockchain (node params)
+(define-rpc "rescanblockchain" (node params)
   "Rescan the local blockchain for wallet transactions (Bitcoin Core
 rescanblockchain). PARAMS: (start_height stop_height)."
   (let ((wallet (wallet-for-request node))
@@ -2102,7 +2102,7 @@ rescanblockchain). PARAMS: (start_height stop_height)."
                                   :message "Rescan aborted.")))))
       (wallet-release-rescan wallet))))
 
-(defun rpc-abortrescan (node params)
+(define-rpc "abortrescan" (node params)
   "Stop the wallet rescan in progress (Bitcoin Core abortrescan). Returns
 whether an abort was triggered."
   (declare (ignore params))
