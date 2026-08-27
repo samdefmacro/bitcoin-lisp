@@ -158,13 +158,7 @@ source-transform and hand-written functions have none, so the two separate
 cleanly and the many unused accessors do not bury the real finding."
   (or *orphan-sweep-cache*
       (setf *orphan-sweep-cache*
-            (let* ((root (asdf:system-source-directory :bitcoin-lisp))
-                   (src (string-downcase
-                         (with-output-to-string (o)
-                           (dolist (f (directory (merge-pathnames "src/**/*.lisp" root)))
-                             (with-open-file (in f :external-format :utf-8)
-                               (loop for line = (read-line in nil) while line
-                                     do (write-line line o)))))))
+            (let* ((src (%source-text))
                    (refs (%function-object-references src))
                    (tests-package (find-package "BITCOIN-LISP.TESTS"))
                    (found '()))
@@ -369,3 +363,438 @@ parallel script-check worker can reach it, synchronize it: ~S"
           "~D baseline entr~:@P no longer unsynchronized; trim the list: ~S"
           (length gone) gone)))
   #-sbcl (skip "SBCL-specific"))
+
+
+
+;;;; ====================================================================
+;;;; Refactoring ratchets (docs/refactoring-plan-2026-08-27.md, phase P0)
+;;;;
+;;;; The cleanup plan turns five observations about the tree into numbers and
+;;;; pins each one so that it can only move in the intended direction:
+;;;;
+;;;;   duplicate definitions   the same DEFUN/DEFMACRO name defined in two files
+;;;;   long functions          a top-level definition over 200 (or 100) lines
+;;;;   serialization families  call sites of the byte-I/O APIs being retired
+;;;;   bare error strings      (error "...") where a condition type should be
+;;;;   layering                a file naming a package loaded after it
+;;;;
+;;;; Each baseline below is the state of main at the start of the cleanup. A
+;;;; test fails when the tree gets WORSE (a new duplicate, a new 200-line
+;;;; function, a new call into a family being retired). The named lists also
+;;;; fail when an entry is resolved, so the baseline is trimmed in the same PR
+;;;; that earns it -- the precedent is +KNOWN-UNSYNCHRONIZED-GLOBALS+ above.
+;;;; The plain counts only report a decrease: they move incidentally in
+;;;; unrelated PRs, and a red test on good news trains people to re-paste the
+;;;; number without reading it.
+;;;;
+;;;; Everything is measured from one read of src/ (%SOURCE-CORPUS). Form
+;;;; lengths come from the reader under *READ-SUPPRESS*, which interns nothing
+;;;; and needs no package to exist, so it sees exactly the form a reviewer
+;;;; sees -- including a docstring line that happens to begin with a paren.
+;;;; ====================================================================
+
+(defvar *source-corpus* nil
+  "Memo: every file under src/ as (relative-name . lines), read once per image.
+Nothing between the tests here edits src/.")
+
+(defun %source-corpus ()
+  (or *source-corpus*
+      (setf *source-corpus*
+            (let ((root (asdf:system-source-directory :bitcoin-lisp)))
+              (loop for path in (sort (directory (merge-pathnames "src/**/*.lisp" root))
+                                      #'string< :key #'namestring)
+                    collect (cons (enough-namestring path root)
+                                  (coerce (uiop:read-file-lines path :external-format :utf-8)
+                                          'vector)))))))
+
+(defvar *source-text* nil)
+
+(defun %source-text ()
+  "All of src/ as one downcased string, for call-site counting."
+  (or *source-text*
+      (setf *source-text*
+            (with-output-to-string (o)
+              (loop for (nil . lines) in (%source-corpus)
+                    do (loop for l across lines do (write-line (string-downcase l) o)))))))
+
+(defun %lines-text (lines)
+  (with-output-to-string (o) (loop for l across lines do (write-line l o))))
+
+(defun %count-occurrences (needle text)
+  (loop with i = 0 and n = 0
+        while (setf i (search needle text :start2 i))
+        do (incf n) (incf i (length needle))
+        finally (return n)))
+
+(defun %check-pinned-set (current baseline baseline-name hint &key (test #'string=))
+  "The shape shared by every pinned-list ratchet here: nothing new, and
+nothing resolved without trimming BASELINE-NAME."
+  (let ((new (set-difference current baseline :test test))
+        (gone (set-difference baseline current :test test)))
+    (is (null new) "~D new entr~:@P: ~S -- ~A" (length new) new hint)
+    (is (null gone) "~D baseline entr~:@P resolved; trim ~A: ~S"
+        (length gone) baseline-name gone)))
+
+(defun %ratchet-down (label now then baseline-name hint)
+  "A count that may only fall. Growth fails; a drop is reported so the
+baseline can follow it."
+  (is (<= now then) "~A: ~D, baseline ~D -- ~A" label now then hint)
+  (when (< now then)
+    (format *test-dribble* "~&; ~A down to ~D (baseline ~D); update ~A~%"
+            label now then baseline-name)))
+
+;;; --- top-level definitions ------------------------------------------------
+
+(defparameter +definition-prefixes+
+  '((:defun . "(defun ") (:defmacro . "(defmacro "))
+  "A definition is a line that starts with one of these. Coalton's DEFINEs sit
+inside COALTON-TOPLEVEL at indentation 2 and are therefore not counted, on
+purpose: the interpreter is a deliberate port of one Core file.")
+
+(defstruct (%definition (:conc-name %def-))
+  kind name file line length)
+
+(defun %definition-name (line prefix)
+  "The name that follows PREFIX on LINE, downcased. A (setf foo) name is kept
+whole, parentheses included."
+  (let* ((start (position #\Space line :start (length prefix) :test-not #'char=))
+         (end (cond ((null start) nil)
+                    ((char= (char line start) #\()
+                     (let ((close (position #\) line :start start)))
+                       (and close (1+ close))))
+                    (t (position-if (lambda (c) (member c '(#\Space #\( #\))))
+                                    line :start start)))))
+    (and start (string-downcase (subseq line start end)))))
+
+(defun %form-line-count (text start)
+  "Lines spanned by the form beginning at character START of TEXT. Read with
+*READ-SUPPRESS* so no symbol is interned and no package need exist; strings,
+comments, #| |# blocks and #\\x literals are the reader's problem, not ours.
+:PRESERVE-WHITESPACE keeps the reader from eating the newline after the
+closing paren, which would count as a line."
+  (let ((end (let ((*read-suppress* t))
+               (nth-value 1 (read-from-string text t nil :start start
+                                              :preserve-whitespace t)))))
+    (1+ (count #\Newline text :start start :end end))))
+
+(defvar *toplevel-definitions-cache* nil)
+
+(defun %toplevel-definitions ()
+  "Every top-level DEFUN/DEFMACRO under src/, with its length in lines."
+  (or *toplevel-definitions-cache*
+      (setf *toplevel-definitions-cache*
+            (loop for (file . lines) in (%source-corpus)
+                  for text = (%lines-text lines)
+                  nconc (loop with offset = 0
+                              for line across lines
+                              for lineno from 1
+                              for entry = (find-if (lambda (e) (uiop:string-prefix-p (cdr e) line))
+                                                   +definition-prefixes+)
+                              when entry
+                                collect (make-%definition
+                                         :kind (car entry)
+                                         :name (%definition-name line (cdr entry))
+                                         :file file :line lineno
+                                         :length (%form-line-count text offset))
+                              do (incf offset (1+ (length line))))))))
+
+;;; --- duplicate definitions -------------------------------------------
+
+(defparameter +duplicate-definition-baseline+
+  '("%script-push"
+    "bb-ensure" "bb-finish" "bb-write-bytes" "bb-write-u16-le" "bb-write-u32-le"
+    "bb-write-u64-le" "bb-write-u8" "bb-write-varint"
+    "fsync-directory" "satoshi+" "satoshi>" "tagged-hash"
+    "unwrap-block-height" "unwrap-satoshi" "with-node-lock"
+    "wrap-block-height" "wrap-satoshi")
+  "Names defined by DEFUN or DEFMACRO in more than one file under src/, as of
+the start of the cleanup. Two of everything is how the byte-buffer family came
+to exist twice (serialization/binary.lisp and coalton/interop.lisp), and how
+WITH-NODE-LOCK came to be two macros with different lambda lists.")
+
+(defun %duplicate-definition-names ()
+  "Names with a top-level DEFUN/DEFMACRO in two or more distinct files."
+  (let ((files-by-name (make-hash-table :test #'equal))
+        (found '()))
+    (dolist (d (%toplevel-definitions))
+      (pushnew (%def-file d) (gethash (%def-name d) files-by-name) :test #'string=))
+    (maphash (lambda (name files)
+               (when (> (length files) 1) (push name found)))
+             files-by-name)
+    (sort found #'string<)))
+
+(test no-new-duplicate-definitions
+  "A DEFUN or DEFMACRO name defined in two files is one implementation too
+many, or two things that should not share a name. Either way it is a decision
+to make on purpose, so the set is pinned."
+  (%check-pinned-set (%duplicate-definition-names) +duplicate-definition-baseline+
+                     "+DUPLICATE-DEFINITION-BASELINE+" "merge them, or rename one"))
+
+;;; --- long functions ----------------------------------------------------
+
+(defparameter +long-function-lines+ 200
+  "Above this a definition is on the named list.")
+
+(defparameter +longish-function-lines+ 100
+  "Above this a definition counts against +LONGISH-FUNCTION-CEILING+.")
+
+(defparameter +long-function-baseline+
+  '(("start-node" . 1337)                        ; node.lisp
+    ("perform-reorg" . 465)                      ; validation/block.lisp
+    ("%create-transaction-internal" . 442)       ; rpc/wallet-spend.lisp
+    ("apply-config-globals" . 387)               ; config.lisp
+    ("validate-transaction-for-mempool" . 358)   ; validation/transaction.lisp
+    ("run-ibd" . 348)                            ; networking/ibd.lisp
+    ("validate-block" . 307)                     ; validation/block.lisp
+    ("process-received-block" . 300)             ; networking/ibd.lisp
+    ("rpc-sendall" . 289)                        ; rpc/wallet-spend.lisp
+    ("ms-from-script" . 243)                     ; validation/miniscript.lisp
+    ("connect-block" . 215)                      ; validation/block.lisp
+    ("activate-block" . 214)                     ; validation/block.lisp
+    ("handle-message" . 206))                    ; networking/protocol.lisp
+  "(name . lines) of every top-level definition over +LONG-FUNCTION-LINES+ at
+the start of the cleanup. Each is a phase-3 target
+(docs/refactoring-plan-2026-08-27.md §4 P3): START-NODE becomes Core's
+thirteen init steps, PERFORM-REORG becomes DisconnectTip/ConnectTip/
+ActivateBestChainStep, and so on. The line count is pinned too, so an entry
+may shrink but not grow while it waits its turn.")
+
+(defparameter +longish-function-ceiling+ 62
+  "How many definitions may exceed +LONGISH-FUNCTION-LINES+ lines. Lower it
+when the count drops; the test says so.")
+
+(defun %definitions-longer-than (lines)
+  (sort (remove-if-not (lambda (d) (> (%def-length d) lines)) (%toplevel-definitions))
+        #'> :key #'%def-length))
+
+(test no-new-long-functions
+  "A function over 200 lines is a file's worth of logic with one name. The
+plan splits the existing ones along Core's own function boundaries; this test
+keeps new ones from appearing, and the old ones from growing, while that
+happens."
+  (let ((long (%definitions-longer-than +long-function-lines+)))
+    (%check-pinned-set (mapcar #'%def-name long) (mapcar #'car +long-function-baseline+)
+                       "+LONG-FUNCTION-BASELINE+" "split along Core's function boundaries")
+    (dolist (d long)
+      (let ((pinned (cdr (assoc (%def-name d) +long-function-baseline+ :test #'string=))))
+        (when pinned
+          (%ratchet-down (%def-name d) (%def-length d) pinned
+                         "+LONG-FUNCTION-BASELINE+" "a long function may not grow"))))))
+
+(test longish-function-count-does-not-grow
+  "The softer ratchet: how many definitions exceed 100 lines."
+  (let ((long (%definitions-longer-than +longish-function-lines+)))
+    (is (<= (length long) +longish-function-ceiling+)
+        "~D definitions over ~D lines, ceiling is ~D: ~S"
+        (length long) +longish-function-lines+ +longish-function-ceiling+
+        (mapcar #'%def-name long))
+    (when (< (length long) +longish-function-ceiling+)
+      (format *test-dribble*
+              "~&; ~D definitions over ~D lines; lower +LONGISH-FUNCTION-CEILING+ to ~D~%"
+              (length long) +longish-function-lines+ (length long)))))
+
+;;; --- serialization API families -----------------------------------------
+
+(defparameter +stream-io-call-patterns+
+  '("(read-uint8 " "(read-uint16-le " "(read-uint32-le " "(read-uint64-le "
+    "(read-int32-le " "(read-int64-le "
+    "(write-uint8 " "(write-uint16-le " "(write-uint32-le " "(write-uint64-le "
+    "(write-int32-le " "(write-int64-le ")
+  "Call sites of the stream-based integer codecs (serialization/binary.lisp,
+top). They run through flexi-streams' gray-stream dispatch, which profiling
+found to be the block-deserialization bottleneck (2026-08-22); the plan
+retires them in favour of the byte-reader.")
+
+(defparameter +retiring-serialization-family-baseline+
+  '((:stream-io . 88)
+    (:interop-buf . 54)
+    (:compact-size-definitions . 12))
+  "Call-site counts, at the start of the cleanup, of the byte-I/O families the
+plan retires (§4 P1). The byte-reader (br-read-*, 70 sites) and byte-buf
+(bb-write-*, 102 sites) are the ones that stay and are not pinned.
+  :stream-io     the patterns above
+  :interop-buf   (buf-set-...)  coalton/interop.lisp's second byte buffer
+  :compact-size-definitions  distinct DEFUN names containing compact-size or
+                 varint, core-varint excluded (a different encoding)")
+
+(defun %serialization-family-count (family text)
+  (ecase family
+    (:stream-io (reduce #'+ +stream-io-call-patterns+
+                        :key (lambda (p) (%count-occurrences p text))))
+    (:interop-buf (%count-occurrences "(buf-set-" text))
+    (:compact-size-definitions
+     (length (remove-duplicates
+              (loop for d in (%toplevel-definitions)
+                    for name = (%def-name d)
+                    when (and (eq (%def-kind d) :defun)
+                              (or (search "compact-size" name) (search "varint" name))
+                              (not (search "core-varint" name)))
+                      collect name)
+              :test #'string=)))))
+
+(test retiring-serialization-families-do-not-grow
+  "Four byte-I/O APIs do one job. New code goes through the byte-reader and
+byte-buf; the stream codecs and interop's private buffer only lose call sites."
+  (let ((text (%source-text)))
+    (loop for (family . then) in +retiring-serialization-family-baseline+
+          do (%ratchet-down family (%serialization-family-count family text) then
+                            "+RETIRING-SERIALIZATION-FAMILY-BASELINE+"
+                            "use the byte-reader/byte-buf"))))
+
+;;; --- bare error strings -------------------------------------------------
+
+(defparameter +bare-error-baseline+
+  '(("src/config.lisp" . 36)
+    ("src/crypto/" . 28)
+    ("src/logging.lisp" . 3)
+    ("src/mempool/" . 7)
+    ("src/mining/" . 1)
+    ("src/networking/" . 4)
+    ("src/node.lisp" . 36)
+    ("src/rpc/" . 14)
+    ("src/serialization/" . 49)
+    ("src/storage/" . 17)
+    ("src/validation/" . 3)
+    ("src/zmq.lisp" . 1))
+  "Count of (error \"...\") -- a string where a condition type belongs -- per
+top-level src/ directory (or file, for src/*.lisp) at the start of the
+cleanup. A place not listed tolerates none. A string cannot be handled
+selectively or mapped to an RPC error code; the plan introduces a condition
+hierarchy (§4 P4) and these only go down.")
+
+(defun %bare-error-census ()
+  "Alist of top-level src/ directory (or file) to its (error \"...\") count."
+  (let ((counts (make-hash-table :test #'equal)))
+    (loop for (file . lines) in (%source-corpus)
+          for slash = (position #\/ file :start (length "src/"))
+          for key = (if slash (subseq file 0 (1+ slash)) file)
+          do (loop for l across lines
+                   do (incf (gethash key counts 0) (%count-occurrences "(error \"" l))))
+    (sort (loop for k being the hash-keys of counts using (hash-value v)
+                collect (cons k v))
+          #'string< :key #'car)))
+
+(test bare-error-strings-do-not-grow
+  "Signal a condition, not a string."
+  (loop for (place . now) in (%bare-error-census)
+        do (%ratchet-down place now
+                          (or (cdr (assoc place +bare-error-baseline+ :test #'string=)) 0)
+                          "+BARE-ERROR-BASELINE+" "define or reuse a condition type")))
+
+;;; --- layering -------------------------------------------------------------
+
+(defun %load-order ()
+  "Each child of the src module in bitcoin-lisp.asd's order, as (path-prefix
+. index): a file as \"src/name.lisp\", a module as \"src/name/\". Derived
+from ASDF rather than copied, so a phase-4 reordering cannot leave a stale
+list behind."
+  (loop for child in (asdf:component-children (asdf:find-component :bitcoin-lisp "src"))
+        for i from 0
+        collect (cons (if (typep child 'asdf:module)
+                          (format nil "src/~A/" (asdf:component-name child))
+                          (format nil "src/~A.lisp" (asdf:component-name child)))
+                      i)))
+
+(defun %file-layer (file order)
+  (cdr (find-if (lambda (e) (uiop:string-prefix-p (car e) file)) order)))
+
+(defun %package-layer (package order)
+  "The load position of the module that owns PACKAGE: bitcoin-lisp.NAME and
+bitcoin-lisp.NAME.sub belong to src/NAME/. The top package BITCOIN-LISP is
+placed at src/package.lisp, position 0 -- its files span the whole load
+(logging.lisp is first, node.lisp last), so a reference INTO it is never
+counted as upward. That is a blind spot this test accepts, not a claim."
+  (if (string= package "bitcoin-lisp")
+      (cdr (assoc "src/package.lisp" order :test #'string=))
+      (let* ((start (length "bitcoin-lisp."))
+             (module (subseq package start (position #\. package :start start))))
+        (cdr (assoc (format nil "src/~A/" module) order :test #'string=)))))
+
+(defun %package-references (lines)
+  "The bitcoin-lisp.* packages LINES name with an explicit prefix: only
+bitcoin-lisp.foo followed by a colon counts; a mention in a comment or
+docstring does not."
+  (let ((found '()))
+    (loop for raw across lines
+          for line = (string-downcase raw)
+          do (loop with i = 0
+                   while (setf i (search "bitcoin-lisp." line :start2 i))
+                   do (let* ((end (or (position-if-not
+                                       (lambda (c) (or (alphanumericp c) (find c ".-")))
+                                       line :start i)
+                                      (length line))))
+                        (when (and (< end (length line)) (char= (char line end) #\:))
+                          (pushnew (subseq line i end) found :test #'string=))
+                        (setf i end))))
+    (sort found #'string<)))
+
+(defparameter +layering-violation-baseline+
+  '(("src/coalton/crypto.lisp" . "bitcoin-lisp.crypto")
+    ("src/coalton/interop.lisp" . "bitcoin-lisp.crypto")
+    ("src/coalton/interop.lisp" . "bitcoin-lisp.serialization")
+    ("src/coalton/interop.lisp" . "bitcoin-lisp.storage")
+    ("src/config.lisp" . "bitcoin-lisp.crypto")
+    ("src/config.lisp" . "bitcoin-lisp.mempool")
+    ("src/config.lisp" . "bitcoin-lisp.mining")
+    ("src/config.lisp" . "bitcoin-lisp.networking")
+    ("src/config.lisp" . "bitcoin-lisp.serialization")
+    ("src/config.lisp" . "bitcoin-lisp.storage")
+    ("src/config.lisp" . "bitcoin-lisp.validation")
+    ("src/validation/block.lisp" . "bitcoin-lisp.mempool")
+    ("src/validation/packages.lisp" . "bitcoin-lisp.mempool")
+    ("src/validation/transaction.lisp" . "bitcoin-lisp.mempool")
+    ("src/zmq.lisp" . "bitcoin-lisp.serialization"))
+  "(file . package) pairs where a file names a package whose module loads
+LATER, at the start of the cleanup. They compile because src/package.lisp
+defines every package up front, so the reader interns the symbol and the call
+resolves at run time -- which is exactly why nothing has ever flagged them.
+This is also the plan's \"which file reaches which package\" table (§4 P4):
+config.lisp loads second and names seven later packages.")
+
+(defun %layering-violations ()
+  (let ((order (%load-order)))
+    (loop for (file . lines) in (%source-corpus)
+          for layer = (%file-layer file order)
+          when layer
+            append (loop for package in (%package-references lines)
+                         for package-layer = (%package-layer package order)
+                         when (and package-layer (> package-layer layer))
+                           collect (cons file package)))))
+
+(test no-new-layering-violations
+  "A file may name its own package and the ones loaded before it. Naming a
+later one works only because src/package.lisp defines every package up front;
+the plan's phase 4 splits the tree into ASDF systems, at which point each of
+these becomes a compile error. Pinned so the list only shrinks until then."
+  (%check-pinned-set (%layering-violations) +layering-violation-baseline+
+                     "+LAYERING-VIOLATION-BASELINE+"
+                     "pass the value in, or move the code down" :test #'equal))
+
+(test refactoring-ratchets-can-actually-fail
+  "Positive controls: each scanner must find something on the real tree, and
+the measuring functions must measure a known shape correctly."
+  (is (plusp (length (%toplevel-definitions))) "no definitions scanned")
+  (is (plusp (length (%definitions-longer-than +longish-function-lines+)))
+      "no long definitions found -- a sweep that finds nothing proves nothing")
+  (is (plusp (length (%layering-violations))) "no upward references found")
+  (is (string= "(setf node-chain-state)"
+               (%definition-name "(defun (setf node-chain-state) (value node)" "(defun "))
+      "a setf function name must be kept whole")
+  (is (string= "foo" (%definition-name "(defun foo (a b)" "(defun ")))
+  (is (string= "bar" (%definition-name "(defmacro bar(x)" "(defmacro ")))
+  (is (= 5 (%form-line-count
+            (format nil "(defun f ()~%  \"doc with a line that starts like a form:~%~
+(values a b) and a paren char #\\( and a semicolon ; here\"~%  ~
+(list #\\) #| ) |# 1)~%  ) ; trailing comment~%(defun g () 2)")
+            0))
+      "strings, comments and char literals must not open or close a form")
+  (is (equal '("bitcoin-lisp.storage")
+             (%package-references
+              (vector ";; bitcoin-lisp.validation in a comment does not count"
+                      "(bitcoin-lisp.storage:current-height x)")))
+      "a package prefix counts, a mention in a comment does not")
+  (let ((order (%load-order)))
+    (is (< (%package-layer "bitcoin-lisp.crypto" order)
+           (%package-layer "bitcoin-lisp.storage" order)))
+    (is (= (%package-layer "bitcoin-lisp.coalton.interop" order)
+           (%file-layer "src/coalton/interop.lisp" order)))))
