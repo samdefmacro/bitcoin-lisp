@@ -40,6 +40,7 @@ src/; cold = cold-battery check count / failures.
 | 2026-08-28 | P0c | cold lane gates on `undefined variable` warnings (scripts/check-undefined-variables.sh, self-tested); 6 docstrings cut short by an inner `"` fixed (open-coins-view-db, dispatch-rpc-method, %target-unroutable-p, apply-log-categories, %write-settings-file, recon-fanout-target-p) | 0 | 12 | 61 | 42 | 8 | 205 | 15 | 6,767 | 34,425 / 0 (fresh) |
 | 2026-08-28 | P2e-2 | txindex joins node-indexes: the `:tx-index` argument threaded through 7 validation entry points, accept-downloaded-block, ibd-context, node-context and 4 RPC sites is gone (-263/+153 lines); index-height takes the chainstate; txindex rewinds its marker on disconnect; getindexinfo via the generics | 0 | 12 | 61 | 42 | 8 | 205 | 15 | 6,764 | 34,425 / 0 (fresh) |
 | 2026-08-28 | P2f-1 | define-option registry (src/config-options.lisp): 4 option lists + an inline list of 15 → one table of 192 rows; known/repeatable/core-only/scalar/collected all answered from it | 0 | 12 | 61 | 42 | 8 | 205 | 15 | 6,764 | 34,432 / 0 (fresh) |
+| 2026-08-28 | P2f-2 | option rows carry :global/:apply/:min; apply-config-globals 388 → 2 steps (table walk + a 113-line apply-parameter-interactions); registry mechanism split into src/option-registry.lisp, the table loads after the modules it names | 0 | 11 | 61 | 42 | 8 | 195 | 11 | 6,764 | 34,432 / 0 (fresh) |
 
 ## Notes
 
