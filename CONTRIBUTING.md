@@ -12,7 +12,7 @@ SBCL:
 
 ```
 scripts/dev.sh start                       # warm image
-scripts/dev.sh eval '(+ 1 2)'              # ~0.1s per eval
+scripts/dev.sh eval '(+ 1 2)'              # ~1 s per eval
 scripts/dev.sh test :bitcoin-core-script-tests
 cl-workbench validation run cold-unit      # the cold battery: verification of record (docker-test.sh)
 scripts/dev.sh stop
