@@ -124,7 +124,7 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; instead of per-tx immediate invs (Core m_tx_inventory_to_send +
   ;; m_next_inv_send_time). Entries are (txid wtxid fee-rate-per-kb),
   ;; oldest first. Guarded by the node lock: the P2P enqueue paths
-  ;; (handle-tx, orphan cascade) run under with-node-lock on the sync
+  ;; (handle-tx, orphan cascade) run under with-current-node-lock on the sync
   ;; thread, the RPC broadcast path (sendrawtransaction/submitpackage)
   ;; enqueues under the same lock from RPC threads, and the flush
   ;; (flush-tx-announcements) takes it too.

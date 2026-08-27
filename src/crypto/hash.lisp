@@ -147,15 +147,6 @@ re-hash; the table's structure is what needs the lock.")
       (setf (gethash tag *tagged-hash-cache*)
             (sha256 (flexi-streams:string-to-octets tag :external-format :utf-8)))))
 
-(defun tagged-hash (tag data)
-  "Compute BIP 340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data).
-   TAG is a string (e.g., \"BIP0340/challenge\", \"TapLeaf\").
-   DATA is a byte vector.
-   Returns a 32-byte hash."
-  (let ((tag-hash (get-tag-hash tag)))
-    (sha256 (concatenate '(vector (unsigned-byte 8))
-                         tag-hash tag-hash data))))
-
 ;; Pre-defined tag constants for Taproot
 ;; Use alexandria:define-constant for SBCL reload compatibility
 (alexandria:define-constant +tag-bip340-challenge+ "BIP0340/challenge" :test #'equal)

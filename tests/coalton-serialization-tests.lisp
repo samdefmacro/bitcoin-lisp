@@ -94,14 +94,6 @@
 
 ;;;; Serialization/Deserialization roundtrip tests
 
-(defun get-read-result-value (rr)
-  "Extract value from ReadResult."
-  (bitcoin-lisp.coalton.binary:read-result-value rr))
-
-(defun get-read-result-position (rr)
-  "Extract position from ReadResult."
-  (bitcoin-lisp.coalton.binary:read-result-position rr))
-
 (test serialize-outpoint-length
   "Test that serialized Outpoint is 36 bytes."
   (let* ((op (bitcoin-lisp.coalton.serialization:make-outpoint

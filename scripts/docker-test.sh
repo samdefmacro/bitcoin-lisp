@@ -29,11 +29,13 @@ if [ "$FRESH" = 1 ]; then
   # whichever way the run ends.
   BITCOIN_LISP_FASL_VOLUME="bitcoin-lisp-fasl-fresh-$(date +%s)-$$"
   export BITCOIN_LISP_FASL_VOLUME
-  trap 'docker volume rm -f "$BITCOIN_LISP_FASL_VOLUME" >/dev/null 2>&1 || true' EXIT
   echo "fresh FASL volume: $BITCOIN_LISP_FASL_VOLUME (removed on exit)" >&2
 fi
 
-# Not exec: the EXIT trap must run after the container returns.
+# Not exec: the EXIT trap must run after the container returns, and the
+# transcript is scanned afterwards.
+TRANSCRIPT="$(mktemp -t bitcoin-lisp-cold)"
+trap 'rm -f "$TRANSCRIPT"; [ "$FRESH" = 1 ] && docker volume rm -f "$BITCOIN_LISP_FASL_VOLUME" >/dev/null 2>&1; true' EXIT
 "$(dirname "$0")/docker-sbcl.sh" --dynamic-space-size 4096 --non-interactive \
   --eval '(asdf:load-system "bitcoin-lisp/tests")' \
   --eval "(let ((r (fiveam:run $SUITE)))
@@ -41,4 +43,19 @@ fi
             (when (null r)
               (format t \"~&suite $SUITE selected no tests~%\")
               (sb-ext:exit :code 1))
-            (unless (fiveam:results-status r) (sb-ext:exit :code 1)))"
+            (unless (fiveam:results-status r) (sb-ext:exit :code 1)))" \
+  2>&1 | tee "$TRANSCRIPT"
+rc=${PIPESTATUS[0]}
+
+# A definition that replaces one already loaded under the same name is a
+# duplicate -- two files in one package defining the same function, the later
+# silently winning. The 2026-08-27 cleanup found two: FSYNC-DIRECTORY (the
+# active copy fsynced a file where the callers meant its parent directory)
+# and TAGGED-HASH (a dead pure-Lisp copy). SBCL warned about both on every
+# cold run and nobody read it; now the run fails.
+if grep -q "WARNING: redefining BITCOIN-LISP" "$TRANSCRIPT"; then
+  echo "ERROR: a bitcoin-lisp definition was redefined during the load:" >&2
+  grep "WARNING: redefining BITCOIN-LISP" "$TRANSCRIPT" >&2
+  exit 1
+fi
+exit "$rc"

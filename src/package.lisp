@@ -234,6 +234,7 @@ compile against them. src/util/bytes.lisp.")
    #:read-compact-size
    #:write-compact-size
    #:compact-size-length
+   #:script-push-data
    #:read-bytes
    #:write-bytes
    #:read-var-bytes

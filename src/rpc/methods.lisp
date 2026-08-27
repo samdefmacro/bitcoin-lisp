@@ -5399,18 +5399,6 @@ with |ANYONECANPAY setting 0x80."
                                           :message "Invalid sighashtype")))))
     (logior base (if acp #x80 0))))
 
-(defun %script-push (data)
-  "Script push of DATA with the minimal pushdata encoding (direct for <=75 bytes,
-OP_PUSHDATA1 for 76-255, OP_PUSHDATA2 above). Covers signatures, pubkeys, and the
-larger redeem/witness scripts of multisig."
-  (let ((len (length data)))
-    (cond
-      ((<= len 75) (concatenate '(vector (unsigned-byte 8)) (vector len) data))
-      ((<= len 255) (concatenate '(vector (unsigned-byte 8)) (vector #x4c len) data))
-      (t (concatenate '(vector (unsigned-byte 8))
-                      (vector #x4d (logand len #xff) (logand (ash len -8) #xff))
-                      data)))))
-
 (defun %parse-multisig (script)
   "If SCRIPT is a bare multisig (OP_m <pubkey>...<pubkey> OP_n OP_CHECKMULTISIG),
 return (values m n pubkeys) — pubkeys a list of the n 33/65-byte key vectors in
@@ -5756,7 +5744,7 @@ error here (a missing key already failed in %compute-input-signatures)."
       (ecase (input-sig-kind sig)
         (:p2pkh (let ((s (first (input-sig-ecdsa sig))))
                   (values (concatenate '(vector (unsigned-byte 8))
-                                       (%script-push (cdr s)) (%script-push (car s)))
+                                       (bitcoin-lisp.serialization:script-push-data (cdr s)) (bitcoin-lisp.serialization:script-push-data (car s)))
                           nil nil)))
         (:p2wpkh (let ((s (first (input-sig-ecdsa sig))))
                    (values nil (list (cdr s) (car s)) nil)))
@@ -5766,7 +5754,7 @@ error here (a missing key already failed in %compute-input-signatures)."
         ;; the last two, so there is nothing to assemble here.
         (:p2tr-script (values nil (input-sig-stack sig) nil))
         (:p2sh-p2wpkh (let ((s (first (input-sig-ecdsa sig))))
-                        (values (%script-push (input-sig-redeem sig))
+                        (values (bitcoin-lisp.serialization:script-push-data (input-sig-redeem sig))
                                 (list (cdr s) (car s)) nil)))
         (:p2wsh (let ((err (threshold-error "")))
                   (if err
@@ -5777,7 +5765,7 @@ error here (a missing key already failed in %compute-input-signatures)."
         (:p2sh-p2wsh (let ((err (threshold-error "")))
                        (if err
                            (values nil nil err)
-                           (values (%script-push (input-sig-redeem sig))
+                           (values (bitcoin-lisp.serialization:script-push-data (input-sig-redeem sig))
                                    (concatenate 'list (list empty) (sigs)
                                                 (list (input-sig-witness-script sig)))
                                    nil))))
@@ -5789,7 +5777,7 @@ error here (a missing key already failed in %compute-input-signatures)."
                              (list (input-sig-witness-script sig)))
                  nil))
         (:p2sh-p2wsh-miniscript
-         (values (%script-push (input-sig-redeem sig))
+         (values (bitcoin-lisp.serialization:script-push-data (input-sig-redeem sig))
                  (append (input-sig-stack sig)
                          (list (input-sig-witness-script sig)))
                  nil))
@@ -5797,15 +5785,15 @@ error here (a missing key already failed in %compute-input-signatures)."
                      (if err
                          (values nil nil err)
                          (values (apply #'concatenate '(vector (unsigned-byte 8))
-                                        (vector 0) (mapcar #'%script-push (sigs)))
+                                        (vector 0) (mapcar #'bitcoin-lisp.serialization:script-push-data (sigs)))
                                  nil nil))))
         (:p2sh-multisig (let ((err (threshold-error "P2SH-")))
                           (if err
                               (values nil nil err)
                               (values (apply #'concatenate '(vector (unsigned-byte 8))
                                              (vector 0)
-                                             (append (mapcar #'%script-push (sigs))
-                                                     (list (%script-push (input-sig-redeem sig)))))
+                                             (append (mapcar #'bitcoin-lisp.serialization:script-push-data (sigs))
+                                                     (list (bitcoin-lisp.serialization:script-push-data (input-sig-redeem sig)))))
                                       nil nil))))))))
 
 (defun %build-spent-utxos (inputs prevmap)

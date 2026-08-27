@@ -1463,7 +1463,7 @@ Returns (values sel-result error-message)."
 
 (defun %op-return-script (data)
   "CScript() << OP_RETURN << data."
-  (concatenate '(vector (unsigned-byte 8)) (vector #x6a) (%script-push data)))
+  (concatenate '(vector (unsigned-byte 8)) (vector #x6a) (bitcoin-lisp.serialization:script-push-data data)))
 
 (defun %parse-outputs (network outputs-param)
   "Core ParseOutputs over the outputs argument: an object {address: amount,

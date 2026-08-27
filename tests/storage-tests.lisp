@@ -2307,3 +2307,22 @@ happened while the index was offline."
                    "and the location must be the NEW block"))))
       (bitcoin-lisp.storage:close-tx-index txindex)
       (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
+
+
+(test fsync-parent-directory-targets-the-directory
+  "fsync-parent-directory opens the directory a file lives in. Its
+predecessor was a second FSYNC-DIRECTORY, defined in utxo.lisp and silently
+replaced by flatfile.lisp's directory-taking one (same package, same name),
+so every rename-into-place in utxo.lisp fsynced the file and never the
+directory. The helper must accept a plain file path and a bare name."
+  (let ((path (merge-pathnames "fsync-parent-probe.dat" (uiop:temporary-directory))))
+    (with-open-file (o path :direction :output :if-exists :supersede
+                            :element-type '(unsigned-byte 8))
+      (write-byte 1 o))
+    (unwind-protect
+         (progn
+           (finishes (bitcoin-lisp.storage::fsync-parent-directory (namestring path)))
+           (finishes (bitcoin-lisp.storage::fsync-parent-directory "bare-name.dat"))
+           (finishes (bitcoin-lisp.storage::fsync-directory
+                      (namestring (uiop:temporary-directory)))))
+      (delete-file path))))

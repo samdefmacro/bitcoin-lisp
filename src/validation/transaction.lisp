@@ -5,12 +5,6 @@
 ;;; This module validates Bitcoin transactions according to consensus rules.
 ;;; Uses Coalton Satoshi type for amount calculations to ensure type safety.
 
-;;;; Imports for typed operations
-(defun wrap-satoshi (v) (bitcoin-lisp.coalton.interop:wrap-satoshi v))
-(defun unwrap-satoshi (s) (bitcoin-lisp.coalton.interop:unwrap-satoshi s))
-(defun satoshi+ (a b) (bitcoin-lisp.coalton.interop:satoshi+ a b))
-(defun satoshi> (a b) (bitcoin-lisp.coalton.interop:satoshi> a b))
-
 ;;;; Constants
 (defconstant +max-money+ 2100000000000000)  ; 21 million BTC in satoshis
 (defconstant +coin+ 100000000)               ; 1 BTC in satoshis
@@ -30,7 +24,7 @@
 (defun max-money-satoshi ()
   "Return +max-money+ as a Satoshi type (lazy initialization)."
   (or *max-money-satoshi*
-      (setf *max-money-satoshi* (wrap-satoshi +max-money+))))
+      (setf *max-money-satoshi* (bitcoin-lisp.coalton.interop:wrap-satoshi +max-money+))))
 
 ;;;; Structure validation (context-free)
 
@@ -78,7 +72,7 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
           (setf (gethash key seen-outpoints) t))))
 
     ;; Validate outputs using typed Satoshi arithmetic
-    (let ((total-output (wrap-satoshi 0)))
+    (let ((total-output (bitcoin-lisp.coalton.interop:wrap-satoshi 0)))
       (bitcoin-lisp.serialization:dovector (output outputs)
         (let ((value (bitcoin-lisp.serialization:tx-out-value output)))
           ;; Output value must be non-negative
@@ -90,9 +84,9 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
             (return-from validate-transaction-structure
               (values nil :output-too-large)))
           ;; Use typed addition
-          (setf total-output (satoshi+ total-output (wrap-satoshi value)))))
+          (setf total-output (bitcoin-lisp.coalton.interop:satoshi+ total-output (bitcoin-lisp.coalton.interop:wrap-satoshi value)))))
       ;; Total output must not exceed max money
-      (when (satoshi> total-output (max-money-satoshi))
+      (when (bitcoin-lisp.coalton.interop:satoshi> total-output (max-money-satoshi))
         (return-from validate-transaction-structure
           (values nil :total-output-too-large))))
 
@@ -135,8 +129,8 @@ Returns (VALUES T NIL FEE) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure
 FEE is returned as a Satoshi type."
   (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
         (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
-        (total-input (wrap-satoshi 0))
-        (total-output (wrap-satoshi 0)))
+        (total-input (bitcoin-lisp.coalton.interop:wrap-satoshi 0))
+        (total-output (bitcoin-lisp.coalton.interop:wrap-satoshi 0)))
 
     ;; Skip input validation for coinbase
     (unless is-coinbase
@@ -176,18 +170,18 @@ FEE is returned as a Satoshi type."
 
           ;; Use typed addition for input sum
           (setf total-input
-                (satoshi+ total-input
-                          (wrap-satoshi (bitcoin-lisp.storage:utxo-entry-value utxo)))))))
+                (bitcoin-lisp.coalton.interop:satoshi+ total-input
+                          (bitcoin-lisp.coalton.interop:wrap-satoshi (bitcoin-lisp.storage:utxo-entry-value utxo)))))))
 
     ;; Sum outputs with typed addition
     (bitcoin-lisp.serialization:dovector (output outputs)
       (setf total-output
-            (satoshi+ total-output
-                      (wrap-satoshi (bitcoin-lisp.serialization:tx-out-value output)))))
+            (bitcoin-lisp.coalton.interop:satoshi+ total-output
+                      (bitcoin-lisp.coalton.interop:wrap-satoshi (bitcoin-lisp.serialization:tx-out-value output)))))
 
     ;; For non-coinbase, inputs must cover outputs
     (unless is-coinbase
-      (when (satoshi> total-output total-input)
+      (when (bitcoin-lisp.coalton.interop:satoshi> total-output total-input)
         (return-from validate-transaction-contextual
           (values nil :insufficient-funds nil))))
 
@@ -1161,7 +1155,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
         ;; size — Core's ws.m_vsize is the entry's GetTxSize()
         ;; (validation.cpp:929), not the raw BIP141 vsize — so the fee floor,
         ;; TRUC size caps, and RBF economics all price sigop-dense txs.
-        (let* ((fee-value (unwrap-satoshi fee))
+        (let* ((fee-value (bitcoin-lisp.coalton.interop:unwrap-satoshi fee))
                (modified-fee-value
                  (+ fee-value
                     (gethash (bitcoin-lisp.serialization:transaction-hash tx)

@@ -281,16 +281,6 @@ FINALIZE (Core FlatFileSeq::Flush). POS is the first UNWRITTEN position."
     (fsync-directory (flat-file-seq-dir seq))
     t))
 
-(defun fsync-directory (dir)
-  "fsync a directory so newly created names are durable (Core DirectoryCommit)."
-  #+sbcl
-  (handler-case
-      (let ((fd (sb-posix:open (namestring (truename dir)) sb-posix:o-rdonly)))
-        (unwind-protect (sb-posix:fsync fd)
-          (sb-posix:close fd)))
-    (error () nil))
-  #-sbcl nil)
-
 ;;;; --- Record framing -----------------------------------------------------
 ;;;;
 ;;;; Every record on disk is [4-byte network magic][4-byte LE length][payload],

@@ -380,3 +380,22 @@ marker/flag (byte 4, the input count, must be non-zero)."
            #xaabbccddeeff))
     (is (= (second (bitcoin-lisp.serialization:compact-block-short-ids cb2))
            #x112233445566))))
+
+
+(test script-push-data-minimal-encoding
+  "Core CScript::operator<< picks the smallest push opcode for the length:
+direct to 75, OP_PUSHDATA1 to 255, OP_PUSHDATA2 to 65535, OP_PUSHDATA4 above.
+The 76-byte case is the testnet4 genesis timestamp message."
+  (flet ((push-of (n)
+           (bitcoin-lisp.serialization:script-push-data
+            (make-array n :element-type '(unsigned-byte 8) :initial-element 7)))
+         (prefix (v k) (coerce (subseq v 0 k) 'list)))
+    (is (equal '(0) (coerce (push-of 0) 'list)))
+    (is (equal '(75) (prefix (push-of 75) 1)))
+    (is (equal '(#x4c 76) (prefix (push-of 76) 2)))
+    (is (equal '(#x4c 255) (prefix (push-of 255) 2)))
+    (is (equal '(#x4d #x00 #x01) (prefix (push-of 256) 3)))
+    (is (equal '(#x4d #xff #xff) (prefix (push-of 65535) 3)))
+    (is (equal '(#x4e #x00 #x00 #x01 #x00) (prefix (push-of 65536) 5)))
+    (is (= (+ 3 300) (length (push-of 300))))
+    (is (typep (push-of 10) '(simple-array (unsigned-byte 8) (*))))))

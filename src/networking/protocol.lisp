@@ -4,7 +4,7 @@
 ;;;
 ;;; Higher-level protocol operations for syncing and message handling.
 
-(defmacro with-node-lock (&body body)
+(defmacro with-current-node-lock (&body body)
   "Execute BODY while holding the node lock for thread-safe state access.
 Guards shared state (chain-state, UTXO set, mempool, peer list) against
 concurrent access from RPC and sync threads."
@@ -942,7 +942,7 @@ committed to the index from announcements."
     ;; Node lock: process-headers (inside ingest-headers-from-peer) mutates
     ;; the block index, which the RPC threads (submitheader, chain queries)
     ;; also touch under this lock — the same discipline handle-block follows.
-    (with-node-lock
+    (with-current-node-lock
       (ingest-headers-from-peer peer headers chain-state))))
 
 ;;; Block handling
@@ -1083,7 +1083,7 @@ ones, so promotion must not be a compact-block-only privilege."
   (let ((block (bitcoin-lisp.serialization:parse-block-payload payload)))
     (when block
       (let ((connected
-              (with-node-lock
+              (with-current-node-lock
                 (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
                        (hash (bitcoin-lisp.serialization:block-header-hash header))
                        (tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
@@ -1744,7 +1744,7 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
   (handler-case
       (let ((tx (bitcoin-lisp.serialization:parse-tx-payload payload)))
         (when tx
-          (with-node-lock
+          (with-current-node-lock
             (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
                   (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))
                   (current-height (bitcoin-lisp.storage:current-height chain-state)))
@@ -2940,7 +2940,7 @@ the shared *next-inbound-inv-flush* rotation with mean
 Holds the node lock: the queues are also written by the RPC broadcast
 path (sendrawtransaction/submitpackage), which enqueues under the same
 lock from RPC handler threads."
-  (with-node-lock
+  (with-current-node-lock
     (let ((now (get-internal-real-time))
           (inbound-due nil))
       ;; Shared inbound rotation.
@@ -3040,7 +3040,7 @@ the first — is scheduled 10min + rand(5min) out."
             ((>= now *next-initial-broadcast-time*)
              (setf *next-initial-broadcast-time*
                    (+ now (%next-initial-broadcast-ticks)))
-             (with-node-lock
+             (with-current-node-lock
                (reattempt-initial-broadcast peers mempool)))))))
 
 (defun block-relay-targets (source-peer peers)
@@ -3598,7 +3598,7 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
     ;; in-flight reconstruction of the block we are actually missing (Core
     ;; keeps per-block in-flight state, so it has no such cross-talk).
     (multiple-value-bind (verdict reason credits-announcement)
-        (with-node-lock
+        (with-current-node-lock
           (compact-block-header-verdict chain-state header block-hash prev-hash))
       (ecase verdict
         (:accept
@@ -3666,7 +3666,7 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
          ;; Process like a normal block (fork-aware: a reconstructed block on a
          ;; side branch is stored and reorged, not tip-validated).
          (let ((connected
-                 (with-node-lock
+                 (with-current-node-lock
                    (let ((tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
                      (multiple-value-bind (valid error)
                          (accept-downloaded-block block chain-state utxo-set block-store
@@ -3777,7 +3777,7 @@ punished outright (:3487-3491)."
           ;; Block delivery from this peer (getpeerinfo "last_block").
           (record-block-received-from-peer peer)
           (let ((connected
-                  (with-node-lock
+                  (with-current-node-lock
                     (let ((tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
                       (multiple-value-bind (valid error)
                           (accept-downloaded-block block chain-state utxo-set block-store
