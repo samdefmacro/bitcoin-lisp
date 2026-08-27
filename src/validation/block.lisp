@@ -2602,15 +2602,9 @@ Handles chain reorganizations when a competing chain has more work."
                                utxo-set block new-height)))
              (%warn-if-undo-empty block hash new-height spent-utxos)
              (store-undo-data hash spent-utxos new-height :block block)
-             ;; BIP158: add this block's basic filter to the block filter index
-             ;; (no-op unless the index is enabled; never signals).
-             (bl:index-block-filter chain-state block hash new-height spent-utxos)
-             ;; coinstatsindex: fold this block into the running UTXO stats
-             ;; (no-op unless enabled; never signals).
-             (bl:index-block-coinstats chain-state block hash new-height spent-utxos)
-             ;; txospenderindex: record which tx here spent each output it
-             ;; consumes (no-op unless enabled; never signals).
-             (bl:index-block-txospenders chain-state block hash new-height)
+             ;; Every enabled index (block filter, coinstats, spender) folds
+             ;; the block in; no-op with none enabled, never signals.
+             (bl:index-block-connected chain-state block hash new-height spent-utxos)
              ;; Record fee statistics for fee estimation
              (when fee-estimator
                (let ((stats (bl.mp:compute-block-fee-stats
@@ -3419,10 +3413,11 @@ comment above."
             ;; PHASE C with every other side effect, so an INTERRUPTED reorg —
             ;; which rolls back and leaves these blocks connected — never
             ;; erases entries for blocks that are still on the chain.
-            (bl:unindex-block-txospenders
+            (bl:index-block-disconnected
              chain-state (car pair)
              (bl.ser:block-header-hash
-              (bl.ser:bitcoin-block-header (car pair)))))
+              (bl.ser:bitcoin-block-header (car pair)))
+             (cdr pair)))
           (dolist (item (reverse connected))
             (destructuring-bind (entry block height spent-utxos) item
               (when fee-estimator
@@ -3439,16 +3434,12 @@ comment above."
                 (when (and tx-index (bl.store:tx-index-enabled tx-index))
                   (bl.store:txindex-add-block tx-index block hash)
                   (bl.store:txindex-set-best-block tx-index hash))
-                ;; BIP158: index the reconnected block's basic filter (oldest-to-
-                ;; newest here, so its header chains off the already-indexed parent).
-                (bl:index-block-filter chain-state block hash height spent-utxos)
-                ;; coinstatsindex: reconnected oldest-to-newest, so each block
-                ;; loads its (already-reindexed) parent's running state.
-                (bl:index-block-coinstats chain-state block hash height spent-utxos)
-                ;; txospenderindex: the erase for the disconnected side already
-                ;; ran earlier in this phase, so these writes cannot be undone
-                ;; by it.
-                (bl:index-block-txospenders chain-state block hash height))
+                ;; Reconnected oldest-to-newest, so a filter header chains off
+                ;; its already-indexed parent and each coinstats record loads
+                ;; its parent's running state; the spender erase for the
+                ;; disconnected side already ran earlier in this phase, so
+                ;; these writes cannot be undone by it.
+                (bl:index-block-connected chain-state block hash height spent-utxos))
               (when mempool
                 (bl.mp:mempool-remove-for-block mempool block)
                 (bl.mp:orphan-erase-for-block

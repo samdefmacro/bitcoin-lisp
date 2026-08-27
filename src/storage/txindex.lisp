@@ -15,7 +15,7 @@
   (block-hash nil :type (or null (simple-array (unsigned-byte 8) (32))))
   (tx-position 0 :type (unsigned-byte 32)))
 
-(defstruct tx-index
+(defstruct (tx-index (:include base-index))
   "Transaction index state — a LevelDB index, as Core's TxIndex is.
 
 Core's TxIndex holds only a DB (index/txindex.h:32): ReadTxPos is one DB read
@@ -31,10 +31,31 @@ network the node claims to support. A hard OOM, not a diagnosable refusal.
 
 Moving to LevelDB deletes the in-memory table, the startup replay and the
 per-lookup file open together, and gives the index the persisted best-block
-marker it never had."
-  (base-path nil :type (or null pathname))
-  (db nil)
-  (enabled nil :type boolean))
+marker it never had.")
+
+(defmethod index-name ((index tx-index)) "txindex")
+(defmethod index-best-block ((index tx-index))
+  "The txindex marker is a hash only (Core TxIndex stores a locator, not a
+height); the height comes from the chain, so it is -1 here."
+  (let ((hash (txindex-best-block index)))
+    (and hash (values hash -1))))
+(defmethod index-height ((index tx-index))
+  "-1: the txindex marker carries no height; %TXINDEX-RESUME-HEIGHT resolves
+it against the chain when a build resumes."
+  -1)
+(defmethod index-set-best ((index tx-index) block-hash height)
+  (declare (ignore height))
+  (txindex-set-best-block index block-hash))
+(defmethod index-clear-best ((index tx-index))
+  (when (tx-index-db index) (leveldb-delete (tx-index-db index) *txindex-meta-key*)))
+(defmethod index-write-block ((index tx-index) chainstate block block-hash height spent-utxos)
+  (declare (ignore chainstate height spent-utxos))
+  (txindex-add-block index block block-hash)
+  (txindex-set-best-block index block-hash)
+  (values t nil))
+(defmethod index-sync ((index tx-index) chainstate block-store &key undo-fn subsidy-fn progress)
+  (declare (ignore undo-fn subsidy-fn))
+  (build-tx-index index chainstate block-store :progress-callback progress))
 
 (defconstant +txindex-record-size+ 36
   "Value size: 32 (block-hash) + 4 (tx position, little-endian).")

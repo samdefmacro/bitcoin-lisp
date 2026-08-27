@@ -152,12 +152,12 @@ an unrelated script (almost surely) does not."
 ;;;
 ;;; Reuses the regtest fixture from mining-tests.lisp (%with-regtest,
 ;;; %regtest-node-fixture). Binding bl::*node* lets the connect-time
-;;; hook (index-block-filter) fire as generatetodescriptor mines blocks.
+;;; hook (index-block-connected) fire as generatetodescriptor mines blocks.
 
 (defun %bfi-regtest-node ()
   "A regtest node at genesis with an enabled block filter index (fresh temp
 DB), genesis-anchored the way production startup leaves it: the initial
-backfill (%catch-up-blockfilterindex -> build-blockfilterindex) indexes the
+backfill (catch-up-index -> index-sync -> build-blockfilterindex) indexes the
 genesis filter from chain parameters before any block connects."
   (let* ((tag (format nil "bfi~D" (get-internal-real-time)))
          (node (%regtest-node-fixture tag))

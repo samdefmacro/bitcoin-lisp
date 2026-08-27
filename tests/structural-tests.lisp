@@ -549,7 +549,7 @@ to make on purpose, so the set is pinned."
   "Above this a definition counts against +LONGISH-FUNCTION-CEILING+.")
 
 (defparameter +long-function-baseline+
-  '(("start-node" . 1332)                        ; node.lisp
+  '(("start-node" . 1227)                        ; node.lisp
     ("perform-reorg" . 465)                      ; validation/block.lisp
     ("%create-transaction-internal" . 442)       ; rpc/wallet-spend.lisp
     ("apply-config-globals" . 387)               ; config.lisp

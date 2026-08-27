@@ -36,6 +36,7 @@ src/; cold = cold-battery check count / failures.
 | 2026-08-28 | P2b-2 | define-message: 6 struct+reader+writer triples → 6 field lists (src/serialization/message-macro.lisp) | 0 | 13 | 62 | 42 | 8 | 202 | 15 | 6,783 | 34,420 / 0 (fresh) |
 | 2026-08-28 | P2c | node-context: every P2P handler and the IBD pump take (peer payload ctx) instead of up to 8 params | 0 | 12 | 62 | 42 | 8 | 202 | 15 | 6,783 | 34,420 / 0 (fresh) |
 | 2026-08-28 | P2d-1 | define-rpc: 161 handlers register themselves; register-all-methods 197 → 6 lines | 0 | 12 | 61 | 42 | 8 | 202 | 15 | 6,783 | 34,424 / 0 (fresh) |
+| 2026-08-28 | P2e-1 | base-index + 9 generics: 3 per-index catch-ups → catch-up-index, 3 connect hooks → index-block-connected/disconnected (txindex still via :tx-index, P2e-2); start-node 1332 → 1227 (%start-txindex, %start-indexes) | 0 | 12 | 61 | 42 | 8 | 205† | 15 | 6,767 | 34,425 / 0 (fresh) |
 
 ## Notes
 
@@ -48,3 +49,5 @@ src/; cold = cold-battery check count / failures.
 - `ms-from-script` (243 lines) is a faithful port of Core's
   `miniscript.h` FromScript; it is on the >200 list so the decision to leave
   it is made in P3, not by default.
+
+† 205 is the census on main as well — the earlier rows carried a stale 202; the P2e-1 diff adds and removes no `(error "...")` form.

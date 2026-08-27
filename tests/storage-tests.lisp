@@ -2122,6 +2122,18 @@ a complete, correct, unreachable function is exactly the shape of this bug."
         "start-node must call build-tx-index, or -txindex indexes nothing
          historical")))
 
+(test txospenderindex-startup-catch-up-is-wired
+  "The same shape for -txospenderindex, found by the P2e-1 review: its only
+catch-up caller was the assumeutxo-promotion rebind, so an existing node that
+turned the flag on indexed nothing historical and gettxspendingprevout knew
+only spends connected after the restart. Core starts every index's background
+sync from init (init.cpp StartIndexBackgroundSync)."
+  (let ((src (uiop:read-file-string
+              (merge-pathnames "src/node.lisp"
+                               (asdf:system-source-directory :bitcoin-lisp)))))
+    (is (search "(catch-up-index *node* (node-txospenderindex *node*))" src)
+        "start-node must catch the txospenderindex up over stored blocks")))
+
 (defun %txresume-chain (n)
   "A chain-state with an N-block active chain (heights 0..N-1) linked by
 prev-entry, so GET-BLOCK-AT-HEIGHT can walk it. Returns (values state hashes)."

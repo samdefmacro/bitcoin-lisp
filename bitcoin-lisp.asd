@@ -88,6 +88,7 @@
                                (:file "chain")
                                (:file "reindex")
                                (:file "migrate-blocks")
+                               (:file "index-base")      ; the protocol the four indexes below implement
                                (:file "txindex")
                                (:file "txospenderindex")
                                (:file "blockfilter")

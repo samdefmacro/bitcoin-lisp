@@ -23,11 +23,20 @@
 (defconstant +bfi-key-meta+ #x42
   "LevelDB key byte ('B') for the best-indexed-block metadata record.")
 
-(defstruct blockfilterindex
-  "Block filter index state."
-  (base-path nil :type (or null pathname))
-  (db nil)
-  (enabled nil :type boolean))
+(defstruct (blockfilterindex (:include base-index))
+  "Block filter index state.")
+
+(defmethod index-name ((index blockfilterindex)) "basic block filter index")
+(defmethod index-height ((index blockfilterindex)) (blockfilterindex-height index))
+(defmethod index-best-block ((index blockfilterindex))
+  (multiple-value-bind (height hash) (blockfilterindex-best index)
+    (and hash (values hash height))))
+(defmethod index-set-best ((index blockfilterindex) block-hash height)
+  (blockfilterindex-set-best index height block-hash))
+(defmethod index-clear-best ((index blockfilterindex)) (blockfilterindex-clear-best index))
+(defmethod index-write-block ((index blockfilterindex) chainstate block block-hash height spent-utxos)
+  (declare (ignore chainstate))
+  (blockfilterindex-add-block index block block-hash height spent-utxos))
 
 (defun blockfilterindex-path (base-path)
   "Directory holding the block filter index LevelDB. Core's

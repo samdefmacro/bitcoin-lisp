@@ -50,14 +50,28 @@ a 45-byte spender key.")
   (map '(vector (unsigned-byte 8)) #'char-code "siphash_key")
   "Core stores its salt under this literal key (txospenderindex.cpp:66).")
 
-(defstruct txospender-index
+(defstruct (txospender-index (:include base-index))
   "Spender index state. Like the txindex, the database IS the index: there is
 no in-memory table and no startup replay."
-  (base-path nil :type (or null pathname))
-  (db nil)
-  (enabled nil :type boolean)
   (k0 0 :type (unsigned-byte 64))
   (k1 0 :type (unsigned-byte 64)))
+
+(defmethod index-name ((index txospender-index)) "txospenderindex")
+(defmethod index-height ((index txospender-index)) (txospenderindex-height index))
+(defmethod index-best-block ((index txospender-index)) (txospenderindex-best-block index))
+(defmethod index-set-best ((index txospender-index) block-hash height)
+  (txospenderindex-set-best-block index block-hash height))
+(defmethod index-clear-best ((index txospender-index))
+  (when (%txospender-index-live-p index)
+    (leveldb-delete (txospender-index-db index) *txospender-meta-key*)))
+(defmethod index-write-block ((index txospender-index) chainstate block block-hash height spent-utxos)
+  (declare (ignore chainstate spent-utxos))
+  (txospenderindex-add-block index block block-hash)
+  (txospenderindex-set-best-block index block-hash height)
+  (values t nil))
+(defmethod index-rewind-block ((index txospender-index) chainstate block block-hash height)
+  (declare (ignore chainstate height))
+  (txospenderindex-remove-block index block block-hash))
 
 (defun txospenderindex-db-path (base-path)
   "Directory of the spender index LevelDB (Core's indexes/txospenderindex/)."
