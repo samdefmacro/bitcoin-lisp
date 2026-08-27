@@ -528,7 +528,7 @@ discarded every DNS seed of a proxied node."
     (is-true seeds)
     (is-true (notany #'bl.net:parse-network-address seeds))
     (is-true (every #'bl.net:parse-network-address
-                    bl.net:*testnet4-fixed-seeds*))
+                    (bl.chain:chain-params-fixed-seeds (bl.chain:find-chain-params :testnet4))))
     ;; -proxy with no -onlynet: discover-peers returns the hostnames verbatim
     ;; (no DNS is performed on this branch, so the test does no network I/O)
     ;; and every one must survive the filter.
@@ -572,7 +572,7 @@ is dropped along with every clearnet literal."
       (is (null (bl::%reachable-seed-addresses
                  '("203.0.113.7" "2001:db8::1"))))
       (is (null (bl::%reachable-seed-addresses
-                 bl.net:*testnet4-fixed-seeds*)))
+                 (bl.chain:chain-params-fixed-seeds (bl.chain:find-chain-params :testnet4)))))
       ;; An onion literal is of course still dialable.
       (is (equal onion (bl::%reachable-seed-addresses onion))))
     ;; cjdns-only is equally clearnet-free with a proxy configured.

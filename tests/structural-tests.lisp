@@ -48,6 +48,9 @@
     ;; the CompactSize writer goes through buf-set-u16-le directly, so nothing
     ;; in src/ calls this one. Kept for the family's completeness.
     "bitcoin-lisp.bytes:bb-write-u16-le"
+    ;; The chain-params table's enumerator: API for tests and tools; no
+    ;; production path iterates over chains.
+    "bitcoin-lisp.chainparams:chain-names"
     "bitcoin-lisp.crypto:bip324-cipher-initialized-p"
     "bitcoin-lisp.crypto:ellswift-decode"
     "bitcoin-lisp.crypto:muhash-combine"
@@ -654,8 +657,8 @@ byte-buf; the stream codecs and interop's private buffer only lose call sites."
     ("src/node.lisp" . 36)
     ("src/rpc/" . 14)
     ("src/serialization/" . 44)
-    ("src/storage/" . 16)
-    ("src/util/" . 5)
+    ("src/storage/" . 17)
+    ("src/util/" . 6)
     ("src/validation/" . 3)
     ("src/zmq.lisp" . 1))
   "Count of (error \"...\") -- a string where a condition type belongs -- per
@@ -787,6 +790,40 @@ these becomes a compile error. Pinned so the list only shrinks until then."
                      "+LAYERING-VIOLATION-BASELINE+"
                      "pass the value in, or move the code down" :test #'equal))
 
+(defparameter +chain-dispatch-ceiling+ 1
+  "How many (ecase network ...) / (case network ...) forms whose branches name
+a chain (:mainnet, :testnet4, ...) may exist outside src/util/chainparams.lisp.
+One since P2a: rpc-getnetworkinfo's \"networks\" entry, which prints a chain
+name where Core lists network TYPES (ipv4, onion, ...) -- a divergence for the
+RPC work to fix, not a parameter to add to the table. Everything else reads
+the table, and a new per-chain fact is a new field there, not a new dispatch.")
+
+(defun %chain-dispatch-forms ()
+  "(file . line) of every case/ecase over a network variable whose next lines
+mention a chain keyword, outside the chain-params table itself."
+  (let ((found '()))
+    (loop for (file . lines) in (%source-corpus)
+          unless (string= file "src/util/chainparams.lisp")
+            do (loop for line across lines
+                     for i from 0
+                     when (and (search "case network" line)
+                               (or (search "(ecase" line) (search "(case" line))
+                               (loop for j from i below (min (length lines) (+ i 8))
+                                     thereis (or (search ":mainnet" (aref lines j))
+                                                 (search ":testnet4" (aref lines j))
+                                                 (search ":regtest" (aref lines j)))))
+                       do (push (cons file (1+ i)) found)))
+    (nreverse found)))
+
+(test no-chain-dispatch-outside-chainparams
+  "Per-chain facts live in one table. A CASE over the network keyword whose
+branches name chains is the shape this test retires -- there were 29 of them
+in 8 files before src/util/chainparams.lisp."
+  (let ((forms (%chain-dispatch-forms)))
+    (is (<= (length forms) +chain-dispatch-ceiling+)
+        "~D chain dispatch form~:P outside the table: ~S -- add a field to ~
+chain-params instead" (length forms) forms)))
+
 (test refactoring-ratchets-can-actually-fail
   "Positive controls: each scanner must find something on the real tree, and
 the measuring functions must measure a known shape correctly."
@@ -794,6 +831,14 @@ the measuring functions must measure a known shape correctly."
   (is (plusp (length (%definitions-longer-than +longish-function-lines+)))
       "no long definitions found -- a sweep that finds nothing proves nothing")
   (is (plusp (length (%layering-violations))) "no upward references found")
+  (is (equal '(("probe.lisp" . 2))
+             (let ((*source-corpus* (list (cons "probe.lisp"
+                                                (vector "(defun f (network)"
+                                                        "  (ecase network"
+                                                        "    (:mainnet 1)"
+                                                        "    (:regtest 2)))")))))
+               (%chain-dispatch-forms)))
+      "a case over the network keyword with chain branches must be found")
   (is (string= "(setf node-chain-state)"
                (%definition-name "(defun (setf node-chain-state) (value node)" "(defun "))
       "a setf function name must be kept whole")

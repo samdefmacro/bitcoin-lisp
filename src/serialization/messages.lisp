@@ -10,39 +10,7 @@
 ;;; - Variable: Payload
 
 ;;;; Network magic bytes
-;;; Using alexandria:define-constant for arrays to handle SBCL reloading
-
-(alexandria:define-constant +mainnet-magic+
-  (make-array 4 :element-type '(unsigned-byte 8)
-                :initial-contents '(#xF9 #xBE #xB4 #xD9))
-  :test #'equalp
-  :documentation "Mainnet network magic bytes.")
-
-(alexandria:define-constant +testnet3-magic+
-  (make-array 4 :element-type '(unsigned-byte 8)
-                :initial-contents '(#x0B #x11 #x09 #x07))
-  :test #'equalp
-  :documentation "Testnet network magic bytes.")
-
-(alexandria:define-constant +testnet4-magic+
-  (make-array 4 :element-type '(unsigned-byte 8)
-                :initial-contents '(#x1C #x16 #x3F #x28))
-  :test #'equalp
-  :documentation "Testnet4 network magic bytes.")
-
-(alexandria:define-constant +signet-magic+
-  (make-array 4 :element-type '(unsigned-byte 8)
-                :initial-contents '(#x0A #x03 #xCF #x40))
-  :test #'equalp
-  :documentation "Default signet network magic bytes.")
-
-(alexandria:define-constant +regtest-magic+
-  (make-array 4 :element-type '(unsigned-byte 8)
-                :initial-contents '(#xFA #xBF #xB5 #xDA))
-  :test #'equalp
-  :documentation "Regtest network magic bytes.")
-
-(defvar *network-magic* +testnet3-magic+
+(defvar *network-magic* (bl.chain:chain-params-magic (bl.chain:find-chain-params :testnet3))
   "Current network magic bytes.")
 
 ;;;; Message header
@@ -52,7 +20,7 @@
 
 (defstruct message-header
   "P2P message header."
-  (magic (copy-seq +testnet3-magic+) :type (simple-array (unsigned-byte 8) (4)))
+  (magic (copy-seq *network-magic*) :type (simple-array (unsigned-byte 8) (4)))
   (command "" :type string)
   (payload-length 0 :type (unsigned-byte 32))
   (checksum (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)

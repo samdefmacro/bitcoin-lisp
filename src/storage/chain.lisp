@@ -256,38 +256,9 @@ validation.cpp:6379-6388). O(index size) — fine for its callers
              (chain-state-block-index chain-state))
     best))
 
-;;; Testnet genesis block hash (little-endian, as on wire)
-(defvar *testnet3-genesis-hash*
-  (bl.crypto:hex-to-bytes
-   "43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000"))
-
-(defvar *testnet4-genesis-hash*
-  (bl.crypto:hex-to-bytes
-   "43f08bdab050e35b567c864b91f47f50ae725ae2de53bcfbbaf284da00000000"))
-
-(defvar *signet-genesis-hash*
-  (bl.crypto:hex-to-bytes
-   "f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e973988108000000"))
-
-;;; Mainnet genesis block hash (little-endian, as on wire)
-(defvar *mainnet-genesis-hash*
-  (bl.crypto:hex-to-bytes
-   "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000"))
-
-;;; Regtest genesis block hash (little-endian). Big-endian display:
-;;; 0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
-(defvar *regtest-genesis-hash*
-  (bl.crypto:hex-to-bytes
-   "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"))
-
 (defun network-genesis-hash (network)
-  "Return the genesis block hash for NETWORK."
-  (ecase network
-    (:testnet3 \*testnet3-genesis-hash*)
-    (:testnet4 *testnet4-genesis-hash*)
-    (:signet *signet-genesis-hash*)
-    (:regtest *regtest-genesis-hash*)
-    (:mainnet *mainnet-genesis-hash*)))
+  "NETWORK's genesis block hash, 32 bytes in wire order (chain-params-genesis-hash)."
+  (bl.chain:chain-params-genesis-hash (bl.chain:find-chain-params network)))
 
 ;;;; Genesis block construction (Core kernel/chainparams.cpp CreateGenesisBlock)
 ;;;
@@ -310,23 +281,14 @@ validation.cpp:6379-6388). O(index size) — fine for its callers
 mainnet, testnet3, signet and regtest. Verified by the genesis-hash check in
 MAKE-GENESIS-BLOCK: a transcription error cannot produce the known hash.")
 
-(defparameter *genesis-timestamp-message*
-  "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
-  "pszTimestamp for mainnet/testnet3/signet/regtest (kernel/chainparams.cpp:70).")
-
-(defparameter *testnet4-timestamp-message*
-  "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
-  "testnet4's own pszTimestamp (kernel/chainparams.cpp:367).")
-
 (defun %genesis-coinbase (network)
   "The genesis coinbase transaction for NETWORK, per Core CreateGenesisBlock
 (kernel/chainparams.cpp:36-49): scriptSig pushes 486604799, CScriptNum(4) and
 the timestamp message; one 50 BTC output to <pubkey> OP_CHECKSIG (testnet4:
 33 zero bytes as the \"pubkey\", chainparams.cpp:368)."
   (let* ((testnet4-p (eq network :testnet4))
-         (message (%ascii-bytes (if testnet4-p
-                                    *testnet4-timestamp-message*
-                                    *genesis-timestamp-message*)))
+         (message (%ascii-bytes (bl.chain:chain-params-genesis-timestamp-message
+                                 (bl.chain:find-chain-params network))))
          ;; CScript() << 486604799: minimal CScriptNum bytes of 0x1d00ffff,
          ;; little-endian -> ff ff 00 1d, pushed as data.
          (script-sig (concatenate '(simple-array (unsigned-byte 8) (*))
@@ -364,13 +326,10 @@ signals an error instead of returning a corrupt block."
   (let* ((coinbase (%genesis-coinbase network))
          (merkle-root (bl.ser:transaction-hash coinbase))
          (header
-           (multiple-value-bind (timestamp bits nonce)
-               (ecase network
-                 (:mainnet  (values 1231006505 #x1d00ffff 2083236893))
-                 (:testnet3 (values 1296688602 #x1d00ffff 414098458))
-                 (:testnet4 (values 1714777860 #x1d00ffff 393743547))
-                 (:signet   (values 1598918400 #x1e0377ae 52613770))
-                 (:regtest  (values 1296688602 #x207fffff 2)))
+           (let* ((params (bl.chain:find-chain-params network))
+                  (timestamp (bl.chain:chain-params-genesis-timestamp params))
+                  (bits (bl.chain:chain-params-genesis-bits params))
+                  (nonce (bl.chain:chain-params-genesis-nonce params)))
              (bl.ser:make-block-header
               :version 1
               :prev-block (make-array 32 :element-type '(unsigned-byte 8)
@@ -468,17 +427,20 @@ the position once it exists."
 (defconstant +pow-target-timespan+ 1209600
   "Target time for one retarget period in seconds (2 weeks = 14 * 24 * 60 * 60).")
 
-(defconstant +pow-limit-bits+ #x1d00ffff
-  "Minimum difficulty (maximum target) in compact bits format.
-Same for mainnet and testnet.")
+(defconstant +pow-limit-bits+
+  (bl.chain:chain-params-pow-limit-bits (bl.chain:find-chain-params :mainnet))
+  "Minimum difficulty (maximum target) in compact bits format, #x1d00ffff.
+Same for mainnet and the testnets; from the chain-params table.")
 
-(defconstant +signet-pow-limit-bits+ #x1e0377ae
+(defconstant +signet-pow-limit-bits+
+  (bl.chain:chain-params-pow-limit-bits (bl.chain:find-chain-params :signet))
   "Core signet powLimit, 00000377ae00...00 (kernel/chainparams.cpp:490). Signet
 is EASIER than mainnet's minimum, so a signet nBits derives a target ABOVE the
 mainnet limit — which is why running signet against the mainnet clamp rejected
 even signet's own genesis.")
 
-(defconstant +regtest-pow-limit-bits+ #x207fffff
+(defconstant +regtest-pow-limit-bits+
+  (bl.chain:chain-params-pow-limit-bits (bl.chain:find-chain-params :regtest))
   "Regtest minimum difficulty (Bitcoin Core CRegTestParams powLimit). Trivial:
 the target is ~2^255, so a single hash usually satisfies it — blocks are
 CPU-mined on demand.")
@@ -509,9 +471,9 @@ nWord >>= 8*(3-nSize)); real difficulty values always have exponent > 3."
 
 (defvar *pow-limit-target* +pow-limit-target+
   "The active PoW limit target — the maximum target a block's nBits may decode
-to. Defaults to the standard limit; init-node raises it to
-+regtest-pow-limit-target+ on regtest. derive-target rejects any target above
-this, so it must be network-aware.")
+to. Defaults to the standard limit; init-node sets it from the chain's
+powLimit (chain-params-pow-limit-bits). derive-target rejects any target
+above this, so it must be network-aware.")
 
 (defun derive-target (bits)
   "Decode nBits to a target, returning NIL if it is out of range — i.e.

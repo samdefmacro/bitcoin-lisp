@@ -43,7 +43,8 @@
                  ;; util first: byte I/O that the script interpreter's
                  ;; sighash code inlines must be loaded before src/coalton/.
                  (:module "util"
-                  :components ((:file "bytes")))
+                  :components ((:file "bytes")
+                               (:file "chainparams")))
                  (:file "logging")
                  (:file "config")
                  (:file "zmq")
@@ -274,6 +275,8 @@
                              (:file "eclipse-dos-tests")
                              ;; bitcoin.conf + CLI argument parsing
                              (:file "config-tests")
+                             ;; The chain-params table
+                             (:file "chainparams-tests")
                              (:file "logging-tests")
                              ;; SOCKS5 outbound proxy (-proxy) client
                              (:file "socks5-tests")

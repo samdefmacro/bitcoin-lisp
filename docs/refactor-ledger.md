@@ -31,6 +31,7 @@ src/; cold = cold-battery check count / failures.
 | 2026-08-28 | P1.3 | last 10 duplicate names gone; redefinition warnings now fail the cold lane | 0 | 13 | 62 | 88 | 8 | 198 | 15 | 6,783 | 34,317 / 0 (fresh) |
 | 2026-08-28 | P1.4 | package-local nicknames (bl.ser, bl.store, …) across src/ and tests/ | 0 | 13 | 62 | 88 | 8 | 198 | 15 | 6,783 | 34,319 / 0 (fresh) |
 | 2026-08-28 | P1.5 | each module's package in src/<module>/package.lisp; src/package.lisp 1,780 → 246 lines | 0 | 13 | 62 | 88 | 8 | 198 | 15 | 6,783 | 34,319 / 0 (fresh) |
+| 2026-08-28 | P2a | define-chain-params: 29 network dispatches in 8 files → one table (src/util/chainparams.lisp) | 0 | 13 | 62 | 88 | 8 | 200 | 15 | 6,783 | 34,420 / 0 (fresh) |
 
 ## Notes
 

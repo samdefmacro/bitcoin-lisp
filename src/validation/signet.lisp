@@ -258,7 +258,7 @@ or a malformed signet solution)."
 ;;; --- the check ---
 
 (defun check-signet-block-solution (block &optional (challenge *signet-challenge*)
-                                              (genesis-hash bl.store:*signet-genesis-hash*))
+                                              (genesis-hash (bl.store:network-genesis-hash :signet)))
   "Core CheckSignetBlockSolution. Return T iff BLOCK carries a valid signet
 solution for CHALLENGE (or is the signet genesis, whose solution is trivially
 valid). Reconstructs the to_spend/to_sign transactions and runs the script

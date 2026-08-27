@@ -153,10 +153,6 @@
    ;; Constants
    #:+coinbase-maturity+
    #:+max-money+
-   #:+bip34-activation-height-testnet3+
-   #:+bip34-activation-height-mainnet+
-   #:+bip66-activation-height-testnet3+
-   #:+bip66-activation-height-mainnet+
    ;; Coinbase / subsidy (for the block assembler)
    #:calculate-block-subsidy
    #:encode-bip34-height))

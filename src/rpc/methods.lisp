@@ -4016,13 +4016,9 @@ GetDifficulty."
     (if (zerop cur) 0d0 (/ (float one 1d0) (float cur 1d0)))))
 
 (defun %chain-name (network)
-  "Bitcoin Core GetChainTypeString for NETWORK."
-  (ecase network
-    (:mainnet "main")
-    (:testnet3 "test")
-    (:testnet4 "testnet4")
-    (:signet "signet")
-    (:regtest "regtest")))
+  "Core's chain name for NETWORK (getblockchaininfo.chain): main, test,
+testnet4, signet, regtest."
+  (bl.chain:chain-params-core-name (bl.chain:find-chain-params network)))
 
 (defun %gbt-transactions (template)
   "The getblocktemplate `transactions` array for TEMPLATE: one object per

@@ -205,6 +205,7 @@
 (defparameter *package-nicknames*
   '(("BL" . "BITCOIN-LISP")
     ("BL.BYTES" . "BITCOIN-LISP.BYTES")
+    ("BL.CHAIN" . "BITCOIN-LISP.CHAINPARAMS")
     ("BL.CRYPTO" . "BITCOIN-LISP.CRYPTO")
     ("BL.SER" . "BITCOIN-LISP.SERIALIZATION")
     ("BL.STORE" . "BITCOIN-LISP.STORAGE")
