@@ -84,7 +84,14 @@ record. Consensus-critical work still finishes with
 `cl-workbench validation run cold-unit` (= scripts/docker-test.sh, check count
 recorded) — the warm image is a dev convenience, not the verification of
 record. A suite designator that selects zero tests fails (rc 1); it can never
-pass silently.
+pass silently. The cold lane also fails on `WARNING: redefining
+BITCOIN-LISP` (a same-package duplicate silently winning) and on any
+`undefined variable` warning that is not an earmuffed special defined
+somewhere in the tree (`scripts/check-undefined-variables.sh`): ASDF's
+compilation unit defers those warnings past compile-file's failure-p, so a
+from-scratch build otherwise passes with them buried in the transcript —
+2026-08-28 it hid a `setf` of a deleted defvar and six docstrings cut short
+by an unescaped `"` whose remaining prose had become code.
 
 **Changing a MACRO (or a defstruct's layout) needs a FRESH FASL volume** —
 the cold lane is not "compiles fresh": it mounts a persistent per-checkout

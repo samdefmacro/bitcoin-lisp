@@ -118,7 +118,7 @@ safety net."
 than reconciled.
 
 RECONCILING-PEER-COUNT is how many peers are reconciling at all, which is what
-turns "one outbound destination" into a per-peer probability of 1/n. It is
+turns \"one outbound destination\" into a per-peer probability of 1/n. It is
 passed in because only the caller can see the peer list.
 
 Deterministic in (wtxid, peer salt), so a node does not reveal a new sample on
