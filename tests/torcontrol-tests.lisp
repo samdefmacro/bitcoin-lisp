@@ -38,29 +38,29 @@
   "Save/restore the networking globals the torcontrol client mutates, and
 start each test from a clean slate (no proxies, no local addresses,
 default reachability)."
-  `(let ((old-proxy bitcoin-lisp.networking:*proxy*)
-         (old-onion bitcoin-lisp.networking:*onion-proxy*)
-         (old-explicit bitcoin-lisp.networking:*onion-proxy-explicit*)
-         (old-reach bitcoin-lisp.networking:*reachable-networks*)
-         (old-onlynet bitcoin-lisp.networking:*onlynet-networks*)
-         (old-locals (bitcoin-lisp.networking:local-addresses)))
+  `(let ((old-proxy bl.net:*proxy*)
+         (old-onion bl.net:*onion-proxy*)
+         (old-explicit bl.net:*onion-proxy-explicit*)
+         (old-reach bl.net:*reachable-networks*)
+         (old-onlynet bl.net:*onlynet-networks*)
+         (old-locals (bl.net:local-addresses)))
      (unwind-protect
           (progn
-            (setf bitcoin-lisp.networking:*proxy* nil
-                  bitcoin-lisp.networking:*onion-proxy* nil
-                  bitcoin-lisp.networking:*onion-proxy-explicit* nil
-                  bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6)
-                  bitcoin-lisp.networking:*onlynet-networks* nil)
-            (bitcoin-lisp.networking:clear-local-addresses)
+            (setf bl.net:*proxy* nil
+                  bl.net:*onion-proxy* nil
+                  bl.net:*onion-proxy-explicit* nil
+                  bl.net:*reachable-networks* '(:ipv4 :ipv6)
+                  bl.net:*onlynet-networks* nil)
+            (bl.net:clear-local-addresses)
             ,@body)
-       (setf bitcoin-lisp.networking:*proxy* old-proxy
-             bitcoin-lisp.networking:*onion-proxy* old-onion
-             bitcoin-lisp.networking:*onion-proxy-explicit* old-explicit
-             bitcoin-lisp.networking:*reachable-networks* old-reach
-             bitcoin-lisp.networking:*onlynet-networks* old-onlynet)
+       (setf bl.net:*proxy* old-proxy
+             bl.net:*onion-proxy* old-onion
+             bl.net:*onion-proxy-explicit* old-explicit
+             bl.net:*reachable-networks* old-reach
+             bl.net:*onlynet-networks* old-onlynet)
        ;; old-locals is already a private snapshot (local-addresses copies).
-       (bt:with-lock-held (bitcoin-lisp.networking::*local-addresses-lock*)
-         (setf bitcoin-lisp.networking::*local-addresses* old-locals)))))
+       (bt:with-lock-held (bl.net::*local-addresses-lock*)
+         (setf bl.net::*local-addresses* old-locals)))))
 
 (defun %fake-tor-server (handler)
   "One-shot fake Tor control server on 127.0.0.1: accept a single client,
@@ -116,7 +116,7 @@ RECEIVED-FN returns the command lines received so far, newest last."
             :name "fake-tor-server")))
     (values port thread (lambda () (bt:with-lock-held (lock) (reverse received))))))
 
-(defun %hx (hex) (bitcoin-lisp.crypto:hex-to-bytes hex))
+(defun %hx (hex) (bl.crypto:hex-to-bytes hex))
 
 ;;; --- reply line framing ------------------------------------------------------
 
@@ -125,37 +125,37 @@ RECEIVED-FN returns the command lines received so far, newest last."
 skipped; a non-numeric status parses as 0 (Core readcb + ToIntegral
 .value_or(0), torcontrol.cpp:96-105)."
   (multiple-value-bind (code sep data)
-      (bitcoin-lisp.networking::parse-tor-reply-line "250 OK")
+      (bl.net::parse-tor-reply-line "250 OK")
     (is (= 250 code))
     (is (char= #\Space sep))
     (is (string= "OK" data)))
   (multiple-value-bind (code sep data)
-      (bitcoin-lisp.networking::parse-tor-reply-line "250-AUTH METHODS=NULL")
+      (bl.net::parse-tor-reply-line "250-AUTH METHODS=NULL")
     (is (= 250 code))
     (is (char= #\- sep))
     (is (string= "AUTH METHODS=NULL" data)))
   (multiple-value-bind (code sep data)
-      (bitcoin-lisp.networking::parse-tor-reply-line "250+onions/current=")
+      (bl.net::parse-tor-reply-line "250+onions/current=")
     (is (= 250 code))
     (is (char= #\+ sep))
     (is (string= "onions/current=" data)))
   (multiple-value-bind (code sep data)
-      (bitcoin-lisp.networking::parse-tor-reply-line "650 CIRC 1000 EXTENDED")
+      (bl.net::parse-tor-reply-line "650 CIRC 1000 EXTENDED")
     (is (= 650 code))
     (is (char= #\Space sep))
     (is (string= "CIRC 1000 EXTENDED" data)))
   ;; Short lines are skipped by the reader.
-  (is-false (bitcoin-lisp.networking::parse-tor-reply-line ""))
-  (is-false (bitcoin-lisp.networking::parse-tor-reply-line "250"))
-  (is-false (bitcoin-lisp.networking::parse-tor-reply-line "OK"))
+  (is-false (bl.net::parse-tor-reply-line ""))
+  (is-false (bl.net::parse-tor-reply-line "250"))
+  (is-false (bl.net::parse-tor-reply-line "OK"))
   ;; Garbage status -> code 0.
-  (is (= 0 (bitcoin-lisp.networking::parse-tor-reply-line "abc def"))))
+  (is (= 0 (bl.net::parse-tor-reply-line "abc def"))))
 
 ;;; --- SplitTorReplyLine (Core torcontrol_tests.cpp vectors) -------------------
 
 (defun %check-split (input command args)
   (multiple-value-bind (c a)
-      (bitcoin-lisp.networking::split-tor-reply-line input)
+      (bl.net::split-tor-reply-line input)
     (is (string= command c) "command of ~S" input)
     (is (string= args a) "args of ~S" input)))
 
@@ -181,7 +181,7 @@ skipped; a non-numeric status parses as 0 (Core readcb + ToIntegral
   "EXPECTED is an alist; order matters (Core compares std::map iteration, but
 every vector's keys arrive pre-sorted or singleton, and we additionally pin
 arrival order)."
-  (let ((ret (bitcoin-lisp.networking::parse-tor-reply-mapping input)))
+  (let ((ret (bl.net::parse-tor-reply-mapping input)))
     (is (= (length expected) (length ret)) "size for ~S: got ~S" input ret)
     (loop for (ek . ev) in expected
           for (rk . rv) in ret
@@ -218,7 +218,7 @@ octals, error and OptArguments cases."
                   '(("Foo" . "Bar\"Baz") ("Spam" . "\"Eggs\"")))
   (%check-mapping "Foo=\"Bar\\\\Baz\"" '(("Foo" . "Bar\\Baz")))
   ;; C escapes + octals (the torture vector).
-  (let ((ret (bitcoin-lisp.networking::parse-tor-reply-mapping
+  (let ((ret (bl.net::parse-tor-reply-mapping
               "Foo=\"Bar\\nBaz\\t\" Spam=\"\\rEggs\" Octals=\"\\1a\\11\\17\\18\\81\\377\\378\\400\\2222\" Final=Check")))
     (is (= 4 (length ret)))
     (is (string= (format nil "Bar~ABaz~A" #\Newline #\Tab)
@@ -239,7 +239,7 @@ octals, error and OptArguments cases."
                   `(("OneOctal" . ,(format nil "OneEnd~A" (code-char 1)))
                     ("TwoOctal" . ,(format nil "TwoEnd~A" (code-char 9)))))
   ;; Null escape.
-  (let ((ret (bitcoin-lisp.networking::parse-tor-reply-mapping "Null=\"\\0\"")))
+  (let ((ret (bl.net::parse-tor-reply-mapping "Null=\"\\0\"")))
     (is (= 1 (length ret)))
     (is (string= "Null" (car (first ret))))
     (is (= 1 (length (cdr (first ret)))))
@@ -261,11 +261,11 @@ octals, error and OptArguments cases."
 key strings over cookie||clientNonce||serverNonce. Vectors computed with
 python3 hmac/hashlib (scratchpad safecookie_vectors.py), not hand-derived."
   (flet ((server (cookie cn sn)
-           (bitcoin-lisp.networking::compute-safecookie-response
-            bitcoin-lisp.networking::+tor-safe-serverkey+ cookie cn sn))
+           (bl.net::compute-safecookie-response
+            bl.net::+tor-safe-serverkey+ cookie cn sn))
          (client (cookie cn sn)
-           (bitcoin-lisp.networking::compute-safecookie-response
-            bitcoin-lisp.networking::+tor-safe-clientkey+ cookie cn sn)))
+           (bl.net::compute-safecookie-response
+            bl.net::+tor-safe-clientkey+ cookie cn sn)))
     ;; v1: all-zero cookie and nonces.
     (let ((z (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
       (is (equalp (%hx "3d1188024fd00a2a157e9850572bb3b26af8c149d2d21838c7bccc7fa83a8574")
@@ -295,20 +295,20 @@ python3 hmac/hashlib (scratchpad safecookie_vectors.py), not hand-derived."
   "ADD_ONION command: NEW:ED25519-V3 on first run, the cached key verbatim on
 restore; virtual port = chain default, forwarding to the local onion listener
 (torcontrol.cpp:476-481)."
-  (let ((ctl (bitcoin-lisp.networking::make-tor-controller
+  (let ((ctl (bl.net::make-tor-controller
               :virtual-port 8333 :target-host "127.0.0.1" :target-port 8334)))
     (is (string= "ADD_ONION NEW:ED25519-V3 Port=8333,127.0.0.1:8334"
-                 (bitcoin-lisp.networking::tor-add-onion-command ctl)))
-    (setf (bitcoin-lisp.networking::tor-controller-private-key ctl)
+                 (bl.net::tor-add-onion-command ctl)))
+    (setf (bl.net::tor-controller-private-key ctl)
           "ED25519-V3:SGVsbG8=")
     (is (string= "ADD_ONION ED25519-V3:SGVsbG8= Port=8333,127.0.0.1:8334"
-                 (bitcoin-lisp.networking::tor-add-onion-command ctl)))))
+                 (bl.net::tor-add-onion-command ctl)))))
 
 (test tor-parse-torcontrol-spec
   "-torcontrol host[:port] parsing; port defaults to 9051."
   (flet ((check (spec host port)
            (multiple-value-bind (h p)
-               (bitcoin-lisp.networking:parse-torcontrol-spec spec)
+               (bl.net:parse-torcontrol-spec spec)
              (is (string= host h) "host of ~S" spec)
              (is (= port p) "port of ~S" spec))))
     (check nil "127.0.0.1" 9051)
@@ -330,8 +330,8 @@ file is owner-only (0600). Core stores the exact PrivateKey reply value."
          (key "ED25519-V3:yLSDc8b11PaIHTtNtvi9lNzZQMR3XVRBE5q3BSc1JBWidunZLxSFhsP2CIkjT5oJ58rPYYNjSCkQnLtzfFPqfA=="))
     (unwind-protect
          (progn
-           (is-true (bitcoin-lisp.networking::write-onion-private-key path key))
-           (is (string= key (bitcoin-lisp.networking::read-onion-private-key path)))
+           (is-true (bl.net::write-onion-private-key path key))
+           (is (string= key (bl.net::read-onion-private-key path)))
            ;; Owner-only permissions.
            #+sbcl
            (is (= #o600 (logand (sb-posix:stat-mode
@@ -341,7 +341,7 @@ file is owner-only (0600). Core stores the exact PrivateKey reply value."
            (with-open-file (out path :direction :output :if-exists :supersede)
              (write-string key out)
              (terpri out))
-           (is (string= key (bitcoin-lisp.networking::read-onion-private-key path))))
+           (is (string= key (bl.net::read-onion-private-key path))))
       (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
 ;;; --- local addresses + advertisement policy ----------------------------------
@@ -356,164 +356,164 @@ support), unreachable networks (e.g. onion without a Tor route), and
 unroutable bytes; a re-add with >= score bumps the score by one."
   (with-tor-globals
     ;; :torv3 not reachable -> refused.
-    (is-false (bitcoin-lisp.networking:add-local
+    (is-false (bl.net:add-local
                :torv3 +test-onion-pubkey+ 8333
-               bitcoin-lisp.networking:+local-manual+))
-    (push :torv3 bitcoin-lisp.networking:*reachable-networks*)
+               bl.net:+local-manual+))
+    (push :torv3 bl.net:*reachable-networks*)
     ;; Score below LOCAL_MANUAL -> refused (fDiscover is permanently false).
-    (is-false (bitcoin-lisp.networking:add-local :torv3 +test-onion-pubkey+ 8333 0))
+    (is-false (bl.net:add-local :torv3 +test-onion-pubkey+ 8333 0))
     ;; All-zero bytes are unroutable.
-    (is-false (bitcoin-lisp.networking:add-local
+    (is-false (bl.net:add-local
                :torv3 (make-array 32 :element-type '(unsigned-byte 8)
                                      :initial-element 0)
-               8333 bitcoin-lisp.networking:+local-manual+))
-    (is-true (bitcoin-lisp.networking:add-local
+               8333 bl.net:+local-manual+))
+    (is-true (bl.net:add-local
               :torv3 +test-onion-pubkey+ 8333
-              bitcoin-lisp.networking:+local-manual+))
-    (is (= 1 (length (bitcoin-lisp.networking:local-addresses))))
-    (let ((la (first (bitcoin-lisp.networking:local-addresses))))
-      (is (= bitcoin-lisp.networking:+local-manual+
-             (bitcoin-lisp.networking:local-address-score la))))
+              bl.net:+local-manual+))
+    (is (= 1 (length (bl.net:local-addresses))))
+    (let ((la (first (bl.net:local-addresses))))
+      (is (= bl.net:+local-manual+
+             (bl.net:local-address-score la))))
     ;; Re-add with equal score: score+1, port updated, still one entry.
-    (is-true (bitcoin-lisp.networking:add-local
+    (is-true (bl.net:add-local
               :torv3 +test-onion-pubkey+ 18333
-              bitcoin-lisp.networking:+local-manual+))
-    (is (= 1 (length (bitcoin-lisp.networking:local-addresses))))
-    (let ((la (first (bitcoin-lisp.networking:local-addresses))))
-      (is (= (1+ bitcoin-lisp.networking:+local-manual+)
-             (bitcoin-lisp.networking:local-address-score la)))
-      (is (= 18333 (bitcoin-lisp.networking:local-address-port la))))
+              bl.net:+local-manual+))
+    (is (= 1 (length (bl.net:local-addresses))))
+    (let ((la (first (bl.net:local-addresses))))
+      (is (= (1+ bl.net:+local-manual+)
+             (bl.net:local-address-score la)))
+      (is (= 18333 (bl.net:local-address-port la))))
     ;; remove-local is keyed by address only.
-    (bitcoin-lisp.networking:remove-local :torv3 +test-onion-pubkey+)
-    (is (null (bitcoin-lisp.networking:local-addresses)))))
+    (bl.net:remove-local :torv3 +test-onion-pubkey+)
+    (is (null (bl.net:local-addresses)))))
 
 (test tor-best-local-address-privacy-rule
   "GetLocal's privacy rule (net.cpp:174-186): a privacy-net (onion) local
 address is only advertised to peers connected through that same network, and
 privacy-net peers are never told our other-network addresses."
   (with-tor-globals
-    (push :torv3 bitcoin-lisp.networking:*reachable-networks*)
-    (bitcoin-lisp.networking:add-local
-     :torv3 +test-onion-pubkey+ 8333 bitcoin-lisp.networking:+local-manual+)
+    (push :torv3 bl.net:*reachable-networks*)
+    (bl.net:add-local
+     :torv3 +test-onion-pubkey+ 8333 bl.net:+local-manual+)
     ;; Onion-connected peer: gets the onion address.
-    (let ((la (bitcoin-lisp.networking:best-local-address :torv3)))
+    (let ((la (bl.net:best-local-address :torv3)))
       (is-true la)
-      (is (eq :torv3 (bitcoin-lisp.networking:local-address-network la))))
+      (is (eq :torv3 (bl.net:local-address-network la))))
     ;; Clearnet peers: never told the onion address.
-    (is-false (bitcoin-lisp.networking:best-local-address :ipv4))
-    (is-false (bitcoin-lisp.networking:best-local-address :ipv6))
-    (is-false (bitcoin-lisp.networking:best-local-address :unroutable))
+    (is-false (bl.net:best-local-address :ipv4))
+    (is-false (bl.net:best-local-address :ipv6))
+    (is-false (bl.net:best-local-address :unroutable))
     ;; Add a clearnet local address too: clearnet peers get it, and the
     ;; onion-connected peer still only ever sees the onion one.
-    (bitcoin-lisp.networking:add-local
-     :ipv4 (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 1 2 3 4) 8333
-     bitcoin-lisp.networking:+local-manual+)
-    (let ((la (bitcoin-lisp.networking:best-local-address :ipv4)))
+    (bl.net:add-local
+     :ipv4 (bl.net:ipv4-to-mapped-ipv6 1 2 3 4) 8333
+     bl.net:+local-manual+)
+    (let ((la (bl.net:best-local-address :ipv4)))
       (is-true la)
-      (is (eq :ipv4 (bitcoin-lisp.networking:local-address-network la))))
-    (let ((la (bitcoin-lisp.networking:best-local-address :torv3)))
+      (is (eq :ipv4 (bl.net:local-address-network la))))
+    (let ((la (bl.net:best-local-address :torv3)))
       (is-true la)
-      (is (eq :torv3 (bitcoin-lisp.networking:local-address-network la))))))
+      (is (eq :torv3 (bl.net:local-address-network la))))))
 
 (test tor-peer-connected-through-network
   "ConnectedThroughNetwork: inbound-onion peers are :torv3 regardless of
 socket address; others follow their address; hostnames are :unroutable."
-  (let ((onion-peer (bitcoin-lisp.networking:make-peer
+  (let ((onion-peer (bl.net:make-peer
                      :address "127.0.0.1" :inbound t :inbound-onion t))
-        (v4-peer (bitcoin-lisp.networking:make-peer :address "8.8.8.8"))
-        (onion-out (bitcoin-lisp.networking:make-peer
-                    :address (bitcoin-lisp.networking:onion-address-string
+        (v4-peer (bl.net:make-peer :address "8.8.8.8"))
+        (onion-out (bl.net:make-peer
+                    :address (bl.net:onion-address-string
                               +test-onion-pubkey+)))
-        (host-peer (bitcoin-lisp.networking:make-peer :address "seed.example.com")))
-    (is (eq :torv3 (bitcoin-lisp.networking:peer-connected-through-network onion-peer)))
-    (is (eq :ipv4 (bitcoin-lisp.networking:peer-connected-through-network v4-peer)))
-    (is (eq :torv3 (bitcoin-lisp.networking:peer-connected-through-network onion-out)))
-    (is (eq :unroutable (bitcoin-lisp.networking:peer-connected-through-network host-peer)))))
+        (host-peer (bl.net:make-peer :address "seed.example.com")))
+    (is (eq :torv3 (bl.net:peer-connected-through-network onion-peer)))
+    (is (eq :ipv4 (bl.net:peer-connected-through-network v4-peer)))
+    (is (eq :torv3 (bl.net:peer-connected-through-network onion-out)))
+    (is (eq :unroutable (bl.net:peer-connected-through-network host-peer)))))
 
 (test tor-self-advertisement-message-construction
   "The self-announcement for our onion address is an addrv2 message carrying
 the torv3 entry with our services; a peer without sendaddrv2 gets nothing
 (Core IsAddrCompatible — torv3 is not V1-representable)."
   (with-tor-globals
-    (push :torv3 bitcoin-lisp.networking:*reachable-networks*)
-    (bitcoin-lisp.networking:add-local
-     :torv3 +test-onion-pubkey+ 48333 bitcoin-lisp.networking:+local-manual+)
-    (let* ((peer (bitcoin-lisp.networking:make-peer
+    (push :torv3 bl.net:*reachable-networks*)
+    (bl.net:add-local
+     :torv3 +test-onion-pubkey+ 48333 bl.net:+local-manual+)
+    (let* ((peer (bl.net:make-peer
                   :address "127.0.0.1" :inbound t :inbound-onion t))
-           (la (bitcoin-lisp.networking:get-local-addr-for-peer peer)))
+           (la (bl.net:get-local-addr-for-peer peer)))
       (is-true la)
       ;; No addrv2 negotiated: nothing to send.
-      (let ((pa (bitcoin-lisp.networking:make-peer-address
-                 :net (bitcoin-lisp.networking:local-address-network la)
-                 :ip (bitcoin-lisp.networking:local-address-bytes la)
-                 :port (bitcoin-lisp.networking:local-address-port la)
-                 :services (bitcoin-lisp.networking:local-services)
-                 :last-seen (bitcoin-lisp.serialization:get-unix-time))))
-        (is-false (bitcoin-lisp.networking::build-addr-response peer (list pa)))
+      (let ((pa (bl.net:make-peer-address
+                 :net (bl.net:local-address-network la)
+                 :ip (bl.net:local-address-bytes la)
+                 :port (bl.net:local-address-port la)
+                 :services (bl.net:local-services)
+                 :last-seen (bl.ser:get-unix-time))))
+        (is-false (bl.net::build-addr-response peer (list pa)))
         ;; With addrv2: a single-entry addrv2 message with our torv3 address.
-        (setf (bitcoin-lisp.networking:peer-wants-addrv2 peer) t)
-        (let ((msg (bitcoin-lisp.networking::build-addr-response peer (list pa))))
+        (setf (bl.net:peer-wants-addrv2 peer) t)
+        (let ((msg (bl.net::build-addr-response peer (list pa))))
           (is-true msg)
           ;; Parse the payload back (skip the 24-byte P2P header).
           (let* ((payload (subseq msg 24))
-                 (entries (bitcoin-lisp.serialization:parse-addrv2-payload payload)))
+                 (entries (bl.ser:parse-addrv2-payload payload)))
             (is (= 1 (length entries)))
             (destructuring-bind (net-addr timestamp network-id) (first entries)
               (declare (ignore timestamp))
               (is (= 4 network-id))     ; BIP155 TORV3
               (is (equalp +test-onion-pubkey+
-                          (bitcoin-lisp.serialization:net-addr-ip net-addr)))
-              (is (= 48333 (bitcoin-lisp.serialization:net-addr-port net-addr)))
-              (is (= (bitcoin-lisp.networking:local-services)
-                     (bitcoin-lisp.serialization:net-addr-services net-addr))))))))
+                          (bl.ser:net-addr-ip net-addr)))
+              (is (= 48333 (bl.ser:net-addr-port net-addr)))
+              (is (= (bl.net:local-services)
+                     (bl.ser:net-addr-services net-addr))))))))
     ;; A clearnet peer gets no local address at all (privacy rule).
-    (let ((clearnet (bitcoin-lisp.networking:make-peer :address "8.8.8.8")))
-      (is-false (bitcoin-lisp.networking:get-local-addr-for-peer clearnet)))))
+    (let ((clearnet (bl.net:make-peer :address "8.8.8.8")))
+      (is-false (bl.net:get-local-addr-for-peer clearnet)))))
 
 (test tor-version-addr-recv
   "The version message's addr_recv carries the peer's own routable address
 (Core PushNodeVersion's addr_you); non-IP and hostname peers get the all-zero
 dummy; addr_from is always the all-zero dummy, exactly like modern Core."
-  (let ((v4-peer (bitcoin-lisp.networking:make-peer
+  (let ((v4-peer (bl.net:make-peer
                   :address "8.8.8.8"
-                  :connection (bitcoin-lisp.networking::make-connection
+                  :connection (bl.net::make-connection
                                :host "8.8.8.8" :port 8333))))
-    (setf (bitcoin-lisp.networking:peer-services v4-peer) 1033)
-    (let ((na (bitcoin-lisp.networking::%version-addr-recv v4-peer)))
-      (is (equalp (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 8 8 8 8)
-                  (bitcoin-lisp.serialization:net-addr-ip na)))
-      (is (= 8333 (bitcoin-lisp.serialization:net-addr-port na)))
-      (is (= 1033 (bitcoin-lisp.serialization:net-addr-services na)))))
+    (setf (bl.net:peer-services v4-peer) 1033)
+    (let ((na (bl.net::%version-addr-recv v4-peer)))
+      (is (equalp (bl.net:ipv4-to-mapped-ipv6 8 8 8 8)
+                  (bl.ser:net-addr-ip na)))
+      (is (= 8333 (bl.ser:net-addr-port na)))
+      (is (= 1033 (bl.ser:net-addr-services na)))))
   ;; Onion peer: not V1-compatible -> dummy.
-  (let* ((onion-peer (bitcoin-lisp.networking:make-peer
-                      :address (bitcoin-lisp.networking:onion-address-string
+  (let* ((onion-peer (bl.net:make-peer
+                      :address (bl.net:onion-address-string
                                 +test-onion-pubkey+)))
-         (na (bitcoin-lisp.networking::%version-addr-recv onion-peer)))
-    (is (every #'zerop (bitcoin-lisp.serialization:net-addr-ip na)))
-    (is (zerop (bitcoin-lisp.serialization:net-addr-port na))))
+         (na (bl.net::%version-addr-recv onion-peer)))
+    (is (every #'zerop (bl.ser:net-addr-ip na)))
+    (is (zerop (bl.ser:net-addr-port na))))
   ;; Hostname peer: unparseable -> dummy.
-  (let* ((host-peer (bitcoin-lisp.networking:make-peer :address "node.example.com"))
-         (na (bitcoin-lisp.networking::%version-addr-recv host-peer)))
-    (is (every #'zerop (bitcoin-lisp.serialization:net-addr-ip na))))
+  (let* ((host-peer (bl.net:make-peer :address "node.example.com"))
+         (na (bl.net::%version-addr-recv host-peer)))
+    (is (every #'zerop (bl.ser:net-addr-ip na))))
   ;; Full round-trip: the serialized version message carries addr_recv and a
   ;; zero addr_from.
-  (let* ((recv (bitcoin-lisp.serialization:make-net-addr
+  (let* ((recv (bl.ser:make-net-addr
                 :services 9
-                :ip (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 1 2 3 4)
+                :ip (bl.net:ipv4-to-mapped-ipv6 1 2 3 4)
                 :port 8333))
-         (bytes (bitcoin-lisp.serialization:make-version-message-bytes
+         (bytes (bl.ser:make-version-message-bytes
                  :services 1033 :addr-recv recv))
          (msg (flexi-streams:with-input-from-sequence (s bytes)
-                (bitcoin-lisp.serialization:read-version-message s))))
-    (is (equalp (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 1 2 3 4)
-                (bitcoin-lisp.serialization:net-addr-ip
-                 (bitcoin-lisp.serialization::version-message-addr-recv msg))))
-    (is (= 8333 (bitcoin-lisp.serialization:net-addr-port
-                 (bitcoin-lisp.serialization::version-message-addr-recv msg))))
-    (is (every #'zerop (bitcoin-lisp.serialization:net-addr-ip
-                        (bitcoin-lisp.serialization::version-message-addr-from msg))))
-    (is (zerop (bitcoin-lisp.serialization:net-addr-port
-                (bitcoin-lisp.serialization::version-message-addr-from msg))))))
+                (bl.ser:read-version-message s))))
+    (is (equalp (bl.net:ipv4-to-mapped-ipv6 1 2 3 4)
+                (bl.ser:net-addr-ip
+                 (bl.ser::version-message-addr-recv msg))))
+    (is (= 8333 (bl.ser:net-addr-port
+                 (bl.ser::version-message-addr-recv msg))))
+    (is (every #'zerop (bl.ser:net-addr-ip
+                        (bl.ser::version-message-addr-from msg))))
+    (is (zerop (bl.ser:net-addr-port
+                (bl.ser::version-message-addr-from msg))))))
 
 ;;; --- config wiring -----------------------------------------------------------
 
@@ -522,24 +522,24 @@ dummy; addr_from is always the all-zero dummy, exactly like modern Core."
 -listen=0 soft-disables -listenonion (init.cpp:808) and the explicit
 combination -listen=0 -listenonion=1 is an init error (init.cpp:1022-1024);
 -proxy's listen soft-off cascades to listenonion."
-  (let ((plist (bitcoin-lisp::args->start-node-plist
+  (let ((plist (bl::args->start-node-plist
                 '("-torcontrol=127.0.0.1:9151" "-torpassword=hunter2"))))
     (is (string= "127.0.0.1:9151" (getf plist :tor-control)))
     (is (string= "hunter2" (getf plist :tor-password)))
     ;; Default: listenonion not forced off (absent -> start-node default T).
     (is (eq 'unset (getf plist :listen-onion 'unset))))
-  (let ((plist (bitcoin-lisp::args->start-node-plist '("-listen=0"))))
+  (let ((plist (bl::args->start-node-plist '("-listen=0"))))
     (is (null (getf plist :listen)))
     (is (null (getf plist :listen-onion 'unset))))
-  (let ((plist (bitcoin-lisp::args->start-node-plist '("-proxy=127.0.0.1:9050"))))
+  (let ((plist (bl::args->start-node-plist '("-proxy=127.0.0.1:9050"))))
     (is (null (getf plist :listen)))
     (is (null (getf plist :listen-onion 'unset))))
   (signals error
-    (bitcoin-lisp::args->start-node-plist '("-listen=0" "-listenonion=1")))
+    (bl::args->start-node-plist '("-listen=0" "-listenonion=1")))
   (signals error
-    (bitcoin-lisp::args->start-node-plist '("-proxy=127.0.0.1:9050" "-listenonion")))
+    (bl::args->start-node-plist '("-proxy=127.0.0.1:9050" "-listenonion")))
   ;; Explicit listen=1 with listenonion stays on.
-  (let ((plist (bitcoin-lisp::args->start-node-plist '("-listen=1" "-listenonion=1"))))
+  (let ((plist (bl::args->start-node-plist '("-listen=1" "-listenonion=1"))))
     (is (eq t (getf plist :listen-onion)))))
 
 (test tor-config-onion-explicit-and-onlynet
@@ -548,38 +548,38 @@ auto-configure gate) and keeps the raw -onlynet list; -onlynet=onion without
 any Tor route errors, but is allowed when -listenonion will deliver one
 (init.cpp:1788-1798)."
   (with-tor-globals
-    (let ((old-datacarrier bitcoin-lisp:*accept-datacarrier*))
+    (let ((old-datacarrier bl:*accept-datacarrier*))
       (unwind-protect
            (progn
              ;; No -onion: not explicit.
-             (bitcoin-lisp::apply-config-globals '())
-             (is-false bitcoin-lisp.networking:*onion-proxy-explicit*)
-             (is (null bitcoin-lisp.networking:*onlynet-networks*))
+             (bl::apply-config-globals '())
+             (is-false bl.net:*onion-proxy-explicit*)
+             (is (null bl.net:*onlynet-networks*))
              ;; -onion given: explicit, proxy set.
-             (bitcoin-lisp::apply-config-globals '(("onion" . "127.0.0.1:9050")))
-             (is-true bitcoin-lisp.networking:*onion-proxy-explicit*)
-             (is-true bitcoin-lisp.networking:*onion-proxy*)
+             (bl::apply-config-globals '(("onion" . "127.0.0.1:9050")))
+             (is-true bl.net:*onion-proxy-explicit*)
+             (is-true bl.net:*onion-proxy*)
              ;; -onion=0: explicit, proxy cleared.
-             (setf bitcoin-lisp.networking:*onion-proxy* nil)
-             (bitcoin-lisp::apply-config-globals '(("onion" . "0")))
-             (is-true bitcoin-lisp.networking:*onion-proxy-explicit*)
-             (is (null bitcoin-lisp.networking:*onion-proxy*))
+             (setf bl.net:*onion-proxy* nil)
+             (bl::apply-config-globals '(("onion" . "0")))
+             (is-true bl.net:*onion-proxy-explicit*)
+             (is (null bl.net:*onion-proxy*))
              ;; -onlynet=onion with no proxy and listenonion off -> error.
-             (setf bitcoin-lisp.networking:*onion-proxy* nil)
+             (setf bl.net:*onion-proxy* nil)
              (signals error
-               (bitcoin-lisp::apply-config-globals
+               (bl::apply-config-globals
                 '(("onlynet" . "onion") ("listenonion" . "0"))))
              ;; -onlynet=onion + -onion=0 -> error even with listenonion.
              (signals error
-               (bitcoin-lisp::apply-config-globals
+               (bl::apply-config-globals
                 '(("onlynet" . "onion") ("onion" . "0"))))
              ;; -onlynet=onion with default listenonion -> allowed; :torv3
              ;; stays out of the reachable set until torcontrol delivers the
              ;; proxy (Core get_socks_cb re-adds it).
-             (bitcoin-lisp::apply-config-globals '(("onlynet" . "onion")))
-             (is (equal '(:torv3) bitcoin-lisp.networking:*onlynet-networks*))
-             (is (not (member :torv3 bitcoin-lisp.networking:*reachable-networks*))))
-        (setf bitcoin-lisp:*accept-datacarrier* old-datacarrier)))))
+             (bl::apply-config-globals '(("onlynet" . "onion")))
+             (is (equal '(:torv3) bl.net:*onlynet-networks*))
+             (is (not (member :torv3 bl.net:*reachable-networks*))))
+        (setf bl:*accept-datacarrier* old-datacarrier)))))
 
 ;;; --- end-to-end against a fake control server --------------------------------
 
@@ -590,7 +590,7 @@ GETINFO net/listeners/socks (auto-configures the onion proxy + reachability,
 persisted 0600, .onion address AddLocal'd."
   (with-tor-globals
     (let* ((dir (%torcontrol-temp-dir))
-           (onion (bitcoin-lisp.networking:onion-address-string +test-onion-pubkey+))
+           (onion (bl.net:onion-address-string +test-onion-pubkey+))
            (service-id (subseq onion 0 56))
            (key "ED25519-V3:c2VjcmV0a2V5YmxvYg=="))
       (multiple-value-bind (port thread received)
@@ -609,7 +609,7 @@ persisted 0600, .onion address AddLocal'd."
                 (list (format nil "250-ServiceID=~A" service-id)
                       (format nil "250-PrivateKey=~A" key)
                       "250 OK")))))
-        (let ((ctl (bitcoin-lisp.networking:start-tor-control
+        (let ((ctl (bl.net:start-tor-control
                     :control-spec (format nil "127.0.0.1:~D" port)
                     :data-directory dir
                     :virtual-port 48333
@@ -618,42 +618,42 @@ persisted 0600, .onion address AddLocal'd."
                (progn
                  (is-true (%wait-until
                            (lambda ()
-                             (bitcoin-lisp.networking::tor-controller-service-pubkey ctl))))
+                             (bl.net::tor-controller-service-pubkey ctl))))
                  (is (string= service-id
-                              (bitcoin-lisp.networking:tor-controller-service-id ctl)))
+                              (bl.net:tor-controller-service-id ctl)))
                  ;; ADD_ONION command formatting on the wire.
                  (is-true (member "ADD_ONION NEW:ED25519-V3 Port=48333,127.0.0.1:48334"
                                   (funcall received) :test #'string=))
                  ;; Onion proxy auto-configured from GETINFO (-onion unset).
-                 (is-true bitcoin-lisp.networking:*onion-proxy*)
+                 (is-true bl.net:*onion-proxy*)
                  (is (string= "127.0.0.1"
-                              (bitcoin-lisp.networking:proxy-host
-                               bitcoin-lisp.networking:*onion-proxy*)))
-                 (is (= 19050 (bitcoin-lisp.networking:proxy-port
-                               bitcoin-lisp.networking:*onion-proxy*)))
-                 (is-true (member :torv3 bitcoin-lisp.networking:*reachable-networks*))
+                              (bl.net:proxy-host
+                               bl.net:*onion-proxy*)))
+                 (is (= 19050 (bl.net:proxy-port
+                               bl.net:*onion-proxy*)))
+                 (is-true (member :torv3 bl.net:*reachable-networks*))
                  ;; Local address registered at LOCAL_MANUAL with the chain port.
-                 (let ((locals (bitcoin-lisp.networking:local-addresses)))
+                 (let ((locals (bl.net:local-addresses)))
                    (is (= 1 (length locals)))
                    (let ((la (first locals)))
-                     (is (eq :torv3 (bitcoin-lisp.networking:local-address-network la)))
+                     (is (eq :torv3 (bl.net:local-address-network la)))
                      (is (equalp +test-onion-pubkey+
-                                 (bitcoin-lisp.networking:local-address-bytes la)))
-                     (is (= 48333 (bitcoin-lisp.networking:local-address-port la)))
-                     (is (= bitcoin-lisp.networking:+local-manual+
-                            (bitcoin-lisp.networking:local-address-score la)))))
+                                 (bl.net:local-address-bytes la)))
+                     (is (= 48333 (bl.net:local-address-port la)))
+                     (is (= bl.net:+local-manual+
+                            (bl.net:local-address-score la)))))
                  ;; Key persisted verbatim, owner-only.
                  (let ((path (merge-pathnames "onion_v3_private_key" dir)))
-                   (is (string= key (bitcoin-lisp.networking::read-onion-private-key path)))
+                   (is (string= key (bl.net::read-onion-private-key path)))
                    #+sbcl
                    (is (= #o600 (logand (sb-posix:stat-mode
                                          (sb-posix:stat (namestring path)))
                                         #o777)))))
-            (bitcoin-lisp.networking:stop-tor-control ctl)
+            (bl.net:stop-tor-control ctl)
             (ignore-errors (bt:join-thread thread))
             (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
       ;; stop-tor-control unregistered the service (Core ~TorController).
-      (is (null (bitcoin-lisp.networking:local-addresses))))))
+      (is (null (bl.net:local-addresses))))))
 
 (test torcontrol-e2e-safecookie-and-key-restore
   "SAFECOOKIE auth end-to-end: the client reads the cookie file, sends
@@ -663,16 +663,16 @@ cached onion key is sent verbatim in ADD_ONION and survives a reply that
 carries no PrivateKey (restore path)."
   (with-tor-globals
     ;; Simulate '-onion given': skip GETINFO, onion reachable from startup.
-    (setf bitcoin-lisp.networking:*onion-proxy-explicit* t)
-    (push :torv3 bitcoin-lisp.networking:*reachable-networks*)
+    (setf bl.net:*onion-proxy-explicit* t)
+    (push :torv3 bl.net:*reachable-networks*)
     (let* ((dir (%torcontrol-temp-dir))
-           (onion (bitcoin-lisp.networking:onion-address-string +test-onion-pubkey+))
+           (onion (bl.net:onion-address-string +test-onion-pubkey+))
            (service-id (subseq onion 0 56))
            (saved-key "ED25519-V3:cmVzdG9yZWRrZXk=")
-           (cookie (bitcoin-lisp.crypto:hex-to-bytes
+           (cookie (bl.crypto:hex-to-bytes
                     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"))
            (cookie-path (merge-pathnames "control_auth_cookie" dir))
-           (server-nonce (bitcoin-lisp.crypto:hex-to-bytes
+           (server-nonce (bl.crypto:hex-to-bytes
                           "fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a2"))
            (client-nonce nil)
            (auth-ok nil))
@@ -680,7 +680,7 @@ carries no PrivateKey (restore path)."
       (with-open-file (out cookie-path :direction :output
                                        :element-type '(unsigned-byte 8))
         (write-sequence cookie out))
-      (bitcoin-lisp.networking::write-onion-private-key
+      (bl.net::write-onion-private-key
        (merge-pathnames "onion_v3_private_key" dir) saved-key)
       (multiple-value-bind (port thread received)
           (%fake-tor-server
@@ -692,18 +692,18 @@ carries no PrivateKey (restore path)."
                               (namestring cookie-path))
                       "250 OK"))
                ((uiop:string-prefix-p "AUTHCHALLENGE SAFECOOKIE " line)
-                (setf client-nonce (bitcoin-lisp.crypto:hex-to-bytes
+                (setf client-nonce (bl.crypto:hex-to-bytes
                                     (subseq line (length "AUTHCHALLENGE SAFECOOKIE "))))
                 (list (format nil "250 AUTHCHALLENGE SERVERHASH=~A SERVERNONCE=~A"
-                              (bitcoin-lisp.crypto:bytes-to-hex
-                               (bitcoin-lisp.networking::compute-safecookie-response
-                                bitcoin-lisp.networking::+tor-safe-serverkey+
+                              (bl.crypto:bytes-to-hex
+                               (bl.net::compute-safecookie-response
+                                bl.net::+tor-safe-serverkey+
                                 cookie client-nonce server-nonce))
-                              (bitcoin-lisp.crypto:bytes-to-hex server-nonce))))
+                              (bl.crypto:bytes-to-hex server-nonce))))
                ((uiop:string-prefix-p "AUTHENTICATE " line)
-                (let ((expected (bitcoin-lisp.crypto:bytes-to-hex
-                                 (bitcoin-lisp.networking::compute-safecookie-response
-                                  bitcoin-lisp.networking::+tor-safe-clientkey+
+                (let ((expected (bl.crypto:bytes-to-hex
+                                 (bl.net::compute-safecookie-response
+                                  bl.net::+tor-safe-clientkey+
                                   cookie client-nonce server-nonce))))
                   (if (string-equal expected (subseq line (length "AUTHENTICATE ")))
                       (progn (setf auth-ok t) '("250 OK"))
@@ -711,7 +711,7 @@ carries no PrivateKey (restore path)."
                ((uiop:string-prefix-p "ADD_ONION" line)
                 ;; Restore path: ServiceID only, no PrivateKey line.
                 (list (format nil "250-ServiceID=~A" service-id) "250 OK")))))
-        (let ((ctl (bitcoin-lisp.networking:start-tor-control
+        (let ((ctl (bl.net:start-tor-control
                     :control-spec (format nil "127.0.0.1:~D" port)
                     :data-directory dir
                     :virtual-port 8333
@@ -720,7 +720,7 @@ carries no PrivateKey (restore path)."
                (progn
                  (is-true (%wait-until
                            (lambda ()
-                             (bitcoin-lisp.networking::tor-controller-service-pubkey ctl))))
+                             (bl.net::tor-controller-service-pubkey ctl))))
                  (is-true auth-ok)      ; server verified our HMAC
                  (is (= 32 (length client-nonce)))
                  ;; The cached key went out verbatim.
@@ -732,10 +732,10 @@ carries no PrivateKey (restore path)."
                                     (funcall received)))
                  ;; Key file untouched by the PrivateKey-less reply.
                  (is (string= saved-key
-                              (bitcoin-lisp.networking::read-onion-private-key
+                              (bl.net::read-onion-private-key
                                (merge-pathnames "onion_v3_private_key" dir))))
-                 (is (= 1 (length (bitcoin-lisp.networking:local-addresses)))))
-            (bitcoin-lisp.networking:stop-tor-control ctl)
+                 (is (= 1 (length (bl.net:local-addresses)))))
+            (bl.net:stop-tor-control ctl)
             (ignore-errors (bt:join-thread thread))
             (uiop:delete-directory-tree dir :validate t
                                             :if-does-not-exist :ignore)))))))
@@ -745,8 +745,8 @@ carries no PrivateKey (restore path)."
 local address; the control connection stays up (Core add_onion_cb error arm —
 no retry, no disconnect)."
   (with-tor-globals
-    (setf bitcoin-lisp.networking:*onion-proxy-explicit* t)
-    (push :torv3 bitcoin-lisp.networking:*reachable-networks*)
+    (setf bl.net:*onion-proxy-explicit* t)
+    (push :torv3 bl.net:*reachable-networks*)
     (let ((dir (%torcontrol-temp-dir))
           (add-onion-seen nil))
       (multiple-value-bind (port thread received)
@@ -760,7 +760,7 @@ no retry, no disconnect)."
                 (setf add-onion-seen t)
                 '("551 Failed to generate onion address")))))
         (declare (ignore received))
-        (let ((ctl (bitcoin-lisp.networking:start-tor-control
+        (let ((ctl (bl.net:start-tor-control
                     :control-spec (format nil "127.0.0.1:~D" port)
                     :data-directory dir
                     :virtual-port 8333
@@ -769,12 +769,12 @@ no retry, no disconnect)."
                (progn
                  (is-true (%wait-until (lambda () add-onion-seen)))
                  (sleep 0.3)            ; let the (non-)registration settle
-                 (is (null (bitcoin-lisp.networking:tor-controller-service-id ctl)))
-                 (is (null (bitcoin-lisp.networking:local-addresses)))
+                 (is (null (bl.net:tor-controller-service-id ctl)))
+                 (is (null (bl.net:local-addresses)))
                  ;; Connection held open: thread alive, not reconnect-looping.
                  (is-true (bt:thread-alive-p
-                           (bitcoin-lisp.networking::tor-controller-thread ctl))))
-            (bitcoin-lisp.networking:stop-tor-control ctl)
+                           (bl.net::tor-controller-thread ctl))))
+            (bl.net:stop-tor-control ctl)
             (ignore-errors (bt:join-thread thread))
             (uiop:delete-directory-tree dir :validate t
                                             :if-does-not-exist :ignore)))))))

@@ -52,71 +52,71 @@
 
 (test empty-script-zero-sigops
   "Empty script has zero sigops."
-  (is (= 0 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 0 (bl.val:count-script-sigops
              (make-array 0 :element-type '(unsigned-byte 8))))))
 
 (test checksig-counts-as-one
   "OP_CHECKSIG counts as 1 sigop."
-  (is (= 1 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 1 (bl.val:count-script-sigops
              (make-script #xac)))))
 
 (test checksigverify-counts-as-one
   "OP_CHECKSIGVERIFY counts as 1 sigop."
-  (is (= 1 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 1 (bl.val:count-script-sigops
              (make-script #xad)))))
 
 (test multiple-checksigs
   "Multiple OP_CHECKSIG opcodes are summed."
-  (is (= 3 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 3 (bl.val:count-script-sigops
              (make-script #xac #xac #xac)))))
 
 (test checkmultisig-inaccurate-counts-20
   "OP_CHECKMULTISIG counts as 20 in inaccurate mode."
   ;; OP_3 <keys> OP_3 OP_CHECKMULTISIG - but inaccurate ignores preceding opcode
-  (is (= 20 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 20 (bl.val:count-script-sigops
               (make-script #x53 #xae)))))
 
 (test checkmultisig-accurate-uses-preceding-opcode
   "OP_CHECKMULTISIG uses preceding OP_n in accurate mode."
   ;; OP_3 OP_CHECKMULTISIG = 3 sigops (accurate)
-  (is (= 3 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 3 (bl.val:count-script-sigops
              (make-script #x53 #xae) :accurate t))))
 
 (test checkmultisig-accurate-op1
   "OP_1 OP_CHECKMULTISIG = 1 sigop in accurate mode."
-  (is (= 1 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 1 (bl.val:count-script-sigops
              (make-script #x51 #xae) :accurate t))))
 
 (test checkmultisig-accurate-op16
   "OP_16 OP_CHECKMULTISIG = 16 sigops in accurate mode."
-  (is (= 16 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 16 (bl.val:count-script-sigops
               (make-script #x60 #xae) :accurate t))))
 
 (test checkmultisig-accurate-no-preceding-small-int
   "OP_CHECKMULTISIG without preceding OP_n counts as 20 even in accurate mode."
-  (is (= 20 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 20 (bl.val:count-script-sigops
               (make-script #x00 #xae) :accurate t))))
 
 (test checkmultisigverify-inaccurate
   "OP_CHECKMULTISIGVERIFY counts as 20 in inaccurate mode."
-  (is (= 20 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 20 (bl.val:count-script-sigops
               (make-script #x53 #xaf)))))
 
 (test checkmultisigverify-accurate
   "OP_CHECKMULTISIGVERIFY uses preceding OP_n in accurate mode."
-  (is (= 3 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 3 (bl.val:count-script-sigops
              (make-script #x53 #xaf) :accurate t))))
 
 (test push-data-skips-sigop-bytes
   "Push data correctly skips over bytes that look like sigops."
   ;; Push 2 bytes [OP_CHECKSIG, OP_CHECKSIG] then actual OP_CHECKSIG
   ;; Only the final OP_CHECKSIG should count
-  (is (= 1 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 1 (bl.val:count-script-sigops
              (make-script #x02 #xac #xac #xac)))))
 
 (test p2pkh-script-sigops
   "P2PKH scriptPubKey has 1 sigop (the OP_CHECKSIG)."
-  (is (= 1 (bitcoin-lisp.validation:count-script-sigops
+  (is (= 1 (bl.val:count-script-sigops
              (make-p2pkh-script (make-dummy-hash #xaa 20))))))
 
 ;;;; Task 5.2: Unit tests for count-transaction-sigops-cost
@@ -125,16 +125,16 @@
                               (script-pubkey (make-array 0 :element-type '(unsigned-byte 8)))
                               witness)
   "Create a test transaction with one input and one output."
-  (let* ((input (bitcoin-lisp.serialization:make-tx-in
-                 :previous-output (bitcoin-lisp.serialization:make-outpoint
+  (let* ((input (bl.ser:make-tx-in
+                 :previous-output (bl.ser:make-outpoint
                                    :hash (make-dummy-hash #x01 32)
                                    :index 0)
                  :script-sig script-sig
                  :sequence #xFFFFFFFF))
-         (output (bitcoin-lisp.serialization:make-tx-out
+         (output (bl.ser:make-tx-out
                   :value 50000000
                   :script-pubkey script-pubkey)))
-    (bitcoin-lisp.serialization:make-transaction
+    (bl.ser:make-transaction
      :version 1
      :inputs (vector input)
      :outputs (vector output)
@@ -157,7 +157,7 @@
     ;; P2SH: spent scriptPubKey is P2PKH, not P2SH, so 0
     ;; Witness: not a witness program, so 0
     ;; Cost = (1 + 0) * 4 + 0 = 4
-    (is (= 4 (bitcoin-lisp.validation:count-transaction-sigops-cost tx get-spent)))))
+    (is (= 4 (bl.val:count-transaction-sigops-cost tx get-spent)))))
 
 (test p2wpkh-transaction-sigops-cost
   "Native P2WPKH transaction: witness sigops = 1, cost = 1."
@@ -173,7 +173,7 @@
     ;; P2SH: not P2SH, 0
     ;; Witness: P2WPKH = 1
     ;; Cost = (1 + 0) * 4 + 1 = 5
-    (is (= 5 (bitcoin-lisp.validation:count-transaction-sigops-cost tx get-spent)))))
+    (is (= 5 (bl.val:count-transaction-sigops-cost tx get-spent)))))
 
 (test p2sh-wrapped-p2wpkh-sigops-cost
   "P2SH-P2WPKH: witness sigops = 1, redeemScript (witness program) has 0 script sigops."
@@ -195,7 +195,7 @@
     ;; P2SH: redeemScript is a witness program (no sigops in script bytes) = 0
     ;; Witness: P2SH-wrapped P2WPKH = 1
     ;; Cost = (1 + 0) * 4 + 1 = 5
-    (is (= 5 (bitcoin-lisp.validation:count-transaction-sigops-cost tx get-spent)))))
+    (is (= 5 (bl.val:count-transaction-sigops-cost tx get-spent)))))
 
 (test bare-multisig-sigops-cost
   "Bare 2-of-3 multisig: legacy counts OP_CHECKMULTISIG as 20."
@@ -236,7 +236,7 @@
     ;; Cost = 0 * 4 + 0 = 0
     ;; NOTE: The multisig is in the *spent* output, which isn't in this tx's scripts.
     ;; Legacy counts are from the tx's OWN scriptSigs and scriptPubKeys.
-    (is (= 0 (bitcoin-lisp.validation:count-transaction-sigops-cost tx get-spent)))))
+    (is (= 0 (bl.val:count-transaction-sigops-cost tx get-spent)))))
 
 (test p2sh-multisig-sigops-cost
   "P2SH 2-of-3 multisig: P2SH counts accurately from redeemScript."
@@ -277,7 +277,7 @@
     ;; P2SH: redeemScript is multisig, accurate count: preceding OP_3 => 3
     ;; Witness: not witness, 0
     ;; Cost = (0 + 3) * 4 + 0 = 12
-    (is (= 12 (bitcoin-lisp.validation:count-transaction-sigops-cost tx get-spent)))))
+    (is (= 12 (bl.val:count-transaction-sigops-cost tx get-spent)))))
 
 (test sigops-cost-gates-on-activation
   "P2SH/witness sigops are only counted when their flags are active, mirroring
@@ -290,9 +290,9 @@ Bitcoin Core's GetTransactionSigOpCost honoring SCRIPT_VERIFY_P2SH/_WITNESS."
               :witness (list (make-dummy-hash #xcc 72))))
          (get-spent (lambda (txid index) (declare (ignore txid index)) spent)))
     ;; witness active: (1+0)*4 + 1 = 5 ; witness inactive: (1+0)*4 + 0 = 4
-    (is (= 5 (bitcoin-lisp.validation:count-transaction-sigops-cost
+    (is (= 5 (bl.val:count-transaction-sigops-cost
               tx get-spent :count-witness t)))
-    (is (= 4 (bitcoin-lisp.validation:count-transaction-sigops-cost
+    (is (= 4 (bl.val:count-transaction-sigops-cost
               tx get-spent :count-witness nil))))
   ;; P2SH input whose redeemScript is a bare OP_CHECKSIG (accurate p2sh sigops = 1).
   (let* ((redeem (make-script #xac))                 ; OP_CHECKSIG
@@ -303,18 +303,18 @@ Bitcoin Core's GetTransactionSigOpCost honoring SCRIPT_VERIFY_P2SH/_WITNESS."
               :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
          (get-spent (lambda (txid index) (declare (ignore txid index)) spent)))
     ;; p2sh active: (0+1)*4 + 0 = 4 ; p2sh inactive: (0+0)*4 + 0 = 0
-    (is (= 4 (bitcoin-lisp.validation:count-transaction-sigops-cost
+    (is (= 4 (bl.val:count-transaction-sigops-cost
               tx get-spent :count-p2sh t)))
-    (is (= 0 (bitcoin-lisp.validation:count-transaction-sigops-cost
+    (is (= 0 (bl.val:count-transaction-sigops-cost
               tx get-spent :count-p2sh nil)))))
 
 (test witness-scale-factor-constant
   "Witness scale factor is 4."
-  (is (= 4 bitcoin-lisp.validation:+witness-scale-factor+)))
+  (is (= 4 bl.val:+witness-scale-factor+)))
 
 (test max-block-sigops-cost-constant
   "Max block sigops cost is 80,000."
-  (is (= 80000 bitcoin-lisp.validation:+max-block-sigops-cost+)))
+  (is (= 80000 bl.val:+max-block-sigops-cost+)))
 
 ;;;; P2SH sigop subscript — CScript::GetSigOpCount(const CScript& scriptSig)
 
@@ -334,7 +334,7 @@ Bitcoin Core's GetTransactionSigOpCost honoring SCRIPT_VERIFY_P2SH/_WITNESS."
 
 (defun %sigop-empty-redeem-spk ()
   "P2SH scriptPubKey committing to the EMPTY redeem script."
-  (make-p2sh-script (bitcoin-lisp.crypto:hash160
+  (make-p2sh-script (bl.crypto:hash160
                      (make-array 0 :element-type '(unsigned-byte 8)))))
 
 (defun %sigop-empty-redeem-script-sig ()
@@ -352,11 +352,11 @@ OP_RESERVED or OP_1..OP_16 leaves an EMPTY subscript rather than the preceding
 push — while still not tripping the opcode > OP_16 early-out."
   (let ((blob (%sigop-dense-blob 520)))
     (flet ((expect-empty-subscript (script-sig)
-             (let ((subscript (bitcoin-lisp.validation::p2sh-sigop-subscript script-sig)))
+             (let ((subscript (bl.val::p2sh-sigop-subscript script-sig)))
                (is (not (null subscript)))
                (is (zerop (length subscript))))))
       ;; The push alone is the subscript when it really is the last opcode.
-      (is (equalp blob (bitcoin-lisp.validation::p2sh-sigop-subscript
+      (is (equalp blob (bl.val::p2sh-sigop-subscript
                         (%sigop-pushdata2 blob))))
       ;; OP_0 is a zero-length push; OP_1NEGATE/OP_RESERVED/OP_1/OP_16 are above
       ;; OP_PUSHDATA4 and refill nothing. All five clear the subscript.
@@ -371,7 +371,7 @@ push — while still not tripping the opcode > OP_16 early-out."
 OP_16 (script.cpp:183-205) — the same condition as IsPushOnly (script.cpp:266-281),
 so NIL is both the zero-sigop answer and the gate CountWitnessSigOps needs."
   (flet ((subscript-of (&rest bytes)
-           (bitcoin-lisp.validation::p2sh-sigop-subscript (apply #'make-script bytes))))
+           (bl.val::p2sh-sigop-subscript (apply #'make-script bytes))))
     ;; OP_NOP (#x61) is one above OP_16.
     (is (null (subscript-of #x01 #x51 #x61)))
     (is (null (subscript-of #xac)))
@@ -394,9 +394,9 @@ leftover instead charged 4,160 sigops (16,640 weighted) per input."
               :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
          (get-spent (lambda (txid index) (declare (ignore txid index)) spent)))
     ;; Not vacuous: the leftover blob really is worth 4,160 accurate sigops.
-    (is (= 4160 (bitcoin-lisp.validation:count-script-sigops
+    (is (= 4160 (bl.val:count-script-sigops
                  (%sigop-dense-blob 520) :accurate t)))
-    (is (= 0 (bitcoin-lisp.validation:count-transaction-sigops-cost tx get-spent)))))
+    (is (= 0 (bl.val:count-transaction-sigops-cost tx get-spent)))))
 
 (test p2sh-wrapped-witness-sigops-need-push-only-script-sig
   "CountWitnessSigOps only looks inside a P2SH scriptSig when it IsPushOnly
@@ -413,12 +413,12 @@ last-push extractor found the witness program regardless and charged 1."
               :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))
               :witness (list (make-dummy-hash #xcc 72)))))
       ;; OP_NOP after the push makes the scriptSig non-push-only.
-      (is (= 0 (bitcoin-lisp.validation:count-transaction-sigops-cost
+      (is (= 0 (bl.val:count-transaction-sigops-cost
                 (witness-spend (concatenate '(vector (unsigned-byte 8))
                                             canonical-push (vector #x61)))
                 get-spent)))
       ;; Control: drop the OP_NOP and the wrapped P2WPKH costs its 1 witness sigop.
-      (is (= 1 (bitcoin-lisp.validation:count-transaction-sigops-cost
+      (is (= 1 (bl.val:count-transaction-sigops-cost
                 (witness-spend canonical-push) get-spent))))))
 
 (test p2sh-empty-redeem-script-within-standard-sigops-cost
@@ -426,25 +426,25 @@ last-push extractor found the witness program regardless and charged 1."
 the over-count also made us refuse to relay a transaction Core relays. The input
 stays nonstandard for an unrelated reason — the per-input MAX_P2SH_SIGOPS gate
 keeps its own policy last-push extraction."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
-         (utxo (bitcoin-lisp.storage:make-utxo-set))
+  (let* ((mempool (bl.mp:make-mempool))
+         (utxo (bl.store:make-utxo-set))
          (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5a))
-         (tx (bitcoin-lisp.serialization:make-transaction
+         (tx (bl.ser:make-transaction
               :version 2
-              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint
                                                  :hash funding :index 0)
                                :script-sig (%sigop-empty-redeem-script-sig)
                                :sequence #xffffffff))
-              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+              :outputs (vector (bl.ser:make-tx-out
                                 :value 95000 :script-pubkey (%p2sh-optrue-spk)))
               :lock-time 0)))
-    (bitcoin-lisp.storage:add-utxo utxo funding 0 100000 (%sigop-empty-redeem-spk) 1
+    (bl.store:add-utxo utxo funding 0 100000 (%sigop-empty-redeem-spk) 1
                                    :coinbase nil)
     ;; Not vacuous: one such input was worth 16,640 weighted sigops, above the cap.
-    (is (> 16640 bitcoin-lisp.validation::+max-standard-tx-sigops-cost+))
+    (is (> 16640 bl.val::+max-standard-tx-sigops-cost+))
     (multiple-value-bind (valid err)
-        (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
+        (bl.val:validate-transaction-for-mempool tx utxo mempool 100)
       (is (null valid))
       (is (eq :nonstandard-inputs err)))))
 
@@ -455,37 +455,37 @@ Core fully validates. A pure chain split: our own script engine accepts the
 spends, which this block proves by validating with scripts on."
   (%with-regtest
    (let* ((node (%regtest-node-fixture "sigop-p2sh"))
-          (cs (bitcoin-lisp::node-chain-state node))
-          (utxo (bitcoin-lisp::node-utxo-set node))
-          (mempool (bitcoin-lisp::node-mempool node))
+          (cs (bl::node-chain-state node))
+          (utxo (bl::node-utxo-set node))
+          (mempool (bl::node-mempool node))
           (spk (%sigop-empty-redeem-spk))
           (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5a)))
      (dotimes (idx 5)
-       (bitcoin-lisp.storage:add-utxo utxo funding idx 100000 spk 0 :coinbase nil))
-     (let ((tx (bitcoin-lisp.serialization:make-transaction
+       (bl.store:add-utxo utxo funding idx 100000 spk 0 :coinbase nil))
+     (let ((tx (bl.ser:make-transaction
                 :version 1
                 :inputs (coerce (loop for idx from 0 below 5
-                                      collect (bitcoin-lisp.serialization:make-tx-in
+                                      collect (bl.ser:make-tx-in
                                                :previous-output
-                                               (bitcoin-lisp.serialization:make-outpoint
+                                               (bl.ser:make-outpoint
                                                 :hash funding :index idx)
                                                :script-sig (%sigop-empty-redeem-script-sig)
                                                :sequence #xffffffff))
                                 'vector)
-                :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                :outputs (vector (bl.ser:make-tx-out
                                   :value 499000 :script-pubkey (%p2sh-optrue-spk)))
                 :lock-time 0)))
        ;; Not vacuous: the old count for these five inputs exceeds the budget.
-       (is (> (* 5 4 (bitcoin-lisp.validation:count-script-sigops
+       (is (> (* 5 4 (bl.val:count-script-sigops
                       (%sigop-dense-blob 520) :accurate t))
-              bitcoin-lisp.validation:+max-block-sigops-cost+))
+              bl.val:+max-block-sigops-cost+))
        (%mine-add-entry mempool tx 1000)
-       (let ((block (bitcoin-lisp.mining:assemble-full-block
+       (let ((block (bl.mining:assemble-full-block
                      cs mempool :coinbase-script-pubkey (%p2sh-optrue-spk))))
-         (bitcoin-lisp.mining:mine-block block)
-         (is (= 2 (length (bitcoin-lisp.serialization:bitcoin-block-transactions block))))
+         (bl.mining:mine-block block)
+         (is (= 2 (length (bl.ser:bitcoin-block-transactions block))))
          (multiple-value-bind (valid err)
-             (bitcoin-lisp.validation:validate-block
-              block cs utxo 1 (bitcoin-lisp.serialization:get-unix-time))
+             (bl.val:validate-block
+              block cs utxo 1 (bl.ser:get-unix-time))
            (is (null err))
            (is-true valid)))))))

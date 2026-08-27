@@ -16,14 +16,14 @@
 (in-suite descriptor-tests)
 
 (defun %desc-parse (s &optional (net :mainnet))
-  (bitcoin-lisp.rpc::parse-descriptor s net))
+  (bl.rpc::parse-descriptor s net))
 
 (defun %desc-pub (s &optional (net :mainnet))
-  (bitcoin-lisp.rpc::out-desc-string (%desc-parse s net)))
+  (bl.rpc::out-desc-string (%desc-parse s net)))
 
 (defun %desc-scripts (s net pos)
-  (mapcar #'bitcoin-lisp.crypto:bytes-to-hex
-          (bitcoin-lisp.rpc::out-desc-expand (%desc-parse s net) pos)))
+  (mapcar #'bl.crypto:bytes-to-hex
+          (bl.rpc::out-desc-expand (%desc-parse s net) pos)))
 
 (defun %check-desc (prv pub scripts &key (net :mainnet) range hardened)
   "Port of Core's Check(): PRV and PUB must both parse and canonicalize to
@@ -32,23 +32,23 @@ RANGE = expected isrange; HARDENED = expansion needs private keys, so the
 PUB form must fail to expand."
   (let ((prv-desc (%desc-parse prv net))
         (pub-desc (%desc-parse pub net)))
-    (is (string= pub (bitcoin-lisp.rpc::out-desc-string prv-desc))
+    (is (string= pub (bl.rpc::out-desc-string prv-desc))
         "private form ~A canonicalizes to ~A, wanted ~A"
-        prv (bitcoin-lisp.rpc::out-desc-string prv-desc) pub)
-    (is (string= pub (bitcoin-lisp.rpc::out-desc-string pub-desc)))
-    (is (eq (and range t) (and (bitcoin-lisp.rpc::out-desc-ranged-p prv-desc) t)))
-    (is (eq t (bitcoin-lisp.rpc::out-desc-solvable-p prv-desc)))
+        prv (bl.rpc::out-desc-string prv-desc) pub)
+    (is (string= pub (bl.rpc::out-desc-string pub-desc)))
+    (is (eq (and range t) (and (bl.rpc::out-desc-ranged-p prv-desc) t)))
+    (is (eq t (bl.rpc::out-desc-solvable-p prv-desc)))
     (when (string/= prv pub)
-      (is (eq t (bitcoin-lisp.rpc::out-desc-has-privkeys-p prv-desc)))
-      (is (null (bitcoin-lisp.rpc::out-desc-has-privkeys-p pub-desc))))
+      (is (eq t (bl.rpc::out-desc-has-privkeys-p prv-desc)))
+      (is (null (bl.rpc::out-desc-has-privkeys-p pub-desc))))
     (loop for expected in scripts
           for i from 0
           do (is (equal expected (%desc-scripts prv net i))
                  "~A at index ~D expands to ~S, wanted ~S"
                  prv i (%desc-scripts prv net i) expected)
              (if hardened
-                 (signals bitcoin-lisp.rpc::descriptor-derivation-error
-                   (bitcoin-lisp.rpc::out-desc-expand pub-desc i))
+                 (signals bl.rpc::descriptor-derivation-error
+                   (bl.rpc::out-desc-expand pub-desc i))
                  (is (equal expected (%desc-scripts pub net i)))))))
 
 (defun %check-unparsable (prv pub message &key (net :mainnet))
@@ -61,11 +61,11 @@ must be exactly MESSAGE."
           do (handler-case
                  (progn (%desc-parse s net)
                         (fail "~A parsed but should have failed with: ~A" s message))
-               (bitcoin-lisp.rpc::rpc-error (e)
+               (bl.rpc::rpc-error (e)
                  (when last-p
-                   (is (string= message (bitcoin-lisp.rpc::rpc-error-message e))
+                   (is (string= message (bl.rpc::rpc-error-message e))
                        "~A failed with ~S, wanted ~S"
-                       s (bitcoin-lisp.rpc::rpc-error-message e) message)))))))
+                       s (bl.rpc::rpc-error-message e) message)))))))
 
 ;;; --- descriptor_tests.cpp: single keys ---
 
@@ -382,8 +382,8 @@ plain sh(); >3 rejected bare; >20 rejected everywhere."
   (let ((prv "sh(multi(2,[00000000/111'/222]xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0))")
         (pub "sh(multi(2,[00000000/111'/222]xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0))"))
     ;; Core's known checksums for both forms
-    (is (string= "ggrsrxfy" (bitcoin-lisp.rpc::descriptor-checksum prv)))
-    (is (string= "tjg09x5t" (bitcoin-lisp.rpc::descriptor-checksum pub)))
+    (is (string= "ggrsrxfy" (bl.rpc::descriptor-checksum prv)))
+    (is (string= "tjg09x5t" (bl.rpc::descriptor-checksum pub)))
     ;; Valid with correct checksum, with or without
     (finishes (%desc-parse (concatenate 'string prv "#ggrsrxfy")))
     (finishes (%desc-parse (concatenate 'string pub "#tjg09x5t")))
@@ -404,9 +404,9 @@ plain sh(); >3 rejected bare; >20 rejected everywhere."
                                          (subseq prv 10)
                                          "#ggrsrxfy"))
                (fail "bad payload accepted"))
-      (bitcoin-lisp.rpc::rpc-error (e)
+      (bl.rpc::rpc-error (e)
         (is (alexandria:starts-with-subseq "Provided checksum 'ggrsrxfy' does not match computed checksum"
-                                           (bitcoin-lisp.rpc::rpc-error-message e)))))
+                                           (bl.rpc::rpc-error-message e)))))
     ;; Error in checksum detected
     (%check-unparsable (concatenate 'string prv "#ggssrxfy") ""
                        "Provided checksum 'ggssrxfy' does not match computed checksum 'ggrsrxfy'")
@@ -484,14 +484,14 @@ TR-SCRIPT-TREES-MATCH-CORE-VECTORS below holds it to Core's vectors."
 the cache; different descriptors/indices don't collide."
   (let* ((s "wpkh([ffffffff/13']xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH/1/2/*)")
          (desc (%desc-parse s)))
-    (let ((first-time (bitcoin-lisp.rpc::out-desc-expand desc 7)))
+    (let ((first-time (bl.rpc::out-desc-expand desc 7)))
       ;; second expansion returns the identical (cached) list
-      (is (eq first-time (bitcoin-lisp.rpc::out-desc-expand desc 7)))
+      (is (eq first-time (bl.rpc::out-desc-expand desc 7)))
       ;; a fresh parse of the same string hits the same cache entry
-      (is (eq first-time (bitcoin-lisp.rpc::out-desc-expand (%desc-parse s) 7)))
+      (is (eq first-time (bl.rpc::out-desc-expand (%desc-parse s) 7)))
       ;; a different index derives a different script
       (is (not (equalp (first first-time)
-                       (first (bitcoin-lisp.rpc::out-desc-expand desc 8))))))))
+                       (first (bl.rpc::out-desc-expand desc 8))))))))
 
 ;;; --- getdescriptorinfo (Core rpc/output_script.cpp behavior) ---
 
@@ -501,12 +501,12 @@ the cache; different descriptors/indices don't collide."
     ;; Private ranged descriptor: xprv normalized to xpub in `descriptor`,
     ;; `checksum` is the checksum of the input as given.
     (let* ((prv "wpkh(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK/1/1/*)")
-           (r (bitcoin-lisp.rpc::rpc-getdescriptorinfo node (list prv)))
+           (r (bl.rpc::rpc-getdescriptorinfo node (list prv)))
            (reported (cdr (assoc "descriptor" r :test #'string=))))
       (is (eq t (cdr (assoc "isrange" r :test #'string=))))
       (is (eq t (cdr (assoc "issolvable" r :test #'string=))))
       (is (eq t (cdr (assoc "hasprivatekeys" r :test #'string=))))
-      (is (string= (bitcoin-lisp.rpc::descriptor-checksum prv)
+      (is (string= (bl.rpc::descriptor-checksum prv)
                    (cdr (assoc "checksum" r :test #'string=))))
       ;; The reported descriptor is public (tpub..., no tprv) and checksummed.
       (is (search "tpub" reported))
@@ -515,22 +515,22 @@ the cache; different descriptors/indices don't collide."
       ;; and it round-trips: parsing it yields the same canonical form.
       (is (string= reported
                    (cdr (assoc "descriptor"
-                               (bitcoin-lisp.rpc::rpc-getdescriptorinfo
+                               (bl.rpc::rpc-getdescriptorinfo
                                 node (list reported))
                                :test #'string=)))))
     ;; Unranged public descriptor: no range, no private keys.
-    (let ((r (bitcoin-lisp.rpc::rpc-getdescriptorinfo
+    (let ((r (bl.rpc::rpc-getdescriptorinfo
               node
               (list "pkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/1/0)"))))
       (is (eq 'yason:false (cdr (assoc "isrange" r :test #'string=))))
       (is (eq t (cdr (assoc "issolvable" r :test #'string=))))
       (is (eq 'yason:false (cdr (assoc "hasprivatekeys" r :test #'string=)))))
     ;; addr()/raw() are not solvable.
-    (let ((r (bitcoin-lisp.rpc::rpc-getdescriptorinfo node (list "raw(51)"))))
+    (let ((r (bl.rpc::rpc-getdescriptorinfo node (list "raw(51)"))))
       (is (eq 'yason:false (cdr (assoc "issolvable" r :test #'string=)))))
     ;; Bad checksum still rejected.
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-getdescriptorinfo node (list "raw(51)#deadbeef")))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::rpc-getdescriptorinfo node (list "raw(51)#deadbeef")))))
 
 ;;; --- deriveaddresses (Core test/functional/rpc_deriveaddresses.py) ---
 
@@ -538,14 +538,14 @@ the cache; different descriptors/indices don't collide."
   "scriptPubKey bytes of ADDRESS (used to compare against Core's documented
 regtest bcrt1 addresses, whose witness programs are network-independent)."
   (multiple-value-bind (type script)
-      (bitcoin-lisp.crypto:decode-address address network)
+      (bl.crypto:decode-address address network)
     (declare (ignore type))
     script))
 
 (defun %derived-scripts (node args)
   "deriveaddresses -> scriptPubKeys of the returned addresses."
   (mapcar (lambda (a) (%addr-script a :testnet3))
-          (bitcoin-lisp.rpc::rpc-deriveaddresses node args)))
+          (bl.rpc::rpc-deriveaddresses node args)))
 
 (test rpc-deriveaddresses-core-functional
   "Port of Core's rpc_deriveaddresses.py: same tprv/tpub descriptors; the
@@ -554,14 +554,14 @@ in the Core test (bech32 HRP differs between our testnet node and Core's
 regtest node, the underlying scriptPubKeys must match exactly)."
   (let* ((node (make-test-node))     ; :testnet3
          (tprv "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK")
-         (descsum (lambda (body) (bitcoin-lisp.rpc::descriptor-add-checksum body))))
+         (descsum (lambda (body) (bl.rpc::descriptor-add-checksum body))))
     (flet ((expect-error (message &rest args)
              (handler-case
-                 (progn (bitcoin-lisp.rpc::rpc-deriveaddresses node args)
+                 (progn (bl.rpc::rpc-deriveaddresses node args)
                         (fail "expected error ~S for ~S" message args))
-               (bitcoin-lisp.rpc::rpc-error (e)
-                 (is (string= message (bitcoin-lisp.rpc::rpc-error-message e))
-                     "got ~S wanted ~S" (bitcoin-lisp.rpc::rpc-error-message e) message)))))
+               (bl.rpc::rpc-error (e)
+                 (is (string= message (bl.rpc::rpc-error-message e))
+                     "got ~S wanted ~S" (bl.rpc::rpc-error-message e) message)))))
       ;; No checksum -> error
       (expect-error "Missing checksum" "a")
       ;; Single wpkh
@@ -592,7 +592,7 @@ regtest node, the underlying scriptPubKeys must match exactly)."
                     (funcall descsum (format nil "wpkh(~A/1/1/0)" tprv)) (list 0 2))
       ;; combo(): P2PK is skipped, 3 addresses remain (base58 forms are
       ;; identical between regtest and testnet, compare them literally).
-      (let ((addrs (bitcoin-lisp.rpc::rpc-deriveaddresses
+      (let ((addrs (bl.rpc::rpc-deriveaddresses
                     node (list (funcall descsum (format nil "combo(~A/1/1/0)" tprv))))))
         (is (= 3 (length addrs)))
         (is (string= "mtfUoUax9L4tzXARpw1oTGxWyoogp52KhJ" (first addrs)))
@@ -615,39 +615,39 @@ regtest node, the underlying scriptPubKeys must match exactly)."
   "scantxoutset expands ranged descriptors over their range (default
 [0,1000]); an explicit range object narrows/widens the window."
   (let* ((node (make-test-node))
-         (utxo (bitcoin-lisp::node-utxo-set node))
+         (utxo (bl::node-utxo-set node))
          (desc "wpkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/1/*)")
-         (parsed (bitcoin-lisp.rpc::parse-descriptor desc :testnet3))
-         (script-at-5 (first (bitcoin-lisp.rpc::out-desc-expand parsed 5)))
-         (script-at-1500 (first (bitcoin-lisp.rpc::out-desc-expand parsed 1500)))
+         (parsed (bl.rpc::parse-descriptor desc :testnet3))
+         (script-at-5 (first (bl.rpc::out-desc-expand parsed 5)))
+         (script-at-1500 (first (bl.rpc::out-desc-expand parsed 1500)))
          (txid-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
          (txid-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
-    (bitcoin-lisp.storage:add-utxo utxo txid-a 0 100000000 script-at-5 0)
-    (bitcoin-lisp.storage:add-utxo utxo txid-b 0 200000000 script-at-1500 0)
+    (bl.store:add-utxo utxo txid-a 0 100000000 script-at-5 0)
+    (bl.store:add-utxo utxo txid-b 0 200000000 script-at-1500 0)
     ;; Default range [0,1000]: finds index 5, not index 1500.
-    (let ((r (bitcoin-lisp.rpc::rpc-scantxoutset node (list "start" (list desc)))))
+    (let ((r (bl.rpc::rpc-scantxoutset node (list "start" (list desc)))))
       (is (= 1 (length (cdr (assoc "unspents" r :test #'string=))))))
     ;; Explicit range through a scan object reaches index 1500.
     (let ((obj (make-hash-table :test 'equal)))
       (setf (gethash "desc" obj) desc
             (gethash "range" obj) (list 1400 1600))
-      (let ((r (bitcoin-lisp.rpc::rpc-scantxoutset node (list "start" (list obj)))))
+      (let ((r (bl.rpc::rpc-scantxoutset node (list "start" (list obj)))))
         (let ((unspents (cdr (assoc "unspents" r :test #'string=))))
           (is (= 1 (length unspents)))
-          (is (string= (bitcoin-lisp.crypto:bytes-to-hex script-at-1500)
+          (is (string= (bl.crypto:bytes-to-hex script-at-1500)
                        (cdr (assoc "scriptPubKey" (first unspents) :test #'string=)))))))
     ;; Narrow range that misses both.
     (let ((obj (make-hash-table :test 'equal)))
       (setf (gethash "desc" obj) desc
             (gethash "range" obj) (list 6 10))
-      (let ((r (bitcoin-lisp.rpc::rpc-scantxoutset node (list "start" (list obj)))))
+      (let ((r (bl.rpc::rpc-scantxoutset node (list "start" (list obj)))))
         (is (= 0 (length (cdr (assoc "unspents" r :test #'string=)))))))
     ;; Range validation errors propagate.
     (let ((obj (make-hash-table :test 'equal)))
       (setf (gethash "desc" obj) desc
             (gethash "range" obj) (list 0 2000000))
-      (signals bitcoin-lisp.rpc::rpc-error
-        (bitcoin-lisp.rpc::rpc-scantxoutset node (list "start" (list obj)))))))
+      (signals bl.rpc::rpc-error
+        (bl.rpc::rpc-scantxoutset node (list "start" (list obj)))))))
 
 ;;; --- generatetodescriptor-style consumers reject ranged descriptors ---
 
@@ -655,15 +655,15 @@ regtest node, the underlying scriptPubKeys must match exactly)."
   "parse-output-descriptor (generatetodescriptor / generateblock path) keeps
 Core's 'Ranged descriptor not accepted' behavior."
   (handler-case
-      (progn (bitcoin-lisp.rpc::parse-output-descriptor
+      (progn (bl.rpc::parse-output-descriptor
               "wpkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/*)"
               :testnet3)
              (fail "ranged descriptor accepted"))
-    (bitcoin-lisp.rpc::rpc-error (e)
+    (bl.rpc::rpc-error (e)
       (is (string= "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?"
-                   (bitcoin-lisp.rpc::rpc-error-message e)))))
+                   (bl.rpc::rpc-error-message e)))))
   ;; Unranged xpub descriptors now expand fine on this path.
-  (let ((pairs (bitcoin-lisp.rpc::parse-output-descriptor
+  (let ((pairs (bl.rpc::parse-output-descriptor
                 "wpkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/1/0)"
                 :testnet3)))
     (is (= 1 (length pairs)))
@@ -672,9 +672,9 @@ Core's 'Ranged descriptor not accepted' behavior."
 ;;;; Multipath descriptors (BIP389)
 
 (defun %mp-expand (s)
-  (handler-case (bitcoin-lisp.rpc::expand-multipath-descriptor s)
-    (bitcoin-lisp.rpc::rpc-error (e)
-      (list :error (bitcoin-lisp.rpc::rpc-error-message e)))))
+  (handler-case (bl.rpc::expand-multipath-descriptor s)
+    (bl.rpc::rpc-error (e)
+      (list :error (bl.rpc::rpc-error-message e)))))
 
 (test multipath-descriptors-expand-into-one-descriptor-each
   "`wpkh(xpub/<0;1>/*)` is ONE string meaning TWO descriptors — the receive
@@ -728,18 +728,18 @@ the reason a multipath import cannot carry a label (:203-206)."
              (declare (ignore w ts))
              (push (cons (gethash "desc" data) (gethash "internal" data)) seen)
              '(("success" . t))))
-      (let ((original (symbol-function 'bitcoin-lisp.rpc::%process-descriptor-import)))
+      (let ((original (symbol-function 'bl.rpc::%process-descriptor-import)))
         (unwind-protect
              (progn
-               (setf (symbol-function 'bitcoin-lisp.rpc::%process-descriptor-import)
+               (setf (symbol-function 'bl.rpc::%process-descriptor-import)
                      #'fake-import)
                (let ((data (make-hash-table :test 'equal)))
                  (setf (gethash "desc" data) "wpkh(xpub/<0;1>/*)")
-                 (let ((result (bitcoin-lisp.rpc::%process-multipath-import
+                 (let ((result (bl.rpc::%process-multipath-import
                                 wallet data 1
                                 '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)"))))
                    (is (eq t (cdr (assoc "success" result :test #'string=)))))))
-          (setf (symbol-function 'bitcoin-lisp.rpc::%process-descriptor-import)
+          (setf (symbol-function 'bl.rpc::%process-descriptor-import)
                 original))))
     (setf seen (nreverse seen))
     (is (= 2 (length seen)))
@@ -755,7 +755,7 @@ the reason a multipath import cannot carry a label (:203-206)."
   (let ((data (make-hash-table :test 'equal)))
     (setf (gethash "desc" data) "wpkh(xpub/<0;1>/*)"
           (gethash "label" data) "mine")
-    (let ((result (bitcoin-lisp.rpc::%process-multipath-import
+    (let ((result (bl.rpc::%process-multipath-import
                    :fake data 1 '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)"))))
       (is-false (cdr (assoc "success" result :test #'string=)))
       (is (string= "Multipath descriptors should not have a label"
@@ -766,7 +766,7 @@ the reason a multipath import cannot carry a label (:203-206)."
   (let ((data (make-hash-table :test 'equal)))
     (setf (gethash "desc" data) "wpkh(xpub/<0;1;2>/*)"
           (gethash "internal" data) t)
-    (let ((result (bitcoin-lisp.rpc::%process-multipath-import
+    (let ((result (bl.rpc::%process-multipath-import
                    :fake data 1 '("a" "b" "c"))))
       (is-false (cdr (assoc "success" result :test #'string=))))))
 
@@ -775,11 +775,11 @@ the reason a multipath import cannot carry a label (:203-206)."
 (defun %dt-expand-pairs (desc-string)
   "(values desc scripts pairs) for DESC-STRING at index 0, the way
 %SPKM-EXPANSION-PAIRS builds them for the wallet."
-  (let ((d (bitcoin-lisp.rpc::parse-descriptor desc-string :mainnet)))
+  (let ((d (bl.rpc::parse-descriptor desc-string :mainnet)))
     (multiple-value-bind (scripts pubkeys)
-        (bitcoin-lisp.rpc::%out-desc-expand-cached d 0)
+        (bl.rpc::%out-desc-expand-cached d 0)
       (values d scripts
-              (mapcar #'cons (bitcoin-lisp.rpc::out-desc-ordered-keys d) pubkeys)))))
+              (mapcar #'cons (bl.rpc::out-desc-ordered-keys d) pubkeys)))))
 
 (test expansion-pubkeys-come-back-in-key-expression-order
   "%SPKM-EXPANSION-PAIRS zips the expansion's pubkey list against
@@ -799,7 +799,7 @@ consulted when signing."
       (declare (ignore desc scripts))
       ;; Every pair must hold a key and the pubkey that key derives to.
       (dolist (pair pairs)
-        (is (equalp (bitcoin-lisp.rpc::desc-key-pubkey (car pair)) (cdr pair))
+        (is (equalp (bl.rpc::desc-key-pubkey (car pair)) (cdr pair))
             "key expression paired with another expression's pubkey")))))
 
 (test wsh-miniscript-can-be-inferred-instead-of-crashing
@@ -812,7 +812,7 @@ from getaddressinfo and listunspent for any wallet holding a policy descriptor."
          (c "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
     (multiple-value-bind (desc scripts pairs)
         (%dt-expand-pairs (format nil "wsh(and_v(v:pk(~A),older(42)))" a))
-      (let ((body (bitcoin-lisp.rpc::%infer-desc-body desc (first scripts) scripts pairs 0)))
+      (let ((body (bl.rpc::%infer-desc-body desc (first scripts) scripts pairs 0)))
         (is-true (stringp body) "inference returned ~S" body)
         (is-true (search "wsh(and_v(v:pk(" body))
         (is-true (search "older(42))" body))
@@ -822,7 +822,7 @@ from getaddressinfo and listunspent for any wallet holding a policy descriptor."
     ;; keys transposed is a backup that restores a different wallet.
     (multiple-value-bind (desc scripts pairs)
         (%dt-expand-pairs (format nil "wsh(andor(pk(~A),pk(~A),pk(~A)))" a b c))
-      (let ((body (bitcoin-lisp.rpc::%infer-desc-body desc (first scripts) scripts pairs 0)))
+      (let ((body (bl.rpc::%infer-desc-body desc (first scripts) scripts pairs 0)))
         (is-true (stringp body))
         (let ((pa (search a body)) (pb (search b body)) (pc (search c body)))
           (is-true (and pa pb pc) "not every key appears in the inferred body")
@@ -910,15 +910,15 @@ leaf as pk(xpub.../1/*) while pushing the 32-byte form into the script. Deciding
 the script from the print flag silently gives a 33-byte push here — a different
 leaf hash, a different merkle root, and therefore a different ADDRESS."
   (let* ((d (%desc-parse (format nil "tr(~A/0/*,pk(~A/1/*))" +tr-xpub+ +tr-xpub+)))
-         (leaf (cdr (first (bitcoin-lisp.rpc::out-desc-tree d))))
-         (script (first (bitcoin-lisp.rpc::out-desc-expand leaf 0))))
+         (leaf (cdr (first (bl.rpc::out-desc-tree d))))
+         (script (first (bl.rpc::out-desc-expand leaf 0))))
     (is (= 34 (length script))
         "leaf script is ~D bytes, wanted 34 (push32 + CHECKSIG)" (length script))
     (is (= 32 (aref script 0)) "leaf pushes ~D bytes, wanted 32" (aref script 0))
     (is (= #xac (aref script 33)))
     ;; And the key still prints as an xpub, which is the half that must NOT
     ;; follow the script.
-    (is-true (search +tr-xpub+ (bitcoin-lisp.rpc::out-desc-string d))
+    (is-true (search +tr-xpub+ (bl.rpc::out-desc-string d))
              "the leaf key stopped printing as an xpub")))
 
 (test tr-tree-inference-names-each-leafs-own-key
@@ -934,7 +934,7 @@ wrong key restores a different wallet."
          (x-b (subseq b 2)))
     (multiple-value-bind (desc scripts pairs)
         (%dt-expand-pairs (format nil "tr(~A,{pk(~A),pk(~A)})" +tr-xonly+ a b))
-      (let ((body (bitcoin-lisp.rpc::%infer-desc-body desc (first scripts)
+      (let ((body (bl.rpc::%infer-desc-body desc (first scripts)
                                                       scripts pairs 0)))
         (is-true (stringp body) "inference returned ~S" body)
         ;; Each leaf reports its OWN key, x-only (Core builds the inferred
@@ -961,23 +961,23 @@ wallet backup is identified by."
   (let* ((node (make-test-node))          ; :testnet3
          (body (format nil "tr(~A,{pk(~A),multi_a(1,~A)})"
                        +tr-xonly+ +tr-xonly+ +tr-xonly+))
-         (r (bitcoin-lisp.rpc::rpc-getdescriptorinfo node (list body)))
+         (r (bl.rpc::rpc-getdescriptorinfo node (list body)))
          (reported (cdr (assoc "descriptor" r :test #'string=))))
-    (is (string= (bitcoin-lisp.rpc::descriptor-checksum body)
+    (is (string= (bl.rpc::descriptor-checksum body)
                  (cdr (assoc "checksum" r :test #'string=))))
     (is (eq t (cdr (assoc "issolvable" r :test #'string=))))
     ;; JSON false is a SENTINEL OBJECT, which is true in Lisp: IS-FALSE here
     ;; would pass on any value the RPC could ever return.
-    (is (eq bitcoin-lisp.rpc::+json-false+
+    (is (eq bl.rpc::+json-false+
             (cdr (assoc "isrange" r :test #'string=))))
-    (is (eq bitcoin-lisp.rpc::+json-false+
+    (is (eq bl.rpc::+json-false+
             (cdr (assoc "hasprivatekeys" r :test #'string=))))
     ;; The reported form keeps the tree and round-trips to itself.
     (is-true (search "{pk(" reported) "the tree vanished from ~S" reported)
     (is-true (search "multi_a(1," reported))
     (is (string= reported
                  (cdr (assoc "descriptor"
-                             (bitcoin-lisp.rpc::rpc-getdescriptorinfo
+                             (bl.rpc::rpc-getdescriptorinfo
                               node (list reported))
                              :test #'string=))))))
 
@@ -994,26 +994,26 @@ The interpreter is the oracle here: it is held to Core's script/sighash/BIP341
 vectors by the rest of this battery, so a witness it accepts under standard
 flags is one Core accepts. A hand-written expected witness would only re-assert
 whatever the signer happened to build."
-  (let* ((desc (bitcoin-lisp.rpc::parse-descriptor desc-str :mainnet))
-         (spk (first (bitcoin-lisp.rpc::out-desc-expand desc 0)))
+  (let* ((desc (bl.rpc::parse-descriptor desc-str :mainnet))
+         (spk (first (bl.rpc::out-desc-expand desc 0)))
          (amount 100000)
          (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (multiple-value-bind (output-key leaves)
-        (bitcoin-lisp.rpc::tr-spend-data
-         desc 0 (lambda (k) (bitcoin-lisp.rpc::%desc-key-pubkey-at k 0)))
+        (bl.rpc::tr-spend-data
+         desc 0 (lambda (k) (bl.rpc::%desc-key-pubkey-at k 0)))
       (let* ((prev-txid (make-array 32 :element-type '(unsigned-byte 8)
                                        :initial-element 7))
-             (tx (bitcoin-lisp.serialization:make-transaction
+             (tx (bl.ser:make-transaction
                   :version 2
-                  :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                  :inputs (vector (bl.ser:make-tx-in
                                    :previous-output
-                                   (bitcoin-lisp.serialization:make-outpoint
+                                   (bl.ser:make-outpoint
                                     :hash prev-txid :index 0)
                                    :script-sig empty :sequence #xffffffff))
-                  :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                  :outputs (vector (bl.ser:make-tx-out
                                     :value (- amount 1000)
                                     :script-pubkey
-                                    (coerce (bitcoin-lisp.crypto:hex-to-bytes
+                                    (coerce (bl.crypto:hex-to-bytes
                                              "0014751e76e8199196d454941c45d1b3a323f1433bd6")
                                             '(simple-array (unsigned-byte 8) (*)))))))
              (prevmap (make-hash-table :test 'equalp))
@@ -1022,27 +1022,27 @@ whatever the signer happened to build."
              (tr-keymap (make-hash-table :test 'equalp))
              (tr-scripts (make-hash-table :test 'equalp))
              (pairs (mapcar (lambda (k)
-                              (cons k (bitcoin-lisp.rpc::%desc-key-pubkey-at k 0)))
-                            (bitcoin-lisp.rpc::out-desc-ordered-keys desc)))
-             (next (bitcoin-lisp.rpc::%pairs-splitter (rest pairs))))
+                              (cons k (bl.rpc::%desc-key-pubkey-at k 0)))
+                            (bl.rpc::out-desc-ordered-keys desc)))
+             (next (bl.rpc::%pairs-splitter (rest pairs))))
         (setf (gethash (cons prev-txid 0) prevmap) (list spk amount nil nil))
         (dolist (wif held-wifs)
-          (let* ((sk (bitcoin-lisp.crypto:wif-to-private-key wif))
-                 (pub (bitcoin-lisp.crypto:derive-public-key sk :compressed t)))
+          (let* ((sk (bl.crypto:wif-to-private-key wif))
+                 (pub (bl.crypto:derive-public-key sk :compressed t)))
             (setf (gethash pub pubmap) sk)
-            (setf (gethash (bitcoin-lisp.crypto:hash160 pub) keymap) (cons sk pub))))
+            (setf (gethash (bl.crypto:hash160 pub) keymap) (cons sk pub))))
         (setf (gethash output-key tr-scripts)
               (loop for (script leaf-hash control) in leaves
-                    for (nil . leaf) in (bitcoin-lisp.rpc::out-desc-tree desc)
+                    for (nil . leaf) in (bl.rpc::out-desc-tree desc)
                     for own = (funcall next leaf)
                     collect (list script leaf-hash control leaf
                                   (mapcar #'cdr own))))
-        (let ((errs (bitcoin-lisp.rpc::%sign-tx-inputs
+        (let ((errs (bl.rpc::%sign-tx-inputs
                      tx prevmap keymap pubmap tr-keymap 1 tr-scripts)))
           (values (mapcar #'cdr errs)
                   (map 'list (lambda (st) (mapcar #'length st))
-                       (or (bitcoin-lisp.serialization:transaction-witness tx) #()))
-                  (nth-value 0 (bitcoin-lisp.rpc::%verify-tx-scripts tx prevmap))))))))
+                       (or (bl.ser:transaction-witness tx) #()))
+                  (nth-value 0 (bl.rpc::%verify-tx-scripts tx prevmap))))))))
 
 (test tr-script-path-spends-verify
   "A tr() output whose INTERNAL key we do not hold can only be spent through a
@@ -1109,8 +1109,8 @@ Reachable: multi_a allows a threshold up to MAX_PUBKEYS_PER_MULTI_A, so a
 128-of-N tapscript leaf is a legal descriptor. A one-byte-per-number shortcut
 builds a different leaf script there, hence a different leaf hash, merkle root
 and ADDRESS — and above 255 it cannot hold the value at all."
-  (flet ((hex (n) (bitcoin-lisp.crypto:bytes-to-hex
-                   (coerce (bitcoin-lisp.rpc::%script-num n)
+  (flet ((hex (n) (bl.crypto:bytes-to-hex
+                   (coerce (bl.rpc::%script-num n)
                            '(vector (unsigned-byte 8))))))
     ;; 1..16 are the OP_1..OP_16 opcodes.
     (is (string= "51" (hex 1)))
@@ -1137,22 +1137,22 @@ precisely why the guard needs a test of its own rather than a caller."
   (let ((h (lambda (b) (make-array 32 :element-type '(unsigned-byte 8)
                                       :initial-element b))))
     ;; A well-formed tree still works.
-    (is (= 32 (length (bitcoin-lisp.rpc::%taproot-tree
+    (is (= 32 (length (bl.rpc::%taproot-tree
                        (list (cons 1 (funcall h 1)) (cons 1 (funcall h 2)))))))
     ;; Propagating past the root.
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::%taproot-tree
+    (signals bl.rpc::rpc-error
+      (bl.rpc::%taproot-tree
        (list (cons 1 (funcall h 1)) (cons 1 (funcall h 2)) (cons 0 (funcall h 3)))))
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::%taproot-tree
+    (signals bl.rpc::rpc-error
+      (bl.rpc::%taproot-tree
        (list (cons 0 (funcall h 1)) (cons 0 (funcall h 2)))))
     ;; A leaf above an unfinished deeper branch.
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::%taproot-tree
+    (signals bl.rpc::rpc-error
+      (bl.rpc::%taproot-tree
        (list (cons 2 (funcall h 1)) (cons 1 (funcall h 2)))))
     ;; And an incomplete tree is still incomplete.
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::%taproot-tree (list (cons 1 (funcall h 1)))))))
+    (signals bl.rpc::rpc-error
+      (bl.rpc::%taproot-tree (list (cons 1 (funcall h 1)))))))
 
 ;;;; --- musig() key aggregation (BIP327/BIP328) -----------------------------
 
@@ -1163,15 +1163,15 @@ Both orders are pinned on purpose: BIP327 aggregation is NOT symmetric, so the
 same three keys in a different order are a different aggregate and therefore a
 different ADDRESS. The primitive stays order-sensitive; BIP328's KeySort is
 applied one level up, by the descriptor."
-  (let ((x1 (bitcoin-lisp.crypto:hex-to-bytes
+  (let ((x1 (bl.crypto:hex-to-bytes
              "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"))
-        (x2 (bitcoin-lisp.crypto:hex-to-bytes
+        (x2 (bl.crypto:hex-to-bytes
              "03dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659"))
-        (x3 (bitcoin-lisp.crypto:hex-to-bytes
+        (x3 (bl.crypto:hex-to-bytes
              "023590a94e768f8e1815c2f24b4d80a8e3149316c3518ce7b7ad338368d038ca66")))
     (flet ((agg-xonly (keys)
-             (let ((a (bitcoin-lisp.crypto:musig-aggregate-pubkeys keys)))
-               (and a (bitcoin-lisp.crypto:bytes-to-hex (subseq a 1))))))
+             (let ((a (bl.crypto:musig-aggregate-pubkeys keys)))
+               (and a (bl.crypto:bytes-to-hex (subseq a 1))))))
       (is (string= "90539eede565f5d054f32cc0c220126889ed1e5d193baf15aef344fe59d4610c"
                    (agg-xonly (list x1 x2 x3))))
       (is (string= "6204de8b083426dc6eaf9502d27024d53fc826bf7d2012148a0575435df54b2b"
@@ -1244,10 +1244,10 @@ would be unspendable while the descriptor looked fine."
         (b "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
         (i "a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd"))
     ;; multi_a inside wsh(): rejected.
-    (signals bitcoin-lisp.rpc::rpc-error
+    (signals bl.rpc::rpc-error
       (%desc-parse (format nil "wsh(multi_a(1,~A,~A))" a b)))
     ;; multi inside a tr() leaf: rejected.
-    (signals bitcoin-lisp.rpc::rpc-error
+    (signals bl.rpc::rpc-error
       (%desc-parse (format nil "tr(~A,multi(1,~A,~A))" i a b)))
     ;; And each in its own context parses.
     (finishes (%desc-parse (format nil "wsh(multi(1,~A,~A))" a b)))
@@ -1261,10 +1261,10 @@ the same split that produced a wrong address twice in the tr() work."
   (let* ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
          (i "a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd")
          (d (%desc-parse (format nil "tr(~A,and_v(v:pk(~A),older(42)))" i a)))
-         (leaf (cdr (first (bitcoin-lisp.rpc::out-desc-tree d))))
-         (script (first (bitcoin-lisp.rpc::out-desc-expand leaf 0))))
+         (leaf (cdr (first (bl.rpc::out-desc-tree d))))
+         (script (first (bl.rpc::out-desc-expand leaf 0))))
     ;; <32> <x> CHECKSIGVERIFY <42> CHECKSEQUENCEVERIFY
     (is (= 32 (aref script 0))
         "leaf pushes ~D bytes, wanted 32 (x-only)" (aref script 0))
-    (is-false (search (bitcoin-lisp.crypto:hex-to-bytes a) script)
+    (is-false (search (bl.crypto:hex-to-bytes a) script)
               "the 33-byte key appears verbatim in a tapscript leaf")))

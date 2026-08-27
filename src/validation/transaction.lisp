@@ -24,15 +24,15 @@
 (defun max-money-satoshi ()
   "Return +max-money+ as a Satoshi type (lazy initialization)."
   (or *max-money-satoshi*
-      (setf *max-money-satoshi* (bitcoin-lisp.coalton.interop:wrap-satoshi +max-money+))))
+      (setf *max-money-satoshi* (bl.interop:wrap-satoshi +max-money+))))
 
 ;;;; Structure validation (context-free)
 
 (defun validate-transaction-structure (tx)
   "Validate basic transaction structure without chain context.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
-  (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-        (outputs (bitcoin-lisp.serialization:transaction-outputs tx)))
+  (let ((inputs (bl.ser:transaction-inputs tx))
+        (outputs (bl.ser:transaction-outputs tx)))
 
     ;; Must have at least one input
     (when (zerop (length inputs))
@@ -55,26 +55,26 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
     ;; repeating one input — which is exactly how mempool_accept.py:235 builds
     ;; it — must report oversize, not duplicate inputs.
     (when (> (* +witness-scale-factor+
-                (length (bitcoin-lisp.serialization:serialize-transaction tx)))
+                (length (bl.ser:serialize-transaction tx)))
              +max-block-weight+)
       (return-from validate-transaction-structure
         (values nil :tx-oversize)))
 
     ;; Check for duplicate inputs
     (let ((seen-outpoints (make-hash-table :test 'equalp)))
-      (bitcoin-lisp.serialization:dovector (input inputs)
-        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-               (key (cons (bitcoin-lisp.serialization:outpoint-hash prevout)
-                          (bitcoin-lisp.serialization:outpoint-index prevout))))
+      (bl.ser:dovector (input inputs)
+        (let* ((prevout (bl.ser:tx-in-previous-output input))
+               (key (cons (bl.ser:outpoint-hash prevout)
+                          (bl.ser:outpoint-index prevout))))
           (when (gethash key seen-outpoints)
             (return-from validate-transaction-structure
               (values nil :duplicate-inputs)))
           (setf (gethash key seen-outpoints) t))))
 
     ;; Validate outputs using typed Satoshi arithmetic
-    (let ((total-output (bitcoin-lisp.coalton.interop:wrap-satoshi 0)))
-      (bitcoin-lisp.serialization:dovector (output outputs)
-        (let ((value (bitcoin-lisp.serialization:tx-out-value output)))
+    (let ((total-output (bl.interop:wrap-satoshi 0)))
+      (bl.ser:dovector (output outputs)
+        (let ((value (bl.ser:tx-out-value output)))
           ;; Output value must be non-negative
           (when (minusp value)
             (return-from validate-transaction-structure
@@ -84,9 +84,9 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
             (return-from validate-transaction-structure
               (values nil :output-too-large)))
           ;; Use typed addition
-          (setf total-output (bitcoin-lisp.coalton.interop:satoshi+ total-output (bitcoin-lisp.coalton.interop:wrap-satoshi value)))))
+          (setf total-output (bl.interop:satoshi+ total-output (bl.interop:wrap-satoshi value)))))
       ;; Total output must not exceed max money
-      (when (bitcoin-lisp.coalton.interop:satoshi> total-output (max-money-satoshi))
+      (when (bl.interop:satoshi> total-output (max-money-satoshi))
         (return-from validate-transaction-structure
           (values nil :total-output-too-large))))
 
@@ -96,14 +96,14 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
     ;; Coinbase → scriptSig must be 2..100 bytes; non-coinbase → no input
     ;; may have a null prevout (bad-txns-prevout-null).
     (if (and (= (length inputs) 1)
-             (bitcoin-lisp.serialization:coinbase-input-p (aref inputs 0)))
-        (let ((sig-len (length (bitcoin-lisp.serialization:tx-in-script-sig
+             (bl.ser:coinbase-input-p (aref inputs 0)))
+        (let ((sig-len (length (bl.ser:tx-in-script-sig
                                 (aref inputs 0)))))
           (when (or (< sig-len 2) (> sig-len 100))
             (return-from validate-transaction-structure
               (values nil :bad-coinbase-length))))
-        (bitcoin-lisp.serialization:dovector (inp inputs)
-          (when (bitcoin-lisp.serialization:coinbase-input-p inp)
+        (bl.ser:dovector (inp inputs)
+          (when (bl.ser:coinbase-input-p inp)
             (return-from validate-transaction-structure
               (values nil :bad-prevout-null)))))
 
@@ -127,31 +127,31 @@ falls into :missing-input — Core has spent the coin out of its view, so
 HaveInputs fails with bad-txns-inputs-missingorspent (tx_verify.cpp:167-169).
 Returns (VALUES T NIL FEE) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure.
 FEE is returned as a Satoshi type."
-  (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-        (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
-        (total-input (bitcoin-lisp.coalton.interop:wrap-satoshi 0))
-        (total-output (bitcoin-lisp.coalton.interop:wrap-satoshi 0)))
+  (let ((inputs (bl.ser:transaction-inputs tx))
+        (outputs (bl.ser:transaction-outputs tx))
+        (total-input (bl.interop:wrap-satoshi 0))
+        (total-output (bl.interop:wrap-satoshi 0)))
 
     ;; Skip input validation for coinbase
     (unless is-coinbase
-      (bitcoin-lisp.serialization:dovector (input inputs)
-        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-               (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-               (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+      (bl.ser:dovector (input inputs)
+        (let* ((prevout (bl.ser:tx-in-previous-output input))
+               (prev-txid (bl.ser:outpoint-hash prevout))
+               (prev-index (bl.ser:outpoint-index prevout))
                (key (cons prev-txid prev-index))
                (spent-in-block (and spent-outpoints (gethash key spent-outpoints)))
                (utxo (unless spent-in-block
-                       (or (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)
+                       (or (bl.store:get-utxo utxo-set prev-txid prev-index)
                            ;; Check intra-block pending UTXOs
                            (when pending-utxos
                              (gethash key pending-utxos))))))
 
           ;; Input must reference an existing UTXO
           (unless utxo
-            (bitcoin-lisp:log-warn
+            (bl:log-warn
              "MISSING-INPUT: height=~D prev-txid=~A:~D in-pending=~A spent-in-block=~A pending-size=~D"
              current-height
-             (bitcoin-lisp.crypto:bytes-to-hex prev-txid)
+             (bl.crypto:bytes-to-hex prev-txid)
              prev-index
              (and pending-utxos
                   (if (gethash key pending-utxos) "yes" "no"))
@@ -161,32 +161,32 @@ FEE is returned as a Satoshi type."
               (values nil :missing-input nil)))
 
           ;; Check coinbase maturity
-          (when (bitcoin-lisp.storage:utxo-entry-coinbase utxo)
+          (when (bl.store:utxo-entry-coinbase utxo)
             (let ((age (- current-height
-                         (bitcoin-lisp.storage:utxo-entry-height utxo))))
+                         (bl.store:utxo-entry-height utxo))))
               (when (< age +coinbase-maturity+)
                 (return-from validate-transaction-contextual
                   (values nil :coinbase-not-mature nil)))))
 
           ;; Use typed addition for input sum
           (setf total-input
-                (bitcoin-lisp.coalton.interop:satoshi+ total-input
-                          (bitcoin-lisp.coalton.interop:wrap-satoshi (bitcoin-lisp.storage:utxo-entry-value utxo)))))))
+                (bl.interop:satoshi+ total-input
+                          (bl.interop:wrap-satoshi (bl.store:utxo-entry-value utxo)))))))
 
     ;; Sum outputs with typed addition
-    (bitcoin-lisp.serialization:dovector (output outputs)
+    (bl.ser:dovector (output outputs)
       (setf total-output
-            (bitcoin-lisp.coalton.interop:satoshi+ total-output
-                      (bitcoin-lisp.coalton.interop:wrap-satoshi (bitcoin-lisp.serialization:tx-out-value output)))))
+            (bl.interop:satoshi+ total-output
+                      (bl.interop:wrap-satoshi (bl.ser:tx-out-value output)))))
 
     ;; For non-coinbase, inputs must cover outputs
     (unless is-coinbase
-      (when (bitcoin-lisp.coalton.interop:satoshi> total-output total-input)
+      (when (bl.interop:satoshi> total-output total-input)
         (return-from validate-transaction-contextual
           (values nil :insufficient-funds nil))))
 
     ;; Return fee as Satoshi type
-    (values t nil (bitcoin-lisp.coalton.interop:satoshi- total-input total-output))))
+    (values t nil (bl.interop:satoshi- total-input total-output))))
 
 ;;;; Mempool acceptance validation
 
@@ -201,7 +201,7 @@ MAX_STANDARD_TX_WEIGHT).")
   "Maximum standard transaction version. Bitcoin Core (TX_MAX_STANDARD_VERSION)
 accepts v3 as standard in lockstep with enforcing TRUC/v3 topology policy
 (BIP431). We now enforce that topology per-tx at mempool acceptance via
-bitcoin-lisp.mempool:single-truc-checks (at most 1 unconfirmed ancestor +
+bl.mp:single-truc-checks (at most 1 unconfirmed ancestor +
 1 descendant, TRUC_MAX_VSIZE, a 1000-vsize child cap, and v3<->non-v3 spend
 inheritance), so v3 is relayed with its anti-pinning guarantees.")
 
@@ -292,13 +292,13 @@ P2SH whose redeem script (the scriptSig's last push; the scriptSig is known
 push-only here from the standardness checks) is a witness program. Port of
 Core SpendsNonAnchorWitnessProg (policy/policy.cpp:340-373): the classifier
 for a script failure that could be explained by a stripped witness."
-  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-    (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-           (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
-           (pidx (bitcoin-lisp.serialization:outpoint-index prevout))
-           (utxo (or (bitcoin-lisp.storage:get-utxo utxo-set ptxid pidx)
+  (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+    (let* ((prevout (bl.ser:tx-in-previous-output input))
+           (ptxid (bl.ser:outpoint-hash prevout))
+           (pidx (bl.ser:outpoint-index prevout))
+           (utxo (or (bl.store:get-utxo utxo-set ptxid pidx)
                      (when extra-coins (gethash (cons ptxid pidx) extra-coins))))
-           (spk (and utxo (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))))
+           (spk (and utxo (bl.store:utxo-entry-script-pubkey utxo))))
       (when spk
         (cond
           ((and (output-witness-program-p spk)
@@ -306,7 +306,7 @@ for a script failure that could be explained by a stripped witness."
            (return-from spends-non-anchor-witness-program-p t))
           ((script-is-p2sh-p spk)
            (let ((redeem (extract-last-push
-                          (bitcoin-lisp.serialization:tx-in-script-sig input))))
+                          (bl.ser:tx-in-script-sig input))))
              (when (and redeem (output-witness-program-p redeem))
                (return-from spends-non-anchor-witness-program-p t))))))))
   nil)
@@ -339,14 +339,14 @@ by whatever spends it.")
 (defun output-is-dust-p (output)
   "Core IsDust (policy.cpp:65): the output's value is below the dust threshold
 for its scriptPubKey."
-  (< (bitcoin-lisp.serialization:tx-out-value output)
-     (dust-threshold (bitcoin-lisp.serialization:tx-out-script-pubkey output))))
+  (< (bl.ser:tx-out-value output)
+     (dust-threshold (bl.ser:tx-out-script-pubkey output))))
 
 (defun transaction-dust-output-count (tx)
   "Number of dust outputs in TX (Core GetDust, policy.cpp:70-77, counted
 rather than collected)."
   (let ((n 0))
-    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
+    (bl.ser:dovector (output (bl.ser:transaction-outputs tx))
       (when (output-is-dust-p output) (incf n)))
     n))
 
@@ -354,7 +354,7 @@ rather than collected)."
   "Indices of TX's dust outputs, ascending (Core GetDust)."
   (let ((indices '())
         (i 0))
-    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
+    (bl.ser:dovector (output (bl.ser:transaction-outputs tx))
       (when (output-is-dust-p output) (push i indices))
       (incf i))
     (nreverse indices)))
@@ -371,40 +371,40 @@ spends a dust-carrying parent without also spending the dust would strand it,
 so the whole exemption depends on this check."
   (let ((in-package (make-hash-table :test 'equalp)))
     (dolist (tx txns)
-      (setf (gethash (bitcoin-lisp.serialization:transaction-hash tx) in-package) tx))
+      (setf (gethash (bl.ser:transaction-hash tx) in-package) tx))
     (dolist (tx txns)
       (let ((processed (make-hash-table :test 'equalp))
             ;; (parent-txid . index) of every unspent dust output of every
             ;; parent this tx spends from.
             (unspent-dust '()))
-        (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-          (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                 (parent-txid (bitcoin-lisp.serialization:outpoint-hash prevout)))
+        (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+          (let* ((prevout (bl.ser:tx-in-previous-output input))
+                 (parent-txid (bl.ser:outpoint-hash prevout)))
             (unless (gethash parent-txid processed)
               (setf (gethash parent-txid processed) t)
               (let* ((entry (and mempool
-                                 (bitcoin-lisp.mempool:mempool-get mempool parent-txid)))
+                                 (bl.mp:mempool-get mempool parent-txid)))
                      (parent (or (gethash parent-txid in-package)
                                  (and entry
-                                      (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))
+                                      (bl.mp:mempool-entry-transaction entry)))))
                 (when parent
                   (dolist (index (transaction-dust-indices parent))
                     (push (cons parent-txid index) unspent-dust)))))))
         (when unspent-dust
           ;; Remove everything this tx actually spends; anything left is dust
           ;; the child stranded.
-          (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-            (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+          (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+            (let ((prevout (bl.ser:tx-in-previous-output input)))
               (setf unspent-dust
                     (remove-if (lambda (od)
                                  (and (equalp (car od)
-                                              (bitcoin-lisp.serialization:outpoint-hash prevout))
+                                              (bl.ser:outpoint-hash prevout))
                                       (= (cdr od)
-                                         (bitcoin-lisp.serialization:outpoint-index prevout))))
+                                         (bl.ser:outpoint-index prevout))))
                                unspent-dust))))
           (when unspent-dust
             (return-from check-ephemeral-spends
-              (values nil (bitcoin-lisp.serialization:transaction-hash tx)))))))
+              (values nil (bl.ser:transaction-hash tx)))))))
     (values t nil)))
 
 (defun scriptsig-push-only-p (script-sig)
@@ -665,20 +665,20 @@ standard witness program (P2WSH/Taproot stack & script limits, no annex).
 SPENT-SCRIPT-FN maps (txid index) to the spent output's scriptPubKey. Coinbase
 has no witness inputs to check. A tx with no witness at all is vacuously
 standard."
-  (let ((witness (bitcoin-lisp.serialization:transaction-witness tx)))
+  (let ((witness (bl.ser:transaction-witness tx)))
     (or (null witness)
-        (loop for input across (bitcoin-lisp.serialization:transaction-inputs tx)
+        (loop for input across (bl.ser:transaction-inputs tx)
         for wstack across witness
         ;; An input with no witness data imposes no witness-standardness rule.
         always (or (null wstack)
-                   (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                   (let* ((prevout (bl.ser:tx-in-previous-output input))
                           (spk (funcall spent-script-fn
-                                        (bitcoin-lisp.serialization:outpoint-hash prevout)
-                                        (bitcoin-lisp.serialization:outpoint-index prevout))))
+                                        (bl.ser:outpoint-hash prevout)
+                                        (bl.ser:outpoint-index prevout))))
                      (and spk
                           (input-witness-standard-p
                            wstack spk
-                           (bitcoin-lisp.serialization:tx-in-script-sig input)))))))))
+                           (bl.ser:tx-in-script-sig input)))))))))
 
 (defun mempool-extra-coins (tx utxo-set mempool spend-height &optional package-coins)
   "Build a (txid . index) -> utxo-entry table for TX inputs that spend
@@ -696,22 +696,22 @@ validation.cpp:185-192), so any nonzero relative lock on an unconfirmed
 input is non-final. Recording the parent's acceptance height instead let
 such locks mature while the parent was still unconfirmed."
   (let ((extra (make-hash-table :test 'equalp)))
-    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx) (values extra t))
-      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-             (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
-             (pidx (bitcoin-lisp.serialization:outpoint-index prevout)))
-        (unless (bitcoin-lisp.storage:get-utxo utxo-set ptxid pidx)
-          (let* ((pe (bitcoin-lisp.mempool:mempool-get mempool ptxid))
-                 (ptx (and pe (bitcoin-lisp.mempool:mempool-entry-transaction pe)))
-                 (outs (and ptx (bitcoin-lisp.serialization:transaction-outputs ptx)))
+    (bl.ser:dovector (input (bl.ser:transaction-inputs tx) (values extra t))
+      (let* ((prevout (bl.ser:tx-in-previous-output input))
+             (ptxid (bl.ser:outpoint-hash prevout))
+             (pidx (bl.ser:outpoint-index prevout)))
+        (unless (bl.store:get-utxo utxo-set ptxid pidx)
+          (let* ((pe (bl.mp:mempool-get mempool ptxid))
+                 (ptx (and pe (bl.mp:mempool-entry-transaction pe)))
+                 (outs (and ptx (bl.ser:transaction-outputs ptx)))
                  (pkg-coin (and package-coins (gethash (cons ptxid pidx) package-coins))))
             (cond
               ((and outs (< pidx (length outs)))
                (let ((out (aref outs pidx)))
                  (setf (gethash (cons ptxid pidx) extra)
-                       (bitcoin-lisp.storage:make-utxo-entry
-                        :value (bitcoin-lisp.serialization:tx-out-value out)
-                        :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey out)
+                       (bl.store:make-utxo-entry
+                        :value (bl.ser:tx-out-value out)
+                        :script-pubkey (bl.ser:tx-out-script-pubkey out)
                         :height spend-height
                         :coinbase nil))))
               (pkg-coin
@@ -727,12 +727,12 @@ spent scriptPubKey's count for that scriptSig — stay within
 spent scriptPubKey or NIL. Fails as soon as the running total passes the cap,
 as Core does."
   (let ((legacy 0))
-    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-             (script-sig (bitcoin-lisp.serialization:tx-in-script-sig input))
+    (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+      (let* ((prevout (bl.ser:tx-in-previous-output input))
+             (script-sig (bl.ser:tx-in-script-sig input))
              (spk (funcall get-spent-script
-                           (bitcoin-lisp.serialization:outpoint-hash prevout)
-                           (bitcoin-lisp.serialization:outpoint-index prevout))))
+                           (bl.ser:outpoint-hash prevout)
+                           (bl.ser:outpoint-index prevout))))
         (incf legacy (count-script-sigops script-sig :accurate t))
         (when spk
           (incf legacy (spent-script-sigop-count spk script-sig)))
@@ -752,18 +752,18 @@ reuse standard-output-script-p — and a P2SH redeem script may carry at most
 (txid index) and returns the spent scriptPubKey or NIL."
   (unless (check-sigops-bip54-p tx get-spent-script)
     (return-from are-inputs-standard-p nil))
-  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-    (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+  (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+    (let* ((prevout (bl.ser:tx-in-previous-output input))
            (spk (funcall get-spent-script
-                         (bitcoin-lisp.serialization:outpoint-hash prevout)
-                         (bitcoin-lisp.serialization:outpoint-index prevout))))
+                         (bl.ser:outpoint-hash prevout)
+                         (bl.ser:outpoint-index prevout))))
       (when spk
         (case (classify-output-script spk)
           ((:nonstandard :witness-unknown)
            (return-from are-inputs-standard-p nil)))
         (when (script-is-p2sh-p spk)
           (let ((redeem (extract-last-push
-                         (bitcoin-lisp.serialization:tx-in-script-sig input))))
+                         (bl.ser:tx-in-script-sig input))))
             (when (and redeem
                        (> (count-script-sigops redeem :accurate t)
                           +max-standard-p2sh-sigops+))
@@ -799,7 +799,7 @@ Core keeps it OUTSIDE IsStandardTx and outside the require_standard branch
 (validation.cpp:813-815) because it mitigates CVE-2017-12842 — a 64-byte
 transaction is refused even on a node told to relay non-standard ones."
   ;; Policy: standard transaction version
-  (let ((version (bitcoin-lisp.serialization:transaction-version tx)))
+  (let ((version (bl.ser:transaction-version tx)))
     (unless (<= +min-standard-tx-version+ version +max-standard-tx-version+)
       (return-from %is-standard-tx
         (values nil :version-non-standard))))
@@ -808,13 +808,13 @@ transaction is refused even on a node told to relay non-standard ones."
   ;; "tx-size"). This is the POLICY limit and it is not the only size limit —
   ;; CheckTransaction's consensus ceiling is checked in
   ;; VALIDATE-TRANSACTION-STRUCTURE, on the non-witness serialization.
-  (when (> (bitcoin-lisp.serialization:transaction-weight tx) +max-standard-tx-weight+)
+  (when (> (bl.ser:transaction-weight tx) +max-standard-tx-weight+)
     (return-from %is-standard-tx
       (values nil :tx-weight-too-large)))
 
   ;; Policy: scriptSig must be push-only and within the size limit
-  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-    (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input)))
+  (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+    (let ((script-sig (bl.ser:tx-in-script-sig input)))
       (when (> (length script-sig) +max-standard-scriptsig-size+)
         (return-from %is-standard-tx
           (values nil :scriptsig-too-large)))
@@ -832,11 +832,11 @@ transaction is refused even on a node told to relay non-standard ones."
   ;; this shared budget). -datacarrier=0 zeroes the budget, so any OP_RETURN
   ;; output fails with the same reason (Core mempool_args.cpp:95-98:
   ;; max_datacarrier_bytes = nullopt -> value_or(0)).
-  (let ((datacarrier-bytes-left (if bitcoin-lisp:*accept-datacarrier*
-                                    bitcoin-lisp:*max-datacarrier-bytes*
+  (let ((datacarrier-bytes-left (if bl:*accept-datacarrier*
+                                    bl:*max-datacarrier-bytes*
                                     0)))
-    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
-      (let ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+    (bl.ser:dovector (output (bl.ser:transaction-outputs tx))
+      (let ((spk (bl.ser:tx-out-script-pubkey output)))
         (unless (standard-output-script-p spk)
           (return-from %is-standard-tx
             (values nil :non-standard-output)))
@@ -850,7 +850,7 @@ transaction is refused even on a node told to relay non-standard ones."
                (values nil :datacarrier)))
            (decf datacarrier-bytes-left (length spk)))
           ((and (eq (classify-output-script spk) :multisig)
-                (not bitcoin-lisp:*permit-bare-multisig*))
+                (not bl:*permit-bare-multisig*))
            (return-from %is-standard-tx
              (values nil :bare-multisig)))))))
 
@@ -1009,9 +1009,9 @@ decide (Core PreChecks, validation.cpp:950-970)."
 
   ;; 2. Coinbase is only valid in a block (:802-804), and AFTER
   ;;    CheckTransaction: a malformed coinbase is reported as malformed.
-  (when (and (= (length (bitcoin-lisp.serialization:transaction-inputs tx)) 1)
-             (bitcoin-lisp.serialization:coinbase-input-p
-              (aref (bitcoin-lisp.serialization:transaction-inputs tx) 0)))
+  (when (and (= (length (bl.ser:transaction-inputs tx)) 1)
+             (bl.ser:coinbase-input-p
+              (aref (bl.ser:transaction-inputs tx) 0)))
     (return-from validate-transaction-for-mempool
       (values nil :coinbase-not-allowed nil)))
 
@@ -1027,14 +1027,14 @@ decide (Core PreChecks, validation.cpp:950-970)."
   ;;    and outside require_standard so it holds even for a node told to relay
   ;;    non-standard transactions. SERIALIZE-TRANSACTION emits the legacy
   ;;    (non-witness) encoding, so its length is the stripped size Core measures.
-  (when (< (length (bitcoin-lisp.serialization:serialize-transaction tx))
+  (when (< (length (bl.ser:serialize-transaction tx))
            +min-standard-tx-nonwitness-size+)
     (return-from validate-transaction-for-mempool
       (values nil :tx-size-small nil)))
 
   ;; Check for duplicate in mempool
-  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-    (when (bitcoin-lisp.mempool:mempool-has mempool txid)
+  (let ((txid (bl.ser:transaction-hash tx)))
+    (when (bl.mp:mempool-has mempool txid)
       (return-from validate-transaction-for-mempool
         (values nil :already-in-mempool nil))))
 
@@ -1060,10 +1060,10 @@ decide (Core PreChecks, validation.cpp:950-970)."
       ;; Core's missing-inputs instead. We ask the view, which answers the
       ;; question the check exists to ask in every case rather than most of
       ;; them. Both paths reject; only the reason differs.
-      (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
-            (outputs (bitcoin-lisp.serialization:transaction-outputs tx)))
+      (let ((txid (bl.ser:transaction-hash tx))
+            (outputs (bl.ser:transaction-outputs tx)))
         (dotimes (i (length outputs))
-          (when (bitcoin-lisp.storage:get-utxo utxo-set txid i)
+          (when (bl.store:get-utxo utxo-set txid i)
             (return-from validate-transaction-for-mempool
               (values nil :already-known nil)))))
       (return-from validate-transaction-for-mempool
@@ -1076,15 +1076,15 @@ decide (Core PreChecks, validation.cpp:950-970)."
     ;; the block connect path uses; gated on CHAIN-STATE being supplied.
     (when chain-state
       (let* ((eval-height (1+ current-height))
-             (tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+             (tip-hash (bl.store:best-block-hash chain-state))
              (mtp (or (compute-median-time-past chain-state tip-hash) 0))
              (csv-active (>= eval-height
-                             (get-csv-activation-height bitcoin-lisp:*network*)))
+                             (get-csv-activation-height bl:*network*)))
              ;; BIP113: locktime compares against MTP once CSV is active
              ;; (true on all our networks at tip); fall back to wall-clock
              ;; for the pre-activation window.
              (locktime-time (if csv-active mtp
-                                (bitcoin-lisp.serialization:get-unix-time))))
+                                (bl.ser:get-unix-time))))
         (unless (check-transaction-final tx eval-height locktime-time)
           (return-from validate-transaction-for-mempool
             (values nil :non-final nil)))
@@ -1101,9 +1101,9 @@ decide (Core PreChecks, validation.cpp:950-970)."
     ;; block assembler's sigop budget sees real numbers.
     (let ((sigops-cost
             (flet ((spent-script (txid index)
-                     (let ((u (or (bitcoin-lisp.storage:get-utxo utxo-set txid index)
+                     (let ((u (or (bl.store:get-utxo utxo-set txid index)
                                   (gethash (cons txid index) extra-coins))))
-                       (when u (bitcoin-lisp.storage:utxo-entry-script-pubkey u)))))
+                       (when u (bl.store:utxo-entry-script-pubkey u)))))
               ;; Core AreInputsStandard → TX_INPUTS_NOT_STANDARD
               ;; "bad-txns-nonstandard-inputs", checked BEFORE the total
               ;; sigop-cost cap as in PreChecks (validation.cpp), so a tx
@@ -1123,7 +1123,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
                 ;; Policy: witness must be standard (P2WSH/Taproot stack &
                 ;; script limits, no annex). Needs the spent scriptPubKeys,
                 ;; hence inside this flet.
-                (when (and (bitcoin-lisp.serialization:transaction-has-witness-p tx)
+                (when (and (bl.ser:transaction-has-witness-p tx)
                            *require-standard*
                            (not (is-witness-standard-p tx #'spent-script)))
                   (return-from validate-transaction-for-mempool
@@ -1155,15 +1155,15 @@ decide (Core PreChecks, validation.cpp:950-970)."
         ;; size — Core's ws.m_vsize is the entry's GetTxSize()
         ;; (validation.cpp:929), not the raw BIP141 vsize — so the fee floor,
         ;; TRUC size caps, and RBF economics all price sigop-dense txs.
-        (let* ((fee-value (bitcoin-lisp.coalton.interop:unwrap-satoshi fee))
+        (let* ((fee-value (bl.interop:unwrap-satoshi fee))
                (modified-fee-value
                  (+ fee-value
-                    (gethash (bitcoin-lisp.serialization:transaction-hash tx)
-                             (bitcoin-lisp.mempool:mempool-deltas mempool) 0)))
-               (vsize (bitcoin-lisp.mempool:sigop-adjusted-vsize
-                       (bitcoin-lisp.serialization:transaction-weight tx)
+                    (gethash (bl.ser:transaction-hash tx)
+                             (bl.mp:mempool-deltas mempool) 0)))
+               (vsize (bl.mp:sigop-adjusted-vsize
+                       (bl.ser:transaction-weight tx)
                        sigops-cost))
-               (direct-conflicts (bitcoin-lisp.mempool:find-rbf-conflicts mempool tx))
+               (direct-conflicts (bl.mp:find-rbf-conflicts mempool tx))
                (replaced-set nil))
 
           ;; EPHEMERAL DUST, part 2 (Core PreCheckEphemeralTx,
@@ -1199,7 +1199,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
           (when (and (not skip-fee-check)
                      (not bypass-limits)
                      (< (* modified-fee-value 1000)
-                        (* (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)
+                        (* (bl.mp:mempool-effective-min-fee-rate mempool)
                            vsize)))
             (return-from validate-transaction-for-mempool
               (values nil :insufficient-fee nil)))
@@ -1214,7 +1214,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
           ;; and the replacement economics decide its fate.
           (unless bypass-limits
             (multiple-value-bind (truc-ok truc-reason sibling)
-                (bitcoin-lisp.mempool:single-truc-checks mempool tx vsize direct-conflicts)
+                (bl.mp:single-truc-checks mempool tx vsize direct-conflicts)
               (unless truc-ok
                 (if (and sibling allow-sibling-eviction (not skip-rbf-check))
                     (pushnew sibling direct-conflicts :test #'equalp)
@@ -1228,7 +1228,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
           ;; RBF evaluation.
           (when (and direct-conflicts (not skip-rbf-check))
             (multiple-value-bind (ok reason rset)
-                (bitcoin-lisp.mempool:check-rbf-rules mempool tx modified-fee-value
+                (bl.mp:check-rbf-rules mempool tx modified-fee-value
                                                       vsize direct-conflicts)
               (unless ok
                 (return-from validate-transaction-for-mempool (values nil reason nil)))
@@ -1251,7 +1251,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
           ;; skips the doomed execution and keeps the :witness-stripped
           ;; classification. Anchor (P2A) spends are exempt: they
           ;; legitimately carry no witness.
-          (when (and (not (bitcoin-lisp.serialization:transaction-has-witness-p tx))
+          (when (and (not (bl.ser:transaction-has-witness-p tx))
                      (spends-non-anchor-witness-program-p tx utxo-set extra-coins))
             (return-from validate-transaction-for-mempool
               (values nil :witness-stripped nil)))
@@ -1289,10 +1289,10 @@ decide (Core PreChecks, validation.cpp:950-970)."
               (validate-transaction-scripts tx utxo-set :height current-height
                                             :extra-coins extra-coins)
             (unless scripts-valid
-              (bitcoin-lisp:log-error
+              (bl:log-error
                "BUG! PLEASE REPORT THIS! input scripts failed against latest-block but not STANDARD flags: txid=~A input=~A"
-               (bitcoin-lisp.crypto:bytes-to-hex
-                (bitcoin-lisp.serialization:transaction-hash tx))
+               (bl.crypto:bytes-to-hex
+                (bl.ser:transaction-hash tx))
                failed-input)
               (return-from validate-transaction-for-mempool
                 (values nil :block-script-verify-flag-failed nil))))
@@ -1315,14 +1315,14 @@ decide (Core PreChecks, validation.cpp:950-970)."
   (let ((result (make-array (length inputs))))
     (loop for input across inputs
           for i from 0
-          for prevout = (bitcoin-lisp.serialization:tx-in-previous-output input)
-          for utxo = (or (bitcoin-lisp.storage:get-utxo
+          for prevout = (bl.ser:tx-in-previous-output input)
+          for utxo = (or (bl.store:get-utxo
                           utxo-set
-                          (bitcoin-lisp.serialization:outpoint-hash prevout)
-                          (bitcoin-lisp.serialization:outpoint-index prevout))
+                          (bl.ser:outpoint-hash prevout)
+                          (bl.ser:outpoint-index prevout))
                          (and extra-coins
-                              (gethash (cons (bitcoin-lisp.serialization:outpoint-hash prevout)
-                                             (bitcoin-lisp.serialization:outpoint-index prevout))
+                              (gethash (cons (bl.ser:outpoint-hash prevout)
+                                             (bl.ser:outpoint-index prevout))
                                        extra-coins)))
           unless utxo do (return-from collect-spent-utxos nil)
           do (setf (aref result i) utxo))
@@ -1340,7 +1340,7 @@ mempool spends). An input whose coin cannot be resolved fails the transaction:
 Core asserts the coin is present before verifying (CheckInputScripts,
 validation.cpp:2090), so a missing coin must never mean \"no script to check\".
 Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
-  (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+  (let* ((inputs (bl.ser:transaction-inputs tx))
          (effective-flags (or flags (compute-script-flags-for-height height)))
          ;; Script-execution cache (Core CheckInputScripts,
          ;; validation.cpp:2075-2081): a transaction whose inputs ALL verified
@@ -1352,23 +1352,23 @@ Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
          ;; Keyed on the WTXID: the witness is where the signatures live, so a
          ;; malleated copy must not hit.
          (cache-key
-           (when (and bitcoin-lisp.coalton.interop::*script-execution-cache-enabled*
+           (when (and bl.interop::*script-execution-cache-enabled*
                       ;; Core returns true for a coinbase before touching the
                       ;; cache (validation.cpp:2064); it has no input scripts.
                       (not (and (= 1 (length inputs))
-                                (bitcoin-lisp.serialization:coinbase-input-p
+                                (bl.ser:coinbase-input-p
                                  (aref inputs 0)))))
-             (bitcoin-lisp.coalton.interop::make-script-execution-cache-key
-              (bitcoin-lisp.serialization:transaction-wtxid tx)
+             (bl.interop::make-script-execution-cache-key
+              (bl.ser:transaction-wtxid tx)
               effective-flags))))
     (when (and cache-key
-               (bitcoin-lisp.coalton.interop::script-execution-cached-p cache-key))
+               (bl.interop::script-execution-cached-p cache-key))
       (return-from validate-transaction-scripts (values t nil)))
     (let* ((spent-utxos (collect-spent-utxos inputs utxo-set extra-coins))
-           (bitcoin-lisp.coalton.interop:*script-flags* effective-flags)
-           (bitcoin-lisp.coalton.interop:*precomputed-sighash*
-             (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
-           (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent-utxos))
+           (bl.interop:*script-flags* effective-flags)
+           (bl.interop:*precomputed-sighash*
+             (bl.interop:init-precomputed-sighash tx spent-utxos))
+           (bl.interop:*current-spent-utxos* spent-utxos))
       (dotimes (input-idx (length inputs))
         (let ((utxo (and spent-utxos (aref spent-utxos input-idx))))
           (unless (and utxo (validate-input-script tx input-idx utxo))
@@ -1376,5 +1376,5 @@ Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
       ;; Stored only after EVERY input succeeded — a partial success must never
       ;; short-circuit a later pass.
       (when cache-key
-        (bitcoin-lisp.coalton.interop::script-execution-cache-store cache-key))
+        (bl.interop::script-execution-cache-store cache-key))
       (values t nil))))

@@ -24,10 +24,10 @@ initialized so mining can connect blocks."
          (undopath (merge-pathnames "undo/" base)))
     (ensure-directories-exist cspath)
     (ensure-directories-exist undopath)
-    (setf (bitcoin-lisp::node-utxo-set node)
-          (bitcoin-lisp.storage:make-coins-view-cache
-           (bitcoin-lisp.storage:open-coins-view-db cspath)))
-    (bitcoin-lisp.validation:initialize-undo-storage undopath)
+    (setf (bl::node-utxo-set node)
+          (bl.store:make-coins-view-cache
+           (bl.store:open-coins-view-db cspath)))
+    (bl.val:initialize-undo-storage undopath)
     (values node cspath)))
 
 (test reindex-chainstate-rebuilds-utxo-set
@@ -36,44 +36,44 @@ the exact set (same whole-set MuHash) and the same chain tip."
   (%with-regtest
    (let* ((tag (format nil "rbld~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
-     (let ((bitcoin-lisp::*node* node))
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
-       (let* ((cs (bitcoin-lisp::node-chain-state node))
-              (utxo (bitcoin-lisp::node-utxo-set node))
-              (tip (bitcoin-lisp.storage:current-height cs))
+     (let ((bl::*node* node))
+       (bl.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
+       (let* ((cs (bl::node-chain-state node))
+              (utxo (bl::node-utxo-set node))
+              (tip (bl.store:current-height cs))
               ;; Truth: the correct set after mining.
-              (truth-muhash (bitcoin-lisp.storage:compute-utxo-set-muhash utxo))
-              (truth-amount (bitcoin-lisp.storage:utxo-set-total-amount utxo)))
+              (truth-muhash (bl.store:compute-utxo-set-muhash utxo))
+              (truth-amount (bl.store:utxo-set-total-amount utxo)))
          (is (= 8 tip))
          ;; Pollute the coins view with a coin that was never created on-chain.
-         (bitcoin-lisp.storage:add-utxo
+         (bl.store:add-utxo
           utxo (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x99)
           0 424242 (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51) 1)
          (is (not (equalp truth-muhash
-                          (bitcoin-lisp.storage:compute-utxo-set-muhash utxo))))
+                          (bl.store:compute-utxo-set-muhash utxo))))
          ;; Reindex rebuilds from the stored blocks.
-         (bitcoin-lisp::do-reindex-chainstate)
+         (bl::do-reindex-chainstate)
          ;; Tip preserved, and the set matches the pre-pollution truth exactly.
-         (is (= tip (bitcoin-lisp.storage:current-height cs)))
+         (is (= tip (bl.store:current-height cs)))
          (is (equalp truth-muhash
-                     (bitcoin-lisp.storage:compute-utxo-set-muhash utxo)))
-         (is (= truth-amount (bitcoin-lisp.storage:utxo-set-total-amount utxo)))
+                     (bl.store:compute-utxo-set-muhash utxo)))
+         (is (= truth-amount (bl.store:utxo-set-total-amount utxo)))
          ;; And no unspendable outputs snuck in (the coinbase witness-commitment
          ;; OP_RETURN is dropped, as during normal apply).
          (let ((unspendable 0))
-           (bitcoin-lisp.storage:utxo-set-iterate
+           (bl.store:utxo-set-iterate
             utxo (lambda (txid vout entry)
                    (declare (ignore txid vout))
-                   (when (bitcoin-lisp.storage:script-unspendable-p
-                          (bitcoin-lisp.storage:utxo-entry-script-pubkey entry))
+                   (when (bl.store:script-unspendable-p
+                          (bl.store:utxo-entry-script-pubkey entry))
                      (incf unspendable))))
            (is (zerop unspendable)))
          ;; The on-disk chainstate.dat was committed clean by the final
          ;; 3-phase flush (the marker set during the rebuild is cleared).
-         (let ((reload (bitcoin-lisp.storage:make-chain-state
-                        :base-path (bitcoin-lisp.storage::chain-state-base-path cs))))
-           (is (eq t (bitcoin-lisp.storage:load-state reload)))
-           (is (= tip (bitcoin-lisp.storage:current-height reload)))))))))
+         (let ((reload (bl.store:make-chain-state
+                        :base-path (bl.store::chain-state-base-path cs))))
+           (is (eq t (bl.store:load-state reload)))
+           (is (= tip (bl.store:current-height reload)))))))))
 
 (test reindex-chainstate-recovers-emptied-coins-view
   "Reindex rebuilds even from a fully-emptied coins view (disaster recovery:
@@ -81,14 +81,14 @@ blocks + index intact, chainstate DB wiped)."
   (%with-regtest
    (let* ((tag (format nil "recov~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
-     (let ((bitcoin-lisp::*node* node))
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
-       (let* ((utxo (bitcoin-lisp::node-utxo-set node))
-              (truth (bitcoin-lisp.storage:compute-utxo-set-muhash utxo)))
+     (let ((bl::*node* node))
+       (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
+       (let* ((utxo (bl::node-utxo-set node))
+              (truth (bl.store:compute-utxo-set-muhash utxo)))
          ;; Nuke the coins view entirely, then reindex.
-         (bitcoin-lisp.storage:coins-view-cache-wipe utxo)
-         (bitcoin-lisp::do-reindex-chainstate)
-         (is (equalp truth (bitcoin-lisp.storage:compute-utxo-set-muhash utxo))))))))
+         (bl.store:coins-view-cache-wipe utxo)
+         (bl::do-reindex-chainstate)
+         (is (equalp truth (bl.store:compute-utxo-set-muhash utxo))))))))
 
 ;;;; Crash safety. do-reindex-chainstate rewinds chainstate.dat to genesis
 ;;;; WITH the in-transition marker before wiping the coins DB, and every
@@ -104,43 +104,43 @@ recovered to exactly the height the coins DB last committed."
   (%with-regtest
    (let ((tag (format nil "crashr~D" (get-internal-real-time))))
      (multiple-value-bind (node cspath) (%reindex-node-fixture tag)
-       (let ((bitcoin-lisp::*node* node))
-         (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
-         (let* ((cs (bitcoin-lisp::node-chain-state node))
+       (let ((bl::*node* node))
+         (bl.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
+         (let* ((cs (bl::node-chain-state node))
                 (flushes 0)
                 ;; Budget 0 => size trigger after EVERY replayed block, so
                 ;; flush N happens right after block N is applied. The 3rd
                 ;; flush dies in the marker window: on disk the marker is at
                 ;; h=3 while the coins DB committed through h=2.
-                (bitcoin-lisp::*coins-cache-budget-bytes* 0)
-                (bitcoin-lisp::*flush-mid-commit-hook*
+                (bl::*coins-cache-budget-bytes* 0)
+                (bl::*flush-mid-commit-hook*
                   (lambda (flushing)
                     (declare (ignore flushing))
                     (when (= (incf flushes) 3)
                       (throw 'reindex-crash :crashed)))))
            (is (eq :crashed (catch 'reindex-crash
-                              (bitcoin-lisp::do-reindex-chainstate)
+                              (bl::do-reindex-chainstate)
                               :completed))))
          ;; Simulate the process death: drop the in-memory cache and reload
          ;; both the on-disk LevelDB and chainstate.dat, as startup would.
-         (let ((cs (bitcoin-lisp::node-chain-state node)))
-           (bitcoin-lisp.storage:close-chainstate-coins-view cs)
-           (setf (bitcoin-lisp::node-utxo-set node)
-                 (bitcoin-lisp.storage:make-coins-view-cache
-                  (bitcoin-lisp.storage:open-coins-view-db cspath)))
-           (is (eq :inconsistent (bitcoin-lisp.storage:load-state cs)))
-           (is (= 3 (bitcoin-lisp.storage:current-height cs)))
-           (is (eq t (bitcoin-lisp::recover-inconsistent-chainstate node cs)))
+         (let ((cs (bl::node-chain-state node)))
+           (bl.store:close-chainstate-coins-view cs)
+           (setf (bl::node-utxo-set node)
+                 (bl.store:make-coins-view-cache
+                  (bl.store:open-coins-view-db cspath)))
+           (is (eq :inconsistent (bl.store:load-state cs)))
+           (is (= 3 (bl.store:current-height cs)))
+           (is (eq t (bl::recover-inconsistent-chainstate node cs)))
            ;; Rewound to the last committed replay flush: block 2.
-           (is (= 2 (bitcoin-lisp.storage:current-height cs)))
-           (let ((reload (bitcoin-lisp.storage:make-chain-state
-                          :base-path (bitcoin-lisp.storage::chain-state-base-path cs))))
-             (is (eq t (bitcoin-lisp.storage:load-state reload)))
-             (is (= 2 (bitcoin-lisp.storage:current-height reload))))
+           (is (= 2 (bl.store:current-height cs)))
+           (let ((reload (bl.store:make-chain-state
+                          :base-path (bl.store::chain-state-base-path cs))))
+             (is (eq t (bl.store:load-state reload)))
+             (is (= 2 (bl.store:current-height reload))))
            ;; And the coins DB is exactly the height-2 set: two 50-BTC
            ;; coinbases, nothing from block 3.
-           (is (= 10000000000 (bitcoin-lisp.storage:utxo-set-total-amount
-                               (bitcoin-lisp::node-utxo-set node))))))))))
+           (is (= 10000000000 (bl.store:utxo-set-total-amount
+                               (bl::node-utxo-set node))))))))))
 
 (test reindex-crash-mid-wipe-recovers-to-genesis
   "A crash between the genesis+marker rewind and the first replay flush
@@ -150,25 +150,25 @@ loaded as live state."
   (%with-regtest
    (let* ((tag (format nil "crashw~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
-     (let ((bitcoin-lisp::*node* node))
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
-       (let* ((cs (bitcoin-lisp::node-chain-state node))
-              (utxo (bitcoin-lisp::node-utxo-set node))
-              (genesis (bitcoin-lisp.storage::chain-state-genesis-hash cs)))
+     (let ((bl::*node* node))
+       (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
+       (let* ((cs (bl::node-chain-state node))
+              (utxo (bl::node-utxo-set node))
+              (genesis (bl.store::chain-state-genesis-hash cs)))
          ;; Make the mined coins durable, then reproduce the crash state by
          ;; hand: tip rewound to genesis with the marker while the coins DB
          ;; still holds the old set (killed right before the wipe -- the
          ;; worst case: ALL old coins left behind as garbage).
-         (bitcoin-lisp.storage:coins-view-cache-flush utxo :sync t)
-         (bitcoin-lisp.storage:update-chain-tip cs genesis 0)
-         (bitcoin-lisp.storage:save-state cs :in-transition t)
-         (is (eq :inconsistent (bitcoin-lisp.storage:load-state cs)))
-         (is (eq t (bitcoin-lisp::recover-inconsistent-chainstate node cs)))
+         (bl.store:coins-view-cache-flush utxo :sync t)
+         (bl.store:update-chain-tip cs genesis 0)
+         (bl.store:save-state cs :in-transition t)
+         (is (eq :inconsistent (bl.store:load-state cs)))
+         (is (eq t (bl::recover-inconsistent-chainstate node cs)))
          ;; Clean at genesis over an EMPTY coins DB.
-         (is (= 0 (bitcoin-lisp.storage:current-height cs)))
-         (is (equalp genesis (bitcoin-lisp.storage:best-block-hash cs)))
-         (is (= 0 (bitcoin-lisp.storage:utxo-set-total-amount utxo)))
-         (let ((reload (bitcoin-lisp.storage:make-chain-state
-                        :base-path (bitcoin-lisp.storage::chain-state-base-path cs))))
-           (is (eq t (bitcoin-lisp.storage:load-state reload)))
-           (is (= 0 (bitcoin-lisp.storage:current-height reload)))))))))
+         (is (= 0 (bl.store:current-height cs)))
+         (is (equalp genesis (bl.store:best-block-hash cs)))
+         (is (= 0 (bl.store:utxo-set-total-amount utxo)))
+         (let ((reload (bl.store:make-chain-state
+                        :base-path (bl.store::chain-state-base-path cs))))
+           (is (eq t (bl.store:load-state reload)))
+           (is (= 0 (bl.store:current-height reload)))))))))

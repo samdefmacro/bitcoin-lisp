@@ -29,30 +29,30 @@
 ;;; vector 5 is a REJECT corpus — sixteen extended keys that must not parse.
 
 (defun %run-bip32-vector (vec label)
-  (let* ((seed (bitcoin-lisp.crypto:hex-to-bytes (gethash "seed" vec)))
-         (key (bitcoin-lisp.crypto:bip32-master-key seed :network :mainnet)))
+  (let* ((seed (bl.crypto:hex-to-bytes (gethash "seed" vec)))
+         (key (bl.crypto:bip32-master-key seed :network :mainnet)))
     (loop for step across (coerce (gethash "chain" vec) 'vector)
           for i from 0
           do (let ((want-prv (gethash "prv" step))
                    (want-pub (gethash "pub" step))
                    (child (gethash "child" step)))
-               (is (string= want-prv (bitcoin-lisp.crypto:bip32-serialize key))
+               (is (string= want-prv (bl.crypto:bip32-serialize key))
                    "~A step ~D: xprv" label i)
                (is (string= want-pub
-                            (bitcoin-lisp.crypto:bip32-serialize
-                             (bitcoin-lisp.crypto:bip32-neuter key)))
+                            (bl.crypto:bip32-serialize
+                             (bl.crypto:bip32-neuter key)))
                    "~A step ~D: xpub" label i)
                ;; A serialized key must also parse back to the same key — the
                ;; half a round-trip-free corpus never checks.
                (is (string= want-prv
-                            (bitcoin-lisp.crypto:bip32-serialize
-                             (bitcoin-lisp.crypto:bip32-parse want-prv)))
+                            (bl.crypto:bip32-serialize
+                             (bl.crypto:bip32-parse want-prv)))
                    "~A step ~D: xprv does not survive parse+serialize" label i)
                ;; Derive on EVERY step, as Core's RunTest does. Guarding on a
                ;; non-zero index looks harmless and is not: vector 2's first
                ;; derivation IS child 0, so skipping it silently shifts the
                ;; whole chain by one and compares keys against the wrong step.
-               (setf key (bitcoin-lisp.crypto:bip32-derive-child key child))))))
+               (setf key (bl.crypto:bip32-derive-child key child))))))
 
 (test bip32-core-vectors-1-through-4
   "Core bip32_tests.cpp:41-102. Vector 1 was already covered; 2, 3 and 4 are
@@ -75,7 +75,7 @@ intended."
   (let ((invalid (gethash "invalid" (%load-core-vectors "bip32_vectors.json"))))
     (is (= 16 (length invalid)) "expected Core's sixteen invalid keys")
     (dolist (str (coerce invalid 'list))
-      (is-false (ignore-errors (bitcoin-lisp.crypto:bip32-parse str))
+      (is-false (ignore-errors (bl.crypto:bip32-parse str))
                 "accepted an extended key Core rejects: ~A" str))))
 
 ;;; --- SipHash (G7-69): Core hash_tests.cpp:62-79 ----------------------------
@@ -98,6 +98,6 @@ is a node that cannot reconstruct anyone else's compact blocks."
           do (let ((input (make-array n :element-type '(unsigned-byte 8))))
                (dotimes (i n) (setf (aref input i) i))
                (is (= (parse-integer (aref outputs n) :radix 16)
-                      (bitcoin-lisp.crypto:siphash-2-4 k0 k1 input))
+                      (bl.crypto:siphash-2-4 k0 k1 input))
                    "SipHash-2-4 of the first ~D bytes disagrees with the ~
                     reference table" n)))))

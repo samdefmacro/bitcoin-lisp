@@ -179,11 +179,11 @@ BLOCK-HASH is the 32-byte block hash.
 Returns the number of transactions indexed."
   (unless (tx-index-enabled txindex)
     (return-from txindex-add-block 0))
-  (let ((txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+  (let ((txs (bl.ser:bitcoin-block-transactions block))
         (count 0))
     (loop for tx in txs
           for position from 0
-          do (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+          do (let ((txid (bl.ser:transaction-hash tx)))
                (when (txindex-add txindex txid block-hash position)
                  (incf count))))
     count))
@@ -198,10 +198,10 @@ BLOCK is a bitcoin-block structure.
 Returns the number of transactions removed from index."
   (unless (tx-index-enabled txindex)
     (return-from txindex-remove-block 0))
-  (let ((txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+  (let ((txs (bl.ser:bitcoin-block-transactions block))
         (count 0))
     (dolist (tx txs)
-      (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+      (let ((txid (bl.ser:transaction-hash tx)))
         (when (txindex-remove txindex txid)
           (incf count))))
     count))
@@ -217,12 +217,12 @@ coinbase, which is written first). Verifying the stored BLOCK-HASH — not mere
 txid presence — matters now that TXINDEX-ADD upserts: after a reorg the txid
 can exist but point at a stale branch's block, and the catch-up scan must
 re-index it at its active-chain location."
-  (let ((last-tx (car (last (bitcoin-lisp.serialization:bitcoin-block-transactions
+  (let ((last-tx (car (last (bl.ser:bitcoin-block-transactions
                              block)))))
     (and last-tx
          (let ((loc (txindex-lookup
                      txindex
-                     (bitcoin-lisp.serialization:transaction-hash last-tx))))
+                     (bl.ser:transaction-hash last-tx))))
            (and loc (equalp (tx-location-block-hash loc) block-hash))))))
 
 (defun %txindex-resume-height (txindex chain-state)
@@ -309,7 +309,7 @@ marker, and neither can Core, which also resumes from its locator."
     ;; State the decision. Without this the log shows a scan and gives no way
     ;; to tell a resume from a full rescan, or why -- which is exactly the
     ;; question a nine-minute startup raises.
-    (bitcoin-lisp:log-info "Transaction index: ~(~A~), scanning from height ~D"
+    (bl:log-info "Transaction index: ~(~A~), scanning from height ~D"
                            resume-reason resume-height)
     (%build-tx-index-from txindex chain-state block-store resume-height
                           progress-callback)))

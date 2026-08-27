@@ -256,7 +256,7 @@ whole node for an unused feature."
   (when (zmq-topic-active-p "hashtx")
     (zmq-notify-hash-tx txid))
   (when (zmq-topic-active-p "rawtx")
-    (zmq-notify-raw-tx (bitcoin-lisp.serialization:serialize-transaction tx))))
+    (zmq-notify-raw-tx (bl.ser:serialize-transaction tx))))
 
 (defun zmq-notify-tx-accepted (tx txid mempool-sequence)
   "A transaction entered the mempool (Core TransactionAddedToMempool): the
@@ -279,13 +279,13 @@ itself and a sequence 'C'."
   (when *zmq-publishers*
     (when (or (zmq-topic-active-p "hashtx") (zmq-topic-active-p "rawtx"))
       ;; BITCOIN-BLOCK-TRANSACTIONS is a LIST (types.lisp:534), not a vector.
-      (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+      (loop for tx in (bl.ser:bitcoin-block-transactions block)
             do (zmq-notify-transaction
-                tx (bitcoin-lisp.serialization:transaction-hash tx))))
+                tx (bl.ser:transaction-hash tx))))
     (when (zmq-topic-active-p "hashblock")
       (zmq-notify-hash-block hash))
     (when (zmq-topic-active-p "rawblock")
-      (zmq-notify-raw-block (bitcoin-lisp.serialization:serialize-witness-block block)))
+      (zmq-notify-raw-block (bl.ser:serialize-witness-block block)))
     (when (zmq-topic-active-p "sequence")
       (zmq-notify-sequence hash #\C))))
 
@@ -295,8 +295,8 @@ No rawblock/hashblock — those announce the tip moving FORWARD."
   (when *zmq-publishers*
     (when (or (zmq-topic-active-p "hashtx") (zmq-topic-active-p "rawtx"))
       ;; BITCOIN-BLOCK-TRANSACTIONS is a LIST (types.lisp:534), not a vector.
-      (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+      (loop for tx in (bl.ser:bitcoin-block-transactions block)
             do (zmq-notify-transaction
-                tx (bitcoin-lisp.serialization:transaction-hash tx))))
+                tx (bl.ser:transaction-hash tx))))
     (when (zmq-topic-active-p "sequence")
       (zmq-notify-sequence hash #\D))))

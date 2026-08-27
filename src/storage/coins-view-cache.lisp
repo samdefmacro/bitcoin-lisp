@@ -531,38 +531,38 @@ cannot happen (UpdateCoins, validation.cpp:2004): every input of a validated
 block spends a coin the view still holds. Reaching it means the block was
 validated against a stale or double-spent view, and the undo data is now short
 an entry — disconnecting the block would leave the UTXO set wrong."
-  (bitcoin-lisp:log-error
+  (bl:log-error
    "COIN-SPEND-MISSING: block-apply at height ~D found no coin for ~A:~D"
-   height (bitcoin-lisp.crypto:bytes-to-hex txid) index))
+   height (bl.crypto:bytes-to-hex txid) index))
 
 (defun coin-view-apply-block (cache block height)
   "Spend a block's inputs and add its outputs in CACHE. Returns the
 undo list — (txid index entry) for every spent UTXO, in apply order."
   (declare (type coins-view-cache cache))
   (let ((spent '()))
-    (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+    (loop for tx in (bl.ser:bitcoin-block-transactions block)
           for tx-index from 0
           for is-coinbase = (zerop tx-index)
-          do (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+          do (let ((txid (bl.ser:transaction-hash tx)))
                (unless is-coinbase
-                 (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-                   (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                          (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-                          (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+                 (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+                   (let* ((prevout (bl.ser:tx-in-previous-output input))
+                          (prev-txid (bl.ser:outpoint-hash prevout))
+                          (prev-index (bl.ser:outpoint-index prevout))
                           (entry (coin-view-spend cache prev-txid prev-index)))
                      (if entry
                          (push (list prev-txid prev-index entry) spent)
                          (log-missing-block-spend height prev-txid prev-index)))))
-               (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+               (loop for output across (bl.ser:transaction-outputs tx)
                      for out-idx from 0
-                     for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                     for spk = (bl.ser:tx-out-script-pubkey output)
                      ;; Drop provably-unspendable outputs (Core AddCoin returns
                      ;; early on IsUnspendable). They can never be spent, so
                      ;; keeping them only bloats the UTXO set and diverges our
                      ;; gettxoutsetinfo hashes from Core.
                      unless (script-unspendable-p spk)
                      do (coin-view-add cache txid out-idx
-                                       (bitcoin-lisp.serialization:tx-out-value output)
+                                       (bl.ser:tx-out-value output)
                                        spk
                                        height
                                        :coinbase is-coinbase
@@ -615,7 +615,7 @@ test-bitcoin-server 2026-05-19 at h=135597."
   (let ((clean t))
     (flet ((unclean (format &rest args)
              (setf clean nil)
-             (bitcoin-lisp:log-warn "DisconnectBlock: ~?" format args)))
+             (bl:log-warn "DisconnectBlock: ~?" format args)))
       ;; Restore inputs first (from undo data).
       (dolist (prev previous-utxos)
         (destructuring-bind (txid index entry) prev
@@ -629,16 +629,16 @@ test-bitcoin-server 2026-05-19 at h=135597."
                  (present (coins-view-cache-get cache key)))
             (when present
               (unclean "overwriting transaction output ~A:~D"
-                       (bitcoin-lisp.crypto:bytes-to-hex txid) index))
+                       (bl.crypto:bytes-to-hex txid) index))
             (coins-view-cache-add cache key entry :allow-overwrite (and present t)))))
       ;; Then walk transactions forward, removing their outputs.
-      (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+      (loop for tx in (bl.ser:bitcoin-block-transactions block)
             for tx-index from 0
             for is-coinbase = (zerop tx-index)
-            do (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-                 (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+            do (let ((txid (bl.ser:transaction-hash tx)))
+                 (loop for output across (bl.ser:transaction-outputs tx)
                        for out-idx from 0
-                       for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                       for spk = (bl.ser:tx-out-script-pubkey output)
                        ;; Unspendable outputs were never added, so their
                        ;; absence is expected rather than a mismatch (Core
                        ;; skips them here too, validation.cpp:2209).
@@ -656,17 +656,17 @@ test-bitcoin-server 2026-05-19 at h=135597."
                               (cond
                                 ((null spent)
                                  (unclean "output ~A:~D was already absent"
-                                          (bitcoin-lisp.crypto:bytes-to-hex txid)
+                                          (bl.crypto:bytes-to-hex txid)
                                           out-idx))
                                 ((not (and (= (utxo-entry-value spent)
-                                              (bitcoin-lisp.serialization:tx-out-value output))
+                                              (bl.ser:tx-out-value output))
                                            (equalp (utxo-entry-script-pubkey spent) spk)
                                            (eq (and (utxo-entry-coinbase spent) t)
                                                is-coinbase)
                                            (or (null height)
                                                (= (utxo-entry-height spent) height))))
                                  (unclean "transaction output mismatch at ~A:~D"
-                                          (bitcoin-lisp.crypto:bytes-to-hex txid)
+                                          (bl.crypto:bytes-to-hex txid)
                                           out-idx))))))))
     clean))
 
@@ -762,15 +762,15 @@ data — (txid index entry) for each spent UTXO, in apply order."
      ;; Inlined from the legacy utxo-set body. Kept here so the
      ;; redefinition in this file fully shadows the utxo.lisp version.
      (let ((spent '()))
-       (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+       (loop for tx in (bl.ser:bitcoin-block-transactions block)
              for tx-index from 0
              for is-coinbase = (zerop tx-index)
-             do (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+             do (let ((txid (bl.ser:transaction-hash tx)))
                   (unless is-coinbase
-                    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-                      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                             (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-                             (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+                    (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+                      (let* ((prevout (bl.ser:tx-in-previous-output input))
+                             (prev-txid (bl.ser:outpoint-hash prevout))
+                             (prev-index (bl.ser:outpoint-index prevout))
                              (key (make-utxo-key prev-txid prev-index))
                              (entry (gethash key (utxo-set-entries view))))
                         (if entry
@@ -778,15 +778,15 @@ data — (txid index entry) for each spent UTXO, in apply order."
                             (log-missing-block-spend height prev-txid prev-index))
                         (remhash key (utxo-set-entries view))
                         (setf (utxo-set-dirty view) t))))
-                  (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+                  (loop for output across (bl.ser:transaction-outputs tx)
                         for out-idx from 0
-                        for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                        for spk = (bl.ser:tx-out-script-pubkey output)
                         ;; Drop provably-unspendable outputs (see the
                         ;; coins-view-cache branch above / Core AddCoin).
                         unless (script-unspendable-p spk)
                         do (let ((key (make-utxo-key txid out-idx))
                                  (entry (make-utxo-entry
-                                         :value (bitcoin-lisp.serialization:tx-out-value output)
+                                         :value (bl.ser:tx-out-value output)
                                          :script-pubkey spk
                                          :height height
                                          :coinbase is-coinbase)))
@@ -800,8 +800,8 @@ data — (txid index entry) for each spent UTXO, in apply order."
        ;; with SetBestBlock(pindex->GetBlockHash()) (validation.cpp:2651). The
        ;; header caches its hash, so this costs nothing on the hot path.
        (setf (cvc-best-block view)
-             (copy-seq (bitcoin-lisp.serialization:block-header-hash
-                        (bitcoin-lisp.serialization:bitcoin-block-header block))))))))
+             (copy-seq (bl.ser:block-header-hash
+                        (bl.ser:bitcoin-block-header block))))))))
 
 (defun utxo-count (view)
   "Polymorphic UTXO count. For utxo-set, exact. For coins-view-cache,
@@ -835,10 +835,10 @@ production store, so the size trigger never fires for it."
        (destructuring-bind (txid index entry) prev
          (setf (gethash (make-utxo-key txid index) (utxo-set-entries view))
                entry)))
-     (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-       (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+     (dolist (tx (bl.ser:bitcoin-block-transactions block))
+       (let ((txid (bl.ser:transaction-hash tx)))
          (loop for out-idx from 0
-               below (length (bitcoin-lisp.serialization:transaction-outputs tx))
+               below (length (bl.ser:transaction-outputs tx))
                do (remhash (make-utxo-key txid out-idx)
                            (utxo-set-entries view))))))
     (coins-view-cache
@@ -850,8 +850,8 @@ production store, so the size trigger never fires for it."
      ;; through a reorg's disconnect phase, when the chain's tip still names the
      ;; block we are rewinding away from.
      (setf (cvc-best-block view)
-           (copy-seq (bitcoin-lisp.serialization:block-header-prev-block
-                      (bitcoin-lisp.serialization:bitcoin-block-header block)))))))
+           (copy-seq (bl.ser:block-header-prev-block
+                      (bl.ser:bitcoin-block-header block)))))))
 
 ;;;; Polymorphic iteration + full-set statistics.
 ;;;;
@@ -996,17 +996,17 @@ into a byte vector -- this is per-UTXO on the coinstatsindex backfill, where
 the flexi-streams gray-stream path was measurable overhead."
   (declare (type (simple-array (unsigned-byte 8) (*)) txid script))
   (let* ((slen (length script))
-         (out (make-array (+ 32 4 4 8 (bitcoin-lisp.serialization:compact-size-length slen) slen)
+         (out (make-array (+ 32 4 4 8 (bl.ser:compact-size-length slen) slen)
                           :element-type '(unsigned-byte 8)))
          (code (logior (ash height 1) (if coinbase 1 0)))
          (i 0))
     (declare (type fixnum i))
-    (setf i (bitcoin-lisp.bytes:buf-set-bytes out i txid))
-    (setf i (bitcoin-lisp.bytes:buf-set-u32-le out i vout))
-    (setf i (bitcoin-lisp.bytes:buf-set-u32-le out i code))
-    (setf i (bitcoin-lisp.bytes:buf-set-u64-le out i amount))
-    (setf i (bitcoin-lisp.bytes:buf-set-varint out i slen))
-    (bitcoin-lisp.bytes:buf-set-bytes out i script)
+    (setf i (bl.bytes:buf-set-bytes out i txid))
+    (setf i (bl.bytes:buf-set-u32-le out i vout))
+    (setf i (bl.bytes:buf-set-u32-le out i code))
+    (setf i (bl.bytes:buf-set-u64-le out i amount))
+    (setf i (bl.bytes:buf-set-varint out i slen))
+    (bl.bytes:buf-set-bytes out i script)
     out))
 
 (defun coin-muhash-element* (txid vout entry)
@@ -1022,14 +1022,14 @@ the flexi-streams gray-stream path was measurable overhead."
 hash_type=muhash). Returns the 32-byte finalized hash in internal byte order
 (reverse for display). MuHash is order-independent, so the iteration order
 does not affect the result."
-  (let ((mu (bitcoin-lisp.crypto:make-muhash)))
+  (let ((mu (bl.crypto:make-muhash)))
     (utxo-set-iterate
      view
      (lambda (txid vout entry)
-       (bitcoin-lisp.crypto:muhash-insert
+       (bl.crypto:muhash-insert
         mu (coerce (coin-muhash-element* txid vout entry)
                    '(simple-array (unsigned-byte 8) (*))))))
-    (bitcoin-lisp.crypto:muhash-finalize mu)))
+    (bl.crypto:muhash-finalize mu)))
 
 (defun compute-utxo-set-hash (view)
   "Compute the hash_serialized_3 UTXO set hash: a double-SHA256 over
@@ -1062,4 +1062,4 @@ is now flat in the size of one coin's preimage."
        (ironclad:update-digest digest (coin-muhash-element* txid vout entry))))
     ;; hash_serialized_3 is a DOUBLE SHA-256: finalize the streamed inner pass,
     ;; then hash that 32-byte digest again.
-    (bitcoin-lisp.crypto:sha256 (ironclad:produce-digest digest))))
+    (bl.crypto:sha256 (ironclad:produce-digest digest))))

@@ -20,39 +20,39 @@ to the direct whole-UTXO-set MuHash, and tip tallies equal to the live UTXO
 set's txout count and total amount."
   (%with-regtest
    (let ((node (%regtest-node-fixture (format nil "csi~D" (get-internal-real-time)))))
-     (let ((bitcoin-lisp::*node* node))
+     (let ((bl::*node* node))
        ;; Mine spendable coinbases, then a chain of blocks. Coinbase outputs on
        ;; regtest raw(51) are spendable, so this builds a non-trivial UTXO set.
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
-       (let* ((cs (bitcoin-lisp::node-chain-state node))
-              (store (bitcoin-lisp::node-block-store node))
-              (utxo (bitcoin-lisp::node-utxo-set node))
-              (tip (bitcoin-lisp.storage:current-height cs))
+       (bl.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
+       (let* ((cs (bl::node-chain-state node))
+              (store (bl::node-block-store node))
+              (utxo (bl::node-utxo-set node))
+              (tip (bl.store:current-height cs))
               (idxbase (merge-pathnames (format nil "test-csi-~D/" (get-internal-real-time))
                                         (uiop:temporary-directory)))
-              (csi (bitcoin-lisp.storage:init-coinstatsindex idxbase :enabled t))
-              (n (bitcoin-lisp.storage:build-coinstatsindex
-                  csi cs store #'bitcoin-lisp.validation:get-undo-data
-                  #'bitcoin-lisp.validation:calculate-block-subsidy)))
+              (csi (bl.store:init-coinstatsindex idxbase :enabled t))
+              (n (bl.store:build-coinstatsindex
+                  csi cs store #'bl.val:get-undo-data
+                  #'bl.val:calculate-block-subsidy)))
          ;; Indexed heights 1..tip (genesis is synthesized, not counted).
          (is (= tip n))
-         (is (= tip (bitcoin-lisp.storage:coinstatsindex-height csi)))
-         (let* ((stats (bitcoin-lisp.storage:coinstatsindex-get-stats csi tip))
-                (index-muhash (bitcoin-lisp.crypto:muhash-finalize
-                               (bitcoin-lisp.storage:coinstats-muhash stats)))
-                (direct-muhash (bitcoin-lisp.storage:compute-utxo-set-muhash utxo)))
+         (is (= tip (bl.store:coinstatsindex-height csi)))
+         (let* ((stats (bl.store:coinstatsindex-get-stats csi tip))
+                (index-muhash (bl.crypto:muhash-finalize
+                               (bl.store:coinstats-muhash stats)))
+                (direct-muhash (bl.store:compute-utxo-set-muhash utxo)))
            ;; THE invariant: incremental == whole-set.
            (is (equalp direct-muhash index-muhash))
            ;; Tallies match the live UTXO set.
-           (is (= (bitcoin-lisp.storage:utxo-count utxo)
-                  (bitcoin-lisp.storage:coinstats-txout-count stats)))
-           (is (= (bitcoin-lisp.storage:utxo-set-total-amount utxo)
-                  (bitcoin-lisp.storage:coinstats-total-amount stats)))
+           (is (= (bl.store:utxo-count utxo)
+                  (bl.store:coinstats-txout-count stats)))
+           (is (= (bl.store:utxo-set-total-amount utxo)
+                  (bl.store:coinstats-total-amount stats)))
            ;; Every regtest block subsidy summed (genesis..tip).
            (is (= (loop for h from 0 to tip
-                        sum (bitcoin-lisp.validation:calculate-block-subsidy h))
-                  (bitcoin-lisp.storage:coinstats-total-subsidy stats))))
-         (bitcoin-lisp.storage:close-coinstatsindex csi))))))
+                        sum (bl.val:calculate-block-subsidy h))
+                  (bl.store:coinstats-total-subsidy stats))))
+         (bl.store:close-coinstatsindex csi))))))
 
 (test coinstatsindex-per-height-history
   "Each indexed height's record reflects that height's UTXO state: the txout
@@ -60,29 +60,29 @@ count is monotonically non-decreasing across a coinbase-only chain, and each
 height's MuHash is retrievable and distinct from its predecessor."
   (%with-regtest
    (let ((node (%regtest-node-fixture (format nil "csih~D" (get-internal-real-time)))))
-     (let ((bitcoin-lisp::*node* node))
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
-       (let* ((cs (bitcoin-lisp::node-chain-state node))
-              (store (bitcoin-lisp::node-block-store node))
-              (tip (bitcoin-lisp.storage:current-height cs))
+     (let ((bl::*node* node))
+       (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
+       (let* ((cs (bl::node-chain-state node))
+              (store (bl::node-block-store node))
+              (tip (bl.store:current-height cs))
               (idxbase (merge-pathnames (format nil "test-csih-~D/" (get-internal-real-time))
                                         (uiop:temporary-directory)))
-              (csi (bitcoin-lisp.storage:init-coinstatsindex idxbase :enabled t)))
-         (bitcoin-lisp.storage:build-coinstatsindex
-          csi cs store #'bitcoin-lisp.validation:get-undo-data
-          #'bitcoin-lisp.validation:calculate-block-subsidy)
+              (csi (bl.store:init-coinstatsindex idxbase :enabled t)))
+         (bl.store:build-coinstatsindex
+          csi cs store #'bl.val:get-undo-data
+          #'bl.val:calculate-block-subsidy)
          (let ((prev-count -1) (prev-hash nil))
            (loop for h from 1 to tip
-                 for stats = (bitcoin-lisp.storage:coinstatsindex-get-stats csi h)
-                 for hh = (bitcoin-lisp.crypto:bytes-to-hex
-                           (bitcoin-lisp.crypto:muhash-finalize
-                            (bitcoin-lisp.storage:coinstats-muhash stats)))
+                 for stats = (bl.store:coinstatsindex-get-stats csi h)
+                 for hh = (bl.crypto:bytes-to-hex
+                           (bl.crypto:muhash-finalize
+                            (bl.store:coinstats-muhash stats)))
                  do (is-true stats)
-                    (is (>= (bitcoin-lisp.storage:coinstats-txout-count stats) prev-count))
+                    (is (>= (bl.store:coinstats-txout-count stats) prev-count))
                     (is (not (equal hh prev-hash)))
-                    (setf prev-count (bitcoin-lisp.storage:coinstats-txout-count stats)
+                    (setf prev-count (bl.store:coinstats-txout-count stats)
                           prev-hash hh)))
-         (bitcoin-lisp.storage:close-coinstatsindex csi))))))
+         (bl.store:close-coinstatsindex csi))))))
 
 (test coinstatsindex-connect-hook-and-rpc
   "With the index enabled on a node, the connect-time hook advances it as
@@ -94,42 +94,42 @@ stats from the index (muhash equal to the direct whole-set muhash at the tip)."
           (idxbase (merge-pathnames (format nil "test-csirpc-~A/" tag)
                                     (uiop:temporary-directory))))
      (ensure-directories-exist idxbase)
-     (setf (bitcoin-lisp::node-coinstatsindex node)
-           (bitcoin-lisp.storage:init-coinstatsindex idxbase :enabled t))
+     (setf (bl::node-coinstatsindex node)
+           (bl.store:init-coinstatsindex idxbase :enabled t))
      ;; Seed genesis so the connect hook (which needs the parent record) can
      ;; start at height 1, mirroring start-node's backfill seed.
-     (bitcoin-lisp.storage:coinstatsindex-seed-genesis
-      (bitcoin-lisp::node-coinstatsindex node)
-      (bitcoin-lisp.validation:calculate-block-subsidy 0)
-      (bitcoin-lisp.storage:network-genesis-hash :regtest))
-     (let ((bitcoin-lisp::*node* node))
+     (bl.store:coinstatsindex-seed-genesis
+      (bl::node-coinstatsindex node)
+      (bl.val:calculate-block-subsidy 0)
+      (bl.store:network-genesis-hash :regtest))
+     (let ((bl::*node* node))
        ;; The connect hook fires as generatetodescriptor connects each block.
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 6 "raw(51)"))
-       (let* ((csi (bitcoin-lisp::node-coinstatsindex node))
-              (cs (bitcoin-lisp::node-chain-state node))
-              (utxo (bitcoin-lisp::node-utxo-set node))
-              (tip (bitcoin-lisp.storage:current-height cs)))
+       (bl.rpc::rpc-generatetodescriptor node (list 6 "raw(51)"))
+       (let* ((csi (bl::node-coinstatsindex node))
+              (cs (bl::node-chain-state node))
+              (utxo (bl::node-utxo-set node))
+              (tip (bl.store:current-height cs)))
          ;; The hook kept the index at the tip.
-         (is (= tip (bitcoin-lisp.storage:coinstatsindex-height csi)))
+         (is (= tip (bl.store:coinstatsindex-height csi)))
          ;; gettxoutsetinfo <tip> from the index matches the direct whole set.
-         (let* ((res (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "muhash" tip)))
-                (direct (bitcoin-lisp.rpc::hash-to-hex
-                         (bitcoin-lisp.storage:compute-utxo-set-muhash utxo))))
+         (let* ((res (bl.rpc::rpc-gettxoutsetinfo node (list "muhash" tip)))
+                (direct (bl.rpc::hash-to-hex
+                         (bl.store:compute-utxo-set-muhash utxo))))
            (is (= tip (cdr (assoc "height" res :test #'string=))))
            (is (string= direct (cdr (assoc "muhash" res :test #'string=))))
-           (is (= (bitcoin-lisp.storage:utxo-count utxo)
+           (is (= (bl.store:utxo-count utxo)
                   (cdr (assoc "txouts" res :test #'string=))))
            ;; block_info is present with the per-block deltas.
            (is-true (assoc "block_info" res :test #'string=))
            (is-true (assoc "unspendables" (cdr (assoc "block_info" res :test #'string=))
                            :test #'string=)))
          ;; A height above the tip errors.
-         (signals bitcoin-lisp.rpc::rpc-error
-           (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "muhash" (+ tip 100))))
+         (signals bl.rpc::rpc-error
+           (bl.rpc::rpc-gettxoutsetinfo node (list "muhash" (+ tip 100))))
          ;; hash_serialized_3 is not index-backed.
-         (signals bitcoin-lisp.rpc::rpc-error
-           (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "hash_serialized_3" 1)))
-         (bitcoin-lisp.storage:close-coinstatsindex csi))))))
+         (signals bl.rpc::rpc-error
+           (bl.rpc::rpc-gettxoutsetinfo node (list "hash_serialized_3" 1)))
+         (bl.store:close-coinstatsindex csi))))))
 
 (test block-apply-drops-unspendable-outputs
   "After mining regtest blocks (whose coinbases carry a witness-commitment
@@ -138,54 +138,54 @@ application drops them, matching Core's AddCoin. The txout count reflects only
 the spendable coinbase reward outputs."
   (%with-regtest
    (let ((node (%regtest-node-fixture (format nil "unsp~D" (get-internal-real-time)))))
-     (let ((bitcoin-lisp::*node* node))
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
-       (let ((utxo (bitcoin-lisp::node-utxo-set node))
+     (let ((bl::*node* node))
+       (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
+       (let ((utxo (bl::node-utxo-set node))
              (unspendable-found 0)
              (total 0))
-         (bitcoin-lisp.storage:utxo-set-iterate
+         (bl.store:utxo-set-iterate
           utxo
           (lambda (txid vout entry)
             (declare (ignore txid vout))
             (incf total)
-            (when (bitcoin-lisp.storage:script-unspendable-p
-                   (bitcoin-lisp.storage:utxo-entry-script-pubkey entry))
+            (when (bl.store:script-unspendable-p
+                   (bl.store:utxo-entry-script-pubkey entry))
               (incf unspendable-found))))
          ;; No OP_RETURN / oversized outputs made it into the set.
          (is (zerop unspendable-found))
          ;; 5 blocks, one spendable coinbase reward output each (the commitment
          ;; OP_RETURN was dropped) -- so 5, not 10.
          (is (= 5 total))
-         (is (= 5 (bitcoin-lisp.storage:utxo-count utxo))))))))
+         (is (= 5 (bl.store:utxo-count utxo))))))))
 
 (test coinstatsindex-record-roundtrip
   "A coinstats record survives encode/decode with all fields intact, including
 the full MuHash numerator/denominator fraction."
-  (let* ((mu (bitcoin-lisp.crypto:make-muhash))
+  (let* ((mu (bl.crypto:make-muhash))
          (e1 (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3 4)))
          (e2 (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(9 8 7))))
-    (bitcoin-lisp.crypto:muhash-insert mu e1)
-    (bitcoin-lisp.crypto:muhash-remove mu e2)
-    (let* ((stats (bitcoin-lisp.storage::make-coinstats
+    (bl.crypto:muhash-insert mu e1)
+    (bl.crypto:muhash-remove mu e2)
+    (let* ((stats (bl.store::make-coinstats
                    :muhash mu :txout-count 12345 :bogo-size 67890
                    :total-amount 2100000000000000 :total-subsidy 5000000000
                    :total-prevout-spent 42 :total-new-outputs-ex-coinbase 7
                    :total-coinbase 9 :unspendable-genesis 5000000000
                    :unspendable-bip30 100 :unspendable-scripts 200
                    :unspendable-unclaimed 300))
-           (decoded (bitcoin-lisp.storage::%csi-decode-stat
-                     (bitcoin-lisp.storage::%csi-encode-stat stats))))
-      (is (= (bitcoin-lisp.crypto:muhash-numerator mu)
-             (bitcoin-lisp.crypto:muhash-numerator (bitcoin-lisp.storage:coinstats-muhash decoded))))
-      (is (= (bitcoin-lisp.crypto:muhash-denominator mu)
-             (bitcoin-lisp.crypto:muhash-denominator (bitcoin-lisp.storage:coinstats-muhash decoded))))
-      (is (= 12345 (bitcoin-lisp.storage:coinstats-txout-count decoded)))
-      (is (= 2100000000000000 (bitcoin-lisp.storage:coinstats-total-amount decoded)))
-      (is (= 300 (bitcoin-lisp.storage:coinstats-unspendable-unclaimed decoded)))
+           (decoded (bl.store::%csi-decode-stat
+                     (bl.store::%csi-encode-stat stats))))
+      (is (= (bl.crypto:muhash-numerator mu)
+             (bl.crypto:muhash-numerator (bl.store:coinstats-muhash decoded))))
+      (is (= (bl.crypto:muhash-denominator mu)
+             (bl.crypto:muhash-denominator (bl.store:coinstats-muhash decoded))))
+      (is (= 12345 (bl.store:coinstats-txout-count decoded)))
+      (is (= 2100000000000000 (bl.store:coinstats-total-amount decoded)))
+      (is (= 300 (bl.store:coinstats-unspendable-unclaimed decoded)))
       ;; Finalized MuHash is preserved through the roundtrip.
-      (is (equalp (bitcoin-lisp.crypto:muhash-finalize mu)
-                  (bitcoin-lisp.crypto:muhash-finalize
-                   (bitcoin-lisp.storage:coinstats-muhash decoded)))))))
+      (is (equalp (bl.crypto:muhash-finalize mu)
+                  (bl.crypto:muhash-finalize
+                   (bl.store:coinstats-muhash decoded)))))))
 
 ;;;; Rewind on a divergent index (GA8 wave 5, Core BaseIndex::Rewind).
 ;;;;
@@ -204,16 +204,16 @@ coinstats index built over them, installed on the node. Call inside
   (let* ((node (%regtest-node-fixture tag))
          (idxbase (merge-pathnames (format nil "test-csi-rw-~A/" tag)
                                    (uiop:temporary-directory))))
-    (let ((bitcoin-lisp::*node* node))
-      (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list blocks "raw(51)")))
-    (let* ((cs (bitcoin-lisp::node-chain-state node))
-           (csi (bitcoin-lisp.storage:init-coinstatsindex idxbase :enabled t)))
-      (bitcoin-lisp.storage:build-coinstatsindex
-       csi cs (bitcoin-lisp::node-block-store node)
-       #'bitcoin-lisp.validation:get-undo-data
-       #'bitcoin-lisp.validation:calculate-block-subsidy)
-      (setf (bitcoin-lisp::node-coinstatsindex node) csi)
-      (values node csi cs (bitcoin-lisp.storage:current-height cs)))))
+    (let ((bl::*node* node))
+      (bl.rpc::rpc-generatetodescriptor node (list blocks "raw(51)")))
+    (let* ((cs (bl::node-chain-state node))
+           (csi (bl.store:init-coinstatsindex idxbase :enabled t)))
+      (bl.store:build-coinstatsindex
+       csi cs (bl::node-block-store node)
+       #'bl.val:get-undo-data
+       #'bl.val:calculate-block-subsidy)
+      (setf (bl::node-coinstatsindex node) csi)
+      (values node csi cs (bl.store:current-height cs)))))
 
 (defmacro %csi-counting-calls ((count-var fname) &body body)
   "Run BODY with calls to FNAME counted in COUNT-VAR (the real function still
@@ -231,31 +231,31 @@ paths did the work — and that the counter can move at all."
 
 (defun %csi-raw-record (csi height)
   "The stored record at HEIGHT as raw bytes (NIL if absent)."
-  (bitcoin-lisp.storage::leveldb-get
-   (bitcoin-lisp.storage:coinstatsindex-db csi)
-   (bitcoin-lisp.storage::%csi-stat-key height)))
+  (bl.store::leveldb-get
+   (bl.store:coinstatsindex-db csi)
+   (bl.store::%csi-stat-key height)))
 
 (defun %csi-put-raw-record (csi height bytes)
-  (bitcoin-lisp.storage::leveldb-put
-   (bitcoin-lisp.storage:coinstatsindex-db csi)
-   (bitcoin-lisp.storage::%csi-stat-key height) bytes))
+  (bl.store::leveldb-put
+   (bl.store:coinstatsindex-db csi)
+   (bl.store::%csi-stat-key height) bytes))
 
 (defun %csi-fake-branch (cs from-height to-height seed)
   "Add synthetic block-index entries for a competing branch over
 FROM-HEIGHT+1..TO-HEIGHT, forking off the active chain at FROM-HEIGHT.
 Returns the branch tip's hash. Models a reorg whose headers the node still
 knows (they were persisted by an earlier flush)."
-  (let ((prev (bitcoin-lisp.storage:get-block-at-height cs from-height))
+  (let ((prev (bl.store:get-block-at-height cs from-height))
         (tip-hash nil))
     (loop for h from (1+ from-height) to to-height
           for hash = (make-array 32 :element-type '(unsigned-byte 8)
                                     :initial-element (+ seed h))
-          do (let ((entry (bitcoin-lisp.storage:make-block-index-entry
+          do (let ((entry (bl.store:make-block-index-entry
                            :hash hash :height h :chain-work 1 :status :valid
                            :prev-entry prev
-                           :header (bitcoin-lisp.storage:block-index-entry-header
-                                    (bitcoin-lisp.storage:get-block-at-height cs h)))))
-               (bitcoin-lisp.storage:add-block-index-entry cs entry)
+                           :header (bl.store:block-index-entry-header
+                                    (bl.store:get-block-at-height cs h)))))
+               (bl.store:add-block-index-entry cs entry)
                (setf prev entry tip-hash hash)))
     tip-hash))
 
@@ -269,7 +269,7 @@ height -> bytes) so the test can assert they are rebuilt."
         (wrong (%csi-raw-record csi (1- fork-height))))
     (loop for h from (1+ fork-height) to tip
           do (%csi-put-raw-record csi h wrong))
-    (bitcoin-lisp.storage:coinstatsindex-set-best csi tip branch-hash)
+    (bl.store:coinstatsindex-set-best csi tip branch-hash)
     correct))
 
 (test coinstatsindex-rewinds-to-fork-point-when-branch-is-known
@@ -289,29 +289,29 @@ BaseIndex::Rewind)."
        (is (not (equalp (cdr (assoc tip correct)) (%csi-raw-record csi tip))))
        ;; Drive the shipped startup entry point: it must rewind and rebuild
        ;; every record above the fork, exactly.
-       (bitcoin-lisp::%catch-up-coinstatsindex node)
-       (is (= tip (bitcoin-lisp.storage:coinstatsindex-height csi)))
+       (bl::%catch-up-coinstatsindex node)
+       (is (= tip (bl.store:coinstatsindex-height csi)))
        (dolist (entry correct)
          (is (equalp (cdr entry) (%csi-raw-record csi (car entry)))
              "record at height ~D was not rebuilt" (car entry)))
        ;; The best marker names the ACTIVE chain's tip again.
-       (multiple-value-bind (h hash) (bitcoin-lisp.storage:coinstatsindex-best csi)
+       (multiple-value-bind (h hash) (bl.store:coinstatsindex-best csi)
          (is (= tip h))
-         (is (equalp (bitcoin-lisp.storage:block-index-entry-hash
-                      (bitcoin-lisp.storage:get-block-at-height cs tip))
+         (is (equalp (bl.store:block-index-entry-hash
+                      (bl.store:get-block-at-height cs tip))
                      hash)))
        ;; Re-diverge to observe the rewind itself: it lands on the fork point,
        ;; and gets there from the header index alone — no record recomputed, so
        ;; this path is measured separately from the fallback in the next test.
        (%csi-divergent-state csi fork tip branch)
        (%csi-counting-calls
-           (verifications 'bitcoin-lisp.storage:coinstatsindex-record-matches-block-p)
-         (is (eql fork (bitcoin-lisp::%rewind-coinstatsindex node)))
+           (verifications 'bl.store:coinstatsindex-record-matches-block-p)
+         (is (eql fork (bl::%rewind-coinstatsindex node)))
          (is (= 0 verifications)
              "the header-index ancestor walk did not resolve the fork (~D recomputations)"
              verifications))
-       (is (= fork (bitcoin-lisp.storage:coinstatsindex-height csi)))
-       (bitcoin-lisp.storage:close-coinstatsindex csi)))))
+       (is (= fork (bl.store:coinstatsindex-height csi)))
+       (bl.store:close-coinstatsindex csi)))))
 
 (test coinstatsindex-rewinds-when-branch-headers-are-lost
   "Same divergence, but the abandoned branch's headers are NOT in the header
@@ -326,10 +326,10 @@ parent and the active block at that height."
             (unknown (make-array 32 :element-type '(unsigned-byte 8)
                                     :initial-element #xE7))
             (correct (%csi-divergent-state csi fork tip unknown)))
-       (is (null (bitcoin-lisp.storage:get-block-index-entry cs unknown)))
+       (is (null (bl.store:get-block-index-entry cs unknown)))
        ;; The shipped entry point rewinds and rebuilds, as above.
-       (bitcoin-lisp::%catch-up-coinstatsindex node)
-       (is (= tip (bitcoin-lisp.storage:coinstatsindex-height csi)))
+       (bl::%catch-up-coinstatsindex node)
+       (is (= tip (bl.store:coinstatsindex-height csi)))
        (dolist (entry correct)
          (is (equalp (cdr entry) (%csi-raw-record csi (car entry)))
              "record at height ~D was not rebuilt" (car entry)))
@@ -338,12 +338,12 @@ parent and the active block at that height."
        ;; the fork, the path the header-index walk cannot cover here.
        (%csi-divergent-state csi fork tip unknown)
        (%csi-counting-calls
-           (verifications 'bitcoin-lisp.storage:coinstatsindex-record-matches-block-p)
-         (is (eql fork (bitcoin-lisp::%rewind-coinstatsindex node)))
+           (verifications 'bl.store:coinstatsindex-record-matches-block-p)
+         (is (eql fork (bl::%rewind-coinstatsindex node)))
          (is (= 3 verifications)
              "expected one recomputation per height from the tip down to the fork, got ~D"
              verifications))
-       (bitcoin-lisp.storage:close-coinstatsindex csi)))))
+       (bl.store:close-coinstatsindex csi)))))
 
 (test coinstatsindex-consistent-index-is-not-rebuilt
   "Control: a consistent index must NOT rewind and must NOT re-index a single
@@ -353,18 +353,18 @@ by re-running against a divergent index."
   (%with-regtest
    (multiple-value-bind (node csi cs tip)
        (%csi-fixture (format nil "csictl~D" (get-internal-real-time)) 5)
-     (%csi-counting-calls (adds 'bitcoin-lisp.storage:coinstatsindex-add-block)
+     (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
        ;; Consistent: no rewind, no work at all.
-       (is (null (bitcoin-lisp::%rewind-coinstatsindex node)))
-       (bitcoin-lisp::%catch-up-coinstatsindex node)
+       (is (null (bl::%rewind-coinstatsindex node)))
+       (bl::%catch-up-coinstatsindex node)
        (is (= 0 adds) "a consistent index re-indexed ~D block(s)" adds)
-       (is (= tip (bitcoin-lisp.storage:coinstatsindex-height csi)))
+       (is (= tip (bl.store:coinstatsindex-height csi)))
        ;; Positive control: the counter does move when there IS work.
        (let ((fork (- tip 2)))
          (%csi-divergent-state csi fork tip (%csi-fake-branch cs fork tip 100))
-         (bitcoin-lisp::%catch-up-coinstatsindex node)
+         (bl::%catch-up-coinstatsindex node)
          (is (= 2 adds) "divergent index re-indexed ~D block(s)" adds)))
-     (bitcoin-lisp.storage:close-coinstatsindex csi))))
+     (bl.store:close-coinstatsindex csi))))
 
 (test coinstatsindex-ahead-of-tip-rewinds-to-tip
   "The ordinary unclean-shutdown shape: index writes are durable immediately,
@@ -379,21 +379,21 @@ move to the tip — not a rebuild from genesis."
        ;; block the (stale) header index never saw.
        (%csi-put-raw-record csi (+ tip 1) tip-record)
        (%csi-put-raw-record csi (+ tip 2) tip-record)
-       (bitcoin-lisp.storage:coinstatsindex-set-best
+       (bl.store:coinstatsindex-set-best
         csi (+ tip 2) (make-array 32 :element-type '(unsigned-byte 8)
                                      :initial-element #xC3))
-       (%csi-counting-calls (adds 'bitcoin-lisp.storage:coinstatsindex-add-block)
-         (is (eql tip (bitcoin-lisp::%rewind-coinstatsindex node)))
-         (bitcoin-lisp::%catch-up-coinstatsindex node)
+       (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
+         (is (eql tip (bl::%rewind-coinstatsindex node)))
+         (bl::%catch-up-coinstatsindex node)
          (is (= 0 adds) "an index merely ahead of the tip re-indexed ~D block(s)" adds))
        ;; Marker back on the active tip, its record untouched.
-       (multiple-value-bind (h hash) (bitcoin-lisp.storage:coinstatsindex-best csi)
+       (multiple-value-bind (h hash) (bl.store:coinstatsindex-best csi)
          (is (= tip h))
-         (is (equalp (bitcoin-lisp.storage:block-index-entry-hash
-                      (bitcoin-lisp.storage:get-block-at-height cs tip))
+         (is (equalp (bl.store:block-index-entry-hash
+                      (bl.store:get-block-at-height cs tip))
                      hash)))
        (is (equalp tip-record (%csi-raw-record csi tip)))
-       (bitcoin-lisp.storage:close-coinstatsindex csi)))))
+       (bl.store:close-coinstatsindex csi)))))
 
 (test coinstatsindex-rpc-refuses-stale-branch-hash
   "gettxoutsetinfo resolves a block hash to a height through the header index,
@@ -405,18 +405,18 @@ same height still works."
    (multiple-value-bind (node csi cs tip)
        (%csi-fixture (format nil "csirpc2~D" (get-internal-real-time)) 4)
      (let* ((stale (%csi-fake-branch cs (1- tip) tip 150))
-            (active (bitcoin-lisp.storage:block-index-entry-hash
-                     (bitcoin-lisp.storage:get-block-at-height cs tip))))
-       (signals bitcoin-lisp.rpc::rpc-error
-         (bitcoin-lisp.rpc::rpc-gettxoutsetinfo
-          node (list "muhash" (bitcoin-lisp.rpc::hash-to-hex stale))))
-       (let ((res (bitcoin-lisp.rpc::rpc-gettxoutsetinfo
-                   node (list "muhash" (bitcoin-lisp.rpc::hash-to-hex active)))))
+            (active (bl.store:block-index-entry-hash
+                     (bl.store:get-block-at-height cs tip))))
+       (signals bl.rpc::rpc-error
+         (bl.rpc::rpc-gettxoutsetinfo
+          node (list "muhash" (bl.rpc::hash-to-hex stale))))
+       (let ((res (bl.rpc::rpc-gettxoutsetinfo
+                   node (list "muhash" (bl.rpc::hash-to-hex active)))))
          (is (= tip (cdr (assoc "height" res :test #'string=)))))
        ;; A height above the best marker is not vouched for either.
-       (bitcoin-lisp.storage:coinstatsindex-set-best
-        csi (1- tip) (bitcoin-lisp.storage:block-index-entry-hash
-                      (bitcoin-lisp.storage:get-block-at-height cs (1- tip))))
-       (signals bitcoin-lisp.rpc::rpc-error
-         (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "muhash" tip)))
-       (bitcoin-lisp.storage:close-coinstatsindex csi)))))
+       (bl.store:coinstatsindex-set-best
+        csi (1- tip) (bl.store:block-index-entry-hash
+                      (bl.store:get-block-at-height cs (1- tip))))
+       (signals bl.rpc::rpc-error
+         (bl.rpc::rpc-gettxoutsetinfo node (list "muhash" tip)))
+       (bl.store:close-coinstatsindex csi)))))

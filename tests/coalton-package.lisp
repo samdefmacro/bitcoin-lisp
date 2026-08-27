@@ -7,6 +7,9 @@
   (:use #:cl #:fiveam)
   (:export #:coalton-tests))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp::install-package-nicknames))
+
 (in-package #:bitcoin-lisp.coalton.tests)
 
 ;;; Define the test suite for Coalton tests
@@ -16,8 +19,8 @@
 
 (defun get-read-result-value (rr)
   "Extract value from ReadResult."
-  (bitcoin-lisp.coalton.binary:read-result-value rr))
+  (bl.cbin:read-result-value rr))
 
 (defun get-read-result-position (rr)
   "Extract position from ReadResult."
-  (bitcoin-lisp.coalton.binary:read-result-position rr))
+  (bl.cbin:read-result-position rr))

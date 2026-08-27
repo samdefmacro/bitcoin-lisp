@@ -77,11 +77,11 @@ the caller must treat as a reason to stop, not to continue."
       ((not (%legacy-block-p store hash))
        (case (%resolve-duplicate-block store hash)
          (:swept
-          (bitcoin-lisp:log-info
+          (bl:log-info
            "Migration: swept an orphaned per-block file at height ~D left by an ~
             interrupted migration" height))
          (:recovered
-          (bitcoin-lisp:log-warn
+          (bl:log-warn
            "Migration: the flat record for height ~D does not read; the ~
             per-block file is the surviving copy and the index now points at it"
            height)))
@@ -93,9 +93,9 @@ the caller must treat as a reason to stop, not to continue."
             ;; Unreadable. GET-BLOCK has already pruned it for re-download;
             ;; there is nothing to convert and stopping here would strand every
             ;; block above it.
-            (bitcoin-lisp:log-warn
+            (bl:log-warn
              "Migration: block at height ~D (~A) is unreadable; skipped"
-             height (bitcoin-lisp.crypto:bytes-to-hex hash))
+             height (bl.crypto:bytes-to-hex hash))
             :skipped)
            (t
             (let ((legacy-path (block-file-path store hash))
@@ -114,8 +114,8 @@ the caller must treat as a reason to stop, not to continue."
                 (cond
                   ((and check
                         (equalp hash
-                                (bitcoin-lisp.serialization:block-header-hash
-                                 (bitcoin-lisp.serialization:bitcoin-block-header check))))
+                                (bl.ser:block-header-hash
+                                 (bl.ser:bitcoin-block-header check))))
                    (when (probe-file legacy-path)
                      (ignore-errors (delete-file legacy-path)))
                    ;; nFile/nDataPos, now that the block really is in a flat
@@ -137,10 +137,10 @@ the caller must treat as a reason to stop, not to continue."
                    ;; the index from the files anyway.
                    (setf (gethash hash (block-store-index store)) old-located
                          (block-store-total-bytes store) old-total)
-                   (bitcoin-lisp:log-error
+                   (bl:log-error
                     "Migration: block at height ~D (~A) did not read back from its flat ~
                      file; the per-block file is kept and the migration stops"
-                    height (bitcoin-lisp.crypto:bytes-to-hex hash))
+                    height (bl.crypto:bytes-to-hex hash))
                    nil)))))))))))
 
 (defun migrate-blocks-to-flat-files (store chain-state &key (max-blocks 1000)
@@ -188,7 +188,7 @@ reason."
                ;; in a legacy file is still read by the dual-read path.
                (handler-case (funcall on-migrated entry)
                  (error (e)
-                   (bitcoin-lisp:log-warn
+                   (bl:log-warn
                     "Migration: undo data for height ~D was not moved (~A); the ~
 legacy undo file is kept and still read"
                     (block-index-entry-height entry) e)))))

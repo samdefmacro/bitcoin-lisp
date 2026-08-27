@@ -139,8 +139,8 @@ indexed range really ends, so the startup backfill can heal the gap."
   (unless (and (blockfilterindex-enabled bfi) (blockfilterindex-db bfi))
     (return-from blockfilterindex-add-block nil))
   (let* ((db (blockfilterindex-db bfi))
-         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block
-                     (bitcoin-lisp.serialization:bitcoin-block-header block)))
+         (prev-hash (bl.ser:block-header-prev-block
+                     (bl.ser:bitcoin-block-header block)))
          ;; Chain the filter header off the parent's. Blocks are indexed in
          ;; order (connect hook + contiguous backfill), so the parent is present
          ;; for every block except the first one of the indexed range, which
@@ -168,7 +168,7 @@ indexed range really ends, so the startup backfill can heal the gap."
 (defun %block-spends-p (block)
   "T if BLOCK has any non-coinbase transaction (i.e. spends prior outputs), so
 that a correct basic filter needs its undo data."
-  (> (length (bitcoin-lisp.serialization:bitcoin-block-transactions block)) 1))
+  (> (length (bl.ser:bitcoin-block-transactions block)) 1))
 
 (defun blockfilterindex-set-best (bfi height hash)
   "Force the recorded best-indexed block to HEIGHT/HASH (used to repair the meta
@@ -216,15 +216,15 @@ caller's backfill rebuilds it from height 0. Safe on fresh and healthy indexes
   NIL                 index disabled"
   (unless (and (blockfilterindex-enabled bfi) (blockfilterindex-db bfi))
     (return-from blockfilterindex-ensure-genesis-anchor nil))
-  (let ((genesis-hash (network-genesis-hash bitcoin-lisp:*network*)))
+  (let ((genesis-hash (network-genesis-hash bl:*network*)))
     (flet ((rebuild (reason)
              (cond ((plusp (chain-state-pruned-height chain-state))
-                    (bitcoin-lisp:log-warn
+                    (bl:log-warn
                      "Block filter index ~A, and block bodies below the prune horizon (~D) are gone so it cannot be rebuilt; BIP157 headers stay internally consistent but do NOT match the network's absolute values"
                      reason (chain-state-pruned-height chain-state))
                     :unanchored-pruned)
                    (t
-                    (bitcoin-lisp:log-warn
+                    (bl:log-warn
                      "Block filter index ~A; wiping ~A for a full rebuild from genesis"
                      reason (blockfilterindex-path (blockfilterindex-base-path bfi)))
                     (blockfilterindex-wipe bfi)
@@ -276,9 +276,9 @@ indexed."
     ;; genesis block spends nothing, so its filter needs no undo data.
     (when (and (< (blockfilterindex-height bfi) 0)
                (zerop (chain-state-pruned-height chain-state)))
-      (let ((genesis-hash (network-genesis-hash bitcoin-lisp:*network*)))
+      (let ((genesis-hash (network-genesis-hash bl:*network*)))
         (when (blockfilterindex-add-block
-               bfi (make-genesis-block bitcoin-lisp:*network*)
+               bfi (make-genesis-block bl:*network*)
                genesis-hash 0 nil)
           (incf count))))
     (let* ((tip (current-height chain-state))

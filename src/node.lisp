@@ -39,11 +39,11 @@ up the loop's shape.")
 (defun network-magic (network)
   "Return the network magic bytes for NETWORK."
   (ecase network
-    (:testnet3 bitcoin-lisp.serialization:+testnet3-magic+)
-    (:testnet4 bitcoin-lisp.serialization:+testnet4-magic+)
-    (:signet bitcoin-lisp.serialization:+signet-magic+)
-    (:regtest bitcoin-lisp.serialization:+regtest-magic+)
-    (:mainnet bitcoin-lisp.serialization:+mainnet-magic+)))
+    (:testnet3 bl.ser:+testnet3-magic+)
+    (:testnet4 bl.ser:+testnet4-magic+)
+    (:signet bl.ser:+signet-magic+)
+    (:regtest bl.ser:+regtest-magic+)
+    (:mainnet bl.ser:+mainnet-magic+)))
 
 (defun network-port (network)
   "Return the default port for NETWORK."
@@ -122,7 +122,7 @@ process exit is a command that may not run at all (init.cpp:257-265).")
   "Run -blocknotify for a new best block, if configured."
   (when *block-notify-command*
     (run-notify-command *block-notify-command*
-                        :value (bitcoin-lisp.crypto:bytes-to-hex hash))))
+                        :value (bl.crypto:bytes-to-hex hash))))
 
 (defvar *pid-file-path* nil
   "The PID file this process created, or NIL. Set by WRITE-PID-FILE and cleared
@@ -188,16 +188,16 @@ START-NODE-FROM-ARGS immediately after its sibling."
     ;; -rpccookiefile: where the auth cookie goes (Core init.cpp:710). A
     ;; relative path hangs off the data directory.
     (let ((v (lk "rpccookiefile")))
-      (when v (setf bitcoin-lisp.rpc:*rpc-cookie-file* v)))
+      (when v (setf bl.rpc:*rpc-cookie-file* v)))
     ;; -rpccookieperms=owner|group|all (Core init.cpp:711). Loosening who may
     ;; read the cookie is loosening who may drive the RPC, so an unrecognised
     ;; audience is an error rather than a silent fall back to the default.
     (let ((v (lk "rpccookieperms")))
       (when v
-        (let ((perms (bitcoin-lisp.rpc:parse-rpc-cookie-perms v)))
+        (let ((perms (bl.rpc:parse-rpc-cookie-perms v)))
           (unless perms
             (error "Invalid -rpccookieperms=~A (must be owner, group or all)" v))
-          (setf bitcoin-lisp.rpc:*rpc-cookie-perms* perms))))
+          (setf bl.rpc:*rpc-cookie-perms* perms))))
     ;; -rpcthreads: cap on concurrent RPC handler threads (Core
     ;; DEFAULT_HTTP_THREADS = 16).
     (let ((v (lk "rpcthreads")))
@@ -205,7 +205,7 @@ START-NODE-FROM-ARGS immediately after its sibling."
         (let ((n (conf-parse-int v)))
           (unless (and n (plusp n))
             (error "Invalid value for -rpcthreads=~A (must be a positive integer)" v))
-          (setf bitcoin-lisp.rpc:*rpc-threads* n))))
+          (setf bl.rpc:*rpc-threads* n))))
     ;; -rpcservertimeout: seconds an idle RPC connection is held (Core
     ;; DEFAULT_HTTP_SERVER_TIMEOUT). 0 means no timeout, as in Core.
     (let ((v (lk "rpcservertimeout")))
@@ -213,7 +213,7 @@ START-NODE-FROM-ARGS immediately after its sibling."
         (let ((n (conf-parse-int v)))
           (unless (and n (>= n 0))
             (error "Invalid value for -rpcservertimeout=~A (must be a non-negative integer)" v))
-          (setf bitcoin-lisp.rpc:*rpc-server-timeout* (if (zerop n) nil n)))))
+          (setf bl.rpc:*rpc-server-timeout* (if (zerop n) nil n)))))
     ;; --- Wallet knobs over paths that already exist (track D's Wallet group).
     ;; Every one of these has a special with Core's name and default already;
     ;; what was missing was the option that sets it.
@@ -241,25 +241,25 @@ START-NODE-FROM-ARGS immediately after its sibling."
                (bool-knob (option place)
                  `(let ((v (lk ,option)))
                     (when v (setf ,place (conf-parse-bool v))))))
-      (fee-knob "mintxfee" bitcoin-lisp.rpc::*wallet-min-tx-fee*)
-      (fee-knob "discardfee" bitcoin-lisp.rpc::*wallet-discard-rate*)
-      (fee-knob "consolidatefeerate" bitcoin-lisp.rpc::*wallet-consolidate-feerate*)
-      (fee-knob "maxapsfee" bitcoin-lisp.rpc::*wallet-max-aps-fee*)
-      (int-knob "txconfirmtarget" bitcoin-lisp.rpc::*wallet-confirm-target* :min 1)
-      (bool-knob "walletrbf" bitcoin-lisp.rpc::*wallet-signal-rbf*)
-      (bool-knob "spendzeroconfchange" bitcoin-lisp.rpc::*wallet-spend-zero-conf-change*)
-      (bool-knob "walletrejectlongchains" bitcoin-lisp.rpc::*wallet-reject-long-chains*)
+      (fee-knob "mintxfee" bl.rpc::*wallet-min-tx-fee*)
+      (fee-knob "discardfee" bl.rpc::*wallet-discard-rate*)
+      (fee-knob "consolidatefeerate" bl.rpc::*wallet-consolidate-feerate*)
+      (fee-knob "maxapsfee" bl.rpc::*wallet-max-aps-fee*)
+      (int-knob "txconfirmtarget" bl.rpc::*wallet-confirm-target* :min 1)
+      (bool-knob "walletrbf" bl.rpc::*wallet-signal-rbf*)
+      (bool-knob "spendzeroconfchange" bl.rpc::*wallet-spend-zero-conf-change*)
+      (bool-knob "walletrejectlongchains" bl.rpc::*wallet-reject-long-chains*)
       ;; -keypool sizes the keypool of wallets created AFTER it is set; an
       ;; existing wallet keeps the size it was made with, as in Core, where the
       ;; keypool size is per-wallet state.
-      (int-knob "keypool" bitcoin-lisp.rpc::+default-keypool-size+ :min 1))
+      (int-knob "keypool" bl.rpc::+default-keypool-size+ :min 1))
     ;; -walletdir relocates <datadir>/wallets/ (Core init.cpp). Relative paths
     ;; hang off the data directory, as -rpccookiefile does.
     (let ((v (lk "walletdir")))
-      (when v (setf bitcoin-lisp.rpc::*wallet-directory* v)))
+      (when v (setf bl.rpc::*wallet-directory* v)))
     ;; -walletnotify: an operator hook, fired from AddToWallet.
     (let ((v (lk "walletnotify")))
-      (when v (setf bitcoin-lisp.rpc::*wallet-notify-command* v)))
+      (when v (setf bl.rpc::*wallet-notify-command* v)))
     alist))
 
 (defun %start-rpc-early (node rpc-port rpc-bind rpc-bind-supplied-p
@@ -276,7 +276,7 @@ point and answers -28 for every method until FINISH-RPC-WARMUP."
   (let* ((webui-enabled (if webui-supplied-p
                             (and webui t)
                             (not (eq network :mainnet))))
-         (server (bitcoin-lisp.rpc:start-rpc-server node
+         (server (bl.rpc:start-rpc-server node
                                                     :port rpc-port
                                                     :bind rpc-bind
                                                     :bind-supplied-p
@@ -292,7 +292,7 @@ point and answers -28 for every method until FINISH-RPC-WARMUP."
     ;; -webuiopen: pop the local browser at the dashboard. Logged, never
     ;; fatal (open-browser-to-ui catches everything).
     (when (and server webui-enabled webui-open)
-      (bitcoin-lisp.rpc:open-browser-to-ui rpc-port))
+      (bl.rpc:open-browser-to-ui rpc-port))
     server))
 
 (defun %ensure-wallets-subdirectory (data-directory network)
@@ -364,11 +364,11 @@ Core's -port only moves the listening/advertised side."
 (defun network-dns-seeds (network)
   "Return the DNS seeds for NETWORK."
   (ecase network
-    (:testnet3 bitcoin-lisp.networking:*testnet3-dns-seeds*)
-    (:testnet4 bitcoin-lisp.networking:*testnet4-dns-seeds*)
-    (:signet bitcoin-lisp.networking:*signet-dns-seeds*)
-    (:regtest bitcoin-lisp.networking:*regtest-dns-seeds*)
-    (:mainnet bitcoin-lisp.networking:*mainnet-dns-seeds*)))
+    (:testnet3 bl.net:*testnet3-dns-seeds*)
+    (:testnet4 bl.net:*testnet4-dns-seeds*)
+    (:signet bl.net:*signet-dns-seeds*)
+    (:regtest bl.net:*regtest-dns-seeds*)
+    (:mainnet bl.net:*mainnet-dns-seeds*)))
 
 (defun network-rpc-port (network)
   "Return the default RPC port for NETWORK."
@@ -405,7 +405,7 @@ start-node via automatic-inbound-capacity; the default is Core's 125 - 11.")
   (blockfilterindex nil)  ; BIP158 basic block filter index (optional)
   (coinstatsindex nil)  ; per-height UTXO stats + MuHash index (optional)
   (txospenderindex nil)  ; outpoint -> spending tx index (optional, -txospenderindex)
-  ;; Wallet manager (bitcoin-lisp.rpc:wallet-manager) fanning RPCs out to
+  ;; Wallet manager (bl.rpc:wallet-manager) fanning RPCs out to
   ;; loaded wallets by name; NIL when wallet support is disabled (mainnet
   ;; default). Wallet P1, docs/wallet-plan.md §4.
   (wallet-manager nil)
@@ -429,7 +429,7 @@ start-node via automatic-inbound-capacity; the default is Core's 125 - 11.")
   ;; tagged inbound-onion (their true network is :torv3).
   (onion-listener-socket nil)
   (onion-listener-thread nil :type (or null bt:thread))
-  ;; The torcontrol client (bitcoin-lisp.networking:tor-controller) keeping
+  ;; The torcontrol client (bl.net:tor-controller) keeping
   ;; the v3 onion service registered with the local Tor daemon, or NIL.
   (tor-controller nil)
   (pending-inbound-peers '() :type list)
@@ -462,17 +462,17 @@ start-node via automatic-inbound-capacity; the default is Core's 125 - 11.")
   "The chainstate targeting the network tip (Core CurrentChainstate). New
 blocks extend it, the mempool validates against its coins view, and RPC
 reports it as the active chainstate."
-  (bitcoin-lisp.storage:select-current-chainstate (node-chainstates node)))
+  (bl.store:select-current-chainstate (node-chainstates node)))
 
 (defun node-historical-chainstate (node)
   "The chainstate re-deriving history toward a snapshot base block (Core
 HistoricalChainstate); NIL when no background validation is in progress."
-  (bitcoin-lisp.storage:select-historical-chainstate (node-chainstates node)))
+  (bl.store:select-historical-chainstate (node-chainstates node)))
 
 (defun node-validated-chainstate (node)
   "The fully-validated chainstate (Core ValidatedChainstate) — the one
 indexes bind to, since they index blocks in order from genesis."
-  (bitcoin-lisp.storage:select-validated-chainstate (node-chainstates node)))
+  (bl.store:select-validated-chainstate (node-chainstates node)))
 
 ;;; Compatibility accessors for the former chain-state / utxo-set node slots.
 ;;; The chain-state struct now owns its coins view, and the node holds a
@@ -489,9 +489,9 @@ one. A replaced chainstate's coins view carries over when CHAINSTATE has
 none, preserving the former independent-slot semantics (setting chain-state
 never clobbered utxo-set)."
   (let ((old (node-current-chainstate node)))
-    (when (and old (null (bitcoin-lisp.storage:chain-state-coins-view chainstate)))
-      (setf (bitcoin-lisp.storage:chain-state-coins-view chainstate)
-            (bitcoin-lisp.storage:chain-state-coins-view old)))
+    (when (and old (null (bl.store:chain-state-coins-view chainstate)))
+      (setf (bl.store:chain-state-coins-view chainstate)
+            (bl.store:chain-state-coins-view old)))
     (setf (node-chainstates node)
           (if old
               (substitute chainstate old (node-chainstates node))
@@ -501,14 +501,14 @@ never clobbered utxo-set)."
 (defun node-utxo-set (node)
   "The current chainstate's coins view — the former utxo-set slot."
   (let ((cs (node-current-chainstate node)))
-    (and cs (bitcoin-lisp.storage:chain-state-coins-view cs))))
+    (and cs (bl.store:chain-state-coins-view cs))))
 
 (defun (setf node-utxo-set) (view node)
   "Set the current chainstate's coins view — the former utxo-set slot."
   (let ((cs (node-current-chainstate node)))
     (unless cs
       (error "Cannot set the node's utxo-set: no current chainstate exists"))
-    (setf (bitcoin-lisp.storage:chain-state-coins-view cs) view)))
+    (setf (bl.store:chain-state-coins-view cs) view)))
 
 (defvar *node* nil
   "Current running node instance.")
@@ -536,10 +536,10 @@ height recorded on NODE, stamp NODE's durable last-tip-advance time. An O(1)
 height read, safe to call every loop iteration. This is the persistent
 counterpart to note-tip-advanced's ephemeral ibd-context slot."
   (let* ((cs (node-current-chainstate node))
-         (h (and cs (bitcoin-lisp.storage:current-height cs))))
+         (h (and cs (bl.store:current-height cs))))
     (when (and (integerp h) (> h (node-last-tip-height node)))
       (setf (node-last-tip-height node) h
-            (node-last-tip-advance-time node) (bitcoin-lisp.serialization:get-node-time)))))
+            (node-last-tip-advance-time node) (bl.ser:get-node-time)))))
 
 (defun health-ok-p (sync-thread-alive-p seconds-since-tip
                     &optional (threshold *health-max-tip-staleness-seconds*))
@@ -565,9 +565,9 @@ Kept free of node state so it is directly unit-testable."
                      t))
          (last (node-last-tip-advance-time node))
          (seconds (if (plusp last)
-                      (max 0 (- (bitcoin-lisp.serialization:get-node-time) last))
+                      (max 0 (- (bl.ser:get-node-time) last))
                       most-positive-fixnum))
-         (synced (not bitcoin-lisp.networking::*cached-is-ibd*)))
+         (synced (not bl.net::*cached-is-ibd*)))
     (values (health-ok-p alive seconds) seconds synced)))
 
 ;;;; Logging (macros and core functions defined in logging.lisp)
@@ -716,13 +716,13 @@ empty."
 
 (defun make-genesis-header (network)
   "Construct the genesis block header for NETWORK, taken from the full
-genesis-block construction (bitcoin-lisp.storage:make-genesis-block) so the
+genesis-block construction (bl.store:make-genesis-block) so the
 merkle root is COMPUTED from the real per-network coinbase and the header
 hash is verified against the known genesis hash. A previous version shared
 mainnet's merkle-root constant across all networks, which was wrong for
 testnet4 (its genesis coinbase differs; Core kernel/chainparams.cpp:367-379)."
-  (bitcoin-lisp.serialization:bitcoin-block-header
-   (bitcoin-lisp.storage:make-genesis-block network)))
+  (bl.ser:bitcoin-block-header
+   (bl.store:make-genesis-block network)))
 
 ;;;; Process entropy
 
@@ -806,12 +806,12 @@ For testnet, data stays at the base directory (backward compatible)."
   ;; than mainnet's minimum (00000377ae...), so running it against the mainnet
   ;; limit made derive-target reject every real signet nBits — including
   ;; signet's own genesis, whose 0x1e0377ae we already record in chain.lisp.
-  (setf bitcoin-lisp.storage:*pow-limit-target*
+  (setf bl.store:*pow-limit-target*
         (ecase network
-          (:regtest bitcoin-lisp.storage:+regtest-pow-limit-target+)
-          (:signet  bitcoin-lisp.storage:+signet-pow-limit-target+)
+          (:regtest bl.store:+regtest-pow-limit-target+)
+          (:signet  bl.store:+signet-pow-limit-target+)
           ((:mainnet :testnet3 :testnet4)
-           bitcoin-lisp.storage:+pow-limit-target+)))
+           bl.store:+pow-limit-target+)))
 
   ;; Calculate data path — each network uses its own subdirectory, and WHICH
   ;; subdirectory is Core's (chainparamsbase.cpp:40-55). See NETWORK-DATA-PATH.
@@ -827,9 +827,9 @@ For testnet, data stays at the base directory (backward compatible)."
     (ensure-directories-exist (merge-pathnames "dummy" data-path))
 
     ;; Set network configuration
-    (setf bitcoin-lisp.serialization:*network-magic* (network-magic network))
-    (setf bitcoin-lisp.networking:*current-port* (network-port network))
-    (setf bitcoin-lisp.networking:*dns-seeds* (network-dns-seeds network))
+    (setf bl.ser:*network-magic* (network-magic network))
+    (setf bl.net:*current-port* (network-port network))
+    (setf bl.net:*dns-seeds* (network-dns-seeds network))
 
     ;; Create node instance
     (make-node :network network
@@ -839,7 +839,7 @@ For testnet, data stays at the base directory (backward compatible)."
 ;;;; Inbound listening
 
 (defun count-inbound-peers (node)
-  (count-if #'bitcoin-lisp.networking:peer-inbound (node-peers node)))
+  (count-if #'bl.net:peer-inbound (node-peers node)))
 
 (defun merge-inbound-peers (node)
   "Move handshaked inbound peers from the lock-guarded hand-off list into the
@@ -867,23 +867,23 @@ by the sync thread, so PEERS stays single-writer."
            (push peer (node-peers node)))
           (t
            (log-info "Inbound peer cap reached; dropping ~A"
-                     (bitcoin-lisp.networking:peer-address peer))
-           (bitcoin-lisp.networking:disconnect-peer peer)))))))
+                     (bl.net:peer-address peer))
+           (bl.net:disconnect-peer peer)))))))
 
 (defun evict-discouraged-inbound (node)
   "If any existing inbound peer is discouraged, disconnect it and return T so a
 new inbound connection can take its slot. NIL if none are discouraged."
   (bt:with-recursive-lock-held ((node-lock node))
     (let ((victim (find-if (lambda (p)
-                             (and (bitcoin-lisp.networking:peer-inbound p)
-                                  (bitcoin-lisp.networking:peer-discouraged-p
-                                   (bitcoin-lisp.networking:peer-address p))))
+                             (and (bl.net:peer-inbound p)
+                                  (bl.net:peer-discouraged-p
+                                   (bl.net:peer-address p))))
                            (node-peers node))))
       (when victim
         (log-info "Evicting discouraged inbound peer ~A to admit a new connection"
-                  (bitcoin-lisp.networking:peer-address victim))
+                  (bl.net:peer-address victim))
         (setf (node-peers node) (remove victim (node-peers node)))
-        (bitcoin-lisp.networking:disconnect-peer victim)
+        (bl.net:disconnect-peer victim)
         t))))
 
 (defconstant +evict-protect-netgroup+ 4
@@ -919,8 +919,8 @@ the only one that uses it) without letting the excluded peers consume slots."
   "A per-node-secret keying of the peer's netgroup (Core nKeyedNetGroup). The
 SECRET is what makes the netgroup protection unpredictable: without it an
 attacker knows which groups sort first and can arrange to be outside them."
-  (let ((group (or (bitcoin-lisp.networking:ip-netgroup
-                    (bitcoin-lisp.networking:peer-address peer))
+  (let ((group (or (bl.net:ip-netgroup
+                    (bl.net:peer-address peer))
                    "_")))
     (sxhash (cons *eviction-netgroup-secret* group))))
 
@@ -934,17 +934,17 @@ from the node's own random key.")
 otherwise disadvantaged under our eviction criteria\" — they are higher-latency,
 so they lose the ping pass, and inbound onion peers all share the loopback
 netgroup, so they lose the netgroup pass too."
-  (cond ((bitcoin-lisp.networking:peer-inbound-onion peer) :onion)
+  (cond ((bl.net:peer-inbound-onion peer) :onion)
         (t (multiple-value-bind (net bytes)
-               (bitcoin-lisp.networking:parse-network-address
-                (bitcoin-lisp.networking:peer-address peer))
+               (bl.net:parse-network-address
+                (bl.net:peer-address peer))
              (declare (ignore bytes))
              (case net
                (:cjdns :cjdns)
                (:i2p :i2p)
                (:torv3 :onion)
-               (t (when (bitcoin-lisp.networking:loopback-address-p
-                         (bitcoin-lisp.networking:peer-address peer))
+               (t (when (bl.net:loopback-address-p
+                         (bl.net:peer-address peer))
                     :local)))))))
 
 (defun %evict-protect-by-ratio (candidates)
@@ -986,8 +986,8 @@ than proportionally, so an all-onion inbound set could not make room at all."
                             (after (%evict-erase-last-k
                                     remaining
                                     (lambda (a b)
-                                      (< (bitcoin-lisp.networking:peer-connect-time a)
-                                         (bitcoin-lisp.networking:peer-connect-time b)))
+                                      (< (bl.net:peer-connect-time a)
+                                         (bl.net:peer-connect-time b)))
                                     per-network
                                     (lambda (p) (eq net (%evict-disadvantaged-network p))))))
                        (setf remaining after)
@@ -1001,8 +1001,8 @@ than proportionally, so an all-onion inbound set could not make room at all."
     ;; Whatever is left of the half goes to the longest-connected.
     (%evict-erase-last-k remaining
                          (lambda (a b)
-                           (> (bitcoin-lisp.networking:peer-connect-time a)
-                              (bitcoin-lisp.networking:peer-connect-time b)))
+                           (> (bl.net:peer-connect-time a)
+                              (bl.net:peer-connect-time b)))
                          (max 0 (- total-protect num-protected)))))
 
 (defun select-inbound-peer-to-evict (inbound)
@@ -1021,8 +1021,8 @@ for the ratio reserve."
     ;; permissions landed; a noban peer is never evicted for any reason.
     (setf candidates
           (remove-if (lambda (p)
-                       (bitcoin-lisp.networking:peer-has-permission-p
-                        p bitcoin-lisp.networking:+perm-noban+))
+                       (bl.net:peer-has-permission-p
+                        p bl.net:+perm-noban+))
                      candidates))
     ;; ProtectOutboundConnections is implicit: INBOUND is inbound-only.
     (setf candidates (%evict-erase-last-k candidates
@@ -1036,15 +1036,15 @@ for the ratio reserve."
                       candidates
                       (lambda (a b)
                         (flet ((ping (p)
-                                 (let ((l (bitcoin-lisp.networking:peer-min-ping-latency p)))
+                                 (let ((l (bl.net:peer-min-ping-latency p)))
                                    (if (plusp l) l most-positive-fixnum))))
                           (> (ping a) (ping b))))
                       +evict-protect-min-ping+))
     (setf candidates (%evict-erase-last-k
                       candidates
                       (lambda (a b)
-                        (< (bitcoin-lisp.networking:peer-last-tx-time a)
-                           (bitcoin-lisp.networking:peer-last-tx-time b)))
+                        (< (bl.net:peer-last-tx-time a)
+                           (bl.net:peer-last-tx-time b)))
                       +evict-protect-tx+))
     ;; Block-relay-only peers that have given us blocks: Core filters this pass
     ;; to non-tx-relay peers so the slots cannot be taken by ordinary peers
@@ -1052,16 +1052,16 @@ for the ratio reserve."
     (setf candidates (%evict-erase-last-k
                       candidates
                       (lambda (a b)
-                        (< (bitcoin-lisp.networking:peer-last-block-time a)
-                           (bitcoin-lisp.networking:peer-last-block-time b)))
+                        (< (bl.net:peer-last-block-time a)
+                           (bl.net:peer-last-block-time b)))
                       +evict-protect-block-relay-only+
                       (lambda (p)
-                        (not (bitcoin-lisp.networking:peer-relays-txs-p p)))))
+                        (not (bl.net:peer-relays-txs-p p)))))
     (setf candidates (%evict-erase-last-k
                       candidates
                       (lambda (a b)
-                        (< (bitcoin-lisp.networking:peer-last-block-time a)
-                           (bitcoin-lisp.networking:peer-last-block-time b)))
+                        (< (bl.net:peer-last-block-time a)
+                           (bl.net:peer-last-block-time b)))
                       +evict-protect-block+))
     (setf candidates (%evict-protect-by-ratio candidates))
     (when (null candidates)
@@ -1076,14 +1076,14 @@ for the ratio reserve."
     ;; still preferred here.
     (let ((preferred (remove-if-not
                       (lambda (p)
-                        (bitcoin-lisp.networking:peer-discouraged-p
-                         (bitcoin-lisp.networking:peer-address p)))
+                        (bl.net:peer-discouraged-p
+                         (bl.net:peer-address p)))
                       candidates)))
       (when preferred (setf candidates preferred)))
     ;; Finally: the netgroup with the most connections, youngest member first.
     (let ((groups (make-hash-table :test 'equal)))
-      (flet ((grp (p) (or (bitcoin-lisp.networking:ip-netgroup
-                           (bitcoin-lisp.networking:peer-address p))
+      (flet ((grp (p) (or (bl.net:ip-netgroup
+                           (bl.net:peer-address p))
                           "_")))
         (dolist (p candidates) (incf (gethash (grp p) groups 0)))
         (first (stable-sort
@@ -1093,8 +1093,8 @@ for the ratio reserve."
                         (gb (gethash (grp b) groups 0)))
                     (if (/= ga gb)
                         (> ga gb)
-                        (> (bitcoin-lisp.networking:peer-connect-time a)
-                           (bitcoin-lisp.networking:peer-connect-time b)))))))))))
+                        (> (bl.net:peer-connect-time a)
+                           (bl.net:peer-connect-time b)))))))))))
 
 (defun evict-least-valuable-inbound (node)
   "At inbound capacity with no discouraged peer to drop, evict the least
@@ -1105,15 +1105,15 @@ if a peer was evicted.
 The selection is SELECT-INBOUND-PEER-TO-EVICT, which is Core's
 AttemptToEvictConnection pass for pass."
   (bt:with-recursive-lock-held ((node-lock node))
-    (let ((inbound (remove-if-not #'bitcoin-lisp.networking:peer-inbound
+    (let ((inbound (remove-if-not #'bl.net:peer-inbound
                                   (node-peers node))))
       (when (cdr inbound)               ; need >1 so something stays protected
         (let ((victim (select-inbound-peer-to-evict inbound)))
           (when victim
             (log-info "Evicting least-valuable inbound peer ~A to admit a new connection"
-                      (bitcoin-lisp.networking:peer-address victim))
+                      (bl.net:peer-address victim))
             (setf (node-peers node) (remove victim (node-peers node)))
-            (bitcoin-lisp.networking:disconnect-peer victim)
+            (bl.net:disconnect-peer victim)
             t))))))
 
 (defun inbound-connection-allowed-p (node host)
@@ -1133,13 +1133,13 @@ twice the inbound cap no matter what the rest of the node is doing."
   ;; Ban check first and lock-free: a connect flood is exactly when the listener
   ;; must not contend with the sync thread and RPC readers for the node lock.
   (cond
-    ((bitcoin-lisp.networking:peer-banned-p host)
+    ((bl.net:peer-banned-p host)
      (values nil :banned))
     ((>= (bt:with-recursive-lock-held ((node-lock node))
            (length (node-pending-inbound-peers node)))
          *max-inbound-connections*)
      (values nil :backlog))
-    ((and (bitcoin-lisp.networking:peer-discouraged-p host)
+    ((and (bl.net:peer-discouraged-p host)
           (>= (1+ (bt:with-recursive-lock-held ((node-lock node))
                     (count-inbound-peers node)))
               *max-inbound-connections*))
@@ -1170,12 +1170,12 @@ amount of local reasoning can fix; the caller should treat that as fatal rather
 than proceed on a tip we cannot place."
   (let* ((chainstate (node-chain-state node))
          (view (and chainstate
-                    (bitcoin-lisp.storage:chain-state-coins-view chainstate))))
-    (unless (typep view 'bitcoin-lisp.storage:coins-view-cache)
+                    (bl.store:chain-state-coins-view chainstate))))
+    (unless (typep view 'bl.store:coins-view-cache)
       (return-from reconcile-coins-db-best-block nil))
-    (let ((recorded (bitcoin-lisp.storage:coins-view-db-best-block
-                     (bitcoin-lisp.storage:coins-view-cache-base view)))
-          (tip (bitcoin-lisp.storage:best-block-hash chainstate)))
+    (let ((recorded (bl.store:coins-view-db-best-block
+                     (bl.store:coins-view-cache-base view)))
+          (tip (bl.store:best-block-hash chainstate)))
       (cond
         ((null recorded)
          (log-info "Coins DB has no best-block pointer yet; it will be written on the next flush")
@@ -1183,26 +1183,26 @@ than proceed on a tip we cannot place."
         ((and tip (equalp recorded tip))
          :match)
         (t
-         (let ((entry (bitcoin-lisp.storage:get-block-index-entry chainstate recorded)))
+         (let ((entry (bl.store:get-block-index-entry chainstate recorded)))
            (cond
              ((null entry)
               (log-error "Coins DB best-block ~A is not in the block index; cannot place the UTXO set"
-                         (bitcoin-lisp.crypto:bytes-to-hex
-                          (bitcoin-lisp.crypto:reverse-bytes recorded)))
+                         (bl.crypto:bytes-to-hex
+                          (bl.crypto:reverse-bytes recorded)))
               :unresolvable)
              (t
-              (let ((coins-height (bitcoin-lisp.storage:block-index-entry-height entry))
-                    (tip-height (bitcoin-lisp.storage:current-height chainstate)))
+              (let ((coins-height (bl.store:block-index-entry-height entry))
+                    (tip-height (bl.store:current-height chainstate)))
                 (log-warn "UTXO set is at height ~D (~A) but chainstate.dat records tip height ~D; a reorg or flush was interrupted"
                           coins-height
-                          (bitcoin-lisp.crypto:bytes-to-hex
-                           (bitcoin-lisp.crypto:reverse-bytes recorded))
+                          (bl.crypto:bytes-to-hex
+                           (bl.crypto:reverse-bytes recorded))
                           tip-height)
-                (setf (bitcoin-lisp.storage::chain-state-best-block-hash chainstate)
+                (setf (bl.store::chain-state-best-block-hash chainstate)
                       (copy-seq recorded)
-                      (bitcoin-lisp.storage::chain-state-best-height chainstate)
+                      (bl.store::chain-state-best-height chainstate)
                       coins-height)
-                (bitcoin-lisp.storage:save-state chainstate :in-transition nil)
+                (bl.store:save-state chainstate :in-transition nil)
                 (log-warn "Recovered: chainstate.dat moved to the UTXO set's own block; sync will re-validate the gap")
                 :reconciled)))))))))
 
@@ -1220,7 +1220,7 @@ network is :torv3, Core CNode::m_inbound_onion)."
                ;; setnetworkactive off: don't accept inbound connections.
                (if (not (node-network-active node))
                    (sleep 1)
-               (let ((conn (bitcoin-lisp.networking:accept-connection
+               (let ((conn (bl.net:accept-connection
                             socket :timeout 1)))
                  (when conn
                    ;; Banned/discouraged admission gate BEFORE the handshake
@@ -1228,34 +1228,34 @@ network is :torv3, Core CNode::m_inbound_onion)."
                    ;; net.cpp:1801-1813).
                    (multiple-value-bind (allowed reason)
                        (inbound-connection-allowed-p
-                        node (bitcoin-lisp.networking:connection-host conn))
+                        node (bl.net:connection-host conn))
                      (if (not allowed)
                          (progn
                            (log-info "Inbound connection from ~A dropped (~(~A~))"
-                                     (bitcoin-lisp.networking:connection-host conn)
+                                     (bl.net:connection-host conn)
                                      reason)
-                           (bitcoin-lisp.networking:close-connection conn))
-                         (let ((peer (bitcoin-lisp.networking:make-inbound-peer
-                                      conn (bitcoin-lisp.networking:connection-host conn)
+                           (bl.net:close-connection conn))
+                         (let ((peer (bl.net:make-inbound-peer
+                                      conn (bl.net:connection-host conn)
                                       :inbound-onion onion)))
-                           (if (bitcoin-lisp.networking:perform-inbound-handshake peer)
+                           (if (bl.net:perform-inbound-handshake peer)
                                (progn
-                                 (bitcoin-lisp.networking:send-post-handshake-messages peer)
-                                 (bitcoin-lisp.networking:send-compact-block-negotiation peer)
+                                 (bl.net:send-post-handshake-messages peer)
+                                 (bl.net:send-compact-block-negotiation peer)
                                  (bt:with-recursive-lock-held ((node-lock node))
                                    (push peer (node-pending-inbound-peers node)))
                                  (log-info "Inbound~:[~; onion~] peer ~A (~A) handshake complete"
                                            onion
-                                           (bitcoin-lisp.networking:peer-address peer)
-                                           (bitcoin-lisp.networking:peer-user-agent peer)))
-                               (bitcoin-lisp.networking:disconnect-peer peer))))))))
+                                           (bl.net:peer-address peer)
+                                           (bl.net:peer-user-agent peer)))
+                               (bl.net:disconnect-peer peer))))))))
              (error (c)
                (log-debug "Inbound accept/handshake error: ~A" c)))))
 
 (defun start-inbound-listener (node bind)
   "Open the listening socket and spawn the accept thread. No-op (logged) if the
 port can't be bound."
-  (let ((sock (bitcoin-lisp.networking:open-listener bind (listen-port (node-network node)))))
+  (let ((sock (bl.net:open-listener bind (listen-port (node-network node)))))
     (if (null sock)
         (log-warn "Inbound listening disabled: could not bind ~A:~D"
                   bind (listen-port (node-network node)))
@@ -1281,7 +1281,7 @@ onion binds). No-op (logged) if the port can't be bound; torcontrol still
 runs, matching Core, where a failed onion bind and the control thread are
 independent."
   (let* ((port (onion-listen-port node))
-         (sock (bitcoin-lisp.networking:open-listener "127.0.0.1" port)))
+         (sock (bl.net:open-listener "127.0.0.1" port)))
     (if (null sock)
         (log-warn "Onion inbound listening disabled: could not bind 127.0.0.1:~D" port)
         (progn
@@ -1302,11 +1302,11 @@ wtxid-relay preference, fRelay, and BIP133 feefilter. Under the node lock
 because RPC handler threads call this while the sync thread owns the same
 queues. Returns T when the tx was found in the mempool and queued."
   (bt:with-recursive-lock-held ((node-lock node))
-    (bitcoin-lisp.networking:announce-mempool-tx
+    (bl.net:announce-mempool-tx
      (node-peers node) (node-mempool node) txid)))
 
 (defun load-mempool-from-disk
-    (node &optional (path (bitcoin-lisp.mempool:mempool-dat-path (node-data-directory node)))
+    (node &optional (path (bl.mp:mempool-dat-path (node-data-directory node)))
      &key (apply-unbroadcast t) (apply-fee-delta-priority t) (use-current-time nil))
   "Load a mempool.dat-format file through the normal acceptance path (Core
 LoadMempool): prioritisation deltas first (so fee policy sees them), then per-tx
@@ -1338,7 +1338,7 @@ Returns
 missing or corrupt."
   (when (and path (probe-file path))
       (multiple-value-bind (entries residual ok unbroadcast)
-          (bitcoin-lisp.mempool:read-mempool-file path)
+          (bl.mp:read-mempool-file path)
         (unless ok
           (log-warn "mempool file ~A unreadable or corrupt" path)
           (return-from load-mempool-from-disk nil))
@@ -1364,7 +1364,7 @@ missing or corrupt."
             ;; transactions that never came back. What was already accepted stays
             ;; in the pool and is dumped at shutdown, so the next start resumes
             ;; from a smaller file.
-            (when (bitcoin-lisp:interrupt-requested-p)
+            (when (bl:interrupt-requested-p)
               (log-warn "Mempool import abandoned on a stop request after ~D of ~D transaction~:P (~D accepted, ~D failed); the remainder stays in ~A"
                         tried total accepted failed path)
               (return-from load-mempool-from-disk (values accepted failed 0)))
@@ -1379,11 +1379,11 @@ missing or corrupt."
               ;; Core overwrites the saved time with now BEFORE the fee delta
               ;; and the acceptance (mempool_persist.cpp:95-97).
               (when use-current-time
-                (setf entry-time (bitcoin-lisp.serialization:get-unix-time)))
-              (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
-                    (height (bitcoin-lisp.storage:current-height chain-state)))
+                (setf entry-time (bl.ser:get-unix-time)))
+              (let ((txid (bl.ser:transaction-hash tx))
+                    (height (bl.store:current-height chain-state)))
                 (when (and apply-fee-delta-priority (not (zerop delta)))
-                  (bitcoin-lisp.mempool:mempool-prioritise mempool txid delta))
+                  (bl.mp:mempool-prioritise mempool txid delta))
                 ;; CHAIN-STATE gates the finality/BIP68 checks — a saved tx
                 ;; that is no longer minable in the next block must not
                 ;; reload (Core LoadMempool goes through the full
@@ -1394,13 +1394,13 @@ missing or corrupt."
                     ;; otherwise a stream of transactions that fail AFTER input
                     ;; fetch leaves one cache entry per distinct outpoint, with
                     ;; nothing evicting them until the next block connects.
-                    (bitcoin-lisp.storage:with-coins-to-uncache (utxo-set)
-                      (bitcoin-lisp.validation:validate-transaction-for-mempool
+                    (bl.store:with-coins-to-uncache (utxo-set)
+                      (bl.val:validate-transaction-for-mempool
                        tx utxo-set mempool height :chain-state chain-state))
                   (declare (ignore error))
                   (cond
                     (valid
-                     (if (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
+                     (if (eq :ok (bl.mp:accept-validated-tx
                                   mempool txid tx fee height
                                   :entry-time entry-time :sigops sigops
                                   :replaced replaced))
@@ -1412,13 +1412,13 @@ missing or corrupt."
           ;; import a foreign node's prioritisation by either route.
           (when apply-fee-delta-priority
             (dolist (pair residual)
-              (bitcoin-lisp.mempool:mempool-prioritise mempool (car pair) (cdr pair))))
+              (bl.mp:mempool-prioritise mempool (car pair) (cdr pair))))
           ;; Restore the unbroadcast set for txs that were re-accepted; ids
           ;; whose tx failed to reload are dropped (mempool-add-unbroadcast's
           ;; membership gate) — Core node/mempool_persist.cpp:136-142.
           (when apply-unbroadcast
             (dolist (txid unbroadcast)
-              (when (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
+              (when (bl.mp:mempool-add-unbroadcast mempool txid)
                 (incf unbroadcast-count))))
           (log-info "Imported mempool: ~D accepted, ~D failed, ~D residual deltas, ~D waiting for initial broadcast"
                     accepted failed (length residual) unbroadcast-count)
@@ -1451,12 +1451,12 @@ all. That makes coinbase-presence a monotone probe for 'is the UTXO set at
 or past this block', with no false positives from later spends. Returns
 NIL if the block isn't on disk (the block store is shared across
 chainstates)."
-  (let ((block (bitcoin-lisp.storage:get-block (node-block-store node) block-hash)))
+  (let ((block (bl.store:get-block (node-block-store node) block-hash)))
     (when block
-      (let* ((cb (first (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
-             (txid (bitcoin-lisp.serialization:transaction-hash cb)))
-        (and (bitcoin-lisp.storage:get-utxo
-              (bitcoin-lisp.storage:chain-state-coins-view chainstate) txid 0)
+      (let* ((cb (first (bl.ser:bitcoin-block-transactions block)))
+             (txid (bl.ser:transaction-hash cb)))
+        (and (bl.store:get-utxo
+              (bl.store:chain-state-coins-view chainstate) txid 0)
              t)))))
 
 (defun recover-inconsistent-chainstate
@@ -1481,9 +1481,9 @@ there — so both the tip==base case (nothing dirty could have been flushed)
 and the walk-back floor (rewind to the base, whose coins ARE the verified
 snapshot) resolve without probing blocks below the base, which are not on
 disk on the snapshot side."
-  (let* ((new-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-         (new-height (bitcoin-lisp.storage:current-height chain-state))
-         (snapshot-base (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash
+  (let* ((new-hash (bl.store:best-block-hash chain-state))
+         (new-height (bl.store:current-height chain-state))
+         (snapshot-base (bl.store:chain-state-from-snapshot-blockhash
                          chain-state)))
     (flet ((committed-p (hash)
              (or (and snapshot-base (equalp hash snapshot-base))
@@ -1502,42 +1502,42 @@ disk on the snapshot side."
         ;; an ordinary from-genesis sync (or rebuilds from stored blocks if
         ;; -reindex-chainstate is passed again after IBD re-covers the tip).
         ((and (not snapshot-base)
-              (equalp new-hash (bitcoin-lisp.storage::chain-state-genesis-hash
+              (equalp new-hash (bl.store::chain-state-genesis-hash
                                 chain-state)))
-         (let ((view (bitcoin-lisp.storage:chain-state-coins-view chain-state)))
-           (when (typep view 'bitcoin-lisp.storage:coins-view-cache)
-             (let ((erased (bitcoin-lisp.storage:coins-view-cache-wipe view)))
+         (let ((view (bl.store:chain-state-coins-view chain-state)))
+           (when (typep view 'bl.store:coins-view-cache)
+             (let ((erased (bl.store:coins-view-cache-wipe view)))
                (when (plusp erased)
                  (log-info "Chainstate recovery: erased ~D leftover coin~:P from the interrupted wipe"
                            erased)))))
-         (bitcoin-lisp.storage:save-state chain-state :in-transition nil)
+         (bl.store:save-state chain-state :in-transition nil)
          (log-warn "Chainstate recovery: interrupted reindex-chainstate; UTXO set reset to empty at genesis (chain will re-sync)")
          t)
         ;; Phase 2 committed the new tip — chainstate.dat already holds it,
         ;; just drop the marker.
         ((committed-p new-hash)
-         (bitcoin-lisp.storage:save-state chain-state :in-transition nil)
+         (bl.store:save-state chain-state :in-transition nil)
          (log-info "Chainstate recovery: UTXO set already at recorded tip h=~D; marker cleared"
                    new-height)
          t)
         ;; UTXO set is behind: find the real tip by walking back.
         (t
-         (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state new-hash)))
+         (let ((entry (bl.store:get-block-index-entry chain-state new-hash)))
            (loop while entry
-                 do (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
+                 do (setf entry (bl.store:block-index-entry-prev-entry entry))
                  until (or (null entry)
                            (committed-p
-                            (bitcoin-lisp.storage:block-index-entry-hash entry))))
+                            (bl.store:block-index-entry-hash entry))))
            (cond
              (entry
-              (let ((h (bitcoin-lisp.storage:block-index-entry-height entry))
-                    (hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
+              (let ((h (bl.store:block-index-entry-height entry))
+                    (hash (bl.store:block-index-entry-hash entry)))
                 ;; pruned-height is left as recorded — pruning is monotone and
                 ;; lags the tip by the whole block window, so it is far below
                 ;; this rewind point and those files are gone regardless.
-                (setf (bitcoin-lisp.storage::chain-state-best-block-hash chain-state) hash
-                      (bitcoin-lisp.storage::chain-state-best-height chain-state) h)
-                (bitcoin-lisp.storage:save-state chain-state :in-transition nil)
+                (setf (bl.store::chain-state-best-block-hash chain-state) hash
+                      (bl.store::chain-state-best-height chain-state) h)
+                (bl.store:save-state chain-state :in-transition nil)
                 (log-warn "Chainstate recovery: UTXO set at h=~D (recorded tip h=~D); rewound chainstate.dat ~D block~:P, will re-validate the gap"
                           h new-height (- new-height h))
                 t))
@@ -1571,14 +1571,14 @@ thread (tests, :sync nil nodes)."
   (if (and (node-sync-thread node)
            (bt:thread-alive-p (node-sync-thread node)))
       (progn
-        (bitcoin-lisp.networking:request-ibd-stop)
+        (bl.net:request-ibd-stop)
         (loop repeat 600                ; <= 120s; the IBD loops poll the flag
               while (node-syncing node)
               do (sleep 0.2))
         (when (node-syncing node)
           (log-warn "Sync pass did not pause within 120s; proceeding with snapshot activation anyway"))
         (unwind-protect (funcall thunk)
-          (bitcoin-lisp.networking:reset-ibd-stop)))
+          (bl.net:reset-ibd-stop)))
       (funcall thunk)))
 
 (defun %make-snapshot-chainstate (node base-hash)
@@ -1589,10 +1589,10 @@ the primary chainstate (Core keeps it in m_blockman, outside any
 chainstate). Used by both activation (create-snapshot-chainstate) and
 startup re-detection (load-snapshot-chainstate)."
   (let ((primary (node-current-chainstate node)))
-    (bitcoin-lisp.storage:make-chain-state
+    (bl.store:make-chain-state
      :base-path (node-data-directory node)
-     :genesis-hash (bitcoin-lisp.storage::chain-state-genesis-hash primary)
-     :block-index (bitcoin-lisp.storage::chain-state-block-index primary)
+     :genesis-hash (bl.store::chain-state-genesis-hash primary)
+     :block-index (bl.store::chain-state-block-index primary)
      :from-snapshot-blockhash (copy-seq base-hash)
      :assumeutxo-status :unvalidated
      :storage-suffix "_snapshot")))
@@ -1605,12 +1605,12 @@ aborted or unadoptable earlier activation are removed first — startup
 adopts any intact snapshot chainstate, so anything still here is refuse.
 The caller owns cleanup on failure (abort-snapshot-chainstate)."
   (let ((snap (%make-snapshot-chainstate node base-hash)))
-    (when (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir
+    (when (bl.store:find-assumeutxo-chainstate-dir
            (node-data-directory node))
       (log-warn "[snapshot] removing stale snapshot chainstate leftovers before activation")
-      (bitcoin-lisp.storage:delete-snapshot-chainstate-files
+      (bl.store:delete-snapshot-chainstate-files
        (node-data-directory node)))
-    (bitcoin-lisp.storage:open-chainstate-coins-view snap)
+    (bl.store:open-chainstate-coins-view snap)
     snap))
 
 (defun abort-snapshot-chainstate (node snap)
@@ -1620,9 +1620,9 @@ signals — this runs on the activation failure path."
   ;; Core's cleanup_bad_snapshot rebalances first (validation.cpp:5697) —
   ;; the failed activation must not leave a split cache allocation behind.
   (ignore-errors (maybe-rebalance-caches node))
-  (bitcoin-lisp.storage:close-chainstate-coins-view snap)
+  (bl.store:close-chainstate-coins-view snap)
   (ignore-errors
-    (bitcoin-lisp.storage:delete-snapshot-chainstate-files
+    (bl.store:delete-snapshot-chainstate-files
      (node-data-directory node)))
   nil)
 
@@ -1639,12 +1639,12 @@ empty first (Core asserts it). Core's PopulateBlockIndexCandidates has no
 equivalent here — our fork choice is per-block (activate-block) and the
 historical chainstate's candidate filtering is the target guard there."
   (let* ((prev (node-current-chainstate node))
-         (base-hash (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash snap))
-         (base-entry (bitcoin-lisp.storage:get-block-index-entry prev base-hash)))
-    (assert (eq (bitcoin-lisp.storage:chain-state-assumeutxo-status prev) :validated))
-    (assert (null (bitcoin-lisp.storage:chain-state-target-blockhash prev)))
+         (base-hash (bl.store:chain-state-from-snapshot-blockhash snap))
+         (base-entry (bl.store:get-block-index-entry prev base-hash)))
+    (assert (eq (bl.store:chain-state-assumeutxo-status prev) :validated))
+    (assert (null (bl.store:chain-state-target-blockhash prev)))
     (assert base-entry)
-    (bitcoin-lisp.storage:set-chainstate-target prev base-entry)
+    (bl.store:set-chainstate-target prev base-entry)
     (bt:with-recursive-lock-held ((node-lock node))
       (setf (node-chainstates node)
             (append (node-chainstates node) (list snap))))
@@ -1653,9 +1653,9 @@ historical chainstate's candidate filtering is the target guard there."
     ;; validation.cpp:5745).
     (maybe-rebalance-caches node)
     (log-info "[snapshot] successfully activated snapshot ~A: current chainstate now at height ~D following the network tip; historical chainstate (h=~D) re-derives history toward the base in the background"
-              (bitcoin-lisp.crypto:bytes-to-hex base-hash)
-              (bitcoin-lisp.storage:current-height snap)
-              (bitcoin-lisp.storage:current-height prev))
+              (bl.crypto:bytes-to-hex base-hash)
+              (bl.store:current-height snap)
+              (bl.store:current-height prev))
     snap))
 
 (defun load-snapshot-chainstate (node)
@@ -1668,17 +1668,17 @@ chainstate's header index is loaded — the base entry has to resolve — and
 before crash-recovery resolution (a torn snapshot flush joins
 *pending-chainstate-recovery*). Returns the snapshot chainstate or NIL."
   (let* ((data-dir (node-data-directory node))
-         (dir (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir data-dir)))
+         (dir (bl.store:find-assumeutxo-chainstate-dir data-dir)))
     (when dir
-      (let* ((base-hash (bitcoin-lisp.storage:read-snapshot-base-blockhash dir))
+      (let* ((base-hash (bl.store:read-snapshot-base-blockhash dir))
              (primary (node-current-chainstate node))
              (base-entry (and base-hash
-                              (bitcoin-lisp.storage:get-block-index-entry
+                              (bl.store:get-block-index-entry
                                primary base-hash))))
         (cond
           ((null base-hash)
            (log-warn "[snapshot] snapshot chainstate dir is malformed! no base blockhash file exists at path ~A. Try deleting ~A and calling loadtxoutset again"
-                     (namestring (bitcoin-lisp.storage:snapshot-base-blockhash-path dir))
+                     (namestring (bl.store:snapshot-base-blockhash-path dir))
                      (namestring dir))
            nil)
           ((null base-entry)
@@ -1686,47 +1686,47 @@ before crash-recovery resolution (a torn snapshot flush joins
            ;; chainstate on disk and run single-chainstate this boot; once
            ;; headers re-cover the base, the next restart adopts it.
            (log-warn "[snapshot] snapshot base block ~A is not in the header index; not loading the snapshot chainstate this run"
-                     (bitcoin-lisp.crypto:bytes-to-hex base-hash))
+                     (bl.crypto:bytes-to-hex base-hash))
            nil)
           (t
            (log-info "[snapshot] detected active snapshot chainstate (~A) - loading"
                      (namestring dir))
            (let ((snap (%make-snapshot-chainstate node base-hash))
-                 (base-height (bitcoin-lisp.storage:block-index-entry-height base-entry)))
+                 (base-height (bl.store:block-index-entry-height base-entry)))
              ;; Tip from chainstate_snapshot.dat; a torn flush defers to the
              ;; per-chainstate recovery pass; a missing .dat means activation
              ;; completed (dir + marker prove the populate did) but the first
              ;; save-state never landed — start the chainstate at its base.
-             (case (bitcoin-lisp.storage:load-state snap)
+             (case (bl.store:load-state snap)
                ((:inconsistent)
                 (log-warn "[snapshot] snapshot chainstate in-transition (flush interrupted); will attempt automatic recovery after storage init")
                 (push snap *pending-chainstate-recovery*))
                ((t) nil)
                ((nil)
                 (log-warn "[snapshot] no chainstate_snapshot.dat; starting the snapshot chainstate at its base (h=~D)" base-height)
-                (bitcoin-lisp.storage:update-chain-tip
+                (bl.store:update-chain-tip
                  snap (copy-seq base-hash) base-height)))
              ;; The recorded tip must resolve in the shared header index;
              ;; otherwise fall back to the base (blocks above it re-sync).
-             (let ((tip-hash (bitcoin-lisp.storage:best-block-hash snap)))
+             (let ((tip-hash (bl.store:best-block-hash snap)))
                (unless (and tip-hash
-                            (bitcoin-lisp.storage:get-block-index-entry primary tip-hash))
+                            (bl.store:get-block-index-entry primary tip-hash))
                  (log-warn "[snapshot] snapshot chainstate tip not in the header index; resetting to the base (h=~D)" base-height)
-                 (bitcoin-lisp.storage:update-chain-tip
+                 (bl.store:update-chain-tip
                   snap (copy-seq base-hash) base-height)))
              ;; Open its coins DB (chainstate_snapshot/).
-             (bitcoin-lisp.storage:open-chainstate-coins-view snap)
+             (bl.store:open-chainstate-coins-view snap)
              ;; Retarget the primary (it becomes the historical chainstate)
              ;; and adopt the snapshot chainstate as current.
-             (bitcoin-lisp.storage:set-chainstate-target primary base-entry)
+             (bl.store:set-chainstate-target primary base-entry)
              (setf (node-chainstates node)
                    (append (node-chainstates node) (list snap)))
              ;; Split the coins-cache budget across the re-adopted pair (Core
              ;; LoadChainstate's MaybeRebalanceCaches, node/chainstate.cpp:146).
              (maybe-rebalance-caches node)
              (log-info "[snapshot] switching active chainstate to the snapshot chainstate (tip h=~D); historical chainstate at h=~D targets the base at h=~D"
-                       (bitcoin-lisp.storage:current-height snap)
-                       (bitcoin-lisp.storage:current-height primary)
+                       (bl.store:current-height snap)
+                       (bl.store:current-height primary)
                        base-height)
              snap)))))))
 
@@ -1897,11 +1897,11 @@ is about to exit the process out from under it."
   (car *shutdown-request*))
 
 (defun %node-interrupt-requested-p ()
-  "The node-wide stop predicate installed into bitcoin-lisp:*interrupt-check*
+  "The node-wide stop predicate installed into bl:*interrupt-check*
 (config.lisp), which states the contract. Two flags mean stop and this is the
 only file that sees both: *shutdown-request* is set FIRST (the SIGTERM handler
 just registers it), *ibd-stop-requested* later by stop-node."
-  (or (bitcoin-lisp.networking:ibd-stop-requested-p)
+  (or (bl.net:ibd-stop-requested-p)
       (node-shutdown-requested-p)))
 
 (setf *interrupt-check* '%node-interrupt-requested-p)
@@ -1982,7 +1982,7 @@ With EXIT NIL it returns the code instead of exiting (tests)."
 (defun %node-snapshot-chainstate (node)
   "The node's snapshot-derived chainstate (the one carrying a
 from-snapshot-blockhash), regardless of its assumeutxo status, or NIL."
-  (find-if #'bitcoin-lisp.storage:chain-state-from-snapshot-blockhash
+  (find-if #'bl.store:chain-state-from-snapshot-blockhash
            (node-chainstates node)))
 
 (defun %default-snapshot-fatal (message)
@@ -2014,16 +2014,16 @@ A no-op-guarding predicate: false in every arrangement other than a
 background sync that has just landed on its target."
   (and node snap historical
        (member historical (node-chainstates node))
-       (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash snap)
-       (eq (bitcoin-lisp.storage:chain-state-assumeutxo-status snap) :unvalidated)
-       (eq (bitcoin-lisp.storage:chain-state-assumeutxo-status historical) :validated)
-       (bitcoin-lisp.storage:best-block-hash historical)
-       (bitcoin-lisp.storage:chain-state-target-blockhash historical)
-       (equalp (bitcoin-lisp.storage:chain-state-target-blockhash historical)
-               (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash snap))
+       (bl.store:chain-state-from-snapshot-blockhash snap)
+       (eq (bl.store:chain-state-assumeutxo-status snap) :unvalidated)
+       (eq (bl.store:chain-state-assumeutxo-status historical) :validated)
+       (bl.store:best-block-hash historical)
+       (bl.store:chain-state-target-blockhash historical)
+       (equalp (bl.store:chain-state-target-blockhash historical)
+               (bl.store:chain-state-from-snapshot-blockhash snap))
        ;; ReachedTarget: the historical tip IS the target/base block.
-       (equalp (bitcoin-lisp.storage:best-block-hash historical)
-               (bitcoin-lisp.storage:chain-state-target-blockhash historical))))
+       (equalp (bl.store:best-block-hash historical)
+               (bl.store:chain-state-target-blockhash historical))))
 
 (defun %mark-snapshot-invalid (node historical snap)
   "State mutation Core performs when a snapshot fails validation
@@ -2032,11 +2032,11 @@ validation.cpp:6026-6036): reset the historical chainstate's target back to
 the network tip, mark the snapshot chainstate :invalid, close its coins DB and
 rename its dir aside for forensics. No process shutdown here — the caller
 drives that."
-  (bitcoin-lisp.storage:set-chainstate-target historical nil)
-  (setf (bitcoin-lisp.storage:chain-state-assumeutxo-status snap) :invalid)
-  (bitcoin-lisp.storage:close-chainstate-coins-view snap)
+  (bl.store:set-chainstate-target historical nil)
+  (setf (bl.store:chain-state-assumeutxo-status snap) :invalid)
+  (bl.store:close-chainstate-coins-view snap)
   (ignore-errors
-    (bitcoin-lisp.storage:rename-snapshot-chainstate-dir-invalid
+    (bl.store:rename-snapshot-chainstate-dir-invalid
      (node-data-directory node))))
 
 (defun %validate-snapshot-against-commitment (node historical snap)
@@ -2055,40 +2055,40 @@ MISMATCH / no chainparams entry -> %mark-snapshot-invalid, and returns
   ;; persists the historical's final tip so a crash right after validation
   ;; doesn't lose it.
   (%flush-chainstate historical)
-  (let* ((base-hash (bitcoin-lisp.storage:chain-state-target-blockhash historical))
+  (let* ((base-hash (bl.store:chain-state-target-blockhash historical))
          (au (assumeutxo-data-for-blockhash (node-network node) base-hash)))
     (cond
       ((null au)
        (let ((msg (format nil "assumeutxo data not found for the snapshot base at height ~D — refusing to validate snapshot"
-                          (bitcoin-lisp.storage:current-height historical))))
+                          (bl.store:current-height historical))))
          (log-warn "[snapshot] ~A" msg)
          (%mark-snapshot-invalid node historical snap)
          (values :missing-chainparams msg)))
       (t
        (log-info "[snapshot] computing UTXO stats for the background chainstate to validate the snapshot — this may take a few minutes")
-       (let ((got (bitcoin-lisp.storage:compute-utxo-set-hash
-                   (bitcoin-lisp.storage:chain-state-coins-view historical)))
+       (let ((got (bl.store:compute-utxo-set-hash
+                   (bl.store:chain-state-coins-view historical)))
              (want (assumeutxo-data-hash-serialized au)))
          (cond
            ((equalp got want)
-            (setf (bitcoin-lisp.storage:chain-state-assumeutxo-status snap) :validated
-                  (bitcoin-lisp.storage:chain-state-target-utxohash historical) got)
+            (setf (bl.store:chain-state-assumeutxo-status snap) :validated
+                  (bl.store:chain-state-target-utxohash historical) got)
             ;; VALIDATED lifts the snapshot chainstate's prune floor (Core: a
             ;; validated chainstate's GetPruneRange starts at 0 again); the
             ;; prune-walk cursor rewinds so the window the floor protected
             ;; becomes reclaimable.
-            (bitcoin-lisp.storage:lift-prune-floor-on-promotion snap historical)
+            (bl.store:lift-prune-floor-on-promotion snap historical)
             ;; Core rebalances the caches immediately after promotion
             ;; (validation.cpp:6093): everything to the snapshot chainstate.
             (maybe-rebalance-caches node)
             (log-info "[snapshot] snapshot beginning at ~A has been fully validated"
-                      (bitcoin-lisp.crypto:bytes-to-hex
-                       (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash snap)))
+                      (bl.crypto:bytes-to-hex
+                       (bl.store:chain-state-from-snapshot-blockhash snap)))
             (values :success nil))
            (t
             (let ((msg (format nil "failed to validate the -assumeutxo snapshot state: hash mismatch (computed ~A, expected ~A)"
-                               (bitcoin-lisp.crypto:bytes-to-hex got)
-                               (bitcoin-lisp.crypto:bytes-to-hex want))))
+                               (bl.crypto:bytes-to-hex got)
+                               (bl.crypto:bytes-to-hex want))))
               (log-error "[snapshot] ~A" msg)
               (%mark-snapshot-invalid node historical snap)
               (values :hash-mismatch msg)))))))))
@@ -2116,7 +2116,7 @@ call for any chainstate."
             (:success
              (restart-indexes-for-validated-chainstate node)
              (log-info "[snapshot] promotion complete: the current chainstate (h=~D) is now fully validated; the background chainstate directories are consolidated on the next restart"
-                       (bitcoin-lisp.storage:current-height
+                       (bl.store:current-height
                         (node-current-chainstate node)))
              :success)
             (t
@@ -2157,24 +2157,24 @@ now-unneeded background chainstate), and re-init the node with a single
 fully-validated chainstate. Returns T when it swapped, NIL when there was
 nothing to do."
   (let ((snap (%node-snapshot-chainstate node)))
-    (unless (and snap (eq (bitcoin-lisp.storage:chain-state-assumeutxo-status snap)
+    (unless (and snap (eq (bl.store:chain-state-assumeutxo-status snap)
                           :validated))
       (return-from validated-snapshot-cleanup nil))
     ;; ResetChainstates: release every coins DB handle before shuffling dirs.
     (dolist (cs (node-chainstates node))
-      (bitcoin-lisp.storage:close-chainstate-coins-view cs))
+      (bl.store:close-chainstate-coins-view cs))
     ;; Swap chainstate_snapshot/ into chainstate/ and delete the background one.
-    (bitcoin-lisp.storage:promote-snapshot-chainstate-files (node-data-directory node))
+    (bl.store:promote-snapshot-chainstate-files (node-data-directory node))
     ;; Morph the snapshot chainstate struct into the sole primary chainstate:
     ;; drop its snapshot identity (default file names, no target/snapshot
     ;; marking) and reopen its coins view over the now-promoted chainstate/
     ;; LevelDB. Its shared block index and its (snapshot-tip) chain carry over
     ;; intact, so no block re-download is needed.
-    (bitcoin-lisp.storage:clear-snapshot-chainstate-identity snap)
-    (bitcoin-lisp.storage:open-chainstate-coins-view snap)
+    (bl.store:clear-snapshot-chainstate-identity snap)
+    (bl.store:open-chainstate-coins-view snap)
     (setf (node-chainstates node) (list snap))
     (log-info "[snapshot] background chainstate consolidated; running as a single fully-validated chainstate at height ~D"
-              (bitcoin-lisp.storage:current-height snap))
+              (bl.store:current-height snap))
     t))
 
 (defun %catch-up-blockfilterindex (node)
@@ -2187,7 +2187,7 @@ invalidateblock), then backfills any shortfall. Shared by startup and the
 post-promotion index rebind."
   (let* ((bfi (node-blockfilterindex node))
          (cs (node-validated-chainstate node))
-         (tip (bitcoin-lisp.storage:current-height cs)))
+         (tip (bl.store:current-height cs)))
     ;; BIP157 genesis-anchor migration: an index built before genesis indexing
     ;; existed seeded its header chain at the first STORED block, so every
     ;; absolute cfheaders/cfcheckpt/getblockfilter header it serves diverges
@@ -2196,24 +2196,24 @@ post-promotion index rebind."
     ;; filter is computed from chain parameters). No-op on fresh and healthy
     ;; indexes; on a pruned node a bad index is kept (rebuild impossible) with
     ;; a warning.
-    (when (eq :rebuilt (bitcoin-lisp.storage:blockfilterindex-ensure-genesis-anchor bfi cs))
+    (when (eq :rebuilt (bl.store:blockfilterindex-ensure-genesis-anchor bfi cs))
       (log-info "Block filter index wiped; rebuilding from genesis"))
-    (when (> (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
+    (when (> (bl.store:blockfilterindex-height bfi) tip)
       (log-warn "Block filter index best above tip (~D > ~D); repairing"
-                (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
+                (bl.store:blockfilterindex-height bfi) tip)
       (loop for h from tip downto 0
-            for e = (bitcoin-lisp.storage:get-block-at-height cs h)
-            when (and e (bitcoin-lisp.storage:blockfilterindex-has-block-p
-                         bfi (bitcoin-lisp.storage:block-index-entry-hash e)))
-              do (bitcoin-lisp.storage:blockfilterindex-set-best
-                  bfi h (bitcoin-lisp.storage:block-index-entry-hash e))
+            for e = (bl.store:get-block-at-height cs h)
+            when (and e (bl.store:blockfilterindex-has-block-p
+                         bfi (bl.store:block-index-entry-hash e)))
+              do (bl.store:blockfilterindex-set-best
+                  bfi h (bl.store:block-index-entry-hash e))
                  (return)
-            finally (bitcoin-lisp.storage:blockfilterindex-clear-best bfi)))
-    (when (< (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
+            finally (bl.store:blockfilterindex-clear-best bfi)))
+    (when (< (bl.store:blockfilterindex-height bfi) tip)
       (log-info "Building block filter index to height ~D..." tip)
-      (let ((n (bitcoin-lisp.storage:build-blockfilterindex
+      (let ((n (bl.store:build-blockfilterindex
                 bfi cs (node-block-store node)
-                #'bitcoin-lisp.validation:get-undo-data
+                #'bl.val:get-undo-data
                 :progress-callback
                 (lambda (h pct)
                   (log-info "Block filter index: height ~D (~,1F%)" h pct)))))
@@ -2244,15 +2244,15 @@ BEST-HASH sits on (Core walks pprev in Rewind / FindForkInGlobalIndex). NIL
 when the header index does not know BEST-HASH — headers are only persisted at
 flush time, so the crash that produces a stale marker can also lose the branch
 it names — or when the two chains do not actually meet."
-  (let* ((stale (bitcoin-lisp.storage:get-block-index-entry cs best-hash))
-         (tip (and stale (bitcoin-lisp.storage:get-block-index-entry
-                          cs (bitcoin-lisp.storage:best-block-hash cs))))
-         (fork (and tip (bitcoin-lisp.validation:find-fork-point stale tip))))
+  (let* ((stale (bl.store:get-block-index-entry cs best-hash))
+         (tip (and stale (bl.store:get-block-index-entry
+                          cs (bl.store:best-block-hash cs))))
+         (fork (and tip (bl.val:find-fork-point stale tip))))
     ;; find-fork-point returns wherever its first walk stopped if the chains
     ;; never meet (a broken prev-entry link), so confirm the answer really is
     ;; on the active chain rather than trusting a fail-open result.
-    (when (and fork (bitcoin-lisp.storage:entry-on-active-chain-p cs fork))
-      (bitcoin-lisp.storage:block-index-entry-height fork))))
+    (when (and fork (bl.store:entry-on-active-chain-p cs fork))
+      (bl.store:block-index-entry-height fork))))
 
 (defun %coinstatsindex-verified-height (node from)
   "The highest height at or below FROM whose stored record provably belongs to
@@ -2270,15 +2270,15 @@ the restored tip verifies on the first try. NIL if nothing verifies within
           do (when (zerop h)
                ;; Genesis is on every chain; its record is synthesized, not
                ;; folded from a parent, so presence is the whole check.
-               (return (and (bitcoin-lisp.storage:coinstatsindex-get-stats csi 0) 0)))
-             (let* ((entry (bitcoin-lisp.storage:get-block-at-height cs h))
-                    (hash (and entry (bitcoin-lisp.storage:block-index-entry-hash entry)))
-                    (block (and hash (bitcoin-lisp.storage:get-block store hash))))
+               (return (and (bl.store:coinstatsindex-get-stats csi 0) 0)))
+             (let* ((entry (bl.store:get-block-at-height cs h))
+                    (hash (and entry (bl.store:block-index-entry-hash entry)))
+                    (block (and hash (bl.store:get-block store hash))))
                (when (and block
-                          (bitcoin-lisp.storage:coinstatsindex-record-matches-block-p
+                          (bl.store:coinstatsindex-record-matches-block-p
                            csi block hash h
-                           (bitcoin-lisp.validation:get-undo-data hash)
-                           (bitcoin-lisp.validation:calculate-block-subsidy h)))
+                           (bl.val:get-undo-data hash)
+                           (bl.val:calculate-block-subsidy h)))
                  (return h))))))
 
 (defun %rewind-coinstatsindex (node)
@@ -2293,38 +2293,38 @@ performance regression. Otherwise returns the height rewound to, or -1 when no
 trustworthy record could be identified and the index must be rebuilt."
   (let* ((csi (node-coinstatsindex node))
          (cs (node-validated-chainstate node))
-         (tip (bitcoin-lisp.storage:current-height cs)))
+         (tip (bl.store:current-height cs)))
     (multiple-value-bind (best-height best-hash)
-        (bitcoin-lisp.storage:coinstatsindex-best csi)
+        (bl.store:coinstatsindex-best csi)
       (when (minusp best-height)
         (return-from %rewind-coinstatsindex nil))
       (let ((active (and (<= best-height tip)
-                         (bitcoin-lisp.storage:get-block-at-height cs best-height))))
+                         (bl.store:get-block-at-height cs best-height))))
         (when (and active best-hash
-                   (equalp (bitcoin-lisp.storage:block-index-entry-hash active) best-hash))
+                   (equalp (bl.store:block-index-entry-hash active) best-hash))
           (return-from %rewind-coinstatsindex nil)))
       (log-warn "Coinstats index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
                 best-height
-                (if best-hash (bitcoin-lisp.crypto:bytes-to-hex best-hash) "no hash")
+                (if best-hash (bl.crypto:bytes-to-hex best-hash) "no hash")
                 tip)
       (let* ((fork (and best-hash (%coinstatsindex-fork-height cs best-hash)))
              (target (or (and fork
                               (<= fork tip)
-                              (bitcoin-lisp.storage:coinstatsindex-get-stats csi fork)
+                              (bl.store:coinstatsindex-get-stats csi fork)
                               fork)
                          (%coinstatsindex-verified-height node (min best-height tip))))
-             (entry (and target (bitcoin-lisp.storage:get-block-at-height cs target))))
+             (entry (and target (bl.store:get-block-at-height cs target))))
         (cond
           (entry
            (log-warn "Coinstats index rewound to height ~D (~A records above it will be rebuilt)"
                      target (- tip target))
-           (bitcoin-lisp.storage:coinstatsindex-set-best
-            csi target (bitcoin-lisp.storage:block-index-entry-hash entry))
+           (bl.store:coinstatsindex-set-best
+            csi target (bl.store:block-index-entry-hash entry))
            target)
           (t
            (log-warn "Coinstats index: no record below height ~D could be tied to the active chain; rebuilding from genesis"
                      (min best-height tip))
-           (bitcoin-lisp.storage:coinstatsindex-clear-best csi)
+           (bl.store:coinstatsindex-clear-best csi)
            -1))))))
 
 (defun %catch-up-coinstatsindex (node)
@@ -2336,22 +2336,22 @@ not on the active chain (including one left above the tip) before backfilling.
 Shared by startup and the post-promotion index rebind."
   (let* ((csi (node-coinstatsindex node))
          (cs (node-validated-chainstate node))
-         (tip (bitcoin-lisp.storage:current-height cs)))
+         (tip (bl.store:current-height cs)))
     (%rewind-coinstatsindex node)
-    (when (< (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
+    (when (< (bl.store:coinstatsindex-height csi) tip)
       (log-info "Building coinstats index to height ~D..." tip)
-      (let ((n (bitcoin-lisp.storage:build-coinstatsindex
+      (let ((n (bl.store:build-coinstatsindex
                 csi cs (node-block-store node)
-                #'bitcoin-lisp.validation:get-undo-data
-                #'bitcoin-lisp.validation:calculate-block-subsidy
+                #'bl.val:get-undo-data
+                #'bl.val:calculate-block-subsidy
                 :progress-callback
                 (lambda (h pct)
                   (log-info "Coinstats index: height ~D (~,1F%)" h pct)))))
         (log-info "Coinstats index build complete: ~D block~:P indexed" n)
-        (when (< (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
+        (when (< (bl.store:coinstatsindex-height csi) tip)
           (log-warn "Coinstats index stopped at height ~D of ~D (missing block/undo ~
 data below the pruned horizon; the index needs genesis-contiguous history)"
-                    (bitcoin-lisp.storage:coinstatsindex-height csi) tip))))))
+                    (bl.store:coinstatsindex-height csi) tip))))))
 
 (defun restart-indexes-for-validated-chainstate (node)
   "Rebind the block-filter and coinstats indexes onto the node's (now
@@ -2381,25 +2381,25 @@ walk is interrupted."
   (let* ((idx (node-txospenderindex node))
          (cs (node-validated-chainstate node))
          (store (node-block-store node))
-         (tip (bitcoin-lisp.storage:current-height cs))
-         (from (1+ (bitcoin-lisp.storage:txospenderindex-height idx)))
+         (tip (bl.store:current-height cs))
+         (from (1+ (bl.store:txospenderindex-height idx)))
          (done 0))
     (when (> from tip)
       (return-from %catch-up-txospenderindex 0))
     (when (plusp (- tip from))
       (log-info "Spender index: backfilling heights ~D..~D" from tip))
     (loop for h from from to tip
-          for entry = (bitcoin-lisp.storage:get-block-at-height cs h)
+          for entry = (bl.store:get-block-at-height cs h)
           while entry
-          do (when (bitcoin-lisp:interrupt-requested-p)
+          do (when (bl:interrupt-requested-p)
                (log-warn "Spender index backfill stopped at height ~D" h)
                (return))
-             (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
-                    (block (and store (bitcoin-lisp.storage:get-block store hash))))
+             (let* ((hash (bl.store:block-index-entry-hash entry))
+                    (block (and store (bl.store:get-block store hash))))
                (cond
                  (block
-                  (bitcoin-lisp.storage:txospenderindex-add-block idx block hash)
-                  (bitcoin-lisp.storage:txospenderindex-set-best-block idx hash h)
+                  (bl.store:txospenderindex-add-block idx block hash)
+                  (bl.store:txospenderindex-set-best-block idx hash h)
                   (incf done))
                  (t
                   ;; A pruned or missing body cannot be indexed, and skipping it
@@ -2609,11 +2609,11 @@ Called from the sync loop; also runs unconditionally at shutdown."
       (setf *last-peers-dump-time* now)
       (handler-case
           (progn
-            (bitcoin-lisp.networking:save-address-book
+            (bl.net:save-address-book
              (node-address-book node)
-             (bitcoin-lisp.networking:peers-dat-path (node-data-directory node)))
+             (bl.net:peers-dat-path (node-data-directory node)))
             (log-debug "Periodic peers.dat dump (~D entries)"
-                       (bitcoin-lisp.networking:address-book-count
+                       (bl.net:address-book-count
                         (node-address-book node))))
         (error (e)
           (log-warn "Periodic peers.dat dump failed: ~A" e)))
@@ -2630,8 +2630,8 @@ nothing is ever added. That is exactly what happened against a real Core
 testnet4 datadir — 134,923 records read, 134,923 orphaned, 0 linked — and it
 went unnoticed because reindexing a datadir that ALREADY has an index (the only
 case ever exercised) has genesis for a root."
-  (let* ((genesis-hash (bitcoin-lisp.storage:network-genesis-hash network))
-         (genesis-entry (bitcoin-lisp.storage:get-block-index-entry
+  (let* ((genesis-hash (bl.store:network-genesis-hash network))
+         (genesis-entry (bl.store:get-block-index-entry
                          (node-chain-state *node*) genesis-hash))
          (genesis-header (make-genesis-header network)))
     (if genesis-entry
@@ -2639,24 +2639,24 @@ case ever exercised) has genesis for a root."
         ;; persisted header with the wrong merkle root (the old shared-constant
         ;; make-genesis-header gave testnet4 mainnet's merkle root, and header
         ;; indexes saved before the fix still carry it).
-        (let ((h (bitcoin-lisp.storage:block-index-entry-header genesis-entry)))
+        (let ((h (bl.store:block-index-entry-header genesis-entry)))
           (when (or (null h)
-                    (zerop (bitcoin-lisp.serialization:block-header-bits h))
-                    (not (equalp (bitcoin-lisp.serialization:block-header-merkle-root h)
-                                 (bitcoin-lisp.serialization:block-header-merkle-root
+                    (zerop (bl.ser:block-header-bits h))
+                    (not (equalp (bl.ser:block-header-merkle-root h)
+                                 (bl.ser:block-header-merkle-root
                                   genesis-header))))
-            (setf (bitcoin-lisp.storage:block-index-entry-header genesis-entry)
+            (setf (bl.store:block-index-entry-header genesis-entry)
                   genesis-header)
             ;; This REPLACES a header object on an entry that already exists,
             ;; the one mutation the packed change-detector behind the header
             ;; index delta log cannot see (it tracks presence, not identity).
             ;; Force a full snapshot so the corrected genesis actually lands.
-            (bitcoin-lisp.storage:save-header-index
+            (bl.store:save-header-index
              (node-chain-state *node*) :force-full t)))
         ;; Create new genesis entry
-        (bitcoin-lisp.storage:add-block-index-entry
+        (bl.store:add-block-index-entry
          (node-chain-state *node*)
-         (bitcoin-lisp.storage:make-block-index-entry
+         (bl.store:make-block-index-entry
           :hash genesis-hash
           :height 0
           :header genesis-header
@@ -2670,7 +2670,7 @@ case ever exercised) has genesis for a root."
                         (log-level :info)
                         (log-file nil)
                         (log-rate-limit t)
-                        (flat-block-files bitcoin-lisp.storage:*flat-block-files*)
+                        (flat-block-files bl.store:*flat-block-files*)
                         (reindex nil)
                         (console-log t)
                         (max-peers 8)
@@ -2810,7 +2810,7 @@ Returns the node instance."
   ;; Real time, not the mockable clock: uptime must keep measuring real elapsed
   ;; seconds while a functional test drives setmocktime, exactly as Core's
   ;; GetUptime uses SteadyClock rather than GetTime (common/system.cpp:134).
-  (setf *node-start-time* (bitcoin-lisp.serialization:get-real-unix-time))
+  (setf *node-start-time* (bl.ser:get-real-unix-time))
 
   ;; Wire up logging BEFORE init-node so its log-info calls go somewhere.
   ;; Without these, the node runs silently — the May 5 restart had this
@@ -2884,7 +2884,7 @@ Returns the node instance."
   ;; malformed entry signals, as Core raises: a typo'd deployment name that was
   ;; silently ignored would leave the test running against the very height it
   ;; was trying to move.
-  (bitcoin-lisp.validation:apply-test-activation-heights test-activation-heights)
+  (bl.val:apply-test-activation-heights test-activation-heights)
   (when test-activation-heights
     (unless (eq network :regtest)
       (error "-testactivationheight is for regression testing (-regtest mode) only"))
@@ -2898,7 +2898,7 @@ Returns the node instance."
       (error "-mocktime is for regression testing (-regtest mode) only"))
     (unless (and (integerp mocktime) (<= 0 mocktime))
       (error "Invalid -mocktime: ~A. Must be a non-negative integer." mocktime))
-    (setf bitcoin-lisp.serialization:*mock-time*
+    (setf bl.ser:*mock-time*
           (if (zerop mocktime) nil mocktime))
     (log-info "Mock time set to ~D" mocktime))
 
@@ -2913,24 +2913,24 @@ Returns the node instance."
       (error "Invalid dbcache-mib: ~A. Must be an integer >= 4." dbcache-mib)))
   (let* ((total (if dbcache-mib
                     (* dbcache-mib 1024 1024)
-                    bitcoin-lisp.storage::+default-db-cache-bytes+))
-         (sizes (bitcoin-lisp.storage:calculate-cache-sizes
+                    bl.store::+default-db-cache-bytes+))
+         (sizes (bl.store:calculate-cache-sizes
                  total
                  :tx-index txindex
                  ;; The filter and coinstats indexes share one per-index share,
                  ;; as Core divides its filter budget by n_indexes.
                  :filter-index-count (+ (if blockfilterindex 1 0)
                                         (if coinstatsindex 1 0)))))
-    (setf bitcoin-lisp.storage::*cache-sizes* sizes
+    (setf bl.store::*cache-sizes* sizes
           *coins-cache-budget-bytes*
-          (bitcoin-lisp.storage:cache-sizes-coins sizes))
+          (bl.store:cache-sizes-coins sizes))
     (log-info "Cache budget ~D MiB: coins ~D MiB, coins-db ~D MiB, ~
 txindex ~D MiB, per-index ~D MiB"
               (floor total 1048576)
-              (floor (bitcoin-lisp.storage:cache-sizes-coins sizes) 1048576)
-              (floor (bitcoin-lisp.storage:cache-sizes-coins-db sizes) 1048576)
-              (floor (bitcoin-lisp.storage:cache-sizes-tx-index sizes) 1048576)
-              (floor (bitcoin-lisp.storage:cache-sizes-filter-index sizes) 1048576)))
+              (floor (bl.store:cache-sizes-coins sizes) 1048576)
+              (floor (bl.store:cache-sizes-coins-db sizes) 1048576)
+              (floor (bl.store:cache-sizes-tx-index sizes) 1048576)
+              (floor (bl.store:cache-sizes-filter-index sizes) 1048576)))
 
   ;; Validate the pruning configuration BEFORE assigning the global — a
   ;; config-validation error must not leave *prune-target-mib* set (a failed
@@ -2968,8 +2968,8 @@ txindex ~D MiB, per-index ~D MiB"
   ;; the network starts, init.cpp:1806 ResolveErrMsg); the AddLocal itself
   ;; happens after the tor block below, whose clear-local-addresses would
   ;; otherwise wipe it.
-  (dolist (spec bitcoin-lisp.networking:*external-ips*)
-    (unless (bitcoin-lisp.networking:parse-network-address spec)
+  (dolist (spec bl.net:*external-ips*)
+    (unless (bl.net:parse-network-address spec)
       (error "Cannot resolve -externalip address: '~A'" spec)))
 
   ;; Initialize node
@@ -2988,7 +2988,7 @@ txindex ~D MiB, per-index ~D MiB"
   (let ((network-dir (network-data-path
                       (uiop:ensure-directory-pathname data-directory) network)))
   (when migrate-datadir
-    (let ((moves (bitcoin-lisp.storage:migrate-datadir-layout network-dir)))
+    (let ((moves (bl.store:migrate-datadir-layout network-dir)))
       (if moves
           (dolist (m moves)
             (log-info "Migrated ~A: ~A -> ~A" (first m) (second m) (third m)))
@@ -2997,7 +2997,7 @@ txindex ~D MiB, per-index ~D MiB"
   ;; Reported rather than silently tolerated — an operator whose node cannot be
   ;; driven by Core's functional tests should be told WHICH directory is the
   ;; reason, and `-migratedatadir` is the fix.
-  (let ((legacy (bitcoin-lisp.storage:datadir-layout-report network-dir)))
+  (let ((legacy (bl.store:datadir-layout-report network-dir)))
     (when legacy
       (log-warn "Data directory uses the pre-Core layout for: ~{~A~^, ~}. ~
 Core's functional tests address these paths by name. Run with -migratedatadir ~
@@ -3018,7 +3018,7 @@ to move them (the node must be stopped)."
     (unless (eq network :regtest)
       (error "acceptstalefeeestimates is not supported on ~A chain."
              (string-downcase (symbol-name network))))
-    (setf bitcoin-lisp.mempool:*accept-stale-fee-estimates* t))
+    (setf bl.mp:*accept-stale-fee-estimates* t))
   ;; -blocksonly: reject transactions from network peers (Core
   ;; ignore_incoming_txs). Always assigned so a fresh start-node never
   ;; inherits a stale value from a previous run.
@@ -3044,52 +3044,52 @@ to move them (the node must be stopped)."
   ;; connect, and FATAL on failure as Core's is (init.cpp:1587-1600) — a node
   ;; that silently kept /16 bucketing after being told to use an ASN map would
   ;; have exactly the eclipse exposure the operator was closing.
-  (setf bitcoin-lisp.networking::*asmap* nil)
+  (setf bl.net::*asmap* nil)
   (when (and asmap (stringp asmap) (plusp (length asmap))
              (not (string= asmap "0")))
     (let ((path (if (uiop:absolute-pathname-p asmap)
                     asmap
                     (merge-pathnames asmap (uiop:ensure-directory-pathname
                                             (or data-directory "./"))))))
-      (bitcoin-lisp.networking:load-asmap-file path)
+      (bl.net:load-asmap-file path)
       (log-info "Using asmap version ~A for IP bucketing"
-                (bitcoin-lisp.networking:asmap-version))))
+                (bl.net:asmap-version))))
   ;; ⚠️ Core logs BOTH branches (init.cpp:1628,1631) — the /16 case is not a
   ;; silent default there, and feature_asmap.py greps for it to tell a node
   ;; that fell back apart from one that never had a map. We logged only the
   ;; success side, so the interesting case said nothing.
-  (unless bitcoin-lisp.networking::*asmap*
+  (unless bl.net::*asmap*
     (log-info "Using /16 prefix for IP bucketing"))
   ;; -whitelist / -whitebind: permission grants by address range. Applied
   ;; before any peer can connect. A malformed spec is fatal, as Core's is
   ;; (init.cpp fails on the first entry NetWhitelistPermissions::TryParse
   ;; rejects): a typo'd range grants nothing and the operator never finds out.
-  (setf bitcoin-lisp.networking::*whitelist-entries* '()
-        bitcoin-lisp.networking::*whitebind-flags* 0)
+  (setf bl.net::*whitelist-entries* '()
+        bl.net::*whitebind-flags* 0)
   (dolist (spec whitelist)
-    (let ((entry (bitcoin-lisp.networking:parse-whitelist-entry spec)))
+    (let ((entry (bl.net:parse-whitelist-entry spec)))
       (unless entry
         (error "Invalid netmask, IP address or permission in -whitelist: '~A'" spec))
-      (setf bitcoin-lisp.networking::*whitelist-entries*
-            (append bitcoin-lisp.networking::*whitelist-entries* (list entry)))))
+      (setf bl.net::*whitelist-entries*
+            (append bl.net::*whitelist-entries* (list entry)))))
   (dolist (spec whitebind)
     ;; -whitebind is "perms@addr:port": the ADDRESS half is a bind target, not
     ;; a range, and we bind one listener, so only the PERMISSIONS are kept.
     ;; Core refuses "out" here — a listening socket has no outgoing peers.
     (multiple-value-bind (flags direction rest)
-        (bitcoin-lisp.networking:parse-permission-flags spec)
+        (bl.net:parse-permission-flags spec)
       (declare (ignore rest))
       (unless flags
         (error "Invalid permission in -whitebind: '~A'" spec))
       (when (member direction '(:out))
         (error "whitebind may only be used for incoming connections (\"out\" was passed)"))
-      (setf bitcoin-lisp.networking::*whitebind-flags*
-            (logior bitcoin-lisp.networking::*whitebind-flags* flags))))
+      (setf bl.net::*whitebind-flags*
+            (logior bl.net::*whitebind-flags* flags))))
   (when (or whitelist whitebind)
     (log-info "Net permissions configured: ~D -whitelist range(s), -whitebind ~A"
               (length whitelist)
-              (or (bitcoin-lisp.networking:permission-flag-names
-                   bitcoin-lisp.networking::*whitebind-flags*)
+              (or (bl.net:permission-flag-names
+                   bl.net::*whitebind-flags*)
                   "none")))
   (setf *use-addrman-outgoing* t *connect-nodes* '() *seed-nodes* '())
   ;; -seednode: address sources, not peers (Core connOptions.vSeedNodes).
@@ -3141,8 +3141,8 @@ to move them (the node must be stopped)."
   ;; changes it. A literal NIL default here would have pinned every real node to
   ;; the per-block format no matter what the variable said, since this SETF runs
   ;; unconditionally on every start.
-  (setf bitcoin-lisp.storage:*flat-block-files* (and flat-block-files t))
-  (log-info "Bitcoin-Lisp Node v~A" (bitcoin-lisp.serialization:client-version-string))
+  (setf bl.store:*flat-block-files* (and flat-block-files t))
+  (log-info "Bitcoin-Lisp Node v~A" (bl.ser:client-version-string))
   (log-info "Network: ~A" network)
   (log-info "Data directory: ~A" (node-data-directory *node*))
 
@@ -3182,12 +3182,12 @@ to move them (the node must be stopped)."
   ;; detected and appended here (Core LoadAssumeutxoChainstate) — future work.
   (log-info "Loading chain state...")
   (setf (node-chainstates *node*)
-        (list (bitcoin-lisp.storage:init-chain-state (node-data-directory *node*))))
+        (list (bl.store:init-chain-state (node-data-directory *node*))))
 
   ;; Genesis block index entry is ensured after load-header-index below
 
   (setf *pending-chainstate-recovery* nil)
-  (let ((load-result (bitcoin-lisp.storage:load-state (node-chain-state *node*))))
+  (let ((load-result (bl.store:load-state (node-chain-state *node*))))
     (case load-result
       ((:inconsistent)
        ;; A flush was interrupted mid-commit. Don't abort — defer recovery
@@ -3197,7 +3197,7 @@ to move them (the node must be stopped)."
        (push (node-chain-state *node*) *pending-chainstate-recovery*))
       ((t)
        (log-info "Loaded existing chain state: height ~D"
-                 (bitcoin-lisp.storage:current-height (node-chain-state *node*))))
+                 (bl.store:current-height (node-chain-state *node*))))
       ((:corrupt)
        ;; The file exists but no format validated, so we cannot say which tip
        ;; the on-disk UTXO set belongs to. Continuing would silently start from
@@ -3218,11 +3218,11 @@ to move them (the node must be stopped)."
   ;; Initialize block store
   (log-info "Initializing block storage...")
   (setf (node-block-store *node*)
-        (bitcoin-lisp.storage:init-block-store (node-data-directory *node*)))
+        (bl.store:init-block-store (node-data-directory *node*)))
   ;; Genesis is never RECEIVED, so nothing else ever writes its body. Core has
   ;; it on disk from initialisation, which is what makes blk00000.dat start at
   ;; height 0 for every reader that walks the block files from outside the node.
-  (bitcoin-lisp.storage:ensure-genesis-on-disk (node-block-store *node*))
+  (bl.store:ensure-genesis-on-disk (node-block-store *node*))
   ;; -loadblock=<file>, once the store and chain state exist. Deferred to
   ;; %IMPORT-EXTERNAL-BLOCK-FILES below, which runs after validation is ready.
 
@@ -3243,34 +3243,34 @@ to move them (the node must be stopped)."
          ;; same directory as always); a snapshot chainstate would open
          ;; chainstate_snapshot/ through the same path function.
          (chainstate-path (namestring
-                           (bitcoin-lisp.storage:chainstate-leveldb-path primary)))
-         (utxoset-dat (bitcoin-lisp.storage:utxo-set-file-path data-dir))
-         (migrated-p (bitcoin-lisp.storage:leveldb-utxo-migration-complete-p
+                           (bl.store:chainstate-leveldb-path primary)))
+         (utxoset-dat (bl.store:utxo-set-file-path data-dir))
+         (migrated-p (bl.store:leveldb-utxo-migration-complete-p
                       chainstate-path)))
     (when (and (not migrated-p) (probe-file utxoset-dat))
       (log-info "Found legacy utxoset.dat; migrating into LevelDB at ~A ..."
                 chainstate-path)
-      (bitcoin-lisp.storage:migrate-utxoset-dat-to-leveldb
+      (bl.store:migrate-utxoset-dat-to-leveldb
        utxoset-dat chainstate-path)
       (log-info "Migration complete; LevelDB is now the canonical UTXO store"))
-    (let ((view (bitcoin-lisp.storage:open-coins-view-db chainstate-path)))
-      (setf (bitcoin-lisp.storage:chain-state-coins-view primary)
-            (bitcoin-lisp.storage:make-coins-view-cache view))
+    (let ((view (bl.store:open-coins-view-db chainstate-path)))
+      (setf (bl.store:chain-state-coins-view primary)
+            (bl.store:make-coins-view-cache view))
       ;; Adopt the stored pointer so a flush before the first block-level
       ;; mutation re-stamps what is already true rather than leaving the coins
       ;; and the pointer to drift apart.
-      (bitcoin-lisp.storage:coins-view-cache-load-best-block
-       (bitcoin-lisp.storage:chain-state-coins-view primary))
+      (bl.store:coins-view-cache-load-best-block
+       (bl.store:chain-state-coins-view primary))
       (log-info "UTXO cache opened (base: ~A)" chainstate-path)))
 
   ;; Load persisted header index if available.
   (multiple-value-bind (loaded corrupt-reason)
-      (bitcoin-lisp.storage:load-header-index (node-chain-state *node*))
+      (bl.store:load-header-index (node-chain-state *node*))
     (cond
       (loaded
        (log-info "Loaded persisted header index: ~D entries"
                  (hash-table-count
-                  (bitcoin-lisp.storage::chain-state-block-index
+                  (bl.store::chain-state-block-index
                    (node-chain-state *node*)))))
       ;; A file IS there but did not validate. Starting anyway would leave us
       ;; with an EMPTY block index while chainstate.dat still names a tip: the
@@ -3300,12 +3300,12 @@ to move them (the node must be stopped)."
   (when (and reindex (node-block-store *node*))
     (log-info "Reindex: rebuilding the block index from the block files...")
     (multiple-value-bind (added orphans)
-        (bitcoin-lisp.storage:reindex-block-index
+        (bl.store:reindex-block-index
          (node-block-store *node*) (node-chain-state *node*))
       (log-info "Reindex: added ~D block index entries~@[, ~D record~:P had no parent~]"
                 added (and (plusp orphans) orphans))
       (when (plusp added)
-        (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)
+        (bl.store:save-header-index (node-chain-state *node*)
                                                 :force-full t))))
 
   ;; Per-file accounting for the flat block files, recovered by joining the
@@ -3314,7 +3314,7 @@ to move them (the node must be stopped)."
   ;; so neither half knows enough on its own, and without it no flat file can
   ;; ever be shown to lie inside the prunable window.
   (when (node-block-store *node*)
-    (let ((files (bitcoin-lisp.storage:rebuild-block-file-info
+    (let ((files (bl.store:rebuild-block-file-info
                   (node-block-store *node*) (node-chain-state *node*))))
       (when (plusp files)
         (log-info "Block file accounting: ~D flat block file~:P" files))))
@@ -3330,10 +3330,10 @@ to move them (the node must be stopped)."
   ;; before crash-recovery resolution below (a torn snapshot flush joins the
   ;; pending-recovery list).
   (if reindex-chainstate
-      (when (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir
+      (when (bl.store:find-assumeutxo-chainstate-dir
              (node-data-directory *node*))
         (log-info "[snapshot] deleting snapshot chainstate due to reindexing")
-        (bitcoin-lisp.storage:delete-snapshot-chainstate-files
+        (bl.store:delete-snapshot-chainstate-files
          (node-data-directory *node*)))
       (load-snapshot-chainstate *node*))
 
@@ -3375,7 +3375,7 @@ to move them (the node must be stopped)."
     ;; The store and chain state are what enable Core's rev-file undo format:
     ;; a rev record is addressed only by the block index entry that points at
     ;; it, and reading one needs the block to name its coins.
-    (bitcoin-lisp.validation:initialize-undo-storage
+    (bl.val:initialize-undo-storage
      undo-path
      :block-store (node-block-store *node*)
      :chain-state (node-chain-state *node*))
@@ -3390,10 +3390,10 @@ to move them (the node must be stopped)."
   ;; current (snapshot) chainstate's cursor sits above the base while the
   ;; historical chainstate still needs its own undo window far below it.
   (when (pruning-enabled-p)
-    (let ((swept (bitcoin-lisp.validation:prune-stale-undo-files
+    (let ((swept (bl.val:prune-stale-undo-files
                   (node-chain-state *node*)
                   :horizon (reduce #'min (node-chainstates *node*)
-                                   :key #'bitcoin-lisp.storage:chain-state-pruned-height))))
+                                   :key #'bl.store:chain-state-pruned-height))))
       (when (plusp swept)
         (log-info "Pruned ~D stale undo file~:P below the prune horizon" swept))))
 
@@ -3409,21 +3409,21 @@ to move them (the node must be stopped)."
 
   ;; Initialize mempool
   (log-info "Initializing mempool...")
-  (setf (node-mempool *node*) (bitcoin-lisp.mempool:make-mempool))
+  (setf (node-mempool *node*) (bl.mp:make-mempool))
 
   ;; Initialize fee estimator
   (log-info "Initializing fee estimator...")
   (setf (node-fee-estimator *node*)
-        (bitcoin-lisp.mempool:make-fee-estimator
+        (bl.mp:make-fee-estimator
          :data-directory (node-data-directory *node*)))
   ;; Load persisted fee stats
-  (bitcoin-lisp.mempool:load-fee-stats (node-fee-estimator *node*))
+  (bl.mp:load-fee-stats (node-fee-estimator *node*))
 
   ;; Core's CBlockPolicyEstimator, which learns from how long each feerate
   ;; actually waited rather than from a percentile of what miners took. The
   ;; mempool and connect-block report into it through this one binding.
-  (setf bitcoin-lisp.mempool:*block-policy-estimator*
-        (bitcoin-lisp.mempool:make-block-policy-estimator))
+  (setf bl.mp:*block-policy-estimator*
+        (bl.mp:make-block-policy-estimator))
 
   ;; The RPC server comes up HERE — before the mempool replay and the index
   ;; catch-ups below, which is Core's order: AppInitServers (which starts the
@@ -3443,23 +3443,23 @@ to move them (the node must be stopped)."
                       webui-path webui-open))
 
   ;; Reload the persisted mempool through normal acceptance (Core LoadMempool)
-  (bitcoin-lisp.rpc:set-rpc-warmup-status "Replaying mempool...")
+  (bl.rpc:set-rpc-warmup-status "Replaying mempool...")
   (load-mempool-from-disk *node*)
 
   ;; Initialize peer address book
   (log-info "Loading peer address book...")
-  (setf (node-address-book *node*) (bitcoin-lisp.networking:make-address-book))
-  (let ((peers-path (bitcoin-lisp.networking:peers-dat-path (node-data-directory *node*))))
-    (when (bitcoin-lisp.networking:load-address-book (node-address-book *node*) peers-path)
+  (setf (node-address-book *node*) (bl.net:make-address-book))
+  (let ((peers-path (bl.net:peers-dat-path (node-data-directory *node*))))
+    (when (bl.net:load-address-book (node-address-book *node*) peers-path)
       (log-info "Loaded peer address book: ~D entries"
-                (bitcoin-lisp.networking:address-book-count (node-address-book *node*)))))
+                (bl.net:address-book-count (node-address-book *node*)))))
 
   ;; Manual banlist persistence (Core BanMan <datadir>/banlist.json): load
   ;; previous bans (expired entries swept) and point future mutations at the
   ;; file — every setban/clearbanned dumps it immediately, like Core.
-  (setf bitcoin-lisp.networking:*banlist-path*
+  (setf bl.net:*banlist-path*
         (merge-pathnames "banlist.json" (node-data-directory *node*)))
-  (let ((n (bitcoin-lisp.networking:load-banlist)))
+  (let ((n (bl.net:load-banlist)))
     (when (and n (plusp n))
       (log-info "Loaded ~D banned address~:P from banlist.json" n)))
 
@@ -3484,7 +3484,7 @@ to move them (the node must be stopped)."
   (when txindex
     (log-info "Initializing transaction index...")
     (setf (node-tx-index *node*)
-          (bitcoin-lisp.storage:init-tx-index (node-data-directory *node*)
+          (bl.store:init-tx-index (node-data-directory *node*)
                                                :enabled t))
     ;; CATCH UP to the tip. Without this, -txindex indexed only blocks
     ;; connected AFTER startup: BUILD-TX-INDEX existed, was complete, was
@@ -3506,11 +3506,11 @@ to move them (the node must be stopped)."
     ;; chains this can run over are ones we hold in full; a background thread
     ;; is the better shape and is left for the same change that gives the index
     ;; its own catch-up worker.
-    (bitcoin-lisp.rpc:set-rpc-warmup-status "Catching up transaction index...")
+    (bl.rpc:set-rpc-warmup-status "Catching up transaction index...")
     (let ((chainstate (node-current-chainstate *node*))
           (store (node-block-store *node*)))
       (when (and chainstate store)
-        (let ((added (bitcoin-lisp.storage:build-tx-index
+        (let ((added (bl.store:build-tx-index
                       (node-tx-index *node*) chainstate store
                       :progress-callback
                       (lambda (height pct)
@@ -3518,39 +3518,39 @@ to move them (the node must be stopped)."
           (when (plusp added)
             (log-info "Transaction index catch-up added ~D transactions" added)))))
     (log-info "Transaction index loaded: ~D entries"
-              (bitcoin-lisp.storage:txindex-count (node-tx-index *node*))))
+              (bl.store:txindex-count (node-tx-index *node*))))
 
   ;; Prune locks are re-registered from scratch on every start: registration is
   ;; by name, so a re-init replaces rather than accumulates, but an index that
   ;; was enabled last run and is disabled this one would otherwise leave a lock
   ;; behind holding the prune horizon down forever.
-  (bitcoin-lisp.storage:clear-prune-locks)
+  (bl.store:clear-prune-locks)
 
   ;; Initialize BIP158 block filter index (optional)
   (when blockfilterindex
     (log-info "Initializing block filter index...")
     (setf *blockfilterindex-stall-logged* nil)
     (setf (node-blockfilterindex *node*)
-          (bitcoin-lisp.storage:init-blockfilterindex (node-data-directory *node*)
+          (bl.store:init-blockfilterindex (node-data-directory *node*)
                                                        :enabled t))
     (log-info "Block filter index loaded: indexed to height ~D"
-              (bitcoin-lisp.storage:blockfilterindex-height (node-blockfilterindex *node*)))
+              (bl.store:blockfilterindex-height (node-blockfilterindex *node*)))
     ;; The filter index needs each block's undo data to build its filter, so
     ;; pruning must not run ahead of it (Core blockfilterindex AllowPrune() ->
     ;; true, and BaseIndex::SetBestBlockIndex takes a lock at its best height).
     (let ((bfi (node-blockfilterindex *node*)))
-      (bitcoin-lisp.storage:register-prune-lock
+      (bl.store:register-prune-lock
        "blockfilterindex"
        (lambda ()
          ;; -1 is "nothing indexed yet", which is Core's height_first ==
          ;; INT_MAX: no height to protect, so no constraint. Returning it
          ;; verbatim would drive the ceiling to 1 and stop pruning outright.
-         (let ((h (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+         (let ((h (bl.store:blockfilterindex-height bfi)))
            (and (plusp h) h)))))
     ;; One-time catch-up over already-stored blocks, before the sync thread
     ;; starts (single-threaded here, so no writer races). Fresh-from-genesis
     ;; nodes have nothing to do; the connect-time hook then indexes forward.
-    (bitcoin-lisp.rpc:set-rpc-warmup-status "Catching up block filter index...")
+    (bl.rpc:set-rpc-warmup-status "Catching up block filter index...")
     (%catch-up-blockfilterindex *node*))
 
   ;; Initialize coinstatsindex (optional). Like the filter index, catch up over
@@ -3561,34 +3561,34 @@ to move them (the node must be stopped)."
   (when txospenderindex
     (log-info "Initializing spender index...")
     (setf (node-txospenderindex *node*)
-          (bitcoin-lisp.storage:init-txospender-index (node-data-directory *node*)
+          (bl.store:init-txospender-index (node-data-directory *node*)
                                                       :enabled t))
-    (let ((best (bitcoin-lisp.storage:txospenderindex-best-block
+    (let ((best (bl.store:txospenderindex-best-block
                  (node-txospenderindex *node*))))
       (log-info "Spender index loaded: best block ~A"
-                (if best (bitcoin-lisp.crypto:bytes-to-hex best) "none"))))
+                (if best (bl.crypto:bytes-to-hex best) "none"))))
   (when coinstatsindex
     (log-info "Initializing coinstats index...")
     (setf (node-coinstatsindex *node*)
-          (bitcoin-lisp.storage:init-coinstatsindex (node-data-directory *node*)
+          (bl.store:init-coinstatsindex (node-data-directory *node*)
                                                     :enabled t))
     (log-info "Coinstats index loaded: indexed to height ~D"
-              (bitcoin-lisp.storage:coinstatsindex-height (node-coinstatsindex *node*)))
+              (bl.store:coinstatsindex-height (node-coinstatsindex *node*)))
     ;; Same reasoning as the filter index (Core coinstatsindex AllowPrune() ->
     ;; true): its per-block statistics are derived from undo data.
     (let ((csi (node-coinstatsindex *node*)))
-      (bitcoin-lisp.storage:register-prune-lock
+      (bl.store:register-prune-lock
        "coinstatsindex"
        (lambda ()
-         (let ((h (bitcoin-lisp.storage:coinstatsindex-height csi)))
+         (let ((h (bl.store:coinstatsindex-height csi)))
            (and (plusp h) h)))))
     ;; A chainstate reindex may have changed UTXO-set contents (e.g. dropping
     ;; unspendable outputs), so the coinstats records must be rebuilt to stay
     ;; consistent. Clear the best marker to force a full rebuild below.
     (when reindex-chainstate
-      (bitcoin-lisp.storage:coinstatsindex-clear-best (node-coinstatsindex *node*))
+      (bl.store:coinstatsindex-clear-best (node-coinstatsindex *node*))
       (log-info "Coinstats index: rebuilding after chainstate reindex"))
-    (bitcoin-lisp.rpc:set-rpc-warmup-status "Catching up coinstats index...")
+    (bl.rpc:set-rpc-warmup-status "Catching up coinstats index...")
     (%catch-up-coinstatsindex *node*))
 
   ;; -forcecompactdb: once every LevelDB is open (and any reindex/backfill has
@@ -3600,27 +3600,27 @@ to move them (the node must be stopped)."
 
   ;; BIP157 filter serving (-peerblockfilters): gated above on the block filter
   ;; index being enabled; advertised as NODE_COMPACT_FILTERS in our version.
-  (setf bitcoin-lisp:*peer-block-filters* (and peer-block-filters t))
+  (setf bl:*peer-block-filters* (and peer-block-filters t))
   (when peer-block-filters
     (log-info "BIP157 compact filter serving enabled (NODE_COMPACT_FILTERS)"))
 
   ;; BIP330 Erlay handshake (-txreconciliation; Core DEBUG_ONLY, default off).
   ;; Negotiates sendtxrcncl + per-peer salt storage only — no sketch exchange
   ;; exists at Core ref d3056bc either.
-  (setf bitcoin-lisp:*tx-reconciliation* (and tx-reconciliation t))
+  (setf bl:*tx-reconciliation* (and tx-reconciliation t))
   (when tx-reconciliation
     (log-info "BIP330 transaction reconciliation handshake enabled (sendtxrcncl)"))
 
   ;; BIP324 v2 transport opt-in. Effective only if libsecp256k1 has the
   ;; ellswift module (probed lazily per connection via v2-available-p).
-  (setf bitcoin-lisp.networking:*v2-transport-enabled* (and v2transport t))
+  (setf bl.net:*v2-transport-enabled* (and v2transport t))
   (when v2transport
     (log-info "BIP324 v2 transport enabled (~:[ellswift NOT available -- will run v1 only~;active~])"
-              (bitcoin-lisp.networking:v2-available-p)))
+              (bl.net:v2-available-p)))
 
   ;; Initialize secp256k1
   (log-info "Initializing cryptographic context...")
-  (bitcoin-lisp.crypto:ensure-secp256k1-loaded)
+  (bl.crypto:ensure-secp256k1-loaded)
 
   ;; Wallet support (wallet P1). Default: enabled everywhere except mainnet,
   ;; where holding keys on an internet-facing node is the operator's explicit
@@ -3630,7 +3630,7 @@ to move them (the node must be stopped)."
                             (not (eq network :mainnet)))))
     (when wallet-enabled
       (setf (node-wallet-manager *node*)
-            (bitcoin-lisp.rpc:init-wallet-manager (node-data-directory *node*)
+            (bl.rpc:init-wallet-manager (node-data-directory *node*)
                                                   network))
       (log-info "Wallet support enabled (descriptor wallets under ~A)"
                 (merge-pathnames "wallets/" (node-data-directory *node*)))
@@ -3639,13 +3639,13 @@ to move them (the node must be stopped)."
       ;; and the mempool (load-mempool-from-disk) are both up, so each wallet
       ;; can catch up from its locator and fold in the mempool; networking has
       ;; not started, so no block can connect underneath the catch-up.
-      (bitcoin-lisp.rpc:load-wallets-on-startup *node* wallet-names)))
+      (bl.rpc:load-wallets-on-startup *node* wallet-names)))
 
   (setf (node-running *node*) t)
 
   ;; The RPC server is UP by now (see %start-rpc-early above); the node is
   ;; ready, so stop answering -28.
-  (bitcoin-lisp.rpc:finish-rpc-warmup)
+  (bl.rpc:finish-rpc-warmup)
   (when rpc-port
     (log-info "RPC server ready"))
 
@@ -3657,20 +3657,20 @@ to move them (the node must be stopped)."
   ;; Reconnects and retries when peers are lost, similar to Bitcoin Core's
   ;; CheckForStaleTipAndEvictPeers (net_processing.cpp:5460)
   (when sync
-    (bitcoin-lisp.networking:reset-ibd-stop)
-    (bitcoin-lisp.networking:reset-tx-requests)
-    (bitcoin-lisp.networking:reset-initial-broadcast-schedule)
+    (bl.net:reset-ibd-stop)
+    (bl.net:reset-tx-requests)
+    (bl.net:reset-initial-broadcast-schedule)
     ;; Fresh recent-confirmed filter (Core builds it per process; covers
     ;; in-image restarts).
-    (bitcoin-lisp.validation:reset-recent-confirmed)
+    (bl.val:reset-recent-confirmed)
     ;; Seed the durable at-tip liveness signal (item #6) so a freshly-started,
     ;; already-at-tip node reports healthy on /rest/health before its first new
     ;; block. last-tip-height starts at the current tip so only genuine advances
     ;; bump the timestamp.
     (let ((cs (node-current-chainstate *node*)))
-      (setf (node-last-tip-advance-time *node*) (bitcoin-lisp.serialization:get-node-time)
+      (setf (node-last-tip-advance-time *node*) (bl.ser:get-node-time)
             (node-last-tip-height *node*)
-            (if cs (bitcoin-lisp.storage:current-height cs) 0)))
+            (if cs (bl.store:current-height cs) 0)))
     (setf (node-sync-thread *node*)
           (bt:make-thread
            (lambda ()
@@ -3764,7 +3764,7 @@ to move them (the node must be stopped)."
                                         ;; every peer (non-blocking) — the
                                         ;; periodic half of Core's
                                         ;; SocketSendData.
-                                        (bitcoin-lisp.networking:flush-peer-send-buffers
+                                        (bl.net:flush-peer-send-buffers
                                          (node-peers *node*))
                                         ;; Steady-state receive pump: drain
                                         ;; every peer's readable messages
@@ -3778,10 +3778,10 @@ to move them (the node must be stopped)."
                                         ;; announcement ends the wait so the
                                         ;; block is fetched immediately.
                                         (let* ((cs (node-current-chainstate *node*))
-                                               (pump (bitcoin-lisp.networking:pump-peer-messages
+                                               (pump (bl.net:pump-peer-messages
                                                       (node-peers *node*)
                                                       cs
-                                                      (bitcoin-lisp.storage:chain-state-coins-view cs)
+                                                      (bl.store:chain-state-coins-view cs)
                                                       (node-block-store *node*)
                                                       :mempool (node-mempool *node*)
                                                       :address-book (node-address-book *node*)
@@ -3793,14 +3793,14 @@ to move them (the node must be stopped)."
                                           ;; expired (60s) to another
                                           ;; announcer (Core GetRequestsToSend
                                           ;; runs per SendMessages pass).
-                                          (bitcoin-lisp.networking:process-tx-requests)
-                                          (bitcoin-lisp.networking:retry-timed-out-tx-requests)
+                                          (bl.net:process-tx-requests)
+                                          (bl.net:retry-timed-out-tx-requests)
                                           ;; Trickled tx announcements: drain
                                           ;; due per-peer inv queues each
                                           ;; second (Poisson schedules inside;
                                           ;; Core SendMessages runs its
                                           ;; equivalent on every message pump).
-                                          (bitcoin-lisp.networking:flush-tx-announcements
+                                          (bl.net:flush-tx-announcements
                                            (node-peers *node*)
                                            (node-mempool *node*))
                                           ;; Locally-submitted txs still in the
@@ -3808,7 +3808,7 @@ to move them (the node must be stopped)."
                                           ;; every 10-15 min until a peer's
                                           ;; getdata confirms propagation (Core
                                           ;; ReattemptInitialBroadcast).
-                                          (bitcoin-lisp.networking:maybe-reattempt-initial-broadcast
+                                          (bl.net:maybe-reattempt-initial-broadcast
                                            (node-peers *node*)
                                            (node-mempool *node*))
                                           ;; Wallet rebroadcast timer (Core
@@ -3820,14 +3820,14 @@ to move them (the node must be stopped)."
                                           ;; takes node-lock -> wallet-lock
                                           ;; per tx, so it must run OUTSIDE
                                           ;; any node-lock hold (wallet P4).
-                                          (bitcoin-lisp.rpc:wallets-maybe-resend *node*)
+                                          (bl.rpc:wallets-maybe-resend *node*)
                                           ;; Local-address self-advertisement
                                           ;; (our onion address, once torcontrol
                                           ;; registers it): per-peer ~24h Poisson
                                           ;; schedule inside, no-op while the
                                           ;; local-address map is empty or in
                                           ;; IBD (Core MaybeSendAddr).
-                                          (bitcoin-lisp.networking:maybe-advertise-local-address
+                                          (bl.net:maybe-advertise-local-address
                                            (node-peers *node*)
                                            (node-chain-state *node*))
                                           ;; BIP133 feefilter refresh (Core
@@ -3839,11 +3839,11 @@ to move them (the node must be stopped)."
                                           ;; its RNG use is safe.
                                           (let ((cs (node-chain-state *node*))
                                                 (mp (node-mempool *node*))
-                                                (now (bitcoin-lisp.serialization:get-unix-time)))
+                                                (now (bl.ser:get-unix-time)))
                                             (dolist (p (node-peers *node*))
-                                              (when (eq (bitcoin-lisp.networking:peer-state p) :ready)
+                                              (when (eq (bl.net:peer-state p) :ready)
                                                 (ignore-errors
-                                                 (bitcoin-lisp.networking:maybe-send-feefilter
+                                                 (bl.net:maybe-send-feefilter
                                                   p mp cs now))
                                                 ;; BIP-330: open a reconciliation
                                                 ;; round with one peer at a time.
@@ -3851,7 +3851,7 @@ to move them (the node must be stopped)."
                                                 ;; is set and the peer completed
                                                 ;; the handshake.
                                                 (ignore-errors
-                                                 (bitcoin-lisp.networking:maybe-start-reconciliation
+                                                 (bl.net:maybe-start-reconciliation
                                                   p now)))))
                                           ;; New headers announced: start the
                                           ;; next sync cycle now to fetch the
@@ -3860,7 +3860,7 @@ to move them (the node must be stopped)."
                                           ;; Record a tip advance observed this
                                           ;; second (item #6 durable liveness).
                                           (note-node-tip-progress *node*)
-                                          (when (plusp (bitcoin-lisp.networking:ibd-context-headers-received pump))
+                                          (when (plusp (bl.net:ibd-context-headers-received pump))
                                             (return))
                                           ;; BEHIND: we hold headers above our
                                           ;; own tip, so there is known work.
@@ -3888,8 +3888,8 @@ to move them (the node must be stopped)."
                                           ;; it is what the download loop's own
                                           ;; no-progress yield exists for.
                                           (when (and (>= second +behind-retry-seconds+)
-                                                     (> bitcoin-lisp.networking:*highest-header-seen*
-                                                        (bitcoin-lisp.storage:current-height cs)))
+                                                     (> bl.net:*highest-header-seen*
+                                                        (bl.store:current-height cs)))
                                             (return)))))
                               (t
                                ;; No peers. Before waiting for one, connect
@@ -3908,10 +3908,10 @@ to move them (the node must be stopped)."
                                ;; candidate, which is the steady state.
                                (let ((switched
                                        (ignore-errors
-                                        (bitcoin-lisp.validation:activate-best-chain
+                                        (bl.val:activate-best-chain
                                          (node-current-chainstate *node*)
                                          (node-block-store *node*)
-                                         (bitcoin-lisp.storage:chain-state-coins-view
+                                         (bl.store:chain-state-coins-view
                                           (node-current-chainstate *node*))
                                          :tx-index (node-tx-index *node*)
                                          :fee-estimator (node-fee-estimator *node*)
@@ -3969,10 +3969,10 @@ to move them (the node must be stopped)."
   ;; onion listener whenever it listens, even with -listenonion=0 — we only
   ;; bind it when the service can actually exist.
   (when (and sync listen listen-onion)
-    (bitcoin-lisp.networking:clear-local-addresses)
+    (bl.net:clear-local-addresses)
     (start-onion-listener *node*)
     (setf (node-tor-controller *node*)
-          (bitcoin-lisp.networking:start-tor-control
+          (bl.net:start-tor-control
            :control-spec tor-control
            :password tor-password
            :data-directory (node-data-directory *node*)
@@ -3983,13 +3983,13 @@ to move them (the node must be stopped)."
   ;; init.cpp:1803-1808: AddLocal(addr, LOCAL_MANUAL) at the listen port).
   ;; Validated resolvable above; runs after the tor block so its
   ;; clear-local-addresses cannot wipe these entries.
-  (dolist (spec bitcoin-lisp.networking:*external-ips*)
+  (dolist (spec bl.net:*external-ips*)
     (multiple-value-bind (net bytes)
-        (bitcoin-lisp.networking:parse-network-address spec)
+        (bl.net:parse-network-address spec)
       (when net
-        (bitcoin-lisp.networking:add-local
+        (bl.net:add-local
          net bytes (listen-port network)
-         bitcoin-lisp.networking:+local-manual+))))
+         bl.net:+local-manual+))))
 
   ;; -loadblock=<file>: import external block files before declaring the node
   ;; up, as Core does (ImportBlocks runs on the init thread and the RPC waits
@@ -4025,17 +4025,17 @@ blocks, it does not trust them."
          (log-info "Importing blocks file ~A..." (namestring file))
          (let ((loaded 0) (accepted 0))
            (handler-case
-               (bitcoin-lisp.storage:map-external-block-file
+               (bl.store:map-external-block-file
                 file
                 (lambda (bytes)
                   (incf loaded)
                   (let ((block (handler-case
-                                   (bitcoin-lisp.serialization:br-read-bitcoin-block
-                                    (bitcoin-lisp.serialization:make-byte-reader-from bytes))
+                                   (bl.ser:br-read-bitcoin-block
+                                    (bl.ser:make-byte-reader-from bytes))
                                  (error () nil))))
                     (when block
                       (multiple-value-bind (ok reason)
-                          (bitcoin-lisp.rpc::%activate-submitted-block node block)
+                          (bl.rpc::%activate-submitted-block node block)
                         (declare (ignore reason))
                         (when ok (incf accepted)))))))
              (error (e)
@@ -4059,7 +4059,7 @@ fine; that is the default path, and creating THAT is the intended behaviour."
                                 datadir
                                 (concatenate 'string datadir "/")))))
         (unless (probe-file path)
-          (error 'bitcoin-lisp::config-parse-error
+          (error 'bl::config-parse-error
                  :message (format nil "specified data directory \"~A\" does not exist"
                                   datadir)))))))
 
@@ -4083,16 +4083,16 @@ Core's rules, all of which apply here:
   (when (null conf-text)
     (return-from %read-config-includes nil))
   (let ((cli-include (assoc "includeconf" cli :test #'string=)))
-    (when (and cli-include (not (bitcoin-lisp::conf-parse-bool (cdr cli-include))))
+    (when (and cli-include (not (bl::conf-parse-bool (cdr cli-include))))
       ;; -noincludeconf
       (return-from %read-config-includes (list conf-text)))
-    (when (and cli-include (bitcoin-lisp::conf-parse-bool (cdr cli-include)))
-      (error 'bitcoin-lisp::config-parse-error
+    (when (and cli-include (bl::conf-parse-bool (cdr cli-include)))
+      (error 'bl::config-parse-error
              :message "-includeconf cannot be used from the command line; put it ~
                        in the configuration file")))
-  (let* ((network (bitcoin-lisp::resolve-network-from-config
-                   (append cli (bitcoin-lisp::conf-global-entries conf-text))))
-         (entries (bitcoin-lisp::parse-bitcoin-conf conf-text network))
+  (let* ((network (bl::resolve-network-from-config
+                   (append cli (bl::conf-global-entries conf-text))))
+         (entries (bl::parse-bitcoin-conf conf-text network))
          (names (loop for (k . v) in entries
                       when (and (string= k "includeconf") (plusp (length v)))
                         collect v))
@@ -4104,13 +4104,13 @@ Core's rules, all of which apply here:
     (dolist (name names)
       (let ((path (merge-pathnames name base)))
         (unless (probe-file path)
-          (error 'bitcoin-lisp::config-parse-error
+          (error 'bl::config-parse-error
                  :message (format nil "Failed to include configuration file ~A" name)))
         (let ((text (alexandria:read-file-into-string path)))
           ;; A recursive include is dropped with a warning, exactly as Core
           ;; does (it re-scans for includeconf after reading and prints
           ;; "-includeconf cannot be used from included files").
-          (dolist (inner (bitcoin-lisp::parse-bitcoin-conf text nil))
+          (dolist (inner (bl::parse-bitcoin-conf text nil))
             (when (string= (car inner) "includeconf")
               (log-warn "-includeconf cannot be used from included files; ~
                          ignoring -includeconf=~A" (cdr inner))))
@@ -4198,16 +4198,16 @@ the file ignored would run the node on settings the operator cannot see in it."
   (unless (probe-file path)
     (return-from %read-settings-file nil))
   (multiple-value-bind (alist errors)
-      (bitcoin-lisp:parse-settings-json
+      (bl:parse-settings-json
        (handler-case (alexandria:read-file-into-string path)
          (error (e)
            (error "Settings file could not be read: ~A. Please check permissions." e)))
        (namestring path))
     (when errors
       (error "Settings file could not be read: ~{~A~^; ~}" errors))
-    (let ((invalid (bitcoin-lisp:validate-settings-values alist)))
+    (let ((invalid (bl:validate-settings-values alist)))
       (when invalid (error "~A" invalid)))
-    (dolist (name (bitcoin-lisp:unknown-settings-keys alist))
+    (dolist (name (bl:unknown-settings-keys alist))
       (defer-log :warn "Ignoring unknown rw_settings value ~A" name))
     alist))
 
@@ -4229,10 +4229,10 @@ so the two compose rather than clobbering each other."
         (ensure-directories-exist path)
         (with-open-file (out tmp :direction :output :external-format :utf-8
                                  :if-exists :supersede :if-does-not-exist :create)
-          (write-string (bitcoin-lisp:render-settings-json alist) out))
-        (bitcoin-lisp.storage::fsync-file tmp)
+          (write-string (bl:render-settings-json alist) out))
+        (bl.store::fsync-file tmp)
         (rename-file tmp path)
-        (bitcoin-lisp.storage::fsync-directory path))
+        (bl.store::fsync-directory path))
     (error (e)
       (error "Settings file could not be written: ~A" e))))
 
@@ -4244,15 +4244,15 @@ Only KNOWN options are logged for the config file and the command line — Core
 skips anything GetArgFlags does not recognise (args.cpp:880-884) — while EVERY
 settings-file entry is logged, known or not."
   (dolist (text conf-texts)
-    (dolist (cell (bitcoin-lisp::%config-arg-log-cells text network))
+    (dolist (cell (bl::%config-arg-log-cells text network))
       (destructuring-bind (section name json) cell
         (when (known-config-option-p name)
           (defer-log :info "Config file arg: ~:[~;[~:*~A] ~]~A=~A"
                      (and (plusp (length section)) section) name json)))))
   (dolist (cell settings-cells)
     (defer-log :info "Setting file arg: ~A = ~A"
-               (car cell) (bitcoin-lisp:render-json-value (cdr cell))))
-  (dolist (cell (bitcoin-lisp::%cli-arg-log-cells args))
+               (car cell) (bl:render-json-value (cdr cell))))
+  (dolist (cell (bl::%cli-arg-log-cells args))
     (when (known-config-option-p (car cell))
       (defer-log :info "Command-line arg: ~A=~A" (car cell) (cdr cell)))))
 
@@ -4316,7 +4316,7 @@ file location."
          (settings-cells (and settings-path (%read-settings-file settings-path))))
     (multiple-value-bind (plist merged)
         (args->start-node-plist args conf-texts
-                                (bitcoin-lisp:settings-alist->config-alist
+                                (bl:settings-alist->config-alist
                                  settings-cells))
       ;; Unknown CONFIG-FILE keys only warn (Core ReadConfigFiles with
       ;; ignore_invalid_keys=true, common/init.cpp:38: "Ignoring unknown
@@ -4407,7 +4407,7 @@ Core's behaviour and what assert_start_raises_init_error reads."
           ;; as they do in Core (init.cpp's HelpRequested/-version branch).
           ((%argv-asks-for args '("version"))
            (format t "bitcoin-lisp version ~A~%"
-                   (bitcoin-lisp.serialization:client-version-string))
+                   (bl.ser:client-version-string))
            (finish-output)
            (sb-ext:exit :code 0))
           ((%argv-asks-for args '("help" "h" "?"))
@@ -4417,7 +4417,7 @@ Runs a Bitcoin full node. Options follow Bitcoin Core's spelling ~
 (-datadir, -regtest, -rpcport, ...); see docs/ for what is implemented, and ~
 note that options this node accepts but does not implement are reported at ~
 startup.~%"
-                   (bitcoin-lisp.serialization:client-version-string))
+                   (bl.ser:client-version-string))
            (finish-output)
            (sb-ext:exit :code 0))
           (t
@@ -4502,22 +4502,22 @@ this immediately after either is safe; anywhere else would persist a cache and
 a pointer that disagree."
   (when *node*
     (let ((view (and chainstate
-                     (bitcoin-lisp.storage:chain-state-coins-view chainstate))))
+                     (bl.store:chain-state-coins-view chainstate))))
       (when (and view
-                 (>= (bitcoin-lisp.storage:view-mem-bytes view)
+                 (>= (bl.store:view-mem-bytes view)
                      (chainstate-coins-cache-budget chainstate)))
         (log-info "Coins cache past its budget mid-reorg; flushing")
         (log-memory-snapshot "pre-flush-critical")
         (%flush-chainstate chainstate)
         (setf *blocks-since-flush* 0
-              *last-flush-universal-time* (bitcoin-lisp.serialization:get-node-time))
+              *last-flush-universal-time* (bl.ser:get-node-time))
         t))))
 
 (defun chainstate-coins-cache-budget (chainstate)
   "CHAINSTATE's coins-cache budget in bytes: its per-chainstate allocation
 when maybe-rebalance-caches has split the global budget (assumeutxo dual
 chainstates), otherwise the whole *coins-cache-budget-bytes*."
-  (or (bitcoin-lisp.storage:chain-state-coins-cache-bytes chainstate)
+  (or (bl.store:chain-state-coins-cache-bytes chainstate)
       *coins-cache-budget-bytes*))
 
 (defun maybe-rebalance-caches (node)
@@ -4541,19 +4541,19 @@ check rather than through an immediate resize/eviction."
     (cond
       ((null historical)
        (when (and current
-                  (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash current))
+                  (bl.store:chain-state-from-snapshot-blockhash current))
          (log-info "[snapshot] allocating all cache to the snapshot chainstate"))
        (when current
-         (setf (bitcoin-lisp.storage:chain-state-coins-cache-bytes current) nil)))
+         (setf (bl.store:chain-state-coins-cache-bytes current) nil)))
       (t
        (let ((total *coins-cache-budget-bytes*))
          (multiple-value-bind (current-share historical-share)
-             (if (bitcoin-lisp.networking:initial-block-download-p current)
+             (if (bl.net:initial-block-download-p current)
                  (values 0.95d0 0.05d0)
                  (values 0.05d0 0.95d0))
-           (setf (bitcoin-lisp.storage:chain-state-coins-cache-bytes current)
+           (setf (bl.store:chain-state-coins-cache-bytes current)
                  (floor (* total current-share))
-                 (bitcoin-lisp.storage:chain-state-coins-cache-bytes historical)
+                 (bl.store:chain-state-coins-cache-bytes historical)
                  (floor (* total historical-share)))
            (log-info "[snapshot] coins-cache budgets rebalanced: current chainstate ~D MiB, historical chainstate ~D MiB"
                      (floor (chainstate-coins-cache-budget current) 1048576)
@@ -4563,7 +4563,7 @@ check rather than through an immediate resize/eviction."
   "Rebalance the coins-cache allocation when the node leaves initial block
 download while a background (historical) chainstate is in use (Core
 ActivateBestChain's exited_ibd hook, validation.cpp:3479-3486). Called from
-the IBD latch flip in bitcoin-lisp.networking:initial-block-download-p."
+the IBD latch flip in bl.net:initial-block-download-p."
   (let ((node *node*))
     (when (and node (node-historical-chainstate node))
       (maybe-rebalance-caches node))))
@@ -4600,34 +4600,34 @@ state (UTXO 600MB + headers 30MB + sig-cache 5MB + queues 80MB) only
 accounts for ~700 MB. This logger surfaces the gap."
   #+sbcl
   (let* ((utxo-count (and (node-utxo-set *node*)
-                          (bitcoin-lisp.storage:utxo-count
+                          (bl.store:utxo-count
                            (node-utxo-set *node*))))
          (coins-cache-mb (and (node-utxo-set *node*)
-                              (/ (bitcoin-lisp.storage:view-mem-bytes
+                              (/ (bl.store:view-mem-bytes
                                   (node-utxo-set *node*))
                                  1048576.0)))
          (header-count (and (node-chain-state *node*)
                             (hash-table-count
-                             (bitcoin-lisp.storage::chain-state-block-index
+                             (bl.store::chain-state-block-index
                               (node-chain-state *node*)))))
          (sig-cache-count
-           (+ (hash-table-count bitcoin-lisp.coalton.interop:*signature-cache*)
-              (hash-table-count bitcoin-lisp.coalton.interop:*signature-cache-prev*)))
+           (+ (hash-table-count bl.interop:*signature-cache*)
+              (hash-table-count bl.interop:*signature-cache-prev*)))
          (ibd-pending
-           (and bitcoin-lisp.networking::*ibd-context*
+           (and bl.net::*ibd-context*
                 (hash-table-count
-                 (bitcoin-lisp.networking::ibd-context-pending-blocks
-                  bitcoin-lisp.networking::*ibd-context*))))
+                 (bl.net::ibd-context-pending-blocks
+                  bl.net::*ibd-context*))))
          (ibd-queue
-           (and bitcoin-lisp.networking::*ibd-context*
+           (and bl.net::*ibd-context*
                 (hash-table-count
-                 (bitcoin-lisp.networking::ibd-context-block-queue
-                  bitcoin-lisp.networking::*ibd-context*))))
+                 (bl.net::ibd-context-block-queue
+                  bl.net::*ibd-context*))))
          (ibd-in-flight
-           (and bitcoin-lisp.networking::*ibd-context*
+           (and bl.net::*ibd-context*
                 (hash-table-count
-                 (bitcoin-lisp.networking::ibd-context-in-flight
-                  bitcoin-lisp.networking::*ibd-context*))))
+                 (bl.net::ibd-context-in-flight
+                  bl.net::*ibd-context*))))
          (dyn-bytes (sb-ext:dynamic-space-size))
          (used-bytes (sb-kernel:dynamic-usage)))
     (log-info "MEM[~A]: utxo=~D coins-cache=~,1FMB headers=~D sigcache=~D ibd-pend=~A queue=~A inflight=~A heap-used=~,1FMB heap-cap=~,1FMB"
@@ -4678,12 +4678,12 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
        #-sbcl progn
         ;; Phase 1: mark the chainstate as in-transition.
         (when chainstate
-          (bitcoin-lisp.storage:save-state chainstate :in-transition t)
+          (bl.store:save-state chainstate :in-transition t)
           ;; A shutdown writes the FULL header index rather than a delta: it
           ;; is the one moment we can guarantee the on-disk snapshot matches
           ;; memory exactly, which bounds any drift the packed change-detector
           ;; could not see (a replaced header object on an existing entry).
-          (bitcoin-lisp.storage:save-header-index
+          (bl.store:save-header-index
            chainstate :force-full force-full-header-index))
         (when *flush-mid-commit-hook*
           (funcall *flush-mid-commit-hook* chainstate))
@@ -4692,8 +4692,8 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
         ;; the full ~17M-entry set — replaces the ~13s utxoset.dat
         ;; rewrite that previously froze the sync thread.
         (let ((view (and chainstate
-                         (bitcoin-lisp.storage:chain-state-coins-view chainstate))))
-          (when (typep view 'bitcoin-lisp.storage:coins-view-cache)
+                         (bl.store:chain-state-coins-view chainstate))))
+          (when (typep view 'bl.store:coins-view-cache)
             ;; :sync t fdatasyncs the LevelDB writebatch before we proceed, so a
             ;; power loss after Phase 3 clears the marker cannot leave the coins
             ;; un-durable while chainstate.dat says they are committed. (Was
@@ -4707,18 +4707,18 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
             ;; rewound away from, and stamping it would record a hash the coins
             ;; no longer match. chainstate.dat (Phase 3 below) remains a second
             ;; record of the tip; startup compares the two.
-            (bitcoin-lisp.storage:coins-view-cache-flush view :sync t)))
+            (bl.store:coins-view-cache-flush view :sync t)))
         ;; Phase 3: commit by re-saving chainstate without the marker.
         (when chainstate
-          (bitcoin-lisp.storage:save-state chainstate :in-transition nil))
+          (bl.store:save-state chainstate :in-transition nil))
         (log-info "~A flush: chainstate~@[~A~] at height ~D"
                   label
                   (let ((suffix (and chainstate
-                                     (bitcoin-lisp.storage:chain-state-storage-suffix
+                                     (bl.store:chain-state-storage-suffix
                                       chainstate))))
                     (and suffix (plusp (length suffix)) suffix))
                   (and chainstate
-                       (bitcoin-lisp.storage:current-height chainstate))))
+                       (bl.store:current-height chainstate))))
     (error (c)
       ;; Was log-warn before — surfaced silently. Bumped to log-error so
       ;; persistence failures are obvious in the log instead of getting
@@ -4743,7 +4743,7 @@ time we measure (the same pattern as Bitcoin Core's CCoinsViewCache::Flush
 returning bytes freed to the system allocator), and log memory snapshots."
   (log-memory-snapshot "pre-flush")
   (%flush-chainstate chainstate)
-  (setf *last-flush-universal-time* (bitcoin-lisp.serialization:get-node-time)
+  (setf *last-flush-universal-time* (bl.ser:get-node-time)
         *blocks-since-flush* 0)
   #+sbcl (sb-ext:gc :full t)
   (log-memory-snapshot "post-flush"))
@@ -4766,19 +4766,19 @@ cheap (work is proportional to dirty entries). Cheap if no flush needed;
 durable if it does flush (atomic temp+fsync+rename inside save-*)."
   (unless *node* (return-from maybe-periodic-flush))
   (let* ((cs (or chainstate (node-current-chainstate *node*)))
-         (view (and cs (bitcoin-lisp.storage:chain-state-coins-view cs))))
+         (view (and cs (bl.store:chain-state-coins-view cs))))
     (incf *blocks-since-flush*)
     (when (zerop *last-flush-universal-time*)
-      (setf *last-flush-universal-time* (bitcoin-lisp.serialization:get-node-time)))
+      (setf *last-flush-universal-time* (bl.ser:get-node-time)))
     (when (or (>= *blocks-since-flush* +flush-every-n-blocks+)
-              (>= (- (bitcoin-lisp.serialization:get-node-time) *last-flush-universal-time*)
+              (>= (- (bl.ser:get-node-time) *last-flush-universal-time*)
                   +flush-every-n-seconds+)
               ;; Size trigger (Bitcoin Core dbcache): flush once the coins cache
               ;; reaches its memory budget, so it can't grow unbounded between the
               ;; block-count / time flushes. The budget is per-chainstate while an
               ;; assumeutxo background sync splits it (maybe-rebalance-caches).
               (and view
-                   (>= (bitcoin-lisp.storage:view-mem-bytes view)
+                   (>= (bl.store:view-mem-bytes view)
                        (large-coins-cache-threshold
                         (chainstate-coins-cache-budget cs)))))
       ;; Triggering chainstate first (its cache may be the urgent one),
@@ -4791,7 +4791,7 @@ durable if it does flush (atomic temp+fsync+rename inside save-*)."
       (dolist (other (node-chainstates *node*))
         (unless (eq other cs)
           (%flush-chainstate other)))
-      (setf *last-flush-universal-time* (bitcoin-lisp.serialization:get-node-time)
+      (setf *last-flush-universal-time* (bl.ser:get-node-time)
             *blocks-since-flush* 0)
       #+sbcl (sb-ext:gc :full t)
       (log-memory-snapshot "post-flush"))))
@@ -4811,11 +4811,11 @@ undo list the UTXO apply produced. Never signals -- a filter-index failure
 must not abort a block connect -- so consensus is unaffected whether the
 index is on or off."
   (let ((bfi (and *node* (node-blockfilterindex *node*))))
-    (when (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi)
+    (when (and bfi (bl.store:blockfilterindex-enabled bfi)
                (eq chainstate (node-validated-chainstate *node*)))
       (handler-case
           (multiple-value-bind (filter status)
-              (bitcoin-lisp.storage:blockfilterindex-add-block
+              (bl.store:blockfilterindex-add-block
                bfi block block-hash height spent-utxos)
             (when (and (eq status :noncontiguous)
                        (not *blockfilterindex-stall-logged*))
@@ -4823,7 +4823,7 @@ index is on or off."
               (log-warn "Block filter index stalled at height ~D: gap below ~
 best-indexed height ~D; the startup backfill will heal it on next restart"
                         height
-                        (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+                        (bl.store:blockfilterindex-height bfi)))
             filter)
         (error (e)
           (log-warn "Block filter index failed at height ~D: ~A" height e)
@@ -4837,15 +4837,15 @@ Same shape and same guarantees as INDEX-BLOCK-FILTER above — bound to the
 VALIDATED chainstate so a snapshot chainstate's tip-range connects are ignored,
 and wrapped so an index failure can never abort a block connect."
   (let ((idx (and *node* (node-txospenderindex *node*))))
-    (when (and idx (bitcoin-lisp.storage:txospender-index-enabled idx)
+    (when (and idx (bl.store:txospender-index-enabled idx)
                (eq chainstate (node-validated-chainstate *node*)))
       (handler-case
           (progn
-            (bitcoin-lisp.storage:txospenderindex-add-block idx block block-hash)
-            (bitcoin-lisp.storage:txospenderindex-set-best-block idx block-hash height))
+            (bl.store:txospenderindex-add-block idx block block-hash)
+            (bl.store:txospenderindex-set-best-block idx block-hash height))
         (error (e)
           (log-warn "Spender index failed to add block ~A: ~A"
-                    (bitcoin-lisp.crypto:bytes-to-hex block-hash) e)
+                    (bl.crypto:bytes-to-hex block-hash) e)
           nil)))))
 
 (defun unindex-block-txospenders (chainstate block block-hash)
@@ -4865,13 +4865,13 @@ The erase is exact rather than approximate because Core builds the same
 outpoint list for the connect and the disconnect side from the block alone
 (BuildSpenderPositions, :110-127), and so do we."
   (let ((idx (and *node* (node-txospenderindex *node*))))
-    (when (and idx (bitcoin-lisp.storage:txospender-index-enabled idx)
+    (when (and idx (bl.store:txospender-index-enabled idx)
                (eq chainstate (node-validated-chainstate *node*)))
       (handler-case
-          (bitcoin-lisp.storage:txospenderindex-remove-block idx block block-hash)
+          (bl.store:txospenderindex-remove-block idx block block-hash)
         (error (e)
           (log-warn "Spender index failed to remove block ~A: ~A"
-                    (bitcoin-lisp.crypto:bytes-to-hex block-hash) e)
+                    (bl.crypto:bytes-to-hex block-hash) e)
           nil)))))
 
 (defun do-reindex-chainstate ()
@@ -4907,9 +4907,9 @@ a crash loaded it silently over garbage."
   (let* ((cs (node-chain-state *node*))
          (store (node-block-store *node*))
          (utxo (node-utxo-set *node*))
-         (tip-hash (bitcoin-lisp.storage:best-block-hash cs))
-         (tip-entry (and tip-hash (bitcoin-lisp.storage:get-block-index-entry cs tip-hash)))
-         (tip-height (bitcoin-lisp.storage:current-height cs)))
+         (tip-hash (bl.store:best-block-hash cs))
+         (tip-entry (and tip-hash (bl.store:get-block-index-entry cs tip-hash)))
+         (tip-height (bl.store:current-height cs)))
     (when (or (null tip-entry) (zerop tip-height))
       (log-info "Reindex-chainstate: empty chain, nothing to rebuild")
       (return-from do-reindex-chainstate))
@@ -4918,19 +4918,19 @@ a crash loaded it silently over garbage."
     ;; down from the tip leaves the list in height order).
     (let ((entries '()))
       (loop with e = tip-entry
-            while (and e (plusp (bitcoin-lisp.storage:block-index-entry-height e)))
+            while (and e (plusp (bl.store:block-index-entry-height e)))
             do (push e entries)
-               (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
+               (setf e (bl.store:block-index-entry-prev-entry e)))
       ;; Rewind the chainstate to genesis and persist it WITH the
       ;; in-transition marker BEFORE touching the coins DB: from here until
       ;; the first replay flush commits, a crash is detected at load-state
       ;; and resolved by recover-inconsistent-chainstate's genesis branch
       ;; (re-wipe + clear), never loaded as clean state over a gutted set.
-      (bitcoin-lisp.storage:update-chain-tip
-       cs (bitcoin-lisp.storage::chain-state-genesis-hash cs) 0)
-      (bitcoin-lisp.storage:save-state cs :in-transition t)
+      (bl.store:update-chain-tip
+       cs (bl.store::chain-state-genesis-hash cs) 0)
+      (bl.store:save-state cs :in-transition t)
       ;; Empty the coins view.
-      (let ((erased (bitcoin-lisp.storage:coins-view-cache-wipe utxo)))
+      (let ((erased (bl.store:coins-view-cache-wipe utxo)))
         (log-info "Reindex-chainstate: erased ~D coin~:P; replaying..." erased))
       ;; NB: the coinstatsindex is opened AFTER this runs; its rebuild is
       ;; forced in its own init block (keyed off the reindex flag), not here.
@@ -4940,9 +4940,9 @@ a crash loaded it silently over garbage."
       (let ((n 0) (last-report (get-internal-real-time)))
         (block replay
           (dolist (entry entries)
-            (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
-                   (height (bitcoin-lisp.storage:block-index-entry-height entry))
-                   (blk (bitcoin-lisp.storage:get-block store hash)))
+            (let* ((hash (bl.store:block-index-entry-hash entry))
+                   (height (bl.store:block-index-entry-height entry))
+                   (blk (bl.store:get-block store hash)))
               (unless blk
                 (log-warn "Reindex-chainstate: block at height ~D missing from store; ~
 stopping (UTXO set rebuilt to height ~D)" height (1- height))
@@ -4950,14 +4950,14 @@ stopping (UTXO set rebuilt to height ~D)" height (1- height))
               ;; Apply removes spent prevouts + adds spendable outputs (the
               ;; unspendable skip lives in apply-block-to-utxo-set). Discard the
               ;; returned undo list -- the on-disk undo files are unchanged.
-              (bitcoin-lisp.storage:apply-block-to-utxo-set utxo blk height)
-              (bitcoin-lisp.storage:update-chain-tip cs hash height)
+              (bl.store:apply-block-to-utxo-set utxo blk height)
+              (bl.store:update-chain-tip cs hash height)
               (incf n)
               ;; Size-triggered flushes go through the 3-phase commit like
               ;; the periodic flush: marker at the replay height, one atomic
               ;; synced coins batch, marker cleared — so the on-disk pair is
               ;; always chainstate.dat <= coins DB by an identifiable gap.
-              (when (>= (bitcoin-lisp.storage:view-mem-bytes utxo)
+              (when (>= (bl.store:view-mem-bytes utxo)
                         (large-coins-cache-threshold *coins-cache-budget-bytes*))
                 (%flush-chainstate cs :label "Reindex"))
               (let ((now (get-internal-real-time)))
@@ -4967,7 +4967,7 @@ stopping (UTXO set rebuilt to height ~D)" height (1- height))
                   (setf last-report now))))))
         (%flush-chainstate cs :label "Reindex")
         (log-info "Reindex-chainstate complete: ~D block~:P re-applied, tip at height ~D"
-                  n (bitcoin-lisp.storage:current-height cs))))))
+                  n (bl.store:current-height cs))))))
 
 (defun force-compact-databases ()
   "Full-compact every LevelDB the node has open -- the coins/chainstate DB plus
@@ -4978,17 +4978,17 @@ database it opens. Synchronous and potentially slow on a large chainstate."
   (flet ((compact (label db)
            (when db
              (log-info "Starting database compaction of ~A" label)
-             (bitcoin-lisp.storage:leveldb-compact db)
+             (bl.store:leveldb-compact db)
              (log-info "Finished database compaction of ~A" label))))
     (let ((utxo (node-utxo-set *node*))
           (bfi (node-blockfilterindex *node*))
           (csi (node-coinstatsindex *node*)))
       (when utxo
         (log-info "Starting database compaction of chainstate")
-        (bitcoin-lisp.storage:coins-view-cache-compact utxo)
+        (bl.store:coins-view-cache-compact utxo)
         (log-info "Finished database compaction of chainstate"))
-      (when bfi (compact "blockfilterindex" (bitcoin-lisp.storage:blockfilterindex-db bfi)))
-      (when csi (compact "coinstatsindex" (bitcoin-lisp.storage:coinstatsindex-db csi))))))
+      (when bfi (compact "blockfilterindex" (bl.store:blockfilterindex-db bfi)))
+      (when csi (compact "coinstatsindex" (bl.store:coinstatsindex-db csi))))))
 
 (defun index-block-coinstats (chainstate block block-hash height spent-utxos)
   "Connect-time hook: fold BLOCK into the running node's coinstatsindex, if
@@ -5002,12 +5002,12 @@ so consensus is unaffected whether the index is on or off. Returns NIL (and
 stalls quietly) if the parent height's record is missing (non-contiguous);
 the startup backfill heals such gaps on restart."
   (let ((csi (and *node* (node-coinstatsindex *node*))))
-    (when (and csi (bitcoin-lisp.storage:coinstatsindex-enabled csi)
+    (when (and csi (bl.store:coinstatsindex-enabled csi)
                (eq chainstate (node-validated-chainstate *node*)))
       (handler-case
-          (bitcoin-lisp.storage:coinstatsindex-add-block
+          (bl.store:coinstatsindex-add-block
            csi block block-hash height spent-utxos
-           (bitcoin-lisp.validation:calculate-block-subsidy height))
+           (bl.val:calculate-block-subsidy height))
         (error (e)
           (log-warn "Coinstats index failed at height ~D: ~A" height e)
           nil)))))
@@ -5025,7 +5025,7 @@ the startup backfill heals such gaps on restart."
 else NIL — the fast-path gate shared by the wallet hooks."
   (let ((manager (and *node* (node-wallet-manager *node*))))
     (and manager
-         (bitcoin-lisp.rpc:wallet-manager-has-wallets-p manager)
+         (bl.rpc:wallet-manager-has-wallets-p manager)
          manager)))
 
 (defun wallet-notify-block-connected (chainstate block block-hash height)
@@ -5036,9 +5036,9 @@ old blocks are Core's ChainstateRole::historical, which the wallet ignores
 (wallet.cpp:1526-1529)."
   (let ((manager (%wallet-hook-manager)))
     (when (and manager
-               (not (bitcoin-lisp.storage:chain-state-target-blockhash chainstate)))
+               (not (bl.store:chain-state-target-blockhash chainstate)))
       (handler-case
-          (bitcoin-lisp.rpc:wallets-block-connected
+          (bl.rpc:wallets-block-connected
            manager (node-mempool *node*) chainstate block block-hash height)
         (error (e)
           (log-error "Wallet processing of connected block at height ~D FAILED: ~A"
@@ -5050,9 +5050,9 @@ CWallet::blockDisconnected). Called from perform-reorg's commit phase,
 tip-first."
   (let ((manager (%wallet-hook-manager)))
     (when (and manager
-               (not (bitcoin-lisp.storage:chain-state-target-blockhash chainstate)))
+               (not (bl.store:chain-state-target-blockhash chainstate)))
       (handler-case
-          (bitcoin-lisp.rpc:wallets-block-disconnected manager block height)
+          (bl.rpc:wallets-block-disconnected manager block height)
         (error (e)
           (log-error "Wallet processing of disconnected block at height ~D FAILED: ~A"
                      height e))))))
@@ -5062,7 +5062,7 @@ tip-first."
   (let ((manager (%wallet-hook-manager)))
     (when manager
       (handler-case
-          (bitcoin-lisp.rpc:wallets-mempool-tx-added
+          (bl.rpc:wallets-mempool-tx-added
            manager (node-mempool *node*) tx)
         (error (e)
           (log-error "Wallet processing of mempool tx add FAILED: ~A" e))))))
@@ -5075,7 +5075,7 @@ hook (Core removeUnchecked, txmempool.cpp:269-275)."
     (let ((manager (%wallet-hook-manager)))
       (when manager
         (handler-case
-            (bitcoin-lisp.rpc:wallets-mempool-tx-removed
+            (bl.rpc:wallets-mempool-tx-removed
              manager (node-mempool *node*) tx reason)
           (error (e)
             (log-error "Wallet processing of mempool tx removal FAILED: ~A" e)))))))
@@ -5212,10 +5212,10 @@ state file and LevelDB. The shared header index is saved inside each flush's
 Phase 1."
   (dolist (cs (node-chainstates node))
     (log-info "Flushing chain state~@[ (~A)~]..."
-              (let ((suffix (bitcoin-lisp.storage:chain-state-storage-suffix cs)))
+              (let ((suffix (bl.store:chain-state-storage-suffix cs)))
                 (and (plusp (length suffix)) suffix)))
     (%flush-chainstate cs :label "Shutdown" :force-full-header-index t)
-    (bitcoin-lisp.storage:close-chainstate-coins-view cs)))
+    (bl.store:close-chainstate-coins-view cs)))
 
 (defun stop-node ()
   "Stop the running Bitcoin node: the full teardown, ending with the
@@ -5264,33 +5264,33 @@ thread; see the shutdown-coordination section above."
   ;; Stop RPC server first. Warmup is the SERVER's state, cleared by
   ;; stop-rpc-server — re-arming it here left it armed for anything else in the
   ;; image, which in the test suite meant every later request answered -28.
-  (bitcoin-lisp.rpc:stop-rpc-server)
+  (bl.rpc:stop-rpc-server)
 
   ;; Signal the node to stop. request-ibd-stop reaches the IBD inner
   ;; loops, which can otherwise run for hours after node-running flips
   ;; (the outer sync loop only checks between run-ibd passes).
   (setf (node-running *node*) nil)
-  (bitcoin-lisp.networking:request-ibd-stop)
+  (bl.net:request-ibd-stop)
 
   ;; Stop the torcontrol client: closing the control connection is what tears
   ;; the ephemeral onion service down inside Tor (no DEL_ONION, like Core).
   (when (node-tor-controller *node*)
-    (bitcoin-lisp.networking:stop-tor-control (node-tor-controller *node*))
+    (bl.net:stop-tor-control (node-tor-controller *node*))
     (setf (node-tor-controller *node*) nil))
 
   ;; Stop the inbound listeners: close the sockets (unblocks accept) and let
   ;; the accept threads observe node-running=nil and exit (accept timeout 1s).
   (when (node-listener-socket *node*)
-    (bitcoin-lisp.networking:close-listener (node-listener-socket *node*))
+    (bl.net:close-listener (node-listener-socket *node*))
     (setf (node-listener-socket *node*) nil))
   (when (node-onion-listener-socket *node*)
-    (bitcoin-lisp.networking:close-listener (node-onion-listener-socket *node*))
+    (bl.net:close-listener (node-onion-listener-socket *node*))
     (setf (node-onion-listener-socket *node*) nil))
   ;; One shared deadline bounds the TOTAL wait for both accept threads.
   (let ((deadline (+ (get-internal-real-time) (* 5 internal-time-units-per-second))))
-    (bitcoin-lisp.networking:join-thread-or-destroy
+    (bl.net:join-thread-or-destroy
      (node-listener-thread *node*) :deadline deadline)
-    (bitcoin-lisp.networking:join-thread-or-destroy
+    (bl.net:join-thread-or-destroy
      (node-onion-listener-thread *node*) :deadline deadline))
   (setf (node-listener-thread *node*) nil
         (node-onion-listener-thread *node*) nil)
@@ -5300,7 +5300,7 @@ thread; see the shutdown-coordination section above."
                    (prog1 (node-pending-inbound-peers *node*)
                      (setf (node-pending-inbound-peers *node*) nil)))))
     (dolist (peer pending)
-      (handler-case (bitcoin-lisp.networking:disconnect-peer peer) (error () nil))))
+      (handler-case (bl.net:disconnect-peer peer) (error () nil))))
 
   ;; Wait for sync thread to finish (with timeout)
   (when (and (node-sync-thread *node*)
@@ -5328,7 +5328,7 @@ thread; see the shutdown-coordination section above."
   (log-info "Disconnecting peers...")
   (dolist (peer (node-peers *node*))
     (handler-case
-        (bitcoin-lisp.networking:disconnect-peer peer)
+        (bl.net:disconnect-peer peer)
       (error (c)
         (log-warn "Error disconnecting peer: ~A" c))))
   (bt:with-recursive-lock-held ((node-lock *node*))
@@ -5341,69 +5341,69 @@ thread; see the shutdown-coordination section above."
   ;; Save fee statistics
   (when (node-fee-estimator *node*)
     (log-info "Saving fee statistics...")
-    (bitcoin-lisp.mempool:save-fee-stats (node-fee-estimator *node*)))
+    (bl.mp:save-fee-stats (node-fee-estimator *node*)))
 
   ;; Save mempool (Core DumpMempool)
-  (let ((path (bitcoin-lisp.mempool:mempool-dat-path (node-data-directory *node*))))
+  (let ((path (bl.mp:mempool-dat-path (node-data-directory *node*))))
     (when (and path (node-mempool *node*))
       (log-info "Saving mempool (~D entries)..."
-                (bitcoin-lisp.mempool:save-mempool-file (node-mempool *node*) path))))
+                (bl.mp:save-mempool-file (node-mempool *node*) path))))
 
   ;; Save peer address book
   (when (node-address-book *node*)
     (log-info "Saving peer address book...")
-    (bitcoin-lisp.networking:save-address-book
+    (bl.net:save-address-book
      (node-address-book *node*)
-     (bitcoin-lisp.networking:peers-dat-path (node-data-directory *node*))))
+     (bl.net:peers-dat-path (node-data-directory *node*))))
 
   ;; Final banlist dump (Core ~BanMan calls DumpBanlist, banman.cpp:26),
   ;; then detach the path so post-shutdown mutations stop writing.
-  (bitcoin-lisp.networking:save-banlist)
-  (setf bitcoin-lisp.networking:*banlist-path* nil)
+  (bl.net:save-banlist)
+  (setf bl.net:*banlist-path* nil)
 
   ;; Unload wallets (writes each wallet's best-block marker, closes its DB)
   (when (node-wallet-manager *node*)
     (log-info "Unloading wallets...")
-    (bitcoin-lisp.rpc:close-wallet-manager (node-wallet-manager *node*))
+    (bl.rpc:close-wallet-manager (node-wallet-manager *node*))
     (setf (node-wallet-manager *node*) nil))
 
   ;; Close transaction index
   (when (node-tx-index *node*)
     (log-info "Closing transaction index...")
-    (bitcoin-lisp.storage:close-tx-index (node-tx-index *node*)))
+    (bl.store:close-tx-index (node-tx-index *node*)))
 
   ;; Drop the prune locks before the DBs they read close. Each lock is a thunk
   ;; holding the index object, so leaving them registered keeps a stopped
   ;; node's indexes reachable AND leaves the thunks callable against closed
   ;; LevelDB handles — a live hazard in a test image that starts several nodes,
   ;; since the next PRUNE-LOCK-CEILING would consult the previous node's index.
-  (bitcoin-lisp.storage:clear-prune-locks)
+  (bl.store:clear-prune-locks)
 
   ;; Close block filter index
   (when (node-blockfilterindex *node*)
     (log-info "Closing block filter index...")
-    (bitcoin-lisp.storage:close-blockfilterindex (node-blockfilterindex *node*)))
+    (bl.store:close-blockfilterindex (node-blockfilterindex *node*)))
 
   ;; Close coinstats index
   (when (node-coinstatsindex *node*)
     (log-info "Closing coinstats index...")
-    (bitcoin-lisp.storage:close-coinstatsindex (node-coinstatsindex *node*)))
+    (bl.store:close-coinstatsindex (node-coinstatsindex *node*)))
 
   ;; Close the spender index. Its LevelDB handle is no different from the
   ;; others' — leaving it open on shutdown leaks the handle and leaves the
   ;; database without a clean close.
   (when (node-txospenderindex *node*)
     (log-info "Closing spender index...")
-    (bitcoin-lisp.storage:close-txospender-index (node-txospenderindex *node*)))
+    (bl.store:close-txospender-index (node-txospenderindex *node*)))
 
   ;; Cleanup secp256k1
-  (bitcoin-lisp.crypto:cleanup-secp256k1)
+  (bl.crypto:cleanup-secp256k1)
 
   ;; Stop the script-check workers (Core's CCheckQueue is stopped with the
   ;; validation interface). They hold no resources but would keep the process
   ;; alive, and a pool left running across a restart-in-one-image would be
   ;; sized for the previous -par.
-  (ignore-errors (bitcoin-lisp.validation:stop-script-check-pool))
+  (ignore-errors (bl.val:stop-script-check-pool))
 
   ;; Close the ZMQ publishers before the directory lock: a subscriber should
   ;; see the node go away, not hold a socket to a process that has released
@@ -5453,7 +5453,7 @@ connect-to-peers so they are attempted before DNS-seed candidates.")
 format: magic \"ANC2\", count byte, then per entry a BIP155-style net id,
 length-prefixed address bytes and a big-endian port (crash-safe: temp +
 fsync + atomic rename, CRC32-protected)."
-  (bitcoin-lisp.storage:save-file-with-crc32
+  (bl.store:save-file-with-crc32
    path
    (lambda (stream)
      (loop for shift in '(24 16 8 0)
@@ -5461,7 +5461,7 @@ fsync + atomic rename, CRC32-protected)."
      (write-byte (length entries) stream)
      (dolist (e entries)
        (destructuring-bind (net bytes port) e
-         (write-byte (bitcoin-lisp.networking:network-key-id net) stream)
+         (write-byte (bl.net:network-key-id net) stream)
          (write-byte (length bytes) stream)
          (write-sequence bytes stream)
          (write-byte (ldb (byte 8 8) port) stream)
@@ -5483,7 +5483,7 @@ anchors were dialed at the default port anyway). Unparseable v1 entries
        (let ((count (aref bytes 4)) (pos 5))
          (dotimes (i count)
            (when (< (+ pos 2) end)
-             (let ((net (bitcoin-lisp.networking:key-id-network (aref bytes pos)))
+             (let ((net (bl.net:key-id-network (aref bytes pos)))
                    (len (aref bytes (1+ pos))))
                (incf pos 2)
                (when (and net (<= (+ pos len 2) end))
@@ -5502,7 +5502,7 @@ anchors were dialed at the default port anyway). Unparseable v1 entries
                (incf pos)
                (when (<= (+ pos len) end)
                  (multiple-value-bind (net addr-bytes)
-                     (bitcoin-lisp.networking:parse-network-address
+                     (bl.net:parse-network-address
                       (map 'string #'code-char (subseq bytes pos (+ pos len))))
                    (when net
                      (push (list net addr-bytes nil) entries)))
@@ -5515,15 +5515,15 @@ anchors were dialed at the default port anyway). Unparseable v1 entries
 anchors.dat in the network-typed v2 format (net + address + port)."
   (let* ((ready-outbound
            (remove-if-not
-            (lambda (p) (and (not (bitcoin-lisp.networking:peer-inbound p))
-                             (eq (bitcoin-lisp.networking:peer-state p) :ready)))
+            (lambda (p) (and (not (bl.net:peer-inbound p))
+                             (eq (bl.net:peer-state p) :ready)))
             (node-peers node)))
          ;; Prefer block-relay-only peers as anchors (Core anchors are
          ;; block-relay: an attacker who fed us a poisoned addrman can't
          ;; substitute a peer we were just block-relay-connected to). Fall back
          ;; to full-relay outbound if we have no block-relay peers.
          (block-relay (remove-if-not
-                       (lambda (p) (eq (bitcoin-lisp.networking:peer-conn-type p)
+                       (lambda (p) (eq (bl.net:peer-conn-type p)
                                        :block-relay))
                        ready-outbound))
          (ready (or block-relay ready-outbound))
@@ -5531,13 +5531,13 @@ anchors.dat in the network-typed v2 format (net + address + port)."
          (entries
            (loop for p in (subseq ready 0 (min +max-anchors+ (length ready)))
                  for (net bytes) = (multiple-value-list
-                                    (bitcoin-lisp.networking:parse-network-address
-                                     (bitcoin-lisp.networking:peer-address p)))
+                                    (bl.net:parse-network-address
+                                     (bl.net:peer-address p)))
                  when net                        ; hostname peers (addnode) skipped
                    collect (list net bytes
-                                 (let ((conn (bitcoin-lisp.networking::peer-connection p)))
+                                 (let ((conn (bl.net::peer-connection p)))
                                    (if conn
-                                       (bitcoin-lisp.networking::connection-port conn)
+                                       (bl.net::connection-port conn)
                                        default-port))))))
     (when entries
       (handler-case
@@ -5558,7 +5558,7 @@ are dialable under the current config (dialable-network-p: onion needs a Tor
 proxy, cjdns needs -cjdnsreachable) and reachable (-onlynet) become dial
 candidates."
   (let* ((path (anchors-dat-path (node-data-directory node)))
-         (bytes (bitcoin-lisp.storage:load-file-with-crc32 path 6)))
+         (bytes (bl.store:load-file-with-crc32 path 6)))
     ;; Unconditionally, parse failure included (Core ReadAnchors). A failure
     ;; here leaves the anchors in place, which silently restores the pinning
     ;; this prevents — so say so rather than swallowing it.
@@ -5568,9 +5568,9 @@ candidates."
     (when bytes
       (setf *pending-anchor-addresses*
             (loop for (net addr-bytes port) in (parse-anchor-entries bytes)
-                  when (and (bitcoin-lisp.networking:dialable-network-p net)
-                            (bitcoin-lisp.networking:reachable-network-p net))
-                    collect (cons (bitcoin-lisp.networking:network-address-to-string
+                  when (and (bl.net:dialable-network-p net)
+                            (bl.net:reachable-network-p net))
+                    collect (cons (bl.net:network-address-to-string
                                    net addr-bytes)
                                   port)))
       (when *pending-anchor-addresses*
@@ -5612,14 +5612,14 @@ discover-peers emits IP literals only.
 Applies to SEED candidates only: manual -addnode/-connect targets are
 deliberately exempt from -onlynet, matching Core."
   (let ((name-proxy-p
-          (and bitcoin-lisp.networking:*proxy*
-               (or (bitcoin-lisp.networking:reachable-network-p :ipv4)
-                   (bitcoin-lisp.networking:reachable-network-p :ipv6))
+          (and bl.net:*proxy*
+               (or (bl.net:reachable-network-p :ipv4)
+                   (bl.net:reachable-network-p :ipv6))
                t)))
     (remove-if-not (lambda (addr)
-                     (let ((net (bitcoin-lisp.networking:parse-network-address addr)))
+                     (let ((net (bl.net:parse-network-address addr)))
                        (if net
-                           (bitcoin-lisp.networking:reachable-network-p net)
+                           (bl.net:reachable-network-p net)
                            name-proxy-p)))
                    addresses)))
 
@@ -5644,10 +5644,10 @@ not penalise addresses that work."
   (let ((address-book (node-address-book node)))
     (when address-book
       (multiple-value-bind (net ip-bytes)
-          (bitcoin-lisp.networking:parse-network-address host)
+          (bl.net:parse-network-address host)
         (when net
           (ignore-errors
-           (bitcoin-lisp.networking:address-book-attempt
+           (bl.net:address-book-attempt
             address-book ip-bytes port :count-failure t :net net)))))))
 
 (defun %seed-address-book-from-dns (node)
@@ -5668,17 +5668,17 @@ seeds."
        (lambda ()
          (handler-case
              (let ((added 0))
-               (dolist (addr (bitcoin-lisp.networking:discover-peers))
+               (dolist (addr (bl.net:discover-peers))
                  (multiple-value-bind (net ip-bytes)
-                     (bitcoin-lisp.networking:parse-network-address addr)
+                     (bl.net:parse-network-address addr)
                    (when (and net
-                              (not (bitcoin-lisp.networking:address-book-lookup
+                              (not (bl.net:address-book-lookup
                                     book ip-bytes port net)))
-                     (when (bitcoin-lisp.networking:address-book-add
+                     (when (bl.net:address-book-add
                             book
-                            (bitcoin-lisp.networking:make-peer-address
+                            (bl.net:make-peer-address
                              :net net :ip ip-bytes :port port :services 0
-                             :last-seen (bitcoin-lisp.serialization:get-unix-time)))
+                             :last-seen (bl.ser:get-unix-time)))
                        (incf added)))))
                (log-info "DNS seeds contributed ~D new address~:P" added))
            (error (e)
@@ -5693,27 +5693,27 @@ too): SUCCESS => Good + Connected, failure => Attempt with count-failure
 Hostname dial targets (unparseable as addresses) are skipped."
   (when address-book
     (multiple-value-bind (net ip-bytes)
-        (bitcoin-lisp.networking:parse-network-address addr)
+        (bl.net:parse-network-address addr)
       (when net
-        (unless (bitcoin-lisp.networking:address-book-lookup
+        (unless (bl.net:address-book-lookup
                  address-book ip-bytes port net)
-          (bitcoin-lisp.networking:address-book-add
+          (bl.net:address-book-add
            address-book
-           (bitcoin-lisp.networking:make-peer-address
+           (bl.net:make-peer-address
             :net net :ip ip-bytes :port port
             :services (if (and success peer)
-                          (bitcoin-lisp.networking:peer-services peer)
+                          (bl.net:peer-services peer)
                           0)
-            :last-seen (bitcoin-lisp.serialization:get-unix-time))))
+            :last-seen (bl.ser:get-unix-time))))
         (if success
             (progn
-              (bitcoin-lisp.networking:address-book-good
+              (bl.net:address-book-good
                address-book ip-bytes port
-               (bitcoin-lisp.serialization:get-unix-time) net)
-              (bitcoin-lisp.networking:address-book-connected
+               (bl.ser:get-unix-time) net)
+              (bl.net:address-book-connected
                address-book ip-bytes port
-               (bitcoin-lisp.serialization:get-unix-time) net))
-            (bitcoin-lisp.networking:address-book-attempt
+               (bl.ser:get-unix-time) net))
+            (bl.net:address-book-attempt
              address-book ip-bytes port :count-failure t :net net))))))
 
 (defun connect-to-peers (node max-peers &key (timeout 60) (min-peers 1))
@@ -5742,20 +5742,20 @@ Returns the number of peers connected."
     ;; Warm start: select peers from the addrman (new/tried buckets,
     ;; eclipse-resistant) rather than a single global score ranking.
     (when (and address-book
-               (>= (bitcoin-lisp.networking:address-book-count address-book) 8))
-      (bitcoin-lisp.networking:resolve-tried-collisions address-book)
+               (>= (bl.net:address-book-count address-book) 8))
+      (bl.net:resolve-tried-collisions address-book)
       (log-info "Using peer address book (~D entries)..."
-                (bitcoin-lisp.networking:address-book-count address-book))
+                (bl.net:address-book-count address-book))
       (let ((seen (make-hash-table :test 'equal))
             (picks '()))
         (dotimes (i (* max-peers 8))
           ;; select-dialable-address, never raw select: post-BIP155 the book
           ;; can hold records not dialable under the current config (torv3
           ;; without a Tor proxy, i2p always, cjdns without -cjdnsreachable).
-          (let ((pa (bitcoin-lisp.networking:select-dialable-address address-book)))
+          (let ((pa (bl.net:select-dialable-address address-book)))
             (when pa
-              (let ((str (bitcoin-lisp.networking:peer-address-string pa))
-                    (port (bitcoin-lisp.networking:peer-address-port pa)))
+              (let ((str (bl.net:peer-address-string pa))
+                    (port (bl.net:peer-address-port pa)))
                 (unless (gethash str seen)
                   (setf (gethash str seen) t)
                   (push (cons str (and (plusp port) port)) picks))))))
@@ -5771,7 +5771,7 @@ Returns the number of peers connected."
     ;; -dnsseed=0, the same precedence Core's thread has.
     (when (and *force-dns-seed* *dns-seed-enabled*)
       (log-info "Discovering peers from DNS seeds...")
-      (let* ((dns-addrs (bitcoin-lisp.networking:discover-peers))
+      (let* ((dns-addrs (bl.net:discover-peers))
              (usable (%reachable-seed-addresses dns-addrs)))
         (log-info "Found ~D potential peers from DNS~:[~; (~:*~D dialable under -onlynet)~]"
                   (length dns-addrs)
@@ -5791,23 +5791,23 @@ Returns the number of peers connected."
                *fixed-seeds-enabled*
                (let ((groups (remove-duplicates
                               (remove nil (mapcar (lambda (c)
-                                                    (bitcoin-lisp.networking:ip-netgroup
+                                                    (bl.net:ip-netgroup
                                                      (car c)))
                                                   addresses))
                               :test #'string=)))
                  (< (length groups) 8)))
       (log-info "Merging testnet4 fixed-seed list (~D peers, ~D /16 groups)"
-                (length bitcoin-lisp.networking:*testnet4-fixed-seeds*)
+                (length bl.net:*testnet4-fixed-seeds*)
                 (length (remove-duplicates
-                         (mapcar #'bitcoin-lisp.networking:ip-netgroup
-                                 bitcoin-lisp.networking:*testnet4-fixed-seeds*)
+                         (mapcar #'bl.net:ip-netgroup
+                                 bl.net:*testnet4-fixed-seeds*)
                          :test #'string=)))
       (setf addresses
             (remove-duplicates
              (append addresses
                      (mapcar (lambda (a) (cons a nil))
                              (%reachable-seed-addresses
-                              bitcoin-lisp.networking:*testnet4-fixed-seeds*)))
+                              bl.net:*testnet4-fixed-seeds*)))
              :key #'car :test #'string=)))
 
     ;; Diversify by /16 netgroup so the first 8 connection attempts spread
@@ -5815,7 +5815,7 @@ Returns the number of peers connected."
     ;; from 103.165.192.x wiz.biz nodes — one stall stalled the whole
     ;; sync). Mirrors Bitcoin Core's addrman netgroup bucket selection
     ;; (netaddress.cpp CNetAddr::GetGroup).
-    (setf addresses (bitcoin-lisp.networking:diversify-by-netgroup addresses
+    (setf addresses (bl.net:diversify-by-netgroup addresses
                                                                    :key #'car))
 
     ;; Anchors first (Core anchors.dat): reconnect to the peers we persisted at
@@ -5849,27 +5849,27 @@ Returns the number of peers connected."
                (dial-port (or (cdr candidate) (network-port (node-network node)))))
           (log-debug "Trying to connect to ~A..." addr)
           (handler-case
-              (let ((peer (bitcoin-lisp.networking:connect-peer addr dial-port)))
+              (let ((peer (bl.net:connect-peer addr dial-port)))
                 (when peer
-                  (setf (bitcoin-lisp.networking:peer-address peer) addr)
+                  (setf (bl.net:peer-address peer) addr)
                   (log-info "Connected to ~A" addr)
                   ;; Perform handshake
-                  (when (bitcoin-lisp.networking:perform-handshake peer :near-tip (bitcoin-lisp.networking:near-tip-p (node-chain-state node)))
+                  (when (bl.net:perform-handshake peer :near-tip (bl.net:near-tip-p (node-chain-state node)))
                     (log-info "Handshake complete with ~A (~A, height ~D)"
                               addr
-                              (bitcoin-lisp.networking:peer-user-agent peer)
-                              (bitcoin-lisp.networking:peer-start-height peer))
+                              (bl.net:peer-user-agent peer)
+                              (bl.net:peer-start-height peer))
                     ;; Send feature negotiation messages
-                    (bitcoin-lisp.networking:send-post-handshake-messages peer)
+                    (bl.net:send-post-handshake-messages peer)
                     ;; Record success in address book (add if not present)
                     (%record-outbound-result address-book addr dial-port peer t)
                     ;; Send compact block negotiation (BIP 152)
-                    (bitcoin-lisp.networking:send-compact-block-negotiation peer)
+                    (bl.net:send-compact-block-negotiation peer)
                     (bt:with-recursive-lock-held ((node-lock node))
                       (push peer (node-peers node)))
                     (incf connected))
-                  (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
-                    (bitcoin-lisp.networking:disconnect-peer peer))))
+                  (unless (eq (bl.net:peer-state peer) :ready)
+                    (bl.net:disconnect-peer peer))))
             (error (c)
               (log-debug "Failed to connect to ~A: ~A" addr c)
               ;; Record failure in address book (add if not present)
@@ -5893,17 +5893,17 @@ Also checks compact block reconstruction timeouts (BIP 152)."
       (handler-case
           (progn
             ;; Check compact block timeout
-            (bitcoin-lisp.networking:check-compact-block-timeout peer)
+            (bl.net:check-compact-block-timeout peer)
             ;; Check ping/pong health
-            (let ((status (bitcoin-lisp.networking:check-peer-health peer)))
+            (let ((status (bl.net:check-peer-health peer)))
               (when (eq status :disconnect)
                 (push peer to-disconnect))))
         (error () (push peer to-disconnect))))
     (dolist (peer to-disconnect)
       (log-warn "Disconnecting unresponsive peer ~A"
-                (bitcoin-lisp.networking:peer-address peer))
+                (bl.net:peer-address peer))
       (handler-case
-          (bitcoin-lisp.networking:disconnect-peer peer)
+          (bl.net:disconnect-peer peer)
         (error (c) (declare (ignore c))))
       (bt:with-recursive-lock-held ((node-lock node))
         (setf (node-peers node) (remove peer (node-peers node)))))
@@ -5914,9 +5914,9 @@ Also checks compact block reconstruction timeouts (BIP 152)."
 counts toward the outbound full-relay target (Core CNode::IsFullOutboundConn:
 m_conn_type == OUTBOUND_FULL_RELAY, which is never inbound). Inbound peers
 and block-relay/feeler outbound peers are deliberately excluded."
-  (and (eq (bitcoin-lisp.networking:peer-state peer) :ready)
-       (not (bitcoin-lisp.networking:peer-inbound peer))
-       (eq (bitcoin-lisp.networking:peer-conn-type peer) :outbound-full-relay)))
+  (and (eq (bl.net:peer-state peer) :ready)
+       (not (bl.net:peer-inbound peer))
+       (eq (bl.net:peer-conn-type peer) :outbound-full-relay)))
 
 (defun count-outbound-full-relay-peers (peers)
   "Count ready outbound full-relay peers among PEERS (Core nOutboundFullRelay).
@@ -5990,10 +5990,10 @@ Core does for m_last_tip_update == 0 — otherwise every node would declare
 itself eclipsed the moment it started."
   (let ((last (node-last-tip-advance-time node)))
     (cond ((not (plusp last))
-           (setf (node-last-tip-advance-time node) (bitcoin-lisp.serialization:get-node-time))
+           (setf (node-last-tip-advance-time node) (bl.ser:get-node-time))
            nil)
-          (t (and (> (- (bitcoin-lisp.serialization:get-node-time) last) +stale-tip-age-seconds+)
-                  (not (bitcoin-lisp.networking:any-blocks-in-flight-p)))))))
+          (t (and (> (- (bl.ser:get-node-time) last) +stale-tip-age-seconds+)
+                  (not (bl.net:any-blocks-in-flight-p)))))))
 
 (defun check-for-stale-tip (node now)
   "Core's stale-tip half of CheckForStaleTipAndEvictPeers (:5468-5479), on its
@@ -6019,7 +6019,7 @@ fetching from calling its own tip stale."
            (unless *try-new-outbound-peer*
              (log-info "Potential stale tip detected (no advance in ~Ds); \
 allowing one extra outbound peer"
-                       (- (bitcoin-lisp.serialization:get-node-time) (node-last-tip-advance-time node))))
+                       (- (bl.ser:get-node-time) (node-last-tip-advance-time node))))
            (setf *try-new-outbound-peer* t))
           (*try-new-outbound-peer*
            (log-info "Tip is advancing again; releasing the extra outbound slot")
@@ -6033,7 +6033,7 @@ Returns the number of new peers connected."
   (bt:with-recursive-lock-held ((node-lock node))
     (setf (node-peers node)
           (remove-if (lambda (p)
-                       (eq (bitcoin-lisp.networking:peer-state p) :disconnected))
+                       (eq (bl.net:peer-state p) :disconnected))
                      (node-peers node))))
   ;; setnetworkactive off: don't dial replacements.
   (unless (node-network-active node)
@@ -6065,9 +6065,9 @@ Returns the number of new peers connected."
       (return-from replace-disconnected-peers 0))
 
     ;; Get addresses already in use
-    (let* ((used-addrs (mapcar #'bitcoin-lisp.networking:peer-address
+    (let* ((used-addrs (mapcar #'bl.net:peer-address
                                (node-peers node)))
-           (used-groups (remove nil (mapcar #'bitcoin-lisp.networking:ip-netgroup
+           (used-groups (remove nil (mapcar #'bl.net:ip-netgroup
                                             used-addrs)))
            (connected 0))
       ;; Core ThreadOpenConnections skips a candidate whose /16 netgroup
@@ -6080,31 +6080,31 @@ Returns the number of new peers connected."
         ;; requested — each one can otherwise block (connect timeout + handshake
         ;; read) and delay the sync thread reaching its node-running checkpoint.
         (when (or (>= connected needed)
-                  (bitcoin-lisp.networking:ibd-stop-requested-p))
+                  (bl.net:ibd-stop-requested-p))
           (return))
         (let ((addr (car candidate)))
           (unless (or (member addr used-addrs :test #'string=)
-                      (let ((g (bitcoin-lisp.networking:ip-netgroup addr)))
+                      (let ((g (bl.net:ip-netgroup addr)))
                         (and g (member g used-groups :test #'equal))))
             (handler-case
                 (let* ((dial-port (or (cdr candidate)
                                       (network-port (node-network node))))
                        (peer (progn
                                (%record-dial-attempt node addr dial-port)
-                               (bitcoin-lisp.networking:connect-peer addr dial-port))))
+                               (bl.net:connect-peer addr dial-port))))
                   (when peer
-                    (setf (bitcoin-lisp.networking:peer-address peer) addr)
-                    (when (bitcoin-lisp.networking:perform-handshake peer :near-tip (bitcoin-lisp.networking:near-tip-p (node-chain-state node)))
+                    (setf (bl.net:peer-address peer) addr)
+                    (when (bl.net:perform-handshake peer :near-tip (bl.net:near-tip-p (node-chain-state node)))
                       (log-info "Replacement peer connected: ~A" addr)
                       ;; Send feature negotiation messages
-                      (bitcoin-lisp.networking:send-post-handshake-messages peer)
+                      (bl.net:send-post-handshake-messages peer)
                       ;; Send compact block negotiation (BIP 152)
-                      (bitcoin-lisp.networking:send-compact-block-negotiation peer)
+                      (bl.net:send-compact-block-negotiation peer)
                       (bt:with-recursive-lock-held ((node-lock node))
                         (push peer (node-peers node)))
                       (incf connected))
-                    (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
-                      (bitcoin-lisp.networking:disconnect-peer peer))))
+                    (unless (eq (bl.net:peer-state peer) :ready)
+                      (bl.net:disconnect-peer peer))))
               (error (c)
                 (declare (ignore c)))))))
       connected)))
@@ -6161,7 +6161,7 @@ destination uses PEER-CONNECTED-TO-ENDPOINT-P instead; see there for why the
 difference is not cosmetic."
   (bt:with-recursive-lock-held ((node-lock node))
     (and (find host (node-peers node)
-               :key #'bitcoin-lisp.networking:peer-address :test #'string=)
+               :key #'bl.net:peer-address :test #'string=)
          t)))
 
 (defun peer-connected-to-endpoint-p (node host port)
@@ -6184,10 +6184,10 @@ inside the node, which had simply been asked to dial a host it was already
 talking to."
   (bt:with-recursive-lock-held ((node-lock node))
     (and (find-if (lambda (p)
-                    (let ((conn (bitcoin-lisp.networking::peer-connection p)))
+                    (let ((conn (bl.net::peer-connection p)))
                       (and conn
-                           (string= host (bitcoin-lisp.networking::connection-host conn))
-                           (eql port (bitcoin-lisp.networking::connection-port conn)))))
+                           (string= host (bl.net::connection-host conn))
+                           (eql port (bl.net::connection-port conn)))))
                   (node-peers node))
          t)))
 
@@ -6203,20 +6203,20 @@ node-peers stays single-writer. No-op when networking is disabled."
   (when (node-network-active node)
     (handler-case
         (let ((peer (progn (%record-dial-attempt node host port)
-                           (bitcoin-lisp.networking:connect-peer host port))))
+                           (bl.net:connect-peer host port))))
           (when peer
-            (setf (bitcoin-lisp.networking:peer-address peer) host)
-            (when manual (setf (bitcoin-lisp.networking:peer-manual peer) t))
-            (if (bitcoin-lisp.networking:perform-handshake peer :conn-type conn-type
-                                                        :near-tip (bitcoin-lisp.networking:near-tip-p (node-chain-state node)))
+            (setf (bl.net:peer-address peer) host)
+            (when manual (setf (bl.net:peer-manual peer) t))
+            (if (bl.net:perform-handshake peer :conn-type conn-type
+                                                        :near-tip (bl.net:near-tip-p (node-chain-state node)))
                 (progn
-                  (bitcoin-lisp.networking:send-post-handshake-messages peer)
-                  (bitcoin-lisp.networking:send-compact-block-negotiation peer)
+                  (bl.net:send-post-handshake-messages peer)
+                  (bl.net:send-compact-block-negotiation peer)
                   (bt:with-recursive-lock-held ((node-lock node))
                     (push peer (node-peers node)))
                   (log-info "Added-node peer connected: ~A" host)
                   peer)
-                (progn (bitcoin-lisp.networking:disconnect-peer peer) nil))))
+                (progn (bl.net:disconnect-peer peer) nil))))
       (error (c)
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
         nil))))
@@ -6301,7 +6301,7 @@ Core's min(8, total): it is an operator knob here (run-node.sh sets 16)."
   "Count current peers whose connection type is TYPE."
   (bt:with-recursive-lock-held ((node-lock node))
     (count type (node-peers node)
-           :key #'bitcoin-lisp.networking:peer-conn-type)))
+           :key #'bl.net:peer-conn-type)))
 
 (defun %addrman-pick-unconnected (node &key new-only)
   "Pick an addrman address (as (values host port)) we're not already connected
@@ -6313,10 +6313,10 @@ needs a Tor proxy, cjdns needs -cjdnsreachable, i2p never)."
   (let ((ab (node-address-book node)))
     (when ab
       (dotimes (_ 20)
-        (let ((pa (bitcoin-lisp.networking:select-dialable-address ab :new-only new-only)))
+        (let ((pa (bl.net:select-dialable-address ab :new-only new-only)))
           (when pa
-            (let ((host (bitcoin-lisp.networking:peer-address-string pa))
-                  (port (bitcoin-lisp.networking:peer-address-port pa)))
+            (let ((host (bl.net:peer-address-string pa))
+                  (port (bl.net:peer-address-port pa)))
               (unless (peer-connected-to-host-p node host)
                 (return-from %addrman-pick-unconnected
                   (values host (and (plusp port) port)))))))))))
@@ -6342,18 +6342,18 @@ feelers exist only to validate addrman's tried table (Core anti-eclipse), never
 to join the peer set."
   (handler-case
       (let ((peer (progn (%record-dial-attempt node host port)
-                         (bitcoin-lisp.networking:connect-peer host port))))
+                         (bl.net:connect-peer host port))))
         (when peer
-          (setf (bitcoin-lisp.networking:peer-address peer) host)
-          (when (bitcoin-lisp.networking:perform-handshake peer :conn-type :feeler)
+          (setf (bl.net:peer-address peer) host)
+          (when (bl.net:perform-handshake peer :conn-type :feeler)
             (multiple-value-bind (net ip-bytes)
-                (bitcoin-lisp.networking:parse-network-address host)
+                (bl.net:parse-network-address host)
               (when net
-                (bitcoin-lisp.networking:address-book-good
+                (bl.net:address-book-good
                  (node-address-book node) ip-bytes port
-                 (bitcoin-lisp.serialization:get-unix-time) net)))
+                 (bl.ser:get-unix-time) net)))
             (log-debug "Feeler validated ~A (new -> tried)" host))
-          (bitcoin-lisp.networking:disconnect-peer peer)))
+          (bl.net:disconnect-peer peer)))
     (error (c)
       (log-debug "Feeler to ~A:~D failed: ~A" host port c))))
 
@@ -6364,25 +6364,25 @@ before resolve-tried-collisions may evict it — and only otherwise validates a
 'new' address into 'tried'. An incumbent we are already connected to needs no
 probe: mark it good, which resolves the collision in its favour, and spend the
 feeler on the new table instead."
-  (let ((now (bitcoin-lisp.serialization:get-node-time)))
+  (let ((now (bl.ser:get-node-time)))
     (when (and (node-network-active node) (node-address-book node)
                (addrman-outgoing-enabled-p)
                (>= (- now *last-feeler-time*) +feeler-interval-seconds+))
       (setf *last-feeler-time* now)
       (let* ((book (node-address-book node))
-             (incumbent (bitcoin-lisp.networking:select-tried-collision book))
+             (incumbent (bl.net:select-tried-collision book))
              (host (and incumbent
-                        (bitcoin-lisp.networking:peer-address-string incumbent))))
+                        (bl.net:peer-address-string incumbent))))
         (when (and host (peer-connected-to-host-p node host))
-          (bitcoin-lisp.networking:address-book-good
-           book (bitcoin-lisp.networking:peer-address-ip incumbent)
-           (bitcoin-lisp.networking:peer-address-port incumbent)
-           (bitcoin-lisp.serialization:get-unix-time)
-           (bitcoin-lisp.networking:peer-address-network incumbent))
+          (bl.net:address-book-good
+           book (bl.net:peer-address-ip incumbent)
+           (bl.net:peer-address-port incumbent)
+           (bl.ser:get-unix-time)
+           (bl.net:peer-address-network incumbent))
           (setf host nil))
         (multiple-value-bind (ip port)
             (if host
-                (values host (let ((p (bitcoin-lisp.networking:peer-address-port incumbent)))
+                (values host (let ((p (bl.net:peer-address-port incumbent)))
                                (and (plusp p) p)))
                 (%addrman-pick-unconnected node :new-only t))
           (when ip
@@ -6404,14 +6404,14 @@ eclipse resistance matters.
 
 Two sweeps, in Core's order: the per-peer chain-sync eviction, then the
 whole-set extra-outbound eviction."
-  (let ((now (bitcoin-lisp.serialization:get-unix-time)))
+  (let ((now (bl.ser:get-unix-time)))
     (when (>= (- now *last-chain-sync-check*) +extra-peer-check-interval-seconds+)
       (setf *last-chain-sync-check* now)
       (let ((chain-state (node-current-chainstate node)))
         (when chain-state
           (dolist (peer (node-peers node))
             (handler-case
-                (bitcoin-lisp.networking:consider-chain-sync-eviction
+                (bl.net:consider-chain-sync-eviction
                  peer chain-state now)
               (error (e)
                 ;; Per-peer, so one unhappy peer cannot stop the sweep — but
@@ -6419,7 +6419,7 @@ whole-set extra-outbound eviction."
                 ;; from eviction forever, which is indistinguishable from the
                 ;; eclipse this code exists to prevent.
                 (log-warn "Chain-sync eviction failed for peer ~A: ~A"
-                          (bitcoin-lisp.networking:peer-address peer) e))))))
+                          (bl.net:peer-address peer) e))))))
       ;; Core runs EvictExtraOutboundPeers from this same tick (:5466), and
       ;; BEFORE the stale-tip check rather than after: the peer we are about to
       ;; decide we need is not one we should have dropped on the way in.
@@ -6429,7 +6429,7 @@ whole-set extra-outbound eviction."
       ;; under the node lock: disconnect-peer runs inside it and mutates state
       ;; the listener thread touches too.
       (handler-case
-          (bitcoin-lisp.networking:evict-extra-outbound-peers
+          (bl.net:evict-extra-outbound-peers
         (bt:with-recursive-lock-held ((node-lock node)) (copy-list (node-peers node)))
         now
         ;; Deliberately the UNRAISED target, even while the extra-outbound slot
@@ -6462,7 +6462,7 @@ eviction sweep."
   ;; iteration (net.cpp:2768), not only at startup — otherwise, once the
   ;; collision set is full, address-book-good stops recording successes.
   (let ((book (node-address-book node)))
-    (when book (bitcoin-lisp.networking:resolve-tried-collisions book)))
+    (when book (bl.net:resolve-tried-collisions book)))
   (consider-outbound-evictions node)
   (replace-disconnected-peers node)
   (maintain-block-relay-peers node)
@@ -6503,14 +6503,14 @@ phase exits quickly when there's nothing new to fetch."
     ;; queues its [historical-tip .. snapshot-base] range and routes received
     ;; blocks to whichever chainstate owns their height.
     (let ((chainstate (node-current-chainstate node))
-          (peer-height (bitcoin-lisp.networking:peer-start-height best-peer)))
+          (peer-height (bl.net:peer-start-height best-peer)))
       (log-debug "Sync cycle: local height ~D, peer-start height ~D"
-                 (bitcoin-lisp.storage:current-height chainstate)
+                 (bl.store:current-height chainstate)
                  peer-height)
-      (bitcoin-lisp.networking::start-ibd
+      (bl.net::start-ibd
        (node-peers node)
        chainstate
-       (bitcoin-lisp.storage:chain-state-coins-view chainstate)
+       (bl.store:chain-state-coins-view chainstate)
        (node-block-store node)
        peer-height
        :historical-chainstate (node-historical-chainstate node)
@@ -6528,11 +6528,11 @@ phase exits quickly when there's nothing new to fetch."
   "Find the best peer for syncing (highest block height)."
   (let ((ready-peers (remove-if-not
                       (lambda (p)
-                        (eq (bitcoin-lisp.networking:peer-state p) :ready))
+                        (eq (bl.net:peer-state p) :ready))
                       (node-peers node))))
     (when ready-peers
       (first (sort (copy-list ready-peers) #'>
-                   :key #'bitcoin-lisp.networking:peer-start-height)))))
+                   :key #'bl.net:peer-start-height)))))
 
 ;;;; Status and Info
 
@@ -6553,28 +6553,28 @@ phase exits quickly when there's nothing new to fetch."
   (format t "~%Chain State:~%")
   (when (node-chain-state *node*)
     (format t "  Height: ~D~%"
-            (bitcoin-lisp.storage:current-height (node-chain-state *node*)))
+            (bl.store:current-height (node-chain-state *node*)))
     (format t "  Best block: ~A~%"
-            (bitcoin-lisp.crypto:bytes-to-hex
-             (bitcoin-lisp.storage:best-block-hash (node-chain-state *node*)))))
+            (bl.crypto:bytes-to-hex
+             (bl.store:best-block-hash (node-chain-state *node*)))))
   (format t "~%UTXO Set:~%")
   (when (node-utxo-set *node*)
     (format t "  UTXOs: ~D~%"
-            (bitcoin-lisp.storage:utxo-count (node-utxo-set *node*))))
+            (bl.store:utxo-count (node-utxo-set *node*))))
   (format t "~%Mempool:~%")
   (when (node-mempool *node*)
     (format t "  Transactions: ~D~%"
-            (bitcoin-lisp.mempool:mempool-count (node-mempool *node*)))
+            (bl.mp:mempool-count (node-mempool *node*)))
     (format t "  Size: ~:D vbytes (~:D bytes memory)~%"
-            (bitcoin-lisp.mempool:mempool-total-size (node-mempool *node*))
-            (bitcoin-lisp.mempool:mempool-dynamic-usage (node-mempool *node*))))
+            (bl.mp:mempool-total-size (node-mempool *node*))
+            (bl.mp:mempool-dynamic-usage (node-mempool *node*))))
   (format t "~%Peers:~%")
   (if (node-peers *node*)
       (dolist (peer (node-peers *node*))
         (format t "  - ~A (height ~D, latency ~Dms)~%"
-                (bitcoin-lisp.networking:peer-user-agent peer)
-                (bitcoin-lisp.networking:peer-start-height peer)
-                (bitcoin-lisp.networking:peer-ping-latency peer)))
+                (bl.net:peer-user-agent peer)
+                (bl.net:peer-start-height peer)
+                (bl.net:peer-ping-latency peer)))
       (format t "  (no peers connected)~%"))
   (format t "~%")
   t)

@@ -27,8 +27,8 @@
 (defun %ms-try-parse (expr)
   "Parse EXPR, returning NIL if it is not even well-formed. An expression that
 parses but does not type is a node, not an error — the caller distinguishes."
-  (handler-case (bitcoin-lisp.validation::ms-parse expr)
-    (bitcoin-lisp.validation::miniscript-parse-error () nil)
+  (handler-case (bl.val::ms-parse expr)
+    (bl.val::miniscript-parse-error () nil)
     ;; Some invalid vectors are malformed in ways that surface as ordinary
     ;; errors (a wrapper letter that does not exist, a bad argument count).
     (error () nil)))
@@ -45,8 +45,8 @@ parses but does not type is a node, not an error — the caller distinguishes."
                                 (not (%ms-flag v "P2WSH_INVALID"))))
              (node (%ms-try-parse expr))
              (got-valid (and node
-                             (bitcoin-lisp.validation::ms-node-valid-p node)
-                             (bitcoin-lisp.validation::ms-node-valid-top-level-p node))))
+                             (bl.val::ms-node-valid-p node)
+                             (bl.val::ms-node-valid-top-level-p node))))
         (unless (eq (and got-valid t) expect-valid)
           (push (format nil "~A: expected ~:[invalid~;valid~], got ~:[invalid~;valid~]"
                         expr expect-valid got-valid)
@@ -64,11 +64,11 @@ see."
             (want (gethash "script" v)))
         (when (and want (%ms-flag v "VALID") (not (%ms-flag v "P2WSH_INVALID")))
           (let ((node (%ms-try-parse expr)))
-            (when (and node (bitcoin-lisp.validation::ms-node-valid-p node))
+            (when (and node (bl.val::ms-node-valid-p node))
               (incf checked)
               (let ((got (string-downcase
-                          (bitcoin-lisp.crypto:bytes-to-hex
-                           (bitcoin-lisp.validation::ms-node-script node)))))
+                          (bl.crypto:bytes-to-hex
+                           (bl.val::ms-node-script node)))))
                 (unless (string= got (string-downcase want))
                   (push (format nil "~A~%  want ~A~%  got  ~A" expr want got)
                         mismatches))))))))
@@ -85,14 +85,14 @@ rather than just the four base types."
              (node (and (%ms-flag v "VALID")
                         (not (%ms-flag v "P2WSH_INVALID"))
                         (%ms-try-parse expr))))
-        (when (and node (bitcoin-lisp.validation::ms-node-valid-top-level-p node))
-          (unless (eq (and (bitcoin-lisp.validation::ms-node-non-malleable-p node) t)
+        (when (and node (bl.val::ms-node-valid-top-level-p node))
+          (unless (eq (and (bl.val::ms-node-non-malleable-p node) t)
                       (%ms-flag v "NONMAL"))
             (push expr nonmal))
-          (unless (eq (and (bitcoin-lisp.validation::ms-node-needs-signature-p node) t)
+          (unless (eq (and (bl.val::ms-node-needs-signature-p node) t)
                       (%ms-flag v "NEEDSIG"))
             (push expr needsig))
-          (unless (eq (and (bitcoin-lisp.validation::ms-node-timelock-mix-p node) t)
+          (unless (eq (and (bl.val::ms-node-timelock-mix-p node) t)
                       (%ms-flag v "TIMELOCKMIX"))
             (push expr timelock)))))
     (is (null nonmal) "malleability mismatch: ~{~A~^, ~}" (reverse nonmal))
@@ -106,11 +106,11 @@ rather than just the four base types."
 represents them as their expansions, so anything walking the tree sees only
 canonical forms. If they were kept as distinct fragments, every consumer would
 have to know about them."
-  (flet ((frag (expr) (bitcoin-lisp.validation::ms-node-fragment
-                       (bitcoin-lisp.validation::ms-parse expr)))
-         (subfrags (expr) (mapcar #'bitcoin-lisp.validation::ms-node-fragment
-                                  (bitcoin-lisp.validation::ms-node-subs
-                                   (bitcoin-lisp.validation::ms-parse expr)))))
+  (flet ((frag (expr) (bl.val::ms-node-fragment
+                       (bl.val::ms-parse expr)))
+         (subfrags (expr) (mapcar #'bl.val::ms-node-fragment
+                                  (bl.val::ms-node-subs
+                                   (bl.val::ms-parse expr)))))
     (let ((key "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65"))
       ;; pk(K) = c:pk_k(K)
       (is (eq :wrap-c (frag (format nil "pk(~A)" key))))
@@ -132,12 +132,12 @@ have to know about them."
   "`vc:X' is v(c(X)), not c(v(X)). Getting this backwards produces a tree that
 often still types, so it has to be checked directly."
   (let* ((key "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
-         (node (bitcoin-lisp.validation::ms-parse (format nil "vc:pk_k(~A)" key))))
-    (is (eq :wrap-v (bitcoin-lisp.validation::ms-node-fragment node)))
-    (let ((inner (first (bitcoin-lisp.validation::ms-node-subs node))))
-      (is (eq :wrap-c (bitcoin-lisp.validation::ms-node-fragment inner)))
-      (is (eq :pk-k (bitcoin-lisp.validation::ms-node-fragment
-                     (first (bitcoin-lisp.validation::ms-node-subs inner))))))))
+         (node (bl.val::ms-parse (format nil "vc:pk_k(~A)" key))))
+    (is (eq :wrap-v (bl.val::ms-node-fragment node)))
+    (let ((inner (first (bl.val::ms-node-subs node))))
+      (is (eq :wrap-c (bl.val::ms-node-fragment inner)))
+      (is (eq :pk-k (bl.val::ms-node-fragment
+                     (first (bl.val::ms-node-subs inner))))))))
 
 (test miniscript-verify-wrapper-converts-rather-than-appending
   "`v:' is free on an expression whose last opcode has a -VERIFY form — Core
@@ -146,18 +146,18 @@ exactly the flag for `cannot do that'. So v:c:pk_k(K) must end in
 OP_CHECKSIGVERIFY and be the same LENGTH as c:pk_k(K), while v:older(1) must
 grow by one byte."
   (let* ((key "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
-         (plain (bitcoin-lisp.validation::ms-node-script
-                 (bitcoin-lisp.validation::ms-parse (format nil "c:pk_k(~A)" key))))
-         (verified (bitcoin-lisp.validation::ms-node-script
-                    (bitcoin-lisp.validation::ms-parse (format nil "vc:pk_k(~A)" key)))))
+         (plain (bl.val::ms-node-script
+                 (bl.val::ms-parse (format nil "c:pk_k(~A)" key))))
+         (verified (bl.val::ms-node-script
+                    (bl.val::ms-parse (format nil "vc:pk_k(~A)" key)))))
     (is (= (length plain) (length verified)))
     (is (= #xac (aref plain (1- (length plain)))) "OP_CHECKSIG")
     (is (= #xad (aref verified (1- (length verified)))) "OP_CHECKSIGVERIFY"))
   ;; older() ends in OP_CHECKSEQUENCEVERIFY, which has no -VERIFY form: 'x'.
-  (let ((plain (bitcoin-lisp.validation::ms-node-script
-                (bitcoin-lisp.validation::ms-parse "older(1)")))
-        (verified (bitcoin-lisp.validation::ms-node-script
-                   (bitcoin-lisp.validation::ms-parse "v:older(1)"))))
+  (let ((plain (bl.val::ms-node-script
+                (bl.val::ms-parse "older(1)")))
+        (verified (bl.val::ms-node-script
+                   (bl.val::ms-parse "v:older(1)"))))
     (is (= (1+ (length plain)) (length verified)))
     (is (= #x69 (aref verified (1- (length verified)))) "OP_VERIFY appended")))
 
@@ -166,16 +166,16 @@ grow by one byte."
 a sub-expression that fails to type must poison its parent explicitly — a zero
 would otherwise read as `no properties' and the parent could type fine."
   ;; andor requires X to be Bdu; `1' is Bu but not d.
-  (let ((node (bitcoin-lisp.validation::ms-parse "andor(1,1,1)")))
+  (let ((node (bl.val::ms-parse "andor(1,1,1)")))
     (is-true node)
-    (is-false (bitcoin-lisp.validation::ms-node-valid-p node)))
+    (is-false (bl.val::ms-node-valid-p node)))
   ;; A valid expression wrapped around an invalid one stays invalid.
-  (let ((node (bitcoin-lisp.validation::ms-parse "and_v(v:andor(1,1,1),1)")))
+  (let ((node (bl.val::ms-parse "and_v(v:andor(1,1,1),1)")))
     (is-true node)
-    (is-false (bitcoin-lisp.validation::ms-node-valid-p node)))
+    (is-false (bl.val::ms-node-valid-p node)))
   ;; Genuinely malformed input is a parse error, which is a different thing.
-  (signals bitcoin-lisp.validation::miniscript-parse-error
-    (bitcoin-lisp.validation::ms-parse "nosuchfragment(1)")))
+  (signals bl.val::miniscript-parse-error
+    (bl.val::ms-parse "nosuchfragment(1)")))
 
 ;;; --- Inside a descriptor ----------------------------------------------------
 
@@ -189,19 +189,19 @@ would otherwise read as `no properties' and the parent could type fine."
   "03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556")
 
 (defun %ms-desc-spk (string &optional (pos 0))
-  (let ((d (bitcoin-lisp.rpc::parse-descriptor string :mainnet)))
+  (let ((d (bl.rpc::parse-descriptor string :mainnet)))
     (string-downcase
-     (bitcoin-lisp.crypto:bytes-to-hex
-      (first (bitcoin-lisp.rpc::%out-desc-expand-uncached d pos))))))
+     (bl.crypto:bytes-to-hex
+      (first (bl.rpc::%out-desc-expand-uncached d pos))))))
 
 (defun %ms-desc-witness-script (string &optional (pos 0))
-  (let* ((d (bitcoin-lisp.rpc::parse-descriptor string :mainnet))
-         (inner (bitcoin-lisp.rpc::out-desc-sub d)))
+  (let* ((d (bl.rpc::parse-descriptor string :mainnet))
+         (inner (bl.rpc::out-desc-sub d)))
     (string-downcase
-     (bitcoin-lisp.crypto:bytes-to-hex
-      (first (bitcoin-lisp.rpc::%out-desc-expand-1
+     (bl.crypto:bytes-to-hex
+      (first (bl.rpc::%out-desc-expand-1
               inner pos
-              (lambda (k) (bitcoin-lisp.rpc::%desc-key-pubkey-at k pos))))))))
+              (lambda (k) (bl.rpc::%desc-key-pubkey-at k pos))))))))
 
 (test wsh-accepts-a-miniscript-policy
   "The point of G7-41: a timelocked recovery policy is expressible as a
@@ -258,11 +258,11 @@ limits are stated for a specific script context, and P2WSH is the one this
 implements. Accepting it at top level or inside sh() would produce scripts
 whose limits were never checked."
   (let ((expr (format nil "and_v(v:pk(~A),older(144))" *ms-desc-key-a*)))
-    (signals error (bitcoin-lisp.rpc::parse-descriptor expr :mainnet))
-    (signals error (bitcoin-lisp.rpc::parse-descriptor
+    (signals error (bl.rpc::parse-descriptor expr :mainnet))
+    (signals error (bl.rpc::parse-descriptor
                     (format nil "sh(~A)" expr) :mainnet))
     ;; But sh(wsh(...)) is fine, since the miniscript is still in a wsh.
-    (is-true (bitcoin-lisp.rpc::parse-descriptor
+    (is-true (bl.rpc::parse-descriptor
               (format nil "sh(wsh(~A))" expr) :mainnet))))
 
 (test a-miniscript-that-does-not-type-is-refused-by-the-descriptor
@@ -271,12 +271,12 @@ descriptor layer must reject it rather than build a script from a node whose
 type is zero — that script would be unspendable or malleable, and the whole
 point of miniscript is to know so in advance."
   ;; andor requires its first argument to be Bdu; `1' is not d.
-  (signals error (bitcoin-lisp.rpc::parse-descriptor "wsh(andor(1,1,1))" :mainnet))
+  (signals error (bl.rpc::parse-descriptor "wsh(andor(1,1,1))" :mainnet))
   ;; A K-type expression is not valid at top level; it needs a c: wrapper.
-  (signals error (bitcoin-lisp.rpc::parse-descriptor
+  (signals error (bl.rpc::parse-descriptor
                   (format nil "wsh(pk_k(~A))" *ms-desc-key-a*) :mainnet))
   ;; older(0) is out of range.
-  (signals error (bitcoin-lisp.rpc::parse-descriptor
+  (signals error (bl.rpc::parse-descriptor
                   (format nil "wsh(and_v(v:pk(~A),older(0)))" *ms-desc-key-a*)
                   :mainnet)))
 
@@ -293,14 +293,14 @@ getdescriptorinfo failed on the live node with an ECASE fallthrough."
                            *ms-desc-key-a* *ms-desc-key-b*)
                    (format nil "wsh(or_i(pk(~A),and_v(v:pk(~A),after(500000))))"
                            *ms-desc-key-a* *ms-desc-key-b*)))
-    (let ((parsed (bitcoin-lisp.rpc::parse-descriptor d :mainnet)))
-      (is (string= d (bitcoin-lisp.rpc::out-desc-string parsed))
+    (let ((parsed (bl.rpc::parse-descriptor d :mainnet)))
+      (is (string= d (bl.rpc::out-desc-string parsed))
           "~A did not round-trip" d)
       ;; And the round-tripped string parses to the same script.
-      (is (equalp (bitcoin-lisp.rpc::%out-desc-expand-uncached parsed 0)
-                  (bitcoin-lisp.rpc::%out-desc-expand-uncached
-                   (bitcoin-lisp.rpc::parse-descriptor
-                    (bitcoin-lisp.rpc::out-desc-string parsed) :mainnet)
+      (is (equalp (bl.rpc::%out-desc-expand-uncached parsed 0)
+                  (bl.rpc::%out-desc-expand-uncached
+                   (bl.rpc::parse-descriptor
+                    (bl.rpc::out-desc-string parsed) :mainnet)
                    0))))))
 
 (test miniscript-rendering-re-sugars-and-collapses-wrapper-runs
@@ -310,8 +310,8 @@ and_n(X,Y). And a run of wrappers takes ONE colon: `t:v:pk(K)' is canonically
 `tv:pk(K)', because the colon belongs to the wrapped node rather than to each
 wrapper."
   (flet ((canon (expr)
-           (bitcoin-lisp.validation::ms-node-to-string
-            (bitcoin-lisp.validation::ms-parse expr))))
+           (bl.val::ms-node-to-string
+            (bl.val::ms-parse expr))))
     (is (string= (format nil "pk(~A)" *ms-desc-key-a*)
                  (canon (format nil "c:pk_k(~A)" *ms-desc-key-a*))))
     (is (string= (format nil "pkh(~A)" *ms-desc-key-a*)
@@ -331,16 +331,16 @@ wrapper."
 checksum, and the ranged/solvable predicates — every one of which walks the
 descriptor tree, and any of which would have thrown on an unknown kind."
   (let* ((d (format nil "wsh(and_v(v:pk(~A),older(144)))" *ms-desc-key-a*))
-         (parsed (bitcoin-lisp.rpc::parse-descriptor d :mainnet)))
-    (is-false (bitcoin-lisp.rpc::out-desc-ranged-p parsed))
-    (is-true (bitcoin-lisp.rpc::out-desc-solvable-p parsed))
-    (is-false (bitcoin-lisp.rpc::out-desc-has-privkeys-p parsed))
-    (is (= 32 (length (bitcoin-lisp.rpc::descriptor-id parsed))))
+         (parsed (bl.rpc::parse-descriptor d :mainnet)))
+    (is-false (bl.rpc::out-desc-ranged-p parsed))
+    (is-true (bl.rpc::out-desc-solvable-p parsed))
+    (is-false (bl.rpc::out-desc-has-privkeys-p parsed))
+    (is (= 32 (length (bl.rpc::descriptor-id parsed))))
     ;; A checksummed string must parse back, which is what getdescriptorinfo
     ;; hands the user to paste into importdescriptors.
-    (let ((checksummed (bitcoin-lisp.rpc::descriptor-add-checksum
-                        (bitcoin-lisp.rpc::out-desc-string parsed))))
-      (is-true (bitcoin-lisp.rpc::parse-descriptor checksummed :mainnet
+    (let ((checksummed (bl.rpc::descriptor-add-checksum
+                        (bl.rpc::out-desc-string parsed))))
+      (is-true (bl.rpc::parse-descriptor checksummed :mainnet
                                                    :require-checksum t)))))
 
 ;;; --- Satisfaction -----------------------------------------------------------
@@ -355,10 +355,10 @@ to tell one key's signature from another's."
 (defun %ms-satisfier (&key keys preimages older after estimating)
   "A satisfier that can sign for KEYS (a list of hex strings) and reveal
 PREIMAGES (an alist of (kind . preimage))."
-  (bitcoin-lisp.validation::make-ms-satisfier
+  (bl.val::make-ms-satisfier
    :estimating estimating
    :sign-fn (lambda (key)
-              (let ((hex (string-downcase (bitcoin-lisp.crypto:bytes-to-hex key))))
+              (let ((hex (string-downcase (bl.crypto:bytes-to-hex key))))
                 (let ((pos (position hex keys :test #'string-equal)))
                   (and pos (%ms-fake-sig (+ 1 pos))))))
    :preimage-fn (lambda (kind hash)
@@ -368,8 +368,8 @@ PREIMAGES (an alist of (kind . preimage))."
    :check-after-fn (lambda (k) (and after (<= k after)))))
 
 (defun %ms-sat (expr &rest args)
-  (bitcoin-lisp.validation::ms-satisfy
-   (bitcoin-lisp.validation::ms-parse expr)
+  (bl.val::ms-satisfy
+   (bl.val::ms-parse expr)
    (apply #'%ms-satisfier args)))
 
 (test satisfying-a-timelocked-policy-needs-both-the-key-and-the-time
@@ -436,9 +436,9 @@ satisfier that produced all three would be handing out a rewritable witness."
 wrong 32-byte value — which is why the fragment insists on a 32-byte size
 check in the script."
   (let* ((preimage (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x42))
-         (h (bitcoin-lisp.crypto:sha256 preimage))
+         (h (bl.crypto:sha256 preimage))
          (expr (format nil "and_v(v:pk(~A),sha256(~A))"
-                       *ms-desc-key-a* (string-downcase (bitcoin-lisp.crypto:bytes-to-hex h)))))
+                       *ms-desc-key-a* (string-downcase (bl.crypto:bytes-to-hex h)))))
     (multiple-value-bind (stack malleable)
         (%ms-sat expr :keys (list *ms-desc-key-a*)
                       :preimages (list (cons :sha256 preimage)))
@@ -484,7 +484,7 @@ operator prefers the LARGER of two MAYBEs."
 
 (defun %ms-p2wsh-spk (witness-script)
   (concatenate '(vector (unsigned-byte 8))
-               (vector 0 32) (bitcoin-lisp.crypto:sha256 witness-script)))
+               (vector 0 32) (bl.crypto:sha256 witness-script)))
 
 (defun %ms-verify-p2wsh (witness-script witness amount)
   "Run the node's real script verification over a P2WSH spend whose witness is
@@ -494,14 +494,14 @@ WITNESS plus the witness script. Exactly the shape a spending transaction has."
   ;; as a bare script, leaves its 32-byte program on the stack, and every
   ;; witness "verifies" -- including an empty one. That is how the first draft
   ;; of this test passed while checking nothing at all.
-  (bitcoin-lisp.coalton.interop:set-script-flags "P2SH,WITNESS,CLEANSTACK,MINIMALDATA")
+  (bl.interop:set-script-flags "P2SH,WITNESS,CLEANSTACK,MINIMALDATA")
   (unwind-protect
-       (bitcoin-lisp.coalton.interop:verify-script
+       (bl.interop:verify-script
         (make-array 0 :element-type '(unsigned-byte 8))
         (%ms-p2wsh-spk witness-script)
         :witness (append witness (list witness-script))
         :amount amount)
-    (bitcoin-lisp.coalton.interop:set-script-flags nil)))
+    (bl.interop:set-script-flags nil)))
 
 (test a-satisfied-policy-actually-verifies-as-a-p2wsh-spend
   "The end-to-end claim, checked by the node's own script verification rather
@@ -514,19 +514,19 @@ cannot — and it did: the first draft of MS-SATISFY reversed the stack, and
 every element-by-element assertion still passed."
   (let* ((p1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
          (p2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))
-         (h1 (string-downcase (bitcoin-lisp.crypto:bytes-to-hex
-                               (bitcoin-lisp.crypto:sha256 p1))))
-         (h2 (string-downcase (bitcoin-lisp.crypto:bytes-to-hex
-                               (bitcoin-lisp.crypto:sha256 p2))))
-         (node (bitcoin-lisp.validation::ms-parse
+         (h1 (string-downcase (bl.crypto:bytes-to-hex
+                               (bl.crypto:sha256 p1))))
+         (h2 (string-downcase (bl.crypto:bytes-to-hex
+                               (bl.crypto:sha256 p2))))
+         (node (bl.val::ms-parse
                 (format nil "and_v(v:sha256(~A),sha256(~A))" h1 h2)))
-         (script (bitcoin-lisp.validation::ms-node-script node))
-         (sat (bitcoin-lisp.validation::make-ms-satisfier
+         (script (bl.val::ms-node-script node))
+         (sat (bl.val::make-ms-satisfier
                :preimage-fn (lambda (kind hash)
                               (declare (ignore kind))
-                              (cond ((equalp hash (bitcoin-lisp.crypto:sha256 p1)) p1)
-                                    ((equalp hash (bitcoin-lisp.crypto:sha256 p2)) p2)))))
-         (witness (bitcoin-lisp.validation::ms-satisfy node sat)))
+                              (cond ((equalp hash (bl.crypto:sha256 p1)) p1)
+                                    ((equalp hash (bl.crypto:sha256 p2)) p2)))))
+         (witness (bl.val::ms-satisfy node sat)))
     (is (= 2 (length witness)))
     (is-true (%ms-verify-p2wsh script witness 100000)
              "the satisfaction the satisfier produced must actually spend")
@@ -549,27 +549,27 @@ zero element's POSITION in the witness is exercised too."
   (let* ((pres (loop for i from 1 to 3
                      collect (make-array 32 :element-type '(unsigned-byte 8)
                                             :initial-element i)))
-         (hashes (mapcar (lambda (p) (bitcoin-lisp.crypto:sha256 p)) pres))
+         (hashes (mapcar (lambda (p) (bl.crypto:sha256 p)) pres))
          (expr (format nil "thresh(2,sha256(~A),s:sha256(~A),s:sha256(~A))"
-                       (string-downcase (bitcoin-lisp.crypto:bytes-to-hex (first hashes)))
-                       (string-downcase (bitcoin-lisp.crypto:bytes-to-hex (second hashes)))
-                       (string-downcase (bitcoin-lisp.crypto:bytes-to-hex (third hashes)))))
-         (node (bitcoin-lisp.validation::ms-parse expr))
-         (script (bitcoin-lisp.validation::ms-node-script node))
+                       (string-downcase (bl.crypto:bytes-to-hex (first hashes)))
+                       (string-downcase (bl.crypto:bytes-to-hex (second hashes)))
+                       (string-downcase (bl.crypto:bytes-to-hex (third hashes)))))
+         (node (bl.val::ms-parse expr))
+         (script (bl.val::ms-node-script node))
          ;; Only two of the three preimages are known, which is exactly the
          ;; threshold — so the satisfier must dissatisfy the third.
-         (sat (bitcoin-lisp.validation::make-ms-satisfier
+         (sat (bl.val::make-ms-satisfier
                :preimage-fn (lambda (kind hash)
                               (declare (ignore kind))
                               (cond ((equalp hash (first hashes)) (first pres))
                                     ((equalp hash (second hashes)) (second pres))))))
-         (witness (bitcoin-lisp.validation::ms-satisfy node sat)))
-    (is-true (bitcoin-lisp.validation::ms-node-valid-top-level-p node))
+         (witness (bl.val::ms-satisfy node sat)))
+    (is-true (bl.val::ms-node-valid-top-level-p node))
     (is (= 3 (length witness)))
     (is-true (%ms-verify-p2wsh script witness 100000))
     ;; With no preimages at all, below the threshold: no satisfaction.
-    (is-false (bitcoin-lisp.validation::ms-satisfy
-               node (bitcoin-lisp.validation::make-ms-satisfier)))))
+    (is-false (bl.val::ms-satisfy
+               node (bl.val::make-ms-satisfier)))))
 
 ;;; --- Inference: script bytes back to a miniscript -----------------------------
 
@@ -586,13 +586,13 @@ mis-parses almost always produces a different script rather than none."
       (let ((expr (gethash "ms" v)))
         (when (and (%ms-flag v "VALID") (not (%ms-flag v "P2WSH_INVALID")))
           (let ((node (%ms-try-parse expr)))
-            (when (and node (bitcoin-lisp.validation::ms-node-valid-top-level-p node))
+            (when (and node (bl.val::ms-node-valid-top-level-p node))
               (incf checked)
-              (let* ((script (bitcoin-lisp.validation::ms-node-script node))
-                     (back (bitcoin-lisp.validation::ms-from-script script)))
+              (let* ((script (bl.val::ms-node-script node))
+                     (back (bl.val::ms-from-script script)))
                 (cond
                   ((null back) (push (format nil "~A: not inferred" expr) bad))
-                  ((not (equalp script (bitcoin-lisp.validation::ms-node-script back)))
+                  ((not (equalp script (bl.val::ms-node-script back)))
                    (push (format nil "~A: re-compiled differently" expr) bad)))))))))
     (is (>= checked 60) "expected ~60 inferable vectors, checked ~D" checked)
     (is (null bad) "~{~A~^~%~}" (reverse bad))))
@@ -611,14 +611,14 @@ script rather than merely validating it."
                       ;; and a wrapper run takes one colon, so the un-sugared
                       ;; form would print back as tv:sha256(...) — correctly.
                       "tv:sha256(0000000000000000000000000000000000000000000000000000000000000001)"))
-    (let* ((node (bitcoin-lisp.validation::ms-parse expr))
-           (back (bitcoin-lisp.validation::ms-from-script
-                  (bitcoin-lisp.validation::ms-node-script node))))
+    (let* ((node (bl.val::ms-parse expr))
+           (back (bl.val::ms-from-script
+                  (bl.val::ms-node-script node))))
       (is-true back "~A was not inferred" expr)
       (when back
-        (is (string= expr (bitcoin-lisp.validation::ms-node-to-string back))
+        (is (string= expr (bl.val::ms-node-to-string back))
             "~A came back as ~A" expr
-            (bitcoin-lisp.validation::ms-node-to-string back)))))
+            (bl.val::ms-node-to-string back)))))
   ;; Printing and re-parsing preserves the script — for everything except
   ;; pk_h, whose inferred form names a 20-byte HASH where the grammar wants a
   ;; key. That is not a gap to paper over: the script genuinely does not
@@ -627,14 +627,14 @@ script rather than merely validating it."
   (dolist (expr (list (format nil "and_v(v:pk(~A),older(9))" *ms-desc-key-a*)
                       (format nil "thresh(2,pk(~A),s:pk(~A))"
                               *ms-desc-key-a* *ms-desc-key-b*)))
-    (let* ((script (bitcoin-lisp.validation::ms-node-script
-                    (bitcoin-lisp.validation::ms-parse expr)))
-           (back (bitcoin-lisp.validation::ms-from-script script)))
+    (let* ((script (bl.val::ms-node-script
+                    (bl.val::ms-parse expr)))
+           (back (bl.val::ms-from-script script)))
       (is-true back)
       (is (equalp script
-                  (bitcoin-lisp.validation::ms-node-script
-                   (bitcoin-lisp.validation::ms-parse
-                    (bitcoin-lisp.validation::ms-node-to-string back))))
+                  (bl.val::ms-node-script
+                   (bl.val::ms-parse
+                    (bl.val::ms-node-to-string back))))
           "~A: printing and re-parsing must preserve the script" expr))))
 
 (test a-pkh-script-yields-the-hash-because-that-is-all-it-holds
@@ -642,49 +642,49 @@ script rather than merely validating it."
 hash, and the node has to say so — a node that pretended the hash was a key
 would hash it again and produce a different script."
   (let* ((expr (format nil "c:pk_h(~A)" *ms-desc-key-a*))
-         (node (bitcoin-lisp.validation::ms-parse expr))
-         (script (bitcoin-lisp.validation::ms-node-script node))
-         (back (bitcoin-lisp.validation::ms-from-script script)))
+         (node (bl.val::ms-parse expr))
+         (script (bl.val::ms-node-script node))
+         (back (bl.val::ms-from-script script)))
     (is-true back)
-    (is (equalp script (bitcoin-lisp.validation::ms-node-script back))
+    (is (equalp script (bl.val::ms-node-script back))
         "the inferred node must still compile to the same script")
-    (let ((inner (first (bitcoin-lisp.validation::ms-node-subs back))))
-      (is (eq :pk-h (bitcoin-lisp.validation::ms-node-fragment inner)))
-      (is (equalp (bitcoin-lisp.crypto:hash160
-                   (bitcoin-lisp.crypto:hex-to-bytes *ms-desc-key-a*))
-                  (bitcoin-lisp.validation::ms-node-data inner))
+    (let ((inner (first (bl.val::ms-node-subs back))))
+      (is (eq :pk-h (bl.val::ms-node-fragment inner)))
+      (is (equalp (bl.crypto:hash160
+                   (bl.crypto:hex-to-bytes *ms-desc-key-a*))
+                  (bl.val::ms-node-data inner))
           "the node carries the hash the script committed to")
-      (is (null (bitcoin-lisp.validation::ms-node-keys inner))
+      (is (null (bl.val::ms-node-keys inner))
           "and no key, because the script does not contain one"))))
 
 (test non-miniscript-and-non-minimal-scripts-are-refused
   "Inference answers a question about ARBITRARY scripts, so a wrong answer is
 worse than none. Three ways to be refused."
   ;; Not miniscript at all.
-  (is-false (bitcoin-lisp.validation::ms-from-script
+  (is-false (bl.val::ms-from-script
              (coerce #(#x51 #x52 #x93) '(vector (unsigned-byte 8)))))
   ;; Truncated.
-  (is-false (bitcoin-lisp.validation::ms-from-script
+  (is-false (bl.val::ms-from-script
              (coerce #(#xac) '(vector (unsigned-byte 8)))))
   ;; A non-minimal push: <1 byte> written as PUSHDATA1. Miniscript's mapping
   ;; from expression to script is one-to-one, so a second encoding of the same
   ;; script must not decode.
-  (let ((minimal (bitcoin-lisp.validation::ms-node-script
-                  (bitcoin-lisp.validation::ms-parse
+  (let ((minimal (bl.val::ms-node-script
+                  (bl.val::ms-parse
                    (format nil "c:pk_k(~A)" *ms-desc-key-a*)))))
-    (is-true (bitcoin-lisp.validation::ms-from-script minimal))
+    (is-true (bl.val::ms-from-script minimal))
     (let ((padded (concatenate '(vector (unsigned-byte 8))
                                (vector #x4c 33)
                                (subseq minimal 1 34)
                                (vector #xac))))
-      (is-false (bitcoin-lisp.validation::ms-from-script padded)
+      (is-false (bl.val::ms-from-script padded)
                 "a PUSHDATA1-encoded 33-byte push is not the minimal form")))
   ;; OP_CHECKSIG followed by a separate OP_VERIFY, where OP_CHECKSIGVERIFY was
   ;; the canonical spelling.
-  (is-false (bitcoin-lisp.validation::ms-from-script
+  (is-false (bl.val::ms-from-script
              (concatenate '(vector (unsigned-byte 8))
                           (vector 33)
-                          (bitcoin-lisp.crypto:hex-to-bytes *ms-desc-key-a*)
+                          (bl.crypto:hex-to-bytes *ms-desc-key-a*)
                           (vector #xac #x69 #x51)))))
 
 (test inference-refuses-a-script-whose-types-do-not-check
@@ -692,7 +692,7 @@ worse than none. Three ways to be refused."
 rules are what make satisfaction and non-malleability decidable, so a node that
 does not type is refused rather than returned as a best effort."
   ;; and_b(1,1): the second argument must be W-type, and OP_1 is B.
-  (is-false (bitcoin-lisp.validation::ms-from-script
+  (is-false (bl.val::ms-from-script
              (coerce #(#x51 #x51 #x9a) '(vector (unsigned-byte 8))))))
 
 ;;;; --- Resource limits and the sanity gate (Core IsSane) -------------------
@@ -702,8 +702,8 @@ does not type is refused rather than returned as a best effort."
 checked against scripts small enough to count by hand. GetOps is
 `ops.count + ops.sat' and GetStackSize is `ss.sat.netdiff + IsBKW'
 (miniscript.h:1557,1578)."
-  (flet ((ops (e) (bitcoin-lisp.validation::ms-node-get-ops (%ms-try-parse e)))
-         (ss (e) (bitcoin-lisp.validation::ms-node-get-stack-size (%ms-try-parse e))))
+  (flet ((ops (e) (bl.val::ms-node-get-ops (%ms-try-parse e)))
+         (ss (e) (bl.val::ms-node-get-stack-size (%ms-try-parse e))))
     (let ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
           (b "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65"))
       ;; pk(A) is `<key> OP_CHECKSIG': one non-push op, one witness element.
@@ -730,10 +730,10 @@ Core would not call it valid otherwise."
         (let ((node (%ms-try-parse (gethash "ms" v))))
           (when node
             (incf checked)
-            (is-true (bitcoin-lisp.validation::ms-node-check-ops-limit-p node)
+            (is-true (bl.val::ms-node-check-ops-limit-p node)
                      "ops limit rejected a Core-valid vector: ~A"
                      (gethash "ms" v))
-            (is-true (bitcoin-lisp.validation::ms-node-check-stack-size-p node)
+            (is-true (bl.val::ms-node-check-stack-size-p node)
                      "stack limit rejected a Core-valid vector: ~A"
                      (gethash "ms" v))))))
     (is (plusp checked) "no vectors were checked at all")))
@@ -743,12 +743,12 @@ Core would not call it valid otherwise."
 its subs, not one level."
   (let ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
         (b "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65"))
-    (is-false (bitcoin-lisp.validation::ms-node-duplicate-keys-p
+    (is-false (bl.val::ms-node-duplicate-keys-p
                (%ms-try-parse (format nil "or_b(pk(~A),s:pk(~A))" a b))))
-    (is-true (bitcoin-lisp.validation::ms-node-duplicate-keys-p
+    (is-true (bl.val::ms-node-duplicate-keys-p
               (%ms-try-parse (format nil "or_b(pk(~A),s:pk(~A))" a a))))
     ;; Buried two levels down, in different branches.
-    (is-true (bitcoin-lisp.validation::ms-node-duplicate-keys-p
+    (is-true (bl.val::ms-node-duplicate-keys-p
               (%ms-try-parse
                (format nil "andor(pk(~A),or_b(pk(~A),s:pk(~A)),0)" b a a))))))
 
@@ -762,17 +762,17 @@ is its inverse, so IsSane must negate it — getting that backwards would accept
 exactly the expressions the property exists to catch."
   (let ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc"))
     ;; Sane: needs a signature, non-malleable, no duplicates, no mix.
-    (is-true (bitcoin-lisp.validation::ms-node-sane-p
+    (is-true (bl.val::ms-node-sane-p
               (%ms-try-parse (format nil "and_v(v:pk(~A),older(42))" a))))
     ;; No signature anywhere: Core refuses it.
-    (is-false (bitcoin-lisp.validation::ms-node-sane-p (%ms-try-parse "older(42)")))
+    (is-false (bl.val::ms-node-sane-p (%ms-try-parse "older(42)")))
     ;; Every vector Core marks TIMELOCKMIX must fail the un-inverted predicate.
     (dolist (v (%ms-vectors))
       (when (and (%ms-flag v "TIMELOCKMIX") (%ms-flag v "VALID"))
         (let ((node (%ms-try-parse (gethash "ms" v))))
           (when node
-            (is-true (bitcoin-lisp.validation::ms-node-timelock-mix-p node))
-            (is-false (bitcoin-lisp.validation::ms-node-sane-p node))))))))
+            (is-true (bl.val::ms-node-timelock-mix-p node))
+            (is-false (bl.val::ms-node-sane-p node))))))))
 
 ;;;; --- Signing a wsh(<miniscript>) output ----------------------------------
 
@@ -783,49 +783,49 @@ signer over it. Returns (values kind witness-length verified-p error), where
 VERIFIED-P is the script engine's verdict on the witness that came out — the
 only evidence that matters, since a signer can always produce SOMETHING."
   (let* ((sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
-         (pk (bitcoin-lisp.crypto:derive-public-key sk))
-         (node (bitcoin-lisp.validation::ms-parse
-                (format nil expr (bitcoin-lisp.crypto:bytes-to-hex pk))))
-         (witscript (coerce (bitcoin-lisp.validation::ms-node-script node)
+         (pk (bl.crypto:derive-public-key sk))
+         (node (bl.val::ms-parse
+                (format nil expr (bl.crypto:bytes-to-hex pk))))
+         (witscript (coerce (bl.val::ms-node-script node)
                             '(vector (unsigned-byte 8))))
          (spk (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x20)
-                           (bitcoin-lisp.crypto:sha256 witscript)))
+                           (bl.crypto:sha256 witscript)))
          (prev-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xE1))
          (amount 100000)
-         (tx (bitcoin-lisp.serialization:make-transaction
+         (tx (bl.ser:make-transaction
               :version version
-              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint
                                                  :hash prev-txid :index 0)
                                :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                                :sequence sequence))
-              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+              :outputs (vector (bl.ser:make-tx-out
                                 :value 90000 :script-pubkey spk))
               :lock-time lock-time))
          (pubmap (make-hash-table :test 'equalp))
          (keymap (make-hash-table :test 'equalp)))
     (when have-key
       (setf (gethash pk pubmap) sk)
-      (setf (gethash (bitcoin-lisp.crypto:hash160 pk) keymap) (cons sk pk)))
-    (let ((bitcoin-lisp.coalton.interop:*current-tx* tx))
+      (setf (gethash (bl.crypto:hash160 pk) keymap) (cons sk pk)))
+    (let ((bl.interop:*current-tx* tx))
       (multiple-value-bind (sig err)
-          (bitcoin-lisp.rpc::%compute-input-signatures
+          (bl.rpc::%compute-input-signatures
            tx 0 (list spk amount nil witscript) keymap pubmap
            (make-hash-table :test 'equalp) #x01 nil nil)
         (if err
             (values nil nil nil err)
             (multiple-value-bind (ss wit ferr)
-                (bitcoin-lisp.rpc::%finalize-input-signatures sig)
+                (bl.rpc::%finalize-input-signatures sig)
               (declare (ignore ss))
               (if ferr
-                  (values (bitcoin-lisp.rpc::input-sig-kind sig) nil nil ferr)
-                  (let ((utxo-set (bitcoin-lisp.storage:make-utxo-set)))
-                    (setf (bitcoin-lisp.serialization:transaction-witness tx)
+                  (values (bl.rpc::input-sig-kind sig) nil nil ferr)
+                  (let ((utxo-set (bl.store:make-utxo-set)))
+                    (setf (bl.ser:transaction-witness tx)
                           (vector (coerce wit 'list)))
-                    (bitcoin-lisp.storage:add-utxo utxo-set prev-txid 0 amount spk 5)
-                    (values (bitcoin-lisp.rpc::input-sig-kind sig)
+                    (bl.store:add-utxo utxo-set prev-txid 0 amount spk 5)
+                    (values (bl.rpc::input-sig-kind sig)
                             (length wit)
-                            (bitcoin-lisp.validation:validate-transaction-scripts
+                            (bl.val:validate-transaction-scripts
                              tx utxo-set :height 800000)
                             nil)))))))))
 
@@ -915,16 +915,16 @@ low and the transaction underpays its fee. Core charges a constant 1+72 per
 signature (miniscript.h:1188), which is exactly why it is an upper bound: real
 signatures are 71 or 72 bytes."
   (let* ((sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
-         (pk (bitcoin-lisp.crypto:derive-public-key sk)))
+         (pk (bl.crypto:derive-public-key sk)))
     (dolist (expr '("and_v(v:pk(~a),older(42))"
                     "or_d(pk(~a),older(1000))"
                     "andor(pk(~a),older(42),older(1000))"))
-      (let* ((node (bitcoin-lisp.validation::ms-parse
-                    (format nil expr (bitcoin-lisp.crypto:bytes-to-hex pk))))
-             (witscript (coerce (bitcoin-lisp.validation::ms-node-script node)
+      (let* ((node (bl.val::ms-parse
+                    (format nil expr (bl.crypto:bytes-to-hex pk))))
+             (witscript (coerce (bl.val::ms-node-script node)
                                 '(vector (unsigned-byte 8)))))
         (multiple-value-bind (bytes elems)
-            (bitcoin-lisp.rpc::%miniscript-sat-size-and-elems witscript)
+            (bl.rpc::%miniscript-sat-size-and-elems witscript)
           (is-true (and bytes elems) "no estimate for ~A" expr)
           ;; The witnessScript is counted by the caller, so ELEMS is the
           ;; satisfaction's own elements plus one.
@@ -935,13 +935,13 @@ signatures are 71 or 72 bytes."
         (%ms-sign-p2wsh "and_v(v:pk(~a),older(42))")
       (declare (ignore kind verified))
       (is (null err))
-      (let* ((node (bitcoin-lisp.validation::ms-parse
+      (let* ((node (bl.val::ms-parse
                     (format nil "and_v(v:pk(~a),older(42))"
-                            (bitcoin-lisp.crypto:bytes-to-hex pk))))
-             (witscript (coerce (bitcoin-lisp.validation::ms-node-script node)
+                            (bl.crypto:bytes-to-hex pk))))
+             (witscript (coerce (bl.val::ms-node-script node)
                                 '(vector (unsigned-byte 8)))))
         (multiple-value-bind (bytes elems)
-            (bitcoin-lisp.rpc::%miniscript-sat-size-and-elems witscript)
+            (bl.rpc::%miniscript-sat-size-and-elems witscript)
           (declare (ignore bytes))
           (is (= elems len)
               "estimated ~D witness elements, signer produced ~D" elems len))))))

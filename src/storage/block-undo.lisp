@@ -33,23 +33,23 @@
 
 (defun bb-write-undo-coin (bb entry)
   "Serialize one spent output into BB (Core TxInUndoFormatter::Ser, undo.h:26-33)."
-  (bitcoin-lisp.serialization:bb-write-core-varint
+  (bl.ser:bb-write-core-varint
    bb (+ (* (utxo-entry-height entry) 2) (if (utxo-entry-coinbase entry) 1 0)))
   (when (plusp (utxo-entry-height entry))
-    (bitcoin-lisp.serialization:bb-write-u8 bb 0))
-  (bitcoin-lisp.serialization:bb-write-compressed-tx-out
+    (bl.ser:bb-write-u8 bb 0))
+  (bl.ser:bb-write-compressed-tx-out
    bb (utxo-entry-value entry) (utxo-entry-script-pubkey entry)))
 
 (defun br-read-undo-coin (br)
   "Read one spent output from BR (Core TxInUndoFormatter::Unser, undo.h:35-48).
 Returns a UTXO-ENTRY."
-  (let* ((code (bitcoin-lisp.serialization:br-read-core-varint br))
+  (let* ((code (bl.ser:br-read-core-varint br))
          (height (ash code -1))
          (coinbase (logtest code 1)))
     (when (plusp height)
-      (bitcoin-lisp.serialization:br-read-core-varint br))
+      (bl.ser:br-read-core-varint br))
     (multiple-value-bind (value script)
-        (bitcoin-lisp.serialization:br-read-compressed-tx-out br)
+        (bl.ser:br-read-compressed-tx-out br)
       (make-utxo-entry :value value
                        :script-pubkey script
                        :height height
@@ -58,22 +58,22 @@ Returns a UTXO-ENTRY."
 (defun serialize-block-undo (tx-undos)
   "Serialize TX-UNDOS -- a list with one element per non-coinbase transaction,
 each a list of UTXO-ENTRY in input order -- as Core's CBlockUndo."
-  (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
-    (bitcoin-lisp.serialization:bb-write-varint bb (length tx-undos))
+  (let ((bb (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-varint bb (length tx-undos))
     (dolist (tx-undo tx-undos)
-      (bitcoin-lisp.serialization:bb-write-varint bb (length tx-undo))
+      (bl.ser:bb-write-varint bb (length tx-undo))
       (dolist (entry tx-undo)
         (bb-write-undo-coin bb entry)))
-    (bitcoin-lisp.serialization:bb-finish bb)))
+    (bl.ser:bb-finish bb)))
 
 (defun deserialize-block-undo (bytes)
   "Parse Core's CBlockUndo from BYTES. Returns a list with one element per
 non-coinbase transaction, each a list of UTXO-ENTRY in input order."
-  (let* ((br (bitcoin-lisp.serialization:make-byte-reader-from bytes))
-         (tx-count (bitcoin-lisp.serialization:br-read-compact-size br))
+  (let* ((br (bl.ser:make-byte-reader-from bytes))
+         (tx-count (bl.ser:br-read-compact-size br))
          (result '()))
     (dotimes (i tx-count)
-      (let ((input-count (bitcoin-lisp.serialization:br-read-compact-size br))
+      (let ((input-count (bl.ser:br-read-compact-size br))
             (coins '()))
         (dotimes (j input-count)
           (push (br-read-undo-coin br) coins))
@@ -93,21 +93,21 @@ position of a Coin is the only thing naming it: a short or misaligned list
 would silently restore the wrong coins."
   (let ((remaining spent-utxos)
         (result '()))
-    (loop for tx in (rest (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+    (loop for tx in (rest (bl.ser:bitcoin-block-transactions block))
           for tx-index from 1
           do (let ((coins '()))
-               (bitcoin-lisp.serialization:dovector
-                   (input (bitcoin-lisp.serialization:transaction-inputs tx))
-                 (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+               (bl.ser:dovector
+                   (input (bl.ser:transaction-inputs tx))
+                 (let* ((prevout (bl.ser:tx-in-previous-output input))
                         (triple (pop remaining)))
                    (unless triple
                      (error "undo data is short: transaction ~D has more inputs than the ~
                              spent-utxo list accounts for" tx-index))
                    (destructuring-bind (txid index entry) triple
                      (unless (and (equalp txid
-                                          (bitcoin-lisp.serialization:outpoint-hash prevout))
+                                          (bl.ser:outpoint-hash prevout))
                                   (= index
-                                     (bitcoin-lisp.serialization:outpoint-index prevout)))
+                                     (bl.ser:outpoint-index prevout)))
                        (error "undo data is misaligned at transaction ~D: the spent-utxo ~
                                list does not match the block's inputs" tx-index))
                      (push entry coins))))
@@ -120,7 +120,7 @@ would silently restore the wrong coins."
 (defun spent-utxos-from-block-undo (block tx-undos)
   "The inverse of BLOCK-UNDO-FROM-SPENT-UTXOS: recover (txid index entry)
 triples in apply order by reading the outpoints back out of BLOCK."
-  (let ((txs (rest (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+  (let ((txs (rest (bl.ser:bitcoin-block-transactions block)))
         (result '()))
     (unless (= (length txs) (length tx-undos))
       (error "block and undo data inconsistent: ~D non-coinbase transactions, ~
@@ -128,17 +128,17 @@ triples in apply order by reading the outpoints back out of BLOCK."
     (loop for tx in txs
           for tx-undo in tx-undos
           for tx-index from 1
-          do (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
+          do (let ((inputs (bl.ser:transaction-inputs tx)))
                (unless (= (length inputs) (length tx-undo))
                  (error "transaction and undo data inconsistent at transaction ~D: ~
                          ~D inputs, ~D undo coins"
                         tx-index (length inputs) (length tx-undo)))
                (loop for entry in tx-undo
                      for input-index from 0
-                     do (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output
+                     do (let ((prevout (bl.ser:tx-in-previous-output
                                         (aref inputs input-index))))
-                          (push (list (bitcoin-lisp.serialization:outpoint-hash prevout)
-                                      (bitcoin-lisp.serialization:outpoint-index prevout)
+                          (push (list (bl.ser:outpoint-hash prevout)
+                                      (bl.ser:outpoint-index prevout)
                                       entry)
                                 result)))))
     (nreverse result)))

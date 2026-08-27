@@ -32,15 +32,15 @@
 
 (defun %cmp-core-varint-bytes (n)
   "Encode N as a Core VARINT, returning the raw bytes."
-  (let ((buf (bitcoin-lisp.serialization:make-byte-buf)))
-    (bitcoin-lisp.serialization:bb-write-core-varint buf n)
-    (bitcoin-lisp.serialization:bb-finish buf)))
+  (let ((buf (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-core-varint buf n)
+    (bl.ser:bb-finish buf)))
 
 (defun %cmp-read-core-varint (bytes)
   "Decode a Core VARINT. Returns (values value bytes-consumed)."
-  (let ((br (bitcoin-lisp.serialization:make-byte-reader-from bytes)))
-    (values (bitcoin-lisp.serialization:br-read-core-varint br)
-            (bitcoin-lisp.serialization:br-pos br))))
+  (let ((br (bl.ser:make-byte-reader-from bytes)))
+    (values (bl.ser:br-read-core-varint br)
+            (bl.ser:br-pos br))))
 
 (defun %cmp-fixed-privkey ()
   "Deterministic valid secp256k1 secret key (bytes 1..32)."
@@ -55,11 +55,11 @@ below reuse make-p2pkh-script / make-p2sh-script from sigops-tests.)"
 (defun %cmp-script-roundtrip (script)
   "Serialize SCRIPT through the compressed-script stream codec and read
 it back. Returns (values decoded-script encoded-bytes)."
-  (let ((buf (bitcoin-lisp.serialization:make-byte-buf)))
-    (bitcoin-lisp.serialization:bb-write-compressed-script buf script)
-    (let* ((encoded (bitcoin-lisp.serialization:bb-finish buf))
-           (br (bitcoin-lisp.serialization:make-byte-reader-from encoded)))
-      (values (bitcoin-lisp.serialization:br-read-compressed-script br)
+  (let ((buf (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-compressed-script buf script)
+    (let* ((encoded (bl.ser:bb-finish buf))
+           (br (bl.ser:make-byte-reader-from encoded)))
+      (values (bl.ser:br-read-compressed-script br)
               encoded))))
 
 (defun %cmp-x-not-on-curve ()
@@ -71,7 +71,7 @@ compress_p2pk_scripts_not_on_curve's rejection-sampling loop."
                                :initial-element i)
         for candidate = (concatenate '(simple-array (unsigned-byte 8) (*))
                                      (%cmp-bytes #x02) x)
-        unless (bitcoin-lisp.crypto:public-key-valid-p candidate)
+        unless (bl.crypto:public-key-valid-p candidate)
           return x
         finally (error "no off-curve x found (impossible)")))
 
@@ -128,8 +128,8 @@ large\", serialize.h:442-462)."
                     (,(* 50 coin) . #x32)
                     (,(* 21000000 coin) . #x1406f40)))
       (destructuring-bind (dec . enc) case
-        (is (= enc (bitcoin-lisp.serialization:compress-amount dec)))
-        (is (= dec (bitcoin-lisp.serialization:decompress-amount enc)))))))
+        (is (= enc (bl.ser:compress-amount dec)))
+        (is (= dec (bl.ser:decompress-amount enc)))))))
 
 (test compress-amounts-round-trip-multiples
   "compress_tests.cpp:50-63: encode round-trips for the unit/CENT/COIN/
@@ -139,12 +139,12 @@ Failures are counted, not is'd per-iteration (540k+ iterations)."
         (coin 100000000)
         (bad 0))
     (flet ((enc-ok (v)
-             (unless (= v (bitcoin-lisp.serialization:decompress-amount
-                           (bitcoin-lisp.serialization:compress-amount v)))
+             (unless (= v (bl.ser:decompress-amount
+                           (bl.ser:compress-amount v)))
                (incf bad)))
            (dec-ok (v)
-             (unless (= v (bitcoin-lisp.serialization:compress-amount
-                           (bitcoin-lisp.serialization:decompress-amount v)))
+             (unless (= v (bl.ser:compress-amount
+                           (bl.ser:decompress-amount v)))
                (incf bad))))
       (loop for i from 1 to 100000 do (enc-ok i))              ; NUM_MULTIPLES_UNIT
       (loop for i from 1 to 10000 do (enc-ok (* i cent)))      ; NUM_MULTIPLES_CENT
@@ -157,16 +157,16 @@ Failures are counted, not is'd per-iteration (540k+ iterations)."
 
 (test compress-script-p2pkh
   "P2PKH compresses to 0x00 + 20-byte key hash and round-trips."
-  (let* ((pubkey (bitcoin-lisp.crypto:derive-public-key (%cmp-fixed-privkey)))
-         (hash (bitcoin-lisp.crypto:hash160 pubkey))
+  (let* ((pubkey (bl.crypto:derive-public-key (%cmp-fixed-privkey)))
+         (hash (bl.crypto:hash160 pubkey))
          (script (make-p2pkh-script hash))
-         (out (bitcoin-lisp.serialization:compress-script script)))
+         (out (bl.ser:compress-script script)))
     (is (= 25 (length script)))
     (is (= 21 (length out)))
     (is (= #x00 (aref out 0)))
     (is (equalp hash (subseq out 1)))
     ;; direct decompress + stream round-trip
-    (is (equalp script (bitcoin-lisp.serialization:decompress-script
+    (is (equalp script (bl.ser:decompress-script
                         #x00 (subseq out 1))))
     (multiple-value-bind (decoded encoded) (%cmp-script-roundtrip script)
       (is (equalp out encoded))
@@ -175,14 +175,14 @@ Failures are counted, not is'd per-iteration (540k+ iterations)."
 (test compress-script-p2sh
   "P2SH compresses to 0x01 + 20-byte script hash and round-trips."
   (let* ((redeem (%cmp-bytes #x51))    ; OP_1
-         (hash (bitcoin-lisp.crypto:hash160 redeem))
+         (hash (bl.crypto:hash160 redeem))
          (script (make-p2sh-script hash))
-         (out (bitcoin-lisp.serialization:compress-script script)))
+         (out (bl.ser:compress-script script)))
     (is (= 23 (length script)))
     (is (= 21 (length out)))
     (is (= #x01 (aref out 0)))
     (is (equalp hash (subseq out 1)))
-    (is (equalp script (bitcoin-lisp.serialization:decompress-script
+    (is (equalp script (bl.ser:decompress-script
                         #x01 (subseq out 1))))
     (multiple-value-bind (decoded encoded) (%cmp-script-roundtrip script)
       (is (equalp out encoded))
@@ -191,14 +191,14 @@ Failures are counted, not is'd per-iteration (540k+ iterations)."
 (test compress-script-p2pk-compressed-key
   "P2PK with a compressed key: id byte = the key's own 0x02/0x03 prefix,
 payload = the 32-byte x coordinate (compress_tests.cpp:102-117)."
-  (let* ((pubkey (bitcoin-lisp.crypto:derive-public-key (%cmp-fixed-privkey)))
+  (let* ((pubkey (bl.crypto:derive-public-key (%cmp-fixed-privkey)))
          (script (%cmp-p2pk-script pubkey))
-         (out (bitcoin-lisp.serialization:compress-script script)))
+         (out (bl.ser:compress-script script)))
     (is (= 35 (length script)))
     (is (= 33 (length out)))
     (is (= (aref pubkey 0) (aref out 0)))
     (is (equalp (subseq pubkey 1 33) (subseq out 1)))
-    (is (equalp script (bitcoin-lisp.serialization:decompress-script
+    (is (equalp script (bl.ser:decompress-script
                         (aref out 0) (subseq out 1))))
     (multiple-value-bind (decoded encoded) (%cmp-script-roundtrip script)
       (is (equalp out encoded))
@@ -208,17 +208,17 @@ payload = the 32-byte x coordinate (compress_tests.cpp:102-117)."
   "P2PK with an uncompressed key: id = 0x04 | y-parity, payload = x;
 decompression must recover the FULL 65-byte key via secp256k1
 (compress_tests.cpp:119-133; compressor.cpp:122-135)."
-  (let* ((pubkey (bitcoin-lisp.crypto:derive-public-key
+  (let* ((pubkey (bl.crypto:derive-public-key
                   (%cmp-fixed-privkey) :compressed nil))
          (script (%cmp-p2pk-script pubkey))
-         (out (bitcoin-lisp.serialization:compress-script script)))
+         (out (bl.ser:compress-script script)))
     (is (= 67 (length script)))
     (is (= 33 (length out)))
     (is (= (logior #x04 (logand (aref pubkey 64) #x01)) (aref out 0)))
     (is (equalp (subseq pubkey 1 33) (subseq out 1)))
     ;; Point recovery: the decompressed script must be byte-identical,
     ;; i.e. the y coordinate was correctly recomputed.
-    (is (equalp script (bitcoin-lisp.serialization:decompress-script
+    (is (equalp script (bl.ser:decompress-script
                         (aref out 0) (subseq out 1))))
     (multiple-value-bind (decoded encoded) (%cmp-script-roundtrip script)
       (is (equalp out encoded))
@@ -234,14 +234,14 @@ compressed nor decompressed (compress_tests.cpp:135-165)."
                                                  :initial-element 0)))
          (script (%cmp-p2pk-script pubkey-raw)))
     (is (= 67 (length script)))
-    (is (null (bitcoin-lisp.serialization:compress-script script)))
+    (is (null (bl.ser:compress-script script)))
     (dolist (id '(#x04 #x05))
-      (is (null (bitcoin-lisp.serialization:decompress-script id x))))))
+      (is (null (bl.ser:decompress-script id x))))))
 
 (test compress-script-raw-fallback
   "A non-special script serializes as VARINT(size + 6) + raw bytes."
   (let ((script (%cmp-bytes #x6a #x04 #xde #xad #xbe #xef))) ; OP_RETURN push
-    (is (null (bitcoin-lisp.serialization:compress-script script)))
+    (is (null (bl.ser:compress-script script)))
     (multiple-value-bind (decoded encoded) (%cmp-script-roundtrip script)
       ;; 6 + 6 = 12 -> single VARINT byte 0x0C, then the script.
       (is (= (+ 1 (length script)) (length encoded)))
@@ -253,15 +253,15 @@ compressed nor decompressed (compress_tests.cpp:135-165)."
   "A raw script above MAX_SCRIPT_SIZE decodes as a one-byte OP_RETURN
 and the payload is skipped (compressor.h:87-90)."
   (let ((size 10001)
-        (buf (bitcoin-lisp.serialization:make-byte-buf)))
-    (bitcoin-lisp.serialization:bb-write-core-varint buf (+ size 6))
-    (bitcoin-lisp.serialization:bb-write-bytes
+        (buf (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-core-varint buf (+ size 6))
+    (bl.ser:bb-write-bytes
      buf (make-array size :element-type '(unsigned-byte 8) :initial-element #x55))
-    (let* ((bytes (bitcoin-lisp.serialization:bb-finish buf))
-           (br (bitcoin-lisp.serialization:make-byte-reader-from bytes))
-           (script (bitcoin-lisp.serialization:br-read-compressed-script br)))
+    (let* ((bytes (bl.ser:bb-finish buf))
+           (br (bl.ser:make-byte-reader-from bytes))
+           (script (bl.ser:br-read-compressed-script br)))
       (is (equalp (%cmp-bytes #x6a) script))
-      (is (bitcoin-lisp.serialization:br-eof-p br)))))
+      (is (bl.ser:br-eof-p br)))))
 
 ;;;; Compressed TxOut + Coin record (compressor.h:112-116; coins.h:63-79)
 
@@ -276,46 +276,46 @@ VARINT [80 49]; 50 COIN -> compressed 0x32 -> VARINT [32]; P2PKH(0xCC*20)
                                 (%cmp-bytes #x80 #x49 #x32 #x00)
                                 (make-array 20 :element-type '(unsigned-byte 8)
                                                :initial-element #xCC)))
-         (buf (bitcoin-lisp.serialization:make-byte-buf)))
-    (bitcoin-lisp.serialization:bb-write-compressed-coin
+         (buf (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-compressed-coin
      buf 100 t 5000000000 script)
-    (is (equalp expected (bitcoin-lisp.serialization:bb-finish buf)))))
+    (is (equalp expected (bl.ser:bb-finish buf)))))
 
 (test compressed-coin-record-zero-fields
   "height 0, non-coinbase, value 0, raw script [51]: [00 00 07 51]."
-  (let ((buf (bitcoin-lisp.serialization:make-byte-buf)))
-    (bitcoin-lisp.serialization:bb-write-compressed-coin
+  (let ((buf (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-compressed-coin
      buf 0 nil 0 (%cmp-bytes #x51))
     (is (equalp (%cmp-bytes #x00 #x00 #x07 #x51)
-                (bitcoin-lisp.serialization:bb-finish buf)))))
+                (bl.ser:bb-finish buf)))))
 
 (test compressed-coin-record-round-trip
   "serialize -> parse round-trips height/coinbase/value/script."
-  (let ((pubkey (bitcoin-lisp.crypto:derive-public-key (%cmp-fixed-privkey))))
+  (let ((pubkey (bl.crypto:derive-public-key (%cmp-fixed-privkey))))
     (dolist (case (list (list 0 nil 0 (%cmp-bytes #x51))
                         (list 1 t 5000000000
                               (make-p2pkh-script
-                               (bitcoin-lisp.crypto:hash160 pubkey)))
+                               (bl.crypto:hash160 pubkey)))
                         (list 100000 nil 546 (%cmp-p2pk-script pubkey))
                         (list 918212 nil 123456789
                               (%cmp-bytes #x6a #x02 #xab #xcd))
                         ;; height 2^30 exercises multi-byte VARINT codes
                         (list (expt 2 30) t 2100000000000000
                               (make-p2sh-script
-                               (bitcoin-lisp.crypto:hash160 (%cmp-bytes #x51))))))
+                               (bl.crypto:hash160 (%cmp-bytes #x51))))))
       (destructuring-bind (height coinbase value script) case
-        (let ((buf (bitcoin-lisp.serialization:make-byte-buf)))
-          (bitcoin-lisp.serialization:bb-write-compressed-coin
+        (let ((buf (bl.ser:make-byte-buf)))
+          (bl.ser:bb-write-compressed-coin
            buf height coinbase value script)
-          (let ((br (bitcoin-lisp.serialization:make-byte-reader-from
-                     (bitcoin-lisp.serialization:bb-finish buf))))
+          (let ((br (bl.ser:make-byte-reader-from
+                     (bl.ser:bb-finish buf))))
             (multiple-value-bind (h cb v s)
-                (bitcoin-lisp.serialization:br-read-compressed-coin br)
+                (bl.ser:br-read-compressed-coin br)
               (is (= height h))
               (is (eq (and coinbase t) (and cb t)))
               (is (= value v))
               (is (equalp script s))
-              (is (bitcoin-lisp.serialization:br-eof-p br)))))))))
+              (is (bl.ser:br-eof-p br)))))))))
 
 ;;;; hash_serialized_3 (kernel/coinstats.cpp:47-52, 88-146)
 ;;;;
@@ -342,7 +342,7 @@ Scripts here are all < 253 bytes, so compactsize is a single byte."
   "Double-SHA256 over hand-assembled preimages. COINS is a list of
 (txid vout height coinbase value script), already in Core order
 (txid-lex groups, numerically ascending vout within a group)."
-  (bitcoin-lisp.crypto:hash256
+  (bl.crypto:hash256
    (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
           (mapcar (lambda (c) (apply #'%h3-coin-preimage c)) coins))))
 
@@ -350,11 +350,11 @@ Scripts here are all < 253 bytes, so compactsize is a single byte."
   "Single-coin vector against a hand-assembled preimage."
   (let ((txid (%cmp-byte-vec (loop for i below 32 collect i)))
         (script (%cmp-bytes #x51 #x52))
-        (set (bitcoin-lisp.storage:make-utxo-set)))
-    (bitcoin-lisp.storage:add-utxo set txid 5 123456789 script 1000)
+        (set (bl.store:make-utxo-set)))
+    (bl.store:add-utxo set txid 5 123456789 script 1000)
     (is (equalp (%h3-expected-hash
                  (list (list txid 5 1000 nil 123456789 script)))
-                (bitcoin-lisp.storage:compute-utxo-set-hash set)))))
+                (bl.store:compute-utxo-set-hash set)))))
 
 (test hash-serialized-3-vout-ordering-trap
   "vouts 1, 256, 300 on ONE txid must hash in NUMERIC order (Core's
@@ -363,11 +363,11 @@ order them 256 < 1 < 300, so an unsorted implementation diverges."
   (let ((txid (make-array 32 :element-type '(unsigned-byte 8)
                              :initial-element #xAB))
         (script (%cmp-bytes #x51))
-        (set (bitcoin-lisp.storage:make-utxo-set)))
+        (set (bl.store:make-utxo-set)))
     ;; scrambled insertion order
-    (bitcoin-lisp.storage:add-utxo set txid 300 333 script 7)
-    (bitcoin-lisp.storage:add-utxo set txid 1 111 script 7)
-    (bitcoin-lisp.storage:add-utxo set txid 256 222 script 7)
+    (bl.store:add-utxo set txid 300 333 script 7)
+    (bl.store:add-utxo set txid 1 111 script 7)
+    (bl.store:add-utxo set txid 256 222 script 7)
     (let ((numeric (%h3-expected-hash
                     (list (list txid 1 7 nil 111 script)
                           (list txid 256 7 nil 222 script)
@@ -378,7 +378,7 @@ order them 256 < 1 < 300, so an unsorted implementation diverges."
                          (list txid 300 7 nil 333 script)))))
       ;; the trap is real: the two orders produce different digests
       (is (not (equalp numeric le-lex)))
-      (is (equalp numeric (bitcoin-lisp.storage:compute-utxo-set-hash set))))))
+      (is (equalp numeric (bl.store:compute-utxo-set-hash set))))))
 
 (test hash-serialized-3-coinbase-code-word
   "Coinbase + non-coinbase mix across two txids: the u32 code word must
@@ -389,15 +389,15 @@ pack (height<<1)|coinbase, and groups must follow txid-lex order."
                                :initial-element #x02))
         (script-a (%cmp-bytes #x51))
         (script-b (%cmp-bytes #x52 #x53))
-        (set (bitcoin-lisp.storage:make-utxo-set)))
+        (set (bl.store:make-utxo-set)))
     ;; insert b's coin first; group order must still be a then b
-    (bitcoin-lisp.storage:add-utxo set txid-b 0 999 script-b 200)
-    (bitcoin-lisp.storage:add-utxo set txid-a 0 5000000000 script-a 100
+    (bl.store:add-utxo set txid-b 0 999 script-b 200)
+    (bl.store:add-utxo set txid-a 0 5000000000 script-a 100
                                    :coinbase t)
     (is (equalp (%h3-expected-hash
                  (list (list txid-a 0 100 t 5000000000 script-a)
                        (list txid-b 0 200 nil 999 script-b)))
-                (bitcoin-lisp.storage:compute-utxo-set-hash set)))))
+                (bl.store:compute-utxo-set-hash set)))))
 
 (test hash-serialized-3-leveldb-cache-parity
   "The LevelDB-backed coins-view-cache path must produce the identical
@@ -411,18 +411,18 @@ order, so the per-txid sort must fix it there too)."
                              :initial-element #xAB))
         (script (%cmp-bytes #x51)))
     (unwind-protect
-         (bitcoin-lisp.storage:with-coins-view-db (base path)
-           (let ((cache (bitcoin-lisp.storage:make-coins-view-cache base))
+         (bl.store:with-coins-view-db (base path)
+           (let ((cache (bl.store:make-coins-view-cache base))
                  (expected (%h3-expected-hash
                             (list (list txid 1 7 nil 111 script)
                                   (list txid 256 7 nil 222 script)
                                   (list txid 300 7 nil 333 script)))))
-             (bitcoin-lisp.storage:add-utxo cache txid 300 333 script 7)
-             (bitcoin-lisp.storage:add-utxo cache txid 1 111 script 7)
-             (bitcoin-lisp.storage:add-utxo cache txid 256 222 script 7)
+             (bl.store:add-utxo cache txid 300 333 script 7)
+             (bl.store:add-utxo cache txid 1 111 script 7)
+             (bl.store:add-utxo cache txid 256 222 script 7)
              (is (equalp expected
-                         (bitcoin-lisp.storage:compute-utxo-set-hash cache)))))
-      (ignore-errors (bitcoin-lisp.storage:leveldb-destroy-db path))
+                         (bl.store:compute-utxo-set-hash cache)))))
+      (ignore-errors (bl.store:leveldb-destroy-db path))
       (ignore-errors
         (uiop:delete-directory-tree (pathname path)
                                     :validate t :if-does-not-exist :ignore)))))

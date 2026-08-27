@@ -8,7 +8,7 @@
                               (merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
                               (timestamp 0) (bits #x1d00ffff) (nonce 0))
   "Create a mock block header for testing."
-  (bitcoin-lisp.serialization:make-block-header
+  (bl.ser:make-block-header
    :version version
    :prev-block prev-block
    :merkle-root merkle-root
@@ -24,13 +24,13 @@
 BITS-FN if provided is called with (height) and should return bits for that block.
 Returns a list of entries from genesis (index 0) to tip."
   (let ((entries (make-array count))
-        (chain-state (bitcoin-lisp.storage:make-chain-state)))
+        (chain-state (bl.store:make-chain-state)))
     (dotimes (h count)
       (let* ((bits (if bits-fn (funcall bits-fn h) start-bits))
              (timestamp (+ start-time (* h interval)))
              (prev-entry (if (> h 0) (aref entries (1- h)) nil))
              (prev-hash (if prev-entry
-                            (bitcoin-lisp.storage:block-index-entry-hash prev-entry)
+                            (bl.store:block-index-entry-hash prev-entry)
                             (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
              (header (make-mock-header :timestamp timestamp :bits bits :prev-block prev-hash))
              ;; Generate a unique hash for this entry
@@ -39,23 +39,23 @@ Returns a list of entries from genesis (index 0) to tip."
                      (setf (aref h-bytes 1) (logand (ash h -8) #xFF))
                      (setf (aref h-bytes 2) (logand (ash h -16) #xFF))
                      h-bytes))
-             (entry (bitcoin-lisp.storage:make-block-index-entry
+             (entry (bl.store:make-block-index-entry
                      :hash hash
                      :height h
                      :header header
                      :prev-entry prev-entry
-                     :chain-work (bitcoin-lisp.storage:calculate-chain-work bits
+                     :chain-work (bl.store:calculate-chain-work bits
                                   (if prev-entry
-                                      (bitcoin-lisp.storage:block-index-entry-chain-work prev-entry)
+                                      (bl.store:block-index-entry-chain-work prev-entry)
                                       0))
                      :status :valid)))
         (setf (aref entries h) entry)
-        (bitcoin-lisp.storage:add-block-index-entry chain-state entry)))
+        (bl.store:add-block-index-entry chain-state entry)))
     ;; Update chain tip
     (let ((tip (aref entries (1- count))))
-      (bitcoin-lisp.storage:update-chain-tip
+      (bl.store:update-chain-tip
        chain-state
-       (bitcoin-lisp.storage:block-index-entry-hash tip)
+       (bl.store:block-index-entry-hash tip)
        (1- count)))
     (values entries chain-state)))
 
@@ -65,28 +65,28 @@ Returns a list of entries from genesis (index 0) to tip."
   "target-to-bits roundtrips with bits-to-target for standard values."
   ;; Genesis / min difficulty
   (let* ((bits #x1d00ffff)
-         (target (bitcoin-lisp.storage:bits-to-target bits))
-         (result (bitcoin-lisp.storage:target-to-bits target)))
+         (target (bl.store:bits-to-target bits))
+         (result (bl.store:target-to-bits target)))
     (is (= bits result)))
   ;; A real mainnet difficulty bits value (block 100000)
   (let* ((bits #x1b04864c)
-         (target (bitcoin-lisp.storage:bits-to-target bits))
-         (result (bitcoin-lisp.storage:target-to-bits target)))
+         (target (bl.store:bits-to-target bits))
+         (result (bl.store:target-to-bits target)))
     (is (= bits result)))
   ;; Another real value
   (let* ((bits #x1a05db8b)
-         (target (bitcoin-lisp.storage:bits-to-target bits))
-         (result (bitcoin-lisp.storage:target-to-bits target)))
+         (target (bl.store:bits-to-target bits))
+         (result (bl.store:target-to-bits target)))
     (is (= bits result))))
 
 (test target-to-bits-zero
   "target-to-bits of zero returns zero."
-  (is (= 0 (bitcoin-lisp.storage:target-to-bits 0))))
+  (is (= 0 (bl.store:target-to-bits 0))))
 
 (test target-to-bits-pow-limit
   "target-to-bits of the PoW limit target gives 0x1d00ffff."
-  (let ((pow-limit (bitcoin-lisp.storage:bits-to-target #x1d00ffff)))
-    (is (= #x1d00ffff (bitcoin-lisp.storage:target-to-bits pow-limit)))))
+  (let ((pow-limit (bl.store:bits-to-target #x1d00ffff)))
+    (is (= #x1d00ffff (bl.store:target-to-bits pow-limit)))))
 
 ;;;; Task 4.2: calculate-next-work-required tests
 
@@ -94,8 +94,8 @@ Returns a list of entries from genesis (index 0) to tip."
   "When actual timespan equals target timespan, bits stay the same."
   (let* ((bits #x1d00ffff)
          (start-time 1231006505)
-         (end-time (+ start-time bitcoin-lisp.storage:+pow-target-timespan+))
-         (result (bitcoin-lisp.storage:calculate-next-work-required start-time end-time bits)))
+         (end-time (+ start-time bl.store:+pow-target-timespan+))
+         (result (bl.store:calculate-next-work-required start-time end-time bits)))
     (is (= bits result))))
 
 (test retarget-4x-clamp-increase
@@ -104,10 +104,10 @@ Returns a list of entries from genesis (index 0) to tip."
          (start-time 1231006505)
          ;; Timespan = 1 second (extremely fast), should clamp to timespan/4
          (end-time (+ start-time 1))
-         (result (bitcoin-lisp.storage:calculate-next-work-required start-time end-time bits))
+         (result (bl.store:calculate-next-work-required start-time end-time bits))
          ;; With 1/4 timespan, target should be target/4 (harder)
-         (expected-timespan (floor bitcoin-lisp.storage:+pow-target-timespan+ 4))
-         (expected (bitcoin-lisp.storage:calculate-next-work-required
+         (expected-timespan (floor bl.store:+pow-target-timespan+ 4))
+         (expected (bl.store:calculate-next-work-required
                     start-time (+ start-time expected-timespan) bits)))
     (is (= result expected))))
 
@@ -116,11 +116,11 @@ Returns a list of entries from genesis (index 0) to tip."
   (let* ((bits #x1d00ffff)
          (start-time 1231006505)
          ;; Timespan = 100 * target (extremely slow), should clamp to timespan*4
-         (end-time (+ start-time (* 100 bitcoin-lisp.storage:+pow-target-timespan+)))
-         (result (bitcoin-lisp.storage:calculate-next-work-required start-time end-time bits))
+         (end-time (+ start-time (* 100 bl.store:+pow-target-timespan+)))
+         (result (bl.store:calculate-next-work-required start-time end-time bits))
          ;; With 4x timespan, target should be target*4 (easier) but capped at pow-limit
-         (expected-timespan (* 4 bitcoin-lisp.storage:+pow-target-timespan+))
-         (expected (bitcoin-lisp.storage:calculate-next-work-required
+         (expected-timespan (* 4 bl.store:+pow-target-timespan+))
+         (expected (bl.store:calculate-next-work-required
                     start-time (+ start-time expected-timespan) bits)))
     (is (= result expected))))
 
@@ -128,11 +128,11 @@ Returns a list of entries from genesis (index 0) to tip."
   "When blocks are mined in half the target time, difficulty roughly doubles."
   (let* ((bits #x1d00ffff)
          (start-time 1231006505)
-         (half-timespan (floor bitcoin-lisp.storage:+pow-target-timespan+ 2))
+         (half-timespan (floor bl.store:+pow-target-timespan+ 2))
          (end-time (+ start-time half-timespan))
-         (result (bitcoin-lisp.storage:calculate-next-work-required start-time end-time bits))
-         (old-target (bitcoin-lisp.storage:bits-to-target bits))
-         (new-target (bitcoin-lisp.storage:bits-to-target result)))
+         (result (bl.store:calculate-next-work-required start-time end-time bits))
+         (old-target (bl.store:bits-to-target bits))
+         (new-target (bl.store:bits-to-target result)))
     ;; New target should be roughly half the old target (harder)
     (is (< new-target old-target))
     ;; Within rounding, new-target ~= old-target / 2
@@ -145,21 +145,21 @@ Returns a list of entries from genesis (index 0) to tip."
   (let* ((bits #x1d00ffff)
          (start-time 1231006505)
          ;; 4x slower than target timespan (maximum decrease)
-         (end-time (+ start-time (* 4 bitcoin-lisp.storage:+pow-target-timespan+)))
-         (result (bitcoin-lisp.storage:calculate-next-work-required start-time end-time bits))
-         (result-target (bitcoin-lisp.storage:bits-to-target result))
-         (pow-limit (bitcoin-lisp.storage:bits-to-target bitcoin-lisp.storage:+pow-limit-bits+)))
+         (end-time (+ start-time (* 4 bl.store:+pow-target-timespan+)))
+         (result (bl.store:calculate-next-work-required start-time end-time bits))
+         (result-target (bl.store:bits-to-target result))
+         (pow-limit (bl.store:bits-to-target bl.store:+pow-limit-bits+)))
     (is (<= result-target pow-limit))))
 
 ;;;; Task 4.3: testnet min-difficulty and walk-back tests
 
 (test testnet-min-difficulty-allowed
   "testnet-min-difficulty-allowed-p returns T when >20 min gap."
-  (is (bitcoin-lisp.validation:testnet-min-difficulty-allowed-p
+  (is (bl.val:testnet-min-difficulty-allowed-p
        (+ 1000 1201) 1000))
-  (is (not (bitcoin-lisp.validation:testnet-min-difficulty-allowed-p
+  (is (not (bl.val:testnet-min-difficulty-allowed-p
             (+ 1000 1200) 1000)))
-  (is (not (bitcoin-lisp.validation:testnet-min-difficulty-allowed-p
+  (is (not (bl.val:testnet-min-difficulty-allowed-p
             (+ 1000 600) 1000))))
 
 (test testnet-walk-back-bits-finds-real-difficulty
@@ -175,7 +175,7 @@ Returns a list of entries from genesis (index 0) to tip."
                                        (t #x1d00ffff))))
       (declare (ignore chain-state))
       ;; Walk back from the last entry (height 9, min-difficulty)
-      (let ((result (bitcoin-lisp.validation:testnet-walk-back-bits (aref entries 9))))
+      (let ((result (bl.val:testnet-walk-back-bits (aref entries 9))))
         ;; Should find real-bits at height 4
         (is (= real-bits result))))))
 
@@ -187,50 +187,50 @@ Returns a list of entries from genesis (index 0) to tip."
       (build-mock-chain 6 :start-bits #x1d00ffff)
     (declare (ignore chain-state))
     ;; Walk back from entry 5 should stop at entry 0 (height 0, retarget boundary)
-    (let ((result (bitcoin-lisp.validation:testnet-walk-back-bits (aref entries 5))))
+    (let ((result (bl.val:testnet-walk-back-bits (aref entries 5))))
       (is (= #x1d00ffff result)))))
 
 ;;;; Task 4.4: first retarget period tests
 
 (test first-period-uses-genesis-bits
   "Blocks in the first retarget period (heights 0-2015) expect pow-limit bits on mainnet."
-  (let ((bitcoin-lisp:*network* :mainnet))
+  (let ((bl:*network* :mainnet))
     (multiple-value-bind (entries chain-state)
         (build-mock-chain 100)
       (declare (ignore chain-state))
       ;; Check various heights within first period
       (dolist (h '(1 50 99))
         (let* ((prev-entry (aref entries (1- h)))
-               (expected (bitcoin-lisp.validation:get-expected-bits h prev-entry)))
-          (is (= bitcoin-lisp.storage:+pow-limit-bits+ expected)
+               (expected (bl.val:get-expected-bits h prev-entry)))
+          (is (= bl.store:+pow-limit-bits+ expected)
               "Height ~D should expect pow-limit bits" h))))))
 
 (test genesis-block-expects-pow-limit
   "Height 0 (genesis) expects pow-limit bits."
-  (is (= bitcoin-lisp.storage:+pow-limit-bits+
-         (bitcoin-lisp.validation:get-expected-bits 0 nil))))
+  (is (= bl.store:+pow-limit-bits+
+         (bl.val:get-expected-bits 0 nil))))
 
 ;;;; Task 4.5: validate-difficulty integration tests
 
 (test validate-difficulty-accepts-correct-mainnet-bits
   "validate-difficulty accepts correct bits on mainnet."
-  (let ((bitcoin-lisp:*network* :mainnet))
+  (let ((bl:*network* :mainnet))
     (multiple-value-bind (entries chain-state)
         (build-mock-chain 100)
       (declare (ignore chain-state))
       ;; All blocks use pow-limit bits, which is correct for the first period
       (dotimes (h 99)
         (let* ((entry (aref entries (1+ h)))
-               (header (bitcoin-lisp.storage:block-index-entry-header entry))
+               (header (bl.store:block-index-entry-header entry))
                (prev-entry (aref entries h)))
           (multiple-value-bind (valid error)
-              (bitcoin-lisp.validation:validate-difficulty header (1+ h) prev-entry)
+              (bl.val:validate-difficulty header (1+ h) prev-entry)
             (is (eq t valid) "Height ~D should be valid" (1+ h))
             (is (null error))))))))
 
 (test validate-difficulty-rejects-wrong-bits-mainnet
   "validate-difficulty rejects incorrect bits on mainnet."
-  (let ((bitcoin-lisp:*network* :mainnet))
+  (let ((bl:*network* :mainnet))
     (multiple-value-bind (entries chain-state)
         (build-mock-chain 10)
       (declare (ignore chain-state))
@@ -238,13 +238,13 @@ Returns a list of entries from genesis (index 0) to tip."
       (let* ((prev-entry (aref entries 4))
              (wrong-header (make-mock-header :bits #x1b04864c :timestamp 1231006505)))
         (multiple-value-bind (valid error)
-            (bitcoin-lisp.validation:validate-difficulty wrong-header 5 prev-entry)
+            (bl.val:validate-difficulty wrong-header 5 prev-entry)
           (is (null valid))
           (is (eq :bad-difficulty error)))))))
 
 (test validate-difficulty-at-retarget-boundary
   "validate-difficulty accepts correct retarget at boundary."
-  (let ((bitcoin-lisp:*network* :mainnet))
+  (let ((bl:*network* :mainnet))
     ;; Build exactly 2017 blocks (0 through 2016)
     (multiple-value-bind (entries chain-state)
         (build-mock-chain 2017 :start-time 1231006505 :interval 600)
@@ -253,29 +253,29 @@ Returns a list of entries from genesis (index 0) to tip."
       ;; Timespan from block 0 to block 2015 = 2015 * 600 = 1,209,000 seconds
       ;; This is close to target (1,209,600), so bits should be very similar
       (let* ((prev-entry (aref entries 2015))
-             (expected-bits (bitcoin-lisp.validation:get-expected-bits 2016 prev-entry))
+             (expected-bits (bl.val:get-expected-bits 2016 prev-entry))
              (header (make-mock-header :bits expected-bits
                                        :timestamp (+ 1231006505 (* 2016 600)))))
         (multiple-value-bind (valid error)
-            (bitcoin-lisp.validation:validate-difficulty header 2016 prev-entry)
+            (bl.val:validate-difficulty header 2016 prev-entry)
           (is (eq t valid))
           (is (null error)))))))
 
 (test validate-difficulty-testnet-min-difficulty
   "validate-difficulty accepts min-difficulty on testnet with >20 min gap."
-  (let ((bitcoin-lisp:*network* :testnet3))
+  (let ((bl:*network* :testnet3))
     (multiple-value-bind (entries chain-state)
         (build-mock-chain 10 :start-time 1000000 :interval 600
                           :bits-fn (lambda (h) (declare (ignore h)) #x1b04864c))
       (declare (ignore chain-state))
       ;; Create a header with min-difficulty and >20 min gap
       (let* ((prev-entry (aref entries 9))
-             (prev-time (bitcoin-lisp.serialization:block-header-timestamp
-                         (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
+             (prev-time (bl.ser:block-header-timestamp
+                         (bl.store:block-index-entry-header prev-entry)))
              (header (make-mock-header :bits #x1d00ffff
                                        :timestamp (+ prev-time 1201))))
         (multiple-value-bind (valid error)
-            (bitcoin-lisp.validation:validate-difficulty header 10 prev-entry)
+            (bl.val:validate-difficulty header 10 prev-entry)
           (is (eq t valid))
           (is (null error)))))))
 
@@ -284,35 +284,35 @@ Returns a list of entries from genesis (index 0) to tip."
 unconditionally when min-difficulty is allowed). One at the real walk-back
 difficulty is rejected, not accepted -- fixing an over-acceptance vs Core that
 could split us from the testnet network."
-  (let ((bitcoin-lisp:*network* :testnet4))
+  (let ((bl:*network* :testnet4))
     (multiple-value-bind (entries chain-state)
         (build-mock-chain 10 :start-time 1000000 :interval 600
                           :bits-fn (lambda (h) (declare (ignore h)) #x1b04864c))
       (declare (ignore chain-state))
       (let* ((prev-entry (aref entries 9))
-             (prev-time (bitcoin-lisp.serialization:block-header-timestamp
-                         (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
+             (prev-time (bl.ser:block-header-timestamp
+                         (bl.store:block-index-entry-header prev-entry)))
              ;; >20 min gap but carrying the real (walk-back) difficulty.
              (header (make-mock-header :bits #x1b04864c
                                        :timestamp (+ prev-time 1201))))
         (multiple-value-bind (valid error)
-            (bitcoin-lisp.validation:validate-difficulty header 10 prev-entry)
+            (bl.val:validate-difficulty header 10 prev-entry)
           (is (null valid))
           (is (eq :bad-difficulty error))))
       ;; The same >20-min gap WITH powLimit bits is still accepted.
       (let* ((prev-entry (aref entries 9))
-             (prev-time (bitcoin-lisp.serialization:block-header-timestamp
-                         (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
-             (header (make-mock-header :bits bitcoin-lisp.storage:+pow-limit-bits+
+             (prev-time (bl.ser:block-header-timestamp
+                         (bl.store:block-index-entry-header prev-entry)))
+             (header (make-mock-header :bits bl.store:+pow-limit-bits+
                                        :timestamp (+ prev-time 1201))))
         (multiple-value-bind (valid error)
-            (bitcoin-lisp.validation:validate-difficulty header 10 prev-entry)
+            (bl.val:validate-difficulty header 10 prev-entry)
           (is (eq t valid))
           (is (null error)))))))
 
 (test validate-difficulty-testnet-walk-back
   "validate-difficulty uses walk-back bits on testnet with <=20 min gap."
-  (let ((bitcoin-lisp:*network* :testnet3)
+  (let ((bl:*network* :testnet3)
         (real-bits #x1b04864c))
     (multiple-value-bind (entries chain-state)
         (build-mock-chain 10 :start-time 1000000 :interval 600
@@ -321,12 +321,12 @@ could split us from the testnet network."
       (declare (ignore chain-state))
       ;; Create a header with real bits and <=20 min gap (should pass via walk-back)
       (let* ((prev-entry (aref entries 9))
-             (prev-time (bitcoin-lisp.serialization:block-header-timestamp
-                         (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
+             (prev-time (bl.ser:block-header-timestamp
+                         (bl.store:block-index-entry-header prev-entry)))
              (header (make-mock-header :bits real-bits
                                        :timestamp (+ prev-time 600))))
         (multiple-value-bind (valid error)
-            (bitcoin-lisp.validation:validate-difficulty header 10 prev-entry)
+            (bl.val:validate-difficulty header 10 prev-entry)
           (is (eq t valid))
           (is (null error)))))))
 
@@ -339,7 +339,7 @@ could split us from the testnet network."
 
 (defun %timewarp-entry (height timestamp)
   "A mock block-index-entry at HEIGHT whose header has timestamp TIMESTAMP."
-  (bitcoin-lisp.storage:make-block-index-entry
+  (bl.store:make-block-index-entry
    :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
    :height height
    :header (make-mock-header :timestamp timestamp)
@@ -347,39 +347,39 @@ could split us from the testnet network."
 
 (test bip94-timewarp-rejected-on-testnet4-boundary
   "A period-boundary block >600s earlier than its predecessor violates BIP 94."
-  (let ((bitcoin-lisp:*network* :testnet4)
+  (let ((bl:*network* :testnet4)
         (prev (%timewarp-entry 2015 100000)))
-    (is (bitcoin-lisp.validation::bip94-timewarp-violation-p
+    (is (bl.val::bip94-timewarp-violation-p
          (make-mock-header :timestamp (- 100000 601)) 2016 prev))))
 
 (test bip94-timewarp-allowed-within-tolerance
   "Exactly 600s early is allowed (strict <), and so is a later timestamp."
-  (let ((bitcoin-lisp:*network* :testnet4)
+  (let ((bl:*network* :testnet4)
         (prev (%timewarp-entry 2015 100000)))
-    (is (null (bitcoin-lisp.validation::bip94-timewarp-violation-p
+    (is (null (bl.val::bip94-timewarp-violation-p
                (make-mock-header :timestamp (- 100000 600)) 2016 prev)))
-    (is (null (bitcoin-lisp.validation::bip94-timewarp-violation-p
+    (is (null (bl.val::bip94-timewarp-violation-p
                (make-mock-header :timestamp 100000) 2016 prev)))))
 
 (test bip94-timewarp-only-at-period-boundary
   "Non-boundary heights are exempt even with a wildly early timestamp."
-  (let ((bitcoin-lisp:*network* :testnet4)
+  (let ((bl:*network* :testnet4)
         (prev (%timewarp-entry 2014 100000)))
-    (is (null (bitcoin-lisp.validation::bip94-timewarp-violation-p
+    (is (null (bl.val::bip94-timewarp-violation-p
                (make-mock-header :timestamp (- 100000 5000)) 2015 prev)))))
 
 (test bip94-timewarp-not-enforced-off-testnet4
   "enforce_BIP94 is false on mainnet/testnet3: the timewarp check is skipped."
   (dolist (net '(:mainnet :testnet3))
-    (let ((bitcoin-lisp:*network* net)
+    (let ((bl:*network* net)
           (prev (%timewarp-entry 2015 100000)))
-      (is (null (bitcoin-lisp.validation::bip94-timewarp-violation-p
+      (is (null (bl.val::bip94-timewarp-violation-p
                  (make-mock-header :timestamp (- 100000 601)) 2016 prev))))))
 
 (test bip94-timewarp-excludes-genesis
   "Height 0 satisfies the modulo but is excluded (no predecessor)."
-  (let ((bitcoin-lisp:*network* :testnet4))
-    (is (null (bitcoin-lisp.validation::bip94-timewarp-violation-p
+  (let ((bl:*network* :testnet4))
+    (is (null (bl.val::bip94-timewarp-violation-p
                (make-mock-header :timestamp 0) 0 nil)))))
 
 ;;;; nBits range validation (derive-target / check-proof-of-work)
@@ -389,34 +389,34 @@ could split us from the testnet network."
 (test derive-target-valid-within-limit
   "A normal compact target decodes; pow-limit bits decode to exactly the
 pow-limit target."
-  (is (= bitcoin-lisp.storage::+pow-limit-target+
-         (bitcoin-lisp.storage:derive-target #x1d00ffff)))
+  (is (= bl.store::+pow-limit-target+
+         (bl.store:derive-target #x1d00ffff)))
   ;; a harder (smaller) historical target is valid and below the limit
-  (let ((tgt (bitcoin-lisp.storage:derive-target #x1b0404cb)))
+  (let ((tgt (bl.store:derive-target #x1b0404cb)))
     (is (not (null tgt)))
-    (is (< tgt bitcoin-lisp.storage::+pow-limit-target+))))
+    (is (< tgt bl.store::+pow-limit-target+))))
 
 (test derive-target-rejects-negative
   "Sign bit (0x00800000) set on a non-zero mantissa => negative => NIL."
-  (is (null (bitcoin-lisp.storage:derive-target #x1d80ffff))))
+  (is (null (bl.store:derive-target #x1d80ffff))))
 
 (test derive-target-rejects-zero
   "Zero mantissa => zero target => NIL."
-  (is (null (bitcoin-lisp.storage:derive-target #x03000000))))
+  (is (null (bl.store:derive-target #x03000000))))
 
 (test derive-target-rejects-overflow
   "Exponent/size > 34 with non-zero mantissa => overflow => NIL."
-  (is (null (bitcoin-lisp.storage:derive-target #x23000001))))
+  (is (null (bl.store:derive-target #x23000001))))
 
 (test derive-target-rejects-above-powlimit
   "A target larger than the PoW limit (bigger exponent) => NIL."
-  (is (null (bitcoin-lisp.storage:derive-target #x1e00ffff))))
+  (is (null (bl.store:derive-target #x1e00ffff))))
 
 (test check-proof-of-work-rejects-out-of-range-bits
   "check-proof-of-work returns NIL for nBits out of range, regardless of
 the hash (negative / above-limit), and is not fooled by the old
 24-bit-mantissa decode."
-  (is (null (bitcoin-lisp.validation::check-proof-of-work
+  (is (null (bl.val::check-proof-of-work
              (make-mock-header :bits #x1d80ffff))))   ; negative
-  (is (null (bitcoin-lisp.validation::check-proof-of-work
+  (is (null (bl.val::check-proof-of-work
              (make-mock-header :bits #x1e00ffff)))))  ; above pow limit

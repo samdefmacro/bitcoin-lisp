@@ -15,18 +15,18 @@
   (let ((combined (make-array 64 :element-type '(unsigned-byte 8))))
     (replace combined a :start1 0)
     (replace combined b :start1 32)
-    (bitcoin-lisp.crypto:hash256 combined)))
+    (bl.crypto:hash256 combined)))
 
 (test merkle-root-empty
   "Empty hash list should return 32 zero bytes."
-  (let ((root (bitcoin-lisp.validation:compute-merkle-root '())))
+  (let ((root (bl.val:compute-merkle-root '())))
     (is (= 32 (length root)))
     (is (every #'zerop root))))
 
 (test merkle-root-single-tx
   "Single hash: merkle root equals that hash."
   (let* ((h (make-merkle-test-hash #xAA))
-         (root (bitcoin-lisp.validation:compute-merkle-root (list h))))
+         (root (bl.val:compute-merkle-root (list h))))
     (is (equalp h root))))
 
 (test merkle-root-two-tx
@@ -34,7 +34,7 @@
   (let* ((h0 (make-merkle-test-hash #x11))
          (h1 (make-merkle-test-hash #x22))
          (expected (manual-hash-pair h0 h1))
-         (root (bitcoin-lisp.validation:compute-merkle-root (list h0 h1))))
+         (root (bl.val:compute-merkle-root (list h0 h1))))
     (is (equalp expected root))))
 
 (test merkle-root-three-tx-odd-duplication
@@ -46,7 +46,7 @@ Root = hash256(hash256(h0||h1) || hash256(h2||h2))."
          (left (manual-hash-pair h0 h1))
          (right (manual-hash-pair h2 h2))
          (expected (manual-hash-pair left right))
-         (root (bitcoin-lisp.validation:compute-merkle-root (list h0 h1 h2))))
+         (root (bl.val:compute-merkle-root (list h0 h1 h2))))
     (is (equalp expected root))))
 
 (test merkle-root-four-tx
@@ -58,15 +58,15 @@ Root = hash256(hash256(h0||h1) || hash256(h2||h2))."
          (left (manual-hash-pair h0 h1))
          (right (manual-hash-pair h2 h3))
          (expected (manual-hash-pair left right))
-         (root (bitcoin-lisp.validation:compute-merkle-root (list h0 h1 h2 h3))))
+         (root (bl.val:compute-merkle-root (list h0 h1 h2 h3))))
     (is (equalp expected root))))
 
 (test merkle-root-deterministic
   "Same inputs should always produce the same root."
   (let* ((hashes (loop for i from 1 to 5
                        collect (make-merkle-test-hash i)))
-         (root1 (bitcoin-lisp.validation:compute-merkle-root (copy-list hashes)))
-         (root2 (bitcoin-lisp.validation:compute-merkle-root (copy-list hashes))))
+         (root1 (bl.val:compute-merkle-root (copy-list hashes)))
+         (root2 (bl.val:compute-merkle-root (copy-list hashes))))
     (is (equalp root1 root2))))
 
 (test merkle-root-does-not-mutate-input
@@ -76,7 +76,7 @@ Root = hash256(hash256(h0||h1) || hash256(h2||h2))."
          (h0-copy (copy-seq h0))
          (h1-copy (copy-seq h1))
          (input-list (list h0 h1)))
-    (bitcoin-lisp.validation:compute-merkle-root input-list)
+    (bl.val:compute-merkle-root input-list)
     (is (equalp h0 h0-copy))
     (is (equalp h1 h1-copy))))
 
@@ -90,10 +90,10 @@ compute-merkle-root returns the identical root for both but flags the mutated
          (h1 (make-merkle-test-hash #x22))
          (h2 (make-merkle-test-hash #x33)))
     (multiple-value-bind (root-original mutated-original)
-        (bitcoin-lisp.validation:compute-merkle-root (list h0 h1 h2))
+        (bl.val:compute-merkle-root (list h0 h1 h2))
       (multiple-value-bind (root-mutated mutated-flag)
           ;; [h0 h1 h2 h2] — the attacker's explicit duplication of the last tx.
-          (bitcoin-lisp.validation:compute-merkle-root (list h0 h1 h2 h2))
+          (bl.val:compute-merkle-root (list h0 h1 h2 h2))
         ;; Same root — this IS the vulnerability.
         (is (equalp root-original root-mutated)
             "Duplicate-last-tx attack should produce identical merkle root")
@@ -107,6 +107,6 @@ including the odd-count self-duplication of the last element."
   (dolist (n '(1 2 3 4 5 7 8))
     (let ((hashes (loop for i from 1 to n collect (make-merkle-test-hash i))))
       (multiple-value-bind (root mutated)
-          (bitcoin-lisp.validation:compute-merkle-root hashes)
+          (bl.val:compute-merkle-root hashes)
         (declare (ignore root))
         (is (null mutated) "n=~D should not be flagged mutated" n)))))

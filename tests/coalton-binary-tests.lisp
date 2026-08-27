@@ -11,35 +11,35 @@
 
 (defun call-read-u8 (bytes pos)
   "Call Coalton read-u8 from CL."
-  (bitcoin-lisp.coalton.binary:read-u8 bytes pos))
+  (bl.cbin:read-u8 bytes pos))
 
 (defun call-read-u16-le (bytes pos)
   "Call Coalton read-u16-le from CL."
-  (bitcoin-lisp.coalton.binary:read-u16-le bytes pos))
+  (bl.cbin:read-u16-le bytes pos))
 
 (defun call-read-u32-le (bytes pos)
   "Call Coalton read-u32-le from CL."
-  (bitcoin-lisp.coalton.binary:read-u32-le bytes pos))
+  (bl.cbin:read-u32-le bytes pos))
 
 (defun call-read-u64-le (bytes pos)
   "Call Coalton read-u64-le from CL."
-  (bitcoin-lisp.coalton.binary:read-u64-le bytes pos))
+  (bl.cbin:read-u64-le bytes pos))
 
 (defun call-read-i32-le (bytes pos)
   "Call Coalton read-i32-le from CL."
-  (bitcoin-lisp.coalton.binary:read-i32-le bytes pos))
+  (bl.cbin:read-i32-le bytes pos))
 
 (defun call-read-i64-le (bytes pos)
   "Call Coalton read-i64-le from CL."
-  (bitcoin-lisp.coalton.binary:read-i64-le bytes pos))
+  (bl.cbin:read-i64-le bytes pos))
 
 (defun call-read-compact-size (bytes pos)
   "Call Coalton read-compact-size from CL."
-  (bitcoin-lisp.coalton.binary:read-compact-size bytes pos))
+  (bl.cbin:read-compact-size bytes pos))
 
 (defun call-read-bytes (bytes pos count)
   "Call Coalton read-bytes from CL."
-  (bitcoin-lisp.coalton.binary:read-bytes bytes pos count))
+  (bl.cbin:read-bytes bytes pos count))
 
 ;;;; Read tests
 
@@ -123,20 +123,20 @@
 
 (test binary-write-u8
   "Test writing unsigned 8-bit integer."
-  (let ((result (bitcoin-lisp.coalton.binary:write-u8 42)))
+  (let ((result (bl.cbin:write-u8 42)))
     (is (= 1 (length result)))
     (is (= 42 (aref result 0)))))
 
 (test binary-write-u16-le
   "Test writing unsigned 16-bit little-endian integer."
-  (let ((result (bitcoin-lisp.coalton.binary:write-u16-le #x1234)))
+  (let ((result (bl.cbin:write-u16-le #x1234)))
     (is (= 2 (length result)))
     (is (= #x34 (aref result 0)))
     (is (= #x12 (aref result 1)))))
 
 (test binary-write-u32-le
   "Test writing unsigned 32-bit little-endian integer."
-  (let ((result (bitcoin-lisp.coalton.binary:write-u32-le #x12345678)))
+  (let ((result (bl.cbin:write-u32-le #x12345678)))
     (is (= 4 (length result)))
     (is (= #x78 (aref result 0)))
     (is (= #x56 (aref result 1)))
@@ -145,7 +145,7 @@
 
 (test binary-write-u64-le
   "Test writing unsigned 64-bit little-endian integer."
-  (let ((result (bitcoin-lisp.coalton.binary:write-u64-le #x0102030405060708)))
+  (let ((result (bl.cbin:write-u64-le #x0102030405060708)))
     (is (= 8 (length result)))
     (is (= #x08 (aref result 0)))
     (is (= #x07 (aref result 1)))
@@ -158,7 +158,7 @@
 
 (test binary-write-i32-le-negative
   "Test writing negative signed 32-bit integer."
-  (let ((result (bitcoin-lisp.coalton.binary:write-i32-le -1)))
+  (let ((result (bl.cbin:write-i32-le -1)))
     (is (= 4 (length result)))
     (is (= #xFF (aref result 0)))
     (is (= #xFF (aref result 1)))
@@ -167,13 +167,13 @@
 
 (test binary-write-compact-size-small
   "Test writing small CompactSize value."
-  (let ((result (bitcoin-lisp.coalton.binary:write-compact-size 100)))
+  (let ((result (bl.cbin:write-compact-size 100)))
     (is (= 1 (length result)))
     (is (= 100 (aref result 0)))))
 
 (test binary-write-compact-size-medium
   "Test writing medium CompactSize value (>= 253)."
-  (let ((result (bitcoin-lisp.coalton.binary:write-compact-size 300)))
+  (let ((result (bl.cbin:write-compact-size 300)))
     (is (= 3 (length result)))
     (is (= #xFD (aref result 0)))  ; Prefix for 2-byte encoding
     (is (= #x2C (aref result 1)))  ; 300 = 0x012C
@@ -200,7 +200,7 @@
   "Test byte vector concatenation."
   (let* ((a (make-array 3 :initial-contents '(1 2 3)))
          (b (make-array 2 :initial-contents '(4 5)))
-         (result (bitcoin-lisp.coalton.binary:concat-bytes a b)))
+         (result (bl.cbin:concat-bytes a b)))
     (is (= 5 (length result)))
     (is (= 1 (aref result 0)))
     (is (= 2 (aref result 1)))
@@ -225,13 +225,13 @@
 (test binary-roundtrip-u32
   "Test that write-u32-le and read-u32-le are inverses."
   (let* ((original #xDEADBEEF)
-         (bytes (bitcoin-lisp.coalton.binary:write-u32-le original))
+         (bytes (bl.cbin:write-u32-le original))
          (result (call-read-u32-le bytes 0)))
     (is (= original (get-read-result-value result)))))
 
 (test binary-roundtrip-compact-size
   "Test that write-compact-size and read-compact-size are inverses."
   (dolist (value '(0 100 252 253 300 65535 65536 100000))
-    (let* ((bytes (bitcoin-lisp.coalton.binary:write-compact-size value))
+    (let* ((bytes (bl.cbin:write-compact-size value))
            (result (call-read-compact-size bytes 0)))
       (is (= value (get-read-result-value result))))))

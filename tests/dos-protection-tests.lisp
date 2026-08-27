@@ -8,53 +8,53 @@
 
 (test token-bucket-creation
   "Token bucket should initialize with full tokens."
-  (let ((bucket (bitcoin-lisp:make-rate-limiter 10.0 20.0)))
-    (is (= 10.0 (bitcoin-lisp:token-bucket-rate bucket)))
-    (is (= 20.0 (bitcoin-lisp:token-bucket-burst bucket)))
+  (let ((bucket (bl:make-rate-limiter 10.0 20.0)))
+    (is (= 10.0 (bl:token-bucket-rate bucket)))
+    (is (= 20.0 (bl:token-bucket-burst bucket)))
     ;; Starts full (tokens = burst)
-    (is (= 20.0 (bitcoin-lisp:token-bucket-tokens bucket)))))
+    (is (= 20.0 (bl:token-bucket-tokens bucket)))))
 
 (test token-bucket-allows-within-burst
   "Token bucket should allow requests within burst capacity."
-  (let ((bucket (bitcoin-lisp:make-rate-limiter 10.0 5.0)))
+  (let ((bucket (bl:make-rate-limiter 10.0 5.0)))
     ;; Should allow 5 requests (burst capacity)
     (dotimes (i 5)
-      (is (bitcoin-lisp:token-bucket-allow-p bucket)))))
+      (is (bl:token-bucket-allow-p bucket)))))
 
 (test token-bucket-rejects-when-depleted
   "Token bucket should reject when tokens are depleted."
-  (let ((bucket (bitcoin-lisp:make-rate-limiter 10.0 3.0)))
+  (let ((bucket (bl:make-rate-limiter 10.0 3.0)))
     ;; Consume all tokens
     (dotimes (i 3)
-      (bitcoin-lisp:token-bucket-allow-p bucket))
+      (bl:token-bucket-allow-p bucket))
     ;; Next request should be rejected
-    (is (not (bitcoin-lisp:token-bucket-allow-p bucket)))))
+    (is (not (bl:token-bucket-allow-p bucket)))))
 
 (test token-bucket-refills-over-time
   "Token bucket should refill tokens based on elapsed time."
-  (let ((bucket (bitcoin-lisp:make-rate-limiter 1000.0 5.0)))
+  (let ((bucket (bl:make-rate-limiter 1000.0 5.0)))
     ;; Consume all tokens
     (dotimes (i 5)
-      (bitcoin-lisp:token-bucket-allow-p bucket))
+      (bl:token-bucket-allow-p bucket))
     ;; With a high rate (1000/sec), even a tiny delay should refill
     ;; Force a refill by manipulating last-refill time
-    (setf (bitcoin-lisp::token-bucket-last-refill bucket)
+    (setf (bl::token-bucket-last-refill bucket)
           (- (get-internal-real-time) (* 2 internal-time-units-per-second)))
     ;; Should now allow (2 seconds at 1000/sec = 2000 tokens, capped at burst=5)
-    (is (bitcoin-lisp:token-bucket-allow-p bucket))))
+    (is (bl:token-bucket-allow-p bucket))))
 
 (test token-bucket-burst-caps-refill
   "Refilled tokens should not exceed burst capacity."
-  (let ((bucket (bitcoin-lisp:make-rate-limiter 1000.0 3.0)))
+  (let ((bucket (bl:make-rate-limiter 1000.0 3.0)))
     ;; Consume one token
-    (bitcoin-lisp:token-bucket-allow-p bucket)
+    (bl:token-bucket-allow-p bucket)
     ;; Simulate long delay
-    (setf (bitcoin-lisp::token-bucket-last-refill bucket)
+    (setf (bl::token-bucket-last-refill bucket)
           (- (get-internal-real-time) (* 100 internal-time-units-per-second)))
     ;; Should allow exactly 3 (burst) then reject
     (dotimes (i 3)
-      (is (bitcoin-lisp:token-bucket-allow-p bucket)))
-    (is (not (bitcoin-lisp:token-bucket-allow-p bucket)))))
+      (is (bl:token-bucket-allow-p bucket)))
+    (is (not (bl:token-bucket-allow-p bucket)))))
 
 ;;;; ============================================================
 ;;;; 2. Per-Peer Rate Limiting Tests
@@ -62,46 +62,46 @@
 
 (test peer-rate-limiters-initialized
   "Peer rate limiters should be initialized from config."
-  (let ((peer (bitcoin-lisp.networking::make-peer)))
-    (bitcoin-lisp.networking:init-peer-rate-limiters peer)
+  (let ((peer (bl.net::make-peer)))
+    (bl.net:init-peer-rate-limiters peer)
     ;; All rate limiters should be non-nil
-    (is (not (null (bitcoin-lisp.networking::peer-rate-limit-inv peer))))
-    (is (not (null (bitcoin-lisp.networking::peer-rate-limit-tx peer))))
-    (is (not (null (bitcoin-lisp.networking::peer-rate-limit-addr peer))))
-    (is (not (null (bitcoin-lisp.networking::peer-rate-limit-getdata peer))))
-    (is (not (null (bitcoin-lisp.networking::peer-rate-limit-headers peer))))))
+    (is (not (null (bl.net::peer-rate-limit-inv peer))))
+    (is (not (null (bl.net::peer-rate-limit-tx peer))))
+    (is (not (null (bl.net::peer-rate-limit-addr peer))))
+    (is (not (null (bl.net::peer-rate-limit-getdata peer))))
+    (is (not (null (bl.net::peer-rate-limit-headers peer))))))
 
 (test check-peer-rate-limit-allows-normal
   "Rate limit check should allow messages within limits."
-  (let ((peer (bitcoin-lisp.networking::make-peer)))
-    (bitcoin-lisp.networking:init-peer-rate-limiters peer)
+  (let ((peer (bl.net::make-peer)))
+    (bl.net:init-peer-rate-limiters peer)
     ;; Each message type should allow at least one message
-    (is (bitcoin-lisp.networking:check-peer-rate-limit peer "inv"))
-    (is (bitcoin-lisp.networking:check-peer-rate-limit peer "tx"))
-    (is (bitcoin-lisp.networking:check-peer-rate-limit peer "addr"))
-    (is (bitcoin-lisp.networking:check-peer-rate-limit peer "addrv2"))
-    (is (bitcoin-lisp.networking:check-peer-rate-limit peer "getdata"))
-    (is (bitcoin-lisp.networking:check-peer-rate-limit peer "headers"))))
+    (is (bl.net:check-peer-rate-limit peer "inv"))
+    (is (bl.net:check-peer-rate-limit peer "tx"))
+    (is (bl.net:check-peer-rate-limit peer "addr"))
+    (is (bl.net:check-peer-rate-limit peer "addrv2"))
+    (is (bl.net:check-peer-rate-limit peer "getdata"))
+    (is (bl.net:check-peer-rate-limit peer "headers"))))
 
 (test check-peer-rate-limit-unknown-command
   "Rate limit check for unknown commands should always pass."
-  (let ((peer (bitcoin-lisp.networking::make-peer)))
-    (bitcoin-lisp.networking:init-peer-rate-limiters peer)
-    (is (bitcoin-lisp.networking:check-peer-rate-limit peer "ping"))
-    (is (bitcoin-lisp.networking:check-peer-rate-limit peer "pong"))
-    (is (bitcoin-lisp.networking:check-peer-rate-limit peer "version"))))
+  (let ((peer (bl.net::make-peer)))
+    (bl.net:init-peer-rate-limiters peer)
+    (is (bl.net:check-peer-rate-limit peer "ping"))
+    (is (bl.net:check-peer-rate-limit peer "pong"))
+    (is (bl.net:check-peer-rate-limit peer "version"))))
 
 (test check-peer-rate-limit-rejects-flood
   "Rate limit check should reject when burst is exceeded."
-  (let ((peer (bitcoin-lisp.networking::make-peer)))
+  (let ((peer (bl.net::make-peer)))
     ;; Use a very low burst for testing
-    (let ((bitcoin-lisp:*rate-limit-addr* '(1.0 . 2.0)))
-      (bitcoin-lisp.networking:init-peer-rate-limiters peer)
+    (let ((bl:*rate-limit-addr* '(1.0 . 2.0)))
+      (bl.net:init-peer-rate-limiters peer)
       ;; Consume the burst
       (dotimes (i 2)
-        (bitcoin-lisp.networking:check-peer-rate-limit peer "addr"))
+        (bl.net:check-peer-rate-limit peer "addr"))
       ;; Next should fail
-      (is (not (bitcoin-lisp.networking:check-peer-rate-limit peer "addr"))))))
+      (is (not (bl.net:check-peer-rate-limit peer "addr"))))))
 
 ;;;; ============================================================
 ;;;; 3. Handshake Timeout Tests
@@ -109,34 +109,34 @@
 
 (test handshake-timeout-ok-when-ready
   "Ready peers should not be flagged for handshake timeout."
-  (let ((peer (bitcoin-lisp.networking::make-peer :state :ready)))
+  (let ((peer (bl.net::make-peer :state :ready)))
     ;; check-handshake-timeout is only called for non-ready peers
     ;; via check-peer-health, which returns early for ready peers
-    (is (eq :ok (bitcoin-lisp.networking:check-handshake-timeout peer)))))
+    (is (eq :ok (bl.net:check-handshake-timeout peer)))))
 
 (test handshake-timeout-ok-when-recent
   "Peers with recent connect time should be ok."
-  (let ((peer (bitcoin-lisp.networking::make-peer
+  (let ((peer (bl.net::make-peer
                :state :handshaking
                :connect-time (get-internal-real-time))))
-    (is (eq :ok (bitcoin-lisp.networking:check-handshake-timeout peer)))))
+    (is (eq :ok (bl.net:check-handshake-timeout peer)))))
 
 (test handshake-timeout-disconnect-when-expired
   "Peers that exceeded handshake timeout should be flagged for disconnect."
   (let* ((past-time (- (get-internal-real-time)
-                       (* (1+ bitcoin-lisp:+handshake-timeout-seconds+)
+                       (* (1+ bl:+handshake-timeout-seconds+)
                           internal-time-units-per-second)))
-         (peer (bitcoin-lisp.networking::make-peer
+         (peer (bl.net::make-peer
                 :state :handshaking
                 :connect-time past-time)))
-    (is (eq :disconnect (bitcoin-lisp.networking:check-handshake-timeout peer)))))
+    (is (eq :disconnect (bl.net:check-handshake-timeout peer)))))
 
 (test handshake-timeout-not-checked-for-zero-connect-time
   "Peers with connect-time 0 (default) should not be timed out."
-  (let ((peer (bitcoin-lisp.networking::make-peer
+  (let ((peer (bl.net::make-peer
                :state :connecting
                :connect-time 0)))
-    (is (eq :ok (bitcoin-lisp.networking:check-handshake-timeout peer)))))
+    (is (eq :ok (bl.net:check-handshake-timeout peer)))))
 
 ;;;; ============================================================
 ;;;; 4. Maximum Message Payload Tests
@@ -145,7 +145,7 @@
 (test max-message-payload-constant
   "Max message payload should be 4,000,000 bytes (Core MAX_PROTOCOL_MESSAGE_LENGTH,
 decimal 4e6 -- not 4 MiB)."
-  (is (= (* 4 1000 1000) bitcoin-lisp:+max-message-payload+)))
+  (is (= (* 4 1000 1000) bl:+max-message-payload+)))
 
 ;;;; ============================================================
 ;;;; 5. Recent Transaction Rejects Filter Tests
@@ -157,63 +157,63 @@ decimal 4e6 -- not 4 MiB)."
 
 (test recent-rejects-creation
   "Recent rejects filter should be created correctly."
-  (let ((filter (bitcoin-lisp:make-rejects-filter 100)))
+  (let ((filter (bl:make-rejects-filter 100)))
     (is (not (null filter)))
     ;; Empty filter should not match anything
-    (is (not (bitcoin-lisp:recent-reject-p filter (make-test-txid 1))))))
+    (is (not (bl:recent-reject-p filter (make-test-txid 1))))))
 
 (test recent-rejects-add-and-check
   "Adding a hash should make it detectable."
-  (let ((filter (bitcoin-lisp:make-rejects-filter 100))
+  (let ((filter (bl:make-rejects-filter 100))
         (txid (make-test-txid 42)))
     ;; Not present yet
-    (is (not (bitcoin-lisp:recent-reject-p filter txid)))
+    (is (not (bl:recent-reject-p filter txid)))
     ;; Add it
-    (is (bitcoin-lisp:add-recent-reject filter txid))
+    (is (bl:add-recent-reject filter txid))
     ;; Now present
-    (is (bitcoin-lisp:recent-reject-p filter txid))))
+    (is (bl:recent-reject-p filter txid))))
 
 (test recent-rejects-duplicate-add
   "Adding an already-present hash should return NIL."
-  (let ((filter (bitcoin-lisp:make-rejects-filter 100))
+  (let ((filter (bl:make-rejects-filter 100))
         (txid (make-test-txid 42)))
     ;; First add succeeds
-    (is (bitcoin-lisp:add-recent-reject filter txid))
+    (is (bl:add-recent-reject filter txid))
     ;; Duplicate add returns NIL
-    (is (not (bitcoin-lisp:add-recent-reject filter txid)))))
+    (is (not (bl:add-recent-reject filter txid)))))
 
 (test recent-rejects-eviction
   "Filter should evict oldest entry when at capacity."
-  (let ((filter (bitcoin-lisp:make-rejects-filter 3)))
+  (let ((filter (bl:make-rejects-filter 3)))
     ;; Fill to capacity
-    (bitcoin-lisp:add-recent-reject filter (make-test-txid 1))
-    (bitcoin-lisp:add-recent-reject filter (make-test-txid 2))
-    (bitcoin-lisp:add-recent-reject filter (make-test-txid 3))
+    (bl:add-recent-reject filter (make-test-txid 1))
+    (bl:add-recent-reject filter (make-test-txid 2))
+    (bl:add-recent-reject filter (make-test-txid 3))
     ;; All present
-    (is (bitcoin-lisp:recent-reject-p filter (make-test-txid 1)))
-    (is (bitcoin-lisp:recent-reject-p filter (make-test-txid 2)))
-    (is (bitcoin-lisp:recent-reject-p filter (make-test-txid 3)))
+    (is (bl:recent-reject-p filter (make-test-txid 1)))
+    (is (bl:recent-reject-p filter (make-test-txid 2)))
+    (is (bl:recent-reject-p filter (make-test-txid 3)))
     ;; Add one more - should evict oldest (1)
-    (bitcoin-lisp:add-recent-reject filter (make-test-txid 4))
-    (is (not (bitcoin-lisp:recent-reject-p filter (make-test-txid 1))))
-    (is (bitcoin-lisp:recent-reject-p filter (make-test-txid 4)))))
+    (bl:add-recent-reject filter (make-test-txid 4))
+    (is (not (bl:recent-reject-p filter (make-test-txid 1))))
+    (is (bl:recent-reject-p filter (make-test-txid 4)))))
 
 (test recent-rejects-clear
   "Clearing filter should remove all entries."
-  (let ((filter (bitcoin-lisp:make-rejects-filter 100)))
-    (bitcoin-lisp:add-recent-reject filter (make-test-txid 1))
-    (bitcoin-lisp:add-recent-reject filter (make-test-txid 2))
+  (let ((filter (bl:make-rejects-filter 100)))
+    (bl:add-recent-reject filter (make-test-txid 1))
+    (bl:add-recent-reject filter (make-test-txid 2))
     ;; Clear
-    (bitcoin-lisp:clear-recent-rejects filter)
+    (bl:clear-recent-rejects filter)
     ;; Should be empty
-    (is (not (bitcoin-lisp:recent-reject-p filter (make-test-txid 1))))
-    (is (not (bitcoin-lisp:recent-reject-p filter (make-test-txid 2))))))
+    (is (not (bl:recent-reject-p filter (make-test-txid 1))))
+    (is (not (bl:recent-reject-p filter (make-test-txid 2))))))
 
 (test recent-rejects-nil-filter-safe
   "Operations on NIL filter should be safe (no errors)."
-  (is (not (bitcoin-lisp:recent-reject-p nil (make-test-txid 1))))
-  (is (not (bitcoin-lisp:add-recent-reject nil (make-test-txid 1))))
-  (finishes (bitcoin-lisp:clear-recent-rejects nil)))
+  (is (not (bl:recent-reject-p nil (make-test-txid 1))))
+  (is (not (bl:add-recent-reject nil (make-test-txid 1))))
+  (finishes (bl:clear-recent-rejects nil)))
 
 ;;;; ============================================================
 ;;;; 6. RPC Rate Limiting Tests
@@ -221,32 +221,32 @@ decimal 4e6 -- not 4 MiB)."
 
 (test rpc-rate-limiter-initialization
   "RPC rate limiter should be initialized from config."
-  (let ((bitcoin-lisp:*rpc-rate-limit* '(10.0 . 5.0))
-        (bitcoin-lisp.rpc::*rpc-rate-limiter* nil))
-    (bitcoin-lisp.rpc::init-rpc-rate-limiter)
-    (is (not (null bitcoin-lisp.rpc::*rpc-rate-limiter*)))
+  (let ((bl:*rpc-rate-limit* '(10.0 . 5.0))
+        (bl.rpc::*rpc-rate-limiter* nil))
+    (bl.rpc::init-rpc-rate-limiter)
+    (is (not (null bl.rpc::*rpc-rate-limiter*)))
     ;; Should allow requests within burst
-    (is (bitcoin-lisp.rpc::rpc-rate-limit-check))
+    (is (bl.rpc::rpc-rate-limit-check))
     ;; Cleanup
-    (setf bitcoin-lisp.rpc::*rpc-rate-limiter* nil)))
+    (setf bl.rpc::*rpc-rate-limiter* nil)))
 
 (test rpc-rate-limiter-rejects-flood
   "RPC rate limiter should reject when burst exceeded."
-  (let ((bitcoin-lisp:*rpc-rate-limit* '(1.0 . 3.0))
-        (bitcoin-lisp.rpc::*rpc-rate-limiter* nil))
-    (bitcoin-lisp.rpc::init-rpc-rate-limiter)
+  (let ((bl:*rpc-rate-limit* '(1.0 . 3.0))
+        (bl.rpc::*rpc-rate-limiter* nil))
+    (bl.rpc::init-rpc-rate-limiter)
     ;; Consume burst
     (dotimes (i 3)
-      (bitcoin-lisp.rpc::rpc-rate-limit-check))
+      (bl.rpc::rpc-rate-limit-check))
     ;; Next should fail
-    (is (not (bitcoin-lisp.rpc::rpc-rate-limit-check)))
+    (is (not (bl.rpc::rpc-rate-limit-check)))
     ;; Cleanup
-    (setf bitcoin-lisp.rpc::*rpc-rate-limiter* nil)))
+    (setf bl.rpc::*rpc-rate-limiter* nil)))
 
 (test rpc-rate-limiter-nil-allows-all
   "When rate limiter is nil, all requests should be allowed."
-  (let ((bitcoin-lisp.rpc::*rpc-rate-limiter* nil))
-    (is (bitcoin-lisp.rpc::rpc-rate-limit-check))))
+  (let ((bl.rpc::*rpc-rate-limiter* nil))
+    (is (bl.rpc::rpc-rate-limit-check))))
 
 ;;;; ============================================================
 ;;;; 7. RPC Body Size Limit Tests
@@ -255,7 +255,7 @@ decimal 4e6 -- not 4 MiB)."
 (test max-rpc-body-size-constant
   "Max RPC body size is Core's MAX_SIZE = 32 MiB (httpserver.cpp:410,
 serialize.h:32) — the old 1 MiB cap broke submitblock for mainnet blocks."
-  (is (= #x02000000 bitcoin-lisp:+max-rpc-body-size+)))
+  (is (= #x02000000 bl:+max-rpc-body-size+)))
 
 ;;;; ============================================================
 ;;;; Configuration Tests
@@ -264,16 +264,16 @@ serialize.h:32) — the old 1 MiB cap broke submitblock for mainnet blocks."
 (test dos-config-defaults
   "Default DoS configuration values should be reasonable."
   ;; Rate limits are (rate . burst) cons cells
-  (is (consp bitcoin-lisp:*rate-limit-inv*))
-  (is (consp bitcoin-lisp:*rate-limit-tx*))
-  (is (consp bitcoin-lisp:*rate-limit-addr*))
-  (is (consp bitcoin-lisp:*rate-limit-getdata*))
-  (is (consp bitcoin-lisp:*rate-limit-headers*))
-  (is (consp bitcoin-lisp:*rpc-rate-limit*))
+  (is (consp bl:*rate-limit-inv*))
+  (is (consp bl:*rate-limit-tx*))
+  (is (consp bl:*rate-limit-addr*))
+  (is (consp bl:*rate-limit-getdata*))
+  (is (consp bl:*rate-limit-headers*))
+  (is (consp bl:*rpc-rate-limit*))
   ;; Constants
-  (is (> bitcoin-lisp:+max-message-payload+ 0))
-  (is (> bitcoin-lisp:+max-rpc-body-size+ 0))
-  (is (> bitcoin-lisp:+handshake-timeout-seconds+ 0)))
+  (is (> bl:+max-message-payload+ 0))
+  (is (> bl:+max-rpc-body-size+ 0))
+  (is (> bl:+handshake-timeout-seconds+ 0)))
 
 ;;;; ============================================================
 ;;;; Discouragement (soft-ban) Tests
@@ -281,29 +281,29 @@ serialize.h:32) — the old 1 MiB cap broke submitblock for mainnet blocks."
 
 (test discourage-and-check
   "discourage-peer marks an address; peer-discouraged-p reports it."
-  (bitcoin-lisp.networking:clear-discouraged)
-  (is (not (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.7")))
-  (bitcoin-lisp.networking:discourage-peer "203.0.113.7")
-  (is (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.7"))
+  (bl.net:clear-discouraged)
+  (is (not (bl.net:peer-discouraged-p "203.0.113.7")))
+  (bl.net:discourage-peer "203.0.113.7")
+  (is (bl.net:peer-discouraged-p "203.0.113.7"))
   ;; Unrelated address is unaffected.
-  (is (not (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.8")))
-  (bitcoin-lisp.networking:clear-discouraged)
-  (is (not (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.7"))))
+  (is (not (bl.net:peer-discouraged-p "203.0.113.8")))
+  (bl.net:clear-discouraged)
+  (is (not (bl.net:peer-discouraged-p "203.0.113.7"))))
 
 (test discourage-ignores-empty-address
   "Empty/blank addresses are never discouraged."
-  (bitcoin-lisp.networking:clear-discouraged)
-  (bitcoin-lisp.networking:discourage-peer "")
-  (is (not (bitcoin-lisp.networking:peer-discouraged-p ""))))
+  (bl.net:clear-discouraged)
+  (bl.net:discourage-peer "")
+  (is (not (bl.net:peer-discouraged-p ""))))
 
 (test connect-peer-refuses-discouraged
   "connect-peer returns NIL for a discouraged host (never dial it)."
-  (bitcoin-lisp.networking:clear-discouraged)
-  (bitcoin-lisp.networking:discourage-peer "192.0.2.123")
+  (bl.net:clear-discouraged)
+  (bl.net:discourage-peer "192.0.2.123")
   ;; 192.0.2.0/24 (TEST-NET-1) never routes, so a non-discouraged dial here would
   ;; fail at connect time anyway — but the discouraged guard returns NIL first.
-  (is (null (bitcoin-lisp.networking:connect-peer "192.0.2.123" 18333)))
-  (bitcoin-lisp.networking:clear-discouraged))
+  (is (null (bl.net:connect-peer "192.0.2.123" 18333)))
+  (bl.net:clear-discouraged))
 
 ;;;; ============================================================
 ;;;; Serve-request rate limiting (getheaders/getblocks/getaddr)
@@ -311,31 +311,31 @@ serialize.h:32) — the old 1 MiB cap broke submitblock for mainnet blocks."
 
 (test rate-limit-serve-config-present
   "The shared serve-request rate-limit config is a (rate . burst) pair."
-  (is (consp bitcoin-lisp:*rate-limit-serve*)))
+  (is (consp bl:*rate-limit-serve*)))
 
 (test rate-limit-serve-throttles-getheaders-flood
   "A flood of getheaders is throttled (eventually denied), and getblocks/getaddr
 share the same bucket — once it's drained, they are denied too."
-  (let ((peer (bitcoin-lisp.networking:make-peer)))
-    (bitcoin-lisp.networking::init-peer-rate-limiters peer)
+  (let ((peer (bl.net:make-peer)))
+    (bl.net::init-peer-rate-limiters peer)
     ;; The first call is allowed (full burst); drive well past the burst rapidly.
-    (is-true (bitcoin-lisp.networking::check-peer-rate-limit peer "getheaders"))
+    (is-true (bl.net::check-peer-rate-limit peer "getheaders"))
     (let ((denied nil))
       (dotimes (i 100)
-        (unless (bitcoin-lisp.networking::check-peer-rate-limit peer "getheaders")
+        (unless (bl.net::check-peer-rate-limit peer "getheaders")
           (setf denied t)))
       (is-true denied))
     ;; Bucket is shared: getblocks and getaddr are now denied as well.
-    (is-false (bitcoin-lisp.networking::check-peer-rate-limit peer "getblocks"))
-    (is-false (bitcoin-lisp.networking::check-peer-rate-limit peer "getaddr"))))
+    (is-false (bl.net::check-peer-rate-limit peer "getblocks"))
+    (is-false (bl.net::check-peer-rate-limit peer "getaddr"))))
 
 (test rate-limit-unrelated-command-unaffected
   "Draining the serve bucket does not throttle an unrelated command (ping)."
-  (let ((peer (bitcoin-lisp.networking:make-peer)))
-    (bitcoin-lisp.networking::init-peer-rate-limiters peer)
-    (dotimes (i 100) (bitcoin-lisp.networking::check-peer-rate-limit peer "getheaders"))
+  (let ((peer (bl.net:make-peer)))
+    (bl.net::init-peer-rate-limiters peer)
+    (dotimes (i 100) (bl.net::check-peer-rate-limit peer "getheaders"))
     ;; ping has no bucket -> always allowed.
-    (is-true (bitcoin-lisp.networking::check-peer-rate-limit peer "ping"))))
+    (is-true (bl.net::check-peer-rate-limit peer "ping"))))
 
 ;;;; ============================================================
 ;;;; Concurrency hardening (recursive node-lock, ban-lock, node-peers)
@@ -350,13 +350,13 @@ node-lock now uses); a non-recursive lock would deadlock here."
 
 (test node-lock-is-recursive
   "node-lock is recursive: nested acquisition on the real node lock succeeds."
-  (let ((node (bitcoin-lisp::make-node)))
-    (is (eq :ok (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-                  (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+  (let ((node (bl::make-node)))
+    (is (eq :ok (bt:with-recursive-lock-held ((bl::node-lock node))
+                  (bt:with-recursive-lock-held ((bl::node-lock node))
                     :ok))))))
 
 (defun %inbound-peer (addr ping connect-time)
-  (bitcoin-lisp.networking:make-peer
+  (bl.net:make-peer
    :address addr :inbound t :state :ready
    :ping-latency ping :connect-time connect-time))
 
@@ -365,26 +365,26 @@ node-lock now uses); a non-recursive lock would deadlock here."
 restores them (in order) for priority reconnection. Inbound peers excluded."
   (let* ((dir (ensure-directories-exist
                (merge-pathnames "test-anchors/" (uiop:temporary-directory))))
-         (node (bitcoin-lisp::make-node)))
-    (setf (bitcoin-lisp::node-data-directory node) dir)
-    (setf (bitcoin-lisp::node-peers node)
-          (list (bitcoin-lisp.networking:make-peer :address "1.2.3.4" :inbound nil :state :ready)
-                (bitcoin-lisp.networking:make-peer :address "5.6.7.8" :inbound nil :state :ready)
-                (bitcoin-lisp.networking:make-peer :address "9.9.9.9" :inbound nil :state :ready)
-                (bitcoin-lisp.networking:make-peer :address "7.7.7.7" :inbound t   :state :ready)))
-    (bitcoin-lisp::save-anchors node)        ; saves the first 2 ready outbound
-    (let ((bitcoin-lisp::*pending-anchor-addresses* nil)
+         (node (bl::make-node)))
+    (setf (bl::node-data-directory node) dir)
+    (setf (bl::node-peers node)
+          (list (bl.net:make-peer :address "1.2.3.4" :inbound nil :state :ready)
+                (bl.net:make-peer :address "5.6.7.8" :inbound nil :state :ready)
+                (bl.net:make-peer :address "9.9.9.9" :inbound nil :state :ready)
+                (bl.net:make-peer :address "7.7.7.7" :inbound t   :state :ready)))
+    (bl::save-anchors node)        ; saves the first 2 ready outbound
+    (let ((bl::*pending-anchor-addresses* nil)
           ;; Connection-less test peers save the network default port; load
           ;; yields (host . stored-port) dial candidates.
-          (dp (bitcoin-lisp::network-port (bitcoin-lisp::node-network node))))
-      (bitcoin-lisp::load-anchors node)
+          (dp (bl::network-port (bl::node-network node))))
+      (bl::load-anchors node)
       (is (equal (list (cons "1.2.3.4" dp) (cons "5.6.7.8" dp))
-                 bitcoin-lisp::*pending-anchor-addresses*))
+                 bl::*pending-anchor-addresses*))
       ;; Core ReadAnchors removes the file unconditionally (addrdb.cpp:244):
       ;; anchors are one-shot, so a crash loop cannot re-dial the same two
       ;; peers on every start.
-      (is-false (probe-file (bitcoin-lisp::anchors-dat-path
-                             (bitcoin-lisp::node-data-directory node)))))))
+      (is-false (probe-file (bl::anchors-dat-path
+                             (bl::node-data-directory node)))))))
 
 (test anchors-v1-file-migrates-on-load
   "A pre-P1 anchors.dat (magic ANC1, bare IP strings, no port) still loads:
@@ -392,37 +392,37 @@ entries parse to typed addresses and become dial candidates; the next save
 writes the v2 network-typed format."
   (let* ((dir (ensure-directories-exist
                (merge-pathnames "test-anchors-v1/" (uiop:temporary-directory))))
-         (node (bitcoin-lisp::make-node))
-         (path (bitcoin-lisp::anchors-dat-path dir)))
-    (setf (bitcoin-lisp::node-data-directory node) dir)
+         (node (bl::make-node))
+         (path (bl::anchors-dat-path dir)))
+    (setf (bl::node-data-directory node) dir)
     ;; Byte-faithful ANC1 writer (the pre-P1 save-anchors format): magic,
     ;; count, then len-prefixed address strings — via the same CRC32 wrapper.
-    (bitcoin-lisp.storage:save-file-with-crc32
+    (bl.store:save-file-with-crc32
      path
      (lambda (stream)
        (loop for shift in '(24 16 8 0)
-             do (write-byte (ldb (byte 8 shift) bitcoin-lisp::+anchors-magic-v1+) stream))
+             do (write-byte (ldb (byte 8 shift) bl::+anchors-magic-v1+) stream))
        (write-byte 3 stream)
        (dolist (a '("203.0.113.7" "2001:db8::7" "not-an-address.example"))
          (let ((bytes (map '(vector (unsigned-byte 8)) #'char-code a)))
            (write-byte (length bytes) stream)
            (write-sequence bytes stream)))))
-    (let ((bitcoin-lisp::*pending-anchor-addresses* nil)
-          (bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6)))
-      (bitcoin-lisp::load-anchors node)
+    (let ((bl::*pending-anchor-addresses* nil)
+          (bl.net:*reachable-networks* '(:ipv4 :ipv6)))
+      (bl::load-anchors node)
       ;; IP entries survive (the hostname is dropped — never representable).
       ;; Our IPv6 rendering is the full uncompressed form (no RFC5952 "::").
       ;; Migrated v1 entries carry port NIL (dial at the network default).
       (is (equal '(("203.0.113.7" . nil)
                    ("2001:0db8:0000:0000:0000:0000:0000:0007" . nil))
-                 bitcoin-lisp::*pending-anchor-addresses*)))
+                 bl::*pending-anchor-addresses*)))
     ;; Re-save from live peers: the file is rewritten as v2.
-    (setf (bitcoin-lisp::node-peers node)
-          (list (bitcoin-lisp.networking:make-peer :address "203.0.113.7"
+    (setf (bl::node-peers node)
+          (list (bl.net:make-peer :address "203.0.113.7"
                                                    :inbound nil :state :ready)))
-    (bitcoin-lisp::save-anchors node)
-    (let ((bytes (bitcoin-lisp.storage:load-file-with-crc32 path 6)))
-      (is (= bitcoin-lisp::+anchors-magic-v2+
+    (bl::save-anchors node)
+    (let ((bytes (bl.store:load-file-with-crc32 path 6)))
+      (is (= bl::+anchors-magic-v2+
              (logior (ash (aref bytes 0) 24) (ash (aref bytes 1) 16)
                      (ash (aref bytes 2) 8) (aref bytes 3)))))))
 
@@ -433,75 +433,75 @@ candidates, and each is dialed at its STORED port — an onion anchor yields
 a dial target iff a Tor proxy is configured."
   (let* ((dir (ensure-directories-exist
                (merge-pathnames "test-anchors-v2/" (uiop:temporary-directory))))
-         (node (bitcoin-lisp::make-node))
-         (path (bitcoin-lisp::anchors-dat-path dir))
-         (onion-pk (bitcoin-lisp.crypto:hex-to-bytes
+         (node (bl::make-node))
+         (path (bl::anchors-dat-path dir))
+         (onion-pk (bl.crypto:hex-to-bytes
                     "79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f"))
-         (onion-str (bitcoin-lisp.networking:onion-address-string onion-pk))
+         (onion-str (bl.net:onion-address-string onion-pk))
          ;; Distinct non-default ports prove the STORED port is what loads.
-         (entries (list (list :ipv4 (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 9 9 9 9) 4567)
+         (entries (list (list :ipv4 (bl.net:ipv4-to-mapped-ipv6 9 9 9 9) 4567)
                         (list :torv3 onion-pk 8333))))
-    (setf (bitcoin-lisp::node-data-directory node) dir)
-    (bitcoin-lisp::save-anchor-entries path entries)
+    (setf (bl::node-data-directory node) dir)
+    (bl::save-anchor-entries path entries)
     ;; Byte-level round trip.
-    (let ((parsed (bitcoin-lisp::parse-anchor-entries
-                   (bitcoin-lisp.storage:load-file-with-crc32 path 6))))
+    (let ((parsed (bl::parse-anchor-entries
+                   (bl.store:load-file-with-crc32 path 6))))
       (is (= 2 (length parsed)))
       (destructuring-bind (net bytes port) (first parsed)
         (is (eq :ipv4 net))
-        (is (equalp (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 9 9 9 9) bytes))
+        (is (equalp (bl.net:ipv4-to-mapped-ipv6 9 9 9 9) bytes))
         (is (= 4567 port)))
       (destructuring-bind (net bytes port) (second parsed)
         (is (eq :torv3 net))
         (is (equalp onion-pk bytes))
         (is (= 8333 port))))
     ;; No Tor proxy: only the IPv4 anchor comes back, at its stored port.
-    (let ((bitcoin-lisp::*pending-anchor-addresses* nil)
-          (bitcoin-lisp.networking:*onion-proxy* nil)
-          (bitcoin-lisp.networking:*reachable-networks*
-            (copy-list bitcoin-lisp.networking:+bip155-networks+)))
-      (bitcoin-lisp::load-anchors node)
-      (is (equal '(("9.9.9.9" . 4567)) bitcoin-lisp::*pending-anchor-addresses*)))
+    (let ((bl::*pending-anchor-addresses* nil)
+          (bl.net:*onion-proxy* nil)
+          (bl.net:*reachable-networks*
+            (copy-list bl.net:+bip155-networks+)))
+      (bl::load-anchors node)
+      (is (equal '(("9.9.9.9" . 4567)) bl::*pending-anchor-addresses*)))
     ;; load-anchors consumes the file (Core ReadAnchors), so re-save before
     ;; the second load.
-    (bitcoin-lisp::save-anchor-entries path entries)
+    (bl::save-anchor-entries path entries)
     ;; With a Tor proxy the onion anchor becomes a dial candidate too —
     ;; formatted .onion string + stored port (the P2 anchors redial path).
-    (let ((bitcoin-lisp::*pending-anchor-addresses* nil)
-          (bitcoin-lisp.networking:*onion-proxy*
-            (bitcoin-lisp.networking:make-proxy :host "127.0.0.1" :port 9050))
-          (bitcoin-lisp.networking:*reachable-networks*
-            (copy-list bitcoin-lisp.networking:+bip155-networks+)))
-      (bitcoin-lisp::load-anchors node)
+    (let ((bl::*pending-anchor-addresses* nil)
+          (bl.net:*onion-proxy*
+            (bl.net:make-proxy :host "127.0.0.1" :port 9050))
+          (bl.net:*reachable-networks*
+            (copy-list bl.net:+bip155-networks+)))
+      (bl::load-anchors node)
       (is (equal (list '("9.9.9.9" . 4567) (cons onion-str 8333))
-                 bitcoin-lisp::*pending-anchor-addresses*)))))
+                 bl::*pending-anchor-addresses*)))))
 
 (test anchors-load-missing-file-noop
   "load-anchors on a directory with no anchors.dat doesn't crash or set anchors."
   (let* ((dir (ensure-directories-exist
                (merge-pathnames "test-anchors-empty/" (uiop:temporary-directory))))
-         (node (bitcoin-lisp::make-node)))
-    (setf (bitcoin-lisp::node-data-directory node) dir)
-    (ignore-errors (delete-file (bitcoin-lisp::anchors-dat-path dir)))
-    (let ((bitcoin-lisp::*pending-anchor-addresses* nil))
-      (bitcoin-lisp::load-anchors node)
-      (is (null bitcoin-lisp::*pending-anchor-addresses*)))))
+         (node (bl::make-node)))
+    (setf (bl::node-data-directory node) dir)
+    (ignore-errors (delete-file (bl::anchors-dat-path dir)))
+    (let ((bl::*pending-anchor-addresses* nil))
+      (bl::load-anchors node)
+      (is (null bl::*pending-anchor-addresses*)))))
 
 (defun %evict-peer (addr &key (ping 1000) (connect-time 5000)
                               (min-ping nil) (tx-time 0) (block-time 0)
                               (relay t))
   "An inbound peer for the eviction tests. MIN-PING defaults to PING, since
 Core protects on the MINIMUM and that is what the selector reads."
-  (let ((p (bitcoin-lisp.networking:make-peer
+  (let ((p (bl.net:make-peer
             :address addr :inbound t :state :ready
             :ping-latency ping :connect-time connect-time)))
-    (setf (bitcoin-lisp.networking::peer-min-ping-latency p) (or min-ping ping)
-          (bitcoin-lisp.networking::peer-last-tx-time p) tx-time
-          (bitcoin-lisp.networking::peer-last-block-time p) block-time)
+    (setf (bl.net::peer-min-ping-latency p) (or min-ping ping)
+          (bl.net::peer-last-tx-time p) tx-time
+          (bl.net::peer-last-block-time p) block-time)
     ;; peer-relays-txs-p is derived from the conn type; :block-relay is the
     ;; shape Core's non-tx-relay pass filters on.
     (unless relay
-      (setf (bitcoin-lisp.networking:peer-conn-type p) :block-relay))
+      (setf (bl.net:peer-conn-type p) :block-relay))
     p))
 
 (defun %evict-filler (n &key (first-octet 10))
@@ -531,7 +531,7 @@ Note what the real k values imply: with 8 peers protected on ping alone,
 eviction does not fire on a small inbound set — Core does not evict from one
 either. The old version of this test used SIX peers and asserted an eviction,
 which only passed because our k was half Core's."
-  (let ((node (bitcoin-lisp::make-node)))
+  (let ((node (bl::make-node)))
     ;; 40 filler peers plus one obvious victim: newest, in the most populous
     ;; netgroup, having done nothing.
     (let* ((filler (%evict-filler 40))
@@ -542,18 +542,18 @@ which only passed because our k was half Core's."
       ;; tie-break alone. Core has the same property (CompareNetGroupKeyed
       ;; compares only the key, and equal keys fall to std::sort's unspecified
       ;; order), so this is the fixture's problem to avoid, not the code's.
-      (setf (bitcoin-lisp::node-peers node) (cons victim filler))
-      (is (eq t (bitcoin-lisp::evict-least-valuable-inbound node)))
-      (is (not (member victim (bitcoin-lisp::node-peers node)))
+      (setf (bl::node-peers node) (cons victim filler))
+      (is (eq t (bl::evict-least-valuable-inbound node)))
+      (is (not (member victim (bl::node-peers node)))
           "the newest peer in the most populous netgroup survived")))
   ;; A small inbound set is left alone entirely, because every pass protects
   ;; more peers than exist.
-  (let ((node (bitcoin-lisp::make-node)))
-    (setf (bitcoin-lisp::node-peers node)
+  (let ((node (bl::make-node)))
+    (setf (bl::node-peers node)
           (list (%evict-peer "1.1.1.1" :ping 10 :connect-time 100)
                 (%evict-peer "2.2.2.2" :ping 20 :connect-time 200)))
-    (is (null (bitcoin-lisp::evict-least-valuable-inbound node)))
-    (is (= 2 (length (bitcoin-lisp::node-peers node))))))
+    (is (null (bl::evict-least-valuable-inbound node)))
+    (is (= 2 (length (bl::node-peers node))))))
 
 (test eviction-protects-noban-peers-absolutely
   "Core ProtectNoBanConnections runs FIRST and unconditionally
@@ -562,19 +562,19 @@ peer the operator explicitly trusted was as evictable as any other."
   ;; The whitelist bound directly rather than through eclipse-dos-tests'
   ;; %WITH-WHITELIST: this file compiles first, so that macro does not exist
   ;; yet here.
-  (let ((bitcoin-lisp.networking::*whitelist-entries*
-          (list (bitcoin-lisp.networking:parse-whitelist-entry
+  (let ((bl.net::*whitelist-entries*
+          (list (bl.net:parse-whitelist-entry
                  "noban@192.168.0.0/16"))))
-    (let* ((node (bitcoin-lisp::make-node))
+    (let* ((node (bl::make-node))
            ;; The noban peer is the WORST candidate on every measure: newest,
            ;; slowest, and in the most populous netgroup.
            (protected (%evict-peer "192.168.0.1" :ping 99999 :connect-time 9999999))
            (filler (%evict-filler 40)))
       ;; First, for the tie-break reason in the test above — the point here is
       ;; that noban protects it even when nothing else would.
-      (setf (bitcoin-lisp::node-peers node) (cons protected filler))
-      (bitcoin-lisp::evict-least-valuable-inbound node)
-      (is (member protected (bitcoin-lisp::node-peers node))
+      (setf (bl::node-peers node) (cons protected filler))
+      (bl::evict-least-valuable-inbound node)
+      (is (member protected (bl::node-peers node))
           "a noban peer was evicted despite being the worst candidate"))))
 
 (test eviction-protects-block-relay-only-peers-that-deliver-blocks
@@ -582,15 +582,15 @@ peer the operator explicitly trusted was as evictable as any other."
 (eviction.cpp:195-197), a pass this node did not have. Without it a
 block-relay-only peer doing exactly the job it exists for was no safer than an
 idle one — and block-relay-only links are the anti-partition insurance."
-  (let* ((node (bitcoin-lisp::make-node))
+  (let* ((node (bl::make-node))
          ;; Worst on every OTHER measure, but a block-relay-only peer that has
          ;; delivered a block.
          (br (%evict-peer "10.0.9.9" :ping 99999 :connect-time 9999999
                                      :block-time 999999 :relay nil))
          (filler (%evict-filler 40)))
-    (setf (bitcoin-lisp::node-peers node) (cons br filler))
-    (bitcoin-lisp::evict-least-valuable-inbound node)
-    (is (member br (bitcoin-lisp::node-peers node))
+    (setf (bl::node-peers node) (cons br filler))
+    (bl::evict-least-valuable-inbound node)
+    (is (member br (bl::node-peers node))
         "a block-relay-only peer that delivered a block was evicted")))
 
 (test eviction-reserves-slots-for-disadvantaged-networks
@@ -602,74 +602,74 @@ That is not a nicety here: every inbound ONION peer arrives via the local Tor
 daemon, so they all share the loopback netgroup and are automatically the most
 populous group. This node previously exempted onion peers absolutely, which
 fixed the symptom but meant an all-onion inbound set could never make room."
-  (let* ((node (bitcoin-lisp::make-node))
+  (let* ((node (bl::make-node))
          (onions (loop for i below 4
                        collect (let ((p (%evict-peer (format nil "127.0.0.~D" (1+ i))
                                                      :ping 99999
                                                      :connect-time (+ 9000000 i))))
-                                 (setf (bitcoin-lisp.networking::peer-inbound-onion p) t)
+                                 (setf (bl.net::peer-inbound-onion p) t)
                                  p)))
          (filler (%evict-filler 40)))
-    (setf (bitcoin-lisp::node-peers node) (append onions filler))
+    (setf (bl::node-peers node) (append onions filler))
     ;; Repeated admissions must not strip the onion peers out.
-    (dotimes (i 5) (bitcoin-lisp::evict-least-valuable-inbound node))
-    (let ((left (count-if #'bitcoin-lisp.networking:peer-inbound-onion
-                          (bitcoin-lisp::node-peers node))))
+    (dotimes (i 5) (bl::evict-least-valuable-inbound node))
+    (let ((left (count-if #'bl.net:peer-inbound-onion
+                          (bl::node-peers node))))
       (is (plusp left)
           "five evictions removed every onion peer; the ratio reserve did not fire"))
     ;; But an ALL-onion set can still make room — the reserve is proportional,
     ;; not absolute, which the old exemption was not.
-    (let ((only-onion (bitcoin-lisp::make-node)))
-      (setf (bitcoin-lisp::node-peers only-onion)
+    (let ((only-onion (bl::make-node)))
+      (setf (bl::node-peers only-onion)
             (loop for i below 40
                   collect (let ((p (%evict-peer (format nil "127.0.1.~D" i)
                                                 :ping (+ 1000 i)
                                                 :connect-time (+ 100000 i))))
-                            (setf (bitcoin-lisp.networking::peer-inbound-onion p) t)
+                            (setf (bl.net::peer-inbound-onion p) t)
                             p)))
-      (is (eq t (bitcoin-lisp::evict-least-valuable-inbound only-onion))
+      (is (eq t (bl::evict-least-valuable-inbound only-onion))
           "an all-onion inbound set could not evict anything"))))
 
 (test ban-lock-concurrent-stress
   "Many threads hammering the discourage/ban globals do not crash or corrupt
 the shared structures (the *ban-lock* serializes their mutations)."
-  (bitcoin-lisp.networking:clear-discouraged)
-  (bitcoin-lisp.networking:clear-ban-list)
+  (bl.net:clear-discouraged)
+  (bl.net:clear-ban-list)
   (let ((threads '()))
     (dotimes (i 8)
       (push (bt:make-thread
              (lambda ()
                (dotimes (j 2000)
                  (let ((addr (format nil "10.0.~D.~D" (mod j 5) i)))
-                   (bitcoin-lisp.networking:discourage-peer addr)
-                   (bitcoin-lisp.networking:peer-discouraged-p addr)
-                   (bitcoin-lisp.networking:peer-banned-p addr)))))
+                   (bl.net:discourage-peer addr)
+                   (bl.net:peer-discouraged-p addr)
+                   (bl.net:peer-banned-p addr)))))
             threads))
     (dolist (th threads) (bt:join-thread th))
     ;; Still functional after the contention.
-    (bitcoin-lisp.networking:discourage-peer "203.0.113.50")
-    (is-true (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.50"))
-    (bitcoin-lisp.networking:clear-discouraged)))
+    (bl.net:discourage-peer "203.0.113.50")
+    (is-true (bl.net:peer-discouraged-p "203.0.113.50"))
+    (bl.net:clear-discouraged)))
 
 (test node-peers-concurrent-stress
   "A writer mutating node-peers and a reader copy-listing it (both under
 node-lock) run concurrently without crashing or deadlocking."
-  (let ((node (bitcoin-lisp::make-node)))
+  (let ((node (bl::make-node)))
     (let ((writer (bt:make-thread
                    (lambda ()
                      (dotimes (i 3000)
-                       (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-                         (push (bitcoin-lisp.networking:make-peer)
-                               (bitcoin-lisp::node-peers node)))
-                       (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-                         (when (bitcoin-lisp::node-peers node)
-                           (setf (bitcoin-lisp::node-peers node)
-                                 (rest (bitcoin-lisp::node-peers node)))))))))
+                       (bt:with-recursive-lock-held ((bl::node-lock node))
+                         (push (bl.net:make-peer)
+                               (bl::node-peers node)))
+                       (bt:with-recursive-lock-held ((bl::node-lock node))
+                         (when (bl::node-peers node)
+                           (setf (bl::node-peers node)
+                                 (rest (bl::node-peers node)))))))))
           (reader (bt:make-thread
                    (lambda ()
                      (dotimes (i 3000)
-                       (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-                         (length (copy-list (bitcoin-lisp::node-peers node)))))))))
+                       (bt:with-recursive-lock-held ((bl::node-lock node))
+                         (length (copy-list (bl::node-peers node)))))))))
       (bt:join-thread writer)
       (bt:join-thread reader)
       (is-true t))))
@@ -698,7 +698,7 @@ while the reader is about to ask for ANNOUNCED-BYTES. Returns
                     (usocket:socket-stream client))
     (force-output (usocket:socket-stream client))
     (sleep 0.2)
-    (values (bitcoin-lisp.networking::make-connection :socket server :connected t)
+    (values (bl.net::make-connection :socket server :connected t)
             client server listener)))
 
 (defun %run-bounded (thunk &key (limit 8))
@@ -724,7 +724,7 @@ froze a live node's entire network layer for five days."
     (unwind-protect
          (multiple-value-bind (finished result)
              (%run-bounded (lambda ()
-                             (bitcoin-lisp.networking::receive-bytes
+                             (bl.net::receive-bytes
                               conn 1000 :timeout 2))
                            :limit 8)
            (is-true finished
@@ -732,7 +732,7 @@ froze a live node's entire network layer for five days."
            (is (null result) "a stalled read reports failure")
            ;; The aborted read consumed an unknown number of bytes, so the
            ;; stream can never be resynchronized: the connection must be dead.
-           (is-false (bitcoin-lisp.networking::connection-connected conn)))
+           (is-false (bl.net::connection-connected conn)))
       (usocket:socket-close client)
       (usocket:socket-close server)
       (usocket:socket-close listener))))
@@ -749,10 +749,10 @@ this ever 'passes' quickly, the test above has stopped proving anything."
               (lambda ()
                 (let ((buffer (make-array 1000 :element-type '(unsigned-byte 8))))
                   (usocket:wait-for-input
-                   (bitcoin-lisp.networking::connection-socket conn)
+                   (bl.net::connection-socket conn)
                    :timeout 2 :ready-only t)
                   (read-sequence buffer
-                                 (bitcoin-lisp.networking::connection-stream conn))))
+                                 (bl.net::connection-stream conn))))
               :limit 4)
            (declare (ignore result))
            (is-false finished
@@ -771,14 +771,14 @@ to the PEER-START-HEIGHT accessor. The resulting type error unwound the sync
 iteration, so maintain-peers never ran, so the dead peers were never reaped or
 redialed — the failure fed itself. A live node logged it every five seconds for
 nineteen days."
-  (let ((node (bitcoin-lisp::make-node)))
-    (setf (bitcoin-lisp::node-peers node)
-          (list (bitcoin-lisp.networking:make-peer :state :disconnected)
-                (bitcoin-lisp.networking:make-peer :state :disconnected)))
+  (let ((node (bl::make-node)))
+    (setf (bl::node-peers node)
+          (list (bl.net:make-peer :state :disconnected)
+                (bl.net:make-peer :state :disconnected)))
     ;; Control: the precondition the bug needs must actually hold here.
-    (is (null (bitcoin-lisp::find-best-peer node))
+    (is (null (bl::find-best-peer node))
         "no peer is :READY, so this exercises the NIL path")
-    (is (= 0 (bitcoin-lisp::sync-blockchain node))
+    (is (= 0 (bl::sync-blockchain node))
         "the cycle is skipped cleanly instead of signalling a type error")))
 
 (test inbound-admission-counts-the-pending-handoff-queue
@@ -786,14 +786,14 @@ nineteen days."
 them. Admission used to count only merged peers, so a stalled sync thread let
 the queue — and its file descriptors — grow without bound: the live wedge left
 751 sockets rotting in CLOSE-WAIT. Admission must count the backlog too."
-  (let ((node (bitcoin-lisp::make-node)))
+  (let ((node (bl::make-node)))
     ;; Control: an empty backlog admits.
-    (is-true (bitcoin-lisp::inbound-connection-allowed-p node "198.51.100.7"))
-    (setf (bitcoin-lisp::node-pending-inbound-peers node)
-          (loop repeat bitcoin-lisp::*max-inbound-connections*
-                collect (bitcoin-lisp.networking:make-peer :inbound t)))
+    (is-true (bl::inbound-connection-allowed-p node "198.51.100.7"))
+    (setf (bl::node-pending-inbound-peers node)
+          (loop repeat bl::*max-inbound-connections*
+                collect (bl.net:make-peer :inbound t)))
     (multiple-value-bind (allowed reason)
-        (bitcoin-lisp::inbound-connection-allowed-p node "198.51.100.7")
+        (bl::inbound-connection-allowed-p node "198.51.100.7")
       (is-false allowed "a full hand-off queue must stop admitting")
       (is (eq :backlog reason)))))
 
@@ -810,7 +810,7 @@ above."
          (client (usocket:socket-connect "127.0.0.1" port
                                          :element-type '(unsigned-byte 8)))
          (server (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
-         (conn (bitcoin-lisp.networking::make-connection :socket server :connected t))
+         (conn (bl.net::make-connection :socket server :connected t))
          (chunk (* 100 1024))
          (chunks 10)
          (total (* chunk chunks))
@@ -832,13 +832,13 @@ above."
     (unwind-protect
          (multiple-value-bind (finished result)
              (%run-bounded (lambda ()
-                             (bitcoin-lisp.networking::receive-bytes
+                             (bl.net::receive-bytes
                               conn total :timeout 1))
                            :limit 30)
            (is-true finished "the read must terminate")
            (is (and result (= total (length result)))
                "a peer that keeps making progress delivers its whole message")
-           (is-true (bitcoin-lisp.networking::connection-connected conn)
+           (is-true (bl.net::connection-connected conn)
                     "and keeps its connection"))
       (ignore-errors (bt:join-thread sender))
       (usocket:socket-close client)
@@ -856,12 +856,12 @@ backwards would disconnect every quiet peer on every poll."
          (client (usocket:socket-connect "127.0.0.1" port
                                          :element-type '(unsigned-byte 8)))
          (server (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
-         (conn (bitcoin-lisp.networking::make-connection :socket server :connected t)))
+         (conn (bl.net::make-connection :socket server :connected t)))
     (unwind-protect
          (progn
            ;; Nothing sent at all: a pure idle poll.
-           (is (null (bitcoin-lisp.networking::receive-bytes conn 24 :timeout 1)))
-           (is-true (bitcoin-lisp.networking::connection-connected conn)
+           (is (null (bl.net::receive-bytes conn 24 :timeout 1)))
+           (is-true (bl.net::connection-connected conn)
                     "an idle peer keeps its connection"))
       (usocket:socket-close client)
       (usocket:socket-close server)
@@ -889,7 +889,7 @@ not hang."
                (%run-bounded
                 (lambda ()
                   (handler-case
-                      (bitcoin-lisp.networking::%socks5-recv
+                      (bl.net::%socks5-recv
                        client 2
                        (+ (get-internal-real-time)
                           (* 1 internal-time-units-per-second))
@@ -915,7 +915,7 @@ fails if only the stall bound is present."
          (client (usocket:socket-connect "127.0.0.1" port
                                          :element-type '(unsigned-byte 8)))
          (server (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
-         (conn (bitcoin-lisp.networking::make-connection :socket server :connected t))
+         (conn (bl.net::make-connection :socket server :connected t))
          (stop nil)
          ;; Ask for more than the rate floor allows within the stall window, so
          ;; the two bounds are distinguishable: 200 KiB at 32 KiB/s = ~6.4s.
@@ -934,7 +934,7 @@ fails if only the stall bound is present."
     (unwind-protect
          (multiple-value-bind (finished result)
              (%run-bounded (lambda ()
-                             (bitcoin-lisp.networking::receive-bytes
+                             (bl.net::receive-bytes
                               conn wanted :timeout 1))
                            :limit 30)
            (is-true finished "a dribbling peer must not hold the reader open")
@@ -969,12 +969,12 @@ Announce just under the limit."
                                            :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+         (conn (bl.net::make-connection :socket victim-socket
                                                         :connected t))
-         (peer (bitcoin-lisp.networking:make-peer :connection conn :state :ready))
-         (announced (1- bitcoin-lisp:+max-message-payload+))
-         (header (bitcoin-lisp.serialization::make-message-header
-                  :magic (copy-seq bitcoin-lisp.serialization:*network-magic*)
+         (peer (bl.net:make-peer :connection conn :state :ready))
+         (announced (1- bl:+max-message-payload+))
+         (header (bl.ser::make-message-header
+                  :magic (copy-seq bl.ser:*network-magic*)
                   :command "block"
                   :payload-length announced
                   :checksum (make-array 4 :element-type '(unsigned-byte 8)))))
@@ -982,7 +982,7 @@ Announce just under the limit."
          (progn
            (let ((header-bytes
                    (flexi-streams:with-output-to-sequence (s)
-                     (bitcoin-lisp.serialization::write-message-header s header))))
+                     (bl.ser::write-message-header s header))))
              (write-sequence header-bytes (usocket:socket-stream attacker))
              (write-sequence (make-array 3 :element-type '(unsigned-byte 8))
                              (usocket:socket-stream attacker))
@@ -990,7 +990,7 @@ Announce just under the limit."
            (sleep 0.3)
            (let ((start (get-internal-real-time)))
              (multiple-value-bind (command detail)
-                 (bitcoin-lisp.networking:receive-message peer :timeout 5)
+                 (bl.net:receive-message peer :timeout 5)
                (let ((elapsed (/ (- (get-internal-real-time) start)
                                  internal-time-units-per-second)))
                  (is (null command) "no message is produced")
@@ -1000,23 +1000,23 @@ Announce just under the limit."
                  ;; The old reader sat here for the full stall window.
                  (is (< elapsed 1)
                      "the reader must return at once, not wait out the budget"))))
-           (is-true (bitcoin-lisp.networking::connection-connected conn)
+           (is-true (bl.net::connection-connected conn)
                     "an incomplete message is not yet a reason to disconnect")
-           (is (= 3 (bitcoin-lisp.networking::connection-recv-filled conn))
+           (is (= 3 (bl.net::connection-recv-filled conn))
                "the bytes that did arrive are retained for the next pass")
            ;; Now the pump\'s half: a peer that has delivered nothing toward
            ;; its message for +receive-stall-timeout-seconds+ is reaped.
            ;; Backdate the last-progress stamp rather than sleeping for minutes.
-           (setf (bitcoin-lisp.networking::connection-recv-last-progress conn)
+           (setf (bl.net::connection-recv-last-progress conn)
                  (- (get-internal-real-time)
-                    (* (1+ bitcoin-lisp.networking::+receive-stall-timeout-seconds+)
+                    (* (1+ bl.net::+receive-stall-timeout-seconds+)
                        internal-time-units-per-second)))
-           (is-true (bitcoin-lisp.networking::connection-receive-expired-p conn)
+           (is-true (bl.net::connection-receive-expired-p conn)
                     "an abandoned message eventually expires")
-           (bitcoin-lisp.networking::drain-and-reap-peer peer nil nil nil nil)
-           (is-false (bitcoin-lisp.networking::connection-connected conn)
+           (bl.net::drain-and-reap-peer peer nil nil nil nil)
+           (is-false (bl.net::connection-connected conn)
                      "and the pump drops the peer")
-           (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer))
+           (is (eq :disconnected (bl.net:peer-state peer))
                "peer state reflects the disconnect, so maintenance replaces it"))
       (usocket:socket-close attacker)
       (usocket:socket-close victim-socket)
@@ -1043,42 +1043,42 @@ finite, and this makes it nonexistent."
                                               :element-type '(unsigned-byte 8)))
          (fast-socket (usocket:socket-accept listener
                                              :element-type '(unsigned-byte 8)))
-         (slow-conn (bitcoin-lisp.networking::make-connection :socket slow-socket
+         (slow-conn (bl.net::make-connection :socket slow-socket
                                                              :connected t))
-         (fast-conn (bitcoin-lisp.networking::make-connection :socket fast-socket
+         (fast-conn (bl.net::make-connection :socket fast-socket
                                                              :connected t))
-         (slow-peer (bitcoin-lisp.networking:make-peer :connection slow-conn
+         (slow-peer (bl.net:make-peer :connection slow-conn
                                                       :state :ready))
-         (fast-peer (bitcoin-lisp.networking:make-peer :connection fast-conn
+         (fast-peer (bl.net:make-peer :connection fast-conn
                                                       :state :ready)))
     (unwind-protect
          (progn
            ;; Slow peer: header for a big payload, then 3 bytes and silence.
-           (let* ((header (bitcoin-lisp.serialization::make-message-header
-                           :magic (copy-seq bitcoin-lisp.serialization:*network-magic*)
+           (let* ((header (bl.ser::make-message-header
+                           :magic (copy-seq bl.ser:*network-magic*)
                            :command "block"
-                           :payload-length (1- bitcoin-lisp:+max-message-payload+)
+                           :payload-length (1- bl:+max-message-payload+)
                            :checksum (make-array 4 :element-type '(unsigned-byte 8))))
                   (header-bytes (flexi-streams:with-output-to-sequence (s)
-                                  (bitcoin-lisp.serialization::write-message-header
+                                  (bl.ser::write-message-header
                                    s header))))
              (write-sequence header-bytes (usocket:socket-stream slow-sender))
              (write-sequence (make-array 3 :element-type '(unsigned-byte 8))
                              (usocket:socket-stream slow-sender))
              (force-output (usocket:socket-stream slow-sender)))
            ;; Fast peer: one complete, well-formed message.
-           (write-sequence (bitcoin-lisp.serialization:make-ping-message 12345)
+           (write-sequence (bl.ser:make-ping-message 12345)
                            (usocket:socket-stream fast-sender))
            (force-output (usocket:socket-stream fast-sender))
            (sleep 0.3)
            (let ((start (get-internal-real-time)))
              ;; One pass over both peers, slow one first — the worst order.
              (multiple-value-bind (slow-command slow-detail)
-                 (bitcoin-lisp.networking:receive-message slow-peer :timeout 30)
+                 (bl.net:receive-message slow-peer :timeout 30)
                (is (null slow-command))
                (is (eq :incomplete slow-detail)))
              (multiple-value-bind (fast-command payload)
-                 (bitcoin-lisp.networking:receive-message fast-peer :timeout 30)
+                 (bl.net:receive-message fast-peer :timeout 30)
                (declare (ignore payload))
                (is (equal "ping" fast-command)
                    "the second peer is served despite the first being mid-message"))
@@ -1110,16 +1110,16 @@ consults expiry."
                                          :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+         (conn (bl.net::make-connection :socket victim-socket
                                                         :connected t))
-         (peer (bitcoin-lisp.networking:make-peer :connection conn :state :ready))
+         (peer (bl.net:make-peer :connection conn :state :ready))
          (payload (make-array 100 :element-type '(unsigned-byte 8)
                                   :initial-element 7))
-         (header (bitcoin-lisp.serialization::make-message-header
-                  :magic (copy-seq bitcoin-lisp.serialization:*network-magic*)
+         (header (bl.ser::make-message-header
+                  :magic (copy-seq bl.ser:*network-magic*)
                   :command "ping"
                   :payload-length (length payload)
-                  :checksum (subseq (bitcoin-lisp.serialization:compute-checksum
+                  :checksum (subseq (bl.ser:compute-checksum
                                      payload)
                                     0 4))))
     (unwind-protect
@@ -1128,12 +1128,12 @@ consults expiry."
            ;; never silent for long.
            (let ((header-bytes
                    (flexi-streams:with-output-to-sequence (s)
-                     (bitcoin-lisp.serialization::write-message-header s header))))
+                     (bl.ser::write-message-header s header))))
              (write-sequence header-bytes (usocket:socket-stream sender))
              (force-output (usocket:socket-stream sender)))
            (sleep 0.2)
            (multiple-value-bind (command detail)
-               (bitcoin-lisp.networking:receive-message peer :timeout 5)
+               (bl.net:receive-message peer :timeout 5)
              (is (null command))
              (is (eq :incomplete detail)))
            ;; The payload arrives while we are busy elsewhere.
@@ -1142,11 +1142,11 @@ consults expiry."
            ;; Simulate a long pump cycle: far longer than the pump\'s own
            ;; :timeout 5, which the old per-message deadline was built from.
            (sleep 1.2)
-           (is-false (bitcoin-lisp.networking::connection-receive-expired-p conn)
+           (is-false (bl.net::connection-receive-expired-p conn)
                      "a peer whose bytes are already here is not stalled")
            ;; And the drain — not a disconnect — is what happens next.
-           (bitcoin-lisp.networking::drain-and-reap-peer peer nil nil nil nil)
-           (is-true (bitcoin-lisp.networking::connection-connected conn)
+           (bl.net::drain-and-reap-peer peer nil nil nil nil)
+           (is-true (bl.net::connection-connected conn)
                     "a busy pump must not cost a healthy peer its connection"))
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
@@ -1168,16 +1168,16 @@ payload and left the connection ALIVE and permanently out of frame."
                                          :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+         (conn (bl.net::make-connection :socket victim-socket
                                                         :connected t))
-         (peer (bitcoin-lisp.networking:make-peer :connection conn :state :ready))
+         (peer (bl.net:make-peer :connection conn :state :ready))
          (payload (make-array 100 :element-type '(unsigned-byte 8)
                                   :initial-element 3))
-         (header (bitcoin-lisp.serialization::make-message-header
-                  :magic (copy-seq bitcoin-lisp.serialization:*network-magic*)
+         (header (bl.ser::make-message-header
+                  :magic (copy-seq bl.ser:*network-magic*)
                   :command "ping"
                   :payload-length (length payload)
-                  :checksum (subseq (bitcoin-lisp.serialization:compute-checksum
+                  :checksum (subseq (bl.ser:compute-checksum
                                      payload)
                                     0 4))))
     (unwind-protect
@@ -1185,28 +1185,28 @@ payload and left the connection ALIVE and permanently out of frame."
            ;; Pass 1: header only.
            (let ((header-bytes
                    (flexi-streams:with-output-to-sequence (s)
-                     (bitcoin-lisp.serialization::write-message-header s header))))
+                     (bl.ser::write-message-header s header))))
              (write-sequence header-bytes (usocket:socket-stream sender))
              (force-output (usocket:socket-stream sender)))
            (sleep 0.2)
            (multiple-value-bind (command detail)
-               (bitcoin-lisp.networking:receive-message peer :timeout 30)
+               (bl.net:receive-message peer :timeout 30)
              (is (null command))
              (is (eq :incomplete detail)))
-           (is-true (bitcoin-lisp.networking::connection-recv-framing conn)
+           (is-true (bl.net::connection-recv-framing conn)
                     "the parsed header survives the gap")
-           (is-true (bitcoin-lisp.networking::connection-connected conn)
+           (is-true (bl.net::connection-connected conn)
                     "and the peer is not dropped for being mid-message")
            ;; Pass 2: the payload arrives, and the message completes normally.
            (write-sequence payload (usocket:socket-stream sender))
            (force-output (usocket:socket-stream sender))
            (sleep 0.2)
            (multiple-value-bind (command received)
-               (bitcoin-lisp.networking:receive-message peer :timeout 30)
+               (bl.net:receive-message peer :timeout 30)
              (is (equal "ping" command)
                  "the message completes from the parked framing state")
              (is (equalp payload received)))
-           (is-false (bitcoin-lisp.networking::connection-recv-framing conn)
+           (is-false (bl.net::connection-recv-framing conn)
                      "and the framing state is consumed with it"))
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
@@ -1226,13 +1226,13 @@ node-wide peer churn. Bad magic is the opposite case and is covered below."
                                          :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+         (conn (bl.net::make-connection :socket victim-socket
                                                         :connected t))
-         (peer (bitcoin-lisp.networking:make-peer :connection conn :state :ready))
+         (peer (bl.net:make-peer :connection conn :state :ready))
          (payload (make-array 8 :element-type '(unsigned-byte 8)
                                 :initial-element 1))
-         (header (bitcoin-lisp.serialization::make-message-header
-                  :magic (copy-seq bitcoin-lisp.serialization:*network-magic*)
+         (header (bl.ser::make-message-header
+                  :magic (copy-seq bl.ser:*network-magic*)
                   :command "ping"
                   :payload-length (length payload)
                   ;; deliberately wrong
@@ -1242,16 +1242,16 @@ node-wide peer churn. Bad magic is the opposite case and is covered below."
          (progn
            (let ((header-bytes
                    (flexi-streams:with-output-to-sequence (s)
-                     (bitcoin-lisp.serialization::write-message-header s header))))
+                     (bl.ser::write-message-header s header))))
              (write-sequence header-bytes (usocket:socket-stream sender))
              (write-sequence payload (usocket:socket-stream sender))
              (force-output (usocket:socket-stream sender)))
            (sleep 0.2)
-           (is (null (bitcoin-lisp.networking:receive-message peer :timeout 1))
+           (is (null (bl.net:receive-message peer :timeout 1))
                "the corrupt message is dropped")
-           (is-true (bitcoin-lisp.networking::connection-connected conn)
+           (is-true (bl.net::connection-connected conn)
                     "but the peer survives, as in Core")
-           (is (eq :ready (bitcoin-lisp.networking:peer-state peer))))
+           (is (eq :ready (bl.net:peer-state peer))))
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
       (usocket:socket-close listener))))
@@ -1268,9 +1268,9 @@ forever."
                                          :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+         (conn (bl.net::make-connection :socket victim-socket
                                                         :connected t))
-         (peer (bitcoin-lisp.networking:make-peer :connection conn :state :ready)))
+         (peer (bl.net:make-peer :connection conn :state :ready)))
     (unwind-protect
          (progn
            (write-sequence (make-array 24 :element-type '(unsigned-byte 8)
@@ -1278,8 +1278,8 @@ forever."
                            (usocket:socket-stream sender))
            (force-output (usocket:socket-stream sender))
            (sleep 0.2)
-           (is (null (bitcoin-lisp.networking:receive-message peer :timeout 1)))
-           (is-false (bitcoin-lisp.networking::connection-connected conn)
+           (is (null (bl.net:receive-message peer :timeout 1)))
+           (is-false (bl.net::connection-connected conn)
                      "a peer talking a foreign protocol is dropped"))
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
@@ -1303,9 +1303,9 @@ has actually sent (net.cpp:1323-1324)."
                                          :element-type '(unsigned-byte 8)))
          (victim-socket (usocket:socket-accept listener
                                                :element-type '(unsigned-byte 8)))
-         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+         (conn (bl.net::make-connection :socket victim-socket
                                                         :connected t))
-         (announced (1- bitcoin-lisp:+max-message-payload+)))
+         (announced (1- bl:+max-message-payload+)))
     (unwind-protect
          (progn
            ;; One byte delivered against a ~4 MB announcement.
@@ -1313,13 +1313,13 @@ has actually sent (net.cpp:1323-1324)."
            (force-output (usocket:socket-stream sender))
            (sleep 0.2)
            (is (eq :incomplete
-                   (bitcoin-lisp.networking::receive-bytes-resumable conn announced))
+                   (bl.net::receive-bytes-resumable conn announced))
                "the read is in progress, not complete")
-           (is (= 1 (bitcoin-lisp.networking::connection-recv-filled conn)))
-           (is (<= (length (bitcoin-lisp.networking::connection-recv-buffer conn))
-                   bitcoin-lisp.networking::+recv-reserve-ahead+)
+           (is (= 1 (bl.net::connection-recv-filled conn)))
+           (is (<= (length (bl.net::connection-recv-buffer conn))
+                   bl.net::+recv-reserve-ahead+)
                "one delivered byte must not reserve the whole announced size")
-           (is (< (length (bitcoin-lisp.networking::connection-recv-buffer conn))
+           (is (< (length (bl.net::connection-recv-buffer conn))
                   announced)
                "control: the announcement really is far larger than the reserve")
            ;; An honest peer that keeps delivering gets the room it earns.
@@ -1327,12 +1327,12 @@ has actually sent (net.cpp:1323-1324)."
                            (usocket:socket-stream sender))
            (force-output (usocket:socket-stream sender))
            (sleep 0.4)
-           (bitcoin-lisp.networking::receive-bytes-resumable conn announced)
-           (bitcoin-lisp.networking::receive-bytes-resumable conn announced)
-           (is (> (bitcoin-lisp.networking::connection-recv-filled conn)
-                  bitcoin-lisp.networking::+recv-reserve-ahead+)
+           (bl.net::receive-bytes-resumable conn announced)
+           (bl.net::receive-bytes-resumable conn announced)
+           (is (> (bl.net::connection-recv-filled conn)
+                  bl.net::+recv-reserve-ahead+)
                "the buffer grows as the peer earns it")
-           (is-true (bitcoin-lisp.networking::connection-connected conn)
+           (is-true (bl.net::connection-connected conn)
                     "and a progressing peer is not dropped"))
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
@@ -1352,12 +1352,12 @@ has actually sent (net.cpp:1323-1324)."
   "The capture must discriminate exactly as the log line does. Peers hanging up
 is the normal case and vastly the common one; capturing a backtrace for every
 closed socket would bury the log under noise and teach the reader to ignore it."
-  (let ((bitcoin-lisp.networking::*recv-backtrace-remaining* nil)
-        (bitcoin-lisp.networking::*recv-backtrace-budget* 10))
-    (is (null (bitcoin-lisp.networking:capture-recv-backtrace
+  (let ((bl.net::*recv-backtrace-remaining* nil)
+        (bl.net::*recv-backtrace-budget* 10))
+    (is (null (bl.net:capture-recv-backtrace
                (make-condition 'end-of-file :stream *standard-output*)))
         "end-of-file is a peer going away, not a bug")
-    (is-true (stringp (bitcoin-lisp.networking:capture-recv-backtrace
+    (is-true (stringp (bl.net:capture-recv-backtrace
                        (make-condition 'type-error :datum 3122
                                                    :expected-type '(unsigned-byte 10))))
              "a TYPE-ERROR is ours and must be captured")))
@@ -1366,9 +1366,9 @@ closed socket would bury the log under noise and teach the reader to ignore it."
   "Bounded on purpose: the failure repeats once per failing peer — ~15k times in
 200k log lines during the mainnet incident — so an unbounded backtrace would
 bury the log it exists to explain. The budget is per process, not per peer."
-  (let ((bitcoin-lisp.networking::*recv-backtrace-remaining* nil)
-        (bitcoin-lisp.networking::*recv-backtrace-budget* 2))
-    (flet ((cap () (bitcoin-lisp.networking:capture-recv-backtrace
+  (let ((bl.net::*recv-backtrace-remaining* nil)
+        (bl.net::*recv-backtrace-budget* 2))
+    (flet ((cap () (bl.net:capture-recv-backtrace
                     (make-condition 'type-error :datum 1 :expected-type 'string))))
       (is-true (stringp (cap)) "1st capture allowed")
       (is-true (stringp (cap)) "2nd capture allowed")
@@ -1386,12 +1386,12 @@ do with the capture."
   "The point of capturing from a HANDLER-BIND: the trace must name the function
 that signalled, not just the recovery path. Asserted on a distinctly-named
 frame so this cannot pass on an empty or truncated string."
-  (let ((bitcoin-lisp.networking::*recv-backtrace-remaining* nil)
-        (bitcoin-lisp.networking::*recv-backtrace-budget* 5)
+  (let ((bl.net::*recv-backtrace-remaining* nil)
+        (bl.net::*recv-backtrace-budget* 5)
         (trace nil))
     (ignore-errors
      (handler-bind ((error (lambda (c)
-                             (setf trace (bitcoin-lisp.networking:capture-recv-backtrace c)))))
+                             (setf trace (bl.net:capture-recv-backtrace c)))))
        (%recv-backtrace-canary)))
     (is-true (stringp trace) "a backtrace must have been produced")
     (is-true (search "RECV-BACKTRACE-CANARY" trace)
@@ -1435,13 +1435,13 @@ for a function that always returns T."
                               (type-error () :failed)))
                         "control: the select-based path must still fail above the ceiling, ~
                          or this test is no longer reproducing the bug")
-                    (is-false (bitcoin-lisp.networking:socket-input-ready-p server :timeout 0)
+                    (is-false (bl.net:socket-input-ready-p server :timeout 0)
                               "no data yet: must report NOT ready")
                     (write-sequence (coerce '(104 105) '(vector (unsigned-byte 8)))
                                     (usocket:socket-stream client))
                     (force-output (usocket:socket-stream client))
                     (sleep 0.5)
-                    (is-true (bitcoin-lisp.networking:socket-input-ready-p server :timeout 0)
+                    (is-true (bl.net:socket-input-ready-p server :timeout 0)
                              "data arrived: must report ready, above the ceiling")))
              (usocket:socket-close client)
              (usocket:socket-close server)

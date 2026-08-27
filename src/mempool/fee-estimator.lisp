@@ -52,20 +52,20 @@ Returns the fee rate as an integer, or NIL if inputs cannot be resolved."
   (let ((total-input 0)
         (total-output 0))
     ;; Sum input values from spent UTXOs
-    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-             (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-             (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+    (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+      (let* ((prevout (bl.ser:tx-in-previous-output input))
+             (prev-txid (bl.ser:outpoint-hash prevout))
+             (prev-index (bl.ser:outpoint-index prevout))
              (utxo-entry (gethash (cons prev-txid prev-index) spent-utxos-map)))
         (unless utxo-entry
           (return-from calculate-tx-fee-rate nil))
-        (incf total-input (bitcoin-lisp.storage:utxo-entry-value utxo-entry))))
+        (incf total-input (bl.store:utxo-entry-value utxo-entry))))
     ;; Sum output values
-    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
-      (incf total-output (bitcoin-lisp.serialization:tx-out-value output)))
+    (bl.ser:dovector (output (bl.ser:transaction-outputs tx))
+      (incf total-output (bl.ser:tx-out-value output)))
     ;; Calculate fee rate (fee / vsize)
     (let ((fee (- total-input total-output))
-          (vsize (bitcoin-lisp.serialization:transaction-vsize tx)))
+          (vsize (bl.ser:transaction-vsize tx)))
       (if (and (> fee 0) (> vsize 0))
           (ceiling fee vsize)
           0))))
@@ -74,7 +74,7 @@ Returns the fee rate as an integer, or NIL if inputs cannot be resolved."
   "Compute fee statistics for a block given its spent UTXOs.
 SPENT-UTXOS is a list of (txid index utxo-entry) from apply-block-to-utxo-set.
 Returns a block-fee-stats struct, or NIL if block has no fee-paying transactions."
-  (let ((transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+  (let ((transactions (bl.ser:bitcoin-block-transactions block))
         (fee-rates '()))
     ;; Build lookup map for spent UTXOs
     (let ((spent-map (make-hash-table :test 'equalp)))
@@ -172,24 +172,24 @@ entries (20 bytes each: height, median, low, high, tx-count), CRC32 (4 bytes)."
       (let ((data-bytes
               (flexi-streams:with-output-to-sequence (mem)
                 ;; Write header
-                (bitcoin-lisp.serialization:write-uint32-le mem +fee-stats-magic+)
-                (bitcoin-lisp.serialization:write-uint8 mem +fee-stats-version+)
-                (bitcoin-lisp.serialization:write-uint16-le mem (length entries))
+                (bl.ser:write-uint32-le mem +fee-stats-magic+)
+                (bl.ser:write-uint8 mem +fee-stats-version+)
+                (bl.ser:write-uint16-le mem (length entries))
                 ;; Write entries
                 (dolist (entry entries)
-                  (bitcoin-lisp.serialization:write-uint32-le mem (block-fee-stats-height entry))
-                  (bitcoin-lisp.serialization:write-uint32-le mem (block-fee-stats-median-rate entry))
-                  (bitcoin-lisp.serialization:write-uint32-le mem (block-fee-stats-low-rate entry))
-                  (bitcoin-lisp.serialization:write-uint32-le mem (block-fee-stats-high-rate entry))
-                  (bitcoin-lisp.serialization:write-uint32-le mem (block-fee-stats-tx-count entry)))
+                  (bl.ser:write-uint32-le mem (block-fee-stats-height entry))
+                  (bl.ser:write-uint32-le mem (block-fee-stats-median-rate entry))
+                  (bl.ser:write-uint32-le mem (block-fee-stats-low-rate entry))
+                  (bl.ser:write-uint32-le mem (block-fee-stats-high-rate entry))
+                  (bl.ser:write-uint32-le mem (block-fee-stats-tx-count entry)))
                 ;; v2: the Core estimator's state. A node running without one
                 ;; writes a zero marker, which reads back as "no section".
                 (let ((est *block-policy-estimator*))
                   (if est
                       (progn
-                        (bitcoin-lisp.serialization:write-uint8 mem 1)
+                        (bl.ser:write-uint8 mem 1)
                         (bpe-write-to-stream est mem))
-                      (bitcoin-lisp.serialization:write-uint8 mem 0))))))
+                      (bl.ser:write-uint8 mem 0))))))
         ;; Write data + CRC32 to file
         (with-open-file (stream path
                                 :direction :output
@@ -197,7 +197,7 @@ entries (20 bytes each: height, median, low, high, tx-count), CRC32 (4 bytes)."
                                 :if-exists :supersede
                                 :if-does-not-exist :create)
           (write-sequence data-bytes stream)
-          (write-sequence (bitcoin-lisp.storage:compute-crc32 data-bytes) stream))))
+          (write-sequence (bl.store:compute-crc32 data-bytes) stream))))
     ;; Reset flush counter
     (setf (fee-estimator-blocks-since-flush estimator) 0)
     t))
@@ -214,7 +214,7 @@ Returns T on success, NIL if file doesn't exist or is corrupt."
     (let ((age (- (get-universal-time) (file-write-date path))))
       (when (and (> age +fee-estimates-max-file-age-seconds+)
                  (not *accept-stale-fee-estimates*))
-        (bitcoin-lisp:log-warn
+        (bl:log-warn
          "Ignoring fee_estimates.dat: ~,1Fh old, over the ~Dh limit"
          (/ age 3600.0) (floor +fee-estimates-max-file-age-seconds+ 3600))
         (return-from load-fee-stats nil)))
@@ -228,56 +228,56 @@ Returns T on success, NIL if file doesn't exist or is corrupt."
                               bytes))))
           ;; Need at least header (7 bytes) + CRC32 (4 bytes)
           (when (< (length file-bytes) 11)
-            (bitcoin-lisp:log-warn "Fee stats file too short")
+            (bl:log-warn "Fee stats file too short")
             (return-from load-fee-stats nil))
           ;; Verify CRC32
           (let* ((data-len (- (length file-bytes) 4))
                  (data-bytes (subseq file-bytes 0 data-len))
                  (stored-crc (subseq file-bytes data-len))
-                 (computed-crc (bitcoin-lisp.storage:compute-crc32 data-bytes)))
+                 (computed-crc (bl.store:compute-crc32 data-bytes)))
             (unless (equalp stored-crc computed-crc)
-              (bitcoin-lisp:log-warn "Fee stats file CRC32 mismatch - file corrupted")
+              (bl:log-warn "Fee stats file CRC32 mismatch - file corrupted")
               (return-from load-fee-stats nil)))
           ;; Parse data
           (flexi-streams:with-input-from-sequence (stream file-bytes)
-            (let ((magic (bitcoin-lisp.serialization:read-uint32-le stream))
-                  (version (bitcoin-lisp.serialization:read-uint8 stream))
-                  (count (bitcoin-lisp.serialization:read-uint16-le stream)))
+            (let ((magic (bl.ser:read-uint32-le stream))
+                  (version (bl.ser:read-uint8 stream))
+                  (count (bl.ser:read-uint16-le stream)))
               (unless (= magic +fee-stats-magic+)
-                (bitcoin-lisp:log-warn "Fee stats file has invalid magic")
+                (bl:log-warn "Fee stats file has invalid magic")
                 (return-from load-fee-stats nil))
               (unless (<= 1 version +fee-stats-version+)
-                (bitcoin-lisp:log-warn "Fee stats file has unsupported version ~D" version)
+                (bl:log-warn "Fee stats file has unsupported version ~D" version)
                 (return-from load-fee-stats nil))
               ;; Read entries
               (dotimes (i count)
                 (let ((entry (make-block-fee-stats
-                              :height (bitcoin-lisp.serialization:read-uint32-le stream)
-                              :median-rate (bitcoin-lisp.serialization:read-uint32-le stream)
-                              :low-rate (bitcoin-lisp.serialization:read-uint32-le stream)
-                              :high-rate (bitcoin-lisp.serialization:read-uint32-le stream)
-                              :tx-count (bitcoin-lisp.serialization:read-uint32-le stream))))
+                              :height (bl.ser:read-uint32-le stream)
+                              :median-rate (bl.ser:read-uint32-le stream)
+                              :low-rate (bl.ser:read-uint32-le stream)
+                              :high-rate (bl.ser:read-uint32-le stream)
+                              :tx-count (bl.ser:read-uint32-le stream))))
                   (fee-estimator-add-stats estimator entry)))
               ;; v2: the Core estimator's state follows the legacy entries.
               (when (>= version 2)
-                (let ((present (bitcoin-lisp.serialization:read-uint8 stream))
+                (let ((present (bl.ser:read-uint8 stream))
                       (est *block-policy-estimator*))
                   (cond
                     ((zerop present)
-                     (bitcoin-lisp:log-info "Fee estimates file carries no policy-estimator state"))
+                     (bl:log-info "Fee estimates file carries no policy-estimator state"))
                     ((null est)
-                     (bitcoin-lisp:log-info "Fee estimates file has policy-estimator state but no estimator is installed"))
+                     (bl:log-info "Fee estimates file has policy-estimator state but no estimator is installed"))
                     ((bpe-read-into est stream)
-                     (bitcoin-lisp:log-info "Loaded fee policy estimator state (best height ~D)"
+                     (bl:log-info "Loaded fee policy estimator state (best height ~D)"
                                             (block-policy-estimator-best-height est)))
                     (t
                      ;; Discarded, not partially applied. The estimator keeps
                      ;; whatever it had and rebuilds from live observation.
-                     (bitcoin-lisp:log-warn "Fee policy estimator state rejected as corrupt; starting from live observation")))))
-              (bitcoin-lisp:log-info "Loaded ~D fee stats entries" count)
+                     (bl:log-warn "Fee policy estimator state rejected as corrupt; starting from live observation")))))
+              (bl:log-info "Loaded ~D fee stats entries" count)
               t)))
       (error (e)
-        (bitcoin-lisp:log-warn "Failed to load fee stats: ~A" e)
+        (bl:log-warn "Failed to load fee stats: ~A" e)
         nil))))
 
 (defun maybe-flush-fee-stats (estimator)

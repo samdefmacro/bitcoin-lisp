@@ -76,24 +76,24 @@ abandoned TxStateInactive (transaction.h:85-103).")
     key))
 
 (defun %tx-value-out (tx)
-  (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs tx)
-          :key #'bitcoin-lisp.serialization:tx-out-value :initial-value 0))
+  (reduce #'+ (bl.ser:transaction-outputs tx)
+          :key #'bl.ser:tx-out-value :initial-value 0))
 
 (defun %tx-coinbase-p (tx)
-  (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
+  (let ((inputs (bl.ser:transaction-inputs tx)))
     (and (plusp (length inputs))
-         (bitcoin-lisp.serialization:coinbase-input-p (aref inputs 0)))))
+         (bl.ser:coinbase-input-p (aref inputs 0)))))
 
 (defun %tx-witness-hash (tx)
   "The tx's real witness hash for the RPC wtxid field. transaction-wtxid
 returns 32 zero bytes for a coinbase (the merkle-computation convention);
 Core's GetWitnessHash reports the actual hash."
   (if (%tx-coinbase-p tx)
-      (if (bitcoin-lisp.serialization:transaction-has-witness-p tx)
-          (bitcoin-lisp.crypto:hash256
-           (bitcoin-lisp.serialization:serialize-witness-transaction tx))
-          (bitcoin-lisp.serialization:transaction-hash tx))
-      (bitcoin-lisp.serialization:transaction-wtxid tx)))
+      (if (bl.ser:transaction-has-witness-p tx)
+          (bl.crypto:hash256
+           (bl.ser:serialize-witness-transaction tx))
+          (bl.ser:transaction-hash tx))
+      (bl.ser:transaction-wtxid tx)))
 
 ;;; --- wallet-tx: CWalletTx (transaction.h:194) ---
 
@@ -192,7 +192,7 @@ loaded without any chain state."
 the coinbase output is spendable (COINBASE_MATURITY + the +1 rule)."
   (if (not (%wtx-coinbase-p wtx))
       0
-      (max 0 (- (1+ bitcoin-lisp.validation:+coinbase-maturity+)
+      (max 0 (- (1+ bl.val:+coinbase-maturity+)
                 (wallet-tx-depth wallet wtx)))))
 
 (defun wallet-tx-immature-coinbase-p (wallet wtx)
@@ -257,51 +257,51 @@ timesmart record fields, sorted by key (std::map iteration order)."
   "Serialize WTX as Core's CWalletTx record value."
   (multiple-value-bind (state-hash state-index) (%wtx-serialized-state wtx)
     (%wser (s)
-      (bitcoin-lisp.serialization:write-bytes
-       s (bitcoin-lisp.serialization:transaction-wire-bytes (wallet-tx-tx wtx)))
-      (bitcoin-lisp.serialization:write-bytes s state-hash)
-      (bitcoin-lisp.serialization:write-compact-size s 0)   ; vMerkleBranch
-      (bitcoin-lisp.serialization:write-int32-le s state-index)
-      (bitcoin-lisp.serialization:write-compact-size s 0)   ; vtxPrev
+      (bl.ser:write-bytes
+       s (bl.ser:transaction-wire-bytes (wallet-tx-tx wtx)))
+      (bl.ser:write-bytes s state-hash)
+      (bl.ser:write-compact-size s 0)   ; vMerkleBranch
+      (bl.ser:write-int32-le s state-index)
+      (bl.ser:write-compact-size s 0)   ; vtxPrev
       (let ((map-pairs (%wtx-serialized-map-value wtx)))
-        (bitcoin-lisp.serialization:write-compact-size s (length map-pairs))
+        (bl.ser:write-compact-size s (length map-pairs))
         (loop for (k . v) in map-pairs
               do (%wser-string s k) (%wser-string s v)))
-      (bitcoin-lisp.serialization:write-compact-size
+      (bl.ser:write-compact-size
        s (length (wallet-tx-order-form wtx)))
       (loop for (k . v) in (wallet-tx-order-form wtx)
             do (%wser-string s k) (%wser-string s v))
-      (bitcoin-lisp.serialization:write-uint32-le s 0)      ; fTimeReceivedIsTxTime
-      (bitcoin-lisp.serialization:write-uint32-le s (wallet-tx-time-received wtx))
-      (bitcoin-lisp.serialization:write-uint8 s 0)          ; fFromMe
-      (bitcoin-lisp.serialization:write-uint8 s 0))))       ; fSpent
+      (bl.ser:write-uint32-le s 0)      ; fTimeReceivedIsTxTime
+      (bl.ser:write-uint32-le s (wallet-tx-time-received wtx))
+      (bl.ser:write-uint8 s 0)          ; fFromMe
+      (bl.ser:write-uint8 s 0))))       ; fSpent
 
 (defun parse-wallet-tx-record (bytes)
   "(values wallet-tx warning-or-nil) from a CWalletTx record value
 (CWalletTx::Unserialize)."
   (%wparse (s bytes)
-    (let* ((tx (bitcoin-lisp.serialization:read-transaction s))
-           (state-hash (bitcoin-lisp.serialization:read-bytes s 32))
-           (dummy1-count (bitcoin-lisp.serialization:read-compact-size s)))
+    (let* ((tx (bl.ser:read-transaction s))
+           (state-hash (bl.ser:read-bytes s 32))
+           (dummy1-count (bl.ser:read-compact-size s)))
       ;; vMerkleBranch: vector<uint256>, always written empty since 2014.
-      (dotimes (i dummy1-count) (bitcoin-lisp.serialization:read-bytes s 32))
-      (let ((state-index (bitcoin-lisp.serialization:read-int32-le s))
-            (vtxprev-count (bitcoin-lisp.serialization:read-compact-size s)))
+      (dotimes (i dummy1-count) (bl.ser:read-bytes s 32))
+      (let ((state-index (bl.ser:read-int32-le s))
+            (vtxprev-count (bl.ser:read-compact-size s)))
         ;; vtxPrev (legacy CMerkleTx list): we never write it and no
         ;; descriptor wallet ever has — refuse rather than mis-parse.
         (unless (zerop vtxprev-count)
           (error "wallet tx record carries legacy vtxPrev data"))
-        (let* ((map-pairs (loop repeat (bitcoin-lisp.serialization:read-compact-size s)
+        (let* ((map-pairs (loop repeat (bl.ser:read-compact-size s)
                                 collect (cons (%wread-string s) (%wread-string s))))
-               (order-form (loop repeat (bitcoin-lisp.serialization:read-compact-size s)
+               (order-form (loop repeat (bl.ser:read-compact-size s)
                                  collect (cons (%wread-string s) (%wread-string s)))))
-          (bitcoin-lisp.serialization:read-uint32-le s)     ; fTimeReceivedIsTxTime
-          (let ((time-received (bitcoin-lisp.serialization:read-uint32-le s)))
-            (bitcoin-lisp.serialization:read-uint8 s)       ; fFromMe
-            (bitcoin-lisp.serialization:read-uint8 s)       ; fSpent
+          (bl.ser:read-uint32-le s)     ; fTimeReceivedIsTxTime
+          (let ((time-received (bl.ser:read-uint32-le s)))
+            (bl.ser:read-uint8 s)       ; fFromMe
+            (bl.ser:read-uint8 s)       ; fSpent
             (let* ((wtx (make-wallet-tx
                          :tx tx
-                         :txid (bitcoin-lisp.serialization:transaction-hash tx)
+                         :txid (bl.ser:transaction-hash tx)
                          :time-received time-received
                          :order-form order-form))
                    (n-pair (assoc "n" map-pairs :test #'string=))
@@ -325,8 +325,8 @@ timesmart record fields, sorted by key (std::map iteration order)."
   (let ((key (wdb-key-tx (wallet-tx-txid wtx)))
         (value (wallet-tx-record-value wtx)))
     (if batch
-        (bitcoin-lisp.storage:leveldb-writebatch-put batch key value)
-        (bitcoin-lisp.storage:leveldb-put (wallet-db wallet) key value :sync t))))
+        (bl.store:leveldb-writebatch-put batch key value)
+        (bl.store:leveldb-put (wallet-db wallet) key value :sync t))))
 
 ;;; --- mapWallet / m_txos / mapTxSpends primitives ---
 
@@ -351,26 +351,26 @@ persist the counter."
     (let ((key (wdb-key-simple +wdb-key-orderposnext+))
           (value (wdb-int64-value (wallet-orderposnext wallet))))
       (if batch
-          (bitcoin-lisp.storage:leveldb-writebatch-put batch key value)
-          (bitcoin-lisp.storage:leveldb-put (wallet-db wallet) key value)))))
+          (bl.store:leveldb-writebatch-put batch key value)
+          (bl.store:leveldb-put (wallet-db wallet) key value)))))
 
 (defun %wallet-tx-equivalent-p (a b)
   "Core CWalletTx::IsEquivalentTo: equal after nulling every scriptSig and
 witness — same prevouts/sequences/outputs/version/locktime."
   (let ((ta (wallet-tx-tx a)) (tb (wallet-tx-tx b)))
     (flet ((stripped (tx)
-             (bitcoin-lisp.serialization:serialize-transaction
-              (bitcoin-lisp.serialization:make-transaction
-               :version (bitcoin-lisp.serialization:transaction-version tx)
+             (bl.ser:serialize-transaction
+              (bl.ser:make-transaction
+               :version (bl.ser:transaction-version tx)
                :inputs (map 'simple-vector
                             (lambda (in)
-                              (bitcoin-lisp.serialization:make-tx-in
-                               :previous-output (bitcoin-lisp.serialization:tx-in-previous-output in)
+                              (bl.ser:make-tx-in
+                               :previous-output (bl.ser:tx-in-previous-output in)
                                :script-sig (make-array 0 :element-type '(unsigned-byte 8))
-                               :sequence (bitcoin-lisp.serialization:tx-in-sequence in)))
-                            (bitcoin-lisp.serialization:transaction-inputs tx))
-               :outputs (bitcoin-lisp.serialization:transaction-outputs tx)
-               :lock-time (bitcoin-lisp.serialization:transaction-lock-time tx)))))
+                               :sequence (bl.ser:tx-in-sequence in)))
+                            (bl.ser:transaction-inputs tx))
+               :outputs (bl.ser:transaction-outputs tx)
+               :lock-time (bl.ser:transaction-lock-time tx)))))
       (equalp (stripped ta) (stripped tb)))))
 
 (defun %wallet-sync-metadata (wallet key)
@@ -408,7 +408,7 @@ persist) triple — erasing its record only when it was persisted."
       (setf (wallet-locked-utxos wallet)
             (remove entry (wallet-locked-utxos wallet)))
       (when (third entry)
-        (bitcoin-lisp.storage:leveldb-delete
+        (bl.store:leveldb-delete
          (wallet-db wallet) (wdb-key-lockedutxo txid index))))
     t))
 
@@ -418,11 +418,11 @@ outpoint in mapTxSpends, unlock any locked coin it spends, and sync metadata
 across equivalent spenders. Coinbases spend nothing."
   (unless (%wtx-coinbase-p wtx)
     (let ((txid (wallet-tx-txid wtx)))
-      (bitcoin-lisp.serialization:dovector
-          (input (bitcoin-lisp.serialization:transaction-inputs (wallet-tx-tx wtx)))
-        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-               (prev-hash (bitcoin-lisp.serialization:outpoint-hash prevout))
-               (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+      (bl.ser:dovector
+          (input (bl.ser:transaction-inputs (wallet-tx-tx wtx)))
+        (let* ((prevout (bl.ser:tx-in-previous-output input))
+               (prev-hash (bl.ser:outpoint-hash prevout))
+               (prev-index (bl.ser:outpoint-index prevout))
                (key (%wtx-outpoint-key prev-hash prev-index)))
           (pushnew txid (gethash key (wallet-tx-spends wallet)) :test #'equalp)
           (%wallet-unlock-coin wallet prev-hash prev-index)
@@ -432,10 +432,10 @@ across equivalent spenders. Coinbases spend nothing."
   "Core CWallet::RefreshTXOsFromTx: cache this tx's IsMine outputs (spent
 AND unspent) in m_txos."
   (loop for i from 0
-        for output across (bitcoin-lisp.serialization:transaction-outputs
+        for output across (bl.ser:transaction-outputs
                            (wallet-tx-tx wtx))
         do (when (%wallet-script-mine-p
-                  wallet (bitcoin-lisp.serialization:tx-out-script-pubkey output))
+                  wallet (bl.ser:tx-out-script-pubkey output))
              (let ((key (%wtx-outpoint-key (wallet-tx-txid wtx) i)))
                (unless (gethash key (wallet-txos wallet))
                  (setf (gethash key (wallet-txos wallet)) (cons wtx i)))))))
@@ -460,28 +460,28 @@ AND unspent) in m_txos."
 
 (defun %wallet-tx-any-output-mine-p (wallet tx)
   "Core CWallet::IsMine(CTransaction)."
-  (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+  (loop for output across (bl.ser:transaction-outputs tx)
         thereis (%wallet-script-mine-p
-                 wallet (bitcoin-lisp.serialization:tx-out-script-pubkey output))))
+                 wallet (bl.ser:tx-out-script-pubkey output))))
 
 (defun %wallet-input-debit (wallet input)
   "Core CWallet::GetDebit(CTxIn): the prevout's value when it is an owned
 TXO, else 0."
-  (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+  (let ((prevout (bl.ser:tx-in-previous-output input)))
     (multiple-value-bind (wtx index)
         (wallet-get-txo wallet
-                        (bitcoin-lisp.serialization:outpoint-hash prevout)
-                        (bitcoin-lisp.serialization:outpoint-index prevout))
+                        (bl.ser:outpoint-hash prevout)
+                        (bl.ser:outpoint-index prevout))
       (if wtx
-          (bitcoin-lisp.serialization:tx-out-value
-           (aref (bitcoin-lisp.serialization:transaction-outputs
+          (bl.ser:tx-out-value
+           (aref (bl.ser:transaction-outputs
                   (wallet-tx-tx wtx))
                  index))
           0))))
 
 (defun wallet-tx-debit (wallet tx)
   "Core GetDebit(CTransaction): Σ owned prevout values."
-  (reduce #'+ (bitcoin-lisp.serialization:transaction-inputs tx)
+  (reduce #'+ (bl.ser:transaction-inputs tx)
           :key (lambda (in) (%wallet-input-debit wallet in))
           :initial-value 0))
 
@@ -491,11 +491,11 @@ TXO, else 0."
 
 (defun wallet-tx-credit-raw (wallet tx)
   "receive.cpp TxGetCredit: Σ IsMine output values (no maturity handling)."
-  (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs tx)
+  (reduce #'+ (bl.ser:transaction-outputs tx)
           :key (lambda (out)
                  (if (%wallet-script-mine-p
-                      wallet (bitcoin-lisp.serialization:tx-out-script-pubkey out))
-                     (bitcoin-lisp.serialization:tx-out-value out)
+                      wallet (bl.ser:tx-out-script-pubkey out))
+                     (bl.ser:tx-out-value out)
                      0))
           :initial-value 0))
 
@@ -513,18 +513,18 @@ TXO, else 0."
 (defun wallet-mark-inputs-dirty (wallet tx)
   "Core CWallet::MarkInputsDirty: break the amount caches of every wallet tx
 TX spends — its state change usually changes their available balance."
-  (bitcoin-lisp.serialization:dovector
-      (input (bitcoin-lisp.serialization:transaction-inputs tx))
+  (bl.ser:dovector
+      (input (bl.ser:transaction-inputs tx))
     (let ((wtx (wallet-get-wallet-tx
                 wallet
-                (bitcoin-lisp.serialization:outpoint-hash
-                 (bitcoin-lisp.serialization:tx-in-previous-output input)))))
+                (bl.ser:outpoint-hash
+                 (bl.ser:tx-in-previous-output input)))))
       (when wtx (wtx-mark-dirty wtx)))))
 
 (defun wallet-tx-get-debit (wallet wtx)
   "receive.cpp CachedTxGetDebit: 0 when the tx has no inputs, else the
 cached GetDebit."
-  (if (zerop (length (bitcoin-lisp.serialization:transaction-inputs
+  (if (zerop (length (bl.ser:transaction-inputs
                       (wallet-tx-tx wtx))))
       0
       (or (wallet-tx-cached-debit wtx)
@@ -552,7 +552,7 @@ cached TxGetCredit."
 (defun %wallet-output-change-p (wallet output)
   "receive.cpp ScriptIsChange heuristic: IsMine but not in the address book
 (change-only book records don't count — allow_change=false lookup)."
-  (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+  (let ((script (bl.ser:tx-out-script-pubkey output)))
     (and (%wallet-script-mine-p wallet script)
          (let ((address (%script->address script (wallet-network wallet))))
            (or (null address)
@@ -562,11 +562,11 @@ cached TxGetCredit."
   "receive.cpp CachedTxGetChange: cached Σ change-output values."
   (or (wallet-tx-cached-change wtx)
       (setf (wallet-tx-cached-change wtx)
-            (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs
+            (reduce #'+ (bl.ser:transaction-outputs
                          (wallet-tx-tx wtx))
                     :key (lambda (out)
                            (if (%wallet-output-change-p wallet out)
-                               (bitcoin-lisp.serialization:tx-out-value out)
+                               (bl.ser:tx-out-value out)
                                0))
                     :initial-value 0))))
 
@@ -579,12 +579,12 @@ address-book record and write (or erase) its destdata \"used\" record."
         (and used t))
   (let ((key (wdb-key-destdata address "used")))
     (cond ((not used)
-           (bitcoin-lisp.storage:leveldb-delete (wallet-db wallet) key))
+           (bl.store:leveldb-delete (wallet-db wallet) key))
           (batch
-           (bitcoin-lisp.storage:leveldb-writebatch-put
+           (bl.store:leveldb-writebatch-put
             batch key (wdb-string-value "1")))
           (t
-           (bitcoin-lisp.storage:leveldb-put (wallet-db wallet) key
+           (bl.store:leveldb-put (wallet-db wallet) key
                                              (wdb-string-value "1"))))))
 
 (defun wallet-address-previously-spent-p (wallet address)
@@ -606,10 +606,10 @@ output, record its address as previously spent; newly-flagged addresses
 collect into TX-DESTINATIONS (an equal-set of address strings)."
   (let ((srctx (wallet-get-wallet-tx wallet txid)))
     (when (and srctx
-               (< n (length (bitcoin-lisp.serialization:transaction-outputs
+               (< n (length (bl.ser:transaction-outputs
                              (wallet-tx-tx srctx)))))
-      (let* ((script (bitcoin-lisp.serialization:tx-out-script-pubkey
-                      (aref (bitcoin-lisp.serialization:transaction-outputs
+      (let* ((script (bl.ser:tx-out-script-pubkey
+                      (aref (bl.ser:transaction-outputs
                              (wallet-tx-tx srctx))
                             n)))
              (address (%script->address script (wallet-network wallet))))
@@ -627,10 +627,10 @@ paying one of TX-DESTINATIONS (address-string set)."
   (when (plusp (hash-table-count tx-destinations))
     (loop for wtx being the hash-values of (wallet-map-wallet wallet)
           do (unless (wallet-tx-cache-empty wtx)
-               (loop for output across (bitcoin-lisp.serialization:transaction-outputs
+               (loop for output across (bl.ser:transaction-outputs
                                         (wallet-tx-tx wtx))
                      for address = (%script->address
-                                    (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                    (bl.ser:tx-out-script-pubkey
                                      output)
                                     (wallet-network wallet))
                      do (when (and address (gethash address tx-destinations))
@@ -649,19 +649,19 @@ paying one of TX-DESTINATIONS (address-string set)."
       ((not (eq (wallet-tx-state wtx) :in-mempool)) nil)
       (t
        (block check-parents
-         (bitcoin-lisp.serialization:dovector
-             (input (bitcoin-lisp.serialization:transaction-inputs
+         (bl.ser:dovector
+             (input (bl.ser:transaction-inputs
                      (wallet-tx-tx wtx)))
-           (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+           (let* ((prevout (bl.ser:tx-in-previous-output input))
                   (parent (wallet-get-wallet-tx
-                           wallet (bitcoin-lisp.serialization:outpoint-hash prevout))))
+                           wallet (bl.ser:outpoint-hash prevout))))
              (unless parent (return-from check-parents nil))
              (let ((parent-out
-                     (aref (bitcoin-lisp.serialization:transaction-outputs
+                     (aref (bl.ser:transaction-outputs
                             (wallet-tx-tx parent))
-                           (bitcoin-lisp.serialization:outpoint-index prevout))))
+                           (bl.ser:outpoint-index prevout))))
                (unless (%wallet-script-mine-p
-                        wallet (bitcoin-lisp.serialization:tx-out-script-pubkey
+                        wallet (bl.ser:tx-out-script-pubkey
                                 parent-out))
                  (return-from check-parents nil)))
              (unless (gethash (wallet-tx-txid parent) trusted-parents)
@@ -674,12 +674,12 @@ paying one of TX-DESTINATIONS (address-string set)."
   "Core GetTxConflicts: other wallet txids spending any of WTX's prevouts."
   (let ((txid (wallet-tx-txid wtx))
         (result '()))
-    (bitcoin-lisp.serialization:dovector
-        (input (bitcoin-lisp.serialization:transaction-inputs (wallet-tx-tx wtx)))
-      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+    (bl.ser:dovector
+        (input (bl.ser:transaction-inputs (wallet-tx-tx wtx)))
+      (let* ((prevout (bl.ser:tx-in-previous-output input))
              (key (%wtx-outpoint-key
-                   (bitcoin-lisp.serialization:outpoint-hash prevout)
-                   (bitcoin-lisp.serialization:outpoint-index prevout)))
+                   (bl.ser:outpoint-hash prevout)
+                   (bl.ser:outpoint-index prevout)))
              (spenders (gethash key (wallet-tx-spends wallet))))
         (when (> (length spenders) 1)
           (dolist (spender spenders)
@@ -727,7 +727,7 @@ ordering of same-block historical txs."
                (wtx-mark-dirty desc)
                (wallet-write-tx wallet desc :batch batch)
                (wallet-mark-inputs-dirty wallet (wallet-tx-tx desc))
-               (dotimes (i (length (bitcoin-lisp.serialization:transaction-outputs
+               (dotimes (i (length (bl.ser:transaction-outputs
                                     (wallet-tx-tx desc))))
                  (dolist (spender (gethash (%wtx-outpoint-key
                                             (wallet-tx-txid desc) i)
@@ -741,26 +741,26 @@ STATE (a state list), persist, refresh the TXO cache. Returns the wallet-tx.
 MAP-VALUE seeds a freshly-inserted wtx's user mapValue pairs — the
 CommitTransaction update callback (wallet.cpp:2464-2472); ignored on update,
 where Core asserts the existing mapValue is what it keeps."
-  (let* ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+  (let* ((txid (bl.ser:transaction-hash tx))
          (existing (wallet-get-wallet-tx wallet txid))
          (wtx (or existing (make-wallet-tx :tx tx :txid txid)))
          (inserted (not existing))
          (updated nil))
     (when (and inserted map-value)
       (setf (wallet-tx-map-value wtx) map-value))
-    (bitcoin-lisp.storage:with-leveldb-writebatch (batch)
+    (bl.store:with-leveldb-writebatch (batch)
       ;; WALLET_FLAG_AVOID_REUSE: destinations this tx spends from become
       ;; previously-spent; txs paying newly-flagged destinations lose their
       ;; caches (wallet.cpp:1032-1042).
       (when (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+)
         (let ((tx-destinations (make-hash-table :test 'equal)))
-          (bitcoin-lisp.serialization:dovector
-              (input (bitcoin-lisp.serialization:transaction-inputs tx))
-            (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+          (bl.ser:dovector
+              (input (bl.ser:transaction-inputs tx))
+            (let ((prevout (bl.ser:tx-in-previous-output input)))
               (%wallet-set-spent-key-state
                wallet batch
-               (bitcoin-lisp.serialization:outpoint-hash prevout)
-               (bitcoin-lisp.serialization:outpoint-index prevout)
+               (bl.ser:outpoint-hash prevout)
+               (bl.ser:outpoint-index prevout)
                t tx-destinations)))
           ;; The batch below only commits on inserted/updated; a queued
           ;; previously-spent record must land regardless (Core's batch
@@ -772,7 +772,7 @@ where Core asserts the existing mapValue is what it keeps."
         (%wtx-apply-state-list wtx state)
         (setf (gethash txid (wallet-map-wallet wallet)) wtx)
         (setf (wallet-tx-time-received wtx)
-              (bitcoin-lisp.serialization:get-unix-time))
+              (bl.ser:get-unix-time))
         (setf (wallet-tx-order-pos wtx) (wallet-inc-order-pos-next wallet batch))
         (%wallet-tx-ordered-insert wallet wtx)
         (setf (wallet-tx-time-smart wtx)
@@ -792,12 +792,12 @@ where Core asserts the existing mapValue is what it keeps."
                     (%wtx-serialized-state probe)
                   (unless (and (equalp old-hash new-hash)
                                (= old-index new-index))
-                    (bitcoin-lisp:log-warn
+                    (bl:log-warn
                      "AddToWallet: same-kind state mismatch for ~A (kept existing)"
                      (hash-to-hex txid)))))))
         ;; Witness upgrade: replace a stored witness-stripped version.
-        (when (and (bitcoin-lisp.serialization:transaction-has-witness-p tx)
-                   (not (bitcoin-lisp.serialization:transaction-has-witness-p
+        (when (and (bl.ser:transaction-has-witness-p tx)
+                   (not (bl.ser:transaction-has-witness-p
                          (wallet-tx-tx wtx))))
           (setf (wallet-tx-tx wtx) tx)
           (setf updated t)))
@@ -807,7 +807,7 @@ where Core asserts the existing mapValue is what it keeps."
         (setf updated t))
       (when (or inserted updated)
         (wallet-write-tx wallet wtx :batch batch)
-        (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t)))
+        (bl.store:leveldb-write (wallet-db wallet) batch :sync t)))
     ;; Break debit/credit balance caches (wallet.cpp:1117).
     (wtx-mark-dirty wtx)
     (wallet-refresh-txos wallet wtx)
@@ -828,7 +828,7 @@ the literal \"unconfirmed\"/-1."
               (values (hash-to-hex (wallet-tx-block-hash wtx))
                       (princ-to-string (wallet-tx-block-height wtx)))
               (values "unconfirmed" "-1"))
-        (bitcoin-lisp:run-notify-command
+        (bl:run-notify-command
          command
          :substitutions (list (cons #\s (hash-to-hex (wallet-tx-txid wtx)))
                               (cons #\w (wallet-name wallet))
@@ -865,21 +865,21 @@ Returns the newly-marked addresses."
 (defun wallet-add-to-wallet-if-involving-me (wallet tx state
                                              &key (update t) rescanning
                                                   block-time)
-  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+  (let ((txid (bl.ser:transaction-hash tx)))
     ;; A confirmed tx marks every OTHER wallet tx spending the same prevouts
     ;; block-conflicted — runs for ALL block txs, ours or not.
     (when (eq (first state) :confirmed)
       (destructuring-bind (block-hash height index) (rest state)
         (declare (ignore index))
-        (bitcoin-lisp.serialization:dovector
-            (input (bitcoin-lisp.serialization:transaction-inputs tx))
-          (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+        (bl.ser:dovector
+            (input (bl.ser:transaction-inputs tx))
+          (let* ((prevout (bl.ser:tx-in-previous-output input))
                  (key (%wtx-outpoint-key
-                       (bitcoin-lisp.serialization:outpoint-hash prevout)
-                       (bitcoin-lisp.serialization:outpoint-index prevout))))
+                       (bl.ser:outpoint-hash prevout)
+                       (bl.ser:outpoint-index prevout))))
             (dolist (spender (gethash key (wallet-tx-spends wallet)))
               (unless (equalp spender txid)
-                (bitcoin-lisp:log-info
+                (bl:log-info
                  "Wallet ~A: tx ~A in block ~A conflicts with wallet tx ~A"
                  (wallet-name wallet) (hash-to-hex txid)
                  (hash-to-hex block-hash) (hash-to-hex spender))
@@ -892,9 +892,9 @@ Returns the newly-marked addresses."
              (wallet-tx-from-me-p wallet tx))
          ;; Keypool items that turn out used (e.g. restored backup) advance
          ;; next_index; fresh external receiving addresses join the book.
-         (bitcoin-lisp.serialization:dovector
-             (output (bitcoin-lisp.serialization:transaction-outputs tx))
-           (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+         (bl.ser:dovector
+             (output (bl.ser:transaction-outputs tx))
+           (let ((script (bl.ser:tx-out-script-pubkey output)))
              (loop for spkm being the hash-values of (wallet-spkms wallet)
                    do (when (spkm-is-mine spkm script)
                         (let ((dests (spkm-mark-unused-addresses wallet spkm script)))
@@ -943,7 +943,7 @@ mempool-conflicts bookkeeping passes NIL (Core passes a null batch)."
                               (not (eq (funcall update-fn wtx) :unchanged)))
                      (wtx-mark-dirty wtx)
                      (when write (wallet-write-tx wallet wtx))
-                     (dotimes (i (length (bitcoin-lisp.serialization:transaction-outputs
+                     (dotimes (i (length (bl.ser:transaction-outputs
                                           (wallet-tx-tx wtx))))
                        (dolist (spender (gethash (%wtx-outpoint-key now i)
                                                  (wallet-tx-spends wallet)))
@@ -997,7 +997,7 @@ mempool; returns T on success."
   "Core RefreshMempoolStatus (wallet.cpp:142): in-memory only, no disk write
 — InMempool serializes as Inactive anyway."
   (declare (ignore wallet))
-  (cond ((and mempool (bitcoin-lisp.mempool:mempool-has
+  (cond ((and mempool (bl.mp:mempool-has
                        mempool (wallet-tx-txid wtx)))
          (%wtx-apply-state wtx :in-mempool))
         ((eq (wallet-tx-state wtx) :in-mempool)
@@ -1007,7 +1007,7 @@ mempool; returns T on success."
   "Core UpdateTrucSiblingConflicts: TRUC policy admits one unconfirmed child
 per parent, so other spenders of the parent's outputs are mempool-conflicted
 by CHILD-TXID (or released when it leaves)."
-  (dotimes (i (length (bitcoin-lisp.serialization:transaction-outputs
+  (dotimes (i (length (bl.ser:transaction-outputs
                        (wallet-tx-tx parent-wtx))))
     (dolist (sibling (gethash (%wtx-outpoint-key (wallet-tx-txid parent-wtx) i)
                               (wallet-tx-spends wallet)))
@@ -1027,17 +1027,17 @@ by CHILD-TXID (or released when it leaves)."
   "Core CWallet::transactionAddedToMempool."
   (with-wallet-lock (wallet)
     (wallet-sync-transaction wallet tx '(:in-mempool))
-    (let* ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+    (let* ((txid (bl.ser:transaction-hash tx))
            (wtx (wallet-get-wallet-tx wallet txid)))
       (when wtx
         (%wallet-refresh-mempool-status wallet wtx mempool))
       ;; Wallet txs spending the same prevouts are now mempool-conflicted.
-      (bitcoin-lisp.serialization:dovector
-          (input (bitcoin-lisp.serialization:transaction-inputs tx))
-        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+      (bl.ser:dovector
+          (input (bl.ser:transaction-inputs tx))
+        (let* ((prevout (bl.ser:tx-in-previous-output input))
                (key (%wtx-outpoint-key
-                     (bitcoin-lisp.serialization:outpoint-hash prevout)
-                     (bitcoin-lisp.serialization:outpoint-index prevout))))
+                     (bl.ser:outpoint-hash prevout)
+                     (bl.ser:outpoint-index prevout))))
           (dolist (spender (gethash key (wallet-tx-spends wallet)))
             (unless (equalp spender txid)
               (wallet-recursive-update-tx-state
@@ -1049,13 +1049,13 @@ by CHILD-TXID (or released when it leaves)."
                        (progn (setf (gethash txid set) t) :changed))))
                :write nil)))))
       ;; TRUC: remember the one unconfirmed child; its siblings conflict.
-      (when (= (bitcoin-lisp.serialization:transaction-version tx)
-               bitcoin-lisp.mempool:+truc-version+)
-        (bitcoin-lisp.serialization:dovector
-            (input (bitcoin-lisp.serialization:transaction-inputs tx))
-          (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+      (when (= (bl.ser:transaction-version tx)
+               bl.mp:+truc-version+)
+        (bl.ser:dovector
+            (input (bl.ser:transaction-inputs tx))
+          (let* ((prevout (bl.ser:tx-in-previous-output input))
                  (parent (wallet-get-wallet-tx
-                          wallet (bitcoin-lisp.serialization:outpoint-hash prevout))))
+                          wallet (bl.ser:outpoint-hash prevout))))
             (when (and parent (%wtx-unconfirmed-p parent))
               (setf (wallet-tx-truc-child parent) txid)
               (%wallet-update-truc-sibling-conflicts wallet parent txid t))))))))
@@ -1063,7 +1063,7 @@ by CHILD-TXID (or released when it leaves)."
 (defun wallet-transaction-removed-from-mempool (wallet mempool tx reason)
   "Core CWallet::transactionRemovedFromMempool."
   (with-wallet-lock (wallet)
-    (let* ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+    (let* ((txid (bl.ser:transaction-hash tx))
            (wtx (wallet-get-wallet-tx wallet txid)))
       (when wtx
         (%wallet-refresh-mempool-status wallet wtx mempool))
@@ -1074,12 +1074,12 @@ by CHILD-TXID (or released when it leaves)."
       (when (eq reason :conflict)
         (wallet-sync-transaction wallet tx '(:inactive)))
       ;; The departed tx no longer mempool-conflicts anything.
-      (bitcoin-lisp.serialization:dovector
-          (input (bitcoin-lisp.serialization:transaction-inputs tx))
-        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+      (bl.ser:dovector
+          (input (bl.ser:transaction-inputs tx))
+        (let* ((prevout (bl.ser:tx-in-previous-output input))
                (key (%wtx-outpoint-key
-                     (bitcoin-lisp.serialization:outpoint-hash prevout)
-                     (bitcoin-lisp.serialization:outpoint-index prevout))))
+                     (bl.ser:outpoint-hash prevout)
+                     (bl.ser:outpoint-index prevout))))
           (dolist (spender (gethash key (wallet-tx-spends wallet)))
             (wallet-recursive-update-tx-state
              wallet spender
@@ -1088,13 +1088,13 @@ by CHILD-TXID (or released when it leaves)."
                    :changed
                    :unchanged))
              :write nil))))
-      (when (= (bitcoin-lisp.serialization:transaction-version tx)
-               bitcoin-lisp.mempool:+truc-version+)
-        (bitcoin-lisp.serialization:dovector
-            (input (bitcoin-lisp.serialization:transaction-inputs tx))
-          (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+      (when (= (bl.ser:transaction-version tx)
+               bl.mp:+truc-version+)
+        (bl.ser:dovector
+            (input (bl.ser:transaction-inputs tx))
+          (let* ((prevout (bl.ser:tx-in-previous-output input))
                  (parent (wallet-get-wallet-tx
-                          wallet (bitcoin-lisp.serialization:outpoint-hash prevout))))
+                          wallet (bl.ser:outpoint-hash prevout))))
             (when (and parent
                        (equalp (wallet-tx-truc-child parent) txid))
               (setf (wallet-tx-truc-child parent) nil)
@@ -1104,10 +1104,10 @@ by CHILD-TXID (or released when it leaves)."
   "Exponential step-back locator for BLOCK-HASH (Core GetLocator), or the
 single-hash fallback when the entry is unknown."
   (let ((entry (and chain-state
-                    (bitcoin-lisp.storage:get-block-index-entry chain-state
+                    (bl.store:get-block-index-entry chain-state
                                                                 block-hash))))
     (if entry
-        (bitcoin-lisp.storage:build-block-locator chain-state entry)
+        (bl.store:build-block-locator chain-state entry)
         (list block-hash))))
 
 (defun wallet-block-connected (wallet mempool chain-state block block-hash height)
@@ -1116,8 +1116,8 @@ single-hash fallback when the entry is unknown."
     ;; Best block in memory first — MarkConflicted needs the height.
     (setf (wallet-last-block-hash wallet) block-hash
           (wallet-last-block-height wallet) height)
-    (let ((block-time (bitcoin-lisp.serialization:block-header-timestamp
-                       (bitcoin-lisp.serialization:bitcoin-block-header block))))
+    (let ((block-time (bl.ser:block-header-timestamp
+                       (bl.ser:bitcoin-block-header block))))
       ;; Core SetLastBlockProcessed's m_best_block_time — the rebroadcast
       ;; filter's reference clock (wallet P4).
       (setf (wallet-last-block-time wallet) block-time)
@@ -1130,7 +1130,7 @@ single-hash fallback when the entry is unknown."
                (- (wallet-birth-time wallet) (* 2 +wallet-timestamp-window+)))
         (return-from wallet-block-connected))
       (let ((wallet-updated nil))
-        (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+        (loop for tx in (bl.ser:bitcoin-block-transactions block)
               for index from 0
               do (when (wallet-sync-transaction
                         wallet tx (list :confirmed block-hash height index)
@@ -1147,7 +1147,7 @@ single-hash fallback when the entry is unknown."
 (defun wallet-block-disconnected (wallet block height)
   "Core CWallet::blockDisconnected."
   (with-wallet-lock (wallet)
-    (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+    (loop for tx in (bl.ser:bitcoin-block-transactions block)
           for index from 0
           ;; A disconnected coinbase is not just inactive but abandoned —
           ;; it can never be relayed standalone.
@@ -1155,12 +1155,12 @@ single-hash fallback when the entry is unknown."
              ;; Wallet txs the disconnected tx had conflicted-out revert to
              ;; unconfirmed when their conflicting block is at/above the
              ;; disconnect height.
-             (bitcoin-lisp.serialization:dovector
-                 (input (bitcoin-lisp.serialization:transaction-inputs tx))
-               (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+             (bl.ser:dovector
+                 (input (bl.ser:transaction-inputs tx))
+               (let* ((prevout (bl.ser:tx-in-previous-output input))
                       (key (%wtx-outpoint-key
-                            (bitcoin-lisp.serialization:outpoint-hash prevout)
-                            (bitcoin-lisp.serialization:outpoint-index prevout))))
+                            (bl.ser:outpoint-hash prevout)
+                            (bl.ser:outpoint-index prevout))))
                  (dolist (spender (gethash key (wallet-tx-spends wallet)))
                    (let ((wtx (wallet-get-wallet-tx wallet spender)))
                      (when (and wtx (eq (wallet-tx-state wtx) :block-conflicted))
@@ -1172,8 +1172,8 @@ single-hash fallback when the entry is unknown."
                               (progn (%wtx-apply-state w :inactive) :changed)
                               :unchanged)))))))))
     (setf (wallet-last-block-hash wallet)
-          (bitcoin-lisp.serialization:block-header-prev-block
-           (bitcoin-lisp.serialization:bitcoin-block-header block))
+          (bl.ser:block-header-prev-block
+           (bl.ser:bitcoin-block-header block))
           (wallet-last-block-height wallet) (1- height))))
 
 ;;; --- Manager fan-outs (called by node.lisp's wallet-notify-* hooks) ---
@@ -1198,7 +1198,7 @@ node down)."
          (when (wallet-db ,wallet)
            ,@body)
        (error (e)
-         (bitcoin-lisp:log-error "Wallet ~A: ~A hook failed: ~A"
+         (bl:log-error "Wallet ~A: ~A hook failed: ~A"
                                  (wallet-name ,wallet) ,what e)))))
 
 (defun wallets-block-connected (manager mempool chain-state block block-hash height)
@@ -1224,11 +1224,11 @@ node down)."
 chain — fill the height, or demote to inactive when the block was reorged
 away while the wallet was closed."
   (when (member (wallet-tx-state wtx) '(:confirmed :block-conflicted))
-    (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+    (let ((entry (bl.store:get-block-index-entry
                   chain-state (wallet-tx-block-hash wtx))))
-      (if (and entry (bitcoin-lisp.storage:entry-on-active-chain-p chain-state entry))
+      (if (and entry (bl.store:entry-on-active-chain-p chain-state entry))
           (setf (wallet-tx-block-height wtx)
-                (bitcoin-lisp.storage:block-index-entry-height entry))
+                (bl.store:block-index-entry-height entry))
           (%wtx-apply-state wtx :inactive)))))
 
 (defun wallet-load-tx-records (wallet tx-records chain-state warnings)
@@ -1262,13 +1262,13 @@ LoadToWallet). TX-RECORDS is (txid . value-bytes) pairs. Returns WARNINGS."
                ;; A parent already loaded as block-conflicted conflicts its
                ;; spenders too (LoadToWallet, wallet.cpp:1172-1180; no-op
                ;; until a chain height is known, like Core pre-AttachChain).
-               (bitcoin-lisp.serialization:dovector
-                   (input (bitcoin-lisp.serialization:transaction-inputs
+               (bl.ser:dovector
+                   (input (bl.ser:transaction-inputs
                            (wallet-tx-tx wtx)))
                  (let ((prev (wallet-get-wallet-tx
                               wallet
-                              (bitcoin-lisp.serialization:outpoint-hash
-                               (bitcoin-lisp.serialization:tx-in-previous-output input)))))
+                              (bl.ser:outpoint-hash
+                               (bl.ser:tx-in-previous-output input)))))
                    (when (and prev (eq (wallet-tx-state prev) :block-conflicted))
                      (wallet-mark-conflicted wallet
                                              (wallet-tx-block-hash prev)
@@ -1314,7 +1314,7 @@ Returns NIL when a rescan is already running."
     (if (wallet-scanning-since wallet)
         nil
         (progn (setf (wallet-scanning-since wallet)
-                     (bitcoin-lisp.serialization:get-unix-time)
+                     (bl.ser:get-unix-time)
                      (wallet-abort-rescan wallet) nil
                      (wallet-scan-progress wallet) 0.0)
                t))))
@@ -1335,23 +1335,23 @@ deadline for the scan's duration so its keypool top-ups cannot fail mid-scan
   "Core CChain::FindEarliestAtLeast (via findFirstBlockWithTimeAndHeight):
 the first active-chain entry whose max-block-time-so-far reaches MIN-TIME
 (ties broken by MIN-HEIGHT), or NIL. One O(tip) walk."
-  (let ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+  (let ((tip-hash (bl.store:best-block-hash chain-state)))
     (when tip-hash
       (let ((entries '())
-            (entry (bitcoin-lisp.storage:get-block-index-entry chain-state tip-hash)))
+            (entry (bl.store:get-block-index-entry chain-state tip-hash)))
         (loop while entry
               do (push entry entries)
-                 (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+                 (setf entry (bl.store:block-index-entry-prev-entry entry)))
         (let ((time-max 0))
           (dolist (e entries)
-            (let ((header (bitcoin-lisp.storage:block-index-entry-header e)))
+            (let ((header (bl.store:block-index-entry-header e)))
               (when header
                 (setf time-max
                       (max time-max
-                           (bitcoin-lisp.serialization:block-header-timestamp header)))))
+                           (bl.ser:block-header-timestamp header)))))
             (when (or (> time-max min-time)
                       (and (= time-max min-time)
-                           (>= (bitcoin-lisp.storage:block-index-entry-height e)
+                           (>= (bl.store:block-index-entry-height e)
                                min-height)))
               (return-from find-first-block-with-time e))))
         nil))))
@@ -1359,15 +1359,15 @@ the first active-chain entry whose max-block-time-so-far reaches MIN-TIME
 (defun %entry-chain-time-max (chain-state block-hash)
   "Max block time over BLOCK-HASH's chain up to and including it (Core
 CBlockIndex::GetBlockTimeMax). O(height); failure-path only."
-  (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash))
+  (let ((entry (bl.store:get-block-index-entry chain-state block-hash))
         (time-max 0))
     (loop while entry
-          do (let ((header (bitcoin-lisp.storage:block-index-entry-header entry)))
+          do (let ((header (bl.store:block-index-entry-header entry)))
                (when header
                  (setf time-max
                        (max time-max
-                            (bitcoin-lisp.serialization:block-header-timestamp header)))))
-             (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+                            (bl.ser:block-header-timestamp header)))))
+             (setf entry (bl.store:block-index-entry-prev-entry entry)))
     time-max))
 
 ;;; --- Fast rescan via the BIP158 filter index (Core FastWalletRescanFilter) ---
@@ -1444,12 +1444,12 @@ nullopt, node/interfaces.cpp:583-584): the caller inspects the block. There is
 deliberately NO whole-scan guard on the index's sync height — Core has none,
 our index can legitimately contain holes below its best marker, and 'no filter
 => read the block' is already the safe direction."
-  (let ((filter (bitcoin-lisp.storage:blockfilterindex-get-filter bfi block-hash)))
+  (let ((filter (bl.store:blockfilterindex-get-filter bfi block-hash)))
     (if (null filter)
         :unknown
         (multiple-value-bind (k0 k1)
-            (bitcoin-lisp.storage:block-filter-siphash-keys block-hash)
-          (if (bitcoin-lisp.storage:gcs-filter-match-any
+            (bl.store:block-filter-siphash-keys block-hash)
+          (if (bl.store:gcs-filter-match-any
                filter k0 k1 (rescan-filter-scripts rf))
               :match
               :no-match)))))
@@ -1486,11 +1486,11 @@ away) / :user-abort."
         ;; gappy index, and a whole-scan guard would disable the fast path
         ;; whenever the index trails the tip by even one block.
         (bfi (let ((b (rpc-get-blockfilterindex node)))
-               (and b (bitcoin-lisp.storage:blockfilterindex-enabled b) b)))
+               (and b (bl.store:blockfilterindex-enabled b) b)))
         (rf nil)
         (skipped 0))
     (when bfi (setf rf (%make-wallet-rescan-filter wallet)))
-    (bitcoin-lisp:log-info "Wallet ~A: rescan started from height ~D (~A)"
+    (bl:log-info "Wallet ~A: rescan started from height ~D (~A)"
                            (wallet-name wallet) start-height
                            (if rf
                                "fast variant using block filters"
@@ -1502,33 +1502,33 @@ away) / :user-abort."
           (return-from scan))
         (let ((done nil))
           (with-node-lock (node)
-            (let* ((chain-state (bitcoin-lisp::node-current-chainstate node))
-                   (store (bitcoin-lisp::node-block-store node))
+            (let* ((chain-state (bl::node-current-chainstate node))
+                   (store (bl::node-block-store node))
                    (entry (and chain-state
-                               (bitcoin-lisp.storage:get-block-index-entry
+                               (bl.store:get-block-index-entry
                                 chain-state block-hash))))
               (cond
                 ((or (null chain-state) (null store) (null entry)
-                     (not (bitcoin-lisp.storage:entry-on-active-chain-p
+                     (not (bl.store:entry-on-active-chain-p
                            chain-state entry)))
                  ;; Segment start reorged away (or no chain): abort as
                  ;; failure so no tx is marked confirmed in a stale block.
                  (setf status :failure done t))
                 (t
-                 (let* ((tip-height (bitcoin-lisp.storage:current-height chain-state))
+                 (let* ((tip-height (bl.store:current-height chain-state))
                         (end-height (min tip-height
                                          (or max-height most-positive-fixnum)
                                          (+ height (1- +rescan-segment-blocks+)))))
                    (if (> height end-height)
                        (setf done t)
                        (progn
-                         (dolist (e (bitcoin-lisp.storage:active-chain-entries-from
+                         (dolist (e (bl.store:active-chain-entries-from
                                      chain-state height (1+ (- end-height height))))
                            (when (wallet-abort-rescan wallet)
                              (setf status :user-abort done t)
                              (return))
-                           (let* ((ehash (bitcoin-lisp.storage:block-index-entry-hash e))
-                                  (eheight (bitcoin-lisp.storage:block-index-entry-height e))
+                           (let* ((ehash (bl.store:block-index-entry-hash e))
+                                  (eheight (bl.store:block-index-entry-height e))
                                   ;; Core wallet.cpp:1901-1902: refresh the set
                                   ;; BEFORE matching this block, so a TopUp that
                                   ;; block N-1 triggered is present for block N.
@@ -1537,7 +1537,7 @@ away) / :user-abort."
                                              (%rescan-filter-matches-block bfi rf ehash)))
                                   ;; Only read the block if we might need it.
                                   (blk (unless (eq verdict :no-match)
-                                         (bitcoin-lisp.storage:get-block store ehash))))
+                                         (bl.store:get-block store ehash))))
                              (cond
                                ((eq verdict :no-match)
                                 ;; Filter proves no script of ours appears in
@@ -1558,10 +1558,10 @@ away) / :user-abort."
                                 (setf status :failure))
                                (t
                                 (let ((block-time
-                                        (bitcoin-lisp.serialization:block-header-timestamp
-                                         (bitcoin-lisp.serialization:bitcoin-block-header blk))))
+                                        (bl.ser:block-header-timestamp
+                                         (bl.ser:bitcoin-block-header blk))))
                                   (with-wallet-lock (wallet)
-                                    (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions blk)
+                                    (loop for tx in (bl.ser:bitcoin-block-transactions blk)
                                           for index from 0
                                           do (wallet-sync-transaction
                                               wallet tx
@@ -1589,29 +1589,29 @@ away) / :user-abort."
                              ((and max-height (>= end-height max-height))
                               (setf done t))
                              ((>= end-height tip-height) (setf done t))
-                             (t (let ((next (bitcoin-lisp.storage:get-block-at-height
+                             (t (let ((next (bl.store:get-block-at-height
                                              chain-state (1+ end-height))))
                                   (if next
                                       (setf height (1+ end-height)
                                             block-hash
-                                            (bitcoin-lisp.storage:block-index-entry-hash next))
+                                            (bl.store:block-index-entry-hash next))
                                       (setf done t)))))))))))))
           (when done (return-from scan)))))
     ;; Scanning reached the tip: fold the current mempool in.
     (when (and (null max-height) (not (eq status :user-abort)))
       (with-node-lock (node)
-        (let ((mempool (bitcoin-lisp::node-mempool node)))
+        (let ((mempool (bl::node-mempool node)))
           (when mempool
-            (bitcoin-lisp.mempool:mempool-for-each
+            (bl.mp:mempool-for-each
              mempool
              (lambda (txid entry)
                (declare (ignore txid))
                (wallet-transaction-added-to-mempool
                 wallet mempool
-                (bitcoin-lisp.mempool:mempool-entry-transaction entry))))))))
+                (bl.mp:mempool-entry-transaction entry))))))))
     (setf (wallet-scan-progress wallet) 1.0)
     (when rf
-      (bitcoin-lisp:log-info "Wallet ~A: fast rescan skipped ~D block~:P via block filters"
+      (bl:log-info "Wallet ~A: fast rescan skipped ~D block~:P via block filters"
                              (wallet-name wallet) skipped))
     ;; SKIPPED is a 4th value so tests (and operators) can confirm the fast
     ;; path actually fired rather than inferring it; all existing callers
@@ -1625,13 +1625,13 @@ was successfully covered (> START-TIME when blocks could not be read). The
 caller holds the rescan reservation."
   (let (start-entry-hash start-entry-height)
     (with-node-lock (node)
-      (let* ((chain-state (bitcoin-lisp::node-current-chainstate node))
+      (let* ((chain-state (bl::node-current-chainstate node))
              (entry (and chain-state
                          (find-first-block-with-time
                           chain-state (- start-time +wallet-timestamp-window+) 0))))
         (when entry
-          (setf start-entry-hash (bitcoin-lisp.storage:block-index-entry-hash entry)
-                start-entry-height (bitcoin-lisp.storage:block-index-entry-height entry)))))
+          (setf start-entry-hash (bl.store:block-index-entry-hash entry)
+                start-entry-height (bl.store:block-index-entry-height entry)))))
     (if (null start-entry-hash)
         start-time
         (multiple-value-bind (status last-height last-hash)
@@ -1642,7 +1642,7 @@ caller holds the rescan reservation."
               ;; Core reads the last FAILED block's max time; our scan aborts
               ;; the segment on failure, so the segment start bounds it.
               (with-node-lock (node)
-                (let ((chain-state (bitcoin-lisp::node-current-chainstate node)))
+                (let ((chain-state (bl::node-current-chainstate node)))
                   (+ (%entry-chain-time-max chain-state start-entry-hash)
                      +wallet-timestamp-window+ 1)))
               start-time)))))
@@ -1657,19 +1657,19 @@ pending notifications. Returns NIL on success or an error string (the wallet
 should then be unloaded, like Core's failed AttachChain)."
   (let (rescan-height tip-height start-hash)
     (with-node-lock (node)
-      (let ((chain-state (bitcoin-lisp::node-current-chainstate node)))
+      (let ((chain-state (bl::node-current-chainstate node)))
         (unless (and chain-state
-                     (bitcoin-lisp.storage:best-block-hash chain-state))
+                     (bl.store:best-block-hash chain-state))
           (return-from wallet-attach-chain nil))
-        (setf tip-height (max (bitcoin-lisp.storage:current-height chain-state) 0))
+        (setf tip-height (max (bl.store:current-height chain-state) 0))
         (let ((fork (and (wallet-loaded-locator wallet)
-                         (bitcoin-lisp.storage:find-fork-in-active-chain
+                         (bl.store:find-fork-in-active-chain
                           chain-state (wallet-loaded-locator wallet)))))
           (setf rescan-height
-                (if fork (bitcoin-lisp.storage:block-index-entry-height fork) 0)))
+                (if fork (bl.store:block-index-entry-height fork) 0)))
         (with-wallet-lock (wallet)
           (setf (wallet-last-block-hash wallet)
-                (bitcoin-lisp.storage:best-block-hash chain-state)
+                (bl.store:best-block-hash chain-state)
                 (wallet-last-block-height wallet) tip-height))
         (when (/= tip-height rescan-height)
           ;; Skip blocks predating the wallet birthday (adjusted for block
@@ -1680,18 +1680,18 @@ should then be unloaded, like Core's failed AttachChain)."
                         rescan-height)))
             (setf rescan-height
                   (if found
-                      (bitcoin-lisp.storage:block-index-entry-height found)
+                      (bl.store:block-index-entry-height found)
                       tip-height)))
-          (when (and (bitcoin-lisp:pruning-enabled-p)
+          (when (and (bl:pruning-enabled-p)
                      (< rescan-height
-                        (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
+                        (bl.store:chain-state-pruned-height chain-state)))
             (return-from wallet-attach-chain
               "Prune: last wallet synchronisation goes beyond pruned data. You need to -reindex (download the whole blockchain again in case of a pruned node)"))
-          (let ((start-entry (bitcoin-lisp.storage:get-block-at-height
+          (let ((start-entry (bl.store:get-block-at-height
                               chain-state rescan-height)))
             (when start-entry
               (setf start-hash
-                    (bitcoin-lisp.storage:block-index-entry-hash start-entry)))))))
+                    (bl.store:block-index-entry-hash start-entry)))))))
     (when start-hash
       (unless (wallet-reserve-rescan wallet)
         (return-from wallet-attach-chain
@@ -1707,7 +1707,7 @@ should then be unloaded, like Core's failed AttachChain)."
              ;; the pre-scan tip after a reorg), persisted.
              (when last-hash
                (with-node-lock (node)
-                 (let ((chain-state (bitcoin-lisp::node-current-chainstate node)))
+                 (let ((chain-state (bl::node-current-chainstate node)))
                    (with-wallet-lock (wallet)
                      (setf (wallet-last-block-hash wallet) last-hash
                            (wallet-last-block-height wallet) last-height)
@@ -1727,13 +1727,13 @@ should then be unloaded, like Core's failed AttachChain)."
 (defun %wallet-block-time (node block-hash)
   "The timestamp of BLOCK-HASH's header via the block index (WalletTxToJSON's
 chain.findBlock time lookup). Caller holds the node-lock."
-  (let* ((chain-state (bitcoin-lisp::node-current-chainstate node))
+  (let* ((chain-state (bl::node-current-chainstate node))
          (entry (and chain-state
-                     (bitcoin-lisp.storage:get-block-index-entry chain-state
+                     (bl.store:get-block-index-entry chain-state
                                                                  block-hash)))
-         (header (and entry (bitcoin-lisp.storage:block-index-entry-header entry))))
+         (header (and entry (bl.store:block-index-entry-header entry))))
     (if header
-        (bitcoin-lisp.serialization:block-header-timestamp header)
+        (bl.ser:block-header-timestamp header)
         0)))
 
 (defun %wtx-rbf-status (node wallet wtx confirms)
@@ -1742,14 +1742,14 @@ chain.findBlock time lookup). Caller holds the node-lock."
   (if (plusp confirms)
       "no"
       (let ((tx (wallet-tx-tx wtx))
-            (mempool (bitcoin-lisp::node-mempool node)))
+            (mempool (bl::node-mempool node)))
         (cond
-          ((bitcoin-lisp.mempool:tx-signals-rbf-p tx) "yes")
+          ((bl.mp:tx-signals-rbf-p tx) "yes")
           ((or (null mempool)
-               (not (bitcoin-lisp.mempool:mempool-has mempool
+               (not (bl.mp:mempool-has mempool
                                                       (wallet-tx-txid wtx))))
            "unknown")
-          ((bitcoin-lisp.mempool::mempool-tx-or-ancestor-signals-rbf-p
+          ((bl.mp::mempool-tx-or-ancestor-signals-rbf-p
             mempool (wallet-tx-txid wtx))
            "yes")
           (t "no")))))
@@ -1799,15 +1799,15 @@ the tx."
          (received '())
          (sent '()))
     (loop for i from 0
-          for output across (bitcoin-lisp.serialization:transaction-outputs tx)
-          do (let* ((script (bitcoin-lisp.serialization:tx-out-script-pubkey output))
+          for output across (bl.ser:transaction-outputs tx)
+          do (let* ((script (bl.ser:tx-out-script-pubkey output))
                     (mine (%wallet-script-mine-p wallet script)))
                (unless (or (and (plusp debit)
                                 (not include-change)
                                 (%wallet-output-change-p wallet output))
                            (and (not (plusp debit)) (not mine)))
                  (let ((entry (list (%script->address script (wallet-network wallet))
-                                    (bitcoin-lisp.serialization:tx-out-value output)
+                                    (bl.ser:tx-out-value output)
                                     i script)))
                    (when (plusp debit) (push entry sent))
                    (when mine (push entry received))))))
@@ -1893,8 +1893,8 @@ gettransaction). PARAMS: (txid include_watchonly verbose)."
               ("details" . ,(or (%wallet-list-transactions node wallet wtx 0
                                                            nil nil)
                                 #()))
-              ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                         (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
+              ("hex" . ,(bl.crypto:bytes-to-hex
+                         (bl.ser:transaction-wire-bytes tx)))
               ,@(when verbose
                   `(("decoded" . ,(remove "hex" (tx-to-json tx (wallet-network wallet))
                                           :key #'car :test #'equal))))
@@ -1953,11 +1953,11 @@ include_removed include_change label)."
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid parameter"))
     (with-node-lock (node)
       (with-wallet-lock (wallet)
-        (let* ((chain-state (bitcoin-lisp::node-current-chainstate node))
-               (store (bitcoin-lisp::node-block-store node))
+        (let* ((chain-state (bl::node-current-chainstate node))
+               (store (bl::node-block-store node))
                (wallet-tip-entry
                  (and chain-state (wallet-last-block-hash wallet)
-                      (bitcoin-lisp.storage:get-block-index-entry
+                      (bl.store:get-block-index-entry
                        chain-state (wallet-last-block-hash wallet))))
                (height nil)      ; common-ancestor height
                (altheight nil)   ; the named block's height (possibly detached)
@@ -1968,15 +1968,15 @@ include_removed include_change label)."
               (let ((bh (%wallet-parse-txid blockhash-arg)))
                 (setf block-entry
                       (and chain-state
-                           (bitcoin-lisp.storage:get-block-index-entry chain-state bh)))
+                           (bl.store:get-block-index-entry chain-state bh)))
                 (let ((fork (and block-entry wallet-tip-entry
-                                 (bitcoin-lisp.validation:find-fork-point
+                                 (bl.val:find-fork-point
                                   block-entry wallet-tip-entry))))
                   (unless fork
                     (error 'rpc-error :code +rpc-invalid-address-or-key+
                                       :message "Block not found"))
-                  (setf height (bitcoin-lisp.storage:block-index-entry-height fork)
-                        altheight (bitcoin-lisp.storage:block-index-entry-height
+                  (setf height (bl.store:block-index-entry-height fork)
+                        altheight (bl.store:block-index-entry-height
                                    block-entry))))))
           (let ((depth (if height
                            (- (1+ (wallet-last-block-height wallet)) height)
@@ -1993,20 +1993,20 @@ include_removed include_change label)."
             ;; Walk the detached branch for "removed" (Core reads each block).
             (let ((removed '()))
               (when (and include-removed altheight height)
-                (let ((walk-hash (bitcoin-lisp.storage:block-index-entry-hash
+                (let ((walk-hash (bl.store:block-index-entry-hash
                                   block-entry))
                       (walk-height altheight))
                   (loop while (> walk-height height)
                         do (let ((blk (and store
-                                           (bitcoin-lisp.storage:get-block
+                                           (bl.store:get-block
                                             store walk-hash))))
                              (unless blk
                                (error 'rpc-error :code +rpc-internal-error+
                                                  :message "Can't read block from disk"))
-                             (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions blk))
+                             (dolist (tx (bl.ser:bitcoin-block-transactions blk))
                                (let ((wtx (wallet-get-wallet-tx
                                            wallet
-                                           (bitcoin-lisp.serialization:transaction-hash tx))))
+                                           (bl.ser:transaction-hash tx))))
                                  (when wtx
                                    (setf removed
                                          (nconc removed
@@ -2015,20 +2015,20 @@ include_removed include_change label)."
                                                  filter-label
                                                  :include-change include-change))))))
                              (setf walk-hash
-                                   (bitcoin-lisp.serialization:block-header-prev-block
-                                    (bitcoin-lisp.serialization:bitcoin-block-header blk)))
+                                   (bl.ser:block-header-prev-block
+                                    (bl.ser:bitcoin-block-header blk)))
                              (decf walk-height)))))
               (let* ((last-height (wallet-last-block-height wallet))
                      (confirms (min target-confirms (1+ last-height)))
                      (lastblock-entry
                        (and wallet-tip-entry
-                            (bitcoin-lisp.storage:entry-ancestor-at-height
+                            (bl.store:entry-ancestor-at-height
                              wallet-tip-entry (- (1+ last-height) confirms)))))
                 `(("transactions" . ,(or transactions #()))
                   ,@(when include-removed `(("removed" . ,(or removed #()))))
                   ("lastblock" . ,(if lastblock-entry
                                       (hash-to-hex
-                                       (bitcoin-lisp.storage:block-index-entry-hash
+                                       (bl.store:block-index-entry-hash
                                         lastblock-entry))
                                       (make-string 64 :initial-element #\0))))))))))))
 
@@ -2062,7 +2062,7 @@ rescanblockchain). PARAMS: (start_height stop_height)."
            (with-node-lock (node)
              (let ((tip-height (with-wallet-lock (wallet)
                                  (wallet-last-block-height wallet)))
-                   (chain-state (bitcoin-lisp::node-current-chainstate node)))
+                   (chain-state (bl::node-current-chainstate node)))
                (when (or (minusp start-height) (> start-height tip-height))
                  (error 'rpc-error :code +rpc-invalid-parameter+
                                    :message "Invalid start_height"))
@@ -2073,20 +2073,20 @@ rescanblockchain). PARAMS: (start_height stop_height)."
                  (when (< stop-height start-height)
                    (error 'rpc-error :code +rpc-invalid-parameter+
                                      :message "stop_height must be greater than start_height")))
-               (when (and (bitcoin-lisp:pruning-enabled-p) chain-state
+               (when (and (bl:pruning-enabled-p) chain-state
                           (< start-height
-                             (bitcoin-lisp.storage:chain-state-pruned-height
+                             (bl.store:chain-state-pruned-height
                               chain-state)))
                  (error 'rpc-error :code +rpc-misc-error+
                                    :message "Can't rescan beyond pruned data. Use RPC call getblockchaininfo to determine your pruned height."))
                (let ((entry (and chain-state
-                                 (bitcoin-lisp.storage:get-block-at-height
+                                 (bl.store:get-block-at-height
                                   chain-state start-height))))
                  (unless entry
                    (error 'rpc-error :code +rpc-misc-error+
                                      :message "Failed to rescan unavailable blocks, potentially caused by data corruption. If the issue persists you may want to reindex (see -reindex option)."))
                  (setf start-hash
-                       (bitcoin-lisp.storage:block-index-entry-hash entry)))))
+                       (bl.store:block-index-entry-hash entry)))))
            (multiple-value-bind (status last-height)
                (scan-for-wallet-transactions node wallet start-hash start-height
                                              :max-height stop-height :update t)

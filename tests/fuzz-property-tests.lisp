@@ -78,7 +78,7 @@ condition) or a value that is not returned at all."
                             (storage-condition (c) c)
                             (serious-condition (c) c))))
              (when ,caught
-               (push (list ,i (bitcoin-lisp.crypto:bytes-to-hex ,bytes-var)
+               (push (list ,i (bl.crypto:bytes-to-hex ,bytes-var)
                            (type-of ,caught))
                      ,bad)))))
        (is (null ,bad)
@@ -90,24 +90,24 @@ condition) or a value that is not returned at all."
 here is a remote crash, and the deserializer is the very first thing an
 unauthenticated peer reaches."
   (%fuzz-total ("parse-tx-payload" 1 3000 bytes :max-len 512)
-    (bitcoin-lisp.serialization:parse-tx-payload bytes)))
+    (bl.ser:parse-tx-payload bytes)))
 
 (test fuzz-block-deserialisation-is-total
   "The body of a `block' message, same reasoning."
   (%fuzz-total ("read-bitcoin-block" 2 2000 bytes :max-len 512)
-    (bitcoin-lisp.serialization:br-read-bitcoin-block
-     (bitcoin-lisp.serialization:make-byte-reader-from bytes))))
+    (bl.ser:br-read-bitcoin-block
+     (bl.ser:make-byte-reader-from bytes))))
 
 (test fuzz-script-classification-is-total
   "classify-script runs over every scriptPubKey in every block and every
 scriptSig a peer sends; it has no length or shape guarantee at all."
   (%fuzz-total ("classify-script" 3 4000 bytes :max-len 256)
-    (bitcoin-lisp.validation:classify-script bytes)))
+    (bl.val:classify-script bytes)))
 
 (test fuzz-psbt-parsing-is-total
   "PSBTs arrive from wallets and hardware signers, i.e. from outside."
   (%fuzz-total ("parse-psbt" 4 2000 bytes :max-len 512)
-    (bitcoin-lisp.serialization:parse-psbt bytes)))
+    (bl.ser:parse-psbt bytes)))
 
 (test fuzz-address-and-descriptor-parsing-are-total
   "Text parsers reachable from RPC. Bytes are read as latin-1 so every octet is
@@ -118,10 +118,10 @@ a legal character and the parser sees genuinely arbitrary text."
       (let* ((bytes (%fuzz-bytes 128))
              (s (map 'string #'code-char bytes)))
         (let ((caught (handler-case
-                          (progn (bitcoin-lisp.crypto:bech32-decode s)
-                                 (bitcoin-lisp.crypto:base58-decode s)
-                                 (bitcoin-lisp.crypto:decode-address s :mainnet)
-                                 (ignore-errors (bitcoin-lisp.rpc::parse-descriptor s :mainnet))
+                          (progn (bl.crypto:bech32-decode s)
+                                 (bl.crypto:base58-decode s)
+                                 (bl.crypto:decode-address s :mainnet)
+                                 (ignore-errors (bl.rpc::parse-descriptor s :mainnet))
                                  nil)
                         (error () nil)
                         (serious-condition (c) c))))
@@ -137,10 +137,10 @@ hand-written vector and fails here."
     (%fuzz-seed 6)
     (dotimes (i 3000)
       (let* ((bytes (%fuzz-bytes 64))
-             (encoded (bitcoin-lisp.crypto:base58-encode bytes))
-             (decoded (ignore-errors (bitcoin-lisp.crypto:base58-decode encoded))))
+             (encoded (bl.crypto:base58-encode bytes))
+             (decoded (ignore-errors (bl.crypto:base58-decode encoded))))
         (unless (and decoded (equalp (coerce decoded 'list) (coerce bytes 'list)))
-          (push (list i (bitcoin-lisp.crypto:bytes-to-hex bytes) encoded) bad))))
+          (push (list i (bl.crypto:bytes-to-hex bytes) encoded) bad))))
     (is (null bad) "~D of 3000 base58 roundtrips lost data; first ~S"
         (length bad) (first (last bad)))))
 
@@ -160,7 +160,7 @@ which for a witnessless transaction is the encoding Core rejects as a
 `Superfluous witness record'. Every caller in the tree guards it with
 TRANSACTION-HAS-WITNESS-P; a test that did not would be measuring its own
 mistake."
-  (let* ((base (bitcoin-lisp.crypto:hex-to-bytes
+  (let* ((base (bl.crypto:hex-to-bytes
                 (concatenate 'string
                              "0200000001c1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"
                              "e1e1e1e1e1e1e1e1e1e1e1e100000000006400000001"
@@ -178,13 +178,13 @@ mistake."
           (setf (aref mutated (mod (%fuzz-u64) (length mutated)))
                 (ldb (byte 8 0) (%fuzz-u64))))
         (let ((tx (ignore-errors
-                   (bitcoin-lisp.serialization:parse-tx-payload mutated))))
+                   (bl.ser:parse-tx-payload mutated))))
           (when tx
             (incf parsed)
             (let ((re (ignore-errors
-                       (bitcoin-lisp.serialization:transaction-wire-bytes tx))))
+                       (bl.ser:transaction-wire-bytes tx))))
               (unless (and re (equalp (coerce re 'list) (coerce mutated 'list)))
-                (push (list i (bitcoin-lisp.crypto:bytes-to-hex mutated)) bad)))))))
+                (push (list i (bl.crypto:bytes-to-hex mutated)) bad)))))))
     ;; The count matters: if nothing parsed, the property asserted nothing.
     (is (> parsed 50) "only ~D of 2000 mutants parsed — the property is vacuous"
         parsed)
@@ -209,10 +209,10 @@ address — which is how a segwit v1 output gets paid to a v0-looking address."
              (hrp (if (evenp (%fuzz-u64)) "bc" "tb")))
         (dolist (variant '(:bech32 :bech32m))
           (let ((encoded (ignore-errors
-                          (bitcoin-lisp.crypto:bech32-encode hrp data variant))))
+                          (bl.crypto:bech32-encode hrp data variant))))
             (when encoded
               (multiple-value-bind (dhrp ddata dvariant)
-                  (ignore-errors (bitcoin-lisp.crypto:bech32-decode encoded))
+                  (ignore-errors (bl.crypto:bech32-decode encoded))
                 (unless (and dhrp
                              (string= dhrp hrp)
                              (equal ddata data)
@@ -229,15 +229,15 @@ of every hex RPC argument."
     (%fuzz-seed 9)
     (dotimes (i 3000)
       (let* ((bytes (%fuzz-bytes 64))
-             (hex (bitcoin-lisp.crypto:bytes-to-hex bytes))
-             (back (ignore-errors (bitcoin-lisp.crypto:hex-to-bytes hex))))
+             (hex (bl.crypto:bytes-to-hex bytes))
+             (back (ignore-errors (bl.crypto:hex-to-bytes hex))))
         (unless (and back (equalp (coerce back 'list) (coerce bytes 'list)))
           (push (list :roundtrip i hex) bad))))
     ;; Arbitrary text must decode or fail, never half-decode.
     (%fuzz-seed 10)
     (dotimes (i 3000)
       (let* ((s (map 'string #'code-char (%fuzz-bytes 40)))
-             (out (ignore-errors (bitcoin-lisp.crypto:hex-to-bytes s))))
+             (out (ignore-errors (bl.crypto:hex-to-bytes s))))
         (when (and out (oddp (length s)))
           (push (list :odd-length i s) bad))))
     (is (null bad) "~D hex properties failed; first ~S"
@@ -248,8 +248,8 @@ of every hex RPC argument."
 `headers' message carries up to 2000 of them — so this parser sees more hostile
 bytes than any other."
   (%fuzz-total ("read-block-header" 11 4000 bytes :max-len 200)
-    (bitcoin-lisp.serialization::br-read-block-header
-     (bitcoin-lisp.serialization:make-byte-reader-from bytes))))
+    (bl.ser::br-read-block-header
+     (bl.ser:make-byte-reader-from bytes))))
 
 (test fuzz-descriptor-parsing-never-escapes
   "Core descriptor_parse.cpp. Descriptors reach us from RPC and from wallet
@@ -261,7 +261,7 @@ handler written for the latter."
     (dotimes (i 1500)
       (let* ((s (map 'string #'code-char (%fuzz-bytes 96)))
              (caught (handler-case
-                         (progn (bitcoin-lisp.rpc::parse-descriptor s :mainnet) nil)
+                         (progn (bl.rpc::parse-descriptor s :mainnet) nil)
                        (error () nil)
                        (serious-condition (c) c))))
         (when caught (push (list i s (type-of caught)) bad))))
@@ -275,7 +275,7 @@ handler written for the latter."
                              "1"
                              (make-string depth :initial-element #\))))
              (caught (handler-case
-                         (progn (bitcoin-lisp.rpc::parse-descriptor s :mainnet) nil)
+                         (progn (bl.rpc::parse-descriptor s :mainnet) nil)
                        (error () nil)
                        (serious-condition (c) c))))
         (when caught (push (list :nesting depth (type-of caught)) bad))))

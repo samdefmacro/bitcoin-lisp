@@ -712,22 +712,36 @@ counted as upward. That is a blind spot this test accepts, not a claim."
              (module (subseq package start (position #\. package :start start))))
         (cdr (assoc (format nil "src/~A/" module) order :test #'string=)))))
 
+(defun %resolve-package-prefix (token)
+  "The project package TOKEN names as a prefix: a full bitcoin-lisp* name, or
+one of the local nicknames in bitcoin-lisp::*package-nicknames*; NIL for
+anything else (keywords, other packages)."
+  (if (uiop:string-prefix-p "bitcoin-lisp" token)
+      token
+      (let ((full (cdr (assoc token bitcoin-lisp::*package-nicknames*
+                              :test #'string-equal))))
+        (and full (string-downcase full)))))
+
 (defun %package-references (lines)
-  "The bitcoin-lisp.* packages LINES name with an explicit prefix: only
-bitcoin-lisp.foo followed by a colon counts, and only outside a ; comment. A
-prefix quoted in a docstring still counts; the sources do not do that."
+  "The project packages LINES name with an explicit prefix -- a full name or
+a local nickname, followed by a colon, outside a ; comment. A prefix quoted in
+a docstring still counts; the sources do not do that."
   (let ((found '()))
-    (loop for raw across lines
-          for line = (string-downcase (subseq raw 0 (position #\; raw)))
-          do (loop with i = 0
-                   while (setf i (search "bitcoin-lisp." line :start2 i))
-                   do (let* ((end (or (position-if-not
-                                       (lambda (c) (or (alphanumericp c) (find c ".-")))
-                                       line :start i)
-                                      (length line))))
-                        (when (and (< end (length line)) (char= (char line end) #\:))
-                          (pushnew (subseq line i end) found :test #'string=))
-                        (setf i end))))
+    (flet ((name-char-p (c) (or (alphanumericp c) (find c ".-"))))
+      (loop for raw across lines
+            for line = (string-downcase (subseq raw 0 (position #\; raw)))
+            do (loop for colon = (position #\: line)
+                       then (position #\: line :start (1+ colon))
+                     while colon
+                     do (let ((start (position-if-not #'name-char-p line
+                                                      :end colon :from-end t)))
+                          ;; the token is the name chars before this colon;
+                          ;; the second colon of :: has none and is skipped
+                          (let* ((token (subseq line (if start (1+ start) 0) colon))
+                                 (package (and (plusp (length token))
+                                               (%resolve-package-prefix token))))
+                            (when package
+                              (pushnew package found :test #'string=)))))))
     (sort found #'string<)))
 
 (defparameter +layering-violation-baseline+
@@ -790,11 +804,21 @@ the measuring functions must measure a known shape correctly."
 (list #\\) #| ) |# 1)~%  ) ; trailing comment~%(defun g () 2)")
             0))
       "strings, comments and char literals must not open or close a form")
-  (is (equal '("bitcoin-lisp.storage")
+  (is (equal '("bitcoin-lisp" "bitcoin-lisp.mempool" "bitcoin-lisp.storage")
              (%package-references
               (vector ";; bitcoin-lisp.validation in a comment does not count"
-                      "(bitcoin-lisp.storage:current-height x) ; nor bitcoin-lisp.rpc:here")))
-      "a package prefix counts, a mention in a comment does not")
+                      "(bitcoin-lisp.storage:current-height x) ; nor bitcoin-lisp.rpc:here"
+                      "(bl.mp::internal bl::*node* :keyword #:uninterned other:pkg)")))
+      "a package prefix counts, full name or nickname; a comment, a keyword ~
+and a foreign package do not")
+  (is (every (lambda (entry)
+               (find-package (cdr entry)))
+             bitcoin-lisp::*package-nicknames*)
+      "every nickname in the table must name a package that exists")
+  (is (eq (find-package :bitcoin-lisp.serialization)
+          (cdr (assoc "bl.ser" (sb-ext:package-local-nicknames :bitcoin-lisp.storage)
+                      :test #'string-equal)))
+      "the nicknames must actually be installed on the packages")
   (let ((order (%load-order)))
     (is (< (%package-layer "bitcoin-lisp.crypto" order)
            (%package-layer "bitcoin-lisp.storage" order)))

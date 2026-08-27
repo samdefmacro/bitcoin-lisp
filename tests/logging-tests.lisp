@@ -23,20 +23,20 @@ FORMAT-LOG-ENTRY, so assert against the shape that reproduces it."
     ;; The symptom, so the test fails if the reproducer stops reproducing.
     (is (find #\Newline (let ((*print-pretty* t))
                           (format nil "prefix: ~A" condition))))
-    (let ((entry (bitcoin-lisp::format-log-entry :warn "boom: ~A" (list condition))))
+    (let ((entry (bl::format-log-entry :warn "boom: ~A" (list condition))))
       (is (null (find #\Newline entry)))
       (is (search "3119" entry))
       (is (search "UNSIGNED-BYTE 10" entry)))))
 
 (test log-escapes-control-characters-but-keeps-newline
   "Core BCLog::LogEscapeMessage (logging.cpp:329-340)."
-  (is (string= "plain ascii" (bitcoin-lisp::%log-escape-message "plain ascii")))
+  (is (string= "plain ascii" (bl::%log-escape-message "plain ascii")))
   ;; Identity, not just equality: an unescaped string is returned as-is.
   (let ((s "nothing to escape"))
-    (is (eq s (bitcoin-lisp::%log-escape-message s))))
-  (is (string= (format nil "a~%b") (bitcoin-lisp::%log-escape-message (format nil "a~%b"))))
+    (is (eq s (bl::%log-escape-message s))))
+  (is (string= (format nil "a~%b") (bl::%log-escape-message (format nil "a~%b"))))
   (is (string= "cr\\x0d esc\\x1b del\\x7f nul\\x00"
-               (bitcoin-lisp::%log-escape-message
+               (bl::%log-escape-message
                 (format nil "cr~C esc~C del~C nul~C"
                         #\Return (code-char 27) (code-char 127) (code-char 0)))))
   ;; A peer-supplied subversion string reaches the log, so the carriage return
@@ -44,58 +44,58 @@ FORMAT-LOG-ENTRY, so assert against the shape that reproduces it."
   ;; passes it through so a genuinely multi-line message stays readable — which
   ;; is why this is escaping and not sanitising.
   (is (string= "peer /Satoshi:1.0/\\x0d[2026-01-01 00:00:00] ERROR: fake"
-               (bitcoin-lisp::%log-escape-message
+               (bl::%log-escape-message
                 (format nil "peer /Satoshi:1.0/~C[2026-01-01 00:00:00] ERROR: fake"
                         #\Return)))))
 
 ;;; --- rate limiting (Core BCLog::LogRateLimiter) ------------------------------
 
 (defmacro with-fresh-rate-limiter ((&key (limit t)) &body body)
-  `(let ((bitcoin-lisp::*log-rate-locations* (make-hash-table :test 'equal))
-         (bitcoin-lisp::*log-rate-window-start* (get-universal-time))
-         (bitcoin-lisp::*log-suppressions-active* nil)
-         (bitcoin-lisp::*log-rate-limit* ,limit)
-         (bitcoin-lisp::*log-stream* nil)
-         (bitcoin-lisp::*log-file-stream* nil))
+  `(let ((bl::*log-rate-locations* (make-hash-table :test 'equal))
+         (bl::*log-rate-window-start* (get-universal-time))
+         (bl::*log-suppressions-active* nil)
+         (bl::*log-rate-limit* ,limit)
+         (bl::*log-stream* nil)
+         (bl::*log-file-stream* nil))
      ,@body))
 
 (test log-rate-limiter-state-machine
   "Consume returns Core's three statuses, and the budget is per location."
   (with-fresh-rate-limiter ()
-    (is (eq :unsuppressed (bitcoin-lisp::%log-rate-consume "site A" 10)))
+    (is (eq :unsuppressed (bl::%log-rate-consume "site A" 10)))
     (is (eq :newly-suppressed
-            (bitcoin-lisp::%log-rate-consume
-             "site A" (* 2 bitcoin-lisp::+log-ratelimit-max-bytes+))))
-    (is (eq :still-suppressed (bitcoin-lisp::%log-rate-consume "site A" 10)))
+            (bl::%log-rate-consume
+             "site A" (* 2 bl::+log-ratelimit-max-bytes+))))
+    (is (eq :still-suppressed (bl::%log-rate-consume "site A" 10)))
     ;; A different location keeps its own budget — suppressing one site must
     ;; never silence the rest of the node.
-    (is (eq :unsuppressed (bitcoin-lisp::%log-rate-consume "site B" 10)))
-    (is-true bitcoin-lisp::*log-suppressions-active*)))
+    (is (eq :unsuppressed (bl::%log-rate-consume "site B" 10)))
+    (is-true bl::*log-suppressions-active*)))
 
 (test log-rate-limiter-exhausts-a-budget-gradually
   "The budget is bytes, not calls: many small writes eventually suppress."
   (with-fresh-rate-limiter ()
     (let* ((chunk 1024)
-           (calls (ceiling bitcoin-lisp::+log-ratelimit-max-bytes+ chunk))
+           (calls (ceiling bl::+log-ratelimit-max-bytes+ chunk))
            (statuses (loop repeat (1+ calls)
-                           collect (bitcoin-lisp::%log-rate-consume "site" chunk))))
+                           collect (bl::%log-rate-consume "site" chunk))))
       (is (every (lambda (s) (eq s :unsuppressed)) (subseq statuses 0 calls)))
       (is (eq :newly-suppressed (car (last statuses)))))))
 
 (test log-rate-limiter-window-reset-restores-and-reports
   "Reset clears the budget and reports what was dropped (Core Reset)."
   (with-fresh-rate-limiter ()
-    (bitcoin-lisp::%log-rate-consume
-     "noisy site" (* 2 bitcoin-lisp::+log-ratelimit-max-bytes+))
-    (is-true bitcoin-lisp::*log-suppressions-active*)
+    (bl::%log-rate-consume
+     "noisy site" (* 2 bl::+log-ratelimit-max-bytes+))
+    (is-true bl::*log-suppressions-active*)
     ;; Backdate the window so the lazy close fires.
-    (setf bitcoin-lisp::*log-rate-window-start*
-          (- (get-universal-time) bitcoin-lisp::+log-ratelimit-window-seconds+ 1))
-    (bitcoin-lisp::%log-maybe-reset-window)
-    (is-false bitcoin-lisp::*log-suppressions-active*)
-    (is (zerop (hash-table-count bitcoin-lisp::*log-rate-locations*)))
+    (setf bl::*log-rate-window-start*
+          (- (get-universal-time) bl::+log-ratelimit-window-seconds+ 1))
+    (bl::%log-maybe-reset-window)
+    (is-false bl::*log-suppressions-active*)
+    (is (zerop (hash-table-count bl::*log-rate-locations*)))
     (let ((restart (find-if (lambda (e) (and e (search "Restarting logging" e)))
-                            bitcoin-lisp::*log-buffer*)))
+                            bl::*log-buffer*)))
       (is-true restart)
       (is (search "noisy site" restart)))))
 
@@ -104,13 +104,13 @@ FORMAT-LOG-ENTRY, so assert against the shape that reproduces it."
   (with-fresh-rate-limiter ()
     (let ((console (make-string-output-stream))
           (file (make-string-output-stream)))
-      (let ((bitcoin-lisp::*log-stream* console)
-            (bitcoin-lisp::*log-file-stream* file))
-        (bitcoin-lisp::%log-emit :info "big ~A" (list (make-string 4096 :initial-element #\x)))
+      (let ((bl::*log-stream* console)
+            (bl::*log-file-stream* file))
+        (bl::%log-emit :info "big ~A" (list (make-string 4096 :initial-element #\x)))
         ;; Blow the budget from the same location, then write again.
-        (bitcoin-lisp::%log-rate-consume
-         "big ~A" (* 2 bitcoin-lisp::+log-ratelimit-max-bytes+))
-        (bitcoin-lisp::%log-emit :info "big ~A" (list "second")))
+        (bl::%log-rate-consume
+         "big ~A" (* 2 bl::+log-ratelimit-max-bytes+))
+        (bl::%log-emit :info "big ~A" (list "second")))
       (let ((console-text (get-output-stream-string console))
             (file-text (get-output-stream-string file)))
         (is (search "second" console-text))
@@ -123,9 +123,9 @@ FORMAT-LOG-ENTRY, so assert against the shape that reproduces it."
 cannot be eaten by the limiter that produced it."
   (with-fresh-rate-limiter ()
     (let ((file (make-string-output-stream)))
-      (let ((bitcoin-lisp::*log-file-stream* file))
-        (bitcoin-lisp::%log-emit
-         :info "wordy ~A" (list (make-string (* 2 bitcoin-lisp::+log-ratelimit-max-bytes+)
+      (let ((bl::*log-file-stream* file))
+        (bl::%log-emit
+         :info "wordy ~A" (list (make-string (* 2 bl::+log-ratelimit-max-bytes+)
                                              :initial-element #\y))))
       (let ((text (get-output-stream-string file)))
         (is (search "Excessive logging detected" text))
@@ -137,24 +137,24 @@ cannot be eaten by the limiter that produced it."
   "Core rate-limits Info and louder only (util/log.h:91-113): -debug users are
 assumed to accept the volume."
   (with-fresh-rate-limiter ()
-    (let ((bitcoin-lisp::*current-log-level* :debug))
-      (bitcoin-lisp::node-log :debug "quiet ~A" "x")
-      (bitcoin-lisp::node-log-category "validation" "cat ~A" "x"))
-    (is (zerop (hash-table-count bitcoin-lisp::*log-rate-locations*)))
-    (bitcoin-lisp::node-log :warn "loud ~A" "x")
-    (is (= 1 (hash-table-count bitcoin-lisp::*log-rate-locations*)))))
+    (let ((bl::*current-log-level* :debug))
+      (bl::node-log :debug "quiet ~A" "x")
+      (bl::node-log-category "validation" "cat ~A" "x"))
+    (is (zerop (hash-table-count bl::*log-rate-locations*)))
+    (bl::node-log :warn "loud ~A" "x")
+    (is (= 1 (hash-table-count bl::*log-rate-locations*)))))
 
 (test log-rate-limit-can-be-turned-off
   "-logratelimit=0 (Core -logratelimit)."
   (with-fresh-rate-limiter (:limit nil)
     (let ((file (make-string-output-stream)))
-      (let ((bitcoin-lisp::*log-file-stream* file))
+      (let ((bl::*log-file-stream* file))
         (dotimes (i 3)
-          (bitcoin-lisp::%log-emit
-           :info "huge ~A" (list (make-string bitcoin-lisp::+log-ratelimit-max-bytes+
+          (bl::%log-emit
+           :info "huge ~A" (list (make-string bl::+log-ratelimit-max-bytes+
                                               :initial-element #\z)))))
       (is (null (search "Excessive logging detected" (get-output-stream-string file)))))
-    (is (zerop (hash-table-count bitcoin-lisp::*log-rate-locations*)))))
+    (is (zerop (hash-table-count bl::*log-rate-locations*)))))
 
 ;;;; --- Core's [category:level] prefix (BCLog::LogPrefix) ---
 
@@ -165,7 +165,7 @@ looks for the literal '[warning] Parsed potentially confusing double-negative'.
 
 The uncategorized-INFO case is the one that changes most lines: Core prints NO
 tag there, where this used to print `INFO: `."
-  (flet ((p (cat level) (bitcoin-lisp::log-category-level-prefix cat level)))
+  (flet ((p (cat level) (bl::log-category-level-prefix cat level)))
     (is (string= "" (p nil :info))
         "an uncategorized info line carries no tag in Core")
     (is (string= "[warning] " (p nil :warn)))
@@ -182,19 +182,19 @@ tag there, where this used to print `INFO: `."
 (test log-level-names-are-cores-spelling
   ":WARN prints as \"warning\". Core's LogLevelToStr has no \"warn\", and a
 test matching Core's word would never fire on ours."
-  (is (string= "warning" (bitcoin-lisp::log-level-name :warn)))
-  (is (string= "error" (bitcoin-lisp::log-level-name :error)))
-  (is (string= "info" (bitcoin-lisp::log-level-name :info)))
-  (is (string= "debug" (bitcoin-lisp::log-level-name :debug)))
-  (is (string= "trace" (bitcoin-lisp::log-level-name :trace))))
+  (is (string= "warning" (bl::log-level-name :warn)))
+  (is (string= "error" (bl::log-level-name :error)))
+  (is (string= "info" (bl::log-level-name :info)))
+  (is (string= "debug" (bl::log-level-name :debug)))
+  (is (string= "trace" (bl::log-level-name :trace))))
 
 (test log-entry-renders-the-prefix
   "The whole line, not just the prefix helper: a warning must contain Core's
 tag immediately before the message, and an info line must have no tag between
 the timestamp and the message."
-  (let ((warn (bitcoin-lisp::format-log-entry :warn "hello ~A" '("world")))
-        (info (bitcoin-lisp::format-log-entry :info "hello ~A" '("world")))
-        (net (bitcoin-lisp::format-log-entry :debug "hello ~A" '("world") "net")))
+  (let ((warn (bl::format-log-entry :warn "hello ~A" '("world")))
+        (info (bl::format-log-entry :info "hello ~A" '("world")))
+        (net (bl::format-log-entry :debug "hello ~A" '("world") "net")))
     (is-true (search "[warning] hello world" warn))
     (is-true (search "] hello world" info))
     (is-false (search "[warning]" info))
@@ -205,11 +205,11 @@ the timestamp and the message."
   "log-cat's category used to be consulted for the enabled/disabled decision
 and then DROPPED, so every categorized line came out as an untagged debug line
 — there was no way to tell from the log which subsystem wrote it."
-  (let ((bitcoin-lisp::*current-log-level* :debug)
-        (bitcoin-lisp::*log-file-stream* nil))
-    (bitcoin-lisp:log-cat "net" "a categorized line")
+  (let ((bl::*current-log-level* :debug)
+        (bl::*log-file-stream* nil))
+    (bl:log-cat "net" "a categorized line")
     (let ((entry (find-if (lambda (e) (and e (search "a categorized line" e)))
-                          bitcoin-lisp::*log-buffer*)))
+                          bl::*log-buffer*)))
       (is-true entry "the line reached the buffer")
       (when entry
         (is-true (search "[net] a categorized line" entry))))))
@@ -219,14 +219,14 @@ and then DROPPED, so every categorized line came out as an untagged debug line
 contract: 'Error: Unsupported logging category -debug=abc.' — trailing period
 included. Ours said 'Unknown logging category in -debug: abc', which could
 never match however correct the behaviour was."
-  (let ((e (handler-case (bitcoin-lisp::apply-log-categories '("abc") nil)
+  (let ((e (handler-case (bl::apply-log-categories '("abc") nil)
              (error (c) (princ-to-string c)))))
     (is (string= "Unsupported logging category -debug=abc." e)))
-  (let ((e (handler-case (bitcoin-lisp::apply-log-categories nil '("xyz"))
+  (let ((e (handler-case (bl::apply-log-categories nil '("xyz"))
              (error (c) (princ-to-string c)))))
     (is (string= "Unsupported logging category -debugexclude=xyz." e)))
   ;; A known category still applies without complaint.
-  (is-true (bitcoin-lisp::apply-log-categories '("net") nil)))
+  (is-true (bl::apply-log-categories '("net") nil)))
 
 ;;;; --- -loglevel=<category>:<level> (Core SetLoggingLevel) ---
 
@@ -235,18 +235,18 @@ never match however correct the behaviour was."
 level name is never long enough to contain one there, so that is how
 `-loglevel=net:debug` is told from a bare `-loglevel=trace`."
   (is (equal '(nil :debug) (multiple-value-list
-                            (bitcoin-lisp:parse-loglevel-spec "trace"))))
+                            (bl:parse-loglevel-spec "trace"))))
   (is (equal '(nil :info) (multiple-value-list
-                           (bitcoin-lisp:parse-loglevel-spec "info"))))
+                           (bl:parse-loglevel-spec "info"))))
   (is (equal '("net" :debug) (multiple-value-list
-                              (bitcoin-lisp:parse-loglevel-spec "net:debug")))))
+                              (bl:parse-loglevel-spec "net:debug")))))
 
 (test loglevel-spec-rejects-an-unknown-half-with-cores-wording
   "Both halves must be known and the message is matched by feature_logging.py.
 An option that silently does nothing is how an operator ends up staring at a
 log that will never contain what they asked for."
   (dolist (bad '("nosuch:debug" "net:abc"))
-    (let ((e (handler-case (progn (bitcoin-lisp:parse-loglevel-spec bad) nil)
+    (let ((e (handler-case (progn (bl:parse-loglevel-spec bad) nil)
                (error (c) (princ-to-string c)))))
       (is-true e "~A must be refused" bad)
       (when e
@@ -259,23 +259,23 @@ log that will never contain what they asked for."
 fall back to the global one for it (LogAcceptCategory). Setting
 -loglevel=net:debug therefore surfaces net lines on a node whose global level
 is info, without -debug=net."
-  (let ((bitcoin-lisp::*category-log-levels* (make-hash-table :test 'equal :synchronized t))
-        (bitcoin-lisp::*debug-categories* (make-hash-table :test 'equal))
-        (bitcoin-lisp::*current-log-level* :info)
-        (bitcoin-lisp::*log-file-stream* nil))
+  (let ((bl::*category-log-levels* (make-hash-table :test 'equal :synchronized t))
+        (bl::*debug-categories* (make-hash-table :test 'equal))
+        (bl::*current-log-level* :info)
+        (bl::*log-file-stream* nil))
     ;; Without a threshold and without -debug=net, a net line is suppressed.
-    (bitcoin-lisp:log-cat "net" "suppressed line one")
+    (bl:log-cat "net" "suppressed line one")
     (is-false (find-if (lambda (e) (and e (search "suppressed line one" e)))
-                       bitcoin-lisp::*log-buffer*))
+                       bl::*log-buffer*))
     ;; With one, it is emitted — and carries the category tag.
-    (is-true (bitcoin-lisp:set-category-log-level "net" :debug))
-    (bitcoin-lisp:log-cat "net" "visible line two")
+    (is-true (bl:set-category-log-level "net" :debug))
+    (bl:log-cat "net" "visible line two")
     (let ((entry (find-if (lambda (e) (and e (search "visible line two" e)))
-                          bitcoin-lisp::*log-buffer*)))
+                          bl::*log-buffer*)))
       (is-true entry)
       (when entry (is-true (search "[net] visible line two" entry))))
     ;; An unknown category cannot be given one.
-    (is-false (bitcoin-lisp:set-category-log-level "nosuch" :debug))))
+    (is-false (bl:set-category-log-level "nosuch" :debug))))
 
 (test debug-categories-before-the-last-negation-are-disregarded
   "Core finds the LAST -debug=0/none and processes only the categories after it
@@ -286,15 +286,15 @@ node to start, with http off and the invalid `abc` never mentioned.
 
 Validating the whole list made that a fatal error over a category the operator
 had already cancelled."
-  (let ((bitcoin-lisp::*debug-categories* (make-hash-table :test 'equal)))
-    (bitcoin-lisp::apply-log-categories '("http" "abc" "none" "rpc" "net") nil)
-    (is-false (bitcoin-lisp:log-category-enabled-p "http")
+  (let ((bl::*debug-categories* (make-hash-table :test 'equal)))
+    (bl::apply-log-categories '("http" "abc" "none" "rpc" "net") nil)
+    (is-false (bl:log-category-enabled-p "http")
               "a category named before the negation must not survive it")
-    (is-true (bitcoin-lisp:log-category-enabled-p "rpc"))
-    (is-true (bitcoin-lisp:log-category-enabled-p "net")))
+    (is-true (bl:log-category-enabled-p "rpc"))
+    (is-true (bl:log-category-enabled-p "net")))
   ;; An invalid name AFTER the last negation is still fatal.
-  (let ((bitcoin-lisp::*debug-categories* (make-hash-table :test 'equal)))
-    (signals error (bitcoin-lisp::apply-log-categories '("none" "abc") nil)))
+  (let ((bl::*debug-categories* (make-hash-table :test 'equal)))
+    (signals error (bl::apply-log-categories '("none" "abc") nil)))
   ;; And with no negation at all, the whole list is validated as before.
-  (let ((bitcoin-lisp::*debug-categories* (make-hash-table :test 'equal)))
-    (signals error (bitcoin-lisp::apply-log-categories '("net" "abc") nil))))
+  (let ((bl::*debug-categories* (make-hash-table :test 'equal)))
+    (signals error (bl::apply-log-categories '("net" "abc") nil))))

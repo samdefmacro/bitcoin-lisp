@@ -16,19 +16,19 @@
   "Open a listener on an ephemeral localhost port, connect a client, accept
 it, and run BODY with both connection structs bound. Closes everything after."
   (let ((listener (gensym)) (port (gensym)))
-    `(let* ((,listener (bitcoin-lisp.networking:open-listener "127.0.0.1" 0))
+    `(let* ((,listener (bl.net:open-listener "127.0.0.1" 0))
             (,port (usocket:get-local-port ,listener)))
        (unwind-protect
-            (let* ((,client-conn (bitcoin-lisp.networking:make-tcp-connection
+            (let* ((,client-conn (bl.net:make-tcp-connection
                                   "127.0.0.1" ,port))
-                   (,server-conn (bitcoin-lisp.networking::accept-connection
+                   (,server-conn (bl.net::accept-connection
                                   ,listener :timeout 5)))
               (unwind-protect (progn ,@body)
                 (when ,client-conn
-                  (bitcoin-lisp.networking:close-connection ,client-conn))
+                  (bl.net:close-connection ,client-conn))
                 (when ,server-conn
-                  (bitcoin-lisp.networking:close-connection ,server-conn))))
-         (bitcoin-lisp.networking::close-listener ,listener)))))
+                  (bl.net:close-connection ,server-conn))))
+         (bl.net::close-listener ,listener)))))
 
 (test buffered-input-is-visible-to-the-drain-loop
   "The readers pull bytes with LISTEN on the Lisp STREAM, and a Lisp stream
@@ -53,20 +53,20 @@ hold is that CONNECTION-INPUT-PENDING-P sees the buffered remainder."
       (let ((payload (make-array 64 :element-type '(unsigned-byte 8)
                                     :initial-element 7)))
         ;; One write, so both halves have every chance to share a segment.
-        (bitcoin-lisp.networking:send-bytes client payload)
+        (bl.net:send-bytes client payload)
         (%v2t-drain client)
         ;; Let the bytes land.
         (loop repeat 50
-              until (bitcoin-lisp.networking::data-available-p server :timeout 0.1)
+              until (bl.net::data-available-p server :timeout 0.1)
               do (sleep 0.02))
         ;; Take the FIRST half through the reader, which drains via LISTEN and
         ;; so pulls whatever the stream is holding into userspace.
-        (let ((first-half (bitcoin-lisp.networking::receive-bytes-resumable server 32)))
+        (let ((first-half (bl.net::receive-bytes-resumable server 32)))
           (is (not (eq first-half :incomplete))
               "the first half never completed; the fixture proves nothing"))
         ;; The remainder is now in OUR buffer. This is the assertion that
         ;; fails against the bug.
-        (is-true (bitcoin-lisp.networking::connection-input-pending-p server)
+        (is-true (bl.net::connection-input-pending-p server)
                  "buffered input is invisible to the drain loop — the second ~
 message of any pair sharing a TCP segment waits for unrelated traffic")))))
 
@@ -83,8 +83,8 @@ receiving side. Nothing about the transport was wrong; the bytes had not left."
   (declare (ignorable conn))
   (loop with deadline = (+ (get-internal-real-time)
                            (* seconds internal-time-units-per-second))
-        while (plusp (bitcoin-lisp.networking::connection-send-queue-bytes conn))
-        do (unless (bitcoin-lisp.networking:flush-send-buffer conn)
+        while (plusp (bl.net::connection-send-queue-bytes conn))
+        do (unless (bl.net:flush-send-buffer conn)
              (return))
            (when (> (get-internal-real-time) deadline)
              (return))
@@ -93,13 +93,13 @@ receiving side. Nothing about the transport was wrong; the bytes had not left."
 
 (defun %v2t-frame (command payload)
   "A v1-framed message, as every message builder in the codebase produces."
-  (bitcoin-lisp.serialization:serialize-message command payload))
+  (bl.ser:serialize-message command payload))
 
 (test v2-transport-loopback-handshake-and-messages
   "Full v2 handshake initiator<->responder over a socket pair, then messages
 both ways: short-ID type (inv), long-form type (verack), a decoy packet that
 must be skipped, and a 0-length payload."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (%with-loopback-pair (client server)
         (is-true client)
@@ -117,7 +117,7 @@ must be skipped, and a 0-length payload."
                   (lambda ()
                     (handler-case
                         (let ((transport (progn
-                                           (prog1 (bitcoin-lisp.networking::v2-handshake-outbound
+                                           (prog1 (bl.net::v2-handshake-outbound
                                                    client :timeout 60)
                                              ;; The HANDSHAKE's own sends go
                                              ;; through send-bytes too, and the
@@ -129,7 +129,7 @@ must be skipped, and a 0-length payload."
                                              ;; full timeout, which is exactly
                                              ;; the failure that kept recurring.
                                              (%v2t-drain client)))))
-                          (if (not (bitcoin-lisp.networking::v2-transport-p transport))
+                          (if (not (bl.net::v2-transport-p transport))
                               ;; Say WHY rather than leaving NIL behind: a
                               ;; failed handshake and a wrong message were
                               ;; previously indistinguishable, both surfacing
@@ -137,31 +137,31 @@ must be skipped, and a 0-length payload."
                               (setf client-result (list :handshake-failed transport))
                               (progn
                                 ;; short-ID message out; long-form + decoy back.
-                                (bitcoin-lisp.networking::v2-send-message
+                                (bl.net::v2-send-message
                                  client transport (%v2t-frame "inv" (%bc-hex "00")))
                                 (%v2t-drain client)
                                 (multiple-value-bind (cmd payload)
-                                    (bitcoin-lisp.networking::v2-receive-message-blocking
+                                    (bl.net::v2-receive-message-blocking
                                      client transport :timeout 60)
                                   (setf client-result (list cmd payload))))))
                       (error (e) (setf client-result (list :error e)))))
                   :name "v2-initiator")))
-          (let ((transport (prog1 (bitcoin-lisp.networking::v2-detect-inbound
+          (let ((transport (prog1 (bl.net::v2-detect-inbound
                                    server :timeout 60)
                              (%v2t-drain server))))
-            (is-true (bitcoin-lisp.networking::v2-transport-p transport))
-            (when (bitcoin-lisp.networking::v2-transport-p transport)
+            (is-true (bl.net::v2-transport-p transport))
+            (when (bl.net::v2-transport-p transport)
               ;; Receive the client's short-ID message.
               (multiple-value-bind (cmd payload)
-                  (bitcoin-lisp.networking::v2-receive-message-blocking server transport
+                  (bl.net::v2-receive-message-blocking server transport
                                                                :timeout 60)
                 (is (equal "inv" cmd))
                 (is (equalp (%bc-hex "00") payload)))
               ;; Send a decoy the client must skip, then a long-form message
               ;; with empty payload.
-              (bitcoin-lisp.networking::%v2-send-packet
+              (bl.net::%v2-send-packet
                server transport (%bc-hex "deadbeef") (%bc-buf 0) t)
-              (bitcoin-lisp.networking::v2-send-message
+              (bl.net::v2-send-message
                server transport (%v2t-frame "verack" (%bc-buf 0)))
               ;; Make sure both packets actually reached the wire before we
               ;; join the initiator thread; see %v2t-drain.
@@ -175,25 +175,25 @@ must be skipped, and a 0-length payload."
   "A corrupt packet (auth failure) marks the connection dead rather than
 returning a silent NIL that would leave a zombie peer (Bug 2). Same for an
 oversize length descriptor."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (%with-loopback-pair (client server)
         (let* ((client-transport nil)
                (thread (bt:make-thread
                         (lambda ()
                           (setf client-transport
-                                (bitcoin-lisp.networking::v2-handshake-outbound
+                                (bl.net::v2-handshake-outbound
                                  client :timeout 10))))))
-          (let ((server-transport (bitcoin-lisp.networking::v2-detect-inbound
+          (let ((server-transport (bl.net::v2-detect-inbound
                                    server :timeout 10)))
             (bt:join-thread thread)
-            (is-true (bitcoin-lisp.networking::v2-transport-p server-transport))
-            (is-true (bitcoin-lisp.networking::v2-transport-p client-transport))
+            (is-true (bl.net::v2-transport-p server-transport))
+            (is-true (bl.net::v2-transport-p client-transport))
             ;; Client sends 3 length bytes + a garbage body that will not
             ;; authenticate. Server must return NIL AND mark itself dead.
-            (bitcoin-lisp.networking:send-bytes
-             client (bitcoin-lisp.crypto:bip324-cipher-encrypt
-                     (bitcoin-lisp.networking::v2-transport-cipher client-transport)
+            (bl.net:send-bytes
+             client (bl.crypto:bip324-cipher-encrypt
+                     (bl.net::v2-transport-cipher client-transport)
                      (%bc-hex "07") (%bc-buf 0) nil))
             (%v2t-drain client)
             ;; Corrupt the wire by having the server decrypt a tampered copy:
@@ -202,7 +202,7 @@ oversize length descriptor."
             ;; heavy; instead assert the healthy receive works, then a
             ;; hand-corrupted length triggers oversize.
             (multiple-value-bind (cmd payload)
-                (bitcoin-lisp.networking::v2-receive-message-blocking server server-transport
+                (bl.net::v2-receive-message-blocking server server-transport
                                                              :timeout 10)
               (declare (ignore payload))
               (is-true cmd))
@@ -210,30 +210,30 @@ oversize length descriptor."
             ;; sending raw bytes the recv length-cipher will interpret. We only
             ;; assert the connection dies, since the exact decrypted length is
             ;; cipher-dependent; feed 3 bytes then let the read fail.
-            (bitcoin-lisp.networking:send-bytes client (%bc-hex "ffffff"))
+            (bl.net:send-bytes client (%bc-hex "ffffff"))
             (%v2t-drain client)
-            (bitcoin-lisp.networking::v2-receive-message-blocking server server-transport
+            (bl.net::v2-receive-message-blocking server server-transport
                                                          :timeout 2)
-            (is-false (bitcoin-lisp.networking:connection-connected server)))))))
+            (is-false (bl.net:connection-connected server)))))))
 
 (test v2-transport-inbound-v1-detection
   "A v1 client's first 16 bytes (magic + padded \"version\") are recognized
 and pushed back so the v1 path reads them unchanged."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (%with-loopback-pair (client server)
         (let ((version-msg (%v2t-frame "version" (%bc-hex "00010203"))))
-          (bitcoin-lisp.networking:send-bytes client version-msg)
+          (bl.net:send-bytes client version-msg)
           (%v2t-drain client)
-          (is (eq :v1 (bitcoin-lisp.networking::v2-detect-inbound server :timeout 5)))
+          (is (eq :v1 (bl.net::v2-detect-inbound server :timeout 5)))
           ;; The sniffed 16 bytes plus the rest must reassemble the message.
-          (let ((got (bitcoin-lisp.networking:receive-bytes
+          (let ((got (bl.net:receive-bytes
                       server (length version-msg) :timeout 5)))
             (is (equalp version-msg got)))))))
 
 (test v2-transport-inbound-wrong-network
   "A v1 VERSION with a wrong network magic is rejected outright."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (%with-loopback-pair (client server)
         (let ((bytes (make-array 16 :element-type '(unsigned-byte 8)
@@ -243,20 +243,20 @@ and pushed back so the v1 path reads them unchanged."
           (loop for c across "version"
                 for i from 4
                 do (setf (aref bytes i) (char-code c)))
-          (bitcoin-lisp.networking:send-bytes client bytes)
+          (bl.net:send-bytes client bytes)
           (%v2t-drain client)
-          (is-false (bitcoin-lisp.networking::v2-detect-inbound server :timeout 5))))))
+          (is-false (bl.net::v2-detect-inbound server :timeout 5))))))
 
 (test v2-transport-outbound-fallback-on-silence
   "An outbound v2 attempt against a peer that never responds yields
 :FALLBACK-V1 (the caller then reconnects as v1)."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (%with-loopback-pair (client server)
         server                          ; kept open but silent
         ;; Server reads nothing and says nothing; use a short timeout.
         (is (eq :fallback-v1
-                (bitcoin-lisp.networking::v2-handshake-outbound client
+                (bl.net::v2-handshake-outbound client
                                                                 :timeout 2))))))
 
 (test v2-receive-resumes-a-packet-split-across-passes
@@ -270,7 +270,7 @@ fix did not hold where it mattered.
 Also pins what makes v2 framing stricter than v1: decrypting the length
 descriptor ADVANCES the receive cipher and can never be repeated, so the body
 length it yielded has to survive the gap between passes."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (%with-loopback-pair (client server)
         (let* ((client-transport nil)
@@ -278,21 +278,21 @@ length it yielded has to survive the gap between passes."
                         (lambda ()
                           (handler-case
                               (setf client-transport
-                                    (bitcoin-lisp.networking::v2-handshake-outbound
+                                    (bl.net::v2-handshake-outbound
                                      client :timeout 10))
                             (error (e) (setf client-transport e))))
                         :name "v2-split-initiator")))
           (let ((server-transport
-                  (bitcoin-lisp.networking::v2-detect-inbound server :timeout 10)))
+                  (bl.net::v2-detect-inbound server :timeout 10)))
             (bt:join-thread thread)
-            (is-true (bitcoin-lisp.networking::v2-transport-p server-transport))
-            (is-true (bitcoin-lisp.networking::v2-transport-p client-transport))
-            (when (and (bitcoin-lisp.networking::v2-transport-p server-transport)
-                       (bitcoin-lisp.networking::v2-transport-p client-transport))
+            (is-true (bl.net::v2-transport-p server-transport))
+            (is-true (bl.net::v2-transport-p client-transport))
+            (when (and (bl.net::v2-transport-p server-transport)
+                       (bl.net::v2-transport-p client-transport))
               ;; Nothing sent yet: the reader must say so at once, not wait.
               (let ((start (get-internal-real-time)))
                 (multiple-value-bind (command detail)
-                    (bitcoin-lisp.networking::v2-receive-message
+                    (bl.net::v2-receive-message
                      server server-transport :timeout 30)
                   (is (null command))
                   (is (eq :incomplete detail)
@@ -303,42 +303,42 @@ length it yielded has to survive the gap between passes."
                     "and consumes none of the caller's budget"))
               ;; Encrypt one real packet, then deliver it in two pieces.
               (let* ((framed (%v2t-frame "inv" (%bc-hex "00")))
-                     (contents (bitcoin-lisp.networking::%v2-contents-for-message
+                     (contents (bl.net::%v2-contents-for-message
                                 framed))
                      (packet (bt:with-lock-held
-                                 ((bitcoin-lisp.networking::v2-transport-send-lock
+                                 ((bl.net::v2-transport-send-lock
                                    client-transport))
-                               (bitcoin-lisp.crypto:bip324-cipher-encrypt
-                                (bitcoin-lisp.networking::v2-transport-cipher
+                               (bl.crypto:bip324-cipher-encrypt
+                                (bl.net::v2-transport-cipher
                                  client-transport)
-                                contents bitcoin-lisp.networking::*v2-empty-bytes* nil))))
+                                contents bl.net::*v2-empty-bytes* nil))))
                 ;; Piece 1: the length descriptor only. Decrypting it advances
                 ;; the receive cipher — the point of no return.
-                (bitcoin-lisp.networking::send-bytes
-                 client (subseq packet 0 bitcoin-lisp.crypto:+bip324-length-len+))
+                (bl.net::send-bytes
+                 client (subseq packet 0 bl.crypto:+bip324-length-len+))
                 (%v2t-drain client)
                 (sleep 0.2)
                 (multiple-value-bind (command detail)
-                    (bitcoin-lisp.networking::v2-receive-message
+                    (bl.net::v2-receive-message
                      server server-transport :timeout 30)
                   (is (null command))
                   (is (eq :incomplete detail) "the body has not arrived yet"))
-                (is-true (bitcoin-lisp.networking::connection-recv-framing server)
+                (is-true (bl.net::connection-recv-framing server)
                          "the decrypted body length is parked for the next pass")
-                (is-true (bitcoin-lisp.networking::connection-connected server)
+                (is-true (bl.net::connection-connected server)
                          "and a mid-packet peer is not dropped")
                 ;; Piece 2: the body.
-                (bitcoin-lisp.networking::send-bytes
-                 client (subseq packet bitcoin-lisp.crypto:+bip324-length-len+))
+                (bl.net::send-bytes
+                 client (subseq packet bl.crypto:+bip324-length-len+))
                 (%v2t-drain client)
                 (sleep 0.2)
                 (multiple-value-bind (command payload)
-                    (bitcoin-lisp.networking::v2-receive-message
+                    (bl.net::v2-receive-message
                      server server-transport :timeout 30)
                   (is (equal "inv" command)
                       "the packet completes from the parked framing state")
                   (is (equalp (%bc-hex "00") payload)))
-                (is-false (bitcoin-lisp.networking::connection-recv-framing server)
+                (is-false (bl.net::connection-recv-framing server)
                           "and the framing state is consumed with it"))))))))
 
 (test v2-decoy-flood-yields-the-pump
@@ -353,7 +353,7 @@ the path both live nodes prefer.
 +v2-max-recv-bytes-per-call+ bounds the work per call the way Core bounds bytes
 per socket-handler pass; past it the reader yields :INCOMPLETE and the next pass
 resumes, after every other peer has had a turn."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (%with-loopback-pair (client server)
         (let* ((client-transport nil)
@@ -361,28 +361,28 @@ resumes, after every other peer has had a turn."
                         (lambda ()
                           (handler-case
                               (setf client-transport
-                                    (bitcoin-lisp.networking::v2-handshake-outbound
+                                    (bl.net::v2-handshake-outbound
                                      client :timeout 10))
                             (error (e) (setf client-transport e))))
                         :name "v2-decoy-initiator")))
           (let ((server-transport
-                  (bitcoin-lisp.networking::v2-detect-inbound server :timeout 10)))
+                  (bl.net::v2-detect-inbound server :timeout 10)))
             (bt:join-thread thread)
-            (when (and (bitcoin-lisp.networking::v2-transport-p server-transport)
-                       (bitcoin-lisp.networking::v2-transport-p client-transport))
+            (when (and (bl.net::v2-transport-p server-transport)
+                       (bl.net::v2-transport-p client-transport))
               ;; Enough empty decoys to exceed the per-call budget several times
               ;; over (20 bytes each), and no real message behind them.
-              (let ((decoys (ceiling (* 4 bitcoin-lisp.networking::+v2-max-recv-bytes-per-call+)
+              (let ((decoys (ceiling (* 4 bl.net::+v2-max-recv-bytes-per-call+)
                                      20)))
                 (dotimes (i decoys)
-                  (bitcoin-lisp.networking::%v2-send-packet
+                  (bl.net::%v2-send-packet
                    client client-transport (%bc-buf 0)
-                   bitcoin-lisp.networking::*v2-empty-bytes* t))
+                   bl.net::*v2-empty-bytes* t))
                 (%v2t-drain client))
               (sleep 0.3)
               (let ((start (get-internal-real-time)))
                 (multiple-value-bind (command detail)
-                    (bitcoin-lisp.networking::v2-receive-message
+                    (bl.net::v2-receive-message
                      server server-transport)
                   (is (null command) "decoys carry no message")
                   (is (eq :incomplete detail)
@@ -393,5 +393,5 @@ resumes, after every other peer has had a turn."
                           internal-time-units-per-second)
                        5)
                     "and it yields promptly"))
-              (is-true (bitcoin-lisp.networking::connection-connected server)
+              (is-true (bl.net::connection-connected server)
                        "sending decoys is legal — the peer keeps its connection")))))))

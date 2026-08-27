@@ -9,23 +9,23 @@
 (defun %sf-graph (feerates &optional deps)
   "A depgraph with one transaction per (fee . size) in FEERATES, plus DEPS as
 a list of (parent-index . child-index)."
-  (let ((g (bitcoin-lisp.mempool::make-depgraph)))
+  (let ((g (bl.mp::make-depgraph)))
     (dolist (fr feerates)
-      (bitcoin-lisp.mempool::depgraph-add-transaction
-       g (bitcoin-lisp.mempool:make-feefrac (car fr) (cdr fr))))
+      (bl.mp::depgraph-add-transaction
+       g (bl.mp:make-feefrac (car fr) (cdr fr))))
     (dolist (d deps)
-      (bitcoin-lisp.mempool::depgraph-add-dependencies g (ash 1 (car d)) (cdr d)))
+      (bl.mp::depgraph-add-dependencies g (ash 1 (car d)) (cdr d)))
     g))
 
 (defun %sf-chunks (g lin)
-  (bitcoin-lisp.mempool::chunk-linearization g lin))
+  (bl.mp::chunk-linearization g lin))
 
 (defun %sf-incumbent (g)
   "The linearizer SFL replaced: ancestor-set feerate seeding refined by
 PostLinearize. Built explicitly because LINEARIZE is now SFL — comparing
 against LINEARIZE would compare the port with itself."
-  (bitcoin-lisp.mempool::post-linearize
-   g (bitcoin-lisp.mempool::ancestor-sort-linearization g)))
+  (bl.mp::post-linearize
+   g (bl.mp::ancestor-sort-linearization g)))
 
 (defstruct (%sf-rng (:constructor %make-sf-rng (state)))
   (state 1 :type (unsigned-byte 62)))
@@ -41,14 +41,14 @@ against LINEARIZE would compare the port with itself."
   "A random DAG: dependencies only ever run from a lower index to a higher one,
 so it is acyclic by construction."
   (let* ((n (1+ (%sf-rnd rng max-n)))
-         (g (bitcoin-lisp.mempool::make-depgraph)))
+         (g (bl.mp::make-depgraph)))
     (dotimes (i n)
-      (bitcoin-lisp.mempool::depgraph-add-transaction
-       g (bitcoin-lisp.mempool:make-feefrac (1+ (%sf-rnd rng 100)) (1+ (%sf-rnd rng 5)))))
+      (bl.mp::depgraph-add-transaction
+       g (bl.mp:make-feefrac (1+ (%sf-rnd rng 100)) (1+ (%sf-rnd rng 5)))))
     (dotimes (i n)
       (loop for j from (1+ i) below n
             do (when (zerop (%sf-rnd rng 3))
-                 (bitcoin-lisp.mempool::depgraph-add-dependencies g (ash 1 i) j))))
+                 (bl.mp::depgraph-add-dependencies g (ash 1 i) j))))
     (values g n)))
 
 ;;; --- Basics -----------------------------------------------------------------
@@ -57,7 +57,7 @@ so it is acyclic by construction."
   "With no dependencies every transaction is its own chunk, so the answer is
 simply decreasing feerate."
   (let ((g (%sf-graph '((10 . 1) (30 . 1) (20 . 1)))))
-    (multiple-value-bind (lin optimal) (bitcoin-lisp.mempool::sfl-linearize g :rng-seed 42)
+    (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 42)
       (is (equalp #(1 2 0) lin))
       (is-true optimal))))
 
@@ -65,7 +65,7 @@ simply decreasing feerate."
   "A high-feerate child cannot come before its low-feerate parent."
   ;; tx0 pays 1/1, tx1 pays 100/1 and depends on tx0.
   (let ((g (%sf-graph '((1 . 1) (100 . 1)) '((0 . 1)))))
-    (multiple-value-bind (lin optimal) (bitcoin-lisp.mempool::sfl-linearize g :rng-seed 1)
+    (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 1)
       (is (equalp #(0 1) lin))
       (is-true optimal)
       ;; They chunk together: the pair's feerate beats tx0 alone.
@@ -73,9 +73,9 @@ simply decreasing feerate."
 
 (test sfl-handles-the-empty-and-singleton-cases
   (let ((g (%sf-graph '())))
-    (is (equalp #() (bitcoin-lisp.mempool::sfl-linearize g :rng-seed 3))))
+    (is (equalp #() (bl.mp::sfl-linearize g :rng-seed 3))))
   (let ((g (%sf-graph '((5 . 2)))))
-    (multiple-value-bind (lin optimal) (bitcoin-lisp.mempool::sfl-linearize g :rng-seed 3)
+    (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 3)
       (is (equalp #(0) lin))
       (is-true optimal))))
 
@@ -85,10 +85,10 @@ no optimality guarantee for. Both linearizers in fact solve it; the assertion is
 the one that matters either way -- SFL is never worse."
   (let* ((g (%sf-graph '((1 . 1) (9 . 1) (2 . 1) (9 . 1))
                        '((0 . 1) (0 . 2) (1 . 3) (2 . 3)))))
-    (multiple-value-bind (lin optimal) (bitcoin-lisp.mempool::sfl-linearize g :rng-seed 5)
+    (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 5)
       (is-true optimal)
-      (is-true (bitcoin-lisp.mempool::linearization-topological-p g lin))
-      (let ((cmp (bitcoin-lisp.mempool:compare-chunks
+      (is-true (bl.mp::linearization-topological-p g lin))
+      (let ((cmp (bl.mp:compare-chunks
                   (%sf-chunks g lin)
                   (%sf-chunks g (%sf-incumbent g)))))
         (is (member cmp '(:greater :equal))
@@ -103,11 +103,11 @@ the one that matters either way -- SFL is never worse."
         (bad-topo 0))
     (dotimes (trial 400)
       (multiple-value-bind (g n) (%sf-random-graph rng 10)
-        (let ((lin (bitcoin-lisp.mempool::sfl-linearize g :rng-seed (1+ trial))))
+        (let ((lin (bl.mp::sfl-linearize g :rng-seed (1+ trial))))
           (unless (and (= n (length lin))
                        (= n (length (remove-duplicates (coerce lin 'list)))))
             (incf bad-count))
-          (unless (bitcoin-lisp.mempool::linearization-topological-p g lin)
+          (unless (bl.mp::linearization-topological-p g lin)
             (incf bad-topo)))))
     (is (zerop bad-count) "every transaction must appear exactly once")
     (is (zerop bad-topo) "every output must be topologically valid")))
@@ -116,14 +116,14 @@ the one that matters either way -- SFL is never worse."
   "A random DAG with between MIN-N and MAX-N transactions, where each ordered
 pair is joined with probability DENSITY/100."
   (let* ((n (+ min-n (%sf-rnd rng (1+ (- max-n min-n)))))
-         (g (bitcoin-lisp.mempool::make-depgraph)))
+         (g (bl.mp::make-depgraph)))
     (dotimes (i n)
-      (bitcoin-lisp.mempool::depgraph-add-transaction
-       g (bitcoin-lisp.mempool:make-feefrac (1+ (%sf-rnd rng 50)) (1+ (%sf-rnd rng 10)))))
+      (bl.mp::depgraph-add-transaction
+       g (bl.mp:make-feefrac (1+ (%sf-rnd rng 50)) (1+ (%sf-rnd rng 10)))))
     (dotimes (i n)
       (loop for j from (1+ i) below n
             do (when (< (%sf-rnd rng 100) density)
-                 (bitcoin-lisp.mempool::depgraph-add-dependencies g (ash 1 i) j))))
+                 (bl.mp::depgraph-add-dependencies g (ash 1 i) j))))
     (values g n)))
 
 (test sfl-is-never-worse-than-the-ancestor-set-linearizer
@@ -146,8 +146,8 @@ bought with the algorithm, and it is what this asserts."
     (dotimes (trial 200)
       (multiple-value-bind (g n) (%sf-random-graph-sized rng 40 64 15)
         (declare (ignore n))
-        (case (bitcoin-lisp.mempool:compare-chunks
-               (%sf-chunks g (bitcoin-lisp.mempool::sfl-linearize g :rng-seed (1+ trial)))
+        (case (bl.mp:compare-chunks
+               (%sf-chunks g (bl.mp::sfl-linearize g :rng-seed (1+ trial)))
                (%sf-chunks g (%sf-incumbent g)))
           (:less (incf worse))
           (:greater (incf better))
@@ -170,14 +170,14 @@ so the claim stays true rather than remaining a note in a commit message."
       (dotimes (trial 60)
         (multiple-value-bind (g n) (%sf-random-graph-sized rng 2 7 density)
           (incf checked)
-          (let ((cs (%sf-chunks g (bitcoin-lisp.mempool::sfl-linearize g :rng-seed (1+ trial))))
+          (let ((cs (%sf-chunks g (bl.mp::sfl-linearize g :rng-seed (1+ trial))))
                 (co (%sf-chunks g (%sf-incumbent g)))
                 (all (%sf-all-topological-orders g n)))
-            (when (some (lambda (c) (eq :greater (bitcoin-lisp.mempool:compare-chunks
+            (when (some (lambda (c) (eq :greater (bl.mp:compare-chunks
                                                   (%sf-chunks g c) co)))
                         all)
               (incf old-suboptimal))
-            (when (some (lambda (c) (eq :greater (bitcoin-lisp.mempool:compare-chunks
+            (when (some (lambda (c) (eq :greater (bl.mp:compare-chunks
                                                   (%sf-chunks g c) cs)))
                         all)
               (incf sfl-suboptimal))))))
@@ -198,10 +198,10 @@ by index -- and require the result beat or match it."
         ;; Index order is topological here by construction, and it is a poor
         ;; linearization because it ignores feerate entirely.
         (let* ((seed-lin (coerce (loop for i below n collect i) 'simple-vector))
-               (lin (bitcoin-lisp.mempool::sfl-linearize
+               (lin (bl.mp::sfl-linearize
                      g :rng-seed (1+ trial) :old-linearization seed-lin)))
-          (is-true (bitcoin-lisp.mempool::linearization-topological-p g lin))
-          (when (eq :less (bitcoin-lisp.mempool:compare-chunks
+          (is-true (bl.mp::linearization-topological-p g lin))
+          (when (eq :less (bl.mp:compare-chunks
                            (%sf-chunks g lin) (%sf-chunks g seed-lin)))
             (incf worse)))))
     (is (zerop worse))))
@@ -214,13 +214,13 @@ every topologically valid order and confirm none has a better diagram."
         (violations 0))
     (dotimes (trial 60)
       (multiple-value-bind (g n) (%sf-random-graph rng 6)
-        (multiple-value-bind (lin optimal) (bitcoin-lisp.mempool::sfl-linearize
+        (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize
                                             g :rng-seed (1+ trial))
           (when optimal
             (incf checked)
             (let ((best (%sf-chunks g lin)))
               (dolist (cand (%sf-all-topological-orders g n))
-                (when (eq :less (bitcoin-lisp.mempool:compare-chunks
+                (when (eq :less (bl.mp:compare-chunks
                                  best (%sf-chunks g cand)))
                   (incf violations))))))))
     (is (plusp checked) "the fuzz must actually produce optimal results to check")
@@ -236,7 +236,7 @@ the tiny clusters the optimality test uses."
                    (push (coerce (reverse chosen-list) 'simple-vector) results)
                    (dotimes (i n)
                      (unless (logbitp i chosen-set)
-                       (let ((parents (logandc2 (bitcoin-lisp.mempool::depgraph-ancestors g i)
+                       (let ((parents (logandc2 (bl.mp::depgraph-ancestors g i)
                                                 (ash 1 i))))
                          (when (= parents (logand parents chosen-set))
                            (walk (logior chosen-set (ash 1 i))
@@ -251,16 +251,16 @@ the tiny clusters the optimality test uses."
 linearization -- just not a provably optimal one."
   (let ((g (%sf-graph (loop for i below 20 collect (cons (1+ (* 7 (mod i 13))) (1+ (mod i 3))))
                       (loop for i below 19 collect (cons i (1+ i))))))
-    (multiple-value-bind (lin optimal cost) (bitcoin-lisp.mempool::sfl-linearize
+    (multiple-value-bind (lin optimal cost) (bl.mp::sfl-linearize
                                              g :rng-seed 9 :max-cost 1)
       (is (= 20 (length lin)))
-      (is-true (bitcoin-lisp.mempool::linearization-topological-p g lin))
+      (is-true (bl.mp::linearization-topological-p g lin))
       (is-false optimal "no budget means no optimality claim")
       (is (plusp cost)))
     ;; With a real budget the same cluster is solved and reported optimal.
-    (multiple-value-bind (lin optimal) (bitcoin-lisp.mempool::sfl-linearize g :rng-seed 9)
+    (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 9)
       (is-true optimal)
-      (is-true (bitcoin-lisp.mempool::linearization-topological-p g lin)))))
+      (is-true (bl.mp::linearization-topological-p g lin)))))
 
 (test sfl-is-deterministic-for-a-given-seed
   "Same graph, same seed, same answer -- the randomness is a heuristic, not a
@@ -269,8 +269,8 @@ source of run-to-run variation."
     (dotimes (trial 30)
       (multiple-value-bind (g n) (%sf-random-graph rng 8)
         (declare (ignore n))
-        (is (equalp (bitcoin-lisp.mempool::sfl-linearize g :rng-seed 77)
-                    (bitcoin-lisp.mempool::sfl-linearize g :rng-seed 77)))))))
+        (is (equalp (bl.mp::sfl-linearize g :rng-seed 77)
+                    (bl.mp::sfl-linearize g :rng-seed 77)))))))
 
 ;;; --- The seam ---------------------------------------------------------------
 
@@ -288,17 +288,17 @@ produce SFL's answer and not the incumbent's."
       (unless found
         (multiple-value-bind (g n) (%sf-random-graph-sized rng 40 64 15)
           (declare (ignore n))
-          (let ((sfl (%sf-chunks g (bitcoin-lisp.mempool::sfl-linearize g :rng-seed (1+ trial))))
+          (let ((sfl (%sf-chunks g (bl.mp::sfl-linearize g :rng-seed (1+ trial))))
                 (inc (%sf-chunks g (%sf-incumbent g))))
-            (when (eq :greater (bitcoin-lisp.mempool:compare-chunks sfl inc))
+            (when (eq :greater (bl.mp:compare-chunks sfl inc))
               (setf found (list g (1+ trial))))))))
     (is-true found "no disagreeing cluster found; the comparison below is vacuous")
     (when found
       (destructuring-bind (g seed) found
-        (let* ((bitcoin-lisp.mempool::*linearize-rng-seed* seed)
-               (via-linearize (%sf-chunks g (bitcoin-lisp.mempool::linearize g)))
+        (let* ((bl.mp::*linearize-rng-seed* seed)
+               (via-linearize (%sf-chunks g (bl.mp::linearize g)))
                (incumbent (%sf-chunks g (%sf-incumbent g))))
-          (is (eq :greater (bitcoin-lisp.mempool:compare-chunks via-linearize incumbent))
+          (is (eq :greater (bl.mp:compare-chunks via-linearize incumbent))
               "LINEARIZE must give SFL's better answer, not the incumbent's"))))))
 
 (test linearize-still-runs-post-linearize-over-the-sfl-output
@@ -308,11 +308,11 @@ either case, guarantees every chunk is connected. Starve SFL of budget so its
 output is not optimal, and require LINEARIZE's chunks to be connected anyway."
   (let ((g (%sf-graph (loop for i below 24 collect (cons (1+ (* 11 (mod i 7))) (1+ (mod i 4))))
                       (loop for i below 23 collect (cons i (1+ i))))))
-    (let ((bitcoin-lisp.mempool::*linearize-rng-seed* 4))
-      (let ((lin (bitcoin-lisp.mempool::linearize g :max-cost 1)))
+    (let ((bl.mp::*linearize-rng-seed* 4))
+      (let ((lin (bl.mp::linearize g :max-cost 1)))
         (is (= 24 (length lin)))
-        (is-true (bitcoin-lisp.mempool::linearization-topological-p g lin))
-        (dolist (si (bitcoin-lisp.mempool::chunk-linearization-info g lin))
-          (is-true (bitcoin-lisp.mempool::depgraph-connected-p
-                    g (bitcoin-lisp.mempool::setinfo-transactions si))
+        (is-true (bl.mp::linearization-topological-p g lin))
+        (dolist (si (bl.mp::chunk-linearization-info g lin))
+          (is-true (bl.mp::depgraph-connected-p
+                    g (bl.mp::setinfo-transactions si))
                    "every chunk PostLinearize produces must be connected"))))))

@@ -307,7 +307,7 @@ FINALIZE (Core FlatFileSeq::Flush). POS is the first UNWRITTEN position."
   "Core's undo checksum: SHA256d(prev block hash || serialized CBlockUndo)
 (blockstorage.cpp:996-999). Binding the PREVIOUS block's hash means a rev
 record cannot be silently mistaken for a different block's."
-  (bitcoin-lisp.crypto:hash256
+  (bl.crypto:hash256
    (concatenate '(vector (unsigned-byte 8)) prev-block-hash undo-bytes)))
 
 (defun undo-record-bytes (magic prev-block-hash undo-bytes)

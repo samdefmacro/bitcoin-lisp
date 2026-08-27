@@ -18,16 +18,16 @@
   "ALWAYS_ACTIVE and NEVER_ACTIVE are answered before any chain walk
 (versionbits.cpp:33-40), which is what lets them be evaluated with no block
 index at all."
-  (let ((always (bitcoin-lisp.validation::versionbits-deployment
+  (let ((always (bl.val::versionbits-deployment
                  "taproot" :regtest))
-        (never (bitcoin-lisp.validation::versionbits-deployment
+        (never (bl.val::versionbits-deployment
                 "testdummy" :mainnet)))
-    (is (= bitcoin-lisp.validation:+vb-always-active+
-           (bitcoin-lisp.validation:vb-deployment-start-time always)))
-    (is (eq :active (bitcoin-lisp.validation:versionbits-state nil nil always)))
-    (is (= bitcoin-lisp.validation:+vb-never-active+
-           (bitcoin-lisp.validation:vb-deployment-start-time never)))
-    (is (eq :failed (bitcoin-lisp.validation:versionbits-state nil nil never)))))
+    (is (= bl.val:+vb-always-active+
+           (bl.val:vb-deployment-start-time always)))
+    (is (eq :active (bl.val:versionbits-state nil nil always)))
+    (is (= bl.val:+vb-never-active+
+           (bl.val:vb-deployment-start-time never)))
+    (is (eq :failed (bl.val:versionbits-state nil nil never)))))
 
 (test versionbits-table-is-per-chain
   "⚠️ The window and threshold DIFFER PER CHAIN, and a chain-blind table gets
@@ -35,32 +35,32 @@ exactly this wrong: regtest counts over 144 blocks needing 108, where mainnet
 counts over 2016 needing 1815 (kernel/chainparams.cpp:106-107 vs :590-591).
 Transcription errors here are invisible until a functional test on regtest
 disagrees about when a fork locks in."
-  (flet ((dep (net name) (bitcoin-lisp.validation::versionbits-deployment name net)))
+  (flet ((dep (net name) (bl.val::versionbits-deployment name net)))
     ;; Core's five chains, the values that differ between them.
-    (is (= 2016 (bitcoin-lisp.validation:vb-deployment-period (dep :mainnet "taproot"))))
-    (is (= 1815 (bitcoin-lisp.validation:vb-deployment-threshold (dep :mainnet "taproot"))))
-    (is (= 1512 (bitcoin-lisp.validation:vb-deployment-threshold (dep :testnet3 "taproot"))))
-    (is (= 1512 (bitcoin-lisp.validation:vb-deployment-threshold (dep :testnet4 "taproot"))))
-    (is (= 1815 (bitcoin-lisp.validation:vb-deployment-threshold (dep :signet "taproot"))))
-    (is (= 144 (bitcoin-lisp.validation:vb-deployment-period (dep :regtest "taproot"))))
-    (is (= 108 (bitcoin-lisp.validation:vb-deployment-threshold (dep :regtest "taproot"))))
+    (is (= 2016 (bl.val:vb-deployment-period (dep :mainnet "taproot"))))
+    (is (= 1815 (bl.val:vb-deployment-threshold (dep :mainnet "taproot"))))
+    (is (= 1512 (bl.val:vb-deployment-threshold (dep :testnet3 "taproot"))))
+    (is (= 1512 (bl.val:vb-deployment-threshold (dep :testnet4 "taproot"))))
+    (is (= 1815 (bl.val:vb-deployment-threshold (dep :signet "taproot"))))
+    (is (= 144 (bl.val:vb-deployment-period (dep :regtest "taproot"))))
+    (is (= 108 (bl.val:vb-deployment-threshold (dep :regtest "taproot"))))
     ;; Every chain uses bit 2 for taproot and bit 28 for testdummy.
     (dolist (net '(:mainnet :testnet3 :testnet4 :signet :regtest))
-      (is (= 2 (bitcoin-lisp.validation:vb-deployment-bit (dep net "taproot"))))
-      (is (= 28 (bitcoin-lisp.validation:vb-deployment-bit (dep net "testdummy")))))
+      (is (= 2 (bl.val:vb-deployment-bit (dep net "taproot"))))
+      (is (= 28 (bl.val:vb-deployment-bit (dep net "testdummy")))))
     ;; Only mainnet delays taproot's activation past lock-in
     ;; (chainparams.cpp:113 vs :244/:352/:503/:589).
-    (is (= 709632 (bitcoin-lisp.validation:vb-deployment-min-activation-height
+    (is (= 709632 (bl.val:vb-deployment-min-activation-height
                    (dep :mainnet "taproot"))))
     (dolist (net '(:testnet3 :testnet4 :signet :regtest))
-      (is (= 0 (bitcoin-lisp.validation:vb-deployment-min-activation-height
+      (is (= 0 (bl.val:vb-deployment-min-activation-height
                 (dep net "taproot")))))
     ;; And only regtest's testdummy is drivable — everywhere else it is
     ;; NEVER_ACTIVE, which is what keeps it out of getdeploymentinfo.
-    (is (= 0 (bitcoin-lisp.validation:vb-deployment-start-time (dep :regtest "testdummy"))))
+    (is (= 0 (bl.val:vb-deployment-start-time (dep :regtest "testdummy"))))
     (dolist (net '(:mainnet :testnet3 :testnet4 :signet))
-      (is (= bitcoin-lisp.validation:+vb-never-active+
-             (bitcoin-lisp.validation:vb-deployment-start-time (dep net "testdummy")))))))
+      (is (= bl.val:+vb-never-active+
+             (bl.val:vb-deployment-start-time (dep net "testdummy")))))))
 
 (test getdeploymentinfo-reports-taproot-as-bip9-not-buried
   "Core carries taproot as a BIP9 deployment in all five chain parameter sets,
@@ -73,7 +73,7 @@ happens to be bound to — MAKE-TEST-NODE builds a testnet3 node. Reading the
 table by the ambient global instead would be the chain-blind bug this project
 has already shipped twice."
   (let* ((node (make-test-node))
-         (r (bitcoin-lisp.rpc::rpc-getdeploymentinfo node nil))
+         (r (bl.rpc::rpc-getdeploymentinfo node nil))
          (deps (cdr (assoc "deployments" r :test #'string=)))
          (taproot (cdr (assoc "taproot" deps :test #'string=))))
     (is-true taproot "taproot is missing from getdeploymentinfo")
@@ -95,7 +95,7 @@ has already shipped twice."
       (is-false (assoc "statistics" bip9 :test #'string=))
       (is-false (assoc "bit" bip9 :test #'string=)))
     ;; Not active, and with no active_since there is no height key at all.
-    (is (eq bitcoin-lisp.rpc::+json-false+ (cdr (assoc "active" taproot :test #'string=))))
+    (is (eq bl.rpc::+json-false+ (cdr (assoc "active" taproot :test #'string=))))
     (is-false (assoc "height" taproot :test #'string=))
     ;; The buried ones keep their shape.
     (let ((segwit (cdr (assoc "segwit" deps :test #'string=))))
@@ -107,11 +107,11 @@ has already shipped twice."
 
 (test versionbits-state-names-are-cores
   "The status strings getdeploymentinfo emits are Core's, exactly."
-  (is (string= "defined" (bitcoin-lisp.validation:versionbits-state-name :defined)))
-  (is (string= "started" (bitcoin-lisp.validation:versionbits-state-name :started)))
-  (is (string= "locked_in" (bitcoin-lisp.validation:versionbits-state-name :locked-in)))
-  (is (string= "active" (bitcoin-lisp.validation:versionbits-state-name :active)))
-  (is (string= "failed" (bitcoin-lisp.validation:versionbits-state-name :failed))))
+  (is (string= "defined" (bl.val:versionbits-state-name :defined)))
+  (is (string= "started" (bl.val:versionbits-state-name :started)))
+  (is (string= "locked_in" (bl.val:versionbits-state-name :locked-in)))
+  (is (string= "active" (bl.val:versionbits-state-name :active)))
+  (is (string= "failed" (bl.val:versionbits-state-name :failed))))
 
 (defun %vb-chain (n &key (network :regtest) (signal-bit nil) (base-time 1000000))
   "(values chain-state last-entry) for a synthetic chain of N blocks.
@@ -119,11 +119,11 @@ has already shipped twice."
 Every header carries the versionbits top bits, and SIGNAL-BIT additionally sets
 that deployment bit — which is what CONDITION counts."
   (declare (ignore network))
-  (let ((cs (bitcoin-lisp.storage:make-chain-state))
+  (let ((cs (bl.store:make-chain-state))
         (prev nil))
     (dotimes (i n)
       (let* ((version (logior #x20000000 (if signal-bit (ash 1 signal-bit) 0)))
-             (header (bitcoin-lisp.serialization:make-block-header
+             (header (bl.ser:make-block-header
                       :version version
                       :prev-block (make-array 32 :element-type '(unsigned-byte 8)
                                                  :initial-element 0)
@@ -134,10 +134,10 @@ that deployment bit — which is what CONDITION counts."
              (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
         (setf (aref hash 0) (logand i #xFF)
               (aref hash 1) (logand (ash i -8) #xFF))
-        (let ((e (bitcoin-lisp.storage:make-block-index-entry
+        (let ((e (bl.store:make-block-index-entry
                   :hash hash :height i :prev-entry prev :header header
                   :status :valid)))
-          (bitcoin-lisp.storage:add-block-index-entry cs e)
+          (bl.store:add-block-index-entry cs e)
           (setf prev e))))
     (values cs prev)))
 
@@ -149,12 +149,12 @@ where Core reports a full period elapsed and that reports ZERO — and zero
 elapsed means zero count and a `possible' computed from nothing.
 
 regtest's period is 144, so height 143 is the case that separates them."
-  (let ((dep (bitcoin-lisp.validation::versionbits-deployment "testdummy" :regtest)))
+  (let ((dep (bl.val::versionbits-deployment "testdummy" :regtest)))
     (multiple-value-bind (cs last) (%vb-chain 144 :signal-bit 28)
       ;; Height 143 is the last block of the first period.
-      (is (= 143 (bitcoin-lisp.storage:block-index-entry-height last)))
+      (is (= 143 (bl.store:block-index-entry-height last)))
       (multiple-value-bind (period threshold elapsed count possible)
-          (bitcoin-lisp.validation:versionbits-statistics cs last dep)
+          (bl.val:versionbits-statistics cs last dep)
         (declare (ignore possible))
         (is (= 144 period))
         (is (= 108 threshold))
@@ -164,7 +164,7 @@ regtest's period is 144, so height 143 is the case that separates them."
     ;; And one block earlier, elapsed is 143 — the formulas agree here.
     (multiple-value-bind (cs last) (%vb-chain 143 :signal-bit 28)
       (multiple-value-bind (period threshold elapsed)
-          (bitcoin-lisp.validation:versionbits-statistics cs last dep)
+          (bl.val:versionbits-statistics cs last dep)
         (declare (ignore period threshold))
         (is (= 143 elapsed))))))
 
@@ -175,9 +175,9 @@ count zero and `possible' FALSE — default-initialised, never computed
 
 Without that early return the corrected elapsed formula is a trap: `(mod -1 144)'
 is 143 in Common Lisp, so it would walk a NIL entry a whole period of times."
-  (let ((dep (bitcoin-lisp.validation::versionbits-deployment "testdummy" :regtest)))
+  (let ((dep (bl.val::versionbits-deployment "testdummy" :regtest)))
     (multiple-value-bind (period threshold elapsed count possible)
-        (bitcoin-lisp.validation:versionbits-statistics nil nil dep)
+        (bl.val:versionbits-statistics nil nil dep)
       (is (= 144 period))
       (is (= 108 threshold))
       (is (= 0 elapsed))
@@ -188,10 +188,10 @@ is 143 in Common Lisp, so it would walk a NIL entry a whole period of times."
   "CONDITION requires both the versionbits top bits and the deployment's own
 bit; a chain that sets neither counts zero, which is what makes `possible' go
 false once the window cannot be reached."
-  (let ((dep (bitcoin-lisp.validation::versionbits-deployment "testdummy" :regtest)))
+  (let ((dep (bl.val::versionbits-deployment "testdummy" :regtest)))
     (multiple-value-bind (cs last) (%vb-chain 144)   ; top bits only, no bit 28
       (multiple-value-bind (period threshold elapsed count possible)
-          (bitcoin-lisp.validation:versionbits-statistics cs last dep)
+          (bl.val:versionbits-statistics cs last dep)
         (declare (ignore period threshold))
         (is (= 144 elapsed))
         (is (= 0 count))

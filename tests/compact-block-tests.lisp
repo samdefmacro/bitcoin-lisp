@@ -10,34 +10,34 @@
 
 (defun make-mock-peer ()
   "Create a mock peer for testing."
-  (bitcoin-lisp.networking:make-peer
+  (bl.net:make-peer
    :state :ready
    :address "127.0.0.1"))
 
 (defun make-mock-mempool-with-txs (txs)
   "Create a mempool with the given transactions.
    TXS is a list of (txid . transaction) pairs."
-  (let ((mempool (bitcoin-lisp.mempool:make-mempool)))
+  (let ((mempool (bl.mp:make-mempool)))
     (dolist (pair txs)
       (let ((txid (car pair))
             (tx (cdr pair)))
-        (bitcoin-lisp.mempool:mempool-add
+        (bl.mp:mempool-add
          mempool txid
-         (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))))
+         (bl.mp:make-entry-from-tx tx 1000 0))))
     mempool))
 
 (defun make-simple-tx (id-byte)
   "Create a simple transaction with a unique identifier byte."
-  (bitcoin-lisp.serialization:make-transaction
+  (bl.ser:make-transaction
    :version 2
-   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                  :previous-output (bitcoin-lisp.serialization:make-outpoint
+   :inputs (vector (bl.ser:make-tx-in
+                  :previous-output (bl.ser:make-outpoint
                                     :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                       :initial-element id-byte)
                                     :index 0)
                   :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                   :sequence #xffffffff))
-   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bl.ser:make-tx-out
                    :value 50000
                    :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                               :initial-element #x76)))
@@ -53,15 +53,15 @@ reconstructed block fails BIP141 validation (bad-witness-nonce-size). Accepting 
 is what wedged the testnet4 node ~1800 blocks behind the chain."
   (let ((peer (make-mock-peer)))
     ;; Initially no compact block support
-    (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 0))
+    (is (= (bl.net:peer-compact-block-version peer) 0))
     ;; v1 is ignored — peer stays unsupported (we fall back to full witness blocks)
-    (let ((payload (subseq (bitcoin-lisp.serialization:make-sendcmpct-message nil 1) 24)))
-      (bitcoin-lisp.networking::handle-sendcmpct peer payload))
-    (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 0))
+    (let ((payload (subseq (bl.ser:make-sendcmpct-message nil 1) 24)))
+      (bl.net::handle-sendcmpct peer payload))
+    (is (= (bl.net:peer-compact-block-version peer) 0))
     ;; v2 is accepted
-    (let ((payload (subseq (bitcoin-lisp.serialization:make-sendcmpct-message nil 2) 24)))
-      (bitcoin-lisp.networking::handle-sendcmpct peer payload))
-    (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 2))))
+    (let ((payload (subseq (bl.ser:make-sendcmpct-message nil 2) 24)))
+      (bl.net::handle-sendcmpct peer payload))
+    (is (= (bl.net:peer-compact-block-version peer) 2))))
 
 (test sendcmpct-rejects-invalid-version
   "handle-sendcmpct ignores every version other than 2 — v1 and future/unknown
@@ -70,23 +70,23 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
     ;; v3 (unknown/future) ignored
     (let ((payload (flexi-streams:with-output-to-sequence (s)
                      (write-byte 0 s)  ; low-bandwidth
-                     (bitcoin-lisp.serialization:write-uint64-le s 3))))  ; version 3
-      (bitcoin-lisp.networking::handle-sendcmpct peer payload))
-    (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 0))
+                     (bl.ser:write-uint64-le s 3))))  ; version 3
+      (bl.net::handle-sendcmpct peer payload))
+    (is (= (bl.net:peer-compact-block-version peer) 0))
     ;; v1 ignored too
-    (let ((payload (subseq (bitcoin-lisp.serialization:make-sendcmpct-message nil 1) 24)))
-      (bitcoin-lisp.networking::handle-sendcmpct peer payload))
-    (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 0))))
+    (let ((payload (subseq (bl.ser:make-sendcmpct-message nil 1) 24)))
+      (bl.net::handle-sendcmpct peer payload))
+    (is (= (bl.net:peer-compact-block-version peer) 0))))
 
 (test sendcmpct-tracks-high-bandwidth
   "handle-sendcmpct tracks the high-bandwidth preference from a (v2) sendcmpct."
   (let ((peer (make-mock-peer)))
-    (is (null (bitcoin-lisp.networking:peer-compact-block-high-bandwidth peer)))
+    (is (null (bl.net:peer-compact-block-high-bandwidth peer)))
     ;; Receive high-bandwidth request (v2 — the only version we accept)
-    (let ((payload (subseq (bitcoin-lisp.serialization:make-sendcmpct-message t 2) 24)))
-      (bitcoin-lisp.networking::handle-sendcmpct peer payload))
-    (is (bitcoin-lisp.networking:peer-compact-block-high-bandwidth peer))
-    (is (= 2 (bitcoin-lisp.networking:peer-compact-block-version peer)))))
+    (let ((payload (subseq (bl.ser:make-sendcmpct-message t 2) 24)))
+      (bl.net::handle-sendcmpct peer payload))
+    (is (bl.net:peer-compact-block-high-bandwidth peer))
+    (is (= 2 (bl.net:peer-compact-block-version peer)))))
 
 ;;;; Short ID Map Building Tests
 
@@ -94,18 +94,18 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
   "build-shortid-map should create mapping from short IDs to transactions."
   (let* ((tx1 (make-simple-tx #x11))
          (tx2 (make-simple-tx #x22))
-         (txid1 (bitcoin-lisp.serialization:transaction-hash tx1))
-         (txid2 (bitcoin-lisp.serialization:transaction-hash tx2))
+         (txid1 (bl.ser:transaction-hash tx1))
+         (txid2 (bl.ser:transaction-hash tx2))
          (mempool (make-mock-mempool-with-txs (list (cons txid1 tx1)
                                                     (cons txid2 tx2))))
          (k0 #x0706050403020100)
          (k1 #x0f0e0d0c0b0a0908))
     (multiple-value-bind (map collision)
-        (bitcoin-lisp.networking::build-shortid-map mempool k0 k1 nil)
+        (bl.net::build-shortid-map mempool k0 k1 nil)
       (is (not collision))
       (is (= (hash-table-count map) 2))
       ;; Each entry should be (tx . full-id)
-      (let ((short-id1 (bitcoin-lisp.crypto:compute-short-txid k0 k1 txid1)))
+      (let ((short-id1 (bl.crypto:compute-short-txid k0 k1 txid1)))
         (is (gethash short-id1 map))))))
 
 (test build-shortid-map-detects-collision
@@ -113,10 +113,10 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
   ;; This is hard to test directly without crafting collision inputs,
   ;; but we can verify the collision flag mechanism works
   (let* ((tx1 (make-simple-tx #x11))
-         (txid1 (bitcoin-lisp.serialization:transaction-hash tx1))
+         (txid1 (bl.ser:transaction-hash tx1))
          (mempool (make-mock-mempool-with-txs (list (cons txid1 tx1)))))
     (multiple-value-bind (map collision)
-        (bitcoin-lisp.networking::build-shortid-map mempool 0 0 nil)
+        (bl.net::build-shortid-map mempool 0 0 nil)
       (declare (ignore map))
       ;; With just one tx, no collision expected
       (is (not collision)))))
@@ -124,22 +124,22 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
 (test build-shortid-map-uses-wtxid-for-v2
   "build-shortid-map should use wtxid when use-wtxid is true."
   (let* ((tx (make-simple-tx #x33))
-         (txid (bitcoin-lisp.serialization:transaction-hash tx))
-         (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))
+         (txid (bl.ser:transaction-hash tx))
+         (wtxid (bl.ser:transaction-wtxid tx))
          (mempool (make-mock-mempool-with-txs (list (cons txid tx))))
          (k0 #x1234)
          (k1 #x5678))
     ;; With use-wtxid=nil, should use txid
     (multiple-value-bind (map1 collision1)
-        (bitcoin-lisp.networking::build-shortid-map mempool k0 k1 nil)
+        (bl.net::build-shortid-map mempool k0 k1 nil)
       (declare (ignore collision1))
-      (let ((short-id-txid (bitcoin-lisp.crypto:compute-short-txid k0 k1 txid)))
+      (let ((short-id-txid (bl.crypto:compute-short-txid k0 k1 txid)))
         (is (gethash short-id-txid map1))))
     ;; With use-wtxid=t, should use wtxid
     (multiple-value-bind (map2 collision2)
-        (bitcoin-lisp.networking::build-shortid-map mempool k0 k1 t)
+        (bl.net::build-shortid-map mempool k0 k1 t)
       (declare (ignore collision2))
-      (let ((short-id-wtxid (bitcoin-lisp.crypto:compute-short-txid k0 k1 wtxid)))
+      (let ((short-id-wtxid (bl.crypto:compute-short-txid k0 k1 wtxid)))
         (is (gethash short-id-wtxid map2))))))
 
 ;;;; Block Reconstruction Tests
@@ -148,11 +148,11 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
   "Block should reconstruct successfully when all txs are in mempool."
   (let* ((tx1 (make-simple-tx #x11))
          (tx2 (make-simple-tx #x22))
-         (txid1 (bitcoin-lisp.serialization:transaction-hash tx1))
-         (txid2 (bitcoin-lisp.serialization:transaction-hash tx2))
+         (txid1 (bl.ser:transaction-hash tx1))
+         (txid2 (bl.ser:transaction-hash tx2))
          (mempool (make-mock-mempool-with-txs (list (cons txid1 tx1)
                                                     (cons txid2 tx2))))
-         (header (bitcoin-lisp.serialization:make-block-header
+         (header (bl.ser:make-block-header
                   :version 1
                   :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                   :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
@@ -160,41 +160,41 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
                   :bits #x1d00ffff
                   :nonce 0))
          (nonce #x1234567890abcdef)
-         (header-bytes (bitcoin-lisp.serialization:serialize-block-header header)))
+         (header-bytes (bl.ser:serialize-block-header header)))
     ;; Compute short IDs for our transactions
     (multiple-value-bind (k0 k1)
-        (bitcoin-lisp.crypto:compute-siphash-key header-bytes nonce)
-      (let* ((short-id1 (bitcoin-lisp.crypto:compute-short-txid k0 k1 txid1))
-             (short-id2 (bitcoin-lisp.crypto:compute-short-txid k0 k1 txid2))
-             (compact-block (bitcoin-lisp.serialization:make-compact-block
+        (bl.crypto:compute-siphash-key header-bytes nonce)
+      (let* ((short-id1 (bl.crypto:compute-short-txid k0 k1 txid1))
+             (short-id2 (bl.crypto:compute-short-txid k0 k1 txid2))
+             (compact-block (bl.ser:make-compact-block
                              :header header
                              :nonce nonce
                              :short-ids (list short-id1 short-id2)
                              :prefilled-txs '())))
         (multiple-value-bind (block missing partial)
-            (bitcoin-lisp.networking::reconstruct-compact-block compact-block mempool nil)
+            (bl.net::reconstruct-compact-block compact-block mempool nil)
           (declare (ignore partial))
           (is-true block)
           (is (null missing))
-          (is (= (length (bitcoin-lisp.serialization:bitcoin-block-transactions block)) 2)))))))
+          (is (= (length (bl.ser:bitcoin-block-transactions block)) 2)))))))
 
 (test reconstruct-with-missing-txs
   "Reconstruction should return missing indexes when txs not in mempool."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))  ; Empty mempool
-         (header (bitcoin-lisp.serialization:make-block-header
+  (let* ((mempool (bl.mp:make-mempool))  ; Empty mempool
+         (header (bl.ser:make-block-header
                   :version 1
                   :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                   :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                   :timestamp 0
                   :bits #x1d00ffff
                   :nonce 0))
-         (compact-block (bitcoin-lisp.serialization:make-compact-block
+         (compact-block (bl.ser:make-compact-block
                          :header header
                          :nonce 0
                          :short-ids (list #x112233445566 #xaabbccddeeff)
                          :prefilled-txs '())))
     (multiple-value-bind (block missing partial)
-        (bitcoin-lisp.networking::reconstruct-compact-block compact-block mempool nil)
+        (bl.net::reconstruct-compact-block compact-block mempool nil)
       (is (null block))
       (is (equal missing '(0 1)))  ; Both indexes missing
       (is-true partial))))  ; Partial array returned
@@ -203,9 +203,9 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
   "Reconstruction should place prefilled transactions correctly."
   (let* ((coinbase-tx (make-simple-tx #x00))
          (tx1 (make-simple-tx #x11))
-         (txid1 (bitcoin-lisp.serialization:transaction-hash tx1))
+         (txid1 (bl.ser:transaction-hash tx1))
          (mempool (make-mock-mempool-with-txs (list (cons txid1 tx1))))
-         (header (bitcoin-lisp.serialization:make-block-header
+         (header (bl.ser:make-block-header
                   :version 1
                   :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                   :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
@@ -213,25 +213,25 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
                   :bits #x1d00ffff
                   :nonce 0))
          (nonce #x1234567890abcdef)
-         (header-bytes (bitcoin-lisp.serialization:serialize-block-header header)))
+         (header-bytes (bl.ser:serialize-block-header header)))
     (multiple-value-bind (k0 k1)
-        (bitcoin-lisp.crypto:compute-siphash-key header-bytes nonce)
-      (let* ((short-id1 (bitcoin-lisp.crypto:compute-short-txid k0 k1 txid1))
-             (prefilled (bitcoin-lisp.serialization:make-prefilled-tx
+        (bl.crypto:compute-siphash-key header-bytes nonce)
+      (let* ((short-id1 (bl.crypto:compute-short-txid k0 k1 txid1))
+             (prefilled (bl.ser:make-prefilled-tx
                          :index 0
                          :transaction coinbase-tx))
-             (compact-block (bitcoin-lisp.serialization:make-compact-block
+             (compact-block (bl.ser:make-compact-block
                              :header header
                              :nonce nonce
                              :short-ids (list short-id1)
                              :prefilled-txs (list prefilled))))
         (multiple-value-bind (block missing partial)
-            (bitcoin-lisp.networking::reconstruct-compact-block compact-block mempool nil)
+            (bl.net::reconstruct-compact-block compact-block mempool nil)
           (declare (ignore partial))
           (is-true block)
           (is (null missing))
           ;; First tx should be coinbase (prefilled), second should be tx1
-          (is (= (length (bitcoin-lisp.serialization:bitcoin-block-transactions block)) 2)))))))
+          (is (= (length (bl.ser:bitcoin-block-transactions block)) 2)))))))
 
 ;;;; Timeout Handling Tests
 
@@ -239,36 +239,36 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
   "check-compact-block-timeout should clear expired pending state."
   (let ((peer (make-mock-peer)))
     ;; Set up pending state with old timestamp
-    (setf (bitcoin-lisp.networking:peer-pending-compact-block peer)
-          (bitcoin-lisp.networking:make-pending-compact-block
+    (setf (bl.net:peer-pending-compact-block peer)
+          (bl.net:make-pending-compact-block
            :block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xab)
            :request-time (- (get-internal-real-time)
                             (* 20 internal-time-units-per-second))))  ; 20 seconds ago
-    (is (bitcoin-lisp.networking:peer-pending-compact-block peer))
+    (is (bl.net:peer-pending-compact-block peer))
     ;; Check timeout (should clear and request full block)
     ;; Note: This will try to send a message which will fail, but state should clear
     (handler-case
-        (bitcoin-lisp.networking:check-compact-block-timeout peer)
+        (bl.net:check-compact-block-timeout peer)
       (error () nil))
-    (is (null (bitcoin-lisp.networking:peer-pending-compact-block peer)))))
+    (is (null (bl.net:peer-pending-compact-block peer)))))
 
 (test compact-block-timeout-preserves-fresh-pending
   "check-compact-block-timeout should not clear fresh pending state."
   (let ((peer (make-mock-peer)))
     ;; Set up pending state with recent timestamp
-    (setf (bitcoin-lisp.networking:peer-pending-compact-block peer)
-          (bitcoin-lisp.networking:make-pending-compact-block
+    (setf (bl.net:peer-pending-compact-block peer)
+          (bl.net:make-pending-compact-block
            :block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xab)
            :request-time (get-internal-real-time)))  ; Just now
-    (bitcoin-lisp.networking:check-compact-block-timeout peer)
+    (bl.net:check-compact-block-timeout peer)
     ;; Should still have pending state
-    (is (bitcoin-lisp.networking:peer-pending-compact-block peer))))
+    (is (bl.net:peer-pending-compact-block peer))))
 
 ;;;; Metrics Tests
 
 (test compact-block-stats-returns-metrics
   "compact-block-stats should return current metrics."
-  (let ((stats (bitcoin-lisp.networking:compact-block-stats)))
+  (let ((stats (bl.net:compact-block-stats)))
     (is (listp stats))
     (is (member :successes stats))
     (is (member :failures stats))
@@ -279,12 +279,12 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
 (test clear-pending-compact-block
   "clear-pending-compact-block should remove pending state."
   (let ((peer (make-mock-peer)))
-    (setf (bitcoin-lisp.networking:peer-pending-compact-block peer)
-          (bitcoin-lisp.networking:make-pending-compact-block
+    (setf (bl.net:peer-pending-compact-block peer)
+          (bl.net:make-pending-compact-block
            :block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (is (bitcoin-lisp.networking:peer-pending-compact-block peer))
-    (bitcoin-lisp.networking:clear-pending-compact-block peer)
-    (is (null (bitcoin-lisp.networking:peer-pending-compact-block peer)))))
+    (is (bl.net:peer-pending-compact-block peer))
+    (bl.net:clear-pending-compact-block peer)
+    (is (null (bl.net:peer-pending-compact-block peer)))))
 
 ;;;; =============================================================
 ;;;; Compact-block punishment policy (GA8 wave 4)
@@ -310,25 +310,25 @@ message command strings it sent, in order. Restores the real definition under
 UNWIND-PROTECT. Needed because a test peer owns no socket, so the production
 SEND-MESSAGE silently drops everything and would assert nothing."
   (let ((sent '())
-        (real (fdefinition 'bitcoin-lisp.networking:send-message)))
+        (real (fdefinition 'bl.net:send-message)))
     (unwind-protect
          (progn
-           (setf (fdefinition 'bitcoin-lisp.networking:send-message)
+           (setf (fdefinition 'bl.net:send-message)
                  (lambda (peer bytes)
                    (declare (ignore peer))
-                   (push (bitcoin-lisp.serialization:bytes-to-command
+                   (push (bl.ser:bytes-to-command
                           (subseq bytes 4 16))
                          sent)
                    t))
            (funcall thunk))
-      (setf (fdefinition 'bitcoin-lisp.networking:send-message) real))
+      (setf (fdefinition 'bl.net:send-message) real))
     (nreverse sent)))
 
 (defun %cbp-peer (address)
   "A ready, compact-block-v2 peer at ADDRESS. Each punishment test uses its own
 address: the discourage filter is a process-global rolling set."
-  (let ((p (bitcoin-lisp.networking:make-peer :state :ready :address address)))
-    (setf (bitcoin-lisp.networking:peer-compact-block-version p) 2)
+  (let ((p (bl.net:make-peer :state :ready :address address)))
+    (setf (bl.net:peer-compact-block-version p) 2)
     p))
 
 (defun %cbp-hash (byte)
@@ -338,7 +338,7 @@ address: the discourage filter is a process-global rolling set."
   "A regtest-difficulty header on PREV-HASH. Version 4 clears the BIP34/66/65
 gates (BIP34 is active from height 1 on regtest), so the checks under test are
 never pre-empted by :BAD-VERSION. Call inside %WITH-REGTEST."
-  (bitcoin-lisp.serialization:make-block-header
+  (bl.ser:make-block-header
    :version 4
    :prev-block prev-hash
    :merkle-root (%cbp-hash 0)
@@ -351,15 +351,15 @@ never pre-empted by :BAD-VERSION. Call inside %WITH-REGTEST."
 passes roughly half of all nonces, so a fixed nonce would flake ~50% of runs on
 :BAD-PROOF-OF-WORK instead of reaching the check under test. Returns HEADER."
   (loop for nonce from 0 below 500
-        do (setf (bitcoin-lisp.serialization:block-header-nonce header) nonce
-                 (bitcoin-lisp.serialization:block-header-cached-hash header) nil)
-        when (bitcoin-lisp.validation:check-proof-of-work header)
+        do (setf (bl.ser:block-header-nonce header) nonce
+                 (bl.ser:block-header-cached-hash header) nil)
+        when (bl.val:check-proof-of-work header)
           do (return header)
         finally (return header)))
 
 (defun %cbp-payload (compact-block)
   (flexi-streams:with-output-to-sequence (s)
-    (bitcoin-lisp.serialization:write-compact-block s compact-block)))
+    (bl.ser:write-compact-block s compact-block)))
 
 (defun %cbp-state-with-parent (parent-hash parent-timestamp &key (status :valid))
   "A chain-state holding only PARENT-HASH at height 0, with a real header (the
@@ -367,9 +367,9 @@ MTP walk and the difficulty check both dereference it). BEST-BLOCK-HASH stays
 NIL so ACCEPT-DOWNLOADED-BLOCK takes its side-branch path, which is the one
 that consults the parent index entry. STATUS :INVALID makes the parent a block
 we rejected — Core's BLOCK_INVALID_PREV."
-  (let ((state (bitcoin-lisp.storage:make-chain-state)))
-    (bitcoin-lisp.storage:add-block-index-entry
-     state (bitcoin-lisp.storage:make-block-index-entry
+  (let ((state (bl.store:make-chain-state)))
+    (bl.store:add-block-index-entry
+     state (bl.store:make-block-index-entry
             :hash parent-hash :height 0 :chain-work 1 :status status
             :header (%cbp-header (%cbp-hash 0) parent-timestamp)))
     state))
@@ -378,11 +378,11 @@ we rejected — Core's BLOCK_INVALID_PREV."
   "A compact block carrying HEADER, exactly one prefilled transaction and no
 short IDs, so tx-count is 1. PREFILLED-INDEX 0 reconstructs; anything else is
 out of bounds and is Core's READ_STATUS_INVALID."
-  (bitcoin-lisp.serialization:make-compact-block
+  (bl.ser:make-compact-block
    :header header
    :nonce 7
    :short-ids '()
-   :prefilled-txs (list (bitcoin-lisp.serialization:make-prefilled-tx
+   :prefilled-txs (list (bl.ser:make-prefilled-tx
                          :index prefilled-index :transaction tx))))
 
 (defun %cbp-one-tx-compact-block (prev-hash prefilled-index tx)
@@ -396,14 +396,14 @@ BUILD-SHORTID-MAP SipHashes EVERY mempool entry under a key derived from the
 announced header, so it is the per-message cost an unpunished attacker buys.
 The real definition still runs, so nothing downstream is disturbed."
   (let ((calls 0)
-        (real (fdefinition 'bitcoin-lisp.networking::build-shortid-map)))
+        (real (fdefinition 'bl.net::build-shortid-map)))
     (unwind-protect
          (progn
-           (setf (fdefinition 'bitcoin-lisp.networking::build-shortid-map)
+           (setf (fdefinition 'bl.net::build-shortid-map)
                  (lambda (&rest args) (incf calls) (apply real args)))
            (let ((result (funcall thunk)))
              (values result calls)))
-      (setf (fdefinition 'bitcoin-lisp.networking::build-shortid-map) real))))
+      (setf (fdefinition 'bl.net::build-shortid-map) real))))
 
 (test cmpctblock-unknown-parent-asks-for-headers-and-never-punishes
   "GA8 W4 (the finding). A cmpctblock whose PARENT is not in the block index
@@ -421,22 +421,22 @@ block-relay peer. Core answers this shape with MaybeSendGetHeaders and an early
 return, before anything can be scored (net_processing.cpp:4571-4577); its
 BLOCK_MISSING_PREV punishment (:1938-1944) is unreachable via the compact path."
   (%with-regtest
-   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+   (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.41")
           (peer (%cbp-peer addr))
-          (state (bitcoin-lisp.storage:make-chain-state))
-          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (state (bl.store:make-chain-state))
+          (utxo (bl.store:make-utxo-set))
           (cb (%cbp-one-tx-compact-block (%cbp-hash #xAA) 0 (make-simple-tx #x11)))
           (sent (%cbp-capture-sends
                  (lambda ()
-                   (bitcoin-lisp.networking::handle-cmpctblock
+                   (bl.net::handle-cmpctblock
                     peer (%cbp-payload cb) state utxo nil
-                    (bitcoin-lisp.mempool:make-mempool))))))
+                    (bl.mp:make-mempool))))))
      (is (equal '("getheaders") sent)
          "unknown-parent cmpctblock must send exactly one getheaders, sent: ~S" sent)
-     (is-false (bitcoin-lisp.networking:peer-discouraged-p addr)
+     (is-false (bl.net:peer-discouraged-p addr)
                "an honest peer relaying ahead of our headers must not be discouraged")
-     (is (eq :ready (bitcoin-lisp.networking:peer-state peer))))))
+     (is (eq :ready (bl.net:peer-state peer))))))
 
 (test cmpctblock-unknown-parent-sends-no-getheaders-during-ibd
   "GA8 W4. Core gates the unknown-parent getheaders on
@@ -447,25 +447,25 @@ still hold. Without this test the IBD gate is an unasserted clause: the
 unknown-parent test above pins *cached-is-ibd* to NIL and cannot distinguish a
 gated getheaders from an ungated one."
   (%with-regtest
-   (let* ((bitcoin-lisp.networking::*cached-is-ibd* t)
+   (let* ((bl.net::*cached-is-ibd* t)
           (addr "203.0.113.47")
           (peer (%cbp-peer addr))
           ;; No tip at all ⇒ initial-block-download-p stays latched at T.
-          (state (bitcoin-lisp.storage:make-chain-state))
-          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (state (bl.store:make-chain-state))
+          (utxo (bl.store:make-utxo-set))
           (cb (%cbp-one-tx-compact-block (%cbp-hash #xAB) 0 (make-simple-tx #x14)))
           (sent (%cbp-capture-sends
                  (lambda ()
-                   (bitcoin-lisp.networking::handle-cmpctblock
+                   (bl.net::handle-cmpctblock
                     peer (%cbp-payload cb) state utxo nil
-                    (bitcoin-lisp.mempool:make-mempool))))))
-     (is-true bitcoin-lisp.networking::*cached-is-ibd*
+                    (bl.mp:make-mempool))))))
+     (is-true bl.net::*cached-is-ibd*
               "fixture must still be in IBD or this test asserts nothing")
      (is (null sent)
          "no getheaders may be sent for an unknown-parent cmpctblock during IBD, sent: ~S"
          sent)
-     (is-false (bitcoin-lisp.networking:peer-discouraged-p addr))
-     (is (eq :ready (bitcoin-lisp.networking:peer-state peer))))))
+     (is-false (bl.net:peer-discouraged-p addr))
+     (is (eq :ready (bl.net:peer-state peer))))))
 
 (test cmpctblock-invalid-reconstruction-refetches-instead-of-discouraging
   "GA8 W4. When the parent IS known and reconstruction succeeds but the block
@@ -483,30 +483,30 @@ Doubles as the anti-vacuity control for the unknown-parent test above: the
 parent guard must be narrow enough that a KNOWN parent still reaches
 reconstruction -- otherwise this test would see a getheaders here."
   (%with-regtest
-   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
-          (bitcoin-lisp.networking::*compact-block-success-count* 0)
-          (bitcoin-lisp.networking::*compact-block-failure-count* 0)
+   (let* ((bl.net::*cached-is-ibd* nil)
+          (bl.net::*compact-block-success-count* 0)
+          (bl.net::*compact-block-failure-count* 0)
           (addr "203.0.113.42")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA1))
           (state (%cbp-state-with-parent parent 1296688600))
-          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (utxo (bl.store:make-utxo-set))
           ;; The single prefilled transaction is NOT a coinbase: reconstruction
           ;; succeeds, then validate-block rejects with :FIRST-TX-NOT-COINBASE.
           (cb (%cbp-one-tx-compact-block parent 0 (make-simple-tx #x12)))
           (sent (%cbp-capture-sends
                  (lambda ()
-                   (bitcoin-lisp.networking::handle-cmpctblock
+                   (bl.net::handle-cmpctblock
                     peer (%cbp-payload cb) state utxo nil
-                    (bitcoin-lisp.mempool:make-mempool))))))
-     (is (= 1 bitcoin-lisp.networking::*compact-block-success-count*)
+                    (bl.mp:make-mempool))))))
+     (is (= 1 bl.net::*compact-block-success-count*)
          "the compact block must have been reconstructed (parent guard too broad?)")
      (is (equal '("getdata") sent)
          "an invalid reconstruction must be refetched in full, sent: ~S" sent)
-     (is (= 1 bitcoin-lisp.networking::*compact-block-failure-count*))
-     (is-false (bitcoin-lisp.networking:peer-discouraged-p addr)
+     (is (= 1 bl.net::*compact-block-failure-count*))
+     (is-false (bl.net:peer-discouraged-p addr)
                "a compact block that fails validation must not discourage its sender")
-     (is (eq :ready (bitcoin-lisp.networking:peer-state peer))))))
+     (is (eq :ready (bl.net:peer-state peer))))))
 
 (test cmpctblock-structurally-malformed-still-punishes
   "GA8 W4 control: removing the punishment for INVALID blocks must not remove
@@ -517,22 +517,22 @@ produce it. Before this change our reconstruction reported it as :COLLISION,
 i.e. the same value as an innocent short-ID clash in our own mempool, so it got
 a polite full-block getdata instead."
   (%with-regtest
-   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+   (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.43")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA2))
           (state (%cbp-state-with-parent parent 1296688600))
-          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (utxo (bl.store:make-utxo-set))
           ;; tx-count = 1 (one prefilled, no short IDs), prefilled index 3.
           (cb (%cbp-one-tx-compact-block parent 3 (make-simple-tx #x13)))
           (sent (%cbp-capture-sends
                  (lambda ()
-                   (bitcoin-lisp.networking::handle-cmpctblock
+                   (bl.net::handle-cmpctblock
                     peer (%cbp-payload cb) state utxo nil
-                    (bitcoin-lisp.mempool:make-mempool))))))
-     (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+                    (bl.mp:make-mempool))))))
+     (is-true (bl.net:peer-discouraged-p addr)
               "a structurally malformed cmpctblock must still discourage the sender")
-     (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+     (is (eq :disconnected (bl.net:peer-state peer)))
      (is (null sent)
          "a malformed message must not earn a full-block refetch, sent: ~S" sent))))
 
@@ -545,10 +545,10 @@ right above it), so it gets a full-block refetch, not a discouragement."
    (let* ((addr "203.0.113.44")
           (peer (%cbp-peer addr))
           (block-hash (%cbp-hash #xB1))
-          (state (bitcoin-lisp.storage:make-chain-state))
-          (utxo (bitcoin-lisp.storage:make-utxo-set)))
-     (setf (bitcoin-lisp.networking:peer-pending-compact-block peer)
-           (bitcoin-lisp.networking:make-pending-compact-block
+          (state (bl.store:make-chain-state))
+          (utxo (bl.store:make-utxo-set)))
+     (setf (bl.net:peer-pending-compact-block peer)
+           (bl.net:make-pending-compact-block
             :block-hash block-hash
             ;; Parent unknown => ACCEPT-DOWNLOADED-BLOCK returns :ORPHAN-BLOCK,
             ;; which is precisely the verdict that used to exile the peer.
@@ -559,17 +559,17 @@ right above it), so it gets a full-block refetch, not a discouragement."
             :use-wtxid t))
      (let ((sent (%cbp-capture-sends
                   (lambda ()
-                    (bitcoin-lisp.networking::handle-blocktxn
+                    (bl.net::handle-blocktxn
                      peer
-                     (subseq (bitcoin-lisp.serialization:make-blocktxn-message
+                     (subseq (bl.ser:make-blocktxn-message
                               block-hash (list (make-simple-tx #x21)))
                              24)
-                     state utxo nil (bitcoin-lisp.mempool:make-mempool))))))
+                     state utxo nil (bl.mp:make-mempool))))))
        (is (equal '("getdata") sent)
            "an invalid completed block must be refetched in full, sent: ~S" sent)
-       (is-false (bitcoin-lisp.networking:peer-discouraged-p addr)
+       (is-false (bl.net:peer-discouraged-p addr)
                  "a completed compact block that fails validation must not discourage")
-       (is (eq :ready (bitcoin-lisp.networking:peer-state peer)))))))
+       (is (eq :ready (bl.net:peer-state peer)))))))
 
 (test blocktxn-non-matching-transaction-count-punishes
   "GA8 W4 control for the blocktxn side: a blocktxn that does not answer the
@@ -581,10 +581,10 @@ Previously we treated it as a mere reconstruction miss and sent a getdata."
    (let* ((addr "203.0.113.45")
           (peer (%cbp-peer addr))
           (block-hash (%cbp-hash #xB2))
-          (state (bitcoin-lisp.storage:make-chain-state))
-          (utxo (bitcoin-lisp.storage:make-utxo-set)))
-     (setf (bitcoin-lisp.networking:peer-pending-compact-block peer)
-           (bitcoin-lisp.networking:make-pending-compact-block
+          (state (bl.store:make-chain-state))
+          (utxo (bl.store:make-utxo-set)))
+     (setf (bl.net:peer-pending-compact-block peer)
+           (bl.net:make-pending-compact-block
             :block-hash block-hash
             :header (%cbp-grind (%cbp-header (%cbp-hash #xBC) 1296688700))
             :transactions (make-array 2 :initial-element nil)
@@ -593,16 +593,16 @@ Previously we treated it as a mere reconstruction miss and sent a getdata."
             :use-wtxid t))
      (let ((sent (%cbp-capture-sends
                   (lambda ()
-                    (bitcoin-lisp.networking::handle-blocktxn
+                    (bl.net::handle-blocktxn
                      peer
-                     (subseq (bitcoin-lisp.serialization:make-blocktxn-message
+                     (subseq (bl.ser:make-blocktxn-message
                               block-hash (list (make-simple-tx #x22)))  ; got ONE
                              24)
-                     state utxo nil (bitcoin-lisp.mempool:make-mempool))))))
-       (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+                     state utxo nil (bl.mp:make-mempool))))))
+       (is-true (bl.net:peer-discouraged-p addr)
                 "a non-matching blocktxn must discourage the sender")
-       (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
-       (is (null (bitcoin-lisp.networking:peer-pending-compact-block peer)))
+       (is (eq :disconnected (bl.net:peer-state peer)))
+       (is (null (bl.net:peer-pending-compact-block peer)))
        (is (null sent)
            "a malformed blocktxn must not earn a full-block refetch, sent: ~S" sent)))))
 
@@ -618,17 +618,17 @@ not mutation evidence."
   (%with-regtest
    (let* ((addr "203.0.113.46")
           (peer (%cbp-peer addr))
-          (state (bitcoin-lisp.storage:make-chain-state))
-          (utxo (bitcoin-lisp.storage:make-utxo-set))
-          (blk (bitcoin-lisp.serialization:make-bitcoin-block
+          (state (bl.store:make-chain-state))
+          (utxo (bl.store:make-utxo-set))
+          (blk (bl.ser:make-bitcoin-block
                 :header (%cbp-grind (%cbp-header (%cbp-hash #xCC) 1296688700))
                 :transactions (list (make-simple-tx #x31)))))
-     (bitcoin-lisp.networking::handle-block
-      peer (subseq (bitcoin-lisp.serialization:make-block-message blk) 24)
+     (bl.net::handle-block
+      peer (subseq (bl.ser:make-block-message blk) 24)
       state utxo nil)
-     (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+     (is-true (bl.net:peer-discouraged-p addr)
               "the BLOCK path must keep punishing :ORPHAN-BLOCK (Core parity)")
-     (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer))))))
+     (is (eq :disconnected (bl.net:peer-state peer))))))
 
 ;;;; ====================================================================
 ;;;; Per-reason punishment on the compact path (GA8 W4, review finding on #326)
@@ -655,8 +655,8 @@ target is far BELOW the regtest pow limit, so DERIVE-TARGET accepts the bits and
 the hash then misses the target with overwhelming probability — Core's high-hash,
 BLOCK_INVALID_HEADER (validation.cpp:3864). Each test asserts the miss."
   (let ((h (%cbp-header prev-hash 1296688700)))
-    (setf (bitcoin-lisp.serialization:block-header-bits h) #x1d00ffff
-          (bitcoin-lisp.serialization:block-header-cached-hash h) nil)
+    (setf (bl.ser:block-header-bits h) #x1d00ffff
+          (bl.ser:block-header-cached-hash h) nil)
     h))
 
 (test cmpctblock-invalid-header-punishes-and-never-hashes-the-mempool
@@ -671,19 +671,19 @@ mempool entry under a key derived from the attacker's own header+nonce, so it
 must happen only after the header is known good. The valid-header control at the
 end proves the counter is wired to something real (it goes to exactly 1)."
   (%with-regtest
-   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
-          (bitcoin-lisp.networking::*compact-block-success-count* 0)
-          (bitcoin-lisp.networking::*compact-block-failure-count* 0)
+   (let* ((bl.net::*cached-is-ibd* nil)
+          (bl.net::*compact-block-success-count* 0)
+          (bl.net::*compact-block-failure-count* 0)
           (addr "203.0.113.48")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA4))
           (state (%cbp-state-with-parent parent 1296688600))
-          (utxo (bitcoin-lisp.storage:make-utxo-set))
-          (mempool (bitcoin-lisp.mempool:make-mempool))
+          (utxo (bl.store:make-utxo-set))
+          (mempool (bl.mp:make-mempool))
           (hdr (%cbp-bad-pow-header parent))
           (cb (%cbp-one-tx-compact-block-with-header hdr 0 (make-simple-tx #x41)))
           (payload (%cbp-payload cb)))
-     (is-false (bitcoin-lisp.validation:check-proof-of-work hdr)
+     (is-false (bl.val:check-proof-of-work hdr)
                "fixture must actually fail PoW or this test asserts nothing")
      (multiple-value-bind (sent passes)
          (%cbp-count-shortid-passes
@@ -691,17 +691,17 @@ end proves the counter is wired to something real (it goes to exactly 1)."
             (%cbp-capture-sends
              (lambda ()
                (dotimes (i 5)
-                 (bitcoin-lisp.networking::handle-cmpctblock
+                 (bl.net::handle-cmpctblock
                   peer payload state utxo nil mempool))))))
-       (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+       (is-true (bl.net:peer-discouraged-p addr)
                 "an invalid-PoW cmpctblock header must discourage its sender (Core BLOCK_INVALID_HEADER)")
-       (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+       (is (eq :disconnected (bl.net:peer-state peer)))
        (is (null sent)
            "an invalid header must not earn a getdata or a getheaders, sent: ~S" sent)
        (is (zerop passes)
            "5 replays hashed the mempool ~D times; an invalid header must be rejected before BUILD-SHORTID-MAP"
            passes)
-       (is (zerop bitcoin-lisp.networking::*compact-block-success-count*)
+       (is (zerop bl.net::*compact-block-success-count*)
            "no reconstruction may be attempted for a header we reject"))
      ;; Control: the counter seam is real. A well-formed header on the same
      ;; parent DOES reach reconstruction, hashing the mempool exactly once.
@@ -712,13 +712,13 @@ end proves the counter is wired to something real (it goes to exactly 1)."
             (lambda ()
               (%cbp-capture-sends
                (lambda ()
-                 (bitcoin-lisp.networking::handle-cmpctblock
+                 (bl.net::handle-cmpctblock
                   ok-peer (%cbp-payload ok-cb) state utxo nil mempool)))))
          (is (= 1 passes)
              "control: a valid header must still reach BUILD-SHORTID-MAP, passes: ~D" passes)
          (is (equal '("getdata") sent)
              "control: a consensus-invalid reconstruction is still refetched, sent: ~S" sent)
-         (is-false (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.49")
+         (is-false (bl.net:peer-discouraged-p "203.0.113.49")
                    "control: the honest-peer exemption must survive this fix"))))))
 
 (test cmpctblock-stale-timestamp-header-punishes
@@ -727,29 +727,29 @@ fix that special-cased PoW would be a different bug. A timestamp at or below the
 median-time-past is Core's time-too-old (validation.cpp:4125): same arm, same
 unconditional Misbehaving. The header's PoW is mined, so nothing pre-empts it."
   (%with-regtest
-   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+   (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.50")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA5))
           ;; The parent's timestamp is the whole MTP window here, so a header
           ;; timestamped 1296688500 is <= MTP.
           (state (%cbp-state-with-parent parent 1296688600))
-          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (utxo (bl.store:make-utxo-set))
           (hdr (%cbp-grind (%cbp-header parent 1296688500)))
           (cb (%cbp-one-tx-compact-block-with-header hdr 0 (make-simple-tx #x43))))
-     (is-true (bitcoin-lisp.validation:check-proof-of-work hdr)
+     (is-true (bl.val:check-proof-of-work hdr)
               "fixture must pass PoW or it would test the wrong arm")
      (multiple-value-bind (sent passes)
          (%cbp-count-shortid-passes
           (lambda ()
             (%cbp-capture-sends
              (lambda ()
-               (bitcoin-lisp.networking::handle-cmpctblock
+               (bl.net::handle-cmpctblock
                 peer (%cbp-payload cb) state utxo nil
-                (bitcoin-lisp.mempool:make-mempool))))))
-       (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+                (bl.mp:make-mempool))))))
+       (is-true (bl.net:peer-discouraged-p addr)
                 "a time-too-old cmpctblock header must discourage its sender")
-       (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+       (is (eq :disconnected (bl.net:peer-state peer)))
        (is (null sent) "sent: ~S" sent)
        (is (zerop passes) "passes: ~D" passes)))))
 
@@ -758,24 +758,24 @@ unconditional Misbehaving. The header's PoW is mined, so nothing pre-empts it."
 is Core's bad-prevblk (validation.cpp:4251-4255), the arm right beside
 BLOCK_INVALID_HEADER and equally exempt from the via_compact_block amnesty."
   (%with-regtest
-   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+   (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.51")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA6))
           (state (%cbp-state-with-parent parent 1296688600 :status :invalid))
-          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (utxo (bl.store:make-utxo-set))
           (cb (%cbp-one-tx-compact-block parent 0 (make-simple-tx #x44))))
      (multiple-value-bind (sent passes)
          (%cbp-count-shortid-passes
           (lambda ()
             (%cbp-capture-sends
              (lambda ()
-               (bitcoin-lisp.networking::handle-cmpctblock
+               (bl.net::handle-cmpctblock
                 peer (%cbp-payload cb) state utxo nil
-                (bitcoin-lisp.mempool:make-mempool))))))
-       (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+                (bl.mp:make-mempool))))))
+       (is-true (bl.net:peer-discouraged-p addr)
                 "a cmpctblock extending a known-invalid block must discourage its sender")
-       (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+       (is (eq :disconnected (bl.net:peer-state peer)))
        (is (null sent) "sent: ~S" sent)
        (is (zerop passes) "passes: ~D" passes)))))
 
@@ -788,29 +788,29 @@ getdata would deliver the same block on the BLOCK path, where HANDLE-BLOCK
 punishes unconditionally, converting Core's no-op into an exile one message
 later."
   (%with-regtest
-   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+   (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.52")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA7))
           (state (%cbp-state-with-parent parent 1296688600))
-          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (utxo (bl.store:make-utxo-set))
           ;; +3h: past Core's MAX_FUTURE_BLOCK_TIME of 2h.
-          (hdr (%cbp-grind (%cbp-header parent (+ (bitcoin-lisp.serialization:get-unix-time)
+          (hdr (%cbp-grind (%cbp-header parent (+ (bl.ser:get-unix-time)
                                                   10800))))
           (cb (%cbp-one-tx-compact-block-with-header hdr 0 (make-simple-tx #x45))))
-     (is-true (bitcoin-lisp.validation:check-proof-of-work hdr)
+     (is-true (bl.val:check-proof-of-work hdr)
               "fixture must pass PoW or it would test the wrong arm")
      (multiple-value-bind (sent passes)
          (%cbp-count-shortid-passes
           (lambda ()
             (%cbp-capture-sends
              (lambda ()
-               (bitcoin-lisp.networking::handle-cmpctblock
+               (bl.net::handle-cmpctblock
                 peer (%cbp-payload cb) state utxo nil
-                (bitcoin-lisp.mempool:make-mempool))))))
-       (is-false (bitcoin-lisp.networking:peer-discouraged-p addr)
+                (bl.mp:make-mempool))))))
+       (is-false (bl.net:peer-discouraged-p addr)
                  "BLOCK_TIME_FUTURE must not discourage (our clock, not their fault)")
-       (is (eq :ready (bitcoin-lisp.networking:peer-state peer)))
+       (is (eq :ready (bl.net:peer-state peer)))
        (is (null sent)
            "a future-timestamped block must not be refetched either, sent: ~S" sent)
        (is (zerop passes) "passes: ~D" passes)))))
@@ -822,30 +822,30 @@ invalid. Core exempts it whenever via_compact_block is true
 re-downloading a block we have already rejected is a self-inflicted DoS. Checked
 before the parent lookup, mirroring AcceptBlockHeader (validation.cpp:4229-4237)."
   (%with-regtest
-   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+   (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.53")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA8))
           (state (%cbp-state-with-parent parent 1296688600))
-          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (utxo (bl.store:make-utxo-set))
           (cb (%cbp-one-tx-compact-block parent 0 (make-simple-tx #x46)))
-          (block-hash (bitcoin-lisp.serialization:block-header-hash
-                       (bitcoin-lisp.serialization:compact-block-header cb))))
-     (bitcoin-lisp.storage:add-block-index-entry
-      state (bitcoin-lisp.storage:make-block-index-entry
+          (block-hash (bl.ser:block-header-hash
+                       (bl.ser:compact-block-header cb))))
+     (bl.store:add-block-index-entry
+      state (bl.store:make-block-index-entry
              :hash block-hash :height 1 :chain-work 2 :status :invalid
-             :header (bitcoin-lisp.serialization:compact-block-header cb)))
+             :header (bl.ser:compact-block-header cb)))
      (multiple-value-bind (sent passes)
          (%cbp-count-shortid-passes
           (lambda ()
             (%cbp-capture-sends
              (lambda ()
-               (bitcoin-lisp.networking::handle-cmpctblock
+               (bl.net::handle-cmpctblock
                 peer (%cbp-payload cb) state utxo nil
-                (bitcoin-lisp.mempool:make-mempool))))))
-       (is-false (bitcoin-lisp.networking:peer-discouraged-p addr)
+                (bl.mp:make-mempool))))))
+       (is-false (bl.net:peer-discouraged-p addr)
                  "BLOCK_CACHED_INVALID is exempt for compact-block senders")
-       (is (eq :ready (bitcoin-lisp.networking:peer-state peer)))
+       (is (eq :ready (bl.net:peer-state peer)))
        (is (null sent)
            "a block we already rejected must not be re-requested, sent: ~S" sent)
        (is (zerop passes) "passes: ~D" passes)))))
@@ -855,7 +855,7 @@ before the parent lookup, mirroring AcceptBlockHeader (validation.cpp:4229-4237)
 with via_compact_block=true (net_processing.cpp:1908-1950). Both handlers are
 thin wrappers over this, so a wrong entry here is either an unpunished attack or
 an exiled honest peer."
-  (flet ((action (reason) (bitcoin-lisp.networking::compact-block-failure-action reason)))
+  (flet ((action (reason) (bl.net::compact-block-failure-action reason)))
     ;; BLOCK_INVALID_HEADER (validation.cpp:3864/4121/4125/4134/4148).
     (dolist (reason '(:bad-proof-of-work :bad-difficulty :time-too-old
                       :time-timewarp-attack :bad-version))
@@ -883,19 +883,19 @@ an exiled honest peer."
 ;;;; ============================================================
 
 (defun %g716-peer (&key inbound (version 2))
-  (let ((p (bitcoin-lisp.networking::make-peer :inbound inbound)))
-    (setf (bitcoin-lisp.networking::peer-compact-block-version p) version
-          (bitcoin-lisp.networking::peer-state p) :ready)
+  (let ((p (bl.net::make-peer :inbound inbound)))
+    (setf (bl.net::peer-compact-block-version p) version
+          (bl.net::peer-state p) :ready)
     p))
 
 (defmacro %g716-quiet (&body body)
   "Run BODY with send-message stubbed out (no sockets)."
-  `(let ((real (fdefinition 'bitcoin-lisp.networking::send-message)))
+  `(let ((real (fdefinition 'bl.net::send-message)))
      (unwind-protect
-          (progn (setf (fdefinition 'bitcoin-lisp.networking::send-message)
+          (progn (setf (fdefinition 'bl.net::send-message)
                        (lambda (peer msg) (declare (ignore peer msg)) t))
                  ,@body)
-       (setf (fdefinition 'bitcoin-lisp.networking::send-message) real))))
+       (setf (fdefinition 'bl.net::send-message) real))))
 
 (test g7-16-initial-sendcmpct-is-low-bandwidth
   "G7-16: high bandwidth is a SCARCE SELECTION (BIP152 allows 3), not a
@@ -904,13 +904,13 @@ every one of them pushed an unsolicited cmpctblock for every block instead of
 about three."
   (let ((sent '())
         (peer (%g716-peer)))
-    (let ((real (fdefinition 'bitcoin-lisp.networking::send-message)))
+    (let ((real (fdefinition 'bl.net::send-message)))
       (unwind-protect
            (progn
-             (setf (fdefinition 'bitcoin-lisp.networking::send-message)
+             (setf (fdefinition 'bl.net::send-message)
                    (lambda (p msg) (declare (ignore p)) (push msg sent)))
-             (bitcoin-lisp.networking::send-compact-block-negotiation peer))
-        (setf (fdefinition 'bitcoin-lisp.networking::send-message) real)))
+             (bl.net::send-compact-block-negotiation peer))
+        (setf (fdefinition 'bl.net::send-message) real)))
     (is (= 1 (length sent)))
     ;; Assert on the ACTUAL sendcmpct byte on the wire, and on the peer that
     ;; was negotiated — checking a fresh peer's default-NIL flag would pass no
@@ -918,7 +918,7 @@ about three."
     (let ((payload (subseq (first sent) 24)))
       (is (zerop (aref payload 0))
           "the high-bandwidth byte of the initial sendcmpct must be 0"))
-    (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to peer))
+    (is (null (bl.net::peer-compact-block-high-bandwidth-to peer))
         "negotiation must not mark the peer HB")))
 
 (test g7-16-hb-selection-capped-at-three-demoting-oldest
@@ -926,22 +926,22 @@ about three."
 lNodesAnnouncingHeaderAndIDs). A peer already selected is only moved to the
 back with NO sendcmpct re-sent — re-announcing every block would be a visible
 protocol anomaly."
-  (let ((bitcoin-lisp.networking::*hb-announcing-peers* '()))
+  (let ((bl.net::*hb-announcing-peers* '()))
     (%g716-quiet
       (let ((a (%g716-peer)) (b (%g716-peer)) (c (%g716-peer)) (d (%g716-peer)))
         (dolist (p (list a b c))
-          (bitcoin-lisp.networking:maybe-set-peer-announcing-hb p))
-        (is (equal (list a b c) bitcoin-lisp.networking::*hb-announcing-peers*))
-        (is (every #'bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to
+          (bl.net:maybe-set-peer-announcing-hb p))
+        (is (equal (list a b c) bl.net::*hb-announcing-peers*))
+        (is (every #'bl.net::peer-compact-block-high-bandwidth-to
                    (list a b c)))
         ;; Re-selecting an existing peer only reorders it.
-        (bitcoin-lisp.networking:maybe-set-peer-announcing-hb a)
-        (is (equal (list b c a) bitcoin-lisp.networking::*hb-announcing-peers*)
+        (bl.net:maybe-set-peer-announcing-hb a)
+        (is (equal (list b c a) bl.net::*hb-announcing-peers*)
             "an already-selected peer moves to the back")
         ;; A fourth peer evicts the oldest (now b).
-        (bitcoin-lisp.networking:maybe-set-peer-announcing-hb d)
-        (is (equal (list c a d) bitcoin-lisp.networking::*hb-announcing-peers*))
-        (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to b))
+        (bl.net:maybe-set-peer-announcing-hb d)
+        (is (equal (list c a d) bl.net::*hb-announcing-peers*))
+        (is (null (bl.net::peer-compact-block-high-bandwidth-to b))
             "the evicted peer must be demoted to low bandwidth")))))
 
 (test g7-16-inbound-promotion-protects-last-outbound-hb-peer
@@ -952,7 +952,7 @@ front, Core swaps the first two so the outbound HB peer is not evicted.
 Without it a flood of inbound peers evicts every outbound HB peer in turn — an
 eclipse/partition weakening, and the same class of ordering mistake as trimming
 the wrong end of the reorg disconnect pool."
-  (let ((bitcoin-lisp.networking::*hb-announcing-peers* '()))
+  (let ((bl.net::*hb-announcing-peers* '()))
     (%g716-quiet
       (let ((out (%g716-peer))
             (in1 (%g716-peer :inbound t))
@@ -960,24 +960,24 @@ the wrong end of the reorg disconnect pool."
             (in3 (%g716-peer :inbound t)))
         ;; Outbound peer is at the FRONT and is the only outbound entry.
         (dolist (p (list out in1 in2))
-          (bitcoin-lisp.networking:maybe-set-peer-announcing-hb p))
-        (is (equal (list out in1 in2) bitcoin-lisp.networking::*hb-announcing-peers*))
+          (bl.net:maybe-set-peer-announcing-hb p))
+        (is (equal (list out in1 in2) bl.net::*hb-announcing-peers*))
         ;; Promoting another inbound peer must NOT evict the lone outbound one.
-        (bitcoin-lisp.networking:maybe-set-peer-announcing-hb in3)
-        (is (member out bitcoin-lisp.networking::*hb-announcing-peers*)
+        (bl.net:maybe-set-peer-announcing-hb in3)
+        (is (member out bl.net::*hb-announcing-peers*)
             "the last outbound HB peer must be protected from inbound eviction")
-        (is-true (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to out))
-        (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to in1))
+        (is-true (bl.net::peer-compact-block-high-bandwidth-to out))
+        (is (null (bl.net::peer-compact-block-high-bandwidth-to in1))
             "the inbound peer in slot 1 is evicted instead")))))
 
 (test g7-16-non-signalling-and-blocksonly-peers-not-promoted
   "Core gates promotion on m_provides_cmpctblocks and skips it entirely in
 blocksonly mode — our mempool would not hold the transactions needed to
 reconstruct the block."
-  (let ((bitcoin-lisp.networking::*hb-announcing-peers* '()))
+  (let ((bl.net::*hb-announcing-peers* '()))
     (%g716-quiet
-      (bitcoin-lisp.networking:maybe-set-peer-announcing-hb (%g716-peer :version 0))
-      (is (null bitcoin-lisp.networking::*hb-announcing-peers*)
+      (bl.net:maybe-set-peer-announcing-hb (%g716-peer :version 0))
+      (is (null bl.net::*hb-announcing-peers*)
           "a peer that never signalled compact-block support is not eligible"))))
 
 (test g7-16-disconnected-hb-peer-neither-counts-nor-squats
@@ -993,39 +993,39 @@ LIVE inbound HB peer to defend a corpse. Both halves below run the SAME
 promotion; only the liveness of `out' differs, and it must flip the outcome."
   (%g716-quiet
     ;; CONTROL — `out' is alive: the protection swap fires, in1 is evicted.
-    (let ((bitcoin-lisp.networking::*hb-announcing-peers* '()))
+    (let ((bl.net::*hb-announcing-peers* '()))
       (let ((out (%g716-peer))
             (in1 (%g716-peer :inbound t))
             (in2 (%g716-peer :inbound t))
             (in3 (%g716-peer :inbound t)))
         (dolist (p (list out in1 in2))
-          (bitcoin-lisp.networking:maybe-set-peer-announcing-hb p))
-        (bitcoin-lisp.networking:maybe-set-peer-announcing-hb in3)
-        (is (equal (list out in2 in3) bitcoin-lisp.networking::*hb-announcing-peers*)
+          (bl.net:maybe-set-peer-announcing-hb p))
+        (bl.net:maybe-set-peer-announcing-hb in3)
+        (is (equal (list out in2 in3) bl.net::*hb-announcing-peers*)
             "control: a LIVE lone outbound HB peer is protected, in1 is evicted")
-        (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to in1)))))
+        (is (null (bl.net::peer-compact-block-high-bandwidth-to in1)))))
     ;; FIX — identical shape, but `out' goes away through the production
     ;; disconnect path first. Nothing calls into the HB code on disconnect: the
     ;; list's only reader re-reads liveness, so it does not matter WHICH of the
     ;; several paths that kill a peer (disconnect-peer, record-misbehavior,
     ;; ban-peer) got there.
-    (let ((bitcoin-lisp.networking::*hb-announcing-peers* '()))
+    (let ((bl.net::*hb-announcing-peers* '()))
       (let ((out (%g716-peer))
             (in1 (%g716-peer :inbound t))
             (in2 (%g716-peer :inbound t))
             (in3 (%g716-peer :inbound t)))
         (dolist (p (list out in1 in2))
-          (bitcoin-lisp.networking:maybe-set-peer-announcing-hb p))
-        (bitcoin-lisp.networking:disconnect-peer out)
-        (bitcoin-lisp.networking:maybe-set-peer-announcing-hb in3)
-        (is (equal (list in1 in2 in3) bitcoin-lisp.networking::*hb-announcing-peers*)
+          (bl.net:maybe-set-peer-announcing-hb p))
+        (bl.net:disconnect-peer out)
+        (bl.net:maybe-set-peer-announcing-hb in3)
+        (is (equal (list in1 in2 in3) bl.net::*hb-announcing-peers*)
             "a dead peer must not be counted as outbound, protected, or kept")
-        (is (null (member out bitcoin-lisp.networking::*hb-announcing-peers*))
+        (is (null (member out bl.net::*hb-announcing-peers*))
             "the dead peer's slot must be reclaimed, not squatted")
-        (is-true (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to in1)
+        (is-true (bl.net::peer-compact-block-high-bandwidth-to in1)
                  "a LIVE inbound HB peer must not be evicted to defend a corpse")
-        (is (= 3 (count-if #'bitcoin-lisp.networking::%hb-peer-live-p
-                           bitcoin-lisp.networking::*hb-announcing-peers*))
+        (is (= 3 (count-if #'bl.net::%hb-peer-live-p
+                           bl.net::*hb-announcing-peers*))
             "all three slots hold peers that can actually announce")))))
 
 ;;;; ------------------------------------------------------------
@@ -1035,11 +1035,11 @@ promotion; only the liveness of `out' differs, and it must flip the outcome."
 (defun %g716-mine-on (node spk)
   "Assemble + PoW-mine a block on NODE's tip paying the coinbase to SPK,
 without connecting it."
-  (let ((blk (bitcoin-lisp.mining:assemble-full-block
-              (bitcoin-lisp::node-chain-state node)
-              (bitcoin-lisp::node-mempool node)
+  (let ((blk (bl.mining:assemble-full-block
+              (bl::node-chain-state node)
+              (bl::node-mempool node)
               :coinbase-script-pubkey spk)))
-    (bitcoin-lisp.mining:mine-block blk)
+    (bl.mining:mine-block blk)
     blk))
 
 (defun %g716-cmpctblock-payload (block)
@@ -1052,43 +1052,43 @@ serializes prefilled txs with WRITE-TRANSACTION — legacy, witness-stripped —
 which drops the coinbase witness nonce and makes every reconstructed block fail
 BIP141. It has no production caller (we parse cmpctblock, we never emit one),
 so it is a latent bug in the emitter rather than one this test can assert on."
-  (let ((txs (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+  (let ((txs (bl.ser:bitcoin-block-transactions block)))
     (flexi-streams:with-output-to-sequence (s)
-      (bitcoin-lisp.serialization::write-block-header
-       s (bitcoin-lisp.serialization:bitcoin-block-header block))
-      (bitcoin-lisp.serialization:write-uint64-le s 0)     ; short-id nonce
-      (bitcoin-lisp.serialization:write-compact-size s 0)  ; no short ids
-      (bitcoin-lisp.serialization:write-compact-size s (length txs))
+      (bl.ser::write-block-header
+       s (bl.ser:bitcoin-block-header block))
+      (bl.ser:write-uint64-le s 0)     ; short-id nonce
+      (bl.ser:write-compact-size s 0)  ; no short ids
+      (bl.ser:write-compact-size s (length txs))
       (dolist (tx txs)
         ;; Differential index: consecutive prefilled txs all encode as 0.
-        (bitcoin-lisp.serialization:write-compact-size s 0)
-        (if (bitcoin-lisp.serialization:transaction-has-witness-p tx)
-            (bitcoin-lisp.serialization::write-witness-transaction s tx)
-            (bitcoin-lisp.serialization::write-transaction s tx))))))
+        (bl.ser:write-compact-size s 0)
+        (if (bl.ser:transaction-has-witness-p tx)
+            (bl.ser::write-witness-transaction s tx)
+            (bl.ser::write-transaction s tx))))))
 
 (defun %g716-block-payload (block)
   "The wire payload of a plain `block' message carrying BLOCK."
-  (subseq (bitcoin-lisp.serialization:make-block-message block :witness t) 24))
+  (subseq (bl.ser:make-block-message block :witness t) 24))
 
 (defun %g716-corrupt-block (block)
   "BLOCK's header (valid PoW, parent = our tip) over a bogus transaction list:
 reconstruction/parsing still succeed, validation fails on the merkle root. The
 shape an attacker uses to buy an HB slot with a block we will never connect."
-  (bitcoin-lisp.serialization:make-bitcoin-block
-   :header (bitcoin-lisp.serialization:bitcoin-block-header block)
+  (bl.ser:make-bitcoin-block
+   :header (bl.ser:bitcoin-block-header block)
    :transactions (list (make-simple-tx #x99))))
 
 (defun %g716-delivering-peer (address)
   (let ((p (%g716-peer)))
-    (setf (bitcoin-lisp.networking:peer-address p) address)
+    (setf (bl.net:peer-address p) address)
     p))
 
 (defmacro %g716-with-fresh-hb (&body body)
   "Run BODY with an empty HB set and IBD latched off — maybe-promote-block-
 deliverer skips everything during IBD, so a test that left it on would pass
 whatever the promotion code did."
-  `(let ((bitcoin-lisp.networking::*hb-announcing-peers* '())
-         (bitcoin-lisp.networking::*cached-is-ibd* nil))
+  `(let ((bl.net::*hb-announcing-peers* '())
+         (bl.net::*cached-is-ibd* nil))
      ,@body))
 
 (test g7-16-compact-block-promotes-only-after-the-block-validates
@@ -1099,34 +1099,34 @@ delivered a reconstructible-but-INVALID compact block bought an HB slot — and
 through the cap-of-3 eviction could demote an honest HB peer at will."
   (%with-regtest
    (let* ((node (%regtest-node-fixture "g716-cb"))
-          (cs (bitcoin-lisp::node-chain-state node))
-          (utxo (bitcoin-lisp::node-utxo-set node))
-          (store (bitcoin-lisp::node-block-store node))
-          (mp (bitcoin-lisp::node-mempool node))
+          (cs (bl::node-chain-state node))
+          (utxo (bl::node-utxo-set node))
+          (store (bl::node-block-store node))
+          (mp (bl::node-mempool node))
           (good (%g716-mine-on node (%p2sh-optrue-spk)))
           (bad (%g716-corrupt-block good)))
      (%g716-quiet
        ;; DEFECT: an invalid delivery earns nothing.
        (%g716-with-fresh-hb
         (let ((peer (%g716-delivering-peer "198.51.100.16")))
-          (bitcoin-lisp.networking::handle-cmpctblock
+          (bl.net::handle-cmpctblock
            peer (%g716-cmpctblock-payload bad) cs utxo store mp)
-          (is (= 0 (bitcoin-lisp.storage:current-height cs))
+          (is (= 0 (bl.store:current-height cs))
               "the bogus block must not have connected")
-          (is (null bitcoin-lisp.networking::*hb-announcing-peers*)
+          (is (null bl.net::*hb-announcing-peers*)
               "a peer delivering an INVALID compact block must not be promoted")
-          (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to peer)))))
+          (is (null (bl.net::peer-compact-block-high-bandwidth-to peer)))))
        ;; CONTROL: the same path with a VALID block does promote — otherwise the
        ;; assertion above would hold even if promotion were deleted outright.
        (%g716-with-fresh-hb
         (let ((peer (%g716-delivering-peer "198.51.100.17")))
-          (bitcoin-lisp.networking::handle-cmpctblock
+          (bl.net::handle-cmpctblock
            peer (%g716-cmpctblock-payload good) cs utxo store mp)
-          (is (= 1 (bitcoin-lisp.storage:current-height cs))
+          (is (= 1 (bl.store:current-height cs))
               "the good block connected")
-          (is (equal (list peer) bitcoin-lisp.networking::*hb-announcing-peers*)
+          (is (equal (list peer) bl.net::*hb-announcing-peers*)
               "a peer delivering a VALID compact block earns high bandwidth")
-          (is-true (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to
+          (is-true (bl.net::peer-compact-block-high-bandwidth-to
                     peer))))))))
 
 (test cmpctblock-message-round-trips-through-our-own-parser
@@ -1138,31 +1138,31 @@ by the receive-side tests and the SipHash vectors."
   (%with-regtest
    (let* ((node (%regtest-node-fixture "cb-msg"))
           (block (%g716-mine-on node (%p2sh-optrue-spk)))
-          (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-          (msg (bitcoin-lisp.serialization:make-cmpctblock-message block :nonce 42))
-          (cb (bitcoin-lisp.serialization:parse-cmpctblock-payload (subseq msg 24))))
-     (is (equalp (bitcoin-lisp.serialization:block-header-hash
-                  (bitcoin-lisp.serialization:bitcoin-block-header block))
-                 (bitcoin-lisp.serialization:block-header-hash
-                  (bitcoin-lisp.serialization:compact-block-header cb))))
-     (is (= 42 (bitcoin-lisp.serialization:compact-block-nonce cb)))
-     (let* ((prefilled (bitcoin-lisp.serialization:compact-block-prefilled-txs cb))
+          (txs (bl.ser:bitcoin-block-transactions block))
+          (msg (bl.ser:make-cmpctblock-message block :nonce 42))
+          (cb (bl.ser:parse-cmpctblock-payload (subseq msg 24))))
+     (is (equalp (bl.ser:block-header-hash
+                  (bl.ser:bitcoin-block-header block))
+                 (bl.ser:block-header-hash
+                  (bl.ser:compact-block-header cb))))
+     (is (= 42 (bl.ser:compact-block-nonce cb)))
+     (let* ((prefilled (bl.ser:compact-block-prefilled-txs cb))
             (coinbase (and prefilled
-                           (bitcoin-lisp.serialization:prefilled-tx-transaction
+                           (bl.ser:prefilled-tx-transaction
                             (first prefilled)))))
        (is (= 1 (length prefilled)))
-       (is (= 0 (bitcoin-lisp.serialization:prefilled-tx-index (first prefilled))))
+       (is (= 0 (bl.ser:prefilled-tx-index (first prefilled))))
        ;; WTXID, not txid: BIP152 v2 prefills TX_WITH_WITNESS
        ;; (blockencodings.h:80) and the coinbase's witness is the BIP141
        ;; reserved value. A txid comparison passes even when the emitter drops
        ;; the witness — which it did until this change, leaving every
        ;; reconstruction to fail bad-witness-nonce-size.
-       (is-true (bitcoin-lisp.serialization:transaction-has-witness-p coinbase)
+       (is-true (bl.ser:transaction-has-witness-p coinbase)
                 "the prefilled coinbase keeps its witness")
-       (is (equalp (bitcoin-lisp.serialization:transaction-wtxid (first txs))
-                   (bitcoin-lisp.serialization:transaction-wtxid coinbase))))
+       (is (equalp (bl.ser:transaction-wtxid (first txs))
+                   (bl.ser:transaction-wtxid coinbase))))
      (is (= (1- (length txs))
-            (length (bitcoin-lisp.serialization:compact-block-short-ids cb)))))))
+            (length (bl.ser:compact-block-short-ids cb)))))))
 
 (test getdata-serves-cmpctblock-near-tip-and-a-full-block-deeper
   "We send sendcmpct to every peer, so a Core peer records us as providing
@@ -1174,36 +1174,36 @@ of the tip a cmpctblock, deeper the full witness block, because a peer asking
 for old blocks has no mempool that could reconstruct one (:2463-2476)."
   (%with-regtest
    (let* ((node (%regtest-node-fixture "cb-getdata"))
-          (cs (bitcoin-lisp::node-chain-state node))
-          (store (bitcoin-lisp::node-block-store node))
+          (cs (bl::node-chain-state node))
+          (store (bl::node-block-store node))
           ;; Seven blocks, so the first sits deeper than the depth rule allows.
-          (hashes (bitcoin-lisp.rpc::%generate-to-script-pubkey
+          (hashes (bl.rpc::%generate-to-script-pubkey
                    node (%p2sh-optrue-spk) 7 1000000))
-          (deep-hash (bitcoin-lisp.rpc::parse-hex-hash (first hashes))))
+          (deep-hash (bl.rpc::parse-hex-hash (first hashes))))
      (progn
-       (is (= 7 (bitcoin-lisp.storage:current-height cs)))
+       (is (= 7 (bl.store:current-height cs)))
        (let ((peer (%cbp-peer "198.51.100.30"))
-             (tip (bitcoin-lisp.storage:best-block-hash cs)))
+             (tip (bl.store:best-block-hash cs)))
          (flet ((serve (hash type)
                   (%cbp-capture-sends
                    (lambda ()
-                     (bitcoin-lisp.networking::handle-getdata
-                      peer (subseq (bitcoin-lisp.serialization:make-getdata-message
-                                    (list (bitcoin-lisp.serialization:make-inv-vector
+                     (bl.net::handle-getdata
+                      peer (subseq (bl.ser:make-getdata-message
+                                    (list (bl.ser:make-inv-vector
                                            :type type :hash hash)))
                                    24)
                       cs nil store)))))
            (is (equal '("cmpctblock")
-                      (serve tip bitcoin-lisp.serialization:+inv-type-cmpct-block+))
+                      (serve tip bl.ser:+inv-type-cmpct-block+))
                "MSG_CMPCT_BLOCK at the tip is answered compactly")
            (is (equal '("block")
-                      (serve deep-hash bitcoin-lisp.serialization:+inv-type-cmpct-block+))
+                      (serve deep-hash bl.ser:+inv-type-cmpct-block+))
                "deeper than MAX_CMPCTBLOCK_DEPTH falls back to the full block")
            ;; The ordinary block requests are unchanged.
            (is (equal '("block")
-                      (serve tip bitcoin-lisp.serialization:+inv-type-witness-block+)))
+                      (serve tip bl.ser:+inv-type-witness-block+)))
            (is (equal '("block")
-                      (serve tip bitcoin-lisp.serialization:+inv-type-block+)))))))))
+                      (serve tip bl.ser:+inv-type-block+)))))))))
 
 (test g7-16-blocktxn-completion-promotes-only-after-the-block-validates
   "The OTHER compact path — a reconstruction completed by blocktxn — carried the
@@ -1211,28 +1211,28 @@ same defect and needs its own coverage: a dropped hunk there would disable the
 fix on half the compact traffic without failing the cmpctblock test."
   (%with-regtest
    (let* ((node (%regtest-node-fixture "g716-btxn"))
-          (cs (bitcoin-lisp::node-chain-state node))
-          (utxo (bitcoin-lisp::node-utxo-set node))
-          (store (bitcoin-lisp::node-block-store node))
-          (mp (bitcoin-lisp::node-mempool node))
+          (cs (bl::node-chain-state node))
+          (utxo (bl::node-utxo-set node))
+          (store (bl::node-block-store node))
+          (mp (bl::node-mempool node))
           (good (%g716-mine-on node (%p2sh-optrue-spk)))
-          (hash (bitcoin-lisp.serialization:block-header-hash
-                 (bitcoin-lisp.serialization:bitcoin-block-header good))))
+          (hash (bl.ser:block-header-hash
+                 (bl.ser:bitcoin-block-header good))))
      (flet ((%deliver (peer txs)
               ;; Prime the pending reconstruction exactly as handle-cmpctblock
               ;; leaves it when the mempool holds none of the block's txs, then
               ;; feed the blocktxn that completes it.
-              (setf (bitcoin-lisp.networking:peer-pending-compact-block peer)
-                    (bitcoin-lisp.networking::make-pending-compact-block
+              (setf (bl.net:peer-pending-compact-block peer)
+                    (bl.net::make-pending-compact-block
                      :block-hash hash
-                     :header (bitcoin-lisp.serialization:bitcoin-block-header good)
+                     :header (bl.ser:bitcoin-block-header good)
                      :transactions (make-array (length txs) :initial-element nil)
                      :missing-indexes (loop for i below (length txs) collect i)
                      :request-time (get-internal-real-time)
                      :use-wtxid t))
-              (bitcoin-lisp.networking::handle-blocktxn
+              (bl.net::handle-blocktxn
                peer
-               (subseq (bitcoin-lisp.serialization:make-blocktxn-message
+               (subseq (bl.ser:make-blocktxn-message
                         hash txs :witness t)
                        24)
                cs utxo store mp)))
@@ -1241,16 +1241,16 @@ fix on half the compact traffic without failing the cmpctblock test."
          (%g716-with-fresh-hb
           (let ((peer (%g716-delivering-peer "198.51.100.21")))
             (%deliver peer (list (make-simple-tx #x99)))
-            (is (= 0 (bitcoin-lisp.storage:current-height cs)))
-            (is (null bitcoin-lisp.networking::*hb-announcing-peers*)
+            (is (= 0 (bl.store:current-height cs)))
+            (is (null bl.net::*hb-announcing-peers*)
                 "an INVALID blocktxn completion must not be promoted")))
          ;; CONTROL: the real transactions complete a valid block — promoted.
          (%g716-with-fresh-hb
           (let ((peer (%g716-delivering-peer "198.51.100.22")))
-            (%deliver peer (bitcoin-lisp.serialization:bitcoin-block-transactions good))
-            (is (= 1 (bitcoin-lisp.storage:current-height cs))
+            (%deliver peer (bl.ser:bitcoin-block-transactions good))
+            (is (= 1 (bl.store:current-height cs))
                 "the completed block connected")
-            (is (equal (list peer) bitcoin-lisp.networking::*hb-announcing-peers*)
+            (is (equal (list peer) bl.net::*hb-announcing-peers*)
                 "a VALID blocktxn completion earns high bandwidth"))))))))
 
 (test g7-16-full-block-delivery-earns-hb-promotion
@@ -1264,10 +1264,10 @@ generic dispatcher, reached from the header-sync drains) and
 dispatch-ibd-message's `block' branch (the block-download path)."
   (%with-regtest
    (let* ((node (%regtest-node-fixture "g716-full"))
-          (cs (bitcoin-lisp::node-chain-state node))
-          (utxo (bitcoin-lisp::node-utxo-set node))
-          (store (bitcoin-lisp::node-block-store node))
-          (mp (bitcoin-lisp::node-mempool node))
+          (cs (bl::node-chain-state node))
+          (utxo (bl::node-utxo-set node))
+          (store (bl::node-block-store node))
+          (mp (bl::node-mempool node))
           (spk (%p2sh-optrue-spk))
           (b1 (%g716-mine-on node spk)))
      (%g716-quiet
@@ -1275,46 +1275,46 @@ dispatch-ibd-message's `block' branch (the block-download path)."
        ;; shape) — so the promotion assertions below cannot pass vacuously.
        (%g716-with-fresh-hb
         (let ((peer (%g716-delivering-peer "198.51.100.18")))
-          (bitcoin-lisp.networking::handle-block
+          (bl.net::handle-block
            peer (%g716-block-payload (%g716-corrupt-block b1)) cs utxo store mp)
-          (is (= 0 (bitcoin-lisp.storage:current-height cs)))
-          (is (null bitcoin-lisp.networking::*hb-announcing-peers*)
+          (is (= 0 (bl.store:current-height cs)))
+          (is (null bl.net::*hb-announcing-peers*)
               "an invalid full block must not earn high bandwidth")))
        ;; handle-block with a VALID block: promoted.
        (%g716-with-fresh-hb
         (let ((peer (%g716-delivering-peer "198.51.100.19")))
-          (bitcoin-lisp.networking::handle-block
+          (bl.net::handle-block
            peer (%g716-block-payload b1) cs utxo store mp)
-          (is (= 1 (bitcoin-lisp.storage:current-height cs))
+          (is (= 1 (bl.store:current-height cs))
               "the full block connected")
-          (is (equal (list peer) bitcoin-lisp.networking::*hb-announcing-peers*)
+          (is (equal (list peer) bl.net::*hb-announcing-peers*)
               "a full-block delivery earns high bandwidth, like a compact one")
-          (is-true (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to peer))))
+          (is-true (bl.net::peer-compact-block-high-bandwidth-to peer))))
        ;; The block-download path (dispatch-ibd-message "block"): its header is
        ;; in the index first, exactly as the real pipeline has it.
        (let ((b2 (%g716-mine-on node spk)))
-         (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header b2))
-                (bhash (bitcoin-lisp.serialization:block-header-hash hdr))
-                (prev (bitcoin-lisp.storage:get-block-index-entry
-                       cs (bitcoin-lisp.storage:best-block-hash cs))))
-           (bitcoin-lisp.storage:add-block-index-entry
-            cs (bitcoin-lisp.storage:make-block-index-entry
+         (let* ((hdr (bl.ser:bitcoin-block-header b2))
+                (bhash (bl.ser:block-header-hash hdr))
+                (prev (bl.store:get-block-index-entry
+                       cs (bl.store:best-block-hash cs))))
+           (bl.store:add-block-index-entry
+            cs (bl.store:make-block-index-entry
                 :hash bhash :height 2 :header hdr :prev-entry prev
-                :chain-work (bitcoin-lisp.storage:calculate-chain-work
-                             (bitcoin-lisp.serialization:block-header-bits hdr)
-                             (bitcoin-lisp.storage:block-index-entry-chain-work prev))
+                :chain-work (bl.store:calculate-chain-work
+                             (bl.ser:block-header-bits hdr)
+                             (bl.store:block-index-entry-chain-work prev))
                 :status :header-valid)))
          (%g716-with-fresh-hb
-          (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+          (let ((bl.net::*ibd-context* (bl.net::make-ibd))
                 (peer (%g716-delivering-peer "198.51.100.20")))
-            (bitcoin-lisp.networking::dispatch-ibd-message
+            (bl.net::dispatch-ibd-message
              peer "block" (%g716-block-payload b2) cs utxo store
-             bitcoin-lisp.networking::*ibd-context*)
-            (is (= 2 (bitcoin-lisp.storage:current-height cs))
+             bl.net::*ibd-context*)
+            (is (= 2 (bl.store:current-height cs))
                 "the downloaded block connected")
-            (is (equal (list peer) bitcoin-lisp.networking::*hb-announcing-peers*)
+            (is (equal (list peer) bl.net::*hb-announcing-peers*)
                 "the block-download path promotes too")
-            (is-true (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to
+            (is-true (bl.net::peer-compact-block-high-bandwidth-to
                       peer)))))))))
 
 ;;;; ------------------------------------------------------------
@@ -1322,8 +1322,8 @@ dispatch-ibd-message's `block' branch (the block-download path)."
 ;;;; ------------------------------------------------------------
 
 (defun %g716-block-hash (block)
-  (bitcoin-lisp.serialization:block-header-hash
-   (bitcoin-lisp.serialization:bitcoin-block-header block)))
+  (bl.ser:block-header-hash
+   (bl.ser:bitcoin-block-header block)))
 
 (defun %g716-other-spk ()
   "A second, DIFFERENT coinbase scriptPubKey. Two blocks assembled on the same
@@ -1338,17 +1338,17 @@ different hashes — siblings, equal work."
 reconstruction exactly as handle-cmpctblock leaves it when our mempool holds
 none of the block's transactions, then feed the blocktxn carrying TXS."
   (let ((hash (%g716-block-hash block)))
-    (setf (bitcoin-lisp.networking:peer-pending-compact-block peer)
-          (bitcoin-lisp.networking::make-pending-compact-block
+    (setf (bl.net:peer-pending-compact-block peer)
+          (bl.net::make-pending-compact-block
            :block-hash hash
-           :header (bitcoin-lisp.serialization:bitcoin-block-header block)
+           :header (bl.ser:bitcoin-block-header block)
            :transactions (make-array (length txs) :initial-element nil)
            :missing-indexes (loop for i below (length txs) collect i)
            :request-time (get-internal-real-time)
            :use-wtxid t))
-    (bitcoin-lisp.networking::handle-blocktxn
+    (bl.net::handle-blocktxn
      peer
-     (subseq (bitcoin-lisp.serialization:make-blocktxn-message hash txs :witness t) 24)
+     (subseq (bl.ser:make-blocktxn-message hash txs :witness t) 24)
      cs utxo store mp)))
 
 (test cmpctblock-replay-never-hashes-the-mempool
@@ -1365,10 +1365,10 @@ replay was already harmless to the chain and expensive to us, which is exactly
 why the hole survived this long."
   (%with-regtest
    (let* ((node (%regtest-node-fixture "cb-replay-cost"))
-          (cs (bitcoin-lisp::node-chain-state node))
-          (utxo (bitcoin-lisp::node-utxo-set node))
-          (store (bitcoin-lisp::node-block-store node))
-          (mp (bitcoin-lisp::node-mempool node))
+          (cs (bl::node-chain-state node))
+          (utxo (bl::node-utxo-set node))
+          (store (bl::node-block-store node))
+          (mp (bl::node-mempool node))
           (spk (%p2sh-optrue-spk))
           (b1 (%g716-mine-on node spk))
           (builds 0)
@@ -1381,20 +1381,20 @@ why the hole survived this long."
           ;; eclipse-dos-tests went red in the cold battery while this suite
           ;; stayed green. The neighbouring g7-16 tests get the same
           ;; protection from %g716-with-fresh-hb.
-          (bitcoin-lisp.networking::*cached-is-ibd* nil))
+          (bl.net::*cached-is-ibd* nil))
     (%g716-quiet
       ;; Count every shortid map built, whoever builds it.
-      (let ((real (symbol-function 'bitcoin-lisp.networking::build-shortid-map)))
+      (let ((real (symbol-function 'bl.net::build-shortid-map)))
         (unwind-protect
              (progn
-               (setf (symbol-function 'bitcoin-lisp.networking::build-shortid-map)
+               (setf (symbol-function 'bl.net::build-shortid-map)
                      (lambda (&rest args) (incf builds) (apply real args)))
                ;; Control: the FIRST delivery is new to us, so it is
                ;; reconstructed — the gate must not swallow real work.
                (let ((a (%g716-delivering-peer "198.51.100.60")))
-                 (bitcoin-lisp.networking::handle-cmpctblock
+                 (bl.net::handle-cmpctblock
                   a (%g716-cmpctblock-payload b1) cs utxo store mp))
-               (is (= 1 (bitcoin-lisp.storage:current-height cs))
+               (is (= 1 (bl.store:current-height cs))
                    "control: the first delivery of b1 connected")
                (is (plusp builds)
                    "control: the first delivery must actually reconstruct")
@@ -1402,19 +1402,19 @@ why the hole survived this long."
                (let ((after-first builds)
                      (b (%g716-delivering-peer "198.51.100.61")))
                  (dotimes (i 10)
-                   (bitcoin-lisp.networking::handle-cmpctblock
+                   (bl.net::handle-cmpctblock
                     b (%g716-cmpctblock-payload b1) cs utxo store mp))
                  (is (= after-first builds)
                      "a replayed cmpctblock rebuilt the shortid map ~D time(s)"
                      (- builds after-first))
-                 (is (= 1 (bitcoin-lisp.storage:current-height cs))
+                 (is (= 1 (bl.store:current-height cs))
                      "the replays connected nothing")
                  ;; And the replaying peer is not punished: an honest peer
                  ;; relaying what it just accepted is the ordinary case.
-                 (is-false (bitcoin-lisp.networking:peer-discouraged-p
+                 (is-false (bl.net:peer-discouraged-p
                             "198.51.100.61"))
-                 (is (eq :ready (bitcoin-lisp.networking:peer-state b)))))
-          (setf (symbol-function 'bitcoin-lisp.networking::build-shortid-map)
+                 (is (eq :ready (bl.net:peer-state b)))))
+          (setf (symbol-function 'bl.net::build-shortid-map)
                 real)))))))
 
 (test g7-16-replayed-block-earns-no-hb-promotion
@@ -1441,75 +1441,75 @@ own control: the FIRST, genuinely-connecting delivery of the same block on the
 same path must promote."
   (%with-regtest
    (let* ((node (%regtest-node-fixture "g716-replay"))
-          (cs (bitcoin-lisp::node-chain-state node))
-          (utxo (bitcoin-lisp::node-utxo-set node))
-          (store (bitcoin-lisp::node-block-store node))
-          (mp (bitcoin-lisp::node-mempool node))
+          (cs (bl::node-chain-state node))
+          (utxo (bl::node-utxo-set node))
+          (store (bl::node-block-store node))
+          (mp (bl::node-mempool node))
           (spk (%p2sh-optrue-spk))
           (b1 (%g716-mine-on node spk)))
-     (is (= 0 (bitcoin-lisp.storage:current-height cs)) "fixture starts at genesis")
+     (is (= 0 (bl.store:current-height cs)) "fixture starts at genesis")
      (%g716-quiet
        ;;; --- cmpctblock ------------------------------------------------
        (%g716-with-fresh-hb
         (let ((a (%g716-delivering-peer "198.51.100.30")))
-          (bitcoin-lisp.networking::handle-cmpctblock
+          (bl.net::handle-cmpctblock
            a (%g716-cmpctblock-payload b1) cs utxo store mp)
-          (is (= 1 (bitcoin-lisp.storage:current-height cs))
+          (is (= 1 (bl.store:current-height cs))
               "control: the first delivery of b1 connected")
-          (is (equal (list a) bitcoin-lisp.networking::*hb-announcing-peers*)
+          (is (equal (list a) bl.net::*hb-announcing-peers*)
               "control: a genuinely-connecting cmpctblock delivery promotes")))
        (%g716-with-fresh-hb
         (let ((b (%g716-delivering-peer "198.51.100.31")))
-          (bitcoin-lisp.networking::handle-cmpctblock
+          (bl.net::handle-cmpctblock
            b (%g716-cmpctblock-payload b1) cs utxo store mp)
-          (is (= 1 (bitcoin-lisp.storage:current-height cs))
+          (is (= 1 (bl.store:current-height cs))
               "the replay connected nothing")
-          (is (eq :ready (bitcoin-lisp.networking::peer-state b))
+          (is (eq :ready (bl.net::peer-state b))
               "the replayer is NOT punished, so nothing else stops the promotion")
-          (is (null bitcoin-lisp.networking::*hb-announcing-peers*)
+          (is (null bl.net::*hb-announcing-peers*)
               "replaying our own tip as a cmpctblock must not buy an HB slot")
-          (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to b)))))
+          (is (null (bl.net::peer-compact-block-high-bandwidth-to b)))))
        ;;; --- full block (handle-block) ---------------------------------
        (let ((b2 (%g716-mine-on node spk)))
          (%g716-with-fresh-hb
           (let ((c (%g716-delivering-peer "198.51.100.32")))
-            (bitcoin-lisp.networking::handle-block
+            (bl.net::handle-block
              c (%g716-block-payload b2) cs utxo store mp)
-            (is (= 2 (bitcoin-lisp.storage:current-height cs))
+            (is (= 2 (bl.store:current-height cs))
                 "control: the first delivery of b2 connected")
-            (is (equal (list c) bitcoin-lisp.networking::*hb-announcing-peers*)
+            (is (equal (list c) bl.net::*hb-announcing-peers*)
                 "control: a genuinely-connecting full block promotes")))
          (%g716-with-fresh-hb
           (let ((d (%g716-delivering-peer "198.51.100.33")))
-            (bitcoin-lisp.networking::handle-block
+            (bl.net::handle-block
              d (%g716-block-payload b2) cs utxo store mp)
-            (is (= 2 (bitcoin-lisp.storage:current-height cs))
+            (is (= 2 (bl.store:current-height cs))
                 "the replay connected nothing")
-            (is (eq :ready (bitcoin-lisp.networking::peer-state d))
+            (is (eq :ready (bl.net::peer-state d))
                 "the replayer is NOT punished")
-            (is (null bitcoin-lisp.networking::*hb-announcing-peers*)
+            (is (null bl.net::*hb-announcing-peers*)
                 "replaying our own tip as a full block must not buy an HB slot")
-            (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to d))))))
+            (is (null (bl.net::peer-compact-block-high-bandwidth-to d))))))
        ;;; --- blocktxn completion ---------------------------------------
        (let* ((b3 (%g716-mine-on node spk))
-              (txs (bitcoin-lisp.serialization:bitcoin-block-transactions b3)))
+              (txs (bl.ser:bitcoin-block-transactions b3)))
          (%g716-with-fresh-hb
           (let ((e (%g716-delivering-peer "198.51.100.34")))
             (%g716-blocktxn-deliver e b3 txs cs utxo store mp)
-            (is (= 3 (bitcoin-lisp.storage:current-height cs))
+            (is (= 3 (bl.store:current-height cs))
                 "control: the first blocktxn completion of b3 connected")
-            (is (equal (list e) bitcoin-lisp.networking::*hb-announcing-peers*)
+            (is (equal (list e) bl.net::*hb-announcing-peers*)
                 "control: a genuinely-connecting blocktxn completion promotes")))
          (%g716-with-fresh-hb
           (let ((f (%g716-delivering-peer "198.51.100.35")))
             (%g716-blocktxn-deliver f b3 txs cs utxo store mp)
-            (is (= 3 (bitcoin-lisp.storage:current-height cs))
+            (is (= 3 (bl.store:current-height cs))
                 "the replay connected nothing")
-            (is (eq :ready (bitcoin-lisp.networking::peer-state f))
+            (is (eq :ready (bl.net::peer-state f))
                 "the replayer is NOT punished")
-            (is (null bitcoin-lisp.networking::*hb-announcing-peers*)
+            (is (null bl.net::*hb-announcing-peers*)
                 "replaying our own tip as a blocktxn completion must not buy an HB slot")
-            (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to
+            (is (null (bl.net::peer-compact-block-high-bandwidth-to
                        f))))))))))
 
 (test g7-16-side-branch-block-earns-no-hb-promotion
@@ -1521,10 +1521,10 @@ addressable by any dedup guard — the block is genuinely new to us — so it pi
 the connection gate on its own."
   (%with-regtest
    (let* ((node (%regtest-node-fixture "g716-side"))
-          (cs (bitcoin-lisp::node-chain-state node))
-          (utxo (bitcoin-lisp::node-utxo-set node))
-          (store (bitcoin-lisp::node-block-store node))
-          (mp (bitcoin-lisp::node-mempool node))
+          (cs (bl::node-chain-state node))
+          (utxo (bl::node-utxo-set node))
+          (store (bl::node-block-store node))
+          (mp (bl::node-mempool node))
           ;; Two SIBLINGS assembled on genesis before either is connected:
           ;; equal work, so the second is stored and first-seen wins.
           (main (%g716-mine-on node (%p2sh-optrue-spk)))
@@ -1534,27 +1534,27 @@ the connection gate on its own."
      (%g716-quiet
        (%g716-with-fresh-hb
         (let ((a (%g716-delivering-peer "198.51.100.40")))
-          (bitcoin-lisp.networking::handle-block
+          (bl.net::handle-block
            a (%g716-block-payload main) cs utxo store mp)
-          (is (= 1 (bitcoin-lisp.storage:current-height cs))
+          (is (= 1 (bl.store:current-height cs))
               "control: the first sibling connected")
-          (is (equal (list a) bitcoin-lisp.networking::*hb-announcing-peers*)
+          (is (equal (list a) bl.net::*hb-announcing-peers*)
               "control: the connecting sibling's deliverer is promoted")))
        (%g716-with-fresh-hb
         (let ((b (%g716-delivering-peer "198.51.100.41")))
-          (bitcoin-lisp.networking::handle-block
+          (bl.net::handle-block
            b (%g716-block-payload sibling) cs utxo store mp)
-          (is (= 1 (bitcoin-lisp.storage:current-height cs))
+          (is (= 1 (bl.store:current-height cs))
               "the side branch did not become the tip")
-          (is (equalp (bitcoin-lisp.storage:best-block-hash cs) (%g716-block-hash main))
+          (is (equalp (bl.store:best-block-hash cs) (%g716-block-hash main))
               "the tip is still the first sibling")
-          (is-true (bitcoin-lisp.storage:get-block-index-entry
+          (is-true (bl.store:get-block-index-entry
                     cs (%g716-block-hash sibling))
                    "...but the side block WAS accepted and stored — this is the
 valid-yet-unconnected case, not a rejection")
-          (is (eq :ready (bitcoin-lisp.networking::peer-state b))
+          (is (eq :ready (bl.net::peer-state b))
               "storing a side branch is not misbehaviour")
-          (is (null bitcoin-lisp.networking::*hb-announcing-peers*)
+          (is (null bl.net::*hb-announcing-peers*)
               "a stored-but-unconnected block must not earn high bandwidth")
-          (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to
+          (is (null (bl.net::peer-compact-block-high-bandwidth-to
                      b)))))))))

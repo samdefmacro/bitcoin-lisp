@@ -16,7 +16,7 @@
 
 (in-suite :bip324-crypto-tests)
 
-(defun %bc-hex (hex) (bitcoin-lisp.crypto:hex-to-bytes hex))
+(defun %bc-hex (hex) (bl.crypto:hex-to-bytes hex))
 (defun %bc-buf (n) (make-array n :element-type '(unsigned-byte 8) :initial-element 0))
 
 (defun %check-chacha20 (msg-hex key-hex nonce1 nonce2 seek out-hex)
@@ -27,29 +27,29 @@ re-run split into fragments to exercise the one-block output buffer."
          (expect (%bc-hex out-hex))
          (n (length expect))
          (out (%bc-buf n))
-         (c (bitcoin-lisp.crypto::make-chacha20 key)))
-    (bitcoin-lisp.crypto::chacha20-seek c nonce1 nonce2 seek)
+         (c (bl.crypto::make-chacha20 key)))
+    (bl.crypto::chacha20-seek c nonce1 nonce2 seek)
     (if (plusp (length msg))
-        (bitcoin-lisp.crypto::chacha20-crypt c msg out)
-        (bitcoin-lisp.crypto::chacha20-keystream c out))
+        (bl.crypto::chacha20-crypt c msg out)
+        (bl.crypto::chacha20-keystream c out))
     (is (equalp expect out))
     ;; Fragmented re-runs at deterministic split points.
     (dolist (cut (remove-duplicates
                   (list 1 (floor n 3) (max 1 (- n 2)) (floor n 2))))
       (when (< 0 cut n)
-        (bitcoin-lisp.crypto::chacha20-seek c nonce1 nonce2 seek)
+        (bl.crypto::chacha20-seek c nonce1 nonce2 seek)
         (fill out 0)
         (if (plusp (length msg))
-            (progn (bitcoin-lisp.crypto::chacha20-crypt c msg out :end cut)
-                   (bitcoin-lisp.crypto::chacha20-crypt c msg out :start cut))
-            (progn (bitcoin-lisp.crypto::chacha20-keystream c out :end cut)
-                   (bitcoin-lisp.crypto::chacha20-keystream c out :start cut)))
+            (progn (bl.crypto::chacha20-crypt c msg out :end cut)
+                   (bl.crypto::chacha20-crypt c msg out :start cut))
+            (progn (bl.crypto::chacha20-keystream c out :end cut)
+                   (bl.crypto::chacha20-keystream c out :start cut)))
         (is (equalp expect out))))))
 
 (defun %check-poly1305 (msg-hex key-hex tag-hex)
   (let ((mac (ironclad:make-mac :poly1305 (%bc-hex key-hex))))
     (ironclad:update-mac mac (%bc-hex msg-hex))
-    (is (string= tag-hex (bitcoin-lisp.crypto:bytes-to-hex (ironclad:produce-mac mac))))))
+    (is (string= tag-hex (bl.crypto:bytes-to-hex (ironclad:produce-mac mac))))))
 
 (defun %check-aead (plain-hex aad-hex key-hex nonce1 nonce2 cipher-hex)
   (let* ((plain (%bc-hex plain-hex))
@@ -58,41 +58,41 @@ re-run split into fragments to exercise the one-block output buffer."
          (expect (%bc-hex cipher-hex))
          (n (length plain))
          (cipher (%bc-buf (+ n 16)))
-         (aead (bitcoin-lisp.crypto::make-aead-chacha20-poly1305 key)))
+         (aead (bl.crypto::make-aead-chacha20-poly1305 key)))
     ;; Single-segment encrypt.
-    (bitcoin-lisp.crypto::aead-encrypt aead plain aad nonce1 nonce2 cipher)
+    (bl.crypto::aead-encrypt aead plain aad nonce1 nonce2 cipher)
     (is (equalp expect cipher))
     ;; Split-segment encrypt (plain1/plain2 at the midpoint).
     (let ((k (floor n 2)))
       (fill cipher 0)
-      (bitcoin-lisp.crypto::aead-encrypt
+      (bl.crypto::aead-encrypt
        aead (subseq plain 0 k) aad nonce1 nonce2 cipher (subseq plain k))
       (is (equalp expect cipher)))
     ;; Decrypt round-trip.
     (let ((out (%bc-buf n)))
-      (is-true (bitcoin-lisp.crypto::aead-decrypt aead cipher aad nonce1 nonce2 out))
+      (is-true (bl.crypto::aead-decrypt aead cipher aad nonce1 nonce2 out))
       (is (equalp plain out)))
     ;; Keystream XOR property.
     (when (plusp n)
       (let ((ks (%bc-buf n)))
-        (bitcoin-lisp.crypto::aead-keystream aead nonce1 nonce2 ks)
+        (bl.crypto::aead-keystream aead nonce1 nonce2 ks)
         (is (loop for i below n
                   always (= (logxor (aref plain i) (aref ks i)) (aref expect i))))))
     ;; Tampered tag must fail.
     (let ((bad (copy-seq cipher))
           (out (%bc-buf n)))
       (setf (aref bad (1- (length bad))) (logxor (aref bad (1- (length bad))) 1))
-      (is-false (bitcoin-lisp.crypto::aead-decrypt aead bad aad nonce1 nonce2 out)))))
+      (is-false (bl.crypto::aead-decrypt aead bad aad nonce1 nonce2 out)))))
 
 (defun %check-fschacha20 (plain-hex key-hex interval expect-hex)
   "Crypt the same plaintext INTERVAL+1 times; the final output (the first
 chunk after the automatic rekey) must equal EXPECT-HEX."
   (let* ((plain (%bc-hex plain-hex))
-         (fsc (bitcoin-lisp.crypto:make-fschacha20 (%bc-hex key-hex) interval))
+         (fsc (bl.crypto:make-fschacha20 (%bc-hex key-hex) interval))
          (out (%bc-buf (length plain))))
     (dotimes (i (1+ interval))
-      (bitcoin-lisp.crypto:fschacha20-crypt fsc plain out))
-    (is (string= expect-hex (bitcoin-lisp.crypto:bytes-to-hex out)))))
+      (bl.crypto:fschacha20-crypt fsc plain out))
+    (is (string= expect-hex (bl.crypto:bytes-to-hex out)))))
 
 (defun %check-fsaead (plain-hex aad-hex key-hex msg-idx cipher-hex)
   "Core's TestFSChaCha20Poly1305: MSG-IDX empty dummy packets seek to the
@@ -106,50 +106,50 @@ packet must match CIPHER-HEX; an independent receiver decrypts it."
          (dummy (%bc-buf 16))
          (empty (%bc-buf 0))
          (cipher (%bc-buf (+ n 16)))
-         (enc (bitcoin-lisp.crypto:make-fschacha20poly1305 key 224))
-         (dec (bitcoin-lisp.crypto:make-fschacha20poly1305 key 224)))
+         (enc (bl.crypto:make-fschacha20poly1305 key 224))
+         (dec (bl.crypto:make-fschacha20poly1305 key 224)))
     (dotimes (i msg-idx)
-      (bitcoin-lisp.crypto:fsaead-encrypt enc empty empty dummy))
-    (bitcoin-lisp.crypto:fsaead-encrypt enc plain aad cipher)
+      (bl.crypto:fsaead-encrypt enc empty empty dummy))
+    (bl.crypto:fsaead-encrypt enc plain aad cipher)
     (is (equalp expect cipher))
     ;; Split-segment variant on a fresh instance.
     (when (plusp n)
-      (let ((enc2 (bitcoin-lisp.crypto:make-fschacha20poly1305 key 224))
+      (let ((enc2 (bl.crypto:make-fschacha20poly1305 key 224))
             (k (floor n 2)))
         (dotimes (i msg-idx)
-          (bitcoin-lisp.crypto:fsaead-encrypt enc2 empty empty dummy))
+          (bl.crypto:fsaead-encrypt enc2 empty empty dummy))
         (fill cipher 0)
-        (bitcoin-lisp.crypto:fsaead-encrypt
+        (bl.crypto:fsaead-encrypt
          enc2 (subseq plain 0 k) aad cipher (subseq plain k))
         (is (equalp expect cipher))))
     ;; Receiver side: dummy decrypts fail authentication but still advance
     ;; the packet counter, mirroring Core.
     (fill dummy 0)
     (dotimes (i msg-idx)
-      (bitcoin-lisp.crypto:fsaead-decrypt dec dummy empty empty))
+      (bl.crypto:fsaead-decrypt dec dummy empty empty))
     (let ((out (%bc-buf n)))
-      (is-true (bitcoin-lisp.crypto:fsaead-decrypt dec expect aad out))
+      (is-true (bl.crypto:fsaead-decrypt dec expect aad out))
       (is (equalp plain out)))))
 
 (defun %check-hkdf (ikm-hex salt-hex info-hex okm-hex)
-  (let* ((prk (bitcoin-lisp.crypto:hkdf-sha256-extract
+  (let* ((prk (bl.crypto:hkdf-sha256-extract
                (%bc-hex salt-hex) (%bc-hex ikm-hex)))
-         (okm (bitcoin-lisp.crypto:hkdf-sha256-expand32 prk (%bc-hex info-hex))))
-    (is (string= okm-hex (bitcoin-lisp.crypto:bytes-to-hex okm)))))
+         (okm (bl.crypto:hkdf-sha256-expand32 prk (%bc-hex info-hex))))
+    (is (string= okm-hex (bl.crypto:bytes-to-hex okm)))))
 
 ;;; --- Structural tests (not vector-driven) ---
 
 (test chacha20-midblock
   "Consuming 5+7+52 keystream bytes equals one straight 64-byte block."
   (let* ((key (%bc-buf 32))
-         (c1 (bitcoin-lisp.crypto::make-chacha20 key))
-         (c2 (bitcoin-lisp.crypto::make-chacha20 key))
+         (c1 (bl.crypto::make-chacha20 key))
+         (c2 (bl.crypto::make-chacha20 key))
          (block (%bc-buf 64))
          (b1 (%bc-buf 5)) (b2 (%bc-buf 7)) (b3 (%bc-buf 52)))
-    (bitcoin-lisp.crypto::chacha20-keystream c1 block)
-    (bitcoin-lisp.crypto::chacha20-keystream c2 b1)
-    (bitcoin-lisp.crypto::chacha20-keystream c2 b2)
-    (bitcoin-lisp.crypto::chacha20-keystream c2 b3)
+    (bl.crypto::chacha20-keystream c1 block)
+    (bl.crypto::chacha20-keystream c2 b1)
+    (bl.crypto::chacha20-keystream c2 b2)
+    (bl.crypto::chacha20-keystream c2 b3)
     (is (equalp (subseq block 0 5) b1))
     (is (equalp (subseq block 5 12) b2))
     (is (equalp (subseq block 12 64) b3))))
@@ -167,7 +167,7 @@ packet must match CIPHER-HEX; an independent receiver decrypts it."
                                                :initial-element i))
         (ironclad:update-mac total (ironclad:produce-mac mac))))
     (is (string= "64afe2e8d6ad7bbdd287f97c44623d39"
-                 (bitcoin-lisp.crypto:bytes-to-hex (ironclad:produce-mac total))))))
+                 (bl.crypto:bytes-to-hex (ironclad:produce-mac total))))))
 
 ;;; --- Machine-extracted vector tests (see file header) ---
 (test chacha20-core-vectors
@@ -412,7 +412,7 @@ packet must match CIPHER-HEX; an independent receiver decrypts it."
 (test ellswift-decode-core-vectors
   "All 76 decode vectors from Core's ellswift_decode_test_vectors.csv:
 decode the 64-byte encoding, serialize compressed, compare the x coordinate."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (let ((path (%ellswift-vectors-path)))
         (if (not (probe-file path))
@@ -425,9 +425,9 @@ decode the 64-byte encoding, serialize compressed, compare the x coordinate."
                     for comma2 = (position #\, line :start (1+ comma1))
                     for ell = (%bc-hex (subseq line 0 comma1))
                     for x-hex = (subseq line (1+ comma1) comma2)
-                    for pubkey = (bitcoin-lisp.crypto:ellswift-decode ell)
+                    for pubkey = (bl.crypto:ellswift-decode ell)
                     do (is (string= x-hex
-                                    (bitcoin-lisp.crypto:bytes-to-hex
+                                    (bl.crypto:bytes-to-hex
                                      (subseq pubkey 1)))
                            "x mismatch for ~A" (subseq line 0 8))))))))
 
@@ -435,62 +435,62 @@ decode the 64-byte encoding, serialize compressed, compare the x coordinate."
   "ellswift-create's encoding decodes back to the secret key's public key,
 with and without auxiliary randomness, and distinct aux gives distinct
 encodings of the same key."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (dolist (priv-hex '("0000000000000000000000000000000000000000000000000000000000000001"
                           "00000000000000000000000000000000000000000000000000000000deadbeef"
                           "e93fdb5c762804b9a706816aca31e35b11d2aa3080108ef46a5b1f1508819c0a"))
         (let* ((priv (%bc-hex priv-hex))
-               (expected (bitcoin-lisp.crypto:derive-public-key priv))
+               (expected (bl.crypto:derive-public-key priv))
                (aux (%bc-buf 32))
-               (ell-plain (bitcoin-lisp.crypto:ellswift-create priv)))
+               (ell-plain (bl.crypto:ellswift-create priv)))
           (is-true ell-plain)
           (is (= 64 (length ell-plain)))
-          (is (equalp expected (bitcoin-lisp.crypto:ellswift-decode ell-plain)))
+          (is (equalp expected (bl.crypto:ellswift-decode ell-plain)))
           (fill aux 7)
-          (let ((ell-aux (bitcoin-lisp.crypto:ellswift-create priv aux)))
-            (is (equalp expected (bitcoin-lisp.crypto:ellswift-decode ell-aux)))
+          (let ((ell-aux (bl.crypto:ellswift-create priv aux)))
+            (is (equalp expected (bl.crypto:ellswift-decode ell-aux)))
             ;; Different entropy -> different encoding of the same key.
             (is-false (equalp ell-plain ell-aux)))))))
 
 (test bip324-ecdh-symmetry
   "Initiator and responder derive the same 32-byte shared secret; a third
 party or a role mix-up does not."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (let* ((priv-a (%bc-hex "1111111111111111111111111111111111111111111111111111111111111111"))
              (priv-b (%bc-hex "2222222222222222222222222222222222222222222222222222222222222222"))
              (priv-c (%bc-hex "3333333333333333333333333333333333333333333333333333333333333333"))
-             (ell-a (bitcoin-lisp.crypto:ellswift-create priv-a))
-             (ell-b (bitcoin-lisp.crypto:ellswift-create priv-b))
+             (ell-a (bl.crypto:ellswift-create priv-a))
+             (ell-b (bl.crypto:ellswift-create priv-b))
              ;; A initiates to B.
-             (secret-a (bitcoin-lisp.crypto:bip324-ecdh ell-b ell-a priv-a t))
-             (secret-b (bitcoin-lisp.crypto:bip324-ecdh ell-a ell-b priv-b nil)))
+             (secret-a (bl.crypto:bip324-ecdh ell-b ell-a priv-a t))
+             (secret-b (bl.crypto:bip324-ecdh ell-a ell-b priv-b nil)))
         (is (= 32 (length secret-a)))
         (is (equalp secret-a secret-b))
         ;; Wrong key: C using its key over A/B's encodings gets a different secret.
         (is-false (equalp secret-a
-                          (bitcoin-lisp.crypto:bip324-ecdh ell-a ell-b priv-c nil)))
+                          (bl.crypto:bip324-ecdh ell-a ell-b priv-c nil)))
         ;; Role mix-up: both claiming initiator diverges.
         (is-false (equalp secret-a
-                          (bitcoin-lisp.crypto:bip324-ecdh ell-a ell-b priv-b t))))))
+                          (bl.crypto:bip324-ecdh ell-a ell-b priv-b t))))))
 
 (test bip324-ecdh-pinned-vectors
   "Exactness against the pure-Python reference (Core test_framework
 ellswift_ecdh_xonly + TaggedHash, independent of libsecp256k1): fixed key
 and fixed arbitrary 64-byte encodings, both roles. The 'ours' encoding only
 enters the tagged hash, so no key correspondence is required."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (let ((priv (%bc-hex "1111111111111111111111111111111111111111111111111111111111111111"))
             (theirs (make-array 64 :element-type '(unsigned-byte 8) :initial-element #xAA))
             (ours (make-array 64 :element-type '(unsigned-byte 8) :initial-element #xBB)))
         (is (string= "44ea2116a4c8badb83785c77ab0fb13917e022a0e04c42d9b102013d93ac7647"
-                     (bitcoin-lisp.crypto:bytes-to-hex
-                      (bitcoin-lisp.crypto:bip324-ecdh theirs ours priv t))))
+                     (bl.crypto:bytes-to-hex
+                      (bl.crypto:bip324-ecdh theirs ours priv t))))
         (is (string= "6cfd97979551cc7aeb682c4067d34f985f5e366eb49f69777e93cfc09292a627"
-                     (bitcoin-lisp.crypto:bytes-to-hex
-                      (bitcoin-lisp.crypto:bip324-ecdh theirs ours priv nil)))))))
+                     (bl.crypto:bytes-to-hex
+                      (bl.crypto:bip324-ecdh theirs ours priv nil)))))))
 
 ;;; --- BIP324Cipher packet vectors ---
 
@@ -521,24 +521,24 @@ seeks the same way, decrypts it back, and rejects tampered copies."
          (contents (let ((v (%bc-buf (* multiply (length base)))))
                      (dotimes (i multiply v)
                        (replace v base :start1 (* i (length base))))))
-         (enc (bitcoin-lisp.crypto:make-bip324-cipher priv :our-ell64 ours))
+         (enc (bl.crypto:make-bip324-cipher priv :our-ell64 ours))
          (dummies '()))
-    (is-false (bitcoin-lisp.crypto:bip324-cipher-initialized-p enc))
-    (is (equalp ours (bitcoin-lisp.crypto:bip324-cipher-our-pubkey enc)))
-    (bitcoin-lisp.crypto:bip324-cipher-initialize enc theirs initiating
+    (is-false (bl.crypto:bip324-cipher-initialized-p enc))
+    (is (equalp ours (bl.crypto:bip324-cipher-our-pubkey enc)))
+    (bl.crypto:bip324-cipher-initialize enc theirs initiating
                                                   *bip324-mainnet-magic*)
-    (is-true (bitcoin-lisp.crypto:bip324-cipher-initialized-p enc))
-    (is (equalp session-id (bitcoin-lisp.crypto:bip324-cipher-session-id enc)))
+    (is-true (bl.crypto:bip324-cipher-initialized-p enc))
+    (is (equalp session-id (bl.crypto:bip324-cipher-session-id enc)))
     (is (equalp send-garbage
-                (bitcoin-lisp.crypto:bip324-cipher-send-garbage-terminator enc)))
+                (bl.crypto:bip324-cipher-send-garbage-terminator enc)))
     (is (equalp recv-garbage
-                (bitcoin-lisp.crypto:bip324-cipher-recv-garbage-terminator enc)))
+                (bl.crypto:bip324-cipher-recv-garbage-terminator enc)))
     ;; Seek to the numbered packet with empty decoy packets.
     (dotimes (i idx)
-      (push (bitcoin-lisp.crypto:bip324-cipher-encrypt enc (%bc-buf 0) (%bc-buf 0) t)
+      (push (bl.crypto:bip324-cipher-encrypt enc (%bc-buf 0) (%bc-buf 0) t)
             dummies))
     (setf dummies (nreverse dummies))
-    (let ((ciphertext (bitcoin-lisp.crypto:bip324-cipher-encrypt enc contents aad ignore)))
+    (let ((ciphertext (bl.crypto:bip324-cipher-encrypt enc contents aad ignore)))
       (if (plusp (length expect-ct))
           (is (equalp expect-ct ciphertext))
           (progn
@@ -548,21 +548,21 @@ seeks the same way, decrypts it back, and rejects tampered copies."
                                               (length expect-tail)))))))
       ;; Self-decrypting instance: same key/role, send<->recv swapped.
       (flet ((make-decryptor ()
-               (let ((dec (bitcoin-lisp.crypto:make-bip324-cipher priv :our-ell64 ours)))
-                 (bitcoin-lisp.crypto:bip324-cipher-initialize
+               (let ((dec (bl.crypto:make-bip324-cipher priv :our-ell64 ours)))
+                 (bl.crypto:bip324-cipher-initialize
                   dec theirs initiating *bip324-mainnet-magic* :self-decrypt t)
-                 (is (equalp session-id (bitcoin-lisp.crypto:bip324-cipher-session-id dec)))
+                 (is (equalp session-id (bl.crypto:bip324-cipher-session-id dec)))
                  (dolist (d dummies)
-                   (bitcoin-lisp.crypto:bip324-cipher-decrypt-length dec (subseq d 0 3))
-                   (bitcoin-lisp.crypto:bip324-cipher-decrypt dec (subseq d 3) (%bc-buf 0)))
+                   (bl.crypto:bip324-cipher-decrypt-length dec (subseq d 0 3))
+                   (bl.crypto:bip324-cipher-decrypt dec (subseq d 3) (%bc-buf 0)))
                  dec)))
         ;; Successful decrypt round-trip.
         (let* ((dec (make-decryptor))
-               (len (bitcoin-lisp.crypto:bip324-cipher-decrypt-length
+               (len (bl.crypto:bip324-cipher-decrypt-length
                      dec (subseq ciphertext 0 3))))
           (is (= (length contents) len))
           (multiple-value-bind (plain dec-ignore)
-              (bitcoin-lisp.crypto:bip324-cipher-decrypt dec (subseq ciphertext 3) aad)
+              (bl.crypto:bip324-cipher-decrypt dec (subseq ciphertext 3) aad)
             (is-true plain)
             (when plain
               (is (equalp contents plain))
@@ -572,19 +572,19 @@ seeks the same way, decrypts it back, and rejects tampered copies."
                (bad (copy-seq ciphertext)))
           (setf (aref bad (+ 3 (mod 5 (- (length bad) 3))))
                 (logxor (aref bad (+ 3 (mod 5 (- (length bad) 3)))) 1))
-          (bitcoin-lisp.crypto:bip324-cipher-decrypt-length dec (subseq bad 0 3))
-          (is-false (bitcoin-lisp.crypto:bip324-cipher-decrypt dec (subseq bad 3) aad)))
+          (bl.crypto:bip324-cipher-decrypt-length dec (subseq bad 0 3))
+          (is-false (bl.crypto:bip324-cipher-decrypt dec (subseq bad 3) aad)))
         ;; Damaged AAD must fail authentication.
         (when (plusp (length aad))
           (let ((dec (make-decryptor))
                 (bad-aad (copy-seq aad)))
             (setf (aref bad-aad 0) (logxor (aref bad-aad 0) 1))
-            (bitcoin-lisp.crypto:bip324-cipher-decrypt-length dec (subseq ciphertext 0 3))
-            (is-false (bitcoin-lisp.crypto:bip324-cipher-decrypt
+            (bl.crypto:bip324-cipher-decrypt-length dec (subseq ciphertext 0 3))
+            (is-false (bl.crypto:bip324-cipher-decrypt
                        dec (subseq ciphertext 3) bad-aad))))))))
 (test bip324-cipher-core-vectors
   "The official BIP324 packet vectors from Core bip324_tests.cpp (mainnet magic)."
-  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+  (if (not (bl.crypto:ellswift-available-p))
       (skip "libsecp256k1 lacks the ellswift module")
       (progn
   (%check-bip324-packet 1

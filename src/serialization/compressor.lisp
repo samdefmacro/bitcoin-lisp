@@ -176,7 +176,7 @@ no special form applies (caller falls back to raw encoding)."
             (= (aref script 0) 65)
             (= (aref script 66) #xac)  ; OP_CHECKSIG
             (= (aref script 1) #x04)
-            (bitcoin-lisp.crypto:public-key-valid-p (subseq script 1 66)))
+            (bl.crypto:public-key-valid-p (subseq script 1 66)))
        (let ((out (make-array 33 :element-type '(unsigned-byte 8))))
          (setf (aref out 0) (logior #x04 (logand (aref script 65) #x01)))
          (replace out script :start1 1 :start2 2 :end2 34)
@@ -225,7 +225,7 @@ SIZE-ID is not special or a 0x04/0x05 x-coordinate is not on the curve."
      (let ((compressed (make-array 33 :element-type '(unsigned-byte 8))))
        (setf (aref compressed 0) (- size-id 2))
        (replace compressed payload :start1 1 :end2 32)
-       (let ((full (bitcoin-lisp.crypto:decompress-public-key compressed)))
+       (let ((full (bl.crypto:decompress-public-key compressed)))
          (when full
            (let ((script (make-array 67 :element-type '(unsigned-byte 8))))
              (setf (aref script 0) 65)

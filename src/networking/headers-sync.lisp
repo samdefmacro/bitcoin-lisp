@@ -110,23 +110,23 @@ difficulty into few blocks. On min-difficulty networks the check is disabled
 (as in Core). Returns T if the transition is allowed."
   (if (pow-allow-min-difficulty-blocks-p network)
       t
-      (let ((interval bitcoin-lisp.storage:+difficulty-adjustment-interval+))
+      (let ((interval bl.store:+difficulty-adjustment-interval+))
         (cond
           ((zerop (mod height interval))
-           (let* ((timespan bitcoin-lisp.storage:+pow-target-timespan+)
+           (let* ((timespan bl.store:+pow-target-timespan+)
                   (smallest (floor timespan 4))
                   (largest (* timespan 4))
-                  (pow-limit bitcoin-lisp.storage:*pow-limit-target*)
-                  (old-target (bitcoin-lisp.storage:bits-to-target old-bits))
-                  (observed (bitcoin-lisp.storage:bits-to-target new-bits))
+                  (pow-limit bl.store:*pow-limit-target*)
+                  (old-target (bl.store:bits-to-target old-bits))
+                  (observed (bl.store:bits-to-target new-bits))
                   ;; Largest permitted new target (easiest difficulty), capped.
                   (largest-target (min pow-limit (floor (* old-target largest) timespan)))
-                  (max-new (bitcoin-lisp.storage:bits-to-target
-                            (bitcoin-lisp.storage:target-to-bits largest-target)))
+                  (max-new (bl.store:bits-to-target
+                            (bl.store:target-to-bits largest-target)))
                   ;; Smallest permitted new target (hardest difficulty), capped.
                   (smallest-target (min pow-limit (floor (* old-target smallest) timespan)))
-                  (min-new (bitcoin-lisp.storage:bits-to-target
-                            (bitcoin-lisp.storage:target-to-bits smallest-target))))
+                  (min-new (bl.store:bits-to-target
+                            (bl.store:target-to-bits smallest-target))))
              (not (or (< max-new observed) (> min-new observed)))))
           ;; Off a boundary, difficulty must not change at all.
           (t (= old-bits new-bits))))))
@@ -140,7 +140,7 @@ attacker who doesn't know the salt cannot craft a divergent phase-2 chain that
 reproduces the phase-1 commitments (Core SaltedUint256Hasher)."
   (let* ((salt (hss-salt hss))
          (buf (concatenate '(simple-array (unsigned-byte 8) (*)) salt header-hash))
-         (digest (bitcoin-lisp.crypto:sha256 buf)))
+         (digest (bl.crypto:sha256 buf)))
     (logand (aref digest 0) 1)))
 
 ;;; --- Construction
@@ -149,10 +149,10 @@ reproduces the phase-1 commitments (Core SaltedUint256Hasher)."
   "Median timestamp of ENTRY and up to its 10 ancestors (Core GetMedianTimePast)."
   (let ((times nil) (e entry) (n 0))
     (loop while (and e (< n 11))
-          do (push (bitcoin-lisp.serialization:block-header-timestamp
-                    (bitcoin-lisp.storage:block-index-entry-header e))
+          do (push (bl.ser:block-header-timestamp
+                    (bl.store:block-index-entry-header e))
                    times)
-             (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e))
+             (setf e (bl.store:block-index-entry-prev-entry e))
              (incf n))
     (let ((sorted (sort times #'<)))
       (if sorted (nth (floor (length sorted) 2) sorted) 0))))
@@ -164,19 +164,19 @@ reproduces the phase-1 commitments (Core SaltedUint256Hasher)."
     acc))
 
 (defun make-headers-sync (chain-start-entry min-work
-                          &key (network bitcoin-lisp:*network*)
-                               (now (bitcoin-lisp.serialization:get-unix-time))
+                          &key (network bl:*network*)
+                               (now (bl.ser:get-unix-time))
                                salt)
   "Build a HeadersSyncState to presync a peer's chain that branches from
 CHAIN-START-ENTRY (a block-index entry) and requires MIN-WORK total chain work
 before we will store it. SALT (16 bytes) may be supplied for deterministic
 tests; otherwise it is drawn from the OS CSPRNG. Mirrors Core's ctor."
   (destructuring-bind (period . buffer-size) (headers-sync-params network)
-    (let* ((header (bitcoin-lisp.storage:block-index-entry-header chain-start-entry))
-           (start-hash (bitcoin-lisp.storage:block-index-entry-hash chain-start-entry))
-           (start-bits (bitcoin-lisp.serialization:block-header-bits header))
-           (start-work (bitcoin-lisp.storage:block-index-entry-chain-work chain-start-entry))
-           (start-height (bitcoin-lisp.storage:block-index-entry-height chain-start-entry))
+    (let* ((header (bl.store:block-index-entry-header chain-start-entry))
+           (start-hash (bl.store:block-index-entry-hash chain-start-entry))
+           (start-bits (bl.ser:block-header-bits header))
+           (start-work (bl.store:block-index-entry-chain-work chain-start-entry))
+           (start-height (bl.store:block-index-entry-height chain-start-entry))
            (salt (or salt (ironclad:random-data 16)))
            ;; Secret offset in [0, period): commit at heights h where
            ;; (h mod period) == commit-offset.
@@ -210,7 +210,7 @@ tests; otherwise it is drawn from the OS CSPRNG. Mirrors Core's ctor."
 
 (defun hss-block-proof (bits)
   "Work contributed by a header with the given compact BITS (Core GetBlockProof)."
-  (bitcoin-lisp.storage:calculate-chain-work bits 0))
+  (bl.store:calculate-chain-work bits 0))
 
 (defun hss-validate-and-process-single (hss header)
   "PRESYNC: validate one HEADER's difficulty transition, store its commitment if
@@ -218,7 +218,7 @@ this height is a commitment height, and advance cumulative work/height. Returns
 NIL (caller aborts) if the transition is impermissible or the peer's chain has
 grown beyond max-commitments."
   (let ((next-height (1+ (hss-current-height hss)))
-        (bits (bitcoin-lisp.serialization:block-header-bits header)))
+        (bits (bl.ser:block-header-bits header)))
     (cond
       ((not (permitted-difficulty-transition (hss-network hss) next-height
                                              (hss-last-bits hss) bits))
@@ -226,11 +226,11 @@ grown beyond max-commitments."
       (t
        (when (= (mod next-height (hss-commitment-period hss)) (hss-commit-offset hss))
          (hss-queue-push (hss-commitments hss)
-                         (hss-commitment-bit hss (bitcoin-lisp.serialization:block-header-hash header)))
+                         (hss-commitment-bit hss (bl.ser:block-header-hash header)))
          (when (> (hss-queue-size (hss-commitments hss)) (hss-max-commitments hss))
            (return-from hss-validate-and-process-single nil)))
        (incf (hss-current-work hss) (hss-block-proof bits))
-       (setf (hss-last-hash hss) (bitcoin-lisp.serialization:block-header-hash header)
+       (setf (hss-last-hash hss) (bl.ser:block-header-hash header)
              (hss-last-bits hss) bits
              (hss-current-height hss) next-height)
        t))))
@@ -238,7 +238,7 @@ grown beyond max-commitments."
 (defun hss-validate-and-store-commitments (hss headers)
   "PRESYNC: process a batch, and if cumulative work crosses the threshold,
 transition to REDOWNLOAD. Returns NIL on any failure (caller aborts)."
-  (unless (equalp (bitcoin-lisp.serialization:block-header-prev-block (first headers))
+  (unless (equalp (bl.ser:block-header-prev-block (first headers))
                   (hss-last-hash hss))
     ;; Non-continuous with what we've seen — peer likely reorged; give up.
     (return-from hss-validate-and-store-commitments nil))
@@ -262,10 +262,10 @@ transition to REDOWNLOAD. Returns NIL on any failure (caller aborts)."
 (continuity, difficulty, and — at commitment heights — the stored commitment
 bit), and buffer it. Returns NIL (caller aborts) on any mismatch."
   (let ((next-height (1+ (hss-redownload-last-height hss)))
-        (bits (bitcoin-lisp.serialization:block-header-bits header))
-        (hash (bitcoin-lisp.serialization:block-header-hash header)))
+        (bits (bl.ser:block-header-bits header))
+        (hash (bl.ser:block-header-hash header)))
     (cond
-      ((not (equalp (bitcoin-lisp.serialization:block-header-prev-block header)
+      ((not (equalp (bl.ser:block-header-prev-block header)
                     (hss-redownload-last-hash hss)))
        nil)
       ((not (permitted-difficulty-transition (hss-network hss) next-height
@@ -348,11 +348,11 @@ failure or completion the sync is finalized. Mirrors ProcessNextHeaders."
 (Core LocatorEntries)."
   (let ((hashes nil) (step 1) (n 0) (e entry))
     (loop while e do
-      (push (bitcoin-lisp.storage:block-index-entry-hash e) hashes)
+      (push (bl.store:block-index-entry-hash e) hashes)
       (when (> n 10) (setf step (* step 2)))
       (dotimes (_ step)
         (when (null e) (return))
-        (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
+        (setf e (bl.store:block-index-entry-prev-entry e)))
       (incf n))
     (nreverse hashes)))
 
@@ -373,22 +373,22 @@ reorged (Core NextHeadersRequestLocator)."
 (defun headers-pow-valid-p (headers)
   "Core CheckHeadersPoW: every header satisfies its own claimed target and the
 batch is internally continuous. Required before feeding a batch to a sync."
-  (and (every #'bitcoin-lisp.validation:check-proof-of-work headers)
+  (and (every #'bl.val:check-proof-of-work headers)
        (loop for (a b) on headers
              while b
-             always (equalp (bitcoin-lisp.serialization:block-header-hash a)
-                            (bitcoin-lisp.serialization:block-header-prev-block b)))))
+             always (equalp (bl.ser:block-header-hash a)
+                            (bl.ser:block-header-prev-block b)))))
 
 (defun anti-dos-work-threshold (chain-state)
   "Core GetAntiDoSWorkThreshold: max(nMinimumChainWork, tip_work - 144·tip_proof).
 The 144-block buffer lets us accept headers that fork just below our tip."
-  (let* ((min-work (bitcoin-lisp:minimum-chain-work bitcoin-lisp:*network*))
-         (tip (bitcoin-lisp.storage:get-block-index-entry
-               chain-state (bitcoin-lisp.storage:best-block-hash chain-state))))
+  (let* ((min-work (bl:minimum-chain-work bl:*network*))
+         (tip (bl.store:get-block-index-entry
+               chain-state (bl.store:best-block-hash chain-state))))
     (if tip
-        (let* ((tip-work (bitcoin-lisp.storage:block-index-entry-chain-work tip))
-               (tip-bits (bitcoin-lisp.serialization:block-header-bits
-                          (bitcoin-lisp.storage:block-index-entry-header tip)))
+        (let* ((tip-work (bl.store:block-index-entry-chain-work tip))
+               (tip-bits (bl.ser:block-header-bits
+                          (bl.store:block-index-entry-header tip)))
                (tip-proof (hss-block-proof tip-bits))
                (near (- tip-work (min (* 144 tip-proof) tip-work))))
           (max near min-work))
@@ -396,9 +396,9 @@ The 144-block buffer lets us accept headers that fork just below our tip."
 
 (defun claimed-headers-work (chain-start-entry headers)
   "Total work a chain would have if HEADERS extend CHAIN-START-ENTRY."
-  (let ((w (bitcoin-lisp.storage:block-index-entry-chain-work chain-start-entry)))
+  (let ((w (bl.store:block-index-entry-chain-work chain-start-entry)))
     (dolist (h headers w)
-      (incf w (hss-block-proof (bitcoin-lisp.serialization:block-header-bits h))))))
+      (incf w (hss-block-proof (bl.ser:block-header-bits h))))))
 
 (defun maybe-start-presync (headers chain-state full-batch-p)
   "Decide whether a received header batch should be diverted into low-work
@@ -412,9 +412,9 @@ IGNORES such batches entirely rather than storing them (TryLowWorkHeadersSync
 dropped by CheckHeadersPoW before ever being stored), so callers must not
 fall back to a normal store when LOW-WORK-P is set. Mirrors the gate in
 ProcessHeadersMessage/TryLowWorkHeadersSync (net_processing.cpp:2767-2811)."
-  (let ((chain-start (bitcoin-lisp.storage:get-block-index-entry
+  (let ((chain-start (bl.store:get-block-index-entry
                       chain-state
-                      (bitcoin-lisp.serialization:block-header-prev-block (first headers)))))
+                      (bl.ser:block-header-prev-block (first headers)))))
     (when chain-start
       (let ((min-work (anti-dos-work-threshold chain-state)))
         (when (< (claimed-headers-work chain-start headers) min-work)

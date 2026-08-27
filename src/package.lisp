@@ -204,7 +204,7 @@ compile against them. src/util/bytes.lisp.")
 (defpackage #:bitcoin-lisp.serialization
   (:use #:cl)
   ;; The byte-buf / byte-reader live in bitcoin-lisp.bytes (src/util/bytes.lisp)
-  ;; and are re-exported here, so every existing bitcoin-lisp.serialization:bb-*
+  ;; and are re-exported here, so every existing bl.ser:bb-*
   ;; / br-* reference keeps working.
   (:import-from #:bitcoin-lisp.bytes
                 #:+max-compact-size+
@@ -1840,3 +1840,65 @@ compile against them. src/util/bytes.lisp.")
    #:maybe-validate-snapshot
    #:rebalance-caches-on-ibd-exit))
 
+
+;;;; Package-local nicknames
+;;;
+;;; Every project package sees every other one under a short name, so a
+;;; cross-package reference is written with the bl.ser prefix instead of the
+;;; full bitcoin-lisp.serialization one (about 5,300 of them in src/, 20,000
+;;; in tests/). The names carry the bl. prefix on purpose: a bare
+;;; crypto would shadow ironclad's global nickname CRYPTO inside our packages
+;;; and read as ironclad to anyone who knows it.
+;;;
+;;; SBCL refuses a nickname for a package that does not exist yet, and the
+;;; packages are defined in several files (this one, src/rpc/package.lisp,
+;;; src/coalton/package.lisp, src/coalton/interop.lisp, the tests), so each
+;;; of those calls INSTALL-PACKAGE-NICKNAMES after its DEFPACKAGE: the call
+;;; adds every nickname whose target exists to every project package, and
+;;; re-adding an existing mapping is a no-op. scripts/refactor/apply-nicknames.sh
+;;; rewrites a branch's explicit prefixes to these names.
+
+(in-package #:bitcoin-lisp)
+
+(defparameter *package-nicknames*
+  '(("BL" . "BITCOIN-LISP")
+    ("BL.BYTES" . "BITCOIN-LISP.BYTES")
+    ("BL.CRYPTO" . "BITCOIN-LISP.CRYPTO")
+    ("BL.SER" . "BITCOIN-LISP.SERIALIZATION")
+    ("BL.STORE" . "BITCOIN-LISP.STORAGE")
+    ("BL.VAL" . "BITCOIN-LISP.VALIDATION")
+    ("BL.MP" . "BITCOIN-LISP.MEMPOOL")
+    ("BL.MINING" . "BITCOIN-LISP.MINING")
+    ("BL.NET" . "BITCOIN-LISP.NETWORKING")
+    ("BL.RPC" . "BITCOIN-LISP.RPC")
+    ("BL.CTYPES" . "BITCOIN-LISP.COALTON.TYPES")
+    ("BL.CCRYPTO" . "BITCOIN-LISP.COALTON.CRYPTO")
+    ("BL.CBIN" . "BITCOIN-LISP.COALTON.BINARY")
+    ("BL.CSER" . "BITCOIN-LISP.COALTON.SERIALIZATION")
+    ("BL.SCRIPT" . "BITCOIN-LISP.COALTON.SCRIPT")
+    ("BL.INTEROP" . "BITCOIN-LISP.COALTON.INTEROP")
+    ("BL.TESTS" . "BITCOIN-LISP.TESTS"))
+  "(NICKNAME . package-name). Nicknames are matched case-sensitively against
+the reader's upcased token, so they are upper-case here and are written in
+lower case as prefixes in source. scripts/refactor/apply-nicknames.sh derives
+its rewrite rules from this table and tests/structural-tests.lisp resolves
+prefixes through it.")
+
+(defun install-package-nicknames ()
+  "Give every BITCOIN-LISP* package every nickname in *PACKAGE-NICKNAMES*
+whose target package exists. Called after each file that defines packages."
+  (dolist (package (list-all-packages))
+    (let ((name (package-name package)))
+      (when (uiop:string-prefix-p "BITCOIN-LISP" name)
+        (loop for (nickname . target) in *package-nicknames*
+              for target-package = (find-package target)
+              ;; a package nicknames itself too: files in the top package
+              ;; write bl::*node* like everyone else
+              when target-package
+                do (sb-ext:add-package-local-nickname nickname target-package package))))))
+
+;; Load time is enough here: nothing below reads a nickname, and every later
+;; file compiles after this FASL is loaded. The other package-defining files
+;; call it inside EVAL-WHEN because src/coalton/interop.lisp reads nicknames
+;; in the same file that defines its package.
+(install-package-nicknames)

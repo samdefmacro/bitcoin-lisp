@@ -221,21 +221,21 @@ multipath expansion — multipath descriptors are not supported at P0)."
   "Check the version prefix of parsed ext-key K against NETWORK (Core's
 DecodeExtKey/DecodeExtPubKey check chainparams EXT_SECRET_KEY/EXT_PUBLIC_KEY),
 plus key-material sanity."
-  (let ((version (bitcoin-lisp.crypto:ext-key-version k))
-        (key (bitcoin-lisp.crypto:ext-key-key k)))
+  (let ((version (bl.crypto:ext-key-version k))
+        (key (bl.crypto:ext-key-key k)))
     (and (if (eq network :mainnet)
-             (member version (list bitcoin-lisp.crypto:+xprv-mainnet+
-                                   bitcoin-lisp.crypto:+xpub-mainnet+))
-             (member version (list bitcoin-lisp.crypto:+xprv-testnet+
-                                   bitcoin-lisp.crypto:+xpub-testnet+)))
-         (if (bitcoin-lisp.crypto:ext-key-privatep k)
+             (member version (list bl.crypto:+xprv-mainnet+
+                                   bl.crypto:+xpub-mainnet+))
+             (member version (list bl.crypto:+xprv-testnet+
+                                   bl.crypto:+xpub-testnet+)))
+         (if (bl.crypto:ext-key-privatep k)
              (and (zerop (aref key 0))
                   (< 0
                      (reduce (lambda (acc b) (logior (ash acc 8) b))
                              (subseq key 1) :initial-value 0)
-                     bitcoin-lisp.crypto:+secp256k1-order+))
+                     bl.crypto:+secp256k1-order+))
              (and (member (aref key 0) '(2 3))
-                  (bitcoin-lisp.crypto:public-key-valid-p key))))))
+                  (bl.crypto:public-key-valid-p key))))))
 
 (defun %parse-desc-key-inner (str ctx network apostrophe-box)
   "Parse a key expression without origin info (Core's ParsePubkeyInner).
@@ -255,38 +255,38 @@ see %XONLY-CONTEXT-P — because only the aggregate is x-only."
     (when (null path-elems)
       ;; Hex pubkey?
       (when (%hex-string-p key-str)
-        (let* ((bytes (bitcoin-lisp.crypto:hex-to-bytes key-str))
+        (let* ((bytes (bl.crypto:hex-to-bytes key-str))
                (len (length bytes))
                (b0 (and (plusp len) (aref bytes 0)))
                (valid-header (or (and (= len 33) (member b0 '(2 3)))
                                  (and (= len 65) (member b0 '(4 6 7))))))
           (when (and valid-header (member b0 '(6 7)))
             (%desc-error "Hybrid public keys are not allowed"))
-          (cond ((and valid-header (bitcoin-lisp.crypto:public-key-valid-p bytes))
+          (cond ((and valid-header (bl.crypto:public-key-valid-p bytes))
                  (if (or permit-uncompressed (= len 33))
                      (return-from %parse-desc-key-inner
                        (make-desc-key :pubkey bytes :xonly-p nil))
                      (%desc-error "Uncompressed keys are not allowed")))
                 ((and (= len 32) (%xonly-context-p ctx))
                  (let ((full (concatenate '(vector (unsigned-byte 8)) #(2) bytes)))
-                   (when (bitcoin-lisp.crypto:public-key-valid-p full)
+                   (when (bl.crypto:public-key-valid-p full)
                      (return-from %parse-desc-key-inner
                        (make-desc-key :pubkey full :xonly-p t))))))
           (%desc-error "Pubkey '~A' is invalid" key-str)))
       ;; WIF private key?
       (multiple-value-bind (priv compressed wif-network)
-          (bitcoin-lisp.crypto:wif-to-private-key key-str)
+          (bl.crypto:wif-to-private-key key-str)
         (when (and priv (%wif-network-matches-p wif-network network))
           (unless (or permit-uncompressed compressed)
             (%desc-error "Uncompressed keys are not allowed"))
           (return-from %parse-desc-key-inner
-            (make-desc-key :pubkey (bitcoin-lisp.crypto:derive-public-key
+            (make-desc-key :pubkey (bl.crypto:derive-public-key
                                     priv :compressed compressed)
                            :xonly-p (%xonly-context-p ctx)
                            :privkey priv
                            :compressed-p compressed)))))
     ;; Extended key (with optional derivation path and ranged terminal).
-    (let ((k (bitcoin-lisp.crypto:bip32-parse key-str)))
+    (let ((k (bl.crypto:bip32-parse key-str)))
       (unless (and k (%extkey-valid-for-network-p k network))
         (%desc-error "key '~A' is not valid" key-str))
       ;; Ranged terminal is popped before the path is parsed (Core's
@@ -302,8 +302,8 @@ see %XONLY-CONTEXT-P — because only the aggregate is x-only."
                        (car apostrophe-box) (equal last "*'")
                        path-elems (butlast path-elems)))))
         (let ((path (%parse-key-path path-elems t apostrophe-box)))
-          (if (bitcoin-lisp.crypto:ext-key-privatep k)
-              (make-desc-key :extkey (bitcoin-lisp.crypto:bip32-neuter k)
+          (if (bl.crypto:ext-key-privatep k)
+              (make-desc-key :extkey (bl.crypto:bip32-neuter k)
                              :ext-privkey k
                              :path path :derive derive)
               (make-desc-key :extkey k :path path :derive derive)))))))
@@ -324,14 +324,14 @@ fixes one so every implementation derives the same children.")
   "The BIP328 synthetic xpub over AGGREGATE-PUBKEY: depth 0, zero fingerprint,
 child 0, the fixed MuSig2 chaincode (Core CreateMuSig2SyntheticXpub,
 musig.cpp:71). It is a derivation ROOT, not a key anyone published."
-  (bitcoin-lisp.crypto:make-ext-key
+  (bl.crypto:make-ext-key
    :version (if (eq network :mainnet)
-                bitcoin-lisp.crypto:+xpub-mainnet+
-                bitcoin-lisp.crypto:+xpub-testnet+)
+                bl.crypto:+xpub-mainnet+
+                bl.crypto:+xpub-testnet+)
    :depth 0
    :parent-fingerprint 0
    :child-number 0
-   :chain-code (bitcoin-lisp.crypto:hex-to-bytes *musig-chaincode-hex*)
+   :chain-code (bl.crypto:hex-to-bytes *musig-chaincode-hex*)
    :key (coerce aggregate-pubkey '(simple-array (unsigned-byte 8) (*)))
    :privatep nil))
 
@@ -436,7 +436,7 @@ Every error message here is Core's, verbatim."
                                                  nil apostrophe-box))
                    (key (%parse-desc-key-inner key-part ctx network apostrophe-box)))
               (setf (desc-key-origin-fingerprint key)
-                    (bitcoin-lisp.crypto:hex-to-bytes fpr-hex)
+                    (bl.crypto:hex-to-bytes fpr-hex)
                     (desc-key-origin-path key) origin-path
                     (desc-key-apostrophe key) (car apostrophe-box))
               key))))))
@@ -495,15 +495,15 @@ used only for DescriptorID stability across versions)."
      'string
      (if (desc-key-origin-fingerprint key)
          (format nil "[~A~A]"
-                 (bitcoin-lisp.crypto:bytes-to-hex (desc-key-origin-fingerprint key))
+                 (bl.crypto:bytes-to-hex (desc-key-origin-fingerprint key))
                  (%format-key-path (desc-key-origin-path key) apostrophe))
          "")
      (if (desc-key-pubkey key)
-         (bitcoin-lisp.crypto:bytes-to-hex
+         (bl.crypto:bytes-to-hex
           (if (desc-key-xonly-p key)
               (subseq (desc-key-pubkey key) 1)
               (desc-key-pubkey key)))
-         (bitcoin-lisp.crypto:bip32-serialize (desc-key-extkey key)))
+         (bl.crypto:bip32-serialize (desc-key-extkey key)))
      (if (desc-key-extkey key)
          (%format-key-path (desc-key-path key) apostrophe)
          "")
@@ -539,22 +539,22 @@ same descriptor written two ways would be two different ADDRESSES."
          (ranged (some #'desc-key-ranged-p participants))
          (pubkeys (mapcar (lambda (p) (%desc-key-pubkey-at p (if ranged pos 0)))
                           participants))
-         (aggregate (bitcoin-lisp.crypto:musig-aggregate-pubkeys
+         (aggregate (bl.crypto:musig-aggregate-pubkeys
                      (sort (copy-list pubkeys) #'%pubkey-lessp))))
     (unless aggregate
       (error 'descriptor-derivation-error))
     (if (and (null (desc-key-path key)) (eq (desc-key-derive key) :none))
         aggregate
         (let ((root (%musig-synthetic-xpub aggregate
-                                           (if (= (bitcoin-lisp.crypto:ext-key-version
+                                           (if (= (bl.crypto:ext-key-version
                                                    (or (desc-key-extkey (first participants))
                                                        (desc-key-ext-privkey (first participants))))
-                                                  bitcoin-lisp.crypto:+xpub-mainnet+)
+                                                  bl.crypto:+xpub-mainnet+)
                                                :mainnet :testnet3))))
-          (let ((k (bitcoin-lisp.crypto:bip32-derive-path root (desc-key-path key))))
+          (let ((k (bl.crypto:bip32-derive-path root (desc-key-path key))))
             (when (eq (desc-key-derive key) :unhardened)
-              (setf k (bitcoin-lisp.crypto:bip32-derive-child k pos)))
-            (bitcoin-lisp.crypto:ext-key-key k))))))
+              (setf k (bl.crypto:bip32-derive-child k pos)))
+            (bl.crypto:ext-key-key k))))))
 
 (defun %desc-key-pubkey-at (key pos)
   "The pubkey bytes KEY produces at range position POS (Core GetPubKey).
@@ -575,15 +575,15 @@ optional caches); keep the two derivation paths in sync."
                          (hardened (error 'descriptor-derivation-error))
                          (t (desc-key-extkey key)))))
         (handler-case
-            (let ((k (bitcoin-lisp.crypto:bip32-derive-path root (desc-key-path key))))
+            (let ((k (bl.crypto:bip32-derive-path root (desc-key-path key))))
               (ecase (desc-key-derive key)
                 (:none)
                 (:unhardened
-                 (setf k (bitcoin-lisp.crypto:bip32-derive-child k pos)))
+                 (setf k (bl.crypto:bip32-derive-child k pos)))
                 (:hardened
-                 (setf k (bitcoin-lisp.crypto:bip32-derive-child
-                          k (+ pos bitcoin-lisp.crypto:+bip32-hardened+)))))
-              (bitcoin-lisp.crypto:ext-key-public-bytes k))
+                 (setf k (bl.crypto:bip32-derive-child
+                          k (+ pos bl.crypto:+bip32-hardened+)))))
+              (bl.crypto:ext-key-public-bytes k))
           (descriptor-derivation-error (e) (error e))
           (error () (error 'descriptor-derivation-error))))))
 
@@ -829,7 +829,7 @@ ParseScriptContext::P2TR."
         (unless (eq ctx :top)
           (%desc-error "Can only have addr() at top level"))
         (multiple-value-bind (type script-pubkey)
-            (bitcoin-lisp.crypto:decode-address inner network)
+            (bl.crypto:decode-address inner network)
           (unless type
             (%desc-error "Address is not valid"))
           (return-from %parse-descriptor-body
@@ -874,7 +874,7 @@ ParseScriptContext::P2TR."
           (%desc-error "Raw script is not hex"))
         (return-from %parse-descriptor-body
           (make-out-desc :kind :raw
-                         :script (bitcoin-lisp.crypto:hex-to-bytes inner))))
+                         :script (bl.crypto:hex-to-bytes inner))))
       ;; Fallthrough. Inside wsh() Core tries miniscript here, which is what
       ;; makes policy descriptors -- timelocked recovery, decaying multisig --
       ;; expressible at all (Core descriptor.cpp ParseScript).
@@ -898,7 +898,7 @@ rules, its legal fragments and its resource limits are all stated per context,
 which is why the context travels with the node rather than being assumed."
   (let* ((keys '())
          (node (handler-case
-                   (let ((bitcoin-lisp.validation::*ms-key-parser*
+                   (let ((bl.val::*ms-key-parser*
                            (lambda (text)
                              (let ((key (%with-desc-error-prefix
                                          "miniscript: "
@@ -912,13 +912,13 @@ which is why the context travels with the node rather than being assumed."
                                             network)))))
                                (push key keys)
                                key))))
-                     (bitcoin-lisp.validation::ms-parse expr :ctx ms-ctx))
+                     (bl.val::ms-parse expr :ctx ms-ctx))
                  ;; Not a miniscript expression at all -- a bare pubkey, say.
                  ;; Core only reports a miniscript error when the expression
                  ;; PARSED and then failed its rules (descriptor.cpp:2600);
                  ;; an unparseable one falls through to the generic message,
                  ;; which is far more useful for the common typo.
-                 (bitcoin-lisp.validation::miniscript-parse-error ()
+                 (bl.val::miniscript-parse-error ()
                    (%desc-error "A function is needed within ~A"
                                 (if (eq ms-ctx :tapscript) "P2TR" "P2WSH"))))))
     (%check-miniscript-sane node)
@@ -941,34 +941,34 @@ The branch ORDER is Core's and is load-bearing: malleability is reported ahead
 of the missing signature, and NeedsSignature is only ever blamed on the TOP
 node (`insane_node == &node.value()'), because a sub that needs no signature is
 fine as long as the whole expression does."
-  (let ((v (bitcoin-lisp.validation::ms-node-sane-p node))
-        (satisfiable (not (bitcoin-lisp.validation::ms-node-not-satisfiable-p node))))
+  (let ((v (bl.val::ms-node-sane-p node))
+        (satisfiable (not (bl.val::ms-node-not-satisfiable-p node))))
     (when (and v satisfiable)
       (return-from %check-miniscript-sane node))
-    (let* ((sub (bitcoin-lisp.validation::ms-find-insane-sub node))
+    (let* ((sub (bl.val::ms-find-insane-sub node))
            (blamed (or sub node))
-           (text (bitcoin-lisp.validation::ms-node-to-string
+           (text (bl.val::ms-node-to-string
                   blamed (lambda (k) (desc-key-string k :public)))))
       (%desc-error
        "~A"
        (concatenate
         'string text
         (cond
-          ((not (bitcoin-lisp.validation::ms-node-valid-p blamed)) " is invalid")
+          ((not (bl.val::ms-node-valid-p blamed)) " is invalid")
           ((not v)
            (concatenate
             'string " is not sane"
             (cond
-              ((not (bitcoin-lisp.validation::ms-node-non-malleable-p blamed))
+              ((not (bl.val::ms-node-non-malleable-p blamed))
                ": malleable witnesses exist")
               ((and (null sub)
-                    (not (bitcoin-lisp.validation::ms-node-needs-signature-p blamed)))
+                    (not (bl.val::ms-node-needs-signature-p blamed)))
                ": witnesses without signature exist")
-              ((bitcoin-lisp.validation::ms-node-timelock-mix-p blamed)
+              ((bl.val::ms-node-timelock-mix-p blamed)
                ": contains mixes of timelocks expressed in blocks and seconds")
-              ((bitcoin-lisp.validation::ms-node-duplicate-keys-p blamed)
+              ((bl.val::ms-node-duplicate-keys-p blamed)
                ": contains duplicate public keys")
-              ((not (bitcoin-lisp.validation::ms-node-valid-satisfactions-p blamed))
+              ((not (bl.val::ms-node-valid-satisfactions-p blamed))
                ": needs witnesses that may exceed resource limits")
               (t ""))))
           (t " is not satisfiable")))))))
@@ -1081,7 +1081,7 @@ private, and normalized string forms (Core's ToStringHelper, parameterized
 by StringType, descriptor.cpp:909)."
   (ecase (out-desc-kind desc)
     (:addr (format nil "addr(~A)" (out-desc-address desc)))
-    (:raw (format nil "raw(~A)" (bitcoin-lisp.crypto:bytes-to-hex (out-desc-script desc))))
+    (:raw (format nil "raw(~A)" (bl.crypto:bytes-to-hex (out-desc-script desc))))
     ((:pk :pkh :wpkh :combo :rawtr)
      (format nil "~(~A~)(~A)" (out-desc-kind desc)
              (funcall keyfn (first (out-desc-keys desc)))))
@@ -1108,7 +1108,7 @@ by StringType, descriptor.cpp:909)."
     ;; private and normalized forms differ in exactly the way every other
     ;; descriptor's do.
     (:miniscript
-     (bitcoin-lisp.validation::ms-node-to-string (out-desc-node desc) keyfn))))
+     (bl.val::ms-node-to-string (out-desc-node desc) keyfn))))
 
 (defun tr-tree-string (tree render-leaf)
   "Re-emit a taproot script tree's braces from its depth sequence — the inverse
@@ -1154,7 +1154,7 @@ by their public forms, origins and hardened-marker style preserved. STYLE
 in COMPAT format — apostrophe hardened markers regardless of input style
 (Core DescriptorID, descriptor.cpp:2902: desc.ToString(/*compat_format=*/true)
 then CSHA256 over the string). Keys wallet records for this descriptor."
-  (bitcoin-lisp.crypto:sha256
+  (bl.crypto:sha256
    (flexi-streams:string-to-octets
     (descriptor-add-checksum (out-desc-string desc :compat))
     :external-format :ascii)))
@@ -1190,19 +1190,19 @@ Consumers that slice this list positionally depend on the order — see
 
 (defun %script-p2pkh (pubkey)
   (concatenate '(vector (unsigned-byte 8))
-               #(#x76 #xa9 #x14) (bitcoin-lisp.crypto:hash160 pubkey) #(#x88 #xac)))
+               #(#x76 #xa9 #x14) (bl.crypto:hash160 pubkey) #(#x88 #xac)))
 
 (defun %script-p2wpkh (pubkey)
   (concatenate '(vector (unsigned-byte 8))
-               #(#x00 #x14) (bitcoin-lisp.crypto:hash160 pubkey)))
+               #(#x00 #x14) (bl.crypto:hash160 pubkey)))
 
 (defun %script-p2sh (redeem-script)
   (concatenate '(vector (unsigned-byte 8))
-               #(#xa9 #x14) (bitcoin-lisp.crypto:hash160 redeem-script) #(#x87)))
+               #(#xa9 #x14) (bl.crypto:hash160 redeem-script) #(#x87)))
 
 (defun %script-p2wsh (witness-script)
   (concatenate '(vector (unsigned-byte 8))
-               #(#x00 #x20) (bitcoin-lisp.crypto:sha256 witness-script)))
+               #(#x00 #x20) (bl.crypto:sha256 witness-script)))
 
 (defun %script-p2tr (output-key32)
   (concatenate '(vector (unsigned-byte 8)) #(#x51 #x20) output-key32))
@@ -1288,7 +1288,7 @@ times."
   (flet ((extend (leaves sibling)
            (loop for (index . path) in leaves
                  collect (cons index (cons sibling path)))))
-    (cons (bitcoin-lisp.crypto:tap-branch-hash (car a) (car b))
+    (cons (bl.crypto:tap-branch-hash (car a) (car b))
           (append (extend (cdr a) (car b))
                   (extend (cdr b) (car a))))))
 
@@ -1439,7 +1439,7 @@ PATHS is NIL unless TRACK-PATHS — see %TAPROOT-TREE."
          (leaves (loop for entry in (out-desc-tree desc)
                        for script = (first (%out-desc-expand-1 (cdr entry) pos keyfn))
                        collect (cons script
-                                     (bitcoin-lisp.crypto:tap-leaf-hash
+                                     (bl.crypto:tap-leaf-hash
                                       +tapleaf-version-tapscript+ script))))
          (leaf-hashes (loop for entry in (out-desc-tree desc)
                             for leaf in leaves
@@ -1449,8 +1449,8 @@ PATHS is NIL unless TRACK-PATHS — see %TAPROOT-TREE."
             (%taproot-tree leaf-hashes track-paths)
             (values nil nil))
       (multiple-value-bind (output-key parity)
-          (bitcoin-lisp.crypto:tweak-xonly-pubkey
-           internal (bitcoin-lisp.crypto:tap-tweak-hash internal root))
+          (bl.crypto:tweak-xonly-pubkey
+           internal (bl.crypto:tap-tweak-hash internal root))
         (unless output-key
           (error 'descriptor-derivation-error))
         (values output-key parity internal leaves paths)))))
@@ -1524,7 +1524,7 @@ resolving each key expression's pubkey via (KEYFN desc-key)."
     (:miniscript
      ;; One parsed node, a different script per range index: the converter is
      ;; what turns each key expression into the pubkey for THIS position.
-     (list (bitcoin-lisp.validation::ms-node-script
+     (list (bl.val::ms-node-script
             (out-desc-node desc) nil keyfn)))))
 
 (defun %out-desc-expand-uncached (desc pos)
@@ -1613,16 +1613,16 @@ an inner table keyed by derivation (range) index."
   (setf (gethash expr-index (descriptor-cache-last-hardened-xpubs cache)) xpub))
 
 (defun %ext-key-equal-p (a b)
-  (and (= (bitcoin-lisp.crypto:ext-key-depth a)
-          (bitcoin-lisp.crypto:ext-key-depth b))
-       (= (bitcoin-lisp.crypto:ext-key-parent-fingerprint a)
-          (bitcoin-lisp.crypto:ext-key-parent-fingerprint b))
-       (= (bitcoin-lisp.crypto:ext-key-child-number a)
-          (bitcoin-lisp.crypto:ext-key-child-number b))
-       (equalp (bitcoin-lisp.crypto:ext-key-chain-code a)
-               (bitcoin-lisp.crypto:ext-key-chain-code b))
-       (equalp (bitcoin-lisp.crypto:ext-key-key a)
-               (bitcoin-lisp.crypto:ext-key-key b))))
+  (and (= (bl.crypto:ext-key-depth a)
+          (bl.crypto:ext-key-depth b))
+       (= (bl.crypto:ext-key-parent-fingerprint a)
+          (bl.crypto:ext-key-parent-fingerprint b))
+       (= (bl.crypto:ext-key-child-number a)
+          (bl.crypto:ext-key-child-number b))
+       (equalp (bl.crypto:ext-key-chain-code a)
+               (bl.crypto:ext-key-chain-code b))
+       (equalp (bl.crypto:ext-key-key a)
+               (bl.crypto:ext-key-key b))))
 
 (defun descriptor-cache-merge-and-diff (cache new-items)
   "Merge NEW-ITEMS into CACHE and return a fresh descriptor-cache holding only
@@ -1663,8 +1663,8 @@ Core's cache-corruption check."
 (defun %desc-key-root-keyid (key)
   "hash160 of the root pubkey of a BIP32 key expression — the CKeyID under
 which the wallet stores the root private key."
-  (bitcoin-lisp.crypto:hash160
-   (bitcoin-lisp.crypto:ext-key-public-bytes (desc-key-extkey key))))
+  (bl.crypto:hash160
+   (bl.crypto:ext-key-public-bytes (desc-key-extkey key))))
 
 (defun %desc-key-root-xprv (key privkey-provider)
   "The root extended PRIVATE key for a BIP32 key expression, or NIL. Prefers
@@ -1677,15 +1677,15 @@ the xpub, substitute the private key material)."
         (let* ((pub (desc-key-extkey key))
                (priv (funcall privkey-provider (%desc-key-root-keyid key))))
           (when priv
-            (bitcoin-lisp.crypto:make-ext-key
-             :version (if (= (bitcoin-lisp.crypto:ext-key-version pub)
-                             bitcoin-lisp.crypto:+xpub-mainnet+)
-                          bitcoin-lisp.crypto:+xprv-mainnet+
-                          bitcoin-lisp.crypto:+xprv-testnet+)
-             :depth (bitcoin-lisp.crypto:ext-key-depth pub)
-             :parent-fingerprint (bitcoin-lisp.crypto:ext-key-parent-fingerprint pub)
-             :child-number (bitcoin-lisp.crypto:ext-key-child-number pub)
-             :chain-code (bitcoin-lisp.crypto:ext-key-chain-code pub)
+            (bl.crypto:make-ext-key
+             :version (if (= (bl.crypto:ext-key-version pub)
+                             bl.crypto:+xpub-mainnet+)
+                          bl.crypto:+xprv-mainnet+
+                          bl.crypto:+xprv-testnet+)
+             :depth (bl.crypto:ext-key-depth pub)
+             :parent-fingerprint (bl.crypto:ext-key-parent-fingerprint pub)
+             :child-number (bl.crypto:ext-key-child-number pub)
+             :chain-code (bl.crypto:ext-key-chain-code pub)
              :key (concatenate '(vector (unsigned-byte 8)) #(0) priv)
              :privatep t))))))
 
@@ -1714,32 +1714,32 @@ derived / last-hardened xpubs exactly as Core caches them."
                    (t (let ((p (descriptor-cache-parent read-cache expr-index)))
                         (unless p (error 'descriptor-derivation-error))
                         (setf final (if (eq derive :unhardened)
-                                        (bitcoin-lisp.crypto:bip32-derive-child p pos)
+                                        (bl.crypto:bip32-derive-child p pos)
                                         p)))))))
           (hardened-p
            (let ((xprv (%desc-key-root-xprv key privkey-provider)))
              (unless xprv (error 'descriptor-derivation-error))
              (let ((k xprv) (lh nil))
                (dolist (entry path)
-                 (setf k (bitcoin-lisp.crypto:bip32-derive-child k entry))
+                 (setf k (bl.crypto:bip32-derive-child k entry))
                  (when (logbitp 31 entry) (setf lh k)))
-               (setf parent (bitcoin-lisp.crypto:bip32-neuter k))
+               (setf parent (bl.crypto:bip32-neuter k))
                (ecase derive
                  (:none)
                  (:unhardened
-                  (setf k (bitcoin-lisp.crypto:bip32-derive-child k pos)))
+                  (setf k (bl.crypto:bip32-derive-child k pos)))
                  (:hardened
-                  (setf k (bitcoin-lisp.crypto:bip32-derive-child
-                           k (+ pos bitcoin-lisp.crypto:+bip32-hardened+)))))
-               (setf final (bitcoin-lisp.crypto:bip32-neuter k))
-               (when lh (setf last-hardened (bitcoin-lisp.crypto:bip32-neuter lh))))))
+                  (setf k (bl.crypto:bip32-derive-child
+                           k (+ pos bl.crypto:+bip32-hardened+)))))
+               (setf final (bl.crypto:bip32-neuter k))
+               (when lh (setf last-hardened (bl.crypto:bip32-neuter lh))))))
           (t
            (let ((k (desc-key-extkey key)))
              (dolist (entry path)
-               (setf k (bitcoin-lisp.crypto:bip32-derive-child k entry)))
+               (setf k (bl.crypto:bip32-derive-child k entry)))
              (setf parent k)
              (setf final (if (eq derive :unhardened)
-                             (bitcoin-lisp.crypto:bip32-derive-child k pos)
+                             (bl.crypto:bip32-derive-child k pos)
                              k)))))
       (descriptor-derivation-error (e) (error e))
       (error () (error 'descriptor-derivation-error)))
@@ -1754,7 +1754,7 @@ derived / last-hardened xpubs exactly as Core caches them."
               (setf (descriptor-cache-last-hardened write-cache expr-index)
                     last-hardened)))
           (setf (descriptor-cache-derived write-cache expr-index pos) final)))
-    (bitcoin-lisp.crypto:ext-key-public-bytes final)))
+    (bl.crypto:ext-key-public-bytes final)))
 
 (defun %out-desc-expand-cached (desc pos &key read-cache write-cache privkey-provider)
   "Expand DESC at POS through the wallet cache machinery. Returns
@@ -1815,11 +1815,11 @@ XOnlyPubKey::GetKeyIDs)."
          (let* ((full (concatenate '(vector (unsigned-byte 8))
                                    (vector prefix) x))
                 (priv (funcall privkey-provider
-                               (bitcoin-lisp.crypto:hash160 full))))
+                               (bl.crypto:hash160 full))))
            (when priv (return (values priv t)))))))
     (t
      (let ((priv (funcall privkey-provider
-                          (bitcoin-lisp.crypto:hash160 (desc-key-pubkey key)))))
+                          (bl.crypto:hash160 (desc-key-pubkey key)))))
        (when priv (values priv (= (length (desc-key-pubkey key)) 33)))))))
 
 (defun desc-key-private-string (key network privkey-provider)
@@ -1829,7 +1829,7 @@ const keys, xprv for BIP32 keys, hardened markers in input style. Returns
 returned with HAS-PRIV-P nil."
   (let ((origin (if (desc-key-origin-fingerprint key)
                     (format nil "[~A~A]"
-                            (bitcoin-lisp.crypto:bytes-to-hex
+                            (bl.crypto:bytes-to-hex
                              (desc-key-origin-fingerprint key))
                             (%format-key-path (desc-key-origin-path key)
                                               (desc-key-apostrophe key)))
@@ -1839,7 +1839,7 @@ returned with HAS-PRIV-P nil."
             (%desc-key-privkey-for key privkey-provider)
           (if priv
               (values (concatenate 'string origin
-                                   (bitcoin-lisp.crypto:private-key-to-wif
+                                   (bl.crypto:private-key-to-wif
                                     priv
                                     :network (if (eq network :mainnet) :mainnet :testnet)
                                     :compressed compressed))
@@ -1849,7 +1849,7 @@ returned with HAS-PRIV-P nil."
           (if xprv
               (values (concatenate
                        'string origin
-                       (bitcoin-lisp.crypto:bip32-serialize xprv)
+                       (bl.crypto:bip32-serialize xprv)
                        (%format-key-path (desc-key-path key)
                                          (desc-key-apostrophe key))
                        (ecase (desc-key-derive key)
@@ -1871,7 +1871,7 @@ entry and no private key)."
            ;; with an origin the inner normalization produced.
            (if (desc-key-origin-fingerprint key)
                (let ((origin (format nil "~A~A"
-                                     (bitcoin-lisp.crypto:bytes-to-hex
+                                     (bl.crypto:bytes-to-hex
                                       (desc-key-origin-fingerprint key))
                                      (%format-key-path (desc-key-origin-path key) nil))))
                  (if (and (plusp (length sub)) (char= (char sub 0) #\[))
@@ -1887,7 +1887,7 @@ entry and no private key)."
       ((eq (desc-key-derive key) :hardened)
        (values (wrap-origin
                 (concatenate 'string
-                             (bitcoin-lisp.crypto:bip32-serialize (desc-key-extkey key))
+                             (bl.crypto:bip32-serialize (desc-key-extkey key))
                              (%format-key-path (desc-key-path key) nil)
                              "/*h"))
                t))
@@ -1906,17 +1906,17 @@ entry and no private key)."
                                 (when xprv
                                   (let ((k xprv))
                                     (dolist (entry origin-path
-                                                   (bitcoin-lisp.crypto:bip32-neuter k))
-                                      (setf k (bitcoin-lisp.crypto:bip32-derive-child
+                                                   (bl.crypto:bip32-neuter k))
+                                      (setf k (bl.crypto:bip32-derive-child
                                                k entry)))))))))
                (if (null xpub)
                    (values (desc-key-string key) nil)
                    (values (wrap-origin
                             (concatenate
                              'string
-                             "[" (bitcoin-lisp.crypto:bytes-to-hex fingerprint)
+                             "[" (bl.crypto:bytes-to-hex fingerprint)
                              (%format-key-path origin-path nil) "]"
-                             (bitcoin-lisp.crypto:bip32-serialize xpub)
+                             (bl.crypto:bip32-serialize xpub)
                              (%format-key-path end-path nil)
                              (if (eq (desc-key-derive key) :unhardened) "/*" "")))
                            t)))))))))
@@ -2047,19 +2047,19 @@ encoders in crypto/address.lisp."
         ;; P2PKH: OP_DUP OP_HASH160 14 <20> OP_EQUALVERIFY OP_CHECKSIG
         ((and (= len 25) (= (b 0) #x76) (= (b 1) #xa9) (= (b 2) #x14)
               (= (b 23) #x88) (= (b 24) #xac))
-         (bitcoin-lisp.crypto:encode-p2pkh-address (subseq script 3 23) network))
+         (bl.crypto:encode-p2pkh-address (subseq script 3 23) network))
         ;; P2SH: OP_HASH160 14 <20> OP_EQUAL
         ((and (= len 23) (= (b 0) #xa9) (= (b 1) #x14) (= (b 22) #x87))
-         (bitcoin-lisp.crypto:encode-p2sh-address (subseq script 2 22) network))
+         (bl.crypto:encode-p2sh-address (subseq script 2 22) network))
         ;; P2WPKH: OP_0 14 <20>
         ((and (= len 22) (= (b 0) #x00) (= (b 1) #x14))
-         (bitcoin-lisp.crypto:encode-p2wpkh-address (subseq script 2 22) network))
+         (bl.crypto:encode-p2wpkh-address (subseq script 2 22) network))
         ;; P2WSH: OP_0 20 <32>
         ((and (= len 34) (= (b 0) #x00) (= (b 1) #x20))
-         (bitcoin-lisp.crypto:encode-p2wsh-address (subseq script 2 34) network))
+         (bl.crypto:encode-p2wsh-address (subseq script 2 34) network))
         ;; P2TR: OP_1 20 <32>
         ((and (= len 34) (= (b 0) #x51) (= (b 1) #x20))
-         (bitcoin-lisp.crypto:encode-p2tr-address (subseq script 2 34) network))
+         (bl.crypto:encode-p2tr-address (subseq script 2 34) network))
         (t nil)))))
 
 (defun %script-p2pk-p (script)
@@ -2078,7 +2078,7 @@ outputs (gettxout, decoderawtransaction, getblock verbosity 2, decodescript)."
     (descriptor-add-checksum
      (if addr
          (format nil "addr(~A)" addr)
-         (format nil "raw(~A)" (bitcoin-lisp.crypto:bytes-to-hex script))))))
+         (format nil "raw(~A)" (bl.crypto:bytes-to-hex script))))))
 
 ;;; --- Descriptor RPCs (getdescriptorinfo / deriveaddresses) ---
 

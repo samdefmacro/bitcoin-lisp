@@ -76,7 +76,7 @@ nothing outside this node ever reads this database."
           (aref buf 33) (logand (ash vout -8) #xFF)
           (aref buf 34) (logand (ash vout -16) #xFF)
           (aref buf 35) (logand (ash vout -24) #xFF))
-    (bitcoin-lisp.crypto:siphash-2-4 (txospender-index-k0 index)
+    (bl.crypto:siphash-2-4 (txospender-index-k0 index)
                                      (txospender-index-k1 index)
                                      buf)))
 
@@ -167,18 +167,18 @@ TX-POSITION is the offset of the spending transaction within the block's
 serialization, the same locator the txindex stores."
   (let ((entries '())
         (position 0))
-    (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
-          for inputs = (bitcoin-lisp.serialization:transaction-inputs tx)
+    (loop for tx in (bl.ser:bitcoin-block-transactions block)
+          for inputs = (bl.ser:transaction-inputs tx)
           for coinbase = (and (= 1 (length inputs))
-                              (bitcoin-lisp.serialization:coinbase-input-p (aref inputs 0)))
+                              (bl.ser:coinbase-input-p (aref inputs 0)))
           do (unless coinbase
                (loop for input across inputs
-                     for outpoint = (bitcoin-lisp.serialization:tx-in-previous-output input)
-                     do (push (list (bitcoin-lisp.serialization:outpoint-hash outpoint)
-                                    (bitcoin-lisp.serialization:outpoint-index outpoint)
+                     for outpoint = (bl.ser:tx-in-previous-output input)
+                     do (push (list (bl.ser:outpoint-hash outpoint)
+                                    (bl.ser:outpoint-index outpoint)
                                     position)
                               entries)))
-             (incf position (length (bitcoin-lisp.serialization:transaction-wire-bytes tx))))
+             (incf position (length (bl.ser:transaction-wire-bytes tx))))
     (nreverse entries)))
 
 (defun txospenderindex-add-block (index block block-hash)

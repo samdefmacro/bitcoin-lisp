@@ -161,7 +161,7 @@ address's NETWORK TAG, not its bytes — so a CJDNS address (same prefix, tagged
 NET_CJDNS) is routable and an unsuffixed -proxy covers it (init.cpp:1735).
 Telling ULA from CJDNS needs that tag, which a bare host string does not carry,
 so this stays out rather than guessing."
-  (let ((ip (bitcoin-lisp.networking::string-to-ip-bytes host)))
+  (let ((ip (bl.net::string-to-ip-bytes host)))
     (when ip
       (flet ((v4 () (and (ipv4-mapped-p ip) (subseq ip 12))))
         (let ((a (v4)))
@@ -287,7 +287,7 @@ or NIL on any invalid input."
     (replace material (map 'vector #'char-code ".onion checksum"))
     (replace material pubkey :start1 15)
     (setf (aref material 47) +torv3-version-byte+)
-    (subseq (bitcoin-lisp.crypto:sha3-256 material) 0 2)))
+    (subseq (bl.crypto:sha3-256 material) 0 2)))
 
 (defun onion-address-string (pubkey)
   "Format a 32-byte TORv3 ed25519 PUBKEY as its .onion address string
@@ -534,7 +534,7 @@ address is (now) present."
     (return-from add-local nil))
   (unless (reachable-network-p network)
     (return-from add-local nil))
-  (bitcoin-lisp:log-info "AddLocal(~A:~D,~D)"
+  (bl:log-info "AddLocal(~A:~D,~D)"
                          (network-address-to-string network bytes) port score)
   (bt:with-lock-held (*local-addresses-lock*)
     (let ((existing (%find-local-address network bytes)))
@@ -552,7 +552,7 @@ address is (now) present."
 (defun remove-local (network bytes)
   "Forget a local address (Core RemoveLocal, net.cpp:310-315; keyed by
 address only, like the map)."
-  (bitcoin-lisp:log-info "RemoveLocal(~A)"
+  (bl:log-info "RemoveLocal(~A)"
                          (network-address-to-string network bytes))
   (bt:with-lock-held (*local-addresses-lock*)
     (let ((la (%find-local-address network bytes)))
@@ -929,7 +929,7 @@ would have exactly the eclipse exposure the operator was trying to close."
       ;; the size (util/asmap.cpp:331); the "Using asmap version" line comes
       ;; later, from init. feature_asmap.py greps for both, which is why they
       ;; are two lines and not one.
-      (bitcoin-lisp:log-info "Opened asmap file \"~A\" (~D bytes) from disk"
+      (bl:log-info "Opened asmap file \"~A\" (~D bytes) from disk"
                              (namestring path) size)
       size)))
 
@@ -943,6 +943,6 @@ is the thing an operator comparing two nodes actually needs."
   ;; gives the right bytes in the wrong order, which reads as a completely
   ;; different version and matches nothing an operator can compare against.
   (when (and *asmap* (plusp (length *asmap*)))
-    (bitcoin-lisp.crypto:bytes-to-hex
-     (bitcoin-lisp.crypto:reverse-bytes
-      (bitcoin-lisp.crypto:hash256 *asmap*)))))
+    (bl.crypto:bytes-to-hex
+     (bl.crypto:reverse-bytes
+      (bl.crypto:hash256 *asmap*)))))

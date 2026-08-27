@@ -76,7 +76,7 @@ time, like the cluster limits.")
 
 (defstruct mempool-entry
   "An entry in the mempool."
-  (transaction nil :type bitcoin-lisp.serialization:transaction)
+  (transaction nil :type bl.ser:transaction)
   (fee 0 :type (unsigned-byte 64))
   ;; Fee plus any prioritisetransaction delta (Core's GetModifiedFee). This is
   ;; the value mining selection, eviction, and RBF scoring see; FEE stays the
@@ -215,9 +215,9 @@ nUsageSize: RecursiveDynamicUsage(CTransactionRef) (core_memusage.h:32-41,
 vector allocations, each input's scriptSig (prevector) and witness stack
 (outer vector + one exact-sized allocation per stack item), and each
 output's scriptPubKey."
-  (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-         (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
-         (witness (bitcoin-lisp.serialization:transaction-witness tx))
+  (let* ((inputs (bl.ser:transaction-inputs tx))
+         (outputs (bl.ser:transaction-outputs tx))
+         (witness (bl.ser:transaction-witness tx))
          (usage (+ ;; DynamicUsage(shared_ptr<CTransaction>): object +
                    ;; control block, each a separate modeled malloc
                    ;; (memusage.h:156-163).
@@ -226,12 +226,12 @@ output's scriptPubKey."
                    ;; DynamicUsage(tx.vin) + DynamicUsage(tx.vout).
                    (malloc-usage (* (length inputs) +sizeof-ctxin+))
                    (malloc-usage (* (length outputs) +sizeof-ctxout+)))))
-    (bitcoin-lisp.serialization:dovector (input inputs)
-      (incf usage (%script-usage (bitcoin-lisp.serialization:tx-in-script-sig input))))
-    (bitcoin-lisp.serialization:dovector (output outputs)
-      (incf usage (%script-usage (bitcoin-lisp.serialization:tx-out-script-pubkey output))))
+    (bl.ser:dovector (input inputs)
+      (incf usage (%script-usage (bl.ser:tx-in-script-sig input))))
+    (bl.ser:dovector (output outputs)
+      (incf usage (%script-usage (bl.ser:tx-out-script-pubkey output))))
     (when witness
-      (bitcoin-lisp.serialization:dovector (wstack witness)
+      (bl.ser:dovector (wstack witness)
         (when wstack
           ;; The stack's outer vector, then each item's own allocation
           ;; (std::vector<uchar> has no small-buffer optimization, so even
@@ -250,11 +250,11 @@ fields (handle-tx, sendrawtransaction, reorg re-add)."
    :transaction tx
    :fee fee
    :modified-fee fee
-   :size (length (bitcoin-lisp.serialization:transaction-wire-bytes tx))
+   :size (length (bl.ser:transaction-wire-bytes tx))
    :usage (transaction-dynamic-usage tx)
-   :vsize (sigop-adjusted-vsize (bitcoin-lisp.serialization:transaction-weight tx)
+   :vsize (sigop-adjusted-vsize (bl.ser:transaction-weight tx)
                                 sigops)
-   :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)
+   :wtxid (bl.ser:transaction-wtxid tx)
    :sigops sigops
    :height height
    :entry-time entry-time))
@@ -447,7 +447,7 @@ non-decreasing, since each half only ever grows."
   (let ((admitted (1- (mempool-next-sequence mempool))))
     (+ admitted (- admitted (mempool-count mempool)))))
 
-(defun mempool-effective-min-fee-rate (mempool &optional (now (bitcoin-lisp.serialization:get-unix-time)))
+(defun mempool-effective-min-fee-rate (mempool &optional (now (bl.ser:get-unix-time)))
   "Effective minimum fee rate to enter the mempool, in SAT/KVB: the relay floor,
 or the decayed rolling minimum if higher (Bitcoin Core CTxMemPool::GetMinFee,
 CFeeRate::GetFeePerK units). Compare as (>= (* fee 1000) (* rate vsize)).
@@ -459,7 +459,7 @@ half the incremental relay fee resets to zero (txmempool.cpp:845-848)."
        (mempool-decayed-rolling-min-fee-rate mempool now)))
 
 (defun mempool-decayed-rolling-min-fee-rate (mempool
-                                             &optional (now (bitcoin-lisp.serialization:get-unix-time)))
+                                             &optional (now (bl.ser:get-unix-time)))
   "The DECAYED rolling minimum ALONE, in sat/kvB, or 0 when there is none.
 
 This is exactly Core's CTxMemPool::GetMinFee, which does NOT fold in
@@ -516,7 +516,7 @@ follow (MEMPOOL-UPDATE-FOR-REORG), so ALL the checks - including the cheap
 tx-count equality - only run at batch end.")
 
 (defun %short-txid (txid)
-  (bitcoin-lisp.crypto:bytes-to-hex (subseq txid 0 8)))
+  (bl.crypto:bytes-to-hex (subseq txid 0 8)))
 
 (defun %graph-closure-equal-p (closure self bfs-set)
   "True when CLOSURE (a txgraph ancestor/descendant handle list, which
@@ -563,7 +563,7 @@ everything is deferred to the batch-end verify."
           (error "txgraph shadow divergence: graph has ~D transactions, ~
                   mempool has ~D"
                  (txgraph-tx-count graph) count)
-          (bitcoin-lisp:log-warn
+          (bl:log-warn
            "txgraph shadow divergence: graph ~D txs, mempool ~D"
            (txgraph-tx-count graph) count)))
     (when (and *txgraph-shadow-checks* (not *graph-verify-batch*))
@@ -636,11 +636,11 @@ or NIL if no mempool tx spends it. Used by the gettxspendingprevout RPC."
 (defun mempool-check-conflict (mempool tx)
   "Check if TX conflicts with any existing mempool entry.
 Returns the txid of the conflicting transaction, or NIL if no conflict."
-  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-    (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+  (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+    (let* ((prevout (bl.ser:tx-in-previous-output input))
            (key (make-outpoint-key
-                 (bitcoin-lisp.serialization:outpoint-hash prevout)
-                 (bitcoin-lisp.serialization:outpoint-index prevout)))
+                 (bl.ser:outpoint-hash prevout)
+                 (bl.ser:outpoint-index prevout)))
            (spending-txid (gethash key (mempool-spent-outpoints mempool))))
       (when spending-txid
         (return-from mempool-check-conflict spending-txid))))
@@ -652,9 +652,9 @@ Returns the txid of the conflicting transaction, or NIL if no conflict."
   "Return the distinct txids of TX's inputs that are themselves in the mempool."
   (let ((seen (make-hash-table :test 'equalp))
         (result '()))
-    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-      (let ((ptxid (bitcoin-lisp.serialization:outpoint-hash
-                    (bitcoin-lisp.serialization:tx-in-previous-output input))))
+    (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+      (let ((ptxid (bl.ser:outpoint-hash
+                    (bl.ser:tx-in-previous-output input))))
         (when (and (mempool-has mempool ptxid) (not (gethash ptxid seen)))
           (setf (gethash ptxid seen) t)
           (push ptxid result))))
@@ -772,13 +772,13 @@ ancestor set is exactly {parent, itself} (Core truc_policy.cpp:250-252) — it i
 that sibling's txid. The caller (validate-transaction-for-mempool, mirroring
 Core PreChecks validation.cpp:950-970) may then treat the sibling as a
 to-be-replaced conflict and re-run the RBF economics, instead of rejecting."
-  (let* ((version (bitcoin-lisp.serialization:transaction-version tx))
+  (let* ((version (bl.ser:transaction-version tx))
          (parents (mempool-find-parents mempool tx))
          (v3 (= version +truc-version+)))
     ;; 1. TRUC / non-TRUC inheritance, both directions.
     (dolist (p parents)
       (let* ((pe (mempool-get mempool p))
-             (pv (and pe (bitcoin-lisp.serialization:transaction-version
+             (pv (and pe (bl.ser:transaction-version
                           (mempool-entry-transaction pe)))))
         (when pe
           (cond
@@ -846,7 +846,7 @@ to-be-replaced conflict and re-run the RBF economics, instead of rejecting."
 
 (defun accept-validated-tx (mempool txid tx fee height
                             &key (entry-time
-                                  (bitcoin-lisp.serialization:get-unix-time))
+                                  (bl.ser:get-unix-time))
                                  (sigops 0) replaced defer-trim)
   "The shared tail of every mempool acceptance path (peer tx handler,
 orphan cascade, sendrawtransaction, mempool.dat reload, reorg re-add,
@@ -873,7 +873,7 @@ RESULT is mempool-add's keyword. DEFER-TRIM is threaded to MEMPOOL-ADD
         ;; ZMQ TransactionAddedToMempool: hashtx/rawtx, then a sequence 'A'
         ;; carrying the sequence THIS entry was stamped with -- a subscriber
         ;; uses it to order acceptances against removals.
-        (bitcoin-lisp:zmq-notify-tx-accepted tx txid (mempool-entry-sequence entry)))
+        (bl:zmq-notify-tx-accepted tx txid (mempool-entry-sequence entry)))
       (values result entry))))
 
 (defvar *mempool-removal-reason* nil
@@ -962,12 +962,12 @@ runs unconditionally (validation.cpp:1338-1342)."
       (setf (gethash wtxid (mempool-by-wtxid mempool)) txid)))
 
   ;; Index spent outpoints
-  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs
+  (bl.ser:dovector (input (bl.ser:transaction-inputs
                   (mempool-entry-transaction entry)))
-    (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+    (let* ((prevout (bl.ser:tx-in-previous-output input))
            (key (make-outpoint-key
-                 (bitcoin-lisp.serialization:outpoint-hash prevout)
-                 (bitcoin-lisp.serialization:outpoint-index prevout))))
+                 (bl.ser:outpoint-hash prevout)
+                 (bl.ser:outpoint-index prevout))))
       (setf (gethash key (mempool-spent-outpoints mempool)) txid)))
 
   ;; Update the running totals (Core addNewTransaction, txmempool.cpp:250:
@@ -997,7 +997,7 @@ runs unconditionally (validation.cpp:1338-1342)."
   ;; Core's package path fires the added signal before its final re-limit
   ;; too (SubmitPackage, validation.cpp:1292-1310) — the eviction then
   ;; surfaces as a :size-limit removal.
-  (bitcoin-lisp:wallet-notify-mempool-tx-added (mempool-entry-transaction entry))
+  (bl:wallet-notify-mempool-tx-added (mempool-entry-transaction entry))
   :ok)
 
 (defun mempool-remove (mempool txid)
@@ -1026,14 +1026,14 @@ shadow checks report as divergence."
         ;; mined transaction is announced by the block notification, and
         ;; reporting it here too would show subscribers a removal that never
         ;; happened.
-        (bitcoin-lisp:zmq-notify-tx-removed txid (mempool-entry-sequence entry)))
+        (bl:zmq-notify-tx-removed txid (mempool-entry-sequence entry)))
       ;; Remove spent outpoint entries
-      (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs
+      (bl.ser:dovector (input (bl.ser:transaction-inputs
                       (mempool-entry-transaction entry)))
-        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+        (let* ((prevout (bl.ser:tx-in-previous-output input))
                (key (make-outpoint-key
-                     (bitcoin-lisp.serialization:outpoint-hash prevout)
-                     (bitcoin-lisp.serialization:outpoint-index prevout))))
+                     (bl.ser:outpoint-hash prevout)
+                     (bl.ser:outpoint-index prevout))))
           (remhash key (mempool-spent-outpoints mempool))))
       ;; Remove wtxid index
       (let ((wtxid (mempool-entry-wtxid entry)))
@@ -1061,7 +1061,7 @@ shadow checks report as divergence."
       ;; Wallet chain-tracking hook — the single removal chokepoint, like
       ;; Core removeUnchecked's TransactionRemovedFromMempool signal. The
       ;; hook itself skips reason :block (Core txmempool.cpp:269-275).
-      (bitcoin-lisp:wallet-notify-mempool-tx-removed
+      (bl:wallet-notify-mempool-tx-removed
        (mempool-entry-transaction entry) *mempool-removal-reason*)
       entry)))
 
@@ -1103,9 +1103,9 @@ The acceptance path is full-RBF UNCONDITIONALLY — signaling is not consulted
 (defun tx-signals-rbf-p (tx)
   "True if TX opts in to replacement (any input nSequence <= 0xfffffffd)."
   (some (lambda (in)
-          (<= (bitcoin-lisp.serialization:tx-in-sequence in)
+          (<= (bl.ser:tx-in-sequence in)
               +max-bip125-rbf-sequence+))
-        (bitcoin-lisp.serialization:transaction-inputs tx)))
+        (bl.ser:transaction-inputs tx)))
 
 (defun mempool-tx-or-ancestor-signals-rbf-p (mempool txid)
   "True if the mempool tx TXID, or any of its in-mempool ancestors, signals RBF."
@@ -1124,11 +1124,11 @@ The acceptance path is full-RBF UNCONDITIONALLY — signaling is not consulted
   "Distinct txids of mempool txs that directly conflict with TX (spend a common
 outpoint). Generalizes mempool-check-conflict, which returns only the first."
   (let ((seen (make-hash-table :test 'equalp)) (result '()))
-    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx) result)
-      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+    (bl.ser:dovector (input (bl.ser:transaction-inputs tx) result)
+      (let* ((prevout (bl.ser:tx-in-previous-output input))
              (key (make-outpoint-key
-                   (bitcoin-lisp.serialization:outpoint-hash prevout)
-                   (bitcoin-lisp.serialization:outpoint-index prevout)))
+                   (bl.ser:outpoint-hash prevout)
+                   (bl.ser:outpoint-index prevout)))
              (sp (gethash key (mempool-spent-outpoints mempool))))
         (when (and sp (not (gethash sp seen)))
           (setf (gethash sp seen) t)
@@ -1222,9 +1222,9 @@ in terms of clusters; and the old feerate-superiority test
     ;; EntriesAndTxidsDisjoint, rbf.cpp:85-98) — that would leave a dangling
     ;; input after the replaced set is evicted. (This is NOT old rule 2, which
     ;; is gone; it only forbids depending on the very txs being removed.)
-    (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
-      (when (gethash (bitcoin-lisp.serialization:outpoint-hash
-                      (bitcoin-lisp.serialization:tx-in-previous-output in))
+    (bl.ser:dovector (in (bl.ser:transaction-inputs tx))
+      (when (gethash (bl.ser:outpoint-hash
+                      (bl.ser:tx-in-previous-output in))
                      replaced)
         (return-from check-rbf-rules (values nil :spends-conflicting-tx nil))))
     ;; Rules 3 and 4 against the total fees of everything being replaced.
@@ -1334,7 +1334,7 @@ further)."
            (dolist (m members)
              (destructuring-bind (tx fee vsize) m
                (let ((handle (txgraph-add-transaction graph fee vsize))
-                     (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+                     (txid (bl.ser:transaction-hash tx)))
                  (setf (tx-handle-data handle) txid
                        (gethash txid staged) handle)
                  (push handle handles)
@@ -1346,10 +1346,10 @@ further)."
                  ;; member (MEMBERS is topologically sorted, so parents are
                  ;; staged before their spenders). Dedupe multi-input spends.
                  (let ((seen (make-hash-table :test 'equalp)))
-                   (bitcoin-lisp.serialization:dovector
-                       (input (bitcoin-lisp.serialization:transaction-inputs tx))
-                     (let* ((ptxid (bitcoin-lisp.serialization:outpoint-hash
-                                    (bitcoin-lisp.serialization:tx-in-previous-output input)))
+                   (bl.ser:dovector
+                       (input (bl.ser:transaction-inputs tx))
+                     (let* ((ptxid (bl.ser:outpoint-hash
+                                    (bl.ser:tx-in-previous-output input)))
                             (ph (gethash ptxid staged)))
                        (when (and ph
                                   (not (eq ph handle))
@@ -1472,20 +1472,20 @@ recompute the parents-first ordering, which on a large mempool is not cheap."
           unbroadcast (sort unbroadcast #'%bytes-lessp))
     (values
      (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-      (bitcoin-lisp.serialization:write-uint64-le s (length ordered))
+      (bl.ser:write-uint64-le s (length ordered))
       (loop for (txid . entry) in ordered
-            do (write-sequence (bitcoin-lisp.serialization:transaction-wire-bytes
+            do (write-sequence (bl.ser:transaction-wire-bytes
                                 (mempool-entry-transaction entry))
                                s)
-               (bitcoin-lisp.serialization:write-int64-le
+               (bl.ser:write-int64-le
                 s (mempool-entry-entry-time entry))
-               (bitcoin-lisp.serialization:write-int64-le
+               (bl.ser:write-int64-le
                 s (gethash txid (mempool-deltas mempool) 0)))
-      (bitcoin-lisp.serialization:write-compact-size s (length residual))
+      (bl.ser:write-compact-size s (length residual))
       (loop for (txid . delta) in residual
             do (write-sequence txid s)
-               (bitcoin-lisp.serialization:write-int64-le s delta))
-      (bitcoin-lisp.serialization:write-compact-size s (length unbroadcast))
+               (bl.ser:write-int64-le s delta))
+      (bl.ser:write-compact-size s (length unbroadcast))
       (dolist (txid unbroadcast)
         (write-sequence txid s)))
      (length ordered))))
@@ -1513,14 +1513,14 @@ not supplied. Passing it is what lets a test assert an exact byte layout."
     ;; The key offset is the ABSOLUTE file position of each byte, so the
     ;; payload starts at 17 and its first byte pairs with key byte 1.
     (let ((obfuscated (copy-seq payload)))
-      (bitcoin-lisp.storage:obfuscate! obfuscated key
+      (bl.store:obfuscate! obfuscated key
                                        :key-offset +core-mempool-payload-offset+)
       (values
        (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-        (bitcoin-lisp.serialization:write-uint64-le s +core-mempool-dump-version+)
+        (bl.ser:write-uint64-le s +core-mempool-dump-version+)
         ;; The key is serialized as a VECTOR: a compact-size length then the
         ;; bytes (util/obfuscation.h:61-68). Nine bytes, not eight.
-        (bitcoin-lisp.serialization:write-compact-size
+        (bl.ser:write-compact-size
          s +core-mempool-obfuscation-key-size+)
         (write-sequence key s)
         (write-sequence obfuscated s))
@@ -1534,39 +1534,39 @@ READ-MEMPOOL-FILE returns, or (values nil nil nil nil) when DATA is not one.
 Core returns false for any version it does not know (mempool_persist.cpp:69)
 and starts with an empty mempool; so do we."
   (handler-case
-      (let* ((br (bitcoin-lisp.serialization:make-byte-reader-from data))
-             (version (bitcoin-lisp.serialization:br-read-u64-le br))
+      (let* ((br (bl.ser:make-byte-reader-from data))
+             (version (bl.ser:br-read-u64-le br))
              (payload-offset 8)
              (key nil))
         (cond
           ((= version +core-mempool-dump-version-no-xor-key+))
           ((= version +core-mempool-dump-version+)
-           (let ((n (bitcoin-lisp.serialization:br-read-compact-size br)))
+           (let ((n (bl.ser:br-read-compact-size br)))
              (unless (= n +core-mempool-obfuscation-key-size+)
                (return-from read-core-mempool-file-bytes (values nil nil nil nil)))
-             (setf key (bitcoin-lisp.serialization:br-read-bytes br n)
+             (setf key (bl.ser:br-read-bytes br n)
                    ;; 8 for the version, 1 for the compact size, 8 for the key.
                    payload-offset +core-mempool-payload-offset+)))
           (t (return-from read-core-mempool-file-bytes (values nil nil nil nil))))
         (let ((payload (subseq data payload-offset)))
           (when key
-            (bitcoin-lisp.storage:obfuscate! payload key :key-offset payload-offset))
-          (let* ((pr (bitcoin-lisp.serialization:make-byte-reader-from payload))
-                 (count (bitcoin-lisp.serialization:br-read-u64-le pr))
+            (bl.store:obfuscate! payload key :key-offset payload-offset))
+          (let* ((pr (bl.ser:make-byte-reader-from payload))
+                 (count (bl.ser:br-read-u64-le pr))
                  (entries '()))
             (dotimes (i count)
-              (let* ((tx (bitcoin-lisp.serialization:br-read-transaction pr))
-                     (time (bitcoin-lisp.serialization:br-read-i64-le pr))
-                     (delta (bitcoin-lisp.serialization:br-read-i64-le pr)))
+              (let* ((tx (bl.ser:br-read-transaction pr))
+                     (time (bl.ser:br-read-i64-le pr))
+                     (delta (bl.ser:br-read-i64-le pr)))
                 (push (list tx time delta) entries)))
             (let ((residual '())
                   (unbroadcast '()))
-              (dotimes (i (bitcoin-lisp.serialization:br-read-compact-size pr))
-                (let ((txid (bitcoin-lisp.serialization:br-read-bytes pr 32)))
-                  (push (cons txid (bitcoin-lisp.serialization:br-read-i64-le pr))
+              (dotimes (i (bl.ser:br-read-compact-size pr))
+                (let ((txid (bl.ser:br-read-bytes pr 32)))
+                  (push (cons txid (bl.ser:br-read-i64-le pr))
                         residual)))
-              (dotimes (i (bitcoin-lisp.serialization:br-read-compact-size pr))
-                (push (bitcoin-lisp.serialization:br-read-bytes pr 32) unbroadcast))
+              (dotimes (i (bl.ser:br-read-compact-size pr))
+                (push (bl.ser:br-read-bytes pr 32) unbroadcast))
               (values (nreverse entries) (nreverse residual) t
                       (nreverse unbroadcast))))))
     (error () (values nil nil nil nil))))
@@ -1584,9 +1584,9 @@ understand."
                              :element-type '(unsigned-byte 8))
       (write-sequence bytes out)
       (finish-output out))
-    (bitcoin-lisp.storage::fsync-file tmp)
+    (bl.store::fsync-file tmp)
     (rename-file tmp path)
-    (bitcoin-lisp.storage::fsync-directory path)))
+    (bl.store::fsync-directory path)))
 
 (defun save-mempool-file (mempool path)
   "Persist MEMPOOL (entries + prioritisation deltas + the unbroadcast txid
@@ -1657,39 +1657,39 @@ mempool.dat is a long outage that logs nothing."
 (defun %read-legacy-mempool-file (path)
   "Read a mempool.dat in the format this node wrote before it learned Core's.
 Kept so an existing on-disk mempool survives the upgrade; nothing writes it."
-  (let ((data (bitcoin-lisp.storage:load-file-with-crc32 path 13)))
+  (let ((data (bl.store:load-file-with-crc32 path 13)))
     (unless data
       (return-from %read-legacy-mempool-file (values nil nil nil nil)))
     (handler-case
         ;; The byte-reader spans the full verified buffer; parsing reads
         ;; exactly the declared counts, so the trailing CRC bytes (already
         ;; checked by load-file-with-crc32) are simply never consumed.
-        (let ((br (bitcoin-lisp.serialization:make-byte-reader-from data))
+        (let ((br (bl.ser:make-byte-reader-from data))
               (version 0))
-          (unless (and (= (bitcoin-lisp.serialization:br-read-u32-le br) +mempool-dat-magic+)
-                       (<= 1 (setf version (bitcoin-lisp.serialization:br-read-u8 br))
+          (unless (and (= (bl.ser:br-read-u32-le br) +mempool-dat-magic+)
+                       (<= 1 (setf version (bl.ser:br-read-u8 br))
                            +mempool-dat-version+))
             (return-from %read-legacy-mempool-file (values nil nil nil nil)))
-          (let* ((count (bitcoin-lisp.serialization:br-read-u32-le br))
+          (let* ((count (bl.ser:br-read-u32-le br))
                  (entries
                    (loop repeat count
                          collect
-                         (let* ((len (bitcoin-lisp.serialization:br-read-u32-le br))
-                                (bytes (bitcoin-lisp.serialization:br-read-bytes br len))
-                                (tx (bitcoin-lisp.serialization:br-read-transaction
-                                     (bitcoin-lisp.serialization:make-byte-reader-from bytes)))
-                                (entry-time (bitcoin-lisp.serialization:br-read-u64-le br))
-                                (delta (bitcoin-lisp.serialization:br-read-i64-le br)))
+                         (let* ((len (bl.ser:br-read-u32-le br))
+                                (bytes (bl.ser:br-read-bytes br len))
+                                (tx (bl.ser:br-read-transaction
+                                     (bl.ser:make-byte-reader-from bytes)))
+                                (entry-time (bl.ser:br-read-u64-le br))
+                                (delta (bl.ser:br-read-i64-le br)))
                            (list tx entry-time delta))))
                  (residual
-                   (loop repeat (bitcoin-lisp.serialization:br-read-u32-le br)
-                         collect (cons (bitcoin-lisp.serialization:br-read-bytes br 32)
-                                       (bitcoin-lisp.serialization:br-read-i64-le br))))
+                   (loop repeat (bl.ser:br-read-u32-le br)
+                         collect (cons (bl.ser:br-read-bytes br 32)
+                                       (bl.ser:br-read-i64-le br))))
                  ;; v1 files end after the residual deltas: no trailer to read.
                  (unbroadcast
                    (when (>= version 2)
-                     (loop repeat (bitcoin-lisp.serialization:br-read-u32-le br)
-                           collect (bitcoin-lisp.serialization:br-read-bytes br 32)))))
+                     (loop repeat (bl.ser:br-read-u32-le br)
+                           collect (bl.ser:br-read-bytes br 32)))))
             (values entries residual t unbroadcast)))
       (error () (values nil nil nil nil)))))
 
@@ -1721,7 +1721,7 @@ the incremental relay fee, so newcomers must beat what was just trimmed
                    (when (> rate (mempool-rolling-min-fee-rate mempool))
                      (setf (mempool-rolling-min-fee-rate mempool) rate
                            (mempool-rolling-min-fee-time mempool)
-                           (bitcoin-lisp.serialization:get-unix-time))))
+                           (bl.ser:get-unix-time))))
                  ;; The worst chunk is the tail of its own cluster's
                  ;; linearization, so it contains every in-mempool descendant
                  ;; of its members: removing its transactions (delivered
@@ -1735,7 +1735,7 @@ the incremental relay fee, so newcomers must beat what was just trimmed
 
 ;;;; Expiry and periodic trim
 
-(defun mempool-expire (mempool &optional (now (bitcoin-lisp.serialization:get-unix-time)))
+(defun mempool-expire (mempool &optional (now (bl.ser:get-unix-time)))
   "Remove transactions (and their descendants) older than the expiry window.
 Returns the number of transactions removed."
   (let ((cutoff (- now (* *mempool-expiry-hours* 3600)))
@@ -1762,20 +1762,20 @@ tx's descendants spend outputs that no longer exist)."
   (%with-graph-verify-batch (mempool)
     (let ((block-outpoints (make-hash-table :test 'equalp)))
       ;; Collect all outpoints spent by block transactions
-      (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-        (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-          (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+      (dolist (tx (bl.ser:bitcoin-block-transactions block))
+        (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+          (let* ((prevout (bl.ser:tx-in-previous-output input))
                  (key (make-outpoint-key
-                       (bitcoin-lisp.serialization:outpoint-hash prevout)
-                       (bitcoin-lisp.serialization:outpoint-index prevout))))
+                       (bl.ser:outpoint-hash prevout)
+                       (bl.ser:outpoint-index prevout))))
             (setf (gethash key block-outpoints) t))))
 
       ;; Remove confirmed transactions; a mined tx's prioritisation delta is
       ;; spent ballast (Core removeForBlock -> ClearPrioritisation). Reason
       ;; :block never reaches the wallet hook (blockConnected covers these).
       (let ((*mempool-removal-reason* :block))
-        (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-          (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+        (dolist (tx (bl.ser:bitcoin-block-transactions block))
+          (let ((txid (bl.ser:transaction-hash tx)))
             (remhash txid (mempool-deltas mempool))
             (mempool-remove mempool txid))))
 
@@ -1824,7 +1824,7 @@ vHashUpdate in reverse). Returns the number of transactions the trim evicted."
       (dolist (txid readded-txids)
         (let ((entry (mempool-get mempool txid)))
           (when entry
-            (dotimes (i (length (bitcoin-lisp.serialization:transaction-outputs
+            (dotimes (i (length (bl.ser:transaction-outputs
                                  (mempool-entry-transaction entry))))
               (let* ((child-txid (mempool-spending-tx mempool txid i))
                      (child (and child-txid (mempool-get mempool child-txid))))

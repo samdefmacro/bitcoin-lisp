@@ -24,29 +24,29 @@
 
 (defun %pr-peer ()
   "A :ready peer advertising NODE_WITNESS, like every modern Core peer."
-  (bitcoin-lisp.networking:make-peer
+  (bl.net:make-peer
    :address "pkgrelay" :state :ready
-   :services bitcoin-lisp.serialization:+node-witness+))
+   :services bl.ser:+node-witness+))
 
 (defun %pr-payload (tx)
   "The `tx` message payload for TX (header stripped), as handle-tx sees it."
-  (subseq (bitcoin-lisp.serialization:make-tx-message tx) 24))
+  (subseq (bl.ser:make-tx-message tx) 24))
 
 (defun %pr-tx (inputs out-value)
   "A non-witness P2SH(OP_TRUE) transaction spending INPUTS — a list of
 (txid . index) — and paying OUT-VALUE to a single P2SH(OP_TRUE) output."
-  (bitcoin-lisp.serialization:make-transaction
+  (bl.ser:make-transaction
    :version 2
    :inputs (coerce (mapcar
                     (lambda (in)
-                      (bitcoin-lisp.serialization:make-tx-in
-                       :previous-output (bitcoin-lisp.serialization:make-outpoint
+                      (bl.ser:make-tx-in
+                       :previous-output (bl.ser:make-outpoint
                                          :hash (car in) :index (cdr in))
                        :script-sig (%p2sh-optrue-scriptsig)
                        :sequence #xffffffff))
                     inputs)
                    'vector)
-   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bl.ser:make-tx-out
                      :value out-value
                      :script-pubkey (%p2sh-optrue-spk)))
    :lock-time 0))
@@ -56,12 +56,12 @@
 node-global reconsiderable filter rebound to a fresh one, so reject state
 never leaks between tests. Also brackets BODY with reset-tx-requests, since
 handle-tx and the orphan-parent fetch both touch the shared tracker."
-  `(let ((,rejects (bitcoin-lisp:make-rejects-filter 100))
-         (bitcoin-lisp.validation:*recent-rejects-reconsiderable*
-           (bitcoin-lisp:make-rejects-filter 100)))
-     (bitcoin-lisp.networking:reset-tx-requests)
+  `(let ((,rejects (bl:make-rejects-filter 100))
+         (bl.val:*recent-rejects-reconsiderable*
+           (bl:make-rejects-filter 100)))
+     (bl.net:reset-tx-requests)
      (unwind-protect (progn ,@body)
-       (bitcoin-lisp.networking:reset-tx-requests))))
+       (bl.net:reset-tx-requests))))
 
 (defmacro %counting-tx-validations ((counter) &body body)
   "Run BODY with VALIDATE-TRANSACTION-FOR-MEMPOOL wrapped in a call counter
@@ -71,24 +71,24 @@ which is the whole point of a rejects filter (Core's AlreadyHaveTx gate)."
   (let ((real (gensym "REAL")))
     `(let ((,counter 0)
            (,real (fdefinition
-                   'bitcoin-lisp.validation:validate-transaction-for-mempool)))
+                   'bl.val:validate-transaction-for-mempool)))
        (unwind-protect
             (progn
               (setf (fdefinition
-                     'bitcoin-lisp.validation:validate-transaction-for-mempool)
+                     'bl.val:validate-transaction-for-mempool)
                     (lambda (&rest args)
                       (incf ,counter)
                       (apply ,real args)))
               ,@body)
          (setf (fdefinition
-                'bitcoin-lisp.validation:validate-transaction-for-mempool)
+                'bl.val:validate-transaction-for-mempool)
                ,real)))))
 
 (defun %pr-orphan-p (mempool tx)
   "T if TX is in MEMPOOL's orphan pool (wtxid-keyed)."
-  (and (bitcoin-lisp.mempool:orphan-tx
-        (bitcoin-lisp.mempool:mempool-orphan-pool mempool)
-        (bitcoin-lisp.serialization:transaction-wtxid tx))
+  (and (bl.mp:orphan-tx
+        (bl.mp:mempool-orphan-pool mempool)
+        (bl.ser:transaction-wtxid tx))
        t))
 
 ;;;; (a) The headline case: an LN-shaped CPFP pair arriving as two messages
@@ -110,29 +110,29 @@ Against main this fails at step 1 already, and there is no path at all from
 step 3 to the mempool."
   (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
-           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- 100000000 5 50000)))
-           (cid (bitcoin-lisp.serialization:transaction-hash child))
+           (cid (bl.ser:transaction-hash child))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
         ;; 1. The parent on its own: below the floor, reconsiderable.
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-        (is-false (bitcoin-lisp.mempool:mempool-has mempool pid))
-        (is-true (bitcoin-lisp.validation:reconsiderable-reject-p
-                  (bitcoin-lisp.serialization:transaction-wtxid parent)))
-        (is-false (bitcoin-lisp:recent-reject-p
-                   rejects (bitcoin-lisp.serialization:transaction-wtxid parent)))
+        (is-false (bl.mp:mempool-has mempool pid))
+        (is-true (bl.val:reconsiderable-reject-p
+                  (bl.ser:transaction-wtxid parent)))
+        (is-false (bl:recent-reject-p
+                   rejects (bl.ser:transaction-wtxid parent)))
         ;; 2. The child: an orphan, not a reject.
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
         (is-true (%pr-orphan-p mempool child))
-        (is-false (bitcoin-lisp:recent-reject-p rejects cid))
+        (is-false (bl:recent-reject-p rejects cid))
         ;; 3. The parent again: accepted as a package with the orphan child.
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-        (is-true (bitcoin-lisp.mempool:mempool-has mempool pid))
-        (is-true (bitcoin-lisp.mempool:mempool-has mempool cid))
+        (is-true (bl.mp:mempool-has mempool pid))
+        (is-true (bl.mp:mempool-has mempool cid))
         ;; The child left the orphanage when it entered the mempool
         ;; (Core MempoolAcceptedTx -> EraseTx).
         (is-false (%pr-orphan-p mempool child))))))
@@ -145,18 +145,18 @@ ProcessInvalidTx -> Find1P1CPackage on first_time_failure,
 txdownloadman_impl.cpp:460-465). No re-announcement is needed."
   (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
-           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- 100000000 5 50000)))
-           (cid (bitcoin-lisp.serialization:transaction-hash child))
+           (cid (bl.ser:transaction-hash child))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
         (is-true (%pr-orphan-p mempool child))
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-        (is-true (bitcoin-lisp.mempool:mempool-has mempool pid))
-        (is-true (bitcoin-lisp.mempool:mempool-has mempool cid))
+        (is-true (bl.mp:mempool-has mempool pid))
+        (is-true (bl.mp:mempool-has mempool cid))
         (is-false (%pr-orphan-p mempool child))))))
 
 (test reconsiderable-parent-alone-is-still-rejected
@@ -165,15 +165,15 @@ re-arriving low-fee parent is still not accepted. The fee floor is intact —
 1p1c relay makes the parent reconsiderable, not acceptable."
   (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
-           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (pid (bl.ser:transaction-hash parent))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-        (is-false (bitcoin-lisp.mempool:mempool-has mempool pid))
-        (is (zerop (bitcoin-lisp.mempool:mempool-count mempool)))))))
+        (is-false (bl.mp:mempool-has mempool pid))
+        (is (zerop (bl.mp:mempool-count mempool)))))))
 
 (test one-p-one-c-only-pairs-children-from-the-same-peer
   "Core's censorship guard: Find1P1CPackage only considers children the SAME
@@ -182,21 +182,21 @@ from an attacker cannot displace the honest peer's real one. Here the child
 comes from peer B, the parent from peer A: no package is formed."
   (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
-           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- 100000000 5 50000)))
-           (cid (bitcoin-lisp.serialization:transaction-hash child))
+           (cid (bl.ser:transaction-hash child))
            (peer-a (%pr-peer))
            (peer-b (%pr-peer)))
       (%with-fresh-rejects (rejects)
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer-a (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer-b (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
         (is-true (%pr-orphan-p mempool child))
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer-a (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-        (is-false (bitcoin-lisp.mempool:mempool-has mempool pid))
-        (is-false (bitcoin-lisp.mempool:mempool-has mempool cid))))))
+        (is-false (bl.mp:mempool-has mempool pid))
+        (is-false (bl.mp:mempool-has mempool cid))))))
 
 ;;;; (b) A non-segwit low-fee parent must not blacklist its child
 
@@ -209,56 +209,56 @@ Previously the parent's fee failure sat in the MAIN filter and the child was
 blacklisted under both of its own ids — permanently, until the next block."
   (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
-           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- 100000000 5 50000)))
-           (cid (bitcoin-lisp.serialization:transaction-hash child))
+           (cid (bl.ser:transaction-hash child))
            (peer (%pr-peer)))
       ;; The precondition that makes this case distinct.
-      (is (equalp pid (bitcoin-lisp.serialization:transaction-wtxid parent)))
+      (is (equalp pid (bl.ser:transaction-wtxid parent)))
       (%with-fresh-rejects (rejects)
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
         (is-true (%pr-orphan-p mempool child))
-        (is-false (bitcoin-lisp:recent-reject-p rejects cid))
-        (is-false (bitcoin-lisp:recent-reject-p
-                   rejects (bitcoin-lisp.serialization:transaction-wtxid child)))))))
+        (is-false (bl:recent-reject-p rejects cid))
+        (is-false (bl:recent-reject-p
+                   rejects (bl.ser:transaction-wtxid child)))))))
 
 (test two-reconsiderable-parents-do-blacklist-the-child
   "The boundary on the other side: 1p1c submits ONE parent with one child, so
 a child whose TWO missing parents both failed reconsiderably can never be
 rescued. Core gives up at the second one (txdownloadman_impl.cpp:379-386) and
 rejects the child under both ids rather than holding it in the orphanage."
-  (let* ((utxo (bitcoin-lisp.storage:make-utxo-set))
-         (mempool (bitcoin-lisp.mempool:make-mempool))
-         (state (bitcoin-lisp.storage:make-chain-state :best-height 200))
+  (let* ((utxo (bl.store:make-utxo-set))
+         (mempool (bl.mp:make-mempool))
+         (state (bl.store:make-chain-state :best-height 200))
          (fund-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 21))
          (fund-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 22))
          (peer (%pr-peer)))
-    (bitcoin-lisp.storage:add-utxo utxo fund-a 0 100000000 (%p2sh-optrue-spk) 1)
-    (bitcoin-lisp.storage:add-utxo utxo fund-b 0 100000000 (%p2sh-optrue-spk) 1)
+    (bl.store:add-utxo utxo fund-a 0 100000000 (%p2sh-optrue-spk) 1)
+    (bl.store:add-utxo utxo fund-b 0 100000000 (%p2sh-optrue-spk) 1)
     (let* ((pa (%pr-tx (list (cons fund-a 0)) (- 100000000 5)))
            (pb (%pr-tx (list (cons fund-b 0)) (- 100000000 5)))
-           (paid (bitcoin-lisp.serialization:transaction-hash pa))
-           (pbid (bitcoin-lisp.serialization:transaction-hash pb))
+           (paid (bl.ser:transaction-hash pa))
+           (pbid (bl.ser:transaction-hash pb))
            (child (%pr-tx (list (cons paid 0) (cons pbid 0))
                           (- (* 2 (- 100000000 5)) 50000)))
-           (cid (bitcoin-lisp.serialization:transaction-hash child)))
+           (cid (bl.ser:transaction-hash child)))
       (%with-fresh-rejects (rejects)
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer (%pr-payload pa) utxo mempool state nil :recent-rejects rejects)
-        (bitcoin-lisp.networking::handle-tx
+        (bl.net::handle-tx
          peer (%pr-payload pb) utxo mempool state nil :recent-rejects rejects)
         ;; Both parents are reconsiderable — the precondition.
-        (is-true (bitcoin-lisp.validation:reconsiderable-reject-p paid))
-        (is-true (bitcoin-lisp.validation:reconsiderable-reject-p pbid))
-        (bitcoin-lisp.networking::handle-tx
+        (is-true (bl.val:reconsiderable-reject-p paid))
+        (is-true (bl.val:reconsiderable-reject-p pbid))
+        (bl.net::handle-tx
          peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
         (is-false (%pr-orphan-p mempool child))
-        (is-true (bitcoin-lisp:recent-reject-p rejects cid))
-        (is-true (bitcoin-lisp:recent-reject-p
-                  rejects (bitcoin-lisp.serialization:transaction-wtxid child)))))))
+        (is-true (bl:recent-reject-p rejects cid))
+        (is-true (bl:recent-reject-p
+                  rejects (bl.ser:transaction-wtxid child)))))))
 
 ;;;; (c) The DoS control: genuinely invalid transactions are still cached
 
@@ -274,19 +274,19 @@ zero on the second would prove nothing."
            ;; version 5 > +max-standard-tx-version+: rejected as
            ;; :version-non-standard, a plain (non-reconsiderable) failure.
            (bad (%pkg-tx funding 0 (- 100000000 10000) :version 5))
-           (bad-id (bitcoin-lisp.serialization:transaction-hash bad)))
+           (bad-id (bl.ser:transaction-hash bad)))
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
-          (bitcoin-lisp.networking::handle-tx
+          (bl.net::handle-tx
            peer (%pr-payload bad) utxo mempool state nil :recent-rejects rejects)
           (is (= 1 calls) "first arrival must reach validation" calls)
-          (is-true (bitcoin-lisp:recent-reject-p rejects bad-id))
-          (is-false (bitcoin-lisp.validation:reconsiderable-reject-p bad-id))
+          (is-true (bl:recent-reject-p rejects bad-id))
+          (is-false (bl.val:reconsiderable-reject-p bad-id))
           ;; Re-announced: dropped at the precheck, never re-validated.
-          (bitcoin-lisp.networking::handle-tx
+          (bl.net::handle-tx
            peer (%pr-payload bad) utxo mempool state nil :recent-rejects rejects)
           (is (= 1 calls) "re-arrival must not be re-validated" calls)
-          (is-false (bitcoin-lisp.mempool:mempool-has mempool bad-id)))))))
+          (is-false (bl.mp:mempool-has mempool bad-id)))))))
 
 ;;;; (d) Post-validation mempool-add failures are cached too
 
@@ -297,24 +297,24 @@ fails with \"mempool full\", which Core marks TX_RECONSIDERABLE
 re-announcement was re-downloaded and fully re-validated. It must now land in
 the reconsiderable filter — not the main one, since a package could still
 carry it — and be dropped before validation on re-arrival."
-  (let* ((utxo (bitcoin-lisp.storage:make-utxo-set))
+  (let* ((utxo (bl.store:make-utxo-set))
          ;; A zero-byte cap: the trim after the add evicts the new entry.
-         (mempool (bitcoin-lisp.mempool:make-mempool :max-size 0))
-         (state (bitcoin-lisp.storage:make-chain-state :best-height 200))
+         (mempool (bl.mp:make-mempool :max-size 0))
+         (state (bl.store:make-chain-state :best-height 200))
          (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 31))
          (peer (%pr-peer)))
-    (bitcoin-lisp.storage:add-utxo utxo funding 0 100000000 (%p2sh-optrue-spk) 1)
+    (bl.store:add-utxo utxo funding 0 100000000 (%p2sh-optrue-spk) 1)
     (let* ((tx (%pr-tx (list (cons funding 0)) (- 100000000 10000)))
-           (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+           (txid (bl.ser:transaction-hash tx)))
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
-          (bitcoin-lisp.networking::handle-tx
+          (bl.net::handle-tx
            peer (%pr-payload tx) utxo mempool state nil :recent-rejects rejects)
           (is (= 1 calls) "first arrival must reach validation" calls)
-          (is-false (bitcoin-lisp.mempool:mempool-has mempool txid))
-          (is-true (bitcoin-lisp.validation:reconsiderable-reject-p txid))
-          (is-false (bitcoin-lisp:recent-reject-p rejects txid))
-          (bitcoin-lisp.networking::handle-tx
+          (is-false (bl.mp:mempool-has mempool txid))
+          (is-true (bl.val:reconsiderable-reject-p txid))
+          (is-false (bl:recent-reject-p rejects txid))
+          (bl.net::handle-tx
            peer (%pr-payload tx) utxo mempool state nil :recent-rejects rejects)
           (is (= 1 calls) "re-arrival must not be re-validated" calls))))))
 
@@ -348,7 +348,7 @@ failure that overwrites no member result. Returns
   (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
     (let* ((rival (%pkg-tx funding 0 (- 100000000 50000)))     ; fee 50000
            (parent (%pkg-tx funding 0 (- 100000000 5)))        ; fee 5
-           (child (%pkg-tx (bitcoin-lisp.serialization:transaction-hash parent)
+           (child (%pkg-tx (bl.ser:transaction-hash parent)
                            0 (- 100000000 5 10000))))          ; fee 10000
       (values utxo mempool state rival parent child))))
 
@@ -364,7 +364,7 @@ the caller."
       (%pr-rbf-loser-fixture)
     (is (eq :ok (%add-tx mempool rival :fee 50000 :height 200)))
     (multiple-value-bind (msg results)
-        (bitcoin-lisp.validation:validate-package-for-mempool
+        (bl.val:validate-package-for-mempool
          (list parent child) utxo mempool state)
       (is (eq :insufficient-fee msg))
       (let ((pres (%result-for results parent))
@@ -372,15 +372,15 @@ the caller."
         (is (not (null pres)))
         (is (not (null cres)))
         (when (and pres cres)
-          (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status pres)))
+          (is (eq :invalid (bl.val:package-tx-result-status pres)))
           (is (eq :insufficient-fee
-                  (bitcoin-lisp.validation:package-tx-result-error pres)))
-          (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status cres)))
+                  (bl.val:package-tx-result-error pres)))
+          (is (eq :invalid (bl.val:package-tx-result-status cres)))
           (is (eq :missing-input
-                  (bitcoin-lisp.validation:package-tx-result-error cres))
+                  (bl.val:package-tx-result-error cres))
               "the child must still carry its nonfinal missing-input result"))))
     ;; Nothing was admitted and RIVAL is untouched.
-    (is (= 1 (bitcoin-lisp.mempool:mempool-count mempool)))))
+    (is (= 1 (bl.mp:mempool-count mempool)))))
 
 (test failed-1p1c-package-does-not-blacklist-the-child
   "THE regression this section exists for. A 1p1c package that loses a
@@ -395,60 +395,60 @@ is not re-validated on every re-announcement), and the PARENT's own
 one."
   (multiple-value-bind (utxo mempool state rival parent child)
       (%pr-rbf-loser-fixture)
-    (let* ((rid (bitcoin-lisp.serialization:transaction-hash rival))
-           (pid (bitcoin-lisp.serialization:transaction-hash parent))
-           (pwtxid (bitcoin-lisp.serialization:transaction-wtxid parent))
-           (cid (bitcoin-lisp.serialization:transaction-hash child))
-           (cwtxid (bitcoin-lisp.serialization:transaction-wtxid child))
-           (pool (bitcoin-lisp.mempool:mempool-orphan-pool mempool))
+    (let* ((rid (bl.ser:transaction-hash rival))
+           (pid (bl.ser:transaction-hash parent))
+           (pwtxid (bl.ser:transaction-wtxid parent))
+           (cid (bl.ser:transaction-hash child))
+           (cwtxid (bl.ser:transaction-wtxid child))
+           (pool (bl.mp:mempool-orphan-pool mempool))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
           ;; RIVAL wins the outpoint honestly.
-          (bitcoin-lisp.networking::handle-tx
+          (bl.net::handle-tx
            peer (%pr-payload rival) utxo mempool state nil :recent-rejects rejects)
-          (is-true (bitcoin-lisp.mempool:mempool-has mempool rid))
+          (is-true (bl.mp:mempool-has mempool rid))
           ;; The sub-floor double-spending PARENT: reconsiderable, not main.
-          (bitcoin-lisp.networking::handle-tx
+          (bl.net::handle-tx
            peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-          (is-true (bitcoin-lisp.validation:reconsiderable-reject-p pwtxid))
+          (is-true (bl.val:reconsiderable-reject-p pwtxid))
           ;; The CHILD: held as an orphan (one reconsiderable parent is fine).
-          (bitcoin-lisp.networking::handle-tx
+          (bl.net::handle-tx
            peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
           (is-true (%pr-orphan-p mempool child))
           ;; The parent again — this forms the package, and it FAILS.
-          (bitcoin-lisp.networking::handle-tx
+          (bl.net::handle-tx
            peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
           ;; The package path really ran and really failed as a package.
-          (is-true (bitcoin-lisp.validation:reconsiderable-reject-p
-                    (bitcoin-lisp.validation:package-hash (list parent child)))
+          (is-true (bl.val:reconsiderable-reject-p
+                    (bl.val:package-hash (list parent child)))
                    "the failed combination must be remembered by package hash")
-          (is-false (bitcoin-lisp.mempool:mempool-has mempool pid))
-          (is-false (bitcoin-lisp.mempool:mempool-has mempool cid))
-          (is-true (bitcoin-lisp.mempool:mempool-has mempool rid))
+          (is-false (bl.mp:mempool-has mempool pid))
+          (is-false (bl.mp:mempool-has mempool cid))
+          (is-true (bl.mp:mempool-has mempool rid))
           ;; THE BLOCKER: the child is cached NOWHERE, under either id.
-          (is-false (bitcoin-lisp:recent-reject-p rejects cwtxid)
+          (is-false (bl:recent-reject-p rejects cwtxid)
                     "child wtxid must not enter the MAIN rejects filter")
-          (is-false (bitcoin-lisp:recent-reject-p rejects cid)
+          (is-false (bl:recent-reject-p rejects cid)
                     "child txid must not enter the MAIN rejects filter")
-          (is-false (bitcoin-lisp.validation:reconsiderable-reject-p cwtxid))
+          (is-false (bl.val:reconsiderable-reject-p cwtxid))
           ;; ...and it is not erased from the orphanage either
           ;; (txdownloadman_impl.cpp:490-492 excludes TX_MISSING_INPUTS).
           (is-true (%pr-orphan-p mempool child))
           ;; CONTROL (b): the parent's own fee failure is still reconsiderable.
-          (is-true (bitcoin-lisp.validation:reconsiderable-reject-p pwtxid))
-          (is-false (bitcoin-lisp:recent-reject-p rejects pwtxid))
+          (is-true (bl.val:reconsiderable-reject-p pwtxid))
+          (is-false (bl:recent-reject-p rejects pwtxid))
           ;; The child is still RETRYABLE. Simulate the orphanage eviction
           ;; LimitOrphans performs under load: the announcement must still be
           ;; worth requesting (Core AlreadyHaveTx, the gate handle-inv uses)...
-          (bitcoin-lisp.mempool:orphan-remove pool cwtxid)
-          (is-false (bitcoin-lisp.networking::%already-have-tx-p
+          (bl.mp:orphan-remove pool cwtxid)
+          (is-false (bl.net::%already-have-tx-p
                      cwtxid t mempool rejects t)
                     "an inv for the child must still be requestable")
           ;; ...and the re-sent child must reach validation instead of being
           ;; dropped at handle-tx's precheck, and be held as an orphan again.
           (let ((before calls))
-            (bitcoin-lisp.networking::handle-tx
+            (bl.net::handle-tx
              peer (%pr-payload child) utxo mempool state nil
              :recent-rejects rejects)
             (is (= (1+ before) calls)
@@ -458,28 +458,28 @@ one."
           ;; And once the blocking condition clears — the next block confirms
           ;; RIVAL and wipes both reject filters (Core ActiveTipChange) — the
           ;; honest CPFP pair is accepted after all.
-          (bitcoin-lisp.mempool:mempool-remove mempool rid)
-          (bitcoin-lisp:clear-recent-rejects rejects)
-          (bitcoin-lisp.validation:clear-reconsiderable-rejects)
-          (bitcoin-lisp.networking::handle-tx
+          (bl.mp:mempool-remove mempool rid)
+          (bl:clear-recent-rejects rejects)
+          (bl.val:clear-reconsiderable-rejects)
+          (bl.net::handle-tx
            peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-          (is-true (bitcoin-lisp.mempool:mempool-has mempool pid))
-          (is-true (bitcoin-lisp.mempool:mempool-has mempool cid)))))))
+          (is-true (bl.mp:mempool-has mempool pid))
+          (is-true (bl.mp:mempool-has mempool cid)))))))
 
 (defun %pr-badscript-child (parent-txid out-value)
   "A child of PARENT-TXID whose scriptSig pushes the WRONG redeemScript, so
 the P2SH OP_EQUAL fails. Push-only and standard, so it is rejected only once
 the parent's output is actually available — i.e. individually it is a plain
 :missing-input orphan, and the hard failure surfaces inside the package."
-  (bitcoin-lisp.serialization:make-transaction
+  (bl.ser:make-transaction
    :version 2
-   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
                                       :hash parent-txid :index 0)
                     :script-sig (make-array 2 :element-type '(unsigned-byte 8)
                                               :initial-contents '(#x01 #x00))
                     :sequence #xffffffff))
-   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bl.ser:make-tx-out
                      :value out-value
                      :script-pubkey (%p2sh-optrue-spk)))
    :lock-time 0))
@@ -495,43 +495,43 @@ re-arrival WITHOUT being re-validated. The parent's :insufficient-fee still
 goes to the reconsiderable filter — CONTROL (b) again, on this path."
   (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))        ; fee 5
-           (pid (bitcoin-lisp.serialization:transaction-hash parent))
-           (pwtxid (bitcoin-lisp.serialization:transaction-wtxid parent))
+           (pid (bl.ser:transaction-hash parent))
+           (pwtxid (bl.ser:transaction-wtxid parent))
            (child (%pr-badscript-child pid (- 100000000 5 10000)))
-           (cid (bitcoin-lisp.serialization:transaction-hash child))
-           (cwtxid (bitcoin-lisp.serialization:transaction-wtxid child))
+           (cid (bl.ser:transaction-hash child))
+           (cwtxid (bl.ser:transaction-wtxid child))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
-          (bitcoin-lisp.networking::handle-tx
+          (bl.net::handle-tx
            peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-          (is-true (bitcoin-lisp.validation:reconsiderable-reject-p pwtxid))
-          (bitcoin-lisp.networking::handle-tx
+          (is-true (bl.val:reconsiderable-reject-p pwtxid))
+          (bl.net::handle-tx
            peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
           (is-true (%pr-orphan-p mempool child)
                    "the bad child must be an orphan first, or the package
 never forms and this control asserts nothing")
           ;; Form the package; the child fails hard inside it.
-          (bitcoin-lisp.networking::handle-tx
+          (bl.net::handle-tx
            peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
-          (is (zerop (bitcoin-lisp.mempool:mempool-count mempool)))
-          (is-true (bitcoin-lisp:recent-reject-p rejects cwtxid)
+          (is (zerop (bl.mp:mempool-count mempool)))
+          (is-true (bl:recent-reject-p rejects cwtxid)
                    "a hard package failure must still be cached")
-          (is-false (bitcoin-lisp.validation:reconsiderable-reject-p cwtxid))
+          (is-false (bl.val:reconsiderable-reject-p cwtxid))
           (is-false (%pr-orphan-p mempool child)
                     "a hard failure must leave the orphanage")
           ;; CONTROL (b): the parent is still only reconsiderable.
-          (is-true (bitcoin-lisp.validation:reconsiderable-reject-p pwtxid))
-          (is-false (bitcoin-lisp:recent-reject-p rejects pwtxid))
+          (is-true (bl.val:reconsiderable-reject-p pwtxid))
+          (is-false (bl:recent-reject-p rejects pwtxid))
           ;; Re-announced: dropped at the precheck, never re-validated.
           (let ((before calls))
-            (bitcoin-lisp.networking::handle-tx
+            (bl.net::handle-tx
              peer (%pr-payload child) utxo mempool state nil
              :recent-rejects rejects)
             (is (= before calls)
                 "a cached hard failure must not be re-validated" before calls))
           (is-false (%pr-orphan-p mempool child))
-          (is-false (bitcoin-lisp.mempool:mempool-has mempool cid)))))))
+          (is-false (bl.mp:mempool-has mempool cid)))))))
 
 ;;;; Filter plumbing
 
@@ -542,62 +542,62 @@ which is what lets a failed 1p1c pairing be remembered once."
   (multiple-value-bind (u m c funding) (%pkg-fixture)
     (declare (ignore u m c))
     (let* ((a (%pkg-tx funding 0 99990000))
-           (b (%pkg-tx (bitcoin-lisp.serialization:transaction-hash a) 0 99980000))
-           (h1 (bitcoin-lisp.validation:package-hash (list a b)))
-           (h2 (bitcoin-lisp.validation:package-hash (list b a))))
+           (b (%pkg-tx (bl.ser:transaction-hash a) 0 99980000))
+           (h1 (bl.val:package-hash (list a b)))
+           (h2 (bl.val:package-hash (list b a))))
       (is (= 32 (length h1)))
       (is (equalp h1 h2))
-      (is-false (equalp h1 (bitcoin-lisp.validation:package-hash (list a)))))))
+      (is-false (equalp h1 (bl.val:package-hash (list a)))))))
 
 (test reconsiderable-filter-cleared-on-tip-change
   "Core resets BOTH reject filters on every active tip change
 (ActiveTipChange, txdownloadman_impl.cpp:91-95): a new block moves the fee
 floor and changes which parents exist, so every cached fee failure is stale."
-  (let ((bitcoin-lisp.validation:*recent-rejects-reconsiderable*
-          (bitcoin-lisp:make-rejects-filter 100))
+  (let ((bl.val:*recent-rejects-reconsiderable*
+          (bl:make-rejects-filter 100))
         (h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 77)))
-    (bitcoin-lisp.validation:add-reconsiderable-reject h)
-    (is-true (bitcoin-lisp.validation:reconsiderable-reject-p h))
-    (bitcoin-lisp.validation:clear-reconsiderable-rejects)
-    (is-false (bitcoin-lisp.validation:reconsiderable-reject-p h))))
+    (bl.val:add-reconsiderable-reject h)
+    (is-true (bl.val:reconsiderable-reject-p h))
+    (bl.val:clear-reconsiderable-rejects)
+    (is-false (bl.val:reconsiderable-reject-p h))))
 
 (test inv-for-reconsiderable-tx-is-not-requested
   "AlreadyHaveTx(include_reconsiderable=true) at announcement time: there is
 no point downloading a transaction we would only submit alone again (Core
 AddTxAnnouncement, txdownloadman_impl.cpp:199). The control is the same inv
 with the filter empty, which IS requested."
-  (let* ((bitcoin-lisp.networking::*cached-is-ibd* t)
-         (bitcoin-lisp:*network* :regtest)
-         (bitcoin-lisp:*minimum-chain-work-override* nil)
-         (now (bitcoin-lisp.serialization:get-unix-time))
+  (let* ((bl.net::*cached-is-ibd* t)
+         (bl:*network* :regtest)
+         (bl:*minimum-chain-work-override* nil)
+         (now (bl.ser:get-unix-time))
          (state (%make-ibd-latch-state now))
-         (mempool (bitcoin-lisp.mempool:make-mempool))
-         (announcer (bitcoin-lisp.networking:make-peer :state :ready
+         (mempool (bl.mp:make-mempool))
+         (announcer (bl.net:make-peer :state :ready
                                                        :wtxid-relay t))
-         (probe (bitcoin-lisp.networking:make-peer :state :ready))
+         (probe (bl.net:make-peer :state :ready))
          (blocked (make-array 32 :element-type '(unsigned-byte 8)
                                  :initial-element 51))
          (fresh (make-array 32 :element-type '(unsigned-byte 8)
                                :initial-element 52))
          (inv-payload
            (lambda (hash)
-             (subseq (bitcoin-lisp.serialization:make-inv-message
-                      (list (bitcoin-lisp.serialization:make-inv-vector
-                             :type bitcoin-lisp.serialization:+inv-type-wtx+
+             (subseq (bl.ser:make-inv-message
+                      (list (bl.ser:make-inv-vector
+                             :type bl.ser:+inv-type-wtx+
                              :hash hash)))
                      24))))
     (%with-fresh-rejects (rejects)
-      (bitcoin-lisp.validation:add-reconsiderable-reject blocked)
+      (bl.val:add-reconsiderable-reject blocked)
       (ignore-errors
-       (bitcoin-lisp.networking::handle-inv
+       (bl.net::handle-inv
         announcer (funcall inv-payload blocked) state mempool
         :recent-rejects rejects))
       ;; Nothing recorded: a probe from another peer still wants it.
-      (is-true (bitcoin-lisp.networking::tx-request-wanted-p blocked probe t))
-      (bitcoin-lisp.networking:reset-tx-requests)
+      (is-true (bl.net::tx-request-wanted-p blocked probe t))
+      (bl.net:reset-tx-requests)
       ;; Control: an unknown wtxid from the same announcer IS requested.
       (ignore-errors
-       (bitcoin-lisp.networking::handle-inv
+       (bl.net::handle-inv
         announcer (funcall inv-payload fresh) state mempool
         :recent-rejects rejects))
-      (is-false (bitcoin-lisp.networking::tx-request-wanted-p fresh probe t)))))
+      (is-false (bl.net::tx-request-wanted-p fresh probe t)))))

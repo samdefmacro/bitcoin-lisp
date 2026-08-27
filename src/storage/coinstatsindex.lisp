@@ -34,9 +34,9 @@
 
 (defstruct coinstats
   "The running UTXO statistics at one height (Core CCoinsStats subset). MUHASH
-is a bitcoin-lisp.crypto:muhash accumulator; the rest are satoshi/count
+is a bl.crypto:muhash accumulator; the rest are satoshi/count
 integers."
-  (muhash (bitcoin-lisp.crypto:make-muhash))
+  (muhash (bl.crypto:make-muhash))
   (txout-count 0 :type integer)
   (bogo-size 0 :type integer)
   (total-amount 0 :type integer)
@@ -89,10 +89,10 @@ key order is height order)."
 (defun %csi-encode-stat (stats)
   (let ((v (make-array +csi-record-size+ :element-type '(unsigned-byte 8)))
         (mu (coinstats-muhash stats)))
-    (replace v (bitcoin-lisp.crypto::%le-integer-to-bytes
-                (bitcoin-lisp.crypto:muhash-numerator mu) 384))
-    (replace v (bitcoin-lisp.crypto::%le-integer-to-bytes
-                (bitcoin-lisp.crypto:muhash-denominator mu) 384)
+    (replace v (bl.crypto::%le-integer-to-bytes
+                (bl.crypto:muhash-numerator mu) 384))
+    (replace v (bl.crypto::%le-integer-to-bytes
+                (bl.crypto:muhash-denominator mu) 384)
              :start1 384)
     (loop for off from 768 by 8
           for val in (list (coinstats-txout-count stats)
@@ -110,9 +110,9 @@ key order is height order)."
     v))
 
 (defun %csi-decode-stat (v)
-  (let ((mu (bitcoin-lisp.crypto::%make-muhash
-             :numerator (bitcoin-lisp.crypto::%bytes-to-le-integer (subseq v 0 384))
-             :denominator (bitcoin-lisp.crypto::%bytes-to-le-integer (subseq v 384 768)))))
+  (let ((mu (bl.crypto::%make-muhash
+             :numerator (bl.crypto::%bytes-to-le-integer (subseq v 0 384))
+             :denominator (bl.crypto::%bytes-to-le-integer (subseq v 384 768)))))
     (make-coinstats
      :muhash mu
      :txout-count (%read-i64-le v 768)
@@ -188,14 +188,14 @@ this tree used before — see storage/datadir.lisp."
 (defun %csi-bip30-unspendable-p (height)
   "The two mainnet coinbases (heights 91722, 91812) BIP30-overwritten and thus
 unspendable (Core IsBIP30Unspendable). Height-only match; only mainnet."
-  (and (eq bitcoin-lisp:*network* :mainnet)
+  (and (eq bl:*network* :mainnet)
        (or (= height 91722) (= height 91812))))
 
 (defun %copy-coinstats (s)
   (make-coinstats
-   :muhash (bitcoin-lisp.crypto::%make-muhash
-            :numerator (bitcoin-lisp.crypto:muhash-numerator (coinstats-muhash s))
-            :denominator (bitcoin-lisp.crypto:muhash-denominator (coinstats-muhash s)))
+   :muhash (bl.crypto::%make-muhash
+            :numerator (bl.crypto:muhash-numerator (coinstats-muhash s))
+            :denominator (bl.crypto:muhash-denominator (coinstats-muhash s)))
    :txout-count (coinstats-txout-count s) :bogo-size (coinstats-bogo-size s)
    :total-amount (coinstats-total-amount s) :total-subsidy (coinstats-total-subsidy s)
    :total-prevout-spent (coinstats-total-prevout-spent s)
@@ -213,7 +213,7 @@ CoinStatsIndex::CustomAppend). SUBSIDY is the block reward for HEIGHT. Returns
 STATS."
   (declare (ignore block-hash))
   (incf (coinstats-total-subsidy stats) subsidy)
-  (let ((txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+  (let ((txs (bl.ser:bitcoin-block-transactions block))
         (mu (coinstats-muhash stats)))
     (if (zerop height)
         ;; Genesis coinbase is unspendable (its outputs never enter the UTXO set).
@@ -223,13 +223,13 @@ STATS."
           (loop for tx in txs
                 for tx-idx from 0
                 for coinbase = (zerop tx-idx)
-                for txid = (bitcoin-lisp.serialization:transaction-hash tx)
+                for txid = (bl.ser:transaction-hash tx)
                 do (if (and coinbase (%csi-bip30-unspendable-p height))
                        (incf (coinstats-unspendable-bip30 stats) subsidy)
-                       (loop for out across (bitcoin-lisp.serialization:transaction-outputs tx)
+                       (loop for out across (bl.ser:transaction-outputs tx)
                              for vout from 0
-                             for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey out)
-                             for value = (bitcoin-lisp.serialization:tx-out-value out)
+                             for spk = (bl.ser:tx-out-script-pubkey out)
+                             for value = (bl.ser:tx-out-value out)
                              ;; Provably-unspendable outputs are dropped from the
                              ;; UTXO set (Core AddCoin / our block apply), so they
                              ;; contribute to the unspendable-scripts bucket, not
@@ -238,7 +238,7 @@ STATS."
                                   ((script-unspendable-p spk)
                                    (incf (coinstats-unspendable-scripts stats) value))
                                   (t
-                                   (bitcoin-lisp.crypto:muhash-insert
+                                   (bl.crypto:muhash-insert
                                     mu (coerce (coin-muhash-element txid vout height coinbase value spk)
                                                '(simple-array (unsigned-byte 8) (*))))
                                    (if coinbase
@@ -252,7 +252,7 @@ STATS."
             (destructuring-bind (ptxid pidx putxo) entry
               (let ((value (utxo-entry-value putxo))
                     (spk (utxo-entry-script-pubkey putxo)))
-                (bitcoin-lisp.crypto:muhash-remove
+                (bl.crypto:muhash-remove
                  mu (coerce (coin-muhash-element ptxid pidx
                                                  (utxo-entry-height putxo)
                                                  (utxo-entry-coinbase putxo)
@@ -356,7 +356,7 @@ Returns the number of blocks indexed."
   ;; Seed the synthetic genesis record so height 1 has a parent to build on.
   (when (< (coinstatsindex-height csi) 0)
     (coinstatsindex-seed-genesis csi (funcall subsidy-fn 0)
-                                 (network-genesis-hash bitcoin-lisp:*network*)))
+                                 (network-genesis-hash bl:*network*)))
   (let* ((tip (current-height chain-state))
          (start (1+ (coinstatsindex-height csi)))
          (count 0)
@@ -385,4 +385,4 @@ Returns the number of blocks indexed."
     count))
 
 (defun %csi-block-spends-p (block)
-  (> (length (bitcoin-lisp.serialization:bitcoin-block-transactions block)) 1))
+  (> (length (bl.ser:bitcoin-block-transactions block)) 1))

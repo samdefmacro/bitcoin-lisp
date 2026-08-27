@@ -25,7 +25,7 @@
 (defun hash-to-hex (bytes)
   "Convert a 32-byte hash to lowercase hex string (reversed for display),
 matching Bitcoin Core's uint256::GetHex."
-  (bitcoin-lisp.crypto:bytes-to-hex (bitcoin-lisp.crypto:reverse-bytes bytes)))
+  (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes bytes)))
 
 ;;; --- Blockchain Query Methods ---
 
@@ -33,21 +33,21 @@ matching Bitcoin Core's uint256::GetHex."
   "Return blockchain state information."
   (declare (ignore params))
   (let* ((chain-state (rpc-get-chain-state node))
-         (height (bitcoin-lisp.storage:current-height chain-state))
-         (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (height (bl.store:current-height chain-state))
+         (best-hash (bl.store:best-block-hash chain-state))
          (network (rpc-get-network node))
          (syncing (rpc-is-syncing node))
          (block-store (rpc-get-block-store node))
-         (tip (and best-hash (bitcoin-lisp.storage:get-block-index-entry chain-state best-hash)))
-         (tip-header (and tip (bitcoin-lisp.storage:block-index-entry-header tip)))
-         (bits (if tip-header (bitcoin-lisp.serialization:block-header-bits tip-header) #x1d00ffff))
+         (tip (and best-hash (bl.store:get-block-index-entry chain-state best-hash)))
+         (tip-header (and tip (bl.store:block-index-entry-header tip)))
+         (bits (if tip-header (bl.ser:block-header-bits tip-header) #x1d00ffff))
          ;; Report the best-HEADER height, not the validated-tip height, so a
          ;; download wedge is visible as blocks < headers (Core parity; matches
          ;; getchainstates). Reporting tip height for both hid exactly the
          ;; kind of stuck-tip-below-headers state the reorg wedge produced.
-         (best-header (bitcoin-lisp.storage:best-header-entry chain-state))
+         (best-header (bl.store:best-header-entry chain-state))
          (headers-height (if best-header
-                             (bitcoin-lisp.storage:block-index-entry-height best-header)
+                             (bl.store:block-index-entry-height best-header)
                              height))
          (result `(("chain" . ,(%chain-name network))
                    ("blocks" . ,height)
@@ -55,71 +55,71 @@ matching Bitcoin Core's uint256::GetHex."
                    ("bestblockhash" . ,(if best-hash (hash-to-hex best-hash) nil))
                    ("difficulty" . ,(%difficulty-from-bits bits))
                    ("time" . ,(if tip-header
-                                  (bitcoin-lisp.serialization:block-header-timestamp tip-header) 0))
+                                  (bl.ser:block-header-timestamp tip-header) 0))
                    ("mediantime" . ,(or (and best-hash
-                                             (bitcoin-lisp.validation:compute-median-time-past
+                                             (bl.val:compute-median-time-past
                                               chain-state best-hash))
                                         0))
                    ("verificationprogress" . ,(if syncing 0.0 1.0))
                    ("initialblockdownload" . ,(json-bool syncing))
                    ("chainwork" . ,(string-downcase
                                     (format nil "~64,'0x"
-                                            (if tip (bitcoin-lisp.storage:block-index-entry-chain-work tip) 0))))
+                                            (if tip (bl.store:block-index-entry-chain-work tip) 0))))
                    ("size_on_disk" . ,(if block-store
-                                          (round (* (bitcoin-lisp.storage:block-storage-size-mib block-store)
+                                          (round (* (bl.store:block-storage-size-mib block-store)
                                                     1048576))
                                           0))
                    ("bits" . ,(string-downcase (format nil "~8,'0x" bits)))
                    ("target" . ,(string-downcase
-                                 (format nil "~64,'0x" (bitcoin-lisp.storage:bits-to-target bits))))
-                   ("pruned" . ,(json-bool (bitcoin-lisp:pruning-enabled-p)))
+                                 (format nil "~64,'0x" (bl.store:bits-to-target bits))))
+                   ("pruned" . ,(json-bool (bl:pruning-enabled-p)))
                    ("warnings" . #()))))
     ;; Add pruning-specific fields when pruning is enabled
-    (when (bitcoin-lisp:pruning-enabled-p)
-      (let ((pruned-height (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
+    (when (bl:pruning-enabled-p)
+      (let ((pruned-height (bl.store:chain-state-pruned-height chain-state)))
         (setf result
               (append result
                       ;; pruneheight = first UNpruned block (Bitcoin Core convention).
                       ;; Note: pruneblockchain RPC returns pruned-height (last pruned).
                       `(("pruneheight" . ,(1+ pruned-height))
-                        ("automatic_pruning" . ,(json-bool (bitcoin-lisp:automatic-pruning-p)))
-                        ("prune_target_size" . ,(if (bitcoin-lisp:automatic-pruning-p)
-                                                    (* bitcoin-lisp:*prune-target-mib* 1048576)
+                        ("automatic_pruning" . ,(json-bool (bl:automatic-pruning-p)))
+                        ("prune_target_size" . ,(if (bl:automatic-pruning-p)
+                                                    (* bl:*prune-target-mib* 1048576)
                                                     0)))))))
     ;; Core reports the signet challenge here too, on a signet chain and
     ;; nowhere else (rpc/blockchain.cpp:1436-1440); feature_signet.py asserts
     ;; it. This is the third place the challenge belongs — getmininginfo had
     ;; it, getblocktemplate now does, and a client that only reads chain info
     ;; had no way to learn it.
-    (when (eq (bitcoin-lisp::node-network node) :signet)
-      (let ((challenge (bitcoin-lisp.validation:signet-challenge-for-network
-                        (bitcoin-lisp::node-network node))))
+    (when (eq (bl::node-network node) :signet)
+      (let ((challenge (bl.val:signet-challenge-for-network
+                        (bl::node-network node))))
         (when challenge
           (setf result
                 (append result
                         `(("signet_challenge"
-                           . ,(bitcoin-lisp.crypto:bytes-to-hex challenge))))))))
+                           . ,(bl.crypto:bytes-to-hex challenge))))))))
     result))
 
 (defun %getchainstates-entry (chain-state syncing)
   "Per-chainstate object for getchainstates — fields per Core's
 RPCHelpForChainstate (rpc/blockchain.cpp): snapshot_blockhash appears only
 for a snapshot chainstate, and validated reflects its assumeutxo status."
-  (let* ((height (bitcoin-lisp.storage:current-height chain-state))
-         (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+  (let* ((height (bl.store:current-height chain-state))
+         (best-hash (bl.store:best-block-hash chain-state))
          (tip (and best-hash
-                   (bitcoin-lisp.storage:get-block-index-entry chain-state best-hash)))
-         (bits (if (and tip (bitcoin-lisp.storage:block-index-entry-header tip))
-                   (bitcoin-lisp.serialization:block-header-bits
-                    (bitcoin-lisp.storage:block-index-entry-header tip))
+                   (bl.store:get-block-index-entry chain-state best-hash)))
+         (bits (if (and tip (bl.store:block-index-entry-header tip))
+                   (bl.ser:block-header-bits
+                    (bl.store:block-index-entry-header tip))
                    #x1d00ffff))
-         (snapshot-hash (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash
+         (snapshot-hash (bl.store:chain-state-from-snapshot-blockhash
                          chain-state)))
     `(("blocks" . ,height)
       ("bestblockhash" . ,(if best-hash (hash-to-hex best-hash) nil))
       ("bits" . ,(string-downcase (format nil "~8,'0x" bits)))
       ("target" . ,(string-downcase
-                    (format nil "~64,'0x" (bitcoin-lisp.storage:bits-to-target bits))))
+                    (format nil "~64,'0x" (bl.store:bits-to-target bits))))
       ("difficulty" . ,(%difficulty-from-bits bits))
       ;; Consistent with getblockchaininfo: 1.0 at tip, 0.0 while syncing.
       ("verificationprogress" . ,(if syncing 0.0d0 1.0d0))
@@ -128,12 +128,12 @@ for a snapshot chainstate, and validated reflects its assumeutxo status."
       ;; sync splits it — Core MaybeRebalanceCaches) for the tip cache and 0
       ;; for the db cache.
       ("coins_db_cache_bytes" . 0)
-      ("coins_tip_cache_bytes" . ,(bitcoin-lisp::chainstate-coins-cache-budget
+      ("coins_tip_cache_bytes" . ,(bl::chainstate-coins-cache-budget
                                    chain-state))
       ,@(when snapshot-hash
           `(("snapshot_blockhash" . ,(hash-to-hex snapshot-hash))))
       ("validated" . ,(json-bool
-                       (eq (bitcoin-lisp.storage:chain-state-assumeutxo-status
+                       (eq (bl.store:chain-state-assumeutxo-status
                             chain-state)
                            :validated))))))
 
@@ -145,25 +145,25 @@ first (when assumeutxo background validation is in progress), the current
   (declare (ignore params))
   (let* ((syncing (rpc-is-syncing node))
          (chainstates (rpc-get-chainstates node))
-         (current (bitcoin-lisp.storage:select-current-chainstate chainstates))
-         (historical (bitcoin-lisp.storage:select-historical-chainstate chainstates))
+         (current (bl.store:select-current-chainstate chainstates))
+         (historical (bl.store:select-historical-chainstate chainstates))
          ;; Core reports m_best_header's height, which can exceed every
          ;; chainstate's validated tip.
-         (best-header (bitcoin-lisp.storage:best-header-entry current))
+         (best-header (bl.store:best-header-entry current))
          (entries (append
                    (when historical
                      (list (%getchainstates-entry historical syncing)))
                    (list (%getchainstates-entry current syncing)))))
     `(("headers" . ,(if best-header
-                        (bitcoin-lisp.storage:block-index-entry-height best-header)
-                        (bitcoin-lisp.storage:current-height current)))
+                        (bl.store:block-index-entry-height best-header)
+                        (bl.store:current-height current)))
       ("chainstates" . ,entries))))
 
 (defun rpc-getbestblockhash (node params)
   "Return the hash of the best (tip) block."
   (declare (ignore params))
   (let* ((chain-state (rpc-get-chain-state node))
-         (best-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+         (best-hash (bl.store:best-block-hash chain-state)))
     (if best-hash
         (hash-to-hex best-hash)
         (error 'rpc-error :code +rpc-misc-error+ :message "No blocks"))))
@@ -172,7 +172,7 @@ first (when assumeutxo background validation is in progress), the current
   "Return the current block height."
   (declare (ignore params))
   (let ((chain-state (rpc-get-chain-state node)))
-    (bitcoin-lisp.storage:current-height chain-state)))
+    (bl.store:current-height chain-state)))
 
 (defun rpc-getblockhash (node params)
   "Return the hash of block at given height."
@@ -181,13 +181,13 @@ first (when assumeutxo background validation is in progress), the current
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid height parameter"))
     (let* ((chain-state (rpc-get-chain-state node))
-           (current-height (bitcoin-lisp.storage:current-height chain-state)))
+           (current-height (bl.store:current-height chain-state)))
       (when (> height current-height)
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message (format nil "Block height ~A out of range" height)))
-      (let ((entry (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+      (let ((entry (bl.store:get-block-at-height chain-state height)))
         (if entry
-            (hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash entry))
+            (hash-to-hex (bl.store:block-index-entry-hash entry))
             (error 'rpc-error :code +rpc-misc-error+
                               :message "Block not found"))))))
 
@@ -254,15 +254,15 @@ prevout object per input (Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT)."
            (hash-bytes (parse-hex-hash hash-str))
            (block-store (rpc-get-block-store node))
            (block (and block-store
-                       (bitcoin-lisp.storage:get-block block-store hash-bytes))))
+                       (bl.store:get-block block-store hash-bytes))))
       (unless block
         ;; Core getblock: RPC_INVALID_ADDRESS_OR_KEY (-5), blockchain.cpp:855.
         (error 'rpc-error :code +rpc-invalid-address-or-key+
                           :message "Block not found"))
       (cond
         ((<= verbosity 0) ;; Hex of the block's wire (witness-complete) bytes
-         (bitcoin-lisp.crypto:bytes-to-hex
-          (bitcoin-lisp.serialization:serialize-witness-block block)))
+         (bl.crypto:bytes-to-hex
+          (bl.ser:serialize-witness-block block)))
         ((= verbosity 1) ;; JSON with txids only
          (block-to-json block hash-str nil (rpc-get-chain-state node) (rpc-get-network node)))
         (t ;; verbosity 2: full tx details + fee; 3 adds the prevout objects
@@ -276,15 +276,15 @@ prevout object per input (Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT)."
 NIL for a coinbase: Core returns early for one (rawtransaction.cpp:354), and
 the undo list has no entry for it — indexing it anyway would hand the coinbase
 the FIRST real transaction's coins."
-  (unless (let ((ins (bitcoin-lisp.serialization:transaction-inputs tx)))
+  (unless (let ((ins (bl.ser:transaction-inputs tx)))
             (and (plusp (length ins))
-                 (bitcoin-lisp.serialization:coinbase-input-p (aref ins 0))))
+                 (bl.ser:coinbase-input-p (aref ins 0))))
     (let ((undos (%block-tx-undos block))
-          (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+          (txid (bl.ser:transaction-hash tx)))
       (when undos
-        (loop for candidate in (rest (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+        (loop for candidate in (rest (bl.ser:bitcoin-block-transactions block))
               for i from 0
-              when (equalp txid (bitcoin-lisp.serialization:transaction-hash candidate))
+              when (equalp txid (bl.ser:transaction-hash candidate))
                 return (nth i undos))))))
 
 (defun %block-tx-undos (block)
@@ -292,52 +292,52 @@ the FIRST real transaction's coins."
 available. Never signals: a pruned or missing undo record means the fee and
 prevout fields are absent, which is what Core reports for a pruned block."
   (handler-case
-      (let* ((hash (bitcoin-lisp.serialization:block-header-hash
-                    (bitcoin-lisp.serialization:bitcoin-block-header block)))
-             (undo (bitcoin-lisp.validation:get-undo-data hash)))
+      (let* ((hash (bl.ser:block-header-hash
+                    (bl.ser:bitcoin-block-header block)))
+             (undo (bl.val:get-undo-data hash)))
         (and undo
-             (bitcoin-lisp.storage:block-undo-from-spent-utxos block undo)))
+             (bl.store:block-undo-from-spent-utxos block undo)))
     (error () nil)))
 
 (defun %block-on-active-chain-p (entry chain-state)
   "T if ENTRY is the block at its height on the active chain."
-  (let ((at (bitcoin-lisp.storage:get-block-at-height
-             chain-state (bitcoin-lisp.storage:block-index-entry-height entry))))
-    (and at (equalp (bitcoin-lisp.storage:block-index-entry-hash at)
-                    (bitcoin-lisp.storage:block-index-entry-hash entry)))))
+  (let ((at (bl.store:get-block-at-height
+             chain-state (bl.store:block-index-entry-height entry))))
+    (and at (equalp (bl.store:block-index-entry-hash at)
+                    (bl.store:block-index-entry-hash entry)))))
 
 (defun %chain-header-fields (entry chain-state)
   "The chain-context header fields Bitcoin Core shares between getblock and
 getblockheader: confirmations, height, versionHex, mediantime, bits (hex),
 target, difficulty, chainwork, and -- when the block is on the active chain and
 not the tip -- nextblockhash."
-  (let* ((header (bitcoin-lisp.storage:block-index-entry-header entry))
-         (height (bitcoin-lisp.storage:block-index-entry-height entry))
-         (bits (bitcoin-lisp.serialization:block-header-bits header))
+  (let* ((header (bl.store:block-index-entry-header entry))
+         (height (bl.store:block-index-entry-height entry))
+         (bits (bl.ser:block-header-bits header))
          (on-active (%block-on-active-chain-p entry chain-state))
          (next (and on-active
-                    (bitcoin-lisp.storage:get-block-at-height chain-state (1+ height)))))
+                    (bl.store:get-block-at-height chain-state (1+ height)))))
     (append
      `(("confirmations" . ,(if on-active
-                               (+ (- (bitcoin-lisp.storage:current-height chain-state) height) 1)
+                               (+ (- (bl.store:current-height chain-state) height) 1)
                                -1))
        ("height" . ,height)
        ("versionHex" . ,(string-downcase
                          (format nil "~8,'0x"
-                                 (logand (bitcoin-lisp.serialization:block-header-version header)
+                                 (logand (bl.ser:block-header-version header)
                                          #xffffffff))))
-       ("mediantime" . ,(or (bitcoin-lisp.validation:compute-median-time-past-from-entry
+       ("mediantime" . ,(or (bl.val:compute-median-time-past-from-entry
                              entry)
                             0))
        ("bits" . ,(string-downcase (format nil "~8,'0x" bits)))
        ("target" . ,(string-downcase
-                     (format nil "~64,'0x" (bitcoin-lisp.storage:bits-to-target bits))))
+                     (format nil "~64,'0x" (bl.store:bits-to-target bits))))
        ("difficulty" . ,(%difficulty-from-bits bits))
        ("chainwork" . ,(string-downcase
                         (format nil "~64,'0x"
-                                (bitcoin-lisp.storage:block-index-entry-chain-work entry)))))
+                                (bl.store:block-index-entry-chain-work entry)))))
      (when next
-       `(("nextblockhash" . ,(hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash next))))))))
+       `(("nextblockhash" . ,(hash-to-hex (bl.store:block-index-entry-hash next))))))))
 
 (defun block-to-json (block hash-str include-tx-details chain-state
                       &optional network &key prevouts)
@@ -350,35 +350,35 @@ With INCLUDE-TX-DETAILS the block's undo data is read and each transaction gets
 its FEE, as Core does at verbosity 2 AND 3 (blockToJSON reads the undo for
 both, rpc/blockchain.cpp). PREVOUTS additionally renders Core's verbosity-3
 prevout object per input."
-  (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-         (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (txs (bl.ser:bitcoin-block-transactions block))
          (ntx (length txs))
-         (entry (bitcoin-lisp.storage:get-block-index-entry
-                 chain-state (bitcoin-lisp.serialization:block-header-hash header)))
-         (stripped (+ 80 (bitcoin-lisp.serialization:compact-size-length ntx)
+         (entry (bl.store:get-block-index-entry
+                 chain-state (bl.ser:block-header-hash header)))
+         (stripped (+ 80 (bl.ser:compact-size-length ntx)
                       (reduce #'+ txs :key (lambda (tx)
-                                             (length (bitcoin-lisp.serialization:serialize-transaction tx))))))
-         (size (+ 80 (bitcoin-lisp.serialization:compact-size-length ntx)
+                                             (length (bl.ser:serialize-transaction tx))))))
+         (size (+ 80 (bl.ser:compact-size-length ntx)
                   (reduce #'+ txs :key (lambda (tx)
-                                         (length (bitcoin-lisp.serialization:transaction-wire-bytes tx)))))))
+                                         (length (bl.ser:transaction-wire-bytes tx)))))))
     (append
      `(("hash" . ,hash-str))
      (when entry (%chain-header-fields entry chain-state))
      `(("strippedsize" . ,stripped)
        ("size" . ,size)
-       ("weight" . ,(bitcoin-lisp.validation:calculate-block-weight txs))
+       ("weight" . ,(bl.val:calculate-block-weight txs))
        ;; Core blockToJSON:211 pushes coinbase_tx at every verbosity it is
        ;; reached at (blockToJSON is only called for verbosity >= 1). Core
        ;; CHECK_NONFATALs the coinbase's existence; we simply omit the key for
        ;; a degenerate block rather than error out of an informational RPC.
        ,@(let ((coinbase (first txs)))
            (when (and coinbase
-                      (plusp (length (bitcoin-lisp.serialization:transaction-inputs coinbase))))
+                      (plusp (length (bl.ser:transaction-inputs coinbase))))
              `(("coinbase_tx" . ,(%coinbase-tx-json coinbase)))))
-       ("version" . ,(bitcoin-lisp.serialization:block-header-version header))
-       ("merkleroot" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-merkle-root header)))
-       ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
-       ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
+       ("version" . ,(bl.ser:block-header-version header))
+       ("merkleroot" . ,(hash-to-hex (bl.ser:block-header-merkle-root header)))
+       ("time" . ,(bl.ser:block-header-timestamp header))
+       ("nonce" . ,(bl.ser:block-header-nonce header))
        ("nTx" . ,ntx))
      ;; Same rule as getblockheader: blockToJSON delegates its header fields to
      ;; blockheaderToJSON, so genesis omits previousblockhash here too.
@@ -403,20 +403,20 @@ prevout object per input."
 rpc/blockchain.cpp:185-200): version, locktime, the input's sequence and
 scriptSig hex, and — only when the coinbase carries one — the single witness
 stack item (the segwit reserved value, BIP141)."
-  (let* ((vin0 (aref (bitcoin-lisp.serialization:transaction-inputs coinbase-tx) 0))
+  (let* ((vin0 (aref (bl.ser:transaction-inputs coinbase-tx) 0))
          (witness (%tx-input-witness coinbase-tx 0)))
     (append
-     `(("version" . ,(bitcoin-lisp.serialization:transaction-version coinbase-tx))
-       ("locktime" . ,(bitcoin-lisp.serialization:transaction-lock-time coinbase-tx))
-       ("sequence" . ,(bitcoin-lisp.serialization:tx-in-sequence vin0))
-       ("coinbase" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                       (bitcoin-lisp.serialization:tx-in-script-sig vin0))))
+     `(("version" . ,(bl.ser:transaction-version coinbase-tx))
+       ("locktime" . ,(bl.ser:transaction-lock-time coinbase-tx))
+       ("sequence" . ,(bl.ser:tx-in-sequence vin0))
+       ("coinbase" . ,(bl.crypto:bytes-to-hex
+                       (bl.ser:tx-in-script-sig vin0))))
      (when (and witness (plusp (length witness)))
-       `(("witness" . ,(bitcoin-lisp.crypto:bytes-to-hex (elt witness 0))))))))
+       `(("witness" . ,(bl.crypto:bytes-to-hex (elt witness 0))))))))
 
 (defun tx-to-txid (tx)
   "Get transaction ID as hex string."
-  (hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
+  (hash-to-hex (bl.ser:transaction-hash tx)))
 
 (defun %script-type (script)
   "Bitcoin Core scriptPubKey 'type' name for a standard SCRIPT, else
@@ -440,7 +440,7 @@ stack item (the segwit reserved value, BIP141)."
 
 (defun %tx-input-witness (tx index)
   "The witness stack (vector of byte vectors) for input INDEX of TX, or NIL."
-  (let ((w (bitcoin-lisp.serialization:transaction-witness tx)))
+  (let ((w (bl.ser:transaction-witness tx)))
     (when (and w (< index (length w)))
       (elt w index))))
 
@@ -456,16 +456,16 @@ order — which unlocks Core's two extra fields (TxToUniv, core_io.cpp:455-525):
 
 Those two are gated separately in Core, so they are gated separately here: a
 verbosity-2 caller gets the fee and no prevout objects."
-  (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-        (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
-        (wire (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
+  (let ((inputs (bl.ser:transaction-inputs tx))
+        (outputs (bl.ser:transaction-outputs tx))
+        (wire (bl.ser:transaction-wire-bytes tx)))
     `(("txid" . ,(tx-to-txid tx))
-      ("hash" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
-      ("version" . ,(bitcoin-lisp.serialization:transaction-version tx))
+      ("hash" . ,(hash-to-hex (bl.ser:transaction-wtxid tx)))
+      ("version" . ,(bl.ser:transaction-version tx))
       ("size" . ,(length wire))
-      ("vsize" . ,(bitcoin-lisp.serialization:transaction-vsize tx))
-      ("weight" . ,(bitcoin-lisp.serialization:transaction-weight tx))
-      ("locktime" . ,(bitcoin-lisp.serialization:transaction-lock-time tx))
+      ("vsize" . ,(bl.ser:transaction-vsize tx))
+      ("weight" . ,(bl.ser:transaction-weight tx))
+      ("locktime" . ,(bl.ser:transaction-lock-time tx))
       ("vin" . ,(loop for input across inputs
                       for i from 0
                       collect (input-to-json input (%tx-input-witness tx i)
@@ -479,12 +479,12 @@ verbosity-2 caller gets the fee and no prevout objects."
           ;; Core computes the fee from the spent coins whenever it has them,
           ;; independently of whether it renders the prevout objects.
           (let ((in-total (reduce #'+ spent-coins
-                                  :key #'bitcoin-lisp.storage:utxo-entry-value
+                                  :key #'bl.store:utxo-entry-value
                                   :initial-value 0))
                 (out-total (loop for o across outputs
-                                 sum (bitcoin-lisp.serialization:tx-out-value o))))
+                                 sum (bl.ser:tx-out-value o))))
             `(("fee" . ,(/ (- in-total out-total) 100000000.0d0)))))
-      ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex wire)))))
+      ("hex" . ,(bl.crypto:bytes-to-hex wire)))))
 
 (defun input-to-json (input &optional witness-stack &key prevout network)
   "Convert transaction input to JSON, including sequence and (when present) the
@@ -493,51 +493,51 @@ witness stack; coinbase inputs emit a coinbase field instead of txid/vout.
 PREVOUT is the UTXO-ENTRY this input spent; supplying it adds Core's
 verbosity-3 prevout object (core_io.cpp:478-488)."
   (let ((base
-          (if (bitcoin-lisp.serialization:coinbase-input-p input)
-              `(("coinbase" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                                (bitcoin-lisp.serialization:tx-in-script-sig input))))
-              (let ((outpoint (bitcoin-lisp.serialization:tx-in-previous-output input)))
-                `(("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:outpoint-hash outpoint)))
-                  ("vout" . ,(bitcoin-lisp.serialization:outpoint-index outpoint))
-                  ("scriptSig" . (("asm" . ,(bitcoin-lisp.validation:disassemble-script
-                                             (bitcoin-lisp.serialization:tx-in-script-sig input)))
-                                  ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                                             (bitcoin-lisp.serialization:tx-in-script-sig input))))))))))
-    (when (and prevout (not (bitcoin-lisp.serialization:coinbase-input-p input)))
-      (let ((spk (bitcoin-lisp.storage:utxo-entry-script-pubkey prevout)))
+          (if (bl.ser:coinbase-input-p input)
+              `(("coinbase" . ,(bl.crypto:bytes-to-hex
+                                (bl.ser:tx-in-script-sig input))))
+              (let ((outpoint (bl.ser:tx-in-previous-output input)))
+                `(("txid" . ,(hash-to-hex (bl.ser:outpoint-hash outpoint)))
+                  ("vout" . ,(bl.ser:outpoint-index outpoint))
+                  ("scriptSig" . (("asm" . ,(bl.val:disassemble-script
+                                             (bl.ser:tx-in-script-sig input)))
+                                  ("hex" . ,(bl.crypto:bytes-to-hex
+                                             (bl.ser:tx-in-script-sig input))))))))))
+    (when (and prevout (not (bl.ser:coinbase-input-p input)))
+      (let ((spk (bl.store:utxo-entry-script-pubkey prevout)))
         (setf base
               (append base
                       `(("prevout"
                          . (("generated" . ,(json-bool
-                                             (bitcoin-lisp.storage:utxo-entry-coinbase prevout)))
-                            ("height" . ,(bitcoin-lisp.storage:utxo-entry-height prevout))
-                            ("value" . ,(/ (bitcoin-lisp.storage:utxo-entry-value prevout)
+                                             (bl.store:utxo-entry-coinbase prevout)))
+                            ("height" . ,(bl.store:utxo-entry-height prevout))
+                            ("value" . ,(/ (bl.store:utxo-entry-value prevout)
                                            100000000.0d0))
                             ("scriptPubKey"
                              . ,(let ((addr (and network (%script->address spk network))))
                                   (append
-                                   `(("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
-                                     ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
+                                   `(("asm" . ,(bl.val:disassemble-script spk))
+                                     ("hex" . ,(bl.crypto:bytes-to-hex spk))
                                      ("type" . ,(%script-type spk)))
                                    (when addr `(("address" . ,addr)))))))))))))
     (when (and witness-stack (plusp (length witness-stack)))
       (setf base (append base
                          `(("txinwitness"
-                            . ,(map 'list #'bitcoin-lisp.crypto:bytes-to-hex witness-stack))))))
-    (append base `(("sequence" . ,(bitcoin-lisp.serialization:tx-in-sequence input))))))
+                            . ,(map 'list #'bl.crypto:bytes-to-hex witness-stack))))))
+    (append base `(("sequence" . ,(bl.ser:tx-in-sequence input))))))
 
 (defun output-to-json (output index &optional network)
   "Convert transaction output to JSON, with scriptPubKey type and (when NETWORK
 is supplied and the script is addressable) address."
-  (let* ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output))
+  (let* ((spk (bl.ser:tx-out-script-pubkey output))
          (addr (and network (%script->address spk network)))
-         (spk-json `(("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
+         (spk-json `(("asm" . ,(bl.val:disassemble-script spk))
                      ,@(when network `(("desc" . ,(scriptpubkey-desc spk network))))
-                     ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
+                     ("hex" . ,(bl.crypto:bytes-to-hex spk))
                      ("type" . ,(%script-type spk)))))
     (when addr
       (setf spk-json (append spk-json `(("address" . ,addr)))))
-    `(("value" . ,(/ (bitcoin-lisp.serialization:tx-out-value output) 100000000.0d0))
+    `(("value" . ,(/ (bl.ser:tx-out-value output) 100000000.0d0))
       ("n" . ,index)
       ("scriptPubKey" . ,spk-json))))
 
@@ -550,7 +550,7 @@ is supplied and the script is addressable) address."
                         :message "Invalid block hash"))
     (let* ((hash-bytes (parse-hex-hash hash-str))
            (chain-state (rpc-get-chain-state node))
-           (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash-bytes)))
+           (entry (bl.store:get-block-index-entry chain-state hash-bytes)))
       (unless entry
         ;; Core getblockheader: RPC_INVALID_ADDRESS_OR_KEY (-5),
         ;; blockchain.cpp:655.
@@ -562,9 +562,9 @@ is supplied and the script is addressable) address."
           ;; Non-verbose: serialize the header straight from the index entry
           ;; (Core serializes pblockindex->GetBlockHeader() — no block-store
           ;; read, so header-only/pruned entries work too).
-          (bitcoin-lisp.crypto:bytes-to-hex
-           (bitcoin-lisp.serialization:serialize
-            (bitcoin-lisp.storage:block-index-entry-header entry)))))))
+          (bl.crypto:bytes-to-hex
+           (bl.ser:serialize
+            (bl.store:block-index-entry-header entry)))))))
 
 (defun %previousblockhash-field (entry header)
   "Core blockheaderToJSON (rpc/blockchain.cpp:177-178) pushes previousblockhash
@@ -577,9 +577,9 @@ exactly Core's pprev == nullptr, and unlike the back-link it stays correct for
 an entry loaded without one (an assumeutxo base, a synthetic fixture). A NIL
 ENTRY — a block we hold but have not indexed — always gets the key, since only
 genesis lacks a parent and genesis is always indexed."
-  (unless (and entry (zerop (bitcoin-lisp.storage:block-index-entry-height entry)))
+  (unless (and entry (zerop (bl.store:block-index-entry-height entry)))
     `(("previousblockhash"
-       . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-prev-block header))))))
+       . ,(hash-to-hex (bl.ser:block-header-prev-block header))))))
 
 (defun block-header-entry-to-json (entry hash-str chain-state &optional block-store)
   "Convert block index entry to header JSON (Bitcoin Core getblockheader): the
@@ -588,14 +588,14 @@ nTx, and previousblockhash when the block has a parent. BLOCK-STORE, when given,
 lets nTx be backfilled for an index entry that predates the tx-count field —
 one block-store read per such entry, after which %entry-tx-count caches the
 count on the entry."
-  (let ((header (bitcoin-lisp.storage:block-index-entry-header entry)))
+  (let ((header (bl.store:block-index-entry-header entry)))
     (append
      `(("hash" . ,hash-str))
      (%chain-header-fields entry chain-state)
-     `(("version" . ,(bitcoin-lisp.serialization:block-header-version header))
-       ("merkleroot" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-merkle-root header)))
-       ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
-       ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
+     `(("version" . ,(bl.ser:block-header-version header))
+       ("merkleroot" . ,(hash-to-hex (bl.ser:block-header-merkle-root header)))
+       ("time" . ,(bl.ser:block-header-timestamp header))
+       ("nonce" . ,(bl.ser:block-header-nonce header))
        ;; Core blockheaderToJSON:175 pushes nTx unconditionally. It is 0 for a
        ;; header whose body we have never stored, matching Core's nTx, which
        ;; stays 0 until ReceivedBlockTransactions.
@@ -606,10 +606,10 @@ count on the entry."
   "Bitcoin Core getchaintips status for a tip ENTRY."
   (cond
     ((and on-active (equalp hash best-hash)) "active")
-    (t (case (bitcoin-lisp.storage:block-index-entry-status entry)
+    (t (case (bl.store:block-index-entry-status entry)
          (:valid "valid-fork")
          (:invalid "invalid")
-         (t (if (bitcoin-lisp.storage:get-block block-store hash)
+         (t (if (bl.store:get-block block-store hash)
                 "valid-headers"
                 "headers-only"))))))
 
@@ -618,26 +618,26 @@ count on the entry."
   (declare (ignore params))
   (let* ((chain-state (rpc-get-chain-state node))
          (block-store (rpc-get-block-store node))
-         (index (bitcoin-lisp.storage::chain-state-block-index chain-state))
-         (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (index (bl.store::chain-state-block-index chain-state))
+         (best-hash (bl.store:best-block-hash chain-state))
          (has-child (make-hash-table :test 'equalp))
          (active (make-hash-table :test 'equalp))
          (tips '()))
     ;; Any block referenced as a parent has a child, so it is not a tip.
     (maphash (lambda (h entry)
                (declare (ignore h))
-               (let ((prev (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+               (let ((prev (bl.store:block-index-entry-prev-entry entry)))
                  (when prev
-                   (setf (gethash (bitcoin-lisp.storage:block-index-entry-hash prev)
+                   (setf (gethash (bl.store:block-index-entry-hash prev)
                                   has-child)
                          t))))
              index)
     ;; Active-chain hash set (tip back to genesis) for O(1) membership tests.
     (loop for e = (and best-hash
-                       (bitcoin-lisp.storage:get-block-index-entry chain-state best-hash))
-            then (bitcoin-lisp.storage:block-index-entry-prev-entry e)
+                       (bl.store:get-block-index-entry chain-state best-hash))
+            then (bl.store:block-index-entry-prev-entry e)
           while e
-          do (setf (gethash (bitcoin-lisp.storage:block-index-entry-hash e) active) t))
+          do (setf (gethash (bl.store:block-index-entry-hash e) active) t))
     (maphash
      (lambda (h entry)
        (unless (gethash h has-child)
@@ -646,11 +646,11 @@ count on the entry."
            ;; branchlen = blocks from this tip back to the active chain.
            (unless on-active
              (loop for e = entry
-                     then (bitcoin-lisp.storage:block-index-entry-prev-entry e)
-                   while (and e (not (gethash (bitcoin-lisp.storage:block-index-entry-hash e)
+                     then (bl.store:block-index-entry-prev-entry e)
+                   while (and e (not (gethash (bl.store:block-index-entry-hash e)
                                               active)))
                    do (incf branchlen)))
-           (push `(("height" . ,(bitcoin-lisp.storage:block-index-entry-height entry))
+           (push `(("height" . ,(bl.store:block-index-entry-height entry))
                    ("hash" . ,(hash-to-hex h))
                    ("branchlen" . ,branchlen)
                    ("status" . ,(chaintip-status entry on-active best-hash h block-store)))
@@ -675,15 +675,15 @@ Coin(out, MEMPOOL_HEIGHT, false), txmempool.cpp:756).")
   "The unconfirmed coin TXID:VOUT created by a mempool transaction, as a
 utxo-entry at +mempool-coin-height+ with coinbase=false (Core
 CCoinsViewMemPool::GetCoin), or NIL."
-  (let ((entry (and mempool (bitcoin-lisp.mempool:mempool-get mempool txid))))
+  (let ((entry (and mempool (bl.mp:mempool-get mempool txid))))
     (when entry
-      (let ((outputs (bitcoin-lisp.serialization:transaction-outputs
-                      (bitcoin-lisp.mempool:mempool-entry-transaction entry))))
+      (let ((outputs (bl.ser:transaction-outputs
+                      (bl.mp:mempool-entry-transaction entry))))
         (when (< vout (length outputs))
           (let ((out (aref outputs vout)))
-            (bitcoin-lisp.storage:make-utxo-entry
-             :value (bitcoin-lisp.serialization:tx-out-value out)
-             :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey out)
+            (bl.store:make-utxo-entry
+             :value (bl.ser:tx-out-value out)
+             :script-pubkey (bl.ser:tx-out-script-pubkey out)
              :height +mempool-coin-height+
              :coinbase nil)))))))
 
@@ -716,11 +716,11 @@ accepted but ignored."
             (entry (cond
                      ;; include_mempool: a mempool spend hides the coin ...
                      ((and mempool
-                           (bitcoin-lisp.mempool:mempool-spending-tx
+                           (bl.mp:mempool-spending-tx
                             mempool txid-bytes vout))
                       nil)
                      ;; ... and a mempool-created output is visible.
-                     (t (or (bitcoin-lisp.storage:get-utxo utxo-set txid-bytes vout)
+                     (t (or (bl.store:get-utxo utxo-set txid-bytes vout)
                             (and mempool
                                  (%mempool-view-coin mempool txid-bytes vout)))))))
       (if entry
@@ -729,11 +729,11 @@ accepted but ignored."
                  ;; differ partway through a reorg's disconnect phase, and Core
                  ;; reports the view's (rpc/blockchain.cpp:1083). Falls back to
                  ;; the tip for a view that tracks no pointer.
-                 (best-hash (or (bitcoin-lisp.storage:coins-view-best-block utxo-set)
-                                (bitcoin-lisp.storage:best-block-hash chain-state)))
-                 (height (bitcoin-lisp.storage:current-height chain-state))
-                 (utxo-height (bitcoin-lisp.storage:utxo-entry-height entry))
-                 (spk (bitcoin-lisp.storage:utxo-entry-script-pubkey entry))
+                 (best-hash (or (bl.store:coins-view-best-block utxo-set)
+                                (bl.store:best-block-hash chain-state)))
+                 (height (bl.store:current-height chain-state))
+                 (utxo-height (bl.store:utxo-entry-height entry))
+                 (spk (bl.store:utxo-entry-script-pubkey entry))
                  (network (rpc-get-network node))
                  (addr (%script->address spk network)))
             `(("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
@@ -742,15 +742,15 @@ accepted but ignored."
               ("confirmations" . ,(if (= utxo-height +mempool-coin-height+)
                                       0
                                       (1+ (- height utxo-height))))
-              ("value" . ,(/ (bitcoin-lisp.storage:utxo-entry-value entry) 100000000.0d0))
+              ("value" . ,(/ (bl.store:utxo-entry-value entry) 100000000.0d0))
               ;; Core's scriptPubKey shape: asm/hex/type plus address when the
               ;; script encodes to one (previously only hex was returned).
-              ("scriptPubKey" . (("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
+              ("scriptPubKey" . (("asm" . ,(bl.val:disassemble-script spk))
                                  ("desc" . ,(scriptpubkey-desc spk network))
-                                 ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
+                                 ("hex" . ,(bl.crypto:bytes-to-hex spk))
                                  ("type" . ,(%script-type spk))
                                  ,@(when addr `(("address" . ,addr)))))
-              ("coinbase" . ,(json-bool (bitcoin-lisp.storage:utxo-entry-coinbase entry)))))
+              ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))))
           nil))))) ; Return null for spent/absent outputs
 
 ;;; --- Network Query Methods ---
@@ -788,11 +788,11 @@ must coerce to a vector (NIL would encode as null, not [])."
 regardless of its socket address (127.0.0.1); otherwise the address's
 network, or \"not_publicly_routable\" when it isn't a routable literal."
   (multiple-value-bind (net bytes)
-      (bitcoin-lisp.networking:parse-network-address
-       (bitcoin-lisp::peer-address peer))
+      (bl.net:parse-network-address
+       (bl::peer-address peer))
     (cond
-      ((bitcoin-lisp.networking::peer-inbound-onion peer) "onion")
-      ((and net (bitcoin-lisp.networking:address-routable-p bytes net))
+      ((bl.net::peer-inbound-onion peer) "onion")
+      ((and net (bl.net:address-routable-p bytes net))
        (ecase net
          (:ipv4 "ipv4") (:ipv6 "ipv6") (:torv3 "onion")
          (:i2p "i2p") (:cjdns "cjdns")))
@@ -807,8 +807,8 @@ it opened against the node's getpeerinfo row by comparing addrbind to the
 address it dialled. Taken from the socket rather than from configuration —
 with -bind=0.0.0.0 the configured address names no interface, and the bind
 address of an OUTBOUND connection is whichever local address the kernel chose."
-  (let* ((connection (bitcoin-lisp.networking::peer-connection peer))
-         (socket (and connection (bitcoin-lisp.networking::connection-socket connection))))
+  (let* ((connection (bl.net::peer-connection peer))
+         (socket (and connection (bl.net::connection-socket connection))))
     (when socket
       (ignore-errors
        (let ((address (usocket:get-local-address socket))
@@ -834,12 +834,12 @@ in getpeerinfo output without it, which on regtest is every peer.
 Read from the socket, like ADDRBIND: an outbound connection knows the port it
 dialled, and an inbound one only learns the remote's ephemeral port from the
 accepted socket."
-  (let* ((connection (bitcoin-lisp.networking::peer-connection peer))
-         (socket (and connection (bitcoin-lisp.networking::connection-socket connection)))
-         (host (bitcoin-lisp::peer-address peer))
+  (let* ((connection (bl.net::peer-connection peer))
+         (socket (and connection (bl.net::connection-socket connection)))
+         (host (bl::peer-address peer))
          (port (or (ignore-errors (and socket (usocket:get-peer-port socket)))
                    (let ((p (and connection
-                                 (bitcoin-lisp.networking::connection-port connection))))
+                                 (bl.net::connection-port connection))))
                      (and p (plusp p) p)))))
     (cond ((null port) host)
           ;; A v6 literal is bracketed before the port, as Core's
@@ -852,20 +852,20 @@ accepted socket."
 (Core addrLocal, set from the version addrMe for outbound peers when
 routable, net_processing.cpp:3651-3654). Returns \"ip:port\" or NIL — the
 field is optional in Core and omitted when unknown."
-  (let ((vmsg (bitcoin-lisp::peer-version peer)))
-    (when (and vmsg (not (bitcoin-lisp.networking::peer-inbound peer)))
-      (let* ((addr-me (bitcoin-lisp.serialization::version-message-addr-recv vmsg))
-             (ip (bitcoin-lisp.serialization:net-addr-ip addr-me))
-             (net (and (= (length ip) 16) (bitcoin-lisp.networking::ip-network ip))))
-        (when (and net (bitcoin-lisp.networking:address-routable-p ip net))
+  (let ((vmsg (bl::peer-version peer)))
+    (when (and vmsg (not (bl.net::peer-inbound peer)))
+      (let* ((addr-me (bl.ser::version-message-addr-recv vmsg))
+             (ip (bl.ser:net-addr-ip addr-me))
+             (net (and (= (length ip) 16) (bl.net::ip-network ip))))
+        (when (and net (bl.net:address-routable-p ip net))
           (format nil "~A:~D"
-                  (bitcoin-lisp.networking:network-address-to-string net ip)
-                  (bitcoin-lisp.serialization:net-addr-port addr-me)))))))
+                  (bl.net:network-address-to-string net ip)
+                  (bl.ser:net-addr-port addr-me)))))))
 
 (defun %universal-to-unix (universal)
   "Universal-time -> unix time, preserving 0 as \"never\" (Core reports 0)."
   (if (plusp universal)
-      (- universal bitcoin-lisp.serialization:+universal-unix-epoch-offset+)
+      (- universal bl.ser:+universal-unix-epoch-offset+)
       0))
 
 (defun rpc-getpeerinfo (node params)
@@ -908,43 +908,43 @@ against 50ms and hopeless against 30s. Filtering here is not a workaround for
 the reap cadence: reporting a peer we have closed the socket on is wrong
 whatever the cadence is."
   (let ((peers (sort (remove-if (lambda (p)
-                                  (eq (bitcoin-lisp.networking:peer-state p) :disconnected))
+                                  (eq (bl.net:peer-state p) :disconnected))
                                 (rpc-get-peers node))
-                     #'< :key #'bitcoin-lisp.networking::peer-id))
+                     #'< :key #'bl.net::peer-id))
         (chain-state (rpc-get-chain-state node))
         (now (get-internal-real-time)))
     (mapcar
      (lambda (peer)
        ;; peer-version holds the received version *message* struct, not a
        ;; number — pull the numeric protocol version out of it.
-       (let* ((vmsg (bitcoin-lisp::peer-version peer))
-              (conn (bitcoin-lisp.networking::peer-connection peer))
-              (ping (bitcoin-lisp.networking::peer-ping-latency peer))
-              (minping (bitcoin-lisp.networking::peer-min-ping-latency peer))
-              (ping-nonce (bitcoin-lisp.networking::peer-ping-nonce peer))
-              (services (or (bitcoin-lisp::peer-services peer) 0))
-              (sh (or (bitcoin-lisp::peer-start-height peer) -1))
-              (hss (bitcoin-lisp.networking::peer-headers-sync peer))
-              (transport (and conn (bitcoin-lisp.networking::connection-transport conn)))
+       (let* ((vmsg (bl::peer-version peer))
+              (conn (bl.net::peer-connection peer))
+              (ping (bl.net::peer-ping-latency peer))
+              (minping (bl.net::peer-min-ping-latency peer))
+              (ping-nonce (bl.net::peer-ping-nonce peer))
+              (services (or (bl::peer-services peer) 0))
+              (sh (or (bl::peer-start-height peer) -1))
+              (hss (bl.net::peer-headers-sync peer))
+              (transport (and conn (bl.net::connection-transport conn)))
               ;; Last header we have in common: the peer's best known block
               ;; per its inv/headers announcements (Core pindexBestKnownBlock
               ;; -> nSyncHeight), -1 while unknown.
-              (best-known (bitcoin-lisp.networking::peer-best-known-block-hash peer))
+              (best-known (bl.net::peer-best-known-block-hash peer))
               (best-entry (and best-known chain-state
-                               (bitcoin-lisp.storage:get-block-index-entry
+                               (bl.store:get-block-index-entry
                                 chain-state best-known)))
               ;; Heights of blocks in flight from this peer (Core
               ;; vHeightInFlight), ascending; hashes whose header vanished
               ;; (reorged index) are skipped.
               (inflight
-                (sort (loop for hash in (bitcoin-lisp.networking::peer-inflight-block-hashes peer)
+                (sort (loop for hash in (bl.net::peer-inflight-block-hashes peer)
                             for entry = (and chain-state
-                                             (bitcoin-lisp.storage:get-block-index-entry
+                                             (bl.store:get-block-index-entry
                                               chain-state hash))
                             when entry
-                              collect (bitcoin-lisp.storage:block-index-entry-height entry))
+                              collect (bl.store:block-index-entry-height entry))
                       #'<)))
-         `(("id" . ,(bitcoin-lisp.networking::peer-id peer))
+         `(("id" . ,(bl.net::peer-id peer))
            ("addr" . ,(%peer-addr peer))
            ,@(let ((addrlocal (%peer-addrlocal peer)))
                (when addrlocal `(("addrlocal" . ,addrlocal))))
@@ -957,23 +957,23 @@ whatever the cadence is."
            ;; Whether we relay txs to this peer: tx-relay state exists — the
            ;; connection type allows it AND the peer's version set fRelay
            ;; (Core CNodeStateStats::m_relay_txs).
-           ("relaytxes" . ,(json-bool (bitcoin-lisp.networking:peer-tx-relay-p peer)))
+           ("relaytxes" . ,(json-bool (bl.net:peer-tx-relay-p peer)))
            ;; Mempool sequence snapshot of our last inv flush to this peer +
            ;; queued-but-unsent announcements (Core m_last_inv_sequence /
            ;; m_inv_to_send).
-           ("last_inv_sequence" . ,(bitcoin-lisp.networking::peer-last-inv-sequence peer))
-           ("inv_to_send" . ,(length (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
+           ("last_inv_sequence" . ,(bl.net::peer-last-inv-sequence peer))
+           ("inv_to_send" . ,(length (bl.net::peer-tx-inv-queue peer)))
            ("lastsend" . ,(%universal-to-unix
-                           (if conn (bitcoin-lisp.networking::connection-last-send-time conn) 0)))
+                           (if conn (bl.net::connection-last-send-time conn) 0)))
            ("lastrecv" . ,(%universal-to-unix
-                           (if conn (bitcoin-lisp.networking::connection-last-recv-time conn) 0)))
-           ("last_transaction" . ,(bitcoin-lisp.networking::peer-last-tx-time peer))
-           ("last_block" . ,(bitcoin-lisp.networking::peer-last-block-time peer))
-           ("bytessent" . ,(if conn (bitcoin-lisp.networking::connection-bytes-sent conn) 0))
-           ("bytesrecv" . ,(if conn (bitcoin-lisp.networking::connection-bytes-received conn) 0))
-           ("conntime" . ,(bitcoin-lisp.networking::peer-connected-at peer))
+                           (if conn (bl.net::connection-last-recv-time conn) 0)))
+           ("last_transaction" . ,(bl.net::peer-last-tx-time peer))
+           ("last_block" . ,(bl.net::peer-last-block-time peer))
+           ("bytessent" . ,(if conn (bl.net::connection-bytes-sent conn) 0))
+           ("bytesrecv" . ,(if conn (bl.net::connection-bytes-received conn) 0))
+           ("conntime" . ,(bl.net::peer-connected-at peer))
            ;; Peer's version-message timestamp vs our clock at receipt.
-           ("timeoffset" . ,(bitcoin-lisp.networking::peer-time-offset peer))
+           ("timeoffset" . ,(bl.net::peer-time-offset peer))
            ;; ping stats are in internal-time units; report seconds. All
            ;; three are optional in Core: pingtime/minping only once a pong
            ;; arrived, pingwait only while a ping is outstanding.
@@ -982,55 +982,55 @@ whatever the cadence is."
            ,@(when (plusp minping)
                `(("minping" . ,(/ minping internal-time-units-per-second 1.0d0))))
            ,@(when ping-nonce
-               `(("pingwait" . ,(/ (- now (bitcoin-lisp.networking::peer-last-ping-time peer))
+               `(("pingwait" . ,(/ (- now (bl.net::peer-last-ping-time peer))
                                    internal-time-units-per-second 1.0d0))))
            ("version" . ,(if vmsg
-                             (bitcoin-lisp.serialization:version-message-version vmsg)
+                             (bl.ser:version-message-version vmsg)
                              0))
-           ("subver" . ,(or (bitcoin-lisp::peer-user-agent peer) ""))
-           ("inbound" . ,(json-bool (bitcoin-lisp.networking::peer-inbound peer)))
+           ("subver" . ,(or (bl::peer-user-agent peer) ""))
+           ("inbound" . ,(json-bool (bl.net::peer-inbound peer)))
            ;; BIP152 high-bandwidth selection, both directions (Core
            ;; m_bip152_highbandwidth_to / _from).
            ("bip152_hb_to" . ,(json-bool
-                               (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to peer)))
+                               (bl.net::peer-compact-block-high-bandwidth-to peer)))
            ("bip152_hb_from" . ,(json-bool
-                                 (bitcoin-lisp.networking::peer-compact-block-high-bandwidth peer)))
+                                 (bl.net::peer-compact-block-high-bandwidth peer)))
            ;; Kept unconditionally (Core gates it behind -deprecatedrpc).
            ("startingheight" . ,sh)
            ;; Low-work headers presync progress (Core presync_height): the
            ;; current height of an in-progress PRESYNC phase, else -1.
            ("presynced_headers"
-            . ,(if (and hss (eq (bitcoin-lisp.networking::hss-state hss) :presync))
-                   (bitcoin-lisp.networking::hss-current-height hss)
+            . ,(if (and hss (eq (bl.net::hss-state hss) :presync))
+                   (bl.net::hss-current-height hss)
                    -1))
            ("synced_headers" . ,(if best-entry
-                                    (bitcoin-lisp.storage:block-index-entry-height best-entry)
+                                    (bl.store:block-index-entry-height best-entry)
                                     -1))
            ;; We keep no pindexLastCommonBlock analogue; -1 = unknown.
            ("synced_blocks" . -1)
            ("inflight" . ,(coerce inflight 'vector))
            ("addr_relay_enabled" . ,(json-bool
-                                     (bitcoin-lisp.networking::peer-addr-relay-enabled peer)))
+                                     (bl.net::peer-addr-relay-enabled peer)))
            ;; Addr intake counters (Core m_addr_processed /
            ;; m_addr_rate_limited; the rate-limited count is addresses
            ;; dropped by the per-address token bucket).
-           ("addr_processed" . ,(bitcoin-lisp.networking::peer-addr-processed peer))
-           ("addr_rate_limited" . ,(bitcoin-lisp.networking::peer-addr-rate-limited peer))
+           ("addr_processed" . ,(bl.net::peer-addr-processed peer))
+           ("addr_rate_limited" . ,(bl.net::peer-addr-rate-limited peer))
            ;; The -whitelist / -whitebind permissions this peer holds (Core
            ;; getpeerinfo "permissions", rpc/net.cpp). Was hardcoded empty.
            ("permissions"
-            . ,(let ((names (bitcoin-lisp.networking:permission-flag-names
-                             (bitcoin-lisp.networking:peer-permission-flags
-                              (bitcoin-lisp.networking:peer-address peer)
-                              (bitcoin-lisp.networking::peer-inbound peer)))))
+            . ,(let ((names (bl.net:permission-flag-names
+                             (bl.net:peer-permission-flags
+                              (bl.net:peer-address peer)
+                              (bl.net::peer-inbound peer)))))
                  (if names (coerce names 'vector) #())))
            ;; BIP133: the peer's advertised fee floor, sat/kvB -> BTC/kvB.
-           ("minfeefilter" . ,(/ (bitcoin-lisp.networking::peer-feefilter-rate peer)
+           ("minfeefilter" . ,(/ (bl.net::peer-feefilter-rate peer)
                                  100000000.0d0))
-           ("bytessent_per_msg" . ,(bitcoin-lisp.networking::snapshot-per-msg-table
-                                    (bitcoin-lisp.networking::peer-sent-per-msg peer)))
-           ("bytesrecv_per_msg" . ,(bitcoin-lisp.networking::snapshot-per-msg-table
-                                    (bitcoin-lisp.networking::peer-recv-per-msg peer)))
+           ("bytessent_per_msg" . ,(bl.net::snapshot-per-msg-table
+                                    (bl.net::peer-sent-per-msg peer)))
+           ("bytesrecv_per_msg" . ,(bl.net::snapshot-per-msg-table
+                                    (bl.net::peer-recv-per-msg peer)))
            ;; Core ConnectionType string (block-relay-only/feeler peers get
            ;; no tx relay -- #216).
            ;; A manual peer's TYPE is "manual" in Core — ConnectionType::MANUAL
@@ -1039,11 +1039,11 @@ whatever the cadence is."
            ;; flag internally because the outbound-slot budgets are written
            ;; against the automatic types, and Core's manual peer likewise
            ;; occupies none of them; what has to agree is the REPORT.
-           ("connection_type" . ,(if (and (bitcoin-lisp.networking:peer-manual peer)
-                                          (not (bitcoin-lisp.networking::peer-inbound peer)))
+           ("connection_type" . ,(if (and (bl.net:peer-manual peer)
+                                          (not (bl.net::peer-inbound peer)))
                                      "manual"
                                      (%connection-type-string
-                                      (bitcoin-lisp.networking:peer-conn-type peer))))
+                                      (bl.net:peer-conn-type peer))))
            ;; Core TransportTypeAsString: the BIP324 v2 session lives in
            ;; connection-transport (NIL = plaintext v1). Peers surface
            ;; here only after the handshake, so "detecting" never applies.
@@ -1051,10 +1051,10 @@ whatever the cadence is."
            ;; BIP324 session id (v2 only; "" otherwise, like Core).
            ("session_id"
             . ,(let ((sid (and transport
-                               (bitcoin-lisp.networking::v2-transport-p transport)
-                               (bitcoin-lisp.crypto:bip324-cipher-session-id
-                                (bitcoin-lisp.networking::v2-transport-cipher transport)))))
-                 (if sid (bitcoin-lisp.crypto:bytes-to-hex sid) ""))))))
+                               (bl.net::v2-transport-p transport)
+                               (bl.crypto:bip324-cipher-session-id
+                                (bl.net::v2-transport-cipher transport)))))
+                 (if sid (bl.crypto:bytes-to-hex sid) ""))))))
      peers)))
 
 (defun rpc-getnetworkinfo (node params)
@@ -1065,26 +1065,26 @@ whatever the cadence is."
          ;; THE service bits we advertise on the wire (peer.lisp local-services,
          ;; Core g_local_services) — the one composition; do not duplicate it
          ;; here. Names via the shared %service-names (Core GetServicesNames).
-         (services (bitcoin-lisp.networking::local-services))
+         (services (bl.net::local-services))
          (service-names (%service-names services))
-         (in (count-if #'bitcoin-lisp.networking::peer-inbound peers))
+         (in (count-if #'bl.net::peer-inbound peers))
          ;; The EFFECTIVE -minrelaytxfee (sat/kvB -> BTC/kvB); Core reports
          ;; ::minRelayTxFee.GetFeePerK(), not the compile-time default.
-         (relayfee (/ bitcoin-lisp.mempool:*min-relay-fee-rate*
+         (relayfee (/ bl.mp:*min-relay-fee-rate*
                       100000000.0d0))
          ;; +incremental-relay-fee-rate+ is sat/kvB -> BTC/kvB.
-         (incfee (/ bitcoin-lisp.mempool::+incremental-relay-fee-rate+ 100000000.0d0)))
-    `(("version" . ,bitcoin-lisp.serialization:+client-version+)
-      ("subversion" . ,bitcoin-lisp.serialization:*user-agent*)
+         (incfee (/ bl.mp::+incremental-relay-fee-rate+ 100000000.0d0)))
+    `(("version" . ,bl.ser:+client-version+)
+      ("subversion" . ,bl.ser:*user-agent*)
       ("protocolversion" . 70016)
       ("localservices" . ,(string-downcase (format nil "~16,'0X" services)))
       ("localservicesnames" . ,service-names)
       ;; Core: localrelay = !peerman->IgnoresIncomingTxs() — false under
       ;; -blocksonly OR our mainnet relay-disabled default. json-bool so it
       ;; serializes as JSON true/false (never null).
-      ("localrelay" . ,(json-bool (not (bitcoin-lisp.networking:ignore-incoming-txs-p))))
+      ("localrelay" . ,(json-bool (not (bl.net:ignore-incoming-txs-p))))
       ("timeoffset" . 0)
-      ("networkactive" . ,(json-bool (bitcoin-lisp::node-network-active node)))
+      ("networkactive" . ,(json-bool (bl::node-network-active node)))
       ("connections" . ,(length peers))
       ("connections_in" . ,in)
       ("connections_out" . ,(- (length peers) in))
@@ -1115,7 +1115,7 @@ no-op on a peer whose connection has dropped, and ignore-errors guards against a
 peer disconnecting mid-send."
   (declare (ignore params))
   (dolist (peer (rpc-get-peers node))
-    (ignore-errors (bitcoin-lisp.networking:send-ping peer)))
+    (ignore-errors (bl.net:send-ping peer)))
   nil)
 
 ;;; --- Mempool Methods ---
@@ -1126,17 +1126,17 @@ by ANNOUNCERS (a list of peer objects, possibly containing nil for local
 submissions). VERBOSE2 appends the raw hex. \"bytes\" and \"hex\" use the wire
 (witness-complete) encoding — Core ComputeTotalSize / EncodeHexTx. \"from\"
 lists every announcer's peer id (Core OrphanInfo::announcers)."
-  (let* ((ser (bitcoin-lisp.serialization:transaction-wire-bytes tx))
-         (base `(("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
-                 ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
+  (let* ((ser (bl.ser:transaction-wire-bytes tx))
+         (base `(("txid" . ,(hash-to-hex (bl.ser:transaction-hash tx)))
+                 ("wtxid" . ,(hash-to-hex (bl.ser:transaction-wtxid tx)))
                  ("bytes" . ,(length ser))
-                 ("vsize" . ,(bitcoin-lisp.serialization:transaction-vsize tx))
-                 ("weight" . ,(bitcoin-lisp.serialization:transaction-weight tx))
+                 ("vsize" . ,(bl.ser:transaction-vsize tx))
+                 ("weight" . ,(bl.ser:transaction-weight tx))
                  ("from" . ,(loop for peer in announcers
                                   when peer
-                                    collect (bitcoin-lisp.networking::peer-id peer))))))
+                                    collect (bl.net::peer-id peer))))))
     (if verbose2
-        (append base `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex ser))))
+        (append base `(("hex" . ,(bl.crypto:bytes-to-hex ser))))
         base)))
 
 (defun rpc-getorphantxs (node params)
@@ -1145,7 +1145,7 @@ PARAMS: ([verbosity]) -- 0 (default) an array of txids, 1 an array of orphan
 detail objects, 2 the detail objects plus each transaction's raw hex."
   (let* ((verbosity (%parse-verbosity params 0 0))
          (mempool (rpc-get-mempool node))
-         (pool (and mempool (bitcoin-lisp.mempool:mempool-orphan-pool mempool)))
+         (pool (and mempool (bl.mp:mempool-orphan-pool mempool)))
          (result '()))
     (unless (member verbosity '(0 1 2))
       (error 'rpc-error :code +rpc-invalid-parameter+
@@ -1157,15 +1157,15 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
         (maphash
          (lambda (wtxid entry)
            (declare (ignore wtxid))
-           (let ((tx (bitcoin-lisp.mempool:orphan-entry-transaction entry))
-                 (from (mapcar #'bitcoin-lisp.mempool::orphan-announcement-peer
-                               (bitcoin-lisp.mempool::orphan-entry-announcements entry))))
+           (let ((tx (bl.mp:orphan-entry-transaction entry))
+                 (from (mapcar #'bl.mp::orphan-announcement-peer
+                               (bl.mp::orphan-entry-announcements entry))))
              (push (case verbosity
-                     (0 (hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
+                     (0 (hash-to-hex (bl.ser:transaction-hash tx)))
                      (1 (%orphan-tx-json tx from nil))
                      (t (%orphan-tx-json tx from t)))
                    result)))
-         (bitcoin-lisp.mempool::orphan-pool-by-wtxid pool))))
+         (bl.mp::orphan-pool-by-wtxid pool))))
     ;; Core returns a UniValue VARR: an empty orphanage is [], not null.
     (json-array (nreverse result))))
 
@@ -1173,56 +1173,56 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
   "Return mempool statistics."
   (declare (ignore params))
   (let ((mempool (rpc-get-mempool node))
-        (incfee (/ bitcoin-lisp.mempool::+incremental-relay-fee-rate+ 100000000.0d0)))
+        (incfee (/ bl.mp::+incremental-relay-fee-rate+ 100000000.0d0)))
     (if mempool
         ;; Rates are sat/kvB (Core CFeeRate); convert to BTC/kvB via /1e8.
         ;; Node lock: count/bytes/total-fee must be one consistent snapshot
         ;; while the sync thread adds/evicts entries (Core getmempoolinfo
         ;; takes pool.cs via the stats getters).
         (with-node-lock (node)
-         (let* ((min-fee-sat-kvb (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
+         (let* ((min-fee-sat-kvb (bl.mp:mempool-effective-min-fee-rate mempool))
                (min-fee-btc-kvb (/ min-fee-sat-kvb 100000000.0d0))
                ;; The pool's configured floor (Core m_min_relay_feerate).
-               (relay-fee-btc-kvb (/ (bitcoin-lisp.mempool:mempool-min-fee-rate mempool)
+               (relay-fee-btc-kvb (/ (bl.mp:mempool-min-fee-rate mempool)
                                      100000000.0d0))
-               (count (bitcoin-lisp.mempool:mempool-count mempool))
+               (count (bl.mp:mempool-count mempool))
                ;; Core "bytes" = GetTotalTxSize(), the sum of the entries'
                ;; sigop-adjusted VIRTUAL sizes (rpc/mempool.cpp:1040,
                ;; txmempool.h:191), not serialized bytes.
-               (bytes (bitcoin-lisp.mempool:mempool-total-size mempool))
+               (bytes (bl.mp:mempool-total-size mempool))
                (total-fee-sat 0))
-          (bitcoin-lisp.mempool:mempool-for-each
+          (bl.mp:mempool-for-each
            mempool (lambda (txid e) (declare (ignore txid))
-                     (incf total-fee-sat (bitcoin-lisp.mempool:mempool-entry-fee e))))
+                     (incf total-fee-sat (bl.mp:mempool-entry-fee e))))
           `(("loaded" . t)
             ("size" . ,count)
             ("bytes" . ,bytes)
             ;; Core DynamicMemoryUsage(): the malloc-modeled memory usage the
             ;; -maxmempool cap is keyed on (rpc/mempool.cpp:1041).
-            ("usage" . ,(bitcoin-lisp.mempool:mempool-dynamic-usage mempool))
+            ("usage" . ,(bl.mp:mempool-dynamic-usage mempool))
             ("total_fee" . ,(/ total-fee-sat 100000000.0d0))
-            ("maxmempool" . ,(bitcoin-lisp.mempool::mempool-max-size mempool))
+            ("maxmempool" . ,(bl.mp::mempool-max-size mempool))
             ("mempoolminfee" . ,min-fee-btc-kvb)
             ("minrelaytxfee" . ,relay-fee-btc-kvb)
             ("incrementalrelayfee" . ,incfee)
             ;; Core rpc/mempool.cpp:1047: GetUnbroadcastTxs().size().
-            ("unbroadcastcount" . ,(bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))
+            ("unbroadcastcount" . ,(bl.mp:mempool-unbroadcast-count mempool))
             ;; Acceptance is unconditionally full-RBF since cluster mempool;
             ;; Core hardcodes true (rpc/mempool.cpp:1048, field DEPRECATED).
             ("fullrbf" . t)
-            ("permitbaremultisig" . ,(json-bool bitcoin-lisp:*permit-bare-multisig*)))))
+            ("permitbaremultisig" . ,(json-bool bl:*permit-bare-multisig*)))))
         `(("loaded" . ,+json-false+)
           ("size" . 0)
           ("bytes" . 0)
           ("usage" . 0)
           ("total_fee" . 0)
-          ("maxmempool" . ,bitcoin-lisp.mempool:+default-max-mempool-bytes+)
+          ("maxmempool" . ,bl.mp:+default-max-mempool-bytes+)
           ("mempoolminfee" . 0.000001)
           ("minrelaytxfee" . 0.000001)
           ("incrementalrelayfee" . ,incfee)
           ("unbroadcastcount" . 0)
           ("fullrbf" . t)
-          ("permitbaremultisig" . ,(json-bool bitcoin-lisp:*permit-bare-multisig*))))))
+          ("permitbaremultisig" . ,(json-bool bl:*permit-bare-multisig*))))))
 
 (defun rpc-getrawmempool (node params)
   "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t)."
@@ -1239,7 +1239,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
       ((null mempool) (if verbose (json-object nil) (json-array nil)))
       ((not verbose)
        (let ((ids '()))
-         (bitcoin-lisp.mempool:mempool-for-each
+         (bl.mp:mempool-for-each
           mempool (lambda (txid entry)
                     (declare (ignore entry))
                     (push (hash-to-hex txid) ids)))
@@ -1248,7 +1248,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
        ;; Verbose: an alist (txid -> field-alist); the RPC normalizer turns it
        ;; into nested JSON objects.
        (let ((result '()))
-         (bitcoin-lisp.mempool:mempool-for-each
+         (bl.mp:mempool-for-each
           mempool
           (lambda (txid entry)
             (push (cons (hash-to-hex txid) (%mempool-entry-fields mempool txid entry))
@@ -1270,51 +1270,51 @@ WEIGHT (GetAdjustedWeight), ours sigops-adjusted virtual bytes, so
 ancestor/descendant sizes are the sigop-adjusted virtual size, exactly
 Core's GetTxSize-based reporting."
   (multiple-value-bind (acount asize afees)
-      (bitcoin-lisp.mempool:mempool-ancestor-stats mempool txid)
+      (bl.mp:mempool-ancestor-stats mempool txid)
     (multiple-value-bind (dcount dsize dfees)
-        (bitcoin-lisp.mempool:mempool-descendant-stats mempool txid)
-      (let ((chunk (bitcoin-lisp.mempool:txgraph-get-main-chunk-feerate
-                    (bitcoin-lisp.mempool:mempool-graph mempool)
-                    (bitcoin-lisp.mempool:mempool-entry-graph-handle entry))))
-        `(("vsize" . ,(bitcoin-lisp.mempool:mempool-entry-vsize entry))
-          ("weight" . ,(bitcoin-lisp.serialization:transaction-weight
-                        (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
-          ("time" . ,(bitcoin-lisp.mempool:mempool-entry-entry-time entry))
-          ("height" . ,(bitcoin-lisp.mempool:mempool-entry-height entry))
-          ("chunkweight" . ,(bitcoin-lisp.mempool:feefrac-size chunk))
-          ("fees" . (("base" . ,(/ (bitcoin-lisp.mempool:mempool-entry-fee entry) 100000000.0d0))
-                     ("modified" . ,(/ (bitcoin-lisp.mempool:mempool-entry-modified-fee entry)
+        (bl.mp:mempool-descendant-stats mempool txid)
+      (let ((chunk (bl.mp:txgraph-get-main-chunk-feerate
+                    (bl.mp:mempool-graph mempool)
+                    (bl.mp:mempool-entry-graph-handle entry))))
+        `(("vsize" . ,(bl.mp:mempool-entry-vsize entry))
+          ("weight" . ,(bl.ser:transaction-weight
+                        (bl.mp:mempool-entry-transaction entry)))
+          ("time" . ,(bl.mp:mempool-entry-entry-time entry))
+          ("height" . ,(bl.mp:mempool-entry-height entry))
+          ("chunkweight" . ,(bl.mp:feefrac-size chunk))
+          ("fees" . (("base" . ,(/ (bl.mp:mempool-entry-fee entry) 100000000.0d0))
+                     ("modified" . ,(/ (bl.mp:mempool-entry-modified-fee entry)
                                        100000000.0d0))
                      ("ancestor" . ,(/ afees 100000000.0d0))
                      ("descendant" . ,(/ dfees 100000000.0d0))
-                     ("chunk" . ,(/ (bitcoin-lisp.mempool:feefrac-fee chunk)
+                     ("chunk" . ,(/ (bl.mp:feefrac-fee chunk)
                                     100000000.0d0))))
           ("ancestorcount" . ,acount)
           ("ancestorsize" . ,asize)
           ("descendantcount" . ,dcount)
           ("descendantsize" . ,dsize)
-          ("wtxid" . ,(hash-to-hex (bitcoin-lisp.mempool:mempool-entry-wtxid entry)))
+          ("wtxid" . ,(hash-to-hex (bl.mp:mempool-entry-wtxid entry)))
           ("depends" . ,(let ((deps '()))
                           (maphash (lambda (p v) (declare (ignore v))
                                      (push (hash-to-hex p) deps))
-                                   (bitcoin-lisp.mempool:mempool-entry-parents entry))
+                                   (bl.mp:mempool-entry-parents entry))
                           deps))
           ;; In-mempool txs that spend this tx's outputs (Core "spentby").
           ("spentby" . ,(let ((sb '()))
                           (maphash (lambda (c v) (declare (ignore v))
                                      (push (hash-to-hex c) sb))
-                                   (bitcoin-lisp.mempool::mempool-entry-children entry))
+                                   (bl.mp::mempool-entry-children entry))
                           sb))
           ;; BIP125: whether the tx or any unconfirmed ancestor SIGNALS
           ;; replaceability (Core IsRBFOptIn, reporting only — acceptance is
           ;; unconditionally full-RBF; rpc/mempool.cpp:456,567, DEPRECATED).
           ("bip125-replaceable"
            . ,(json-bool
-               (bitcoin-lisp.mempool::mempool-tx-or-ancestor-signals-rbf-p mempool txid)))
+               (bl.mp::mempool-tx-or-ancestor-signals-rbf-p mempool txid)))
           ;; Core IsUnbroadcastTx (rpc/mempool.cpp:568) — was hardcoded nil,
           ;; which both lied for locally-submitted txs and encoded as null.
           ("unbroadcast" . ,(json-bool
-                             (bitcoin-lisp.mempool:mempool-unbroadcast-p mempool txid))))))))
+                             (bl.mp:mempool-unbroadcast-p mempool txid))))))))
 
 (defun %mempool-txid-arg (params mempool)
   "Resolve the first param (a big-endian txid hex) to (values internal-txid
@@ -1325,7 +1325,7 @@ entry), erroring if malformed or not in the mempool."
     (let ((txid (parse-hex-hash txid-hex)))
       (unless txid
         (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid txid"))
-      (let ((entry (and mempool (bitcoin-lisp.mempool:mempool-get mempool txid))))
+      (let ((entry (and mempool (bl.mp:mempool-get mempool txid))))
         (unless entry
           ;; Core: RPC_INVALID_ADDRESS_OR_KEY (-5), rpc/mempool.cpp:887.
           (error 'rpc-error :code +rpc-invalid-address-or-key+
@@ -1345,7 +1345,7 @@ strings or, when VERBOSE, an alist of txid-hex -> entry fields. An empty set is
 Core's empty VARR/VOBJ ([] / {}), never null."
   (let ((result '()))
     (maphash (lambda (txid v) (declare (ignore v))
-               (let ((entry (bitcoin-lisp.mempool:mempool-get mempool txid)))
+               (let ((entry (bl.mp:mempool-get mempool txid)))
                  (when entry
                    (push (if verbose
                              (cons (hash-to-hex txid) (%mempool-entry-fields mempool txid entry))
@@ -1362,7 +1362,7 @@ PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
     (with-node-lock (node)
       (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
         (declare (ignore entry))
-        (%mempool-set->result mempool (bitcoin-lisp.mempool:mempool-ancestors mempool txid) verbose)))))
+        (%mempool-set->result mempool (bl.mp:mempool-ancestors mempool txid) verbose)))))
 
 (defun rpc-getmempooldescendants (node params)
   "Return the in-mempool descendants of TXID (Bitcoin Core getmempooldescendants).
@@ -1372,7 +1372,7 @@ PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
     (with-node-lock (node)
       (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
         (declare (ignore entry))
-        (%mempool-set->result mempool (bitcoin-lisp.mempool:mempool-descendants mempool txid) verbose)))))
+        (%mempool-set->result mempool (bl.mp:mempool-descendants mempool txid) verbose)))))
 
 (defun rpc-getmempoolcluster (node params)
   "Return mempool data for the cluster containing TXID (Bitcoin Core
@@ -1390,21 +1390,21 @@ fields here are in vB (~ Core / 4)."
     (with-node-lock (node)
      (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
       (declare (ignore txid))
-      (let ((chunks (bitcoin-lisp.mempool:txgraph-get-cluster-chunks
-                     (bitcoin-lisp.mempool:mempool-graph mempool)
-                     (bitcoin-lisp.mempool:mempool-entry-graph-handle entry))))
+      (let ((chunks (bl.mp:txgraph-get-cluster-chunks
+                     (bl.mp:mempool-graph mempool)
+                     (bl.mp:mempool-entry-graph-handle entry))))
         `(("clusterweight"
            . ,(reduce #'+ chunks
-                      :key (lambda (c) (bitcoin-lisp.mempool:feefrac-size (cdr c)))))
+                      :key (lambda (c) (bl.mp:feefrac-size (cdr c)))))
           ("txcount" . ,(reduce #'+ chunks :key (lambda (c) (length (car c)))))
           ("chunks"
            . ,(mapcar (lambda (c)
-                        `(("chunkfee" . ,(/ (bitcoin-lisp.mempool:feefrac-fee (cdr c))
+                        `(("chunkfee" . ,(/ (bl.mp:feefrac-fee (cdr c))
                                             100000000.0d0))
-                          ("chunkweight" . ,(bitcoin-lisp.mempool:feefrac-size (cdr c)))
+                          ("chunkweight" . ,(bl.mp:feefrac-size (cdr c)))
                           ("txs" . ,(mapcar (lambda (h)
                                               (hash-to-hex
-                                               (bitcoin-lisp.mempool:tx-handle-data h)))
+                                               (bl.mp:tx-handle-data h)))
                                             (car c)))))
                       chunks))))))))
 
@@ -1425,19 +1425,19 @@ weight; ours is BIP141 virtual bytes (~ Core / 4)."
     ;; takes (assembler.lisp %with-mempool-lock).
     (when mempool
       (with-node-lock (node)
-        (let ((builder (bitcoin-lisp.mempool:make-block-builder
-                        (bitcoin-lisp.mempool:mempool-graph mempool))))
+        (let ((builder (bl.mp:make-block-builder
+                        (bl.mp:mempool-graph mempool))))
           (unwind-protect
-               (loop for feerate = (bitcoin-lisp.mempool:block-builder-current-chunk-feerate
+               (loop for feerate = (bl.mp:block-builder-current-chunk-feerate
                                     builder)
                      while feerate
-                     do (incf cum-weight (bitcoin-lisp.mempool:feefrac-size feerate))
-                        (incf cum-fee (bitcoin-lisp.mempool:feefrac-fee feerate))
+                     do (incf cum-weight (bl.mp:feefrac-size feerate))
+                        (incf cum-fee (bl.mp:feefrac-fee feerate))
                         (push `(("weight" . ,cum-weight)
                                 ("fee" . ,(/ cum-fee 100000000.0d0)))
                               points)
-                        (bitcoin-lisp.mempool:block-builder-include builder))
-            (bitcoin-lisp.mempool:block-builder-finish builder)))))
+                        (bl.mp:block-builder-include builder))
+            (bl.mp:block-builder-finish builder)))))
     (nreverse points)))
 
 (defun rpc-gettxspendingprevout (node params)
@@ -1458,8 +1458,8 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
   (let* ((outpoints (%positional-array (first params)))
          (options (second params))
          (mempool (rpc-get-mempool node))
-         (index (bitcoin-lisp::node-txospenderindex node))
-         (index-live (and index (bitcoin-lisp.storage:txospender-index-enabled index)))
+         (index (bl::node-txospenderindex node))
+         (index-live (and index (bl.store:txospender-index-enabled index)))
          (mempool-only (if (and (hash-table-p options)
                                 (nth-value 1 (gethash "mempool_only" options)))
                            (and (gethash "mempool_only" options) t)
@@ -1485,7 +1485,7 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
             (error 'rpc-error :code +rpc-invalid-parameter+
                               :message "Invalid parameter, vout cannot be negative"))
           (let* ((mem (and mempool
-                           (bitcoin-lisp.mempool:mempool-spending-tx mempool txid vout)))
+                           (bl.mp:mempool-spending-tx mempool txid vout)))
                  (spender-tx (and (not mem) (not mempool-only)
                                   (%txospender-confirmed-spender node index txid vout))))
             (cond
@@ -1493,21 +1493,21 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
                      ("vout" . ,vout)
                      ("spendingtxid" . ,(hash-to-hex mem))
                      ,@(when return-tx
-                         (let* ((e (and mempool (bitcoin-lisp.mempool:mempool-get mempool mem)))
-                                (tx (and e (bitcoin-lisp.mempool:mempool-entry-transaction e))))
+                         (let* ((e (and mempool (bl.mp:mempool-get mempool mem)))
+                                (tx (and e (bl.mp:mempool-entry-transaction e))))
                            (when tx
                              `(("spendingtx"
-                                . ,(bitcoin-lisp.crypto:bytes-to-hex
-                                    (bitcoin-lisp.serialization:transaction-wire-bytes tx))))))))) 
+                                . ,(bl.crypto:bytes-to-hex
+                                    (bl.ser:transaction-wire-bytes tx))))))))) 
               (spender-tx
                `(("txid" . ,txid-hex)
                  ("vout" . ,vout)
                  ("spendingtxid"
-                  . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-hash spender-tx)))
+                  . ,(hash-to-hex (bl.ser:transaction-hash spender-tx)))
                  ,@(when return-tx
                      `(("spendingtx"
-                        . ,(bitcoin-lisp.crypto:bytes-to-hex
-                            (bitcoin-lisp.serialization:transaction-wire-bytes spender-tx)))))))
+                        . ,(bl.crypto:bytes-to-hex
+                            (bl.ser:transaction-wire-bytes spender-tx)))))))
               ;; Not in the mempool. Core answers "unspent" only when the caller
               ;; asked for the mempool alone; otherwise not having the index is
               ;; an ERROR, because silence would be indistinguishable from a
@@ -1531,11 +1531,11 @@ before it is believed — Core does the same for the same reason
 outpoint is a hash collision; one whose block is no longer on the active chain
 is a reorg the index has not been told about, and both are skipped."
   (let ((chain-state (rpc-get-chain-state node))
-        (block-store (bitcoin-lisp::node-block-store node)))
-    (dolist (locator (bitcoin-lisp.storage:txospenderindex-locators index txid vout))
+        (block-store (bl::node-block-store node)))
+    (dolist (locator (bl.store:txospenderindex-locators index txid vout))
       (destructuring-bind (block-hash . position) locator
         (let ((block (and block-store
-                          (bitcoin-lisp.storage:get-block block-store block-hash))))
+                          (bl.store:get-block block-store block-hash))))
           ;; ⚠️ ACTIVE chain, not merely known. An index entry left behind by
           ;; a reorg names a block that is still on disk and still spends the
           ;; outpoint, so believing it would answer with a spender from an
@@ -1543,7 +1543,7 @@ is a reorg the index has not been told about, and both are skipped."
           ;; the belt to its braces. Reuses the %BLOCK-ON-ACTIVE-CHAIN-P this
           ;; file already had rather than adding a second one.
           (when (and block
-                     (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                     (let ((entry (bl.store:get-block-index-entry
                                    chain-state block-hash)))
                        (and entry (%block-on-active-chain-p entry chain-state))))
             (let ((tx (%tx-at-block-position block position)))
@@ -1556,17 +1556,17 @@ is a reorg the index has not been told about, and both are skipped."
 NIL when the offset does not land on one — which is what a stale index entry
 looks like."
   (let ((offset 0))
-    (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+    (dolist (tx (bl.ser:bitcoin-block-transactions block))
       (when (= offset position) (return-from %tx-at-block-position tx))
-      (incf offset (length (bitcoin-lisp.serialization:transaction-wire-bytes tx))))
+      (incf offset (length (bl.ser:transaction-wire-bytes tx))))
     nil))
 
 (defun %tx-spends-outpoint-p (tx txid vout)
   (some (lambda (input)
-          (let ((op (bitcoin-lisp.serialization:tx-in-previous-output input)))
-            (and (equalp (bitcoin-lisp.serialization:outpoint-hash op) txid)
-                 (= (bitcoin-lisp.serialization:outpoint-index op) vout))))
-        (bitcoin-lisp.serialization:transaction-inputs tx)))
+          (let ((op (bl.ser:tx-in-previous-output input)))
+            (and (equalp (bl.ser:outpoint-hash op) txid)
+                 (= (bl.ser:outpoint-index op) vout))))
+        (bl.ser:transaction-inputs tx)))
 
 ;;;; Raw-transaction safety rails (Core node/transaction.h:28-34)
 ;;;;
@@ -1607,11 +1607,11 @@ MAX-BURN satoshis to a script that can never spend it -- provably unspendable,
 or one that does not even parse (rpc/mempool.cpp:99-103). Core runs this on the
 DECODED transaction before any validation, so a burning transaction never
 reaches the mempool."
-  (loop for out across (bitcoin-lisp.serialization:transaction-outputs tx)
-        for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey out)
-        when (and (or (bitcoin-lisp.storage:script-unspendable-p spk)
-                      (not (bitcoin-lisp.storage:script-has-valid-ops-p spk)))
-                  (> (bitcoin-lisp.serialization:tx-out-value out) max-burn))
+  (loop for out across (bl.ser:transaction-outputs tx)
+        for spk = (bl.ser:tx-out-script-pubkey out)
+        when (and (or (bl.store:script-unspendable-p spk)
+                      (not (bl.store:script-has-valid-ops-p spk)))
+                  (> (bl.ser:tx-out-value out) max-burn))
           do (error 'rpc-error :code +rpc-verify-error+
                                :message "Unspendable output exceeds maximum configured by user (maxburnamount)")))
 
@@ -1631,19 +1631,19 @@ anything to the mempool. Each tx is checked independently against current state
     (unless (%positional-array-p txs-arg)
       (%json-type-error txs-arg "array"))
     ;; Core caps the batch at package size (rpc/mempool.cpp:322).
-    (when (or (null txs) (> (length txs) bitcoin-lisp.validation:+max-package-count+))
+    (when (or (null txs) (> (length txs) bl.val:+max-package-count+))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message (format nil "Array must contain between 1 and ~D transactions."
-                                         bitcoin-lisp.validation:+max-package-count+)))
+                                         bl.val:+max-package-count+)))
     ;; Decode every tx up front: a decode failure aborts the WHOLE call with
     ;; -22 (Core DecodeHexTx -> RPC_DESERIALIZATION_ERROR, rpc/mempool.cpp:333),
     ;; it does not produce a per-tx allowed=false row.
     (let ((decoded
             (mapcar (lambda (hex-str)
                       (handler-case
-                          (let ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes hex-str)))
+                          (let ((tx-bytes (bl.crypto:hex-to-bytes hex-str)))
                             (flexi-streams:with-input-from-sequence (stream tx-bytes)
-                              (bitcoin-lisp.serialization:read-transaction stream)))
+                              (bl.ser:read-transaction stream)))
                         (error ()
                           (error 'rpc-error :code +rpc-deserialization-error+
                                             :message "TX decode failed"))))
@@ -1652,7 +1652,7 @@ anything to the mempool. Each tx is checked independently against current state
       ;; a consistent view for the whole batch (Core ProcessTransaction
       ;; requires cs_main even for test_accept).
       (with-node-lock (node)
-        (let ((height (bitcoin-lisp.storage:current-height chain-state))
+        (let ((height (bl.store:current-height chain-state))
               (max-fee-rate (%parse-max-fee-rate params 1))
               ;; Core stops filling in results after the first tx that breaches
               ;; the rail: a descendant's verdict is meaningless once an
@@ -1661,22 +1661,22 @@ anything to the mempool. Each tx is checked independently against current state
               (results '()))
           (dolist (tx decoded (nreverse results))
             (push
-             (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
-                   (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+             (let ((txid (bl.ser:transaction-hash tx))
+                   (wtxid (bl.ser:transaction-wtxid tx)))
                (if exit-early
                    ;; Validation unfinished: txid and wtxid only, no verdict.
                    `(("txid" . ,(hash-to-hex txid))
                      ("wtxid" . ,(hash-to-hex wtxid)))
                    (multiple-value-bind (valid error fee replaced sigops)
-                       (bitcoin-lisp.validation:validate-transaction-for-mempool
+                       (bl.val:validate-transaction-for-mempool
                         tx utxo-set mempool height :chain-state chain-state)
                      (declare (ignore replaced))
                      (if valid
                          ;; Core reports ws.m_vsize here — the sigop-adjusted
                          ;; size, not the raw BIP141 vsize (rpc/mempool.cpp:375)
                          ;; — and caps the fee against that same vsize (:376).
-                         (let* ((vsize (bitcoin-lisp.mempool:sigop-adjusted-vsize
-                                        (bitcoin-lisp.serialization:transaction-weight tx)
+                         (let* ((vsize (bl.mp:sigop-adjusted-vsize
+                                        (bl.ser:transaction-weight tx)
                                         sigops))
                                 (max-fee (%feerate-fee max-fee-rate vsize)))
                            (cond
@@ -1705,7 +1705,7 @@ anything to the mempool. Each tx is checked independently against current state
                                     ("effective-feerate"
                                      . ,(%btc (let ((modified
                                                       (+ (or fee 0)
-                                                         (gethash txid (bitcoin-lisp.mempool:mempool-deltas mempool) 0))))
+                                                         (gethash txid (bl.mp:mempool-deltas mempool) 0))))
                                                 (if (plusp vsize)
                                                     (truncate (* modified 1000) vsize)
                                                     0))))
@@ -1728,7 +1728,7 @@ anything to the mempool. Each tx is checked independently against current state
                            ("reject-reason"
                             . ,(if (eq error :missing-input)
                                    "missing-inputs"
-                                   (bitcoin-lisp.validation:tx-reject-reason-string error))))))))
+                                   (bl.val:tx-reject-reason-string error))))))))
              results)))))))
 
 (defun rpc-sendrawtransaction (node params)
@@ -1746,10 +1746,10 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid transaction hex"))
     (handler-case
-        (let* ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes hex-str))
+        (let* ((tx-bytes (bl.crypto:hex-to-bytes hex-str))
                (tx (flexi-streams:with-input-from-sequence (stream tx-bytes)
-                     (bitcoin-lisp.serialization:read-transaction stream)))
-               (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+                     (bl.ser:read-transaction stream)))
+               (txid (bl.ser:transaction-hash tx)))
           (%check-max-burn tx max-burn)
           ;; Node lock across validate -> accept -> unbroadcast -> announce:
           ;; the whole sequence mutates state the sync thread owns (Core
@@ -1761,17 +1761,17 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
            (let* ((utxo-set (rpc-get-utxo-set node))
                   (mempool (rpc-get-mempool node))
                   (chain-state (rpc-get-chain-state node))
-                  (current-height (bitcoin-lisp.storage:current-height chain-state))
+                  (current-height (bl.store:current-height chain-state))
                   ;; ParseFeeRate comes after the burn loop in Core (:107).
                   ;; The cap is taken on the PLAIN BIP141 vsize here
                   ;; (GetVirtualTransactionSize, :109) -- not the
                   ;; sigop-adjusted vsize testmempoolaccept reports.
                   (max-fee (%feerate-fee
                             (%parse-max-fee-rate params 1)
-                            (bitcoin-lisp.serialization:transaction-vsize tx))))
+                            (bl.ser:transaction-vsize tx))))
             ;; Validate transaction for mempool
             (multiple-value-bind (valid error fee replaced sigops)
-                (bitcoin-lisp.validation:validate-transaction-for-mempool
+                (bl.val:validate-transaction-for-mempool
                  tx utxo-set mempool current-height :chain-state chain-state)
               (when (and (not valid) (eq error :already-in-mempool))
                 ;; Core doesn't reject a same-txid resubmission: it skips the
@@ -1779,7 +1779,7 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                 ;; entry's wtxid (a same-txid/different-witness submission must
                 ;; advertise the witness we can actually serve). No unbroadcast
                 ;; add — Core's already-in-mempool branch skips it too.
-                (bitcoin-lisp::broadcast-transaction-to-peers node txid)
+                (bl::broadcast-transaction-to-peers node txid)
                 (return-from rpc-sendrawtransaction (hash-to-hex txid)))
               (unless valid
                 ;; Core reports the state's own reject reason, with no prefix
@@ -1796,7 +1796,7 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                        :code (if (eq error :missing-input)
                                  +rpc-verify-error+
                                  +rpc-transaction-rejected+)
-                       :message (bitcoin-lisp.validation:tx-reject-reason-string error)))
+                       :message (bl.val:tx-reject-reason-string error)))
               ;; Core runs ATMP with test_accept FIRST and only submits for real
               ;; once the fee is under the rail (node/transaction.cpp:74-84), so
               ;; an over-paying transaction never enters the mempool and is
@@ -1807,7 +1807,7 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
               (when (and (plusp max-fee) (> fee max-fee))
                 (error 'rpc-error :code +rpc-verify-error+
                                   :message "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"))
-              (let ((add-result (bitcoin-lisp.mempool:accept-validated-tx
+              (let ((add-result (bl.mp:accept-validated-tx
                                  mempool txid tx fee current-height
                                  :sigops sigops :replaced replaced)))
                 (unless (eq add-result :ok)
@@ -1816,8 +1816,8 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                 ;; Track for best-effort initial broadcast (Core
                 ;; node/transaction.cpp:100-104), then queue the announcement
                 ;; to all relay peers.
-                (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
-                (bitcoin-lisp::broadcast-transaction-to-peers node txid)
+                (bl.mp:mempool-add-unbroadcast mempool txid)
+                (bl::broadcast-transaction-to-peers node txid)
                 (hash-to-hex txid))))))
       ;; Re-raise our own rpc-errors (the -26 rejections above) unchanged; only a
       ;; genuine parse/deserialization failure maps to RPC_DESERIALIZATION_ERROR
@@ -1830,37 +1830,37 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
 (defun %package-tx-result-fields (r)
   "Field alist for one package-tx-result, mirroring Bitcoin Core submitpackage's
 per-wtxid object. Status drives which fields are present."
-  (let ((status (bitcoin-lisp.validation:package-tx-result-status r))
+  (let ((status (bl.val:package-tx-result-status r))
         (base (list (cons "txid" (hash-to-hex
-                                  (bitcoin-lisp.validation:package-tx-result-txid r))))))
+                                  (bl.val:package-tx-result-txid r))))))
     (flet ((btc (sat) (/ (or sat 0) 100000000.0d0))
            ;; sat/vB -> BTC/kvB, the unit Core reports feerates in.
            (feerate-btc-kvb (rate) (/ (* (or rate 0) 1000) 100000000.0d0)))
       (ecase status
         (:valid
          (append base
-                 `(("vsize" . ,(bitcoin-lisp.validation:package-tx-result-vsize r))
-                   ("fees" . (("base" . ,(btc (bitcoin-lisp.validation:package-tx-result-fee r)))
+                 `(("vsize" . ,(bl.val:package-tx-result-vsize r))
+                   ("fees" . (("base" . ,(btc (bl.val:package-tx-result-fee r)))
                               ("effective-feerate"
                                . ,(feerate-btc-kvb
-                                   (bitcoin-lisp.validation:package-tx-result-effective-feerate r)))
+                                   (bl.val:package-tx-result-effective-feerate r)))
                               ("effective-includes"
                                . ,(mapcar #'hash-to-hex
-                                          (bitcoin-lisp.validation:package-tx-result-effective-includes r))))))))
+                                          (bl.val:package-tx-result-effective-includes r))))))))
         (:mempool-entry
          (append base
-                 `(("vsize" . ,(bitcoin-lisp.validation:package-tx-result-vsize r))
-                   ("fees" . (("base" . ,(btc (bitcoin-lisp.validation:package-tx-result-fee r))))))))
+                 `(("vsize" . ,(bl.val:package-tx-result-vsize r))
+                   ("fees" . (("base" . ,(btc (bl.val:package-tx-result-fee r))))))))
         (:different-witness
          (append base
                  `(("other-wtxid"
-                    . ,(let ((ow (bitcoin-lisp.validation:package-tx-result-other-wtxid r)))
+                    . ,(let ((ow (bl.val:package-tx-result-other-wtxid r)))
                          (if ow (hash-to-hex ow) ""))))))
         ((:invalid :not-validated)
          (append base
-                 `(("error" . ,(let ((e (bitcoin-lisp.validation:package-tx-result-error r)))
+                 `(("error" . ,(let ((e (bl.val:package-tx-result-error r)))
                                  (if e
-                                     (bitcoin-lisp.validation:tx-reject-reason-string e)
+                                     (bl.val:tx-reject-reason-string e)
                                      "rejected"))))))))))
 
 (defun rpc-submitpackage (node params)
@@ -1878,7 +1878,7 @@ member may send to a script that can never spend it."
     (unless (and (listp hexes) hexes)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "First parameter must be a non-empty array of tx hex"))
-    (when (> (length hexes) bitcoin-lisp.validation:+max-package-count+)
+    (when (> (length hexes) bl.val:+max-package-count+)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Array must contain between 1 and 25 transactions"))
     (unless mempool
@@ -1889,9 +1889,9 @@ member may send to a script that can never spend it."
     (let ((package
             (handler-case
                 (mapcar (lambda (hex)
-                          (let ((bytes (bitcoin-lisp.crypto:hex-to-bytes hex)))
+                          (let ((bytes (bl.crypto:hex-to-bytes hex)))
                             (flexi-streams:with-input-from-sequence (s bytes)
-                              (bitcoin-lisp.serialization:read-transaction s))))
+                              (bl.ser:read-transaction s))))
                         hexes)
               (error ()
                 ;; Core: RPC_DESERIALIZATION_ERROR (-22), rpc/mempool.cpp:333.
@@ -1913,7 +1913,7 @@ member may send to a script that can never spend it."
       (multiple-value-bind (msg results replaced)
           (with-node-lock (node)
             (multiple-value-prog1
-                (bitcoin-lisp.validation:validate-package-for-mempool
+                (bl.val:validate-package-for-mempool
                  package utxo-set mempool chain-state
                  :client-maxfeerate client-maxfeerate)
               ;; Broadcast every package member that made it into (or already
@@ -1923,14 +1923,14 @@ member may send to a script that can never spend it."
               ;; already-in-mempool branch applies: relay only, no
               ;; unbroadcast-set add (node/transaction.cpp:63-72).
               (dolist (tx package)
-                (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-                  (when (bitcoin-lisp.mempool:mempool-has mempool txid)
-                    (bitcoin-lisp::broadcast-transaction-to-peers node txid))))))
+                (let ((txid (bl.ser:transaction-hash tx)))
+                  (when (bl.mp:mempool-has mempool txid)
+                    (bl::broadcast-transaction-to-peers node txid))))))
         `(("package_msg" . ,(if (eq msg :success) "success"
                                 (string-downcase (symbol-name msg))))
           ("tx-results"
            . ,(mapcar (lambda (r)
-                        (cons (hash-to-hex (bitcoin-lisp.validation:package-tx-result-wtxid r))
+                        (cons (hash-to-hex (bl.val:package-tx-result-wtxid r))
                               (%package-tx-result-fields r)))
                       results))
           ,@(when replaced
@@ -1969,17 +1969,17 @@ context. Returns null on success; errors otherwise."
 (defun rpc-invalidateblock (node params)
   "Mark a block (and its descendants) invalid and reorg the active chain away from
 it (Bitcoin Core invalidateblock). PARAMS: (blockhash). Returns null."
-  (%chain-control-block node params #'bitcoin-lisp.validation:invalidate-block))
+  (%chain-control-block node params #'bl.val:invalidate-block))
 
 (defun rpc-reconsiderblock (node params)
   "Clear a previously-invalidated block's status and reconsider the best chain
 (Bitcoin Core reconsiderblock). PARAMS: (blockhash). Returns null."
-  (%chain-control-block node params #'bitcoin-lisp.validation:reconsider-block))
+  (%chain-control-block node params #'bl.val:reconsider-block))
 
 (defun rpc-preciousblock (node params)
   "Treat a block as preferred over equal-work competitors, reorganizing to it
 (Bitcoin Core preciousblock). PARAMS: (blockhash). Returns null."
-  (%chain-control-block node params #'bitcoin-lisp.validation:precious-block))
+  (%chain-control-block node params #'bl.val:precious-block))
 
 ;;; --- Peer / address RPCs ---
 
@@ -1987,27 +1987,27 @@ it (Bitcoin Core invalidateblock). PARAMS: (blockhash). Returns null."
   "Return known peer addresses from the address book (Bitcoin Core
 getnodeaddresses). PARAMS: ([count]) — max addresses (default 1; 0 = all)."
   (let* ((count (if (integerp (first params)) (first params) 1))
-         (book (bitcoin-lisp::node-address-book node))
+         (book (bl::node-address-book node))
          ;; count=0 => all known addresses; count>0 => up to that many.
-         (limited (and book (bitcoin-lisp.networking:address-book-get-addr
+         (limited (and book (bl.net:address-book-get-addr
                              book :max (max count 0) :pct 100))))
     ;; Core pushes a VARR: an empty address book is [], not null.
     (json-array
      (mapcar
       (lambda (pa)
-        `(("time" . ,(bitcoin-lisp.networking:peer-address-last-seen pa))
-          ("services" . ,(bitcoin-lisp.networking:peer-address-services pa))
-          ("address" . ,(bitcoin-lisp.networking:peer-address-string pa))
-          ("port" . ,(bitcoin-lisp.networking:peer-address-port pa))
+        `(("time" . ,(bl.net:peer-address-last-seen pa))
+          ("services" . ,(bl.net:peer-address-services pa))
+          ("address" . ,(bl.net:peer-address-string pa))
+          ("port" . ,(bl.net:peer-address-port pa))
           ("network" . ,(or (%addrman-network-name pa) "unroutable"))))
       limited))))
 
 (defun %addrman-network-name (pa)
   "Network bucket name (Bitcoin Core GetNetworkName) for a peer-address PA, or
 NIL for an unroutable/empty address."
-  (let ((network (bitcoin-lisp.networking:peer-address-network pa)))
-    (when (bitcoin-lisp.networking:address-routable-p
-           (bitcoin-lisp.networking:peer-address-ip pa) network)
+  (let ((network (bl.net:peer-address-network pa)))
+    (when (bl.net:address-routable-p
+           (bl.net:peer-address-ip pa) network)
       (ecase network
         (:ipv4 "ipv4") (:ipv6 "ipv6") (:torv3 "onion")
         (:i2p "i2p") (:cjdns "cjdns")))))
@@ -2018,7 +2018,7 @@ aggregate (Bitcoin Core getaddrmaninfo). Like Core, every standard network key
 is always present (0 when empty); all_networks uses the address book's
 authoritative running counts."
   (declare (ignore params))
-  (let ((book (bitcoin-lisp::node-address-book node))
+  (let ((book (bl::node-address-book node))
         ;; name -> (new . tried)
         (tally (make-hash-table :test 'equal))
         (networks '("ipv4" "ipv6" "onion" "i2p" "cjdns")))
@@ -2030,18 +2030,18 @@ authoritative running counts."
          (let ((name (%addrman-network-name pa)))
            (when name
              (let ((cell (gethash name tally)))
-               (if (bitcoin-lisp.networking:peer-address-in-tried pa)
+               (if (bl.net:peer-address-in-tried pa)
                    (incf (cdr cell))
                    (incf (car cell)))))))
-       (bitcoin-lisp.networking::address-book-info book)))
+       (bl.net::address-book-info book)))
     (flet ((entry (new tried)
              `(("new" . ,new) ("tried" . ,tried) ("total" . ,(+ new tried)))))
       (let ((result (mapcar (lambda (n)
                               (let ((cell (gethash n tally)))
                                 (cons n (entry (car cell) (cdr cell)))))
                             networks))
-            (nn (if book (bitcoin-lisp.networking::address-book-n-new book) 0))
-            (nt (if book (bitcoin-lisp.networking::address-book-n-tried book) 0)))
+            (nn (if book (bl.net::address-book-n-new book) 0))
+            (nt (if book (bl.net::address-book-n-tried book) 0)))
         (append result (list (cons "all_networks" (entry nn nt))))))))
 
 (defparameter %addconnection-types
@@ -2062,11 +2062,11 @@ ADDR-FETCH and FEELER have no cap in Core — the first because -seednode has
 none either, the second because feelers are short-lived — so they always fit."
   (case conn-type
     (:outbound-full-relay
-     (< (bitcoin-lisp::peers-of-conn-type node :outbound-full-relay)
-        (bitcoin-lisp::node-max-peers node)))
+     (< (bl::peers-of-conn-type node :outbound-full-relay)
+        (bl::node-max-peers node)))
     (:block-relay
-     (< (bitcoin-lisp::peers-of-conn-type node :block-relay)
-        bitcoin-lisp::+target-block-relay-peers+))
+     (< (bl::peers-of-conn-type node :block-relay)
+        bl::+target-block-relay-peers+))
     (t t)))
 
 (defun rpc-addconnection (node params)
@@ -2078,7 +2078,7 @@ PARAMS: (address connection_type v2transport). The dial itself is HANDED TO THE
 SYNC THREAD rather than run here — node-peers is single-writer by design, and
 Core's own AddConnection likewise returns before the connection completes. The
 capacity check runs synchronously, because that is the answer the caller needs."
-  (unless (eq bitcoin-lisp:*network* :regtest)
+  (unless (eq bl:*network* :regtest)
     ;; Core raises a plain std::runtime_error, which JSONRPCError maps to
     ;; RPC_MISC_ERROR with this exact text (rpc/net.cpp).
     (error 'rpc-error :code +rpc-misc-error+
@@ -2100,14 +2100,14 @@ capacity check runs synchronously, because that is the answer the caller needs."
       ;; Core refuses a v2 request when the node was not started with
       ;; -v2transport, rather than silently dialing v1 (rpc/net.cpp).
       (when (and (%positional-bool v2transport)
-                 (not (bitcoin-lisp.networking::v2-available-p)))
+                 (not (bl.net::v2-available-p)))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message "Error: Adding v2transport connections requires -v2transport init flag to be set."))
       (unless (%addconnection-capacity-left-p node conn-type)
         (error 'rpc-error :code +rpc-client-node-capacity-reached+
                           :message "Error: Already at capacity for specified connection type."))
-      (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-        (push (cons address conn-type) bitcoin-lisp::*pending-test-connections*))
+      (bt:with-recursive-lock-held ((bl::node-lock node))
+        (push (cons address conn-type) bl::*pending-test-connections*))
       `(("address" . ,address)
         ("connection_type" . ,trimmed)))))
 
@@ -2125,22 +2125,22 @@ transport is not implemented."
     (unless (member command '("add" "remove" "onetry") :test #'equal)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "command must be \"add\", \"remove\", or \"onetry\""))
-    (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+    (bt:with-recursive-lock-held ((bl::node-lock node))
       (cond
         ((equal command "onetry")
-         (push spec (bitcoin-lisp::node-pending-onetry node)))
+         (push spec (bl::node-pending-onetry node)))
         ((equal command "add")
-         (when (member spec (bitcoin-lisp::node-added-nodes node) :test #'string=)
+         (when (member spec (bl::node-added-nodes node) :test #'string=)
            (error 'rpc-error :code +rpc-client-node-already-added+
                              :message "Error: Node already added"))
-         (setf (bitcoin-lisp::node-added-nodes node)
-               (append (bitcoin-lisp::node-added-nodes node) (list spec))))
+         (setf (bl::node-added-nodes node)
+               (append (bl::node-added-nodes node) (list spec))))
         ((equal command "remove")
-         (unless (member spec (bitcoin-lisp::node-added-nodes node) :test #'string=)
+         (unless (member spec (bl::node-added-nodes node) :test #'string=)
            (error 'rpc-error :code +rpc-client-node-not-added+
                              :message "Error: Node could not be removed. It has not been added previously."))
-         (setf (bitcoin-lisp::node-added-nodes node)
-               (remove spec (bitcoin-lisp::node-added-nodes node) :test #'string=)))))
+         (setf (bl::node-added-nodes node)
+               (remove spec (bl::node-added-nodes node) :test #'string=)))))
     nil))
 
 (defun rpc-getaddednodeinfo (node params)
@@ -2150,8 +2150,8 @@ was never added). Returns an array of {addednode, connected, addresses}."
   (let ((filter (first params)))
     (when (and filter (not (stringp filter)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "node must be a string"))
-    (let ((added (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-                   (copy-list (bitcoin-lisp::node-added-nodes node)))))
+    (let ((added (bt:with-recursive-lock-held ((bl::node-lock node))
+                   (copy-list (bl::node-added-nodes node)))))
       (when filter
         (unless (member filter added :test #'string=)
           (error 'rpc-error :code +rpc-client-node-not-added+
@@ -2161,10 +2161,10 @@ was never added). Returns an array of {addednode, connected, addresses}."
       (json-array
        (mapcar
         (lambda (spec)
-          (let* ((host (bitcoin-lisp::parse-node-endpoint node spec))
-                 (peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-                         (find host (bitcoin-lisp::node-peers node)
-                               :key #'bitcoin-lisp.networking:peer-address :test #'string=))))
+          (let* ((host (bl::parse-node-endpoint node spec))
+                 (peer (bt:with-recursive-lock-held ((bl::node-lock node))
+                         (find host (bl::node-peers node)
+                               :key #'bl.net:peer-address :test #'string=))))
             `(("addednode" . ,spec)
               ("connected" . ,(json-bool peer))
               ;; A list (not a vector) when populated, so rpc-result->json
@@ -2173,8 +2173,8 @@ was never added). Returns an array of {addednode, connected, addresses}."
               ("addresses"
                . ,(json-array
                    (when peer
-                     (list `(("address" . ,(bitcoin-lisp.networking:peer-address peer))
-                             ("connected" . ,(if (bitcoin-lisp.networking::peer-inbound peer)
+                     (list `(("address" . ,(bl.net:peer-address peer))
+                             ("connected" . ,(if (bl.net::peer-inbound peer)
                                                  "inbound" "outbound"))))))))))
         added)))))
 
@@ -2185,11 +2185,11 @@ Core's socket thread does the same as a consequence of the cleared flag
 (net.cpp DisconnectNodes); the sync thread reaps them from node-peers,
 keeping it single-writer. Shared by setnetworkactive and dumptxoutset's
 rollback-time NetworkDisable. Returns STATE."
-  (setf (bitcoin-lisp::node-network-active node) state)
+  (setf (bl::node-network-active node) state)
   (unless state
-    (dolist (peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-                    (copy-list (bitcoin-lisp::node-peers node))))
-      (ignore-errors (bitcoin-lisp.networking:disconnect-peer peer))))
+    (dolist (peer (bt:with-recursive-lock-held ((bl::node-lock node))
+                    (copy-list (bl::node-peers node))))
+      (ignore-errors (bl.net:disconnect-peer peer))))
   state)
 
 (defun rpc-setnetworkactive (node params)
@@ -2217,26 +2217,26 @@ the cross-thread send safe."
     (let* ((hash (parse-hex-hash blockhash-hex))
            (chain-state (rpc-get-chain-state node))
            (block-store (rpc-get-block-store node))
-           (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+           (entry (bl.store:get-block-index-entry chain-state hash)))
       (unless entry
         (error 'rpc-error :code +rpc-misc-error+ :message "Block header missing"))
-      (when (and (bitcoin-lisp:pruning-enabled-p)
-                 (> (bitcoin-lisp.storage:block-index-entry-height entry)
-                    (bitcoin-lisp.storage:current-height chain-state)))
+      (when (and (bl:pruning-enabled-p)
+                 (> (bl.store:block-index-entry-height entry)
+                    (bl.store:current-height chain-state)))
         (error 'rpc-error :code +rpc-misc-error+
                           :message "In prune mode, only blocks that the node has already synced previously can be fetched from a peer"))
-      (when (and block-store (bitcoin-lisp.storage:block-exists-p block-store hash))
+      (when (and block-store (bl.store:block-exists-p block-store hash))
         (error 'rpc-error :code +rpc-misc-error+ :message "Block already downloaded"))
-      (let ((peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-                    (find peer-id (bitcoin-lisp::node-peers node)
-                          :key #'bitcoin-lisp.networking::peer-id))))
+      (let ((peer (bt:with-recursive-lock-held ((bl::node-lock node))
+                    (find peer-id (bl::node-peers node)
+                          :key #'bl.net::peer-id))))
         (unless peer
           (error 'rpc-error :code +rpc-misc-error+ :message "Peer does not exist"))
-        (bitcoin-lisp.networking:send-message
+        (bl.net:send-message
          peer
-         (bitcoin-lisp.serialization:make-getdata-message
-          (list (bitcoin-lisp.serialization:make-inv-vector
-                 :type bitcoin-lisp.serialization:+inv-type-witness-block+
+         (bl.ser:make-getdata-message
+          (list (bl.ser:make-inv-vector
+                 :type bl.ser:+inv-type-witness-block+
                  :hash hash)))))
       ;; Core returns an empty object; an empty hash-table serializes as {}.
       (make-hash-table :test 'equal))))
@@ -2262,17 +2262,17 @@ parameter the caller never sent."
          (have-nodeid (integerp nodeid)))
     ;; Atomic against the sync thread's node-peers mutations: hold node-lock
     ;; across the find + disconnect so we don't act on a peer mid-removal.
-    (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+    (bt:with-recursive-lock-held ((bl::node-lock node))
       (let ((target
               (cond
                 ((and have-address (not have-nodeid))
-                 (find address (bitcoin-lisp::node-peers node)
-                       :key (lambda (p) (bitcoin-lisp::peer-address p))
+                 (find address (bl::node-peers node)
+                       :key (lambda (p) (bl::peer-address p))
                        :test #'string=))
                 ((and have-nodeid (or (null address)
                                       (and (stringp address) (zerop (length address)))))
-                 (find nodeid (bitcoin-lisp::node-peers node)
-                       :key (lambda (p) (bitcoin-lisp.networking::peer-id p))
+                 (find nodeid (bl::node-peers node)
+                       :key (lambda (p) (bl.net::peer-id p))
                        :test #'eql))
                 (t
                  (error 'rpc-error :code +rpc-invalid-params+
@@ -2281,15 +2281,15 @@ parameter the caller never sent."
           ;; Core: RPC_CLIENT_NODE_NOT_CONNECTED (-29), net.cpp:482.
           (error 'rpc-error :code +rpc-client-node-not-connected+
                             :message "Node not found in connected nodes"))
-        (bitcoin-lisp.networking:disconnect-peer target)
+        (bl.net:disconnect-peer target)
         ;; Reap it here rather than waiting for the next sync cycle's
         ;; REPLACE-DISCONNECTED-PEERS. Core's DisconnectNodes() runs every
         ;; socket-handler pass, so by the time disconnectnode returns the node
         ;; is already out of m_nodes; ours would otherwise linger in
         ;; node-peers for as long as a sync cycle takes. We already hold
         ;; node-lock, which is the only thing that made this awkward before.
-        (setf (bitcoin-lisp::node-peers node)
-              (remove target (bitcoin-lisp::node-peers node)))
+        (setf (bl::node-peers node)
+              (remove target (bl::node-peers node)))
         nil))))
 
 ;;; --- Manual ban management (Bitcoin Core setban/listbanned/clearbanned) ---
@@ -2317,42 +2317,42 @@ subnet syntax is rejected as invalid. Returns null."
     ;; Core: unparseable IP/subnet -> RPC_CLIENT_INVALID_IP_OR_SUBNET (-30),
     ;; net.cpp:781. parse-network-address accepts IPv4/IPv6/onion/i2p
     ;; literals; hostnames and CIDR subnets are rejected.
-    (unless (bitcoin-lisp.networking:parse-network-address address)
+    (unless (bl.net:parse-network-address address)
       (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
                         :message "Error: Invalid IP/Subnet"))
     (cond
       ((equal command "add")
        ;; Core: already banned -> RPC_CLIENT_NODE_ALREADY_ADDED (-23),
        ;; net.cpp:786.
-       (when (bitcoin-lisp.networking:peer-banned-p address)
+       (when (bl.net:peer-banned-p address)
          (error 'rpc-error :code +rpc-client-node-already-added+
                            :message "Error: IP/Subnet already banned"))
        (cond
-         ((null bantime) (bitcoin-lisp.networking:ban-address address))
+         ((null bantime) (bl.net:ban-address address))
          ((not (integerp bantime))
           (error 'rpc-error :code +rpc-invalid-parameter+ :message "bantime must be an integer"))
          (absolute
           ;; Core: an absolute time in the past is -8, net.cpp:796.
-          (let ((offset (- bantime (bitcoin-lisp.serialization:get-unix-time))))
+          (let ((offset (- bantime (bl.ser:get-unix-time))))
             (when (minusp offset)
               (error 'rpc-error :code +rpc-invalid-parameter+
                                 :message "Error: Absolute timestamp is in the past"))
-            (bitcoin-lisp.networking:ban-address address offset)))
+            (bl.net:ban-address address offset)))
          ;; Core: bantime <= 0 falls back to -bantime (banman.cpp:130-140).
-         ((<= bantime 0) (bitcoin-lisp.networking:ban-address address))
-         (t (bitcoin-lisp.networking:ban-address address bantime)))
+         ((<= bantime 0) (bl.net:ban-address address))
+         (t (bl.net:ban-address address bantime)))
        ;; Core: a fresh ban disconnects every matching connected peer itself
        ;; (net.cpp:803-810, CConnman::DisconnectNode marks ALL nodes with
        ;; that address). Same node-lock discipline as rpc-disconnectnode:
        ;; hold it across the scan + disconnects so we never act on a peer
        ;; mid-removal by the sync thread.
-       (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-         (dolist (peer (bitcoin-lisp::node-peers node))
-           (when (string= address (bitcoin-lisp::peer-address peer))
-             (bitcoin-lisp.networking:disconnect-peer peer))))
+       (bt:with-recursive-lock-held ((bl::node-lock node))
+         (dolist (peer (bl::node-peers node))
+           (when (string= address (bl::peer-address peer))
+             (bl.net:disconnect-peer peer))))
        nil)
       ((equal command "remove")
-       (unless (bitcoin-lisp.networking:unban-address address)
+       (unless (bl.net:unban-address address)
          ;; Core: RPC_CLIENT_INVALID_IP_OR_SUBNET (-30), net.cpp:812.
          (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
                            :message "Error: Unban failed. Requested address/subnet was not previously manually banned."))
@@ -2368,13 +2368,13 @@ subnet syntax is rejected as invalid. Returns null."
    (mapcar (lambda (ban)
              `(("address" . ,(car ban))
                ("banned_until" . ,(- (cdr ban)
-                                     bitcoin-lisp.serialization:+universal-unix-epoch-offset+))))
-           (bitcoin-lisp.networking:list-bans))))
+                                     bl.ser:+universal-unix-epoch-offset+))))
+           (bl.net:list-bans))))
 
 (defun rpc-clearbanned (node params)
   "Clear all manual bans (Bitcoin Core clearbanned). Returns null."
   (declare (ignore node params))
-  (bitcoin-lisp.networking:clear-ban-list)
+  (bl.net:clear-ban-list)
   nil)
 
 ;;; --- Network totals (Bitcoin Core getnettotals) ---
@@ -2382,23 +2382,23 @@ subnet syntax is rejected as invalid. Returns null."
 (defun rpc-getnettotals (node params)
   "Cumulative network byte totals since startup (Bitcoin Core getnettotals)."
   (declare (ignore node params))
-  `(("totalbytesrecv" . ,bitcoin-lisp.networking:*total-bytes-received*)
-    ("totalbytessent" . ,bitcoin-lisp.networking:*total-bytes-sent*)
-    ("timemillis" . ,(* (bitcoin-lisp.serialization:get-unix-time) 1000))
+  `(("totalbytesrecv" . ,bl.net:*total-bytes-received*)
+    ("totalbytessent" . ,bl.net:*total-bytes-sent*)
+    ("timemillis" . ,(* (bl.ser:get-unix-time) 1000))
     ;; -maxuploadtarget (Core rpc/net.cpp:598-608). With no target set every
     ;; field reads as Core's disabled shape, because Core's own accessors
     ;; short-circuit on nMaxOutboundLimit == 0.
     ("uploadtarget"
-     . (("timeframe" . ,bitcoin-lisp.networking::+max-upload-timeframe-seconds+)
-        ("target" . ,bitcoin-lisp.networking::*max-upload-target*)
+     . (("timeframe" . ,bl.net::+max-upload-timeframe-seconds+)
+        ("target" . ,bl.net::*max-upload-target*)
         ("target_reached"
-         . ,(json-bool (bitcoin-lisp.networking::outbound-target-reached-p nil)))
+         . ,(json-bool (bl.net::outbound-target-reached-p nil)))
         ("serve_historical_blocks"
-         . ,(json-bool (not (bitcoin-lisp.networking::outbound-target-reached-p t))))
+         . ,(json-bool (not (bl.net::outbound-target-reached-p t))))
         ("bytes_left_in_cycle"
-         . ,(bitcoin-lisp.networking::outbound-target-bytes-left))
+         . ,(bl.net::outbound-target-bytes-left))
         ("time_left_in_cycle"
-         . ,(bitcoin-lisp.networking::max-outbound-time-left-in-cycle))))))
+         . ,(bl.net::max-outbound-time-left-in-cycle))))))
 
 ;;; --- Chain verification (Bitcoin Core verifychain) ---
 
@@ -2415,23 +2415,23 @@ block reads back. Returns T if all checks pass, NIL otherwise."
     ;; sync thread could otherwise splice entries from two tips (Core
     ;; VerifyDB holds cs_main throughout).
     (with-node-lock (node)
-     (let ((tip (bitcoin-lisp.storage:current-height chain-state)))
+     (let ((tip (bl.store:current-height chain-state)))
       (when (or (<= nblocks 0) (> nblocks (1+ tip)))
         (setf nblocks (1+ tip)))
       (loop for height from tip downto (max 0 (- tip (1- nblocks)))
-            do (let ((entry (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+            do (let ((entry (bl.store:get-block-at-height chain-state height)))
                  (unless entry (return-from rpc-verifychain +json-false+))
-                 (let ((block (bitcoin-lisp.storage:get-block
+                 (let ((block (bl.store:get-block
                                block-store
-                               (bitcoin-lisp.storage:block-index-entry-hash entry))))
+                               (bl.store:block-index-entry-hash entry))))
                    (unless block (return-from rpc-verifychain +json-false+))
                    (when (>= checklevel 1)
-                     (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-                            (txids (mapcar #'bitcoin-lisp.serialization:transaction-hash
-                                           (bitcoin-lisp.serialization:bitcoin-block-transactions block))))
-                       (unless (and (equalp (bitcoin-lisp.validation:compute-merkle-root txids)
-                                            (bitcoin-lisp.serialization:block-header-merkle-root header))
-                                    (bitcoin-lisp.validation:check-proof-of-work header))
+                     (let* ((header (bl.ser:bitcoin-block-header block))
+                            (txids (mapcar #'bl.ser:transaction-hash
+                                           (bl.ser:bitcoin-block-transactions block))))
+                       (unless (and (equalp (bl.val:compute-merkle-root txids)
+                                            (bl.ser:block-header-merkle-root header))
+                                    (bl.val:check-proof-of-work header))
                          (return-from rpc-verifychain +json-false+)))))))
       t))))
 
@@ -2446,25 +2446,25 @@ the RPC worker thread."
     (when (minusp timeout)
       (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
     (let* ((chain-state (rpc-get-chain-state node))
-           (start-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+           (start-hash (bl.store:best-block-hash chain-state))
            (deadline (when (plusp timeout)
                        (+ (get-internal-real-time)
                           (floor (* timeout internal-time-units-per-second) 1000)))))
-      (loop while (and (bitcoin-lisp::node-running node)
-                       (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+      (loop while (and (bl::node-running node)
+                       (equalp (bl.store:best-block-hash chain-state)
                                start-hash)
                        (or (null deadline)
                            (< (get-internal-real-time) deadline)))
             do (sleep 0.25))
-      (let ((hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+      (let ((hash (bl.store:best-block-hash chain-state)))
         `(("hash" . ,(if hash (hash-to-hex hash) ""))
-          ("height" . ,(bitcoin-lisp.storage:current-height chain-state)))))))
+          ("height" . ,(bl.store:current-height chain-state)))))))
 
 (defun %tip-result (chain-state)
   "The {hash, height} alist Core's waitfor* RPCs return for the current tip."
-  (let ((hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+  (let ((hash (bl.store:best-block-hash chain-state)))
     `(("hash" . ,(if hash (hash-to-hex hash) ""))
-      ("height" . ,(bitcoin-lisp.storage:current-height chain-state)))))
+      ("height" . ,(bl.store:current-height chain-state)))))
 
 (defun %wait-deadline (timeout-ms)
   "Internal-real-time deadline for a TIMEOUT-MS wait, or NIL for wait-forever."
@@ -2489,8 +2489,8 @@ RPC worker thread."
                           :message "blockhash must be a 64-character hex string"))
       (let* ((chain-state (rpc-get-chain-state node))
              (deadline (%wait-deadline timeout)))
-        (loop while (and (bitcoin-lisp::node-running node)
-                         (not (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+        (loop while (and (bl::node-running node)
+                         (not (equalp (bl.store:best-block-hash chain-state)
                                       target))
                          (or (null deadline) (< (get-internal-real-time) deadline)))
               do (sleep 0.25))
@@ -2509,8 +2509,8 @@ indefinitely. Returns the tip on reaching the height, timeout, or node shutdown.
       (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
     (let* ((chain-state (rpc-get-chain-state node))
            (deadline (%wait-deadline timeout)))
-      (loop while (and (bitcoin-lisp::node-running node)
-                       (< (bitcoin-lisp.storage:current-height chain-state) height)
+      (loop while (and (bl::node-running node)
+                       (< (bl.store:current-height chain-state) height)
                        (or (null deadline) (< (get-internal-real-time) deadline)))
             do (sleep 0.25))
       (%tip-result chain-state))))
@@ -2539,7 +2539,7 @@ indefinitely. Returns the tip on reaching the height, timeout, or node shutdown.
 
 (defun %network-for-magic (magic)
   "The network keyword whose P2P message magic is MAGIC, or NIL."
-  (find-if (lambda (net) (equalp magic (bitcoin-lisp:network-magic net)))
+  (find-if (lambda (net) (equalp magic (bl:network-magic net)))
            '(:mainnet :testnet3 :testnet4 :signet :regtest)))
 
 (defun %chain-tx-count (tip-entry block-store)
@@ -2551,9 +2551,9 @@ CBlockIndex::m_chain_tx_count), or NIL when any block's count is unknown
           do (let ((n (%entry-tx-count entry block-store)))
                (unless n (return-from %chain-tx-count nil))
                (incf total n)
-               (when (zerop (bitcoin-lisp.storage:block-index-entry-height entry))
+               (when (zerop (bl.store:block-index-entry-height entry))
                  (return-from %chain-tx-count total))
-               (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry))))
+               (setf entry (bl.store:block-index-entry-prev-entry entry))))
     ;; The walk fell off a prev-entry link before reaching genesis.
     nil))
 
@@ -2568,16 +2568,16 @@ type-error message."
      (when (minusp param)
        (error 'rpc-error :code +rpc-invalid-parameter+
                          :message (format nil "Target block height ~D is negative" param)))
-     (let ((tip-height (bitcoin-lisp.storage:current-height chain-state)))
+     (let ((tip-height (bl.store:current-height chain-state)))
        (when (> param tip-height)
          (error 'rpc-error :code +rpc-invalid-parameter+
                            :message (format nil "Target block height ~D after current tip ~D"
                                             param tip-height))))
-     (or (bitcoin-lisp.storage:get-block-at-height chain-state param)
+     (or (bl.store:get-block-at-height chain-state param)
          (error 'rpc-error :code +rpc-invalid-address-or-key+
                            :message "Block not found")))
     ((and (stringp param) (valid-hex-hash-p param))
-     (or (bitcoin-lisp.storage:get-block-index-entry
+     (or (bl.store:get-block-index-entry
           chain-state (parse-hex-hash param))
          (error 'rpc-error :code +rpc-invalid-address-or-key+
                            :message "Block not found")))
@@ -2604,8 +2604,8 @@ else — including an omitted type — is refused."
                            :message (format nil "Invalid snapshot type \"~A\" specified with rollback option" type)))
        (%parse-hash-or-height-entry chain-state rollback-param "rollback"))
       ((string= type "rollback")
-       (let ((heights (mapcar #'bitcoin-lisp:assumeutxo-data-height
-                              (bitcoin-lisp:network-assumeutxo-data
+       (let ((heights (mapcar #'bl:assumeutxo-data-height
+                              (bl:network-assumeutxo-data
                                (rpc-get-network node)))))
          (unless heights
            (error 'rpc-error :code +rpc-misc-error+
@@ -2624,11 +2624,11 @@ activity is suspended so peers aren't punished for relaying data that only
 looks wrong in the rolled-back state; the rollback is invalidateblock on the
 active chain's block after the target, always undone with reconsiderblock in
 reverse RAII order (rollback restored first, then the network re-enabled)."
-  (let ((target-height (bitcoin-lisp.storage:block-index-entry-height target-entry))
-        (target-hash (bitcoin-lisp.storage:block-index-entry-hash target-entry)))
+  (let ((target-height (bl.store:block-index-entry-height target-entry))
+        (target-hash (bl.store:block-index-entry-hash target-entry)))
     ;; A hash-resolved target must lie on the active chain — Core takes
     ;; ActiveChain().Next(target), which has no answer off-chain.
-    (unless (eq (bitcoin-lisp.storage:get-block-at-height chain-state target-height)
+    (unless (eq (bl.store:get-block-at-height chain-state target-height)
                 target-entry)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Block is not in the active chain"))
@@ -2636,20 +2636,20 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
     ;; undo) still on disk to disconnect down and reconnect afterwards (Core
     ;; checks GetFirstBlock(BLOCK_HAVE_MASK) <= target, rpc/blockchain.cpp:
     ;; 3139-3149). Our pruned horizon is the pruned-height cursor.
-    (when (and (bitcoin-lisp:pruning-enabled-p)
+    (when (and (bl:pruning-enabled-p)
                (<= target-height
-                   (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
+                   (bl.store:chain-state-pruned-height chain-state)))
       (error 'rpc-error :code +rpc-misc-error+
                         :message "Could not roll back to requested height since necessary block data is already pruned."))
     (let ((invalidate-hash
-            (bitcoin-lisp.storage:block-index-entry-hash
-             (bitcoin-lisp.storage:get-block-at-height
+            (bl.store:block-index-entry-hash
+             (bl.store:get-block-at-height
               chain-state (1+ target-height))))
           (block-store (rpc-get-block-store node))
           (utxo-set (rpc-get-utxo-set node))
           (mempool (rpc-get-mempool node))
           (tx-index (rpc-get-tx-index node))
-          (was-active (bitcoin-lisp::node-network-active node)))
+          (was-active (bl::node-network-active node)))
       ;; NetworkDisable: skipped when the network is already off, so we don't
       ;; re-enable it behind the user's back at the end.
       (when was-active
@@ -2663,7 +2663,7 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
                   ;; while the dump runs unlocked.
                   (with-node-lock (node)
                     (multiple-value-bind (ok reason)
-                        (bitcoin-lisp.validation:invalidate-block
+                        (bl.val:invalidate-block
                          chain-state block-store utxo-set invalidate-hash
                          :mempool mempool :tx-index tx-index)
                       (unless ok
@@ -2673,7 +2673,7 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
                     ;; The new tip must be the target: a block-read failure or a
                     ;; stale equal-work sister of the invalidated block would
                     ;; land elsewhere (Core rpc/blockchain.cpp:3178-3187).
-                    (unless (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+                    (unless (equalp (bl.store:best-block-hash chain-state)
                                     target-hash)
                       (error 'rpc-error :code +rpc-misc-error+
                                         :message "Could not roll back to requested height.")))
@@ -2681,7 +2681,7 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
              ;; ~TemporaryRollback: always reconsider, even on error —
              ;; harmless if the invalidation never took effect.
              (with-node-lock (node)
-               (bitcoin-lisp.validation:reconsider-block
+               (bl.val:reconsider-block
                 chain-state block-store utxo-set invalidate-hash
                 :mempool mempool :tx-index tx-index)))
         ;; ~NetworkDisable (runs after the rollback is undone, like Core's
@@ -2707,10 +2707,10 @@ on completion. nchaintx is omitted when some block's tx count is unknown
     (unless (and (stringp path) (plusp (length path)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
     (let* ((chain-state (rpc-get-chain-state node))
-           (tip-hash (or (bitcoin-lisp.storage:best-block-hash chain-state)
+           (tip-hash (or (bl.store:best-block-hash chain-state)
                          (error 'rpc-error :code +rpc-misc-error+
                                            :message "Chain has no tip")))
-           (tip-entry (bitcoin-lisp.storage:get-block-index-entry
+           (tip-entry (bl.store:get-block-index-entry
                        chain-state tip-hash))
            (target-entry (%dump-rollback-target-entry
                           node chain-state tip-entry type options)))
@@ -2727,9 +2727,9 @@ on completion. nchaintx is omitted when some block's tx count is unknown
   "Stream CHAIN-STATE's UTXO set to PATH in snapshot v2 format at its
 current tip (Core PrepareUTXOSnapshot + WriteUTXOSnapshot, rpc/
 blockchain.cpp:3208-3323) and return dumptxoutset's result alist."
-  (let* ((base-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-         (base-height (bitcoin-lisp.storage:current-height chain-state))
-         (base-entry (bitcoin-lisp.storage:get-block-index-entry chain-state base-hash))
+  (let* ((base-hash (bl.store:best-block-hash chain-state))
+         (base-height (bl.store:current-height chain-state))
+         (base-entry (bl.store:get-block-index-entry chain-state base-hash))
          (temppath (concatenate 'string path ".incomplete"))
          (digest (ironclad:make-digest :sha256))
          (count 0)
@@ -2741,10 +2741,10 @@ blockchain.cpp:3208-3323) and return dumptxoutset's result alist."
              ;; SnapshotMetadata (node/utxo_snapshot.h:63-70); the coin
              ;; count is back-patched after the streaming pass.
              (write-sequence +snapshot-magic-bytes+ out)
-             (bitcoin-lisp.serialization:write-uint16-le out +snapshot-version+)
-             (write-sequence (bitcoin-lisp:network-magic (rpc-get-network node)) out)
+             (bl.ser:write-uint16-le out +snapshot-version+)
+             (write-sequence (bl:network-magic (rpc-get-network node)) out)
              (write-sequence base-hash out)
-             (bitcoin-lisp.serialization:write-uint64-le out 0)
+             (bl.ser:write-uint64-le out 0)
              ;; Coins grouped per txid (WriteUTXOSnapshot, rpc/
              ;; blockchain.cpp:3246-3308). utxo-set-iterate's cursor
              ;; order contract makes groups contiguous and vouts
@@ -2753,22 +2753,22 @@ blockchain.cpp:3208-3323) and return dumptxoutset's result alist."
                    (group '()))
                (flet ((flush-group ()
                         (when group
-                          (let ((buf (bitcoin-lisp.serialization:make-byte-buf)))
-                            (bitcoin-lisp.serialization:bb-write-bytes buf group-txid)
-                            (bitcoin-lisp.serialization:bb-write-varint buf (length group))
+                          (let ((buf (bl.ser:make-byte-buf)))
+                            (bl.ser:bb-write-bytes buf group-txid)
+                            (bl.ser:bb-write-varint buf (length group))
                             (dolist (pair (nreverse group))
                               (let ((vout (car pair))
                                     (entry (cdr pair)))
-                                (bitcoin-lisp.serialization:bb-write-varint buf vout)
-                                (bitcoin-lisp.serialization:bb-write-compressed-coin
+                                (bl.ser:bb-write-varint buf vout)
+                                (bl.ser:bb-write-compressed-coin
                                  buf
-                                 (bitcoin-lisp.storage:utxo-entry-height entry)
-                                 (bitcoin-lisp.storage:utxo-entry-coinbase entry)
-                                 (bitcoin-lisp.storage:utxo-entry-value entry)
-                                 (bitcoin-lisp.storage:utxo-entry-script-pubkey entry))))
-                            (write-sequence (bitcoin-lisp.serialization:bb-finish buf) out))
+                                 (bl.store:utxo-entry-height entry)
+                                 (bl.store:utxo-entry-coinbase entry)
+                                 (bl.store:utxo-entry-value entry)
+                                 (bl.store:utxo-entry-script-pubkey entry))))
+                            (write-sequence (bl.ser:bb-finish buf) out))
                           (setf group '()))))
-                 (bitcoin-lisp.storage:utxo-set-iterate
+                 (bl.store:utxo-set-iterate
                   utxo-set
                   (lambda (txid vout entry)
                     (unless (and group-txid (equalp txid group-txid))
@@ -2776,15 +2776,15 @@ blockchain.cpp:3208-3323) and return dumptxoutset's result alist."
                       (setf group-txid txid))
                     (push (cons vout entry) group)
                     (ironclad:update-digest
-                     digest (bitcoin-lisp.storage:coin-muhash-element* txid vout entry))
+                     digest (bl.store:coin-muhash-element* txid vout entry))
                     (incf count)))
                  (flush-group)))
              (file-position out +snapshot-count-offset+)
-             (bitcoin-lisp.serialization:write-uint64-le out count))
+             (bl.ser:write-uint64-le out count))
            (rename-file temppath path)
            (setf renamed t))
       (unless renamed (ignore-errors (delete-file temppath))))
-    (let ((hash (bitcoin-lisp.crypto:sha256 (ironclad:produce-digest digest)))
+    (let ((hash (bl.crypto:sha256 (ironclad:produce-digest digest)))
           (nchaintx (and base-entry
                          (%chain-tx-count base-entry (rpc-get-block-store node)))))
       `(("coins_written" . ,count)
@@ -2805,21 +2805,21 @@ Core loadtxoutset's \"Unable to parse metadata\" wrapper."
                                               (apply #'format nil fmt args)))))
     (handler-case
         (progn
-          (unless (equalp (bitcoin-lisp.serialization:read-bytes in 5)
+          (unless (equalp (bl.ser:read-bytes in 5)
                           +snapshot-magic-bytes+)
             (bad "Invalid UTXO set snapshot magic bytes. Please check if this is indeed a snapshot file or if you are using an outdated snapshot format."))
-          (let ((version (bitcoin-lisp.serialization:read-uint16-le in)))
+          (let ((version (bl.ser:read-uint16-le in)))
             (unless (= version +snapshot-version+)
               (bad "Version of snapshot ~D does not match any of the supported versions." version)))
-          (let ((magic (bitcoin-lisp.serialization:read-bytes in 4)))
-            (unless (equalp magic (bitcoin-lisp:network-magic network))
+          (let ((magic (bl.ser:read-bytes in 4)))
+            (unless (equalp magic (bl:network-magic network))
               (let ((theirs (%network-for-magic magic)))
                 (if theirs
                     (bad "The network of the snapshot (~A) does not match the network of this node (~A)."
                          (%chain-name theirs) (%chain-name network))
                     (bad "This snapshot has been created for an unrecognized network. This could be a custom signet, a new testnet or possibly caused by data corruption.")))))
-          (values (bitcoin-lisp.serialization:read-bytes in 32)
-                  (bitcoin-lisp.serialization:read-uint64-le in)))
+          (values (bl.ser:read-bytes in 32)
+                  (bl.ser:read-uint64-le in)))
       (rpc-error (e) (error e))
       (error () (bad "truncated snapshot header")))))
 
@@ -2843,14 +2843,14 @@ GLOBAL-REMAINING has left — Core's coins_per_txid > coins_left guard
 per-batch budget. Returns the number of coins consumed in this call."
   (let ((consumed 0))
     (loop while (and (< consumed batch-budget) (< consumed global-remaining))
-          do (let ((txid (bitcoin-lisp.serialization:read-bytes in 32))
-                   (ncoins (bitcoin-lisp.serialization:read-compact-size in)))
+          do (let ((txid (bl.ser:read-bytes in 32))
+                   (ncoins (bl.ser:read-compact-size in)))
                (when (> ncoins (- global-remaining consumed))
                  (funcall mismatch-fn))
                (dotimes (i ncoins)
-                 (let ((vout (bitcoin-lisp.serialization:read-compact-size in)))
+                 (let ((vout (bl.ser:read-compact-size in)))
                    (multiple-value-bind (height coinbase value script)
-                       (bitcoin-lisp.serialization:read-compressed-coin in)
+                       (bl.ser:read-compressed-coin in)
                      (funcall coin-fn txid vout height coinbase value script)
                      (incf consumed))))))
     consumed))
@@ -2869,30 +2869,30 @@ base entry's tx-count is seeded from the commitment's nChainTx (Core
 validation.cpp:5938-5967), and the chainstate is adopted as current. Any
 failure tears the snapshot chainstate down (dir deleted) via FAIL, a
 function of (format-string &rest args) that must signal."
-  (let ((snap (bitcoin-lisp::create-snapshot-chainstate node base-hash))
+  (let ((snap (bl::create-snapshot-chainstate node base-hash))
         (adopted nil))
     (unwind-protect
-         (let* ((view (bitcoin-lisp.storage:chain-state-coins-view snap))
-                (base-db (bitcoin-lisp.storage:coins-view-cache-base view))
+         (let* ((view (bl.store:chain-state-coins-view snap))
+                (base-db (bl.store:coins-view-cache-base view))
                 (processed 0))
            (flet ((put-coin (batch txid vout height coinbase value script)
                     (when (or (> height base-height) (>= vout #xFFFFFFFF))
                       (funcall fail "Bad snapshot data after deserializing ~D coins"
                                processed))
                     (when (or (minusp value)
-                              (> value bitcoin-lisp.validation:+max-money+))
+                              (> value bl.val:+max-money+))
                       (funcall fail "Bad snapshot data after deserializing ~D coins - bad tx out value"
                                processed))
-                    (bitcoin-lisp.storage:coins-view-batch-put
+                    (bl.store:coins-view-batch-put
                      batch
-                     (bitcoin-lisp.storage::make-utxo-key txid vout)
-                     (bitcoin-lisp.storage:make-utxo-entry
+                     (bl.store::make-utxo-key txid vout)
+                     (bl.store:make-utxo-entry
                       :value value :script-pubkey script
                       :height height :coinbase coinbase))
                     (incf processed)))
              (handler-case
                  (loop while (< processed coins-count)
-                       do (bitcoin-lisp.storage:with-coins-view-batch
+                       do (bl.store:with-coins-view-batch
                               (batch base-db :sync t)
                             ;; GLOBAL remaining drives the mismatch guard; the
                             ;; batch budget only bounds this LevelDB commit, so
@@ -2915,8 +2915,8 @@ function of (format-string &rest args) that must signal."
            ;; hash_serialized_3 over the POPULATED set vs the chainparams
            ;; commitment (Core ComputeUTXOStats over the new DB,
            ;; validation.cpp:5921-5936).
-           (let ((got (bitcoin-lisp.storage:compute-utxo-set-hash view))
-                 (want (bitcoin-lisp:assumeutxo-data-hash-serialized au)))
+           (let ((got (bl.store:compute-utxo-set-hash view))
+                 (want (bl:assumeutxo-data-hash-serialized au)))
              (unless (equalp got want)
                (funcall fail "Bad snapshot content hash: expected ~A, got ~A"
                         (hash-to-hex want) (hash-to-hex got))))
@@ -2930,20 +2930,20 @@ function of (format-string &rest args) that must signal."
            ;; in the same batch as the coins — so a crash after adoption leaves
            ;; a populated database claiming no block at all, and the startup
            ;; comparison of the two records has nothing to compare.
-           (setf (bitcoin-lisp.storage::cvc-best-block view) (copy-seq base-hash))
-           (bitcoin-lisp.storage:coins-view-cache-flush view :sync t)
-           (bitcoin-lisp.storage:update-chain-tip snap base-hash base-height)
-           (bitcoin-lisp.storage:write-snapshot-base-blockhash snap)
-           (bitcoin-lisp.storage:save-state snap)
-           (setf (bitcoin-lisp.storage:block-index-entry-tx-count base-entry)
-                 (bitcoin-lisp:assumeutxo-data-chain-tx-count au))
-           (bitcoin-lisp::add-snapshot-chainstate node snap)
+           (setf (bl.store::cvc-best-block view) (copy-seq base-hash))
+           (bl.store:coins-view-cache-flush view :sync t)
+           (bl.store:update-chain-tip snap base-hash base-height)
+           (bl.store:write-snapshot-base-blockhash snap)
+           (bl.store:save-state snap)
+           (setf (bl.store:block-index-entry-tx-count base-entry)
+                 (bl:assumeutxo-data-chain-tx-count au))
+           (bl::add-snapshot-chainstate node snap)
            (setf adopted t)
-           (bitcoin-lisp::node-log
+           (bl::node-log
             :info "RPC loadtxoutset: loaded ~D coins, hash_serialized_3 verified, snapshot chainstate active at h=~D"
             coins-count base-height))
       (unless adopted
-        (bitcoin-lisp::abort-snapshot-chainstate node snap)))))
+        (bl::abort-snapshot-chainstate node snap)))))
 
 (defun rpc-loadtxoutset (node params)
   "Load a Bitcoin Core-format UTXO snapshot (loadtxoutset). PARAMS: (path).
@@ -2989,58 +2989,58 @@ chainstate exists (effective-prune-target-bytes)."
           (multiple-value-bind (base-hash coins-count)
               (%read-snapshot-metadata in network)
             ;; --- Preconditions (ActivateSnapshot, validation.cpp:5616-5650) ---
-            (when (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+            (when (bl.store:chain-state-from-snapshot-blockhash chain-state)
               (load-error "Can't activate a snapshot-based chainstate more than once"))
-            (let ((au (bitcoin-lisp:assumeutxo-data-for-blockhash network base-hash))
-                  (base-entry (bitcoin-lisp.storage:get-block-index-entry
+            (let ((au (bl:assumeutxo-data-for-blockhash network base-hash))
+                  (base-entry (bl.store:get-block-index-entry
                                chain-state base-hash)))
               (unless au
                 (load-error "assumeutxo block hash in snapshot metadata not recognized (hash: ~A). The following snapshot heights are available: ~{~D~^, ~}"
                             (hash-to-hex base-hash)
-                            (sort (mapcar #'bitcoin-lisp:assumeutxo-data-height
-                                          (bitcoin-lisp:network-assumeutxo-data network))
+                            (sort (mapcar #'bl:assumeutxo-data-height
+                                          (bl:network-assumeutxo-data network))
                                   #'<)))
               (unless base-entry
                 (load-error "The base block header (~A) must appear in the headers chain. Make sure all headers are syncing, and call loadtxoutset again"
                             (hash-to-hex base-hash)))
-              (when (eq (bitcoin-lisp.storage:block-index-entry-status base-entry) :invalid)
+              (when (eq (bl.store:block-index-entry-status base-entry) :invalid)
                 (load-error "The base block header (~A) is part of an invalid chain"
                             (hash-to-hex base-hash)))
-              (let ((base-height (bitcoin-lisp.storage:block-index-entry-height base-entry)))
-                (unless (= base-height (bitcoin-lisp:assumeutxo-data-height au))
+              (let ((base-height (bl.store:block-index-entry-height base-entry)))
+                (unless (= base-height (bl:assumeutxo-data-height au))
                   (load-error "Assumeutxo height in snapshot metadata not recognized (~D) - refusing to load snapshot"
                               base-height))
                 ;; The base must lie on the best header chain (Core
                 ;; m_best_header->GetAncestor(height) == base).
-                (let ((best (bitcoin-lisp.storage:best-header-entry chain-state)))
+                (let ((best (bl.store:best-header-entry chain-state)))
                   (unless (and best
-                               (eq (bitcoin-lisp.storage:entry-ancestor-at-height
+                               (eq (bl.store:entry-ancestor-at-height
                                     best base-height)
                                    base-entry))
                     (load-error "A forked headers-chain with more work than the chain with the snapshot base block header exists. Please proceed to sync without AssumeUtxo.")))
                 ;; The snapshot must be a more-work chain than the active tip
                 ;; (Core CBlockIndexWorkComparator; height as the tiebreak
                 ;; for work-less synthetic chains in tests).
-                (let* ((tip-entry (bitcoin-lisp.storage:get-block-index-entry
+                (let* ((tip-entry (bl.store:get-block-index-entry
                                    chain-state
-                                   (bitcoin-lisp.storage:best-block-hash chain-state)))
-                       (tip-height (bitcoin-lisp.storage:current-height chain-state))
+                                   (bl.store:best-block-hash chain-state)))
+                       (tip-height (bl.store:current-height chain-state))
                        (tip-work (if tip-entry
-                                     (bitcoin-lisp.storage:block-index-entry-chain-work
+                                     (bl.store:block-index-entry-chain-work
                                       tip-entry)
                                      0))
-                       (base-work (bitcoin-lisp.storage:block-index-entry-chain-work
+                       (base-work (bl.store:block-index-entry-chain-work
                                    base-entry)))
                   (unless (or (> base-work tip-work)
                               (and (= base-work tip-work) (> base-height tip-height)))
                     (load-error "Work does not exceed active chainstate (node already at or past height ~D)"
                                 base-height)))
-                (when (and mempool (plusp (bitcoin-lisp.mempool:mempool-count mempool)))
+                (when (and mempool (plusp (bl.mp:mempool-count mempool)))
                   (load-error "Can't activate a snapshot when mempool not empty"))
                 ;; --- Populate + verify into a NEW snapshot chainstate ---
                 ;; (see %populate-snapshot-chainstate). Any failure leaves
                 ;; the node untouched.
-                (bitcoin-lisp::call-with-sync-paused
+                (bl::call-with-sync-paused
                  node
                  (lambda ()
                    (%populate-snapshot-chainstate
@@ -3057,8 +3057,8 @@ chainstate exists (effective-prune-target-bytes)."
   "Dump the mempool to disk (Bitcoin Core savemempool). Returns the filename.
 The same dump runs automatically on graceful shutdown."
   (declare (ignore params))
-  (let ((path (bitcoin-lisp.mempool:mempool-dat-path
-               (bitcoin-lisp::node-data-directory node))))
+  (let ((path (bl.mp:mempool-dat-path
+               (bl::node-data-directory node))))
     (unless path
       (error 'rpc-error :code +rpc-misc-error+
                         :message "Node has no data directory"))
@@ -3066,7 +3066,7 @@ The same dump runs automatically on graceful shutdown."
     ;; set; a concurrent sync-thread mutation would tear the snapshot
     ;; (Core DumpMempool snapshots under pool.cs).
     (with-node-lock (node)
-      (bitcoin-lisp.mempool:save-mempool-file (rpc-get-mempool node) path))
+      (bl.mp:save-mempool-file (rpc-get-mempool node) path))
     `(("filename" . ,(namestring path)))))
 
 (defun rpc-importmempool (node params)
@@ -3109,7 +3109,7 @@ separates them."
       ;; thread (Core importmempool holds cs_main + pool.cs through
       ;; LoadMempool, rpc/mempool.cpp:1130).
       (unless (with-node-lock (node)
-                (bitcoin-lisp::load-mempool-from-disk
+                (bl::load-mempool-from-disk
                  node path
                  :apply-unbroadcast apply-unbroadcast
                  :apply-fee-delta-priority apply-fee-delta
@@ -3145,18 +3145,18 @@ mempool acceptance and RBF scoring; the fee is not actually paid. Returns T."
     ;; takes pool.cs).
     (with-node-lock (node)
      (let* ((mempool (rpc-get-mempool node))
-           (entry (bitcoin-lisp.mempool:mempool-get mempool txid)))
+           (entry (bl.mp:mempool-get mempool txid)))
       ;; Core: dust-output txs can't enter with a nonzero delta, so refuse to
       ;; prioritise them after the fact too.
       (when entry
-        (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
-          (loop for out across (bitcoin-lisp.serialization:transaction-outputs tx)
-                do (when (< (bitcoin-lisp.serialization:tx-out-value out)
-                            (bitcoin-lisp.validation::dust-threshold
-                             (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
+        (let ((tx (bl.mp:mempool-entry-transaction entry)))
+          (loop for out across (bl.ser:transaction-outputs tx)
+                do (when (< (bl.ser:tx-out-value out)
+                            (bl.val::dust-threshold
+                             (bl.ser:tx-out-script-pubkey out)))
                      (error 'rpc-error :code +rpc-invalid-parameter+
                                        :message "Priority is not supported for transactions with dust outputs.")))))
-      (bitcoin-lisp.mempool:mempool-prioritise mempool txid fee-delta)
+      (bl.mp:mempool-prioritise mempool txid fee-delta)
       t))))
 
 (defun rpc-getprioritisedtransactions (node params)
@@ -3171,15 +3171,15 @@ tx is currently in the mempool."
     (with-node-lock (node)
       (maphash
        (lambda (txid delta)
-         (let ((entry (bitcoin-lisp.mempool:mempool-get mempool txid)))
+         (let ((entry (bl.mp:mempool-get mempool txid)))
            (push
             (cons (hash-to-hex txid)
                   `(("fee_delta" . ,delta)
                     ("in_mempool" . ,(json-bool entry))
                     ,@(when entry
-                        `(("modified_fee" . ,(bitcoin-lisp.mempool:mempool-entry-modified-fee entry))))))
+                        `(("modified_fee" . ,(bl.mp:mempool-entry-modified-fee entry))))))
             result)))
-       (bitcoin-lisp.mempool:mempool-deltas mempool)))
+       (bl.mp:mempool-deltas mempool)))
     (or result (make-hash-table :test 'equal))))
 
 ;;; --- UTXO set scanning (Bitcoin Core scantxoutset) ---
@@ -3242,8 +3242,8 @@ mirroring Core."
               (let ((needles (%needle-scripts scanobjects (rpc-get-network node))))
                 (let* ((chain-state (rpc-get-chain-state node))
                        (utxo-set (rpc-get-utxo-set node))
-                       (tip-height (bitcoin-lisp.storage:current-height chain-state))
-                       (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+                       (tip-height (bl.store:current-height chain-state))
+                       (best-hash (bl.store:best-block-hash chain-state))
                        (count 0) (total-amount 0) (unspents '())
                        (height-hashes nil)
                        (aborted nil))
@@ -3254,17 +3254,17 @@ mirroring Core."
                            (unless height-hashes
                              (setf height-hashes (make-hash-table))
                              (loop with e = (and best-hash
-                                                 (bitcoin-lisp.storage:get-block-index-entry
+                                                 (bl.store:get-block-index-entry
                                                   chain-state best-hash))
                                    while e
-                                   do (setf (gethash (bitcoin-lisp.storage:block-index-entry-height e)
+                                   do (setf (gethash (bl.store:block-index-entry-height e)
                                                      height-hashes)
                                             (hash-to-hex
-                                             (bitcoin-lisp.storage:block-index-entry-hash e)))
-                                      (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e))))
+                                             (bl.store:block-index-entry-hash e)))
+                                      (setf e (bl.store:block-index-entry-prev-entry e))))
                            (gethash height height-hashes)))
                   (block scan
-                    (bitcoin-lisp.storage:utxo-set-iterate
+                    (bl.store:utxo-set-iterate
                      utxo-set
                      (lambda (txid vout entry)
                        (when *txoutset-scan-abort*
@@ -3278,21 +3278,21 @@ mirroring Core."
                              (floor (* 100 (+ (* 256 (aref txid 0)) (aref txid 1)))
                                     65536))
                        (let ((desc (gethash
-                                    (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)
+                                    (bl.store:utxo-entry-script-pubkey entry)
                                     needles)))
                          (when desc
-                           (let ((height (bitcoin-lisp.storage:utxo-entry-height entry))
-                                 (value (bitcoin-lisp.storage:utxo-entry-value entry)))
+                           (let ((height (bl.store:utxo-entry-height entry))
+                                 (value (bl.store:utxo-entry-value entry)))
                              (incf total-amount value)
                              (push
                               `(("txid" . ,(hash-to-hex txid))
                                 ("vout" . ,vout)
                                 ("scriptPubKey"
-                                 . ,(bitcoin-lisp.crypto:bytes-to-hex
-                                     (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
+                                 . ,(bl.crypto:bytes-to-hex
+                                     (bl.store:utxo-entry-script-pubkey entry)))
                                 ("desc" . ,desc)
                                 ("amount" . ,(/ value 100000000.0d0))
-                                ("coinbase" . ,(json-bool (bitcoin-lisp.storage:utxo-entry-coinbase entry)))
+                                ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))
                                 ("height" . ,height)
                                 ,@(let ((hex (blockhash-at height)))
                                     (when hex `(("blockhash" . ,hex))))
@@ -3316,20 +3316,20 @@ mirroring Core."
   "Per-block tx count for ENTRY, lazily backfilled by reading the block from
 BLOCK-STORE when the index predates the v2 tx-count field. Returns NIL when
 unknown (header-only entry whose block isn't readable, e.g. pruned)."
-  (let ((n (bitcoin-lisp.storage:block-index-entry-tx-count entry)))
+  (let ((n (bl.store:block-index-entry-tx-count entry)))
     (cond ((plusp n) n)
           ;; Genesis is never in the block store; it carries exactly its
           ;; coinbase (a v1-loaded index leaves its entry at 0).
-          ((zerop (bitcoin-lisp.storage:block-index-entry-height entry))
-           (setf (bitcoin-lisp.storage:block-index-entry-tx-count entry) 1))
+          ((zerop (bl.store:block-index-entry-height entry))
+           (setf (bl.store:block-index-entry-tx-count entry) 1))
           (t
            (let ((block (and block-store
-                             (bitcoin-lisp.storage:get-block
+                             (bl.store:get-block
                               block-store
-                              (bitcoin-lisp.storage:block-index-entry-hash entry)))))
+                              (bl.store:block-index-entry-hash entry)))))
              (when block
-               (setf (bitcoin-lisp.storage:block-index-entry-tx-count entry)
-                     (length (bitcoin-lisp.serialization:bitcoin-block-transactions
+               (setf (bl.store:block-index-entry-tx-count entry)
+                     (length (bl.ser:bitcoin-block-transactions
                               block)))))))))
 
 (defun rpc-getchaintxstats (node params)
@@ -3341,20 +3341,20 @@ omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
   (let* ((chain-state (rpc-get-chain-state node))
          (block-store (rpc-get-block-store node))
          (final (if (stringp (second params))
-                    (let ((e (bitcoin-lisp.storage:get-block-index-entry
+                    (let ((e (bl.store:get-block-index-entry
                               chain-state (parse-hex-hash (second params)))))
                       (unless e
                         (error 'rpc-error :code +rpc-invalid-address-or-key+
                                           :message "Block not found"))
-                      (unless (bitcoin-lisp.storage:entry-on-active-chain-p chain-state e)
+                      (unless (bl.store:entry-on-active-chain-p chain-state e)
                         (error 'rpc-error :code +rpc-invalid-parameter+
                                           :message "Block is not in main chain"))
                       e)
-                    (bitcoin-lisp.storage:get-block-index-entry
-                     chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))))
+                    (bl.store:get-block-index-entry
+                     chain-state (bl.store:best-block-hash chain-state)))))
     (unless final
       (error 'rpc-error :code +rpc-misc-error+ :message "Chain has no tip"))
-    (let* ((final-height (bitcoin-lisp.storage:block-index-entry-height final))
+    (let* ((final-height (bl.store:block-index-entry-height final))
            (blockcount
              (if (integerp (first params))
                  (let ((bc (first params)))
@@ -3378,21 +3378,21 @@ omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
                               (when (< i blockcount) (setf window-known nil)))))
                  (incf i)
                  (when (= i blockcount)
-                   (setf past (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
-                 (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+                   (setf past (bl.store:block-index-entry-prev-entry entry)))
+                 (setf entry (bl.store:block-index-entry-prev-entry entry)))
         (let ((result
-                `(("time" . ,(bitcoin-lisp.serialization:block-header-timestamp
-                              (bitcoin-lisp.storage:block-index-entry-header final)))
+                `(("time" . ,(bl.ser:block-header-timestamp
+                              (bl.store:block-index-entry-header final)))
                   ,@(when txcount-known `(("txcount" . ,txcount)))
                   ("window_final_block_hash"
-                   . ,(hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash final)))
+                   . ,(hash-to-hex (bl.store:block-index-entry-hash final)))
                   ("window_final_block_height" . ,final-height)
                   ("window_block_count" . ,blockcount))))
           (when (and (plusp blockcount) past)
-            (let ((interval (- (or (bitcoin-lisp.validation:compute-median-time-past-from-entry
+            (let ((interval (- (or (bl.val:compute-median-time-past-from-entry
                                     final)
                                    0)
-                               (or (bitcoin-lisp.validation:compute-median-time-past-from-entry
+                               (or (bl.val:compute-median-time-past-from-entry
                                     past)
                                    0))))
               (setf result (append result `(("window_interval" . ,interval))))
@@ -3411,24 +3411,24 @@ omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
 getdifficulty)."
   (declare (ignore params))
   (let* ((chain-state (rpc-get-chain-state node))
-         (tip (bitcoin-lisp.storage:get-block-index-entry
-               chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
-         (bits (if (and tip (bitcoin-lisp.storage:block-index-entry-header tip))
-                   (bitcoin-lisp.serialization:block-header-bits
-                    (bitcoin-lisp.storage:block-index-entry-header tip))
+         (tip (bl.store:get-block-index-entry
+               chain-state (bl.store:best-block-hash chain-state)))
+         (bits (if (and tip (bl.store:block-index-entry-header tip))
+                   (bl.ser:block-header-bits
+                    (bl.store:block-index-entry-header tip))
                    #x1d00ffff)))
     (%difficulty-from-bits bits)))
 
 (defun rpc-uptime (node params)
   "Seconds the node has been running (Bitcoin Core uptime)."
   (declare (ignore node params))
-  (if bitcoin-lisp::*node-start-time*
+  (if bl::*node-start-time*
       ;; Real clock on BOTH sides. Core's uptime is SteadyClock::now() minus a
       ;; steady startup stamp (common/system.cpp:134), so setmocktime does not
       ;; move it; reading the mockable clock here would make uptime jump — or
       ;; clamp to 0 — the moment a test set the clock backwards.
-      (max 0 (- (bitcoin-lisp.serialization:get-real-unix-time)
-                bitcoin-lisp::*node-start-time*))
+      (max 0 (- (bl.ser:get-real-unix-time)
+                bl::*node-start-time*))
       0))
 
 (defun rpc-stop (node params)
@@ -3444,7 +3444,7 @@ this response flush before the RPC server goes away."
   (bt:make-thread (lambda ()
                     (sleep 0.3)
                     (ignore-errors
-                     (bitcoin-lisp::request-node-shutdown "RPC stop")))
+                     (bl::request-node-shutdown "RPC stop")))
                   :name "rpc-stop")
   "Bitcoin-lisp server stopping")
 
@@ -3453,21 +3453,21 @@ this response flush before the RPC server goes away."
 chain-work and time spanned (Bitcoin Core getnetworkhashps)."
   (let* ((nblocks (let ((n (first params))) (if (and (integerp n) (> n 0)) n 120)))
          (chain-state (rpc-get-chain-state node))
-         (height (bitcoin-lisp.storage:current-height chain-state))
-         (tip (bitcoin-lisp.storage:get-block-index-entry
-               chain-state (bitcoin-lisp.storage:best-block-hash chain-state))))
+         (height (bl.store:current-height chain-state))
+         (tip (bl.store:get-block-index-entry
+               chain-state (bl.store:best-block-hash chain-state))))
     (if (or (null tip) (<= height 0))
         0
         (let* ((window (min nblocks height))
-               (start (bitcoin-lisp.storage:get-block-at-height chain-state (- height window))))
+               (start (bl.store:get-block-at-height chain-state (- height window))))
           (if (null start)
               0
-              (let ((dwork (- (bitcoin-lisp.storage:block-index-entry-chain-work tip)
-                              (bitcoin-lisp.storage:block-index-entry-chain-work start)))
-                    (dtime (- (bitcoin-lisp.serialization:block-header-timestamp
-                               (bitcoin-lisp.storage:block-index-entry-header tip))
-                              (bitcoin-lisp.serialization:block-header-timestamp
-                               (bitcoin-lisp.storage:block-index-entry-header start)))))
+              (let ((dwork (- (bl.store:block-index-entry-chain-work tip)
+                              (bl.store:block-index-entry-chain-work start)))
+                    (dtime (- (bl.ser:block-header-timestamp
+                               (bl.store:block-index-entry-header tip))
+                              (bl.ser:block-header-timestamp
+                               (bl.store:block-index-entry-header start)))))
                 (if (<= dtime 0) 0 (round dwork dtime))))))))
 
 ;;; --- Test-harness control methods (Core rpc/node.cpp) ---
@@ -3484,7 +3484,7 @@ rpc/node.cpp:38-80). Regtest only, and 0 restores the system clock.
 This is what lets the functional test framework drive time forward instead of
 sleeping; almost every non-clean test depends on it."
   (declare (ignore node))
-  (unless (eq bitcoin-lisp:*network* :regtest)
+  (unless (eq bl:*network* :regtest)
     ;; Core raises a plain std::runtime_error here, which JSONRPCError maps to
     ;; RPC_MISC_ERROR with this exact text (rpc/node.cpp:52-54).
     (error 'rpc-error :code +rpc-misc-error+
@@ -3499,7 +3499,7 @@ sleeping; almost every non-clean test depends on it."
                                          +max-mock-time+ timestamp)))
     ;; Core's SetMockTime(0) means "stop mocking" — GetTime falls back to the
     ;; system clock when g_mock_time is zero — so 0 is NIL here, not epoch.
-    (setf bitcoin-lisp.serialization:*mock-time*
+    (setf bl.ser:*mock-time*
           (if (zerop timestamp) nil timestamp))
     :null))
 
@@ -3542,15 +3542,15 @@ whether it is currently enabled. Errors on an unknown category."
     (when (and exclude (not (listp exclude)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "exclude must be an array"))
     (dolist (cat include)
-      (unless (and (stringp cat) (bitcoin-lisp::enable-log-category cat))
+      (unless (and (stringp cat) (bl::enable-log-category cat))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message (format nil "unknown logging category ~A" cat))))
     (dolist (cat exclude)
-      (unless (and (stringp cat) (bitcoin-lisp::disable-log-category cat))
+      (unless (and (stringp cat) (bl::disable-log-category cat))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message (format nil "unknown logging category ~A" cat))))
-    (mapcar (lambda (c) (cons c (json-bool (bitcoin-lisp:log-category-enabled-p c))))
-            bitcoin-lisp::+log-categories+)))
+    (mapcar (lambda (c) (cons c (json-bool (bl:log-category-enabled-p c))))
+            bl::+log-categories+)))
 
 (defun rpc-mockscheduler (node params)
   "Advance the scheduler by DELTA_TIME seconds (Core mockscheduler,
@@ -3561,7 +3561,7 @@ thread, so advancing the mock clock IS advancing the scheduler — which is what
 the tests using this actually depend on (mempool_unbroadcast.py forwards past
 the unbroadcast re-announce interval and then asserts the re-announce happened)."
   (declare (ignore node))
-  (unless (eq bitcoin-lisp:*network* :regtest)
+  (unless (eq bl:*network* :regtest)
     (error 'rpc-error :code +rpc-misc-error+
                       :message "mockscheduler is for regression testing (-regtest mode) only"))
   (let ((delta (first params)))
@@ -3575,8 +3575,8 @@ the unbroadcast re-announce interval and then asserts the re-announce happened).
     ;; NB the base is GET-UNIX-TIME, not *MOCK-TIME*: Core forwards from "now"
     ;; whether or not the clock is already mocked, and a test that calls
     ;; mockscheduler without a prior setmocktime relies on that.
-    (setf bitcoin-lisp.serialization:*mock-time*
-          (+ (bitcoin-lisp.serialization:get-unix-time) delta))
+    (setf bl.ser:*mock-time*
+          (+ (bl.ser:get-unix-time) delta))
     :null))
 
 (defun rpc-echo (node params)
@@ -3610,8 +3610,8 @@ shutdown, so a node reporting none hangs that test forever."
      . ,(json-array
          (mapcar (lambda (c) `(("method" . ,(car c)) ("duration" . ,(cdr c))))
                  (active-rpc-commands))))
-    ("logpath" . ,(or (and bitcoin-lisp::*log-file-path*
-                           (namestring bitcoin-lisp::*log-file-path*))
+    ("logpath" . ,(or (and bl::*log-file-path*
+                           (namestring bl::*log-file-path*))
                       ""))))
 
 (defun %raw-fee-bucket-json (bucket)
@@ -3640,7 +3640,7 @@ answer\" mean different things to whoever is reading this."
     (unless (integerp conf-target)
       (error 'rpc-error :code +rpc-type-error+
                         :message "Expected type number for conf_target"))
-    (let ((max-target (or (bitcoin-lisp.mempool:highest-target-tracked) 1008)))
+    (let ((max-target (or (bl.mp:highest-target-tracked) 1008)))
       (unless (<= 1 conf-target max-target)
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message (format nil "Invalid conf_target, must be between 1 and ~D"
@@ -3653,10 +3653,10 @@ answer\" mean different things to whoever is reading this."
         (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid threshold"))
       (let ((result '()))
         (dolist (horizon '((:short . "short") (:medium . "medium") (:long . "long")))
-          (let ((max-confirms (bitcoin-lisp.mempool:horizon-max-confirms (car horizon))))
+          (let ((max-confirms (bl.mp:horizon-max-confirms (car horizon))))
             (when (and max-confirms (<= conf-target max-confirms))
               (multiple-value-bind (rate buckets)
-                  (bitcoin-lisp.mempool:bpe-estimate-raw-fee
+                  (bl.mp:bpe-estimate-raw-fee
                    conf-target threshold (car horizon))
                 (when rate
                   (push
@@ -3689,24 +3689,24 @@ collision test), and reporting success for that would misinform the test."
     (unless (and (integerp port) (<= 0 port 65535))
       (error 'rpc-error :code +rpc-type-error+ :message "Expected type number for port"))
     (multiple-value-bind (net bytes)
-        (bitcoin-lisp.networking:parse-network-address address)
+        (bl.net:parse-network-address address)
       (unless (and net bytes)
         (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
                           :message "Invalid IP address"))
-      (let ((book (bitcoin-lisp::node-address-book node)))
+      (let ((book (bl::node-address-book node)))
         (unless book
           (error 'rpc-error :code +rpc-misc-error+ :message "Address manager unavailable"))
-        (let* ((pa (bitcoin-lisp.networking:make-peer-address
+        (let* ((pa (bl.net:make-peer-address
                     :net net :ip bytes :port port
                     ;; Core stores NODE_NETWORK|NODE_WITNESS for the address.
                     :services (logior 1 8)
-                    :last-seen (bitcoin-lisp.serialization:get-unix-time)))
-               (added (bitcoin-lisp.networking:address-book-add book pa)))
+                    :last-seen (bl.ser:get-unix-time)))
+               (added (bl.net:address-book-add book pa)))
           (cond
             ((not added) `(("success" . ,(json-bool nil))))
             ((not tried) `(("success" . ,(json-bool t))))
-            ((bitcoin-lisp.networking:address-book-good
-              book bytes port (bitcoin-lisp.serialization:get-unix-time) net)
+            ((bl.net:address-book-good
+              book bytes port (bl.ser:get-unix-time) net)
              `(("success" . ,(json-bool t))))
             (t `(("success" . ,(json-bool nil))
                  ("error" . "failed-adding-to-tried")))))))))
@@ -3735,16 +3735,16 @@ PARAMS: (peer_id msg_type msg). Returns an empty object."
                  (every (lambda (c) (digit-char-p c 16)) msg-hex))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Error parsing input for msg"))
-    (let ((peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-                  (find peer-id (bitcoin-lisp::node-peers node)
-                        :key #'bitcoin-lisp.networking::peer-id))))
+    (let ((peer (bt:with-recursive-lock-held ((bl::node-lock node))
+                  (find peer-id (bl::node-peers node)
+                        :key #'bl.net::peer-id))))
       (unless peer
         (error 'rpc-error :code +rpc-misc-error+
                           :message "Error: Could not send message to peer"))
       (handler-case
-          (bitcoin-lisp.networking:send-message
-           peer (bitcoin-lisp.serialization:serialize-message
-                 msg-type (bitcoin-lisp.crypto:hex-to-bytes msg-hex)))
+          (bl.net:send-message
+           peer (bl.ser:serialize-message
+                 msg-type (bl.crypto:hex-to-bytes msg-hex)))
         (error ()
           (error 'rpc-error :code +rpc-misc-error+
                             :message "Error: Could not send message to peer")))
@@ -3808,11 +3808,11 @@ if it is not an enabled index). Every index is maintained inline as blocks
 connect, so a present index normally tracks the tip; \"synced\" reflects whether
 its best indexed block has reached the current tip."
   (let* ((name (and (consp params) (first params)))
-         (tip (bitcoin-lisp.storage:current-height (rpc-get-chain-state node)))
+         (tip (bl.store:current-height (rpc-get-chain-state node)))
          (tx-index (rpc-get-tx-index node))
          (bfi (rpc-get-blockfilterindex node))
          (csi (rpc-get-coinstatsindex node))
-         (tsi (bitcoin-lisp::node-txospenderindex node))
+         (tsi (bl::node-txospenderindex node))
          (entries '()))
     (flet ((add (key enabled-p height)
              (when (and enabled-p (or (null name) (string= name key)))
@@ -3821,20 +3821,20 @@ its best indexed block has reached the current tip."
                      entries))))
       ;; txindex has no separate best-height accessor; it tracks the tip inline.
       (add "txindex"
-           (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
+           (and tx-index (bl.store:tx-index-enabled tx-index))
            tip)
       (add "basic block filter index"
-           (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi))
-           (if bfi (bitcoin-lisp.storage:blockfilterindex-height bfi) -1))
+           (and bfi (bl.store:blockfilterindex-enabled bfi))
+           (if bfi (bl.store:blockfilterindex-height bfi) -1))
       (add "coinstatsindex"
-           (and csi (bitcoin-lisp.storage:coinstatsindex-enabled csi))
-           (if csi (bitcoin-lisp.storage:coinstatsindex-height csi) -1))
+           (and csi (bl.store:coinstatsindex-enabled csi))
+           (if csi (bl.store:coinstatsindex-height csi) -1))
       ;; Core names it "txospenderindex" (index/txospenderindex.cpp:64, the
       ;; BaseIndex name argument), which is the string getindexinfo's optional
       ;; filter argument matches on.
       (add "txospenderindex"
-           (and tsi (bitcoin-lisp.storage:txospender-index-enabled tsi))
-           (if tsi (bitcoin-lisp.storage:txospenderindex-height tsi) -1)))
+           (and tsi (bl.store:txospender-index-enabled tsi))
+           (if tsi (bl.store:txospenderindex-height tsi) -1)))
     ;; No matching active index -> empty JSON object.
     (if entries (nreverse entries) (make-hash-table :test 'equal))))
 
@@ -3869,7 +3869,7 @@ when a -zmqpub* option asks for it."
                `(("type" . ,type)
                  ("address" . ,address)
                  ("hwm" . ,hwm))))
-           (bitcoin-lisp::zmq-notifications-info))))
+           (bl::zmq-notifications-info))))
 
 (defun rpc-getdeploymentinfo (node params)
   "Report soft-fork deployment status at the tip, or at the block named by an
@@ -3877,7 +3877,7 @@ optional blockhash param (Bitcoin Core getdeploymentinfo, rpc/blockchain.cpp:
 1489-1540). Reports the buried deployments (bip34/bip66/bip65/csv/segwit/
 taproot) using this node's per-network activation heights."
   (let* ((chain-state (rpc-get-chain-state node))
-         (network (bitcoin-lisp::node-network node))
+         (network (bl::node-network node))
          ;; Core takes a hash only (no height form), hence the stringp guard
          ;; in front of the shared hash-or-height parser.
          (entry (let ((hex (first params)))
@@ -3887,11 +3887,11 @@ taproot) using this node's per-network activation heights."
                                         :message "blockhash must be hexadecimal string"))
                     (%parse-hash-or-height-entry chain-state hex "blockhash"))))
          (height (if entry
-                     (bitcoin-lisp.storage:block-index-entry-height entry)
-                     (bitcoin-lisp.storage:current-height chain-state)))
+                     (bl.store:block-index-entry-height entry)
+                     (bl.store:current-height chain-state)))
          (best-hash (if entry
-                        (bitcoin-lisp.storage:block-index-entry-hash entry)
-                        (bitcoin-lisp.storage:best-block-hash chain-state)))
+                        (bl.store:block-index-entry-hash entry)
+                        (bl.store:best-block-hash chain-state)))
          ;; With no blockhash argument Core still has a blockindex — the tip —
          ;; and the BIP9 objects are computed from it. Resolving it here rather
          ;; than leaving ENTRY nil is what keeps the deployments in the answer
@@ -3899,7 +3899,7 @@ taproot) using this node's per-network activation heights."
          ;; used.
          (at-entry (or entry
                        (and best-hash
-                            (bitcoin-lisp.storage:get-block-index-entry
+                            (bl.store:get-block-index-entry
                              chain-state best-hash)))))
     `(("hash" . ,(if best-hash (hash-to-hex best-hash) ""))
       ("height" . ,height)
@@ -3914,14 +3914,14 @@ taproot) using this node's per-network activation heights."
       ;; where Core returns an empty array (GetScriptFlagNames returns an empty
       ;; vector for NONE, interpreter.cpp:2200-2203, pushed into a VARR).
       ("script_flags" . ,(json-array
-                          (bitcoin-lisp.validation:block-script-flags-list
+                          (bl.val:block-script-flags-list
                            best-hash height)))
       ("deployments"
-       . (("bip34" . ,(%buried-deployment (bitcoin-lisp.validation:get-bip34-activation-height network) height))
-          ("bip66" . ,(%buried-deployment (bitcoin-lisp.validation:get-bip66-activation-height network) height))
-          ("bip65" . ,(%buried-deployment (bitcoin-lisp.validation:get-bip65-activation-height network) height))
-          ("csv" . ,(%buried-deployment (bitcoin-lisp.validation:get-csv-activation-height network) height))
-          ("segwit" . ,(%buried-deployment (bitcoin-lisp.validation:get-segwit-activation-height network) height))
+       . (("bip34" . ,(%buried-deployment (bl.val:get-bip34-activation-height network) height))
+          ("bip66" . ,(%buried-deployment (bl.val:get-bip66-activation-height network) height))
+          ("bip65" . ,(%buried-deployment (bl.val:get-bip65-activation-height network) height))
+          ("csv" . ,(%buried-deployment (bl.val:get-csv-activation-height network) height))
+          ("segwit" . ,(%buried-deployment (bl.val:get-segwit-activation-height network) height))
           ;; taproot is a BIP9 deployment in every one of Core's five chain
           ;; parameter sets (kernel/chainparams.cpp:110-115 and the four
           ;; others), so Core reports it with a bip9 object and we reported it
@@ -3936,11 +3936,11 @@ taproot) using this node's per-network activation heights."
 GetStateFor(blockindex->pprev) — the state OF this block — and `status_next' is
 GetStateFor(blockindex), the state of the NEXT one (versionbits.cpp:202-203).
 Reporting one value twice is the easy mistake here."
-  (let* ((prev (and entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
-         (height (if entry (bitcoin-lisp.storage:block-index-entry-height entry) 0))
-         (current (bitcoin-lisp.validation:versionbits-state chain-state prev deployment))
-         (next (bitcoin-lisp.validation:versionbits-state chain-state entry deployment))
-         (since (bitcoin-lisp.validation:versionbits-since-height chain-state prev deployment))
+  (let* ((prev (and entry (bl.store:block-index-entry-prev-entry entry)))
+         (height (if entry (bl.store:block-index-entry-height entry) 0))
+         (current (bl.val:versionbits-state chain-state prev deployment))
+         (next (bl.val:versionbits-state chain-state entry deployment))
+         (since (bl.val:versionbits-since-height chain-state prev deployment))
          ;; Statistics exist only while the window is being counted
          ;; (versionbits.cpp:210-212).
          (counting (member current '(:started :locked-in)))
@@ -3955,17 +3955,17 @@ Reporting one value twice is the easy mistake here."
                              ((eq next :active) (1+ height))))
          (bip9
            `(,@(when counting
-                 `(("bit" . ,(bitcoin-lisp.validation:vb-deployment-bit deployment))))
-             ("start_time" . ,(bitcoin-lisp.validation:vb-deployment-start-time deployment))
-             ("timeout" . ,(bitcoin-lisp.validation:vb-deployment-timeout deployment))
+                 `(("bit" . ,(bl.val:vb-deployment-bit deployment))))
+             ("start_time" . ,(bl.val:vb-deployment-start-time deployment))
+             ("timeout" . ,(bl.val:vb-deployment-timeout deployment))
              ("min_activation_height"
-              . ,(bitcoin-lisp.validation:vb-deployment-min-activation-height deployment))
-             ("status" . ,(bitcoin-lisp.validation:versionbits-state-name current))
+              . ,(bl.val:vb-deployment-min-activation-height deployment))
+             ("status" . ,(bl.val:versionbits-state-name current))
              ("since" . ,since)
-             ("status_next" . ,(bitcoin-lisp.validation:versionbits-state-name next))
+             ("status_next" . ,(bl.val:versionbits-state-name next))
              ,@(when counting
                  (multiple-value-bind (period threshold elapsed count possible)
-                     (bitcoin-lisp.validation:versionbits-statistics chain-state entry deployment)
+                     (bl.val:versionbits-statistics chain-state entry deployment)
                    `(("statistics"
                       . (("period" . ,period)
                          ("elapsed" . ,elapsed)
@@ -3988,21 +3988,21 @@ not reproduced: Core always has one, because genesis is always in its index,
 whereas a node here can be asked before any block exists — and dropping the
 deployments entirely for that node would be a worse answer than reporting them
 in their initial state."
-  (bitcoin-lisp.validation:with-versionbits-cache
-    (let ((bitcoin-lisp:*network* network))
-      (loop for d in (bitcoin-lisp.validation:versionbits-deployments network)
+  (bl.val:with-versionbits-cache
+    (let ((bl:*network* network))
+      (loop for d in (bl.val:versionbits-deployments network)
             ;; NEVER_ACTIVE is Core's DeploymentEnabled = false: the deployment
             ;; exists in the table but is not reported at all.
-            unless (= (bitcoin-lisp.validation:vb-deployment-start-time d)
-                      bitcoin-lisp.validation:+vb-never-active+)
-              collect (cons (bitcoin-lisp.validation:vb-deployment-name d)
+            unless (= (bl.val:vb-deployment-start-time d)
+                      bl.val:+vb-never-active+)
+              collect (cons (bl.val:vb-deployment-name d)
                             (%bip9-deployment chain-state entry d))))))
 
 ;;; --- Mining RPCs ---
 
 (defun %bits-to-target-hex (bits)
   "The 256-bit target for BITS as 64 lowercase hex chars (Core hashTarget.GetHex)."
-  (format nil "~(~64,'0x~)" (bitcoin-lisp.storage:bits-to-target bits)))
+  (format nil "~(~64,'0x~)" (bl.store:bits-to-target bits)))
 
 (defun %bits-hex (bits)
   "Compact BITS as 8 lowercase hex chars."
@@ -4011,8 +4011,8 @@ in their initial state."
 (defun %difficulty-from-bits (bits)
   "Difficulty ratio relative to difficulty-1 (bits 0x1d00ffff), like Core's
 GetDifficulty."
-  (let ((cur (bitcoin-lisp.storage:bits-to-target bits))
-        (one (bitcoin-lisp.storage:bits-to-target #x1d00ffff)))
+  (let ((cur (bl.store:bits-to-target bits))
+        (one (bl.store:bits-to-target #x1d00ffff)))
     (if (zerop cur) 0d0 (/ (float one 1d0) (float cur 1d0)))))
 
 (defun %chain-name (network)
@@ -4028,35 +4028,35 @@ GetDifficulty."
   "The getblocktemplate `transactions` array for TEMPLATE: one object per
 selected tx with data/txid/hash/depends/fee/sigops/weight. `depends` holds the
 1-based indices of the in-template txs each tx spends from."
-  (let ((entries (bitcoin-lisp.mining:block-template-transactions template))
+  (let ((entries (bl.mining:block-template-transactions template))
         (index-of (make-hash-table :test 'equalp)))
     ;; 1-based index of each selected txid (they are in parents-first order).
     (loop for e in entries
           for i from 1
-          do (setf (gethash (bitcoin-lisp.serialization:transaction-hash
-                             (bitcoin-lisp.mempool:mempool-entry-transaction e))
+          do (setf (gethash (bl.ser:transaction-hash
+                             (bl.mp:mempool-entry-transaction e))
                             index-of)
                    i))
     (loop for e in entries
-          for tx = (bitcoin-lisp.mempool:mempool-entry-transaction e)
+          for tx = (bl.mp:mempool-entry-transaction e)
           for depends = (let ((ds '()))
-                          (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
-                            (let ((idx (gethash (bitcoin-lisp.serialization:outpoint-hash
-                                                 (bitcoin-lisp.serialization:tx-in-previous-output in))
+                          (bl.ser:dovector (in (bl.ser:transaction-inputs tx))
+                            (let ((idx (gethash (bl.ser:outpoint-hash
+                                                 (bl.ser:tx-in-previous-output in))
                                                 index-of)))
                               (when idx (pushnew idx ds))))
                           (sort ds #'<))
           ;; Wire encoding (Core EncodeHexTx): a witnessless tx must NOT carry
           ;; marker/flag or the reconstructed block fails Core deserialization
           ;; with "Superfluous witness record".
-          collect `(("data" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                                (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
-                    ("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
-                    ("hash" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
+          collect `(("data" . ,(bl.crypto:bytes-to-hex
+                                (bl.ser:transaction-wire-bytes tx)))
+                    ("txid" . ,(hash-to-hex (bl.ser:transaction-hash tx)))
+                    ("hash" . ,(hash-to-hex (bl.ser:transaction-wtxid tx)))
                     ("depends" . ,depends)
-                    ("fee" . ,(bitcoin-lisp.mempool:mempool-entry-fee e))
-                    ("sigops" . ,(bitcoin-lisp.mempool:mempool-entry-sigops e))
-                    ("weight" . ,(bitcoin-lisp.serialization:transaction-weight tx))))))
+                    ("fee" . ,(bl.mp:mempool-entry-fee e))
+                    ("sigops" . ,(bl.mp:mempool-entry-sigops e))
+                    ("weight" . ,(bl.ser:transaction-weight tx))))))
 
 (defun %gbt-rules (network height)
   "Active versionbits soft-fork rule names for a block at HEIGHT on NETWORK, as
@@ -4075,7 +4075,7 @@ template cache is keyed on the node."
     ;; Core pushes "csv" UNCONDITIONALLY (rpc/mining.cpp:949), not gated on its
     ;; activation height.
     (push "csv" rules)
-    (when (>= height (bitcoin-lisp.validation:get-segwit-activation-height net))
+    (when (>= height (bl.val:get-segwit-activation-height net))
       (push "!segwit" rules))
     ;; "!signet" tells the miner it must understand signet rules to mine this
     ;; template at all (rpc/mining.cpp:951-955). Without it a signet miner has
@@ -4085,7 +4085,7 @@ template cache is keyed on the node."
     ;; taproot carries NO "!" prefix: its VersionBitsDeploymentInfo sets
     ;; gbt_optional_rule = true (deploymentinfo.cpp:17-18), and gbt_rule_value
     ;; only prefixes the mandatory ones (rpc/mining.cpp:605-611).
-    (when (>= height (bitcoin-lisp.validation:get-taproot-activation-height net))
+    (when (>= height (bl.val:get-taproot-activation-height net))
       (push "taproot" rules))
     (nreverse rules)))
 
@@ -4137,7 +4137,7 @@ AFTER the proposal branch has already returned (rpc/mining.cpp:729-758) — a
 proposal is a validation request, not a request for work."
   (let ((rules (%gbt-client-rules params)))
     (flet ((declared-p (name) (and (member name rules :test #'string=) t)))
-      (when (and (eq (bitcoin-lisp::node-network node) :signet)
+      (when (and (eq (bl::node-network node) :signet)
                  (not (declared-p "signet")))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message "getblocktemplate must be called with the signet rule set (call with {\"rules\": [\"segwit\", \"signet\"]})"))
@@ -4160,33 +4160,33 @@ point of the mode (check_pow=false, :750)."
     (error 'rpc-error :code +rpc-type-error+
                       :message "Missing data String key for proposal"))
   (let ((block (handler-case
-                   (let ((bytes (bitcoin-lisp.crypto:hex-to-bytes data)))
+                   (let ((bytes (bl.crypto:hex-to-bytes data)))
                      (flexi-streams:with-input-from-sequence (s bytes)
-                       (bitcoin-lisp.serialization:read-bitcoin-block s)))
+                       (bl.ser:read-bitcoin-block s)))
                  (error ()
                    (error 'rpc-error :code +rpc-deserialization-error+
                                      :message "Block decode failed")))))
     (with-node-lock (node)
       (let* ((chain-state (rpc-get-chain-state node))
-             (hash (bitcoin-lisp.serialization:block-header-hash
-                    (bitcoin-lisp.serialization:bitcoin-block-header block)))
-             (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+             (hash (bl.ser:block-header-hash
+                    (bl.ser:bitcoin-block-header block)))
+             (entry (bl.store:get-block-index-entry chain-state hash)))
         (when entry
           (return-from %gbt-proposal
-            (case (bitcoin-lisp.storage:block-index-entry-status entry)
+            (case (bl.store:block-index-entry-status entry)
               (:valid "duplicate")
               (:invalid "duplicate-invalid")
               (t "duplicate-inconclusive"))))
         ;; Core requires a proposal to build on the CURRENT tip; TestBlockValidity
         ;; asserts it, so check first and answer BIP22's reason rather than
         ;; signalling out of the RPC.
-        (unless (equalp (bitcoin-lisp.serialization:block-header-prev-block
-                         (bitcoin-lisp.serialization:bitcoin-block-header block))
-                        (bitcoin-lisp.storage:best-block-hash chain-state))
+        (unless (equalp (bl.ser:block-header-prev-block
+                         (bl.ser:bitcoin-block-header block))
+                        (bl.store:best-block-hash chain-state))
           (return-from %gbt-proposal "inconclusive-not-best-prevblk"))
         (multiple-value-bind (ok reason)
             (handler-case
-                (bitcoin-lisp.validation:test-block-validity
+                (bl.val:test-block-validity
                  block chain-state (rpc-get-utxo-set node))
               (error () (values nil :rejected)))
           (if ok
@@ -4257,9 +4257,9 @@ Holds NO lock while waiting — Core takes a REVERSE_LOCK around the same loop �
 and gives up after Core's first interval plus a few of its later ones, so a
 miner polling a node that never changes still gets an answer rather than a
 socket timeout."
-  (let* ((tip-hex (hash-to-hex (bitcoin-lisp.storage:best-block-hash
+  (let* ((tip-hex (hash-to-hex (bl.store:best-block-hash
                                 (rpc-get-chain-state node))))
-         (updated (bitcoin-lisp.mempool:mempool-transactions-updated
+         (updated (bl.mp:mempool-transactions-updated
                    (rpc-get-mempool node))))
     (multiple-value-bind (watched-tip watched-updated)
         (%gbt-parse-longpoll-id id tip-hex updated)
@@ -4267,15 +4267,15 @@ socket timeout."
                          +gbt-longpoll-first-wait-seconds+
                          (* 3 +gbt-longpoll-later-wait-seconds+))))
         (loop
-          (let ((now-tip (hash-to-hex (bitcoin-lisp.storage:best-block-hash
+          (let ((now-tip (hash-to-hex (bl.store:best-block-hash
                                        (rpc-get-chain-state node))))
-                (now-updated (bitcoin-lisp.mempool:mempool-transactions-updated
+                (now-updated (bl.mp:mempool-transactions-updated
                               (rpc-get-mempool node))))
             (when (or (not (string= now-tip watched-tip))
                       (/= now-updated watched-updated))
               (return)))
           ;; A node on its way down answers rather than holding the socket.
-          (unless (bitcoin-lisp::node-running node)
+          (unless (bl::node-running node)
             (error 'rpc-error :code +rpc-client-not-connected+
                               :message "Shutting down"))
           (when (>= (get-universal-time) deadline)
@@ -4310,7 +4310,7 @@ miner."
   ;; holding a request open for a node that cannot mine anyway is exactly what
   ;; Core avoids by checking first. This file previously did the reverse and
   ;; said it was Core's order.
-  (when (eq (bitcoin-lisp::node-network node) :mainnet)
+  (when (eq (bl::node-network node) :mainnet)
     (when (zerop (length (rpc-get-peers node)))
       (error 'rpc-error :code +rpc-client-not-connected+
                         :message "Bitcoin is not connected!"))
@@ -4326,8 +4326,8 @@ miner."
   (%gbt-check-client-rules node params)
   (let* ((chain-state (rpc-get-chain-state node))
          (mempool (rpc-get-mempool node))
-         (tip-hex (hash-to-hex (bitcoin-lisp.storage:best-block-hash chain-state)))
-         (txs-updated (bitcoin-lisp.mempool:mempool-transactions-updated mempool))
+         (tip-hex (hash-to-hex (bl.store:best-block-hash chain-state)))
+         (txs-updated (bl.mp:mempool-transactions-updated mempool))
          (cached (%gbt-cached-result node tip-hex txs-updated)))
     (when cached (return-from rpc-getblocktemplate cached))
     (%gbt-build-and-cache node chain-state mempool tip-hex txs-updated)))
@@ -4348,7 +4348,7 @@ getblocktemplate call reassemble a block."
           (when (and (eq cached-node node)
                      (string= cached-tip tip-hex)
                      (or (= cached-updated txs-updated)
-                         (<= (- (bitcoin-lisp.serialization:get-unix-time) built-at)
+                         (<= (- (bl.ser:get-unix-time) built-at)
                              +gbt-cache-seconds+)))
             result))))))
 
@@ -4357,7 +4357,7 @@ getblocktemplate call reassemble a block."
   (let ((result (%gbt-assemble node chain-state mempool tip-hex txs-updated)))
     (bt:with-lock-held (*gbt-cache-lock*)
       (setf *gbt-cache* (list* node tip-hex txs-updated
-                               (bitcoin-lisp.serialization:get-unix-time)
+                               (bl.ser:get-unix-time)
                                result)))
     result))
 
@@ -4372,48 +4372,48 @@ cache above wraps exactly the expensive part and nothing else."
          ;; (Core CreateNewBlock holds cs_main + pool.cs end-to-end,
          ;; node/miner.cpp:151).
          (template (with-node-lock (node)
-                     (nth-value 1 (bitcoin-lisp.mining:assemble-full-block
+                     (nth-value 1 (bl.mining:assemble-full-block
                                    chain-state mempool
                                    :coinbase-script-pubkey
                                    (make-array 1 :element-type '(unsigned-byte 8)
                                                  :initial-element #x51) ; OP_TRUE
                                    :utxo-set (rpc-get-utxo-set node)))))
-         (bits (bitcoin-lisp.mining:block-template-bits template)))
+         (bits (bl.mining:block-template-bits template)))
     `(("capabilities" . ("proposal"))
-      ("version" . ,(bitcoin-lisp.mining:block-template-version template))
-      ("previousblockhash" . ,(hash-to-hex (bitcoin-lisp.mining:block-template-prev-hash template)))
+      ("version" . ,(bl.mining:block-template-version template))
+      ("previousblockhash" . ,(hash-to-hex (bl.mining:block-template-prev-hash template)))
       ("transactions" . ,(%gbt-transactions template))
       ("coinbaseaux" . ,(make-hash-table :test 'equal))
-      ("coinbasevalue" . ,(bitcoin-lisp.mining:block-template-coinbase-value template))
+      ("coinbasevalue" . ,(bl.mining:block-template-coinbase-value template))
       ("target" . ,(%bits-to-target-hex bits))
-      ("mintime" . ,(bitcoin-lisp.mining:block-template-mintime template))
+      ("mintime" . ,(bl.mining:block-template-mintime template))
       ("mutable" . ("time" "transactions" "prevblock"))
       ("noncerange" . "00000000ffffffff")
-      ("sigoplimit" . ,bitcoin-lisp.validation:+max-block-sigops-cost+)
+      ("sigoplimit" . ,bl.val:+max-block-sigops-cost+)
       ("sizelimit" . 4000000)          ; MAX_BLOCK_SERIALIZED_SIZE
-      ("weightlimit" . ,bitcoin-lisp.validation:+max-block-weight+)
-      ("curtime" . ,(bitcoin-lisp.mining:block-template-curtime template))
+      ("weightlimit" . ,bl.val:+max-block-weight+)
+      ("curtime" . ,(bl.mining:block-template-curtime template))
       ("bits" . ,(%bits-hex bits))
-      ("height" . ,(bitcoin-lisp.mining:block-template-height template))
+      ("height" . ,(bl.mining:block-template-height template))
       ;; Core emits signet_challenge on a signet chain and nowhere else
       ;; (rpc/mining.cpp:1017-1019), as the raw challenge script in hex. A
       ;; signet miner cannot build the block's signet solution without it, so
       ;; omitting it made signet mining against this node impossible; we
       ;; reported the challenge from getmininginfo only, which no miner reads.
-      ,@(when (eq (bitcoin-lisp::node-network node) :signet)
-          (let ((challenge (bitcoin-lisp.validation:signet-challenge-for-network
-                            (bitcoin-lisp::node-network node))))
+      ,@(when (eq (bl::node-network node) :signet)
+          (let ((challenge (bl.val:signet-challenge-for-network
+                            (bl::node-network node))))
             (when challenge
               (list (cons "signet_challenge"
-                          (bitcoin-lisp.crypto:bytes-to-hex challenge))))))
+                          (bl.crypto:bytes-to-hex challenge))))))
       ("default_witness_commitment"
-       . ,(bitcoin-lisp.crypto:bytes-to-hex
-           (bitcoin-lisp.mining:block-template-default-witness-commitment-script template)))
+       . ,(bl.crypto:bytes-to-hex
+           (bl.mining:block-template-default-witness-commitment-script template)))
       ;; Active soft-fork rules + versionbits signaling state. No BIP9
       ;; deployment is currently pending on any of our networks, so
       ;; vbavailable is empty and vbrequired is 0.
-      ("rules" . ,(%gbt-rules (bitcoin-lisp::node-network node)
-                              (bitcoin-lisp.mining:block-template-height template)))
+      ("rules" . ,(%gbt-rules (bl::node-network node)
+                              (bl.mining:block-template-height template)))
       ("vbavailable" . ,(make-hash-table :test 'equal))
       ("vbrequired" . 0)
       ;; longpoll id: <best chain hash><nTransactionsUpdatedLast> (Core
@@ -4421,7 +4421,7 @@ cache above wraps exactly the expensive part and nothing else."
       ;; the height: a miner longpolling on a height-derived id would never be
       ;; woken by mempool churn, which is most of what a new template is for.
       ("longpollid" . ,(format nil "~A~D"
-                               (hash-to-hex (bitcoin-lisp.mining:block-template-prev-hash template))
+                               (hash-to-hex (bl.mining:block-template-prev-hash template))
                                txs-updated)))))
 
 (defun rpc-getmininginfo (node params)
@@ -4430,44 +4430,44 @@ cache above wraps exactly the expensive part and nothing else."
   (with-node-lock (node)                 ; consistent tip + pool count snapshot
    (let* ((chain-state (rpc-get-chain-state node))
          (mempool (rpc-get-mempool node))
-         (height (bitcoin-lisp.storage:current-height chain-state))
-         (tip (bitcoin-lisp.storage:get-block-index-entry
-               chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+         (height (bl.store:current-height chain-state))
+         (tip (bl.store:get-block-index-entry
+               chain-state (bl.store:best-block-hash chain-state)))
          (bits (if tip
-                   (bitcoin-lisp.serialization:block-header-bits
-                    (bitcoin-lisp.storage:block-index-entry-header tip))
+                   (bl.ser:block-header-bits
+                    (bl.store:block-index-entry-header tip))
                    #x1d00ffff))
          ;; Report the last assembled template (Bitcoin Core m_last_block_*),
          ;; rather than re-assembling on every status call.
-         (template bitcoin-lisp.mining:*last-block-template*)
-         (network (bitcoin-lisp::node-network node))
+         (template bl.mining:*last-block-template*)
+         (network (bl::node-network node))
          ;; Core getmininginfo "next" (rpc/mining.cpp:450-458): the block that
          ;; would extend the tip, timed as the assembler times it — UpdateTime's
          ;; max(GetMinimumTime, now) — so its bits match getblocktemplate's.
          (next-bits (if tip
-                        (let* ((mtp (or (bitcoin-lisp.validation:compute-median-time-past-from-entry tip) 0))
-                               (curtime (max (bitcoin-lisp.serialization:get-unix-time)
-                                             (bitcoin-lisp.mining:next-block-mintime tip (1+ height) mtp))))
-                          (bitcoin-lisp.mining:next-block-required-bits chain-state tip curtime))
+                        (let* ((mtp (or (bl.val:compute-median-time-past-from-entry tip) 0))
+                               (curtime (max (bl.ser:get-unix-time)
+                                             (bl.mining:next-block-mintime tip (1+ height) mtp))))
+                          (bl.mining:next-block-required-bits chain-state tip curtime))
                         bits))
-         (challenge (bitcoin-lisp.validation:signet-challenge-for-network network)))
+         (challenge (bl.val:signet-challenge-for-network network)))
       `(("blocks" . ,height)
-        ("currentblockweight" . ,(if template (bitcoin-lisp.mining:block-template-total-weight template) 0))
-        ("currentblocktx" . ,(if template (length (bitcoin-lisp.mining:block-template-transactions template)) 0))
+        ("currentblockweight" . ,(if template (bl.mining:block-template-total-weight template) 0))
+        ("currentblocktx" . ,(if template (length (bl.mining:block-template-transactions template)) 0))
         ("bits" . ,(%bits-hex bits))
         ("difficulty" . ,(%difficulty-from-bits bits))
         ("target" . ,(%bits-to-target-hex bits))
         ("networkhashps" . ,(rpc-getnetworkhashps node nil))
-        ("pooledtx" . ,(if mempool (bitcoin-lisp.mempool:mempool-count mempool) 0))
+        ("pooledtx" . ,(if mempool (bl.mp:mempool-count mempool) 0))
         ;; BTC/kvB, as Core's ValueFromAmount renders blockMinFeeRate.
-        ("blockmintxfee" . ,(/ bitcoin-lisp.mining:*block-min-tx-fee-rate* 100000000.0d0))
+        ("blockmintxfee" . ,(/ bl.mining:*block-min-tx-fee-rate* 100000000.0d0))
         ("chain" . ,(%chain-name network))
         ("next" . (("height" . ,(1+ height))
                    ("bits" . ,(%bits-hex next-bits))
                    ("difficulty" . ,(%difficulty-from-bits next-bits))
                    ("target" . ,(%bits-to-target-hex next-bits))))
         ,@(when challenge
-            `(("signet_challenge" . ,(bitcoin-lisp.crypto:bytes-to-hex challenge))))
+            `(("signet_challenge" . ,(bl.crypto:bytes-to-hex challenge))))
         ("warnings" . #())))))
 
 (defun %activate-submitted-block (node block)
@@ -4491,7 +4491,7 @@ agree on a tip, timed out on a node that was working perfectly in isolation."
   (with-node-lock (node)
     (let* ((chain-state (rpc-get-chain-state node))
            (result (multiple-value-list
-                    (bitcoin-lisp.validation:activate-block
+                    (bl.val:activate-block
                      block
                      chain-state
                      (rpc-get-block-store node)
@@ -4499,20 +4499,20 @@ agree on a tip, timed out on a node that was working perfectly in isolation."
                      :mempool (rpc-get-mempool node)
                      :tx-index (rpc-get-tx-index node)))))
       (when (first result)
-        (let ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-              (peers (bitcoin-lisp::node-peers node)))
+        (let ((header (bl.ser:bitcoin-block-header block))
+              (peers (bl::node-peers node)))
           ;; Only when it is the ACTIVE tip, which is the same condition the
           ;; P2P path applies (protocol.lisp): a stored side block announces
           ;; nothing.
           (when (and peers
-                     (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
-                             (bitcoin-lisp.serialization:block-header-hash header)))
+                     (equalp (bl.store:best-block-hash chain-state)
+                             (bl.ser:block-header-hash header)))
             (handler-case
-                (bitcoin-lisp.networking::relay-block header nil peers)
+                (bl.net::relay-block header nil peers)
               ;; A send failure must not turn an accepted block into a
               ;; submitblock error: the block IS connected either way.
               (error (e)
-                (bitcoin-lisp:log-warn "Announcing submitted block failed: ~A" e))))))
+                (bl:log-warn "Announcing submitted block failed: ~A" e))))))
       (values-list result))))
 
 (defun rpc-submitblock (node params)
@@ -4526,9 +4526,9 @@ stored without becoming the tip, or a BIP22 reject reason string. Routes through
       (error 'rpc-error :code +rpc-deserialization-error+
                         :message "Block decode failed"))
     (let ((block (handler-case
-                     (let ((bytes (bitcoin-lisp.crypto:hex-to-bytes hex)))
+                     (let ((bytes (bl.crypto:hex-to-bytes hex)))
                        (flexi-streams:with-input-from-sequence (s bytes)
-                         (bitcoin-lisp.serialization:read-bitcoin-block s)))
+                         (bl.ser:read-bitcoin-block s)))
                    (error ()
                      (error 'rpc-error :code +rpc-deserialization-error+
                                        :message "Block decode failed"))))
@@ -4538,13 +4538,13 @@ stored without becoming the tip, or a BIP22 reject reason string. Routes through
       ;; ProcessNewBlock under cs_main); the lock is recursive, so the
       ;; nested %activate-submitted-block lock is free.
       (with-node-lock (node)
-       (let* ((hash (bitcoin-lisp.serialization:block-header-hash
-                    (bitcoin-lisp.serialization:bitcoin-block-header block)))
-             (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+       (let* ((hash (bl.ser:block-header-hash
+                    (bl.ser:bitcoin-block-header block)))
+             (entry (bl.store:get-block-index-entry chain-state hash)))
         (when entry
           ;; A known-invalid block short-circuits (Core AcceptBlockHeader,
           ;; validation.cpp:4231-4235 — BLOCK_FAILED_VALID → "duplicate-invalid").
-          (when (eq (bitcoin-lisp.storage:block-index-entry-status entry) :invalid)
+          (when (eq (bl.store:block-index-entry-status entry) :invalid)
             (return-from rpc-submitblock "duplicate-invalid"))
           ;; "duplicate" only when we already HAVE the block data (Core
           ;; AcceptBlock fAlreadyHave = BLOCK_HAVE_DATA, validation.cpp:4351;
@@ -4552,9 +4552,9 @@ stored without becoming the tip, or a BIP22 reject reason string. Routes through
           ;; A header-only index entry (headers-sync / submitheader) must
           ;; proceed to full processing or the mined block is silently lost.
           (let ((store (rpc-get-block-store node)))
-            (when (and store (bitcoin-lisp.storage:block-exists-p store hash))
+            (when (and store (bl.store:block-exists-p store hash))
               (return-from rpc-submitblock "duplicate"))))
-        (bitcoin-lisp.validation:update-uncommitted-block-structures block chain-state)
+        (bl.val:update-uncommitted-block-structures block chain-state)
         (multiple-value-bind (ok reason) (%activate-submitted-block node block)
           (cond
             (ok nil)                        ; accepted → JSON null (BIP22 success)
@@ -4574,9 +4574,9 @@ header); errors if the parent is missing or the header fails validation."
     (unless (and (stringp hex) (plusp (length hex)))
       (error 'rpc-error :code +rpc-deserialization-error+ :message "Block header decode failed"))
     (let ((header (handler-case
-                      (let ((bytes (bitcoin-lisp.crypto:hex-to-bytes hex)))
+                      (let ((bytes (bl.crypto:hex-to-bytes hex)))
                         (flexi-streams:with-input-from-sequence (s bytes)
-                          (bitcoin-lisp.serialization::read-block-header s)))
+                          (bl.ser::read-block-header s)))
                     (error ()
                       (error 'rpc-error :code +rpc-deserialization-error+
                                         :message "Block header decode failed"))))
@@ -4585,23 +4585,23 @@ header); errors if the parent is missing or the header fails validation."
       ;; thread's headers-sync also writes (Core ProcessNewBlockHeaders
       ;; takes cs_main).
       (with-node-lock (node)
-       (let ((hash (bitcoin-lisp.serialization:block-header-hash header))
-            (prev (bitcoin-lisp.serialization:block-header-prev-block header)))
+       (let ((hash (bl.ser:block-header-hash header))
+            (prev (bl.ser:block-header-prev-block header)))
         ;; Already known → success (Core returns null).
-        (when (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
+        (when (bl.store:get-block-index-entry chain-state hash)
           (return-from rpc-submitheader nil))
         ;; Parent must be present first (Core's LookupBlockIndex check).
-        (unless (bitcoin-lisp.storage:get-block-index-entry chain-state prev)
+        (unless (bl.store:get-block-index-entry chain-state prev)
           (error 'rpc-error :code +rpc-verify-error+
                             :message (format nil "Must submit previous header (~A) first"
                                              (hash-to-hex prev))))
         ;; Validate (PoW/MTP/difficulty) then add to the index.
         (multiple-value-bind (valid err)
-            (bitcoin-lisp.networking::validate-header-chain (list header) chain-state)
+            (bl.net::validate-header-chain (list header) chain-state)
           (unless valid
             (error 'rpc-error :code +rpc-verify-error+
                               :message (or err "header validation failed")))
-          (bitcoin-lisp.networking::process-headers valid chain-state))
+          (bl.net::process-headers valid chain-state))
         nil)))))
 
 (defun %generate-to-script-pubkey (node script-pubkey nblocks maxtries)
@@ -4617,18 +4617,18 @@ by generatetoaddress and generatetodescriptor."
       ;; CreateNewBlock and ProcessNewBlock (rpc/mining.cpp GenerateBlocks),
       ;; and a stale-template block simply fails activation below.
       (let ((block (with-node-lock (node)
-                     (bitcoin-lisp.mining:assemble-full-block
+                     (bl.mining:assemble-full-block
                       chain-state mempool :coinbase-script-pubkey script-pubkey
                       ;; TestBlockValidity before mining (Core CreateNewBlock).
                       :utxo-set (rpc-get-utxo-set node)))))
-        (unless (bitcoin-lisp.mining:mine-block block :max-tries maxtries)
+        (unless (bl.mining:mine-block block :max-tries maxtries)
           (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
         (multiple-value-bind (ok reason) (%activate-submitted-block node block)
           (unless ok
             (error 'rpc-error :code +rpc-misc-error+
                               :message (format nil "Mined block rejected: ~A" reason)))
-          (push (hash-to-hex (bitcoin-lisp.serialization:block-header-hash
-                              (bitcoin-lisp.serialization:bitcoin-block-header block)))
+          (push (hash-to-hex (bl.ser:block-header-hash
+                              (bl.ser:bitcoin-block-header block)))
                 hashes))))))
 
 (defun rpc-generatetoaddress (node params)
@@ -4638,13 +4638,13 @@ generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
   (let ((nblocks (first params))
         (address (second params))
         (maxtries (or (third params) 1000000))
-        (network (bitcoin-lisp::node-network node)))
+        (network (bl::node-network node)))
     (unless (and (integerp nblocks) (plusp nblocks))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "nblocks must be a positive integer"))
     (unless (stringp address)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "address must be a string"))
-    (multiple-value-bind (type script-pubkey) (bitcoin-lisp.crypto:decode-address address network)
+    (multiple-value-bind (type script-pubkey) (bl.crypto:decode-address address network)
       (declare (ignore type))
       (unless script-pubkey
         ;; Core: RPC_INVALID_ADDRESS_OR_KEY (-5), rpc/mining.cpp:291.
@@ -4660,7 +4660,7 @@ script. Returns an array of the mined block hashes (hex)."
   (let ((nblocks (first params))
         (descriptor (second params))
         (maxtries (or (third params) 1000000))
-        (network (bitcoin-lisp::node-network node)))
+        (network (bl::node-network node)))
     (unless (and (integerp nblocks) (plusp nblocks))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "num_blocks must be a positive integer"))
@@ -4681,7 +4681,7 @@ Core's getScriptFromDescriptor) or an address. Signals rpc-error if neither."
   (or (handler-case (caar (parse-output-descriptor output network))
         (rpc-error () nil))
       (handler-case
-          (multiple-value-bind (type spk) (bitcoin-lisp.crypto:decode-address output network)
+          (multiple-value-bind (type spk) (bl.crypto:decode-address output network)
             (and type spk))
         (error () nil))
       (error 'rpc-error :code +rpc-invalid-address-or-key+
@@ -4694,14 +4694,14 @@ otherwise S is decoded as a raw transaction (Bitcoin Core generateblock)."
     (error 'rpc-error :code +rpc-deserialization-error+ :message "Transaction must be a hex string"))
   (if (valid-hex-hash-p s)
       (let* ((mempool (rpc-get-mempool node))
-             (entry (and mempool (bitcoin-lisp.mempool:mempool-get
+             (entry (and mempool (bl.mp:mempool-get
                                   mempool (parse-hex-hash s)))))
         (unless entry
           (error 'rpc-error :code +rpc-invalid-address-or-key+
                             :message (format nil "Transaction ~A not in mempool." s)))
-        (bitcoin-lisp.mempool:mempool-entry-transaction entry))
+        (bl.mp:mempool-entry-transaction entry))
       (handler-case
-          (bitcoin-lisp.serialization:parse-tx-payload (bitcoin-lisp.crypto:hex-to-bytes s))
+          (bl.ser:parse-tx-payload (bl.crypto:hex-to-bytes s))
         (error ()
           (error 'rpc-error :code +rpc-deserialization-error+
                             :message (format nil "Transaction decode failed for ~A" s))))))
@@ -4710,12 +4710,12 @@ otherwise S is decoded as a raw transaction (Bitcoin Core generateblock)."
   "BIP141 witness-commitment scriptPubKey over a block whose coinbase wtxid is
 zero and whose remaining transactions are TXS (Core GenerateCoinbaseCommitment)."
   (let* ((zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
-         (wtxids (cons zeros (mapcar #'bitcoin-lisp.serialization:transaction-wtxid txs)))
-         (witness-root (bitcoin-lisp.validation:compute-merkle-root wtxids))
+         (wtxids (cons zeros (mapcar #'bl.ser:transaction-wtxid txs)))
+         (witness-root (bl.val:compute-merkle-root wtxids))
          (combined (make-array 64 :element-type '(unsigned-byte 8) :initial-element 0)))
     (replace combined witness-root)
-    (bitcoin-lisp.mining:build-witness-commitment-script
-     (bitcoin-lisp.crypto:hash256 combined))))
+    (bl.mining:build-witness-commitment-script
+     (bl.crypto:hash256 combined))))
 
 (defun rpc-generateblock (node params)
   "Mine a single block containing exactly the given transactions (Bitcoin Core
@@ -4730,7 +4730,7 @@ and {hash} is returned; otherwise {hash, hex}."
   (let ((output (first params))
         (txs-arg (second params))
         (submit (%positional-bool-or (third params) t))
-        (network (bitcoin-lisp::node-network node)))
+        (network (bl::node-network node)))
     (unless (stringp output)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "output must be a string"))
     (unless (listp txs-arg)
@@ -4749,38 +4749,38 @@ and {hash} is returned; otherwise {hash, hex}."
                       ;; Reuse the assembler only for header fields (height/prev/
                       ;; bits/version/time); its tx selection and coinbase value
                       ;; are ignored.
-                      (template (bitcoin-lisp.mining:assemble-block-template chain-state mempool))
-                      (height (bitcoin-lisp.mining:block-template-height template))
-                      (coinbase (bitcoin-lisp.mining:build-coinbase-transaction
+                      (template (bl.mining:assemble-block-template chain-state mempool))
+                      (height (bl.mining:block-template-height template))
+                      (coinbase (bl.mining:build-coinbase-transaction
                                  height
-                                 (bitcoin-lisp.validation:calculate-block-subsidy height)
+                                 (bl.val:calculate-block-subsidy height)
                                  :script-pubkey script-pubkey
                                  :witness-commitment-script (%witness-commitment-script-for-txs txs)))
                       (all-txs (cons coinbase txs))
-                      (merkle (bitcoin-lisp.validation:compute-merkle-root
-                               (mapcar #'bitcoin-lisp.serialization:transaction-hash all-txs)))
-                      (header (bitcoin-lisp.serialization:make-block-header
-                               :version (bitcoin-lisp.mining:block-template-version template)
-                               :prev-block (bitcoin-lisp.mining:block-template-prev-hash template)
+                      (merkle (bl.val:compute-merkle-root
+                               (mapcar #'bl.ser:transaction-hash all-txs)))
+                      (header (bl.ser:make-block-header
+                               :version (bl.mining:block-template-version template)
+                               :prev-block (bl.mining:block-template-prev-hash template)
                                :merkle-root merkle
-                               :timestamp (bitcoin-lisp.mining:block-template-curtime template)
-                               :bits (bitcoin-lisp.mining:block-template-bits template)
+                               :timestamp (bl.mining:block-template-curtime template)
+                               :bits (bl.mining:block-template-bits template)
                                :nonce 0))
-                      (block (bitcoin-lisp.serialization:make-bitcoin-block
+                      (block (bl.ser:make-bitcoin-block
                               :header header :transactions all-txs)))
                  ;; TestBlockValidity before mining (Core rpc/mining.cpp:389-393): a
                  ;; consensus-invalid tx list errors instead of producing a doomed block.
                  (multiple-value-bind (ok reason)
-                     (bitcoin-lisp.validation:test-block-validity
+                     (bl.val:test-block-validity
                       block chain-state (rpc-get-utxo-set node))
                    (unless ok
                      (error 'rpc-error :code +rpc-verify-error+
                                        :message (format nil "TestBlockValidity failed: ~A" reason))))
                  block))))
-      (unless (bitcoin-lisp.mining:mine-block block)
+      (unless (bl.mining:mine-block block)
         (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
-      (let ((hash-hex (hash-to-hex (bitcoin-lisp.serialization:block-header-hash
-                                    (bitcoin-lisp.serialization:bitcoin-block-header block)))))
+      (let ((hash-hex (hash-to-hex (bl.ser:block-header-hash
+                                    (bl.ser:bitcoin-block-header block)))))
         (if submit
             (multiple-value-bind (ok reason) (%activate-submitted-block node block)
               (unless (or ok (eq reason :weaker-chain))
@@ -4791,8 +4791,8 @@ and {hash} is returned; otherwise {hash, hex}."
                                   :message (format nil "Block not accepted: ~A" reason)))
               `(("hash" . ,hash-hex)))
             `(("hash" . ,hash-hex)
-              ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                         (bitcoin-lisp.serialization:serialize-witness-block block)))))))))
+              ("hex" . ,(bl.crypto:bytes-to-hex
+                         (bl.ser:serialize-witness-block block)))))))))
 
 ;;; --- Extended RPC Methods ---
 
@@ -4812,9 +4812,9 @@ and {hash} is returned; otherwise {hash, hex}."
       (error 'rpc-error :code +rpc-deserialization-error+
                         :message "Invalid transaction hex"))
     (handler-case
-        (let* ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes hex-str))
+        (let* ((tx-bytes (bl.crypto:hex-to-bytes hex-str))
                (tx (flexi-streams:with-input-from-sequence (stream tx-bytes)
-                     (bitcoin-lisp.serialization:read-transaction stream))))
+                     (bl.ser:read-transaction stream))))
           (tx-to-json tx (rpc-get-network node)))
       (error (e)
         (error 'rpc-error :code +rpc-deserialization-error+
@@ -4844,21 +4844,21 @@ Searches mempool first, then blockhash hint, then txindex (if enabled)."
            (txid-bytes (parse-hex-hash txid-str))
            (mempool (rpc-get-mempool node))
            (mempool-entry (when mempool
-                            (bitcoin-lisp.mempool:mempool-get mempool txid-bytes))))
+                            (bl.mp:mempool-get mempool txid-bytes))))
       ;; Check mempool first
       (when mempool-entry
-        (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction mempool-entry)))
+        (let ((tx (bl.mp:mempool-entry-transaction mempool-entry)))
           (return-from rpc-getrawtransaction
             (if verbose
                 (tx-to-json tx (rpc-get-network node))
-                (bitcoin-lisp.crypto:bytes-to-hex
-                 (bitcoin-lisp.serialization:transaction-wire-bytes tx))))))
+                (bl.crypto:bytes-to-hex
+                 (bl.ser:transaction-wire-bytes tx))))))
 
       ;; Try blockhash hint if provided
       (when blockhash-hint
         (let* ((block-hash-bytes (parse-hex-hash blockhash-hint))
                (block-store (rpc-get-block-store node))
-               (block (bitcoin-lisp.storage:get-block block-store block-hash-bytes)))
+               (block (bl.store:get-block block-store block-hash-bytes)))
           (when block
             (let ((found-tx (find-tx-in-block block txid-bytes)))
               (when found-tx
@@ -4866,23 +4866,23 @@ Searches mempool first, then blockhash hint, then txindex (if enabled)."
                   (if verbose
                       ;; With an explicit blockhash, Core adds in_active_chain.
                       (let* ((cs (rpc-get-chain-state node))
-                             (entry (bitcoin-lisp.storage:get-block-index-entry cs block-hash-bytes)))
+                             (entry (bl.store:get-block-index-entry cs block-hash-bytes)))
                         (append (tx-to-json-confirmed found-tx node block-hash-bytes
                                                       :block block :prevouts prevouts)
                                 `(("in_active_chain"
                                    . ,(json-bool
                                        (and entry (%block-on-active-chain-p entry cs)))))))
-                      (bitcoin-lisp.crypto:bytes-to-hex
-                       (bitcoin-lisp.serialization:transaction-wire-bytes found-tx)))))))))
+                      (bl.crypto:bytes-to-hex
+                       (bl.ser:transaction-wire-bytes found-tx)))))))))
 
       ;; Try txindex if enabled
       (let ((tx-index (rpc-get-tx-index node)))
-        (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
-          (let ((location (bitcoin-lisp.storage:txindex-lookup tx-index txid-bytes)))
+        (when (and tx-index (bl.store:tx-index-enabled tx-index))
+          (let ((location (bl.store:txindex-lookup tx-index txid-bytes)))
             (when location
-              (let* ((block-hash (bitcoin-lisp.storage:tx-location-block-hash location))
+              (let* ((block-hash (bl.store:tx-location-block-hash location))
                      (block-store (rpc-get-block-store node))
-                     (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+                     (block (bl.store:get-block block-store block-hash)))
                 (when block
                   (let ((found-tx (find-tx-in-block block txid-bytes)))
                     (when found-tx
@@ -4890,8 +4890,8 @@ Searches mempool first, then blockhash hint, then txindex (if enabled)."
                         (if verbose
                             (tx-to-json-confirmed found-tx node block-hash
                                                   :block block :prevouts prevouts)
-                            (bitcoin-lisp.crypto:bytes-to-hex
-                             (bitcoin-lisp.serialization:transaction-wire-bytes found-tx))))))))))))
+                            (bl.crypto:bytes-to-hex
+                             (bl.ser:transaction-wire-bytes found-tx))))))))))))
 
       ;; Not found. Core selects one of FOUR messages and appends the same
       ;; sentence to every one of them (rawtransaction.cpp:315-329), and its
@@ -4921,16 +4921,16 @@ Searches mempool first, then blockhash hint, then txindex (if enabled)."
                              (blockhash-hint
                               "No such transaction found in the provided block")
                              ((not (and tx-index
-                                        (bitcoin-lisp.storage:tx-index-enabled tx-index)))
+                                        (bl.store:tx-index-enabled tx-index)))
                               "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries")
                              (t "No such mempool or blockchain transaction"))
                            ". Use gettransaction for wallet transactions."))))))
 
 (defun find-tx-in-block (block txid)
   "Find a transaction in a block by txid. Returns the transaction or NIL."
-  (let ((txs (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+  (let ((txs (bl.ser:bitcoin-block-transactions block)))
     (find-if (lambda (tx)
-               (equalp txid (bitcoin-lisp.serialization:transaction-hash tx)))
+               (equalp txid (bl.ser:transaction-hash tx)))
              txs)))
 
 (defun tx-to-json-confirmed (tx node block-hash &key block prevouts)
@@ -4941,7 +4941,7 @@ confirmations/time/blocktime; a known but STALE block (e.g. a txindex entry
 pointing into a reorged-away branch — Core keeps those) gets confirmations 0
 and NO time fields; an unknown block gets blockhash only."
   (let* ((chain-state (rpc-get-chain-state node))
-         (block-entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash))
+         (block-entry (bl.store:get-block-index-entry chain-state block-hash))
          ;; verbosity 2 (Core rawtransaction.cpp:351-370): find THIS
          ;; transaction's coins in the block's undo data. The undo list has one
          ;; entry per NON-coinbase transaction, so the index is one less than
@@ -4953,11 +4953,11 @@ and NO time fields; an unknown block gets blockhash only."
             `(("blockhash" . ,(hash-to-hex block-hash)))
             (cond ((null block-entry) '())
                   ((%block-on-active-chain-p block-entry chain-state)
-                   (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
-                          (block-height (bitcoin-lisp.storage:block-index-entry-height block-entry))
-                          (header (bitcoin-lisp.storage:block-index-entry-header block-entry))
+                   (let* ((current-height (bl.store:current-height chain-state))
+                          (block-height (bl.store:block-index-entry-height block-entry))
+                          (header (bl.store:block-index-entry-header block-entry))
                           (block-time (when header
-                                        (bitcoin-lisp.serialization:block-header-timestamp header))))
+                                        (bl.ser:block-header-timestamp header))))
                      `(("confirmations" . ,(1+ (- current-height block-height)))
                        ("time" . ,block-time)
                        ("blocktime" . ,block-time))))
@@ -4997,7 +4997,7 @@ all of them silently:
     ;; Core bounds conf_target by the estimator's highest tracked target rather
     ;; than a fixed constant (ParseConfirmTarget with
     ;; HighestTargetTracked(LONG_HALFLIFE), rpc/util.cpp:369-377).
-    (let ((max-target (bitcoin-lisp.mempool:highest-target-tracked)))
+    (let ((max-target (bl.mp:highest-target-tracked)))
       (unless (and (integerp conf-target) (>= conf-target 1)
                    (<= conf-target max-target))
         (error 'rpc-error :code +rpc-invalid-parameter+
@@ -5008,12 +5008,12 @@ all of them silently:
       (return-from rpc-estimatesmartfee
         `(("blocks" . ,conf-target)
           ("errors" . #("Insufficient data (node still syncing)")))))
-    (let ((fee-estimator (bitcoin-lisp:node-fee-estimator node))
+    (let ((fee-estimator (bl:node-fee-estimator node))
           (mempool (rpc-get-mempool node)))
       (multiple-value-bind (rate-sat-vb error-msg returned-target)
           (if (and fee-estimator
-                   (bitcoin-lisp.mempool:fee-estimator-ready-p fee-estimator))
-              (bitcoin-lisp.mempool:estimate-fee-rate fee-estimator conf-target
+                   (bl.mp:fee-estimator-ready-p fee-estimator))
+              (bl.mp:estimate-fee-rate fee-estimator conf-target
                                                       :mode mode)
               (values 0 "Insufficient data or no feerate found" conf-target))
         (let ((blocks (or returned-target conf-target)))
@@ -5026,7 +5026,7 @@ all of them silently:
               (let* ((rate-sat-kvb (* rate-sat-vb 1000))
                      (floor-sat-kvb
                        (if mempool
-                           (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)
+                           (bl.mp:mempool-effective-min-fee-rate mempool)
                            0))
                      (clamped (max rate-sat-kvb floor-sat-kvb)))
                 `(("feerate" . ,(/ clamped 100000000.0d0))
@@ -5064,10 +5064,10 @@ Pubkeys are appended in the given order (Core does not sort them)."
   "Parse a hex-encoded 33/65-byte public key for createmultisig, validating it is
 a real point (Bitcoin Core HexToPubKey). Returns the key bytes; signals
 rpc-error otherwise."
-  (let ((bytes (handler-case (bitcoin-lisp.crypto:hex-to-bytes hex)
+  (let ((bytes (handler-case (bl.crypto:hex-to-bytes hex)
                  (error () nil))))
     (unless (and bytes (member (length bytes) '(33 65))
-                 (bitcoin-lisp.crypto:public-key-valid-p bytes))
+                 (bl.crypto:public-key-valid-p bytes))
       (error 'rpc-error :code +rpc-invalid-address-or-key+
                         :message (format nil "Invalid public key: ~A" hex)))
     bytes))
@@ -5122,17 +5122,17 @@ bare multisig script regardless of address type. Uncompressed keys force legacy
           (error 'rpc-error :code +rpc-invalid-parameter+
                             :message (format nil "redeemScript exceeds size limit: ~D > ~D"
                                              (length redeem) +max-script-element-size+)))
-        (let* ((hexkeys (mapcar #'bitcoin-lisp.crypto:bytes-to-hex pubkeys))
+        (let* ((hexkeys (mapcar #'bl.crypto:bytes-to-hex pubkeys))
                (multi (format nil "multi(~D~{,~A~})" nrequired hexkeys))
-               (sha (bitcoin-lisp.crypto:sha256 redeem))
+               (sha (bl.crypto:sha256 redeem))
                (address
                  (ecase otype
-                   (:legacy (bitcoin-lisp.crypto:encode-p2sh-address
-                             (bitcoin-lisp.crypto:hash160 redeem) network))
-                   (:bech32 (bitcoin-lisp.crypto:encode-p2wsh-address sha network))
+                   (:legacy (bl.crypto:encode-p2sh-address
+                             (bl.crypto:hash160 redeem) network))
+                   (:bech32 (bl.crypto:encode-p2wsh-address sha network))
                    (:p2sh-segwit
-                    (bitcoin-lisp.crypto:encode-p2sh-address
-                     (bitcoin-lisp.crypto:hash160
+                    (bl.crypto:encode-p2sh-address
+                     (bl.crypto:hash160
                       (concatenate '(vector (unsigned-byte 8)) #(#x00 #x20) sha))
                      network))))
                (body (ecase otype
@@ -5140,7 +5140,7 @@ bare multisig script regardless of address type. Uncompressed keys force legacy
                        (:bech32 (format nil "wsh(~A)" multi))
                        (:p2sh-segwit (format nil "sh(wsh(~A))" multi))))
                (result `(("address" . ,address)
-                         ("redeemScript" . ,(bitcoin-lisp.crypto:bytes-to-hex redeem))
+                         ("redeemScript" . ,(bl.crypto:bytes-to-hex redeem))
                          ("descriptor" . ,(descriptor-add-checksum body)))))
           ;; Core warns only when an explicitly-chosen type could not be produced.
           (if (and forced-legacy (not (eq requested :legacy)))
@@ -5165,18 +5165,18 @@ error_locations like Core's."
     (unless (and (stringp address) (> (length address) 0))
       (return-from rpc-validateaddress (%validateaddress-invalid)))
     (multiple-value-bind (type script-pubkey wit-ver wit-prog)
-        (bitcoin-lisp.crypto:decode-address address network)
+        (bl.crypto:decode-address address network)
       (if type
           (let ((result `(("isvalid" . t)
                           ("address" . ,address)
-                          ("scriptPubKey" . ,(bitcoin-lisp.crypto:bytes-to-hex script-pubkey))
+                          ("scriptPubKey" . ,(bl.crypto:bytes-to-hex script-pubkey))
                           ("isscript" . ,(json-bool
                                           (member type '(:p2sh :p2wsh :witness-v0-scripthash))))
                           ("iswitness" . ,(json-bool wit-ver)))))
             (when wit-ver
               (setf result (append result
                                    `(("witness_version" . ,wit-ver)
-                                     ("witness_program" . ,(bitcoin-lisp.crypto:bytes-to-hex wit-prog))))))
+                                     ("witness_program" . ,(bl.crypto:bytes-to-hex wit-prog))))))
             result)
           (%validateaddress-invalid)))))
 
@@ -5193,11 +5193,11 @@ error_locations like Core's."
         `(("asm" . "")
           ("type" . "nonstandard"))))
     (handler-case
-        (let ((script (bitcoin-lisp.crypto:hex-to-bytes hex-str)))
+        (let ((script (bl.crypto:hex-to-bytes hex-str)))
           (multiple-value-bind (type data)
-              (bitcoin-lisp.validation:classify-script script)
-            (let ((result `(("asm" . ,(bitcoin-lisp.validation:disassemble-script script))
-                            ("type" . ,(bitcoin-lisp.validation:script-type-to-string type)))))
+              (bl.val:classify-script script)
+            (let ((result `(("asm" . ,(bl.val:disassemble-script script))
+                            ("type" . ,(bl.val:script-type-to-string type)))))
               ;; Add type-specific fields
               (case type
                 (:multisig
@@ -5208,24 +5208,24 @@ error_locations like Core's."
                                         ("addresses"
                                          . ,(mapcar
                                              (lambda (pk)
-                                               (bitcoin-lisp.crypto:encode-p2pkh-address
-                                                (bitcoin-lisp.crypto:hash160 pk) network))
+                                               (bl.crypto:encode-p2pkh-address
+                                                (bl.crypto:hash160 pk) network))
                                              (getf data :pubkeys)))))))
                 ((:pubkeyhash :scripthash)
                  (let* ((hash (getf data :hash))
                         (addr (if (eq type :pubkeyhash)
-                                  (bitcoin-lisp.crypto:encode-p2pkh-address hash network)
-                                  (bitcoin-lisp.crypto:encode-p2sh-address hash network))))
+                                  (bl.crypto:encode-p2pkh-address hash network)
+                                  (bl.crypto:encode-p2sh-address hash network))))
                    (setf result (append result `(("addresses" . (,addr)))))))
                 ((:witness-v0-keyhash :witness-v0-scripthash :witness-v1-taproot)
                  (let* ((prog (getf data :witness-program))
                         (ver (getf data :witness-version))
                         (hrp (if (eq network :testnet3) "tb" "bc"))
-                        (addr (bitcoin-lisp.crypto:segwit-address-encode hrp ver prog)))
+                        (addr (bl.crypto:segwit-address-encode hrp ver prog)))
                    (setf result (append result `(("segwit" . (("address" . ,addr)))))))))
               ;; Add p2sh address (script wrapped in P2SH)
-              (let* ((script-hash (bitcoin-lisp.crypto:hash160 script))
-                     (p2sh-addr (bitcoin-lisp.crypto:encode-p2sh-address script-hash network)))
+              (let* ((script-hash (bl.crypto:hash160 script))
+                     (p2sh-addr (bl.crypto:encode-p2sh-address script-hash network)))
                 (setf result (append result `(("p2sh" . ,p2sh-addr)))))
               result)))
       (error (e)
@@ -5245,11 +5245,11 @@ compact-size(24) || \"Bitcoin Signed Message:\\n\" || compact-size(len) || messa
                              (vector 10)))
          (msg (flexi-streams:string-to-octets message :external-format :utf-8))
          (buf (flexi-streams:with-output-to-sequence (s)
-                (bitcoin-lisp.serialization:write-compact-size s (length magic))
+                (bl.ser:write-compact-size s (length magic))
                 (write-sequence magic s)
-                (bitcoin-lisp.serialization:write-compact-size s (length msg))
+                (bl.ser:write-compact-size s (length msg))
                 (write-sequence msg s))))
-    (bitcoin-lisp.crypto:hash256 buf)))
+    (bl.crypto:hash256 buf)))
 
 (defun rpc-signmessagewithprivkey (node params)
   "Sign MESSAGE with the WIF private key (Bitcoin Core signmessagewithprivkey).
@@ -5260,14 +5260,14 @@ PARAMS: (privkey-wif message). Returns the base64 recoverable signature."
     (unless (and (stringp wif) (stringp message))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "privkey (WIF) and message are required"))
-    (multiple-value-bind (privkey compressed) (bitcoin-lisp.crypto:wif-to-private-key wif)
+    (multiple-value-bind (privkey compressed) (bl.crypto:wif-to-private-key wif)
       (unless privkey
         ;; Core: RPC_INVALID_ADDRESS_OR_KEY (-5), rpc/signmessage.cpp.
         (error 'rpc-error :code +rpc-invalid-address-or-key+
                           :message "Invalid private key"))
       (let ((hash (%bitcoin-message-hash message)))
         (multiple-value-bind (compact recid)
-            (bitcoin-lisp.crypto:sign-recoverable-compact privkey hash)
+            (bl.crypto:sign-recoverable-compact privkey hash)
           (let ((sig65 (concatenate '(vector (unsigned-byte 8))
                                     (vector (+ 27 recid (if compressed 4 0)))
                                     compact)))
@@ -5290,12 +5290,12 @@ not refer to key\", and malformed base64 -5 \"Malformed base64 encoding\"."
     ;; must decode, and must be base58 P2PKH (only key-hash addresses can be
     ;; message-verified). base58check-decode's payload is the 20-byte key-id.
     (multiple-value-bind (ver payload)
-        (handler-case (bitcoin-lisp.crypto:base58check-decode address)
+        (handler-case (bl.crypto:base58check-decode address)
           (error () (values nil nil)))
       (declare (ignore ver))
       (unless (and payload (= (length payload) 20))
         (if (nth-value 0 (ignore-errors
-                          (bitcoin-lisp.crypto:decode-address
+                          (bl.crypto:decode-address
                            address (rpc-get-network node))))
             (error 'rpc-error :code +rpc-type-error+
                               :message "Address does not refer to key")
@@ -5314,11 +5314,11 @@ not refer to key\", and malformed base64 -5 \"Malformed base64 encoding\"."
                              (compressed (>= (- header 27) 4))
                              (compact (subseq sig65 1 65))
                              (hash (%bitcoin-message-hash message))
-                             (pubkey (bitcoin-lisp.crypto:recover-public-key
+                             (pubkey (bl.crypto:recover-public-key
                                       compact recid hash :compressed compressed)))
                         (and pubkey
                              (equalp payload
-                                     (bitcoin-lisp.crypto:hash160 pubkey)))))))))))))
+                                     (bl.crypto:hash160 pubkey)))))))))))))
 
 ;;; --- Message signing (wallet): signmessage ---
 
@@ -5338,11 +5338,11 @@ holds the wallet lock."
                 for priv = (%desc-key-priv-at key pos provider)
                 when (and priv
                           (equalp keyid
-                                  (bitcoin-lisp.crypto:hash160
-                                   (bitcoin-lisp.crypto:derive-public-key
+                                  (bl.crypto:hash160
+                                   (bl.crypto:derive-public-key
                                     priv :compressed (= (length pubkey) 33)))))
                   do (return
-                       (bitcoin-lisp.crypto:private-key-to-wif
+                       (bl.crypto:private-key-to-wif
                         priv :network (wallet-network wallet)
                              :compressed (= (length pubkey) 33)))))))))
 
@@ -5363,7 +5363,7 @@ PRIVATE_KEY_NOT_AVAILABLE)."
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "address and message are required"))
     (multiple-value-bind (type script wit-ver keyid)
-        (bitcoin-lisp.crypto:decode-address address (wallet-network wallet))
+        (bl.crypto:decode-address address (wallet-network wallet))
       (declare (ignore wit-ver))
       ;; DecodeDestination / IsValidDestination.
       (unless type
@@ -5434,7 +5434,7 @@ signer therefore records at most M partial sigs per multisig input."
         (let ((sk (gethash pub pubmap)))
           (when sk
             (push (cons pub (concatenate '(vector (unsigned-byte 8))
-                                         (bitcoin-lisp.crypto:sign-ecdsa sk sighash)
+                                         (bl.crypto:sign-ecdsa sk sighash)
                                          (vector sighash-byte)))
                   pairs)
             (incf count)))))))
@@ -5474,7 +5474,7 @@ REDEEM/WITNESS-SCRIPT are the P2SH/P2WSH sub-scripts to reveal."
 (defun %tap-sig (privkey sighash tap-sighash-type)
   "A BIP341 signature: 64 bytes for SIGHASH_DEFAULT, else 65 with the sighash
 byte appended (Core's CreateSchnorrSig, sign.cpp:340)."
-  (let ((sig64 (bitcoin-lisp.crypto:sign-schnorr privkey sighash)))
+  (let ((sig64 (bl.crypto:sign-schnorr privkey sighash)))
     (if (zerop tap-sighash-type)
         sig64
         (concatenate '(vector (unsigned-byte 8)) sig64 (vector tap-sighash-type)))))
@@ -5502,8 +5502,8 @@ the caller -- the sighash commits to all of them."
                  ;; "no codeseparator executed" -- our tapscript leaves contain
                  ;; none, and a leaf that did would need the position it
                  ;; actually reached at execution time.
-                 (bitcoin-lisp.coalton.interop::*tapscript-codesep-pos* #xFFFFFFFF)
-                 (sighash (bitcoin-lisp.coalton.interop::compute-bip341-sighash
+                 (bl.interop::*tapscript-codesep-pos* #xFFFFFFFF)
+                 (sighash (bl.interop::compute-bip341-sighash
                            amount tap-sighash-type leaf-hash 0)))
             (when sighash
               (let ((satisfaction
@@ -5550,20 +5550,20 @@ must be bound by the caller."
   (let* ((spk (first prev)) (amount (second prev))
          (redeem (third prev)) (witness-script (fourth prev))
          (type (%script-type spk))
-         (bitcoin-lisp.coalton.interop::*current-input-index* i)
-         (bitcoin-lisp.coalton.interop::*precomputed-sighash* precomp))
+         (bl.interop::*current-input-index* i)
+         (bl.interop::*precomputed-sighash* precomp))
     (macrolet ((fail (msg)
                  `(return-from %compute-input-signatures (values nil ,msg))))
       (labels ((legacy-sig (subscript key)
                  (concatenate '(vector (unsigned-byte 8))
-                              (bitcoin-lisp.crypto:sign-ecdsa
-                               key (bitcoin-lisp.coalton.interop::compute-legacy-sighash
+                              (bl.crypto:sign-ecdsa
+                               key (bl.interop::compute-legacy-sighash
                                     tx i subscript sighash-byte))
                               (vector sighash-byte)))
                (bip143-sig (script-code key)
                  (concatenate '(vector (unsigned-byte 8))
-                              (bitcoin-lisp.crypto:sign-ecdsa
-                               key (bitcoin-lisp.coalton.interop::compute-bip143-sighash
+                              (bl.crypto:sign-ecdsa
+                               key (bl.interop::compute-bip143-sighash
                                     script-code amount sighash-byte))
                               (vector sighash-byte)))
                (p2wpkh-scriptcode (pkh)
@@ -5573,7 +5573,7 @@ must be bound by the caller."
                  (multiple-value-bind (m nn pubkeys) (%parse-multisig subscript)
                    (declare (ignore nn))
                    (values (%collect-multisig-sig-pairs
-                            (bitcoin-lisp.coalton.interop::compute-legacy-sighash
+                            (bl.interop::compute-legacy-sighash
                              tx i subscript sighash-byte)
                             pubmap pubkeys m sighash-byte)
                            m)))
@@ -5581,7 +5581,7 @@ must be bound by the caller."
                  (multiple-value-bind (m nn pubkeys) (%parse-multisig witscript)
                    (declare (ignore nn))
                    (values (%collect-multisig-sig-pairs
-                            (bitcoin-lisp.coalton.interop::compute-bip143-sighash
+                            (bl.interop::compute-bip143-sighash
                              witscript amount sighash-byte)
                             pubmap pubkeys m sighash-byte)
                            m)))
@@ -5596,12 +5596,12 @@ must be bound by the caller."
                  ;; second value says a third party could rewrite the witness
                  ;; into another equally valid one, which changes the txid of a
                  ;; transaction already in flight.
-                 (let ((node (bitcoin-lisp.validation::ms-from-script witscript)))
+                 (let ((node (bl.val::ms-from-script witscript)))
                    (when node
                      (multiple-value-bind (stack malleable)
-                         (bitcoin-lisp.validation::ms-satisfy
+                         (bl.val::ms-satisfy
                           node
-                          (bitcoin-lisp.validation::make-ms-satisfier
+                          (bl.val::make-ms-satisfier
                            :sign-fn
                            (lambda (pubkey)
                              (let ((sk (gethash pubkey pubmap)))
@@ -5609,9 +5609,9 @@ must be bound by the caller."
                            ;; No preimage source exists on this path; a hash
                            ;; branch is simply unavailable rather than faked.
                            :check-older-fn
-                           (lambda (v) (bitcoin-lisp.validation::ms-check-older tx i v))
+                           (lambda (v) (bl.val::ms-check-older tx i v))
                            :check-after-fn
-                           (lambda (v) (bitcoin-lisp.validation::ms-check-after tx i v))))
+                           (lambda (v) (bl.val::ms-check-after tx i v))))
                        (and stack (not malleable) stack))))))
         (cond
           ((string= type "pubkeyhash")
@@ -5642,7 +5642,7 @@ must be bound by the caller."
                ;; (sign.cpp:558-608): a key-path spend is both cheaper and
                ;; smaller, and reveals nothing about the tree.
                (sk
-                (let ((sighash (bitcoin-lisp.coalton.interop::compute-bip341-sighash
+                (let ((sighash (bl.interop::compute-bip341-sighash
                                 amount tap-sighash-type nil nil)))
                   ;; No sighash is defined for SIGHASH_SINGLE at an input
                   ;; index with no matching output. Signing the
@@ -5650,7 +5650,7 @@ must be bound by the caller."
                   ;; Core rejects, so fail loudly instead.
                   (unless sighash
                     (fail "P2TR SIGHASH_SINGLE has no output at this input index"))
-                  (let ((sig (%tap-sig (bitcoin-lisp.crypto:taproot-tweak-private-key sk)
+                  (let ((sig (%tap-sig (bl.crypto:taproot-tweak-private-key sk)
                                        sighash tap-sighash-type)))
                     (values (%make-input-sig :kind :p2tr :needed 1 :tap sig)))))
                (t
@@ -5665,7 +5665,7 @@ must be bound by the caller."
           ((string= type "scripthash")   ; P2SH (wrapped)
            (cond
              ((null redeem) (fail "P2SH requires redeemScript"))
-             ((not (equalp (bitcoin-lisp.crypto:hash160 redeem) (subseq spk 2 22)))
+             ((not (equalp (bl.crypto:hash160 redeem) (subseq spk 2 22)))
               (fail "redeemScript hash mismatch"))
              ;; P2SH-P2WPKH (nested segwit single-key)
              ((and (= (length redeem) 22) (= (aref redeem 0) #x00) (= (aref redeem 1) #x14))
@@ -5682,7 +5682,7 @@ must be bound by the caller."
              ((and (= (length redeem) 34) (= (aref redeem 0) #x00) (= (aref redeem 1) #x20))
               (cond
                 ((null witness-script) (fail "P2SH-P2WSH requires witnessScript"))
-                ((not (equalp (bitcoin-lisp.crypto:sha256 witness-script) (subseq redeem 2 34)))
+                ((not (equalp (bl.crypto:sha256 witness-script) (subseq redeem 2 34)))
                  (fail "witnessScript hash mismatch (P2SH-P2WSH)"))
                 ;; Not multisig: Core's fallback is miniscript, not a refusal.
                 ((not (%parse-multisig witness-script))
@@ -5707,7 +5707,7 @@ must be bound by the caller."
           ((string= type "witness_v0_scripthash")   ; native P2WSH
            (cond
              ((null witness-script) (fail "P2WSH requires witnessScript"))
-             ((not (equalp (bitcoin-lisp.crypto:sha256 witness-script) (subseq spk 2 34)))
+             ((not (equalp (bl.crypto:sha256 witness-script) (subseq spk 2 34)))
               (fail "witnessScript hash mismatch"))
              ;; Not multisig: Core's fallback is miniscript, not a refusal.
              ((not (%parse-multisig witness-script))
@@ -5744,7 +5744,7 @@ error here (a missing key already failed in %compute-input-signatures)."
       (ecase (input-sig-kind sig)
         (:p2pkh (let ((s (first (input-sig-ecdsa sig))))
                   (values (concatenate '(vector (unsigned-byte 8))
-                                       (bitcoin-lisp.serialization:script-push-data (cdr s)) (bitcoin-lisp.serialization:script-push-data (car s)))
+                                       (bl.ser:script-push-data (cdr s)) (bl.ser:script-push-data (car s)))
                           nil nil)))
         (:p2wpkh (let ((s (first (input-sig-ecdsa sig))))
                    (values nil (list (cdr s) (car s)) nil)))
@@ -5754,7 +5754,7 @@ error here (a missing key already failed in %compute-input-signatures)."
         ;; the last two, so there is nothing to assemble here.
         (:p2tr-script (values nil (input-sig-stack sig) nil))
         (:p2sh-p2wpkh (let ((s (first (input-sig-ecdsa sig))))
-                        (values (bitcoin-lisp.serialization:script-push-data (input-sig-redeem sig))
+                        (values (bl.ser:script-push-data (input-sig-redeem sig))
                                 (list (cdr s) (car s)) nil)))
         (:p2wsh (let ((err (threshold-error "")))
                   (if err
@@ -5765,7 +5765,7 @@ error here (a missing key already failed in %compute-input-signatures)."
         (:p2sh-p2wsh (let ((err (threshold-error "")))
                        (if err
                            (values nil nil err)
-                           (values (bitcoin-lisp.serialization:script-push-data (input-sig-redeem sig))
+                           (values (bl.ser:script-push-data (input-sig-redeem sig))
                                    (concatenate 'list (list empty) (sigs)
                                                 (list (input-sig-witness-script sig)))
                                    nil))))
@@ -5777,7 +5777,7 @@ error here (a missing key already failed in %compute-input-signatures)."
                              (list (input-sig-witness-script sig)))
                  nil))
         (:p2sh-p2wsh-miniscript
-         (values (bitcoin-lisp.serialization:script-push-data (input-sig-redeem sig))
+         (values (bl.ser:script-push-data (input-sig-redeem sig))
                  (append (input-sig-stack sig)
                          (list (input-sig-witness-script sig)))
                  nil))
@@ -5785,15 +5785,15 @@ error here (a missing key already failed in %compute-input-signatures)."
                      (if err
                          (values nil nil err)
                          (values (apply #'concatenate '(vector (unsigned-byte 8))
-                                        (vector 0) (mapcar #'bitcoin-lisp.serialization:script-push-data (sigs)))
+                                        (vector 0) (mapcar #'bl.ser:script-push-data (sigs)))
                                  nil nil))))
         (:p2sh-multisig (let ((err (threshold-error "P2SH-")))
                           (if err
                               (values nil nil err)
                               (values (apply #'concatenate '(vector (unsigned-byte 8))
                                              (vector 0)
-                                             (append (mapcar #'bitcoin-lisp.serialization:script-push-data (sigs))
-                                                     (list (bitcoin-lisp.serialization:script-push-data (input-sig-redeem sig)))))
+                                             (append (mapcar #'bl.ser:script-push-data (sigs))
+                                                     (list (bl.ser:script-push-data (input-sig-redeem sig)))))
                                       nil nil))))))))
 
 (defun %build-spent-utxos (inputs prevmap)
@@ -5804,14 +5804,14 @@ if any input lacks a prevout-with-amount."
          (vec (make-array n)))
     (dotimes (i n vec)
       (let* ((in (aref inputs i))
-             (op (bitcoin-lisp.serialization:tx-in-previous-output in))
-             (prev (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
-                                  (bitcoin-lisp.serialization:outpoint-index op))
+             (op (bl.ser:tx-in-previous-output in))
+             (prev (gethash (cons (bl.ser:outpoint-hash op)
+                                  (bl.ser:outpoint-index op))
                             prevmap)))
         (unless (and prev (second prev))
           (return-from %build-spent-utxos nil))
         (setf (aref vec i)
-              (bitcoin-lisp.storage:make-utxo-entry
+              (bl.store:make-utxo-entry
                :value (second prev)
                :script-pubkey (coerce (first prev) '(simple-array (unsigned-byte 8) (*)))))))))
 
@@ -5825,9 +5825,9 @@ PREVMAP: (txid . vout) -> (script-pubkey amount-sats redeem witness-script);
 KEYMAP: hash160(pubkey) -> (priv32 . pubkey); PUBMAP: pubkey -> priv32;
 TR-KEYMAP: tweaked taproot output x-only key -> UNtweaked priv32.
 Returns a list of (input-index . error-message), NIL when every input signed."
-  (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+  (let* ((inputs (bl.ser:transaction-inputs tx))
          (n (length inputs))
-         (witness (let ((existing (bitcoin-lisp.serialization:transaction-witness tx)))
+         (witness (let ((existing (bl.ser:transaction-witness tx)))
                     (if (and existing (= (length existing) n))
                         (copy-seq existing)
                         (make-array n :initial-element '()))))
@@ -5840,14 +5840,14 @@ Returns a list of (input-index . error-message), NIL when every input signed."
     ;; inputs' outputs) so the BIP341 amount/scriptPubKey commitments are
     ;; available for taproot inputs.
     (let* ((spent-utxos (%build-spent-utxos inputs prevmap))
-           (bitcoin-lisp.coalton.interop::*current-tx* tx)
-           (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent-utxos)
-           (precomp (bitcoin-lisp.coalton.interop::init-precomputed-sighash tx spent-utxos)))
+           (bl.interop::*current-tx* tx)
+           (bl.interop::*current-spent-utxos* spent-utxos)
+           (precomp (bl.interop::init-precomputed-sighash tx spent-utxos)))
       (dotimes (i n)
         (let* ((in (aref inputs i))
-               (op (bitcoin-lisp.serialization:tx-in-previous-output in))
-               (prev (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
-                                    (bitcoin-lisp.serialization:outpoint-index op))
+               (op (bl.ser:tx-in-previous-output in))
+               (prev (gethash (cons (bl.ser:outpoint-hash op)
+                                    (bl.ser:outpoint-index op))
                               prevmap)))
           ;; Compute the input's signature material then finalize it into
           ;; scriptSig/witness. Taproot signs SIGHASH_DEFAULT (tap-sighash 0),
@@ -5865,12 +5865,12 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                         (ferr (push (cons i ferr) errors))
                         (t (setf (aref signed i) t)
                            (when ss
-                             (setf (bitcoin-lisp.serialization:tx-in-script-sig in) ss))
+                             (setf (bl.ser:tx-in-script-sig in) ss))
                            (when wit
                              (setf (aref witness i) wit)
                              (setf any-witness t))))))))))
-      (when (or any-witness (bitcoin-lisp.serialization:transaction-witness tx))
-        (setf (bitcoin-lisp.serialization:transaction-witness tx) witness))
+      (when (or any-witness (bl.ser:transaction-witness tx))
+        (setf (bl.ser:transaction-witness tx) witness))
       ;; Core's ProduceSignature does not take "no error" for complete: it ENDS
       ;; by running VerifyScript over the scriptSig/witness it just built, with
       ;; a real signature checker, and reports complete only if that passes
@@ -5887,9 +5887,9 @@ Returns a list of (input-index . error-message), NIL when every input signed."
         (dotimes (i n)
           (when (and (aref signed i) (not (assoc i errors)))
             (unless (handler-case
-                        (let ((bitcoin-lisp.coalton.interop:*script-flags*
-                                bitcoin-lisp.validation:+standard-script-verify-flags+))
-                          (bitcoin-lisp.validation:validate-input-script
+                        (let ((bl.interop:*script-flags*
+                                bl.val:+standard-script-verify-flags+))
+                          (bl.val:validate-input-script
                            tx i (aref spent-utxos i)))
                       (error () nil))
               (push (cons i "signing produced a script that does not verify")
@@ -5915,8 +5915,8 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
     (unless (listp wifs)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "privkeys must be an array"))
     (let* ((tx (handler-case
-                   (bitcoin-lisp.serialization:parse-tx-payload
-                    (bitcoin-lisp.crypto:hex-to-bytes hexstring))
+                   (bl.ser:parse-tx-payload
+                    (bl.crypto:hex-to-bytes hexstring))
                  (error () (error 'rpc-error :code +rpc-deserialization-error+
                                              :message "Transaction decode failed"))))
            (keymap (make-hash-table :test 'equalp))   ; hash160(pubkey) -> (privkey . pubkey)
@@ -5925,15 +5925,15 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
            (prevmap (make-hash-table :test 'equalp))) ; (txid . vout) -> (spk amount-sats redeem witness-script)
       ;; Key map: derive each WIF's pubkey (per its compression flag) -> key-id.
       (dolist (wif wifs)
-        (multiple-value-bind (sk compressed) (bitcoin-lisp.crypto:wif-to-private-key wif)
+        (multiple-value-bind (sk compressed) (bl.crypto:wif-to-private-key wif)
           (unless sk
             (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid private key"))
-          (let ((pub (bitcoin-lisp.crypto:derive-public-key sk :compressed compressed)))
-            (setf (gethash (bitcoin-lisp.crypto:hash160 pub) keymap) (cons sk pub))
+          (let ((pub (bl.crypto:derive-public-key sk :compressed compressed)))
+            (setf (gethash (bl.crypto:hash160 pub) keymap) (cons sk pub))
             (setf (gethash pub pubmap) sk))
           ;; Taproot key-path output key (P + H_TapTweak(P)*G) -> privkey.
-          (let ((qx (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey
-                     (bitcoin-lisp.crypto:derive-xonly-pubkey sk))))
+          (let ((qx (bl.interop:compute-tweaked-pubkey
+                     (bl.crypto:derive-xonly-pubkey sk))))
             (when qx (setf (gethash qx tr-keymap) sk)))))
       ;; Prevout map from prevtxs (carries optional redeemScript / witnessScript).
       ;; %OBJ-GET, not ASSOC: each element is a JSON object, which arrives as a
@@ -5953,16 +5953,16 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
               (ws-hex (%obj-get pt "witnessScript")))
           (when (and (stringp txid) (valid-hex-hash-p txid) (integerp vout) (stringp spk-hex))
             (setf (gethash (cons (parse-hex-hash txid) vout) prevmap)
-                  (list (bitcoin-lisp.crypto:hex-to-bytes spk-hex)
+                  (list (bl.crypto:hex-to-bytes spk-hex)
                         (when (numberp amount) (round (* amount 100000000)))
-                        (when (stringp redeem-hex) (bitcoin-lisp.crypto:hex-to-bytes redeem-hex))
-                        (when (stringp ws-hex) (bitcoin-lisp.crypto:hex-to-bytes ws-hex)))))))
+                        (when (stringp redeem-hex) (bl.crypto:hex-to-bytes redeem-hex))
+                        (when (stringp ws-hex) (bl.crypto:hex-to-bytes ws-hex)))))))
       ;; Sign whatever the supplied keys can satisfy (shared machinery).
       (let ((sign-errors (%sign-tx-inputs tx prevmap keymap pubmap tr-keymap
                                           sighash-byte)))
-        (let ((bytes (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
+        (let ((bytes (bl.ser:transaction-wire-bytes tx)))
           (append
-           `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex bytes))
+           `(("hex" . ,(bl.crypto:bytes-to-hex bytes))
              ("complete" . ,(json-bool (null sign-errors))))
            (when sign-errors
              `(("errors" . ,(mapcar (lambda (e)
@@ -6001,8 +6001,8 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
                      (unless (and (integerp vout) (>= vout 0))
                        (error 'rpc-error :code +rpc-invalid-parameter+
                                          :message "Invalid input vout"))
-                  collect (bitcoin-lisp.serialization:make-tx-in
-                           :previous-output (bitcoin-lisp.serialization:make-outpoint
+                  collect (bl.ser:make-tx-in
+                           :previous-output (bl.ser:make-outpoint
                                              :hash (parse-hex-hash txid-str)
                                              :index vout)
                            :script-sig (make-array 0 :element-type '(unsigned-byte 8))
@@ -6020,18 +6020,18 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
           ;; drifting into a second dialect.
           (tx-outputs
             (mapcar (lambda (r)
-                      (bitcoin-lisp.serialization:make-tx-out
+                      (bl.ser:make-tx-out
                        :value (recipient-amount r)
                        :script-pubkey (recipient-script r)))
                     (%parse-outputs network outputs))))
       ;; Create transaction
-      (let ((tx (bitcoin-lisp.serialization:make-transaction
+      (let ((tx (bl.ser:make-transaction
                  :version 2
                  :inputs (coerce tx-inputs 'simple-vector)
                  :outputs (coerce tx-outputs 'simple-vector)
                  :lock-time locktime)))
-        (bitcoin-lisp.crypto:bytes-to-hex
-         (bitcoin-lisp.serialization:transaction-wire-bytes tx))))))
+        (bl.crypto:bytes-to-hex
+         (bl.ser:transaction-wire-bytes tx))))))
 
 ;;; --- UTXO Set Statistics ---
 
@@ -6045,7 +6045,7 @@ hex. Returns the cumulative stats at that height plus a block_info object of
 that block's deltas. Only the muhash hash_type is index-backed."
   (let* ((csi (rpc-get-coinstatsindex node))
          (chain-state (rpc-get-chain-state node)))
-    (unless (and csi (bitcoin-lisp.storage:coinstatsindex-enabled csi))
+    (unless (and csi (bl.store:coinstatsindex-enabled csi))
       (error 'rpc-error :code +rpc-misc-error+
                         :message "Querying by block height/hash requires -coinstatsindex"))
     (when (string= hash-type "hash_serialized_3")
@@ -6054,7 +6054,7 @@ that block's deltas. Only the muhash hash_type is index-backed."
     (let* ((height (cond
                      ((integerp hash-or-height) hash-or-height)
                      ((and (stringp hash-or-height) (valid-hex-hash-p hash-or-height))
-                      (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                      (let ((entry (bl.store:get-block-index-entry
                                     chain-state (parse-hex-hash hash-or-height))))
                         (unless entry
                           (error 'rpc-error :code +rpc-invalid-address-or-key+
@@ -6063,50 +6063,50 @@ that block's deltas. Only the muhash hash_type is index-backed."
                         ;; and the index holds only active-chain statistics —
                         ;; serving the active chain's numbers under a
                         ;; stale-branch hash would be a silently wrong answer.
-                        (unless (bitcoin-lisp.storage:entry-on-active-chain-p
+                        (unless (bl.store:entry-on-active-chain-p
                                  chain-state entry)
                           (error 'rpc-error :code +rpc-invalid-parameter+
                                             :message "Block is not on the active chain; the coinstatsindex holds active-chain statistics only"))
-                        (bitcoin-lisp.storage:block-index-entry-height entry)))
+                        (bl.store:block-index-entry-height entry)))
                      (t (error 'rpc-error :code +rpc-invalid-parameter+
                                           :message "hash_or_height must be a height or block hash"))))
-           (stats (bitcoin-lisp.storage:coinstatsindex-get-stats csi height))
+           (stats (bl.store:coinstatsindex-get-stats csi height))
            (prev (and (plusp height)
-                      (bitcoin-lisp.storage:coinstatsindex-get-stats csi (1- height))))
-           (entry (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+                      (bl.store:coinstatsindex-get-stats csi (1- height))))
+           (entry (bl.store:get-block-at-height chain-state height)))
       ;; Records above the best marker are not vouched for: a rewind moves the
       ;; marker down and leaves the abandoned branch's records in place until
       ;; the backfill overwrites them.
-      (unless (and stats (<= height (bitcoin-lisp.storage:coinstatsindex-height csi)))
+      (unless (and stats (<= height (bl.store:coinstatsindex-height csi)))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message "Height not in coinstatsindex (out of range or below the indexed horizon)"))
       (flet ((g (fn s) (if s (funcall fn s) 0)))
-        (let* ((unspendable-total (+ (bitcoin-lisp.storage:coinstats-unspendable-genesis stats)
-                                     (bitcoin-lisp.storage:coinstats-unspendable-bip30 stats)
-                                     (bitcoin-lisp.storage:coinstats-unspendable-scripts stats)
-                                     (bitcoin-lisp.storage:coinstats-unspendable-unclaimed stats)))
+        (let* ((unspendable-total (+ (bl.store:coinstats-unspendable-genesis stats)
+                                     (bl.store:coinstats-unspendable-bip30 stats)
+                                     (bl.store:coinstats-unspendable-scripts stats)
+                                     (bl.store:coinstats-unspendable-unclaimed stats)))
                ;; block_info = this block's deltas (cumulative[h] - cumulative[h-1]).
-               (d-prevout (- (bitcoin-lisp.storage:coinstats-total-prevout-spent stats)
-                             (g #'bitcoin-lisp.storage:coinstats-total-prevout-spent prev)))
-               (d-coinbase (- (bitcoin-lisp.storage:coinstats-total-coinbase stats)
-                              (g #'bitcoin-lisp.storage:coinstats-total-coinbase prev)))
-               (d-newout (- (bitcoin-lisp.storage:coinstats-total-new-outputs-ex-coinbase stats)
-                            (g #'bitcoin-lisp.storage:coinstats-total-new-outputs-ex-coinbase prev)))
-               (d-uns-genesis (- (bitcoin-lisp.storage:coinstats-unspendable-genesis stats)
-                                 (g #'bitcoin-lisp.storage:coinstats-unspendable-genesis prev)))
-               (d-uns-bip30 (- (bitcoin-lisp.storage:coinstats-unspendable-bip30 stats)
-                               (g #'bitcoin-lisp.storage:coinstats-unspendable-bip30 prev)))
-               (d-uns-scripts (- (bitcoin-lisp.storage:coinstats-unspendable-scripts stats)
-                                 (g #'bitcoin-lisp.storage:coinstats-unspendable-scripts prev)))
-               (d-uns-unclaimed (- (bitcoin-lisp.storage:coinstats-unspendable-unclaimed stats)
-                                   (g #'bitcoin-lisp.storage:coinstats-unspendable-unclaimed prev))))
+               (d-prevout (- (bl.store:coinstats-total-prevout-spent stats)
+                             (g #'bl.store:coinstats-total-prevout-spent prev)))
+               (d-coinbase (- (bl.store:coinstats-total-coinbase stats)
+                              (g #'bl.store:coinstats-total-coinbase prev)))
+               (d-newout (- (bl.store:coinstats-total-new-outputs-ex-coinbase stats)
+                            (g #'bl.store:coinstats-total-new-outputs-ex-coinbase prev)))
+               (d-uns-genesis (- (bl.store:coinstats-unspendable-genesis stats)
+                                 (g #'bl.store:coinstats-unspendable-genesis prev)))
+               (d-uns-bip30 (- (bl.store:coinstats-unspendable-bip30 stats)
+                               (g #'bl.store:coinstats-unspendable-bip30 prev)))
+               (d-uns-scripts (- (bl.store:coinstats-unspendable-scripts stats)
+                                 (g #'bl.store:coinstats-unspendable-scripts prev)))
+               (d-uns-unclaimed (- (bl.store:coinstats-unspendable-unclaimed stats)
+                                   (g #'bl.store:coinstats-unspendable-unclaimed prev))))
           `(("height" . ,height)
-            ("bestblock" . ,(if entry (hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash entry)) ""))
-            ("txouts" . ,(bitcoin-lisp.storage:coinstats-txout-count stats))
-            ("bogosize" . ,(bitcoin-lisp.storage:coinstats-bogo-size stats))
-            ("muhash" . ,(hash-to-hex (bitcoin-lisp.crypto:muhash-finalize
-                                       (bitcoin-lisp.storage:coinstats-muhash stats))))
-            ("total_amount" . ,(%csi-amount-btc (bitcoin-lisp.storage:coinstats-total-amount stats)))
+            ("bestblock" . ,(if entry (hash-to-hex (bl.store:block-index-entry-hash entry)) ""))
+            ("txouts" . ,(bl.store:coinstats-txout-count stats))
+            ("bogosize" . ,(bl.store:coinstats-bogo-size stats))
+            ("muhash" . ,(hash-to-hex (bl.crypto:muhash-finalize
+                                       (bl.store:coinstats-muhash stats))))
+            ("total_amount" . ,(%csi-amount-btc (bl.store:coinstats-total-amount stats)))
             ("total_unspendable_amount" . ,(%csi-amount-btc unspendable-total))
             ("block_info"
              . (("prevout_spent" . ,(%csi-amount-btc d-prevout))
@@ -6134,17 +6134,17 @@ coinstatsindex (Core's use_index path)."
     (when hash-or-height
       (return-from rpc-gettxoutsetinfo
         (%gettxoutsetinfo-from-index node hash-type hash-or-height)))
-    (let* ((height (bitcoin-lisp.storage:current-height chain-state))
+    (let* ((height (bl.store:current-height chain-state))
            ;; The COINS VIEW's own best block, as Core reports
            ;; (rpc/blockchain.cpp:1083). hash_serialized_3 IS the assumeutxo
            ;; commitment, so hashing one set of coins and labelling it with a
            ;; different block's hash commits to nothing — and the two genuinely
            ;; differ partway through a reorg's disconnect phase.
-           (best-hash (or (bitcoin-lisp.storage:coins-view-best-block utxo-set)
-                          (bitcoin-lisp.storage:best-block-hash chain-state)))
-           (txout-count (bitcoin-lisp.storage:utxo-count utxo-set))
-           (tx-count (bitcoin-lisp.storage:utxo-set-distinct-txids utxo-set))
-           (total-satoshis (bitcoin-lisp.storage:utxo-set-total-amount utxo-set))
+           (best-hash (or (bl.store:coins-view-best-block utxo-set)
+                          (bl.store:best-block-hash chain-state)))
+           (txout-count (bl.store:utxo-count utxo-set))
+           (tx-count (bl.store:utxo-set-distinct-txids utxo-set))
+           (total-satoshis (bl.store:utxo-set-total-amount utxo-set))
            (total-btc (/ total-satoshis 100000000.0d0))
            (result `(("height" . ,height)
                      ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
@@ -6157,12 +6157,12 @@ coinstatsindex (Core's use_index path)."
         ((string= hash-type "hash_serialized_3")
          (setf result (append result
                               `(("hash_serialized_3"
-                                 . ,(hash-to-hex (bitcoin-lisp.storage:compute-utxo-set-hash
+                                 . ,(hash-to-hex (bl.store:compute-utxo-set-hash
                                                   utxo-set)))))))
         ((string= hash-type "muhash")
          (setf result (append result
                               `(("muhash"
-                                 . ,(hash-to-hex (bitcoin-lisp.storage:compute-utxo-set-muhash
+                                 . ,(hash-to-hex (bl.store:compute-utxo-set-muhash
                                                   utxo-set))))))))
       result)))
 
@@ -6187,7 +6187,7 @@ sizeof(COutPoint) + sizeof(uint32_t) + sizeof(bool) = 36 + 4 + 1.")
 (defun %txout-serialize-size (script-pubkey)
   "GetSerializeSize(CTxOut) for an output with SCRIPT-PUBKEY: the 8-byte amount
 plus the compact-size-prefixed script."
-  (+ 8 (bitcoin-lisp.serialization:compact-size-length (length script-pubkey))
+  (+ 8 (bl.ser:compact-size-length (length script-pubkey))
      (length script-pubkey)))
 
 (defun %truncated-median (values)
@@ -6271,16 +6271,16 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
       ;; index — the old height-0 fallback for an unindexed block reported a
       ;; wrong subsidy and mediantime instead of erroring.
       (let* ((entry (%parse-hash-or-height-entry chain-state hash-or-height))
-             (block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
-             (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+             (block-hash (bl.store:block-index-entry-hash entry))
+             (block (bl.store:get-block block-store block-hash)))
         (unless block
           (error 'rpc-error :code +rpc-invalid-address-or-key+
                             :message "Block not found"))
-        (let* ((height (bitcoin-lisp.storage:block-index-entry-height entry))
-               (header (bitcoin-lisp.serialization:bitcoin-block-header block))
-               (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+        (let* ((height (bl.store:block-index-entry-height entry))
+               (header (bl.ser:bitcoin-block-header block))
+               (txs (bl.ser:bitcoin-block-transactions block))
                (ntx (length txs))
-               (undo (bitcoin-lisp.validation:get-undo-data block-hash)))
+               (undo (bl.val:get-undo-data block-hash)))
           (when (and (> ntx 1) (null undo))
             ;; Core GetUndoChecked, rpc/blockchain.cpp:730-732.
             (error 'rpc-error :code +rpc-misc-error+
@@ -6300,12 +6300,12 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
               do (let ((tx-total-out 0))
                    ;; Outputs are counted for EVERY transaction, coinbase
                    ;; included — Core :2054, before the coinbase continue.
-                   (incf outputs (length (bitcoin-lisp.serialization:transaction-outputs tx)))
-                   (bitcoin-lisp.serialization:dovector
-                       (out (bitcoin-lisp.serialization:transaction-outputs tx))
-                     (let* ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey out))
+                   (incf outputs (length (bl.ser:transaction-outputs tx)))
+                   (bl.ser:dovector
+                       (out (bl.ser:transaction-outputs tx))
+                     (let* ((spk (bl.ser:tx-out-script-pubkey out))
                             (out-size (+ (%txout-serialize-size spk) +per-utxo-overhead+)))
-                       (incf tx-total-out (bitcoin-lisp.serialization:tx-out-value out))
+                       (incf tx-total-out (bl.ser:tx-out-value out))
                        (incf utxo-size-inc out-size)
                        ;; Genesis and the BIP30-repeated coinbases never enter
                        ;; the UTXO set, and unspendable outputs are dropped
@@ -6313,32 +6313,32 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
                        ;; figures (Core :2064-2072).
                        (unless (or (zerop height)
                                    (and coinbase-p
-                                        (bitcoin-lisp.validation::bip30-repeat-block-p height))
-                                   (bitcoin-lisp.storage:script-unspendable-p spk))
+                                        (bl.val::bip30-repeat-block-p height))
+                                   (bl.store:script-unspendable-p spk))
                          (incf utxos)
                          (incf utxo-size-inc-actual out-size))))
                    ;; Everything below is non-coinbase only (Core :2075-2077).
                    (unless coinbase-p
-                     (let* ((tx-size (length (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
-                            (weight (bitcoin-lisp.serialization:transaction-weight tx))
+                     (let* ((tx-size (length (bl.ser:transaction-wire-bytes tx)))
+                            (weight (bl.ser:transaction-weight tx))
                             (tx-total-in 0))
-                       (incf inputs (length (bitcoin-lisp.serialization:transaction-inputs tx)))
+                       (incf inputs (length (bl.ser:transaction-inputs tx)))
                        (incf total-out tx-total-out)
                        (push tx-size txsize-array)
                        (setf maxtxsize (max maxtxsize tx-size))
                        (setf mintxsize (if mintxsize (min mintxsize tx-size) tx-size))
                        (incf total-size tx-size)
                        (incf total-weight weight)
-                       (when (bitcoin-lisp.serialization:transaction-has-witness-p tx)
+                       (when (bl.ser:transaction-has-witness-p tx)
                          (incf swtxs)
                          (incf swtotal-size tx-size)
                          (incf swtotal-weight weight))
-                       (bitcoin-lisp.serialization:dovector
-                           (in (bitcoin-lisp.serialization:transaction-inputs tx))
-                         (let* ((outpoint (bitcoin-lisp.serialization:tx-in-previous-output in))
+                       (bl.ser:dovector
+                           (in (bl.ser:transaction-inputs tx))
+                         (let* ((outpoint (bl.ser:tx-in-previous-output in))
                                 (coin (gethash (%outpoint-key
-                                                (bitcoin-lisp.serialization:outpoint-hash outpoint)
-                                                (bitcoin-lisp.serialization:outpoint-index outpoint))
+                                                (bl.ser:outpoint-hash outpoint)
+                                                (bl.ser:outpoint-index outpoint))
                                                prevouts)))
                            (unless coin
                              ;; Incomplete undo data: fail closed rather than
@@ -6347,9 +6347,9 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
                                                :message "Can't read undo data from disk"))
                            (let ((prevout-size
                                    (+ (%txout-serialize-size
-                                       (bitcoin-lisp.storage:utxo-entry-script-pubkey coin))
+                                       (bl.store:utxo-entry-script-pubkey coin))
                                       +per-utxo-overhead+)))
-                             (incf tx-total-in (bitcoin-lisp.storage:utxo-entry-value coin))
+                             (incf tx-total-in (bl.store:utxo-entry-value coin))
                              (decf utxo-size-inc prevout-size)
                              (decf utxo-size-inc-actual prevout-size))))
                        (let* ((txfee (- tx-total-in tx-total-out))
@@ -6380,18 +6380,18 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
                        ("maxfeerate" . ,maxfeerate)
                        ("maxtxsize" . ,maxtxsize)
                        ("medianfee" . ,(%truncated-median fee-array))
-                       ("mediantime" . ,(bitcoin-lisp.validation:compute-median-time-past
+                       ("mediantime" . ,(bl.val:compute-median-time-past
                                          chain-state block-hash))
                        ("mediantxsize" . ,(%truncated-median txsize-array))
                        ("minfee" . ,(or minfee 0))
                        ("minfeerate" . ,(or minfeerate 0))
                        ("mintxsize" . ,(or mintxsize 0))
                        ("outs" . ,outputs)
-                       ("subsidy" . ,(bitcoin-lisp.validation:calculate-block-subsidy height))
+                       ("subsidy" . ,(bl.val:calculate-block-subsidy height))
                        ("swtotal_size" . ,swtotal-size)
                        ("swtotal_weight" . ,swtotal-weight)
                        ("swtxs" . ,swtxs)
-                       ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
+                       ("time" . ,(bl.ser:block-header-timestamp header))
                        ("total_out" . ,total-out)
                        ("total_size" . ,total-size)
                        ("total_weight" . ,total-weight)
@@ -6413,7 +6413,7 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
   "Prune the blockchain up to a given block height.
 PARAMS: [height]
 Returns the height of the last pruned block."
-  (unless (bitcoin-lisp:pruning-enabled-p)
+  (unless (bl:pruning-enabled-p)
     (error 'rpc-error :code +rpc-misc-error+
                       :message "Cannot prune: pruning is not enabled. Start with :prune 1 or :prune 550+"))
   (let ((target-height (first params)))
@@ -6426,14 +6426,14 @@ Returns the height of the last pruned block."
     (with-node-lock (node)
      (let* ((chain-state (rpc-get-chain-state node))
            (block-store (rpc-get-block-store node))
-           (pruned (bitcoin-lisp.storage:prune-blocks-to-height
+           (pruned (bl.store:prune-blocks-to-height
                     block-store chain-state target-height
-                    :on-prune #'bitcoin-lisp.validation:delete-undo-file)))
-      (bitcoin-lisp::node-log :info "RPC pruneblockchain: pruned ~D blocks to height ~D"
+                    :on-prune #'bl.val:delete-undo-file)))
+      (bl::node-log :info "RPC pruneblockchain: pruned ~D blocks to height ~D"
                               pruned target-height)
       ;; Return the last pruned block height (matching Bitcoin Core).
       ;; Note: getblockchaininfo.pruneheight returns (1+ this) = first UNpruned block.
-      (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))))
+      (bl.store:chain-state-pruned-height chain-state)))))
 
 (defun rpc-migrateblocks (node params)
   "Convert legacy per-block files into flat blk?????.dat files.
@@ -6462,15 +6462,15 @@ block connection for as long as that takes. Prefer several small calls."
       (let ((store (rpc-get-block-store node))
             (chain-state (rpc-get-chain-state node)))
         (multiple-value-bind (migrated next remaining)
-            (bitcoin-lisp.storage:migrate-blocks-to-flat-files
+            (bl.store:migrate-blocks-to-flat-files
              store chain-state :max-blocks nblocks :start-height start
              ;; Each block's undo data follows it into the matching rev file.
              ;; Storage cannot do this itself: the undo format lives above it.
              :on-migrated
              (lambda (entry)
-               (bitcoin-lisp.validation:migrate-undo-to-flat
-                (bitcoin-lisp.storage:block-index-entry-hash entry))))
-          (bitcoin-lisp::node-log
+               (bl.val:migrate-undo-to-flat
+                (bl.store:block-index-entry-hash entry))))
+          (bl::node-log
            :info "RPC migrateblocks: converted ~D block~:P; resume at height ~D; ~D legacy file~:P left"
            migrated next remaining)
           `(("migrated" . ,migrated)
@@ -6494,17 +6494,17 @@ PARAMS: (blockhash [filtertype]). Mirrors Bitcoin Core getblockfilter."
       (error 'rpc-error :code +rpc-invalid-address-or-key+
                         :message (format nil "Unknown filtertype ~A" filtertype)))
     (let ((bfi (rpc-get-blockfilterindex node)))
-      (unless (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi))
+      (unless (and bfi (bl.store:blockfilterindex-enabled bfi))
         (error 'rpc-error :code +rpc-misc-error+
                           :message "Index is not enabled for filtertype basic"))
-      (unless (bitcoin-lisp.storage:get-block-index-entry (rpc-get-chain-state node) hash)
+      (unless (bl.store:get-block-index-entry (rpc-get-chain-state node) hash)
         (error 'rpc-error :code +rpc-invalid-address-or-key+ :message "Block not found"))
       (multiple-value-bind (filter header)
-          (bitcoin-lisp.storage:blockfilterindex-get bfi hash)
+          (bl.store:blockfilterindex-get bfi hash)
         (unless filter
           (error 'rpc-error :code +rpc-misc-error+
                             :message "Could not find block filter for the given block"))
-        `(("filter" . ,(bitcoin-lisp.crypto:bytes-to-hex filter))
+        `(("filter" . ,(bl.crypto:bytes-to-hex filter))
           ("header" . ,(hash-to-hex header)))))))
 
 ;;; scanblocks — return blockhashes whose filters match a descriptor set.
@@ -6556,7 +6556,7 @@ ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
          (unless (string-equal filtertype "basic")
            (error 'rpc-error :code +rpc-invalid-address-or-key+
                              :message (format nil "Unknown filtertype ~A" filtertype)))
-         (unless (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi))
+         (unless (and bfi (bl.store:blockfilterindex-enabled bfi))
            (error 'rpc-error :code +rpc-misc-error+
                              :message "Index is not enabled for filtertype basic"))
          (unless (%reserve-scanblocks)
@@ -6566,7 +6566,7 @@ ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
               (let* ((chain-state (rpc-get-chain-state node))
                      (block-store (rpc-get-block-store node))
                      (network (rpc-get-network node))
-                     (tip (bitcoin-lisp.storage:current-height chain-state))
+                     (tip (bl.store:current-height chain-state))
                      (start (or (third params) 0))
                      (stop (or (fourth params) tip))
                      (options (sixth params))
@@ -6589,18 +6589,18 @@ ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
                         (if (> stop start)
                             (floor (* 100 (- height start)) (- stop start))
                             100))
-                  (let ((entry (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+                  (let ((entry (bl.store:get-block-at-height chain-state height)))
                     (when entry
-                      (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
-                             (filter (bitcoin-lisp.storage:blockfilterindex-get-filter bfi hash)))
+                      (let* ((hash (bl.store:block-index-entry-hash entry))
+                             (filter (bl.store:blockfilterindex-get-filter bfi hash)))
                         (when filter
                           (multiple-value-bind (k0 k1)
-                              (bitcoin-lisp.storage:block-filter-siphash-keys hash)
-                            (when (bitcoin-lisp.storage:gcs-filter-match-any
+                              (bl.store:block-filter-siphash-keys hash)
+                            (when (bl.store:gcs-filter-match-any
                                    filter k0 k1 needle-list)
                               (when (or (not fp-check)
                                         (%block-matches-needles-p
-                                         (bitcoin-lisp.storage:get-block block-store hash)
+                                         (bl.store:get-block block-store hash)
                                          hash needles))
                                 (push (hash-to-hex hash) relevant))))))))
                   ;; Last fully-scanned height; on abort this is where we stopped.
@@ -6622,17 +6622,17 @@ latter from undo data when available). When the block body is unavailable
 risk a false negative."
   (if (null block)
       t
-      (let* ((undo (bitcoin-lisp.validation:get-undo-data block-hash))
-             (spent (mapcar (lambda (e) (bitcoin-lisp.storage:utxo-entry-script-pubkey (third e)))
+      (let* ((undo (bl.val:get-undo-data block-hash))
+             (spent (mapcar (lambda (e) (bl.store:utxo-entry-script-pubkey (third e)))
                             undo)))
         (some (lambda (e) (gethash e needles))
-              (bitcoin-lisp.storage:basic-filter-elements block spent)))))
+              (bl.store:basic-filter-elements block spent)))))
 
 ;;; getdescriptoractivity — spend/receive activity for descriptors in blocks.
 
 (defun %spk-object (script needles)
   "A scriptPubKey JSON object (hex, plus the matched descriptor when known)."
-  `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex script))
+  `(("hex" . ,(bl.crypto:bytes-to-hex script))
     ,@(let ((desc (gethash script needles))) (when desc `(("desc" . ,desc))))))
 
 (defun %outpoint-key (txid index)
@@ -6651,22 +6651,22 @@ risk a false negative."
   "Collect spend+receive activity entries for TX. NEEDLES maps script->desc;
 PREVOUT-FN maps (txid index) -> utxo-entry (or NIL); BASE-FIELDS is an alist of
 common fields (blockhash/height, or nil for mempool). Returns a list of entries."
-  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+  (let ((txid (bl.ser:transaction-hash tx))
         (acc '()))
     ;; Spends: each non-coinbase input whose prevout script matches.
-    (loop for in across (bitcoin-lisp.serialization:transaction-inputs tx)
+    (loop for in across (bl.ser:transaction-inputs tx)
           for vin from 0
-          for prev = (bitcoin-lisp.serialization:tx-in-previous-output in)
-          for phash = (bitcoin-lisp.serialization:outpoint-hash prev)
-          for pindex = (bitcoin-lisp.serialization:outpoint-index prev)
+          for prev = (bl.ser:tx-in-previous-output in)
+          for phash = (bl.ser:outpoint-hash prev)
+          for pindex = (bl.ser:outpoint-index prev)
           ;; Skip the coinbase's null prevout (index 0xffffffff, all-zero hash).
           unless (and (= pindex #xffffffff) (every #'zerop phash))
             do (let ((entry (funcall prevout-fn phash pindex)))
                  (when entry
-                   (let ((spk (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
+                   (let ((spk (bl.store:utxo-entry-script-pubkey entry)))
                      (when (gethash spk needles)
                        (push `(("type" . "spend")
-                               ("amount" . ,(/ (bitcoin-lisp.storage:utxo-entry-value entry)
+                               ("amount" . ,(/ (bl.store:utxo-entry-value entry)
                                                100000000.0d0))
                                ,@base-fields
                                ("spend_txid" . ,(hash-to-hex txid))
@@ -6676,12 +6676,12 @@ common fields (blockhash/height, or nil for mempool). Returns a list of entries.
                                ("prevout_spk" . ,(%spk-object spk needles)))
                              acc))))))
     ;; Receives: each output whose script matches.
-    (loop for out across (bitcoin-lisp.serialization:transaction-outputs tx)
+    (loop for out across (bl.ser:transaction-outputs tx)
           for vout from 0
-          for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey out)
+          for spk = (bl.ser:tx-out-script-pubkey out)
           when (gethash spk needles)
             do (push `(("type" . "receive")
-                       ("amount" . ,(/ (bitcoin-lisp.serialization:tx-out-value out)
+                       ("amount" . ,(/ (bl.ser:tx-out-value out)
                                        100000000.0d0))
                        ,@base-fields
                        ("txid" . ,(hash-to-hex txid))
@@ -6711,19 +6711,19 @@ optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
       (let ((entries '()))
         (dolist (bhash-hex (and (listp blockhashes) blockhashes))
           (let* ((hash (and (stringp bhash-hex) (parse-hex-hash bhash-hex)))
-                 (entry (and hash (bitcoin-lisp.storage:get-block-index-entry chain-state hash))))
+                 (entry (and hash (bl.store:get-block-index-entry chain-state hash))))
             (unless entry
               (error 'rpc-error :code +rpc-invalid-address-or-key+
                                 :message "Block not found"))
-            (unless (bitcoin-lisp.storage:entry-on-active-chain-p chain-state entry)
+            (unless (bl.store:entry-on-active-chain-p chain-state entry)
               (error 'rpc-error :code +rpc-invalid-parameter+
                                 :message "Block is not in main chain"))
             (push entry entries)))
-        (dolist (entry (sort entries #'< :key #'bitcoin-lisp.storage:block-index-entry-height))
-          (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
-                 (height (bitcoin-lisp.storage:block-index-entry-height entry))
-                 (block (bitcoin-lisp.storage:get-block block-store hash))
-                 (undo (bitcoin-lisp.validation:get-undo-data hash)))
+        (dolist (entry (sort entries #'< :key #'bl.store:block-index-entry-height))
+          (let* ((hash (bl.store:block-index-entry-hash entry))
+                 (height (bl.store:block-index-entry-height entry))
+                 (block (bl.store:get-block block-store hash))
+                 (undo (bl.val:get-undo-data hash)))
             (unless block
               (error 'rpc-error :code +rpc-invalid-address-or-key+
                                 :message "Block not available (pruned?)"))
@@ -6731,12 +6731,12 @@ optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
             ;; activity; error rather than silently omitting spends (Core's
             ;; GetUndoChecked throws).
             (when (and (null undo)
-                       (> (length (bitcoin-lisp.serialization:bitcoin-block-transactions block)) 1))
+                       (> (length (bl.ser:bitcoin-block-transactions block)) 1))
               (error 'rpc-error :code +rpc-misc-error+
                                 :message "Undo data not available (pruned?)"))
             (let ((prevouts (%undo-prevout-table undo))
                   (base `(("blockhash" . ,(hash-to-hex hash)) ("height" . ,height))))
-              (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+              (dolist (tx (bl.ser:bitcoin-block-transactions block))
                 (push (%tx-activity tx needles
                                     (lambda (th ti) (gethash (%outpoint-key th ti) prevouts))
                                     base)
@@ -6745,26 +6745,26 @@ optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
       (when include-mempool
         (let ((mempool (rpc-get-mempool node)))
           (when mempool
-            (bitcoin-lisp.mempool:mempool-for-each
+            (bl.mp:mempool-for-each
              mempool
              (lambda (txid entry)
                (declare (ignore txid))
-               (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
+               (let ((tx (bl.mp:mempool-entry-transaction entry)))
                  (push (%tx-activity
                         tx needles
                         (lambda (th ti)
                           ;; prevout from the UTXO set, else an unconfirmed
                           ;; mempool parent's output.
-                          (or (bitcoin-lisp.storage:get-utxo utxo-set th ti)
-                              (let ((ptx (bitcoin-lisp.mempool:mempool-get mempool th)))
+                          (or (bl.store:get-utxo utxo-set th ti)
+                              (let ((ptx (bl.mp:mempool-get mempool th)))
                                 (when (and ptx
-                                           (< ti (length (bitcoin-lisp.serialization:transaction-outputs
-                                                          (bitcoin-lisp.mempool:mempool-entry-transaction ptx)))))
-                                  (let ((o (aref (bitcoin-lisp.serialization:transaction-outputs
-                                                  (bitcoin-lisp.mempool:mempool-entry-transaction ptx)) ti)))
-                                    (bitcoin-lisp.storage:make-utxo-entry
-                                     :value (bitcoin-lisp.serialization:tx-out-value o)
-                                     :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey o)))))))
+                                           (< ti (length (bl.ser:transaction-outputs
+                                                          (bl.mp:mempool-entry-transaction ptx)))))
+                                  (let ((o (aref (bl.ser:transaction-outputs
+                                                  (bl.mp:mempool-entry-transaction ptx)) ti)))
+                                    (bl.store:make-utxo-entry
+                                     :value (bl.ser:tx-out-value o)
+                                     :script-pubkey (bl.ser:tx-out-script-pubkey o)))))))
                         nil)
                        chunks)))))))
       ;; chunks is reverse-order lists of entries; flatten once (O(total)).

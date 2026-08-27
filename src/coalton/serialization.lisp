@@ -316,7 +316,7 @@
   (define (make-hash256-unsafe bytes)
     "Create Hash256 without length check (use only when you know length is 32)."
     (lisp Hash256 (bytes)
-      (bitcoin-lisp.coalton.types::Hash256 bytes)))
+      (bl.ctypes::Hash256 bytes)))
 
   (declare deserialize-outpoint ((Vector U8) -> UFix -> (ReadResult Outpoint)))
   (define (deserialize-outpoint bytes pos)

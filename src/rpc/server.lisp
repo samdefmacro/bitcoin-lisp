@@ -987,7 +987,7 @@ request and shape the reply (see MAKE-RPC-RESPONSE)."
                                :data (rpc-error-data e)
                                :id-present id-present))
     (error (e)
-      (bitcoin-lisp::node-log :error "RPC internal error: ~A" e)
+      (bl::node-log :error "RPC internal error: ~A" e)
       (make-rpc-error-response +rpc-internal-error+
                                (format nil "Internal error: ~A" e)
                                id version
@@ -1162,7 +1162,7 @@ creates it under umask 0077 (request.cpp:99-146)."
         (sb-posix:rename (namestring tmp) (namestring path))
         (values path secret))
     (error (e)
-      (bitcoin-lisp::node-log :warn "Could not write RPC cookie: ~A" e)
+      (bl::node-log :warn "Could not write RPC cookie: ~A" e)
       nil)))
 
 (defun delete-rpc-cookie ()
@@ -1173,7 +1173,7 @@ request.cpp:167-177). A cookie we did not write is left alone."
         (when (probe-file *rpc-cookie-path*)
           (delete-file *rpc-cookie-path*))
       (error (e)
-        (bitcoin-lisp::node-log :warn "Could not remove RPC cookie ~A: ~A"
+        (bl::node-log :warn "Could not remove RPC cookie ~A: ~A"
                                 *rpc-cookie-path* e)))
     (setf *rpc-cookie-path* nil)))
 
@@ -1210,9 +1210,9 @@ comparison of an attacker-supplied credential leaks its correct prefix."
 
 (defun init-rpc-rate-limiter ()
   "Initialize the global RPC rate limiter from configuration."
-  (let ((config bitcoin-lisp:*rpc-rate-limit*))
+  (let ((config bl:*rpc-rate-limit*))
     (setf *rpc-rate-limiter*
-          (bitcoin-lisp:make-rate-limiter (car config) (cdr config)))))
+          (bl:make-rate-limiter (car config) (cdr config)))))
 
 (defun rpc-rate-limit-check ()
   "Check if the RPC request is within rate limits (thread-safe).
@@ -1220,7 +1220,7 @@ Returns T if allowed, NIL if rate limited."
   (when *rpc-rate-limiter*
     (bt:with-lock-held (*rpc-rate-limiter-lock*)
       (return-from rpc-rate-limit-check
-        (bitcoin-lisp:token-bucket-allow-p *rpc-rate-limiter*))))
+        (bl:token-bucket-allow-p *rpc-rate-limiter*))))
   t)
 
 (defun rpc-origin-allowed-p (origin host)
@@ -1300,8 +1300,8 @@ dollar sign is expressible, and both are rejected rather than truncated."
 digest an offered password is reduced to before comparison (CheckUserAuthorized,
 httprpc.cpp:70-76). The salt keys the MAC as its own characters, not as the
 bytes its hex spells."
-  (bitcoin-lisp.crypto:bytes-to-hex
-   (bitcoin-lisp.crypto:hmac-sha256 salt-bytes password-bytes)))
+  (bl.crypto:bytes-to-hex
+   (bl.crypto:hmac-sha256 salt-bytes password-bytes)))
 
 (defun %credential-authorizes-p (credential user-bytes password-bytes)
   "T when CREDENTIAL accepts USER-BYTES/PASSWORD-BYTES. Core compares the
@@ -1314,8 +1314,8 @@ salt only once the username matched (CheckUserAuthorized, httprpc.cpp:63-82)."
         (rpc-credential-hash credential))))
 
 (defparameter *rpc-loopback-subnets*
-  (list (bitcoin-lisp.networking:parse-subnet "127.0.0.0/8")
-        (bitcoin-lisp.networking:parse-subnet "::1"))
+  (list (bl.net:parse-subnet "127.0.0.0/8")
+        (bl.net:parse-subnet "::1"))
   "The subnets the RPC ACL always contains. Core seeds rpc_allow_subnets with
 127.0.0.0/8 and ::1 before reading any -rpcallowip and offers no way to remove
 them (InitHTTPAllowList, httpserver.cpp:150-152), so they are the floor of the
@@ -1330,7 +1330,7 @@ one that refuses even localhost.")
 (defun rpc-client-allowed-p (address)
   "T when ADDRESS, the remote address of an HTTP request, is inside the RPC ACL
 (Core ClientAllowed, httpserver.cpp:137-146)."
-  (bitcoin-lisp.networking:address-in-subnets-p address *rpc-allow-subnets*))
+  (bl.net:address-in-subnets-p address *rpc-allow-subnets*))
 
 (defun check-auth (auth-header)
   "The username AUTH-HEADER authenticates as, or NIL. AUTH-HEADER is the
@@ -1438,7 +1438,7 @@ must stay a value test (NIL = success), not a key-presence test."
         ;; credential has actually been offered: a request with no
         ;; Authorization header is answered immediately (httprpc.cpp:112-133).
         (when auth-header
-          (bitcoin-lisp::node-log :warn "RPC incorrect password attempt from ~A"
+          (bl::node-log :warn "RPC incorrect password attempt from ~A"
                                   (hunchentoot:remote-addr request))
           (sleep 0.25))
         (setf (hunchentoot:return-code*) hunchentoot:+http-authorization-required+)
@@ -1451,7 +1451,7 @@ must stay a value test (NIL = success), not a key-presence test."
            (content-length (and content-length-str
                                 (parse-integer content-length-str :junk-allowed t))))
       (when (and content-length
-                 (> content-length bitcoin-lisp:+max-rpc-body-size+))
+                 (> content-length bl:+max-rpc-body-size+))
         (return-from rpc-handler
           (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
                           "Request body too large"))))
@@ -1472,7 +1472,7 @@ must stay a value test (NIL = success), not a key-presence test."
     (let ((*rpc-wallet-name* (wallet-name-from-uri (hunchentoot:script-name*)))
           (body (hunchentoot:raw-post-data :force-text t)))
       ;; Post-read body size check (in case Content-Length was absent or wrong)
-      (when (and body (> (length body) bitcoin-lisp:+max-rpc-body-size+))
+      (when (and body (> (length body) bl:+max-rpc-body-size+))
         (return-from rpc-handler
           (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
                           "Request body too large")))
@@ -1525,7 +1525,7 @@ must stay a value test (NIL = success), not a key-presence test."
                                                    nil :v1)
                           s)))
         (error (e)
-          (bitcoin-lisp::node-log :error "RPC handler error: ~A" e)
+          (bl::node-log :error "RPC handler error: ~A" e)
           (setf (hunchentoot:return-code*) hunchentoot:+http-internal-server-error+)
           (with-output-to-string (s)
             (yason:encode (make-rpc-error-response +rpc-internal-error+
@@ -1588,13 +1588,13 @@ default configuration here."
          ;; else branch and warns about nothing. BIND-SUPPLIED-P is what keeps
          ;; the two apart, since BIND arrives already defaulted to 127.0.0.1.
          (when (and allow-ip (not bind-supplied-p))
-           (bitcoin-lisp::node-log
+           (bl::node-log
             :warn "Option -rpcallowip was specified without -rpcbind; this ~
 doesn't usually make sense, as the RPC port stays on ~A" bind))
          bind)
         (allow-ip bind)
         (t
-         (bitcoin-lisp::node-log
+         (bl::node-log
           :warn "-rpcbind=~A ignored because -rpcallowip was not specified, ~
 refusing to allow everyone to connect; the RPC port stays on 127.0.0.1"
           (or bind "<any>"))
@@ -1612,9 +1612,9 @@ half-configured ACL behind — the same reason the credential is installed only
 after the socket is bound."
   (let ((subnets '()))
     (dolist (spec allow-ip)
-      (let ((subnet (bitcoin-lisp.networking:parse-subnet spec)))
+      (let ((subnet (bl.net:parse-subnet spec)))
         (unless subnet
-          (bitcoin-lisp::node-log
+          (bl::node-log
            :error "RPC server not started: invalid -rpcallowip subnet ~S. Valid ~
 values are a single IP (1.2.3.4), a network/netmask (1.2.3.4/255.255.255.0), a ~
 network/CIDR (1.2.3.4/24), all ipv4 (0.0.0.0/0), or all ipv6 (::/0)"
@@ -1636,7 +1636,7 @@ password's HMAC."
   (loop for spec in rpc-auth
         for credential = (parse-rpcauth-entry spec)
         unless credential
-          do (bitcoin-lisp::node-log
+          do (bl::node-log
               :error "RPC server not started: invalid -rpcauth argument. ~
 Expected USERNAME:SALT$HMAC as produced by share/rpcauth/rpcauth.py")
              (return :invalid)
@@ -1647,7 +1647,7 @@ Expected USERNAME:SALT$HMAC as produced by share/rpcauth/rpcauth.py")
 every plaintext credential this way before storing it, with a random 16-byte
 hex salt, and keeps the password nowhere else (InitRPCAuthentication,
 httprpc.cpp:275-287)."
-  (let ((salt (bitcoin-lisp.crypto:bytes-to-hex (ironclad:random-data 16))))
+  (let ((salt (bl.crypto:bytes-to-hex (ironclad:random-data 16))))
     (make-rpc-credential
      user salt
      (%rpcauth-hmac-hex (%credential-bytes salt) (%credential-bytes password)))))
@@ -1668,12 +1668,12 @@ Callers must have bound the listening socket first — this writes .cookie, and
     (if (and user password)
         (install (list (hash-rpc-credential user password)) nil)
         (multiple-value-bind (path secret)
-            (let ((data-directory (and node (bitcoin-lisp::node-data-directory node))))
+            (let ((data-directory (and node (bl::node-data-directory node))))
               (if data-directory (generate-rpc-cookie data-directory) (values nil nil)))
           (cond (path
                  (install (list (hash-rpc-credential +rpc-cookie-user+ secret)) path))
                 (t
-                 (bitcoin-lisp::node-log
+                 (bl::node-log
                   :error "RPC server not started: no -rpcuser/-rpcpassword and the ~
 .cookie file could not be written, so no request could be authorized")
                  nil))))))
@@ -1697,11 +1697,11 @@ REST interface is OFF unless -rest is given (DEFAULT_REST_ENABLE = false,
 init.cpp:153,758 — previously we registered it unconditionally).
 UI-ENABLED registers the /ui/ web UI dispatcher (gui-plan P0); UI-DIRECTORY
 overrides the asset directory (default: the repo's ui/, see ui.lisp)."
-  (let ((port (or port (bitcoin-lisp:network-rpc-port bitcoin-lisp:*network*)))
+  (let ((port (or port (bl:network-rpc-port bl:*network*)))
         (acl nil)
         (rpcauth-credentials nil))
     (when *rpc-server*
-      (bitcoin-lisp::node-log :warn "RPC server already running")
+      (bl::node-log :warn "RPC server already running")
       (return-from start-rpc-server nil))
     (setf bind (%rpc-bind-address bind allow-ip bind-supplied-p))
 
@@ -1837,7 +1837,7 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
               ;; so it sits at the front of the list and matches first. Only when
               ;; -rest is given (Core StartREST gate, init.cpp:758).
               (when rest-enabled
-                (bitcoin-lisp::node-log :info "REST interface enabled at /rest/")
+                (bl::node-log :info "REST interface enabled at /rest/")
                 (let ((rest-dispatcher (hunchentoot:create-prefix-dispatcher
                                         "/rest/" 'rest-dispatch-handler)))
                   (setf *rest-dispatcher* rest-dispatcher)
@@ -1851,8 +1851,8 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
               (when *ui-enabled*
                 (let ((dir (ui-directory)))
                   (if (and dir (probe-file dir))
-                      (bitcoin-lisp::node-log :info "Web UI enabled at /ui/ (serving ~A)" dir)
-                      (bitcoin-lisp::node-log
+                      (bl::node-log :info "Web UI enabled at /ui/ (serving ~A)" dir)
+                      (bl::node-log
                        :warn "Web UI enabled but asset directory ~A is missing — /ui/ will 404" dir)))
                 (let ((ui-dispatcher (make-ui-dispatcher)))
                   (setf *ui-dispatcher* ui-dispatcher)
@@ -1860,13 +1860,13 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
                   (push ui-dispatcher hunchentoot:*dispatch-table*)))
 
               (setf *rpc-server* acceptor)
-              (bitcoin-lisp::node-log :info "RPC server started on ~A:~A" bind port)
+              (bl::node-log :info "RPC server started on ~A:~A" bind port)
               acceptor)
           (usocket:address-in-use-error ()
-            (bitcoin-lisp::node-log :error "RPC port ~A already in use, continuing without RPC" port)
+            (bl::node-log :error "RPC port ~A already in use, continuing without RPC" port)
             (abort-start))
           (error (e)
-            (bitcoin-lisp::node-log :error "Failed to start RPC server: ~A" e)
+            (bl::node-log :error "Failed to start RPC server: ~A" e)
             (abort-start)))))))
 
 (defun stop-rpc-server ()
@@ -1875,9 +1875,9 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
     (handler-case
         (progn
           (hunchentoot:stop *rpc-server*)
-          (bitcoin-lisp::node-log :info "RPC server stopped"))
+          (bl::node-log :info "RPC server stopped"))
       (error (e)
-        (bitcoin-lisp::node-log :warn "Error stopping RPC server: ~A" e)))
+        (bl::node-log :warn "Error stopping RPC server: ~A" e)))
     ;; Remove dispatcher from dispatch table to prevent accumulation
     (when *rpc-dispatcher*
       (setf hunchentoot:*dispatch-table*

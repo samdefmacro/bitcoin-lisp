@@ -22,14 +22,14 @@ or a branch (list of two subtrees)."
     ((null tree) nil)
     ((hash-table-p tree)
      ;; Leaf node
-     (let ((script (bitcoin-lisp.crypto:hex-to-bytes (gethash "script" tree)))
+     (let ((script (bl.crypto:hex-to-bytes (gethash "script" tree)))
            (leaf-version (gethash "leafVersion" tree)))
-       (bitcoin-lisp.crypto:tap-leaf-hash leaf-version script)))
+       (bl.crypto:tap-leaf-hash leaf-version script)))
     ((listp tree)
      ;; Branch: [left, right]
      (let ((left (compute-script-tree-merkle-root (first tree)))
            (right (compute-script-tree-merkle-root (second tree))))
-       (bitcoin-lisp.crypto:tap-branch-hash left right)))
+       (bl.crypto:tap-branch-hash left right)))
     (t (error "Unknown script tree format: ~A" (type-of tree)))))
 
 (test bip341-wallet-vectors
@@ -43,7 +43,7 @@ or a branch (list of two subtrees)."
       (let* ((given (gethash "given" vec))
              (intermediary (gethash "intermediary" vec))
              (expected (gethash "expected" vec))
-             (internal-pubkey (bitcoin-lisp.crypto:hex-to-bytes
+             (internal-pubkey (bl.crypto:hex-to-bytes
                                (gethash "internalPubkey" given)))
              (script-tree (gethash "scriptTree" given))
              ;; Compute merkle root from script tree
@@ -58,24 +58,24 @@ or a branch (list of two subtrees)."
             (let ((ok t))
               ;; Check merkle root
               (when expected-merkle
-                (let ((expected-bytes (bitcoin-lisp.crypto:hex-to-bytes expected-merkle)))
+                (let ((expected-bytes (bl.crypto:hex-to-bytes expected-merkle)))
                   (unless (equalp merkle-root expected-bytes)
                     (setf ok nil)
                     (push (format nil "merkleRoot mismatch") failures))))
 
               ;; Check tweak
-              (let* ((tweak (bitcoin-lisp.crypto:tap-tweak-hash internal-pubkey merkle-root))
-                     (expected-tweak-bytes (bitcoin-lisp.crypto:hex-to-bytes expected-tweak)))
+              (let* ((tweak (bl.crypto:tap-tweak-hash internal-pubkey merkle-root))
+                     (expected-tweak-bytes (bl.crypto:hex-to-bytes expected-tweak)))
                 (unless (equalp tweak expected-tweak-bytes)
                   (setf ok nil)
                   (push (format nil "tweak mismatch") failures)))
 
               ;; Check tweaked pubkey
               (multiple-value-bind (tweaked-pubkey parity)
-                  (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey
+                  (bl.interop:compute-tweaked-pubkey
                    internal-pubkey merkle-root)
                 (declare (ignore parity))
-                (let ((expected-tweaked-bytes (bitcoin-lisp.crypto:hex-to-bytes expected-tweaked)))
+                (let ((expected-tweaked-bytes (bl.crypto:hex-to-bytes expected-tweaked)))
                   (unless (equalp tweaked-pubkey expected-tweaked-bytes)
                     (setf ok nil)
                     (push (format nil "tweakedPubkey mismatch") failures)))
@@ -84,7 +84,7 @@ or a branch (list of two subtrees)."
                 (when tweaked-pubkey
                   (let* ((spk (concatenate '(vector (unsigned-byte 8))
                                            #(#x51 #x20) tweaked-pubkey))
-                         (spk-hex (bitcoin-lisp.crypto:bytes-to-hex spk)))
+                         (spk-hex (bl.crypto:bytes-to-hex spk)))
                     (unless (string= spk-hex expected-spk)
                       (setf ok nil)
                       (push (format nil "scriptPubKey mismatch: ~A vs ~A" spk-hex expected-spk)
@@ -112,29 +112,29 @@ values (the scriptPubKey section above only covers address derivation)."
   (let* ((data (load-bip341-vectors))
          (kps (first (gethash "keyPathSpending" data)))
          (given (gethash "given" kps))
-         (raw-tx (bitcoin-lisp.crypto:hex-to-bytes (gethash "rawUnsignedTx" given)))
+         (raw-tx (bl.crypto:hex-to-bytes (gethash "rawUnsignedTx" given)))
          (tx (flexi-streams:with-input-from-sequence (s raw-tx)
-               (bitcoin-lisp.serialization:read-transaction s)))
+               (bl.ser:read-transaction s)))
          (utxos-spent (gethash "utxosSpent" given))
          (spent-vec (make-array (length utxos-spent))))
     (loop for u in utxos-spent for i from 0
           do (setf (aref spent-vec i)
-                   (bitcoin-lisp.storage:make-utxo-entry
+                   (bl.store:make-utxo-entry
                     :value (gethash "amountSats" u)
-                    :script-pubkey (bitcoin-lisp.crypto:hex-to-bytes
+                    :script-pubkey (bl.crypto:hex-to-bytes
                                     (gethash "scriptPubKey" u)))))
-    (let ((bitcoin-lisp.coalton.interop::*current-tx* tx)
-          (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent-vec)
-          (bitcoin-lisp.coalton.interop::*precomputed-sighash* nil))
+    (let ((bl.interop::*current-tx* tx)
+          (bl.interop::*current-spent-utxos* spent-vec)
+          (bl.interop::*precomputed-sighash* nil))
       (dolist (entry (gethash "inputSpending" kps))
         (let* ((g (gethash "given" entry))
                (inter (gethash "intermediary" entry))
                (idx (gethash "txinIndex" g))
                (hash-type (gethash "hashType" g))
                (expected (gethash "sigHash" inter)))
-          (let ((bitcoin-lisp.coalton.interop::*current-input-index* idx))
-            (let ((got (bitcoin-lisp.crypto:bytes-to-hex
-                        (bitcoin-lisp.coalton.interop::compute-bip341-sighash-real
+          (let ((bl.interop::*current-input-index* idx))
+            (let ((got (bl.crypto:bytes-to-hex
+                        (bl.interop::compute-bip341-sighash-real
                          hash-type nil nil))))
               (is (string-equal expected got)
                   "input ~D hashType ~D: expected ~A got ~A" idx hash-type expected got))))))))
@@ -151,35 +151,35 @@ values (the scriptPubKey section above only covers address derivation)."
 
 (defun run-taproot-spend-vector (rec)
   "Run one taproot spend vector through verify-script. Returns (values ok err)."
-  (let* ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes (gethash "tx" rec)))
+  (let* ((tx-bytes (bl.crypto:hex-to-bytes (gethash "tx" rec)))
          (tx (flexi-streams:with-input-from-sequence (s tx-bytes)
-               (bitcoin-lisp.serialization:read-transaction s)))
+               (bl.ser:read-transaction s)))
          (prevouts (gethash "prevouts" rec))
          (index (gethash "index" rec))
          (flags (gethash "flags" rec))
          (spent-vec (make-array (length prevouts))))
     (loop for p in prevouts for i from 0
           do (setf (aref spent-vec i)
-                   (bitcoin-lisp.storage:make-utxo-entry
+                   (bl.store:make-utxo-entry
                     :value (gethash "amountSats" p)
-                    :script-pubkey (bitcoin-lisp.crypto:hex-to-bytes
+                    :script-pubkey (bl.crypto:hex-to-bytes
                                     (gethash "scriptPubKey" p)))))
     (let* ((utxo (aref spent-vec index))
-           (amount (bitcoin-lisp.storage:utxo-entry-value utxo))
-           (spk (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
-           (input (elt (bitcoin-lisp.serialization:transaction-inputs tx) index))
-           (sig-bytes (bitcoin-lisp.serialization:tx-in-script-sig input))
-           (witness-stack (elt (bitcoin-lisp.serialization:transaction-witness tx) index))
-           (bitcoin-lisp.coalton.interop:*current-tx* tx)
-           (bitcoin-lisp.coalton.interop:*current-input-index* index)
-           (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent-vec)
-           (bitcoin-lisp.coalton.interop::*precomputed-sighash* nil)
-           (bitcoin-lisp.coalton.interop:*witness-input-amount* amount))
-      (bitcoin-lisp.coalton.interop:set-script-flags flags)
+           (amount (bl.store:utxo-entry-value utxo))
+           (spk (bl.store:utxo-entry-script-pubkey utxo))
+           (input (elt (bl.ser:transaction-inputs tx) index))
+           (sig-bytes (bl.ser:tx-in-script-sig input))
+           (witness-stack (elt (bl.ser:transaction-witness tx) index))
+           (bl.interop:*current-tx* tx)
+           (bl.interop:*current-input-index* index)
+           (bl.interop::*current-spent-utxos* spent-vec)
+           (bl.interop::*precomputed-sighash* nil)
+           (bl.interop:*witness-input-amount* amount))
+      (bl.interop:set-script-flags flags)
       (unwind-protect
-           (bitcoin-lisp.coalton.interop:verify-script
+           (bl.interop:verify-script
             sig-bytes spk :witness witness-stack :amount amount)
-        (bitcoin-lisp.coalton.interop:set-script-flags nil)))))
+        (bl.interop:set-script-flags nil)))))
 
 (test taproot-spend-vectors-baseline
   "All generated taproot spends verify: key-path (DEFAULT, ALL|ANYONECANPAY),
@@ -211,10 +211,10 @@ final signature byte (the explicit sighash byte of a 65-byte sig)."
                                    :initial-element #x02)))
     (when (and last-byte (plusp sig-len))
       (setf (aref sig (1- sig-len)) last-byte))
-    (let ((bitcoin-lisp.coalton.interop::*script-flags* flags)
-          (bitcoin-lisp.coalton.interop::*tapscript-validation-weight-left* weight))
+    (let ((bl.interop::*script-flags* flags)
+          (bl.interop::*tapscript-validation-weight-left* weight))
       (multiple-value-bind (status result)
-          (bitcoin-lisp.coalton.interop:verify-tapscript-signature sig pk)
+          (bl.interop:verify-tapscript-signature sig pk)
         (values status result)))))
 
 (test ga7-01-tapscript-checksig-dispatch-order
@@ -283,12 +283,12 @@ the length check first and never charged for those."
   (is (eq :empty-sig (tapsig-status 0 32 :weight 0)))
   (is (eq :empty-pubkey (tapsig-status 0 0 :weight 0)))
   ;; The decrement really does land on the caller's binding.
-  (let ((bitcoin-lisp.coalton.interop::*script-flags* nil)
-        (bitcoin-lisp.coalton.interop::*tapscript-validation-weight-left* 120))
-    (bitcoin-lisp.coalton.interop:verify-tapscript-signature
+  (let ((bl.interop::*script-flags* nil)
+        (bl.interop::*tapscript-validation-weight-left* 120))
+    (bl.interop:verify-tapscript-signature
      (make-array 10 :element-type '(unsigned-byte 8) :initial-element 1)
      (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2))
-    (is (= 70 bitcoin-lisp.coalton.interop::*tapscript-validation-weight-left*))))
+    (is (= 70 bl.interop::*tapscript-validation-weight-left*))))
 
 (test ga7-02-bip341-sighash-single-out-of-range
   "G7-02: SignatureHashSchnorr returns false when SIGHASH_SINGLE is used at an
@@ -301,29 +301,29 @@ but only 2 outputs, and every SINGLE vector sits at index 0 or 1."
   (let* ((data (load-bip341-vectors))
          (kps (first (gethash "keyPathSpending" data)))
          (given (gethash "given" kps))
-         (raw-tx (bitcoin-lisp.crypto:hex-to-bytes (gethash "rawUnsignedTx" given)))
+         (raw-tx (bl.crypto:hex-to-bytes (gethash "rawUnsignedTx" given)))
          (tx (flexi-streams:with-input-from-sequence (s raw-tx)
-               (bitcoin-lisp.serialization:read-transaction s)))
+               (bl.ser:read-transaction s)))
          (utxos-spent (gethash "utxosSpent" given))
          (spent-vec (make-array (length utxos-spent)))
-         (num-inputs (length (bitcoin-lisp.serialization:transaction-inputs tx)))
-         (num-outputs (length (bitcoin-lisp.serialization:transaction-outputs tx))))
+         (num-inputs (length (bl.ser:transaction-inputs tx)))
+         (num-outputs (length (bl.ser:transaction-outputs tx))))
     (loop for u in utxos-spent for i from 0
           do (setf (aref spent-vec i)
-                   (bitcoin-lisp.storage:make-utxo-entry
+                   (bl.store:make-utxo-entry
                     :value (gethash "amountSats" u)
-                    :script-pubkey (bitcoin-lisp.crypto:hex-to-bytes
+                    :script-pubkey (bl.crypto:hex-to-bytes
                                     (gethash "scriptPubKey" u)))))
     ;; Precondition: the vector tx really does have more inputs than outputs.
     (is (= 9 num-inputs))
     (is (= 2 num-outputs))
-    (let ((bitcoin-lisp.coalton.interop::*current-tx* tx)
-          (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent-vec)
-          (bitcoin-lisp.coalton.interop::*precomputed-sighash* nil))
+    (let ((bl.interop::*current-tx* tx)
+          (bl.interop::*current-spent-utxos* spent-vec)
+          (bl.interop::*precomputed-sighash* nil))
       (loop for idx from 0 below num-inputs
-            do (let ((bitcoin-lisp.coalton.interop::*current-input-index* idx))
+            do (let ((bl.interop::*current-input-index* idx))
                  (dolist (ht '(#x03 #x83))   ; SINGLE, SINGLE|ANYONECANPAY
-                   (let ((got (bitcoin-lisp.coalton.interop::compute-bip341-sighash-real
+                   (let ((got (bl.interop::compute-bip341-sighash-real
                                ht nil nil)))
                      (if (< idx num-outputs)
                          (is (not (null got))
@@ -334,7 +334,7 @@ produce a sighash" idx ht)
 hard-fail, got a sighash" idx ht))))
                  ;; Non-SINGLE hash types are unaffected at every index.
                  (dolist (ht '(#x00 #x01 #x02 #x81 #x82))
-                   (is (not (null (bitcoin-lisp.coalton.interop::compute-bip341-sighash-real
+                   (is (not (null (bl.interop::compute-bip341-sighash-real
                                    ht nil nil)))
                        "hashType ~2,'0X at input ~D must produce a sighash" ht idx)))))))
 
@@ -345,9 +345,9 @@ one. Uses the same 9-input/2-output vector tx at an out-of-range index."
   (let* ((data (load-bip341-vectors))
          (kps (first (gethash "keyPathSpending" data)))
          (given (gethash "given" kps))
-         (raw-tx (bitcoin-lisp.crypto:hex-to-bytes (gethash "rawUnsignedTx" given)))
+         (raw-tx (bl.crypto:hex-to-bytes (gethash "rawUnsignedTx" given)))
          (tx (flexi-streams:with-input-from-sequence (s raw-tx)
-               (bitcoin-lisp.serialization:read-transaction s)))
+               (bl.ser:read-transaction s)))
          (utxos-spent (gethash "utxosSpent" given))
          (spent-vec (make-array (length utxos-spent)))
          ;; 65-byte sig whose explicit sighash byte is SIGHASH_SINGLE.
@@ -356,27 +356,27 @@ one. Uses the same 9-input/2-output vector tx at an out-of-range index."
     (setf (aref sig 64) #x03)
     (loop for u in utxos-spent for i from 0
           do (setf (aref spent-vec i)
-                   (bitcoin-lisp.storage:make-utxo-entry
+                   (bl.store:make-utxo-entry
                     :value (gethash "amountSats" u)
-                    :script-pubkey (bitcoin-lisp.crypto:hex-to-bytes
+                    :script-pubkey (bl.crypto:hex-to-bytes
                                     (gethash "scriptPubKey" u)))))
-    (let ((bitcoin-lisp.coalton.interop::*current-tx* tx)
-          (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent-vec)
-          (bitcoin-lisp.coalton.interop::*current-input-index* 5)  ; >= 2 outputs
-          (bitcoin-lisp.coalton.interop::*precomputed-sighash* nil)
-          (bitcoin-lisp.coalton.interop::*script-flags* nil)
-          (bitcoin-lisp.coalton.interop::*tapscript-amount* 0)
-          (bitcoin-lisp.coalton.interop::*tapscript-leaf-hash* nil)
-          (bitcoin-lisp.coalton.interop::*tapscript-validation-weight-left* 1000))
+    (let ((bl.interop::*current-tx* tx)
+          (bl.interop::*current-spent-utxos* spent-vec)
+          (bl.interop::*current-input-index* 5)  ; >= 2 outputs
+          (bl.interop::*precomputed-sighash* nil)
+          (bl.interop::*script-flags* nil)
+          (bl.interop::*tapscript-amount* 0)
+          (bl.interop::*tapscript-leaf-hash* nil)
+          (bl.interop::*tapscript-validation-weight-left* 1000))
       ;; Tapscript CHECKSIG: :bad-sighash-type maps to SE-TapscriptInvalidSig,
       ;; a hard failure — never a schnorr verification against a short preimage.
       (multiple-value-bind (status result)
-          (bitcoin-lisp.coalton.interop:verify-tapscript-signature sig pk)
+          (bl.interop:verify-tapscript-signature sig pk)
         (is (eq :bad-sighash-type status))
         (is (null result)))
       ;; Key path: same input, witness of one 65-byte signature.
       (multiple-value-bind (ok err)
-          (bitcoin-lisp.coalton.interop::validate-taproot-key-path (list sig) pk 0)
+          (bl.interop::validate-taproot-key-path (list sig) pk 0)
         (is (null ok))
         (is (eq :sig-hashtype err))))))
 
@@ -410,13 +410,13 @@ one. Uses the same 9-input/2-output vector tx at an out-of-range index."
   "Validate a script-path spend of LEAF-SCRIPT as the single leaf (version 0xc0)
 of a taproot output, with INPUTS as the initial witness stack and an optional
 ANNEX as the final witness element. Returns (values ok err)."
-  (let* ((internal (bitcoin-lisp.crypto:derive-xonly-pubkey
+  (let* ((internal (bl.crypto:derive-xonly-pubkey
                     (make-array 32 :element-type '(unsigned-byte 8)
                                    :initial-element #x03)))
-         (leaf-hash (bitcoin-lisp.crypto:tap-leaf-hash #xc0 leaf-script)))
+         (leaf-hash (bl.crypto:tap-leaf-hash #xc0 leaf-script)))
     (multiple-value-bind (output-key parity)
-        (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey internal leaf-hash)
-      (bitcoin-lisp.coalton.interop:validate-taproot
+        (bl.interop:compute-tweaked-pubkey internal leaf-hash)
+      (bl.interop:validate-taproot
        (append inputs
                (list leaf-script (tap-bytes (logior #xc0 parity) internal))
                (and annex (list annex)))
@@ -432,8 +432,8 @@ pre-fix code gated all three on TAPSCRIPT and accepted the oversize push."
   (is (null (tapscript-leaf-spend (tap-bytes (tap-pushdata2 600) #x75 #x51))))
   ;; Control: the same scripts under witness v0, where the cap was never gated.
   (flet ((p2wsh (script)
-           (bitcoin-lisp.coalton.interop:validate-p2wsh
-            (list script) (bitcoin-lisp.crypto:sha256 script) 100000)))
+           (bl.interop:validate-p2wsh
+            (list script) (bl.crypto:sha256 script) 100000)))
     (is (eq t (p2wsh (tap-bytes (tap-pushdata2 520) #x75 #x51))))
     (is (null (p2wsh (tap-bytes (tap-pushdata2 521) #x75 #x51))))))
 
@@ -509,17 +509,17 @@ the only way such a spend can fail."
 for this spend, read out of the production path by stubbing RUN-TAPSCRIPT.
 Returns :NEVER-CALLED if the spend never reached tapscript execution."
   (let ((captured :never-called)
-        (original (fdefinition 'bitcoin-lisp.coalton.interop::run-tapscript)))
+        (original (fdefinition 'bl.interop::run-tapscript)))
     (unwind-protect
          (progn
-           (setf (fdefinition 'bitcoin-lisp.coalton.interop::run-tapscript)
+           (setf (fdefinition 'bl.interop::run-tapscript)
                  (lambda (&rest ignored)
                    (declare (ignore ignored))
                    (setf captured
-                         bitcoin-lisp.coalton.interop::*tapscript-validation-weight-left*)
+                         bl.interop::*tapscript-validation-weight-left*)
                    (values t nil)))
            (tapscript-leaf-spend leaf-script :annex annex))
-      (setf (fdefinition 'bitcoin-lisp.coalton.interop::run-tapscript) original))
+      (setf (fdefinition 'bl.interop::run-tapscript) original))
     captured))
 
 (test ga8-s1-4-annex-counts-toward-the-validation-weight-budget
@@ -555,15 +555,15 @@ tapscript is VALID and must stay valid. Both directions are asserted here."
   (let ((op-success #xbb))              ; OP_SUCCESS187 (BIP 342)
     ;; Consensus: the block flag set has no DISCOURAGE_* at all, so
     ;; OP_SUCCESSx still short-circuits to success. This must not change.
-    (let ((bitcoin-lisp.coalton.interop:*script-flags*
-            (let ((bitcoin-lisp:*network* :mainnet))
-              (bitcoin-lisp.validation:block-script-flags nil 900000))))
+    (let ((bl.interop:*script-flags*
+            (let ((bl:*network* :mainnet))
+              (bl.val:block-script-flags nil 900000))))
       (is (eq t (tapscript-leaf-spend (tap-bytes op-success)))
           "a block containing an OP_SUCCESS tapscript must stay valid"))
     ;; Policy: the standard flag set carries DISCOURAGE_OP_SUCCESS, so the
     ;; mempool refuses it.
-    (let ((bitcoin-lisp.coalton.interop:*script-flags*
-            bitcoin-lisp.validation:+standard-script-verify-flags+))
+    (let ((bl.interop:*script-flags*
+            bl.val:+standard-script-verify-flags+))
       (multiple-value-bind (ok err) (tapscript-leaf-spend (tap-bytes op-success))
         (is (null ok) "an OP_SUCCESS tapscript was accepted under policy flags")
         (is (eq :discourage-op-success err)))))
@@ -571,10 +571,10 @@ tapscript is VALID and must stay valid. Both directions are asserted here."
   ;; a test that only exercised the interpreter would pass even if the two sets
   ;; had been swapped.
   (is-true (search "DISCOURAGE_OP_SUCCESS"
-                   bitcoin-lisp.validation:+standard-script-verify-flags+))
-  (let ((bitcoin-lisp:*network* :mainnet))
+                   bl.val:+standard-script-verify-flags+))
+  (let ((bl:*network* :mainnet))
     (is-false (member "DISCOURAGE_OP_SUCCESS"
-                      (bitcoin-lisp.validation:block-script-flags-list nil 900000)
+                      (bl.val:block-script-flags-list nil 900000)
                       :test #'string=))))
 
 ;;;; --- Control blocks: TaprootBuilder::GetSpendData ------------------------
@@ -603,18 +603,18 @@ vectors are the only oracle that separates the two."
                                   (if (listp node)
                                       (dolist (child node) (walk child (1+ depth)))
                                       (push (list depth
-                                                  (bitcoin-lisp.crypto:hex-to-bytes
+                                                  (bl.crypto:hex-to-bytes
                                                    (gethash "script" node))
                                                   (truncate (gethash "leafVersion" node)))
                                             leaves))))
                          (walk tree 0))
                        (setf leaves (nreverse leaves))
-                       (let* ((internal (bitcoin-lisp.crypto:hex-to-bytes
+                       (let* ((internal (bl.crypto:hex-to-bytes
                                          (gethash "internalPubkey" given)))
                               (leaf-hashes
                                 (loop for (depth script version) in leaves
                                       collect (cons depth
-                                                    (bitcoin-lisp.crypto:tap-leaf-hash
+                                                    (bl.crypto:tap-leaf-hash
                                                      version script))))
                               (expected (gethash "scriptPathControlBlocks"
                                                  (gethash "expected" c))))
@@ -622,24 +622,24 @@ vectors are the only oracle that separates the two."
                              ;; T: merkle PATHS are spend data and %TAPROOT-TREE
                              ;; only tracks them on request — address derivation
                              ;; walks whole ranges and needs the root alone.
-                             (bitcoin-lisp.rpc::%taproot-tree leaf-hashes t)
+                             (bl.rpc::%taproot-tree leaf-hashes t)
                            (is (string= (gethash "merkleRoot" (gethash "intermediary" c))
-                                        (bitcoin-lisp.crypto:bytes-to-hex root)))
+                                        (bl.crypto:bytes-to-hex root)))
                            (multiple-value-bind (output-key parity)
-                               (bitcoin-lisp.crypto:tweak-xonly-pubkey
-                                internal (bitcoin-lisp.crypto:tap-tweak-hash internal root))
+                               (bl.crypto:tweak-xonly-pubkey
+                                internal (bl.crypto:tap-tweak-hash internal root))
                              (declare (ignore output-key))
                              (loop for (nil nil version) in leaves
                                    for p in paths
                                    for want in expected
                                    do (incf checked)
                                       (is (string= want
-                                                   (bitcoin-lisp.crypto:bytes-to-hex
-                                                    (bitcoin-lisp.rpc::%taproot-control-block
+                                                   (bl.crypto:bytes-to-hex
+                                                    (bl.rpc::%taproot-control-block
                                                      version parity internal p)))
                                           "control block mismatch: got ~A wanted ~A"
-                                          (bitcoin-lisp.crypto:bytes-to-hex
-                                           (bitcoin-lisp.rpc::%taproot-control-block
+                                          (bl.crypto:bytes-to-hex
+                                           (bl.rpc::%taproot-control-block
                                             version parity internal p))
                                           want)))))))
           (is (= 12 checked) "checked ~D control blocks, expected 12" checked)))))

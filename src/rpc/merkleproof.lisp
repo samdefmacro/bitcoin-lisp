@@ -16,7 +16,7 @@
   (let ((c (make-array 64 :element-type '(unsigned-byte 8))))
     (replace c a :start1 0)
     (replace c b :start1 32)
-    (bitcoin-lisp.crypto:hash256 c)))
+    (bl.crypto:hash256 c)))
 
 (defun %mp-tree-width (ntx height)
   "Number of nodes at HEIGHT in a merkle tree over NTX leaves."
@@ -133,27 +133,27 @@ vBits serialization)."
 
 (defun serialize-merkle-block (header-bytes ntx hashes bits)
   "Serialize a CMerkleBlock: header(80) + ntx(u32) + vHash + vBits."
-  (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
-    (bitcoin-lisp.serialization:bb-write-bytes bb header-bytes)
-    (bitcoin-lisp.serialization:bb-write-u32-le bb ntx)
-    (bitcoin-lisp.serialization:bb-write-varint bb (length hashes))
-    (dolist (h hashes) (bitcoin-lisp.serialization:bb-write-bytes bb h))
+  (let ((bb (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-bytes bb header-bytes)
+    (bl.ser:bb-write-u32-le bb ntx)
+    (bl.ser:bb-write-varint bb (length hashes))
+    (dolist (h hashes) (bl.ser:bb-write-bytes bb h))
     (let ((packed (%mp-pack-bits bits)))
-      (bitcoin-lisp.serialization:bb-write-varint bb (length packed))
-      (bitcoin-lisp.serialization:bb-write-bytes bb packed))
-    (bitcoin-lisp.serialization:bb-finish bb)))
+      (bl.ser:bb-write-varint bb (length packed))
+      (bl.ser:bb-write-bytes bb packed))
+    (bl.ser:bb-finish bb)))
 
 (defun parse-merkle-block (bytes)
   "Parse a serialized CMerkleBlock. Returns
 (values header-bytes ntx hashes bits) or signals on truncation."
-  (let ((br (bitcoin-lisp.serialization:make-byte-reader-from bytes)))
-    (let* ((header (bitcoin-lisp.serialization:br-read-bytes br 80))
-           (ntx (bitcoin-lisp.serialization:br-read-u32-le br))
-           (nhash (bitcoin-lisp.serialization:br-read-compact-size br))
+  (let ((br (bl.ser:make-byte-reader-from bytes)))
+    (let* ((header (bl.ser:br-read-bytes br 80))
+           (ntx (bl.ser:br-read-u32-le br))
+           (nhash (bl.ser:br-read-compact-size br))
            (hashes (loop repeat nhash
-                         collect (bitcoin-lisp.serialization:br-read-bytes br 32)))
-           (nbits-bytes (bitcoin-lisp.serialization:br-read-compact-size br))
-           (bit-bytes (bitcoin-lisp.serialization:br-read-bytes br nbits-bytes)))
+                         collect (bl.ser:br-read-bytes br 32)))
+           (nbits-bytes (bl.ser:br-read-compact-size br))
+           (bit-bytes (bl.ser:br-read-bytes br nbits-bytes)))
       (values header ntx hashes (%mp-unpack-bits bit-bytes)))))
 
 ;;; --- RPCs ---
@@ -183,21 +183,21 @@ hex-encoded CMerkleBlock."
                     (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid blockhash"))
                   (parse-hex-hash blockhash-hex))
                  ((let ((ti (rpc-get-tx-index node)))
-                    (and ti (bitcoin-lisp.storage:tx-index-enabled ti)))
-                  (let ((loc (bitcoin-lisp.storage:txindex-lookup
+                    (and ti (bl.store:tx-index-enabled ti)))
+                  (let ((loc (bl.store:txindex-lookup
                               (rpc-get-tx-index node) (first wanted))))
                     (unless loc
                       (error 'rpc-error :code +rpc-invalid-address-or-key+
                                         :message "Transaction not in txindex; pass a blockhash"))
-                    (bitcoin-lisp.storage:tx-location-block-hash loc)))
+                    (bl.store:tx-location-block-hash loc)))
                  (t (error 'rpc-error :code +rpc-invalid-parameter+
                                       :message "Need a blockhash (no txindex on this node)"))))
-             (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+             (block (bl.store:get-block block-store block-hash)))
         (unless block
           (error 'rpc-error :code +rpc-invalid-address-or-key+
                             :message "Block not found (pruned?)"))
-        (let* ((txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-               (txids-vec (map 'vector #'bitcoin-lisp.serialization:transaction-hash txs))
+        (let* ((txs (bl.ser:bitcoin-block-transactions block))
+               (txids-vec (map 'vector #'bl.ser:transaction-hash txs))
                (match (make-array (length txids-vec) :initial-element nil)))
           ;; Flag the requested txids; every one must be in the block.
           (dolist (w wanted)
@@ -207,9 +207,9 @@ hex-encoded CMerkleBlock."
                                   :message "Not all txids found in the specified block"))
               (setf (aref match idx) t)))
           (multiple-value-bind (bits hashes) (build-partial-merkle-tree txids-vec match)
-            (let ((header-bytes (bitcoin-lisp.serialization:serialize-block-header
-                                 (bitcoin-lisp.serialization:bitcoin-block-header block))))
-              (bitcoin-lisp.crypto:bytes-to-hex
+            (let ((header-bytes (bl.ser:serialize-block-header
+                                 (bl.ser:bitcoin-block-header block))))
+              (bl.crypto:bytes-to-hex
                (serialize-merkle-block header-bytes (length txids-vec) hashes bits)))))))))
 
 (defun rpc-verifytxoutproof (node params)
@@ -220,7 +220,7 @@ strings, or an empty list if the block isn't in the active chain."
   (let ((proof-hex (first params)))
     (unless (stringp proof-hex)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "proof must be a hex string"))
-    (let ((bytes (handler-case (bitcoin-lisp.crypto:hex-to-bytes proof-hex)
+    (let ((bytes (handler-case (bl.crypto:hex-to-bytes proof-hex)
                    (error () (error 'rpc-error :code +rpc-invalid-parameter+
                                               :message "Invalid proof hex")))))
       (multiple-value-bind (header-bytes ntx hashes bits) (parse-merkle-block bytes)
@@ -232,8 +232,8 @@ strings, or an empty list if the block isn't in the active chain."
           ;; and on the active chain).
           (let* ((header-root (subseq header-bytes 36 68))
                  (chain-state (rpc-get-chain-state node))
-                 (block-hash (bitcoin-lisp.crypto:hash256 header-bytes))
-                 (entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
+                 (block-hash (bl.crypto:hash256 header-bytes))
+                 (entry (bl.store:get-block-index-entry chain-state block-hash)))
             (unless (equalp root header-root)
               (error 'rpc-error :code +rpc-invalid-parameter+
                                 :message "Merkle root mismatch — proof does not match its header"))
@@ -248,8 +248,8 @@ strings, or an empty list if the block isn't in the active chain."
             ;; committed to by a block cannot distinguish "no" from "I have no
             ;; idea what block that is" when both render as [].
             (unless (and entry
-                         (bitcoin-lisp.storage:entry-on-active-chain-p chain-state entry)
-                         (plusp (bitcoin-lisp.storage:block-index-entry-tx-count entry)))
+                         (bl.store:entry-on-active-chain-p chain-state entry)
+                         (plusp (bl.store:block-index-entry-tx-count entry)))
               (error 'rpc-error :code +rpc-invalid-address-or-key+
                                 :message "Block not found in chain"))
             ;; THE proof check (rpc/txoutproof.cpp:165-170, "Check if proof is
@@ -267,6 +267,6 @@ strings, or an empty list if the block isn't in the active chain."
             ;; deposit, bridge or attestation logic through this RPC got a
             ;; forged yes for the cost of one call -- no chain access, no
             ;; hashpower.
-            (if (= ntx (bitcoin-lisp.storage:block-index-entry-tx-count entry))
+            (if (= ntx (bl.store:block-index-entry-tx-count entry))
                 (json-array (mapcar #'hash-to-hex matched))
                 (json-array nil))))))))

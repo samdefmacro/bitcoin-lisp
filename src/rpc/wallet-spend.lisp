@@ -112,10 +112,10 @@ satoshis (-1 disables the APS retry).")
   "Core DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT — the legacy
 package limits chain.getPackageLimits still reports for the eligibility
 filters (cluster limits are enforced by the mempool itself).")
-(defconstant +truc-max-weight+ (* 4 bitcoin-lisp.mempool:+truc-max-vsize+)
+(defconstant +truc-max-weight+ (* 4 bl.mp:+truc-max-vsize+)
   "policy/truc_policy.h TRUC_MAX_WEIGHT.")
 (defconstant +truc-child-max-weight+
-  (* 4 bitcoin-lisp.mempool:+truc-child-max-vsize+)
+  (* 4 bl.mp:+truc-child-max-vsize+)
   "policy/truc_policy.h TRUC_CHILD_MAX_WEIGHT.")
 (defconstant +uint64-max+ (1- (ash 1 64)))
 
@@ -190,7 +190,7 @@ validation-layer dust-threshold is specialized to the 3000 sat/kvB dust
 relay rate)."
   (if (and (plusp (length script)) (= (aref script 0) #x6a)) ; OP_RETURN
       0
-      (let* ((spend-size (if (bitcoin-lisp.validation::output-witness-program-p
+      (let* ((spend-size (if (bl.val::output-witness-program-p
                               script)
                              (+ 32 4 1 (floor 107 4) 4)
                              (+ 32 4 1 107 4)))
@@ -203,7 +203,7 @@ relay rate)."
 is 0, so a NEGATIVE value (SFFO driving a data output below zero) IS dust —
 that is exactly the check that turns it into Core's \"transaction amount is
 too small to pay the fee\" error instead of committing a broken tx."
-  (< value (bitcoin-lisp.validation:dust-threshold script)))
+  (< value (bl.val:dust-threshold script)))
 
 (defun %format-money (satoshis)
   "Core FormatMoney: BTC decimal string, trailing zeros trimmed but at
@@ -314,27 +314,27 @@ decimal string with at most 3 fraction digits, to integer sat/kvB."
       (wcc-signal-bip125-rbf cc)))
 
 (defun %wcc-add-external-script (cc script)
-  (setf (gethash (bitcoin-lisp.crypto:hash160 script) (wcc-external-scripts cc))
+  (setf (gethash (bl.crypto:hash160 script) (wcc-external-scripts cc))
         script)
-  (setf (gethash (bitcoin-lisp.crypto:sha256 script) (wcc-external-scripts cc))
+  (setf (gethash (bl.crypto:sha256 script) (wcc-external-scripts cc))
         script))
 
 ;;; --- Wallet fee estimation (Core wallet/fees.cpp) ---
 
 (defun %wallet-required-fee-rate ()
   "GetRequiredFeeRate: max(-mintxfee, min relay feerate), sat/kvB."
-  (max *wallet-min-tx-fee* bitcoin-lisp.mempool:*min-relay-fee-rate*))
+  (max *wallet-min-tx-fee* bl.mp:*min-relay-fee-rate*))
 
 (defun %estimate-smart-fee-sat-kvb (node target conservative)
   "estimateSmartFee via the node's fee estimator, as integer sat/kvB;
 0 when no reliable estimate exists (Core CFeeRate(0)). The estimator's
 sat/vB value (possibly non-integral) is converted to integer sat/kvB HERE,
 at the estimate boundary — all downstream fee math is integer."
-  (let ((estimator (bitcoin-lisp:node-fee-estimator node)))
+  (let ((estimator (bl:node-fee-estimator node)))
     (if (and estimator
-             (bitcoin-lisp.mempool:fee-estimator-ready-p estimator))
+             (bl.mp:fee-estimator-ready-p estimator))
         (multiple-value-bind (rate error)
-            (bitcoin-lisp.mempool:estimate-fee-rate
+            (bl.mp:estimate-fee-rate
              estimator (max 1 (min target 1008))
              :mode (if conservative :conservative :economical))
           (if error 0 (max 0 (round (* (rational rate) 1000)))))
@@ -359,15 +359,15 @@ node lock (fee estimator + mempool reads)."
                               (t (not (%wcc-signal-rbf cc))))))
          (setf rate (%estimate-smart-fee-sat-kvb node target conservative))
          (when (zerop rate)
-           (setf rate bitcoin-lisp:*wallet-fallback-fee*
+           (setf rate bl:*wallet-fallback-fee*
                  reason :fallback)
            (when (zerop rate)
              ;; Fallback disabled: return 0 directly (Core returns the zero
              ;; CFeeRate; the caller errors on the FALLBACK reason).
              (return-from %wallet-minimum-fee-rate (values 0 :fallback))))
-         (let* ((mempool (bitcoin-lisp::node-mempool node))
+         (let* ((mempool (bl::node-mempool node))
                 (mempool-min (if mempool
-                                 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate
+                                 (bl.mp:mempool-effective-min-fee-rate
                                   mempool)
                                  0)))
            (when (< rate mempool-min)
@@ -384,7 +384,7 @@ by -discardfee, floored at the dust relay feerate."
          (rate (if (zerop estimate)
                    *wallet-discard-rate*
                    (min estimate *wallet-discard-rate*))))
-    (max rate bitcoin-lisp.validation:+dust-relay-fee-rate+)))
+    (max rate bl.val:+dust-relay-fee-rate+)))
 
 (defun %fee-reason-string (reason)
   "common/messages.cpp StringForFeeReason. DIVERGENCE (cosmetic): our block
@@ -427,7 +427,7 @@ SCRIPT's position, or the coin control's external solving data."
         (and spkm (%spkm-sub-scripts spkm script))
       (when (and cc (wcc-external-scripts cc))
         (multiple-value-bind (type data)
-            (bitcoin-lisp.validation:classify-script script)
+            (bl.val:classify-script script)
           (case type
             (:scripthash
              (unless redeem
@@ -464,10 +464,10 @@ mis-sized.
 
 ELEMS adds one for the witnessScript itself, which the caller pushes and which
 GetWitnessSize deliberately excludes."
-  (let ((node (bitcoin-lisp.validation::ms-from-script witness-script)))
+  (let ((node (bl.val::ms-from-script witness-script)))
     (when node
-      (let ((bytes (bitcoin-lisp.validation::ms-node-get-witness-size node))
-            (stack (bitcoin-lisp.validation::ms-node-get-stack-size node)))
+      (let ((bytes (bl.val::ms-node-get-witness-size node))
+            (stack (bl.val::ms-node-get-stack-size node)))
         (when (and bytes stack)
           (values bytes (1+ stack)))))))
 
@@ -476,7 +476,7 @@ GetWitnessSize deliberately excludes."
 SCRIPT, mirroring the descriptor MaxSatisfactionWeight arithmetic on the
 descriptor InferDescriptor would produce; NIL when not solvable."
   (multiple-value-bind (type data)
-      (bitcoin-lisp.validation:classify-script script)
+      (bl.val:classify-script script)
     (case type
       (:pubkey (values (* 4 (+ 1 +ecdsa-max-sig-size+)) nil 1))
       (:pubkeyhash
@@ -508,7 +508,7 @@ descriptor InferDescriptor would produce; NIL when not solvable."
                 (when sat
                   (multiple-value-bind (m) (%parse-multisig witness)
                     (values (+ (* 4 (+ 1 (length redeem)))
-                               (+ (bitcoin-lisp.serialization:compact-size-length (length witness))
+                               (+ (bl.ser:compact-size-length (length witness))
                                   (length witness) sat))
                             t (+ 3 m))))))
              ;; sh(multi(...)) — legacy
@@ -525,7 +525,7 @@ descriptor InferDescriptor would produce; NIL when not solvable."
            (let ((sat (%multisig-sat-size witness)))
              (if sat
                  (multiple-value-bind (m) (%parse-multisig witness)
-                   (values (+ (bitcoin-lisp.serialization:compact-size-length (length witness))
+                   (values (+ (bl.ser:compact-size-length (length witness))
                               (length witness) sat)
                            t (+ 2 m)))
                  ;; Not multisig: try miniscript, or the coin looks unsolvable
@@ -535,7 +535,7 @@ descriptor InferDescriptor would produce; NIL when not solvable."
                  (multiple-value-bind (msat elems)
                      (%miniscript-sat-size-and-elems witness)
                    (when msat
-                     (values (+ (bitcoin-lisp.serialization:compact-size-length (length witness))
+                     (values (+ (bl.ser:compact-size-length (length witness))
                                 (length witness) msat)
                              t elems))))))))
       (t nil))))
@@ -547,9 +547,9 @@ incl. outpoint/sequence/length prefixes, or NIL when unsolvable."
     (when sat
       (let ((scriptsig-len (if segwit
                                1
-                               (bitcoin-lisp.serialization:compact-size-length (floor sat 4))))
+                               (bl.ser:compact-size-length (floor sat 4))))
             (witstack-len (if segwit
-                              (bitcoin-lisp.serialization:compact-size-length elems)
+                              (bl.ser:compact-size-length elems)
                               (if tx-is-segwit 1 0))))
         (+ (* 4 (+ 32 4 4 scriptsig-len)) witstack-len sat)))))
 
@@ -565,7 +565,7 @@ programs count even when unsolvable (Core's InferDescriptor falls back to
 an addr() descriptor whose output type is still a witness type,
 spend.cpp:150-157); P2SH counts only when the known redeem script wraps a
 witness program."
-  (case (bitcoin-lisp.validation:classify-script script)
+  (case (bl.val:classify-script script)
     ((:witness-v0-keyhash :witness-v0-scripthash :witness-v1-taproot) t)
     (:scripthash
      (multiple-value-bind (sat segwit) (%script-sat-weight wallet cc script)
@@ -577,18 +577,18 @@ witness program."
 each element (script . weight-override) where WEIGHT-OVERRIDE is the coin
 control's explicit input weight or NIL). Returns (values vsize weight) or
 (values -1 -1)."
-  (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-         (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
+  (let* ((inputs (bl.ser:transaction-inputs tx))
+         (outputs (bl.ser:transaction-outputs tx))
          (weight (* 4 (+ 4 4
-                         (bitcoin-lisp.serialization:compact-size-length (length inputs))
-                         (bitcoin-lisp.serialization:compact-size-length (length outputs)))))
+                         (bl.ser:compact-size-length (length inputs))
+                         (bl.ser:compact-size-length (length outputs)))))
          (is-segwit (some (lambda (txo)
                             (%txout-script-segwit-p wallet cc (car txo)))
                           txouts)))
     (when is-segwit (incf weight 2))
     (loop for output across outputs
           do (incf weight (* 4 (%txout-serialize-size
-                                (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                (bl.ser:tx-out-script-pubkey
                                  output)))))
     (loop for txo in txouts
           for override = (cdr txo)
@@ -606,25 +606,25 @@ preset, the UTXO set, or the mempool (Core mapWallet + GetExternalOutput +
 chain findCoins). Returns NIL when unknown. Caller holds both locks."
   (or (let ((wtx (wallet-get-wallet-tx wallet txid)))
         (when (and wtx
-                   (< vout (length (bitcoin-lisp.serialization:transaction-outputs
+                   (< vout (length (bl.ser:transaction-outputs
                                     (wallet-tx-tx wtx)))))
-          (aref (bitcoin-lisp.serialization:transaction-outputs
+          (aref (bl.ser:transaction-outputs
                  (wallet-tx-tx wtx))
                 vout)))
       (let ((preset (and cc (gethash (cons txid vout) (wcc-presets cc)))))
         (and preset (wcc-preset-txout preset)))
       (let* ((utxo-set (rpc-get-utxo-set node))
              (utxo (and utxo-set
-                        (bitcoin-lisp.storage:get-utxo utxo-set txid vout))))
+                        (bl.store:get-utxo utxo-set txid vout))))
         (when utxo
-          (bitcoin-lisp.serialization:make-tx-out
-           :value (bitcoin-lisp.storage:utxo-entry-value utxo)
-           :script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))))
-      (let* ((mempool (bitcoin-lisp::node-mempool node))
-             (entry (and mempool (bitcoin-lisp.mempool:mempool-get mempool txid))))
+          (bl.ser:make-tx-out
+           :value (bl.store:utxo-entry-value utxo)
+           :script-pubkey (bl.store:utxo-entry-script-pubkey utxo))))
+      (let* ((mempool (bl::node-mempool node))
+             (entry (and mempool (bl.mp:mempool-get mempool txid))))
         (when entry
-          (let ((outputs (bitcoin-lisp.serialization:transaction-outputs
-                          (bitcoin-lisp.mempool:mempool-entry-transaction entry))))
+          (let ((outputs (bl.ser:transaction-outputs
+                          (bl.mp:mempool-entry-transaction entry))))
             (when (< vout (length outputs))
               (aref outputs vout)))))))
 
@@ -658,11 +658,11 @@ chain findCoins). Returns NIL when unknown. Caller holds both locks."
   (incf (out-group-long-term-fee group) (wallet-coin-long-term-fee coin))
   (incf (out-group-effective-value group)
         (or (wallet-coin-effective-value coin)
-            (bitcoin-lisp.serialization:tx-out-value (wallet-coin-output coin))))
+            (bl.ser:tx-out-value (wallet-coin-output coin))))
   (setf (out-group-from-me group)
         (and (out-group-from-me group) (wallet-coin-from-me coin)))
   (incf (out-group-value group)
-        (bitcoin-lisp.serialization:tx-out-value (wallet-coin-output coin)))
+        (bl.ser:tx-out-value (wallet-coin-output coin)))
   (setf (out-group-depth group)
         (min (out-group-depth group) (wallet-coin-depth coin)))
   (incf (out-group-ancestors group) ancestors)
@@ -726,15 +726,15 @@ chain findCoins). Returns NIL when unknown. Caller holds both locks."
 (defun %mempool-tx-ancestry (mempool txid)
   "Core chain.getTransactionAncestry: (values ancestors cluster-count) for
 TXID's mempool entry, both 0 when not in the mempool."
-  (let ((entry (and mempool (bitcoin-lisp.mempool:mempool-get mempool txid))))
+  (let ((entry (and mempool (bl.mp:mempool-get mempool txid))))
     (if (null entry)
         (values 0 0)
-        (let ((ancestors (bitcoin-lisp.mempool:mempool-ancestor-stats mempool txid))
-              (handle (bitcoin-lisp.mempool::mempool-entry-graph-handle entry)))
+        (let ((ancestors (bl.mp:mempool-ancestor-stats mempool txid))
+              (handle (bl.mp::mempool-entry-graph-handle entry)))
           (values ancestors
                   (if handle
-                      (length (bitcoin-lisp.mempool::txgraph-get-cluster
-                               (bitcoin-lisp.mempool::mempool-graph mempool)
+                      (length (bl.mp::txgraph-get-cluster
+                               (bl.mp::mempool-graph mempool)
                                handle))
                       ancestors))))))
 
@@ -761,7 +761,7 @@ TXID's mempool entry, both 0 when not in the mempool."
   "Core GroupOutputs: (values filter-maps discarded-groups) — FILTER-MAPS a
 list of group-maps parallel to FILTERS. Caller holds the node lock (mempool
 ancestry reads)."
-  (let ((mempool (bitcoin-lisp::node-mempool node))
+  (let ((mempool (bl::node-mempool node))
         (maps (mapcar (lambda (f) (declare (ignore f)) (make-group-map))
                       filters))
         (discarded '()))
@@ -804,7 +804,7 @@ ancestry reads)."
             (dolist (coin coins)
               (multiple-value-bind (ancestors cluster-count)
                   (%mempool-tx-ancestry mempool (wallet-coin-txid coin))
-                (let ((key (cons (bitcoin-lisp.serialization:tx-out-script-pubkey
+                (let ((key (cons (bl.ser:tx-out-script-pubkey
                                   (wallet-coin-output coin))
                                  (wallet-coin-output-type coin))))
                   (unless (gethash key spk-groups)
@@ -885,7 +885,7 @@ STR_INTERNAL_BUG on shared UTXOs among selection results)."
 (defun sel-result-selected-value (result)
   (reduce #'+ (sel-result-inputs result)
           :key (lambda (coin)
-                 (bitcoin-lisp.serialization:tx-out-value
+                 (bl.ser:tx-out-value
                   (wallet-coin-output coin)))
           :initial-value 0))
 
@@ -986,7 +986,7 @@ result NIL + message NIL = plain not-found."
          (curr-available-value 0)
          (curr-waste 0)
          (best-selection nil)
-         (best-waste bitcoin-lisp.validation:+max-money+)
+         (best-waste bl.val:+max-money+)
          (max-tx-weight-exceeded nil))
     (loop for group across pool
           do (assert (plusp (out-group-selection-amount group)))
@@ -1223,7 +1223,7 @@ Returns (values sel-result error-message)."
   (let ((results '())
         (errors '())
         (max-transaction-weight (or (csel-params-max-tx-weight params)
-                                    bitcoin-lisp.validation:+max-standard-tx-weight+))
+                                    bl.val:+max-standard-tx-weight+))
         (tx-weight-no-input (* 4 (csel-params-tx-noinputs-size params))))
     (let ((max-selection-weight (- max-transaction-weight tx-weight-no-input)))
       (when (<= max-selection-weight 0)
@@ -1346,7 +1346,7 @@ Returns (values sel-result error-message)."
         ;; Balance check after the filters possibly discarded groups.
         (let ((total-amount (reduce #'+ coins
                                     :key (lambda (coin)
-                                           (bitcoin-lisp.serialization:tx-out-value
+                                           (bl.ser:tx-out-value
                                             (wallet-coin-output coin)))
                                     :initial-value 0))
               (total-discarded 0)
@@ -1373,11 +1373,11 @@ Returns (values sel-result error-message)."
                      ;; TRUC childhood: an unconfirmed-input round caps the
                      ;; weight at TRUC_CHILD_MAX_WEIGHT (spend.cpp:958-962).
                      (when (and (= (csel-params-version params)
-                                   bitcoin-lisp.mempool:+truc-version+)
+                                   bl.mp:+truc-version+)
                                 (or (zerop (elig-filter-conf-mine filter))
                                     (zerop (elig-filter-conf-theirs filter)))
                                 (> (or (csel-params-max-tx-weight params)
-                                       bitcoin-lisp.validation:+max-standard-tx-weight+)
+                                       bl.val:+max-standard-tx-weight+)
                                    +truc-child-max-weight+))
                        (setf local-params (copy-csel-params params))
                        (setf (csel-params-max-tx-weight local-params)
@@ -1400,7 +1400,7 @@ Returns (values sel-result error-message)."
          (preset-total (reduce #'+ preset-coins
                                :key (lambda (coin)
                                       (if sffo
-                                          (bitcoin-lisp.serialization:tx-out-value
+                                          (bl.ser:tx-out-value
                                            (wallet-coin-output coin))
                                           (or (wallet-coin-effective-value coin) 0)))
                                :initial-value 0))
@@ -1421,7 +1421,7 @@ Returns (values sel-result error-message)."
             (reduce #'+ available-coins
                     :key (lambda (coin)
                            (if sffo
-                               (bitcoin-lisp.serialization:tx-out-value
+                               (bl.ser:tx-out-value
                                 (wallet-coin-output coin))
                                (or (wallet-coin-effective-value coin) 0)))
                     :initial-value 0)))
@@ -1446,7 +1446,7 @@ Returns (values sel-result error-message)."
                                         (csel-params-change-fee params))
           (let ((max-inputs-weight
                   (- (or (csel-params-max-tx-weight params)
-                         bitcoin-lisp.validation:+max-standard-tx-weight+)
+                         bl.val:+max-standard-tx-weight+)
                      (* 4 (csel-params-tx-noinputs-size params)))))
             (when (> (sel-result-weight result) max-inputs-weight)
               (return-from %select-coins
@@ -1463,7 +1463,7 @@ Returns (values sel-result error-message)."
 
 (defun %op-return-script (data)
   "CScript() << OP_RETURN << data."
-  (concatenate '(vector (unsigned-byte 8)) (vector #x6a) (bitcoin-lisp.serialization:script-push-data data)))
+  (concatenate '(vector (unsigned-byte 8)) (vector #x6a) (bl.ser:script-push-data data)))
 
 (defun %parse-outputs (network outputs-param)
   "Core ParseOutputs over the outputs argument: an object {address: amount,
@@ -1503,7 +1503,7 @@ send/walletcreatefundedpsbt docstrings."
                (setf (gethash key seen) t)
                (push key keys)
                (if (string= key "data")
-                   (let ((data (handler-case (bitcoin-lisp.crypto:hex-to-bytes value)
+                   (let ((data (handler-case (bl.crypto:hex-to-bytes value)
                                  (error ()
                                    (error 'rpc-error :code +rpc-invalid-parameter+
                                                      :message "Data must be hexadecimal string")))))
@@ -1512,7 +1512,7 @@ send/walletcreatefundedpsbt docstrings."
                                            :amount 0)
                            recipients))
                    (multiple-value-bind (type script)
-                       (bitcoin-lisp.crypto:decode-address key network)
+                       (bl.crypto:decode-address key network)
                      (declare (ignore type))
                      (unless script
                        (error 'rpc-error :code +rpc-invalid-address-or-key+
@@ -1562,7 +1562,7 @@ bech32 (DEFAULT_ADDRESS_TYPE), never legacy."
   (let ((any-tr nil) (any-wpkh nil) (any-sh nil) (any-pkh nil))
     (dolist (recipient recipients)
       (let ((script (recipient-script recipient)))
-        (case (bitcoin-lisp.validation:classify-script script)
+        (case (bl.val:classify-script script)
           (:witness-v1-taproot (setf any-tr t))
           (:witness-v0-keyhash (setf any-wpkh t))
           (:scripthash (setf any-sh t))
@@ -1600,7 +1600,7 @@ rewinds next_index only when it is still the most recent
                     (reservedest-index rd) (1- (desc-spkm-next-index spkm))
                     (reservedest-address rd) address
                     (reservedest-script rd)
-                    (nth-value 1 (bitcoin-lisp.crypto:decode-address
+                    (nth-value 1 (bl.crypto:decode-address
                                   address (wallet-network wallet))))
               (values address nil))
           (rpc-error (e) (values nil (rpc-error-message e)))))))
@@ -1622,40 +1622,40 @@ reserved index is still the most recent, and persist."
 
 (defun %current-for-anti-fee-sniping-p (node block-hash)
   "Core IsCurrentForAntiFeeSniping. Caller holds the node lock."
-  (let ((chain-state (bitcoin-lisp::node-current-chainstate node)))
+  (let ((chain-state (bl::node-current-chainstate node)))
     (and chain-state
          block-hash
-         (not (bitcoin-lisp.networking:initial-block-download-p chain-state))
-         (let* ((entry (bitcoin-lisp.storage:get-block-index-entry
+         (not (bl.net:initial-block-download-p chain-state))
+         (let* ((entry (bl.store:get-block-index-entry
                         chain-state block-hash))
                 (header (and entry
-                             (bitcoin-lisp.storage:block-index-entry-header entry))))
+                             (bl.store:block-index-entry-header entry))))
            (and header
-                (>= (bitcoin-lisp.serialization:block-header-timestamp header)
-                    (- (bitcoin-lisp.serialization:get-unix-time)
+                (>= (bl.ser:block-header-timestamp header)
+                    (- (bl.ser:get-unix-time)
                        +max-anti-fee-sniping-tip-age+)))))))
 
 (defun discourage-fee-sniping (tx rng node block-hash block-height)
   "Core DiscourageFeeSniping: nLockTime = tip height, 10% of the time
 backed off by rand(100); 0 when the chain lags. Core's asserts are ported
 as hard internal-bug errors (funds-critical invariants)."
-  (when (zerop (length (bitcoin-lisp.serialization:transaction-inputs tx)))
+  (when (zerop (length (bl.ser:transaction-inputs tx)))
     (error 'rpc-error :code +rpc-wallet-error+
                       :message "Internal bug detected: anti-fee-sniping on an inputless transaction"))
   (if (%current-for-anti-fee-sniping-p node block-hash)
       (progn
-        (setf (bitcoin-lisp.serialization:transaction-lock-time tx) block-height)
+        (setf (bl.ser:transaction-lock-time tx) block-height)
         (when (zerop (wrng-randrange rng 10))
-          (setf (bitcoin-lisp.serialization:transaction-lock-time tx)
+          (setf (bl.ser:transaction-lock-time tx)
                 (max 0 (- block-height (wrng-randrange rng 100))))))
-      (setf (bitcoin-lisp.serialization:transaction-lock-time tx) 0))
-  (let ((locktime (bitcoin-lisp.serialization:transaction-lock-time tx)))
+      (setf (bl.ser:transaction-lock-time tx) 0))
+  (let ((locktime (bl.ser:transaction-lock-time tx)))
     (unless (and (< locktime +locktime-threshold+) (<= locktime block-height))
       (error 'rpc-error :code +rpc-wallet-error+
                         :message "Internal bug detected: anti-fee-sniping locktime out of range")))
-  (bitcoin-lisp.serialization:dovector
-      (input (bitcoin-lisp.serialization:transaction-inputs tx))
-    (let ((sequence (bitcoin-lisp.serialization:tx-in-sequence input)))
+  (bl.ser:dovector
+      (input (bl.ser:transaction-inputs tx))
+    (let ((sequence (bl.ser:tx-in-sequence input)))
       (unless (or (= sequence +max-sequence-nonfinal+)
                   (= sequence +max-bip125-rbf-sequence+))
         (error 'rpc-error :code +rpc-wallet-error+
@@ -1684,27 +1684,27 @@ inputs, in selection order. Caller holds node + wallet locks."
             (declare (ignore txo-index))
             (cond
               (wtx
-               (setf txout (aref (bitcoin-lisp.serialization:transaction-outputs
+               (setf txout (aref (bl.ser:transaction-outputs
                                   (wallet-tx-tx wtx))
                                  vout))
                (when (minusp input-bytes)
                  (setf input-bytes
                        (%max-signed-input-vsize
-                        wallet cc (bitcoin-lisp.serialization:tx-out-script-pubkey
+                        wallet cc (bl.ser:tx-out-script-pubkey
                                    txout))))
                ;; TRUC version mixing on unconfirmed preset inputs
                ;; (spend.cpp:286-293).
                (when (zerop (wallet-tx-depth wallet wtx))
-                 (let ((parent-version (bitcoin-lisp.serialization:transaction-version
+                 (let ((parent-version (bl.ser:transaction-version
                                         (wallet-tx-tx wtx))))
                    (cond
-                     ((and (= parent-version bitcoin-lisp.mempool:+truc-version+)
-                           (/= (wcc-version cc) bitcoin-lisp.mempool:+truc-version+))
+                     ((and (= parent-version bl.mp:+truc-version+)
+                           (/= (wcc-version cc) bl.mp:+truc-version+))
                       (return-from %fetch-selected-inputs
                         (values nil (format nil "Can't spend unconfirmed version 3 pre-selected input with a version ~D tx"
                                             (wcc-version cc)))))
-                     ((and (= (wcc-version cc) bitcoin-lisp.mempool:+truc-version+)
-                           (/= parent-version bitcoin-lisp.mempool:+truc-version+))
+                     ((and (= (wcc-version cc) bl.mp:+truc-version+)
+                           (/= parent-version bl.mp:+truc-version+))
                       (return-from %fetch-selected-inputs
                         (values nil (format nil "Can't spend unconfirmed version ~D pre-selected input with a version 3 tx"
                                             parent-version))))))))
@@ -1717,7 +1717,7 @@ inputs, in selection order. Caller holds node + wallet locks."
             (when (minusp input-bytes)
               (setf input-bytes
                     (%max-signed-input-vsize
-                     nil cc (bitcoin-lisp.serialization:tx-out-script-pubkey
+                     nil cc (bl.ser:tx-out-script-pubkey
                              txout))))
             (when (minusp input-bytes)
               (return-from %fetch-selected-inputs
@@ -1730,7 +1730,7 @@ inputs, in selection order. Caller holds node + wallet locks."
                      :depth 0 :solvable t :safe t :time 0 :from-me nil
                      :input-bytes input-bytes
                      :fee fee
-                     :effective-value (- (bitcoin-lisp.serialization:tx-out-value
+                     :effective-value (- (bl.ser:tx-out-value
                                           txout)
                                          fee)
                      :output-type :unknown)
@@ -1748,15 +1748,15 @@ path plus the ranged step; const keys come from the parse or PROVIDER."
         (when xprv
           (let ((k xprv))
             (dolist (entry (desc-key-path key))
-              (setf k (bitcoin-lisp.crypto:bip32-derive-child k entry)))
+              (setf k (bl.crypto:bip32-derive-child k entry)))
             (ecase (desc-key-derive key)
               (:none)
               (:unhardened
-               (setf k (bitcoin-lisp.crypto:bip32-derive-child k pos)))
+               (setf k (bl.crypto:bip32-derive-child k pos)))
               (:hardened
-               (setf k (bitcoin-lisp.crypto:bip32-derive-child
-                        k (+ pos bitcoin-lisp.crypto:+bip32-hardened+)))))
-            (subseq (bitcoin-lisp.crypto:ext-key-key k) 1 33))))
+               (setf k (bl.crypto:bip32-derive-child
+                        k (+ pos bl.crypto:+bip32-hardened+)))))
+            (subseq (bl.crypto:ext-key-key k) 1 33))))
       (nth-value 0 (%desc-key-privkey-for key provider))))
 
 (defun %sign-map-add-key! (keymap pubmap tr-keymap key pubkey priv pos)
@@ -1772,7 +1772,7 @@ hex and reload lifted with a fixed 02 prefix, so an odd-Y key's stored parity
 byte is arbitrary: compare X COORDINATES only. Taproot signing normalizes parity
 itself (derive-xonly-pubkey + BIP86 tweak). Everything else keeps the strict
 full-point check."
-  (let* ((derived (bitcoin-lisp.crypto:derive-public-key
+  (let* ((derived (bl.crypto:derive-public-key
                    priv :compressed (= (length pubkey) 33)))
          (matches (if (and (desc-key-xonly-p key)
                            (= (length derived) 33)
@@ -1781,14 +1781,14 @@ full-point check."
                       (equalp derived pubkey))))
     (if matches
         (progn
-          (setf (gethash (bitcoin-lisp.crypto:hash160 pubkey) keymap)
+          (setf (gethash (bl.crypto:hash160 pubkey) keymap)
                 (cons priv pubkey))
           (setf (gethash pubkey pubmap) priv)
           (when (= (length pubkey) 33)
-            (let ((qx (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey
-                       (bitcoin-lisp.crypto:derive-xonly-pubkey priv))))
+            (let ((qx (bl.interop:compute-tweaked-pubkey
+                       (bl.crypto:derive-xonly-pubkey priv))))
               (when qx (setf (gethash qx tr-keymap) priv)))))
-        (bitcoin-lisp:log-warn
+        (bl:log-warn
          "wallet-sign: derived key does not match expected pubkey at index ~D; key skipped"
          pos))))
 
@@ -1820,10 +1820,10 @@ the wrong keys."
           ;; surface as a missing-key signing error, never as a witness built
           ;; for a different output.
           (unless (equalp output-key (subseq script 2 34))
-            (bitcoin-lisp:log-warn
+            (bl:log-warn
              "wallet-sign: tr() spend data derives ~A but the output is ~A; skipped"
-             (bitcoin-lisp.crypto:bytes-to-hex output-key)
-             (bitcoin-lisp.crypto:bytes-to-hex (subseq script 2 34)))
+             (bl.crypto:bytes-to-hex output-key)
+             (bl.crypto:bytes-to-hex (subseq script 2 34)))
             (return-from %spkm-tr-script-leaves nil))
           (let ((next (%pairs-splitter (rest pairs))))
             (loop for (script leaf-hash control) in leaves
@@ -1848,11 +1848,11 @@ TR-KEYMAP (keyed on the BIP86 untweaked-root form) by construction."
         (pubmap (make-hash-table :test 'equalp))
         (tr-keymap (make-hash-table :test 'equalp))
         (tr-scripts (make-hash-table :test 'equalp)))
-    (bitcoin-lisp.serialization:dovector
-        (input (bitcoin-lisp.serialization:transaction-inputs tx))
-      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-             (entry (gethash (cons (bitcoin-lisp.serialization:outpoint-hash prevout)
-                                   (bitcoin-lisp.serialization:outpoint-index prevout))
+    (bl.ser:dovector
+        (input (bl.ser:transaction-inputs tx))
+      (let* ((prevout (bl.ser:tx-in-previous-output input))
+             (entry (gethash (cons (bl.ser:outpoint-hash prevout)
+                                   (bl.ser:outpoint-index prevout))
                              coins))
              (script (and entry (first entry))))
         (when script
@@ -1886,19 +1886,19 @@ NIL = complete."
 TXOs, the coin control's external outputs, the UTXO set, and the mempool.
 Missing prevouts are simply absent. Caller holds node + wallet locks."
   (let ((coins (make-hash-table :test 'equalp)))
-    (bitcoin-lisp.serialization:dovector
-        (input (bitcoin-lisp.serialization:transaction-inputs tx))
-      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-             (txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-             (vout (bitcoin-lisp.serialization:outpoint-index prevout))
+    (bl.ser:dovector
+        (input (bl.ser:transaction-inputs tx))
+      (let* ((prevout (bl.ser:tx-in-previous-output input))
+             (txid (bl.ser:outpoint-hash prevout))
+             (vout (bl.ser:outpoint-index prevout))
              (txout (%wallet-input-txout node wallet txid vout cc)))
         (when txout
-          (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey txout)))
+          (let ((script (bl.ser:tx-out-script-pubkey txout)))
             (multiple-value-bind (redeem witness)
                 (%known-sub-scripts wallet cc script)
               (setf (gethash (cons txid vout) coins)
                     (list script
-                          (bitcoin-lisp.serialization:tx-out-value txout)
+                          (bl.ser:tx-out-value txout)
                           redeem witness)))))))
     coins))
 
@@ -1909,28 +1909,28 @@ Missing prevouts are simply absent. Caller holds node + wallet locks."
 spent scriptPubKey/amount in COINS, under the standard flag set. Returns
 (values t nil) or (values nil failing-input-index). A missing coin fails
 its input (a tx we cannot fully verify is never broadcast)."
-  (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+  (let* ((inputs (bl.ser:transaction-inputs tx))
          (n (length inputs))
          (spent (make-array n)))
     (dotimes (i n)
-      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output
+      (let* ((prevout (bl.ser:tx-in-previous-output
                        (aref inputs i)))
-             (entry (gethash (cons (bitcoin-lisp.serialization:outpoint-hash prevout)
-                                   (bitcoin-lisp.serialization:outpoint-index prevout))
+             (entry (gethash (cons (bl.ser:outpoint-hash prevout)
+                                   (bl.ser:outpoint-index prevout))
                              coins)))
         (unless entry (return-from %verify-tx-scripts (values nil i)))
         (setf (aref spent i)
-              (bitcoin-lisp.storage:make-utxo-entry
+              (bl.store:make-utxo-entry
                :value (second entry)
                :script-pubkey (coerce (first entry)
                                       '(simple-array (unsigned-byte 8) (*)))))))
-    (let ((bitcoin-lisp.coalton.interop:*script-flags*
-            bitcoin-lisp.validation:+standard-script-verify-flags+)
-          (bitcoin-lisp.coalton.interop:*precomputed-sighash*
-            (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent))
-          (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent))
+    (let ((bl.interop:*script-flags*
+            bl.val:+standard-script-verify-flags+)
+          (bl.interop:*precomputed-sighash*
+            (bl.interop:init-precomputed-sighash tx spent))
+          (bl.interop:*current-spent-utxos* spent))
       (dotimes (i n)
-        (unless (bitcoin-lisp.validation:validate-input-script tx i (aref spent i))
+        (unless (bl.val:validate-input-script tx i (aref spent i))
           (return-from %verify-tx-scripts (values nil i))))
       (values t nil))))
 
@@ -1938,7 +1938,7 @@ its input (a tx we cannot fully verify is never broadcast)."
 
 (defun %recipient-outputs (recipients)
   (mapcar (lambda (recipient)
-            (bitcoin-lisp.serialization:make-tx-out
+            (bl.ser:make-tx-out
              :value (recipient-amount recipient)
              :script-pubkey (recipient-script recipient)))
           recipients))
@@ -1962,19 +1962,19 @@ Caller holds node + wallet locks."
                   (wcc-include-unsafe cc)
                   (csel-params-max-tx-weight params)
                   (or (wcc-max-tx-weight cc)
-                      bitcoin-lisp.validation:+max-standard-tx-weight+)
+                      bl.val:+max-standard-tx-weight+)
                   (csel-params-version params) (wcc-version cc))
             (let ((minimum-tx-weight (* 4 +min-standard-tx-nonwitness-size+))
                   (max-weight (csel-params-max-tx-weight params)))
               (when (or (< max-weight minimum-tx-weight)
-                        (> max-weight bitcoin-lisp.validation:+max-standard-tx-weight+))
+                        (> max-weight bl.val:+max-standard-tx-weight+))
                 (fail (format nil "Maximum transaction weight must be between ~D and ~D"
                               minimum-tx-weight
-                              bitcoin-lisp.validation:+max-standard-tx-weight+))))
+                              bl.val:+max-standard-tx-weight+))))
             (setf (csel-params-long-term-feerate params)
                   *wallet-consolidate-feerate*)
             (setf (csel-params-tx-noinputs-size params)
-                  (+ 10 (bitcoin-lisp.serialization:compact-size-length (length recipients))))
+                  (+ 10 (bl.ser:compact-size-length (length recipients))))
             (let ((recipients-sum 0)
                   (outputs-to-subtract-fee-from 0)
                   (change-type (%transaction-change-type
@@ -2021,7 +2021,7 @@ Caller holds node + wallet locks."
                                     (%format-feerate-sat-vb (wcc-feerate cc))
                                     (%format-feerate-sat-vb feerate))))
                     (when (and (eq reason :fallback)
-                               (zerop bitcoin-lisp:*wallet-fallback-fee*))
+                               (zerop bl:*wallet-fallback-fee*))
                       (fail "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee."))
                     (setf (csel-params-effective-feerate params) feerate)
                     (setf (csel-params-change-fee params)
@@ -2090,7 +2090,7 @@ Caller holds node + wallet locks."
                                       :skip-outpoints skip
                                       :check-version-trucness t
                                       :tx-version (wcc-version cc)
-                                      :mempool (bitcoin-lisp::node-mempool node))
+                                      :mempool (bl::node-mempool node))
                                      '())))
                           (multiple-value-bind (selection select-error)
                               (%select-coins node available-coins preset-coins
@@ -2102,12 +2102,12 @@ Caller holds node + wallet locks."
                               (let ((available-balance
                                       (+ (reduce #'+ preset-coins
                                                  :key (lambda (c)
-                                                        (bitcoin-lisp.serialization:tx-out-value
+                                                        (bl.ser:tx-out-value
                                                          (wallet-coin-output c)))
                                                  :initial-value 0)
                                          (reduce #'+ available-coins
                                                  :key (lambda (c)
-                                                        (bitcoin-lisp.serialization:tx-out-value
+                                                        (bl.ser:tx-out-value
                                                          (wallet-coin-output c)))
                                                  :initial-value 0))))
                                 (when (>= available-balance recipients-sum)
@@ -2143,7 +2143,7 @@ Caller holds node + wallet locks."
                                       ((> final-change-pos (length outputs))
                                        (fail "Transaction change output index out of range")))
                                     (let ((change-output
-                                            (bitcoin-lisp.serialization:make-tx-out
+                                            (bl.ser:make-tx-out
                                              :value change-amount
                                              :script-pubkey
                                              ;; Empty when the keypool ran
@@ -2194,9 +2194,9 @@ Caller holds node + wallet locks."
                                                                   (wcc-preset-sequence preset))))
                                               (when sequence
                                                 (setf use-anti-fee-sniping nil))
-                                              (bitcoin-lisp.serialization:make-tx-in
+                                              (bl.ser:make-tx-in
                                                :previous-output
-                                               (bitcoin-lisp.serialization:make-outpoint
+                                               (bl.ser:make-outpoint
                                                 :hash (wallet-coin-txid coin)
                                                 :index (wallet-coin-index coin))
                                                :script-sig
@@ -2207,7 +2207,7 @@ Caller holds node + wallet locks."
                                                :sequence (or sequence
                                                              default-sequence))))
                                           selected-coins))
-                                       (tx (bitcoin-lisp.serialization:make-transaction
+                                       (tx (bl.ser:make-transaction
                                             :version (wcc-version cc)
                                             :inputs (coerce inputs 'simple-vector)
                                             :outputs (coerce outputs 'simple-vector)
@@ -2228,11 +2228,11 @@ Caller holds node + wallet locks."
                                                      (wcc-preset-script-witness preset)
                                                      any t)))
                                     (when any
-                                      (setf (bitcoin-lisp.serialization:transaction-witness tx)
+                                      (setf (bl.ser:transaction-witness tx)
                                             witnesses)))
                                   (cond
                                     ((wcc-locktime cc)
-                                     (setf (bitcoin-lisp.serialization:transaction-lock-time tx)
+                                     (setf (bl.ser:transaction-lock-time tx)
                                            (wcc-locktime cc))
                                      (setf use-anti-fee-sniping nil))
                                     (t nil))
@@ -2248,7 +2248,7 @@ Caller holds node + wallet locks."
                                              (let ((preset (gethash (cons (wallet-coin-txid coin)
                                                                           (wallet-coin-index coin))
                                                                     (wcc-presets cc))))
-                                               (cons (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                               (cons (bl.ser:tx-out-script-pubkey
                                                       (wallet-coin-output coin))
                                                      (and preset
                                                           (wcc-preset-weight preset)))))
@@ -2263,8 +2263,8 @@ Caller holds node + wallet locks."
                                                    vsize)
                                                   (sel-result-total-bump-fees selection)))
                                              (output-value
-                                               (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs tx)
-                                                       :key #'bitcoin-lisp.serialization:tx-out-value
+                                               (reduce #'+ (bl.ser:transaction-outputs tx)
+                                                       :key #'bl.ser:tx-out-value
                                                        :initial-value 0))
                                              (current-fee
                                                (- (sel-result-selected-value selection)
@@ -2278,15 +2278,15 @@ Caller holds node + wallet locks."
                                         (when (and final-change-pos
                                                    (< fee-needed current-fee))
                                           (let ((change-output
-                                                  (aref (bitcoin-lisp.serialization:transaction-outputs tx)
+                                                  (aref (bl.ser:transaction-outputs tx)
                                                         final-change-pos)))
-                                            (incf (bitcoin-lisp.serialization:tx-out-value
+                                            (incf (bl.ser:tx-out-value
                                                    change-output)
                                                   (- current-fee fee-needed))
                                             (setf current-fee
                                                   (- (sel-result-selected-value selection)
-                                                     (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs tx)
-                                                             :key #'bitcoin-lisp.serialization:tx-out-value
+                                                     (reduce #'+ (bl.ser:transaction-outputs tx)
+                                                             :key #'bl.ser:tx-out-value
                                                              :initial-value 0)))
                                             (unless (= fee-needed current-fee)
                                               (fail "Internal bug detected: Change adjustment: Fee needed != fee paid"))))
@@ -2295,7 +2295,7 @@ Caller holds node + wallet locks."
                                           (let ((to-reduce (- fee-needed current-fee))
                                                 (i 0)
                                                 (first-p t)
-                                                (txvout (bitcoin-lisp.serialization:transaction-outputs tx)))
+                                                (txvout (bl.ser:transaction-outputs tx)))
                                             (dolist (recipient recipients)
                                               (when (and final-change-pos
                                                          (= i final-change-pos))
@@ -2309,7 +2309,7 @@ Caller holds node + wallet locks."
                                                   ;; be negative in edge
                                                   ;; cases, exactly as in
                                                   ;; Core).
-                                                  (decf (bitcoin-lisp.serialization:tx-out-value output)
+                                                  (decf (bl.ser:tx-out-value output)
                                                         (truncate to-reduce
                                                                   outputs-to-subtract-fee-from))
                                                   (when first-p
@@ -2318,20 +2318,20 @@ Caller holds node + wallet locks."
                                                     ;; the remainder not
                                                     ;; divisible by the
                                                     ;; output count.
-                                                    (decf (bitcoin-lisp.serialization:tx-out-value output)
+                                                    (decf (bl.ser:tx-out-value output)
                                                           (rem to-reduce
                                                                outputs-to-subtract-fee-from)))
                                                   (when (%output-dust-p
-                                                         (bitcoin-lisp.serialization:tx-out-value output)
-                                                         (bitcoin-lisp.serialization:tx-out-script-pubkey output))
-                                                    (if (minusp (bitcoin-lisp.serialization:tx-out-value output))
+                                                         (bl.ser:tx-out-value output)
+                                                         (bl.ser:tx-out-script-pubkey output))
+                                                    (if (minusp (bl.ser:tx-out-value output))
                                                         (fail "The transaction amount is too small to pay the fee")
                                                         (fail "The transaction amount is too small to send after the fee has been deducted")))))
                                               (incf i))
                                             (setf current-fee
                                                   (- (sel-result-selected-value selection)
-                                                     (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs tx)
-                                                             :key #'bitcoin-lisp.serialization:tx-out-value
+                                                     (reduce #'+ (bl.ser:transaction-outputs tx)
+                                                             :key #'bl.ser:tx-out-value
                                                              :initial-value 0)))
                                             (unless (= fee-needed current-fee)
                                               (fail "Internal bug detected: SFFO: Fee needed != fee paid"))))
@@ -2362,19 +2362,19 @@ Caller holds node + wallet locks."
                                         ;; --- Caps ---
                                         (let ((final-weight
                                                 (if sign
-                                                    (bitcoin-lisp.serialization:transaction-weight tx)
+                                                    (bl.ser:transaction-weight tx)
                                                     est-weight)))
                                           (when (> final-weight
-                                                   bitcoin-lisp.validation:+max-standard-tx-weight+)
+                                                   bl.val:+max-standard-tx-weight+)
                                             (fail "Transaction too large")))
                                         (when (> current-fee
-                                                 bitcoin-lisp:*wallet-max-tx-fee*)
+                                                 bl:*wallet-max-tx-fee*)
                                           (fail +max-fee-exceeded-message+))
                                         ;; -walletrejectlongchains'
                                         ;; checkChainLimits simulation is not
                                         ;; run pre-commit (divergence 4).
                                         (setf keep-reservation t)
-                                        (bitcoin-lisp:log-info
+                                        (bl:log-info
                                          "Coin Selection: Algorithm:~(~A~), Waste Metric Score:~D; fee ~D sat over ~D vB"
                                          (sel-result-algo selection)
                                          (sel-result-waste selection)
@@ -2415,14 +2415,14 @@ Caller holds node + wallet locks."
           ;; are not skipped.
           (when tx-change-pos
             (setf (wcc-dest-change aps-cc)
-                  (bitcoin-lisp.serialization:tx-out-script-pubkey
-                   (aref (bitcoin-lisp.serialization:transaction-outputs tx)
+                  (bl.ser:tx-out-script-pubkey
+                   (aref (bl.ser:transaction-outputs tx)
                          tx-change-pos))))
           (multiple-value-bind (aps-tx aps-fee aps-change-pos aps-reason)
               (%create-transaction-internal node wallet recipients change-pos
                                             aps-cc sign rng)
             (when (and aps-tx (<= aps-fee (+ fee *wallet-max-aps-fee*)))
-              (bitcoin-lisp:log-info
+              (bl:log-info
                "Fee non-grouped = ~D, grouped = ~D, using grouped" fee aps-fee)
               (setf tx aps-tx fee aps-fee tx-change-pos aps-change-pos
                     fee-reason aps-reason)))))
@@ -2435,22 +2435,22 @@ Caller holds node + wallet locks."
 locktime/version transfer to the coin control, and CreateTransaction runs
 unsigned. Returns (values tx fee change-pos) or (values nil error-message).
 Caller holds node + wallet locks."
-  (setf (wcc-locktime cc) (bitcoin-lisp.serialization:transaction-lock-time tx))
-  (setf (wcc-version cc) (bitcoin-lisp.serialization:transaction-version tx))
-  (bitcoin-lisp.serialization:dovector
-      (input (bitcoin-lisp.serialization:transaction-inputs tx))
-    (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-           (txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-           (vout (bitcoin-lisp.serialization:outpoint-index prevout))
+  (setf (wcc-locktime cc) (bl.ser:transaction-lock-time tx))
+  (setf (wcc-version cc) (bl.ser:transaction-version tx))
+  (bl.ser:dovector
+      (input (bl.ser:transaction-inputs tx))
+    (let* ((prevout (bl.ser:tx-in-previous-output input))
+           (txid (bl.ser:outpoint-hash prevout))
+           (vout (bl.ser:outpoint-index prevout))
            (preset (wcc-select cc txid vout))
            (wtx (wallet-get-wallet-tx wallet txid))
            (mine (and wtx
-                      (< vout (length (bitcoin-lisp.serialization:transaction-outputs
+                      (< vout (length (bl.ser:transaction-outputs
                                        (wallet-tx-tx wtx))))
                       (%wallet-script-mine-p
                        wallet
-                       (bitcoin-lisp.serialization:tx-out-script-pubkey
-                        (aref (bitcoin-lisp.serialization:transaction-outputs
+                       (bl.ser:tx-out-script-pubkey
+                        (aref (bl.ser:transaction-outputs
                                (wallet-tx-tx wtx))
                               vout))))))
       (unless mine
@@ -2460,12 +2460,12 @@ Caller holds node + wallet locks."
               (values nil "Unable to find UTXO for external input")))
           (setf (wcc-preset-txout preset) txout)))
       (setf (wcc-preset-sequence preset)
-            (bitcoin-lisp.serialization:tx-in-sequence input))
-      (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input)))
+            (bl.ser:tx-in-sequence input))
+      (let ((script-sig (bl.ser:tx-in-script-sig input)))
         (when (plusp (length script-sig))
           (setf (wcc-preset-script-sig preset) script-sig)))
-      (let* ((witnesses (bitcoin-lisp.serialization:transaction-witness tx))
-             (index (position input (bitcoin-lisp.serialization:transaction-inputs tx)))
+      (let* ((witnesses (bl.ser:transaction-witness tx))
+             (index (position input (bl.ser:transaction-inputs tx)))
              (stack (and witnesses index (< index (length witnesses))
                          (aref witnesses index))))
         (when stack
@@ -2474,12 +2474,12 @@ Caller holds node + wallet locks."
       (%create-transaction node wallet recipients change-pos cc nil)
     (unless new-tx (return-from %fund-transaction (values nil fee)))
     (when lock-unspents
-      (bitcoin-lisp.serialization:dovector
-          (input (bitcoin-lisp.serialization:transaction-inputs new-tx))
-        (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+      (bl.ser:dovector
+          (input (bl.ser:transaction-inputs new-tx))
+        (let ((prevout (bl.ser:tx-in-previous-output input)))
           (wallet-lock-coin wallet
-                            (bitcoin-lisp.serialization:outpoint-hash prevout)
-                            (bitcoin-lisp.serialization:outpoint-index prevout)
+                            (bl.ser:outpoint-hash prevout)
+                            (bl.ser:outpoint-index prevout)
                             nil))))
     (values new-tx fee tx-change-pos)))
 
@@ -2491,36 +2491,36 @@ Caller holds node + wallet locks."
 it to the unbroadcast set and announce to peers (the sendrawtransaction
 path). A tx already in the mempool is only (re)announced. Caller holds the
 node lock. Returns (values ok error-string)."
-  (let* ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+  (let* ((txid (bl.ser:transaction-hash tx))
          (utxo-set (rpc-get-utxo-set node))
          (mempool (rpc-get-mempool node))
          (chain-state (rpc-get-chain-state node))
-         (current-height (bitcoin-lisp.storage:current-height chain-state)))
+         (current-height (bl.store:current-height chain-state)))
     (unless mempool
       (return-from %wallet-submit-tx (values nil "no mempool")))
     (multiple-value-bind (valid error fee replaced sigops)
-        (bitcoin-lisp.validation:validate-transaction-for-mempool
+        (bl.val:validate-transaction-for-mempool
          tx utxo-set mempool current-height :chain-state chain-state)
       (cond
         ((and (not valid) (eq error :already-in-mempool))
          (when relay
-           (bitcoin-lisp::broadcast-transaction-to-peers node txid))
+           (bl::broadcast-transaction-to-peers node txid))
          (values t nil))
         ((not valid)
          (values nil (format nil "~A" error)))
         ;; Funds rail: never hand the relay layer a tx over -maxtxfee (Core
         ;; BroadcastTransaction's max_tx_fee check, node/transaction.cpp:47).
-        ((> fee bitcoin-lisp:*wallet-max-tx-fee*)
+        ((> fee bl:*wallet-max-tx-fee*)
          (values nil +max-fee-exceeded-message+))
         (t
-         (let ((result (bitcoin-lisp.mempool:accept-validated-tx
+         (let ((result (bl.mp:accept-validated-tx
                         mempool txid tx fee current-height
                         :sigops sigops :replaced replaced)))
            (if (eq result :ok)
                (progn
                  (when relay
-                   (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
-                   (bitcoin-lisp::broadcast-transaction-to-peers node txid))
+                   (bl.mp:mempool-add-unbroadcast mempool txid)
+                   (bl::broadcast-transaction-to-peers node txid))
                  (values t nil))
                (values nil (format nil "~A" result)))))))))
 
@@ -2539,7 +2539,7 @@ hook context (see with-wallet-lock's lock-order contract)."
                  (wallet-mark-inputs-dirty wallet tx)))))
     (multiple-value-bind (ok error) (%wallet-submit-tx node tx :relay t)
       (unless ok
-        (bitcoin-lisp:log-warn
+        (bl:log-warn
          "CommitTransaction(): Transaction cannot be broadcast immediately, ~A"
          error)))
     wtx))
@@ -2554,7 +2554,7 @@ minute; each wallet then gates on its own 12-36h m_next_resend).")
 
 (defun %wallet-default-next-resend (&optional (rng (%rng)))
   "Core GetDefaultNextResend: now + 12h + uniform(24h)."
-  (+ (bitcoin-lisp.serialization:get-unix-time)
+  (+ (bl.ser:get-unix-time)
      (* 12 3600)
      (wrng-randrange rng (* 24 3600))))
 
@@ -2602,11 +2602,11 @@ is logged and never aborts the rest (nor the caller). Returns
                                          node (wallet-tx-tx wtx) :relay relay)))
                   (incf submitted))))
           (error (e)
-            (bitcoin-lisp:log-error
+            (bl:log-error
              "ResubmitWalletTransactions: error resubmitting ~A (wallet ~A): ~A"
              (hash-to-hex (wallet-tx-txid wtx)) (wallet-name wallet) e))))
       (when (plusp submitted)
-        (bitcoin-lisp:log-info "ResubmitWalletTransactions: resubmit ~D unconfirmed transactions (wallet ~A)"
+        (bl:log-info "ResubmitWalletTransactions: resubmit ~D unconfirmed transactions (wallet ~A)"
                                submitted (wallet-name wallet)))
       (values submitted remaining))))
 
@@ -2622,14 +2622,14 @@ The inline work is acceptable because each pass is bounded
 (+max-resubmit-per-pass+ mempool validations, each under its own
 node-lock hold) and this thread is idle between 1s housekeeping ticks."
   (handler-case
-      (let ((manager (bitcoin-lisp::node-wallet-manager node)))
+      (let ((manager (bl::node-wallet-manager node)))
         (when (and manager (wallet-manager-has-wallets-p manager))
-          (let ((now (bitcoin-lisp.serialization:get-unix-time)))
+          (let ((now (bl.ser:get-unix-time)))
             (when (>= (- now *last-resend-check*) +resend-check-interval+)
               (setf *last-resend-check* now)
-              (let ((chain-state (bitcoin-lisp::node-chain-state node)))
+              (let ((chain-state (bl::node-chain-state node)))
                 (unless (or (null chain-state)
-                            (bitcoin-lisp.networking:initial-block-download-p
+                            (bl.net:initial-block-download-p
                              chain-state))
                   (dolist (wallet (%manager-wallets manager))
                     (handler-case
@@ -2654,11 +2654,11 @@ node-lock hold) and this thread is idle between 1s housekeeping ticks."
                                          now
                                          (%wallet-default-next-resend)))))))
                       (error (e)
-                        (bitcoin-lisp:log-error
+                        (bl:log-error
                          "MaybeResendWalletTxs: wallet ~A resend pass failed: ~A"
                          (wallet-name wallet) e))))))))))
     (error (e)
-      (bitcoin-lisp:log-error "MaybeResendWalletTxs: pass failed: ~A" e))))
+      (bl:log-error "MaybeResendWalletTxs: pass failed: ~A" e))))
 
 (defun wallet-post-load-resubmit (node wallet)
   "Core CWallet::postInitProcess: push the loaded wallet's unconfirmed txs
@@ -2668,7 +2668,7 @@ wallet loading or an importdescriptors rescan."
   (handler-case
       (wallet-resubmit-transactions node wallet :relay nil :force t)
     (error (e)
-      (bitcoin-lisp:log-error
+      (bl:log-error
        "postInitProcess resubmit failed for wallet ~A: ~A"
        (wallet-name wallet) e))))
 
@@ -2783,7 +2783,7 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
       (when change-address
         (multiple-value-bind (type script)
             (and (stringp change-address)
-                 (bitcoin-lisp.crypto:decode-address change-address network))
+                 (bl.crypto:decode-address change-address network))
           (declare (ignore type))
           (unless script
             (error 'rpc-error :code +rpc-invalid-address-or-key+
@@ -2862,7 +2862,7 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
           (when pk-present
             (dolist (hex pubkeys)
               (let ((pubkey (%parse-multisig-pubkey hex)))
-                (setf (gethash (bitcoin-lisp.crypto:hash160 pubkey)
+                (setf (gethash (bl.crypto:hash160 pubkey)
                                (wcc-external-pubkeys cc))
                       pubkey)
                 ;; Core also registers the P2WPKH witness script for each
@@ -2876,7 +2876,7 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
                            (every (lambda (ch) (digit-char-p ch 16)) hex))
                 (error 'rpc-error :code +rpc-invalid-address-or-key+
                                   :message (format nil "'~A' is not hex" hex)))
-              (%wcc-add-external-script cc (bitcoin-lisp.crypto:hex-to-bytes hex)))))
+              (%wcc-add-external-script cc (bl.crypto:hex-to-bytes hex)))))
         (multiple-value-bind (descriptors d-present) (%opt solving "descriptors")
           (when d-present
             (dolist (desc-str descriptors)
@@ -2894,7 +2894,7 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
                   (dolist (script scripts)
                     (%wcc-add-external-script cc script))
                   (dolist (pubkey pubkeys)
-                    (setf (gethash (bitcoin-lisp.crypto:hash160 pubkey)
+                    (setf (gethash (bl.crypto:hash160 pubkey)
                                    (wcc-external-pubkeys cc))
                           pubkey)))))))))
     ;; input_weights: explicit per-input weight bounds.
@@ -2919,10 +2919,10 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
             (when (< weight 165)
               (error 'rpc-error :code +rpc-invalid-parameter+
                                 :message "Invalid parameter, weight cannot be less than 165 (41 bytes (size of outpoint + sequence + empty scriptSig) * 4 (witness scaling factor)) + 1 (empty witness)"))
-            (when (> weight bitcoin-lisp.validation:+max-standard-tx-weight+)
+            (when (> weight bl.val:+max-standard-tx-weight+)
               (error 'rpc-error :code +rpc-invalid-parameter+
                                 :message (format nil "Invalid parameter, weight cannot be greater than the maximum standard tx weight of ~D"
-                                                 bitcoin-lisp.validation:+max-standard-tx-weight+)))
+                                                 bl.val:+max-standard-tx-weight+)))
             (let ((preset (wcc-select cc (parse-hex-hash txid) vout)))
               (setf (wcc-preset-weight preset) weight))))))
     (multiple-value-bind (max-weight present) (%opt options "max_tx_weight")
@@ -2932,7 +2932,7 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
                             :message "max_tx_weight must be an integer"))
         (setf (wcc-max-tx-weight cc) max-weight)))
     ;; TRUC transactions are capped at TRUC_MAX_WEIGHT.
-    (when (= (wcc-version cc) bitcoin-lisp.mempool:+truc-version+)
+    (when (= (wcc-version cc) bl.mp:+truc-version+)
       (when (or (null (wcc-max-tx-weight cc))
                 (> (wcc-max-tx-weight cc) +truc-max-weight+))
         (setf (wcc-max-tx-weight cc) +truc-max-weight+)))
@@ -2980,14 +2980,14 @@ ConstructTransaction sequence defaults."
 ;;; --- FinishTransaction (rpc/spend.cpp:96-150) ---
 
 (defun %serialize-txout-bytes (txout)
-  (%wser (s) (bitcoin-lisp.serialization:write-tx-out s txout)))
+  (%wser (s) (bl.ser:write-tx-out s txout)))
 
 (defun %serialize-witness-stack (stack)
   (%wser (s)
-    (bitcoin-lisp.serialization:write-compact-size s (length stack))
+    (bl.ser:write-compact-size s (length stack))
     (dolist (element stack)
-      (bitcoin-lisp.serialization:write-compact-size s (length element))
-      (bitcoin-lisp.serialization:write-bytes s element))))
+      (bl.ser:write-compact-size s (length element))
+      (bl.ser:write-bytes s element))))
 
 (defun %tx-to-finalized-psbt (node wallet signed-tx coins)
   "A PSBT for SIGNED-TX: the unsigned skeleton plus, per input, the known
@@ -2998,62 +2998,62 @@ FillPSBT(sign)+FinalizePSBT leaves behind. DIVERGENCE (wallet P5 closes
 it): no partial_sig records for UNSIGNED inputs and no bip32_derivs
 metadata yet."
   (declare (ignorable node))
-  (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs signed-tx))
+  (let* ((inputs (bl.ser:transaction-inputs signed-tx))
          (n (length inputs))
-         (unsigned (bitcoin-lisp.serialization:make-transaction
-                    :version (bitcoin-lisp.serialization:transaction-version signed-tx)
+         (unsigned (bl.ser:make-transaction
+                    :version (bl.ser:transaction-version signed-tx)
                     :inputs (map 'simple-vector
                                  (lambda (input)
-                                   (bitcoin-lisp.serialization:make-tx-in
-                                    :previous-output (bitcoin-lisp.serialization:tx-in-previous-output input)
+                                   (bl.ser:make-tx-in
+                                    :previous-output (bl.ser:tx-in-previous-output input)
                                     :script-sig (make-array 0 :element-type '(unsigned-byte 8))
-                                    :sequence (bitcoin-lisp.serialization:tx-in-sequence input)))
+                                    :sequence (bl.ser:tx-in-sequence input)))
                                  inputs)
-                    :outputs (bitcoin-lisp.serialization:transaction-outputs signed-tx)
-                    :lock-time (bitcoin-lisp.serialization:transaction-lock-time signed-tx)))
-         (psbt (bitcoin-lisp.serialization:make-empty-psbt unsigned))
-         (witnesses (bitcoin-lisp.serialization:transaction-witness signed-tx))
+                    :outputs (bl.ser:transaction-outputs signed-tx)
+                    :lock-time (bl.ser:transaction-lock-time signed-tx)))
+         (psbt (bl.ser:make-empty-psbt unsigned))
+         (witnesses (bl.ser:transaction-witness signed-tx))
          (empty-key (make-array 0 :element-type '(unsigned-byte 8))))
     (dotimes (i n)
       (let* ((input (aref inputs i))
-             (prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-             (txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-             (vout (bitcoin-lisp.serialization:outpoint-index prevout))
+             (prevout (bl.ser:tx-in-previous-output input))
+             (txid (bl.ser:outpoint-hash prevout))
+             (vout (bl.ser:outpoint-index prevout))
              (entry (gethash (cons txid vout) coins))
-             (map (aref (bitcoin-lisp.serialization:psbt-inputs psbt) i)))
+             (map (aref (bl.ser:psbt-inputs psbt) i)))
         (when entry
-          (bitcoin-lisp.serialization:psbt-map-set
-           map bitcoin-lisp.serialization:+psbt-in-witness-utxo+ empty-key
+          (bl.ser:psbt-map-set
+           map bl.ser:+psbt-in-witness-utxo+ empty-key
            (%serialize-txout-bytes
-            (bitcoin-lisp.serialization:make-tx-out
+            (bl.ser:make-tx-out
              :value (second entry) :script-pubkey (first entry))))
           (let ((wtx (wallet-get-wallet-tx wallet txid)))
             (when wtx
-              (bitcoin-lisp.serialization:psbt-map-set
-               map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+
+              (bl.ser:psbt-map-set
+               map bl.ser:+psbt-in-non-witness-utxo+
                empty-key
-               (bitcoin-lisp.serialization:transaction-wire-bytes
+               (bl.ser:transaction-wire-bytes
                 (wallet-tx-tx wtx))))))
-        (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input))
+        (let ((script-sig (bl.ser:tx-in-script-sig input))
               (stack (and witnesses (< i (length witnesses)) (aref witnesses i))))
           (when (plusp (length script-sig))
-            (bitcoin-lisp.serialization:psbt-map-set
-             map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+ empty-key
+            (bl.ser:psbt-map-set
+             map bl.ser:+psbt-in-final-scriptsig+ empty-key
              script-sig))
           (when stack
-            (bitcoin-lisp.serialization:psbt-map-set
-             map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+
+            (bl.ser:psbt-map-set
+             map bl.ser:+psbt-in-final-scriptwitness+
              empty-key (%serialize-witness-stack stack))))))
-    (bitcoin-lisp.serialization:encode-psbt psbt)))
+    (bl.ser:encode-psbt psbt)))
 
 (defun %finish-transaction (node wallet options tx)
   "Core FinishTransaction: optional anti-fee-sniping, wallet signing, then
 commit-and-broadcast or serialized return per psbt/add_to_wallet. Caller
 holds node + wallet locks."
   (let ((can-anti-fee-snipe (not (%opt-present-p options "locktime"))))
-    (bitcoin-lisp.serialization:dovector
-        (input (bitcoin-lisp.serialization:transaction-inputs tx))
-      (let ((sequence (bitcoin-lisp.serialization:tx-in-sequence input)))
+    (bl.ser:dovector
+        (input (bl.ser:transaction-inputs tx))
+      (let ((sequence (bl.ser:tx-in-sequence input)))
         (setf can-anti-fee-snipe
               (and can-anti-fee-snipe
                    (or (= sequence +max-sequence-nonfinal+)
@@ -3082,12 +3082,12 @@ holds node + wallet locks."
         (push (cons "psbt" (%tx-to-finalized-psbt node wallet tx coins)) result))
       (when complete
         (push (cons "txid" (hash-to-hex
-                            (bitcoin-lisp.serialization:transaction-hash tx)))
+                            (bl.ser:transaction-hash tx)))
               result)
         (if (and add-to-wallet (not psbt-opt-in))
             (%wallet-commit-transaction node wallet tx '())
-            (push (cons "hex" (bitcoin-lisp.crypto:bytes-to-hex
-                               (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
+            (push (cons "hex" (bl.crypto:bytes-to-hex
+                               (bl.ser:transaction-wire-bytes tx)))
                   result)))
       (push (cons "complete" (json-bool complete)) result)
       (nreverse result))))
@@ -3118,7 +3118,7 @@ snapshot, so no lock-order inversion is possible; see with-wallet-lock)."
                         :message fee-or-error))
     (%wallet-commit-transaction node wallet tx map-value)
     (let ((txid-hex (hash-to-hex
-                     (bitcoin-lisp.serialization:transaction-hash tx))))
+                     (bl.ser:transaction-hash tx))))
       (if verbose
           `(("txid" . ,txid-hex)
             ("fee_reason" . ,fee-reason))
@@ -3211,8 +3211,8 @@ fundrawtransaction). PARAMS: (hexstring options iswitness)."
       (error 'rpc-error :code +rpc-deserialization-error+
                         :message "TX decode failed"))
     (let ((tx (handler-case
-                  (bitcoin-lisp.serialization:parse-tx-payload
-                   (bitcoin-lisp.crypto:hex-to-bytes hexstring))
+                  (bl.ser:parse-tx-payload
+                   (bl.crypto:hex-to-bytes hexstring))
                 (error () (error 'rpc-error :code +rpc-deserialization-error+
                                             :message "TX decode failed")))))
       (with-node-lock (node)
@@ -3222,20 +3222,20 @@ fundrawtransaction). PARAMS: (hexstring options iswitness)."
                 (keys '()))
             ;; Recipients from the existing outputs; the original script is
             ;; kept verbatim (Core round-trips through CTxDestination).
-            (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+            (loop for output across (bl.ser:transaction-outputs tx)
                   do (push (make-recipient
                             :address (%script->address
-                                      (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                                      (bl.ser:tx-out-script-pubkey output)
                                       network)
-                            :script (bitcoin-lisp.serialization:tx-out-script-pubkey output)
-                            :amount (bitcoin-lisp.serialization:tx-out-value output))
+                            :script (bl.ser:tx-out-script-pubkey output)
+                            :amount (bl.ser:tx-out-value output))
                            recipients)
                      (push "dummy" keys))
             (setf recipients (nreverse recipients)
                   keys (nreverse keys))
             (%interpret-sffo (%opt options "subtractFeeFromOutputs") keys
                              recipients)
-            (let ((cc (make-wcc :version (bitcoin-lisp.serialization:transaction-version tx))))
+            (let ((cc (make-wcc :version (bl.ser:transaction-version tx))))
               (multiple-value-bind (change-position lock-unspents)
                   (%parse-fund-options node wallet cc options recipients t)
                 (when (null recipients)
@@ -3246,8 +3246,8 @@ fundrawtransaction). PARAMS: (hexstring options iswitness)."
                                        change-position lock-unspents cc)
                   (unless funded
                     (error 'rpc-error :code +rpc-wallet-error+ :message fee))
-                  `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                               (bitcoin-lisp.serialization:transaction-wire-bytes funded)))
+                  `(("hex" . ,(bl.crypto:bytes-to-hex
+                               (bl.ser:transaction-wire-bytes funded)))
                     ("fee" . ,(%btc fee))
                     ("changepos" . ,(or change-pos -1))))))))))))
 
@@ -3313,12 +3313,12 @@ FundTransaction wrapping (RPC_WALLET_ERROR)."
     (unless tx
       (error 'rpc-error :code +rpc-wallet-error+ :message fee))
     (when lock-unspents
-      (bitcoin-lisp.serialization:dovector
-          (input (bitcoin-lisp.serialization:transaction-inputs tx))
-        (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+      (bl.ser:dovector
+          (input (bl.ser:transaction-inputs tx))
+        (let ((prevout (bl.ser:tx-in-previous-output input)))
           (wallet-lock-coin wallet
-                            (bitcoin-lisp.serialization:outpoint-hash prevout)
-                            (bitcoin-lisp.serialization:outpoint-index prevout)
+                            (bl.ser:outpoint-hash prevout)
+                            (bl.ser:outpoint-index prevout)
                             nil))))
     (values tx fee change-pos)))
 
@@ -3394,9 +3394,9 @@ estimate_mode fee_rate options)."
                                         :message "Invalid parameter, version must be 1, 2, or 3"))
                     (setf (wcc-version cc) version)))
                 (setf (wcc-max-tx-weight cc)
-                      (if (= (wcc-version cc) bitcoin-lisp.mempool:+truc-version+)
+                      (if (= (wcc-version cc) bl.mp:+truc-version+)
                           +truc-max-weight+
-                          bitcoin-lisp.validation:+max-standard-tx-weight+))
+                          bl.val:+max-standard-tx-weight+))
                 (let ((rbf (if (%opt-present-p options "replaceable")
                                (and (%opt options "replaceable") t)
                                *wallet-signal-rbf*)))
@@ -3408,7 +3408,7 @@ estimate_mode fee_rate options)."
                                                          (%format-feerate-sat-vb (wcc-feerate cc))
                                                          (%format-feerate-sat-vb fee-rate))))
                     (when (and (eq fee-reason :fallback)
-                               (zerop bitcoin-lisp:*wallet-fallback-fee*))
+                               (zerop bl:*wallet-fallback-fee*))
                       (error 'rpc-error :code +rpc-wallet-error+
                                         :message "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee."))
                     (let* ((locktime (%opt options "locktime"))
@@ -3440,12 +3440,12 @@ estimate_mode fee_rate options)."
                                                                    (hash-to-hex txid) vout)))
                               (let ((wtx (wallet-get-wallet-tx wallet txid)))
                                 (unless (and wtx
-                                             (< vout (length (bitcoin-lisp.serialization:transaction-outputs
+                                             (< vout (length (bl.ser:transaction-outputs
                                                               (wallet-tx-tx wtx))))
                                              (%wallet-script-mine-p
                                               wallet
-                                              (bitcoin-lisp.serialization:tx-out-script-pubkey
-                                               (aref (bitcoin-lisp.serialization:transaction-outputs
+                                              (bl.ser:tx-out-script-pubkey
+                                               (aref (bl.ser:transaction-outputs
                                                       (wallet-tx-tx wtx))
                                                      vout))))
                                   (error 'rpc-error :code +rpc-invalid-parameter+
@@ -3453,26 +3453,26 @@ estimate_mode fee_rate options)."
                                                                      (hash-to-hex txid) vout)))
                                 (when (zerop (wallet-tx-depth wallet wtx))
                                   (let ((parent-version
-                                          (bitcoin-lisp.serialization:transaction-version
+                                          (bl.ser:transaction-version
                                            (wallet-tx-tx wtx))))
                                     (cond
-                                      ((and (= parent-version bitcoin-lisp.mempool:+truc-version+)
-                                            (/= (wcc-version cc) bitcoin-lisp.mempool:+truc-version+))
+                                      ((and (= parent-version bl.mp:+truc-version+)
+                                            (/= (wcc-version cc) bl.mp:+truc-version+))
                                        (error 'rpc-error :code +rpc-invalid-parameter+
                                                          :message (format nil "Can't spend unconfirmed version 3 pre-selected input with a version ~D tx"
                                                                           (wcc-version cc))))
-                                      ((and (= (wcc-version cc) bitcoin-lisp.mempool:+truc-version+)
-                                            (/= parent-version bitcoin-lisp.mempool:+truc-version+))
+                                      ((and (= (wcc-version cc) bl.mp:+truc-version+)
+                                            (/= parent-version bl.mp:+truc-version+))
                                        (error 'rpc-error :code +rpc-invalid-parameter+
                                                          :message (format nil "Can't spend unconfirmed version ~D pre-selected input with a version 3 tx"
                                                                           parent-version))))))
                                 (incf total-input-value
-                                      (bitcoin-lisp.serialization:tx-out-value
-                                       (aref (bitcoin-lisp.serialization:transaction-outputs
+                                      (bl.ser:tx-out-value
+                                       (aref (bl.ser:transaction-outputs
                                               (wallet-tx-tx wtx))
                                              vout)))
-                                (push (bitcoin-lisp.serialization:make-tx-in
-                                       :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                (push (bl.ser:make-tx-in
+                                       :previous-output (bl.ser:make-outpoint
                                                          :hash txid :index vout)
                                        :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                                        :sequence (or sequence
@@ -3509,18 +3509,18 @@ estimate_mode fee_rate options)."
                                          :allow-used-addresses t
                                          :check-version-trucness t
                                          :tx-version (wcc-version cc)
-                                         :mempool (bitcoin-lisp::node-mempool node)))
+                                         :mempool (bl::node-mempool node)))
                             (unless (and send-max
                                          (> (%feerate-fee fee-rate
                                                           (max 0 (wallet-coin-input-bytes coin)))
-                                            (bitcoin-lisp.serialization:tx-out-value
+                                            (bl.ser:tx-out-value
                                              (wallet-coin-output coin))))
                               (when (and (zerop (wallet-coin-depth coin))
                                          (= (wcc-version cc)
-                                            bitcoin-lisp.mempool:+truc-version+))
+                                            bl.mp:+truc-version+))
                                 (setf (wcc-max-tx-weight cc) +truc-child-max-weight+))
-                              (push (bitcoin-lisp.serialization:make-tx-in
-                                     :previous-output (bitcoin-lisp.serialization:make-outpoint
+                              (push (bl.ser:make-tx-in
+                                     :previous-output (bl.ser:make-outpoint
                                                        :hash (wallet-coin-txid coin)
                                                        :index (wallet-coin-index coin))
                                      :script-sig (make-array 0 :element-type '(unsigned-byte 8))
@@ -3532,10 +3532,10 @@ estimate_mode fee_rate options)."
                                           (wallet-coin-index coin))
                                     outpoints)
                               (incf total-input-value
-                                    (bitcoin-lisp.serialization:tx-out-value
+                                    (bl.ser:tx-out-value
                                      (wallet-coin-output coin))))))
                       (setf tx-inputs (nreverse tx-inputs))
-                      (let ((tx (bitcoin-lisp.serialization:make-transaction
+                      (let ((tx (bl.ser:make-transaction
                                  :version (wcc-version cc)
                                  :inputs (coerce tx-inputs 'simple-vector)
                                  :outputs (coerce (%recipient-outputs recipients)
@@ -3545,7 +3545,7 @@ estimate_mode fee_rate options)."
                             (%max-signed-tx-size
                              wallet cc tx
                              (loop for (txid . vout) in (reverse outpoints)
-                                   collect (cons (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                   collect (cons (bl.ser:tx-out-script-pubkey
                                                   (%wallet-input-txout node wallet txid vout))
                                                  nil)))
                           (when (minusp vsize)
@@ -3553,7 +3553,7 @@ estimate_mode fee_rate options)."
                                               :message "Unable to determine the size of the transaction, the wallet contains unsolvable descriptors"))
                           (let* ((fee-from-size (%feerate-fee fee-rate vsize))
                                  (effective-value (- total-input-value fee-from-size)))
-                            (when (> fee-from-size bitcoin-lisp:*wallet-max-tx-fee*)
+                            (when (> fee-from-size bl:*wallet-max-tx-fee*)
                               (error 'rpc-error :code +rpc-wallet-error+
                                                 :message +max-fee-exceeded-message+))
                             (when (<= effective-value 0)
@@ -3562,11 +3562,11 @@ estimate_mode fee_rate options)."
                                                              "Total value of UTXO pool too low to pay for transaction, try using lower feerate."
                                                              "Total value of UTXO pool too low to pay for transaction. Try using lower feerate or excluding uneconomic UTXOs with 'send_max' option.")))
                             (when (> tx-weight (or (wcc-max-tx-weight cc)
-                                                   bitcoin-lisp.validation:+max-standard-tx-weight+))
+                                                   bl.val:+max-standard-tx-weight+))
                               (error 'rpc-error :code +rpc-wallet-error+
                                                 :message "Transaction too large."))
-                            (let ((claimed (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs tx)
-                                                   :key #'bitcoin-lisp.serialization:tx-out-value
+                            (let ((claimed (reduce #'+ (bl.ser:transaction-outputs tx)
+                                                   :key #'bl.ser:tx-out-value
                                                    :initial-value 0)))
                               (when (> claimed total-input-value)
                                 (error 'rpc-error :code +rpc-wallet-insufficient-funds+
@@ -3578,38 +3578,38 @@ estimate_mode fee_rate options)."
                                 (let ((per-output (floor remainder
                                                          (hash-table-count addresses-without-amount)))
                                       (gave-remaining nil))
-                                  (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+                                  (loop for output across (bl.ser:transaction-outputs tx)
                                         for recipient in recipients
                                         do (let ((address (recipient-address recipient)))
                                              (if (and address
                                                       (gethash address addresses-without-amount))
                                                  (progn
-                                                   (setf (bitcoin-lisp.serialization:tx-out-value output)
+                                                   (setf (bl.ser:tx-out-value output)
                                                          per-output)
                                                    (unless gave-remaining
-                                                     (incf (bitcoin-lisp.serialization:tx-out-value output)
+                                                     (incf (bl.ser:tx-out-value output)
                                                            (mod remainder
                                                                 (hash-table-count addresses-without-amount)))
                                                      (setf gave-remaining t))
                                                    (when (%output-dust-p
-                                                          (bitcoin-lisp.serialization:tx-out-value output)
-                                                          (bitcoin-lisp.serialization:tx-out-script-pubkey output))
+                                                          (bl.ser:tx-out-value output)
+                                                          (bl.ser:tx-out-script-pubkey output))
                                                      (error 'rpc-error :code +rpc-wallet-insufficient-funds+
                                                                        :message "Dynamically assigned remainder results in dust output.")))
                                                  (when (%output-dust-p
-                                                        (bitcoin-lisp.serialization:tx-out-value output)
-                                                        (bitcoin-lisp.serialization:tx-out-script-pubkey output))
+                                                        (bl.ser:tx-out-value output)
+                                                        (bl.ser:tx-out-script-pubkey output))
                                                    (error 'rpc-error :code +rpc-invalid-parameter+
                                                                      :message (format nil "Specified output amount to ~A is below dust threshold."
                                                                                       address))))))
                                   (when (and (%opt options "lock_unspents"))
-                                    (bitcoin-lisp.serialization:dovector
-                                        (input (bitcoin-lisp.serialization:transaction-inputs tx))
-                                      (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+                                    (bl.ser:dovector
+                                        (input (bl.ser:transaction-inputs tx))
+                                      (let ((prevout (bl.ser:tx-in-previous-output input)))
                                         (wallet-lock-coin
                                          wallet
-                                         (bitcoin-lisp.serialization:outpoint-hash prevout)
-                                         (bitcoin-lisp.serialization:outpoint-index prevout)
+                                         (bl.ser:outpoint-hash prevout)
+                                         (bl.ser:outpoint-index prevout)
                                          nil))))
                                   (%finish-transaction node wallet options
                                                        tx))))))))))))))))))
@@ -3634,11 +3634,11 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
       (error 'rpc-error :code +rpc-deserialization-error+
                         :message "TX decode failed. Make sure the tx has at least one input."))
     (let ((tx (handler-case
-                  (bitcoin-lisp.serialization:parse-tx-payload
-                   (bitcoin-lisp.crypto:hex-to-bytes hexstring))
+                  (bl.ser:parse-tx-payload
+                   (bl.crypto:hex-to-bytes hexstring))
                 (error () (error 'rpc-error :code +rpc-deserialization-error+
                                             :message "TX decode failed. Make sure the tx has at least one input.")))))
-      (when (zerop (length (bitcoin-lisp.serialization:transaction-inputs tx)))
+      (when (zerop (length (bl.ser:transaction-inputs tx)))
         (error 'rpc-error :code +rpc-deserialization-error+
                           :message "TX decode failed. Make sure the tx has at least one input."))
       (with-node-lock (node)
@@ -3663,7 +3663,7 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                   (error 'rpc-error :code +rpc-invalid-parameter+
                                     :message "vout cannot be negative"))
                 (let* ((key (cons (parse-hex-hash txid) vout))
-                       (script (bitcoin-lisp.crypto:hex-to-bytes spk-hex))
+                       (script (bl.crypto:hex-to-bytes spk-hex))
                        (known (gethash key coins)))
                   (when (and known (not (equalp (first known) script)))
                     (error 'rpc-error :code +rpc-deserialization-error+
@@ -3674,10 +3674,10 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                                   (%amount-from-value amount)
                                   (and known (second known)))
                               (if (stringp redeem-hex)
-                                  (bitcoin-lisp.crypto:hex-to-bytes redeem-hex)
+                                  (bl.crypto:hex-to-bytes redeem-hex)
                                   (and known (third known)))
                               (if (stringp witness-hex)
-                                  (bitcoin-lisp.crypto:hex-to-bytes witness-hex)
+                                  (bl.crypto:hex-to-bytes witness-hex)
                                   (and known (fourth known))))))))
             ;; Explicit non-DEFAULT sighash types cannot be honored on
             ;; taproot inputs yet (the P2TR arm signs keypath
@@ -3688,7 +3688,7 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
               (maphash
                (lambda (key entry)
                  (declare (ignore key))
-                 (when (eq (bitcoin-lisp.validation:classify-script
+                 (when (eq (bl.val:classify-script
                             (first entry))
                            :witness-v1-taproot)
                    (error 'rpc-error :code +rpc-invalid-parameter+
@@ -3696,11 +3696,11 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                coins))
             (let* ((sign-errors (%wallet-sign-transaction wallet tx coins
                                                           :sighash-byte sighash-byte))
-                   (inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-                   (witnesses (bitcoin-lisp.serialization:transaction-witness tx)))
+                   (inputs (bl.ser:transaction-inputs tx))
+                   (witnesses (bl.ser:transaction-witness tx)))
               (append
-               `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                            (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
+               `(("hex" . ,(bl.crypto:bytes-to-hex
+                            (bl.ser:transaction-wire-bytes tx)))
                  ("complete" . ,(json-bool (null sign-errors))))
                (when sign-errors
                  `(("errors"
@@ -3708,19 +3708,19 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                         (lambda (entry)
                           (destructuring-bind (index . message) entry
                             (let* ((input (aref inputs index))
-                                   (prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                                   (prevout (bl.ser:tx-in-previous-output input))
                                    (stack (and witnesses
                                                (< index (length witnesses))
                                                (aref witnesses index))))
                               ;; Core SignTransactionResultToJSON entry shape.
                               `(("txid" . ,(hash-to-hex
-                                            (bitcoin-lisp.serialization:outpoint-hash prevout)))
-                                ("vout" . ,(bitcoin-lisp.serialization:outpoint-index prevout))
-                                ("witness" . ,(or (mapcar #'bitcoin-lisp.crypto:bytes-to-hex
+                                            (bl.ser:outpoint-hash prevout)))
+                                ("vout" . ,(bl.ser:outpoint-index prevout))
+                                ("witness" . ,(or (mapcar #'bl.crypto:bytes-to-hex
                                                           stack)
                                                   #()))
-                                ("scriptSig" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                                                 (bitcoin-lisp.serialization:tx-in-script-sig input)))
-                                ("sequence" . ,(bitcoin-lisp.serialization:tx-in-sequence input))
+                                ("scriptSig" . ,(bl.crypto:bytes-to-hex
+                                                 (bl.ser:tx-in-script-sig input)))
+                                ("sequence" . ,(bl.ser:tx-in-sequence input))
                                 ("error" . ,message)))))
                         sign-errors)))))))))))))

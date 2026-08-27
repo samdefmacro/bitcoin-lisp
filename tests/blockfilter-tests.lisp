@@ -13,16 +13,16 @@
 
 (in-suite :blockfilter-tests)
 
-(defun %bf-hex (bytes) (bitcoin-lisp.crypto:bytes-to-hex bytes))
-(defun %bf-unhex (hex) (bitcoin-lisp.crypto:hex-to-bytes hex))
+(defun %bf-hex (bytes) (bl.crypto:bytes-to-hex bytes))
+(defun %bf-unhex (hex) (bl.crypto:hex-to-bytes hex))
 
 (defun %bf-unhex-reversed (hex)
   "Parse a display-order (big-endian) uint256 hex string into internal
 little-endian byte order (Core stores/compares hashes this way)."
-  ;; NB: bitcoin-lisp.crypto:reverse-bytes, not (coerce (reverse ...) '(simple-array
+  ;; NB: bl.crypto:reverse-bytes, not (coerce (reverse ...) '(simple-array
   ;; (unsigned-byte 8) (*))) -- SBCL 2.5.4 compiles that idiom to elide the reverse
   ;; when the derived type already matches the coerce target.
-  (bitcoin-lisp.crypto:reverse-bytes (%bf-unhex hex)))
+  (bl.crypto:reverse-bytes (%bf-unhex hex)))
 
 (defun %blockfilter-vectors-path ()
   (merge-pathnames "refs/bitcoin/src/test/data/blockfilters.json"
@@ -39,36 +39,36 @@ little-endian byte order (Core stores/compares hashes this way)."
 
 (test gcs-bitstream-roundtrip
   "Bits written MSB-first read back identically across byte boundaries."
-  (let ((w (bitcoin-lisp.storage::%make-gcs-writer)))
+  (let ((w (bl.store::%make-gcs-writer)))
     ;; A mix of widths that straddle byte boundaries.
-    (bitcoin-lisp.storage::gcs-writer-push-bits w 1 1)
-    (bitcoin-lisp.storage::gcs-writer-push-bits w #b101 3)
-    (bitcoin-lisp.storage::gcs-writer-push-bits w #x1ff 9)
-    (bitcoin-lisp.storage::gcs-writer-push-bits w 0 7)
-    (bitcoin-lisp.storage::gcs-writer-push-bits w #xdeadbeef 32)
-    (bitcoin-lisp.storage::gcs-writer-flush w)
-    (let ((r (bitcoin-lisp.storage::%make-gcs-reader
-              :bytes (coerce (bitcoin-lisp.storage::gcs-writer-bytes w)
+    (bl.store::gcs-writer-push-bits w 1 1)
+    (bl.store::gcs-writer-push-bits w #b101 3)
+    (bl.store::gcs-writer-push-bits w #x1ff 9)
+    (bl.store::gcs-writer-push-bits w 0 7)
+    (bl.store::gcs-writer-push-bits w #xdeadbeef 32)
+    (bl.store::gcs-writer-flush w)
+    (let ((r (bl.store::%make-gcs-reader
+              :bytes (coerce (bl.store::gcs-writer-bytes w)
                              '(simple-array (unsigned-byte 8) (*))))))
-      (is (= 1 (bitcoin-lisp.storage::gcs-reader-read-bits r 1)))
-      (is (= #b101 (bitcoin-lisp.storage::gcs-reader-read-bits r 3)))
-      (is (= #x1ff (bitcoin-lisp.storage::gcs-reader-read-bits r 9)))
-      (is (= 0 (bitcoin-lisp.storage::gcs-reader-read-bits r 7)))
-      (is (= #xdeadbeef (bitcoin-lisp.storage::gcs-reader-read-bits r 32))))))
+      (is (= 1 (bl.store::gcs-reader-read-bits r 1)))
+      (is (= #b101 (bl.store::gcs-reader-read-bits r 3)))
+      (is (= #x1ff (bl.store::gcs-reader-read-bits r 9)))
+      (is (= 0 (bl.store::gcs-reader-read-bits r 7)))
+      (is (= #xdeadbeef (bl.store::gcs-reader-read-bits r 32))))))
 
 (test gcs-golomb-roundtrip
   "Golomb-Rice encode/decode round-trips for a range of magnitudes."
-  (let ((w (bitcoin-lisp.storage::%make-gcs-writer))
+  (let ((w (bl.store::%make-gcs-writer))
         (values '(0 1 18 19 524287 524288 1000000 78493100)))
     (dolist (x values)
-      (bitcoin-lisp.storage::gcs-golomb-encode w bitcoin-lisp.storage:+basic-filter-p+ x))
-    (bitcoin-lisp.storage::gcs-writer-flush w)
-    (let ((r (bitcoin-lisp.storage::%make-gcs-reader
-              :bytes (coerce (bitcoin-lisp.storage::gcs-writer-bytes w)
+      (bl.store::gcs-golomb-encode w bl.store:+basic-filter-p+ x))
+    (bl.store::gcs-writer-flush w)
+    (let ((r (bl.store::%make-gcs-reader
+              :bytes (coerce (bl.store::gcs-writer-bytes w)
                              '(simple-array (unsigned-byte 8) (*))))))
       (dolist (x values)
-        (is (= x (bitcoin-lisp.storage::gcs-golomb-decode
-                  r bitcoin-lisp.storage:+basic-filter-p+)))))))
+        (is (= x (bl.store::gcs-golomb-decode
+                  r bl.store:+basic-filter-p+)))))))
 
 ;;; --- Core blockfilters.json vectors (end-to-end) ---
 
@@ -85,14 +85,14 @@ little-endian byte order (Core stores/compares hashes this way)."
                                  expected-header-hex &optional notes)
                 row
               (declare (ignore notes))
-              (let* ((block (bitcoin-lisp.serialization:parse-block-payload
+              (let* ((block (bl.ser:parse-block-payload
                              (%bf-unhex block-hex)))
-                     (block-hash (bitcoin-lisp.serialization:block-header-hash
-                                  (bitcoin-lisp.serialization:bitcoin-block-header block)))
+                     (block-hash (bl.ser:block-header-hash
+                                  (bl.ser:bitcoin-block-header block)))
                      (spent-scripts (mapcar #'%bf-unhex prev-scripts))
-                     (filter (bitcoin-lisp.storage:build-basic-block-filter
+                     (filter (bl.store:build-basic-block-filter
                               block block-hash spent-scripts))
-                     (header (bitcoin-lisp.storage:compute-block-filter-header
+                     (header (bl.store:compute-block-filter-header
                               filter (%bf-unhex-reversed prev-header-hex))))
                 ;; Cross-check the block hash decodes to the vector's hash.
                 (is (equalp block-hash (%bf-unhex-reversed block-hash-hex))
@@ -102,10 +102,10 @@ little-endian byte order (Core stores/compares hashes this way)."
                     "height ~D: filter mismatch~%  got ~A~%  exp ~A"
                     height (%bf-hex filter) expected-filter-hex)
                 ;; Filter header is a uint256, displayed big-endian.
-                (is (string= (%bf-hex (bitcoin-lisp.crypto:reverse-bytes header))
+                (is (string= (%bf-hex (bl.crypto:reverse-bytes header))
                              expected-header-hex)
                     "height ~D: filter header mismatch~%  got ~A~%  exp ~A"
-                    height (%bf-hex (bitcoin-lisp.crypto:reverse-bytes header))
+                    height (%bf-hex (bl.crypto:reverse-bytes header))
                     expected-header-hex)
                 (incf checked))))
           (is (>= checked 9) "expected to check all Core vectors, got ~D" checked)))))
@@ -125,24 +125,24 @@ an unrelated script (almost surely) does not."
               row
             (declare (ignore block-hash-hex prev-header-hex expected-filter-hex
                              expected-header-hex notes))
-            (let* ((block (bitcoin-lisp.serialization:parse-block-payload
+            (let* ((block (bl.ser:parse-block-payload
                            (%bf-unhex block-hex)))
-                   (block-hash (bitcoin-lisp.serialization:block-header-hash
-                                (bitcoin-lisp.serialization:bitcoin-block-header block)))
+                   (block-hash (bl.ser:block-header-hash
+                                (bl.ser:bitcoin-block-header block)))
                    (spent-scripts (mapcar #'%bf-unhex prev-scripts))
-                   (filter (bitcoin-lisp.storage:build-basic-block-filter
+                   (filter (bl.store:build-basic-block-filter
                             block block-hash spent-scripts))
-                   (elements (bitcoin-lisp.storage:basic-filter-elements
+                   (elements (bl.store:basic-filter-elements
                               block spent-scripts)))
               (multiple-value-bind (k0 k1)
-                  (bitcoin-lisp.storage:block-filter-siphash-keys block-hash)
+                  (bl.store:block-filter-siphash-keys block-hash)
                 ;; No false negatives: all elements must match.
                 (dolist (e elements)
-                  (is (bitcoin-lisp.storage:gcs-filter-match filter k0 k1 e)
+                  (is (bl.store:gcs-filter-match filter k0 k1 e)
                       "height ~D: element failed to match its own filter" height))
                 ;; MatchAny over the whole set is true when the set is non-empty.
                 (when elements
-                  (is (bitcoin-lisp.storage:gcs-filter-match-any filter k0 k1 elements)))
+                  (is (bl.store:gcs-filter-match-any filter k0 k1 elements)))
                 ;; An unrelated script should not match (allow rare false positive).
                 (let ((bogus (%bf-unhex "6a24aa21a9edfacefeed00")))
                   (declare (ignorable bogus))
@@ -151,7 +151,7 @@ an unrelated script (almost surely) does not."
 ;;; --- Persistent index + RPCs (regtest integration) ---
 ;;;
 ;;; Reuses the regtest fixture from mining-tests.lisp (%with-regtest,
-;;; %regtest-node-fixture). Binding bitcoin-lisp::*node* lets the connect-time
+;;; %regtest-node-fixture). Binding bl::*node* lets the connect-time
 ;;; hook (index-block-filter) fire as generatetodescriptor mines blocks.
 
 (defun %bfi-regtest-node ()
@@ -164,13 +164,13 @@ genesis filter from chain parameters before any block connects."
          (idxbase (merge-pathnames (format nil "test-bfi-~A/" tag)
                                    (uiop:temporary-directory))))
     (ensure-directories-exist idxbase)
-    (setf (bitcoin-lisp::node-blockfilterindex node)
-          (bitcoin-lisp.storage:init-blockfilterindex idxbase :enabled t))
-    (bitcoin-lisp.storage:build-blockfilterindex
-     (bitcoin-lisp::node-blockfilterindex node)
-     (bitcoin-lisp::node-chain-state node)
-     (bitcoin-lisp::node-block-store node)
-     #'bitcoin-lisp.validation:get-undo-data)
+    (setf (bl::node-blockfilterindex node)
+          (bl.store:init-blockfilterindex idxbase :enabled t))
+    (bl.store:build-blockfilterindex
+     (bl::node-blockfilterindex node)
+     (bl::node-chain-state node)
+     (bl::node-block-store node)
+     #'bl.val:get-undo-data)
     node))
 
 (defun %bfi-zeros32 ()
@@ -185,14 +185,14 @@ nothing."
   (let ((element (list (make-array 3 :element-type '(unsigned-byte 8)
                                      :initial-contents '(1 2 3)))))
     (signals error
-      (bitcoin-lisp.storage:gcs-filter-match-any
+      (bl.store:gcs-filter-match-any
        (coerce #(#xfd #x01 #x00 #x00) '(simple-array (unsigned-byte 8) (*)))
        1 2 element))
     (signals error
-      (bitcoin-lisp.storage:gcs-filter-match-any
+      (bl.store:gcs-filter-match-any
        (coerce #(#xfe #x00 #x00 #x00 #x03) '(simple-array (unsigned-byte 8) (*)))
        1 2 element))
-    (is-false (bitcoin-lisp.storage:gcs-filter-match-any
+    (is-false (bl.store:gcs-filter-match-any
                (coerce #(#x00) '(simple-array (unsigned-byte 8) (*)))
                1 2 element))))
 
@@ -201,52 +201,52 @@ nothing."
 recomputation, and a filter header; unknown type / missing block error."
   (%with-regtest
    (let ((node (%bfi-regtest-node)))
-     (let ((bitcoin-lisp::*node* node))
-       (let ((hashes (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 3 "raw(51)")))
-             (bfi (bitcoin-lisp::node-blockfilterindex node)))
+     (let ((bl::*node* node))
+       (let ((hashes (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)")))
+             (bfi (bl::node-blockfilterindex node)))
          (is (= 3 (length hashes)))
-         (is (= 3 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+         (is (= 3 (bl.store:blockfilterindex-height bfi)))
          (dolist (h hashes)
-           (let* ((res (bitcoin-lisp.rpc::rpc-getblockfilter node (list h)))
+           (let* ((res (bl.rpc::rpc-getblockfilter node (list h)))
                   (filt-hex (cdr (assoc "filter" res :test #'equal)))
                   (hdr-hex (cdr (assoc "header" res :test #'equal)))
-                  (hash (bitcoin-lisp.rpc::parse-hex-hash h))
-                  (block (bitcoin-lisp.storage:get-block
-                          (bitcoin-lisp::node-block-store node) hash))
-                  (undo (bitcoin-lisp.validation:get-undo-data hash))
+                  (hash (bl.rpc::parse-hex-hash h))
+                  (block (bl.store:get-block
+                          (bl::node-block-store node) hash))
+                  (undo (bl.val:get-undo-data hash))
                   (spent (mapcar (lambda (e)
-                                   (bitcoin-lisp.storage:utxo-entry-script-pubkey (third e)))
+                                   (bl.store:utxo-entry-script-pubkey (third e)))
                                  undo))
-                  (recomputed (bitcoin-lisp.storage:build-basic-block-filter
+                  (recomputed (bl.store:build-basic-block-filter
                                block hash spent)))
              (is (= 64 (length hdr-hex)))
-             (is (string= filt-hex (bitcoin-lisp.crypto:bytes-to-hex recomputed)))))
+             (is (string= filt-hex (bl.crypto:bytes-to-hex recomputed)))))
          ;; unknown filtertype
-         (signals bitcoin-lisp.rpc::rpc-error
-           (bitcoin-lisp.rpc::rpc-getblockfilter node (list (first hashes) "foo")))
+         (signals bl.rpc::rpc-error
+           (bl.rpc::rpc-getblockfilter node (list (first hashes) "foo")))
          ;; unknown block
-         (signals bitcoin-lisp.rpc::rpc-error
-           (bitcoin-lisp.rpc::rpc-getblockfilter
-            node (list (bitcoin-lisp.rpc::hash-to-hex (%bfi-zeros32))))))))))
+         (signals bl.rpc::rpc-error
+           (bl.rpc::rpc-getblockfilter
+            node (list (bl.rpc::hash-to-hex (%bfi-zeros32))))))))))
 
 (test blockfilterindex-header-chain
   "Each block's stored filter header chains off its parent's (BIP157)."
   (%with-regtest
    (let ((node (%bfi-regtest-node)))
-     (let ((bitcoin-lisp::*node* node))
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
-       (let ((bfi (bitcoin-lisp::node-blockfilterindex node))
-             (cs (bitcoin-lisp::node-chain-state node)))
+     (let ((bl::*node* node))
+       (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
+       (let ((bfi (bl::node-blockfilterindex node))
+             (cs (bl::node-chain-state node)))
          (loop for h from 1 to 3
-               for hash = (bitcoin-lisp.storage:block-index-entry-hash
-                           (bitcoin-lisp.storage:get-block-at-height cs h))
-               for prev-hash = (bitcoin-lisp.storage:block-index-entry-hash
-                                (bitcoin-lisp.storage:get-block-at-height cs (1- h)))
-               for filter = (bitcoin-lisp.storage:blockfilterindex-get-filter bfi hash)
-               for prev-header = (or (bitcoin-lisp.storage:blockfilterindex-get-header bfi prev-hash)
-                                     bitcoin-lisp.storage:+zero-filter-header+)
-               do (is (equalp (bitcoin-lisp.storage:blockfilterindex-get-header bfi hash)
-                              (bitcoin-lisp.storage:compute-block-filter-header
+               for hash = (bl.store:block-index-entry-hash
+                           (bl.store:get-block-at-height cs h))
+               for prev-hash = (bl.store:block-index-entry-hash
+                                (bl.store:get-block-at-height cs (1- h)))
+               for filter = (bl.store:blockfilterindex-get-filter bfi hash)
+               for prev-header = (or (bl.store:blockfilterindex-get-header bfi prev-hash)
+                                     bl.store:+zero-filter-header+)
+               do (is (equalp (bl.store:blockfilterindex-get-header bfi hash)
+                              (bl.store:compute-block-filter-header
                                filter prev-header)))))))))
 
 (test scanblocks-finds-and-misses
@@ -254,31 +254,31 @@ recomputation, and a filter header; unknown type / missing block error."
 filter_false_positives keeps the true matches; idle status is null."
   (%with-regtest
    (let ((node (%bfi-regtest-node)))
-     (let ((bitcoin-lisp::*node* node))
-       (let ((hashes (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))))
-         (let* ((res (bitcoin-lisp.rpc::rpc-scanblocks node (list "start" (list "raw(51)"))))
+     (let ((bl::*node* node))
+       (let ((hashes (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))))
+         (let* ((res (bl.rpc::rpc-scanblocks node (list "start" (list "raw(51)"))))
                 (blocks (cdr (assoc "relevant_blocks" res :test #'equal))))
            (is-true (cdr (assoc "completed" res :test #'equal)))
            (is (= 3 (length blocks)))
            (is (every (lambda (h) (member h hashes :test #'string=)) blocks)))
          ;; a script no block contains
-         (let* ((res (bitcoin-lisp.rpc::rpc-scanblocks node (list "start" (list "raw(6a00deadbeef)"))))
+         (let* ((res (bl.rpc::rpc-scanblocks node (list "start" (list "raw(6a00deadbeef)"))))
                 (blocks (cdr (assoc "relevant_blocks" res :test #'equal))))
            (is (null blocks)))
          ;; filter_false_positives verification path keeps the real matches
          (let ((opts (make-hash-table :test 'equal)))
            (setf (gethash "filter_false_positives" opts) t)
-           (let* ((res (bitcoin-lisp.rpc::rpc-scanblocks
+           (let* ((res (bl.rpc::rpc-scanblocks
                         node (list "start" (list "raw(51)") 0 3 "basic" opts)))
                   (blocks (cdr (assoc "relevant_blocks" res :test #'equal))))
              (is (= 3 (length blocks)))))
          ;; idle status is null
-         (is (null (bitcoin-lisp.rpc::rpc-scanblocks node (list "status"))))
+         (is (null (bl.rpc::rpc-scanblocks node (list "status"))))
          ;; out-of-range / reversed heights error rather than silently clamp
-         (signals bitcoin-lisp.rpc::rpc-error
-           (bitcoin-lisp.rpc::rpc-scanblocks node (list "start" (list "raw(51)") 999999)))
-         (signals bitcoin-lisp.rpc::rpc-error
-           (bitcoin-lisp.rpc::rpc-scanblocks node (list "start" (list "raw(51)") 3 1))))))))
+         (signals bl.rpc::rpc-error
+           (bl.rpc::rpc-scanblocks node (list "start" (list "raw(51)") 999999)))
+         (signals bl.rpc::rpc-error
+           (bl.rpc::rpc-scanblocks node (list "start" (list "raw(51)") 3 1))))))))
 
 (test blockfilterindex-backfill-seeks-first-indexable
   "Backfilling an empty index over an UNPRUNED chain first indexes GENESIS from
@@ -291,76 +291,76 @@ contiguous."
    ;; Mine 5 blocks on a node with NO filter index attached, so the connect
    ;; hook indexes nothing and the backfill does all the work.
    (let ((node (%regtest-node-fixture (format nil "bfb~D" (get-internal-real-time)))))
-     (let ((bitcoin-lisp::*node* node))
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
-       (let* ((cs (bitcoin-lisp::node-chain-state node))
-              (store (bitcoin-lisp::node-block-store node))
+     (let ((bl::*node* node))
+       (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
+       (let* ((cs (bl::node-chain-state node))
+              (store (bl::node-block-store node))
               (idxbase (merge-pathnames
                         (format nil "test-bfb-~D/" (get-internal-real-time))
                         (uiop:temporary-directory)))
-              (bfi (bitcoin-lisp.storage:init-blockfilterindex idxbase :enabled t))
-              (n (bitcoin-lisp.storage:build-blockfilterindex
-                  bfi cs store #'bitcoin-lisp.validation:get-undo-data)))
+              (bfi (bl.store:init-blockfilterindex idxbase :enabled t))
+              (n (bl.store:build-blockfilterindex
+                  bfi cs store #'bl.val:get-undo-data)))
          ;; Genesis (from chain params) + heights 1..5 indexed.
          (is (= 6 n))
-         (is (= 5 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
-         (is-true (bitcoin-lisp.storage:blockfilterindex-has-block-p
-                   bfi (bitcoin-lisp.storage:network-genesis-hash :regtest)))
+         (is (= 5 (bl.store:blockfilterindex-height bfi)))
+         (is-true (bl.store:blockfilterindex-has-block-p
+                   bfi (bl.store:network-genesis-hash :regtest)))
          ;; Genesis anchors on the all-zero header; height 1 chains off genesis.
-         (let* ((ghash (bitcoin-lisp.storage:network-genesis-hash :regtest))
-                (gheader (bitcoin-lisp.storage:blockfilterindex-get-header bfi ghash))
-                (gfilter (bitcoin-lisp.storage:blockfilterindex-get-filter bfi ghash))
-                (h1 (bitcoin-lisp.storage:block-index-entry-hash
-                     (bitcoin-lisp.storage:get-block-at-height cs 1)))
-                (filter (bitcoin-lisp.storage:blockfilterindex-get-filter bfi h1)))
+         (let* ((ghash (bl.store:network-genesis-hash :regtest))
+                (gheader (bl.store:blockfilterindex-get-header bfi ghash))
+                (gfilter (bl.store:blockfilterindex-get-filter bfi ghash))
+                (h1 (bl.store:block-index-entry-hash
+                     (bl.store:get-block-at-height cs 1)))
+                (filter (bl.store:blockfilterindex-get-filter bfi h1)))
            (is (equalp gheader
-                       (bitcoin-lisp.storage:compute-block-filter-header
-                        gfilter bitcoin-lisp.storage:+zero-filter-header+)))
-           (is (equalp (bitcoin-lisp.storage:blockfilterindex-get-header bfi h1)
-                       (bitcoin-lisp.storage:compute-block-filter-header
+                       (bl.store:compute-block-filter-header
+                        gfilter bl.store:+zero-filter-header+)))
+           (is (equalp (bl.store:blockfilterindex-get-header bfi h1)
+                       (bl.store:compute-block-filter-header
                         filter gheader))))
-         (bitcoin-lisp.storage:close-blockfilterindex bfi)
+         (bl.store:close-blockfilterindex bfi)
          ;; Make block 3's body unreadable and rebuild from scratch: the
          ;; backfill seeds genesis + 1..2, then STOPS at the gap rather than
          ;; skipping past it. FORGET-BLOCK-BODY, not PRUNE-BLOCK: what the test
          ;; needs is a missing body, and PRUNE-BLOCK refuses for a block inside
          ;; a flat file (which is where the default format puts it), leaving no
          ;; gap and the test asserting against a chain with none.
-         (bitcoin-lisp.storage:forget-block-body
-          store (bitcoin-lisp.storage:block-index-entry-hash
-                 (bitcoin-lisp.storage:get-block-at-height cs 3)))
+         (bl.store:forget-block-body
+          store (bl.store:block-index-entry-hash
+                 (bl.store:get-block-at-height cs 3)))
          (let* ((idxbase2 (merge-pathnames
                            (format nil "test-bfb2-~D/" (get-internal-real-time))
                            (uiop:temporary-directory)))
-                (bfi2 (bitcoin-lisp.storage:init-blockfilterindex idxbase2 :enabled t))
-                (n2 (bitcoin-lisp.storage:build-blockfilterindex
-                     bfi2 cs store #'bitcoin-lisp.validation:get-undo-data)))
+                (bfi2 (bl.store:init-blockfilterindex idxbase2 :enabled t))
+                (n2 (bl.store:build-blockfilterindex
+                     bfi2 cs store #'bl.val:get-undo-data)))
            (is (= 3 n2))
-           (is (= 2 (bitcoin-lisp.storage:blockfilterindex-height bfi2)))
-           (is-true (bitcoin-lisp.storage:blockfilterindex-has-block-p
-                     bfi2 (bitcoin-lisp.storage:network-genesis-hash :regtest)))
-           (bitcoin-lisp.storage:close-blockfilterindex bfi2))
+           (is (= 2 (bl.store:blockfilterindex-height bfi2)))
+           (is-true (bl.store:blockfilterindex-has-block-p
+                     bfi2 (bl.store:network-genesis-hash :regtest)))
+           (bl.store:close-blockfilterindex bfi2))
          ;; An empty index starts the seek at the pruned horizon (a pruned
          ;; mainnet node would otherwise probe ~950k deleted heights, ~14 ms
          ;; each). With pruned-height=2 the genesis anchor is impossible (no
          ;; genesis seeding on a pruned chain): the scan starts at 3 -- whose
          ;; body was pruned above -- and still seeds at 4, indexing 4..5.
-         (setf (bitcoin-lisp.storage:chain-state-pruned-height cs) 2)
+         (setf (bl.store:chain-state-pruned-height cs) 2)
          (let* ((idxbase3 (merge-pathnames
                            (format nil "test-bfb3-~D/" (get-internal-real-time))
                            (uiop:temporary-directory)))
-                (bfi3 (bitcoin-lisp.storage:init-blockfilterindex idxbase3 :enabled t))
-                (n3 (bitcoin-lisp.storage:build-blockfilterindex
-                     bfi3 cs store #'bitcoin-lisp.validation:get-undo-data)))
+                (bfi3 (bl.store:init-blockfilterindex idxbase3 :enabled t))
+                (n3 (bl.store:build-blockfilterindex
+                     bfi3 cs store #'bl.val:get-undo-data)))
            (is (= 2 n3))
-           (is (= 5 (bitcoin-lisp.storage:blockfilterindex-height bfi3)))
-           (is-false (bitcoin-lisp.storage:blockfilterindex-has-block-p
-                      bfi3 (bitcoin-lisp.storage:network-genesis-hash :regtest)))
-           (is-false (bitcoin-lisp.storage:blockfilterindex-has-block-p
-                      bfi3 (bitcoin-lisp.storage:block-index-entry-hash
-                            (bitcoin-lisp.storage:get-block-at-height cs 1))))
-           (bitcoin-lisp.storage:close-blockfilterindex bfi3)
-           (setf (bitcoin-lisp.storage:chain-state-pruned-height cs) 0)))))))
+           (is (= 5 (bl.store:blockfilterindex-height bfi3)))
+           (is-false (bl.store:blockfilterindex-has-block-p
+                      bfi3 (bl.store:network-genesis-hash :regtest)))
+           (is-false (bl.store:blockfilterindex-has-block-p
+                      bfi3 (bl.store:block-index-entry-hash
+                            (bl.store:get-block-at-height cs 1))))
+           (bl.store:close-blockfilterindex bfi3)
+           (setf (bl.store:chain-state-pruned-height cs) 0)))))))
 
 (test blockfilterindex-refuses-noncontiguous-add
   "Adding a block whose parent has no stored filter header while the index is
@@ -370,44 +370,44 @@ marker (observed live after a mid-backfill crash). An empty index still seeds
 from the zero header, and filling the gap in order is then accepted."
   (%with-regtest
    (let ((node (%regtest-node-fixture (format nil "bfc~D" (get-internal-real-time)))))
-     (let ((bitcoin-lisp::*node* node))
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
-       (let* ((cs (bitcoin-lisp::node-chain-state node))
-              (store (bitcoin-lisp::node-block-store node))
+     (let ((bl::*node* node))
+       (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
+       (let* ((cs (bl::node-chain-state node))
+              (store (bl::node-block-store node))
               (idxbase (merge-pathnames
                         (format nil "test-bfc-~D/" (get-internal-real-time))
                         (uiop:temporary-directory)))
-              (bfi (bitcoin-lisp.storage:init-blockfilterindex idxbase :enabled t)))
+              (bfi (bl.store:init-blockfilterindex idxbase :enabled t)))
          (flet ((blk (h)
-                  (let ((hash (bitcoin-lisp.storage:block-index-entry-hash
-                               (bitcoin-lisp.storage:get-block-at-height cs h))))
-                    (values (bitcoin-lisp.storage:get-block store hash) hash))))
+                  (let ((hash (bl.store:block-index-entry-hash
+                               (bl.store:get-block-at-height cs h))))
+                    (values (bl.store:get-block store hash) hash))))
            ;; Empty index: block 1 seeds from the zero header.
            (multiple-value-bind (b1 h1) (blk 1)
-             (is-true (bitcoin-lisp.storage:blockfilterindex-add-block bfi b1 h1 1 nil)))
+             (is-true (bl.store:blockfilterindex-add-block bfi b1 h1 1 nil)))
            ;; Non-empty index: block 3's parent (2) is unindexed -> refused,
            ;; best marker untouched.
            (multiple-value-bind (b3 h3) (blk 3)
              (multiple-value-bind (filter status)
-                 (bitcoin-lisp.storage:blockfilterindex-add-block bfi b3 h3 3 nil)
+                 (bl.store:blockfilterindex-add-block bfi b3 h3 3 nil)
                (is (null filter))
                (is (eq :noncontiguous status))))
-           (is (= 1 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+           (is (= 1 (bl.store:blockfilterindex-height bfi)))
            ;; In-order adds are accepted and advance the best marker.
            (multiple-value-bind (b2 h2) (blk 2)
-             (is-true (bitcoin-lisp.storage:blockfilterindex-add-block bfi b2 h2 2 nil)))
+             (is-true (bl.store:blockfilterindex-add-block bfi b2 h2 2 nil)))
            (multiple-value-bind (b3 h3) (blk 3)
-             (is-true (bitcoin-lisp.storage:blockfilterindex-add-block bfi b3 h3 3 nil)))
-           (is (= 3 (bitcoin-lisp.storage:blockfilterindex-height bfi))))
-         (bitcoin-lisp.storage:close-blockfilterindex bfi))))))
+             (is-true (bl.store:blockfilterindex-add-block bfi b3 h3 3 nil)))
+           (is (= 3 (bl.store:blockfilterindex-height bfi))))
+         (bl.store:close-blockfilterindex bfi))))))
 
 (test getdescriptoractivity-receives
   "getdescriptoractivity reports a receive for a matching coinbase output."
   (%with-regtest
    (let ((node (%bfi-regtest-node)))
-     (let ((bitcoin-lisp::*node* node))
-       (let* ((hashes (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 2 "raw(51)")))
-              (res (bitcoin-lisp.rpc::rpc-getdescriptoractivity
+     (let ((bl::*node* node))
+       (let* ((hashes (bl.rpc::rpc-generatetodescriptor node (list 2 "raw(51)")))
+              (res (bl.rpc::rpc-getdescriptoractivity
                     node (list hashes (list "raw(51)") nil)))
               (activity (cdr (assoc "activity" res :test #'equal))))
          (is (= 2 (length activity)))
@@ -419,9 +419,9 @@ from the zero header, and filling the gap in order is then accepted."
            (is-true (assoc "height" e :test #'equal))
            (is-true (assoc "output_spk" e :test #'equal)))
          ;; an unknown block hash errors (Core parity)
-         (signals bitcoin-lisp.rpc::rpc-error
-           (bitcoin-lisp.rpc::rpc-getdescriptoractivity
-            node (list (list (bitcoin-lisp.rpc::hash-to-hex (%bfi-zeros32)))
+         (signals bl.rpc::rpc-error
+           (bl.rpc::rpc-getdescriptoractivity
+            node (list (list (bl.rpc::hash-to-hex (%bfi-zeros32)))
                        (list "raw(51)") nil))))))))
 
 (test bip157-serving-request-validation-and-messages
@@ -430,43 +430,43 @@ range bounds; the cfilter/cfheaders/cfcheckpt builders and parsers round-trip
 against a real backfilled index. peer-block-filters gates %cf-serving-index."
   (%with-regtest
    (let ((node (%bfi-regtest-node)))
-     (let ((bitcoin-lisp::*node* node)
-           (bitcoin-lisp:*peer-block-filters* t))
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
-       (let* ((cs (bitcoin-lisp::node-chain-state node))
-              (bfi (bitcoin-lisp::node-blockfilterindex node))
-              (h3 (bitcoin-lisp.storage:block-index-entry-hash
-                   (bitcoin-lisp.storage:get-block-at-height cs 3))))
+     (let ((bl::*node* node)
+           (bl:*peer-block-filters* t))
+       (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
+       (let* ((cs (bl::node-chain-state node))
+              (bfi (bl::node-blockfilterindex node))
+              (h3 (bl.store:block-index-entry-hash
+                   (bl.store:get-block-at-height cs 3))))
          ;; gate: off when peer-block-filters is nil
-         (is-true (bitcoin-lisp.networking::%cf-serving-index))
-         (let ((bitcoin-lisp:*peer-block-filters* nil))
-           (is (null (bitcoin-lisp.networking::%cf-serving-index))))
+         (is-true (bl.net::%cf-serving-index))
+         (let ((bl:*peer-block-filters* nil))
+           (is (null (bl.net::%cf-serving-index))))
          ;; valid request: active-chain stop hash, in range
-         (is (= 3 (bitcoin-lisp.networking::%cf-request-stop-height cs 1 h3 1000)))
+         (is (= 3 (bl.net::%cf-request-stop-height cs 1 h3 1000)))
          ;; start > stop -> nil
-         (is (null (bitcoin-lisp.networking::%cf-request-stop-height cs 4 h3 1000)))
+         (is (null (bl.net::%cf-request-stop-height cs 4 h3 1000)))
          ;; span >= max-diff -> nil (0..3 is 4 blocks, max-diff 3 -> reject)
-         (is (null (bitcoin-lisp.networking::%cf-request-stop-height cs 0 h3 3)))
+         (is (null (bl.net::%cf-request-stop-height cs 0 h3 3)))
          ;; unknown/fork stop hash -> nil
-         (is (null (bitcoin-lisp.networking::%cf-request-stop-height
+         (is (null (bl.net::%cf-request-stop-height
                     cs 0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)
                     1000)))
          ;; getcfilters payload round-trips
-         (let ((payload (subseq (bitcoin-lisp.serialization:make-cfilter-message
-                                 0 h3 (bitcoin-lisp.storage:blockfilterindex-get-filter bfi h3))
+         (let ((payload (subseq (bl.ser:make-cfilter-message
+                                 0 h3 (bl.store:blockfilterindex-get-filter bfi h3))
                                 24)))
            (declare (ignore payload)))
          (multiple-value-bind (ft sh sp)
-             (bitcoin-lisp.serialization:parse-getcfilters-payload
+             (bl.ser:parse-getcfilters-payload
               (concatenate '(vector (unsigned-byte 8)) (vector 0 1 0 0 0) h3))
            (is (= 0 ft)) (is (= 1 sh)) (is (equalp h3 sp)))
          ;; cfcheckpt at interval 1000: none below height 4 -> empty header list, still builds
-         (let* ((msg (bitcoin-lisp.serialization:make-cfcheckpt-message 0 h3 '()))
-                (cmd (bitcoin-lisp.serialization:message-header-command
+         (let* ((msg (bl.ser:make-cfcheckpt-message 0 h3 '()))
+                (cmd (bl.ser:message-header-command
                       (flexi-streams:with-input-from-sequence (s msg)
-                        (bitcoin-lisp.serialization:read-message-header s)))))
+                        (bl.ser:read-message-header s)))))
            (is (string= "cfcheckpt" cmd))))
-       (bitcoin-lisp.storage:close-blockfilterindex (bitcoin-lisp::node-blockfilterindex node))))))
+       (bl.store:close-blockfilterindex (bl::node-blockfilterindex node))))))
 
 ;;; --- BIP157 genesis anchor ---
 ;;;
@@ -497,20 +497,20 @@ the all-zero previous header."
             ;; The genesis anchor really is the zero header in Core's vector.
             (is (string= prev-header-hex (make-string 64 :initial-element #\0)))
             (is (null prev-scripts))
-            (let* ((blk (bitcoin-lisp.storage:make-genesis-block :testnet3))
-                   (ghash (bitcoin-lisp.serialization:block-header-hash
-                           (bitcoin-lisp.serialization:bitcoin-block-header blk)))
-                   (filter (bitcoin-lisp.storage:build-basic-block-filter
+            (let* ((blk (bl.store:make-genesis-block :testnet3))
+                   (ghash (bl.ser:block-header-hash
+                           (bl.ser:bitcoin-block-header blk)))
+                   (filter (bl.store:build-basic-block-filter
                             blk ghash '()))
-                   (header (bitcoin-lisp.storage:compute-block-filter-header
-                            filter bitcoin-lisp.storage:+zero-filter-header+)))
+                   (header (bl.store:compute-block-filter-header
+                            filter bl.store:+zero-filter-header+)))
               ;; Constructed block serializes to Core's exact genesis bytes.
-              (is (string= (%bf-hex (bitcoin-lisp.serialization:serialize-witness-block blk))
+              (is (string= (%bf-hex (bl.ser:serialize-witness-block blk))
                            block-hex))
               (is (equalp ghash (%bf-unhex-reversed block-hash-hex)))
               ;; Filter and anchor header match the Core vector.
               (is (string= (%bf-hex filter) expected-filter-hex))
-              (is (string= (%bf-hex (bitcoin-lisp.crypto:reverse-bytes header))
+              (is (string= (%bf-hex (bl.crypto:reverse-bytes header))
                            expected-header-hex))))))))
 
 (test genesis-filter-headers-all-networks
@@ -527,22 +527,22 @@ Golomb-Rice P=19/M=784931) that also reproduces Core's testnet3 genesis row
 bit-exactly. Both derivations agree; a regression in either pipeline fails
 this test loudly."
   (dolist (net '(:mainnet :testnet3 :testnet4 :signet :regtest))
-    (let* ((blk (bitcoin-lisp.storage:make-genesis-block net))
-           (hdr (bitcoin-lisp.serialization:bitcoin-block-header blk))
-           (cb (first (bitcoin-lisp.serialization:bitcoin-block-transactions blk))))
-      (is (equalp (bitcoin-lisp.serialization:block-header-merkle-root hdr)
-                  (bitcoin-lisp.serialization:transaction-hash cb))
+    (let* ((blk (bl.store:make-genesis-block net))
+           (hdr (bl.ser:bitcoin-block-header blk))
+           (cb (first (bl.ser:bitcoin-block-transactions blk))))
+      (is (equalp (bl.ser:block-header-merkle-root hdr)
+                  (bl.ser:transaction-hash cb))
           "~A: genesis merkle root must equal the coinbase txid" net)
-      (is (equalp (bitcoin-lisp.serialization:block-header-hash hdr)
-                  (bitcoin-lisp.storage:network-genesis-hash net)))))
-  (let* ((blk (bitcoin-lisp.storage:make-genesis-block :mainnet))
-         (ghash (bitcoin-lisp.storage:network-genesis-hash :mainnet))
-         (filter (bitcoin-lisp.storage:build-basic-block-filter blk ghash '()))
-         (header (bitcoin-lisp.storage:compute-block-filter-header
-                  filter bitcoin-lisp.storage:+zero-filter-header+)))
+      (is (equalp (bl.ser:block-header-hash hdr)
+                  (bl.store:network-genesis-hash net)))))
+  (let* ((blk (bl.store:make-genesis-block :mainnet))
+         (ghash (bl.store:network-genesis-hash :mainnet))
+         (filter (bl.store:build-basic-block-filter blk ghash '()))
+         (header (bl.store:compute-block-filter-header
+                  filter bl.store:+zero-filter-header+)))
     (is (string= "017fa880" (%bf-hex filter)))
     (is (string= "02c2392180d0ce2b5b6f8b08d39a11ffe831c673311a3ecf77b97fc3f0303c9f"
-                 (%bf-hex (bitcoin-lisp.crypto:reverse-bytes header))))))
+                 (%bf-hex (bl.crypto:reverse-bytes header))))))
 
 (test blockfilterindex-genesis-anchor-migration
   "A legacy index (header chain seeded at the first stored block, no height-0
@@ -552,69 +552,69 @@ alone; a pruned node's legacy index is kept (rebuild impossible) with a
 warning."
   (%with-regtest
    (let ((node (%regtest-node-fixture (format nil "bfm~D" (get-internal-real-time)))))
-     (let ((bitcoin-lisp::*node* node))
-       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
-       (let* ((cs (bitcoin-lisp::node-chain-state node))
-              (store (bitcoin-lisp::node-block-store node))
-              (ghash (bitcoin-lisp.storage:network-genesis-hash :regtest))
+     (let ((bl::*node* node))
+       (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
+       (let* ((cs (bl::node-chain-state node))
+              (store (bl::node-block-store node))
+              (ghash (bl.store:network-genesis-hash :regtest))
               (idxbase (merge-pathnames
                         (format nil "test-bfm-~D/" (get-internal-real-time))
                         (uiop:temporary-directory)))
-              (bfi (bitcoin-lisp.storage:init-blockfilterindex idxbase :enabled t)))
+              (bfi (bl.store:init-blockfilterindex idxbase :enabled t)))
          ;; Empty index: nothing to migrate.
-         (is (eq :empty (bitcoin-lisp.storage:blockfilterindex-ensure-genesis-anchor
+         (is (eq :empty (bl.store:blockfilterindex-ensure-genesis-anchor
                          bfi cs)))
          ;; Fabricate the LEGACY shape: seed the header chain at height 1
          ;; (exactly what the old code did on every from-genesis node).
          (flet ((add (h)
-                  (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash
-                                (bitcoin-lisp.storage:get-block-at-height cs h)))
-                         (block (bitcoin-lisp.storage:get-block store hash))
-                         (undo (bitcoin-lisp.validation:get-undo-data hash)))
-                    (bitcoin-lisp.storage:blockfilterindex-add-block
+                  (let* ((hash (bl.store:block-index-entry-hash
+                                (bl.store:get-block-at-height cs h)))
+                         (block (bl.store:get-block store hash))
+                         (undo (bl.val:get-undo-data hash)))
+                    (bl.store:blockfilterindex-add-block
                      bfi block hash h undo))))
            (loop for h from 1 to 4 do (is-true (add h))))
-         (is (= 4 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
-         (is-false (bitcoin-lisp.storage:blockfilterindex-has-block-p bfi ghash))
+         (is (= 4 (bl.store:blockfilterindex-height bfi)))
+         (is-false (bl.store:blockfilterindex-has-block-p bfi ghash))
          ;; Pruned chain: the bad index is kept (bodies gone, cannot rebuild).
-         (setf (bitcoin-lisp.storage:chain-state-pruned-height cs) 2)
+         (setf (bl.store:chain-state-pruned-height cs) 2)
          (is (eq :unanchored-pruned
-                 (bitcoin-lisp.storage:blockfilterindex-ensure-genesis-anchor bfi cs)))
-         (is (= 4 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
-         (setf (bitcoin-lisp.storage:chain-state-pruned-height cs) 0)
+                 (bl.store:blockfilterindex-ensure-genesis-anchor bfi cs)))
+         (is (= 4 (bl.store:blockfilterindex-height bfi)))
+         (setf (bl.store:chain-state-pruned-height cs) 0)
          ;; Unpruned: detected and wiped...
          (is (eq :rebuilt
-                 (bitcoin-lisp.storage:blockfilterindex-ensure-genesis-anchor bfi cs)))
-         (is (= -1 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+                 (bl.store:blockfilterindex-ensure-genesis-anchor bfi cs)))
+         (is (= -1 (bl.store:blockfilterindex-height bfi)))
          ;; ...and the backfill rebuilds the whole chain anchored at genesis.
-         (let ((n (bitcoin-lisp.storage:build-blockfilterindex
-                   bfi cs store #'bitcoin-lisp.validation:get-undo-data)))
+         (let ((n (bl.store:build-blockfilterindex
+                   bfi cs store #'bl.val:get-undo-data)))
            (is (= 5 n)))
-         (is (= 4 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+         (is (= 4 (bl.store:blockfilterindex-height bfi)))
          (multiple-value-bind (gfilter gheader)
-             (bitcoin-lisp.storage:blockfilterindex-get bfi ghash)
+             (bl.store:blockfilterindex-get bfi ghash)
            ;; Stored genesis record matches a from-parameters recomputation
            ;; (and the independently derived regtest constants, python BIP158).
-           (let* ((gblk (bitcoin-lisp.storage:make-genesis-block :regtest))
-                  (expected-filter (bitcoin-lisp.storage:build-basic-block-filter
+           (let* ((gblk (bl.store:make-genesis-block :regtest))
+                  (expected-filter (bl.store:build-basic-block-filter
                                     gblk ghash '())))
              (is (equalp gfilter expected-filter))
              (is (string= "014756c0" (%bf-hex gfilter)))
-             (is (equalp gheader (bitcoin-lisp.storage:compute-block-filter-header
-                                  gfilter bitcoin-lisp.storage:+zero-filter-header+)))
+             (is (equalp gheader (bl.store:compute-block-filter-header
+                                  gfilter bl.store:+zero-filter-header+)))
              (is (string= "485e301e4509d7f0d954bf5b529f3ecef68c5191fd0e635f775c1d0266dc5a2b"
-                          (%bf-hex (bitcoin-lisp.crypto:reverse-bytes gheader)))))
+                          (%bf-hex (bl.crypto:reverse-bytes gheader)))))
            ;; Every subsequent header chains, so absolute values are anchored.
            (loop for h from 1 to 4
-                 for hash = (bitcoin-lisp.storage:block-index-entry-hash
-                             (bitcoin-lisp.storage:get-block-at-height cs h))
+                 for hash = (bl.store:block-index-entry-hash
+                             (bl.store:get-block-at-height cs h))
                  for prev = gheader then hdr
-                 for hdr = (bitcoin-lisp.storage:blockfilterindex-get-header bfi hash)
-                 for filter = (bitcoin-lisp.storage:blockfilterindex-get-filter bfi hash)
-                 do (is (equalp hdr (bitcoin-lisp.storage:compute-block-filter-header
+                 for hdr = (bl.store:blockfilterindex-get-header bfi hash)
+                 for filter = (bl.store:blockfilterindex-get-filter bfi hash)
+                 do (is (equalp hdr (bl.store:compute-block-filter-header
                                      filter prev)))))
          ;; Healthy index: second run is a no-op.
-         (is (eq :ok (bitcoin-lisp.storage:blockfilterindex-ensure-genesis-anchor
+         (is (eq :ok (bl.store:blockfilterindex-ensure-genesis-anchor
                       bfi cs)))
-         (is (= 4 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
-         (bitcoin-lisp.storage:close-blockfilterindex bfi))))))
+         (is (= 4 (bl.store:blockfilterindex-height bfi)))
+         (bl.store:close-blockfilterindex bfi))))))

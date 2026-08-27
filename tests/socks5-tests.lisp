@@ -72,9 +72,9 @@ Returns (values PORT THREAD CAPTURED)."
   "Call THUNK; return (values message phase) of the signaled socks5-error, or
 NIL if none was signaled."
   (handler-case (progn (funcall thunk) nil)
-    (bitcoin-lisp.networking:socks5-error (e)
-      (values (bitcoin-lisp.networking::socks5-error-message e)
-              (bitcoin-lisp.networking:socks5-error-phase e)))))
+    (bl.net:socks5-error (e)
+      (values (bl.net::socks5-error-message e)
+              (bl.net:socks5-error-phase e)))))
 
 ;;; --- handshake success paths ------------------------------------------------
 
@@ -89,7 +89,7 @@ NIL if none was signaled."
          (:read 18)                     ; 4 hdr + 1 len + 11 "example.com" + 2 port
          (:write #(#x05 #x00 #x00 #x01 10 0 0 1 #x47 #x9D))))
     (with-socks5-client (sock port)
-      (is-true (bitcoin-lisp.networking:socks5-connect
+      (is-true (bl.net:socks5-connect
                 sock "example.com" 18333 :timeout 5)))
     (bt:join-thread thread)
     (is (= 21 (length captured)))
@@ -113,7 +113,7 @@ BND.ADDR is consumed cleanly (netbase.cpp:400-445, 489-505)."
          ;; success, ATYP DOMAINNAME: len 3 "foo" + port
          (:write #(#x05 #x00 #x00 #x03 3 #x66 #x6F #x6F #x1F #x40))))
     (with-socks5-client (sock port)
-      (is-true (bitcoin-lisp.networking:socks5-connect
+      (is-true (bl.net:socks5-connect
                 sock "abc.onion" 8333
                 :username "user" :password "pass" :timeout 5)))
     (bt:join-thread thread)
@@ -138,7 +138,7 @@ BND.ADDR (16 bytes) is consumed cleanly."
                                (make-array 16 :initial-element 0)
                                #(#x20 #x8D)))))
     (with-socks5-client (sock port)
-      (is-true (bitcoin-lisp.networking:socks5-connect
+      (is-true (bl.net:socks5-connect
                 sock "10.1.2.3" 8333
                 :username "u" :password "p" :timeout 5)))
     (bt:join-thread thread)
@@ -158,7 +158,7 @@ signals a socks5-error in the :connect phase."
     (with-socks5-client (sock port)
       (multiple-value-bind (message phase)
           (%socks5-error-message
-           (lambda () (bitcoin-lisp.networking:socks5-connect
+           (lambda () (bl.net:socks5-connect
                        sock "example.com" 18333 :timeout 5)))
         (is (equal "general failure" message))
         (is (eq :connect phase))))
@@ -174,7 +174,7 @@ found\" (netbase.cpp:368-369)."
     (with-socks5-client (sock port)
       (is (equal "onion service descriptor can not be found"
                  (%socks5-error-message
-                  (lambda () (bitcoin-lisp.networking:socks5-connect
+                  (lambda () (bl.net:socks5-connect
                               sock "abc.onion" 8333 :timeout 5))))))
     (bt:join-thread thread)))
 
@@ -186,7 +186,7 @@ greeting phase (netbase.cpp:448-450)."
     (with-socks5-client (sock port)
       (multiple-value-bind (message phase)
           (%socks5-error-message
-           (lambda () (bitcoin-lisp.networking:socks5-connect
+           (lambda () (bl.net:socks5-connect
                        sock "example.com" 18333 :timeout 5)))
         (declare (ignore message))
         (is (eq :greeting phase))))
@@ -198,16 +198,16 @@ g_socks5_recv_timeout, netbase.cpp:40-41)."
   (multiple-value-bind (port thread)
       (%fake-socks5-server `((:read 3) (:sleep 1.5)))
     (with-socks5-client (sock port)
-      (signals bitcoin-lisp.networking:socks5-error
-        (bitcoin-lisp.networking:socks5-connect
+      (signals bl.net:socks5-error
+        (bl.net:socks5-connect
          sock "example.com" 18333 :timeout 0.3)))
     (bt:join-thread thread)))
 
 (test socks5-hostname-too-long
   "Destinations over 255 bytes are rejected before any I/O (the DOMAINNAME
 length field is one byte, netbase.cpp:396-399)."
-  (signals bitcoin-lisp.networking:socks5-error
-    (bitcoin-lisp.networking:socks5-connect
+  (signals bl.net:socks5-error
+    (bl.net:socks5-connect
      nil (make-string 256 :initial-element #\a) 8333)))
 
 ;;; --- stream isolation ---------------------------------------------------------
@@ -215,8 +215,8 @@ length field is one byte, netbase.cpp:396-399)."
 (test socks5-stream-isolation-credentials
   "Successive connections get distinct credentials sharing the per-process
 random prefix: \"<16 hex>-<counter>\" (netbase.cpp:748-784)."
-  (let ((a (bitcoin-lisp.networking:next-proxy-credentials))
-        (b (bitcoin-lisp.networking:next-proxy-credentials)))
+  (let ((a (bl.net:next-proxy-credentials))
+        (b (bl.net:next-proxy-credentials)))
     (is (not (equal a b)))
     (let ((dash-a (position #\- a))
           (dash-b (position #\- b)))
@@ -239,21 +239,21 @@ netbase.cpp:786-810)."
          (:read-userpass) (:write #(#x01 #x00))
          (:read-connect)
          (:write #(#x05 #x00 #x00 #x01 10 0 0 1 #x20 #x8D))))
-    (let ((old-proxy bitcoin-lisp.networking:*proxy*))
+    (let ((old-proxy bl.net:*proxy*))
       (unwind-protect
           (progn
-            (setf bitcoin-lisp.networking:*proxy*
-                  (bitcoin-lisp.networking:make-proxy
+            (setf bl.net:*proxy*
+                  (bl.net:make-proxy
                    :host "127.0.0.1" :port port :randomize-credentials t))
-            (let ((conn (bitcoin-lisp.networking:make-tcp-connection
+            (let ((conn (bl.net:make-tcp-connection
                          "seed.example.org" 8333)))
               (is-true conn)
               (when conn
                 (is (equal "seed.example.org"
-                           (bitcoin-lisp.networking:connection-host conn)))
-                (is-true (bitcoin-lisp.networking:connection-connected conn))
-                (bitcoin-lisp.networking:close-connection conn))))
-        (setf bitcoin-lisp.networking:*proxy* old-proxy)))
+                           (bl.net:connection-host conn)))
+                (is-true (bl.net:connection-connected conn))
+                (bl.net:close-connection conn))))
+        (setf bl.net:*proxy* old-proxy)))
     (bt:join-thread thread)
     ;; The greeting offered USER/PASS (isolation credentials were sent) and
     ;; the CONNECT carried the hostname (never resolved locally).
@@ -266,15 +266,15 @@ netbase.cpp:786-810)."
 contract (no condition escapes to the dial loop)."
   (multiple-value-bind (port thread)
       (%fake-socks5-server `((:read 4) (:write #(#x05 #xFF))))
-    (let ((old-proxy bitcoin-lisp.networking:*proxy*))
+    (let ((old-proxy bl.net:*proxy*))
       (unwind-protect
           (progn
-            (setf bitcoin-lisp.networking:*proxy*
-                  (bitcoin-lisp.networking:make-proxy
+            (setf bl.net:*proxy*
+                  (bl.net:make-proxy
                    :host "127.0.0.1" :port port :randomize-credentials t))
-            (is (null (bitcoin-lisp.networking:make-tcp-connection
+            (is (null (bl.net:make-tcp-connection
                        "example.com" 8333))))
-        (setf bitcoin-lisp.networking:*proxy* old-proxy)))
+        (setf bl.net:*proxy* old-proxy)))
     (bt:join-thread thread)))
 
 ;;; --- onion dialing (P2) ---------------------------------------------------------
@@ -295,28 +295,28 @@ NET_ONION proxy and passes ToStringAddr()/GetPort() to ConnectThroughProxy
        `((:read 3) (:write #(#x05 #x00))          ; NOAUTH
          (:read-connect)
          (:write #(#x05 #x00 #x00 #x01 0 0 0 0 #x00 #x00))))
-    (let ((old-proxy bitcoin-lisp.networking:*proxy*)
-          (old-onion bitcoin-lisp.networking:*onion-proxy*))
+    (let ((old-proxy bl.net:*proxy*)
+          (old-onion bl.net:*onion-proxy*))
       (unwind-protect
           (progn
             ;; General proxy points NOWHERE dialable: proves the onion dial
             ;; uses the -onion proxy, not -proxy.
-            (setf bitcoin-lisp.networking:*proxy*
-                  (bitcoin-lisp.networking:make-proxy
+            (setf bl.net:*proxy*
+                  (bl.net:make-proxy
                    :host "192.0.2.1" :port 1 :randomize-credentials nil))
-            (setf bitcoin-lisp.networking:*onion-proxy*
-                  (bitcoin-lisp.networking:make-proxy
+            (setf bl.net:*onion-proxy*
+                  (bl.net:make-proxy
                    :host "127.0.0.1" :port port :randomize-credentials nil))
-            (let ((conn (bitcoin-lisp.networking:make-tcp-connection
+            (let ((conn (bl.net:make-tcp-connection
                          +socks5-onion-target+ 8333)))
               (is-true conn)
               (when conn
                 (is (equal +socks5-onion-target+
-                           (bitcoin-lisp.networking:connection-host conn)))
-                (is (= 8333 (bitcoin-lisp.networking::connection-port conn)))
-                (bitcoin-lisp.networking:close-connection conn))))
-        (setf bitcoin-lisp.networking:*proxy* old-proxy
-              bitcoin-lisp.networking:*onion-proxy* old-onion)))
+                           (bl.net:connection-host conn)))
+                (is (= 8333 (bl.net::connection-port conn)))
+                (bl.net:close-connection conn))))
+        (setf bl.net:*proxy* old-proxy
+              bl.net:*onion-proxy* old-onion)))
     (bt:join-thread thread)
     ;; Exact wire bytes: greeting 05 01 00, CONNECT 05 01 00 03 3E <name> 20 8D.
     (is (= (+ 3 4 1 62 2) (length captured)))
@@ -331,30 +331,30 @@ NET_ONION proxy and passes ToStringAddr()/GetPort() to ConnectThroughProxy
   "With no Tor proxy configured, an onion dial is refused up front — NIL, no
 socket, no DNS lookup of the onion name. The no-proxy node is provably
 unchanged: onion addresses can be stored but never dialed."
-  (let ((old-proxy bitcoin-lisp.networking:*proxy*)
-        (old-onion bitcoin-lisp.networking:*onion-proxy*))
+  (let ((old-proxy bl.net:*proxy*)
+        (old-onion bl.net:*onion-proxy*))
     (unwind-protect
         (progn
-          (setf bitcoin-lisp.networking:*proxy* nil
-                bitcoin-lisp.networking:*onion-proxy* nil)
-          (is (null (bitcoin-lisp.networking:make-tcp-connection
+          (setf bl.net:*proxy* nil
+                bl.net:*onion-proxy* nil)
+          (is (null (bl.net:make-tcp-connection
                      +socks5-onion-target+ 8333)))
           ;; I2P targets are refused too (SAM is P4).
-          (is (null (bitcoin-lisp.networking:make-tcp-connection
+          (is (null (bl.net:make-tcp-connection
                      "ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p"
                      0))))
-      (setf bitcoin-lisp.networking:*proxy* old-proxy
-            bitcoin-lisp.networking:*onion-proxy* old-onion))))
+      (setf bl.net:*proxy* old-proxy
+            bl.net:*onion-proxy* old-onion))))
 
 ;;; --- DNS discipline -------------------------------------------------------------
 
 (test discover-peers-skips-local-dns-when-proxied
   "With a proxy set, DNS seeds are returned as hostname dial targets instead
 of being resolved locally (Core net.cpp:2353-2358 AddAddrFetch)."
-  (let ((bitcoin-lisp.networking:*proxy*
-          (bitcoin-lisp.networking:make-proxy :host "127.0.0.1" :port 9050)))
+  (let ((bl.net:*proxy*
+          (bl.net:make-proxy :host "127.0.0.1" :port 9050)))
     (is (equal '("seed.example.org" "dnsseed.example.net")
-               (bitcoin-lisp.networking:discover-peers
+               (bl.net:discover-peers
                 '("seed.example.org" "dnsseed.example.net"))))))
 
 ;;; --- config wiring ----------------------------------------------------------------
@@ -362,19 +362,19 @@ of being resolved locally (Core net.cpp:2353-2358 AddAddrFetch)."
 (test conf-parse-proxy-forms
   "-proxy value parsing: default port 9050, explicit port, \"0\" clears,
 bracketed IPv6."
-  (multiple-value-bind (host port) (bitcoin-lisp::conf-parse-proxy "127.0.0.1")
+  (multiple-value-bind (host port) (bl::conf-parse-proxy "127.0.0.1")
     (is (equal "127.0.0.1" host))
     (is (= 9050 port)))
   (multiple-value-bind (host port)
-      (bitcoin-lisp::conf-parse-proxy "127.0.0.1:9150")
+      (bl::conf-parse-proxy "127.0.0.1:9150")
     (is (equal "127.0.0.1" host))
     (is (= 9150 port)))
-  (is (null (bitcoin-lisp::conf-parse-proxy "0")))
-  (is (null (bitcoin-lisp::conf-parse-proxy "")))
-  (multiple-value-bind (host port) (bitcoin-lisp::conf-parse-proxy "[::1]:9150")
+  (is (null (bl::conf-parse-proxy "0")))
+  (is (null (bl::conf-parse-proxy "")))
+  (multiple-value-bind (host port) (bl::conf-parse-proxy "[::1]:9150")
     (is (equal "::1" host))
     (is (= 9150 port)))
-  (multiple-value-bind (host port) (bitcoin-lisp::conf-parse-proxy "[::1]")
+  (multiple-value-bind (host port) (bl::conf-parse-proxy "[::1]")
     (is (equal "::1" host))
     (is (= 9050 port))))
 
@@ -382,80 +382,80 @@ bracketed IPv6."
   "-proxy sets networking's *proxy* (randomize default on), -proxyrandomize=0
 disables isolation, -noproxy/-proxy=0 clears, -onion overrides and defaults
 to -proxy."
-  (let ((old-proxy bitcoin-lisp.networking:*proxy*)
-        (old-onion bitcoin-lisp.networking:*onion-proxy*)
+  (let ((old-proxy bl.net:*proxy*)
+        (old-onion bl.net:*onion-proxy*)
         ;; apply-config-globals also recomputes the reachable-network set
         ;; (onion follows the proxy) — keep that from leaking out of the test.
-        (bitcoin-lisp.networking:*reachable-networks*
-          bitcoin-lisp.networking:*reachable-networks*)
-        (bitcoin-lisp.networking:*cjdns-reachable*
-          bitcoin-lisp.networking:*cjdns-reachable*))
+        (bl.net:*reachable-networks*
+          bl.net:*reachable-networks*)
+        (bl.net:*cjdns-reachable*
+          bl.net:*cjdns-reachable*))
     (unwind-protect
         (progn
           ;; -proxy with default randomize; onion follows proxy.
-          (bitcoin-lisp::apply-config-globals '(("proxy" . "127.0.0.1:9150")))
-          (let ((p bitcoin-lisp.networking:*proxy*))
+          (bl::apply-config-globals '(("proxy" . "127.0.0.1:9150")))
+          (let ((p bl.net:*proxy*))
             (is-true p)
-            (is (equal "127.0.0.1" (bitcoin-lisp.networking:proxy-host p)))
-            (is (= 9150 (bitcoin-lisp.networking:proxy-port p)))
-            (is-true (bitcoin-lisp.networking:proxy-randomize-credentials p))
-            (is (eq p bitcoin-lisp.networking:*onion-proxy*)))
+            (is (equal "127.0.0.1" (bl.net:proxy-host p)))
+            (is (= 9150 (bl.net:proxy-port p)))
+            (is-true (bl.net:proxy-randomize-credentials p))
+            (is (eq p bl.net:*onion-proxy*)))
           ;; -proxyrandomize=0 disables stream isolation.
-          (bitcoin-lisp::apply-config-globals
+          (bl::apply-config-globals
            '(("proxy" . "10.0.0.1") ("proxyrandomize" . "0")))
-          (let ((p bitcoin-lisp.networking:*proxy*))
-            (is (= 9050 (bitcoin-lisp.networking:proxy-port p)))
-            (is-false (bitcoin-lisp.networking:proxy-randomize-credentials p)))
+          (let ((p bl.net:*proxy*))
+            (is (= 9050 (bl.net:proxy-port p)))
+            (is-false (bl.net:proxy-randomize-credentials p)))
           ;; -onion overrides the onion proxy only.
-          (bitcoin-lisp::apply-config-globals
+          (bl::apply-config-globals
            '(("proxy" . "10.0.0.1") ("onion" . "10.0.0.2:9051")))
-          (is (equal "10.0.0.1" (bitcoin-lisp.networking:proxy-host
-                                 bitcoin-lisp.networking:*proxy*)))
-          (is (equal "10.0.0.2" (bitcoin-lisp.networking:proxy-host
-                                 bitcoin-lisp.networking:*onion-proxy*)))
-          (is (= 9051 (bitcoin-lisp.networking:proxy-port
-                       bitcoin-lisp.networking:*onion-proxy*)))
+          (is (equal "10.0.0.1" (bl.net:proxy-host
+                                 bl.net:*proxy*)))
+          (is (equal "10.0.0.2" (bl.net:proxy-host
+                                 bl.net:*onion-proxy*)))
+          (is (= 9051 (bl.net:proxy-port
+                       bl.net:*onion-proxy*)))
           ;; -noproxy parses as proxy=0 and clears the proxy.
-          (bitcoin-lisp::apply-config-globals
-           (bitcoin-lisp::parse-cli-args '("-noproxy")))
-          (is (null bitcoin-lisp.networking:*proxy*)))
-      (setf bitcoin-lisp.networking:*proxy* old-proxy
-            bitcoin-lisp.networking:*onion-proxy* old-onion))))
+          (bl::apply-config-globals
+           (bl::parse-cli-args '("-noproxy")))
+          (is (null bl.net:*proxy*)))
+      (setf bl.net:*proxy* old-proxy
+            bl.net:*onion-proxy* old-onion))))
 
 (test onion-zero-disables-tor-dialing
   "-onion=0 (or -noonion) disables onion dialing even with -proxy set (Core
 init.cpp:1766-1780: onion_proxy cleared, NET_ONION removed from the reachable
 set): *onion-proxy* NIL, torv3 neither reachable nor dialable, and an onion
 dial is refused."
-  (let ((old-proxy bitcoin-lisp.networking:*proxy*)
-        (old-onion bitcoin-lisp.networking:*onion-proxy*)
-        (bitcoin-lisp.networking:*reachable-networks*
-          bitcoin-lisp.networking:*reachable-networks*)
-        (bitcoin-lisp.networking:*cjdns-reachable*
-          bitcoin-lisp.networking:*cjdns-reachable*))
+  (let ((old-proxy bl.net:*proxy*)
+        (old-onion bl.net:*onion-proxy*)
+        (bl.net:*reachable-networks*
+          bl.net:*reachable-networks*)
+        (bl.net:*cjdns-reachable*
+          bl.net:*cjdns-reachable*))
     (unwind-protect
         (progn
-          (bitcoin-lisp::apply-config-globals
+          (bl::apply-config-globals
            '(("proxy" . "127.0.0.1:9150") ("onion" . "0")))
-          (is-true bitcoin-lisp.networking:*proxy*)
-          (is (null bitcoin-lisp.networking:*onion-proxy*))
-          (is-false (bitcoin-lisp.networking:reachable-network-p :torv3))
-          (is-false (bitcoin-lisp.networking:dialable-network-p :torv3))
+          (is-true bl.net:*proxy*)
+          (is (null bl.net:*onion-proxy*))
+          (is-false (bl.net:reachable-network-p :torv3))
+          (is-false (bl.net:dialable-network-p :torv3))
           (multiple-value-bind (proxy refusal)
-              (bitcoin-lisp.networking:proxy-for-target +socks5-onion-target+)
+              (bl.net:proxy-for-target +socks5-onion-target+)
             (is (null proxy))
             (is (stringp refusal)))
           ;; -noonion parses to onion=0 and behaves identically.
-          (bitcoin-lisp::apply-config-globals
-           (append (bitcoin-lisp::parse-cli-args '("-noonion"))
+          (bl::apply-config-globals
+           (append (bl::parse-cli-args '("-noonion"))
                    '(("proxy" . "127.0.0.1:9150"))))
-          (is (null bitcoin-lisp.networking:*onion-proxy*))
+          (is (null bl.net:*onion-proxy*))
           ;; And plain -proxy (no -onion) re-enables: torv3 dialable again.
-          (bitcoin-lisp::apply-config-globals '(("proxy" . "127.0.0.1:9150")))
-          (is-true (bitcoin-lisp.networking:dialable-network-p :torv3))
-          (is-true (bitcoin-lisp.networking:reachable-network-p :torv3)))
-      (setf bitcoin-lisp.networking:*proxy* old-proxy
-            bitcoin-lisp.networking:*onion-proxy* old-onion))))
+          (bl::apply-config-globals '(("proxy" . "127.0.0.1:9150")))
+          (is-true (bl.net:dialable-network-p :torv3))
+          (is-true (bl.net:reachable-network-p :torv3)))
+      (setf bl.net:*proxy* old-proxy
+            bl.net:*onion-proxy* old-onion))))
 
 (test proxy-is-not-used-for-unroutable-targets
   "Core never proxies an unroutable target, and reaches that structurally:
@@ -473,12 +473,12 @@ any private network.
 
 Hostnames keep the proxy on purpose — Core routes name lookups through it
 precisely so the name does not leak to local DNS."
-  (let ((bitcoin-lisp.networking::*proxy*
-          (bitcoin-lisp.networking::make-proxy :host "127.0.0.1" :port 1)))
+  (let ((bl.net::*proxy*
+          (bl.net::make-proxy :host "127.0.0.1" :port 1)))
     (dolist (direct '("127.0.0.1" "127.5.5.5" "10.0.0.1" "172.16.0.1"
                       "192.168.1.5" "169.254.1.1" "100.64.0.1" "::1"
                       "fe80::1"))
-      (is (null (bitcoin-lisp.networking::proxy-for-target direct))
+      (is (null (bl.net::proxy-for-target direct))
           "~A was dialed through the proxy" direct))
     ;; Documentation space (203.0.113/24) stays PROXIED here, unlike in Core:
     ;; this tree treats it as routable on purpose so fixtures can use it as a
@@ -488,13 +488,13 @@ precisely so the name does not leak to local DNS."
     ;; an unsuffixed -proxy covers it. A bare host string carries no tag.
     (dolist (proxied '("8.8.8.8" "1.1.1.1" "2001:db8::1" "example.com"
                        "203.0.113.7" "fc00:1:2:3:4:5:6:7"))
-      (is (not (null (bitcoin-lisp.networking::proxy-for-target proxied)))
+      (is (not (null (bl.net::proxy-for-target proxied)))
           "~A skipped the proxy" proxied))
     ;; The positive control: with no proxy configured, everything is direct,
     ;; so a test that only asserted NIL above would pass against a broken
     ;; classifier.
-    (let ((bitcoin-lisp.networking::*proxy* nil))
-      (is (null (bitcoin-lisp.networking::proxy-for-target "8.8.8.8"))))))
+    (let ((bl.net::*proxy* nil))
+      (is (null (bl.net::proxy-for-target "8.8.8.8"))))))
 
 (test proxy-soft-defaults-listen-off
   "-proxy soft-sets listen off (Core init.cpp:786-790), but an explicit
@@ -506,18 +506,18 @@ InitParameterInteraction does, so the plist always carries it; \"absent\"
 stopped being how the default is expressed. START-NODE's own default is T, so
 an explicit T and an absent key mean the same thing to the caller — the
 distinction the old assertion rested on was in the plist, not in behaviour."
-  (let ((plist (bitcoin-lisp::config-alist->start-node-plist
+  (let ((plist (bl::config-alist->start-node-plist
                 '(("proxy" . "127.0.0.1")) :testnet4)))
     (is (null (getf plist :listen 'missing))))
-  (let ((plist (bitcoin-lisp::config-alist->start-node-plist
+  (let ((plist (bl::config-alist->start-node-plist
                 '(("proxy" . "127.0.0.1") ("listen" . "1")) :testnet4)))
     (is (eq t (getf plist :listen))))
-  (let ((plist (bitcoin-lisp::config-alist->start-node-plist
+  (let ((plist (bl::config-alist->start-node-plist
                 '(("proxy" . "0")) :testnet4)))
     (is (eq t (getf plist :listen 'missing))))
   ;; -bind wins over -proxy, for the same reason it wins over -connect: Core
   ;; applies it FIRST (init.cpp:766-771) and says "you want to listen on it
   ;; even when -connect or -proxy is specified".
-  (let ((plist (bitcoin-lisp::config-alist->start-node-plist
+  (let ((plist (bl::config-alist->start-node-plist
                 '(("proxy" . "127.0.0.1") ("bind" . "127.0.0.1")) :testnet4)))
     (is (eq t (getf plist :listen)))))

@@ -81,11 +81,11 @@ consensus/params.h:45-79)."
     (:testnet4 . 0) (:signet . 0) (:regtest . 0))
   "Core MinBIP9WarningHeight (chainparams.cpp:95, :226, :333, :490).")
 
-(defun versionbits-deployments (&optional (network bitcoin-lisp:*network*))
+(defun versionbits-deployments (&optional (network bl:*network*))
   "The BIP9 deployments defined for NETWORK."
   (rest (assoc network *versionbits-deployments*)))
 
-(defun versionbits-deployment (name &optional (network bitcoin-lisp:*network*))
+(defun versionbits-deployment (name &optional (network bl:*network*))
   (find name (versionbits-deployments network) :key #'vb-deployment-name
                                                :test #'string=))
 
@@ -94,8 +94,8 @@ consensus/params.h:45-79)."
 (defun %vb-condition-p (entry deployment)
   "Core's ThresholdConditionChecker::Condition (versionbits_impl.h): the block
 sets the versionbits top bits and has this deployment's bit set."
-  (let ((v (bitcoin-lisp.serialization:block-header-version
-            (bitcoin-lisp.storage:block-index-entry-header entry))))
+  (let ((v (bl.ser:block-header-version
+            (bl.store:block-index-entry-header entry))))
     (and (= (logand v +vb-top-mask+) +vb-top-bits+)
          (logbitp (vb-deployment-bit deployment) v)
          t)))
@@ -108,12 +108,12 @@ Core: `a block's state is always the same as that of the first of its period',
 so pindexPrev is moved to the boundary before any walking
 (versionbits.cpp:43-46). After this, (height + 1) mod period is 0."
   (when entry
-    (let* ((h (bitcoin-lisp.storage:block-index-entry-height entry))
+    (let* ((h (bl.store:block-index-entry-height entry))
            (target (- h (mod (1+ h) period))))
       (if (= target h)
           entry
           (and (>= target 0)
-               (bitcoin-lisp.storage:entry-ancestor-at-height entry target))))))
+               (bl.store:entry-ancestor-at-height entry target))))))
 
 (defvar *versionbits-state-cache* nil
   "Per-call memo for VERSIONBITS-STATE: an EQ table from deployment to an EQ
@@ -171,9 +171,9 @@ Returns one of :defined :started :locked-in :active :failed."
         (when (null cursor) (return))
         (when (< (%vb-mtp chain-state cursor) start) (return))
         (push cursor to-compute)
-        (let ((h (- (bitcoin-lisp.storage:block-index-entry-height cursor) period)))
+        (let ((h (- (bl.store:block-index-entry-height cursor) period)))
           (setf cursor (and (>= h 0)
-                            (bitcoin-lisp.storage:entry-ancestor-at-height cursor h)))))
+                            (bl.store:entry-ancestor-at-height cursor h)))))
       ;; Walk FORWARD, one transition per period (versionbits.cpp:69-110).
       (let ((state :defined))
         (dolist (boundary to-compute state)
@@ -190,7 +190,7 @@ Returns one of :defined :started :locked-in :active :failed."
                  ;; prev-entry, not a fresh ancestor lookup per step: this
                  ;; runs PERIOD times (2016 on the real chains) and an
                  ;; ancestor walk inside it would be quadratic.
-                 (setf walker (bitcoin-lisp.storage:block-index-entry-prev-entry walker)))
+                 (setf walker (bl.store:block-index-entry-prev-entry walker)))
                (cond
                  ;; Threshold wins over timeout when both hold in one period
                  ;; (versionbits.cpp:92-96).
@@ -200,7 +200,7 @@ Returns one of :defined :started :locked-in :active :failed."
             (:locked-in
              ;; LOCKED_IN can never go to FAILED; it waits whole periods until
              ;; the activation height (versionbits.cpp:97-103).
-             (when (>= (1+ (bitcoin-lisp.storage:block-index-entry-height boundary))
+             (when (>= (1+ (bl.store:block-index-entry-height boundary))
                        (vb-deployment-min-activation-height deployment))
                (setf state :active)))
             ((:active :failed))))))))
@@ -217,11 +217,11 @@ entered its current state (Core GetStateSinceHeightFor, versionbits.cpp:116)."
           (since 0))
       (loop
         (when (null cursor) (return))
-        (let ((h (- (bitcoin-lisp.storage:block-index-entry-height cursor) period)))
+        (let ((h (- (bl.store:block-index-entry-height cursor) period)))
           (let ((prev (and (>= h 0)
-                           (bitcoin-lisp.storage:entry-ancestor-at-height cursor h))))
+                           (bl.store:entry-ancestor-at-height cursor h))))
             (unless (eq state (versionbits-state chain-state prev deployment))
-              (setf since (1+ (bitcoin-lisp.storage:block-index-entry-height cursor)))
+              (setf since (1+ (bl.store:block-index-entry-height cursor)))
               (return))
             (setf cursor prev))))
       since)))
@@ -232,7 +232,7 @@ Core BIP9Stats (versionbits.cpp:135-166). Meaningful only in the STARTED state,
 which is what getdeploymentinfo gates it on."
   (let* ((period (vb-deployment-period deployment))
          (threshold (vb-deployment-threshold deployment))
-         (height (if entry (bitcoin-lisp.storage:block-index-entry-height entry) -1))
+         (height (if entry (bl.store:block-index-entry-height entry) -1))
          ;; Core: blocks_in_period = 1 + (nHeight % period), counted down to
          ;; zero, so elapsed ends at that value (versionbits.cpp:129-150).
          ;; `(mod (1+ height) period)' agrees everywhere EXCEPT the last block
@@ -252,7 +252,7 @@ which is what getdeploymentinfo gates it on."
     (dotimes (i elapsed)
       (unless walker (return))
       (when (%vb-condition-p walker deployment) (incf count))
-      (setf walker (bitcoin-lisp.storage:block-index-entry-prev-entry walker)))
+      (setf walker (bl.store:block-index-entry-prev-entry walker)))
     (values period threshold elapsed count
             ;; `possible' is false once the blocks remaining in the period can
             ;; no longer reach the threshold (versionbits.cpp:161-163).
