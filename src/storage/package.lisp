@@ -7,6 +7,12 @@
 ;;;; becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.storage
+  (:documentation "Everything on disk below validation: the block store
+(flat blk/rev files, pruning), the coins view and its cache, the chain
+state and block index, snapshots, the indexes (tx, txospender,
+blockfilter, coinstats) on one BASE-INDEX protocol. Core
+node/blockstorage.cpp, coins.cpp, txdb.cpp, chain.cpp, index/.
+src/storage/.")
   (:use #:cl #:bitcoin-lisp.conditions #:bitcoin-lisp.kv)
   (:export
    ;; Block store

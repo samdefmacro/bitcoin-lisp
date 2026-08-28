@@ -12,6 +12,10 @@
 (in-package #:cl-user)
 
 (defpackage #:bitcoin-lisp.rpc
+  (:documentation "The JSON-RPC/HTTP server (bitcoin-lisp/rpc-server:
+requests, replies, auth, ACL, warmup, DEFINE-RPC) and, in the main system,
+the methods one file per Core rpc/*.cpp, the REST interface and the web
+UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
   (:use #:cl #:bitcoin-lisp.conditions)
   (:local-nicknames (#:bt #:bordeaux-threads))
   (:export

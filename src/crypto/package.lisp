@@ -7,6 +7,10 @@
 ;;;; definition in src/crypto/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.crypto
+  (:documentation "Hashes, HMAC/HKDF, the ChaCha20 family behind BIP324,
+libsecp256k1 through CFFI (ECDSA, Schnorr, ellswift, tweaks), BIP32, hex
+and byte-order helpers, MuHash. Core crypto/, key.cpp, pubkey.cpp,
+hash.cpp. src/crypto/.")
   (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    ;; Hash functions

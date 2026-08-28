@@ -7,6 +7,13 @@
 ;;;; definition in src/validation/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.validation
+  (:documentation "Consensus and policy checks: transaction structure and
+context, script execution (the Coalton interpreter behind
+EXECUTE-SCRIPT), mempool acceptance for single transactions and packages,
+block validation, connect/disconnect/reorg, versionbits, signet.
+Consensus-critical: matches Core validation.cpp, consensus/,
+policy/packages.cpp, versionbits.cpp, signet.cpp line for line where it
+can. src/validation/.")
   (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    ;; Transaction validation

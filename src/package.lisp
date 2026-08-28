@@ -1,6 +1,12 @@
 
 
 (defpackage #:bitcoin-lisp
+  (:documentation "The node: process-wide configuration specials
+(config.lisp), the option table (config-options.lisp), ZMQ, and src/node/
+-- start-up in twelve steps, the sync thread, shutdown, eviction, index
+catch-up, assumeutxo, the executable's main. Re-exports what it inherits
+from the layers below so that bl: keeps naming the whole API. Core
+init.cpp, node/. src/node/.")
   (:use #:cl #:bitcoin-lisp.conditions #:bitcoin-lisp.logging)
   ;; The option registry and the configuration parsers; the option table
   ;; (config-options.lisp) and the node's glue (config.lisp) build on them.

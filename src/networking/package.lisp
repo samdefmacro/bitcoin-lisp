@@ -11,6 +11,12 @@
 ;;;; becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.networking
+  (:documentation "The transport (bitcoin-lisp/net: sockets and readiness,
+SOCKS5, the BIP324 v2 transport, BIP155 addresses, the address book, Tor
+control) and, in the main system, the protocol on top of it (peers,
+message handlers, headers sync, IBD). Core net.cpp, netbase.cpp,
+addrman.cpp, torcontrol.cpp, bip324.cpp; net_processing.cpp,
+headerssync.cpp. src/networking/.")
   (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    ;; Connection

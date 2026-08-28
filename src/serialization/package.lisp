@@ -7,6 +7,11 @@
 ;;;; becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.serialization
+  (:documentation "Bitcoin's wire and disk encodings: little-endian
+integers and CompactSize, DEFINE-MESSAGE for the P2P messages, transaction
+and block structs with their hashes, PSBT, the script/amount compressor.
+Core serialize.h, primitives/, protocol.cpp, psbt.cpp, compressor.cpp.
+src/serialization/.")
   (:use #:cl #:bitcoin-lisp.conditions)
   ;; The byte-buf / byte-reader live in bitcoin-lisp.bytes (src/util/bytes.lisp)
   ;; and are re-exported here, so every existing bl.ser:bb-*
