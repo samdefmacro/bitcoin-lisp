@@ -531,7 +531,7 @@ cannot happen (UpdateCoins, validation.cpp:2004): every input of a validated
 block spends a coin the view still holds. Reaching it means the block was
 validated against a stale or double-spent view, and the undo data is now short
 an entry — disconnecting the block would leave the UTXO set wrong."
-  (bl:log-error
+  (bl.log:log-error
    "COIN-SPEND-MISSING: block-apply at height ~D found no coin for ~A:~D"
    height (bl.crypto:bytes-to-hex txid) index))
 
@@ -615,7 +615,7 @@ test-bitcoin-server 2026-05-19 at h=135597."
   (let ((clean t))
     (flet ((unclean (format &rest args)
              (setf clean nil)
-             (bl:log-warn "DisconnectBlock: ~?" format args)))
+             (bl.log:log-warn "DisconnectBlock: ~?" format args)))
       ;; Restore inputs first (from undo data).
       (dolist (prev previous-utxos)
         (destructuring-bind (txid index entry) prev

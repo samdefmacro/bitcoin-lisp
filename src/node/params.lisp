@@ -36,13 +36,6 @@ up the loop's shape.")
 
 (defconstant +regtest+ :regtest)
 
-(defvar *network* +testnet4+
-  "Current network mode (:testnet3, :testnet4, :signet, :regtest, or :mainnet).")
-
-(defun network-magic (network)
-  "NETWORK's message-start bytes (chain-params-magic)."
-  (bl.chain:chain-params-magic (bl.chain:find-chain-params network)))
-
 (defun network-port (network)
   "NETWORK's default P2P port (chain-params-port)."
   (bl.chain:chain-params-port (bl.chain:find-chain-params network)))

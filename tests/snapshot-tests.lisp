@@ -660,7 +660,9 @@ MaybeRebalanceCaches via ActivateSnapshot)."
             (setf (bl.store:block-store-total-bytes store)
                   (* 600 1048576))
             (let ((bl::*node* dst))
-              (is (= 0 (bl.store:prune-old-blocks store current)))
+              (is (= 0 (bl.store:prune-old-blocks
+                        store current
+                        :target-bytes (bl:effective-prune-target-bytes))))
               ;; The automatic target is halved (floored at 550 MiB) while
               ;; the historical chainstate exists.
               (is (= bl:+min-disk-space-for-block-files+

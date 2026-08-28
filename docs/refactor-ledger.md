@@ -51,6 +51,7 @@ src/; cold = cold-battery check count / failures.
 | 2026-08-28 | P4.2b | bitcoin-lisp/logging: logging.lisp is package bitcoin-lisp.logging (bl.log); the main package :uses it and re-exports the 35 names the tree reaches, so no call site changed; tests name logging internals bl.log:: | 0 | 10 | 63 | 42 | 8 | 0 | 8 | 4,029 | 34,468 / 0 (fresh) |
 | 2026-08-28 | P4.2c | bitcoin-lisp/kv: leveldb, flatfile, datadir and the fsync helpers are package bitcoin-lisp.kv (bl.kv) in src/kv/; storage :uses it and re-exports 72 names (computed from the image's real symbol set, not from a defun regex) | 0 | 10 | 63 | 42 | 8 | 0 | 8 | 4,029 | 34,469 / 0 (fresh) |
 | 2026-08-28 | P4.2d | bitcoin-lisp/serialization as a sub-system (no package change: it never named anything above crypto); layering scanner ignores string literals (a docstring's `/bl:0.1.0/` was a false upward reference) | 0 | 10 | 63 | 42 | 8 | 0 | 6 | 4,029 | 34,469 / 0 (fresh) |
+| 2026-08-28 | P4.2e | bitcoin-lisp/storage as a sub-system: *network* / network-magic moved down to chainparams, the 7 pruning knobs to storage/prune-policy.lisp (the node re-exports them), prune-old-blocks takes its target as an argument; storage no longer names the top package | 0 | 10 | 63 | 42 | 8 | 0 | 5 | 4,029 | 34,469 / 0 (fresh) |
 
 ## Notes
 

@@ -77,11 +77,11 @@ the caller must treat as a reason to stop, not to continue."
       ((not (%legacy-block-p store hash))
        (case (%resolve-duplicate-block store hash)
          (:swept
-          (bl:log-info
+          (bl.log:log-info
            "Migration: swept an orphaned per-block file at height ~D left by an ~
             interrupted migration" height))
          (:recovered
-          (bl:log-warn
+          (bl.log:log-warn
            "Migration: the flat record for height ~D does not read; the ~
             per-block file is the surviving copy and the index now points at it"
            height)))
@@ -93,7 +93,7 @@ the caller must treat as a reason to stop, not to continue."
             ;; Unreadable. GET-BLOCK has already pruned it for re-download;
             ;; there is nothing to convert and stopping here would strand every
             ;; block above it.
-            (bl:log-warn
+            (bl.log:log-warn
              "Migration: block at height ~D (~A) is unreadable; skipped"
              height (bl.crypto:bytes-to-hex hash))
             :skipped)
@@ -137,7 +137,7 @@ the caller must treat as a reason to stop, not to continue."
                    ;; the index from the files anyway.
                    (setf (gethash hash (block-store-index store)) old-located
                          (block-store-total-bytes store) old-total)
-                   (bl:log-error
+                   (bl.log:log-error
                     "Migration: block at height ~D (~A) did not read back from its flat ~
                      file; the per-block file is kept and the migration stops"
                     height (bl.crypto:bytes-to-hex hash))
@@ -188,7 +188,7 @@ reason."
                ;; in a legacy file is still read by the dual-read path.
                (handler-case (funcall on-migrated entry)
                  (error (e)
-                   (bl:log-warn
+                   (bl.log:log-warn
                     "Migration: undo data for height ~D was not moved (~A); the ~
 legacy undo file is kept and still read"
                     (block-index-entry-height entry) e)))))

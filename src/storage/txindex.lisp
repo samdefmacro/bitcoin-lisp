@@ -344,7 +344,7 @@ marker, and neither can Core, which also resumes from its locator."
     ;; State the decision. Without this the log shows a scan and gives no way
     ;; to tell a resume from a full rescan, or why -- which is exactly the
     ;; question a nine-minute startup raises.
-    (bl:log-info "Transaction index: ~(~A~), scanning from height ~D"
+    (bl.log:log-info "Transaction index: ~(~A~), scanning from height ~D"
                            resume-reason resume-height)
     (%build-tx-index-from txindex chain-state block-store resume-height
                           progress-callback)))

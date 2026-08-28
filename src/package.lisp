@@ -7,6 +7,8 @@
   (:use #:bitcoin-lisp.storage)
   (:use #:bitcoin-lisp.validation)
   (:use #:bitcoin-lisp.networking)
+  ;; The current chain lives in the chainparams layer; the node re-exports it.
+  (:import-from #:bitcoin-lisp.chainparams #:*network* #:network-magic)
   (:local-nicknames (#:bt #:bordeaux-threads))
   (:export
    ;; Network parameters

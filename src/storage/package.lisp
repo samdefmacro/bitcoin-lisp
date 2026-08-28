@@ -1,10 +1,10 @@
 ;;;; Package bitcoin-lisp.storage -- the public API of src/storage/.
 ;;;;
-;;;; Loaded with the other package files before any code (bitcoin-lisp.asd,
-;;;; the "packages" phase): src/config.lisp loads third and already names
-;;;; most of these packages, and every package must exist before
-;;;; src/package.lisp installs the bl.* nicknames. Add an export here when a
-;;;; definition in src/storage/ becomes API; keep %-prefixed names internal.
+;;;; First component of the bitcoin-lisp/storage sub-system (bitcoin-lisp.asd):
+;;;; the package exists before any file in src/storage/ compiles, and the
+;;;; INSTALL-PACKAGE-NICKNAMES call at the end of this file gives those files
+;;;; their bl.* prefixes. Add an export here when a definition in src/storage/
+;;;; becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.storage
   (:use #:cl #:bitcoin-lisp.conditions #:bitcoin-lisp.kv)
@@ -53,6 +53,15 @@
    #:+max-block-serialized-size+
    #:block-store-total-bytes
    #:block-storage-size-mib
+   ;; pruning policy (prune-policy.lisp): set by the node, read here
+   #:+min-blocks-to-keep+
+   #:+min-disk-space-for-block-files+
+   #:*prune-target-mib*
+   #:*prune-after-height*
+   #:pruning-enabled-p
+   #:automatic-pruning-p
+   #:prune-after-height
+   #:prune-target-bytes
    #:prune-old-blocks
    #:prune-blocks-to-height
    ;; UTXO set

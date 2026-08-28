@@ -349,8 +349,8 @@ signals an error instead of returning a corrupt block."
 
 (defun init-chain-state (base-path &key genesis-hash network)
   "Initialize chain state at BASE-PATH.
-NETWORK defaults to bl:*network* if not specified."
-  (let ((net (or network bl:*network*)))
+NETWORK defaults to bl.chain:*network* if not specified."
+  (let ((net (or network bl.chain:*network*)))
     (make-chain-state
      :base-path (pathname base-path)
      :genesis-hash (or genesis-hash (network-genesis-hash net))

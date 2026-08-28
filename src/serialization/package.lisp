@@ -1,10 +1,10 @@
 ;;;; Package bitcoin-lisp.serialization -- the public API of src/serialization/.
 ;;;;
-;;;; Loaded with the other package files before any code (bitcoin-lisp.asd,
-;;;; the "packages" phase): src/config.lisp loads third and already names
-;;;; most of these packages, and every package must exist before
-;;;; src/package.lisp installs the bl.* nicknames. Add an export here when a
-;;;; definition in src/serialization/ becomes API; keep %-prefixed names internal.
+;;;; First component of the bitcoin-lisp/serialization sub-system (bitcoin-lisp.asd):
+;;;; the package exists before any file in src/serialization/ compiles, and the
+;;;; INSTALL-PACKAGE-NICKNAMES call at the end of this file gives those files
+;;;; their bl.* prefixes. Add an export here when a definition in src/serialization/
+;;;; becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.serialization
   (:use #:cl #:bitcoin-lisp.conditions)
