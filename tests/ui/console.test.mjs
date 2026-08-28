@@ -83,7 +83,7 @@ globalThis.sessionStorage = {
 
 // --- stubbed JSON-RPC endpoint -------------------------------------------
 
-// `help` mirrors exactly what src/rpc/methods.lisp rpc-help emits with no
+// `help` mirrors exactly what src/rpc/node.lisp rpc-help emits with no
 // params: sorted registered method names, one per line.
 const METHODS = ['getbestblockhash', 'getblock', 'getblockchaininfo',
   'getblockcount', 'getblockhash', 'help', 'setban', 'uptime'];

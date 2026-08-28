@@ -83,7 +83,7 @@ globalThis.sessionStorage = {
 
 // --- stubbed JSON-RPC endpoint -------------------------------------------
 
-// Fixtures mirror what src/rpc/methods.lisp emits (a representative subset
+// Fixtures mirror what src/rpc/net.lisp emits (a representative subset
 // of the Core-parity field set): synced_blocks is always -1 (no
 // last-common-block tracking), pingtime is ABSENT until a pong arrived, and
 // the height column reads startingheight.

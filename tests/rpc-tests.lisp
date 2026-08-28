@@ -2493,10 +2493,7 @@ the submitblock path actually makes the call."
     ;; And the production call site passes NIL, rather than only the P2P one
     ;; having a call at all. This is the half that was missing, so it is the
     ;; half the test pins.
-    (let ((src (with-open-file (in (merge-pathnames "src/rpc/methods.lisp"
-                                                    (asdf:system-source-directory :bitcoin-lisp)))
-                 (let ((text (make-string (file-length in))))
-                   (subseq text 0 (read-sequence text in))))))
+    (let ((src (%rpc-source-text)))
       (is (search "relay-block header nil peers" src)
           "the submitblock path no longer announces the block it just connected"))))
 

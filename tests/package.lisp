@@ -146,25 +146,29 @@ rejects filter"
   "Run integration tests only (requires network)."
   (run! :integration-tests))
 
-(defun %node-source-files ()
-  "The files of src/node/, as repo-relative strings, in name order."
+(defun %module-source-files (subdir)
+  "The files of src/SUBDIR/, as repo-relative strings, in name order."
   (sort (mapcar (lambda (path)
-                  (concatenate 'string "src/node/" (file-namestring path)))
-                (directory (merge-pathnames "src/node/*.lisp"
+                  (concatenate 'string "src/" subdir "/" (file-namestring path)))
+                (directory (merge-pathnames (concatenate 'string "src/" subdir "/*.lisp")
                                             (asdf:system-source-directory :bitcoin-lisp))))
         #'string<))
 
-(defun %node-source-text ()
-  "The text of every src/node/*.lisp, concatenated -- for the source-text
-tests that used to read the one node.lisp. Two things a test compares the
-POSITIONS of must sit in the same file for the order to mean anything; the
-tests that do so compare within one function."
+(defun %module-source-text (subdir)
+  "The text of every src/SUBDIR/*.lisp, concatenated -- for the source-text
+tests that used to read one big file (node.lisp, rpc/methods.lisp). Two
+things a test compares the POSITIONS of must sit in the same file for the
+order to mean anything; the tests that do so compare within one function."
   (with-output-to-string (out)
-    (dolist (rel (%node-source-files))
+    (dolist (rel (%module-source-files subdir))
       (write-string (uiop:read-file-string
                      (merge-pathnames rel (asdf:system-source-directory :bitcoin-lisp)))
                     out)
       (terpri out))))
+
+(defun %node-source-files () (%module-source-files "node"))
+(defun %node-source-text () (%module-source-text "node"))
+(defun %rpc-source-text () (%module-source-text "rpc"))
 
 (defun %reached-from-start-node-p (fn &optional (depth 6))
   "T when FN is reachable from START-NODE through the callers SB-INTROSPECT

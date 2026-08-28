@@ -401,10 +401,7 @@ Core-identical and intended, so it is asserted here rather than 'fixed'."
   "Core's rpc/net.cpp:956 deliberately calls the UNCACHED GetAddressesUnsafe:
 the operator asking their own node must see live addrman state, not a snapshot
 frozen for a day. Guard against 'helpfully' routing it through the cache."
-  (let ((src (with-open-file (s (merge-pathnames "src/rpc/methods.lisp"
-                                                 (asdf:system-source-directory :bitcoin-lisp)))
-               (let ((text (make-string (file-length s))))
-                 (subseq text 0 (read-sequence text s))))))
+  (let ((src (%rpc-source-text)))
     (let ((start (search "define-rpc \"getnodeaddresses\"" src)))
       (is (integerp start) "rpc-getnodeaddresses must exist")
       (when start

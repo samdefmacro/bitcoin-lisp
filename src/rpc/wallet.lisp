@@ -21,21 +21,6 @@
 ;;; never the reverse — handlers that need chain state read it under the
 ;;; node-lock BEFORE touching wallet state.
 
-;;; --- Wallet RPC error codes (Core rpc/protocol.h:71-86) ---
-
-(defconstant +rpc-wallet-error+ -4)
-(defconstant +rpc-wallet-insufficient-funds+ -6)
-(defconstant +rpc-wallet-invalid-label-name+ -11)
-(defconstant +rpc-wallet-keypool-ran-out+ -12)
-(defconstant +rpc-wallet-unlock-needed+ -13)
-(defconstant +rpc-wallet-passphrase-incorrect+ -14)
-(defconstant +rpc-wallet-wrong-enc-state+ -15)
-(defconstant +rpc-wallet-encryption-failed+ -16)
-(defconstant +rpc-wallet-not-found+ -18)
-(defconstant +rpc-wallet-not-specified+ -19)
-(defconstant +rpc-wallet-already-loaded+ -35)
-(defconstant +rpc-wallet-already-exists+ -36)
-
 ;;; --- Wallet flags (Core wallet/walletutil.h WalletFlags) ---
 
 (defconstant +wallet-flag-avoid-reuse+ (ash 1 0))

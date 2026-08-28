@@ -1,7 +1,7 @@
 // Peers & network ops (gui-plan P3): sortable peer table + detail drawer,
 // ban management, network-active toggle — Qt's Peers tab transposed.
 //
-// RPC shapes consumed here are exactly what src/rpc/methods.lisp emits:
+// RPC shapes consumed here are exactly what src/rpc/net.lisp emits:
 //
 //   getpeerinfo -> [{ id, addr, version, subver, services (16-hex string),
 //     inbound, transport_protocol_type ("v1"|"v2"), connection_type,
