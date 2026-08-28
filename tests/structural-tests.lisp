@@ -808,8 +808,11 @@ list behind."
           for i from -100
           when (and (stringp dep) (uiop:string-prefix-p "bitcoin-lisp/" dep))
             do (dolist (child (asdf:component-children (asdf:find-system dep)))
-                 (when (typep child 'asdf:module)
-                   (push (cons (format nil "src/~A/" (asdf:component-name child)) i) order))))
+                 (push (cons (if (typep child 'asdf:module)
+                                 (format nil "src/~A/" (asdf:component-name child))
+                                 (format nil "src/~A.lisp" (asdf:component-name child)))
+                             i)
+                       order)))
     (loop for child in (asdf:component-children (asdf:find-component :bitcoin-lisp "src"))
           for i from 0
           do (if (typep child 'asdf:module)
@@ -840,7 +843,10 @@ spot this test accepts, not a claim."
       (cdr (assoc "src/package.lisp" order :test #'string=))
       (let* ((start (length "bitcoin-lisp."))
              (module (subseq package start (position #\. package :start start))))
-        (cdr (assoc (format nil "src/~A/" module) order :test #'string=)))))
+        ;; A one-file layer (bitcoin-lisp.logging is src/logging.lisp) has no
+        ;; directory; its package sits where the file loads.
+        (or (cdr (assoc (format nil "src/~A/" module) order :test #'string=))
+            (cdr (assoc (format nil "src/~A.lisp" module) order :test #'string=))))))
 
 (defun %resolve-package-prefix (token)
   "The project package TOKEN names as a prefix: a full bitcoin-lisp* name, or

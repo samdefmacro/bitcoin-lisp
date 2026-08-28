@@ -18,7 +18,7 @@
 
 ;; Enable console output
 (setf bl:*log-stream* *standard-output*)
-(setf bl::*current-log-level* :info)
+(setf bl.log::*current-log-level* :info)
 
 (format t "~%========================================~%")
 (format t "Testnet Sync Test - Target: ~A blocks~%" *target-blocks*)

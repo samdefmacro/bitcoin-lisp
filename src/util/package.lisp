@@ -53,6 +53,7 @@ consensus / policy errors that carry Core's reject reason.")
 (defparameter *package-nicknames*
   '(("BL" . "BITCOIN-LISP")
     ("BL.ERR" . "BITCOIN-LISP.CONDITIONS")
+    ("BL.LOG" . "BITCOIN-LISP.LOGGING")
     ("BL.BYTES" . "BITCOIN-LISP.BYTES")
     ("BL.CHAIN" . "BITCOIN-LISP.CHAINPARAMS")
     ("BL.CTX" . "BITCOIN-LISP.CONTEXT")

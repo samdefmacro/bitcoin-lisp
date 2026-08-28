@@ -23,20 +23,20 @@ FORMAT-LOG-ENTRY, so assert against the shape that reproduces it."
     ;; The symptom, so the test fails if the reproducer stops reproducing.
     (is (find #\Newline (let ((*print-pretty* t))
                           (format nil "prefix: ~A" condition))))
-    (let ((entry (bl::format-log-entry :warn "boom: ~A" (list condition))))
+    (let ((entry (bl.log::format-log-entry :warn "boom: ~A" (list condition))))
       (is (null (find #\Newline entry)))
       (is (search "3119" entry))
       (is (search "UNSIGNED-BYTE 10" entry)))))
 
 (test log-escapes-control-characters-but-keeps-newline
   "Core BCLog::LogEscapeMessage (logging.cpp:329-340)."
-  (is (string= "plain ascii" (bl::%log-escape-message "plain ascii")))
+  (is (string= "plain ascii" (bl.log::%log-escape-message "plain ascii")))
   ;; Identity, not just equality: an unescaped string is returned as-is.
   (let ((s "nothing to escape"))
-    (is (eq s (bl::%log-escape-message s))))
-  (is (string= (format nil "a~%b") (bl::%log-escape-message (format nil "a~%b"))))
+    (is (eq s (bl.log::%log-escape-message s))))
+  (is (string= (format nil "a~%b") (bl.log::%log-escape-message (format nil "a~%b"))))
   (is (string= "cr\\x0d esc\\x1b del\\x7f nul\\x00"
-               (bl::%log-escape-message
+               (bl.log::%log-escape-message
                 (format nil "cr~C esc~C del~C nul~C"
                         #\Return (code-char 27) (code-char 127) (code-char 0)))))
   ;; A peer-supplied subversion string reaches the log, so the carriage return
@@ -44,58 +44,58 @@ FORMAT-LOG-ENTRY, so assert against the shape that reproduces it."
   ;; passes it through so a genuinely multi-line message stays readable — which
   ;; is why this is escaping and not sanitising.
   (is (string= "peer /Satoshi:1.0/\\x0d[2026-01-01 00:00:00] ERROR: fake"
-               (bl::%log-escape-message
+               (bl.log::%log-escape-message
                 (format nil "peer /Satoshi:1.0/~C[2026-01-01 00:00:00] ERROR: fake"
                         #\Return)))))
 
 ;;; --- rate limiting (Core BCLog::LogRateLimiter) ------------------------------
 
 (defmacro with-fresh-rate-limiter ((&key (limit t)) &body body)
-  `(let ((bl::*log-rate-locations* (make-hash-table :test 'equal))
-         (bl::*log-rate-window-start* (get-universal-time))
-         (bl::*log-suppressions-active* nil)
-         (bl::*log-rate-limit* ,limit)
-         (bl::*log-stream* nil)
-         (bl::*log-file-stream* nil))
+  `(let ((bl.log::*log-rate-locations* (make-hash-table :test 'equal))
+         (bl.log::*log-rate-window-start* (get-universal-time))
+         (bl.log::*log-suppressions-active* nil)
+         (bl.log::*log-rate-limit* ,limit)
+         (bl.log::*log-stream* nil)
+         (bl.log::*log-file-stream* nil))
      ,@body))
 
 (test log-rate-limiter-state-machine
   "Consume returns Core's three statuses, and the budget is per location."
   (with-fresh-rate-limiter ()
-    (is (eq :unsuppressed (bl::%log-rate-consume "site A" 10)))
+    (is (eq :unsuppressed (bl.log::%log-rate-consume "site A" 10)))
     (is (eq :newly-suppressed
-            (bl::%log-rate-consume
-             "site A" (* 2 bl::+log-ratelimit-max-bytes+))))
-    (is (eq :still-suppressed (bl::%log-rate-consume "site A" 10)))
+            (bl.log::%log-rate-consume
+             "site A" (* 2 bl.log::+log-ratelimit-max-bytes+))))
+    (is (eq :still-suppressed (bl.log::%log-rate-consume "site A" 10)))
     ;; A different location keeps its own budget — suppressing one site must
     ;; never silence the rest of the node.
-    (is (eq :unsuppressed (bl::%log-rate-consume "site B" 10)))
-    (is-true bl::*log-suppressions-active*)))
+    (is (eq :unsuppressed (bl.log::%log-rate-consume "site B" 10)))
+    (is-true bl.log::*log-suppressions-active*)))
 
 (test log-rate-limiter-exhausts-a-budget-gradually
   "The budget is bytes, not calls: many small writes eventually suppress."
   (with-fresh-rate-limiter ()
     (let* ((chunk 1024)
-           (calls (ceiling bl::+log-ratelimit-max-bytes+ chunk))
+           (calls (ceiling bl.log::+log-ratelimit-max-bytes+ chunk))
            (statuses (loop repeat (1+ calls)
-                           collect (bl::%log-rate-consume "site" chunk))))
+                           collect (bl.log::%log-rate-consume "site" chunk))))
       (is (every (lambda (s) (eq s :unsuppressed)) (subseq statuses 0 calls)))
       (is (eq :newly-suppressed (car (last statuses)))))))
 
 (test log-rate-limiter-window-reset-restores-and-reports
   "Reset clears the budget and reports what was dropped (Core Reset)."
   (with-fresh-rate-limiter ()
-    (bl::%log-rate-consume
-     "noisy site" (* 2 bl::+log-ratelimit-max-bytes+))
-    (is-true bl::*log-suppressions-active*)
+    (bl.log::%log-rate-consume
+     "noisy site" (* 2 bl.log::+log-ratelimit-max-bytes+))
+    (is-true bl.log::*log-suppressions-active*)
     ;; Backdate the window so the lazy close fires.
-    (setf bl::*log-rate-window-start*
-          (- (get-universal-time) bl::+log-ratelimit-window-seconds+ 1))
-    (bl::%log-maybe-reset-window)
-    (is-false bl::*log-suppressions-active*)
-    (is (zerop (hash-table-count bl::*log-rate-locations*)))
+    (setf bl.log::*log-rate-window-start*
+          (- (get-universal-time) bl.log::+log-ratelimit-window-seconds+ 1))
+    (bl.log::%log-maybe-reset-window)
+    (is-false bl.log::*log-suppressions-active*)
+    (is (zerop (hash-table-count bl.log::*log-rate-locations*)))
     (let ((restart (find-if (lambda (e) (and e (search "Restarting logging" e)))
-                            bl::*log-buffer*)))
+                            bl.log::*log-buffer*)))
       (is-true restart)
       (is (search "noisy site" restart)))))
 
@@ -104,13 +104,13 @@ FORMAT-LOG-ENTRY, so assert against the shape that reproduces it."
   (with-fresh-rate-limiter ()
     (let ((console (make-string-output-stream))
           (file (make-string-output-stream)))
-      (let ((bl::*log-stream* console)
-            (bl::*log-file-stream* file))
-        (bl::%log-emit :info "big ~A" (list (make-string 4096 :initial-element #\x)))
+      (let ((bl.log::*log-stream* console)
+            (bl.log::*log-file-stream* file))
+        (bl.log::%log-emit :info "big ~A" (list (make-string 4096 :initial-element #\x)))
         ;; Blow the budget from the same location, then write again.
-        (bl::%log-rate-consume
-         "big ~A" (* 2 bl::+log-ratelimit-max-bytes+))
-        (bl::%log-emit :info "big ~A" (list "second")))
+        (bl.log::%log-rate-consume
+         "big ~A" (* 2 bl.log::+log-ratelimit-max-bytes+))
+        (bl.log::%log-emit :info "big ~A" (list "second")))
       (let ((console-text (get-output-stream-string console))
             (file-text (get-output-stream-string file)))
         (is (search "second" console-text))
@@ -123,9 +123,9 @@ FORMAT-LOG-ENTRY, so assert against the shape that reproduces it."
 cannot be eaten by the limiter that produced it."
   (with-fresh-rate-limiter ()
     (let ((file (make-string-output-stream)))
-      (let ((bl::*log-file-stream* file))
-        (bl::%log-emit
-         :info "wordy ~A" (list (make-string (* 2 bl::+log-ratelimit-max-bytes+)
+      (let ((bl.log::*log-file-stream* file))
+        (bl.log::%log-emit
+         :info "wordy ~A" (list (make-string (* 2 bl.log::+log-ratelimit-max-bytes+)
                                              :initial-element #\y))))
       (let ((text (get-output-stream-string file)))
         (is (search "Excessive logging detected" text))
@@ -137,24 +137,24 @@ cannot be eaten by the limiter that produced it."
   "Core rate-limits Info and louder only (util/log.h:91-113): -debug users are
 assumed to accept the volume."
   (with-fresh-rate-limiter ()
-    (let ((bl::*current-log-level* :debug))
-      (bl::node-log :debug "quiet ~A" "x")
-      (bl::node-log-category "validation" "cat ~A" "x"))
-    (is (zerop (hash-table-count bl::*log-rate-locations*)))
-    (bl::node-log :warn "loud ~A" "x")
-    (is (= 1 (hash-table-count bl::*log-rate-locations*)))))
+    (let ((bl.log::*current-log-level* :debug))
+      (bl.log::node-log :debug "quiet ~A" "x")
+      (bl.log::node-log-category "validation" "cat ~A" "x"))
+    (is (zerop (hash-table-count bl.log::*log-rate-locations*)))
+    (bl.log::node-log :warn "loud ~A" "x")
+    (is (= 1 (hash-table-count bl.log::*log-rate-locations*)))))
 
 (test log-rate-limit-can-be-turned-off
   "-logratelimit=0 (Core -logratelimit)."
   (with-fresh-rate-limiter (:limit nil)
     (let ((file (make-string-output-stream)))
-      (let ((bl::*log-file-stream* file))
+      (let ((bl.log::*log-file-stream* file))
         (dotimes (i 3)
-          (bl::%log-emit
-           :info "huge ~A" (list (make-string bl::+log-ratelimit-max-bytes+
+          (bl.log::%log-emit
+           :info "huge ~A" (list (make-string bl.log::+log-ratelimit-max-bytes+
                                               :initial-element #\z)))))
       (is (null (search "Excessive logging detected" (get-output-stream-string file)))))
-    (is (zerop (hash-table-count bl::*log-rate-locations*)))))
+    (is (zerop (hash-table-count bl.log::*log-rate-locations*)))))
 
 ;;;; --- Core's [category:level] prefix (BCLog::LogPrefix) ---
 
@@ -165,7 +165,7 @@ looks for the literal '[warning] Parsed potentially confusing double-negative'.
 
 The uncategorized-INFO case is the one that changes most lines: Core prints NO
 tag there, where this used to print `INFO: `."
-  (flet ((p (cat level) (bl::log-category-level-prefix cat level)))
+  (flet ((p (cat level) (bl.log::log-category-level-prefix cat level)))
     (is (string= "" (p nil :info))
         "an uncategorized info line carries no tag in Core")
     (is (string= "[warning] " (p nil :warn)))
@@ -182,19 +182,19 @@ tag there, where this used to print `INFO: `."
 (test log-level-names-are-cores-spelling
   ":WARN prints as \"warning\". Core's LogLevelToStr has no \"warn\", and a
 test matching Core's word would never fire on ours."
-  (is (string= "warning" (bl::log-level-name :warn)))
-  (is (string= "error" (bl::log-level-name :error)))
-  (is (string= "info" (bl::log-level-name :info)))
-  (is (string= "debug" (bl::log-level-name :debug)))
-  (is (string= "trace" (bl::log-level-name :trace))))
+  (is (string= "warning" (bl.log::log-level-name :warn)))
+  (is (string= "error" (bl.log::log-level-name :error)))
+  (is (string= "info" (bl.log::log-level-name :info)))
+  (is (string= "debug" (bl.log::log-level-name :debug)))
+  (is (string= "trace" (bl.log::log-level-name :trace))))
 
 (test log-entry-renders-the-prefix
   "The whole line, not just the prefix helper: a warning must contain Core's
 tag immediately before the message, and an info line must have no tag between
 the timestamp and the message."
-  (let ((warn (bl::format-log-entry :warn "hello ~A" '("world")))
-        (info (bl::format-log-entry :info "hello ~A" '("world")))
-        (net (bl::format-log-entry :debug "hello ~A" '("world") "net")))
+  (let ((warn (bl.log::format-log-entry :warn "hello ~A" '("world")))
+        (info (bl.log::format-log-entry :info "hello ~A" '("world")))
+        (net (bl.log::format-log-entry :debug "hello ~A" '("world") "net")))
     (is-true (search "[warning] hello world" warn))
     (is-true (search "] hello world" info))
     (is-false (search "[warning]" info))
@@ -205,11 +205,11 @@ the timestamp and the message."
   "log-cat's category used to be consulted for the enabled/disabled decision
 and then DROPPED, so every categorized line came out as an untagged debug line
 — there was no way to tell from the log which subsystem wrote it."
-  (let ((bl::*current-log-level* :debug)
-        (bl::*log-file-stream* nil))
+  (let ((bl.log::*current-log-level* :debug)
+        (bl.log::*log-file-stream* nil))
     (bl:log-cat "net" "a categorized line")
     (let ((entry (find-if (lambda (e) (and e (search "a categorized line" e)))
-                          bl::*log-buffer*)))
+                          bl.log::*log-buffer*)))
       (is-true entry "the line reached the buffer")
       (when entry
         (is-true (search "[net] a categorized line" entry))))))
@@ -219,14 +219,14 @@ and then DROPPED, so every categorized line came out as an untagged debug line
 contract: 'Error: Unsupported logging category -debug=abc.' — trailing period
 included. Ours said 'Unknown logging category in -debug: abc', which could
 never match however correct the behaviour was."
-  (let ((e (handler-case (bl::apply-log-categories '("abc") nil)
+  (let ((e (handler-case (bl.log::apply-log-categories '("abc") nil)
              (error (c) (princ-to-string c)))))
     (is (string= "Unsupported logging category -debug=abc." e)))
-  (let ((e (handler-case (bl::apply-log-categories nil '("xyz"))
+  (let ((e (handler-case (bl.log::apply-log-categories nil '("xyz"))
              (error (c) (princ-to-string c)))))
     (is (string= "Unsupported logging category -debugexclude=xyz." e)))
   ;; A known category still applies without complaint.
-  (is-true (bl::apply-log-categories '("net") nil)))
+  (is-true (bl.log::apply-log-categories '("net") nil)))
 
 ;;;; --- -loglevel=<category>:<level> (Core SetLoggingLevel) ---
 
@@ -259,19 +259,19 @@ log that will never contain what they asked for."
 fall back to the global one for it (LogAcceptCategory). Setting
 -loglevel=net:debug therefore surfaces net lines on a node whose global level
 is info, without -debug=net."
-  (let ((bl::*category-log-levels* (make-hash-table :test 'equal :synchronized t))
-        (bl::*debug-categories* (make-hash-table :test 'equal))
-        (bl::*current-log-level* :info)
-        (bl::*log-file-stream* nil))
+  (let ((bl.log::*category-log-levels* (make-hash-table :test 'equal :synchronized t))
+        (bl.log::*debug-categories* (make-hash-table :test 'equal))
+        (bl.log::*current-log-level* :info)
+        (bl.log::*log-file-stream* nil))
     ;; Without a threshold and without -debug=net, a net line is suppressed.
     (bl:log-cat "net" "suppressed line one")
     (is-false (find-if (lambda (e) (and e (search "suppressed line one" e)))
-                       bl::*log-buffer*))
+                       bl.log::*log-buffer*))
     ;; With one, it is emitted — and carries the category tag.
     (is-true (bl:set-category-log-level "net" :debug))
     (bl:log-cat "net" "visible line two")
     (let ((entry (find-if (lambda (e) (and e (search "visible line two" e)))
-                          bl::*log-buffer*)))
+                          bl.log::*log-buffer*)))
       (is-true entry)
       (when entry (is-true (search "[net] visible line two" entry))))
     ;; An unknown category cannot be given one.
@@ -286,15 +286,15 @@ node to start, with http off and the invalid `abc` never mentioned.
 
 Validating the whole list made that a fatal error over a category the operator
 had already cancelled."
-  (let ((bl::*debug-categories* (make-hash-table :test 'equal)))
-    (bl::apply-log-categories '("http" "abc" "none" "rpc" "net") nil)
+  (let ((bl.log::*debug-categories* (make-hash-table :test 'equal)))
+    (bl.log::apply-log-categories '("http" "abc" "none" "rpc" "net") nil)
     (is-false (bl:log-category-enabled-p "http")
               "a category named before the negation must not survive it")
     (is-true (bl:log-category-enabled-p "rpc"))
     (is-true (bl:log-category-enabled-p "net")))
   ;; An invalid name AFTER the last negation is still fatal.
-  (let ((bl::*debug-categories* (make-hash-table :test 'equal)))
-    (signals error (bl::apply-log-categories '("none" "abc") nil)))
+  (let ((bl.log::*debug-categories* (make-hash-table :test 'equal)))
+    (signals error (bl.log::apply-log-categories '("none" "abc") nil)))
   ;; And with no negation at all, the whole list is validated as before.
-  (let ((bl::*debug-categories* (make-hash-table :test 'equal)))
-    (signals error (bl::apply-log-categories '("net" "abc") nil))))
+  (let ((bl.log::*debug-categories* (make-hash-table :test 'equal)))
+    (signals error (bl.log::apply-log-categories '("net" "abc") nil))))

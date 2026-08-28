@@ -1826,14 +1826,14 @@ Drive the real handler with the log path booby-trapped: if it emits, it dies."
     (setf bl::*shutdown-watchdog-running* t)
     (bl::%open-shutdown-pipe)
     (let ((emits 0)
-          (real-emit (fdefinition 'bl::%log-emit))
+          (real-emit (fdefinition 'bl.log::%log-emit))
           (err (make-string-output-stream)))
       (unwind-protect
            (let ((*error-output* err))
-             (setf (fdefinition 'bl::%log-emit)
+             (setf (fdefinition 'bl.log::%log-emit)
                    (lambda (&rest args) (declare (ignore args)) (incf emits)))
              (is (eq t (bl::%handle-stop-signal))))
-        (setf (fdefinition 'bl::%log-emit) real-emit))
+        (setf (fdefinition 'bl.log::%log-emit) real-emit))
       (is (= 0 emits)
           "the handler logged ~D time(s); a log emit takes *LOG-LOCK*, which is ~
            the deadlock the recursive lock used to paper over" emits)
@@ -1890,7 +1890,7 @@ takes a SIGTERM registers the request and then sits there forever."
 recursive only because the signal handler logged; Core's BCLog::Logger::m_cs is
 a plain StdMutex. A recursive lock here would hide a genuine re-entrant emit
 instead of deadlocking on it, which is how a logging bug becomes invisible."
-  (is (typep bl::*log-lock* 'sb-thread:mutex))
+  (is (typep bl.log::*log-lock* 'sb-thread:mutex))
   ;; And no source file may take it recursively again.
   (dolist (rel (cons "src/logging.lisp" (%node-source-files)))
     (let ((src (uiop:read-file-string
