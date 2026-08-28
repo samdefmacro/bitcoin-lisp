@@ -322,7 +322,7 @@ parts, or NIL on EOF/shutdown."
             (when (char= sep #\Space)   ; final line of this message
               (if (>= code 600)
                   (progn                ; async notification: drop, keep reading
-                    (bl:log-cat "tor" "Ignoring async event ~D" code)
+                    (bl.log:log-cat "tor" "Ignoring async event ~D" code)
                     (setf code 0 lines '()))
                   (return-from tor-read-reply
                     (values code (nreverse lines)))))))))))
@@ -330,7 +330,7 @@ parts, or NIL on EOF/shutdown."
 (defun tor-command (ctl cmd &key sensitive)
   "Send CMD and wait for its reply — (VALUES code lines), or NIL on a dead
 connection. SENSITIVE elides the command from the debug log (passwords)."
-  (bl:log-cat "tor" "-> ~A" (if sensitive "AUTHENTICATE <elided>" cmd))
+  (bl.log:log-cat "tor" "-> ~A" (if sensitive "AUTHENTICATE <elided>" cmd))
   (%tor-write-line ctl cmd)
   (tor-read-reply ctl))
 
@@ -358,7 +358,7 @@ itself guards key material. Returns T on success."
         #+sbcl (sb-posix:chmod (namestring (truename path)) #o600)
         t)
     (error (e)
-      (bl:log-warn "tor: Error writing service private key to ~A: ~A"
+      (bl.log:log-warn "tor: Error writing service private key to ~A: ~A"
                              path e)
       nil)))
 
@@ -372,12 +372,12 @@ Returns the final reply code, or NIL on any protocol/verification failure."
   (let ((cookie (handler-case
                     (alexandria:read-file-into-byte-vector cookiefile)
                   (error ()
-                    (bl:log-warn
+                    (bl.log:log-warn
                      "tor: Authentication cookie ~A could not be opened (check permissions)"
                      cookiefile)
                     (return-from %tor-authenticate-safecookie nil)))))
     (unless (= (length cookie) +tor-cookie-size+)
-      (bl:log-warn
+      (bl.log:log-warn
        "tor: Authentication cookie ~A is not exactly ~D bytes, as is required by the spec"
        cookiefile +tor-cookie-size+)
       (return-from %tor-authenticate-safecookie nil))
@@ -386,29 +386,29 @@ Returns the final reply code, or NIL on any protocol/verification failure."
           (tor-command ctl (format nil "AUTHCHALLENGE SAFECOOKIE ~A"
                                    (bl.crypto:bytes-to-hex client-nonce)))
         (unless (eql code +tor-reply-ok+)
-          (bl:log-warn "tor: SAFECOOKIE authentication challenge failed")
+          (bl.log:log-warn "tor: SAFECOOKIE authentication challenge failed")
           (return-from %tor-authenticate-safecookie nil))
         (multiple-value-bind (type args) (split-tor-reply-line (first lines))
           (unless (string= type "AUTHCHALLENGE")
-            (bl:log-warn "tor: Invalid reply to AUTHCHALLENGE")
+            (bl.log:log-warn "tor: Invalid reply to AUTHCHALLENGE")
             (return-from %tor-authenticate-safecookie nil))
           (let ((mapping (parse-tor-reply-mapping args)))
             (unless mapping
-              (bl:log-warn "tor: Error parsing AUTHCHALLENGE parameters: ~A" args)
+              (bl.log:log-warn "tor: Error parsing AUTHCHALLENGE parameters: ~A" args)
               (return-from %tor-authenticate-safecookie nil))
             (let ((server-hash (bl.crypto:hex-to-bytes
                                 (or (tor-mapping-value mapping "SERVERHASH") "")))
                   (server-nonce (bl.crypto:hex-to-bytes
                                  (or (tor-mapping-value mapping "SERVERNONCE") ""))))
               (unless (= (length server-nonce) +tor-nonce-size+)
-                (bl:log-warn
+                (bl.log:log-warn
                  "tor: ServerNonce is not 32 bytes, as required by spec")
                 (return-from %tor-authenticate-safecookie nil))
               ;; The server proves knowledge of the cookie first.
               (unless (equalp (compute-safecookie-response
                                +tor-safe-serverkey+ cookie client-nonce server-nonce)
                               server-hash)
-                (bl:log-warn
+                (bl.log:log-warn
                  "tor: ServerHash ~A does not match expected value"
                  (bl.crypto:bytes-to-hex server-hash))
                 (return-from %tor-authenticate-safecookie nil))
@@ -425,7 +425,7 @@ HASHEDPASSWORD when -torpassword is given (and offered), else NULL, else
 SAFECOOKIE. Returns T on a 250 to AUTHENTICATE."
   (multiple-value-bind (code lines) (tor-command ctl "PROTOCOLINFO 1")
     (unless (eql code +tor-reply-ok+)
-      (bl:log-warn "tor: Requesting protocol info failed")
+      (bl.log:log-warn "tor: Requesting protocol info failed")
       (return-from %tor-authenticate nil))
     (let ((methods '())
           (cookiefile nil))
@@ -441,14 +441,14 @@ SAFECOOKIE. Returns T on a 250 to AUTHENTICATE."
             ((string= type "VERSION")
              (let ((v (tor-mapping-value (parse-tor-reply-mapping args) "Tor")))
                (when v
-                 (bl:log-cat "tor" "Connected to Tor version ~A" v)))))))
+                 (bl.log:log-cat "tor" "Connected to Tor version ~A" v)))))))
       (let* ((password (tor-controller-password ctl))
              (auth-code
                (cond
                  ((and password (plusp (length password)))
                   (cond
                     ((member "HASHEDPASSWORD" methods :test #'string=)
-                     (bl:log-cat "tor" "Using HASHEDPASSWORD authentication")
+                     (bl.log:log-cat "tor" "Using HASHEDPASSWORD authentication")
                      ;; Escape double quotes inside the QuotedString.
                      (let ((escaped (with-output-to-string (s)
                                       (loop for ch across password
@@ -458,29 +458,29 @@ SAFECOOKIE. Returns T on a 250 to AUTHENTICATE."
                         ctl (format nil "AUTHENTICATE \"~A\"" escaped)
                         :sensitive t)))
                     (t
-                     (bl:log-warn
+                     (bl.log:log-warn
                       "tor: Password provided with -torpassword, but HASHEDPASSWORD authentication is not available")
                      nil)))
                  ((member "NULL" methods :test #'string=)
-                  (bl:log-cat "tor" "Using NULL authentication")
+                  (bl.log:log-cat "tor" "Using NULL authentication")
                   (tor-command ctl "AUTHENTICATE"))
                  ((member "SAFECOOKIE" methods :test #'string=)
-                  (bl:log-cat
+                  (bl.log:log-cat
                    "tor" "Using SAFECOOKIE authentication, cookie file ~A" cookiefile)
                   (%tor-authenticate-safecookie ctl cookiefile))
                  ((member "HASHEDPASSWORD" methods :test #'string=)
-                  (bl:log-warn
+                  (bl.log:log-warn
                    "tor: The only supported authentication mechanism left is password, but no password provided with -torpassword")
                   nil)
                  (t
-                  (bl:log-warn "tor: No supported authentication method")
+                  (bl.log:log-warn "tor: No supported authentication method")
                   nil))))
         (cond
           ((eql auth-code +tor-reply-ok+)
-           (bl:log-cat "tor" "Authentication successful")
+           (bl.log:log-cat "tor" "Authentication successful")
            t)
           (auth-code
-           (bl:log-warn "tor: Authentication failed")
+           (bl.log:log-warn "tor: Authentication failed")
            nil)
           (t nil))))))
 
@@ -516,21 +516,21 @@ DIAL onion peers, not just serve them."
                    (when (uiop:string-prefix-p "127.0.0.1:" portstr)
                      (return)))))))    ; prefer localhost — ignore the rest
          (if socks-location
-             (bl:log-cat "tor" "Get SOCKS port command yielded ~A"
+             (bl.log:log-cat "tor" "Get SOCKS port command yielded ~A"
                                    socks-location)
-             (bl:log-warn "tor: Get SOCKS port command returned nothing")))
+             (bl.log:log-warn "tor: Get SOCKS port command returned nothing")))
         ((eql code +tor-reply-unrecognized+)
-         (bl:log-warn
+         (bl.log:log-warn
           "tor: Get SOCKS port command failed with unrecognized command (You probably should upgrade Tor)"))
         (t
-         (bl:log-warn "tor: Get SOCKS port command failed; error code ~D"
+         (bl.log:log-warn "tor: Get SOCKS port command failed; error code ~D"
                                 code)))
       (multiple-value-bind (host port)
           ;; Fallback to the old behaviour (127.0.0.1:9050) when Tor
           ;; reported nothing usable.
           (split-host-port (or socks-location "127.0.0.1")
                            +default-tor-socks-port+)
-        (bl:log-cat "tor" "Configuring onion proxy for ~A:~D" host port)
+        (bl.log:log-cat "tor" "Configuring onion proxy for ~A:~D" host port)
         ;; Stream isolation unconditionally, as Core does on this path.
         (setf *onion-proxy* (make-proxy :host host :port port
                                         :randomize-credentials t))
@@ -565,15 +565,15 @@ the generic error arm, as in Core: logged, no retry, connection stays up."
              (let ((key (tor-mapping-value mapping "PrivateKey")))
                (when key (setf (tor-controller-private-key ctl) key)))))
          (unless sid
-           (bl:log-warn "tor: Error parsing ADD_ONION parameters:~{ ~A~}"
+           (bl.log:log-warn "tor: Error parsing ADD_ONION parameters:~{ ~A~}"
                                   lines)
            (return-from %tor-add-onion nil))
          (let ((pubkey (parse-onion-address (concatenate 'string sid ".onion"))))
            (unless pubkey
-             (bl:log-warn "tor: Invalid ServiceID in ADD_ONION reply: ~A" sid)
+             (bl.log:log-warn "tor: Invalid ServiceID in ADD_ONION reply: ~A" sid)
              (return-from %tor-add-onion nil))
            (setf (tor-controller-service-pubkey ctl) pubkey)
-           (bl:log-info
+           (bl.log:log-info
             "tor: Got service ID ~A, advertising service ~A.onion:~D"
             sid sid (tor-controller-virtual-port ctl))
            (when (and (tor-controller-private-key ctl)
@@ -581,17 +581,17 @@ the generic error arm, as in Core: logged, no retry, connection stays up."
                       (write-onion-private-key
                        (tor-controller-private-key-file ctl)
                        (tor-controller-private-key ctl)))
-             (bl:log-cat "tor" "Cached service private key to ~A"
+             (bl.log:log-cat "tor" "Cached service private key to ~A"
                                    (tor-controller-private-key-file ctl)))
            (add-local :torv3 pubkey (tor-controller-virtual-port ctl)
                       +local-manual+)
            t)))
       ((eql code +tor-reply-unrecognized+)
-       (bl:log-warn
+       (bl.log:log-warn
         "tor: Add onion failed with unrecognized command (You probably need to upgrade Tor)")
        nil)
       (code
-       (bl:log-warn "tor: Add onion failed; error code ~D" code)
+       (bl.log:log-warn "tor: Add onion failed; error code ~D" code)
        nil)
       (t nil))))
 
@@ -626,7 +626,7 @@ Core never subscribes to events) until EOF or shutdown."
                                       (tor-controller-control-port ctl)
                                       :element-type '(unsigned-byte 8)
                                       :timeout 10))
-        (bl:log-cat "tor" "Successfully connected to Tor control port ~A:~D"
+        (bl.log:log-cat "tor" "Successfully connected to Tor control port ~A:~D"
                               (tor-controller-control-host ctl)
                               (tor-controller-control-port ctl))
         t)
@@ -644,7 +644,7 @@ Core never subscribes to events) until EOF or shutdown."
   "Sleep the current reconnect backoff (interruptible), then grow it:
 1s x1.5 capped at 600s (Core disconnected_cb, torcontrol.cpp:643-651)."
   (let ((timeout (tor-controller-reconnect-timeout ctl)))
-    (bl:log-cat
+    (bl.log:log-cat
      "tor" "Not connected to Tor control port ~A:~D, retrying in ~,2F s"
      (tor-controller-control-host ctl) (tor-controller-control-port ctl) timeout)
     (let ((deadline (+ (get-internal-real-time)
@@ -668,10 +668,10 @@ until stopped."
                  (unwind-protect
                       (handler-case (%tor-session ctl)
                         (tor-control-error (e)
-                          (bl:log-warn "tor: ~A"
+                          (bl.log:log-warn "tor: ~A"
                                                  (tor-control-error-message e)))
                         (error (e)
-                          (bl:log-warn "tor: control session error: ~A" e)))
+                          (bl.log:log-warn "tor: control session error: ~A" e)))
                    (%tor-disconnect ctl)
                    (%tor-forget-service ctl)))
                (%tor-disconnect ctl))
@@ -710,12 +710,12 @@ tor-controller."
                  :private-key-file key-file
                  :private-key (read-onion-private-key key-file))))
       (when (tor-controller-private-key ctl)
-        (bl:log-cat "tor" "Reading cached private key from ~A" key-file))
+        (bl.log:log-cat "tor" "Reading cached private key from ~A" key-file))
       (setf (tor-controller-thread ctl)
             (bt:make-thread (lambda ()
                               (handler-case (%torcontrol-loop ctl)
                                 (error (e)
-                                  (bl:log-error
+                                  (bl.log:log-error
                                    "tor: control thread died: ~A" e))))
                             :name "torcontrol"))
       ctl)))

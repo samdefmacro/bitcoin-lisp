@@ -161,7 +161,7 @@ address's NETWORK TAG, not its bytes — so a CJDNS address (same prefix, tagged
 NET_CJDNS) is routable and an unsuffixed -proxy covers it (init.cpp:1735).
 Telling ULA from CJDNS needs that tag, which a bare host string does not carry,
 so this stays out rather than guessing."
-  (let ((ip (bl.net::string-to-ip-bytes host)))
+  (let ((ip (string-to-ip-bytes host)))
     (when ip
       (flet ((v4 () (and (ipv4-mapped-p ip) (subseq ip 12))))
         (let ((a (v4)))
@@ -534,7 +534,7 @@ address is (now) present."
     (return-from add-local nil))
   (unless (reachable-network-p network)
     (return-from add-local nil))
-  (bl:log-info "AddLocal(~A:~D,~D)"
+  (bl.log:log-info "AddLocal(~A:~D,~D)"
                          (network-address-to-string network bytes) port score)
   (bt:with-lock-held (*local-addresses-lock*)
     (let ((existing (%find-local-address network bytes)))
@@ -552,7 +552,7 @@ address is (now) present."
 (defun remove-local (network bytes)
   "Forget a local address (Core RemoveLocal, net.cpp:310-315; keyed by
 address only, like the map)."
-  (bl:log-info "RemoveLocal(~A)"
+  (bl.log:log-info "RemoveLocal(~A)"
                          (network-address-to-string network bytes))
   (bt:with-lock-held (*local-addresses-lock*)
     (let ((la (%find-local-address network bytes)))
@@ -929,7 +929,7 @@ would have exactly the eclipse exposure the operator was trying to close."
       ;; the size (util/asmap.cpp:331); the "Using asmap version" line comes
       ;; later, from init. feature_asmap.py greps for both, which is why they
       ;; are two lines and not one.
-      (bl:log-info "Opened asmap file \"~A\" (~D bytes) from disk"
+      (bl.log:log-info "Opened asmap file \"~A\" (~D bytes) from disk"
                              (namestring path) size)
       size)))
 

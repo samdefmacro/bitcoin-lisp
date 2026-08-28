@@ -343,3 +343,16 @@ to the next magic rather than giving up at the first bad byte."
                (declare (ignore found))
                (when (<= (+ i +storage-header-bytes+ length) (length bytes))
                  (return (values (+ i +storage-header-bytes+) length)))))))
+
+;;; Record checksums. Every flat file a layer above writes with its own
+;;; framing -- utxo.dat, the chain-state snapshot, peers.dat -- ends each
+;;; record with this CRC32, so the one function lives here, below all of them.
+
+(defun compute-crc32 (data)
+  "Compute CRC32 checksum of byte vector DATA. Returns 4-byte vector."
+  (let ((digest (ironclad:make-digest :crc32))
+        (simple-data (if (typep data '(simple-array (unsigned-byte 8) (*)))
+                         data
+                         (coerce data '(simple-array (unsigned-byte 8) (*))))))
+    (ironclad:update-digest digest simple-data)
+    (ironclad:produce-digest digest)))

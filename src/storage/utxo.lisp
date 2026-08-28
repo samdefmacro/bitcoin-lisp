@@ -387,15 +387,6 @@ Returns the file bytes (without CRC) on success, NIL on failure."
 (defconstant +utxo-format-version+ 1
   "Current UTXO persistence format version.")
 
-(defun compute-crc32 (data)
-  "Compute CRC32 checksum of byte vector DATA. Returns 4-byte vector."
-  (let ((digest (ironclad:make-digest :crc32))
-        (simple-data (if (typep data '(simple-array (unsigned-byte 8) (*)))
-                         data
-                         (coerce data '(simple-array (unsigned-byte 8) (*))))))
-    (ironclad:update-digest digest simple-data)
-    (ironclad:produce-digest digest)))
-
 (defparameter +utxo-save-flush-threshold+ (* 4 1024 1024)
   "Bytes to accumulate in the byte-buf before flushing to disk during
 save-utxo-set. Caps peak save-time memory at ~4MB regardless of UTXO

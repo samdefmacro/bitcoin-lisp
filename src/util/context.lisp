@@ -12,7 +12,8 @@
 ;;; blocks silently disabled outside unit tests) was a dispatch that passed
 ;;; two of the eight. With one argument there is nothing to forget.
 ;;;
-;;; Data only, so it loads first and every layer can name it; the node
+;;; Data only (plus the stop predicate at the end of the file), so it
+;;; loads first and every layer can name it; the node
 ;;; (src/node/sync.lisp node->context) builds one from its slots for each sync pass
 ;;; and each receive tick, and tests build one with the pieces they have (an
 ;;; absent piece is NIL, which is what a handler used to receive when a keyword
@@ -55,3 +56,31 @@ a style-warning, which is how the lists stay honest."
                                               :bitcoin-lisp.context)
                                      ,c))))
        ,@body)))
+
+;;;; Interrupt signalling — THE contract statement for the cooperative-stop
+;;;; seam. Other files point here rather than restating it.
+;;;;
+;;;; The one thing every long-running loop needs to know: has the node been
+;;;; asked to stop? Core keeps that BELOW validation — util::SignalInterrupt,
+;;;; handed to ChainstateManager by reference (validation.h:1034) — so
+;;;; validation never calls up into networking to ask. This variable is the same
+;;;; seam, and it lives in the earliest-loaded file for the same reason.
+
+(defvar *interrupt-check* (constantly nil)
+  "Predicate of no arguments: T once the node has been asked to stop.
+
+Installed once, by node/shutdown.lisp (%node-interrupt-requested-p) — the only file that
+sees both flags that mean stop: *shutdown-request*, set the moment SIGTERM
+arrives, and networking's *ibd-stop-requested*, set later by stop-node and also
+by call-with-sync-paused for the assumeutxo pause, after which the node keeps
+RUNNING. Consumers that must distinguish those two meanings have to say so
+(perform-reorg does, in its phase-3b section comment).
+
+Stays (CONSTANTLY NIL) in an image that never starts a node, so lower layers
+never depend upward; tests bind it to interrupt a loop at a chosen point.")
+
+(defun interrupt-requested-p ()
+  "T when the node has been asked to stop. Polled at loop boundaries by work
+that must give up cooperatively — perform-reorg between blocks,
+load-mempool-from-disk between transactions. See *interrupt-check*."
+  (funcall *interrupt-check*))
