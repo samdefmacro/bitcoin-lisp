@@ -47,6 +47,7 @@ src/; cold = cold-battery check count / failures.
 | 2026-08-28 | P3.4 | wallet → package bitcoin-lisp.wallet (bl.wallet), src/wallet/ ×9 files, 10 exports; money helpers to src/rpc/amounts.lisp; asd rpc → wallet → rpc-server; ~1,100 cross-package references qualified mechanically from a definition map; definition scanner taught `(bl.rpc:define-rpc ` | 0 | 11 | 63 | 42 | 8 | 195 | 11 | 4,029 | 34,455 / 0 (fresh) |
 | 2026-08-28 | P3.2b | %sync-thread-loop 258 → 50 lines: %sync-thread-connect, %sync-pass, %sync-idle-tick (one tick of the message pump), %sync-offline-activation | 0 | 10 | 63 | 42 | 8 | 195 | 11 | 4,029 | 34,454 / 0 (fresh) |
 | 2026-08-28 | P4.1 | condition hierarchy: bitcoin-lisp.conditions (bl.err) with bitcoin-lisp-error root, 8 per-module simple-error classes + signalling functions, consensus/policy errors with a reason; all 195 bare `(error "…")` sites classified (message text unchanged); 8 existing conditions re-parented; signalling functions declared non-returning; test-time format-arity scan of every site | 0 | 10 | 63 | 42 | 8 | 0 | 11 | 4,029 | 34,468 / 0 (fresh) |
+| 2026-08-28 | P4.2a | ASDF sub-systems bitcoin-lisp/util and bitcoin-lisp/crypto; the main system :depends-on them, so an upward reference inside either is a compile error; layering test lists sub-systems first | 0 | 10 | 63 | 42 | 8 | 0 | 8 | 4,029 | 34,464 / 0 (fresh) |
 
 ## Notes
 

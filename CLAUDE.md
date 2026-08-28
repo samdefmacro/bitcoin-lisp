@@ -31,6 +31,15 @@ its DEFPACKAGE forms with `(eval-when (:compile-toplevel :load-toplevel
 reload of a package file re-executes its DEFPACKAGE, which DROPS that
 package's nicknames, and this call restores them.
 
+## ASDF systems
+
+`bitcoin-lisp.asd` defines `bitcoin-lisp/util` (nicknames, conditions, byte
+I/O, chain parameters, node-context) and `bitcoin-lisp/crypto` as separate
+systems that the main `bitcoin-lisp` system `:depends-on`; nothing above them
+exists while they compile, so a reference upward from src/util/ or src/crypto/
+is a compile error. Add a file to the sub-system that owns its directory, not
+to the main system's `src` module.
+
 ## The development loop (cl-workbench managed, containerized warm image)
 
 This is a Common Lisp Workbench managed project (`.cl-workbench/project.toml`,

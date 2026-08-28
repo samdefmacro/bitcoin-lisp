@@ -7,12 +7,49 @@
     (when (and coalton-path (probe-file coalton-path))
       (pushnew coalton-path asdf:*central-registry* :test #'equal))))
 
+(defsystem "bitcoin-lisp/util"
+  :description "The chain-agnostic base every other layer builds on: the
+bl.* package nicknames, the condition hierarchy, index-based byte I/O with
+CompactSize, chain parameters and the node-context struct. No project
+package above it exists while it compiles, so an upward reference here is
+a compile error, not a layering-test entry."
+  :depends-on ("ironclad" "flexi-streams")
+  :pathname "src"
+  :serial t
+  :components ((:file "util/package")
+               (:file "util/conditions")
+               (:module "util"
+                :components ((:file "bytes")
+                             (:file "chainparams")
+                             (:file "context")))))
+
+(defsystem "bitcoin-lisp/crypto"
+  :description "Hashes, ChaCha20, MuHash, the libsecp256k1 FFI, BIP324
+key exchange, addresses and BIP32 -- everything Bitcoin needs from
+cryptography and nothing that needs Bitcoin's chain state. Depends on the
+util layer for chain parameters (bech32 HRPs) only."
+  :depends-on ("bitcoin-lisp/util" "ironclad" "cffi" "nibbles" "flexi-streams" "alexandria")
+  :pathname "src"
+  :serial t
+  :components ((:file "crypto/package")
+               (:module "crypto"
+                :components ((:file "hash")
+                             (:file "crypter")
+                             (:file "chacha20")
+                             (:file "muhash")
+                             (:file "secp256k1")
+                             (:file "bip324")
+                             (:file "address")
+                             (:file "bip32")))))
+
 (defsystem "bitcoin-lisp"
   :version "0.1.0"
   :author "samdefmacro"
   :license "MIT"
   :description "Bitcoin full node implementation in Common Lisp"
-  :depends-on ("ironclad"
+  :depends-on ("bitcoin-lisp/util"
+               "bitcoin-lisp/crypto"
+               "ironclad"
                "nibbles"
                "cffi"
                "usocket"
@@ -31,9 +68,9 @@
                  ;; because its top package :USEs the others -- installs the
                  ;; bl.* nicknames on every package that exists by then.
                  ;; Each module's package lives next to its code.
-                 (:file "util/package")
-                 (:file "util/conditions")
-                 (:file "crypto/package")
+                 ;; bitcoin-lisp/util and bitcoin-lisp/crypto load before this
+                 ;; system (:depends-on): their packages, nicknames and
+                 ;; conditions already exist here.
                  (:file "serialization/package")
                  (:file "storage/package")
                  (:file "validation/package")
@@ -43,10 +80,6 @@
                  (:file "package")
                  ;; util first: byte I/O that the script interpreter's
                  ;; sighash code inlines must be loaded before src/coalton/.
-                 (:module "util"
-                  :components ((:file "bytes")
-                               (:file "chainparams")
-                               (:file "context")))
                  (:file "logging")
                  (:file "option-registry")
                  (:file "config")
@@ -59,15 +92,6 @@
                                (:file "serialization")
                                (:file "script")
                                (:file "interop")))
-                 (:module "crypto"
-                  :components ((:file "hash")
-                               (:file "crypter")
-                               (:file "chacha20")
-                               (:file "muhash")
-                               (:file "secp256k1")
-                               (:file "bip324")
-                               (:file "address")
-                               (:file "bip32")))
                  (:module "serialization"
                   :components ((:file "binary")
                                (:file "compressor")

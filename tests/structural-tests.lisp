@@ -800,6 +800,16 @@ name -- (config-error \"...\") -- with the message text unchanged.")
 from ASDF rather than copied, so a phase-4 reordering cannot leave a stale
 list behind."
   (let ((order '()) (per-file '()))
+    ;; The sub-systems the main system :depends-on (bitcoin-lisp/util, /crypto,
+    ;; ...) load before any of its own files: their modules take the lowest
+    ;; layers. ASDF already refuses an upward reference inside them at
+    ;; compile time; listing them keeps this test's view of the order whole.
+    (loop for dep in (asdf:system-depends-on (asdf:find-system :bitcoin-lisp))
+          for i from -100
+          when (and (stringp dep) (uiop:string-prefix-p "bitcoin-lisp/" dep))
+            do (dolist (child (asdf:component-children (asdf:find-system dep)))
+                 (when (typep child 'asdf:module)
+                   (push (cons (format nil "src/~A/" (asdf:component-name child)) i) order))))
     (loop for child in (asdf:component-children (asdf:find-component :bitcoin-lisp "src"))
           for i from 0
           do (if (typep child 'asdf:module)
@@ -865,11 +875,8 @@ a docstring still counts; the sources do not do that."
     (sort found #'string<)))
 
 (defparameter +layering-violation-baseline+
-  '(("src/coalton/crypto.lisp" . "bitcoin-lisp.crypto")
-    ("src/coalton/interop.lisp" . "bitcoin-lisp.crypto")
-    ("src/coalton/interop.lisp" . "bitcoin-lisp.serialization")
+  '(("src/coalton/interop.lisp" . "bitcoin-lisp.serialization")
     ("src/coalton/interop.lisp" . "bitcoin-lisp.storage")
-    ("src/config.lisp" . "bitcoin-lisp.crypto")
     ("src/config.lisp" . "bitcoin-lisp.mempool")
     ("src/config.lisp" . "bitcoin-lisp.networking")
     ("src/validation/block.lisp" . "bitcoin-lisp.mempool")
