@@ -4,7 +4,7 @@
 ;;;
 ;;; Mounted on the same Hunchentoot acceptor as JSON-RPC, under /rest/ —
 ;;; and, like Core, ONLY when -rest is given (DEFAULT_REST_ENABLE = false,
-;;; init.cpp:153; see start-rpc-server's :rest-enabled).
+;;; init.cpp:153; see the :rest surface at the end of this file).
 ;;; Every endpoint reuses an existing rpc-* method body, so REST and RPC
 ;;; can never diverge. Content type comes from the URI extension:
 ;;;   .json -> application/json   .hex -> text/plain   .bin -> octet-stream
@@ -602,8 +602,19 @@ to its handler. Returns the response body; sets status/content-type."
   (if (eq (hunchentoot:request-method*) :get)
       (handler-case (rest-handle *rpc-node* (hunchentoot:script-name*))
         (error (e)
-          (bl::node-log :error "REST handler error: ~A" e)
+          (bl.log:node-log :error "REST handler error: ~A" e)
           (%rest-error 500 "Internal error")))
       (progn
         (setf (hunchentoot:return-code*) hunchentoot:+http-method-not-allowed+)
         "")))
+
+;;; The surface itself. Off unless -rest is given (Core StartREST gate,
+;;; init.cpp:758; DEFAULT_REST_ENABLE = false, init.cpp:153 -- we once
+;;; registered it unconditionally).
+(register-http-surface
+ :rest
+ :options '(:rest-enabled)
+ :start (lambda (options)
+          (when (getf options :rest-enabled)
+            (bl.log:node-log :info "REST interface enabled at /rest/")
+            (hunchentoot:create-prefix-dispatcher "/rest/" 'rest-dispatch-handler))))

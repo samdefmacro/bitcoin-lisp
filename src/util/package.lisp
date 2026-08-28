@@ -58,6 +58,7 @@ consensus / policy errors that carry Core's reject reason.")
     ("BL.BYTES" . "BITCOIN-LISP.BYTES")
     ("BL.CHAIN" . "BITCOIN-LISP.CHAINPARAMS")
     ("BL.CTX" . "BITCOIN-LISP.CONTEXT")
+    ("BL.RL" . "BITCOIN-LISP.RATELIMIT")
     ("BL.CRYPTO" . "BITCOIN-LISP.CRYPTO")
     ("BL.SER" . "BITCOIN-LISP.SERIALIZATION")
     ("BL.STORE" . "BITCOIN-LISP.STORAGE")
@@ -164,6 +165,9 @@ FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
   (:export
    #:*network*
    #:network-magic
+   #:network-port
+   #:network-dns-seeds
+   #:network-rpc-port
    #:chain-params
    #:define-chain-params
    #:find-chain-params
@@ -219,6 +223,21 @@ handler or sync pass acts on, as one value. src/util/context.lisp.")
    #:node-context-recent-rejects
    #:node-context-historical-chainstate
    #:with-node-context))
+
+(defpackage #:bitcoin-lisp.ratelimit
+  (:documentation "The token-bucket rate limiter the P2P protocol and the RPC
+server both meter with. src/util/ratelimit.lisp.")
+  (:use #:cl)
+  (:export
+   #:token-bucket
+   #:make-token-bucket
+   #:token-bucket-p
+   #:token-bucket-rate
+   #:token-bucket-burst
+   #:token-bucket-tokens
+   #:token-bucket-last-refill
+   #:make-rate-limiter
+   #:token-bucket-allow-p))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

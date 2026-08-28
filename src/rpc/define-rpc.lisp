@@ -21,6 +21,19 @@
   "((name . handler-symbol) ...), every DEFINE-RPC in load order; what
 REGISTER-ALL-METHODS installs.")
 
+;;; The named-parameter tables %NAMED-PARAMS-TO-POSITIONAL (server.lisp)
+;;; consults. Empty here: the chain's own rows are data, generated from Core
+;;; into rpc/core-tables.lisp, which SETFs both after the handlers load.
+
+(defvar *rpc-named-arg-names* '()
+  "((method arg-name ...) ...): every method's positional argument names in
+declaration order, so a named-parameter call can be laid out positionally.")
+
+(defvar *rpc-named-only-args* '()
+  "((method option-name ...) ...): the members of each method's
+OBJ_NAMED_PARAMS options object, which a named-parameter call may pass at
+top level (Core rpc/server.cpp:408-415).")
+
 (defun register-rpc-method (name handler)
   "Install HANDLER (a function of NODE and PARAMS) as method NAME."
   (setf (gethash name *rpc-methods*) handler))

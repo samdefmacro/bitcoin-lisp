@@ -136,7 +136,22 @@ that file and compares. Editing an entry here by hand without changing Core is
 how the two drift apart, so the test exists to make that impossible to do
 quietly.")
 
-(defparameter *rpc-named-only-args*
+;;; Members of an RPC's OBJ_NAMED_PARAMS options object, which Core lets a
+;;; client pass as TOP-LEVEL named arguments.
+;;;
+;;; RPCHelpMan::GetArgNames emits these with named_only=true (rpc/util.cpp:750) and
+;;; transformNamedArguments collects them into a fresh options object which it
+;;; pushes at the options slot (rpc/server.cpp:408-415). Without them the server
+;;; answers "Unknown named parameter fee_rate" to a call every Core client can
+;;; make.
+;;;
+;;; ⚠️ Covers BOTH declaration forms. Matching only `RPCHelpMan{"name"` misses
+;;; every RPC declared through a helper that takes the name as a PARAMETER —
+;;; bumpfee and psbtbumpfee are declared that way (wallet/rpc/spend.cpp:960,
+;;; 1166-1167), so both were absent and wallet_bumpfee.py died on fee_rate.
+;;;
+;;; GENERATED from Core's RPCHelpMan declarations. Do not hand-edit.
+(setf *rpc-named-only-args*
   '(
     ("bumpfee" "conf_target" "fee_rate" "replaceable" "estimate_mode" "outputs" "original_change_index")
     ("createwalletdescriptor" "internal" "hdkey")
@@ -151,24 +166,32 @@ quietly.")
     ("send" "add_inputs" "include_unsafe" "minconf" "maxconf" "add_to_wallet" "change_address" "change_position" "change_type" "fee_rate" "include_watching" "inputs" "txid" "vout" "sequence" "weight" "locktime" "lock_unspents" "psbt" "subtract_fee_from_outputs" "vout_index" "max_tx_weight")
     ("sendall" "add_to_wallet" "fee_rate" "include_watching" "inputs" "txid" "vout" "sequence" "locktime" "lock_unspents" "psbt" "send_max" "minconf" "maxconf" "version")
     ("simulaterawtransaction" "include_watchonly")
-    ("walletcreatefundedpsbt" "add_inputs" "include_unsafe" "minconf" "maxconf" "change_type" "fee_rate" "vout_index" "max_tx_weight"))
-  "Members of an RPC's OBJ_NAMED_PARAMS options object, which Core lets a
-client pass as TOP-LEVEL named arguments.
+    ("walletcreatefundedpsbt" "add_inputs" "include_unsafe" "minconf" "maxconf" "change_type" "fee_rate" "vout_index" "max_tx_weight")))
 
-RPCHelpMan::GetArgNames emits these with named_only=true (rpc/util.cpp:750) and
-transformNamedArguments collects them into a fresh options object which it
-pushes at the options slot (rpc/server.cpp:408-415). Without them the server
-answers \"Unknown named parameter fee_rate\" to a call every Core client can
-make.
-
-⚠️ Covers BOTH declaration forms. Matching only `RPCHelpMan{\"name\"` misses
-every RPC declared through a helper that takes the name as a PARAMETER —
-bumpfee and psbtbumpfee are declared that way (wallet/rpc/spend.cpp:960,
-1166-1167), so both were absent and wallet_bumpfee.py died on fee_rate.
-
-GENERATED from Core's RPCHelpMan declarations. Do not hand-edit.")
-
-(defparameter *rpc-named-arg-names*
+;;; Positional argument names for every RPC method Core declares, in declaration
+;;; order — what transformNamedArguments (rpc/server.cpp:396) matches an incoming
+;;; named parameter against. A name containing #\\| lists aliases for one slot,
+;;; exactly as Core stores it; getblock's "verbosity|verbose" is the case that
+;;; matters, since older clients send the second spelling.
+;;;
+;;; GENERATED from Core's RPCHelpMan declarations by scripts/gen-rpc-arg-names.py,
+;;; which walks src/rpc/*.cpp and src/wallet/rpc/*.cpp. Do not hand-edit: rerun the
+;;; script against refs/bitcoin.
+;;;
+;;; It has to come from RPCHelpMan and not from client.cpp, which is where #458's
+;;; type-conversion table comes from. client.cpp lists only arguments that need
+;;; JSON CONVERSION, so it structurally omits every STRING argument. A named-parameter
+;;; table derived from it is missing `scantxoutset action`, `setban subnet`,
+;;; `addnode command`, and about a hundred more — and, worse, the positions of the
+;;; arguments that ARE listed are Core's real positions, so a table built from it
+;;; disagrees with itself about where an argument sits.
+;;;
+;;; The hand-curated 43-method predecessor is why this exists. MiniWallet — which a
+;;; large share of Core's functional suite instantiates — opens with
+;;; `scantxoutset(action="start", ...)`, and `action` was not in the table, so
+;;; the node answered "Unknown named parameter action" and the test died in
+;;; setup. Found by running the suite, not by reading it.
+(setf *rpc-named-arg-names*
   '(
     ("abandontransaction" "txid")
     ("abortprivatebroadcast" "id")
@@ -340,27 +363,4 @@ GENERATED from Core's RPCHelpMan declarations. Do not hand-edit.")
     ("walletpassphrase" "passphrase" "timeout")
     ("walletpassphrasechange" "oldpassphrase" "newpassphrase")
     ("walletprocesspsbt" "psbt" "sign" "sighashtype" "bip32derivs" "finalize")
-    )
-  "Positional argument names for every RPC method Core declares, in declaration
-order — what transformNamedArguments (rpc/server.cpp:396) matches an incoming
-named parameter against. A name containing #\\| lists aliases for one slot,
-exactly as Core stores it; getblock's \"verbosity|verbose\" is the case that
-matters, since older clients send the second spelling.
-
-GENERATED from Core's RPCHelpMan declarations by scripts/gen-rpc-arg-names.py,
-which walks src/rpc/*.cpp and src/wallet/rpc/*.cpp. Do not hand-edit: rerun the
-script against refs/bitcoin.
-
-It has to come from RPCHelpMan and not from client.cpp, which is where #458's
-type-conversion table comes from. client.cpp lists only arguments that need
-JSON CONVERSION, so it structurally omits every STRING argument. A named-parameter
-table derived from it is missing `scantxoutset action`, `setban subnet`,
-`addnode command`, and about a hundred more — and, worse, the positions of the
-arguments that ARE listed are Core's real positions, so a table built from it
-disagrees with itself about where an argument sits.
-
-The hand-curated 43-method predecessor is why this exists. MiniWallet — which a
-large share of Core's functional suite instantiates — opens with
-`scantxoutset(action=\"start\", ...)`, and `action` was not in the table, so
-the node answered \"Unknown named parameter action\" and the test died in
-setup. Found by running the suite, not by reading it.")
+    ))

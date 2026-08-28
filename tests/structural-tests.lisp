@@ -44,9 +44,11 @@
     ;; API that coins-view-cache replaced, REQUEST-HEADERS beside the live
     ;; REQUEST-HEADERS-FOR-IBD, and BAN-PEER, which nothing calls because
     ;; misbehaviour discourages and setban bans by address.
-    ;; Called only from the top-level EVAL-WHEN form at the end of every
-    ;; package file; xref records calls from named functions only.
+    ;; Called only from top-level forms -- the EVAL-WHEN at the end of every
+    ;; package file, the surface registrations at the end of rest.lisp and
+    ;; ui.lisp; xref records calls from named functions only.
     "bitcoin-lisp.nicknames:install-package-nicknames"
+    "bitcoin-lisp.rpc:register-http-surface"
     "bitcoin-lisp.crypto:bip324-cipher-initialized-p"
     "bitcoin-lisp.crypto:ellswift-decode"
     "bitcoin-lisp.crypto:muhash-combine"

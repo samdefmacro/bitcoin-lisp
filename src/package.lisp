@@ -8,7 +8,14 @@
   (:use #:bitcoin-lisp.validation)
   (:use #:bitcoin-lisp.networking)
   ;; The current chain lives in the chainparams layer; the node re-exports it.
-  (:import-from #:bitcoin-lisp.chainparams #:*network* #:network-magic)
+  (:import-from #:bitcoin-lisp.chainparams #:*network* #:network-magic
+                #:network-port #:network-dns-seeds #:network-rpc-port)
+  ;; The token bucket the protocol and the RPC server meter with.
+  (:import-from #:bitcoin-lisp.ratelimit #:make-rate-limiter #:token-bucket-allow-p
+                #:token-bucket-rate #:token-bucket-burst #:token-bucket-tokens
+                #:token-bucket-last-refill)
+  ;; The RPC server's own knobs, re-exported for the tests that tune them.
+  (:import-from #:bitcoin-lisp.rpc #:*rpc-rate-limit* #:+max-rpc-body-size+)
   ;; So does the stop seam every long loop polls; node/shutdown.lisp sets it.
   (:import-from #:bitcoin-lisp.context #:*interrupt-check* #:interrupt-requested-p)
   (:local-nicknames (#:bt #:bordeaux-threads))

@@ -1442,8 +1442,10 @@ chainstate is up."
 ;;; --- RPC plumbing: /wallet/<name> endpoint resolution ---
 
 (defvar *rpc-wallet-name* nil
-  "The wallet name from the request's /wallet/<name> URI path, or NIL when
-the request came in on the base endpoint. Bound per-request by rpc-handler.")
+  "A caller's override of the wallet a request addresses: the tests bind it
+around direct handler calls. NIL, the served case, means \"read it from the
+request's /wallet/<name> path\" -- %REQUEST-WALLET-NAME does that from
+bl.rpc:*rpc-request-uri*, which the server binds per request.")
 
 (defun wallet-name-from-uri (script-name)
   "The url-decoded wallet name when SCRIPT-NAME is a /wallet/<name> endpoint
@@ -1460,24 +1462,32 @@ for wallet RPCs: method not found."
       (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-method-not-found+
                         :message "Method not found (wallet support is disabled)")))
 
+(defun %request-wallet-name ()
+  "The wallet the current request addresses: *RPC-WALLET-NAME* when a caller
+bound it (the tests call handlers directly), else the /wallet/<name> endpoint
+of the HTTP request the server exposes as bl.rpc:*rpc-request-uri* -- Core
+GetWalletNameFromJSONRPCRequest reads request.URI the same way."
+  (or *rpc-wallet-name* (wallet-name-from-uri bl.rpc:*rpc-request-uri*)))
+
 (defun wallet-for-request (node)
   "Resolve the wallet a request addresses (Core GetWalletForJSONRPCRequest,
 wallet/rpc/util.cpp:64-88): the /wallet/<name> endpoint's wallet, else the
 sole loaded wallet; errors match Core's."
   (let ((manager (node-wallet-manager-checked node)))
     (bt:with-recursive-lock-held ((wallet-manager-lock manager))
-      (if *rpc-wallet-name*
-          (or (gethash *rpc-wallet-name* (wallet-manager-wallets manager))
-              (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-found+
-                                :message "Requested wallet does not exist or is not loaded"))
-          (let ((count (hash-table-count (wallet-manager-wallets manager))))
-            (case count
-              (1 (gethash (first (wallet-manager-wallet-order manager))
-                          (wallet-manager-wallets manager)))
-              (0 (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-found+
-                                   :message "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet. (Note: A default wallet is no longer automatically created)"))
-              (t (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-specified+
-                                   :message "Multiple wallets are loaded. Please select which wallet to use by requesting the RPC through the /wallet/<walletname> URI path."))))))))
+      (let ((name (%request-wallet-name)))
+        (if name
+            (or (gethash name (wallet-manager-wallets manager))
+                (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-found+
+                                  :message "Requested wallet does not exist or is not loaded"))
+            (let ((count (hash-table-count (wallet-manager-wallets manager))))
+              (case count
+                (1 (gethash (first (wallet-manager-wallet-order manager))
+                            (wallet-manager-wallets manager)))
+                (0 (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-found+
+                                     :message "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet. (Note: A default wallet is no longer automatically created)"))
+                (t (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-specified+
+                                     :message "Multiple wallets are loaded. Please select which wallet to use by requesting the RPC through the /wallet/<walletname> URI path.")))))))))
 
 (defun wallet-ensure-unlocked (wallet)
   "Signal RPC_WALLET_UNLOCK_NEEDED when WALLET is encrypted and locked
@@ -1692,12 +1702,13 @@ settings.json so the next node start loads it automatically."
 settings.json so the next node start no longer loads it."
   (let* ((manager (node-wallet-manager-checked node))
          (arg (first params))
-         (name (cond ((and *rpc-wallet-name* arg)
-                      (unless (equal *rpc-wallet-name* arg)
+         (endpoint (%request-wallet-name))
+         (name (cond ((and endpoint arg)
+                      (unless (equal endpoint arg)
                         (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                           :message "The RPC endpoint wallet and the wallet name parameter specify different wallets"))
                       arg)
-                     (*rpc-wallet-name*)
+                     (endpoint)
                      (arg)
                      (t (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                           :message "Either the RPC endpoint wallet or the wallet name parameter must be provided")))))

@@ -131,7 +131,7 @@ file does not exist."
   (if (member (hunchentoot:request-method*) '(:get :head))
       (handler-case (ui-handle (hunchentoot:script-name*))
         (error (e)
-          (bl::node-log :error "UI handler error: ~A" e)
+          (bl.log:node-log :error "UI handler error: ~A" e)
           (%ui-error 500 "Internal error")))
       (progn
         (setf (hunchentoot:return-code*) hunchentoot:+http-method-not-allowed+)
@@ -158,9 +158,28 @@ are logged and never signal: a headless box just keeps starting."
           (cond
             (command
              (uiop:launch-program command)
-             (bl::node-log :info "Opened browser at ~A" url))
+             (bl.log:node-log :info "Opened browser at ~A" url))
             (t
-             (bl::node-log
+             (bl.log:node-log
               :warn "No browser opener for this platform; web UI is at ~A" url))))
       (error (e)
-        (bl::node-log :warn "Could not open browser at ~A: ~A" url e)))))
+        (bl.log:node-log :warn "Could not open browser at ~A: ~A" url e)))))
+
+;;; The surface itself: registered only when enabled -- a disabled UI leaves
+;;; no handler at all (gui-plan P0).
+(register-http-surface
+ :ui
+ :options '(:ui-enabled :ui-directory)
+ :start (lambda (options)
+          (setf *ui-enabled* (and (getf options :ui-enabled) t)
+                *ui-directory* (let ((dir (getf options :ui-directory)))
+                                 (and dir (uiop:ensure-directory-pathname dir))))
+          (when *ui-enabled*
+            (let ((dir (ui-directory)))
+              (if (and dir (probe-file dir))
+                  (bl.log:node-log :info "Web UI enabled at /ui/ (serving ~A)" dir)
+                  (bl.log:node-log
+                   :warn "Web UI enabled but asset directory ~A is missing — /ui/ will 404" dir)))
+            (setf *ui-dispatcher* (make-ui-dispatcher))))
+ :stop (lambda ()
+         (setf *ui-dispatcher* nil *ui-enabled* nil *ui-directory* nil)))
