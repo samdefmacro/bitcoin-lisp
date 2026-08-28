@@ -231,12 +231,12 @@ paths did the work — and that the counter can move at all."
 
 (defun %csi-raw-record (csi height)
   "The stored record at HEIGHT as raw bytes (NIL if absent)."
-  (bl.store::leveldb-get
+  (bl.kv::leveldb-get
    (bl.store:coinstatsindex-db csi)
    (bl.store::%csi-stat-key height)))
 
 (defun %csi-put-raw-record (csi height bytes)
-  (bl.store::leveldb-put
+  (bl.kv::leveldb-put
    (bl.store:coinstatsindex-db csi)
    (bl.store::%csi-stat-key height) bytes))
 

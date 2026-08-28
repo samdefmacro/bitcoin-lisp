@@ -1,4 +1,4 @@
-(in-package #:bitcoin-lisp.storage)
+(in-package #:bitcoin-lisp.kv)
 
 ;;;; Flat-file storage engine (Core flatfile.{h,cpp}, util/obfuscation.h)
 ;;;;

@@ -397,7 +397,7 @@ STORE-BLOCK / GET-BLOCK API, which does not change."
        ;; And the position reported is Core's: past the 8-byte header.
        (multiple-value-bind (h pos) (bl.store:store-block store (%ff-test-block 50))
          (declare (ignore h))
-         (is (typep pos 'bl.store::flat-file-pos))
+         (is (typep pos 'bl.kv::flat-file-pos))
          (is (plusp (bl.store:flat-file-pos-pos pos))))))))
 
 (test flat-store-survives-a-restart-by-scanning-its-files
@@ -1129,7 +1129,7 @@ reads, which also lets the migration retry it."
          ;; And make the flat copy unreadable for this hash only.
          (let ((wrapper (lambda (s h)
                           (if (equalp h victim)
-                              (if (bl.store::flat-file-pos-p
+                              (if (bl.kv::flat-file-pos-p
                                    (gethash h (bl.store::block-store-index s)))
                                   nil
                                   (funcall real s h))

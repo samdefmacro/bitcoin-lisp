@@ -50,6 +50,20 @@ bitcoin-lisp.logging, which the main package :USEs and re-exports."
   :pathname "src"
   :components ((:file "logging")))
 
+(defsystem "bitcoin-lisp/kv"
+  :description "Persistence primitives: the LevelDB binding, flat file
+sequences with XOR obfuscation, the datadir layout, fsync. Package
+bitcoin-lisp.kv, which bitcoin-lisp.storage :USEs and re-exports."
+  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "cffi" "bordeaux-threads" "ironclad")
+  :pathname "src"
+  :serial t
+  :components ((:file "kv/package")
+               (:module "kv"
+                :components ((:file "fsync")
+                             (:file "datadir")
+                             (:file "flatfile")
+                             (:file "leveldb")))))
+
 (defsystem "bitcoin-lisp"
   :version "0.1.0"
   :author "samdefmacro"
@@ -58,6 +72,7 @@ bitcoin-lisp.logging, which the main package :USEs and re-exports."
   :depends-on ("bitcoin-lisp/util"
                "bitcoin-lisp/crypto"
                "bitcoin-lisp/logging"
+               "bitcoin-lisp/kv"
                "ironclad"
                "nibbles"
                "cffi"
@@ -108,14 +123,11 @@ bitcoin-lisp.logging, which the main package :USEs and re-exports."
                                (:file "messages")
                                (:file "psbt")))
                  (:module "storage"
-                  ;; utxo first: it defines fsync-file, which flatfile uses;
-                  ;; flatfile before blocks, which now stores through it.
-                  :components ((:file "datadir")
-                               (:file "utxo")
+                  ;; The persistence primitives (LevelDB, flat files, datadir,
+                  ;; fsync) are bitcoin-lisp/kv, loaded before this system.
+                  :components ((:file "utxo")
                                (:file "block-undo")
-                               (:file "flatfile")
                                (:file "blocks")
-                               (:file "leveldb")
                                (:file "coins-view")
                                (:file "coins-view-cache")
                                (:file "coins-view-migration")

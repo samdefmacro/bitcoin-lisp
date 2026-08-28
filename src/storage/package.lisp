@@ -7,7 +7,7 @@
 ;;;; definition in src/storage/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.storage
-  (:use #:cl #:bitcoin-lisp.conditions)
+  (:use #:cl #:bitcoin-lisp.conditions #:bitcoin-lisp.kv)
   (:export
    ;; Block store
    #:block-store
@@ -34,7 +34,7 @@
    #:rebuild-block-file-info
    #:reindex-block-index
    #:migrate-blocks-to-flat-files
-   ;; Core datadir layout (storage/datadir.lisp)
+   ;; Core datadir layout (kv/datadir.lisp)
    #:datadir-block-index-path
    #:datadir-header-index-file
    #:datadir-index-path
