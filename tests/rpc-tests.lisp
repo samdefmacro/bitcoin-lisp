@@ -1116,7 +1116,7 @@ code, carrying an uppercased Lisp keyword no client can match on."
 
 ;;; --- sendrawtransaction broadcast (unbroadcast set + peer announcement) ---
 ;;;
-;;; Uses the P2SH(OP_TRUE) fixture from package-tests.lisp (%pkg-fixture /
+;;; Uses the P2SH(OP_TRUE) fixture from package-tests.lisp (make-package-fixture /
 ;;; %pkg-tx): standard, script-valid transactions with no signing key.
 
 (defun %broadcast-test-node (utxo-set mempool chain-state peer)
@@ -1134,7 +1134,7 @@ set, and queues an announcement to relay peers (Core BroadcastTransaction,
 node/transaction.cpp:100-135); resubmitting the same tx is NOT an error and
 re-announces (already-in-mempool branch, :63-72) without re-adding to the
 unbroadcast set."
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((peer (bl.net:make-peer :state :ready))
            (node (%broadcast-test-node utxo-set mempool chain-state peer))
            (tx (%pkg-tx funding-txid 0 (- 100000000 10000)))
@@ -1160,7 +1160,7 @@ unbroadcast set."
 (test rpc-testmempoolaccept-does-not-broadcast
   "testmempoolaccept is a dry run: nothing enters the mempool, nothing joins
 the unbroadcast set, and no announcement is queued."
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((peer (bl.net:make-peer :state :ready))
            (node (%broadcast-test-node utxo-set mempool chain-state peer))
            (tx (%pkg-tx funding-txid 0 (- 100000000 10000)))
@@ -1228,7 +1228,7 @@ validation.cpp:2117) through testmempoolaccept."
 neither enters the mempool nor gets announced — Core runs ATMP with
 test_accept first and only submits once the fee is under the rail
 (node/transaction.cpp:74-84). maxfeerate=0 switches the rail off."
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((peer (bl.net:make-peer :state :ready))
            (node (%broadcast-test-node utxo-set mempool chain-state peer))
            ;; 1 BTC in, 0.01 BTC out: a 0.99 BTC fee on 85 vbytes, far over the
@@ -1254,7 +1254,7 @@ test_accept first and only submits once the fee is under the rail
 (test rpc-sendrawtransaction-maxfeerate-rejects-one-btc
   "ParseFeeRate refuses a rate at or above 1 BTC/kvB with -8
 (rpc/util.cpp:110-115)."
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
                                        (bl.net:make-peer :state :ready)))
            (hex (bl.crypto:bytes-to-hex
@@ -1270,7 +1270,7 @@ test_accept first and only submits once the fee is under the rail
 (test rpc-sendrawtransaction-maxburnamount-rail
   "Value sent to a provably-unspendable output is refused with Core's
 MAX_BURN_EXCEEDED (-25), and the default cap is 0 (rpc/mempool.cpp:92-103)."
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
                                        (bl.net:make-peer :state :ready)))
            (tx (%burn-tx funding-txid 99900000))
@@ -1296,7 +1296,7 @@ MAX_BURN_EXCEEDED (-25), and the default cap is 0 (rpc/mempool.cpp:92-103)."
 \"max-fee-exceeded\" and then stops filling in verdicts: every later member
 carries txid and wtxid only, because a descendant's verdict is meaningless
 once an ancestor would not be submitted (rpc/mempool.cpp:352-355,381)."
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((node (%broadcast-test-node utxo-set mempool chain-state
                                        (bl.net:make-peer :state :ready)))
            (parent (%pkg-tx funding-txid 0 1000000))
@@ -1321,7 +1321,7 @@ once an ancestor would not be submitted (rpc/mempool.cpp:352-355,381)."
   "A member over submitpackage's maxfeerate aborts the WHOLE package before
 submission: that member is invalid with :max-feerate-exceeded, later members
 are :not-validated, and nothing enters the mempool (validation.cpp:1365-1368)."
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((parent (%pkg-tx funding-txid 0 1000000))
            (child (%pkg-tx (bl.ser:transaction-hash parent) 0 900000)))
       (multiple-value-bind (msg results)
@@ -1416,7 +1416,7 @@ with zero thread errors and every submitted tx in the pool exactly once."
       (let ((funding (make-array 32 :element-type '(unsigned-byte 8)
                                     :initial-element (+ 50 i))))
         (bl.store:add-utxo utxo-set funding 0 100000000
-                                       (%p2sh-optrue-spk) 1 :coinbase nil)
+                                       (p2sh-optrue-script-pubkey) 1 :coinbase nil)
         (let ((tx (%pkg-tx funding 0 99990000)))
           (push (bl.crypto:bytes-to-hex
                  (bl.ser:serialize-transaction tx))
@@ -1487,15 +1487,15 @@ rpc/mempool.cpp:1047)."
                          :test #'string=))))))
 
 (defun %mempool-node (&optional (funding-outputs 1))
-  "A test node on a fresh %pkg-fixture whose UTXO set holds FUNDING-OUTPUTS
+  "A test node on a fresh make-package-fixture whose UTXO set holds FUNDING-OUTPUTS
 confirmed spendable coins (vouts 0..n-1 of the fixture's funding txid), so a
 saved mempool can be reloaded against it. Use (bl::node-mempool node)
 for the pool."
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (declare (ignore mempool))
     (loop for i from 1 below funding-outputs
           do (bl.store:add-utxo utxo-set funding-txid i 100000000
-                                            (%p2sh-optrue-spk) 1 :coinbase nil))
+                                            (p2sh-optrue-script-pubkey) 1 :coinbase nil))
     (values (%broadcast-test-node utxo-set mempool chain-state
                                   (bl.net:make-peer :state :ready))
             funding-txid)))
@@ -1612,7 +1612,7 @@ rpc/mempool.cpp:1115-1116)."
     (unwind-protect
          (let (txid)
            ;; Source pool: one accepted tx marked unbroadcast, saved to PATH.
-           (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+           (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
              (declare (ignore utxo-set chain-state))
              (let ((tx (%pkg-tx funding-txid 0 (- 100000000 10000))))
                (setf txid (bl.ser:transaction-hash tx))

@@ -15,7 +15,7 @@
 ;;; could never be accepted, mined or relayed.
 ;;;
 ;;; Spendable fixtures are the P2SH(OP_TRUE) transactions from
-;;; package-tests.lisp (%pkg-tx / %pkg-fixture / %p2sh-optrue-*): standard,
+;;; package-tests.lisp (%pkg-tx / make-package-fixture / %p2sh-optrue-*): standard,
 ;;; non-witness, and valid without a signing key. Non-witness means
 ;;; txid == wtxid, which is also the exact shape of the second divergence
 ;;; tested here.
@@ -48,7 +48,7 @@
                    'vector)
    :outputs (vector (bl.ser:make-tx-out
                      :value out-value
-                     :script-pubkey (%p2sh-optrue-spk)))
+                     :script-pubkey (p2sh-optrue-script-pubkey)))
    :lock-time 0))
 
 (defmacro %with-fresh-rejects ((rejects) &body body)
@@ -108,7 +108,7 @@ asserted, because each one used to fail:
 
 Against main this fails at step 1 already, and there is no path at all from
 step 3 to the mempool."
-  (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- 100000000 5 50000)))
@@ -140,7 +140,7 @@ already an orphan when the parent arrives for the FIRST time, so the
 parent's very first fee failure forms the package (Core's
 ProcessInvalidTx -> Find1P1CPackage on first_time_failure,
 txdownloadman_impl.cpp:460-465). No re-announcement is needed."
-  (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- 100000000 5 50000)))
@@ -158,7 +158,7 @@ txdownloadman_impl.cpp:460-465). No re-announcement is needed."
   "The control for the test above: with NO child in the orphanage, a
 re-arriving low-fee parent is still not accepted. The fee floor is intact —
 1p1c relay makes the parent reconsiderable, not acceptable."
-  (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
            (pid (bl.ser:transaction-hash parent))
            (peer (%pr-peer)))
@@ -173,7 +173,7 @@ re-arriving low-fee parent is still not accepted. The fee floor is intact —
 peer announced (txdownloadman_impl.cpp:303-307), so a flood of fake children
 from an attacker cannot displace the honest peer's real one. Here the child
 comes from peer B, the parent from peer A: no package is formed."
-  (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- 100000000 5 50000)))
@@ -197,7 +197,7 @@ distinguishes the two filters there and tolerates exactly one reconsiderable
 parent (txdownloadman_impl.cpp:371-396): the child stays in the orphanage.
 Previously the parent's fee failure sat in the MAIN filter and the child was
 blacklisted under both of its own ids — permanently, until the next block."
-  (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- 100000000 5 50000)))
@@ -224,8 +224,8 @@ rejects the child under both ids rather than holding it in the orphanage."
          (fund-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 21))
          (fund-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 22))
          (peer (%pr-peer)))
-    (bl.store:add-utxo utxo fund-a 0 100000000 (%p2sh-optrue-spk) 1)
-    (bl.store:add-utxo utxo fund-b 0 100000000 (%p2sh-optrue-spk) 1)
+    (bl.store:add-utxo utxo fund-a 0 100000000 (p2sh-optrue-script-pubkey) 1)
+    (bl.store:add-utxo utxo fund-b 0 100000000 (p2sh-optrue-script-pubkey) 1)
     (let* ((pa (%pr-tx (list (cons fund-a 0)) (- 100000000 5)))
            (pb (%pr-tx (list (cons fund-b 0)) (- 100000000 5)))
            (paid (bl.ser:transaction-hash pa))
@@ -254,7 +254,7 @@ MAIN filter and is dropped on re-arrival WITHOUT being re-validated — the
 whole DoS property of the filter. The call counter carries its own positive
 control: the first arrival must reach validation exactly once, or a count of
 zero on the second would prove nothing."
-  (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
     (let* ((peer (%pr-peer))
            ;; version 5 > +max-standard-tx-version+: rejected as
            ;; :version-non-standard, a plain (non-reconsiderable) failure.
@@ -286,7 +286,7 @@ carry it — and be dropped before validation on re-arrival."
          (state (bl.store:make-chain-state :best-height 200))
          (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 31))
          (peer (%pr-peer)))
-    (bl.store:add-utxo utxo funding 0 100000000 (%p2sh-optrue-spk) 1)
+    (bl.store:add-utxo utxo funding 0 100000000 (p2sh-optrue-script-pubkey) 1)
     (let* ((tx (%pr-tx (list (cons funding 0)) (- 100000000 10000)))
            (txid (bl.ser:transaction-hash tx)))
       (%with-fresh-rejects (rejects)
@@ -326,7 +326,7 @@ The pair is a legitimate CPFP package, it just cannot out-earn RIVAL, so
 validate-package-for-mempool fails at the package-RBF step — a PACKAGE-level
 failure that overwrites no member result. Returns
 (values utxo mempool state rival parent child)."
-  (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
     (let* ((rival (%pkg-tx funding 0 (- 100000000 50000)))     ; fee 50000
            (parent (%pkg-tx funding 0 (- 100000000 5)))        ; fee 5
            (child (%pkg-tx (bl.ser:transaction-hash parent)
@@ -455,7 +455,7 @@ the parent's output is actually available — i.e. individually it is a plain
                     :sequence #xffffffff))
    :outputs (vector (bl.ser:make-tx-out
                      :value out-value
-                     :script-pubkey (%p2sh-optrue-spk)))
+                     :script-pubkey (p2sh-optrue-script-pubkey)))
    :lock-time 0))
 
 (test hard-failure-inside-a-1p1c-package-is-still-cached
@@ -467,7 +467,7 @@ orphanage (Core MempoolRejectedTx's tail erases everything except
 TX_MISSING_INPUTS, txdownloadman_impl.cpp:490-492), and is dropped on
 re-arrival WITHOUT being re-validated. The parent's :insufficient-fee still
 goes to the reconsiderable filter — CONTROL (b) again, on this path."
-  (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))        ; fee 5
            (pid (bl.ser:transaction-hash parent))
            (pwtxid (bl.ser:transaction-wtxid parent))
@@ -508,7 +508,7 @@ never forms and this control asserts nothing")
   "Core GetPackageHash sorts the wtxids before hashing (policy/packages.cpp:
 151-170), so the identity of a package is the COMBINATION, not the order —
 which is what lets a failed 1p1c pairing be remembered once."
-  (multiple-value-bind (u m c funding) (%pkg-fixture)
+  (multiple-value-bind (u m c funding) (make-package-fixture)
     (declare (ignore u m c))
     (let* ((a (%pkg-tx funding 0 99990000))
            (b (%pkg-tx (bl.ser:transaction-hash a) 0 99980000))

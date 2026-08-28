@@ -480,7 +480,7 @@ after adding a normal 5-cent coin BnB finds {8, 5, 3}."
   "sendtoaddress: exact fee (= feerate x estimated vsize), internal change,
 RBF sequences, anti-fee-sniping locktime, script-verifier round trip, and
 balances that reconcile to the satoshi before and after confirmation."
-  (%with-wallet-chain-node (node "ws-send")
+  (with-wallet-chain-node (node "ws-send")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (is (= 50.0d0 (bl.wallet::rpc-getbalance node '())))
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 12345))
@@ -542,7 +542,7 @@ balances that reconcile to the satoshi before and after confirmation."
   "Subtract-fee-from-outputs: single recipient pays exactly the fee;
 multi-recipient splits it with the first (in built-tx order) paying the
 remainder."
-  (%with-wallet-chain-node (node "ws-sffo")
+  (with-wallet-chain-node (node "ws-sffo")
     (multiple-value-bind (wallet) (%ws-fund-wallet node :blocks 2)
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 777))
              (dest (%wc-optrue-address))
@@ -602,7 +602,7 @@ remainder."
 (test ws-dust-change-to-fee
   "A remainder below the minimum viable change is discarded to fees: the
 tx gets no change output and overpays exactly the remainder."
-  (%with-wallet-chain-node (node "ws-dust")
+  (with-wallet-chain-node (node "ws-dust")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 5))
              (dest (%wc-optrue-address))
@@ -622,7 +622,7 @@ tx gets no change output and overpays exactly the remainder."
 (test ws-sendall-sweep
   "sendall sweeps every coin: fee = feerate x estimated size, single
 output of total - fee, wallet empty afterwards."
-  (%with-wallet-chain-node (node "ws-sendall")
+  (with-wallet-chain-node (node "ws-sendall")
     (multiple-value-bind (wallet) (%ws-fund-wallet node :blocks 2)
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 21))
              (dest (%wc-optrue-address))
@@ -648,7 +648,7 @@ output of total - fee, wallet empty afterwards."
   "fundrawtransaction on an externally-built raw tx adds change at the
 requested feerate; signrawtransactionwithwallet completes it;
 sendrawtransaction accepts it. Preset locktime/sequence survive."
-  (%with-wallet-chain-node (node "ws-fund")
+  (with-wallet-chain-node (node "ws-fund")
     (multiple-value-bind (wallet address) (%ws-fund-wallet node)
       (declare (ignore address))
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 31))
@@ -665,7 +665,7 @@ sendrawtransaction accepts it. Preset locktime/sequence survive."
                                     :sequence #xFFFFFFFE))
                    :outputs (vector (bl.ser:make-tx-out
                                      :value 100000000
-                                     :script-pubkey (%p2sh-optrue-spk)))
+                                     :script-pubkey (p2sh-optrue-script-pubkey)))
                    :lock-time 0))
              (funded (bl.wallet::rpc-fundrawtransaction
                       node (list (bl.crypto:bytes-to-hex
@@ -698,7 +698,7 @@ sendrawtransaction accepts it. Preset locktime/sequence survive."
 (test ws-signraw-watch-only-partial
   "signrawtransactionwithwallet on a watch-only wallet returns
 complete:false with Core's per-input errors array."
-  (%with-wallet-chain-node (node "ws-watch")
+  (with-wallet-chain-node (node "ws-watch")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (declare (ignore wallet))
       ;; Watch-only wallet from an xpub descriptor.
@@ -752,7 +752,7 @@ complete:false with Core's per-input errors array."
                                           :sequence #xFFFFFFFD))
                          :outputs (vector (bl.ser:make-tx-out
                                            :value 90000000
-                                           :script-pubkey (%p2sh-optrue-spk)))
+                                           :script-pubkey (p2sh-optrue-script-pubkey)))
                          :lock-time 0))
                  (result (let ((bl.wallet::*rpc-wallet-name* "wo"))
                            (bl.wallet::rpc-signrawtransactionwithwallet
@@ -774,7 +774,7 @@ complete:false with Core's per-input errors array."
 (test ws-maxtxfee-and-weight-caps
   "The -maxtxfee rail refuses to build over-fee transactions; max_tx_weight
 bounds are enforced with Core's messages."
-  (%with-wallet-chain-node (node "ws-caps")
+  (with-wallet-chain-node (node "ws-caps")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (declare (ignore wallet))
       (let ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 61))
@@ -813,7 +813,7 @@ bounds are enforced with Core's messages."
   "Fallback fee drives fee estimation when the estimator has no data;
 disabled fallback errors with Core's message; explicit feerates report
 PayTxFee."
-  (%with-wallet-chain-node (node "ws-fees")
+  (with-wallet-chain-node (node "ws-fees")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (let ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 77))
             (dest (%wc-optrue-address)))
@@ -845,7 +845,7 @@ PayTxFee."
 (test ws-anti-fee-sniping-direct
   "DiscourageFeeSniping: locktime = tip height, or backed off by up to 99
 on the 1-in-10 branch; a FINAL sequence is an internal-bug error."
-  (%with-wallet-chain-node (node "ws-snipe")
+  (with-wallet-chain-node (node "ws-snipe")
     (%ws-fund-wallet node)
     (let* ((tip-hash (bl.store:best-block-hash
                       (bl::node-chain-state node)))
@@ -860,7 +860,7 @@ on the 1-in-10 branch; a FINAL sequence is an internal-bug error."
                                         :sequence sequence))
                        :outputs (vector (bl.ser:make-tx-out
                                          :value 1000
-                                         :script-pubkey (%p2sh-optrue-spk)))
+                                         :script-pubkey (p2sh-optrue-script-pubkey)))
                        :lock-time 0)))
            ;; Find seeds whose FIRST randrange(10) draw is nonzero / zero.
            (seed-tip (loop for seed from 1
@@ -896,7 +896,7 @@ on the 1-in-10 branch; a FINAL sequence is an internal-bug error."
 
 (test ws-nonfinal-sequence-when-rbf-off
   "With BIP125 signaling off, inputs carry MAX_SEQUENCE_NONFINAL."
-  (%with-wallet-chain-node (node "ws-seq")
+  (with-wallet-chain-node (node "ws-seq")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (let ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 4)))
         (bl.rpc::with-node-lock (node)
@@ -906,7 +906,7 @@ on the 1-in-10 branch; a FINAL sequence is an internal-bug error."
                  node wallet
                  (list (bl.rpc::make-recipient
                         :address (%wc-optrue-address)
-                        :script (%p2sh-optrue-spk)
+                        :script (p2sh-optrue-script-pubkey)
                         :amount 100000000))
                  nil
                  (bl.wallet::make-wcc :signal-bip125-rbf nil
@@ -921,7 +921,7 @@ on the 1-in-10 branch; a FINAL sequence is an internal-bug error."
 (test ws-rebroadcast-machinery
   "ResubmitWalletTransactions puts an evicted wallet tx back into the
 mempool; the resend scheduler windows land in [12h, 36h)."
-  (%with-wallet-chain-node (node "ws-resend")
+  (with-wallet-chain-node (node "ws-resend")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 51))
              (dest (%wc-optrue-address))
@@ -954,7 +954,7 @@ mempool; the resend scheduler windows land in [12h, 36h)."
 (test ws-send-rpc-e2e
   "send: commits and broadcasts by default; add_to_wallet=false returns
 hex+psbt without committing."
-  (%with-wallet-chain-node (node "ws-sendrpc")
+  (with-wallet-chain-node (node "ws-sendrpc")
     (multiple-value-bind (wallet) (%ws-fund-wallet node :blocks 2)
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 43))
              (dest (%wc-optrue-address))
@@ -987,7 +987,7 @@ hex+psbt without committing."
   "B2: SFFO driving an OP_RETURN output negative is DUST (threshold 0) and
 must error with Core's too-small-to-pay-the-fee message instead of
 committing a mempool-invalid transaction as success."
-  (%with-wallet-chain-node (node "ws-sffo-neg")
+  (with-wallet-chain-node (node "ws-sffo-neg")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (let ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 13))
             (dest (%wc-optrue-address))
@@ -1019,7 +1019,7 @@ committing a mempool-invalid transaction as success."
   "B3: sendall on an avoid_reuse wallet still sweeps coins on previously
 used addresses (Core AvailableCoins allow_used with sendall's default
 coin control; excluding them would strand funds)."
-  (%with-wallet-chain-node (node "ws-reuse")
+  (with-wallet-chain-node (node "ws-reuse")
     ;; avoid_reuse wallet.
     (bl.wallet::rpc-createwallet node '("w" nil nil nil t))
     (let* ((wallet (%wc-wallet node "w"))
@@ -1062,7 +1062,7 @@ coin control; excluding them would strand funds)."
 replaceable=false turns RBF signaling off (nonfinal sequences); a
 null-padded avoid_reuse keeps the wallet default while explicit true on a
 wallet without the flag errors."
-  (%with-wallet-chain-node (node "ws-bools")
+  (with-wallet-chain-node (node "ws-bools")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (declare (ignore wallet))
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 23))
@@ -1107,7 +1107,7 @@ wallet without the flag errors."
 keypath spend, and an imported tr(WIF) with an ODD-Y internal key still
 signs after a full unload/reload cycle (the persisted public descriptor
 stores only the 32-byte x coordinate)."
-  (%with-wallet-chain-node (node "ws-tr")
+  (with-wallet-chain-node (node "ws-tr")
     (bl.wallet::rpc-createwallet node '("w"))
     (let* ((wallet (%wc-wallet node "w"))
            (addr-tr (bl.wallet::rpc-getnewaddress node '("" "bech32m")))
@@ -1174,7 +1174,7 @@ stores only the 32-byte x coordinate)."
 (test ws-resubmit-chunking
   "B6: the per-pass resubmission cap chunks work across passes instead of
 doing unbounded validation in one housekeeping tick."
-  (%with-wallet-chain-node (node "ws-chunk")
+  (with-wallet-chain-node (node "ws-chunk")
     (multiple-value-bind (wallet) (%ws-fund-wallet node :blocks 2)
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 37))
              (dest (%wc-optrue-address))

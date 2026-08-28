@@ -278,7 +278,7 @@ non-block inclusion reasons\")."
   "connect-block must publish hashblock. Drives the real validation path."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "zmq-connect")
+       (make-activate-block-fixture "zmq-connect")
      (%with-zmq-hook-test (address "hashblock" sub)
        (let ((warm (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)))
          (is-true (%zmq-await-attached
@@ -305,7 +305,7 @@ error instead of notifying. The compiler said so on every clean build; nothing
 executed it."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "zmq-blocktx")
+       (make-activate-block-fixture "zmq-blocktx")
      (%with-zmq-hook-test (address "hashtx" sub)
        (let ((warm (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
          (is-true (%zmq-await-attached

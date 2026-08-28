@@ -11,7 +11,7 @@
 ;;;; check the whole engine against a brute-force closure model (the same
 ;;;; ancestor/descendant-closure semantics as DepGraph, so a removed
 ;;;; middleman keeps grandparents connected), reusing the seeded xorshift64
-;;;; PRNG from cluster-linearize-tests (%cl-make-rng).
+;;;; PRNG from cluster-linearize-tests (make-deterministic-rng).
 
 (def-suite :txgraph-tests
   :description "TxGraph engine vs Core txgraph.{h,cpp}"
@@ -732,7 +732,7 @@ high its own feerate is (unmet dependencies are never jumped)."
 default (never-oversized at these sizes) limits: every query, the chunk
 walk, the comparator, worst-chunk and the sanity check must agree with the
 brute-force closure model."
-  (let ((rng (%cl-make-rng 6364136223846793005)))
+  (let ((rng (make-deterministic-rng 6364136223846793005)))
     (dotimes (iter 25)
       (let ((g (%tg-new))
             (model (make-array 0 :adjustable t :fill-pointer 0))
@@ -775,7 +775,7 @@ brute-force closure model."
   "Random skip decisions: the emitted chunk sequence must equal a
 simulation over the full chunk list where skipping suppresses the rest of
 the chunk's cluster."
-  (let ((rng (%cl-make-rng 88172645463325252)))
+  (let ((rng (make-deterministic-rng 88172645463325252)))
     (dotimes (iter 20)
       ;; Build a random (never-oversized) graph.
       (let ((g (%tg-new))
@@ -834,7 +834,7 @@ every step; removals take whole descendant sets (the defined-behavior
 regime, txgraph.h:82-92); Trim must restore the limits, remove
 descendant-closed sets drawn only from over-limit components, and leave a
 graph equivalent to the model."
-  (let ((rng (%cl-make-rng 2718281828459045235)))
+  (let ((rng (make-deterministic-rng 2718281828459045235)))
     (dotimes (iter 25)
       (let* ((max-count (+ 2 (funcall rng 5)))
              (max-size (+ 800 (funcall rng 1500)))

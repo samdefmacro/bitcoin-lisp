@@ -151,7 +151,7 @@ an unrelated script (almost surely) does not."
 ;;; --- Persistent index + RPCs (regtest integration) ---
 ;;;
 ;;; Reuses the regtest fixture from mining-tests.lisp (with-network (:regtest),
-;;; %regtest-node-fixture). Binding bl::*node* lets the connect-time
+;;; regtest-node-fixture). Binding bl::*node* lets the connect-time
 ;;; hook (index-block-connected) fire as generatetodescriptor mines blocks.
 
 (defun %bfi-regtest-node ()
@@ -160,7 +160,7 @@ DB), genesis-anchored the way production startup leaves it: the initial
 backfill (catch-up-index -> index-sync -> build-blockfilterindex) indexes the
 genesis filter from chain parameters before any block connects."
   (let* ((tag (format nil "bfi~D" (get-internal-real-time)))
-         (node (%regtest-node-fixture tag))
+         (node (regtest-node-fixture tag))
          (idxbase (merge-pathnames (format nil "test-bfi-~A/" tag)
                                    (uiop:temporary-directory))))
     (ensure-directories-exist idxbase)
@@ -290,7 +290,7 @@ contiguous."
   (with-network (:regtest)
    ;; Mine 5 blocks on a node with NO filter index attached, so the connect
    ;; hook indexes nothing and the backfill does all the work.
-   (let ((node (%regtest-node-fixture (format nil "bfb~D" (get-internal-real-time)))))
+   (let ((node (regtest-node-fixture (format nil "bfb~D" (get-internal-real-time)))))
      (let ((bl::*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
        (let* ((cs (bl::node-chain-state node))
@@ -369,7 +369,7 @@ a second header chain over a gap and strand the gap behind an advanced best
 marker (observed live after a mid-backfill crash). An empty index still seeds
 from the zero header, and filling the gap in order is then accepted."
   (with-network (:regtest)
-   (let ((node (%regtest-node-fixture (format nil "bfc~D" (get-internal-real-time)))))
+   (let ((node (regtest-node-fixture (format nil "bfc~D" (get-internal-real-time)))))
      (let ((bl::*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
        (let* ((cs (bl::node-chain-state node))
@@ -551,7 +551,7 @@ backfill rebuilds it anchored at genesis; healthy and empty indexes are left
 alone; a pruned node's legacy index is kept (rebuild impossible) with a
 warning."
   (with-network (:regtest)
-   (let ((node (%regtest-node-fixture (format nil "bfm~D" (get-internal-real-time)))))
+   (let ((node (regtest-node-fixture (format nil "bfm~D" (get-internal-real-time)))))
      (let ((bl::*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
        (let* ((cs (bl::node-chain-state node))

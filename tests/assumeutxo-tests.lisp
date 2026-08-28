@@ -74,9 +74,9 @@ stored but refused (:weaker-chain) — Core TryAddBlockIndexCandidate — and so
 is any block past the target (ReachedTarget stops the chainstate)."
   (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
-       (%make-activate-block-fixture "target-guard")
+       (make-activate-block-fixture "target-guard")
      ;; Connect A1; then index A2 (target), S2 (sibling of A2), A3 (past).
-     (%build-and-connect cs store utxo genesis-hash
+     (build-and-connect cs store utxo genesis-hash
                          (make-test-chain-hashes #xA1 1))
      (let* ((a1-hash (bl.store:best-block-hash cs))
             (a1-entry (bl.store:get-block-index-entry cs a1-hash))

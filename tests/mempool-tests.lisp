@@ -4,34 +4,6 @@
 
 ;;;; Test helpers
 
-(defun make-mempool-test-tx (&key (input-id 1) (input-index 0) (value 50000000))
-  "Create a test transaction for mempool tests.
-INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
-  (let ((input (bl.ser:make-tx-in
-                :previous-output (bl.ser:make-outpoint
-                                  :hash (make-array 32 :element-type '(unsigned-byte 8)
-                                                    :initial-element input-id)
-                                  :index input-index)
-                :script-sig (make-array 10 :element-type '(unsigned-byte 8)
-                                        :initial-element #x00)
-                :sequence #xFFFFFFFF))
-        ;; P2PKH output script (standard)
-        (output (bl.ser:make-tx-out
-                 :value value
-                 :script-pubkey (let ((s (make-array 25 :element-type '(unsigned-byte 8)
-                                                    :initial-element 0)))
-                                  (setf (aref s 0) #x76)   ; OP_DUP
-                                  (setf (aref s 1) #xa9)   ; OP_HASH160
-                                  (setf (aref s 2) #x14)   ; push 20 bytes
-                                  (setf (aref s 23) #x88)  ; OP_EQUALVERIFY
-                                  (setf (aref s 24) #xac)  ; OP_CHECKSIG
-                                  s))))
-    (bl.ser:make-transaction
-     :version 1
-     :inputs (vector input)
-     :outputs (vector output)
-     :lock-time 0)))
-
 (defun make-mempool-entry-for-tx (tx &key (fee 10000))
   "Create a mempool entry for a test transaction (computes size/vsize/wtxid)."
   (bl.mp:make-entry-from-tx tx fee 0 :entry-time 1000000))

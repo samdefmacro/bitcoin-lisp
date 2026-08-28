@@ -681,7 +681,7 @@ verification gate on a fresh node."
   (with-network (:mainnet)
    (with-temp-directory (dst-dir)
      (multiple-value-bind (cs utxo store genesis-hash)
-         (%make-activate-block-fixture "rollback-dump")
+         (make-activate-block-fixture "rollback-dump")
        (let* ((bl:*prune-target-mib* nil)
               (node (bl::make-node :network :testnet3))
               (hashes (make-test-chain-hashes #xD1 4))
@@ -690,7 +690,7 @@ verification gate on a fresh node."
          (setf (bl.store:chain-state-coins-view cs) utxo
                (bl::node-chainstates node) (list cs)
                (bl::node-block-store node) store)
-         (%build-and-connect cs store utxo genesis-hash hashes)
+         (build-and-connect cs store utxo genesis-hash hashes)
          (is (= 4 (bl.store:current-height cs)))
          (let ((tip-hash (bl.store:best-block-hash cs))
                (pre-dump-hash (bl.store:compute-utxo-set-hash utxo))

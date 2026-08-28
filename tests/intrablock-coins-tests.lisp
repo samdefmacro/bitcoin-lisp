@@ -121,12 +121,12 @@ their amounts and scriptPubKeys, so it is exactly what a chained spend needs."
   "Regtest node at genesis with a fresh UTXO set holding one confirmed
 P2SH(OP_TRUE) coin of +IB-COIN-VALUE+ at ((%ib-coin) . 0). Returns
 (values chain-state utxo-set prev-hash bits now subsidy)."
-  (let* ((node (%regtest-node-fixture suffix))
+  (let* ((node (regtest-node-fixture suffix))
          (cs (bl::node-chain-state node))
          (utxo (bl.store:make-utxo-set)))
     (setf (bl::node-utxo-set node) utxo)
     (bl.store:add-utxo utxo (%ib-coin) 0 +ib-coin-value+
-                                   (%p2sh-optrue-spk) 0 :coinbase nil)
+                                   (p2sh-optrue-script-pubkey) 0 :coinbase nil)
     (values cs utxo
             (bl.store:best-block-hash cs)
             (bl.ser:block-header-bits
@@ -144,7 +144,7 @@ commitment over TXS) followed by TXS."
     (replace combined (bl.val:compute-merkle-root wtxids) :start1 0)
     (let* ((coinbase (bl.mining:build-coinbase-transaction
                       1 cb-value
-                      :script-pubkey (%p2sh-optrue-spk)
+                      :script-pubkey (p2sh-optrue-script-pubkey)
                       :witness-commitment-script
                       (bl.mining:build-witness-commitment-script
                        (bl.crypto:hash256 combined))))
@@ -190,9 +190,9 @@ signature really is invalid."
                           (list (list 90000000 p2pkh))))
             (a-txid (bl.ser:transaction-hash tx-a))
             (unsigned (%ib-tx (list (list a-txid 0 (%ib-empty)))
-                              (list (list 80000000 (%p2sh-optrue-spk)))))
+                              (list (list 80000000 (p2sh-optrue-script-pubkey)))))
             (tx-b (%ib-tx (list (list a-txid 0 (%ib-p2pkh-scriptsig unsigned 0 :corrupt t)))
-                          (list (list 80000000 (%p2sh-optrue-spk)))))
+                          (list (list 80000000 (p2sh-optrue-script-pubkey)))))
             (blk (%ib-block (list tx-a tx-b) prev bits now (+ subsidy 20000000))))
        (bl.store:add-utxo utxo confirmed 0 90000000 p2pkh 0 :coinbase nil)
        (multiple-value-bind (valid error) (%ib-validate blk cs utxo now)
@@ -200,10 +200,10 @@ signature really is invalid."
          (is (eq :script-failed error)))
        ;; CONTROL: identical shape, but the parent coin is confirmed.
        (let* ((unsigned-c (%ib-tx (list (list confirmed 0 (%ib-empty)))
-                                  (list (list 80000000 (%p2sh-optrue-spk)))))
+                                  (list (list 80000000 (p2sh-optrue-script-pubkey)))))
               (tx-c (%ib-tx (list (list confirmed 0
                                         (%ib-p2pkh-scriptsig unsigned-c 0 :corrupt t)))
-                            (list (list 80000000 (%p2sh-optrue-spk)))))
+                            (list (list 80000000 (p2sh-optrue-script-pubkey)))))
               (blk-c (%ib-block (list tx-c) prev bits now (+ subsidy 10000000))))
          (multiple-value-bind (valid error) (%ib-validate blk-c cs utxo now)
            (is (null valid))
@@ -220,9 +220,9 @@ supplying the intra-block coins would reject every honest CPFP chain."
                           (list (list 90000000 p2pkh))))
             (a-txid (bl.ser:transaction-hash tx-a))
             (unsigned (%ib-tx (list (list a-txid 0 (%ib-empty)))
-                              (list (list 80000000 (%p2sh-optrue-spk)))))
+                              (list (list 80000000 (p2sh-optrue-script-pubkey)))))
             (tx-b (%ib-tx (list (list a-txid 0 (%ib-p2pkh-scriptsig unsigned 0)))
-                          (list (list 80000000 (%p2sh-optrue-spk)))))
+                          (list (list 80000000 (p2sh-optrue-script-pubkey)))))
             (blk (%ib-block (list tx-a tx-b) prev bits now (+ subsidy 20000000))))
        (multiple-value-bind (valid error fees) (%ib-validate blk cs utxo now)
          (is (eq t valid))
@@ -247,7 +247,7 @@ accepted, so the rejection is attributable to the bad one."
                        (a-txid (bl.ser:transaction-hash tx-a))
                        (ins (list (list confirmed 0 (%ib-empty))
                                   (list a-txid 0 (%ib-empty))))
-                       (outs (list (list 130000000 (%p2sh-optrue-spk))))
+                       (outs (list (list 130000000 (p2sh-optrue-script-pubkey))))
                        (unsigned (%ib-tx ins outs))
                        (tx-b (%ib-tx
                               (list (list confirmed 0
@@ -277,7 +277,7 @@ The honest spend must validate and a corrupted one must not."
             (a-txid (bl.ser:transaction-hash tx-a))
             (spent (vector (%ib-entry 90000000 p2tr 1)))
             (ins (list (list a-txid 0 (%ib-empty))))
-            (outs (list (list 80000000 (%p2sh-optrue-spk))))
+            (outs (list (list 80000000 (p2sh-optrue-script-pubkey))))
             (unsigned (%ib-tx ins outs)))
        (flet ((spend (corrupt)
                 (%ib-block

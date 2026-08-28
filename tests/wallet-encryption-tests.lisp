@@ -758,7 +758,7 @@ key held in plaintext — the encryption round trip is lossless."
 locked, every spending RPC refuses with -13 rather than producing a
 half-signed or wrongly-signed transaction; after unlocking, the spend goes
 through and the coins encrypted before the seed rotation are still spendable."
-  (%with-wallet-chain-node (node "enc-spend")
+  (with-wallet-chain-node (node "enc-spend")
     (multiple-value-bind (wallet address) (%ws-fund-wallet node :blocks 2)
       (declare (ignore address))
       (let* ((bl.wallet::*rpc-wallet-name* "w")

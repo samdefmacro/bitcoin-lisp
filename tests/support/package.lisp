@@ -10,13 +10,32 @@
 
 (defpackage #:bitcoin-lisp.test-support
   (:documentation "Shared test fixtures: temporary directories, network
-bindings, the minimal test node. tests/support/.")
+bindings, the minimal test node, synthetic transactions, blocks and chains,
+a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
   (:use #:cl)
   (:export
    #:with-temp-directory
    #:make-temp-directory
    #:with-network
-   #:make-test-node))
+   #:make-test-node
+   #:make-deterministic-rng
+   ;; transactions.lisp
+   #:make-mempool-test-tx
+   #:make-witness-test-tx-bytes
+   ;; chain.lisp
+   #:make-test-chain-hashes
+   #:make-reorg-test-block
+   #:regtest-node-fixture
+   #:activate-block-base-path
+   #:make-activate-block-fixture
+   #:build-and-connect
+   ;; mempool-fixtures.lisp
+   #:+optrue-redeem+
+   #:p2sh-optrue-script-pubkey
+   #:make-package-fixture
+   ;; wallet.lisp
+   #:make-wallet-chain-node
+   #:with-wallet-chain-node))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

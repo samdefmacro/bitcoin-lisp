@@ -437,7 +437,7 @@ keeps its own policy last-push extraction."
                                :script-sig (%sigop-empty-redeem-script-sig)
                                :sequence #xffffffff))
               :outputs (vector (bl.ser:make-tx-out
-                                :value 95000 :script-pubkey (%p2sh-optrue-spk)))
+                                :value 95000 :script-pubkey (p2sh-optrue-script-pubkey)))
               :lock-time 0)))
     (bl.store:add-utxo utxo funding 0 100000 (%sigop-empty-redeem-spk) 1
                                    :coinbase nil)
@@ -454,7 +454,7 @@ extractor — past MAX_BLOCK_SIGOPS_COST — so we rejected :too-many-sigops a b
 Core fully validates. A pure chain split: our own script engine accepts the
 spends, which this block proves by validating with scripts on."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "sigop-p2sh"))
+   (let* ((node (regtest-node-fixture "sigop-p2sh"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
           (mempool (bl::node-mempool node))
@@ -473,7 +473,7 @@ spends, which this block proves by validating with scripts on."
                                                :sequence #xffffffff))
                                 'vector)
                 :outputs (vector (bl.ser:make-tx-out
-                                  :value 499000 :script-pubkey (%p2sh-optrue-spk)))
+                                  :value 499000 :script-pubkey (p2sh-optrue-script-pubkey)))
                 :lock-time 0)))
        ;; Not vacuous: the old count for these five inputs exceeds the budget.
        (is (> (* 5 4 (bl.val:count-script-sigops
@@ -481,7 +481,7 @@ spends, which this block proves by validating with scripts on."
               bl.val:+max-block-sigops-cost+))
        (%mine-add-entry mempool tx 1000)
        (let ((block (bl.mining:assemble-full-block
-                     cs mempool :coinbase-script-pubkey (%p2sh-optrue-spk))))
+                     cs mempool :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
          (bl.mining:mine-block block)
          (is (= 2 (length (bl.ser:bitcoin-block-transactions block))))
          (multiple-value-bind (valid err)

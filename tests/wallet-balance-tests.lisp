@@ -146,7 +146,7 @@ MoneyRange enforced."
 (test wallet-balance-rollups
   "getbalance/getbalances track immature -> trusted -> untrusted-pending ->
 trusted-change transitions exactly like Core's wallet_balance.py."
-  (%with-wallet-chain-node (node "balance")
+  (with-wallet-chain-node (node "balance")
     (let ((bl.wallet::*rpc-wallet-name* nil))
       (bl.wallet::rpc-createwallet node '("w"))
       (let* ((addr (bl.wallet::rpc-getnewaddress node nil))
@@ -207,7 +207,7 @@ trusted-change transitions exactly like Core's wallet_balance.py."
             (let ((change-addr (bl.wallet::rpc-getrawchangeaddress node nil)))
               (%wb-spend node "w"
                          (list (cons cb-txid 0))
-                         (list (cons (%p2sh-optrue-spk) 2000000000)
+                         (list (cons (p2sh-optrue-script-pubkey) 2000000000)
                                (cons (%address-script change-addr :regtest)
                                      2999990000)))
               (let ((mine (%wb-balances node)))
@@ -242,7 +242,7 @@ trusted-change transitions exactly like Core's wallet_balance.py."
 (test wallet-listunspent-filters-and-locks
   "listunspent filter arguments, query_options, field set, and
 lockunspent/listlockunspent with persistence across reload."
-  (%with-wallet-chain-node (node "coins")
+  (with-wallet-chain-node (node "coins")
     (let ((bl.wallet::*rpc-wallet-name* nil))
       (bl.wallet::rpc-createwallet node '("w"))
       (let* ((addr1 (bl.wallet::rpc-getnewaddress node nil))
@@ -351,7 +351,7 @@ lockunspent/listlockunspent with persistence across reload."
   "setlabel/getaddressesbylabel/listlabels semantics and getaddressinfo's
 Core field set per address type, with inferred descriptors that derive back
 to the same address."
-  (%with-wallet-chain-node (node "addrinfo")
+  (with-wallet-chain-node (node "addrinfo")
     (let ((bl.wallet::*rpc-wallet-name* nil))
       (bl.wallet::rpc-createwallet node '("w"))
       (let* ((bech32 (bl.wallet::rpc-getnewaddress node '("gold")))
@@ -477,7 +477,7 @@ to the same address."
   "Eviction -> abandon frees the inputs (descendants abandoned too);
 re-broadcast unabandons the parent only; double spends surface in
 walletconflicts on both sides."
-  (%with-wallet-chain-node (node "abandon")
+  (with-wallet-chain-node (node "abandon")
     (let ((bl.wallet::*rpc-wallet-name* nil))
       (bl.wallet::rpc-createwallet node '("w"))
       (let* ((addr (bl.wallet::rpc-getnewaddress node nil))
@@ -591,7 +591,7 @@ walletconflicts on both sides."
   "With WALLET_FLAG_AVOID_REUSE, spending from an address marks it dirty:
 payments to it are excluded from the default balances (reported as used),
 listunspent flags them reused, and the destdata record survives reload."
-  (%with-wallet-chain-node (node "reuse")
+  (with-wallet-chain-node (node "reuse")
     (let ((bl.wallet::*rpc-wallet-name* nil))
       ;; avoid_reuse is the 5th createwallet argument.
       (bl.wallet::rpc-createwallet node '("wr" nil nil nil t))
@@ -608,7 +608,7 @@ listunspent flags them reused, and the destdata record survives reload."
           (is (%wb= 49.9999d0 (bl.wallet::rpc-getbalance node nil)))
           ;; Spend it all away: ADDR becomes previously-spent.
           (%wb-spend node "wr" (list (cons txid1 0))
-                     (list (cons (%p2sh-optrue-spk) 4999890000)))
+                     (list (cons (p2sh-optrue-script-pubkey) 4999890000)))
           (%wc-mine node 1 (%wc-optrue-address))
           (is (%wb= 0.0d0 (bl.wallet::rpc-getbalance node nil)))
           ;; Pay 2 to the SAME address, confirm: reused.
