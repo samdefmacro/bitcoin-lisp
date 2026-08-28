@@ -50,12 +50,12 @@ Errors if the value would exceed 64 bits, mirroring Core's
     (loop
       (let ((b (br-read-u8 br)))
         (when (> n (ash #xFFFFFFFFFFFFFFFF -7))
-          (error "ReadVarInt(): size too large"))
+          (serialization-error "ReadVarInt(): size too large"))
         (setf n (logior (ash n 7) (logand b #x7F)))
         (if (logtest b #x80)
             (progn
               (when (= n #xFFFFFFFFFFFFFFFF)
-                (error "ReadVarInt(): size too large"))
+                (serialization-error "ReadVarInt(): size too large"))
               (incf n))
             (return n))))))
 
@@ -256,14 +256,14 @@ skipped and replaced with a one-byte OP_RETURN, matching Core."
         (let* ((payload (br-read-bytes br (special-script-size n)))
                (script (decompress-script n payload)))
           (or script
-              (error "br-read-compressed-script: invalid special script (id ~D)" n)))
+              (serialization-error "br-read-compressed-script: invalid special script (id ~D)" n)))
         (let ((size (- n +special-scripts+)))
           (if (> size +compress-max-script-size+)
               ;; Overly long script, replace with a short invalid one
               ;; (compressor.h:87-90).
               (let ((p (br-pos br)))
                 (when (> (+ p size) (length (br-data br)))
-                  (error "br-read-compressed-script: script overruns buffer (~D bytes)" size))
+                  (serialization-error "br-read-compressed-script: script overruns buffer (~D bytes)" size))
                 (setf (br-pos br) (+ p size))
                 (make-array 1 :element-type '(unsigned-byte 8)
                               :initial-element #x6a)) ; OP_RETURN
@@ -295,12 +295,12 @@ TxOutCompression): VARINT(compressed amount) + compressed script."
     (loop
       (let ((b (read-byte stream)))
         (when (> n (ash #xFFFFFFFFFFFFFFFF -7))
-          (error "ReadVarInt(): size too large"))
+          (serialization-error "ReadVarInt(): size too large"))
         (setf n (logior (ash n 7) (logand b #x7F)))
         (if (logtest b #x80)
             (progn
               (when (= n #xFFFFFFFFFFFFFFFF)
-                (error "ReadVarInt(): size too large"))
+                (serialization-error "ReadVarInt(): size too large"))
               (incf n))
             (return n))))))
 
@@ -312,7 +312,7 @@ ScriptCompression::Unser)."
         (let* ((payload (read-bytes stream (special-script-size n)))
                (script (decompress-script n payload)))
           (or script
-              (error "read-compressed-script: invalid special script (id ~D)" n)))
+              (serialization-error "read-compressed-script: invalid special script (id ~D)" n)))
         (let ((size (- n +special-scripts+)))
           (if (> size +compress-max-script-size+)
               ;; Overly long script: skip its bytes and replace with a
@@ -324,7 +324,7 @@ ScriptCompression::Unser)."
                       do (let ((got (read-sequence chunk stream
                                                    :end (min remaining (length chunk)))))
                            (when (zerop got)
-                             (error "read-compressed-script: unexpected end of input"))
+                             (serialization-error "read-compressed-script: unexpected end of input"))
                            (decf remaining got)))
                 (make-array 1 :element-type '(unsigned-byte 8)
                               :initial-element #x6a)) ; OP_RETURN

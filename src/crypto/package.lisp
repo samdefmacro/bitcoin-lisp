@@ -7,7 +7,7 @@
 ;;;; definition in src/crypto/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.crypto
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    ;; Hash functions
    #:sha256

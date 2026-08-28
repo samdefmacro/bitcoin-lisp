@@ -7,7 +7,7 @@
 ;;;; definition in src/mempool/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.mempool
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    ;; Constants
    #:+default-max-mempool-bytes+

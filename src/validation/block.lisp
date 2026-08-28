@@ -218,7 +218,7 @@ leave the test running against the height it was trying to move."
   (dolist (spec specs)
     (multiple-value-bind (name height) (parse-test-activation-height spec)
       (unless name
-        (error "Invalid -testactivationheight=~A. Expected name@height, where ~
+        (config-error "Invalid -testactivationheight=~A. Expected name@height, where ~
 name is one of ~{~A~^, ~} and height is a non-negative integer."
                spec +buried-deployment-names+))
       (setf (gethash name *test-activation-heights*) height))))

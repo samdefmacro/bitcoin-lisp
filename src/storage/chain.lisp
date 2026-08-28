@@ -338,7 +338,7 @@ signals an error instead of returning a corrupt block."
               :timestamp timestamp :bits bits :nonce nonce)))
          (hash (bl.ser:block-header-hash header)))
     (unless (equalp hash (network-genesis-hash network))
-      (error "make-genesis-block: constructed ~A genesis hashes to ~A, expected ~A"
+      (internal-error "make-genesis-block: constructed ~A genesis hashes to ~A, expected ~A"
              network
              (bl.crypto:bytes-to-hex (bl.crypto:reverse-bytes hash))
              (bl.crypto:bytes-to-hex

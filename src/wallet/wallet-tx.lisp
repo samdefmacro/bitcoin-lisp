@@ -290,7 +290,7 @@ timesmart record fields, sorted by key (std::map iteration order)."
         ;; vtxPrev (legacy CMerkleTx list): we never write it and no
         ;; descriptor wallet ever has — refuse rather than mis-parse.
         (unless (zerop vtxprev-count)
-          (error "wallet tx record carries legacy vtxPrev data"))
+          (wallet-error "wallet tx record carries legacy vtxPrev data"))
         (let* ((map-pairs (loop repeat (bl.ser:read-compact-size s)
                                 collect (cons (%wread-string s) (%wread-string s))))
                (order-form (loop repeat (bl.ser:read-compact-size s)
@@ -852,7 +852,7 @@ Returns the newly-marked addresses."
                                  (desc-spkm-next-index spkm)
                                  (desc-spkm-cache spkm))))
                    (unless scripts
-                     (error "MarkUnusedAddresses: unable to expand descriptor from cache"))
+                     (wallet-error "MarkUnusedAddresses: unable to expand descriptor from cache"))
                    (let ((address (bl.rpc::%script->address (first scripts)
                                                     (wallet-network wallet))))
                      (when address (push address result)))

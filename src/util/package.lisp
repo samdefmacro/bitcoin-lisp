@@ -6,6 +6,26 @@ call it.")
   (:use #:cl)
   (:export #:*package-nicknames* #:install-package-nicknames))
 
+(defpackage #:bitcoin-lisp.conditions
+  (:documentation "The condition hierarchy every project package :USEs
+(src/util/conditions.lisp): BITCOIN-LISP-ERROR at the root, one simple-error
+subclass per module with a signalling function of the same name, and the
+consensus / policy errors that carry Core's reject reason.")
+  (:use #:cl)
+  (:export
+   #:bitcoin-lisp-error
+   #:internal-error
+   #:config-error
+   #:init-error
+   #:serialization-error
+   #:storage-error
+   #:net-error
+   #:crypto-error
+   #:wallet-error
+   #:consensus-error
+   #:policy-error
+   #:error-reason))
+
 (in-package #:bitcoin-lisp.nicknames)
 
 ;;;; Package-local nicknames
@@ -32,6 +52,7 @@ call it.")
 
 (defparameter *package-nicknames*
   '(("BL" . "BITCOIN-LISP")
+    ("BL.ERR" . "BITCOIN-LISP.CONDITIONS")
     ("BL.BYTES" . "BITCOIN-LISP.BYTES")
     ("BL.CHAIN" . "BITCOIN-LISP.CHAINPARAMS")
     ("BL.CTX" . "BITCOIN-LISP.CONTEXT")
@@ -87,7 +108,7 @@ whose target package exists. Called after each file that defines packages."
 the positional buf-set-* primitives and CompactSize. Loads before every other
 package that does I/O (bitcoin-lisp.asd) so the hot paths that inline these
 compile against them. src/util/bytes.lisp.")
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    #:+max-compact-size+
    ;; positional writers into a pre-sized array
@@ -137,7 +158,7 @@ compile against them. src/util/bytes.lisp.")
   (:documentation "Per-chain parameters (Core CChainParams): one
 DEFINE-CHAIN-PARAMS form per chain in src/util/chainparams.lisp, read through
 FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    #:chain-params
    #:define-chain-params
@@ -175,7 +196,7 @@ FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
 (defpackage #:bitcoin-lisp.context
   (:documentation "node-context (Core NodeContext): the references a message
 handler or sync pass acts on, as one value. src/util/context.lisp.")
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    #:node-context
    #:make-node-context

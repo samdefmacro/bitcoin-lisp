@@ -243,7 +243,7 @@ derived from the pubkey (the id is its base32 form, onion codec minus the
 ;;; timeout to reply callbacks either), so reads block indefinitely but stay
 ;;; interruptible: wait-for-input in short windows, polling stop flags.
 
-(define-condition tor-control-error (error)
+(define-condition tor-control-error (net-error)
   ((message :initarg :message :reader tor-control-error-message))
   (:report (lambda (c stream)
              (format stream "tor control: ~A" (tor-control-error-message c))))

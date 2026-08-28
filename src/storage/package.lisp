@@ -7,7 +7,7 @@
 ;;;; definition in src/storage/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.storage
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    ;; Block store
    #:block-store

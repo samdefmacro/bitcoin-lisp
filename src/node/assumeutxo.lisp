@@ -365,7 +365,7 @@ keyword, or :skipped when there is nothing to finalize."
              (validated-snapshot-cleanup node)
              :success)
             (t
-             (error "Unable to complete -assumeutxo snapshot validation: ~A. ~
+             (init-error "Unable to complete -assumeutxo snapshot validation: ~A. ~
 Restart to resume normal initial block download, or load a different snapshot."
                     message)))))))
 

@@ -392,10 +392,10 @@ an operator staring at a log that will never contain what they asked for.
             ;; Core's wording verbatim (init/common.cpp:91): feature_logging.py
             ;; matches it as a FULL regex, so the old "Unknown logging category
             ;; in -debug: abc" could never match.
-            (t (error "Unsupported logging category -debug=~A." cat)))))
+            (t (config-error "Unsupported logging category -debug=~A." cat)))))
   (dolist (cat exclude)
     (unless (disable-log-category cat)
-      (error "Unsupported logging category -debugexclude=~A." cat)))
+      (config-error "Unsupported logging category -debugexclude=~A." cat)))
   (remove-if-not #'log-category-enabled-p +log-categories+))
 
 (defun node-log-category (category format-string &rest args)
@@ -468,7 +468,7 @@ Single pass, so a substituted value can never itself be rescanned for a
 placeholder: a block hash cannot smuggle in a %w."
   (loop for (nil . value) in substitutions
         unless (%notify-safe-value-p value)
-          do (error "Refusing to substitute ~S into a notify command" value))
+          do (internal-error "Refusing to substitute ~S into a notify command" value))
   (let ((out (make-string-output-stream))
         (i 0)
         (n (length command)))

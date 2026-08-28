@@ -175,7 +175,7 @@ freeing the C string before raising."
     (unless (cffi:null-pointer-p msg-ptr)
       (let ((msg (cffi:foreign-string-to-lisp msg-ptr)))
         (%libc-free msg-ptr)
-        (error "LevelDB error: ~A" msg)))))
+        (storage-error "LevelDB error: ~A" msg)))))
 
 (defmacro with-errptr ((var) &body body)
   "Allocate a stack-local char** ERRPTR pre-initialized to NULL, run BODY,

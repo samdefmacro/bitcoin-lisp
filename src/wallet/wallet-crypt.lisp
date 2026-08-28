@@ -786,7 +786,7 @@ ciphertext."
         (let ((path (uiop:parse-native-namestring destination)))
           (when (or (uiop:directory-exists-p path)
                     (%path-under-p path (wallets-directory manager)))
-            (error "invalid backup destination"))
+            (wallet-error "invalid backup destination"))
           (with-wallet-lock (wallet)
             (wallet-write-best-block wallet)
             (%write-wallet-dump wallet path)))

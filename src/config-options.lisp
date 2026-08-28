@@ -169,12 +169,12 @@
 (define-option "limitclustercount" :type :int
   :apply (lambda (n)
            (unless (<= 1 n 64)
-             (error "limitclustercount must be between 1 and 64"))
+             (config-error "limitclustercount must be between 1 and 64"))
            (setf bl.mp:*cluster-count-limit* n)))
 (define-option "limitclustersize" :type :int
   :apply (lambda (kvb)
            (unless (plusp kvb)
-             (error "limitclustersize must be a positive number of kvB"))
+             (config-error "limitclustersize must be a positive number of kvB"))
            (setf bl.mp:*cluster-size-limit* (* kvb 1000))))
 ;; -signetchallenge: a custom signet block-challenge script.
 (define-option "signetchallenge" :type :hex :global bl.val:*signet-challenge*)
@@ -193,7 +193,7 @@
   :apply (lambda (v)
            (let ((display (conf-parse-user-hex v)))
              (unless display
-               (error "Invalid assumevalid block hash specified (~A), must be up to 64 hex digits (or 0 to disable)" v))
+               (config-error "Invalid assumevalid block hash specified (~A), must be up to 64 hex digits (or 0 to disable)" v))
              (setf *assumevalid-override*
                    (if (every #'zerop display)
                        nil                     ; assumevalid=0: always verify
@@ -204,7 +204,7 @@
   :apply (lambda (v)
            (let ((display (conf-parse-user-hex v)))
              (unless display
-               (error "Invalid minimum work specified (~A), must be up to 64 hex digits" v))
+               (config-error "Invalid minimum work specified (~A), must be up to 64 hex digits" v))
              (setf *minimum-chain-work-override*
                    (loop with acc = 0
                          for b across display
@@ -221,7 +221,7 @@
   :apply (lambda (v)
            (let ((mb (conf-parse-int v)))
              (when (minusp mb)
-               (error "Invalid value for -maxmempool=~A" v))
+               (config-error "Invalid value for -maxmempool=~A" v))
              (setf bl.mp:*max-mempool-bytes* (* mb 1000 1000)))))
 ;; -minrelaytxfee: BTC/kvB (Core ParseMoney, mempool_args.cpp:69-81). Read
 ;; at MAKE-MEMPOOL time like the cluster limits.
@@ -238,16 +238,16 @@
 (define-option "blockmaxweight" :type :int
   :apply (lambda (w)
            (when (> w bl.val:+max-block-weight+)
-             (error "Specified -blockmaxweight (~D) exceeds consensus maximum block weight (~D)"
+             (config-error "Specified -blockmaxweight (~D) exceeds consensus maximum block weight (~D)"
                     w bl.val:+max-block-weight+))
            (setf bl.mining:*block-max-weight* w)))
 (define-option "blockreservedweight" :type :int
   :apply (lambda (w)
            (when (> w bl.val:+max-block-weight+)
-             (error "Specified -blockreservedweight (~D) exceeds consensus maximum block weight (~D)"
+             (config-error "Specified -blockreservedweight (~D) exceeds consensus maximum block weight (~D)"
                     w bl.val:+max-block-weight+))
            (when (< w bl.mining:+minimum-block-reserved-weight+)
-             (error "Specified -blockreservedweight (~D) is lower than minimum safety value of (~D)"
+             (config-error "Specified -blockreservedweight (~D) is lower than minimum safety value of (~D)"
                     w bl.mining:+minimum-block-reserved-weight+))
            (setf bl.mining:*block-reserved-weight* w)))
 ;; -maxtxfee: BTC, absolute cap on any wallet tx fee (Core init: BTC via
@@ -265,11 +265,11 @@
   :apply (lambda (comments)
            (dolist (cmt comments)
              (unless (ua-comment-safe-p cmt)
-               (error "User Agent comment (~A) contains unsafe characters." cmt)))
+               (config-error "User Agent comment (~A) contains unsafe characters." cmt)))
            (when comments
              (let ((subversion (bl.ser:subversion-with-build-rev comments)))
                (when (> (length subversion) +max-subversion-length+)
-                 (error "Total length of network version string (~D) exceeds maximum length (~D). Reduce the number or size of uacomments."
+                 (config-error "Total length of network version string (~D) exceeds maximum length (~D). Reduce the number or size of uacomments."
                         (length subversion) +max-subversion-length+))
                (setf bl.ser:*user-agent* subversion)))))
 ;; -dustrelayfee: BTC/kvB below which an output is dust (Core
@@ -344,7 +344,7 @@
 (define-option "acceptnonstdtxn" :type :bool
   :apply (lambda (accept)
            (when (and accept (member *network* '(:mainnet)))
-             (error "acceptnonstdtxn is not currently supported for ~(~A~) chain"
+             (config-error "acceptnonstdtxn is not currently supported for ~(~A~) chain"
                     *network*))
            (setf bl.val::*require-standard* (not accept))))
 ;; -par: how many script-check worker threads. Core's semantics -- 0 means

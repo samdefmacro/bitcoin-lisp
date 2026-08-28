@@ -186,10 +186,10 @@ USE-XOR is off — that is a fatal init error, and it needs the path to say so."
         (let ((key (make-array +obfuscation-key-size+ :element-type '(unsigned-byte 8))))
           (with-open-file (s path :element-type '(unsigned-byte 8))
             (unless (= +obfuscation-key-size+ (read-sequence key s))
-              (error "xor.dat must be exactly ~D bytes" +obfuscation-key-size+))
+              (storage-error "xor.dat must be exactly ~D bytes" +obfuscation-key-size+))
             ;; Core rejects a longer file too: the key is fixed-size.
             (when (read-byte s nil nil)
-              (error "xor.dat must be exactly ~D bytes" +obfuscation-key-size+)))
+              (storage-error "xor.dat must be exactly ~D bytes" +obfuscation-key-size+)))
           key)
         (%write-xor-key path
                         (if (and use-xor (%blocksdir-first-run-p dir))
@@ -207,7 +207,7 @@ flatfile.h:37-84)."
 
 (defun make-flat-file-seq (dir prefix chunk-size)
   (when (zerop chunk-size)
-    (error "chunk-size must be positive"))
+    (internal-error "chunk-size must be positive"))
   (%make-flat-file-seq dir prefix chunk-size))
 
 (defun flat-file-name (seq pos)

@@ -8,7 +8,7 @@ For mainnet, data is stored in a 'mainnet' subdirectory.
 For testnet, data stays at the base directory (backward compatible)."
   ;; Validate network parameter
   (unless (member network '(:testnet3 :testnet4 :signet :regtest :mainnet))
-    (error "Invalid network: ~A. Must be :testnet3, :testnet4, :signet, :regtest, or :mainnet." network))
+    (config-error "Invalid network: ~A. Must be :testnet3, :testnet4, :signet, :regtest, or :mainnet." network))
 
   ;; Re-seed the process RNG here, at the head of the only startup path
   ;; (start-node calls init-node before it builds the address book, opens the
@@ -128,11 +128,11 @@ log line of the node itself."
       ;; ENSURE-DIRECTORIES-EXIST alone would have created `foo/` and started
       ;; happily, which is the opposite of what the option means.
       (unless (probe-file (make-pathname :name nil :type nil :defaults path))
-        (error "Could not open debug log file ~A" (namestring path)))
+        (init-error "Could not open debug log file ~A" (namestring path)))
       (ensure-directories-exist path)
       (handler-case (start-file-logging path)
         (error ()
-          (error "Could not open debug log file ~A" (namestring path))))))
+          (init-error "Could not open debug log file ~A" (namestring path))))))
   ;; The level BEFORE the flush below, not 270 lines further down where it used
   ;; to be set: a deferred line is filtered when it is emitted, so flushing
   ;; first would judge every queued line against whatever level the image
@@ -187,7 +187,7 @@ resolvability check (its Step 6)."
   (bl.val:apply-test-activation-heights test-activation-heights)
   (when test-activation-heights
     (unless (eq network :regtest)
-      (error "-testactivationheight is for regression testing (-regtest mode) only"))
+      (config-error "-testactivationheight is for regression testing (-regtest mode) only"))
     (log-warn "Activation heights overridden by -testactivationheight: ~{~A~^ ~}"
               test-activation-heights))
 
@@ -195,9 +195,9 @@ resolvability check (its Step 6)."
   ;; clock before the first RPC can be made. Same regtest gate the RPC has.
   (when mocktime
     (unless (eq network :regtest)
-      (error "-mocktime is for regression testing (-regtest mode) only"))
+      (config-error "-mocktime is for regression testing (-regtest mode) only"))
     (unless (and (integerp mocktime) (<= 0 mocktime))
-      (error "Invalid -mocktime: ~A. Must be a non-negative integer." mocktime))
+      (config-error "Invalid -mocktime: ~A. Must be a non-negative integer." mocktime))
     (setf bl.ser:*mock-time*
           (if (zerop mocktime) nil mocktime))
     (log-info "Mock time set to ~D" mocktime))
@@ -210,7 +210,7 @@ resolvability check (its Step 6)."
   ;; every miss. Computed BEFORE init-node, which is what opens them.
   (when dbcache-mib
     (unless (and (integerp dbcache-mib) (>= dbcache-mib 4))
-      (error "Invalid dbcache-mib: ~A. Must be an integer >= 4." dbcache-mib)))
+      (config-error "Invalid dbcache-mib: ~A. Must be an integer >= 4." dbcache-mib)))
   (let* ((total (if dbcache-mib
                     (* dbcache-mib 1024 1024)
                     bl.store::+default-db-cache-bytes+))
@@ -238,22 +238,22 @@ txindex ~D MiB, per-index ~D MiB"
   ;; process, making e.g. a later loadtxoutset believe the node is pruned).
   (when prune
     (unless (or (= prune 1) (>= prune 550))
-      (error "Invalid prune target: ~A MiB. Must be 1 (manual-only) or >= 550." prune))
+      (config-error "Invalid prune target: ~A MiB. Must be 1 (manual-only) or >= 550." prune))
     (when (and prune txindex)
-      (error "Cannot enable both pruning and txindex. Pruned blocks cannot be looked up."))
+      (config-error "Cannot enable both pruning and txindex. Pruned blocks cannot be looked up."))
     ;; Core refuses the same pair for the spender index, and for the same
     ;; reason: answering a lookup means READING the spending transaction back
     ;; from its block, which a pruned node no longer has (init.cpp, the
     ;; -txospenderindex prune check).
     (when (and prune txospenderindex)
-      (error "Cannot enable both pruning and txospenderindex. Pruned blocks cannot be looked up."))
+      (config-error "Cannot enable both pruning and txospenderindex. Pruned blocks cannot be looked up."))
     ;; Bitcoin Core init.cpp: -prune is incompatible with -reindex-chainstate --
     ;; the wipe leaves the UTXO set to be replayed from stored blocks, but early
     ;; blocks are pruned, so a pruned reindex-chainstate wedges at the first gap.
     (when (and peer-block-filters (not blockfilterindex))
-      (error "Cannot set -peerblockfilters without -blockfilterindex."))
+      (config-error "Cannot set -peerblockfilters without -blockfilterindex."))
     (when (and prune reindex-chainstate)
-      (error "Prune mode is incompatible with -reindex-chainstate (pruned blocks cannot be replayed). Use a full resync instead.")))
+      (config-error "Prune mode is incompatible with -reindex-chainstate (pruned blocks cannot be replayed). Use a full resync instead.")))
   (setf *prune-target-mib* prune)
 
   ;; -port: validate, then make it the single global listen-port override.
@@ -261,7 +261,7 @@ txindex ~D MiB, per-index ~D MiB"
   ;; stale override from a previous run.
   (when port
     (unless (and (integerp port) (<= 1 port 65535))
-      (error "Invalid port specified in -port: '~A'" port)))
+      (config-error "Invalid port specified in -port: '~A'" port)))
   (setf *p2p-port-override* port)
 
   ;; -externalip: validate resolvability up front (Core init errors before
@@ -270,7 +270,7 @@ txindex ~D MiB, per-index ~D MiB"
   ;; otherwise wipe it.
   (dolist (spec bl.net:*external-ips*)
     (unless (bl.net:parse-network-address spec)
-      (error "Cannot resolve -externalip address: '~A'" spec))))
+      (config-error "Cannot resolve -externalip address: '~A'" spec))))
 
 
 (defun %init-datadir-layout (data-directory network migrate-datadir)
@@ -321,7 +321,7 @@ to move them (the node must be stopped)."
   ;; Core -acceptstalefeeestimates is regtest-only (init.cpp:1654-1656).
   (when accept-stale-fee-estimates
     (unless (eq network :regtest)
-      (error "acceptstalefeeestimates is not supported on ~A chain."
+      (config-error "acceptstalefeeestimates is not supported on ~A chain."
              (string-downcase (symbol-name network))))
     (setf bl.mp:*accept-stale-fee-estimates* t))
   ;; -blocksonly: reject transactions from network peers (Core
@@ -374,7 +374,7 @@ to move them (the node must be stopped)."
   (dolist (spec whitelist)
     (let ((entry (bl.net:parse-whitelist-entry spec)))
       (unless entry
-        (error "Invalid netmask, IP address or permission in -whitelist: '~A'" spec))
+        (config-error "Invalid netmask, IP address or permission in -whitelist: '~A'" spec))
       (setf bl.net::*whitelist-entries*
             (append bl.net::*whitelist-entries* (list entry)))))
   (dolist (spec whitebind)
@@ -385,9 +385,9 @@ to move them (the node must be stopped)."
         (bl.net:parse-permission-flags spec)
       (declare (ignore rest))
       (unless flags
-        (error "Invalid permission in -whitebind: '~A'" spec))
+        (config-error "Invalid permission in -whitebind: '~A'" spec))
       (when (member direction '(:out))
-        (error "whitebind may only be used for incoming connections (\"out\" was passed)"))
+        (config-error "whitebind may only be used for incoming connections (\"out\" was passed)"))
       (setf bl.net::*whitebind-flags*
             (logior bl.net::*whitebind-flags* flags))))
   (when (or whitelist whitebind)
@@ -532,7 +532,7 @@ index, -reindex, and the block-store <-> header-index position map."
        (log-error "chainstate.dat is present but unreadable (failed integrity check).")
        (log-error "Refusing to start: replaying over the existing UTXO set would corrupt the chain index.")
        (log-error "Recover by restoring a backup of chainstate.dat, or reindex from the block files.")
-       (error "Corrupt chainstate.dat at ~A" (node-data-directory *node*)))
+       (init-error "Corrupt chainstate.dat at ~A" (node-data-directory *node*)))
       ;; NIL means no chainstate file at all — a legitimate first run.
       ((nil)
        (log-info "No chain state on disk; starting from genesis"))))
@@ -605,7 +605,7 @@ index, -reindex, and the block-store <-> header-index position map."
        (log-error "headerindex.dat is present but unreadable: ~A." corrupt-reason)
        (log-error "Refusing to start: an empty block index would contradict the stored chainstate.")
        (log-error "Recover by restoring a backup of headerindex.dat, or reindex from the block files.")
-       (error "Corrupt headerindex.dat at ~A" (node-data-directory *node*)))
+       (init-error "Corrupt headerindex.dat at ~A" (node-data-directory *node*)))
       ;; No file at all — a legitimate first run.
       (t nil)))
 
@@ -670,7 +670,7 @@ connect."
     (setf *pending-chainstate-recovery* nil)
     (dolist (cs pending)
       (unless (recover-inconsistent-chainstate *node* cs)
-        (error "chainstate inconsistent and unrecoverable: move ~A aside and re-sync"
+        (init-error "chainstate inconsistent and unrecoverable: move ~A aside and re-sync"
                (node-data-directory *node*)))))
 
   ;; Assumeutxo P5: if a persisted historical chainstate already reached the
@@ -812,7 +812,7 @@ anchors (Step 12); the coins-DB tip reconciliation; the indexes (Step 8) and
   (when (eq :unresolvable (reconcile-coins-db-best-block *node*))
     (log-error "Refusing to start: the UTXO set names a block this node cannot place.")
     (log-error "Recover by reindexing from the block files, or restore a backup.")
-    (error "Unplaceable UTXO set in ~A" (node-data-directory *node*)))
+    (init-error "Unplaceable UTXO set in ~A" (node-data-directory *node*)))
 
   ;; Step 8 of Core's init (indexes): open every enabled index and catch it
   ;; up over the blocks already on disk before the sync thread starts.

@@ -37,7 +37,7 @@
 
 ;;; --- RPC Error Condition ---
 
-(define-condition rpc-error (error)
+(define-condition rpc-error (bitcoin-lisp-error)
   ((code :initarg :code :reader rpc-error-code)
    (message :initarg :message :reader rpc-error-message)
    (data :initarg :data :initform nil :reader rpc-error-data))

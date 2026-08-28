@@ -81,7 +81,7 @@
          (il (subseq i 0 32))
          (ir (subseq i 32 64)))
     (unless (< 0 (%be->int il) +secp256k1-order+)
-      (error "invalid seed: master key out of range"))
+      (crypto-error "invalid seed: master key out of range"))
     (make-ext-key :version (if (eq network :mainnet) +xprv-mainnet+ +xprv-testnet+)
                   :chain-code ir
                   :key (concatenate '(vector (unsigned-byte 8)) #(0) il)
@@ -97,7 +97,7 @@ invalid-child case (IL >= n or zero key) — the caller should try the next inde
          (data (if hardened
                    (progn
                      (unless (ext-key-privatep parent)
-                       (error "cannot derive a hardened child from a public key"))
+                       (crypto-error "cannot derive a hardened child from a public key"))
                      (concatenate '(vector (unsigned-byte 8))
                                   (ext-key-key parent) (%u32-be index)))
                    (concatenate '(vector (unsigned-byte 8))
@@ -109,19 +109,19 @@ invalid-child case (IL >= n or zero key) — the caller should try the next inde
          (fp (%fingerprint parent))
          (depth (1+ (ext-key-depth parent))))
     (when (>= il-int +secp256k1-order+)
-      (error "invalid child (IL >= n); try the next index"))
+      (crypto-error "invalid child (IL >= n); try the next index"))
     (if (ext-key-privatep parent)
         ;; CKDpriv: child key = (IL + kpar) mod n
         (let ((ki (mod (+ il-int (%be->int (subseq (ext-key-key parent) 1 33)))
                        +secp256k1-order+)))
-          (when (zerop ki) (error "invalid child (zero key); try the next index"))
+          (when (zerop ki) (crypto-error "invalid child (zero key); try the next index"))
           (make-ext-key :version (ext-key-version parent) :depth depth
                         :parent-fingerprint fp :child-number index :chain-code ir
                         :key (concatenate '(vector (unsigned-byte 8)) #(0) (%int->32be ki))
                         :privatep t))
         ;; CKDpub: child pubkey = Kpar + IL*G
         (let ((kpub (tweak-add-public-key (ext-key-key parent) il)))
-          (unless kpub (error "invalid child public key; try the next index"))
+          (unless kpub (crypto-error "invalid child public key; try the next index"))
           (make-ext-key :version (ext-key-version parent) :depth depth
                         :parent-fingerprint fp :child-number index :chain-code ir
                         :key kpub :privatep nil)))))
@@ -237,7 +237,7 @@ invalid cases (tweak >= n or zero result)."
          ;; effective base point has even Y.
          (d-even (if (= (aref full-pub 0) 2) d (- +secp256k1-order+ d)))
          (tweak (%be->int (tap-tweak-hash p-xonly merkle-root))))
-    (when (>= tweak +secp256k1-order+) (error "invalid taproot tweak (>= n)"))
+    (when (>= tweak +secp256k1-order+) (crypto-error "invalid taproot tweak (>= n)"))
     (let ((out (mod (+ d-even tweak) +secp256k1-order+)))
-      (when (zerop out) (error "invalid taproot output key (zero)"))
+      (when (zerop out) (crypto-error "invalid taproot output key (zero)"))
       (%int->32be out))))

@@ -593,6 +593,56 @@ walker a form list with one repeat."
                 (dolist (topic '("hashtx")) nil))))
       "positive control: the walker must report a repeated name"))
 
+(defparameter +module-error-functions+
+  '("internal-error" "config-error" "init-error" "serialization-error"
+    "storage-error" "net-error" "crypto-error" "wallet-error")
+  "The bl.err signalling functions (P4.1). Calling one instead of ERROR loses
+SBCL's compile-time check that a literal control string and its arguments
+agree, because the keyword form of ERROR they expand to is not checked; the
+scan below does it at test time instead.")
+
+(defun %error-site-arity-mismatches (corpus)
+  "Every (<module>-error \"control\" args...) call in CORPUS whose argument
+count is outside what the control string consumes, as
+(file position needed-min needed-max got). Sites whose form cannot be read
+here (a comma outside its backquote, in a macro body) are skipped; the
+second value counts the sites that were checked."
+  (let ((bad '()) (checked 0) (*read-eval* nil)
+        (*package* (find-package "BITCOIN-LISP.TESTS")))
+    (dolist (entry corpus)
+      (let ((file (car entry)) (text (%lines-text (cdr entry))))
+        (dolist (fn +module-error-functions+)
+          (loop with needle = (format nil "(~A \"" fn)
+                with start = 0
+                for pos = (search needle text :start2 start)
+                while pos
+                do (setf start (1+ pos))
+                   (let ((form (handler-case (read-from-string text t nil :start pos)
+                                 (error () nil))))
+                     (when (and (consp form) (stringp (second form)))
+                       (incf checked)
+                       (multiple-value-bind (min max)
+                           (handler-case
+                               (sb-format::%compiler-walk-format-string (second form) nil)
+                             (error () (values nil nil)))
+                         (let ((got (length (cddr form))))
+                           (when (and min (or (< got min) (> got max)))
+                             (push (list file pos min max got) bad))))))))))
+    (values (nreverse bad) checked)))
+
+(test module-error-sites-match-their-format-strings
+  "Every bl.err signalling call formats its control string with the right
+number of arguments -- the check SBCL did for a bare ERROR and cannot do for
+the keyword form the functions use. The positive control feeds a mismatch."
+  (multiple-value-bind (bad checked) (%error-site-arity-mismatches (%source-corpus))
+    (is (> checked 150) "the scan must see the whole tree, not a handful of sites")
+    (is (null bad)
+        "control string and arguments disagree at: ~{~{~A@~D needs ~D..~D, got ~D~}~^; ~}" bad))
+  (is (equal '(("probe.lisp" 0 2 2 1))
+             (%error-site-arity-mismatches
+              (list (cons "probe.lisp" (vector "(config-error \"~A and ~A\" x)")))))
+      "positive control: a one-argument call to a two-directive string must be reported"))
+
 (test no-new-duplicate-definitions
   "A DEFUN or DEFMACRO name defined in two files is one implementation too
 many, or two things that should not share a name. Either way it is a decision
@@ -714,26 +764,14 @@ byte-buf; the stream codecs and interop's private buffer only lose call sites."
 ;;; --- bare error strings -------------------------------------------------
 
 (defparameter +bare-error-baseline+
-  '(("src/config-options.lisp" . 11)  ; the option rows' own validations
-    ("src/config.lisp" . 15)
-    ("src/crypto/" . 28)
-    ("src/logging.lisp" . 3)
-    ("src/mempool/" . 7)
-    ("src/mining/" . 1)
-    ("src/networking/" . 4)
-    ("src/node/" . 36)
-    ("src/rpc/" . 3)
-    ("src/wallet/" . 11)
-    ("src/serialization/" . 49)   ; 4 are macroexpansion-time errors in message-macro.lisp
-    ("src/storage/" . 16)
-    ("src/util/" . 7)
-    ("src/validation/" . 3)
-    ("src/zmq.lisp" . 1))
+  '()
   "Count of (error \"...\") -- a string where a condition type belongs -- per
 top-level src/ directory (or file, for src/*.lisp) at the start of the
 cleanup. A place not listed tolerates none. A string cannot be handled
 selectively or mapped to an RPC error code; the plan introduces a condition
-hierarchy (§4 P4) and these only go down.")
+hierarchy (§4 P4) and these only go down. Zero everywhere since P4.1: every
+site signals a BITCOIN-LISP.CONDITIONS class through its function of the same
+name -- (config-error \"...\") -- with the message text unchanged.")
 
 (defun %bare-error-census ()
   "Alist of top-level src/ directory (or file) to its (error \"...\") count."
@@ -752,7 +790,7 @@ hierarchy (§4 P4) and these only go down.")
   (loop for (place . now) in (%bare-error-census)
         do (%ratchet-down place now
                           (or (cdr (assoc place +bare-error-baseline+ :test #'string=)) 0)
-                          "+BARE-ERROR-BASELINE+" "define or reuse a condition type")))
+                          "+BARE-ERROR-BASELINE+" "signal it through the module's bl.err function")))
 
 ;;; --- layering -------------------------------------------------------------
 
@@ -906,6 +944,11 @@ the measuring functions must measure a known shape correctly."
   (is (plusp (length (%definitions-longer-than +longish-function-lines+)))
       "no long definitions found -- a sweep that finds nothing proves nothing")
   (is (plusp (length (%layering-violations))) "no upward references found")
+  (is (equal '(("probe.lisp" . 1))
+             (let ((*source-corpus* (list (cons "probe.lisp"
+                                                (vector "(defun f () (error \"x\"))")))))
+               (%bare-error-census)))
+      "positive control: the bare-error census must see a bare (error \"...\")")
   (is (equal '(("probe.lisp" . 2))
              (let ((*source-corpus* (list (cons "probe.lisp"
                                                 (vector "(defun f (network)"

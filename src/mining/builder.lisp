@@ -115,7 +115,7 @@ assembly against synthetic chain states with no coins view)."
       (multiple-value-bind (ok reason)
           (bl.val:test-block-validity block chain-state utxo-set)
         (unless ok
-          (error "TestBlockValidity failed on assembled block at height ~D: ~A"
+          (internal-error "TestBlockValidity failed on assembled block at height ~D: ~A"
                  (block-template-height template) reason))))
     (values block template)))
 

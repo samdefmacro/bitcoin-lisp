@@ -1,7 +1,7 @@
 
 
 (defpackage #:bitcoin-lisp
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:use #:bitcoin-lisp.crypto)
   (:use #:bitcoin-lisp.serialization)
   (:use #:bitcoin-lisp.storage)

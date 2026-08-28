@@ -229,7 +229,7 @@ algorithm with XOR throughout."
   "A mod M, by repeated subtraction of shifted multiples. Subtraction is XOR."
   (let* ((a (copy-seq a))
          (dm (%ms-poly-degree m)))
-    (when (< dm 0) (error "division by the zero polynomial"))
+    (when (< dm 0) (internal-error "division by the zero polynomial"))
     (let ((lead-inv (ms-inv (aref m dm))))
       (loop for da = (%ms-poly-degree a)
             while (>= da dm)
