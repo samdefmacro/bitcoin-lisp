@@ -49,6 +49,9 @@
     ;; ui.lisp; xref records calls from named functions only.
     "bitcoin-lisp.nicknames:install-package-nicknames"
     "bitcoin-lisp.rpc:register-http-surface"
+    ;; Called by DEFINE-OPTION's expansion and the option table's own
+    ;; top-level loops (config-options.lisp) -- registration at load time.
+    "bitcoin-lisp.config:register-config-option"
     "bitcoin-lisp.crypto:bip324-cipher-initialized-p"
     "bitcoin-lisp.crypto:ellswift-decode"
     "bitcoin-lisp.crypto:muhash-combine"

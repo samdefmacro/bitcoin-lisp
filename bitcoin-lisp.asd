@@ -51,6 +51,22 @@ bitcoin-lisp.logging, which the main package :USEs and re-exports."
   :pathname "src"
   :components ((:file "logging")))
 
+(defsystem "bitcoin-lisp/config"
+  :description "The option registry (DEFINE-OPTION) and the parsers for the
+command line, bitcoin.conf, settings.json and option values -- Core's
+common/args.cpp, config.cpp and settings.cpp without the option table,
+which the chain above supplies (src/config-options.lisp)."
+  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "bitcoin-lisp/logging" "yason")
+  :pathname "src"
+  :serial t
+  :components ((:file "config/package")
+               (:module "config"
+                :components ((:file "registry")   ; the table's mechanism, and reading a value its way
+                             (:file "values")     ; one option value: ints, bools, money, hex, proxies, binds
+                             (:file "args")       ; the command line
+                             (:file "conf")       ; bitcoin.conf
+                             (:file "settings"))))) ; settings.json
+
 (defsystem "bitcoin-lisp/kv"
   :description "Persistence primitives: the LevelDB binding, flat file
 sequences with XOR obfuscation, the datadir layout, fsync. Package
@@ -162,6 +178,7 @@ this same package."
   :depends-on ("bitcoin-lisp/util"
                "bitcoin-lisp/crypto"
                "bitcoin-lisp/logging"
+               "bitcoin-lisp/config"
                "bitcoin-lisp/kv"
                "bitcoin-lisp/serialization"
                "bitcoin-lisp/storage"
@@ -195,7 +212,6 @@ this same package."
                  (:file "package")
                  ;; util first: byte I/O that the script interpreter's
                  ;; sighash code inlines must be loaded before src/coalton/.
-                 (:file "option-registry")
                  (:file "config")
                  (:file "zmq")
                  (:module "coalton"

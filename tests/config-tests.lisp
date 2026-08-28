@@ -1860,7 +1860,7 @@ depending on which parser saw it."
   "Core logs the JSON VALUE it stored, not the string the option readers see:
 a negation is `false`, a bare -flag is the empty string, and -flag=x is the
 string \"x\" (args.cpp:105-126, 880-884)."
-  (let ((cells (bl::%cli-arg-log-cells
+  (let ((cells (bl.cfg:cli-arg-log-cells
                 (list "-nolisten" "-prune=550" "-txindex"))))
     (is (string= "false" (cdr (assoc "listen" cells :test #'string=))))
     (is (string= "\"550\"" (cdr (assoc "prune" cells :test #'string=))))

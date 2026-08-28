@@ -1484,7 +1484,7 @@ Only KNOWN options are logged for the config file and the command line — Core
 skips anything GetArgFlags does not recognise (args.cpp:880-884) — while EVERY
 settings-file entry is logged, known or not."
   (dolist (text conf-texts)
-    (dolist (cell (bl::%config-arg-log-cells text network))
+    (dolist (cell (bl.cfg:config-arg-log-cells text network))
       (destructuring-bind (section name json) cell
         (when (known-config-option-p name)
           (defer-log :info "Config file arg: ~:[~;[~:*~A] ~]~A=~A"
@@ -1492,7 +1492,7 @@ settings-file entry is logged, known or not."
   (dolist (cell settings-cells)
     (defer-log :info "Setting file arg: ~A = ~A"
                (car cell) (bl:render-json-value (cdr cell))))
-  (dolist (cell (bl::%cli-arg-log-cells args))
+  (dolist (cell (bl.cfg:cli-arg-log-cells args))
     (when (known-config-option-p (car cell))
       (defer-log :info "Command-line arg: ~A=~A" (car cell) (cdr cell)))))
 

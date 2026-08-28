@@ -2,6 +2,9 @@
 
 (defpackage #:bitcoin-lisp
   (:use #:cl #:bitcoin-lisp.conditions #:bitcoin-lisp.logging)
+  ;; The option registry and the configuration parsers; the option table
+  ;; (config-options.lisp) and the node's glue (config.lisp) build on them.
+  (:use #:bitcoin-lisp.config)
   (:use #:bitcoin-lisp.crypto)
   (:use #:bitcoin-lisp.serialization)
   (:use #:bitcoin-lisp.storage)
