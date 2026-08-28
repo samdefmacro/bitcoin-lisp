@@ -58,11 +58,16 @@ not tell you). Add a file to the sub-system that owns its directory, not to
 the main system's `src` module. The main package re-exports what it inherits
 from these layers (`bl:log-info`, `bl:*network*`, `bl:*prune-target-mib*`,
 `bl:*interrupt-check*`, `bl:make-rate-limiter`, `bl:parse-cli-args` keep working); tests reach a layer's internals through its own package
-(`bl.log::`, `bl.kv::`). Shared test fixtures (temp directories, `with-network`,
-`make-test-node`) live in `tests/support/` (package `bitcoin-lisp.test-support`,
-`:use`d by the tests package): put a fixture there the moment a second test
-file wants it, and never export an internal only a test uses (the `::` count
-over tests/ is a ratchet; an orphan export is a failure). `docs/manual.lisp` is the PAX manual: one section per
+(`bl.log::`, `bl.kv::`). `tests/` mirrors `src/`: a test lives in the directory of the sub-system it
+would travel with if that layer were extracted (`tests/networking/`,
+`tests/storage/`, ...), and only what belongs to no single module stays at
+the top (the ratchets, the cross-cutting suites, the manual network
+scripts). Shared fixtures (temp directories, `with-network`,
+`make-test-node`, the chain builders) live in `tests/support/` (package
+`bitcoin-lisp.test-support`, `:use`d by the tests package): put a fixture
+there the moment a SECOND test file wants it, move it verbatim, and never
+export an internal only a test uses (the `::` count over tests/ is a
+ratchet; an orphan export is a failure). `docs/manual.lisp` is the PAX manual: one section per
 layer with its Core files, entry points, invariants and traps -- read a
 module's section before touching it, and keep it true when you rename or
 remove an entry point (`scripts/dev.sh docs-check` locates every reference
