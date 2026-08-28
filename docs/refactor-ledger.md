@@ -42,6 +42,7 @@ src/; cold = cold-battery check count / failures.
 | 2026-08-28 | P2f-1 | define-option registry (src/config-options.lisp): 4 option lists + an inline list of 15 → one table of 192 rows; known/repeatable/core-only/scalar/collected all answered from it | 0 | 12 | 61 | 42 | 8 | 205 | 15 | 6,764 | 34,432 / 0 (fresh) |
 | 2026-08-28 | P2f-2 | option rows carry :global/:apply/:min; apply-config-globals 388 → 2 steps (table walk + a 113-line apply-parameter-interactions); registry mechanism split into src/option-registry.lisp, the table loads after the modules it names | 0 | 11 | 61 | 42 | 8 | 195 | 11 | 6,764 | 34,432 / 0 (fresh) |
 | 2026-08-28 | P3.1 | node.lisp (6,477 lines) → src/node/ ×21 files by concern (params … init), pure move, same package; source-text tests read the directory | 0 | 11 | 61 | 42 | 8 | 195 | 11 | 6,753 | 34,453 / 0 (fresh) |
+| 2026-08-28 | P3.2 | start-node 1,227 → 169 lines: 12 named init steps (%init-logging … %start-network-services) + %sync-thread-loop; each step takes only the keywords it reads | 0 | 11 | 63 | 42 | 8 | 195 | 11 | 6,753 | 34,453 / 0 (fresh) |
 
 ## Notes
 
