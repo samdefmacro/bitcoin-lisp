@@ -1,9 +1,58 @@
-(in-package #:bitcoin-lisp)
+(defpackage #:bitcoin-lisp.logging
+  (:documentation "The node's log: levels, categories (Core -debug), the
+in-memory ring buffer, the file stream, the rate limiter, the lines deferred
+from before the log file exists, and the -*notify shell hooks. A layer of
+its own (bitcoin-lisp/logging): nothing above the util layer exists while it
+compiles. BITCOIN-LISP :USEs it and re-exports the entry points, so every
+caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
+  (:use #:cl #:bitcoin-lisp.conditions)
+  (:local-nicknames (#:bt #:bordeaux-threads))
+  (:export
+   #:*category-log-levels*
+   #:*current-log-level*
+   #:*deferred-log-lines*
+   #:*log-buffer*
+   #:*log-buffer-count*
+   #:*log-buffer-index*
+   #:*log-file-stream*
+   #:*log-lock*
+   #:*log-rate-limit*
+   #:*log-rate-locations*
+   #:*log-rate-window-start*
+   #:*log-stream*
+   #:*log-suppressions-active*
+   #:*log-thread-names*
+   #:*log-time-micros*
+   #:+log-buffer-size+
+   #:+log-categories+
+   #:apply-log-categories
+   #:category-log-level
+   #:clear-category-log-levels
+   #:defer-log
+   #:disable-log-category
+   #:enable-log-category
+   #:flush-deferred-log-lines
+   #:log-cat
+   #:log-category-enabled-p
+   #:log-category-known-p
+   #:log-debug
+   #:log-error
+   #:log-info
+   #:log-level-value
+   #:log-warn
+   #:node-log
+   #:run-notify-command
+   #:set-category-log-level))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (bitcoin-lisp.nicknames:install-package-nicknames))
+
+(in-package #:bitcoin-lisp.logging)
 
 ;;;; Logging
 ;;;;
 ;;;; Logging infrastructure for the Bitcoin node.
-;;;; This file must be loaded before any modules that use log-debug/log-info/etc.
+;;;; Loaded (as its own ASDF system) before any module that logs.
 
 (defvar *log-stream* nil
   "Stream for log output. NIL means logs only go to buffer.")

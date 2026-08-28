@@ -951,13 +951,13 @@ occurrence would silently drop every override but one."
 (defmacro %with-clean-log-categories (&body body)
   "Run BODY with every logging category off, and restore them afterwards."
   `(let ((saved (remove-if-not #'bl:log-category-enabled-p
-                               bl::+log-categories+)))
+                               bl.log::+log-categories+)))
      (unwind-protect
           (progn (bl:apply-log-categories
-                  nil (copy-list bl::+log-categories+))
+                  nil (copy-list bl.log::+log-categories+))
                  ,@body)
        (bl:apply-log-categories
-        nil (copy-list bl::+log-categories+))
+        nil (copy-list bl.log::+log-categories+))
        (bl:apply-log-categories saved nil))))
 
 (test debug-categories-are-applied-in-core-s-order
@@ -969,8 +969,8 @@ and it is the exact pair Core's own test framework passes to every node."
                (bl:apply-log-categories '("net" "mempool") '("net"))))
     ;; "all" and a bare -debug (empty value) enable everything.
     (dolist (spelling '("all" "1" ""))
-      (bl:apply-log-categories nil (copy-list bl::+log-categories+))
-      (is (= (length bl::+log-categories+)
+      (bl:apply-log-categories nil (copy-list bl.log::+log-categories+))
+      (is (= (length bl.log::+log-categories+)
              (length (bl:apply-log-categories (list spelling) nil)))
           "~S did not enable every category" spelling))
     ;; ...minus the exclusions, which are applied after.
@@ -1024,31 +1024,31 @@ category AND did not raise the level: it did nothing whatsoever."
   "-logtimemicros appends a microsecond fraction and -logthreadnames inserts
 the writing thread's name, as Core does. Asserted on the formatted line rather
 than on the flags, since the flag existing is not the feature."
-  (let ((plain (let ((bl::*log-time-micros* nil)
-                     (bl::*log-thread-names* nil))
-                 (bl::format-log-entry :info "hello ~A" '(1)))))
+  (let ((plain (let ((bl.log::*log-time-micros* nil)
+                     (bl.log::*log-thread-names* nil))
+                 (bl.log::format-log-entry :info "hello ~A" '(1)))))
     ;; No level tag: Core prints none on an uncategorized info line
     ;; (BCLog::LogPrefix). The message follows the timestamp directly.
     (is-true (search "] hello 1" plain))
     (is-false (search "INFO" plain))
     ;; [YYYY-MM-DD HH:MM:SS] with no fraction
     (is-false (search "." (subseq plain 0 (1+ (position #\] plain))))))
-  (let ((micros (let ((bl::*log-time-micros* t)
-                      (bl::*log-thread-names* nil))
-                  (bl::format-log-entry :info "hello" '()))))
+  (let ((micros (let ((bl.log::*log-time-micros* t)
+                      (bl.log::*log-thread-names* nil))
+                  (bl.log::format-log-entry :info "hello" '()))))
     (is-true (find #\. (subseq micros 0 (1+ (position #\] micros))))
              "no microsecond fraction in ~S" micros))
-  (let ((named (let ((bl::*log-time-micros* nil)
-                     (bl::*log-thread-names* t))
-                 (bl::format-log-entry :info "hello" '()))))
+  (let ((named (let ((bl.log::*log-time-micros* nil)
+                     (bl.log::*log-thread-names* t))
+                 (bl.log::format-log-entry :info "hello" '()))))
     ;; A second bracketed field appears after the timestamp. Two, not three:
     ;; an info line carries no level tag of its own.
     (is (= 2 (count #\[ named)) "thread name missing from ~S" named))
   ;; And with a level that DOES print a tag, the thread name sits between the
   ;; timestamp and it — Core's order.
-  (let ((named-warn (let ((bl::*log-time-micros* nil)
-                          (bl::*log-thread-names* t))
-                      (bl::format-log-entry :warn "hello" '()))))
+  (let ((named-warn (let ((bl.log::*log-time-micros* nil)
+                          (bl.log::*log-thread-names* t))
+                      (bl.log::format-log-entry :warn "hello" '()))))
     (is (= 3 (count #\[ named-warn)) "expected timestamp, thread and level in ~S"
         named-warn)
     (is-true (search "[warning] hello" named-warn))))
@@ -1202,7 +1202,7 @@ wallet name (%VALID-WALLET-NAME-P already holds those to [A-Za-z0-9._-]), so
 refusing anything outside that set costs nothing and closes the route. Core
 instead shell-escapes %w and substitutes the rest raw."
   (flet ((sub (command &rest pairs)
-           (bl::%notify-substitute command pairs)))
+           (bl.log::%notify-substitute command pairs)))
     (is (equal "echo deadbeef" (sub "echo %s" (cons #\s "deadbeef"))))
     ;; Every occurrence, as ReplaceAll does.
     (is (equal "a beef b beef c" (sub "a %s b %s c" (cons #\s "beef"))))
@@ -1251,12 +1251,12 @@ immediately; -blocknotify is detached, so it is polled for."
          (progn
            (ensure-directories-exist dir)
            ;; Waited: the file must exist the moment the call returns.
-           (bl::run-notify-command
+           (bl.log::run-notify-command
             (format nil "touch ~A" (namestring marker)) :wait t)
            (is-true (probe-file marker) "a waited notify command did not run")
            ;; And the hash substitution reaches the command line.
            (let ((hashed (merge-pathnames "deadbeef" dir)))
-             (bl::run-notify-command
+             (bl.log::run-notify-command
               (format nil "touch ~A%s" (namestring dir)) :value "deadbeef" :wait t)
              (is-true (probe-file hashed)
                       "%s was not substituted into the executed command")))
@@ -1264,8 +1264,8 @@ immediately; -blocknotify is detached, so it is polled for."
                                                     :if-does-not-exist :ignore))))
   ;; A failing hook is logged, never signalled: it must not fail whatever
   ;; triggered it.
-  (is-true (bl::run-notify-command "exit 1" :wait t))
-  (is-false (bl::run-notify-command "echo %s" :value "not hex")))
+  (is-true (bl.log::run-notify-command "exit 1" :wait t))
+  (is-false (bl.log::run-notify-command "echo %s" :value "not hex")))
 
 (test pid-file-is-written-and-removed
   "-pid (Core CreatePidFile/RemovePidFile, init.cpp:178-208). Asserted through

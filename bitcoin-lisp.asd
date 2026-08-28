@@ -42,6 +42,14 @@ util layer for chain parameters (bech32 HRPs) only."
                              (:file "address")
                              (:file "bip32")))))
 
+(defsystem "bitcoin-lisp/logging"
+  :description "The node's log (levels, Core-style categories, ring buffer,
+file stream, rate limiter, deferred lines, notify hooks): package
+bitcoin-lisp.logging, which the main package :USEs and re-exports."
+  :depends-on ("bitcoin-lisp/util" "bordeaux-threads")
+  :pathname "src"
+  :components ((:file "logging")))
+
 (defsystem "bitcoin-lisp"
   :version "0.1.0"
   :author "samdefmacro"
@@ -49,6 +57,7 @@ util layer for chain parameters (bech32 HRPs) only."
   :description "Bitcoin full node implementation in Common Lisp"
   :depends-on ("bitcoin-lisp/util"
                "bitcoin-lisp/crypto"
+               "bitcoin-lisp/logging"
                "ironclad"
                "nibbles"
                "cffi"
@@ -80,7 +89,6 @@ util layer for chain parameters (bech32 HRPs) only."
                  (:file "package")
                  ;; util first: byte I/O that the script interpreter's
                  ;; sighash code inlines must be loaded before src/coalton/.
-                 (:file "logging")
                  (:file "option-registry")
                  (:file "config")
                  (:file "zmq")

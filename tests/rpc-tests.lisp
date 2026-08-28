@@ -5899,12 +5899,12 @@ missing file or non-string path errors."
 (test rpc-logging-toggles-categories
   "logging reports every category and enables/disables via include/exclude, with
 all/none and unknown-category handling."
-  (clrhash bl::*debug-categories*)
+  (clrhash bl.log::*debug-categories*)
   (unwind-protect
        (let ((node (make-test-node)))
          ;; default: all categories present, none enabled
          (let ((r (bl.rpc::rpc-logging node nil)))
-           (is (= (length bl::+log-categories+) (length r)))
+           (is (= (length bl.log::+log-categories+) (length r)))
            (is (assoc "net" r :test #'string=))
            ;; category states are JSON booleans — false, never null (wave 10)
            (is (eq 'yason:false (cdr (assoc "net" r :test #'string=)))))
@@ -5924,25 +5924,25 @@ all/none and unknown-category handling."
          ;; unknown category errors
          (signals bl.rpc::rpc-error
            (bl.rpc::rpc-logging node (list (list "boguscat") nil))))
-    (clrhash bl::*debug-categories*)))
+    (clrhash bl.log::*debug-categories*)))
 
 (test log-cat-respects-category-state
   "log-cat emits a debug line only when its category is enabled (independent of
 the global level threshold)."
-  (clrhash bl::*debug-categories*)
+  (clrhash bl.log::*debug-categories*)
   (unwind-protect
        (let ((s (make-string-output-stream)))
-         (let ((bl::*log-stream* s)
-               (bl::*current-log-level* :info))  ; debug normally hidden
+         (let ((bl.log::*log-stream* s)
+               (bl.log::*current-log-level* :info))  ; debug normally hidden
            (bl:log-cat "net" "MARKER-DISABLED-~D" 1)   ; off -> nothing
-           (bl::enable-log-category "net")
+           (bl.log::enable-log-category "net")
            (bl:log-cat "net" "MARKER-ENABLED-~D" 2)    ; on -> emitted
            (bl:log-cat "mempool" "MARKER-OTHER-~D" 3)) ; still off
          (let ((out (get-output-stream-string s)))
            (is (null (search "MARKER-DISABLED" out)))
            (is (search "MARKER-ENABLED" out))
            (is (null (search "MARKER-OTHER" out)))))
-    (clrhash bl::*debug-categories*)))
+    (clrhash bl.log::*debug-categories*)))
 
 ;;; --- Cluster mempool RPCs (P9: entry chunk fields, getmempoolcluster,
 ;;; getmempoolfeeratediagram — Core rpc/mempool.cpp:413-506/609-650/829-862) ---
