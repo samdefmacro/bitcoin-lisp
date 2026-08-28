@@ -8,7 +8,7 @@
 ;;;; The option table (Core ArgsManager::AddArg, init.cpp / common/args.cpp)
 ;;;
 ;;; One DEFINE-OPTION per option bitcoind accepts; the mechanism and the
-;;; questions the table answers are in src/option-registry.lisp. Rows with
+;;; questions the table answers are in src/config/registry.lisp. Rows with
 ;;; :KEY / :COLLECT feed start-node keywords; rows with :GLOBAL / :APPLY set
 ;;; process-global specials from APPLY-CONFIG-GLOBALS; :KIND :SELECTOR rows
 ;;; are consumed by the network / entry-point logic and :CORE-ONLY rows
@@ -377,9 +377,9 @@
 ;; a start-node keyword.
 (dolist (topic '("hashblock" "hashtx" "rawblock" "rawtx" "sequence"))
   (register-config-option
-   (%make-config-option :name (format nil "zmqpub~A" topic) :kind :global))
+   (make-config-option :name (format nil "zmqpub~A" topic) :kind :global))
   (register-config-option
-   (%make-config-option :name (format nil "zmqpub~Ahwm" topic) :kind :global)))
+   (make-config-option :name (format nil "zmqpub~Ahwm" topic) :kind :global)))
 
 ;;; --- Accepted, not implemented ---------------------------------------------
 ;;; Extracted from Core's AddArg registrations (init.cpp, common/args.cpp,

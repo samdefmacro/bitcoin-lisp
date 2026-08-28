@@ -22,7 +22,7 @@ default-OFF on mainnet (config flag `-wallet`); testnet4 first.
 Cross-package references use the package-local nicknames installed by
 `src/util/package.lisp` (`bitcoin-lisp.nicknames:*package-nicknames*`): `bl:` for the top
 package, `bl.err`, `bl.log`, `bl.kv`, `bl.bytes`, `bl.chain`, `bl.ctx`, `bl.rl`, `bl.crypto`,
-`bl.ser`, `bl.store`, `bl.val`, `bl.mp`, `bl.mining`, `bl.net`, `bl.rpc`, `bl.wallet`, `bl.interop`,
+`bl.ser`, `bl.store`, `bl.val`, `bl.mp`, `bl.mining`, `bl.net`, `bl.rpc`, `bl.wallet`, `bl.cfg`, `bl.interop`,
 `bl.script`, `bl.ctypes`,
 `bl.cser`, `bl.cbin`, `bl.ccrypto`, `bl.tests`. Write `bl.ser:transaction-inputs`,
 never the full name. A branch that predates the nicknames rebases and runs
@@ -37,7 +37,11 @@ package's nicknames, and this call restores them.
 `bitcoin-lisp.asd` defines the layers below the node as separate systems the
 main `bitcoin-lisp` system `:depends-on`, loaded in this order:
 `bitcoin-lisp/util` (nicknames, conditions, byte I/O, chain parameters incl.
-`*network*`, node-context), `/crypto`, `/logging` (package `bl.log`), `/kv`
+`*network*`, node-context, the token bucket), `/crypto`, `/logging` (package
+`bl.log`), `/config` (the option registry `define-option` and the CLI /
+bitcoin.conf / settings.json / option-value parsers; package `bl.cfg`; the
+option TABLE `src/config-options.lisp` and the node globals in
+`src/config.lisp` stay in the main system), `/kv`
 (LevelDB, flat files, datadir, fsync; package `bl.kv`), `/serialization`,
 `/storage` (incl. the pruning policy knobs), `/net` (the transport half of
 `src/networking/`: sockets, SOCKS5, BIP324, BIP155, addrman, Tor control;
@@ -53,7 +57,7 @@ its own `:depends-on` (the warm image already has everything loaded and will
 not tell you). Add a file to the sub-system that owns its directory, not to
 the main system's `src` module. The main package re-exports what it inherits
 from these layers (`bl:log-info`, `bl:*network*`, `bl:*prune-target-mib*`,
-`bl:*interrupt-check*`, `bl:make-rate-limiter` keep working); tests reach a layer's internals through its own package
+`bl:*interrupt-check*`, `bl:make-rate-limiter`, `bl:parse-cli-args` keep working); tests reach a layer's internals through its own package
 (`bl.log::`, `bl.kv::`).
 
 ## The development loop (cl-workbench managed, containerized warm image)

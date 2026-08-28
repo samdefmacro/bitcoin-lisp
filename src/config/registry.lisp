@@ -1,4 +1,4 @@
-(in-package #:bitcoin-lisp)
+(in-package #:bitcoin-lisp.config)
 
 ;;;; The option registry (Core ArgsManager::AddArg, init.cpp / common/args.cpp)
 ;;;
@@ -12,11 +12,12 @@
 ;;; process-global special does it set (APPLY-CONFIG-GLOBALS), and is it
 ;;; accepted-but-unimplemented (SUPPLIED-CORE-ONLY-OPTIONS).
 ;;;
-;;; This file loads before config.lisp (which reads the table); the table
-;;; itself loads after it, so a row's :APPLY function can name any special
-;;; or parser without a forward reference.
+;;; This file is the first code of the bitcoin-lisp/config sub-system; the
+;;; table itself (src/config-options.lisp) loads in the main system, after
+;;; every layer, so a row's :APPLY function can name any special or parser
+;;; without a forward reference.
 
-(defstruct (config-option (:constructor %make-config-option))
+(defstruct (config-option (:constructor make-config-option))
   (name "" :type string)
   (key nil :type (or null keyword))        ; start-node keyword of a scalar
   (type nil :type (or null keyword))       ; see PARSE-OPTION-VALUE
@@ -76,7 +77,7 @@ is given, :GLOBAL otherwise."
     (when (and repeatable global) (bad "a repeatable option sets its special through :apply"))
     (when (and (or global apply) key) (bad "a :key option is applied by start-node, not here")))
   `(register-config-option
-    (%make-config-option :name ,name :key ,key :type ,type :min ,min :collect ,collect
+    (make-config-option :name ,name :key ,key :type ,type :min ,min :collect ,collect
                          :repeatable ,(and repeatable t)
                          :kind ,(if kind-p kind (if (or key collect) :start-node :global))
                          :global ',global
@@ -127,3 +128,44 @@ definition order."
 special or an :apply function, in definition order."
   (remove-if-not (lambda (o) (or (config-option-global o) (config-option-apply o)))
                  *config-options*))
+
+;;; Reading a value the table's way, and applying the :GLOBAL rows.
+
+(defun parse-option-value (option raw)
+  "RAW, the string value of OPTION, parsed by the option's :TYPE. The error
+texts are Core's: \"Invalid amount for -x=v\" for a fee that ParseMoney
+rejects, \"Invalid value for -x=v (must be a positive integer)\" for an
+:int below its :MIN."
+  (let ((name (config-option-name option)))
+    (ecase (config-option-type option)
+      ((nil :string) raw)
+      (:bool (conf-parse-bool raw))
+      (:int (let ((n (conf-parse-int raw))
+                  (min (config-option-min option)))
+              (when (and min (< n min))
+                (config-error "Invalid value for -~A=~A (must be a ~A integer)"
+                       name raw (if (zerop min) "non-negative" "positive")))
+              n))
+      (:money (or (conf-parse-money raw)
+                  (config-error "Invalid amount for -~A=~A" name raw)))
+      (:hex (bl.crypto:hex-to-bytes raw))
+      (:byte-units (conf-parse-byte-units raw))
+      (:loglevel (conf-parse-loglevel raw))
+      (:loglevel-global (conf-parse-loglevel-global raw)))))
+
+(defun apply-option-globals (merged)
+  "Apply every :GLOBAL / :APPLY row of the option table to the MERGED config
+alist, in table order: a present scalar option sets its special (or is
+handed to its function) parsed by PARSE-OPTION-VALUE; a repeatable option's
+function always runs, with the list of every raw value."
+  (dolist (option (global-options))
+    (let ((name (config-option-name option)))
+      (if (config-option-repeatable option)
+          (funcall (config-option-apply option)
+                   (loop for (k . v) in merged when (string= k name) collect v))
+          (let ((cell (assoc name merged :test #'string=)))
+            (when cell
+              (let ((value (parse-option-value option (cdr cell))))
+                (if (config-option-global option)
+                    (setf (symbol-value (config-option-global option)) value)
+                    (funcall (config-option-apply option) value)))))))))
