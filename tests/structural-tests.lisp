@@ -672,25 +672,38 @@ to make on purpose, so the set is pinned."
     ("rpc-sendall" . 289)                        ; wallet/wallet-spend.lisp
     ("validate-transaction-for-mempool" . 358)   ; validation/transaction.lisp
     ("run-ibd" . 345)                            ; networking/ibd.lisp (+2: keeps node-context peers live, P2c)
-    ("validate-block" . 307)                     ; validation/block.lisp
     ("process-received-block" . 300)             ; networking/ibd.lisp
     ("ms-from-script" . 243)                     ; validation/miniscript.lisp
     ("connect-block" . 215)                      ; validation/block.lisp
     ("activate-block" . 214))                    ; validation/block.lisp
   "(name . lines) of every top-level definition over +LONG-FUNCTION-LINES+ at
-the start of the cleanup. Each is a phase-3 target
+the start of the cleanup, less the ones since split. VALIDATE-BLOCK left the
+list in P6a, which made Core's CheckBlock/ContextualCheckBlock boundary a
+function boundary here too instead of a keyword flag. Each remaining entry is
+a phase-3 target
 (docs/refactoring-plan-2026-08-27.md §4 P3): START-NODE becomes Core's
 thirteen init steps, PERFORM-REORG becomes DisconnectTip/ConnectTip/
 ActivateBestChainStep, and so on. The line count is pinned too, so an entry
 may shrink but not grow while it waits its turn.")
 
-(defparameter +longish-function-ceiling+ 63
+(defparameter +longish-function-ceiling+ 64
   "How many definitions may exceed +LONGISH-FUNCTION-LINES+ lines. Lower it
 when the count drops; the test says so. Raised 61 -> 63 by P3.2, which turned
 the 1,227-line start-node into named init steps: three of them are 100-170
 lines (start-node's own docstring and lambda list, %init-load-chain, and the
-sync thread's %sync-idle-tick after P3.2b) and the count resumes going down
-from here.")
+sync thread's %sync-idle-tick after P3.2b).
+
+Raised 63 -> 64 by P6a, and the arithmetic there is worth stating because it
+recurs for every remaining split: VALIDATE-BLOCK was 307 lines and became
+%CHECK-BLOCK (107) plus %CONTEXTUAL-CHECK-BLOCK (191), so one entry over the
+LONG threshold became two over the LONGISH one. Splitting a function along
+Core's boundaries lowers the >200 count and RAISES this one whenever both
+halves are still substantial -- and Core's own halves are: PreChecks is 198
+lines, ConnectTip 104, ActivateBestChain 167, ConnectBlock 379,
+CreateTransactionInternal 376. Driving this number to the plan's target of 15
+would mean cutting well below Core's own decomposition, which costs the
+file-by-file comparison that is this project's main verification method. See
+docs/refactoring-plan-2026-08-27.md 6b.")
 
 (defun %definitions-longer-than (lines)
   (sort (remove-if-not (lambda (d) (> (%def-length d) lines)) (%toplevel-definitions))
