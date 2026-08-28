@@ -1281,9 +1281,9 @@ keeps an unrelated lone address in its own group."
 ;;; RBF fee-bump (bumpfee / psbtbumpfee): hermetic regtest round-trips.
 ;;;
 ;;; wallet-tests.lisp loads BEFORE wallet-chain/spend-tests, so their
-;;; %with-wallet-chain-node / %ws-fund-wallet fixtures are not yet defined here;
+;;; with-wallet-chain-node / %ws-fund-wallet fixtures are not yet defined here;
 ;;; this section carries its own %pp-* equivalents built on the
-;;; %regtest-node-fixture + %with-regtest primitives (mining-tests.lisp).
+;;; regtest-node-fixture + %with-regtest primitives (mining-tests.lisp).
 ;;; ==============================================================
 
 (defvar *pp-counter* 0)
@@ -1295,7 +1295,7 @@ keeps an unrelated lone address in its own group."
 (defun %pp-fixture (suffix &key (keypool 5))
   "A regtest node at genesis with a wallet manager + genesis block stored."
   (let* ((id (format nil "~A-~D-~D" suffix (get-universal-time) (incf *pp-counter*)))
-         (node (%regtest-node-fixture (format nil "pp-~A" id)))
+         (node (regtest-node-fixture (format nil "pp-~A" id)))
          (wallet-dir (merge-pathnames (format nil "pp-wallet-~A/" id)
                                       (uiop:temporary-directory))))
     (bl.store:store-block

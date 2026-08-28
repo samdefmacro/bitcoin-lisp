@@ -53,3 +53,15 @@ BIP34 at height 1)."
     (setf (bl::node-mempool node)
           (bl.mp:make-mempool))
     node))
+
+;;;; Reproducible randomness
+
+(defun make-deterministic-rng (seed)
+  "Deterministic xorshift64 PRNG closure: (funcall rng n) => [0, n). No
+dependence on the global *random-state*, so runs are reproducible."
+  (let ((state seed))
+    (lambda (n)
+      (setf state (ldb (byte 64 0) (logxor state (ash state 13))))
+      (setf state (logxor state (ash state -7)))
+      (setf state (ldb (byte 64 0) (logxor state (ash state 17))))
+      (mod state n))))

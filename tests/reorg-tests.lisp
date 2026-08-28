@@ -266,69 +266,20 @@ DisconnectTip iterates from active tip backwards via pindex->pprev."
 ;;;; competing-fork block, chain-state's tip and the UTXO set reflect
 ;;;; the new fork, which means perform-reorg ran before validate.
 
-(defun %use-activate-block-test-base-path (suffix)
-  (ensure-directories-exist
-   (merge-pathnames (format nil "test-activate-block-~A/" suffix)
-                    (uiop:temporary-directory))))
-
 ;; make-reorg-test-block was replaced by the unified make-reorg-test-block
 ;; (persistence-tests.lisp) — that helper now derives script-sig from
 ;; block-hash and computes a real merkle root, so it satisfies both the
 ;; direct-connect-block path (older tests) and the activate-block / full
 ;; validate-block path (these tests) without per-test duplication.
 
-(defun %make-activate-block-fixture (suffix &optional view)
-  "Returns (values chain-state utxo-set block-store genesis-hash). The
-genesis index entry has a dummy header so validate-block's MTP walk
-doesn't trip on a NIL header. VIEW overrides the default in-memory
-utxo-set (pass a coins-view-cache to exercise the LevelDB surface)."
-  (let* ((base-path (%use-activate-block-test-base-path suffix))
-         (chain-state (bl.store:init-chain-state base-path))
-         (utxo-set (or view (bl.store:make-utxo-set)))
-         (block-store (bl.store:init-block-store base-path))
-         (genesis-hash (bl.store:best-block-hash chain-state))
-         (genesis-header
-           (bl.ser:make-block-header
-            :version 1
-            :prev-block (make-array 32 :element-type '(unsigned-byte 8)
-                                       :initial-element 0)
-            :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
-                                        :initial-element 0)
-            :timestamp 1231006505 :bits #x1d00ffff :nonce 0
-            :cached-hash genesis-hash)))
-    (clrhash bl.val::*block-undo-data*)
-    (bl.store:add-block-index-entry
-     chain-state
-     (bl.store:make-block-index-entry
-      :hash genesis-hash :height 0 :chain-work 1 :status :valid
-      :header genesis-header))
-    (values chain-state utxo-set block-store genesis-hash)))
-
-(defun %build-and-connect (chain-state block-store utxo-set genesis-hash hashes)
-  "Build a chain of coinbase-only blocks from GENESIS-HASH using HASHES,
-connecting each via connect-block. Returns the list of (block . index-entry)
-pairs in connect order."
-  (let ((prev-hash genesis-hash)
-        (results '()))
-    (loop for h from 1
-          for block-hash in hashes
-          do (let ((block (make-reorg-test-block prev-hash block-hash h)))
-               (bl.val:connect-block
-                block chain-state block-store utxo-set)
-               (push (cons block (bl.store:get-block-index-entry
-                                  chain-state block-hash))
-                     results)
-               (setf prev-hash block-hash)))
-    (nreverse results)))
-
 (test activate-block-extends-current-tip
   "When the incoming block's parent IS the current tip, activate-block
 should extend the chain normally."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "extends-tip")
+       (make-activate-block-fixture "extends-tip")
     ;; Build chain A: genesis → A1 → A2.
-    (%build-and-connect chain-state block-store utxo-set genesis-hash
+    (build-and-connect chain-state block-store utxo-set genesis-hash
                         (make-test-chain-hashes #xA0 2))
     (is (= 2 (bl.store:current-height chain-state)))
     ;; Build A3 extending the tip; receive it via activate-block.
@@ -352,9 +303,9 @@ activate-block should pre-reorg to the new fork and then activate the
 block. Chain tip should land on the new fork's tip."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "stronger-fork")
+       (make-activate-block-fixture "stronger-fork")
     ;; Chain A: genesis → A1 → A2. Active.
-    (%build-and-connect chain-state block-store utxo-set genesis-hash
+    (build-and-connect chain-state block-store utxo-set genesis-hash
                         (make-test-chain-hashes #xA0 2))
     (let ((a-tip-hash (bl.store:best-block-hash chain-state)))
       ;; Pre-build chain B: genesis → B1 → B2 (both stored + indexed but
@@ -407,9 +358,9 @@ blocks with apply-block-to-utxo-set and NO validate-block — so a more-work for
 block into the chainstate."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "reorg-invalid-fork")
+       (make-activate-block-fixture "reorg-invalid-fork")
     ;; Chain A: genesis -> A1 -> A2. Active and valid.
-    (%build-and-connect chain-state block-store utxo-set genesis-hash
+    (build-and-connect chain-state block-store utxo-set genesis-hash
                         (make-test-chain-hashes #xA0 2))
     (let ((a-tip-hash (bl.store:best-block-hash chain-state))
           (a-utxo-count (bl.store:utxo-count utxo-set)))
@@ -466,9 +417,9 @@ total work doesn't exceed current tip's, activate-block returns
 update the chain tip."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "weaker-fork")
+       (make-activate-block-fixture "weaker-fork")
     ;; Chain A has 3 blocks.
-    (%build-and-connect chain-state block-store utxo-set genesis-hash
+    (build-and-connect chain-state block-store utxo-set genesis-hash
                         (make-test-chain-hashes #xA0 3))
     (let ((a-tip-hash (bl.store:best-block-hash chain-state)))
       (is (= 3 (bl.store:current-height chain-state)))
@@ -498,9 +449,9 @@ update the chain tip."
 activate-block returns :unknown-parent without doing anything."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "unknown-parent")
+       (make-activate-block-fixture "unknown-parent")
     (declare (ignore genesis-hash))
-    (%build-and-connect chain-state block-store utxo-set
+    (build-and-connect chain-state block-store utxo-set
                         (bl.store:best-block-hash chain-state)
                         (make-test-chain-hashes #xA0 1))
     (let* ((mystery-prev (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xCC))
@@ -521,10 +472,10 @@ activate-block returns :unknown-parent without doing anything."
 reconsider-block clears the flags and reorgs back to the best valid chain."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "invalidate")
+       (make-activate-block-fixture "invalidate")
      ;; genesis -> A1 -> A2 -> A3
      (let ((hashes (make-test-chain-hashes #xA0 3)))
-       (%build-and-connect chain-state block-store utxo-set genesis-hash hashes)
+       (build-and-connect chain-state block-store utxo-set genesis-hash hashes)
        (is (= 3 (bl.store:current-height chain-state)))
        (let ((a2-hash (second hashes)))
          ;; invalidate A2 -> chain reorgs back to A1 (height 1); A2 + A3 invalid
@@ -559,9 +510,9 @@ competitors don't displace it (strict-> fork choice), and it can flip between
 equal-work forks."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "precious")
+       (make-activate-block-fixture "precious")
      (let ((a-hashes (make-test-chain-hashes #xA0 1)))
-       (%build-and-connect chain-state block-store utxo-set genesis-hash a-hashes)
+       (build-and-connect chain-state block-store utxo-set genesis-hash a-hashes)
        (let* ((a1-hash (first a-hashes))
               (a1-entry (bl.store:get-block-index-entry chain-state a1-hash))
               (genesis-entry (bl.store:get-block-index-entry chain-state genesis-hash))
@@ -604,8 +555,8 @@ equal-work forks."
 the block store."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "verifychain")
-     (%build-and-connect chain-state block-store utxo-set genesis-hash
+       (make-activate-block-fixture "verifychain")
+     (build-and-connect chain-state block-store utxo-set genesis-hash
                          (make-test-chain-hashes #x70 3))
      (let ((node (bl::make-node)))
        (setf (bl::node-chain-state node) chain-state)
@@ -618,8 +569,8 @@ the block store."
 test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "chaintxstats")
-     (%build-and-connect chain-state block-store utxo-set genesis-hash
+       (make-activate-block-fixture "chaintxstats")
+     (build-and-connect chain-state block-store utxo-set genesis-hash
                          (make-test-chain-hashes #x71 3))
      (let ((node (bl::make-node)))
        (setf (bl::node-chain-state node) chain-state)
@@ -648,8 +599,8 @@ store, so its zeroed tx-count is backfilled definitionally (exactly its
 coinbase) instead of being dropped as unreadable."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "chaintxstats-genesis")
-     (%build-and-connect chain-state block-store utxo-set genesis-hash
+       (make-activate-block-fixture "chaintxstats-genesis")
+     (build-and-connect chain-state block-store utxo-set genesis-hash
                          (make-test-chain-hashes #x72 3))
      ;; Simulate a v1-loaded index: genesis entry's tx-count is 0.
      (let ((genesis-entry (bl.store:get-block-index-entry
@@ -708,9 +659,9 @@ and returned as MISSING so it gets re-downloaded witness-complete — instead of
 failing the reorg forever and wedging the node (testnet4 stuck ~1800 blocks behind)."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "prune-stripped")
+       (make-activate-block-fixture "prune-stripped")
      ;; Active chain A: genesis -> A1 -> A2.
-     (%build-and-connect chain-state block-store utxo-set genesis-hash
+     (build-and-connect chain-state block-store utxo-set genesis-hash
                          (make-test-chain-hashes #xA0 2))
      (let* ((a2-entry (bl.store:get-block-index-entry
                        chain-state (bl.store:best-block-hash chain-state)))
@@ -761,8 +712,8 @@ Live on 2026-08-19: testnet4 held tip 149110 for 40+ minutes while a
 fully-downloaded 149120 branch with strictly more work lay on disk."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "activate-best")
-     (%build-and-connect chain-state block-store utxo-set genesis-hash
+       (make-activate-block-fixture "activate-best")
+     (build-and-connect chain-state block-store utxo-set genesis-hash
                          (make-test-chain-hashes #xA0 2))
      (let* ((a2-hash (bl.store:best-block-hash chain-state))
             (a2-entry (bl.store:get-block-index-entry chain-state a2-hash))
@@ -840,7 +791,7 @@ what keeps the test free of the shutdown machinery — the real function would
 ask the node to stop."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "stopatheight-seam")
+       (make-activate-block-fixture "stopatheight-seam")
      (unwind-protect
           (let ((seen '())
                 (real (symbol-function 'bl:maybe-stop-at-height)))
@@ -897,8 +848,8 @@ reconsiderblock RPC. Drive the real run-ibd (no peers, so nothing else can
 move the tip) and require that the heavier downloaded fork gets activated."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "run-ibd-wiring")
-     (%build-and-connect chain-state block-store utxo-set genesis-hash
+       (make-activate-block-fixture "run-ibd-wiring")
+     (build-and-connect chain-state block-store utxo-set genesis-hash
                          (make-test-chain-hashes #xA0 2))
      (let ((fork-tip (%stage-heavier-downloaded-fork
                       chain-state block-store genesis-hash)))
@@ -925,7 +876,7 @@ no argument to forget -- so this binds *NODE* the way a live node has it and
 asserts the marker, which is the thing that was wrong."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "run-ibd-txindex")
+       (make-activate-block-fixture "run-ibd-txindex")
      (let* ((txdir (ensure-directories-exist
                     (merge-pathnames (format nil "test-txidx-activate-~D/"
                                              (get-internal-real-time))
@@ -933,7 +884,7 @@ asserts the marker, which is the thing that was wrong."
             (txindex (bl.store:init-tx-index txdir)))
        (unwind-protect
             (progn
-              (%build-and-connect chain-state block-store utxo-set genesis-hash
+              (build-and-connect chain-state block-store utxo-set genesis-hash
                                   (make-test-chain-hashes #xA0 2))
               (let ((fork-tip (%stage-heavier-downloaded-fork
                                chain-state block-store genesis-hash)))
@@ -980,8 +931,8 @@ has to come first and the floor has to prune. Behaviourally: nothing at or
 below the floor is ever returned."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "bvt-floor")
-     (%build-and-connect chain-state block-store utxo-set genesis-hash
+       (make-activate-block-fixture "bvt-floor")
+     (build-and-connect chain-state block-store utxo-set genesis-hash
                          (make-test-chain-hashes #xA0 2))
      (let* ((tip (bl.store:get-block-index-entry
                   chain-state (bl.store:best-block-hash chain-state)))
@@ -1027,7 +978,7 @@ undo is legitimate) are exempt. The refusal is a DISTINCT keyword, not the
 missing-block list."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "corrupt-undo")
+       (make-activate-block-fixture "corrupt-undo")
      (let* ((genesis-entry (bl.store:get-block-index-entry chain-state genesis-hash))
             (a-hashes (make-test-chain-hashes #xA0 2))
             (a1-hash (first a-hashes)) (a2-hash (second a-hashes))
@@ -1086,7 +1037,7 @@ its pre-existing pool child; a disconnected tx whose inputs are gone on the
 new chain is dropped and its pool spender removed with it (Core
 removeRecursive, validation.cpp:317-321)."
   (multiple-value-bind (utxo-set mempool chain-state funding)
-      (%pkg-fixture)
+      (make-package-fixture)
     (let* ((graph (bl.mp:mempool-graph mempool))
            ;; dtx: spends the confirmed funding output, paying ZERO fee.
            (dtx (%pkg-tx funding 0 100000000))
@@ -1124,7 +1075,7 @@ BIP68 checks (Core PreChecks CheckFinalTxAtTip runs unconditionally,
 validation.cpp:819). Previously the re-add path skipped finality entirely,
 letting a premature tx re-enter the pool and get mined."
   (multiple-value-bind (utxo-set mempool chain-state funding)
-      (%pkg-fixture)
+      (make-package-fixture)
     (let* ((locked (bl.ser:make-transaction
                     :version 1
                     :inputs (vector (bl.ser:make-tx-in
@@ -1134,7 +1085,7 @@ letting a premature tx re-enter the pool and get mined."
                                      :sequence 0))   ; locktime enforced
                     :outputs (vector (bl.ser:make-tx-out
                                       :value 99990000
-                                      :script-pubkey (%p2sh-optrue-spk)))
+                                      :script-pubkey (p2sh-optrue-script-pubkey)))
                     :lock-time 500))                 ; height 500 > next block 201
            (lid (bl.ser:transaction-hash locked)))
       (bl.val::readd-disconnected-txs-to-mempool
@@ -1192,7 +1143,7 @@ stale block; (c) the startup catch-up scan is idempotent under upsert
 semantics and re-points entries left stale by a crash."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "txidx-remined")
+       (make-activate-block-fixture "txidx-remined")
      (let* ((txdir (ensure-directories-exist
                     (merge-pathnames (format nil "test-txidx-reorg-~D/" (get-internal-real-time))
                                      (uiop:temporary-directory))))
@@ -1334,7 +1285,7 @@ no time/blocktime fields are present; a tx on the active chain gets normal
 confirmations."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "txidx-rpc")
+       (make-activate-block-fixture "txidx-rpc")
      (let* ((txdir (ensure-directories-exist
                     (merge-pathnames (format nil "test-txidx-rpc-~D/" (get-internal-real-time))
                                      (uiop:temporary-directory))))
@@ -1399,7 +1350,7 @@ too-low-fee, or missing-inputs can become valid at the next block.
 Previously only the reorg path cleared it."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "wave8-rejects-clear")
+       (make-activate-block-fixture "wave8-rejects-clear")
      (let ((rejects (bl:make-rejects-filter 100))
            (cached (make-array 32 :element-type '(unsigned-byte 8)
                                   :initial-element 77)))
@@ -1427,7 +1378,7 @@ Previously only the reorg path cleared it."
 whose absolute locktime the new (shorter) chain no longer satisfies is
 removed WITH its descendants — the re-add loop only vets the disconnected
 blocks' txs, never what already sat in the pool."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* (;; LOCKED entered the pool while the tip was high enough; the
            ;; reorg leaves the tip at 200, so locktime 350 > next block 201.
            (locked (bl.ser:make-transaction
@@ -1439,7 +1390,7 @@ blocks' txs, never what already sat in the pool."
                                      :sequence 0))   ; locktime enforced
                     :outputs (vector (bl.ser:make-tx-out
                                       :value 99990000
-                                      :script-pubkey (%p2sh-optrue-spk)))
+                                      :script-pubkey (p2sh-optrue-script-pubkey)))
                     :lock-time 350))
            (lid (bl.ser:transaction-hash locked))
            ;; a pool child of the locked tx: removed as a descendant
@@ -1450,7 +1401,7 @@ blocks' txs, never what already sat in the pool."
            (ok-tx (%pkg-tx funding2 0 99990000))
            (okid (bl.ser:transaction-hash ok-tx)))
       (bl.store:add-utxo utxo-set funding2 0 100000000
-                                     (%p2sh-optrue-spk) 1 :coinbase nil)
+                                     (p2sh-optrue-script-pubkey) 1 :coinbase nil)
       (is (eq :ok (%add-tx mempool locked :fee 10000 :height 200)))
       (is (eq :ok (%add-tx mempool child :fee 10000 :height 200)))
       (is (eq :ok (%add-tx mempool ok-tx :fee 10000 :height 200)))
@@ -1467,7 +1418,7 @@ blocks' txs, never what already sat in the pool."
 removed (Core filter_final_and_mature, validation.cpp:368-379): maturity is
 COINBASE_MATURITY at the NEXT block. A spend of a still-mature coinbase
 stays."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (declare (ignore funding))
     (let* ((cb-young (make-reorg-hash 4320))     ; coinbase @ 150: age 51 < 100
            (cb-old (make-reorg-hash 4321))       ; coinbase @ 90: age 111 >= 100
@@ -1476,9 +1427,9 @@ stays."
            (spend-old (%pkg-tx cb-old 0 99990000))
            (oid (bl.ser:transaction-hash spend-old)))
       (bl.store:add-utxo utxo-set cb-young 0 100000000
-                                     (%p2sh-optrue-spk) 150 :coinbase t)
+                                     (p2sh-optrue-script-pubkey) 150 :coinbase t)
       (bl.store:add-utxo utxo-set cb-old 0 100000000
-                                     (%p2sh-optrue-spk) 90 :coinbase t)
+                                     (p2sh-optrue-script-pubkey) 90 :coinbase t)
       (is (eq :ok (%add-tx mempool spend-young :fee 10000 :height 200)))
       (is (eq :ok (%add-tx mempool spend-old :fee 10000 :height 200)))
       ;; New tip 200 -> spend height 201: 201-150 = 51 < 100 immature;
@@ -1492,7 +1443,7 @@ stays."
   "A pool entry whose BIP68 height lock the new chain no longer satisfies is
 removed: Core re-tests lockpoints against the new tip
 (validation.cpp:350-366). A lock already deep enough stays."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (declare (ignore funding))
     (let* ((coin1 (make-reorg-hash 4330))
            (coin2 (make-reorg-hash 4331))
@@ -1504,9 +1455,9 @@ removed: Core re-tests lockpoints against the new tip
            (ok-tx (%pkg-tx coin2 0 99990000 :sequence 40))
            (okid (bl.ser:transaction-hash ok-tx)))
       (bl.store:add-utxo utxo-set coin1 0 100000000
-                                     (%p2sh-optrue-spk) 150 :coinbase nil)
+                                     (p2sh-optrue-script-pubkey) 150 :coinbase nil)
       (bl.store:add-utxo utxo-set coin2 0 100000000
-                                     (%p2sh-optrue-spk) 150 :coinbase nil)
+                                     (p2sh-optrue-script-pubkey) 150 :coinbase nil)
       (is (eq :ok (%add-tx mempool locked :fee 10000 :height 200)))
       (is (eq :ok (%add-tx mempool ok-tx :fee 10000 :height 200)))
       (bl.val::readd-disconnected-txs-to-mempool
@@ -1519,7 +1470,7 @@ removed: Core re-tests lockpoints against the new tip
 re-filter — so a disconnected tx that is itself non-final under the new tip
 is caught even though the filter, not the re-add validation, is what sees
 the pool child it would strand. A re-added final tx survives the filter."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((dtx (%pkg-tx funding 0 100000000))   ; zero-fee, final: re-adds
            (did (bl.ser:transaction-hash dtx)))
       (bl.val::readd-disconnected-txs-to-mempool
@@ -1563,10 +1514,10 @@ WITHOUT connecting it. Returns the mined block."
 (so a fork block validated at the wrong tip height is not spuriously rejected),
 while the pure block-integrity checks still run."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "cfo"))
+   (let* ((node (regtest-node-fixture "cfo"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
-          (spk (%p2sh-optrue-spk))
+          (spk (p2sh-optrue-script-pubkey))
           (now (bl.ser:get-unix-time))
           ;; A valid, mined height-1 block on genesis.
           (block (%dr-mine-on node spk)))
@@ -1607,18 +1558,18 @@ by tip-validation), and the branch must win via reorg once it outweighs the
 active chain. Old code rejected the fork blocks (BAD-COINBASE-HEIGHT, since
 their height != tip+1) and never reorged."
   (with-network (:regtest)
-   (let* ((spk-a (%p2sh-optrue-spk))
+   (let* ((spk-a (p2sh-optrue-script-pubkey))
           ;; A distinct coinbase spk so branch B's blocks differ from A's.
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))  ; bare OP_TRUE
           ;; Throwaway node to build branch B (4 blocks on genesis), capturing
           ;; the block objects.
-          (nb (%regtest-node-fixture "dr-b"))
+          (nb (regtest-node-fixture "dr-b"))
           (b-blocks (loop repeat 4
                           for blk = (%dr-mine-on nb spk-b)
                           do (%dr-connect nb blk)
                           collect blk))
           ;; Main node: branch A, 3 blocks on the same genesis.
-          (na (%regtest-node-fixture "dr-a"))
+          (na (regtest-node-fixture "dr-a"))
           (csa (bl::node-chain-state na))
           (utxoa (bl::node-utxo-set na))
           (storea (bl::node-block-store na)))
@@ -1663,11 +1614,11 @@ with duplicate inputs, CVE-2018-17144) is rejected before storage rather than
 being stored and only caught later in perform-reorg. A well-formed block still
 passes context-free."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "cfo-ct"))
+   (let* ((node (regtest-node-fixture "cfo-ct"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
           (now (bl.ser:get-unix-time))
-          (block (%dr-mine-on node (%p2sh-optrue-spk)))
+          (block (%dr-mine-on node (p2sh-optrue-script-pubkey)))
           (coinbase (first (bl.ser:bitcoin-block-transactions block))))
      ;; Baseline: the valid coinbase-only block passes context-free.
      (is-true (bl.val:validate-block
@@ -1705,14 +1656,14 @@ list as its second value, so the download path (accept-downloaded-block) can
 re-queue them. Regression for the testnet4 deep-reorg wedge: the compact/relay
 path swallowed this signal and never re-requested the sub-tip fork blocks."
   (with-network (:regtest)
-   (let* ((spk-a (%p2sh-optrue-spk))
+   (let* ((spk-a (p2sh-optrue-script-pubkey))
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
           ;; Branch B (4 blocks) built on a throwaway node; capture the blocks.
-          (nb (%regtest-node-fixture "requeue-b"))
+          (nb (regtest-node-fixture "requeue-b"))
           (b-blocks (loop repeat 4 for blk = (%dr-mine-on nb spk-b)
                           do (%dr-connect nb blk) collect blk))
           ;; Main node: capture genesis, then branch A (3 blocks). Tip = A3.
-          (na (%regtest-node-fixture "requeue-a"))
+          (na (regtest-node-fixture "requeue-a"))
           (csa (bl::node-chain-state na))
           (utxoa (bl::node-utxo-set na))
           (storea (bl::node-block-store na))
@@ -1757,12 +1708,12 @@ blocks to download and never fork-A blocks; a peer at our own tip yields nothing
 This is why the node downloads the chains its peers actually serve instead of
 fixating on a fork no connected peer has."
   (with-network (:regtest)
-   (let* ((spk-a (%p2sh-optrue-spk))
+   (let* ((spk-a (p2sh-optrue-script-pubkey))
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
-          (nb (%regtest-node-fixture "l5-b"))
+          (nb (regtest-node-fixture "l5-b"))
           (b-blocks (loop repeat 5 for blk = (%dr-mine-on nb spk-b)
                           do (%dr-connect nb blk) collect blk))
-          (na (%regtest-node-fixture "l5-a"))
+          (na (regtest-node-fixture "l5-a"))
           (csa (bl::node-chain-state na))
           (storea (bl::node-block-store na))
           (genesis-hash (bl.store:best-block-hash csa)))
@@ -1887,12 +1838,12 @@ Fork-B index works are hand-set so B's cumulative work crosses the tip's
 only at B4 (equal-bits regtest blocks always cross exactly at tip+1, which
 would let the ordinary tip+1 path preempt the scenario)."
   (with-network (:regtest)
-   (let* ((spk-a (%p2sh-optrue-spk))
+   (let* ((spk-a (p2sh-optrue-script-pubkey))
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
-          (nb (%regtest-node-fixture "drc-b"))
+          (nb (regtest-node-fixture "drc-b"))
           (b-blocks (loop repeat 4 for blk = (%dr-mine-on nb spk-b)
                           do (%dr-connect nb blk) collect blk))
-          (na (%regtest-node-fixture "drc-a"))
+          (na (regtest-node-fixture "drc-a"))
           (csa (bl::node-chain-state na))
           (storea (bl::node-block-store na))
           (utxoa (bl::node-utxo-set na))
@@ -1965,9 +1916,9 @@ drain-block-queue connects it from disk via disk-blocks-above-tip once the
 tip reaches its parent — pre-fix the block was silently re-downloaded (or,
 post-persist without the fallback, stranded on disk forever)."
   (with-network (:regtest)
-   (let* ((spk-a (%p2sh-optrue-spk))
-          (na (%regtest-node-fixture "ddf-a"))
-          (nb (%regtest-node-fixture "ddf-b"))
+   (let* ((spk-a (p2sh-optrue-script-pubkey))
+          (na (regtest-node-fixture "ddf-a"))
+          (nb (regtest-node-fixture "ddf-b"))
           (csa (bl::node-chain-state na))
           (storea (bl::node-block-store na))
           (utxoa (bl::node-utxo-set na))
@@ -2059,16 +2010,16 @@ the retry, not eager arrival-time activation, is what performs the reorg."
   (with-network (:regtest)
    (let* ((spk-g (coerce '(#x51) '(vector (unsigned-byte 8))))       ; OP_TRUE
           (spk-h (coerce '(#x52) '(vector (unsigned-byte 8))))       ; OP_2 — distinct
-          (spk-a (%p2sh-optrue-spk))                                 ; distinct from both
+          (spk-a (p2sh-optrue-script-pubkey))                                 ; distinct from both
           ;; Distinct coinbase scripts per fork so deterministic regtest mining
           ;; produces genuinely different blocks (same spk => identical hashes).
-          (ng (%regtest-node-fixture "cand-g"))          ; fork G, fully stored
+          (ng (regtest-node-fixture "cand-g"))          ; fork G, fully stored
           (g-blocks (loop repeat 3 for blk = (%dr-mine-on ng spk-g)
                           do (%dr-connect ng blk) collect blk))
-          (nh (%regtest-node-fixture "cand-h"))          ; fork H, only top stored
+          (nh (regtest-node-fixture "cand-h"))          ; fork H, only top stored
           (h-blocks (loop repeat 5 for blk = (%dr-mine-on nh spk-h)
                           do (%dr-connect nh blk) collect blk))
-          (na (%regtest-node-fixture "cand-a"))
+          (na (regtest-node-fixture "cand-a"))
           (csa (bl::node-chain-state na))
           (storea (bl::node-block-store na))
           (utxoa (bl::node-utxo-set na))
@@ -2127,8 +2078,8 @@ the retry, not eager arrival-time activation, is what performs the reorg."
 ;;;; download, AcceptBlock persist gate, deep-reorg candidate set, witness-
 ;;;; strip guard). Every test is deterministic and hermetic — synthetic index
 ;;;; topologies or deterministic regtest mining, no Bitcoin Core test vectors.
-;;;; Reuses the layer-5 fixtures (with-network (:regtest), %regtest-node-fixture,
-;;;; %dr-mine-on/%dr-connect, %make-activate-block-fixture, make-reorg-test-block,
+;;;; Reuses the layer-5 fixtures (with-network (:regtest), regtest-node-fixture,
+;;;; %dr-mine-on/%dr-connect, make-activate-block-fixture, make-reorg-test-block,
 ;;;; make-stripped-reorg-block, make-reorg-hash). Synthetic peers advertise
 ;;;; NODE_NETWORK|NODE_WITNESS or the per-peer walk's service guard skips them.
 ;;;; ===========================================================================
@@ -2142,9 +2093,9 @@ hash). The invalid signal is an over-value coinbase (:coinbase-too-large), the
 same deterministic fork failure as reorg-rejects-fork-carrying-invalid-block."
   (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
-       (%make-activate-block-fixture "l5-invalid-cand")
+       (make-activate-block-fixture "l5-invalid-cand")
      ;; Active chain A: a single block A1 on genesis (tip height 1).
-     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
+     (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
      (let* ((a1-hash (bl.store:best-block-hash cs))
             (a1-entry (bl.store:get-block-index-entry cs a1-hash))
             (a1-work (bl.store:block-index-entry-chain-work a1-entry))
@@ -2198,12 +2149,12 @@ re-queues the missing (hash . height) blocks into pending (queue-missing-fork-
 blocks) and records the winner as a reorg CANDIDATE (recoverable) — never in the
 rejected set. The active tip is untouched until the bodies arrive."
   (with-network (:regtest)
-   (let* ((spk-a (%p2sh-optrue-spk))
+   (let* ((spk-a (p2sh-optrue-script-pubkey))
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
-          (nb (%regtest-node-fixture "l5-refuse-b"))
+          (nb (regtest-node-fixture "l5-refuse-b"))
           (b-blocks (loop repeat 4 for blk = (%dr-mine-on nb spk-b)
                           do (%dr-connect nb blk) collect blk))
-          (na (%regtest-node-fixture "l5-refuse-a"))
+          (na (regtest-node-fixture "l5-refuse-a"))
           (csa (bl::node-chain-state na))
           (utxoa (bl::node-utxo-set na))
           (storea (bl::node-block-store na))
@@ -2258,9 +2209,9 @@ stripped copy of a REQUESTED block re-enters pending so a witness-complete copy 
 re-fetched; an unsolicited stripped copy does not."
   (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
-       (%make-activate-block-fixture "l5-stripped")
+       (make-activate-block-fixture "l5-stripped")
      ;; Active chain A: two blocks, tip A2 at height 2.
-     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 2))
+     (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 2))
      (let* ((a2-hash (bl.store:best-block-hash cs))
             (a2-entry (bl.store:get-block-index-entry cs a2-hash))
             (genesis-entry (bl.store:get-block-index-entry cs genesis-hash))
@@ -2574,9 +2525,9 @@ BLOCK_FAILED_CHILD'd, the reorg rolls back, and ANCESTORS on the fork stay
 recoverable (:header-valid). Directly exercises the perform-reorg poisoning hook."
   (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
-       (%make-activate-block-fixture "item14-phaseb")
+       (make-activate-block-fixture "item14-phaseb")
      ;; Active chain A: A1 is the tip (height 1), fully valid.
-     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
+     (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
      (let* ((a1-hash (bl.store:best-block-hash cs))
             (a1-entry (bl.store:get-block-index-entry cs a1-hash))
             (genesis-entry (bl.store:get-block-index-entry cs genesis-hash))
@@ -2638,12 +2589,12 @@ recoverable (:header-valid). Directly exercises the perform-reorg poisoning hook
 the per-peer walk at an :invalid block (Core FindNextBlocks) — blocks BELOW it are
 still offered, the invalid block and everything above it are never re-requested."
   (with-network (:regtest)
-   (let* ((spk-a (%p2sh-optrue-spk))
+   (let* ((spk-a (p2sh-optrue-script-pubkey))
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
-          (nb (%regtest-node-fixture "item14-walk-b"))
+          (nb (regtest-node-fixture "item14-walk-b"))
           (b-blocks (loop repeat 5 for blk = (%dr-mine-on nb spk-b)
                           do (%dr-connect nb blk) collect blk))
-          (na (%regtest-node-fixture "item14-walk-a"))
+          (na (regtest-node-fixture "item14-walk-a"))
           (csa (bl::node-chain-state na))
           (storea (bl::node-block-store na))
           (genesis-hash (bl.store:best-block-hash csa)))
@@ -2691,7 +2642,7 @@ still offered, the invalid block and everything above it are never re-requested.
 is admitted marked :invalid (so its own descendants are recognized) but is NEVER
 queued for download; a header on a valid parent is still admitted normally."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "item14-fc"))
+   (let* ((node (regtest-node-fixture "item14-fc"))
           (cs (bl::node-chain-state node))
           (genesis-hash (bl.store:best-block-hash cs))
           (genesis-entry (bl.store:get-block-index-entry cs genesis-hash))
@@ -2737,9 +2688,9 @@ fork stays recoverable once the bodies arrive. Poisoning here would re-wedge the
 node (the exact class of bug this project has fought)."
   (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
-       (%make-activate-block-fixture "item14-neg-missing")
+       (make-activate-block-fixture "item14-neg-missing")
      ;; Active chain A: A1 -> A2 (tip height 2), bodies on disk.
-     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 2))
+     (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 2))
      (let* ((a2-hash (bl.store:best-block-hash cs))
             (a2-entry (bl.store:get-block-index-entry cs a2-hash))
             (genesis-entry (bl.store:get-block-index-entry cs genesis-hash))
@@ -2780,7 +2731,7 @@ is missing/corrupt (:corrupt-undo) is TRANSIENT — a LOCAL fault, not a verdict
 the fork. It marks NOTHING :invalid; the competing fork stays recoverable."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "item14-neg-corrupt")
+       (make-activate-block-fixture "item14-neg-corrupt")
      (let* ((genesis-entry (bl.store:get-block-index-entry chain-state genesis-hash))
             (a-hashes (make-test-chain-hashes #xA0 2))
             (a1-hash (first a-hashes)) (a2-hash (second a-hashes))
@@ -2833,7 +2784,7 @@ the fork. It marks NOTHING :invalid; the competing fork stays recoverable."
 ;;;; Median-time-past on the reorg path (GA8 S1-7)
 
 (defconstant +mtp-reorg-genesis-time+ 1231006505
-  "Timestamp of the genesis header %make-activate-block-fixture installs.")
+  "Timestamp of the genesis header make-activate-block-fixture installs.")
 
 (test perform-reorg-refuses-mtp-violating-fork-block
   "CONSENSUS (GA8 S1-7): perform-reorg connects fork blocks with :skip-header t,
@@ -2846,9 +2797,9 @@ Control: the same block through validate-block WITHOUT :skip-header is
 :time-too-old, so the fixture genuinely violates the rule."
   (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
-       (%make-activate-block-fixture "mtp-fork")
+       (make-activate-block-fixture "mtp-fork")
      ;; Active chain A: A1 is the tip at height 1.
-     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
+     (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
      (let* ((a1-hash (bl.store:best-block-hash cs))
             (a1-entry (bl.store:get-block-index-entry cs a1-hash))
             (genesis-entry (bl.store:get-block-index-entry cs genesis-hash))
@@ -2906,8 +2857,8 @@ straight to perform-reorg, so an MTP-violating block can be the reorg TIP.
 The reorg must refuse and reconsiderblock report :reorg-failed."
   (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
-       (%make-activate-block-fixture "mtp-reconsider")
-     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
+       (make-activate-block-fixture "mtp-reconsider")
+     (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
      (let* ((a1-hash (bl.store:best-block-hash cs))
             (a1-entry (bl.store:get-block-index-entry cs a1-hash))
             (genesis-entry (bl.store:get-block-index-entry cs genesis-hash))
@@ -2954,12 +2905,12 @@ per block, so connect-block leaves it inactive). VIEW defaults to a plain
 utxo-set; pass a coins-view-cache to exercise the best-block pointer.
 Returns (values chain-state view block-store a-entries b-entries)."
   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-      (%make-activate-block-fixture suffix view)
+      (make-activate-block-fixture suffix view)
     (values chain-state utxo-set block-store
-            (mapcar #'cdr (%build-and-connect chain-state block-store utxo-set
+            (mapcar #'cdr (build-and-connect chain-state block-store utxo-set
                                               genesis-hash
                                               (make-test-chain-hashes #xA0 3)))
-            (mapcar #'cdr (%build-and-connect chain-state block-store utxo-set
+            (mapcar #'cdr (build-and-connect chain-state block-store utxo-set
                                               genesis-hash
                                               (make-test-chain-hashes #xB0 3))))))
 
@@ -3093,7 +3044,7 @@ actually exists."
    (bl.store:with-coins-view-db
        (base (ensure-directories-exist
               (merge-pathnames "coins/"
-                               (%use-activate-block-test-base-path "p3b-pointer"))))
+                               (activate-block-base-path "p3b-pointer"))))
      (let ((cache (bl.store:make-coins-view-cache base)))
        (multiple-value-bind (chain-state view block-store a-entries b-entries)
            (%p3b-reorg-fixture "p3b-pointer" cache)
@@ -3247,7 +3198,7 @@ sites removes it, since a crash between disconnect and marker update recreates
 it."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "txindex-rewind")
+       (make-activate-block-fixture "txindex-rewind")
      (let* ((txdir (ensure-directories-exist
                     (merge-pathnames (format nil "test-txidx-rewind-~D/"
                                              (get-internal-real-time))
@@ -3257,7 +3208,7 @@ it."
             (progn
               ;; Two blocks on the original branch, then a heavier fork that
               ;; replaces them.
-              (%build-and-connect chain-state block-store utxo-set genesis-hash
+              (build-and-connect chain-state block-store utxo-set genesis-hash
                                   (make-test-chain-hashes #xA0 2))
               (let ((losing-tip (bl.store:best-block-hash chain-state)))
                 (%stage-heavier-downloaded-fork chain-state block-store genesis-hash)

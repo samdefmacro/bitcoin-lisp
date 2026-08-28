@@ -32,16 +32,6 @@
 (defun %dg-chunks (g lin) (bl.mp:chunk-linearization g lin))
 (defun %dg-topo-p (g lin) (bl.mp:linearization-topological-p g lin))
 
-(defun %cl-make-rng (seed)
-  "Deterministic xorshift64 PRNG closure: (funcall rng n) => [0, n). No
-dependence on the global *random-state*, so runs are reproducible."
-  (let ((state seed))
-    (lambda (n)
-      (setf state (ldb (byte 64 0) (logxor state (ash state 13))))
-      (setf state (logxor state (ash state -7)))
-      (setf state (ldb (byte 64 0) (logxor state (ash state 17))))
-      (mod state n))))
-
 (defun %cl-random-depgraph (rng n)
   "A random DAG of N transactions; edges only from lower to higher position."
   (let ((g (bl.mp:make-depgraph)))
@@ -358,7 +348,7 @@ D(1,3) E(1,1); deps C->A, D->A, D->B, E->D (cluster_linearize_tests.cpp:189-192)
 topological; chunk feerates are non-increasing; PostLinearize never worsens
 the diagram (:greater or :equal, its documented guarantee) and leaves only
 connected chunks; DepGraph invariants hold throughout."
-  (let ((rng (%cl-make-rng 88172645463325252)))
+  (let ((rng (make-deterministic-rng 88172645463325252)))
     (dotimes (iter 200)
       (let* ((n (1+ (funcall rng 12)))
              (g (%cl-random-depgraph rng n))

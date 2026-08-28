@@ -1072,12 +1072,12 @@ whatever the promotion code did."
 delivered a reconstructible-but-INVALID compact block bought an HB slot — and
 through the cap-of-3 eviction could demote an honest HB peer at will."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "g716-cb"))
+   (let* ((node (regtest-node-fixture "g716-cb"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
           (store (bl::node-block-store node))
           (mp (bl::node-mempool node))
-          (good (%g716-mine-on node (%p2sh-optrue-spk)))
+          (good (%g716-mine-on node (p2sh-optrue-script-pubkey)))
           (bad (%g716-corrupt-block good)))
      (%g716-quiet
        ;; DEFECT: an invalid delivery earns nothing.
@@ -1108,8 +1108,8 @@ prefilled at index 0 (a peer's mempool can never hold it) and every other
 transaction is represented by a short id. Short-id derivation itself is covered
 by the receive-side tests and the SipHash vectors."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "cb-msg"))
-          (block (%g716-mine-on node (%p2sh-optrue-spk)))
+   (let* ((node (regtest-node-fixture "cb-msg"))
+          (block (%g716-mine-on node (p2sh-optrue-script-pubkey)))
           (txs (bl.ser:bitcoin-block-transactions block))
           (msg (bl.ser:make-cmpctblock-message block :nonce 42))
           (cb (bl.ser:parse-cmpctblock-payload (subseq msg 24))))
@@ -1145,12 +1145,12 @@ the same guards answer it, with Core's depth rule: within MAX_CMPCTBLOCK_DEPTH
 of the tip a cmpctblock, deeper the full witness block, because a peer asking
 for old blocks has no mempool that could reconstruct one (:2463-2476)."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "cb-getdata"))
+   (let* ((node (regtest-node-fixture "cb-getdata"))
           (cs (bl::node-chain-state node))
           (store (bl::node-block-store node))
           ;; Seven blocks, so the first sits deeper than the depth rule allows.
           (hashes (bl.rpc::%generate-to-script-pubkey
-                   node (%p2sh-optrue-spk) 7 1000000))
+                   node (p2sh-optrue-script-pubkey) 7 1000000))
           (deep-hash (bl.rpc::parse-hex-hash (first hashes))))
      (progn
        (is (= 7 (bl.store:current-height cs)))
@@ -1180,12 +1180,12 @@ for old blocks has no mempool that could reconstruct one (:2463-2476)."
 same defect and needs its own coverage: a dropped hunk there would disable the
 fix on half the compact traffic without failing the cmpctblock test."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "g716-btxn"))
+   (let* ((node (regtest-node-fixture "g716-btxn"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
           (store (bl::node-block-store node))
           (mp (bl::node-mempool node))
-          (good (%g716-mine-on node (%p2sh-optrue-spk)))
+          (good (%g716-mine-on node (p2sh-optrue-script-pubkey)))
           (hash (bl.ser:block-header-hash
                  (bl.ser:bitcoin-block-header good))))
      (flet ((%deliver (peer txs)
@@ -1230,12 +1230,12 @@ three. Both live full-block entry points are exercised: handle-block (the
 generic dispatcher, reached from the header-sync drains) and
 dispatch-ibd-message's `block' branch (the block-download path)."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "g716-full"))
+   (let* ((node (regtest-node-fixture "g716-full"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
           (store (bl::node-block-store node))
           (mp (bl::node-mempool node))
-          (spk (%p2sh-optrue-spk))
+          (spk (p2sh-optrue-script-pubkey))
           (b1 (%g716-mine-on node spk)))
      (%g716-quiet
        ;; CONTROL: an INVALID full block earns nothing (same path, same peer
@@ -1292,7 +1292,7 @@ dispatch-ibd-message's `block' branch (the block-download path)."
   "A second, DIFFERENT coinbase scriptPubKey. Two blocks assembled on the same
 tip with different coinbase outputs get different merkle roots and therefore
 different hashes — siblings, equal work."
-  (let ((spk (copy-seq (%p2sh-optrue-spk))))
+  (let ((spk (copy-seq (p2sh-optrue-script-pubkey))))
     (setf (aref spk 2) (logxor (aref spk 2) 1))
     spk))
 
@@ -1324,12 +1324,12 @@ builds, because \"nothing connected\" is ALSO true of the ungated path — the
 replay was already harmless to the chain and expensive to us, which is exactly
 why the hole survived this long."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "cb-replay-cost"))
+   (let* ((node (regtest-node-fixture "cb-replay-cost"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
           (store (bl::node-block-store node))
           (mp (bl::node-mempool node))
-          (spk (%p2sh-optrue-spk))
+          (spk (p2sh-optrue-script-pubkey))
           (b1 (%g716-mine-on node spk))
           (builds 0)
           ;; BIND the IBD latch. INITIAL-BLOCK-DOWNLOAD-P (protocol.lisp:695)
@@ -1398,12 +1398,12 @@ property this whole change exists to establish. Each replay below carries its
 own control: the FIRST, genuinely-connecting delivery of the same block on the
 same path must promote."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "g716-replay"))
+   (let* ((node (regtest-node-fixture "g716-replay"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
           (store (bl::node-block-store node))
           (mp (bl::node-mempool node))
-          (spk (%p2sh-optrue-spk))
+          (spk (p2sh-optrue-script-pubkey))
           (b1 (%g716-mine-on node spk)))
      (is (= 0 (bl.store:current-height cs)) "fixture starts at genesis")
      (%g716-quiet
@@ -1474,14 +1474,14 @@ BlockChecked and promotes nobody. Unlike the replay case this one is not
 addressable by any dedup guard — the block is genuinely new to us — so it pins
 the connection gate on its own."
   (with-network (:regtest)
-   (let* ((node (%regtest-node-fixture "g716-side"))
+   (let* ((node (regtest-node-fixture "g716-side"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
           (store (bl::node-block-store node))
           (mp (bl::node-mempool node))
           ;; Two SIBLINGS assembled on genesis before either is connected:
           ;; equal work, so the second is stored and first-seen wins.
-          (main (%g716-mine-on node (%p2sh-optrue-spk)))
+          (main (%g716-mine-on node (p2sh-optrue-script-pubkey)))
           (sibling (%g716-mine-on node (%g716-other-spk))))
      (is (not (equalp (%g716-block-hash main) (%g716-block-hash sibling)))
          "the fixture must really have built two DIFFERENT blocks")

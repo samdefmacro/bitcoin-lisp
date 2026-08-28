@@ -16,43 +16,6 @@
 ;; Wire format (BIP 144):
 ;;   version(4) + marker(1) + flag(1) + inputs + outputs + witness + locktime(4)
 
-(defun make-witness-test-tx-bytes ()
-  "Build raw bytes for a synthetic BIP 144 witness transaction."
-  (coerce
-   (bl.bytes:with-byte-buf (s)
-     ;; Version = 2
-     (bl.bytes:bb-write-i32-le s 2)
-     ;; Marker + flag
-     (bl.bytes:bb-write-u8 s #x00)
-     (bl.bytes:bb-write-u8 s #x01)
-     ;; 1 input
-     (bl.bytes:bb-write-varint s 1)
-     ;; prev outpoint: txid (32 bytes of 0x11), index 0
-     (bl.bytes:bb-write-bytes s (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11))
-     (bl.bytes:bb-write-u32-le s 0)
-     ;; empty scriptSig
-     (bl.bytes:bb-write-varint s 0)
-     ;; sequence
-     (bl.bytes:bb-write-u32-le s #xFFFFFFFE)
-     ;; 1 output
-     (bl.bytes:bb-write-varint s 1)
-     ;; value: 49999 satoshis
-     (bl.bytes:bb-write-i64-le s 49999)
-     ;; 25-byte scriptPubKey (P2PKH placeholder)
-     (bl.bytes:bb-write-varint s 25)
-     (bl.bytes:bb-write-bytes s (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76))
-     ;; Witness for input 0: 2 items
-     (bl.bytes:bb-write-varint s 2)
-     ;; Item 1: 72-byte signature placeholder
-     (bl.bytes:bb-write-varint s 72)
-     (bl.bytes:bb-write-bytes s (make-array 72 :element-type '(unsigned-byte 8) :initial-element #xAA))
-     ;; Item 2: 33-byte pubkey placeholder
-     (bl.bytes:bb-write-varint s 33)
-     (bl.bytes:bb-write-bytes s (make-array 33 :element-type '(unsigned-byte 8) :initial-element #xBB))
-     ;; Locktime: 500000
-     (bl.bytes:bb-write-u32-le s 500000))
-   '(simple-array (unsigned-byte 8) (*))))
-
 (test witness-transaction-deserialize
   "A BIP 144 witness transaction should deserialize correctly."
   (let* ((raw (make-witness-test-tx-bytes))

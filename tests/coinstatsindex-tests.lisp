@@ -19,7 +19,7 @@
 to the direct whole-UTXO-set MuHash, and tip tallies equal to the live UTXO
 set's txout count and total amount."
   (with-network (:regtest)
-   (let ((node (%regtest-node-fixture (format nil "csi~D" (get-internal-real-time)))))
+   (let ((node (regtest-node-fixture (format nil "csi~D" (get-internal-real-time)))))
      (let ((bl::*node* node))
        ;; Mine spendable coinbases, then a chain of blocks. Coinbase outputs on
        ;; regtest raw(51) are spendable, so this builds a non-trivial UTXO set.
@@ -59,7 +59,7 @@ set's txout count and total amount."
 count is monotonically non-decreasing across a coinbase-only chain, and each
 height's MuHash is retrievable and distinct from its predecessor."
   (with-network (:regtest)
-   (let ((node (%regtest-node-fixture (format nil "csih~D" (get-internal-real-time)))))
+   (let ((node (regtest-node-fixture (format nil "csih~D" (get-internal-real-time)))))
      (let ((bl::*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
        (let* ((cs (bl::node-chain-state node))
@@ -90,7 +90,7 @@ blocks are mined, and gettxoutsetinfo <height> serves matching historical
 stats from the index (muhash equal to the direct whole-set muhash at the tip)."
   (with-network (:regtest)
    (let* ((tag (format nil "csirpc~D" (get-internal-real-time)))
-          (node (%regtest-node-fixture tag))
+          (node (regtest-node-fixture tag))
           (idxbase (merge-pathnames (format nil "test-csirpc-~A/" tag)
                                     (uiop:temporary-directory))))
      (ensure-directories-exist idxbase)
@@ -137,7 +137,7 @@ OP_RETURN output), the UTXO set contains NO unspendable outputs -- block
 application drops them, matching Core's AddCoin. The txout count reflects only
 the spendable coinbase reward outputs."
   (with-network (:regtest)
-   (let ((node (%regtest-node-fixture (format nil "unsp~D" (get-internal-real-time)))))
+   (let ((node (regtest-node-fixture (format nil "unsp~D" (get-internal-real-time)))))
      (let ((bl::*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
        (let ((utxo (bl::node-utxo-set node))
@@ -201,7 +201,7 @@ the full MuHash numerator/denominator fraction."
   "(values node csi cs tip) — a regtest node with BLOCKS mined blocks and a
 coinstats index built over them, installed on the node. Call inside
 (with-network (:regtest) ...)."
-  (let* ((node (%regtest-node-fixture tag))
+  (let* ((node (regtest-node-fixture tag))
          (idxbase (merge-pathnames (format nil "test-csi-rw-~A/" tag)
                                    (uiop:temporary-directory))))
     (let ((bl::*node* node))

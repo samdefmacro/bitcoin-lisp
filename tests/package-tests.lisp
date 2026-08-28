@@ -10,20 +10,6 @@
 
 (in-suite :package-tests)
 
-(defparameter +optrue-redeem+
-  (make-array 1 :element-type '(unsigned-byte 8) :initial-contents '(#x51))
-  "The redeemScript: OP_TRUE.")
-
-(defun %p2sh-optrue-spk ()
-  "scriptPubKey for P2SH(OP_TRUE): OP_HASH160 <hash160(OP_TRUE)> OP_EQUAL."
-  (let ((h (bl.crypto:hash160 +optrue-redeem+))
-        (spk (make-array 23 :element-type '(unsigned-byte 8))))
-    (setf (aref spk 0) #xa9)        ; OP_HASH160
-    (setf (aref spk 1) #x14)        ; push 20 bytes
-    (replace spk h :start1 2)
-    (setf (aref spk 22) #x87)       ; OP_EQUAL
-    spk))
-
 (defun %p2sh-optrue-scriptsig ()
   "scriptSig spending P2SH(OP_TRUE): a single push of the 1-byte redeemScript."
   (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(#x01 #x51)))
@@ -40,19 +26,8 @@ OUT-VALUE to one P2SH(OP_TRUE) output."
                   :sequence sequence))
    :outputs (vector (bl.ser:make-tx-out
                    :value out-value
-                   :script-pubkey (%p2sh-optrue-spk)))
+                   :script-pubkey (p2sh-optrue-script-pubkey)))
    :lock-time 0))
-
-(defun %pkg-fixture (&key (fund-value 100000000) (fund-height 1) (current-height 200))
-  "Return (values utxo-set mempool chain-state funding-txid). The funding UTXO is
-a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
-  (let ((utxo-set (bl.store:make-utxo-set))
-        (mempool (bl.mp:make-mempool))
-        (chain-state (bl.store:make-chain-state :best-height current-height))
-        (funding-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
-    (bl.store:add-utxo utxo-set funding-txid 0 fund-value
-                                   (%p2sh-optrue-spk) fund-height :coinbase nil)
-    (values utxo-set mempool chain-state funding-txid)))
 
 (defun %result-for (results tx)
   "The package-tx-result in RESULTS whose wtxid matches TX."
@@ -62,7 +37,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
 ;;;; Well-formedness / topology (pure)
 
 (test package-well-formed-accepts-valid-chain
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (declare (ignore utxo-set mempool chain-state))
     (let* ((parent (%pkg-tx funding-txid 0 99990000))
            (child (%pkg-tx (bl.ser:transaction-hash parent) 0 99980000)))
@@ -89,7 +64,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
 
 (test package-well-formed-rejects-unsorted
   ;; child before parent.
-  (multiple-value-bind (u m c funding-txid) (%pkg-fixture)
+  (multiple-value-bind (u m c funding-txid) (make-package-fixture)
     (declare (ignore u m c))
     (let* ((parent (%pkg-tx funding-txid 0 99990000))
            (child (%pkg-tx (bl.ser:transaction-hash parent) 0 99980000)))
@@ -100,7 +75,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
 
 (test package-well-formed-rejects-internal-conflict
   ;; two txs spend the same funding outpoint.
-  (multiple-value-bind (u m c funding-txid) (%pkg-fixture)
+  (multiple-value-bind (u m c funding-txid) (make-package-fixture)
     (declare (ignore u m c))
     (let ((a (%pkg-tx funding-txid 0 99990000))
           (b (%pkg-tx funding-txid 0 99980000)))
@@ -110,7 +85,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
         (is (eq :conflict-in-package reason))))))
 
 (test package-child-with-parents-tree-accepts-valid
-  (multiple-value-bind (u m c funding-txid) (%pkg-fixture)
+  (multiple-value-bind (u m c funding-txid) (make-package-fixture)
     (declare (ignore u m c))
     (let* ((parent (%pkg-tx funding-txid 0 99990000))
            (child (%pkg-tx (bl.ser:transaction-hash parent) 0 99980000)))
@@ -119,7 +94,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
 
 (test package-child-with-parents-tree-rejects-non-parent
   ;; "parent" is not actually spent by the child.
-  (multiple-value-bind (u m c funding-txid) (%pkg-fixture)
+  (multiple-value-bind (u m c funding-txid) (make-package-fixture)
     (declare (ignore u m c))
     (let* ((stray (%pkg-tx funding-txid 0 99990000))
            (child (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)
@@ -133,7 +108,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
   ;; parent2 spends parent1's output → parents depend on each other (a chain, not
   ;; a tree). The child spends both, so child-with-parents holds but the tree
   ;; check must reject.
-  (multiple-value-bind (u m c funding-txid) (%pkg-fixture)
+  (multiple-value-bind (u m c funding-txid) (make-package-fixture)
     (declare (ignore u m c))
     (let* ((p1 (%pkg-tx funding-txid 0 99990000))
            (p1id (bl.ser:transaction-hash p1))
@@ -156,7 +131,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
                                                     :hash p1id :index 0)
                                   :script-sig (%p2sh-optrue-scriptsig)))
                    :outputs (vector (bl.ser:make-tx-out
-                                   :value 50000 :script-pubkey (%p2sh-optrue-spk)))
+                                   :value 50000 :script-pubkey (p2sh-optrue-script-pubkey)))
                    :lock-time 0)))
       (multiple-value-bind (ok reason)
           (bl.val:package-child-with-parents-tree-p (list p1 p2 child))
@@ -169,7 +144,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
   ;; The headline case: a parent paying 5 sat (~0.05 sat/vB, below the
   ;; 0.1 sat/vB / 100 sat/kvB floor) is accepted because the child pays
   ;; 50000 sat; the package feerate clears the floor.
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((parent (%pkg-tx funding-txid 0 (- 100000000 5)))
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- (- 100000000 5) 50000))))
@@ -192,7 +167,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
                           (%result-for results parent)))))))))
 
 (test package-single-sufficient-tx-accepted
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let ((tx (%pkg-tx funding-txid 0 (- 100000000 10000))))
       (multiple-value-bind (msg results replaced)
           (bl.val:validate-package-for-mempool
@@ -205,7 +180,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
                   mempool (bl.ser:transaction-hash tx)))))))
 
 (test package-single-low-fee-tx-rejected
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let ((tx (%pkg-tx funding-txid 0 (- 100000000 5))))
       (multiple-value-bind (msg results replaced)
           (bl.val:validate-package-for-mempool
@@ -220,7 +195,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
 (test package-below-floor-rejected
   ;; parent + child both tiny: even the package feerate is below the 0.1 sat/vB
   ;; (100 sat/kvB) relay floor.
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((parent (%pkg-tx funding-txid 0 (- 100000000 1)))
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- (- 100000000 1) 1))))
@@ -236,7 +211,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
 (test package-dedup-already-in-mempool
   ;; A package whose parent is already in the mempool reports the parent as
   ;; :mempool-entry and still accepts the child.
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((parent (%pkg-tx funding-txid 0 (- 100000000 10000)))
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- (- 100000000 10000) 10000))))
@@ -259,7 +234,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
 
 (test package-bad-topology-rejected
   ;; unsorted package → context-free reject, nothing validated, nothing added.
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((parent (%pkg-tx funding-txid 0 (- 100000000 50)))
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- (- 100000000 50) 50000))))
@@ -273,7 +248,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
         (is (= 0 (bl.mp:mempool-count mempool)))))))
 
 (test package-not-child-with-parents-rejected
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((stray (%pkg-tx funding-txid 0 99990000))
            (child (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8) :initial-element 4)
                            0 50000)))
@@ -287,7 +262,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
 ;;;; RPC shape
 
 (test rpc-submitpackage-cpfp-shape
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((node (bl::make-node :network :testnet3))
            (parent (%pkg-tx funding-txid 0 (- 100000000 50)))
            (pid (bl.ser:transaction-hash parent))
@@ -314,7 +289,7 @@ BroadcastTransaction per accepted tx). The members are NOT added to the
 unbroadcast set: they are already in the pool when broadcast runs, so
 Core's already-in-mempool branch (node/transaction.cpp:63-72) relays
 without AddUnbroadcastTx — matched exactly."
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let* ((node (bl::make-node :network :testnet3))
            (peer (bl.net:make-peer :state :ready))
            (parent (%pkg-tx funding-txid 0 (- 100000000 50)))
@@ -342,7 +317,7 @@ without AddUnbroadcastTx — matched exactly."
   "A lone tx paying ~0.5 sat/vB -- inside the 0.1..1.0 sat/vB band Core relays --
 is accepted under the 100 sat/kvB floor (the old 1 sat/vB integer floor rejected
 the entire band)."
-  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (let ((tx (%pkg-tx funding-txid 0 (- 100000000 50))))   ; 50 sat fee
       (multiple-value-bind (msg results replaced)
           (bl.val:validate-package-for-mempool
@@ -371,14 +346,14 @@ the entire band)."
                     :sequence #xffffffff))
    :outputs (vector (bl.ser:make-tx-out
                      :value out-value
-                     :script-pubkey (%p2sh-optrue-spk)))
+                     :script-pubkey (p2sh-optrue-script-pubkey)))
    :lock-time 0))
 
 (test package-rbf-replaces-mempool-conflict
   "A 1p1c package whose parent conflicts with a pool tx replaces it when the
 package out-earns it through the diagram check: the conflict is evicted and
 both members enter the pool."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((a (%pkg-tx funding 0 99999000))          ; pool tx, fee 1000
            (aid (bl.ser:transaction-hash a))
            ;; Parent double-spends FUNDING:0 at a sub-floor fee (5 sat) so its
@@ -402,7 +377,7 @@ both members enter the pool."
 (test package-rbf-insufficient-total-fees-rejected
   "Package RBF rule 3 on the totals: a pair whose combined fees do not cover
 the replaced tx's is rejected and the pool is untouched."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((a (%pkg-tx funding 0 99950000))          ; pool tx, fee 50000
            (aid (bl.ser:transaction-hash a))
            (parent (%pkg-tx funding 0 99999995))     ; fee 5, conflicts with A
@@ -422,7 +397,7 @@ the replaced tx's is rejected and the pool is untouched."
   "Package RBF requires NO in-mempool ancestors (the resulting cluster must
 be exactly the pair, Core validation.cpp:1052-1064): a conflicting package
 whose parent also spends a pool tx's output is rejected."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((funding2 (make-array 32 :element-type '(unsigned-byte 8)
                                     :initial-element 8))
            (m (%pkg-tx funding 0 99999000))          ; pool tx: parent's ancestor
@@ -435,7 +410,7 @@ whose parent also spends a pool tx's output is rejected."
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 199948990)))        ; fee 50000
       (bl.store:add-utxo utxo-set funding2 0 100000000
-                                     (%p2sh-optrue-spk) 1 :coinbase nil)
+                                     (p2sh-optrue-script-pubkey) 1 :coinbase nil)
       (is (eq :ok (%add-tx mempool m :fee 1000 :height 200)))
       (is (eq :ok (%add-tx mempool a2 :fee 1000 :height 200)))
       (multiple-value-bind (msg results replaced)
@@ -451,7 +426,7 @@ whose parent also spends a pool tx's output is rejected."
 (test package-rbf-not-1p1c-rejected
   "A conflicting multi-tx subset larger than 1-parent-1-child cannot use
 package RBF (Core validation.cpp:1047-1050)."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((funding4 (make-array 32 :element-type '(unsigned-byte 8)
                                     :initial-element 9))
            (a (%pkg-tx funding 0 99999000))          ; pool tx, fee 1000
@@ -462,7 +437,7 @@ package RBF (Core validation.cpp:1047-1050)."
                                (bl.ser:transaction-hash p2) 0
                                199899990)))          ; fee 100000
       (bl.store:add-utxo utxo-set funding4 0 100000000
-                                     (%p2sh-optrue-spk) 1 :coinbase nil)
+                                     (p2sh-optrue-script-pubkey) 1 :coinbase nil)
       (is (eq :ok (%add-tx mempool a :fee 1000 :height 200)))
       (multiple-value-bind (msg results replaced)
           (bl.val:validate-package-for-mempool
@@ -487,9 +462,9 @@ not input-conflict with the first."
                     :script-sig (%p2sh-optrue-scriptsig)
                     :sequence #xffffffff))
    :outputs (vector (bl.ser:make-tx-out
-                     :value 49990000 :script-pubkey (%p2sh-optrue-spk))
+                     :value 49990000 :script-pubkey (p2sh-optrue-script-pubkey))
                     (bl.ser:make-tx-out
-                     :value 49990000 :script-pubkey (%p2sh-optrue-spk)))
+                     :value 49990000 :script-pubkey (p2sh-optrue-script-pubkey)))
    :lock-time 0))
 
 (test truc-sibling-eviction-accepted-when-paying
@@ -498,7 +473,7 @@ economics instead of being rejected on the descendant limit (Core PreChecks
 sibling eviction, validation.cpp:950-970); one that does not pay is rejected
 on the economics (:insufficient-fee), and with sibling eviction disabled the
 TRUC error surfaces unchanged."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (declare (ignore chain-state))
     (let* ((parent (%truc-2out-parent funding))
            (pid (bl.ser:transaction-hash parent))
@@ -577,7 +552,7 @@ multisig outputs of 1000 sat each, plus a CHANGE P2SH(OP_TRUE) output."
                                     :value 1000
                                     :script-pubkey (%bare-multisig-spk)))
                      (list (bl.ser:make-tx-out
-                            :value change :script-pubkey (%p2sh-optrue-spk))))
+                            :value change :script-pubkey (p2sh-optrue-script-pubkey))))
              'simple-vector)
    :lock-time 0))
 
@@ -586,7 +561,7 @@ multisig outputs of 1000 sat each, plus a CHANGE P2SH(OP_TRUE) output."
 and recorded on the mempool entry — the value the block assembler's sigop
 budget consumes (Core PreChecks -> StageAddition sigops_cost,
 validation.cpp:905,924). 5 bare 1-of-3 multisig outputs = 5 * 20 * 4 = 400."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((tx (%multisig-outputs-tx funding 5 99900000))
            (txid (bl.ser:transaction-hash tx)))
       (multiple-value-bind (valid err fee replaced sigops)
@@ -605,7 +580,7 @@ validation.cpp:905,924). 5 bare 1-of-3 multisig outputs = 5 * 20 * 4 = 400."
   "MAX_STANDARD_TX_SIGOPS_COST is MAX_BLOCK_SIGOPS_COST/5 = 16,000 (Core
 policy.h:43), not the 80,000 block budget: 201 bare multisig outputs
 (16,080 cost) are rejected, 200 (exactly 16,000 — Core rejects on >) pass."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (multiple-value-bind (valid err)
         (bl.val:validate-transaction-for-mempool
          (%multisig-outputs-tx funding 201 99000000)
@@ -626,7 +601,7 @@ PreChecks runs CheckFinalTxAtTip for package members like any other tx
 (validation.cpp:819); previously the package path skipped finality entirely
 and a timelocked tx could sit in the mempool and get mined. The zero-fee
 parent forces the CPFP package-feerate path."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((parent (%pkg-tx funding 0 100000000))     ; zero fee -> deferred
            (pid (bl.ser:transaction-hash parent))
            (child (bl.ser:make-transaction
@@ -638,7 +613,7 @@ parent forces the CPFP package-feerate path."
                                     :sequence 0))   ; non-final sequence: locktime enforced
                    :outputs (vector (bl.ser:make-tx-out
                                      :value 99900000
-                                     :script-pubkey (%p2sh-optrue-spk)))
+                                     :script-pubkey (p2sh-optrue-script-pubkey)))
                    :lock-time 500)))                  ; height 500 > next block 201
       (multiple-value-bind (msg results)
           (bl.val:validate-package-for-mempool
@@ -653,7 +628,7 @@ parent forces the CPFP package-feerate path."
 rejected. The child's 5-block height lock is on an UNCONFIRMED parent, which
 Core assumes confirms in the next block (prevheight = tip+1,
 validation.cpp:185-192) — so any nonzero relative lock on it is non-final."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((parent (%pkg-tx funding 0 100000000))     ; zero fee -> deferred
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 99900000 :sequence 5)))   ; 5-block relative lock
@@ -671,7 +646,7 @@ validation.cpp:185-192) — so any nonzero relative lock on it is non-final."
 validation.cpp:929,945): 200 bare multisig outputs adjust ~23 kvB of actual
 bytes up to 80,000 vB (16,000 sigops * 20 / 4), so a fee ample for the raw
 size fails the floor."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let ((tx (%multisig-outputs-tx funding 200 99795000)))   ; fee 5,000 sat
       ;; Ample for the raw ~23 kvB at 100 sat/kvB (needs ~2,300)...
       (is (> 5000 (ceiling (* 100 (bl.ser:transaction-vsize tx))
@@ -760,7 +735,7 @@ CPFPing a 0-fee v3 parent — invisible to the per-tx single checks because
 the parent is not in the mempool — is rejected by PACKAGE-TRUC-CHECKS and
 the mempool is untouched (pre-Wave-9 this package was ACCEPTED: the
 PackageTRUCChecks port was a stub)."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((parent (%pkg-tx funding 0 100000000 :version 3))   ; 0 fee -> deferred
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 99950000 :version 2)))        ; v2 spends v3!
@@ -777,7 +752,7 @@ PackageTRUCChecks port was a stub)."
   "TRUC_CHILD_MAX_VSIZE applies to a child of an IN-PACKAGE v3 parent on the
 CPFP path (single checks only see in-mempool parents): a >1000-vB v3 child
 fails the package."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((parent (%pkg-tx funding 0 100000000 :version 3))   ; 0 fee -> deferred
            (pid (bl.ser:transaction-hash parent))
            ;; Bulk the child past 1000 vB with a large OP_RETURN output
@@ -792,7 +767,7 @@ fails the package."
                    :outputs (vector
                              (bl.ser:make-tx-out
                               :value 99000000
-                              :script-pubkey (%p2sh-optrue-spk))
+                              :script-pubkey (p2sh-optrue-script-pubkey))
                              (bl.ser:make-tx-out
                               :value 0
                               :script-pubkey
@@ -823,7 +798,7 @@ CheckMemPoolPolicyLimits, validation.cpp:1516-1520). Pre-Wave-9 the members
 were added one by one and a mid-package :too-large-cluster stranded the
 earlier members in the pool."
   (let ((bl.mp:*cluster-count-limit* 2))
-    (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
       (let* ((m (%pkg-tx funding 0 99990000))          ; pool tx, fee 10000
              (mid (bl.ser:transaction-hash m))
              ;; P spends M's output at 0 fee -> deferred to the CPFP phase.
@@ -853,7 +828,7 @@ earlier members in the pool."
 rest: Core keeps validating the remaining members individually and the
 valid ones land in the mempool (AcceptPackage quit_early only skips the
 package-feerate retry, validation.cpp:1694-1712)."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((funding2 (make-array 32 :element-type '(unsigned-byte 8)
                                     :initial-element 31))
            ;; P1: pays a 100-sat P2SH output -> :dust, a hard failure.
@@ -864,7 +839,7 @@ package-feerate retry, validation.cpp:1694-1712)."
            (p2id (bl.ser:transaction-hash p2))
            (child (%pkg-tx-2in p1id 0 p2id 0 99000000)))
       (bl.store:add-utxo utxo-set funding2 0 100000000
-                                     (%p2sh-optrue-spk) 1 :coinbase nil)
+                                     (p2sh-optrue-script-pubkey) 1 :coinbase nil)
       (multiple-value-bind (msg results)
           (bl.val:validate-package-for-mempool
            (list p1 p2 child) utxo-set mempool chain-state)
@@ -890,7 +865,7 @@ package-feerate retry, validation.cpp:1694-1712)."
 package feerate and the wtxids it was computed over (Core FeeFailure on
 workspaces.back(), validation.cpp:1504-1509); the parent keeps its phase-1
 individual fee failure without those fields."
-  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+  (multiple-value-bind (utxo-set mempool chain-state funding) (make-package-fixture)
     (let* ((parent (%pkg-tx funding 0 (- 100000000 1)))
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- (- 100000000 1) 1))))

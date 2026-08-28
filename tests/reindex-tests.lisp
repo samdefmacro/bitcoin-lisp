@@ -17,7 +17,7 @@
   "(values node coins-db-path) — a regtest node whose UTXO set is a
 LevelDB-backed coins-view-cache (matching the live node), with undo storage
 initialized so mining can connect blocks."
-  (let* ((node (%regtest-node-fixture tag))
+  (let* ((node (regtest-node-fixture tag))
          (base (merge-pathnames (format nil "test-reindex-~A/" tag)
                                 (uiop:temporary-directory)))
          (cspath (namestring (merge-pathnames "chainstate/" base)))

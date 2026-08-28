@@ -335,6 +335,10 @@ this same package."
   :components ((:module "tests"
                 :components ((:file "support/package")  ; the shared fixtures, before the package that :USEs them
                              (:file "support/fixtures")
+                             (:file "support/transactions")
+                             (:file "support/chain")
+                             (:file "support/mempool-fixtures")
+                             (:file "support/wallet")
                              (:file "package")
                              (:file "crypto-tests")
                              (:file "serialization-tests")

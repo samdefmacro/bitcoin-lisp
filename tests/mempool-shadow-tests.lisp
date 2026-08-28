@@ -362,7 +362,7 @@ mempool and graph agree throughout, and the pool remains fully usable."
 block confirmations, with the per-mutation shadow asserts doing the heavy
 checking; explicit spot checks at the end."
   (dolist (seed '(88172645463325252 3141592653589793))
-    (let ((rng (%cl-make-rng seed))
+    (let ((rng (make-deterministic-rng seed))
           (mempool (bl.mp:make-mempool))
           (all-txs (make-hash-table :test 'equalp))   ; txid -> tx
           (next-vout (make-hash-table :test 'equalp)) ; txid -> next free vout

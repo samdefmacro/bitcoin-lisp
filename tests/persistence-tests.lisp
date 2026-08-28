@@ -1158,63 +1158,6 @@ header; these synthetic fixtures must too."
    :timestamp 1231006505 :bits #x1d00ffff :nonce 0
    :cached-hash genesis-hash))
 
-(defun make-reorg-test-block (prev-hash block-hash height
-                              &key (value 5000000000)
-                                   (timestamp (+ 1231006505 (* height 600))))
-  "Create a minimal test block for reorg tests.
-
-The coinbase's script-sig is derived from BLOCK-HASH so each block's
-coinbase tx SERIALIZES uniquely. Without that, every coinbase produced
-by this helper would serialize to identical bytes and hash to the same
-real txid after a block round-trips through the store (which
-serializes then deserializes, dropping any cached tx hash). The
-collapsed-txid bug let reorg tests pass by coincidence: A's outputs
-were never disconnected (stored under cached-hash keys, looked up
-under real-hash keys) and B's collapsed to one entry, so the final
-count happened to equal the number-of-B-blocks the test expected.
-
-We still set cached-hash on the coinbase as a small optimization for
-tests that compare txids before any disk round-trip — it must match
-the real hash256(serialize-tx) which it now does, since the unique
-script-sig makes the serialization deterministic per block."
-  (let* ((script-sig (let ((s (make-array 4 :element-type '(unsigned-byte 8))))
-                       (replace s block-hash :start2 0 :end2 4)
-                       s))
-         (coinbase-tx (bl.ser:make-transaction
-                       :version 1
-                       :inputs (vector (bl.ser:make-tx-in
-                                      :previous-output (bl.ser:make-outpoint
-                                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
-                                                                          :initial-element 0)
-                                                        :index #xFFFFFFFF)
-                                      :script-sig script-sig))
-                       :outputs (vector (bl.ser:make-tx-out
-                                       :value value
-                                       :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
-                                                                  :initial-element #x76)))
-                       :lock-time 0))
-         (merkle-root (bl.val:compute-merkle-root
-                       (list (bl.ser:transaction-hash coinbase-tx))))
-         (header (bl.ser:make-block-header
-                  :version 1
-                  :prev-block prev-hash
-                  :merkle-root merkle-root
-                  :timestamp timestamp
-                  :bits #x1d00ffff
-                  :nonce 0
-                  :cached-hash block-hash)))
-    (bl.ser:make-bitcoin-block
-     :header header
-     :transactions (list coinbase-tx))))
-
-(defun make-test-chain-hashes (prefix count)
-  "Generate COUNT unique 32-byte hashes with PREFIX byte for chain identification."
-  (loop for i from 1 to count
-        collect (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
-                  (setf (aref h 0) prefix)
-                  (setf (aref h 1) i)
-                  h)))
-
 (test multi-block-reorg-3-deep
   "A reorg of 3+ blocks should correctly switch chains."
   (let* (;; testnet4 (the default network) activates BIP34 at h=1. perform-reorg

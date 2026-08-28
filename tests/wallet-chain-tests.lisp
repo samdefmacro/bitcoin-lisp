@@ -10,7 +10,7 @@
 ;;; rescan-from-genesis equal to live-tracked state, and keypool/tx-state
 ;;; persistence across a simulated crash + reload.
 ;;;
-;;; Reuses %regtest-node-fixture/%with-regtest (mining-tests.lisp) and the
+;;; Reuses regtest-node-fixture/%with-regtest (mining-tests.lisp) and the
 ;;; P2SH(OP_TRUE) spend helpers (package-tests.lisp).
 
 (def-suite wallet-chain-tests
@@ -20,35 +20,6 @@
 (in-suite wallet-chain-tests)
 
 ;;; --- Fixture ---
-
-(defvar *wallet-chain-counter* 0)
-
-(defun %wc-fixture (suffix &key (keypool 5))
-  "A regtest node at genesis with a wallet manager, the genesis block stored
-(so rescans from height 0 can read it), ready for the chain hooks."
-  (let* ((id (format nil "~A-~D-~D" suffix (get-universal-time)
-                     (incf *wallet-chain-counter*)))
-         (node (%regtest-node-fixture (format nil "wallet-~A" id)))
-         (wallet-dir (merge-pathnames (format nil "wallet-chain-~A/" id)
-                                      (uiop:temporary-directory))))
-    (bl.store:store-block
-     (bl::node-block-store node)
-     (bl.store:make-genesis-block :regtest))
-    (setf (bl::node-wallet-manager node)
-          (bl.wallet::make-wallet-manager
-           :data-directory wallet-dir :network :regtest :keypool-size keypool))
-    node))
-
-(defmacro %with-wallet-chain-node ((node suffix &key (keypool 5)) &body body)
-  "Run BODY under regtest bindings with NODE bound to a %wc-fixture and
-bl::*node* bound so the wallet chain hooks fire."
-  `(with-network (:regtest)
-    (let* ((,node (%wc-fixture ,suffix :keypool ,keypool))
-           (bl::*node* ,node))
-      (unwind-protect (progn ,@body)
-        (ignore-errors
-         (bl.wallet:close-wallet-manager
-          (bl::node-wallet-manager ,node)))))))
 
 (defun %wc-wallet (node name)
   (gethash name (bl.wallet::wallet-manager-wallets
@@ -134,7 +105,7 @@ the block time; live mempool tracking stamps the arrival time — Core too)."
   "CWalletTx records round-trip byte-exactly through Core's layout, and the
 TxStateInterpretSerialized vectors map to the right states."
   (let* ((prev (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
-         (tx (%wc-spend-tx prev 0 12345 (%p2sh-optrue-spk)))
+         (tx (%wc-spend-tx prev 0 12345 (p2sh-optrue-script-pubkey)))
          (txid (bl.ser:transaction-hash tx))
          (bhash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
          (wtx (bl.wallet::make-wallet-tx :tx tx :txid txid)))
@@ -192,7 +163,7 @@ TxStateInterpretSerialized vectors map to the right states."
   "Mining to a wallet address tracks the coinbase through the connect hook;
 categories follow Core's maturity rules (immature until depth 101, the
 COINBASE_MATURITY+1 rule)."
-  (%with-wallet-chain-node (node "maturity")
+  (with-wallet-chain-node (node "maturity")
     (let ((bl.wallet::*rpc-wallet-name* nil))
       (bl.wallet::rpc-createwallet node '("w"))
       (let* ((addr (bl.wallet::rpc-getnewaddress node nil))
@@ -238,7 +209,7 @@ COINBASE_MATURITY+1 rule)."
 confirms through the connect hook, listsinceblock windows are Core-shaped,
 and a from-genesis rescan (rescanblockchain AND a fresh importdescriptors
 wallet) reproduces exactly the live-tracked state."
-  (%with-wallet-chain-node (node "receive")
+  (with-wallet-chain-node (node "receive")
     (let ((bl.wallet::*rpc-wallet-name* nil))
       (bl.wallet::rpc-createwallet node '("w"))
       (let* ((wallet (%wc-wallet node "w"))
@@ -329,7 +300,7 @@ wallet) reproduces exactly the live-tracked state."
 (test wallet-coinbase-reorg-abandon
   "Disconnecting the wallet's coinbase block marks it inactive+abandoned
 (orphan category); reconsidering the block reconfirms it."
-  (%with-wallet-chain-node (node "cbreorg")
+  (with-wallet-chain-node (node "cbreorg")
     (let ((bl.wallet::*rpc-wallet-name* nil))
       (bl.wallet::rpc-createwallet node '("w"))
       (let* ((addr (bl.wallet::rpc-getnewaddress node nil))
@@ -364,7 +335,7 @@ the mempool (in-mempool state); a confirmed double-spend marks it
 block-conflicted (negative confirmations); disconnecting the conflict block
 reverts it to inactive with the double-spend as a mempool conflict; re-mining
 the double-spend re-conflicts it and clears the mempool conflict."
-  (%with-wallet-chain-node (node "conflicts")
+  (with-wallet-chain-node (node "conflicts")
     (let ((bl.wallet::*rpc-wallet-name* nil))
       (bl.wallet::rpc-createwallet node '("w"))
       (let* ((wallet (%wc-wallet node "w"))
@@ -400,7 +371,7 @@ the double-spend re-conflicts it and clears the mempool conflict."
                (txid2 (%wc-send node tx2))
                ;; Double-spend of the same prevout, NOT paying the wallet.
                (tx2x (%wc-spend-tx cb2 0 (- +wc-subsidy+ 1000000)
-                                   (%p2sh-optrue-spk)))
+                                   (p2sh-optrue-script-pubkey)))
                (txid2x (bl.ser:transaction-hash tx2x)))
           (is (= 0 (%aval "confirmations" (%wc-gettx node txid2))))
           ;; Mine a block containing ONLY the double-spend.
@@ -441,7 +412,7 @@ the double-spend re-conflicts it and clears the mempool conflict."
   "Tx state and the keypool survive a crash-simulating close + loadwallet
 (records were persisted at hook time), and a wallet unloaded while blocks
 were mined catches up from its stored locator on load."
-  (%with-wallet-chain-node (node "crash")
+  (with-wallet-chain-node (node "crash")
     (let ((bl.wallet::*rpc-wallet-name* nil)
           (issued '()))
       (bl.wallet::rpc-createwallet node '("w"))
@@ -504,10 +475,7 @@ were mined catches up from its stored locator on load."
 (defun %wc-build-filter-index (node)
   "Populate a BASIC block-filter index over the whole active chain, as the
 connect hook does live. Returns the index."
-  (let* ((dir (merge-pathnames (format nil "wc-bfi-~D-~D/"
-                                       (get-universal-time)
-                                       (incf *wallet-chain-counter*))
-                               (uiop:temporary-directory)))
+  (let* ((dir (make-temp-directory "wc-bfi"))
          (bfi (bl.store:init-blockfilterindex dir))
          (state (bl::node-chain-state node))
          (store (bl::node-block-store node)))
@@ -540,7 +508,7 @@ skipped blocks (Core wallet.cpp:1907-1908). Skipping that advance would make
 rescanblockchain report the last MATCHING block as stop_height and make
 wallet-attach-chain persist a stale best block."
   (with-network (:regtest)
-    (let* ((node (%wc-fixture "g738"))
+    (let* ((node (make-wallet-chain-node "g738"))
            (wname "g738w"))
       (unwind-protect
            (progn
@@ -588,7 +556,7 @@ blockFilterMatchesAny -> nullopt, node/interfaces.cpp:583-584). The fallback is
 PER BLOCK; there is deliberately no whole-scan guard on the index sync height,
 because our index can contain holes below its best marker."
   (with-network (:regtest)
-    (let* ((node (%wc-fixture "g738b"))
+    (let* ((node (make-wallet-chain-node "g738b"))
            (wname "g738bw"))
       (unwind-protect
            (progn
@@ -619,7 +587,7 @@ UpdateIfNeeded must fold in scripts created by a mid-rescan TopUp — polling
 GetEndRange = max-cached-index + 1 (Core scriptpubkeyman.cpp:1518-1521), NOT
 range-end and NOT next-index."
   (with-network (:regtest)
-    (let* ((node (%wc-fixture "g738c" :keypool 3))
+    (let* ((node (make-wallet-chain-node "g738c" :keypool 3))
            (wname "g738cw"))
       (unwind-protect
            (progn

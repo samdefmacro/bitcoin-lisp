@@ -276,7 +276,7 @@ the confirmation was recorded — silently discarding the data point."
 transactions are still tracked. Drives the real connect-block."
   (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
-       (%make-activate-block-fixture "bpe-connect")
+       (make-activate-block-fixture "bpe-connect")
      (let* ((bl.mp:*block-policy-estimator*
               (bl.mp:make-block-policy-estimator))
             (est bl.mp:*block-policy-estimator*)
