@@ -202,9 +202,9 @@ scripts/dev.sh ui-test.)"
         "RPC method ~S (called by the wallet page) must be registered" method))
   ;; The page pins every wallet RPC to /wallet/<name>; the URI parsing it
   ;; rides must resolve names (and leave the base endpoint wallet-less).
-  (is (equal "w1" (bl.rpc::wallet-name-from-uri "/wallet/w1")))
-  (is (null (bl.rpc::wallet-name-from-uri "/")))
-  (is (null (bl.rpc::wallet-name-from-uri "/wallet/"))))
+  (is (equal "w1" (bl.wallet::wallet-name-from-uri "/wallet/w1")))
+  (is (null (bl.wallet::wallet-name-from-uri "/")))
+  (is (null (bl.wallet::wallet-name-from-uri "/wallet/"))))
 
 (test ui-handle-404s
   "Missing files, traversal attempts, and directories are all 404."

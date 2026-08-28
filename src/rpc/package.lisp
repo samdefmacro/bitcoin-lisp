@@ -31,22 +31,8 @@
    #:define-rpc
    #:dispatch-rpc-method
 
-   ;; Wallet manager (wallet P1; owned by the node)
-   #:init-wallet-manager
-   #:load-wallets-on-startup
-   #:close-wallet-manager
-
-   ;; Wallet chain-tracking fan-out (wallet P2; called by node/wallet-hooks.lisp's
-   ;; wallet-notify-* hooks)
-   #:wallet-manager-has-wallets-p
-   #:wallets-block-connected
-   #:wallets-block-disconnected
-   #:wallets-mempool-tx-added
-   #:wallets-mempool-tx-removed
-
-   ;; Wallet rebroadcast timer (wallet P4; driven by src/node/'s
-   ;; housekeeping loop)
-   #:wallets-maybe-resend
+   ;; The wallet manager, its chain-tracking fan-out and the rebroadcast
+   ;; timer are BITCOIN-LISP.WALLET's exports (src/wallet/package.lisp).
 
    ;; Error codes
    #:+rpc-parse-error+

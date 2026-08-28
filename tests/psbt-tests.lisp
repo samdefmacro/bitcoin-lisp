@@ -97,7 +97,7 @@ equality)."
                ;; Core's rpc_psbt.py generates this vector with replaceable=False
                ;; (explicit false = the +json-false+ sentinel; a null would
                ;; take Core's default true and signal RBF).
-               (out (bl.rpc::rpc-createpsbt
+               (out (bl.wallet::rpc-createpsbt
                      node (list (gethash "inputs" c) (gethash "outputs" c) 0
                                 bl.rpc:+json-false+))))
           (is (equalp (%psbt-ser out) (%psbt-ser (gethash "result" c))))))))
@@ -108,14 +108,14 @@ equality)."
     (if (null data)
         (skip "refs/bitcoin rpc_psbt.json not present")
         (let* ((node (bl::make-node :network :regtest))
-               (res (bl.rpc::rpc-decodepsbt
+               (res (bl.wallet::rpc-decodepsbt
                      node (list (first (gethash "valid" data))))))
           (is-true (assoc "tx" res :test #'equal))
           (is-true (assoc "inputs" res :test #'equal))
           (is-true (assoc "outputs" res :test #'equal))
           ;; every valid vector decodes without error
           (dolist (b64 (gethash "valid" data))
-            (is-true (bl.rpc::rpc-decodepsbt node (list b64))))))))
+            (is-true (bl.wallet::rpc-decodepsbt node (list b64))))))))
 
 (test psbt-converttopsbt-roundtrip
   "converttopsbt on an unsigned tx yields a PSBT wrapping that same tx; a signed
@@ -130,7 +130,7 @@ tx is rejected unless permitsigdata."
                      (gethash "result" (first (gethash "creator" data))))))
                (hex (bl.crypto:bytes-to-hex
                      (bl.ser:serialize-transaction tx)))
-               (out (bl.rpc::rpc-converttopsbt node (list hex))))
+               (out (bl.wallet::rpc-converttopsbt node (list hex))))
           (is (equalp (%psbt-ser out)
                       (%psbt-ser (bl.ser:encode-psbt
                                   (bl.ser:make-empty-psbt tx)))))))))
@@ -165,26 +165,26 @@ tx is rejected unless permitsigdata."
         (let ((node (bl::make-node :network :regtest)))
           (dolist (c (gethash "combiner" data))
             (let ((got (bl.ser:decode-psbt
-                        (bl.rpc::rpc-combinepsbt node (list (gethash "combine" c)))))
+                        (bl.wallet::rpc-combinepsbt node (list (gethash "combine" c)))))
                   (exp (bl.ser:decode-psbt (gethash "result" c))))
               (is (%psbt-equiv got exp) "combiner vector mismatch")))))))
 
 (test psbt-joinpsbts-and-analyze
   "joinpsbts concatenates distinct PSBTs; analyzepsbt reports structure."
   (let ((node (bl::make-node :network :regtest)))
-    (let* ((a (bl.rpc::rpc-createpsbt
+    (let* ((a (bl.wallet::rpc-createpsbt
                node (list (list (list (cons "txid" (make-string 64 :initial-element #\a))
                                       (cons "vout" 0)))
                           '())))
-           (b (bl.rpc::rpc-createpsbt
+           (b (bl.wallet::rpc-createpsbt
                node (list (list (list (cons "txid" (make-string 64 :initial-element #\b))
                                       (cons "vout" 1)))
                           '())))
            (joined (bl.ser:decode-psbt
-                    (bl.rpc::rpc-joinpsbts node (list (list a b))))))
+                    (bl.wallet::rpc-joinpsbts node (list (list a b))))))
       (is (= 2 (length (bl.ser:psbt-inputs joined))))
       ;; analyze a freshly created PSBT: no utxos -> next is updater
-      (let ((res (bl.rpc::rpc-analyzepsbt node (list a))))
+      (let ((res (bl.wallet::rpc-analyzepsbt node (list a))))
         (is (string= "updater" (cdr (assoc "next" res :test #'equal))))
         (is-true (assoc "inputs" res :test #'equal))))))
 
@@ -197,7 +197,7 @@ tx is rejected unless permitsigdata."
         (skip "refs/bitcoin rpc_psbt.json not present")
         (let* ((node (bl::make-node :network :regtest))
                (f (first (gethash "finalizer" data)))
-               (out (bl.rpc::rpc-finalizepsbt
+               (out (bl.wallet::rpc-finalizepsbt
                      node (list (gethash "finalize" f)
                                 bl.rpc:+json-false+)))
                (got (bl.ser:decode-psbt (cdr (assoc "psbt" out :test #'equal))))
@@ -213,7 +213,7 @@ vector."
         (skip "refs/bitcoin rpc_psbt.json not present")
         (let* ((node (bl::make-node :network :regtest))
                (e (first (gethash "extractor" data)))
-               (out (bl.rpc::rpc-finalizepsbt node (list (gethash "extract" e)))))
+               (out (bl.wallet::rpc-finalizepsbt node (list (gethash "extract" e)))))
           (is (string= (cdr (assoc "hex" out :test #'equal)) (gethash "result" e)))))))
 
 (test combinerawtransaction-merges
@@ -233,7 +233,7 @@ vector."
                   :outputs (vector out) :lock-time 0)))))
          (signed (funcall mk (coerce #(1 2 3 4 5) '(simple-array (unsigned-byte 8) (*)))))
          (empty  (funcall mk (make-array 0 :element-type '(unsigned-byte 8))))
-         (combined (bl.rpc::rpc-combinerawtransaction node (list (list empty signed))))
+         (combined (bl.wallet::rpc-combinerawtransaction node (list (list empty signed))))
          (tx (bl.ser:br-read-transaction
               (bl.ser:make-byte-reader-from
                (coerce (bl.crypto:hex-to-bytes combined)
@@ -270,8 +270,8 @@ key resolution — so it validates the signing dispatch against Core's vectors."
         (let ((qx (bl.interop:compute-tweaked-pubkey
                    (bl.crypto:derive-xonly-pubkey sk))))
           (when qx (setf (gethash qx tr-keymap) sk)))))
-    (let ((coins (bl.rpc::%psbt-coins-map psbt)))
-      (bl.rpc::%psbt-record-signatures psbt coins keymap pubmap tr-keymap nil))
+    (let ((coins (bl.wallet::%psbt-coins-map psbt)))
+      (bl.wallet::%psbt-record-signatures psbt coins keymap pubmap tr-keymap nil))
     psbt))
 
 (test psbt-signer-vectors
@@ -327,7 +327,7 @@ under the consensus script verifier. Runs WITHOUT vendored vectors."
        (make-array 0 :element-type '(unsigned-byte 8))
        (bl.ser:bb-finish bb)))
     (let* ((b64 (bl.ser:encode-psbt psbt))
-           (result (bl.rpc::rpc-descriptorprocesspsbt
+           (result (bl.wallet::rpc-descriptorprocesspsbt
                     node (list b64 (list (format nil "wpkh(~A)" wif)))))
            (hex (cdr (assoc "hex" result :test #'equal))))
       (is (eq t (cdr (assoc "complete" result :test #'equal))))
@@ -359,7 +359,7 @@ false honors locktime), and duplicate outputs are rejected."
                     (aref (bl.ser:transaction-inputs
                            (bl.ser:psbt-tx
                             (bl.ser:decode-psbt
-                             (bl.rpc::rpc-createpsbt node params))))
+                             (bl.wallet::rpc-createpsbt node params))))
                           0)))))
     ;; default (no replaceable) -> RBF-signaling 0xfffffffd
     (is (= #xfffffffd (funcall seq-of (list in '()))))
@@ -376,7 +376,7 @@ false honors locktime), and duplicate outputs are rejected."
     (let ((addr (bl.crypto:encode-p2pkh-address
                  (make-array 20 :element-type '(unsigned-byte 8) :initial-element 5) :regtest)))
       (signals bl.rpc::rpc-error
-        (bl.rpc::rpc-createpsbt
+        (bl.wallet::rpc-createpsbt
          node (list in (list (list (cons addr 0.1)) (list (cons addr 0.2)))))))))
 
 ;;;; BIP371 taproot fields in decodepsbt (rawtransaction.cpp:1253-1314)
@@ -423,7 +423,7 @@ rawtransaction.cpp:1253-1314)."
                                                (vector 1) leaf-hash
                                                (vector 1 2 3 4)
                                                (vector 0 0 0 #x80))))))
-         (json (bl.rpc::%psbt-input-json map :regtest)))
+         (json (bl.wallet::%psbt-input-json map :regtest)))
     (flet ((f (k) (cdr (assoc k json :test #'string=))))
       (is (equal (bl.crypto:bytes-to-hex sig) (f "taproot_key_path_sig")))
       (is (equal (bl.crypto:bytes-to-hex xonly) (f "taproot_internal_key")))
@@ -470,7 +470,7 @@ inventing a shape a client would not recognise."
                                   xonly
                                   (concatenate '(vector (unsigned-byte 8))
                                                (vector 0) (vector 9 9 9 9))))))
-         (json (bl.rpc::%psbt-output-json map)))
+         (json (bl.wallet::%psbt-output-json map)))
     (flet ((f (k) (cdr (assoc k json :test #'string=))))
       (is (equal (bl.crypto:bytes-to-hex xonly) (f "taproot_internal_key")))
       (is (equal (bl.crypto:bytes-to-hex tree) (f "taproot_tree")))
@@ -508,7 +508,7 @@ reader that ignores it files every script-path nonce under the key path."
                      ;; Script path: leaf hash present.
                      (%tap-record bl.ser:+psbt-in-musig2-partial-sig+
                                   (funcall cat p2 agg leaf-hash) psig)))))
-    (let* ((json (bl.rpc::%psbt-input-json map :mainnet))
+    (let* ((json (bl.wallet::%psbt-input-json map :mainnet))
            (parts (cdr (assoc "musig2_participant_pubkeys" json :test #'string=)))
            (nonces (cdr (assoc "musig2_pubnonces" json :test #'string=)))
            (sigs (cdr (assoc "musig2_partial_sigs" json :test #'string=))))
@@ -546,13 +546,13 @@ whole test out before it asserted anything."
     ;; The sentinel must behave exactly like an omitted/empty input list.
     (let ((with-sentinel
             (handler-case
-                (bl.rpc::rpc-createpsbt
+                (bl.wallet::rpc-createpsbt
                  (make-test-node)
                  (list bl.rpc::+json-empty-array+ outputs))
               (error (e) (format nil "ERR: ~A" e))))
           (with-nil
             (handler-case
-                (bl.rpc::rpc-createpsbt (make-test-node) (list nil outputs))
+                (bl.wallet::rpc-createpsbt (make-test-node) (list nil outputs))
               (error (e) (format nil "ERR: ~A" e)))))
       (is-true (stringp with-sentinel)
                "createpsbt([]) raised instead of building: ~A" with-sentinel)

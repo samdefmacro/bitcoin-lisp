@@ -19,7 +19,7 @@
   (blockfilterindex nil)  ; BIP158 basic block filter index (optional)
   (coinstatsindex nil)  ; per-height UTXO stats + MuHash index (optional)
   (txospenderindex nil)  ; outpoint -> spending tx index (optional, -txospenderindex)
-  ;; Wallet manager (bl.rpc:wallet-manager) fanning RPCs out to
+  ;; Wallet manager (bl.wallet:wallet-manager) fanning RPCs out to
   ;; loaded wallets by name; NIL when wallet support is disabled (mainnet
   ;; default). Wallet P1, docs/wallet-plan.md §4.
   (wallet-manager nil)

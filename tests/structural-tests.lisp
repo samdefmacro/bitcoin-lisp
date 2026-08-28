@@ -450,10 +450,13 @@ baseline can follow it."
 
 (defparameter +definition-prefixes+
   '((:defun . "(defun ") (:defmacro . "(defmacro ") (:defun . "(define-rpc ")
-    (:defun . "(define-option "))
+    (:defun . "(bl.rpc:define-rpc ") (:defun . "(define-option "))
   "A definition is a line that starts with one of these. A DEFINE-RPC form is
 the DEFUN of its handler (named rpc-<method> here, as the function is), so
-the RPC handlers stay on the long-function ratchet; a DEFINE-OPTION row is
+the RPC handlers stay on the long-function ratchet -- spelled
+BL.RPC:DEFINE-RPC from the wallet package, which the P3.4 review caught the
+scanner NOT seeing (62 handlers had silently left every ratchet); a
+DEFINE-OPTION row is
 option-<name>, so a name registered twice is a duplicate definition. Coalton's DEFINEs sit
 inside COALTON-TOPLEVEL at indentation 2 and are therefore not counted, on
 purpose: the interpreter is a deliberate port of one Core file.")
@@ -474,11 +477,12 @@ its alias list) becomes rpc-<method>, the handler's function name."
                                     line :start start))))
          (token (and start (string-downcase (subseq line start end)))))
     (cond ((null token) nil)
-          ((member prefix '("(define-rpc " "(define-option ") :test #'string=)
+          ((member prefix '("(define-rpc " "(bl.rpc:define-rpc " "(define-option ")
+                   :test #'string=)
            (let* ((q (position #\" token))
                   (q2 (and q (position #\" token :start (1+ q)))))
              (if (and q q2)
-                 (format nil "~A~A" (if (string= prefix "(define-rpc ") "rpc-" "option-")
+                 (format nil "~A~A" (if (string= prefix "(define-option ") "option-" "rpc-")
                          (subseq token (1+ q) q2))
                  token)))
           (t token))))
@@ -609,12 +613,12 @@ to make on purpose, so the set is pinned."
                                                  ; out of start-node (1,227 lines);
                                                  ; its own split is P3.2b
     ("perform-reorg" . 465)                      ; validation/block.lisp
-    ("%create-transaction-internal" . 442)       ; rpc/wallet-spend.lisp
+    ("%create-transaction-internal" . 442)       ; wallet/wallet-spend.lisp
+    ("rpc-sendall" . 289)                        ; wallet/wallet-spend.lisp
     ("validate-transaction-for-mempool" . 358)   ; validation/transaction.lisp
     ("run-ibd" . 345)                            ; networking/ibd.lisp (+2: keeps node-context peers live, P2c)
     ("validate-block" . 307)                     ; validation/block.lisp
     ("process-received-block" . 300)             ; networking/ibd.lisp
-    ("rpc-sendall" . 289)                        ; rpc/wallet-spend.lisp
     ("ms-from-script" . 243)                     ; validation/miniscript.lisp
     ("connect-block" . 215)                      ; validation/block.lisp
     ("activate-block" . 214))                    ; validation/block.lisp
@@ -720,7 +724,8 @@ byte-buf; the stream codecs and interop's private buffer only lose call sites."
     ("src/mining/" . 1)
     ("src/networking/" . 4)
     ("src/node/" . 36)
-    ("src/rpc/" . 14)
+    ("src/rpc/" . 3)
+    ("src/wallet/" . 11)
     ("src/serialization/" . 49)   ; 4 are macroexpansion-time errors in message-macro.lisp
     ("src/storage/" . 16)
     ("src/util/" . 7)
@@ -758,12 +763,22 @@ hierarchy (§4 P4) and these only go down.")
 . index): a file as \"src/name.lisp\", a module as \"src/name/\". Derived
 from ASDF rather than copied, so a phase-4 reordering cannot leave a stale
 list behind."
-  (loop for child in (asdf:component-children (asdf:find-component :bitcoin-lisp "src"))
-        for i from 0
-        collect (cons (if (typep child 'asdf:module)
-                          (format nil "src/~A/" (asdf:component-name child))
-                          (format nil "src/~A.lisp" (asdf:component-name child)))
-                      i)))
+  (let ((order '()) (per-file '()))
+    (loop for child in (asdf:component-children (asdf:find-component :bitcoin-lisp "src"))
+          for i from 0
+          do (if (typep child 'asdf:module)
+                 (let ((dir (car (last (pathname-directory (asdf:component-pathname child))))))
+                   ;; A module that lives in another module's directory (the
+                   ;; rpc-server module's files are src/rpc/*.lisp, loaded after
+                   ;; the wallet) gets per-file entries instead, which win the
+                   ;; prefix match below over that directory's own entry.
+                   (if (string= dir (asdf:component-name child))
+                       (push (cons (format nil "src/~A/" dir) i) order)
+                       (dolist (file (asdf:component-children child))
+                         (push (cons (format nil "src/~A/~A.lisp" dir (asdf:component-name file)) i)
+                               per-file))))
+                 (push (cons (format nil "src/~A.lisp" (asdf:component-name child)) i) order)))
+    (append (nreverse per-file) (nreverse order))))
 
 (defun %file-layer (file order)
   (cdr (find-if (lambda (e) (uiop:string-prefix-p (car e) file)) order)))
@@ -908,6 +923,7 @@ the measuring functions must measure a known shape correctly."
   (is (string= "bar" (%definition-name "(defmacro bar(x)" "(defmacro ")))
   (is (string= "rpc-getblock" (%definition-name "(define-rpc \"getblock\" (node params)" "(define-rpc ")))
   (is (string= "rpc-echo" (%definition-name "(define-rpc (\"echo\" \"echojson\") (node params)" "(define-rpc ")))
+  (is (string= "rpc-sendall" (%definition-name "(bl.rpc:define-rpc \"sendall\" (node params)" "(bl.rpc:define-rpc ")))
   (is (= 5 (%form-line-count
             (format nil "(defun f ()~%  \"doc with a line that starts like a form:~%~
 (values a b) and a paren char #\\( and a semicolon ; here\"~%  ~

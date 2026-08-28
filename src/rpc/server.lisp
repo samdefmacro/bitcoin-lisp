@@ -884,7 +884,7 @@ must stay a value test (NIL = success), not a key-presence test."
     ;; wallet (Core httprpc.cpp:340 registers the same handler under
     ;; /wallet/); non-wallet methods ignore the binding.
     (setf (hunchentoot:content-type*) "application/json")
-    (let ((*rpc-wallet-name* (wallet-name-from-uri (hunchentoot:script-name*)))
+    (let ((bl.wallet::*rpc-wallet-name* (bl.wallet::wallet-name-from-uri (hunchentoot:script-name*)))
           (body (hunchentoot:raw-post-data :force-text t)))
       ;; Post-read body size check (in case Content-Length was absent or wrong)
       (when (and body (> (length body) bl:+max-rpc-body-size+))

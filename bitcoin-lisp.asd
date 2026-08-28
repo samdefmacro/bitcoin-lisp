@@ -136,6 +136,7 @@
                                (:file "define-rpc")
                                (:file "core-tables")
                                (:file "accessors")
+                               (:file "amounts")
                                (:file "descriptors")
                                ;; The handlers, one file per Core rpc/*.cpp.
                                (:file "blockchain")
@@ -145,7 +146,13 @@
                                (:file "node")
                                (:file "mining")
                                (:file "output-script")
-                               (:file "signmessage")
+                               (:file "signmessage")))
+                 ;; The wallet (Core wallet/ and wallet/rpc/): its own package,
+                 ;; after the RPC helpers it uses and before the server files
+                 ;; that reach into it.
+                 (:module "wallet"
+                  :serial t
+                  :components ((:file "package")
                                (:file "wallet-store")
                                (:file "wallet")
                                (:file "wallet-crypt")
@@ -153,7 +160,12 @@
                                (:file "wallet-coins")
                                (:file "wallet-spend")
                                (:file "psbt")
-                               (:file "merkleproof")
+                               (:file "signmessage")))
+                 ;; The RPC server proper, last: it dispatches to everything above.
+                 (:module "rpc-server"
+                  :pathname "rpc"
+                  :serial t
+                  :components ((:file "merkleproof")
                                (:file "rest")
                                (:file "ui")
                                (:file "server")))

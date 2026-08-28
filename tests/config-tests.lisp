@@ -1605,14 +1605,14 @@ wallet could not be tuned at all.
 
 Fee options are BTC/kvB on the command line and satoshis internally, matching
 -maxtxfee and -fallbackfee, which apply-config-globals already handled."
-  (let ((saved (list bl.rpc::*wallet-min-tx-fee*
-                     bl.rpc::*wallet-discard-rate*
-                     bl.rpc::*wallet-consolidate-feerate*
-                     bl.rpc::*wallet-max-aps-fee*
-                     bl.rpc::*wallet-confirm-target*
-                     bl.rpc::*wallet-signal-rbf*
-                     bl.rpc::*wallet-spend-zero-conf-change*
-                     bl.rpc::*wallet-reject-long-chains*)))
+  (let ((saved (list bl.wallet::*wallet-min-tx-fee*
+                     bl.wallet::*wallet-discard-rate*
+                     bl.wallet::*wallet-consolidate-feerate*
+                     bl.wallet::*wallet-max-aps-fee*
+                     bl.wallet::*wallet-confirm-target*
+                     bl.wallet::*wallet-signal-rbf*
+                     bl.wallet::*wallet-spend-zero-conf-change*
+                     bl.wallet::*wallet-reject-long-chains*)))
     (unwind-protect
          (progn
            (bl::apply-rpc-config-globals
@@ -1620,25 +1620,25 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
               ("consolidatefeerate" . "0.0003") ("maxapsfee" . "0.0001")
               ("txconfirmtarget" . "12") ("walletrbf" . "0")
               ("spendzeroconfchange" . "0") ("walletrejectlongchains" . "0")))
-           (is (= 2000 bl.rpc::*wallet-min-tx-fee*))
-           (is (= 20000 bl.rpc::*wallet-discard-rate*))
-           (is (= 30000 bl.rpc::*wallet-consolidate-feerate*))
-           (is (= 10000 bl.rpc::*wallet-max-aps-fee*))
-           (is (= 12 bl.rpc::*wallet-confirm-target*))
+           (is (= 2000 bl.wallet::*wallet-min-tx-fee*))
+           (is (= 20000 bl.wallet::*wallet-discard-rate*))
+           (is (= 30000 bl.wallet::*wallet-consolidate-feerate*))
+           (is (= 10000 bl.wallet::*wallet-max-aps-fee*))
+           (is (= 12 bl.wallet::*wallet-confirm-target*))
            ;; The three booleans all default TRUE, so a test that only checked
            ;; "can be set" would pass without the option doing anything —
            ;; setting them to 0 is what proves the wiring.
-           (is-false bl.rpc::*wallet-signal-rbf*)
-           (is-false bl.rpc::*wallet-spend-zero-conf-change*)
-           (is-false bl.rpc::*wallet-reject-long-chains*))
-      (setf bl.rpc::*wallet-min-tx-fee* (first saved)
-            bl.rpc::*wallet-discard-rate* (second saved)
-            bl.rpc::*wallet-consolidate-feerate* (third saved)
-            bl.rpc::*wallet-max-aps-fee* (fourth saved)
-            bl.rpc::*wallet-confirm-target* (fifth saved)
-            bl.rpc::*wallet-signal-rbf* (sixth saved)
-            bl.rpc::*wallet-spend-zero-conf-change* (seventh saved)
-            bl.rpc::*wallet-reject-long-chains* (eighth saved))))
+           (is-false bl.wallet::*wallet-signal-rbf*)
+           (is-false bl.wallet::*wallet-spend-zero-conf-change*)
+           (is-false bl.wallet::*wallet-reject-long-chains*))
+      (setf bl.wallet::*wallet-min-tx-fee* (first saved)
+            bl.wallet::*wallet-discard-rate* (second saved)
+            bl.wallet::*wallet-consolidate-feerate* (third saved)
+            bl.wallet::*wallet-max-aps-fee* (fourth saved)
+            bl.wallet::*wallet-confirm-target* (fifth saved)
+            bl.wallet::*wallet-signal-rbf* (sixth saved)
+            bl.wallet::*wallet-spend-zero-conf-change* (seventh saved)
+            bl.wallet::*wallet-reject-long-chains* (eighth saved))))
   ;; Malformed values are refused rather than silently leaving the default.
   (dolist (bad '((("mintxfee" . "notanumber")) (("txconfirmtarget" . "0"))
                  (("txconfirmtarget" . "x")) (("maxapsfee" . "zz"))))
@@ -1655,30 +1655,30 @@ EFFECT — a freshly made wallet manager's keypool size, and the directory
 WALLETS-DIRECTORY hands back — rather than through the variable, because the
 keypool size is read as a struct slot DEFAULT and a test on the variable alone
 would pass even if no struct ever consulted it."
-  (let ((saved-keypool bl.rpc::+default-keypool-size+)
-        (saved-dir bl.rpc::*wallet-directory*))
+  (let ((saved-keypool bl.wallet::+default-keypool-size+)
+        (saved-dir bl.wallet::*wallet-directory*))
     (unwind-protect
          (progn
            (bl::apply-rpc-config-globals '(("keypool" . "37")))
-           (is (= 37 (bl.rpc::wallet-manager-keypool-size
-                      (bl.rpc::make-wallet-manager
+           (is (= 37 (bl.wallet::wallet-manager-keypool-size
+                      (bl.wallet::make-wallet-manager
                        :data-directory #p"/tmp/kp/"))))
            ;; Relative -walletdir hangs off the data directory, absolute wins
            ;; outright, and NIL restores <datadir>/wallets/.
-           (let ((manager (bl.rpc::make-wallet-manager
+           (let ((manager (bl.wallet::make-wallet-manager
                            :data-directory #p"/tmp/dd/")))
-             (setf bl.rpc::*wallet-directory* nil)
+             (setf bl.wallet::*wallet-directory* nil)
              (is (equal #p"/tmp/dd/wallets/"
-                        (bl.rpc::wallets-directory manager)))
+                        (bl.wallet::wallets-directory manager)))
              (bl::apply-rpc-config-globals '(("walletdir" . "purses")))
              (is (equal #p"/tmp/dd/purses/"
-                        (bl.rpc::wallets-directory manager)))
+                        (bl.wallet::wallets-directory manager)))
              (bl::apply-rpc-config-globals
               '(("walletdir" . "/srv/keys")))
              (is (equal #p"/srv/keys/"
-                        (bl.rpc::wallets-directory manager)))))
-      (setf bl.rpc::+default-keypool-size+ saved-keypool
-            bl.rpc::*wallet-directory* saved-dir)))
+                        (bl.wallet::wallets-directory manager)))))
+      (setf bl.wallet::+default-keypool-size+ saved-keypool
+            bl.wallet::*wallet-directory* saved-dir)))
   ;; Core rejects -keypool=0; so do we, rather than making an unusable wallet.
   (dolist (bad '((("keypool" . "0")) (("keypool" . "-1")) (("keypool" . "x"))))
     (signals error (bl::apply-rpc-config-globals bad)))

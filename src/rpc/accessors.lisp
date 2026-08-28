@@ -195,3 +195,9 @@ the object-valued counterpart of JSON-ARRAY (rpc-result->json turns a
 non-empty (string . value) alist into a hash-table by itself, but cannot
 tell an empty object from null)."
   (or alist (make-hash-table :test 'equal)))
+
+(defun %obj-get (obj key)
+  "Read KEY from a JSON object that arrived as either an alist (from tests /
+JSON-RPC 1.x) or a hash-table (from yason)."
+  (cond ((hash-table-p obj) (gethash key obj))
+        ((listp obj) (cdr (assoc key obj :test #'string=)))))

@@ -728,18 +728,18 @@ the reason a multipath import cannot carry a label (:203-206)."
              (declare (ignore w ts))
              (push (cons (gethash "desc" data) (gethash "internal" data)) seen)
              '(("success" . t))))
-      (let ((original (symbol-function 'bl.rpc::%process-descriptor-import)))
+      (let ((original (symbol-function 'bl.wallet::%process-descriptor-import)))
         (unwind-protect
              (progn
-               (setf (symbol-function 'bl.rpc::%process-descriptor-import)
+               (setf (symbol-function 'bl.wallet::%process-descriptor-import)
                      #'fake-import)
                (let ((data (make-hash-table :test 'equal)))
                  (setf (gethash "desc" data) "wpkh(xpub/<0;1>/*)")
-                 (let ((result (bl.rpc::%process-multipath-import
+                 (let ((result (bl.wallet::%process-multipath-import
                                 wallet data 1
                                 '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)"))))
                    (is (eq t (cdr (assoc "success" result :test #'string=)))))))
-          (setf (symbol-function 'bl.rpc::%process-descriptor-import)
+          (setf (symbol-function 'bl.wallet::%process-descriptor-import)
                 original))))
     (setf seen (nreverse seen))
     (is (= 2 (length seen)))
@@ -755,7 +755,7 @@ the reason a multipath import cannot carry a label (:203-206)."
   (let ((data (make-hash-table :test 'equal)))
     (setf (gethash "desc" data) "wpkh(xpub/<0;1>/*)"
           (gethash "label" data) "mine")
-    (let ((result (bl.rpc::%process-multipath-import
+    (let ((result (bl.wallet::%process-multipath-import
                    :fake data 1 '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)"))))
       (is-false (cdr (assoc "success" result :test #'string=)))
       (is (string= "Multipath descriptors should not have a label"
@@ -766,7 +766,7 @@ the reason a multipath import cannot carry a label (:203-206)."
   (let ((data (make-hash-table :test 'equal)))
     (setf (gethash "desc" data) "wpkh(xpub/<0;1;2>/*)"
           (gethash "internal" data) t)
-    (let ((result (bl.rpc::%process-multipath-import
+    (let ((result (bl.wallet::%process-multipath-import
                    :fake data 1 '("a" "b" "c"))))
       (is-false (cdr (assoc "success" result :test #'string=))))))
 
@@ -812,7 +812,7 @@ from getaddressinfo and listunspent for any wallet holding a policy descriptor."
          (c "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
     (multiple-value-bind (desc scripts pairs)
         (%dt-expand-pairs (format nil "wsh(and_v(v:pk(~A),older(42)))" a))
-      (let ((body (bl.rpc::%infer-desc-body desc (first scripts) scripts pairs 0)))
+      (let ((body (bl.wallet::%infer-desc-body desc (first scripts) scripts pairs 0)))
         (is-true (stringp body) "inference returned ~S" body)
         (is-true (search "wsh(and_v(v:pk(" body))
         (is-true (search "older(42))" body))
@@ -822,7 +822,7 @@ from getaddressinfo and listunspent for any wallet holding a policy descriptor."
     ;; keys transposed is a backup that restores a different wallet.
     (multiple-value-bind (desc scripts pairs)
         (%dt-expand-pairs (format nil "wsh(andor(pk(~A),pk(~A),pk(~A)))" a b c))
-      (let ((body (bl.rpc::%infer-desc-body desc (first scripts) scripts pairs 0)))
+      (let ((body (bl.wallet::%infer-desc-body desc (first scripts) scripts pairs 0)))
         (is-true (stringp body))
         (let ((pa (search a body)) (pb (search b body)) (pc (search c body)))
           (is-true (and pa pb pc) "not every key appears in the inferred body")
@@ -934,7 +934,7 @@ wrong key restores a different wallet."
          (x-b (subseq b 2)))
     (multiple-value-bind (desc scripts pairs)
         (%dt-expand-pairs (format nil "tr(~A,{pk(~A),pk(~A)})" +tr-xonly+ a b))
-      (let ((body (bl.rpc::%infer-desc-body desc (first scripts)
+      (let ((body (bl.wallet::%infer-desc-body desc (first scripts)
                                                       scripts pairs 0)))
         (is-true (stringp body) "inference returned ~S" body)
         ;; Each leaf reports its OWN key, x-only (Core builds the inferred
@@ -1024,7 +1024,7 @@ whatever the signer happened to build."
              (pairs (mapcar (lambda (k)
                               (cons k (bl.rpc::%desc-key-pubkey-at k 0)))
                             (bl.rpc::out-desc-ordered-keys desc)))
-             (next (bl.rpc::%pairs-splitter (rest pairs))))
+             (next (bl.wallet::%pairs-splitter (rest pairs))))
         (setf (gethash (cons prev-txid 0) prevmap) (list spk amount nil nil))
         (dolist (wif held-wifs)
           (let* ((sk (bl.crypto:wif-to-private-key wif))
@@ -1042,7 +1042,7 @@ whatever the signer happened to build."
           (values (mapcar #'cdr errs)
                   (map 'list (lambda (st) (mapcar #'length st))
                        (or (bl.ser:transaction-witness tx) #()))
-                  (nth-value 0 (bl.rpc::%verify-tx-scripts tx prevmap))))))))
+                  (nth-value 0 (bl.wallet::%verify-tx-scripts tx prevmap))))))))
 
 (test tr-script-path-spends-verify
   "A tr() output whose INTERNAL key we do not hold can only be spent through a

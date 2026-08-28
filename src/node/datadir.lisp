@@ -229,7 +229,7 @@ the file ignored would run the node on settings the operator cannot see in it."
   "Rewrite PATH with ALIST plus Core's warning comment.
 
 Temp file, fsync, rename, fsync the directory — the same discipline
-BITCOIN-LISP.RPC::%WRITE-SETTINGS uses for the wallet half of this very file.
+BITCOIN-LISP.WALLET::%WRITE-SETTINGS uses for the wallet half of this very file.
 Core writes it through a temp and a rename too (args.cpp:429-460). Without the
 fsyncs a crash can leave the renamed file empty or revert the rename, and this
 is now rewritten on EVERY start, so it is the crash window an operator hits

@@ -13,7 +13,7 @@
 else NIL — the fast-path gate shared by the wallet hooks."
   (let ((manager (and *node* (node-wallet-manager *node*))))
     (and manager
-         (bl.rpc:wallet-manager-has-wallets-p manager)
+         (bl.wallet:wallet-manager-has-wallets-p manager)
          manager)))
 
 (defun wallet-notify-block-connected (chainstate block block-hash height)
@@ -26,7 +26,7 @@ old blocks are Core's ChainstateRole::historical, which the wallet ignores
     (when (and manager
                (not (bl.store:chain-state-target-blockhash chainstate)))
       (handler-case
-          (bl.rpc:wallets-block-connected
+          (bl.wallet:wallets-block-connected
            manager (node-mempool *node*) chainstate block block-hash height)
         (error (e)
           (log-error "Wallet processing of connected block at height ~D FAILED: ~A"
@@ -40,7 +40,7 @@ tip-first."
     (when (and manager
                (not (bl.store:chain-state-target-blockhash chainstate)))
       (handler-case
-          (bl.rpc:wallets-block-disconnected manager block height)
+          (bl.wallet:wallets-block-disconnected manager block height)
         (error (e)
           (log-error "Wallet processing of disconnected block at height ~D FAILED: ~A"
                      height e))))))
@@ -50,7 +50,7 @@ tip-first."
   (let ((manager (%wallet-hook-manager)))
     (when manager
       (handler-case
-          (bl.rpc:wallets-mempool-tx-added
+          (bl.wallet:wallets-mempool-tx-added
            manager (node-mempool *node*) tx)
         (error (e)
           (log-error "Wallet processing of mempool tx add FAILED: ~A" e))))))
@@ -63,7 +63,7 @@ hook (Core removeUnchecked, txmempool.cpp:269-275)."
     (let ((manager (%wallet-hook-manager)))
       (when manager
         (handler-case
-            (bl.rpc:wallets-mempool-tx-removed
+            (bl.wallet:wallets-mempool-tx-removed
              manager (node-mempool *node*) tx reason)
           (error (e)
             (log-error "Wallet processing of mempool tx removal FAILED: ~A" e)))))))
