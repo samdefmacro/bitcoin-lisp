@@ -44,6 +44,7 @@ src/; cold = cold-battery check count / failures.
 | 2026-08-28 | P3.1 | node.lisp (6,477 lines) → src/node/ ×21 files by concern (params … init), pure move, same package; source-text tests read the directory | 0 | 11 | 61 | 42 | 8 | 195 | 11 | 6,753 | 34,453 / 0 (fresh) |
 | 2026-08-28 | P3.2 | start-node 1,227 → 169 lines: 12 named init steps (%init-logging … %start-network-services) + %sync-thread-loop; each step takes only the keywords it reads | 0 | 11 | 63 | 42 | 8 | 195 | 11 | 6,753 | 34,453 / 0 (fresh) |
 | 2026-08-28 | P3.3 | rpc/methods.lisp (6,753) → 8 files named after Core rpc/*.cpp; errors.lisp (36 error codes + rpc-error, first in the module, 2 duplicate defconstants dropped); core-tables.lisp (3 generated tables out of server.lisp); 11 RPCs moved to the file Core keeps them in | 0 | 11 | 63 | 42 | 8 | 195 | 11 | 4,029 | 34,453 / 0 (fresh); undefined-variable warnings 129 → 52 |
+| 2026-08-28 | P3.4 | wallet → package bitcoin-lisp.wallet (bl.wallet), src/wallet/ ×9 files, 10 exports; money helpers to src/rpc/amounts.lisp; asd rpc → wallet → rpc-server; ~1,100 cross-package references qualified mechanically from a definition map; definition scanner taught `(bl.rpc:define-rpc ` | 0 | 11 | 63 | 42 | 8 | 195 | 11 | 4,029 | 34,455 / 0 (fresh) |
 
 ## Notes
 

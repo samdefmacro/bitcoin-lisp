@@ -1,4 +1,4 @@
-(in-package #:bitcoin-lisp.rpc)
+(in-package #:bitcoin-lisp.wallet)
 
 ;;; Wallet P1: wallet container + descriptor keystore (docs/wallet-plan.md §5 P1)
 ;;;
@@ -89,10 +89,10 @@ these for both external and internal (wallet.cpp:3595-3602).")
 (defun out-desc-output-type (desc)
   "Core Descriptor::GetOutputType: the OutputType a descriptor's scripts pay
 to, or NIL when it has none (bare pk/multi/combo)."
-  (case (out-desc-kind desc)
+  (case (bl.rpc::out-desc-kind desc)
     (:pkh :legacy)
     (:wpkh :bech32)
-    (:sh (if (member (out-desc-kind (out-desc-sub desc)) '(:wpkh :wsh))
+    (:sh (if (member (bl.rpc::out-desc-kind (bl.rpc::out-desc-sub desc)) '(:wpkh :wsh))
              :p2sh-segwit
              :legacy))
     (:wsh :bech32)
@@ -101,7 +101,7 @@ to, or NIL when it has none (bare pk/multi/combo)."
 
 (defun out-desc-single-type-p (desc)
   "Core IsSingleType: false only for combo()."
-  (not (eq (out-desc-kind desc) :combo)))
+  (not (eq (bl.rpc::out-desc-kind desc) :combo)))
 
 ;;; --- Structures ---
 
@@ -116,7 +116,7 @@ map, and the descriptor's private keys."
   (range-start 0 :type (signed-byte 32))
   (range-end 0 :type (signed-byte 32))    ; exclusive; grows with TopUp
   (next-index 0 :type (signed-byte 32))   ; next position to hand out
-  (cache (make-descriptor-cache))
+  (cache (bl.rpc::make-descriptor-cache))
   ;; script bytes -> descriptor range index (Core m_map_script_pub_keys —
   ;; the IsMine hash lookup)
   (script-map (make-hash-table :test 'equalp) :type hash-table)
@@ -471,7 +471,7 @@ next_index landing on disk BEFORE the address is handed out."
                 (wdb-key-descriptor-parent-cache +wdb-key-walletdescriptorcache+
                                                  id expr-index)
                 (wdb-xpub-value xpub)))
-             (descriptor-cache-parent-xpubs diff))
+             (bl.rpc::descriptor-cache-parent-xpubs diff))
     (maphash (lambda (expr-index inner)
                (maphash (lambda (der-index xpub)
                           (bl.store:leveldb-writebatch-put
@@ -479,14 +479,14 @@ next_index landing on disk BEFORE the address is handed out."
                            (wdb-key-descriptor-derived-cache id expr-index der-index)
                            (wdb-xpub-value xpub)))
                         inner))
-             (descriptor-cache-derived-xpubs diff))
+             (bl.rpc::descriptor-cache-derived-xpubs diff))
     (maphash (lambda (expr-index xpub)
                (bl.store:leveldb-writebatch-put
                 batch
                 (wdb-key-descriptor-parent-cache +wdb-key-walletdescriptorlhcache+
                                                  id expr-index)
                 (wdb-xpub-value xpub)))
-             (descriptor-cache-last-hardened-xpubs diff))))
+             (bl.rpc::descriptor-cache-last-hardened-xpubs diff))))
 
 ;;; --- TopUp (Core DescriptorScriptPubKeyMan::TopUpWithDB, scriptpubkeyman.cpp:1001) ---
 
@@ -506,7 +506,7 @@ pubkey map."
          (new-range-end (max (+ (desc-spkm-next-index spkm) target)
                              (desc-spkm-range-end spkm))))
     ;; A non-ranged descriptor just fills its single cache slot.
-    (unless (out-desc-ranged-p (desc-spkm-desc spkm))
+    (unless (bl.rpc::out-desc-ranged-p (desc-spkm-desc spkm))
       (setf new-range-end 1
             (desc-spkm-range-end spkm) 1
             (desc-spkm-range-start spkm) 0))
@@ -514,15 +514,15 @@ pubkey map."
                          (spkm-privkey-provider wallet spkm))))
       (loop for i from (1+ (desc-spkm-max-cached-index spkm)) below new-range-end
             do (multiple-value-bind (scripts pubkeys)
-                   (out-desc-expand-from-cache (desc-spkm-desc spkm) i
+                   (bl.rpc::out-desc-expand-from-cache (desc-spkm-desc spkm) i
                                                (desc-spkm-cache spkm))
                  (unless scripts
-                   (let ((temp-cache (make-descriptor-cache)))
+                   (let ((temp-cache (bl.rpc::make-descriptor-cache)))
                      (handler-case
                          (multiple-value-setq (scripts pubkeys)
-                           (out-desc-expand-with-provider
+                           (bl.rpc::out-desc-expand-with-provider
                             (desc-spkm-desc spkm) i provider temp-cache))
-                       (descriptor-derivation-error ()
+                       (bl.rpc::descriptor-derivation-error ()
                          ;; Core logs this too (scriptpubkeyman.cpp:1091):
                          ;; both callers discard our NIL, so a genuine
                          ;; failure would otherwise be invisible. The
@@ -536,7 +536,7 @@ pubkey map."
                      ;; Merge and persist only the genuinely new cache items.
                      (%spkm-write-cache-diff
                       spkm
-                      (descriptor-cache-merge-and-diff (desc-spkm-cache spkm)
+                      (bl.rpc::descriptor-cache-merge-and-diff (desc-spkm-cache spkm)
                                                        temp-cache)
                       batch)))
                  (%spkm-note-expansion spkm i scripts pubkeys)
@@ -570,7 +570,7 @@ WALLET is unused beyond symmetry with the other spkm operations."
   (setf (desc-spkm-cache spkm) cache)
   (loop for i from (desc-spkm-range-start spkm) below (desc-spkm-range-end spkm)
         do (multiple-value-bind (scripts pubkeys)
-               (out-desc-expand-from-cache (desc-spkm-desc spkm) i cache)
+               (bl.rpc::out-desc-expand-from-cache (desc-spkm-desc spkm) i cache)
              (unless scripts
                (error "Error: Unable to expand wallet descriptor from cache"))
              (dolist (script scripts)
@@ -596,7 +596,7 @@ a hash lookup in m_map_script_pub_keys, scriptpubkeyman.cpp:863)."
   "Core CanGetAddresses: single-type, ranged, and either private keys are
 present (TopUp can extend) or precomputed addresses remain."
   (and (out-desc-single-type-p (desc-spkm-desc spkm))
-       (out-desc-ranged-p (desc-spkm-desc spkm))
+       (bl.rpc::out-desc-ranged-p (desc-spkm-desc spkm))
        (or (spkm-have-private-keys-p spkm)
            (< (desc-spkm-next-index spkm) (desc-spkm-range-end spkm)))))
 
@@ -617,27 +617,27 @@ descriptor record — the fsynced write happens BEFORE the address is returned,
 so a crash can never reissue a handed-out address (funds-critical; Core
 GetNewDestination persists via WriteDescriptor before returning)."
   (unless (spkm-can-get-addresses spkm)
-    (error 'rpc-error :code +rpc-wallet-keypool-ran-out+
+    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-keypool-ran-out+
                       :message "No addresses available"))
   (assert (out-desc-single-type-p (desc-spkm-desc spkm)))
   (let ((desc-type (out-desc-output-type (desc-spkm-desc spkm))))
     (unless (eq type desc-type)
-      (error 'rpc-error :code +rpc-internal-error+
+      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-internal-error+
                         :message "GetNewDestination: Types are inconsistent. Stored type does not match type of newly generated address")))
   (spkm-top-up wallet spkm)
   (when (and (<= (desc-spkm-range-end spkm) (desc-spkm-max-cached-index spkm))
              (not (spkm-top-up wallet spkm 1)))
-    (error 'rpc-error :code +rpc-wallet-keypool-ran-out+
+    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-keypool-ran-out+
                       :message "Error: Keypool ran out, please call keypoolrefill first"))
-  (let ((scripts (out-desc-expand-from-cache (desc-spkm-desc spkm)
+  (let ((scripts (bl.rpc::out-desc-expand-from-cache (desc-spkm-desc spkm)
                                              (desc-spkm-next-index spkm)
                                              (desc-spkm-cache spkm))))
     (unless scripts
-      (error 'rpc-error :code +rpc-wallet-keypool-ran-out+
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-keypool-ran-out+
                         :message "Error: Keypool ran out, please call keypoolrefill first"))
-    (let ((address (%script->address (first scripts) (wallet-network wallet))))
+    (let ((address (bl.rpc::%script->address (first scripts) (wallet-network wallet))))
       (unless address
-        (error 'rpc-error :code +rpc-wallet-keypool-ran-out+
+        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-keypool-ran-out+
                           :message "Error: Cannot extract destination from the generated scriptpubkey"))
       (incf (desc-spkm-next-index spkm))
       ;; Funds-critical ordering: persist next_index (fsync) before returning.
@@ -719,8 +719,8 @@ sh(wpkh) 49h, wpkh 84h, tr 86h; coin 0h mainnet / 1h test chains; account 0h;
 
 (defun %make-spkm-from-descriptor (desc creation-time range-start
                                    range-end next-index)
-  (let ((canonical (descriptor-add-checksum (out-desc-string desc))))
-    (make-desc-spkm :id (descriptor-id desc)
+  (let ((canonical (bl.rpc::descriptor-add-checksum (bl.rpc::out-desc-string desc))))
+    (make-desc-spkm :id (bl.rpc::descriptor-id desc)
                     :desc desc
                     :desc-string canonical
                     :creation-time creation-time
@@ -778,7 +778,7 @@ wallet.cpp:3594-3602)."
         (dolist (type +output-types+)
           (let* ((desc-str (generate-wallet-descriptor-string
                             xpub-string type internal network))
-                 (desc (parse-descriptor desc-str network))
+                 (desc (bl.rpc::parse-descriptor desc-str network))
                  (spkm (%make-spkm-from-descriptor desc now 0 0 0)))
             (setf (gethash (desc-spkm-id spkm) (wallet-spkms wallet)) spkm)
             ;; Store the master private key for this descriptor, then the
@@ -815,8 +815,8 @@ its descriptor by exactly the path wallet creation does — a second
 implementation would be a second set of derivation-path bugs."
   (let* ((desc-str (generate-wallet-descriptor-string
                     xpub-string type internal (wallet-network wallet)))
-         (desc (parse-descriptor desc-str (wallet-network wallet)))
-         (id (descriptor-id desc)))
+         (desc (bl.rpc::parse-descriptor desc-str (wallet-network wallet)))
+         (id (bl.rpc::descriptor-id desc)))
     (when (gethash id (wallet-spkms wallet))
       (return-from %create-one-descriptor-spkm nil))
     (let ((spkm (%make-spkm-from-descriptor desc now 0 0 0)))
@@ -839,22 +839,22 @@ cannot recover from their backup of the other one."
     (dolist (table (list (wallet-external-spkms wallet)
                          (wallet-internal-spkms wallet)))
       (loop for spkm being the hash-values of table
-            do (dolist (key (out-desc-ordered-keys (desc-spkm-desc spkm)))
-                 (let ((xprv (%desc-key-root-xprv
+            do (dolist (key (bl.rpc::out-desc-ordered-keys (desc-spkm-desc spkm)))
+                 (let ((xprv (bl.rpc::%desc-key-root-xprv
                               key (spkm-privkey-provider wallet spkm))))
                    (when xprv
                      (pushnew (bl.crypto:bip32-serialize xprv) roots
                               :test #'string=))))))
     (cond
       ((null roots)
-       (error 'rpc-error :code +rpc-invalid-address-or-key+
+       (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                          :message "Unable to determine which HD key to use from active descriptors. Please specify with 'hdkey'"))
       ((cdr roots)
-       (error 'rpc-error :code +rpc-invalid-address-or-key+
+       (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                          :message "Unable to determine which HD key to use from active descriptors. Please specify with 'hdkey'"))
       (t (bl.crypto:bip32-parse (first roots))))))
 
-(define-rpc "createwalletdescriptor" (node params)
+(bl.rpc:define-rpc "createwalletdescriptor" (node params)
   "Create the wallet's descriptor for an address type it does not yet have
  (Core createwalletdescriptor, wallet/rpc/wallet.cpp:745-836).
 
@@ -865,7 +865,7 @@ result is an array."
          (type-string (first params))
          (options (second params)))
     (unless (stringp type-string)
-      (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for type"))
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+ :message "Expected type string for type"))
     (let ((type (cdr (assoc type-string
                             '(("legacy" . :legacy)
                               ("p2sh-segwit" . :p2sh-segwit)
@@ -873,19 +873,19 @@ result is an array."
                               ("bech32m" . :bech32m))
                             :test #'string=))))
       (unless type
-        (error 'rpc-error :code +rpc-invalid-address-or-key+
+        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                           :message (format nil "Unknown address type '~A'" type-string)))
       (let* ((internal-given (and (hash-table-p options)
                                   (nth-value 1 (gethash "internal" options))))
              (internals (if internal-given
-                            (list (%positional-bool (gethash "internal" options)))
+                            (list (bl.rpc::%positional-bool (gethash "internal" options)))
                             '(nil t)))
              (hdkey (and (hash-table-p options) (gethash "hdkey" options))))
         (with-wallet-lock (wallet)
           (wallet-ensure-unlocked wallet)
           (let* ((root (if hdkey
                            (or (ignore-errors (bl.crypto:bip32-parse hdkey))
-                               (error 'rpc-error :code +rpc-invalid-address-or-key+
+                               (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                                                  :message "Unable to parse HD key. Please provide a valid xpub"))
                            (%wallet-single-active-root-xprv wallet)))
                  (xprv (if (bl.crypto:ext-key-privatep root)
@@ -893,7 +893,7 @@ result is an array."
                            ;; An xpub was given: we must hold its private half,
                            ;; or the descriptor would be watch-only in a wallet
                            ;; that claims to control it.
-                           (error 'rpc-error :code +rpc-invalid-address-or-key+
+                           (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                                              :message (format nil "Private key for ~A is not known"
                                                               (bl.crypto:bip32-serialize root)))))
                  (xpub-string (bl.crypto:bip32-serialize
@@ -910,7 +910,7 @@ result is an array."
                   (when spkm (push spkm made))))
               (unless made
                 ;; Nothing written; the batch is dropped unapplied.
-                (error 'rpc-error :code +rpc-wallet-error+
+                (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                                   :message "Descriptor already exists"))
               (bl.store:leveldb-write (wallet-db wallet) batch :sync t))
             `(("descs" . ,(mapcar (lambda (spkm)
@@ -970,7 +970,7 @@ a plaintext walletdescriptorkey record never reaches the disk at all, so
 there is nothing for a later compaction to have to scrub. The wallet is
 left LOCKED."
   (unless (%valid-wallet-name-p name)
-    (error 'rpc-error :code +rpc-invalid-parameter+
+    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                       :message (if (and (stringp name) (zerop (length name)))
                                    "Wallet name cannot be empty"
                                    (format nil "Invalid wallet name ~S" name))))
@@ -978,7 +978,7 @@ left LOCKED."
     (let ((path (wallet-directory manager name)))
       (when (or (gethash name (wallet-manager-wallets manager))
                 (probe-file path))
-        (error 'rpc-error :code +rpc-wallet-already-exists+
+        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-already-exists+
                           :message (format nil "Failed to create database path '~A'. Database already exists."
                                            (namestring path))))
       (let* ((encrypt-p (and (stringp passphrase) (plusp (length passphrase))))
@@ -1011,14 +1011,14 @@ left LOCKED."
                                                        (wallet-network wallet))))
               (when encrypt-p
                 (unless (encrypt-wallet wallet passphrase)
-                  (error 'rpc-error :code +rpc-wallet-encryption-failed+
+                  (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-encryption-failed+
                                     :message "Error: Wallet created but failed to encrypt."))
                 ;; Blank was only forced to defer the seed; when the caller
                 ;; did not ask for a blank wallet, derive it now, under the
                 ;; freshly minted master key.
                 (unless blank
                   (unless (unlock-wallet wallet passphrase)
-                    (error 'rpc-error :code +rpc-wallet-encryption-failed+
+                    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-encryption-failed+
                                       :message "Error: Wallet was encrypted but could not be unlocked"))
                   (wallet-setup-descriptor-spkms wallet (generate-wallet-master-key
                                                          (wallet-network wallet)))
@@ -1060,25 +1060,25 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
              ;; (Core LoadWalletFlags, wallet.cpp:1767).
              (when (plusp (logxor (ash (logand flags +known-wallet-flags+) -32)
                                   (ash flags -32)))
-               (error 'rpc-error :code +rpc-wallet-error+
+               (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                                  :message "Unknown wallet flags"))
              (setf (wallet-flags wallet) flags)))
           ((equal type +wdb-key-walletdescriptor+)
            (multiple-value-bind (desc-str creation-time next-index range-start range-end)
                (wdb-parse-descriptor-value (cdr rec))
-             (let* ((desc (parse-descriptor desc-str network :require-checksum t))
+             (let* ((desc (bl.rpc::parse-descriptor desc-str network :require-checksum t))
                     (spkm (%make-spkm-from-descriptor desc creation-time
                                                       range-start range-end
                                                       next-index)))
                ;; The stored id must round-trip; guard against corruption.
                (unless (equalp (desc-spkm-id spkm) fields)
-                 (error 'rpc-error :code +rpc-wallet-error+
+                 (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                                    :message "Wallet descriptor record id mismatch"))
                (setf (gethash (desc-spkm-id spkm) (wallet-spkms wallet)) spkm))))
           ((equal type +wdb-key-mkey+)
            (let ((id (wdb-parse-mkey-fields fields)))
              (when (gethash id (wallet-master-keys wallet))
-               (error 'rpc-error :code +rpc-wallet-error+
+               (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                                  :message (format nil "Error reading wallet database: duplicate CMasterKey id ~D" id)))
              (multiple-value-bind (crypted salt method iterations other)
                  (wdb-parse-mkey-value (cdr rec))
@@ -1138,7 +1138,7 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                  (push "Found a descriptor key for an unknown descriptor" warnings)
                  (let ((priv (wdb-parse-descriptor-key-value (cdr rec) pubkey)))
                    (unless priv
-                     (error 'rpc-error :code +rpc-wallet-error+
+                     (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                                        :message "Error reading wallet database: descriptor private key checksum mismatch"))
                    (setf (gethash (bl.crypto:hash160 pubkey)
                                   (desc-spkm-keys spkm))
@@ -1155,7 +1155,7 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                ((null spkm)
                 (push "Found a descriptor key for an unknown descriptor" warnings))
                ((not (member (length pubkey) '(33 65)))
-                (error 'rpc-error :code +rpc-wallet-error+
+                (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                                   :message "Error reading wallet database: descriptor encrypted key CPubKey corrupt"))
                (t
                 (setf (gethash (bl.crypto:hash160 pubkey)
@@ -1164,24 +1164,24 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
           ((equal type +wdb-key-walletdescriptorcache+)
            (let* ((id (subseq fields 0 32))
                   (cache (or (gethash id caches)
-                             (setf (gethash id caches) (make-descriptor-cache))))
+                             (setf (gethash id caches) (bl.rpc::make-descriptor-cache))))
                   (xpub (wdb-parse-xpub-value (cdr rec) network)))
              (%wparse (s fields)
                (bl.ser:read-bytes s 32)
                (let ((key-exp (bl.ser:read-uint32-le s)))
                  (if (= (length fields) 40)      ; id + keyexp + derindex
-                     (setf (descriptor-cache-derived
+                     (setf (bl.rpc::descriptor-cache-derived
                             cache key-exp (bl.ser:read-uint32-le s))
                            xpub)
-                     (setf (descriptor-cache-parent cache key-exp) xpub))))))
+                     (setf (bl.rpc::descriptor-cache-parent cache key-exp) xpub))))))
           ((equal type +wdb-key-walletdescriptorlhcache+)
            (let* ((id (subseq fields 0 32))
                   (cache (or (gethash id caches)
-                             (setf (gethash id caches) (make-descriptor-cache))))
+                             (setf (gethash id caches) (bl.rpc::make-descriptor-cache))))
                   (xpub (wdb-parse-xpub-value (cdr rec) network)))
              (%wparse (s fields)
                (bl.ser:read-bytes s 32)
-               (setf (descriptor-cache-last-hardened
+               (setf (bl.rpc::descriptor-cache-last-hardened
                       cache (bl.ser:read-uint32-le s))
                      xpub))))
           ((or (equal type +wdb-key-activeexternalspk+)
@@ -1201,7 +1201,7 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
     (loop for spkm being the hash-values of (wallet-spkms wallet)
           do (spkm-set-cache wallet spkm
                              (or (gethash (desc-spkm-id spkm) caches)
-                                 (make-descriptor-cache)))
+                                 (bl.rpc::make-descriptor-cache)))
              ;; Core wires NotifyFirstKeyTimeChanged -> MaybeUpdateBirthTime
              ;; per SPKM (wallet.cpp:3556).
              (wallet-maybe-update-birth-time wallet
@@ -1228,14 +1228,14 @@ locator catch-up rescan is a separate step (wallet-attach-chain) run by the
 RPC after registration, mirroring Core's LoadWallet -> AttachChain split."
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (when (gethash name (wallet-manager-wallets manager))
-      (error 'rpc-error :code +rpc-wallet-already-loaded+
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-already-loaded+
                         :message (format nil "Wallet \"~A\" is already loaded." name)))
     (unless (%valid-wallet-name-p name)
-      (error 'rpc-error :code +rpc-wallet-not-found+
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-found+
                         :message (format nil "Wallet \"~A\" not found." name)))
     (let ((path (wallet-directory manager name)))
       (unless (wallet-db-exists-p path)
-        (error 'rpc-error :code +rpc-wallet-not-found+
+        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-found+
                           :message (format nil "Wallet file verification failed. Failed to load database path '~A'. Path does not exist."
                                            (namestring path))))
       (let* ((db (wallet-db-open path))
@@ -1274,7 +1274,7 @@ shutdown path — which flags the scan to abort and proceeds."
   (when (wallet-scanning-since wallet)
     (if force
         (setf (wallet-abort-rescan wallet) t)
-        (error 'rpc-error :code +rpc-wallet-error+
+        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                           :message "Wallet is currently rescanning. Abort existing rescan or wait.")))
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (with-wallet-lock (wallet)
@@ -1410,7 +1410,7 @@ updated, which the caller surfaces as a warning rather than failing the RPC."
 std::optional<bool>: NIL for null/omitted, :FALSE for the explicit-false
 sentinel, :TRUE otherwise."
   (cond ((null value) nil)
-        ((eq value +json-false+) :false)
+        ((eq value bl.rpc:+json-false+) :false)
         (t :true)))
 
 (defun %load-on-startup-warning (action)
@@ -1457,7 +1457,7 @@ the request came in on the base endpoint. Bound per-request by rpc-handler.")
   "The node's wallet manager, or the same error a no-wallet Core build gives
 for wallet RPCs: method not found."
   (or (bl::node-wallet-manager node)
-      (error 'rpc-error :code +rpc-method-not-found+
+      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-method-not-found+
                         :message "Method not found (wallet support is disabled)")))
 
 (defun wallet-for-request (node)
@@ -1468,15 +1468,15 @@ sole loaded wallet; errors match Core's."
     (bt:with-recursive-lock-held ((wallet-manager-lock manager))
       (if *rpc-wallet-name*
           (or (gethash *rpc-wallet-name* (wallet-manager-wallets manager))
-              (error 'rpc-error :code +rpc-wallet-not-found+
+              (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-found+
                                 :message "Requested wallet does not exist or is not loaded"))
           (let ((count (hash-table-count (wallet-manager-wallets manager))))
             (case count
               (1 (gethash (first (wallet-manager-wallet-order manager))
                           (wallet-manager-wallets manager)))
-              (0 (error 'rpc-error :code +rpc-wallet-not-found+
+              (0 (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-found+
                                    :message "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet. (Note: A default wallet is no longer automatically created)"))
-              (t (error 'rpc-error :code +rpc-wallet-not-specified+
+              (t (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-specified+
                                    :message "Multiple wallets are loaded. Please select which wallet to use by requesting the RPC through the /wallet/<walletname> URI path."))))))))
 
 (defun wallet-ensure-unlocked (wallet)
@@ -1490,13 +1490,13 @@ node -> manager -> wallet order documented on WITH-WALLET-LOCK. Checking
 inside the caller's hold also closes the check-then-use race Core has: the
 relock cannot land between this test and the signing that follows it."
   (when (wallet-is-locked-p wallet)
-    (error 'rpc-error :code +rpc-wallet-unlock-needed+
+    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-unlock-needed+
                       :message "Error: Please enter the wallet passphrase with walletpassphrase first.")))
 
 (defun %wallet-current-tip (node)
   "(values hash height) of the active chainstate tip, under the node-lock.
 Callers take this BEFORE any wallet lock (lock order)."
-  (with-node-lock (node)
+  (bl.rpc::with-node-lock (node)
     (let ((cs (bl::node-current-chainstate node)))
       (if cs
           (values (bl.store:best-block-hash cs)
@@ -1508,7 +1508,7 @@ Callers take this BEFORE any wallet lock (lock order)."
 of a \"now\" timestamp) is the tip's median-time-past and the lowest-timestamp
 accumulator starts at the tip's block time (Core backup.cpp:385-388), falling
 back to wall-clock time when there is no tip."
-  (with-node-lock (node)
+  (bl.rpc::with-node-lock (node)
     (let* ((cs (bl::node-current-chainstate node))
            (hash (and cs (bl.store:best-block-hash cs)))
            (entry (and hash (bl.store:get-block-index-entry cs hash))))
@@ -1524,9 +1524,9 @@ back to wall-clock time when there is no tip."
   "Core LabelFromValue: NIL -> \"\", \"*\" -> invalid."
   (cond ((null value) "")
         ((not (stringp value))
-         (error 'rpc-error :code +rpc-type-error+ :message "label must be a string"))
+         (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+ :message "label must be a string"))
         ((string= value "*")
-         (error 'rpc-error :code +rpc-wallet-invalid-label-name+
+         (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-invalid-label-name+
                            :message "Invalid label name"))
         (t value)))
 
@@ -1538,7 +1538,7 @@ back to wall-clock time when there is no tip."
 
 ;;; --- Wallet management RPCs (Core wallet/rpc/wallet.cpp) ---
 
-(define-rpc "createwallet" (node params)
+(bl.rpc:define-rpc "createwallet" (node params)
   "Create and load a new wallet (Bitcoin Core createwallet). PARAMS:
  (wallet_name disable_private_keys blank passphrase avoid_reuse descriptors
   load_on_startup external_signer). Only descriptor wallets can be created.
@@ -1547,34 +1547,34 @@ A non-empty PASSPHRASE creates the wallet already encrypted and locked."
         (name (first params))
         (warnings '()))
     (unless (stringp name)
-      (error 'rpc-error :code +rpc-invalid-parameter+
+      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "wallet_name must be a string"))
     ;; descriptors must be true — legacy wallets cannot be created
     ;; (rpc/wallet.cpp:403-406). Explicit false arrives as the +json-false+
     ;; sentinel; null/omitted defaults to true, exactly Core's isNull gate.
-    (when (eq (nth 5 params) +json-false+)
-      (error 'rpc-error :code +rpc-wallet-error+
+    (when (eq (nth 5 params) bl.rpc:+json-false+)
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                         :message "descriptors argument must be set to \"true\"; it is no longer possible to create a legacy wallet."))
-    (when (%positional-bool (nth 7 params))
-      (error 'rpc-error :code +rpc-wallet-error+
+    (when (bl.rpc::%positional-bool (nth 7 params))
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                         :message "Compiled without external signing support (required for external signing)"))
     (let ((passphrase (nth 3 params)))
       (when (and passphrase (not (stringp passphrase)))
-        (error 'rpc-error :code +rpc-invalid-parameter+
+        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                           :message "passphrase must be a string"))
       (when (and (stringp passphrase) (zerop (length passphrase)))
         (push "Empty string given as passphrase, wallet will not be encrypted."
               warnings))
       (when (and (stringp passphrase) (plusp (length passphrase))
-                 (%positional-bool (nth 1 params)))
-        (error 'rpc-error :code +rpc-wallet-error+
+                 (bl.rpc::%positional-bool (nth 1 params)))
+        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                           :message "Passphrase provided but private keys are disabled. A passphrase is only used to encrypt private keys, so cannot be used for wallets with private keys disabled.")))
     (multiple-value-bind (tip-hash tip-height) (%wallet-current-tip node)
       (let ((wallet (create-wallet manager name
-                                   :disable-private-keys (%positional-bool
+                                   :disable-private-keys (bl.rpc::%positional-bool
                                                           (nth 1 params))
-                                   :blank (%positional-bool (nth 2 params))
-                                   :avoid-reuse (%positional-bool
+                                   :blank (bl.rpc::%positional-bool (nth 2 params))
+                                   :avoid-reuse (bl.rpc::%positional-bool
                                                  (nth 4 params))
                                    :passphrase (let ((p (nth 3 params)))
                                                  (when (and (stringp p)
@@ -1601,7 +1601,7 @@ sequence has exactly one definition."
   ;; inside): tx-state resolution reads the chain, and no block may connect
   ;; between the load and the wallet becoming hook-visible.
   (multiple-value-bind (wallet warnings)
-      (with-node-lock (node)
+      (bl.rpc::with-node-lock (node)
         (load-wallet manager name
                      :chain-state (bl::node-current-chainstate node)))
     ;; Catch up from the stored locator OUTSIDE the node-lock hold — the
@@ -1610,11 +1610,11 @@ sequence has exactly one definition."
     (let ((error-message (wallet-attach-chain node wallet)))
       (when error-message
         (ignore-errors (unload-wallet manager wallet :force t))
-        (error 'rpc-error :code +rpc-wallet-error+ :message error-message)))
+        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+ :message error-message)))
     ;; Fold the current mempool in (Core LoadWallet -> postInitProcess ->
     ;; requestMempoolTransactions); the attach-chain scan only does this
     ;; when the wallet was behind the tip.
-    (with-node-lock (node)
+    (bl.rpc::with-node-lock (node)
       (let ((mempool (bl::node-mempool node)))
         (when mempool
           (bl.mp:mempool-for-each
@@ -1665,7 +1665,7 @@ whose wallet is missing and loudly logged."
               (bl:log-warn "Could not load wallet ~S at startup, skipping it: ~A"
                                      name e))))))))
 
-(define-rpc "loadwallet" (node params)
+(bl.rpc:define-rpc "loadwallet" (node params)
   "Load a wallet from the wallet directory (Bitcoin Core loadwallet).
 PARAMS: (filename load_on_startup). After the records load, the wallet is
 caught up from its stored best-block locator (Core AttachChain: fork lookup +
@@ -1676,7 +1676,7 @@ settings.json so the next node start loads it automatically."
         (name (first params))
         (action (%load-on-startup-action (nth 1 params))))
     (unless (stringp name)
-      (error 'rpc-error :code +rpc-invalid-parameter+
+      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "filename must be a string"))
     (multiple-value-bind (wallet warnings) (%load-and-attach-wallet node manager name)
       ;; Core updates the setting only after the load succeeds (wallet.cpp:183).
@@ -1685,7 +1685,7 @@ settings.json so the next node start loads it automatically."
         (setf warnings (append warnings (list (%load-on-startup-warning action)))))
       (%push-warnings warnings `(("name" . ,(wallet-name wallet)))))))
 
-(define-rpc "unloadwallet" (node params)
+(bl.rpc:define-rpc "unloadwallet" (node params)
   "Unload the wallet named by the endpoint or the wallet_name argument
 (Bitcoin Core unloadwallet); both given must match. PARAMS:
  (wallet_name load_on_startup) — load_on_startup false removes the wallet from
@@ -1694,17 +1694,17 @@ settings.json so the next node start no longer loads it."
          (arg (first params))
          (name (cond ((and *rpc-wallet-name* arg)
                       (unless (equal *rpc-wallet-name* arg)
-                        (error 'rpc-error :code +rpc-invalid-parameter+
+                        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                           :message "The RPC endpoint wallet and the wallet name parameter specify different wallets"))
                       arg)
                      (*rpc-wallet-name*)
                      (arg)
-                     (t (error 'rpc-error :code +rpc-invalid-parameter+
+                     (t (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                           :message "Either the RPC endpoint wallet or the wallet name parameter must be provided")))))
     (let ((wallet (bt:with-recursive-lock-held ((wallet-manager-lock manager))
                     (gethash name (wallet-manager-wallets manager)))))
       (unless wallet
-        (error 'rpc-error :code +rpc-wallet-not-found+
+        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-found+
                           :message "Requested wallet does not exist or is not loaded"))
       (unload-wallet manager wallet)
       (let ((action (%load-on-startup-action (nth 1 params))))
@@ -1715,7 +1715,7 @@ settings.json so the next node start no longer loads it."
             (make-hash-table :test 'equal)
             `(("warnings" . ,(list (%load-on-startup-warning action)))))))))
 
-(define-rpc "listwallets" (node params)
+(bl.rpc:define-rpc "listwallets" (node params)
   "Names of the currently loaded wallets, in load order (Bitcoin Core
 listwallets)."
   (declare (ignore params))
@@ -1723,7 +1723,7 @@ listwallets)."
     (bt:with-recursive-lock-held ((wallet-manager-lock manager))
       (or (copy-list (wallet-manager-wallet-order manager)) #()))))
 
-(define-rpc "listwalletdir" (node params)
+(bl.rpc:define-rpc "listwalletdir" (node params)
   "Wallets present in the wallet directory (Bitcoin Core listwalletdir)."
   (declare (ignore params))
   (let ((manager (node-wallet-manager-checked node)))
@@ -1733,7 +1733,7 @@ listwallets)."
                                 (sort (list-wallet-dir manager) #'string<))
                         #())))))
 
-(define-rpc "getwalletinfo" (node params)
+(bl.rpc:define-rpc "getwalletinfo" (node params)
   "Wallet state info (Bitcoin Core getwalletinfo); format reports our storage
 backend (leveldb, where Core says sqlite)."
   (declare (ignore params))
@@ -1768,19 +1768,19 @@ backend (leveldb, where Core says sqlite)."
           ;; Core booleans are true/false, never null (wave-10 cleanup);
           ;; "scanning" is Core's false-or-progress-object — the progress
           ;; object during a rescan, false otherwise.
-          ("private_keys_enabled" . ,(json-bool
+          ("private_keys_enabled" . ,(bl.rpc:json-bool
                                       (not (wallet-flag-set-p
                                             wallet +wallet-flag-disable-private-keys+))))
-          ("avoid_reuse" . ,(json-bool (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+)))
+          ("avoid_reuse" . ,(bl.rpc:json-bool (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+)))
           ("scanning" . ,(let ((since (wallet-scanning-since wallet)))
                            (if since
                                `(("duration" . ,(- (bl.ser:get-unix-time)
                                                    since))
                                  ("progress" . ,(wallet-scan-progress wallet)))
-                               +json-false+)))
-          ("descriptors" . ,(json-bool (wallet-flag-set-p wallet +wallet-flag-descriptors+)))
-          ("external_signer" . ,+json-false+)
-          ("blank" . ,(json-bool (wallet-flag-set-p wallet +wallet-flag-blank-wallet+)))
+                               bl.rpc:+json-false+)))
+          ("descriptors" . ,(bl.rpc:json-bool (wallet-flag-set-p wallet +wallet-flag-descriptors+)))
+          ("external_signer" . ,bl.rpc:+json-false+)
+          ("blank" . ,(bl.rpc:json-bool (wallet-flag-set-p wallet +wallet-flag-blank-wallet+)))
           ,@(when birthtime `(("birthtime" . ,birthtime)))
           ("flags" . ,(or (loop for bit from 0 below 64
                                 for flag = (ash 1 bit)
@@ -1790,7 +1790,7 @@ backend (leveldb, where Core says sqlite)."
                           #()))
           ("lastprocessedblock"
            . (("hash" . ,(if (wallet-last-block-hash wallet)
-                             (hash-to-hex (wallet-last-block-hash wallet))
+                             (bl.rpc::hash-to-hex (wallet-last-block-hash wallet))
                              (make-string 64 :initial-element #\0)))
               ("height" . ,(wallet-last-block-height wallet)))))))))
 
@@ -1800,23 +1800,23 @@ backend (leveldb, where Core says sqlite)."
   (if (null value)
       default
       (or (and (stringp value) (%parse-output-type value))
-          (error 'rpc-error :code +rpc-invalid-address-or-key+
+          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                             :message (format nil "Unknown address type '~A'" value)))))
 
-(define-rpc "getnewaddress" (node params)
+(bl.rpc:define-rpc "getnewaddress" (node params)
   "A new receiving address (Bitcoin Core getnewaddress). PARAMS:
  (label address_type); default address type bech32 (wallet.h
 DEFAULT_ADDRESS_TYPE)."
   (let ((wallet (wallet-for-request node)))
     (with-wallet-lock (wallet)
       (unless (wallet-can-get-addresses wallet)
-        (error 'rpc-error :code +rpc-wallet-error+
+        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                           :message "Error: This wallet has no available keys"))
       (let* ((label (%label-from-value (first params)))
              (type (%address-type-arg (second params) :bech32))
              (spkm (gethash type (wallet-external-spkms wallet))))
         (unless spkm
-          (error 'rpc-error :code +rpc-wallet-keypool-ran-out+
+          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-keypool-ran-out+
                             :message (format nil "Error: No ~A addresses available."
                                              (%format-output-type type))))
         (let ((address (spkm-get-new-destination wallet spkm type)))
@@ -1825,18 +1825,18 @@ DEFAULT_ADDRESS_TYPE)."
           (wallet-write-address-book-entry wallet address label "receive")
           address)))))
 
-(define-rpc "getrawchangeaddress" (node params)
+(bl.rpc:define-rpc "getrawchangeaddress" (node params)
   "A new change address from the internal SPKMs (Bitcoin Core
 getrawchangeaddress). PARAMS: (address_type)."
   (let ((wallet (wallet-for-request node)))
     (with-wallet-lock (wallet)
       (unless (wallet-can-get-addresses wallet t)
-        (error 'rpc-error :code +rpc-wallet-error+
+        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                           :message "Error: This wallet has no available keys"))
       (let* ((type (%address-type-arg (first params) :bech32))
              (spkm (gethash type (wallet-internal-spkms wallet))))
         (unless spkm
-          (error 'rpc-error :code +rpc-wallet-keypool-ran-out+
+          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-keypool-ran-out+
                             :message (format nil "Error: No ~A addresses available."
                                              (%format-output-type type))))
         ;; Change addresses get no address book entry.
@@ -1851,14 +1851,14 @@ derived children) or the normalized public form, checksummed
   (let ((provider (spkm-privkey-provider wallet spkm)))
     (multiple-value-bind (body ok)
         (if private
-            (out-desc-string-private (desc-spkm-desc spkm)
+            (bl.rpc::out-desc-string-private (desc-spkm-desc spkm)
                                      (wallet-network wallet) provider)
-            (out-desc-string-normalized (desc-spkm-desc spkm)
+            (bl.rpc::out-desc-string-normalized (desc-spkm-desc spkm)
                                         (desc-spkm-cache spkm) provider))
       (unless ok
-        (error 'rpc-error :code +rpc-wallet-error+
+        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                           :message "Unable to produce descriptor string"))
-      (descriptor-add-checksum body))))
+      (bl.rpc::descriptor-add-checksum body))))
 
 (defun %spkm-active-info (wallet spkm)
   "(values active-p internal-p). INTERNAL-P is only meaningful for active
@@ -1870,14 +1870,14 @@ SPKMs (Core IsInternalScriptPubKeyMan's optional bool)."
           ((active-in-p (wallet-internal-spkms wallet)) (values t t))
           (t (values nil nil)))))
 
-(define-rpc "listdescriptors" (node params)
+(bl.rpc:define-rpc "listdescriptors" (node params)
   "All wallet descriptors, sorted by string (Bitcoin Core listdescriptors).
 PARAMS: (private)."
   (let ((wallet (wallet-for-request node))
-        (private (%positional-bool (first params))))
+        (private (bl.rpc::%positional-bool (first params))))
     (when (and private
                (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
-      (error 'rpc-error :code +rpc-wallet-error+
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                         :message "Can't get private descriptor string for watch-only wallets"))
     (with-wallet-lock (wallet)
       ;; Without this a locked wallet would silently emit the PUBLIC
@@ -1888,7 +1888,7 @@ PARAMS: (private)."
         (loop for spkm being the hash-values of (wallet-spkms wallet)
               do (multiple-value-bind (active internal)
                      (%spkm-active-info wallet spkm)
-                   (let ((ranged (out-desc-ranged-p (desc-spkm-desc spkm))))
+                   (let ((ranged (bl.rpc::out-desc-ranged-p (desc-spkm-desc spkm))))
                      (push (list (%spkm-descriptor-string wallet spkm private)
                                  spkm active internal ranged)
                            entries))))
@@ -1901,10 +1901,10 @@ PARAMS: (private)."
                          entry
                        `(("desc" . ,desc-str)
                          ("timestamp" . ,(desc-spkm-creation-time spkm))
-                         ("active" . ,(json-bool active))
+                         ("active" . ,(bl.rpc:json-bool active))
                          ;; internal is defined only for active descriptors
                          ,@(when active
-                             `(("internal" . ,(json-bool internal))))
+                             `(("internal" . ,(bl.rpc:json-bool internal))))
                          ,@(when ranged
                              `(("range" . (,(desc-spkm-range-start spkm)
                                            ,(1- (desc-spkm-range-end spkm))))
@@ -1926,7 +1926,7 @@ which is the whole point of the RPC."
           do (multiple-value-bind (active internal) (%spkm-active-info wallet spkm)
                (declare (ignore internal))
                (when (or active (not active-only))
-                 (dolist (key (out-desc-ordered-keys (desc-spkm-desc spkm)))
+                 (dolist (key (bl.rpc::out-desc-ordered-keys (desc-spkm-desc spkm)))
                    ;; Only BIP32 keys are HD keys; a raw pubkey or WIF key in a
                    ;; descriptor has no xpub to report.
                    ;;
@@ -1936,9 +1936,9 @@ which is the whole point of the RPC."
                    ;; desc-key-ext-privkey alone reported has_private FALSE for
                    ;; every wallet that had been written to disk — which is
                    ;; every real one.
-                   (let* ((xprv (%desc-key-root-xprv
+                   (let* ((xprv (bl.rpc::%desc-key-root-xprv
                                  key (spkm-privkey-provider wallet spkm)))
-                          (xpub-key (or (desc-key-extkey key)
+                          (xpub-key (or (bl.rpc::desc-key-extkey key)
                                         (and xprv (bl.crypto:bip32-neuter xprv)))))
                      (when xpub-key
                        (let ((xpub (bl.crypto:bip32-serialize xpub-key)))
@@ -1953,18 +1953,18 @@ which is the whole point of the RPC."
           collect (let ((xprv (first entry))
                         (descs (reverse (second entry))))
                     `(("xpub" . ,xpub)
-                      ("has_private" . ,(json-bool (and xprv t)))
+                      ("has_private" . ,(bl.rpc:json-bool (and xprv t)))
                       ,@(when (and private xprv)
                           `(("xprv" . ,(bl.crypto:bip32-serialize xprv))))
                       ("descriptors"
                        . ,(or (mapcar (lambda (pair)
                                         `(("desc" . ,(%spkm-descriptor-string
                                                       wallet (car pair) nil))
-                                          ("active" . ,(json-bool (cdr pair)))))
+                                          ("active" . ,(bl.rpc:json-bool (cdr pair)))))
                                       descs)
                               #())))))))
 
-(define-rpc "gethdkeys" (node params)
+(bl.rpc:define-rpc "gethdkeys" (node params)
   "List the wallet's BIP32 HD keys and the descriptors that use them (Core
 gethdkeys). PARAMS: ([{active_only, private}]).
 
@@ -1977,7 +1977,7 @@ PUBLIC material under a private request — a wrong answer rather than an error.
          (private (%options-bool options "private")))
     (when (and private
                (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
-      (error 'rpc-error :code +rpc-wallet-error+
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                         :message "Can't get private keys for wallets without private keys"))
     (with-wallet-lock (wallet)
       (when private (wallet-ensure-unlocked wallet))
@@ -1987,7 +1987,7 @@ PUBLIC material under a private request — a wrong answer rather than an error.
 (defun %options-bool (options name)
   "One boolean out of an OBJ_NAMED_PARAMS options object, defaulting false."
   (and (hash-table-p options)
-       (%positional-bool (gethash name options))))
+       (bl.rpc::%positional-bool (gethash name options))))
 
 (defparameter +mutable-wallet-flags+ +wallet-flag-avoid-reuse+
   "Core wallet.h:159-160 MUTABLE_WALLET_FLAGS — the flags setwalletflag may
@@ -1999,7 +1999,7 @@ retrofitted.")
      . "You need to rescan the blockchain in order to correctly mark used destinations in the past. Until this is done, some destinations may be considered unused, even if the opposite is the case."))
   "Core wallet/rpc/wallet.cpp:27-32 WALLET_FLAG_CAVEATS.")
 
-(define-rpc "setwalletflag" (node params)
+(bl.rpc:define-rpc "setwalletflag" (node params)
   "Turn a mutable wallet flag on or off (Core setwalletflag). PARAMS:
  (flag [value]), value defaulting TRUE.
 
@@ -2009,20 +2009,20 @@ ignoring the request. Setting a flag to the value it already holds is also an
 error, as Core makes it — the caller has misunderstood the state."
   (let* ((wallet (wallet-for-request node))
          (flag-str (first params))
-         (value (if (null (second params)) t (%positional-bool (second params)))))
+         (value (if (null (second params)) t (bl.rpc::%positional-bool (second params)))))
     (unless (stringp flag-str)
-      (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for flag"))
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+ :message "Expected type string for flag"))
     (let ((flag (car (find flag-str +wallet-flag-names+
                            :key #'cdr :test #'string=))))
       (unless flag
-        (error 'rpc-error :code +rpc-invalid-parameter+
+        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                           :message (format nil "Unknown wallet flag: ~A" flag-str)))
       (unless (logtest flag +mutable-wallet-flags+)
-        (error 'rpc-error :code +rpc-invalid-parameter+
+        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                           :message (format nil "Wallet flag is immutable: ~A" flag-str)))
       (with-wallet-lock (wallet)
         (when (eq (and (wallet-flag-set-p wallet flag) t) (and value t))
-          (error 'rpc-error :code +rpc-invalid-parameter+
+          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message (format nil "Wallet flag is already set to ~A: ~A"
                                              (if value "true" "false") flag-str)))
         (setf (wallet-flags wallet)
@@ -2031,7 +2031,7 @@ error, as Core makes it — the caller has misunderstood the state."
                   (logandc2 (wallet-flags wallet) flag)))
         (%wallet-persist-flags wallet)
         `(("flag_name" . ,flag-str)
-          ("flag_state" . ,(json-bool value))
+          ("flag_state" . ,(bl.rpc:json-bool value))
           ,@(let ((caveat (and value (cdr (assoc flag +wallet-flag-caveats+)))))
               (when caveat `(("warnings" . ,caveat)))))))))
 
@@ -2050,18 +2050,18 @@ avoid_reuse means silently resuming address reuse."
   "The private keys carried by a parsed descriptor, as a list of
  (pubkey priv32 compressed-p) — Core Parse's FlatSigningProvider keys."
   (let ((out '()))
-    (dolist (key (out-desc-ordered-keys desc) (nreverse out))
+    (dolist (key (bl.rpc::out-desc-ordered-keys desc) (nreverse out))
       (cond
-        ((desc-key-ext-privkey key)
-         (let ((xprv (desc-key-ext-privkey key)))
+        ((bl.rpc::desc-key-ext-privkey key)
+         (let ((xprv (bl.rpc::desc-key-ext-privkey key)))
            (push (list (bl.crypto:ext-key-public-bytes xprv)
                        (subseq (bl.crypto:ext-key-key xprv) 1 33)
                        t)
                  out)))
-        ((desc-key-privkey key)
-         (push (list (desc-key-pubkey key)
-                     (desc-key-privkey key)
-                     (desc-key-compressed-p key))
+        ((bl.rpc::desc-key-privkey key)
+         (push (list (bl.rpc::desc-key-pubkey key)
+                     (bl.rpc::desc-key-privkey key)
+                     (bl.rpc::desc-key-compressed-p key))
                out))))))
 
 (defun wallet-add-descriptor (wallet desc timestamp range-start range-end
@@ -2082,31 +2082,31 @@ the SigningProvider (descriptors.lisp:868), so an SPKM built straight from
 the next reload, which rebuilds it from the public string and behaves
 differently. Core never has this problem: its descriptor objects hold only
 pubkey providers. Now in-session state matches post-reload state."
-  (setf desc (parse-descriptor (descriptor-add-checksum (out-desc-string desc))
+  (setf desc (bl.rpc::parse-descriptor (bl.rpc::descriptor-add-checksum (bl.rpc::out-desc-string desc))
                                (wallet-network wallet)
                                :require-checksum t))
-  (let* ((id (descriptor-id desc))
+  (let* ((id (bl.rpc::descriptor-id desc))
          (existing (gethash id (wallet-spkms wallet)))
          (spkm existing))
     (if existing
         (progn
           ;; UpdateWalletDescriptor (scriptpubkeyman.cpp:1569): the new range
           ;; must contain the current one; state is replaced wholesale.
-          (when (and (out-desc-ranged-p desc)
+          (when (and (bl.rpc::out-desc-ranged-p desc)
                      (or (> range-start (desc-spkm-range-start existing))
                          (< range-end (desc-spkm-range-end existing))))
-            (error 'rpc-error :code +rpc-wallet-error+
+            (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                               :message (format nil "new range must include current range = [~D,~D]"
                                                (desc-spkm-range-start existing)
                                                (1- (desc-spkm-range-end existing)))))
           (setf (desc-spkm-desc existing) desc
                 (desc-spkm-desc-string existing)
-                (descriptor-add-checksum (out-desc-string desc))
+                (bl.rpc::descriptor-add-checksum (bl.rpc::out-desc-string desc))
                 (desc-spkm-creation-time existing) timestamp
                 (desc-spkm-range-start existing) range-start
                 (desc-spkm-range-end existing) range-end
                 (desc-spkm-next-index existing) next-index
-                (desc-spkm-cache existing) (make-descriptor-cache)
+                (desc-spkm-cache existing) (bl.rpc::make-descriptor-cache)
                 (desc-spkm-max-cached-index existing) -1)
           (clrhash (desc-spkm-script-map existing))
           (clrhash (desc-spkm-pubkey-map existing)))
@@ -2117,18 +2117,18 @@ pubkey providers. Now in-session state matches post-reload state."
     (dolist (key keys)
       (destructuring-bind (pubkey priv compressed) key
         (unless (spkm-add-key wallet spkm priv pubkey compressed)
-          (error 'rpc-error :code +rpc-wallet-error+
+          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                             :message "Error: writing descriptor private key failed"))))
     (unless (spkm-top-up wallet spkm)
-      (error 'rpc-error :code +rpc-wallet-error+
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                         :message "Could not top up scriptPubKeys"))
-    (unless (out-desc-ranged-p desc)
+    (unless (bl.rpc::out-desc-ranged-p desc)
       (when (zerop (hash-table-count (desc-spkm-script-map spkm)))
-        (error 'rpc-error :code +rpc-wallet-error+
+        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                           :message "Could not generate scriptPubKeys (cache is empty)"))
       (unless internal
         (loop for script being the hash-keys of (desc-spkm-script-map spkm)
-              for address = (%script->address script (wallet-network wallet))
+              for address = (bl.rpc::%script->address script (wallet-network wallet))
               when address
                 do (wallet-write-address-book-entry wallet address label "receive"))))
     (spkm-write-descriptor wallet spkm)
@@ -2140,11 +2140,11 @@ pubkey providers. Now in-session state matches post-reload state."
 median-time-past."
   (multiple-value-bind (value present) (gethash "timestamp" data)
     (unless present
-      (error 'rpc-error :code +rpc-type-error+
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
                         :message "Missing required timestamp field for key"))
     (cond ((integerp value) value)
           ((equal value "now") now)
-          (t (error 'rpc-error :code +rpc-type-error+
+          (t (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
                                :message "Expected number or \"now\" timestamp value for key.")))))
 
 (defun %process-descriptor-import (wallet data timestamp)
@@ -2164,8 +2164,8 @@ descriptors. Core's rules, all of them load-bearing for a real wallet export:
   (let ((expansions (handler-case
                         (and (hash-table-p data)
                              (stringp (gethash "desc" data))
-                             (expand-multipath-descriptor (gethash "desc" data)))
-                      (rpc-error () nil))))
+                             (bl.rpc::expand-multipath-descriptor (gethash "desc" data)))
+                      (bl.rpc::rpc-error () nil))))
     (when (and expansions (rest expansions))
       (return-from %process-descriptor-import
         (%process-multipath-import wallet data timestamp expansions))))
@@ -2173,33 +2173,33 @@ descriptors. Core's rules, all of them load-bearing for a real wallet export:
     (handler-case
         (progn
           (unless (hash-table-p data)
-            (error 'rpc-error :code +rpc-invalid-parameter+
+            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message "Import request must be an object"))
           (multiple-value-bind (desc-str desc-present) (gethash "desc" data)
             (unless desc-present
-              (error 'rpc-error :code +rpc-invalid-parameter+
+              (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                 :message "Descriptor not found."))
             (unless (stringp desc-str)
-              (error 'rpc-error :code +rpc-type-error+
+              (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
                                 :message "desc must be a string"))
             (let* ((active (and (gethash "active" data) t))
                    (label-present (nth-value 1 (gethash "label" data)))
                    (label (%label-from-value (gethash "label" data)))
                    (internal (and (gethash "internal" data) t))
-                   (desc (parse-descriptor desc-str (wallet-network wallet)
+                   (desc (bl.rpc::parse-descriptor desc-str (wallet-network wallet)
                                            :require-checksum t))
-                   (ranged (out-desc-ranged-p desc))
+                   (ranged (bl.rpc::out-desc-ranged-p desc))
                    (range-start 0)
                    (range-end 1)
                    (next-index 0))
               (multiple-value-bind (range range-present) (gethash "range" data)
                 (cond
                   ((and (not ranged) range-present)
-                   (error 'rpc-error :code +rpc-invalid-parameter+
+                   (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                      :message "Range should not be specified for an un-ranged descriptor"))
                   (ranged
                    (if range-present
-                       (multiple-value-bind (low high) (%parse-descriptor-range range)
+                       (multiple-value-bind (low high) (bl.rpc::%parse-descriptor-range range)
                          (setf range-start low
                                range-end (1+ high)))   ; exclusive end internally
                        (progn
@@ -2210,45 +2210,45 @@ descriptors. Core's rules, all of them load-bearing for a real wallet export:
                    (multiple-value-bind (ni ni-present) (gethash "next_index" data)
                      (when ni-present
                        (unless (and (integerp ni) (<= range-start ni (1- range-end)))
-                         (error 'rpc-error :code +rpc-invalid-parameter+
+                         (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                            :message "next_index is out of range"))
                        (setf next-index ni))))))
               (when (and active (not ranged))
-                (error 'rpc-error :code +rpc-invalid-parameter+
+                (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                   :message "Active descriptors must be ranged"))
               (when (and ranged label-present)
-                (error 'rpc-error :code +rpc-invalid-parameter+
+                (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                   :message "Ranged descriptors should not have a label"))
               (when (and internal label-present)
-                (error 'rpc-error :code +rpc-invalid-parameter+
+                (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                   :message "Internal addresses should not have a label"))
               (when (and active (not (out-desc-single-type-p desc)))
-                (error 'rpc-error :code +rpc-wallet-error+
+                (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                                   :message "Combo descriptors cannot be set to active"))
               (let ((keys (%out-desc-embedded-keys desc))
                     (priv-disabled (wallet-flag-set-p
                                     wallet +wallet-flag-disable-private-keys+)))
                 (when (and priv-disabled keys)
-                  (error 'rpc-error :code +rpc-wallet-error+
+                  (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                                     :message "Cannot import private keys to a wallet with private keys disabled"))
                 ;; Expansion check at position 0 (Core Expand(0, keys, ...)).
                 (handler-case
-                    (out-desc-expand-with-provider
+                    (bl.rpc::out-desc-expand-with-provider
                      desc range-start
                      (lambda (keyid)
                        (loop for (pubkey priv) in keys
                              when (equalp keyid (bl.crypto:hash160 pubkey))
                                do (return priv)))
-                     (make-descriptor-cache))
-                  (descriptor-derivation-error ()
-                    (error 'rpc-error :code +rpc-wallet-error+
+                     (bl.rpc::make-descriptor-cache))
+                  (bl.rpc::descriptor-derivation-error ()
+                    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                                       :message "Cannot expand descriptor. Probably because of hardened derivations without private keys provided")))
                 (unless priv-disabled
                   (when (null keys)
-                    (error 'rpc-error :code +rpc-wallet-error+
+                    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                                       :message "Cannot import descriptor without private keys to a wallet with private keys enabled"))
-                  (unless (every #'desc-key-has-privkey-p
-                                 (out-desc-ordered-keys desc))
+                  (unless (every #'bl.rpc::desc-key-has-privkey-p
+                                 (bl.rpc::out-desc-ordered-keys desc))
                     (push "Not all private keys provided. Some wallet functionality may return unexpected errors"
                           warnings)))
                 (let ((spkm (handler-case
@@ -2256,11 +2256,11 @@ descriptors. Core's rules, all of them load-bearing for a real wallet export:
                                                        range-start range-end
                                                        next-index keys label
                                                        internal)
-                              (rpc-error (e)
-                                (error 'rpc-error
-                                       :code (rpc-error-code e)
+                              (bl.rpc::rpc-error (e)
+                                (error 'bl.rpc::rpc-error
+                                       :code (bl.rpc::rpc-error-code e)
                                        :message (format nil "Could not add descriptor '~A': ~A"
-                                                        desc-str (rpc-error-message e))))))
+                                                        desc-str (bl.rpc::rpc-error-message e))))))
                       (output-type (out-desc-output-type desc)))
                   (if active
                       (if output-type
@@ -2270,11 +2270,11 @@ descriptors. Core's rules, all of them load-bearing for a real wallet export:
                       (when output-type
                         (wallet-deactivate-spkm wallet spkm output-type internal)))))
               (%push-warnings (nreverse warnings) `(("success" . t))))))
-      (rpc-error (e)
+      (bl.rpc::rpc-error (e)
         (%push-warnings (nreverse warnings)
-                        `(("success" . ,+json-false+)
-                          ("error" . (("code" . ,(rpc-error-code e))
-                                      ("message" . ,(rpc-error-message e))))))))))
+                        `(("success" . ,bl.rpc:+json-false+)
+                          ("error" . (("code" . ,(bl.rpc::rpc-error-code e))
+                                      ("message" . ,(bl.rpc::rpc-error-message e))))))))))
 
 (defun %process-multipath-import (wallet data timestamp expansions)
   "Import the EXPANSIONS of one multipath request and return a single result,
@@ -2282,11 +2282,11 @@ as Core returns one result per REQUEST rather than per expansion."
   (handler-case
       (progn
         (when (nth-value 1 (gethash "label" data))
-          (error 'rpc-error :code +rpc-invalid-parameter+
+          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Multipath descriptors should not have a label"))
         (when (and (> (length expansions) 2)
                    (gethash "internal" data))
-          (error 'rpc-error :code +rpc-invalid-parameter+
+          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Cannot have multipath descriptor with more than two paths and internal"))
         (loop for expansion in expansions
               for index from 0
@@ -2295,7 +2295,7 @@ as Core returns one result per REQUEST rather than per expansion."
                    ;; The checksum covered the multipath form, not this
                    ;; expansion, so a fresh one is computed for each.
                    (setf (gethash "desc" sub)
-                         (descriptor-add-checksum expansion))
+                         (bl.rpc::descriptor-add-checksum expansion))
                    ;; Two expansions: the second IS the change chain, whatever
                    ;; the request said (Core backup.cpp:230-231).
                    (when (= (length expansions) 2)
@@ -2304,26 +2304,26 @@ as Core returns one result per REQUEST rather than per expansion."
                      (unless (eq t (cdr (assoc "success" result :test #'string=)))
                        (return-from %process-multipath-import result)))))
         `(("success" . t)))
-    (rpc-error (e)
+    (bl.rpc::rpc-error (e)
       `(("success" . nil)
-        ("error" . (("code" . ,(rpc-error-code e))
-                    ("message" . ,(rpc-error-message e))))))))
+        ("error" . (("code" . ,(bl.rpc::rpc-error-code e))
+                    ("message" . ,(bl.rpc::rpc-error-message e))))))))
 
-(define-rpc "importdescriptors" (node params)
+(bl.rpc:define-rpc "importdescriptors" (node params)
   "Import descriptors into the wallet (Bitcoin Core importdescriptors), then
 rescan the chain from the lowest request timestamp (backup.cpp:302-462): a
 successful import triggers RescanFromTime(lowest_timestamp), and any request
 whose timestamp the scan could not cover has its result replaced with Core's
 rescan-failed error."
   (let ((wallet (wallet-for-request node))
-        (requests (%positional-array (first params))))
+        (requests (bl.rpc::%positional-array (first params))))
     (unless (and (listp requests) requests)
-      (error 'rpc-error :code +rpc-type-error+
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
                         :message "requests must be a non-empty array"))
     (with-wallet-lock (wallet)
       (wallet-ensure-unlocked wallet))
     (unless (wallet-reserve-rescan wallet)
-      (error 'rpc-error :code +rpc-wallet-error+
+      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
                         :message "Wallet is currently rescanning. Abort existing rescan or wait."))
     ;; The import holds the wallet unlocked across the rescan's own lock
     ;; drops, so suspend the relock for its duration (Core
@@ -2368,7 +2368,7 @@ rescan-failed error."
                 (let ((scanned-time (wallet-rescan-from-time
                                      node wallet lowest-timestamp :update t)))
                   (when (wallet-abort-rescan wallet)
-                    (error 'rpc-error :code +rpc-misc-error+
+                    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-misc-error+
                                       :message "Rescan aborted by user."))
                   ;; The rescan can revert wallet txs to unconfirmed: push
                   ;; them back into our mempool, no relay (backup.cpp:410,
@@ -2384,9 +2384,9 @@ rescan-failed error."
                             (if (or (<= scanned-time timestamp)
                                     (assoc "error" result :test #'string=))
                                 result
-                                `(("success" . ,+json-false+)
+                                `(("success" . ,bl.rpc:+json-false+)
                                   ("error"
-                                   . (("code" . ,+rpc-misc-error+)
+                                   . (("code" . ,bl.rpc:+rpc-misc-error+)
                                       ("message"
                                        . ,(format nil "Rescan failed for descriptor with timestamp ~D. There was an error reading a block from time ~D, which is after or within ~D seconds of key creation, and could contain transactions pertaining to the desc. As a result, transactions and coins using this desc may not appear in the wallet. This error could potentially caused by data corruption. If the issue persists you may want to reindex (see -reindex option)."
                                                   timestamp

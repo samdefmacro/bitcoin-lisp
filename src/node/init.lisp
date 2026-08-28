@@ -864,7 +864,7 @@ recorded for startup."
                             (not (eq network :mainnet)))))
     (when wallet-enabled
       (setf (node-wallet-manager *node*)
-            (bl.rpc:init-wallet-manager (node-data-directory *node*)
+            (bl.wallet:init-wallet-manager (node-data-directory *node*)
                                                   network))
       (log-info "Wallet support enabled (descriptor wallets under ~A)"
                 (merge-pathnames "wallets/" (node-data-directory *node*)))
@@ -873,7 +873,7 @@ recorded for startup."
       ;; and the mempool (load-mempool-from-disk) are both up, so each wallet
       ;; can catch up from its locator and fold in the mempool; networking has
       ;; not started, so no block can connect underneath the catch-up.
-      (bl.rpc:load-wallets-on-startup *node* wallet-names))))
+      (bl.wallet:load-wallets-on-startup *node* wallet-names))))
 
 
 (defun %sync-thread-loop (max-peers)
@@ -1021,7 +1021,7 @@ its own thread; the body catches and retries transient iteration errors."
                                ;; takes node-lock -> wallet-lock
                                ;; per tx, so it must run OUTSIDE
                                ;; any node-lock hold (wallet P4).
-                               (bl.rpc:wallets-maybe-resend *node*)
+                               (bl.wallet:wallets-maybe-resend *node*)
                                ;; Local-address self-advertisement
                                ;; (our onion address, once torcontrol
                                ;; registers it): per-peer ~24h Poisson

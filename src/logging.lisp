@@ -444,7 +444,7 @@ via the logging RPC (or the node is globally at :debug)."
 ;;;; value, which is why %NOTIFY-SUBSTITUTE validates every one.
 ;;;;
 ;;;; Here rather than in src/node/ because the wallet fires -walletnotify from
-;;;; AddToWallet, and rpc/wallet-tx.lisp compiles long before src/node/.
+;;;; AddToWallet, and wallet/wallet-tx.lisp compiles long before src/node/.
 
 (defun %notify-safe-value-p (value)
   "Whether VALUE may be substituted into a shell command.

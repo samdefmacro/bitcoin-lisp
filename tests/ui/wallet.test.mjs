@@ -87,7 +87,7 @@ globalThis.sessionStorage = {
 
 // --- stubbed JSON-RPC endpoint -------------------------------------------
 
-// Fixtures mirror what src/rpc/wallet*.lisp emits. A master oldest-first
+// Fixtures mirror what src/wallet/*.lisp emits. A master oldest-first
 // tx list backs listtransactions with our node's count/skip semantics
 // (page slices are answered oldest-first).
 const NOW = Math.floor(Date.now() / 1000);

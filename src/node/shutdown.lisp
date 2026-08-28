@@ -506,7 +506,7 @@ thread; see the shutdown-coordination section above."
   ;; Unload wallets (writes each wallet's best-block marker, closes its DB)
   (when (node-wallet-manager *node*)
     (log-info "Unloading wallets...")
-    (bl.rpc:close-wallet-manager (node-wallet-manager *node*))
+    (bl.wallet:close-wallet-manager (node-wallet-manager *node*))
     (setf (node-wallet-manager *node*) nil))
 
   ;; Close transaction index

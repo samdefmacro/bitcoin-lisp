@@ -1,4 +1,4 @@
-(in-package #:bitcoin-lisp.rpc)
+(in-package #:bitcoin-lisp.wallet)
 
 ;;; Wallet record storage (wallet P1)
 ;;;

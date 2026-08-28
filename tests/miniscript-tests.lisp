@@ -924,7 +924,7 @@ signatures are 71 or 72 bytes."
              (witscript (coerce (bl.val::ms-node-script node)
                                 '(vector (unsigned-byte 8)))))
         (multiple-value-bind (bytes elems)
-            (bl.rpc::%miniscript-sat-size-and-elems witscript)
+            (bl.wallet::%miniscript-sat-size-and-elems witscript)
           (is-true (and bytes elems) "no estimate for ~A" expr)
           ;; The witnessScript is counted by the caller, so ELEMS is the
           ;; satisfaction's own elements plus one.
@@ -941,7 +941,7 @@ signatures are 71 or 72 bytes."
              (witscript (coerce (bl.val::ms-node-script node)
                                 '(vector (unsigned-byte 8)))))
         (multiple-value-bind (bytes elems)
-            (bl.rpc::%miniscript-sat-size-and-elems witscript)
+            (bl.wallet::%miniscript-sat-size-and-elems witscript)
           (declare (ignore bytes))
           (is (= elems len)
               "estimated ~D witness elements, signer produced ~D" elems len))))))
