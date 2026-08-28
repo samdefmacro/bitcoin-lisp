@@ -1470,10 +1470,7 @@ become a second -addnode."
            (bl::connect-seed-nodes node)
            (is (= 0 (length (bl::node-peers node))))
            ;; And it is reached from startup, not merely defined.
-           (is-true (member 'bl::start-node
-                            (mapcar #'car
-                                    (sb-introspect:who-calls
-                                     'bl::connect-seed-nodes)))))
+           (is-true (%reached-from-start-node-p 'bl::connect-seed-nodes)))
       (setf bl::*use-addrman-outgoing* saved-addrman
             bl::*seed-nodes* saved-seeds)))
   ;; -forcednsseed does not override -dnsseed=0: a node told not to use DNS

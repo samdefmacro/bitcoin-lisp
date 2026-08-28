@@ -165,3 +165,17 @@ tests that do so compare within one function."
                      (merge-pathnames rel (asdf:system-source-directory :bitcoin-lisp)))
                     out)
       (terpri out))))
+
+(defun %reached-from-start-node-p (fn &optional (depth 6))
+  "T when FN is reachable from START-NODE through the callers SB-INTROSPECT
+records, at most DEPTH calls deep -- so a wiring test does not have to know
+which init step a call site landed in (P3.2 cut start-node into %INIT-*
+steps), while a step dropped from start-node's sequence still fails it."
+  (let ((seen '()))
+    (labels ((walk (f d)
+               (cond ((eq f 'bl:start-node) t)
+                     ((or (minusp d) (member f seen)) nil)
+                     (t (push f seen)
+                        (some (lambda (c) (and (symbolp c) (walk c (1- d))))
+                              (mapcar #'car (sb-introspect:who-calls f)))))))
+      (and (walk fn depth) t))))
