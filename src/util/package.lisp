@@ -202,6 +202,9 @@ FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
 handler or sync pass acts on, as one value. src/util/context.lisp.")
   (:use #:cl #:bitcoin-lisp.conditions)
   (:export
+   ;; The cooperative stop seam (Core util::SignalInterrupt)
+   #:*interrupt-check*
+   #:interrupt-requested-p
    #:node-context
    #:make-node-context
    #:copy-node-context

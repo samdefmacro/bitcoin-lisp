@@ -171,7 +171,7 @@ in-flight socket reads.")
   *ibd-stop-requested*)
 
 ;;; This flag reaches layers that cannot see networking through
-;;; bl:*interrupt-check* (config.lisp), installed by node/shutdown.lisp — the
+;;; bl.ctx:*interrupt-check* (config.lisp), installed by node/shutdown.lisp — the
 ;;; only file that also sees *shutdown-request*.
 
 (defun join-thread-or-destroy (thread &key (timeout 5) deadline)
@@ -245,7 +245,7 @@ so callers (including the v1-fallback re-dial in peer.lisp) re-dial through
 the right proxy transparently."
   (multiple-value-bind (proxy refusal) (proxy-for-target host)
     (when refusal
-      (bl:log-debug "Not dialing ~A:~D: ~A" host port refusal)
+      (bl.log:log-debug "Not dialing ~A:~D: ~A" host port refusal)
       (return-from make-tcp-connection nil))
     (handler-case
       (let* ((socket (usocket:socket-connect (if proxy (proxy-host proxy) host)
@@ -261,7 +261,7 @@ the right proxy transparently."
                                     :username credentials :password credentials))
                   (socks5-connect socket host port))
             (error (e)
-              (bl:log-debug "SOCKS5 connect to ~A:~D via ~A:~D failed: ~A"
+              (bl.log:log-debug "SOCKS5 connect to ~A:~D via ~A:~D failed: ~A"
                                       host port (proxy-host proxy) (proxy-port proxy) e)
               (ignore-errors (usocket:socket-close socket))
               (return-from make-tcp-connection nil))))
@@ -737,7 +737,7 @@ healthy peers whenever a pump cycle ran long."
           ;; More bytes in hand than the caller now says it wants means two reads
           ;; got mixed — a framing bug here, not a peer fault.
           (when (> filled count)
-            (bl:log-error
+            (bl.log:log-error
              "Receive state mismatch: ~D bytes in progress, asked for ~D — dropping connection"
              filled count)
             (return-from receive-bytes-resumable (%abandon-receive conn)))
@@ -798,7 +798,7 @@ healthy peers whenever a pump cycle ran long."
     ;; once; say so instead of hiding it.
     (error (c)
       (when (%recv-error-diagnosable-p c)
-        (bl:log-warn
+        (bl.log:log-warn
          "Receive failed on ~A:~D with a non-I/O error: ~A~@[~%Backtrace:~%~A~]"
          (connection-host conn) (connection-port conn) c backtrace))
       (%abandon-receive conn)))))

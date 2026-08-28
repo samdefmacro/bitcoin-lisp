@@ -110,6 +110,30 @@ of the kv and serialization layers. The pruning policy knobs live here
                              (:file "blockfilterindex")
                              (:file "coinstatsindex")))))
 
+(defsystem "bitcoin-lisp/net"
+  :description "The transport layer below the Bitcoin protocol: poll-based
+readiness, TCP connections through an optional SOCKS5 proxy, the BIP324 v2
+transport, BIP155 addresses and reachability, addrman with its peers.dat,
+the Tor control client and minisketch. The protocol itself -- peer,
+protocol, headers-sync, ibd, txreconciliation-set -- stays in the main
+system, in this same package, because it drives validation and the mempool."
+  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "bitcoin-lisp/logging"
+               "bitcoin-lisp/kv" "bitcoin-lisp/serialization"
+               "usocket" "bordeaux-threads" "ironclad" "flexi-streams" "alexandria")
+  :pathname "src"
+  :serial t
+  :components ((:file "networking/package")
+               (:module "networking"
+                :components ((:file "fd-wait")    ; before everything: poll-based readiness (select's fd ceiling)
+                             (:file "minisketch")
+                             (:file "socks5")     ; before connection: make-tcp-connection tunnels through *proxy*
+                             (:file "connection")
+                             (:file "v2-transport")
+                             (:file "peerdb")
+                             (:file "netaddress") ; BIP155 codecs/reachability; before addrman (netgroups)
+                             (:file "addrman")
+                             (:file "torcontrol")))))
+
 (defsystem "bitcoin-lisp"
   :version "0.1.0"
   :author "samdefmacro"
@@ -121,6 +145,7 @@ of the kv and serialization layers. The pruning policy knobs live here
                "bitcoin-lisp/kv"
                "bitcoin-lisp/serialization"
                "bitcoin-lisp/storage"
+               "bitcoin-lisp/net"
                "ironclad"
                "nibbles"
                "cffi"
@@ -146,7 +171,6 @@ of the kv and serialization layers. The pruning policy knobs live here
                  (:file "validation/package")
                  (:file "mempool/package")
                  (:file "mining/package")
-                 (:file "networking/package")
                  (:file "package")
                  ;; util first: byte I/O that the script interpreter's
                  ;; sighash code inlines must be loaded before src/coalton/.
@@ -181,18 +205,11 @@ of the kv and serialization layers. The pruning policy knobs live here
                  (:module "mining"
                   :components ((:file "assembler")
                                (:file "builder")))
+                 ;; The transport below these (connection, addrman, tor, ...)
+                 ;; is bitcoin-lisp/net; these are the protocol on top of it.
                  (:module "networking"
-                  :components ((:file "fd-wait")    ; before everything: poll-based readiness (select's fd ceiling)
-                               (:file "minisketch")
-                               (:file "txreconciliation-set")
-                               (:file "socks5")     ; before connection: make-tcp-connection tunnels through *proxy*
-                               (:file "connection")
-                               (:file "v2-transport")
+                  :components ((:file "txreconciliation-set")
                                (:file "peer")
-                               (:file "peerdb")
-                               (:file "netaddress") ; BIP155 codecs/reachability; before addrman (netgroups)
-                               (:file "addrman")
-                               (:file "torcontrol") ; Tor control client (inbound onion service)
                                (:file "protocol")
                                (:file "headers-sync")
                                (:file "ibd")))

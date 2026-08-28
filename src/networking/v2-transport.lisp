@@ -162,7 +162,7 @@ body length is parked on the CONNECTION between passes rather than recomputed."
         (let ((len (bl.crypto:bip324-cipher-decrypt-length
                     (v2-transport-cipher transport) len3)))
           (when (> len +v2-max-contents-len+)
-            (bl:log-warn "V2 transport: packet too large (~D bytes) from ~A, disconnecting"
+            (bl.log:log-warn "V2 transport: packet too large (~D bytes) from ~A, disconnecting"
                                    len (connection-host conn))
             (setf (connection-connected conn) nil)
             (return nil))
@@ -186,7 +186,7 @@ body length is parked on the CONNECTION between passes rather than recomputed."
            (v2-transport-cipher transport) rest
            (or (v2-transport-recv-aad transport) *v2-empty-bytes*))
         (unless contents
-          (bl:log-warn "V2 transport: packet auth failure from ~A, disconnecting"
+          (bl.log:log-warn "V2 transport: packet auth failure from ~A, disconnecting"
                                  (connection-host conn))
           (setf (connection-connected conn) nil)
           (return nil))
@@ -314,7 +314,7 @@ appears within the 4095+16 byte bound (or the DEADLINE passes)."
           (when (not (mismatch terminator buf :start2 (- n term-len)))
             (return (subseq buf 0 (- n term-len))))
           (when (>= n (+ +v2-max-garbage-len+ term-len))
-            (bl:log-warn "V2 transport: missing garbage terminator from ~A"
+            (bl.log:log-warn "V2 transport: missing garbage terminator from ~A"
                                    (connection-host conn))
             (return nil))
           (let ((next (%v2-read conn 1 deadline)))
@@ -384,7 +384,7 @@ peer, or NIL (dead peer, wrong-network v1 peer, or failed v2 handshake)."
       ;; command but the magic doesn't (else the branch above hit). Not a v2
       ;; key; log and drop (Core does the same for the logging value).
       ((not (mismatch first16 v1-prefix :start1 4 :start2 4))
-       (bl:log-warn "V2 transport: v1 peer with wrong network magic from ~A"
+       (bl.log:log-warn "V2 transport: v1 peer with wrong network magic from ~A"
                               (connection-host conn))
        nil)
       (t

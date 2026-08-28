@@ -708,7 +708,7 @@ up to +addrman-new-buckets-per-address+ buckets)."
     (with-open-file (out tmp-path :direction :output :if-exists :supersede
                                   :element-type '(unsigned-byte 8))
       (write-sequence all-bytes out)
-      (write-sequence (bl.store:compute-crc32 all-bytes) out))
+      (write-sequence (bl.kv:compute-crc32 all-bytes) out))
     (rename-file tmp-path path))
   (setf (address-book-dirty book) nil)
   t)
@@ -755,7 +755,7 @@ were loaded, NIL otherwise."
   ;; the ordinary case and feature_addrman.py greps for exactly that. Same shape
   ;; as the banlist gap: absence is a RESULT, not a reason to say nothing.
   (unless (probe-file path)
-    (bl:log-info "Loaded 0 addresses from peers.dat")
+    (bl.log:log-info "Loaded 0 addresses from peers.dat")
     (return-from load-address-book nil))
   (flet ((backup ()
            (ignore-errors
@@ -772,18 +772,18 @@ were loaded, NIL otherwise."
               (backup) (return-from load-address-book nil))
             (let ((payload (subseq data 0 (- file-size 4)))
                   (stored-crc (subseq data (- file-size 4))))
-              (unless (equalp (bl.store:compute-crc32 payload) stored-crc)
-                (bl:log-warn "peers.dat CRC32 mismatch; backing up to .bak")
+              (unless (equalp (bl.kv:compute-crc32 payload) stored-crc)
+                (bl.log:log-warn "peers.dat CRC32 mismatch; backing up to .bak")
                 (backup) (return-from load-address-book nil))
               (flexi-streams:with-input-from-sequence (s payload)
                 (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
                   (read-sequence magic s)
                   (unless (equalp magic +addrman-magic+)
-                    (bl:log-warn "peers.dat unknown format; backing up to .bak")
+                    (bl.log:log-warn "peers.dat unknown format; backing up to .bak")
                     (backup) (return-from load-address-book nil)))
                 (let ((version (bl.ser:read-uint32-le s)))
                   (unless (member version '(2 3 4))
-                    (bl:log-warn "peers.dat version ~D unsupported; backing up to .bak"
+                    (bl.log:log-warn "peers.dat version ~D unsupported; backing up to .bak"
                                            version)
                     (backup) (return-from load-address-book nil))
                 (read-sequence (address-book-key book) s)
@@ -823,12 +823,12 @@ were loaded, NIL otherwise."
                   ;; count is the same, the sentence was not. The tried count
                   ;; moves to its own line rather than being dropped: it is
                   ;; genuinely useful and Core simply does not report it.
-                  (bl:log-info "Loaded ~D addresses from peers.dat"
+                  (bl.log:log-info "Loaded ~D addresses from peers.dat"
                                          (address-book-count book))
-                  (bl:log-cat "net" "  (~D of them tried)"
+                  (bl.log:log-cat "net" "  (~D of them tried)"
                                          (address-book-n-tried book))
                   (> count 0)))))))
       (error (c)
-        (bl:log-warn "Failed to load peers.dat (~A); backing up to .bak" c)
+        (bl.log:log-warn "Failed to load peers.dat (~A); backing up to .bak" c)
         (backup)
         nil))))

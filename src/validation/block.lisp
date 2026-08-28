@@ -3019,7 +3019,7 @@ includes ENTRY itself."
 ;;;; interruptible work, while a truncated reorg is simply a shorter (or
 ;;;; partially advanced) valid chain that the next sync pass re-activates.
 ;;;;
-;;;; The predicate is bl:interrupt-requested-p (config.lisp states the
+;;;; The predicate is bl:interrupt-requested-p (util/context.lisp states the
 ;;;; contract). It is true for BOTH meanings the node has for "stop": a real
 ;;;; shutdown, and call-with-sync-paused (assumeutxo snapshot activation, after
 ;;;; which the node keeps RUNNING). Covering the pause too is only safe because the

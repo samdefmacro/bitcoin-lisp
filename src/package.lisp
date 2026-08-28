@@ -9,6 +9,8 @@
   (:use #:bitcoin-lisp.networking)
   ;; The current chain lives in the chainparams layer; the node re-exports it.
   (:import-from #:bitcoin-lisp.chainparams #:*network* #:network-magic)
+  ;; So does the stop seam every long loop polls; node/shutdown.lisp sets it.
+  (:import-from #:bitcoin-lisp.context #:*interrupt-check* #:interrupt-requested-p)
   (:local-nicknames (#:bt #:bordeaux-threads))
   (:export
    ;; Network parameters

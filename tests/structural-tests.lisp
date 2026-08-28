@@ -795,58 +795,71 @@ name -- (config-error \"...\") -- with the message text unchanged.")
 ;;; --- layering -------------------------------------------------------------
 
 (defun %load-order ()
-  "Each child of the src module in bitcoin-lisp.asd's order, as (path-prefix
-. index): a file as \"src/name.lisp\", a module as \"src/name/\". Derived
-from ASDF rather than copied, so a phase-4 reordering cannot leave a stale
-list behind."
+  "Every component of bitcoin-lisp.asd in load order, as (path-prefix
+. index): a file as \"src/name.lisp\", a module as \"src/name/\" AND one
+entry per file inside it. The per-file entries come first, so a file's layer
+is its own load position even when its directory is split across systems
+(src/networking/ is bitcoin-lisp/net below and the protocol files above;
+src/rpc/ is the rpc module, then the wallet, then rpc-server); the module
+entries place packages (%package-layer). Derived from ASDF rather than
+copied, so a phase-4 reordering cannot leave a stale list behind."
   (let ((order '()) (per-file '()))
-    ;; The sub-systems the main system :depends-on (bitcoin-lisp/util, /crypto,
-    ;; ...) load before any of its own files: their modules take the lowest
-    ;; layers. ASDF already refuses an upward reference inside them at
-    ;; compile time; listing them keeps this test's view of the order whole.
-    (loop for dep in (asdf:system-depends-on (asdf:find-system :bitcoin-lisp))
-          for i from -100
-          when (and (stringp dep) (uiop:string-prefix-p "bitcoin-lisp/" dep))
-            do (dolist (child (asdf:component-children (asdf:find-system dep)))
-                 (push (cons (if (typep child 'asdf:module)
-                                 (format nil "src/~A/" (asdf:component-name child))
-                                 (format nil "src/~A.lisp" (asdf:component-name child)))
-                             i)
-                       order)))
-    (loop for child in (asdf:component-children (asdf:find-component :bitcoin-lisp "src"))
-          for i from 0
-          do (if (typep child 'asdf:module)
-                 (let ((dir (car (last (pathname-directory (asdf:component-pathname child))))))
-                   ;; A module that lives in another module's directory (the
-                   ;; rpc-server module's files are src/rpc/*.lisp, loaded after
-                   ;; the wallet) gets per-file entries instead, which win the
-                   ;; prefix match below over that directory's own entry.
-                   (if (string= dir (asdf:component-name child))
-                       (push (cons (format nil "src/~A/" dir) i) order)
-                       (dolist (file (asdf:component-children child))
-                         (push (cons (format nil "src/~A/~A.lisp" dir (asdf:component-name file)) i)
-                               per-file))))
-                 (push (cons (format nil "src/~A.lisp" (asdf:component-name child)) i) order)))
+    (flet ((add (children i)
+             (dolist (child children)
+               (if (typep child 'asdf:module)
+                   (let ((dir (car (last (pathname-directory
+                                          (asdf:component-pathname child))))))
+                     (push (cons (format nil "src/~A/" dir) i) order)
+                     (dolist (file (asdf:component-children child))
+                       (push (cons (format nil "src/~A/~A.lisp" dir (asdf:component-name file)) i)
+                             per-file)))
+                   (push (cons (format nil "src/~A.lisp" (asdf:component-name child)) i)
+                         order)))))
+      ;; The sub-systems the main system :depends-on (bitcoin-lisp/util,
+      ;; /crypto, ...) load before any of its own files: they take the lowest
+      ;; layers. ASDF already refuses an upward reference inside them at
+      ;; compile time; listing them keeps this test's view of the order whole.
+      (loop for dep in (asdf:system-depends-on (asdf:find-system :bitcoin-lisp))
+            for i from -100
+            when (and (stringp dep) (uiop:string-prefix-p "bitcoin-lisp/" dep))
+              do (add (asdf:component-children (asdf:find-system dep)) i))
+      (loop for child in (asdf:component-children (asdf:find-component :bitcoin-lisp "src"))
+            for i from 0
+            do (add (list child) i)))
     (append (nreverse per-file) (nreverse order))))
 
 (defun %file-layer (file order)
   (cdr (find-if (lambda (e) (uiop:string-prefix-p (car e) file)) order)))
 
-(defun %package-layer (package order)
-  "The load position of the module that owns PACKAGE: bitcoin-lisp.NAME and
+(defun %package-prefix (package)
+  "The path prefix of the files that define PACKAGE: bitcoin-lisp.NAME and
 bitcoin-lisp.NAME.sub belong to src/NAME/. The top package BITCOIN-LISP is
 placed at src/package.lisp, the last of the package files and still before
-any code -- its files span the whole load (logging.lisp is first, the node/
-module last), so a reference INTO it is never counted as upward. That is a blind
-spot this test accepts, not a claim."
+any code -- its files span the whole load (config.lisp is early, the node/
+module last), so a reference INTO it is never counted as upward. That is a
+blind spot this test accepts, not a claim."
   (if (string= package "bitcoin-lisp")
-      (cdr (assoc "src/package.lisp" order :test #'string=))
-      (let* ((start (length "bitcoin-lisp."))
-             (module (subseq package start (position #\. package :start start))))
-        ;; A one-file layer (bitcoin-lisp.logging is src/logging.lisp) has no
-        ;; directory; its package sits where the file loads.
-        (or (cdr (assoc (format nil "src/~A/" module) order :test #'string=))
-            (cdr (assoc (format nil "src/~A.lisp" module) order :test #'string=))))))
+      "src/package.lisp"
+      (let ((start (length "bitcoin-lisp.")))
+        (format nil "src/~A/" (subseq package start (position #\. package :start start))))))
+
+(defun %package-layer (package order)
+  "The load position of the module that owns PACKAGE: the FIRST module in
+its directory when the package spans two systems (bitcoin-lisp.networking is
+the transport in bitcoin-lisp/net and the protocol in the main system;
+bitcoin-lisp.rpc is the rpc module, then rpc-server after the wallet). A
+qualified reference into such a package cannot say which half it names, so
+it is counted at the lower one -- a reference from between the halves into
+the upper half is a blind spot this test accepts, like the top package's. A
+one-file layer (bitcoin-lisp.logging is src/logging.lisp) has no directory;
+its package sits where the file loads."
+  (let* ((prefix (%package-prefix package))
+         (positions (loop for (entry . index) in order
+                          when (string= entry prefix) collect index)))
+    (if positions
+        (reduce #'min positions)
+        (cdr (assoc (format nil "src/~A.lisp" (subseq prefix 4 (1- (length prefix))))
+                    order :test #'string=)))))
 
 (defun %resolve-package-prefix (token)
   "The project package TOKEN names as a prefix: a full bitcoin-lisp* name, or
@@ -907,7 +920,6 @@ comments are blanked first, so a prefix quoted in a docstring (a user-agent
 
 (defparameter +layering-violation-baseline+
   '(("src/config.lisp" . "bitcoin-lisp.mempool")
-    ("src/config.lisp" . "bitcoin-lisp.networking")
     ("src/validation/block.lisp" . "bitcoin-lisp.mempool")
     ("src/validation/packages.lisp" . "bitcoin-lisp.mempool")
     ("src/validation/transaction.lisp" . "bitcoin-lisp.mempool"))
@@ -916,8 +928,9 @@ LATER, at the start of the cleanup. They compile because src/package.lisp
 defines every package up front, so the reader interns the symbol and the call
 resolves at run time -- which is exactly why nothing has ever flagged them.
 This is also the plan's \"which file reaches which package\" table (§4 P4):
-config.lisp loads early and still names three later packages (crypto,
-mempool, networking); the option table that names the rest loads after them.")
+config.lisp loads early and still names the mempool (the proxy and
+reachability knobs it once named in networking moved below it with
+bitcoin-lisp/net); the option table that names the rest loads after them.")
 
 (defun %layering-violations ()
   (let ((order (%load-order)))

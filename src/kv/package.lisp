@@ -30,6 +30,8 @@ of its own (bitcoin-lisp/kv) below serialization. BITCOIN-LISP.STORAGE
    #:datadir-layout-report
    #:ensure-libleveldb-loaded
    #:find-next-record
+   ;; Record checksums
+   #:compute-crc32
    #:flat-file-allocate
    #:flat-file-flush
    #:flat-file-name

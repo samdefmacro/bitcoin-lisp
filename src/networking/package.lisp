@@ -1,10 +1,14 @@
 ;;;; Package bitcoin-lisp.networking -- the public API of src/networking/.
 ;;;;
-;;;; Loaded with the other package files before any code (bitcoin-lisp.asd,
-;;;; the "packages" phase): src/config.lisp loads third and already names
-;;;; most of these packages, and every package must exist before
-;;;; src/package.lisp installs the bl.* nicknames. Add an export here when a
-;;;; definition in src/networking/ becomes API; keep %-prefixed names internal.
+;;;; First component of the bitcoin-lisp/net sub-system (bitcoin-lisp.asd):
+;;;; the package exists before any file in src/networking/ compiles, and the
+;;;; INSTALL-PACKAGE-NICKNAMES call at the end of this file gives those files
+;;;; their bl.* prefixes. The package spans two systems: the transport
+;;;; (fd-wait ... torcontrol) is bitcoin-lisp/net and may name only the
+;;;; layers below it; the protocol (txreconciliation-set, peer, protocol,
+;;;; headers-sync, ibd) loads in the main system and may name validation and
+;;;; the mempool. Add an export here when a definition in src/networking/
+;;;; becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.networking
   (:use #:cl #:bitcoin-lisp.conditions)

@@ -52,6 +52,7 @@ src/; cold = cold-battery check count / failures.
 | 2026-08-28 | P4.2c | bitcoin-lisp/kv: leveldb, flatfile, datadir and the fsync helpers are package bitcoin-lisp.kv (bl.kv) in src/kv/; storage :uses it and re-exports 72 names (computed from the image's real symbol set, not from a defun regex) | 0 | 10 | 63 | 42 | 8 | 0 | 8 | 4,029 | 34,469 / 0 (fresh) |
 | 2026-08-28 | P4.2d | bitcoin-lisp/serialization as a sub-system (no package change: it never named anything above crypto); layering scanner ignores string literals (a docstring's `/bl:0.1.0/` was a false upward reference) | 0 | 10 | 63 | 42 | 8 | 0 | 6 | 4,029 | 34,469 / 0 (fresh) |
 | 2026-08-28 | P4.2e | bitcoin-lisp/storage as a sub-system: *network* / network-magic moved down to chainparams, the 7 pruning knobs to storage/prune-policy.lisp (the node re-exports them), prune-old-blocks takes its target as an argument; storage no longer names the top package | 0 | 10 | 63 | 42 | 8 | 0 | 5 | 4,029 | 34,469 / 0 (fresh) |
+| 2026-08-28 | P4.2f | bitcoin-lisp/net as a sub-system: the transport half of src/networking/ (fd-wait, minisketch, socks5, connection, v2-transport, peerdb, netaddress, addrman, torcontrol) loads before the main system; the protocol half stays above in the same package. *interrupt-check* moved down to util/context.lisp, compute-crc32 to kv/flatfile.lisp; config.lisp -> networking resolved (its 8 proxy/reachability knobs are transport) | 0 | 10 | 63 | 42 | 8 | 0 | 4 | 4,029 | 34,469 / 0 |
 
 ## Notes
 
