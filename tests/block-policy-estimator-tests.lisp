@@ -274,7 +274,7 @@ the confirmation was recorded — silently discarding the data point."
 (test connect-block-reports-confirmations-to-the-fee-estimator
   "connect-block must call the block hook, and it must run while the block's
 transactions are still tracked. Drives the real connect-block."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "bpe-connect")
      (let* ((bl.mp:*block-policy-estimator*

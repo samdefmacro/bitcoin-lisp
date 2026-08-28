@@ -59,15 +59,6 @@ creates its chainstate_snapshot/ LevelDB there."
     (bl.store:add-block-index-entry chain-state tip-entry)
     node))
 
-(defmacro %with-snap-dir ((dir) &body body)
-  "Bind DIR to a fresh temp directory; delete the tree afterwards."
-  `(let ((,dir (ensure-directories-exist
-                (merge-pathnames (format nil "snap-~D-~D/" (get-universal-time)
-                                         (random 1000000))
-                                 (uiop:temporary-directory)))))
-     (unwind-protect (progn ,@body)
-       (uiop:delete-directory-tree ,dir :validate t :if-does-not-exist :ignore))))
-
 (defun %snap-file-bytes (path)
   (with-open-file (in path :element-type '(unsigned-byte 8))
     (let ((bytes (make-array (file-length in) :element-type '(unsigned-byte 8))))
@@ -151,7 +142,7 @@ per-coin preimages (kernel/coinstats.cpp:46-52,111-181)."
 magic, u16 version, network magic, base hash, u64 count, then txid groups
 in cursor order with CompactSize vouts and compressed Coin records. The
 expected bytes are assembled by hand from the format spec."
-  (%with-snap-dir (dir)
+  (with-temp-directory (dir)
     (let* ((h5 (%snap-fill 32 5))
            (txid-a (%snap-fill 32 #x11))
            (txid-b (%snap-fill 32 #x22))
@@ -230,8 +221,8 @@ gate: an injected assumeutxo-data entry carrying the real hash_serialized_3
 accepts the snapshot into a NEW snapshot chainstate that becomes the current
 chainstate at the base height, while the previous chainstate is retargeted
 at the base (historical). The base entry's tx-count is seeded from nChainTx."
-  (%with-snap-dir (src-dir)
-    (%with-snap-dir (dst-dir)
+  (with-temp-directory (src-dir)
+    (with-temp-directory (dst-dir)
       (let* ((bl:*prune-target-mib* nil) ; deterministic: pruning off
              (h5 (%snap-fill 32 5))
              (txid-a (%snap-fill 32 #x11))
@@ -328,8 +319,8 @@ snapshot LevelDB in batches; Core's coins_per_txid>coins_left guard
 the batch budget is consumed whole. With the batch budget pinned to 2 and
 txid-a carrying 3 coins, the group crosses the first commit — the exact shape
 that made every real multi-batch public snapshot (>100k coins) fail before."
-  (%with-snap-dir (src-dir)
-    (%with-snap-dir (dst-dir)
+  (with-temp-directory (src-dir)
+    (with-temp-directory (dst-dir)
       (let* ((bl:*prune-target-mib* nil)
              (bl.rpc::*snapshot-load-batch-coins* 2) ; tiny batches
              (h5 (%snap-fill 32 5))
@@ -368,7 +359,7 @@ that made every real multi-batch public snapshot (>100k coins) fail before."
   "SnapshotMetadata parsing rejects bad magic, unsupported version, wrong
 or unrecognized network magic, and a truncated header — all as
 RPC_DESERIALIZATION_ERROR before any state is read (utxo_snapshot.h:73-106)."
-  (%with-snap-dir (dir)
+  (with-temp-directory (dir)
     (let* ((h5 (%snap-fill 32 5))
            (node (%snap-node dir h5 5))
            (base (%snap-file-bytes
@@ -405,7 +396,7 @@ RPC_DESERIALIZATION_ERROR before any state is read (utxo_snapshot.h:73-106)."
 assumeutxo hash, base header missing from the index, commitment/index
 height mismatch, invalid base header, tip already at the base height, and
 a non-empty mempool — all rejected before the coin stream is touched."
-  (%with-snap-dir (dir)
+  (with-temp-directory (dir)
     (let* ((bl:*prune-target-mib* nil) ; deterministic: pruning off
            (h5 (%snap-fill 32 5))
            (h7 (%snap-fill 32 7))
@@ -468,7 +459,7 @@ a non-empty mempool — all rejected before the coin stream is touched."
 claiming more coins than the metadata count, truncation, trailing bytes,
 an out-of-range vout, and a hash_serialized_3 mismatch. Every rejection
 leaves the node's UTXO set and tip untouched."
-  (%with-snap-dir (dir)
+  (with-temp-directory (dir)
     (let* ((bl:*prune-target-mib* nil) ; deterministic: pruning off
            (h5 (%snap-fill 32 5))
            (txid (%snap-fill 32 #x33))
@@ -625,8 +616,8 @@ prune floor, Chainstate::GetPruneRange, and the halved automatic target,
 FindFilesToPrune). Activation also splits the coins-cache budget 95/5
 toward the snapshot chainstate while the node is in IBD (Core
 MaybeRebalanceCaches via ActivateSnapshot)."
-  (%with-snap-dir (src-dir)
-    (%with-snap-dir (dst-dir)
+  (with-temp-directory (src-dir)
+    (with-temp-directory (dst-dir)
       (let* ((bl:*prune-target-mib* 550)   ; pruning ON
              (bl:*prune-after-height* 0)
              (h5 (%snap-fill 32 5))
@@ -687,8 +678,8 @@ activity suspended during, restored after — reverse RAII order), the UTXO
 set is dumped at the target height, and the chain is restored with
 reconsiderblock. The historical dump re-loads through loadtxoutset's full
 verification gate on a fresh node."
-  (%with-mainnet-network
-   (%with-snap-dir (dst-dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dst-dir)
      (multiple-value-bind (cs utxo store genesis-hash)
          (%make-activate-block-fixture "rollback-dump")
        (let* ((bl:*prune-target-mib* nil)

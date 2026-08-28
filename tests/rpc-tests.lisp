@@ -12,17 +12,6 @@
 ;;;
 ;;; The HTTP helpers also serve ui-tests.lisp, which loads after this file.
 
-(defmacro with-rpc-test-datadir ((var) &body body)
-  "Run BODY with VAR bound to a fresh temporary data directory, removed after.
-Every start-rpc-server call needs one: the .cookie written there is the
-credential when no rpcuser/rpcpassword is configured."
-  `(let ((,var (ensure-directories-exist
-                (merge-pathnames (format nil "bl-rpc-test-~D-~D/"
-                                         (get-universal-time) (random 1000000))
-                                 (uiop:temporary-directory)))))
-     (unwind-protect (progn ,@body)
-       (uiop:delete-directory-tree ,var :validate t :if-does-not-exist :ignore))))
-
 (defun %basic-auth-header (credential)
   "An HTTP Basic Authorization header value carrying CREDENTIAL (\"user:pass\")."
   (concatenate 'string "Basic " (cl-base64:string-to-base64-string credential)))
@@ -722,7 +711,7 @@ status with no scan running returns null; abort with no scan is a no-op."
   (is (null bl.rpc:*rpc-server*))
 
   ;; Start on an unusual port to avoid conflicts
-  (with-rpc-test-datadir (dir)
+  (with-temp-directory (dir)
     (let ((node (make-test-node)))
       (setf (bl::node-data-directory node) dir)
       (bl.rpc:start-rpc-server node :port 19999)
@@ -733,20 +722,6 @@ status with no scan running returns null; abort with no scan is a no-op."
       (is (null bl.rpc:*rpc-server*)))))
 
 ;;; --- Helper to create initialized test node ---
-
-(defun make-test-node ()
-  "Create a node with minimal initialized state for testing."
-  (let ((node (bl::make-node :network :testnet3)))
-    ;; Initialize chain-state
-    (setf (bl::node-chain-state node)
-          (bl.store:make-chain-state))
-    ;; Initialize UTXO set
-    (setf (bl::node-utxo-set node)
-          (bl.store:make-utxo-set))
-    ;; Initialize mempool
-    (setf (bl::node-mempool node)
-          (bl.mp:make-mempool))
-    node))
 
 ;;; --- Blockchain Query Method Tests (3.11) ---
 
@@ -2648,7 +2623,7 @@ a broken pipe polling the second node ~50s after its previous call.
 Assert against the acceptor's own slot — the thing the socket actually uses —
 not against the special."
   (bl.rpc:stop-rpc-server)
-  (with-rpc-test-datadir (dir)
+  (with-temp-directory (dir)
     (let ((node (make-test-node)))
       (setf (bl::node-data-directory node) dir)
       ;; Core's default, not hunchentoot's.
@@ -4676,7 +4651,7 @@ InitRPCAuthentication pushes exactly one entry into g_rpcauth
 that pair otherwise. Binding user, password AND cookie secret at once — what
 this test used to do — describes no reachable configuration."
   (bl.rpc:stop-rpc-server)
-  (with-rpc-test-datadir (dir)
+  (with-temp-directory (dir)
     (let ((node (make-test-node))
           (cookie-file (merge-pathnames ".cookie" dir)))
       (setf (bl::node-data-directory node) dir)
@@ -4712,7 +4687,7 @@ it: Core creates it under umask 0077 (GenerateAuthCookie, request.cpp:99-146).
 Ours was 0664 on the live testnet4 and mainnet datadirs, which would have left
 the credential readable node-wide even with auth enforced."
   (bl.rpc:stop-rpc-server)
-  (with-rpc-test-datadir (dir)
+  (with-temp-directory (dir)
     (let ((node (make-test-node)))
       (setf (bl::node-data-directory node) dir)
       (unwind-protect
@@ -4738,7 +4713,7 @@ from a process-wide umask 0077 (common/system.cpp:92-93) so the cookie is
 owner-only from creation (GenerateAuthCookie, request.cpp:99-146); we set no
 process umask, so the mode must be passed to open. The live host runs umask
 002 — its .cookie files were 0664 — which is what this test reproduces."
-  (with-rpc-test-datadir (dir)
+  (with-temp-directory (dir)
     (let ((old-umask (sb-posix:umask #o002)))
       (unwind-protect
            (progn
@@ -4767,7 +4742,7 @@ umask's mode stays valid across the chmod and the rename, and inotify on the
 data directory makes that window deterministic on every node start. Both halves
 below are the same defect — WITH-OPEN-FILE :if-exists :supersede opens the
 EXISTING inode with O_TRUNC, and follows a symlink to do it."
-  (with-rpc-test-datadir (dir)
+  (with-temp-directory (dir)
     (let ((tmp (merge-pathnames ".cookie.tmp" dir)))
       ;; (a) a planted regular file whose descriptor the attacker still holds
       (with-open-file (s tmp :direction :output :if-does-not-exist :create)
@@ -4816,7 +4791,7 @@ overwrites .cookie with a secret matching nothing and then exits. The healthy
 node keeps serving with the old secret, so every client that re-reads the file
 gets 401 from a node that is perfectly fine, and nothing logs anything."
   (bl.rpc:stop-rpc-server)
-  (with-rpc-test-datadir (dir)
+  (with-temp-directory (dir)
     (let* ((port 19993)
            (node (make-test-node))
            (cookie-file (merge-pathnames ".cookie" dir)))
@@ -4859,7 +4834,7 @@ cookie answers 200 (Core HTTPReq_JSONRPC, httprpc.cpp:112-133). Proven live
 against the running testnet4 node before this fix: an unauthenticated
 getblockcount returned 200, and so did a wrong Basic credential."
   (bl.rpc:stop-rpc-server)
-  (with-rpc-test-datadir (dir)
+  (with-temp-directory (dir)
     (let ((port 19996)
           (node (make-test-node))
           (body "{\"method\":\"getblockcount\",\"id\":1}"))
@@ -4921,7 +4896,7 @@ bind before giving up.)"
            ;; binds, then finds it has no credential to install, then aborts
            (is (null (bl.rpc:start-rpc-server no-datadir-node :port port)))
            (is (null bl.rpc:*rpc-server*))
-           (with-rpc-test-datadir (dir)
+           (with-temp-directory (dir)
              (let ((node (make-test-node)))
                (setf (bl::node-data-directory node) dir)
                (is (not (null (bl.rpc:start-rpc-server node :port port)))
@@ -6783,7 +6758,7 @@ refused by us and worked against Core.
 Driven through the live acceptor, because the whole point is what a real client
 on the wire gets back."
   (bl.rpc:stop-rpc-server)
-  (with-rpc-test-datadir (dir)
+  (with-temp-directory (dir)
     (let ((port 19987)
           (node (make-test-node))
           (cookie nil))

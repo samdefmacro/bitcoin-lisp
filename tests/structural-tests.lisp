@@ -114,7 +114,8 @@ is an ordinary test failure and not a READ error that kills compilation.")
 
 (defun %bitcoin-lisp-packages ()
   "The project's own CL packages: everything named BITCOIN-LISP*, minus the
-tests package and the Coalton ones. Derived rather than listed so a new package
+tests packages (bitcoin-lisp.tests and its fixtures, bitcoin-lisp.test-support)
+and the Coalton ones. Derived rather than listed so a new package
 cannot be silently excluded from the sweep -- but the Coalton packages are held
 out on purpose: their exports are generated, and the several hundred that no CL
 code calls would bury the finding this test exists to surface."
@@ -124,7 +125,8 @@ code calls would bury the finding this test exists to surface."
        (and (>= (length n) 12)
             (string= "BITCOIN-LISP" n :end2 12)
             (not (search ".COALTON" n))
-            (not (string= "BITCOIN-LISP.TESTS" n)))))
+            (not (string= "BITCOIN-LISP.TESTS" n))
+            (not (string= "BITCOIN-LISP.TEST-SUPPORT" n)))))
    (list-all-packages)))
 
 (defun %function-object-references (src)
@@ -168,7 +170,8 @@ cleanly and the many unused accessors do not bury the real finding."
       (setf *orphan-sweep-cache*
             (let* ((src (%source-text))
                    (refs (%function-object-references src))
-                   (tests-package (find-package "BITCOIN-LISP.TESTS"))
+                   (tests-packages (list (find-package "BITCOIN-LISP.TESTS")
+                                         (find-package "BITCOIN-LISP.TEST-SUPPORT")))
                    (found '()))
               (labels ((root-symbol (name)
                          (cond ((symbolp name) name)
@@ -176,7 +179,7 @@ cleanly and the many unused accessors do not bury the real finding."
                                (t nil)))
                        (test-caller-p (caller)
                          (let ((r (root-symbol (car caller))))
-                           (and r (eq (symbol-package r) tests-package))))
+                           (and r (member (symbol-package r) tests-packages))))
                        (orphan-p (sym)
                          (and (fboundp sym)
                               (not (macro-function sym))
@@ -988,10 +991,45 @@ in 8 files before src/util/chainparams.lisp."
         "~D chain dispatch form~:P outside the table: ~S -- add a field to ~
 chain-params instead" (length forms) forms)))
 
+(defparameter +test-internal-reference-ceiling+ 7174
+  "How many package-qualified INTERNAL references (a :: token) the test
+tree may contain: 7,136 when the cleanup started. White-box tests reaching
+an internal are legitimate, so this is not driven to zero; it must not
+GROW, and the shared fixtures in tests/support/ bring it down where the
+same internal was reached from a copy of the same helper in several files.
+Do not shrink it by exporting an internal only a test uses -- that symbol
+becomes an orphan export, and the two ratchets would fight.")
+
+(defun %test-internal-references ()
+  "The number of :: references in the code of every file under tests/
+(strings and comments blanked)."
+  (let ((root (asdf:system-source-directory :bitcoin-lisp))
+        (count 0))
+    (dolist (file (directory (merge-pathnames "tests/**/*.lisp" root)))
+      (with-open-file (in file)
+        (let ((in-string nil))
+          (loop for raw = (read-line in nil)
+                while raw
+                do (multiple-value-bind (code next) (%code-only raw in-string)
+                     (setf in-string next)
+                     (loop for pos = (search "::" code)
+                             then (search "::" code :start2 (+ pos 2))
+                           while pos do (incf count)))))))
+    count))
+
+(test test-internal-references-do-not-grow
+  "The :: count over tests/ may only fall; see +TEST-INTERNAL-REFERENCE-CEILING+."
+  (let ((now (%test-internal-references)))
+    (is (<= now +test-internal-reference-ceiling+)
+        "~D internal (::) references in tests/, ceiling ~D -- reach the internal ~
+through a shared fixture in tests/support/ instead of a new :: in a test file"
+        now +test-internal-reference-ceiling+)))
+
 (test refactoring-ratchets-can-actually-fail
   "Positive controls: each scanner must find something on the real tree, and
 the measuring functions must measure a known shape correctly."
   (is (plusp (length (%toplevel-definitions))) "no definitions scanned")
+  (is (plusp (%test-internal-references)) "no :: references counted in tests/")
   (is (plusp (length (%definitions-longer-than +longish-function-lines+)))
       "no long definitions found -- a sweep that finds nothing proves nothing")
   (is (equal '(("src/util/bytes.lisp" . "bitcoin-lisp.validation"))

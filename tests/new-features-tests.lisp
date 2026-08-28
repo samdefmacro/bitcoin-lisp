@@ -33,13 +33,6 @@ normal scripts (P2PKH, P2WPKH, bare pubkey, empty) are not."
 
 ;;;; Undo Data Persistence Tests
 
-(defun make-test-undo-dir ()
-  "Create a temporary directory for undo data tests."
-  (let ((path (merge-pathnames "test-undo/"
-                               (uiop:temporary-directory))))
-    (ensure-directories-exist path)
-    path))
-
 (defun make-sample-spent-utxos ()
   "Create a sample list of spent UTXOs for testing."
   (let ((txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA))
@@ -61,7 +54,7 @@ normal scripts (P2PKH, P2WPKH, bare pubkey, empty) are not."
 
 (test undo-data-save-load-round-trip
   "Saving and loading undo data should preserve all entries."
-  (let* ((base-path (make-test-undo-dir))
+  (let* ((base-path (make-temp-directory))
          (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x42))
          (spent-utxos (make-sample-spent-utxos)))
     (unwind-protect
@@ -99,7 +92,7 @@ normal scripts (P2PKH, P2WPKH, bare pubkey, empty) are not."
 
 (test undo-data-cache-hit
   "Getting undo data should return from cache without disk access."
-  (let* ((base-path (make-test-undo-dir))
+  (let* ((base-path (make-temp-directory))
          (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x43))
          (spent-utxos (make-sample-spent-utxos)))
     (unwind-protect
@@ -120,7 +113,7 @@ path does no height bookkeeping, so evict-undo-cache (which iterates
 backfill read every spending block's undo this way and accumulated ~4.5 GiB
 of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
 2026-07-02)."
-  (let* ((base-path (make-test-undo-dir))
+  (let* ((base-path (make-temp-directory))
          (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x45))
          (spent-utxos (make-sample-spent-utxos)))
     (unwind-protect
@@ -138,7 +131,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
 
 (test undo-data-crc-integrity
   "Corrupted undo data file should return NIL on load."
-  (let* ((base-path (make-test-undo-dir))
+  (let* ((base-path (make-temp-directory))
          (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x44))
          (spent-utxos (make-sample-spent-utxos)))
     (unwind-protect
@@ -164,7 +157,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
 
 (test undo-data-nonexistent-block
   "Getting undo data for unknown block should return NIL."
-  (let ((base-path (make-test-undo-dir))
+  (let ((base-path (make-temp-directory))
         (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xFF)))
     (unwind-protect
          (progn
@@ -176,7 +169,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
 
 (test undo-data-empty-list
   "Saving empty spent-utxos list should produce a valid file on disk."
-  (let* ((base-path (make-test-undo-dir))
+  (let* ((base-path (make-temp-directory))
          (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x45)))
     (unwind-protect
          (progn

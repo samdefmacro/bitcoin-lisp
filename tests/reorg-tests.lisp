@@ -271,13 +271,6 @@ DisconnectTip iterates from active tip backwards via pindex->pprev."
    (merge-pathnames (format nil "test-activate-block-~A/" suffix)
                     (uiop:temporary-directory))))
 
-(defmacro %with-mainnet-network (&body body)
-  "Bind *network* to :mainnet so version-1 test blocks pass the
-BIP34 activation check (testnet4 activates BIP34 at h=1, which would
-otherwise reject the synthetic make-reorg-test-block blocks)."
-  `(let ((bl:*network* :mainnet))
-     ,@body))
-
 ;; make-reorg-test-block was replaced by the unified make-reorg-test-block
 ;; (persistence-tests.lisp) — that helper now derives script-sig from
 ;; block-hash and computes a real merkle root, so it satisfies both the
@@ -331,7 +324,7 @@ pairs in connect order."
 (test activate-block-extends-current-tip
   "When the incoming block's parent IS the current tip, activate-block
 should extend the chain normally."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "extends-tip")
     ;; Build chain A: genesis → A1 → A2.
@@ -357,7 +350,7 @@ should extend the chain normally."
 this block added, has strictly more chain-work than current tip,
 activate-block should pre-reorg to the new fork and then activate the
 block. Chain tip should land on the new fork's tip."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "stronger-fork")
     ;; Chain A: genesis → A1 → A2. Active.
@@ -412,7 +405,7 @@ back to its original valid chain. Before the fix, perform-reorg applied fork
 blocks with apply-block-to-utxo-set and NO validate-block — so a more-work fork
 (cheap to mine under testnet4's min-difficulty rule) could inject any invalid
 block into the chainstate."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "reorg-invalid-fork")
     ;; Chain A: genesis -> A1 -> A2. Active and valid.
@@ -471,7 +464,7 @@ block into the chainstate."
 total work doesn't exceed current tip's, activate-block returns
 :weaker-chain and stores the block in the block-store but doesn't
 update the chain tip."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "weaker-fork")
     ;; Chain A has 3 blocks.
@@ -503,7 +496,7 @@ update the chain tip."
 (test activate-block-unknown-parent
   "When the incoming block's parent isn't in the chain index,
 activate-block returns :unknown-parent without doing anything."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "unknown-parent")
     (declare (ignore genesis-hash))
@@ -526,7 +519,7 @@ activate-block returns :unknown-parent without doing anything."
 (test invalidate-and-reconsider-block
   "invalidate-block marks a block + descendants invalid and reorgs to its parent;
 reconsider-block clears the flags and reorgs back to the best valid chain."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "invalidate")
      ;; genesis -> A1 -> A2 -> A3
@@ -564,7 +557,7 @@ reconsider-block clears the flags and reorgs back to the best valid chain."
   "preciousblock reorgs to a chosen block of >= the tip's work; equal-work
 competitors don't displace it (strict-> fork choice), and it can flip between
 equal-work forks."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "precious")
      (let ((a-hashes (make-test-chain-hashes #xA0 1)))
@@ -609,7 +602,7 @@ equal-work forks."
 (test rpc-verifychain-reads-stored-blocks
   "verifychain (checklevel 0) confirms the last N stored blocks read back from
 the block store."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "verifychain")
      (%build-and-connect chain-state block-store utxo-set genesis-hash
@@ -623,7 +616,7 @@ the block store."
 (test rpc-getchaintxstats-window
   "getchaintxstats computes window tx counts over connected blocks (coinbase-only
 test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "chaintxstats")
      (%build-and-connect chain-state block-store utxo-set genesis-hash
@@ -653,7 +646,7 @@ test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
   "txcount stays known on a v1-upgraded index: genesis is never in the block
 store, so its zeroed tx-count is backfilled definitionally (exactly its
 coinbase) instead of being dropped as unreadable."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "chaintxstats-genesis")
      (%build-and-connect chain-state block-store utxo-set genesis-hash
@@ -713,7 +706,7 @@ output and NO coinbase witness — a witness-stripped block (block-witness-strip
 from the old v1-compact :weaker-chain path) is pruned during the reorg precondition
 and returned as MISSING so it gets re-downloaded witness-complete — instead of
 failing the reorg forever and wedging the node (testnet4 stuck ~1800 blocks behind)."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "prune-stripped")
      ;; Active chain A: genesis -> A1 -> A2.
@@ -766,7 +759,7 @@ arrive.
 
 Live on 2026-08-19: testnet4 held tip 149110 for 40+ minutes while a
 fully-downloaded 149120 branch with strictly more work lay on disk."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "activate-best")
      (%build-and-connect chain-state block-store utxo-set genesis-hash
@@ -845,7 +838,7 @@ SEAM: it replaces MAYBE-STOP-AT-HEIGHT with a recorder and asserts
 ACTIVATE-BEST-CHAIN calls it with the height it just activated to. Stubbing is
 what keeps the test free of the shutdown machinery — the real function would
 ask the node to stop."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "stopatheight-seam")
      (unwind-protect
@@ -902,7 +895,7 @@ right is worthless if nothing invokes it — which is precisely the defect being
 fixed here, where best-valid-tip was correct and reachable only from the
 reconsiderblock RPC. Drive the real run-ibd (no peers, so nothing else can
 move the tip) and require that the heavier downloaded fork gets activated."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "run-ibd-wiring")
      (%build-and-connect chain-state block-store utxo-set genesis-hash
@@ -930,7 +923,7 @@ reorg had just disconnected and the next startup rescanned from genesis
 reached through the connect-time hook over the node's index list -- there is
 no argument to forget -- so this binds *NODE* the way a live node has it and
 asserts the marker, which is the thing that was wrong."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "run-ibd-txindex")
      (let* ((txdir (ensure-directories-exist
@@ -985,7 +978,7 @@ takes an index, and both connect sites in block.lisp call the hook."
 path: BLOCK-EXISTS-P is a filesystem probe per entry, so the chain-work compare
 has to come first and the floor has to prune. Behaviourally: nothing at or
 below the floor is ever returned."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "bvt-floor")
      (%build-and-connect chain-state block-store utxo-set genesis-hash
@@ -1032,7 +1025,7 @@ undo, which silently corrupts the UTXO set (removes the block's created outputs
 but never restores the coins it spent). Coinbase-only disconnect blocks (empty
 undo is legitimate) are exempt. The refusal is a DISTINCT keyword, not the
 missing-block list."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "corrupt-undo")
      (let* ((genesis-entry (bl.store:get-block-index-entry chain-state genesis-hash))
@@ -1197,7 +1190,7 @@ the old early-return + disconnect-time removal left it UNINDEXED); (b) a tx
 only in the stale branch keeps its entry and resolves through the still-stored
 stale block; (c) the startup catch-up scan is idempotent under upsert
 semantics and re-points entries left stale by a crash."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "txidx-remined")
      (let* ((txdir (ensure-directories-exist
@@ -1339,7 +1332,7 @@ names some other block is left alone."
 the tx IS returned, blockhash names the stale block, confirmations is 0, and
 no time/blocktime fields are present; a tx on the active chain gets normal
 confirmations."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "txidx-rpc")
      (let* ((txdir (ensure-directories-exist
@@ -1404,7 +1397,7 @@ recent-rejects filter — Core resets it on EVERY active tip change
 txdownloadman_impl.cpp:92-96), because cached failures like non-final,
 too-low-fee, or missing-inputs can become valid at the next block.
 Previously only the reorg path cleared it."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "wave8-rejects-clear")
      (let ((rejects (bl:make-rejects-filter 100))
@@ -1569,7 +1562,7 @@ WITHOUT connecting it. Returns the mined block."
   "CONTEXT-FREE-ONLY returns success before the UTXO/height-dependent checks
 (so a fork block validated at the wrong tip height is not spuriously rejected),
 while the pure block-integrity checks still run."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "cfo"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
@@ -1613,7 +1606,7 @@ is already on the shorter branch: every fork block must be stored (not rejected
 by tip-validation), and the branch must win via reorg once it outweighs the
 active chain. Old code rejected the fork blocks (BAD-COINBASE-HEIGHT, since
 their height != tip+1) and never reorged."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((spk-a (%p2sh-optrue-spk))
           ;; A distinct coinbase spk so branch B's blocks differ from A's.
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))  ; bare OP_TRUE
@@ -1669,7 +1662,7 @@ their height != tip+1) and never reorged."
 with duplicate inputs, CVE-2018-17144) is rejected before storage rather than
 being stored and only caught later in perform-reorg. A well-formed block still
 passes context-free."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "cfo-ct"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
@@ -1711,7 +1704,7 @@ fork blocks are absent from the store, it returns the missing (hash . height)
 list as its second value, so the download path (accept-downloaded-block) can
 re-queue them. Regression for the testnet4 deep-reorg wedge: the compact/relay
 path swallowed this signal and never re-requested the sub-tip fork blocks."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((spk-a (%p2sh-optrue-spk))
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
           ;; Branch B (4 blocks) built on a throwaway node; capture the blocks.
@@ -1763,7 +1756,7 @@ the PEER'S chain only. A peer whose best-known block is on fork B yields fork-B
 blocks to download and never fork-A blocks; a peer at our own tip yields nothing.
 This is why the node downloads the chains its peers actually serve instead of
 fixating on a fork no connected peer has."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((spk-a (%p2sh-optrue-spk))
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
           (nb (%regtest-node-fixture "l5-b"))
@@ -1823,7 +1816,7 @@ is asked only for blocks within NODE_NETWORK_LIMITED_MIN_BLOCKS-2 (=286) of its
 best-known height; deeper blocks are skipped, shallower ones still fetched. A
 full NODE_NETWORK|NODE_WITNESS peer gets the whole range. Pure synthetic
 index/peer setup, no Bitcoin Core vectors."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((store (bl.store::make-block-store
                   :base-path #p"/nonexistent/l5-svc-guards/"))
           (cs (bl.store:make-chain-state))
@@ -1893,7 +1886,7 @@ fork bodies complete on disk) performs the reorg.
 Fork-B index works are hand-set so B's cumulative work crosses the tip's
 only at B4 (equal-bits regtest blocks always cross exactly at tip+1, which
 would let the ordinary tip+1 path preempt the scenario)."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((spk-a (%p2sh-optrue-spk))
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
           (nb (%regtest-node-fixture "drc-b"))
@@ -1971,7 +1964,7 @@ even if its RAM queue slot is lost (cap-drop, fork collision, restart),
 drain-block-queue connects it from disk via disk-blocks-above-tip once the
 tip reaches its parent — pre-fix the block was silently re-downloaded (or,
 post-persist without the fallback, stranded on disk forever)."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((spk-a (%p2sh-optrue-spk))
           (na (%regtest-node-fixture "ddf-a"))
           (nb (%regtest-node-fixture "ddf-b"))
@@ -2026,7 +2019,7 @@ UNSOLICITED out-of-order block is kept only if it outweighs the tip, sits
 within +min-blocks-to-keep+ of it, and meets minimum chain work — else an
 attacker fills disk with unsolicited far-ahead / low-work fork bodies. A
 REQUESTED block always passes. Tests %out-of-order-block-acceptable-p directly."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((cs (bl.store:make-chain-state))
           (%h (lambda (n) (make-array 32 :element-type '(unsigned-byte 8)
                                          :initial-element n)))
@@ -2063,7 +2056,7 @@ higher-work fork whose bodies are INCOMPLETE (unobtainable) must not starve a
 lower-work fork that IS complete — retry-best-reorg-candidate activates the
 best COMPLETABLE target. Blocks are stored + candidates populated directly so
 the retry, not eager arrival-time activation, is what performs the reorg."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((spk-g (coerce '(#x51) '(vector (unsigned-byte 8))))       ; OP_TRUE
           (spk-h (coerce '(#x52) '(vector (unsigned-byte 8))))       ; OP_2 — distinct
           (spk-a (%p2sh-optrue-spk))                                 ; distinct from both
@@ -2134,7 +2127,7 @@ the retry, not eager arrival-time activation, is what performs the reorg."
 ;;;; download, AcceptBlock persist gate, deep-reorg candidate set, witness-
 ;;;; strip guard). Every test is deterministic and hermetic — synthetic index
 ;;;; topologies or deterministic regtest mining, no Bitcoin Core test vectors.
-;;;; Reuses the layer-5 fixtures (%with-regtest, %regtest-node-fixture,
+;;;; Reuses the layer-5 fixtures (with-network (:regtest), %regtest-node-fixture,
 ;;;; %dr-mine-on/%dr-connect, %make-activate-block-fixture, make-reorg-test-block,
 ;;;; make-stripped-reorg-block, make-reorg-hash). Synthetic peers advertise
 ;;;; NODE_NETWORK|NODE_WITNESS or the per-peer walk's service guard skips them.
@@ -2147,7 +2140,7 @@ ibd-context-rejected-reorg-candidates, the active tip rolls back untouched, and
 it is never re-selected (note-reorg-candidate refuses to re-add a rejected
 hash). The invalid signal is an over-value coinbase (:coinbase-too-large), the
 same deterministic fork failure as reorg-rejects-fork-carrying-invalid-block."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
        (%make-activate-block-fixture "l5-invalid-cand")
      ;; Active chain A: a single block A1 on genesis (tip height 1).
@@ -2204,7 +2197,7 @@ fork bodies are absent yields a transient :reorg-refused. process-received-block
 re-queues the missing (hash . height) blocks into pending (queue-missing-fork-
 blocks) and records the winner as a reorg CANDIDATE (recoverable) — never in the
 rejected set. The active tip is untouched until the bodies arrive."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((spk-a (%p2sh-optrue-spk))
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
           (nb (%regtest-node-fixture "l5-refuse-b"))
@@ -2263,7 +2256,7 @@ stripped body on disk fails every later reorg (the original testnet4 wedge).
 block-exists-p stays NIL for the stripped copy in all three cases. An above-tip
 stripped copy of a REQUESTED block re-enters pending so a witness-complete copy is
 re-fetched; an unsolicited stripped copy does not."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
        (%make-activate-block-fixture "l5-stripped")
      ;; Active chain A: two blocks, tip A2 at height 2.
@@ -2335,7 +2328,7 @@ REQUESTED copy bypasses the gate). Min-work boundary: a more-work in-window
 unsolicited block is accepted only when its work meets minimum-chain-work; one
 unit below the floor is rejected (again bypassed when REQUESTED). Pure synthetic
 index — no Bitcoin Core vectors."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((cs (bl.store:make-chain-state))
           (%h (lambda (n) (make-array 32 :element-type '(unsigned-byte 8)
                                          :initial-element n)))
@@ -2381,7 +2374,7 @@ not both get the same block in one request-blocks-from-peers pass. Each peer's
 chosen blocks are marked in-flight before the next peer is walked (Core
 FindNextBlocksToDownload marks mapBlocksInFlight), so the two peers PARTITION the
 fork range — no hash is requested twice."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((cs (bl.store:make-chain-state))
           (store (bl.store::make-block-store :base-path #p"/nonexistent/l5-dedup/"))
           (genesis (bl.store:make-block-index-entry
@@ -2437,7 +2430,7 @@ next-needed (gap) block is absent from it, request-blocks-from-peers lifts
 backpressure for only ONE block — the over-cap gap-only path clamps the total
 request budget to 1, so peers can't flood blocks above a stalled gap (the heap
 exhaustion this gate exists to prevent)."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((cs (bl.store:make-chain-state))
           (store (bl.store::make-block-store :base-path #p"/nonexistent/l5-gap/"))
           (genesis (bl.store:make-block-index-entry
@@ -2481,7 +2474,7 @@ target-ancestor range [hist-tip+1 .. base] ONLY for a peer whose best-known chai
 contains the snapshot base (Core GetAncestor(base->nHeight) == base). A peer on a
 fork that does not contain the base gets nothing. Synthetic chainstates, no
 Bitcoin Core vectors."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((cs (bl.store:make-chain-state))
           (hist (bl.store:make-chain-state))
           (store (bl.store::make-block-store :base-path #p"/nonexistent/l5-hist/"))
@@ -2579,7 +2572,7 @@ CheckBlock, control, unrecognized, or NIL value is TRANSIENT (never poisons)."
 (:coinbase-too-large) is marked :invalid, its descendant subtree is
 BLOCK_FAILED_CHILD'd, the reorg rolls back, and ANCESTORS on the fork stay
 recoverable (:header-valid). Directly exercises the perform-reorg poisoning hook."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
        (%make-activate-block-fixture "item14-phaseb")
      ;; Active chain A: A1 is the tip (height 1), fully valid.
@@ -2644,7 +2637,7 @@ recoverable (:header-valid). Directly exercises the perform-reorg poisoning hook
   "Verifies the already-wired hook fires: find-blocks-to-download-for-peer aborts
 the per-peer walk at an :invalid block (Core FindNextBlocks) — blocks BELOW it are
 still offered, the invalid block and everything above it are never re-requested."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((spk-a (%p2sh-optrue-spk))
           (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
           (nb (%regtest-node-fixture "item14-walk-b"))
@@ -2697,7 +2690,7 @@ still offered, the invalid block and everything above it are never re-requested.
   "process-headers BLOCK_FAILED_CHILD: a header extending a known-:invalid block
 is admitted marked :invalid (so its own descendants are recognized) but is NEVER
 queued for download; a header on a valid parent is still admitted normally."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "item14-fc"))
           (cs (bl::node-chain-state node))
           (genesis-hash (bl.store:best-block-hash cs))
@@ -2742,7 +2735,7 @@ queued for download; a header on a valid parent is still admitted normally."
 (:reorg-refused-with-missing) is TRANSIENT — it marks NOTHING :invalid, so the
 fork stays recoverable once the bodies arrive. Poisoning here would re-wedge the
 node (the exact class of bug this project has fought)."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
        (%make-activate-block-fixture "item14-neg-missing")
      ;; Active chain A: A1 -> A2 (tip height 2), bodies on disk.
@@ -2785,7 +2778,7 @@ node (the exact class of bug this project has fought)."
   "CRITICAL NEGATIVE: a reorg refused because a to-DISCONNECT spending block's undo
 is missing/corrupt (:corrupt-undo) is TRANSIENT — a LOCAL fault, not a verdict on
 the fork. It marks NOTHING :invalid; the competing fork stays recoverable."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "item14-neg-corrupt")
      (let* ((genesis-entry (bl.store:get-block-index-entry chain-state genesis-hash))
@@ -2851,7 +2844,7 @@ unchecked. PHASE B re-runs that ONE header rule (never PoW/difficulty — a fork
 body re-read from the store carries no cached hash) and refuses.
 Control: the same block through validate-block WITHOUT :skip-header is
 :time-too-old, so the fixture genuinely violates the rule."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
        (%make-activate-block-fixture "mtp-fork")
      ;; Active chain A: A1 is the tip at height 1.
@@ -2911,7 +2904,7 @@ Control: the same block through validate-block WITHOUT :skip-header is
   "GA8 S1-7, the case with no descendant: reconsider-block hands its target
 straight to perform-reorg, so an MTP-violating block can be the reorg TIP.
 The reorg must refuse and reconsiderblock report :reorg-failed."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
        (%make-activate-block-fixture "mtp-reconsider")
      (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
@@ -3006,7 +2999,7 @@ here would stay green."
   "CONTROL for the two truncation tests below: the same fixture and the same
 perform-reorg call, with no stop request, must run the whole reorg — otherwise
 those tests could pass on a reorg that never worked at all."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store a-entries b-entries)
        (%p3b-reorg-fixture "p3b-control")
      (is (eq t (bl.val:perform-reorg
@@ -3026,7 +3019,7 @@ the state the whole phase is otherwise free to contradict. Before this, PHASE A
 rewound the UTXO set for its entire duration without touching the tip, so a
 shutdown (or the 600s destroy-thread fallback) landed mid-phase and persisted a
 UTXO set that did not match the recorded tip."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store a-entries b-entries)
        (%p3b-reorg-fixture "p3b-disconnect")
      (let* ((a1 (first a-entries))
@@ -3061,7 +3054,7 @@ block and leave the chain there. It must NOT run %rollback-partial-reorg: that i
 minutes of interruptible work whose only purpose is to reach a consistent chain,
 and a block boundary in PHASE B already IS one (the tip advances per connected
 block). The next start simply reorgs the rest of the way."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store a-entries b-entries)
        (%p3b-reorg-fixture "p3b-connect")
      (let* ((b2-hash (bl.store:block-index-entry-hash (second b-entries)))
@@ -3096,7 +3089,7 @@ block). The next start simply reorgs the rest of the way."
 shutdown flush persists a consistent pair and startup reconciliation (phase 3a)
 has nothing to repair. Run against a real coins-view-cache, where the pointer
 actually exists."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (bl.store:with-coins-view-db
        (base (ensure-directories-exist
               (merge-pathnames "coins/"
@@ -3252,7 +3245,7 @@ The marker is planted on the LOSING branch deliberately — that is the only
 state that produced the full rescan, and no amount of fixing the reorg drive
 sites removes it, since a crash between disconnect and marker update recreates
 it."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "txindex-rewind")
      (let* ((txdir (ensure-directories-exist

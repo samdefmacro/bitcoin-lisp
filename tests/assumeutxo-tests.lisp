@@ -18,7 +18,7 @@
 
 (in-suite :assumeutxo-tests)
 
-;;; Temp dirs use snapshot-tests' %with-snap-dir (same package, loads first).
+;;; Temp dirs use the shared WITH-TEMP-DIRECTORY (tests/support/).
 
 (defun %au-hash (byte &optional (second 0))
   "A 32-byte hash with BYTE at index 0 and SECOND at index 1."
@@ -72,7 +72,7 @@ off the target path and heights past the target are excluded."
 ancestor path of its target: an equal-work sibling extending the same tip is
 stored but refused (:weaker-chain) — Core TryAddBlockIndexCandidate — and so
 is any block past the target (ReachedTarget stops the chainstate)."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (cs utxo store genesis-hash)
        (%make-activate-block-fixture "target-guard")
      ;; Connect A1; then index A2 (target), S2 (sibling of A2), A3 (past).
@@ -140,8 +140,8 @@ base_blockhash marker: dual chainstates are rebuilt with the snapshot
 chainstate current (:unvalidated — never persisted, re-derived), its tip
 loaded from chainstate_snapshot.dat, its coins reopened, and the primary
 retargeted at the base."
-  (%with-snap-dir (src-dir)
-    (%with-snap-dir (dir)
+  (with-temp-directory (src-dir)
+    (with-temp-directory (dir)
       (let* ((bl:*prune-target-mib* nil) ; deterministic: pruning off
              (h5 (%snap-fill 32 5))
              (txid (%snap-fill 32 #x33))
@@ -201,7 +201,7 @@ retargeted at the base."
   "Startup detection is conservative: a snapshot dir without a base_blockhash
 marker, or whose base header is missing from the index, does NOT create a
 second chainstate (single-chainstate startup, dir left for later adoption)."
-  (%with-snap-dir (dir)
+  (with-temp-directory (dir)
     ;; Case 1: dir exists but no marker.
     (ensure-directories-exist (merge-pathnames "chainstate_snapshot/" dir))
     (let ((node (make-test-node)))
@@ -320,7 +320,7 @@ flush at tip==base just clears the marker (populate committed the coins
 atomically before the tip ever moved); a torn flush above the base with no
 committed descendant block on disk rewinds to the base — whose coins ARE the
 verified snapshot — never below it."
-  (%with-snap-dir (dir)
+  (with-temp-directory (dir)
     (let* ((base-hash (%au-hash 5))
            (g (%au-entry (%au-hash 0) 0 nil :status :valid))
            (e5 (%au-entry base-hash 5 g :status :valid))
@@ -368,7 +368,7 @@ verified snapshot — never below it."
   "do-flush writes only the given chainstate's storage-suffix-named state
 file: flushing the snapshot chainstate never marks the primary's
 chainstate.dat in-transition, and vice versa."
-  (%with-snap-dir (dir)
+  (with-temp-directory (dir)
     (let* ((primary (bl.store:make-chain-state
                      :base-path (pathname dir)
                      :best-block-hash (%au-hash 1) :best-height 1))
@@ -529,7 +529,7 @@ the historical records its target-utxohash (so it is no longer selected as the
 historical chainstate), services regain NODE_NETWORK, and getchainstates
 reports a single validated current chainstate (Core MaybeValidateSnapshot
 SUCCESS, validation.cpp:6088-6095). A second call is a no-op."
-  (%with-snap-dir (dir)
+  (with-temp-directory (dir)
     (let* ((base-hash (%au-hash 5))
            (txid (%snap-fill 32 #x44))
            (spk (%snap-cat #(#x51)))
@@ -607,7 +607,7 @@ LevelDB dir to chainstate_snapshot_INVALID for forensics, and fires the fatal
 shutdown decision (Core handle_invalid_snapshot + InvalidateCoinsDBOnDisk,
 validation.cpp:6006-6036). The decision path is exercised via a rebound
 *snapshot-fatal-hook* — no actual process exit."
-  (%with-snap-dir (dir)
+  (with-temp-directory (dir)
     (multiple-value-bind (node historical snap base-hash)
         (%snap-validation-fixture dir)
       (let ((bl::*node* node)
@@ -639,7 +639,7 @@ finalize-snapshot-validation-at-startup re-proves the hash and swaps the
 LevelDB dirs — chainstate_snapshot/ becomes chainstate/, the old background
 chainstate is deleted — leaving the node with a single fully-validated
 chainstate whose coins view is the (formerly snapshot) promoted set."
-  (%with-snap-dir (dir)
+  (with-temp-directory (dir)
     (let* ((base-hash (%au-hash 5))
            (txid-h (%snap-fill 32 #x11))     ; only in the background chainstate
            (txid-s (%snap-fill 32 #x22))     ; only in the snapshot chainstate
@@ -716,7 +716,7 @@ chainstate whose coins view is the (formerly snapshot) promoted set."
   "At startup a persisted historical chainstate that reached the base but
 whose UTXO set fails the commitment aborts node startup (Core FAILURE_FATAL,
 node/chainstate.cpp:231-235) and still renames the snapshot dir aside."
-  (%with-snap-dir (dir)
+  (with-temp-directory (dir)
     (multiple-value-bind (node historical snap base-hash)
         (%snap-validation-fixture dir)
       (declare (ignore historical))

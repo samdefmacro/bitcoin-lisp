@@ -6,14 +6,6 @@
 
 (in-suite :flatfile-tests)
 
-(defmacro %with-flat-dir ((var) &body body)
-  "A private empty directory, removed afterwards."
-  `(let ((,var (ensure-directories-exist
-                (merge-pathnames (format nil "bl-flatfile-~D/" (get-internal-real-time))
-                                 (uiop:temporary-directory)))))
-     (unwind-protect (progn ,@body)
-       (uiop:delete-directory-tree ,var :validate t :if-does-not-exist :ignore))))
-
 (defun %ff-bytes (&rest values)
   (coerce values '(vector (unsigned-byte 8))))
 
@@ -109,7 +101,7 @@ readable byte for byte."
 xor.dat always wins (blockstorage.cpp:1167-1222). Turning obfuscation on for a
 directory that already holds plaintext would make every existing byte
 unreadable, which is why the second case here matters more than the first."
-  (%with-flat-dir (dir)
+  (with-temp-directory (dir)
     (let ((key (bl.store:read-or-create-xor-key dir)))
       (is-true (bl.store:obfuscation-key-active-p key))
       (is (probe-file (merge-pathnames "xor.dat" dir)))
@@ -119,7 +111,7 @@ unreadable, which is why the second case here matters more than the first."
   ;; file is still written. Core creates xor.dat whenever it is missing,
   ;; whatever key it chose (blockstorage.cpp:1195-1206); its presence holding
   ;; zeros is what records that obfuscation was considered and declined here.
-  (%with-flat-dir (dir)
+  (with-temp-directory (dir)
     (with-open-file (s (merge-pathnames "blk00000.dat" dir)
                        :direction :output :element-type '(unsigned-byte 8))
       (write-sequence (%ff-bytes 1 2 3) s))
@@ -135,7 +127,7 @@ means an older node wrote blocks before xor.dat existed; generating a key now
 would make every one of them unreadable."
   (dolist (name '("blk00000.dat" "rev00000.dat"
                   "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff.blk"))
-    (%with-flat-dir (dir)
+    (with-temp-directory (dir)
       (with-open-file (s (merge-pathnames name dir)
                          :direction :output :element-type '(unsigned-byte 8))
         (write-sequence (%ff-bytes 1 2 3) s))
@@ -145,7 +137,7 @@ would make every one of them unreadable."
         (is-true (probe-file (merge-pathnames "xor.dat" dir))
                  "the null key is still written to disk"))))
   ;; And a genuinely fresh one does get a random key.
-  (%with-flat-dir (dir)
+  (with-temp-directory (dir)
     (is-true (bl.store:obfuscation-key-active-p
               (bl.store:read-or-create-xor-key dir)))))
 
@@ -155,8 +147,8 @@ has a random key (blockstorage.cpp:1213-1219): reading those files without the
 key returns garbage, and a node that started anyway would conclude its whole
 block store was corrupt. Now that a fresh datadir gets a key by default, this
 is the ordinary way an operator meets it."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((bl.store:*flat-block-files* t)
             (store (bl.store:init-block-store dir)))
        (is-true (bl.store:obfuscation-key-active-p
@@ -175,12 +167,12 @@ is the ordinary way an operator meets it."
 (test a-wrong-sized-xor-key-is-refused
   "Reading a truncated key and padding it would silently decrypt every block
 wrongly, so the size is a hard error."
-  (%with-flat-dir (dir)
+  (with-temp-directory (dir)
     (with-open-file (s (merge-pathnames "xor.dat" dir)
                        :direction :output :element-type '(unsigned-byte 8))
       (write-sequence (%ff-bytes 1 2 3) s))
     (signals error (bl.store:read-or-create-xor-key dir)))
-  (%with-flat-dir (dir)
+  (with-temp-directory (dir)
     (with-open-file (s (merge-pathnames "xor.dat" dir)
                        :direction :output :element-type '(unsigned-byte 8))
       (write-sequence (%ff-bytes 1 2 3 4 5 6 7 8 9) s))
@@ -190,7 +182,7 @@ wrongly, so the size is a hard error."
 
 (test flat-file-names-are-core-s
   "blk00000.dat / rev00007.dat: five zero-padded digits (FlatFileSeq::FileName)."
-  (%with-flat-dir (dir)
+  (with-temp-directory (dir)
     (let ((blk (bl.store:make-flat-file-seq dir "blk" 1024))
           (rev (bl.store:make-flat-file-seq dir "rev" 1024)))
       (is (string= "blk00000.dat"
@@ -206,7 +198,7 @@ wrongly, so the size is a hard error."
 (test allocation-rounds-up-to-whole-chunks
   "Core allocates in multiples of the sequence chunk size, and does nothing when
 the request already fits inside the chunks already allocated."
-  (%with-flat-dir (dir)
+  (with-temp-directory (dir)
     (let ((seq (bl.store:make-flat-file-seq dir "blk" 1024))
           (pos (bl.store:make-flat-file-pos 0 0)))
       ;; 100 bytes at offset 0 => one 1024-byte chunk.
@@ -225,7 +217,7 @@ the request already fits inside the chunks already allocated."
   "The point of the finalize flag: a rolled-over block file must not keep the
 zeros it preallocated, or every full file would carry up to a chunk of padding
 forever."
-  (%with-flat-dir (dir)
+  (with-temp-directory (dir)
     (let* ((seq (bl.store:make-flat-file-seq dir "blk" 1024))
            (pos (bl.store:make-flat-file-pos 0 0))
            (path (bl.store:flat-file-name seq pos)))
@@ -326,7 +318,7 @@ LoadExternalBlockFile scans byte-wise for the next magic rather than giving up
 (test obfuscated-records-round-trip-through-a-file
   "The combination P2 will actually use: frame a record, obfuscate it at its
 file offset, write it, read it back, de-obfuscate, and get the payload."
-  (%with-flat-dir (dir)
+  (with-temp-directory (dir)
     (let* ((key (bl.store:read-or-create-xor-key dir))
            (seq (bl.store:make-flat-file-seq dir "blk" 1024))
            (magic (%ff-bytes #xF9 #xBE #xB4 #xD9))
@@ -376,7 +368,7 @@ what production data always has."
     block))
 
 (defmacro %with-flat-store ((store dir &key (flat t)) &body body)
-  `(%with-flat-dir (,dir)
+  `(with-temp-directory (,dir)
      (let* ((bl.store:*flat-block-files* ,flat)
             (,store (bl.store:init-block-store ,dir)))
        ,@body)))
@@ -384,7 +376,7 @@ what production data always has."
 (test flat-store-round-trips-a-block-through-a-blk-file
   "Written into blk00000.dat, obfuscated, and read back — through the ordinary
 STORE-BLOCK / GET-BLOCK API, which does not change."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (%with-flat-store (store dir)
      (let* ((block (%ff-test-block 40))
             (hash (bl.store:store-block store block)))
@@ -404,8 +396,8 @@ STORE-BLOCK / GET-BLOCK API, which does not change."
   "A blk file is self-describing: reopening the store rebuilds the hash ->
 position map by walking the records, so nothing outside the file is needed to
 find a block again. This is most of what a full -reindex does."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let ((hashes '()))
        (let* ((bl.store:*flat-block-files* t)
               (store (bl.store:init-block-store dir)))
@@ -429,8 +421,8 @@ find a block again. This is most of what a full -reindex does."
   "Dual read, which is what makes the transition survivable: blocks written
 before the flat files stay readable after the switch, and blocks written after
 it stay readable if the flag is turned back off."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let (legacy-hash flat-hash)
        ;; One block the old way.
        (let* ((bl.store:*flat-block-files* nil)
@@ -454,7 +446,7 @@ it stay readable if the flag is turned back off."
 are read without the obfuscation layer, so they neither need nor forbid one —
 but an existing blk?????.dat written without a key must never acquire one, or
 every record already in it becomes unreadable."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    ;; Fresh: obfuscated, and the magic is not visible on disk.
    (%with-flat-store (store dir)
      (bl.store:store-block store (%ff-test-block 120))
@@ -462,7 +454,7 @@ every record already in it becomes unreadable."
        (is (not (equalp (bl:network-magic :mainnet) (subseq raw 0 4)))
            "a fresh blocksdir writes obfuscated records")))
    ;; Flat records written with no key: a later start must not create one.
-   (%with-flat-dir (dir)
+   (with-temp-directory (dir)
      (let (first-hash)
        (let* ((bl.store:*flat-block-files* t)
               (store (bl.store:init-block-store dir)))
@@ -489,7 +481,7 @@ every record already in it becomes unreadable."
    ;; chosen before any block exists, not after. What matters is that adding
    ;; flat records later does not disturb the legacy file, and that both forms
    ;; still read back.
-   (%with-flat-dir (dir)
+   (with-temp-directory (dir)
      (let (legacy)
        (let* ((bl.store:*flat-block-files* nil)
               (store (bl.store:init-block-store dir)))
@@ -506,7 +498,7 @@ every record already in it becomes unreadable."
 refusal has to be visible: returning NIL is how the caller says `already gone',
 so a silent NIL would let a pruned node stop reclaiming space without a word.
 This is also why the flag is off by default."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (%with-flat-store (store dir)
      (declare (ignorable dir))
      (let ((hash (bl.store:store-block store (%ff-test-block 150))))
@@ -521,7 +513,7 @@ This is also why the flag is off by default."
 height range, not on individual blocks. A file holding one block above the
 window keeps the whole file — which is the trade the format makes, and the
 reason Core's unit is the file."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (%with-flat-store (store dir)
      (declare (ignorable dir))
      ;; File 0 gets heights 10..12, and (pretending it rolled over) file 1
@@ -543,7 +535,7 @@ reason Core's unit is the file."
   "The safe direction. A file whose range is unknown can never be SHOWN to lie
 inside the window, so it is never deleted — the alternative is dropping a block
 the chain still needs. Storing without a height still stores the block."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (%with-flat-store (store dir)
      (declare (ignorable dir))
      (let ((hash (bl.store:store-block store (%ff-test-block 170))))
@@ -557,7 +549,7 @@ the chain still needs. Storing without a height still stores the block."
   "The blk and rev files go together — a pruned node cannot reorg below its
 window, so undo data there is dead weight — and every block in the file leaves
 the index, so the download path can re-request it."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (%with-flat-store (store dir)
      (let ((hashes (loop for h from 30 to 32
                          collect (bl.store:store-block
@@ -585,8 +577,8 @@ the index, so the download path can re-request it."
 the header index knows WHAT HEIGHT it is, and pruning needs both. Core persists
 this in its block-index database; deriving it means there is no second file to
 fall out of step."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let ((blocks '()))
        ;; Store three blocks and record them in a chain state at known heights.
        (let* ((bl.store:*flat-block-files* t)
@@ -640,8 +632,8 @@ are five call sites; a sixth that forgets is how this returns."
 pruning entry point never calls it — which is the failure mode this project
 keeps finding. Drive the real PRUNE-OLD-BLOCKS with a target of zero and
 require the file to be gone."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((bl.store:*flat-block-files* t)
             (store (bl.store:init-block-store dir))
             (cs (bl.store:init-chain-state dir))
@@ -709,8 +701,8 @@ reason as elsewhere: reindexing recovers identity from BYTES."
   "The capability the flat files were worth having for. Delete the whole header
 index, keep the blocks, and the chain comes back — which turns a lost index
 from a full resync into local work."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((bl.store:*flat-block-files* t)
             (store (bl.store:init-block-store dir))
             (cs (bl.store:init-chain-state dir))
@@ -760,8 +752,8 @@ from a full resync into local work."
 later in the file. Core parks such records by their parent's hash and drains
 them once it lands; without that, reindexing a node that saw a block out of
 order would silently lose the rest of the chain behind it."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((bl.store:*flat-block-files* t)
             (store (bl.store:init-block-store dir))
             (cs (bl.store:init-chain-state dir))
@@ -795,8 +787,8 @@ order would silently lose the rest of the chain behind it."
 reachable parent are EXPECTED. Reporting the count lets an operator tell that
 apart from a genuinely broken file; refusing would make reindex useless on
 exactly the nodes that most need it."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((bl.store:*flat-block-files* t)
             (store (bl.store:init-block-store dir))
             (cs (bl.store:init-chain-state dir))
@@ -824,8 +816,8 @@ exactly the nodes that most need it."
   "It never discards what is already known: a node that threw away a good index
 to rebuild it would be strictly worse off if the files turned out to be
 incomplete. Running it twice adds nothing the second time."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((bl.store:*flat-block-files* t)
             (store (bl.store:init-block-store dir))
             (cs (bl.store:init-chain-state dir))
@@ -877,8 +869,8 @@ state, the store, and the hashes in height order."
 and the per-block files are gone. Reading the blocks back is the assertion that
 matters — a migration that updated the index but wrote nothing usable would
 pass any count-based check."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 5)
        ;; Capture the blocks as the legacy store serves them.
        (let ((before (mapcar (lambda (h)
@@ -911,8 +903,8 @@ pass any count-based check."
   "The converted blocks have to be findable by a process that never saw the
 migration — otherwise the migration is only true of the running image, and the
 next restart loses the chain."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 4 :seed-base 60)
        (bl.store:migrate-blocks-to-flat-files store cs)
        (let* ((bl.store:*flat-block-files* t)
@@ -926,8 +918,8 @@ next restart loses the chain."
   "An operator converting a live node needs to stop after a slice and continue
 later. The resume height is the contract; if it were wrong the next call would
 either redo work or skip blocks."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 6 :seed-base 70)
        (declare (ignore hashes))
        (multiple-value-bind (migrated next remaining)
@@ -951,8 +943,8 @@ either redo work or skip blocks."
 (test migration-is-idempotent
   "Re-running must be free, not destructive. A resumable job that converts
 already-converted blocks would rewrite the whole chain on every retry."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (multiple-value-bind (cs store) (%ff-migration-chain dir 3 :seed-base 80)
        (is (= 3 (bl.store:migrate-blocks-to-flat-files store cs)))
        (let ((size (bl.store::file-size-bytes
@@ -968,8 +960,8 @@ already-converted blocks would rewrite the whole chain on every retry."
 whole height range is below the horizon; converting in arrival order would give
 file 0 a range spanning the chain, and a pruned node would quietly stop
 reclaiming space. Assert the range, not the order."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (multiple-value-bind (cs store) (%ff-migration-chain dir 5 :seed-base 90)
        (bl.store:migrate-blocks-to-flat-files store cs)
        (let ((info (gethash 0 (bl.store:block-store-file-info store))))
@@ -983,8 +975,8 @@ reclaiming space. Assert the range, not the order."
 (test migration-does-not-touch-blocks-off-the-active-chain
   "Side-chain blocks have no height in a flat file's range, and converting them
 would poison that range. They stay per-block, and dual read keeps them served."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 3 :seed-base 100)
        ;; A block that is in the store but not on the active chain.
        (let* ((bl.store:*flat-block-files* nil)
@@ -1004,8 +996,8 @@ would poison that range. They stay per-block, and dual read keeps them served."
 the legacy file's contribution when it writes the flat record, so decrementing
 again at the unlink — the obvious thing to write — would drive the total toward
 zero and disable pruning on a node that has just been migrated."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (multiple-value-bind (cs store) (%ff-migration-chain dir 4 :seed-base 110)
        (bl.store:migrate-blocks-to-flat-files store cs)
        (let ((on-disk (bl.store::file-size-bytes
@@ -1025,8 +1017,8 @@ zero and disable pruning on a node that has just been migrated."
 cannot be read back, the per-block file is the only surviving copy — so it is
 kept, and the walk stops rather than converting more blocks through a path just
 shown not to work."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 4 :seed-base 120)
        (let* ((victim (second hashes))
               (real #'bl.store:get-block)
@@ -1078,8 +1070,8 @@ records second, so after a crash in that window the flat record wins the index
 and the per-block file becomes an orphan nothing reads — but its bytes still
 count toward the pruning total, so a pruned node prunes earlier than it should.
 Re-running the migration must sweep it."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 3 :seed-base 130)
        (bl.store:migrate-blocks-to-flat-files store cs)
        ;; Recreate exactly what the crash leaves behind: the flat record is
@@ -1112,8 +1104,8 @@ Re-running the migration must sweep it."
 sweeping the per-block file because the index names the flat copy would delete
 the only readable copy of the block. The index goes back onto the file that
 reads, which also lets the migration retry it."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 3 :seed-base 140)
        (bl.store:migrate-blocks-to-flat-files store cs)
        (let* ((victim (second hashes))
@@ -1154,8 +1146,8 @@ below the target (node/blockstorage.cpp:292-319).
 
 This is what blocked rolling the flat format out to the pruned mainnet node:
 its operator would have had a -prune node that silently stopped reclaiming."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((bl.store:*flat-block-files* t)
             (store (bl.store:init-block-store dir))
             (cs (bl.store:init-chain-state dir))
@@ -1303,8 +1295,8 @@ then drop the lock and require the same call to delete it.
 Without this, a filter index that had not caught up would have its undo data
 deleted out from under it, and the only symptom would be the index failing to
 build much later."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((bl.store:*flat-block-files* t)
             (bl.store:*prune-locks*
               (make-hash-table :test 'equal :synchronized t))
@@ -1357,8 +1349,8 @@ build much later."
   "Core caps FindFilesToPruneManual by the same lock-limited last_prune
 (validation.cpp:2740-2745), so pruneblockchain cannot step around an index
 either."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((bl.store:*flat-block-files* t)
             (bl.store:*prune-locks*
               (make-hash-table :test 'equal :synchronized t))
@@ -1414,8 +1406,8 @@ file starts on a record."
 (test external-block-file-reads-every-record
   "The framing Core's contrib/linearize writes into bootstrap.dat, which is the
 same framing a blk file uses minus the XOR."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((blocks (loop for h from 1 to 3
                           collect (bl.ser:serialize-witness-block
                                    (%ff-test-block (+ 30 h)))))
@@ -1430,8 +1422,8 @@ same framing a blk file uses minus the XOR."
   "Leading garbage must not cost the file: Core scans for the magic a byte at a
 time so a partially-downloaded or concatenated bootstrap.dat still yields every
 whole record in it."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((blocks (loop for h from 1 to 2
                           collect (bl.ser:serialize-witness-block
                                    (%ff-test-block (+ 60 h)))))
@@ -1445,8 +1437,8 @@ whole record in it."
   "A record whose length runs past the end of the file is not a record. Core
 treats it as a coincidence in the data and keeps hunting, which is what lets a
 half-downloaded file still deliver the blocks that ARE complete."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (let* ((blocks (loop for h from 1 to 2
                           collect (bl.ser:serialize-witness-block
                                    (%ff-test-block (+ 90 h)))))
@@ -1467,8 +1459,8 @@ half-downloaded file still deliver the blocks that ARE complete."
 (test external-block-file-that-does-not-exist-reads-nothing
   "Core warns and moves on to the next -loadblock rather than refusing to
 start (blockstorage.cpp:1306)."
-  (%with-mainnet-network
-   (%with-flat-dir (dir)
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
      (is (= 0 (bl.store:map-external-block-file
                (merge-pathnames "no-such-file.dat" dir)
                (lambda (b) (declare (ignore b)) (error "must not be called"))))))))

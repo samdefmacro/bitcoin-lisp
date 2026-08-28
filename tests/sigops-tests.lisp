@@ -453,7 +453,7 @@ keeps its own policy last-push extraction."
 extractor — past MAX_BLOCK_SIGOPS_COST — so we rejected :too-many-sigops a block
 Core fully validates. A pure chain split: our own script engine accepts the
 spends, which this block proves by validating with scripts on."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "sigop-p2sh"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))

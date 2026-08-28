@@ -1221,7 +1221,7 @@ script-sig makes the serialization deterministic per block."
          ;; now fully validates fork blocks, and the synthetic make-reorg-test-block
          ;; coinbases carry no BIP34 height — bind mainnet so these low-height
          ;; mechanics blocks skip that check (same reason reorg-tests uses
-         ;; %with-mainnet-network).
+         ;; (with-network (:mainnet) ...)).
          (bl:*network* :mainnet)
          (base-path (ensure-directories-exist
                      (merge-pathnames "test-reorg-deep/"

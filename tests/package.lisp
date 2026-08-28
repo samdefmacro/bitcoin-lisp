@@ -1,5 +1,5 @@
 (defpackage #:bitcoin-lisp.tests
-  (:use #:cl #:fiveam)
+  (:use #:cl #:fiveam #:bitcoin-lisp.test-support)
   (:export #:run-tests
            #:run-unit-tests
            #:run-integration-tests))

@@ -286,7 +286,7 @@ supplied-but-false :webui; nothing is supplied when the flags are absent."
 before auth, Origin-absent and same-origin POSTs pass with the cookie
 credential, batch works with it too."
   (bl.rpc:stop-rpc-server)
-  (with-rpc-test-datadir (dir)
+  (with-temp-directory (dir)
     (let ((port 19981)
           (node (make-test-node))
           (cookie nil))
@@ -367,7 +367,7 @@ correct ones pass — the Origin check must not weaken auth."
   "With the UI flag off, no /ui/ dispatcher exists — a GET lands on the
 RPC prefix dispatcher and is refused (405), never served."
   (bl.rpc:stop-rpc-server)
-  (with-rpc-test-datadir (dir)
+  (with-temp-directory (dir)
     (let ((port 19983)
           (node (make-test-node)))
       (setf (bl::node-data-directory node) dir)

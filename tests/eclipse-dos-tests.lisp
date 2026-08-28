@@ -1190,11 +1190,9 @@ so the only thing that differs is the peer's liveness."
   "Regtest network + regtest PoW limit + the IBD latch forced ON, so these
 assertions cannot be made vacuous by whatever an earlier test left in the
 globals."
-  `(let ((bl:*network* :regtest)
-         (bl.store:*pow-limit-target*
-           bl.store:+regtest-pow-limit-target+)
-         (bl.net::*cached-is-ibd* t))
-     ,@body))
+  `(with-network (:regtest)
+     (let ((bl.net::*cached-is-ibd* t))
+       ,@body)))
 
 (defun %w3-stored-header (dir)
   "A regtest chain-state (genesis chain-work 1) with one real header H1 stored

@@ -181,7 +181,7 @@ COLLECT-SPENT-UTXOS returned NIL for the whole transaction and the loop skipped
 every input, so this block was accepted with an invalid signature. Control: the
 same P2PKH scriptSig against a CONFIRMED coin is rejected, proving the fixture's
 signature really is invalid."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (cs utxo prev bits now subsidy) (%ib-env "ib-badsig")
      (let* ((p2pkh (%ib-p2pkh-spk))
             (confirmed (%ib-coin #xD1))
@@ -213,7 +213,7 @@ signature really is invalid."
   "The other half of the fix: an honestly signed chained spend must still be
 accepted. Failing the transaction on a NIL spent-utxos vector without first
 supplying the intra-block coins would reject every honest CPFP chain."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (cs utxo prev bits now subsidy) (%ib-env "ib-goodsig")
      (let* ((p2pkh (%ib-p2pkh-spk))
             (tx-a (%ib-tx (list (list (%ib-coin) 0 (%p2sh-optrue-scriptsig)))
@@ -236,7 +236,7 @@ CONFIRMED inputs too — unsigned spending of arbitrary third-party UTXOs. Input
 here is a confirmed coin with a bad signature, input 1 a same-block coin with a
 good one. Control: the identical transaction with both signatures valid is
 accepted, so the rejection is attributable to the bad one."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (cs utxo prev bits now subsidy) (%ib-env "ib-mixed")
      (let ((p2pkh (%ib-p2pkh-spk))
            (confirmed (%ib-coin #xD2)))
@@ -269,7 +269,7 @@ accepted, so the rejection is attributable to the bad one."
 sighash commits to every input's amount and scriptPubKey, so an incomplete
 vector cannot produce a verifiable signature (it was NIL for chained spends).
 The honest spend must validate and a corrupted one must not."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (cs utxo prev bits now subsidy) (%ib-env "ib-taproot")
      (let* ((p2tr (%ib-p2tr-spk))
             (tx-a (%ib-tx (list (list (%ib-coin) 0 (%p2sh-optrue-scriptsig)))
@@ -313,7 +313,7 @@ The honest spend must validate and a corrupted one must not."
 the coin out of its view in UpdateCoins, so the second one fails HaveInputs;
 we now report the same condition as :missing-input. Control: either transaction
 alone is accepted, so the fixture's inputs are genuinely spendable."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (cs utxo prev bits now subsidy) (%ib-env "ib-dspend")
      (let* ((tx-x (%pkg-tx (%ib-coin) 0 90000000))
             (tx-y (%pkg-tx (%ib-coin) 0 80000000)))
@@ -336,7 +336,7 @@ alone is accepted, so the fixture's inputs are genuinely spendable."
   "The same defect one level down: an output CREATED earlier in the block could
 also be spent twice, because the overlay was add-only. Control: the block
 without the second spender is accepted."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (cs utxo prev bits now subsidy) (%ib-env "ib-dspend2")
      (let* ((tx-a (%pkg-tx (%ib-coin) 0 90000000))
             (a-txid (bl.ser:transaction-hash tx-a))
@@ -360,7 +360,7 @@ without the second spender is accepted."
 one-satoshi-larger coinbase was rejected, which pinned the inflated ceiling as
 real. The block must now be refused whatever the coinbase claims, and a
 legitimate single spend must still report exactly its own fee."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (cs utxo prev bits now subsidy) (%ib-env "ib-fees")
      (let ((tx-x (%pkg-tx (%ib-coin) 0 90000000))
            (tx-y (%pkg-tx (%ib-coin) 0 80000000)))

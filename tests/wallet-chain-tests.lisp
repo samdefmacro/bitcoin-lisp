@@ -42,7 +42,7 @@
 (defmacro %with-wallet-chain-node ((node suffix &key (keypool 5)) &body body)
   "Run BODY under regtest bindings with NODE bound to a %wc-fixture and
 bl::*node* bound so the wallet chain hooks fire."
-  `(%with-regtest
+  `(with-network (:regtest)
     (let* ((,node (%wc-fixture ,suffix :keypool ,keypool))
            (bl::*node* ,node))
       (unwind-protect (progn ,@body)
@@ -539,7 +539,7 @@ status, same last-scanned height/hash — and last-scanned must advance THROUGH
 skipped blocks (Core wallet.cpp:1907-1908). Skipping that advance would make
 rescanblockchain report the last MATCHING block as stop_height and make
 wallet-attach-chain persist a stale best block."
-  (%with-regtest
+  (with-network (:regtest)
     (let* ((node (%wc-fixture "g738"))
            (wname "g738w"))
       (unwind-protect
@@ -587,7 +587,7 @@ wallet-attach-chain persist a stale best block."
 blockFilterMatchesAny -> nullopt, node/interfaces.cpp:583-584). The fallback is
 PER BLOCK; there is deliberately no whole-scan guard on the index sync height,
 because our index can contain holes below its best marker."
-  (%with-regtest
+  (with-network (:regtest)
     (let* ((node (%wc-fixture "g738b"))
            (wname "g738bw"))
       (unwind-protect
@@ -618,7 +618,7 @@ because our index can contain holes below its best marker."
 UpdateIfNeeded must fold in scripts created by a mid-rescan TopUp — polling
 GetEndRange = max-cached-index + 1 (Core scriptpubkeyman.cpp:1518-1521), NOT
 range-end and NOT next-index."
-  (%with-regtest
+  (with-network (:regtest)
     (let* ((node (%wc-fixture "g738c" :keypool 3))
            (wname "g738cw"))
       (unwind-protect

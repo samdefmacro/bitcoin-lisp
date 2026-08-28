@@ -14,13 +14,6 @@
 
 ;;; --- Helpers ---
 
-(defvar *wallet-test-counter* 0)
-
-(defun %wallet-temp-dir ()
-  (merge-pathnames (format nil "wallet-tests-~D-~D/"
-                           (get-universal-time) (incf *wallet-test-counter*))
-                   (uiop:temporary-directory)))
-
 (defun %make-wallet-test-node (dir &key (network :testnet4) (keypool 5))
   "A minimal node with a wallet manager rooted at DIR."
   (let ((node (bl::make-node :network network)))
@@ -39,7 +32,7 @@
   "Run BODY with NODE bound to a wallet-enabled test node in a fresh temp
 datadir; the directory is deleted on unwind."
   (let ((dir (gensym "DIR")))
-    `(let* ((,dir (%wallet-temp-dir))
+    `(let* ((,dir (make-temp-directory))
             (,node (%make-wallet-test-node ,dir :network ,network
                                                 :keypool ,keypool)))
        (unwind-protect (progn ,@body)
@@ -136,7 +129,7 @@ byte for byte."
 
 (test wallet-record-schema-roundtrip
   "Write one record of every schema type, reopen the DB, read back identical."
-  (let* ((dir (%wallet-temp-dir))
+  (let* ((dir (make-temp-directory))
          (path (merge-pathnames "roundtrip/" dir))
          (id (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 4))
@@ -1316,7 +1309,7 @@ keeps an unrelated lone address in its own group."
 (defmacro %with-pp-node ((node suffix) &body body)
   "BODY under regtest bindings with NODE a %pp-fixture and bl::*node*
 bound so the wallet chain hooks fire."
-  `(%with-regtest
+  `(with-network (:regtest)
     (let* ((,node (%pp-fixture ,suffix))
            (bl::*node* ,node))
       (unwind-protect (progn ,@body)
