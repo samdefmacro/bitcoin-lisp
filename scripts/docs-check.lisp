@@ -3,12 +3,15 @@
 ;;;; Usage: scripts/dev.sh docs-check   (cold container via docker-sbcl.sh)
 ;;;;        sbcl --non-interactive --load scripts/docs-check.lisp
 ;;;;
-;;;; Two gates, both required:
+;;;; Three gates, all required:
 ;;;;   GREEN: every section in *CHECKED-SECTIONS* must document cleanly —
 ;;;;          a transcript whose recorded output/values drift from reality
-;;;;          signals TRANSCRIPTION-CONSISTENCY-ERROR and fails the run.
-;;;;   RED:   the deliberately broken self-test section must FAIL; if it
-;;;;          passes, checking is silently off and the run fails.
+;;;;          signals TRANSCRIPTION-CONSISTENCY-ERROR, and an entry naming a
+;;;;          symbol that does not exist (or is not the kind the locative
+;;;;          says) is a LOCATE-ERROR; either fails the run.
+;;;;   RED:   the deliberately broken transcript section must FAIL, and so
+;;;;          must the deliberately dangling-reference section; if either
+;;;;          passes, that check is silently off and the run fails.
 ;;;;
 ;;;; (ql:quickload "mgl-pax/full") is required — plain "mgl-pax" autoloads
 ;;;; its document extension through bare ASDF, which cannot fetch missing
@@ -58,6 +61,13 @@
                      transcript checking is silently OFF.~%")
           (setf ok nil))
         (format t "~&;; RED ok: broken section failed as it must.~%")))
+  (let ((dangling (find-symbol "@DOCS-CHECK-DANGLING-SELFTEST" "BITCOIN-LISP.DOCS")))
+    (if (section-documents-cleanly-p dangling)
+        (progn
+          (format t "~&;; RED SELF-TEST FAILED: the dangling-reference section passed — ~
+                     entry-point checking is silently OFF.~%")
+          (setf ok nil))
+        (format t "~&;; RED ok: dangling reference failed as it must.~%")))
   (if ok
       (format t "~&;; docs-check PASSED~%")
       (progn

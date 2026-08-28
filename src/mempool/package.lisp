@@ -7,6 +7,12 @@
 ;;;; definition in src/mempool/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.mempool
+  (:documentation "The transaction pool and its policy: entries and
+lookups, the cluster mempool (feefrac, depgraph, txgraph, linearization),
+RBF and TRUC rules, the orphan pool, fee estimation, mempool.dat. Policy,
+not consensus. Core txmempool.cpp, txgraph.cpp, cluster_linearize.h,
+policy/rbf.cpp, policy/truc_policy.cpp, txorphanage.cpp, policy/fees.cpp.
+src/mempool/.")
   (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    ;; Constants

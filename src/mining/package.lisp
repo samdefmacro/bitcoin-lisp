@@ -7,6 +7,9 @@
 ;;;; definition in src/mining/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.mining
+  (:documentation "Block templates: transaction selection from the mempool
+under the weight and sigop limits, the coinbase and witness commitment,
+and the regtest miner. Core node/miner.cpp. src/mining/.")
   (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    #:assemble-block-template

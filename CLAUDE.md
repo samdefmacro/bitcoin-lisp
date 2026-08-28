@@ -58,7 +58,11 @@ not tell you). Add a file to the sub-system that owns its directory, not to
 the main system's `src` module. The main package re-exports what it inherits
 from these layers (`bl:log-info`, `bl:*network*`, `bl:*prune-target-mib*`,
 `bl:*interrupt-check*`, `bl:make-rate-limiter`, `bl:parse-cli-args` keep working); tests reach a layer's internals through its own package
-(`bl.log::`, `bl.kv::`).
+(`bl.log::`, `bl.kv::`). `docs/manual.lisp` is the PAX manual: one section per
+layer with its Core files, entry points, invariants and traps -- read a
+module's section before touching it, and keep it true when you rename or
+remove an entry point (`scripts/dev.sh docs-check` locates every reference
+in the image and fails on a dangling one).
 
 ## The development loop (cl-workbench managed, containerized warm image)
 
