@@ -36,10 +36,6 @@ up the loop's shape.")
 
 (defconstant +regtest+ :regtest)
 
-(defun network-port (network)
-  "NETWORK's default P2P port (chain-params-port)."
-  (bl.chain:chain-params-port (bl.chain:find-chain-params network)))
-
 (defvar *connect-nodes* '()
   "-connect targets (Core m_specified_outgoing): peer specs to dial and keep
 dialed, and NOTHING else. Deliberately not the node's added-nodes list, because
@@ -80,14 +76,6 @@ the MANUAL connections (-connect and -addnode) remain."
 GetListenPort, net.cpp:138-162). Dialing peers keeps the chain default —
 Core's -port only moves the listening/advertised side."
   (or *p2p-port-override* (network-port network)))
-
-(defun network-dns-seeds (network)
-  "NETWORK's DNS seeds (chain-params-dns-seeds)."
-  (bl.chain:chain-params-dns-seeds (bl.chain:find-chain-params network)))
-
-(defun network-rpc-port (network)
-  "NETWORK's default RPC port (chain-params-rpc-port)."
-  (bl.chain:chain-params-rpc-port (bl.chain:find-chain-params network)))
 
 (defvar *mainnet-relay-enabled* nil
   "Whether transaction relay is enabled on mainnet. Default NIL for safety.")

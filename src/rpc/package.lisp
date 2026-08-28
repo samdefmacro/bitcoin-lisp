@@ -1,3 +1,14 @@
+;;;; Package bitcoin-lisp.rpc -- the public API of src/rpc/.
+;;;;
+;;;; First component of the bitcoin-lisp/rpc-server sub-system
+;;;; (bitcoin-lisp.asd): the package exists before any file in src/rpc/
+;;;; compiles, and the INSTALL-PACKAGE-NICKNAMES call at the end of this file
+;;;; gives those files their bl.* prefixes. The package spans two systems: the
+;;;; JSON-RPC/HTTP server (errors, define-rpc, json, server) is
+;;;; bitcoin-lisp/rpc-server and knows no chain; the handlers, the REST
+;;;; interface and the web UI load in the main system. Add an export here when
+;;;; a definition in src/rpc/ becomes API; keep %-prefixed names internal.
+
 (in-package #:cl-user)
 
 (defpackage #:bitcoin-lisp.rpc
@@ -6,6 +17,11 @@
   (:export
    ;; Server control
    #:start-rpc-server
+   #:rpc-server-data-directory
+   #:register-http-surface
+   #:*rpc-request-uri*
+   #:*rpc-rate-limit*
+   #:+max-rpc-body-size+
    #:*rpc-threads*
    #:*rpc-server-timeout*
    #:*rpc-cookie-file*

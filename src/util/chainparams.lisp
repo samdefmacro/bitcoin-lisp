@@ -311,3 +311,15 @@ MAKE-CHAIN-PARAMS, replacing an earlier definition of the same name."
 (defun network-magic (network)
   "NETWORK's message-start bytes (chain-params-magic)."
   (chain-params-magic (find-chain-params network)))
+
+(defun network-port (network)
+  "NETWORK's default P2P port (chain-params-port)."
+  (chain-params-port (find-chain-params network)))
+
+(defun network-dns-seeds (network)
+  "NETWORK's DNS seeds (chain-params-dns-seeds)."
+  (chain-params-dns-seeds (find-chain-params network)))
+
+(defun network-rpc-port (network)
+  "NETWORK's default RPC port (chain-params-rpc-port)."
+  (chain-params-rpc-port (find-chain-params network)))

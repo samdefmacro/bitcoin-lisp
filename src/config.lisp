@@ -5,7 +5,8 @@
 ;;; Global configuration variables and constants that are referenced
 ;;; across multiple subsystems. Loaded early so that validation, the
 ;;; mempool and the protocol half of networking can reference these symbols
-;;; at compile time (the layers below -- storage, net -- cannot, and do not).
+;;; at compile time (the layers below -- storage, net, rpc-server -- cannot,
+;;; and do not).
 
 ;;;; Chain-work and assumevalid overrides
 
@@ -211,43 +212,6 @@ handshake + per-peer salt storage exist (no sketch exchange); we match that.")
 (Bitcoin Core -permitbaremultisig, DEFAULT_PERMIT_BAREMULTISIG = true in Core).
 When NIL, bare multisig is non-standard. Consensus is unaffected.")
 
-;;;; Token Bucket Rate Limiter
-
-(defstruct token-bucket
-  "Token bucket for rate limiting. Allows RATE tokens per second with
-maximum BURST capacity. Tokens accumulate while idle."
-  (rate 1.0 :type single-float)
-  (burst 1.0 :type single-float)
-  (tokens 0.0 :type single-float)
-  (last-refill 0 :type integer))
-
-(defun make-rate-limiter (rate burst)
-  "Create a token bucket with RATE tokens/sec and BURST max capacity.
-Starts full (tokens = burst) to avoid rejecting initial messages."
-  (make-token-bucket :rate (float rate)
-                     :burst (float burst)
-                     :tokens (float burst)
-                     :last-refill (get-internal-real-time)))
-
-(defun token-bucket-allow-p (bucket)
-  "Consume one token from BUCKET if available.
-Returns T if allowed, NIL if rate limited.
-Refills tokens based on elapsed time since last check."
-  (let* ((now (get-internal-real-time))
-         (elapsed (/ (float (- now (token-bucket-last-refill bucket)))
-                     (float internal-time-units-per-second)))
-         (refilled (min (token-bucket-burst bucket)
-                        (+ (token-bucket-tokens bucket)
-                           (* elapsed (token-bucket-rate bucket))))))
-    (setf (token-bucket-last-refill bucket) now)
-    (if (>= refilled 1.0)
-        (progn
-          (setf (token-bucket-tokens bucket) (- refilled 1.0))
-          t)
-        (progn
-          (setf (token-bucket-tokens bucket) refilled)
-          nil))))
-
 ;;;; Recent Transaction Rejects Filter
 
 (defstruct recent-rejects
@@ -326,18 +290,9 @@ spamming them could load the sync thread. A normal syncing peer sends a
 getheaders per ~2000-block batch (well under this); a flood is throttled, then
 disconnected by handle-message's rate-limit gate.")
 
-(defvar *rpc-rate-limit* '(100.0 . 200.0)
-  "Rate limit for RPC requests: (rate-per-sec . burst).")
-
 (defconstant +max-message-payload+ (* 4 1000 1000)
   "Maximum P2P message payload size in bytes: 4,000,000, matching Bitcoin Core
 MAX_PROTOCOL_MESSAGE_LENGTH (net.h). Not 4 MiB -- Core uses decimal 4e6.")
-
-(defconstant +max-rpc-body-size+ #x02000000
-  "Maximum RPC request body size in bytes: 32 MiB, matching Bitcoin Core's
-evhttp_set_max_body_size(MAX_SIZE) (httpserver.cpp:410, serialize.h:32).
-The previous 1 MiB cap rejected submitblock for a normal mainnet block.
-Oversized bodies get HTTP 400, like libevent's enforcement.")
 
 (defparameter +handshake-timeout-seconds+ 60
   "Maximum seconds a peer has to complete the version handshake, settable with

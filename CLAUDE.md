@@ -21,8 +21,9 @@ default-OFF on mainnet (config flag `-wallet`); testnet4 first.
 
 Cross-package references use the package-local nicknames installed by
 `src/util/package.lisp` (`bitcoin-lisp.nicknames:*package-nicknames*`): `bl:` for the top
-package, `bl.err`, `bl.log`, `bl.kv`, `bl.bytes`, `bl.crypto`, `bl.ser`, `bl.store`, `bl.val`, `bl.mp`,
-`bl.mining`, `bl.net`, `bl.rpc`, `bl.wallet`, `bl.interop`, `bl.script`, `bl.ctypes`,
+package, `bl.err`, `bl.log`, `bl.kv`, `bl.bytes`, `bl.chain`, `bl.ctx`, `bl.rl`, `bl.crypto`,
+`bl.ser`, `bl.store`, `bl.val`, `bl.mp`, `bl.mining`, `bl.net`, `bl.rpc`, `bl.wallet`, `bl.interop`,
+`bl.script`, `bl.ctypes`,
 `bl.cser`, `bl.cbin`, `bl.ccrypto`, `bl.tests`. Write `bl.ser:transaction-inputs`,
 never the full name. A branch that predates the nicknames rebases and runs
 `scripts/refactor/apply-nicknames.sh`. A file that DEFINES packages follows
@@ -41,14 +42,18 @@ main `bitcoin-lisp` system `:depends-on`, loaded in this order:
 `/storage` (incl. the pruning policy knobs), `/net` (the transport half of
 `src/networking/`: sockets, SOCKS5, BIP324, BIP155, addrman, Tor control;
 the protocol half -- peer, protocol, headers-sync, ibd -- stays in the main
-system in the SAME package `bl.net`). Nothing above a layer exists
+system in the SAME package `bl.net`), `/rpc-server` (the JSON-RPC/HTTP
+server: package, errors, define-rpc, json, server; the handlers, REST and
+the web UI stay in the main system in the SAME package `bl.rpc`, and REST/UI
+register their HTTP surfaces with `bl.rpc:register-http-surface` at the end
+of their files). Nothing above a layer exists
 while it compiles, so a reference upward from its files is a compile error
 in the fresh cold lane -- and a foreign package a new layer uses must be in
 its own `:depends-on` (the warm image already has everything loaded and will
 not tell you). Add a file to the sub-system that owns its directory, not to
 the main system's `src` module. The main package re-exports what it inherits
 from these layers (`bl:log-info`, `bl:*network*`, `bl:*prune-target-mib*`,
-`bl:*interrupt-check*` keep working); tests reach a layer's internals through its own package
+`bl:*interrupt-check*`, `bl:make-rate-limiter` keep working); tests reach a layer's internals through its own package
 (`bl.log::`, `bl.kv::`).
 
 ## The development loop (cl-workbench managed, containerized warm image)

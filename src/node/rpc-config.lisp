@@ -84,6 +84,11 @@ APPLY-CONFIG-GLOBALS."
       (when v (setf bl.wallet::*wallet-notify-command* v)))
     alist))
 
+;;; The server writes .cookie into the node's data directory; it asks through
+;;; this generic function rather than naming the node struct.
+(defmethod bl.rpc:rpc-server-data-directory ((node node))
+  (node-data-directory node))
+
 (defun %start-rpc-early (node rpc-port rpc-bind rpc-bind-supplied-p
                          rpc-user rpc-password rpc-auth rpc-allow-ip
                          rest-enabled network webui webui-supplied-p

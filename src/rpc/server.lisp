@@ -402,7 +402,7 @@ request and shape the reply (see MAKE-RPC-RESPONSE)."
                                :data (rpc-error-data e)
                                :id-present id-present))
     (error (e)
-      (bl::node-log :error "RPC internal error: ~A" e)
+      (bl.log:node-log :error "RPC internal error: ~A" e)
       (make-rpc-error-response +rpc-internal-error+
                                (format nil "Internal error: ~A" e)
                                id version
@@ -445,6 +445,11 @@ but contributes no reply at all (:207-209)."
 
 (defvar *rpc-node* nil
   "The node instance for RPC handlers.")
+
+(defvar *rpc-request-uri* nil
+  "The path of the HTTP request being served, bound by RPC-HANDLER for the
+duration of the call (Core JSONRPCRequest::URI). The wallet reads its
+/wallet/<name> endpoint from it; NIL outside a request.")
 
 (defvar *rpc-credentials* '()
   "Every credential the RPC server authorizes against, each an RPC-CREDENTIAL:
@@ -577,7 +582,7 @@ creates it under umask 0077 (request.cpp:99-146)."
         (sb-posix:rename (namestring tmp) (namestring path))
         (values path secret))
     (error (e)
-      (bl::node-log :warn "Could not write RPC cookie: ~A" e)
+      (bl.log:node-log :warn "Could not write RPC cookie: ~A" e)
       nil)))
 
 (defun delete-rpc-cookie ()
@@ -588,7 +593,7 @@ request.cpp:167-177). A cookie we did not write is left alone."
         (when (probe-file *rpc-cookie-path*)
           (delete-file *rpc-cookie-path*))
       (error (e)
-        (bl::node-log :warn "Could not remove RPC cookie ~A: ~A"
+        (bl.log:node-log :warn "Could not remove RPC cookie ~A: ~A"
                                 *rpc-cookie-path* e)))
     (setf *rpc-cookie-path* nil)))
 
@@ -612,10 +617,58 @@ comparison of an attacker-supplied credential leaks its correct prefix."
 (defvar *rpc-dispatcher* nil
   "The RPC dispatcher function (for cleanup on stop).")
 
-(defvar *rest-dispatcher* nil
-  "The REST /rest/ dispatcher function (for cleanup on stop).")
+(defstruct (http-surface (:constructor %make-http-surface (name options start stop)))
+  "An HTTP surface a layer above serves through this acceptor (REST, the web
+UI). OPTIONS are the START-RPC-SERVER keywords it reads; START is called with
+that option plist and returns the hunchentoot dispatcher to install, or NIL
+to stay off; STOP (may be NIL) clears its state when the server stops."
+  name options start stop)
+
+(defvar *http-surfaces* '()
+  "The surfaces registered so far, in registration order -- Core's
+RegisterHTTPHandler table (httpserver.cpp). START-RPC-SERVER installs each
+one's dispatcher in FRONT of the JSON-RPC \"/\" dispatcher, later
+registrations in front of earlier ones.")
+
+(defvar *surface-dispatchers* '()
+  "The dispatchers the running server installed for its surfaces.")
+
+(defun register-http-surface (name &key options start stop)
+  "Register (or replace) the HTTP surface NAME; see HTTP-SURFACE. Called at
+load time by the file that serves the surface, so START-RPC-SERVER never has
+to name it."
+  (setf *http-surfaces*
+        (append (remove name *http-surfaces* :key #'http-surface-name)
+                (list (%make-http-surface name options start stop)))))
+
+(defun %check-surface-options (options)
+  "Refuse a START-RPC-SERVER keyword neither the server nor any registered
+surface reads -- the check &ALLOW-OTHER-KEYS gave away."
+  (let ((known (append '(:port :bind :bind-supplied-p :user :password
+                         :rpc-auth :allow-ip :warmup)
+                       (loop for surface in *http-surfaces*
+                             append (http-surface-options surface)))))
+    (loop for (key nil) on options by #'cddr
+          unless (member key known)
+            do (internal-error "start-rpc-server: unknown option ~S (known: ~{~S~^ ~})"
+                               key known))))
+
+(defun %stop-http-surfaces ()
+  (setf *surface-dispatchers* '())
+  (dolist (surface *http-surfaces*)
+    (when (http-surface-stop surface)
+      (funcall (http-surface-stop surface)))))
 
 ;;; --- RPC Rate Limiting ---
+
+(defvar *rpc-rate-limit* '(100.0 . 200.0)
+  "Rate limit for RPC requests: (rate-per-sec . burst).")
+
+(defconstant +max-rpc-body-size+ #x02000000
+  "Maximum RPC request body size in bytes: 32 MiB, matching Bitcoin Core's
+evhttp_set_max_body_size(MAX_SIZE) (httpserver.cpp:410, serialize.h:32).
+The previous 1 MiB cap rejected submitblock for a normal mainnet block.
+Oversized bodies get HTTP 400, like libevent's enforcement.")
 
 (defvar *rpc-rate-limiter* nil
   "Global RPC rate limiter (token bucket). Thread-safe via *rpc-rate-limiter-lock*.")
@@ -625,9 +678,9 @@ comparison of an attacker-supplied credential leaks its correct prefix."
 
 (defun init-rpc-rate-limiter ()
   "Initialize the global RPC rate limiter from configuration."
-  (let ((config bl:*rpc-rate-limit*))
+  (let ((config *rpc-rate-limit*))
     (setf *rpc-rate-limiter*
-          (bl:make-rate-limiter (car config) (cdr config)))))
+          (bl.rl:make-rate-limiter (car config) (cdr config)))))
 
 (defun rpc-rate-limit-check ()
   "Check if the RPC request is within rate limits (thread-safe).
@@ -635,7 +688,7 @@ Returns T if allowed, NIL if rate limited."
   (when *rpc-rate-limiter*
     (bt:with-lock-held (*rpc-rate-limiter-lock*)
       (return-from rpc-rate-limit-check
-        (bl:token-bucket-allow-p *rpc-rate-limiter*))))
+        (bl.rl:token-bucket-allow-p *rpc-rate-limiter*))))
   t)
 
 (defun rpc-origin-allowed-p (origin host)
@@ -853,7 +906,7 @@ must stay a value test (NIL = success), not a key-presence test."
         ;; credential has actually been offered: a request with no
         ;; Authorization header is answered immediately (httprpc.cpp:112-133).
         (when auth-header
-          (bl::node-log :warn "RPC incorrect password attempt from ~A"
+          (bl.log:node-log :warn "RPC incorrect password attempt from ~A"
                                   (hunchentoot:remote-addr request))
           (sleep 0.25))
         (setf (hunchentoot:return-code*) hunchentoot:+http-authorization-required+)
@@ -866,7 +919,7 @@ must stay a value test (NIL = success), not a key-presence test."
            (content-length (and content-length-str
                                 (parse-integer content-length-str :junk-allowed t))))
       (when (and content-length
-                 (> content-length bl:+max-rpc-body-size+))
+                 (> content-length +max-rpc-body-size+))
         (return-from rpc-handler
           (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
                           "Request body too large"))))
@@ -880,14 +933,16 @@ must stay a value test (NIL = success), not a key-presence test."
     ;; Core. A body that is not JSON already fails at the parse below with a
     ;; -32700, which is the accurate answer; 415 blamed the header instead.
 
-    ;; Process request. A /wallet/<name> endpoint routes wallet RPCs to that
-    ;; wallet (Core httprpc.cpp:340 registers the same handler under
-    ;; /wallet/); non-wallet methods ignore the binding.
+    ;; Process request. The request path is exposed to the handlers as
+    ;; *RPC-REQUEST-URI* (Core JSONRPCRequest::URI): a /wallet/<name> endpoint
+    ;; is how the wallet routes a call to one of its wallets (httprpc.cpp:340
+    ;; registers the same handler under /wallet/); every other method
+    ;; ignores it.
     (setf (hunchentoot:content-type*) "application/json")
-    (let ((bl.wallet::*rpc-wallet-name* (bl.wallet::wallet-name-from-uri (hunchentoot:script-name*)))
+    (let ((*rpc-request-uri* (hunchentoot:script-name*))
           (body (hunchentoot:raw-post-data :force-text t)))
       ;; Post-read body size check (in case Content-Length was absent or wrong)
-      (when (and body (> (length body) bl:+max-rpc-body-size+))
+      (when (and body (> (length body) +max-rpc-body-size+))
         (return-from rpc-handler
           (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
                           "Request body too large")))
@@ -940,7 +995,7 @@ must stay a value test (NIL = success), not a key-presence test."
                                                    nil :v1)
                           s)))
         (error (e)
-          (bl::node-log :error "RPC handler error: ~A" e)
+          (bl.log:node-log :error "RPC handler error: ~A" e)
           (setf (hunchentoot:return-code*) hunchentoot:+http-internal-server-error+)
           (with-output-to-string (s)
             (yason:encode (make-rpc-error-response +rpc-internal-error+
@@ -1003,13 +1058,13 @@ default configuration here."
          ;; else branch and warns about nothing. BIND-SUPPLIED-P is what keeps
          ;; the two apart, since BIND arrives already defaulted to 127.0.0.1.
          (when (and allow-ip (not bind-supplied-p))
-           (bl::node-log
+           (bl.log:node-log
             :warn "Option -rpcallowip was specified without -rpcbind; this ~
 doesn't usually make sense, as the RPC port stays on ~A" bind))
          bind)
         (allow-ip bind)
         (t
-         (bl::node-log
+         (bl.log:node-log
           :warn "-rpcbind=~A ignored because -rpcallowip was not specified, ~
 refusing to allow everyone to connect; the RPC port stays on 127.0.0.1"
           (or bind "<any>"))
@@ -1029,7 +1084,7 @@ after the socket is bound."
     (dolist (spec allow-ip)
       (let ((subnet (bl.net:parse-subnet spec)))
         (unless subnet
-          (bl::node-log
+          (bl.log:node-log
            :error "RPC server not started: invalid -rpcallowip subnet ~S. Valid ~
 values are a single IP (1.2.3.4), a network/netmask (1.2.3.4/255.255.255.0), a ~
 network/CIDR (1.2.3.4/24), all ipv4 (0.0.0.0/0), or all ipv6 (::/0)"
@@ -1051,7 +1106,7 @@ password's HMAC."
   (loop for spec in rpc-auth
         for credential = (parse-rpcauth-entry spec)
         unless credential
-          do (bl::node-log
+          do (bl.log:node-log
               :error "RPC server not started: invalid -rpcauth argument. ~
 Expected USERNAME:SALT$HMAC as produced by share/rpcauth/rpcauth.py")
              (return :invalid)
@@ -1066,6 +1121,13 @@ httprpc.cpp:275-287)."
     (make-rpc-credential
      user salt
      (%rpcauth-hmac-hex (%credential-bytes salt) (%credential-bytes password)))))
+
+(defgeneric rpc-server-data-directory (node)
+  (:documentation "The directory the .cookie credential is written to for NODE,
+or NIL when NODE has none (then -rpcuser/-rpcpassword is the only way to
+authorize a request). The node above this layer adds the method for its own
+struct; the server never names it.")
+  (:method (node) (declare (ignore node)) nil))
 
 (defun %install-rpc-credential (node user password rpcauth-credentials)
   "Install every credential check-auth authorizes against and return T, or log
@@ -1083,21 +1145,20 @@ Callers must have bound the listening socket first — this writes .cookie, and
     (if (and user password)
         (install (list (hash-rpc-credential user password)) nil)
         (multiple-value-bind (path secret)
-            (let ((data-directory (and node (bl::node-data-directory node))))
+            (let ((data-directory (rpc-server-data-directory node)))
               (if data-directory (generate-rpc-cookie data-directory) (values nil nil)))
           (cond (path
                  (install (list (hash-rpc-credential +rpc-cookie-user+ secret)) path))
                 (t
-                 (bl::node-log
+                 (bl.log:node-log
                   :error "RPC server not started: no -rpcuser/-rpcpassword and the ~
 .cookie file could not be written, so no request could be authorized")
                  nil))))))
 
-(defun start-rpc-server (node &key port (bind "127.0.0.1")
-                                   (bind-supplied-p nil)
-                                   user password rpc-auth allow-ip warmup
-                                   rest-enabled
-                                   ui-enabled ui-directory)
+(defun start-rpc-server (node &rest options
+                         &key port (bind "127.0.0.1") (bind-supplied-p nil)
+                              user password rpc-auth allow-ip warmup
+                         &allow-other-keys)
   "Start the RPC server.
 PORT defaults to 18332 for testnet, 8332 for mainnet.
 Every request must carry a credential: the USER/PASSWORD pair when configured,
@@ -1107,16 +1168,16 @@ InitRPCAuthentication fails (httprpc.cpp:300-302). RPC-AUTH holds -rpcauth
 specs, additional USERNAME:SALT$HMAC credentials accepted alongside that pair.
 ALLOW-IP holds -rpcallowip specs; loopback is always allowed, and a
 non-loopback BIND is honoured only when ALLOW-IP is non-empty.
-REST-ENABLED registers the Core-style /rest/ GET surface; like Core, the
-REST interface is OFF unless -rest is given (DEFAULT_REST_ENABLE = false,
-init.cpp:153,758 — previously we registered it unconditionally).
-UI-ENABLED registers the /ui/ web UI dispatcher (gui-plan P0); UI-DIRECTORY
-overrides the asset directory (default: the repo's ui/, see ui.lisp)."
-  (let ((port (or port (bl:network-rpc-port bl:*network*)))
+The remaining keywords belong to the registered HTTP surfaces
+(REGISTER-HTTP-SURFACE): :REST-ENABLED to the /rest/ interface (rest.lisp),
+:UI-ENABLED and :UI-DIRECTORY to the web UI (ui.lisp). Each surface reads
+its own from OPTIONS; an option nobody reads is an error."
+  (%check-surface-options options)
+  (let ((port (or port (bl.chain:network-rpc-port bl.chain:*network*)))
         (acl nil)
         (rpcauth-credentials nil))
     (when *rpc-server*
-      (bl::node-log :warn "RPC server already running")
+      (bl.log:node-log :warn "RPC server already running")
       (return-from start-rpc-server nil))
     (setf bind (%rpc-bind-address bind allow-ip bind-supplied-p))
 
@@ -1168,8 +1229,8 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
                  (setf hunchentoot:*dispatch-table*
                        (remove d hunchentoot:*dispatch-table*)))
                (when pushed
-                 (setf *rpc-dispatcher* nil *rest-dispatcher* nil
-                       *ui-dispatcher* nil *ui-enabled* nil *ui-directory* nil))
+                 (setf *rpc-dispatcher* nil)
+                 (%stop-http-surfaces))
                (when listening
                  (handler-case (hunchentoot:stop acceptor) (error () nil)))
                (when credential-installed
@@ -1248,40 +1309,24 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
                 (setf *rpc-dispatcher* dispatcher)
                 (push dispatcher pushed)
                 (push dispatcher hunchentoot:*dispatch-table*))
-              ;; REST GET surface under /rest/ — pushed AFTER the "/" dispatcher
-              ;; so it sits at the front of the list and matches first. Only when
-              ;; -rest is given (Core StartREST gate, init.cpp:758).
-              (when rest-enabled
-                (bl::node-log :info "REST interface enabled at /rest/")
-                (let ((rest-dispatcher (hunchentoot:create-prefix-dispatcher
-                                        "/rest/" 'rest-dispatch-handler)))
-                  (setf *rest-dispatcher* rest-dispatcher)
-                  (push rest-dispatcher pushed)
-                  (push rest-dispatcher hunchentoot:*dispatch-table*)))
-              ;; Web UI static assets under /ui/ (gui-plan P0). Registered only
-              ;; when enabled — a disabled UI leaves no handler at all.
-              (setf *ui-enabled* (and ui-enabled t)
-                    *ui-directory* (and ui-directory
-                                        (uiop:ensure-directory-pathname ui-directory)))
-              (when *ui-enabled*
-                (let ((dir (ui-directory)))
-                  (if (and dir (probe-file dir))
-                      (bl::node-log :info "Web UI enabled at /ui/ (serving ~A)" dir)
-                      (bl::node-log
-                       :warn "Web UI enabled but asset directory ~A is missing — /ui/ will 404" dir)))
-                (let ((ui-dispatcher (make-ui-dispatcher)))
-                  (setf *ui-dispatcher* ui-dispatcher)
-                  (push ui-dispatcher pushed)
-                  (push ui-dispatcher hunchentoot:*dispatch-table*)))
+              ;; The surfaces the layers above registered (the REST interface,
+              ;; the web UI): each goes in FRONT of the "/" dispatcher so it
+              ;; matches first, later registrations in front of earlier ones.
+              (dolist (surface *http-surfaces*)
+                (let ((dispatcher (funcall (http-surface-start surface) options)))
+                  (when dispatcher
+                    (push dispatcher *surface-dispatchers*)
+                    (push dispatcher pushed)
+                    (push dispatcher hunchentoot:*dispatch-table*))))
 
               (setf *rpc-server* acceptor)
-              (bl::node-log :info "RPC server started on ~A:~A" bind port)
+              (bl.log:node-log :info "RPC server started on ~A:~A" bind port)
               acceptor)
           (usocket:address-in-use-error ()
-            (bl::node-log :error "RPC port ~A already in use, continuing without RPC" port)
+            (bl.log:node-log :error "RPC port ~A already in use, continuing without RPC" port)
             (abort-start))
           (error (e)
-            (bl::node-log :error "Failed to start RPC server: ~A" e)
+            (bl.log:node-log :error "Failed to start RPC server: ~A" e)
             (abort-start)))))))
 
 (defun stop-rpc-server ()
@@ -1290,19 +1335,16 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
     (handler-case
         (progn
           (hunchentoot:stop *rpc-server*)
-          (bl::node-log :info "RPC server stopped"))
+          (bl.log:node-log :info "RPC server stopped"))
       (error (e)
-        (bl::node-log :warn "Error stopping RPC server: ~A" e)))
+        (bl.log:node-log :warn "Error stopping RPC server: ~A" e)))
     ;; Remove dispatcher from dispatch table to prevent accumulation
     (when *rpc-dispatcher*
       (setf hunchentoot:*dispatch-table*
             (remove *rpc-dispatcher* hunchentoot:*dispatch-table*)))
-    (when *rest-dispatcher*
+    (dolist (dispatcher *surface-dispatchers*)
       (setf hunchentoot:*dispatch-table*
-            (remove *rest-dispatcher* hunchentoot:*dispatch-table*)))
-    (when *ui-dispatcher*
-      (setf hunchentoot:*dispatch-table*
-            (remove *ui-dispatcher* hunchentoot:*dispatch-table*)))
+            (remove dispatcher hunchentoot:*dispatch-table*)))
     (delete-rpc-cookie)
     (setf *rpc-server* nil)
     (setf *rpc-node* nil)
@@ -1313,8 +1355,5 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
     (setf *rpc-warmup-status* nil)
     (setf *rpc-allow-subnets* *rpc-loopback-subnets*)
     (setf *rpc-dispatcher* nil)
-    (setf *rest-dispatcher* nil)
-    (setf *ui-dispatcher* nil)
-    (setf *ui-enabled* nil)
-    (setf *ui-directory* nil)
+    (%stop-http-surfaces)
     (setf *rpc-rate-limiter* nil)))

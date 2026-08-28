@@ -21,7 +21,8 @@ a compile error, not a layering-test entry."
                (:module "util"
                 :components ((:file "bytes")
                              (:file "chainparams")
-                             (:file "context")))))
+                             (:file "context")
+                             (:file "ratelimit")))))
 
 (defsystem "bitcoin-lisp/crypto"
   :description "Hashes, ChaCha20, MuHash, the libsecp256k1 FFI, BIP324
@@ -134,6 +135,25 @@ system, in this same package, because it drives validation and the mempool."
                              (:file "addrman")
                              (:file "torcontrol")))))
 
+(defsystem "bitcoin-lisp/rpc-server"
+  :description "The JSON-RPC-over-HTTP server without its methods: request
+parsing and replies (1.0/1.1/2.0, batches, named parameters), the cookie and
+-rpcauth credentials, the address ACL, the unauthenticated-side rate limit,
+warmup, and DEFINE-RPC -- the registry a chain's handlers add themselves to.
+The handlers, the REST interface and the web UI are the main system's, in
+this same package."
+  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "bitcoin-lisp/logging"
+               "bitcoin-lisp/net"
+               "hunchentoot" "yason" "usocket" "bordeaux-threads" "ironclad"
+               "flexi-streams" "cl-base64")
+  :pathname "src"
+  :serial t
+  :components ((:file "rpc/package")
+               (:file "rpc/errors")
+               (:file "rpc/define-rpc")
+               (:file "rpc/json")
+               (:file "rpc/server")))
+
 (defsystem "bitcoin-lisp"
   :version "0.1.0"
   :author "samdefmacro"
@@ -146,6 +166,7 @@ system, in this same package, because it drives validation and the mempool."
                "bitcoin-lisp/serialization"
                "bitcoin-lisp/storage"
                "bitcoin-lisp/net"
+               "bitcoin-lisp/rpc-server"
                "ironclad"
                "nibbles"
                "cffi"
@@ -213,11 +234,10 @@ system, in this same package, because it drives validation and the mempool."
                                (:file "protocol")
                                (:file "headers-sync")
                                (:file "ibd")))
+                 ;; The server itself is bitcoin-lisp/rpc-server; these are
+                 ;; the chain's methods, on top of it.
                  (:module "rpc"
-                  :components ((:file "package")
-                               (:file "errors")
-                               (:file "define-rpc")
-                               (:file "core-tables")
+                  :components ((:file "core-tables")
                                (:file "accessors")
                                (:file "amounts")
                                (:file "descriptors")
@@ -250,8 +270,7 @@ system, in this same package, because it drives validation and the mempool."
                   :serial t
                   :components ((:file "merkleproof")
                                (:file "rest")
-                               (:file "ui")
-                               (:file "server")))
+                               (:file "ui")))
                  ;; The option table: after every module whose specials its
                  ;; :global / :apply rows name, before the node that reads it.
                  (:file "config-options")
