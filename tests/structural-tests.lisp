@@ -667,24 +667,62 @@ to make on purpose, so the set is pinned."
   "Above this a definition counts against +LONGISH-FUNCTION-CEILING+.")
 
 (defparameter +long-function-baseline+
-  '(("perform-reorg" . 465)                      ; validation/block.lisp
-    ("%create-transaction-internal" . 442)       ; wallet/wallet-spend.lisp
-    ("rpc-sendall" . 289)                        ; wallet/wallet-spend.lisp
+  ;; (name . lines), each with the Bitcoin Core counterpart it mirrors and
+  ;; the verdict that came out of comparing the two (P6a, 2026-08-29).
+  '(;; SPLIT PENDING -- Core has named boundaries here that we fused, so
+    ;; these are real targets. Both need a state object FIRST, the way Core
+    ;; carries one: MemPoolAccept threads a 13-field Workspace through
+    ;; PreChecks/PolicyScriptChecks/ConsensusScriptChecks, and our reorg
+    ;; phases share eight accumulators plus a rollback path. That is a
+    ;; design change, not the "pure move + extract" the plan rated medium
+    ;; risk, so each wants its own PR and its own review.
+    ("perform-reorg" . 465)                      ; validation/block.lisp
+                                                 ; Core DisconnectTip 64 +
+                                                 ; ConnectTip 104 +
+                                                 ; ActivateBestChainStep 84
     ("validate-transaction-for-mempool" . 358)   ; validation/transaction.lisp
+                                                 ; Core PreChecks 198 +
+                                                 ; PolicyScriptChecks 22 +
+                                                 ; ConsensusScriptChecks 32
+
+    ;; EXCEPTIONS -- Core's counterpart is a SINGLE function that is itself
+    ;; this long or longer. Splitting these would diverge from Core and cost
+    ;; the file-by-file comparison this project verifies with, so they stay
+    ;; and the reason is recorded here rather than in someone's memory.
+    ("%create-transaction-internal" . 442)       ; wallet/wallet-spend.lisp
+                                                 ; Core CreateTransactionInternal 376
+    ("rpc-sendall" . 289)                        ; wallet/wallet-spend.lisp
+                                                 ; Core sendall 279
+    ("ms-from-script" . 243)                     ; validation/miniscript.lisp
+                                                 ; Core DecodeScript 385
+    ("connect-block" . 215)                      ; validation/block.lisp
+                                                 ; Core ConnectBlock 379
+
+    ;; EXCEPTIONS -- our own orchestration of a loop Core spreads across the
+    ;; net_processing message pump, whose own functions are far longer
+    ;; (ProcessMessage 1594, SendMessages 508). There is no Core boundary to
+    ;; copy, so a split here would be invented rather than mirrored.
     ("run-ibd" . 345)                            ; networking/ibd.lisp (+2: keeps node-context peers live, P2c)
     ("process-received-block" . 300)             ; networking/ibd.lisp
-    ("ms-from-script" . 243)                     ; validation/miniscript.lisp
-    ("connect-block" . 215)                      ; validation/block.lisp
+
+    ;; BORDERLINE -- 210 against Core's ActivateBestChain 167. Left alone
+    ;; until perform-reorg is split, since the two share the same phases.
     ("activate-block" . 214))                    ; validation/block.lisp
-  "(name . lines) of every top-level definition over +LONG-FUNCTION-LINES+ at
-the start of the cleanup, less the ones since split. VALIDATE-BLOCK left the
-list in P6a, which made Core's CheckBlock/ContextualCheckBlock boundary a
-function boundary here too instead of a keyword flag. Each remaining entry is
-a phase-3 target
-(docs/refactoring-plan-2026-08-27.md §4 P3): START-NODE becomes Core's
-thirteen init steps, PERFORM-REORG becomes DisconnectTip/ConnectTip/
-ActivateBestChainStep, and so on. The line count is pinned too, so an entry
-may shrink but not grow while it waits its turn.")
+  "(name . lines) of every top-level definition over +LONG-FUNCTION-LINES+,
+each annotated above with its Bitcoin Core counterpart and the verdict.
+
+The plan originally targeted ZERO entries here. Measuring each against Core
+before splitting anything overturned that: only three of the ten had a Core
+that split them, and four mirror a Core function that is itself as long or
+longer. A size target stated as an absolute number is wrong for a port --
+the rule is SPLIT WHERE CORE SPLITS, and where it does not, name the
+exception with its counterpart and line count, exactly as the max-file-size
+metric already said for files. VALIDATE-BLOCK left this list in P6a, which
+made Core's CheckBlock/ContextualCheckBlock boundary a function boundary
+here too instead of a keyword flag.
+
+The line count is pinned too, so an entry may shrink but not grow.
+See docs/refactoring-plan-2026-08-27.md 6b.")
 
 (defparameter +longish-function-ceiling+ 64
   "How many definitions may exceed +LONGISH-FUNCTION-LINES+ lines. Lower it
