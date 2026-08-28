@@ -1578,36 +1578,19 @@ set (tx_verify.cpp). Legacy sigops are always counted."
 
 ;;;; Full block validation
 
-(defun validate-block (block chain-state utxo-set current-height current-time
-                        &key skip-scripts skip-header skip-pow context-free-only)
-  "Fully validate a block including all transactions.
-When CONTEXT-FREE-ONLY is true, run only the checks that are a pure function of
-the block itself (Bitcoin Core CheckBlock: header, coinbase structure, signet
-solution, merkle root / CVE-2012-2459, weight, size) and RETURN SUCCESS before
-the UTXO-dependent contextual checks (BIP30, per-input validation, sequence
-locks, scripts, BIP34 coinbase height, coinbase value — Core ContextualCheck
-Block + ConnectBlock). Used when accepting a downloaded block that does NOT
-extend the active tip: its inputs live on its own branch, not in the active
-UTXO set, so the contextual checks would spuriously fail (MISSING-INPUT) — they
-are performed instead by PERFORM-REORG, which connects the fork fork-to-tip
-against the rewound UTXO set. CURRENT-HEIGHT should still be the block's own
-branch height so the header (difficulty/MTP/timewarp) checks are correct.
-When SKIP-SCRIPTS is true, script validation is skipped (used during IBD for
-blocks below the last checkpoint, matching Bitcoin Core behavior).
-When SKIP-HEADER is true, the block-header re-validation (PoW / difficulty /
-MTP / timewarp) is skipped — these are header-level checks already performed at
-header admission (process-headers), exactly as Bitcoin Core's ConnectBlock does
-not re-check the header. Used by perform-reorg, whose fork blocks are already in
-the index with validated headers (and whose deserialized copies carry no cached
-hash, so a redundant PoW recompute would spuriously fail).
-When SKIP-POW is true, only the PoW hash<=target check (and, on signet, the
-block-solution check — Core gates both on fCheckPOW) is skipped, while every
-contextual header check still runs: the TEST-BLOCK-VALIDITY dry-run of an
-unmined template (Core TestBlockValidity's check_pow=false).
-Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure."
+(defun %check-block (block chain-state current-height current-time
+                     &key skip-header skip-pow)
+  "Core CheckBlock (validation.cpp): the checks that are a pure function of
+the block itself -- header, coinbase structure, signet solution, merkle root
+and the CVE-2012-2459 mutation flag, weight, legacy size, per-transaction
+CheckTransaction, and the legacy sigop budget. Needs no UTXO set and no
+active chain, so it is correct for a block on ANY branch, which is why
+VALIDATE-BLOCK's CONTEXT-FREE-ONLY stops after it.
+
+Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
   (let* ((header (bl.ser:bitcoin-block-header block))
          (transactions (bl.ser:bitcoin-block-transactions block)))
-
+    (declare (ignorable header transactions))
     ;; Validate header (with difficulty check when prev-entry is available)
     (unless skip-header
       (let ((prev-hash (bl.ser:block-header-prev-block header)))
@@ -1619,24 +1602,24 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                                                 chain-state prev-hash)
                                    :skip-pow skip-pow)
           (unless valid
-            (return-from validate-block (values nil error nil))))))
+            (return-from %check-block (values nil error nil))))))
 
     ;; Must have at least one transaction (coinbase)
     (when (null transactions)
-      (return-from validate-block
-        (values nil :no-transactions nil)))
+      (return-from %check-block
+        (values nil :no-transactions)))
 
     ;; First transaction must be coinbase
     (let ((first-tx (first transactions)))
       (unless (is-coinbase-tx first-tx)
-        (return-from validate-block
-          (values nil :first-tx-not-coinbase nil))))
+        (return-from %check-block
+          (values nil :first-tx-not-coinbase))))
 
     ;; Other transactions must not be coinbase
     (loop for tx in (rest transactions)
           when (is-coinbase-tx tx)
-            do (return-from validate-block
-                 (values nil :multiple-coinbase nil)))
+            do (return-from %check-block
+                 (values nil :multiple-coinbase)))
 
     ;; BIP325: on signet every block must carry a valid signet solution -- a
     ;; signature over the block by the network's challenge key. Without it,
@@ -1647,7 +1630,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
     ;;   if (signet_blocks && fCheckPOW && !CheckSignetBlockSolution(...)) reject.
     (when (and (eq bl:*network* :signet) (not skip-pow))
       (unless (check-signet-block-solution block)
-        (return-from validate-block (values nil :bad-signet-solution nil))))
+        (return-from %check-block (values nil :bad-signet-solution))))
 
     ;; Validate merkle root, then reject CVE-2012-2459 malleation. Order
     ;; mirrors Bitcoin Core CheckBlock: a mutated block hashes to the SAME
@@ -1659,17 +1642,17 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
       (multiple-value-bind (computed-root mutated)
           (compute-merkle-root tx-hashes)
         (unless (equalp computed-root header-root)
-          (return-from validate-block
-            (values nil :bad-merkle-root nil)))
+          (return-from %check-block
+            (values nil :bad-merkle-root)))
         (when mutated
-          (return-from validate-block
-            (values nil :bad-txns-duplicate nil)))))
+          (return-from %check-block
+            (values nil :bad-txns-duplicate)))))
 
     ;; Validate block weight (BIP 141)
     (let ((weight (calculate-block-weight transactions)))
       (when (> weight +max-block-weight+)
-        (return-from validate-block
-          (values nil :block-too-heavy nil))))
+        (return-from %check-block
+          (values nil :block-too-heavy))))
 
     ;; Legacy block size limit (non-witness serialization must fit in 1 MB)
     (let ((base-size (+ 80  ; header
@@ -1679,8 +1662,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                               sum (length
                                    (bl.ser:serialize-transaction tx))))))
       (when (> base-size +max-block-size+)
-        (return-from validate-block
-          (values nil :block-too-large nil))))
+        (return-from %check-block
+          (values nil :block-too-large))))
 
     ;; Per-transaction context-free checks (Core CheckBlock: CheckTransaction
     ;; per tx — CVE-2018-17144 duplicate inputs, empty vin/vout, value
@@ -1696,19 +1679,25 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
       (dolist (tx transactions)
         (multiple-value-bind (valid error) (validate-transaction-structure tx)
           (unless valid
-            (return-from validate-block (values nil error nil))))
+            (return-from %check-block (values nil error nil))))
         (incf legacy-sigops (count-legacy-sigops tx)))
       (when (> (* legacy-sigops +witness-scale-factor+) +max-block-sigops-cost+)
-        (return-from validate-block (values nil :bad-blk-sigops nil))))
+        (return-from %check-block (values nil :bad-blk-sigops))))
+    (values t nil)))
 
-    ;; CONTEXT-FREE-ONLY stops here: everything above is a pure function of the
-    ;; block (Core CheckBlock); everything below depends on the active UTXO set
-    ;; / chain height (Core ContextualCheckBlock + ConnectBlock) and is only
-    ;; correct for a tip-extending block. A fork block is stored now and its
-    ;; contextual checks run later in PERFORM-REORG, fork-to-tip.
-    (when context-free-only
-      (return-from validate-block (values t nil nil)))
+(defun %contextual-check-block (block chain-state utxo-set current-height
+                               &key skip-scripts)
+  "Core ContextualCheckBlock plus the UTXO-dependent half of ConnectBlock:
+BIP30, per-input validation and fee accumulation, sequence locks, scripts,
+the BIP34 coinbase height and the coinbase value cap. Every check here
+reads the ACTIVE UTXO set or the chain height, so it is only correct for a
+block that extends the tip -- a fork block gets these from PERFORM-REORG
+instead, fork-to-tip against the rewound set.
 
+Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (transactions (bl.ser:bitcoin-block-transactions block)))
+    (declare (ignorable header transactions))
     ;; BIP 30: reject a block that re-creates a still-unspent txid.
     ;; Per-output point lookups, exactly Core's HaveCoin loop
     ;; (validation.cpp:2444): a duplicate txid implies an identical tx
@@ -1721,7 +1710,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
         (let ((txid (bl.ser:transaction-hash tx)))
           (dotimes (o (length (bl.ser:transaction-outputs tx)))
             (when (bl.store:get-utxo utxo-set txid o)
-              (return-from validate-block
+              (return-from %contextual-check-block
                 (values nil :duplicate-txid nil)))))))
 
     ;; Validate each transaction and collect fees (using Satoshi type)
@@ -1783,7 +1772,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                                                       :pending-utxos pending-utxos
                                                       :spent-outpoints spent-outpoints)
                    (unless valid
-                     (return-from validate-block (values nil error nil)))
+                     (return-from %contextual-check-block (values nil error nil)))
                    ;; fee is now a Satoshi type, use typed addition
                    (setf total-fees (bl.interop:satoshi+ total-fees fee)))
                  ;; Accumulate sigops cost and check limit (early exit for DoS protection)
@@ -1792,7 +1781,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                                                       :count-p2sh count-p2sh
                                                       :count-witness count-witness))
                  (when (> total-sigops-cost +max-block-sigops-cost+)
-                   (return-from validate-block
+                   (return-from %contextual-check-block
                      (values nil :too-many-sigops nil)))
                  ;; Core's UpdateCoins order (validation.cpp:1996-2008): mark
                  ;; this transaction's inputs spent, THEN add its outputs. Only
@@ -1837,13 +1826,13 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
         ;; one bug or the other.
         (loop for tx in transactions
               unless (check-transaction-final tx current-height locktime-check-time)
-                do (return-from validate-block (values nil :non-final-tx nil)))
+                do (return-from %contextual-check-block (values nil :non-final-tx nil)))
         ;; BIP 68 sequence lock enforcement (only at or above CSV activation)
         (when csv-active
           (loop for tx in (rest transactions)
                 unless (check-sequence-locks tx utxo-set current-height mtp chain-state
                                              :pending-utxos pending-utxos)
-                  do (return-from validate-block (values nil :bad-sequence-lock nil)))))
+                  do (return-from %contextual-check-block (values nil :bad-sequence-lock nil)))))
 
       ;; Validate transaction scripts via Coalton interop
       ;; Skip during IBD for blocks below the last checkpoint (performance optimization)
@@ -1852,7 +1841,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
             (validate-block-scripts block utxo-set :height current-height
                                                    :extra-coins pending-utxos)
           (unless valid
-            (return-from validate-block (values nil error nil)))))
+            (return-from %contextual-check-block (values nil error nil)))))
 
       ;; Validate witness commitment / malleation (BIP 141). Gated on
       ;; segwit activation for this height, matching Core's
@@ -1863,13 +1852,13 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
            (>= current-height
                (get-segwit-activation-height bl:*network*)))
         (unless valid
-          (return-from validate-block (values nil error nil))))
+          (return-from %contextual-check-block (values nil error nil))))
 
       ;; Validate BIP 34 coinbase height
       (multiple-value-bind (valid error)
           (validate-coinbase-height block current-height)
         (unless valid
-          (return-from validate-block (values nil error nil))))
+          (return-from %contextual-check-block (values nil error nil))))
 
       ;; Validate coinbase value
       (let* ((coinbase-tx (first transactions))
@@ -1880,11 +1869,55 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
              ;; Convert total-fees to integer for comparison
              (max-coinbase-value (+ block-subsidy (bl.interop:unwrap-satoshi total-fees))))
         (when (> coinbase-output-total max-coinbase-value)
-          (return-from validate-block
+          (return-from %contextual-check-block
             (values nil :coinbase-too-large nil))))
 
       ;; Return total-fees as Satoshi type
       (values t nil total-fees))))
+
+
+(defun validate-block (block chain-state utxo-set current-height current-time
+                        &key skip-scripts skip-header skip-pow context-free-only)
+  "Fully validate a block including all transactions.
+When CONTEXT-FREE-ONLY is true, run only the checks that are a pure function of
+the block itself (Bitcoin Core CheckBlock: header, coinbase structure, signet
+solution, merkle root / CVE-2012-2459, weight, size) and RETURN SUCCESS before
+the UTXO-dependent contextual checks (BIP30, per-input validation, sequence
+locks, scripts, BIP34 coinbase height, coinbase value — Core ContextualCheck
+Block + ConnectBlock). Used when accepting a downloaded block that does NOT
+extend the active tip: its inputs live on its own branch, not in the active
+UTXO set, so the contextual checks would spuriously fail (MISSING-INPUT) — they
+are performed instead by PERFORM-REORG, which connects the fork fork-to-tip
+against the rewound UTXO set. CURRENT-HEIGHT should still be the block's own
+branch height so the header (difficulty/MTP/timewarp) checks are correct.
+When SKIP-SCRIPTS is true, script validation is skipped (used during IBD for
+blocks below the last checkpoint, matching Bitcoin Core behavior).
+When SKIP-HEADER is true, the block-header re-validation (PoW / difficulty /
+MTP / timewarp) is skipped — these are header-level checks already performed at
+header admission (process-headers), exactly as Bitcoin Core's ConnectBlock does
+not re-check the header. Used by perform-reorg, whose fork blocks are already in
+the index with validated headers (and whose deserialized copies carry no cached
+hash, so a redundant PoW recompute would spuriously fail).
+When SKIP-POW is true, only the PoW hash<=target check (and, on signet, the
+block-solution check — Core gates both on fCheckPOW) is skipped, while every
+contextual header check still runs: the TEST-BLOCK-VALIDITY dry-run of an
+unmined template (Core TestBlockValidity's check_pow=false).
+Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure."
+  (multiple-value-bind (ok error)
+      (%check-block block chain-state current-height current-time
+                    :skip-header skip-header :skip-pow skip-pow)
+    (unless ok (return-from validate-block (values nil error nil))))
+
+  ;; CONTEXT-FREE-ONLY stops here: everything above is a pure function of the
+  ;; block (Core CheckBlock); everything below depends on the active UTXO set
+  ;; / chain height (Core ContextualCheckBlock + ConnectBlock) and is only
+  ;; correct for a tip-extending block. A fork block is stored now and its
+  ;; contextual checks run later in PERFORM-REORG, fork-to-tip.
+  (when context-free-only
+    (return-from validate-block (values t nil nil)))
+
+  (%contextual-check-block block chain-state utxo-set current-height
+                           :skip-scripts skip-scripts))
 
 (defun test-block-validity (block chain-state utxo-set
                             &key (current-time
