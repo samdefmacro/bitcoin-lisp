@@ -13,7 +13,7 @@
 ;;;
 ;;; The streaming/verification half of activation (Core
 ;;; PopulateAndValidateSnapshot) lives with the loadtxoutset RPC
-;;; (rpc/methods.lisp), which parses the snapshot format; the chainstate
+;;; (rpc/blockchain.lisp), which parses the snapshot format; the chainstate
 ;;; mechanics live here.
 
 (defun call-with-sync-paused (node thunk)

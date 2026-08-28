@@ -795,7 +795,7 @@ throws out of the whole call."
         (is (= bl.rpc::+rpc-wallet-error+ (%aval "code" err)))
         (is (search "private keys disabled" (%aval "message" err)))))))
 
-;;; --- Wallet P7: signmessage (methods.lisp) + received-by / keypoolrefill /
+;;; --- Wallet P7: signmessage (rpc/signmessage.lisp) + received-by / keypoolrefill /
 ;;; simulaterawtransaction / listaddressgroupings (wallet-coins.lisp) ---
 
 (defun %wt= (a b)

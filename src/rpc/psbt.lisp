@@ -946,7 +946,7 @@ PARAMS: (txs). Mirrors Core combinerawtransaction."
 ;;;; =====================================================================
 ;;;;
 ;;;; The signer REUSES the funds-critical sighash+sign dispatch factored out of
-;;;; the in-place spend signer: %compute-input-signatures (methods.lisp) computes
+;;;; the in-place spend signer: %compute-input-signatures (rawtransaction.lisp) computes
 ;;;; the per-input partial signatures without finalizing, and the same key
 ;;;; resolution (%wallet-sign-maps / %sign-map-add-key!) resolves wallet or
 ;;;; descriptor keys. Prevouts are sourced from the PSBT's own witness_utxo /

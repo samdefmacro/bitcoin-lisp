@@ -1,6 +1,6 @@
 // Block/tx explorer + universal search (gui-plan P2).
 //
-// RPC shapes consumed here are exactly what src/rpc/methods.lisp emits:
+// RPC shapes consumed here are exactly what src/rpc/blockchain.lisp (and mempool.lisp, rawtransaction.lisp) emit:
 //
 //   getblockhash <height>  -> hash hex (error -8 when out of range)
 //   getblock <hash> 1      -> { hash, confirmations, height, versionHex,
