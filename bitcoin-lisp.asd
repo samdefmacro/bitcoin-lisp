@@ -340,169 +340,169 @@ this same package."
                              (:file "support/mempool-fixtures")
                              (:file "support/wallet")
                              (:file "package")
-                             (:file "crypto-tests")
-                             (:file "serialization-tests")
-                             (:file "storage-tests")
-                             (:file "validation-tests")
+                             (:file "crypto/crypto-tests")
+                             (:file "serialization/serialization-tests")
+                             (:file "storage/storage-tests")
+                             (:file "validation/validation-tests")
                              (:file "integration-tests")
                              ;; Coalton tests
-                             (:file "coalton-package")
-                             (:file "coalton-types-tests")
-                             (:file "coalton-crypto-tests")
-                             (:file "coalton-serialization-tests")
-                             (:file "coalton-binary-tests")
-                             (:file "coalton-script-tests")
+                             (:file "coalton/coalton-package")
+                             (:file "coalton/coalton-types-tests")
+                             (:file "coalton/coalton-crypto-tests")
+                             (:file "coalton/coalton-serialization-tests")
+                             (:file "coalton/coalton-binary-tests")
+                             (:file "coalton/coalton-script-tests")
                              ;; Bitcoin Core compatibility tests
-                             (:file "bitcoin-core-script-tests")
+                             (:file "coalton/bitcoin-core-script-tests")
                              ;; IBD tests
-                             (:file "ibd-tests")
+                             (:file "networking/ibd-tests")
                              ;; Mempool tests
-                             (:file "mempool-tests")
+                             (:file "mempool/mempool-tests")
                              ;; Cluster mempool: FeeFrac + CompareChunks (Core feefrac_tests.cpp)
-                             (:file "feefrac-tests")
+                             (:file "mempool/feefrac-tests")
                              ;; Cluster mempool: DepGraph/chunking/linearization
-                             (:file "cluster-linearize-tests")
-                             (:file "spanning-forest-tests")
+                             (:file "mempool/cluster-linearize-tests")
+                             (:file "mempool/spanning-forest-tests")
                              ;; Cluster mempool: txgraph engine (Core txgraph.{h,cpp})
-                             (:file "txgraph-tests")
+                             (:file "mempool/txgraph-tests")
                              ;; Cluster mempool P3: shadow-mode mempool/txgraph equivalence
-                             (:file "mempool-shadow-tests")
+                             (:file "mempool/mempool-shadow-tests")
                              ;; Package relay tests (submitpackage)
-                             (:file "package-tests")
+                             (:file "validation/package-tests")
                              ;; Opportunistic 1p1c package relay over P2P
-                             (:file "package-relay-tests")
+                             (:file "networking/package-relay-tests")
                              ;; Mining / regtest tests
-                             (:file "mining-tests")
+                             (:file "mining/mining-tests")
                              ;; Deserializer robustness / fuzz tests
                              (:file "robustness-tests")
                              ;; Serialize<->deserialize round-trip property tests
-                             (:file "roundtrip-tests")
+                             (:file "util/roundtrip-tests")
                              ;; Script SCRIPT_VERIFY flag-gating matrix
-                             (:file "script-flag-tests")
+                             (:file "coalton/script-flag-tests")
                              ;; Inbound listening + handshake
-                             (:file "inbound-listening-tests")
+                             (:file "networking/inbound-listening-tests")
                              ;; Serving getheaders/getblocks/getaddr to peers
-                             (:file "serve-requests-tests")
+                             (:file "networking/serve-requests-tests")
                              ;; Persistence, peer health, reorg tests
-                             (:file "persistence-tests")
+                             (:file "storage/persistence-tests")
                              ;; RPC tests
-                             (:file "rpc-tests")
+                             (:file "rpc/rpc-tests")
                              ;; Output descriptor engine (Core descriptor_tests.cpp vectors)
-                             (:file "descriptor-tests")
+                             (:file "wallet/descriptor-tests")
                              ;; Web UI serving + Origin-check tests (gui-plan P0)
-                             (:file "ui-tests")
+                             (:file "rpc/ui-tests")
                              ;; Mainnet support tests
                              (:file "mainnet-tests")
                              ;; Pruning tests
-                             (:file "pruning-tests")
+                             (:file "storage/pruning-tests")
                              ;; Peer database tests
-                             (:file "peerdb-tests")
+                             (:file "networking/peerdb-tests")
                              ;; Address manager (new/tried buckets) tests
-                             (:file "addrman-tests")
+                             (:file "networking/addrman-tests")
                              ;; Compact block relay tests (BIP 152)
-                             (:file "compact-block-tests")
-                             (:file "db-cache-tests")
+                             (:file "networking/compact-block-tests")
+                             (:file "kv/db-cache-tests")
                                (:file "structural-tests")
                              ;; ADDRv2 tests (BIP 155)
-                             (:file "addrv2-tests")
+                             (:file "networking/addrv2-tests")
                              ;; Network-typed address codecs (onion/i2p/base32) + reachability
-                             (:file "netaddress-tests")
+                             (:file "networking/netaddress-tests")
                              ;; DoS protection tests
-                             (:file "dos-protection-tests")
+                             (:file "networking/dos-protection-tests")
                              ;; Difficulty adjustment tests
-                             (:file "difficulty-tests")
-                             (:file "signet-tests")
+                             (:file "storage/difficulty-tests")
+                             (:file "validation/signet-tests")
                              ;; Block weight tests (BIP 141)
-                             (:file "weight-tests")
+                             (:file "serialization/weight-tests")
                              ;; Sigops validation tests
-                             (:file "sigops-tests")
+                             (:file "validation/sigops-tests")
                              ;; Bitcoin Core comparison feature tests
-                             (:file "new-features-tests")
+                             (:file "validation/new-features-tests")
                              ;; Bitcoin Core sighash test vectors
-                             (:file "bitcoin-core-sighash-tests")
+                             (:file "coalton/bitcoin-core-sighash-tests")
                              ;; Chain reorganization tests
-                             (:file "reorg-tests")
+                             (:file "validation/reorg-tests")
                              ;; Block validation end-to-end tests
-                             (:file "block-e2e-tests")
+                             (:file "validation/block-e2e-tests")
                              ;; Bitcoin Core tx_valid/tx_invalid test vectors
-                             (:file "bitcoin-core-tx-tests")
+                             (:file "validation/bitcoin-core-tx-tests")
                              ;; Merkle tree edge case tests
-                             (:file "merkle-tests")
+                             (:file "validation/merkle-tests")
                              ;; Bitcoin Core BIP 341 taproot test vectors
-                             (:file "bitcoin-core-bip341-tests")
-                               (:file "bitcoin-core-vector-tests")
-                             (:file "bitcoin-core-key-io-tests")
-                             (:file "block-policy-estimator-tests")
-                             (:file "zmq-tests")
+                             (:file "coalton/bitcoin-core-bip341-tests")
+                               (:file "crypto/bitcoin-core-vector-tests")
+                             (:file "crypto/bitcoin-core-key-io-tests")
+                             (:file "mempool/block-policy-estimator-tests")
+                             (:file "node/zmq-tests")
                              ;; BIP 158 compact block filter tests
-                             (:file "blockfilter-tests")
+                             (:file "storage/blockfilter-tests")
                              ;; BIP 174 PSBT tests
-                             (:file "psbt-tests")
+                             (:file "serialization/psbt-tests")
                              ;; BIP 324 cipher suite tests
-                             (:file "bip324-crypto-tests")
+                             (:file "crypto/bip324-crypto-tests")
                              ;; BIP 324 v2 transport loopback tests
-                             (:file "bip324-transport-tests")
+                             (:file "networking/bip324-transport-tests")
                              ;; MuHash3072 tests
-                             (:file "muhash-tests")
+                             (:file "crypto/muhash-tests")
                              ;; coinstatsindex tests
-                             (:file "coinstatsindex-tests")
-                             (:file "txospenderindex-tests")
-                             (:file "versionbits-tests")
+                             (:file "storage/coinstatsindex-tests")
+                             (:file "storage/txospenderindex-tests")
+                             (:file "validation/versionbits-tests")
                              ;; -reindex-chainstate tests
-                             (:file "reindex-tests")
+                             (:file "storage/reindex-tests")
                              ;; Connection types (block-relay-only + feeler)
-                             (:file "conn-type-tests")
+                             (:file "networking/conn-type-tests")
                              ;; Low-work headers sync (anti-DoS presync/redownload)
-                             (:file "headers-sync-tests")
+                             (:file "networking/headers-sync-tests")
                              ;; Wave 9A: eclipse/DoS hardening (outbound accounting,
                              ;; non-blocking send, addr rate limit, generic presync)
-                             (:file "eclipse-dos-tests")
+                             (:file "networking/eclipse-dos-tests")
                              ;; bitcoin.conf + CLI argument parsing
-                             (:file "config-tests")
+                             (:file "config/config-tests")
                              ;; The chain-params table
-                             (:file "chainparams-tests")
-                             (:file "logging-tests")
+                             (:file "util/chainparams-tests")
+                             (:file "logging/logging-tests")
                              ;; SOCKS5 outbound proxy (-proxy) client
-                             (:file "socks5-tests")
+                             (:file "networking/socks5-tests")
                              ;; Tor control client + onion service + self-advertisement
-                             (:file "torcontrol-tests")
+                             (:file "networking/torcontrol-tests")
                              ;; TxOutCompression + hash_serialized_3
-                             (:file "compressor-tests")
-                             (:file "block-undo-tests")
-                             (:file "miniscript-tests")
-                             (:file "minisketch-tests")
-                             (:file "txreconciliation-set-tests")
-                             (:file "flatfile-tests")
+                             (:file "serialization/compressor-tests")
+                             (:file "storage/block-undo-tests")
+                             (:file "validation/miniscript-tests")
+                             (:file "networking/minisketch-tests")
+                             (:file "networking/txreconciliation-set-tests")
+                             (:file "kv/flatfile-tests")
                              ;; Assumeutxo snapshot format (dumptxoutset/loadtxoutset)
-                             (:file "snapshot-tests")
+                             (:file "storage/snapshot-tests")
                              ;; Chainstate list + selection accessors + storage suffix
-                             (:file "chainstate-tests")
+                             (:file "storage/chainstate-tests")
                              ;; Assumeutxo P4: dual chainstate + background IBD
-                             (:file "assumeutxo-tests")
+                             (:file "storage/assumeutxo-tests")
                              ;; Wallet P1: container + keystore + wallet RPCs
-                             (:file "wallet-tests")
+                             (:file "wallet/wallet-tests")
                              ;; Wallet P2: chain tracking (hooks, TxState,
                              ;; conflicts, rescan, tx RPCs)
-                             (:file "wallet-chain-tests")
+                             (:file "wallet/wallet-chain-tests")
                              ;; Wallet P3: balances, coins, labels,
                              ;; getaddressinfo, abandontransaction
-                             (:file "wallet-balance-tests")
+                             (:file "wallet/wallet-balance-tests")
                              ;; Wallet P4: coin selection, spending RPCs,
                              ;; wallet signing, rebroadcast
-                             (:file "wallet-spend-tests")
+                             (:file "wallet/wallet-spend-tests")
                              ;; Wallet P6: crypter KATs, encryption lifecycle,
                              ;; locked-wallet gating, relock timer, backup
-                             (:file "wallet-encryption-tests")
+                             (:file "wallet/wallet-encryption-tests")
                              ;; Process RNG seeding (*random-state* must not
                              ;; replay SBCL's build-time stream on every start)
-                             (:file "entropy-tests")
+                             (:file "crypto/entropy-tests")
                              ;; Wave 10: RPC boolean/error-code parity, HTTP
                              ;; layer, BIP64 getutxos, config wires, arg
                              ;; handling, banlist persistence
                              (:file "wave10-tests")
                              ;; GA8 W1-A: intra-block coin overlay (chained-spend
                              ;; script validation + same-block double spends)
-                             (:file "intrablock-coins-tests")
+                             (:file "validation/intrablock-coins-tests")
                              ;; Randomised totality/roundtrip properties over
                              ;; the parsers a hostile peer reaches
                              (:file "fuzz-property-tests"))))
