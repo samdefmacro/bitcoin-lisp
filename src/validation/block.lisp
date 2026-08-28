@@ -2680,7 +2680,8 @@ Handles chain reorganizations when a competing chain has more work."
            (when (bl:automatic-pruning-p)
              (let ((pruned (bl.store:prune-old-blocks
                             block-store chain-state
-                            :on-prune #'delete-undo-file)))
+                            :on-prune #'delete-undo-file
+                            :target-bytes (bl:effective-prune-target-bytes))))
                (when (> pruned 0)
                  (bl:log-info "Pruned ~D old block~:P" pruned)))))
 

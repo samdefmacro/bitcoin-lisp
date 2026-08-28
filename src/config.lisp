@@ -34,39 +34,7 @@ that must give up cooperatively — perform-reorg between blocks,
 load-mempool-from-disk between transactions. See *interrupt-check*."
   (funcall *interrupt-check*))
 
-;;;; Block Pruning Configuration
-
-(defconstant +min-blocks-to-keep+ 288
-  "Minimum number of recent blocks to keep on disk (matches Bitcoin Core).")
-
-(defconstant +min-disk-space-for-block-files+ (* 550 1024 1024)
-  "Floor for the effective automatic-prune target in bytes (Bitcoin Core
-MIN_DISK_SPACE_FOR_BLOCK_FILES, validation.h:87). The per-chainstate halving
-while an assumeutxo historical chainstate exists never pushes the target
-below this.")
-
-(defvar *prune-target-mib* nil
-  "Block pruning target in MiB.
-NIL = pruning disabled (default).
-1 = manual-only mode (pruneblockchain RPC works, no automatic pruning).
->= 550 = automatic pruning to this target size.
-Any other value signals an error at startup.")
-
-(defvar *prune-after-height* nil
-  "Minimum chain height before pruning can begin.
-Set automatically based on network: 100000 for mainnet, 1000 for testnet.")
-
-(defun pruning-enabled-p ()
-  "Return T if pruning is enabled (any mode)."
-  (and *prune-target-mib* (> *prune-target-mib* 0)))
-
-(defun automatic-pruning-p ()
-  "Return T if automatic pruning is enabled (not manual-only)."
-  (and *prune-target-mib* (>= *prune-target-mib* 550)))
-
-(defun prune-after-height (network)
-  "Return the minimum chain height before pruning begins for NETWORK."
-  (bl.chain:chain-params-prune-after-height (bl.chain:find-chain-params network)))
+;;;; Chain-work and assumevalid overrides
 
 (defvar *minimum-chain-work-override* nil
   "When non-NIL, overrides the per-network nMinimumChainWork. Set by
@@ -988,7 +956,6 @@ warning per key (Core LogWarning \"Ignoring unknown configuration value\")
          unless (known-config-option-p k)
            collect k)
    :test #'string= :from-end t))
-
 
 ;;; --- settings.json (Core's read-write settings file) ---
 ;;;

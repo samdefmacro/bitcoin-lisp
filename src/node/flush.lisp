@@ -140,9 +140,8 @@ chainstates — halved while an assumeutxo historical chainstate exists, so
 half the block storage is reserved for the historical chainstate's
 re-derivation and the other half for the most-work chainstate — and floored
 at +min-disk-space-for-block-files+ (550 MiB, validation.h:87)."
-  (let ((num-chainstates (if (and *node* (node-historical-chainstate *node*)) 2 1)))
-    (max +min-disk-space-for-block-files+
-         (floor (* *prune-target-mib* 1048576) num-chainstates))))
+  (bl.store:prune-target-bytes
+   (if (and *node* (node-historical-chainstate *node*)) 2 1)))
 
 (defvar *blocks-since-flush* 0
   "Counter incremented per connected block; reset to 0 when a flush runs.")

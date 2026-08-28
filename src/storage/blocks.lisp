@@ -101,7 +101,7 @@ Uses stat on SBCL — one syscall, no file open."
 (defun block-network-magic ()
   "The 4-byte network magic that prefixes every stored record, which is the
 same value the P2P message header uses (Core MessageStart)."
-  (bl:network-magic bl:*network*))
+  (bl.chain:network-magic bl.chain:*network*))
 
 (defun %blk-seq (store)
   "The blk file sequence, created on demand."
@@ -445,7 +445,7 @@ as absent, so none relies on the raise."
       (return-from get-block
         (handler-case (%read-block-flat store located)
           (error (e)
-            (bl:log-warn
+            (bl.log:log-warn
              "CORRUPT BLOCK record for ~A (~A) — dropping from the index"
              (bl.crypto:bytes-to-hex hash) e)
             (remhash hash (block-store-index store))
@@ -469,7 +469,7 @@ as absent, so none relies on the raise."
               (bl.ser:br-read-bitcoin-block
                (bl.ser:make-byte-reader-from data))))
         (error (e)
-          (bl:log-warn
+          (bl.log:log-warn
            "CORRUPT BLOCK file for ~A (~A) — pruning for re-download"
            (bl.crypto:bytes-to-hex hash) e)
           (ignore-errors (prune-block store hash))
@@ -505,7 +505,7 @@ NIL and never signal. NETWORK-GENESIS-HASH is an ECASE and MAKE-GENESIS-BLOCK
 raises when construction does not reproduce the known hash; letting either
 escape turns `absent' into an error on a path that has no handler for one, and
 takes the reorg, migration and filter-index tests down with it."
-  (let ((network bl:*network*))
+  (let ((network bl.chain:*network*))
     (let ((genesis (ignore-errors (network-genesis-hash network))))
       (when (and genesis (equalp hash genesis))
         (or (gethash network *genesis-body-cache*)
@@ -645,7 +645,7 @@ an offline tool has no business acquiring a block it was not given.
 Best effort by construction: a datadir that cannot be written (read-only, full
 disk) is a problem for whoever actually needs to write, not for start-up."
   (ignore-errors
-   (let ((hash (ignore-errors (network-genesis-hash bl:*network*))))
+   (let ((hash (ignore-errors (network-genesis-hash bl.chain:*network*))))
      (when (and hash (not (gethash hash (block-store-index store))))
        (let ((block (%genesis-block-body hash)))
          (when block
@@ -661,7 +661,7 @@ Returns the size in bytes of the deleted file, or NIL if the file didn't exist."
   ;; rather than returning NIL, which the caller reads as "already gone" and
   ;; would let a pruned node stop reclaiming space in silence.
   (when (flat-file-pos-p (gethash hash (block-store-index store)))
-    (bl:log-warn
+    (bl.log:log-warn
      "Cannot prune ~A: it is inside a flat block file, which prunes per FILE ~
       (block-file-format P3). Callers that only need the body to become ~
       unreadable want FORGET-BLOCK-BODY."
@@ -829,7 +829,7 @@ callback keeps storage from having to reach into the chain state."
             (incf freed size)))))
     (remhash file (block-store-file-info store))
     (decf (block-store-total-bytes store) (min freed (block-store-total-bytes store)))
-    (bl:log-info "Pruned block file ~D: ~D blocks, ~D bytes"
+    (bl.log:log-info "Pruned block file ~D: ~D blocks, ~D bytes"
                            file (length hashes) freed)
     freed))
 
@@ -838,24 +838,29 @@ callback keeps storage from having to reach into the chain state."
 maintained by store-block/prune-block (initialized by init-block-store)."
   (/ (block-store-total-bytes store) 1048576.0))  ; 1024 * 1024
 
-(defun prune-old-blocks (store chain-state &key on-prune)
+(defun prune-old-blocks (store chain-state &key on-prune target-bytes)
   "Prune old blocks when storage exceeds target.
 Deletes oldest block files until storage is at or below the effective prune
 target (halved while an assumeutxo historical chainstate exists — Core
 BlockManager::FindFilesToPrune, node/blockstorage.cpp:330-338), respecting
 +min-blocks-to-keep+, *prune-after-height*, and CHAIN-STATE's per-chainstate
 prune floor (an unvalidated snapshot chainstate never prunes at or below its
-base — Core Chainstate::GetPruneRange).
+base — Core Chainstate::GetPruneRange). TARGET-BYTES is the automatic target,
+defaulting to the single-chainstate PRUNE-TARGET-BYTES; the node passes
+(effective-prune-target-bytes), which halves it while an assumeutxo
+historical chainstate exists -- a fact only the node knows.
 Only runs in automatic pruning mode.
 Returns the number of blocks pruned."
-  (unless (bl:automatic-pruning-p)
+  (unless (automatic-pruning-p)
     (return-from prune-old-blocks 0))
   (let ((current-height (chain-state-best-height chain-state))
-        (prune-after (or bl:*prune-after-height* 0)))
+        (prune-after (or *prune-after-height* 0)))
     ;; Don't prune until chain reaches prune-after-height
     (when (< current-height prune-after)
       (return-from prune-old-blocks 0))
-    (let ((target-bytes (bl:effective-prune-target-bytes)))
+    ;; Computed here, after the mode and height guards: with pruning off there
+    ;; is no target to compute (*prune-target-mib* is NIL).
+    (let ((target-bytes (or target-bytes (prune-target-bytes))))
       (when (<= (block-store-total-bytes store) target-bytes)
         (return-from prune-old-blocks 0))
       ;; Calculate the allowed prune window: (floor, min-keep-height].
@@ -864,7 +869,7 @@ Returns the number of blocks pruned."
       ;; caught up (Core caps last_prune by every lock before calling
       ;; FindFilesToPrune, validation.cpp:2722-2732).
       (let* ((min-keep-height (min (max 0 (- current-height
-                                             bl:+min-blocks-to-keep+))
+                                             +min-blocks-to-keep+))
                                    (prune-lock-ceiling current-height)))
              (start (chain-state-prune-walk-start chain-state))
              (pruned 0))
@@ -932,10 +937,10 @@ Respects +min-blocks-to-keep+ retention and CHAIN-STATE's per-chainstate
 prune floor (Core FindFilesToPruneManual also bounds the manual range by
 GetPruneRange, node/blockstorage.cpp:292-319).
 Returns the number of blocks pruned."
-  (unless (bl:pruning-enabled-p)
+  (unless (pruning-enabled-p)
     (return-from prune-blocks-to-height 0))
   (let* ((current-height (chain-state-best-height chain-state))
-         (max-prune-height (max 0 (- current-height bl:+min-blocks-to-keep+)))
+         (max-prune-height (max 0 (- current-height +min-blocks-to-keep+)))
          ;; The locks bound a manual prune too — Core passes the same
          ;; lock-capped last_prune into FindFilesToPruneManual.
          (effective-target (min target-height max-prune-height

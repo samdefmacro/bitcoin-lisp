@@ -198,7 +198,7 @@ this tree used before — see kv/datadir.lisp."
 (defun %csi-bip30-unspendable-p (height)
   "The two mainnet coinbases (heights 91722, 91812) BIP30-overwritten and thus
 unspendable (Core IsBIP30Unspendable). Height-only match; only mainnet."
-  (and (eq bl:*network* :mainnet)
+  (and (eq bl.chain:*network* :mainnet)
        (or (= height 91722) (= height 91812))))
 
 (defun %copy-coinstats (s)
@@ -366,7 +366,7 @@ Returns the number of blocks indexed."
   ;; Seed the synthetic genesis record so height 1 has a parent to build on.
   (when (< (coinstatsindex-height csi) 0)
     (coinstatsindex-seed-genesis csi (funcall subsidy-fn 0)
-                                 (network-genesis-hash bl:*network*)))
+                                 (network-genesis-hash bl.chain:*network*)))
   (let* ((tip (current-height chain-state))
          (start (1+ (coinstatsindex-height csi)))
          (count 0)

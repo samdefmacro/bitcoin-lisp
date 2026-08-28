@@ -33,12 +33,20 @@ package's nicknames, and this call restores them.
 
 ## ASDF systems
 
-`bitcoin-lisp.asd` defines `bitcoin-lisp/util` (nicknames, conditions, byte
-I/O, chain parameters, node-context) and `bitcoin-lisp/crypto` as separate
-systems that the main `bitcoin-lisp` system `:depends-on`; nothing above them
-exists while they compile, so a reference upward from src/util/ or src/crypto/
-is a compile error. Add a file to the sub-system that owns its directory, not
-to the main system's `src` module.
+`bitcoin-lisp.asd` defines the layers below the node as separate systems the
+main `bitcoin-lisp` system `:depends-on`, loaded in this order:
+`bitcoin-lisp/util` (nicknames, conditions, byte I/O, chain parameters incl.
+`*network*`, node-context), `/crypto`, `/logging` (package `bl.log`), `/kv`
+(LevelDB, flat files, datadir, fsync; package `bl.kv`), `/serialization`,
+`/storage` (incl. the pruning policy knobs). Nothing above a layer exists
+while it compiles, so a reference upward from its files is a compile error
+in the fresh cold lane -- and a foreign package a new layer uses must be in
+its own `:depends-on` (the warm image already has everything loaded and will
+not tell you). Add a file to the sub-system that owns its directory, not to
+the main system's `src` module. The main package re-exports what it inherits
+from these layers (`bl:log-info`, `bl:*network*`, `bl:*prune-target-mib*`
+keep working); tests reach a layer's internals through its own package
+(`bl.log::`, `bl.kv::`).
 
 ## The development loop (cl-workbench managed, containerized warm image)
 

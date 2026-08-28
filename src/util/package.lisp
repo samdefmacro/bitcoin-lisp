@@ -162,6 +162,8 @@ DEFINE-CHAIN-PARAMS form per chain in src/util/chainparams.lisp, read through
 FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
   (:use #:cl #:bitcoin-lisp.conditions)
   (:export
+   #:*network*
+   #:network-magic
    #:chain-params
    #:define-chain-params
    #:find-chain-params

@@ -906,8 +906,7 @@ comments are blanked first, so a prefix quoted in a docstring (a user-agent
     (sort found #'string<)))
 
 (defparameter +layering-violation-baseline+
-  '(("src/coalton/interop.lisp" . "bitcoin-lisp.storage")
-    ("src/config.lisp" . "bitcoin-lisp.mempool")
+  '(("src/config.lisp" . "bitcoin-lisp.mempool")
     ("src/config.lisp" . "bitcoin-lisp.networking")
     ("src/validation/block.lisp" . "bitcoin-lisp.mempool")
     ("src/validation/packages.lisp" . "bitcoin-lisp.mempool")

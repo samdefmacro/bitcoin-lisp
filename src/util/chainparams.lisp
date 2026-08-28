@@ -302,3 +302,12 @@ MAKE-CHAIN-PARAMS, replacing an earlier definition of the same name."
                 334))
   :prune-after-height 1000
   :bech32-hrp "bcrt")
+
+;;; The current chain, and the lookups every layer needs from it.
+
+(defvar *network* :testnet4
+  "Current network mode (:testnet3, :testnet4, :signet, :regtest, or :mainnet).")
+
+(defun network-magic (network)
+  "NETWORK's message-start bytes (chain-params-magic)."
+  (chain-params-magic (find-chain-params network)))

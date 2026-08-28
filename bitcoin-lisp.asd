@@ -81,6 +81,35 @@ needs nothing above util and crypto, so it is a layer of its own."
                              (:file "messages")
                              (:file "psbt")))))
 
+(defsystem "bitcoin-lisp/storage"
+  :description "The block store, undo data, the coins view and its cache,
+the header/block index, reindexing, and the four optional indexes -- on top
+of the kv and serialization layers. The pruning policy knobs live here
+(prune-policy.lisp) so the store never reaches up into the node."
+  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "bitcoin-lisp/logging"
+               "bitcoin-lisp/kv" "bitcoin-lisp/serialization"
+               "flexi-streams" "ironclad" "bordeaux-threads")
+  :pathname "src"
+  :serial t
+  :components ((:file "storage/package")
+               (:module "storage"
+                :components ((:file "prune-policy")
+                             (:file "utxo")
+                             (:file "block-undo")
+                             (:file "blocks")
+                             (:file "coins-view")
+                             (:file "coins-view-cache")
+                             (:file "coins-view-migration")
+                             (:file "chain")
+                             (:file "reindex")
+                             (:file "migrate-blocks")
+                             (:file "index-base")      ; the protocol the four indexes below implement
+                             (:file "txindex")
+                             (:file "txospenderindex")
+                             (:file "blockfilter")
+                             (:file "blockfilterindex")
+                             (:file "coinstatsindex")))))
+
 (defsystem "bitcoin-lisp"
   :version "0.1.0"
   :author "samdefmacro"
@@ -91,6 +120,7 @@ needs nothing above util and crypto, so it is a layer of its own."
                "bitcoin-lisp/logging"
                "bitcoin-lisp/kv"
                "bitcoin-lisp/serialization"
+               "bitcoin-lisp/storage"
                "ironclad"
                "nibbles"
                "cffi"
@@ -113,7 +143,6 @@ needs nothing above util and crypto, so it is a layer of its own."
                  ;; bitcoin-lisp/util and bitcoin-lisp/crypto load before this
                  ;; system (:depends-on): their packages, nicknames and
                  ;; conditions already exist here.
-                 (:file "storage/package")
                  (:file "validation/package")
                  (:file "mempool/package")
                  (:file "mining/package")
@@ -132,24 +161,6 @@ needs nothing above util and crypto, so it is a layer of its own."
                                (:file "serialization")
                                (:file "script")
                                (:file "interop")))
-                 (:module "storage"
-                  ;; The persistence primitives (LevelDB, flat files, datadir,
-                  ;; fsync) are bitcoin-lisp/kv, loaded before this system.
-                  :components ((:file "utxo")
-                               (:file "block-undo")
-                               (:file "blocks")
-                               (:file "coins-view")
-                               (:file "coins-view-cache")
-                               (:file "coins-view-migration")
-                               (:file "chain")
-                               (:file "reindex")
-                               (:file "migrate-blocks")
-                               (:file "index-base")      ; the protocol the four indexes below implement
-                               (:file "txindex")
-                               (:file "txospenderindex")
-                               (:file "blockfilter")
-                               (:file "blockfilterindex")
-                               (:file "coinstatsindex")))
                  (:module "validation"
                   :components ((:file "script")
                                (:file "miniscript")

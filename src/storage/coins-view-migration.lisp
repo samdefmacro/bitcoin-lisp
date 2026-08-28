@@ -63,7 +63,7 @@ it (CRC mismatch, version mismatch, truncated file)."
            (written 0)
            (in-batch 0)
            (batch nil))
-      (bl:log-info "Migrating ~D UTXO entries from ~A → ~A"
+      (bl.log:log-info "Migrating ~D UTXO entries from ~A → ~A"
                              total dat-path leveldb-path)
       (with-coins-view-db (view leveldb-path)
         (flet ((open-batch () (setf batch (leveldb-make-writebatch)))
@@ -73,7 +73,7 @@ it (CRC mismatch, version mismatch, truncated file)."
                    (leveldb-destroy-writebatch batch)
                    (setf batch nil
                          in-batch 0)
-                   (bl:log-info "Migration progress: ~D / ~D" written total))))
+                   (bl.log:log-info "Migration progress: ~D / ~D" written total))))
           (open-batch)
           (unwind-protect
                (progn
@@ -96,5 +96,5 @@ it (CRC mismatch, version mismatch, truncated file)."
       ;; Release the ~5 GB in-memory utxo-set back to the OS before the
       ;; caller continues — they have no reason to keep it.
       #+sbcl (sb-ext:gc :full t)
-      (bl:log-info "Migration complete: ~D entries written" written)
+      (bl.log:log-info "Migration complete: ~D entries written" written)
       written)))
