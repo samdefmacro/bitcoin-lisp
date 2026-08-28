@@ -876,34 +876,262 @@ recorded for startup."
       (bl.wallet:load-wallets-on-startup *node* wallet-names))))
 
 
+(defun %sync-thread-connect (max-peers)
+  "The sync thread's startup dial: -seednode first (its whole purpose is to
+fill the address book BEFORE the dial that reads it), then the initial
+outbound connections. Each is guarded on its own so a failure logs and
+defers to the loop's reconnect path instead of ending the thread (a dead
+sync thread with node-running still T is a socket-reading zombie)."
+  ;; A failure here defers to %SYNC-THREAD-LOOP's no-peers branch
+  ;; (%SYNC-OFFLINE-ACTIVATION), which dials again.
+  (handler-case
+      (connect-seed-nodes *node*)
+    (error (c)
+      (log-error "-seednode address fetch failed: ~A" c)))
+  (handler-case
+      (connect-to-peers *node* max-peers :timeout 60 :min-peers 2)
+    (error (c)
+      (log-error "Initial peer connection failed (retrying in loop): ~A" c))))
+
+(defun %sync-idle-tick (second)
+  "One sub-second tick of the sync thread's wait between sync passes (Core's
+per-peer ProcessMessages / SendMessages duties, bounded): flush unsent bytes,
+pump every peer's readable messages with the full node context, run the
+tx-request scheduler, trickle announcements, rebroadcasts, the wallet resend
+timer, local-address adverts, feefilter and reconciliation rounds, and the
+at-tip liveness signal; SECOND is the whole second (1..30) this tick falls
+in, and only gates the behind-known-work exit. Returns T when the wait should
+end now: new headers arrived, or the node is behind known work and
++BEHIND-RETRY-SECONDS+ have passed."
+  ;; Retry buffered unsent bytes on
+  ;; every peer (non-blocking) — the
+  ;; periodic half of Core's
+  ;; SocketSendData.
+  (bl.net:flush-peer-send-buffers
+   (node-peers *node*))
+  ;; Steady-state receive pump: drain
+  ;; every peer's readable messages
+  ;; with the full node context. The wait
+  ;; in %SYNC-PASS used to be a pure 30s
+  ;; sleep — a receive dead window in which
+  ;; pings, invs, and getdata for txs
+  ;; we had JUST announced sat unread
+  ;; (Core's per-peer ProcessMessages
+  ;; runs continuously). A new header
+  ;; announcement returns T so %SYNC-PASS
+  ;; ends the wait and fetches the block.
+  (let* ((cs (node-current-chainstate *node*))
+         (pump (bl.net:pump-peer-messages
+                (node-peers *node*)
+                (node->context *node* cs)
+                nil)))
+    ;; Tx-request scheduler: send
+    ;; delayed announcements now due,
+    ;; and re-route requests that
+    ;; expired (60s) to another
+    ;; announcer (Core GetRequestsToSend
+    ;; runs per SendMessages pass).
+    (bl.net:process-tx-requests)
+    (bl.net:retry-timed-out-tx-requests)
+    ;; Trickled tx announcements: drain
+    ;; due per-peer inv queues each
+    ;; second (Poisson schedules inside;
+    ;; Core SendMessages runs its
+    ;; equivalent on every message pump).
+    (bl.net:flush-tx-announcements
+     (node-peers *node*)
+     (node-mempool *node*))
+    ;; Locally-submitted txs still in the
+    ;; unbroadcast set get re-announced
+    ;; every 10-15 min until a peer's
+    ;; getdata confirms propagation (Core
+    ;; ReattemptInitialBroadcast).
+    (bl.net:maybe-reattempt-initial-broadcast
+     (node-peers *node*)
+     (node-mempool *node*))
+    ;; Wallet rebroadcast timer (Core
+    ;; MaybeResendWalletTxs on the
+    ;; scheduler, every minute): each
+    ;; wallet resubmits its unconfirmed
+    ;; txs past a randomized 12-36h
+    ;; deadline. Cadence-gated inside;
+    ;; takes node-lock -> wallet-lock
+    ;; per tx, so it must run OUTSIDE
+    ;; any node-lock hold (wallet P4).
+    (bl.wallet:wallets-maybe-resend *node*)
+    ;; Local-address self-advertisement
+    ;; (our onion address, once torcontrol
+    ;; registers it): per-peer ~24h Poisson
+    ;; schedule inside, no-op while the
+    ;; local-address map is empty or in
+    ;; IBD (Core MaybeSendAddr).
+    (bl.net:maybe-advertise-local-address
+     (node-peers *node*)
+     (node-chain-state *node*))
+    ;; BIP133 feefilter refresh (Core
+    ;; MaybeSendFeefilter on the message
+    ;; loop): per-peer ~10min Poisson
+    ;; schedule inside, so this is a
+    ;; cheap no-op most ticks. Runs on
+    ;; the sync thread, which is why
+    ;; its RNG use is safe.
+    (let ((cs (node-chain-state *node*))
+          (mp (node-mempool *node*))
+          (now (bl.ser:get-unix-time)))
+      (dolist (p (node-peers *node*))
+        (when (eq (bl.net:peer-state p) :ready)
+          (ignore-errors
+           (bl.net:maybe-send-feefilter
+            p mp cs now))
+          ;; BIP-330: open a reconciliation
+          ;; round with one peer at a time.
+          ;; Inert unless -txreconciliation
+          ;; is set and the peer completed
+          ;; the handshake.
+          (ignore-errors
+           (bl.net:maybe-start-reconciliation
+            p now)))))
+    ;; New headers announced: start the
+    ;; next sync cycle now to fetch the
+    ;; block instead of waiting out the
+    ;; 30s poll.
+    ;; Record a tip advance observed this
+    ;; second (item #6 durable liveness).
+    (note-node-tip-progress *node*)
+    (when (plusp (bl.net:ibd-context-headers-received pump))
+      (return-from %sync-idle-tick t))
+    ;; BEHIND: we hold headers above our
+    ;; own tip, so there is known work.
+    ;; Sitting out the rest of the 30s
+    ;; poll here is pure latency — the
+    ;; headers arrived during the sync
+    ;; pass, not during this wait, so
+    ;; the new-headers exit above never
+    ;; fires and the retry waits a full
+    ;; cycle.
+    ;;
+    ;; Measured: two regtest nodes, five
+    ;; blocks, one announcement — 40
+    ;; seconds to converge, of which ~24
+    ;; were this wait. Core's tests allow
+    ;; 60s for a full sync, so that alone
+    ;; puts most multi-node tests on the
+    ;; edge.
+    ;;
+    ;; Bounded rather than immediate:
+    ;; leave only after +BEHIND-RETRY-
+    ;; SECONDS+ so a chain no peer can
+    ;; serve retries on a timer instead
+    ;; of spinning. That case is real —
+    ;; it is what the download loop's own
+    ;; no-progress yield exists for.
+    (when (and (>= second +behind-retry-seconds+)
+               (> bl.net:*highest-header-seen*
+                  (bl.store:current-height cs)))
+      (return-from %sync-idle-tick t)))
+  nil)
+
+(defun %sync-pass ()
+  "One sync pass with peers connected: IBD or follow-tip (SYNC-BLOCKCHAIN),
+the liveness signal, full peer maintenance, the periodic peers.dat dump, and
+then up to 30 seconds of %SYNC-IDLE-TICKs -- sub-second so an announced
+block is noticed within a tick, ended early by new headers or known work."
+  (setf (node-syncing *node*) t)
+  (unwind-protect
+       (sync-blockchain *node*)
+    (setf (node-syncing *node*) nil))
+  ;; Durable at-tip liveness signal (item #6):
+  ;; record a tip advance whenever this sync pass
+  ;; raised the active-chain height.
+  (note-node-tip-progress *node*)
+  ;; Full peer maintenance, not just replacement:
+  ;; health checks + outgoing pings, addnode
+  ;; retry, slot refill, dedicated block-relay
+  ;; slots, and feeler probes. maintain-peers was
+  ;; previously dead code — nothing called it, so
+  ;; the PR #216 block-relay/feeler conns and
+  ;; ping-timeout eviction never ran live.
+  (maintain-peers *node*)
+  ;; Periodic peers.dat dump (Core DumpAddresses
+  ;; every 15 min); cadence-gated inside.
+  (maybe-dump-peer-addresses *node*)
+  ;; ⚠️ The SLEEP runs BEFORE the pump in %SYNC-IDLE-TICK, so a message
+  ;; that arrives just after one pass waits out the
+  ;; whole tick before anything reads it. At one
+  ;; second a tick that is the floor on how fast an
+  ;; announced block can be noticed, and a
+  ;; propagation spans two of them — which is the
+  ;; flat 2s diag/propagation_probe.py still
+  ;; measures after #507 removed the header round
+  ;; trip.
+  ;;
+  ;; Sub-second ticks, with the same 30s ceiling: the
+  ;; once-per-second work in %SYNC-IDLE-TICK keeps its
+  ;; own clocks, so it keeps its period while the pump
+  ;; gets to run sooner.
+  ;; Core's ProcessMessages runs continuously; this
+  ;; is the same direction, bounded.
+  (loop for tick from 1 to (* 30 +sync-ticks-per-second+)
+        for second = (ceiling tick +sync-ticks-per-second+)
+        while (node-running *node*)
+        do (sleep (/ 1 +sync-ticks-per-second+))
+           (when (%sync-idle-tick second)
+             (return))))
+
+(defun %sync-offline-activation (max-peers)
+  "The sync pass with no peer connected: activate whatever is already on
+disk (Core ActivateBestChain runs from startup, not only on an arriving
+block -- a -reindex with -connect=0 relies on it). If that advanced the
+tip, return so the next iteration keeps activating; otherwise wait five
+seconds and dial again."
+  ;; No peers. Before waiting for one, connect
+  ;; whatever is ALREADY on disk: after a -reindex
+  ;; the whole chain can be indexed with the
+  ;; chainstate still at genesis, and with
+  ;; -connect=0 no peer will ever arrive to
+  ;; trigger it. Core rebuilds entirely from disk
+  ;; in that situation (ActivateBestChain runs
+  ;; from startup, not only on an arriving block),
+  ;; and an operator recovering a corrupted
+  ;; chainstate offline is exactly who needs it.
+  ;;
+  ;; Cheap when there is nothing to do: it returns
+  ;; immediately once the tip IS the most-work
+  ;; candidate, which is the steady state.
+  (let ((switched
+          (ignore-errors
+           (bl.val:activate-best-chain
+            (node-current-chainstate *node*)
+            (node-block-store *node*)
+            (bl.store:chain-state-coins-view
+             (node-current-chainstate *node*))
+            :fee-estimator (node-fee-estimator *node*)
+            :mempool (node-mempool *node*)))))
+    (cond
+      (switched
+       (note-node-tip-progress *node*))
+      (t
+       (log-warn "No peers available, reconnecting in 5s...")
+       (loop repeat 5 while (node-running *node*)
+             do (sleep 1))
+       (connect-to-peers *node* max-peers
+                         :timeout 30 :min-peers 1)))))
+
 (defun %sync-thread-loop (max-peers)
-  "Core Step 12's sync thread: reset the per-process sync state, then run the
-IBD / follow-tip cycle with peer maintenance until the node stops. Runs on
-its own thread; the body catches and retries transient iteration errors."
+  "Core Step 12's sync thread: the startup dial, then the sync / follow-tip
+loop until the node stops -- %SYNC-PASS with peers, %SYNC-OFFLINE-ACTIVATION
+without. Runs on its own thread; each iteration's errors are logged with a
+live backtrace and retried after a short backoff, never allowed to end the
+thread."
   (handler-case
       (progn
-        ;; Initial connection. Guarded on its own so a startup dial
-        ;; failure logs and defers to the loop's reconnect path
-        ;; instead of ending the thread (a dead sync thread with
-        ;; node-running still T is a socket-reading zombie).
-        ;; -seednode first: its whole purpose is to fill the
-        ;; address book BEFORE the dial that reads it. Guarded
-        ;; separately so an unreachable seed never costs us the
-        ;; startup dial.
-        (handler-case
-            (connect-seed-nodes *node*)
-          (error (c)
-            (log-error "-seednode address fetch failed: ~A" c)))
-        (handler-case
-            (connect-to-peers *node* max-peers :timeout 60 :min-peers 2)
-          (error (c)
-            (log-error "Initial peer connection failed (retrying in loop): ~A" c)))
+        (%sync-thread-connect max-peers)
         ;; Sync + follow-tip loop runs until node shutdown. The
         ;; previous early-return on "sync complete" exited the only
         ;; thread reading from peer sockets, so live tip
         ;; announcements after IBD were never processed. Peers push
-        ;; new tips via sendheaders (BIP 130); this 30s poll is the
-        ;; backstop for inv-only peers and missed announcements.
+        ;; new tips via sendheaders (BIP 130); %SYNC-PASS's 30s poll is
+        ;; the backstop for inv-only peers and missed announcements.
         (loop while (node-running *node*)
               ;; Per-iteration error containment (item #5): a
               ;; transient error must retry the loop, never unwind
@@ -926,205 +1154,8 @@ its own thread; the body catches and retries transient iteration errors."
                  (connect-added-nodes *node*)
                  (cond
                    ((>= (length (node-peers *node*)) 1)
-                    (setf (node-syncing *node*) t)
-                    (unwind-protect
-                         (sync-blockchain *node*)
-                      (setf (node-syncing *node*) nil))
-                    ;; Durable at-tip liveness signal (item #6):
-                    ;; record a tip advance whenever this sync pass
-                    ;; raised the active-chain height.
-                    (note-node-tip-progress *node*)
-                    ;; Full peer maintenance, not just replacement:
-                    ;; health checks + outgoing pings, addnode
-                    ;; retry, slot refill, dedicated block-relay
-                    ;; slots, and feeler probes. maintain-peers was
-                    ;; previously dead code — nothing called it, so
-                    ;; the PR #216 block-relay/feeler conns and
-                    ;; ping-timeout eviction never ran live.
-                    (maintain-peers *node*)
-                    ;; Periodic peers.dat dump (Core DumpAddresses
-                    ;; every 15 min); cadence-gated inside.
-                    (maybe-dump-peer-addresses *node*)
-                    ;; ⚠️ The SLEEP runs BEFORE the pump, so a message
-                    ;; that arrives just after one pass waits out the
-                    ;; whole tick before anything reads it. At one
-                    ;; second a tick that is the floor on how fast an
-                    ;; announced block can be noticed, and a
-                    ;; propagation spans two of them — which is the
-                    ;; flat 2s diag/propagation_probe.py still
-                    ;; measures after #507 removed the header round
-                    ;; trip.
-                    ;;
-                    ;; Sub-second ticks, with the same 30s ceiling and
-                    ;; the same per-second cadence for everything that
-                    ;; wants one: the trickle, ping and dump work below
-                    ;; is gated on SECOND changing, so it keeps its
-                    ;; period while the pump gets to run sooner.
-                    ;; Core's ProcessMessages runs continuously; this
-                    ;; is the same direction, bounded.
-                    (loop for tick from 1 to (* 30 +sync-ticks-per-second+)
-                          for second = (ceiling tick +sync-ticks-per-second+)
-                          while (node-running *node*)
-                          do (sleep (/ 1 +sync-ticks-per-second+))
-                             ;; Retry buffered unsent bytes on
-                             ;; every peer (non-blocking) — the
-                             ;; periodic half of Core's
-                             ;; SocketSendData.
-                             (bl.net:flush-peer-send-buffers
-                              (node-peers *node*))
-                             ;; Steady-state receive pump: drain
-                             ;; every peer's readable messages
-                             ;; with the full node context. This
-                             ;; loop used to be a pure 30s sleep
-                             ;; — a receive dead window in which
-                             ;; pings, invs, and getdata for txs
-                             ;; we had JUST announced sat unread
-                             ;; (Core's per-peer ProcessMessages
-                             ;; runs continuously). A new header
-                             ;; announcement ends the wait so the
-                             ;; block is fetched immediately.
-                             (let* ((cs (node-current-chainstate *node*))
-                                    (pump (bl.net:pump-peer-messages
-                                           (node-peers *node*)
-                                           (node->context *node* cs)
-                                           nil)))
-                               ;; Tx-request scheduler: send
-                               ;; delayed announcements now due,
-                               ;; and re-route requests that
-                               ;; expired (60s) to another
-                               ;; announcer (Core GetRequestsToSend
-                               ;; runs per SendMessages pass).
-                               (bl.net:process-tx-requests)
-                               (bl.net:retry-timed-out-tx-requests)
-                               ;; Trickled tx announcements: drain
-                               ;; due per-peer inv queues each
-                               ;; second (Poisson schedules inside;
-                               ;; Core SendMessages runs its
-                               ;; equivalent on every message pump).
-                               (bl.net:flush-tx-announcements
-                                (node-peers *node*)
-                                (node-mempool *node*))
-                               ;; Locally-submitted txs still in the
-                               ;; unbroadcast set get re-announced
-                               ;; every 10-15 min until a peer's
-                               ;; getdata confirms propagation (Core
-                               ;; ReattemptInitialBroadcast).
-                               (bl.net:maybe-reattempt-initial-broadcast
-                                (node-peers *node*)
-                                (node-mempool *node*))
-                               ;; Wallet rebroadcast timer (Core
-                               ;; MaybeResendWalletTxs on the
-                               ;; scheduler, every minute): each
-                               ;; wallet resubmits its unconfirmed
-                               ;; txs past a randomized 12-36h
-                               ;; deadline. Cadence-gated inside;
-                               ;; takes node-lock -> wallet-lock
-                               ;; per tx, so it must run OUTSIDE
-                               ;; any node-lock hold (wallet P4).
-                               (bl.wallet:wallets-maybe-resend *node*)
-                               ;; Local-address self-advertisement
-                               ;; (our onion address, once torcontrol
-                               ;; registers it): per-peer ~24h Poisson
-                               ;; schedule inside, no-op while the
-                               ;; local-address map is empty or in
-                               ;; IBD (Core MaybeSendAddr).
-                               (bl.net:maybe-advertise-local-address
-                                (node-peers *node*)
-                                (node-chain-state *node*))
-                               ;; BIP133 feefilter refresh (Core
-                               ;; MaybeSendFeefilter on the message
-                               ;; loop): per-peer ~10min Poisson
-                               ;; schedule inside, so this is a
-                               ;; cheap no-op most ticks. Runs on
-                               ;; the sync thread, which is why
-                               ;; its RNG use is safe.
-                               (let ((cs (node-chain-state *node*))
-                                     (mp (node-mempool *node*))
-                                     (now (bl.ser:get-unix-time)))
-                                 (dolist (p (node-peers *node*))
-                                   (when (eq (bl.net:peer-state p) :ready)
-                                     (ignore-errors
-                                      (bl.net:maybe-send-feefilter
-                                       p mp cs now))
-                                     ;; BIP-330: open a reconciliation
-                                     ;; round with one peer at a time.
-                                     ;; Inert unless -txreconciliation
-                                     ;; is set and the peer completed
-                                     ;; the handshake.
-                                     (ignore-errors
-                                      (bl.net:maybe-start-reconciliation
-                                       p now)))))
-                               ;; New headers announced: start the
-                               ;; next sync cycle now to fetch the
-                               ;; block instead of waiting out the
-                               ;; 30s poll.
-                               ;; Record a tip advance observed this
-                               ;; second (item #6 durable liveness).
-                               (note-node-tip-progress *node*)
-                               (when (plusp (bl.net:ibd-context-headers-received pump))
-                                 (return))
-                               ;; BEHIND: we hold headers above our
-                               ;; own tip, so there is known work.
-                               ;; Sitting out the rest of the 30s
-                               ;; poll here is pure latency — the
-                               ;; headers arrived during the sync
-                               ;; pass, not during this wait, so
-                               ;; the new-headers exit above never
-                               ;; fires and the retry waits a full
-                               ;; cycle.
-                               ;;
-                               ;; Measured: two regtest nodes, five
-                               ;; blocks, one announcement — 40
-                               ;; seconds to converge, of which ~24
-                               ;; were this wait. Core's tests allow
-                               ;; 60s for a full sync, so that alone
-                               ;; puts most multi-node tests on the
-                               ;; edge.
-                               ;;
-                               ;; Bounded rather than immediate:
-                               ;; leave only after +BEHIND-RETRY-
-                               ;; SECONDS+ so a chain no peer can
-                               ;; serve retries on a timer instead
-                               ;; of spinning. That case is real —
-                               ;; it is what the download loop's own
-                               ;; no-progress yield exists for.
-                               (when (and (>= second +behind-retry-seconds+)
-                                          (> bl.net:*highest-header-seen*
-                                             (bl.store:current-height cs)))
-                                 (return)))))
-                   (t
-                    ;; No peers. Before waiting for one, connect
-                    ;; whatever is ALREADY on disk: after a -reindex
-                    ;; the whole chain can be indexed with the
-                    ;; chainstate still at genesis, and with
-                    ;; -connect=0 no peer will ever arrive to
-                    ;; trigger it. Core rebuilds entirely from disk
-                    ;; in that situation (ActivateBestChain runs
-                    ;; from startup, not only on an arriving block),
-                    ;; and an operator recovering a corrupted
-                    ;; chainstate offline is exactly who needs it.
-                    ;;
-                    ;; Cheap when there is nothing to do: it returns
-                    ;; immediately once the tip IS the most-work
-                    ;; candidate, which is the steady state.
-                    (let ((switched
-                            (ignore-errors
-                             (bl.val:activate-best-chain
-                              (node-current-chainstate *node*)
-                              (node-block-store *node*)
-                              (bl.store:chain-state-coins-view
-                               (node-current-chainstate *node*))
-                              :fee-estimator (node-fee-estimator *node*)
-                              :mempool (node-mempool *node*)))))
-                      (cond
-                        (switched
-                         (note-node-tip-progress *node*))
-                        (t
-                         (log-warn "No peers available, reconnecting in 5s...")
-                         (loop repeat 5 while (node-running *node*)
-                               do (sleep 1))
-                         (connect-to-peers *node* max-peers
-                                           :timeout 30 :min-peers 1)))))))
+                    (%sync-pass))
+                   (t (%sync-offline-activation max-peers))))
                    (error (c)
                      ;; Transient iteration error: the backtrace was
                      ;; already logged above (live stack). Log a

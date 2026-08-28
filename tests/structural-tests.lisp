@@ -609,10 +609,7 @@ to make on purpose, so the set is pinned."
   "Above this a definition counts against +LONGISH-FUNCTION-CEILING+.")
 
 (defparameter +long-function-baseline+
-  '(("%sync-thread-loop" . 258)                  ; node/init.lisp -- P3.2 lifted it
-                                                 ; out of start-node (1,227 lines);
-                                                 ; its own split is P3.2b
-    ("perform-reorg" . 465)                      ; validation/block.lisp
+  '(("perform-reorg" . 465)                      ; validation/block.lisp
     ("%create-transaction-internal" . 442)       ; wallet/wallet-spend.lisp
     ("rpc-sendall" . 289)                        ; wallet/wallet-spend.lisp
     ("validate-transaction-for-mempool" . 358)   ; validation/transaction.lisp
@@ -632,9 +629,10 @@ may shrink but not grow while it waits its turn.")
 (defparameter +longish-function-ceiling+ 63
   "How many definitions may exceed +LONGISH-FUNCTION-LINES+ lines. Lower it
 when the count drops; the test says so. Raised 61 -> 63 by P3.2, which turned
-the 1,227-line start-node into named init steps: three of them are 100-260
-lines (start-node's own docstring and lambda list, %init-load-chain,
-%sync-thread-loop) and the count resumes going down from here.")
+the 1,227-line start-node into named init steps: three of them are 100-170
+lines (start-node's own docstring and lambda list, %init-load-chain, and the
+sync thread's %sync-idle-tick after P3.2b) and the count resumes going down
+from here.")
 
 (defun %definitions-longer-than (lines)
   (sort (remove-if-not (lambda (d) (> (%def-length d) lines)) (%toplevel-definitions))
