@@ -222,14 +222,6 @@ this same package."
                                (:file "serialization")
                                (:file "script")
                                (:file "interop")))
-                 (:module "validation"
-                  :components ((:file "script")
-                               (:file "miniscript")
-                               (:file "transaction")
-                               (:file "packages")
-                               (:file "block")
-                               (:file "versionbits")
-                               (:file "signet")))
                  (:module "mempool"
                   :components ((:file "feefrac")
                                (:file "cluster-linearize")
@@ -239,6 +231,17 @@ this same package."
                                (:file "mempool")
                                (:file "block-policy-estimator")
                                (:file "fee-estimator")))
+                 ;; Validation names the mempool -- MemPoolAccept lives in Core's
+                 ;; validation.cpp too -- and the mempool never names
+                 ;; validation, so the mempool loads first.
+                 (:module "validation"
+                  :components ((:file "script")
+                               (:file "miniscript")
+                               (:file "transaction")
+                               (:file "packages")
+                               (:file "block")
+                               (:file "versionbits")
+                               (:file "signet")))
                  (:module "mining"
                   :components ((:file "assembler")
                                (:file "builder")))
@@ -297,6 +300,7 @@ this same package."
                   :serial t
                   :components (
                                (:file "params")
+                               (:file "args")      ; the parsed options meet the node
                                (:file "state")
                                (:file "notify")
                                (:file "datadir")
