@@ -858,14 +858,39 @@ anything else (keywords, other packages)."
                               :test #'string-equal))))
         (and full (string-downcase full)))))
 
+(defun %code-only (raw in-string)
+  "RAW with its string literals and its ; comment blanked out, given whether
+the line starts inside a string; returns the blanked line and whether the
+next line starts inside a string. A \\\" inside a string and the #\\\" character
+literal do not end a string."
+  (let ((out (make-string (length raw) :initial-element #\Space))
+        (i 0) (n (length raw)))
+    (loop while (< i n)
+          do (let ((c (char raw i)))
+               (cond (in-string
+                      (cond ((char= c #\\) (incf i))
+                            ((char= c #\") (setf in-string nil))))
+                     ((and (char= c #\#) (< (1+ i) n) (char= (char raw (1+ i)) #\\))
+                      (setf (char out i) c)
+                      (when (< (+ i 2) n) (setf (char out (1+ i)) #\\ (char out (+ i 2)) #\x))
+                      (incf i 2))
+                     ((char= c #\;) (return))
+                     ((char= c #\") (setf in-string t))
+                     (t (setf (char out i) c))))
+             (incf i))
+    (values out in-string)))
+
 (defun %package-references (lines)
   "The project packages LINES name with an explicit prefix -- a full name or
-a local nickname, followed by a colon, outside a ; comment. A prefix quoted in
-a docstring still counts; the sources do not do that."
-  (let ((found '()))
+a local nickname, followed by a colon -- in CODE: string literals and ;
+comments are blanked first, so a prefix quoted in a docstring (a user-agent
+\"/bl:0.1.0/\", an example call) does not count."
+  (let ((found '()) (in-string nil))
     (flet ((name-char-p (c) (or (alphanumericp c) (find c ".-"))))
       (loop for raw across lines
-            for line = (string-downcase (subseq raw 0 (position #\; raw)))
+            for line = (multiple-value-bind (code next) (%code-only raw in-string)
+                         (setf in-string next)
+                         (string-downcase code))
             do (loop for colon = (position #\: line)
                        then (position #\: line :start (1+ colon))
                      while colon
@@ -881,14 +906,12 @@ a docstring still counts; the sources do not do that."
     (sort found #'string<)))
 
 (defparameter +layering-violation-baseline+
-  '(("src/coalton/interop.lisp" . "bitcoin-lisp.serialization")
-    ("src/coalton/interop.lisp" . "bitcoin-lisp.storage")
+  '(("src/coalton/interop.lisp" . "bitcoin-lisp.storage")
     ("src/config.lisp" . "bitcoin-lisp.mempool")
     ("src/config.lisp" . "bitcoin-lisp.networking")
     ("src/validation/block.lisp" . "bitcoin-lisp.mempool")
     ("src/validation/packages.lisp" . "bitcoin-lisp.mempool")
-    ("src/validation/transaction.lisp" . "bitcoin-lisp.mempool")
-    ("src/zmq.lisp" . "bitcoin-lisp.serialization"))
+    ("src/validation/transaction.lisp" . "bitcoin-lisp.mempool"))
   "(file . package) pairs where a file names a package whose module loads
 LATER, at the start of the cleanup. They compile because src/package.lisp
 defines every package up front, so the reader interns the symbol and the call
@@ -988,9 +1011,11 @@ the measuring functions must measure a known shape correctly."
              (%package-references
               (vector ";; bitcoin-lisp.validation in a comment does not count"
                       "(bitcoin-lisp.storage:current-height x) ; nor bitcoin-lisp.rpc:here"
-                      "(bl.mp::internal bl::*node* :keyword #:uninterned other:pkg)")))
-      "a package prefix counts, full name or nickname; a comment, a keyword ~
-and a foreign package do not")
+                      "(bl.mp::internal bl::*node* :keyword #:uninterned other:pkg)"
+                      "  \"a docstring naming bl.rpc:inside-a-string, even over"
+                      "   two lines with a #\\\" in it, bl.val:still-not-code\" x)")))
+      "a package prefix counts, full name or nickname; a comment, a keyword, ~
+a foreign package and a prefix inside a string literal do not")
   (is (every (lambda (entry)
                (find-package (cdr entry)))
              bitcoin-lisp.nicknames:*package-nicknames*)

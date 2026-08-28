@@ -64,6 +64,23 @@ bitcoin-lisp.kv, which bitcoin-lisp.storage :USEs and re-exports."
                              (:file "flatfile")
                              (:file "leveldb")))))
 
+(defsystem "bitcoin-lisp/serialization"
+  :description "Bitcoin's wire and disk encodings: the byte codecs, the
+transaction / block / header types, CompactSize, the P2P message table
+(define-message), the UTXO compressor and PSBT. Chain-specific, but it
+needs nothing above util and crypto, so it is a layer of its own."
+  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "flexi-streams" "cl-base64")
+  :pathname "src"
+  :serial t
+  :components ((:file "serialization/package")
+               (:module "serialization"
+                :components ((:file "binary")
+                             (:file "compressor")
+                             (:file "types")
+                             (:file "message-macro")
+                             (:file "messages")
+                             (:file "psbt")))))
+
 (defsystem "bitcoin-lisp"
   :version "0.1.0"
   :author "samdefmacro"
@@ -73,6 +90,7 @@ bitcoin-lisp.kv, which bitcoin-lisp.storage :USEs and re-exports."
                "bitcoin-lisp/crypto"
                "bitcoin-lisp/logging"
                "bitcoin-lisp/kv"
+               "bitcoin-lisp/serialization"
                "ironclad"
                "nibbles"
                "cffi"
@@ -95,7 +113,6 @@ bitcoin-lisp.kv, which bitcoin-lisp.storage :USEs and re-exports."
                  ;; bitcoin-lisp/util and bitcoin-lisp/crypto load before this
                  ;; system (:depends-on): their packages, nicknames and
                  ;; conditions already exist here.
-                 (:file "serialization/package")
                  (:file "storage/package")
                  (:file "validation/package")
                  (:file "mempool/package")
@@ -115,13 +132,6 @@ bitcoin-lisp.kv, which bitcoin-lisp.storage :USEs and re-exports."
                                (:file "serialization")
                                (:file "script")
                                (:file "interop")))
-                 (:module "serialization"
-                  :components ((:file "binary")
-                               (:file "compressor")
-                               (:file "types")
-                               (:file "message-macro")
-                               (:file "messages")
-                               (:file "psbt")))
                  (:module "storage"
                   ;; The persistence primitives (LevelDB, flat files, datadir,
                   ;; fsync) are bitcoin-lisp/kv, loaded before this system.
