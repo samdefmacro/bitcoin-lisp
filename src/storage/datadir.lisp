@@ -131,9 +131,9 @@ nothing is exactly the failure this comment is about."
                              (uiop:ensure-directory-pathname to)))
   (sb-posix:rename (%rename-namestring from) (%rename-namestring to))
   (unless (probe-file to)
-    (error "datadir migration: ~A did not arrive at ~A" from to))
+    (storage-error "datadir migration: ~A did not arrive at ~A" from to))
   (when (probe-file from)
-    (error "datadir migration: ~A still exists after moving to ~A" from to))
+    (storage-error "datadir migration: ~A still exists after moving to ~A" from to))
   to)
 
 (defun %rename-namestring (path)

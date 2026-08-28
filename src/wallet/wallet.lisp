@@ -71,7 +71,7 @@ these for both external and internal (wallet.cpp:3595-3602).")
 
 (defun %output-type-code (type)
   (or (position type +output-types+)
-      (error "unknown output type ~S" type)))
+      (wallet-error "unknown output type ~S" type)))
 
 (defun %output-type-from-code (code)
   (nth code +output-types+))
@@ -572,11 +572,11 @@ WALLET is unused beyond symmetry with the other spkm operations."
         do (multiple-value-bind (scripts pubkeys)
                (bl.rpc::out-desc-expand-from-cache (desc-spkm-desc spkm) i cache)
              (unless scripts
-               (error "Error: Unable to expand wallet descriptor from cache"))
+               (wallet-error "Error: Unable to expand wallet descriptor from cache"))
              (dolist (script scripts)
                (let ((existing (gethash script (desc-spkm-script-map spkm))))
                  (when (and existing (/= existing i))
-                   (error "Error: Already loaded script at index ~D as being at index ~D"
+                   (wallet-error "Error: Already loaded script at index ~D as being at index ~D"
                           i existing))))
              (%spkm-note-expansion spkm i scripts pubkeys)
              (incf (desc-spkm-max-cached-index spkm)))))
@@ -786,10 +786,10 @@ wallet.cpp:3594-3602)."
             ;; scriptpubkeyman.cpp:1136-1161).
             (unless (spkm-add-key wallet spkm master-priv master-pub t
                                   :batch batch)
-              (error "wallet setup: writing descriptor master private key failed for ~A"
+              (wallet-error "wallet setup: writing descriptor master private key failed for ~A"
                      desc-str))
             (unless (spkm-top-up wallet spkm 0 batch)
-              (error "wallet setup: keypool top-up failed for ~A" desc-str))
+              (wallet-error "wallet setup: keypool top-up failed for ~A" desc-str))
             (wallet-add-active-spkm wallet spkm type internal :batch batch))))
       ;; A wallet that has just generated descriptors is no longer blank
       ;; (Core SetupDescriptorGeneration -> UnsetBlankWalletFlag,
@@ -822,9 +822,9 @@ implementation would be a second set of derivation-path bugs."
     (let ((spkm (%make-spkm-from-descriptor desc now 0 0 0)))
       (setf (gethash id (wallet-spkms wallet)) spkm)
       (unless (spkm-add-key wallet spkm master-priv master-pub t :batch batch)
-        (error "writing descriptor master private key failed for ~A" desc-str))
+        (wallet-error "writing descriptor master private key failed for ~A" desc-str))
       (unless (spkm-top-up wallet spkm 0 batch)
-        (error "keypool top-up failed for ~A" desc-str))
+        (wallet-error "keypool top-up failed for ~A" desc-str))
       (wallet-add-active-spkm wallet spkm type internal :batch batch)
       spkm)))
 

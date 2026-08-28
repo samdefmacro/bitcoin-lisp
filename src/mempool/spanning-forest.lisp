@@ -144,7 +144,7 @@ uniformly random position among the live elements."
     (do-bits (tx tx-idxs)
       (when (zerop pos) (return-from sfl-pick-random-tx tx))
       (decf pos))
-    (error "PickRandomTx on an empty set")))
+    (internal-error "PickRandomTx on an empty set")))
 
 ;;;; --- Cost model (Core SFLDefaultCostModel, cluster_linearize.h:496-544) --
 ;;;;
@@ -272,7 +272,7 @@ chunk, which must exist. Returns the merged chunk (Core MergeChunks, :943-982)."
                      (return-from sfl-merge-chunks (sfl-activate st tx-idx child-idx)))
                    (decf pick)))
                 (t (decf pick count)))))
-      (error "MergeChunks failed to find the picked dependency"))))
+      (internal-error "MergeChunks failed to find the picked dependency"))))
 
 (defun sfl-pick-merge-candidate (st chunk-idx downward)
   "The chunk CHUNK-IDX should merge with, or +SFL-INVALID-IDX+ (Core

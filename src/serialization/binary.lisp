@@ -100,20 +100,20 @@ Mirrors Bitcoin Core's ReadCompactSize (serialize.h:330-360):
                   ((= first-byte 253)
                    (let ((v (read-uint16-le stream)))
                      (when (< v 253)
-                       (error "non-canonical ReadCompactSize"))
+                       (serialization-error "non-canonical ReadCompactSize"))
                      v))
                   ((= first-byte 254)
                    (let ((v (read-uint32-le stream)))
                      (when (< v #x10000)
-                       (error "non-canonical ReadCompactSize"))
+                       (serialization-error "non-canonical ReadCompactSize"))
                      v))
                   ((= first-byte 255)
                    (let ((v (read-uint64-le stream)))
                      (when (< v #x100000000)
-                       (error "non-canonical ReadCompactSize"))
+                       (serialization-error "non-canonical ReadCompactSize"))
                      v)))))
     (when (and range-check (> value +max-compact-size+))
-      (error "ReadCompactSize: size too large (~D > ~D)"
+      (serialization-error "ReadCompactSize: size too large (~D > ~D)"
              value +max-compact-size+))
     value))
 
@@ -149,7 +149,7 @@ vector — truncated peer/disk input must be rejected, not parsed as garbage."
   (let* ((bytes (make-array count :element-type '(unsigned-byte 8)))
          (got (read-sequence bytes stream)))
     (unless (= got count)
-      (error "read-bytes: unexpected end of input (wanted ~D bytes, got ~D)"
+      (serialization-error "read-bytes: unexpected end of input (wanted ~D bytes, got ~D)"
              count got))
     bytes))
 

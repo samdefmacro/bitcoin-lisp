@@ -7,7 +7,7 @@
 ;;;; definition in src/validation/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.validation
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    ;; Transaction validation
    #:validate-transaction-structure

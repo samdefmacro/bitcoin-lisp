@@ -45,7 +45,7 @@ values do not escape this file, but keeping Core's makes the two diffable.")
   (let ((flags 0))
     (loop for ch across string
           for bit = (cdr (assoc ch +mst-bits+))
-          do (unless bit (error "Unknown miniscript type character ~S" ch))
+          do (unless bit (internal-error "Unknown miniscript type character ~S" ch))
              (setf flags (logior flags (ash 1 bit))))
     flags))
 
@@ -1030,7 +1030,7 @@ sub is sane and the insanity is a property of NODE itself."
 ;;;;   and_n(X,Y)= andor(X,Y,0)     t:X       = and_v(X,1)
 ;;;;   l:X       = or_i(0,X)        u:X       = or_i(X,0)
 
-(define-condition miniscript-parse-error (error)
+(define-condition miniscript-parse-error (bitcoin-lisp-error)
   ((message :initarg :message :reader miniscript-parse-error-message))
   (:report (lambda (c s) (format s "~A" (miniscript-parse-error-message c))))
   (:documentation "The expression could not be parsed at all. Distinct from an
@@ -1295,7 +1295,7 @@ run of wrappers needs only one colon."
                              (mapcar #'key (ms-node-keys node))))
            (:thresh (format nil "~Athresh(~D~{,~A~})" prefix (ms-node-k node)
                             (loop for i from 0 below (length subs) collect (sub i))))
-           (t (error "cannot render miniscript fragment ~S"
+           (t (internal-error "cannot render miniscript fragment ~S"
                      (ms-node-fragment node)))))))))
 
 ;;;; --- Satisfaction (miniscript.h:1242-1440, miniscript.cpp:298-366) -------

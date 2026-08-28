@@ -462,7 +462,7 @@ Core's — a silent, opposite-direction divergence on a security-relevant flag."
   "Parse a config VALUE as an integer, or signal an error."
   (let ((v (string-trim '(#\Space #\Tab) value)))
     (handler-case (parse-integer v)
-      (error () (error "Invalid integer config value: ~S" value)))))
+      (error () (config-error "Invalid integer config value: ~S" value)))))
 
 (defun log-categories-string ()
   "Core's LogCategoriesString: every category name, comma-separated, for the
@@ -487,7 +487,7 @@ staring at a log that will never contain what they asked for."
                        (member (string-downcase level)
                                '("info" "debug" "trace" "warn" "warning" "error")
                                :test #'string=))
-            (error "Unsupported category-specific logging level -loglevel=~A. ~
+            (config-error "Unsupported category-specific logging level -loglevel=~A. ~
 Expected -loglevel=<category>:<loglevel>. Valid categories: ~A. ~
 Valid loglevels: info, debug, trace." value (log-categories-string)))
           (values category (conf-parse-loglevel level))))))
@@ -511,7 +511,7 @@ category instead. A category-specific spec leaves the global level alone."
           ;; error exist as LEVELS but are not offered as a global threshold, so
           ;; they are accepted here (nothing should start refusing a config that
           ;; worked) and simply not named among the valid values.
-          (t (error "Unsupported global logging level -loglevel=~A. ~
+          (t (config-error "Unsupported global logging level -loglevel=~A. ~
 Valid values: info, debug, trace." value)))))
 
 (defun conf-parse-money (value)
@@ -624,7 +624,7 @@ ByteUnit::NOOP, where a bare number is a byte count."
                        (#\g (expt 1000 3)) (#\G (expt 1024 3))
                        (#\t (expt 1000 4)) (#\T (expt 1024 4)))))
     (unless (and (plusp (length digits)) (every #'digit-char-p digits))
-      (error "Unable to parse byte amount: '~A'" value))
+      (config-error "Unable to parse byte amount: '~A'" value))
     (* (parse-integer digits) multiplier)))
 
 (defun conf-parse-network-name (value)
@@ -636,7 +636,7 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
           ((string= v "onion") :torv3)
           ((string= v "i2p") :i2p)
           ((string= v "cjdns") :cjdns)
-          (t (error "Unknown network specified in -onlynet: ~S" value)))))
+          (t (config-error "Unknown network specified in -onlynet: ~S" value)))))
 
 (defun conf-section-name (network)
   "The bitcoin.conf [section] header that scopes options to NETWORK
@@ -721,7 +721,7 @@ check-cli-args rejects them up front."
                 (setf (gethash key seen) t)
                 (push cell kept))))))))
 
-(define-condition config-parse-error (error)
+(define-condition config-parse-error (config-error)
   ((message :initarg :message :reader config-parse-error-message))
   (:report (lambda (c stream) (write-string (config-parse-error-message c) stream)))
   (:documentation
@@ -885,7 +885,7 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
                ((string= c "testnet4") :testnet4)
                ((string= c "signet") :signet)
                ((string= c "regtest") :regtest)
-               (t (error "Unknown -chain value: ~S" c)))))
+               (t (config-error "Unknown -chain value: ~S" c)))))
       (t default))))
 
 (defun supplied-core-only-options (alist)
@@ -911,7 +911,7 @@ ArgsManager::ParseParameters (common/args.cpp:229-238)."
                 (known-config-option-p (subseq name 2))))
        t))
 
-(define-condition cli-parse-error (error)
+(define-condition cli-parse-error (config-error)
   ((detail :initarg :detail :reader cli-parse-error-detail))
   (:report (lambda (c stream)
              ;; Core's bitcoind prints the parse failure with this prefix and
@@ -1270,7 +1270,7 @@ contradiction -listen=0 -listenonion=1 is an init ERROR (:1022-1024)."
              (lo (lk "listenonion"))
              (lo-p (and lo (conf-parse-bool lo))))
         (when (and (not listen-p) lo-p)
-          (error "Cannot set -listen=0 together with -listenonion=1"))
+          (config-error "Cannot set -listen=0 together with -listenonion=1"))
         (values listen-p
                 (and listen-p (if lo lo-p t)))))))
 
@@ -1290,7 +1290,7 @@ resolved network. Honors -server (enable RPC on the default port when no
       ;; "Invalid port specified in -port").
       (let ((port (getf plist :port)))
         (when (and port (not (<= 1 port 65535)))
-          (error "Invalid port specified in -port: '~A'" port)))
+          (config-error "Invalid port specified in -port: '~A'" port)))
       ;; Repeatable options whose value is just the string: keep every
       ;; occurrence, CLI and config file, the way Core's GetArgs does (the
       ;; :COLLECT rows of the option table). Each is validated where it is
@@ -1395,11 +1395,11 @@ rejects, \"Invalid value for -x=v (must be a positive integer)\" for an
       (:int (let ((n (conf-parse-int raw))
                   (min (config-option-min option)))
               (when (and min (< n min))
-                (error "Invalid value for -~A=~A (must be a ~A integer)"
+                (config-error "Invalid value for -~A=~A (must be a ~A integer)"
                        name raw (if (zerop min) "non-negative" "positive")))
               n))
       (:money (or (conf-parse-money raw)
-                  (error "Invalid amount for -~A=~A" name raw)))
+                  (config-error "Invalid amount for -~A=~A" name raw)))
       (:hex (bl.crypto:hex-to-bytes raw))
       (:byte-units (conf-parse-byte-units raw))
       (:loglevel (conf-parse-loglevel raw))
@@ -1518,16 +1518,16 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
           ;; the Tor route; otherwise -listenonion may still deliver a proxy
           ;; later via the torcontrol connection.
           (cond ((lk "onion")
-                 (error "-onlynet=onion given but the proxy for reaching the Tor network is explicitly forbidden: -onion=0"))
+                 (config-error "-onlynet=onion given but the proxy for reaching the Tor network is explicitly forbidden: -onion=0"))
                 ((not listenonion-p)
-                 (error "-onlynet=onion given but no Tor route is configured: none of -proxy, -onion or -listenonion is given"))))
+                 (config-error "-onlynet=onion given but no Tor route is configured: none of -proxy, -onion or -listenonion is given"))))
         (setf nets (remove :torv3 nets)))
       (when (member :i2p onlynets)
-        (error "-onlynet=i2p given but I2P (SAM) is not supported"))
+        (config-error "-onlynet=i2p given but I2P (SAM) is not supported"))
       (setf nets (remove :i2p nets))
       (unless bl.net:*cjdns-reachable*
         (when (member :cjdns onlynets)
-          (error "-onlynet=cjdns given without -cjdnsreachable"))
+          (config-error "-onlynet=cjdns given without -cjdnsreachable"))
         (setf nets (remove :cjdns nets)))
       (setf bl.net:*reachable-networks* nets)
       ;; PRIVACY: requesting DNS seeds entails clearnet. Resolving a seed
@@ -1544,7 +1544,7 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
         (cond ((not (lk "dnsseed"))
                (setf *dns-seed-enabled* nil))
               (*dns-seed-enabled*
-               (error "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6")))))))
+               (config-error "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6")))))))
 
 (defun args->start-node-plist (args &optional conf-text settings-cells)
   ;; CONF-TEXT is the main bitcoin.conf, or a LIST of texts when -includeconf

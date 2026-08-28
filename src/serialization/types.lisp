@@ -217,7 +217,7 @@ flexi-streams' Gray-stream input dispatch."
         ;; Witness format: marker=0x00, flag=0x01
         (let ((flag (br-read-u8 br)))
           (unless (= flag 1)
-            (error "Invalid witness flag byte: ~D" flag))
+            (serialization-error "Invalid witness flag byte: ~D" flag))
           (let* ((input-count (br-read-compact-size br))
                  (inputs (%read-n-vector input-count (br-read-tx-in br)))
                  (output-count (br-read-compact-size br))
@@ -236,22 +236,22 @@ flexi-streams' Gray-stream input dispatch."
                        ((= marker 253)
                         (let ((v (br-read-u16-le br)))
                           (when (< v 253)
-                            (error "non-canonical ReadCompactSize"))
+                            (serialization-error "non-canonical ReadCompactSize"))
                           v))
                        ((= marker 254)
                         (let ((v (br-read-u32-le br)))
                           (when (< v #x10000)
-                            (error "non-canonical ReadCompactSize"))
+                            (serialization-error "non-canonical ReadCompactSize"))
                           v))
                        (t
                         (let ((v (br-read-u64-le br)))
                           (when (< v #x100000000)
-                            (error "non-canonical ReadCompactSize"))
+                            (serialization-error "non-canonical ReadCompactSize"))
                           v))))
                ;; Core ReadCompactSize's range check (serialize.h:330-360),
                ;; which the inline decode above skips.
                (input-count (if (> input-count +max-compact-size+)
-                                (error "ReadCompactSize: size too large (~D > ~D)"
+                                (serialization-error "ReadCompactSize: size too large (~D > ~D)"
                                        input-count +max-compact-size+)
                                 input-count))
                (inputs (%read-n-vector input-count (br-read-tx-in br)))
@@ -273,7 +273,7 @@ where the input count would normally be."
         ;; Possible witness format: marker=0x00, check flag
         (let ((flag (read-uint8 stream)))
           (unless (= flag 1)
-            (error "Invalid witness flag byte: ~D" flag))
+            (serialization-error "Invalid witness flag byte: ~D" flag))
           ;; Witness format: inputs, outputs, witness stacks, lock-time
           (let* ((input-count (read-compact-size stream))
                  (inputs (%read-n-vector input-count (read-tx-in stream)))
@@ -308,20 +308,20 @@ read-compact-size and Bitcoin Core's ReadCompactSize (serialize.h:330-360)."
                  ((= first-byte 253)
                   (let ((v (read-uint16-le stream)))
                     (when (< v 253)
-                      (error "non-canonical ReadCompactSize"))
+                      (serialization-error "non-canonical ReadCompactSize"))
                     v))
                  ((= first-byte 254)
                   (let ((v (read-uint32-le stream)))
                     (when (< v #x10000)
-                      (error "non-canonical ReadCompactSize"))
+                      (serialization-error "non-canonical ReadCompactSize"))
                     v))
                  (t
                   (let ((v (read-uint64-le stream)))
                     (when (< v #x100000000)
-                      (error "non-canonical ReadCompactSize"))
+                      (serialization-error "non-canonical ReadCompactSize"))
                     v)))))
     (when (> value +max-compact-size+)
-      (error "ReadCompactSize: size too large (~D > ~D)"
+      (serialization-error "ReadCompactSize: size too large (~D > ~D)"
              value +max-compact-size+))
     value))
 

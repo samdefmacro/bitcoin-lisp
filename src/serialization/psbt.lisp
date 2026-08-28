@@ -128,9 +128,9 @@ KEYDATA (byte vector, may be empty) and VALUE (byte vector)."
 (partial sigs, derivations, preimages) must. Unknown/proprietary types are
 unconstrained (preserved verbatim)."
   (flet ((empty () (when (plusp keydata-len)
-                     (error "PSBT key type ~D must have empty key data" keytype)))
+                     (serialization-error "PSBT key type ~D must have empty key data" keytype)))
          (nonempty () (when (zerop keydata-len)
-                        (error "PSBT key type ~D requires key data" keytype))))
+                        (serialization-error "PSBT key type ~D requires key data" keytype))))
     (ecase context
       (:global (case keytype ((#x00 #xfb) (empty)) (#x01 (nonempty))))
       (:input (case keytype
@@ -151,7 +151,7 @@ illegal key-data length (Core rejects those)."
         (let ((key (br-read-bytes br keylen))
               (value (br-read-var-bytes br)))
           (when (member key records :key #'car :test #'equalp)
-            (error "Duplicate key in PSBT map"))
+            (serialization-error "Duplicate key in PSBT map"))
           (multiple-value-bind (kt off) (psbt-key-type key)
             (%psbt-validate-key context kt (- (length key) off)))
           (push (cons key value) records))))
@@ -171,7 +171,7 @@ inputs would otherwise have its 0x00 input-count misread as the segwit marker."
       (dotimes (i nout) (setf (aref outputs i) (br-read-tx-out br)))
       (let ((lock-time (br-read-u32-le br)))
         (unless (br-eof-p br)
-          (error "PSBT unsigned transaction has trailing/witness data"))
+          (serialization-error "PSBT unsigned transaction has trailing/witness data"))
         (make-transaction :version version :inputs inputs :outputs outputs
                           :lock-time lock-time :witness nil)))))
 
@@ -179,46 +179,46 @@ inputs would otherwise have its 0x00 input-count misread as the segwit marker."
   "Field-content checks on one input map that Core enforces at parse time."
   (let ((sh (psbt-map-find map +psbt-in-sighash+)))
     (when (and sh (/= (length sh) 4))
-      (error "PSBT input sighash type must be 4 bytes")))
+      (serialization-error "PSBT input sighash type must be 4 bytes")))
   (let ((wu (psbt-map-find map +psbt-in-witness-utxo+)))
     (when wu
       (let ((br (make-byte-reader-from wu)))
         (br-read-tx-out br)
-        (unless (br-eof-p br) (error "PSBT witness_utxo has trailing data")))))
+        (unless (br-eof-p br) (serialization-error "PSBT witness_utxo has trailing data")))))
   (let ((nwu (psbt-map-find map +psbt-in-non-witness-utxo+)))
     (when nwu
       (let* ((br (make-byte-reader-from nwu))
              (prev (br-read-transaction br)))
         (unless (br-eof-p br)
-          (error "PSBT non_witness_utxo has trailing data"))
+          (serialization-error "PSBT non_witness_utxo has trailing data"))
         (unless (equalp (transaction-hash prev) (outpoint-hash (tx-in-previous-output tx-in)))
-          (error "PSBT non_witness_utxo does not match the input outpoint")))))
+          (serialization-error "PSBT non_witness_utxo does not match the input outpoint")))))
   (dolist (ps (psbt-map-collect map +psbt-in-partial-sig+))
     (unless (member (length (car ps)) '(33 65))
-      (error "PSBT partial signature has an invalid public key")))
+      (serialization-error "PSBT partial signature has an invalid public key")))
   (dolist (d (psbt-map-collect map +psbt-in-bip32+))
     (unless (member (length (car d)) '(33 65))
-      (error "PSBT input BIP32 derivation has an invalid public key"))))
+      (serialization-error "PSBT input BIP32 derivation has an invalid public key"))))
 
 (defun parse-psbt (bytes)
   "Parse a binary PSBT. Signals an error on any structural violation."
   (let ((br (make-byte-reader-from bytes)))
     (let ((magic (br-read-bytes br 5)))
       (unless (equalp magic *psbt-magic*)
-        (error "Invalid PSBT magic")))
+        (serialization-error "Invalid PSBT magic")))
     (let* ((global (%psbt-read-map br :global))
            (tx-bytes (psbt-map-find global +psbt-global-unsigned-tx+))
            (ver (psbt-map-find global +psbt-global-version+)))
       (unless tx-bytes
-        (error "PSBT is missing the global unsigned transaction"))
+        (serialization-error "PSBT is missing the global unsigned transaction"))
       (when (and ver (/= (length ver) 4))
-        (error "PSBT global version must be 4 bytes"))
+        (serialization-error "PSBT global version must be 4 bytes"))
       (let ((tx (%psbt-read-unsigned-tx tx-bytes)))
         ;; The global tx must be unsigned: empty scriptSigs (the legacy reader
         ;; above already rejects witness data).
         (loop for in across (transaction-inputs tx)
               do (when (plusp (length (tx-in-script-sig in)))
-                   (error "PSBT unsigned transaction must have empty scriptSigs")))
+                   (serialization-error "PSBT unsigned transaction must have empty scriptSigs")))
         (let* ((nin (length (transaction-inputs tx)))
                (nout (length (transaction-outputs tx)))
                (inputs (make-array nin))
@@ -226,7 +226,7 @@ inputs would otherwise have its 0x00 input-count misread as the segwit marker."
           (dotimes (i nin) (setf (aref inputs i) (%psbt-read-map br :input)))
           (dotimes (i nout) (setf (aref outputs i) (%psbt-read-map br :output)))
           (unless (br-eof-p br)
-            (error "Trailing data after PSBT"))
+            (serialization-error "Trailing data after PSBT"))
           (dotimes (i nin)
             (%psbt-validate-input (aref inputs i) (aref (transaction-inputs tx) i)))
           (make-psbt :tx tx :global global :inputs inputs :outputs outputs))))))

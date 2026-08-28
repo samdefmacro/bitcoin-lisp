@@ -68,7 +68,7 @@ MAKE-CHAIN-PARAMS, replacing an earlier definition of the same name."
   "The chain-params for NAME (:mainnet, :testnet3, :testnet4, :signet or
 :regtest); an error for an unknown chain."
   (or (find name *chain-params* :key #'chain-params-name)
-      (error "no chain parameters for ~S (known: ~{~S~^ ~})" name (chain-names))))
+      (config-error "no chain parameters for ~S (known: ~{~S~^ ~})" name (chain-names))))
 
 ;;;; The chains (kernel/chainparams.cpp: CMainParams, CTestNetParams,
 ;;;; CTestNet4Params, SigNetParams, CRegTestParams). Genesis nTime/nBits/nNonce

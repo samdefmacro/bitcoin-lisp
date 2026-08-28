@@ -46,7 +46,7 @@ its body verbatim under this. No IGNORABLE: a slot the body does not use is
 a style-warning, which is how the lists stay honest."
   (dolist (slot slots)
     (unless (member (symbol-name slot) +node-context-slots+ :test #'string=)
-      (error "with-node-context: ~S is not a node-context slot (one of ~{~A~^, ~})"
+      (internal-error "with-node-context: ~S is not a node-context slot (one of ~{~A~^, ~})"
              slot +node-context-slots+)))
   (let ((c (gensym "CTX")))
     `(let* ((,c ,context)

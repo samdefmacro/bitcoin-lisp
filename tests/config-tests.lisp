@@ -1984,3 +1984,22 @@ the apply inside start-node-from-args."
          (apply-pos (search "(apply-config-globals merged)" body)))
     (is (and set-pos apply-pos (< set-pos apply-pos))
         "start-node-from-args must set *network* before apply-config-globals")))
+
+
+(test condition-hierarchy-contract
+  "The bl.err classes and their signalling functions (P4.1): a module error
+is a BITCOIN-LISP-ERROR and a SIMPLE-ERROR, the message is the control string
+formatted with the arguments -- exactly what the bare ERROR call gave -- and
+the pre-existing conditions sit under the hierarchy."
+  (signals bl.err:bitcoin-lisp-error (bl.err:config-error "x"))
+  (signals bl.err:config-error (bl.err:config-error "x"))
+  (let ((e (handler-case (bl.err:config-error "Invalid port ~A" 5) (error (e) e))))
+    (is (typep e 'simple-error))
+    (is (string= "Invalid port 5" (princ-to-string e))))
+  (is-true (subtypep 'bl::config-parse-error 'bl.err:config-error))
+  (is-true (subtypep 'bl::cli-parse-error 'bl.err:config-error))
+  (is-true (subtypep 'bl.net::socks5-error 'bl.err:net-error))
+  (is-true (subtypep 'bl.rpc::rpc-error 'bl.err:bitcoin-lisp-error))
+  (is-true (subtypep 'bl.err:consensus-error 'bl.err:bitcoin-lisp-error))
+  (is (eq :bad-txns-vin-empty
+          (bl.err:error-reason (make-condition 'bl.err:consensus-error :reason :bad-txns-vin-empty)))))

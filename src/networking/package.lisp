@@ -7,7 +7,7 @@
 ;;;; definition in src/networking/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.networking
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    ;; Connection
    #:connection

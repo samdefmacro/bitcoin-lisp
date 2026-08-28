@@ -1,7 +1,7 @@
 (in-package #:cl-user)
 
 (defpackage #:bitcoin-lisp.rpc
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:local-nicknames (#:bt #:bordeaux-threads))
   (:export
    ;; Server control

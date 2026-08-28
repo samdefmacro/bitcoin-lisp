@@ -45,7 +45,7 @@ same name in place so a warm reload never duplicates a row."
         (setf *config-options* (append *config-options* (list option))))
     option))
 
-(define-condition option-definition-error (program-error)
+(define-condition option-definition-error (program-error bitcoin-lisp-error)
   ((name :initarg :name :reader option-definition-error-name)
    (detail :initarg :detail :reader option-definition-error-detail))
   (:report (lambda (c stream)

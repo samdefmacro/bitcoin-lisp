@@ -236,7 +236,7 @@ a node that does not use ZMQ."
                             (if h
                                 (let ((n (conf-parse-int h)))
                                   (when (minusp n)
-                                    (error "Invalid value for -zmqpub~Ahwm=~A" topic h))
+                                    (config-error "Invalid value for -zmqpub~Ahwm=~A" topic h))
                                   n)
                                 +default-zmq-sndhwm+))))))
 

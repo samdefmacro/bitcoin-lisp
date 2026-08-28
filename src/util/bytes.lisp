@@ -270,7 +270,7 @@ ahead of an overrun error."
   (let ((p (br-pos br)))
     (declare (type fixnum p))
     (when (> (+ p n) (length (br-data br)))
-      (error "br-read-bytes: read past end of buffer (pos ~D + ~D > ~D)"
+      (serialization-error "br-read-bytes: read past end of buffer (pos ~D + ~D > ~D)"
              p n (length (br-data br))))
     (let ((out (make-array n :element-type '(unsigned-byte 8))))
       (declare (type (simple-array (unsigned-byte 8) (*)) out))
@@ -292,20 +292,20 @@ bits."
              ((= first 253)
               (let ((v (br-read-u16-le br)))
                 (when (< v 253)
-                  (error "non-canonical ReadCompactSize"))
+                  (serialization-error "non-canonical ReadCompactSize"))
                 v))
              ((= first 254)
               (let ((v (br-read-u32-le br)))
                 (when (< v #x10000)
-                  (error "non-canonical ReadCompactSize"))
+                  (serialization-error "non-canonical ReadCompactSize"))
                 v))
              (t
               (let ((v (br-read-u64-le br)))
                 (when (< v #x100000000)
-                  (error "non-canonical ReadCompactSize"))
+                  (serialization-error "non-canonical ReadCompactSize"))
                 v)))))
     (when (and range-check (> value +max-compact-size+))
-      (error "ReadCompactSize: size too large (~D > ~D)"
+      (serialization-error "ReadCompactSize: size too large (~D > ~D)"
              value +max-compact-size+))
     value))
 

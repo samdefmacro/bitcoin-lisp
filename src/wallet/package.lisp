@@ -1,7 +1,7 @@
 (in-package #:cl-user)
 
 (defpackage #:bitcoin-lisp.wallet
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:local-nicknames (#:bt #:bordeaux-threads))
   (:documentation "The descriptor wallet (Core wallet/ and wallet/rpc/): stores,
 manager, encryption, transaction tracking, coin selection, spending, PSBT and

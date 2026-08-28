@@ -32,6 +32,7 @@
                  ;; bl.* nicknames on every package that exists by then.
                  ;; Each module's package lives next to its code.
                  (:file "util/package")
+                 (:file "util/conditions")
                  (:file "crypto/package")
                  (:file "serialization/package")
                  (:file "storage/package")

@@ -453,7 +453,7 @@ length shrank parsed happily and re-serialized shorter than its input."
   (with-byte-reader (stream payload)
     (let ((tx (br-read-transaction stream)))
       (unless (= (br-pos stream) (length payload))
-        (error "tx payload has ~D trailing byte(s)"
+        (serialization-error "tx payload has ~D trailing byte(s)"
                (- (length payload) (br-pos stream))))
       tx)))
 
@@ -466,7 +466,7 @@ looping/allocating for it -- is Bitcoin Core's misbehaving-peer posture for
 protocol vectors (inv, headers, addr, block txns)."
   (let ((count (br-read-compact-size br)))
     (when (> count max)
-      (error "~A count ~D exceeds maximum ~D" name count max))
+      (serialization-error "~A count ~D exceeds maximum ~D" name count max))
     count))
 
 (defconstant +max-inv-count+ 50000
@@ -767,7 +767,7 @@ Each entry is a list (net-addr timestamp)."
 (defun network-bip155-id (network)
   "BIP155 network id for the keyword NETWORK (Core GetBIP155Network)."
   (or (car (rassoc network *addrv2-net-keywords*))
-      (error "network-bip155-id: unknown network ~S" network)))
+      (internal-error "network-bip155-id: unknown network ~S" network)))
 
 ;;; Deserialization
 
@@ -802,12 +802,12 @@ address length, or any address longer than +max-addrv2-address-size+."
          (network-id (br-read-u8 stream))
          (addr-len (br-read-compact-size stream)))
     (when (> addr-len +max-addrv2-address-size+)
-      (error "addrv2 address too long: ~D > ~D" addr-len +max-addrv2-address-size+))
+      (serialization-error "addrv2 address too long: ~D > ~D" addr-len +max-addrv2-address-size+))
     (let ((expected-len (gethash network-id *addrv2-addr-sizes*)))
       ;; A recognized network with the wrong length is a stream failure in
       ;; Core (SetNetFromBIP155Network throws) — the entire message is bad.
       (when (and expected-len (/= addr-len expected-len))
-        (error "BIP155 network ~D address with length ~D (should be ~D)"
+        (serialization-error "BIP155 network ~D address with length ~D (should be ~D)"
                network-id addr-len expected-len))
       ;; Read address bytes + port regardless (to advance stream position)
       (let* ((addr-bytes (br-read-bytes stream addr-len))
@@ -864,7 +864,7 @@ TIMESTAMP is the uint32 last-seen time."
   (let ((ip (net-addr-ip addr)))
     (flet ((emit (bytes required-len)
              (unless (= (length bytes) required-len)
-               (error "write-net-addr-v2: network ~D address must be ~D bytes, got ~D"
+               (internal-error "write-net-addr-v2: network ~D address must be ~D bytes, got ~D"
                       network-id required-len (length bytes)))
              (bb-write-varint stream required-len)
              (bb-write-bytes stream bytes)))
@@ -879,7 +879,7 @@ TIMESTAMP is the uint32 last-seen time."
              (= network-id +addrv2-net-i2p+))
          (emit ip 32))
         (t
-         (error "write-net-addr-v2: unsupported network ID ~D" network-id)))))
+         (internal-error "write-net-addr-v2: unsupported network ID ~D" network-id)))))
   ;; Port (big-endian)
   (bb-write-u8 stream (ash (net-addr-port addr) -8))
   (bb-write-u8 stream (logand (net-addr-port addr) #xFF)))

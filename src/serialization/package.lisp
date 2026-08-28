@@ -7,7 +7,7 @@
 ;;;; definition in src/serialization/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.serialization
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   ;; The byte-buf / byte-reader live in bitcoin-lisp.bytes (src/util/bytes.lisp)
   ;; and are re-exported here, so every existing bl.ser:bb-*
   ;; / br-* reference keeps working.

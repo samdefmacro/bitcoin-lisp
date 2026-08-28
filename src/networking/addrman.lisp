@@ -797,7 +797,7 @@ were loaded, NIL otherwise."
                            ;; the next save rewrites the file as v4).
                            (net (when (>= version 4)
                                   (or (key-id-network (read-byte s))
-                                      (error "peers.dat: unknown network id"))))
+                                      (net-error "peers.dat: unknown network id"))))
                            (ip-len (if (>= version 4) (read-byte s) 16))
                            (ip (make-array ip-len :element-type '(unsigned-byte 8))))
                       (read-sequence ip s)

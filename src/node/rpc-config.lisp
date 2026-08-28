@@ -19,7 +19,7 @@ APPLY-CONFIG-GLOBALS."
       (when v
         (let ((perms (bl.rpc:parse-rpc-cookie-perms v)))
           (unless perms
-            (error "Invalid -rpccookieperms=~A (must be owner, group or all)" v))
+            (config-error "Invalid -rpccookieperms=~A (must be owner, group or all)" v))
           (setf bl.rpc:*rpc-cookie-perms* perms))))
     ;; -rpcthreads: cap on concurrent RPC handler threads (Core
     ;; DEFAULT_HTTP_THREADS = 16).
@@ -27,7 +27,7 @@ APPLY-CONFIG-GLOBALS."
       (when v
         (let ((n (conf-parse-int v)))
           (unless (and n (plusp n))
-            (error "Invalid value for -rpcthreads=~A (must be a positive integer)" v))
+            (config-error "Invalid value for -rpcthreads=~A (must be a positive integer)" v))
           (setf bl.rpc:*rpc-threads* n))))
     ;; -rpcservertimeout: seconds an idle RPC connection is held (Core
     ;; DEFAULT_HTTP_SERVER_TIMEOUT). 0 means no timeout, as in Core.
@@ -35,7 +35,7 @@ APPLY-CONFIG-GLOBALS."
       (when v
         (let ((n (conf-parse-int v)))
           (unless (and n (>= n 0))
-            (error "Invalid value for -rpcservertimeout=~A (must be a non-negative integer)" v))
+            (config-error "Invalid value for -rpcservertimeout=~A (must be a non-negative integer)" v))
           (setf bl.rpc:*rpc-server-timeout* (if (zerop n) nil n)))))
     ;; --- Wallet knobs over paths that already exist (track D's Wallet group).
     ;; Every one of these has a special with Core's name and default already;
@@ -51,14 +51,14 @@ APPLY-CONFIG-GLOBALS."
                     (when v
                       (let ((sats (conf-parse-money v)))
                         (unless sats
-                          (error "Invalid amount for -~A=~A" ,option v))
+                          (config-error "Invalid amount for -~A=~A" ,option v))
                         (setf ,place sats)))))
                (int-knob (option place &key (min 0))
                  `(let ((v (lk ,option)))
                     (when v
                       (let ((n (conf-parse-int v)))
                         (unless (and n (>= n ,min))
-                          (error "Invalid value for -~A=~A" ,option v))
+                          (config-error "Invalid value for -~A=~A" ,option v))
                         (setf ,place n)))))
                (bool-knob (option place)
                  `(let ((v (lk ,option)))

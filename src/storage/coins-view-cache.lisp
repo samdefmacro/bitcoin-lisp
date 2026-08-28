@@ -246,7 +246,7 @@ purely from cache state; see the file header for the caller contract."
            (type utxo-entry entry))
   (let ((existing (gethash key (cvc-entries cache))))
     (when (and existing (ce-entry existing) (not allow-overwrite))
-      (error "coins-view-cache-add: refusing to overwrite unspent coin"))
+      (internal-error "coins-view-cache-add: refusing to overwrite unspent coin"))
     (cond
       ;; Reuse the existing struct: mutate slots, fix the counts to
       ;; reflect the transition. Avoids an alloc on the hot path.

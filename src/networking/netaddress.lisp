@@ -918,11 +918,11 @@ would have exactly the eclipse exposure the operator was trying to close."
   (with-open-file (in path :element-type '(unsigned-byte 8)
                            :if-does-not-exist nil)
     (unless in
-      (error "Could not find asmap file ~A" path))
+      (config-error "Could not find asmap file ~A" path))
     (let* ((size (file-length in))
            (buf (make-array size :element-type '(unsigned-byte 8))))
       (when (zerop size)
-        (error "Could not parse asmap file ~A" path))
+        (config-error "Could not parse asmap file ~A" path))
       (read-sequence buf in)
       (setf *asmap* buf)
       ;; Core logs the OPEN here, inside the reader, with the path quoted and

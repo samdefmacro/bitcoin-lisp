@@ -7,7 +7,7 @@
 ;;;; definition in src/mining/ becomes API; keep %-prefixed names internal.
 
 (defpackage #:bitcoin-lisp.mining
-  (:use #:cl)
+  (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    #:assemble-block-template
    #:next-block-required-bits

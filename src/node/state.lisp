@@ -121,7 +121,7 @@ never clobbered utxo-set)."
   "Set the current chainstate's coins view — the former utxo-set slot."
   (let ((cs (node-current-chainstate node)))
     (unless cs
-      (error "Cannot set the node's utxo-set: no current chainstate exists"))
+      (internal-error "Cannot set the node's utxo-set: no current chainstate exists"))
     (setf (bl.store:chain-state-coins-view cs) view)))
 
 (defvar *node* nil

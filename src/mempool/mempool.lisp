@@ -533,11 +533,11 @@ graph must not be oversized."
   (let ((handle (mempool-entry-graph-handle entry)))
     (unless (%graph-closure-equal-p (txgraph-get-ancestors graph handle)
                                     handle (mempool-ancestors mempool txid))
-      (error "txgraph shadow divergence: ancestor sets differ for ~A"
+      (internal-error "txgraph shadow divergence: ancestor sets differ for ~A"
              (%short-txid txid)))
     (unless (%graph-closure-equal-p (txgraph-get-descendants graph handle)
                                     handle (mempool-descendants mempool txid))
-      (error "txgraph shadow divergence: descendant sets differ for ~A"
+      (internal-error "txgraph shadow divergence: descendant sets differ for ~A"
              (%short-txid txid)))
     (maphash (lambda (parent v)
                (declare (ignore v))
@@ -545,7 +545,7 @@ graph must not be oversized."
                  (unless (and pe (eq (tx-handle-cluster
                                       (mempool-entry-graph-handle pe))
                                      (tx-handle-cluster handle)))
-                   (error "txgraph shadow divergence: edge ~A -> ~A ~
+                   (internal-error "txgraph shadow divergence: edge ~A -> ~A ~
                            spans clusters"
                           (%short-txid parent) (%short-txid txid)))))
              (mempool-entry-parents entry))))
@@ -560,7 +560,7 @@ everything is deferred to the batch-end verify."
         (count (mempool-count mempool)))
     (unless (or *graph-verify-batch* (= (txgraph-tx-count graph) count))
       (if *txgraph-shadow-checks*
-          (error "txgraph shadow divergence: graph has ~D transactions, ~
+          (internal-error "txgraph shadow divergence: graph has ~D transactions, ~
                   mempool has ~D"
                  (txgraph-tx-count graph) count)
           (bl:log-warn
@@ -573,7 +573,7 @@ everything is deferred to the batch-end verify."
                    (unless (and handle
                                 (txgraph-exists-p graph handle)
                                 (equalp (tx-handle-data handle) txid))
-                     (error "txgraph shadow divergence: entry ~A has ~
+                     (internal-error "txgraph shadow divergence: entry ~A has ~
                              ~:[no~;a dead or mismatched~] graph handle"
                             (%short-txid txid) handle))))
                (mempool-entries mempool))

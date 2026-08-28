@@ -55,10 +55,10 @@ restart. Returns the number of UTXO entries written.
 Signals an error if the source is missing or load-utxo-set rejects
 it (CRC mismatch, version mismatch, truncated file)."
   (unless (probe-file (pathname dat-path))
-    (error "source file does not exist: ~A" dat-path))
+    (storage-error "source file does not exist: ~A" dat-path))
   (let ((utxo-set (make-utxo-set)))
     (unless (load-utxo-set utxo-set dat-path)
-      (error "failed to load source: ~A" dat-path))
+      (storage-error "failed to load source: ~A" dat-path))
     (let* ((total (hash-table-count (utxo-set-entries utxo-set)))
            (written 0)
            (in-batch 0)

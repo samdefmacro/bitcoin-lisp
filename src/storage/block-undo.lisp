@@ -101,19 +101,19 @@ would silently restore the wrong coins."
                  (let* ((prevout (bl.ser:tx-in-previous-output input))
                         (triple (pop remaining)))
                    (unless triple
-                     (error "undo data is short: transaction ~D has more inputs than the ~
+                     (storage-error "undo data is short: transaction ~D has more inputs than the ~
                              spent-utxo list accounts for" tx-index))
                    (destructuring-bind (txid index entry) triple
                      (unless (and (equalp txid
                                           (bl.ser:outpoint-hash prevout))
                                   (= index
                                      (bl.ser:outpoint-index prevout)))
-                       (error "undo data is misaligned at transaction ~D: the spent-utxo ~
+                       (storage-error "undo data is misaligned at transaction ~D: the spent-utxo ~
                                list does not match the block's inputs" tx-index))
                      (push entry coins))))
                (push (nreverse coins) result)))
     (when remaining
-      (error "undo data is long: ~D spent-utxo entries past the block's last input"
+      (storage-error "undo data is long: ~D spent-utxo entries past the block's last input"
              (length remaining)))
     (nreverse result)))
 
@@ -123,14 +123,14 @@ triples in apply order by reading the outpoints back out of BLOCK."
   (let ((txs (rest (bl.ser:bitcoin-block-transactions block)))
         (result '()))
     (unless (= (length txs) (length tx-undos))
-      (error "block and undo data inconsistent: ~D non-coinbase transactions, ~
+      (storage-error "block and undo data inconsistent: ~D non-coinbase transactions, ~
               ~D undo records" (length txs) (length tx-undos)))
     (loop for tx in txs
           for tx-undo in tx-undos
           for tx-index from 1
           do (let ((inputs (bl.ser:transaction-inputs tx)))
                (unless (= (length inputs) (length tx-undo))
-                 (error "transaction and undo data inconsistent at transaction ~D: ~
+                 (storage-error "transaction and undo data inconsistent at transaction ~D: ~
                          ~D inputs, ~D undo coins"
                         tx-index (length inputs) (length tx-undo)))
                (loop for entry in tx-undo

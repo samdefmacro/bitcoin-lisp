@@ -587,7 +587,7 @@ zero tail of the file currently being appended to looks like."
             ;; its whole block store was corrupt. Now that a fresh datadir gets
             ;; a key by default, this is the ordinary way an operator meets it.
             (when (and (not *blocks-xor*) (notevery #'zerop key))
-              (error "The blocksdir XOR-key can not be disabled when a random ~
+              (config-error "The blocksdir XOR-key can not be disabled when a random ~
 key was already stored! Stored key: '~A', stored path: '~A'."
                      (bl.crypto:bytes-to-hex key)
                      (namestring (merge-pathnames "xor.dat" blocks-dir))))

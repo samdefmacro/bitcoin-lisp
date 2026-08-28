@@ -51,7 +51,7 @@ otherwise (lists, booleans)."
   "(values slot-type read-form write-form default) for TYPE, with BR, BB and
 VALUE substituted for the template variables."
   (flet ((substitute-vars (form) (sublis `((br . ,br) (bb . ,bb) (value . ,value)) form))
-         (bad () (error "define-message: unknown field type ~S" type)))
+         (bad () (internal-error "define-message: unknown field type ~S" type)))
     (cond
       ((keywordp type)
        (destructuring-bind (slot-type read write)
@@ -136,16 +136,16 @@ reader binds the slots in order, so a :READ form may consult an earlier one."
            (loop for (slot type . opts) in fields
                  collect (destructuring-bind (&key (default nil default-p) (slot-type nil slot-type-p) read write) opts
                            (when (member slot (list br bb value))
-                             (error "define-message ~A: slot ~A collides with the codec variable"
+                             (internal-error "define-message ~A: slot ~A collides with the codec variable"
                                     name slot))
                            (when (and read write (not (eq type :custom)))
-                             (error "define-message ~A: field ~A overrides both :read and :write -- declare it :custom"
+                             (internal-error "define-message ~A: field ~A overrides both :read and :write -- declare it :custom"
                                     name slot))
                            (multiple-value-bind (derived-type read-form write-form derived-default)
                                (if (eq type :custom)
                                    (progn
                                      (unless (and read write slot-type-p)
-                                       (error "define-message ~A: a :custom field (~A) needs :read, :write and :slot-type"
+                                       (internal-error "define-message ~A: a :custom field (~A) needs :read, :write and :slot-type"
                                               name slot))
                                      (values t nil nil (%message-default-for slot-type)))
                                    (%message-codec-forms type br bb value))

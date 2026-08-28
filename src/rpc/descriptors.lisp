@@ -514,7 +514,7 @@ used only for DescriptorID stability across versions)."
 
 ;;; --- Key expression expansion ---
 
-(define-condition descriptor-derivation-error (error)
+(define-condition descriptor-derivation-error (bitcoin-lisp-error)
   ()
   (:documentation "Expansion needs private keys (hardened derivation from a
 public-only descriptor) or hit an invalid BIP32 child."))
@@ -1636,7 +1636,7 @@ Core's cache-corruption check."
                         (setf (descriptor-cache-parent cache expr-index) xpub
                               (descriptor-cache-parent diff expr-index) xpub))
                        ((not (%ext-key-equal-p existing xpub))
-                        (error "Attempted to overwrite a cached parent xpub with a different one")))))
+                        (internal-error "Attempted to overwrite a cached parent xpub with a different one")))))
              (descriptor-cache-parent-xpubs new-items))
     (maphash (lambda (expr-index inner)
                (maphash (lambda (der-index xpub)
@@ -1645,7 +1645,7 @@ Core's cache-corruption check."
                                    (setf (descriptor-cache-derived cache expr-index der-index) xpub
                                          (descriptor-cache-derived diff expr-index der-index) xpub))
                                   ((not (%ext-key-equal-p existing xpub))
-                                   (error "Attempted to overwrite a cached derived xpub with a different one")))))
+                                   (internal-error "Attempted to overwrite a cached derived xpub with a different one")))))
                         inner))
              (descriptor-cache-derived-xpubs new-items))
     (maphash (lambda (expr-index xpub)
@@ -1654,7 +1654,7 @@ Core's cache-corruption check."
                         (setf (descriptor-cache-last-hardened cache expr-index) xpub
                               (descriptor-cache-last-hardened diff expr-index) xpub))
                        ((not (%ext-key-equal-p existing xpub))
-                        (error "Attempted to overwrite a cached last hardened xpub with a different one")))))
+                        (internal-error "Attempted to overwrite a cached last hardened xpub with a different one")))))
              (descriptor-cache-last-hardened-xpubs new-items))
     diff))
 

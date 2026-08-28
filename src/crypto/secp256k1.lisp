@@ -181,7 +181,7 @@
                      *secp256k1-context*
                      out-ptr tag-ptr taglen msg-ptr msglen)))
             (unless (= rc 1)
-              (error "secp256k1_tagged_sha256 returned ~A" rc))))))
+              (crypto-error "secp256k1_tagged_sha256 returned ~A" rc))))))
     out))
 
 (defun cleanup-secp256k1 ()
@@ -265,20 +265,20 @@ CPubKey::Decompress (pubkey.h:196-210), used by DecompressScript for the
 (default) or 65 uncompressed. Errors if PRIVKEY is not a valid secret key."
   (ensure-secp256k1-loaded)
   (unless (= (length privkey) 32)
-    (error "private key must be 32 bytes"))
+    (crypto-error "private key must be 32 bytes"))
   (cffi:with-foreign-objects ((sk :uint8 32)
                               (pk :uint8 +secp256k1-pubkey-size+)
                               (out :uint8 65)
                               (outlen :size))
     (loop for i below 32 do (setf (cffi:mem-aref sk :uint8 i) (aref privkey i)))
     (unless (= 1 (secp256k1-ec-pubkey-create *secp256k1-context* pk sk))
-      (error "invalid private key"))
+      (crypto-error "invalid private key"))
     (let ((len (if compressed 33 65)))
       (setf (cffi:mem-ref outlen :size) len)
       (unless (= 1 (secp256k1-ec-pubkey-serialize
                     *secp256k1-context* out outlen pk
                     (if compressed +secp256k1-ec-compressed+ +secp256k1-ec-uncompressed+)))
-        (error "public key serialization failed"))
+        (crypto-error "public key serialization failed"))
       (let* ((n (cffi:mem-ref outlen :size))
              (result (make-array n :element-type '(unsigned-byte 8))))
         (loop for i below n do (setf (aref result i) (cffi:mem-aref out :uint8 i)))
@@ -317,8 +317,8 @@ integer), which Core does to shave a byte off every signature. Without this,
 signer test vectors, wallet spends, etc.). Returns the DER bytes; errors if
 PRIVKEY is invalid."
   (ensure-secp256k1-loaded)
-  (unless (= (length hash32) 32) (error "message hash must be 32 bytes"))
-  (unless (= (length privkey) 32) (error "private key must be 32 bytes"))
+  (unless (= (length hash32) 32) (crypto-error "message hash must be 32 bytes"))
+  (unless (= (length privkey) 32) (crypto-error "private key must be 32 bytes"))
   (cffi:with-foreign-objects ((sk :uint8 32)
                               (msg :uint8 32)
                               (sig :uint8 +secp256k1-signature-size+)
@@ -338,10 +338,10 @@ PRIVKEY is invalid."
         (unless (= 1 (secp256k1-ecdsa-sign
                       *secp256k1-context* sig msg sk (cffi:null-pointer)
                       (if (zerop counter) (cffi:null-pointer) extra)))
-          (error "ECDSA signing failed (invalid private key?)"))
+          (crypto-error "ECDSA signing failed (invalid private key?)"))
         (unless (= 1 (secp256k1-ecdsa-signature-serialize-compact
                       *secp256k1-context* compact sig))
-          (error "compact signature serialization failed"))
+          (crypto-error "compact signature serialization failed"))
         (when (< (cffi:mem-aref compact :uint8 0) #x80)
           (return))                     ; low-R found
         (incf counter)
@@ -352,7 +352,7 @@ PRIVKEY is invalid."
     (setf (cffi:mem-ref derlen :size) 72)
     (unless (= 1 (secp256k1-ecdsa-signature-serialize-der
                   *secp256k1-context* der derlen sig))
-      (error "DER signature serialization failed"))
+      (crypto-error "DER signature serialization failed"))
     (let* ((n (cffi:mem-ref derlen :size))
            (result (make-array n :element-type '(unsigned-byte 8))))
       (loop for i below n do (setf (aref result i) (cffi:mem-aref der :uint8 i)))
@@ -363,8 +363,8 @@ PRIVKEY is invalid."
 nonce). Returns (VALUES compact-64-byte-vector recid) — the form used by Bitcoin
 message signing (the caller prepends the 27+recid[+4] header byte)."
   (ensure-secp256k1-loaded)
-  (unless (= (length hash32) 32) (error "message hash must be 32 bytes"))
-  (unless (= (length privkey) 32) (error "private key must be 32 bytes"))
+  (unless (= (length hash32) 32) (crypto-error "message hash must be 32 bytes"))
+  (unless (= (length privkey) 32) (crypto-error "private key must be 32 bytes"))
   (cffi:with-foreign-objects ((sk :uint8 32)
                               (msg :uint8 32)
                               (rsig :uint8 65)
@@ -375,10 +375,10 @@ message signing (the caller prepends the 27+recid[+4] header byte)."
     (unless (= 1 (secp256k1-ecdsa-sign-recoverable
                   *secp256k1-context* rsig msg sk
                   (cffi:null-pointer) (cffi:null-pointer)))
-      (error "recoverable ECDSA signing failed"))
+      (crypto-error "recoverable ECDSA signing failed"))
     (unless (= 1 (secp256k1-ecdsa-recoverable-signature-serialize-compact
                   *secp256k1-context* out recid rsig))
-      (error "recoverable signature serialization failed"))
+      (crypto-error "recoverable signature serialization failed"))
     (let ((compact (make-array 64 :element-type '(unsigned-byte 8))))
       (loop for i below 64 do (setf (aref compact i) (cffi:mem-aref out :uint8 i)))
       (values compact (cffi:mem-ref recid :int)))))
@@ -740,13 +740,13 @@ for the verify call. ~10x reduction in CFFI overhead."
   "The 32-byte x-only (BIP340) public key for the 32-byte secret PRIVKEY. Errors
 if PRIVKEY is invalid."
   (ensure-secp256k1-loaded)
-  (unless (= (length privkey) 32) (error "private key must be 32 bytes"))
+  (unless (= (length privkey) 32) (crypto-error "private key must be 32 bytes"))
   (cffi:with-foreign-objects ((keypair :uint8 +secp256k1-keypair-size+)
                               (xonly :uint8 +secp256k1-xonly-pubkey-size+)
                               (out :uint8 32))
     (cffi:with-pointer-to-vector-data (sk-ptr privkey)
       (unless (= 1 (secp256k1-keypair-create *secp256k1-context* keypair sk-ptr))
-        (error "invalid private key")))
+        (crypto-error "invalid private key")))
     (secp256k1-keypair-xonly-pub *secp256k1-context* xonly (cffi:null-pointer) keypair)
     (secp256k1-xonly-pubkey-serialize *secp256k1-context* out xonly)
     (let ((result (make-array 32 :element-type '(unsigned-byte 8))))
@@ -759,21 +759,21 @@ PRIVKEY. AUX-RAND32, if given, is 32 bytes of auxiliary randomness (BIP340
 recommends fresh randomness; omitting it signs with all-zero aux, which is
 deterministic and matches the BIP340 test vectors). Errors if PRIVKEY is invalid."
   (ensure-secp256k1-loaded)
-  (unless (= (length privkey) 32) (error "private key must be 32 bytes"))
-  (unless (= (length hash32) 32) (error "message hash must be 32 bytes"))
+  (unless (= (length privkey) 32) (crypto-error "private key must be 32 bytes"))
+  (unless (= (length hash32) 32) (crypto-error "message hash must be 32 bytes"))
   (when (and aux-rand32 (/= (length aux-rand32) 32))
-    (error "aux randomness must be 32 bytes"))
+    (crypto-error "aux randomness must be 32 bytes"))
   (cffi:with-foreign-objects ((keypair :uint8 +secp256k1-keypair-size+)
                               (sig :uint8 64)
                               (aux :uint8 32))
     (cffi:with-pointer-to-vector-data (sk-ptr privkey)
       (unless (= 1 (secp256k1-keypair-create *secp256k1-context* keypair sk-ptr))
-        (error "invalid private key")))
+        (crypto-error "invalid private key")))
     (loop for i below 32
           do (setf (cffi:mem-aref aux :uint8 i) (if aux-rand32 (aref aux-rand32 i) 0)))
     (cffi:with-pointer-to-vector-data (msg-ptr hash32)
       (unless (= 1 (secp256k1-schnorrsig-sign32 *secp256k1-context* sig msg-ptr keypair aux))
-        (error "schnorr signing failed")))
+        (crypto-error "schnorr signing failed")))
     (let ((result (make-array 64 :element-type '(unsigned-byte 8))))
       (loop for i below 64 do (setf (aref result i) (cffi:mem-aref sig :uint8 i)))
       result)))
@@ -914,7 +914,7 @@ Old system libraries lack it; the v2 transport must fall back to v1 then."
 the function pointer, so it needs one dereference."
   (cffi:mem-ref
    (or (cffi:foreign-symbol-pointer "secp256k1_ellswift_xdh_hash_function_bip324")
-       (error "libsecp256k1 lacks the ellswift module"))
+       (crypto-error "libsecp256k1 lacks the ellswift module"))
    :pointer))
 
 (defun ellswift-create (seckey &optional auxrnd32)

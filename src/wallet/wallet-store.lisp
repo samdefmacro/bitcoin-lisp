@@ -175,7 +175,7 @@ chaincode(32) pubkey(33)."
   "Inverse of %ext-pubkey-encode. NETWORK supplies the xpub version prefix
  (the 74-byte form does not carry one)."
   (unless (= (length bytes) +bip32-extkey-size+)
-    (error "bad extended pubkey encoding: ~D bytes" (length bytes)))
+    (wallet-error "bad extended pubkey encoding: ~D bytes" (length bytes)))
   (flet ((be32 (offset)
            (loop with r = 0
                  for i from offset below (+ offset 4)

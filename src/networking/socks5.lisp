@@ -77,7 +77,7 @@ TorStreamIsolationCredentialsGenerator::Generate, netbase.cpp:761-767)."
 
 ;;; Errors
 
-(define-condition socks5-error (error)
+(define-condition socks5-error (net-error)
   ((phase :initarg :phase :reader socks5-error-phase
           :documentation "Handshake phase that failed: :greeting, :auth,
 :connect, or :bind-address.")

@@ -33,7 +33,7 @@ never find this process."
                                     :if-does-not-exist :create)
             (format out "~D~%" (sb-posix:getpid)))
         (error (e)
-          (error "Unable to create the PID file '~A': ~A" path e)))
+          (init-error "Unable to create the PID file '~A': ~A" path e)))
       (setf *pid-file-path* path)
       path)))
 
@@ -215,12 +215,12 @@ the file ignored would run the node on settings the operator cannot see in it."
       (bl:parse-settings-json
        (handler-case (alexandria:read-file-into-string path)
          (error (e)
-           (error "Settings file could not be read: ~A. Please check permissions." e)))
+           (init-error "Settings file could not be read: ~A. Please check permissions." e)))
        (namestring path))
     (when errors
-      (error "Settings file could not be read: ~{~A~^; ~}" errors))
+      (init-error "Settings file could not be read: ~{~A~^; ~}" errors))
     (let ((invalid (bl:validate-settings-values alist)))
-      (when invalid (error "~A" invalid)))
+      (when invalid (init-error "~A" invalid)))
     (dolist (name (bl:unknown-settings-keys alist))
       (defer-log :warn "Ignoring unknown rw_settings value ~A" name))
     alist))
@@ -248,7 +248,7 @@ so the two compose rather than clobbering each other."
         (rename-file tmp path)
         (bl.store::fsync-directory path))
     (error (e)
-      (error "Settings file could not be written: ~A" e))))
+      (init-error "Settings file could not be written: ~A" e))))
 
 (defvar *data-directory-lock-fd* nil
   "Open file descriptor holding the exclusive advisory lock on the data
@@ -276,7 +276,7 @@ process editing the files."
                                 (logior sb-posix:o-creat sb-posix:o-rdwr)
                                 #o644)
                (error (e)
-                 (error "Cannot create the lock file at ~A: ~A" path e)))))
+                 (init-error "Cannot create the lock file at ~A: ~A" path e)))))
     (when (minusp (cffi:foreign-funcall "flock" :int fd :int +flock-ex-nb+ :int))
       (ignore-errors (sb-posix:close fd))
       ;; Core's wording exactly (init.cpp:1165): "Cannot obtain a lock on
@@ -288,7 +288,7 @@ process editing the files."
                              directory
                              "bitcoin-lisp")))
         (log-error "~A" message)
-        (error "~A" message)))
+        (init-error "~A" message)))
     ;; Keep the descriptor open. UNWIND from here on must not close it.
     (setf *data-directory-lock-fd* fd)))
 (defun unlock-data-directory ()
