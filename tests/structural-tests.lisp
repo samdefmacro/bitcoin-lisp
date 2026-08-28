@@ -924,18 +924,16 @@ comments are blanked first, so a prefix quoted in a docstring (a user-agent
     (sort found #'string<)))
 
 (defparameter +layering-violation-baseline+
-  '(("src/config.lisp" . "bitcoin-lisp.mempool")
-    ("src/validation/block.lisp" . "bitcoin-lisp.mempool")
-    ("src/validation/packages.lisp" . "bitcoin-lisp.mempool")
-    ("src/validation/transaction.lisp" . "bitcoin-lisp.mempool"))
+  '()
   "(file . package) pairs where a file names a package whose module loads
-LATER, at the start of the cleanup. They compile because src/package.lisp
-defines every package up front, so the reader interns the symbol and the call
-resolves at run time -- which is exactly why nothing has ever flagged them.
-This is also the plan's \"which file reaches which package\" table (§4 P4):
-config.lisp loads early and still names the mempool (the proxy and
-reachability knobs it once named in networking moved below it with
-bitcoin-lisp/net); the option table that names the rest loads after them.")
+LATER. There were 15 at the start of the cleanup (config 7, coalton 4, zmq 1,
+validation -> mempool 3); they compiled because src/package.lisp defined
+every package up front, so the reader interned the symbol and the call
+resolved at run time -- which is exactly why nothing had ever flagged them.
+Each was resolved by moving code DOWN to its owner or by loading the named
+module first (the mempool before validation, as validation.cpp includes
+txmempool.h in Core). Empty since P4.2i; the positive control below proves
+the scanner still fires.")
 
 (defun %layering-violations ()
   (let ((order (%load-order)))
@@ -996,7 +994,11 @@ the measuring functions must measure a known shape correctly."
   (is (plusp (length (%toplevel-definitions))) "no definitions scanned")
   (is (plusp (length (%definitions-longer-than +longish-function-lines+)))
       "no long definitions found -- a sweep that finds nothing proves nothing")
-  (is (plusp (length (%layering-violations))) "no upward references found")
+  (is (equal '(("src/util/bytes.lisp" . "bitcoin-lisp.validation"))
+             (let ((*source-corpus* (list (cons "src/util/bytes.lisp"
+                                                (vector "(bl.val:check-block x)")))))
+               (%layering-violations)))
+      "positive control: a util file naming validation must be an upward reference")
   (is (equal '(("probe.lisp" . 1))
              (let ((*source-corpus* (list (cons "probe.lisp"
                                                 (vector "(defun f () (error \"x\"))")))))

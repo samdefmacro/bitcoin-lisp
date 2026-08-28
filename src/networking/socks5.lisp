@@ -26,7 +26,7 @@ puts each peer connection on its own circuit."
 
 (defvar *proxy* nil
   "The configured outbound SOCKS5 proxy (a PROXY struct), or NIL for direct
-connections. Set from -proxy by apply-config-globals (config.lisp); applies to
+connections. Set from -proxy by apply-config-globals (node/args.lisp); applies to
 ALL outbound P2P connections (Core init.cpp:1698-1762 sets it for every
 network). When set, make-tcp-connection dials the proxy and tunnels via
 SOCKS5, and discover-peers stops resolving DNS seeds locally.")
