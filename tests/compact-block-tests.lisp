@@ -420,7 +420,7 @@ the address and dropped the connection, permanently exiling our FASTEST honest
 block-relay peer. Core answers this shape with MaybeSendGetHeaders and an early
 return, before anything can be scored (net_processing.cpp:4571-4577); its
 BLOCK_MISSING_PREV punishment (:1938-1944) is unreachable via the compact path."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.41")
           (peer (%cbp-peer addr))
@@ -444,7 +444,7 @@ cmpctblock is pure noise. The early return, and the absence of punishment,
 still hold. Without this test the IBD gate is an unasserted clause: the
 unknown-parent test above pins *cached-is-ibd* to NIL and cannot distinguish a
 gated getheaders from an ungated one."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((bl.net::*cached-is-ibd* t)
           (addr "203.0.113.47")
           (peer (%cbp-peer addr))
@@ -478,7 +478,7 @@ bad, the full copy arrives on the BLOCK path where punishment is correct.
 Doubles as the anti-vacuity control for the unknown-parent test above: the
 parent guard must be narrow enough that a KNOWN parent still reaches
 reconstruction -- otherwise this test would see a getheaders here."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((bl.net::*cached-is-ibd* nil)
           (bl.net::*compact-block-success-count* 0)
           (bl.net::*compact-block-failure-count* 0)
@@ -510,7 +510,7 @@ which net_processing answers with Misbehaving (:4679-4683) -- no honest peer can
 produce it. Before this change our reconstruction reported it as :COLLISION,
 i.e. the same value as an innocent short-ID clash in our own mempool, so it got
 a polite full-block getdata instead."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.43")
           (peer (%cbp-peer addr))
@@ -533,7 +533,7 @@ a polite full-block getdata instead."
 fails validation is still a compact-block delivery (Core emplaces mapBlockSource
 with /*punish=*/false at net_processing.cpp:3516, and says so in the comment
 right above it), so it gets a full-block refetch, not a discouragement."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((addr "203.0.113.44")
           (peer (%cbp-peer addr))
           (block-hash (%cbp-hash #xB1))
@@ -566,7 +566,7 @@ getblocktxn we sent is structurally malformed -- Core's FillBlock returns
 READ_STATUS_INVALID for both too few and too many transactions
 (blockencodings.cpp:198-217) and Misbehaves (net_processing.cpp:3487-3491).
 Previously we treated it as a mere reconstruction miss and sent a getdata."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((addr "203.0.113.45")
           (peer (%cbp-peer addr))
           (block-hash (%cbp-hash #xB2))
@@ -601,7 +601,7 @@ the asymmetry the fix depends on: the full-block refetch that now replaces
 compact-block punishment still ends in punishment when the block is genuinely
 bad. This test passes both before and after the fix; it is a regression guard,
 not mutation evidence."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((addr "203.0.113.46")
           (peer (%cbp-peer addr))
           (state (bl.store:make-chain-state))
@@ -654,7 +654,7 @@ connection must cost ZERO BUILD-SHORTID-MAP passes. That pass SipHashes every
 mempool entry under a key derived from the attacker's own header+nonce, so it
 must happen only after the header is known good. The valid-header control at the
 end proves the counter is wired to something real (it goes to exactly 1)."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((bl.net::*cached-is-ibd* nil)
           (bl.net::*compact-block-success-count* 0)
           (bl.net::*compact-block-failure-count* 0)
@@ -708,7 +708,7 @@ end proves the counter is wired to something real (it goes to exactly 1)."
 fix that special-cased PoW would be a different bug. A timestamp at or below the
 median-time-past is Core's time-too-old (validation.cpp:4125): same arm, same
 unconditional Misbehaving. The header's PoW is mined, so nothing pre-empts it."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.50")
           (peer (%cbp-peer addr))
@@ -737,7 +737,7 @@ unconditional Misbehaving. The header's PoW is mined, so nothing pre-empts it."
   "GA8 W4. BLOCK_INVALID_PREV: a header building on a block we already rejected
 is Core's bad-prevblk (validation.cpp:4251-4255), the arm right beside
 BLOCK_INVALID_HEADER and equally exempt from the via_compact_block amnesty."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.51")
           (peer (%cbp-peer addr))
@@ -765,7 +765,7 @@ punish every header-level verdict. A timestamp too far ahead is BLOCK_TIME_FUTUR
 getdata would deliver the same block on the BLOCK path, where HANDLE-BLOCK
 punishes unconditionally, converting Core's no-op into an exile one message
 later."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.52")
           (peer (%cbp-peer addr))
@@ -797,7 +797,7 @@ invalid. Core exempts it whenever via_compact_block is true
 (net_processing.cpp:1926-1935), so no discouragement — and no refetch, since
 re-downloading a block we have already rejected is a self-inflicted DoS. Checked
 before the parent lookup, mirroring AcceptBlockHeader (validation.cpp:4229-4237)."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((bl.net::*cached-is-ibd* nil)
           (addr "203.0.113.53")
           (peer (%cbp-peer addr))
@@ -1071,7 +1071,7 @@ whatever the promotion code did."
 (:2207). Promotion used to run before accept-downloaded-block, so a peer that
 delivered a reconstructible-but-INVALID compact block bought an HB slot — and
 through the cap-of-3 eviction could demote an honest HB peer at will."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "g716-cb"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
@@ -1107,7 +1107,7 @@ accepts: the header survives, the nonce is the one we chose, the coinbase is
 prefilled at index 0 (a peer's mempool can never hold it) and every other
 transaction is represented by a short id. Short-id derivation itself is covered
 by the receive-side tests and the SipHash vectors."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "cb-msg"))
           (block (%g716-mine-on node (%p2sh-optrue-spk)))
           (txs (bl.ser:bitcoin-block-transactions block))
@@ -1144,7 +1144,7 @@ through and the peer waited out its whole block timeout. Now the same path and
 the same guards answer it, with Core's depth rule: within MAX_CMPCTBLOCK_DEPTH
 of the tip a cmpctblock, deeper the full witness block, because a peer asking
 for old blocks has no mempool that could reconstruct one (:2463-2476)."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "cb-getdata"))
           (cs (bl::node-chain-state node))
           (store (bl::node-block-store node))
@@ -1179,7 +1179,7 @@ for old blocks has no mempool that could reconstruct one (:2463-2476)."
   "The OTHER compact path — a reconstruction completed by blocktxn — carried the
 same defect and needs its own coverage: a dropped hunk there would disable the
 fix on half the compact traffic without failing the cmpctblock test."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "g716-btxn"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
@@ -1229,7 +1229,7 @@ plain full-block downloads at the tip) our HB set stayed empty where Core keeps
 three. Both live full-block entry points are exercised: handle-block (the
 generic dispatcher, reached from the header-sync drains) and
 dispatch-ibd-message's `block' branch (the block-download path)."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "g716-full"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
@@ -1323,7 +1323,7 @@ a message that costs the sender nothing. Asserted by counting the shortid-map
 builds, because \"nothing connected\" is ALSO true of the ungated path — the
 replay was already harmless to the chain and expensive to us, which is exactly
 why the hole survived this long."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "cb-replay-cost"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
@@ -1397,7 +1397,7 @@ the cap-of-3 eviction choose which honest HB peer we demote — destroying the
 property this whole change exists to establish. Each replay below carries its
 own control: the FIRST, genuinely-connecting delivery of the same block on the
 same path must promote."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "g716-replay"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
@@ -1473,7 +1473,7 @@ protocol.lisp), where Core runs no ConnectTip and therefore fires no valid
 BlockChecked and promotes nobody. Unlike the replay case this one is not
 addressable by any dedup guard — the block is genuinely new to us — so it pins
 the connection gate on its own."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "g716-side"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))

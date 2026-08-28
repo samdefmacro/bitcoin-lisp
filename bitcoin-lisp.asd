@@ -333,7 +333,9 @@ this same package."
                ;; cold battery loads no Swank.
                (:require "sb-introspect"))
   :components ((:module "tests"
-                :components ((:file "package")
+                :components ((:file "support/package")  ; the shared fixtures, before the package that :USEs them
+                             (:file "support/fixtures")
+                             (:file "package")
                              (:file "crypto-tests")
                              (:file "serialization-tests")
                              (:file "storage-tests")

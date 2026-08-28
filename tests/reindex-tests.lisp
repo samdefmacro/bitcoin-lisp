@@ -33,7 +33,7 @@ initialized so mining can connect blocks."
 (test reindex-chainstate-rebuilds-utxo-set
   "Mining builds a UTXO set; polluting the coins view then reindexing restores
 the exact set (same whole-set MuHash) and the same chain tip."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((tag (format nil "rbld~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
      (let ((bl::*node* node))
@@ -78,7 +78,7 @@ the exact set (same whole-set MuHash) and the same chain tip."
 (test reindex-chainstate-recovers-emptied-coins-view
   "Reindex rebuilds even from a fully-emptied coins view (disaster recovery:
 blocks + index intact, chainstate DB wiped)."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((tag (format nil "recov~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
      (let ((bl::*node* node))
@@ -101,7 +101,7 @@ blocks + index intact, chainstate DB wiped)."
   "A crash inside a replay flush's unsafe window (marker written at the
 replay height, coins batch not yet committed) is detected at load-state and
 recovered to exactly the height the coins DB last committed."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((tag (format nil "crashr~D" (get-internal-real-time))))
      (multiple-value-bind (node cspath) (%reindex-node-fixture tag)
        (let ((bl::*node* node))
@@ -147,7 +147,7 @@ recovered to exactly the height the coins DB last committed."
 (e.g. mid-wipe, when the coins DB holds arbitrary leftovers of the old set)
 recovers to a clean EMPTY set at genesis -- the leftovers are re-wiped, never
 loaded as live state."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((tag (format nil "crashw~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
      (let ((bl::*node* node))

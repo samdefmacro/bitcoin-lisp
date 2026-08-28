@@ -585,13 +585,6 @@ is dropped along with every clearnet literal."
 
 ;;; --- datadir layout and lifecycle (Core chainparamsbase.cpp, args.cpp:789) ---
 
-(defmacro %with-temp-datadir ((var) &body body)
-  `(let ((,var (ensure-directories-exist
-                (merge-pathnames (format nil "bl-datadir-~D/" (get-internal-real-time))
-                                 (uiop:temporary-directory)))))
-     (unwind-protect (progn ,@body)
-       (uiop:delete-directory-tree ,var :validate t :if-does-not-exist :ignore))))
-
 (defun %touch-chainstate (dir)
   (ensure-directories-exist dir)
   (with-open-file (s (merge-pathnames "chainstate.dat" dir)
@@ -605,7 +598,7 @@ is dropped along with every clearnet literal."
 testnet3 at the root — so pointing our node at a Core datadir with the default
 network wrote testnet3 data into Core's MAINNET directory, and pointing Core at
 ours found nothing and started a fresh sync. The other three already agreed."
-  (%with-temp-datadir (dir)
+  (with-temp-directory (dir)
     (is (equal dir (bl::network-data-path dir :mainnet)))
     (is (equal (merge-pathnames "testnet3/" dir)
                (bl::network-data-path dir :testnet3)))
@@ -621,7 +614,7 @@ ours found nothing and started a fresh sync. The other three already agreed."
 an EMPTY datadir to a node that has one — on mainnet that is a synced chain
 discarded and IBD restarted from genesis, measured in days. So a datadir that
 already holds a chainstate in the old layout keeps using it (and says so)."
-  (%with-temp-datadir (dir)
+  (with-temp-directory (dir)
     (%touch-chainstate (merge-pathnames "mainnet/" dir))
     (is (equal (merge-pathnames "mainnet/" dir)
                (bl::network-data-path dir :mainnet))
@@ -631,14 +624,14 @@ already holds a chainstate in the old layout keeps using it (and says so)."
   "The legacy check is for DATA, not for a directory: ensure-directories-exist
 creates empty ones freely, and treating an empty mainnet/ as legacy would pin
 every new node to the old layout forever."
-  (%with-temp-datadir (dir)
+  (with-temp-directory (dir)
     (ensure-directories-exist (merge-pathnames "mainnet/" dir))
     (is (equal dir (bl::network-data-path dir :mainnet)))))
 
 (test core-s-layout-wins-when-both-exist
   "If the node has already been moved, the Core-layout chainstate is the live
 one and the leftover legacy directory must not pull it back."
-  (%with-temp-datadir (dir)
+  (with-temp-directory (dir)
     (%touch-chainstate (merge-pathnames "mainnet/" dir))
     (%touch-chainstate dir)
     (is (equal dir (bl::network-data-path dir :mainnet)))))
@@ -652,7 +645,7 @@ is the default path, and creating it is the intended behaviour."
     (bl::%check-datadir-option '(("datadir" . "/nonexistent/bl-typo-xyz"))))
   ;; No -datadir at all: not an error.
   (finishes (bl::%check-datadir-option '()))
-  (%with-temp-datadir (dir)
+  (with-temp-directory (dir)
     (finishes (bl::%check-datadir-option
                (list (cons "datadir" (namestring dir)))))))
 

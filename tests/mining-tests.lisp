@@ -584,16 +584,9 @@ which is what stops a busy mempool from reassembling a block on every call."
 
 ;;;; Block construction + CPU mining + submitblock (regtest, disk-backed)
 
-(defmacro %with-regtest (&body body)
-  "Bind *network* and the active PoW limit to regtest for BODY."
-  `(let ((bl:*network* :regtest)
-         (bl.store:*pow-limit-target*
-           bl.store:+regtest-pow-limit-target+))
-     ,@body))
-
 (defun %regtest-node-fixture (suffix)
   "(values node) — a regtest node at genesis with disk-backed chain-state /
-block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
+block-store / utxo-set, ready for activate-block. Call inside (with-network (:regtest) ...)."
   (let* ((base (ensure-directories-exist
                 (merge-pathnames (format nil "test-regtest-mine-~A/" suffix)
                                  (uiop:temporary-directory))))
@@ -654,7 +647,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
                  "a pre-segwit block still fails the witness check")))))
 
 (test build-coinbase-transaction-shape
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((spk (%p2sh-optrue-spk))
           (commit (bl.mining:build-witness-commitment-script (%zeros 32)))
           (cb (bl.mining:build-coinbase-transaction
@@ -675,7 +668,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
   ;; Core node/miner.cpp:171,196: the template coinbase uses
   ;; nSequence = MAX_SEQUENCE_NONFINAL and nLockTime = height - 1, so the
   ;; coinbase commits to its height a second way (BIP54's coinbase rule).
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((cb (bl.mining:build-coinbase-transaction
                42 5000000000 :script-pubkey (%p2sh-optrue-spk)))
           (in0 (elt (bl.ser:transaction-inputs cb) 0)))
@@ -683,7 +676,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
      (is (= 41 (bl.ser:transaction-lock-time cb))))))
 
 (test mine-block-satisfies-pow
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%regtest-node-fixture "mine")))
      (let ((block (bl.mining:assemble-full-block
                    (bl::node-chain-state node)
@@ -696,7 +689,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
 (test submitblock-round-trip
   ;; Build + mine a regtest block at the genesis tip, serialize it, submit the
   ;; hex via the RPC — accepted (null), tip advances, resubmit → "duplicate".
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "submit"))
           (block (bl.mining:assemble-full-block
                   (bl::node-chain-state node)
@@ -718,7 +711,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
   ;; commitment but no witness gets the 32-zero nonce installed. A miner that
   ;; serializes the template's coinbase witnessless is therefore accepted;
   ;; before the fix we refused the block as bad-witness-nonce-size.
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "submit-nonce"))
           (block (bl.mining:assemble-full-block
                   (bl::node-chain-state node)
@@ -740,7 +733,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
   ;; the second is stored on a side chain and never connected, which Core's
   ;; submitblock_StateCatcher never sees → "inconclusive" (rpc/mining.cpp:
   ;; 1091-1095), not null and not a reject reason.
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "submit-side"))
           (cs (bl::node-chain-state node))
           (mp (bl::node-mempool node))
@@ -765,7 +758,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
   ;; when the entry has BLOCK_HAVE_DATA — AcceptBlock fAlreadyHave,
   ;; validation.cpp:4351); a known-invalid block returns "duplicate-invalid"
   ;; (AcceptBlockHeader, validation.cpp:4231-4235).
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "subhdrblk"))
           (cs (bl::node-chain-state node))
           (block (bl.mining:assemble-full-block
@@ -801,7 +794,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
   ;; bytes — Core reads the raw on-disk block (GetRawBlockChecked) — and the
   ;; verbosity argument follows Core ParseVerbosity: booleans allowed
   ;; (false→0, true→1), default 1, verbosity >= 2 gives tx details.
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "getblockv0"))
           (block (bl.mining:assemble-full-block
                   (bl::node-chain-state node)
@@ -866,7 +859,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
                  (cdr (assoc "data" (second txs) :test #'string=)))))))
 
 (test generatetoaddress-advances-chain
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "gen"))
           (addr (bl.crypto:encode-p2pkh-address
                  (make-array 20 :element-type '(unsigned-byte 8) :initial-element 3)
@@ -885,7 +878,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
 (test generatetodescriptor-advances-chain
   ;; Mine to a descriptor-derived coinbase script (raw(51) = OP_TRUE) and confirm
   ;; the chain advances, mirroring generatetoaddress.
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "gendesc"))
           (hashes (bl.rpc::rpc-generatetodescriptor node (list 2 "raw(51)"))))
      (is (= 2 (length hashes)))
@@ -905,7 +898,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
 (test submitheader-accepts-valid-rejects-orphan
   ;; A mined header whose parent is known validates and is added to the index;
   ;; a header with an unknown parent and malformed hex both error.
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "subhdr"))
           (block (bl.mining:assemble-full-block
                   (bl::node-chain-state node)
@@ -945,7 +938,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
 (test generateblock-empty-submit-advances-chain
   ;; generateblock with no extra txs mines an empty block to the descriptor
   ;; output and (submit=true) advances the chain.
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "genblk"))
           (r (bl.rpc::rpc-generateblock node (list "raw(51)" '()))))
      (is (stringp (cdr (assoc "hash" r :test #'string=))))
@@ -959,7 +952,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
 
 (test generateblock-no-submit-returns-hex-without-advancing
   ;; submit=false returns {hash, hex} and does NOT change the tip.
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "genblk-ns"))
           (h0 (bl.store:current-height (bl::node-chain-state node)))
           (r (bl.rpc::rpc-generateblock
@@ -983,7 +976,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
   ;; commitment is computed over it (submit=false). The block is dry-run
   ;; through TestBlockValidity before mining (Core rpc/mining.cpp:389-393),
   ;; so the tx must genuinely spend an existing UTXO; a bogus output errors.
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "genblk-tx"))
           (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
           (tx (%pkg-tx funding 0 99990000 :version 1))
@@ -1010,7 +1003,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
   ;; TestBlockValidity dry-run with an RPC verify error — even with
   ;; submit=false, unvalidated hex is never returned (Core generateblock
   ;; runs TestBlockValidity unconditionally, rpc/mining.cpp:389-393).
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "genblk-badtx"))
           (bogus (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
                                          :initial-element 66)
@@ -1090,7 +1083,7 @@ the class of bug TestBlockValidity exists to net) makes template assembly
 ERROR instead of handing miners a doomed block; both getblocktemplate and
 the generate* paths pass the UTXO set, so all live templates are dry-run
 (Core CreateNewBlock throws, node/miner.cpp:227-231)."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%regtest-node-fixture "tbv")))
      ;; Missing-input tx, injected directly (bypasses acceptance validation).
      (%mine-add (bl::node-mempool node)
@@ -1115,7 +1108,7 @@ the generate* paths pass the UTXO set, so all live templates are dry-run
   "TEST-BLOCK-VALIDITY passes a freshly assembled valid block (PoW not yet
 ground — check_pow=false) and reports inconclusive-not-best-prevblk for a
 block not extending the tip (Core validation.cpp:4506-4509)."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((node (%regtest-node-fixture "tbv-ok"))
           (cs (bl::node-chain-state node))
           (utxo (bl::node-utxo-set node))
@@ -1161,7 +1154,7 @@ implementing it — a node claiming a capability it does not have. mode=proposal
 is a VALIDATION request, not a request for work: it answers before any template
 is assembled (rpc/mining.cpp:729-751), and it does NOT check proof of work,
 because a proposal is by definition unmined."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%regtest-node-fixture (format nil "gbtp~D" (get-internal-real-time)))))
     (flet ((propose (data)
              (let ((req (make-hash-table :test 'equal)))

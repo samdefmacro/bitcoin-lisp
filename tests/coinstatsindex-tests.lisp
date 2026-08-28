@@ -18,7 +18,7 @@
   "Backfilling the index over a mined regtest chain yields a tip MuHash equal
 to the direct whole-UTXO-set MuHash, and tip tallies equal to the live UTXO
 set's txout count and total amount."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%regtest-node-fixture (format nil "csi~D" (get-internal-real-time)))))
      (let ((bl::*node* node))
        ;; Mine spendable coinbases, then a chain of blocks. Coinbase outputs on
@@ -58,7 +58,7 @@ set's txout count and total amount."
   "Each indexed height's record reflects that height's UTXO state: the txout
 count is monotonically non-decreasing across a coinbase-only chain, and each
 height's MuHash is retrievable and distinct from its predecessor."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%regtest-node-fixture (format nil "csih~D" (get-internal-real-time)))))
      (let ((bl::*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
@@ -88,7 +88,7 @@ height's MuHash is retrievable and distinct from its predecessor."
   "With the index enabled on a node, the connect-time hook advances it as
 blocks are mined, and gettxoutsetinfo <height> serves matching historical
 stats from the index (muhash equal to the direct whole-set muhash at the tip)."
-  (%with-regtest
+  (with-network (:regtest)
    (let* ((tag (format nil "csirpc~D" (get-internal-real-time)))
           (node (%regtest-node-fixture tag))
           (idxbase (merge-pathnames (format nil "test-csirpc-~A/" tag)
@@ -136,7 +136,7 @@ stats from the index (muhash equal to the direct whole-set muhash at the tip)."
 OP_RETURN output), the UTXO set contains NO unspendable outputs -- block
 application drops them, matching Core's AddCoin. The txout count reflects only
 the spendable coinbase reward outputs."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%regtest-node-fixture (format nil "unsp~D" (get-internal-real-time)))))
      (let ((bl::*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
@@ -200,7 +200,7 @@ the full MuHash numerator/denominator fraction."
 (defun %csi-fixture (tag blocks)
   "(values node csi cs tip) — a regtest node with BLOCKS mined blocks and a
 coinstats index built over them, installed on the node. Call inside
-%with-regtest."
+(with-network (:regtest) ...)."
   (let* ((node (%regtest-node-fixture tag))
          (idxbase (merge-pathnames (format nil "test-csi-rw-~A/" tag)
                                    (uiop:temporary-directory))))
@@ -279,7 +279,7 @@ rebuilt — not blessed in place with the active chain's hash written over the
 evidence. Here the abandoned branch's headers are still in the header index,
 so the fork point comes from the cheap ancestor walk (Core's pprev walk in
 BaseIndex::Rewind)."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (node csi cs tip)
        (%csi-fixture (format nil "csirw~D" (get-internal-real-time)) 6)
      (let* ((fork (- tip 2))
@@ -319,7 +319,7 @@ index — the realistic case, since headers are only persisted at flush time, so
 the crash that strands the marker also loses the branch it names. The rewind
 must still find the fork point, by recomputing each record from its stored
 parent and the active block at that height."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (node csi cs tip)
        (%csi-fixture (format nil "csirwu~D" (get-internal-real-time)) 6)
      (let* ((fork (- tip 2))
@@ -350,7 +350,7 @@ parent and the active block at that height."
 block — a fix that always rebuilt would be a severe performance regression
 (hours on a real chain). The same counter proves it can see work happening,
 by re-running against a divergent index."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (node csi cs tip)
        (%csi-fixture (format nil "csictl~D" (get-internal-real-time)) 5)
      (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
@@ -371,7 +371,7 @@ by re-running against a divergent index."
 the chainstate tip only at a flush, so after a kill the marker sits above the
 restored tip on the SAME chain. That must cost one verification and a marker
 move to the tip — not a rebuild from genesis."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (node csi cs tip)
        (%csi-fixture (format nil "csiahd~D" (get-internal-real-time)) 5)
      (let ((tip-record (%csi-raw-record csi tip)))
@@ -401,7 +401,7 @@ which also resolves STALE-BRANCH hashes — and the index holds active-chain
 statistics only. Asking by a stale-branch hash must error rather than serve the
 active chain's numbers under that hash. Control: the active-chain hash at the
 same height still works."
-  (%with-regtest
+  (with-network (:regtest)
    (multiple-value-bind (node csi cs tip)
        (%csi-fixture (format nil "csirpc2~D" (get-internal-real-time)) 4)
      (let* ((stale (%csi-fake-branch cs (1- tip) tip 150))

@@ -150,7 +150,7 @@ an unrelated script (almost surely) does not."
 
 ;;; --- Persistent index + RPCs (regtest integration) ---
 ;;;
-;;; Reuses the regtest fixture from mining-tests.lisp (%with-regtest,
+;;; Reuses the regtest fixture from mining-tests.lisp (with-network (:regtest),
 ;;; %regtest-node-fixture). Binding bl::*node* lets the connect-time
 ;;; hook (index-block-connected) fire as generatetodescriptor mines blocks.
 
@@ -199,7 +199,7 @@ nothing."
 (test blockfilterindex-connect-and-getblockfilter
   "Mining indexes each block; getblockfilter returns filter bytes that match a
 recomputation, and a filter header; unknown type / missing block error."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
      (let ((bl::*node* node))
        (let ((hashes (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)")))
@@ -231,7 +231,7 @@ recomputation, and a filter header; unknown type / missing block error."
 
 (test blockfilterindex-header-chain
   "Each block's stored filter header chains off its parent's (BIP157)."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
      (let ((bl::*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
@@ -252,7 +252,7 @@ recomputation, and a filter header; unknown type / missing block error."
 (test scanblocks-finds-and-misses
   "scanblocks returns blocks whose filter matches a descriptor; misses otherwise;
 filter_false_positives keeps the true matches; idle status is null."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
      (let ((bl::*node* node))
        (let ((hashes (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))))
@@ -287,7 +287,7 @@ BIP157, then continues 1..tip. On a pruned chain the genesis anchor is
 impossible (bodies gone) and the range still seeds at the first indexable
 block. Once seeded, a gap stops the backfill to keep the header chain
 contiguous."
-  (%with-regtest
+  (with-network (:regtest)
    ;; Mine 5 blocks on a node with NO filter index attached, so the connect
    ;; hook indexes nothing and the backfill does all the work.
    (let ((node (%regtest-node-fixture (format nil "bfb~D" (get-internal-real-time)))))
@@ -368,7 +368,7 @@ non-empty is refused with (values nil :noncontiguous) -- storing it would seed
 a second header chain over a gap and strand the gap behind an advanced best
 marker (observed live after a mid-backfill crash). An empty index still seeds
 from the zero header, and filling the gap in order is then accepted."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%regtest-node-fixture (format nil "bfc~D" (get-internal-real-time)))))
      (let ((bl::*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
@@ -403,7 +403,7 @@ from the zero header, and filling the gap in order is then accepted."
 
 (test getdescriptoractivity-receives
   "getdescriptoractivity reports a receive for a matching coinbase output."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
      (let ((bl::*node* node))
        (let* ((hashes (bl.rpc::rpc-generatetodescriptor node (list 2 "raw(51)")))
@@ -428,7 +428,7 @@ from the zero header, and filling the gap in order is then accepted."
   "BIP157 serving: %cf-request-stop-height enforces active-chain stop hash +
 range bounds; the cfilter/cfheaders/cfcheckpt builders and parsers round-trip
 against a real backfilled index. peer-block-filters gates %cf-serving-index."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
      (let ((bl::*node* node)
            (bl:*peer-block-filters* t))
@@ -550,7 +550,7 @@ entry) is detected by blockfilterindex-ensure-genesis-anchor and wiped so the
 backfill rebuilds it anchored at genesis; healthy and empty indexes are left
 alone; a pruned node's legacy index is kept (rebuild impossible) with a
 warning."
-  (%with-regtest
+  (with-network (:regtest)
    (let ((node (%regtest-node-fixture (format nil "bfm~D" (get-internal-real-time)))))
      (let ((bl::*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))

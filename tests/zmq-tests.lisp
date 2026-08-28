@@ -276,7 +276,7 @@ non-block inclusion reasons\")."
 
 (test zmq-connect-block-is-wired-to-the-publisher
   "connect-block must publish hashblock. Drives the real validation path."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "zmq-connect")
      (%with-zmq-hook-test (address "hashblock" sub)
@@ -303,7 +303,7 @@ BITCOIN-BLOCK-TRANSACTIONS -- a LIST (types.lisp:534) -- with LOOP ... ACROSS,
 so the first block published with hashtx enabled would have signalled a type
 error instead of notifying. The compiler said so on every clean build; nothing
 executed it."
-  (%with-mainnet-network
+  (with-network (:mainnet)
    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
        (%make-activate-block-fixture "zmq-blocktx")
      (%with-zmq-hook-test (address "hashtx" sub)

@@ -795,7 +795,7 @@ refuses at admission."
   (let* ((bl:*network* :regtest)
          ;; Bind the regtest PoW limit so #x207fffff is a valid target (else
          ;; derive-target rejects it as above the default limit and PoW never
-         ;; passes) -- mirrors the mining tests' %with-regtest.
+         ;; passes) -- mirrors (with-network (:regtest) ...).
          (bl.store:*pow-limit-target* bl.store:+regtest-pow-limit-target+)
          (state (bl.store:init-chain-state
                  (merge-pathnames "test-hdr-ctx/" (uiop:temporary-directory))))
@@ -852,14 +852,6 @@ refuses at admission."
 (defconstant +mtp-batch-genesis-time+ 1296688600
   "Timestamp of the synthetic genesis header the MTP-batch fixtures chain from.")
 
-(defmacro %with-mtp-regtest (&body body)
-  "Regtest network plus the regtest PoW limit, so #x207fffff is a valid target
-and ground headers reach the contextual checks."
-  `(let ((bl:*network* :regtest)
-         (bl.store:*pow-limit-target*
-           bl.store:+regtest-pow-limit-target+))
-     ,@body))
-
 (defun %mtp-batch-fixture (suffix)
   "(values chain-state genesis-hash) — a regtest chain-state whose genesis index
 entry carries a header timestamped +mtp-batch-genesis-time+."
@@ -903,7 +895,7 @@ pindexPrev->GetMedianTimePast()) was vacuously satisfied for every header after
 the first in a batch.
 Control: the same two headers delivered as SEPARATE batches — the second is
 rejected once its parent is indexed — proving the fixture really violates MTP."
-  (%with-mtp-regtest
+  (with-network (:regtest)
    (multiple-value-bind (state genesis-hash) (%mtp-batch-fixture "inbatch")
      (let* ((h1 (%mtp-header genesis-hash (+ +mtp-batch-genesis-time+ 1000)))
             (h1-hash (bl.ser:block-header-hash h1))
@@ -934,7 +926,7 @@ rejected once its parent is indexed — proving the fixture really violates MTP.
 (test validate-header-chain-accepts-valid-mtp-batch
   "No false positives: a batch whose every header is strictly after its parent's
 median-time-past is admitted whole."
-  (%with-mtp-regtest
+  (with-network (:regtest)
    (multiple-value-bind (state genesis-hash) (%mtp-batch-fixture "valid")
      (let* ((h1 (%mtp-header genesis-hash (+ +mtp-batch-genesis-time+ 1000)))
             (h2 (%mtp-header (bl.ser:block-header-hash h1)
@@ -952,7 +944,7 @@ contextual rule that consulted the index by hash. Proof-of-work, the future-time
 bound, difficulty and the softfork version minimums all consume the threaded
 parent entry and already reject a violating header at batch position 2, so none
 of them needed the same fix."
-  (%with-mtp-regtest
+  (with-network (:regtest)
    (multiple-value-bind (state genesis-hash) (%mtp-batch-fixture "position2")
      (let* ((h1 (%mtp-header genesis-hash (+ +mtp-batch-genesis-time+ 1000)))
             (h1-hash (bl.ser:block-header-hash h1))
