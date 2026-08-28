@@ -141,7 +141,7 @@ key order is height order)."
 
 (defun coinstatsindex-path (base-path)
   "Core's indexes/coinstatsindex/, falling back to the flat coinstatsindex/
-this tree used before — see storage/datadir.lisp."
+this tree used before — see kv/datadir.lisp."
   (datadir-index-path (pathname base-path) :coinstats))
 
 (defun init-coinstatsindex (base-path &key (enabled t))

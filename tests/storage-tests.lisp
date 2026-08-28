@@ -158,7 +158,7 @@ cannot be repeated as a refactor."
         "undo storage was routed through a path resolver again: ~S" form)))
 
 (test datadir-resolvers-have-callers
-  "Every resolver in storage/datadir.lisp must be REACHED by the node, not
+  "Every resolver in kv/datadir.lisp must be REACHED by the node, not
 merely defined. #461 shipped DATADIR-UNDO-PATH with no caller — the undo site
 still hardcoded \"undo/\" — so the resolver was dead code and the option it
 implements did nothing. That was found by starting a real node and reading its
@@ -305,14 +305,14 @@ discard every good block beside it. Core does the same, failing the single read
            (is-true (bl.store:get-block store bystander))
            ;; Scribble over the first record's framing header in place.
            (let* ((pos (gethash victim (bl.store::block-store-index store)))
-                  (path (bl.store::flat-file-name
+                  (path (bl.kv::flat-file-name
                          (bl.store::%blk-seq store) pos)))
-             (is-true (bl.store::flat-file-pos-p pos)
+             (is-true (bl.kv::flat-file-pos-p pos)
                       "the flat default did not put the block in a blk file")
              (with-open-file (s path :direction :io :element-type '(unsigned-byte 8)
                                      :if-exists :overwrite)
-               (file-position s (- (bl.store::flat-file-pos-pos pos)
-                                   bl.store::+storage-header-bytes+))
+               (file-position s (- (bl.kv::flat-file-pos-pos pos)
+                                   bl.kv::+storage-header-bytes+))
                (write-sequence (make-array 8 :element-type '(unsigned-byte 8)
                                              :initial-element #xff)
                                s))
@@ -2306,8 +2306,8 @@ directory. The helper must accept a plain file path and a bare name."
       (write-byte 1 o))
     (unwind-protect
          (progn
-           (finishes (bl.store::fsync-parent-directory (namestring path)))
-           (finishes (bl.store::fsync-parent-directory "bare-name.dat"))
-           (finishes (bl.store::fsync-directory
+           (finishes (bl.kv::fsync-parent-directory (namestring path)))
+           (finishes (bl.kv::fsync-parent-directory "bare-name.dat"))
+           (finishes (bl.kv::fsync-directory
                       (namestring (uiop:temporary-directory)))))
       (delete-file path))))

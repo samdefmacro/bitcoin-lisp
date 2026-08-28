@@ -1,4 +1,4 @@
-(in-package #:bitcoin-lisp.storage)
+(in-package #:bitcoin-lisp.kv)
 
 ;;;; Core's data-directory layout (doc/files.md)
 ;;;;

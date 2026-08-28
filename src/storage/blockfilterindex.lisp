@@ -43,7 +43,7 @@
 (defun blockfilterindex-path (base-path)
   "Directory holding the block filter index LevelDB. Core's
 indexes/blockfilter/basic/, falling back to the flat blockfilterindex/ this
-tree used before — see storage/datadir.lisp."
+tree used before — see kv/datadir.lisp."
   (datadir-index-path (pathname base-path) :blockfilter))
 
 (defun init-blockfilterindex (base-path &key (enabled t))

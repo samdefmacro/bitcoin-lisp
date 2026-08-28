@@ -1,4 +1,4 @@
-(in-package #:bitcoin-lisp.storage)
+(in-package #:bitcoin-lisp.kv)
 
 ;;; CFFI bindings for libleveldb's C API (leveldb/c.h).
 ;;;

@@ -1115,7 +1115,7 @@ constants. Each asserts the EFFECT, not the assignment."
            ;; -fastprune changes the ROLLOVER threshold, which is the whole
            ;; point: 64 KiB instead of 128 MiB (blockstorage.cpp:858).
            (is-true bl.store:*fast-prune*)
-           (is (= bl.store::+fast-prune-blockfile-size+
+           (is (= bl.kv::+fast-prune-blockfile-size+
                   (bl.store:max-blockfile-size 100)))
            ;; ...and Core raises it past a record that would not otherwise fit,
            ;; because a block that fits in NO file could never be written.
@@ -1127,7 +1127,7 @@ constants. Each asserts the EFFECT, not the assignment."
             bl.store:*fast-prune* (third saved)
             bl.store:*blocks-xor* (fourth saved))))
   ;; Default: the full 128 MiB rollover.
-  (is (= bl.store::+max-blockfile-size+
+  (is (= bl.kv::+max-blockfile-size+
          (bl.store:max-blockfile-size 100)))
   ;; Malformed values are refused.
   (dolist (bad '((("maxtipage" . "-1")) (("maxsigcachesize" . "0"))

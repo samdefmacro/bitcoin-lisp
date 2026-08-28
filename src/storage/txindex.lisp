@@ -85,7 +85,7 @@ distinct from the 33-byte transaction keys, so it can never collide.")
 
 (defun txindex-db-path (base-path)
   "Directory of the txindex LevelDB. Core's indexes/txindex/, falling back to
-the flat txindex/ this tree used before — see storage/datadir.lisp."
+the flat txindex/ this tree used before — see kv/datadir.lisp."
   (datadir-index-path (pathname base-path) :txindex))
 
 (defun %txindex-key (txid)

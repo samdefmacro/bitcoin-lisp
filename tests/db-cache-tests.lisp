@@ -55,7 +55,7 @@ cache a negative remainder."
           (is-true (every (lambda (p) (>= p 0)) parts)
                    "negative share at ~D MiB, ~D indexes, txindex ~A: ~S"
                    mib indexes tx parts)
-          (is (<= (reduce #'+ parts) (max total bl.store::+min-db-cache-bytes+))
+          (is (<= (reduce #'+ parts) (max total bl.kv::+min-db-cache-bytes+))
               "shares overspend the budget at ~D MiB, ~D indexes, txindex ~A"
               mib indexes tx)))))
   ;; Below the floor, Core clamps UP to MIN_DB_CACHE rather than dividing
@@ -77,7 +77,7 @@ every index reopen leaks a whole cache. LEVELDB-CLOSE owns both halves of that."
              (is-true db)
              ;; The resources were registered against this handle.
              (is-true (gethash (cffi:pointer-address db)
-                               bl.store::*leveldb-owned-resources*)
+                               bl.kv::*leveldb-owned-resources*)
                       "the cache and filter were not recorded for freeing")
              (bl.store:leveldb-put db
                                                (map '(vector (unsigned-byte 8)) #'char-code "k")
@@ -91,7 +91,7 @@ every index reopen leaks a whole cache. LEVELDB-CLOSE owns both halves of that."
                         db (map '(vector (unsigned-byte 8)) #'char-code "absent")))
              (bl.store:leveldb-close db)
              (is-false (gethash (cffi:pointer-address db)
-                                bl.store::*leveldb-owned-resources*)
+                                bl.kv::*leveldb-owned-resources*)
                        "closing left the cache registered, so it leaked")))
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                     :if-does-not-exist :ignore)))))
@@ -109,7 +109,7 @@ double free on the next handle that reused the address."
                       dir :cache-bytes 0 :bloom-bits 0)))
              (is-true db)
              (is-false (gethash (cffi:pointer-address db)
-                                bl.store::*leveldb-owned-resources*))
+                                bl.kv::*leveldb-owned-resources*))
              (bl.store:leveldb-close db)))
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                     :if-does-not-exist :ignore)))))
