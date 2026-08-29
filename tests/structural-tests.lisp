@@ -669,24 +669,13 @@ to make on purpose, so the set is pinned."
 (defparameter +long-function-baseline+
   ;; (name . lines), each with the Bitcoin Core counterpart it mirrors and
   ;; the verdict that came out of comparing the two (P6a, 2026-08-29).
-  '(;; SPLIT PENDING -- Core has a named boundary here that we fused.
-    ;; PERFORM-REORG needs a state object FIRST, the way Core carries one:
-    ;; its three phases share eight accumulators plus a rollback path, and
-    ;; MemPoolAccept can only be divided because a 13-field Workspace struct
-    ;; travels through it. That is a design change, not the "pure move +
-    ;; extract" the plan rated medium risk, so it wants its own PR and its
-    ;; own review.
-    ;;
-    ;; VALIDATE-TRANSACTION-FOR-MEMPOOL is here for a different reason, and
+  '(;; VALIDATE-TRANSACTION-FOR-MEMPOOL is here for a different reason than the
+    ;; entries below, and
     ;; P6c corrected the earlier note that called it a three-phase fusion:
     ;; the script passes were already delegated to
     ;; VALIDATE-TRANSACTION-SCRIPTS and now carry Core's own names, so what
     ;; remains is PreChecks alone -- 330 lines against Core's 198. Closing
     ;; that gap means shortening OUR PreChecks, not extracting a phase.
-    ("perform-reorg" . 465)                      ; validation/block.lisp
-                                                 ; Core DisconnectTip 64 +
-                                                 ; ConnectTip 104 +
-                                                 ; ActivateBestChainStep 84
     ("validate-transaction-for-mempool" . 330)   ; validation/transaction.lisp
                                                  ; Core PreChecks 198.
                                                  ; NOT a three-phase fusion:
@@ -740,24 +729,27 @@ here too instead of a keyword flag.
 The line count is pinned too, so an entry may shrink but not grow.
 See docs/refactoring-plan-2026-08-27.md 6b.")
 
-(defparameter +longish-function-ceiling+ 64
+(defparameter +longish-function-ceiling+ 66
   "How many definitions may exceed +LONGISH-FUNCTION-LINES+ lines. Lower it
 when the count drops; the test says so. Raised 61 -> 63 by P3.2, which turned
 the 1,227-line start-node into named init steps: three of them are 100-170
 lines (start-node's own docstring and lambda list, %init-load-chain, and the
 sync thread's %sync-idle-tick after P3.2b).
 
-Raised 63 -> 64 by P6a, and the arithmetic there is worth stating because it
-recurs for every remaining split: VALIDATE-BLOCK was 307 lines and became
+Raised 63 -> 64 by P6a and 64 -> 66 by P6d, and the arithmetic is worth
+stating because it recurs for every split of this kind: VALIDATE-BLOCK was 307 lines and became
 %CHECK-BLOCK (107) plus %CONTEXTUAL-CHECK-BLOCK (191), so one entry over the
 LONG threshold became two over the LONGISH one. Splitting a function along
 Core's boundaries lowers the >200 count and RAISES this one whenever both
 halves are still substantial -- and Core's own halves are: PreChecks is 198
 lines, ConnectTip 104, ActivateBestChain 167, ConnectBlock 379,
-CreateTransactionInternal 376. Driving this number to the plan's target of 15
-would mean cutting well below Core's own decomposition, which costs the
-file-by-file comparison that is this project's main verification method. See
-docs/refactoring-plan-2026-08-27.md 6b.")
+CreateTransactionInternal 376. P6d repeated it at a larger scale: PERFORM-REORG was 469 lines
+and became %REORG-DISCONNECT (92), %REORG-CONNECT (118) and %REORG-COMMIT
+(114), so one LONG entry became three LONGISH ones. Driving this number to
+the plan's target of 15 would mean cutting well below Core's own
+decomposition, which costs the file-by-file comparison that is this
+project's main verification method. See docs/refactoring-plan-2026-08-27.md
+6b.")
 
 (defun %definitions-longer-than (lines)
   (sort (remove-if-not (lambda (d) (> (%def-length d) lines)) (%toplevel-definitions))
