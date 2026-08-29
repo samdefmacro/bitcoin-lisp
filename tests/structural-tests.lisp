@@ -669,21 +669,37 @@ to make on purpose, so the set is pinned."
 (defparameter +long-function-baseline+
   ;; (name . lines), each with the Bitcoin Core counterpart it mirrors and
   ;; the verdict that came out of comparing the two (P6a, 2026-08-29).
-  '(;; SPLIT PENDING -- Core has named boundaries here that we fused, so
-    ;; these are real targets. Both need a state object FIRST, the way Core
-    ;; carries one: MemPoolAccept threads a 13-field Workspace through
-    ;; PreChecks/PolicyScriptChecks/ConsensusScriptChecks, and our reorg
-    ;; phases share eight accumulators plus a rollback path. That is a
-    ;; design change, not the "pure move + extract" the plan rated medium
-    ;; risk, so each wants its own PR and its own review.
+  '(;; SPLIT PENDING -- Core has a named boundary here that we fused.
+    ;; PERFORM-REORG needs a state object FIRST, the way Core carries one:
+    ;; its three phases share eight accumulators plus a rollback path, and
+    ;; MemPoolAccept can only be divided because a 13-field Workspace struct
+    ;; travels through it. That is a design change, not the "pure move +
+    ;; extract" the plan rated medium risk, so it wants its own PR and its
+    ;; own review.
+    ;;
+    ;; VALIDATE-TRANSACTION-FOR-MEMPOOL is here for a different reason, and
+    ;; P6c corrected the earlier note that called it a three-phase fusion:
+    ;; the script passes were already delegated to
+    ;; VALIDATE-TRANSACTION-SCRIPTS and now carry Core's own names, so what
+    ;; remains is PreChecks alone -- 330 lines against Core's 198. Closing
+    ;; that gap means shortening OUR PreChecks, not extracting a phase.
     ("perform-reorg" . 465)                      ; validation/block.lisp
                                                  ; Core DisconnectTip 64 +
                                                  ; ConnectTip 104 +
                                                  ; ActivateBestChainStep 84
-    ("validate-transaction-for-mempool" . 358)   ; validation/transaction.lisp
-                                                 ; Core PreChecks 198 +
-                                                 ; PolicyScriptChecks 22 +
-                                                 ; ConsensusScriptChecks 32
+    ("validate-transaction-for-mempool" . 330)   ; validation/transaction.lisp
+                                                 ; Core PreChecks 198.
+                                                 ; NOT a three-phase fusion:
+                                                 ; the script passes were
+                                                 ; already delegated, and P6c
+                                                 ; gave them Core's names
+                                                 ; (%policy-script-checks 20,
+                                                 ; %consensus-script-checks 29).
+                                                 ; What is left IS PreChecks,
+                                                 ; at 1.7x Core's -- the excess
+                                                 ; is our package-coins path,
+                                                 ; sibling eviction and the
+                                                 ; documented divergences.
 
     ;; EXCEPTIONS -- Core's counterpart is a SINGLE function that is itself
     ;; this long or longer. Splitting these would diverge from Core and cost
