@@ -943,6 +943,55 @@ rather than by a client: see TX-REJECT-REASONS-COVER-EVERY-KEYWORD."
   (or (cdr (assoc reason *tx-reject-reasons*))
       (string-downcase (symbol-name reason))))
 
+(defun %policy-script-checks (tx utxo-set extra-coins)
+  "Core MemPoolAccept::PolicyScriptChecks (validation.cpp:1132-1153).
+Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
+  ;; Script pass 1 — PolicyScriptChecks (Core MemPoolAccept::
+  ;; PolicyScriptChecks, validation.cpp:1132-1153): run the input
+  ;; scripts under the full STANDARD flag set (a constant in Core,
+  ;; policy/policy.h:118). A failure is a POLICY rejection
+  ;; (TX_NOT_STANDARD), reject reason "mempool-script-verify-flag-
+  ;; failed (...)" (CheckInputScripts, validation.cpp:2117), which
+  ;; the P2P reject cache keys by wtxid only — never misbehavior.
+  (multiple-value-bind (scripts-valid failed-input)
+      (validate-transaction-scripts tx utxo-set
+                                    :flags +standard-script-verify-flags+
+                                    :extra-coins extra-coins)
+    (declare (ignore failed-input))
+    (unless scripts-valid
+      (return-from %policy-script-checks
+        (values nil :mempool-script-verify-flag-failed))))
+  (values t nil))
+
+(defun %consensus-script-checks (tx utxo-set current-height extra-coins)
+  "Core MemPoolAccept::ConsensusScriptChecks (validation.cpp:1155-1185).
+Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
+  ;; Script pass 2 — ConsensusScriptChecks (Core MemPoolAccept::
+  ;; ConsensusScriptChecks -> CheckInputsFromMempoolAndCache,
+  ;; validation.cpp:1155-1185): re-run against the CURRENT TIP's
+  ;; consensus flags. Its purposes are (a) never admit a tx that
+  ;; standard flags pass but tip consensus flags reject (a
+  ;; standardness-bug backstop — Core cites STRICTENC once wrongly
+  ;; passing invalid CHECKSIG NOT scripts), and (b) warm the
+  ;; validation cache under the flags block connection will use:
+  ;; our sig-cache keys include the flag string, so this pass's
+  ;; verifies are the ones block connect hits. Standard-pass/
+  ;; consensus-fail is a should-never-happen internal error in Core
+  ;; ("BUG! ... CheckInputScripts failed against latest-block but
+  ;; not STANDARD flags"); we log the same and reject.
+  (multiple-value-bind (scripts-valid failed-input)
+      (validate-transaction-scripts tx utxo-set :height current-height
+                                    :extra-coins extra-coins)
+    (unless scripts-valid
+      (bl:log-error
+       "BUG! PLEASE REPORT THIS! input scripts failed against latest-block but not STANDARD flags: txid=~A input=~A"
+       (bl.crypto:bytes-to-hex
+        (bl.ser:transaction-hash tx))
+       failed-input)
+      (return-from %consensus-script-checks
+        (values nil :block-script-verify-flag-failed))))
+  (values t nil))
+
 (defun validate-transaction-for-mempool (tx utxo-set mempool current-height
                                          &key package-coins skip-fee-check chain-state
                                               bypass-limits skip-rbf-check
@@ -1256,46 +1305,18 @@ decide (Core PreChecks, validation.cpp:950-970)."
             (return-from validate-transaction-for-mempool
               (values nil :witness-stripped nil)))
 
-          ;; Script pass 1 — PolicyScriptChecks (Core MemPoolAccept::
-          ;; PolicyScriptChecks, validation.cpp:1132-1153): run the input
-          ;; scripts under the full STANDARD flag set (a constant in Core,
-          ;; policy/policy.h:118). A failure is a POLICY rejection
-          ;; (TX_NOT_STANDARD), reject reason "mempool-script-verify-flag-
-          ;; failed (...)" (CheckInputScripts, validation.cpp:2117), which
-          ;; the P2P reject cache keys by wtxid only — never misbehavior.
-          (multiple-value-bind (scripts-valid failed-input)
-              (validate-transaction-scripts tx utxo-set
-                                            :flags +standard-script-verify-flags+
-                                            :extra-coins extra-coins)
-            (declare (ignore failed-input))
-            (unless scripts-valid
-              (return-from validate-transaction-for-mempool
-                (values nil :mempool-script-verify-flag-failed nil))))
+          ;; The two script passes, Core's names (defined above this
+          ;; function): STANDARD flags first, then the tip's consensus
+          ;; flags to warm the cache block connection will hit.
+          (multiple-value-bind (ok error)
+              (%policy-script-checks tx utxo-set extra-coins)
+            (unless ok
+              (return-from validate-transaction-for-mempool (values nil error nil))))
+          (multiple-value-bind (ok error)
+              (%consensus-script-checks tx utxo-set current-height extra-coins)
+            (unless ok
+              (return-from validate-transaction-for-mempool (values nil error nil))))
 
-          ;; Script pass 2 — ConsensusScriptChecks (Core MemPoolAccept::
-          ;; ConsensusScriptChecks -> CheckInputsFromMempoolAndCache,
-          ;; validation.cpp:1155-1185): re-run against the CURRENT TIP's
-          ;; consensus flags. Its purposes are (a) never admit a tx that
-          ;; standard flags pass but tip consensus flags reject (a
-          ;; standardness-bug backstop — Core cites STRICTENC once wrongly
-          ;; passing invalid CHECKSIG NOT scripts), and (b) warm the
-          ;; validation cache under the flags block connection will use:
-          ;; our sig-cache keys include the flag string, so this pass's
-          ;; verifies are the ones block connect hits. Standard-pass/
-          ;; consensus-fail is a should-never-happen internal error in Core
-          ;; ("BUG! ... CheckInputScripts failed against latest-block but
-          ;; not STANDARD flags"); we log the same and reject.
-          (multiple-value-bind (scripts-valid failed-input)
-              (validate-transaction-scripts tx utxo-set :height current-height
-                                            :extra-coins extra-coins)
-            (unless scripts-valid
-              (bl:log-error
-               "BUG! PLEASE REPORT THIS! input scripts failed against latest-block but not STANDARD flags: txid=~A input=~A"
-               (bl.crypto:bytes-to-hex
-                (bl.ser:transaction-hash tx))
-               failed-input)
-              (return-from validate-transaction-for-mempool
-                (values nil :block-script-verify-flag-failed nil))))
 
           (values t nil fee-value
                   (when replaced-set
