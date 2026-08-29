@@ -3060,6 +3060,357 @@ includes ENTRY itself."
 ;;;; flag without moving the tip would merely relocate the inconsistency from disk
 ;;;; into memory, where no startup check ever looks.
 
+(defstruct (reorg (:constructor %make-reorg))
+  "The state a reorg's three phases share (Core ActivateBestChainStep plus
+its DisconnectedBlockTransactions pool). PHASE A disconnects and fills the
+pool, PHASE B connects the fork and may roll back, PHASE C commits the side
+effects for whatever actually moved -- so these live longer than any one
+phase, which is why the phases could not simply be extracted before.
+
+TO-DISCONNECT / TO-CONNECT are tip-first (collect-chain-entries order).
+DISCONNECTED-BLOCK-TXS holds (TXS . BYTES) per disconnected block,
+oldest-block-first, bounded by +MAX-DISCONNECTED-TX-POOL-BYTES+;
+DISCONNECTED-BLOCKS the (BLOCK . HEIGHT) pairs for the PHASE C wallet and
+ZMQ notifications, same order. CONNECTED is (ENTRY BLOCK HEIGHT
+SPENT-UTXOS) newest-first, both the rollback list and the PHASE C index
+feed. STOP-ENTRY is the PHASE A entry the disconnect stopped BEFORE -- the
+block the coins are left at, and therefore where the tip must land -- and
+INTERRUPTED covers both phases, turning the return into
+(VALUES NIL :INTERRUPTED)."
+  to-disconnect
+  to-connect
+  (disconnected-block-txs '())
+  (disconnected-bytes 0)
+  (disconnected-dropped 0)
+  (disconnected-blocks '())
+  (connected '())
+  stop-entry
+  interrupted)
+
+(defun %reorg-disconnect (r chain-state block-store utxo-set mempool fork-entry)
+  "PHASE A of a reorg: Core ActivateBestChainStep's disconnect half, one
+DisconnectTip (validation.cpp:2966) per old-chain block, tip-to-fork,
+then land the in-memory tip where the coins actually stopped.
+
+Touches the UTXO set and R only -- every observable side effect is
+deferred to %REORG-COMMIT so a rolled-back reorg leaves nothing behind."
+  ;; PHASE A — disconnect the old chain (UTXO only), tip-to-fork.
+  ;; collect-chain-entries returns tip-first; iterate as-is. Order
+  ;; matters across blocks: if A (lower) creates output O and B
+  ;; (higher) spends O, disconnecting A first leaves O re-added by
+  ;; B's undo data — see coin-view-disconnect-block for the analogous
+  ;; within-block case. Side effects (txindex / mempool re-add /
+  ;; recent-rejects) are deferred to PHASE C so a rolled-back reorg
+  ;; leaves them untouched.
+  (dolist (entry (reorg-to-disconnect r))
+    ;; Cooperative stop (see the phase-3b section comment above). At the TOP
+    ;; of this iteration the coins are exactly ENTRY's state, so the tip
+    ;; update below lands on ENTRY instead of the fork point, and nothing
+    ;; needs undoing.
+    (when (bl:interrupt-requested-p)
+      (setf (reorg-stop-entry r) entry
+            (reorg-interrupted r) t)
+      (return))
+    (let* ((block-hash (bl.store:block-index-entry-hash entry))
+           (block (bl.store:get-block block-store block-hash)))
+      (when block
+        (let ((undo (get-undo-data block-hash)))
+          (bl.store:disconnect-block-from-utxo-set
+           utxo-set block (or undo '())
+           :height (bl.store:block-index-entry-height entry)))
+        ;; Core flushes IF_NEEDED at the end of DisconnectTip
+        ;; (validation.cpp:2966). Safe HERE and not a line earlier:
+        ;; disconnect-block-from-utxo-set sets the coins-view best-block
+        ;; as its last act, so the pointer already names the block whose
+        ;; coins are in the cache. Flushing between the two would persist
+        ;; a cache and a pointer that disagree.
+        (bl:maybe-critical-flush chain-state)
+        ;; Collect this block's non-coinbase txs (original order) for the
+        ;; PHASE C mempool re-add. Pushing whole per-block lists during
+        ;; the tip-first loop leaves disconnected-block-txs oldest-first.
+        ;; Bound the pool at Core's MAX_DISCONNECTED_TX_POOL_BYTES
+        ;; (20MB, kernel/disconnected_transactions.h:18). Unbounded, a
+        ;; deep reorg over full blocks pins hundreds of MB right in the
+        ;; middle of chainstate surgery — and this node has lived
+        ;; through multi-hundred-block testnet4 reorgs.
+        ;;
+        ;; Direction matters: Core trims the MOST-RECENTLY-CONFIRMED
+        ;; entries (LimitMemoryUsage pops the front, which holds the
+        ;; blocks nearest the old tip) and re-adds from the oldest end,
+        ;; so survivors are always PARENTS. Dropping the oldest instead
+        ;; would strand children with missing inputs — they would fail
+        ;; re-validation anyway, and we would have thrown away the
+        ;; entries most likely to still be valid. Our list is
+        ;; oldest-block-first with the tip block at the TAIL, so
+        ;; "trim newest" means dropping from the tail.
+        (when mempool
+          (let* ((txs (rest (bl.ser:bitcoin-block-transactions block)))
+                 ;; Serialized size stands in for Core's
+                 ;; RecursiveDynamicUsage: same order of magnitude and
+                 ;; monotone in the same thing, without walking every
+                 ;; input/output allocation.
+                 (bytes (let ((n 0))
+                          (dolist (tx txs n)
+                            (incf n (bl.ser:transaction-weight tx))))))
+            (push (cons txs bytes) (reorg-disconnected-block-txs r))
+            (incf (reorg-disconnected-bytes r) bytes)
+            (multiple-value-bind (kept left dropped)
+                (trim-disconnect-pool (reorg-disconnected-block-txs r) (reorg-disconnected-bytes r))
+              (setf (reorg-disconnected-block-txs r) kept
+                    (reorg-disconnected-bytes r) left)
+              (incf (reorg-disconnected-dropped r) dropped))))
+        (push (cons block (bl.store:block-index-entry-height entry))
+              (reorg-disconnected-blocks r))
+        (setf (bl.store:block-index-entry-status entry) :header-valid))))
+
+  ;; Tip is now logically at the fork point. Set it so each fork block's
+  ;; validate-block sees the fork's active chain for sequence-lock / MTP
+  ;; lookups (get-block-at-height walks back from the tip).
+  ;;
+  ;; If a stop request truncated the disconnect, land on STOP-ENTRY
+  ;; instead: that is the block the coins stopped at, so this is what
+  ;; makes the in-memory tip agree with them (and with the pointer the
+  ;; next flush persists) before we return.
+  (let ((landing (or (reorg-stop-entry r) fork-entry)))
+    (bl.store:update-chain-tip
+     chain-state
+     (bl.store:block-index-entry-hash landing)
+     (bl.store:block-index-entry-height landing)))
+
+  (values))
+
+(defun %reorg-connect (r chain-state block-store utxo-set old-tip-entry skip-scripts)
+  "PHASE B of a reorg: Core ActivateBestChainStep's connect half -- one
+ConnectTip (validation.cpp:3093) per fork block, fork-to-tip, each FULLY
+validated against the intermediate UTXO state and the incrementally
+advanced tip. On failure the partial reorg is rolled back to OLD-TIP, so a
+more-work fork carrying an invalid block can never enter the UTXO set.
+
+Returns (VALUES T NIL) when the fork connected, or a stop request
+truncated it (R's INTERRUPTED says which); (VALUES NIL ERROR-KEYWORD)
+when it was rolled back."
+;; PHASE B — validate + connect the fork, fork-to-tip, with rollback.
+;; collect-chain-entries returns tip-first, so reverse to oldest-first:
+;; each block must be validated/applied after its parent (so its inputs
+;; exist), and the incremental tip must end at the new tip, not the
+;; fork-side block.
+;; CONNECTED lives on the reorg struct: PHASE C reads it after this
+;; LET has closed, and %rollback-partial-reorg takes it on failure.
+  (let ((now (bl.ser:get-unix-time)))
+  ;; A stop request already handled in PHASE A leaves nothing to connect:
+  ;; the chain is parked on STOP-ENTRY and must not move further.
+  (dolist (entry (if (reorg-interrupted r) '() (reverse (reorg-to-connect r))))
+    ;; Cooperative stop, as in PHASE A. Here the tip already advanced per
+    ;; connected block (below), so this boundary needs no fixing up — and
+    ;; no rollback (see the section comment).
+    (when (bl:interrupt-requested-p)
+      (setf (reorg-interrupted r) t)
+      (return))
+    (let* ((block-hash (bl.store:block-index-entry-hash entry))
+           (block (bl.store:get-block block-store block-hash))
+           (height (bl.store:block-index-entry-height entry)))
+      ;; Full body validation against the intermediate UTXO + active
+      ;; chain. The header was checked at receive time, but a
+      ;; competing-fork block stored via the :weaker-chain path had its
+      ;; body (scripts / merkle / coinbase value / finality / seqlocks)
+      ;; UNvalidated — connecting it blindly was the consensus hole.
+      ;; Re-run the ONE header rule an already-persisted index entry may
+      ;; predate, since :skip-header t below will not. It must stay
+      ;; exactly this rule: a fork body re-read from the store carries no
+      ;; cached hash, so re-running PoW here would spuriously fail (see
+      ;; VALIDATE-BLOCK's SKIP-HEADER docstring).
+      (multiple-value-bind (valid error)
+          (if (header-time-too-old-p
+               (bl.ser:bitcoin-block-header block)
+               (bl.store:block-index-entry-prev-entry entry))
+              (values nil :time-too-old)
+              (validate-block block chain-state utxo-set height now
+                              ;; PER BLOCK, not the caller's single
+                              ;; verdict for the whole fork. PERFORM-REORG
+                              ;; takes SKIP-SCRIPTS as one keyword and
+                              ;; applied it to every block it connected,
+                              ;; which makes Core's ancestor condition
+                              ;; unenforceable for exactly the fork
+                              ;; blocks it exists to protect: a fork
+                              ;; block is by construction NOT an
+                              ;; ancestor of assumevalid. The incoming
+                              ;; SKIP-SCRIPTS can now only ever narrow
+                              ;; the skip, never widen it.
+                              :skip-scripts (and skip-scripts
+                                                 (script-checks-skippable-p
+                                                  chain-state block-hash height))
+                              ;; Header (PoW/difficulty/MTP/timewarp) was
+                              ;; validated at index admission — Core's
+                              ;; ConnectBlock doesn't re-check it.
+                              :skip-header t))
+        (unless valid
+          (bl:log-error
+           "REORG ABORTED at height ~D: fork block failed validation (~A). Rolling back to original chain."
+           height error)
+          ;; BLOCK_FAILED_VALID / _CHILD: only when this is a DETERMINISTIC
+          ;; consensus verdict (never a corrupt-body / witness-dependent /
+          ;; transient artifact — see %deterministic-consensus-failure-p),
+          ;; poison this fork block and its whole descendant subtree BEFORE
+          ;; the rollback, so the download walk aborts above it and the
+          ;; deep-reorg candidate scan prunes it — the doomed subtree is
+          ;; never re-requested or re-attempted. Marking before the rollback
+          ;; is safe: %rollback-partial-reorg only resets the CONNECTED
+          ;; ancestors (-> :header-valid) and the re-applied original chain
+          ;; (-> :valid); ENTRY (never connected, this is the first failure)
+          ;; and its descendants (all strictly above it, not yet processed)
+          ;; are in neither list, so the :invalid marks survive.
+          (when (%deterministic-consensus-failure-p error)
+            (%mark-block-subtree-invalid chain-state entry))
+          (%rollback-partial-reorg chain-state block-store utxo-set
+                                   (reorg-connected r) (reorg-to-disconnect r) old-tip-entry)
+          (return-from %reorg-connect (values nil error))))
+      ;; Apply and advance the tip incrementally.
+      (let ((spent-utxos (bl.store:apply-block-to-utxo-set
+                          utxo-set block height)))
+        (%warn-if-undo-empty block block-hash height spent-utxos)
+        (store-undo-data block-hash spent-utxos height :block block)
+        (setf (bl.store:block-index-entry-status entry) :valid)
+        (bl.store:update-chain-tip chain-state block-hash height)
+        (push (list entry block height spent-utxos) (reorg-connected r)))))
+  ;; NOTE: deliberately NO maybe-critical-flush in this loop, unlike
+  ;; PHASE A above, even though Core flushes IF_NEEDED at the end of
+  ;; ConnectTip too (validation.cpp:3093).
+  ;;
+  ;; Core can, because a failed ConnectTip marks the block invalid and
+  ;; the chain is disconnected properly; whatever it persisted is a real
+  ;; chain state it can move away from. We instead rewind IN MEMORY
+  ;; (%rollback-partial-reorg re-applies the original chain), so a flush
+  ;; here would leave the coins DB naming a FORK-SIDE block that we then
+  ;; reject, and a crash before the rollback is itself flushed would
+  ;; roll forward onto the branch we refused.
+  ;;
+  ;; PHASE A has no such exposure: its flushes only ever land on blocks
+  ;; between the old tip and the fork point, which are ancestors of both
+  ;; chains, so rolling forward from one is always correct. It is also
+  ;; the half that actually grows without bound -- the sharp path is a
+  ;; deep rollback (dumptxoutset to an assumeutxo height,
+  ;; invalidateblock on an old hash) disconnecting tens of thousands of
+  ;; blocks in one loop.
+  ;;
+  ;; Closing the connect side needs the rollback to become a real
+  ;; disconnect, as in Core, rather than an in-memory rewind.
+
+    (values t nil)))
+
+(defun %reorg-commit (r chain-state utxo-set mempool fee-estimator recent-rejects)
+  "PHASE C of a reorg: the observable side effects, committed only once the
+whole fork has validated and applied -- wallet and ZMQ notifications, the
+indexes, the fee estimator, the mempool removals and the disconnected-tx
+re-add. Deferred to here so a rolled-back reorg leaves every one of them
+untouched, and an INTERRUPTED one commits exactly the blocks that moved.
+
+Returns PERFORM-REORG's value: T, or (VALUES NIL :INTERRUPTED)."
+;; PHASE C — commit side effects, only now the whole fork is valid
+;; and applied. Oldest-to-newest for chain-order indexing.
+;;
+;; Blocks were disconnected: reset the recent-confirmed filter so
+;; previously-confirmed txs returning to circulation can relay
+;; again (Core BlockDisconnected -> RecentConfirmedTransactions
+;; Filter().reset(), txdownloadman_impl.cpp:112-123). Deferred to
+;; the commit phase alongside the other side effects: a rolled-back
+;; reorg never disconnected anything observably.
+(reset-recent-confirmed)
+;; Wallet chain-tracking (wallet P2): Core fires BlockDisconnected
+;; per DisconnectTip — tip-first, before the fork's BlockConnected
+;; signals. Deferred here with the other side effects, so a
+;; rolled-back reorg never notified anything. disconnected-blocks
+;; is oldest-first (PHASE A push order); reverse restores tip-first.
+(dolist (pair (reverse (reorg-disconnected-blocks r)))
+  (bl:wallet-notify-block-disconnected
+   chain-state (car pair) (cdr pair))
+  ;; ZMQ BlockDisconnected: the block's transactions, then a
+  ;; sequence 'D'. No hashblock/rawblock -- those announce the tip
+  ;; moving FORWARD, and a subscriber that saw one for a block now
+  ;; being undone learns that from the 'D' instead.
+  (bl:zmq-notify-block-disconnected
+   (car pair) (bl.ser:block-header-hash
+               (bl.ser:bitcoin-block-header (car pair))))
+  ;; txospenderindex: erase this block's spender entries. Deferred to
+  ;; PHASE C with every other side effect, so an INTERRUPTED reorg —
+  ;; which rolls back and leaves these blocks connected — never
+  ;; erases entries for blocks that are still on the chain.
+  (bl:index-block-disconnected
+   chain-state (car pair)
+   (bl.ser:block-header-hash
+    (bl.ser:bitcoin-block-header (car pair)))
+   (cdr pair)))
+(dolist (item (reverse (reorg-connected r)))
+  (destructuring-bind (entry block height spent-utxos) item
+    (when fee-estimator
+      (let ((stats (bl.mp:compute-block-fee-stats
+                    block spent-utxos height)))
+        (when stats
+          (bl.mp:fee-estimator-add-stats fee-estimator stats))))
+    ;; Index under the block-index ENTRY's hash — the block index is
+    ;; the canonical identity (Core BaseIndex writes are keyed off
+    ;; the CBlockIndex), and BLOCK here was re-read from disk so a
+    ;; recomputed header hash is a fresh object, not the one the
+    ;; connect path / index entries key by.
+    (let ((hash (bl.store:block-index-entry-hash entry)))
+      ;; Reconnected oldest-to-newest, so a filter header chains off
+      ;; its already-indexed parent and each coinstats record loads
+      ;; its parent's running state; the spender erase for the
+      ;; disconnected side already ran earlier in this phase, so
+      ;; these writes cannot be undone by it.
+      (bl:index-block-connected chain-state block hash height spent-utxos))
+    (when mempool
+      (bl.mp:mempool-remove-for-block mempool block)
+      (bl.mp:orphan-erase-for-block
+       (bl.mp:mempool-orphan-pool mempool) block))
+    ;; Each reconnected block counts as connected for the tx-relay
+    ;; tip structures; the LAST one leaves the map at the new tip.
+    (note-block-connected block)
+    ;; Wallet hook: the fork's blocks connect oldest-to-newest,
+    ;; after that block's mempool conflict removals (Core order).
+    (bl:wallet-notify-block-connected
+     chain-state block (bl.store:block-index-entry-hash entry)
+     height)))
+;; The disconnected old chain's txs stay in the tx-index: Core never
+;; erases txindex entries on disconnect (index/base.h:136 CustomRemove
+;; defaults to a no-op; index/txindex.cpp has no override). Txs
+;; re-mined in the new chain were re-pointed by the connect-time
+;; upserts above; stale-branch-only txs keep resolving through the
+;; still-stored stale block (removing them here used to leave re-mined
+;; txs UNINDEXED, since the old txindex-add skipped existing txids).
+;; Reorg may change tx validity — clear both rejects caches.
+(bl:clear-recent-rejects recent-rejects)
+(clear-reconsiderable-rejects)
+;; Re-add disconnected-block txs (best-effort, against the new tip),
+;; parents before children. Txs re-confirmed or invalidated by the
+;; new chain are dropped by re-validation.
+(when (plusp (reorg-disconnected-dropped r))
+  (bl:log-warn "REORG: disconnect pool over ~D bytes — dropped ~D transaction~:P nearest the old tip; they will not be re-added to the mempool"
+                         +max-disconnected-tx-pool-bytes+
+                         (reorg-disconnected-dropped r)))
+;; Re-validate against the height the chain ACTUALLY reached: equal to
+;; NEW-HEIGHT on the normal path, and the truncation point when a stop
+;; request cut the reorg short.
+(let ((reached (bl.store:current-height chain-state)))
+  (readd-disconnected-txs-to-mempool
+   mempool (loop for entry in (reorg-disconnected-block-txs r) append (car entry))
+   utxo-set reached chain-state)
+
+  (cond
+    ((reorg-interrupted r)
+     ;; Not a failure: the blocks that moved are committed above, the
+     ;; chain sits on a block boundary where coins, pointer and tip
+     ;; agree, and the next sync pass re-attempts the rest. Callers must
+     ;; treat :INTERRUPTED as transient — never as a verdict on the fork.
+     (bl:log-warn
+      "REORG INTERRUPTED by a stop request after disconnecting ~D of ~D and connecting ~D of ~D; chain left at height ~D"
+      (length (reorg-disconnected-blocks r)) (length (reorg-to-disconnect r))
+      (length (reorg-connected r)) (length (reorg-to-connect r)) reached)
+     (values nil :interrupted))
+    (t
+     (bl:log-info "REORG complete: disconnected ~D, connected ~D blocks"
+                            (length (reorg-to-disconnect r)) (length (reorg-to-connect r)))
+               t))))
+
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
                       &key fee-estimator recent-rejects mempool skip-scripts)
   "Perform a chain reorganization from OLD-TIP to NEW-TIP.
@@ -3107,30 +3458,14 @@ comment above."
             (return-from perform-reorg nil))))
 
       ;; Collect blocks to disconnect (old chain, tip to fork)
-      (let ((to-disconnect (collect-chain-entries old-tip-entry fork-entry))
-            ;; Collect blocks to connect (new chain, fork to new tip)
-            (to-connect (collect-chain-entries new-tip-entry fork-entry))
-            ;; Per-disconnected-block non-coinbase tx lists, re-added to the
-            ;; mempool after the reorg. Pushed during the tip-first disconnect
-            ;; loop, so the list ends up oldest-block-first — flattening then
-            ;; re-adds parents before children (a child can only spend a parent
-            ;; in an equal-or-lower block).
-            ;; Each element is (TXS . BYTES) for one disconnected block.
-            (disconnected-block-txs '())
-            ;; Running size of the pool above, bounded by
-            ;; +max-disconnected-tx-pool-bytes+ (see the trim in the loop).
-            (disconnected-bytes 0)
-            (disconnected-dropped 0)
-            ;; (block . height) per disconnected block, oldest-first (same
-            ;; push order), for the PHASE C wallet notifications.
-            (disconnected-blocks '())
-            ;; Cooperative-stop state (phase 3b). STOP-ENTRY is the PHASE A
-            ;; entry the disconnect stopped BEFORE — i.e. the block the coins
-            ;; are left at, and therefore where the tip must land. INTERRUPTED
-            ;; covers both phases and turns the return value into
-            ;; (VALUES NIL :INTERRUPTED).
-            (stop-entry nil)
-            (interrupted nil))
+      ;; All the state the three phases share, as one value -- Core carries
+      ;; the same thing through ActivateBestChainStep (a
+      ;; DisconnectedBlockTransactions pool plus the per-phase bookkeeping).
+      ;; It exists so the phases below can become functions instead of one
+      ;; 469-line body: eight accumulators written in PHASE A and read in
+      ;; PHASE C is exactly what made the split impossible before.
+      (let ((r (%make-reorg :to-disconnect (collect-chain-entries old-tip-entry fork-entry)
+                            :to-connect (collect-chain-entries new-tip-entry fork-entry))))
 
         ;; Self-heal stored witness-stripped forward blocks. A fork block stored
         ;; via the deferred-validation (:weaker-chain) path before the v2-only
@@ -3154,14 +3489,14 @@ comment above."
         (let ((failed (find-if (lambda (e)
                                  (eq (bl.store:block-index-entry-status e)
                                      :invalid))
-                               to-connect)))
+                               (reorg-to-connect r))))
           (when failed
             (bl:log-warn
              "REORG refused: block at height ~D on the target branch is marked invalid"
              (bl.store:block-index-entry-height failed))
             (return-from perform-reorg (values nil :invalid-branch))))
 
-        (dolist (entry to-connect)
+        (dolist (entry (reorg-to-connect r))
           (let* ((block-hash (bl.store:block-index-entry-hash entry))
                  (block (bl.store:get-block block-store block-hash)))
             (when (and block (block-witness-stripped-p block))
@@ -3184,7 +3519,7 @@ comment above."
         ;; missing list so activate-block's caller can re-queue those blocks for
         ;; download instead of looping forever on the unprocessable incoming tip.
         (let ((missing '()))
-          (dolist (entry (append to-disconnect to-connect))
+          (dolist (entry (append (reorg-to-disconnect r) (reorg-to-connect r)))
             (let ((block-hash (bl.store:block-index-entry-hash entry)))
               (unless (bl.store:get-block block-store block-hash)
                 (push (cons block-hash
@@ -3209,7 +3544,7 @@ comment above."
         ;; re-download the to-CONNECT fork; a corrupt LOCAL disconnect-side undo
         ;; is not fixed by fetching fork blocks. Core aborts DisconnectBlock on
         ;; undo-read failure (DISCONNECT_FAILED) for the same reason.
-        (dolist (entry to-disconnect)
+        (dolist (entry (reorg-to-disconnect r))
           (let* ((block-hash (bl.store:block-index-entry-hash entry))
                  (block (bl.store:get-block block-store block-hash)))
             (when (and block
@@ -3226,299 +3561,15 @@ comment above."
         (bl:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
                                old-height fork-height new-height)
 
-        ;; PHASE A — disconnect the old chain (UTXO only), tip-to-fork.
-        ;; collect-chain-entries returns tip-first; iterate as-is. Order
-        ;; matters across blocks: if A (lower) creates output O and B
-        ;; (higher) spends O, disconnecting A first leaves O re-added by
-        ;; B's undo data — see coin-view-disconnect-block for the analogous
-        ;; within-block case. Side effects (txindex / mempool re-add /
-        ;; recent-rejects) are deferred to PHASE C so a rolled-back reorg
-        ;; leaves them untouched.
-        (dolist (entry to-disconnect)
-          ;; Cooperative stop (see the phase-3b section comment above). At the TOP
-          ;; of this iteration the coins are exactly ENTRY's state, so the tip
-          ;; update below lands on ENTRY instead of the fork point, and nothing
-          ;; needs undoing.
-          (when (bl:interrupt-requested-p)
-            (setf stop-entry entry
-                  interrupted t)
-            (return))
-          (let* ((block-hash (bl.store:block-index-entry-hash entry))
-                 (block (bl.store:get-block block-store block-hash)))
-            (when block
-              (let ((undo (get-undo-data block-hash)))
-                (bl.store:disconnect-block-from-utxo-set
-                 utxo-set block (or undo '())
-                 :height (bl.store:block-index-entry-height entry)))
-              ;; Core flushes IF_NEEDED at the end of DisconnectTip
-              ;; (validation.cpp:2966). Safe HERE and not a line earlier:
-              ;; disconnect-block-from-utxo-set sets the coins-view best-block
-              ;; as its last act, so the pointer already names the block whose
-              ;; coins are in the cache. Flushing between the two would persist
-              ;; a cache and a pointer that disagree.
-              (bl:maybe-critical-flush chain-state)
-              ;; Collect this block's non-coinbase txs (original order) for the
-              ;; PHASE C mempool re-add. Pushing whole per-block lists during
-              ;; the tip-first loop leaves disconnected-block-txs oldest-first.
-              ;; Bound the pool at Core's MAX_DISCONNECTED_TX_POOL_BYTES
-              ;; (20MB, kernel/disconnected_transactions.h:18). Unbounded, a
-              ;; deep reorg over full blocks pins hundreds of MB right in the
-              ;; middle of chainstate surgery — and this node has lived
-              ;; through multi-hundred-block testnet4 reorgs.
-              ;;
-              ;; Direction matters: Core trims the MOST-RECENTLY-CONFIRMED
-              ;; entries (LimitMemoryUsage pops the front, which holds the
-              ;; blocks nearest the old tip) and re-adds from the oldest end,
-              ;; so survivors are always PARENTS. Dropping the oldest instead
-              ;; would strand children with missing inputs — they would fail
-              ;; re-validation anyway, and we would have thrown away the
-              ;; entries most likely to still be valid. Our list is
-              ;; oldest-block-first with the tip block at the TAIL, so
-              ;; "trim newest" means dropping from the tail.
-              (when mempool
-                (let* ((txs (rest (bl.ser:bitcoin-block-transactions block)))
-                       ;; Serialized size stands in for Core's
-                       ;; RecursiveDynamicUsage: same order of magnitude and
-                       ;; monotone in the same thing, without walking every
-                       ;; input/output allocation.
-                       (bytes (let ((n 0))
-                                (dolist (tx txs n)
-                                  (incf n (bl.ser:transaction-weight tx))))))
-                  (push (cons txs bytes) disconnected-block-txs)
-                  (incf disconnected-bytes bytes)
-                  (multiple-value-bind (kept left dropped)
-                      (trim-disconnect-pool disconnected-block-txs disconnected-bytes)
-                    (setf disconnected-block-txs kept
-                          disconnected-bytes left)
-                    (incf disconnected-dropped dropped))))
-              (push (cons block (bl.store:block-index-entry-height entry))
-                    disconnected-blocks)
-              (setf (bl.store:block-index-entry-status entry) :header-valid))))
+        (%reorg-disconnect r chain-state block-store utxo-set mempool fork-entry)
 
-        ;; Tip is now logically at the fork point. Set it so each fork block's
-        ;; validate-block sees the fork's active chain for sequence-lock / MTP
-        ;; lookups (get-block-at-height walks back from the tip).
-        ;;
-        ;; If a stop request truncated the disconnect, land on STOP-ENTRY
-        ;; instead: that is the block the coins stopped at, so this is what
-        ;; makes the in-memory tip agree with them (and with the pointer the
-        ;; next flush persists) before we return.
-        (let ((landing (or stop-entry fork-entry)))
-          (bl.store:update-chain-tip
-           chain-state
-           (bl.store:block-index-entry-hash landing)
-           (bl.store:block-index-entry-height landing)))
+        (multiple-value-bind (ok error)
+            (%reorg-connect r chain-state block-store utxo-set old-tip-entry
+                            skip-scripts)
+          (unless ok (return-from perform-reorg (values nil error))))
 
-        ;; PHASE B — validate + connect the fork, fork-to-tip, with rollback.
-        ;; collect-chain-entries returns tip-first, so reverse to oldest-first:
-        ;; each block must be validated/applied after its parent (so its inputs
-        ;; exist), and the incremental tip must end at the new tip, not the
-        ;; fork-side block.
-        (let ((connected '())          ; (entry block height spent-utxos), newest-first
-              (now (bl.ser:get-unix-time)))
-          ;; A stop request already handled in PHASE A leaves nothing to connect:
-          ;; the chain is parked on STOP-ENTRY and must not move further.
-          (dolist (entry (if interrupted '() (reverse to-connect)))
-            ;; Cooperative stop, as in PHASE A. Here the tip already advanced per
-            ;; connected block (below), so this boundary needs no fixing up — and
-            ;; no rollback (see the section comment).
-            (when (bl:interrupt-requested-p)
-              (setf interrupted t)
-              (return))
-            (let* ((block-hash (bl.store:block-index-entry-hash entry))
-                   (block (bl.store:get-block block-store block-hash))
-                   (height (bl.store:block-index-entry-height entry)))
-              ;; Full body validation against the intermediate UTXO + active
-              ;; chain. The header was checked at receive time, but a
-              ;; competing-fork block stored via the :weaker-chain path had its
-              ;; body (scripts / merkle / coinbase value / finality / seqlocks)
-              ;; UNvalidated — connecting it blindly was the consensus hole.
-              ;; Re-run the ONE header rule an already-persisted index entry may
-              ;; predate, since :skip-header t below will not. It must stay
-              ;; exactly this rule: a fork body re-read from the store carries no
-              ;; cached hash, so re-running PoW here would spuriously fail (see
-              ;; VALIDATE-BLOCK's SKIP-HEADER docstring).
-              (multiple-value-bind (valid error)
-                  (if (header-time-too-old-p
-                       (bl.ser:bitcoin-block-header block)
-                       (bl.store:block-index-entry-prev-entry entry))
-                      (values nil :time-too-old)
-                      (validate-block block chain-state utxo-set height now
-                                      ;; PER BLOCK, not the caller's single
-                                      ;; verdict for the whole fork. PERFORM-REORG
-                                      ;; takes SKIP-SCRIPTS as one keyword and
-                                      ;; applied it to every block it connected,
-                                      ;; which makes Core's ancestor condition
-                                      ;; unenforceable for exactly the fork
-                                      ;; blocks it exists to protect: a fork
-                                      ;; block is by construction NOT an
-                                      ;; ancestor of assumevalid. The incoming
-                                      ;; SKIP-SCRIPTS can now only ever narrow
-                                      ;; the skip, never widen it.
-                                      :skip-scripts (and skip-scripts
-                                                         (script-checks-skippable-p
-                                                          chain-state block-hash height))
-                                      ;; Header (PoW/difficulty/MTP/timewarp) was
-                                      ;; validated at index admission — Core's
-                                      ;; ConnectBlock doesn't re-check it.
-                                      :skip-header t))
-                (unless valid
-                  (bl:log-error
-                   "REORG ABORTED at height ~D: fork block failed validation (~A). Rolling back to original chain."
-                   height error)
-                  ;; BLOCK_FAILED_VALID / _CHILD: only when this is a DETERMINISTIC
-                  ;; consensus verdict (never a corrupt-body / witness-dependent /
-                  ;; transient artifact — see %deterministic-consensus-failure-p),
-                  ;; poison this fork block and its whole descendant subtree BEFORE
-                  ;; the rollback, so the download walk aborts above it and the
-                  ;; deep-reorg candidate scan prunes it — the doomed subtree is
-                  ;; never re-requested or re-attempted. Marking before the rollback
-                  ;; is safe: %rollback-partial-reorg only resets the CONNECTED
-                  ;; ancestors (-> :header-valid) and the re-applied original chain
-                  ;; (-> :valid); ENTRY (never connected, this is the first failure)
-                  ;; and its descendants (all strictly above it, not yet processed)
-                  ;; are in neither list, so the :invalid marks survive.
-                  (when (%deterministic-consensus-failure-p error)
-                    (%mark-block-subtree-invalid chain-state entry))
-                  (%rollback-partial-reorg chain-state block-store utxo-set
-                                           connected to-disconnect old-tip-entry)
-                  (return-from perform-reorg (values nil error))))
-              ;; Apply and advance the tip incrementally.
-              (let ((spent-utxos (bl.store:apply-block-to-utxo-set
-                                  utxo-set block height)))
-                (%warn-if-undo-empty block block-hash height spent-utxos)
-                (store-undo-data block-hash spent-utxos height :block block)
-                (setf (bl.store:block-index-entry-status entry) :valid)
-                (bl.store:update-chain-tip chain-state block-hash height)
-                (push (list entry block height spent-utxos) connected))))
-          ;; NOTE: deliberately NO maybe-critical-flush in this loop, unlike
-          ;; PHASE A above, even though Core flushes IF_NEEDED at the end of
-          ;; ConnectTip too (validation.cpp:3093).
-          ;;
-          ;; Core can, because a failed ConnectTip marks the block invalid and
-          ;; the chain is disconnected properly; whatever it persisted is a real
-          ;; chain state it can move away from. We instead rewind IN MEMORY
-          ;; (%rollback-partial-reorg re-applies the original chain), so a flush
-          ;; here would leave the coins DB naming a FORK-SIDE block that we then
-          ;; reject, and a crash before the rollback is itself flushed would
-          ;; roll forward onto the branch we refused.
-          ;;
-          ;; PHASE A has no such exposure: its flushes only ever land on blocks
-          ;; between the old tip and the fork point, which are ancestors of both
-          ;; chains, so rolling forward from one is always correct. It is also
-          ;; the half that actually grows without bound -- the sharp path is a
-          ;; deep rollback (dumptxoutset to an assumeutxo height,
-          ;; invalidateblock on an old hash) disconnecting tens of thousands of
-          ;; blocks in one loop.
-          ;;
-          ;; Closing the connect side needs the rollback to become a real
-          ;; disconnect, as in Core, rather than an in-memory rewind.
-
-          ;; PHASE C — commit side effects, only now the whole fork is valid
-          ;; and applied. Oldest-to-newest for chain-order indexing.
-          ;;
-          ;; Blocks were disconnected: reset the recent-confirmed filter so
-          ;; previously-confirmed txs returning to circulation can relay
-          ;; again (Core BlockDisconnected -> RecentConfirmedTransactions
-          ;; Filter().reset(), txdownloadman_impl.cpp:112-123). Deferred to
-          ;; the commit phase alongside the other side effects: a rolled-back
-          ;; reorg never disconnected anything observably.
-          (reset-recent-confirmed)
-          ;; Wallet chain-tracking (wallet P2): Core fires BlockDisconnected
-          ;; per DisconnectTip — tip-first, before the fork's BlockConnected
-          ;; signals. Deferred here with the other side effects, so a
-          ;; rolled-back reorg never notified anything. disconnected-blocks
-          ;; is oldest-first (PHASE A push order); reverse restores tip-first.
-          (dolist (pair (reverse disconnected-blocks))
-            (bl:wallet-notify-block-disconnected
-             chain-state (car pair) (cdr pair))
-            ;; ZMQ BlockDisconnected: the block's transactions, then a
-            ;; sequence 'D'. No hashblock/rawblock -- those announce the tip
-            ;; moving FORWARD, and a subscriber that saw one for a block now
-            ;; being undone learns that from the 'D' instead.
-            (bl:zmq-notify-block-disconnected
-             (car pair) (bl.ser:block-header-hash
-                         (bl.ser:bitcoin-block-header (car pair))))
-            ;; txospenderindex: erase this block's spender entries. Deferred to
-            ;; PHASE C with every other side effect, so an INTERRUPTED reorg —
-            ;; which rolls back and leaves these blocks connected — never
-            ;; erases entries for blocks that are still on the chain.
-            (bl:index-block-disconnected
-             chain-state (car pair)
-             (bl.ser:block-header-hash
-              (bl.ser:bitcoin-block-header (car pair)))
-             (cdr pair)))
-          (dolist (item (reverse connected))
-            (destructuring-bind (entry block height spent-utxos) item
-              (when fee-estimator
-                (let ((stats (bl.mp:compute-block-fee-stats
-                              block spent-utxos height)))
-                  (when stats
-                    (bl.mp:fee-estimator-add-stats fee-estimator stats))))
-              ;; Index under the block-index ENTRY's hash — the block index is
-              ;; the canonical identity (Core BaseIndex writes are keyed off
-              ;; the CBlockIndex), and BLOCK here was re-read from disk so a
-              ;; recomputed header hash is a fresh object, not the one the
-              ;; connect path / index entries key by.
-              (let ((hash (bl.store:block-index-entry-hash entry)))
-                ;; Reconnected oldest-to-newest, so a filter header chains off
-                ;; its already-indexed parent and each coinstats record loads
-                ;; its parent's running state; the spender erase for the
-                ;; disconnected side already ran earlier in this phase, so
-                ;; these writes cannot be undone by it.
-                (bl:index-block-connected chain-state block hash height spent-utxos))
-              (when mempool
-                (bl.mp:mempool-remove-for-block mempool block)
-                (bl.mp:orphan-erase-for-block
-                 (bl.mp:mempool-orphan-pool mempool) block))
-              ;; Each reconnected block counts as connected for the tx-relay
-              ;; tip structures; the LAST one leaves the map at the new tip.
-              (note-block-connected block)
-              ;; Wallet hook: the fork's blocks connect oldest-to-newest,
-              ;; after that block's mempool conflict removals (Core order).
-              (bl:wallet-notify-block-connected
-               chain-state block (bl.store:block-index-entry-hash entry)
-               height)))
-          ;; The disconnected old chain's txs stay in the tx-index: Core never
-          ;; erases txindex entries on disconnect (index/base.h:136 CustomRemove
-          ;; defaults to a no-op; index/txindex.cpp has no override). Txs
-          ;; re-mined in the new chain were re-pointed by the connect-time
-          ;; upserts above; stale-branch-only txs keep resolving through the
-          ;; still-stored stale block (removing them here used to leave re-mined
-          ;; txs UNINDEXED, since the old txindex-add skipped existing txids).
-          ;; Reorg may change tx validity — clear both rejects caches.
-          (bl:clear-recent-rejects recent-rejects)
-          (clear-reconsiderable-rejects)
-          ;; Re-add disconnected-block txs (best-effort, against the new tip),
-          ;; parents before children. Txs re-confirmed or invalidated by the
-          ;; new chain are dropped by re-validation.
-          (when (plusp disconnected-dropped)
-            (bl:log-warn "REORG: disconnect pool over ~D bytes — dropped ~D transaction~:P nearest the old tip; they will not be re-added to the mempool"
-                                   +max-disconnected-tx-pool-bytes+
-                                   disconnected-dropped))
-          ;; Re-validate against the height the chain ACTUALLY reached: equal to
-          ;; NEW-HEIGHT on the normal path, and the truncation point when a stop
-          ;; request cut the reorg short.
-          (let ((reached (bl.store:current-height chain-state)))
-            (readd-disconnected-txs-to-mempool
-             mempool (loop for entry in disconnected-block-txs append (car entry))
-             utxo-set reached chain-state)
-
-            (cond
-              (interrupted
-               ;; Not a failure: the blocks that moved are committed above, the
-               ;; chain sits on a block boundary where coins, pointer and tip
-               ;; agree, and the next sync pass re-attempts the rest. Callers must
-               ;; treat :INTERRUPTED as transient — never as a verdict on the fork.
-               (bl:log-warn
-                "REORG INTERRUPTED by a stop request after disconnecting ~D of ~D and connecting ~D of ~D; chain left at height ~D"
-                (length disconnected-blocks) (length to-disconnect)
-                (length connected) (length to-connect) reached)
-               (values nil :interrupted))
-              (t
-               (bl:log-info "REORG complete: disconnected ~D, connected ~D blocks"
-                                      (length to-disconnect) (length to-connect))
-               t))))))))
+        (%reorg-commit r chain-state utxo-set mempool fee-estimator
+                       recent-rejects)))))
 
 ;;;; Chain-control helpers (invalidateblock / reconsiderblock)
 ;;;;
