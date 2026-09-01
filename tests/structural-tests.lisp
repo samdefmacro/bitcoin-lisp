@@ -1084,18 +1084,13 @@ becomes an orphan export, and the two ratchets would fight.")
 through a shared fixture in tests/support/ instead of a new :: in a test file"
         now +test-internal-reference-ceiling+)))
 
-(test every-export-names-something
-  "An exported symbol that names nothing is a broken API: a caller writing
-BL:TOKEN-BUCKET gets a reader error, not a fallback. This catches the shape a
-layer split produces -- the EXPORT list is carried over verbatim while the
-IMPORT-FROM list beside it is retyped, so a name keeps being exported after the
-thing it named moved to another package. GA10 found exactly that:
-BL:TOKEN-BUCKET and BL:MAKE-TOKEN-BUCKET survived P6d's move of the struct to
-BITCOIN-LISP.RATELIMIT as exported symbols with no class, no function and no
-value behind them. The orphan-export sweep could not see it -- that test asks
-who CALLS an exported function, and these were not functions at all."
+(defun %dead-exports (&optional (packages (%bitcoin-lisp-packages)))
+  "Exported symbols of PACKAGES that name nothing at all -- no function, no
+value, no class, no macro, no type, no package. Factored out of the test below
+so REFACTORING-RATCHETS-CAN-ACTUALLY-FAIL can feed it a synthetic dead export
+and prove the sweep still fires."
   (let ((dead '()))
-    (dolist (package (%bitcoin-lisp-packages))
+    (dolist (package packages)
       (do-external-symbols (sym package)
         (unless (or (fboundp sym) (boundp sym) (find-class sym nil)
                     (macro-function sym) (find-package sym)
@@ -1104,6 +1099,20 @@ who CALLS an exported function, and these were not functions at all."
                     ;; compiler whether the name is a defined type instead.
                     (sb-int:info :type :kind sym))
           (push (format nil "~A:~A" (package-name package) (symbol-name sym)) dead))))
+    dead))
+
+(test every-export-names-something
+  "An exported symbol that names nothing is a broken API: a caller writing
+BL:TOKEN-BUCKET gets an undefined-function or unknown-type at compile or run
+time (the symbol itself reads fine -- it exists, it just names nothing). This catches the shape a
+layer split produces -- the EXPORT list is carried over verbatim while the
+IMPORT-FROM list beside it is retyped, so a name keeps being exported after the
+thing it named moved to another package. GA10 found exactly that:
+BL:TOKEN-BUCKET and BL:MAKE-TOKEN-BUCKET survived P6d's move of the struct to
+BITCOIN-LISP.RATELIMIT as exported symbols with no class, no function and no
+value behind them. The orphan-export sweep could not see it -- that test asks
+who CALLS an exported function, and these were not functions at all."
+  (let ((dead (%dead-exports)))
     (is (null dead)
         "~D exported symbol~:P name nothing -- either import the symbol the ~
 definition moved to, or drop it from the export list: ~S" (length dead) dead)))
@@ -1112,6 +1121,19 @@ definition moved to, or drop it from the export list: ~S" (length dead) dead)))
   "Positive controls: each scanner must find something on the real tree, and
 the measuring functions must measure a known shape correctly."
   (is (plusp (length (%toplevel-definitions))) "no definitions scanned")
+  ;; %DEAD-EXPORTS: feed it a package whose only export names nothing. GA10
+  ;; found that this control existed only in a commit message -- the sweep's
+  ;; FIRST draft was vacuous ((subtypep sym sym) is true for every symbol) and
+  ;; nothing in the tree would have said so.
+  (let ((probe (or (find-package "BITCOIN-LISP.RATCHET-PROBE")
+                   (make-package "BITCOIN-LISP.RATCHET-PROBE" :use '()))))
+    (unwind-protect
+         (progn
+           (export (intern "DEAD-ON-ARRIVAL" probe) probe)
+           (is (equal '("BITCOIN-LISP.RATCHET-PROBE:DEAD-ON-ARRIVAL")
+                      (%dead-exports (list probe)))
+               "positive control: the dead-export sweep must flag an export that names nothing"))
+      (delete-package probe)))
   (is (plusp (%test-internal-references)) "no :: references counted in tests/")
   (is (plusp (length (%definitions-longer-than +longish-function-lines+)))
       "no long definitions found -- a sweep that finds nothing proves nothing")
