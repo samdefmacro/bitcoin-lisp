@@ -1084,6 +1084,30 @@ becomes an orphan export, and the two ratchets would fight.")
 through a shared fixture in tests/support/ instead of a new :: in a test file"
         now +test-internal-reference-ceiling+)))
 
+(test every-export-names-something
+  "An exported symbol that names nothing is a broken API: a caller writing
+BL:TOKEN-BUCKET gets a reader error, not a fallback. This catches the shape a
+layer split produces -- the EXPORT list is carried over verbatim while the
+IMPORT-FROM list beside it is retyped, so a name keeps being exported after the
+thing it named moved to another package. GA10 found exactly that:
+BL:TOKEN-BUCKET and BL:MAKE-TOKEN-BUCKET survived P6d's move of the struct to
+BITCOIN-LISP.RATELIMIT as exported symbols with no class, no function and no
+value behind them. The orphan-export sweep could not see it -- that test asks
+who CALLS an exported function, and these were not functions at all."
+  (let ((dead '()))
+    (dolist (package (%bitcoin-lisp-packages))
+      (do-external-symbols (sym package)
+        (unless (or (fboundp sym) (boundp sym) (find-class sym nil)
+                    (macro-function sym) (find-package sym)
+                    ;; NOT (subtypep sym sym) -- that is true for EVERY symbol,
+                    ;; which silently makes this whole sweep vacuous. Ask the
+                    ;; compiler whether the name is a defined type instead.
+                    (sb-int:info :type :kind sym))
+          (push (format nil "~A:~A" (package-name package) (symbol-name sym)) dead))))
+    (is (null dead)
+        "~D exported symbol~:P name nothing -- either import the symbol the ~
+definition moved to, or drop it from the export list: ~S" (length dead) dead)))
+
 (test refactoring-ratchets-can-actually-fail
   "Positive controls: each scanner must find something on the real tree, and
 the measuring functions must measure a known shape correctly."

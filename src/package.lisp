@@ -20,7 +20,8 @@ init.cpp, node/. src/node/.")
   (:import-from #:bitcoin-lisp.chainparams #:*network* #:network-magic
                 #:network-port #:network-dns-seeds #:network-rpc-port)
   ;; The token bucket the protocol and the RPC server meter with.
-  (:import-from #:bitcoin-lisp.ratelimit #:make-rate-limiter #:token-bucket-allow-p
+  (:import-from #:bitcoin-lisp.ratelimit #:token-bucket #:make-token-bucket
+                #:make-rate-limiter #:token-bucket-allow-p
                 #:token-bucket-rate #:token-bucket-burst #:token-bucket-tokens
                 #:token-bucket-last-refill)
   ;; The RPC server's own knobs, re-exported for the tests that tune them.

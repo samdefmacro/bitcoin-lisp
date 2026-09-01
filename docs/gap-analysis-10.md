@@ -47,6 +47,66 @@ What did work: where the panel ran it changed answers. `%scan-flat-block-files` 
 S2 by its finder and **upgraded to S1** by a verifier who traced the consequence further
 than the finder had. That is the pass GA9 explicitly lacked, doing its job.
 
+## Round 2 (2026-09-01, 10 agents): the four S1s are verified, and three of them stand
+
+The first run left four S1s with no verdict at all. A second, deliberately small run (10 agents:
+8 verifiers = 4 findings x 2 adversarial lenses, 1 refactor-regression finder, 1 critic) settled
+them. **All four verifiers-pairs returned; none of the four was refuted on mechanism, and every
+verdict was reached by RUNNING code in the container, not only by reading.**
+
+| # | finding | verdict | severity |
+|---|---|---|---|
+| 1 | cmpctblock has no anti-DoS work threshold; the replay gate only fires for headers already indexed | **confirmed** | **S1** |
+| 2 | deserializer accepts BIP144 with all-empty witness stacks ("Superfluous witness record") | mechanism confirmed, **impact refuted** | **S3** (was S1) |
+| 3 | block bodies persisted with no CheckBlock on both IBD paths | **confirmed** | **S1** |
+| 4 | BIP143/BIP341 sighash writes nVersion through a `(unsigned-byte 32)`-declared writer | **confirmed by execution** | **S1** |
+
+**#4 was decided by running it.** Its finder wrote "I could not execute the image to determine
+which" -- whether SBCL elides the declaration or signals. A verifier ran it:
+`(buf-set-u32-le b 0 -2147483648)` -> `SIMPLE-TYPE-ERROR`, and both
+`compute-bip143-sighash-real` and `compute-bip341-sighash-real` abort the same way on a real
+transaction struct with `:version -2147483648`. There is no benign branch. A miner can mine a
+segwit/taproot spend inside a transaction with bit 31 set -- valid to Core, which has no consensus
+rule on version -- and our validation aborts. The verifier also corrected the finder: at `d3056bc`
+Core's `CTransaction::version` is `uint32_t`, not `int32_t`, which *strengthens* the finding.
+
+**#2 is why the verification pass exists.** Both lenses confirmed the parse divergence exactly as
+filed -- and both downgraded it, because the *consequence* does not follow. Every outbound path
+re-serializes from the struct rather than echoing received bytes (`store-block` writes
+`serialize-witness-block`, blocks.lisp:387; `make-block-message` re-serializes, messages.lisp:431).
+Executed: the hostile block parses, and re-serializing it is byte-identical to the canonical one --
+same header hash, same merkle root. So we *launder* the block into the encoding Core accepts rather
+than following a chain the network rejects. The attacker gains nothing over publishing the
+canonical form. It is a strictness gap, not a chain split.
+
+**#1 was measured, and the finder's magnitude was wrong in both directions.** Executed against a
+50,000-entry mempool: a replay costs ~13-15 ms and 6.4-16 MB, not the claimed 0.2-0.3 s and 50 MB
+(`transaction-wtxid` is cached). The DoS is real and unrate-limited -- `check-peer-rate-limit`
+returned T for 10,000 consecutive `cmpctblock` calls -- but it is a smaller constant than filed.
+A verifier also found the finding *understated* elsewhere: a replay matching an outstanding
+`getblocktxn` re-runs the whole map build and emits another `getblocktxn`, where Core returns early.
+
+### The refactor-regression dimension (it had never run)
+
+Three findings, one of them a regression introduced by the refactor itself and now fixed in this
+same branch:
+
+1. **`bl:token-bucket` and `bl:make-token-bucket` were exported but named nothing.** P6d (#551)
+   moved the struct to `bitcoin-lisp.ratelimit`; `src/package.lisp`'s `:import-from` list was
+   retyped with six names while the `:export` list beside it was carried over verbatim with eight.
+   Executed: `eq` NIL, no class, not `fbound`. A caller writing `bl:token-bucket` got a reader
+   error. **Fixed here**, plus a new structural ratchet `every-export-names-something` so the shape
+   cannot recur -- the orphan-export sweep could never have caught it, because that test asks who
+   *calls* an exported **function** and these were not functions.
+2. **`fsync-parent-directory` was wired into 3 of its 7 drive sites.** #525 split a file-path and a
+   directory-path fsync that had previously collided, but scoped the fix to the file the losing
+   definition lived in rather than to the callers' argument shape. Four `rename-file` paths still
+   pass a *file* to the *directory* function -- `settings.json` (twice), `mempool.dat`, and the
+   wallet backup -- each directly under a comment saying the rename is not durable until the
+   directory is synced. `fsync-directory` swallows all errors, so it never complains. Pre-existing,
+   but the tree now *looks* fixed, which is worse than the uniform bug it replaced. NOT yet fixed.
+3. A third finding plus a set of load-bearing negative results, recorded in the workflow journal.
+
 ## Summary
 
 | | S1 | S2 | S3 | total |
