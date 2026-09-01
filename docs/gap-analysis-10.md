@@ -162,6 +162,68 @@ by prose**. Both of my errors in GA10 were bookkeeping, not analysis -- first co
 | round-1 "confirmed", some on a single vote | 26 |
 | **still no verdict at all** | **41** (38 S3 + 3 refactor-regression findings) |
 
+## Round 4 (22 agents): GA10 is complete
+
+Every remaining finding now has a verdict. 22 agents, 0 errors, **67 verdicts, 63 of them settled
+by running code**. Coverage check: 0 findings missed, 0 index misalignments (three alignment
+warnings were the agents echoing a `[S2] ` prefix I had stripped from the stored titles).
+
+| bucket | result |
+|---|---|
+| the 3 refactor-regression claims | all 3 mechanisms confirmed, **all 3 cut to S3** |
+| the 26 round-1 "confirmed" (single vote) | re-checked independently; 12 hold at S2, 1 cut to S3, the rest S3 |
+| the 38 never-judged S3s | 2 **upgraded to S2**, 2 refuted, 34 hold |
+
+### The sweep found two S3s that were worse than filed
+
+- **`getnetworkhashps` ignores its `height` argument entirely** and never implements `nblocks = -1`;
+  it always anchors at the tip. Confirmed by execution -- `(second params)` never appears in the body.
+- **PSBT `complete` trusts the final/partial fields without verifying them.** Core ANDs
+  `PSBTInputSignedAndVerified` over every input, which resolves the UTXO and runs `VerifyScript`
+  under standard flags; we do not.
+
+### Two refutations, one of which exposed a different bug
+
+- `address-book-add`'s missing update-interval: mechanism true, consequence unreachable, and the
+  finding misread what Core's gate blocks.
+- Block-relay-only eviction ignoring `fRelevantServices`: **mechanism textually true, consequence
+  unreachable because our filter is broken in a *different* way** -- `(not (peer-relays-txs-p p))`
+  makes the pass select nobody at all. The refutation is worth more than the finding was.
+
+### ⚠️ Three errors of MINE that the verifiers caught
+
+1. **The fsync finding is not what I published.** I recorded it as a refactor-introduced problem.
+   It is not: `git grep fsync-directory 5f4f321` shows the same four call sites, byte-identical,
+   before the refactor -- two same-named definitions collided in one package and the
+   directory-taking one won, so those sites already fsynced the wrong inode. Nor is it a Core
+   divergence: Core calls `DirectoryCommit` in exactly one place (`flatfile.cpp:108`, the block
+   allocator -- the one site we get right), and its own settings writer does `RenameOver` with no
+   directory sync at all. Our settings path is *more* durable than Core's. **S3, pre-existing,
+   not a regression.**
+2. **My commit message for #564 said a caller "got a reader error".** Wrong -- the symbol exists
+   and reads fine; you get an undefined-function or unknown-type at compile or run time. The
+   original finder said "signals", which was right; I introduced the error while writing it up.
+   That message also labels #551 as "P6d"; P6d is #562.
+3. **The positive control for `every-export-names-something` existed only in that commit message.**
+   `refactoring-ratchets-can-actually-fail` carries a control for every other scanner and had none
+   for this one -- so the sweep could have silently gone vacuous again and nothing in the tree would
+   have said so. Fixed in this change: `%dead-exports` is factored out and the control feeds it a
+   probe package whose only export names nothing.
+
+The verifier also confirmed the #564 fix is complete: sweeping all 28 `BITCOIN-LISP*` packages
+(2,360 external symbols, wider than the ratchet's own scope) finds no other dead export, and no
+exported name anywhere resolves to two different symbol objects -- so no other "export list carried
+over, import list retyped" residue exists.
+
+### Final tally
+
+| state | count |
+|---|---|
+| findings with a verdict | **84 of 84** |
+| verified by execution | 83 |
+| confirmed | 78 |
+| refuted | 6 |
+
 ## Summary
 
 | | S1 | S2 | S3 | total |
