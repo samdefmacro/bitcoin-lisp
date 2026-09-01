@@ -107,6 +107,61 @@ same branch:
    but the tree now *looks* fixed, which is worse than the uniform bug it replaced. NOT yet fixed.
 3. A third finding plus a set of load-bearing negative results, recorded in the workflow journal.
 
+## Round 3 (10 agents): all 16 S2s verified
+
+Eight agents took two S2s each (grouped by file so each carried related context), plus two on what
+I mis-counted as a remaining S1. Every verdict was again settled by RUNNING code, and each carried
+a `title_prefix` so index-to-finding alignment could be checked: **16/16 aligned**.
+
+**All 16 S2s were confirmed on mechanism; none was refuted.** Three had their consequence cut to
+S3. That is a much lower kill rate than the S1 round, and the likely reason is that an S2 claim is
+modest enough to be right more often -- the S1s were where the overreach lived.
+
+| # | finding | verdict |
+|---|---|---|
+| 0 | *last-checksig-error* / *last-checkmultisig-error* are process-global specials, never rebound, so parallel script-check workers clobber each other's e | **S2** |
+| 1 | Lax (pre-BIP66) DER signature parser diverges from Core's ecdsa_signature_parse_der_lax in both directions | **S3** (was S2) |
+| 2 | Fee estimator has no `validForFeeEstimation` gate: it tracks reorg re-adds, package submissions, chained children, and transactions accepted while the | **S2** |
+| 3 | We never push an unsolicited cmpctblock to peers that selected us as their BIP152 high-bandwidth peer | **S2** |
+| 4 | ContextualCheckBlock's UTXO-free half (finality, BIP34 height, witness malleation, block weight) is deferred to reorg time for every non-tip block | **S3** (was S2) |
+| 5 | testmempoolaccept validates each transaction in isolation; Core runs multi-tx batches as a package, so a CPFP child is falsely reported "missing-input | **S2** |
+| 6 | invalidateblock reorgs only to the invalidated block's parent and never re-activates the best remaining valid chain | **S2** |
+| 7 | getblocktemplate returns a cached template verbatim — curtime, bits and target are never refreshed, so on min-difficulty chains the served nBits goes  | **S3** (was S2) |
+| 8 | Pruning is not a flush trigger, so block files below tip-288 are unlinked while the on-disk chainstate can be thousands of blocks behind | **S2** |
+| 9 | Re-mined transactions are never removed from the reorg disconnect pool, so their still-valid in-mempool children are removed recursively | **S2** |
+| 10 | REORG-DISCONNECTED-BLOCKS retains every disconnected block in full, defeating the 20 MB disconnect-pool cap | **S2** |
+| 11 | A fork block failing with a non-allowlisted error is neither poisoned nor excluded from candidate selection, so activate-best-chain repeats the same r | **S2** |
+| 12 | No ZMQ block-connected, -blocknotify or fee-estimator block notification for blocks connected through a reorg | **S2** |
+| 13 | BIP30 is skipped for essentially the whole chain on testnet4/signet/regtest, where Core enforces it at every height | **S2** |
+| 14 | bumpfee's MarkReplaced writes `replaced_by_txid` only in memory — the marker is lost on restart | **S2** |
+| 15 | bumpfee forces fOverrideFeeRate, skipping the mempool-min-fee and required-fee halves of Core's CheckFeeRate | **S2** |
+
+### ⚠️ A second accounting error of mine, and it wasted two agents
+
+I reported "1 S1 still unverified" and spent two agents on it. There was none. All four S1s had
+been settled in round 2; my de-duplication matched findings **by title string**, and the titles I
+retyped into the workflow args had different quote characters from the ones in the journal, so the
+BIP144 finding failed to match itself and was queued again.
+
+The silver lining is real but accidental: two fresh agents, with no knowledge of round 2, reached
+the **same** verdict independently -- mechanism confirmed, consequence refuted, S1 -> S3, each
+proving it by executing the round-trip and showing the re-serialized block is byte-identical to the
+canonical one. An unintended replication is still evidence. One of them also corrected an older
+record: `docs/gap-analysis-9.md:367` claimed the non-canonical encoding reaches the block store; it
+does not, because `store-block` writes `serialize-witness-block`.
+
+The lesson is the same one this round already produced once: **match findings by a stable id, not
+by prose**. Both of my errors in GA10 were bookkeeping, not analysis -- first collapsing
+"never judged" into "refuted", now failing to de-duplicate across rounds.
+
+### Where GA10 stands
+
+| state | count |
+|---|---|
+| verified this round or in round 2 (executed) | 20 (4 S1-round + 16 S2) |
+| round-1 "confirmed", some on a single vote | 26 |
+| **still no verdict at all** | **41** (38 S3 + 3 refactor-regression findings) |
+
 ## Summary
 
 | | S1 | S2 | S3 | total |
