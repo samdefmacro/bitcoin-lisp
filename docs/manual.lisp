@@ -73,8 +73,13 @@
   (@node section))
 
 (defsection @util (:title "util: the chain-agnostic base")
-  "Six small packages every other layer can name. Core: `util/`,
-  `kernel/chainparams.cpp`, `node/context.h`, `util/signalinterrupt.h`.
+  "Seven small packages every other layer can name. Core: `util/`,
+  `kernel/chainparams.cpp`, `node/context.h`, `util/signalinterrupt.h`,
+  `validationinterface.h` (as hook lists: validation and the mempool
+  announce a block connected or disconnected, a tip update, a transaction
+  added or removed, and the wallet, ZMQ, the indexes and the node's own
+  housekeeping subscribe with `define-validation-hook` -- so the lower
+  layers name nothing above themselves).
 
   Invariants: nothing here knows a chain except through the
   `chain-params` table; a file that DEFINES a package ends with
@@ -115,6 +120,14 @@
   (bitcoin-lisp.ratelimit package)
   (bitcoin-lisp.ratelimit:make-rate-limiter function)
   (bitcoin-lisp.ratelimit:token-bucket-allow-p function)
+  (bitcoin-lisp.validation-interface package)
+  (bitcoin-lisp.validation-interface:define-validation-hook macro)
+  (bitcoin-lisp.validation-interface:validation-hooks function)
+  (bitcoin-lisp.validation-interface:notify-block-connected function)
+  (bitcoin-lisp.validation-interface:notify-block-disconnected function)
+  (bitcoin-lisp.validation-interface:notify-updated-block-tip function)
+  (bitcoin-lisp.validation-interface:notify-transaction-added function)
+  (bitcoin-lisp.validation-interface:notify-transaction-removed function)
   "The chain table answers every per-network question; the five chains
   are one DEFINE-CHAIN-PARAMS form each in `src/util/chainparams.lisp`:
 
@@ -567,7 +580,11 @@
 
   Invariants: consensus checks are ported check by check with Core's
   order and Core's reject reasons (the reason vocabulary is Core's, cross-
-  checked by the functional tests). Signature validation of a block's
+  checked by the functional tests). Validation announces through the
+  validation interface (`notify-block-connected` after the tip update and
+  the mempool's conflict removals, then `notify-updated-block-tip`; the
+  disconnect side tip-first in the reorg's commit phase) and calls nothing
+  in `src/node/` by name. Signature validation of a block's
   scripts is batched and cached but never skipped -- same-block chained
   spends once bypassed it. Long loops poll `interrupt-requested-p`
   between blocks so shutdown and the assumeutxo pause can cut in.

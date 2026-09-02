@@ -15,14 +15,17 @@
   "Cadence of the periodic peers.dat dump (Core DUMP_PEERS_INTERVAL = 15
 minutes, net.cpp:63, scheduled at net.cpp:3560).")
 
-(defun maybe-stop-at-height (height)
+(bl.vi:define-validation-hook :updated-block-tip maybe-stop-at-height (chainstate hash height)
   "Request a node shutdown once HEIGHT reaches -stopatheight (Core
-KernelNotifications::blockTip, node/kernel_notifications.cpp:61-66). Called
-from connect-block on every ACTIVE-chainstate tip advance; a background
-(targeted) chainstate never triggers it. Only REQUESTS the shutdown: the main
-thread runs stop-node (which joins the sync thread — usually the caller here),
-and the clean exit code stops the supervisor from respawning straight back
-into the same trigger."
+KernelNotifications::blockTip, node/kernel_notifications.cpp:61-66). An
+:updated-block-tip hook; a background (targeted) chainstate's tips never
+trigger it -- Core's blockTip is the active chainstate's. Only REQUESTS the
+shutdown: the main thread runs stop-node (which joins the sync thread --
+usually the caller here), and the clean exit code stops the supervisor from
+respawning straight back into the same trigger."
+  (declare (ignore hash))
+  (when (and chainstate (bl.store:chain-state-target-blockhash chainstate))
+    (return-from maybe-stop-at-height nil))
   ;; Under -debug=net, say WHICH guard declined when the height has been
   ;; reached. #478 wired this into the activation-step loop and a benchmark
   ;; reindex then ran straight past -stopatheight=134000 to 134898. The seam is

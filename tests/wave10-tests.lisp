@@ -798,12 +798,12 @@ no node running -> no trigger."
   (let ((bl:*stop-at-height* 0)
         (bl::*stop-at-height-triggered* nil)
         (bl:*node* nil))
-    (is (null (bl:maybe-stop-at-height 100))))
+    (is (null (bl:maybe-stop-at-height nil nil 100))))
   (let ((bl:*stop-at-height* 50)
         (bl::*stop-at-height-triggered* nil)
         (bl:*node* nil))
-    (is (null (bl:maybe-stop-at-height 49)))
-    (is (null (bl:maybe-stop-at-height 50))) ; no node -> no trigger
+    (is (null (bl:maybe-stop-at-height nil nil 49)))
+    (is (null (bl:maybe-stop-at-height nil nil 50))) ; no node -> no trigger
     (is (null bl::*stop-at-height-triggered*))))
 
 (test wave10-check-disk-space

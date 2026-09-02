@@ -72,9 +72,12 @@ which correctly refuses to flush because a rollback there rewinds in memory."
           (perform (search "(defun perform-reorg" src)))
       (is-true activate)
       (is-true perform)
-      ;; The flush call must be inside ACTIVATE-BEST-CHAIN.
-      (let ((flush (search "maybe-periodic-flush" src :start2 activate)))
-        (is-true flush "activate-best-chain no longer flushes between steps"))
+      ;; The tip notification must be inside ACTIVATE-BEST-CHAIN, and the
+      ;; periodic flush must be one of its subscribers.
+      (let ((tip (search "notify-updated-block-tip" src :start2 activate)))
+        (is-true tip "activate-best-chain no longer announces the tip between steps"))
+      (is-true (member 'bl:maybe-periodic-flush (bl.vi:validation-hooks :updated-block-tip))
+               "the periodic flush is no longer an :updated-block-tip hook")
       ;; And PERFORM-REORG's connect loop must still NOT flush — that refusal
       ;; is deliberate and load-bearing, so assert its note is still there.
       (is-true (search "deliberately NO maybe-critical-flush in this loop" src)

@@ -300,3 +300,28 @@ No rawblock/hashblock — those announce the tip moving FORWARD."
                 tx (bl.ser:transaction-hash tx))))
     (when (zmq-topic-active-p "sequence")
       (zmq-notify-sequence hash #\D))))
+
+;;; --- Subscriptions (Core CZMQNotificationInterface) ---
+;;; A background (assumeutxo) chainstate's blocks are not announced: Core's
+;;; interface returns early for ChainstateRole::BACKGROUND.
+
+(bl.vi:define-validation-hook :block-connected zmq-block-connected (chainstate block block-hash height spent-utxos)
+  (declare (ignore height spent-utxos))
+  (unless (bl.store:chain-state-target-blockhash chainstate)
+    (zmq-notify-block-connected block block-hash)))
+
+(bl.vi:define-validation-hook :block-disconnected zmq-block-disconnected (chainstate block block-hash height)
+  (declare (ignore height))
+  (unless (bl.store:chain-state-target-blockhash chainstate)
+    (zmq-notify-block-disconnected block block-hash)))
+
+(bl.vi:define-validation-hook :transaction-added zmq-transaction-added (tx txid sequence)
+  (zmq-notify-tx-accepted tx txid sequence))
+
+(bl.vi:define-validation-hook :transaction-removed zmq-transaction-removed (tx txid sequence reason)
+  "ZMQ TransactionRemovedFromMempool is \"called for all non-block inclusion
+reasons\" (zmqnotificationinterface.cpp:172): a mined transaction is
+announced by the block notification."
+  (declare (ignore tx))
+  (unless (eq reason :block)
+    (zmq-notify-tx-removed txid sequence)))

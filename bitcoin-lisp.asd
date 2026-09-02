@@ -22,7 +22,8 @@ a compile error, not a layering-test entry."
                 :components ((:file "bytes")
                              (:file "chainparams")
                              (:file "context")
-                             (:file "ratelimit")))))
+                             (:file "ratelimit")
+                             (:file "validation-interface")))))
 
 (defsystem "bitcoin-lisp/crypto"
   :description "Hashes, ChaCha20, MuHash, the libsecp256k1 FFI, BIP324

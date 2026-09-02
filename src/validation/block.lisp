@@ -2624,16 +2624,15 @@ Handles chain reorganizations when a competing chain has more work."
           ;; this critical section completes, so saved state on disk is never
           ;; "chain advanced but UTXOs not applied" or vice versa.
           ((equalp prev-hash current-best-hash)
+           ;; The undo list the critical section produces, announced
+           ;; (BlockConnected) outside it.
+           (let ((spent-utxos nil))
            #+sbcl (sb-sys:without-interrupts
-           (let ((spent-utxos (bl.store:apply-block-to-utxo-set
-                               utxo-set block new-height)))
+           (progn
+             (setf spent-utxos (bl.store:apply-block-to-utxo-set
+                                     utxo-set block new-height))
              (%warn-if-undo-empty block hash new-height spent-utxos)
              (store-undo-data hash spent-utxos new-height :block block)
-             ;; Every enabled index (transaction, block filter, coinstats,
-             ;; spender) folds the block in, and the txindex moves its
-             ;; best-block marker with the tip; no-op with none enabled,
-             ;; never signals.
-             (bl:index-block-connected chain-state block hash new-height spent-utxos)
              ;; Record fee statistics for fee estimation
              (when fee-estimator
                (let ((stats (bl.mp:compute-block-fee-stats
@@ -2650,12 +2649,6 @@ Handles chain reorganizations when a competing chain has more work."
             new-height
             (map 'list #'bl.ser:transaction-hash
                  (bl.ser:bitcoin-block-transactions block)))
-           ;; ZMQ BlockConnected: each transaction, then the block and a
-           ;; sequence 'C' (zmqnotificationinterface.cpp:180).
-           (bl:zmq-notify-block-connected block hash)
-           ;; -blocknotify, detached so an operator hook can never stall block
-           ;; connection (Core "thread runs free", init.cpp:2017).
-           (bl:notify-block-tip hash)
            (bl.store:update-chain-tip chain-state hash new-height)
            ;; Remove now-confirmed (and conflicting) txs from the mempool,
            ;; inside the same critical section as the tip update.
@@ -2677,21 +2670,17 @@ Handles chain reorganizations when a competing chain has more work."
                (bl.mp:mempool-expire mempool)
                (bl.mp:orphan-erase-for-block
                 (bl.mp:mempool-orphan-pool mempool) block))
-             (note-block-connected block)
-             ;; Wallet chain-tracking hook (wallet P2): scan the block for
-             ;; wallet-relevant txs (Core CWallet::blockConnected). Runs
-             ;; after mempool-remove-for-block, so the wallet sees the
-             ;; conflict removals first — Core's signal order. Cheap no-op
-             ;; when no wallets are loaded; never signals.
-             (bl:wallet-notify-block-connected
-              chain-state block hash new-height)
-             ;; -stopatheight: request shutdown once the ACTIVE tip reaches
-             ;; the configured height (Core KernelNotifications::blockTip,
-             ;; node/kernel_notifications.cpp:61-66); a background (targeted)
-             ;; chainstate's ancient tips never trigger it. After the wallet
-             ;; hook — Core's blockTip notification fires after the wallet's
-             ;; BlockConnected signals.
-             (bl:maybe-stop-at-height new-height))
+             (note-block-connected block))
+           ;; Core's validation interface, after the tip update and the
+           ;; mempool's conflict removals (Core's signal order): the indexes,
+           ;; ZMQ and the wallet subscribe to BlockConnected; -blocknotify,
+           ;; -stopatheight and the periodic flush to the tip update that
+           ;; follows it (KernelNotifications::blockTip fires after the
+           ;; wallet's BlockConnected). Subscribers decide for themselves
+           ;; whether a targeted (assumeutxo background) chainstate concerns
+           ;; them, as Core's do by ChainstateRole.
+           (bl.vi:notify-block-connected chain-state block hash new-height spent-utxos)
+           (bl.vi:notify-updated-block-tip chain-state hash new-height)
            ;; Core resets the recent-rejects filter on EVERY active tip change,
            ;; not just reorgs: cached failures (non-final, too-low-fee, missing
            ;; inputs) can become valid at the next block (ActiveTipChange,
@@ -2700,7 +2689,6 @@ Handles chain reorganizations when a competing chain has more work."
            ;; cleared it. ActiveTipChange resets BOTH filters.
            (bl:clear-recent-rejects recent-rejects)
            (clear-reconsiderable-rejects)
-           (bl:maybe-periodic-flush chain-state)
            ;; Automatic block pruning after connecting a new block; each
            ;; pruned block's undo file goes with it.
            (when (bl:automatic-pruning-p)
@@ -2709,7 +2697,7 @@ Handles chain reorganizations when a competing chain has more work."
                             :on-prune #'delete-undo-file
                             :target-bytes (bl:effective-prune-target-bytes))))
                (when (> pruned 0)
-                 (bl:log-info "Pruned ~D old block~:P" pruned)))))
+                 (bl:log-info "Pruned ~D old block~:P" pruned))))))
 
           ;; New chain has more work - reorganize. Capture perform-reorg's
           ;; (values ok detail) so the caller can re-queue missing fork blocks
@@ -3308,29 +3296,17 @@ Returns PERFORM-REORG's value: T, or (VALUES NIL :INTERRUPTED)."
 ;; the commit phase alongside the other side effects: a rolled-back
 ;; reorg never disconnected anything observably.
 (reset-recent-confirmed)
-;; Wallet chain-tracking (wallet P2): Core fires BlockDisconnected
-;; per DisconnectTip — tip-first, before the fork's BlockConnected
-;; signals. Deferred here with the other side effects, so a
-;; rolled-back reorg never notified anything. disconnected-blocks
-;; is oldest-first (PHASE A push order); reverse restores tip-first.
+;; Core fires BlockDisconnected per DisconnectTip — tip-first, before
+;; the fork's BlockConnected signals — and the wallet, ZMQ and the
+;; spender index subscribe to it. Deferred here with the other side
+;; effects, so a rolled-back reorg never notified anything (an
+;; INTERRUPTED reorg leaves these blocks connected, and erasing the
+;; spender entries then would be wrong). disconnected-blocks is
+;; oldest-first (PHASE A push order); reverse restores tip-first.
 (dolist (pair (reverse (reorg-disconnected-blocks r)))
-  (bl:wallet-notify-block-disconnected
-   chain-state (car pair) (cdr pair))
-  ;; ZMQ BlockDisconnected: the block's transactions, then a
-  ;; sequence 'D'. No hashblock/rawblock -- those announce the tip
-  ;; moving FORWARD, and a subscriber that saw one for a block now
-  ;; being undone learns that from the 'D' instead.
-  (bl:zmq-notify-block-disconnected
-   (car pair) (bl.ser:block-header-hash
-               (bl.ser:bitcoin-block-header (car pair))))
-  ;; txospenderindex: erase this block's spender entries. Deferred to
-  ;; PHASE C with every other side effect, so an INTERRUPTED reorg —
-  ;; which rolls back and leaves these blocks connected — never
-  ;; erases entries for blocks that are still on the chain.
-  (bl:index-block-disconnected
+  (bl.vi:notify-block-disconnected
    chain-state (car pair)
-   (bl.ser:block-header-hash
-    (bl.ser:bitcoin-block-header (car pair)))
+   (bl.ser:block-header-hash (bl.ser:bitcoin-block-header (car pair)))
    (cdr pair)))
 (dolist (item (reverse (reorg-connected r)))
   (destructuring-bind (entry block height spent-utxos) item
@@ -3345,24 +3321,21 @@ Returns PERFORM-REORG's value: T, or (VALUES NIL :INTERRUPTED)."
     ;; recomputed header hash is a fresh object, not the one the
     ;; connect path / index entries key by.
     (let ((hash (bl.store:block-index-entry-hash entry)))
-      ;; Reconnected oldest-to-newest, so a filter header chains off
-      ;; its already-indexed parent and each coinstats record loads
-      ;; its parent's running state; the spender erase for the
-      ;; disconnected side already ran earlier in this phase, so
-      ;; these writes cannot be undone by it.
-      (bl:index-block-connected chain-state block hash height spent-utxos))
-    (when mempool
-      (bl.mp:mempool-remove-for-block mempool block)
-      (bl.mp:orphan-erase-for-block
-       (bl.mp:mempool-orphan-pool mempool) block))
-    ;; Each reconnected block counts as connected for the tx-relay
-    ;; tip structures; the LAST one leaves the map at the new tip.
-    (note-block-connected block)
-    ;; Wallet hook: the fork's blocks connect oldest-to-newest,
-    ;; after that block's mempool conflict removals (Core order).
-    (bl:wallet-notify-block-connected
-     chain-state block (bl.store:block-index-entry-hash entry)
-     height)))
+      (when mempool
+        (bl.mp:mempool-remove-for-block mempool block)
+        (bl.mp:orphan-erase-for-block
+         (bl.mp:mempool-orphan-pool mempool) block))
+      ;; Each reconnected block counts as connected for the tx-relay
+      ;; tip structures; the LAST one leaves the map at the new tip.
+      (note-block-connected block)
+      ;; The fork's blocks connect oldest-to-newest, after that block's
+      ;; mempool conflict removals (Core order): the indexes, ZMQ and the
+      ;; wallet hear it here. Reconnected in order, so a filter header
+      ;; chains off its already-indexed parent and each coinstats record
+      ;; loads its parent's running state; the spender erase for the
+      ;; disconnected side already ran earlier in this phase, so these
+      ;; writes cannot be undone by it.
+      (bl.vi:notify-block-connected chain-state block hash height spent-utxos))))
 ;; The disconnected old chain's txs stay in the tx-index: Core never
 ;; erases txindex entries on disconnect (index/base.h:136 CustomRemove
 ;; defaults to a no-op; index/txindex.cpp has no override). Txs
@@ -3732,7 +3705,6 @@ backstop against a candidate that reorgs away and reappears."
              ;; slowdown with height is testnet4's own busy zone around
              ;; 51,000-55,000 (the region scripts/profile-regions.sh already
              ;; singles out), not this cache.
-             (bl:maybe-periodic-flush chain-state)
              ;; -stopatheight, for the same reason and at the same boundary.
              ;; MAYBE-STOP-AT-HEIGHT is called from CONNECT-BLOCK's
              ;; tip-EXTENSION arm only, so a chain activated through
@@ -3752,7 +3724,9 @@ backstop against a candidate that reorgs away and reappears."
                              chain-state
                              (bl.store:best-block-hash chain-state))))
                (when new-tip
-                 (bl:maybe-stop-at-height
+                 (bl.vi:notify-updated-block-tip
+                  chain-state
+                  (bl.store:block-index-entry-hash new-tip)
                   (bl.store:block-index-entry-height new-tip)))))
             (t
              ;; :interrupted means the node is stopping — not a refusal to
