@@ -1014,8 +1014,7 @@ least two, distinct, values — all three of those errors are its own text."
   (let* ((hash (position #\# string))
          (body (if hash (subseq string 0 hash) string))
          (start (position #\< body)))
-    (if (null start)
-        (list string)
+    (if start
         (let ((end (position #\> body :start start)))
           (unless end
             (%desc-error "Key path value '~A' specifies multipath in a section where multipath is not allowed"
@@ -1027,7 +1026,8 @@ least two, distinct, values — all three of those errors are its own text."
                 (elem (subseq body start (1+ end))))
             (mapcar (lambda (sub)
                       (concatenate 'string prefix (cdr sub) suffix))
-                    (%multipath-substitutes elem)))))))
+                    (%multipath-substitutes elem))))
+        (list string))))
 
 (defun parse-descriptor (string network &key require-checksum)
   "Parse descriptor STRING (Core's Parse). Returns (values out-desc
@@ -1084,12 +1084,12 @@ by StringType, descriptor.cpp:909)."
              (funcall keyfn (first (out-desc-keys desc)))))
     (:tr
      (let ((internal (funcall keyfn (first (out-desc-keys desc)))))
-       (if (null (out-desc-tree desc))
-           (format nil "tr(~A)" internal)
+       (if (out-desc-tree desc)
            (format nil "tr(~A,~A)" internal
                    (tr-tree-string (out-desc-tree desc)
                                    (lambda (leaf)
-                                     (%out-desc-string-walk leaf keyfn)))))))
+                                     (%out-desc-string-walk leaf keyfn))))
+           (format nil "tr(~A)" internal))))
     ((:multi :sortedmulti :multi-a :sortedmulti-a)
      ;; The kind keywords carry a hyphen where the descriptor name has an
      ;; underscore, so the name is repaired before ~( ~) lowercases it.
@@ -2081,7 +2081,7 @@ required for ranged descriptors (an end N meaning [0,N], or [begin,end]) and
 rejected for unranged ones; combo() P2PK scripts are skipped like Core."
   (let* ((desc-str (first params))
          (range (second params))
-         (range-given (and (> (length params) 1) (not (null range))))
+         (range-given (and (> (length params) 1) (and range t)))
          (network (rpc-get-network node)))
     (unless (stringp desc-str)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))

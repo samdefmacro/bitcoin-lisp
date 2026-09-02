@@ -595,8 +595,8 @@ coins-view slot so a stale handle can never be reused. Never signals."
 ;;; else. LevelDB ignores foreign files in its directory, so co-locating the
 ;;; marker with the coins DB (as Core does) is safe.
 
-(defparameter +snapshot-blockhash-filename+ "base_blockhash"
-  "Core SNAPSHOT_BLOCKHASH_FILENAME (node/utxo_snapshot.h:113).")
+(alexandria:define-constant +snapshot-blockhash-filename+ "base_blockhash"
+  :test #'equalp :documentation "Core SNAPSHOT_BLOCKHASH_FILENAME (node/utxo_snapshot.h:113).")
 
 (defun snapshot-base-blockhash-path (chainstate-dir)
   "Path of the base_blockhash marker inside CHAINSTATE-DIR."

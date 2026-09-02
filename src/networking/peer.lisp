@@ -475,18 +475,18 @@ type verbatim, plus the payload), and the 16-byte Poly1305 tag."
          payload-len)
       (+ 24 payload-len)))
 
-(defparameter +known-message-commands+
+(alexandria:define-constant +known-message-commands+
   '("addr" "addrv2" "block" "blocktxn" "cfcheckpt" "cfheaders" "cfilter"
     "cmpctblock" "feefilter" "filteradd" "filterclear" "filterload" "getaddr"
     "getblocks" "getblocktxn" "getcfcheckpt" "getcfheaders" "getcfilters"
     "getdata" "getheaders" "headers" "inv" "mempool" "merkleblock" "notfound"
     "ping" "pong" "reject" "sendaddrv2" "sendcmpct" "sendheaders"
     "sendtxrcncl" "tx" "verack" "version" "wtxidrelay")
-  "Message types that get their own byte-accounting bucket — Core's
+  :test #'equalp :documentation "Message types that get their own byte-accounting bucket — Core's
 ALL_NET_MESSAGE_TYPES. Anything else is folded into +other-message-command+.")
 
-(defparameter +other-message-command+ "*other*"
-  "Core NET_MESSAGE_TYPE_OTHER: the single bucket every unrecognised command
+(alexandria:define-constant +other-message-command+ "*other*"
+  :test #'equalp :documentation "Core NET_MESSAGE_TYPE_OTHER: the single bucket every unrecognised command
 shares.")
 
 (defun %account-message (table v2-p command payload-len)
@@ -1158,8 +1158,7 @@ version handshake may proceed (over whichever transport), NIL to give up."
            (setf (peer-connection peer) fresh)
            (bl:log-info "Peer ~A: no v2 response, reconnected as v1"
                                   (peer-address peer))
-           t)))
-      (t nil))))
+           t))))))
 
 (defun perform-handshake (peer &key (try-v2 (v2-available-p))
                                     (conn-type :outbound-full-relay)
@@ -1444,7 +1443,7 @@ Returns :disconnect if the peer should be disconnected, :ok otherwise."
     (let* ((now (get-internal-real-time))
            (elapsed-secs (/ (float (- now (peer-connect-time peer)))
                             (float internal-time-units-per-second))))
-      (when (> elapsed-secs bl:+handshake-timeout-seconds+)
+      (when (> elapsed-secs bl:*handshake-timeout-seconds*)
         (bl:log-warn "Handshake timeout for peer ~A (~,1Fs elapsed)"
                                (peer-address peer) elapsed-secs)
         (return-from check-handshake-timeout :disconnect))))

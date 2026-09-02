@@ -187,9 +187,9 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
 Empty unless the option was given. Core stores the same overrides in
 options.activation_heights and applies them when building chainparams.")
 
-(defparameter +buried-deployment-names+
+(alexandria:define-constant +buried-deployment-names+
   '("segwit" "bip34" "dersig" "cltv" "csv")
-  "The deployments -testactivationheight can move, spelled as Core spells them
+  :test #'equalp :documentation "The deployments -testactivationheight can move, spelled as Core spells them
 (GetBuriedDeployment, deploymentinfo.cpp:41-54). `dersig` is BIP66 and `cltv`
 is BIP65 — the option takes the deployment's name, not the BIP number.")
 
@@ -257,37 +257,36 @@ name is one of ~{~A~^, ~} and height is a non-negative integer."
 ;;; Mandatory flags are required for block validation. Standard flags add policy
 ;;; restrictions for mempool acceptance and transaction relay.
 
-(defparameter +standard-policy-flags+
+(alexandria:define-constant +standard-policy-flags+
   '("STRICTENC" "MINIMALDATA" "DISCOURAGE_UPGRADABLE_NOPS"
     "CLEANSTACK" "MINIMALIF" "NULLFAIL" "LOW_S"
     "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" "WITNESS_PUBKEYTYPE"
     "CONST_SCRIPTCODE" "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
     "DISCOURAGE_OP_SUCCESS" "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")
-  "Policy flags layered on top of mandatory consensus flags for mempool acceptance
+  :test #'equalp :documentation "Policy flags layered on top of mandatory consensus flags for mempool acceptance
 (Core STANDARD_SCRIPT_VERIFY_FLAGS minus MANDATORY_SCRIPT_VERIFY_FLAGS =
 STANDARD_NOT_MANDATORY_VERIFY_FLAGS, policy/policy.h:118-134).")
 
-(defparameter +mandatory-script-verify-flags+
+(alexandria:define-constant +mandatory-script-verify-flags+
   '("P2SH" "DERSIG" "NULLDUMMY" "CHECKLOCKTIMEVERIFY"
     "CHECKSEQUENCEVERIFY" "WITNESS" "TAPROOT")
-  "Core MANDATORY_SCRIPT_VERIFY_FLAGS (policy/policy.h:104-110): the flags all
+  :test #'equalp :documentation "Core MANDATORY_SCRIPT_VERIFY_FLAGS (policy/policy.h:104-110): the flags all
 NEW transactions must comply with. A height-independent CONSTANT in Core —
 distinct from GetBlockScriptFlags/compute-script-flags-for-height, which gate
 each flag on its activation height for block (consensus) validation.")
 
-(defparameter +standard-script-verify-flags+
-  (format nil "~{~A~^,~}" (append +mandatory-script-verify-flags+
+(alexandria:define-constant +standard-script-verify-flags+ (format nil "~{~A~^,~}" (append +mandatory-script-verify-flags+
                                   +standard-policy-flags+))
-  "Core STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:118-133) as the
+  :test #'equalp :documentation "Core STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:118-133) as the
 comma-separated flag string the script engine consumes: the mandatory set
 plus every policy flag. This is what MemPoolAccept::PolicyScriptChecks runs
 (validation.cpp:1140) — a constant, not a per-height computation, because
 the mempool only ever validates against the current tip where every
 deployment is active.")
 
-(defparameter +always-on-block-script-flags+
+(alexandria:define-constant +always-on-block-script-flags+
   '("P2SH" "WITNESS" "TAPROOT")
-  "The flags Core turns on for EVERY block, whatever its height
+  :test #'equalp :documentation "The flags Core turns on for EVERY block, whatever its height
 (GetBlockScriptFlags, validation.cpp:2259).
 
 Gating these on activation height — which this did until now — is a consensus
@@ -524,11 +523,7 @@ and testnet min-difficulty exception."
       ;; were :bad-difficulty.
       ((member bl:*network* '(:mainnet :signet))
        (bl.ser:block-header-bits
-        (bl.store:block-index-entry-header prev-entry)))
-
-      ;; Non-boundary on testnet: return nil to indicate caller must check
-      ;; timestamp-based min-difficulty or walk-back
-      (t nil))))
+        (bl.store:block-index-entry-header prev-entry))))))
 
 (defun validate-difficulty (header height prev-entry)
   "Validate that HEADER's bits field matches expected difficulty at HEIGHT.
@@ -720,12 +715,12 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 
 ;;;; Block script validation
 
-(defparameter +parallel-validation-min-txs+ 16
+(defconstant +parallel-validation-min-txs+ 16
   "Below this tx count we validate sequentially — thread-spawn overhead
    exceeds the parallel speedup for tiny blocks. Bitcoin Core's
    CCheckQueue uses a similar batching threshold.")
 
-(defparameter +parallel-validation-workers+ 4
+(defvar *parallel-validation-workers* 4
   "Number of worker threads for parallel block-script validation, settable
 with -par (Core's DEFAULT_SCRIPTCHECK_THREADS / MAX_SCRIPTCHECK_THREADS).
 A DEFPARAMETER because -par changes it; see PARSE-PAR-THREADS.")
@@ -761,7 +756,7 @@ The negative form is the one worth getting right: -par=-1 on a 4-core box means
 THREE workers, not one, and reading it as an absolute value would quietly
 oversubscribe the machine Core was told to leave headroom on."
   (let* ((cores (available-processor-count))
-         (n (cond ((null value) +parallel-validation-workers+)
+         (n (cond ((null value) *parallel-validation-workers*)
                   ((zerop value) cores)
                   ((minusp value) (+ cores value))
                   (t value))))
@@ -852,7 +847,7 @@ written concurrently."
 ;;;; Persistent script-check worker pool (Core CCheckQueue, checkqueue.h)
 ;;;;
 ;;;; Core keeps ONE pool for the life of the process and hands it batches;
-;;;; ours used to spawn +parallel-validation-workers+ fresh threads PER BLOCK.
+;;;; ours used to spawn *parallel-validation-workers* fresh threads PER BLOCK.
 ;;;; At one block per ten minutes that is invisible, but during IBD it is a
 ;;;; thread creation per block, and thread creation in SBCL is not cheap.
 ;;;;
@@ -1002,7 +997,7 @@ then receive pure data and never touch the coins view, whose cache inserts on
 read and is not synchronized."
   (let* ((non-coinbase (rest txs))
          (prefetched (prefetch-block-spent-coins txs utxo-set extra-coins))
-         (pool (ensure-script-check-pool +parallel-validation-workers+))
+         (pool (ensure-script-check-pool *parallel-validation-workers*))
          ;; One item per transaction. Each closes over data that is already
          ;; resolved, so nothing here reaches the coins view.
          (items (loop for tx in non-coinbase
@@ -1043,7 +1038,7 @@ until now, accepts blocks Core rejects."
     ;; dominates any speedup.
     (if (and bl:*parallel-block-validation*
              (>= (length (rest transactions)) +parallel-validation-min-txs+)
-             (> +parallel-validation-workers+ 1))
+             (> *parallel-validation-workers* 1))
         (if (validate-block-scripts-parallel transactions script-flags utxo-set height
                                              :extra-coins extra-coins)
             (values t nil)
@@ -1284,9 +1279,7 @@ Returns the decoded height, or NIL if the leading push is malformed."
        (let ((height 0))
          (loop for i from 1 to push-len
                do (setf height (logior height (ash (aref script-sig i) (* 8 (1- i))))))
-         height))
-      ;; Other encodings not valid for BIP 34
-      (t nil))))
+         height)))))
 
 (defun validate-coinbase-height (block current-height)
   "Validate BIP 34: at/above the network activation height, the coinbase
@@ -2708,10 +2701,7 @@ Handles chain reorganizations when a competing chain has more work."
                            current-best-entry entry
                            :fee-estimator fee-estimator
                            :recent-rejects recent-rejects
-                           :mempool mempool)))
-
-          ;; New block is on a weaker chain - just store it
-          (t nil)))))
+                           :mempool mempool)))))))
 
       (values entry reorg-outcome)))))
 
@@ -3777,8 +3767,7 @@ chain back to BLOCK-HASH's parent if the active chain contained it. Returns
 reorganize to the best valid chain if it now outweighs the active tip. Returns
 (values t nil) on success, (values nil reason-keyword) on failure."
   (let ((entry (bl.store:get-block-index-entry chain-state block-hash)))
-    (if (null entry)
-        (values nil :block-not-found)
+    (if entry
         (progn
           (maphash (lambda (h e) (declare (ignore h))
                      (when (and (eq (bl.store:block-index-entry-status e) :invalid)
@@ -3803,7 +3792,8 @@ reorganize to the best valid chain if it now outweighs the active tip. Returns
                 (unless ok
                   (return-from reconsider-block
                     (values nil (if (eq detail :interrupted) :interrupted :reorg-failed)))))))
-          (values t nil)))))
+          (values t nil))
+        (values nil :block-not-found))))
 
 (defun precious-block (chain-state block-store utxo-set block-hash
                        &key fee-estimator recent-rejects mempool)

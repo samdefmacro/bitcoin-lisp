@@ -71,9 +71,9 @@ default-false parameters."
   "Positional JSON boolean with a non-false DEFAULT: NIL (null or omitted)
 yields DEFAULT; explicit false yields NIL; anything else T. Core:
 `params[i].isNull() ? default : params[i].get_bool()`."
-  (if (null value)
-      default
-      (positional-bool value)))
+  (if value
+      (positional-bool value)
+      default))
 
 (defun json-bool (x)
   "Coerce generalized boolean X to a JSON boolean: T or the false literal.

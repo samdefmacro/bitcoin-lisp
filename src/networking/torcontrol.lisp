@@ -39,13 +39,11 @@ DEFAULT_TOR_SOCKS_PORT, torcontrol.h:22).")
 (defconstant +tor-reply-ok+ 250)
 (defconstant +tor-reply-unrecognized+ 510)
 
-(defparameter +tor-safe-serverkey+
-  "Tor safe cookie authentication server-to-controller hash"
-  "HMAC key string for the SAFECOOKIE ServerHash (torcontrol.cpp:60).")
+(alexandria:define-constant +tor-safe-serverkey+ "Tor safe cookie authentication server-to-controller hash"
+  :test #'equalp :documentation "HMAC key string for the SAFECOOKIE ServerHash (torcontrol.cpp:60).")
 
-(defparameter +tor-safe-clientkey+
-  "Tor safe cookie authentication controller-to-server hash"
-  "HMAC key string for the SAFECOOKIE client response (torcontrol.cpp:62).")
+(alexandria:define-constant +tor-safe-clientkey+ "Tor safe cookie authentication controller-to-server hash"
+  :test #'equalp :documentation "HMAC key string for the SAFECOOKIE client response (torcontrol.cpp:62).")
 
 (defconstant +tor-reconnect-timeout-start+ 1.0
   "Initial reconnect backoff, seconds (Core RECONNECT_TIMEOUT_START).")
@@ -61,8 +59,8 @@ DEFAULT_TOR_SOCKS_PORT, torcontrol.h:22).")
 the spec sets no limit; a longer line means a broken/hostile server, so we
 disconnect rather than buffer without bound.")
 
-(defparameter +onion-private-key-file+ "onion_v3_private_key"
-  "Datadir filename holding the onion service's private key, verbatim as Tor
+(alexandria:define-constant +onion-private-key-file+ "onion_v3_private_key"
+  :test #'equalp :documentation "Datadir filename holding the onion service's private key, verbatim as Tor
 returned it (\"ED25519-V3:<base64>\") — same name and content as Core
 (TorController::GetPrivateKeyFile, torcontrol.cpp:665-668).")
 
@@ -481,8 +479,7 @@ SAFECOOKIE. Returns T on a 250 to AUTHENTICATE."
            t)
           (auth-code
            (bl.log:log-warn "tor: Authentication failed")
-           nil)
-          (t nil))))))
+           nil))))))
 
 ;;;; Onion proxy auto-configuration (Core get_socks_cb, torcontrol.cpp:358-427)
 
@@ -592,8 +589,7 @@ the generic error arm, as in Core: logged, no retry, connection stays up."
        nil)
       (code
        (bl.log:log-warn "tor: Add onion failed; error code ~D" code)
-       nil)
-      (t nil))))
+       nil))))
 
 ;;;; Session + reconnect loop (Core connected_cb / disconnected_cb / Reconnect)
 

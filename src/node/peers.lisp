@@ -13,7 +13,7 @@
 ;;;; dedicated block-relay-only outbound slots are a separate follow-up — these
 ;;;; anchors are drawn from the regular outbound pool.)
 
-(defparameter +max-anchors+ 2
+(defconstant +max-anchors+ 2
   "How many outbound peers to persist as reconnection anchors (Core saves 2).")
 
 (defconstant +anchors-magic-v1+ #x414e4331)  ; "ANC1" — bare IP strings, no port
@@ -700,15 +700,15 @@ bare IPv6 address (which contains colons) is treated as host-only."
       ;; [ipv6]:port  or  [ipv6]
       ((and (plusp (length spec)) (char= (char spec 0) #\[))
        (let ((close (position #\] spec)))
-         (if (null close)
-             (values spec default-port)
+         (if close
              (let ((host (subseq spec 1 close))
                    (rest (subseq spec (1+ close))))
                (if (and (plusp (length rest)) (char= (char rest 0) #\:)
                         (plusp (length (subseq rest 1)))
                         (every #'digit-char-p (subseq rest 1)))
                    (values host (parse-integer rest :start 1))
-                   (values host default-port))))))
+                   (values host default-port)))
+             (values spec default-port))))
       (t
        (let ((colon (position #\: spec :from-end t)))
          (if (and colon

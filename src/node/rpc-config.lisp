@@ -74,7 +74,7 @@ APPLY-CONFIG-GLOBALS."
       ;; -keypool sizes the keypool of wallets created AFTER it is set; an
       ;; existing wallet keeps the size it was made with, as in Core, where the
       ;; keypool size is per-wallet state.
-      (int-knob "keypool" bl.wallet:+default-keypool-size+ :min 1))
+      (int-knob "keypool" bl.wallet:*default-keypool-size* :min 1))
     ;; -walletdir relocates <datadir>/wallets/ (Core init.cpp). Relative paths
     ;; hang off the data directory, as -rpccookiefile does.
     (let ((v (lk "walletdir")))

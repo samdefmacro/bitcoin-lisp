@@ -698,10 +698,10 @@ test-bitcoin-server 2026-05-19 at h=135597."
 (defun utxo-exists-p (view txid output-index)
   (etypecase view
     (utxo-set
-     (not (null (gethash (make-utxo-key txid output-index)
-                         (utxo-set-entries view)))))
+     (and (gethash (make-utxo-key txid output-index)
+                         (utxo-set-entries view)) t))
     (coins-view-cache
-     (not (null (coin-view-has-p view txid output-index))))))
+     (and (coin-view-has-p view txid output-index) t))))
 
 (defun add-utxo (view txid output-index value script-pubkey height
                  &key coinbase)

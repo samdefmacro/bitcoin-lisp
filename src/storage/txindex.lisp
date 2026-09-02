@@ -74,7 +74,7 @@ the tip after invalidateblock and the next start rescanned from genesis."
 (defconstant +txindex-record-size+ 36
   "Value size: 32 (block-hash) + 4 (tx position, little-endian).")
 
-(defparameter +txindex-key-prefix+ 116
+(defconstant +txindex-key-prefix+ 116
   "ASCII #\t — the per-transaction key prefix, keeping txid keys clear of the
 metadata key below.")
 
@@ -149,7 +149,7 @@ index explicitly."
   "Check if a transaction is indexed."
   (and (tx-index-enabled txindex)
        (tx-index-db txindex)
-       (not (null (leveldb-get (tx-index-db txindex) (%txindex-key txid))))
+       (leveldb-get (tx-index-db txindex) (%txindex-key txid))
        t))
 
 (defun txindex-set-best-block (txindex block-hash)
@@ -258,11 +258,9 @@ Without this the scan re-read EVERY block from disk on every start just to ask
 whether it was already indexed — 149k blocks and about nine minutes on the live
 testnet4 node."
   (let ((best (txindex-best-block txindex)))
-    (if (null best)
-        (values 0 :no-marker)
+    (if best
         (let ((entry (get-block-index-entry chain-state best)))
-          (if (null entry)
-              (values 0 :marker-not-in-index)
+          (if entry
               (let* ((height (block-index-entry-height entry))
                      (on-chain (get-block-at-height chain-state height)))
                 (cond
@@ -283,7 +281,9 @@ testnet4 node."
                    ;; block as the scan reaches it, so resuming there is safe
                    ;; rather than merely cheaper.
                    (%txindex-fork-point chain-state entry))
-                  (t (values (1+ height) :resumed)))))))))
+                  (t (values (1+ height) :resumed))))
+              (values 0 :marker-not-in-index)))
+        (values 0 :no-marker))))
 
 (defun %txindex-fork-point (chain-state entry)
   "(values NEXT-HEIGHT REASON) for a marker ENTRY that is not on the active

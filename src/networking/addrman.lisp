@@ -262,8 +262,7 @@ address + bucket + table, so MakeTried can scan all buckets at this position."
     ((and (zerop (peer-address-last-success pa))
           (>= (peer-address-n-attempts pa) +addrman-retries+)) t)
     ((and (> (- now (peer-address-last-success pa)) +addrman-min-fail-seconds+)
-          (>= (peer-address-n-attempts pa) +addrman-max-failures+)) t)
-    (t nil)))
+          (>= (peer-address-n-attempts pa) +addrman-max-failures+)) t)))
 
 (defun addr-info-chance (pa now)
   "Selection-probability weight in [0,1] (Core GetChance)."
@@ -640,8 +639,8 @@ the attempt the second branch reads."
 
 ;;;; Persistence (rename-to-.bak + fresh on mismatch, Core LoadAddrman)
 
-(defparameter +addrman-magic+ #(#x41 #x44 #x52 #x4D)  ; "ADRM"
-  "Magic bytes for the bucket-format peers.dat.")
+(alexandria:define-constant +addrman-magic+ #(#x41 #x44 #x52 #x4D)  ; "ADRM"
+  :test #'equalp :documentation "Magic bytes for the bucket-format peers.dat.")
 (defconstant +addrman-format-version+ 4
   "v4 makes entries network-typed (BIP155): a net-id byte and a
 variable-length address replace the fixed 16-byte IP, so torv3/i2p/cjdns

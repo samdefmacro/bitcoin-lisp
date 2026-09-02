@@ -13,7 +13,7 @@ bl.* package nicknames, the condition hierarchy, index-based byte I/O with
 CompactSize, chain parameters and the node-context struct. No project
 package above it exists while it compiles, so an upward reference here is
 a compile error, not a layering-test entry."
-  :depends-on ("ironclad" "flexi-streams")
+  :depends-on ("ironclad" "flexi-streams" "alexandria")
   :pathname "src"
   :serial t
   :components ((:file "util/package")
@@ -48,7 +48,7 @@ util layer for chain parameters (bech32 HRPs) only."
   :description "The node's log (levels, Core-style categories, ring buffer,
 file stream, rate limiter, deferred lines, notify hooks): package
 bitcoin-lisp.logging, which the main package :USEs and re-exports."
-  :depends-on ("bitcoin-lisp/util" "bordeaux-threads")
+  :depends-on ("bitcoin-lisp/util" "bordeaux-threads" "alexandria")
   :pathname "src"
   :components ((:file "logging")))
 
@@ -72,7 +72,7 @@ which the chain above supplies (src/config-options.lisp)."
   :description "Persistence primitives: the LevelDB binding, flat file
 sequences with XOR obfuscation, the datadir layout, fsync. Package
 bitcoin-lisp.kv, which bitcoin-lisp.storage :USEs and re-exports."
-  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "cffi" "bordeaux-threads" "ironclad")
+  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "cffi" "bordeaux-threads" "ironclad" "alexandria")
   :pathname "src"
   :serial t
   :components ((:file "kv/package")
@@ -87,7 +87,7 @@ bitcoin-lisp.kv, which bitcoin-lisp.storage :USEs and re-exports."
 transaction / block / header types, CompactSize, the P2P message table
 (define-message), the UTXO compressor and PSBT. Chain-specific, but it
 needs nothing above util and crypto, so it is a layer of its own."
-  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "flexi-streams" "cl-base64")
+  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "flexi-streams" "cl-base64" "alexandria")
   :pathname "src"
   :serial t
   :components ((:file "serialization/package")
@@ -106,7 +106,7 @@ of the kv and serialization layers. The pruning policy knobs live here
 (prune-policy.lisp) so the store never reaches up into the node."
   :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "bitcoin-lisp/logging"
                "bitcoin-lisp/kv" "bitcoin-lisp/serialization"
-               "flexi-streams" "ironclad" "bordeaux-threads")
+               "flexi-streams" "ironclad" "bordeaux-threads" "alexandria")
   :pathname "src"
   :serial t
   :components ((:file "storage/package")

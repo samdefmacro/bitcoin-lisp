@@ -58,21 +58,21 @@ headerindex.dat at the root. Returns (values path legacy-p)."
           ((probe-file legacy) (values legacy t))
           (t (values core nil)))))
 
-(defparameter +core-index-subdirectories+
+(alexandria:define-constant +core-index-subdirectories+
   '((:txindex . "indexes/txindex/")
     (:blockfilter . "indexes/blockfilter/basic/")
     (:coinstats . "indexes/coinstatsindex/")
     ;; Core nests this one a level deeper than the others — the DB lives at
     ;; indexes/txospenderindex/db (index/txospenderindex.cpp:64).
     (:txospenderindex . "indexes/txospenderindex/db/"))
-  "Core doc/files.md's index paths.")
+  :test #'equalp :documentation "Core doc/files.md's index paths.")
 
-(defparameter +legacy-index-subdirectories+
+(alexandria:define-constant +legacy-index-subdirectories+
   '((:txindex . "txindex/")
     (:blockfilter . "blockfilterindex/")
     (:coinstats . "coinstatsindex/")
     (:txospenderindex . "txospenderindex/"))
-  "The flat layout this tree used before.")
+  :test #'equalp :documentation "The flat layout this tree used before.")
 
 (defun datadir-index-path (data-dir which)
   "Where index WHICH (:txindex, :blockfilter, :coinstats or

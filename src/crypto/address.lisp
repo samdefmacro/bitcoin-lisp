@@ -171,8 +171,7 @@ DecodeSecret does; the byte alone cannot tell the test chains apart."
   (let ((polymod (bech32-polymod (append (bech32-hrp-expand hrp) data))))
     (cond
       ((= polymod +bech32-const+) :bech32)
-      ((= polymod +bech32m-const+) :bech32m)
-      (t nil))))
+      ((= polymod +bech32m-const+) :bech32m))))
 
 (defun bech32-create-checksum (hrp data variant)
   "Create Bech32/Bech32m checksum."

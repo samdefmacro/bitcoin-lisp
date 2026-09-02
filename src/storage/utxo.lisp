@@ -387,7 +387,7 @@ Returns the file bytes (without CRC) on success, NIL on failure."
 (defconstant +utxo-format-version+ 1
   "Current UTXO persistence format version.")
 
-(defparameter +utxo-save-flush-threshold+ (* 4 1024 1024)
+(defconstant +utxo-save-flush-threshold+ (* 4 1024 1024)
   "Bytes to accumulate in the byte-buf before flushing to disk during
 save-utxo-set. Caps peak save-time memory at ~4MB regardless of UTXO
 set size, which matters at testnet4 h>~70k (10M+ entries → ~800MB

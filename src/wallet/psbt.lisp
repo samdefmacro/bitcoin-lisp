@@ -18,8 +18,7 @@
   "The (key . value) pairs of a JSON object (alist or hash-table)."
   (cond ((hash-table-p obj)
          (loop for k being the hash-keys of obj using (hash-value v) collect (cons k v)))
-        ((listp obj) obj)
-        (t nil)))
+        ((listp obj) obj)))
 
 (defun %psbt-decode-arg (b64 &optional (what "psbt"))
   "Decode a base64 PSBT argument, mapping any failure to a deserialization error."
@@ -1714,7 +1713,7 @@ max(node incremental, wallet incremental), floored at GetMinimumFeeRate."
   (declare (ignore wallet))
   (let* ((txsize (bl.ser:transaction-vsize orig))
          (base (if (plusp txsize) (floor (* old-fee 1000) txsize) 0))
-         (feerate (+ base 1 (max bl.mp:+incremental-relay-fee-rate+
+         (feerate (+ base 1 (max bl.mp:*incremental-relay-fee-rate*
                                  +wallet-incremental-relay-fee-rate+)))
          (min-rate (%wallet-minimum-fee-rate node cc)))
     (max feerate min-rate)))
@@ -1799,7 +1798,7 @@ Caller holds node + wallet locks."
           ;; it here so a too-low bump fails BEFORE we sign / mark the original
           ;; replaced (%create-transaction already caps at -maxtxfee).
           (let ((min-total (+ old-fee
-                              (bl.rpc:feerate-fee bl.mp:+incremental-relay-fee-rate+
+                              (bl.rpc:feerate-fee bl.mp:*incremental-relay-fee-rate*
                                             (bl.ser:transaction-vsize new-tx)))))
             (when (< new-fee min-total)
               (return-from %create-rate-bump

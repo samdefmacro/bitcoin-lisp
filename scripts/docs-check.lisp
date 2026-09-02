@@ -68,6 +68,36 @@
                      entry-point checking is silently OFF.~%")
           (setf ok nil))
         (format t "~&;; RED ok: dangling reference failed as it must.~%")))
+  ;; Every src/ module -- each directory and each top-level file -- must be
+  ;; named somewhere in the manual's text, so a new layer cannot go
+  ;; undocumented (src/zmq.lisp was, for a month, with no way to tell).
+  (let* ((root (uiop:getcwd))
+         (manual (uiop:read-file-string (merge-pathnames "docs/manual.lisp" root)))
+         (missing '()))
+    ;; A module is named by its directory (src/NAME/) or its package
+    ;; (bitcoin-lisp.NAME); a top-level file by its name (NAME.lisp) or the
+    ;; package it defines.
+    (flet ((named-p (name)
+             (or (search (format nil "src/~A/" name) manual)
+                 (search (format nil "~A.lisp" name) manual)
+                 (search (format nil "bitcoin-lisp.~A" name) manual))))
+      (dolist (dir (uiop:subdirectories (merge-pathnames "src/" root)))
+        (let ((name (car (last (pathname-directory dir)))))
+          (unless (named-p name)
+            (push (format nil "src/~A/" name) missing))))
+      (dolist (file (uiop:directory-files (merge-pathnames "src/" root) "*.lisp"))
+        (let ((name (pathname-name file)))
+          (unless (or (string= name "package") (named-p name))
+            (push (format nil "src/~A.lisp" name) missing))))
+    (if missing
+        (progn (format t "~&;; RED: no manual section names ~{~A~^, ~}~%" missing)
+               (setf ok nil))
+        (format t "~&;; GREEN ok: every src/ module is named in the manual~%"))
+    ;; The check can actually fail: a module no section names must be missed.
+    (if (named-p "no-such-module-probe")
+        (progn (format t "~&;; RED SELF-TEST FAILED: the coverage check accepts a module nothing names.~%")
+               (setf ok nil))
+        (format t "~&;; RED ok: an unnamed module is reported as it must.~%"))))
   (if ok
       (format t "~&;; docs-check PASSED~%")
       (progn

@@ -239,11 +239,12 @@ never once caught by a unit test."
         "no caller in src/ for:~%~{  ~A~%~}Wire it up, or add it to ~
 *ORPHAN-EXPORT-BASELINE* under the group that says why."
         new)
-    ;; Progress, not a failure: report it so the list can be pruned.
-    (when resolved
-      (format *test-dribble*
-              "~&; ~D *ORPHAN-EXPORT-BASELINE* entr~:@P now called from src/; ~
-delete from the list:~%~{;   ~A~%~}" (length resolved) resolved))))
+    ;; Progress must be recorded, or the list stops meaning anything: an
+    ;; entry that gained a caller (or stopped being exported) is pruned in
+    ;; the same change, so the baseline is always exactly the open cases.
+    (is (null resolved)
+        "~D *ORPHAN-EXPORT-BASELINE* entr~:@P no longer orphaned; delete from ~
+the list: ~S" (length resolved) resolved)))
 
 (test orphan-sweep-can-actually-fail
   "Positive control for NO-NEW-ORPHANED-EXPORTS, whose assertion is of the form

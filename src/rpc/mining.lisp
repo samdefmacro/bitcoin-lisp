@@ -119,8 +119,7 @@ setClientRules empty."
       (let ((v (gethash "rules" req)))
         (let ((elements (cond ((stringp v) nil)
                               ((listp v) v)
-                              ((vectorp v) (coerce v 'list))
-                              (t nil))))
+                              ((vectorp v) (coerce v 'list)))))
           ;; Core calls get_str() on each element, so a non-string one is a
           ;; type error rather than a rule that silently does not match
           ;; (rpc/mining.cpp:756-757, univalue type_error).
@@ -808,15 +807,15 @@ chain-work and time spanned (Bitcoin Core getnetworkhashps)."
         0
         (let* ((window (min nblocks height))
                (start (bl.store:get-block-at-height chain-state (- height window))))
-          (if (null start)
-              0
+          (if start
               (let ((dwork (- (bl.store:block-index-entry-chain-work tip)
                               (bl.store:block-index-entry-chain-work start)))
                     (dtime (- (bl.ser:block-header-timestamp
                                (bl.store:block-index-entry-header tip))
                               (bl.ser:block-header-timestamp
                                (bl.store:block-index-entry-header start)))))
-                (if (<= dtime 0) 0 (round dwork dtime))))))))
+                (if (<= dtime 0) 0 (round dwork dtime)))
+              0)))))
 
 (define-rpc "generate" (node params)
   "Core keeps `generate' registered ONLY so that calling it explains itself

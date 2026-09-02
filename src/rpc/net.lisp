@@ -322,8 +322,8 @@ whatever the cadence is."
          ;; ::minRelayTxFee.GetFeePerK(), not the compile-time default.
          (relayfee (/ bl.mp:*min-relay-fee-rate*
                       100000000.0d0))
-         ;; +incremental-relay-fee-rate+ is sat/kvB -> BTC/kvB.
-         (incfee (/ bl.mp:+incremental-relay-fee-rate+ 100000000.0d0)))
+         ;; *incremental-relay-fee-rate* is sat/kvB -> BTC/kvB.
+         (incfee (/ bl.mp:*incremental-relay-fee-rate* 100000000.0d0)))
     `(("version" . ,bl.ser:+client-version+)
       ("subversion" . ,bl.ser:*user-agent*)
       ("protocolversion" . 70016)

@@ -190,8 +190,7 @@ stop-node's own 600s sync-thread join."
 running. A node that stopped running without a request was not asked to stop
 (fatal snapshot, dead sync thread) — that is the respawn case."
   (cond ((cdr *shutdown-request*))
-        ((or (null *node*) (not (node-running *node*))) +node-exit-watchdog+)
-        (t nil)))
+        ((or (null *node*) (not (node-running *node*))) +node-exit-watchdog+)))
 
 (defun run-node-watchdog (&key (poll-seconds 1) (exit t))
   "Main-thread shutdown watchdog, the last form the supervisor launcher

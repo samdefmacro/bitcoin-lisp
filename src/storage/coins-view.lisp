@@ -229,7 +229,7 @@ CCoinsViewDB::BatchWrite, txdb.cpp:100-159)."
 (defun coins-view-db-has-p (view utxo-key)
   "Mirrors CCoinsViewDB::HaveCoin (txdb.cpp:81)."
   (declare (type coins-view-db view) (type utxo-key utxo-key))
-  (not (null (leveldb-get (cvdb-db view) (encode-coin-key utxo-key)))))
+  (and (leveldb-get (cvdb-db view) (encode-coin-key utxo-key)) t))
 
 (defun coins-view-db-erase-all-coins (view)
   "Delete every coin ('C'-prefixed) entry from the base LevelDB, in bounded

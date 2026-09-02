@@ -166,11 +166,11 @@ opcode (OP_1..OP_16) as the key count, or 20 if not present."
 
 (defun stack-pop (ctx)
   "Pop and return the top value from the stack."
-  (if (null (script-context-stack ctx))
+  (if (script-context-stack ctx)
+      (pop (script-context-stack ctx))
       (progn
         (setf (script-context-error ctx) :stack-underflow)
-        nil)
-      (pop (script-context-stack ctx))))
+        nil)))
 
 (defun stack-top (ctx)
   "Return the top value without popping."

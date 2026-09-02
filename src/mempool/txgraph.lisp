@@ -185,7 +185,7 @@ alone exceeds the size limit (Core IsOversized, txgraph.cpp:2606-2624)."
   "True when HANDLE's transaction has not been removed (Core Exists).
 Available even when oversized."
   (%check-handle graph handle)
-  (not (null (tx-handle-cluster handle))))
+  (and (tx-handle-cluster handle) t))
 
 ;;;; Internal helpers
 
@@ -437,8 +437,7 @@ closure, then apply the (parent-handle . child-handle) DEPS (the eager
 equivalent of Core Merge + Cluster::ApplyDependencies,
 txgraph.cpp:2068-2155). The caller has checked the combined limits."
   (let ((target
-          (if (null (rest clusters))
-              (first clusters)
+          (if (rest clusters)
               (let* ((total (reduce #'+ clusters
                                     :key (lambda (c) (depgraph-tx-count (%cluster-depgraph c)))))
                      (new (%graph-new-cluster graph))
@@ -470,7 +469,8 @@ txgraph.cpp:2068-2155). The caller has checked the combined limits."
                            dg parents (tx-handle-pos (aref old-map i))))))))
                 (dolist (old clusters)
                   (remhash old (txgraph-clusters graph)))
-                new))))
+                new)
+              (first clusters))))
     (let ((dg (%cluster-depgraph target)))
       (dolist (dep deps)
         (depgraph-add-dependencies dg (ash 1 (tx-handle-pos (car dep)))

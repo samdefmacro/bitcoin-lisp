@@ -299,7 +299,7 @@ disconnected by handle-message's rate-limit gate.")
   "Maximum P2P message payload size in bytes: 4,000,000, matching Bitcoin Core
 MAX_PROTOCOL_MESSAGE_LENGTH (net.h). Not 4 MiB -- Core uses decimal 4e6.")
 
-(defparameter +handshake-timeout-seconds+ 60
+(defvar *handshake-timeout-seconds* 60
   "Maximum seconds a peer has to complete the version handshake, settable with
 -peertimeout (Core DEFAULT_PEER_CONNECT_TIMEOUT, net.h:87).
 

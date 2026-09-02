@@ -605,9 +605,7 @@ index, -reindex, and the block-store <-> header-index position map."
        (log-error "headerindex.dat is present but unreadable: ~A." corrupt-reason)
        (log-error "Refusing to start: an empty block index would contradict the stored chainstate.")
        (log-error "Recover by restoring a backup of headerindex.dat, or reindex from the block files.")
-       (init-error "Corrupt headerindex.dat at ~A" (node-data-directory *node*)))
-      ;; No file at all — a legitimate first run.
-      (t nil)))
+       (init-error "Corrupt headerindex.dat at ~A" (node-data-directory *node*)))))
 
   ;; Genesis FIRST: the reindex below links each record to a parent already in
   ;; the index, so without a root the drain never starts and every record is

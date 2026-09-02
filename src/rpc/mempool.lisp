@@ -59,7 +59,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
   "Return mempool statistics."
   (declare (ignore params))
   (let ((mempool (rpc-get-mempool node))
-        (incfee (/ bl.mp:+incremental-relay-fee-rate+ 100000000.0d0)))
+        (incfee (/ bl.mp:*incremental-relay-fee-rate* 100000000.0d0)))
     (if mempool
         ;; Rates are sat/kvB (Core CFeeRate); convert to BTC/kvB via /1e8.
         ;; Node lock: count/bytes/total-fee must be one consistent snapshot
@@ -473,19 +473,19 @@ maxfeerate at INDEX: a BTC/kvB amount defaulting to
 DEFAULT_MAX_RAW_TX_FEE_RATE, which must stay strictly under 1 BTC/kvB.
 Returns satoshis per kvB, where 0 means the caller disabled the rail."
   (let ((v (and (> (length params) index) (nth index params))))
-    (if (null v)
-        +default-max-raw-tx-fee-rate+
+    (if v
         (let ((sat (amount-from-value v)))
           (when (>= sat 100000000)
             (error 'rpc-error :code +rpc-invalid-parameter+
                               :message "Fee rates larger than or equal to 1BTC/kvB are not accepted"))
-          sat))))
+          sat)
+        +default-max-raw-tx-fee-rate+)))
 
 (defun %parse-max-burn-amount (params index)
   "Core's maxburnamount at INDEX (rpc/mempool.cpp:92), a BTC amount defaulting
 to DEFAULT_MAX_BURN_AMOUNT (0) -- no burn is tolerated unless asked for."
   (let ((v (and (> (length params) index) (nth index params))))
-    (if (null v) 0 (amount-from-value v))))
+    (if v (amount-from-value v) 0)))
 
 (defun %check-max-burn (tx max-burn)
   "Signal Core's MAX_BURN_EXCEEDED when an output of TX commits more than

@@ -30,9 +30,9 @@ queued for a slow subscriber are DROPPED rather than allowed to grow the node's
 memory without bound -- a subscriber that cannot keep up must not be able to
 stall or exhaust the node.")
 
-(defparameter +zmq-topics+
+(alexandria:define-constant +zmq-topics+
   '("hashblock" "hashtx" "rawblock" "rawtx" "sequence")
-  "Core's five publishers (zmqpublishnotifier.cpp:34-38).")
+  :test #'equalp :documentation "Core's five publishers (zmqpublishnotifier.cpp:34-38).")
 
 (defun ensure-zmq-library ()
   "Load libzmq on first use. Returns T on success, NIL (with a warning) if the

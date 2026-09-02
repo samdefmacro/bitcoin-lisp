@@ -44,10 +44,10 @@ Falls back to usocket:wait-for-input when the descriptor cannot be reached, so
 a socket type we do not recognise still behaves as before rather than silently
 reporting `never ready' -- which would be worse than the bug this replaces."
   (let ((fd (%socket-fd socket)))
-    (if (null fd)
-        (and (usocket:wait-for-input socket :timeout timeout :ready-only t) t)
+    (if fd
         (let ((msec (if (or (null timeout) (zerop timeout))
                         0
                         (max 1 (round (* 1000 timeout))))))
           #+sbcl (and (sb-unix:unix-simple-poll fd :input msec) t)
-          #-sbcl (and (usocket:wait-for-input socket :timeout timeout :ready-only t) t)))))
+          #-sbcl (and (usocket:wait-for-input socket :timeout timeout :ready-only t) t))
+        (and (usocket:wait-for-input socket :timeout timeout :ready-only t) t))))

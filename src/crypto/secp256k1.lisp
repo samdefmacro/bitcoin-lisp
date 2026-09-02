@@ -222,7 +222,7 @@ Returns an internal public key structure, or NIL if invalid."
 
 (defun public-key-valid-p (pubkey-bytes)
   "Check if PUBKEY-BYTES represents a valid secp256k1 public key."
-  (not (null (parse-public-key pubkey-bytes))))
+  (and (parse-public-key pubkey-bytes) t))
 
 (defun decompress-public-key (pubkey33)
   "Decompress a 33-byte compressed public key (prefix 0x02/0x03) into its
@@ -620,7 +620,7 @@ signature over HASH32 with the given RECID (0-3). Returns the pubkey bytes
 
 (defun xonly-pubkey-valid-p (pubkey32)
   "Check if 32 bytes represent a valid x-only public key (point on curve)."
-  (not (null (parse-xonly-pubkey pubkey32))))
+  (and (parse-xonly-pubkey pubkey32) t))
 
 (defun tweak-xonly-pubkey (xonly-pubkey32 tweak32)
   "Tweak an x-only public key: output = internal_pubkey + tweak*G.
@@ -907,7 +907,7 @@ When low-s=T and signature has high-S, returns (values nil :high-s)."
   "T when the loaded libsecp256k1 was built with the ellswift module.
 Old system libraries lack it; the v2 transport must fall back to v1 then."
   (ensure-secp256k1-loaded)
-  (not (null (cffi:foreign-symbol-pointer "secp256k1_ellswift_create"))))
+  (and (cffi:foreign-symbol-pointer "secp256k1_ellswift_create") t))
 
 (defun %ellswift-bip324-hashfp ()
   "The library's BIP324 xdh hash function: an exported const VARIABLE holding

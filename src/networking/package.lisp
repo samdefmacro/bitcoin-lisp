@@ -32,7 +32,7 @@ headerssync.cpp. src/networking/.")
    #:connection-send-stalled-p
    #:flush-send-buffer
    #:flush-peer-send-buffers
-   #:+max-send-buffer-bytes+
+   #:*max-send-buffer-bytes*
    ;; BIP324 v2 transport
    #:*v2-transport-enabled*
    #:v2-available-p
@@ -328,7 +328,7 @@ headerssync.cpp. src/networking/.")
    #:*whitelist-entries*
    #:*whitelist-force-relay*
    #:*whitelist-relay*
-   #:+max-tip-age-seconds+
+   #:*max-tip-age-seconds*
    #:+max-upload-timeframe-seconds+
    #:address-book-info
    #:address-book-n-new
