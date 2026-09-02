@@ -130,204 +130,145 @@ AddAddrFetch peer dials instead of getaddrinfo lookups (net.cpp:2353-2358)."
 ;;; Message handling
 
 (defun handle-message (peer command payload ctx)
-  "Handle an incoming message from a peer.
-CTX is the node-context; a NIL slot disables the path that needs it:
-no mempool or peers, no transaction relay;
+  "Handle an incoming message from a peer: the DEFINE-P2P-HANDLER row for
+COMMAND, after the per-peer rate limit. CTX is the node-context; a NIL slot
+disables the path that needs it: no mempool or peers, no transaction relay;
 no fee-estimator, no fee stats from blocks; no address-book, no peer
 database updates from addr messages; no recent-rejects, no reject cache.
-Returns T if message was handled, NIL otherwise."
-  (bl.ctx:with-node-context (mempool peers) ctx
-  ;; Core logs EVERY inbound message here, before dispatch
-  ;; (net_processing.cpp:3582). It is not a debugging nicety: several functional
-  ;; tests assert on the exact line — p2p_addr_relay.py waits for
-  ;; "received: addr (301 bytes) peer=1" to know the message was taken in at all,
-  ;; because the observable effect it is really testing (relay to two peers)
-  ;; happens later and asynchronously.
-  ;;
-  ;; The BYTE COUNT is the payload's, not the framed message's, matching
-  ;; vRecv.size() at that point.
-  (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
-                        command (length payload) (peer-id peer))
-  ;; Check per-peer rate limit before processing
-  (unless (check-peer-rate-limit peer command)
-    (bl:log-warn "Rate limit exceeded for peer ~A on ~A messages"
-                           (peer-address peer) command)
-    (disconnect-peer peer)
-    (return-from handle-message nil))
+Returns T if the message was handled, NIL for a command this node does not
+know or a peer that exceeded its rate limit (and was disconnected)."
+  (bl.ctx:with-node-context (mempool) ctx
+    ;; Core logs EVERY inbound message here, before dispatch
+    ;; (net_processing.cpp:3582). It is not a debugging nicety: several functional
+    ;; tests assert on the exact line -- p2p_addr_relay.py waits for
+    ;; "received: addr (301 bytes) peer=1" to know the message was taken in at all,
+    ;; because the observable effect it is really testing (relay to two peers)
+    ;; happens later and asynchronously.
+    ;;
+    ;; The BYTE COUNT is the payload's, not the framed message's, matching
+    ;; vRecv.size() at that point.
+    (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
+                command (length payload) (peer-id peer))
+    (let ((handler (p2p-handler-for command)))
+      ;; Check per-peer rate limit before processing
+      (unless (check-peer-rate-limit peer command handler)
+        (bl:log-warn "Rate limit exceeded for peer ~A on ~A messages"
+                     (peer-address peer) command)
+        (disconnect-peer peer)
+        (return-from handle-message nil))
+      (cond ((null handler) nil)          ; Unknown message
+            ;; Acknowledged but not processed: the message needs a mempool
+            ;; and this context has none (a header-only or IBD pump).
+            ((and (p2p-handler-needs-mempool handler) (null mempool)) t)
+            (t (funcall (p2p-handler-function handler) peer payload ctx)
+               t)))))
+
+;;; The messages whose whole handling fits in a table row. The larger
+;;; handlers below are DEFINE-P2P-HANDLER forms of their own.
+
+(define-p2p-handler "ping" (peer payload ctx)
+  "BIP31: answer with the same nonce."
+  (declare (ignore ctx))
+  (let ((nonce (bl.bytes:with-byte-reader (s payload)
+                 (bl.bytes:br-read-u64-le s))))
+    (bl:log-debug "ping from ~A: ~D payload bytes, nonce ~D"
+                  (peer-address peer) (length payload) nonce)
+    (reply-to-ping peer nonce)))
+
+(define-p2p-handler "pong" (peer payload ctx)
+  "Close the round trip our last ping opened."
+  (declare (ignore ctx))
+  (record-pong peer (bl.bytes:with-byte-reader (s payload)
+                      (bl.bytes:br-read-u64-le s))))
+
+(define-p2p-handler "mempool" (peer payload ctx)
+  "BIP35. Core honors this only when it advertises NODE_BLOOM or the peer
+holds the \"mempool\" permission; otherwise it disconnects (\"mempool
+request with bloom filters disabled\", net_processing.cpp:4940-4951). We
+never advertise NODE_BLOOM, so the permission is the only way in.
+
+Core also refuses a permitted request once -maxuploadtarget is spent
+(:4953), and does not disconnect a noban peer for it either."
   (cond
-    ((string= command "ping")
-     (let ((nonce (bl.bytes:with-byte-reader (s payload)
-                    (bl.bytes:br-read-u64-le s))))
-       (bl:log-debug "ping from ~A: ~D payload bytes, nonce ~D"
-                               (peer-address peer) (length payload) nonce)
-       (handle-ping peer nonce))
-     t)
+    ((not (peer-has-permission-p peer +perm-mempool+))
+     (bl:log-cat
+      "net" "mempool request with bloom filters disabled — disconnecting peer ~A"
+      (peer-address peer))
+     (disconnect-peer peer))
+    ((outbound-target-reached-p nil)
+     (bl:log-cat
+      "net" "mempool request with bandwidth limit reached from ~A"
+      (peer-address peer))
+     (unless (peer-has-permission-p peer +perm-noban+)
+       (disconnect-peer peer)))
+    (t (handle-mempool-request peer payload ctx))))
 
-    ((string= command "pong")
-     (let ((nonce (bl.bytes:with-byte-reader (s payload)
-                    (bl.bytes:br-read-u64-le s))))
-       (handle-pong peer nonce))
-     t)
+(define-p2p-handler "verack" (peer payload ctx)
+  "A second verack, after the handshake already completed. Core ignores it
+with this exact line rather than disconnecting (net_processing.cpp:3822)
+-- and p2p_handshake.py greps the log for it, so the wording is part of
+the behaviour, not decoration."
+  (declare (ignore payload ctx))
+  (bl:log-cat "net" "ignoring redundant verack message from peer=~A"
+              (peer-id peer)))
 
-    ((string= command "inv")
-     (handle-inv peer payload ctx)
-     t)
+(define-p2p-handler "sendaddrv2" (peer payload ctx)
+  "No-op post-handshake (only meaningful during handshake)."
+  (declare (ignore peer payload ctx)))
 
-    ((string= command "headers")
-     (handle-headers peer payload ctx)
-     t)
+(define-p2p-handler "wtxidrelay" (peer payload ctx)
+  "BIP 339: No-op post-handshake (only meaningful during handshake)."
+  (declare (ignore peer payload ctx)))
 
-    ((string= command "block")
-     (handle-block peer payload ctx)
-     t)
+(define-p2p-handler "sendtxrcncl" (peer payload ctx)
+  "BIP 330: feature negotiation is only valid between VERSION and VERACK
+(handled in %await-verack). Receiving it here -- post-verack -- is a
+protocol violation: Core disconnects (net_processing.cpp:3969-3973),
+unlike the sendaddrv2/wtxidrelay no-op stubs. With -txreconciliation off,
+Core ignores the message instead (:3964-3967)."
+  (declare (ignore payload ctx))
+  (when bl:*tx-reconciliation*
+    (bl:log-cat "net" "sendtxrcncl received after verack — disconnecting peer ~A"
+                (peer-address peer))
+    (disconnect-peer peer)))
 
-    ((string= command "tx")
-     (when mempool
-       (handle-tx peer payload ctx))
-     t)
+;;; BIP-330 reconciliation. Every one of these is ignored unless the peer
+;;; completed the sendtxrcncl handshake, which needs -txreconciliation on
+;;; both sides -- so with the flag off they are inert rather than errors.
 
-    ((string= command "getdata")
-     (handle-getdata peer payload ctx)
-     t)
+(define-p2p-handler "reqrecon" (peer payload ctx)
+  "The peer opens a reconciliation round: answer with a sketch."
+  (declare (ignore ctx))
+  (when (peer-recon-registered peer) (%handle-reqrecon peer payload)))
 
-    ((string= command "getheaders")
-     (handle-getheaders peer payload ctx)
-     t)
+(define-p2p-handler "sketch" (peer payload ctx)
+  "The responder's sketch: decode, or ask for an extension."
+  (declare (ignore ctx))
+  (when (peer-recon-registered peer) (%handle-sketch peer payload)))
 
-    ((string= command "getblocks")
-     (handle-getblocks peer payload ctx)
-     t)
+(define-p2p-handler "reqsketchext" (peer payload ctx)
+  "The initiator could not decode: send a sketch of double capacity."
+  (declare (ignore payload ctx))
+  (when (peer-recon-registered peer) (%handle-reqsketchext peer)))
 
-    ((string= command "getaddr")
-     (handle-getaddr peer payload ctx)
-     t)
+(define-p2p-handler "reconcildiff" (peer payload ctx)
+  "The initiator's verdict: announce what it asked for, or everything on failure."
+  (declare (ignore ctx))
+  (when (peer-recon-registered peer) (%handle-reconcildiff peer payload)))
 
-    ((string= command "mempool")
-     ;; BIP35. Core honors this only when it advertises NODE_BLOOM or the peer
-     ;; holds the "mempool" permission; otherwise it disconnects ("mempool
-     ;; request with bloom filters disabled", net_processing.cpp:4940-4951). We
-     ;; never advertise NODE_BLOOM, so the permission is the only way in.
-     ;;
-     ;; Core also refuses a permitted request once -maxuploadtarget is spent
-     ;; (:4953), and does not disconnect a noban peer for it either.
-     (cond
-       ((not (peer-has-permission-p peer +perm-mempool+))
-        (bl:log-cat
-         "net" "mempool request with bloom filters disabled — disconnecting peer ~A"
-         (peer-address peer))
-        (disconnect-peer peer))
-       ((bl.net:outbound-target-reached-p nil)
-        (bl:log-cat
-         "net" "mempool request with bandwidth limit reached from ~A"
-         (peer-address peer))
-        (unless (peer-has-permission-p peer +perm-noban+)
-          (disconnect-peer peer)))
-       (t (handle-mempool-request peer payload ctx)))
-     t)
+(define-p2p-handler "sendheaders" (peer payload ctx)
+  "BIP 130: Peer prefers header announcements over inv."
+  (declare (ignore payload ctx))
+  (setf (peer-prefers-headers peer) t))
 
-    ((string= command "notfound")
-     (handle-notfound peer payload)
-     t)
-
-    ((string= command "addr")
-     (handle-addr peer payload ctx)
-     t)
-
-    ((string= command "addrv2")
-     (handle-addrv2 peer payload ctx)
-     t)
-
-    ((string= command "getcfilters")
-     (handle-getcfilters peer payload ctx)
-     t)
-
-    ((string= command "getcfheaders")
-     (handle-getcfheaders peer payload ctx)
-     t)
-
-    ((string= command "getcfcheckpt")
-     (handle-getcfcheckpt peer payload ctx)
-     t)
-
-    ((string= command "verack")
-     ;; A second verack, after the handshake already completed. Core ignores it
-     ;; with this exact line rather than disconnecting (net_processing.cpp:3822)
-     ;; — and p2p_handshake.py greps the log for it, so the wording is part of
-     ;; the behaviour, not decoration.
-     (bl:log-cat "net" "ignoring redundant verack message from peer=~A"
-                           (peer-id peer))
-     t)
-
-    ((string= command "sendaddrv2")
-     ;; No-op post-handshake (only meaningful during handshake)
-     t)
-
-    ((string= command "wtxidrelay")
-     ;; BIP 339: No-op post-handshake (only meaningful during handshake)
-     t)
-
-    ((string= command "sendtxrcncl")
-     ;; BIP 330: feature negotiation is only valid between VERSION and VERACK
-     ;; (handled in %await-verack). Receiving it here — post-verack — is a
-     ;; protocol violation: Core disconnects (net_processing.cpp:3969-3973),
-     ;; unlike the sendaddrv2/wtxidrelay no-op stubs above. With
-     ;; -txreconciliation off, Core ignores the message instead (:3964-3967).
-     (when bl:*tx-reconciliation*
-       (bl:log-cat "net" "sendtxrcncl received after verack — disconnecting peer ~A"
-                             (peer-address peer))
-       (disconnect-peer peer))
-     t)
-
-    ;; BIP-330 reconciliation. Every one of these is ignored unless the peer
-    ;; completed the sendtxrcncl handshake, which needs -txreconciliation on
-    ;; both sides — so with the flag off they are inert rather than errors.
-    ((string= command "reqrecon")
-     (when (peer-recon-registered peer) (%handle-reqrecon peer payload))
-     t)
-    ((string= command "sketch")
-     (when (peer-recon-registered peer) (%handle-sketch peer payload))
-     t)
-    ((string= command "reqsketchext")
-     (when (peer-recon-registered peer) (%handle-reqsketchext peer))
-     t)
-    ((string= command "reconcildiff")
-     (when (peer-recon-registered peer) (%handle-reconcildiff peer payload))
-     t)
-
-    ((string= command "sendheaders")
-     ;; BIP 130: Peer prefers header announcements over inv
-     (setf (peer-prefers-headers peer) t)
-     t)
-
-    ((string= command "feefilter")
-     ;; BIP 133: the peer's minimum fee rate for tx relay. Core applies it
-     ;; only when MoneyRange (net_processing.cpp:5126); a rate above
-     ;; MAX_MONEY would otherwise silently suppress all relay to this peer.
-     (let ((rate (bl.ser:parse-feefilter-payload payload)))
-       (when (<= rate bl.val:+max-money+)
-         (setf (peer-feefilter-rate peer) rate)))
-     t)
-
-    ;; Compact block messages (BIP 152)
-    ((string= command "sendcmpct")
-     (handle-sendcmpct peer payload)
-     t)
-
-    ((string= command "cmpctblock")
-     (when mempool
-       (handle-cmpctblock peer payload ctx))
-     t)
-
-    ((string= command "blocktxn")
-     (when mempool
-       (handle-blocktxn peer payload ctx))
-     t)
-
-    ((string= command "getblocktxn")
-     (handle-getblocktxn peer payload ctx)
-     t)
-
-    (t nil))))  ; Unknown message
+(define-p2p-handler "feefilter" (peer payload ctx)
+  "BIP 133: the peer's minimum fee rate for tx relay. Core applies it
+only when MoneyRange (net_processing.cpp:5126); a rate above
+MAX_MONEY would otherwise silently suppress all relay to this peer."
+  (declare (ignore ctx))
+  (let ((rate (bl.ser:parse-feefilter-payload payload)))
+    (when (<= rate bl.val:+max-money+)
+      (setf (peer-feefilter-rate peer) rate))))
 
 ;;; Inventory handling
 
@@ -793,7 +734,7 @@ lives in request-orphan-parents) and record PEER as an additional announcer."
           (when (request-orphan-parents peer parents num-wtxid-peers)
             (bl.mp:orphan-add pool otx peer)))))))
 
-(defun handle-inv (peer payload ctx)
+(define-p2p-handler ("inv" :rate-bucket peer-rate-limit-inv) (peer payload ctx)
   "Handle an inv message.
 
 For block invs we DO NOT request the block directly via getdata — under
@@ -894,7 +835,7 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
 
 ;;; Notfound handling
 
-(defun handle-notfound (peer payload)
+(define-p2p-handler "notfound" (peer payload ctx)
   "Handle a notfound message: the peer is telling us it lacks one or
 more items we requested via getdata. For tx items, complete the peer's
 announcement in the tx-request tracker so the request fails over to
@@ -905,6 +846,7 @@ NOTFOUND arm ignores them (net_processing.cpp, tx invs only): no Core
 peer — and no bitcoin-lisp peer, see handle-getdata — ever sends a
 notfound for a block, and a peer that cannot serve one it announced is
 handled by the block-download timeout like any other stalled request."
+  (declare (ignore ctx))
   (let ((tx-completed nil))
     (dolist (inv (bl.ser:parse-inv-payload payload))
       (let ((inv-type (bl.ser:inv-vector-type inv))
@@ -922,7 +864,7 @@ handled by the block-download timeout like any other stalled request."
 
 ;;; Headers handling
 
-(defun handle-headers (peer payload ctx)
+(define-p2p-handler ("headers" :rate-bucket peer-rate-limit-headers) (peer payload ctx)
   "Handle a headers message: validate the announced headers (PoW, MTP,
 difficulty, checkpoint) and admit only the valid ones to the block index,
 queueing them for block download. This is the generic message-loop path (the
@@ -1061,7 +1003,7 @@ sells an HB slot."
   (and (not (equalp tip-before hash))
        (equalp (bl.store:best-block-hash chain-state) hash)))
 
-(defun handle-block (peer payload ctx)
+(define-p2p-handler "block" (peer payload ctx)
   "Handle a block message. When CTX carries peers and the block becomes the new
 active tip, announce it onward (BIP 130 headers / inv), so the node propagates
 blocks instead of being a sink. A peer that delivers a block that CONNECTS
@@ -1343,7 +1285,7 @@ the number stored."
               do (relay-address pa peer peers :now now :max-targets max-targets)))
       added)))
 
-(defun handle-addr (peer payload ctx)
+(define-p2p-handler ("addr" :rate-bucket peer-rate-limit-addr) (peer payload ctx)
   "Handle an addr message. When CTX carries an address-book, add the addresses on
 reachable networks to the address book regardless of age (absurd timestamps are
 rewritten, not dropped — see %ingest-gossiped-address), keyed to the gossiping
@@ -1381,7 +1323,7 @@ net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
 
 ;;; ADDRv2 handling (BIP 155)
 
-(defun handle-addrv2 (peer payload ctx)
+(define-p2p-handler ("addrv2" :rate-bucket peer-rate-limit-addr) (peer payload ctx)
   "Handle an addrv2 message (BIP 155). When CTX carries an address-book, add
 addresses of any representable network (IPv4/IPv6/TORv3/I2P/CJDNS) to the
 address book regardless of age (absurd timestamps are rewritten, not dropped —
@@ -1713,7 +1655,7 @@ mempool, which subsumes Core's `!m_opts.m_mempool.exists(parent_txid)` guard."
              (when (> (incf reconsiderable) 1)
                (return t)))))))
 
-(defun handle-tx (peer payload ctx)
+(define-p2p-handler ("tx" :needs-mempool t :rate-bucket peer-rate-limit-tx) (peer payload ctx)
   "Handle a tx message. Validate, add to mempool, and relay.
 CTX's recent-rejects, when present, caches recently rejected txs."
   (bl.ctx:with-node-context (utxo-set mempool chain-state peers recent-rejects) ctx
@@ -1966,7 +1908,7 @@ form would waste the construction on both ends."
 the -maxuploadtarget serving limit (Core HISTORICAL_BLOCK_AGE,
 net_processing.cpp:120).")
 
-(defun handle-getdata (peer payload ctx)
+(define-p2p-handler ("getdata" :rate-bucket peer-rate-limit-getdata) (peer payload ctx)
   "Handle a getdata message. Respond with requested transactions or blocks.
 Does not respond to transaction requests when relay is disabled (mainnet default).
 Blocks are served from BLOCK-STORE — MSG_BLOCK legacy, MSG_WITNESS_BLOCK with
@@ -2176,7 +2118,7 @@ blocks via GetAncestor; we serve the active chain only -- the light-client case.
                    (< (- stop-height start-height) max-diff))
           stop-height)))))
 
-(defun handle-getcfilters (peer payload ctx)
+(define-p2p-handler "getcfilters" (peer payload ctx)
   "Serve a BIP157 getcfilters: one cfilter message per block in the requested
 range, from the block filter index. Silently ignored when serving is disabled
 or the request is invalid (Core disconnects; we drop the request)."
@@ -2198,7 +2140,7 @@ or the request is invalid (Core disconnects; we drop the request)."
                         peer (bl.ser:make-cfilter-message
                               0 bh filter)))))))))))
 
-(defun handle-getcfheaders (peer payload ctx)
+(define-p2p-handler "getcfheaders" (peer payload ctx)
   "Serve a BIP157 getcfheaders: the previous filter header at START-1 (zeros at
 genesis) plus the per-block filter HASHES for the range, in one cfheaders."
   (bl.ctx:with-node-context (chain-state) ctx
@@ -2228,7 +2170,7 @@ genesis) plus the per-block filter HASHES for the range, in one cfheaders."
                    peer (bl.ser:make-cfheaders-message
                          0 stop-hash prev-header (nreverse hashes)))))))))))))
 
-(defun handle-getcfcheckpt (peer payload ctx)
+(define-p2p-handler "getcfcheckpt" (peer payload ctx)
   "Serve a BIP157 getcfcheckpt: the filter header at every 1000th block up to
 the stop hash."
   (bl.ctx:with-node-context (chain-state) ctx
@@ -2254,7 +2196,7 @@ the stop hash."
   "Core MAX_BLOCKTXN_DEPTH (net_processing.cpp:140). Deeper than this we refuse
 to build a blocktxn and send the whole block instead.")
 
-(defun handle-getblocktxn (peer payload ctx)
+(define-p2p-handler "getblocktxn" (peer payload ctx)
   "Serve a BIP152 getblocktxn: reply with a blocktxn carrying the requested
 transactions (by index, witness-serialized) from the named block. This is the
 serve side of compact-block relay — without it a peer reconstructing one of our
@@ -2382,7 +2324,7 @@ Mirrors Bitcoin Core's GETHEADERS handler."
                           (truncate-entries-at-stop entries stop-hash t))))))
       (bl.ser:make-headers-message headers))))
 
-(defun handle-getheaders (peer payload ctx)
+(define-p2p-handler ("getheaders" :rate-bucket peer-rate-limit-serve) (peer payload ctx)
   "Serve a peer's getheaders by sending the headers message built from PAYLOAD
 against our active chain (see getheaders-response-message)."
   (bl.ctx:with-node-context (chain-state) ctx
@@ -2410,7 +2352,7 @@ announce. Mirrors Bitcoin Core's GETBLOCKS handler (legacy blocks-first peers)."
                     :hash (bl.store:block-index-entry-hash entry)))
                  chosen))))))
 
-(defun handle-getblocks (peer payload ctx)
+(define-p2p-handler ("getblocks" :rate-bucket peer-rate-limit-serve) (peer payload ctx)
   "Serve a peer's getblocks by sending the inv built from PAYLOAD, if any (see
 getblocks-response-message)."
   (bl.ctx:with-node-context (chain-state) ctx
@@ -2512,7 +2454,7 @@ for up to 27h after banning it; that is Core-identical and intended."
                                (random (1+ +addr-response-cache-jitter-seconds+)))))
           addrs))))
 
-(defun handle-getaddr (peer payload ctx)
+(define-p2p-handler ("getaddr" :rate-bucket peer-rate-limit-serve) (peer payload ctx)
   "Serve a peer's getaddr: reply once per connection, and only to inbound peers,
 with up to +max-addr-count+ known addresses from ADDRESS-BOOK (defaulting to the
 node's). The inbound-only + once-per-connection rules mirror Bitcoin Core's
@@ -3250,11 +3192,12 @@ than silently approximated away."
   (unless (initial-block-download-p chain-state)
     (maybe-set-peer-announcing-hb peer)))
 
-(defun handle-sendcmpct (peer payload)
+(define-p2p-handler "sendcmpct" (peer payload ctx)
   "Handle a sendcmpct message from a peer. We support only compact block version 2;
 any other version is ignored entirely, mirroring Bitcoin Core
 (net_processing.cpp: `if (sendcmpct_version != CMPCTBLOCKS_VERSION) return;`). A
 v1 compact block would deliver a witness-stripped coinbase."
+  (declare (ignore ctx))
   (multiple-value-bind (high-bandwidth version)
       (bl.ser:parse-sendcmpct-payload payload)
     (when (= version +compact-blocks-version+)
@@ -3575,7 +3518,7 @@ does the IO (getheaders / getdata / disconnect) outside."
                                (bl.store:block-index-entry-chain-work tip)))))
              (values :reject reason)))))))
 
-(defun handle-cmpctblock (peer payload ctx)
+(define-p2p-handler ("cmpctblock" :needs-mempool t) (peer payload ctx)
   "Handle a cmpctblock message: validate the announced header, then attempt
 reconstruction from the mempool.
 
@@ -3720,7 +3663,7 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
                        (bl.ser:make-getblocktxn-message
                         block-hash missing-indexes))))))))
 
-(defun handle-blocktxn (peer payload ctx)
+(define-p2p-handler ("blocktxn" :needs-mempool t) (peer payload ctx)
   "Handle a blocktxn message. Complete pending block reconstruction.
 
 Same per-reason punishment rule as HANDLE-CMPCTBLOCK: the completed block is a

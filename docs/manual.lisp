@@ -449,7 +449,12 @@
   download, eviction. Core: `net_processing.cpp`, `headerssync.cpp`,
   `net.cpp`'s connection management and eviction.
 
-  Invariants: every message handler runs under the node lock and acts on
+  Invariants: every message handler is a DEFINE-P2P-HANDLER row -- the
+  function HANDLE-<command> of (peer payload ctx) and its dispatch facts
+  (the token bucket it drains, whether it needs a mempool) in one form, so
+  a handler cannot exist without being dispatched (HANDLE-MESSAGE was a
+  31-branch STRING= COND, and the command names were spelled out again
+  in the rate limiter). Every handler runs under the node lock and acts on
   a NODE-CONTEXT, one value, so a dispatch cannot forget an argument (a
   dispatch that passed two of eight once disabled tx relay, addr gossip
   and compact blocks outside unit tests). A peer's traffic is metered by
@@ -467,6 +472,8 @@
   (bitcoin-lisp.networking:connect-peer function)
   (bitcoin-lisp.networking:disconnect-peer function)
   (bitcoin-lisp.networking:handle-message function)
+  (bitcoin-lisp.networking:define-p2p-handler macro)
+  (bitcoin-lisp.networking:p2p-handler-for function)
   (bitcoin-lisp.networking:send-message function)
   (bitcoin-lisp.networking:pump-peer-messages function)
   (bitcoin-lisp.networking:ingest-headers-from-peer function)

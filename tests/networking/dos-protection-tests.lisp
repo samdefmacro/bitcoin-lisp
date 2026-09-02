@@ -71,6 +71,49 @@
     (is (not (null (bl.net::peer-rate-limit-getdata peer))))
     (is (not (null (bl.net::peer-rate-limit-headers peer))))))
 
+(defparameter +p2p-commands-this-node-handles+
+  '("ping" "pong" "inv" "headers" "block" "tx" "getdata" "getheaders"
+    "getblocks" "getaddr" "mempool" "notfound" "addr" "addrv2" "getcfilters"
+    "getcfheaders" "getcfcheckpt" "verack" "sendaddrv2" "wtxidrelay"
+    "sendtxrcncl" "reqrecon" "sketch" "reqsketchext" "reconcildiff"
+    "sendheaders" "feefilter" "sendcmpct" "cmpctblock" "blocktxn" "getblocktxn")
+  "The 31 commands HANDLE-MESSAGE dispatched as a COND before the table
+(second-round review wave C). A handler that exists but is not in the table
+is the failure the table was built against, so the list is pinned here;
+extend it when a message type is added.")
+
+(test every-known-p2p-command-has-a-table-row
+  "Each command the node handled before DEFINE-P2P-HANDLER still has a row,
+and the row's function is the HANDLE-<command> the tests call directly."
+  (dolist (command +p2p-commands-this-node-handles+)
+    (let ((row (bl.net:p2p-handler-for command)))
+      (is-true row "no handler registered for ~S" command)
+      (when row
+        (is (fboundp (bl.net:p2p-handler-function row))
+            "~S's row names ~S, which is not a function"
+            command (bl.net:p2p-handler-function row)))))
+  (is (null (bl.net:p2p-handler-for "version"))
+      "version is handshake-only and must not be in the post-verack table"))
+
+(test define-p2p-handler-registers-what-it-defines
+  "Positive control for the table: a probe definition is dispatched by
+HANDLE-MESSAGE, and an unknown command answers NIL."
+  (let ((seen nil))
+    (unwind-protect
+         (progn
+           (bl.net:define-p2p-handler "probe-cmd" (peer payload ctx)
+             (declare (ignore peer ctx))
+             (setf seen payload))
+           (let ((peer (bl.net:make-peer)))
+             (bl.net:init-peer-rate-limiters peer)
+             (let ((ctx (bl.ctx:make-node-context)))
+               (is-true (bl.net:handle-message peer "probe-cmd" #(1 2 3) ctx))
+               (is (equalp #(1 2 3) seen))
+               (is (null (bl.net:handle-message peer "no-such-cmd" #() ctx))))))
+      (let ((row (bl.net:p2p-handler-for "probe-cmd")))
+        (setf (bl.net:p2p-handler-for "probe-cmd") nil)
+        (when row (fmakunbound (bl.net:p2p-handler-function row)))))))
+
 (test check-peer-rate-limit-allows-normal
   "Rate limit check should allow messages within limits."
   (let ((peer (bl.net:make-peer)))

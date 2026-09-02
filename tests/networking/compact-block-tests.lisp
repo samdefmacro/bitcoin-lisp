@@ -56,11 +56,11 @@ is what wedged the testnet4 node ~1800 blocks behind the chain."
     (is (= (bl.net:peer-compact-block-version peer) 0))
     ;; v1 is ignored — peer stays unsupported (we fall back to full witness blocks)
     (let ((payload (subseq (bl.ser:make-sendcmpct-message nil 1) 24)))
-      (bl.net::handle-sendcmpct peer payload))
+      (bl.net::handle-sendcmpct peer payload nil))
     (is (= (bl.net:peer-compact-block-version peer) 0))
     ;; v2 is accepted
     (let ((payload (subseq (bl.ser:make-sendcmpct-message nil 2) 24)))
-      (bl.net::handle-sendcmpct peer payload))
+      (bl.net::handle-sendcmpct peer payload nil))
     (is (= (bl.net:peer-compact-block-version peer) 2))))
 
 (test sendcmpct-rejects-invalid-version
@@ -71,11 +71,11 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
     (let ((payload (bl.bytes:with-byte-buf (s)
                      (bl.bytes:bb-write-u8 s 0)  ; low-bandwidth
                      (bl.bytes:bb-write-u64-le s 3))))  ; version 3
-      (bl.net::handle-sendcmpct peer payload))
+      (bl.net::handle-sendcmpct peer payload nil))
     (is (= (bl.net:peer-compact-block-version peer) 0))
     ;; v1 ignored too
     (let ((payload (subseq (bl.ser:make-sendcmpct-message nil 1) 24)))
-      (bl.net::handle-sendcmpct peer payload))
+      (bl.net::handle-sendcmpct peer payload nil))
     (is (= (bl.net:peer-compact-block-version peer) 0))))
 
 (test sendcmpct-tracks-high-bandwidth
@@ -84,7 +84,7 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
     (is (null (bl.net:peer-compact-block-high-bandwidth peer)))
     ;; Receive high-bandwidth request (v2 — the only version we accept)
     (let ((payload (subseq (bl.ser:make-sendcmpct-message t 2) 24)))
-      (bl.net::handle-sendcmpct peer payload))
+      (bl.net::handle-sendcmpct peer payload nil))
     (is (bl.net:peer-compact-block-high-bandwidth peer))
     (is (= 2 (bl.net:peer-compact-block-version peer)))))
 
