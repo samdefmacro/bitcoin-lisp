@@ -259,12 +259,13 @@ public key (and rejects under a different key); RFC6979 makes it deterministic."
   (let ((k1 (%secret-key 1)))
     (is (string= "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn"
                  (bl.crypto:private-key-to-wif k1 :network :mainnet :compressed t)))
-    (multiple-value-bind (sk comp net)
+    (multiple-value-bind (sk comp version)
         (bl.crypto:wif-to-private-key
-         (bl.crypto:private-key-to-wif k1 :network :testnet :compressed nil))
+         (bl.crypto:private-key-to-wif k1 :network :testnet3 :compressed nil))
       (is (equalp k1 sk))
       (is (null comp))
-      (is (eq :testnet net)))
+      ;; the test chains' SECRET_KEY prefix; the byte cannot say which one
+      (is (= #xef version)))
     (is (null (bl.crypto:wif-to-private-key "not-a-wif")))))
 
 (test bip32-test-vector-1
@@ -340,3 +341,31 @@ for an arbitrary key/message (default zero aux), and signing is deterministic."
     ;; a different message must not verify against this signature
     (is (null (bl.crypto:verify-schnorr-signature
                (%secret-key 9) sig1 pub)))))
+
+(test chain-prefixes-are-cores-base58prefixes
+  "Every chain's address, WIF and BIP32 prefixes are Core's chainparams.cpp
+base58Prefixes (mainnet 0/5/128 + xpub/xprv; every test chain 111/196/239 +
+tpub/tprv), and the SLIP-44 coin type is 0 on mainnet and 1 elsewhere. The
+address, WIF and extended-key codecs all read these fields now; before, the
+bytes lived in constants that collapsed five chains into two."
+  (flet ((row (chain) (let ((p (bl.chain:find-chain-params chain)))
+                        (list (bl.chain:chain-params-base58-pubkey-prefix p)
+                              (bl.chain:chain-params-base58-script-prefix p)
+                              (bl.chain:chain-params-base58-secret-prefix p)
+                              (bl.chain:chain-params-ext-public-prefix p)
+                              (bl.chain:chain-params-ext-secret-prefix p)
+                              (bl.chain:chain-params-bip44-coin-type p)))))
+    (is (equal '(#x00 #x05 #x80 #x0488B21E #x0488ADE4 0) (row :mainnet)))
+    (dolist (chain '(:testnet3 :testnet4 :signet :regtest))
+      (is (equal '(#x6f #xc4 #xef #x043587CF #x04358394 1) (row chain))
+          "~A does not carry the test-chain prefixes" chain))
+    ;; A WIF reports the version byte it was encoded under; the chain it is
+    ;; valid for is whoever's SECRET_KEY prefix that is.
+    (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+      (multiple-value-bind (sk compressed version)
+          (bl.crypto:wif-to-private-key (bl.crypto:private-key-to-wif k :network :regtest))
+        (is (equalp k sk)) (is-true compressed) (is (= #xef version))))
+    ;; The extended-key prefix names its chain family.
+    (is (eq :mainnet (bl.chain:chain-params-name (bl.chain:chain-params-of-ext-prefix #x0488B21E))))
+    (is (eq :testnet3 (bl.chain:chain-params-name (bl.chain:chain-params-of-ext-prefix #x04358394))))
+    (is (null (bl.chain:chain-params-of-ext-prefix 0)))))

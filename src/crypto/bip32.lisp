@@ -14,10 +14,6 @@
 (defconstant +bip32-hardened+ #x80000000)
 
 ;;; Base58 version prefixes (the leading 4 serialization bytes).
-(defconstant +xprv-mainnet+ #x0488ADE4)  ; "xprv"
-(defconstant +xpub-mainnet+ #x0488B21E)  ; "xpub"
-(defconstant +xprv-testnet+ #x04358394)  ; "tprv"
-(defconstant +xpub-testnet+ #x043587CF)  ; "tpub"
 
 (defstruct ext-key
   "A BIP32 extended key (private or public)."
@@ -57,8 +53,9 @@
     (loop for i from 31 downto 0 do (setf (aref v i) (logand n #xff) n (ash n -8)))
     v))
 
-(defun %xprv-version-p (v) (or (= v +xprv-mainnet+) (= v +xprv-testnet+)))
-(defun %xprv->xpub-version (v) (if (= v +xprv-mainnet+) +xpub-mainnet+ +xpub-testnet+))
+(defun %xprv-version-p (v) (bl.chain:ext-secret-prefix-known-p v))
+(defun %xprv->xpub-version (v)
+  (bl.chain:chain-params-ext-public-prefix (bl.chain:chain-params-of-ext-prefix v)))
 
 (defun ext-key-public-bytes (k)
   "The 33-byte compressed public key for K (derived if K is a private key)."
@@ -73,8 +70,9 @@
 ;;; --- derivation ---
 
 (defun bip32-master-key (seed &key (network :mainnet))
-  "Master extended PRIVATE key from SEED (a 16-64 byte octet vector). NETWORK is
-:mainnet or :testnet (selects the xprv/tprv version prefix)."
+  "Master extended PRIVATE key from SEED (a 16-64 byte octet vector). NETWORK
+selects the chain's EXT_SECRET_KEY prefix (xprv on mainnet, tprv on the test
+chains)."
   (let* ((i (hmac-sha512 (flexi-streams:string-to-octets "Bitcoin seed"
                                                           :external-format :ascii)
                          seed))
@@ -82,7 +80,8 @@
          (ir (subseq i 32 64)))
     (unless (< 0 (%be->int il) +secp256k1-order+)
       (crypto-error "invalid seed: master key out of range"))
-    (make-ext-key :version (if (eq network :mainnet) +xprv-mainnet+ +xprv-testnet+)
+    (make-ext-key :version (bl.chain:chain-params-ext-secret-prefix
+                            (bl.chain:find-chain-params network))
                   :chain-code ir
                   :key (concatenate '(vector (unsigned-byte 8)) #(0) il)
                   :privatep t)))
@@ -152,7 +151,7 @@ invalid-child case (IL >= n or zero key) — the caller should try the next inde
          (checksum (subseq (hash256 payload) 0 4)))
     (base58-encode (concatenate '(vector (unsigned-byte 8)) payload checksum))))
 
-(defun %xpub-version-p (v) (or (= v +xpub-mainnet+) (= v +xpub-testnet+)))
+(defun %xpub-version-p (v) (bl.chain:ext-public-prefix-known-p v))
 
 (defun bip32-parse (str)
   "Parse a Base58Check xprv/xpub STR into an ext-key, or NIL if it is not a

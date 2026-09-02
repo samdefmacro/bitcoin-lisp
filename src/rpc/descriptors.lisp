@@ -212,10 +212,10 @@ multipath expansion — multipath descriptors are not supported at P0)."
                         (%desc-error "Key path value '~A' specifies multipath in a section where multipath is not allowed" elem))
                     (%parse-key-path-num elem apostrophe-box))))
 
-(defun %wif-network-matches-p (wif-network network)
-  (if (eq network :mainnet)
-      (eq wif-network :mainnet)
-      (eq wif-network :testnet)))
+(defun %wif-network-matches-p (wif-version network)
+  "Core DecodeSecret: the WIF's version byte must be NETWORK's SECRET_KEY prefix."
+  (= wif-version (bl.chain:chain-params-base58-secret-prefix
+                  (bl.chain:find-chain-params network))))
 
 (defun %extkey-valid-for-network-p (k network)
   "Check the version prefix of parsed ext-key K against NETWORK (Core's
@@ -223,11 +223,9 @@ DecodeExtKey/DecodeExtPubKey check chainparams EXT_SECRET_KEY/EXT_PUBLIC_KEY),
 plus key-material sanity."
   (let ((version (bl.crypto:ext-key-version k))
         (key (bl.crypto:ext-key-key k)))
-    (and (if (eq network :mainnet)
-             (member version (list bl.crypto:+xprv-mainnet+
-                                   bl.crypto:+xpub-mainnet+))
-             (member version (list bl.crypto:+xprv-testnet+
-                                   bl.crypto:+xpub-testnet+)))
+    (and (let ((params (bl.chain:find-chain-params network)))
+           (or (= version (bl.chain:chain-params-ext-secret-prefix params))
+               (= version (bl.chain:chain-params-ext-public-prefix params))))
          (if (bl.crypto:ext-key-privatep k)
              (and (zerop (aref key 0))
                   (< 0
@@ -325,9 +323,8 @@ fixes one so every implementation derives the same children.")
 child 0, the fixed MuSig2 chaincode (Core CreateMuSig2SyntheticXpub,
 musig.cpp:71). It is a derivation ROOT, not a key anyone published."
   (bl.crypto:make-ext-key
-   :version (if (eq network :mainnet)
-                bl.crypto:+xpub-mainnet+
-                bl.crypto:+xpub-testnet+)
+   :version (bl.chain:chain-params-ext-public-prefix
+             (bl.chain:find-chain-params network))
    :depth 0
    :parent-fingerprint 0
    :child-number 0
@@ -546,11 +543,11 @@ same descriptor written two ways would be two different ADDRESSES."
     (if (and (null (desc-key-path key)) (eq (desc-key-derive key) :none))
         aggregate
         (let ((root (%musig-synthetic-xpub aggregate
-                                           (if (= (bl.crypto:ext-key-version
-                                                   (or (desc-key-extkey (first participants))
-                                                       (desc-key-ext-privkey (first participants))))
-                                                  bl.crypto:+xpub-mainnet+)
-                                               :mainnet :testnet3))))
+                                           (bl.chain:chain-params-name
+                                            (bl.chain:chain-params-of-ext-prefix
+                                             (bl.crypto:ext-key-version
+                                              (or (desc-key-extkey (first participants))
+                                                  (desc-key-ext-privkey (first participants)))))))))
           (let ((k (bl.crypto:bip32-derive-path root (desc-key-path key))))
             (when (eq (desc-key-derive key) :unhardened)
               (setf k (bl.crypto:bip32-derive-child k pos)))
@@ -1678,10 +1675,8 @@ the xpub, substitute the private key material)."
                (priv (funcall privkey-provider (%desc-key-root-keyid key))))
           (when priv
             (bl.crypto:make-ext-key
-             :version (if (= (bl.crypto:ext-key-version pub)
-                             bl.crypto:+xpub-mainnet+)
-                          bl.crypto:+xprv-mainnet+
-                          bl.crypto:+xprv-testnet+)
+             :version (bl.chain:chain-params-ext-secret-prefix
+                       (bl.chain:chain-params-of-ext-prefix (bl.crypto:ext-key-version pub)))
              :depth (bl.crypto:ext-key-depth pub)
              :parent-fingerprint (bl.crypto:ext-key-parent-fingerprint pub)
              :child-number (bl.crypto:ext-key-child-number pub)
@@ -1841,7 +1836,7 @@ returned with HAS-PRIV-P nil."
               (values (concatenate 'string origin
                                    (bl.crypto:private-key-to-wif
                                     priv
-                                    :network (if (eq network :mainnet) :mainnet :testnet)
+                                    :network network
                                     :compressed compressed))
                       t)
               (values (desc-key-string key) nil)))

@@ -705,7 +705,7 @@ complete:false with Core's per-input errors array."
       (bl.wallet::rpc-createwallet node '("wo" t t))
       (let* ((seed (make-array 32 :element-type '(unsigned-byte 8)
                                   :initial-element 7))
-             (xprv (bl.crypto:bip32-master-key seed :network :testnet))
+             (xprv (bl.crypto:bip32-master-key seed :network :testnet3))
              (xpub (bl.crypto:bip32-serialize
                     (bl.crypto:bip32-neuter xprv)))
              (desc (bl.rpc:descriptor-add-checksum
@@ -1110,7 +1110,7 @@ stores only the 32-byte x coordinate)."
                                          0))
                            return candidate))
              (wif (bl.crypto:private-key-to-wif
-                   priv :network :testnet :compressed t))
+                   priv :network :testnet3 :compressed t))
              (desc (bl.rpc:descriptor-add-checksum
                     (format nil "tr(~A)" wif)))
              (qx (bl.interop:compute-tweaked-pubkey

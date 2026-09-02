@@ -132,10 +132,6 @@ hash.cpp. src/crypto/.")
    #:bip32-parse
    #:+bip32-hardened+
    #:+secp256k1-order+
-   #:+xprv-mainnet+
-   #:+xpub-mainnet+
-   #:+xprv-testnet+
-   #:+xpub-testnet+
    #:taproot-tweak-private-key
    ;; Schnorr / x-only pubkeys (BIP 340)
    #:verify-schnorr-signature
@@ -162,10 +158,7 @@ hash.cpp. src/crypto/.")
    #:encode-p2wpkh-address
    #:encode-p2wsh-address
    #:encode-p2tr-address
-   #:+p2pkh-version-mainnet+
-   #:+p2pkh-version-testnet+
-   #:+p2sh-version-mainnet+
-   #:+p2sh-version-testnet+)
+)
   ;; Reached from another package with :: before the second-round review
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export

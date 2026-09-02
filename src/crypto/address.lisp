@@ -98,52 +98,35 @@ Returns (VALUES version payload) or NIL if invalid."
 ;;; WIF (Wallet Import Format) private keys
 ;;; ============================================================
 
-(defconstant +wif-version-mainnet+ #x80)
-(defconstant +wif-version-testnet+ #xef)  ; also regtest/signet
 
 (defun private-key-to-wif (privkey &key (network :mainnet) (compressed t))
-  "Encode a 32-byte secret PRIVKEY as a WIF string. NETWORK selects the version
-byte (mainnet #x80, otherwise #xef). COMPRESSED appends the 0x01 flag, meaning
-the matching public key is the 33-byte compressed form."
-  (assert (= (length privkey) 32) (privkey) "private key must be 32 bytes")
-  (let ((payload (if compressed
-                     (concatenate '(vector (unsigned-byte 8)) privkey (vector #x01))
-                     (coerce privkey '(vector (unsigned-byte 8))))))
-    (base58check-encode (if (eq network :mainnet)
-                            +wif-version-mainnet+
-                            +wif-version-testnet+)
-                        payload)))
+  "Encode a 32-byte private key as WIF for NETWORK (chainparams SECRET_KEY:
+#x80 on mainnet, #xef on every test chain). COMPRESSED appends the 0x01 flag,
+meaning the corresponding public key is the 33-byte form."
+  (base58check-encode (bl.chain:chain-params-base58-secret-prefix
+                       (bl.chain:find-chain-params network))
+                      (if compressed
+                          (concatenate '(vector (unsigned-byte 8)) privkey #(#x01))
+                          privkey)))
 
 (defun wif-to-private-key (wif)
-  "Decode a WIF string to (VALUES privkey-32-bytes compressed-p network), or NIL
-if invalid. NETWORK is :mainnet for version #x80, else :testnet."
+  "Decode a WIF string to (VALUES privkey-32-bytes compressed-p version-byte),
+or NIL if invalid. VERSION-BYTE is the chainparams SECRET_KEY prefix the key
+was encoded under -- compare it with the expected chain's, as Core's
+DecodeSecret does; the byte alone cannot tell the test chains apart."
   (multiple-value-bind (version payload) (base58check-decode wif)
     (when (and version payload
-               (or (= version +wif-version-mainnet+) (= version +wif-version-testnet+))
+               (bl.chain:secret-prefix-known-p version)
                (or (= (length payload) 32)
                    (and (= (length payload) 33) (= (aref payload 32) #x01))))
       (values (subseq payload 0 32)
               (= (length payload) 33)
-              (if (= version +wif-version-mainnet+) :mainnet :testnet)))))
+              version))))
 
 ;;; ============================================================
 ;;; Address Version Prefixes
 ;;; ============================================================
 
-(defconstant +p2pkh-version-mainnet+ #x00)
-(defconstant +p2pkh-version-testnet+ #x6f)
-(defconstant +p2sh-version-mainnet+ #x05)
-(defconstant +p2sh-version-testnet+ #xc4)
-
-(defun address-version-to-type (version)
-  "Convert address version byte to address type and network.
-Returns (VALUES type network) or NIL."
-  (case version
-    (#x00 (values :p2pkh :mainnet))
-    (#x6f (values :p2pkh :testnet3))
-    (#x05 (values :p2sh :mainnet))
-    (#xc4 (values :p2sh :testnet3))
-    (otherwise nil)))
 
 ;;; ============================================================
 ;;; Bech32/Bech32m Encoding/Decoding (BIP 173, BIP 350)
@@ -336,11 +319,12 @@ NETWORK is :testnet3, :testnet4, :signet, or :mainnet."
     ;; Try Base58Check
     (multiple-value-bind (version payload) (base58check-decode address)
       (when version
-        (multiple-value-bind (type addr-network) (address-version-to-type version)
+        ;; Core DecodeDestination: the version byte must be THIS chain's
+        ;; PUBKEY_ADDRESS or SCRIPT_ADDRESS prefix (the test chains share one pair).
+        (let* ((params (bl.chain:find-chain-params network))
+               (type (cond ((= version (bl.chain:chain-params-base58-pubkey-prefix params)) :p2pkh)
+                           ((= version (bl.chain:chain-params-base58-script-prefix params)) :p2sh))))
           (when (and type
-                     ;; Testnet4/signet use same address versions as testnet3
-                     (or (eq addr-network network)
-                         (and (eq addr-network :testnet3) (test-network-p network)))
                      (= (length payload) 20))
             (let ((script-pubkey
                     (case type
@@ -356,24 +340,17 @@ NETWORK is :testnet3, :testnet4, :signet, or :mainnet."
                 (values type script-pubkey nil payload)))))))
     nil))
 
-(defun test-network-p (network)
-  "Return T if NETWORK is a test network (testnet3, testnet4, signet, or regtest).
-Regtest reuses testnet address versions (base58) like Bitcoin Core."
-  (member network '(:testnet3 :testnet4 :signet :regtest)))
-
 (defun encode-p2pkh-address (pubkey-hash network)
-  "Encode a 20-byte pubkey hash as P2PKH address."
-  (let ((version (if (test-network-p network)
-                     +p2pkh-version-testnet+
-                     +p2pkh-version-mainnet+)))
-    (base58check-encode version pubkey-hash)))
+  "Encode a 20-byte pubkey hash as a P2PKH address (chainparams PUBKEY_ADDRESS)."
+  (base58check-encode (bl.chain:chain-params-base58-pubkey-prefix
+                       (bl.chain:find-chain-params network))
+                      pubkey-hash))
 
 (defun encode-p2sh-address (script-hash network)
-  "Encode a 20-byte script hash as P2SH address."
-  (let ((version (if (test-network-p network)
-                     +p2sh-version-testnet+
-                     +p2sh-version-mainnet+)))
-    (base58check-encode version script-hash)))
+  "Encode a 20-byte script hash as a P2SH address (chainparams SCRIPT_ADDRESS)."
+  (base58check-encode (bl.chain:chain-params-base58-script-prefix
+                       (bl.chain:find-chain-params network))
+                      script-hash))
 
 (defun segwit-hrp (network)
   "Bech32 human-readable part for NETWORK (Core chainparams bech32_hrp):

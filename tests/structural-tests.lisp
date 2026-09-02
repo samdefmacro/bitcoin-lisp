@@ -1064,6 +1064,34 @@ in 8 files before src/util/chainparams.lisp."
         "~D chain dispatch form~:P outside the table: ~S -- add a field to ~
 chain-params instead" (length forms) forms)))
 
+(defun %pseudo-network-references (&optional (corpus (%source-corpus)))
+  "Every (file . line) in CORPUS whose code names the keyword :TESTNET -- the
+two-valued \"not mainnet\" pseudo-network the address, WIF and BIP32 code once
+branched on. It is not a chain: the five chains' prefixes live in chain-params,
+and a function that takes a network takes one of them. Strings and comments
+are blanked first."
+  (let ((hits '()))
+    (loop for (file . lines) in corpus
+          do (let ((in-string nil))
+               (loop for raw across lines
+                     for n from 1
+                     do (multiple-value-bind (code next) (%code-only raw in-string)
+                          (setf in-string next)
+                          (let ((pos (search ":testnet" (string-downcase code))))
+                            (when (and pos
+                                       (let ((after (+ pos (length ":testnet"))))
+                                         (or (= after (length code))
+                                             (not (%symbol-char-p (char code after))))))
+                              (push (cons file n) hits)))))))
+    (nreverse hits)))
+
+(test no-pseudo-network-testnet
+  "No src file names the pseudo-network :TESTNET (wave D2 retired it)."
+  (let ((hits (%pseudo-network-references)))
+    (is (null hits)
+        "~D reference~:P to the pseudo-network :testnet: ~S -- pass the real chain ~
+and read its prefix from chain-params" (length hits) hits)))
+
 (defparameter +test-internal-reference-ceiling+ 4417
   "How many package-qualified INTERNAL references (a :: token) the test
 tree may contain: 7,136 when the cleanup started. White-box tests reaching
@@ -1200,6 +1228,13 @@ the measuring functions must measure a known shape correctly."
                           (vector "(defun f () (bl.val::check-block x)) ; bl.mp::comment"
                                   "(bl.val:public x) \"bl.rpc::in-a-string\" (bl.val::check-block y)")))))
       "positive control: the foreign-internal scanner must see exactly the code :: and not the comment or the string")
+  (is (equal '(("probe.lisp" . 2))
+             (%pseudo-network-references
+              (list (cons "probe.lisp"
+                          (vector "(if (eq network :testnet3) 1 2) ; :testnet"
+                                  "(private-key-to-wif k :network :testnet)"
+                                  "\":testnet\"")))))
+      "positive control: the pseudo-network scanner must flag :testnet in code and only there")
   (is (plusp (length (%definitions-longer-than +longish-function-lines+)))
       "no long definitions found -- a sweep that finds nothing proves nothing")
   (is (equal '(("src/util/bytes.lisp" . "bitcoin-lisp.validation"))

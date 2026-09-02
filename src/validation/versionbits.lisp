@@ -76,11 +76,6 @@ consensus/params.h:45-79)."
      ,(%vb "taproot"   2  +vb-always-active+ +vb-no-timeout+ 0 108 144)))
   "Per-chain BIP9 deployments, in Core's order.")
 
-(defparameter *min-bip9-warning-heights*
-  '((:mainnet . 483840) (:testnet3 . 836640)
-    (:testnet4 . 0) (:signet . 0) (:regtest . 0))
-  "Core MinBIP9WarningHeight (chainparams.cpp:95, :226, :333, :490).")
-
 (defun versionbits-deployments (&optional (network bl:*network*))
   "The BIP9 deployments defined for NETWORK."
   (rest (assoc network *versionbits-deployments*)))

@@ -48,7 +48,14 @@
   (assumevalid-hex nil)                     ; consensus.defaultAssumeValid, display order; NIL = disabled
   (assumeutxo '())                          ; m_assumeutxo_data: ((height blockhash-hex hash-serialized-hex chain-tx-count) ...)
   (prune-after-height 0)                    ; nPruneAfterHeight
-  (bech32-hrp "" :type string))             ; bech32_hrp
+  (bech32-hrp "" :type string)              ; bech32_hrp
+  ;; base58Prefixes: PUBKEY_ADDRESS, SCRIPT_ADDRESS, SECRET_KEY, EXT_PUBLIC_KEY, EXT_SECRET_KEY
+  (base58-pubkey-prefix 0 :type (unsigned-byte 8))
+  (base58-script-prefix 0 :type (unsigned-byte 8))
+  (base58-secret-prefix 0 :type (unsigned-byte 8))
+  (ext-public-prefix 0 :type (unsigned-byte 32))
+  (ext-secret-prefix 0 :type (unsigned-byte 32))
+  (bip44-coin-type 0 :type (unsigned-byte 32))) ; SLIP-44: 0 mainnet, 1 every test chain
 
 (defvar *chain-params* '()
   "Every chain, in definition order; filled by DEFINE-CHAIN-PARAMS.")
@@ -133,7 +140,13 @@ MAKE-CHAIN-PARAMS, replacing an earlier definition of the same name."
                 "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"
                 1305397408))
   :prune-after-height 100000
-  :bech32-hrp "bc")
+  :bech32-hrp "bc"
+  :base58-pubkey-prefix #x00
+  :base58-script-prefix #x05
+  :base58-secret-prefix #x80
+  :ext-public-prefix #x0488B21E                ; "xpub"
+  :ext-secret-prefix #x0488ADE4                ; "xprv"
+  :bip44-coin-type 0)
 
 (define-chain-params :testnet3
   :core-name "test"
@@ -176,7 +189,13 @@ MAKE-CHAIN-PARAMS, replacing an earlier definition of the same name."
                 "ce6bb677bb2ee9789c4a1c9d73e6683c53fc20e8fdbedbdaaf468982a0c8db2a"
                 536078574))
   :prune-after-height 1000
-  :bech32-hrp "tb")
+  :bech32-hrp "tb"
+  :base58-pubkey-prefix #x6f
+  :base58-script-prefix #xc4
+  :base58-secret-prefix #xef
+  :ext-public-prefix #x043587CF                ; "tpub"
+  :ext-secret-prefix #x04358394                ; "tprv"
+  :bip44-coin-type 1)
 
 (define-chain-params :testnet4
   :core-name "testnet4"
@@ -227,7 +246,13 @@ MAKE-CHAIN-PARAMS, replacing an earlier definition of the same name."
                 "10b05d05ad468d0971162e1b222a4aa66caca89da2bb2a93f8f37fb29c4794b0"
                 14141057))
   :prune-after-height 1000
-  :bech32-hrp "tb")
+  :bech32-hrp "tb"
+  :base58-pubkey-prefix #x6f
+  :base58-script-prefix #xc4
+  :base58-secret-prefix #xef
+  :ext-public-prefix #x043587CF                ; "tpub"
+  :ext-secret-prefix #x04358394                ; "tprv"
+  :bip44-coin-type 1)
 
 (define-chain-params :signet
   :core-name "signet"
@@ -263,7 +288,13 @@ MAKE-CHAIN-PARAMS, replacing an earlier definition of the same name."
                 "97267e000b4b876800167e71b9123f1529d13b14308abec2888bbd2160d14545"
                 28547497))
   :prune-after-height 1000
-  :bech32-hrp "tb")
+  :bech32-hrp "tb"
+  :base58-pubkey-prefix #x6f
+  :base58-script-prefix #xc4
+  :base58-secret-prefix #xef
+  :ext-public-prefix #x043587CF                ; "tpub"
+  :ext-secret-prefix #x04358394                ; "tprv"
+  :bip44-coin-type 1)
 
 (define-chain-params :regtest
   :core-name "regtest"
@@ -301,7 +332,13 @@ MAKE-CHAIN-PARAMS, replacing an earlier definition of the same name."
                 "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2"
                 334))
   :prune-after-height 1000
-  :bech32-hrp "bcrt")
+  :bech32-hrp "bcrt"
+  :base58-pubkey-prefix #x6f
+  :base58-script-prefix #xc4
+  :base58-secret-prefix #xef
+  :ext-public-prefix #x043587CF                ; "tpub"
+  :ext-secret-prefix #x04358394                ; "tprv"
+  :bip44-coin-type 1)
 
 ;;; The current chain, and the lookups every layer needs from it.
 
@@ -323,3 +360,22 @@ MAKE-CHAIN-PARAMS, replacing an earlier definition of the same name."
 (defun network-rpc-port (network)
   "NETWORK's default RPC port (chain-params-rpc-port)."
   (chain-params-rpc-port (find-chain-params network)))
+
+(defun chain-params-of-ext-prefix (version)
+  "The chain whose BIP32 extended-key prefix (public or secret) is VERSION,
+or NIL. The test chains share one pair, so the first of them answers for all."
+  (find-if (lambda (p) (or (= version (chain-params-ext-public-prefix p))
+                           (= version (chain-params-ext-secret-prefix p))))
+           *chain-params*))
+
+(defun secret-prefix-known-p (byte)
+  "Is BYTE some chain's SECRET_KEY (WIF) prefix?"
+  (and (find byte *chain-params* :key #'chain-params-base58-secret-prefix) t))
+
+(defun ext-public-prefix-known-p (version)
+  "Is VERSION some chain's EXT_PUBLIC_KEY (xpub/tpub) prefix?"
+  (and (find version *chain-params* :key #'chain-params-ext-public-prefix) t))
+
+(defun ext-secret-prefix-known-p (version)
+  "Is VERSION some chain's EXT_SECRET_KEY (xprv/tprv) prefix?"
+  (and (find version *chain-params* :key #'chain-params-ext-secret-prefix) t))
