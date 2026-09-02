@@ -2352,8 +2352,8 @@ irregular version-0 programs stay nonstandard."
     ;; irregular v0 (OP_0 push2): stays nonstandard
     (is-false (bl.val::standard-output-script-p (wp #x00 #xaa #xbb)))
     ;; RPC type names
-    (is (string= "anchor" (bl.rpc:script-type (wp #x51 #x4e #x73))))
-    (is (string= "witness_unknown" (bl.rpc:script-type (wp #x52 #xaa #xbb))))))
+    (is (string= "anchor" (bl.val:script-type-name (wp #x51 #x4e #x73))))
+    (is (string= "witness_unknown" (bl.val:script-type-name (wp #x52 #xaa #xbb))))))
 
 ;;;; BIP431 TRUC (v3) topology
 
@@ -2712,10 +2712,58 @@ GetTotalTxSize, txmempool.h:191) and \"usage\" the modeled DynamicMemoryUsage
           (aref s (+ 1 push-len)) trailer)
     s))
 
-(test classify-output-script-solver-parity
-  "G7-12/13: classify-output-script mirrors Core's Solver (solver.cpp:141),
+(test classify-script-returns-solver-data
+  "The second value of CLASSIFY-SCRIPT is Solver's vSolutionsRet as a plist:
+the hash forms carry :hash, every witness program carries its version and
+program (P2A included), nulldata its payload, pubkey its key, and bare
+multisig m, n and the keys in script order. The one classifier now feeds
+decodescript, the descriptor address printer and the wallet, so the plist
+shape is a contract."
+  (flet ((spk (&rest bytes) (coerce bytes '(simple-array (unsigned-byte 8) (*))))
+         (cat (&rest parts) (apply #'concatenate '(simple-array (unsigned-byte 8) (*)) parts))
+         (fill-bytes (n v) (make-array n :element-type '(unsigned-byte 8) :initial-element v)))
+    (let ((h20 (fill-bytes 20 7)) (h32 (fill-bytes 32 9)))
+      (multiple-value-bind (type data) (bl.val:classify-script (cat (spk #x76 #xa9 #x14) h20 (spk #x88 #xac)))
+        (is (eq :pubkeyhash type)) (is (equalp h20 (getf data :hash))))
+      (multiple-value-bind (type data) (bl.val:classify-script (cat (spk #xa9 #x14) h20 (spk #x87)))
+        (is (eq :scripthash type)) (is (equalp h20 (getf data :hash))))
+      (multiple-value-bind (type data) (bl.val:classify-script (cat (spk #x51 #x20) h32))
+        (is (eq :witness-v1-taproot type))
+        (is (= 1 (getf data :witness-version)))
+        (is (equalp h32 (getf data :witness-program))))
+      (multiple-value-bind (type data) (bl.val:classify-script (spk #x51 #x02 #x4e #x73))
+        (is (eq :anchor type))
+        (is (equalp (spk #x4e #x73) (getf data :witness-program))))
+      (multiple-value-bind (type data) (bl.val:classify-script (spk #x6a #x02 #xaa #xbb))
+        (is (eq :nulldata type)) (is (equalp (spk #x02 #xaa #xbb) (getf data :data))))
+      ;; An OP_RETURN whose tail is not push-only is NONSTANDARD, not nulldata:
+      ;; the retired classifier said nulldata for any leading OP_RETURN.
+      (is (eq :nonstandard (bl.val:classify-script (spk #x6a #xac))))
+      ;; A 33-byte push whose header byte is not 02/03 is not a pubkey (Core
+      ;; CPubKey::ValidSize); the retired classifier took any 33/65-byte push.
+      (is (eq :nonstandard (bl.val:classify-script (cat (spk 33 #x04) (fill-bytes 32 1) (spk #xac)))))
+      (multiple-value-bind (type data) (bl.val:classify-script (cat (spk 33 #x02) (fill-bytes 32 1) (spk #xac)))
+        (is (eq :pubkey type)) (is (= 33 (length (getf data :pubkey)))))
+      ;; 1-of-2 bare multisig: keys come back in script order.
+      (let* ((k1 (cat (spk #x02) (fill-bytes 32 1)))
+             (k2 (cat (spk #x03) (fill-bytes 32 2))))
+        (multiple-value-bind (type data) (bl.val:classify-script (cat (spk #x51 33) k1 (spk 33) k2 (spk #x52 #xae)))
+          (is (eq :multisig type))
+          (is (= 1 (getf data :m))) (is (= 2 (getf data :n)))
+          (is (equalp (list k1 k2) (getf data :pubkeys)))))
+      ;; A key push whose header byte is not a pubkey header fails MatchMultisig
+      ;; (Core checks CPubKey::ValidSize on every key).
+      (let ((bad (cat (spk #x00) (fill-bytes 32 1))))
+        (is (eq :nonstandard (bl.val:classify-script (cat (spk #x51 33) bad (spk #x51 #xae))))))
+      ;; The type name is the classification's name: one table, not two.
+      (is (string= "anchor" (bl.val:script-type-name (spk #x51 #x02 #x4e #x73))))
+      (is (string= "witness_unknown" (bl.val:script-type-name (cat (spk #x52 #x20) h32))))
+      (is (string= "nonstandard" (bl.val:script-type-name (cat (spk #x00 #x10) (fill-bytes 16 3))))))))
+
+(test classify-script-solver-parity
+  "G7-12/13: classify-script mirrors Core's Solver (solver.cpp:141),
 including the order in which the forms are matched."
-  (flet ((c (s) (bl.val::classify-output-script s)))
+  (flet ((c (s) (bl.val:classify-script s)))
     ;; P2SH is matched first, before anything else.
     (is (eq :scripthash
             (c (let ((s (make-array 23 :element-type '(unsigned-byte 8)
@@ -2751,7 +2799,7 @@ including the order in which the forms are matched."
                                        :initial-element 0)))
                  (setf (aref s 0) #x00 (aref s 1) #x16) s))))
     ;; OP_RETURN, matched before the bare key forms.
-    (is (eq :null-data (c (%spk #x6a #x02 #xaa #xbb))))
+    (is (eq :nulldata (c (%spk #x6a #x02 #xaa #xbb))))
     ;; Bare pay-to-pubkey, both encodings.
     (is (eq :pubkey (c (%push-script 33 #x02 #xac))))
     (is (eq :pubkey (c (%push-script 33 #x03 #xac))))
@@ -2792,15 +2840,19 @@ is still standard, so the two must not share one predicate."
            (let ((s (make-array (+ 1 (* n 34) 2) :element-type '(unsigned-byte 8)
                                                  :initial-element 0)))
              (setf (aref s 0) (+ #x50 m))
-             (dotimes (i n) (setf (aref s (+ 1 (* i 34))) 33))
+             ;; each key: a 33-byte push whose header byte is a compressed
+             ;; pubkey's (Core MatchMultisig checks CPubKey::ValidSize)
+             (dotimes (i n)
+               (setf (aref s (+ 1 (* i 34))) 33
+                     (aref s (+ 2 (* i 34))) #x02))
              (setf (aref s (- (length s) 2)) (+ #x50 n)
                    (aref s (- (length s) 1)) #xae)
              s)))
     ;; Shape matches well past the standardness cap.
-    (is (eq :multisig (bl.val::classify-output-script (ms 1 1))))
-    (is (eq :multisig (bl.val::classify-output-script (ms 2 3))))
-    (is (eq :multisig (bl.val::classify-output-script (ms 5 5))))
-    (is (eq :multisig (bl.val::classify-output-script (ms 15 15))))
+    (is (eq :multisig (bl.val:classify-script (ms 1 1))))
+    (is (eq :multisig (bl.val:classify-script (ms 2 3))))
+    (is (eq :multisig (bl.val:classify-script (ms 5 5))))
+    (is (eq :multisig (bl.val:classify-script (ms 15 15))))
     ;; But only n<=3 is a standard OUTPUT.
     (let ((bl:*permit-bare-multisig* t))
       (is-true (bl.val::standard-output-script-p (ms 2 3)))

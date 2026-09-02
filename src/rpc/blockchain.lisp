@@ -421,26 +421,6 @@ stack item (the segwit reserved value, BIP141)."
   "Get transaction ID as hex string."
   (hash-to-hex (bl.ser:transaction-hash tx)))
 
-(defun script-type (script)
-  "Bitcoin Core scriptPubKey 'type' name for a standard SCRIPT, else
-\"nonstandard\"."
-  (let ((len (length script)))
-    (flet ((b (i) (aref script i)))
-      (cond
-        ((and (= len 25) (= (b 0) #x76) (= (b 1) #xa9) (= (b 2) #x14)
-              (= (b 23) #x88) (= (b 24) #xac)) "pubkeyhash")
-        ((and (= len 23) (= (b 0) #xa9) (= (b 1) #x14) (= (b 22) #x87)) "scripthash")
-        ((and (= len 22) (= (b 0) #x00) (= (b 1) #x14)) "witness_v0_keyhash")
-        ((and (= len 34) (= (b 0) #x00) (= (b 1) #x20)) "witness_v0_scripthash")
-        ((and (= len 34) (= (b 0) #x51) (= (b 1) #x20)) "witness_v1_taproot")
-        ;; P2A (Core ANCHOR): OP_1 <0x4e73>
-        ((and (= len 4) (= (b 0) #x51) (= (b 1) #x02) (= (b 2) #x4e) (= (b 3) #x73)) "anchor")
-        ;; Future witness program v1..v16, 2..40-byte program (Core WITNESS_UNKNOWN)
-        ((and (>= len 4) (<= len 42) (<= #x51 (b 0) #x60) (= (b 1) (- len 2))) "witness_unknown")
-        ((and (>= len 1) (= (b 0) #x6a)) "nulldata")
-        ((and (or (= len 35) (= len 67)) (= (b (1- len)) #xac)) "pubkey")
-        (t "nonstandard")))))
-
 (defun tx-input-witness (tx index)
   "The witness stack (vector of byte vectors) for input INDEX of TX, or NIL."
   (let ((w (bl.ser:transaction-witness tx)))
@@ -521,7 +501,7 @@ verbosity-3 prevout object (core_io.cpp:478-488)."
                                   (append
                                    `(("asm" . ,(bl.val:disassemble-script spk))
                                      ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                                     ("type" . ,(script-type spk)))
+                                     ("type" . ,(bl.val:script-type-name spk)))
                                    (when addr `(("address" . ,addr)))))))))))))
     (when (and witness-stack (plusp (length witness-stack)))
       (setf base (append base
@@ -537,7 +517,7 @@ is supplied and the script is addressable) address."
          (spk-json `(("asm" . ,(bl.val:disassemble-script spk))
                      ,@(when network `(("desc" . ,(scriptpubkey-desc spk network))))
                      ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                     ("type" . ,(script-type spk)))))
+                     ("type" . ,(bl.val:script-type-name spk)))))
     (when addr
       (setf spk-json (append spk-json `(("address" . ,addr)))))
     `(("value" . ,(/ (bl.ser:tx-out-value output) 100000000.0d0))
@@ -751,7 +731,7 @@ accepted but ignored."
               ("scriptPubKey" . (("asm" . ,(bl.val:disassemble-script spk))
                                  ("desc" . ,(scriptpubkey-desc spk network))
                                  ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                                 ("type" . ,(script-type spk))
+                                 ("type" . ,(bl.val:script-type-name spk))
                                  ,@(when addr `(("address" . ,addr)))))
               ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))))
           nil))))) ; Return null for spent/absent outputs

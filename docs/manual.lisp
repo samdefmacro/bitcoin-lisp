@@ -552,6 +552,7 @@
   (bitcoin-lisp.validation:execute-script function)
   (bitcoin-lisp.validation:validate-input-script function)
   (bitcoin-lisp.validation:classify-script function)
+  (bitcoin-lisp.validation:script-type-name function)
   (bitcoin-lisp.validation:disassemble-script function)
   (bitcoin-lisp.validation:compute-script-flags-for-height function)
   (bitcoin-lisp.validation:block-script-flags function))

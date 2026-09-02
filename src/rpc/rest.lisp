@@ -216,7 +216,7 @@ include_hex + include_address)."
     `(("asm" . ,(bl.val:disassemble-script spk))
       ("desc" . ,(scriptpubkey-desc spk network))
       ("hex" . ,(bl.crypto:bytes-to-hex spk))
-      ("type" . ,(script-type spk))
+      ("type" . ,(bl.val:script-type-name spk))
       ,@(when addr `(("address" . ,addr))))))
 
 (defun %getutxos-binary (height tip-hash hits coins)
@@ -530,7 +530,7 @@ each a list of the coins that transaction's inputs spent."
                      (append
                       `(("asm" . ,(bl.val:disassemble-script spk))
                         ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                        ("type" . ,(script-type spk)))
+                        ("type" . ,(bl.val:script-type-name spk)))
                       (when addr `(("address" . ,addr)))))))))
          tx-undo)))
      tx-undos)))

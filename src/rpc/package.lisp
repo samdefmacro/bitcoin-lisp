@@ -172,7 +172,6 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:rpc-signmessagewithprivkey
    #:satoshi->btc
    #:script->address
-   #:script-type
    #:sign-tx-inputs
    #:tr-spend-data
    #:tr-tree-string
