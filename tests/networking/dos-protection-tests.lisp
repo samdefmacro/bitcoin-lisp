@@ -348,6 +348,14 @@ node-lock now uses); a non-recursive lock would deadlock here."
     (is (eq :ok (bt:with-recursive-lock-held (lock)
                   (bt:with-recursive-lock-held (lock) :ok))))))
 
+(test with-current-node-lock-does-not-capture-node
+  "WITH-CURRENT-NODE-LOCK reads bl::*node* into a private binding: a NODE
+variable in the caller's scope is the caller's, not the global. The first
+version expanded into (let ((node bl::*node*)) ...) around BODY, so any body
+with its own NODE silently read the global instead."
+  (let ((node :caller-binding))
+    (is (eq :caller-binding (bl.net::with-current-node-lock node)))))
+
 (test node-lock-is-recursive
   "node-lock is recursive: nested acquisition on the real node lock succeeds."
   (let ((node (bl::make-node)))

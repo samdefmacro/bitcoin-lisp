@@ -154,6 +154,7 @@ hash.cpp. src/crypto/.")
    #:bech32-encode
    #:bech32-decode
    #:segwit-address-encode
+   #:segwit-hrp
    #:segwit-address-decode
    #:decode-address
    #:encode-p2pkh-address

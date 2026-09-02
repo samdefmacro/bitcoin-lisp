@@ -982,7 +982,7 @@ answer\" mean different things to whoever is reading this."
                 ((:witness-v0-keyhash :witness-v0-scripthash :witness-v1-taproot)
                  (let* ((prog (getf data :witness-program))
                         (ver (getf data :witness-version))
-                        (hrp (if (eq network :testnet3) "tb" "bc"))
+                        (hrp (bl.crypto:segwit-hrp network))
                         (addr (bl.crypto:segwit-address-encode hrp ver prog)))
                    (setf result (append result `(("segwit" . (("address" . ,addr)))))))))
               ;; Add p2sh address (script wrapped in P2SH)

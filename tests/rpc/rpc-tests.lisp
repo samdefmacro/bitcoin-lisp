@@ -3830,45 +3830,59 @@ array / could error."
 
 ;;; decodescript tests
 
+(defun %decodescript (script-hex &key (network :testnet3))
+  "decodescript SCRIPT-HEX on a fresh minimal node of NETWORK; the result alist."
+  (bl.rpc::rpc-decodescript (make-test-node :network network) (list script-hex)))
+
+(defun %decodescript-field (result key)
+  (cdr (assoc key result :test #'string=)))
+
 (test rpc-decodescript-p2pkh
   "Test decodescript with P2PKH script"
-  (let* ((node (make-test-node))
-         ;; P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-         (script-hex "76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac")
-         (result (bl.rpc::rpc-decodescript node (list script-hex))))
-    (is (string= (cdr (assoc "type" result :test #'string=)) "pubkeyhash"))
-    (is (assoc "asm" result :test #'string=))
-    (is (assoc "p2sh" result :test #'string=))))
+  ;; P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+  (let ((result (%decodescript "76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac")))
+    (is (string= (%decodescript-field result "type") "pubkeyhash"))
+    (is (%decodescript-field result "asm"))
+    (is (%decodescript-field result "p2sh"))))
 
 (test rpc-decodescript-p2sh
   "Test decodescript with P2SH script"
-  (let* ((node (make-test-node))
-         ;; P2SH: OP_HASH160 <20 bytes> OP_EQUAL
-         (script-hex "a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba87")
-         (result (bl.rpc::rpc-decodescript node (list script-hex))))
-    (is (string= (cdr (assoc "type" result :test #'string=)) "scripthash"))))
+  ;; P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+  (let ((result (%decodescript "a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba87")))
+    (is (string= (%decodescript-field result "type") "scripthash"))))
 
 (test rpc-decodescript-p2wpkh
   "Test decodescript with P2WPKH script"
-  (let* ((node (make-test-node))
-         ;; P2WPKH: OP_0 <20 bytes>
-         (script-hex "001489abcdefabbaabbaabbaabbaabbaabbaabbaabba")
-         (result (bl.rpc::rpc-decodescript node (list script-hex))))
-    (is (string= (cdr (assoc "type" result :test #'string=)) "witness_v0_keyhash"))
-    (is (assoc "segwit" result :test #'string=))))
+  ;; P2WPKH: OP_0 <20 bytes>
+  (let ((result (%decodescript "001489abcdefabbaabbaabbaabbaabbaabbaabbaabba")))
+    (is (string= (%decodescript-field result "type") "witness_v0_keyhash"))
+    (is (%decodescript-field result "segwit"))))
+
+(test rpc-decodescript-segwit-address-uses-chain-hrp
+  "The segwit address decodescript reports carries the CHAIN's bech32 HRP
+(Core chainparams bech32_hrp): bcrt on regtest, tb on the test chains. The
+first version hard-coded tb for testnet3 and bc for everything else, so a
+regtest node printed mainnet addresses."
+  (flet ((segwit-address (network)
+           (%decodescript-field
+            (%decodescript-field
+             (%decodescript "001489abcdefabbaabbaabbaabbaabbaabbaabbaabba"
+                            :network network)
+             "segwit")
+            "address")))
+    (is (uiop:string-prefix-p "bcrt1" (segwit-address :regtest)))
+    (is (uiop:string-prefix-p "tb1" (segwit-address :testnet4)))
+    (is (uiop:string-prefix-p "bc1" (segwit-address :mainnet)))))
 
 (test rpc-decodescript-empty
   "Test decodescript with empty script"
-  (let* ((node (make-test-node))
-         (result (bl.rpc::rpc-decodescript node '(""))))
-    (is (string= (cdr (assoc "type" result :test #'string=)) "nonstandard"))
-    (is (string= (cdr (assoc "asm" result :test #'string=)) ""))))
+  (let ((result (%decodescript "")))
+    (is (string= (%decodescript-field result "type") "nonstandard"))
+    (is (string= (%decodescript-field result "asm") ""))))
 
 (test rpc-decodescript-invalid-hex
   "Test decodescript with invalid hex returns error"
-  (let ((node (make-test-node)))
-    (signals bl.rpc::rpc-error
-      (bl.rpc::rpc-decodescript node '("xyz")))))
+  (signals bl.rpc::rpc-error (%decodescript "xyz")))
 
 ;;; createrawtransaction tests
 
@@ -5040,16 +5054,14 @@ scripts) address — previously only hex."
 (test rpc-decodescript-multisig-addresses
   "decodescript fills the addresses array for bare multisig — one P2PKH address
 per key (previously empty)."
-  (let* ((node (make-test-node))
-         (pk1 (bl.crypto:hex-to-bytes
+  (let* ((pk1 (bl.crypto:hex-to-bytes
                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
          (pk2 (bl.crypto:hex-to-bytes
                "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"))
          ;; 2-of-2 bare multisig: OP_2 <33pk1> <33pk2> OP_2 OP_CHECKMULTISIG
          (script (concatenate '(vector (unsigned-byte 8))
                               (vector #x52 #x21) pk1 (vector #x21) pk2 (vector #x52 #xae)))
-         (r (bl.rpc::rpc-decodescript
-             node (list (bl.crypto:bytes-to-hex script))))
+         (r (%decodescript (bl.crypto:bytes-to-hex script)))
          (addrs (cdr (assoc "addresses" r :test #'string=))))
     (is (string= "multisig" (cdr (assoc "type" r :test #'string=))))
     (is (= 2 (cdr (assoc "reqSigs" r :test #'string=))))

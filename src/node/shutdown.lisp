@@ -95,14 +95,24 @@ no stream. Core SignalInterrupt::operator()'s TokenWrite."
   nil)
 
 (defun %await-shutdown-token ()
-  "Block until a token arrives. Core SignalInterrupt::wait()."
+  "Block until a token arrives. Core SignalInterrupt::wait() over
+TokenPipeEnd::TokenRead: a read interrupted by a signal (EINTR) is retried,
+any other failure -- the pipe end closed under us, a bad descriptor -- ends
+the wait instead of spinning on it forever (the first version wrapped the
+read in IGNORE-ERRORS, so a closed pipe was a busy loop)."
   #+sbcl
   (let ((fd *shutdown-pipe-read*)
         (buf (make-array 1 :element-type '(unsigned-byte 8))))
     (when fd
       (sb-sys:with-pinned-objects (buf)
-        (loop until (eql 1 (ignore-errors
-                            (sb-posix:read fd (sb-sys:vector-sap buf) 1)))))))
+        (loop
+          (handler-case
+              (when (eql 1 (sb-posix:read fd (sb-sys:vector-sap buf) 1))
+                (return))
+            (sb-posix:syscall-error (e)
+              (unless (eql (sb-posix:syscall-errno e) sb-posix:eintr)
+                (bl:log-warn "shutdown token read failed: ~A" e)
+                (return))))))))
   t)
 
 (defvar *shutdown-complete* nil

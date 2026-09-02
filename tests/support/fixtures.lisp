@@ -40,9 +40,9 @@ BIP34 at height 1)."
 
 ;;;; The minimal node
 
-(defun make-test-node ()
+(defun make-test-node (&key (network :testnet3))
   "Create a node with minimal initialized state for testing."
-  (let ((node (bl::make-node :network :testnet3)))
+  (let ((node (bl::make-node :network network)))
     ;; Initialize chain-state
     (setf (bl::node-chain-state node)
           (bl.store:make-chain-state))
