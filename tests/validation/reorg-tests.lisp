@@ -798,7 +798,9 @@ ask the node to stop."
             (unwind-protect
                  (progn
                    (setf (symbol-function 'bl:maybe-stop-at-height)
-                         (lambda (height) (push height seen) nil))
+                         (lambda (chainstate hash height)
+                           (declare (ignore chainstate hash))
+                           (push height seen) nil))
                    (%stage-heavier-downloaded-fork chain-state block-store genesis-hash)
                    (multiple-value-bind (switched missing)
                        (bl.val:activate-best-chain
@@ -920,9 +922,11 @@ takes an index, and both connect sites in block.lisp call the hook."
           "~A still threads :tx-index; indexes reach the chain through
            index-block-connected, never an argument" f))
     (let ((block-src (src "src/validation/block.lisp")))
-      (is (= 2 (%count-occurrences "(bl:index-block-connected " block-src))
-          "block.lisp must call the connect hook at exactly its two connect
-           sites (connect-block and perform-reorg's phase C)"))))
+      (is (= 2 (%count-occurrences "(bl.vi:notify-block-connected " block-src))
+          "block.lisp must announce BlockConnected at exactly its two connect
+           sites (connect-block and perform-reorg's phase C)"))
+    (is-true (member 'bl:index-block-connected (bl.vi:validation-hooks :block-connected))
+             "the index driver is no longer a :block-connected hook")))
 
 (test best-valid-tip-min-work-floor-prunes-the-search
   "best-valid-tip's MIN-WORK floor is what makes it affordable on the sync

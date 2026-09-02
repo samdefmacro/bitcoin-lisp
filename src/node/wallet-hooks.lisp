@@ -16,12 +16,13 @@ else NIL — the fast-path gate shared by the wallet hooks."
          (bl.wallet:wallet-manager-has-wallets-p manager)
          manager)))
 
-(defun wallet-notify-block-connected (chainstate block block-hash height)
+(bl.vi:define-validation-hook :block-connected wallet-notify-block-connected (chainstate block block-hash height spent-utxos)
   "Connect-time hook: let loaded wallets scan BLOCK (Core
 CWallet::blockConnected). Only the active chainstate's connects are
 delivered — an assumeutxo historical (targeted) chainstate's re-derived
 old blocks are Core's ChainstateRole::historical, which the wallet ignores
 (wallet.cpp:1526-1529)."
+  (declare (ignore spent-utxos))
   (let ((manager (%wallet-hook-manager)))
     (when (and manager
                (not (bl.store:chain-state-target-blockhash chainstate)))
@@ -32,7 +33,7 @@ old blocks are Core's ChainstateRole::historical, which the wallet ignores
           (log-error "Wallet processing of connected block at height ~D FAILED: ~A"
                      height e))))))
 
-(defun wallet-notify-block-disconnected (chainstate block height)
+(bl.vi:define-validation-hook :block-disconnected wallet-notify-block-disconnected (chainstate block block-hash height)
   "Reorg hook: let loaded wallets demote BLOCK's transactions (Core
 CWallet::blockDisconnected). Called from perform-reorg's commit phase,
 tip-first."
@@ -45,7 +46,7 @@ tip-first."
           (log-error "Wallet processing of disconnected block at height ~D FAILED: ~A"
                      height e))))))
 
-(defun wallet-notify-mempool-tx-added (tx)
+(bl.vi:define-validation-hook :transaction-added wallet-notify-mempool-tx-added (tx txid sequence)
   "Mempool hook: Core CWallet::transactionAddedToMempool."
   (let ((manager (%wallet-hook-manager)))
     (when manager
@@ -55,7 +56,7 @@ tip-first."
         (error (e)
           (log-error "Wallet processing of mempool tx add FAILED: ~A" e))))))
 
-(defun wallet-notify-mempool-tx-removed (tx reason)
+(bl.vi:define-validation-hook :transaction-removed wallet-notify-mempool-tx-removed (tx txid sequence reason)
   "Mempool hook: Core CWallet::transactionRemovedFromMempool. REASON :block
 is skipped — the wallet learns about mined txs from the block-connected
 hook (Core removeUnchecked, txmempool.cpp:269-275)."

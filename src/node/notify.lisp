@@ -17,9 +17,13 @@ block hash (Core -blocknotify, init.cpp:498).")
 JOINS these — shutdown waits for them — because a detached command racing
 process exit is a command that may not run at all (init.cpp:257-265).")
 
-(defun notify-block-tip (hash)
-  "Run -blocknotify for a new best block, if configured."
-  (when *block-notify-command*
+(bl.vi:define-validation-hook :updated-block-tip notify-block-tip (chainstate hash height)
+  "Run -blocknotify for a new best block, if configured. Detached, so an
+operator hook can never stall block connection (Core \"thread runs free\",
+init.cpp:2017); the ACTIVE chain's tip only, like Core's UpdatedBlockTip."
+  (declare (ignore height))
+  (when (and *block-notify-command*
+             (not (bl.store:chain-state-target-blockhash chainstate)))
     (run-notify-command *block-notify-command*
                         :value (bl.crypto:bytes-to-hex hash))))
 

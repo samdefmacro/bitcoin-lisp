@@ -224,7 +224,7 @@ bugs, all of them the txindex)."
                                    (node-coinstatsindex node)
                                    (node-txospenderindex node)))))
 
-(defun index-block-connected (chainstate block block-hash height spent-utxos)
+(bl.vi:define-validation-hook :block-connected index-block-connected (chainstate block block-hash height spent-utxos)
   "Connect-time hook (Core BaseIndex::BlockConnected): fold BLOCK, connected
 at HEIGHT with SPENT-UTXOS as its undo list, into every enabled index.
 CHAINSTATE is the chainstate the block connected to; signals from any
@@ -249,7 +249,7 @@ the startup backfill will heal it on next restart"
           (error (e)
             (log-warn "~A failed at height ~D: ~A" name height e)))))))
 
-(defun index-block-disconnected (chainstate block block-hash height)
+(bl.vi:define-validation-hook :block-disconnected index-block-disconnected (chainstate block block-hash height)
   "Disconnect-time hook (Core BaseIndex's rewind): erase what
 INDEX-BLOCK-CONNECTED wrote for BLOCK (at HEIGHT) in every enabled index.
 Same chainstate rule and same never-signals rule as the connect hook."

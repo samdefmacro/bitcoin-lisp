@@ -161,6 +161,17 @@ it hunts."
                    (when (plusp (length name))
                      (setf (gethash name refs) t)))
                  (setf i end))))
+    ;; (define-validation-hook :event NAME ...) registers NAME by symbol in
+    ;; the validation interface's hook list: the announcing layer is its
+    ;; caller, through APPLY.
+    (let ((i 0))
+      (loop while (setf i (search "define-validation-hook :" src :start2 i))
+            do (let* ((event-end (position #\Space src :start (+ i (length "define-validation-hook :"))))
+                      (name-start (and event-end (1+ event-end)))
+                      (name-end (and name-start (position-if-not #'%symbol-char-p src :start name-start))))
+                 (when (and name-start name-end (> name-end name-start))
+                   (setf (gethash (subseq src name-start name-end) refs) t))
+                 (setf i (+ i 10)))))
     ;; A DEFINE-P2P-HANDLER row installs HANDLE-<command> in the dispatch
     ;; table by symbol; the wire is its caller, and xref cannot see a funcall
     ;; through a table any more than it sees a hook. The row IS the reference.
@@ -254,6 +265,9 @@ drift cannot turn this control into a false alarm."
                (%function-object-references
                 "(define-p2p-handler (\"probe\" :needs-mempool t) (p q c) nil)"))
       "positive control: a define-p2p-handler row must count as a reference to handle-<command>")
+  (is (gethash "probe-hook"
+               (%function-object-references "(bl.vi:define-validation-hook :block-connected probe-hook (a b c d e) nil)"))
+      "positive control: a define-validation-hook form must count as a reference to its function")
   (let ((refs (%function-object-references "#+sbcl (sb-ext:define-hash-table-test probe= probe-hash)")))
     (is (and (gethash "probe=" refs) (gethash "probe-hash" refs))
         "positive control: a define-hash-table-test form must count as a reference to both functions"))))))
@@ -728,8 +742,6 @@ to make on purpose, so the set is pinned."
                                                  ; Core sendall 279
     ("ms-from-script" . 243)                     ; validation/miniscript.lisp
                                                  ; Core DecodeScript 385
-    ("connect-block" . 215)                      ; validation/block.lisp
-                                                 ; Core ConnectBlock 379
 
     ;; EXCEPTIONS -- our own orchestration of a loop Core spreads across the
     ;; net_processing message pump, whose own functions are far longer
@@ -1035,6 +1047,161 @@ the scanner still fires.")
                          when (and package-layer (> package-layer layer))
                            collect (cons file package)))))
 
+(defun %definition-file (symbol)
+  "The src/-relative file that defines SYMBOL (function, variable, macro,
+generic, structure, constant or type), or NIL. Asked of the image, so a
+symbol whose definition moved is followed to its new home."
+  (let ((root (asdf:system-source-directory :bitcoin-lisp)))
+    (dolist (kind '(:function :variable :macro :generic-function :structure :constant :type))
+      (let ((sources (ignore-errors (sb-introspect:find-definition-sources-by-name symbol kind))))
+        (when sources
+          (let ((path (sb-introspect:definition-source-pathname (first sources))))
+            (when path
+              (return (enough-namestring path root)))))))))
+
+(defun %top-package-upward-references (&optional (corpus (%source-corpus)))
+  "Every (file . \"bl:name\") in CORPUS where a src file names a symbol of
+the TOP package whose DEFINITION loads after that file -- the blind spot
+%PACKAGE-REFERENCES documents: the top package is defined in
+src/package.lisp, third in the load, but its definitions span
+src/config.lisp (fifth) to src/node/ (last), so a package-level test
+cannot see validation calling into the node. This one resolves each
+bl:NAME to its defining file and compares load positions. Strings and
+comments are blanked; a name with no definition in the image (a slot
+accessor of a struct defined by a macro, say) is skipped, not flagged."
+  (let ((order (%load-order))
+        (hits '())
+        (cache (make-hash-table :test #'equal)))
+    (flet ((definition-layer (name)
+             (multiple-value-bind (layer found) (gethash name cache)
+               (if found
+                   layer
+                   (setf (gethash name cache)
+                         (let* ((sym (find-symbol (string-upcase name) :bitcoin-lisp))
+                                (file (and sym (%definition-file sym))))
+                           (and file (%file-layer file order))))))))
+      (loop for (file . lines) in corpus
+            for layer = (%file-layer file order)
+            when layer
+              do (let ((in-string nil))
+                   (loop for raw across lines
+                         do (multiple-value-bind (code next) (%code-only raw in-string)
+                              (setf in-string next)
+                              (loop with start = 0
+                                    for pos = (search "bl:" (string-downcase code) :start2 start)
+                                    while pos
+                                    do (let* ((name-start (+ pos 3))
+                                              (name-end (or (position-if-not #'%symbol-char-p code :start name-start)
+                                                            (length code)))
+                                              (name (subseq code name-start name-end)))
+                                         ;; bl: must start a token: not bl.x: and not ::
+                                         (when (and (plusp (length name))
+                                                    (or (zerop pos) (not (%symbol-char-p (char code (1- pos)))))
+                                                    (not (and (< name-end (length code)) (char= (char code name-end) #\:))))
+                                           (let ((def-layer (definition-layer name)))
+                                             (when (and def-layer (> def-layer layer))
+                                               (push (cons file (format nil "bl:~A" name)) hits))))
+                                         (setf start name-end)))))))
+      (nreverse hits))))
+
+(defparameter +top-package-upward-baseline+
+  '(
+    ("src/mining/assembler.lisp" . "bl:*node*")
+    ("src/mining/assembler.lisp" . "bl:node-lock")
+    ("src/networking/peer.lisp" . "bl:node-mempool")
+    ("src/networking/peer.lisp" . "bl:*mainnet-relay-enabled*")
+    ("src/networking/peer.lisp" . "bl:node-historical-chainstate")
+    ("src/networking/peer.lisp" . "bl:*node*")
+    ("src/networking/peer.lisp" . "bl:node-current-chainstate")
+    ("src/networking/protocol.lisp" . "bl:node-lock")
+    ("src/networking/protocol.lisp" . "bl:rebalance-caches-on-ibd-exit")
+    ("src/networking/protocol.lisp" . "bl:+pow-target-spacing-seconds+")
+    ("src/networking/protocol.lisp" . "bl:node-blockfilterindex")
+    ("src/networking/protocol.lisp" . "bl:*node*")
+    ("src/networking/protocol.lisp" . "bl:node-address-book")
+    ("src/rpc/accessors.lisp" . "bl:node-current-chainstate")
+    ("src/rpc/accessors.lisp" . "bl:node-chainstates")
+    ("src/rpc/accessors.lisp" . "bl:node-peers")
+    ("src/rpc/accessors.lisp" . "bl:node-mempool")
+    ("src/rpc/accessors.lisp" . "bl:node-block-store")
+    ("src/rpc/accessors.lisp" . "bl:node-network")
+    ("src/rpc/accessors.lisp" . "bl:node-syncing")
+    ("src/rpc/accessors.lisp" . "bl:node-tx-index")
+    ("src/rpc/accessors.lisp" . "bl:node-blockfilterindex")
+    ("src/rpc/accessors.lisp" . "bl:node-lock")
+    ("src/rpc/accessors.lisp" . "bl:node-coinstatsindex")
+    ("src/rpc/blockchain.lisp" . "bl:chainstate-coins-cache-budget")
+    ("src/rpc/blockchain.lisp" . "bl:node-running")
+    ("src/rpc/blockchain.lisp" . "bl:node-network-active")
+    ("src/rpc/blockchain.lisp" . "bl:create-snapshot-chainstate")
+    ("src/rpc/blockchain.lisp" . "bl:add-snapshot-chainstate")
+    ("src/rpc/blockchain.lisp" . "bl:abort-snapshot-chainstate")
+    ("src/rpc/blockchain.lisp" . "bl:call-with-sync-paused")
+    ("src/rpc/blockchain.lisp" . "bl:node-network")
+    ("src/rpc/blockchain.lisp" . "bl:node-lock")
+    ("src/rpc/blockchain.lisp" . "bl:node-peers")
+    ("src/rpc/mempool.lisp" . "bl:node-txospenderindex")
+    ("src/rpc/mempool.lisp" . "bl:node-block-store")
+    ("src/rpc/mempool.lisp" . "bl:broadcast-transaction-to-peers")
+    ("src/rpc/mempool.lisp" . "bl:node-data-directory")
+    ("src/rpc/mempool.lisp" . "bl:load-mempool-from-disk")
+    ("src/rpc/mining.lisp" . "bl:node-running")
+    ("src/rpc/mining.lisp" . "bl:node-peers")
+    ("src/rpc/mining.lisp" . "bl:node-network")
+    ("src/rpc/net.lisp" . "bl:node-max-peers")
+    ("src/rpc/net.lisp" . "bl:peers-of-conn-type")
+    ("src/rpc/net.lisp" . "bl:+target-block-relay-peers+")
+    ("src/rpc/net.lisp" . "bl:*pending-test-connections*")
+    ("src/rpc/net.lisp" . "bl:node-pending-onetry")
+    ("src/rpc/net.lisp" . "bl:node-added-nodes")
+    ("src/rpc/net.lisp" . "bl:parse-node-endpoint")
+    ("src/rpc/net.lisp" . "bl:node-network-active")
+    ("src/rpc/net.lisp" . "bl:node-address-book")
+    ("src/rpc/net.lisp" . "bl:node-lock")
+    ("src/rpc/net.lisp" . "bl:node-peers")
+    ("src/rpc/node.lisp" . "bl:*node-start-time*")
+    ("src/rpc/node.lisp" . "bl:request-node-shutdown")
+    ("src/rpc/node.lisp" . "bl:*log-file-path*")
+    ("src/rpc/node.lisp" . "bl:node-indexes")
+    ("src/rpc/rawtransaction.lisp" . "bl:node-fee-estimator")
+    ("src/rpc/rest.lisp" . "bl:node-tip-liveness")
+    ("src/validation/block.lisp" . "bl:gate-block-write-on-disk-space")
+    ("src/validation/block.lisp" . "bl:effective-prune-target-bytes")
+    ("src/validation/block.lisp" . "bl:maybe-critical-flush")
+    ("src/validation/block.lisp" . "bl:maybe-validate-snapshot")
+    ("src/wallet/psbt.lisp" . "bl:node-mempool")
+    ("src/wallet/wallet-coins.lisp" . "bl:node-mempool")
+    ("src/wallet/wallet-spend.lisp" . "bl:node-fee-estimator")
+    ("src/wallet/wallet-spend.lisp" . "bl:node-current-chainstate")
+    ("src/wallet/wallet-spend.lisp" . "bl:broadcast-transaction-to-peers")
+    ("src/wallet/wallet-spend.lisp" . "bl:node-wallet-manager")
+    ("src/wallet/wallet-spend.lisp" . "bl:node-chain-state")
+    ("src/wallet/wallet-spend.lisp" . "bl:node-mempool")
+    ("src/wallet/wallet-tx.lisp" . "bl:node-mempool")
+    ("src/wallet/wallet-tx.lisp" . "bl:node-block-store")
+    ("src/wallet/wallet-tx.lisp" . "bl:node-current-chainstate")
+    ("src/wallet/wallet.lisp" . "bl:node-current-chainstate")
+    ("src/wallet/wallet.lisp" . "bl:node-mempool")
+    ("src/wallet/wallet.lisp" . "bl:node-wallet-manager"))
+  "Pinned (file . \"bl:name\") pairs a src file reaches upward into the top
+package -- 77 distinct pairs on the scanner's first run (wave F, after the
+validation interface took validation's and the mempool's fourteen away);
+allowed only to shrink. Nearly all are the node struct's accessors and
+*node* (src/node/state.lisp, last in the load) reached from rpc, wallet,
+networking and mining -- one file move (wave F2) retires that group. Each entry is a layer boundary the code crosses by name; the
+validation interface (src/util/validation-interface.lisp) is how the
+lower layer announces instead.")
+
+(test no-new-top-package-upward-references
+  "A src file may name top-package definitions loaded before it. The
+validation interface exists so validation and the mempool need nothing
+from src/node/; what remains is pinned and may only shrink."
+  (let* ((current (%top-package-upward-references))
+         (new (set-difference current +top-package-upward-baseline+ :test #'equal)))
+    (is (null new)
+        "~D new upward reference~:P into the top package: ~S -- announce through ~
+the validation interface, or move the definition down" (length new) new)))
+
 (test no-new-layering-violations
   "A file may name its own package and the ones loaded before it. Naming a
 later one works only because src/package.lisp defines every package up front;
@@ -1280,6 +1447,12 @@ the measuring functions must measure a known shape correctly."
                                   "(private-key-to-wif k :network :testnet)"
                                   "\":testnet\"")))))
       "positive control: the pseudo-network scanner must flag :testnet in code and only there")
+  (is (equal '(("src/validation/probe.lisp" . "bl:node-lock"))
+             (%top-package-upward-references
+              (list (cons "src/validation/probe.lisp"
+                          (vector "(bl:node-lock x) (bl.store:chain-state y) (bl:*network* z) ; bl:node-peers"
+                                  "\"bl:node-mempool\"")))))
+      "positive control: a validation file naming the node struct's accessor (src/node/state.lisp) is upward; a re-exported chainparams special is not")
   (is (equal '(("probe.lisp" . 1))
              (%equalp-hash-tables
               (list (cons "probe.lisp"

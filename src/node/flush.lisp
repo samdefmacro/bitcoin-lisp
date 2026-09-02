@@ -312,15 +312,15 @@ returning bytes freed to the system allocator), and log memory snapshots."
   #+sbcl (sb-ext:gc :full t)
   (log-memory-snapshot "post-flush"))
 
-(defun maybe-periodic-flush (&optional chainstate)
+(bl.vi:define-validation-hook :updated-block-tip maybe-periodic-flush (chainstate hash height)
   "Flush chainstates (state file, coins view, and the header index) to disk
 if either:
 - N blocks have been connected since the last flush, OR
 - N seconds have elapsed since the last flush (catches slow-sync regions
   where 1000 blocks would take many minutes to accumulate).
 
-Called from connect-block, which passes the chainstate the block connected
-to; defaults to the node's current chainstate. The size trigger checks the
+An :updated-block-tip hook: CHAINSTATE is the one whose tip moved (any
+chainstate, the background one included); NIL means the node's current one. The size trigger checks the
 connecting chainstate's own coins cache; once ANY trigger fires, EVERY
 chainstate is flushed — with an assumeutxo background sync two chainstates
 connect blocks concurrently but the global time/count triggers reset on any
@@ -328,6 +328,7 @@ flush, so flushing only the triggering one would let the other's dirty
 coins and redo window grow unboundedly. Flushing a clean chainstate is
 cheap (work is proportional to dirty entries). Cheap if no flush needed;
 durable if it does flush (atomic temp+fsync+rename inside save-*)."
+  (declare (ignore hash height))
   (unless *node* (return-from maybe-periodic-flush))
   (let* ((cs (or chainstate (node-current-chainstate *node*)))
          (view (and cs (bl.store:chain-state-coins-view cs))))

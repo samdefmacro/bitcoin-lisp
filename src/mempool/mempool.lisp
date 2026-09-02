@@ -869,11 +869,7 @@ RESULT is mempool-add's keyword. DEFER-TRIM is threaded to MEMPOOL-ADD
       ;; that actually entered counts.
       (when (eq result :ok)
         (bpe-note-entry txid (mempool-entry-fee entry)
-                        (mempool-entry-vsize entry) height)
-        ;; ZMQ TransactionAddedToMempool: hashtx/rawtx, then a sequence 'A'
-        ;; carrying the sequence THIS entry was stamped with -- a subscriber
-        ;; uses it to order acceptances against removals.
-        (bl:zmq-notify-tx-accepted tx txid (mempool-entry-sequence entry)))
+                        (mempool-entry-vsize entry) height))
       (values result entry))))
 
 (defvar *mempool-removal-reason* nil
@@ -989,15 +985,15 @@ runs unconditionally (validation.cpp:1338-1342)."
     (unless (mempool-has mempool txid)
       (return-from mempool-add :mempool-full)))
 
-  ;; Wallet chain-tracking hook (cheap no-op without loaded wallets). Fires
-  ;; only for a tx that made it in AND survived its own trim, matching where
-  ;; Core fires TransactionAddedToMempool (validation.cpp:1393-1416 — after
-  ;; LimitMempoolSize, never on the self-evicted "mempool full" outcome).
-  ;; Under DEFER-TRIM the caller's later re-limit can still evict it, but
-  ;; Core's package path fires the added signal before its final re-limit
-  ;; too (SubmitPackage, validation.cpp:1292-1310) — the eviction then
-  ;; surfaces as a :size-limit removal.
-  (bl:wallet-notify-mempool-tx-added (mempool-entry-transaction entry))
+  ;; Core TransactionAddedToMempool (validation.cpp:1393-1416): only for a
+  ;; tx that made it in AND survived its own trim -- after LimitMempoolSize,
+  ;; never on the self-evicted "mempool full" outcome. Under DEFER-TRIM the
+  ;; caller's later re-limit can still evict it, but Core's package path
+  ;; fires the added signal before its final re-limit too (SubmitPackage,
+  ;; validation.cpp:1292-1310) -- the eviction then surfaces as a
+  ;; :size-limit removal. ZMQ and the wallet subscribe.
+  (bl.vi:notify-transaction-added (mempool-entry-transaction entry) txid
+                                  (mempool-entry-sequence entry))
   :ok)
 
 (defun mempool-remove (mempool txid)
@@ -1020,13 +1016,7 @@ shadow checks report as divergence."
       ;; silently discarding the confirmation. Core splits it the same way —
       ;; removeForBlock does not notify the estimator; processBlock does.
       (unless (eq *mempool-removal-reason* :block)
-        (bpe-note-removal txid :in-block nil)
-        ;; ZMQ TransactionRemovedFromMempool is likewise "called for all
-        ;; non-block inclusion reasons" (zmqnotificationinterface.cpp:172): a
-        ;; mined transaction is announced by the block notification, and
-        ;; reporting it here too would show subscribers a removal that never
-        ;; happened.
-        (bl:zmq-notify-tx-removed txid (mempool-entry-sequence entry)))
+        (bpe-note-removal txid :in-block nil))
       ;; Remove spent outpoint entries
       (bl.ser:dovector (input (bl.ser:transaction-inputs
                       (mempool-entry-transaction entry)))
@@ -1058,11 +1048,12 @@ shadow checks report as divergence."
         (when handle
           (txgraph-remove-transaction (mempool-graph mempool) handle)))
       (%mempool-graph-verify mempool)
-      ;; Wallet chain-tracking hook — the single removal chokepoint, like
-      ;; Core removeUnchecked's TransactionRemovedFromMempool signal. The
-      ;; hook itself skips reason :block (Core txmempool.cpp:269-275).
-      (bl:wallet-notify-mempool-tx-removed
-       (mempool-entry-transaction entry) *mempool-removal-reason*)
+      ;; Core removeUnchecked's TransactionRemovedFromMempool -- the single
+      ;; removal chokepoint. Every subscriber (ZMQ, the wallet) skips reason
+      ;; :block itself: a mined transaction is announced by the block.
+      (bl.vi:notify-transaction-removed
+       (mempool-entry-transaction entry) txid (mempool-entry-sequence entry)
+       *mempool-removal-reason*)
       entry)))
 
 (defun mempool-remove-recursive (mempool txid)
