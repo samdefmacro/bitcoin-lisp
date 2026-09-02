@@ -156,6 +156,9 @@ compile against them. src/util/bytes.lisp.")
    #:br-read-bytes
    #:br-read-compact-size
    #:br-read-var-bytes
+   #:octets=
+   #:octets-hash
+   #:make-octets-hash-table
    #:with-byte-reader))
 
 (defpackage #:bitcoin-lisp.chainparams

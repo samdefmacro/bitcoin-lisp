@@ -111,8 +111,8 @@ time, like the cluster limits.")
   ;; In-mempool dependency links (txid -> t). Ancestor/descendant aggregates
   ;; are derived on demand by walking these (bounded by the 25/25 limits), so
   ;; there are no cached totals to drift out of sync.
-  (parents (make-hash-table :test 'equalp) :type hash-table)
-  (children (make-hash-table :test 'equalp) :type hash-table)
+  (parents (bl.bytes:make-octets-hash-table) :type hash-table)
+  (children (bl.bytes:make-octets-hash-table) :type hash-table)
   ;; This entry's transaction in the mempool's shadow txgraph (cluster mempool
   ;; P3). Core's entry IS its handle (CTxMemPoolEntry : public TxGraph::Ref,
   ;; kernel/mempool_entry.h:65) and the Ref destructor removes the tx from the
@@ -343,11 +343,11 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
 (defstruct mempool
   "In-memory transaction pool."
   ;; txid (byte vector) -> mempool-entry
-  (entries (make-hash-table :test 'equalp) :type hash-table)
+  (entries (bl.bytes:make-octets-hash-table) :type hash-table)
   ;; wtxid (byte vector) -> txid  (BIP339 witness-txid lookup for getdata)
-  (by-wtxid (make-hash-table :test 'equalp) :type hash-table)
+  (by-wtxid (bl.bytes:make-octets-hash-table) :type hash-table)
   ;; outpoint-key (byte vector) -> txid that spends it
-  (spent-outpoints (make-hash-table :test 'equalp) :type hash-table)
+  (spent-outpoints (bl.bytes:make-octets-hash-table) :type hash-table)
   ;; Sum of the entries' sigop-adjusted virtual sizes (Core totalTxSize,
   ;; txmempool.h:191 "sum of all mempool tx's virtual sizes" —
   ;; getmempoolinfo's "bytes").
@@ -373,13 +373,13 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   (rolling-min-fee-time 0 :type integer)
   ;; txid -> satoshi fee delta from prioritisetransaction (Core's mapDeltas).
   ;; Deltas may exist for txs not (yet) in the mempool; applied on acceptance.
-  (deltas (make-hash-table :test 'equalp) :type hash-table)
+  (deltas (bl.bytes:make-octets-hash-table) :type hash-table)
   ;; txid -> T for locally-submitted transactions (sendrawtransaction) whose
   ;; initial broadcast hasn't been confirmed yet (Core m_unbroadcast_txids,
   ;; txmempool.h:286). A peer's getdata for the tx is the confirmation signal;
   ;; until then the periodic re-announcement pass keeps re-relaying. Always a
   ;; subset of ENTRIES: adds are gated on membership, removal drops the txid.
-  (unbroadcast (make-hash-table :test 'equalp) :type hash-table)
+  (unbroadcast (bl.bytes:make-octets-hash-table) :type hash-table)
   ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
   ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
   (orphan-pool (make-orphan-pool) :type orphan-pool)

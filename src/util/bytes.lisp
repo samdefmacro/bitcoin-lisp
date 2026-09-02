@@ -313,3 +313,49 @@ bits."
   "Read a length-prefixed byte vector."
   (let ((len (br-read-compact-size br)))
     (br-read-bytes br len)))
+
+;;;; Hash tables keyed by octet vectors
+;;;
+;;; A txid, wtxid, outpoint key or sighash is a (simple-array (unsigned-byte 8))
+;;; whose leading bytes are already uniformly random. SBCL's EQUALP hash walks
+;;; every byte and its test is a generic descent; this test compares the
+;;; vectors directly and hashes the first eight bytes. The signature cache and
+;;; the UTXO set each invented this once (sig-cache-hash, utxo-key=); the
+;;; mempool's eight txid tables used EQUALP.
+
+(declaim (inline octets=))
+(defun octets= (a b)
+  "EQUALP restricted to two octet vectors."
+  (declare (type (simple-array (unsigned-byte 8) (*)) a b)
+           (optimize (speed 3) (safety 1)))
+  (let ((n (length a)))
+    (and (= n (length b))
+         (loop for i of-type fixnum below n
+               always (= (aref a i) (aref b i))))))
+
+(declaim (inline octets-hash))
+(defun octets-hash (key)
+  "The first eight bytes of KEY as a little-endian integer (fewer when KEY is
+shorter), with the four bytes after a 32-byte hash mixed in when present --
+an outpoint key is txid||index, and the outputs of one transaction must not
+share a bucket. Keys are hash outputs, so the leading bytes are uniform."
+  (declare (type (simple-array (unsigned-byte 8) (*)) key)
+           (optimize (speed 3) (safety 1)))
+  (let ((h 0) (n (length key)))
+    (declare (type (unsigned-byte 64) h) (type fixnum n))
+    (loop for i of-type fixnum below (min 8 n)
+          do (setf h (logior h (ash (aref key i) (* 8 i)))))
+    (when (>= n 36)
+      (setf h (logxor h (ash (logior (aref key 32) (ash (aref key 33) 8)
+                                     (ash (aref key 34) 16) (ash (aref key 35) 24))
+                             24))))
+    (logand h most-positive-fixnum)))
+
+#+sbcl (sb-ext:define-hash-table-test octets= octets-hash)
+
+(defun make-octets-hash-table (&key (size 16) synchronized)
+  "A hash table keyed by octet vectors (txids, outpoint keys, sighashes):
+the OCTETS= test under SBCL, EQUALP elsewhere."
+  (make-hash-table #+sbcl :test #+sbcl 'octets= #-sbcl :test #-sbcl 'equalp
+                   :size size
+                   #+sbcl :synchronized #+sbcl synchronized))

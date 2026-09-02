@@ -88,31 +88,14 @@ below could spin the loop forever and starve peer maintenance.")
    consensus bug in the validator, not a network issue. Halting + logging
    beats spinning until the heap exhausts.")
 
-(declaim (inline block-hash-key-hash))
-(defun block-hash-key-hash (k)
-  "Custom :hash-function for the IBD block-hash-keyed tables (pending,
-in-flight, request-timeouts). Keys are 32-byte SHA256d
-block hashes (already uniformly random), so read the first 8 bytes as a
-fixnum-masked uint64 instead of equalp's full 32-byte data-vector-hash.
-:test stays 'equalp for exact collision resolution. Mirrors utxo-key-hash;
-profile (fresh testnet4 IBD) showed this hashing dominating IBD CPU."
-  (declare (optimize (speed 3)))
-  (if (and (vectorp k) (>= (length k) 8))
-      (logand (+ (aref k 0) (ash (aref k 1) 8) (ash (aref k 2) 16) (ash (aref k 3) 24)
-                 (ash (aref k 4) 32) (ash (aref k 5) 40) (ash (aref k 6) 48) (ash (aref k 7) 56))
-              most-positive-fixnum)
-      (sxhash k)))
-
 (defun make-block-hash-table (&key synchronized)
-  "An equalp hash-table for 32-byte block-hash keys, using the fast
-block-hash-key-hash. Falls back to plain equalp off SBCL. SYNCHRONIZED makes
-the table thread-safe (SBCL): the in-flight table needs it because
-getpeerinfo's \"inflight\" snapshot reads it from RPC threads while the sync
-thread mutates it."
-  (declare (ignorable synchronized))
-  (make-hash-table :test 'equalp
-                   #+sbcl :hash-function #+sbcl #'block-hash-key-hash
-                   #+sbcl :synchronized #+sbcl synchronized))
+  "A hash table for 32-byte block-hash keys (pending, in-flight,
+request-timeouts): bl.bytes:make-octets-hash-table, whose first-eight-bytes
+hash is what a fresh testnet4 IBD profile asked for -- EQUALP's full 32-byte
+data-vector-hash dominated IBD CPU. SYNCHRONIZED makes the table thread-safe
+(SBCL): the in-flight table needs it because getpeerinfo's \"inflight\"
+snapshot reads it from RPC threads while the sync thread mutates it."
+  (bl.bytes:make-octets-hash-table :synchronized synchronized))
 
 (defstruct ibd-context
   "Context for managing Initial Block Download."
