@@ -48,6 +48,7 @@ src/serialization/.")
    ;; define-message (message-macro.lisp)
    #:define-message
    #:define-message-field-type
+   #:field-codec-forms
    #:read-bytes
    #:write-bytes
    #:read-var-bytes
