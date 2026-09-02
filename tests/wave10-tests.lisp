@@ -18,11 +18,6 @@
 
 (in-suite :wave10-tests)
 
-(defun wave10-rpc-code (thunk)
-  "Funcall THUNK; return the rpc-error code it signals, or NIL if none."
-  (handler-case (progn (funcall thunk) nil)
-    (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e))))
-
 (defun wave10-encode (result)
   "Encode an RPC result alist exactly like the server does."
   (with-output-to-string (s)
@@ -118,25 +113,20 @@ unconnected peer."
 RPC_INVALID_ADDRESS_OR_KEY, like Core (was -1)."
   (let ((node (make-test-node))
         (hash (make-string 64 :initial-element #\a)))
-    (is (= -5 (wave10-rpc-code
+    (is (= -5 (rpc-error-code-of
                (lambda () (bl.rpc::rpc-getblock node (list hash))))))
-    (is (= -5 (wave10-rpc-code
+    (is (= -5 (rpc-error-code-of
                (lambda () (bl.rpc::rpc-getblockheader node (list hash))))))
-    (is (= -5 (wave10-rpc-code
+    (is (= -5 (rpc-error-code-of
                (lambda () (bl.rpc::rpc-getmempoolentry node (list hash))))))
-    (is (= -5 (wave10-rpc-code
+    (is (= -5 (rpc-error-code-of
                (lambda () (bl.rpc::rpc-getmempoolancestors node (list hash))))))))
 
 (test wave10-disconnectnode-minus-29
   "disconnectnode on an unknown peer throws -29 RPC_CLIENT_NODE_NOT_CONNECTED
 with Core's message."
-  (handler-case
-      (progn (bl.rpc::rpc-disconnectnode (make-test-node) (list "203.0.113.9"))
-             (fail "expected rpc-error"))
-    (bl.rpc:rpc-error (e)
-      (is (= -29 (bl.rpc:rpc-error-code e)))
-      (is (string= "Node not found in connected nodes"
-                   (bl.rpc:rpc-error-message e))))))
+  (signals-rpc-error (:code -29 :exact-message "Node not found in connected nodes")
+    (bl.rpc::rpc-disconnectnode (make-test-node) (list "203.0.113.9"))))
 
 (test wave10-setban-error-codes
   "setban: invalid address -30; double-add -23; unban of a never-banned
@@ -146,18 +136,18 @@ address -30; absolute past timestamp -8 (Core net.cpp:766-812)."
     (unwind-protect
          (progn
            ;; hostnames / garbage are not bannable addresses
-           (is (= -30 (wave10-rpc-code
+           (is (= -30 (rpc-error-code-of
                        (lambda () (bl.rpc::rpc-setban
                                    node (list "not-an-ip" "add"))))))
            (is (null (bl.rpc::rpc-setban node (list "198.51.100.7" "add"))))
-           (is (= -23 (wave10-rpc-code
+           (is (= -23 (rpc-error-code-of
                        (lambda () (bl.rpc::rpc-setban
                                    node (list "198.51.100.7" "add"))))))
-           (is (= -8 (wave10-rpc-code
+           (is (= -8 (rpc-error-code-of
                       (lambda () (bl.rpc::rpc-setban
                                   node (list "192.0.2.44" "add" 12345 t))))))
            (is (null (bl.rpc::rpc-setban node (list "198.51.100.7" "remove"))))
-           (is (= -30 (wave10-rpc-code
+           (is (= -30 (rpc-error-code-of
                        (lambda () (bl.rpc::rpc-setban
                                    node (list "198.51.100.7" "remove")))))))
       (bl.net:clear-ban-list))))
@@ -166,14 +156,14 @@ address -30; absolute past timestamp -8 (Core net.cpp:766-812)."
   "submitblock/testmempoolaccept/submitpackage decode failures throw -22
 RPC_DESERIALIZATION_ERROR (whole call — no per-tx allowed:false rows)."
   (let ((node (make-test-node)))
-    (is (= -22 (wave10-rpc-code
+    (is (= -22 (rpc-error-code-of
                 (lambda () (bl.rpc::rpc-submitblock node (list "zz"))))))
-    (is (= -22 (wave10-rpc-code
+    (is (= -22 (rpc-error-code-of
                 (lambda () (bl.rpc::rpc-submitblock node (list ""))))))
-    (is (= -22 (wave10-rpc-code
+    (is (= -22 (rpc-error-code-of
                 (lambda () (bl.rpc::rpc-testmempoolaccept
                             node (list (list "nothex!")))))))
-    (is (= -22 (wave10-rpc-code
+    (is (= -22 (rpc-error-code-of
                 (lambda () (bl.rpc::rpc-submitpackage
                             node (list (list "nothex!" "alsonot")))))))))
 
@@ -256,12 +246,12 @@ type comparison and answers \"JSON value of type null is not of expected type
 array\". This test asserted -8 for NIL, which was our merged representation
 rather than either of Core's answers."
   (let ((node (make-test-node)))
-    (is (= -8 (wave10-rpc-code
+    (is (= -8 (rpc-error-code-of
                (lambda () (bl.rpc::rpc-testmempoolaccept
                            node (list bl.rpc::+json-empty-array+))))))
-    (is (= -3 (wave10-rpc-code
+    (is (= -3 (rpc-error-code-of
                (lambda () (bl.rpc::rpc-testmempoolaccept node (list '()))))))
-    (is (= -8 (wave10-rpc-code
+    (is (= -8 (rpc-error-code-of
                (lambda () (bl.rpc::rpc-testmempoolaccept
                            node (list (make-list 26 :initial-element "00")))))))))
 
@@ -269,16 +259,16 @@ rather than either of Core's answers."
   "generatetoaddress bad address -5; prioritisetransaction bad txid -8;
 signmessagewithprivkey bad WIF -5; getblockfilter malformed hash -8."
   (let ((node (make-test-node)))
-    (is (= -5 (wave10-rpc-code
+    (is (= -5 (rpc-error-code-of
                (lambda () (bl.rpc::rpc-generatetoaddress
                            node (list 1 "notanaddress"))))))
-    (is (= -8 (wave10-rpc-code
+    (is (= -8 (rpc-error-code-of
                (lambda () (bl.rpc::rpc-prioritisetransaction
                            node (list "nothex" 0 1000))))))
-    (is (= -5 (wave10-rpc-code
+    (is (= -5 (rpc-error-code-of
                (lambda () (bl.rpc:rpc-signmessagewithprivkey
                            node (list "notawif" "msg"))))))
-    (is (= -8 (wave10-rpc-code
+    (is (= -8 (rpc-error-code-of
                (lambda () (bl.rpc::rpc-getblockfilter
                            node (list "shorthex"))))))))
 
@@ -286,43 +276,25 @@ signmessagewithprivkey bad WIF -5; getblockfilter malformed hash -8."
   "verifymessage: undecodable address -5 'Invalid address'; a decodable
 non-P2PKH (bech32) address -3 'Address does not refer to key'."
   (let ((node (make-test-node)))
-    (handler-case
-        (progn (bl.rpc::rpc-verifymessage
-                node (list "not-an-address" "AAAA" "m"))
-               (fail "expected rpc-error"))
-      (bl.rpc:rpc-error (e)
-        (is (= -5 (bl.rpc:rpc-error-code e)))
-        (is (string= "Invalid address" (bl.rpc:rpc-error-message e)))))
-    (handler-case
-        (progn (bl.rpc::rpc-verifymessage
-                node (list "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx" "AAAA" "m"))
-               (fail "expected rpc-error"))
-      (bl.rpc:rpc-error (e)
-        (is (= -3 (bl.rpc:rpc-error-code e)))
-        (is (string= "Address does not refer to key"
-                     (bl.rpc:rpc-error-message e)))))))
+    (signals-rpc-error (:code -5 :exact-message "Invalid address")
+      (bl.rpc::rpc-verifymessage
+       node (list "not-an-address" "AAAA" "m")))
+    (signals-rpc-error (:code -3 :exact-message "Address does not refer to key")
+      (bl.rpc::rpc-verifymessage
+       node (list "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx" "AAAA" "m")))))
 
 (test wave10-getblocktemplate-mainnet-gates
   "getblocktemplate on MAINNET with no peers throws -9 (Core's
 !isTestChain() gate); test networks skip the gate entirely."
   (let ((node (bl:make-node :network :mainnet)))
-    (handler-case
-        (progn (bl.rpc::rpc-getblocktemplate node nil)
-               (fail "expected rpc-error"))
-      (bl.rpc:rpc-error (e)
-        (is (= -9 (bl.rpc:rpc-error-code e)))
-        (is (string= "Bitcoin is not connected!"
-                     (bl.rpc:rpc-error-message e)))))))
+    (signals-rpc-error (:code -9 :exact-message "Bitcoin is not connected!")
+      (bl.rpc::rpc-getblocktemplate node nil))))
 
 (test wave10-method-not-found
   "Unknown methods throw -32601 with Core's exact message."
   (bl.rpc::register-all-methods)
-  (handler-case
-      (progn (bl.rpc:dispatch-rpc-method nil "nosuchmethod" '())
-             (fail "expected rpc-error"))
-    (bl.rpc:rpc-error (e)
-      (is (= -32601 (bl.rpc:rpc-error-code e)))
-      (is (string= "Method not found" (bl.rpc:rpc-error-message e))))))
+  (signals-rpc-error (:code -32601 :exact-message "Method not found")
+    (bl.rpc:dispatch-rpc-method nil "nosuchmethod" '())))
 
 ;;; ---------------------------------------------------------------------
 ;;; HTTP layer
@@ -374,16 +346,10 @@ distinguishes an absent id (notification -> 204) from id:null."
 (test wave10-invalid-request-not-parse-error
   "A parseable body with a missing method is -32600 INVALID_REQUEST, not
 -32700 PARSE_ERROR (previously swallowed by the outer handler)."
-  (handler-case
-      (progn (bl.rpc::parse-json-rpc-request "{\"id\":1}")
-             (fail "expected rpc-error"))
-    (bl.rpc:rpc-error (e)
-      (is (= -32600 (bl.rpc:rpc-error-code e)))))
-  (handler-case
-      (progn (bl.rpc::parse-json-rpc-request "not json")
-             (fail "expected rpc-error"))
-    (bl.rpc:rpc-error (e)
-      (is (= -32700 (bl.rpc:rpc-error-code e))))))
+  (signals-rpc-error (:code -32600)
+    (bl.rpc::parse-json-rpc-request "{\"id\":1}"))
+  (signals-rpc-error (:code -32700)
+    (bl.rpc::parse-json-rpc-request "not json")))
 
 ;;; ---------------------------------------------------------------------
 ;;; D. gettxout include_mempool

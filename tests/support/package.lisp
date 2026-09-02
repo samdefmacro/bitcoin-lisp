@@ -18,6 +18,9 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:make-temp-directory
    #:with-network
    #:make-test-node
+   #:with-ibd-context
+   #:signals-rpc-error
+   #:rpc-error-code-of
    #:make-deterministic-rng
    ;; transactions.lisp
    #:make-mempool-test-tx

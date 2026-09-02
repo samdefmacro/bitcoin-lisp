@@ -163,44 +163,42 @@ TxStateInterpretSerialized vectors map to the right states."
   "Mining to a wallet address tracks the coinbase through the connect hook;
 categories follow Core's maturity rules (immature until depth 101, the
 COINBASE_MATURITY+1 rule)."
-  (with-wallet-chain-node (node "maturity")
-    (let ((bl.wallet::*rpc-wallet-name* nil))
-      (bl.wallet::rpc-createwallet node '("w"))
-      (let* ((addr (bl.wallet::rpc-getnewaddress node nil))
-             (hashes (%wc-mine node 1 addr))
-             (cb-txid (%wc-coinbase-txid node (first hashes)))
-             (wallet (%wc-wallet node "w")))
-        ;; Tracked via the hook, confirmed at height 1.
-        (is (= 1 (hash-table-count (bl.wallet::wallet-map-wallet wallet))))
-        (is (= 1 (%aval "txcount" (bl.wallet::rpc-getwalletinfo node nil))))
-        (let ((gettx (%wc-gettx node cb-txid)))
-          (is (= 1 (%aval "confirmations" gettx)))
-          (is (eq t (%aval "generated" gettx)))
-          (is (string= (first hashes) (%aval "blockhash" gettx)))
-          (is (= 1 (%aval "blockheight" gettx)))
-          (is (= 0 (%aval "blockindex" gettx)))
-          (is (plusp (%aval "blocktime" gettx)))
-          (is (string= "immature" (%wc-details-category gettx)))
-          ;; Immature coinbase credit counts as 0 (receive.cpp).
-          (is (< (abs (%aval "amount" gettx)) 1d-9))
-          (is (string= "no" (%aval "bip125-replaceable" gettx))))
-        ;; Depth 100 = still one block short of spendable (maturity + 1).
-        (%wc-mine node 99 (%wc-optrue-address))
-        (is (string= "immature" (%wc-details-category (%wc-gettx node cb-txid))))
-        (%wc-mine node 1 (%wc-optrue-address))
-        (let ((gettx (%wc-gettx node cb-txid)))
-          (is (= 101 (%aval "confirmations" gettx)))
-          (is (string= "generate" (%wc-details-category gettx)))
-          (is (< (abs (- (%aval "amount" gettx) 50.0d0)) 1d-9)))
-        ;; listtransactions reports the single generate entry.
-        (let ((entries (bl.wallet::rpc-listtransactions node nil)))
-          (is (= 1 (length entries)))
-          (is (string= "generate" (%aval "category" (first entries))))
-          (is (string= addr (%aval "address" (first entries)))))
-        ;; lastprocessedblock tracks the tip.
-        (let ((lpb (%aval "lastprocessedblock"
-                          (bl.wallet::rpc-getwalletinfo node nil))))
-          (is (= 101 (%aval "height" lpb))))))))
+  (with-wallet-chain-node (node "maturity" :wallet "w")
+    (let* ((addr (bl.wallet::rpc-getnewaddress node nil))
+           (hashes (%wc-mine node 1 addr))
+           (cb-txid (%wc-coinbase-txid node (first hashes)))
+           (wallet (%wc-wallet node "w")))
+      ;; Tracked via the hook, confirmed at height 1.
+      (is (= 1 (hash-table-count (bl.wallet::wallet-map-wallet wallet))))
+      (is (= 1 (%aval "txcount" (bl.wallet::rpc-getwalletinfo node nil))))
+      (let ((gettx (%wc-gettx node cb-txid)))
+        (is (= 1 (%aval "confirmations" gettx)))
+        (is (eq t (%aval "generated" gettx)))
+        (is (string= (first hashes) (%aval "blockhash" gettx)))
+        (is (= 1 (%aval "blockheight" gettx)))
+        (is (= 0 (%aval "blockindex" gettx)))
+        (is (plusp (%aval "blocktime" gettx)))
+        (is (string= "immature" (%wc-details-category gettx)))
+        ;; Immature coinbase credit counts as 0 (receive.cpp).
+        (is (< (abs (%aval "amount" gettx)) 1d-9))
+        (is (string= "no" (%aval "bip125-replaceable" gettx))))
+      ;; Depth 100 = still one block short of spendable (maturity + 1).
+      (%wc-mine node 99 (%wc-optrue-address))
+      (is (string= "immature" (%wc-details-category (%wc-gettx node cb-txid))))
+      (%wc-mine node 1 (%wc-optrue-address))
+      (let ((gettx (%wc-gettx node cb-txid)))
+        (is (= 101 (%aval "confirmations" gettx)))
+        (is (string= "generate" (%wc-details-category gettx)))
+        (is (< (abs (- (%aval "amount" gettx) 50.0d0)) 1d-9)))
+      ;; listtransactions reports the single generate entry.
+      (let ((entries (bl.wallet::rpc-listtransactions node nil)))
+        (is (= 1 (length entries)))
+        (is (string= "generate" (%aval "category" (first entries))))
+        (is (string= addr (%aval "address" (first entries)))))
+      ;; lastprocessedblock tracks the tip.
+      (let ((lpb (%aval "lastprocessedblock"
+                        (bl.wallet::rpc-getwalletinfo node nil))))
+        (is (= 101 (%aval "height" lpb)))))))
 
 ;;; --- Mempool receive -> confirm -> listsinceblock -> rescan equality ---
 
@@ -209,123 +207,119 @@ COINBASE_MATURITY+1 rule)."
 confirms through the connect hook, listsinceblock windows are Core-shaped,
 and a from-genesis rescan (rescanblockchain AND a fresh importdescriptors
 wallet) reproduces exactly the live-tracked state."
-  (with-wallet-chain-node (node "receive")
-    (let ((bl.wallet::*rpc-wallet-name* nil))
-      (bl.wallet::rpc-createwallet node '("w"))
-      (let* ((wallet (%wc-wallet node "w"))
-             (addr (bl.wallet::rpc-getnewaddress node nil))
-             (spk (%address-script addr :regtest))
-             (fund-hashes (%wc-mine node 1 (%wc-optrue-address))))
-        (%wc-mine node 100 (%wc-optrue-address))   ; tip 101, coinbase@1 mature
-        (let* ((fund-txid (%wc-coinbase-txid node (first fund-hashes)))
-               (tx1 (%wc-spend-tx fund-txid 0 (- +wc-subsidy+ 10000) spk))
-               (txid1 (%wc-send node tx1)))
-          ;; In-mempool: confirmations 0, trusted false (not from us) —
-          ;; the wave-10 JSON false literal, not null.
+  (with-wallet-chain-node (node "receive" :wallet "w")
+    (let* ((wallet (%wc-wallet node "w"))
+           (addr (bl.wallet::rpc-getnewaddress node nil))
+           (spk (%address-script addr :regtest))
+           (fund-hashes (%wc-mine node 1 (%wc-optrue-address))))
+      (%wc-mine node 100 (%wc-optrue-address))   ; tip 101, coinbase@1 mature
+      (let* ((fund-txid (%wc-coinbase-txid node (first fund-hashes)))
+             (tx1 (%wc-spend-tx fund-txid 0 (- +wc-subsidy+ 10000) spk))
+             (txid1 (%wc-send node tx1)))
+        ;; In-mempool: confirmations 0, trusted false (not from us) —
+        ;; the wave-10 JSON false literal, not null.
+        (let ((gettx (%wc-gettx node txid1)))
+          (is (= 0 (%aval "confirmations" gettx)))
+          (is (eq 'yason:false (%aval "trusted" gettx)))
+          (is (null (%aval "generated" gettx)))
+          (is (string= "receive" (%wc-details-category gettx)))
+          (is (< (abs (- (%aval "amount" gettx) 49.9999d0)) 1d-9))
+          (is (string= "no" (%aval "bip125-replaceable" gettx))))
+        (is (eq :in-mempool (bl.wallet::wallet-tx-state
+                             (bl.wallet::wallet-get-wallet-tx
+                              wallet txid1))))
+        ;; Confirm at height 102.
+        (let ((h101 (%wc-tip-hex node)))
+          (%wc-mine node 1 (%wc-optrue-address))
           (let ((gettx (%wc-gettx node txid1)))
-            (is (= 0 (%aval "confirmations" gettx)))
-            (is (eq 'yason:false (%aval "trusted" gettx)))
-            (is (null (%aval "generated" gettx)))
-            (is (string= "receive" (%wc-details-category gettx)))
-            (is (< (abs (- (%aval "amount" gettx) 49.9999d0)) 1d-9))
-            (is (string= "no" (%aval "bip125-replaceable" gettx))))
-          (is (eq :in-mempool (bl.wallet::wallet-tx-state
-                               (bl.wallet::wallet-get-wallet-tx
-                                wallet txid1))))
-          ;; Confirm at height 102.
-          (let ((h101 (%wc-tip-hex node)))
-            (%wc-mine node 1 (%wc-optrue-address))
-            (let ((gettx (%wc-gettx node txid1)))
-              (is (= 1 (%aval "confirmations" gettx)))
-              (is (= 102 (%aval "blockheight" gettx)))
-              (is (plusp (%aval "blocktime" gettx))))
-            ;; listsinceblock from height 101: depth window includes tx1;
-            ;; from the tip: excludes it; lastblock respects target_confirms.
-            (let ((since (bl.wallet::rpc-listsinceblock node (list h101))))
-              (is (= 1 (length (%aval "transactions" since))))
-              (is (string= (%wc-tip-hex node) (%aval "lastblock" since))))
-            (let ((since (bl.wallet::rpc-listsinceblock
-                          node (list (%wc-tip-hex node)))))
-              (is (zerop (length (%aval "transactions" since)))))
-            (let ((since (bl.wallet::rpc-listsinceblock
-                          node (list nil 2))))
-              ;; No filter block: everything listed; lastblock = height 101.
-              (is (plusp (length (%aval "transactions" since))))
-              (is (string= h101 (%aval "lastblock" since))))
-            ;; Unknown blockhash -> Core's -5.
-            (is (= bl.rpc:+rpc-invalid-address-or-key+
-                   (%rpc-error-code
-                    (lambda ()
-                      (bl.wallet::rpc-listsinceblock
-                       node (list (make-string 64 :initial-element #\7))))))))
-          ;; abortrescan with no scan running: JSON false; not scanning.
-          (is (eq 'yason:false (bl.wallet::rpc-abortrescan node nil)))
-          (is (eq 'yason:false
-                  (%aval "scanning"
-                         (bl.wallet::rpc-getwalletinfo node nil))))
-          ;; rescanblockchain from genesis must reproduce the live state.
-          (let ((before (%wc-state-snapshot wallet))
-                (result (bl.wallet::rpc-rescanblockchain node '(0))))
-            (is (= 0 (%aval "start_height" result)))
-            (is (= 102 (%aval "stop_height" result)))
-            (is (equalp before (%wc-state-snapshot wallet))))
-          ;; A second wallet importing the same descriptor with an old
-          ;; timestamp rescans to the identical tracked state.
-          (let* ((descs (%aval "descriptors"
-                               (bl.wallet::rpc-listdescriptors node '(t))))
-                 (ext-wpkh (find-if (lambda (d)
-                                      (let ((s (%aval "desc" d)))
-                                        (and (eql 0 (search "wpkh(" s))
-                                             (search "/0/*" s))))
-                                    descs)))
-            (is (not (null ext-wpkh)))
-            (bl.wallet::rpc-createwallet node '("w2" nil t)) ; blank
-            (let* ((bl.wallet::*rpc-wallet-name* "w2")
-                   (results (bl.wallet::rpc-importdescriptors
-                             node (list (list (%ht "desc" (%aval "desc" ext-wpkh)
-                                                   "timestamp" 1
-                                                   "active" t
-                                                   "range" 10))))))
-              (is (eq t (%aval "success" (first results))))
-              (let ((w2 (%wc-wallet node "w2")))
-                ;; Same tracked tx set (only tx1 pays the wpkh descriptor;
-                ;; wallet w also only has tx1). time-smart legitimately
-                ;; differs: live tracking stamps mempool arrival, the
-                ;; import rescan stamps the block time.
-                (is (equalp (%wc-snapshot-sans-times (%wc-state-snapshot wallet))
-                            (%wc-snapshot-sans-times (%wc-state-snapshot w2))))))))))))
+            (is (= 1 (%aval "confirmations" gettx)))
+            (is (= 102 (%aval "blockheight" gettx)))
+            (is (plusp (%aval "blocktime" gettx))))
+          ;; listsinceblock from height 101: depth window includes tx1;
+          ;; from the tip: excludes it; lastblock respects target_confirms.
+          (let ((since (bl.wallet::rpc-listsinceblock node (list h101))))
+            (is (= 1 (length (%aval "transactions" since))))
+            (is (string= (%wc-tip-hex node) (%aval "lastblock" since))))
+          (let ((since (bl.wallet::rpc-listsinceblock
+                        node (list (%wc-tip-hex node)))))
+            (is (zerop (length (%aval "transactions" since)))))
+          (let ((since (bl.wallet::rpc-listsinceblock
+                        node (list nil 2))))
+            ;; No filter block: everything listed; lastblock = height 101.
+            (is (plusp (length (%aval "transactions" since))))
+            (is (string= h101 (%aval "lastblock" since))))
+          ;; Unknown blockhash -> Core's -5.
+          (is (= bl.rpc:+rpc-invalid-address-or-key+
+                 (rpc-error-code-of
+                  (lambda ()
+                    (bl.wallet::rpc-listsinceblock
+                     node (list (make-string 64 :initial-element #\7))))))))
+        ;; abortrescan with no scan running: JSON false; not scanning.
+        (is (eq 'yason:false (bl.wallet::rpc-abortrescan node nil)))
+        (is (eq 'yason:false
+                (%aval "scanning"
+                       (bl.wallet::rpc-getwalletinfo node nil))))
+        ;; rescanblockchain from genesis must reproduce the live state.
+        (let ((before (%wc-state-snapshot wallet))
+              (result (bl.wallet::rpc-rescanblockchain node '(0))))
+          (is (= 0 (%aval "start_height" result)))
+          (is (= 102 (%aval "stop_height" result)))
+          (is (equalp before (%wc-state-snapshot wallet))))
+        ;; A second wallet importing the same descriptor with an old
+        ;; timestamp rescans to the identical tracked state.
+        (let* ((descs (%aval "descriptors"
+                             (bl.wallet::rpc-listdescriptors node '(t))))
+               (ext-wpkh (find-if (lambda (d)
+                                    (let ((s (%aval "desc" d)))
+                                      (and (eql 0 (search "wpkh(" s))
+                                           (search "/0/*" s))))
+                                  descs)))
+          (is (not (null ext-wpkh)))
+          (bl.wallet::rpc-createwallet node '("w2" nil t)) ; blank
+          (let* ((bl.wallet::*rpc-wallet-name* "w2")
+                 (results (bl.wallet::rpc-importdescriptors
+                           node (list (list (%ht "desc" (%aval "desc" ext-wpkh)
+                                                 "timestamp" 1
+                                                 "active" t
+                                                 "range" 10))))))
+            (is (eq t (%aval "success" (first results))))
+            (let ((w2 (%wc-wallet node "w2")))
+              ;; Same tracked tx set (only tx1 pays the wpkh descriptor;
+              ;; wallet w also only has tx1). time-smart legitimately
+              ;; differs: live tracking stamps mempool arrival, the
+              ;; import rescan stamps the block time.
+              (is (equalp (%wc-snapshot-sans-times (%wc-state-snapshot wallet))
+                          (%wc-snapshot-sans-times (%wc-state-snapshot w2)))))))))))
 
 ;;; --- Reorg: disconnected coinbase abandoned, reconnect restores ---
 
 (test wallet-coinbase-reorg-abandon
   "Disconnecting the wallet's coinbase block marks it inactive+abandoned
 (orphan category); reconsidering the block reconfirms it."
-  (with-wallet-chain-node (node "cbreorg")
-    (let ((bl.wallet::*rpc-wallet-name* nil))
-      (bl.wallet::rpc-createwallet node '("w"))
-      (let* ((addr (bl.wallet::rpc-getnewaddress node nil))
-             (b1 (first (%wc-mine node 1 addr)))
-             (cb-txid (%wc-coinbase-txid node b1))
-             (wallet (%wc-wallet node "w")))
-        (%wc-mine node 1 (%wc-optrue-address))     ; tip 2
-        (is (= 2 (%aval "confirmations" (%wc-gettx node cb-txid))))
-        ;; Reorg the funding block away.
-        (bl.rpc::rpc-invalidateblock node (list b1))
-        (let ((wtx (bl.wallet::wallet-get-wallet-tx wallet cb-txid)))
-          (is (eq :inactive (bl.wallet::wallet-tx-state wtx)))
-          (is (eq t (bl.wallet::wallet-tx-abandoned wtx))))
-        (let ((gettx (%wc-gettx node cb-txid)))
-          (is (= 0 (%aval "confirmations" gettx)))
-          (is (string= "orphan" (%wc-details-category gettx)))
-          (is (eq t (%aval "abandoned" (first (%aval "details" gettx))))))
-        (is (= 0 (bl.wallet::wallet-last-block-height wallet)))
-        ;; Reconnect: confirmed again at height 1, abandoned cleared.
-        (bl.rpc::rpc-reconsiderblock node (list b1))
-        (let ((wtx (bl.wallet::wallet-get-wallet-tx wallet cb-txid)))
-          (is (eq :confirmed (bl.wallet::wallet-tx-state wtx)))
-          (is (= 1 (bl.wallet::wallet-tx-block-height wtx))))
-        (is (= 2 (%aval "confirmations" (%wc-gettx node cb-txid))))
-        (is (= 2 (bl.wallet::wallet-last-block-height wallet)))))))
+  (with-wallet-chain-node (node "cbreorg" :wallet "w")
+    (let* ((addr (bl.wallet::rpc-getnewaddress node nil))
+           (b1 (first (%wc-mine node 1 addr)))
+           (cb-txid (%wc-coinbase-txid node b1))
+           (wallet (%wc-wallet node "w")))
+      (%wc-mine node 1 (%wc-optrue-address))     ; tip 2
+      (is (= 2 (%aval "confirmations" (%wc-gettx node cb-txid))))
+      ;; Reorg the funding block away.
+      (bl.rpc::rpc-invalidateblock node (list b1))
+      (let ((wtx (bl.wallet::wallet-get-wallet-tx wallet cb-txid)))
+        (is (eq :inactive (bl.wallet::wallet-tx-state wtx)))
+        (is (eq t (bl.wallet::wallet-tx-abandoned wtx))))
+      (let ((gettx (%wc-gettx node cb-txid)))
+        (is (= 0 (%aval "confirmations" gettx)))
+        (is (string= "orphan" (%wc-details-category gettx)))
+        (is (eq t (%aval "abandoned" (first (%aval "details" gettx))))))
+      (is (= 0 (bl.wallet::wallet-last-block-height wallet)))
+      ;; Reconnect: confirmed again at height 1, abandoned cleared.
+      (bl.rpc::rpc-reconsiderblock node (list b1))
+      (let ((wtx (bl.wallet::wallet-get-wallet-tx wallet cb-txid)))
+        (is (eq :confirmed (bl.wallet::wallet-tx-state wtx)))
+        (is (= 1 (bl.wallet::wallet-tx-block-height wtx))))
+      (is (= 2 (%aval "confirmations" (%wc-gettx node cb-txid))))
+      (is (= 2 (bl.wallet::wallet-last-block-height wallet))))))
 
 ;;; --- Reorg across the funding tx + double-spend conflicts ---
 
@@ -335,76 +329,74 @@ the mempool (in-mempool state); a confirmed double-spend marks it
 block-conflicted (negative confirmations); disconnecting the conflict block
 reverts it to inactive with the double-spend as a mempool conflict; re-mining
 the double-spend re-conflicts it and clears the mempool conflict."
-  (with-wallet-chain-node (node "conflicts")
-    (let ((bl.wallet::*rpc-wallet-name* nil))
-      (bl.wallet::rpc-createwallet node '("w"))
-      (let* ((wallet (%wc-wallet node "w"))
-             (addr (bl.wallet::rpc-getnewaddress node nil))
-             (spk (%address-script addr :regtest))
-             (fund1 (first (%wc-mine node 1 (%wc-optrue-address))))   ; h1
-             (fund2 (first (%wc-mine node 1 (%wc-optrue-address)))))  ; h2
-        (%wc-mine node 100 (%wc-optrue-address))   ; tip 102: both mature
-        ;; --- Part 1: reorg across the funding tx ---
-        (let* ((tx1 (%wc-spend-tx (%wc-coinbase-txid node fund1) 0
-                                  (- +wc-subsidy+ 10000) spk))
-               (txid1 (%wc-send node tx1))
-               (fblock (first (%wc-mine node 1 (%wc-optrue-address))))) ; h103
-          (is (= 1 (%aval "confirmations" (%wc-gettx node txid1))))
-          (bl.rpc::rpc-invalidateblock node (list fblock))
-          ;; Disconnected -> re-added to the mempool -> wallet sees mempool
-          ;; state through the re-add hook.
-          (let ((wtx (bl.wallet::wallet-get-wallet-tx wallet txid1)))
-            (is (eq :in-mempool (bl.wallet::wallet-tx-state wtx))))
-          (is (= 0 (%aval "confirmations" (%wc-gettx node txid1))))
-          ;; Mine again — to the WALLET address, so the coinbase (and hence
-          ;; the block hash) necessarily differs from the invalidated block;
-          ;; re-mining to the same target in the same second can reproduce
-          ;; the byte-identical block. tx1 (back in the mempool) reconfirms.
-          (let ((fblock2 (first (%wc-mine node 1 addr))))
-            (let ((gettx (%wc-gettx node txid1)))
-              (is (= 1 (%aval "confirmations" gettx)))
-              (is (string= fblock2 (%aval "blockhash" gettx)))
-              (is (not (string= fblock (%aval "blockhash" gettx)))))))
-        ;; --- Part 2: double-spend conflict via a block ---
-        (let* ((cb2 (%wc-coinbase-txid node fund2))
-               (tx2 (%wc-spend-tx cb2 0 (- +wc-subsidy+ 10000) spk))
-               (txid2 (%wc-send node tx2))
-               ;; Double-spend of the same prevout, NOT paying the wallet.
-               (tx2x (%wc-spend-tx cb2 0 (- +wc-subsidy+ 1000000)
-                                   (p2sh-optrue-script-pubkey)))
-               (txid2x (bl.ser:transaction-hash tx2x)))
-          (is (= 0 (%aval "confirmations" (%wc-gettx node txid2))))
-          ;; Mine a block containing ONLY the double-spend.
-          (let ((conflict-block
-                  (%aval "hash"
-                         (bl.rpc::rpc-generateblock
-                          node (list (%wc-optrue-address)
-                                     (list (bl.crypto:bytes-to-hex
-                                            (bl.ser:transaction-wire-bytes tx2x))))))))
-            ;; tx2: removed from the mempool as :conflict, then marked
-            ;; block-conflicted by the connect hook's mapTxSpends scan.
-            (let ((wtx (bl.wallet::wallet-get-wallet-tx wallet txid2)))
-              (is (eq :block-conflicted (bl.wallet::wallet-tx-state wtx))))
-            (let ((gettx (%wc-gettx node txid2)))
-              (is (= -1 (%aval "confirmations" gettx)))
-              (is (eq 'yason:false (%aval "trusted" gettx)))
-              (is (zerop (length (%aval "mempoolconflicts" gettx)))))
-            ;; Disconnect the conflict block: tx2 reverts to inactive, and
-            ;; the re-added double-spend becomes a mempool conflict of tx2.
-            (bl.rpc::rpc-invalidateblock node (list conflict-block))
-            (let ((wtx (bl.wallet::wallet-get-wallet-tx wallet txid2)))
-              (is (eq :inactive (bl.wallet::wallet-tx-state wtx))))
-            (let* ((gettx (%wc-gettx node txid2))
-                   (mconf (%aval "mempoolconflicts" gettx)))
-              (is (= 0 (%aval "confirmations" gettx)))
-              (is (equal (list (bl.rpc:hash-to-hex txid2x)) mconf)))
-            ;; Mine the double-spend again (it is back in the mempool):
-            ;; blockConnected re-conflicts tx2 AND clears the mempool
-            ;; conflict (reason-:block removal runs the erase loop).
-            (%wc-mine node 1 (%wc-optrue-address))
-            (let ((gettx (%wc-gettx node txid2)))
-              (is (= -1 (%aval "confirmations" gettx)))
-              (is (zerop (length (%aval "mempoolconflicts" gettx)))))))))))
+  (with-wallet-chain-node (node "conflicts" :wallet "w")
+    (let* ((wallet (%wc-wallet node "w"))
+           (addr (bl.wallet::rpc-getnewaddress node nil))
+           (spk (%address-script addr :regtest))
+           (fund1 (first (%wc-mine node 1 (%wc-optrue-address))))   ; h1
+           (fund2 (first (%wc-mine node 1 (%wc-optrue-address)))))  ; h2
+      (%wc-mine node 100 (%wc-optrue-address))   ; tip 102: both mature
+      ;; --- Part 1: reorg across the funding tx ---
+      (let* ((tx1 (%wc-spend-tx (%wc-coinbase-txid node fund1) 0
+                                (- +wc-subsidy+ 10000) spk))
+             (txid1 (%wc-send node tx1))
+             (fblock (first (%wc-mine node 1 (%wc-optrue-address))))) ; h103
+        (is (= 1 (%aval "confirmations" (%wc-gettx node txid1))))
+        (bl.rpc::rpc-invalidateblock node (list fblock))
+        ;; Disconnected -> re-added to the mempool -> wallet sees mempool
+        ;; state through the re-add hook.
+        (let ((wtx (bl.wallet::wallet-get-wallet-tx wallet txid1)))
+          (is (eq :in-mempool (bl.wallet::wallet-tx-state wtx))))
+        (is (= 0 (%aval "confirmations" (%wc-gettx node txid1))))
+        ;; Mine again — to the WALLET address, so the coinbase (and hence
+        ;; the block hash) necessarily differs from the invalidated block;
+        ;; re-mining to the same target in the same second can reproduce
+        ;; the byte-identical block. tx1 (back in the mempool) reconfirms.
+        (let ((fblock2 (first (%wc-mine node 1 addr))))
+          (let ((gettx (%wc-gettx node txid1)))
+            (is (= 1 (%aval "confirmations" gettx)))
+            (is (string= fblock2 (%aval "blockhash" gettx)))
+            (is (not (string= fblock (%aval "blockhash" gettx)))))))
+      ;; --- Part 2: double-spend conflict via a block ---
+      (let* ((cb2 (%wc-coinbase-txid node fund2))
+             (tx2 (%wc-spend-tx cb2 0 (- +wc-subsidy+ 10000) spk))
+             (txid2 (%wc-send node tx2))
+             ;; Double-spend of the same prevout, NOT paying the wallet.
+             (tx2x (%wc-spend-tx cb2 0 (- +wc-subsidy+ 1000000)
+                                 (p2sh-optrue-script-pubkey)))
+             (txid2x (bl.ser:transaction-hash tx2x)))
+        (is (= 0 (%aval "confirmations" (%wc-gettx node txid2))))
+        ;; Mine a block containing ONLY the double-spend.
+        (let ((conflict-block
+                (%aval "hash"
+                       (bl.rpc::rpc-generateblock
+                        node (list (%wc-optrue-address)
+                                   (list (bl.crypto:bytes-to-hex
+                                          (bl.ser:transaction-wire-bytes tx2x))))))))
+          ;; tx2: removed from the mempool as :conflict, then marked
+          ;; block-conflicted by the connect hook's mapTxSpends scan.
+          (let ((wtx (bl.wallet::wallet-get-wallet-tx wallet txid2)))
+            (is (eq :block-conflicted (bl.wallet::wallet-tx-state wtx))))
+          (let ((gettx (%wc-gettx node txid2)))
+            (is (= -1 (%aval "confirmations" gettx)))
+            (is (eq 'yason:false (%aval "trusted" gettx)))
+            (is (zerop (length (%aval "mempoolconflicts" gettx)))))
+          ;; Disconnect the conflict block: tx2 reverts to inactive, and
+          ;; the re-added double-spend becomes a mempool conflict of tx2.
+          (bl.rpc::rpc-invalidateblock node (list conflict-block))
+          (let ((wtx (bl.wallet::wallet-get-wallet-tx wallet txid2)))
+            (is (eq :inactive (bl.wallet::wallet-tx-state wtx))))
+          (let* ((gettx (%wc-gettx node txid2))
+                 (mconf (%aval "mempoolconflicts" gettx)))
+            (is (= 0 (%aval "confirmations" gettx)))
+            (is (equal (list (bl.rpc:hash-to-hex txid2x)) mconf)))
+          ;; Mine the double-spend again (it is back in the mempool):
+          ;; blockConnected re-conflicts tx2 AND clears the mempool
+          ;; conflict (reason-:block removal runs the erase loop).
+          (%wc-mine node 1 (%wc-optrue-address))
+          (let ((gettx (%wc-gettx node txid2)))
+            (is (= -1 (%aval "confirmations" gettx)))
+            (is (zerop (length (%aval "mempoolconflicts" gettx))))))))))
 
 ;;; --- Crash + reload persistence, load-time catch-up ---
 

@@ -337,19 +337,19 @@ getwalletinfo reports unlocked_until per Core's three states."
                          (bl.wallet::rpc-getwalletinfo node '())
                          :test #'string=)))
         ;; The three encryption-state RPCs refuse on an unencrypted wallet.
-        (is (= -15 (%rpc-error-code
+        (is (= -15 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-walletpassphrase
                                 node '("hunter2" 60))))))
-        (is (= -15 (%rpc-error-code
+        (is (= -15 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-walletlock node '())))))
-        (is (= -15 (%rpc-error-code
+        (is (= -15 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-walletpassphrasechange
                                 node '("a" "b"))))))
         (bl.wallet::rpc-encryptwallet node '("hunter2"))
         ;; Encrypted and locked.
         (is (eql 0 (%aval "unlocked_until"
                           (bl.wallet::rpc-getwalletinfo node '()))))
-        (is (= -14 (%rpc-error-code
+        (is (= -14 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-walletpassphrase
                                 node '("wrong" 60))))))
         (is (null (bl.wallet::rpc-walletpassphrase node '("hunter2" 600))))
@@ -423,18 +423,18 @@ master key is still decrypted" until)
     (let ((bl.wallet::*rpc-wallet-name* "w"))
       (%wenc-fresh-wallet node "w")
       (bl.wallet::rpc-encryptwallet node '("hunter2"))
-      (is (= -8 (%rpc-error-code
+      (is (= -8 (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-walletpassphrase node '(42 60))))))
-      (is (= -8 (%rpc-error-code
+      (is (= -8 (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-walletpassphrase
                              node '("hunter2" "soon"))))))
-      (is (= -8 (%rpc-error-code
+      (is (= -8 (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-walletpassphrase
                              node '("hunter2" -1))))))
-      (is (= -8 (%rpc-error-code
+      (is (= -8 (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-walletpassphrase node '("" 60))))))
       ;; encryptwallet on an already-encrypted wallet.
-      (is (= -15 (%rpc-error-code
+      (is (= -15 (rpc-error-code-of
                   (lambda () (bl.wallet::rpc-encryptwallet node '("x")))))))))
 
 (test wenc-timeout-clamped-and-zero-relocks
@@ -469,7 +469,7 @@ wallet still derives the same addresses."
         (let ((address-before (bl.wallet::rpc-getnewaddress node '()))
               (crypted-before
                 (nth-value 1 (%wenc-in-memory-key-counts wallet))))
-          (is (= -14 (%rpc-error-code
+          (is (= -14 (rpc-error-code-of
                       (lambda () (bl.wallet::rpc-walletpassphrasechange
                                   node '("wrong" "new-pass"))))))
           ;; A failed change leaves the wallet LOCKED, even though it was
@@ -518,10 +518,10 @@ or trivially-opened wallet."
   (with-wallet-test-node (node)
     (let ((bl.wallet::*rpc-wallet-name* "w"))
       (%wenc-fresh-wallet node "w")
-      (is (= -8 (%rpc-error-code
+      (is (= -8 (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-encryptwallet node '(""))))))
       (bl.wallet::rpc-encryptwallet node '("hunter2"))
-      (is (= -8 (%rpc-error-code
+      (is (= -8 (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-walletpassphrasechange
                              node '("hunter2" "")))))))))
 
@@ -530,7 +530,7 @@ or trivially-opened wallet."
   (with-wallet-test-node (node)
     (let ((bl.wallet::*rpc-wallet-name* "wo"))
       (bl.wallet::rpc-createwallet node '("wo" t))
-      (is (= -16 (%rpc-error-code
+      (is (= -16 (rpc-error-code-of
                   (lambda () (bl.wallet::rpc-encryptwallet
                               node '("hunter2")))))))))
 
@@ -604,7 +604,7 @@ encrypting, and a passphrase with private keys disabled is refused."
       (is (not (bl.wallet::wallet-has-encryption-keys-p
                 (gethash "w-empty" (bl.wallet::wallet-manager-wallets
                                     (%node-manager node)))))))
-    (is (= -4 (%rpc-error-code
+    (is (= -4 (rpc-error-code-of
                (lambda () (bl.wallet::rpc-createwallet
                            node '("w-bad" t nil "hunter2"))))))))
 
@@ -625,7 +625,7 @@ no descriptors: it unlocks, but has no addresses to give."
         (is (bl.wallet::unlock-wallet wallet "hunter2"))
         ;; Core's "no available keys" error for a blank wallet — unlocking
         ;; does not conjure descriptors.
-        (is (= -4 (%rpc-error-code
+        (is (= -4 (rpc-error-code-of
                    (lambda () (bl.wallet::rpc-getnewaddress node '())))))))))
 
 (test wenc-corrupt-ckey-is-not-a-wrong-passphrase
@@ -650,7 +650,7 @@ some do not, Core reports it distinctly rather than as a bad passphrase."
                              (cons (car entry) damaged))))
                    (bl.wallet::desc-spkm-crypted-keys spkm)))
         ;; 16 keys, 15 of which still decrypt: the mixed case.
-        (is (= -4 (%rpc-error-code
+        (is (= -4 (rpc-error-code-of
                    (lambda () (bl.wallet::unlock-wallet wallet "hunter2")))))
         (is (bl.wallet::wallet-is-locked-p wallet))))))
 
@@ -679,11 +679,11 @@ it is unlocked."
         (bl.wallet::rpc-encryptwallet node '("hunter2"))
         (is (bl.wallet::wallet-is-locked-p wallet))
         ;; listdescriptors true must ERROR, not quietly emit the public form.
-        (is (= -13 (%rpc-error-code
+        (is (= -13 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-listdescriptors node '(t))))))
-        (is (= -13 (%rpc-error-code
+        (is (= -13 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-keypoolrefill node '(10))))))
-        (is (= -13 (%rpc-error-code
+        (is (= -13 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-importdescriptors
                                 node (list (list (%ht "desc" "x" "timestamp" 0))))))))
         ;; The exact Core message.
@@ -695,7 +695,7 @@ it is unlocked."
         (is (%aval "descriptors" (bl.wallet::rpc-listdescriptors node '())))
         (bl.wallet::rpc-walletpassphrase node '("hunter2" 600))
         (is (%aval "descriptors" (bl.wallet::rpc-listdescriptors node '(t))))
-        (is (null (%rpc-error-code
+        (is (null (rpc-error-code-of
                    (lambda () (bl.wallet::rpc-keypoolrefill node '(10))))))))))
 
 (test wenc-locked-wallet-still-issues-addresses
@@ -731,7 +731,7 @@ unlocking it must produce a signature again."
         (is (stringp (bl.wallet::rpc-signmessage node (list address "hi"))))
         (bl.wallet::rpc-encryptwallet node '("hunter2"))
         ;; The pre-encryption address is still ours, but unsignable while locked.
-        (is (= -13 (%rpc-error-code
+        (is (= -13 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-signmessage
                                 node (list address "hi"))))))
         (bl.wallet::rpc-walletpassphrase node '("hunter2" 600))
@@ -774,12 +774,12 @@ through and the coins encrypted before the seed rotation are still spendable."
         (is (bl.wallet::wallet-is-locked-p wallet))
         ;; The balance is still visible — only signing is blocked.
         (is (plusp (bl.wallet::rpc-getbalance node '())))
-        (is (= -13 (%rpc-error-code
+        (is (= -13 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-sendtoaddress node send-args)))))
-        (is (= -13 (%rpc-error-code
+        (is (= -13 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-sendmany
                                 node (list "" (%ht target 1)))))))
-        (is (= -13 (%rpc-error-code
+        (is (= -13 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-signrawtransactionwithwallet
                                 node (list raw-tx))))))
         ;; Unlock and the same spend succeeds, spending coins whose keys
@@ -790,7 +790,7 @@ through and the coins encrypted before the seed rotation are still spendable."
           (is (= 64 (length txid))))
         ;; Relocking closes it again.
         (bl.wallet::rpc-walletlock node '())
-        (is (= -13 (%rpc-error-code
+        (is (= -13 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-sendtoaddress
                                 node send-args)))))))))
 
@@ -923,9 +923,9 @@ top-ups the scan depends on."
         (is (bl.wallet::wallet-unlocked-key wallet))
         (is (not (bl.wallet::wallet-is-locked-p wallet)))
         ;; The state-changing RPCs refuse while it is set (Core parity).
-        (is (= -4 (%rpc-error-code
+        (is (= -4 (rpc-error-code-of
                    (lambda () (bl.wallet::rpc-walletlock node '())))))
-        (is (= -4 (%rpc-error-code
+        (is (= -4 (rpc-error-code-of
                    (lambda () (bl.wallet::rpc-walletpassphrasechange
                                node '("hunter2" "new"))))))
         ;; Clearing it lets the expired deadline take effect immediately.
@@ -1029,18 +1029,18 @@ restore must not leave a wallet directory behind."
       (let ((bl.wallet::*rpc-wallet-name* "w"))
         (%wenc-fresh-wallet node "w")
         (bl.wallet::rpc-backupwallet node (list (namestring path))))
-      (is (= -8 (%rpc-error-code
+      (is (= -8 (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-restorewallet
                              node (list "" (namestring path)))))))
-      (is (= -8 (%rpc-error-code
+      (is (= -8 (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-restorewallet
                              node (list "../evil" (namestring path)))))))
-      (is (= -8 (%rpc-error-code
+      (is (= -8 (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-restorewallet
                              node (list "missing" "/nonexistent/backup.dump"))))))
       ;; Restoring onto an occupied destination — including a live wallet's
       ;; own directory, which Core reports the same way.
-      (is (= -36 (%rpc-error-code
+      (is (= -36 (rpc-error-code-of
                   (lambda () (bl.wallet::rpc-restorewallet
                               node (list "w" (namestring path)))))))
       ;; A corrupt dump: flip a byte in a record line.
@@ -1057,7 +1057,7 @@ restore must not leave a wallet directory behind."
                                      (concatenate 'string "00" (subseq line 2))
                                      line)
                                  out))))
-        (is (= -18 (%rpc-error-code
+        (is (= -18 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-restorewallet
                                 node (list "from-corrupt" (namestring corrupt)))))))
         ;; Nothing was created for the rejected restore.
@@ -1078,7 +1078,7 @@ where it would be picked up as a wallet directory."
       ;; <wallets>/w/../../wallets/sneaky.dump resolves back inside.
       (let ((traversal (namestring
                         (merge-pathnames "w/../../wallets/sneaky.dump" wallets))))
-        (is (= -4 (%rpc-error-code
+        (is (= -4 (rpc-error-code-of
                    (lambda () (bl.wallet::rpc-backupwallet
                                node (list traversal))))))
         (is (null (probe-file (merge-pathnames "sneaky.dump" wallets)))))
@@ -1135,7 +1135,7 @@ testnet node — Core gets this from the network magic in the SQLite header."
                                      "network,mainnet"
                                      line)
                                  out))))
-        (is (= -18 (%rpc-error-code
+        (is (= -18 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-restorewallet
                                 node (list "foreign" (namestring foreign)))))))))))
 
@@ -1147,13 +1147,13 @@ write into the wallets directory (where it would look like a wallet)."
       (%wenc-fresh-wallet node "w")
       (let ((manager (%node-manager node)))
         ;; An existing directory as the destination.
-        (is (= -4 (%rpc-error-code
+        (is (= -4 (rpc-error-code-of
                    (lambda () (bl.wallet::rpc-backupwallet
                                node (list (namestring
                                            (bl.wallet::wallets-directory
                                             manager))))))))
         ;; Inside the wallets directory.
-        (is (= -4 (%rpc-error-code
+        (is (= -4 (rpc-error-code-of
                    (lambda () (bl.wallet::rpc-backupwallet
                                node (list (namestring
                                            (merge-pathnames
@@ -1161,6 +1161,6 @@ write into the wallets directory (where it would look like a wallet)."
                                             (bl.wallet::wallets-directory
                                              manager)))))))))
         ;; A directory that does not exist.
-        (is (= -4 (%rpc-error-code
+        (is (= -4 (rpc-error-code-of
                    (lambda () (bl.wallet::rpc-backupwallet
                                node (list "/nonexistent/dir/backup.dump"))))))))))

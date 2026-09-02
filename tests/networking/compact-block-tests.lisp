@@ -1270,15 +1270,15 @@ dispatch-ibd-message's `block' branch (the block-download path)."
                              (bl.store:block-index-entry-chain-work prev))
                 :status :header-valid)))
          (%g716-with-fresh-hb
-          (let ((bl.net:*ibd-context* (bl.net::make-ibd))
-                (peer (%g716-delivering-peer "198.51.100.20")))
-            (bl.net::dispatch-ibd-message peer "block" (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store) bl.net:*ibd-context*)
-            (is (= 2 (bl.store:current-height cs))
-                "the downloaded block connected")
-            (is (equal (list peer) bl.net::*hb-announcing-peers*)
-                "the block-download path promotes too")
-            (is-true (bl.net:peer-compact-block-high-bandwidth-to
-                      peer)))))))))
+          (with-ibd-context
+            (let ((peer (%g716-delivering-peer "198.51.100.20")))
+              (bl.net::dispatch-ibd-message peer "block" (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store) bl.net:*ibd-context*)
+              (is (= 2 (bl.store:current-height cs))
+                  "the downloaded block connected")
+              (is (equal (list peer) bl.net::*hb-announcing-peers*)
+                  "the block-download path promotes too")
+              (is-true (bl.net:peer-compact-block-high-bandwidth-to
+                        peer))))))))))
 
 ;;;; ------------------------------------------------------------
 ;;;; G7-16: promotion needs the block to CONNECT, not merely to be accepted

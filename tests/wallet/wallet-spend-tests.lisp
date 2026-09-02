@@ -781,23 +781,14 @@ bounds are enforced with Core's messages."
             (dest (%wc-optrue-address)))
         ;; maxtxfee: a 10 sat/vB spend costs ~1400+ sats; cap at 100.
         (let ((bl:*wallet-max-tx-fee* 100))
-          (handler-case
-              (progn (bl.wallet::rpc-sendtoaddress
-                      node (list dest 1 nil nil nil nil nil nil nil 10))
-                     (fail "maxtxfee cap not enforced"))
-            (bl.rpc:rpc-error (e)
-              (is (= -6 (bl.rpc:rpc-error-code e)))
-              (is (search "Fee exceeds maximum configured by user"
-                          (bl.rpc:rpc-error-message e))))))
+          (signals-rpc-error (:code -6 :message "Fee exceeds maximum configured by user")
+            (bl.wallet::rpc-sendtoaddress
+             node (list dest 1 nil nil nil nil nil nil nil 10))))
         ;; Weight caps via send's max_tx_weight.
-        (handler-case
-            (progn (bl.wallet::rpc-send
-                    node (list (list (cons dest 1)) nil nil 10
-                               '(("max_tx_weight" . 100))))
-                   (fail "max_tx_weight lower bound not enforced"))
-          (bl.rpc:rpc-error (e)
-            (is (search "Maximum transaction weight must be between"
-                        (bl.rpc:rpc-error-message e)))))
+        (signals-rpc-error (:message "Maximum transaction weight must be between")
+          (bl.wallet::rpc-send
+           node (list (list (cons dest 1)) nil nil 10
+                      '(("max_tx_weight" . 100)))))
         (handler-case
             (progn (bl.wallet::rpc-send
                     node (list (list (cons dest 1)) nil nil 10
@@ -818,14 +809,9 @@ PayTxFee."
       (let ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 77))
             (dest (%wc-optrue-address)))
         ;; Fallback disabled (default): estimation failure.
-        (handler-case
-            (progn (bl.wallet::rpc-sendtoaddress
-                    node (list dest 1))
-                   (fail "fallbackfee-disabled path not enforced"))
-          (bl.rpc:rpc-error (e)
-            (is (= -6 (bl.rpc:rpc-error-code e)))
-            (is (search "Fallbackfee is disabled"
-                        (bl.rpc:rpc-error-message e)))))
+        (signals-rpc-error (:code -6 :message "Fallbackfee is disabled")
+          (bl.wallet::rpc-sendtoaddress
+           node (list dest 1)))
         ;; Fallback enabled: 20 sat/vB fallback, verbose reports the reason.
         (let* ((bl:*wallet-fallback-fee* 20000)
                (result (bl.wallet::rpc-sendtoaddress
@@ -995,17 +981,12 @@ committing a mempool-invalid transaction as success."
               (bl.rpc:with-node-lock (node)
                 (bl.mp:mempool-count
                  (bl:node-mempool node)))))
-        (handler-case
-            (progn
-              (bl.wallet::rpc-send
-               node (list (list (list (cons dest 1/1000))
-                                (list (cons "data" "aa")))
-                          nil nil 10
-                          '(("subtract_fee_from_outputs" . (1)))))
-              (fail "negative SFFO data output was not rejected"))
-          (bl.rpc:rpc-error (e)
-            (is (search "too small to pay the fee"
-                        (bl.rpc:rpc-error-message e)))))
+        (signals-rpc-error (:message "too small to pay the fee")
+          (bl.wallet::rpc-send
+           node (list (list (list (cons dest 1/1000))
+                            (list (cons "data" "aa")))
+                      nil nil 10
+                      '(("subtract_fee_from_outputs" . (1))))))
         ;; Nothing committed, nothing in the mempool, no coins spent.
         (is (= mempool-before
                (bl.rpc:with-node-lock (node)
@@ -1083,21 +1064,14 @@ wallet without the flag errors."
       ;; without the flag; explicit true errors (Core GetAvoidReuseFlag).
       (is (numberp (bl.wallet::rpc-getbalance
                     node (list "*" 0 nil nil))))
-      (handler-case
-          (progn (bl.wallet::rpc-getbalance node (list "*" 0 nil t))
-                 (fail "explicit avoid_reuse=true on a non-avoid_reuse wallet must error"))
-        (bl.rpc:rpc-error (e)
-          (is (= -4 (bl.rpc:rpc-error-code e)))))
+      (signals-rpc-error (:code -4)
+        (bl.wallet::rpc-getbalance node (list "*" 0 nil t)))
       ;; createwallet: explicit descriptors=false is rejected; a null-padded
       ;; descriptors argument keeps the default (true) and succeeds.
-      (handler-case
-          (progn (bl.wallet::rpc-createwallet
-                  node (list "wleg" nil nil nil nil
-                             bl.rpc:+json-false+))
-                 (fail "createwallet descriptors=false must be rejected"))
-        (bl.rpc:rpc-error (e)
-          (is (search "no longer possible to create a legacy wallet"
-                      (bl.rpc:rpc-error-message e)))))
+      (signals-rpc-error (:message "no longer possible to create a legacy wallet")
+        (bl.wallet::rpc-createwallet
+         node (list "wleg" nil nil nil nil
+                    bl.rpc:+json-false+)))
       (is (equal "wnull"
                  (%aval "name" (bl.wallet::rpc-createwallet
                                 node (list "wnull" nil nil nil nil nil))))))))

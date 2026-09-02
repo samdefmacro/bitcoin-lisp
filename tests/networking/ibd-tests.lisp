@@ -81,7 +81,7 @@
 
 (test ibd-state-transitions
   "Test IBD state machine transitions."
-  (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
+  (with-ibd-context
     (is (eq :idle (bl.net::ibd-state)))
     (bl.net::set-ibd-state :syncing-headers)
     (is (eq :syncing-headers (bl.net::ibd-state)))
@@ -102,49 +102,49 @@
 
 (test in-flight-tracking
   "Test tracking in-flight block requests."
-  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
-        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
-        (mock-peer :peer))
+  (with-ibd-context
+    (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+          (mock-peer :peer))
 
-    ;; Add to pending
-    (setf (gethash hash (bl.net:ibd-context-pending-blocks
-                         bl.net:*ibd-context*)) 100)
+      ;; Add to pending
+      (setf (gethash hash (bl.net:ibd-context-pending-blocks
+                           bl.net:*ibd-context*)) 100)
 
-    ;; Mark as in-flight
-    (bl.net::mark-block-in-flight hash mock-peer)
+      ;; Mark as in-flight
+      (bl.net::mark-block-in-flight hash mock-peer)
 
-    ;; Check it's now in-flight
-    (let ((in-flight (bl.net:ibd-context-in-flight
-                      bl.net:*ibd-context*)))
-      (is (= 1 (hash-table-count in-flight)))
-      (let ((entry (gethash hash in-flight)))
-        (is (eq mock-peer (car entry)))))))
+      ;; Check it's now in-flight
+      (let ((in-flight (bl.net:ibd-context-in-flight
+                        bl.net:*ibd-context*)))
+        (is (= 1 (hash-table-count in-flight)))
+        (let ((entry (gethash hash in-flight)))
+          (is (eq mock-peer (car entry))))))))
 
 (test block-received-tracking
   "Test marking blocks as received."
-  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
-        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
+  (with-ibd-context
+    (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
 
-    ;; Add to pending and in-flight
-    (setf (gethash hash (bl.net:ibd-context-pending-blocks
-                         bl.net:*ibd-context*)) 100)
-    (bl.net::mark-block-in-flight hash (bl.net:make-peer))
+      ;; Add to pending and in-flight
+      (setf (gethash hash (bl.net:ibd-context-pending-blocks
+                           bl.net:*ibd-context*)) 100)
+      (bl.net::mark-block-in-flight hash (bl.net:make-peer))
 
-    ;; Initial blocks received count
-    (is (= 0 (bl.net::ibd-context-blocks-received
-              bl.net:*ibd-context*)))
+      ;; Initial blocks received count
+      (is (= 0 (bl.net::ibd-context-blocks-received
+                bl.net:*ibd-context*)))
 
-    ;; Mark as received
-    (bl.net::mark-block-received hash)
+      ;; Mark as received
+      (bl.net::mark-block-received hash)
 
-    ;; Should be removed from pending and in-flight
-    (is (= 0 (hash-table-count (bl.net:ibd-context-pending-blocks
-                                bl.net:*ibd-context*))))
-    (is (= 0 (hash-table-count (bl.net:ibd-context-in-flight
-                                bl.net:*ibd-context*))))
-    ;; Blocks received should increment
-    (is (= 1 (bl.net::ibd-context-blocks-received
-              bl.net:*ibd-context*)))))
+      ;; Should be removed from pending and in-flight
+      (is (= 0 (hash-table-count (bl.net:ibd-context-pending-blocks
+                                  bl.net:*ibd-context*))))
+      (is (= 0 (hash-table-count (bl.net:ibd-context-in-flight
+                                  bl.net:*ibd-context*))))
+      ;; Blocks received should increment
+      (is (= 1 (bl.net::ibd-context-blocks-received
+                bl.net:*ibd-context*))))))
 
 ;;;; (The byte-aware request-window tests that lived here exercised the
 ;;;; retired height-based scheduler. The per-peer walk's window is Core's
@@ -313,121 +313,121 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
 
 (test timeout-detection
   "Test detecting timed out requests."
-  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
-        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
+  (with-ibd-context
+    (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
 
-    ;; Set a very short timeout for testing (1 second)
-    (setf (bl.net::ibd-context-request-timeout
-           bl.net:*ibd-context*) 1)
+      ;; Set a very short timeout for testing (1 second)
+      (setf (bl.net::ibd-context-request-timeout
+             bl.net:*ibd-context*) 1)
 
-    ;; Add to in-flight with old timestamp
-    (let ((old-time (- (get-internal-real-time)
-                       (* 2 internal-time-units-per-second))))  ; 2 seconds ago
-      (setf (gethash hash (bl.net:ibd-context-in-flight
-                           bl.net:*ibd-context*))
-            (cons :peer old-time)))
+      ;; Add to in-flight with old timestamp
+      (let ((old-time (- (get-internal-real-time)
+                         (* 2 internal-time-units-per-second))))  ; 2 seconds ago
+        (setf (gethash hash (bl.net:ibd-context-in-flight
+                             bl.net:*ibd-context*))
+              (cons :peer old-time)))
 
-    ;; Should detect timeout
-    (let ((timed-out (bl.net::get-timed-out-requests)))
-      (is (= 1 (length timed-out)))
-      (is (equalp hash (first timed-out))))))
+      ;; Should detect timeout
+      (let ((timed-out (bl.net::get-timed-out-requests)))
+        (is (= 1 (length timed-out)))
+        (is (equalp hash (first timed-out)))))))
 
 (test get-timed-out-requests-near-tip-shorter-timeout
   "A block in-flight ~40s is timed out under the near-tip
 +block-stalling-timeout+ (30s) but NOT under the full per-block timeout
 (120s) — so near the tip a silent peer's block is retried elsewhere fast."
-  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
-        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
-    (setf (bl.net::ibd-context-request-timeout
-           bl.net:*ibd-context*) 120)
-    (setf (gethash hash (bl.net:ibd-context-in-flight
-                         bl.net:*ibd-context*))
-          (cons :peer (- (get-internal-real-time)
-                         (* 40 internal-time-units-per-second))))  ; 40s ago
-    ;; Default (full 120s) timeout: not yet timed out.
-    (is (null (bl.net::get-timed-out-requests)))
-    ;; Near-tip 30s timeout: timed out.
-    (let ((timed-out (bl.net::get-timed-out-requests
-                      bl.net::+block-stalling-timeout+)))
-      (is (= 1 (length timed-out)))
-      (is (equalp hash (first timed-out))))))
+  (with-ibd-context
+    (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+      (setf (bl.net::ibd-context-request-timeout
+             bl.net:*ibd-context*) 120)
+      (setf (gethash hash (bl.net:ibd-context-in-flight
+                           bl.net:*ibd-context*))
+            (cons :peer (- (get-internal-real-time)
+                           (* 40 internal-time-units-per-second))))  ; 40s ago
+      ;; Default (full 120s) timeout: not yet timed out.
+      (is (null (bl.net::get-timed-out-requests)))
+      ;; Near-tip 30s timeout: timed out.
+      (let ((timed-out (bl.net::get-timed-out-requests
+                        bl.net::+block-stalling-timeout+)))
+        (is (= 1 (length timed-out)))
+        (is (equalp hash (first timed-out)))))))
 
 (test retry-timed-out-requests
   "Test retrying timed out requests."
-  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
-        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
+  (with-ibd-context
+    (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
 
-    ;; Set short timeout and add old request
-    (setf (bl.net::ibd-context-request-timeout
-           bl.net:*ibd-context*) 1)
-    (let ((old-time (- (get-internal-real-time)
-                       (* 2 internal-time-units-per-second))))
-      (setf (gethash hash (bl.net:ibd-context-in-flight
-                           bl.net:*ibd-context*))
-            (cons :peer old-time)))
+      ;; Set short timeout and add old request
+      (setf (bl.net::ibd-context-request-timeout
+             bl.net:*ibd-context*) 1)
+      (let ((old-time (- (get-internal-real-time)
+                         (* 2 internal-time-units-per-second))))
+        (setf (gethash hash (bl.net:ibd-context-in-flight
+                             bl.net:*ibd-context*))
+              (cons :peer old-time)))
 
-    ;; Also add to pending so it can be retried
-    (setf (gethash hash (bl.net:ibd-context-pending-blocks
-                         bl.net:*ibd-context*)) 100)
+      ;; Also add to pending so it can be retried
+      (setf (gethash hash (bl.net:ibd-context-pending-blocks
+                           bl.net:*ibd-context*)) 100)
 
-    ;; Retry should remove from in-flight
-    (let ((count (bl.net::retry-timed-out-requests)))
-      (is (= 1 count))
-      (is (= 0 (hash-table-count (bl.net:ibd-context-in-flight
-                                  bl.net:*ibd-context*))))
-      ;; Should still be in pending
-      (is (= 1 (hash-table-count (bl.net:ibd-context-pending-blocks
-                                  bl.net:*ibd-context*)))))))
+      ;; Retry should remove from in-flight
+      (let ((count (bl.net::retry-timed-out-requests)))
+        (is (= 1 count))
+        (is (= 0 (hash-table-count (bl.net:ibd-context-in-flight
+                                    bl.net:*ibd-context*))))
+        ;; Should still be in pending
+        (is (= 1 (hash-table-count (bl.net:ibd-context-pending-blocks
+                                    bl.net:*ibd-context*))))))))
 
 (test retry-timed-out-requests-drops-after-N-attempts
   "After +max-block-request-timeouts+ retries, a block is dropped from
 the pending queue. Without this, competing-fork blocks that peers
 won't serve would keep IBD's main loop spinning forever."
-  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
-        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
-    (setf (bl.net::ibd-context-request-timeout
-           bl.net:*ibd-context*) 1)
-    (setf (gethash hash (bl.net:ibd-context-pending-blocks
-                         bl.net:*ibd-context*)) 100)
-    ;; Simulate N timeouts. Each iteration: put the request back
-    ;; in-flight with an old timestamp, then retry — retry-timed-out-
-    ;; requests removes it from in-flight and bumps the counter.
-    (let ((old-time (- (get-internal-real-time)
-                       (* 2 internal-time-units-per-second))))
-      (loop repeat (1- bl.net::+max-block-request-timeouts+)
-            do (setf (gethash hash (bl.net:ibd-context-in-flight
-                                     bl.net:*ibd-context*))
-                     (cons :peer old-time))
-               (bl.net::retry-timed-out-requests)))
-    ;; After N-1 timeouts, still in pending.
-    (is (= 1 (hash-table-count
-              (bl.net:ibd-context-pending-blocks
-               bl.net:*ibd-context*))))
-    ;; One more timeout should drop it from pending.
-    (let ((old-time (- (get-internal-real-time)
-                       (* 2 internal-time-units-per-second))))
-      (setf (gethash hash (bl.net:ibd-context-in-flight
-                           bl.net:*ibd-context*))
-            (cons :peer old-time)))
-    (bl.net::retry-timed-out-requests)
-    (is (= 0 (hash-table-count
-              (bl.net:ibd-context-pending-blocks
-               bl.net:*ibd-context*))))))
+  (with-ibd-context
+    (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
+      (setf (bl.net::ibd-context-request-timeout
+             bl.net:*ibd-context*) 1)
+      (setf (gethash hash (bl.net:ibd-context-pending-blocks
+                           bl.net:*ibd-context*)) 100)
+      ;; Simulate N timeouts. Each iteration: put the request back
+      ;; in-flight with an old timestamp, then retry — retry-timed-out-
+      ;; requests removes it from in-flight and bumps the counter.
+      (let ((old-time (- (get-internal-real-time)
+                         (* 2 internal-time-units-per-second))))
+        (loop repeat (1- bl.net::+max-block-request-timeouts+)
+              do (setf (gethash hash (bl.net:ibd-context-in-flight
+                                       bl.net:*ibd-context*))
+                       (cons :peer old-time))
+                 (bl.net::retry-timed-out-requests)))
+      ;; After N-1 timeouts, still in pending.
+      (is (= 1 (hash-table-count
+                (bl.net:ibd-context-pending-blocks
+                 bl.net:*ibd-context*))))
+      ;; One more timeout should drop it from pending.
+      (let ((old-time (- (get-internal-real-time)
+                         (* 2 internal-time-units-per-second))))
+        (setf (gethash hash (bl.net:ibd-context-in-flight
+                             bl.net:*ibd-context*))
+              (cons :peer old-time)))
+      (bl.net::retry-timed-out-requests)
+      (is (= 0 (hash-table-count
+                (bl.net:ibd-context-pending-blocks
+                 bl.net:*ibd-context*)))))))
 
 (test mark-block-received-clears-timeout-counter
   "A successful receive clears the per-hash timeout counter so a future
 re-request (e.g. after a reorg) starts fresh."
-  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
-        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
-    ;; Plant a non-zero counter directly.
-    (setf (gethash hash (bl.net::ibd-context-request-timeouts
-                         bl.net:*ibd-context*)) 3)
-    (setf (gethash hash (bl.net:ibd-context-pending-blocks
-                         bl.net:*ibd-context*)) 100)
-    (bl.net::mark-block-received hash)
-    (is (= 0 (hash-table-count
-              (bl.net::ibd-context-request-timeouts
-               bl.net:*ibd-context*))))))
+  (with-ibd-context
+    (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+      ;; Plant a non-zero counter directly.
+      (setf (gethash hash (bl.net::ibd-context-request-timeouts
+                           bl.net:*ibd-context*)) 3)
+      (setf (gethash hash (bl.net:ibd-context-pending-blocks
+                           bl.net:*ibd-context*)) 100)
+      (bl.net::mark-block-received hash)
+      (is (= 0 (hash-table-count
+                (bl.net::ibd-context-request-timeouts
+                 bl.net:*ibd-context*)))))))
 
 ;;;; Per-peer block-availability tracking
 ;;;;
@@ -575,32 +575,32 @@ sending us an old announcement; we keep the strongest claim)."
 (test queue-missing-fork-blocks-adds-with-reset-timeout
   "queue-missing-fork-blocks adds each hash to pending and clears its
 timeout counter so the existing scheduler retries with a fresh budget."
-  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
-        (h1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
-        (h2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
-    ;; Plant a stale timeout count for h1 to ensure it gets reset.
-    (setf (gethash h1 (bl.net::ibd-context-request-timeouts
-                       bl.net:*ibd-context*)) 7)
-    (let ((queued (bl.net::queue-missing-fork-blocks
-                   (list (cons h1 100) (cons h2 101)))))
-      (is (= 2 queued))
-      (is (= 2 (hash-table-count
-                (bl.net:ibd-context-pending-blocks
-                 bl.net:*ibd-context*))))
-      ;; Timeout counter for h1 was reset.
-      (is (= 0 (hash-table-count
-                (bl.net::ibd-context-request-timeouts
-                 bl.net:*ibd-context*)))))))
+  (with-ibd-context
+    (let ((h1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+          (h2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+      ;; Plant a stale timeout count for h1 to ensure it gets reset.
+      (setf (gethash h1 (bl.net::ibd-context-request-timeouts
+                         bl.net:*ibd-context*)) 7)
+      (let ((queued (bl.net::queue-missing-fork-blocks
+                     (list (cons h1 100) (cons h2 101)))))
+        (is (= 2 queued))
+        (is (= 2 (hash-table-count
+                  (bl.net:ibd-context-pending-blocks
+                   bl.net:*ibd-context*))))
+        ;; Timeout counter for h1 was reset.
+        (is (= 0 (hash-table-count
+                  (bl.net::ibd-context-request-timeouts
+                   bl.net:*ibd-context*))))))))
 
 (test queue-missing-fork-blocks-skips-already-queued
   "If a hash is already in pending or in-flight, queue-missing-fork-blocks
 doesn't add it again."
-  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
-        (h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
-    (setf (gethash h (bl.net:ibd-context-pending-blocks
-                      bl.net:*ibd-context*)) 50)
-    (is (= 0 (bl.net::queue-missing-fork-blocks
-              (list (cons h 50)))))))
+  (with-ibd-context
+    (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+      (setf (gethash h (bl.net:ibd-context-pending-blocks
+                        bl.net:*ibd-context*)) 50)
+      (is (= 0 (bl.net::queue-missing-fork-blocks
+                (list (cons h 50))))))))
 
 (test peer-best-known-height-resolves-from-index
   "peer-best-known-height returns the height of the peer's best-known
@@ -635,30 +635,30 @@ block when in the index, and NIL when availability is unknown."
 (test release-orphaned-in-flight-reclaims-disconnected-peer-blocks
   "Releases in-flight blocks held by a non-:ready peer (still in pending),
 leaving a live peer's in-flight untouched."
-  (let* ((bl.net:*ibd-context* (bl.net::make-ibd))
-         (ctx bl.net:*ibd-context*)
-         (live (%make-peer-with-state :ready))
-         (dead (%make-peer-with-state :disconnected))
-         (live-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
-         (dead-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
-    (setf (gethash live-hash (bl.net:ibd-context-pending-blocks ctx)) 10
-          (gethash dead-hash (bl.net:ibd-context-pending-blocks ctx)) 11)
-    (setf (gethash live-hash (bl.net:ibd-context-in-flight ctx))
-          (cons live (get-internal-real-time))
-          (gethash dead-hash (bl.net:ibd-context-in-flight ctx))
-          (cons dead (get-internal-real-time)))
-    (is (= 1 (bl.net::release-orphaned-in-flight)))
-    ;; Dead peer's block freed from in-flight but kept in pending.
-    (is (null (gethash dead-hash (bl.net:ibd-context-in-flight ctx))))
-    (is (= 11 (gethash dead-hash (bl.net:ibd-context-pending-blocks ctx))))
-    ;; Live peer's in-flight is untouched.
-    (is (eq live (car (gethash live-hash (bl.net:ibd-context-in-flight ctx)))))))
+  (with-ibd-context
+    (let* ((ctx bl.net:*ibd-context*)
+          (live (%make-peer-with-state :ready))
+          (dead (%make-peer-with-state :disconnected))
+          (live-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+          (dead-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+      (setf (gethash live-hash (bl.net:ibd-context-pending-blocks ctx)) 10
+            (gethash dead-hash (bl.net:ibd-context-pending-blocks ctx)) 11)
+      (setf (gethash live-hash (bl.net:ibd-context-in-flight ctx))
+            (cons live (get-internal-real-time))
+            (gethash dead-hash (bl.net:ibd-context-in-flight ctx))
+            (cons dead (get-internal-real-time)))
+      (is (= 1 (bl.net::release-orphaned-in-flight)))
+      ;; Dead peer's block freed from in-flight but kept in pending.
+      (is (null (gethash dead-hash (bl.net:ibd-context-in-flight ctx))))
+      (is (= 11 (gethash dead-hash (bl.net:ibd-context-pending-blocks ctx))))
+      ;; Live peer's in-flight is untouched.
+      (is (eq live (car (gethash live-hash (bl.net:ibd-context-in-flight ctx))))))))
 
 ;;;; Progress Reporting Tests
 
 (test ibd-progress-reporting
   "Test IBD progress reporting."
-  (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
+  (with-ibd-context
     ;; Set some state
     (setf (bl.net::ibd-context-target-height
            bl.net:*ibd-context*) 1000)
@@ -1117,19 +1117,19 @@ order and rotates past any that STALL, stopping at the first that answers."
 (test run-ibd-honors-stop-request
   "run-ibd with pending work and a stop requested returns immediately
 instead of cycling the no-peer grace (~6s) or downloading."
-  (let* ((bl.net:*ibd-context* (bl.net::make-ibd))
-         (state (bl.store:make-chain-state))
-         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
-    ;; A header-valid entry above the current tip gives run-ibd pending
-    ;; work and keeps its download-loop gate (height < header-tip) true.
-    (bl.store:add-block-index-entry
-     state (bl.store:make-block-index-entry
-            :hash hash :height 10 :chain-work 100 :status :header-valid))
-    (let ((bl.net::*ibd-stop-requested* t)
-          (start (get-internal-real-time)))
-      (bl.net::run-ibd '() (bl.ctx:make-node-context :chain-state state :peers '()))
-      (is (< (- (get-internal-real-time) start)
-             (* 2 internal-time-units-per-second))))))
+  (with-ibd-context
+    (let* ((state (bl.store:make-chain-state))
+          (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+      ;; A header-valid entry above the current tip gives run-ibd pending
+      ;; work and keeps its download-loop gate (height < header-tip) true.
+      (bl.store:add-block-index-entry
+       state (bl.store:make-block-index-entry
+              :hash hash :height 10 :chain-work 100 :status :header-valid))
+      (let ((bl.net::*ibd-stop-requested* t)
+            (start (get-internal-real-time)))
+        (bl.net::run-ibd '() (bl.ctx:make-node-context :chain-state state :peers '()))
+        (is (< (- (get-internal-real-time) start)
+               (* 2 internal-time-units-per-second)))))))
 
 (test receive-bytes-honors-stop-request
   "receive-bytes on an idle socket must return promptly when

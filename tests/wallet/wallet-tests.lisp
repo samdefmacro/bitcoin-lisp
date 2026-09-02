@@ -41,11 +41,6 @@ datadir; the directory is deleted on unwind."
          (uiop:delete-directory-tree ,dir :validate t
                                           :if-does-not-exist :ignore)))))
 
-(defun %rpc-error-code (thunk)
-  "The rpc-error code THUNK signals, or NIL if it returns normally."
-  (handler-case (progn (funcall thunk) nil)
-    (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e))))
-
 (defun %aval (key alist) (cdr (assoc key alist :test #'string=)))
 
 (defun %crash-close-wallet (node name)
@@ -498,29 +493,29 @@ behave like Core, including the exact error codes."
       (is (equal '("w1" "w2") (bl.wallet::rpc-listwallets node nil)))
       ;; duplicate create -> -36; reload of loaded -> -35; unknown -> -18
       (is (= bl.rpc:+rpc-wallet-already-exists+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-createwallet node '("w1"))))))
       (is (= bl.rpc:+rpc-wallet-already-loaded+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-loadwallet node '("w1"))))))
       (is (= bl.rpc:+rpc-wallet-not-found+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-loadwallet node '("nope"))))))
       ;; unload w1, reload it
       (bl.wallet::rpc-unloadwallet node '("w1"))
       (is (equal '("w2") (bl.wallet::rpc-listwallets node nil)))
       (is (= bl.rpc:+rpc-wallet-not-found+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-unloadwallet node '("w1"))))))
       (bl.wallet::rpc-loadwallet node '("w1"))
       (is (equal '("w2" "w1") (bl.wallet::rpc-listwallets node nil)))
       ;; unloadwallet endpoint/param mismatch -> -8; neither -> -8
       (let ((bl.wallet::*rpc-wallet-name* "w1"))
         (is (= bl.rpc:+rpc-invalid-parameter+
-               (%rpc-error-code
+               (rpc-error-code-of
                 (lambda () (bl.wallet::rpc-unloadwallet node '("w2")))))))
       (is (= bl.rpc:+rpc-invalid-parameter+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-unloadwallet node '())))))
       ;; listwalletdir sees both, loaded or not
       (let ((dir-names (mapcar (lambda (w) (%aval "name" w))
@@ -530,25 +525,25 @@ behave like Core, including the exact error codes."
       ;; createwallet flag semantics: explicit descriptors=false is
       ;; rejected; a null descriptors argument takes Core's default (true).
       (is (= bl.rpc:+rpc-wallet-error+
-             (%rpc-error-code    ; descriptors=false rejected like Core
+             (rpc-error-code-of    ; descriptors=false rejected like Core
               (lambda () (bl.wallet::rpc-createwallet
                           node (list "legacy0" nil nil nil nil
                                      bl.rpc:+json-false+))))))
       ;; A passphrase now creates a born-encrypted wallet (wallet P6). It is
       ;; refused only with private keys disabled, where there would be
       ;; nothing for it to protect.
-      (is (null (%rpc-error-code
+      (is (null (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-createwallet
                              node '("enc0" nil nil "hunter2"))))))
       (is (bl.wallet::wallet-has-encryption-keys-p
            (gethash "enc0" (bl.wallet::wallet-manager-wallets
                             (%node-manager node)))))
       (is (= bl.rpc:+rpc-wallet-error+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-createwallet
                           node '("enc1" t nil "hunter2"))))))
       (is (= bl.rpc:+rpc-invalid-parameter+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-createwallet node '("")))))))))
 
 (test wallet-flags-and-getwalletinfo
@@ -577,7 +572,7 @@ getwalletinfo reports Core's fields."
         (is (assoc "lastprocessedblock" info :test #'string=)))
       ;; a watch-only blank wallet has no keys to hand out
       (is (= bl.rpc:+rpc-wallet-error+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-getnewaddress node nil))))))
     ;; full wallet: keypool counts are per-side
     (let ((bl.wallet::*rpc-wallet-name* nil))
@@ -604,7 +599,7 @@ wallet (-18), no wallet loaded (-18), and ambiguous wallet (-19)."
     ;; no wallet loaded -> -18
     (let ((bl.wallet::*rpc-wallet-name* nil))
       (is (= bl.rpc:+rpc-wallet-not-found+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-getwalletinfo node nil)))))
       (bl.wallet::rpc-createwallet node '("r1"))
       ;; single wallet: base endpoint resolves to it
@@ -613,7 +608,7 @@ wallet (-18), no wallet loaded (-18), and ambiguous wallet (-19)."
       (bl.wallet::rpc-createwallet node '("r2"))
       ;; two wallets: base endpoint is ambiguous -> -19
       (is (= bl.rpc:+rpc-wallet-not-specified+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-getwalletinfo node nil))))))
     ;; endpoint routing picks the named wallet
     (let ((bl.wallet::*rpc-wallet-name* "r2"))
@@ -621,13 +616,8 @@ wallet (-18), no wallet loaded (-18), and ambiguous wallet (-19)."
                                (bl.wallet::rpc-getwalletinfo node nil)))))
     ;; unknown wallet endpoint -> -18 with Core's message
     (let ((bl.wallet::*rpc-wallet-name* "missing"))
-      (handler-case (progn (bl.wallet::rpc-getwalletinfo node nil)
-                           (is nil "expected rpc-error"))
-        (bl.rpc:rpc-error (e)
-          (is (= bl.rpc:+rpc-wallet-not-found+
-                 (bl.rpc:rpc-error-code e)))
-          (is (string= "Requested wallet does not exist or is not loaded"
-                       (bl.rpc:rpc-error-message e))))))
+      (signals-rpc-error (:code bl.rpc:+rpc-wallet-not-found+ :exact-message "Requested wallet does not exist or is not loaded")
+        (bl.wallet::rpc-getwalletinfo node nil)))
     ;; unloadwallet via endpoint (no param)
     (let ((bl.wallet::*rpc-wallet-name* "r2"))
       (bl.wallet::rpc-unloadwallet node '()))
@@ -641,10 +631,10 @@ no-wallet Core build."
     (setf (bl:node-chain-state node)
           (bl.store:make-chain-state))
     (is (= bl.rpc:+rpc-method-not-found+
-           (%rpc-error-code
+           (rpc-error-code-of
             (lambda () (bl.wallet::rpc-createwallet node '("x"))))))
     (is (= bl.rpc:+rpc-method-not-found+
-           (%rpc-error-code
+           (rpc-error-code-of
             (lambda () (bl.wallet::rpc-listwallets node nil)))))))
 
 ;;; --- getnewaddress across all four types ---
@@ -679,11 +669,11 @@ right form for all four address types (testnet4 prefixes), default bech32."
                         wallet (%address-script change :testnet4)))))
         ;; unknown type -> -5; label "*" -> -11
         (is (= bl.rpc:+rpc-invalid-address-or-key+
-               (%rpc-error-code
+               (rpc-error-code-of
                 (lambda () (bl.wallet::rpc-getnewaddress
                             node '("" "p2wpkh"))))))
         (is (= bl.rpc:+rpc-wallet-invalid-label-name+
-               (%rpc-error-code
+               (rpc-error-code-of
                 (lambda () (bl.wallet::rpc-getnewaddress node '("*"))))))))))
 
 ;;; --- listdescriptors / importdescriptors ---
@@ -722,7 +712,7 @@ private=true."
       (bl.wallet::rpc-createwallet node '("ldwo" t)))
     (let ((bl.wallet::*rpc-wallet-name* "ldwo"))
       (is (= bl.rpc:+rpc-wallet-error+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-listdescriptors node '(t)))))))))
 
 (test wallet-importdescriptors-validation
@@ -736,7 +726,7 @@ throws out of the whole call."
     (let ((bl.wallet::*rpc-wallet-name* "imp"))
       ;; missing timestamp -> whole-RPC type error
       (is (= bl.rpc:+rpc-type-error+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda ()
                 (bl.wallet::rpc-importdescriptors
                  node (list (list (%ht "desc" "wpkh(x)"))))))))
@@ -880,12 +870,12 @@ wallet does not own -4 (Core wallet/rpc/signmessage.cpp error codes)."
       ;; Valid bech32 address (not a key hash) -> -3.
       (let ((bech32 (bl.wallet::rpc-getnewaddress node '("" "bech32"))))
         (is (= bl.rpc:+rpc-type-error+
-               (%rpc-error-code
+               (rpc-error-code-of
                 (lambda () (bl.wallet::rpc-signmessage
                             node (list bech32 message)))))))
       ;; Garbage address -> -5.
       (is (= bl.rpc:+rpc-invalid-address-or-key+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-signmessage
                           node (list "not-a-real-address" message))))))
       ;; A valid P2PKH address the wallet does not own -> -4.
@@ -894,7 +884,7 @@ wallet does not own -4 (Core wallet/rpc/signmessage.cpp error codes)."
                                      :initial-element 7)
                       :testnet4)))
         (is (= bl.rpc:+rpc-wallet-error+
-               (%rpc-error-code
+               (rpc-error-code-of
                 (lambda () (bl.wallet::rpc-signmessage
                             node (list foreign message))))))))))
 
@@ -924,7 +914,7 @@ silently resuming address reuse."
       ;; Setting it to the value it already holds is an error, not a no-op:
       ;; the caller has misunderstood the state.
       (is (= bl.rpc:+rpc-invalid-parameter+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-setwalletflag node '("avoid_reuse"))))))
       ;; Off again, and no caveat this time (Core reports it only when SETTING).
       (let ((r (bl.wallet::rpc-setwalletflag
@@ -938,11 +928,11 @@ silently resuming address reuse."
       (dolist (immutable '("blank" "descriptor_wallet" "disable_private_keys"
                            "key_origin_metadata"))
         (is (= bl.rpc:+rpc-invalid-parameter+
-               (%rpc-error-code
+               (rpc-error-code-of
                 (lambda () (bl.wallet::rpc-setwalletflag node (list immutable)))))
             "~A was not refused as immutable" immutable))
       (is (= bl.rpc:+rpc-invalid-parameter+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-setwalletflag node '("no_such_flag"))))))
       ;; And it PERSISTED: the flag word is on disk, not just in the struct.
       (bl.wallet::rpc-setwalletflag node '("avoid_reuse"))
@@ -969,11 +959,11 @@ derivation paths cannot drift between the two."
            (wallet (gethash "cwd" (bl.wallet::wallet-manager-wallets manager))))
       ;; Everything already exists on a freshly created wallet.
       (is (= bl.rpc:+rpc-wallet-error+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-createwalletdescriptor node '("bech32m"))))))
       ;; An unknown address type is refused by name.
       (is (= bl.rpc:+rpc-invalid-address-or-key+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-createwalletdescriptor node '("nosuchtype"))))))
       ;; Now remove one side and re-create it: the real path.
       (let* ((removed (gethash :bech32m (bl.wallet::wallet-internal-spkms wallet)))
@@ -1001,7 +991,7 @@ derivation paths cannot drift between the two."
       (let ((opts (let ((h (make-hash-table :test 'equal)))
                     (setf (gethash "hdkey" h) "not-an-xpub") h)))
         (is (= bl.rpc:+rpc-invalid-address-or-key+
-               (%rpc-error-code
+               (rpc-error-code-of
                 (lambda () (bl.wallet::rpc-createwalletdescriptor
                             node (list "bech32" opts))))))))))
 
@@ -1152,15 +1142,15 @@ outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label
                                        :initial-element 3)
                         :testnet4)))
           (is (= bl.rpc:+rpc-wallet-error+
-                 (%rpc-error-code
+                 (rpc-error-code-of
                   (lambda () (bl.wallet::rpc-getreceivedbyaddress
                               node (list foreign)))))))
         (is (= bl.rpc:+rpc-invalid-address-or-key+
-               (%rpc-error-code
+               (rpc-error-code-of
                 (lambda () (bl.wallet::rpc-getreceivedbyaddress
                             node (list "garbage"))))))
         (is (= bl.rpc:+rpc-wallet-error+
-               (%rpc-error-code
+               (rpc-error-code-of
                 (lambda () (bl.wallet::rpc-getreceivedbylabel
                             node (list "no-such-label"))))))))))
 
@@ -1182,7 +1172,7 @@ outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label
       (dolist (s (bl.wallet::%wallet-active-spkms wallet))
         (is (>= (bl.wallet::spkm-keypool-count s) 20)))
       (is (= bl.rpc:+rpc-invalid-parameter+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.wallet::rpc-keypoolrefill node '(-1)))))))))
 
 (test wallet-simulaterawtransaction-balance-change
@@ -1221,7 +1211,7 @@ rejects a double-spend across the array."
             (is (%wt= -0.01d0 (%aval "balance_change" result))))
           ;; Two txs spending the same funded coin -> -8.
           (is (= bl.rpc:+rpc-invalid-parameter+
-                 (%rpc-error-code
+                 (rpc-error-code-of
                   (lambda ()
                     (bl.wallet::rpc-simulaterawtransaction
                      node (list (list (%wt-raw-tx-hex (list (cons funded 0))
