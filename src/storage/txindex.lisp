@@ -49,7 +49,7 @@ what %TXINDEX-RESUME-HEIGHT scans from."
   (declare (ignore height))
   (txindex-set-best-block index block-hash))
 (defmethod index-clear-best ((index tx-index))
-  (when (tx-index-db index) (leveldb-delete (tx-index-db index) *txindex-meta-key*)))
+  (when (tx-index-db index) (leveldb-delete (tx-index-db index) *index-meta-key*)))
 (defmethod index-write-block ((index tx-index) chainstate block block-hash height spent-utxos)
   (declare (ignore chainstate height spent-utxos))
   (txindex-add-block index block block-hash)
@@ -78,11 +78,6 @@ the tip after invalidateblock and the next start rescanned from genesis."
   "ASCII #\t — the per-transaction key prefix, keeping txid keys clear of the
 metadata key below.")
 
-(defparameter *txindex-meta-key*
-  (make-array 1 :element-type '(unsigned-byte 8) :initial-element 66)
-  "ASCII #\B: the best-block marker (Core's BaseIndex locator). A single byte,
-distinct from the 33-byte transaction keys, so it can never collide.")
-
 (defun txindex-db-path (base-path)
   "Directory of the txindex LevelDB. Core's indexes/txindex/, falling back to
 the flat txindex/ this tree used before — see kv/datadir.lisp."
@@ -90,10 +85,7 @@ the flat txindex/ this tree used before — see kv/datadir.lisp."
 
 (defun %txindex-key (txid)
   "DB key for TXID: the prefix byte followed by the 32-byte hash."
-  (let ((key (make-array 33 :element-type '(unsigned-byte 8))))
-    (setf (aref key 0) +txindex-key-prefix+)
-    (replace key txid :start1 1)
-    key))
+  (index-key +txindex-key-prefix+ txid))
 
 (defun %txindex-encode (block-hash tx-position)
   (let ((v (make-array +txindex-record-size+ :element-type '(unsigned-byte 8))))
@@ -108,22 +100,13 @@ the flat txindex/ this tree used before — see kv/datadir.lisp."
   "Initialize a transaction index at BASE-PATH.
 If ENABLED is nil, creates a disabled index that ignores add operations.
 No startup replay: the DB is the index."
-  (let ((txindex (make-tx-index :base-path (pathname base-path) :enabled enabled)))
-    (when enabled
-      (let ((path (txindex-db-path base-path)))
-        (ensure-directories-exist path)
-        (setf (tx-index-db txindex)
-              (leveldb-open-tuned
-               path :cache-bytes (if *cache-sizes*
-                                     (cache-sizes-tx-index *cache-sizes*)
-                                     0)))))
-    txindex))
+  (open-index-db (make-tx-index :base-path (pathname base-path) :enabled enabled
+                                :cache-share :tx-index)
+                 (txindex-db-path base-path)))
 
 (defun close-tx-index (txindex)
   "Close the txindex database."
-  (when (tx-index-db txindex)
-    (leveldb-close (tx-index-db txindex))
-    (setf (tx-index-db txindex) nil)))
+  (close-index txindex))
 
 (defun txindex-add (txindex txid block-hash tx-position)
   "Add or UPDATE a transaction's location (upsert).
@@ -174,13 +157,13 @@ index explicitly."
 The file-based index had no such marker at all, so nothing could tell whether
 it was current."
   (when (and (tx-index-enabled txindex) (tx-index-db txindex))
-    (leveldb-put (tx-index-db txindex) *txindex-meta-key* block-hash)
+    (leveldb-put (tx-index-db txindex) *index-meta-key* block-hash)
     t))
 
 (defun txindex-best-block (txindex)
   "The block hash this index is caught up to, or NIL."
   (when (and (tx-index-enabled txindex) (tx-index-db txindex))
-    (leveldb-get (tx-index-db txindex) *txindex-meta-key*)))
+    (leveldb-get (tx-index-db txindex) *index-meta-key*)))
 
 (defun txindex-count (txindex)
   "Number of indexed transactions, by DB scan.

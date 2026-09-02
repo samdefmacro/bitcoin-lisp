@@ -24,7 +24,6 @@
 ;;;;   key 0x42 (meta)             ->  best-height(u32 LE) || best-hash(32)
 
 (defconstant +csi-key-stat+ #x53 "LevelDB key prefix ('S') for per-height records.")
-(defconstant +csi-key-meta+ #x42 "LevelDB key ('B') for the best-indexed metadata.")
 
 (defstruct (coinstatsindex (:include base-index))
   "coinstatsindex state (open LevelDB handle + enabled flag).")
@@ -33,12 +32,6 @@
 (defmethod index-height ((index coinstatsindex) chainstate)
   (declare (ignore chainstate))
   (coinstatsindex-height index))
-(defmethod index-best-block ((index coinstatsindex))
-  (multiple-value-bind (height hash) (coinstatsindex-best index)
-    (and hash (values hash height))))
-(defmethod index-set-best ((index coinstatsindex) block-hash height)
-  (coinstatsindex-set-best index height block-hash))
-(defmethod index-clear-best ((index coinstatsindex)) (coinstatsindex-clear-best index))
 ;; index-write-block for the coinstatsindex lives in src/node/indexes.lisp: the block
 ;; subsidy it folds in is consensus (validation), which loads after storage.
 
@@ -64,23 +57,9 @@ integers."
 (defun %csi-stat-key (height)
   "Key for HEIGHT's record: prefix byte + height as 4 big-endian bytes (so the
 key order is height order)."
-  (let ((k (make-array 5 :element-type '(unsigned-byte 8))))
-    (setf (aref k 0) +csi-key-stat+)
-    (dotimes (i 4) (setf (aref k (- 4 i)) (logand (ash height (* -8 i)) #xff)))
-    k))
-
-(defparameter *csi-meta-key*
-  (make-array 1 :element-type '(unsigned-byte 8) :initial-element +csi-key-meta+))
-
-(defun %csi-encode-meta (height hash)
-  (let ((v (make-array 36 :element-type '(unsigned-byte 8))))
-    (dotimes (i 4) (setf (aref v i) (logand (ash height (* -8 i)) #xff)))
-    (replace v hash :start1 4)
-    v))
-
-(defun %csi-decode-meta (v)
-  (values (loop for i below 4 sum (ash (aref v i) (* 8 i)))
-          (subseq v 4 36)))
+  (let ((be (make-array 4 :element-type '(unsigned-byte 8))))
+    (dotimes (i 4) (setf (aref be (- 3 i)) (logand (ash height (* -8 i)) #xff)))
+    (index-key +csi-key-stat+ be)))
 
 ;; A record is: muhash numerator (384 LE) || denominator (384 LE) || 11 tallies
 ;; each as a signed 64-bit little-endian value.
@@ -145,34 +124,22 @@ this tree used before — see kv/datadir.lisp."
   (datadir-index-path (pathname base-path) :coinstats))
 
 (defun init-coinstatsindex (base-path &key (enabled t))
-  "Open (creating if needed) the coinstatsindex under BASE-PATH."
-  (let ((csi (make-coinstatsindex :base-path (pathname base-path) :enabled enabled)))
-    (when enabled
-      (let ((path (coinstatsindex-path base-path)))
-        (ensure-directories-exist path)
-        ;; coinstats shares the filter index's per-index share: Core
-        ;; divides one budget across n_indexes (node/caches.cpp:66-70).
-        (setf (coinstatsindex-db csi)
-              (leveldb-open-tuned
-               path :cache-bytes (if *cache-sizes*
-                                     (cache-sizes-filter-index *cache-sizes*)
-                                     0)))))
-    csi))
+  "Open (creating if needed) the coinstatsindex under BASE-PATH. It shares the
+filter index's cache line: Core divides one budget across n_indexes
+(node/caches.cpp:66-70)."
+  (open-index-db (make-coinstatsindex :base-path (pathname base-path) :enabled enabled)
+                 (coinstatsindex-path base-path)))
 
 (defun close-coinstatsindex (csi)
-  (when (coinstatsindex-db csi)
-    (leveldb-close (coinstatsindex-db csi))
-    (setf (coinstatsindex-db csi) nil)))
+  (close-index csi))
 
 ;;; --- reads ---
 
 (defun coinstatsindex-best (csi)
-  "Return (values height hash) of the highest indexed block, or (values -1 nil)."
-  (let ((db (coinstatsindex-db csi)))
-    (if (null db)
-        (values -1 nil)
-        (let ((v (leveldb-get db *csi-meta-key*)))
-          (if (and v (>= (length v) 36)) (%csi-decode-meta v) (values -1 nil))))))
+  "Return (values height hash) of the highest indexed block, or (values -1 nil).
+Note the order: INDEX-BEST-BLOCK, the generic underneath, answers (hash height)."
+  (multiple-value-bind (hash height) (index-best-block csi)
+    (if hash (values height hash) (values -1 nil))))
 
 (defun coinstatsindex-height (csi)
   (nth-value 0 (coinstatsindex-best csi)))
@@ -186,12 +153,10 @@ this tree used before — see kv/datadir.lisp."
           (%csi-decode-stat v))))))
 
 (defun coinstatsindex-set-best (csi height hash)
-  (when (coinstatsindex-db csi)
-    (leveldb-put (coinstatsindex-db csi) *csi-meta-key* (%csi-encode-meta height hash))))
+  (index-set-best csi hash height))
 
 (defun coinstatsindex-clear-best (csi)
-  (when (coinstatsindex-db csi)
-    (leveldb-delete (coinstatsindex-db csi) *csi-meta-key*)))
+  (index-clear-best csi))
 
 ;;; --- per-block update ---
 
@@ -299,8 +264,7 @@ Only writes if the index is empty."
     (let ((stats (make-coinstats :total-subsidy genesis-subsidy
                                  :unspendable-genesis genesis-subsidy)))
       (leveldb-put (coinstatsindex-db csi) (%csi-stat-key 0) (%csi-encode-stat stats))
-      (leveldb-put (coinstatsindex-db csi) *csi-meta-key*
-                   (%csi-encode-meta 0 genesis-hash))
+      (index-set-best csi genesis-hash 0)
       stats)))
 
 (defun coinstatsindex-add-block (csi block block-hash height spent-utxos subsidy)
@@ -327,8 +291,8 @@ the caller should stop/backfill)."
                (progn
                  (leveldb-writebatch-put batch (%csi-stat-key height)
                                          (%csi-encode-stat stats))
-                 (leveldb-writebatch-put batch *csi-meta-key*
-                                         (%csi-encode-meta height block-hash))
+                 (leveldb-writebatch-put batch (base-index-meta-key csi)
+                                         (index-meta-encode height block-hash))
                  (leveldb-write (coinstatsindex-db csi) batch))
             (leveldb-destroy-writebatch batch)))
         stats))))

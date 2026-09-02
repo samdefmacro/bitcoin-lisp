@@ -14,13 +14,69 @@
 ;;; What differs per index (key layouts, meta encodings, what a block
 ;;; contributes) stays in the index's own file, as its methods.
 
+(defparameter *index-meta-key*
+  (make-array 1 :element-type '(unsigned-byte 8) :initial-element (char-code #\B))
+  "ASCII B: the best-block marker's LevelDB key. One byte, so it can never be
+mistaken for a record key, all of which start with a different prefix byte.")
+
 (defstruct (base-index (:constructor nil) (:copier nil) (:predicate nil))
   "What every index shares: where its LevelDB lives, the open handle (NIL
-until INIT-* opens it, and for a disabled index), and whether it is on.
-Never instantiated directly; the indexes :INCLUDE it."
+until INIT-* opens it, and for a disabled index), whether it is on, and the
+one-byte key of its best-block marker. Never instantiated directly; the
+indexes :INCLUDE it."
   (base-path nil :type (or null pathname))
   (db nil)
-  (enabled nil :type boolean))
+  (enabled nil :type boolean)
+  ;; The marker record's key (ASCII B in every index), and which share of the
+  ;; -dbcache budget the DB gets: Core divides one budget across the indexes
+  ;; (node/caches.cpp:66-70); the txindex has its own line.
+  (meta-key *index-meta-key* :type (simple-array (unsigned-byte 8) (1)))
+  (cache-share :filter-index :type (member :filter-index :tx-index)))
+
+;;; --- The skeleton: open, close, key layout, the 36-byte marker ---
+
+(defun open-index-db (index path)
+  "Open (creating if needed) INDEX's LevelDB at PATH with its cache share,
+when the index is enabled; a disabled index keeps no handle."
+  (when (base-index-enabled index)
+    (ensure-directories-exist path)
+    (setf (base-index-db index)
+          (leveldb-open-tuned
+           path :cache-bytes (if *cache-sizes*
+                                 (ecase (base-index-cache-share index)
+                                   (:filter-index (cache-sizes-filter-index *cache-sizes*))
+                                   (:tx-index (cache-sizes-tx-index *cache-sizes*)))
+                                 0))))
+  index)
+
+(defun close-index (index)
+  "Close INDEX's LevelDB handle, if open."
+  (when (base-index-db index)
+    (leveldb-close (base-index-db index))
+    (setf (base-index-db index) nil)))
+
+(defun index-key (prefix &rest parts)
+  "A record key: the PREFIX byte followed by PARTS, each an octet vector."
+  (let* ((n (reduce #'+ parts :key #'length :initial-value 1))
+         (key (make-array n :element-type '(unsigned-byte 8)))
+         (pos 1))
+    (setf (aref key 0) prefix)
+    (dolist (part parts key)
+      (replace key part :start1 pos)
+      (incf pos (length part)))))
+
+(defun index-meta-encode (height hash)
+  "The best-block marker's value: HEIGHT as 4 little-endian bytes, then the
+32-byte HASH (the blockfilterindex and coinstatsindex layout)."
+  (let ((v (make-array 36 :element-type '(unsigned-byte 8))))
+    (dotimes (i 4) (setf (aref v i) (logand (ash height (* -8 i)) #xff)))
+    (replace v hash :start1 4)
+    v))
+
+(defun index-meta-decode (v)
+  "(values height hash) from a marker value written by INDEX-META-ENCODE."
+  (values (loop for i below 4 sum (ash (aref v i) (* 8 i)))
+          (subseq v 4 36)))
 
 (defgeneric index-name (index)
   (:documentation "The index's name as Core spells it: \"txindex\", ..."))
@@ -70,3 +126,24 @@ on it: repair one left above the tip, rewind one off the active chain
 SUBSIDY-FN a height to its subsidy, for the indexes that need them; PROGRESS
 is called with (height percent). Returns how many blocks (or entries) were
 added."))
+
+;;; --- Default marker methods (the height||hash layout) ---
+;;; The txindex (hash-only marker) and the txospenderindex (hash||height)
+;;; keep their own; the blockfilterindex and coinstatsindex use these.
+
+(defmethod index-best-block ((index base-index))
+  (let ((db (base-index-db index)))
+    (when db
+      (let ((v (leveldb-get db (base-index-meta-key index))))
+        (when (and v (>= (length v) 36))
+          (multiple-value-bind (height hash) (index-meta-decode v)
+            (values hash height)))))))
+
+(defmethod index-set-best ((index base-index) block-hash height)
+  (when (base-index-db index)
+    (leveldb-put (base-index-db index) (base-index-meta-key index)
+                 (index-meta-encode height block-hash))))
+
+(defmethod index-clear-best ((index base-index))
+  (when (base-index-db index)
+    (leveldb-delete (base-index-db index) (base-index-meta-key index))))

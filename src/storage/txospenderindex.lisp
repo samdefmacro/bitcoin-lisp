@@ -41,11 +41,6 @@ coinstatsindex's 'S'/'B'.")
 (defconstant +txospender-key-size+ 45
   "1 prefix + 8 hash + 32 block hash + 4 offset.")
 
-(defparameter *txospender-meta-key*
-  (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x42)
-  "ASCII 'B': the best-block marker. One byte, so it can never be mistaken for
-a 45-byte spender key.")
-
 (defparameter *txospender-salt-key*
   (map '(vector (unsigned-byte 8)) #'char-code "siphash_key")
   "Core stores its salt under this literal key (txospenderindex.cpp:66).")
@@ -65,7 +60,7 @@ no in-memory table and no startup replay."
   (txospenderindex-set-best-block index block-hash height))
 (defmethod index-clear-best ((index txospender-index))
   (when (%txospender-index-live-p index)
-    (leveldb-delete (txospender-index-db index) *txospender-meta-key*)))
+    (leveldb-delete (txospender-index-db index) *index-meta-key*)))
 (defmethod index-write-block ((index txospender-index) chainstate block block-hash height spent-utxos)
   (declare (ignore chainstate spent-utxos))
   (txospenderindex-add-block index block block-hash)
@@ -154,19 +149,15 @@ already recorded."
 (defun init-txospender-index (base-path &key (enabled t))
   "Open the spender index at BASE-PATH. A disabled index ignores every write,
 so callers do not have to test for it."
-  (let ((index (make-txospender-index :base-path (pathname base-path)
-                                      :enabled enabled)))
-    (when enabled
-      (let ((path (txospenderindex-db-path base-path)))
-        (ensure-directories-exist path)
-        (setf (txospender-index-db index) (leveldb-open-tuned path))
-        (%txospender-load-salt index)))
+  (let ((index (open-index-db (make-txospender-index :base-path (pathname base-path)
+                                                     :enabled enabled)
+                              (txospenderindex-db-path base-path))))
+    (when (txospender-index-db index)
+      (%txospender-load-salt index))
     index))
 
 (defun close-txospender-index (index)
-  (when (txospender-index-db index)
-    (leveldb-close (txospender-index-db index))
-    (setf (txospender-index-db index) nil)))
+  (close-index index))
 
 (defun %txospender-index-live-p (index)
   (and index (txospender-index-enabled index) (txospender-index-db index)))
@@ -269,19 +260,21 @@ the one that really spends this outpoint."
 
 The HEIGHT is stored beside the hash purely so getindexinfo can report
 best_block_height without a chain-state lookup — Core's BaseIndex keeps a
-locator and reads the height off it."
+locator and reads the height off it. The layout is hash||height, the
+reverse of INDEX-META-ENCODE's height||hash (the other two indexes); it is
+on disk, so it stays."
   (when (%txospender-index-live-p index)
     (let ((v (make-array 36 :element-type '(unsigned-byte 8))))
       (replace v block-hash)
       (dotimes (i 4)
         (setf (aref v (+ 32 i)) (logand (ash height (* -8 i)) #xFF)))
-      (leveldb-put (txospender-index-db index) *txospender-meta-key* v))
+      (leveldb-put (txospender-index-db index) *index-meta-key* v))
     t))
 
 (defun txospenderindex-best-block (index)
   "(values block-hash height), or NIL when nothing has been indexed."
   (when (%txospender-index-live-p index)
-    (let ((v (leveldb-get (txospender-index-db index) *txospender-meta-key*)))
+    (let ((v (leveldb-get (txospender-index-db index) *index-meta-key*)))
       (when (and v (= 36 (length v)))
         (values (subseq v 0 32)
                 (logior (aref v 32) (ash (aref v 33) 8)

@@ -30,12 +30,6 @@
 (defmethod index-height ((index blockfilterindex) chainstate)
   (declare (ignore chainstate))
   (blockfilterindex-height index))
-(defmethod index-best-block ((index blockfilterindex))
-  (multiple-value-bind (height hash) (blockfilterindex-best index)
-    (and hash (values hash height))))
-(defmethod index-set-best ((index blockfilterindex) block-hash height)
-  (blockfilterindex-set-best index height block-hash))
-(defmethod index-clear-best ((index blockfilterindex)) (blockfilterindex-clear-best index))
 (defmethod index-write-block ((index blockfilterindex) chainstate block block-hash height spent-utxos)
   (declare (ignore chainstate))
   (blockfilterindex-add-block index block block-hash height spent-utxos))
@@ -49,47 +43,20 @@ tree used before — see kv/datadir.lisp."
 (defun init-blockfilterindex (base-path &key (enabled t))
   "Open (creating if needed) the block filter index under BASE-PATH.
 A disabled index ignores writes and reads and holds no DB handle."
-  (let ((bfi (make-blockfilterindex :base-path (pathname base-path) :enabled enabled)))
-    (when enabled
-      (let ((path (blockfilterindex-path base-path)))
-        (ensure-directories-exist path)
-        (setf (blockfilterindex-db bfi)
-              (leveldb-open-tuned
-               path :cache-bytes (if *cache-sizes*
-                                     (cache-sizes-filter-index *cache-sizes*)
-                                     0)))))
-    bfi))
+  (open-index-db (make-blockfilterindex :base-path (pathname base-path) :enabled enabled)
+                 (blockfilterindex-path base-path)))
 
 (defun close-blockfilterindex (bfi)
   "Close the index's LevelDB handle."
-  (when (blockfilterindex-db bfi)
-    (leveldb-close (blockfilterindex-db bfi))
-    (setf (blockfilterindex-db bfi) nil)))
+  (close-index bfi))
 
 ;;; --- key/value encoding ---
 
 (defun %bfi-filter-key (block-hash)
-  (let ((k (make-array 33 :element-type '(unsigned-byte 8))))
-    (setf (aref k 0) +bfi-key-filter+)
-    (replace k block-hash :start1 1)
-    k))
-
-(defparameter *bfi-meta-key*
-  (make-array 1 :element-type '(unsigned-byte 8) :initial-element +bfi-key-meta+)
-  "The single-byte LevelDB key of the best-indexed-block metadata record.")
+  (index-key +bfi-key-filter+ block-hash))
 
 (defun %bfi-encode-record (header filter)
   (concatenate '(simple-array (unsigned-byte 8) (*)) header filter))
-
-(defun %bfi-encode-meta (height hash)
-  (let ((v (make-array 36 :element-type '(unsigned-byte 8))))
-    (dotimes (i 4) (setf (aref v i) (logand (ash height (* -8 i)) #xff)))
-    (replace v hash :start1 4)
-    v))
-
-(defun %bfi-decode-meta (v)
-  (values (loop for i below 4 sum (ash (aref v i) (* 8 i)))
-          (subseq v 4 36)))
 
 ;;; --- reads ---
 
@@ -118,14 +85,10 @@ A disabled index ignores writes and reads and holds no DB handle."
        (not (null (leveldb-get (blockfilterindex-db bfi) (%bfi-filter-key block-hash))))))
 
 (defun blockfilterindex-best (bfi)
-  "Return (values height hash) of the highest indexed block, or (values -1 nil)."
-  (let ((db (blockfilterindex-db bfi)))
-    (if (null db)
-        (values -1 nil)
-        (let ((v (leveldb-get db *bfi-meta-key*)))
-          (if (and v (>= (length v) 36))
-              (%bfi-decode-meta v)
-              (values -1 nil))))))
+  "Return (values height hash) of the highest indexed block, or (values -1 nil).
+Note the order: INDEX-BEST-BLOCK, the generic underneath, answers (hash height)."
+  (multiple-value-bind (hash height) (index-best-block bfi)
+    (if hash (values height hash) (values -1 nil))))
 
 (defun blockfilterindex-height (bfi)
   "Height of the highest indexed block, or -1 if empty."
@@ -171,7 +134,7 @@ indexed range really ends, so the startup backfill can heal the gap."
            (header (compute-block-filter-header
                     filter (or prev-header +zero-filter-header+))))
       (leveldb-put db (%bfi-filter-key block-hash) (%bfi-encode-record header filter))
-      (leveldb-put db *bfi-meta-key* (%bfi-encode-meta height block-hash))
+      (index-set-best bfi block-hash height)
       filter)))
 
 ;;; --- backfill over already-stored blocks ---
@@ -184,13 +147,11 @@ that a correct basic filter needs its undo data."
 (defun blockfilterindex-set-best (bfi height hash)
   "Force the recorded best-indexed block to HEIGHT/HASH (used to repair the meta
 record after a rollback such as invalidateblock)."
-  (when (blockfilterindex-db bfi)
-    (leveldb-put (blockfilterindex-db bfi) *bfi-meta-key* (%bfi-encode-meta height hash))))
+  (index-set-best bfi hash height))
 
 (defun blockfilterindex-clear-best (bfi)
   "Delete the best-indexed metadata (forces a full backfill from height 0)."
-  (when (blockfilterindex-db bfi)
-    (leveldb-delete (blockfilterindex-db bfi) *bfi-meta-key*)))
+  (index-clear-best bfi))
 
 (defun blockfilterindex-wipe (bfi)
   "Delete the on-disk filter index entirely and reopen it empty. Used when the
@@ -200,12 +161,7 @@ genesis indexing existed) and must be rebuilt from scratch."
     (let ((path (blockfilterindex-path (blockfilterindex-base-path bfi))))
       (close-blockfilterindex bfi)
       (leveldb-destroy-db path)
-      (ensure-directories-exist path)
-      (setf (blockfilterindex-db bfi)
-            (leveldb-open-tuned
-             path :cache-bytes (if *cache-sizes*
-                                   (cache-sizes-filter-index *cache-sizes*)
-                                   0))))
+      (open-index-db bfi path))
     t))
 
 (defun blockfilterindex-ensure-genesis-anchor (bfi chain-state)
