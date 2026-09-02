@@ -40,16 +40,6 @@
    #:zero-block-height
    #:next-block-height
    ;; Struct ↔ Coalton vector converters
-   #:outpoint-to-coalton
-   #:outpoint-from-coalton
-   #:tx-in-to-coalton
-   #:tx-in-from-coalton
-   #:tx-out-to-coalton
-   #:tx-out-from-coalton
-   #:transaction-to-coalton
-   #:transaction-from-coalton
-   #:block-header-to-coalton
-   #:block-header-from-coalton
    ;; Constants
    #:+max-money+
    #:+coin+
@@ -152,62 +142,6 @@
 (defun coalton-vector-to-cl-array (vec)
   "Convert a Coalton vector to a CL byte array."
   (coerce vec '(simple-array (unsigned-byte 8) (*))))
-
-;;; Struct ↔ Coalton vector converters
-;;; Serialize CL structs to Coalton-compatible byte vectors and back.
-
-(defun outpoint-to-coalton (outpoint)
-  "Serialize a CL outpoint struct to a Coalton byte vector."
-  (cl-array-to-coalton-vector
-   (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-     (bl.ser:write-outpoint s outpoint))))
-
-(defun outpoint-from-coalton (vec)
-  "Deserialize a Coalton byte vector to a CL outpoint struct."
-  (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
-    (bl.ser:read-outpoint s)))
-
-(defun tx-in-to-coalton (tx-in)
-  "Serialize a CL tx-in struct to a Coalton byte vector."
-  (cl-array-to-coalton-vector
-   (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-     (bl.ser:write-tx-in s tx-in))))
-
-(defun tx-in-from-coalton (vec)
-  "Deserialize a Coalton byte vector to a CL tx-in struct."
-  (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
-    (bl.ser:read-tx-in s)))
-
-(defun tx-out-to-coalton (tx-out)
-  "Serialize a CL tx-out struct to a Coalton byte vector."
-  (cl-array-to-coalton-vector
-   (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-     (bl.ser:write-tx-out s tx-out))))
-
-(defun tx-out-from-coalton (vec)
-  "Deserialize a Coalton byte vector to a CL tx-out struct."
-  (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
-    (bl.ser:read-tx-out s)))
-
-(defun transaction-to-coalton (tx)
-  "Serialize a CL transaction struct to a Coalton byte vector."
-  (cl-array-to-coalton-vector
-   (bl.ser:serialize-transaction tx)))
-
-(defun transaction-from-coalton (vec)
-  "Deserialize a Coalton byte vector to a CL transaction struct."
-  (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
-    (bl.ser:read-transaction s)))
-
-(defun block-header-to-coalton (header)
-  "Serialize a CL block-header struct to a Coalton byte vector."
-  (cl-array-to-coalton-vector
-   (bl.ser:serialize-block-header header)))
-
-(defun block-header-from-coalton (vec)
-  "Deserialize a Coalton byte vector to a CL block-header struct."
-  (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
-    (bl.ser:read-block-header s)))
 
 ;;; Bitcoin constants
 (defconstant +coin+ 100000000
@@ -515,29 +449,9 @@ INPUTS may be any sequence (struct field vector or an ad-hoc list)."
    the old full clrhash dumped the entire hot working set at once and
    forced a re-verification burst.")
 
-(declaim (inline sig-cache-hash))
-(defun sig-cache-hash (key)
-  "Custom :hash-function for *signature-cache*. Keys are 32-byte SHA256
-outputs which are already uniformly random, so we just take the first 8
-bytes as a little-endian uint64 and mask to fixnum width — far cheaper
-than SBCL's generic data-vector-hash, which iterates all 32 bytes per
-lookup. Equalp test still resolves any collisions exactly."
-  (declare (type (simple-array (unsigned-byte 8) (*)) key)
-           (optimize (speed 3) (safety 0)))
-  (logand (logior (aref key 0)
-                  (ash (aref key 1) 8)
-                  (ash (aref key 2) 16)
-                  (ash (aref key 3) 24)
-                  (ash (aref key 4) 32)
-                  (ash (aref key 5) 40)
-                  (ash (aref key 6) 48)
-                  (ash (aref key 7) 56))
-          most-positive-fixnum))
-
 (defun %make-sig-cache-table ()
-  (make-hash-table :test 'equalp :size 65536
-                   #+sbcl :hash-function #+sbcl 'sig-cache-hash
-                   #+sbcl :synchronized #+sbcl t))
+  "Keys are SHA256 outputs: bl.bytes:octets= (first-eight-bytes hash)."
+  (bl.bytes:make-octets-hash-table :size 65536 :synchronized t))
 
 (defvar *signature-cache*
   (%make-sig-cache-table)

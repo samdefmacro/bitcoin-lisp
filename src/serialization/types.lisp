@@ -1,5 +1,13 @@
 (in-package #:bitcoin-lisp.serialization)
 
+;;; Hot path: block deserialization is the IBD bottleneck (profiled
+;;; 2026-08-22, docs/next-wave-2026-08-22.md), and this file is where every
+;;; block, transaction and header is read and written. The byte-reader /
+;;; byte-buf codecs below carry the same policy as the primitives they
+;;; inline, (speed 3) (safety 1), declared per function: a file-level
+;;; DECLAIM would PROCLAIM at load time and leak into every file compiled
+;;; after this one. Safety stays at 1 -- these readers run on peer bytes.
+
 ;;; Bitcoin protocol data structures
 ;;;
 ;;; This module defines the core data types used in the Bitcoin protocol:
@@ -33,12 +41,14 @@ INDEX is the output index within that transaction."
 (declaim (inline bb-write-outpoint))
 (defun bb-write-outpoint (bb outpoint)
   "Write an outpoint into byte-buf BB (32-byte hash + 4-byte LE index)."
+  (declare (type bl.bytes:byte-buf bb) (optimize (speed 3) (safety 1)))
   (bb-write-bytes bb (outpoint-hash outpoint))
   (bb-write-u32-le bb (outpoint-index outpoint)))
 
 (declaim (inline br-read-outpoint))
 (defun br-read-outpoint (br)
   "Read an outpoint from a byte-reader (32-byte hash + 4-byte LE index)."
+  (declare (type bl.bytes:byte-reader br) (optimize (speed 3) (safety 1)))
   (make-outpoint :hash (br-read-bytes br 32)
                  :index (br-read-u32-le br)))
 
@@ -73,6 +83,7 @@ SEQUENCE: Sequence number for replacement/locktime."
 (declaim (inline bb-write-tx-in))
 (defun bb-write-tx-in (bb tx-in)
   "Write a transaction input into byte-buf BB."
+  (declare (type bl.bytes:byte-buf bb) (optimize (speed 3) (safety 1)))
   (bb-write-outpoint bb (tx-in-previous-output tx-in))
   (let ((script (tx-in-script-sig tx-in)))
     (bb-write-varint bb (length script))
@@ -82,6 +93,7 @@ SEQUENCE: Sequence number for replacement/locktime."
 (declaim (inline br-read-tx-in))
 (defun br-read-tx-in (br)
   "Read a transaction input from a byte-reader."
+  (declare (type bl.bytes:byte-reader br) (optimize (speed 3) (safety 1)))
   (make-tx-in :previous-output (br-read-outpoint br)
               :script-sig (br-read-var-bytes br)
               :sequence (br-read-u32-le br)))
@@ -125,6 +137,7 @@ SCRIPT-PUBKEY: Locking script."
 (declaim (inline bb-write-tx-out))
 (defun bb-write-tx-out (bb tx-out)
   "Write a transaction output into byte-buf BB."
+  (declare (type bl.bytes:byte-buf bb) (optimize (speed 3) (safety 1)))
   (bb-write-i64-le bb (tx-out-value tx-out))
   (let ((script (tx-out-script-pubkey tx-out)))
     (bb-write-varint bb (length script))
@@ -133,6 +146,7 @@ SCRIPT-PUBKEY: Locking script."
 (declaim (inline br-read-tx-out))
 (defun br-read-tx-out (br)
   "Read a transaction output from a byte-reader."
+  (declare (type bl.bytes:byte-reader br) (optimize (speed 3) (safety 1)))
   (make-tx-out :value (br-read-i64-le br)
                :script-pubkey (br-read-var-bytes br)))
 
@@ -202,6 +216,7 @@ Returns a list of byte vectors."
 
 (defun br-read-witness-stack (br)
   "Read a single witness stack (one input's worth) from a byte-reader."
+  (declare (type bl.bytes:byte-reader br) (optimize (speed 3) (safety 1)))
   (let ((item-count (br-read-compact-size br)))
     (loop repeat item-count
           collect (br-read-var-bytes br))))
@@ -211,6 +226,7 @@ Returns a list of byte vectors."
 format by checking for marker byte 0x00 where the input count would be.
 Hot path: called per tx during block parsing — index-based reads avoid
 flexi-streams' Gray-stream input dispatch."
+  (declare (type bl.bytes:byte-reader br) (optimize (speed 3) (safety 1)))
   (let* ((version (br-read-i32-le br))
          (marker (br-read-u8 br)))
     (if (zerop marker)
@@ -363,6 +379,7 @@ Used for txid computation."
 
 (defun bb-write-transaction-legacy (bb tx)
   "Write transaction TX into byte-buf BB in legacy format (no witness)."
+  (declare (type bl.bytes:byte-buf bb) (optimize (speed 3) (safety 1)))
   (bb-write-i32-le bb (transaction-version tx))
   (let ((inputs (transaction-inputs tx)))
     (bb-write-varint bb (length inputs))
@@ -500,6 +517,7 @@ NONCE: Proof-of-work nonce."
 (declaim (inline br-read-block-header))
 (defun br-read-block-header (br)
   "Read a block header from a byte-reader (80 bytes)."
+  (declare (type bl.bytes:byte-reader br) (optimize (speed 3) (safety 1)))
   (make-block-header :version (br-read-i32-le br)
                      :prev-block (br-read-bytes br 32)
                      :merkle-root (br-read-bytes br 32)
@@ -519,6 +537,7 @@ NONCE: Proof-of-work nonce."
 (declaim (inline bb-write-block-header))
 (defun bb-write-block-header (bb header)
   "Write an 80-byte block header into byte-buf BB."
+  (declare (type bl.bytes:byte-buf bb) (optimize (speed 3) (safety 1)))
   (bb-write-i32-le bb (block-header-version header))
   (bb-write-bytes bb (block-header-prev-block header))
   (bb-write-bytes bb (block-header-merkle-root header))
@@ -562,6 +581,7 @@ TRANSACTIONS: List of transactions in the block."
 
 (defun br-read-bitcoin-block (br)
   "Read a complete block from a byte-reader. Hot path (per inbound block)."
+  (declare (type bl.bytes:byte-reader br) (optimize (speed 3) (safety 1)))
   (let* ((header (br-read-block-header br))
          (tx-count (br-read-compact-size br))
          (transactions (loop repeat tx-count collect (br-read-transaction br))))

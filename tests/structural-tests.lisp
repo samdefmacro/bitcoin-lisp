@@ -150,6 +150,17 @@ it hunts."
                  (when (> end start)
                    (setf (gethash (subseq src start end) refs) t))
                  (setf i start))))
+    ;; (sb-ext:define-hash-table-test TEST HASH) installs both functions in
+    ;; SBCL's hash-table machinery by name: every GETHASH on such a table is
+    ;; their caller, invisible to xref.
+    (let ((i 0))
+      (loop while (setf i (search "(sb-ext:define-hash-table-test " src :start2 i))
+            do (let* ((start (+ i (length "(sb-ext:define-hash-table-test ")))
+                      (end (or (position #\) src :start start) (length src))))
+                 (dolist (name (uiop:split-string (subseq src start end) :separator " "))
+                   (when (plusp (length name))
+                     (setf (gethash name refs) t)))
+                 (setf i end))))
     ;; A DEFINE-P2P-HANDLER row installs HANDLE-<command> in the dispatch
     ;; table by symbol; the wire is its caller, and xref cannot see a funcall
     ;; through a table any more than it sees a hook. The row IS the reference.
@@ -242,7 +253,10 @@ drift cannot turn this control into a false alarm."
   (is (gethash "handle-probe"
                (%function-object-references
                 "(define-p2p-handler (\"probe\" :needs-mempool t) (p q c) nil)"))
-      "positive control: a define-p2p-handler row must count as a reference to handle-<command>")))))
+      "positive control: a define-p2p-handler row must count as a reference to handle-<command>")
+  (let ((refs (%function-object-references "#+sbcl (sb-ext:define-hash-table-test probe= probe-hash)")))
+    (is (and (gethash "probe=" refs) (gethash "probe-hash" refs))
+        "positive control: a define-hash-table-test form must count as a reference to both functions"))))))
 
 
 ;;;; ====================================================================
@@ -1092,6 +1106,37 @@ are blanked first."
         "~D reference~:P to the pseudo-network :testnet: ~S -- pass the real chain ~
 and read its prefix from chain-params" (length hits) hits)))
 
+(defun %equalp-hash-tables (&optional (corpus (%source-corpus)))
+  "Every (file . line) in CORPUS that makes a hash table with the EQUALP test
+(strings and comments blanked). Keyed by octet vectors that is the slow
+shape: bl.bytes:make-octets-hash-table is the fast one."
+  (let ((hits '()))
+    (loop for (file . lines) in corpus
+          do (let ((in-string nil))
+               (loop for raw across lines
+                     for n from 1
+                     do (multiple-value-bind (code next) (%code-only raw in-string)
+                          (setf in-string next)
+                          (when (or (search "make-hash-table :test 'equalp" code)
+                                    (search "make-hash-table :test #'equalp" code))
+                            (push (cons file n) hits))))))
+    (nreverse hits)))
+
+(defparameter +equalp-hash-table-ceiling+ 103
+  "How many EQUALP hash tables src/ may make: 111 when the second-round
+review counted them, 103 after the mempool's seven txid tables and the IBD
+block-hash tables moved to bl.bytes:make-octets-hash-table (wave E). May only fall: a new table keyed
+by hashes uses the octet test; one keyed by something else is a case to
+name here.")
+
+(test equalp-hash-tables-do-not-grow
+  "The EQUALP hash-table count over src/ may only fall; see +EQUALP-HASH-TABLE-CEILING+."
+  (let ((now (length (%equalp-hash-tables))))
+    (is (<= now +equalp-hash-table-ceiling+)
+        "~D EQUALP hash tables in src/, ceiling ~D -- a table keyed by txids, outpoint ~
+keys or sighashes wants bl.bytes:make-octets-hash-table"
+        now +equalp-hash-table-ceiling+)))
+
 (defparameter +test-internal-reference-ceiling+ 4417
   "How many package-qualified INTERNAL references (a :: token) the test
 tree may contain: 7,136 when the cleanup started. White-box tests reaching
@@ -1235,6 +1280,12 @@ the measuring functions must measure a known shape correctly."
                                   "(private-key-to-wif k :network :testnet)"
                                   "\":testnet\"")))))
       "positive control: the pseudo-network scanner must flag :testnet in code and only there")
+  (is (equal '(("probe.lisp" . 1))
+             (%equalp-hash-tables
+              (list (cons "probe.lisp"
+                          (vector "(make-hash-table :test 'equalp) ; (make-hash-table :test 'equalp)"
+                                  "\"(make-hash-table :test 'equalp)\"")))))
+      "positive control: the equalp-table scanner must see the code table and not the comment or the string")
   (is (plusp (length (%definitions-longer-than +longish-function-lines+)))
       "no long definitions found -- a sweep that finds nothing proves nothing")
   (is (equal '(("src/util/bytes.lisp" . "bitcoin-lisp.validation"))

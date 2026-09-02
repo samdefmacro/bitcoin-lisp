@@ -200,3 +200,20 @@ block hash, and per-tx witness."
              "witness tx must round-trip with witness intact")
     (is (equalp (bl.ser:serialize-witness-transaction wtx)
                 (bl.ser:serialize-witness-transaction (first rtxs))))))
+
+(test octets-hash-table-is-keyed-by-bytes
+  "bl.bytes:make-octets-hash-table looks keys up by their bytes, not their
+identity: a fresh copy of a txid finds the entry, a vector differing in the
+last byte does not, and keys shorter than the eight hashed bytes still work."
+  (let ((table (bl.bytes:make-octets-hash-table))
+        (key (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (setf (gethash key table) :found)
+    (is (eq :found (gethash (copy-seq key) table)))
+    (let ((other (copy-seq key)))
+      (setf (aref other 31) 8)
+      (is (null (gethash other table))))
+    (let ((short (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3))))
+      (setf (gethash short table) :short)
+      (is (eq :short (gethash (copy-seq short) table))))
+    (is (= (bl.bytes:octets-hash key) (bl.bytes:octets-hash (copy-seq key))))
+    (is-true (bl.bytes:octets= key (copy-seq key)))))

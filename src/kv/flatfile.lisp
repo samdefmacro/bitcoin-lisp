@@ -117,7 +117,7 @@ vector, which is the only thing SAFETY 0 would otherwise have cost us."
     ;; division. Asserted at compile time: a future non-power-of-two key size
     ;; would make LOGAND silently read the wrong key byte and corrupt every
     ;; block written after it.
-    (locally (declare (optimize (speed 3) (safety 0)))
+    (locally (declare (optimize (speed 3) (safety 1)))
       (let ((mask (load-time-value
                    (progn
                      (assert (zerop (logand +obfuscation-key-size+

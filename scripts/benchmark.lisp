@@ -14,8 +14,12 @@
 (in-package #:cl-user)
 
 (defmacro %bench (name iterations &body body)
-  "Time ITERATIONS of BODY and report ns/op. Returns the ns/op as a double."
-  `(let ((start (get-internal-real-time)))
+  "Time ITERATIONS of BODY and report ns/op. Returns the ns/op as a double.
+A full collection runs first: an allocating body (serialize-tx builds a
+byte-buf per iteration) otherwise measured 580 or 885 ns/op on identical
+trees, depending on whether a GC landed inside the window (observed
+2026-09-02 across six runs)."
+  `(let ((start (progn #+sbcl (sb-ext:gc :full t) (get-internal-real-time))))
      (dotimes (%i ,iterations) ,@body)
      (let* ((elapsed (/ (- (get-internal-real-time) start)
                         (float internal-time-units-per-second 1d0)))
