@@ -44,7 +44,7 @@ else the compile-time repo default."
   (or *ui-directory*
       (and *ui-default-directory* (pathname *ui-default-directory*))))
 
-(defparameter +ui-content-types+
+(alexandria:define-constant +ui-content-types+
   '(("html" . "text/html; charset=utf-8")
     ("js"   . "text/javascript; charset=utf-8")
     ("mjs"  . "text/javascript; charset=utf-8")
@@ -55,7 +55,7 @@ else the compile-time repo default."
     ("ico"  . "image/x-icon")
     ("txt"  . "text/plain; charset=utf-8")
     ("woff2" . "font/woff2"))
-  "Content-Type by file extension for /ui/ assets.")
+  :test #'equalp :documentation "Content-Type by file extension for /ui/ assets.")
 
 (defun %ui-safe-segment-p (segment)
   "T when SEGMENT is a safe relative path component: non-empty, does not
@@ -153,8 +153,7 @@ are logged and never signal: a headless box just keeps starting."
   (let ((url (format nil "http://localhost:~D/ui/" port)))
     (handler-case
         (let ((command (cond ((uiop:os-macosx-p) (list "open" url))
-                             ((uiop:os-unix-p) (list "xdg-open" url))
-                             (t nil))))
+                             ((uiop:os-unix-p) (list "xdg-open" url)))))
           (cond
             (command
              (uiop:launch-program command)

@@ -53,7 +53,7 @@ BIP324Cipher(key, ent32) constructor). Returns NIL if PRIVKEY is invalid."
 
 (defun bip324-cipher-initialized-p (cipher)
   "T once initialize has derived the session keys (Core's operator bool)."
-  (not (null (bip324-cipher-send-l cipher))))
+  (and (bip324-cipher-send-l cipher) t))
 
 (defun bip324-cipher-initialize (cipher their-ell64 initiating magic
                                  &key self-decrypt)

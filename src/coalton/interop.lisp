@@ -123,7 +123,7 @@
   (:export
    #:*script-execution-cache-enabled*
    #:*tapscript-codesep-pos*
-   #:+signature-cache-max-entries+
+   #:*signature-cache-max-entries*
    #:make-script-execution-cache-key
    #:script-execution-cache-store
    #:script-execution-cached-p))
@@ -440,7 +440,7 @@ INPUTS may be any sequence (struct field vector or an ad-hoc list)."
 ;;; Caches successful ECDSA and Schnorr verifications to avoid re-verification
 ;;; when the same signature is checked during mempool acceptance and block validation.
 
-(defparameter +signature-cache-max-entries+ 65536
+(defvar *signature-cache-max-entries* 65536
   "Maximum entries per signature-cache generation. When the current
    generation fills, it becomes the previous generation and the oldest
    is dropped (sig-cache-store), so total entries are bounded at 2x
@@ -544,7 +544,7 @@ promoted into the current one."
         (setf (gethash key *signature-cache*) t))))
 
 (defun sig-cache-store (key)
-  (when (>= (hash-table-count *signature-cache*) +signature-cache-max-entries+)
+  (when (>= (hash-table-count *signature-cache*) *signature-cache-max-entries*)
     (setf *signature-cache-prev* *signature-cache*
           *signature-cache* (%make-sig-cache-table)))
   (setf (gethash key *signature-cache*) t))
@@ -601,7 +601,7 @@ carry no script flags; see the note there."
 ;;; the signature cache — the whole point of the entry is "these scripts
 ;;; SUCCEEDED under these rules", and the rules change at soft-fork heights.
 
-(defparameter +script-execution-cache-max-entries+ 65536
+(defconstant +script-execution-cache-max-entries+ 65536
   "Per-generation cap, rotated exactly as the signature cache is.")
 
 (defvar *script-execution-cache* (%make-sig-cache-table)
@@ -1489,9 +1489,7 @@ CScript::GetOp returning false."
            (let ((n 0))
              (dotimes (k size-bytes)
                (setf n (logior n (ash (aref script (+ p k)) (* 8 k)))))
-             (setf p (+ p size-bytes n)))))
-        ;; Everything else is a bare opcode.
-        (t nil))
+             (setf p (+ p size-bytes n))))))
       (if (> p len)
           nil                                     ; truncated push payload
           p))))
@@ -1869,8 +1867,7 @@ truncate scripts ending in a malformed push."
        (member (aref pubkey-bytes 0) '(#x02 #x03)))
       ((= len 65)
        ;; Uncompressed: must start with 0x04 (reject hybrid 0x06, 0x07)
-       (= (aref pubkey-bytes 0) #x04))
-      (t nil))))
+       (= (aref pubkey-bytes 0) #x04)))))
 
 (defun check-der-integer-encoding (bytes start)
   "Check if an integer at position START in BYTES is properly DER encoded.
@@ -2143,7 +2140,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 
 (defun last-checksig-had-strictenc-error-p ()
   "Returns T if the last checksig had a STRICTENC/DERSIG validation error."
-  (not (null *last-checksig-error*)))
+  (and *last-checksig-error* t))
 
 ;;; ============================================================
 ;;; CHECKMULTISIG Support
@@ -2162,8 +2159,7 @@ acceptable (or the flags are off)."
     ((and *witness-v0-mode*
           (flag-enabled-p "WITNESS_PUBKEYTYPE")
           (not (is-compressed-pubkey-p pubkey-bytes)))
-     :witness-pubkeytype)
-    (t nil)))
+     :witness-pubkeytype)))
 
 (defun verify-checkmultisig (sigs pubkeys script-pubkey)
   "Verify m-of-n multisig. SIGS and PUBKEYS are lists of byte arrays.
@@ -2272,7 +2268,7 @@ acceptable (or the flags are off)."
 
 (defun last-checkmultisig-had-error-p ()
   "Returns T if the last CHECKMULTISIG had a validation error."
-  (not (null *last-checkmultisig-error*)))
+  (and *last-checkmultisig-error* t))
 
 (defun script-number-to-int (bytes)
   "Convert script number bytes to integer. Empty = 0."

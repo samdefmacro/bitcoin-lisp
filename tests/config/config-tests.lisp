@@ -1055,26 +1055,26 @@ even at the REPL without a restart.
 
 Fee rates arrive as BTC/kvB on the command line, as every other Core fee option
 does, and are stored as satoshis."
-  (let ((saved (list bl.val:+dust-relay-fee-rate+
-                     bl.mp:+incremental-relay-fee-rate+
-                     bl.mp:+bytes-per-sigop+)))
+  (let ((saved (list bl.val:*dust-relay-fee-rate*
+                     bl.mp:*incremental-relay-fee-rate*
+                     bl.mp:*bytes-per-sigop*)))
     (unwind-protect
          (progn
            (bl::apply-config-globals
             '(("dustrelayfee" . "0.00004")
               ("incrementalrelayfee" . "0.00002")
               ("bytespersigop" . "40")))
-           (is (= 4000 bl.val:+dust-relay-fee-rate+))
-           (is (= 2000 bl.mp:+incremental-relay-fee-rate+))
-           (is (= 40 bl.mp:+bytes-per-sigop+))
+           (is (= 4000 bl.val:*dust-relay-fee-rate*))
+           (is (= 2000 bl.mp:*incremental-relay-fee-rate*))
+           (is (= 40 bl.mp:*bytes-per-sigop*))
            ;; And the sigop-adjusted size actually uses the new value, which is
            ;; the point — a knob nothing reads is the failure this repo keeps
            ;; finding.
            (is (= (ceiling (* 3 40) 4)
                   (bl.mp:sigop-adjusted-vsize 1 3))))
-      (setf bl.val:+dust-relay-fee-rate+ (first saved)
-            bl.mp:+incremental-relay-fee-rate+ (second saved)
-            bl.mp:+bytes-per-sigop+ (third saved))))
+      (setf bl.val:*dust-relay-fee-rate* (first saved)
+            bl.mp:*incremental-relay-fee-rate* (second saved)
+            bl.mp:*bytes-per-sigop* (third saved))))
   ;; Malformed values are refused, not silently ignored.
   (dolist (bad '((("dustrelayfee" . "notanumber"))
                  (("incrementalrelayfee" . "x"))
@@ -1089,8 +1089,8 @@ does, and are stored as satoshis."
 (test validation-resource-knobs-take-effect
   "Track D's Validation & resources group over knobs that already existed as
 constants. Each asserts the EFFECT, not the assignment."
-  (let ((saved (list bl.net:+max-tip-age-seconds+
-                     bl.interop:+signature-cache-max-entries+
+  (let ((saved (list bl.net:*max-tip-age-seconds*
+                     bl.interop:*signature-cache-max-entries*
                      bl.store:*fast-prune*
                      bl.store:*blocks-xor*)))
     (unwind-protect
@@ -1100,11 +1100,11 @@ constants. Each asserts the EFFECT, not the assignment."
               ("fastprune" . "1") ("blocksxor" . "0")))
            ;; -maxtipage: how old the tip may be before the node still calls
            ;; itself in IBD (Core DEFAULT_MAX_TIP_AGE).
-           (is (= 3600 bl.net:+max-tip-age-seconds+))
+           (is (= 3600 bl.net:*max-tip-age-seconds*))
            ;; -maxsigcachesize is MiB; a cache entry is a 32-byte key, which is
            ;; what Core's CuckooCache element is too.
            (is (= (floor (* 4 1024 1024) 32)
-                  bl.interop:+signature-cache-max-entries+))
+                  bl.interop:*signature-cache-max-entries*))
            ;; -fastprune changes the ROLLOVER threshold, which is the whole
            ;; point: 64 KiB instead of 128 MiB (blockstorage.cpp:858).
            (is-true bl.store:*fast-prune*)
@@ -1115,8 +1115,8 @@ constants. Each asserts the EFFECT, not the assignment."
            (is (= (1+ (* 200 1024))
                   (bl.store:max-blockfile-size (* 200 1024))))
            (is-false bl.store:*blocks-xor*))
-      (setf bl.net:+max-tip-age-seconds+ (first saved)
-            bl.interop:+signature-cache-max-entries+ (second saved)
+      (setf bl.net:*max-tip-age-seconds* (first saved)
+            bl.interop:*signature-cache-max-entries* (second saved)
             bl.store:*fast-prune* (third saved)
             bl.store:*blocks-xor* (fourth saved))))
   ;; Default: the full 128 MiB rollover.
@@ -1566,23 +1566,23 @@ over budget from the first message."
 
 (test p2p-config-knobs-take-effect
   "Track D's P2P group, the two options that map onto existing constants."
-  (let ((saved (list bl:+handshake-timeout-seconds+
-                     bl.net:+max-send-buffer-bytes+)))
+  (let ((saved (list bl:*handshake-timeout-seconds*
+                     bl.net:*max-send-buffer-bytes*)))
     (unwind-protect
          (progn
            (bl::apply-config-globals
             '(("peertimeout" . "90") ("maxsendbuffer" . "2000")))
-           (is (= 90 bl:+handshake-timeout-seconds+))
+           (is (= 90 bl:*handshake-timeout-seconds*))
            ;; Core's -maxsendbuffer is in KILOBYTES and it multiplies by 1000,
            ;; NOT 1024 (init.cpp:2105). Using 1024 here would silently give
            ;; every operator a 2.4% larger buffer than they asked for.
-           (is (= 2000000 bl.net:+max-send-buffer-bytes+)))
-      (setf bl:+handshake-timeout-seconds+ (first saved)
-            bl.net:+max-send-buffer-bytes+ (second saved))))
+           (is (= 2000000 bl.net:*max-send-buffer-bytes*)))
+      (setf bl:*handshake-timeout-seconds* (first saved)
+            bl.net:*max-send-buffer-bytes* (second saved))))
   ;; The handshake default is Core's 60, not the 30 it used to be: a peer on a
   ;; slow link that Core would keep, we dropped — and re-dialling costs more
   ;; than waiting.
-  (is (= 60 bl:+handshake-timeout-seconds+))
+  (is (= 60 bl:*handshake-timeout-seconds*))
   (dolist (bad '((("peertimeout" . "0")) (("maxsendbuffer" . "-1"))
                  (("maxsendbuffer" . "x"))))
     (signals error (bl::apply-config-globals bad)))
@@ -1648,7 +1648,7 @@ EFFECT — a freshly made wallet manager's keypool size, and the directory
 WALLETS-DIRECTORY hands back — rather than through the variable, because the
 keypool size is read as a struct slot DEFAULT and a test on the variable alone
 would pass even if no struct ever consulted it."
-  (let ((saved-keypool bl.wallet:+default-keypool-size+)
+  (let ((saved-keypool bl.wallet:*default-keypool-size*)
         (saved-dir bl.wallet:*wallet-directory*))
     (unwind-protect
          (progn
@@ -1670,7 +1670,7 @@ would pass even if no struct ever consulted it."
               '(("walletdir" . "/srv/keys")))
              (is (equal #p"/srv/keys/"
                         (bl.wallet::wallets-directory manager)))))
-      (setf bl.wallet:+default-keypool-size+ saved-keypool
+      (setf bl.wallet:*default-keypool-size* saved-keypool
             bl.wallet:*wallet-directory* saved-dir)))
   ;; Core rejects -keypool=0; so do we, rather than making an unusable wallet.
   (dolist (bad '((("keypool" . "0")) (("keypool" . "-1")) (("keypool" . "x"))))

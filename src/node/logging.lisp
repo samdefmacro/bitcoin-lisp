@@ -42,8 +42,7 @@ and the unit tests expect."
           (log-file log-file)
           (data-directory
            (let ((dir (net-dir)))
-             (namestring (merge-pathnames "debug.log" dir))))
-          (t nil))))
+             (namestring (merge-pathnames "debug.log" dir)))))))
 
 ;;;; Logging (macros and core functions defined in logging.lisp)
 

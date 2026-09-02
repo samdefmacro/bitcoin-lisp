@@ -459,8 +459,8 @@ salted and hashed at install time (InitRPCAuthentication, httprpc.cpp:275-287)
 and the password itself is then discarded rather than held in a global for the
 node's lifetime.")
 
-(defparameter +rpc-cookie-user+ "__cookie__"
-  "Username in the .cookie file (Bitcoin Core convention).")
+(alexandria:define-constant +rpc-cookie-user+ "__cookie__"
+  :test #'equalp :documentation "Username in the .cookie file (Bitcoin Core convention).")
 
 (defvar *rpc-cookie-path* nil
   "Path of the .cookie file this process generated, so shutdown can remove it

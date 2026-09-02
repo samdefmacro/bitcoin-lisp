@@ -51,16 +51,16 @@ network is :torv3, Core CNode::m_inbound_onion)."
   "Open the listening socket and spawn the accept thread. No-op (logged) if the
 port can't be bound."
   (let ((sock (bl.net:open-listener bind (listen-port (node-network node)))))
-    (if (null sock)
-        (log-warn "Inbound listening disabled: could not bind ~A:~D"
-                  bind (listen-port (node-network node)))
+    (if sock
         (progn
           (setf (node-listener-socket node) sock)
           (setf (node-listener-thread node)
                 (bt:make-thread (lambda () (run-inbound-listener node))
                                 :name "bitcoin-inbound-listener"))
           (log-info "Listening for inbound peers on ~A:~D"
-                    bind (listen-port (node-network node)))))))
+                    bind (listen-port (node-network node))))
+        (log-warn "Inbound listening disabled: could not bind ~A:~D"
+                  bind (listen-port (node-network node))))))
 
 (defun onion-listen-port (node)
   "The local port Tor forwards inbound onion connections to: the listen
@@ -77,12 +77,12 @@ runs, matching Core, where a failed onion bind and the control thread are
 independent."
   (let* ((port (onion-listen-port node))
          (sock (bl.net:open-listener "127.0.0.1" port)))
-    (if (null sock)
-        (log-warn "Onion inbound listening disabled: could not bind 127.0.0.1:~D" port)
+    (if sock
         (progn
           (setf (node-onion-listener-socket node) sock)
           (setf (node-onion-listener-thread node)
                 (bt:make-thread (lambda ()
                                   (run-inbound-listener node :socket sock :onion t))
                                 :name "bitcoin-onion-listener"))
-          (log-info "Listening for inbound onion peers on 127.0.0.1:~D" port)))))
+          (log-info "Listening for inbound onion peers on 127.0.0.1:~D" port))
+        (log-warn "Onion inbound listening disabled: could not bind 127.0.0.1:~D" port))))

@@ -167,7 +167,7 @@ HANDLE-MESSAGE, and an unknown command answers NIL."
 (test handshake-timeout-disconnect-when-expired
   "Peers that exceeded handshake timeout should be flagged for disconnect."
   (let* ((past-time (- (get-internal-real-time)
-                       (* (1+ bl:+handshake-timeout-seconds+)
+                       (* (1+ bl:*handshake-timeout-seconds*)
                           internal-time-units-per-second)))
          (peer (bl.net:make-peer
                 :state :handshaking
@@ -316,7 +316,7 @@ serialize.h:32) — the old 1 MiB cap broke submitblock for mainnet blocks."
   ;; Constants
   (is (> bl:+max-message-payload+ 0))
   (is (> bl:+max-rpc-body-size+ 0))
-  (is (> bl:+handshake-timeout-seconds+ 0)))
+  (is (> bl:*handshake-timeout-seconds* 0)))
 
 ;;;; ============================================================
 ;;;; Discouragement (soft-ban) Tests

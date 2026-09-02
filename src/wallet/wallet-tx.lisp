@@ -910,8 +910,7 @@ Returns the newly-marked addresses."
                                    wallet address "" "receive"))))))))))
          (wallet-add-to-wallet wallet tx state :rescanning rescanning
                                                :block-time block-time)
-         t)
-        (t nil)))))
+         t)))))
 
 (defun wallet-sync-transaction (wallet tx state &key (update t) rescanning
                                                      block-time)
@@ -1445,14 +1444,14 @@ deliberately NO whole-scan guard on the index's sync height — Core has none,
 our index can legitimately contain holes below its best marker, and 'no filter
 => read the block' is already the safe direction."
   (let ((filter (bl.store:blockfilterindex-get-filter bfi block-hash)))
-    (if (null filter)
-        :unknown
+    (if filter
         (multiple-value-bind (k0 k1)
             (bl.store:block-filter-siphash-keys block-hash)
           (if (bl.store:gcs-filter-match-any
                filter k0 k1 (rescan-filter-scripts rf))
               :match
-              :no-match)))))
+              :no-match))
+        :unknown)))
 
 (defun scan-for-wallet-transactions (node wallet start-hash start-height
                                      &key max-height (update t) save-progress)
@@ -1632,8 +1631,7 @@ caller holds the rescan reservation."
         (when entry
           (setf start-entry-hash (bl.store:block-index-entry-hash entry)
                 start-entry-height (bl.store:block-index-entry-height entry)))))
-    (if (null start-entry-hash)
-        start-time
+    (if start-entry-hash
         (multiple-value-bind (status last-height last-hash)
             (scan-for-wallet-transactions node wallet start-entry-hash
                                           start-entry-height :update update)
@@ -1645,7 +1643,8 @@ caller holds the rescan reservation."
                 (let ((chain-state (bl:node-current-chainstate node)))
                   (+ (%entry-chain-time-max chain-state start-entry-hash)
                      +wallet-timestamp-window+ 1)))
-              start-time)))))
+              start-time))
+        start-time)))
 
 (defun wallet-attach-chain (node wallet)
   "Port of CWallet::AttachChain's catch-up (wallet.cpp:3171): find the fork

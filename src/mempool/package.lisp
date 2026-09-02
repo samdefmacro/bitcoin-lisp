@@ -268,8 +268,8 @@ src/mempool/.")
   ;; Reached from another package with :: before the second-round review
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export
-   #:+bytes-per-sigop+
-   #:+incremental-relay-fee-rate+
+   #:*bytes-per-sigop*
+   #:*incremental-relay-fee-rate*
    #:mempool-max-size
    #:mempool-tx-or-ancestor-signals-rbf-p
    #:orphan-announcement-peer

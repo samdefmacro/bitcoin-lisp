@@ -34,10 +34,10 @@ background validation)."
   recent-rejects
   historical-chainstate) ; assumeutxo background-validation chainstate
 
-(defparameter +node-context-slots+
+(alexandria:define-constant +node-context-slots+
   '("CHAIN-STATE" "UTXO-SET" "BLOCK-STORE" "MEMPOOL" "PEERS" "FEE-ESTIMATOR"
     "ADDRESS-BOOK" "RECENT-REJECTS" "HISTORICAL-CHAINSTATE")
-  "The slot names WITH-NODE-CONTEXT accepts; a misspelling is a macroexpansion
+  :test #'equalp :documentation "The slot names WITH-NODE-CONTEXT accepts; a misspelling is a macroexpansion
 error rather than an undefined accessor at run time.")
 
 (defmacro with-node-context ((&rest slots) context &body body)

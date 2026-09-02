@@ -64,12 +64,12 @@ A disabled index ignores writes and reads and holds no DB handle."
   "Return (values encoded-filter filter-header) for BLOCK-HASH, or
 (values nil nil) if the block is not indexed."
   (let ((db (blockfilterindex-db bfi)))
-    (if (null db)
-        (values nil nil)
+    (if db
         (let ((rec (leveldb-get db (%bfi-filter-key block-hash))))
           (if (and rec (>= (length rec) 32))
               (values (subseq rec 32) (subseq rec 0 32))
-              (values nil nil))))))
+              (values nil nil)))
+        (values nil nil))))
 
 (defun blockfilterindex-get-filter (bfi block-hash)
   "Return the encoded basic filter bytes for BLOCK-HASH, or NIL."
@@ -82,7 +82,8 @@ A disabled index ignores writes and reads and holds no DB handle."
 (defun blockfilterindex-has-block-p (bfi block-hash)
   "T if BLOCK-HASH has an indexed filter."
   (and (blockfilterindex-db bfi)
-       (not (null (leveldb-get (blockfilterindex-db bfi) (%bfi-filter-key block-hash))))))
+       (leveldb-get (blockfilterindex-db bfi) (%bfi-filter-key block-hash))
+       t))
 
 (defun blockfilterindex-best (bfi)
   "Return (values height hash) of the highest indexed block, or (values -1 nil).

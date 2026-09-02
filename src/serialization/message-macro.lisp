@@ -44,8 +44,7 @@ otherwise (lists, booleans)."
               (equal (second slot-type) '(unsigned-byte 8)))
          (let ((n (first (third slot-type))))
            `(make-array ,(if (integerp n) n 0) :element-type '(unsigned-byte 8)
-                                                :initial-element 0)))
-        (t nil)))
+                                                :initial-element 0)))))
 
 (defun field-codec-forms (type br bb value)
   "(values slot-type read-form write-form default) for the field TYPE, with

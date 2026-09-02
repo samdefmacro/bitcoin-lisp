@@ -113,7 +113,7 @@ the orphan's full weight and latency score."
 txid may pass it 'casted' to a wtxid: for non-segwit txs txid == wtxid, and a
 false positive is impossible (Core AlreadyHaveTx's guess, txdownloadman_impl
 .cpp:126-141)."
-  (not (null (gethash wtxid (orphan-pool-by-wtxid pool)))))
+  (and (gethash wtxid (orphan-pool-by-wtxid pool)) t))
 
 (defun orphan-tx (pool wtxid)
   "The transaction for orphan WTXID, or NIL (Core GetTx)."

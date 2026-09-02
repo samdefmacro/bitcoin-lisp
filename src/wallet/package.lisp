@@ -31,7 +31,7 @@ through the lower packages; the node reaches it only through these exports.")
    #:*wallet-reject-long-chains*
    #:*wallet-signal-rbf*
    #:*wallet-spend-zero-conf-change*
-   #:+default-keypool-size+))
+   #:*default-keypool-size*))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

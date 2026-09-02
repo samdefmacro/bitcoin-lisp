@@ -231,17 +231,17 @@ very machine the operator asked to leave headroom on."
     (is (= 0 (bl.val:parse-par-threads (- (+ cores 5))))))
   ;; -par reaches the worker count AND the on/off switch: Core's -par=1 means
   ;; no extra threads at all, which is not the same as "one worker".
-  (let ((saved-n bl.val:+parallel-validation-workers+)
+  (let ((saved-n bl.val:*parallel-validation-workers*)
         (saved-p bl:*parallel-block-validation*))
     (unwind-protect
          (progn
            (bl::apply-config-globals '(("par" . "3")))
-           (is (= 3 bl.val:+parallel-validation-workers+))
+           (is (= 3 bl.val:*parallel-validation-workers*))
            (is-true bl:*parallel-block-validation*)
            (bl::apply-config-globals '(("par" . "1")))
            (is-false bl:*parallel-block-validation*
                      "-par=1 must disable the extra threads, as Core's does"))
-      (setf bl.val:+parallel-validation-workers+ saved-n
+      (setf bl.val:*parallel-validation-workers* saved-n
             bl:*parallel-block-validation* saved-p)))
   (is-true (bl:known-config-option-p "par"))
   (is-false (bl.cfg:core-only-option-p "par")))
@@ -1580,7 +1580,7 @@ then are promoted and survive a second rotation, untouched ones age out."
           (bl.interop::%make-sig-cache-table))
         (bl.interop:*signature-cache-prev*
           (bl.interop::%make-sig-cache-table))
-        (bl.interop:+signature-cache-max-entries+ 4))
+        (bl.interop:*signature-cache-max-entries* 4))
     (loop for n from 1 to 4
           do (bl.interop::sig-cache-store (%sig-key n)))
     ;; 5th store rotates: prev = {1..4}, cur = {5}

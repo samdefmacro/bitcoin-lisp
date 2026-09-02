@@ -127,7 +127,7 @@ init.cpp, node/. src/node/.")
    #:*rpc-rate-limit*
    #:+max-message-payload+
    #:+max-rpc-body-size+
-   #:+handshake-timeout-seconds+
+   #:*handshake-timeout-seconds*
    #:*recent-rejects-max-size*
    ;; Node
    #:node

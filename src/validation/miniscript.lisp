@@ -32,12 +32,12 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
-(defparameter +mst-bits+
+(alexandria:define-constant +mst-bits+
   '((#\B . 0) (#\V . 1) (#\K . 2) (#\W . 3)
     (#\z . 4) (#\o . 5) (#\n . 6) (#\d . 7) (#\u . 8) (#\e . 9)
     (#\f . 10) (#\s . 11) (#\m . 12) (#\x . 13)
     (#\g . 14) (#\h . 15) (#\i . 16) (#\j . 17) (#\k . 18))
-  "Core's bit assignment for each type letter (miniscript.h:159-188). The exact
+  :test #'equalp :documentation "Core's bit assignment for each type letter (miniscript.h:159-188). The exact
 values do not escape this file, but keeping Core's makes the two diffable.")
 
 (defun mst (string)

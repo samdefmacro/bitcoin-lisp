@@ -69,8 +69,7 @@ enough to contain one there. Both halves must be known, and an unknown one is a
 fatal init error — the option silently doing nothing is how an operator ends up
 staring at a log that will never contain what they asked for."
   (let ((colon (position #\: value :start (min 3 (length value)))))
-    (if (null colon)
-        (values nil (conf-parse-loglevel value))
+    (if colon
         (let ((category (string-downcase (subseq value 0 colon)))
               (level (subseq value (1+ colon))))
           (unless (and (bl.log:log-category-known-p category)
@@ -80,7 +79,8 @@ staring at a log that will never contain what they asked for."
             (config-error "Unsupported category-specific logging level -loglevel=~A. ~
 Expected -loglevel=<category>:<loglevel>. Valid categories: ~A. ~
 Valid loglevels: info, debug, trace." value (log-categories-string)))
-          (values category (conf-parse-loglevel level))))))
+          (values category (conf-parse-loglevel level)))
+        (values nil (conf-parse-loglevel value)))))
 
 (defun conf-parse-loglevel-global (value)
   "The GLOBAL threshold a -loglevel value implies, or NIL when it names a
@@ -175,15 +175,15 @@ is all digits after a single colon, so a bare IPv6 address is host-only
       ;; [ipv6]:port or [ipv6]
       ((char= (char v 0) #\[)
        (let ((close (position #\] v)))
-         (if (null close)
-             (values v +default-proxy-port+)
+         (if close
              (let ((host (subseq v 1 close))
                    (rest (subseq v (1+ close))))
                (if (and (plusp (length rest)) (char= (char rest 0) #\:)
                         (plusp (length (subseq rest 1)))
                         (every #'digit-char-p (subseq rest 1)))
                    (values host (parse-integer rest :start 1))
-                   (values host +default-proxy-port+))))))
+                   (values host +default-proxy-port+)))
+             (values v +default-proxy-port+))))
       (t
        (let ((colon (position #\: v :from-end t)))
          (if (and colon
@@ -262,8 +262,7 @@ Core: `[::1]:8333` has a port, `::1` does not."
                (cond ((zerop (length rest)) (values host nil onion-p))
                      ((and (char= (char rest 0) #\:)
                            (%parse-port (subseq rest 1)))
-                      (values host (%parse-port (subseq rest 1)) onion-p))
-                     (t nil))))
+                      (values host (%parse-port (subseq rest 1)) onion-p)))))
             ;; An unbracketed value with exactly one colon is host:port; more
             ;; than one colon is a bare IPv6 literal, never host:port.
             (t

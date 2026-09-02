@@ -23,7 +23,7 @@ soft-set to DEFAULT_BLOCKSONLY_MAX_MEMPOOL_SIZE_MB (5) under -blocksonly, since
 a node that does not relay transactions has no reason to hold 300 MB of them
 (init.cpp:826). Read by MAKE-MEMPOOL.")
 
-(defparameter +incremental-relay-fee-rate+ 100
+(defvar *incremental-relay-fee-rate* 100
   "Incremental relay fee in satoshis per kvB (Bitcoin Core
 DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB = 0.1 sat/vB): BIP125 rule 4
 pricing, the eviction rolling-fee bump, and the floor below which a decayed
@@ -120,7 +120,7 @@ time, like the cluster limits.")
   ;; must explicitly remove it. NIL until the entry is added.
   (graph-handle nil :type (or null tx-handle)))
 
-(defparameter +bytes-per-sigop+ 20
+(defvar *bytes-per-sigop* 20
   "Equivalent bytes charged per weighted sigop in the sigop-adjusted
 transaction size (Bitcoin Core DEFAULT_BYTES_PER_SIGOP, policy.h:49), settable
 with -bytespersigop.
@@ -134,7 +134,7 @@ BIP141 vsize, is Core's mempool-entry size (CTxMemPoolEntry::GetTxSize):
 it prices into the fee floor, RBF rules, TRUC caps, cluster limits, and
 chunk feerates the transactions whose cost to the network is validation
 work rather than bytes."
-  (ceiling (max weight (* sigops +bytes-per-sigop+)) 4))
+  (ceiling (max weight (* sigops *bytes-per-sigop*)) 4))
 
 ;;;; Modeled dynamic memory usage (Core DynamicMemoryUsage)
 ;;;;
@@ -483,7 +483,7 @@ zero (txmempool.cpp:845-848)."
                                 (floor +rolling-fee-halflife-seconds+ 2))
                                (t +rolling-fee-halflife-seconds+)))
                (decayed (floor (* rolling (expt 0.5d0 (/ age halflife))))))
-          (cond ((< decayed (floor +incremental-relay-fee-rate+ 2))
+          (cond ((< decayed (floor *incremental-relay-fee-rate* 2))
                  (setf (mempool-rolling-min-fee-rate mempool) 0)
                  0)
                 (t decayed))))))
@@ -612,7 +612,7 @@ Nested batches verify only at the outermost exit."
 
 (defun mempool-has (mempool txid)
   "Check if a transaction is in the mempool."
-  (not (null (gethash txid (mempool-entries mempool)))))
+  (and (gethash txid (mempool-entries mempool)) t))
 
 (defun mempool-get (mempool txid)
   "Get a mempool entry by txid. Returns the entry or NIL."
@@ -1072,10 +1072,10 @@ behind."
 
 ;;;; Replace-by-fee (BIP125)
 
-(defparameter +max-bip125-rbf-sequence+ #xfffffffd
+(defconstant +max-bip125-rbf-sequence+ #xfffffffd
   "An input signals opt-in RBF when its nSequence is <= this value.")
 
-(defparameter +max-rbf-replacement-candidates+ 100
+(defconstant +max-rbf-replacement-candidates+ 100
   "Cluster-mempool rule 5: a replacement may conflict directly with at most
 this many distinct CLUSTERS (Core MAX_REPLACEMENT_CANDIDATES, policy/rbf.h:26;
 rbf.cpp:58-83 counts clusters, not transactions, since cluster mempool). The
@@ -1177,7 +1177,7 @@ the incremental relay fee rate — 0.1 sat/vB, not the 1 sat/vB relay floor
 (rule 4)."
   (and (>= new-fee orig-fees)
        (>= (- new-fee orig-fees)
-           (ceiling (* new-vsize +incremental-relay-fee-rate+) 1000))))
+           (ceiling (* new-vsize *incremental-relay-fee-rate*) 1000))))
 
 (defun %rbf-diagram-verdict (old-diagram new-diagram)
   "The economic verdict on a staged replacement's before/after diagrams:
@@ -1708,7 +1708,7 @@ the incremental relay fee, so newcomers must beat what was just trimmed
                  ;; relay fee (txmempool.cpp:870-878).
                  (let ((rate (+ (truncate (* (feefrac-fee feerate) 1000)
                                           (feefrac-size feerate))
-                                +incremental-relay-fee-rate+)))
+                                *incremental-relay-fee-rate*)))
                    (when (> rate (mempool-rolling-min-fee-rate mempool))
                      (setf (mempool-rolling-min-fee-rate mempool) rate
                            (mempool-rolling-min-fee-time mempool)

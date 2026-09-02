@@ -70,6 +70,7 @@
   (@mining section)
   (@rpc-methods section)
   (@wallet section)
+  (@zmq section)
   (@node section))
 
 (defsection @util (:title "util: the chain-agnostic base")
@@ -473,7 +474,7 @@
   and compact blocks outside unit tests). A peer's traffic is metered by
   the token bucket per message class, then discouraged, then
   disconnected. Outbound eclipse resistance rotates the extra outbound
-  slot on a stale tip (`+max-tip-age-seconds+` is Core's
+  slot on a stale tip (`*max-tip-age-seconds*` is Core's
   nPowTargetSpacing * 3).
 
   Traps: `getheaders` must send the locator of the LAST header the peer
@@ -498,7 +499,7 @@
   (bitcoin-lisp.networking:discourage-peer function)
   (bitcoin-lisp.networking:ban-address function)
   (bitcoin-lisp.networking:*default-ban-time-seconds* variable)
-  (bitcoin-lisp.networking:+max-tip-age-seconds+ variable))
+  (bitcoin-lisp.networking:*max-tip-age-seconds* variable))
 
 (defsection @rpc-server (:title "rpc-server: JSON-RPC over HTTP")
   "Compiled as `bitcoin-lisp/rpc-server`, without a single method. Core:
@@ -719,6 +720,35 @@
   (bitcoin-lisp.wallet:wallets-maybe-resend function)
   (bitcoin-lisp.wallet::wallet-for-request function)
   (bitcoin-lisp.wallet::*rpc-wallet-name* variable))
+
+(defsection @zmq (:title "zmq: the notification sockets")
+  "`src/zmq.lisp`. Core: `zmq/zmqnotificationinterface.cpp`,
+  `zmq/zmqpublishnotifier.cpp`. Five PUB sockets -- hashblock, hashtx,
+  rawblock, rawtx, sequence -- each bound by its own `-zmqpub<topic>`
+  option, each message the topic, the body and a per-topic sequence
+  counter. libzmq is loaded lazily, only when a `-zmqpub*` option is set,
+  so a host without it runs the node with ZMQ off.
+
+  Invariants: the notifications are validation-interface hooks (see the
+  util section): BlockConnected publishes every transaction, then the
+  block and a sequence `C`; BlockDisconnected the transactions and a `D`;
+  a transaction entering the mempool its hashtx/rawtx and an `A` carrying
+  the mempool sequence, one leaving for any reason but mining an `R`. A
+  background (assumeutxo) chainstate's blocks are not announced, as Core's
+  interface returns early for ChainstateRole::BACKGROUND.
+
+  Traps: ZMQ_LINGER defaults to -1, so closing a socket with messages
+  queued for a departed subscriber blocks forever -- it is set to 0 as Core
+  does. `bitcoin-block-transactions` is a LIST, not a vector."
+  (bitcoin-lisp:zmq-start-publishers function)
+  (bitcoin-lisp:zmq-stop-publishers function)
+  (bitcoin-lisp:zmq-specs-from-config function)
+  (bitcoin-lisp:zmq-notifications-info function)
+  (bitcoin-lisp:zmq-topic-active-p function)
+  (bitcoin-lisp:zmq-notify-block-connected function)
+  (bitcoin-lisp:zmq-notify-block-disconnected function)
+  (bitcoin-lisp:zmq-notify-tx-accepted function)
+  (bitcoin-lisp:zmq-notify-tx-removed function))
 
 (defsection @node (:title "node: start-up, the sync thread, shutdown")
   "The top of the stack. Core: `init.cpp` (AppInitMain in twelve steps

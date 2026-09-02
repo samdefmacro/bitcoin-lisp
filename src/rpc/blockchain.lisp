@@ -906,9 +906,8 @@ indefinitely. Returns the tip on reaching the height, timeout, or node shutdown.
 ;;;             CompactSize(vout) + Coin (VARINT(2*height+coinbase) +
 ;;;             compressed TxOut) — the compressor module's codec.
 
-(defparameter +snapshot-magic-bytes+
-  (coerce #(#x75 #x74 #x78 #x6F #xFF) '(simple-array (unsigned-byte 8) (*)))
-  "SNAPSHOT_MAGIC_BYTES {'u','t','x','o',0xff} (node/utxo_snapshot.h:28).")
+(alexandria:define-constant +snapshot-magic-bytes+ (coerce #(#x75 #x74 #x78 #x6F #xFF) '(simple-array (unsigned-byte 8) (*)))
+  :test #'equalp :documentation "SNAPSHOT_MAGIC_BYTES {'u','t','x','o',0xff} (node/utxo_snapshot.h:28).")
 
 (defconstant +snapshot-version+ 2
   "SnapshotMetadata::VERSION (node/utxo_snapshot.h:46).")
@@ -2239,13 +2238,13 @@ Re-derives the block's basic-filter element set (outputs + spent prevouts, the
 latter from undo data when available). When the block body is unavailable
 (pruned), returns T -- we can't verify, so we keep the filter match rather than
 risk a false negative."
-  (if (null block)
-      t
+  (if block
       (let* ((undo (bl.val:get-undo-data block-hash))
              (spent (mapcar (lambda (e) (bl.store:utxo-entry-script-pubkey (third e)))
                             undo)))
         (some (lambda (e) (gethash e needles))
-              (bl.store:basic-filter-elements block spent)))))
+              (bl.store:basic-filter-elements block spent)))
+      t))
 
 ;;; getdescriptoractivity — spend/receive activity for descriptors in blocks.
 

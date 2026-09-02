@@ -685,8 +685,7 @@ Returns a list of (input-index . error-message), NIL when every input signed."
           ;; Compute the input's signature material then finalize it into
           ;; scriptSig/witness. Taproot signs SIGHASH_DEFAULT (tap-sighash 0),
           ;; the historical spend-path behavior.
-          (if (null prev)
-              (push (cons i "no prevtx scriptPubKey provided") errors)
+          (if prev
               (multiple-value-bind (sig err)
                   (compute-input-signatures tx i prev keymap pubmap tr-keymap
                                              sighash-byte precomp spent-utxos
@@ -701,7 +700,8 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                              (setf (bl.ser:tx-in-script-sig in) ss))
                            (when wit
                              (setf (aref witness i) wit)
-                             (setf any-witness t))))))))))
+                             (setf any-witness t)))))))
+              (push (cons i "no prevtx scriptPubKey provided") errors))))
       (when (or any-witness (bl.ser:transaction-witness tx))
         (setf (bl.ser:transaction-witness tx) witness))
       ;; Core's ProduceSignature does not take "no error" for complete: it ENDS
@@ -890,7 +890,7 @@ does not track CONF-TARGET is OMITTED, not reported as zero: absence and \"no
 answer\" mean different things to whoever is reading this."
   (declare (ignore node))
   (let ((conf-target (first params))
-        (threshold (if (null (second params)) 0.95d0 (second params))))
+        (threshold (if (second params) (second params) 0.95d0)))
     (unless (integerp conf-target)
       (error 'rpc-error :code +rpc-type-error+
                         :message "Expected type number for conf_target"))

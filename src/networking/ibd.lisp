@@ -12,7 +12,7 @@
   "States for Initial Block Download."
   '(member :idle :syncing-headers :syncing-blocks :synced))
 
-(defparameter +block-stalling-timeout+ 30
+(defconstant +block-stalling-timeout+ 30
   "Shorter per-block request timeout applied only NEAR THE TIP (within
    +stalling-near-tip-margin+ of the header tip). There, blocks are recent
    and small, so a block in-flight this long means a silent/unresponsive
@@ -21,7 +21,7 @@
    fork-recovery latency from ~max-block-request-timeouts x 125s (~10 min)
    to ~max x 30s (~2.5 min), with the same retry+eviction path.")
 
-(defparameter +stalling-near-tip-margin+ 144
+(defconstant +stalling-near-tip-margin+ 144
   "How close (in blocks) the validated tip must be to the header tip for
    the shorter +block-stalling-timeout+ to apply. Far below this (bulk
    IBD — notably the testnet4 multi-MB stress region at h=51k-67k, ~70k
@@ -30,13 +30,13 @@
    death-spiral). 144 blocks is firmly in the at-tip zone for any chain
    whose heavy region isn't within a day of the tip.")
 
-(defparameter +max-messages-per-peer-per-cycle+ 32
+(defconstant +max-messages-per-peer-per-cycle+ 32
   "How many messages to drain from each peer in one IBD loop iteration.
    Reading just one used to let kernel TCP buffers fill (multi-MB) whenever
    validation took a few seconds, then the stalling-peer check would evict
    peers for OUR slowness. Drain in batches to keep buffers shallow.")
 
-(defparameter +max-recv-bytes-per-peer-per-cycle+ 65536
+(defconstant +max-recv-bytes-per-peer-per-cycle+ 65536
   "Bytes one peer may hand us in a single drain before we move to the next.
 
 A message count alone is not a fairness bound: 32 messages can be 32 blocks,
@@ -49,7 +49,7 @@ Checked BETWEEN messages, so it never truncates one: a single 4 MB block still
 arrives whole (the reader is resumable, and stopping mid-message would only
 defer the same bytes), it just ends that peer's turn afterwards.")
 
-(defparameter +max-block-queue-bytes+ (* 256 1024 1024)
+(defconstant +max-block-queue-bytes+ (* 256 1024 1024)
   "Byte cap (wire size) for the out-of-order block-queue. The 1024-COUNT
 cap alone was sized for testnet4's small blocks: with the tip stuck at
 mainnet h=544,085 (the bad-version consensus bug), peers filled the
@@ -57,7 +57,7 @@ count window with 2018-era 1-1.5MB blocks — ~5GB once parsed — and the
 heap died before the stuck-tip halt could fire. 256MB wire ≈ ~1-1.5GB
 parsed, comfortably inside the 5GB dynamic space.")
 
-(defparameter +max-block-queue-size+ 1024
+(defconstant +max-block-queue-size+ 1024
   "Maximum number of out-of-order blocks held in the IBD block-queue,
    matching Bitcoin Core's BLOCK_DOWNLOAD_WINDOW (net_processing.cpp:146).
    Each entry holds a fully-deserialized block (multi-MB on testnet4
@@ -68,7 +68,7 @@ parsed, comfortably inside the 5GB dynamic space.")
    clamp, peers no longer redeliver dropped blocks because we stop
    asking once at cap.")
 
-(defparameter +no-progress-yield-seconds+ 5
+(defconstant +no-progress-yield-seconds+ 5
   "The block-download loop RETURNS (yielding to the 30s maintenance cadence)
 when it has neither requested nor received a single block for this many
 seconds while its gate is still open. Distinct from +stuck-tip-halt-seconds+
@@ -79,7 +79,7 @@ heavier chain that is unobtainable. Returning is safe: run-ibd is re-entered
 every maintenance pass, so control resumes; without this the work-based gate
 below could spin the loop forever and starve peer maintenance.")
 
-(defparameter +stuck-tip-halt-seconds+ 300
+(defconstant +stuck-tip-halt-seconds+ 300
   "If the connect-tip fails to advance for this many seconds AND the
    block-queue is at cap, IBD halts. Mirrors the spirit of Bitcoin Core's
    TipMayBeStale check (net_processing.cpp:1332-1340) which uses
@@ -224,12 +224,12 @@ snapshot reads it from RPC threads while the sync thread mutates it."
   ;; context, so it can never go stale across snapshot changes.
   (base-in-chain-cache (make-block-hash-table) :type hash-table))
 
-(defparameter +recent-rate-window-seconds+ 60
+(defconstant +recent-rate-window-seconds+ 60
   "Window for the recent-rate metric in IBD Progress logs. 60s gives a
 useful real-time view of throughput swings (peer disconnects, stress
 regions) that the cumulative session-average smooths over.")
 
-(defparameter +max-block-request-timeouts+ 5
+(defconstant +max-block-request-timeouts+ 5
   "Drop a block from the pending queue after this many request timeouts.
 Competing-fork-block headers get auto-queued by process-headers; most
 peers don't serve blocks on chains they don't follow, so requests time
@@ -455,7 +455,7 @@ block forever (the deferred-reorg loop bug, project_per_peer_block_tracking.md).
                              queued))
     queued))
 
-(defparameter +max-block-revalidation-attempts+ 3
+(defconstant +max-block-revalidation-attempts+ 3
   "Consecutive validation failures for the same block hash after which we stop
 re-requesting it in the tight receive->validate->re-request loop. The stuck-tip
 detector and normal header/tip sync remain the recovery path, so this is a PAUSE,
@@ -464,7 +464,7 @@ processed and connect. A single bad/witness-stripped block spun this loop
 indefinitely and spammed 6.5M log lines / 1.1GB on testnet4
 (project_cmpctblock_witness_wedge).")
 
-(defparameter +block-failure-counts-cap+ 4096
+(defconstant +block-failure-counts-cap+ 4096
   "Hard cap on the failure-count map; cleared wholesale on overflow (losing a few
 counts only grants a few extra retries — harmless).")
 
@@ -615,12 +615,12 @@ below this height may skip SIGNATURE checks: the assumevalid hash is unforgeable
 so a block carrying it pins a known-good ancestor chain. Mirrors Bitcoin Core's
 -assumevalid (sigs skipped for ancestors of the assumed-valid block)."
   (let ((av (default-assumevalid)))
-    (if (null av)
-        -1
+    (if av
         (let ((entry (bl.store:get-block-index-entry chain-state av)))
           (if entry
               (bl.store:block-index-entry-height entry)
-              -1)))))
+              -1))
+        -1)))
 
 (defun script-skip-height (chain-state)
   "Highest height at which a signature skip is even CONSIDERED: the assumevalid
@@ -1268,8 +1268,7 @@ a critical-path block stalls the tip for up to the full request timeout
 (per the 2026-05-24 close-wait follow-up). The per-hash timeout counter
 is deliberately left untouched — the peer dying is not the block's fault,
 so it keeps its full retry budget on reassignment."
-  (if (null *ibd-context*)
-      0
+  (if *ibd-context*
       (let ((in-flight (ibd-context-in-flight *ibd-context*))
             (orphaned '()))
         (maphash (lambda (hash peer-time)
@@ -1278,7 +1277,8 @@ so it keeps its full retry budget on reassignment."
                  in-flight)
         (dolist (hash orphaned)
           (remhash hash in-flight))
-        (length orphaned))))
+        (length orphaned))
+      0))
 
 (defun retry-timed-out-requests (&optional peers timeout-seconds)
   "Remove timed out requests from in-flight so they can be retried.
@@ -3076,11 +3076,11 @@ of headers added to the index."
             (%maybe-request-more-headers peer chain-state last-entry full-batch)
             added)))))))
 
-(defparameter +header-sync-silent-passes+ 50
+(defconstant +header-sync-silent-passes+ 50
   "Pump passes with NO headers message from the chosen peer before header sync
 calls it silent and the caller rotates (~10s at the pass sleep below).")
 
-(defparameter +header-sync-quiet-passes+ 5
+(defconstant +header-sync-quiet-passes+ 5
   "Pump passes after the peer's LAST answer before header sync returns. Short on
 purpose: once a peer has answered, the conversation continues through the pump
 whether or not this function is still watching (ingest sends the follow-up
@@ -3088,7 +3088,7 @@ getheaders itself), so there is nothing to wait for — and at the tip, where th
 first answer is also the last, waiting out the silent budget would burn ~10s of
 every sync cycle for nothing.")
 
-(defparameter +header-sync-deadline-seconds+ 60
+(defconstant +header-sync-deadline-seconds+ 60
   "Absolute cap on one sync-headers call, whatever the peer does. The idle
 counters alone are not a bound: a peer that emits one headers message every few
 seconds — even 1-header announcements — resets them forever, and this runs on
@@ -3257,7 +3257,7 @@ is excluded: the trigger holds the incoming block in hand."
                 ;; pindexTest, the block it keys m_blocks_unlinked on.
                 (return (values nil bh))))))))))
 
-(defparameter +reorg-candidates-cap+ 4096
+(defconstant +reorg-candidates-cap+ 4096
   "Hard cap on the reorg-candidate SET (and disk-blocks-above-tip). The
 AcceptBlock gate already bounds what enters, but this is a belt-and-suspenders
 ceiling so a pathological header topology can't grow the set without bound.")
@@ -3445,12 +3445,7 @@ completable targets are what we want and gated forks early-exit cheaply."
                   ;; every pass and wait for the event that could change the
                   ;; answer — the body arriving.
                   (%park-unlinked-reorg-candidate
-                   (bl.store:block-index-entry-hash e) missing))
-                 ;; No MISSING means the DISCONNECT side is incomplete: local
-                 ;; corruption, not something a peer will deliver, so parking it
-                 ;; under a hash would park it under nothing. Left to the
-                 ;; existing skip.
-                 (t nil))))
+                   (bl.store:block-index-entry-hash e) missing)))))
     nil))
 
 (defun %active-chain-present-to-fork-p (entry tip-entry chain-state block-store)

@@ -129,13 +129,13 @@ also reachable through /rest/deploymentinfo.")
      ,@body))
 
 (defun %vb-cached-state (deployment entry thunk)
-  (if (null *versionbits-state-cache*)
-      (funcall thunk)
+  (if *versionbits-state-cache*
       (let ((per-dep (or (gethash deployment *versionbits-state-cache*)
                          (setf (gethash deployment *versionbits-state-cache*)
                                (make-hash-table :test 'eq)))))
         (multiple-value-bind (v present) (gethash entry per-dep)
-          (if present v (setf (gethash entry per-dep) (funcall thunk)))))))
+          (if present v (setf (gethash entry per-dep) (funcall thunk)))))
+      (funcall thunk)))
 
 (defun %vb-mtp (chain-state entry)
   (and entry (compute-median-time-past-from-entry chain-state entry)))

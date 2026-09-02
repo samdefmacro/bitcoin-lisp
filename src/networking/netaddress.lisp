@@ -11,8 +11,8 @@
 
 ;;;; Network keywords
 
-(defparameter +bip155-networks+ '(:ipv4 :ipv6 :torv3 :i2p :cjdns)
-  "All networks representable in our address layer (BIP155 ids 1,2,4,5,6).")
+(alexandria:define-constant +bip155-networks+ '(:ipv4 :ipv6 :torv3 :i2p :cjdns)
+  :test #'equalp :documentation "All networks representable in our address layer (BIP155 ids 1,2,4,5,6).")
 
 (defun network-address-length (network)
   "Required address byte length for NETWORK, in OUR internal representation
@@ -69,14 +69,14 @@ predate it and keep their own copies for now)."
   (cond
     ((and (plusp (length spec)) (char= (char spec 0) #\[))
      (let ((close (position #\] spec)))
-       (if (null close)
-           (values spec default-port)
+       (if close
            (let ((host (subseq spec 1 close))
                  (rest (subseq spec (1+ close))))
              (if (and (> (length rest) 1) (char= (char rest 0) #\:)
                       (every #'digit-char-p (subseq rest 1)))
                  (values host (parse-integer rest :start 1))
-                 (values host default-port))))))
+                 (values host default-port)))
+           (values spec default-port))))
     (t
      (let ((colon (position #\: spec :from-end t)))
        (if (and colon
@@ -210,7 +210,8 @@ GetProxy(target network), table built by init.cpp:1696-1801). Returns
 ;;; case-insensitive and enforces that leftover bits are zero
 ;;; (ConvertBits<5,8,false>), so a truncated/garbage tail is rejected.
 
-(defparameter +base32-alphabet+ "abcdefghijklmnopqrstuvwxyz234567")
+(alexandria:define-constant +base32-alphabet+ "abcdefghijklmnopqrstuvwxyz234567"
+  :test #'equalp)
 
 (defun base32-encode (bytes &key pad)
   "Encode BYTES as lowercase base32. With PAD, append '=' to a multiple of 8."
@@ -239,8 +240,7 @@ GetProxy(target network), table built by init.cpp:1696-1801). Returns
 decode32_table (strencodings.cpp:166-180)."
   (cond ((char<= #\a ch #\z) (- (char-code ch) (char-code #\a)))
         ((char<= #\A ch #\Z) (- (char-code ch) (char-code #\A)))
-        ((char<= #\2 ch #\7) (+ 26 (- (char-code ch) (char-code #\2))))
-        (t nil)))
+        ((char<= #\2 ch #\7) (+ 26 (- (char-code ch) (char-code #\2))))))
 
 (defun base32-decode (string)
   "Decode base32 STRING (Core DecodeBase32). Requires a length that is a
@@ -681,8 +681,7 @@ when a permission name is unknown. With no @ at all there are no explicit
 permissions and REST is the whole string, which is Core's implicit case
 (net_permissions.cpp:26-36)."
   (let ((at (position #\@ string)))
-    (if (null at)
-        (values +perm-implicit+ :both string)
+    (if at
         (let ((flags 0)
               (direction nil)
               (rest (subseq string (1+ at))))
@@ -694,7 +693,8 @@ permissions and REST is the whole string, which is Core's implicit case
                   (t (let ((bit (cdr (assoc name *permission-names* :test #'string=))))
                        (unless bit (return-from parse-permission-flags nil))
                        (setf flags (logior flags bit))))))
-          (values flags (or direction :both) rest)))))
+          (values flags (or direction :both) rest))
+        (values +perm-implicit+ :both string))))
 
 (defun %split-on-comma (string)
   (loop with start = 0
@@ -828,11 +828,15 @@ BIG-endian even though the bits come off the stream little-endian."
                      (return-from %asmap-decode-bits (values val bitpos))))))
     (values +asmap-invalid+ bitpos)))
 
-(defparameter +asmap-type-bit-sizes+ #(0 0 1))
-(defparameter +asmap-asn-bit-sizes+ #(15 16 17 18 19 20 21 22 23 24))
-(defparameter +asmap-match-bit-sizes+ #(1 2 3 4 5 6 7 8))
-(defparameter +asmap-jump-bit-sizes+
-  #(5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30))
+(alexandria:define-constant +asmap-type-bit-sizes+ #(0 0 1)
+  :test #'equalp)
+(alexandria:define-constant +asmap-asn-bit-sizes+ #(15 16 17 18 19 20 21 22 23 24)
+  :test #'equalp)
+(alexandria:define-constant +asmap-match-bit-sizes+ #(1 2 3 4 5 6 7 8)
+  :test #'equalp)
+(alexandria:define-constant +asmap-jump-bit-sizes+
+  #(5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30)
+  :test #'equalp)
 
 (defun asmap-interpret (asmap ip-bytes)
   "Core Interpret (asmap.cpp:182-232): walk the trie for IP-BYTES and return

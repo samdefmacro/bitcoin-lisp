@@ -4,7 +4,7 @@
 ;;;
 ;;; Handles low-level TCP connections to Bitcoin peers.
 
-(defparameter +max-send-buffer-bytes+ 1000000
+(defvar *max-send-buffer-bytes* 1000000
   "Per-connection cap on buffered unsent bytes, above which the connection is
 send-paused (Bitcoin Core CNode::fPauseSend; cap = -maxsendbuffer default,
 1000 * DEFAULT_MAXSENDBUFFER(1000) bytes, net.h:99 / init.cpp:2105). A single
@@ -453,7 +453,7 @@ after a hard send failure (connection marked dead). Caller holds SEND-LOCK."
 CNode::fPauseSend). Bulk producers (block serving in handle-getdata, exactly
 where Core checks it in ProcessGetData) stop sending to a paused peer;
 send-bytes drops further messages until the buffer drains below the cap."
-  (> (connection-send-queue-bytes conn) +max-send-buffer-bytes+))
+  (> (connection-send-queue-bytes conn) *max-send-buffer-bytes*))
 
 (defun connection-send-stalled-p (conn)
   "T when CONN has had unsent data buffered while the socket accepted nothing

@@ -37,7 +37,7 @@
           +wallet-flag-disable-private-keys+ +wallet-flag-descriptors+
           +wallet-flag-external-signer+))
 
-(defparameter +wallet-flag-names+
+(alexandria:define-constant +wallet-flag-names+
   `((,+wallet-flag-avoid-reuse+ . "avoid_reuse")
     (,+wallet-flag-blank-wallet+ . "blank")
     (,+wallet-flag-key-origin-metadata+ . "key_origin_metadata")
@@ -45,9 +45,9 @@
     (,+wallet-flag-disable-private-keys+ . "disable_private_keys")
     (,+wallet-flag-descriptors+ . "descriptor_wallet")
     (,+wallet-flag-external-signer+ . "external_signer"))
-  "Core wallet.h WALLET_FLAG_TO_STRING.")
+  :test #'equalp :documentation "Core wallet.h WALLET_FLAG_TO_STRING.")
 
-(defparameter +default-keypool-size+ 1000
+(defvar *default-keypool-size* 1000
   "Core scriptpubkeyman.h:63 DEFAULT_KEYPOOL_SIZE, settable with -keypool.
 
 A DEFPARAMETER because Core exposes the knob. Note it is read as a STRUCT SLOT
@@ -65,8 +65,8 @@ legacy minversion 169900 for backwards compatibility (rpc/wallet.cpp:86-90).")
 
 ;;; --- Output types (Core outputtype.{h,cpp}) ---
 
-(defparameter +output-types+ '(:legacy :p2sh-segwit :bech32 :bech32m)
-  "OUTPUT_TYPES in enum order (codes 0-3); the createwallet SPKM set iterates
+(alexandria:define-constant +output-types+ '(:legacy :p2sh-segwit :bech32 :bech32m)
+  :test #'equalp :documentation "OUTPUT_TYPES in enum order (codes 0-3); the createwallet SPKM set iterates
 these for both external and internal (wallet.cpp:3595-3602).")
 
 (defun %output-type-code (type)
@@ -140,7 +140,7 @@ map, and the descriptor's private keys."
   (lock (bt:make-recursive-lock "cs-wallet"))
   (network :testnet4 :type keyword)
   (flags 0 :type (unsigned-byte 64))
-  (keypool-size +default-keypool-size+ :type (integer 1))
+  (keypool-size *default-keypool-size* :type (integer 1))
   (spkms (make-hash-table :test 'equalp) :type hash-table)          ; id -> spkm
   (external-spkms (make-hash-table :test 'eql) :type hash-table)    ; type -> spkm
   (internal-spkms (make-hash-table :test 'eql) :type hash-table)
@@ -206,7 +206,7 @@ Lock-order contract (wallet P4):
 through it (Core WalletContext)."
   (data-directory nil)
   (network :testnet4 :type keyword)
-  (keypool-size +default-keypool-size+ :type (integer 1))
+  (keypool-size *default-keypool-size* :type (integer 1))
   (wallets (make-hash-table :test 'equal) :type hash-table)  ; name -> wallet
   (wallet-order '() :type list)                              ; names, load order
   ;; Immutable load-ordered wallet list, replaced wholesale under the
@@ -1124,8 +1124,7 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                           t))
                    ((and (>= (length data-key) 2)
                          (string= "rr" data-key :end2 2)))
-                   (t (push "Found unknown address data record" warnings)))))
-          (t nil))))
+                   (t (push "Found unknown address data record" warnings))))))))
     ;; Pass 2: keys, caches, active mappings.
     (dolist (rec records)
       (multiple-value-bind (type fields) (wdb-parse-key (car rec))
@@ -1134,15 +1133,15 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
            (let* ((id (subseq fields 0 32))
                   (pubkey (subseq fields 33))   ; skip compactsize byte
                   (spkm (gethash id (wallet-spkms wallet))))
-             (if (null spkm)
-                 (push "Found a descriptor key for an unknown descriptor" warnings)
+             (if spkm
                  (let ((priv (wdb-parse-descriptor-key-value (cdr rec) pubkey)))
                    (unless priv
                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                        :message "Error reading wallet database: descriptor private key checksum mismatch"))
                    (setf (gethash (bl.crypto:hash160 pubkey)
                                   (desc-spkm-keys spkm))
-                         (cons priv (= (length pubkey) 33)))))))
+                         (cons priv (= (length pubkey) 33))))
+                 (push "Found a descriptor key for an unknown descriptor" warnings))))
           ((equal type +wdb-key-walletdescriptorckey+)
            ;; The mirror of the plaintext branch above. Nothing is
            ;; decrypted here — there is no passphrase at load time — so
@@ -1189,8 +1188,7 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
            (push (list (equal type +wdb-key-activeinternalspk+)
                        (aref fields 0)
                        (cdr rec))
-                 actives))
-          (t nil))))
+                 actives)))))
     ;; bestblock preferred when non-empty, else bestblock_nomerkle (Core
     ;; ReadBestBlock; WriteBestBlock deliberately leaves bestblock empty).
     (let ((locator (or locator-main locator-nomerkle)))
@@ -1387,8 +1385,7 @@ std::optional<bool> load_on_startup: NIL leaves the setting untouched, :TRUE
 adds, :FALSE removes. Returns T when the setting holds the requested state
 afterwards — including Core's SKIP_WRITE no-ops — and NIL when it could not be
 updated, which the caller surfaces as a warning rather than failing the RPC."
-  (if (null action)
-      t
+  (if action
       (multiple-value-bind (table ok) (%read-settings data-directory)
         (when ok
           (let* ((current (%settings-wallet-list table))
@@ -1403,7 +1400,8 @@ updated, which the caller surfaces as a warning rather than failing the RPC."
                   ;; Store a vector: yason encodes it unambiguously as a JSON
                   ;; array, whereas a list of strings is shape-sniffed.
                   (setf (gethash "wallet" table) (coerce new 'vector))
-                  (%write-settings data-directory table))))))))
+                  (%write-settings data-directory table))))))
+      t))
 
 (defun %load-on-startup-action (value)
   "Read a positional load_on_startup parameter as Core's
@@ -1808,11 +1806,11 @@ backend (leveldb, where Core says sqlite)."
 ;;; --- Address RPCs (Core wallet/rpc/addresses.cpp) ---
 
 (defun %address-type-arg (value default)
-  (if (null value)
-      default
+  (if value
       (or (and (stringp value) (%parse-output-type value))
           (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
-                            :message (format nil "Unknown address type '~A'" value)))))
+                            :message (format nil "Unknown address type '~A'" value)))
+      default))
 
 (bl.rpc:define-rpc "getnewaddress" (node params)
   "A new receiving address (Bitcoin Core getnewaddress). PARAMS:
@@ -2000,15 +1998,15 @@ PUBLIC material under a private request — a wrong answer rather than an error.
   (and (hash-table-p options)
        (bl.rpc:positional-bool (gethash name options))))
 
-(defparameter +mutable-wallet-flags+ +wallet-flag-avoid-reuse+
+(defconstant +mutable-wallet-flags+ +wallet-flag-avoid-reuse+
   "Core wallet.h:159-160 MUTABLE_WALLET_FLAGS — the flags setwalletflag may
 change. Everything else describes how the wallet was BUILT and cannot be
 retrofitted.")
 
-(defparameter +wallet-flag-caveats+
+(alexandria:define-constant +wallet-flag-caveats+
   `((,+wallet-flag-avoid-reuse+
      . "You need to rescan the blockchain in order to correctly mark used destinations in the past. Until this is done, some destinations may be considered unused, even if the opposite is the case."))
-  "Core wallet/rpc/wallet.cpp:27-32 WALLET_FLAG_CAVEATS.")
+  :test #'equalp :documentation "Core wallet/rpc/wallet.cpp:27-32 WALLET_FLAG_CAVEATS.")
 
 (bl.rpc:define-rpc "setwalletflag" (node params)
   "Turn a mutable wallet flag on or off (Core setwalletflag). PARAMS:
@@ -2020,7 +2018,7 @@ ignoring the request. Setting a flag to the value it already holds is also an
 error, as Core makes it — the caller has misunderstood the state."
   (let* ((wallet (wallet-for-request node))
          (flag-str (first params))
-         (value (if (null (second params)) t (bl.rpc:positional-bool (second params)))))
+         (value (if (second params) (bl.rpc:positional-bool (second params)) t)))
     (unless (stringp flag-str)
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+ :message "Expected type string for flag"))
     (let ((flag (car (find flag-str +wallet-flag-names+

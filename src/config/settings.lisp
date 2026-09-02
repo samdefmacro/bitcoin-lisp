@@ -13,12 +13,12 @@
 ;;; (common/init.cpp:98-115), which is how a datadir that has ever been started
 ;;; always has one.
 
-(defparameter +settings-warning-key+ "_warning_"
-  "Core SETTINGS_WARN_MSG_KEY. Stripped on read, re-added on write, and never
+(alexandria:define-constant +settings-warning-key+ "_warning_"
+  :test #'equalp :documentation "Core SETTINGS_WARN_MSG_KEY. Stripped on read, re-added on write, and never
 visible as a setting.")
 
-(defparameter +client-name+ "bitcoin-lisp"
-  "Core's CLIENT_NAME. Named here rather than derived from the user agent
+(alexandria:define-constant +client-name+ "bitcoin-lisp"
+  :test #'equalp :documentation "Core's CLIENT_NAME. Named here rather than derived from the user agent
 because it is the value scripts/conformance-config.sh publishes to Core's test
 framework as CLIENT_NAME, and the framework compares strings with it.")
 

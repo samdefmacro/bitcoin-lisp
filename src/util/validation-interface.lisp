@@ -37,13 +37,13 @@ for it. Validation and the mempool name nothing above themselves.")
 (defvar *validation-hooks* (make-hash-table :test 'eq)
   "Event keyword -> list of hook names, in registration order.")
 
-(defparameter +validation-events+
+(alexandria:define-constant +validation-events+
   '(:block-connected        ; (chainstate block block-hash height spent-utxos)
     :block-disconnected     ; (chainstate block block-hash height)
     :updated-block-tip      ; (chainstate block-hash height)
     :transaction-added      ; (tx txid sequence)
     :transaction-removed)   ; (tx txid sequence reason)
-  "The events and the argument list each hook receives.")
+  :test #'equalp :documentation "The events and the argument list each hook receives.")
 
 (defun validation-hooks (event)
   "The hook names registered for EVENT, in registration order."

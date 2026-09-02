@@ -343,12 +343,12 @@ usage\" (util/log.h:91-113)."
 ;;;; subsystem's debug output without flipping the whole node to :debug, and a
 ;;;; node already at :debug is unchanged.
 
-(defparameter +log-categories+
+(alexandria:define-constant +log-categories+
   '("net" "tor" "mempool" "http" "bench" "zmq" "walletdb" "rpc" "estimatefee"
     "addrman" "selectcoins" "reindex" "cmpctblock" "rand" "prune" "proxy"
     "mempoolrej" "libevent" "coindb" "qt" "leveldb" "validation" "i2p" "ipc" "lock"
     "blockstorage" "txreconciliation" "scan" "txpackages" "kernel" "privatebroadcast")
-  "Debug logging categories, matching Bitcoin Core's LogCategories (logging.cpp).")
+  :test #'equalp :documentation "Debug logging categories, matching Bitcoin Core's LogCategories (logging.cpp).")
 
 (defvar *debug-categories* (make-hash-table :test 'equal)
   "Set of currently-enabled debug log categories (category-string -> T).")
@@ -398,15 +398,13 @@ success, NIL if CATEGORY is unknown (Bitcoin Core EnableCategory)."
   (cond ((%log-category-all-p category)
          (dolist (c +log-categories+ t) (setf (gethash c *debug-categories*) t)))
         ((log-category-known-p category)
-         (setf (gethash category *debug-categories*) t) t)
-        (t nil)))
+         (setf (gethash category *debug-categories*) t) t)))
 
 (defun disable-log-category (category)
   "Disable CATEGORY (or every category for \"\"/\"1\"/\"all\"). Returns T on
 success, NIL if CATEGORY is unknown (Bitcoin Core DisableCategory)."
   (cond ((%log-category-all-p category) (clrhash *debug-categories*) t)
-        ((log-category-known-p category) (remhash category *debug-categories*) t)
-        (t nil)))
+        ((log-category-known-p category) (remhash category *debug-categories*) t)))
 
 (defvar *log-time-micros* nil
   "Timestamp log lines to microseconds (Core -logtimemicros).")

@@ -763,11 +763,11 @@ Each entry is a list (net-addr timestamp)."
 
 ;;; Deserialization
 
-(defparameter +torv2-in-ipv6-prefix+ #(#xFD #x87 #xD8 #x7E #xEB #x43)
-  "Prefix of the dead TORv2-embedded-in-IPv6 form (Core TORV2_IN_IPV6_PREFIX).")
+(alexandria:define-constant +torv2-in-ipv6-prefix+ #(#xFD #x87 #xD8 #x7E #xEB #x43)
+  :test #'equalp :documentation "Prefix of the dead TORv2-embedded-in-IPv6 form (Core TORV2_IN_IPV6_PREFIX).")
 
-(defparameter +internal-in-ipv6-prefix+ #(#xFD #x6B #x88 #xC0 #x87 #x24)
-  "Prefix of Core's NET_INTERNAL-embedded-in-IPv6 form (0xFD + sha256(\"bitcoin\")[0:5]).")
+(alexandria:define-constant +internal-in-ipv6-prefix+ #(#xFD #x6B #x88 #xC0 #x87 #x24)
+  :test #'equalp :documentation "Prefix of Core's NET_INTERNAL-embedded-in-IPv6 form (0xFD + sha256(\"bitcoin\")[0:5]).")
 
 (defun %bytes-have-prefix-p (bytes prefix)
   (and (>= (length bytes) (length prefix))

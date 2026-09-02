@@ -8,7 +8,7 @@
 # by an unescaped inner quote, whose remaining prose had become code).
 #
 # A warning is tolerated only when the symbol is earmuffed (*name* / +name+)
-# AND a defvar/defparameter/defconstant/defglobal for it exists somewhere in
+# AND a defvar/defparameter/defconstant/define-constant/defglobal for it exists somewhere in
 # the tree -- i.e. a forward reference across load order.  Anything else
 # (a bare word, or a special that no longer exists) fails.
 #
@@ -37,7 +37,7 @@ grep -o 'undefined variable: [^ ]*' "$transcript" | sort -u | while read -r _ _ 
   esac
   lname=$(printf '%s' "$name" | tr 'A-Z' 'a-z')
   pat=${lname//\*/\\*}; pat=${pat//+/\\+}
-  if ! grep -rqiE "\((defvar|defparameter|defconstant|define-constant|defglobal|sb-ext:defglobal|define-symbol-macro|defvar-unbound) ${pat}(\$|[[:space:]])" "$root/src" "$root/tests" 2>/dev/null; then
+  if ! grep -rqiE "\((alexandria:)?(defvar|defparameter|defconstant|define-constant|defglobal|sb-ext:defglobal|define-symbol-macro|defvar-unbound) ${pat}(\$|[[:space:]])" "$root/src" "$root/tests" 2>/dev/null; then
     echo "undefined variable has no definition in the tree: $sym"
   fi
 done

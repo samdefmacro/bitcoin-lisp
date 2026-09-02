@@ -373,7 +373,7 @@ by -discardfee, floored at the dust relay feerate."
          (rate (if (zerop estimate)
                    *wallet-discard-rate*
                    (min estimate *wallet-discard-rate*))))
-    (max rate bl.val:+dust-relay-fee-rate+)))
+    (max rate bl.val:*dust-relay-fee-rate*)))
 
 (defun %fee-reason-string (reason)
   "common/messages.cpp StringForFeeReason. DIVERGENCE (cosmetic): our block
@@ -716,8 +716,7 @@ chain findCoins). Returns NIL when unknown. Caller holds both locks."
   "Core chain.getTransactionAncestry: (values ancestors cluster-count) for
 TXID's mempool entry, both 0 when not in the mempool."
   (let ((entry (and mempool (bl.mp:mempool-get mempool txid))))
-    (if (null entry)
-        (values 0 0)
+    (if entry
         (let ((ancestors (bl.mp:mempool-ancestor-stats mempool txid))
               (handle (bl.mp:mempool-entry-graph-handle entry)))
           (values ancestors
@@ -725,7 +724,8 @@ TXID's mempool entry, both 0 when not in the mempool."
                       (length (bl.mp:txgraph-get-cluster
                                (bl.mp:mempool-graph mempool)
                                handle))
-                      ancestors))))))
+                      ancestors)))
+        (values 0 0))))
 
 (defstruct csel-params
   "Core CoinSelectionParams."
@@ -1048,8 +1048,7 @@ result NIL + message NIL = plain not-found."
                  ;; is 0, so the next iteration always backtracks before the
                  ;; forward branch touches the vector.
                  (incf utxo-pool-index))))
-    (if (null best-selection)
-        (values nil (and max-tx-weight-exceeded +max-weight-error-message+))
+    (if best-selection
         (let ((result (make-sel-result :target selection-target :algo :bnb)))
           (dolist (i best-selection)
             (sel-result-add-group result (aref pool i)))
@@ -1057,7 +1056,8 @@ result NIL + message NIL = plain not-found."
           (unless (= best-waste (sel-result-waste result))
             (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                               :message "Internal bug detected: BnB waste mismatch"))
-          (values result nil)))))
+          (values result nil))
+        (values nil (and max-tx-weight-exceeded +max-weight-error-message+)))))
 
 ;;; --- Knapsack (coinselection.cpp:602-747) ---
 
@@ -2101,8 +2101,7 @@ Caller holds node + wallet locks."
                                              (cond ((and pa pb)
                                                     (< (wcc-preset-position pa)
                                                        (wcc-preset-position pb)))
-                                                   (pa t)
-                                                   (t nil)))))))
+                                                   (pa t)))))))
                                 (let* ((use-anti-fee-sniping t)
                                        (default-sequence
                                          (if (%wcc-signal-rbf cc)
@@ -2158,8 +2157,7 @@ Caller holds node + wallet locks."
                                     ((wcc-locktime cc)
                                      (setf (bl.ser:transaction-lock-time tx)
                                            (wcc-locktime cc))
-                                     (setf use-anti-fee-sniping nil))
-                                    (t nil))
+                                     (setf use-anti-fee-sniping nil)))
                                   (when use-anti-fee-sniping
                                     (discourage-fee-sniping
                                      tx rng node
@@ -2621,8 +2619,7 @@ or (in tests) alists."
 (defun %fee-mode-from-string (string)
   (cond ((or (string-equal string "unset") (string= string "")) :unset)
         ((string-equal string "economical") :economical)
-        ((string-equal string "conservative") :conservative)
-        (t nil)))
+        ((string-equal string "conservative") :conservative)))
 
 (defun %set-fee-estimate-mode (cc conf-target estimate-mode fee-rate
                                override-min-fee)

@@ -21,7 +21,7 @@
 ;;; complete-p checks for the marker; absent → caller should wipe the
 ;;; LevelDB and re-run.
 
-(defparameter +migration-batch-size+ 50000
+(defconstant +migration-batch-size+ 50000
   "Number of entries per LevelDB writebatch during migration. Larger
 batches trade off peak transient memory and crash-window granularity.
 50k × ~100 bytes ≈ 5 MB per batch — modest.")
@@ -43,7 +43,7 @@ interrupted mid-migration — in any of those cases the caller should
 treat the LevelDB as not-yet-migrated."
   (when (probe-file (pathname leveldb-path))
     (with-leveldb (db leveldb-path)
-      (not (null (leveldb-get db *migration-marker-key*))))))
+      (and (leveldb-get db *migration-marker-key*) t))))
 
 (defun migrate-utxoset-dat-to-leveldb (dat-path leveldb-path
                                         &key (batch-size +migration-batch-size+))

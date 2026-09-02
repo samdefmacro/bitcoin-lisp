@@ -330,7 +330,7 @@ MAX_PEER_TX_ANNOUNCEMENTS cap (Core m_txrequest.Count(peer)).")
 delay (Core m_txrequest.CountInFlight(peer)).")
 (defvar *tx-request-lock* (bt:make-lock "tx-request"))
 
-(defparameter +tx-request-timeout-seconds+ 60
+(defconstant +tx-request-timeout-seconds+ 60
   "Expire an outstanding tx getdata after this long with no delivery and fail
 over to another announcer (Core GETDATA_TX_INTERVAL, txdownloadman.h:38).")
 (defconstant +max-peer-tx-announcements+ 5000
@@ -619,7 +619,7 @@ for a tx with no other ready announcer. Returns the number re-requested."
 
 ;;; Initial-block-download status (Core ChainstateManager::IsInitialBlockDownload)
 
-(defparameter +max-tip-age-seconds+ (* 24 60 60)
+(defvar *max-tip-age-seconds* (* 24 60 60)
   "Consider the node still in IBD while the active tip is older than
 this. Core DEFAULT_MAX_TIP_AGE (kernel/chainstatemanager_opts.h:24), settable
 with -maxtipage.
@@ -652,7 +652,7 @@ full NODE_NETWORK peers, as Core does."
   "Return T while the node is in initial block download.
 Latches to (and then always returns) NIL once the active tip exists,
 has at least the network's minimum chain work, and its timestamp is
-within +max-tip-age-seconds+ of now — Core UpdateIBDStatus
+within *max-tip-age-seconds* of now — Core UpdateIBDStatus
 (validation.cpp:3314-3322) + CChain::IsTipRecent (chain.h:431-437)."
   (unless *cached-is-ibd*
     (return-from initial-block-download-p nil))
@@ -665,7 +665,7 @@ within +max-tip-age-seconds+ of now — Core UpdateIBDStatus
              (>= (bl.ser:block-header-timestamp
                   (bl.store:block-index-entry-header tip))
                  (- (bl.ser:get-unix-time)
-                    +max-tip-age-seconds+)))
+                    *max-tip-age-seconds*)))
         (progn
           (bl:log-info "Leaving InitialBlockDownload (latching to false)")
           (setf *cached-is-ibd* nil)
@@ -1357,9 +1357,9 @@ block-relay-only peer (Core SetupAddressRelay)."
 
 ;;; Transaction handling
 
-(defparameter +reconsiderable-tx-failures+
+(alexandria:define-constant +reconsiderable-tx-failures+
   '(:insufficient-fee :replacement-failed :mempool-full)
-  "The rejection reasons Bitcoin Core classifies TX_RECONSIDERABLE — \"fails
+  :test #'equalp :documentation "The rejection reasons Bitcoin Core classifies TX_RECONSIDERABLE — \"fails
 some policy, but might be acceptable if submitted in a (different) package\"
 (consensus/validation.h:48). Core's four sites: both fee-floor failures in
 CheckFeeRate (validation.cpp:703-711), the RBF anti-DoS fee check (:1010)
@@ -3344,10 +3344,10 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
 ;;; lists below are that switch, arm by arm, over the verdicts our
 ;;; VALIDATE-BLOCK / VALIDATE-BLOCK-HEADER actually return.
 
-(defparameter +compact-block-punished-reasons+
+(alexandria:define-constant +compact-block-punished-reasons+
   '(:bad-proof-of-work :bad-difficulty :bad-version :time-too-old
     :time-timewarp-attack :bad-prevblk)
-  "Validation verdicts Core punishes even when via_compact_block is true.
+  :test #'equalp :documentation "Validation verdicts Core punishes even when via_compact_block is true.
 
 The first five are BLOCK_INVALID_HEADER: high-hash (validation.cpp:3864),
 bad-diffbits (:4121), time-too-old (:4125), time-timewarp-attack (:4134),
@@ -3368,9 +3368,9 @@ HANDLE-CMPCTBLOCK's parent guard is that same foreclosure, so an :ORPHAN-BLOCK
 that survives it means our own index lost an entry — the honest-peer case the
 GA8 finding was about.")
 
-(defparameter +compact-block-ignored-reasons+
+(alexandria:define-constant +compact-block-ignored-reasons+
   '(:time-too-new :duplicate-invalid)
-  "Verdicts that end a compact block with neither punishment NOR a refetch.
+  :test #'equalp :documentation "Verdicts that end a compact block with neither punishment NOR a refetch.
 
 :TIME-TOO-NEW is BLOCK_TIME_FUTURE (validation.cpp:4141), whose arm is a bare
 break (net_processing.cpp:1946-1947): the block is not ours to accept yet, and

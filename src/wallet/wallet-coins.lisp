@@ -214,8 +214,8 @@ fills when a feerate is passed (coinselection.h:75-99)."
   effective-value                  ; value - fee, NIL when no feerate
   output-type)                     ; :legacy/:p2sh-segwit/:bech32/:bech32m/:unknown
 
-(defparameter +output-type-order+ '(:legacy :p2sh-segwit :bech32 :bech32m :unknown)
-  "CoinsResult::All concatenation order (OutputType enum order).")
+(alexandria:define-constant +output-type-order+ '(:legacy :p2sh-segwit :bech32 :bech32m :unknown)
+  :test #'equalp :documentation "CoinsResult::All concatenation order (OutputType enum order).")
 
 (defun wallet-available-coins (wallet &key (min-depth 0) (max-depth 9999999)
                                            (only-safe t)
@@ -551,7 +551,7 @@ flag as the default (Core's isNull check); an explicit boolean (incl. the
 +json-false+ sentinel) overrides it. Requesting it on a wallet without the
 flag errors."
   (let* ((can (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+))
-         (avoid (if (null param) can (bl.rpc:positional-bool param))))
+         (avoid (if param (bl.rpc:positional-bool param) can)))
     (when (and avoid (not can))
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                         :message "wallet does not have the \"avoid reuse\" feature enabled"))

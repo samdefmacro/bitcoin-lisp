@@ -215,9 +215,8 @@ BASIC-FILTER-ELEMENTS)."
   "BIP157 filter hash: the double-SHA256 of the encoded filter bytes."
   (bl.crypto:hash256 encoded-filter))
 
-(defparameter +zero-filter-header+
-  (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
-  "The all-zero previous filter header used before the genesis filter.")
+(alexandria:define-constant +zero-filter-header+ (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+  :test #'equalp :documentation "The all-zero previous filter header used before the genesis filter.")
 
 (defun block-filter-header (filter-hash prev-header)
   "BIP157 filter header: double-SHA256(filter-hash || prev-filter-header)."

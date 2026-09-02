@@ -10,7 +10,7 @@
 # Regions:
 #   light      h=10000 .. h=20000   (small txs, typical workload)
 #   stress     h=51000 .. h=67000   (busy zone, prior bottleneck)
-#   tapscript  h=67100 .. h=67200   (heavy tapscript path)
+#   tapscript  h=67100 .. h=70000   (heavy tapscript path; PROFILE_REGIONS="tapscript 67100 70000")
 #
 # Usage (run on test-bitcoin-server):
 #   nohup bash profile-regions.sh >> profile-watcher.log 2>&1 &
@@ -22,13 +22,20 @@ PROFILE_FILE=/data/bitcoin-lisp/logs/profile.txt
 PROFILE_DIR=/data/bitcoin-lisp/logs/profiles
 mkdir -p "$PROFILE_DIR"
 
-# Region table: name start end
+# Region table: name start end. Override with PROFILE_REGIONS="name start end;..."
+# (the tapscript-only watcher this replaced was this table with
+# "tapscript 67100 70000": ~2900 blocks, enough samples when the stress path
+# runs at ~30 b/s).
 # Stress region narrowed to 51k-55k (4000 blocks) so we stay under
 # sb-sprof's :max-samples 200000 cap. Prior run with 51k-67k auto-stopped
 # midway and the second SIGUSR1 wrote an empty report.
-REGIONS=(
-  "stress 51000 55000"
-)
+if [[ -n "${PROFILE_REGIONS:-}" ]]; then
+  IFS=';' read -r -a REGIONS <<< "$PROFILE_REGIONS"
+else
+  REGIONS=(
+    "stress 51000 55000"
+  )
+fi
 
 pid_of_node() {
   # Match the actual SBCL process by argv0 = "sbcl" with our specific args.

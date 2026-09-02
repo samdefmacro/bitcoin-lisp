@@ -156,7 +156,7 @@ can. src/validation/.")
    #:+witness-scale-factor+
    ;; Dust / standardness (wallet spend path)
    #:dust-threshold
-   #:+dust-relay-fee-rate+
+   #:*dust-relay-fee-rate*
    #:+max-standard-tx-weight+
    ;; Constants
    #:+coinbase-maturity+
@@ -169,7 +169,7 @@ can. src/validation/.")
   (:export
    #:*ms-key-parser*
    #:*require-standard*
-   #:+parallel-validation-workers+
+   #:*parallel-validation-workers*
    #:bip30-repeat-block-p
    #:make-ms-satisfier
    #:miniscript-parse-error

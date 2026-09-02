@@ -69,10 +69,10 @@ fPauseSend on nSendBufferMaxSize)."
     (setf (bl.net::connection-send-queue-bytes conn) 0)
     (is-false (bl.net:connection-send-paused-p conn))
     (setf (bl.net::connection-send-queue-bytes conn)
-          bl.net:+max-send-buffer-bytes+)
+          bl.net:*max-send-buffer-bytes*)
     (is-false (bl.net:connection-send-paused-p conn))
     (setf (bl.net::connection-send-queue-bytes conn)
-          (1+ bl.net:+max-send-buffer-bytes+))
+          (1+ bl.net:*max-send-buffer-bytes*))
     (is-true (bl.net:connection-send-paused-p conn))))
 
 (test send-stall-predicate-needs-pending-and-timeout

@@ -205,7 +205,7 @@ bl.mp:single-truc-checks (at most 1 unconfirmed ancestor +
 1 descendant, TRUC_MAX_VSIZE, a 1000-vsize child cap, and v3<->non-v3 spend
 inheritance), so v3 is relayed with its anti-pinning guarantees.")
 
-(defparameter +dust-relay-fee-rate+ 3000
+(defvar *dust-relay-fee-rate* 3000
   "Dust relay fee rate in satoshis per kvB (Bitcoin Core DUST_RELAY_TX_FEE).
 An output is dust when spending it would cost more than 1/3 its value at
 this rate (~546 sat for P2PKH, ~294 sat for P2WPKH).
@@ -306,7 +306,7 @@ GetDustThreshold). Unspendable (OP_RETURN) outputs return 0 — never dust."
         ;; CFeeRate::GetFee rounds UP (EvaluateFeeUp) at d3056bc; a no-op at
         ;; the 3000 sat/kvB default (3*nsize is always exact) but keeps this
         ;; aligned with the wallet's parameterized dust threshold.
-        (ceiling (* nsize +dust-relay-fee-rate+) 1000))))
+        (ceiling (* nsize *dust-relay-fee-rate*) 1000))))
 
 (defconstant +max-dust-outputs-per-tx+ 1
   "How many dust outputs a standard transaction may carry (Core
@@ -466,8 +466,7 @@ have no policy rules."
           (loop for item in (butlast wstack 2)
                 always (<= (length item) +max-standard-tapscript-stack-item-size+)))
          (t t)))                                     ; non-tapscript leaf: no item rule
-      ((= n 1) t)                                    ; key-path: no policy rules
-      (t nil))))                                     ; 0 items: invalid by consensus
+      ((= n 1) t))))                                     ; 0 items: invalid by consensus
 
 (defun input-witness-standard-p (wstack spk script-sig)
   "Whether one input's witness WSTACK is standard for the output SPK it spends
