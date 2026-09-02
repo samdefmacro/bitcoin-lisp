@@ -645,7 +645,7 @@ says which is which, so nothing else needs to be passed in."
            (limit (if multi-a +max-pubkeys-per-multi-a+ +max-pubkeys-per-multisig+))
            (threshold (and (plusp (length thres-str))
                           (every #'digit-char-p thres-str)
-                          (ignore-errors (parse-integer thres-str)))))
+                          (parse-integer thres-str))))
       (unless (and threshold (<= threshold #xffffffff))
         (%desc-error "Multi threshold '~A' is not valid" thres-str))
       (let ((keys '()))

@@ -7,12 +7,16 @@
 (defmacro with-current-node-lock (&body body)
   "Execute BODY while holding the node lock for thread-safe state access.
 Guards shared state (chain-state, UTXO set, mempool, peer list) against
-concurrent access from RPC and sync threads."
-  `(let ((node bl::*node*))
-     (if (and node (bl::node-lock node))
-         (bt:with-recursive-lock-held ((bl::node-lock node))
-           ,@body)
-         (progn ,@body))))
+concurrent access from RPC and sync threads. The node is read from
+bl::*node* into a private binding: BODY's own NODE variables are untouched
+(the first version bound the literal name NODE around BODY). RPC handlers,
+which always hold a node, use bl.rpc::with-node-lock (node) instead."
+  (let ((node (gensym "NODE")))
+    `(let ((,node bl::*node*))
+       (if (and ,node (bl::node-lock ,node))
+           (bt:with-recursive-lock-held ((bl::node-lock ,node))
+             ,@body)
+           (progn ,@body)))))
 
 (defstruct peer-manager
   "Manages connections to multiple peers."
