@@ -47,9 +47,10 @@ otherwise (lists, booleans)."
                                                 :initial-element 0)))
         (t nil)))
 
-(defun %message-codec-forms (type br bb value)
-  "(values slot-type read-form write-form default) for TYPE, with BR, BB and
-VALUE substituted for the template variables."
+(defun field-codec-forms (type br bb value)
+  "(values slot-type read-form write-form default) for the field TYPE, with
+BR, BB and VALUE substituted for the template variables. The one codec table
+behind DEFINE-MESSAGE and the wallet's DEFINE-WDB-KEY / DEFINE-WDB-VALUE."
   (flet ((substitute-vars (form) (sublis `((br . ,br) (bb . ,bb) (value . ,value)) form))
          (bad () (internal-error "define-message: unknown field type ~S" type)))
     (cond
@@ -78,7 +79,7 @@ VALUE substituted for the template variables."
        (destructuring-bind (element &key max name) (rest type)
          (let ((item (gensym "ITEM")))
            (multiple-value-bind (item-type item-read item-write)
-               (%message-codec-forms element br bb item)
+               (field-codec-forms element br bb item)
              (declare (ignore item-type))
              (values 'list
                      `(loop repeat (br-read-bounded-count ,br ,max ,name)
@@ -148,7 +149,7 @@ reader binds the slots in order, so a :READ form may consult an earlier one."
                                        (internal-error "define-message ~A: a :custom field (~A) needs :read, :write and :slot-type"
                                               name slot))
                                      (values t nil nil (%message-default-for slot-type)))
-                                   (%message-codec-forms type br bb value))
+                                   (field-codec-forms type br bb value))
                              (let ((final-type (if slot-type-p slot-type derived-type)))
                                (list slot
                                      (cond (default-p default)
