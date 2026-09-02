@@ -183,7 +183,7 @@ in O(1); they were lists, making large-input txs O(n^2) (B.1-vectorize)."
 (defun transaction-has-witness-p (tx)
   "Check if TX has witness data."
   (and (transaction-witness tx)
-       (some (lambda (stack) (and stack (and stack t)))
+       (some (lambda (stack) (and stack t))
              (transaction-witness tx))))
 
 (defmacro dovector ((var vector &optional result) &body body)

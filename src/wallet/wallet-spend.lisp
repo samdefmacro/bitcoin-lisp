@@ -31,7 +31,7 @@
 ;;;
 ;;; Money discipline: ALL amounts and feerates in this file are INTEGER
 ;;; satoshis / integer sat-per-kvB. The only floats are at the JSON edge
-;;; (%btc on output; %amount-from-value / %feerate-from-value convert
+;;; (satoshi->btc on output; %amount-from-value / %feerate-from-value convert
 ;;; incoming JSON numbers to integers immediately).
 ;;;
 ;;; Locking: the whole build+sign+commit+broadcast sequence runs under
@@ -526,8 +526,7 @@ descriptor InferDescriptor would produce; NIL when not solvable."
                    (when msat
                      (values (+ (bl.ser:compact-size-length (length witness))
                                 (length witness) msat)
-                             t elems))))))))
-      (t nil))))
+                             t elems)))))))))))
 
 (defun %max-input-weight (wallet cc script &key (tx-is-segwit t))
   "Core MaxInputWeight (spend.cpp:69-90): full weight of the signed input
@@ -558,8 +557,7 @@ witness program."
     ((:witness-v0-keyhash :witness-v0-scripthash :witness-v1-taproot) t)
     (:scripthash
      (multiple-value-bind (sat segwit) (%script-sat-weight wallet cc script)
-       (and sat segwit t)))
-    (t nil)))
+       (and sat segwit t)))))
 
 (defun %max-signed-tx-size (wallet cc tx txouts)
   "Core CalculateMaximumSignedTxSize over TXOUTS (parallel to the inputs;

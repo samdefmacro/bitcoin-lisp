@@ -106,8 +106,7 @@ dial time via proxy-for-target."
   (case network
     ((:ipv4 :ipv6) t)
     (:torv3 (and *onion-proxy* t))
-    (:cjdns *cjdns-reachable*)
-    (t nil)))
+    (:cjdns *cjdns-reachable*)))
 
 (defun maybe-flip-ipv6-to-cjdns (network bytes)
   "Retag an :ipv6 address whose first byte is 0xFC as :cjdns when the CJDNS

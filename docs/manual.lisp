@@ -80,7 +80,12 @@
   announce a block connected or disconnected, a tip update, a transaction
   added or removed, and the wallet, ZMQ, the indexes and the node's own
   housekeeping subscribe with `define-validation-hook` -- so the lower
-  layers name nothing above themselves).
+  layers name nothing above themselves). Subscribers run in registration
+  order, which the load order fixes as ZMQ, the indexes, the wallet, and a
+  block's hooks fire after the without-interrupts section that applied it:
+  an interrupt in that window leaves an index one block behind the tip,
+  and its startup catch-up closes the gap, as Core's asynchronous indexes
+  do.
 
   Invariants: nothing here knows a chain except through the
   `chain-params` table; a file that DEFINES a package ends with

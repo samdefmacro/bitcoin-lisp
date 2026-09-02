@@ -523,7 +523,10 @@ and testnet min-difficulty exception."
       ;; were :bad-difficulty.
       ((member bl:*network* '(:mainnet :signet))
        (bl.ser:block-header-bits
-        (bl.store:block-index-entry-header prev-entry))))))
+        (bl.store:block-index-entry-header prev-entry)))
+      ;; Non-boundary on testnet: NIL tells the caller to check the
+      ;; timestamp-based min-difficulty rule or walk back.
+      (t nil))))
 
 (defun validate-difficulty (header height prev-entry)
   "Validate that HEADER's bits field matches expected difficulty at HEIGHT.
@@ -736,15 +739,19 @@ container), falling back to 4 where that file does not exist. SBCL exports no
 portable CPU count and neither does bordeaux-threads, so the choice is this or
 a guess; a wrong guess here oversubscribes the box Core was told to leave
 headroom on."
-  (or (ignore-errors
-       (with-open-file (in #p"/proc/cpuinfo" :if-does-not-exist nil)
-         (when in
-           (let ((n 0))
-             (loop for line = (read-line in nil) while line
-                   do (when (and (>= (length line) 9)
-                                 (string= "processor" (subseq line 0 9)))
-                        (incf n)))
-             (and (plusp n) n)))))
+  (or (handler-case
+          (with-open-file (in #p"/proc/cpuinfo" :if-does-not-exist nil)
+            (when in
+              (let ((n 0))
+                (loop for line = (read-line in nil) while line
+                      do (when (and (>= (length line) 9)
+                                    (string= "processor" (subseq line 0 9)))
+                           (incf n)))
+                (and (plusp n) n))))
+        ;; A file we cannot open or read is the same as no file. Anything
+        ;; else is a bug in this function and propagates: the old
+        ;; IGNORE-ERRORS turned it into "4 cores" silently.
+        ((or file-error stream-error) () nil))
       4))
 
 (defun parse-par-threads (value)
@@ -1279,7 +1286,9 @@ Returns the decoded height, or NIL if the leading push is malformed."
        (let ((height 0))
          (loop for i from 1 to push-len
                do (setf height (logior height (ash (aref script-sig i) (* 8 (1- i))))))
-         height)))))
+         height))
+      ;; Other encodings are not valid for BIP 34.
+      (t nil))))
 
 (defun validate-coinbase-height (block current-height)
   "Validate BIP 34: at/above the network activation height, the coinbase
@@ -2060,17 +2069,25 @@ deleted."
   (let ((deleted 0))
     (when (and *undo-base-path* (plusp horizon))
       (dolist (file (directory (merge-pathnames "*.dat" *undo-base-path*)))
-        (let* ((hash (ignore-errors
-                      (bl.crypto:hex-to-bytes (pathname-name file))))
+        (let* ((name (pathname-name file))
+               (hash (and (= (length name) 64)
+                          (every (lambda (c) (digit-char-p c 16)) name)
+                          (bl.crypto:hex-to-bytes name)))
                (entry (and hash
-                           (= (length hash) 32)
                            (bl.store:get-block-index-entry
                             chain-state hash))))
-          ;; Delete when the block is at/below the pruned horizon, or when
-          ;; the hash is unknown to the index entirely (stale fork remnant).
+          ;; Delete when the block is at/below the pruned horizon, when the
+          ;; hash is unknown to the index entirely (stale fork remnant), or
+          ;; when the name is not a block hash at all: the directory holds
+          ;; one <block-hash>.dat per block and nothing else, so a .dat
+          ;; file named otherwise is garbage, and it is said so -- the
+          ;; parse used to fail into NIL through an IGNORE-ERRORS and the
+          ;; file went as if it were an unknown hash.
           (when (or (null entry)
-                    (<= (bl.store:block-index-entry-height entry)
-                        horizon))
+                    (<= (bl.store:block-index-entry-height entry) horizon))
+            (unless hash
+              (bl:log-info "undo sweep: deleting ~A, not a block-hash name"
+                           (file-namestring file)))
             (ignore-errors (delete-file file))
             (when hash (remhash hash *undo-cache-heights*))
             (incf deleted)))))
@@ -2701,7 +2718,9 @@ Handles chain reorganizations when a competing chain has more work."
                            current-best-entry entry
                            :fee-estimator fee-estimator
                            :recent-rejects recent-rejects
-                           :mempool mempool)))))))
+                           :mempool mempool)))
+          ;; New block is on a weaker chain: it is stored, nothing more.
+          (t nil)))))
 
       (values entry reorg-outcome)))))
 

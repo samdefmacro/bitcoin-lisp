@@ -1879,8 +1879,7 @@ would let the ordinary tip+1 path preempt the scenario)."
                              :chain-work bw :status :header-valid)))
                     (bl.store:add-block-index-entry csa e)
                     (setf prev e))))
-       (let ((bl.net:*ibd-context*
-               (bl.net::make-ibd)))
+       (with-ibd-context
          (let ((ctx bl.net:*ibd-context*))
            ;; B4 arrives FIRST (out of order, above tip+1): persisted to
            ;; disk, recorded as reorg candidate — but gated (fork bodies
@@ -1949,8 +1948,7 @@ post-persist without the fallback, stranded on disk forever)."
                       :status :header-valid)))
              (bl.store:add-block-index-entry csa e)
              (setf prev e))))
-       (let ((bl.net:*ibd-context*
-               (bl.net::make-ibd)))
+       (with-ibd-context
          (let ((ctx bl.net:*ibd-context*))
            ;; A4 arrives out of order: persisted + RAM-queued + recorded.
            (bl.net::process-received-block a4 csa utxoa storea)

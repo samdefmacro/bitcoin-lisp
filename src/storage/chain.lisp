@@ -1122,8 +1122,7 @@ the log can revert a block from :invalid back to :valid. That is the failure
 %ENTRY-PERSIST-KEY's docstring warns about, arriving by a different route."
   (case version
     (1 185)   ; hash+height+header+chainwork+status+prev+tx-count
-    (2 197)   ; ... + file + data-pos + undo-pos
-    (t nil)))
+    (2 197)))   ; ... + file + data-pos + undo-pos
 
 (defun %replay-header-index-delta (state)
   "Apply the delta log beside the snapshot, if it belongs to THIS snapshot.
