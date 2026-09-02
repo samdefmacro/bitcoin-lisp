@@ -150,6 +150,16 @@ it hunts."
                  (when (> end start)
                    (setf (gethash (subseq src start end) refs) t))
                  (setf i start))))
+    ;; A DEFINE-P2P-HANDLER row installs HANDLE-<command> in the dispatch
+    ;; table by symbol; the wire is its caller, and xref cannot see a funcall
+    ;; through a table any more than it sees a hook. The row IS the reference.
+    (let ((i 0))
+      (loop while (setf i (search "(define-p2p-handler " src :start2 i))
+            do (let* ((quote-pos (position #\" src :start i))
+                      (end (and quote-pos (position #\" src :start (1+ quote-pos)))))
+                 (when (and quote-pos end (< (- quote-pos i) 40))
+                   (setf (gethash (format nil "handle-~A" (subseq src (1+ quote-pos) end)) refs) t))
+                 (setf i (+ i 20)))))
     refs))
 
 (defvar *orphan-sweep-cache* nil
@@ -228,7 +238,11 @@ drift cannot turn this control into a false alarm."
     (let ((refs (%function-object-references "(setf *hook* #'tx-request-disconnected-peer)")))
       (is-true (gethash "tx-request-disconnected-peer" refs))
       (is-false (gethash "tx-request-disconnected" refs)
-                "a prefix of a referenced name must not count as referenced"))))
+                "a prefix of a referenced name must not count as referenced"
+  (is (gethash "handle-probe"
+               (%function-object-references
+                "(define-p2p-handler (\"probe\" :needs-mempool t) (p q c) nil)"))
+      "positive control: a define-p2p-handler row must count as a reference to handle-<command>")))))
 
 
 ;;;; ====================================================================

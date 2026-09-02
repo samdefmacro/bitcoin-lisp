@@ -302,6 +302,9 @@ headerssync.cpp. src/networking/.")
    #:*banned-peers*
    ;; DoS protection
    #:check-peer-rate-limit
+   #:define-p2p-handler
+   #:p2p-handler-for
+   #:p2p-handler-function
    #:check-handshake-timeout
    #:init-peer-rate-limiters
    #:peer-connect-time

@@ -2232,7 +2232,7 @@ ReceivedResponse; handle-notfound re-runs the scheduler)."
                           24)))
     (is-true (bl.net:tx-request-wanted-p txid p1))
     (is-false (bl.net:tx-request-wanted-p txid p2))
-    (bl.net::handle-notfound p1 payload)
+    (bl.net::handle-notfound p1 payload nil)
     ;; Failed over to p2; p1's announcement is gone.
     (is (eq p2 (car (gethash txid bl.net::*tx-in-flight*))))
     (is (= 0 (bl.net:tx-request-count p1)))
@@ -3008,9 +3008,10 @@ that handle-getdata reads chain-state out of it and nobody ignores it."
   (let ((src (uiop:read-file-string
               (merge-pathnames "src/networking/protocol.lisp"
                                (asdf:system-source-directory :bitcoin-lisp)))))
-    (is (search "(handle-getdata peer payload ctx)" src)
-        "the message dispatch no longer hands handle-getdata the node context")
-    (let ((start (search "(defun handle-getdata " src)))
+    (is (string= "HANDLE-GETDATA"
+                 (symbol-name (bl.net:p2p-handler-function (bl.net:p2p-handler-for "getdata"))))
+        "the message table no longer routes getdata to handle-getdata")
+    (let ((start (search "(define-p2p-handler (\"getdata\"" src)))
       (is (and start (search "(bl.ctx:with-node-context (chain-state" src :start2 start))
           "handle-getdata no longer reads chain-state from the context"))
     (is (null (search "(declare (ignore chain-state))" src))

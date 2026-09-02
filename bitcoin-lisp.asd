@@ -248,7 +248,8 @@ this same package."
                  ;; The transport below these (connection, addrman, tor, ...)
                  ;; is bitcoin-lisp/net; these are the protocol on top of it.
                  (:module "networking"
-                  :components ((:file "txreconciliation-set")
+                  :components ((:file "p2p-handlers")
+                               (:file "txreconciliation-set")
                                (:file "peer")
                                (:file "protocol")
                                (:file "headers-sync")

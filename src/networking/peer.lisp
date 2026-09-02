@@ -1398,12 +1398,12 @@ periodic tick rather than once at handshake."
     (setf (peer-last-ping-time peer) (get-internal-real-time))
     (send-message peer (bl.ser:make-ping-message nonce))))
 
-(defun handle-ping (peer nonce)
-  "Handle a ping message by sending a pong."
+(defun reply-to-ping (peer nonce)
+  "Answer a ping carrying NONCE with the pong; HANDLE-PING parses the wire."
   (send-message peer (bl.ser:make-pong-message nonce)))
 
-(defun handle-pong (peer nonce)
-  "Handle a pong message."
+(defun record-pong (peer nonce)
+  "Record the round trip a pong carrying NONCE closes; HANDLE-PONG parses the wire."
   (when (and (peer-ping-nonce peer)
              (= nonce (peer-ping-nonce peer)))
     (let ((rtt (- (get-internal-real-time) (peer-last-ping-time peer))))
@@ -1822,22 +1822,12 @@ active bans loaded; NIL when the file is absent/unreadable."
 
 ;;; Per-Peer Rate Limiting
 
-(defun check-peer-rate-limit (peer command)
-  "Check if PEER is within rate limits for COMMAND.
-Returns T if allowed, NIL if rate limit exceeded."
-  (let ((bucket (cond
-                  ((string= command "inv") (peer-rate-limit-inv peer))
-                  ((string= command "tx") (peer-rate-limit-tx peer))
-                  ((string= command "addr") (peer-rate-limit-addr peer))
-                  ((string= command "addrv2") (peer-rate-limit-addr peer))
-                  ((string= command "getdata") (peer-rate-limit-getdata peer))
-                  ((string= command "headers") (peer-rate-limit-headers peer))
-                  ;; Serve requests share one bucket (getheaders/getblocks each
-                  ;; walk the active chain; bound the aggregate load).
-                  ((string= command "getheaders") (peer-rate-limit-serve peer))
-                  ((string= command "getblocks") (peer-rate-limit-serve peer))
-                  ((string= command "getaddr") (peer-rate-limit-serve peer))
-                  (t nil))))  ; No rate limit for other message types
-    (if bucket
-        (bl:token-bucket-allow-p bucket)
-        t)))
+(defun check-peer-rate-limit (peer command &optional (handler (p2p-handler-for command)))
+  "Check if PEER is within rate limits for COMMAND: T if allowed, NIL if the
+command's token bucket (its DEFINE-P2P-HANDLER :rate-bucket) is empty. A
+command with no bucket, or none this node handles, is always allowed.
+HANDLER is COMMAND's table row; HANDLE-MESSAGE passes the one it already
+looked up."
+  (let ((bucket (and handler (p2p-handler-rate-bucket handler))))
+    (or (null bucket)
+        (bl:token-bucket-allow-p (funcall bucket peer)))))

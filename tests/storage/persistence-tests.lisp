@@ -818,7 +818,7 @@ one unanswered for TIMEOUT_INTERVAL (20 min) disconnects the peer."
                          (peer-with-ping 1201))))
     ;; A pong clears the outstanding ping.
     (let ((peer (peer-with-ping 1)))
-      (bl.net::handle-pong peer 7)
+      (bl.net::record-pong peer 7)
       (is (null (bl.net:peer-ping-nonce peer)))))
   ;; A peer that has NEVER been pinged is due now, not in two minutes. Core
   ;; encodes this as m_ping_start{0us} against an absolute clock, so
@@ -830,7 +830,7 @@ one unanswered for TIMEOUT_INTERVAL (20 min) disconnects the peer."
     (is (eq :ping-sent (bl.net:check-peer-health peer)))
     (is (bl.net:peer-ping-nonce peer))
     ;; And having just pinged, it does not ping again.
-    (bl.net::handle-pong
+    (bl.net::record-pong
      peer (bl.net:peer-ping-nonce peer))
     (is (eq :ok (bl.net:check-peer-health peer))))
   ;; The positive control for the bug this replaced: the old code compared
