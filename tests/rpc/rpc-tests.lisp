@@ -3634,22 +3634,22 @@ safe version — asserted here with a size large enough to have overflowed a
 
 ;;; estimatesmartfee tests
 
-(defmacro %with-stubbed-fee-estimate ((&key (rate 10) (error-msg nil)
-                                            (returned-target nil)
-                                            (mode-out nil))
+(defmacro %with-stubbed-fee-estimate ((node &key (rate 10) (error-msg nil)
+                                                 (returned-target nil)
+                                                 (mode-out nil))
                                       &body body)
-  "Run BODY with the fee estimator answering RATE sat/vB (or ERROR-MSG), and
-with MODE-OUT — a symbol naming a place — receiving the mode the RPC passed."
+  "Run BODY with NODE's fee estimator answering RATE sat/vB (or ERROR-MSG),
+and with MODE-OUT -- a symbol naming a place -- receiving the mode the RPC
+passed. A test node has no estimator, and the RPC's first gate is its
+presence -- without one the stubs below are never reached and every
+assertion silently measures the no-estimate path instead. The slot is set,
+not the accessor stubbed: the node struct loads before the RPC code now, so
+its accessors inline there and a redefinition would not be seen."
   `(let ((real-ready (fdefinition 'bl.mp:fee-estimator-ready-p))
-         (real-est (fdefinition 'bl.mp:estimate-fee-rate))
-         ;; A test node has no estimator, and the RPC's first gate is its
-         ;; presence — without one the stub below is never reached and every
-         ;; assertion silently measures the no-estimate path instead.
-         (real-getter (fdefinition 'bl:node-fee-estimator)))
+         (real-est (fdefinition 'bl.mp:estimate-fee-rate)))
+     (setf (bl:node-fee-estimator ,node) :stub-estimator)
      (unwind-protect
           (progn
-            (setf (fdefinition 'bl:node-fee-estimator)
-                  (lambda (&rest args) (declare (ignore args)) :stub-estimator))
             (setf (fdefinition 'bl.mp:fee-estimator-ready-p)
                   (lambda (&rest args) (declare (ignore args)) t))
             (setf (fdefinition 'bl.mp:estimate-fee-rate)
@@ -3659,8 +3659,7 @@ with MODE-OUT — a symbol naming a place — receiving the mode the RPC passed.
                     (values ,rate ,error-msg (or ,returned-target conf-target))))
             ,@body)
        (setf (fdefinition 'bl.mp:fee-estimator-ready-p) real-ready
-             (fdefinition 'bl.mp:estimate-fee-rate) real-est
-             (fdefinition 'bl:node-fee-estimator) real-getter))))
+             (fdefinition 'bl.mp:estimate-fee-rate) real-est))))
 
 (test estimatesmartfee-omits-feerate-when-there-is-no-estimate
   "Core returns ONLY errors and blocks when the estimator has nothing
@@ -3684,7 +3683,7 @@ that did not name a mode was quietly told to overpay."
   (let ((node (make-test-node))
         (bl::*syncing* nil)
         (seen nil))
-    (%with-stubbed-fee-estimate (:rate 10 :mode-out seen)
+    (%with-stubbed-fee-estimate (node :rate 10 :mode-out seen)
       (bl.rpc::rpc-estimatesmartfee node '(6))
       (is (eq :economical seen) "default mode was ~S" seen)
       (bl.rpc::rpc-estimatesmartfee node '(6 "conservative"))
@@ -3702,7 +3701,7 @@ risen recommends a fee BELOW its own acceptance threshold: it rejects the very
 transaction it just priced."
   (let ((node (make-test-node))
         (bl::*syncing* nil))
-    (%with-stubbed-fee-estimate (:rate 10)   ; 10 sat/vB = 10000 sat/kvB
+    (%with-stubbed-fee-estimate (node :rate 10)   ; 10 sat/vB = 10000 sat/kvB
       ;; Floor below the estimate: the estimate stands.
       (let ((result (bl.rpc::rpc-estimatesmartfee node '(6))))
         (is (= (/ 10000 100000000.0d0)
@@ -3723,7 +3722,7 @@ to what its history can justify. Echoing the request tells a caller the answer
 covers a horizon it does not."
   (let ((node (make-test-node))
         (bl::*syncing* nil))
-    (%with-stubbed-fee-estimate (:rate 10 :returned-target 100)
+    (%with-stubbed-fee-estimate (node :rate 10 :returned-target 100)
       (let ((result (bl.rpc::rpc-estimatesmartfee node '(1008))))
         (is (= 100 (cdr (assoc "blocks" result :test #'string=)))
             "blocks echoed the request instead of the estimator's answer")))))

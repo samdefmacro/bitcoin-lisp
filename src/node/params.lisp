@@ -5,7 +5,8 @@
   (require :sb-sprof))
 
 ;;;; The node (Core init.cpp / bitcoind.cpp), one file per concern, loaded in
-;;;; this order: params, state, notify, datadir, rpc-config, logging, entropy,
+;;;; this order (state.lisp, the node struct, loads much earlier -- right after
+;;;; config.lisp): params, notify, datadir, rpc-config, logging, entropy,
 ;;;; housekeeping, eviction, recovery, listen, mempool-persist, assumeutxo,
 ;;;; shutdown, indexes, flush, reindex, wallet-hooks, peers, sync, init.
 
