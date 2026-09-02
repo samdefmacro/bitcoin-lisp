@@ -1106,89 +1106,36 @@ accessor of a struct defined by a macro, say) is skipped, not flagged."
 
 (defparameter +top-package-upward-baseline+
   '(
-    ("src/mining/assembler.lisp" . "bl:*node*")
-    ("src/mining/assembler.lisp" . "bl:node-lock")
-    ("src/networking/peer.lisp" . "bl:node-mempool")
     ("src/networking/peer.lisp" . "bl:*mainnet-relay-enabled*")
-    ("src/networking/peer.lisp" . "bl:node-historical-chainstate")
-    ("src/networking/peer.lisp" . "bl:*node*")
-    ("src/networking/peer.lisp" . "bl:node-current-chainstate")
-    ("src/networking/protocol.lisp" . "bl:node-lock")
     ("src/networking/protocol.lisp" . "bl:rebalance-caches-on-ibd-exit")
     ("src/networking/protocol.lisp" . "bl:+pow-target-spacing-seconds+")
-    ("src/networking/protocol.lisp" . "bl:node-blockfilterindex")
-    ("src/networking/protocol.lisp" . "bl:*node*")
-    ("src/networking/protocol.lisp" . "bl:node-address-book")
-    ("src/rpc/accessors.lisp" . "bl:node-current-chainstate")
-    ("src/rpc/accessors.lisp" . "bl:node-chainstates")
-    ("src/rpc/accessors.lisp" . "bl:node-peers")
-    ("src/rpc/accessors.lisp" . "bl:node-mempool")
-    ("src/rpc/accessors.lisp" . "bl:node-block-store")
-    ("src/rpc/accessors.lisp" . "bl:node-network")
-    ("src/rpc/accessors.lisp" . "bl:node-syncing")
-    ("src/rpc/accessors.lisp" . "bl:node-tx-index")
-    ("src/rpc/accessors.lisp" . "bl:node-blockfilterindex")
-    ("src/rpc/accessors.lisp" . "bl:node-lock")
-    ("src/rpc/accessors.lisp" . "bl:node-coinstatsindex")
     ("src/rpc/blockchain.lisp" . "bl:chainstate-coins-cache-budget")
-    ("src/rpc/blockchain.lisp" . "bl:node-running")
-    ("src/rpc/blockchain.lisp" . "bl:node-network-active")
     ("src/rpc/blockchain.lisp" . "bl:create-snapshot-chainstate")
     ("src/rpc/blockchain.lisp" . "bl:add-snapshot-chainstate")
     ("src/rpc/blockchain.lisp" . "bl:abort-snapshot-chainstate")
     ("src/rpc/blockchain.lisp" . "bl:call-with-sync-paused")
-    ("src/rpc/blockchain.lisp" . "bl:node-network")
-    ("src/rpc/blockchain.lisp" . "bl:node-lock")
-    ("src/rpc/blockchain.lisp" . "bl:node-peers")
-    ("src/rpc/mempool.lisp" . "bl:node-txospenderindex")
-    ("src/rpc/mempool.lisp" . "bl:node-block-store")
     ("src/rpc/mempool.lisp" . "bl:broadcast-transaction-to-peers")
-    ("src/rpc/mempool.lisp" . "bl:node-data-directory")
     ("src/rpc/mempool.lisp" . "bl:load-mempool-from-disk")
-    ("src/rpc/mining.lisp" . "bl:node-running")
-    ("src/rpc/mining.lisp" . "bl:node-peers")
-    ("src/rpc/mining.lisp" . "bl:node-network")
-    ("src/rpc/net.lisp" . "bl:node-max-peers")
     ("src/rpc/net.lisp" . "bl:peers-of-conn-type")
     ("src/rpc/net.lisp" . "bl:+target-block-relay-peers+")
     ("src/rpc/net.lisp" . "bl:*pending-test-connections*")
-    ("src/rpc/net.lisp" . "bl:node-pending-onetry")
-    ("src/rpc/net.lisp" . "bl:node-added-nodes")
     ("src/rpc/net.lisp" . "bl:parse-node-endpoint")
-    ("src/rpc/net.lisp" . "bl:node-network-active")
-    ("src/rpc/net.lisp" . "bl:node-address-book")
-    ("src/rpc/net.lisp" . "bl:node-lock")
-    ("src/rpc/net.lisp" . "bl:node-peers")
-    ("src/rpc/node.lisp" . "bl:*node-start-time*")
     ("src/rpc/node.lisp" . "bl:request-node-shutdown")
     ("src/rpc/node.lisp" . "bl:*log-file-path*")
     ("src/rpc/node.lisp" . "bl:node-indexes")
-    ("src/rpc/rawtransaction.lisp" . "bl:node-fee-estimator")
-    ("src/rpc/rest.lisp" . "bl:node-tip-liveness")
     ("src/validation/block.lisp" . "bl:gate-block-write-on-disk-space")
     ("src/validation/block.lisp" . "bl:effective-prune-target-bytes")
     ("src/validation/block.lisp" . "bl:maybe-critical-flush")
     ("src/validation/block.lisp" . "bl:maybe-validate-snapshot")
-    ("src/wallet/psbt.lisp" . "bl:node-mempool")
-    ("src/wallet/wallet-coins.lisp" . "bl:node-mempool")
-    ("src/wallet/wallet-spend.lisp" . "bl:node-fee-estimator")
-    ("src/wallet/wallet-spend.lisp" . "bl:node-current-chainstate")
-    ("src/wallet/wallet-spend.lisp" . "bl:broadcast-transaction-to-peers")
-    ("src/wallet/wallet-spend.lisp" . "bl:node-wallet-manager")
-    ("src/wallet/wallet-spend.lisp" . "bl:node-chain-state")
-    ("src/wallet/wallet-spend.lisp" . "bl:node-mempool")
-    ("src/wallet/wallet-tx.lisp" . "bl:node-mempool")
-    ("src/wallet/wallet-tx.lisp" . "bl:node-block-store")
-    ("src/wallet/wallet-tx.lisp" . "bl:node-current-chainstate")
-    ("src/wallet/wallet.lisp" . "bl:node-current-chainstate")
-    ("src/wallet/wallet.lisp" . "bl:node-mempool")
-    ("src/wallet/wallet.lisp" . "bl:node-wallet-manager"))
+    ("src/wallet/wallet-spend.lisp" . "bl:broadcast-transaction-to-peers"))
   "Pinned (file . \"bl:name\") pairs a src file reaches upward into the top
 package -- 77 distinct pairs on the scanner's first run (wave F, after the
-validation interface took validation's and the mempool's fourteen away);
-allowed only to shrink. Nearly all are the node struct's accessors and
-*node* (src/node/state.lisp, last in the load) reached from rpc, wallet,
-networking and mining -- one file move (wave F2) retires that group. Each entry is a layer boundary the code crosses by name; the
+validation interface took validation's and the mempool's fourteen away),
+22 once src/node/state.lisp loaded early (wave F2); allowed only to
+shrink. What remains is node machinery reached from rpc, networking and
+validation by name -- snapshot chainstates, the flush budget, the
+disk-space gate, peer endpoints, shutdown -- each a candidate to move
+down or to announce through the validation interface. Each entry is a layer boundary the code crosses by name; the
 validation interface (src/util/validation-interface.lisp) is how the
 lower layer announces instead.")
 
@@ -1447,12 +1394,12 @@ the measuring functions must measure a known shape correctly."
                                   "(private-key-to-wif k :network :testnet)"
                                   "\":testnet\"")))))
       "positive control: the pseudo-network scanner must flag :testnet in code and only there")
-  (is (equal '(("src/validation/probe.lisp" . "bl:node-lock"))
+  (is (equal '(("src/validation/probe.lisp" . "bl:request-node-shutdown"))
              (%top-package-upward-references
               (list (cons "src/validation/probe.lisp"
-                          (vector "(bl:node-lock x) (bl.store:chain-state y) (bl:*network* z) ; bl:node-peers"
-                                  "\"bl:node-mempool\"")))))
-      "positive control: a validation file naming the node struct's accessor (src/node/state.lisp) is upward; a re-exported chainparams special is not")
+                          (vector "(bl:request-node-shutdown x) (bl.store:chain-state y) (bl:*network* z) (bl:node-lock w) ; bl:maybe-critical-flush"
+                                  "\"bl:maybe-critical-flush\"")))))
+      "positive control: a validation file naming a src/node/ function (shutdown.lisp) is upward; a re-exported chainparams special and the node struct's accessor (state.lisp loads early since wave F2) are not")
   (is (equal '(("probe.lisp" . 1))
              (%equalp-hash-tables
               (list (cons "probe.lisp"

@@ -214,6 +214,14 @@ this same package."
                  ;; util first: byte I/O that the script interpreter's
                  ;; sighash code inlines must be loaded before src/coalton/.
                  (:file "config")
+                 ;; The node struct and *node* (Core node/context.h) load
+                 ;; right after the globals: every layer above validation
+                 ;; reads the node's slots, and this file needs only the
+                 ;; packages and the storage layer below it. It used to be
+                 ;; the second file of src/node/ -- the LAST module -- so the
+                 ;; rpc, wallet, networking and mining references to it were
+                 ;; upward, invisible to a package-level layering test.
+                 (:file "node/state")
                  (:file "zmq")
                  (:module "coalton"
                   :components ((:file "package")
@@ -304,7 +312,6 @@ this same package."
                   :components (
                                (:file "params")
                                (:file "args")      ; the parsed options meet the node
-                               (:file "state")
                                (:file "notify")
                                (:file "datadir")
                                (:file "rpc-config")
