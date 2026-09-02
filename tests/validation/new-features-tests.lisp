@@ -67,7 +67,7 @@ normal scripts (P2PKH, P2WPKH, bare pubkey, empty) are not."
            (clrhash bl.val::*block-undo-data*)
            (clrhash bl.val::*undo-cache-heights*)
            ;; Load from disk
-           (let ((loaded (bl.val::get-undo-data block-hash)))
+           (let ((loaded (bl.val:get-undo-data block-hash)))
              (is (not (null loaded)))
              (is (= 2 (length loaded)))
              ;; Verify first entry
@@ -100,7 +100,7 @@ normal scripts (P2PKH, P2WPKH, bare pubkey, empty) are not."
            (bl.val:initialize-undo-storage base-path)
            (bl.val::store-undo-data block-hash spent-utxos 501)
            ;; Should hit cache (not disk)
-           (let ((loaded (bl.val::get-undo-data block-hash)))
+           (let ((loaded (bl.val:get-undo-data block-hash)))
              (is (not (null loaded)))
              (is (= 2 (length loaded)))))
       (setf bl.val::*undo-base-path* nil)
@@ -122,7 +122,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
            (bl.val::store-undo-data block-hash spent-utxos 503)
            (clrhash bl.val::*block-undo-data*)
            (clrhash bl.val::*undo-cache-heights*)
-           (let ((loaded (bl.val::get-undo-data block-hash)))
+           (let ((loaded (bl.val:get-undo-data block-hash)))
              (is (= 2 (length loaded))))
            (is (zerop (hash-table-count bl.val::*block-undo-data*)))
            (is (zerop (hash-table-count bl.val::*undo-cache-heights*))))
@@ -150,7 +150,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
                (file-position f 20)
                (write-byte #xFF f)))
            ;; Load should fail (CRC mismatch)
-           (let ((loaded (bl.val::get-undo-data block-hash)))
+           (let ((loaded (bl.val:get-undo-data block-hash)))
              (is (null loaded))))
       (setf bl.val::*undo-base-path* nil)
       (uiop:delete-directory-tree base-path :validate t :if-does-not-exist :ignore))))
@@ -163,7 +163,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
          (progn
            (bl.val:initialize-undo-storage base-path)
            (clrhash bl.val::*block-undo-data*)
-           (is (null (bl.val::get-undo-data block-hash))))
+           (is (null (bl.val:get-undo-data block-hash))))
       (setf bl.val::*undo-base-path* nil)
       (uiop:delete-directory-tree base-path :validate t :if-does-not-exist :ignore))))
 
@@ -179,7 +179,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
            (let ((path (bl.val::undo-file-path block-hash)))
              (is (not (null (probe-file path)))))
            ;; Cache should have the empty list
-           (let ((cached (bl.val::get-undo-data block-hash)))
+           (let ((cached (bl.val:get-undo-data block-hash)))
              ;; Empty list from cache is NIL (which is '()), this is correct
              (is (null cached))))
       (setf bl.val::*undo-base-path* nil)
@@ -323,9 +323,9 @@ reachable here for the first time, and a bare NIL renders as JSON null
          (empty (bl.val:block-script-flags-list
                  bl.val::*bip16-exception-mainnet* 170060)))
     (is (null empty))
-    (is (equalp #() (bl.rpc::json-array empty)))
+    (is (equalp #() (bl.rpc:json-array empty)))
     (is (string= "[]" (with-output-to-string (s)
-                        (yason:encode (bl.rpc::json-array empty) s))))))
+                        (yason:encode (bl.rpc:json-array empty) s))))))
 
 (test taproot-flag-at-activation
   "TAPROOT flag should be present at activation height."

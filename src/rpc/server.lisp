@@ -100,7 +100,7 @@ cleared or a server started after one."
   "Boolean normalization of a parsed request value (booleans arrive as
 'yason:true / 'yason:false from the symbols parse mode): true -> T
 everywhere; false -> the +json-false+ sentinel when TOP-LEVEL (a direct
-positional parameter — handlers read those through %positional-bool so
+positional parameter — handlers read those through positional-bool so
 explicit false, null, and omitted are distinguishable, Core's isNull
 semantics), NIL inside nested arrays/objects (the historical folding —
 object readers distinguish absence via present-p). Hash tables are

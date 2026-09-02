@@ -455,9 +455,9 @@ Core fully validates. A pure chain split: our own script engine accepts the
 spends, which this block proves by validating with scripts on."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "sigop-p2sh"))
-          (cs (bl::node-chain-state node))
-          (utxo (bl::node-utxo-set node))
-          (mempool (bl::node-mempool node))
+          (cs (bl:node-chain-state node))
+          (utxo (bl:node-utxo-set node))
+          (mempool (bl:node-mempool node))
           (spk (%sigop-empty-redeem-spk))
           (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5a)))
      (dotimes (idx 5)

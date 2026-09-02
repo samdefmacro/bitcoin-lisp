@@ -190,12 +190,12 @@ validation-layer dust-threshold is specialized to the 3000 sat/kvB dust
 relay rate)."
   (if (and (plusp (length script)) (= (aref script 0) #x6a)) ; OP_RETURN
       0
-      (let* ((spend-size (if (bl.val::output-witness-program-p
+      (let* ((spend-size (if (bl.val:output-witness-program-p
                               script)
                              (+ 32 4 1 (floor 107 4) 4)
                              (+ 32 4 1 107 4)))
-             (nsize (+ (bl.rpc::%txout-serialize-size script) spend-size)))
-        (bl.rpc::%feerate-fee rate-sat-kvb nsize))))
+             (nsize (+ (bl.rpc:txout-serialize-size script) spend-size)))
+        (bl.rpc:feerate-fee rate-sat-kvb nsize))))
 
 (defun %output-dust-p (value script)
   "Core IsDust at the dust relay feerate: strictly nValue < threshold
@@ -218,7 +218,7 @@ decimal string with at most 3 fraction digits, to integer sat/kvB."
             ((integerp value) (* value 1000))
             ((rationalp value) (let ((m (* value 1000)))
                                  (unless (integerp m)
-                                   (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+                                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                                      :message "Invalid amount"))
                                  m))
             ((floatp value)
@@ -227,7 +227,7 @@ decimal string with at most 3 fraction digits, to integer sat/kvB."
                ;; JSON doubles: accept values that are integral to within
                ;; double noise, exactly like UniValue's decimal parse.
                (unless (< (abs (- m (round m))) 1/1000)
-                 (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                    :message "Invalid amount"))
                (round m)))
             ((stringp value)
@@ -239,16 +239,16 @@ decimal string with at most 3 fraction digits, to integer sat/kvB."
                             (<= (length frac) 3)
                             (or (null dot) (plusp (length frac)))
                             (every #'digit-char-p frac))
-                 (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                    :message "Invalid amount"))
                (+ (* (parse-integer whole) 1000)
                   (if (plusp (length frac))
                       (* (parse-integer frac) (expt 10 (- 3 (length frac))))
                       0))))
-            (t (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+            (t (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                  :message "Amount is not a number or string")))))
     (when (minusp milli)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+ :message "Amount out of range"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+ :message "Amount out of range"))
     milli))
 
 ;;; --- Coin control (Core CCoinControl, the subset the P4 RPCs drive) ---
@@ -354,7 +354,7 @@ node lock (fee estimator + mempool reads)."
              ;; Fallback disabled: return 0 directly (Core returns the zero
              ;; CFeeRate; the caller errors on the FALLBACK reason).
              (return-from %wallet-minimum-fee-rate (values 0 :fallback))))
-         (let* ((mempool (bl::node-mempool node))
+         (let* ((mempool (bl:node-mempool node))
                 (mempool-min (if mempool
                                  (bl.mp:mempool-effective-min-fee-rate
                                   mempool)
@@ -435,7 +435,7 @@ SCRIPT's position, or the coin control's external solving data."
 
 (defun %multisig-sat-size (script)
   "1 + (1 + 72) * m for an m-of-n multisig SCRIPT, or NIL."
-  (multiple-value-bind (m) (bl.rpc::%parse-multisig script)
+  (multiple-value-bind (m) (bl.rpc:parse-multisig script)
     (when m (+ 1 (* (+ 1 +ecdsa-max-sig-size+) m)))))
 
 (defun %miniscript-sat-size-and-elems (witness-script)
@@ -453,10 +453,10 @@ mis-sized.
 
 ELEMS adds one for the witnessScript itself, which the caller pushes and which
 GetWitnessSize deliberately excludes."
-  (let ((node (bl.val::ms-from-script witness-script)))
+  (let ((node (bl.val:ms-from-script witness-script)))
     (when node
-      (let ((bytes (bl.val::ms-node-get-witness-size node))
-            (stack (bl.val::ms-node-get-stack-size node)))
+      (let ((bytes (bl.val:ms-node-get-witness-size node))
+            (stack (bl.val:ms-node-get-stack-size node)))
         (when (and bytes stack)
           (values bytes (1+ stack)))))))
 
@@ -495,7 +495,7 @@ descriptor InferDescriptor would produce; NIL when not solvable."
                    (= (aref redeem 0) #x00) (= (aref redeem 1) #x20))
               (let ((sat (and witness (%multisig-sat-size witness))))
                 (when sat
-                  (multiple-value-bind (m) (bl.rpc::%parse-multisig witness)
+                  (multiple-value-bind (m) (bl.rpc:parse-multisig witness)
                     (values (+ (* 4 (+ 1 (length redeem)))
                                (+ (bl.ser:compact-size-length (length witness))
                                   (length witness) sat))
@@ -504,7 +504,7 @@ descriptor InferDescriptor would produce; NIL when not solvable."
              (t
               (let ((sat (%multisig-sat-size redeem)))
                 (when sat
-                  (multiple-value-bind (m) (bl.rpc::%parse-multisig redeem)
+                  (multiple-value-bind (m) (bl.rpc:parse-multisig redeem)
                     (values (* 4 (+ (+ 1 (length redeem)) sat))
                             nil (+ 2 m))))))))))
       (:witness-v0-scripthash
@@ -513,7 +513,7 @@ descriptor InferDescriptor would produce; NIL when not solvable."
          (when witness
            (let ((sat (%multisig-sat-size witness)))
              (if sat
-                 (multiple-value-bind (m) (bl.rpc::%parse-multisig witness)
+                 (multiple-value-bind (m) (bl.rpc:parse-multisig witness)
                    (values (+ (bl.ser:compact-size-length (length witness))
                               (length witness) sat)
                            t (+ 2 m)))
@@ -576,7 +576,7 @@ control's explicit input weight or NIL). Returns (values vsize weight) or
                           txouts)))
     (when is-segwit (incf weight 2))
     (loop for output across outputs
-          do (incf weight (* 4 (bl.rpc::%txout-serialize-size
+          do (incf weight (* 4 (bl.rpc:txout-serialize-size
                                 (bl.ser:tx-out-script-pubkey
                                  output)))))
     (loop for txo in txouts
@@ -609,7 +609,7 @@ chain findCoins). Returns NIL when unknown. Caller holds both locks."
           (bl.ser:make-tx-out
            :value (bl.store:utxo-entry-value utxo)
            :script-pubkey (bl.store:utxo-entry-script-pubkey utxo))))
-      (let* ((mempool (bl::node-mempool node))
+      (let* ((mempool (bl:node-mempool node))
              (entry (and mempool (bl.mp:mempool-get mempool txid))))
         (when entry
           (let ((outputs (bl.ser:transaction-outputs
@@ -642,7 +642,7 @@ chain findCoins). Returns NIL when unknown. Caller holds both locks."
   (setf (wallet-coin-long-term-fee coin)
         (if (minusp (wallet-coin-input-bytes coin))
             0
-            (bl.rpc::%feerate-fee (out-group-long-term-feerate group)
+            (bl.rpc:feerate-fee (out-group-long-term-feerate group)
                           (wallet-coin-input-bytes coin))))
   (incf (out-group-long-term-fee group) (wallet-coin-long-term-fee coin))
   (incf (out-group-effective-value group)
@@ -719,11 +719,11 @@ TXID's mempool entry, both 0 when not in the mempool."
     (if (null entry)
         (values 0 0)
         (let ((ancestors (bl.mp:mempool-ancestor-stats mempool txid))
-              (handle (bl.mp::mempool-entry-graph-handle entry)))
+              (handle (bl.mp:mempool-entry-graph-handle entry)))
           (values ancestors
                   (if handle
-                      (length (bl.mp::txgraph-get-cluster
-                               (bl.mp::mempool-graph mempool)
+                      (length (bl.mp:txgraph-get-cluster
+                               (bl.mp:mempool-graph mempool)
                                handle))
                       ancestors))))))
 
@@ -750,7 +750,7 @@ TXID's mempool entry, both 0 when not in the mempool."
   "Core GroupOutputs: (values filter-maps discarded-groups) — FILTER-MAPS a
 list of group-maps parallel to FILTERS. Caller holds the node lock (mempool
 ancestry reads)."
-  (let ((mempool (bl::node-mempool node))
+  (let ((mempool (bl:node-mempool node))
         (maps (mapcar (lambda (f) (declare (ignore f)) (make-group-map))
                       filters))
         (discarded '()))
@@ -849,7 +849,7 @@ STR_INTERNAL_BUG on shared UTXOs among selection results)."
                           (= (wallet-coin-index existing)
                              (wallet-coin-index coin))))
                    (sel-result-inputs result))
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                         :message "Internal bug detected: Shared UTXOs among selection results"))
     (setf (sel-result-inputs result)
           (nconc (sel-result-inputs result) (list coin)))))
@@ -915,7 +915,7 @@ STR_INTERNAL_BUG on shared UTXOs among selection results)."
                             (sel-result-selected-effective-value result)
                             (sel-result-selected-value result))))
           (unless (>= selected (sel-result-target result))
-            (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                               :message "Internal bug detected: selection below target in waste computation"))
           (incf waste (- selected (sel-result-target result)))))
     (setf (sel-result-waste result) waste)))
@@ -1055,7 +1055,7 @@ result NIL + message NIL = plain not-found."
             (sel-result-add-group result (aref pool i)))
           (sel-result-recalculate-waste result cost-of-change cost-of-change 0)
           (unless (= best-waste (sel-result-waste result))
-            (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                               :message "Internal bug detected: BnB waste mismatch"))
           (values result nil)))))
 
@@ -1451,7 +1451,7 @@ Returns (values sel-result error-message)."
 index or destination string."
   (when sffo-param
     (unless (listp sffo-param)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                         :message "subtractfeefrom must be an array"))
     (let ((seen (make-hash-table :test 'eql))
           (n (length recipients)))
@@ -1459,22 +1459,22 @@ index or destination string."
         (let ((pos (cond
                      ((stringp sffo)
                       (or (position sffo keys :test #'string=)
-                          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                             :message (format nil "Invalid parameter 'subtract fee from output', destination ~A not found in tx outputs" sffo))))
                      ((integerp sffo) sffo)
-                     (t (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                     (t (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                           :message "Invalid parameter 'subtract fee from output', invalid value type")))))
           (when (gethash pos seen)
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message (format nil "Invalid parameter 'subtract fee from output', duplicated position: ~D" pos)))
           (when (minusp pos)
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message (format nil "Invalid parameter 'subtract fee from output', negative position: ~D" pos)))
           (when (>= pos n)
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message (format nil "Invalid parameter 'subtract fee from output', position too large: ~D" pos)))
           (setf (gethash pos seen) t)
-          (setf (bl.rpc::recipient-sffo (nth pos recipients)) t)))))
+          (setf (bl.rpc:recipient-sffo (nth pos recipients)) t)))))
   recipients)
 
 ;;; --- Change type + change address reservation ---
@@ -1485,7 +1485,7 @@ bech32 (DEFAULT_ADDRESS_TYPE), never legacy."
   (when change-type (return-from %transaction-change-type change-type))
   (let ((any-tr nil) (any-wpkh nil) (any-sh nil) (any-pkh nil))
     (dolist (recipient recipients)
-      (let ((script (bl.rpc::recipient-script recipient)))
+      (let ((script (bl.rpc:recipient-script recipient)))
         (case (bl.val:classify-script script)
           (:witness-v1-taproot (setf any-tr t))
           (:witness-v0-keyhash (setf any-wpkh t))
@@ -1527,7 +1527,7 @@ rewinds next_index only when it is still the most recent
                     (nth-value 1 (bl.crypto:decode-address
                                   address (wallet-network wallet))))
               (values address nil))
-          (bl.rpc::rpc-error (e) (values nil (bl.rpc::rpc-error-message e)))))))
+          (bl.rpc:rpc-error (e) (values nil (bl.rpc:rpc-error-message e)))))))
 
 (defun reservedest-return (rd)
   "DescriptorScriptPubKeyMan::ReturnDestination: rewind next_index iff the
@@ -1546,7 +1546,7 @@ reserved index is still the most recent, and persist."
 
 (defun %current-for-anti-fee-sniping-p (node block-hash)
   "Core IsCurrentForAntiFeeSniping. Caller holds the node lock."
-  (let ((chain-state (bl::node-current-chainstate node)))
+  (let ((chain-state (bl:node-current-chainstate node)))
     (and chain-state
          block-hash
          (not (bl.net:initial-block-download-p chain-state))
@@ -1564,7 +1564,7 @@ reserved index is still the most recent, and persist."
 backed off by rand(100); 0 when the chain lags. Core's asserts are ported
 as hard internal-bug errors (funds-critical invariants)."
   (when (zerop (length (bl.ser:transaction-inputs tx)))
-    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                       :message "Internal bug detected: anti-fee-sniping on an inputless transaction"))
   (if (%current-for-anti-fee-sniping-p node block-hash)
       (progn
@@ -1575,14 +1575,14 @@ as hard internal-bug errors (funds-critical invariants)."
       (setf (bl.ser:transaction-lock-time tx) 0))
   (let ((locktime (bl.ser:transaction-lock-time tx)))
     (unless (and (< locktime +locktime-threshold+) (<= locktime block-height))
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                         :message "Internal bug detected: anti-fee-sniping locktime out of range")))
   (bl.ser:dovector
       (input (bl.ser:transaction-inputs tx))
     (let ((sequence (bl.ser:tx-in-sequence input)))
       (unless (or (= sequence +max-sequence-nonfinal+)
                   (= sequence +max-bip125-rbf-sequence+))
-        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                           :message "Internal bug detected: unsupported nSequence for anti-fee-sniping")))))
 
 ;;; --- Preset input fetch (spend.cpp:269-318 FetchSelectedInputs) ---
@@ -1590,7 +1590,7 @@ as hard internal-bug errors (funds-critical invariants)."
 (defun %outpoint-string (txid vout)
   "COutPoint::ToString: COutPoint(<10-hex-char prefix>, n)."
   (format nil "COutPoint(~A, ~D)"
-          (subseq (bl.rpc::hash-to-hex txid) 0 10) vout))
+          (subseq (bl.rpc:hash-to-hex txid) 0 10) vout))
 
 (defun %fetch-selected-inputs (node wallet cc params)
   "(values wallet-coin-list error-message) for the coin control's preset
@@ -1647,7 +1647,7 @@ inputs, in selection order. Caller holds node + wallet locks."
               (return-from %fetch-selected-inputs
                 (values nil (format nil "Not solvable pre-selected input ~A"
                                     (%outpoint-string txid vout)))))
-            (let ((fee (bl.rpc::%feerate-fee (csel-params-effective-feerate params)
+            (let ((fee (bl.rpc:feerate-fee (csel-params-effective-feerate params)
                                      input-bytes)))
               (push (make-wallet-coin
                      :txid txid :index vout :output txout :wtx nil
@@ -1667,13 +1667,13 @@ inputs, in selection order. Caller holds node + wallet locks."
   "The 32-byte private key a descriptor key expression yields at range
 position POS, or NIL. BIP32 keys derive from the root xprv along the fixed
 path plus the ranged step; const keys come from the parse or PROVIDER."
-  (if (bl.rpc::desc-key-extkey key)
-      (let ((xprv (bl.rpc::%desc-key-root-xprv key provider)))
+  (if (bl.rpc:desc-key-extkey key)
+      (let ((xprv (bl.rpc:desc-key-root-xprv key provider)))
         (when xprv
           (let ((k xprv))
-            (dolist (entry (bl.rpc::desc-key-path key))
+            (dolist (entry (bl.rpc:desc-key-path key))
               (setf k (bl.crypto:bip32-derive-child k entry)))
-            (ecase (bl.rpc::desc-key-derive key)
+            (ecase (bl.rpc:desc-key-derive key)
               (:none)
               (:unhardened
                (setf k (bl.crypto:bip32-derive-child k pos)))
@@ -1681,7 +1681,7 @@ path plus the ranged step; const keys come from the parse or PROVIDER."
                (setf k (bl.crypto:bip32-derive-child
                         k (+ pos bl.crypto:+bip32-hardened+)))))
             (subseq (bl.crypto:ext-key-key k) 1 33))))
-      (nth-value 0 (bl.rpc::%desc-key-privkey-for key provider))))
+      (nth-value 0 (bl.rpc:desc-key-privkey-for key provider))))
 
 (defun %sign-map-add-key! (keymap pubmap tr-keymap key pubkey priv pos)
   "Verify PRIV reproduces PUBKEY, then register it in the three signing maps:
@@ -1698,7 +1698,7 @@ itself (derive-xonly-pubkey + BIP86 tweak). Everything else keeps the strict
 full-point check."
   (let* ((derived (bl.crypto:derive-public-key
                    priv :compressed (= (length pubkey) 33)))
-         (matches (if (and (bl.rpc::desc-key-xonly-p key)
+         (matches (if (and (bl.rpc:desc-key-xonly-p key)
                            (= (length derived) 33)
                            (= (length pubkey) 33))
                       (equalp (subseq derived 1) (subseq pubkey 1))
@@ -1726,7 +1726,7 @@ The leaf pubkeys are sliced out of the descriptor's flat expansion the same way
 tr() internal key first, so a leaf handed the whole list would be signing with
 the wrong keys."
   (let ((desc (desc-spkm-desc spkm)))
-    (when (and (eq (bl.rpc::out-desc-kind desc) :tr) (bl.rpc::out-desc-tree desc))
+    (when (and (eq (bl.rpc:out-desc-kind desc) :tr) (bl.rpc:out-desc-tree desc))
       (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
         (declare (ignore scripts))
         ;; Resolve keys out of PAIRS, which %SPKM-EXPANSION-PAIRS already
@@ -1734,7 +1734,7 @@ the wrong keys."
         ;; %DESC-KEY-PUBKEY-AT would redo the whole descriptor's BIP32
         ;; derivation, uncached, for every taproot input signed.
         (multiple-value-bind (output-key leaves)
-            (bl.rpc::tr-spend-data desc pos
+            (bl.rpc:tr-spend-data desc pos
                            (lambda (k) (cdr (assoc k pairs :test #'eq))))
           ;; ⚠️ The spend data must be for the output we are actually spending.
           ;; Core cannot get this wrong -- it looks TaprootSpendData UP BY the
@@ -1751,7 +1751,7 @@ the wrong keys."
             (return-from %spkm-tr-script-leaves nil))
           (let ((next (%pairs-splitter (rest pairs))))
             (loop for (script leaf-hash control) in leaves
-                  for (nil . leaf) in (bl.rpc::out-desc-tree desc)
+                  for (nil . leaf) in (bl.rpc:out-desc-tree desc)
                   for own = (funcall next leaf)
                   when own
                     collect (list script leaf-hash control leaf
@@ -1802,7 +1802,7 @@ redeem-script witness-script). Returns the (index . message) error list;
 NIL = complete."
   (multiple-value-bind (keymap pubmap tr-keymap tr-scripts)
       (%wallet-sign-maps wallet tx coins)
-    (bl.rpc::%sign-tx-inputs tx coins keymap pubmap tr-keymap sighash-byte tr-scripts)))
+    (bl.rpc:sign-tx-inputs tx coins keymap pubmap tr-keymap sighash-byte tr-scripts)))
 
 (defun %wallet-input-coins (node wallet tx &optional cc)
   "The signing/verification coins map for TX: (txid . vout) ->
@@ -1863,8 +1863,8 @@ its input (a tx we cannot fully verify is never broadcast)."
 (defun %recipient-outputs (recipients)
   (mapcar (lambda (recipient)
             (bl.ser:make-tx-out
-             :value (bl.rpc::recipient-amount recipient)
-             :script-pubkey (bl.rpc::recipient-script recipient)))
+             :value (bl.rpc:recipient-amount recipient)
+             :script-pubkey (bl.rpc:recipient-script recipient)))
           recipients))
 
 (defun %create-transaction-internal (node wallet recipients change-pos cc sign
@@ -1904,13 +1904,13 @@ Caller holds node + wallet locks."
                   (change-type (%transaction-change-type
                                 wallet (wcc-change-type cc) recipients)))
               (dolist (recipient recipients)
-                (when (%output-dust-p (bl.rpc::recipient-amount recipient)
-                                      (bl.rpc::recipient-script recipient))
+                (when (%output-dust-p (bl.rpc:recipient-amount recipient)
+                                      (bl.rpc:recipient-script recipient))
                   (fail "Transaction amount too small"))
                 (incf (csel-params-tx-noinputs-size params)
-                      (bl.rpc::%txout-serialize-size (bl.rpc::recipient-script recipient)))
-                (incf recipients-sum (bl.rpc::recipient-amount recipient))
-                (when (bl.rpc::recipient-sffo recipient)
+                      (bl.rpc:txout-serialize-size (bl.rpc:recipient-script recipient)))
+                (incf recipients-sum (bl.rpc:recipient-amount recipient))
+                (when (bl.rpc:recipient-sffo recipient)
                   (incf outputs-to-subtract-fee-from)
                   (setf (csel-params-subtract-fee-outputs params) t)))
               ;; Change script: coin control's, else a fresh INTERNAL keypool
@@ -1929,7 +1929,7 @@ Caller holds node + wallet locks."
                                          (make-array 0 :element-type
                                                      '(unsigned-byte 8)))))
                   (setf (csel-params-change-output-size params)
-                        (bl.rpc::%txout-serialize-size change-script))
+                        (bl.rpc:txout-serialize-size change-script))
                   (let ((change-spend-size
                           (%max-signed-input-vsize wallet nil change-script)))
                     (setf (csel-params-change-spend-size params)
@@ -1949,10 +1949,10 @@ Caller holds node + wallet locks."
                       (fail "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee."))
                     (setf (csel-params-effective-feerate params) feerate)
                     (setf (csel-params-change-fee params)
-                          (bl.rpc::%feerate-fee feerate
+                          (bl.rpc:feerate-fee feerate
                                         (csel-params-change-output-size params)))
                     (setf (csel-params-cost-of-change params)
-                          (+ (bl.rpc::%feerate-fee (csel-params-discard-feerate params)
+                          (+ (bl.rpc:feerate-fee (csel-params-discard-feerate params)
                                            (csel-params-change-spend-size params))
                              (csel-params-change-fee params)))
                     (setf (csel-params-min-change-target params)
@@ -1965,12 +1965,12 @@ Caller holds node + wallet locks."
                                  change-script
                                  (csel-params-discard-feerate params)))
                           (change-spend-fee
-                            (bl.rpc::%feerate-fee (csel-params-discard-feerate params)
+                            (bl.rpc:feerate-fee (csel-params-discard-feerate params)
                                           (csel-params-change-spend-size params))))
                       (setf (csel-params-min-viable-change params)
                             (max (1+ change-spend-fee) dust)))
                     (let* ((not-input-fees
-                             (bl.rpc::%feerate-fee feerate
+                             (bl.rpc:feerate-fee feerate
                                            (if (csel-params-subtract-fee-outputs params)
                                                0
                                                (csel-params-tx-noinputs-size params))))
@@ -2014,7 +2014,7 @@ Caller holds node + wallet locks."
                                       :skip-outpoints skip
                                       :check-version-trucness t
                                       :tx-version (wcc-version cc)
-                                      :mempool (bl::node-mempool node))
+                                      :mempool (bl:node-mempool node))
                                      '())))
                           (multiple-value-bind (selection select-error)
                               (%select-coins node available-coins preset-coins
@@ -2046,7 +2046,7 @@ Caller holds node + wallet locks."
                                                      :initial-value 0))))
                                     (when (< effective-balance selection-target)
                                       (fail (format nil "The total exceeds your balance when the ~A transaction fee is included."
-                                                    (bl.rpc::%format-money
+                                                    (bl.rpc:format-money
                                                      (- selection-target
                                                         recipients-sum)))))))
                                 (fail "Insufficient funds")))
@@ -2182,7 +2182,7 @@ Caller holds node + wallet locks."
                                       (when (minusp vsize)
                                         (fail "Missing solving data for estimating transaction size"))
                                       (let* ((fee-needed
-                                               (+ (bl.rpc::%feerate-fee
+                                               (+ (bl.rpc:feerate-fee
                                                    (csel-params-effective-feerate params)
                                                    vsize)
                                                   (sel-result-total-bump-fees selection)))
@@ -2225,7 +2225,7 @@ Caller holds node + wallet locks."
                                                          (= i final-change-pos))
                                                 (incf i))
                                               (let ((output (aref txvout i)))
-                                                (when (bl.rpc::recipient-sffo recipient)
+                                                (when (bl.rpc:recipient-sffo recipient)
                                                   ;; C++ integer division
                                                   ;; truncates toward zero:
                                                   ;; truncate/rem, not
@@ -2318,7 +2318,7 @@ Caller holds node + wallet locks."
   (when (null recipients)
     (return-from %create-transaction
       (values nil "Transaction must have at least one recipient")))
-  (when (some (lambda (recipient) (minusp (bl.rpc::recipient-amount recipient)))
+  (when (some (lambda (recipient) (minusp (bl.rpc:recipient-amount recipient)))
               recipients)
     (return-from %create-transaction
       (values nil "Transaction amounts must not be negative")))
@@ -2428,7 +2428,7 @@ node lock. Returns (values ok error-string)."
       (cond
         ((and (not valid) (eq error :already-in-mempool))
          (when relay
-           (bl::broadcast-transaction-to-peers node txid))
+           (bl:broadcast-transaction-to-peers node txid))
          (values t nil))
         ((not valid)
          (values nil (format nil "~A" error)))
@@ -2444,7 +2444,7 @@ node lock. Returns (values ok error-string)."
                (progn
                  (when relay
                    (bl.mp:mempool-add-unbroadcast mempool txid)
-                   (bl::broadcast-transaction-to-peers node txid))
+                   (bl:broadcast-transaction-to-peers node txid))
                  (values t nil))
                (values nil (format nil "~A" result)))))))))
 
@@ -2516,7 +2516,7 @@ is logged and never aborts the rest (nor the caller). Returns
           (return))
         (incf attempted)
         (handler-case
-            (bl.rpc::with-node-lock (node)
+            (bl.rpc:with-node-lock (node)
               (let ((ok (with-wallet-lock (wallet)
                           ;; Re-check under the locks: state may have moved.
                           (and (%wtx-unconfirmed-p wtx)
@@ -2528,7 +2528,7 @@ is logged and never aborts the rest (nor the caller). Returns
           (error (e)
             (bl:log-error
              "ResubmitWalletTransactions: error resubmitting ~A (wallet ~A): ~A"
-             (bl.rpc::hash-to-hex (wallet-tx-txid wtx)) (wallet-name wallet) e))))
+             (bl.rpc:hash-to-hex (wallet-tx-txid wtx)) (wallet-name wallet) e))))
       (when (plusp submitted)
         (bl:log-info "ResubmitWalletTransactions: resubmit ~D unconfirmed transactions (wallet ~A)"
                                submitted (wallet-name wallet)))
@@ -2546,12 +2546,12 @@ The inline work is acceptable because each pass is bounded
 (+max-resubmit-per-pass+ mempool validations, each under its own
 node-lock hold) and this thread is idle between 1s housekeeping ticks."
   (handler-case
-      (let ((manager (bl::node-wallet-manager node)))
+      (let ((manager (bl:node-wallet-manager node)))
         (when (and manager (wallet-manager-has-wallets-p manager))
           (let ((now (bl.ser:get-unix-time)))
             (when (>= (- now *last-resend-check*) +resend-check-interval+)
               (setf *last-resend-check* now)
-              (let ((chain-state (bl::node-chain-state node)))
+              (let ((chain-state (bl:node-chain-state node)))
                 (unless (or (null chain-state)
                             (bl.net:initial-block-download-p
                              chain-state))
@@ -2609,7 +2609,7 @@ or (in tests) alists."
 (defun %parse-confirm-target (value)
   "Core ParseConfirmTarget."
   (unless (and (integerp value) (<= 1 value 1008))
-    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                       :message "Invalid conf_target, must be between 1 and 1008"))
   value)
 
@@ -2629,10 +2629,10 @@ or (in tests) alists."
   "Core SetFeeEstimateMode."
   (when fee-rate
     (when conf-target
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "Cannot specify both conf_target and fee_rate. Please provide either a confirmation target in blocks for automatic fee estimation, or an explicit fee rate."))
     (when (and estimate-mode (not (string-equal estimate-mode "unset")))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "Cannot specify both estimate_mode and fee_rate"))
     (setf (wcc-feerate cc) (%feerate-from-value fee-rate))
     (when override-min-fee (setf (wcc-override-feerate cc) t))
@@ -2643,7 +2643,7 @@ or (in tests) alists."
   (when estimate-mode
     (let ((mode (%fee-mode-from-string estimate-mode)))
       (unless mode
-        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                           :message +invalid-estimate-mode-message+))
       (setf (wcc-fee-mode cc) mode)))
   (when conf-target
@@ -2663,13 +2663,13 @@ pairs plus the moved arguments)."
            (put (key value) (setf pairs (append pairs (list (cons key value))))))
       (if (or (has "conf_target") (has "estimate_mode"))
           (when (or conf-target estimate-mode)
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message "Pass conf_target and estimate_mode either as arguments or in the options object, but not both"))
           (progn (when conf-target (put "conf_target" conf-target))
                  (when estimate-mode (put "estimate_mode" estimate-mode))))
       (if (has "fee_rate")
           (when fee-rate
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message "Pass the fee_rate either as an argument, or in the options object, but not both"))
           (when fee-rate (put "fee_rate" fee-rate)))
       (let ((ct (has "conf_target"))
@@ -2677,7 +2677,7 @@ pairs plus the moved arguments)."
         (when (and ct (cdr ct)
                    (or (null em) (null (cdr em))
                        (and (stringp (cdr em)) (string-equal (cdr em) "unset"))))
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Specify estimate_mode"))))
     pairs))
 
@@ -2690,7 +2690,7 @@ fundrawtransaction option names)."
                              ("lockUnspents" . "Use lock_unspents instead of lockUnspents")
                              ("subtractFeeFromOutputs" . "Use subtract_fee_from_outputs instead of subtractFeeFromOutputs"))
         do (when (%opt-present-p options old)
-             (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message new))))
+             (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message new))))
 
 (defun %parse-fund-options (node wallet cc options recipients override-min-fee)
   "The shared option block of fundrawtransaction / send /
@@ -2710,7 +2710,7 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
                  (bl.crypto:decode-address change-address network))
           (declare (ignore type))
           (unless script
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                               :message "Change address must be a valid bitcoin address"))
           (setf (wcc-dest-change cc) script))))
     (multiple-value-bind (pos present)
@@ -2719,17 +2719,17 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
         (multiple-value-setq (pos present) (%opt options "changePosition")))
       (when present
         (unless (and (integerp pos) (<= 0 pos (length recipients)))
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "changePosition out of bounds"))
         (setf change-position pos)))
     (let ((change-type (%opt options "change_type")))
       (when change-type
         (when (wcc-dest-change cc)
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Cannot specify both change address and address type options"))
         (let ((parsed (and (stringp change-type) (%parse-output-type change-type))))
           (unless parsed
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                               :message (format nil "Unknown change type '~A'" change-type)))
           (setf (wcc-change-type cc) parsed))))
     (when (or (%opt options "lockUnspents") (%opt options "lock_unspents"))
@@ -2739,15 +2739,15 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
     (multiple-value-bind (fee-rate-btc-kvb present) (%opt options "feeRate")
       (when present
         (when (%opt-present-p options "fee_rate")
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Cannot specify both fee_rate (sat/vB) and feeRate (BTC/kvB)"))
         (when (%opt-present-p options "conf_target")
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Cannot specify both conf_target and feeRate. Please provide either a confirmation target in blocks for automatic fee estimation, or an explicit fee rate."))
         (when (%opt-present-p options "estimate_mode")
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Cannot specify both estimate_mode and feeRate"))
-        (setf (wcc-feerate cc) (bl.rpc::%amount-from-value fee-rate-btc-kvb))
+        (setf (wcc-feerate cc) (bl.rpc:amount-from-value fee-rate-btc-kvb))
         (setf (wcc-override-feerate cc) t)))
     (multiple-value-bind (replaceable present) (%opt options "replaceable")
       (when present
@@ -2755,20 +2755,20 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
     (multiple-value-bind (minconf present) (%opt options "minconf")
       (when present
         (unless (integerp minconf)
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                             :message "minconf must be an integer"))
         (when (minusp minconf)
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Negative minconf"))
         (setf (wcc-min-depth cc) minconf)))
     (multiple-value-bind (maxconf present) (%opt options "maxconf")
       (when present
         (unless (integerp maxconf)
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                             :message "maxconf must be an integer"))
         (setf (wcc-max-depth cc) maxconf)
         (when (< (wcc-max-depth cc) (wcc-min-depth cc))
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message (format nil "maxconf can't be lower than minconf: ~D < ~D"
                                              (wcc-max-depth cc)
                                              (wcc-min-depth cc))))))
@@ -2785,7 +2785,7 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
         (multiple-value-bind (pubkeys pk-present) (%opt solving "pubkeys")
           (when pk-present
             (dolist (hex pubkeys)
-              (let ((pubkey (bl.rpc::%parse-multisig-pubkey hex)))
+              (let ((pubkey (bl.rpc:parse-multisig-pubkey hex)))
                 (setf (gethash (bl.crypto:hash160 pubkey)
                                (wcc-external-pubkeys cc))
                       pubkey)
@@ -2798,23 +2798,23 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
             (dolist (hex scripts)
               (unless (and (stringp hex) (evenp (length hex))
                            (every (lambda (ch) (digit-char-p ch 16)) hex))
-                (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                                   :message (format nil "'~A' is not hex" hex)))
               (%wcc-add-external-script cc (bl.crypto:hex-to-bytes hex)))))
         (multiple-value-bind (descriptors d-present) (%opt solving "descriptors")
           (when d-present
             (dolist (desc-str descriptors)
               (let ((desc (handler-case
-                              (bl.rpc::parse-descriptor desc-str (wallet-network wallet))
+                              (bl.rpc:parse-descriptor desc-str (wallet-network wallet))
                             (error (e)
-                              (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                                 :message (format nil "Unable to parse descriptor '~A': ~A"
                                                                  desc-str e))))))
                 (multiple-value-bind (scripts pubkeys)
                     (handler-case
-                        (bl.rpc::out-desc-expand-with-provider
-                         desc 0 (constantly nil) (bl.rpc::make-descriptor-cache))
-                      (bl.rpc::descriptor-derivation-error () (values nil nil)))
+                        (bl.rpc:out-desc-expand-with-provider
+                         desc 0 (constantly nil) (bl.rpc:make-descriptor-cache))
+                      (bl.rpc:descriptor-derivation-error () (values nil nil)))
                   (dolist (script scripts)
                     (%wcc-add-external-script cc script))
                   (dolist (pubkey pubkeys)
@@ -2828,31 +2828,31 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
           (let ((txid (%opt entry "txid"))
                 (vout (%opt entry "vout"))
                 (weight (%opt entry "weight")))
-            (unless (and (stringp txid) (bl.rpc::valid-hex-hash-p txid))
-              (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (unless (and (stringp txid) (bl.rpc:valid-hex-hash-p txid))
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                 :message "Invalid parameter, missing txid key"))
             (unless (integerp vout)
-              (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                 :message "Invalid parameter, missing vout key"))
             (when (minusp vout)
-              (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                 :message "Invalid parameter, vout cannot be negative"))
             (unless (integerp weight)
-              (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                 :message "Invalid parameter, missing weight key"))
             (when (< weight 165)
-              (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                 :message "Invalid parameter, weight cannot be less than 165 (41 bytes (size of outpoint + sequence + empty scriptSig) * 4 (witness scaling factor)) + 1 (empty witness)"))
             (when (> weight bl.val:+max-standard-tx-weight+)
-              (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                 :message (format nil "Invalid parameter, weight cannot be greater than the maximum standard tx weight of ~D"
                                                  bl.val:+max-standard-tx-weight+)))
-            (let ((preset (wcc-select cc (bl.rpc::parse-hex-hash txid) vout)))
+            (let ((preset (wcc-select cc (bl.rpc:parse-hex-hash txid) vout)))
               (setf (wcc-preset-weight preset) weight))))))
     (multiple-value-bind (max-weight present) (%opt options "max_tx_weight")
       (when present
         (unless (integerp max-weight)
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                             :message "max_tx_weight must be an integer"))
         (setf (wcc-max-tx-weight cc) max-weight)))
     ;; TRUC transactions are capped at TRUC_MAX_WEIGHT.
@@ -2868,13 +2868,13 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
   (mapcar (lambda (entry)
             (let ((txid (%opt entry "txid"))
                   (vout (%opt entry "vout")))
-              (unless (and (stringp txid) (bl.rpc::valid-hex-hash-p txid))
-                (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+              (unless (and (stringp txid) (bl.rpc:valid-hex-hash-p txid))
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                   :message "txid must be of length 64 (not including any '0x' prefix)"))
               (unless (and (integerp vout) (>= vout 0))
-                (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                   :message "Invalid parameter, vout cannot be negative"))
-              (list (bl.rpc::parse-hex-hash txid) vout
+              (list (bl.rpc:parse-hex-hash txid) vout
                     (%opt entry "sequence")
                     (%opt entry "weight"))))
           inputs-param))
@@ -2889,7 +2889,7 @@ ConstructTransaction sequence defaults."
               (cond (sequence
                      (unless (and (integerp sequence)
                                   (<= 0 sequence +sequence-final+))
-                       (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                          :message "Invalid parameter, sequence number is out of range"))
                      sequence)
                     (rbf +max-bip125-rbf-sequence+)
@@ -2897,7 +2897,7 @@ ConstructTransaction sequence defaults."
                     (t +sequence-final+)))
         (when weight
           (unless (integerp weight)
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message "Invalid parameter, missing weight key"))
           (setf (wcc-preset-weight preset) weight))))))
 
@@ -2999,13 +2999,13 @@ holds node + wallet locks."
         ;; returned, or relayed.
         (multiple-value-bind (ok bad-input) (%verify-tx-scripts tx coins)
           (unless ok
-            (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                               :message (format nil "Internal bug detected: signed transaction fails script verification at input ~D"
                                                bad-input)))))
       (when (or psbt-opt-in (not complete) (not add-to-wallet))
         (push (cons "psbt" (%tx-to-finalized-psbt node wallet tx coins)) result))
       (when complete
-        (push (cons "txid" (bl.rpc::hash-to-hex
+        (push (cons "txid" (bl.rpc:hash-to-hex
                             (bl.ser:transaction-hash tx)))
               result)
         (if (and add-to-wallet (not psbt-opt-in))
@@ -3026,7 +3026,7 @@ snapshot, so no lock-order inversion is possible; see with-wallet-lock)."
   (multiple-value-bind (tx fee-or-error change-pos fee-reason)
       (with-wallet-lock (wallet)
         (when (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+)
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                             :message "Error: Private keys are disabled for this wallet"))
         ;; Checked inside the lock that also spans creation and signing, so
         ;; a relock cannot land between the check and the signature.
@@ -3038,10 +3038,10 @@ snapshot, so no lock-order inversion is possible; see with-wallet-lock)."
       ;; Core maps EVERY CreateTransaction failure to
       ;; RPC_WALLET_INSUFFICIENT_FUNDS here (rpc/spend.cpp:187); the second
       ;; value carries the error string on failure.
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-insufficient-funds+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-insufficient-funds+
                         :message fee-or-error))
     (%wallet-commit-transaction node wallet tx map-value)
-    (let ((txid-hex (bl.rpc::hash-to-hex
+    (let ((txid-hex (bl.rpc:hash-to-hex
                      (bl.ser:transaction-hash tx))))
       (if verbose
           `(("txid" . ,txid-hex)
@@ -3055,7 +3055,7 @@ snapshot, so no lock-order inversion is possible; see with-wallet-lock)."
 (address amount comment comment_to subtractfeefromamount replaceable
 conf_target estimate_mode avoid_reuse fee_rate verbose)."
   (let ((wallet (wallet-for-request node)))
-    (bl.rpc::with-node-lock (node)
+    (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
         (let ((map-value '())
               (cc (make-wcc)))
@@ -3071,7 +3071,7 @@ conf_target estimate_mode avoid_reuse fee_rate verbose)."
             ;; null/omitted keeps the wallet default.
             (unless (null replaceable)
               (setf (wcc-signal-bip125-rbf cc)
-                    (bl.rpc::%positional-bool replaceable))))
+                    (bl.rpc:positional-bool replaceable))))
           (setf (wcc-avoid-address-reuse cc)
                 (%get-avoid-reuse-flag wallet (nth 8 params)))
           (setf (wcc-avoid-partial-spends cc)
@@ -3081,14 +3081,14 @@ conf_target estimate_mode avoid_reuse fee_rate verbose)."
                                   (nth 9 params) nil)
           (let ((address (first params)))
             (unless (stringp address)
-              (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                                 :message (format nil "Invalid Bitcoin address: ~A" address)))
             (multiple-value-bind (recipients)
-                (bl.rpc::%parse-outputs (wallet-network wallet)
+                (bl.rpc:parse-outputs (wallet-network wallet)
                                 (list (cons address (second params))))
-              (when (bl.rpc::%positional-bool (nth 4 params))
-                (setf (bl.rpc::recipient-sffo (first recipients)) t))
-              (let ((verbose (bl.rpc::%positional-bool (nth 10 params))))
+              (when (bl.rpc:positional-bool (nth 4 params))
+                (setf (bl.rpc:recipient-sffo (first recipients)) t))
+              (let ((verbose (bl.rpc:positional-bool (nth 10 params))))
                 (%send-money node wallet cc recipients (nreverse map-value)
                              verbose)))))))))
 
@@ -3099,11 +3099,11 @@ conf_target estimate_mode avoid_reuse fee_rate verbose)."
 (dummy amounts minconf comment subtractfeefrom replaceable conf_target
 estimate_mode fee_rate verbose)."
   (let ((wallet (wallet-for-request node)))
-    (bl.rpc::with-node-lock (node)
+    (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
         (let ((dummy (first params)))
           (when (and dummy (not (and (stringp dummy) (zerop (length dummy)))))
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message "Dummy value must be set to \"\"")))
         (let ((map-value '())
               (cc (make-wcc)))
@@ -3113,13 +3113,13 @@ estimate_mode fee_rate verbose)."
           (let ((replaceable (nth 5 params)))
             (unless (null replaceable)
               (setf (wcc-signal-bip125-rbf cc)
-                    (bl.rpc::%positional-bool replaceable))))
+                    (bl.rpc:positional-bool replaceable))))
           (%set-fee-estimate-mode cc (nth 6 params) (nth 7 params)
                                   (nth 8 params) nil)
           (multiple-value-bind (recipients keys)
-              (bl.rpc::%parse-outputs (wallet-network wallet) (second params))
+              (bl.rpc:parse-outputs (wallet-network wallet) (second params))
             (%interpret-sffo (nth 4 params) keys recipients)
-            (let ((verbose (bl.rpc::%positional-bool (nth 9 params))))
+            (let ((verbose (bl.rpc:positional-bool (nth 9 params))))
               (%send-money node wallet cc recipients (nreverse map-value)
                            verbose))))))))
 
@@ -3132,14 +3132,14 @@ fundrawtransaction). PARAMS: (hexstring options iswitness)."
         (hexstring (first params))
         (options (second params)))
     (unless (stringp hexstring)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                         :message "TX decode failed"))
     (let ((tx (handler-case
                   (bl.ser:parse-tx-payload
                    (bl.crypto:hex-to-bytes hexstring))
-                (error () (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+                (error () (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                                             :message "TX decode failed")))))
-      (bl.rpc::with-node-lock (node)
+      (bl.rpc:with-node-lock (node)
         (with-wallet-lock (wallet)
           (let ((network (wallet-network wallet))
                 (recipients '())
@@ -3147,8 +3147,8 @@ fundrawtransaction). PARAMS: (hexstring options iswitness)."
             ;; Recipients from the existing outputs; the original script is
             ;; kept verbatim (Core round-trips through CTxDestination).
             (loop for output across (bl.ser:transaction-outputs tx)
-                  do (push (bl.rpc::make-recipient
-                            :address (bl.rpc::%script->address
+                  do (push (bl.rpc:make-recipient
+                            :address (bl.rpc:script->address
                                       (bl.ser:tx-out-script-pubkey output)
                                       network)
                             :script (bl.ser:tx-out-script-pubkey output)
@@ -3163,16 +3163,16 @@ fundrawtransaction). PARAMS: (hexstring options iswitness)."
               (multiple-value-bind (change-position lock-unspents)
                   (%parse-fund-options node wallet cc options recipients t)
                 (when (null recipients)
-                  (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                     :message "TX must have at least one output"))
                 (multiple-value-bind (funded fee change-pos)
                     (%fund-transaction node wallet tx recipients
                                        change-position lock-unspents cc)
                   (unless funded
-                    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+ :message fee))
+                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+ :message fee))
                   `(("hex" . ,(bl.crypto:bytes-to-hex
                                (bl.ser:transaction-wire-bytes funded)))
-                    ("fee" . ,(bl.rpc::%btc fee))
+                    ("fee" . ,(bl.rpc:satoshi->btc fee))
                     ("changepos" . ,(or change-pos -1))))))))))))
 
 ;;; --- send (rpc/spend.cpp:1169-1291) ---
@@ -3183,7 +3183,7 @@ estimate_mode fee_rate options version). JSON-object outputs arrive as
 hash tables whose key order is not preserved; use the array-of-objects
 form when output order matters."
   (let ((wallet (wallet-for-request node)))
-    (bl.rpc::with-node-lock (node)
+    (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
         (let* ((options (%interpret-fee-estimation-options
                          (nth 1 params) (nth 2 params) (nth 3 params)
@@ -3196,7 +3196,7 @@ form when output order matters."
           ;; a tx its own mempool rejects): versions outside 1..3 can never
           ;; relay, so refusing up front is the funds-safe divergence.
           (unless (and (integerp version) (<= 1 version 3))
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message "Invalid parameter, version must be 1, 2, or 3"))
           (let* ((rbf (if (%opt-present-p options "replaceable")
                           (and (%opt options "replaceable") t)
@@ -3205,10 +3205,10 @@ form when output order matters."
                  (inputs (%parse-rpc-inputs (or (%opt options "inputs") '())))
                  (cc (make-wcc :version version)))
             (when (and locktime (not (integerp locktime)))
-              (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                 :message "locktime must be an integer"))
             (multiple-value-bind (recipients keys)
-                (bl.rpc::%parse-outputs (wallet-network wallet) (first params))
+                (bl.rpc:parse-outputs (wallet-network wallet) (first params))
               (%interpret-sffo (%opt options "subtract_fee_from_outputs")
                                keys recipients)
               (%apply-rpc-inputs cc inputs rbf locktime)
@@ -3222,7 +3222,7 @@ form when output order matters."
                                                 cc)
                   (declare (ignore fee change-pos))
                   (unless funded
-                    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                       :message "send failed"))
                   (%finish-transaction node wallet options funded))))))))))
 
@@ -3235,7 +3235,7 @@ FundTransaction wrapping (RPC_WALLET_ERROR)."
   (multiple-value-bind (tx fee change-pos)
       (%create-transaction node wallet recipients change-position cc nil)
     (unless tx
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+ :message fee))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+ :message fee))
     (when lock-unspents
       (bl.ser:dovector
           (input (bl.ser:transaction-inputs tx))
@@ -3253,7 +3253,7 @@ FundTransaction wrapping (RPC_WALLET_ERROR)."
 recipients (Bitcoin Core sendall). PARAMS: (recipients conf_target
 estimate_mode fee_rate options)."
   (let ((wallet (wallet-for-request node)))
-    (bl.rpc::with-node-lock (node)
+    (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
         (let ((options (%interpret-fee-estimation-options
                         (nth 1 params) (nth 2 params) (nth 3 params)
@@ -3262,7 +3262,7 @@ estimate_mode fee_rate options)."
           (let ((addresses-without-amount (make-hash-table :test 'equal))
                 (pairs '()))
             (unless (and (listp (first params)) (first params))
-              (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                 :message "recipients must be a non-empty array"))
             (dolist (entry (first params))
               (cond
@@ -3274,13 +3274,13 @@ estimate_mode fee_rate options)."
                 ((and (consp entry) (consp (car entry)))
                  (dolist (pair entry) (push (cons (car pair) (cdr pair)) pairs)))
                 ((consp entry) (push (cons (car entry) (cdr entry)) pairs))
-                (t (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+                (t (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                      :message "Invalid recipient"))))
             (when (zerop (hash-table-count addresses-without-amount))
-              (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                 :message "Must provide at least one address without a specified amount"))
             (multiple-value-bind (recipients)
-                (bl.rpc::%parse-outputs (wallet-network wallet) (nreverse pairs))
+                (bl.rpc:parse-outputs (wallet-network wallet) (nreverse pairs))
               (let ((cc (make-wcc)))
                 (%set-fee-estimate-mode cc
                                         (%opt options "conf_target")
@@ -3291,21 +3291,21 @@ estimate_mode fee_rate options)."
                     (%opt options "minconf")
                   (when minconf-present
                     (unless (integerp minconf)
-                      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                         :message "minconf must be an integer"))
                     (when (minusp minconf)
-                      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                         :message (format nil "Invalid minconf (minconf cannot be negative): ~D" minconf)))
                     (setf (wcc-min-depth cc) minconf)))
                 (multiple-value-bind (maxconf maxconf-present)
                     (%opt options "maxconf")
                   (when maxconf-present
                     (unless (integerp maxconf)
-                      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                         :message "maxconf must be an integer"))
                     (setf (wcc-max-depth cc) maxconf)
                     (when (< (wcc-max-depth cc) (wcc-min-depth cc))
-                      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                         :message (format nil "maxconf can't be lower than minconf: ~D < ~D"
                                                          (wcc-max-depth cc)
                                                          (wcc-min-depth cc))))))
@@ -3314,7 +3314,7 @@ estimate_mode fee_rate options)."
                   (when version-present
                     ;; Stricter than Core; see rpc-send's version note.
                     (unless (and (integerp version) (<= 1 version 3))
-                      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                         :message "Invalid parameter, version must be 1, 2, or 3"))
                     (setf (wcc-version cc) version)))
                 (setf (wcc-max-tx-weight cc)
@@ -3327,13 +3327,13 @@ estimate_mode fee_rate options)."
                   (multiple-value-bind (fee-rate fee-reason)
                       (%wallet-minimum-fee-rate node cc)
                     (when (and (wcc-feerate cc) (> fee-rate (wcc-feerate cc)))
-                      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                         :message (format nil "Fee rate (~A) is lower than the minimum fee rate setting (~A)"
                                                          (%format-feerate-sat-vb (wcc-feerate cc))
                                                          (%format-feerate-sat-vb fee-rate))))
                     (when (and (eq fee-reason :fallback)
                                (zerop bl:*wallet-fallback-fee*))
-                      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                         :message "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee."))
                     (let* ((locktime (%opt options "locktime"))
                            (send-max (and (%opt options "send_max") t))
@@ -3344,24 +3344,24 @@ estimate_mode fee_rate options)."
                            (tx-inputs '())
                            (outpoints '()))
                       (when (and locktime (not (integerp locktime)))
-                        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+                        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                           :message "locktime must be an integer"))
                       (when (and inputs-present (%opt-present-p options "send_max"))
-                        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                           :message "Cannot combine send_max with specific inputs."))
                       (when (and inputs-present
                                  (or (%opt-present-p options "minconf")
                                      (%opt-present-p options "maxconf")))
-                        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                           :message "Cannot combine minconf or maxconf with specific inputs."))
                       (if inputs-present
                           (dolist (input inputs)
                             (destructuring-bind (txid vout sequence weight) input
                               (declare (ignore weight))
                               (when (wallet-outpoint-spent-p wallet txid vout)
-                                (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                                   :message (format nil "Input not available. UTXO (~A:~D) was already spent."
-                                                                   (bl.rpc::hash-to-hex txid) vout)))
+                                                                   (bl.rpc:hash-to-hex txid) vout)))
                               (let ((wtx (wallet-get-wallet-tx wallet txid)))
                                 (unless (and wtx
                                              (< vout (length (bl.ser:transaction-outputs
@@ -3372,9 +3372,9 @@ estimate_mode fee_rate options)."
                                                (aref (bl.ser:transaction-outputs
                                                       (wallet-tx-tx wtx))
                                                      vout))))
-                                  (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                                     :message (format nil "Input not found. UTXO (~A:~D) is not part of wallet."
-                                                                     (bl.rpc::hash-to-hex txid) vout)))
+                                                                     (bl.rpc:hash-to-hex txid) vout)))
                                 (when (zerop (wallet-tx-depth wallet wtx))
                                   (let ((parent-version
                                           (bl.ser:transaction-version
@@ -3382,12 +3382,12 @@ estimate_mode fee_rate options)."
                                     (cond
                                       ((and (= parent-version bl.mp:+truc-version+)
                                             (/= (wcc-version cc) bl.mp:+truc-version+))
-                                       (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                                       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                                          :message (format nil "Can't spend unconfirmed version 3 pre-selected input with a version ~D tx"
                                                                           (wcc-version cc))))
                                       ((and (= (wcc-version cc) bl.mp:+truc-version+)
                                             (/= parent-version bl.mp:+truc-version+))
-                                       (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                                       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                                          :message (format nil "Can't spend unconfirmed version ~D pre-selected input with a version 3 tx"
                                                                           parent-version))))))
                                 (incf total-input-value
@@ -3433,9 +3433,9 @@ estimate_mode fee_rate options)."
                                          :allow-used-addresses t
                                          :check-version-trucness t
                                          :tx-version (wcc-version cc)
-                                         :mempool (bl::node-mempool node)))
+                                         :mempool (bl:node-mempool node)))
                             (unless (and send-max
-                                         (> (bl.rpc::%feerate-fee fee-rate
+                                         (> (bl.rpc:feerate-fee fee-rate
                                                           (max 0 (wallet-coin-input-bytes coin)))
                                             (bl.ser:tx-out-value
                                              (wallet-coin-output coin))))
@@ -3473,38 +3473,38 @@ estimate_mode fee_rate options)."
                                                   (%wallet-input-txout node wallet txid vout))
                                                  nil)))
                           (when (minusp vsize)
-                            (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+                            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                               :message "Unable to determine the size of the transaction, the wallet contains unsolvable descriptors"))
-                          (let* ((fee-from-size (bl.rpc::%feerate-fee fee-rate vsize))
+                          (let* ((fee-from-size (bl.rpc:feerate-fee fee-rate vsize))
                                  (effective-value (- total-input-value fee-from-size)))
                             (when (> fee-from-size bl:*wallet-max-tx-fee*)
-                              (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+                              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                                 :message +max-fee-exceeded-message+))
                             (when (<= effective-value 0)
-                              (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-insufficient-funds+
+                              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-insufficient-funds+
                                                 :message (if send-max
                                                              "Total value of UTXO pool too low to pay for transaction, try using lower feerate."
                                                              "Total value of UTXO pool too low to pay for transaction. Try using lower feerate or excluding uneconomic UTXOs with 'send_max' option.")))
                             (when (> tx-weight (or (wcc-max-tx-weight cc)
                                                    bl.val:+max-standard-tx-weight+))
-                              (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+                              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                                 :message "Transaction too large."))
                             (let ((claimed (reduce #'+ (bl.ser:transaction-outputs tx)
                                                    :key #'bl.ser:tx-out-value
                                                    :initial-value 0)))
                               (when (> claimed total-input-value)
-                                (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-insufficient-funds+
+                                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-insufficient-funds+
                                                   :message "Assigned more value to outputs than available funds."))
                               (let ((remainder (- effective-value claimed)))
                                 (when (minusp remainder)
-                                  (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-insufficient-funds+
+                                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-insufficient-funds+
                                                     :message "Insufficient funds for fees after creating specified outputs."))
                                 (let ((per-output (floor remainder
                                                          (hash-table-count addresses-without-amount)))
                                       (gave-remaining nil))
                                   (loop for output across (bl.ser:transaction-outputs tx)
                                         for recipient in recipients
-                                        do (let ((address (bl.rpc::recipient-address recipient)))
+                                        do (let ((address (bl.rpc:recipient-address recipient)))
                                              (if (and address
                                                       (gethash address addresses-without-amount))
                                                  (progn
@@ -3518,12 +3518,12 @@ estimate_mode fee_rate options)."
                                                    (when (%output-dust-p
                                                           (bl.ser:tx-out-value output)
                                                           (bl.ser:tx-out-script-pubkey output))
-                                                     (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-insufficient-funds+
+                                                     (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-insufficient-funds+
                                                                        :message "Dynamically assigned remainder results in dust output.")))
                                                  (when (%output-dust-p
                                                         (bl.ser:tx-out-value output)
                                                         (bl.ser:tx-out-script-pubkey output))
-                                                   (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                                                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                                                      :message (format nil "Specified output amount to ~A is below dust threshold."
                                                                                       address))))))
                                   (when (and (%opt options "lock_unspents"))
@@ -3547,7 +3547,7 @@ callers can reject explicit non-DEFAULT types where only DEFAULT is
 supported (taproot inputs, until the P5 signer lands sighash plumbing)."
   (if (or (null value) (and (stringp value) (string-equal value "DEFAULT")))
       (values 1 t)
-      (values (bl.rpc::%parse-sighash-type value) nil)))
+      (values (bl.rpc:parse-sighash-type value) nil)))
 
 (bl.rpc:define-rpc "signrawtransactionwithwallet" (node params)
   "Sign a raw transaction with the wallet's keys (Bitcoin Core
@@ -3555,17 +3555,17 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
   (let ((wallet (wallet-for-request node))
         (hexstring (first params)))
     (unless (stringp hexstring)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                         :message "TX decode failed. Make sure the tx has at least one input."))
     (let ((tx (handler-case
                   (bl.ser:parse-tx-payload
                    (bl.crypto:hex-to-bytes hexstring))
-                (error () (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+                (error () (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                                             :message "TX decode failed. Make sure the tx has at least one input.")))))
       (when (zerop (length (bl.ser:transaction-inputs tx)))
-        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                           :message "TX decode failed. Make sure the tx has at least one input."))
-      (bl.rpc::with-node-lock (node)
+      (bl.rpc:with-node-lock (node)
         (with-wallet-lock (wallet)
           (wallet-ensure-unlocked wallet)
           (multiple-value-bind (sighash-byte sighash-default-p)
@@ -3579,23 +3579,23 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                     (amount (%opt prevtx "amount"))
                     (redeem-hex (%opt prevtx "redeemScript"))
                     (witness-hex (%opt prevtx "witnessScript")))
-                (unless (and (stringp txid) (bl.rpc::valid-hex-hash-p txid)
+                (unless (and (stringp txid) (bl.rpc:valid-hex-hash-p txid)
                              (integerp vout) (stringp spk-hex))
-                  (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                     :message "Missing txid, vout, or scriptPubKey in prevtxs"))
                 (when (minusp vout)
-                  (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                     :message "vout cannot be negative"))
-                (let* ((key (cons (bl.rpc::parse-hex-hash txid) vout))
+                (let* ((key (cons (bl.rpc:parse-hex-hash txid) vout))
                        (script (bl.crypto:hex-to-bytes spk-hex))
                        (known (gethash key coins)))
                   (when (and known (not (equalp (first known) script)))
-                    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                                       :message "Previous output scriptPubKey mismatch"))
                   (setf (gethash key coins)
                         (list script
                               (if amount
-                                  (bl.rpc::%amount-from-value amount)
+                                  (bl.rpc:amount-from-value amount)
                                   (and known (second known)))
                               (if (stringp redeem-hex)
                                   (bl.crypto:hex-to-bytes redeem-hex)
@@ -3615,7 +3615,7 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                  (when (eq (bl.val:classify-script
                             (first entry))
                            :witness-v1-taproot)
-                   (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                      :message "Only DEFAULT sighash type is supported for taproot inputs")))
                coins))
             (let* ((sign-errors (%wallet-sign-transaction wallet tx coins
@@ -3637,7 +3637,7 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                                                (< index (length witnesses))
                                                (aref witnesses index))))
                               ;; Core SignTransactionResultToJSON entry shape.
-                              `(("txid" . ,(bl.rpc::hash-to-hex
+                              `(("txid" . ,(bl.rpc:hash-to-hex
                                             (bl.ser:outpoint-hash prevout)))
                                 ("vout" . ,(bl.ser:outpoint-index prevout))
                                 ("witness" . ,(or (mapcar #'bl.crypto:bytes-to-hex

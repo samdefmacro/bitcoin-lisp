@@ -62,7 +62,7 @@
 
 (test peer-rate-limiters-initialized
   "Peer rate limiters should be initialized from config."
-  (let ((peer (bl.net::make-peer)))
+  (let ((peer (bl.net:make-peer)))
     (bl.net:init-peer-rate-limiters peer)
     ;; All rate limiters should be non-nil
     (is (not (null (bl.net::peer-rate-limit-inv peer))))
@@ -73,7 +73,7 @@
 
 (test check-peer-rate-limit-allows-normal
   "Rate limit check should allow messages within limits."
-  (let ((peer (bl.net::make-peer)))
+  (let ((peer (bl.net:make-peer)))
     (bl.net:init-peer-rate-limiters peer)
     ;; Each message type should allow at least one message
     (is (bl.net:check-peer-rate-limit peer "inv"))
@@ -85,7 +85,7 @@
 
 (test check-peer-rate-limit-unknown-command
   "Rate limit check for unknown commands should always pass."
-  (let ((peer (bl.net::make-peer)))
+  (let ((peer (bl.net:make-peer)))
     (bl.net:init-peer-rate-limiters peer)
     (is (bl.net:check-peer-rate-limit peer "ping"))
     (is (bl.net:check-peer-rate-limit peer "pong"))
@@ -93,7 +93,7 @@
 
 (test check-peer-rate-limit-rejects-flood
   "Rate limit check should reject when burst is exceeded."
-  (let ((peer (bl.net::make-peer)))
+  (let ((peer (bl.net:make-peer)))
     ;; Use a very low burst for testing
     (let ((bl:*rate-limit-addr* '(1.0 . 2.0)))
       (bl.net:init-peer-rate-limiters peer)
@@ -109,14 +109,14 @@
 
 (test handshake-timeout-ok-when-ready
   "Ready peers should not be flagged for handshake timeout."
-  (let ((peer (bl.net::make-peer :state :ready)))
+  (let ((peer (bl.net:make-peer :state :ready)))
     ;; check-handshake-timeout is only called for non-ready peers
     ;; via check-peer-health, which returns early for ready peers
     (is (eq :ok (bl.net:check-handshake-timeout peer)))))
 
 (test handshake-timeout-ok-when-recent
   "Peers with recent connect time should be ok."
-  (let ((peer (bl.net::make-peer
+  (let ((peer (bl.net:make-peer
                :state :handshaking
                :connect-time (get-internal-real-time))))
     (is (eq :ok (bl.net:check-handshake-timeout peer)))))
@@ -126,14 +126,14 @@
   (let* ((past-time (- (get-internal-real-time)
                        (* (1+ bl:+handshake-timeout-seconds+)
                           internal-time-units-per-second)))
-         (peer (bl.net::make-peer
+         (peer (bl.net:make-peer
                 :state :handshaking
                 :connect-time past-time)))
     (is (eq :disconnect (bl.net:check-handshake-timeout peer)))))
 
 (test handshake-timeout-not-checked-for-zero-connect-time
   "Peers with connect-time 0 (default) should not be timed out."
-  (let ((peer (bl.net::make-peer
+  (let ((peer (bl.net:make-peer
                :state :connecting
                :connect-time 0)))
     (is (eq :ok (bl.net:check-handshake-timeout peer)))))
@@ -317,25 +317,25 @@ serialize.h:32) — the old 1 MiB cap broke submitblock for mainnet blocks."
   "A flood of getheaders is throttled (eventually denied), and getblocks/getaddr
 share the same bucket — once it's drained, they are denied too."
   (let ((peer (bl.net:make-peer)))
-    (bl.net::init-peer-rate-limiters peer)
+    (bl.net:init-peer-rate-limiters peer)
     ;; The first call is allowed (full burst); drive well past the burst rapidly.
-    (is-true (bl.net::check-peer-rate-limit peer "getheaders"))
+    (is-true (bl.net:check-peer-rate-limit peer "getheaders"))
     (let ((denied nil))
       (dotimes (i 100)
-        (unless (bl.net::check-peer-rate-limit peer "getheaders")
+        (unless (bl.net:check-peer-rate-limit peer "getheaders")
           (setf denied t)))
       (is-true denied))
     ;; Bucket is shared: getblocks and getaddr are now denied as well.
-    (is-false (bl.net::check-peer-rate-limit peer "getblocks"))
-    (is-false (bl.net::check-peer-rate-limit peer "getaddr"))))
+    (is-false (bl.net:check-peer-rate-limit peer "getblocks"))
+    (is-false (bl.net:check-peer-rate-limit peer "getaddr"))))
 
 (test rate-limit-unrelated-command-unaffected
   "Draining the serve bucket does not throttle an unrelated command (ping)."
   (let ((peer (bl.net:make-peer)))
-    (bl.net::init-peer-rate-limiters peer)
-    (dotimes (i 100) (bl.net::check-peer-rate-limit peer "getheaders"))
+    (bl.net:init-peer-rate-limiters peer)
+    (dotimes (i 100) (bl.net:check-peer-rate-limit peer "getheaders"))
     ;; ping has no bucket -> always allowed.
-    (is-true (bl.net::check-peer-rate-limit peer "ping"))))
+    (is-true (bl.net:check-peer-rate-limit peer "ping"))))
 
 ;;;; ============================================================
 ;;;; Concurrency hardening (recursive node-lock, ban-lock, node-peers)
@@ -349,18 +349,18 @@ node-lock now uses); a non-recursive lock would deadlock here."
                   (bt:with-recursive-lock-held (lock) :ok))))))
 
 (test with-current-node-lock-does-not-capture-node
-  "WITH-CURRENT-NODE-LOCK reads bl::*node* into a private binding: a NODE
+  "WITH-CURRENT-NODE-LOCK reads bl:*node* into a private binding: a NODE
 variable in the caller's scope is the caller's, not the global. The first
-version expanded into (let ((node bl::*node*)) ...) around BODY, so any body
+version expanded into (let ((node bl:*node*)) ...) around BODY, so any body
 with its own NODE silently read the global instead."
   (let ((node :caller-binding))
     (is (eq :caller-binding (bl.net::with-current-node-lock node)))))
 
 (test node-lock-is-recursive
   "node-lock is recursive: nested acquisition on the real node lock succeeds."
-  (let ((node (bl::make-node)))
-    (is (eq :ok (bt:with-recursive-lock-held ((bl::node-lock node))
-                  (bt:with-recursive-lock-held ((bl::node-lock node))
+  (let ((node (bl:make-node)))
+    (is (eq :ok (bt:with-recursive-lock-held ((bl:node-lock node))
+                  (bt:with-recursive-lock-held ((bl:node-lock node))
                     :ok))))))
 
 (defun %inbound-peer (addr ping connect-time)
@@ -373,9 +373,9 @@ with its own NODE silently read the global instead."
 restores them (in order) for priority reconnection. Inbound peers excluded."
   (let* ((dir (ensure-directories-exist
                (merge-pathnames "test-anchors/" (uiop:temporary-directory))))
-         (node (bl::make-node)))
-    (setf (bl::node-data-directory node) dir)
-    (setf (bl::node-peers node)
+         (node (bl:make-node)))
+    (setf (bl:node-data-directory node) dir)
+    (setf (bl:node-peers node)
           (list (bl.net:make-peer :address "1.2.3.4" :inbound nil :state :ready)
                 (bl.net:make-peer :address "5.6.7.8" :inbound nil :state :ready)
                 (bl.net:make-peer :address "9.9.9.9" :inbound nil :state :ready)
@@ -384,7 +384,7 @@ restores them (in order) for priority reconnection. Inbound peers excluded."
     (let ((bl::*pending-anchor-addresses* nil)
           ;; Connection-less test peers save the network default port; load
           ;; yields (host . stored-port) dial candidates.
-          (dp (bl::network-port (bl::node-network node))))
+          (dp (bl:network-port (bl:node-network node))))
       (bl::load-anchors node)
       (is (equal (list (cons "1.2.3.4" dp) (cons "5.6.7.8" dp))
                  bl::*pending-anchor-addresses*))
@@ -392,7 +392,7 @@ restores them (in order) for priority reconnection. Inbound peers excluded."
       ;; anchors are one-shot, so a crash loop cannot re-dial the same two
       ;; peers on every start.
       (is-false (probe-file (bl::anchors-dat-path
-                             (bl::node-data-directory node)))))))
+                             (bl:node-data-directory node)))))))
 
 (test anchors-v1-file-migrates-on-load
   "A pre-P1 anchors.dat (magic ANC1, bare IP strings, no port) still loads:
@@ -400,9 +400,9 @@ entries parse to typed addresses and become dial candidates; the next save
 writes the v2 network-typed format."
   (let* ((dir (ensure-directories-exist
                (merge-pathnames "test-anchors-v1/" (uiop:temporary-directory))))
-         (node (bl::make-node))
+         (node (bl:make-node))
          (path (bl::anchors-dat-path dir)))
-    (setf (bl::node-data-directory node) dir)
+    (setf (bl:node-data-directory node) dir)
     ;; Byte-faithful ANC1 writer (the pre-P1 save-anchors format): magic,
     ;; count, then len-prefixed address strings — via the same CRC32 wrapper.
     (bl.store:save-file-with-crc32
@@ -425,7 +425,7 @@ writes the v2 network-typed format."
                    ("2001:0db8:0000:0000:0000:0000:0000:0007" . nil))
                  bl::*pending-anchor-addresses*)))
     ;; Re-save from live peers: the file is rewritten as v2.
-    (setf (bl::node-peers node)
+    (setf (bl:node-peers node)
           (list (bl.net:make-peer :address "203.0.113.7"
                                                    :inbound nil :state :ready)))
     (bl::save-anchors node)
@@ -441,7 +441,7 @@ candidates, and each is dialed at its STORED port — an onion anchor yields
 a dial target iff a Tor proxy is configured."
   (let* ((dir (ensure-directories-exist
                (merge-pathnames "test-anchors-v2/" (uiop:temporary-directory))))
-         (node (bl::make-node))
+         (node (bl:make-node))
          (path (bl::anchors-dat-path dir))
          (onion-pk (bl.crypto:hex-to-bytes
                     "79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f"))
@@ -449,7 +449,7 @@ a dial target iff a Tor proxy is configured."
          ;; Distinct non-default ports prove the STORED port is what loads.
          (entries (list (list :ipv4 (bl.net:ipv4-to-mapped-ipv6 9 9 9 9) 4567)
                         (list :torv3 onion-pk 8333))))
-    (setf (bl::node-data-directory node) dir)
+    (setf (bl:node-data-directory node) dir)
     (bl::save-anchor-entries path entries)
     ;; Byte-level round trip.
     (let ((parsed (bl::parse-anchor-entries
@@ -488,8 +488,8 @@ a dial target iff a Tor proxy is configured."
   "load-anchors on a directory with no anchors.dat doesn't crash or set anchors."
   (let* ((dir (ensure-directories-exist
                (merge-pathnames "test-anchors-empty/" (uiop:temporary-directory))))
-         (node (bl::make-node)))
-    (setf (bl::node-data-directory node) dir)
+         (node (bl:make-node)))
+    (setf (bl:node-data-directory node) dir)
     (ignore-errors (delete-file (bl::anchors-dat-path dir)))
     (let ((bl::*pending-anchor-addresses* nil))
       (bl::load-anchors node)
@@ -503,9 +503,9 @@ Core protects on the MINIMUM and that is what the selector reads."
   (let ((p (bl.net:make-peer
             :address addr :inbound t :state :ready
             :ping-latency ping :connect-time connect-time)))
-    (setf (bl.net::peer-min-ping-latency p) (or min-ping ping)
-          (bl.net::peer-last-tx-time p) tx-time
-          (bl.net::peer-last-block-time p) block-time)
+    (setf (bl.net:peer-min-ping-latency p) (or min-ping ping)
+          (bl.net:peer-last-tx-time p) tx-time
+          (bl.net:peer-last-block-time p) block-time)
     ;; peer-relays-txs-p is derived from the conn type; :block-relay is the
     ;; shape Core's non-tx-relay pass filters on.
     (unless relay
@@ -539,7 +539,7 @@ Note what the real k values imply: with 8 peers protected on ping alone,
 eviction does not fire on a small inbound set — Core does not evict from one
 either. The old version of this test used SIX peers and asserted an eviction,
 which only passed because our k was half Core's."
-  (let ((node (bl::make-node)))
+  (let ((node (bl:make-node)))
     ;; 40 filler peers plus one obvious victim: newest, in the most populous
     ;; netgroup, having done nothing.
     (let* ((filler (%evict-filler 40))
@@ -550,18 +550,18 @@ which only passed because our k was half Core's."
       ;; tie-break alone. Core has the same property (CompareNetGroupKeyed
       ;; compares only the key, and equal keys fall to std::sort's unspecified
       ;; order), so this is the fixture's problem to avoid, not the code's.
-      (setf (bl::node-peers node) (cons victim filler))
+      (setf (bl:node-peers node) (cons victim filler))
       (is (eq t (bl::evict-least-valuable-inbound node)))
-      (is (not (member victim (bl::node-peers node)))
+      (is (not (member victim (bl:node-peers node)))
           "the newest peer in the most populous netgroup survived")))
   ;; A small inbound set is left alone entirely, because every pass protects
   ;; more peers than exist.
-  (let ((node (bl::make-node)))
-    (setf (bl::node-peers node)
+  (let ((node (bl:make-node)))
+    (setf (bl:node-peers node)
           (list (%evict-peer "1.1.1.1" :ping 10 :connect-time 100)
                 (%evict-peer "2.2.2.2" :ping 20 :connect-time 200)))
     (is (null (bl::evict-least-valuable-inbound node)))
-    (is (= 2 (length (bl::node-peers node))))))
+    (is (= 2 (length (bl:node-peers node))))))
 
 (test eviction-protects-noban-peers-absolutely
   "Core ProtectNoBanConnections runs FIRST and unconditionally
@@ -570,19 +570,19 @@ peer the operator explicitly trusted was as evictable as any other."
   ;; The whitelist bound directly rather than through eclipse-dos-tests'
   ;; %WITH-WHITELIST: this file compiles first, so that macro does not exist
   ;; yet here.
-  (let ((bl.net::*whitelist-entries*
+  (let ((bl.net:*whitelist-entries*
           (list (bl.net:parse-whitelist-entry
                  "noban@192.168.0.0/16"))))
-    (let* ((node (bl::make-node))
+    (let* ((node (bl:make-node))
            ;; The noban peer is the WORST candidate on every measure: newest,
            ;; slowest, and in the most populous netgroup.
            (protected (%evict-peer "192.168.0.1" :ping 99999 :connect-time 9999999))
            (filler (%evict-filler 40)))
       ;; First, for the tie-break reason in the test above — the point here is
       ;; that noban protects it even when nothing else would.
-      (setf (bl::node-peers node) (cons protected filler))
+      (setf (bl:node-peers node) (cons protected filler))
       (bl::evict-least-valuable-inbound node)
-      (is (member protected (bl::node-peers node))
+      (is (member protected (bl:node-peers node))
           "a noban peer was evicted despite being the worst candidate"))))
 
 (test eviction-protects-block-relay-only-peers-that-deliver-blocks
@@ -590,15 +590,15 @@ peer the operator explicitly trusted was as evictable as any other."
 (eviction.cpp:195-197), a pass this node did not have. Without it a
 block-relay-only peer doing exactly the job it exists for was no safer than an
 idle one — and block-relay-only links are the anti-partition insurance."
-  (let* ((node (bl::make-node))
+  (let* ((node (bl:make-node))
          ;; Worst on every OTHER measure, but a block-relay-only peer that has
          ;; delivered a block.
          (br (%evict-peer "10.0.9.9" :ping 99999 :connect-time 9999999
                                      :block-time 999999 :relay nil))
          (filler (%evict-filler 40)))
-    (setf (bl::node-peers node) (cons br filler))
+    (setf (bl:node-peers node) (cons br filler))
     (bl::evict-least-valuable-inbound node)
-    (is (member br (bl::node-peers node))
+    (is (member br (bl:node-peers node))
         "a block-relay-only peer that delivered a block was evicted")))
 
 (test eviction-reserves-slots-for-disadvantaged-networks
@@ -610,30 +610,30 @@ That is not a nicety here: every inbound ONION peer arrives via the local Tor
 daemon, so they all share the loopback netgroup and are automatically the most
 populous group. This node previously exempted onion peers absolutely, which
 fixed the symptom but meant an all-onion inbound set could never make room."
-  (let* ((node (bl::make-node))
+  (let* ((node (bl:make-node))
          (onions (loop for i below 4
                        collect (let ((p (%evict-peer (format nil "127.0.0.~D" (1+ i))
                                                      :ping 99999
                                                      :connect-time (+ 9000000 i))))
-                                 (setf (bl.net::peer-inbound-onion p) t)
+                                 (setf (bl.net:peer-inbound-onion p) t)
                                  p)))
          (filler (%evict-filler 40)))
-    (setf (bl::node-peers node) (append onions filler))
+    (setf (bl:node-peers node) (append onions filler))
     ;; Repeated admissions must not strip the onion peers out.
     (dotimes (i 5) (bl::evict-least-valuable-inbound node))
     (let ((left (count-if #'bl.net:peer-inbound-onion
-                          (bl::node-peers node))))
+                          (bl:node-peers node))))
       (is (plusp left)
           "five evictions removed every onion peer; the ratio reserve did not fire"))
     ;; But an ALL-onion set can still make room — the reserve is proportional,
     ;; not absolute, which the old exemption was not.
-    (let ((only-onion (bl::make-node)))
-      (setf (bl::node-peers only-onion)
+    (let ((only-onion (bl:make-node)))
+      (setf (bl:node-peers only-onion)
             (loop for i below 40
                   collect (let ((p (%evict-peer (format nil "127.0.1.~D" i)
                                                 :ping (+ 1000 i)
                                                 :connect-time (+ 100000 i))))
-                            (setf (bl.net::peer-inbound-onion p) t)
+                            (setf (bl.net:peer-inbound-onion p) t)
                             p)))
       (is (eq t (bl::evict-least-valuable-inbound only-onion))
           "an all-onion inbound set could not evict anything"))))
@@ -662,22 +662,22 @@ the shared structures (the *ban-lock* serializes their mutations)."
 (test node-peers-concurrent-stress
   "A writer mutating node-peers and a reader copy-listing it (both under
 node-lock) run concurrently without crashing or deadlocking."
-  (let ((node (bl::make-node)))
+  (let ((node (bl:make-node)))
     (let ((writer (bt:make-thread
                    (lambda ()
                      (dotimes (i 3000)
-                       (bt:with-recursive-lock-held ((bl::node-lock node))
+                       (bt:with-recursive-lock-held ((bl:node-lock node))
                          (push (bl.net:make-peer)
-                               (bl::node-peers node)))
-                       (bt:with-recursive-lock-held ((bl::node-lock node))
-                         (when (bl::node-peers node)
-                           (setf (bl::node-peers node)
-                                 (rest (bl::node-peers node)))))))))
+                               (bl:node-peers node)))
+                       (bt:with-recursive-lock-held ((bl:node-lock node))
+                         (when (bl:node-peers node)
+                           (setf (bl:node-peers node)
+                                 (rest (bl:node-peers node)))))))))
           (reader (bt:make-thread
                    (lambda ()
                      (dotimes (i 3000)
-                       (bt:with-recursive-lock-held ((bl::node-lock node))
-                         (length (copy-list (bl::node-peers node)))))))))
+                       (bt:with-recursive-lock-held ((bl:node-lock node))
+                         (length (copy-list (bl:node-peers node)))))))))
       (bt:join-thread writer)
       (bt:join-thread reader)
       (is-true t))))
@@ -732,7 +732,7 @@ froze a live node's entire network layer for five days."
     (unwind-protect
          (multiple-value-bind (finished result)
              (%run-bounded (lambda ()
-                             (bl.net::receive-bytes
+                             (bl.net:receive-bytes
                               conn 1000 :timeout 2))
                            :limit 8)
            (is-true finished
@@ -740,7 +740,7 @@ froze a live node's entire network layer for five days."
            (is (null result) "a stalled read reports failure")
            ;; The aborted read consumed an unknown number of bytes, so the
            ;; stream can never be resynchronized: the connection must be dead.
-           (is-false (bl.net::connection-connected conn)))
+           (is-false (bl.net:connection-connected conn)))
       (usocket:socket-close client)
       (usocket:socket-close server)
       (usocket:socket-close listener))))
@@ -757,7 +757,7 @@ this ever 'passes' quickly, the test above has stopped proving anything."
               (lambda ()
                 (let ((buffer (make-array 1000 :element-type '(unsigned-byte 8))))
                   (usocket:wait-for-input
-                   (bl.net::connection-socket conn)
+                   (bl.net:connection-socket conn)
                    :timeout 2 :ready-only t)
                   (read-sequence buffer
                                  (bl.net::connection-stream conn))))
@@ -779,14 +779,14 @@ to the PEER-START-HEIGHT accessor. The resulting type error unwound the sync
 iteration, so maintain-peers never ran, so the dead peers were never reaped or
 redialed — the failure fed itself. A live node logged it every five seconds for
 nineteen days."
-  (let ((node (bl::make-node)))
-    (setf (bl::node-peers node)
+  (let ((node (bl:make-node)))
+    (setf (bl:node-peers node)
           (list (bl.net:make-peer :state :disconnected)
                 (bl.net:make-peer :state :disconnected)))
     ;; Control: the precondition the bug needs must actually hold here.
     (is (null (bl::find-best-peer node))
         "no peer is :READY, so this exercises the NIL path")
-    (is (= 0 (bl::sync-blockchain node))
+    (is (= 0 (bl:sync-blockchain node))
         "the cycle is skipped cleanly instead of signalling a type error")))
 
 (test inbound-admission-counts-the-pending-handoff-queue
@@ -794,10 +794,10 @@ nineteen days."
 them. Admission used to count only merged peers, so a stalled sync thread let
 the queue — and its file descriptors — grow without bound: the live wedge left
 751 sockets rotting in CLOSE-WAIT. Admission must count the backlog too."
-  (let ((node (bl::make-node)))
+  (let ((node (bl:make-node)))
     ;; Control: an empty backlog admits.
     (is-true (bl::inbound-connection-allowed-p node "198.51.100.7"))
-    (setf (bl::node-pending-inbound-peers node)
+    (setf (bl:node-pending-inbound-peers node)
           (loop repeat bl::*max-inbound-connections*
                 collect (bl.net:make-peer :inbound t)))
     (multiple-value-bind (allowed reason)
@@ -840,13 +840,13 @@ above."
     (unwind-protect
          (multiple-value-bind (finished result)
              (%run-bounded (lambda ()
-                             (bl.net::receive-bytes
+                             (bl.net:receive-bytes
                               conn total :timeout 1))
                            :limit 30)
            (is-true finished "the read must terminate")
            (is (and result (= total (length result)))
                "a peer that keeps making progress delivers its whole message")
-           (is-true (bl.net::connection-connected conn)
+           (is-true (bl.net:connection-connected conn)
                     "and keeps its connection"))
       (ignore-errors (bt:join-thread sender))
       (usocket:socket-close client)
@@ -868,8 +868,8 @@ backwards would disconnect every quiet peer on every poll."
     (unwind-protect
          (progn
            ;; Nothing sent at all: a pure idle poll.
-           (is (null (bl.net::receive-bytes conn 24 :timeout 1)))
-           (is-true (bl.net::connection-connected conn)
+           (is (null (bl.net:receive-bytes conn 24 :timeout 1)))
+           (is-true (bl.net:connection-connected conn)
                     "an idle peer keeps its connection"))
       (usocket:socket-close client)
       (usocket:socket-close server)
@@ -942,7 +942,7 @@ fails if only the stall bound is present."
     (unwind-protect
          (multiple-value-bind (finished result)
              (%run-bounded (lambda ()
-                             (bl.net::receive-bytes
+                             (bl.net:receive-bytes
                               conn wanted :timeout 1))
                            :limit 30)
            (is-true finished "a dribbling peer must not hold the reader open")
@@ -981,7 +981,7 @@ Announce just under the limit."
                                                         :connected t))
          (peer (bl.net:make-peer :connection conn :state :ready))
          (announced (1- bl:+max-message-payload+))
-         (header (bl.ser::make-message-header
+         (header (bl.ser:make-message-header
                   :magic (copy-seq bl.ser:*network-magic*)
                   :command "block"
                   :payload-length announced
@@ -1008,7 +1008,7 @@ Announce just under the limit."
                  ;; The old reader sat here for the full stall window.
                  (is (< elapsed 1)
                      "the reader must return at once, not wait out the budget"))))
-           (is-true (bl.net::connection-connected conn)
+           (is-true (bl.net:connection-connected conn)
                     "an incomplete message is not yet a reason to disconnect")
            (is (= 3 (bl.net::connection-recv-filled conn))
                "the bytes that did arrive are retained for the next pass")
@@ -1022,7 +1022,7 @@ Announce just under the limit."
            (is-true (bl.net::connection-receive-expired-p conn)
                     "an abandoned message eventually expires")
            (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) nil)
-           (is-false (bl.net::connection-connected conn)
+           (is-false (bl.net:connection-connected conn)
                      "and the pump drops the peer")
            (is (eq :disconnected (bl.net:peer-state peer))
                "peer state reflects the disconnect, so maintenance replaces it"))
@@ -1062,7 +1062,7 @@ finite, and this makes it nonexistent."
     (unwind-protect
          (progn
            ;; Slow peer: header for a big payload, then 3 bytes and silence.
-           (let* ((header (bl.ser::make-message-header
+           (let* ((header (bl.ser:make-message-header
                            :magic (copy-seq bl.ser:*network-magic*)
                            :command "block"
                            :payload-length (1- bl:+max-message-payload+)
@@ -1123,7 +1123,7 @@ consults expiry."
          (peer (bl.net:make-peer :connection conn :state :ready))
          (payload (make-array 100 :element-type '(unsigned-byte 8)
                                   :initial-element 7))
-         (header (bl.ser::make-message-header
+         (header (bl.ser:make-message-header
                   :magic (copy-seq bl.ser:*network-magic*)
                   :command "ping"
                   :payload-length (length payload)
@@ -1154,7 +1154,7 @@ consults expiry."
                      "a peer whose bytes are already here is not stalled")
            ;; And the drain — not a disconnect — is what happens next.
            (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) nil)
-           (is-true (bl.net::connection-connected conn)
+           (is-true (bl.net:connection-connected conn)
                     "a busy pump must not cost a healthy peer its connection"))
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
@@ -1181,7 +1181,7 @@ payload and left the connection ALIVE and permanently out of frame."
          (peer (bl.net:make-peer :connection conn :state :ready))
          (payload (make-array 100 :element-type '(unsigned-byte 8)
                                   :initial-element 3))
-         (header (bl.ser::make-message-header
+         (header (bl.ser:make-message-header
                   :magic (copy-seq bl.ser:*network-magic*)
                   :command "ping"
                   :payload-length (length payload)
@@ -1203,7 +1203,7 @@ payload and left the connection ALIVE and permanently out of frame."
              (is (eq :incomplete detail)))
            (is-true (bl.net::connection-recv-framing conn)
                     "the parsed header survives the gap")
-           (is-true (bl.net::connection-connected conn)
+           (is-true (bl.net:connection-connected conn)
                     "and the peer is not dropped for being mid-message")
            ;; Pass 2: the payload arrives, and the message completes normally.
            (write-sequence payload (usocket:socket-stream sender))
@@ -1239,7 +1239,7 @@ node-wide peer churn. Bad magic is the opposite case and is covered below."
          (peer (bl.net:make-peer :connection conn :state :ready))
          (payload (make-array 8 :element-type '(unsigned-byte 8)
                                 :initial-element 1))
-         (header (bl.ser::make-message-header
+         (header (bl.ser:make-message-header
                   :magic (copy-seq bl.ser:*network-magic*)
                   :command "ping"
                   :payload-length (length payload)
@@ -1257,7 +1257,7 @@ node-wide peer churn. Bad magic is the opposite case and is covered below."
            (sleep 0.2)
            (is (null (bl.net:receive-message peer :timeout 1))
                "the corrupt message is dropped")
-           (is-true (bl.net::connection-connected conn)
+           (is-true (bl.net:connection-connected conn)
                     "but the peer survives, as in Core")
            (is (eq :ready (bl.net:peer-state peer))))
       (usocket:socket-close sender)
@@ -1287,7 +1287,7 @@ forever."
            (force-output (usocket:socket-stream sender))
            (sleep 0.2)
            (is (null (bl.net:receive-message peer :timeout 1)))
-           (is-false (bl.net::connection-connected conn)
+           (is-false (bl.net:connection-connected conn)
                      "a peer talking a foreign protocol is dropped"))
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
@@ -1340,7 +1340,7 @@ has actually sent (net.cpp:1323-1324)."
            (is (> (bl.net::connection-recv-filled conn)
                   bl.net::+recv-reserve-ahead+)
                "the buffer grows as the peer earns it")
-           (is-true (bl.net::connection-connected conn)
+           (is-true (bl.net:connection-connected conn)
                     "and a progressing peer is not dropped"))
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
@@ -1361,7 +1361,7 @@ has actually sent (net.cpp:1323-1324)."
 is the normal case and vastly the common one; capturing a backtrace for every
 closed socket would bury the log under noise and teach the reader to ignore it."
   (let ((bl.net::*recv-backtrace-remaining* nil)
-        (bl.net::*recv-backtrace-budget* 10))
+        (bl.net:*recv-backtrace-budget* 10))
     (is (null (bl.net:capture-recv-backtrace
                (make-condition 'end-of-file :stream *standard-output*)))
         "end-of-file is a peer going away, not a bug")
@@ -1375,7 +1375,7 @@ closed socket would bury the log under noise and teach the reader to ignore it."
 200k log lines during the mainnet incident — so an unbounded backtrace would
 bury the log it exists to explain. The budget is per process, not per peer."
   (let ((bl.net::*recv-backtrace-remaining* nil)
-        (bl.net::*recv-backtrace-budget* 2))
+        (bl.net:*recv-backtrace-budget* 2))
     (flet ((cap () (bl.net:capture-recv-backtrace
                     (make-condition 'type-error :datum 1 :expected-type 'string))))
       (is-true (stringp (cap)) "1st capture allowed")
@@ -1395,7 +1395,7 @@ do with the capture."
 that signalled, not just the recovery path. Asserted on a distinctly-named
 frame so this cannot pass on an empty or truncated string."
   (let ((bl.net::*recv-backtrace-remaining* nil)
-        (bl.net::*recv-backtrace-budget* 5)
+        (bl.net:*recv-backtrace-budget* 5)
         (trace nil))
     (ignore-errors
      (handler-bind ((error (lambda (c)

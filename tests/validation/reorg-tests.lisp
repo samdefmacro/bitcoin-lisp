@@ -14,7 +14,7 @@ BLOCK-STORE plus NODE-ARGS -- e.g. :tx-index -- the way the connect-time
 index hook finds it on a live node. The periodic-flush globals are rebound
 so a validation fixture never flushes because of where it landed in the
 battery."
-  `(let ((bl::*node* (bl::make-node :chainstates (list ,chain-state)
+  `(let ((bl:*node* (bl:make-node :chainstates (list ,chain-state)
                                     :block-store ,block-store ,@node-args))
          (bl::*blocks-since-flush* 0)
          (bl::*last-flush-universal-time* (get-universal-time)))
@@ -558,9 +558,9 @@ the block store."
        (make-activate-block-fixture "verifychain")
      (build-and-connect chain-state block-store utxo-set genesis-hash
                          (make-test-chain-hashes #x70 3))
-     (let ((node (bl::make-node)))
-       (setf (bl::node-chain-state node) chain-state)
-       (setf (bl::node-block-store node) block-store)
+     (let ((node (bl:make-node)))
+       (setf (bl:node-chain-state node) chain-state)
+       (setf (bl:node-block-store node) block-store)
        (is (eq t (bl.rpc::rpc-verifychain node (list 0 3)))))
      (clrhash bl.val::*block-undo-data*))))
 
@@ -572,9 +572,9 @@ test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
        (make-activate-block-fixture "chaintxstats")
      (build-and-connect chain-state block-store utxo-set genesis-hash
                          (make-test-chain-hashes #x71 3))
-     (let ((node (bl::make-node)))
-       (setf (bl::node-chain-state node) chain-state)
-       (setf (bl::node-block-store node) block-store)
+     (let ((node (bl:make-node)))
+       (setf (bl:node-chain-state node) chain-state)
+       (setf (bl:node-block-store node) block-store)
        (let ((r (bl.rpc::rpc-getchaintxstats node (list 2))))
          (is (= 3 (cdr (assoc "window_final_block_height" r :test #'string=))))
          (is (= 2 (cdr (assoc "window_block_count" r :test #'string=))))
@@ -589,7 +589,7 @@ test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
                      cs2 (bl.store:best-block-hash chain-state))))
            (is (= 1 (bl.store:block-index-entry-tx-count tip)))))
        ;; blockcount >= height -> error (Core's bound).
-       (signals bl.rpc::rpc-error
+       (signals bl.rpc:rpc-error
          (bl.rpc::rpc-getchaintxstats node (list 99))))
      (clrhash bl.val::*block-undo-data*))))
 
@@ -606,9 +606,9 @@ coinbase) instead of being dropped as unreadable."
      (let ((genesis-entry (bl.store:get-block-index-entry
                            chain-state genesis-hash)))
        (setf (bl.store:block-index-entry-tx-count genesis-entry) 0)
-       (let ((node (bl::make-node)))
-         (setf (bl::node-chain-state node) chain-state)
-         (setf (bl::node-block-store node) block-store)
+       (let ((node (bl:make-node)))
+         (setf (bl:node-chain-state node) chain-state)
+         (setf (bl:node-block-store node) block-store)
          (let ((r (bl.rpc::rpc-getchaintxstats node (list 2))))
            ;; genesis (1) + three coinbase-only blocks.
            (is (= 4 (cdr (assoc "txcount" r :test #'string=))))
@@ -856,7 +856,7 @@ move the tip) and require that the heavier downloaded fork gets activated."
        (is (= 2 (bl.store:current-height chain-state)))
        ;; No peers: run-ibd downloads nothing, so any tip change can only come
        ;; from the activation pass.
-       (let ((bl.net::*ibd-context*
+       (let ((bl.net:*ibd-context*
                (bl.net::make-ibd-context)))
          (bl.net::run-ibd nil (bl.ctx:make-node-context :chain-state chain-state :utxo-set utxo-set :block-store block-store)))
        (is (= 3 (bl.store:current-height chain-state)))
@@ -891,7 +891,7 @@ asserts the marker, which is the thing that was wrong."
                 ;; Marker starts behind: nothing has indexed the fork yet.
                 (is (not (equalp fork-tip
                                  (bl.store:txindex-best-block txindex))))
-                (let ((bl.net::*ibd-context*
+                (let ((bl.net:*ibd-context*
                         (bl.net::make-ibd-context)))
                   (%with-index-node (chain-state block-store :tx-index txindex)
                     (bl.net::run-ibd nil (bl.ctx:make-node-context :chain-state chain-state :utxo-set utxo-set :block-store block-store))))
@@ -1306,12 +1306,12 @@ confirmations."
                  (apply #'make-reorg-test-block spec)
                  chain-state block-store utxo-set))
               (is (equalp (third b-hashes) (bl.store:best-block-hash chain-state)))
-              (let ((node (bl::make-node :network :mainnet)))
-                (setf (bl::node-chain-state node) chain-state
-                      (bl::node-block-store node) block-store
-                      (bl::node-utxo-set node) utxo-set
-                      (bl::node-tx-index node) txindex
-                      (bl::node-mempool node) (bl.mp:make-mempool))
+              (let ((node (bl:make-node :network :mainnet)))
+                (setf (bl:node-chain-state node) chain-state
+                      (bl:node-block-store node) block-store
+                      (bl:node-utxo-set node) utxo-set
+                      (bl:node-tx-index node) txindex
+                      (bl:node-mempool node) (bl.mp:make-mempool))
                 ;; Stale-branch tx: found, blockhash = stale block,
                 ;; confirmations 0, no time/blocktime (Core pushes them only
                 ;; for active-chain blocks).
@@ -1319,9 +1319,9 @@ confirmations."
                        (a2-cb-id (bl.ser:transaction-hash
                                   (first (bl.ser:bitcoin-block-transactions a2))))
                        (r (bl.rpc::rpc-getrawtransaction
-                           node (list (bl.rpc::hash-to-hex a2-cb-id) 1))))
+                           node (list (bl.rpc:hash-to-hex a2-cb-id) 1))))
                   (is (consp r))
-                  (is (string= (bl.rpc::hash-to-hex (second a-hashes))
+                  (is (string= (bl.rpc:hash-to-hex (second a-hashes))
                                (cdr (assoc "blockhash" r :test #'string=))))
                   (is (eql 0 (cdr (assoc "confirmations" r :test #'string=))))
                   (is (null (assoc "time" r :test #'string=)))
@@ -1331,8 +1331,8 @@ confirmations."
                        (b2-cb-id (bl.ser:transaction-hash
                                   (first (bl.ser:bitcoin-block-transactions b2))))
                        (r (bl.rpc::rpc-getrawtransaction
-                           node (list (bl.rpc::hash-to-hex b2-cb-id) 1))))
-                  (is (string= (bl.rpc::hash-to-hex (second b-hashes))
+                           node (list (bl.rpc:hash-to-hex b2-cb-id) 1))))
+                  (is (string= (bl.rpc:hash-to-hex (second b-hashes))
                                (cdr (assoc "blockhash" r :test #'string=))))
                   (is (eql 2 (cdr (assoc "confirmations" r :test #'string=)))))))
          (bl.store:close-tx-index txindex)
@@ -1495,8 +1495,8 @@ the pool child it would strand. A re-added final tx survives the filter."
   "Assemble + PoW-mine a block on NODE's current tip paying coinbase to SPK,
 WITHOUT connecting it. Returns the mined block."
   (let ((block (bl.mining:assemble-full-block
-                (bl::node-chain-state node)
-                (bl::node-mempool node)
+                (bl:node-chain-state node)
+                (bl:node-mempool node)
                 :coinbase-script-pubkey spk)))
     (bl.mining:mine-block block)
     block))
@@ -1505,9 +1505,9 @@ WITHOUT connecting it. Returns the mined block."
   "Connect BLOCK into NODE (advances the tip / stores / reorgs)."
   (bl.val:connect-block
    block
-   (bl::node-chain-state node)
-   (bl::node-block-store node)
-   (bl::node-utxo-set node)))
+   (bl:node-chain-state node)
+   (bl:node-block-store node)
+   (bl:node-utxo-set node)))
 
 (test validate-block-context-free-only-skips-contextual
   "CONTEXT-FREE-ONLY returns success before the UTXO/height-dependent checks
@@ -1515,8 +1515,8 @@ WITHOUT connecting it. Returns the mined block."
 while the pure block-integrity checks still run."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "cfo"))
-          (cs (bl::node-chain-state node))
-          (utxo (bl::node-utxo-set node))
+          (cs (bl:node-chain-state node))
+          (utxo (bl:node-utxo-set node))
           (spk (p2sh-optrue-script-pubkey))
           (now (bl.ser:get-unix-time))
           ;; A valid, mined height-1 block on genesis.
@@ -1570,9 +1570,9 @@ their height != tip+1) and never reorged."
                           collect blk))
           ;; Main node: branch A, 3 blocks on the same genesis.
           (na (regtest-node-fixture "dr-a"))
-          (csa (bl::node-chain-state na))
-          (utxoa (bl::node-utxo-set na))
-          (storea (bl::node-block-store na)))
+          (csa (bl:node-chain-state na))
+          (utxoa (bl:node-utxo-set na))
+          (storea (bl:node-block-store na)))
      (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))
      (is (= 3 (bl.store:current-height csa)))
      (let ((a-tip (bl.store:best-block-hash csa)))
@@ -1615,8 +1615,8 @@ being stored and only caught later in perform-reorg. A well-formed block still
 passes context-free."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "cfo-ct"))
-          (cs (bl::node-chain-state node))
-          (utxo (bl::node-utxo-set node))
+          (cs (bl:node-chain-state node))
+          (utxo (bl:node-utxo-set node))
           (now (bl.ser:get-unix-time))
           (block (%dr-mine-on node (p2sh-optrue-script-pubkey)))
           (coinbase (first (bl.ser:bitcoin-block-transactions block))))
@@ -1637,7 +1637,7 @@ passes context-free."
             (txs (list coinbase dup))
             ;; Correct merkle root over the two txs so the malleation check
             ;; passes and we reach the per-tx CheckTransaction.
-            (root (bl.val::compute-merkle-root
+            (root (bl.val:compute-merkle-root
                    (mapcar #'bl.ser:transaction-hash txs)))
             (hdr (copy-structure (bl.ser:bitcoin-block-header block)))
             (bad (progn
@@ -1664,9 +1664,9 @@ path swallowed this signal and never re-requested the sub-tip fork blocks."
                           do (%dr-connect nb blk) collect blk))
           ;; Main node: capture genesis, then branch A (3 blocks). Tip = A3.
           (na (regtest-node-fixture "requeue-a"))
-          (csa (bl::node-chain-state na))
-          (utxoa (bl::node-utxo-set na))
-          (storea (bl::node-block-store na))
+          (csa (bl:node-chain-state na))
+          (utxoa (bl:node-utxo-set na))
+          (storea (bl:node-block-store na))
           (genesis-hash (bl.store:best-block-hash csa)))
      (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))
      (is (= 3 (bl.store:current-height csa)))
@@ -1714,8 +1714,8 @@ fixating on a fork no connected peer has."
           (b-blocks (loop repeat 5 for blk = (%dr-mine-on nb spk-b)
                           do (%dr-connect nb blk) collect blk))
           (na (regtest-node-fixture "l5-a"))
-          (csa (bl::node-chain-state na))
-          (storea (bl::node-block-store na))
+          (csa (bl:node-chain-state na))
+          (storea (bl:node-block-store na))
           (genesis-hash (bl.store:best-block-hash csa)))
      (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))   ; branch A, tip A3 (h3)
      ;; Add branch B (5 blocks, more work) HEADERS to na, no bodies.
@@ -1741,14 +1741,14 @@ fixating on a fork no connected peer has."
             ;; would otherwise skip a non-witness peer entirely.
             (svc (logior bl.ser:+node-network+
                          bl.ser:+node-witness+))
-            (peer-b (bl.net::make-peer :address "1.2.3.4:18333"
+            (peer-b (bl.net:make-peer :address "1.2.3.4:18333"
                                                         :services svc))
-            (peer-tip (bl.net::make-peer :address "5.6.7.8:18333"
+            (peer-tip (bl.net:make-peer :address "5.6.7.8:18333"
                                                           :services svc)))
-       (setf (bl.net::peer-best-known-block-hash peer-b) (fifth b-hashes)
-             (bl.net::peer-best-known-block-hash peer-tip)
+       (setf (bl.net:peer-best-known-block-hash peer-b) (fifth b-hashes)
+             (bl.net:peer-best-known-block-hash peer-tip)
              (bl.store:best-block-hash csa))
-       (let ((bl.net::*ibd-context* ctx))
+       (let ((bl.net:*ibd-context* ctx))
          ;; Peer on fork B: returns exactly the 5 fork-B blocks, none of fork A.
          (let ((got (bl.net::find-blocks-to-download-for-peer
                      peer-b csa storea 16)))
@@ -1768,7 +1768,7 @@ best-known height; deeper blocks are skipped, shallower ones still fetched. A
 full NODE_NETWORK|NODE_WITNESS peer gets the whole range. Pure synthetic
 index/peer setup, no Bitcoin Core vectors."
   (with-network (:regtest)
-   (let* ((store (bl.store::make-block-store
+   (let* ((store (bl.store:make-block-store
                   :base-path #p"/nonexistent/l5-svc-guards/"))
           (cs (bl.store:make-chain-state))
           (tip-height 300)
@@ -1793,20 +1793,20 @@ index/peer setup, no Bitcoin Core vectors."
                 (setf prev e)))
      (let* ((tip-hash (make-reorg-hash (+ 1000 tip-height)))
             (ctx (bl.net::make-ibd))
-            (nowit (bl.net::make-peer
+            (nowit (bl.net:make-peer
                     :address "1.0.0.1:18444"
                     :services bl.ser:+node-network+))      ; no witness
-            (limited (bl.net::make-peer
+            (limited (bl.net:make-peer
                       :address "2.0.0.2:18444"
                       :services (logior bl.ser:+node-network-limited+
                                         bl.ser:+node-witness+)))
-            (full (bl.net::make-peer
+            (full (bl.net:make-peer
                    :address "3.0.0.3:18444"
                    :services (logior bl.ser:+node-network+
                                      bl.ser:+node-witness+))))
        (dolist (p (list nowit limited full))
-         (setf (bl.net::peer-best-known-block-hash p) tip-hash))
-       (let ((bl.net::*ibd-context* ctx))
+         (setf (bl.net:peer-best-known-block-hash p) tip-hash))
+       (let ((bl.net:*ibd-context* ctx))
          ;; (a) No-witness peer: segwit active at every height -> nothing at all.
          (is (null (bl.net::find-blocks-to-download-for-peer
                     nowit cs store 512)))
@@ -1844,9 +1844,9 @@ would let the ordinary tip+1 path preempt the scenario)."
           (b-blocks (loop repeat 4 for blk = (%dr-mine-on nb spk-b)
                           do (%dr-connect nb blk) collect blk))
           (na (regtest-node-fixture "drc-a"))
-          (csa (bl::node-chain-state na))
-          (storea (bl::node-block-store na))
-          (utxoa (bl::node-utxo-set na))
+          (csa (bl:node-chain-state na))
+          (storea (bl:node-block-store na))
+          (utxoa (bl:node-utxo-set na))
           (genesis-hash (bl.store:best-block-hash csa)))
      (dotimes (i 2) (%dr-connect na (%dr-mine-on na spk-a)))   ; branch A, tip A2
      (let* ((w1 (bl.store:block-index-entry-chain-work
@@ -1875,9 +1875,9 @@ would let the ordinary tip+1 path preempt the scenario)."
                              :chain-work bw :status :header-valid)))
                     (bl.store:add-block-index-entry csa e)
                     (setf prev e))))
-       (let ((bl.net::*ibd-context*
+       (let ((bl.net:*ibd-context*
                (bl.net::make-ibd)))
-         (let ((ctx bl.net::*ibd-context*))
+         (let ((ctx bl.net:*ibd-context*))
            ;; B4 arrives FIRST (out of order, above tip+1): persisted to
            ;; disk, recorded as reorg candidate — but gated (fork bodies
            ;; incomplete), so the tip must not move.
@@ -1919,9 +1919,9 @@ post-persist without the fallback, stranded on disk forever)."
    (let* ((spk-a (p2sh-optrue-script-pubkey))
           (na (regtest-node-fixture "ddf-a"))
           (nb (regtest-node-fixture "ddf-b"))
-          (csa (bl::node-chain-state na))
-          (storea (bl::node-block-store na))
-          (utxoa (bl::node-utxo-set na))
+          (csa (bl:node-chain-state na))
+          (storea (bl:node-block-store na))
+          (utxoa (bl:node-utxo-set na))
           (a1 (%dr-mine-on na spk-a)))
      (%dr-connect na a1) (%dr-connect nb a1)
      (let ((a2 (%dr-mine-on na spk-a)))
@@ -1945,15 +1945,15 @@ post-persist without the fallback, stranded on disk forever)."
                       :status :header-valid)))
              (bl.store:add-block-index-entry csa e)
              (setf prev e))))
-       (let ((bl.net::*ibd-context*
+       (let ((bl.net:*ibd-context*
                (bl.net::make-ibd)))
-         (let ((ctx bl.net::*ibd-context*))
+         (let ((ctx bl.net:*ibd-context*))
            ;; A4 arrives out of order: persisted + RAM-queued + recorded.
            (bl.net::process-received-block a4 csa utxoa storea)
            (is (bl.store:block-exists-p storea h4))
-           (is (gethash 4 (bl.net::ibd-context-block-queue ctx)))
+           (is (gethash 4 (bl.net:ibd-context-block-queue ctx)))
            ;; Simulate the RAM slot being lost (cap-drop / restart).
-           (remhash 4 (bl.net::ibd-context-block-queue ctx))
+           (remhash 4 (bl.net:ibd-context-block-queue ctx))
            (setf (bl.net::ibd-context-block-queue-bytes ctx) 0)
            ;; A3 connects at tip+1; drain must then pull A4 from DISK.
            (bl.net::process-received-block a3 csa utxoa storea)
@@ -2020,9 +2020,9 @@ the retry, not eager arrival-time activation, is what performs the reorg."
           (h-blocks (loop repeat 5 for blk = (%dr-mine-on nh spk-h)
                           do (%dr-connect nh blk) collect blk))
           (na (regtest-node-fixture "cand-a"))
-          (csa (bl::node-chain-state na))
-          (storea (bl::node-block-store na))
-          (utxoa (bl::node-utxo-set na))
+          (csa (bl:node-chain-state na))
+          (storea (bl:node-block-store na))
+          (utxoa (bl:node-utxo-set na))
           (genesis-hash (bl.store:best-block-hash csa)))
      (dotimes (i 2) (%dr-connect na (%dr-mine-on na spk-a)))   ; tip A2
      (let* ((tip-work (bl.store:block-index-entry-chain-work
@@ -2057,9 +2057,9 @@ the retry, not eager arrival-time activation, is what performs the reorg."
                     (bl.store:add-block-index-entry csa e)
                     (setf prev e))))
        (bl.store:store-block storea (fifth h-blocks))
-       (let ((bl.net::*ibd-context* (bl.net::make-ibd)))
+       (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
          (let ((set (bl.net::ibd-context-reorg-candidates
-                     bl.net::*ibd-context*)))
+                     bl.net:*ibd-context*)))
            ;; Both are candidates; H5 outranks G3 by work.
            (setf (gethash g-hash set) t
                  (gethash h-hash set) t))
@@ -2069,7 +2069,7 @@ the retry, not eager arrival-time activation, is what performs the reorg."
          (is (equalp g-hash (bl.store:best-block-hash csa)))
          ;; H5 stays a candidate (still not completable); G3 consumed.
          (is (null (gethash g-hash (bl.net::ibd-context-reorg-candidates
-                                    bl.net::*ibd-context*)))))))))
+                                    bl.net:*ibd-context*)))))))))
 
 ;;;; ===========================================================================
 ;;;; Item #12 — Layer-5 reorg / download REGRESSION SUITE
@@ -2119,11 +2119,11 @@ same deterministic fork failure as reorg-rejects-fork-carrying-invalid-block."
               :hash b2-hash :height 2 :prev-entry b1-entry
               :chain-work (+ a1-work 1000) :status :header-valid
               :header (bl.ser:bitcoin-block-header b2-block)))
-         (let ((bl.net::*ibd-context* (bl.net::make-ibd)))
+         (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
            (let ((set (bl.net::ibd-context-reorg-candidates
-                       bl.net::*ibd-context*))
+                       bl.net:*ibd-context*))
                  (rej (bl.net::ibd-context-rejected-reorg-candidates
-                       bl.net::*ibd-context*))
+                       bl.net:*ibd-context*))
                  (b2-entry (bl.store:get-block-index-entry cs b2-hash)))
              (setf (gethash b2-hash set) t)
              ;; Retry attempts the reorg, hits the over-value coinbase, and
@@ -2155,9 +2155,9 @@ rejected set. The active tip is untouched until the bodies arrive."
           (b-blocks (loop repeat 4 for blk = (%dr-mine-on nb spk-b)
                           do (%dr-connect nb blk) collect blk))
           (na (regtest-node-fixture "l5-refuse-a"))
-          (csa (bl::node-chain-state na))
-          (utxoa (bl::node-utxo-set na))
-          (storea (bl::node-block-store na))
+          (csa (bl:node-chain-state na))
+          (utxoa (bl:node-utxo-set na))
+          (storea (bl:node-block-store na))
           (genesis-hash (bl.store:best-block-hash csa)))
      (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))   ; tip A3 (height 3)
      (is (= 3 (bl.store:current-height csa)))
@@ -2180,17 +2180,17 @@ rejected set. The active tip is untouched until the bodies arrive."
                                  (bl.ser:bitcoin-block-header blk)))
                               b-blocks))
             (b4-hash (fourth b-hashes)))
-       (let ((bl.net::*ibd-context* (bl.net::make-ibd)))
-         (let ((ctx bl.net::*ibd-context*))
+       (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
+         (let ((ctx bl.net:*ibd-context*))
            ;; Feed B4 (height 4 = tip+1). It outweighs A3, but B1-B3 bodies are
            ;; missing -> perform-reorg refuses -> :reorg-refused + missing list.
            (bl.net::process-received-block
             (fourth b-blocks) csa utxoa storea :requested t)
            ;; The three missing sub-tip fork bodies were re-queued for download.
            (is (= 3 (hash-table-count
-                     (bl.net::ibd-context-pending-blocks ctx))))
+                     (bl.net:ibd-context-pending-blocks ctx))))
            (dolist (h (subseq b-hashes 0 3))
-             (is-true (gethash h (bl.net::ibd-context-pending-blocks ctx))))
+             (is-true (gethash h (bl.net:ibd-context-pending-blocks ctx))))
            ;; B4 is a live reorg candidate, NOT rejected (recoverable).
            (is-true (gethash b4-hash
                              (bl.net::ibd-context-reorg-candidates ctx)))
@@ -2246,8 +2246,8 @@ re-fetched; an unsolicited stripped copy does not."
             :hash above-uns-hash :height 6 :prev-entry a2-entry :chain-work 9000
             :status :header-valid
             :header (bl.ser:bitcoin-block-header above-uns)))
-       (let ((bl.net::*ibd-context* (bl.net::make-ibd)))
-         (let ((ctx bl.net::*ibd-context*))
+       (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
+         (let ((ctx bl.net:*ibd-context*))
            ;; sanity: all four copies really are witness-stripped.
            (dolist (blk (list below tip1 above-req above-uns))
              (is-true (bl.val:block-witness-stripped-p blk)))
@@ -2262,13 +2262,13 @@ re-fetched; an unsolicited stripped copy does not."
            (bl.net::process-received-block above-req cs utxo store :requested t)
            (is (null (bl.store:block-exists-p store above-req-hash)))
            (is (eql 5 (gethash above-req-hash
-                               (bl.net::ibd-context-pending-blocks ctx))))
+                               (bl.net:ibd-context-pending-blocks ctx))))
            ;; (d) above tip (height 6), UNSOLICITED — dropped, not stored, and NOT
            ;; re-queued (only a requested stripped copy re-arms a fetch).
            (bl.net::process-received-block above-uns cs utxo store)
            (is (null (bl.store:block-exists-p store above-uns-hash)))
            (is (null (gethash above-uns-hash
-                              (bl.net::ibd-context-pending-blocks ctx)))))))
+                              (bl.net:ibd-context-pending-blocks ctx)))))))
      (clrhash bl.val::*block-undo-data*))))
 
 (test l5-out-of-order-acceptable-boundaries
@@ -2311,10 +2311,10 @@ index — no Bitcoin Core vectors."
      (let ((cand (bl.store:make-block-index-entry
                   :hash (funcall %h 4) :height 3 :chain-work 150 :status :header-valid)))
        ;; work 150 > tip 100; floor exactly at 150 -> accepted.
-       (let ((bl::*minimum-chain-work-override* 150))
+       (let ((bl:*minimum-chain-work-override* 150))
          (is (bl.net::%out-of-order-block-acceptable-p cand 1 nil cs)))
        ;; floor one unit above the block's work -> rejected (unsolicited)...
-       (let ((bl::*minimum-chain-work-override* 151))
+       (let ((bl:*minimum-chain-work-override* 151))
          (is (null (bl.net::%out-of-order-block-acceptable-p cand 1 nil cs)))
          ;; ...unless requested.
          (is (bl.net::%out-of-order-block-acceptable-p cand 1 t cs)))))))
@@ -2327,7 +2327,7 @@ FindNextBlocksToDownload marks mapBlocksInFlight), so the two peers PARTITION th
 fork range — no hash is requested twice."
   (with-network (:regtest)
    (let* ((cs (bl.store:make-chain-state))
-          (store (bl.store::make-block-store :base-path #p"/nonexistent/l5-dedup/"))
+          (store (bl.store:make-block-store :base-path #p"/nonexistent/l5-dedup/"))
           (genesis (bl.store:make-block-index-entry
                     :hash (make-reorg-hash 0) :height 0 :prev-entry nil
                     :chain-work 1 :status :valid))
@@ -2349,18 +2349,18 @@ fork range — no hash is requested twice."
                          bl.ser:+node-witness+))
             (tip-hash (make-reorg-hash (+ 2000 5)))
             (ctx (bl.net::make-ibd))
-            (p1 (bl.net::make-peer :address "1.1.1.1:1"
+            (p1 (bl.net:make-peer :address "1.1.1.1:1"
                                                     :state :ready :services svc))
-            (p2 (bl.net::make-peer :address "2.2.2.2:2"
+            (p2 (bl.net:make-peer :address "2.2.2.2:2"
                                                     :state :ready :services svc)))
-       (setf (bl.net::peer-best-known-block-hash p1) tip-hash
-             (bl.net::peer-best-known-block-hash p2) tip-hash)
+       (setf (bl.net:peer-best-known-block-hash p1) tip-hash
+             (bl.net:peer-best-known-block-hash p2) tip-hash)
        ;; Small per-peer cap so BOTH peers must contribute (else p1 takes all 5).
        (setf (bl.net::ibd-context-max-in-flight ctx) 3)
-       (let ((bl.net::*ibd-context* ctx))
+       (let ((bl.net:*ibd-context* ctx))
          (let ((made (bl.net::request-blocks-from-peers
                       (list p1 p2) cs store))
-               (in-flight (bl.net::ibd-context-in-flight ctx)))
+               (in-flight (bl.net:ibd-context-in-flight ctx)))
            ;; All five fork blocks requested exactly once: requests-made equals the
            ;; distinct in-flight count (a duplicate would have collided on a key).
            (is (= 5 made))
@@ -2383,7 +2383,7 @@ request budget to 1, so peers can't flood blocks above a stalled gap (the heap
 exhaustion this gate exists to prevent)."
   (with-network (:regtest)
    (let* ((cs (bl.store:make-chain-state))
-          (store (bl.store::make-block-store :base-path #p"/nonexistent/l5-gap/"))
+          (store (bl.store:make-block-store :base-path #p"/nonexistent/l5-gap/"))
           (genesis (bl.store:make-block-index-entry
                     :hash (make-reorg-hash 0) :height 0 :prev-entry nil
                     :chain-work 1 :status :valid)))
@@ -2403,21 +2403,21 @@ exhaustion this gate exists to prevent)."
                          bl.ser:+node-witness+))
             (fork-tip (make-reorg-hash (+ 3000 3)))
             (ctx (bl.net::make-ibd))
-            (peer (bl.net::make-peer :address "9.9.9.9:9"
+            (peer (bl.net:make-peer :address "9.9.9.9:9"
                                                       :state :ready :services svc)))
-       (setf (bl.net::peer-best-known-block-hash peer) fork-tip)
+       (setf (bl.net:peer-best-known-block-hash peer) fork-tip)
        ;; Fill the RAM block-queue to capacity, but leave the gap (next-needed
        ;; height 1) absent so the over-cap gap-only path is taken.
-       (let ((q (bl.net::ibd-context-block-queue ctx)))
+       (let ((q (bl.net:ibd-context-block-queue ctx)))
          (loop for i from 0 below bl.net::+max-block-queue-size+
                do (setf (gethash (+ 2 i) q) t)))
-       (let ((bl.net::*ibd-context* ctx))
+       (let ((bl.net:*ibd-context* ctx))
          ;; Over cap + gap missing: exactly one request is allowed.
          (let ((made (bl.net::request-blocks-from-peers
                       (list peer) cs store)))
            (is (= 1 made))
            (is (= 1 (hash-table-count
-                     (bl.net::ibd-context-in-flight ctx))))))))))
+                     (bl.net:ibd-context-in-flight ctx))))))))))
 
 (test l5-historical-download-only-for-base-containing-peer
   "Item #12(6): find-historical-blocks-to-download returns the assumeutxo
@@ -2428,7 +2428,7 @@ Bitcoin Core vectors."
   (with-network (:regtest)
    (let* ((cs (bl.store:make-chain-state))
           (hist (bl.store:make-chain-state))
-          (store (bl.store::make-block-store :base-path #p"/nonexistent/l5-hist/"))
+          (store (bl.store:make-block-store :base-path #p"/nonexistent/l5-hist/"))
           (svc (logior bl.ser:+node-network+
                        bl.ser:+node-witness+))
           (chain '())    ; genesis .. h5, oldest first
@@ -2457,13 +2457,13 @@ Bitcoin Core vectors."
        (bl.store:set-chainstate-target hist base-entry)
        (setf (bl.net::ibd-context-historical-chain-state ctx) hist
              (bl.net::ibd-context-snapshot-base-entry ctx) base-entry)
-       (let ((base-peer (bl.net::make-peer :address "1.0.0.1:1"
+       (let ((base-peer (bl.net:make-peer :address "1.0.0.1:1"
                                                             :state :ready :services svc))
-             (fork-peer (bl.net::make-peer :address "2.0.0.2:2"
+             (fork-peer (bl.net:make-peer :address "2.0.0.2:2"
                                                             :state :ready :services svc)))
-         (setf (bl.net::peer-best-known-block-hash base-peer) base-hash
-               (bl.net::peer-best-known-block-hash fork-peer) fork-hash)
-         (let ((bl.net::*ibd-context* ctx))
+         (setf (bl.net:peer-best-known-block-hash base-peer) base-hash
+               (bl.net:peer-best-known-block-hash fork-peer) fork-hash)
+         (let ((bl.net:*ibd-context* ctx))
            ;; Base-containing peer: the whole h1..h5 target-ancestor range,
            ;; oldest-first, none on disk.
            (let ((got (bl.net::find-historical-blocks-to-download
@@ -2578,7 +2578,7 @@ recoverable (:header-valid). Directly exercises the perform-reorg poisoning hook
          (is (= 1 (bl.store:current-height cs)))
          (is (eq :valid (bl.store:block-index-entry-status a1-entry)))
          ;; best-valid-tip skips the poisoned subtree (never names B2/B3).
-         (let ((bvt (bl.val::best-valid-tip cs store)))
+         (let ((bvt (bl.val:best-valid-tip cs store)))
            (is-true bvt)
            (is (not (eq bvt b2-entry)))
            (is (not (eq bvt b3-entry)))))
@@ -2595,8 +2595,8 @@ still offered, the invalid block and everything above it are never re-requested.
           (b-blocks (loop repeat 5 for blk = (%dr-mine-on nb spk-b)
                           do (%dr-connect nb blk) collect blk))
           (na (regtest-node-fixture "item14-walk-a"))
-          (csa (bl::node-chain-state na))
-          (storea (bl::node-block-store na))
+          (csa (bl:node-chain-state na))
+          (storea (bl:node-block-store na))
           (genesis-hash (bl.store:best-block-hash csa)))
      (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))   ; active branch A, tip A3
      ;; Add branch-B headers (5, more work) to na, no bodies. Capture B2's entry.
@@ -2624,10 +2624,10 @@ still offered, the invalid block and everything above it are never re-requested.
                                 b-blocks))
               (svc (logior bl.ser:+node-network+
                            bl.ser:+node-witness+))
-              (peer-b (bl.net::make-peer :address "1.2.3.4:18333"
+              (peer-b (bl.net:make-peer :address "1.2.3.4:18333"
                                                           :services svc)))
-         (setf (bl.net::peer-best-known-block-hash peer-b) (fifth b-hashes))
-         (let ((bl.net::*ibd-context* ctx))
+         (setf (bl.net:peer-best-known-block-hash peer-b) (fifth b-hashes))
+         (let ((bl.net:*ibd-context* ctx))
            (let ((got (bl.net::find-blocks-to-download-for-peer
                        peer-b csa storea 16)))
              ;; Only B1 (below the invalid B2) is offered; the walk aborts at B2,
@@ -2643,7 +2643,7 @@ is admitted marked :invalid (so its own descendants are recognized) but is NEVER
 queued for download; a header on a valid parent is still admitted normally."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "item14-fc"))
-          (cs (bl::node-chain-state node))
+          (cs (bl:node-chain-state node))
           (genesis-hash (bl.store:best-block-hash cs))
           (genesis-entry (bl.store:get-block-index-entry cs genesis-hash))
           ;; X: an :invalid block-index entry directly on genesis.
@@ -2665,21 +2665,21 @@ queued for download; a header on a valid parent is still admitted normally."
           (v-header (bl.ser:bitcoin-block-header
                      (make-reorg-test-block genesis-hash v-hash 1))))
      (bl.store:add-block-index-entry cs x-entry)
-     (let ((bl.net::*ibd-context* (bl.net::make-ibd)))
-       (let ((ctx bl.net::*ibd-context*))
+     (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
+       (let ((ctx bl.net:*ibd-context*))
          ;; Feed Y (FAILED_CHILD) and V (valid) together. Only V counts as "added".
-         (let ((added (bl.net::process-headers (list y-header v-header) cs)))
+         (let ((added (bl.net:process-headers (list y-header v-header) cs)))
            (is (= 1 added)))
          ;; Y is in the index marked :invalid (BLOCK_FAILED_CHILD), not queued.
          (let ((y-entry (bl.store:get-block-index-entry cs y-hash)))
            (is-true y-entry)
            (is (eq :invalid (bl.store:block-index-entry-status y-entry)))
-           (is (null (gethash y-hash (bl.net::ibd-context-pending-blocks ctx)))))
+           (is (null (gethash y-hash (bl.net:ibd-context-pending-blocks ctx)))))
          ;; V (valid parent) is admitted :header-valid and queued for download.
          (let ((v-entry (bl.store:get-block-index-entry cs v-hash)))
            (is-true v-entry)
            (is (eq :header-valid (bl.store:block-index-entry-status v-entry)))
-           (is-true (gethash v-hash (bl.net::ibd-context-pending-blocks ctx)))))))))
+           (is-true (gethash v-hash (bl.net:ibd-context-pending-blocks ctx)))))))))
 
 (test item14-negative-missing-fork-bodies-not-poisoned
   "CRITICAL NEGATIVE: a reorg REFUSED because the fork bodies are missing
@@ -3053,18 +3053,18 @@ actually exists."
                 ;; the pointer itself, which is the thing under test.
                 (bl:*interrupt-check*
                   (lambda ()
-                    (equalp a1-hash (bl.store::cvc-best-block view)))))
+                    (equalp a1-hash (bl.store:cvc-best-block view)))))
            ;; Control: before the reorg the pointer names the old tip A3.
            (is (equalp (bl.store:block-index-entry-hash (third a-entries))
-                       (bl.store::cvc-best-block view)))
+                       (bl.store:cvc-best-block view)))
            (multiple-value-bind (ok detail)
                (bl.val:perform-reorg
                 chain-state block-store view
                 (third a-entries) (third b-entries) :skip-scripts t)
              (is (null ok))
              (is (eq :interrupted detail)))
-           (is (equalp a1-hash (bl.store::cvc-best-block view)))
-           (is (equalp (bl.store::cvc-best-block view)
+           (is (equalp a1-hash (bl.store:cvc-best-block view)))
+           (is (equalp (bl.store:cvc-best-block view)
                        (bl.store:best-block-hash chain-state))
                "the coins pointer and the chain tip must name one block")
            (is (= 1 (bl.store:current-height chain-state)))))
@@ -3170,7 +3170,7 @@ turn a deep rollback into a flush storm."
       "the mid-reorg check must exist")
   ;; With no node bound it must be inert rather than erroring: perform-reorg
   ;; runs in unit tests with no *node*.
-  (let ((bl::*node* nil))
+  (let ((bl:*node* nil))
     (is-false (bl:maybe-critical-flush nil)
               "no node: inert, not an error"))
   ;; And the reorg's disconnect loop must actually call it — the whole finding
@@ -3212,11 +3212,11 @@ it."
                                   (make-test-chain-hashes #xA0 2))
               (let ((losing-tip (bl.store:best-block-hash chain-state)))
                 (%stage-heavier-downloaded-fork chain-state block-store genesis-hash)
-                (let ((bl.net::*ibd-context*
+                (let ((bl.net:*ibd-context*
                         (bl.net::make-ibd-context)))
                   (bl.net::run-ibd nil (bl.ctx:make-node-context :chain-state chain-state :utxo-set utxo-set :block-store block-store)))
                 ;; The marker names a block the reorg disconnected.
-                (bl.store::txindex-set-best-block txindex losing-tip)
+                (bl.store:txindex-set-best-block txindex losing-tip)
                 (multiple-value-bind (height reason)
                     (bl.store::%txindex-resume-height txindex chain-state)
                   (is (eq :rewound-to-fork reason)

@@ -111,14 +111,14 @@ seeded, the chain links."
          (ghash (bl.store:network-genesis-hash :regtest))
          (ghdr (bl::make-genesis-header :regtest)))
     (is (= 0 (hash-table-count
-              (bl.store::chain-state-block-index empty)))
+              (bl.store:chain-state-block-index empty)))
         "a fresh chain-state must have an EMPTY block index, or this test ~
 asserts nothing about the root")
     (bl.store:add-block-index-entry
      seeded (bl.store:make-block-index-entry
              :hash ghash :height 0 :header ghdr :chain-work 0 :status :valid))
     (is (= 1 (hash-table-count
-              (bl.store::chain-state-block-index seeded))))
+              (bl.store:chain-state-block-index seeded))))
     ;; And the node seeds genesis BEFORE it reindexes — the ordering is the
     ;; whole fix, so assert it structurally rather than trusting the diff.
     (let ((src (%node-source-text)))
@@ -305,14 +305,14 @@ discard every good block beside it. Core does the same, failing the single read
            (is-true (bl.store:get-block store bystander))
            ;; Scribble over the first record's framing header in place.
            (let* ((pos (gethash victim (bl.store::block-store-index store)))
-                  (path (bl.kv::flat-file-name
+                  (path (bl.kv:flat-file-name
                          (bl.store::%blk-seq store) pos)))
-             (is-true (bl.kv::flat-file-pos-p pos)
+             (is-true (bl.kv:flat-file-pos-p pos)
                       "the flat default did not put the block in a blk file")
              (with-open-file (s path :direction :io :element-type '(unsigned-byte 8)
                                      :if-exists :overwrite)
-               (file-position s (- (bl.kv::flat-file-pos-pos pos)
-                                   bl.kv::+storage-header-bytes+))
+               (file-position s (- (bl.kv:flat-file-pos-pos pos)
+                                   bl.kv:+storage-header-bytes+))
                (write-sequence (make-array 8 :element-type '(unsigned-byte 8)
                                              :initial-element #xff)
                                s))
@@ -867,7 +867,7 @@ readable while deleted keys stay gone -- exercises the FFI binding end-to-end."
                                  :initial-element #x76)))
 
 (defun %sample-utxo-key (&optional (txid-element 1) (vout 0))
-  (bl.store::make-utxo-key
+  (bl.store:make-utxo-key
    (make-array 32 :element-type '(unsigned-byte 8) :initial-element txid-element)
    vout))
 
@@ -1121,7 +1121,7 @@ in their txid first-byte to give a mix; values vary in amount/height."
   "Migrating an empty utxo-set yields an empty LevelDB but still marks complete."
   (%with-tmp-dat-and-leveldb (dat-path ldb-path)
     (let ((empty-set (bl.store:make-utxo-set)))
-      (bl.store::save-utxo-set empty-set dat-path))
+      (bl.store:save-utxo-set empty-set dat-path))
     (let ((written (bl.store:migrate-utxoset-dat-to-leveldb
                     dat-path ldb-path)))
       (is (= 0 written)))
@@ -1132,7 +1132,7 @@ in their txid first-byte to give a mix; values vary in amount/height."
 the LevelDB via coins-view-db-get."
   (%with-tmp-dat-and-leveldb (dat-path ldb-path)
     (let* ((source (%populated-utxo-set 50)))
-      (bl.store::save-utxo-set source dat-path)
+      (bl.store:save-utxo-set source dat-path)
       (let ((written (bl.store:migrate-utxoset-dat-to-leveldb
                       dat-path ldb-path)))
         (is (= 50 written)))
@@ -1160,7 +1160,7 @@ the LevelDB via coins-view-db-get."
     (let ((dat-path (%tmp-dat-path)))
       (unwind-protect
            (progn
-             (bl.store::save-utxo-set
+             (bl.store:save-utxo-set
               (bl.store:make-utxo-set) dat-path)
              (bl.store:migrate-utxoset-dat-to-leveldb dat-path ldb-path)
              (is (eq t (bl.store:leveldb-utxo-migration-complete-p
@@ -1178,7 +1178,7 @@ the LevelDB via coins-view-db-get."
   "Migration handles a multi-batch set (batch-size smaller than total)."
   (%with-tmp-dat-and-leveldb (dat-path ldb-path)
     (let ((source (%populated-utxo-set 250)))
-      (bl.store::save-utxo-set source dat-path)
+      (bl.store:save-utxo-set source dat-path)
       ;; Force several batches by using a small batch-size.
       (let ((written (bl.store:migrate-utxoset-dat-to-leveldb
                       dat-path ldb-path :batch-size 32)))
@@ -1311,7 +1311,7 @@ discovers them through the empty cache."
       ;; Pre-populate the base directly.
       (bl.store:with-coins-view-db (view path)
         (bl.store:coins-view-db-put
-         view (bl.store::make-utxo-key txid 0) (%sample-utxo-entry)))
+         view (bl.store:make-utxo-key txid 0) (%sample-utxo-entry)))
       (bl.store:with-coins-view-db (view path)
         (let ((cache (bl.store:make-coins-view-cache view)))
           (is (bl.store:coin-view-any-utxo-for-txid-p cache txid))
@@ -1325,7 +1325,7 @@ discovers them through the empty cache."
     (let ((txid (%sample-txid 12)))
       (bl.store:with-coins-view-db (view path)
         (bl.store:coins-view-db-put
-         view (bl.store::make-utxo-key txid 0) (%sample-utxo-entry)))
+         view (bl.store:make-utxo-key txid 0) (%sample-utxo-entry)))
       (bl.store:with-coins-view-db (view path)
         (let ((cache (bl.store:make-coins-view-cache view)))
           ;; Spend pulls the coin through cache then tombstones it.
@@ -1853,7 +1853,7 @@ version."
   (let* ((dir (merge-pathnames (format nil "bl-loadstate-~D/" (random 1000000))
                                #P"/tmp/"))
          (state (bl.store:make-chain-state :base-path dir))
-         (path (bl.store::state-file-path state)))
+         (path (bl.store:state-file-path state)))
     (ensure-directories-exist dir)
     (unwind-protect
          (flet ((write-bytes (n)
@@ -2002,12 +2002,12 @@ compare two copies of the same wrong answer and report agreement."
       (unwind-protect
            (progn
              ;; Control: nothing tracked before any block is applied.
-             (is (null (bl.store::cvc-best-block cache))
+             (is (null (bl.store:cvc-best-block cache))
                  "a fresh cache tracks no block")
              ;; Connect: the pointer becomes THIS block.
              (let ((spent (bl.store:apply-block-to-utxo-set cache block 1)))
                (declare (ignore spent))
-               (is (equalp this-block (bl.store::cvc-best-block cache))
+               (is (equalp this-block (bl.store:cvc-best-block cache))
                    "applying a block moves the pointer to that block"))
              ;; A flush with no explicit hash stamps what the cache tracks.
              (bl.store:coins-view-cache-flush cache)
@@ -2016,7 +2016,7 @@ compare two copies of the same wrong answer and report agreement."
              ;; Disconnect: the pointer becomes the PARENT, which is the case the
              ;; chain tip would get wrong.
              (bl.store:disconnect-block-from-utxo-set cache block '())
-             (is (equalp parent (bl.store::cvc-best-block cache))
+             (is (equalp parent (bl.store:cvc-best-block cache))
                  "disconnecting moves the pointer back to the parent")
              (bl.store:coins-view-cache-flush cache)
              (is (equalp parent (bl.store:coins-view-db-best-block base))
@@ -2040,9 +2040,9 @@ shutdown flush, say — would move coins while leaving the pointer behind."
              (bl.store:coins-view-cache-flush writer :best-block tip)
              (let ((reopened (bl.store:make-coins-view-cache base)))
                ;; Control: without adopting, a fresh cache knows nothing.
-               (is (null (bl.store::cvc-best-block reopened)))
+               (is (null (bl.store:cvc-best-block reopened)))
                (bl.store:coins-view-cache-load-best-block reopened)
-               (is (equalp tip (bl.store::cvc-best-block reopened))
+               (is (equalp tip (bl.store:cvc-best-block reopened))
                    "the reopened cache adopts what is on disk")))
         (bl.store:close-coins-view-db base)))))
 
@@ -2066,12 +2066,12 @@ cache is afterwards flushed cleanly."
          (db (bl.store:open-coins-view-db
               (ensure-directories-exist (merge-pathnames "chainstate/" base))))
          (cache (bl.store:make-coins-view-cache db))
-         (node (bl::make-node))
+         (node (bl:make-node))
          (coins-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xC0))
          (tip-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xF1)))
     (unwind-protect
          (progn
-           (setf (bl::node-chain-state node) chain-state
+           (setf (bl:node-chain-state node) chain-state
                  (bl.store:chain-state-coins-view chain-state) cache)
            ;; The chain believes it is at height 200; the coins are at 150.
            (dolist (pair (list (cons coins-hash 150) (cons tip-hash 200)))
@@ -2139,9 +2139,9 @@ prev-entry, so GET-BLOCK-AT-HEIGHT can walk it. Returns (values state hashes)."
         (bl.store:add-block-index-entry cs e)
         (push h hashes)
         (setf prev e)))
-    (setf (bl.store::chain-state-best-block-hash cs)
+    (setf (bl.store:chain-state-best-block-hash cs)
           (bl.store:block-index-entry-hash prev)
-          (bl.store::chain-state-best-height cs) (1- n))
+          (bl.store:chain-state-best-height cs) (1- n))
     (values cs (nreverse hashes))))
 
 (test txindex-resume-height-skips-what-is-already-indexed
@@ -2184,11 +2184,11 @@ disabled one is not, and nothing in the tree passes an index to the chain."
          (disabled (bl.store:init-tx-index dir :enabled nil)))
     (unwind-protect
          (progn
-           (is (member enabled (bl::node-indexes (bl::make-node :tx-index enabled)))
+           (is (member enabled (bl:node-indexes (bl:make-node :tx-index enabled)))
                "an enabled txindex must be among the node's driven indexes")
-           (is (null (bl::node-indexes (bl::make-node :tx-index disabled)))
+           (is (null (bl:node-indexes (bl:make-node :tx-index disabled)))
                "a disabled txindex must not be driven")
-           (is (null (bl::node-indexes (bl::make-node)))
+           (is (null (bl:node-indexes (bl:make-node)))
                "no index, nothing driven"))
       (bl.store:close-tx-index enabled)))
   (let ((src (uiop:read-file-string
@@ -2306,8 +2306,8 @@ directory. The helper must accept a plain file path and a bare name."
       (write-byte 1 o))
     (unwind-protect
          (progn
-           (finishes (bl.kv::fsync-parent-directory (namestring path)))
-           (finishes (bl.kv::fsync-parent-directory "bare-name.dat"))
-           (finishes (bl.kv::fsync-directory
+           (finishes (bl.kv:fsync-parent-directory (namestring path)))
+           (finishes (bl.kv:fsync-parent-directory "bare-name.dat"))
+           (finishes (bl.kv:fsync-directory
                       (namestring (uiop:temporary-directory)))))
       (delete-file path))))

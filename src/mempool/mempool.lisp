@@ -1584,9 +1584,9 @@ understand."
                              :element-type '(unsigned-byte 8))
       (write-sequence bytes out)
       (finish-output out))
-    (bl.store::fsync-file tmp)
+    (bl.kv:fsync-file tmp)
     (rename-file tmp path)
-    (bl.store::fsync-directory path)))
+    (bl.kv:fsync-directory path)))
 
 (defun save-mempool-file (mempool path)
   "Persist MEMPOOL (entries + prioritisation deltas + the unbroadcast txid

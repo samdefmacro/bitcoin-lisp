@@ -249,22 +249,22 @@ returns 0."
     (flet ((group (host)
              (multiple-value-bind (net bytes)
                  (bl.net:parse-network-address host)
-               (bl.net::net-group-key bytes net))))
+               (bl.net:net-group-key bytes net))))
       ;; Two addresses Core maps to the SAME ASN (969411) but which share no
       ;; prefix at all.
       (let ((a "c49f:9cc6:86ad:ba08:4580:315e:dbd1:8a62")
             (b "dff5:8021:61d:b17d:406d:7888:fdac:4a20"))
-        (let ((bl.net::*asmap* nil))
+        (let ((bl.net:*asmap* nil))
           (is (not (equalp (group a) (group b)))
               "control: without a map these must be different groups"))
-        (let ((bl.net::*asmap* data))
+        (let ((bl.net:*asmap* data))
           (is (equalp (group a) (group b))
               "two addresses in one AS did not share a group")))
       ;; An address the map does not cover (Core says 0) keeps prefix
       ;; bucketing rather than collapsing into a single "unmapped" group.
       (let ((u1 "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38")
             (u2 "378e:7290:54e5:bd36:4760:971c:e9b9:570d"))
-        (let ((bl.net::*asmap* data))
+        (let ((bl.net:*asmap* data))
           (is (not (equalp (group u1) (group u2)))
               "unmapped addresses collapsed into one group"))))))
 
@@ -289,8 +289,8 @@ operator was trying to close."
              (getf (bl::args->start-node-plist
                     '("-regtest" "-asmap=peers.map") nil)
                    :asmap)))
-  (is-true (bl::known-config-option-p "asmap"))
-  (is-false (bl::core-only-option-p "asmap")))
+  (is-true (bl:known-config-option-p "asmap"))
+  (is-false (bl.cfg:core-only-option-p "asmap")))
 
 (test addr-fetch-peer-disconnects-once-it-delivers-addresses
   "An addr-fetch peer (-seednode) exists only to hand over addresses and is
@@ -555,7 +555,7 @@ cjdns-flip-on-ingress), this covers every fc00 ingress point."
             '(simple-array (unsigned-byte 8) (*)))))
     ;; (handle-addr's return counts plausible+reachable entries for the log;
     ;; the routability drop happens inside address-book-add — assert the book.)
-    (bl.net::handle-addr nil v1-payload (bl.ctx:make-node-context :address-book book))
+    (bl.net:handle-addr nil v1-payload (bl.ctx:make-node-context :address-book book))
     (is (= 0 (bl.net:address-book-count book)))
     (is (null (bl.net:address-book-lookup book fc 8333 :cjdns)))
     (is (null (bl.net:address-book-lookup book fc 8333 :ipv6)))

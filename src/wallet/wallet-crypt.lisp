@@ -180,7 +180,7 @@ check is a handful of AES blocks."
     (when (and any-pass any-fail)
       (bl:log-warn
        "The wallet is probably corrupted: Some keys decrypt but not all.")
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                         :message "Error unlocking wallet: some keys decrypt but not all. Your wallet file may be corrupt."))
     (not any-fail)))
 
@@ -299,7 +299,7 @@ point leaves both the file and the in-memory maps exactly as they were."
                ;; Core: Encrypt() refuses when m_map_crypted_keys is
                ;; non-empty. A mixed wallet means we would be about to
                ;; wrap already-wrapped keys.
-               (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-encryption-failed+
+               (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-encryption-failed+
                                  :message "Error: Failed to encrypt the wallet."))
              (maphash
               (lambda (keyid entry)
@@ -309,7 +309,7 @@ point leaves both the file and the in-memory maps exactly as they were."
                          (ciphertext (encrypt-secret plain-master priv32 pubkey)))
                     (unless (equalp priv32
                                     (decrypt-key plain-master pubkey ciphertext))
-                      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-encryption-failed+
+                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-encryption-failed+
                                         :message "Error: Failed to encrypt the wallet."))
                     (push (list spkm keyid pubkey ciphertext) staged))))
               (desc-spkm-keys spkm)))
@@ -345,7 +345,7 @@ consistent encrypted wallet that merely kept its old seed."
          (mk (encrypt-master-key passphrase plain-master salt
                                  +master-key-default-derive-iterations+)))
     (unless (and mk (equalp plain-master (decrypt-master-key passphrase mk)))
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-encryption-failed+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-encryption-failed+
                         :message "Error: Failed to encrypt the wallet."))
     (bl:log-info "Encrypting Wallet with an nDeriveIterations of ~D"
                            (wallet-master-key-derive-iterations mk))
@@ -389,7 +389,7 @@ consistent encrypted wallet that merely kept its old seed."
       (unwind-protect
            (progn
              (unless (unlock-wallet wallet passphrase)
-               (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-encryption-failed+
+               (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-encryption-failed+
                                  :message "Error: Failed to encrypt the wallet."))
              ;; A new seed, so the addresses handed out before encryption are
              ;; not derivable from a backup taken after it (wallet.cpp:868-871).
@@ -475,7 +475,7 @@ successful unlock; idempotent."
 
 (defun %require-passphrase-string (value)
   (unless (stringp value)
-    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                       :message "passphrase must be a string"))
   value)
 
@@ -483,14 +483,14 @@ successful unlock; idempotent."
   "Refuse while a rescan is holding the wallet unlocked across lock drops
 (Core IsScanningWithPassphrase). ACTION completes Core's message."
   (when (wallet-scanning-with-passphrase wallet)
-    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                       :message (format nil "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before ~A." action))))
 
 (defun %passphrase-incorrect-error (passphrase &key oldp)
   "Core's wrong-passphrase error. A passphrase containing a NUL gets the
 long explanation, because versions before 25.0 truncated at the first NUL
 and such a wallet needs the truncated form to open."
-  (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-passphrase-incorrect+
+  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-passphrase-incorrect+
                     :message
                     (cond ((not (find #\Nul passphrase))
                            "Error: The wallet passphrase entered was incorrect.")
@@ -508,19 +508,19 @@ no longer covers the addresses the wallet will hand out next."
   (let ((wallet (wallet-for-request node))
         (passphrase (%require-passphrase-string (first params))))
     (when (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-encryption-failed+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-encryption-failed+
                         :message "Error: wallet does not contain private keys, nothing to encrypt."))
     (when (wallet-has-encryption-keys-p wallet)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-wrong-enc-state+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-wrong-enc-state+
                         :message "Error: running with an encrypted wallet, but encryptwallet was called."))
     (%require-not-scanning wallet "encrypting the wallet")
     (bt:with-lock-held ((wallet-unlock-lock wallet))
       (with-wallet-lock (wallet)
         (when (zerop (length passphrase))
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "passphrase cannot be empty"))
         (unless (encrypt-wallet wallet passphrase)
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-encryption-failed+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-encryption-failed+
                             :message "Error: Failed to encrypt the wallet."))))
     "wallet encrypted; The keypool has been flushed and a new HD seed was generated. You need to make a new backup with the backupwallet RPC."))
 
@@ -538,18 +538,18 @@ Calling it on an already-unlocked wallet succeeds and re-arms the timer."
     (bt:with-lock-held ((wallet-unlock-lock wallet))
       (with-wallet-lock (wallet)
         (unless (wallet-has-encryption-keys-p wallet)
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-wrong-enc-state+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-wrong-enc-state+
                             :message "Error: running with an unencrypted wallet, but walletpassphrase was called."))
         (%require-passphrase-string passphrase)
         (unless (integerp timeout)
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Timeout must be an integer"))
         (when (minusp timeout)
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Timeout cannot be negative."))
         (let ((timeout (min timeout +walletpassphrase-max-sleep-time+)))
           (when (zerop (length passphrase))
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message "passphrase cannot be empty"))
           (unless (unlock-wallet wallet passphrase)
             (%passphrase-incorrect-error passphrase))
@@ -575,13 +575,13 @@ PARAMS: (oldpassphrase newpassphrase). Returns null."
         (old (%require-passphrase-string (first params)))
         (new (%require-passphrase-string (second params))))
     (unless (wallet-has-encryption-keys-p wallet)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-wrong-enc-state+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-wrong-enc-state+
                         :message "Error: running with an unencrypted wallet, but walletpassphrasechange was called."))
     (%require-not-scanning wallet "changing the passphrase")
     (bt:with-lock-held ((wallet-unlock-lock wallet))
       (with-wallet-lock (wallet)
         (when (or (zerop (length old)) (zerop (length new)))
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "passphrase cannot be empty"))
         (unless (change-wallet-passphrase wallet old new)
           (%passphrase-incorrect-error old :oldp t))))
@@ -592,7 +592,7 @@ PARAMS: (oldpassphrase newpassphrase). Returns null."
   (declare (ignore params))
   (let ((wallet (wallet-for-request node)))
     (unless (wallet-has-encryption-keys-p wallet)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-wrong-enc-state+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-wrong-enc-state+
                         :message "Error: running with an unencrypted wallet, but walletlock was called."))
     (%require-not-scanning wallet "locking the wallet")
     (with-wallet-lock (wallet)
@@ -673,7 +673,7 @@ user asked for."
              ;; POSIX does not make the rename itself durable until the
              ;; containing directory is synced (storage/utxo.lisp does the
              ;; same for the same reason).
-             (bl.store::fsync-directory path)
+             (bl.kv:fsync-directory path)
              (setf temp nil))
         ;; A failed dump must not leave a partial file that looks like a
         ;; backup (Core dump.cpp:104-106 removes its temp the same way).
@@ -777,7 +777,7 @@ ciphertext."
         (destination (first params))
         (manager (node-wallet-manager-checked node)))
     (unless (stringp destination)
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "destination must be a string"))
     ;; Core's BlockUntilSyncedToCurrentChain equivalent: make sure the
     ;; best-block marker we are about to dump refers to the current tip.
@@ -792,7 +792,7 @@ ciphertext."
             (%write-wallet-dump wallet path)))
       (error (e)
         (bl:log-warn "backupwallet failed: ~A" e)
-        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                           :message "Error: Wallet backup failed!")))
     nil))
 
@@ -819,16 +819,16 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
          (action (%load-on-startup-action (third params)))
          (warnings '()))
     (unless (and (stringp name) (plusp (length name)))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "Wallet name cannot be empty"))
     ;; Core does no containment check here at all — AbsPathJoin lets
     ;; "../evil" escape the wallets directory. We do not copy that.
     (unless (%valid-wallet-name-p name)
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message (format nil "Invalid wallet name ~S" name)))
     (unless (and (stringp backup-file)
                  (probe-file (uiop:parse-native-namestring backup-file)))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "Backup file does not exist"))
     (let* ((path (wallet-directory manager name))
            (existed (and (uiop:directory-exists-p path) t)))
@@ -837,7 +837,7 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
       ;; this is also what a restore-over-a-live-wallet gets.
       (when (or (wallet-db-exists-p path)
                 (gethash name (wallet-manager-wallets manager)))
-        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-already-exists+
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-already-exists+
                           :message (format nil "Failed to restore wallet. Database file exists in '~A'."
                                            (namestring path))))
       ;; Verify the whole dump BEFORE creating anything, so a bad file
@@ -846,7 +846,7 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
                       (uiop:parse-native-namestring backup-file)
                       (wallet-manager-network manager))))
         (unless records
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-not-found+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-not-found+
                             :message (format nil "Wallet file verification failed. Failed to load database path '~A'. Data is not in recognized format."
                                              (namestring path))))
         (handler-case
@@ -863,19 +863,19 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
           (error (e)
             (%restore-cleanup path existed)
             (bl:log-warn "restorewallet: writing ~A failed: ~A" name e)
-            (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                               :message (format nil "Wallet loading failed. ~A" e)))))
       (handler-case
           (multiple-value-bind (wallet load-warnings)
               (%load-and-attach-wallet node manager name)
             (declare (ignore wallet))
             (setf warnings load-warnings))
-        (bl.rpc::rpc-error (e)
+        (bl.rpc:rpc-error (e)
           (%restore-cleanup path existed)
           (error e))
         (error (e)
           (%restore-cleanup path existed)
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                             :message (format nil "Wallet loading failed. ~A" e))))
       (unless (update-wallet-setting (wallet-manager-data-directory manager)
                                      name action)

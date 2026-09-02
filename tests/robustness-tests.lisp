@@ -50,19 +50,19 @@
   ;; Bounds-checked before allocating, so this errors rather than allocating a
   ;; huge buffer ahead of the overrun.
   (signals error
-    (let ((br (bl.ser::make-byte-reader-from (%bytes 1 2 3 4))))
-      (bl.ser::br-read-bytes br 33554432))))
+    (let ((br (bl.ser:make-byte-reader-from (%bytes 1 2 3 4))))
+      (bl.ser:br-read-bytes br 33554432))))
 
 (test inv-payload-rejects-oversized-count
   ;; compact-size 50001 (0xfe + LE32) — exceeds MAX_INV_SZ (50000).
   (signals error
-    (bl.ser::parse-inv-payload
+    (bl.ser:parse-inv-payload
      (%bytes #xfe #x51 #xc3 0 0))))   ; 50001 = 0x0000c351
 
 (test headers-payload-rejects-oversized-count
   ;; compact-size 2001 (0xfd + LE16) — exceeds MAX_HEADERS_RESULTS (2000).
   (signals error
-    (bl.ser::parse-headers-payload
+    (bl.ser:parse-headers-payload
      (%bytes #xfd #xd1 #x07))))       ; 2001 = 0x07d1
 
 ;;;; Block-relay message count caps (compact block / getblocktxn / blocktxn)
@@ -128,8 +128,8 @@
                             (bl.ser:br-read-transaction s))))
           (try (lambda () (bl.bytes:with-byte-reader (s bytes)
                             (bl.ser:br-read-bitcoin-block s))))
-          (try (lambda () (bl.ser::br-read-transaction
-                           (bl.ser::make-byte-reader-from bytes))))
+          (try (lambda () (bl.ser:br-read-transaction
+                           (bl.ser:make-byte-reader-from bytes))))
           (incf done))))
     (is (= 400 done))
     (is (plusp errored))))
@@ -155,7 +155,7 @@ connection — enough to drive dispatch + disconnect without a real socket."
             (bl.net::safely-dispatch-peer-message peer "inv" (%bytes #xfe #x51 #xc3 0 0) (bl.ctx:make-node-context) ctx)))
       (is (null still-connected))
       (is (eq :disconnected (bl.net:peer-state peer)))
-      (is (null (bl.net::peer-connection peer))))))
+      (is (null (bl.net:peer-connection peer))))))
 
 (test wellformed-message-keeps-peer-connected
   ;; Control: a benign (unknown, ignored) message dispatches without error, so
@@ -167,7 +167,7 @@ connection — enough to drive dispatch + disconnect without a real socket."
             (bl.net::safely-dispatch-peer-message peer "xyzzy" (%bytes) (bl.ctx:make-node-context) ctx)))
       (is (eq t still-connected))
       (is (eq :ready (bl.net:peer-state peer)))
-      (is-true (bl.net::peer-connection peer)))))
+      (is-true (bl.net:peer-connection peer)))))
 
 (test fuzz-message-vector-parsers-terminate
   ;; Random payloads to the inv/headers parsers must terminate (the count caps +
@@ -176,7 +176,7 @@ connection — enough to drive dispatch + disconnect without a real socket."
         (done 0))
     (dotimes (i 200)
       (let ((bytes (%random-bytes (random 200 state) state)))
-        (ignore-errors (bl.ser::parse-inv-payload bytes))
-        (ignore-errors (bl.ser::parse-headers-payload bytes))
+        (ignore-errors (bl.ser:parse-inv-payload bytes))
+        (ignore-errors (bl.ser:parse-headers-payload bytes))
         (incf done)))
     (is (= 200 done))))

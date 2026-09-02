@@ -165,7 +165,13 @@ hash.cpp. src/crypto/.")
    #:+p2pkh-version-mainnet+
    #:+p2pkh-version-testnet+
    #:+p2sh-version-mainnet+
-   #:+p2sh-version-testnet+))
+   #:+p2sh-version-testnet+)
+  ;; Reached from another package with :: before the second-round review
+  ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
+  (:export
+   #:bytes-to-le-integer
+   #:le-integer-to-bytes
+   #:make-muhash-raw))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

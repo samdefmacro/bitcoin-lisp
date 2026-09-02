@@ -95,7 +95,7 @@ has already shipped twice."
       (is-false (assoc "statistics" bip9 :test #'string=))
       (is-false (assoc "bit" bip9 :test #'string=)))
     ;; Not active, and with no active_since there is no height key at all.
-    (is (eq bl.rpc::+json-false+ (cdr (assoc "active" taproot :test #'string=))))
+    (is (eq bl.rpc:+json-false+ (cdr (assoc "active" taproot :test #'string=))))
     (is-false (assoc "height" taproot :test #'string=))
     ;; The buried ones keep their shape.
     (let ((segwit (cdr (assoc "segwit" deps :test #'string=))))

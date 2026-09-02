@@ -115,9 +115,9 @@ anchors.dat in the network-typed v2 format (net + address + port)."
                                      (bl.net:peer-address p)))
                  when net                        ; hostname peers (addnode) skipped
                    collect (list net bytes
-                                 (let ((conn (bl.net::peer-connection p)))
+                                 (let ((conn (bl.net:peer-connection p)))
                                    (if conn
-                                       (bl.net::connection-port conn)
+                                       (bl.net:connection-port conn)
                                        default-port))))))
     (when entries
       (handler-case
@@ -763,10 +763,10 @@ inside the node, which had simply been asked to dial a host it was already
 talking to."
   (bt:with-recursive-lock-held ((node-lock node))
     (and (find-if (lambda (p)
-                    (let ((conn (bl.net::peer-connection p)))
+                    (let ((conn (bl.net:peer-connection p)))
                       (and conn
-                           (string= host (bl.net::connection-host conn))
-                           (eql port (bl.net::connection-port conn)))))
+                           (string= host (bl.net:connection-host conn))
+                           (eql port (bl.net:connection-port conn)))))
                   (node-peers node))
          t)))
 

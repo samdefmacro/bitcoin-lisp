@@ -16,20 +16,20 @@ directory calls MAKE-TEMP-DIRECTORY, which is already unique.")
          (wallet-dir (merge-pathnames (format nil "wallet-chain-~A/" id)
                                       (uiop:temporary-directory))))
     (bl.store:store-block
-     (bl::node-block-store node)
+     (bl:node-block-store node)
      (bl.store:make-genesis-block :regtest))
-    (setf (bl::node-wallet-manager node)
+    (setf (bl:node-wallet-manager node)
           (bl.wallet::make-wallet-manager
            :data-directory wallet-dir :network :regtest :keypool-size keypool))
     node))
 
 (defmacro with-wallet-chain-node ((node suffix &key (keypool 5)) &body body)
   "Run BODY under regtest bindings with NODE bound to a make-wallet-chain-node and
-bl::*node* bound so the wallet chain hooks fire."
+bl:*node* bound so the wallet chain hooks fire."
   `(with-network (:regtest)
     (let* ((,node (make-wallet-chain-node ,suffix :keypool ,keypool))
-           (bl::*node* ,node))
+           (bl:*node* ,node))
       (unwind-protect (progn ,@body)
         (ignore-errors
          (bl.wallet:close-wallet-manager
-          (bl::node-wallet-manager ,node)))))))
+          (bl:node-wallet-manager ,node)))))))

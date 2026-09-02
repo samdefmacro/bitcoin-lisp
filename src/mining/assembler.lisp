@@ -141,9 +141,9 @@ forbids concurrent txgraph mutation, so the walk must exclude the network
 and sync threads' mempool writes. Outside a running node (unit tests,
 direct calls) there is nothing to lock. Mirrors networking's WITH-NODE-LOCK
 (protocol.lisp:7), duplicated because mining loads before networking."
-  `(let ((node bl::*node*))
+  `(let ((node bl:*node*))
      (if node
-         (bt:with-recursive-lock-held ((bl::node-lock node))
+         (bt:with-recursive-lock-held ((bl:node-lock node))
            ,@body)
          (progn ,@body))))
 

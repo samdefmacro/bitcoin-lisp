@@ -20,13 +20,13 @@ to the direct whole-UTXO-set MuHash, and tip tallies equal to the live UTXO
 set's txout count and total amount."
   (with-network (:regtest)
    (let ((node (regtest-node-fixture (format nil "csi~D" (get-internal-real-time)))))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        ;; Mine spendable coinbases, then a chain of blocks. Coinbase outputs on
        ;; regtest raw(51) are spendable, so this builds a non-trivial UTXO set.
        (bl.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
-       (let* ((cs (bl::node-chain-state node))
-              (store (bl::node-block-store node))
-              (utxo (bl::node-utxo-set node))
+       (let* ((cs (bl:node-chain-state node))
+              (store (bl:node-block-store node))
+              (utxo (bl:node-utxo-set node))
               (tip (bl.store:current-height cs))
               (idxbase (merge-pathnames (format nil "test-csi-~D/" (get-internal-real-time))
                                         (uiop:temporary-directory)))
@@ -60,10 +60,10 @@ count is monotonically non-decreasing across a coinbase-only chain, and each
 height's MuHash is retrievable and distinct from its predecessor."
   (with-network (:regtest)
    (let ((node (regtest-node-fixture (format nil "csih~D" (get-internal-real-time)))))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
-       (let* ((cs (bl::node-chain-state node))
-              (store (bl::node-block-store node))
+       (let* ((cs (bl:node-chain-state node))
+              (store (bl:node-block-store node))
               (tip (bl.store:current-height cs))
               (idxbase (merge-pathnames (format nil "test-csih-~D/" (get-internal-real-time))
                                         (uiop:temporary-directory)))
@@ -94,26 +94,26 @@ stats from the index (muhash equal to the direct whole-set muhash at the tip)."
           (idxbase (merge-pathnames (format nil "test-csirpc-~A/" tag)
                                     (uiop:temporary-directory))))
      (ensure-directories-exist idxbase)
-     (setf (bl::node-coinstatsindex node)
+     (setf (bl:node-coinstatsindex node)
            (bl.store:init-coinstatsindex idxbase :enabled t))
      ;; Seed genesis so the connect hook (which needs the parent record) can
      ;; start at height 1, mirroring start-node's backfill seed.
      (bl.store:coinstatsindex-seed-genesis
-      (bl::node-coinstatsindex node)
+      (bl:node-coinstatsindex node)
       (bl.val:calculate-block-subsidy 0)
       (bl.store:network-genesis-hash :regtest))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        ;; The connect hook fires as generatetodescriptor connects each block.
        (bl.rpc::rpc-generatetodescriptor node (list 6 "raw(51)"))
-       (let* ((csi (bl::node-coinstatsindex node))
-              (cs (bl::node-chain-state node))
-              (utxo (bl::node-utxo-set node))
+       (let* ((csi (bl:node-coinstatsindex node))
+              (cs (bl:node-chain-state node))
+              (utxo (bl:node-utxo-set node))
               (tip (bl.store:current-height cs)))
          ;; The hook kept the index at the tip.
          (is (= tip (bl.store:coinstatsindex-height csi)))
          ;; gettxoutsetinfo <tip> from the index matches the direct whole set.
          (let* ((res (bl.rpc::rpc-gettxoutsetinfo node (list "muhash" tip)))
-                (direct (bl.rpc::hash-to-hex
+                (direct (bl.rpc:hash-to-hex
                          (bl.store:compute-utxo-set-muhash utxo))))
            (is (= tip (cdr (assoc "height" res :test #'string=))))
            (is (string= direct (cdr (assoc "muhash" res :test #'string=))))
@@ -124,10 +124,10 @@ stats from the index (muhash equal to the direct whole-set muhash at the tip)."
            (is-true (assoc "unspendables" (cdr (assoc "block_info" res :test #'string=))
                            :test #'string=)))
          ;; A height above the tip errors.
-         (signals bl.rpc::rpc-error
+         (signals bl.rpc:rpc-error
            (bl.rpc::rpc-gettxoutsetinfo node (list "muhash" (+ tip 100))))
          ;; hash_serialized_3 is not index-backed.
-         (signals bl.rpc::rpc-error
+         (signals bl.rpc:rpc-error
            (bl.rpc::rpc-gettxoutsetinfo node (list "hash_serialized_3" 1)))
          (bl.store:close-coinstatsindex csi))))))
 
@@ -138,9 +138,9 @@ application drops them, matching Core's AddCoin. The txout count reflects only
 the spendable coinbase reward outputs."
   (with-network (:regtest)
    (let ((node (regtest-node-fixture (format nil "unsp~D" (get-internal-real-time)))))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
-       (let ((utxo (bl::node-utxo-set node))
+       (let ((utxo (bl:node-utxo-set node))
              (unspendable-found 0)
              (total 0))
          (bl.store:utxo-set-iterate
@@ -204,15 +204,15 @@ coinstats index built over them, installed on the node. Call inside
   (let* ((node (regtest-node-fixture tag))
          (idxbase (merge-pathnames (format nil "test-csi-rw-~A/" tag)
                                    (uiop:temporary-directory))))
-    (let ((bl::*node* node))
+    (let ((bl:*node* node))
       (bl.rpc::rpc-generatetodescriptor node (list blocks "raw(51)")))
-    (let* ((cs (bl::node-chain-state node))
+    (let* ((cs (bl:node-chain-state node))
            (csi (bl.store:init-coinstatsindex idxbase :enabled t)))
       (bl.store:build-coinstatsindex
-       csi cs (bl::node-block-store node)
+       csi cs (bl:node-block-store node)
        #'bl.val:get-undo-data
        #'bl.val:calculate-block-subsidy)
-      (setf (bl::node-coinstatsindex node) csi)
+      (setf (bl:node-coinstatsindex node) csi)
       (values node csi cs (bl.store:current-height cs)))))
 
 (defmacro %csi-counting-calls ((count-var fname) &body body)
@@ -231,12 +231,12 @@ paths did the work — and that the counter can move at all."
 
 (defun %csi-raw-record (csi height)
   "The stored record at HEIGHT as raw bytes (NIL if absent)."
-  (bl.kv::leveldb-get
+  (bl.kv:leveldb-get
    (bl.store:coinstatsindex-db csi)
    (bl.store::%csi-stat-key height)))
 
 (defun %csi-put-raw-record (csi height bytes)
-  (bl.kv::leveldb-put
+  (bl.kv:leveldb-put
    (bl.store:coinstatsindex-db csi)
    (bl.store::%csi-stat-key height) bytes))
 
@@ -289,7 +289,7 @@ BaseIndex::Rewind)."
        (is (not (equalp (cdr (assoc tip correct)) (%csi-raw-record csi tip))))
        ;; Drive the shipped startup entry point: it must rewind and rebuild
        ;; every record above the fork, exactly.
-       (bl::catch-up-index node (bl::node-coinstatsindex node))
+       (bl:catch-up-index node (bl:node-coinstatsindex node))
        (is (= tip (bl.store:coinstatsindex-height csi)))
        (dolist (entry correct)
          (is (equalp (cdr entry) (%csi-raw-record csi (car entry)))
@@ -306,7 +306,7 @@ BaseIndex::Rewind)."
        (%csi-divergent-state csi fork tip branch)
        (%csi-counting-calls
            (verifications 'bl.store:coinstatsindex-record-matches-block-p)
-         (is (eql fork (bl::%rewind-coinstatsindex (bl::node-coinstatsindex node) (bl::node-validated-chainstate node) (bl::node-block-store node))))
+         (is (eql fork (bl::%rewind-coinstatsindex (bl:node-coinstatsindex node) (bl:node-validated-chainstate node) (bl:node-block-store node))))
          (is (= 0 verifications)
              "the header-index ancestor walk did not resolve the fork (~D recomputations)"
              verifications))
@@ -328,7 +328,7 @@ parent and the active block at that height."
             (correct (%csi-divergent-state csi fork tip unknown)))
        (is (null (bl.store:get-block-index-entry cs unknown)))
        ;; The shipped entry point rewinds and rebuilds, as above.
-       (bl::catch-up-index node (bl::node-coinstatsindex node))
+       (bl:catch-up-index node (bl:node-coinstatsindex node))
        (is (= tip (bl.store:coinstatsindex-height csi)))
        (dolist (entry correct)
          (is (equalp (cdr entry) (%csi-raw-record csi (car entry)))
@@ -339,7 +339,7 @@ parent and the active block at that height."
        (%csi-divergent-state csi fork tip unknown)
        (%csi-counting-calls
            (verifications 'bl.store:coinstatsindex-record-matches-block-p)
-         (is (eql fork (bl::%rewind-coinstatsindex (bl::node-coinstatsindex node) (bl::node-validated-chainstate node) (bl::node-block-store node))))
+         (is (eql fork (bl::%rewind-coinstatsindex (bl:node-coinstatsindex node) (bl:node-validated-chainstate node) (bl:node-block-store node))))
          (is (= 3 verifications)
              "expected one recomputation per height from the tip down to the fork, got ~D"
              verifications))
@@ -355,14 +355,14 @@ by re-running against a divergent index."
        (%csi-fixture (format nil "csictl~D" (get-internal-real-time)) 5)
      (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
        ;; Consistent: no rewind, no work at all.
-       (is (null (bl::%rewind-coinstatsindex (bl::node-coinstatsindex node) (bl::node-validated-chainstate node) (bl::node-block-store node))))
-       (bl::catch-up-index node (bl::node-coinstatsindex node))
+       (is (null (bl::%rewind-coinstatsindex (bl:node-coinstatsindex node) (bl:node-validated-chainstate node) (bl:node-block-store node))))
+       (bl:catch-up-index node (bl:node-coinstatsindex node))
        (is (= 0 adds) "a consistent index re-indexed ~D block(s)" adds)
        (is (= tip (bl.store:coinstatsindex-height csi)))
        ;; Positive control: the counter does move when there IS work.
        (let ((fork (- tip 2)))
          (%csi-divergent-state csi fork tip (%csi-fake-branch cs fork tip 100))
-         (bl::catch-up-index node (bl::node-coinstatsindex node))
+         (bl:catch-up-index node (bl:node-coinstatsindex node))
          (is (= 2 adds) "divergent index re-indexed ~D block(s)" adds)))
      (bl.store:close-coinstatsindex csi))))
 
@@ -383,8 +383,8 @@ move to the tip — not a rebuild from genesis."
         csi (+ tip 2) (make-array 32 :element-type '(unsigned-byte 8)
                                      :initial-element #xC3))
        (%csi-counting-calls (adds 'bl.store:coinstatsindex-add-block)
-         (is (eql tip (bl::%rewind-coinstatsindex (bl::node-coinstatsindex node) (bl::node-validated-chainstate node) (bl::node-block-store node))))
-         (bl::catch-up-index node (bl::node-coinstatsindex node))
+         (is (eql tip (bl::%rewind-coinstatsindex (bl:node-coinstatsindex node) (bl:node-validated-chainstate node) (bl:node-block-store node))))
+         (bl:catch-up-index node (bl:node-coinstatsindex node))
          (is (= 0 adds) "an index merely ahead of the tip re-indexed ~D block(s)" adds))
        ;; Marker back on the active tip, its record untouched.
        (multiple-value-bind (h hash) (bl.store:coinstatsindex-best csi)
@@ -407,16 +407,16 @@ same height still works."
      (let* ((stale (%csi-fake-branch cs (1- tip) tip 150))
             (active (bl.store:block-index-entry-hash
                      (bl.store:get-block-at-height cs tip))))
-       (signals bl.rpc::rpc-error
+       (signals bl.rpc:rpc-error
          (bl.rpc::rpc-gettxoutsetinfo
-          node (list "muhash" (bl.rpc::hash-to-hex stale))))
+          node (list "muhash" (bl.rpc:hash-to-hex stale))))
        (let ((res (bl.rpc::rpc-gettxoutsetinfo
-                   node (list "muhash" (bl.rpc::hash-to-hex active)))))
+                   node (list "muhash" (bl.rpc:hash-to-hex active)))))
          (is (= tip (cdr (assoc "height" res :test #'string=)))))
        ;; A height above the best marker is not vouched for either.
        (bl.store:coinstatsindex-set-best
         csi (1- tip) (bl.store:block-index-entry-hash
                       (bl.store:get-block-at-height cs (1- tip))))
-       (signals bl.rpc::rpc-error
+       (signals bl.rpc:rpc-error
          (bl.rpc::rpc-gettxoutsetinfo node (list "muhash" tip)))
        (bl.store:close-coinstatsindex csi)))))

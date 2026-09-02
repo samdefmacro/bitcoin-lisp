@@ -926,7 +926,7 @@ data actually is, so a running node is untouched until it is migrated."
 (declaim (inline bb-write-chainwork))
 (defun bb-write-chainwork (bb value)
   "byte-buf variant of serialize-chainwork: 32 big-endian bytes."
-  (declare (type bl.ser::byte-buf bb)
+  (declare (type bl.ser:byte-buf bb)
            (optimize (speed 3) (safety 1)))
   (let ((bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
     (declare (type (simple-array (unsigned-byte 8) (32)) bytes))
@@ -949,7 +949,7 @@ data actually is, so a running node is untouched until it is migrated."
   "byte-buf variant: write 80-byte block header (zero-padded if short)."
   (declare (optimize (speed 3) (safety 1)))
   (if header
-      (let* ((header-bytes (bl.ser::serialize-block-header header))
+      (let* ((header-bytes (bl.ser:serialize-block-header header))
              (len (length header-bytes)))
         (declare (type fixnum len))
         (bl.ser:bb-write-bytes bb header-bytes)
@@ -1341,7 +1341,7 @@ possible, and why the position is nullable rather than defaulted."
                             0))
               (header (handler-case
                           (flexi-streams:with-input-from-sequence (hs header-bytes)
-                            (bl.ser::read-block-header hs))
+                            (bl.ser:read-block-header hs))
                         (error () nil))))
           (multiple-value-bind (file data-pos undo-pos)
               (if with-position

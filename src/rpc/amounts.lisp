@@ -5,7 +5,7 @@
 ;;;; live in the wallet files, which made mempool and rawtransaction RPCs
 ;;;; depend on the wallet for a BTC-to-satoshi parse.
 
-(defun %amount-from-value (value)
+(defun amount-from-value (value)
   "Core AmountFromValue: a JSON number or decimal string in BTC to
 satoshis, at most 8 fraction digits, within MoneyRange. Sub-satoshi
 precision is REJECTED like Core (which parses the decimal text exactly):
@@ -60,11 +60,11 @@ where a double's nearest representation may be off by up to ~0.4 sat."
       (error 'rpc-error :code +rpc-type-error+ :message "Amount out of range"))
     satoshis))
 
-(defun %btc (satoshis)
+(defun satoshi->btc (satoshis)
   "Satoshis as the BTC double the RPC layer emits."
   (/ satoshis 100000000.0d0))
 
-(defun %feerate-fee (rate-sat-kvb size)
+(defun feerate-fee (rate-sat-kvb size)
   "Core CFeeRate::GetFee at d3056bc: ceil(RATE-SAT-KVB * SIZE / 1000) —
 FeeFrac::EvaluateFeeUp (feerate.cpp:20-27, feefrac.h:196-223, \"rounding
 up\"). Round-up is what makes per-part fee budgets additive: the sum of
@@ -74,7 +74,7 @@ rates never occur in the wallet."
   (declare (type integer rate-sat-kvb size))
   (ceiling (* rate-sat-kvb size) 1000))
 
-(defun %format-money (satoshis)
+(defun format-money (satoshis)
   "Core FormatMoney: BTC decimal string, trailing zeros trimmed but at
 least two decimals kept."
   (multiple-value-bind (quotient remainder) (truncate (abs satoshis) 100000000)
@@ -91,7 +91,7 @@ least two decimals kept."
   (amount 0 :type integer)
   sffo)
 
-(defun %parse-outputs (network outputs-param)
+(defun parse-outputs (network outputs-param)
   "Core ParseOutputs over the outputs argument: an object {address: amount,
 \"data\": hex} or an array of single-pair objects. Returns
 (values recipient-list key-strings). JSON objects arrive as hash tables
@@ -144,7 +144,7 @@ send/walletcreatefundedpsbt docstrings."
                        (error 'rpc-error :code +rpc-invalid-address-or-key+
                                          :message (format nil "Invalid Bitcoin address: ~A" key)))
                      (push (make-recipient :address key :script script
-                                           :amount (%amount-from-value value))
+                                           :amount (amount-from-value value))
                            recipients))))
       (values (nreverse recipients) (nreverse keys)))))
 

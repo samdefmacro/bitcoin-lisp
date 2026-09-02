@@ -97,8 +97,8 @@ pins bits off-boundary and clamps to 4x either way on a retarget boundary."
       (is-true ok)
       (is-true more)                         ; full batch → ask for more
       (is (null ready))                      ; nothing released to the index
-      (is (eq :presync (bl.net::hss-state hss)))
-      (is (= 6 (bl.net::hss-current-height hss)))
+      (is (eq :presync (bl.net:hss-state hss)))
+      (is (= 6 (bl.net:hss-current-height hss)))
       (is (= (* 6 (hs-per-header-work bits))
              (bl.net::hss-current-work hss))))))
 
@@ -119,7 +119,7 @@ pins bits off-boundary and clamps to 4x either way on a retarget boundary."
         (bl.net::hss-process-next-headers hss headers t)
       (declare (ignore more ready))
       (is-false ok)
-      (is (eq :final (bl.net::hss-state hss))))))
+      (is (eq :final (bl.net:hss-state hss))))))
 
 ;;; --- full presync -> redownload -> accept -----------------------------------
 
@@ -144,7 +144,7 @@ same chain back verifies commitments and releases every header for storage."
       (is-true ok)
       (is-true more)                          ; switched -> re-request from start
       (is (null ready))
-      (is (eq :redownload (bl.net::hss-state hss))))
+      (is (eq :redownload (bl.net:hss-state hss))))
     ;; REDOWNLOAD: same chain back -> all 8 released, in order, sync final.
     (multiple-value-bind (ok more ready)
         (bl.net::hss-process-next-headers hss headers nil)
@@ -153,7 +153,7 @@ same chain back verifies commitments and releases every header for storage."
       (is (= 8 (length ready)))
       (is (equalp (mapcar #'bl.ser:block-header-hash headers)
                   (mapcar #'bl.ser:block-header-hash ready)))
-      (is (eq :final (bl.net::hss-state hss))))))
+      (is (eq :final (bl.net:hss-state hss))))))
 
 (test redownload-commitment-mismatch-aborts
   "A peer that proves work in presync but substitutes a different header at a
@@ -170,7 +170,7 @@ commitment height in redownload is caught by the stored commitment."
           (bl.net::hss-commit-offset hss) 0)
     ;; PRESYNC over all 6 -> crosses 4-header threshold -> REDOWNLOAD.
     (bl.net::hss-process-next-headers hss headers nil)
-    (is (eq :redownload (bl.net::hss-state hss)))
+    (is (eq :redownload (bl.net:hss-state hss)))
     (let* ((h1 (first headers))                                   ; height 1 (no commit)
            (real-h2 (second headers))                             ; height 2 (commit)
            (ref-bit (bl.net::hss-commitment-bit
@@ -188,7 +188,7 @@ commitment height in redownload is caught by the stored commitment."
           (bl.net::hss-process-next-headers hss (list h1 alt-h2) nil)
         (declare (ignore more ready))
         (is-false ok)
-        (is (eq :final (bl.net::hss-state hss)))))))
+        (is (eq :final (bl.net:hss-state hss)))))))
 
 ;;; --- the storage-diversion gate --------------------------------------------
 
@@ -200,11 +200,11 @@ presync; a non-full batch is not (the peer has nothing more to prove work with).
          (bl:*minimum-chain-work-override* 1000000)
          (bits #x207fffff)
          (gh (hs-hash 9))
-         (state (bl.store::make-chain-state))
+         (state (bl.store:make-chain-state))
          (entry (bl.store:make-block-index-entry
                  :hash gh :height 0 :chain-work 1 :status :valid :prev-entry nil
                  :header (hs-test-header (hs-hash 0) bits))))
-    (setf (bl.store::chain-state-best-block-hash state) gh)
+    (setf (bl.store:chain-state-best-block-hash state) gh)
     (bl.store:add-block-index-entry state entry)
     ;; Mine a short continuous PoW-valid chain off genesis.
     (let ((headers (let ((prev gh) (out nil))

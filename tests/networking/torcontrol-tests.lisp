@@ -507,9 +507,9 @@ dummy; addr_from is always the all-zero dummy, exactly like modern Core."
                 (bl.ser:read-version-message s))))
     (is (equalp (bl.net:ipv4-to-mapped-ipv6 1 2 3 4)
                 (bl.ser:net-addr-ip
-                 (bl.ser::version-message-addr-recv msg))))
+                 (bl.ser:version-message-addr-recv msg))))
     (is (= 8333 (bl.ser:net-addr-port
-                 (bl.ser::version-message-addr-recv msg))))
+                 (bl.ser:version-message-addr-recv msg))))
     (is (every #'zerop (bl.ser:net-addr-ip
                         (bl.ser::version-message-addr-from msg))))
     (is (zerop (bl.ser:net-addr-port

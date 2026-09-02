@@ -290,7 +290,7 @@ credential, batch works with it too."
     (let ((port 19981)
           (node (make-test-node))
           (cookie nil))
-      (setf (bl::node-data-directory node) dir)
+      (setf (bl:node-data-directory node) dir)
       (unwind-protect
            (progn
              (is (not (null (bl.rpc:start-rpc-server
@@ -370,7 +370,7 @@ RPC prefix dispatcher and is refused (405), never served."
   (with-temp-directory (dir)
     (let ((port 19983)
           (node (make-test-node)))
-      (setf (bl::node-data-directory node) dir)
+      (setf (bl:node-data-directory node) dir)
       (unwind-protect
            (progn
              (is (not (null (bl.rpc:start-rpc-server node :port port))))

@@ -29,7 +29,7 @@ Pubkeys are appended in the given order (Core does not sort them)."
     (vector-push-extend #xae out)          ; OP_CHECKMULTISIG
     (coerce out '(vector (unsigned-byte 8)))))
 
-(defun %parse-multisig-pubkey (hex)
+(defun parse-multisig-pubkey (hex)
   "Parse a hex-encoded 33/65-byte public key for createmultisig, validating it is
 a real point (Bitcoin Core HexToPubKey). Returns the key bytes; signals
 rpc-error otherwise."
@@ -49,7 +49,7 @@ default), \"p2sh-segwit\" (P2SH-P2WSH), or \"bech32\" (P2WSH). Returns
 bare multisig script regardless of address type. Uncompressed keys force legacy
 (with a warning if another type was requested), matching Core."
   (let ((nrequired (first params))
-        (keys (%positional-array (second params)))
+        (keys (positional-array (second params)))
         (address-type (or (third params) "legacy"))
         (network (rpc-get-network node)))
     (unless (integerp nrequired)
@@ -61,7 +61,7 @@ bare multisig script regardless of address type. Uncompressed keys force legacy
                               (unless (stringp k)
                                 (error 'rpc-error :code +rpc-invalid-address-or-key+
                                                   :message "Invalid public key"))
-                              (%parse-multisig-pubkey k))
+                              (parse-multisig-pubkey k))
                             keys))
            (requested (cond ((string= address-type "legacy") :legacy)
                             ((string= address-type "p2sh-segwit") :p2sh-segwit)

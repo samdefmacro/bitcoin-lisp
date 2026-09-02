@@ -72,15 +72,15 @@ block-store / utxo-set, ready for activate-block. Call inside (with-network (:re
          (store (bl.store:init-block-store base))
          (ghash (bl.store:best-block-hash cs))
          (ghdr (bl::make-genesis-header :regtest))
-         (node (bl::make-node :network :regtest)))
+         (node (bl:make-node :network :regtest)))
     (clrhash bl.val::*block-undo-data*)
     (bl.store:add-block-index-entry
      cs (bl.store:make-block-index-entry
          :hash ghash :height 0 :chain-work 1 :status :valid :header ghdr))
-    (setf (bl::node-chain-state node) cs
-          (bl::node-utxo-set node) (bl.store:make-utxo-set)
-          (bl::node-block-store node) store
-          (bl::node-mempool node) (bl.mp:make-mempool))
+    (setf (bl:node-chain-state node) cs
+          (bl:node-utxo-set node) (bl.store:make-utxo-set)
+          (bl:node-block-store node) store
+          (bl:node-mempool node) (bl.mp:make-mempool))
     node))
 
 (defun activate-block-base-path (suffix)

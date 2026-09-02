@@ -34,16 +34,16 @@ vectors passed this entire suite while answering every real miner -8."
 
 (test regtest-network-params
   (is (equalp (bl.chain:chain-params-magic (bl.chain:find-chain-params :regtest))
-              (bl::network-magic :regtest)))
-  (is (= 18444 (bl::network-port :regtest)))
-  (is (= 18443 (bl::network-rpc-port :regtest)))
-  (is (null (bl::network-dns-seeds :regtest))))
+              (bl:network-magic :regtest)))
+  (is (= 18444 (bl:network-port :regtest)))
+  (is (= 18443 (bl:network-rpc-port :regtest)))
+  (is (null (bl:network-dns-seeds :regtest))))
 
 (test regtest-startup-dispatchers-handle-regtest
   ;; Per-network dispatchers reached during node startup / validation must
   ;; handle :regtest (a missing ecase case crashed start-node).
-  (is (integerp (bl::prune-after-height :regtest)))
-  (is (null (bl.net::network-checkpoints :regtest))))
+  (is (integerp (bl.store:prune-after-height :regtest)))
+  (is (null (bl.net:network-checkpoints :regtest))))
 
 (test regtest-genesis-hash-matches-core
   ;; make-genesis-header must hash to Core's regtest genesis
@@ -77,9 +77,9 @@ vectors passed this entire suite while answering every real miner -8."
                 :hash (%zeros 32) :header hdr :height 0)))
     (let ((bl:*network* :regtest))
       ;; non-boundary
-      (is (= #x207fffff (bl.val::get-expected-bits 1 prev)))
+      (is (= #x207fffff (bl.val:get-expected-bits 1 prev)))
       ;; boundary height — regtest still inherits, no retarget
-      (is (= #x207fffff (bl.val::get-expected-bits 2016 prev))))))
+      (is (= #x207fffff (bl.val:get-expected-bits 2016 prev))))))
 
 ;;;; Block assembler
 
@@ -374,10 +374,10 @@ chunk feerate diagram, not boundary knapsack optimality."
 (test rpc-getblocktemplate-shape
   (let ((bl:*network* :regtest))
     (multiple-value-bind (cs mp) (%mining-fixture)
-      (let ((node (bl::make-node :network :regtest)))
-        (setf (bl::node-chain-state node) cs
-              (bl::node-mempool node) mp
-              (bl::node-utxo-set node) (bl.store:make-utxo-set))
+      (let ((node (bl:make-node :network :regtest)))
+        (setf (bl:node-chain-state node) cs
+              (bl:node-mempool node) mp
+              (bl:node-utxo-set node) (bl.store:make-utxo-set))
         (let ((r (bl.rpc::rpc-getblocktemplate node (%gbt-params))))
           (is (= 1 (cdr (assoc "height" r :test #'string=))))
           (is (stringp (cdr (assoc "previousblockhash" r :test #'string=))))
@@ -408,10 +408,10 @@ mempool churn, which is most of what a new template exists to report."
   (let ((bl:*network* :regtest)
         (bl.rpc::*gbt-cache* nil))
     (multiple-value-bind (cs mp) (%mining-fixture)
-      (let ((node (bl::make-node :network :regtest)))
-        (setf (bl::node-chain-state node) cs
-              (bl::node-mempool node) mp
-              (bl::node-utxo-set node) (bl.store:make-utxo-set))
+      (let ((node (bl:make-node :network :regtest)))
+        (setf (bl:node-chain-state node) cs
+              (bl:node-mempool node) mp
+              (bl:node-utxo-set node) (bl.store:make-utxo-set))
         (let* ((r (bl.rpc::rpc-getblocktemplate node (%gbt-params)))
                (id (cdr (assoc "longpollid" r :test #'string=))))
           (is (= (+ 64 (length (princ-to-string
@@ -464,11 +464,11 @@ holding the socket."
   (let ((bl:*network* :regtest)
         (bl.rpc::*gbt-cache* nil))
     (multiple-value-bind (cs mp) (%mining-fixture)
-      (let ((node (bl::make-node :network :regtest)))
-        (setf (bl::node-chain-state node) cs
-              (bl::node-mempool node) mp
-              (bl::node-utxo-set node) (bl.store:make-utxo-set)
-              (bl::node-running node) t)
+      (let ((node (bl:make-node :network :regtest)))
+        (setf (bl:node-chain-state node) cs
+              (bl:node-mempool node) mp
+              (bl:node-utxo-set node) (bl.store:make-utxo-set)
+              (bl:node-running node) t)
         ;; An id naming a tip we are not on: there is already something new to
         ;; say, so the wait is over before it starts.
         (let ((start (get-internal-real-time)))
@@ -480,19 +480,19 @@ holding the socket."
               "a stale longpollid did not return promptly"))
         ;; A current id on a node that is shutting down: Core throws
         ;; RPC_CLIENT_NOT_CONNECTED "Shutting down" rather than blocking.
-        (setf (bl::node-running node) nil)
+        (setf (bl:node-running node) nil)
         (let ((id (format nil "~A~D"
-                          (bl.rpc::hash-to-hex
+                          (bl.rpc:hash-to-hex
                            (bl.store:best-block-hash cs))
                           (bl.mp:mempool-transactions-updated mp))))
           (handler-case
               (progn (bl.rpc::%gbt-wait-for-change node id)
                      (is-true nil "the wait did not end on shutdown"))
-            (bl.rpc::rpc-error (e)
+            (bl.rpc:rpc-error (e)
               (is (= bl.rpc::+rpc-client-not-connected+
-                     (bl.rpc::rpc-error-code e)))
+                     (bl.rpc:rpc-error-code e)))
               (is (string= "Shutting down"
-                           (bl.rpc::rpc-error-message e))))))))
+                           (bl.rpc:rpc-error-message e))))))))
     ;; And getblocktemplate reaches the wait at all — a longpollid that is
     ;; parsed and then ignored is the failure mode this repo keeps finding.
     (is-true (member 'bl.rpc::rpc-getblocktemplate
@@ -508,8 +508,8 @@ which is what stops a busy mempool from reassembling a block on every call."
   (let ((bl:*network* :regtest)
         (bl.rpc::*gbt-cache* nil))
     (let ((now (bl.ser:get-unix-time))
-          (node-a (bl::make-node :network :regtest))
-          (node-b (bl::make-node :network :regtest)))
+          (node-a (bl:make-node :network :regtest))
+          (node-b (bl:make-node :network :regtest)))
       ;; Same node, same tip, same counter: hit.
       (setf bl.rpc::*gbt-cache* (list* node-a "aa" 5 now '(("marker" . 1))))
       (is (equal '(("marker" . 1))
@@ -542,10 +542,10 @@ which is what stops a busy mempool from reassembling a block on every call."
     ;; End to end: two calls in a row against an unchanged node return the
     ;; SAME object, which is what proves the assembly was skipped.
     (multiple-value-bind (cs mp) (%mining-fixture)
-      (let ((node (bl::make-node :network :regtest)))
-        (setf (bl::node-chain-state node) cs
-              (bl::node-mempool node) mp
-              (bl::node-utxo-set node) (bl.store:make-utxo-set)
+      (let ((node (bl:make-node :network :regtest)))
+        (setf (bl:node-chain-state node) cs
+              (bl:node-mempool node) mp
+              (bl:node-utxo-set node) (bl.store:make-utxo-set)
               bl.rpc::*gbt-cache* nil)
         (let ((a (bl.rpc::rpc-getblocktemplate node (%gbt-params)))
               (b (bl.rpc::rpc-getblocktemplate node (%gbt-params))))
@@ -554,9 +554,9 @@ which is what stops a busy mempool from reassembling a block on every call."
 (test rpc-getmininginfo-shape
   (let ((bl:*network* :regtest))
     (multiple-value-bind (cs mp) (%mining-fixture)
-      (let ((node (bl::make-node :network :regtest)))
-        (setf (bl::node-chain-state node) cs
-              (bl::node-mempool node) mp)
+      (let ((node (bl:make-node :network :regtest)))
+        (setf (bl:node-chain-state node) cs
+              (bl:node-mempool node) mp)
         (let ((r (bl.rpc::rpc-getmininginfo node nil)))
           (is (= 0 (cdr (assoc "blocks" r :test #'string=))))
           (is (string= "regtest" (cdr (assoc "chain" r :test #'string=))))
@@ -573,12 +573,12 @@ which is what stops a busy mempool from reassembling a block on every call."
         ;; getdeploymentinfo's optional blockhash (rpc/blockchain.cpp:1494):
         ;; report at that block (here the genesis tip); an unknown hash is
         ;; RPC_INVALID_ADDRESS_OR_KEY.
-        (let* ((tip-hex (bl.rpc::hash-to-hex
+        (let* ((tip-hex (bl.rpc:hash-to-hex
                          (bl.store:best-block-hash cs)))
                (d (bl.rpc::rpc-getdeploymentinfo node (list tip-hex))))
           (is (string= tip-hex (cdr (assoc "hash" d :test #'string=))))
           (is (= 0 (cdr (assoc "height" d :test #'string=)))))
-        (signals bl.rpc::rpc-error
+        (signals bl.rpc:rpc-error
           (bl.rpc::rpc-getdeploymentinfo
            node (list (make-string 64 :initial-element #\f))))))))
 
@@ -600,7 +600,7 @@ assembled block at height 1: UNEXPECTED-WITNESS'.
 
 Invisible on every network this node runs by default, because segwit is active
 from genesis on all of them."
-  (let ((script (bl.mining::build-witness-commitment-script
+  (let ((script (bl.mining:build-witness-commitment-script
                  (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))))
     (flet ((coinbase (active)
              (bl.mining:build-coinbase-transaction
@@ -658,8 +658,8 @@ not active; contextual validation rejects that block as :unexpected-witness")
   (with-network (:regtest)
    (let ((node (regtest-node-fixture "mine")))
      (let ((block (bl.mining:assemble-full-block
-                   (bl::node-chain-state node)
-                   (bl::node-mempool node)
+                   (bl:node-chain-state node)
+                   (bl:node-mempool node)
                    :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
        (is-true (bl.mining:mine-block block))
        (is-true (bl.val:check-proof-of-work
@@ -671,8 +671,8 @@ not active; contextual validation rejects that block as :unexpected-witness")
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "submit"))
           (block (bl.mining:assemble-full-block
-                  (bl::node-chain-state node)
-                  (bl::node-mempool node)
+                  (bl:node-chain-state node)
+                  (bl:node-mempool node)
                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
      (bl.mining:mine-block block)
      (let ((hex (bl.crypto:bytes-to-hex
@@ -680,7 +680,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
        ;; accepted → null
        (is (null (bl.rpc::rpc-submitblock node (list hex))))
        (is (= 1 (bl.store:current-height
-                 (bl::node-chain-state node))))
+                 (bl:node-chain-state node))))
        ;; resubmit the same block → duplicate
        (is (string= "duplicate" (bl.rpc::rpc-submitblock node (list hex))))))))
 
@@ -693,8 +693,8 @@ not active; contextual validation rejects that block as :unexpected-witness")
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "submit-nonce"))
           (block (bl.mining:assemble-full-block
-                  (bl::node-chain-state node)
-                  (bl::node-mempool node)
+                  (bl:node-chain-state node)
+                  (bl:node-mempool node)
                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey)))
           (cb (first (bl.ser:bitcoin-block-transactions block))))
      (bl.mining:mine-block block)
@@ -705,7 +705,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
                  (bl.ser:serialize-witness-block block))))
        (is (null (bl.rpc::rpc-submitblock node (list hex))))
        (is (= 1 (bl.store:current-height
-                 (bl::node-chain-state node))))))))
+                 (bl:node-chain-state node))))))))
 
 (test submitblock-side-chain-block-is-inconclusive
   ;; Two valid blocks on the genesis tip. The first becomes the tip (null);
@@ -714,8 +714,8 @@ not active; contextual validation rejects that block as :unexpected-witness")
   ;; 1091-1095), not null and not a reject reason.
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "submit-side"))
-          (cs (bl::node-chain-state node))
-          (mp (bl::node-mempool node))
+          (cs (bl:node-chain-state node))
+          (mp (bl:node-mempool node))
           (a (bl.mining:assemble-full-block
               cs mp :coinbase-script-pubkey (p2sh-optrue-script-pubkey)))
           (b (bl.mining:assemble-full-block
@@ -739,9 +739,9 @@ not active; contextual validation rejects that block as :unexpected-witness")
   ;; (AcceptBlockHeader, validation.cpp:4231-4235).
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "subhdrblk"))
-          (cs (bl::node-chain-state node))
+          (cs (bl:node-chain-state node))
           (block (bl.mining:assemble-full-block
-                  cs (bl::node-mempool node)
+                  cs (bl:node-mempool node)
                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
      (bl.mining:mine-block block)
      (let* ((hdr (bl.ser:bitcoin-block-header block))
@@ -776,12 +776,12 @@ not active; contextual validation rejects that block as :unexpected-witness")
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "getblockv0"))
           (block (bl.mining:assemble-full-block
-                  (bl::node-chain-state node)
-                  (bl::node-mempool node)
+                  (bl:node-chain-state node)
+                  (bl:node-mempool node)
                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
      (bl.mining:mine-block block)
      (let* ((wire (bl.ser:serialize-witness-block block))
-            (hash-hex (bl.rpc::hash-to-hex
+            (hash-hex (bl.rpc:hash-to-hex
                        (bl.ser:block-header-hash
                         (bl.ser:bitcoin-block-header block)))))
        (is (null (bl.rpc::rpc-submitblock
@@ -810,7 +810,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
        (is (consp (bl.rpc::rpc-getblock node (list hash-hex 3))))
        (is (stringp (bl.rpc::rpc-getblock node (list hash-hex -1))))
        ;; Non-integer/non-bool verbosity → type error.
-       (signals bl.rpc::rpc-error
+       (signals bl.rpc:rpc-error
          (bl.rpc::rpc-getblock node (list hash-hex "x")))))))
 
 (test gbt-transactions-data-uses-wire-encoding
@@ -847,12 +847,12 @@ not active; contextual validation rejects that block as :unexpected-witness")
      (is (= 3 (length hashes)))
      (is (every #'stringp hashes))
      (is (= 3 (bl.store:current-height
-               (bl::node-chain-state node))))
+               (bl:node-chain-state node))))
      ;; the tip is the last generated hash
      (is (string= (car (last hashes))
-                  (bl.rpc::hash-to-hex
+                  (bl.rpc:hash-to-hex
                    (bl.store:best-block-hash
-                    (bl::node-chain-state node))))))))
+                    (bl:node-chain-state node))))))))
 
 (test generatetodescriptor-advances-chain
   ;; Mine to a descriptor-derived coinbase script (raw(51) = OP_TRUE) and confirm
@@ -863,15 +863,15 @@ not active; contextual validation rejects that block as :unexpected-witness")
      (is (= 2 (length hashes)))
      (is (every #'stringp hashes))
      (is (= 2 (bl.store:current-height
-               (bl::node-chain-state node))))
+               (bl:node-chain-state node))))
      (is (string= (car (last hashes))
-                  (bl.rpc::hash-to-hex
+                  (bl.rpc:hash-to-hex
                    (bl.store:best-block-hash
-                    (bl::node-chain-state node)))))
+                    (bl:node-chain-state node)))))
      ;; bad descriptor + non-positive count error
-     (signals bl.rpc::rpc-error
+     (signals bl.rpc:rpc-error
        (bl.rpc::rpc-generatetodescriptor node (list 1 "frobnicate(03ab)")))
-     (signals bl.rpc::rpc-error
+     (signals bl.rpc:rpc-error
        (bl.rpc::rpc-generatetodescriptor node (list 0 "raw(51)"))))))
 
 (test submitheader-accepts-valid-rejects-orphan
@@ -880,8 +880,8 @@ not active; contextual validation rejects that block as :unexpected-witness")
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "subhdr"))
           (block (bl.mining:assemble-full-block
-                  (bl::node-chain-state node)
-                  (bl::node-mempool node)
+                  (bl:node-chain-state node)
+                  (bl:node-mempool node)
                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
      (bl.mining:mine-block block)
      (let* ((hdr (bl.ser:bitcoin-block-header block))
@@ -891,11 +891,11 @@ not active; contextual validation rejects that block as :unexpected-witness")
             (hex (bl.crypto:bytes-to-hex bytes)))
        (is (= 80 (length bytes)))
        (is (null (bl.store:get-block-index-entry
-                  (bl::node-chain-state node) hash)))
+                  (bl:node-chain-state node) hash)))
        ;; valid → null, now present
        (is (null (bl.rpc::rpc-submitheader node (list hex))))
        (is-true (bl.store:get-block-index-entry
-                 (bl::node-chain-state node) hash))
+                 (bl:node-chain-state node) hash))
        ;; already-known → still null
        (is (null (bl.rpc::rpc-submitheader node (list hex)))))
      ;; header with an unknown parent → verify error
@@ -907,11 +907,11 @@ not active; contextual validation rejects that block as :unexpected-witness")
                      :bits #x207fffff :nonce 0))
             (obytes (flexi-streams:with-output-to-sequence (s)
                       (bl.ser::write-block-header s orphan))))
-       (signals bl.rpc::rpc-error
+       (signals bl.rpc:rpc-error
          (bl.rpc::rpc-submitheader
           node (list (bl.crypto:bytes-to-hex obytes)))))
      ;; malformed hex → deserialization error
-     (signals bl.rpc::rpc-error
+     (signals bl.rpc:rpc-error
        (bl.rpc::rpc-submitheader node (list "zz"))))))
 
 (test generateblock-empty-submit-advances-chain
@@ -923,17 +923,17 @@ not active; contextual validation rejects that block as :unexpected-witness")
      (is (stringp (cdr (assoc "hash" r :test #'string=))))
      (is (null (assoc "hex" r :test #'string=)))   ; no hex when submitted
      (is (= 1 (bl.store:current-height
-               (bl::node-chain-state node))))
+               (bl:node-chain-state node))))
      (is (string= (cdr (assoc "hash" r :test #'string=))
-                  (bl.rpc::hash-to-hex
+                  (bl.rpc:hash-to-hex
                    (bl.store:best-block-hash
-                    (bl::node-chain-state node))))))))
+                    (bl:node-chain-state node))))))))
 
 (test generateblock-no-submit-returns-hex-without-advancing
   ;; submit=false returns {hash, hex} and does NOT change the tip.
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "genblk-ns"))
-          (h0 (bl.store:current-height (bl::node-chain-state node)))
+          (h0 (bl.store:current-height (bl:node-chain-state node)))
           (r (bl.rpc::rpc-generateblock
               node (list "raw(51)" '() bl.rpc:+json-false+))))
      (is (stringp (cdr (assoc "hash" r :test #'string=))))
@@ -943,12 +943,12 @@ not active; contextual validation rejects that block as :unexpected-witness")
             (blk (flexi-streams:with-input-from-sequence (s bytes)
                    (bl.ser:read-bitcoin-block s))))
        (is (string= (cdr (assoc "hash" r :test #'string=))
-                    (bl.rpc::hash-to-hex
+                    (bl.rpc:hash-to-hex
                      (bl.ser:block-header-hash
                       (bl.ser:bitcoin-block-header blk))))))
      ;; tip unchanged
      (is (= h0 (bl.store:current-height
-                (bl::node-chain-state node)))))))
+                (bl:node-chain-state node)))))))
 
 (test generateblock-includes-raw-tx-and-rejects-bad-output
   ;; A consensus-valid raw (non-coinbase) tx is included and the witness
@@ -962,7 +962,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
           (tx-hex (bl.crypto:bytes-to-hex
                    (bl.ser:serialize-transaction tx))))
      ;; A confirmed P2SH(OP_TRUE) coin the raw tx spends without a signature.
-     (bl.store:add-utxo (bl::node-utxo-set node)
+     (bl.store:add-utxo (bl:node-utxo-set node)
                                     funding 0 100000000 (p2sh-optrue-script-pubkey) 0
                                     :coinbase nil)
      (let* ((r (bl.rpc::rpc-generateblock
@@ -974,7 +974,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
        ;; coinbase + the one supplied tx
        (is (= 2 (length (bl.ser:bitcoin-block-transactions blk)))))
      ;; bogus output (neither address nor descriptor) errors
-     (signals bl.rpc::rpc-error
+     (signals bl.rpc:rpc-error
        (bl.rpc::rpc-generateblock node (list "not-an-output" '()))))))
 
 (test generateblock-testblockvalidity-rejects-bad-tx
@@ -989,11 +989,11 @@ not active; contextual validation rejects that block as :unexpected-witness")
                           0 1000 :version 1))
           (hex (bl.crypto:bytes-to-hex
                 (bl.ser:serialize-transaction bogus))))
-     (signals bl.rpc::rpc-error
+     (signals bl.rpc:rpc-error
        (bl.rpc::rpc-generateblock node (list "raw(51)" (list hex) nil)))
      ;; tip unchanged — nothing was mined or activated
      (is (= 0 (bl.store:current-height
-               (bl::node-chain-state node)))))))
+               (bl:node-chain-state node)))))))
 
 ;;;; Wave 7: BIP94 timewarp clamp on template mintime (Core GetMinimumTime,
 ;;;; node/miner.cpp:36-47) + TestBlockValidity on assembled templates
@@ -1065,14 +1065,14 @@ the generate* paths pass the UTXO set, so all live templates are dry-run
   (with-network (:regtest)
    (let ((node (regtest-node-fixture "tbv")))
      ;; Missing-input tx, injected directly (bypasses acceptance validation).
-     (%mine-add (bl::node-mempool node)
+     (%mine-add (bl:node-mempool node)
                 (make-mempool-test-tx :input-id 77) 50000)
      (signals error
        (bl.mining:assemble-full-block
-        (bl::node-chain-state node)
-        (bl::node-mempool node)
+        (bl:node-chain-state node)
+        (bl:node-mempool node)
         :coinbase-script-pubkey (p2sh-optrue-script-pubkey)
-        :utxo-set (bl::node-utxo-set node)))
+        :utxo-set (bl:node-utxo-set node)))
      ;; getblocktemplate takes the same guarded path.
      (signals error (bl.rpc::rpc-getblocktemplate node (%gbt-params)))
      ;; generatetoaddress refuses to mine it.
@@ -1089,10 +1089,10 @@ ground — check_pow=false) and reports inconclusive-not-best-prevblk for a
 block not extending the tip (Core validation.cpp:4506-4509)."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "tbv-ok"))
-          (cs (bl::node-chain-state node))
-          (utxo (bl::node-utxo-set node))
+          (cs (bl:node-chain-state node))
+          (utxo (bl:node-utxo-set node))
           (block (bl.mining:assemble-full-block
-                  cs (bl::node-mempool node)
+                  cs (bl:node-mempool node)
                   :coinbase-script-pubkey (p2sh-optrue-script-pubkey))))
      (multiple-value-bind (ok err)
          (bl.val:test-block-validity block cs utxo)
@@ -1140,9 +1140,9 @@ because a proposal is by definition unmined."
                (setf (gethash "mode" req) "proposal")
                (when data (setf (gethash "data" req) data))
                (handler-case (bl.rpc::rpc-getblocktemplate node (list req))
-                 (bl.rpc::rpc-error (e)
-                   (list :error (bl.rpc::rpc-error-code e)
-                         (bl.rpc::rpc-error-message e)))))))
+                 (bl.rpc:rpc-error (e)
+                   (list :error (bl.rpc:rpc-error-code e)
+                         (bl.rpc:rpc-error-message e)))))))
       ;; A template this node just produced must validate as a proposal —
       ;; anything else means getblocktemplate is handing miners work the node
       ;; would itself reject.
@@ -1177,16 +1177,16 @@ would otherwise hand it."
 (defun %gbt-node (&optional (network :regtest))
   "A node with just enough state for getblocktemplate on NETWORK."
   (multiple-value-bind (cs mp) (%mining-fixture)
-    (let ((node (bl::make-node :network network)))
-      (setf (bl::node-chain-state node) cs
-            (bl::node-mempool node) mp
-            (bl::node-utxo-set node) (bl.store:make-utxo-set))
+    (let ((node (bl:make-node :network network)))
+      (setf (bl:node-chain-state node) cs
+            (bl:node-mempool node) mp
+            (bl:node-utxo-set node) (bl.store:make-utxo-set))
       node)))
 
 (defun %gbt-error-message (node params)
   "The rpc-error message getblocktemplate signals for PARAMS, or NIL."
   (handler-case (progn (bl.rpc::rpc-getblocktemplate node params) nil)
-    (bl.rpc::rpc-error (e) (bl.rpc::rpc-error-message e))))
+    (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-message e))))
 
 (test gbt-requires-the-client-to-declare-segwit
   "Core refuses a template request whose \"rules\" array does not name segwit,

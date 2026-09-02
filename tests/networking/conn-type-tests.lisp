@@ -52,7 +52,7 @@ the services gate (CNode::ExpectServicesFromConn)."
     (is-false (bl.net::has-all-desirable-service-flags-p limited nil))
     (is-true (bl.net::has-all-desirable-service-flags-p limited t))
     (flet ((expects (&rest args)
-             (bl.net::peer-outbound-or-block-relay-p
+             (bl.net:peer-outbound-or-block-relay-p
               (apply #'bl.net:make-peer args))))
       (is-true (expects :conn-type :outbound-full-relay))
       (is-true (expects :conn-type :block-relay))

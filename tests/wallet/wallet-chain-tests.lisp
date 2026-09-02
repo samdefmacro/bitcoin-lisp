@@ -23,7 +23,7 @@
 
 (defun %wc-wallet (node name)
   (gethash name (bl.wallet::wallet-manager-wallets
-                 (bl::node-wallet-manager node))))
+                 (bl:node-wallet-manager node))))
 
 (defun %wc-optrue-address ()
   "P2SH(OP_TRUE) address for regtest — the throwaway coinbase target."
@@ -35,14 +35,14 @@
   (bl.rpc::rpc-generatetoaddress node (list n address)))
 
 (defun %wc-tip-hex (node)
-  (bl.rpc::hash-to-hex
-   (bl.store:best-block-hash (bl::node-chain-state node))))
+  (bl.rpc:hash-to-hex
+   (bl.store:best-block-hash (bl:node-chain-state node))))
 
 (defun %wc-coinbase-txid (node block-hash-hex)
   "Txid of the coinbase of the block named by BLOCK-HASH-HEX."
-  (let* ((store (bl::node-block-store node))
+  (let* ((store (bl:node-block-store node))
          (block (bl.store:get-block
-                 store (bl.rpc::parse-hex-hash block-hash-hex))))
+                 store (bl.rpc:parse-hex-hash block-hash-hex))))
     (bl.ser:transaction-hash
      (first (bl.ser:bitcoin-block-transactions block)))))
 
@@ -69,14 +69,14 @@
 
 (defun %wc-gettx (node txid)
   (bl.wallet::rpc-gettransaction
-   node (list (bl.rpc::hash-to-hex txid))))
+   node (list (bl.rpc:hash-to-hex txid))))
 
 (defun %wc-state-snapshot (wallet)
   "Comparable snapshot of the wallet's tracked tx states: txid-hex ->
 (state height index abandoned order-pos time-smart)."
   (let ((snap '()))
     (maphash (lambda (txid wtx)
-               (push (list (bl.rpc::hash-to-hex txid)
+               (push (list (bl.rpc:hash-to-hex txid)
                            (bl.wallet::wallet-tx-state wtx)
                            (bl.wallet::wallet-tx-block-height wtx)
                            (bl.wallet::wallet-tx-block-index wtx)
@@ -253,7 +253,7 @@ wallet) reproduces exactly the live-tracked state."
               (is (plusp (length (%aval "transactions" since))))
               (is (string= h101 (%aval "lastblock" since))))
             ;; Unknown blockhash -> Core's -5.
-            (is (= bl.rpc::+rpc-invalid-address-or-key+
+            (is (= bl.rpc:+rpc-invalid-address-or-key+
                    (%rpc-error-code
                     (lambda ()
                       (bl.wallet::rpc-listsinceblock
@@ -397,7 +397,7 @@ the double-spend re-conflicts it and clears the mempool conflict."
             (let* ((gettx (%wc-gettx node txid2))
                    (mconf (%aval "mempoolconflicts" gettx)))
               (is (= 0 (%aval "confirmations" gettx)))
-              (is (equal (list (bl.rpc::hash-to-hex txid2x)) mconf)))
+              (is (equal (list (bl.rpc:hash-to-hex txid2x)) mconf)))
             ;; Mine the double-spend again (it is back in the mempool):
             ;; blockConnected re-conflicts tx2 AND clears the mempool
             ;; conflict (reason-:block removal runs the erase loop).
@@ -477,8 +477,8 @@ were mined catches up from its stored locator on load."
 connect hook does live. Returns the index."
   (let* ((dir (make-temp-directory "wc-bfi"))
          (bfi (bl.store:init-blockfilterindex dir))
-         (state (bl::node-chain-state node))
-         (store (bl::node-block-store node)))
+         (state (bl:node-chain-state node))
+         (store (bl:node-block-store node)))
     (loop for h from 0 to (bl.store:current-height state)
           for entry = (bl.store:get-block-at-height state h)
           when entry
@@ -489,7 +489,7 @@ connect hook does live. Returns the index."
                    ;; spent-utxo set is the correct input here.
                    (bl.store:blockfilterindex-add-block
                     bfi blk hash h '()))))
-    (setf (bl::node-blockfilterindex node) bfi)
+    (setf (bl:node-blockfilterindex node) bfi)
     bfi))
 
 (defun %wc-total-end-range (wallet)
@@ -517,15 +517,15 @@ wallet-attach-chain persist a stale best block."
                ;; Blocks that have nothing to do with this wallet.
                (%wc-mine node 6 (%wc-optrue-address))
                (let ((tip (bl.store:current-height
-                           (bl::node-chain-state node))))
+                           (bl:node-chain-state node))))
                  ;; SLOW path first: no filter index on the node.
-                 (setf (bl::node-blockfilterindex node) nil)
+                 (setf (bl:node-blockfilterindex node) nil)
                  (multiple-value-bind (s-status s-height s-hash s-skipped)
                      (bl.wallet::scan-for-wallet-transactions
                       node wallet
                       (bl.store:block-index-entry-hash
                        (bl.store:get-block-at-height
-                        (bl::node-chain-state node) 0))
+                        (bl:node-chain-state node) 0))
                       0)
                    (is (eq :success s-status))
                    (is (= tip s-height) "slow path must reach the tip")
@@ -537,7 +537,7 @@ wallet-attach-chain persist a stale best block."
                         node wallet
                         (bl.store:block-index-entry-hash
                          (bl.store:get-block-at-height
-                          (bl::node-chain-state node) 0))
+                          (bl:node-chain-state node) 0))
                         0)
                      (is (plusp f-skipped)
                          "the fast path must actually skip blocks, else this test is vacuous")
@@ -548,7 +548,7 @@ wallet-attach-chain persist a stale best block."
                          "last-scanned hash must be identical"))))))
         (ignore-errors
          (bl.wallet:close-wallet-manager
-          (bl::node-wallet-manager node)))))))
+          (bl:node-wallet-manager node)))))))
 
 (test g7-38-missing-filter-falls-back-per-block
   "G7-38: a block with NO stored filter must be inspected, not skipped (Core
@@ -564,7 +564,7 @@ because our index can contain holes below its best marker."
              (let ((wallet (%wc-wallet node wname)))
                (%wc-mine node 3 (%wc-optrue-address))
                (let ((bfi (%wc-build-filter-index node))
-                     (state (bl::node-chain-state node)))
+                     (state (bl:node-chain-state node)))
                  ;; A height that IS indexed => a real verdict.
                  (let ((h1 (bl.store:block-index-entry-hash
                             (bl.store:get-block-at-height state 1))))
@@ -579,7 +579,7 @@ because our index can contain holes below its best marker."
                                          :initial-element 99)))))))
         (ignore-errors
          (bl.wallet:close-wallet-manager
-          (bl::node-wallet-manager node)))))))
+          (bl:node-wallet-manager node)))))))
 
 (test g7-38-filter-set-is-the-ismine-set-and-grows-with-topup
   "G7-38: the query set must be exactly the wallet's IsMine script set, and
@@ -618,4 +618,4 @@ range-end and NOT next-index."
                    "UpdateIfNeeded must fold in the newly cached scripts")))
         (ignore-errors
          (bl.wallet:close-wallet-manager
-          (bl::node-wallet-manager node)))))))
+          (bl:node-wallet-manager node)))))))

@@ -55,10 +55,10 @@ overwrite each other."
 assumevalid hash, both reversed from display order -- produce 32-byte hashes
 for every chain."
   (dolist (name (bl.chain:chain-names))
-    (dolist (entry (bl::network-assumeutxo-data name))
-      (is (= 32 (length (bl::assumeutxo-data-blockhash entry))) "~A assumeutxo" name)
-      (is (= 32 (length (bl::assumeutxo-data-hash-serialized entry))) "~A assumeutxo" name))
-    (let ((av (bl::network-assumevalid name)))
+    (dolist (entry (bl:network-assumeutxo-data name))
+      (is (= 32 (length (bl:assumeutxo-data-blockhash entry))) "~A assumeutxo" name)
+      (is (= 32 (length (bl:assumeutxo-data-hash-serialized entry))) "~A assumeutxo" name))
+    (let ((av (bl:network-assumevalid name)))
       (is (or (null av) (= 32 (length av))) "~A assumevalid" name))))
 
 (test every-chain-rebuilds-its-genesis-block
@@ -87,6 +87,6 @@ silently corrupt: ports, activation heights, the mainnet assumevalid hash."
     (is (= 13 (length (bl.chain:chain-params-checkpoints main))))
     (is (= 63 (length (bl.chain:chain-params-fixed-seeds t4))))
     ;; the consumers still answer through their old names
-    (is (equal "main" (bl::conf-section-name :mainnet)))
-    (is (= 18332 (bl::network-rpc-port :testnet3)))
+    (is (equal "main" (bl.cfg:conf-section-name :mainnet)))
+    (is (= 18332 (bl:network-rpc-port :testnet3)))
     (is (= 1 (bl.val:get-segwit-activation-height :signet)))))

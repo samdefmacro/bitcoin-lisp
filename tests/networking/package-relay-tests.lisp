@@ -535,7 +535,7 @@ floor and changes which parents exist, so every cached fee failure is stale."
 no point downloading a transaction we would only submit alone again (Core
 AddTxAnnouncement, txdownloadman_impl.cpp:199). The control is the same inv
 with the filter empty, which IS requested."
-  (let* ((bl.net::*cached-is-ibd* t)
+  (let* ((bl.net:*cached-is-ibd* t)
          (bl:*network* :regtest)
          (bl:*minimum-chain-work-override* nil)
          (now (bl.ser:get-unix-time))
@@ -560,9 +560,9 @@ with the filter empty, which IS requested."
       (ignore-errors
        (bl.net::handle-inv announcer (funcall inv-payload blocked) (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects)))
       ;; Nothing recorded: a probe from another peer still wants it.
-      (is-true (bl.net::tx-request-wanted-p blocked probe t))
+      (is-true (bl.net:tx-request-wanted-p blocked probe t))
       (bl.net:reset-tx-requests)
       ;; Control: an unknown wtxid from the same announcer IS requested.
       (ignore-errors
        (bl.net::handle-inv announcer (funcall inv-payload fresh) (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects)))
-      (is-false (bl.net::tx-request-wanted-p fresh probe t)))))
+      (is-false (bl.net:tx-request-wanted-p fresh probe t)))))

@@ -213,7 +213,7 @@ resolvability check (its Step 6)."
       (config-error "Invalid dbcache-mib: ~A. Must be an integer >= 4." dbcache-mib)))
   (let* ((total (if dbcache-mib
                     (* dbcache-mib 1024 1024)
-                    bl.store::+default-db-cache-bytes+))
+                    bl.kv:+default-db-cache-bytes+))
          (sizes (bl.store:calculate-cache-sizes
                  total
                  :tx-index txindex
@@ -221,7 +221,7 @@ resolvability check (its Step 6)."
                  ;; as Core divides its filter budget by n_indexes.
                  :filter-index-count (+ (if blockfilterindex 1 0)
                                         (if coinstatsindex 1 0)))))
-    (setf bl.store::*cache-sizes* sizes
+    (setf bl.kv:*cache-sizes* sizes
           *coins-cache-budget-bytes*
           (bl.store:cache-sizes-coins sizes))
     (log-info "Cache budget ~D MiB: coins ~D MiB, coins-db ~D MiB, ~
@@ -349,7 +349,7 @@ to move them (the node must be stopped)."
   ;; connect, and FATAL on failure as Core's is (init.cpp:1587-1600) — a node
   ;; that silently kept /16 bucketing after being told to use an ASN map would
   ;; have exactly the eclipse exposure the operator was closing.
-  (setf bl.net::*asmap* nil)
+  (setf bl.net:*asmap* nil)
   (when (and asmap (stringp asmap) (plusp (length asmap))
              (not (string= asmap "0")))
     (let ((path (if (uiop:absolute-pathname-p asmap)
@@ -363,20 +363,20 @@ to move them (the node must be stopped)."
   ;; silent default there, and feature_asmap.py greps for it to tell a node
   ;; that fell back apart from one that never had a map. We logged only the
   ;; success side, so the interesting case said nothing.
-  (unless bl.net::*asmap*
+  (unless bl.net:*asmap*
     (log-info "Using /16 prefix for IP bucketing"))
   ;; -whitelist / -whitebind: permission grants by address range. Applied
   ;; before any peer can connect. A malformed spec is fatal, as Core's is
   ;; (init.cpp fails on the first entry NetWhitelistPermissions::TryParse
   ;; rejects): a typo'd range grants nothing and the operator never finds out.
-  (setf bl.net::*whitelist-entries* '()
-        bl.net::*whitebind-flags* 0)
+  (setf bl.net:*whitelist-entries* '()
+        bl.net:*whitebind-flags* 0)
   (dolist (spec whitelist)
     (let ((entry (bl.net:parse-whitelist-entry spec)))
       (unless entry
         (config-error "Invalid netmask, IP address or permission in -whitelist: '~A'" spec))
-      (setf bl.net::*whitelist-entries*
-            (append bl.net::*whitelist-entries* (list entry)))))
+      (setf bl.net:*whitelist-entries*
+            (append bl.net:*whitelist-entries* (list entry)))))
   (dolist (spec whitebind)
     ;; -whitebind is "perms@addr:port": the ADDRESS half is a bind target, not
     ;; a range, and we bind one listener, so only the PERMISSIONS are kept.
@@ -388,13 +388,13 @@ to move them (the node must be stopped)."
         (config-error "Invalid permission in -whitebind: '~A'" spec))
       (when (member direction '(:out))
         (config-error "whitebind may only be used for incoming connections (\"out\" was passed)"))
-      (setf bl.net::*whitebind-flags*
-            (logior bl.net::*whitebind-flags* flags))))
+      (setf bl.net:*whitebind-flags*
+            (logior bl.net:*whitebind-flags* flags))))
   (when (or whitelist whitebind)
     (log-info "Net permissions configured: ~D -whitelist range(s), -whitebind ~A"
               (length whitelist)
               (or (bl.net:permission-flag-names
-                   bl.net::*whitebind-flags*)
+                   bl.net:*whitebind-flags*)
                   "none")))
   (setf *use-addrman-outgoing* t *connect-nodes* '() *seed-nodes* '())
   ;; -seednode: address sources, not peers (Core connOptions.vSeedNodes).
@@ -592,7 +592,7 @@ index, -reindex, and the block-store <-> header-index position map."
       (loaded
        (log-info "Loaded persisted header index: ~D entries"
                  (hash-table-count
-                  (bl.store::chain-state-block-index
+                  (bl.store:chain-state-block-index
                    (node-chain-state *node*)))))
       ;; A file IS there but did not validate. Starting anyway would leave us
       ;; with an EMPTY block index while chainstate.dat still names a tip: the
@@ -1468,7 +1468,7 @@ blocks, it does not trust them."
                                  (error () nil))))
                     (when block
                       (multiple-value-bind (ok reason)
-                          (bl.rpc::%activate-submitted-block node block)
+                          (bl.rpc:activate-submitted-block node block)
                         (declare (ignore reason))
                         (when ok (incf accepted)))))))
              (error (e)

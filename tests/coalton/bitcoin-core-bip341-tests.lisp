@@ -123,16 +123,16 @@ values (the scriptPubKey section above only covers address derivation)."
                     :value (gethash "amountSats" u)
                     :script-pubkey (bl.crypto:hex-to-bytes
                                     (gethash "scriptPubKey" u)))))
-    (let ((bl.interop::*current-tx* tx)
-          (bl.interop::*current-spent-utxos* spent-vec)
-          (bl.interop::*precomputed-sighash* nil))
+    (let ((bl.interop:*current-tx* tx)
+          (bl.interop:*current-spent-utxos* spent-vec)
+          (bl.interop:*precomputed-sighash* nil))
       (dolist (entry (gethash "inputSpending" kps))
         (let* ((g (gethash "given" entry))
                (inter (gethash "intermediary" entry))
                (idx (gethash "txinIndex" g))
                (hash-type (gethash "hashType" g))
                (expected (gethash "sigHash" inter)))
-          (let ((bl.interop::*current-input-index* idx))
+          (let ((bl.interop:*current-input-index* idx))
             (let ((got (bl.crypto:bytes-to-hex
                         (bl.interop::compute-bip341-sighash-real
                          hash-type nil nil))))
@@ -172,8 +172,8 @@ values (the scriptPubKey section above only covers address derivation)."
            (witness-stack (elt (bl.ser:transaction-witness tx) index))
            (bl.interop:*current-tx* tx)
            (bl.interop:*current-input-index* index)
-           (bl.interop::*current-spent-utxos* spent-vec)
-           (bl.interop::*precomputed-sighash* nil)
+           (bl.interop:*current-spent-utxos* spent-vec)
+           (bl.interop:*precomputed-sighash* nil)
            (bl.interop:*witness-input-amount* amount))
       (bl.interop:set-script-flags flags)
       (unwind-protect
@@ -211,7 +211,7 @@ final signature byte (the explicit sighash byte of a 65-byte sig)."
                                    :initial-element #x02)))
     (when (and last-byte (plusp sig-len))
       (setf (aref sig (1- sig-len)) last-byte))
-    (let ((bl.interop::*script-flags* flags)
+    (let ((bl.interop:*script-flags* flags)
           (bl.interop::*tapscript-validation-weight-left* weight))
       (multiple-value-bind (status result)
           (bl.interop:verify-tapscript-signature sig pk)
@@ -283,7 +283,7 @@ the length check first and never charged for those."
   (is (eq :empty-sig (tapsig-status 0 32 :weight 0)))
   (is (eq :empty-pubkey (tapsig-status 0 0 :weight 0)))
   ;; The decrement really does land on the caller's binding.
-  (let ((bl.interop::*script-flags* nil)
+  (let ((bl.interop:*script-flags* nil)
         (bl.interop::*tapscript-validation-weight-left* 120))
     (bl.interop:verify-tapscript-signature
      (make-array 10 :element-type '(unsigned-byte 8) :initial-element 1)
@@ -317,11 +317,11 @@ but only 2 outputs, and every SINGLE vector sits at index 0 or 1."
     ;; Precondition: the vector tx really does have more inputs than outputs.
     (is (= 9 num-inputs))
     (is (= 2 num-outputs))
-    (let ((bl.interop::*current-tx* tx)
-          (bl.interop::*current-spent-utxos* spent-vec)
-          (bl.interop::*precomputed-sighash* nil))
+    (let ((bl.interop:*current-tx* tx)
+          (bl.interop:*current-spent-utxos* spent-vec)
+          (bl.interop:*precomputed-sighash* nil))
       (loop for idx from 0 below num-inputs
-            do (let ((bl.interop::*current-input-index* idx))
+            do (let ((bl.interop:*current-input-index* idx))
                  (dolist (ht '(#x03 #x83))   ; SINGLE, SINGLE|ANYONECANPAY
                    (let ((got (bl.interop::compute-bip341-sighash-real
                                ht nil nil)))
@@ -360,13 +360,13 @@ one. Uses the same 9-input/2-output vector tx at an out-of-range index."
                     :value (gethash "amountSats" u)
                     :script-pubkey (bl.crypto:hex-to-bytes
                                     (gethash "scriptPubKey" u)))))
-    (let ((bl.interop::*current-tx* tx)
-          (bl.interop::*current-spent-utxos* spent-vec)
-          (bl.interop::*current-input-index* 5)  ; >= 2 outputs
-          (bl.interop::*precomputed-sighash* nil)
-          (bl.interop::*script-flags* nil)
-          (bl.interop::*tapscript-amount* 0)
-          (bl.interop::*tapscript-leaf-hash* nil)
+    (let ((bl.interop:*current-tx* tx)
+          (bl.interop:*current-spent-utxos* spent-vec)
+          (bl.interop:*current-input-index* 5)  ; >= 2 outputs
+          (bl.interop:*precomputed-sighash* nil)
+          (bl.interop:*script-flags* nil)
+          (bl.interop:*tapscript-amount* 0)
+          (bl.interop:*tapscript-leaf-hash* nil)
           (bl.interop::*tapscript-validation-weight-left* 1000))
       ;; Tapscript CHECKSIG: :bad-sighash-type maps to SE-TapscriptInvalidSig,
       ;; a hard failure — never a schnorr verification against a short preimage.
@@ -376,7 +376,7 @@ one. Uses the same 9-input/2-output vector tx at an out-of-range index."
         (is (null result)))
       ;; Key path: same input, witness of one 65-byte signature.
       (multiple-value-bind (ok err)
-          (bl.interop::validate-taproot-key-path (list sig) pk 0)
+          (bl.interop:validate-taproot-key-path (list sig) pk 0)
         (is (null ok))
         (is (eq :sig-hashtype err))))))
 
@@ -509,17 +509,17 @@ the only way such a spend can fail."
 for this spend, read out of the production path by stubbing RUN-TAPSCRIPT.
 Returns :NEVER-CALLED if the spend never reached tapscript execution."
   (let ((captured :never-called)
-        (original (fdefinition 'bl.interop::run-tapscript)))
+        (original (fdefinition 'bl.interop:run-tapscript)))
     (unwind-protect
          (progn
-           (setf (fdefinition 'bl.interop::run-tapscript)
+           (setf (fdefinition 'bl.interop:run-tapscript)
                  (lambda (&rest ignored)
                    (declare (ignore ignored))
                    (setf captured
                          bl.interop::*tapscript-validation-weight-left*)
                    (values t nil)))
            (tapscript-leaf-spend leaf-script :annex annex))
-      (setf (fdefinition 'bl.interop::run-tapscript) original))
+      (setf (fdefinition 'bl.interop:run-tapscript) original))
     captured))
 
 (test ga8-s1-4-annex-counts-toward-the-validation-weight-budget

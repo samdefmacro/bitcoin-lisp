@@ -63,25 +63,25 @@ APPLY-CONFIG-GLOBALS."
                (bool-knob (option place)
                  `(let ((v (lk ,option)))
                     (when v (setf ,place (conf-parse-bool v))))))
-      (fee-knob "mintxfee" bl.wallet::*wallet-min-tx-fee*)
-      (fee-knob "discardfee" bl.wallet::*wallet-discard-rate*)
-      (fee-knob "consolidatefeerate" bl.wallet::*wallet-consolidate-feerate*)
-      (fee-knob "maxapsfee" bl.wallet::*wallet-max-aps-fee*)
-      (int-knob "txconfirmtarget" bl.wallet::*wallet-confirm-target* :min 1)
-      (bool-knob "walletrbf" bl.wallet::*wallet-signal-rbf*)
-      (bool-knob "spendzeroconfchange" bl.wallet::*wallet-spend-zero-conf-change*)
-      (bool-knob "walletrejectlongchains" bl.wallet::*wallet-reject-long-chains*)
+      (fee-knob "mintxfee" bl.wallet:*wallet-min-tx-fee*)
+      (fee-knob "discardfee" bl.wallet:*wallet-discard-rate*)
+      (fee-knob "consolidatefeerate" bl.wallet:*wallet-consolidate-feerate*)
+      (fee-knob "maxapsfee" bl.wallet:*wallet-max-aps-fee*)
+      (int-knob "txconfirmtarget" bl.wallet:*wallet-confirm-target* :min 1)
+      (bool-knob "walletrbf" bl.wallet:*wallet-signal-rbf*)
+      (bool-knob "spendzeroconfchange" bl.wallet:*wallet-spend-zero-conf-change*)
+      (bool-knob "walletrejectlongchains" bl.wallet:*wallet-reject-long-chains*)
       ;; -keypool sizes the keypool of wallets created AFTER it is set; an
       ;; existing wallet keeps the size it was made with, as in Core, where the
       ;; keypool size is per-wallet state.
-      (int-knob "keypool" bl.wallet::+default-keypool-size+ :min 1))
+      (int-knob "keypool" bl.wallet:+default-keypool-size+ :min 1))
     ;; -walletdir relocates <datadir>/wallets/ (Core init.cpp). Relative paths
     ;; hang off the data directory, as -rpccookiefile does.
     (let ((v (lk "walletdir")))
-      (when v (setf bl.wallet::*wallet-directory* v)))
+      (when v (setf bl.wallet:*wallet-directory* v)))
     ;; -walletnotify: an operator hook, fired from AddToWallet.
     (let ((v (lk "walletnotify")))
-      (when v (setf bl.wallet::*wallet-notify-command* v)))
+      (when v (setf bl.wallet:*wallet-notify-command* v)))
     alist))
 
 ;;; The server writes .cookie into the node's data directory; it asks through

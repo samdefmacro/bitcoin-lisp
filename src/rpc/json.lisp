@@ -24,8 +24,8 @@ parser leaves at TOP-LEVEL positional parameter positions (see
 parse-json-rpc-request): explicit false must be distinguishable from
 null/omitted because Core's isNull() checks treat only the latter as
 \"use the default\". IMPORTANT: the sentinel is TRUTHY — positional
-boolean parameters must be read through %positional-bool /
-%positional-bool-or, never by raw truthiness.")
+boolean parameters must be read through positional-bool /
+positional-bool-or, never by raw truthiness.")
 
 (defconstant +json-empty-array+ '%json-empty-array
   "The empty JSON array, at TOP-LEVEL positional parameter positions.
@@ -54,26 +54,26 @@ sentinel is."
   (or (eq value +json-empty-array+)
       (and (consp value) t)))
 
-(defun %positional-array (value)
+(defun positional-array (value)
   "The elements of a positional array parameter, as a list.
 The empty-array sentinel yields NIL, so callers iterate uniformly; use
 %POSITIONAL-ARRAY-P first when the difference between `[]` and null matters."
   (if (eq value +json-empty-array+) nil value))
 
-(defun %positional-bool (value)
+(defun positional-bool (value)
   "Truth of a positional JSON boolean parameter: NIL (null or omitted) and
 the explicit-false sentinel are false; anything else is true. Mirrors
 Core's pattern `if (!params[i].isNull()) x = params[i].get_bool()` for
 default-false parameters."
   (and value (not (eq value +json-false+)) t))
 
-(defun %positional-bool-or (value default)
+(defun positional-bool-or (value default)
   "Positional JSON boolean with a non-false DEFAULT: NIL (null or omitted)
 yields DEFAULT; explicit false yields NIL; anything else T. Core:
 `params[i].isNull() ? default : params[i].get_bool()`."
   (if (null value)
       default
-      (%positional-bool value)))
+      (positional-bool value)))
 
 (defun json-bool (x)
   "Coerce generalized boolean X to a JSON boolean: T or the false literal.
@@ -110,7 +110,7 @@ non-empty (string . value) alist into a hash-table by itself, but cannot
 tell an empty object from null)."
   (or alist (make-hash-table :test 'equal)))
 
-(defun %obj-get (obj key)
+(defun obj-get (obj key)
   "Read KEY from a JSON object that arrived as either an alist (from tests /
 JSON-RPC 1.x) or a hash-table (from yason)."
   (cond ((hash-table-p obj) (gethash key obj))

@@ -197,7 +197,54 @@ init.cpp, node/. src/node/.")
    #:wallet-notify-mempool-tx-added
    #:wallet-notify-mempool-tx-removed
    #:maybe-validate-snapshot
-   #:rebalance-caches-on-ibd-exit))
+   #:rebalance-caches-on-ibd-exit)
+  ;; Reached from another package with :: before the second-round review
+  ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
+  (:export
+   #:*log-file-path*
+   #:*node-start-time*
+   #:*pending-test-connections*
+   #:+pow-target-spacing-seconds+
+   #:+target-block-relay-peers+
+   #:abort-snapshot-chainstate
+   #:add-snapshot-chainstate
+   #:broadcast-transaction-to-peers
+   #:call-with-sync-paused
+   #:chainstate-coins-cache-budget
+   #:create-snapshot-chainstate
+   #:gate-block-write-on-disk-space
+   #:load-mempool-from-disk
+   #:make-node
+   #:node-added-nodes
+   #:node-address-book
+   #:node-block-store
+   #:node-blockfilterindex
+   #:node-chain-state
+   #:node-chainstates
+   #:node-coinstatsindex
+   #:node-current-chainstate
+   #:node-data-directory
+   #:node-historical-chainstate
+   #:node-last-tip-advance-time
+   #:node-lock
+   #:node-max-peers
+   #:node-mempool
+   #:node-network
+   #:node-network-active
+   #:node-p
+   #:node-peers
+   #:node-pending-inbound-peers
+   #:node-pending-onetry
+   #:node-running
+   #:node-syncing
+   #:node-tip-liveness
+   #:node-tx-index
+   #:node-txospenderindex
+   #:node-utxo-set
+   #:node-validated-chainstate
+   #:node-wallet-manager
+   #:parse-node-endpoint
+   #:peers-of-conn-type))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

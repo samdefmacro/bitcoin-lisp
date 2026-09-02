@@ -24,7 +24,7 @@ initialized so mining can connect blocks."
          (undopath (merge-pathnames "undo/" base)))
     (ensure-directories-exist cspath)
     (ensure-directories-exist undopath)
-    (setf (bl::node-utxo-set node)
+    (setf (bl:node-utxo-set node)
           (bl.store:make-coins-view-cache
            (bl.store:open-coins-view-db cspath)))
     (bl.val:initialize-undo-storage undopath)
@@ -36,10 +36,10 @@ the exact set (same whole-set MuHash) and the same chain tip."
   (with-network (:regtest)
    (let* ((tag (format nil "rbld~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
-       (let* ((cs (bl::node-chain-state node))
-              (utxo (bl::node-utxo-set node))
+       (let* ((cs (bl:node-chain-state node))
+              (utxo (bl:node-utxo-set node))
               (tip (bl.store:current-height cs))
               ;; Truth: the correct set after mining.
               (truth-muhash (bl.store:compute-utxo-set-muhash utxo))
@@ -81,9 +81,9 @@ blocks + index intact, chainstate DB wiped)."
   (with-network (:regtest)
    (let* ((tag (format nil "recov~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
-       (let* ((utxo (bl::node-utxo-set node))
+       (let* ((utxo (bl:node-utxo-set node))
               (truth (bl.store:compute-utxo-set-muhash utxo)))
          ;; Nuke the coins view entirely, then reindex.
          (bl.store:coins-view-cache-wipe utxo)
@@ -104,9 +104,9 @@ recovered to exactly the height the coins DB last committed."
   (with-network (:regtest)
    (let ((tag (format nil "crashr~D" (get-internal-real-time))))
      (multiple-value-bind (node cspath) (%reindex-node-fixture tag)
-       (let ((bl::*node* node))
+       (let ((bl:*node* node))
          (bl.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
-         (let* ((cs (bl::node-chain-state node))
+         (let* ((cs (bl:node-chain-state node))
                 (flushes 0)
                 ;; Budget 0 => size trigger after EVERY replayed block, so
                 ;; flush N happens right after block N is applied. The 3rd
@@ -123,9 +123,9 @@ recovered to exactly the height the coins DB last committed."
                               :completed))))
          ;; Simulate the process death: drop the in-memory cache and reload
          ;; both the on-disk LevelDB and chainstate.dat, as startup would.
-         (let ((cs (bl::node-chain-state node)))
+         (let ((cs (bl:node-chain-state node)))
            (bl.store:close-chainstate-coins-view cs)
-           (setf (bl::node-utxo-set node)
+           (setf (bl:node-utxo-set node)
                  (bl.store:make-coins-view-cache
                   (bl.store:open-coins-view-db cspath)))
            (is (eq :inconsistent (bl.store:load-state cs)))
@@ -140,7 +140,7 @@ recovered to exactly the height the coins DB last committed."
            ;; And the coins DB is exactly the height-2 set: two 50-BTC
            ;; coinbases, nothing from block 3.
            (is (= 10000000000 (bl.store:utxo-set-total-amount
-                               (bl::node-utxo-set node))))))))))
+                               (bl:node-utxo-set node))))))))))
 
 (test reindex-crash-mid-wipe-recovers-to-genesis
   "A crash between the genesis+marker rewind and the first replay flush
@@ -150,11 +150,11 @@ loaded as live state."
   (with-network (:regtest)
    (let* ((tag (format nil "crashw~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
-       (let* ((cs (bl::node-chain-state node))
-              (utxo (bl::node-utxo-set node))
-              (genesis (bl.store::chain-state-genesis-hash cs)))
+       (let* ((cs (bl:node-chain-state node))
+              (utxo (bl:node-utxo-set node))
+              (genesis (bl.store:chain-state-genesis-hash cs)))
          ;; Make the mined coins durable, then reproduce the crash state by
          ;; hand: tip rewound to genesis with the marker while the coins DB
          ;; still holds the old set (killed right before the wipe -- the

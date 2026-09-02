@@ -558,8 +558,8 @@ that registers -zmqpub<topic> / -zmqpub<topic>hwm."
   (loop for form in forms
         when (consp form)
           append (case (car form)
-                   (bl::define-option (list (second form)))
-                   (bl::define-core-only-options (rest form))
+                   (bl.cfg:define-option (list (second form)))
+                   (bl.cfg:define-core-only-options (rest form))
                    (dolist (let ((topics (second (second form))))
                              (when (and (consp topics) (eq (car topics) 'quote))
                                (loop for topic in (second topics)
@@ -596,8 +596,8 @@ walker a form list with one repeat."
          row silently replaces the earlier one"))
   (is (equal '("txindex")
              (%config-option-name-duplicates
-              '((bl::define-option "txindex" :key :txindex :type :bool)
-                (bl::define-core-only-options "help" "txindex")
+              '((bl.cfg:define-option "txindex" :key :txindex :type :bool)
+                (bl.cfg:define-core-only-options "help" "txindex")
                 (dolist (topic '("hashtx")) nil))))
       "positive control: the walker must report a repeated name"))
 
@@ -1050,7 +1050,7 @@ in 8 files before src/util/chainparams.lisp."
         "~D chain dispatch form~:P outside the table: ~S -- add a field to ~
 chain-params instead" (length forms) forms)))
 
-(defparameter +test-internal-reference-ceiling+ 7170
+(defparameter +test-internal-reference-ceiling+ 4454
   "How many package-qualified INTERNAL references (a :: token) the test
 tree may contain: 7,136 when the cleanup started. White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
@@ -1083,6 +1083,51 @@ becomes an orphan export, and the two ratchets would fight.")
         "~D internal (::) references in tests/, ceiling ~D -- reach the internal ~
 through a shared fixture in tests/support/ instead of a new :: in a test file"
         now +test-internal-reference-ceiling+)))
+
+(defun %symbol-char-p (c)
+  (or (alphanumericp c) (find c "-+*/<>=!?%.&$_")))
+
+(defun %foreign-internal-references (&optional (corpus (%source-corpus)))
+  "Every (file . \"pkg::name\") in CORPUS where a src file reaches INTO another
+project package with a double colon, strings and comments blanked. A file
+naming its own package's internals is not counted: that is the package's
+business. Not shared with %PACKAGE-REFERENCES, which walks single colons and
+keeps only the set of package names; this one needs every occurrence with
+its symbol. Factored out so the positive control can feed it a synthetic line."
+  (let ((hits '()))
+    (loop for (file . lines) in corpus
+          do (let ((in-string nil))
+               (loop for raw across lines
+                     do (multiple-value-bind (code next) (%code-only raw in-string)
+                          (setf in-string next)
+                          (loop with start = 0
+                                for pos = (search "::" code :start2 start)
+                                while pos
+                                do (let* ((tok-start (let ((before (position-if-not #'%symbol-char-p code
+                                                                                    :end pos :from-end t)))
+                                                       (if before (1+ before) 0)))
+                                          (tok-end (or (position-if-not #'%symbol-char-p code :start (+ pos 2))
+                                                       (length code)))
+                                          (prefix (subseq code tok-start pos)))
+                                     (when (and (plusp (length prefix))
+                                                (%resolve-package-prefix (string-downcase prefix)))
+                                       (push (cons file (subseq code tok-start tok-end)) hits))
+                                     (setf start tok-end)))))))
+    (nreverse hits)))
+
+(test src-reaches-no-foreign-internals
+  "No src file names another project package's INTERNAL symbol with ::. Wave B
+of the second-round review exported the 267 symbols other packages reached
+that way (the wallet alone reached 660 rpc internals, a leftover of the P3.4
+package split) and respelled the 58 that were already external -- so a ::
+between src packages now means one of two things, both wrong: the name is
+API and must be exported, or the caller is reaching past the layer's
+contract. Either way the fix is in the package file, not here."
+  (let ((hits (%foreign-internal-references)))
+    (is (null hits)
+        "~D foreign :: reference~:P in src/: ~S -- export the name from its ~
+package (and drop any % prefix) or stop reaching for it"
+        (length hits) hits)))
 
 (defun %dead-exports (&optional (packages (%bitcoin-lisp-packages)))
   "Exported symbols of PACKAGES that name nothing at all -- no function, no
@@ -1135,6 +1180,12 @@ the measuring functions must measure a known shape correctly."
                "positive control: the dead-export sweep must flag an export that names nothing"))
       (delete-package probe)))
   (is (plusp (%test-internal-references)) "no :: references counted in tests/")
+  (is (equal '(("probe.lisp" . "bl.val::check-block") ("probe.lisp" . "bl.val::check-block"))
+             (%foreign-internal-references
+              (list (cons "probe.lisp"
+                          (vector "(defun f () (bl.val::check-block x)) ; bl.mp::comment"
+                                  "(bl.val:public x) \"bl.rpc::in-a-string\" (bl.val::check-block y)")))))
+      "positive control: the foreign-internal scanner must see exactly the code :: and not the comment or the string")
   (is (plusp (length (%definitions-longer-than +longish-function-lines+)))
       "no long definitions found -- a sweep that finds nothing proves nothing")
   (is (equal '(("src/util/bytes.lisp" . "bitcoin-lisp.validation"))
@@ -1173,7 +1224,7 @@ the measuring functions must measure a known shape correctly."
              (%package-references
               (vector ";; bitcoin-lisp.validation in a comment does not count"
                       "(bitcoin-lisp.storage:current-height x) ; nor bitcoin-lisp.rpc:here"
-                      "(bl.mp::internal bl::*node* :keyword #:uninterned other:pkg)"
+                      "(bl.mp::internal bl:*node* :keyword #:uninterned other:pkg)"
                       "  \"a docstring naming bl.rpc:inside-a-string, even over"
                       "   two lines with a #\\\" in it, bl.val:still-not-code\" x)")))
       "a package prefix counts, full name or nickname; a comment, a keyword, ~

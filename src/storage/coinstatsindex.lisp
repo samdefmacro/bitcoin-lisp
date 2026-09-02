@@ -99,9 +99,9 @@ key order is height order)."
 (defun %csi-encode-stat (stats)
   (let ((v (make-array +csi-record-size+ :element-type '(unsigned-byte 8)))
         (mu (coinstats-muhash stats)))
-    (replace v (bl.crypto::%le-integer-to-bytes
+    (replace v (bl.crypto:le-integer-to-bytes
                 (bl.crypto:muhash-numerator mu) 384))
-    (replace v (bl.crypto::%le-integer-to-bytes
+    (replace v (bl.crypto:le-integer-to-bytes
                 (bl.crypto:muhash-denominator mu) 384)
              :start1 384)
     (loop for off from 768 by 8
@@ -120,9 +120,9 @@ key order is height order)."
     v))
 
 (defun %csi-decode-stat (v)
-  (let ((mu (bl.crypto::%make-muhash
-             :numerator (bl.crypto::%bytes-to-le-integer (subseq v 0 384))
-             :denominator (bl.crypto::%bytes-to-le-integer (subseq v 384 768)))))
+  (let ((mu (bl.crypto:make-muhash-raw
+             :numerator (bl.crypto:bytes-to-le-integer (subseq v 0 384))
+             :denominator (bl.crypto:bytes-to-le-integer (subseq v 384 768)))))
     (make-coinstats
      :muhash mu
      :txout-count (%read-i64-le v 768)
@@ -203,7 +203,7 @@ unspendable (Core IsBIP30Unspendable). Height-only match; only mainnet."
 
 (defun %copy-coinstats (s)
   (make-coinstats
-   :muhash (bl.crypto::%make-muhash
+   :muhash (bl.crypto:make-muhash-raw
             :numerator (bl.crypto:muhash-numerator (coinstats-muhash s))
             :denominator (bl.crypto:muhash-denominator (coinstats-muhash s)))
    :txout-count (coinstats-txout-count s) :bogo-size (coinstats-bogo-size s)

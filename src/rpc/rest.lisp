@@ -212,11 +212,11 @@ Mempool coins carry +mempool-coin-height+."
 (defun %getutxos-spk-json (spk network)
   "The scriptPubKey object of a getutxos JSON coin (Core ScriptToUniv with
 include_hex + include_address)."
-  (let ((addr (%script->address spk network)))
+  (let ((addr (script->address spk network)))
     `(("asm" . ,(bl.val:disassemble-script spk))
       ("desc" . ,(scriptpubkey-desc spk network))
       ("hex" . ,(bl.crypto:bytes-to-hex spk))
-      ("type" . ,(%script-type spk))
+      ("type" . ,(script-type spk))
       ,@(when addr `(("address" . ,addr))))))
 
 (defun %getutxos-binary (height tip-hash hits coins)
@@ -325,7 +325,7 @@ AND the active chain tip advanced within the staleness threshold; else HTTP
 node-tip-liveness read is lock-free and side-effect-free, so the probe stays
 responsive (and correctly reports 503) even when the node is wedged."
   (multiple-value-bind (healthy seconds-since-tip synced)
-      (bl::node-tip-liveness node)
+      (bl:node-tip-liveness node)
     (%rest-respond (if healthy 200 503)
                    "application/json"
                    (with-output-to-string (s)
@@ -526,11 +526,11 @@ each a list of the coins that transaction's inputs spent."
                ;; include_address, which is the shape OUTPUT-TO-JSON already
                ;; builds for a tx-out.
                ("scriptPubKey"
-                . ,(let ((addr (and network (%script->address spk network))))
+                . ,(let ((addr (and network (script->address spk network))))
                      (append
                       `(("asm" . ,(bl.val:disassemble-script spk))
                         ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                        ("type" . ,(%script-type spk)))
+                        ("type" . ,(script-type spk)))
                       (when addr `(("address" . ,addr)))))))))
          tx-undo)))
      tx-undos)))

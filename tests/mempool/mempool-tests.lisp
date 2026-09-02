@@ -561,11 +561,11 @@ rules the operator never asked about."
               :outputs (bl.ser:transaction-outputs base)
               :lock-time 0)))
       ;; Control: with the flag ON (the default) a bad version is refused.
-      (let ((bl.val::*require-standard* t))
+      (let ((bl.val:*require-standard* t))
         (is (eq :version-non-standard (reason (retyped 4)))))
       ;; With the flag OFF it gets past standardness entirely and fails on the
       ;; empty UTXO set instead — i.e. on a CONSENSUS ground, not a policy one.
-      (let ((bl.val::*require-standard* nil))
+      (let ((bl.val:*require-standard* nil))
         (is (eq :missing-input (reason (retyped 4))))
         ;; A non-standard OUTPUT script likewise stops being a reason.
         (let* ((weird (make-array 10 :element-type '(unsigned-byte 8)
@@ -622,7 +622,7 @@ rules the operator never asked about."
   ;; (mempool_args.cpp:102-104). An error, not a warning: a mainnet node quietly
   ;; relaying non-standard transactions has them dropped by every peer and never
   ;; finds out.
-  (let ((saved bl.val::*require-standard*))
+  (let ((saved bl.val:*require-standard*))
     (unwind-protect
          (progn
            (let ((bl:*network* :mainnet))
@@ -630,13 +630,13 @@ rules the operator never asked about."
                (bl::apply-config-globals '(("acceptnonstdtxn" . "1"))))
              ;; =0 on mainnet is fine — it asks for the default.
              (bl::apply-config-globals '(("acceptnonstdtxn" . "0")))
-             (is-true bl.val::*require-standard*))
+             (is-true bl.val:*require-standard*))
            (let ((bl:*network* :regtest))
              (bl::apply-config-globals '(("acceptnonstdtxn" . "1")))
-             (is-false bl.val::*require-standard*)))
-      (setf bl.val::*require-standard* saved)))
-  (is-true (bl::known-config-option-p "acceptnonstdtxn"))
-  (is-false (bl::core-only-option-p "acceptnonstdtxn")))
+             (is-false bl.val:*require-standard*)))
+      (setf bl.val:*require-standard* saved)))
+  (is-true (bl:known-config-option-p "acceptnonstdtxn"))
+  (is-false (bl.cfg:core-only-option-p "acceptnonstdtxn")))
 
 (test non-standard-output-script
   "Arbitrary scripts are non-standard."
@@ -953,11 +953,11 @@ non-standard under *permit-bare-multisig* nil (1<=m<=n<=3, 33/65-byte keys)."
                   (setf (aref s 0) #x00 (aref s 1) #x14) s))
         (opret (let ((s (make-array 10 :element-type '(unsigned-byte 8) :initial-element 0)))
                  (setf (aref s 0) #x6a) s)))
-    (is (= 546 (bl.val::dust-threshold p2pkh)))
-    (is (= 294 (bl.val::dust-threshold p2wpkh)))
-    (is (= 0 (bl.val::dust-threshold opret)))
-    (is-true (bl.val::output-witness-program-p p2wpkh))
-    (is-false (bl.val::output-witness-program-p p2pkh))))
+    (is (= 546 (bl.val:dust-threshold p2pkh)))
+    (is (= 294 (bl.val:dust-threshold p2wpkh)))
+    (is (= 0 (bl.val:dust-threshold opret)))
+    (is-true (bl.val:output-witness-program-p p2wpkh))
+    (is-false (bl.val:output-witness-program-p p2pkh))))
 
 (test policy-scriptsig-push-only
   "scriptsig-push-only-p accepts push opcodes and rejects ops > OP_16."
@@ -2282,8 +2282,8 @@ minimum."
 (test op-return-push-only-standardness
   "OP_RETURN is a standard data-carrier only when its payload is push-only
 (Core Solver NULL_DATA / IsPushOnly); a non-push opcode makes it nonstandard."
-  (let ((bl::*accept-datacarrier* t)
-        (bl::*max-datacarrier-bytes* 83))
+  (let ((bl:*accept-datacarrier* t)
+        (bl:*max-datacarrier-bytes* 83))
     ;; OP_RETURN <push 3 bytes> -> standard
     (is-true (bl.val::standard-output-script-p
               (%policy-bytes #x6a #x03 #xaa #xbb #xcc)))
@@ -2303,7 +2303,7 @@ minimum."
 
 (test bare-multisig-standard-by-default
   "Bare multisig is standard by default (Core DEFAULT_PERMIT_BAREMULTISIG=true)."
-  (is-true bl::*permit-bare-multisig*)          ; default flipped to t
+  (is-true bl:*permit-bare-multisig*)          ; default flipped to t
   (let* ((pk (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2))
          (script (concatenate '(vector (unsigned-byte 8))
                               (%policy-bytes #x51 #x21) pk (%policy-bytes #x51 #xae))))
@@ -2324,7 +2324,7 @@ and unbroadcast. A parent's spentby lists a child that spends it."
         (is (assoc "spentby" f :test #'string=))
         (is (assoc "bip125-replaceable" f :test #'string=))
         (is (assoc "unbroadcast" f :test #'string=))
-        (is (member (bl.rpc::hash-to-hex ctxid)
+        (is (member (bl.rpc:hash-to-hex ctxid)
                     (cdr (assoc "spentby" f :test #'string=)) :test #'string=))))))
 
 (test witness-unknown-and-p2a-outputs-standard
@@ -2352,8 +2352,8 @@ irregular version-0 programs stay nonstandard."
     ;; irregular v0 (OP_0 push2): stays nonstandard
     (is-false (bl.val::standard-output-script-p (wp #x00 #xaa #xbb)))
     ;; RPC type names
-    (is (string= "anchor" (bl.rpc::%script-type (wp #x51 #x4e #x73))))
-    (is (string= "witness_unknown" (bl.rpc::%script-type (wp #x52 #xaa #xbb))))))
+    (is (string= "anchor" (bl.rpc:script-type (wp #x51 #x4e #x73))))
+    (is (string= "witness_unknown" (bl.rpc:script-type (wp #x52 #xaa #xbb))))))
 
 ;;;; BIP431 TRUC (v3) topology
 

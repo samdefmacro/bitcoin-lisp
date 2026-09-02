@@ -362,7 +362,7 @@ what production data always has."
                 (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)
                 (make-array 32 :element-type '(unsigned-byte 8) :initial-element (1+ seed))
                 1)))
-    (setf (bl.ser::block-header-cached-hash
+    (setf (bl.ser:block-header-cached-hash
            (bl.ser:bitcoin-block-header block))
           nil)
     block))
@@ -389,7 +389,7 @@ STORE-BLOCK / GET-BLOCK API, which does not change."
        ;; And the position reported is Core's: past the 8-byte header.
        (multiple-value-bind (h pos) (bl.store:store-block store (%ff-test-block 50))
          (declare (ignore h))
-         (is (typep pos 'bl.kv::flat-file-pos))
+         (is (typep pos 'bl.kv:flat-file-pos))
          (is (plusp (bl.store:flat-file-pos-pos pos))))))))
 
 (test flat-store-survives-a-restart-by-scanning-its-files
@@ -679,7 +679,7 @@ require the file to be gone."
              ;; directly in the PRUNE-FLAT-BLOCK-FILE test above.
              (is (>= (length swept) 3) "each pruned block is reported for undo cleanup"))
            (is-false (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
-           (is (= 3 (bl.store::chain-state-pruned-height cs))
+           (is (= 3 (bl.store:chain-state-pruned-height cs))
                "the prune horizon advances to the file's last height")))))))
 
 ;;; --- Rebuilding the index from the files (P5) ---------------------------------
@@ -692,7 +692,7 @@ reason as elsewhere: reindexing recovers identity from BYTES."
             prev-hash
             (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)
             height)))
-    (setf (bl.ser::block-header-cached-hash
+    (setf (bl.ser:block-header-cached-hash
            (bl.ser:bitcoin-block-header b))
           nil)
     b))
@@ -727,7 +727,7 @@ from a full resync into local work."
           cs2 (bl.store:make-block-index-entry
                :hash genesis :height 0 :chain-work 1 :status :valid))
          (is (= 1 (hash-table-count
-                   (bl.store::chain-state-block-index cs2)))
+                   (bl.store:chain-state-block-index cs2)))
              "starting from an index that knows only genesis")
          (multiple-value-bind (added orphans)
              (bl.store:reindex-block-index store2 cs2)
@@ -1061,8 +1061,8 @@ live node is the RPC, so assert it is registered and validates its arguments."
   (let ((handler (gethash "migrateblocks" bl.rpc::*rpc-methods*)))
     ;; Bad arguments are rejected before any node state is touched, so NIL for
     ;; the node is enough to prove the guard runs first.
-    (signals bl.rpc::rpc-error (funcall handler nil '(0)))
-    (signals bl.rpc::rpc-error (funcall handler nil '(10 -1)))))
+    (signals bl.rpc:rpc-error (funcall handler nil '(0)))
+    (signals bl.rpc:rpc-error (funcall handler nil '(10 -1)))))
 
 (test a-crash-between-the-flat-write-and-the-unlink-is-swept-on-the-next-pass
   "The crash window. INIT-BLOCK-STORE indexes per-block files first and flat
@@ -1121,7 +1121,7 @@ reads, which also lets the migration retry it."
          ;; And make the flat copy unreadable for this hash only.
          (let ((wrapper (lambda (s h)
                           (if (equalp h victim)
-                              (if (bl.kv::flat-file-pos-p
+                              (if (bl.kv:flat-file-pos-p
                                    (gethash h (bl.store::block-store-index s)))
                                   nil
                                   (funcall real s h))
@@ -1179,7 +1179,7 @@ its operator would have had a -prune node that silently stopped reclaiming."
                      "pruneblockchain left the flat file on disk")
            (is (>= (length swept) 3)
                "each pruned block must be reported so its undo data goes too")
-           (is (= 3 (bl.store::chain-state-pruned-height cs))
+           (is (= 3 (bl.store:chain-state-pruned-height cs))
                "the prune horizon did not advance to the file's last height")))))))
 
 (test get-block-serves-the-genesis-body-nobody-stores
@@ -1336,7 +1336,7 @@ build much later."
            ;; happened and pushes the walk start past the file's first height,
            ;; after which %PRUNABLE-FLAT-FILES never offers the file again and
            ;; the node stops reclaiming space permanently.
-           (is (= 0 (bl.store::chain-state-pruned-height cs))
+           (is (= 0 (bl.store:chain-state-pruned-height cs))
                "the prune horizon must not advance over blocks still on disk")
            ;; The same call, with the lock gone, deletes it — which is what
            ;; proves the survival above came from the lock and not from some

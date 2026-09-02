@@ -614,11 +614,11 @@ at MIN_DISK_SPACE_FOR_BLOCK_FILES (Core node/blockstorage.cpp:330-338)."
                 :from-snapshot-blockhash base-hash
                 :assumeutxo-status :unvalidated
                 :storage-suffix "_snapshot"))
-         (node (bl::make-node :network :testnet3)))
+         (node (bl:make-node :network :testnet3)))
     ;; A target-blockhash (and no target-utxohash) makes PRIMARY historical.
     (setf (bl.store:chain-state-target-blockhash primary) base-hash
-          (bl::node-chainstates node) (list primary snap))
-    (let ((bl::*node* node))
+          (bl:node-chainstates node) (list primary snap))
+    (let ((bl:*node* node))
       (let ((bl:*prune-target-mib* 2000))
         (is (= (* 1000 1048576) (bl:effective-prune-target-bytes))))
       ;; Halving never pushes the target below the 550 MiB floor.
@@ -626,13 +626,13 @@ at MIN_DISK_SPACE_FOR_BLOCK_FILES (Core node/blockstorage.cpp:330-338)."
         (is (= bl:+min-disk-space-for-block-files+
                (bl:effective-prune-target-bytes)))))
     ;; No node / no historical chainstate: the full target.
-    (let ((bl::*node* nil)
+    (let ((bl:*node* nil)
           (bl:*prune-target-mib* 2000))
       (is (= (* 2000 1048576) (bl:effective-prune-target-bytes))))
     ;; Background completion ends the historical role: full target again.
     (setf (bl.store:chain-state-target-utxohash primary)
           (make-test-hash 1 1))
-    (let ((bl::*node* node)
+    (let ((bl:*node* node)
           (bl:*prune-target-mib* 2000))
       (is (= (* 2000 1048576) (bl:effective-prune-target-bytes))))))
 
@@ -647,9 +647,9 @@ rewound cursor lets a later walk reclaim the protected window."
     (unwind-protect
          (let* ((base-hash (nth 60 block-hashes))
                 (historical (bl.store:make-chain-state
-                             :block-index (bl.store::chain-state-block-index
+                             :block-index (bl.store:chain-state-block-index
                                            chain-state)))
-                (node (bl::make-node :network :testnet3)))
+                (node (bl:make-node :network :testnet3)))
            ;; CHAIN-STATE becomes the snapshot chainstate (tip 400, base 60);
            ;; HISTORICAL re-derives history below the base (tip 40).
            (setf (bl.store:chain-state-from-snapshot-blockhash chain-state)
@@ -659,8 +659,8 @@ rewound cursor lets a later walk reclaim the protected window."
            (bl.store:update-chain-tip historical (nth 40 block-hashes) 40)
            (bl.store:set-chainstate-target
             historical (bl.store:get-block-index-entry chain-state base-hash))
-           (setf (bl::node-chainstates node) (list historical chain-state))
-           (let ((bl::*node* node)
+           (setf (bl:node-chainstates node) (list historical chain-state))
+           (let ((bl:*node* node)
                  (bl:*prune-target-mib* 550)
                  (bl:*prune-after-height* 0))
              (is (= 60 (bl.store:chain-state-prune-floor chain-state)))
@@ -718,9 +718,9 @@ chainstate prunes its GetPruneRange; the historical range starts at 0)."
     (unwind-protect
          (let* ((base-hash (nth 350 block-hashes))
                 (historical (bl.store:make-chain-state
-                             :block-index (bl.store::chain-state-block-index
+                             :block-index (bl.store:chain-state-block-index
                                            chain-state)))
-                (node (bl::make-node :network :testnet3)))
+                (node (bl:make-node :network :testnet3)))
            (setf (bl.store:chain-state-from-snapshot-blockhash chain-state)
                  base-hash
                  (bl.store:chain-state-assumeutxo-status chain-state)
@@ -728,8 +728,8 @@ chainstate prunes its GetPruneRange; the historical range starts at 0)."
            (bl.store:update-chain-tip historical (nth 300 block-hashes) 300)
            (bl.store:set-chainstate-target
             historical (bl.store:get-block-index-entry chain-state base-hash))
-           (setf (bl::node-chainstates node) (list historical chain-state))
-           (let ((bl::*node* node)
+           (setf (bl:node-chainstates node) (list historical chain-state))
+           (let ((bl:*node* node)
                  (bl:*prune-target-mib* 550)
                  (bl:*prune-after-height* 0))
              (setf (bl.store:block-store-total-bytes block-store)

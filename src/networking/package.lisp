@@ -313,7 +313,63 @@ headerssync.cpp. src/networking/.")
    #:get-checkpoint-hash
    #:last-checkpoint-height
    #:relay-enabled-p
-   #:ignore-incoming-txs-p))
+   #:ignore-incoming-txs-p)
+  ;; Reached from another package with :: before the second-round review
+  ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
+  (:export
+   #:*asmap*
+   #:*cached-is-ibd*
+   #:*ibd-context*
+   #:*max-upload-target*
+   #:*whitebind-flags*
+   #:*whitelist-entries*
+   #:*whitelist-force-relay*
+   #:*whitelist-relay*
+   #:+max-tip-age-seconds+
+   #:+max-upload-timeframe-seconds+
+   #:address-book-info
+   #:address-book-n-new
+   #:address-book-n-tried
+   #:connection-bytes-received
+   #:connection-bytes-sent
+   #:connection-last-recv-time
+   #:connection-last-send-time
+   #:connection-port
+   #:connection-socket
+   #:connection-transport
+   #:hss-current-height
+   #:hss-state
+   #:ibd-context-block-queue
+   #:ibd-context-in-flight
+   #:ibd-context-pending-blocks
+   #:ip-network
+   #:max-outbound-time-left-in-cycle
+   #:outbound-target-bytes-left
+   #:outbound-target-reached-p
+   #:peer-addr-processed
+   #:peer-addr-rate-limited
+   #:peer-addr-relay-enabled
+   #:peer-best-known-block-hash
+   #:peer-compact-block-high-bandwidth-to
+   #:peer-connected-at
+   #:peer-connection
+   #:peer-headers-sync
+   #:peer-id
+   #:peer-inflight-block-hashes
+   #:peer-last-ping-time
+   #:peer-ping-nonce
+   #:peer-recv-per-msg
+   #:peer-sent-per-msg
+   #:peer-time-offset
+   #:peer-tx-inv-queue
+   #:process-headers
+   #:relay-block
+   #:snapshot-per-msg-table
+   #:start-ibd
+   #:update-block-availability
+   #:v2-transport-cipher
+   #:v2-transport-p
+   #:validate-header-chain))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

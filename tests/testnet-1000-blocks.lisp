@@ -18,7 +18,7 @@
 
 ;; Enable console output
 (setf bl:*log-stream* *standard-output*)
-(setf bl.log::*current-log-level* :info)
+(setf bl.log:*current-log-level* :info)
 
 (format t "~%========================================~%")
 (format t "Testnet Sync Test - Target: ~A blocks~%" *target-blocks*)
@@ -34,7 +34,7 @@
 
 (defparameter *start-height*
   (bl.store:current-height
-   (bl::node-chain-state bl:*node*)))
+   (bl:node-chain-state bl:*node*)))
 
 (format t "Starting height: ~D~%" *start-height*)
 (force-output)
@@ -44,7 +44,7 @@
 (force-output)
 (bl::connect-to-peers bl:*node* 4 :timeout 30 :min-peers 1)
 
-(defparameter *peer-count* (length (bl::node-peers bl:*node*)))
+(defparameter *peer-count* (length (bl:node-peers bl:*node*)))
 (format t "Connected to ~D peers~%" *peer-count*)
 (force-output)
 
@@ -58,13 +58,13 @@
 (defparameter *start-time* (get-universal-time))
 
 (defun get-utxo-count ()
-  (let ((utxo-set (bl::node-utxo-set bl:*node*)))
+  (let ((utxo-set (bl:node-utxo-set bl:*node*)))
     (when utxo-set
       (hash-table-count (bl.store::utxo-set-entries utxo-set)))))
 
 (defun verify-utxo-consistency ()
   "Verify UTXO set is consistent"
-  (let* ((utxo-set (bl::node-utxo-set bl:*node*))
+  (let* ((utxo-set (bl:node-utxo-set bl:*node*))
          (utxos (when utxo-set (bl.store::utxo-set-entries utxo-set)))
          (count (if utxos (hash-table-count utxos) 0))
          (valid-count 0)
@@ -72,7 +72,7 @@
     (when utxos
       (maphash (lambda (key value)
                  (if (and (= (length key) 36)  ; txid (32) + vout (4)
-                          (typep value 'bl.store::utxo-entry))
+                          (typep value 'bl.store:utxo-entry))
                      (incf valid-count)
                      (incf invalid-count)))
                utxos))
@@ -95,7 +95,7 @@
  (lambda ()
    (handler-case
        (progn
-         (bl::sync-blockchain bl:*node*)
+         (bl:sync-blockchain bl:*node*)
          (setf *sync-complete* t))
      (error (e)
        (setf *sync-error* e)
@@ -106,7 +106,7 @@
 (loop
   (sleep 10)
   (let* ((height (bl.store:current-height
-                  (bl::node-chain-state bl:*node*)))
+                  (bl:node-chain-state bl:*node*)))
          (elapsed (- (get-universal-time) *start-time*))
          (utxo-count (get-utxo-count)))
 
@@ -130,7 +130,7 @@
          (sb-ext:exit :code 1))
         (t
          (let ((final-height (bl.store:current-height
-                              (bl::node-chain-state bl:*node*))))
+                              (bl:node-chain-state bl:*node*))))
            (format t "~%~%========================================~%")
            (format t "SYNC COMPLETE: ~A blocks synced!~%" final-height)
            (format t "Time elapsed: ~A seconds~%" elapsed)

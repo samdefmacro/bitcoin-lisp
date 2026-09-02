@@ -89,38 +89,38 @@ add_coin comment: group.Insert overwrites long_term_fee, set it after)."
 (test ws-feerate-fee
   "Core CFeeRate::GetFee at d3056bc: EvaluateFeeUp — ceil(rate*size/1000),
 always rounded UP (feerate.cpp:20-27, feefrac.h)."
-  (is (= 0 (bl.rpc::%feerate-fee 1000 0)))
-  (is (= 1 (bl.rpc::%feerate-fee 1000 1)))
-  (is (= 1 (bl.rpc::%feerate-fee 1 999)))     ; ceil(0.999)
-  (is (= 1 (bl.rpc::%feerate-fee 1 1000)))
-  (is (= 2 (bl.rpc::%feerate-fee 1 1001)))    ; ceil(1.001)
-  (is (= 141 (bl.rpc::%feerate-fee 1000 141)))
-  (is (= 1410 (bl.rpc::%feerate-fee 10000 141)))
-  (is (= 423 (bl.rpc::%feerate-fee 3000 141)))  ; exact
+  (is (= 0 (bl.rpc:feerate-fee 1000 0)))
+  (is (= 1 (bl.rpc:feerate-fee 1000 1)))
+  (is (= 1 (bl.rpc:feerate-fee 1 999)))     ; ceil(0.999)
+  (is (= 1 (bl.rpc:feerate-fee 1 1000)))
+  (is (= 2 (bl.rpc:feerate-fee 1 1001)))    ; ceil(1.001)
+  (is (= 141 (bl.rpc:feerate-fee 1000 141)))
+  (is (= 1410 (bl.rpc:feerate-fee 10000 141)))
+  (is (= 423 (bl.rpc:feerate-fee 3000 141)))  ; exact
   ;; Round-up discriminator: truncation would give 422 (422.859 -> 423 up).
-  (is (= 423 (bl.rpc::%feerate-fee 2999 141)))
+  (is (= 423 (bl.rpc:feerate-fee 2999 141)))
   ;; The 1300 sat/kvB case from the review: per-part round-up sums (54+40+88
   ;; = 182... under truncation the parts sum BELOW the whole ceil(183.3);
   ;; under round-up every part covers its share and the whole is 184 <= sum
   ;; of any parts covering >= its size).
-  (is (= 184 (bl.rpc::%feerate-fee 1300 141)))
-  (is (<= (bl.rpc::%feerate-fee 1300 141)
-          (+ (bl.rpc::%feerate-fee 1300 41)
-             (bl.rpc::%feerate-fee 1300 31)
-             (bl.rpc::%feerate-fee 1300 69))))
-  (is (= 204 (bl.rpc::%feerate-fee 3000 68)))   ; exact
-  (is (= 0 (bl.rpc::%feerate-fee 0 1000))))
+  (is (= 184 (bl.rpc:feerate-fee 1300 141)))
+  (is (<= (bl.rpc:feerate-fee 1300 141)
+          (+ (bl.rpc:feerate-fee 1300 41)
+             (bl.rpc:feerate-fee 1300 31)
+             (bl.rpc:feerate-fee 1300 69))))
+  (is (= 204 (bl.rpc:feerate-fee 3000 68)))   ; exact
+  (is (= 0 (bl.rpc:feerate-fee 0 1000))))
 
 (test ws-format-money
   "Core FormatMoney: trailing-zero trim keeping at least two decimals."
-  (is (string= "0.00" (bl.rpc::%format-money 0)))
-  (is (string= "1.00" (bl.rpc::%format-money 100000000)))
-  (is (string= "1.50" (bl.rpc::%format-money 150000000)))
-  (is (string= "0.001" (bl.rpc::%format-money 100000)))
-  (is (string= "0.10" (bl.rpc::%format-money 10000000)))
-  (is (string= "0.00000123" (bl.rpc::%format-money 123)))
-  (is (string= "1.23456789" (bl.rpc::%format-money 123456789)))
-  (is (string= "-0.50" (bl.rpc::%format-money -50000000))))
+  (is (string= "0.00" (bl.rpc:format-money 0)))
+  (is (string= "1.00" (bl.rpc:format-money 100000000)))
+  (is (string= "1.50" (bl.rpc:format-money 150000000)))
+  (is (string= "0.001" (bl.rpc:format-money 100000)))
+  (is (string= "0.10" (bl.rpc:format-money 10000000)))
+  (is (string= "0.00000123" (bl.rpc:format-money 123)))
+  (is (string= "1.23456789" (bl.rpc:format-money 123456789)))
+  (is (string= "-0.50" (bl.rpc:format-money -50000000))))
 
 (test ws-dust-threshold-at-rate
   "The parameterized dust threshold agrees with the validation layer's
@@ -145,20 +145,20 @@ fixed-rate version at the 3000 sat/kvB dust relay rate."
   (is (= 1100 (bl.wallet::%feerate-from-value "1.1")))
   (is (= 1001 (bl.wallet::%feerate-from-value "1.001")))
   (is (= 25000 (bl.wallet::%feerate-from-value 25)))
-  (signals bl.rpc::rpc-error
+  (signals bl.rpc:rpc-error
     (bl.wallet::%feerate-from-value "1.0001")))
 
 (test ws-amount-sub-satoshi-rejected
   "AmountFromValue rejects sub-satoshi precision (Core parses the decimal
 text exactly and errors on >8 fraction digits); legit amounts still parse."
-  (is (= 500000 (bl.rpc::%amount-from-value 0.005)))
-  (is (= 1 (bl.rpc::%amount-from-value 1/100000000)))
-  (signals bl.rpc::rpc-error
-    (bl.rpc::%amount-from-value 1/1000000000))        ; 0.1 sat exact
-  (signals bl.rpc::rpc-error
-    (bl.rpc::%amount-from-value 1.23456789012d0))     ; sub-sat double
-  (signals bl.rpc::rpc-error
-    (bl.rpc::%amount-from-value 0.000000001d0)))      ; 0.1 sat double
+  (is (= 500000 (bl.rpc:amount-from-value 0.005)))
+  (is (= 1 (bl.rpc:amount-from-value 1/100000000)))
+  (signals bl.rpc:rpc-error
+    (bl.rpc:amount-from-value 1/1000000000))        ; 0.1 sat exact
+  (signals bl.rpc:rpc-error
+    (bl.rpc:amount-from-value 1.23456789012d0))     ; sub-sat double
+  (signals bl.rpc:rpc-error
+    (bl.rpc:amount-from-value 0.000000001d0)))      ; 0.1 sat double
 
 (test ws-positional-bool-plumbing
   "Explicit false survives JSON parsing as the +json-false+ sentinel at
@@ -179,14 +179,14 @@ folding; the %positional-bool helpers decode all three states."
         (is (eq t present)))
       (is (eq t (gethash "b" obj))))
     (is (equal '(nil) (fifth params))))
-  (is (null (bl.rpc::%positional-bool
+  (is (null (bl.rpc:positional-bool
              bl.rpc:+json-false+)))
-  (is (null (bl.rpc::%positional-bool nil)))
-  (is (eq t (bl.rpc::%positional-bool t)))
-  (is (eq t (bl.rpc::%positional-bool-or nil t)))
-  (is (null (bl.rpc::%positional-bool-or
+  (is (null (bl.rpc:positional-bool nil)))
+  (is (eq t (bl.rpc:positional-bool t)))
+  (is (eq t (bl.rpc:positional-bool-or nil t)))
+  (is (null (bl.rpc:positional-bool-or
              bl.rpc:+json-false+ t)))
-  (is (eq t (bl.rpc::%positional-bool-or t t))))
+  (is (eq t (bl.rpc:positional-bool-or t t))))
 
 ;;; --- RNG determinism ---
 
@@ -323,7 +323,7 @@ grouping: the oversized 5-cent coin first forces the max-weight error, and
 after adding a normal 5-cent coin BnB finds {8, 5, 3}."
   (flet ((spec (cents input-bytes)
            (list (* cents +ws-cent+)
-                 :fee (bl.rpc::%feerate-fee 5000 input-bytes)
+                 :fee (bl.rpc:feerate-fee 5000 input-bytes)
                  :ltf 0
                  :input-bytes input-bytes)))
     (let ((max-weight bl.val:+max-standard-tx-weight+)
@@ -419,14 +419,14 @@ after adding a normal 5-cent coin BnB finds {8, 5, 3}."
 ;;; --- Regtest end-to-end ---
 
 (defun %ws-mempool-tx (node txid)
-  (bl.rpc::with-node-lock (node)
-    (let* ((mempool (bl::node-mempool node))
+  (bl.rpc:with-node-lock (node)
+    (let* ((mempool (bl:node-mempool node))
            (entry (and mempool (bl.mp:mempool-get mempool txid))))
       (and entry (bl.mp:mempool-entry-transaction entry)))))
 
 (defun %ws-tx-fee (node wallet tx)
   "inputs - outputs, resolved through the wallet/UTXO/mempool coins map."
-  (bl.rpc::with-node-lock (node)
+  (bl.rpc:with-node-lock (node)
     (bl.wallet::with-wallet-lock (wallet)
       (let ((coins (bl.wallet::%wallet-input-coins node wallet tx))
             (in 0))
@@ -445,7 +445,7 @@ after adding a normal 5-cent coin BnB finds {8, 5, 3}."
 
 (defun %ws-est-vsize (node wallet tx)
   "The estimator's max signed vsize for TX (all inputs wallet-owned)."
-  (bl.rpc::with-node-lock (node)
+  (bl.rpc:with-node-lock (node)
     (bl.wallet::with-wallet-lock (wallet)
       (let ((txouts
               (map 'list
@@ -461,7 +461,7 @@ after adding a normal 5-cent coin BnB finds {8, 5, 3}."
         (bl.wallet::%max-signed-tx-size wallet nil tx txouts)))))
 
 (defun %ws-verify-ok-p (node wallet tx)
-  (bl.rpc::with-node-lock (node)
+  (bl.rpc:with-node-lock (node)
     (bl.wallet::with-wallet-lock (wallet)
       (let ((coins (bl.wallet::%wallet-input-coins node wallet tx)))
         (nth-value 0 (bl.wallet::%verify-tx-scripts tx coins))))))
@@ -490,7 +490,7 @@ balances that reconcile to the satoshi before and after confirmation."
              (tip-height 102)
              (txid-hex (bl.wallet::rpc-sendtoaddress
                         node (list dest 1 nil nil nil nil nil nil nil 10)))
-             (txid (bl.rpc::parse-hex-hash txid-hex))
+             (txid (bl.rpc:parse-hex-hash txid-hex))
              (tx (%ws-mempool-tx node txid)))
         (is (not (null tx)))
         (let* ((outputs (bl.ser:transaction-outputs tx))
@@ -498,7 +498,7 @@ balances that reconcile to the satoshi before and after confirmation."
                (est-vsize (%ws-est-vsize node wallet tx)))
           (is (= 2 (length outputs)))
           ;; Exact fee: feerate 10 sat/vB x estimated max signed vsize.
-          (is (= fee (bl.rpc::%feerate-fee 10000 est-vsize)))
+          (is (= fee (bl.rpc:feerate-fee 10000 est-vsize)))
           ;; Actual signed weight never exceeds the estimate.
           (is (<= (bl.ser:transaction-weight tx)
                   (nth-value 1 (%ws-est-vsize node wallet tx))))
@@ -512,7 +512,7 @@ balances that reconcile to the satoshi before and after confirmation."
               (is (bl.wallet::wallet-is-mine
                    wallet (bl.ser:tx-out-script-pubkey change)))
               ;; Change address is an internal-chain (ischange) address.
-              (let* ((change-addr (bl.rpc::%script->address
+              (let* ((change-addr (bl.rpc:script->address
                                    (bl.ser:tx-out-script-pubkey change)
                                    :regtest))
                      (info (bl.wallet::rpc-getaddressinfo
@@ -549,7 +549,7 @@ remainder."
              (dest-spk (nth-value 1 (bl.crypto:decode-address
                                      dest :regtest))))
         ;; Single-recipient SFFO.
-        (let* ((txid (bl.rpc::parse-hex-hash
+        (let* ((txid (bl.rpc:parse-hex-hash
                       (bl.wallet::rpc-sendtoaddress
                        node (list dest 1 nil nil t nil nil nil nil 10))))
                (tx (%ws-mempool-tx node txid))
@@ -562,7 +562,7 @@ remainder."
           (is (not (null tx)))
           (is (= (- 100000000 fee)
                  (bl.ser:tx-out-value pay)))
-          (is (= fee (bl.rpc::%feerate-fee
+          (is (= fee (bl.rpc:feerate-fee
                       10000 (%ws-est-vsize node wallet tx)))))
         ;; Multi-recipient SFFO through sendmany: fee split over both, one
         ;; recipient pays floor(fee/2)+rem, the other floor(fee/2).
@@ -571,7 +571,7 @@ remainder."
                        (bl.crypto:hash160 redeem-2) :regtest))
                (dest2-spk (nth-value 1 (bl.crypto:decode-address
                                         dest2 :regtest)))
-               (txid (bl.rpc::parse-hex-hash
+               (txid (bl.rpc:parse-hex-hash
                       (bl.wallet::rpc-sendmany
                        node (list "" (list (cons dest 2) (cons dest2 1))
                                   nil nil (list dest dest2) nil nil nil 10))))
@@ -607,7 +607,7 @@ tx gets no change output and overpays exactly the remainder."
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 5))
              (dest (%wc-optrue-address))
              (amount-sat (- 5000000000 900))
-             (txid (bl.rpc::parse-hex-hash
+             (txid (bl.rpc:parse-hex-hash
                     (bl.wallet::rpc-sendtoaddress
                      node (list dest (format nil "~D.~8,'0D"
                                              (truncate amount-sat 100000000)
@@ -628,7 +628,7 @@ output of total - fee, wallet empty afterwards."
              (dest (%wc-optrue-address))
              (result (bl.wallet::rpc-sendall
                       node (list (list dest) nil nil 10)))
-             (txid (bl.rpc::parse-hex-hash (%aval "txid" result)))
+             (txid (bl.rpc:parse-hex-hash (%aval "txid" result)))
              (tx (%ws-mempool-tx node txid)))
         (is (eq t (%aval "complete" result)))
         (is (not (null tx)))
@@ -636,7 +636,7 @@ output of total - fee, wallet empty afterwards."
         (is (= 1 (length (bl.ser:transaction-outputs tx))))
         (let ((fee (%ws-tx-fee node wallet tx))
               (est (%ws-est-vsize node wallet tx)))
-          (is (= fee (bl.rpc::%feerate-fee 10000 est)))
+          (is (= fee (bl.rpc:feerate-fee 10000 est)))
           (is (= (- 10000000000 fee)
                  (bl.ser:tx-out-value
                   (aref (bl.ser:transaction-outputs tx) 0)))))
@@ -684,7 +684,7 @@ sendrawtransaction accepts it. Preset locktime/sequence survive."
                   (aref (bl.ser:transaction-inputs funded-tx) 0))))
           ;; Exact fee at 10 sat/vB over the estimator's size.
           (is (= (round (* fee-btc 100000000))
-                 (bl.rpc::%feerate-fee
+                 (bl.rpc:feerate-fee
                   10000 (%ws-est-vsize node wallet funded-tx)))))
         (let ((signed (bl.wallet::rpc-signrawtransactionwithwallet
                        node (list (%aval "hex" funded)))))
@@ -693,7 +693,7 @@ sendrawtransaction accepts it. Preset locktime/sequence survive."
                            node (list (%aval "hex" signed)))))
             (is (stringp txid-hex))
             (is (not (null (%ws-mempool-tx
-                            node (bl.rpc::parse-hex-hash txid-hex)))))))))))
+                            node (bl.rpc:parse-hex-hash txid-hex)))))))))))
 
 (test ws-signraw-watch-only-partial
   "signrawtransactionwithwallet on a watch-only wallet returns
@@ -708,7 +708,7 @@ complete:false with Core's per-input errors array."
              (xprv (bl.crypto:bip32-master-key seed :network :testnet))
              (xpub (bl.crypto:bip32-serialize
                     (bl.crypto:bip32-neuter xprv)))
-             (desc (bl.rpc::descriptor-add-checksum
+             (desc (bl.rpc:descriptor-add-checksum
                     (format nil "wpkh(~A/0/*)" xpub)))
              (request (make-hash-table :test 'equal)))
         (setf (gethash "desc" request) desc
@@ -722,7 +722,7 @@ complete:false with Core's per-input errors array."
                              (bl.wallet::rpc-getnewaddress
                               node '("" "bech32"))))
                (bl.wallet::*wallet-rng* (bl.wallet::make-wrng 8))
-               (fund-txid (bl.rpc::parse-hex-hash
+               (fund-txid (bl.rpc:parse-hex-hash
                            (let ((bl.wallet::*rpc-wallet-name* "w"))
                              (bl.wallet::rpc-sendtoaddress
                               node (list wo-address 1 nil nil nil nil nil nil
@@ -733,7 +733,7 @@ complete:false with Core's per-input errors array."
                             (bl.ser:parse-tx-payload
                              (bl.crypto:hex-to-bytes
                               (%aval "hex" (bl.wallet::rpc-gettransaction
-                                            node (list (bl.rpc::hash-to-hex
+                                            node (list (bl.rpc:hash-to-hex
                                                         fund-txid))))))))
                  (wo-spk (nth-value 1 (bl.crypto:decode-address
                                        wo-address :regtest)))
@@ -764,7 +764,7 @@ complete:false with Core's per-input errors array."
             (let ((errors (%aval "errors" result)))
               (is (= 1 (length errors)))
               (let ((entry (first errors)))
-                (is (string= (bl.rpc::hash-to-hex fund-txid)
+                (is (string= (bl.rpc:hash-to-hex fund-txid)
                              (%aval "txid" entry)))
                 (is (= vout (%aval "vout" entry)))
                 (is (stringp (%aval "error" entry)))
@@ -785,28 +785,28 @@ bounds are enforced with Core's messages."
               (progn (bl.wallet::rpc-sendtoaddress
                       node (list dest 1 nil nil nil nil nil nil nil 10))
                      (fail "maxtxfee cap not enforced"))
-            (bl.rpc::rpc-error (e)
-              (is (= -6 (bl.rpc::rpc-error-code e)))
+            (bl.rpc:rpc-error (e)
+              (is (= -6 (bl.rpc:rpc-error-code e)))
               (is (search "Fee exceeds maximum configured by user"
-                          (bl.rpc::rpc-error-message e))))))
+                          (bl.rpc:rpc-error-message e))))))
         ;; Weight caps via send's max_tx_weight.
         (handler-case
             (progn (bl.wallet::rpc-send
                     node (list (list (cons dest 1)) nil nil 10
                                '(("max_tx_weight" . 100))))
                    (fail "max_tx_weight lower bound not enforced"))
-          (bl.rpc::rpc-error (e)
+          (bl.rpc:rpc-error (e)
             (is (search "Maximum transaction weight must be between"
-                        (bl.rpc::rpc-error-message e)))))
+                        (bl.rpc:rpc-error-message e)))))
         (handler-case
             (progn (bl.wallet::rpc-send
                     node (list (list (cons dest 1)) nil nil 10
                                '(("max_tx_weight" . 300))))
                    (fail "max_tx_weight cap not enforced"))
-          (bl.rpc::rpc-error (e)
+          (bl.rpc:rpc-error (e)
             ;; The 300-weight budget dies in selection: no input fits.
             (is (search "maximum weight"
-                        (bl.rpc::rpc-error-message e)
+                        (bl.rpc:rpc-error-message e)
                         :test #'char-equal))))))))
 
 (test ws-fee-estimation-paths
@@ -822,20 +822,20 @@ PayTxFee."
             (progn (bl.wallet::rpc-sendtoaddress
                     node (list dest 1))
                    (fail "fallbackfee-disabled path not enforced"))
-          (bl.rpc::rpc-error (e)
-            (is (= -6 (bl.rpc::rpc-error-code e)))
+          (bl.rpc:rpc-error (e)
+            (is (= -6 (bl.rpc:rpc-error-code e)))
             (is (search "Fallbackfee is disabled"
-                        (bl.rpc::rpc-error-message e)))))
+                        (bl.rpc:rpc-error-message e)))))
         ;; Fallback enabled: 20 sat/vB fallback, verbose reports the reason.
         (let* ((bl:*wallet-fallback-fee* 20000)
                (result (bl.wallet::rpc-sendtoaddress
                         node (list dest 1 nil nil nil nil nil nil nil nil t)))
-               (txid (bl.rpc::parse-hex-hash (%aval "txid" result)))
+               (txid (bl.rpc:parse-hex-hash (%aval "txid" result)))
                (tx (%ws-mempool-tx node txid)))
           (is (string= "Fallback fee" (%aval "fee_reason" result)))
           (is (not (null tx)))
           (is (= (%ws-tx-fee node wallet tx)
-                 (bl.rpc::%feerate-fee
+                 (bl.rpc:feerate-fee
                   20000 (%ws-est-vsize node wallet tx)))))
         ;; Explicit fee rate reports PayTxFee.
         (let ((result (bl.wallet::rpc-sendtoaddress
@@ -848,7 +848,7 @@ on the 1-in-10 branch; a FINAL sequence is an internal-bug error."
   (with-wallet-chain-node (node "ws-snipe")
     (%ws-fund-wallet node)
     (let* ((tip-hash (bl.store:best-block-hash
-                      (bl::node-chain-state node)))
+                      (bl:node-chain-state node)))
            (tip-height 102)
            (make-tx (lambda (sequence)
                       (bl.ser:make-transaction
@@ -871,7 +871,7 @@ on the 1-in-10 branch; a FINAL sequence is an internal-bug error."
                             when (zerop (bl.wallet::wrng-randrange
                                          (bl.wallet::make-wrng seed) 10))
                               return seed)))
-      (bl.rpc::with-node-lock (node)
+      (bl.rpc:with-node-lock (node)
         ;; Non-backdated branch: locktime = tip height.
         (let ((tx (funcall make-tx #xFFFFFFFD)))
           (bl.wallet::discourage-fee-sniping
@@ -889,7 +889,7 @@ on the 1-in-10 branch; a FINAL sequence is an internal-bug error."
             (is (= expected
                    (bl.ser:transaction-lock-time tx)))))
         ;; FINAL sequence violates the anti-fee-sniping contract.
-        (signals bl.rpc::rpc-error
+        (signals bl.rpc:rpc-error
           (bl.wallet::discourage-fee-sniping
            (funcall make-tx #xFFFFFFFF)
            (bl.wallet::make-wrng seed-tip) node tip-hash tip-height))))))
@@ -899,12 +899,12 @@ on the 1-in-10 branch; a FINAL sequence is an internal-bug error."
   (with-wallet-chain-node (node "ws-seq")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (let ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 4)))
-        (bl.rpc::with-node-lock (node)
+        (bl.rpc:with-node-lock (node)
           (bl.wallet::with-wallet-lock (wallet)
             (multiple-value-bind (tx)
                 (bl.wallet::%create-transaction
                  node wallet
-                 (list (bl.rpc::make-recipient
+                 (list (bl.rpc:make-recipient
                         :address (%wc-optrue-address)
                         :script (p2sh-optrue-script-pubkey)
                         :amount 100000000))
@@ -925,7 +925,7 @@ mempool; the resend scheduler windows land in [12h, 36h)."
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 51))
              (dest (%wc-optrue-address))
-             (txid (bl.rpc::parse-hex-hash
+             (txid (bl.rpc:parse-hex-hash
                     (bl.wallet::rpc-sendtoaddress
                      node (list dest 1 nil nil nil nil nil nil nil 10)))))
         (is (not (null (%ws-mempool-tx node txid))))
@@ -961,14 +961,14 @@ hex+psbt without committing."
              (result (bl.wallet::rpc-send
                       node (list (list (cons dest 1)) nil nil 10 nil))))
         (is (eq t (%aval "complete" result)))
-        (let ((txid (bl.rpc::parse-hex-hash (%aval "txid" result))))
+        (let ((txid (bl.rpc:parse-hex-hash (%aval "txid" result))))
           (is (not (null (%ws-mempool-tx node txid))))
           (is (null (%aval "hex" result))))
         ;; add_to_wallet false: hex + psbt returned, nothing committed.
         (let* ((result2 (bl.wallet::rpc-send
                          node (list (list (cons dest 1)) nil nil 10
                                     '(("add_to_wallet" . nil)))))
-               (txid2 (bl.rpc::parse-hex-hash (%aval "txid" result2))))
+               (txid2 (bl.rpc:parse-hex-hash (%aval "txid" result2))))
           (is (eq t (%aval "complete" result2)))
           (is (stringp (%aval "hex" result2)))
           (is (stringp (%aval "psbt" result2)))
@@ -992,9 +992,9 @@ committing a mempool-invalid transaction as success."
       (let ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 13))
             (dest (%wc-optrue-address))
             (mempool-before
-              (bl.rpc::with-node-lock (node)
-                (bl.mp::mempool-count
-                 (bl::node-mempool node)))))
+              (bl.rpc:with-node-lock (node)
+                (bl.mp:mempool-count
+                 (bl:node-mempool node)))))
         (handler-case
             (progn
               (bl.wallet::rpc-send
@@ -1003,14 +1003,14 @@ committing a mempool-invalid transaction as success."
                           nil nil 10
                           '(("subtract_fee_from_outputs" . (1)))))
               (fail "negative SFFO data output was not rejected"))
-          (bl.rpc::rpc-error (e)
+          (bl.rpc:rpc-error (e)
             (is (search "too small to pay the fee"
-                        (bl.rpc::rpc-error-message e)))))
+                        (bl.rpc:rpc-error-message e)))))
         ;; Nothing committed, nothing in the mempool, no coins spent.
         (is (= mempool-before
-               (bl.rpc::with-node-lock (node)
-                 (bl.mp::mempool-count
-                  (bl::node-mempool node)))))
+               (bl.rpc:with-node-lock (node)
+                 (bl.mp:mempool-count
+                  (bl:node-mempool node)))))
         (bl.wallet::with-wallet-lock (wallet)
           (is (= 1 (hash-table-count
                     (bl.wallet::wallet-map-wallet wallet)))))))))
@@ -1045,7 +1045,7 @@ coin control; excluding them would strand funds)."
       ;; ... but sendall sweeps BOTH coins.
       (let* ((result (bl.wallet::rpc-sendall
                       node (list (list (%wc-optrue-address)) nil nil 2)))
-             (txid (bl.rpc::parse-hex-hash (%aval "txid" result)))
+             (txid (bl.rpc:parse-hex-hash (%aval "txid" result)))
              (tx (%ws-mempool-tx node txid)))
         (is (eq t (%aval "complete" result)))
         (is (not (null tx)))
@@ -1067,7 +1067,7 @@ wallet without the flag errors."
       (declare (ignore wallet))
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 23))
              (dest (%wc-optrue-address))
-             (txid (bl.rpc::parse-hex-hash
+             (txid (bl.rpc:parse-hex-hash
                     (bl.wallet::rpc-sendtoaddress
                      node (list dest 1 nil nil nil
                                 bl.rpc:+json-false+
@@ -1086,8 +1086,8 @@ wallet without the flag errors."
       (handler-case
           (progn (bl.wallet::rpc-getbalance node (list "*" 0 nil t))
                  (fail "explicit avoid_reuse=true on a non-avoid_reuse wallet must error"))
-        (bl.rpc::rpc-error (e)
-          (is (= -4 (bl.rpc::rpc-error-code e)))))
+        (bl.rpc:rpc-error (e)
+          (is (= -4 (bl.rpc:rpc-error-code e)))))
       ;; createwallet: explicit descriptors=false is rejected; a null-padded
       ;; descriptors argument keeps the default (true) and succeeds.
       (handler-case
@@ -1095,9 +1095,9 @@ wallet without the flag errors."
                   node (list "wleg" nil nil nil nil
                              bl.rpc:+json-false+))
                  (fail "createwallet descriptors=false must be rejected"))
-        (bl.rpc::rpc-error (e)
+        (bl.rpc:rpc-error (e)
           (is (search "no longer possible to create a legacy wallet"
-                      (bl.rpc::rpc-error-message e)))))
+                      (bl.rpc:rpc-error-message e)))))
       (is (equal "wnull"
                  (%aval "name" (bl.wallet::rpc-createwallet
                                 node (list "wnull" nil nil nil nil nil))))))))
@@ -1117,7 +1117,7 @@ stores only the 32-byte x coordinate)."
       ;; keypath through the wallet signer + script verifier).
       (%wc-mine node 1 addr-tr)
       (%wc-mine node 101 (%wc-optrue-address))
-      (let* ((txid (bl.rpc::parse-hex-hash
+      (let* ((txid (bl.rpc:parse-hex-hash
                     (bl.wallet::rpc-sendtoaddress
                      node (list dest 1 nil nil nil nil nil nil nil 10))))
              (tx (%ws-mempool-tx node txid)))
@@ -1137,7 +1137,7 @@ stores only the 32-byte x coordinate)."
                            return candidate))
              (wif (bl.crypto:private-key-to-wif
                    priv :network :testnet :compressed t))
-             (desc (bl.rpc::descriptor-add-checksum
+             (desc (bl.rpc:descriptor-add-checksum
                     (format nil "tr(~A)" wif)))
              (qx (bl.interop:compute-tweaked-pubkey
                   (bl.crypto:derive-xonly-pubkey priv)))
@@ -1163,7 +1163,7 @@ stores only the 32-byte x coordinate)."
           ;; only signable when x-only keys are matched by X coordinate.
           (let* ((result (bl.wallet::rpc-sendall
                           node (list (list dest) nil nil 10)))
-                 (txid (bl.rpc::parse-hex-hash (%aval "txid" result)))
+                 (txid (bl.rpc:parse-hex-hash (%aval "txid" result)))
                  (tx (%ws-mempool-tx node txid)))
             (is (eq t (%aval "complete" result)))
             (is (not (null tx)))
@@ -1178,11 +1178,11 @@ doing unbounded validation in one housekeeping tick."
     (multiple-value-bind (wallet) (%ws-fund-wallet node :blocks 2)
       (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 37))
              (dest (%wc-optrue-address))
-             (txid1 (bl.rpc::parse-hex-hash
+             (txid1 (bl.rpc:parse-hex-hash
                      (bl.wallet::rpc-sendtoaddress
                       node (list dest 1 nil nil nil nil nil nil nil 10)))))
         (%wb-evict-tx node txid1)
-        (let ((txid2 (bl.rpc::parse-hex-hash
+        (let ((txid2 (bl.rpc:parse-hex-hash
                       (bl.wallet::rpc-sendtoaddress
                        node (list dest 2 nil nil nil nil nil nil nil 10)))))
           (%wb-evict-tx node txid2)

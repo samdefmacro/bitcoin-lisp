@@ -478,7 +478,7 @@
   (bitcoin-lisp.networking:discourage-peer function)
   (bitcoin-lisp.networking:ban-address function)
   (bitcoin-lisp.networking:*default-ban-time-seconds* variable)
-  (bitcoin-lisp.networking::+max-tip-age-seconds+ variable))
+  (bitcoin-lisp.networking:+max-tip-age-seconds+ variable))
 
 (defsection @rpc-server (:title "rpc-server: JSON-RPC over HTTP")
   "Compiled as `bitcoin-lisp/rpc-server`, without a single method. Core:
@@ -661,7 +661,7 @@
   Trap: the recurring failure shape in this tree is correct code with
   the wrong or missing caller -- an index built but never maintained, a
   check present but never reached. Test the wire, not the function."
-  (bitcoin-lisp.rpc::with-node-lock macro)
+  (bitcoin-lisp.rpc:with-node-lock macro)
   (bitcoin-lisp.rpc:rpc-get-chain-state function)
   (bitcoin-lisp.rpc::*rpc-named-arg-names* variable)
   (bitcoin-lisp.rpc::*rpc-arg-conversions* variable)

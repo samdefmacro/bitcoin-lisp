@@ -9,23 +9,23 @@
 (defun %sf-graph (feerates &optional deps)
   "A depgraph with one transaction per (fee . size) in FEERATES, plus DEPS as
 a list of (parent-index . child-index)."
-  (let ((g (bl.mp::make-depgraph)))
+  (let ((g (bl.mp:make-depgraph)))
     (dolist (fr feerates)
-      (bl.mp::depgraph-add-transaction
+      (bl.mp:depgraph-add-transaction
        g (bl.mp:make-feefrac (car fr) (cdr fr))))
     (dolist (d deps)
-      (bl.mp::depgraph-add-dependencies g (ash 1 (car d)) (cdr d)))
+      (bl.mp:depgraph-add-dependencies g (ash 1 (car d)) (cdr d)))
     g))
 
 (defun %sf-chunks (g lin)
-  (bl.mp::chunk-linearization g lin))
+  (bl.mp:chunk-linearization g lin))
 
 (defun %sf-incumbent (g)
   "The linearizer SFL replaced: ancestor-set feerate seeding refined by
 PostLinearize. Built explicitly because LINEARIZE is now SFL — comparing
 against LINEARIZE would compare the port with itself."
-  (bl.mp::post-linearize
-   g (bl.mp::ancestor-sort-linearization g)))
+  (bl.mp:post-linearize
+   g (bl.mp:ancestor-sort-linearization g)))
 
 (defstruct (%sf-rng (:constructor %make-sf-rng (state)))
   (state 1 :type (unsigned-byte 62)))
@@ -41,14 +41,14 @@ against LINEARIZE would compare the port with itself."
   "A random DAG: dependencies only ever run from a lower index to a higher one,
 so it is acyclic by construction."
   (let* ((n (1+ (%sf-rnd rng max-n)))
-         (g (bl.mp::make-depgraph)))
+         (g (bl.mp:make-depgraph)))
     (dotimes (i n)
-      (bl.mp::depgraph-add-transaction
+      (bl.mp:depgraph-add-transaction
        g (bl.mp:make-feefrac (1+ (%sf-rnd rng 100)) (1+ (%sf-rnd rng 5)))))
     (dotimes (i n)
       (loop for j from (1+ i) below n
             do (when (zerop (%sf-rnd rng 3))
-                 (bl.mp::depgraph-add-dependencies g (ash 1 i) j))))
+                 (bl.mp:depgraph-add-dependencies g (ash 1 i) j))))
     (values g n)))
 
 ;;; --- Basics -----------------------------------------------------------------
@@ -87,7 +87,7 @@ the one that matters either way -- SFL is never worse."
                        '((0 . 1) (0 . 2) (1 . 3) (2 . 3)))))
     (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 5)
       (is-true optimal)
-      (is-true (bl.mp::linearization-topological-p g lin))
+      (is-true (bl.mp:linearization-topological-p g lin))
       (let ((cmp (bl.mp:compare-chunks
                   (%sf-chunks g lin)
                   (%sf-chunks g (%sf-incumbent g)))))
@@ -107,7 +107,7 @@ the one that matters either way -- SFL is never worse."
           (unless (and (= n (length lin))
                        (= n (length (remove-duplicates (coerce lin 'list)))))
             (incf bad-count))
-          (unless (bl.mp::linearization-topological-p g lin)
+          (unless (bl.mp:linearization-topological-p g lin)
             (incf bad-topo)))))
     (is (zerop bad-count) "every transaction must appear exactly once")
     (is (zerop bad-topo) "every output must be topologically valid")))
@@ -116,14 +116,14 @@ the one that matters either way -- SFL is never worse."
   "A random DAG with between MIN-N and MAX-N transactions, where each ordered
 pair is joined with probability DENSITY/100."
   (let* ((n (+ min-n (%sf-rnd rng (1+ (- max-n min-n)))))
-         (g (bl.mp::make-depgraph)))
+         (g (bl.mp:make-depgraph)))
     (dotimes (i n)
-      (bl.mp::depgraph-add-transaction
+      (bl.mp:depgraph-add-transaction
        g (bl.mp:make-feefrac (1+ (%sf-rnd rng 50)) (1+ (%sf-rnd rng 10)))))
     (dotimes (i n)
       (loop for j from (1+ i) below n
             do (when (< (%sf-rnd rng 100) density)
-                 (bl.mp::depgraph-add-dependencies g (ash 1 i) j))))
+                 (bl.mp:depgraph-add-dependencies g (ash 1 i) j))))
     (values g n)))
 
 (test sfl-is-never-worse-than-the-ancestor-set-linearizer
@@ -200,7 +200,7 @@ by index -- and require the result beat or match it."
         (let* ((seed-lin (coerce (loop for i below n collect i) 'simple-vector))
                (lin (bl.mp::sfl-linearize
                      g :rng-seed (1+ trial) :old-linearization seed-lin)))
-          (is-true (bl.mp::linearization-topological-p g lin))
+          (is-true (bl.mp:linearization-topological-p g lin))
           (when (eq :less (bl.mp:compare-chunks
                            (%sf-chunks g lin) (%sf-chunks g seed-lin)))
             (incf worse)))))
@@ -236,7 +236,7 @@ the tiny clusters the optimality test uses."
                    (push (coerce (reverse chosen-list) 'simple-vector) results)
                    (dotimes (i n)
                      (unless (logbitp i chosen-set)
-                       (let ((parents (logandc2 (bl.mp::depgraph-ancestors g i)
+                       (let ((parents (logandc2 (bl.mp:depgraph-ancestors g i)
                                                 (ash 1 i))))
                          (when (= parents (logand parents chosen-set))
                            (walk (logior chosen-set (ash 1 i))
@@ -254,13 +254,13 @@ linearization -- just not a provably optimal one."
     (multiple-value-bind (lin optimal cost) (bl.mp::sfl-linearize
                                              g :rng-seed 9 :max-cost 1)
       (is (= 20 (length lin)))
-      (is-true (bl.mp::linearization-topological-p g lin))
+      (is-true (bl.mp:linearization-topological-p g lin))
       (is-false optimal "no budget means no optimality claim")
       (is (plusp cost)))
     ;; With a real budget the same cluster is solved and reported optimal.
     (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 9)
       (is-true optimal)
-      (is-true (bl.mp::linearization-topological-p g lin)))))
+      (is-true (bl.mp:linearization-topological-p g lin)))))
 
 (test sfl-is-deterministic-for-a-given-seed
   "Same graph, same seed, same answer -- the randomness is a heuristic, not a
@@ -296,7 +296,7 @@ produce SFL's answer and not the incumbent's."
     (when found
       (destructuring-bind (g seed) found
         (let* ((bl.mp::*linearize-rng-seed* seed)
-               (via-linearize (%sf-chunks g (bl.mp::linearize g)))
+               (via-linearize (%sf-chunks g (bl.mp:linearize g)))
                (incumbent (%sf-chunks g (%sf-incumbent g))))
           (is (eq :greater (bl.mp:compare-chunks via-linearize incumbent))
               "LINEARIZE must give SFL's better answer, not the incumbent's"))))))
@@ -309,10 +309,10 @@ output is not optimal, and require LINEARIZE's chunks to be connected anyway."
   (let ((g (%sf-graph (loop for i below 24 collect (cons (1+ (* 11 (mod i 7))) (1+ (mod i 4))))
                       (loop for i below 23 collect (cons i (1+ i))))))
     (let ((bl.mp::*linearize-rng-seed* 4))
-      (let ((lin (bl.mp::linearize g :max-cost 1)))
+      (let ((lin (bl.mp:linearize g :max-cost 1)))
         (is (= 24 (length lin)))
-        (is-true (bl.mp::linearization-topological-p g lin))
-        (dolist (si (bl.mp::chunk-linearization-info g lin))
-          (is-true (bl.mp::depgraph-connected-p
-                    g (bl.mp::setinfo-transactions si))
+        (is-true (bl.mp:linearization-topological-p g lin))
+        (dolist (si (bl.mp:chunk-linearization-info g lin))
+          (is-true (bl.mp:depgraph-connected-p
+                    g (bl.mp:setinfo-transactions si))
                    "every chunk PostLinearize produces must be connected"))))))

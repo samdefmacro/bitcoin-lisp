@@ -411,7 +411,16 @@ src/storage/.")
    #:blockfilterindex-clear-best
    #:blockfilterindex-wipe
    #:blockfilterindex-ensure-genesis-anchor
-   #:build-blockfilterindex))
+   #:build-blockfilterindex)
+  ;; Reached from another package with :: before the second-round review
+  ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
+  (:export
+   #:chain-state-best-block-hash
+   #:chain-state-best-height
+   #:chain-state-block-index
+   #:chain-state-genesis-hash
+   #:cvc-best-block
+   #:make-utxo-key))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

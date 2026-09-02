@@ -1373,17 +1373,17 @@ Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
          ;; Keyed on the WTXID: the witness is where the signatures live, so a
          ;; malleated copy must not hit.
          (cache-key
-           (when (and bl.interop::*script-execution-cache-enabled*
+           (when (and bl.interop:*script-execution-cache-enabled*
                       ;; Core returns true for a coinbase before touching the
                       ;; cache (validation.cpp:2064); it has no input scripts.
                       (not (and (= 1 (length inputs))
                                 (bl.ser:coinbase-input-p
                                  (aref inputs 0)))))
-             (bl.interop::make-script-execution-cache-key
+             (bl.interop:make-script-execution-cache-key
               (bl.ser:transaction-wtxid tx)
               effective-flags))))
     (when (and cache-key
-               (bl.interop::script-execution-cached-p cache-key))
+               (bl.interop:script-execution-cached-p cache-key))
       (return-from validate-transaction-scripts (values t nil)))
     (let* ((spent-utxos (collect-spent-utxos inputs utxo-set extra-coins))
            (bl.interop:*script-flags* effective-flags)
@@ -1397,5 +1397,5 @@ Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
       ;; Stored only after EVERY input succeeded — a partial success must never
       ;; short-circuit a later pass.
       (when cache-key
-        (bl.interop::script-execution-cache-store cache-key))
+        (bl.interop:script-execution-cache-store cache-key))
       (values t nil))))

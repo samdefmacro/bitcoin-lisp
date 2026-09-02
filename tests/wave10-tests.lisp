@@ -21,7 +21,7 @@
 (defun wave10-rpc-code (thunk)
   "Funcall THUNK; return the rpc-error code it signals, or NIL if none."
   (handler-case (progn (funcall thunk) nil)
-    (bl.rpc::rpc-error (e) (bl.rpc::rpc-error-code e))))
+    (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e))))
 
 (defun wave10-encode (result)
   "Encode an RPC result alist exactly like the server does."
@@ -96,17 +96,17 @@ unconnected peer."
   "The mempool entry's unbroadcast field reflects the actual unbroadcast set
 (was hardcoded null)."
   (let* ((node (make-test-node))
-         (mempool (bl::node-mempool node))
+         (mempool (bl:node-mempool node))
          (tx (make-mempool-test-tx :input-id 71))
          (txid (bl.ser:transaction-hash tx)))
     (is (eq :ok (bl.mp:mempool-add
                  mempool txid (make-mempool-entry-for-tx tx))))
     (let ((fields (bl.rpc::rpc-getmempoolentry
-                   node (list (bl.rpc::hash-to-hex txid)))))
+                   node (list (bl.rpc:hash-to-hex txid)))))
       (is (eq 'yason:false (cdr (assoc "unbroadcast" fields :test #'string=)))))
     (bl.mp:mempool-add-unbroadcast mempool txid)
     (let ((fields (bl.rpc::rpc-getmempoolentry
-                   node (list (bl.rpc::hash-to-hex txid)))))
+                   node (list (bl.rpc:hash-to-hex txid)))))
       (is (eq t (cdr (assoc "unbroadcast" fields :test #'string=)))))))
 
 ;;; ---------------------------------------------------------------------
@@ -133,10 +133,10 @@ with Core's message."
   (handler-case
       (progn (bl.rpc::rpc-disconnectnode (make-test-node) (list "203.0.113.9"))
              (fail "expected rpc-error"))
-    (bl.rpc::rpc-error (e)
-      (is (= -29 (bl.rpc::rpc-error-code e)))
+    (bl.rpc:rpc-error (e)
+      (is (= -29 (bl.rpc:rpc-error-code e)))
       (is (string= "Node not found in connected nodes"
-                   (bl.rpc::rpc-error-message e))))))
+                   (bl.rpc:rpc-error-message e))))))
 
 (test wave10-setban-error-codes
   "setban: invalid address -30; double-add -23; unban of a never-banned
@@ -189,7 +189,7 @@ explicit -maxmempool still wins."
     (is (= (* 50 1000 1000) bl.mp:*max-mempool-bytes*))
     ;; The mempool built AFTER the wire uses the new cap.
     (is (= (* 50 1000 1000)
-           (bl.mp::mempool-max-size
+           (bl.mp:mempool-max-size
             (bl.mp:make-mempool))))
     ;; -blocksonly alone shrinks the default.
     (setf bl.mp:*max-mempool-bytes*
@@ -223,7 +223,7 @@ maximum, and the reserve may not fall below MINIMUM_BLOCK_RESERVED_WEIGHT."
     (bl::apply-config-globals '(("blockreservedweight" . "4000")))
     (is (= 4000 bl.mining:*block-reserved-weight*))
     ;; A fresh template starts at the configured reserve.
-    (is (= 4000 (bl.mining::block-template-total-weight
+    (is (= 4000 (bl.mining:block-template-total-weight
                  (bl.mining::make-block-template))))
     ;; Above consensus: refused, both options.
     (signals error
@@ -276,7 +276,7 @@ signmessagewithprivkey bad WIF -5; getblockfilter malformed hash -8."
                (lambda () (bl.rpc::rpc-prioritisetransaction
                            node (list "nothex" 0 1000))))))
     (is (= -5 (wave10-rpc-code
-               (lambda () (bl.rpc::rpc-signmessagewithprivkey
+               (lambda () (bl.rpc:rpc-signmessagewithprivkey
                            node (list "notawif" "msg"))))))
     (is (= -8 (wave10-rpc-code
                (lambda () (bl.rpc::rpc-getblockfilter
@@ -290,39 +290,39 @@ non-P2PKH (bech32) address -3 'Address does not refer to key'."
         (progn (bl.rpc::rpc-verifymessage
                 node (list "not-an-address" "AAAA" "m"))
                (fail "expected rpc-error"))
-      (bl.rpc::rpc-error (e)
-        (is (= -5 (bl.rpc::rpc-error-code e)))
-        (is (string= "Invalid address" (bl.rpc::rpc-error-message e)))))
+      (bl.rpc:rpc-error (e)
+        (is (= -5 (bl.rpc:rpc-error-code e)))
+        (is (string= "Invalid address" (bl.rpc:rpc-error-message e)))))
     (handler-case
         (progn (bl.rpc::rpc-verifymessage
                 node (list "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx" "AAAA" "m"))
                (fail "expected rpc-error"))
-      (bl.rpc::rpc-error (e)
-        (is (= -3 (bl.rpc::rpc-error-code e)))
+      (bl.rpc:rpc-error (e)
+        (is (= -3 (bl.rpc:rpc-error-code e)))
         (is (string= "Address does not refer to key"
-                     (bl.rpc::rpc-error-message e)))))))
+                     (bl.rpc:rpc-error-message e)))))))
 
 (test wave10-getblocktemplate-mainnet-gates
   "getblocktemplate on MAINNET with no peers throws -9 (Core's
 !isTestChain() gate); test networks skip the gate entirely."
-  (let ((node (bl::make-node :network :mainnet)))
+  (let ((node (bl:make-node :network :mainnet)))
     (handler-case
         (progn (bl.rpc::rpc-getblocktemplate node nil)
                (fail "expected rpc-error"))
-      (bl.rpc::rpc-error (e)
-        (is (= -9 (bl.rpc::rpc-error-code e)))
+      (bl.rpc:rpc-error (e)
+        (is (= -9 (bl.rpc:rpc-error-code e)))
         (is (string= "Bitcoin is not connected!"
-                     (bl.rpc::rpc-error-message e)))))))
+                     (bl.rpc:rpc-error-message e)))))))
 
 (test wave10-method-not-found
   "Unknown methods throw -32601 with Core's exact message."
   (bl.rpc::register-all-methods)
   (handler-case
-      (progn (bl.rpc::dispatch-rpc-method nil "nosuchmethod" '())
+      (progn (bl.rpc:dispatch-rpc-method nil "nosuchmethod" '())
              (fail "expected rpc-error"))
-    (bl.rpc::rpc-error (e)
-      (is (= -32601 (bl.rpc::rpc-error-code e)))
-      (is (string= "Method not found" (bl.rpc::rpc-error-message e))))))
+    (bl.rpc:rpc-error (e)
+      (is (= -32601 (bl.rpc:rpc-error-code e)))
+      (is (string= "Method not found" (bl.rpc:rpc-error-message e))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; HTTP layer
@@ -377,13 +377,13 @@ distinguishes an absent id (notification -> 204) from id:null."
   (handler-case
       (progn (bl.rpc::parse-json-rpc-request "{\"id\":1}")
              (fail "expected rpc-error"))
-    (bl.rpc::rpc-error (e)
-      (is (= -32600 (bl.rpc::rpc-error-code e)))))
+    (bl.rpc:rpc-error (e)
+      (is (= -32600 (bl.rpc:rpc-error-code e)))))
   (handler-case
       (progn (bl.rpc::parse-json-rpc-request "not json")
              (fail "expected rpc-error"))
-    (bl.rpc::rpc-error (e)
-      (is (= -32700 (bl.rpc::rpc-error-code e))))))
+    (bl.rpc:rpc-error (e)
+      (is (= -32700 (bl.rpc:rpc-error-code e))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; D. gettxout include_mempool
@@ -393,13 +393,13 @@ distinguishes an absent id (notification -> 204) from id:null."
   "A confirmed coin spent by a mempool tx is hidden by default and visible
 with include_mempool=false (Core mempool.isSpent path)."
   (let* ((node (make-test-node))
-         (utxo (bl::node-utxo-set node))
-         (mempool (bl::node-mempool node))
+         (utxo (bl:node-utxo-set node))
+         (mempool (bl:node-mempool node))
          (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 42))
          (spk (bl.crypto:hex-to-bytes
                "76a914000000000000000000000000000000000000000088ac")))
     (bl.store:add-utxo utxo funding 0 100000000 spk 0)
-    (let ((hex (bl.rpc::hash-to-hex funding)))
+    (let ((hex (bl.rpc:hash-to-hex funding)))
       ;; Visible while nothing spends it.
       (is (consp (bl.rpc::rpc-gettxout node (list hex 0))))
       ;; A mempool tx spending funding:0 hides it under include_mempool.
@@ -426,13 +426,13 @@ with include_mempool=false (Core mempool.isSpent path)."
         ;; The SPENDER's own output is visible via the mempool view with 0
         ;; confirmations and coinbase:false.
         (let ((r (bl.rpc::rpc-gettxout
-                  node (list (bl.rpc::hash-to-hex spender-txid) 0))))
+                  node (list (bl.rpc:hash-to-hex spender-txid) 0))))
           (is (consp r))
           (is (= 0 (cdr (assoc "confirmations" r :test #'string=))))
           (is (eq 'yason:false (cdr (assoc "coinbase" r :test #'string=))))
           ;; ... and invisible without the mempool (explicit false).
           (is (null (bl.rpc::rpc-gettxout
-                     node (list (bl.rpc::hash-to-hex spender-txid) 0
+                     node (list (bl.rpc:hash-to-hex spender-txid) 0
                                 bl.rpc:+json-false+)))))))))
 
 ;;; ---------------------------------------------------------------------
@@ -446,8 +446,8 @@ with include_mempool=false (Core mempool.isSpent path)."
          (spk (bl.crypto:hex-to-bytes
                "76a914111111111111111111111111111111111111111188ac")))
     (bl.store:add-utxo
-     (bl::node-utxo-set node) txid 0 250000000 spk 0)
-    (values node (bl.rpc::hash-to-hex txid) spk)))
+     (bl:node-utxo-set node) txid 0 250000000 spk 0)
+    (values node (bl.rpc:hash-to-hex txid) spk)))
 
 (test wave10-getutxos-json-bitmap
   "BIP64 json: two outpoints (hit, miss) -> bitmap \"10\", one utxo with
@@ -506,8 +506,8 @@ view but stays in the plain view; a mempool-created coin appears only in the
 checkmempool view at MEMPOOL_HEIGHT (Core rest.cpp CCoinsViewMemPool)."
   (multiple-value-bind (node txid-hex spk) (wave10-getutxos-node)
     (let* ((hunchentoot:*reply* (make-instance 'hunchentoot:reply))
-           (mempool (bl::node-mempool node))
-           (funding (bl.rpc::parse-hex-hash txid-hex))
+           (mempool (bl:node-mempool node))
+           (funding (bl.rpc:parse-hex-hash txid-hex))
            (spender (bl.ser:make-transaction
                      :version 1
                      :inputs (vector (bl.ser:make-tx-in
@@ -519,7 +519,7 @@ checkmempool view at MEMPOOL_HEIGHT (Core rest.cpp CCoinsViewMemPool)."
                      :outputs (vector (bl.ser:make-tx-out
                                        :value 249990000 :script-pubkey spk))
                      :lock-time 0))
-           (spender-hex (bl.rpc::hash-to-hex
+           (spender-hex (bl.rpc:hash-to-hex
                          (bl.ser:transaction-hash spender))))
       (is (eq :ok (bl.mp:mempool-add
                    mempool (bl.ser:transaction-hash spender)
@@ -585,28 +585,28 @@ unknown output format (Core rest.cpp:919-947)."
 (test wave10-conf-parse-money
   "conf-parse-money follows Core ParseMoney: BTC decimal string -> satoshis;
 malformed/negative/9-decimals/oversized -> NIL."
-  (is (= 100000000 (bl::conf-parse-money "1")))
-  (is (= 1000 (bl::conf-parse-money "0.00001")))
-  (is (= 1 (bl::conf-parse-money "0.00000001")))
-  (is (= 123456789 (bl::conf-parse-money "1.23456789")))
-  (is (null (bl::conf-parse-money "x")))
-  (is (null (bl::conf-parse-money "-1")))
-  (is (null (bl::conf-parse-money "0.000000001")))  ; 9 decimals
-  (is (null (bl::conf-parse-money "")))
-  (is (null (bl::conf-parse-money "22000000.00000001")))) ; > MAX_MONEY
+  (is (= 100000000 (bl:conf-parse-money "1")))
+  (is (= 1000 (bl:conf-parse-money "0.00001")))
+  (is (= 1 (bl:conf-parse-money "0.00000001")))
+  (is (= 123456789 (bl:conf-parse-money "1.23456789")))
+  (is (null (bl:conf-parse-money "x")))
+  (is (null (bl:conf-parse-money "-1")))
+  (is (null (bl:conf-parse-money "0.000000001")))  ; 9 decimals
+  (is (null (bl:conf-parse-money "")))
+  (is (null (bl:conf-parse-money "22000000.00000001")))) ; > MAX_MONEY
 
 (test wave10-conf-parse-user-hex
   "conf-parse-user-hex follows uint256::FromUserHex: optional 0x, up to 64
 hex digits, left-padded; junk/overlong -> NIL."
-  (let ((z (bl::conf-parse-user-hex "0")))
+  (let ((z (bl:conf-parse-user-hex "0")))
     (is (= 32 (length z)))
     (is (every #'zerop z)))
-  (let ((v (bl::conf-parse-user-hex "0xabcd")))
+  (let ((v (bl:conf-parse-user-hex "0xabcd")))
     (is (= #xab (aref v 30)))
     (is (= #xcd (aref v 31)))
     (is (every #'zerop (subseq v 0 30))))
-  (is (null (bl::conf-parse-user-hex "zz")))
-  (is (null (bl::conf-parse-user-hex (make-string 65 :initial-element #\a)))))
+  (is (null (bl:conf-parse-user-hex "zz")))
+  (is (null (bl:conf-parse-user-hex (make-string 65 :initial-element #\a)))))
 
 (test wave10-config-wires-globals
   "apply-config-globals wires -assumevalid/-minimumchainwork/-mempoolexpiry/
@@ -648,7 +648,7 @@ hex digits, left-padded; junk/overlong -> NIL."
     (bl::apply-config-globals '(("minrelaytxfee" . "0.00002")))
     (is (= 2000 bl.mp:*min-relay-fee-rate*))
     ;; the mempool built AFTER the wire uses the new floor
-    (is (= 2000 (bl.mp::mempool-min-fee-rate
+    (is (= 2000 (bl.mp:mempool-min-fee-rate
                  (bl.mp:make-mempool))))
     (signals error (bl::apply-config-globals '(("minrelaytxfee" . "junk"))))
     (bl::apply-config-globals '(("blockmintxfee" . "0.00005")))
@@ -716,9 +716,9 @@ user agent is built from the one client version constant."
 (test wave10-listen-port-override
   "listen-port honors *p2p-port-override* and falls back to the network
 default; the dial default (network-port) is never affected."
-  (let ((bl::*p2p-port-override* nil))
+  (let ((bl:*p2p-port-override* nil))
     (is (= 48333 (bl:listen-port :testnet4)))
-    (setf bl::*p2p-port-override* 15555)
+    (setf bl:*p2p-port-override* 15555)
     (is (= 15555 (bl:listen-port :testnet4)))
     (is (= 48333 (bl:network-port :testnet4)))))
 
@@ -753,20 +753,20 @@ default; the dial default (network-port) is never affected."
   "Repeated command-line args: LAST wins; repeatable options keep every
 occurrence in order; config-file repeats: FIRST wins; CLI beats config."
   ;; CLI scalar: last occurrence wins
-  (let ((a (bl::parse-cli-args '("-dbcache=100" "-dbcache=200"))))
+  (let ((a (bl.cfg:parse-cli-args '("-dbcache=100" "-dbcache=200"))))
     (is (string= "200" (cdr (assoc "dbcache" a :test #'string=))))
     (is (= 1 (count "dbcache" a :key #'car :test #'string=))))
   ;; repeatable: all kept, in order
-  (let ((a (bl::parse-cli-args '("-onlynet=ipv4" "-onlynet=ipv6"))))
+  (let ((a (bl.cfg:parse-cli-args '("-onlynet=ipv4" "-onlynet=ipv6"))))
     (is (equal '("ipv4" "ipv6")
                (loop for (k . v) in a when (string= k "onlynet") collect v))))
   ;; config file scalar: first occurrence wins
-  (let ((c (bl::parse-bitcoin-conf
+  (let ((c (bl.cfg:parse-bitcoin-conf
             (format nil "dbcache=1~%dbcache=2~%"))))
     (is (string= "1" (cdr (assoc "dbcache" c :test #'string=)))))
   ;; CLI over config (merged = cli ++ conf)
-  (let* ((cli (bl::parse-cli-args '("-dbcache=100" "-dbcache=200")))
-         (conf (bl::parse-bitcoin-conf (format nil "dbcache=1~%")))
+  (let* ((cli (bl.cfg:parse-cli-args '("-dbcache=100" "-dbcache=200")))
+         (conf (bl.cfg:parse-bitcoin-conf (format nil "dbcache=1~%")))
          (merged (append cli conf)))
     (is (string= "200" (cdr (assoc "dbcache" merged :test #'string=))))))
 
@@ -812,10 +812,10 @@ not before (Core DumpAddresses every DUMP_PEERS_INTERVAL)."
   (let* ((dir (ensure-directories-exist
                (merge-pathnames (format nil "wave10-peersdump-~D/" (get-universal-time))
                                 (uiop:temporary-directory))))
-         (node (bl::make-node :network :testnet4))
+         (node (bl:make-node :network :testnet4))
          (bl::*last-peers-dump-time* 0))
-    (setf (bl::node-data-directory node) dir)
-    (setf (bl::node-address-book node)
+    (setf (bl:node-data-directory node) dir)
+    (setf (bl:node-address-book node)
           (bl.net:make-address-book))
     (unwind-protect
          (progn

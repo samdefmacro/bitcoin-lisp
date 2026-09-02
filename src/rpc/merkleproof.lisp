@@ -163,7 +163,7 @@ vBits serialization)."
 gettxoutproof). PARAMS: (txids [blockhash]). On this pruned node the block
 must be locatable: pass BLOCKHASH, or have txindex enabled. Returns the
 hex-encoded CMerkleBlock."
-  (let ((txids (%positional-array (first params)))
+  (let ((txids (positional-array (first params)))
         (blockhash-hex (second params)))
     (unless (and (listp txids) txids)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "txids must be a non-empty array"))

@@ -42,15 +42,15 @@ BIP34 at height 1)."
 
 (defun make-test-node (&key (network :testnet3))
   "Create a node with minimal initialized state for testing."
-  (let ((node (bl::make-node :network network)))
+  (let ((node (bl:make-node :network network)))
     ;; Initialize chain-state
-    (setf (bl::node-chain-state node)
+    (setf (bl:node-chain-state node)
           (bl.store:make-chain-state))
     ;; Initialize UTXO set
-    (setf (bl::node-utxo-set node)
+    (setf (bl:node-utxo-set node)
           (bl.store:make-utxo-set))
     ;; Initialize mempool
-    (setf (bl::node-mempool node)
+    (setf (bl:node-mempool node)
           (bl.mp:make-mempool))
     node))
 

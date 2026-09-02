@@ -78,7 +78,7 @@ fine; that is the default path, and creating THAT is the intended behaviour."
                                 datadir
                                 (concatenate 'string datadir "/")))))
         (unless (probe-file path)
-          (error 'bl::config-parse-error
+          (error 'bl.cfg:config-parse-error
                  :message (format nil "specified data directory \"~A\" does not exist"
                                   datadir)))))))
 
@@ -102,16 +102,16 @@ Core's rules, all of which apply here:
   (when (null conf-text)
     (return-from %read-config-includes nil))
   (let ((cli-include (assoc "includeconf" cli :test #'string=)))
-    (when (and cli-include (not (bl::conf-parse-bool (cdr cli-include))))
+    (when (and cli-include (not (bl.cfg:conf-parse-bool (cdr cli-include))))
       ;; -noincludeconf
       (return-from %read-config-includes (list conf-text)))
-    (when (and cli-include (bl::conf-parse-bool (cdr cli-include)))
-      (error 'bl::config-parse-error
+    (when (and cli-include (bl.cfg:conf-parse-bool (cdr cli-include)))
+      (error 'bl.cfg:config-parse-error
              :message "-includeconf cannot be used from the command line; put it ~
                        in the configuration file")))
-  (let* ((network (bl::resolve-network-from-config
-                   (append cli (bl::conf-global-entries conf-text))))
-         (entries (bl::parse-bitcoin-conf conf-text network))
+  (let* ((network (bl.cfg:resolve-network-from-config
+                   (append cli (bl.cfg:conf-global-entries conf-text))))
+         (entries (bl.cfg:parse-bitcoin-conf conf-text network))
          (names (loop for (k . v) in entries
                       when (and (string= k "includeconf") (plusp (length v)))
                         collect v))
@@ -123,13 +123,13 @@ Core's rules, all of which apply here:
     (dolist (name names)
       (let ((path (merge-pathnames name base)))
         (unless (probe-file path)
-          (error 'bl::config-parse-error
+          (error 'bl.cfg:config-parse-error
                  :message (format nil "Failed to include configuration file ~A" name)))
         (let ((text (alexandria:read-file-into-string path)))
           ;; A recursive include is dropped with a warning, exactly as Core
           ;; does (it re-scans for includeconf after reading and prints
           ;; "-includeconf cannot be used from included files").
-          (dolist (inner (bl::parse-bitcoin-conf text nil))
+          (dolist (inner (bl.cfg:parse-bitcoin-conf text nil))
             (when (string= (car inner) "includeconf")
               (log-warn "-includeconf cannot be used from included files; ~
                          ignoring -includeconf=~A" (cdr inner))))
@@ -244,9 +244,9 @@ so the two compose rather than clobbering each other."
         (with-open-file (out tmp :direction :output :external-format :utf-8
                                  :if-exists :supersede :if-does-not-exist :create)
           (write-string (bl:render-settings-json alist) out))
-        (bl.store::fsync-file tmp)
+        (bl.kv:fsync-file tmp)
         (rename-file tmp path)
-        (bl.store::fsync-directory path))
+        (bl.kv:fsync-directory path))
     (error (e)
       (init-error "Settings file could not be written: ~A" e))))
 

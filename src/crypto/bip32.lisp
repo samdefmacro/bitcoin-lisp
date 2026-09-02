@@ -190,7 +190,7 @@ Every rejection below corresponds to one of those vectors:
                        (and (zerop (aref key 0))
                             (let ((d (%be->int (subseq key 1 33))))
                               (and (plusp d) (< d +secp256k1-order+))))
-                       (and (bl.crypto::parse-public-key key) t))
+                       (and (bl.crypto:parse-public-key key) t))
                    ;; A master key has no parent and no index.
                    (or (plusp depth)
                        (and (zerop fingerprint) (zerop child))))

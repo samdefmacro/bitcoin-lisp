@@ -57,7 +57,7 @@ deliberately absent — like Core's m_last_count_attempt it is not persisted."
                    (bl.net:peer-address-ref-count pa)
                    (sort (copy-list (gethash id id-buckets)) #'<))
              rows))
-     (bl.net::address-book-info book))
+     (bl.net:address-book-info book))
     (sort rows #'string< :key (lambda (row) (format nil "~S" row)))))
 
 (test create-and-populate-address-book
@@ -105,14 +105,14 @@ new-table placement — not merely that the entry count matches."
            ;; always present and exactly one of them is tried.
            (let ((before (peerdb-book-rows book)))
              (is (= 2 (bl.net:address-book-count book)))
-             (is (= 1 (bl.net::address-book-n-tried book)))
+             (is (= 1 (bl.net:address-book-n-tried book)))
              (is (eq t (bl.net:save-address-book book path)))
              ;; book2 keeps its own random key on purpose: everything below
              ;; only works if load reads the key back out of the file.
              (let ((book2 (bl.net:make-address-book)))
                (is (eq t (bl.net:load-address-book book2 path)))
                (is (= 2 (bl.net:address-book-count book2)))
-               (is (= 1 (bl.net::address-book-n-tried book2)))
+               (is (= 1 (bl.net:address-book-n-tried book2)))
                ;; Round-trip fidelity: what was saved is exactly what loads.
                (is (equal before (peerdb-book-rows book2)))
                (let ((addr (bl.net:address-book-lookup

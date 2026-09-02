@@ -22,7 +22,7 @@
 
 ;; Enable console output
 (setf bl:*log-stream* *standard-output*)
-(setf bl.log::*current-log-level* :info)
+(setf bl.log:*current-log-level* :info)
 
 (format t "~%========================================~%")
 (format t "Testnet Sync Resume Test~%")
@@ -44,7 +44,7 @@
 (force-output)
 (bl::connect-to-peers bl:*node* 4 :timeout 30 :min-peers 1)
 
-(defparameter *peer-count* (length (bl::node-peers bl:*node*)))
+(defparameter *peer-count* (length (bl:node-peers bl:*node*)))
 (format t "Connected to ~D peers~%" *peer-count*)
 (force-output)
 
@@ -58,7 +58,7 @@
   (sb-thread:make-thread
    (lambda ()
      (handler-case
-         (bl::sync-blockchain bl:*node*)
+         (bl:sync-blockchain bl:*node*)
        (error (e)
          (format t "Sync error: ~A~%" e))))
    :name "sync-thread"))
@@ -70,7 +70,7 @@
 (loop
   (sleep 5)
   (let ((height (bl.store:current-height
-                 (bl::node-chain-state bl:*node*))))
+                 (bl:node-chain-state bl:*node*))))
     (format t "  Current height: ~D~%" height)
     (force-output)
     (when (>= height 200)
@@ -78,7 +78,7 @@
 
 (defparameter *phase1-height*
   (bl.store:current-height
-   (bl::node-chain-state bl:*node*)))
+   (bl:node-chain-state bl:*node*)))
 
 (format t "~%Phase 1 complete. Stopping at height ~D~%" *phase1-height*)
 (force-output)
@@ -120,7 +120,7 @@
 
 (defparameter *phase2-start-height*
   (bl.store:current-height
-   (bl::node-chain-state bl:*node*)))
+   (bl:node-chain-state bl:*node*)))
 
 (format t "~%Restart complete. Starting height: ~D~%" *phase2-start-height*)
 (force-output)
@@ -157,7 +157,7 @@
 (force-output)
 (bl::connect-to-peers bl:*node* 4 :timeout 30 :min-peers 1)
 
-(setf *peer-count* (length (bl::node-peers bl:*node*)))
+(setf *peer-count* (length (bl:node-peers bl:*node*)))
 (format t "Connected to ~D peers~%" *peer-count*)
 (force-output)
 
@@ -170,7 +170,7 @@
     (sb-thread:make-thread
      (lambda ()
        (handler-case
-           (bl::sync-blockchain bl:*node*)
+           (bl:sync-blockchain bl:*node*)
          (error (e)
            (format t "Sync error: ~A~%" e))))
      :name "sync-thread-2"))
@@ -179,7 +179,7 @@
   (loop
     (sleep 5)
     (let ((height (bl.store:current-height
-                   (bl::node-chain-state bl:*node*))))
+                   (bl:node-chain-state bl:*node*))))
       (format t "  Current height: ~D~%" height)
       (force-output)
       (when (>= height (+ *phase2-start-height* 100))
@@ -187,7 +187,7 @@
 
 (defparameter *final-height*
   (bl.store:current-height
-   (bl::node-chain-state bl:*node*)))
+   (bl:node-chain-state bl:*node*)))
 
 (format t "~%========================================~%")
 (format t "TEST PASSED: Sync Resume Verified~%")

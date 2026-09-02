@@ -64,7 +64,7 @@ block explorer would otherwise see a mirrored hash and match nothing."
       (dotimes (i 32) (setf (aref hash i) i))
       (unwind-protect
            (progn
-             (is (= 1 (bl::zmq-start-publishers
+             (is (= 1 (bl:zmq-start-publishers
                        (list (list "hashblock" address 1000)))))
              (let ((lines (%zmq-collect address "hashblock" 1
                                         (lambda () (bl::zmq-notify-hash-block hash)))))
@@ -75,7 +75,7 @@ block explorer would otherwise see a mirrored hash and match nothing."
                  ;; 00,01,...,1f went in; 1f,...,01,00 must come out.
                  (is (string= "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
                               (third parts))))))
-        (bl::zmq-stop-publishers)
+        (bl:zmq-stop-publishers)
         (ignore-errors (delete-file path))))))
 
 (test zmq-sequence-numbers-advance-so-a-subscriber-can-see-a-gap
@@ -86,7 +86,7 @@ something; if it never advanced, a dropped message would be invisible."
     (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
       (unwind-protect
            (progn
-             (bl::zmq-start-publishers (list (list "hashtx" address 1000)))
+             (bl:zmq-start-publishers (list (list "hashtx" address 1000)))
              (let ((lines (%zmq-collect address "hashtx" 3
                                         (lambda () (bl::zmq-notify-hash-tx hash)))))
                (is (<= 3 (length lines)))
@@ -99,7 +99,7 @@ something; if it never advanced, a dropped message would be invisible."
                    (is (equal (list (1+ (first seqs)) (+ 2 (first seqs)))
                               (rest seqs))
                        "sequence numbers must advance by one per message")))))
-        (bl::zmq-stop-publishers)
+        (bl:zmq-stop-publishers)
         (ignore-errors (delete-file path))))))
 
 (test zmq-sequence-topic-carries-the-label-and-optional-counter
@@ -111,7 +111,7 @@ them by length."
     (let ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAB)))
       (unwind-protect
            (progn
-             (bl::zmq-start-publishers (list (list "sequence" address 1000)))
+             (bl:zmq-start-publishers (list (list "sequence" address 1000)))
              ;; Block connected: label C, no counter -> 33 bytes.
              (let ((lines (%zmq-collect address "sequence" 1
                                         (lambda ()
@@ -132,24 +132,24 @@ them by length."
                    (is (string= "41" (subseq body 64 66)) "label A")
                    ;; 258 = 0x0102, little-endian over 8 bytes.
                    (is (string= "0201000000000000" (subseq body 66 82)))))))
-        (bl::zmq-stop-publishers)
+        (bl:zmq-stop-publishers)
         (ignore-errors (delete-file path))))))
 
 (test zmq-config-asks-for-nothing-when-no-topic-is-set
   "The property that keeps libzmq off the startup path: with no -zmqpub*
 option there are no publishers to start, so the library is never loaded and a
 host without it runs the node perfectly well."
-  (is (null (bl::zmq-specs-from-config '())))
-  (is (null (bl::zmq-specs-from-config '(("zmqpubhashblock" . "")))))
+  (is (null (bl:zmq-specs-from-config '())))
+  (is (null (bl:zmq-specs-from-config '(("zmqpubhashblock" . "")))))
   ;; Per-topic address and per-topic hwm, in Core's topic order.
   (is (equal '(("hashblock" "tcp://127.0.0.1:28332" 1000)
                ("rawtx" "ipc:///tmp/x.sock" 50))
-             (bl::zmq-specs-from-config
+             (bl:zmq-specs-from-config
               '(("zmqpubrawtx" . "ipc:///tmp/x.sock")
                 ("zmqpubrawtxhwm" . "50")
                 ("zmqpubhashblock" . "tcp://127.0.0.1:28332")))))
   (signals error
-    (bl::zmq-specs-from-config
+    (bl:zmq-specs-from-config
      '(("zmqpubhashtx" . "ipc:///tmp/y.sock") ("zmqpubhashtxhwm" . "-1")))))
 
 (test zmq-getzmqnotifications-reports-active-publishers
@@ -160,14 +160,14 @@ prefix on the type."
   (multiple-value-bind (address path) (%zmq-test-address "rpc")
     (unwind-protect
          (progn
-           (bl::zmq-start-publishers (list (list "rawblock" address 42)))
+           (bl:zmq-start-publishers (list (list "rawblock" address 42)))
            (let ((result (bl.rpc::rpc-getzmqnotifications nil nil)))
              (is (= 1 (length result)))
              (let ((entry (elt result 0)))
                (is (string= "pubrawblock" (cdr (assoc "type" entry :test #'string=))))
                (is (string= address (cdr (assoc "address" entry :test #'string=))))
                (is (= 42 (cdr (assoc "hwm" entry :test #'string=)))))))
-      (bl::zmq-stop-publishers)
+      (bl:zmq-stop-publishers)
       (ignore-errors (delete-file path)))))
 
 ;;;; --- The hooks must be CONNECTED ---
@@ -206,12 +206,12 @@ so without this the tests below would be coin flips rather than tests."
     `(multiple-value-bind (,address ,path) (%zmq-test-address ,topic)
        (unwind-protect
             (progn
-              (bl::zmq-start-publishers (list (list ,topic ,address 1000)))
+              (bl:zmq-start-publishers (list (list ,topic ,address 1000)))
               (let ((,sub (%zmq-open-subscriber ,address ,topic ,count)))
                 (unwind-protect (progn ,@body)
                   (ignore-errors (uiop:terminate-process ,sub))
                   (ignore-errors (uiop:wait-process ,sub)))))
-         (bl::zmq-stop-publishers)
+         (bl:zmq-stop-publishers)
          (ignore-errors (delete-file ,path))))))
 
 (test zmq-mempool-acceptance-is-wired-to-the-publisher
@@ -256,8 +256,8 @@ non-block inclusion reasons\")."
                  (bl.mp:accept-validated-tx mempool txid tx 5000 300)
                  (sleep 0.3)
                  (%zmq-drain sub)               ; discard the acceptance
-                 (let ((bl.mp::*mempool-removal-reason* reason))
-                   (bl.mp::mempool-remove mempool txid))
+                 (let ((bl.mp:*mempool-removal-reason* reason))
+                   (bl.mp:mempool-remove mempool txid))
                  (sleep 0.5)
                  (let ((wanted (string-downcase
                                 (bl.crypto:bytes-to-hex (reverse (copy-seq txid))))))

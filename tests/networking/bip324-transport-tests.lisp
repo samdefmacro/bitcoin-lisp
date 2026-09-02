@@ -21,14 +21,14 @@ it, and run BODY with both connection structs bound. Closes everything after."
        (unwind-protect
             (let* ((,client-conn (bl.net:make-tcp-connection
                                   "127.0.0.1" ,port))
-                   (,server-conn (bl.net::accept-connection
+                   (,server-conn (bl.net:accept-connection
                                   ,listener :timeout 5)))
               (unwind-protect (progn ,@body)
                 (when ,client-conn
                   (bl.net:close-connection ,client-conn))
                 (when ,server-conn
                   (bl.net:close-connection ,server-conn))))
-         (bl.net::close-listener ,listener)))))
+         (bl.net:close-listener ,listener)))))
 
 (test buffered-input-is-visible-to-the-drain-loop
   "The readers pull bytes with LISTEN on the Lisp STREAM, and a Lisp stream
@@ -129,7 +129,7 @@ must be skipped, and a 0-length payload."
                                              ;; full timeout, which is exactly
                                              ;; the failure that kept recurring.
                                              (%v2t-drain client)))))
-                          (if (not (bl.net::v2-transport-p transport))
+                          (if (not (bl.net:v2-transport-p transport))
                               ;; Say WHY rather than leaving NIL behind: a
                               ;; failed handshake and a wrong message were
                               ;; previously indistinguishable, both surfacing
@@ -149,8 +149,8 @@ must be skipped, and a 0-length payload."
           (let ((transport (prog1 (bl.net::v2-detect-inbound
                                    server :timeout 60)
                              (%v2t-drain server))))
-            (is-true (bl.net::v2-transport-p transport))
-            (when (bl.net::v2-transport-p transport)
+            (is-true (bl.net:v2-transport-p transport))
+            (when (bl.net:v2-transport-p transport)
               ;; Receive the client's short-ID message.
               (multiple-value-bind (cmd payload)
                   (bl.net::v2-receive-message-blocking server transport
@@ -187,13 +187,13 @@ oversize length descriptor."
           (let ((server-transport (bl.net::v2-detect-inbound
                                    server :timeout 10)))
             (bt:join-thread thread)
-            (is-true (bl.net::v2-transport-p server-transport))
-            (is-true (bl.net::v2-transport-p client-transport))
+            (is-true (bl.net:v2-transport-p server-transport))
+            (is-true (bl.net:v2-transport-p client-transport))
             ;; Client sends 3 length bytes + a garbage body that will not
             ;; authenticate. Server must return NIL AND mark itself dead.
             (bl.net:send-bytes
              client (bl.crypto:bip324-cipher-encrypt
-                     (bl.net::v2-transport-cipher client-transport)
+                     (bl.net:v2-transport-cipher client-transport)
                      (%bc-hex "07") (%bc-buf 0) nil))
             (%v2t-drain client)
             ;; Corrupt the wire by having the server decrypt a tampered copy:
@@ -285,10 +285,10 @@ length it yielded has to survive the gap between passes."
           (let ((server-transport
                   (bl.net::v2-detect-inbound server :timeout 10)))
             (bt:join-thread thread)
-            (is-true (bl.net::v2-transport-p server-transport))
-            (is-true (bl.net::v2-transport-p client-transport))
-            (when (and (bl.net::v2-transport-p server-transport)
-                       (bl.net::v2-transport-p client-transport))
+            (is-true (bl.net:v2-transport-p server-transport))
+            (is-true (bl.net:v2-transport-p client-transport))
+            (when (and (bl.net:v2-transport-p server-transport)
+                       (bl.net:v2-transport-p client-transport))
               ;; Nothing sent yet: the reader must say so at once, not wait.
               (let ((start (get-internal-real-time)))
                 (multiple-value-bind (command detail)
@@ -309,12 +309,12 @@ length it yielded has to survive the gap between passes."
                                  ((bl.net::v2-transport-send-lock
                                    client-transport))
                                (bl.crypto:bip324-cipher-encrypt
-                                (bl.net::v2-transport-cipher
+                                (bl.net:v2-transport-cipher
                                  client-transport)
                                 contents bl.net::*v2-empty-bytes* nil))))
                 ;; Piece 1: the length descriptor only. Decrypting it advances
                 ;; the receive cipher — the point of no return.
-                (bl.net::send-bytes
+                (bl.net:send-bytes
                  client (subseq packet 0 bl.crypto:+bip324-length-len+))
                 (%v2t-drain client)
                 (sleep 0.2)
@@ -325,10 +325,10 @@ length it yielded has to survive the gap between passes."
                   (is (eq :incomplete detail) "the body has not arrived yet"))
                 (is-true (bl.net::connection-recv-framing server)
                          "the decrypted body length is parked for the next pass")
-                (is-true (bl.net::connection-connected server)
+                (is-true (bl.net:connection-connected server)
                          "and a mid-packet peer is not dropped")
                 ;; Piece 2: the body.
-                (bl.net::send-bytes
+                (bl.net:send-bytes
                  client (subseq packet bl.crypto:+bip324-length-len+))
                 (%v2t-drain client)
                 (sleep 0.2)
@@ -368,8 +368,8 @@ resumes, after every other peer has had a turn."
           (let ((server-transport
                   (bl.net::v2-detect-inbound server :timeout 10)))
             (bt:join-thread thread)
-            (when (and (bl.net::v2-transport-p server-transport)
-                       (bl.net::v2-transport-p client-transport))
+            (when (and (bl.net:v2-transport-p server-transport)
+                       (bl.net:v2-transport-p client-transport))
               ;; Enough empty decoys to exceed the per-call budget several times
               ;; over (20 bytes each), and no real message behind them.
               (let ((decoys (ceiling (* 4 bl.net::+v2-max-recv-bytes-per-call+)
@@ -393,5 +393,5 @@ resumes, after every other peer has had a turn."
                           internal-time-units-per-second)
                        5)
                     "and it yields promptly"))
-              (is-true (bl.net::connection-connected server)
+              (is-true (bl.net:connection-connected server)
                        "sending decoys is legal — the peer keeps its connection")))))))

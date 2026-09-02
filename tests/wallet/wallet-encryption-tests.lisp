@@ -587,7 +587,7 @@ path that gives a real erasure guarantee."
         ;; cleared again once the descriptors exist.
         (is (not (bl.wallet::wallet-flag-set-p
                   wallet bl.wallet::+wallet-flag-blank-wallet+)))
-        (is (eq bl.rpc::+json-false+
+        (is (eq bl.rpc:+json-false+
                 (%aval "blank" (bl.wallet::rpc-getwalletinfo node '()))))
         ;; It is a working wallet: it hands out addresses and unlocks.
         (is (stringp (bl.wallet::rpc-getnewaddress node '())))
@@ -688,9 +688,9 @@ it is unlocked."
                                 node (list (list (%ht "desc" "x" "timestamp" 0))))))))
         ;; The exact Core message.
         (handler-case (bl.wallet::rpc-keypoolrefill node '(10))
-          (bl.rpc::rpc-error (e)
+          (bl.rpc:rpc-error (e)
             (is (equal "Error: Please enter the wallet passphrase with walletpassphrase first."
-                       (bl.rpc::rpc-error-message e)))))
+                       (bl.rpc:rpc-error-message e)))))
         ;; The public form of listdescriptors keeps working while locked.
         (is (%aval "descriptors" (bl.wallet::rpc-listdescriptors node '())))
         (bl.wallet::rpc-walletpassphrase node '("hunter2" 600))
@@ -809,7 +809,7 @@ string. wallet-add-descriptor re-parses the public form to close that."
       (let ((wallet (gethash "imp" (bl.wallet::wallet-manager-wallets
                                     (%node-manager node))))
             (private-desc
-              (bl.rpc::descriptor-add-checksum
+              (bl.rpc:descriptor-add-checksum
                "wpkh(tprv8ZgxMBicQKsPeZRHk4rTG6orPS2CRNFX3njhUXx5vj9qGog5ZMH4uGReDWN5kCkY3jmWEtWause41CDvBRXD1shKknAMKxT99o9qUTRVC6m/0h/0h/*)")))
         (bl.wallet::rpc-importdescriptors
          node (list (list (%ht "desc" private-desc "timestamp" 0 "active" nil))))
@@ -820,8 +820,8 @@ string. wallet-add-descriptor re-parses the public form to close that."
           ;; The key landed in the keystore...
           (is (bl.wallet::spkm-have-private-keys-p spkm))
           ;; ...and NOT in the descriptor object.
-          (is (notany #'bl.rpc::desc-key-ext-privkey
-                      (bl.rpc::out-desc-ordered-keys
+          (is (notany #'bl.rpc:desc-key-ext-privkey
+                      (bl.rpc:out-desc-ordered-keys
                        (bl.wallet::desc-spkm-desc spkm))))
           ;; The stored string is the public form, as before.
           (is (search "tpub" (bl.wallet::desc-spkm-desc-string spkm)))
@@ -829,23 +829,23 @@ string. wallet-add-descriptor re-parses the public form to close that."
           ;; Unlocked, the provider still resolves the key: the descriptor
           ;; remains usable, it just goes through the keystore now.
           (let ((provider (bl.wallet::spkm-privkey-provider wallet spkm)))
-            (is (not (null (bl.rpc::%desc-key-root-xprv
-                            (first (bl.rpc::out-desc-ordered-keys
+            (is (not (null (bl.rpc:desc-key-root-xprv
+                            (first (bl.rpc:out-desc-ordered-keys
                                     (bl.wallet::desc-spkm-desc spkm)))
                             provider)))))
           ;; Encrypt, lock — now nothing can produce the key.
           (bl.wallet::rpc-encryptwallet node '("hunter2"))
           (is (bl.wallet::wallet-is-locked-p wallet))
           (let ((provider (bl.wallet::spkm-privkey-provider wallet spkm)))
-            (is (null (bl.rpc::%desc-key-root-xprv
-                       (first (bl.rpc::out-desc-ordered-keys
+            (is (null (bl.rpc:desc-key-root-xprv
+                       (first (bl.rpc:out-desc-ordered-keys
                                (bl.wallet::desc-spkm-desc spkm)))
                        provider))))
           ;; And it comes back once unlocked.
           (bl.wallet::rpc-walletpassphrase node '("hunter2" 600))
           (let ((provider (bl.wallet::spkm-privkey-provider wallet spkm)))
-            (is (not (null (bl.rpc::%desc-key-root-xprv
-                            (first (bl.rpc::out-desc-ordered-keys
+            (is (not (null (bl.rpc:desc-key-root-xprv
+                            (first (bl.rpc:out-desc-ordered-keys
                                     (bl.wallet::desc-spkm-desc spkm)))
                             provider))))))))))
 

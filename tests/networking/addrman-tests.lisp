@@ -61,8 +61,8 @@
   (let ((book (%ab)))
     (is-true (bl.net:address-book-add book (%pa 1 2 3 4)))
     (is (= 1 (bl.net:address-book-count book)))
-    (is (= 1 (bl.net::address-book-n-new book)))
-    (is (= 0 (bl.net::address-book-n-tried book)))
+    (is (= 1 (bl.net:address-book-n-new book)))
+    (is (= 0 (bl.net:address-book-n-tried book)))
     (let ((pa (bl.net:address-book-lookup book (%ip 1 2 3 4) 8333)))
       (is (not (null pa)))
       (is (= 1 (bl.net:peer-address-ref-count pa)))
@@ -80,8 +80,8 @@
   (let ((book (%ab)))
     (bl.net:address-book-add book (%pa 1 2 3 4))
     (is-true (bl.net:address-book-good book (%ip 1 2 3 4) 8333))
-    (is (= 0 (bl.net::address-book-n-new book)))
-    (is (= 1 (bl.net::address-book-n-tried book)))
+    (is (= 0 (bl.net:address-book-n-new book)))
+    (is (= 1 (bl.net:address-book-n-tried book)))
     (is (= 1 (bl.net:address-book-count book)))
     (let ((pa (bl.net:address-book-lookup book (%ip 1 2 3 4) 8333)))
       (is-true (bl.net:peer-address-in-tried pa))
@@ -146,13 +146,13 @@
     (dotimes (i 3)
       (bl.net:address-book-add book (%pa 20 0 0 i))
       (bl.net:address-book-good book (%ip 20 0 0 i) 8333))
-    (let ((tried-before (bl.net::address-book-n-tried book))
+    (let ((tried-before (bl.net:address-book-n-tried book))
           (src (bl.net:net-group-key (%ip 7 7 7 7))))
       (is (> tried-before 0))
       (dotimes (i 400)
         (bl.net:address-book-add
          book (%pa (+ 100 (mod i 150)) (mod (floor i 150) 256) (mod i 251) (mod i 241)) src))
-      (is (= tried-before (bl.net::address-book-n-tried book))))))
+      (is (= tried-before (bl.net:address-book-n-tried book))))))
 
 ;;;; Network-typed records (BIP155 P1): keying, persistence v4, migration
 
@@ -232,7 +232,7 @@ challenger's peer-address, or NIL if none collided within LIMIT."
              (let ((ids (bl.net::address-book-tried-collisions book)))
                (when ids
                  (return (gethash (first ids)
-                                  (bl.net::address-book-info book))))))))
+                                  (bl.net:address-book-info book))))))))
 
 (test tried-collision-tests-the-incumbent-before-evicting
   "Core's test-before-evict (addrman.cpp:930-960, 975-1000). A queued tried
@@ -246,14 +246,14 @@ have not dialed lately."
     ;; select-tried-collision hands back the INCUMBENT holding the slot.
     (let ((incumbent (bl.net:select-tried-collision book)))
       (is-true incumbent)
-      (is-true (bl.net::peer-address-in-tried incumbent))
+      (is-true (bl.net:peer-address-in-tried incumbent))
       (is (not (eq incumbent challenger)))
       ;; (a) Incumbent connected recently -> challenger dropped, slot kept.
-      (setf (bl.net::peer-address-last-success incumbent) (%now))
+      (setf (bl.net:peer-address-last-success incumbent) (%now))
       (bl.net:resolve-tried-collisions book)
       (is (null (bl.net::address-book-tried-collisions book)))
-      (is-true (bl.net::peer-address-in-tried incumbent))
-      (is-false (bl.net::peer-address-in-tried challenger)))))
+      (is-true (bl.net:peer-address-in-tried incumbent))
+      (is-false (bl.net:peer-address-in-tried challenger)))))
 
 (test tried-collision-replaces-an-incumbent-that-failed-its-probe
   "The branch select-tried-collision exists to feed (addrman.cpp:941-950): the
@@ -267,13 +267,13 @@ the blind 40-minute timer."
           (now (%now)))
       (is-true incumbent)
       ;; Probed 2 minutes ago and never answered; last success is stale.
-      (setf (bl.net::peer-address-last-success incumbent)
+      (setf (bl.net:peer-address-last-success incumbent)
             (- now (* 5 60 60))
-            (bl.net::peer-address-last-attempt incumbent)
+            (bl.net:peer-address-last-attempt incumbent)
             (- now 120))
       (bl.net:resolve-tried-collisions book)
       (is (null (bl.net::address-book-tried-collisions book)))
-      (is-true (bl.net::peer-address-in-tried challenger)
+      (is-true (bl.net:peer-address-in-tried challenger)
                "challenger promoted after the incumbent failed its probe"))))
 
 (test tried-collision-waits-out-a-fresh-probe
@@ -285,16 +285,16 @@ before the challenger may replace it (addrman.cpp:946)."
     (let ((incumbent (bl.net:select-tried-collision book))
           (now (%now)))
       (is-true incumbent)
-      (setf (bl.net::peer-address-last-success incumbent)
+      (setf (bl.net:peer-address-last-success incumbent)
             (- now (* 5 60 60))
-            (bl.net::peer-address-last-attempt incumbent)
+            (bl.net:peer-address-last-attempt incumbent)
             (- now 5)
             ;; Not yet old enough for the untestable fallback either.
-            (bl.net::peer-address-last-success challenger) now)
+            (bl.net:peer-address-last-success challenger) now)
       (bl.net:resolve-tried-collisions book)
       (is-true (bl.net::address-book-tried-collisions book)
                "collision still queued while the probe is in flight")
-      (is-false (bl.net::peer-address-in-tried challenger)))))
+      (is-false (bl.net:peer-address-in-tried challenger)))))
 
 (test peers-dat-v4-roundtrip-all-nets
   "Save/load the v4 network-typed format: IPv4, IPv6, TORv3 (tried), I2P and
@@ -327,7 +327,7 @@ CJDNS records all survive with their networks, bytes, ports and stats."
            (let ((book2 (bl.net:make-address-book)))
              (is (eq t (bl.net:load-address-book book2 path)))
              (is (= 5 (bl.net:address-book-count book2)))
-             (is (= 1 (bl.net::address-book-n-tried book2)))
+             (is (= 1 (bl.net:address-book-n-tried book2)))
              (let ((tor (bl.net:address-book-lookup book2 onion 8333 :torv3)))
                (is (not (null tor)))
                (is (eq :torv3 (bl.net:peer-address-network tor)))
@@ -359,7 +359,7 @@ form, and the next save rewrites it as v4 with everything intact."
            (let ((book (bl.net:make-address-book)))
              (is (eq t (bl.net:load-address-book book path)))
              (is (= 3 (bl.net:address-book-count book)))
-             (is (= 1 (bl.net::address-book-n-tried book)))
+             (is (= 1 (bl.net:address-book-n-tried book)))
              (let ((a (bl.net:address-book-lookup book (%ip 1 2 3 4) 8333)))
                (is (not (null a)))
                (is (eq :ipv4 (bl.net:peer-address-network a)))
@@ -383,7 +383,7 @@ form, and the next save rewrites it as v4 with everything intact."
              (let ((book2 (bl.net:make-address-book)))
                (is (eq t (bl.net:load-address-book book2 path)))
                (is (= 3 (bl.net:address-book-count book2)))
-               (is (= 1 (bl.net::address-book-n-tried book2))))))
+               (is (= 1 (bl.net:address-book-n-tried book2))))))
       (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
 
 (test get-addr-includes-typed-records

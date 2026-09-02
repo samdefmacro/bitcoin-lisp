@@ -1177,7 +1177,7 @@ the limit is checked after every push, not only after non-push opcodes."
   "A tapscript leaving more than one element fails :cleanstack even with a
 truthy top (OP_1 OP_1 -> [1,1])."
   (multiple-value-bind (ok err)
-      (bl.interop::run-tapscript
+      (bl.interop:run-tapscript
        (coerce #(#x51 #x51) 'vector) '()
        (make-array 32 :initial-element 0) 100000
        (make-array 32 :initial-element 2))
@@ -1187,7 +1187,7 @@ truthy top (OP_1 OP_1 -> [1,1])."
 (test run-tapscript-single-element-ok
   "A tapscript leaving exactly one truthy element succeeds (OP_1)."
   (multiple-value-bind (ok err)
-      (bl.interop::run-tapscript
+      (bl.interop:run-tapscript
        (coerce #(#x51) 'vector) '()
        (make-array 32 :initial-element 0) 100000
        (make-array 32 :initial-element 2))
@@ -1200,18 +1200,18 @@ truthy top (OP_1 OP_1 -> [1,1])."
 (test parse-control-block-size-bounds
   "Length must be 33 + 32*m with m in 0..128; outside that returns NIL."
   ;; valid: m=0 (33), m=1 (65), m=128 (4129)
-  (is-true (bl.interop::parse-control-block
+  (is-true (bl.interop:parse-control-block
             (make-array 33 :initial-element #xc0)))
-  (is-true (bl.interop::parse-control-block
+  (is-true (bl.interop:parse-control-block
             (make-array 65 :initial-element #xc0)))
-  (is-true (bl.interop::parse-control-block
+  (is-true (bl.interop:parse-control-block
             (make-array (+ 33 (* 32 128)) :initial-element #xc0)))
   ;; invalid: too short, wrong modulus, and one node too many (m=129)
-  (is-false (bl.interop::parse-control-block
+  (is-false (bl.interop:parse-control-block
              (make-array 32 :initial-element #xc0)))
-  (is-false (bl.interop::parse-control-block
+  (is-false (bl.interop:parse-control-block
              (make-array 34 :initial-element #xc0)))
-  (is-false (bl.interop::parse-control-block
+  (is-false (bl.interop:parse-control-block
              (make-array (+ 33 (* 32 129)) :initial-element #xc0))))
 
 ;;;; CHECKMULTISIG consensus-parity regressions (vs Bitcoin Core interpreter.cpp)
@@ -1249,14 +1249,14 @@ real signature is provided (interpreter.cpp:1161)."
                      (setf (aref pk 0) #x02) pk)))
       ;; empty sig + malformed pubkey -> :pubkeytype
       (multiple-value-bind (ok err)
-          (bl.interop::verify-checkmultisig
+          (bl.interop:verify-checkmultisig
            (list empty-sig) (list bad-pk)
            (make-array 0 :element-type '(unsigned-byte 8)))
         (is-false ok)
         (is (eq err :pubkeytype)))
       ;; empty sig + well-formed pubkey -> no encoding error (just fails to match)
       (multiple-value-bind (ok err)
-          (bl.interop::verify-checkmultisig
+          (bl.interop:verify-checkmultisig
            (list empty-sig) (list good-pk)
            (make-array 0 :element-type '(unsigned-byte 8)))
         (is-false ok)

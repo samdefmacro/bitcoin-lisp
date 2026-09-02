@@ -150,32 +150,32 @@ chainstate saved as :unvalidated loads back with the :validated default."
 (test node-chainstates-compat-accessors
   "The node's chain-state / utxo-set compatibility accessors read and write
 the current chainstate in the chainstates list."
-  (let ((node (bl::make-node :network :regtest))
+  (let ((node (bl:make-node :network :regtest))
         (cs (bl.store:make-chain-state))
         (view (bl.store:make-utxo-set)))
-    (is (null (bl::node-chain-state node)))
-    (is (null (bl::node-utxo-set node)))
-    (setf (bl::node-chain-state node) cs
-          (bl::node-utxo-set node) view)
-    (is (equal (list cs) (bl::node-chainstates node)))
-    (is (eq cs (bl::node-chain-state node)))
-    (is (eq cs (bl::node-current-chainstate node)))
-    (is (eq cs (bl::node-validated-chainstate node)))
-    (is (null (bl::node-historical-chainstate node)))
+    (is (null (bl:node-chain-state node)))
+    (is (null (bl:node-utxo-set node)))
+    (setf (bl:node-chain-state node) cs
+          (bl:node-utxo-set node) view)
+    (is (equal (list cs) (bl:node-chainstates node)))
+    (is (eq cs (bl:node-chain-state node)))
+    (is (eq cs (bl:node-current-chainstate node)))
+    (is (eq cs (bl:node-validated-chainstate node)))
+    (is (null (bl:node-historical-chainstate node)))
     ;; The view lives in the chainstate now.
     (is (eq view (bl.store:chain-state-coins-view cs)))
-    (is (eq view (bl::node-utxo-set node)))))
+    (is (eq view (bl:node-utxo-set node)))))
 
 (test node-chain-state-replacement-keeps-view
   "Replacing the node's chain-state (the former independent slot) does not
 clobber a previously-installed coins view — matching the old two-slot
 semantics."
-  (let ((node (bl::make-node :network :regtest))
+  (let ((node (bl:make-node :network :regtest))
         (cs1 (bl.store:make-chain-state))
         (cs2 (bl.store:make-chain-state))
         (view (bl.store:make-utxo-set)))
-    (setf (bl::node-chain-state node) cs1
-          (bl::node-utxo-set node) view)
-    (setf (bl::node-chain-state node) cs2)
-    (is (equal (list cs2) (bl::node-chainstates node)))
-    (is (eq view (bl::node-utxo-set node)))))
+    (setf (bl:node-chain-state node) cs1
+          (bl:node-utxo-set node) view)
+    (setf (bl:node-chain-state node) cs2)
+    (is (equal (list cs2) (bl:node-chainstates node)))
+    (is (eq view (bl:node-utxo-set node)))))

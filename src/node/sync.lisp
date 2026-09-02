@@ -56,7 +56,7 @@ phase exits quickly when there's nothing new to fetch."
       (log-debug "Sync cycle: local height ~D, peer-start height ~D"
                  (bl.store:current-height chainstate)
                  peer-height)
-      (bl.net::start-ibd
+      (bl.net:start-ibd
        (node-peers node)
        (node->context node chainstate)
        peer-height))))

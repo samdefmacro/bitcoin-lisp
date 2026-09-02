@@ -121,7 +121,7 @@ a legal character and the parser sees genuinely arbitrary text."
                           (progn (bl.crypto:bech32-decode s)
                                  (bl.crypto:base58-decode s)
                                  (bl.crypto:decode-address s :mainnet)
-                                 (ignore-errors (bl.rpc::parse-descriptor s :mainnet))
+                                 (ignore-errors (bl.rpc:parse-descriptor s :mainnet))
                                  nil)
                         (error () nil)
                         (serious-condition (c) c))))
@@ -261,7 +261,7 @@ handler written for the latter."
     (dotimes (i 1500)
       (let* ((s (map 'string #'code-char (%fuzz-bytes 96)))
              (caught (handler-case
-                         (progn (bl.rpc::parse-descriptor s :mainnet) nil)
+                         (progn (bl.rpc:parse-descriptor s :mainnet) nil)
                        (error () nil)
                        (serious-condition (c) c))))
         (when caught (push (list i s (type-of caught)) bad))))
@@ -275,7 +275,7 @@ handler written for the latter."
                              "1"
                              (make-string depth :initial-element #\))))
              (caught (handler-case
-                         (progn (bl.rpc::parse-descriptor s :mainnet) nil)
+                         (progn (bl.rpc:parse-descriptor s :mainnet) nil)
                        (error () nil)
                        (serious-condition (c) c))))
         (when caught (push (list :nesting depth (type-of caught)) bad))))

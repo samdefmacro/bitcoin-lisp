@@ -134,7 +134,7 @@ nobody can confirm look perfect for lack of evidence."
   "Run BLOCKS blocks. Each block, PER-BLOCK transactions at FAST-FEERATE enter
 and confirm in the next block, and PER-BLOCK at SLOW-FEERATE enter. CONFIRM-SLOW
 decides whether the cheap ones also confirm or sit unconfirmed forever."
-  (let ((e (bl.mp::make-block-policy-estimator)))
+  (let ((e (bl.mp:make-block-policy-estimator)))
     (loop for h from 1 to blocks
           do (let ((confirmed '()))
                (dotimes (i per-block)
@@ -156,9 +156,9 @@ plentiful but useless, which is exactly the case a block-percentile heuristic
 gets wrong."
   (let ((e (%bpe-simulate)))
     (is (= 61 (bl.mp::block-policy-estimator-best-height e)))
-    (is (= 20000 (bl.mp::bpe-estimate-smart-fee e 2)))
-    (is (= 20000 (bl.mp::bpe-estimate-smart-fee e 6)))
-    (is (= 20000 (bl.mp::bpe-estimate-smart-fee e 6 :conservative t)))
+    (is (= 20000 (bl.mp:bpe-estimate-smart-fee e 2)))
+    (is (= 20000 (bl.mp:bpe-estimate-smart-fee e 6)))
+    (is (= 20000 (bl.mp:bpe-estimate-smart-fee e 6 :conservative t)))
     ;; The unconfirmed cheap transactions are still tracked, still counting
     ;; against their bucket's success rate.
     (is (plusp (hash-table-count
@@ -170,16 +170,16 @@ difference being that the cheap population CONFIRMS. The estimate must fall to
 it — otherwise the previous test would pass on an estimator that simply always
 returns the most expensive bucket."
   (let ((e (%bpe-simulate :confirm-slow t)))
-    (is (= 800 (bl.mp::bpe-estimate-smart-fee e 6)))))
+    (is (= 800 (bl.mp:bpe-estimate-smart-fee e 6)))))
 
 (test estimator-refuses-targets-it-cannot-support
   "Targets outside the tracked range, and a history too short to justify one,
 both return 0 rather than a fabricated number."
-  (let ((fresh (bl.mp::make-block-policy-estimator)))
-    (is (= 0 (bl.mp::bpe-estimate-smart-fee fresh 0)))
-    (is (= 0 (bl.mp::bpe-estimate-smart-fee fresh 6)))
+  (let ((fresh (bl.mp:make-block-policy-estimator)))
+    (is (= 0 (bl.mp:bpe-estimate-smart-fee fresh 0)))
+    (is (= 0 (bl.mp:bpe-estimate-smart-fee fresh 6)))
     ;; Beyond the longest horizon.
-    (is (= 0 (bl.mp::bpe-estimate-smart-fee fresh 100000))))
+    (is (= 0 (bl.mp:bpe-estimate-smart-fee fresh 100000))))
   ;; A short run cannot justify a distant target: MaxUsableEstimate halves the
   ;; observed block span. Ten simulated blocks record from height 2 (the first
   ;; block that confirmed anything) to height 11, a span of 9, so targets are
@@ -190,7 +190,7 @@ both return 0 rather than a fabricated number."
     (is (= 4 (bl.mp::bpe-max-usable-estimate short-run))))
   ;; An estimator that has seen blocks but never counted a transaction has no
   ;; span at all — the clock starts on DATA, not on blocks.
-  (let ((empty (bl.mp::make-block-policy-estimator)))
+  (let ((empty (bl.mp:make-block-policy-estimator)))
     (bl.mp::bpe-process-block empty 100 (list))
     (bl.mp::bpe-process-block empty 200 (list))
     (is (= 0 (bl.mp::block-policy-estimator-first-recorded-height empty)))
@@ -200,7 +200,7 @@ both return 0 rather than a fabricated number."
   "processBlock must untrack what it confirms; otherwise every confirmed
 transaction would go on counting as 'still in the mempool' against its own
 bucket forever."
-  (let ((e (bl.mp::make-block-policy-estimator))
+  (let ((e (bl.mp:make-block-policy-estimator))
         (txid (%bpe-id 9 9 9)))
     (bl.mp::bpe-process-transaction e txid 1 5000d0)
     (is (= 1 (hash-table-count
@@ -258,16 +258,16 @@ the confirmation was recorded — silently discarding the data point."
     ;; Evicted for size: untracked, and a failure is recorded.
     (bl.mp:accept-validated-tx mempool txid tx 5000 200)
     (setf (bl.mp::block-policy-estimator-best-height est) 260)
-    (let ((bl.mp::*mempool-removal-reason* :size-limit))
-      (bl.mp::mempool-remove mempool txid))
+    (let ((bl.mp:*mempool-removal-reason* :size-limit))
+      (bl.mp:mempool-remove mempool txid))
     (is (= 0 (hash-table-count tracked)))
     ;; Removed BY A BLOCK: the removal path leaves it alone.
     (let ((tx2 (make-mempool-test-tx :input-id 122)))
       (let ((txid2 (bl.ser:transaction-hash tx2)))
         (bl.mp:accept-validated-tx mempool txid2 tx2 5000 200)
         (is (= 1 (hash-table-count tracked)))
-        (let ((bl.mp::*mempool-removal-reason* :block))
-          (bl.mp::mempool-remove mempool txid2))
+        (let ((bl.mp:*mempool-removal-reason* :block))
+          (bl.mp:mempool-remove mempool txid2))
         (is (= 1 (hash-table-count tracked))
             "a block removal must leave the estimator's tracking to the block hook")))))
 
@@ -305,11 +305,11 @@ transactions are still tracked. Drives the real connect-block."
 
 (defun %bpe-bytes (est)
   (flexi-streams:with-output-to-sequence (mem)
-    (bl.mp::bpe-write-to-stream est mem)))
+    (bl.mp:bpe-write-to-stream est mem)))
 
 (defun %bpe-load-bytes (est bytes)
   (flexi-streams:with-input-from-sequence (in bytes)
-    (bl.mp::bpe-read-into est in)))
+    (bl.mp:bpe-read-into est in)))
 
 (test estimator-survives-a-save-load-round-trip
   "Without persistence the estimator answers 0 for hours after every restart,
@@ -317,11 +317,11 @@ because MaxUsableEstimate has to re-accumulate a block span. The restored
 estimator must give the same answer as the one that was saved."
   (let* ((original (%bpe-populated))
          (bytes (%bpe-bytes original))
-         (restored (bl.mp::make-block-policy-estimator)))
+         (restored (bl.mp:make-block-policy-estimator)))
     (is-true (%bpe-load-bytes restored bytes))
-    (is (= (bl.mp::bpe-estimate-smart-fee original 6)
-           (bl.mp::bpe-estimate-smart-fee restored 6)))
-    (is (plusp (bl.mp::bpe-estimate-smart-fee restored 6))
+    (is (= (bl.mp:bpe-estimate-smart-fee original 6)
+           (bl.mp:bpe-estimate-smart-fee restored 6)))
+    (is (plusp (bl.mp:bpe-estimate-smart-fee restored 6))
         "the round trip must preserve an ANSWER, not agree on zero")
     (is (= (bl.mp::block-policy-estimator-best-height original)
            (bl.mp::block-policy-estimator-best-height restored)))
@@ -338,25 +338,25 @@ answer confidently from nonsense, and fee estimates are spent money."
   (let* ((bytes (%bpe-bytes (%bpe-populated)))
          (truncated (subseq bytes 0 (floor (length bytes) 2)))
          (victim (%bpe-simulate :blocks 40 :fast-feerate 7000d0))
-         (before (bl.mp::bpe-estimate-smart-fee victim 6)))
+         (before (bl.mp:bpe-estimate-smart-fee victim 6)))
     (is (plusp before))
     ;; A truncated file is rejected...
     (is (null (%bpe-load-bytes victim truncated)))
     ;; ...and the estimator is exactly as it was.
-    (is (= before (bl.mp::bpe-estimate-smart-fee victim 6))
+    (is (= before (bl.mp:bpe-estimate-smart-fee victim 6))
         "a rejected file must leave the existing estimator untouched")
     ;; Garbage in the middle is rejected too.
     (let ((mangled (copy-seq bytes)))
       (loop for i from 40 below 200 do (setf (aref mangled i) #xFF))
       (is (null (%bpe-load-bytes victim mangled)))
-      (is (= before (bl.mp::bpe-estimate-smart-fee victim 6))))))
+      (is (= before (bl.mp:bpe-estimate-smart-fee victim 6))))))
 
 (test estimator-rejects-a-file-written-for-a-different-bucket-set
   "Per-bucket counts only mean anything against the bucket set they were
 recorded in. A file whose buckets differ must be DISCARDED, never remapped —
 silently reinterpreting them would make every count mean something else."
   (let* ((bytes (%bpe-bytes (%bpe-populated)))
-         (est (bl.mp::make-block-policy-estimator)))
+         (est (bl.mp:make-block-policy-estimator)))
     ;; The bucket vector starts after best-height + the two range words (12
     ;; bytes) and a 4-byte count; corrupt its first entry.
     (let ((mangled (copy-seq bytes)))
@@ -369,7 +369,7 @@ non-zero scale. Both are load-bearing — a decay of 1 never forgets and a decay
 of 0 forgets everything, and EstimateMedianVal divides by (1 - decay)."
   (let* ((est (%bpe-populated))
          (bytes (%bpe-bytes est))
-         (target (bl.mp::make-block-policy-estimator))
+         (target (bl.mp:make-block-policy-estimator))
          ;; The first horizon's decay sits right after the bucket vector.
          (offset (+ 4 4 4 4 (* 8 (length (bl.mp::make-fee-buckets))))))
     ;; decay = 1.0 exactly -> rejected
@@ -414,19 +414,19 @@ its own unit tests."
   (let* ((dir (%fee-stats-fixture "seam"))
          (legacy (bl.mp:make-fee-estimator :data-directory dir)))
     (let ((bl.mp:*block-policy-estimator* (%bpe-populated)))
-      (let ((expected (bl.mp::bpe-estimate-smart-fee
+      (let ((expected (bl.mp:bpe-estimate-smart-fee
                        bl.mp:*block-policy-estimator* 6)))
         (is (plusp expected))
         (bl.mp:save-fee-stats legacy)
         ;; A fresh process: new estimator, new legacy history.
         (let ((bl.mp:*block-policy-estimator*
-                (bl.mp::make-block-policy-estimator))
+                (bl.mp:make-block-policy-estimator))
               (legacy2 (bl.mp:make-fee-estimator :data-directory dir)))
-          (is (= 0 (bl.mp::bpe-estimate-smart-fee
+          (is (= 0 (bl.mp:bpe-estimate-smart-fee
                     bl.mp:*block-policy-estimator* 6))
               "a fresh estimator answers 0 before loading")
           (is-true (bl.mp:load-fee-stats legacy2))
-          (is (= expected (bl.mp::bpe-estimate-smart-fee
+          (is (= expected (bl.mp:bpe-estimate-smart-fee
                            bl.mp:*block-policy-estimator* 6))
               "load-fee-stats must restore the policy estimator, not just the legacy history"))))))
 
@@ -442,29 +442,29 @@ them costs money on every transaction built from them."
     (is-true (probe-file path))
     ;; Fresh file: read.
     (let ((bl.mp:*block-policy-estimator*
-            (bl.mp::make-block-policy-estimator)))
+            (bl.mp:make-block-policy-estimator)))
       (is-true (bl.mp:load-fee-stats
                 (bl.mp:make-fee-estimator :data-directory dir))))
     ;; 61 hours old: refused outright, before anything is parsed.
     (%backdate-file path (* 61 60 60))
     (let ((bl.mp:*block-policy-estimator*
-            (bl.mp::make-block-policy-estimator)))
+            (bl.mp:make-block-policy-estimator)))
       (is (null (bl.mp:load-fee-stats
                  (bl.mp:make-fee-estimator :data-directory dir))))
-      (is (= 0 (bl.mp::bpe-estimate-smart-fee
+      (is (= 0 (bl.mp:bpe-estimate-smart-fee
                 bl.mp:*block-policy-estimator* 6))))
     ;; 59 hours old: still inside the window.
     (%backdate-file path (* 59 60 60))
     (let ((bl.mp:*block-policy-estimator*
-            (bl.mp::make-block-policy-estimator)))
+            (bl.mp:make-block-policy-estimator)))
       (is-true (bl.mp:load-fee-stats
                 (bl.mp:make-fee-estimator :data-directory dir))))
     ;; -acceptstalefeeestimates overrides it, as Core allows on regtest.
     (%backdate-file path (* 61 60 60))
     (let ((bl.mp:*block-policy-estimator*
-            (bl.mp::make-block-policy-estimator))
+            (bl.mp:make-block-policy-estimator))
           (bl.mp:*accept-stale-fee-estimates* t))
       (is-true (bl.mp:load-fee-stats
                 (bl.mp:make-fee-estimator :data-directory dir)))
-      (is (plusp (bl.mp::bpe-estimate-smart-fee
+      (is (plusp (bl.mp:bpe-estimate-smart-fee
                   bl.mp:*block-policy-estimator* 6))))))
