@@ -331,7 +331,20 @@ src/serialization/.")
    #:read-core-varint
    #:read-compressed-script
    #:read-compressed-tx-out
-   #:read-compressed-coin))
+   #:read-compressed-coin)
+  ;; Reached from another package with :: before the second-round review
+  ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
+  (:export
+   #:read-block-header
+   #:read-outpoint
+   #:read-tx-in
+   #:read-tx-out
+   #:transaction-cached-weight
+   #:version-message-addr-recv
+   #:version-message-nonce
+   #:version-message-timestamp
+   #:write-outpoint
+   #:write-tx-in))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

@@ -313,7 +313,7 @@ NET_ONION proxy and passes ToStringAddr()/GetPort() to ConnectThroughProxy
               (when conn
                 (is (equal +socks5-onion-target+
                            (bl.net:connection-host conn)))
-                (is (= 8333 (bl.net::connection-port conn)))
+                (is (= 8333 (bl.net:connection-port conn)))
                 (bl.net:close-connection conn))))
         (setf bl.net:*proxy* old-proxy
               bl.net:*onion-proxy* old-onion)))
@@ -362,19 +362,19 @@ of being resolved locally (Core net.cpp:2353-2358 AddAddrFetch)."
 (test conf-parse-proxy-forms
   "-proxy value parsing: default port 9050, explicit port, \"0\" clears,
 bracketed IPv6."
-  (multiple-value-bind (host port) (bl::conf-parse-proxy "127.0.0.1")
+  (multiple-value-bind (host port) (bl.cfg:conf-parse-proxy "127.0.0.1")
     (is (equal "127.0.0.1" host))
     (is (= 9050 port)))
   (multiple-value-bind (host port)
-      (bl::conf-parse-proxy "127.0.0.1:9150")
+      (bl.cfg:conf-parse-proxy "127.0.0.1:9150")
     (is (equal "127.0.0.1" host))
     (is (= 9150 port)))
-  (is (null (bl::conf-parse-proxy "0")))
-  (is (null (bl::conf-parse-proxy "")))
-  (multiple-value-bind (host port) (bl::conf-parse-proxy "[::1]:9150")
+  (is (null (bl.cfg:conf-parse-proxy "0")))
+  (is (null (bl.cfg:conf-parse-proxy "")))
+  (multiple-value-bind (host port) (bl.cfg:conf-parse-proxy "[::1]:9150")
     (is (equal "::1" host))
     (is (= 9150 port)))
-  (multiple-value-bind (host port) (bl::conf-parse-proxy "[::1]")
+  (multiple-value-bind (host port) (bl.cfg:conf-parse-proxy "[::1]")
     (is (equal "::1" host))
     (is (= 9050 port))))
 
@@ -417,7 +417,7 @@ to -proxy."
                        bl.net:*onion-proxy*)))
           ;; -noproxy parses as proxy=0 and clears the proxy.
           (bl::apply-config-globals
-           (bl::parse-cli-args '("-noproxy")))
+           (bl.cfg:parse-cli-args '("-noproxy")))
           (is (null bl.net:*proxy*)))
       (setf bl.net:*proxy* old-proxy
             bl.net:*onion-proxy* old-onion))))
@@ -447,7 +447,7 @@ dial is refused."
             (is (stringp refusal)))
           ;; -noonion parses to onion=0 and behaves identically.
           (bl::apply-config-globals
-           (append (bl::parse-cli-args '("-noonion"))
+           (append (bl.cfg:parse-cli-args '("-noonion"))
                    '(("proxy" . "127.0.0.1:9150"))))
           (is (null bl.net:*onion-proxy*))
           ;; And plain -proxy (no -onion) re-enables: torv3 dialable again.
@@ -473,12 +473,12 @@ any private network.
 
 Hostnames keep the proxy on purpose — Core routes name lookups through it
 precisely so the name does not leak to local DNS."
-  (let ((bl.net::*proxy*
-          (bl.net::make-proxy :host "127.0.0.1" :port 1)))
+  (let ((bl.net:*proxy*
+          (bl.net:make-proxy :host "127.0.0.1" :port 1)))
     (dolist (direct '("127.0.0.1" "127.5.5.5" "10.0.0.1" "172.16.0.1"
                       "192.168.1.5" "169.254.1.1" "100.64.0.1" "::1"
                       "fe80::1"))
-      (is (null (bl.net::proxy-for-target direct))
+      (is (null (bl.net:proxy-for-target direct))
           "~A was dialed through the proxy" direct))
     ;; Documentation space (203.0.113/24) stays PROXIED here, unlike in Core:
     ;; this tree treats it as routable on purpose so fixtures can use it as a
@@ -488,13 +488,13 @@ precisely so the name does not leak to local DNS."
     ;; an unsuffixed -proxy covers it. A bare host string carries no tag.
     (dolist (proxied '("8.8.8.8" "1.1.1.1" "2001:db8::1" "example.com"
                        "203.0.113.7" "fc00:1:2:3:4:5:6:7"))
-      (is (not (null (bl.net::proxy-for-target proxied)))
+      (is (not (null (bl.net:proxy-for-target proxied)))
           "~A skipped the proxy" proxied))
     ;; The positive control: with no proxy configured, everything is direct,
     ;; so a test that only asserted NIL above would pass against a broken
     ;; classifier.
-    (let ((bl.net::*proxy* nil))
-      (is (null (bl.net::proxy-for-target "8.8.8.8"))))))
+    (let ((bl.net:*proxy* nil))
+      (is (null (bl.net:proxy-for-target "8.8.8.8"))))))
 
 (test proxy-soft-defaults-listen-off
   "-proxy soft-sets listen off (Core init.cpp:786-790), but an explicit

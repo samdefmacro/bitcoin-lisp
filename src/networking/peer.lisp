@@ -441,10 +441,10 @@ a later-loaded file, so a direct call would be a forward reference.")
   (setf (peer-headers-sync peer) nil)
   ;; Drop this peer's orphan ANNOUNCEMENTS (DoS hygiene). Orphans other
   ;; peers also announced survive (Core TxOrphanage::EraseForPeer).
-  (let ((node bl::*node*))
-    (when (and node (bl::node-mempool node))
+  (let ((node bl:*node*))
+    (when (and node (bl:node-mempool node))
       (bl.mp:orphan-erase-for-peer
-       (bl.mp:mempool-orphan-pool (bl::node-mempool node))
+       (bl.mp:mempool-orphan-pool (bl:node-mempool node))
        peer)))
   ;; Tx-request tracker cleanup (Core TxDownloadManagerImpl::DisconnectedPeer):
   ;; forget the peer's announcements; its in-flight requests become
@@ -898,11 +898,11 @@ runs, blocks below the snapshot base are not yet locally available, so the
 node runs as NODE_NETWORK_LIMITED until it completes). BIP 324 adds
 NODE_P2P_V2 when the v2 transport is available; BIP 157 adds
 NODE_COMPACT_FILTERS when filter serving is enabled."
-  (let ((node bl::*node*))
+  (let ((node bl:*node*))
     (logior bl.ser:+node-network-limited+
             bl.ser:+node-witness+
             (if (or (bl:pruning-enabled-p)
-                    (and node (bl::node-historical-chainstate node)))
+                    (and node (bl:node-historical-chainstate node)))
                 0
                 bl.ser:+node-network+)
             (if (v2-available-p)
@@ -990,7 +990,7 @@ guesses a 64-bit CSPRNG value."
   (let ((version (peer-version peer)))
     (and version
          (self-connection-nonce-p
-          (bl.ser::version-message-nonce version)))))
+          (bl.ser:version-message-nonce version)))))
 
 (defun %send-version-and-capabilities (peer)
   "Send our version message followed by the post-version capability messages
@@ -1004,10 +1004,10 @@ tx relay on those)."
          ;; pick us as a block-sync source; 0 only if the node isn't up yet.
          ;; The height is the CURRENT (active) chainstate's tip — never a
          ;; historical chainstate's.
-         (node bl::*node*)
+         (node bl:*node*)
          (start-height (if node
                            (bl.store:current-height
-                            (bl::node-current-chainstate node))
+                            (bl:node-current-chainstate node))
                            0))
          (version-payload (bl.ser:make-version-message-bytes
                            :services services
@@ -1078,7 +1078,7 @@ desirable set to limited peers, as in Core."
                 ;; m_time_offset, net_processing.cpp:3646); getpeerinfo
                 ;; "timeoffset".
                 (peer-time-offset peer)
-                (- (bl.ser::version-message-timestamp version-msg)
+                (- (bl.ser:version-message-timestamp version-msg)
                    (bl.ser:get-unix-time)))
           ;; Core's two VERSION-time disconnects (net_processing.cpp:3611-3627).
           ;; The services gate applies to automatic outbounds only — Core

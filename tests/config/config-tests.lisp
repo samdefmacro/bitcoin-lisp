@@ -19,46 +19,46 @@ config an operator could reasonably write: `server=true` opened a listener here
 and left it closed on Core.
 
 Only the empty string (a bare -flag) is true without being a number."
-  (is-true  (bl::conf-parse-bool "1"))
-  (is-true  (bl::conf-parse-bool ""))       ; bare -flag
-  (is-true  (bl::conf-parse-bool "42"))
-  (is-true  (bl::conf-parse-bool "-1"))     ; non-zero, so true
-  (is-true  (bl::conf-parse-bool "1abc"))   ; longest integer prefix
-  (is-false (bl::conf-parse-bool "0"))
-  (is-false (bl::conf-parse-bool "true"))
-  (is-false (bl::conf-parse-bool "YES"))
-  (is-false (bl::conf-parse-bool "on"))
-  (is-false (bl::conf-parse-bool "false"))
-  (is-false (bl::conf-parse-bool "no"))
-  (is-false (bl::conf-parse-bool "off")))
+  (is-true  (bl.cfg:conf-parse-bool "1"))
+  (is-true  (bl.cfg:conf-parse-bool ""))       ; bare -flag
+  (is-true  (bl.cfg:conf-parse-bool "42"))
+  (is-true  (bl.cfg:conf-parse-bool "-1"))     ; non-zero, so true
+  (is-true  (bl.cfg:conf-parse-bool "1abc"))   ; longest integer prefix
+  (is-false (bl.cfg:conf-parse-bool "0"))
+  (is-false (bl.cfg:conf-parse-bool "true"))
+  (is-false (bl.cfg:conf-parse-bool "YES"))
+  (is-false (bl.cfg:conf-parse-bool "on"))
+  (is-false (bl.cfg:conf-parse-bool "false"))
+  (is-false (bl.cfg:conf-parse-bool "no"))
+  (is-false (bl.cfg:conf-parse-bool "off")))
 
 (test locale-independent-atoi-matches-core
   "The integer reading the whole config system rests on (strencodings.h:118-143):
 C-locale atoi with the undefined behaviour removed."
-  (is (= 0   (bl::locale-independent-atoi "true")))
-  (is (= 1   (bl::locale-independent-atoi "1abc")))
-  (is (= -5  (bl::locale-independent-atoi "-5")))
-  (is (= 42  (bl::locale-independent-atoi "  42  ")))
-  (is (= 7   (bl::locale-independent-atoi "+7")))
-  (is (= 0   (bl::locale-independent-atoi "+-3")))  ; Core returns 0
-  (is (= 0   (bl::locale-independent-atoi "")))
-  (is (= 0   (bl::locale-independent-atoi "abc"))))
+  (is (= 0   (bl.cfg:locale-independent-atoi "true")))
+  (is (= 1   (bl.cfg:locale-independent-atoi "1abc")))
+  (is (= -5  (bl.cfg:locale-independent-atoi "-5")))
+  (is (= 42  (bl.cfg:locale-independent-atoi "  42  ")))
+  (is (= 7   (bl.cfg:locale-independent-atoi "+7")))
+  (is (= 0   (bl.cfg:locale-independent-atoi "+-3")))  ; Core returns 0
+  (is (= 0   (bl.cfg:locale-independent-atoi "")))
+  (is (= 0   (bl.cfg:locale-independent-atoi "abc"))))
 
 (test conf-parse-int-and-loglevel
-  (is (= 2000 (bl::conf-parse-int "2000")))
-  (is (= 550 (bl::conf-parse-int " 550 ")))
-  (signals error (bl::conf-parse-int "notanint"))
-  (is (eq :debug (bl::conf-parse-loglevel "debug")))
-  (is (eq :info (bl::conf-parse-loglevel "INFO")))
-  (is (eq :warn (bl::conf-parse-loglevel "warning")))
-  (is (eq :error (bl::conf-parse-loglevel "error")))
-  (signals error (bl::conf-parse-loglevel "verbose")))
+  (is (= 2000 (bl.cfg:conf-parse-int "2000")))
+  (is (= 550 (bl.cfg:conf-parse-int " 550 ")))
+  (signals error (bl.cfg:conf-parse-int "notanint"))
+  (is (eq :debug (bl.cfg:conf-parse-loglevel "debug")))
+  (is (eq :info (bl.cfg:conf-parse-loglevel "INFO")))
+  (is (eq :warn (bl.cfg:conf-parse-loglevel "warning")))
+  (is (eq :error (bl.cfg:conf-parse-loglevel "error")))
+  (signals error (bl.cfg:conf-parse-loglevel "verbose")))
 
 ;;; --- CLI parsing ------------------------------------------------------------
 
 (test parse-cli-args-forms
   "CLI accepts -key=value, --key=value, bare -key (=1), and -nokey (=0)."
-  (let ((a (bl::parse-cli-args
+  (let ((a (bl.cfg:parse-cli-args
             '("-txindex" "-dbcache=2000" "--rpcuser=bob" "-nolisten"
               "-chain=main" "notaflag" "-"))))
     (is (string= "1" (cfg "txindex" a)))
@@ -70,14 +70,14 @@ C-locale atoi with the undefined behaviour removed."
 
 (test parse-cli-args-value-with-equals
   "A value containing '=' is preserved after the first '='."
-  (let ((a (bl::parse-cli-args '("-rpcpassword=a=b=c"))))
+  (let ((a (bl.cfg:parse-cli-args '("-rpcpassword=a=b=c"))))
     (is (string= "a=b=c" (cfg "rpcpassword" a)))))
 
 ;;; --- bitcoin.conf parsing ---------------------------------------------------
 
 (test parse-bitcoin-conf-basic
   "Comments and blank lines are skipped; key=value pairs are trimmed."
-  (let ((a (bl::parse-bitcoin-conf
+  (let ((a (bl.cfg:parse-bitcoin-conf
             (format nil "# a comment~%~%txindex=1~%  dbcache = 500  ~%"))))
     (is (string= "1" (cfg "txindex" a)))
     (is (string= "500" (cfg "dbcache" a)))))
@@ -86,14 +86,14 @@ C-locale atoi with the undefined behaviour removed."
   "Section headers scope keys: only global + the matching network's section."
   (let ((text (format nil "txindex=1~%[main]~%rpcport=8888~%[test]~%rpcport=7777~%")))
     ;; Scoped to mainnet: global txindex + [main] rpcport, not [test].
-    (let ((a (bl::parse-bitcoin-conf text :mainnet)))
+    (let ((a (bl.cfg:parse-bitcoin-conf text :mainnet)))
       (is (string= "1" (cfg "txindex" a)))
       (is (string= "8888" (cfg "rpcport" a))))
     ;; Scoped to testnet3 ([test]): the [test] section's rpcport.
-    (let ((a (bl::parse-bitcoin-conf text :testnet3)))
+    (let ((a (bl.cfg:parse-bitcoin-conf text :testnet3)))
       (is (string= "7777" (cfg "rpcport" a))))
     ;; No network: sections ignored, both rpcports present (first wins on assoc).
-    (let ((a (bl::parse-bitcoin-conf text nil)))
+    (let ((a (bl.cfg:parse-bitcoin-conf text nil)))
       (is (string= "8888" (cfg "rpcport" a))))))
 
 (test the-network-section-outranks-the-global-area
@@ -103,10 +103,10 @@ ASSOC win, so the GLOBAL value beat the section — the reverse of Core, on ever
 key an operator had bothered to scope. Scoping a value is a statement that it
 should win; getting it backwards silently ignores the more specific setting."
   (let ((text (format nil "rpcport=7777~%[main]~%rpcport=8888~%")))
-    (is (string= "8888" (cfg "rpcport" (bl::parse-bitcoin-conf text :mainnet)))))
+    (is (string= "8888" (cfg "rpcport" (bl.cfg:parse-bitcoin-conf text :mainnet)))))
   ;; And a global key with no section counterpart still applies.
   (let ((text (format nil "txindex=1~%[main]~%rpcport=8888~%")))
-    (let ((a (bl::parse-bitcoin-conf text :mainnet)))
+    (let ((a (bl.cfg:parse-bitcoin-conf text :mainnet)))
       (is (string= "1" (cfg "txindex" a)))
       (is (string= "8888" (cfg "rpcport" a))))))
 
@@ -116,7 +116,7 @@ only skipped whole-line comments, so `datadir=/srv/btc  # mainnet` yielded a
 datadir whose literal name contained the comment — and, because a missing
 datadir was created rather than refused, that was a silent resync from genesis
 into a junk directory."
-  (let ((a (bl::parse-bitcoin-conf
+  (let ((a (bl.cfg:parse-bitcoin-conf
             (format nil "datadir=/srv/btc  # mainnet~%txindex=1 # on~%"))))
     (is (string= "/srv/btc" (cfg "datadir" a)))
     (is (string= "1" (cfg "txindex" a)))))
@@ -125,26 +125,26 @@ into a junk directory."
   "The one place Core will not silently strip: it cannot tell a comment from a
 password character, so it refuses the file (config.cpp:58-61). Stripping would
 silently shorten the password; keeping would silently include a comment."
-  (signals bl::config-parse-error
-    (bl::parse-bitcoin-conf (format nil "rpcpassword=abc#def~%"))))
+  (signals bl.cfg:config-parse-error
+    (bl.cfg:parse-bitcoin-conf (format nil "rpcpassword=abc#def~%"))))
 
 (test malformed-config-lines-are-refused-as-core-refuses-them
   "Core returns false from GetConfigOptions and the node does not start
 (config.cpp:52-72). A config this malformed half-applying is how an operator
 ends up running settings they did not write."
   ;; A leading dash: the CLI spelling, in a file.
-  (signals bl::config-parse-error
-    (bl::parse-bitcoin-conf (format nil "-txindex=1~%")))
+  (signals bl.cfg:config-parse-error
+    (bl.cfg:parse-bitcoin-conf (format nil "-txindex=1~%")))
   ;; A non-empty line with no '='.
-  (signals bl::config-parse-error
-    (bl::parse-bitcoin-conf (format nil "txindex~%")))
+  (signals bl.cfg:config-parse-error
+    (bl.cfg:parse-bitcoin-conf (format nil "txindex~%")))
   ;; Core adds a hint for the negated spelling; assert it reaches the operator.
-  (handler-case (bl::parse-bitcoin-conf (format nil "notxindex~%"))
-    (bl::config-parse-error (e)
+  (handler-case (bl.cfg:parse-bitcoin-conf (format nil "notxindex~%"))
+    (bl.cfg:config-parse-error (e)
       (is (search "notxindex=1"
-                  (bl::config-parse-error-message e))
+                  (bl.cfg:config-parse-error-message e))
           "the negated-option hint is missing from: ~A"
-          (bl::config-parse-error-message e)))))
+          (bl.cfg:config-parse-error-message e)))))
 
 (test a-network-selected-inside-the-config-file-still-scopes-its-own-section
   "The network was resolved from the CLI alone and the file was then parsed
@@ -168,16 +168,16 @@ and -chain. Can use at most one.\" (args.cpp:839-841). We resolved the conflict
 by a silent priority order, so `-chain=regtest` on the command line plus a stale
 `testnet=1` in bitcoin.conf started the node on PUBLIC TESTNET3 — a different
 network from either of the two the operator named."
-  (signals bl::config-parse-error
-    (bl::resolve-network-from-config
+  (signals bl.cfg:config-parse-error
+    (bl.cfg:resolve-network-from-config
      '(("chain" . "regtest") ("testnet" . "1"))))
-  (signals bl::config-parse-error
-    (bl::resolve-network-from-config '(("regtest" . "1") ("signet" . "1"))))
+  (signals bl.cfg:config-parse-error
+    (bl.cfg:resolve-network-from-config '(("regtest" . "1") ("signet" . "1"))))
   ;; A selector explicitly turned OFF is not a selector.
-  (is (eq :regtest (bl::resolve-network-from-config
+  (is (eq :regtest (bl.cfg:resolve-network-from-config
                     '(("regtest" . "1") ("testnet" . "0")))))
   ;; And one selector alone still works.
-  (is (eq :testnet4 (bl::resolve-network-from-config '(("testnet4" . "1"))))))
+  (is (eq :testnet4 (bl.cfg:resolve-network-from-config '(("testnet4" . "1"))))))
 
 (test includeconf-merges-a-split-configuration
   "-includeconf was unimplemented: a split configuration loaded with everything
@@ -214,13 +214,13 @@ global keys to the first file's last section."
 ;;; --- network resolution -----------------------------------------------------
 
 (test resolve-network-precedence
-  (is (eq :testnet3 (bl::resolve-network-from-config '())))          ; default
-  (is (eq :mainnet (bl::resolve-network-from-config '(("chain" . "main")))))
-  (is (eq :testnet4 (bl::resolve-network-from-config '(("testnet4" . "1")))))
-  (is (eq :signet (bl::resolve-network-from-config '(("signet" . "1")))))
+  (is (eq :testnet3 (bl.cfg:resolve-network-from-config '())))          ; default
+  (is (eq :mainnet (bl.cfg:resolve-network-from-config '(("chain" . "main")))))
+  (is (eq :testnet4 (bl.cfg:resolve-network-from-config '(("testnet4" . "1")))))
+  (is (eq :signet (bl.cfg:resolve-network-from-config '(("signet" . "1")))))
   ;; -regtest AND -chain together is now an error, not a silent priority —
   ;; asserted in CONFLICTING-CHAIN-SELECTORS-ARE-AN-ERROR-NOT-A-SILENT-PRIORITY.
-  (signals error (bl::resolve-network-from-config '(("chain" . "bogus")))))
+  (signals error (bl.cfg:resolve-network-from-config '(("chain" . "bogus")))))
 
 ;;; --- full plist assembly ----------------------------------------------------
 
@@ -266,10 +266,10 @@ keyword; absent from the plist when not given."
 
 (test cli-overrides-config-file
   "In the merged alist (CLI appended before file), assoc returns the CLI value."
-  (let* ((cli (bl::parse-cli-args '("-txindex=1")))
-         (conf (bl::parse-bitcoin-conf (format nil "txindex=0~%dbcache=300~%")))
+  (let* ((cli (bl.cfg:parse-cli-args '("-txindex=1")))
+         (conf (bl.cfg:parse-bitcoin-conf (format nil "txindex=0~%dbcache=300~%")))
          (merged (append cli conf)))
-    (is (eq t (bl::conf-parse-bool (cfg "txindex" merged))))   ; CLI 1 wins
+    (is (eq t (bl.cfg:conf-parse-bool (cfg "txindex" merged))))   ; CLI 1 wins
     (is (string= "300" (cfg "dbcache" merged)))))                        ; file-only key
 
 (test args-to-start-node-plist-end-to-end
@@ -303,17 +303,17 @@ DEFAULT_BLOCKSONLY = false: absent unless given; -noblocksonly negates)."
 (test config-apply-globals
   "apply-config-globals sets the process-global policy/consensus specials from a
 merged config alist (options with no start-node keyword)."
-  (let ((bl::*accept-datacarrier* t)
-        (bl::*max-datacarrier-bytes* 83)
-        (bl::*permit-bare-multisig* nil)
+  (let ((bl:*accept-datacarrier* t)
+        (bl:*max-datacarrier-bytes* 83)
+        (bl:*permit-bare-multisig* nil)
         (bl.val:*signet-challenge*
           bl.val:*default-signet-challenge*))
     (bl::apply-config-globals
      '(("datacarrier" . "0") ("datacarriersize" . "100000")
        ("permitbaremultisig" . "1") ("signetchallenge" . "5121ff")))
-    (is (eq nil bl::*accept-datacarrier*))
-    (is (= 100000 bl::*max-datacarrier-bytes*))
-    (is (eq t bl::*permit-bare-multisig*))
+    (is (eq nil bl:*accept-datacarrier*))
+    (is (= 100000 bl:*max-datacarrier-bytes*))
+    (is (eq t bl:*permit-bare-multisig*))
     (is (equalp (bl.crypto:hex-to-bytes "5121ff")
                 bl.val:*signet-challenge*))))
 
@@ -375,10 +375,10 @@ of the default set; -cjdnsreachable admits cjdns."
           bl.net:*onion-proxy* nil)
     ;; Repeatable -onlynet restricts the set.
     (bl::apply-config-globals
-     (bl::parse-cli-args '("-onlynet=ipv4" "-onlynet=ipv6")))
+     (bl.cfg:parse-cli-args '("-onlynet=ipv4" "-onlynet=ipv6")))
     (is (equal '(:ipv4 :ipv6) bl.net:*reachable-networks*))
     (bl::apply-config-globals
-     (bl::parse-cli-args '("-onlynet=ipv4")))
+     (bl.cfg:parse-cli-args '("-onlynet=ipv4")))
     (is (equal '(:ipv4) bl.net:*reachable-networks*))
     (is-false (bl.net:reachable-network-p :ipv6))
     ;; -cjdnsreachable admits cjdns to the default set.
@@ -387,7 +387,7 @@ of the default set; -cjdnsreachable admits cjdns."
     (is-true (bl.net:reachable-network-p :cjdns))
     ;; -onlynet=onion with a proxy works; onion-only set results.
     (bl::apply-config-globals
-     (append (bl::parse-cli-args '("-onlynet=onion"))
+     (append (bl.cfg:parse-cli-args '("-onlynet=onion"))
              '(("proxy" . "127.0.0.1:9050"))))
     (is (equal '(:torv3) bl.net:*reachable-networks*))
     (setf bl.net:*proxy* nil
@@ -434,15 +434,15 @@ tests cannot leak reachability or seed state into each other."
          (bl.net:*onion-proxy-explicit* nil)
          (bl.net:*proxy* nil)
          (bl.net:*onion-proxy* nil)
-         (bl::*dns-seed-enabled* t)
-         (bl::*fixed-seeds-enabled* t))
+         (bl:*dns-seed-enabled* t)
+         (bl:*fixed-seeds-enabled* t))
      ,@body))
 
 (defun %dnsseed-after (&rest cli)
   "Value of *dns-seed-enabled* after applying CLI, from a clean t default."
   (%with-net-config-globals
-    (bl::apply-config-globals (bl::parse-cli-args cli))
-    bl::*dns-seed-enabled*))
+    (bl::apply-config-globals (bl.cfg:parse-cli-args cli))
+    bl:*dns-seed-enabled*))
 
 (test config-onlynet-clearnet-exclusion-disables-dnsseed
   "G7-03: -onlynet excluding IPv4 and IPv6 soft-sets -dnsseed=0
@@ -521,7 +521,7 @@ DOMAINNAME) — Core's `if (HaveNameProxy()) AddAddrFetch(seed)`
 (net.cpp:2356-2357), where a proxied seed stays dialable BY NAME. Dropping
 every candidate parse-network-address cannot classify (#306) therefore
 discarded every DNS seed of a proxied node."
-  (let ((seeds (bl::network-dns-seeds :mainnet)))
+  (let ((seeds (bl:network-dns-seeds :mainnet)))
     ;; The affected matrix, asserted rather than assumed: mainnet DNS seeds are
     ;; hostnames — exactly the shape the old predicate discarded — and mainnet
     ;; has no fixed-seed list to fall back on (testnet4 alone has one).
@@ -534,7 +534,7 @@ discarded every DNS seed of a proxied node."
     ;; and every one must survive the filter.
     (%with-net-config-globals
       (bl::apply-config-globals
-       (bl::parse-cli-args '("-proxy=127.0.0.1:9050")))
+       (bl.cfg:parse-cli-args '("-proxy=127.0.0.1:9050")))
       (let ((dns (bl.net:discover-peers seeds)))
         (is (equal seeds dns))
         (is (equal seeds (bl::%reachable-seed-addresses dns))))
@@ -547,9 +547,9 @@ discarded every DNS seed of a proxied node."
     ;; (soft-set does not fire) and the hostnames stay dialable.
     (%with-net-config-globals
       (bl::apply-config-globals
-       (bl::parse-cli-args '("-onlynet=onion" "-onlynet=ipv6"
+       (bl.cfg:parse-cli-args '("-onlynet=onion" "-onlynet=ipv6"
                                        "-proxy=127.0.0.1:9050")))
-      (is-true bl::*dns-seed-enabled*)
+      (is-true bl:*dns-seed-enabled*)
       (is (equal seeds (bl::%reachable-seed-addresses seeds))))))
 
 (test reachable-seed-addresses-onion-only-no-clearnet-dial
@@ -560,13 +560,13 @@ Layer 2 — even if a hostname reached the filter, it is a clearnet candidate
 however the proxy resolves it (a DNS seed answers with A/AAAA records), so it
 is dropped along with every clearnet literal."
   (let ((onion '("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"))
-        (seeds (bl::network-dns-seeds :mainnet)))
+        (seeds (bl:network-dns-seeds :mainnet)))
     (%with-net-config-globals
       (bl::apply-config-globals
-       (bl::parse-cli-args '("-onlynet=onion" "-proxy=127.0.0.1:9050")))
+       (bl.cfg:parse-cli-args '("-onlynet=onion" "-proxy=127.0.0.1:9050")))
       (is (equal '(:torv3) bl.net:*reachable-networks*))
       ;; Layer 1.
-      (is-false bl::*dns-seed-enabled*)
+      (is-false bl:*dns-seed-enabled*)
       ;; Layer 2: hostnames, clearnet literals and the fixed-seed list alike.
       (is (null (bl::%reachable-seed-addresses seeds)))
       (is (null (bl::%reachable-seed-addresses
@@ -578,9 +578,9 @@ is dropped along with every clearnet literal."
     ;; cjdns-only is equally clearnet-free with a proxy configured.
     (%with-net-config-globals
       (bl::apply-config-globals
-       (bl::parse-cli-args '("-onlynet=cjdns" "-cjdnsreachable=1"
+       (bl.cfg:parse-cli-args '("-onlynet=cjdns" "-cjdnsreachable=1"
                                        "-proxy=127.0.0.1:9050")))
-      (is-false bl::*dns-seed-enabled*)
+      (is-false bl:*dns-seed-enabled*)
       (is (null (bl::%reachable-seed-addresses seeds))))))
 
 ;;; --- datadir layout and lifecycle (Core chainparamsbase.cpp, args.cpp:789) ---
@@ -641,7 +641,7 @@ one and the leftover legacy directory must not pull it back."
 so a typo and an unmounted volume both presented as an empty datadir — which
 means a silent full re-sync from genesis. Omitting -datadir is still fine: that
 is the default path, and creating it is the intended behaviour."
-  (signals bl::config-parse-error
+  (signals bl.cfg:config-parse-error
     (bl::%check-datadir-option '(("datadir" . "/nonexistent/bl-typo-xyz"))))
   ;; No -datadir at all: not an error.
   (finishes (bl::%check-datadir-option '()))
@@ -674,10 +674,10 @@ rpcallowip=10.0.0.0/8~%rpcallowip=::/0~%"))))
     (is-false (member :rpc-auth plist))
     (is-false (member :rpc-allow-ip plist)))
   ;; and both are known options, so neither trips the unknown-option check
-  (is-true (bl::known-config-option-p "rpcauth"))
-  (is-true (bl::known-config-option-p "rpcallowip"))
-  (is-true (bl::config-option-repeatable-p "rpcauth"))
-  (is-true (bl::config-option-repeatable-p "rpcallowip")))
+  (is-true (bl:known-config-option-p "rpcauth"))
+  (is-true (bl:known-config-option-p "rpcallowip"))
+  (is-true (bl.cfg:config-option-repeatable-p "rpcauth"))
+  (is-true (bl.cfg:config-option-repeatable-p "rpcallowip")))
 
 ;;; --- Core command-line compatibility (track B P0) ---
 
@@ -691,7 +691,7 @@ this node at all."
                     "-debugexclude=libevent" "-loglevel=trace" "-par=4"
                     "-checkblocks=0" "-whitelist=127.0.0.1" "-asmap=x"
                     "-maxuploadtarget=800" "-peertimeout=999"))
-    (finishes (bl::check-cli-args (list "-regtest" option))
+    (finishes (bl:check-cli-args (list "-regtest" option))
               "~A was rejected" option))
   ;; Accepting is not implementing: the option is reported as supplied.
   ;; -asmap and -par have both since been IMPLEMENTED (#456, #462), so the
@@ -700,12 +700,12 @@ this node at all."
   ;; the point of the list, and this assertion has now been rewritten twice for
   ;; exactly that reason.
   (is (equal '("natpmp")
-             (bl::supplied-core-only-options
+             (bl.cfg:supplied-core-only-options
               '(("asmap" . "x") ("regtest" . "1")
                 ("natpmp" . "1") ("natpmp" . "0")))))
-  (is-false (bl::supplied-core-only-options '(("regtest" . "1"))))
+  (is-false (bl.cfg:supplied-core-only-options '(("regtest" . "1"))))
   ;; And a genuinely unknown option is still a hard error.
-  (signals error (bl::check-cli-args '("-notacoreoption"))))
+  (signals error (bl:check-cli-args '("-notacoreoption"))))
 
 (test cli-parse-errors-carry-cores-prefix
   "Core's bitcoind reports a command line it cannot parse as
@@ -758,7 +758,7 @@ setting -listen. Silent both ways — the misspelled key was accepted (a
 
 Core supports the double negative and warns about it, which is what
 feature_config_args.py:232 looks for."
-  (flet ((one (arg) (bl::parse-cli-args (list arg))))
+  (flet ((one (arg) (bl.cfg:parse-cli-args (list arg))))
     (is (equal '(("listen" . "1")) (one "-listen")))
     (is (equal '(("listen" . "1")) (one "-listen=1")))
     (is (equal '(("listen" . "0")) (one "-nolisten")))
@@ -785,7 +785,7 @@ run wallet-less nodes with it."
   "-bind=<addr>[:<port>][=onion] (test_node.py:272-276 passes both forms). An
 IPv6 literal must be bracketed for its port to be separable, exactly as in
 Core — otherwise ::1 would parse as host \"\" port 1."
-  (flet ((parsed (spec) (multiple-value-list (bl::parse-bind-option spec))))
+  (flet ((parsed (spec) (multiple-value-list (bl.cfg:parse-bind-option spec))))
     (is (equal '("127.0.0.1" nil nil) (parsed "127.0.0.1")))
     (is (equal '("127.0.0.1" 18445 nil) (parsed "127.0.0.1:18445")))
     (is (equal '("127.0.0.1" 18445 t) (parsed "127.0.0.1:18445=onion")))
@@ -936,21 +936,21 @@ occurrence would silently drop every override but one."
     (is (equal '("csv@5" "segwit@7") (getf plist :test-activation-heights)))
     (is (= 1700000000 (getf plist :mocktime))))
   ;; Both are known options now, so neither is reported as accepted-and-ignored.
-  (is-false (bl::core-only-option-p "mocktime"))
-  (is-false (bl::core-only-option-p "testactivationheight"))
-  (is-true (bl::known-config-option-p "mocktime"))
-  (is-true (bl::known-config-option-p "testactivationheight")))
+  (is-false (bl.cfg:core-only-option-p "mocktime"))
+  (is-false (bl.cfg:core-only-option-p "testactivationheight"))
+  (is-true (bl:known-config-option-p "mocktime"))
+  (is-true (bl:known-config-option-p "testactivationheight")))
 
 (defmacro %with-clean-log-categories (&body body)
   "Run BODY with every logging category off, and restore them afterwards."
   `(let ((saved (remove-if-not #'bl:log-category-enabled-p
-                               bl.log::+log-categories+)))
+                               bl.log:+log-categories+)))
      (unwind-protect
           (progn (bl:apply-log-categories
-                  nil (copy-list bl.log::+log-categories+))
+                  nil (copy-list bl.log:+log-categories+))
                  ,@body)
        (bl:apply-log-categories
-        nil (copy-list bl.log::+log-categories+))
+        nil (copy-list bl.log:+log-categories+))
        (bl:apply-log-categories saved nil))))
 
 (test debug-categories-are-applied-in-core-s-order
@@ -962,8 +962,8 @@ and it is the exact pair Core's own test framework passes to every node."
                (bl:apply-log-categories '("net" "mempool") '("net"))))
     ;; "all" and a bare -debug (empty value) enable everything.
     (dolist (spelling '("all" "1" ""))
-      (bl:apply-log-categories nil (copy-list bl.log::+log-categories+))
-      (is (= (length bl.log::+log-categories+)
+      (bl:apply-log-categories nil (copy-list bl.log:+log-categories+))
+      (is (= (length bl.log:+log-categories+)
              (length (bl:apply-log-categories (list spelling) nil)))
           "~S did not enable every category" spelling))
     ;; ...minus the exclusions, which are applied after.
@@ -1017,8 +1017,8 @@ category AND did not raise the level: it did nothing whatsoever."
   "-logtimemicros appends a microsecond fraction and -logthreadnames inserts
 the writing thread's name, as Core does. Asserted on the formatted line rather
 than on the flags, since the flag existing is not the feature."
-  (let ((plain (let ((bl.log::*log-time-micros* nil)
-                     (bl.log::*log-thread-names* nil))
+  (let ((plain (let ((bl.log:*log-time-micros* nil)
+                     (bl.log:*log-thread-names* nil))
                  (bl.log::format-log-entry :info "hello ~A" '(1)))))
     ;; No level tag: Core prints none on an uncategorized info line
     ;; (BCLog::LogPrefix). The message follows the timestamp directly.
@@ -1026,21 +1026,21 @@ than on the flags, since the flag existing is not the feature."
     (is-false (search "INFO" plain))
     ;; [YYYY-MM-DD HH:MM:SS] with no fraction
     (is-false (search "." (subseq plain 0 (1+ (position #\] plain))))))
-  (let ((micros (let ((bl.log::*log-time-micros* t)
-                      (bl.log::*log-thread-names* nil))
+  (let ((micros (let ((bl.log:*log-time-micros* t)
+                      (bl.log:*log-thread-names* nil))
                   (bl.log::format-log-entry :info "hello" '()))))
     (is-true (find #\. (subseq micros 0 (1+ (position #\] micros))))
              "no microsecond fraction in ~S" micros))
-  (let ((named (let ((bl.log::*log-time-micros* nil)
-                     (bl.log::*log-thread-names* t))
+  (let ((named (let ((bl.log:*log-time-micros* nil)
+                     (bl.log:*log-thread-names* t))
                  (bl.log::format-log-entry :info "hello" '()))))
     ;; A second bracketed field appears after the timestamp. Two, not three:
     ;; an info line carries no level tag of its own.
     (is (= 2 (count #\[ named)) "thread name missing from ~S" named))
   ;; And with a level that DOES print a tag, the thread name sits between the
   ;; timestamp and it — Core's order.
-  (let ((named-warn (let ((bl.log::*log-time-micros* nil)
-                          (bl.log::*log-thread-names* t))
+  (let ((named-warn (let ((bl.log:*log-time-micros* nil)
+                          (bl.log:*log-thread-names* t))
                       (bl.log::format-log-entry :warn "hello" '()))))
     (is (= 3 (count #\[ named-warn)) "expected timestamp, thread and level in ~S"
         named-warn)
@@ -1055,26 +1055,26 @@ even at the REPL without a restart.
 
 Fee rates arrive as BTC/kvB on the command line, as every other Core fee option
 does, and are stored as satoshis."
-  (let ((saved (list bl.val::+dust-relay-fee-rate+
-                     bl.mp::+incremental-relay-fee-rate+
-                     bl.mp::+bytes-per-sigop+)))
+  (let ((saved (list bl.val:+dust-relay-fee-rate+
+                     bl.mp:+incremental-relay-fee-rate+
+                     bl.mp:+bytes-per-sigop+)))
     (unwind-protect
          (progn
            (bl::apply-config-globals
             '(("dustrelayfee" . "0.00004")
               ("incrementalrelayfee" . "0.00002")
               ("bytespersigop" . "40")))
-           (is (= 4000 bl.val::+dust-relay-fee-rate+))
-           (is (= 2000 bl.mp::+incremental-relay-fee-rate+))
-           (is (= 40 bl.mp::+bytes-per-sigop+))
+           (is (= 4000 bl.val:+dust-relay-fee-rate+))
+           (is (= 2000 bl.mp:+incremental-relay-fee-rate+))
+           (is (= 40 bl.mp:+bytes-per-sigop+))
            ;; And the sigop-adjusted size actually uses the new value, which is
            ;; the point — a knob nothing reads is the failure this repo keeps
            ;; finding.
            (is (= (ceiling (* 3 40) 4)
-                  (bl.mp::sigop-adjusted-vsize 1 3))))
-      (setf bl.val::+dust-relay-fee-rate+ (first saved)
-            bl.mp::+incremental-relay-fee-rate+ (second saved)
-            bl.mp::+bytes-per-sigop+ (third saved))))
+                  (bl.mp:sigop-adjusted-vsize 1 3))))
+      (setf bl.val:+dust-relay-fee-rate+ (first saved)
+            bl.mp:+incremental-relay-fee-rate+ (second saved)
+            bl.mp:+bytes-per-sigop+ (third saved))))
   ;; Malformed values are refused, not silently ignored.
   (dolist (bad '((("dustrelayfee" . "notanumber"))
                  (("incrementalrelayfee" . "x"))
@@ -1083,14 +1083,14 @@ does, and are stored as satoshis."
     (signals error (bl::apply-config-globals bad)))
   ;; All three are known options and no longer reported as ignored.
   (dolist (name '("dustrelayfee" "incrementalrelayfee" "bytespersigop"))
-    (is-true (bl::known-config-option-p name) "~A unknown" name)
-    (is-false (bl::core-only-option-p name) "~A still ignored" name)))
+    (is-true (bl:known-config-option-p name) "~A unknown" name)
+    (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
 (test validation-resource-knobs-take-effect
   "Track D's Validation & resources group over knobs that already existed as
 constants. Each asserts the EFFECT, not the assignment."
-  (let ((saved (list bl.net::+max-tip-age-seconds+
-                     bl.interop::+signature-cache-max-entries+
+  (let ((saved (list bl.net:+max-tip-age-seconds+
+                     bl.interop:+signature-cache-max-entries+
                      bl.store:*fast-prune*
                      bl.store:*blocks-xor*)))
     (unwind-protect
@@ -1100,11 +1100,11 @@ constants. Each asserts the EFFECT, not the assignment."
               ("fastprune" . "1") ("blocksxor" . "0")))
            ;; -maxtipage: how old the tip may be before the node still calls
            ;; itself in IBD (Core DEFAULT_MAX_TIP_AGE).
-           (is (= 3600 bl.net::+max-tip-age-seconds+))
+           (is (= 3600 bl.net:+max-tip-age-seconds+))
            ;; -maxsigcachesize is MiB; a cache entry is a 32-byte key, which is
            ;; what Core's CuckooCache element is too.
            (is (= (floor (* 4 1024 1024) 32)
-                  bl.interop::+signature-cache-max-entries+))
+                  bl.interop:+signature-cache-max-entries+))
            ;; -fastprune changes the ROLLOVER threshold, which is the whole
            ;; point: 64 KiB instead of 128 MiB (blockstorage.cpp:858).
            (is-true bl.store:*fast-prune*)
@@ -1115,12 +1115,12 @@ constants. Each asserts the EFFECT, not the assignment."
            (is (= (1+ (* 200 1024))
                   (bl.store:max-blockfile-size (* 200 1024))))
            (is-false bl.store:*blocks-xor*))
-      (setf bl.net::+max-tip-age-seconds+ (first saved)
-            bl.interop::+signature-cache-max-entries+ (second saved)
+      (setf bl.net:+max-tip-age-seconds+ (first saved)
+            bl.interop:+signature-cache-max-entries+ (second saved)
             bl.store:*fast-prune* (third saved)
             bl.store:*blocks-xor* (fourth saved))))
   ;; Default: the full 128 MiB rollover.
-  (is (= bl.kv::+max-blockfile-size+
+  (is (= bl.kv:+max-blockfile-size+
          (bl.store:max-blockfile-size 100)))
   ;; Malformed values are refused.
   (dolist (bad '((("maxtipage" . "-1")) (("maxsigcachesize" . "0"))
@@ -1128,8 +1128,8 @@ constants. Each asserts the EFFECT, not the assignment."
     (signals error (bl::apply-config-globals bad)))
   ;; All four are known and no longer reported as ignored.
   (dolist (name '("maxtipage" "maxsigcachesize" "fastprune" "blocksxor"))
-    (is-true (bl::known-config-option-p name) "~A unknown" name)
-    (is-false (bl::core-only-option-p name) "~A still ignored" name)))
+    (is-true (bl:known-config-option-p name) "~A unknown" name)
+    (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
 (test rpc-http-config-knobs-take-effect
   "Track D's RPC/HTTP group. Applied by APPLY-RPC-CONFIG-GLOBALS rather than
@@ -1181,8 +1181,8 @@ there is a READ error, not a link error."
                  (("rpcservertimeout" . "-1"))))
     (signals error (bl::apply-rpc-config-globals bad)))
   (dolist (name '("rpccookiefile" "rpccookieperms" "rpcthreads" "rpcservertimeout"))
-    (is-true (bl::known-config-option-p name) "~A unknown" name)
-    (is-false (bl::core-only-option-p name) "~A still ignored" name)))
+    (is-true (bl:known-config-option-p name) "~A unknown" name)
+    (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
 (test notify-commands-substitute-only-shell-safe-values
   "Core replaces %s (and, for -walletnotify, %w/%b/%h) in a notify command and
@@ -1229,8 +1229,8 @@ one (init.cpp:257-265) — while -blocknotify is a single command."
     (is (equal '("touch /tmp/a") (getf p :startup-notify)))
     (is (equal '("touch /tmp/b" "touch /tmp/c") (getf p :shutdown-notify))))
   (dolist (name '("blocknotify" "startupnotify" "shutdownnotify"))
-    (is-true (bl::known-config-option-p name) "~A unknown" name)
-    (is-false (bl::core-only-option-p name) "~A still ignored" name)))
+    (is-true (bl:known-config-option-p name) "~A unknown" name)
+    (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
 (test notify-commands-actually-run
   "A hook that is stored and never executed is the failure this repo keeps
@@ -1244,12 +1244,12 @@ immediately; -blocknotify is detached, so it is polled for."
          (progn
            (ensure-directories-exist dir)
            ;; Waited: the file must exist the moment the call returns.
-           (bl.log::run-notify-command
+           (bl.log:run-notify-command
             (format nil "touch ~A" (namestring marker)) :wait t)
            (is-true (probe-file marker) "a waited notify command did not run")
            ;; And the hash substitution reaches the command line.
            (let ((hashed (merge-pathnames "deadbeef" dir)))
-             (bl.log::run-notify-command
+             (bl.log:run-notify-command
               (format nil "touch ~A%s" (namestring dir)) :value "deadbeef" :wait t)
              (is-true (probe-file hashed)
                       "%s was not substituted into the executed command")))
@@ -1257,8 +1257,8 @@ immediately; -blocknotify is detached, so it is polled for."
                                                     :if-does-not-exist :ignore))))
   ;; A failing hook is logged, never signalled: it must not fail whatever
   ;; triggered it.
-  (is-true (bl.log::run-notify-command "exit 1" :wait t))
-  (is-false (bl.log::run-notify-command "echo %s" :value "not hex")))
+  (is-true (bl.log:run-notify-command "exit 1" :wait t))
+  (is-false (bl.log:run-notify-command "echo %s" :value "not hex")))
 
 (test pid-file-is-written-and-removed
   "-pid (Core CreatePidFile/RemovePidFile, init.cpp:178-208). Asserted through
@@ -1300,8 +1300,8 @@ option this repo keeps finding."
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                     :if-does-not-exist :ignore))))
   (dolist (name '("pid" "printtoconsole"))
-    (is-true (bl::known-config-option-p name) "~A unknown" name)
-    (is-false (bl::core-only-option-p name) "~A still ignored" name))
+    (is-true (bl:known-config-option-p name) "~A unknown" name)
+    (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name))
   ;; -printtoconsole reaches the plist as :console-log, and is ABSENT when not
   ;; given so START-NODE's default (on, since we never daemonize) applies.
   (is-false (getf (bl::args->start-node-plist '("-printtoconsole=0"))
@@ -1320,9 +1320,9 @@ one Core's ThreadOpenConnections would have taken."
   (let ((saved-addrman bl::*use-addrman-outgoing*)
         (saved-connect bl::*connect-nodes*))
     (unwind-protect
-         (let ((node (bl::make-node :network :testnet3)))
-           (setf (bl::node-network-active node) t
-                 (bl::node-address-book node)
+         (let ((node (bl:make-node :network :testnet3)))
+           (setf (bl:node-network-active node) t
+                 (bl:node-address-book node)
                  (bl.net:make-address-book))
            ;; Without -connect the node chooses its own peers.
            (setf bl::*use-addrman-outgoing* t)
@@ -1339,7 +1339,7 @@ one Core's ThreadOpenConnections would have taken."
            ;; otherwise pick an address themselves.
            (bl::maintain-block-relay-peers node)
            (bl::maybe-do-feeler node)
-           (is (= 0 (length (bl::node-peers node)))))
+           (is (= 0 (length (bl:node-peers node)))))
       (setf bl::*use-addrman-outgoing* saved-addrman
             bl::*connect-nodes* saved-connect)))
   ;; The calls above return 0 for an empty address book too, so assert
@@ -1393,9 +1393,9 @@ one Core's ThreadOpenConnections would have taken."
             '(("connect" . "1.2.3.4") ("dnsseed" . "1")))
            (is-true bl:*dns-seed-enabled*))
       (setf bl:*dns-seed-enabled* saved)))
-  (is-true (bl::known-config-option-p "connect"))
-  (is-false (bl::core-only-option-p "connect"))
-  (is-true (bl::config-option-repeatable-p "connect")))
+  (is-true (bl:known-config-option-p "connect"))
+  (is-false (bl.cfg:core-only-option-p "connect"))
+  (is-true (bl.cfg:config-option-repeatable-p "connect")))
 
 (test whitelist-and-whitebind-reach-the-node
   "-whitelist / -whitebind (Core init.cpp + net_permissions.cpp). Both are
@@ -1410,23 +1410,23 @@ Core's is: a typo'd range grants nothing and the operator never finds out."
                (getf p :whitelist)))
     (is (equal '("noban@127.0.0.1:1234") (getf p :whitebind))))
   (dolist (name '("whitelist" "whitebind" "whitelistrelay" "whitelistforcerelay"))
-    (is-true (bl::known-config-option-p name) "~A unknown" name)
-    (is-false (bl::core-only-option-p name) "~A still ignored" name))
+    (is-true (bl:known-config-option-p name) "~A unknown" name)
+    (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name))
   (dolist (name '("whitelist" "whitebind"))
-    (is-true (bl::config-option-repeatable-p name)
+    (is-true (bl.cfg:config-option-repeatable-p name)
              "~A is not repeatable" name))
-  (let ((saved-relay bl.net::*whitelist-relay*)
-        (saved-force bl.net::*whitelist-force-relay*))
+  (let ((saved-relay bl.net:*whitelist-relay*)
+        (saved-force bl.net:*whitelist-force-relay*))
     (unwind-protect
          (progn
            (bl::apply-config-globals
             '(("whitelistrelay" . "0") ("whitelistforcerelay" . "1")))
            ;; -whitelistrelay defaults TRUE and -whitelistforcerelay FALSE, so
            ;; only these values prove the wiring.
-           (is-false bl.net::*whitelist-relay*)
-           (is-true bl.net::*whitelist-force-relay*))
-      (setf bl.net::*whitelist-relay* saved-relay
-            bl.net::*whitelist-force-relay* saved-force))))
+           (is-false bl.net:*whitelist-relay*)
+           (is-true bl.net:*whitelist-force-relay*))
+      (setf bl.net:*whitelist-relay* saved-relay
+            bl.net:*whitelist-force-relay* saved-force))))
 
 (test seednode-and-forcednsseed
   "-seednode (Core connOptions.vSeedNodes, init.cpp:2212) and -forcednsseed
@@ -1442,7 +1442,7 @@ become a second -addnode."
               "-forcednsseed=1")
             nil)))
     (is (equal '("1.2.3.4" "5.6.7.8:1234") (getf p :seednode))))
-  (is-true (bl::config-option-repeatable-p "seednode"))
+  (is-true (bl.cfg:config-option-repeatable-p "seednode"))
   (let ((saved bl::*force-dns-seed*))
     (unwind-protect
          (progn
@@ -1456,12 +1456,12 @@ become a second -addnode."
   (let ((saved-addrman bl::*use-addrman-outgoing*)
         (saved-seeds bl::*seed-nodes*))
     (unwind-protect
-         (let ((node (bl::make-node :network :testnet3)))
-           (setf (bl::node-network-active node) t
+         (let ((node (bl:make-node :network :testnet3)))
+           (setf (bl:node-network-active node) t
                  bl::*seed-nodes* '("127.0.0.1:1")
                  bl::*use-addrman-outgoing* nil)
            (bl::connect-seed-nodes node)
-           (is (= 0 (length (bl::node-peers node))))
+           (is (= 0 (length (bl:node-peers node))))
            ;; And it is reached from startup, not merely defined.
            (is-true (%reached-from-start-node-p 'bl::connect-seed-nodes)))
       (setf bl::*use-addrman-outgoing* saved-addrman
@@ -1479,8 +1479,8 @@ become a second -addnode."
       (setf bl::*force-dns-seed* saved-force
             bl:*dns-seed-enabled* saved-dns)))
   (dolist (name '("seednode" "forcednsseed"))
-    (is-true (bl::known-config-option-p name) "~A unknown" name)
-    (is-false (bl::core-only-option-p name) "~A still ignored" name)))
+    (is-true (bl:known-config-option-p name) "~A unknown" name)
+    (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
 (test maxuploadtarget-limits-what-the-node-serves
   "-maxuploadtarget (Core net.cpp:3877-3941, net_processing.cpp:2376-2383).
@@ -1490,51 +1490,51 @@ MEBIbytes. Reading it as bytes — the obvious mistake — would make every
 ordinary command line set a target of a few hundred bytes, i.e. permanently
 over budget from the first message."
   ;; ParseByteUnits: lowercase 1000-base, uppercase 1024-base, default M.
-  (is (= (* 100 1024 1024) (bl::conf-parse-byte-units "100")))
+  (is (= (* 100 1024 1024) (bl.cfg:conf-parse-byte-units "100")))
   ;; Core's ByteUnit::NOOP, where a bare number really is a byte count.
-  (is (= 100 (bl::conf-parse-byte-units "100" #\B)))
-  (is (= (* 5 1000) (bl::conf-parse-byte-units "5k")))
-  (is (= (* 5 1024) (bl::conf-parse-byte-units "5K")))
-  (is (= (* 2 (expt 1000 3)) (bl::conf-parse-byte-units "2g")))
-  (is (= (* 2 (expt 1024 4)) (bl::conf-parse-byte-units "2T")))
+  (is (= 100 (bl.cfg:conf-parse-byte-units "100" #\B)))
+  (is (= (* 5 1000) (bl.cfg:conf-parse-byte-units "5k")))
+  (is (= (* 5 1024) (bl.cfg:conf-parse-byte-units "5K")))
+  (is (= (* 2 (expt 1000 3)) (bl.cfg:conf-parse-byte-units "2g")))
+  (is (= (* 2 (expt 1024 4)) (bl.cfg:conf-parse-byte-units "2T")))
   (dolist (bad '("" "M" "1x" "-1" "1.5G" "one"))
-    (signals error (bl::conf-parse-byte-units bad)))
-  (let ((saved-target bl.net::*max-upload-target*)
+    (signals error (bl.cfg:conf-parse-byte-units bad)))
+  (let ((saved-target bl.net:*max-upload-target*)
         (saved-start bl.net::*max-outbound-cycle-start*)
         (saved-bytes bl.net::*max-outbound-bytes-in-cycle*))
     (unwind-protect
          (progn
            ;; No target: every accessor reads as Core's disabled shape, and
            ;; nothing is ever "reached".
-           (setf bl.net::*max-upload-target* 0
+           (setf bl.net:*max-upload-target* 0
                  bl.net::*max-outbound-bytes-in-cycle* (* 999 1024 1024))
-           (is-false (bl.net::outbound-target-reached-p nil))
-           (is-false (bl.net::outbound-target-reached-p t))
-           (is (= 0 (bl.net::outbound-target-bytes-left)))
-           (is (= 0 (bl.net::max-outbound-time-left-in-cycle)))
+           (is-false (bl.net:outbound-target-reached-p nil))
+           (is-false (bl.net:outbound-target-reached-p t))
+           (is (= 0 (bl.net:outbound-target-bytes-left)))
+           (is (= 0 (bl.net:max-outbound-time-left-in-cycle)))
            ;; A target reached by the hard limit.
            (bl::apply-config-globals '(("maxuploadtarget" . "10")))
-           (is (= (* 10 1024 1024) bl.net::*max-upload-target*))
+           (is (= (* 10 1024 1024) bl.net:*max-upload-target*))
            (setf bl.net::*max-outbound-cycle-start*
                  (bl.ser:get-unix-time)
                  bl.net::*max-outbound-bytes-in-cycle* 0)
-           (is-false (bl.net::outbound-target-reached-p nil))
+           (is-false (bl.net:outbound-target-reached-p nil))
            (is (= (* 10 1024 1024)
-                  (bl.net::outbound-target-bytes-left)))
+                  (bl.net:outbound-target-bytes-left)))
            (setf bl.net::*max-outbound-bytes-in-cycle*
                  (* 10 1024 1024))
-           (is-true (bl.net::outbound-target-reached-p nil))
-           (is (= 0 (bl.net::outbound-target-bytes-left)))
+           (is-true (bl.net:outbound-target-reached-p nil))
+           (is (= 0 (bl.net:outbound-target-bytes-left)))
            ;; The historical-serving limit trips FIRST and, for a target this
            ;; small, is already tripped at zero bytes sent: a full cycle's
            ;; buffer (one block per 10 minutes) exceeds 10 MiB outright, which
            ;; is Core's `buffer >= nMaxOutboundLimit` branch.
            (setf bl.net::*max-outbound-bytes-in-cycle* 0)
-           (is-true (bl.net::outbound-target-reached-p t))
+           (is-true (bl.net:outbound-target-reached-p t))
            ;; With a target large enough for the buffer, historical serving is
            ;; allowed again while the hard limit is far away.
            (bl::apply-config-globals '(("maxuploadtarget" . "10T")))
-           (is-false (bl.net::outbound-target-reached-p t))
+           (is-false (bl.net:outbound-target-reached-p t))
            ;; The cycle counter rolls after 24h rather than accumulating
            ;; forever — a target that could only ever be reached once is not a
            ;; rolling budget.
@@ -1546,7 +1546,7 @@ over budget from the first message."
            ;; And accumulates within one cycle.
            (bl.net::%record-outbound-cycle-bytes 3)
            (is (= 10 bl.net::*max-outbound-bytes-in-cycle*)))
-      (setf bl.net::*max-upload-target* saved-target
+      (setf bl.net:*max-upload-target* saved-target
             bl.net::*max-outbound-cycle-start* saved-start
             bl.net::*max-outbound-bytes-in-cycle* saved-bytes)))
   ;; Every byte the node sends is counted, not just the ones a caller
@@ -1560,14 +1560,14 @@ over budget from the first message."
   (is-true (member 'bl.net::handle-getdata
                    (mapcar #'car
                            (sb-introspect:who-calls
-                            'bl.net::outbound-target-reached-p))))
-  (is-true (bl::known-config-option-p "maxuploadtarget"))
-  (is-false (bl::core-only-option-p "maxuploadtarget")))
+                            'bl.net:outbound-target-reached-p))))
+  (is-true (bl:known-config-option-p "maxuploadtarget"))
+  (is-false (bl.cfg:core-only-option-p "maxuploadtarget")))
 
 (test p2p-config-knobs-take-effect
   "Track D's P2P group, the two options that map onto existing constants."
   (let ((saved (list bl:+handshake-timeout-seconds+
-                     bl.net::+max-send-buffer-bytes+)))
+                     bl.net:+max-send-buffer-bytes+)))
     (unwind-protect
          (progn
            (bl::apply-config-globals
@@ -1576,9 +1576,9 @@ over budget from the first message."
            ;; Core's -maxsendbuffer is in KILOBYTES and it multiplies by 1000,
            ;; NOT 1024 (init.cpp:2105). Using 1024 here would silently give
            ;; every operator a 2.4% larger buffer than they asked for.
-           (is (= 2000000 bl.net::+max-send-buffer-bytes+)))
+           (is (= 2000000 bl.net:+max-send-buffer-bytes+)))
       (setf bl:+handshake-timeout-seconds+ (first saved)
-            bl.net::+max-send-buffer-bytes+ (second saved))))
+            bl.net:+max-send-buffer-bytes+ (second saved))))
   ;; The handshake default is Core's 60, not the 30 it used to be: a peer on a
   ;; slow link that Core would keep, we dropped — and re-dialling costs more
   ;; than waiting.
@@ -1587,8 +1587,8 @@ over budget from the first message."
                  (("maxsendbuffer" . "x"))))
     (signals error (bl::apply-config-globals bad)))
   (dolist (name '("peertimeout" "maxsendbuffer"))
-    (is-true (bl::known-config-option-p name) "~A unknown" name)
-    (is-false (bl::core-only-option-p name) "~A still ignored" name)))
+    (is-true (bl:known-config-option-p name) "~A unknown" name)
+    (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
 (test wallet-config-knobs-take-effect
   "Track D's Wallet group, which the plan calls \"mostly knobs over existing
@@ -1598,14 +1598,14 @@ wallet could not be tuned at all.
 
 Fee options are BTC/kvB on the command line and satoshis internally, matching
 -maxtxfee and -fallbackfee, which apply-config-globals already handled."
-  (let ((saved (list bl.wallet::*wallet-min-tx-fee*
-                     bl.wallet::*wallet-discard-rate*
-                     bl.wallet::*wallet-consolidate-feerate*
-                     bl.wallet::*wallet-max-aps-fee*
-                     bl.wallet::*wallet-confirm-target*
-                     bl.wallet::*wallet-signal-rbf*
-                     bl.wallet::*wallet-spend-zero-conf-change*
-                     bl.wallet::*wallet-reject-long-chains*)))
+  (let ((saved (list bl.wallet:*wallet-min-tx-fee*
+                     bl.wallet:*wallet-discard-rate*
+                     bl.wallet:*wallet-consolidate-feerate*
+                     bl.wallet:*wallet-max-aps-fee*
+                     bl.wallet:*wallet-confirm-target*
+                     bl.wallet:*wallet-signal-rbf*
+                     bl.wallet:*wallet-spend-zero-conf-change*
+                     bl.wallet:*wallet-reject-long-chains*)))
     (unwind-protect
          (progn
            (bl::apply-rpc-config-globals
@@ -1613,25 +1613,25 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
               ("consolidatefeerate" . "0.0003") ("maxapsfee" . "0.0001")
               ("txconfirmtarget" . "12") ("walletrbf" . "0")
               ("spendzeroconfchange" . "0") ("walletrejectlongchains" . "0")))
-           (is (= 2000 bl.wallet::*wallet-min-tx-fee*))
-           (is (= 20000 bl.wallet::*wallet-discard-rate*))
-           (is (= 30000 bl.wallet::*wallet-consolidate-feerate*))
-           (is (= 10000 bl.wallet::*wallet-max-aps-fee*))
-           (is (= 12 bl.wallet::*wallet-confirm-target*))
+           (is (= 2000 bl.wallet:*wallet-min-tx-fee*))
+           (is (= 20000 bl.wallet:*wallet-discard-rate*))
+           (is (= 30000 bl.wallet:*wallet-consolidate-feerate*))
+           (is (= 10000 bl.wallet:*wallet-max-aps-fee*))
+           (is (= 12 bl.wallet:*wallet-confirm-target*))
            ;; The three booleans all default TRUE, so a test that only checked
            ;; "can be set" would pass without the option doing anything —
            ;; setting them to 0 is what proves the wiring.
-           (is-false bl.wallet::*wallet-signal-rbf*)
-           (is-false bl.wallet::*wallet-spend-zero-conf-change*)
-           (is-false bl.wallet::*wallet-reject-long-chains*))
-      (setf bl.wallet::*wallet-min-tx-fee* (first saved)
-            bl.wallet::*wallet-discard-rate* (second saved)
-            bl.wallet::*wallet-consolidate-feerate* (third saved)
-            bl.wallet::*wallet-max-aps-fee* (fourth saved)
-            bl.wallet::*wallet-confirm-target* (fifth saved)
-            bl.wallet::*wallet-signal-rbf* (sixth saved)
-            bl.wallet::*wallet-spend-zero-conf-change* (seventh saved)
-            bl.wallet::*wallet-reject-long-chains* (eighth saved))))
+           (is-false bl.wallet:*wallet-signal-rbf*)
+           (is-false bl.wallet:*wallet-spend-zero-conf-change*)
+           (is-false bl.wallet:*wallet-reject-long-chains*))
+      (setf bl.wallet:*wallet-min-tx-fee* (first saved)
+            bl.wallet:*wallet-discard-rate* (second saved)
+            bl.wallet:*wallet-consolidate-feerate* (third saved)
+            bl.wallet:*wallet-max-aps-fee* (fourth saved)
+            bl.wallet:*wallet-confirm-target* (fifth saved)
+            bl.wallet:*wallet-signal-rbf* (sixth saved)
+            bl.wallet:*wallet-spend-zero-conf-change* (seventh saved)
+            bl.wallet:*wallet-reject-long-chains* (eighth saved))))
   ;; Malformed values are refused rather than silently leaving the default.
   (dolist (bad '((("mintxfee" . "notanumber")) (("txconfirmtarget" . "0"))
                  (("txconfirmtarget" . "x")) (("maxapsfee" . "zz"))))
@@ -1639,8 +1639,8 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
   (dolist (name '("mintxfee" "discardfee" "consolidatefeerate" "maxapsfee"
                   "txconfirmtarget" "walletrbf" "spendzeroconfchange"
                   "walletrejectlongchains"))
-    (is-true (bl::known-config-option-p name) "~A unknown" name)
-    (is-false (bl::core-only-option-p name) "~A still ignored" name)))
+    (is-true (bl:known-config-option-p name) "~A unknown" name)
+    (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
 (test rpc-config-keypool-and-walletdir
   "-keypool and -walletdir (Core init.cpp). Both are asserted through their
@@ -1648,8 +1648,8 @@ EFFECT — a freshly made wallet manager's keypool size, and the directory
 WALLETS-DIRECTORY hands back — rather than through the variable, because the
 keypool size is read as a struct slot DEFAULT and a test on the variable alone
 would pass even if no struct ever consulted it."
-  (let ((saved-keypool bl.wallet::+default-keypool-size+)
-        (saved-dir bl.wallet::*wallet-directory*))
+  (let ((saved-keypool bl.wallet:+default-keypool-size+)
+        (saved-dir bl.wallet:*wallet-directory*))
     (unwind-protect
          (progn
            (bl::apply-rpc-config-globals '(("keypool" . "37")))
@@ -1660,7 +1660,7 @@ would pass even if no struct ever consulted it."
            ;; outright, and NIL restores <datadir>/wallets/.
            (let ((manager (bl.wallet::make-wallet-manager
                            :data-directory #p"/tmp/dd/")))
-             (setf bl.wallet::*wallet-directory* nil)
+             (setf bl.wallet:*wallet-directory* nil)
              (is (equal #p"/tmp/dd/wallets/"
                         (bl.wallet::wallets-directory manager)))
              (bl::apply-rpc-config-globals '(("walletdir" . "purses")))
@@ -1670,14 +1670,14 @@ would pass even if no struct ever consulted it."
               '(("walletdir" . "/srv/keys")))
              (is (equal #p"/srv/keys/"
                         (bl.wallet::wallets-directory manager)))))
-      (setf bl.wallet::+default-keypool-size+ saved-keypool
-            bl.wallet::*wallet-directory* saved-dir)))
+      (setf bl.wallet:+default-keypool-size+ saved-keypool
+            bl.wallet:*wallet-directory* saved-dir)))
   ;; Core rejects -keypool=0; so do we, rather than making an unusable wallet.
   (dolist (bad '((("keypool" . "0")) (("keypool" . "-1")) (("keypool" . "x"))))
     (signals error (bl::apply-rpc-config-globals bad)))
   (dolist (name '("keypool" "walletdir"))
-    (is-true (bl::known-config-option-p name) "~A unknown" name)
-    (is-false (bl::core-only-option-p name) "~A still ignored" name)))
+    (is-true (bl:known-config-option-p name) "~A unknown" name)
+    (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 
 ;;;; --- settings.json (Core's read-write settings file) ---
 
@@ -1804,7 +1804,7 @@ carries on (args.cpp:420-423) — unknown settings never abort startup."
 ones (config.cpp:63), so `nolisten=1` in bitcoin.conf is -listen=0. Without
 this the file set an option named \"nolisten\" that nothing reads, and
 bitcoin.conf could not negate anything at all."
-  (let ((cells (bl::parse-bitcoin-conf-sections
+  (let ((cells (bl.cfg:parse-bitcoin-conf-sections
                 (format nil "regtest=1~%[regtest]~%nolisten=1~%nosettings=1~%")
                 :regtest)))
     (is (string= "0" (cdr (assoc "listen" cells :test #'string=))))
@@ -1814,7 +1814,7 @@ bitcoin.conf could not negate anything at all."
 (test conf-file-double-negative-means-true
   "`nofoo=0` is a double negative and means -foo=1, which Core supports and
 warns about (args.cpp:114-118)."
-  (let ((cells (bl::parse-bitcoin-conf-sections
+  (let ((cells (bl.cfg:parse-bitcoin-conf-sections
                 (format nil "[regtest]~%nolisten=0~%") :regtest)))
     (is (string= "1" (cdr (assoc "listen" cells :test #'string=))))))
 
@@ -1825,7 +1825,7 @@ being a known option would make what a line in bitcoin.conf MEANS depend on the
 contents of a lookup table — adding an option would silently change the meaning
 of config files already on disk. An unknown result is warned about and ignored,
 which is also what Core does with it."
-  (let ((cells (bl::parse-bitcoin-conf-sections
+  (let ((cells (bl.cfg:parse-bitcoin-conf-sections
                 (format nil "[regtest]~%nodetour=5~%") :regtest)))
     ;; `5' is truthy, so the negation stands: -detour=0.
     (is (string= "0" (cdr (assoc "detour" cells :test #'string=))))
@@ -1838,8 +1838,8 @@ used to be written out three times — parse-cli-args, the config-file parser an
 the arg-log renderer — and the copies had already drifted apart on whether the
 `no` prefix was stripped at all, so the same string meant different things
 depending on which parser saw it."
-  (flet ((cli (&rest args) (bl::parse-cli-args args))
-         (conf (text) (bl::parse-bitcoin-conf-sections text :regtest)))
+  (flet ((cli (&rest args) (bl.cfg:parse-cli-args args))
+         (conf (text) (bl.cfg:parse-bitcoin-conf-sections text :regtest)))
     ;; Same option, same meaning, from either source.
     (is (equal (cdr (assoc "listen" (cli "-nolisten") :test #'string=))
                (cdr (assoc "listen" (conf (format nil "[regtest]~%nolisten=1~%"))
@@ -1862,7 +1862,7 @@ string \"x\" (args.cpp:105-126, 880-884)."
 (test conf-file-negation-works-in-the-global-area-too
   "The global area is parsed by the same loop, so a negation before any
 [section] header has to behave the same way."
-  (let ((globals (bl::conf-global-entries
+  (let ((globals (bl.cfg:conf-global-entries
                   (format nil "nolisten=1~%regtest=1~%"))))
     (is (string= "0" (cdr (assoc "listen" globals :test #'string=))))))
 
@@ -1946,7 +1946,7 @@ imported nothing."
              (getf (bl::args->start-node-plist
                     '("-regtest" "-loadblock=/a/one.dat" "-loadblock=/b/two.dat"))
                    :load-block)))
-  (is-false (bl::core-only-option-p "loadblock")
+  (is-false (bl.cfg:core-only-option-p "loadblock")
             "-loadblock is implemented now and must not be reported as ignored")
   (is-true (bl:known-config-option-p "loadblock")))
 
@@ -1955,11 +1955,11 @@ imported nothing."
 must actually fire: a :collect option that is not :repeatable would be
 collected from an alist that kept only its last occurrence, and a :key
 option without a :type has no parser in the scalar scan."
-  (signals bl::option-definition-error
-    (macroexpand-1 '(bl::define-option "probe" :collect :probe)))
-  (signals bl::option-definition-error
-    (macroexpand-1 '(bl::define-option "probe" :key :probe)))
-  (finishes (macroexpand-1 '(bl::define-option "probe" :key :probe :type :bool))))
+  (signals bl.cfg:option-definition-error
+    (macroexpand-1 '(bl.cfg:define-option "probe" :collect :probe)))
+  (signals bl.cfg:option-definition-error
+    (macroexpand-1 '(bl.cfg:define-option "probe" :key :probe)))
+  (finishes (macroexpand-1 '(bl.cfg:define-option "probe" :key :probe :type :bool))))
 
 (test network-is-set-before-the-config-globals-are-applied
   "-acceptnonstdtxn on mainnet is an init error (Core mempool_args.cpp:102-104,
@@ -1989,10 +1989,10 @@ the pre-existing conditions sit under the hierarchy."
   (let ((e (handler-case (bl.err:config-error "Invalid port ~A" 5) (error (e) e))))
     (is (typep e 'simple-error))
     (is (string= "Invalid port 5" (princ-to-string e))))
-  (is-true (subtypep 'bl::config-parse-error 'bl.err:config-error))
-  (is-true (subtypep 'bl::cli-parse-error 'bl.err:config-error))
-  (is-true (subtypep 'bl.net::socks5-error 'bl.err:net-error))
-  (is-true (subtypep 'bl.rpc::rpc-error 'bl.err:bitcoin-lisp-error))
+  (is-true (subtypep 'bl.cfg:config-parse-error 'bl.err:config-error))
+  (is-true (subtypep 'bl:cli-parse-error 'bl.err:config-error))
+  (is-true (subtypep 'bl.net:socks5-error 'bl.err:net-error))
+  (is-true (subtypep 'bl.rpc:rpc-error 'bl.err:bitcoin-lisp-error))
   (is-true (subtypep 'bl.err:consensus-error 'bl.err:bitcoin-lisp-error))
   (is (eq :bad-txns-vin-empty
           (bl.err:error-reason (make-condition 'bl.err:consensus-error :reason :bad-txns-vin-empty)))))

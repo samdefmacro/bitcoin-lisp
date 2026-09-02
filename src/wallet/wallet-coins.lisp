@@ -137,7 +137,7 @@ arbitrarily, like Core's *spk_mans.begin())."
         when index do (return (values spkm index))))
 
 (defun %spkm-solvable-p (spkm)
-  (bl.rpc::out-desc-solvable-p (desc-spkm-desc spkm)))
+  (bl.rpc:out-desc-solvable-p (desc-spkm-desc spkm)))
 
 (defun %spkm-sub-scripts (spkm script)
   "(values redeem-script witness-script) known for SCRIPT at its range
@@ -147,21 +147,21 @@ witnessScript fields and getaddressinfo's embedded object."
         (desc (desc-spkm-desc spkm))
         (cache (desc-spkm-cache spkm)))
     (when pos
-      (case (bl.rpc::out-desc-kind desc)
+      (case (bl.rpc:out-desc-kind desc)
         (:sh
-         (let* ((sub (bl.rpc::out-desc-sub desc))
-                (redeem (first (bl.rpc::out-desc-expand-from-cache sub pos cache))))
-           (if (and redeem (eq (bl.rpc::out-desc-kind sub) :wsh))
+         (let* ((sub (bl.rpc:out-desc-sub desc))
+                (redeem (first (bl.rpc:out-desc-expand-from-cache sub pos cache))))
+           (if (and redeem (eq (bl.rpc:out-desc-kind sub) :wsh))
                (values redeem
-                       (first (bl.rpc::out-desc-expand-from-cache
-                               (bl.rpc::out-desc-sub sub) pos cache)))
+                       (first (bl.rpc:out-desc-expand-from-cache
+                               (bl.rpc:out-desc-sub sub) pos cache)))
                (values redeem nil))))
         (:wsh
-         (values nil (first (bl.rpc::out-desc-expand-from-cache
-                             (bl.rpc::out-desc-sub desc) pos cache))))
+         (values nil (first (bl.rpc:out-desc-expand-from-cache
+                             (bl.rpc:out-desc-sub desc) pos cache))))
         (:combo
          ;; The P2SH form of combo() wraps its P2WPKH script.
-         (let ((scripts (bl.rpc::out-desc-expand-from-cache desc pos cache)))
+         (let ((scripts (bl.rpc:out-desc-expand-from-cache desc pos cache)))
            (when (and scripts (= (length scripts) 4)
                       (equalp script (fourth scripts)))
              (values (third scripts) nil))))
@@ -341,12 +341,12 @@ CHECK-VERSION-TRUCNESS are in play, the node lock outside it)."
                                :fee (when feerate
                                       (if (minusp input-bytes)
                                           0
-                                          (bl.rpc::%feerate-fee feerate input-bytes)))
+                                          (bl.rpc:feerate-fee feerate input-bytes)))
                                :effective-value
                                (when feerate
                                  (- value (if (minusp input-bytes)
                                               0
-                                              (bl.rpc::%feerate-fee feerate input-bytes))))
+                                              (bl.rpc:feerate-fee feerate input-bytes))))
                                :output-type output-type)))
                    (if (and check-version-trucness (zerop depth)
                             (= (bl.ser:transaction-version
@@ -388,20 +388,20 @@ BIP32 key's fingerprint is its root key's, the path is the key's fixed path
 plus the range position; a const key's fingerprint is its own keyid prefix
 with an empty path; a declared [origin] prefixes both."
   (multiple-value-bind (base-fpr base-path)
-      (if (bl.rpc::desc-key-extkey key)
+      (if (bl.rpc:desc-key-extkey key)
           (values (subseq (bl.crypto:hash160
                            (bl.crypto:ext-key-public-bytes
-                            (bl.rpc::desc-key-extkey key)))
+                            (bl.rpc:desc-key-extkey key)))
                           0 4)
-                  (append (bl.rpc::desc-key-path key)
-                          (ecase (bl.rpc::desc-key-derive key)
+                  (append (bl.rpc:desc-key-path key)
+                          (ecase (bl.rpc:desc-key-derive key)
                             (:none nil)
                             (:unhardened (list pos))
                             (:hardened (list (logior pos #x80000000))))))
           (values (subseq (bl.crypto:hash160 pubkey) 0 4) nil))
-    (if (bl.rpc::desc-key-origin-fingerprint key)
-        (values (bl.rpc::desc-key-origin-fingerprint key)
-                (append (bl.rpc::desc-key-origin-path key) base-path))
+    (if (bl.rpc:desc-key-origin-fingerprint key)
+        (values (bl.rpc:desc-key-origin-fingerprint key)
+                (append (bl.rpc:desc-key-origin-path key) base-path))
         (values base-fpr base-path))))
 
 (defun %inferred-key-string (key pubkey pos &key xonly)
@@ -410,9 +410,9 @@ hardened markers as 'h' (apostrophe=false)."
   (multiple-value-bind (fpr path) (%desc-key-origin-info key pubkey pos)
     (format nil "[~A~A]~A"
             (bl.crypto:bytes-to-hex fpr)
-            (bl.rpc::%format-key-path path nil)
+            (bl.rpc:format-key-path path nil)
             (bl.crypto:bytes-to-hex
-             (if xonly (bl.rpc::%key-xonly-bytes pubkey) pubkey)))))
+             (if xonly (bl.rpc:key-xonly-bytes pubkey) pubkey)))))
 
 (defun %pairs-splitter (pairs)
   "A closure that returns the slice of PAIRS belonging to each descriptor it is
@@ -430,7 +430,7 @@ listunspent, with multi_a leaves allowed up to 999 keys each.
 Returns NIL once PAIRS runs short, which %INFER-DESC-BODY turns into an
 unrenderable descriptor rather than one built from misaligned keys."
   (lambda (desc)
-    (let ((n (length (bl.rpc::out-desc-ordered-keys desc))))
+    (let ((n (length (bl.rpc:out-desc-ordered-keys desc))))
       (when (<= n (length pairs))
         (prog1 (subseq pairs 0 n)
           (setf pairs (nthcdr n pairs)))))))
@@ -441,7 +441,7 @@ DESC's expansion at POS, PAIRS the (desc-key . derived-pubkey) list in
 expression order. NIL when the descriptor kind cannot be inferred."
   (flet ((key-string (pair &key xonly)
            (%inferred-key-string (car pair) (cdr pair) pos :xonly xonly)))
-    (ecase (bl.rpc::out-desc-kind desc)
+    (ecase (bl.rpc:out-desc-kind desc)
       ((:addr :raw) nil)
       ;; Core builds the inferred pk() with the same m_xonly it parsed with
       ;; (descriptor.cpp:2695 passes /*xonly=*/true for a tapscript leaf), so a
@@ -449,7 +449,7 @@ expression order. NIL when the descriptor kind cannot be inferred."
       ;; not.
       (:pk (format nil "pk(~A)"
                    (key-string (first pairs)
-                               :xonly (bl.rpc::out-desc-xonly-script-p desc))))
+                               :xonly (bl.rpc:out-desc-xonly-script-p desc))))
       (:pkh (format nil "pkh(~A)" (key-string (first pairs))))
       (:wpkh (format nil "wpkh(~A)" (key-string (first pairs))))
       (:combo
@@ -468,18 +468,18 @@ expression order. NIL when the descriptor kind cannot be inferred."
        ;; keys were sorted for it, so sortedmulti() reports as multi() with the
        ;; keys in script (BIP67-sorted) order -- and sortedmulti_a() likewise
        ;; as multi_a(). The tapscript pair pushes its keys x-only.
-       (let* ((kind (bl.rpc::out-desc-kind desc))
+       (let* ((kind (bl.rpc:out-desc-kind desc))
               (tap (and (member kind '(:multi-a :sortedmulti-a)) t))
               (ordered (if (member kind '(:sortedmulti :sortedmulti-a))
-                           (sort (copy-list pairs) #'bl.rpc::%pubkey-lessp :key #'cdr)
+                           (sort (copy-list pairs) #'bl.rpc:pubkey-lessp :key #'cdr)
                            pairs)))
          (format nil "~A(~D~{,~A~})"
                  (if tap "multi_a" "multi")
-                 (bl.rpc::out-desc-threshold desc)
+                 (bl.rpc:out-desc-threshold desc)
                  (mapcar (lambda (pair) (key-string pair :xonly tap)) ordered))))
-      (:sh (let ((sub (%infer-desc-body (bl.rpc::out-desc-sub desc) nil scripts pairs pos)))
+      (:sh (let ((sub (%infer-desc-body (bl.rpc:out-desc-sub desc) nil scripts pairs pos)))
              (and sub (format nil "sh(~A)" sub))))
-      (:wsh (let ((sub (%infer-desc-body (bl.rpc::out-desc-sub desc) nil scripts pairs pos)))
+      (:wsh (let ((sub (%infer-desc-body (bl.rpc:out-desc-sub desc) nil scripts pairs pos)))
               (and sub (format nil "wsh(~A)" sub))))
       ;; The subscript of wsh(<miniscript>) is an out-desc of kind :MINISCRIPT
       ;; (descriptors.lisp, %PARSE-MINISCRIPT-DESCRIPTOR), and the :WSH clause
@@ -491,8 +491,8 @@ expression order. NIL when the descriptor kind cannot be inferred."
       ;; here does.
       (:miniscript
        (let ((solved t))
-         (let ((text (bl.val::ms-node-to-string
-                      (bl.rpc::out-desc-node desc)
+         (let ((text (bl.val:ms-node-to-string
+                      (bl.rpc:out-desc-node desc)
                       (lambda (key)
                         (let ((pair (assoc key pairs :test #'eq)))
                           (cond (pair (key-string pair))
@@ -503,7 +503,7 @@ expression order. NIL when the descriptor kind cannot be inferred."
        ;; before the tree's leaves — and the leaves render through the same
        ;; brace reconstruction the descriptor printer uses.
        (let ((internal (key-string (first pairs) :xonly t)))
-         (if (null (bl.rpc::out-desc-tree desc))
+         (if (null (bl.rpc:out-desc-tree desc))
              (format nil "tr(~A)" internal)
              ;; Each leaf gets ITS OWN pairs. The clauses here address PAIRS
              ;; positionally -- (first pairs) means "this descriptor's key" --
@@ -512,8 +512,8 @@ expression order. NIL when the descriptor kind cannot be inferred."
              ;; the tr() INTERNAL key, because that is the pair ORDERED-KEYS
              ;; numbers first. The splitter starts AFTER the internal key.
              (let* ((next (%pairs-splitter (rest pairs)))
-                    (tree (bl.rpc::tr-tree-string
-                           (bl.rpc::out-desc-tree desc)
+                    (tree (bl.rpc:tr-tree-string
+                           (bl.rpc:out-desc-tree desc)
                            (lambda (leaf)
                              (let ((own (funcall next leaf)))
                                (and own (%infer-desc-body leaf nil scripts
@@ -525,11 +525,11 @@ expression order. NIL when the descriptor kind cannot be inferred."
   "(values scripts pairs) — the SPKM's expansion at POS with each derived
 pubkey paired to its desc-key, in expression order."
   (multiple-value-bind (scripts pubkeys)
-      (bl.rpc::out-desc-expand-from-cache (desc-spkm-desc spkm) pos
+      (bl.rpc:out-desc-expand-from-cache (desc-spkm-desc spkm) pos
                                   (desc-spkm-cache spkm))
     (when scripts
       (values scripts
-              (mapcar #'cons (bl.rpc::out-desc-ordered-keys (desc-spkm-desc spkm))
+              (mapcar #'cons (bl.rpc:out-desc-ordered-keys (desc-spkm-desc spkm))
                       pubkeys)))))
 
 (defun %wallet-inferred-descriptor (wallet script)
@@ -541,7 +541,7 @@ descriptor for SCRIPT, or NIL when the wallet cannot solve it."
         (when scripts
           (let ((body (%infer-desc-body (desc-spkm-desc spkm) script
                                         scripts pairs pos)))
-            (and body (bl.rpc::descriptor-add-checksum body))))))))
+            (and body (bl.rpc:descriptor-add-checksum body))))))))
 
 ;;; --- getbalance / getbalances (wallet/rpc/coins.cpp:164,401) ---
 
@@ -551,16 +551,16 @@ flag as the default (Core's isNull check); an explicit boolean (incl. the
 +json-false+ sentinel) overrides it. Requesting it on a wallet without the
 flag errors."
   (let* ((can (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+))
-         (avoid (if (null param) can (bl.rpc::%positional-bool param))))
+         (avoid (if (null param) can (bl.rpc:positional-bool param))))
     (when (and avoid (not can))
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                         :message "wallet does not have the \"avoid reuse\" feature enabled"))
     avoid))
 
 (defun %wallet-last-processed-block (wallet)
   "Core AppendLastProcessedBlock's object."
   `(("hash" . ,(if (wallet-last-block-hash wallet)
-                   (bl.rpc::hash-to-hex (wallet-last-block-hash wallet))
+                   (bl.rpc:hash-to-hex (wallet-last-block-hash wallet))
                    (make-string 64 :initial-element #\0)))
     ("height" . ,(wallet-last-block-height wallet))))
 
@@ -571,13 +571,13 @@ PARAMS: (dummy minconf include_watchonly avoid_reuse)."
         (dummy (first params))
         (minconf (or (second params) 0)))
     (when (and dummy (not (equal dummy "*")))
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-method-deprecated+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-method-deprecated+
                         :message "dummy first argument must be excluded or set to \"*\"."))
     (unless (integerp minconf)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+ :message "minconf must be an integer"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+ :message "minconf must be an integer"))
     (with-wallet-lock (wallet)
       (let ((avoid-reuse (%get-avoid-reuse-flag wallet (fourth params))))
-        (bl.rpc::%btc (wallet-get-balance wallet :min-depth minconf
+        (bl.rpc:satoshi->btc (wallet-get-balance wallet :min-depth minconf
                                          :avoid-reuse avoid-reuse))))))
 
 (bl.rpc:define-rpc "getbalances" (node params)
@@ -588,15 +588,15 @@ PARAMS: (dummy minconf include_watchonly avoid_reuse)."
       (multiple-value-bind (trusted untrusted immature)
           (wallet-get-balance wallet)
         `(("mine"
-           . (("trusted" . ,(bl.rpc::%btc trusted))
-              ("untrusted_pending" . ,(bl.rpc::%btc untrusted))
-              ("immature" . ,(bl.rpc::%btc immature))
+           . (("trusted" . ,(bl.rpc:satoshi->btc trusted))
+              ("untrusted_pending" . ,(bl.rpc:satoshi->btc untrusted))
+              ("immature" . ,(bl.rpc:satoshi->btc immature))
               ;; With AVOID_REUSE the default balance excludes reused
               ;; addresses; "used" is the difference against the full one.
               ,@(when (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+)
                   (multiple-value-bind (full-trusted full-untrusted)
                       (wallet-get-balance wallet :avoid-reuse nil)
-                    `(("used" . ,(bl.rpc::%btc (- (+ full-trusted full-untrusted)
+                    `(("used" . ,(bl.rpc:satoshi->btc (- (+ full-trusted full-untrusted)
                                           trusted untrusted))))))))
           ("lastprocessedblock" . ,(%wallet-last-processed-block wallet)))))))
 
@@ -605,12 +605,12 @@ PARAMS: (dummy minconf include_watchonly avoid_reuse)."
 (defun %listunspent-entry (node wallet coin avoid-reuse)
   (let* ((output (wallet-coin-output coin))
          (script (bl.ser:tx-out-script-pubkey output))
-         (address (bl.rpc::%script->address script (wallet-network wallet)))
+         (address (bl.rpc:script->address script (wallet-network wallet)))
          (txid (wallet-coin-txid coin))
-         (mempool (bl::node-mempool node)))
+         (mempool (bl:node-mempool node)))
     (multiple-value-bind (spkm) (%wallet-owning-spkm wallet script)
       (multiple-value-bind (redeem witness) (and spkm (%spkm-sub-scripts spkm script))
-        `(("txid" . ,(bl.rpc::hash-to-hex txid))
+        `(("txid" . ,(bl.rpc:hash-to-hex txid))
           ("vout" . ,(wallet-coin-index coin))
           ,@(when address
               `(("address" . ,address)
@@ -623,7 +623,7 @@ PARAMS: (dummy minconf include_watchonly avoid_reuse)."
                 ,@(when witness
                     `(("witnessScript" . ,(bl.crypto:bytes-to-hex witness))))))
           ("scriptPubKey" . ,(bl.crypto:bytes-to-hex script))
-          ("amount" . ,(bl.rpc::%btc (bl.ser:tx-out-value output)))
+          ("amount" . ,(bl.rpc:satoshi->btc (bl.ser:tx-out-value output)))
           ("confirmations" . ,(wallet-coin-depth coin))
           ,@(when (and (zerop (wallet-coin-depth coin))
                        mempool
@@ -650,8 +650,8 @@ include_unsafe query_options)."
   (let ((wallet (wallet-for-request node))
         (minconf (if (and (>= (length params) 1) (first params)) (first params) 1))
         (maxconf (if (and (>= (length params) 2) (second params)) (second params) 9999999))
-        (addresses (bl.rpc::%positional-array (third params)))
-        (include-unsafe (bl.rpc::%positional-bool-or (fourth params) t))
+        (addresses (bl.rpc:positional-array (third params)))
+        (include-unsafe (bl.rpc:positional-bool-or (fourth params) t))
         (options (fifth params))
         (min-amount 0)
         (max-amount nil)
@@ -660,11 +660,11 @@ include_unsafe query_options)."
         (include-immature nil)
         (filter-scripts nil))
     (unless (and (integerp minconf) (integerp maxconf))
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                         :message "minconf and maxconf must be integers"))
     (when addresses
       (unless (listp addresses)
-        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+ :message "addresses must be an array"))
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+ :message "addresses must be an array"))
       (setf filter-scripts (make-hash-table :test 'equalp))
       (dolist (address addresses)
         (multiple-value-bind (type script)
@@ -672,28 +672,28 @@ include_unsafe query_options)."
                  (bl.crypto:decode-address address
                                                      (wallet-network wallet)))
           (unless type
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                               :message (format nil "Invalid Bitcoin address: ~A" address)))
           (when (gethash script filter-scripts)
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message (format nil "Invalid parameter, duplicated address: ~A" address)))
           (setf (gethash script filter-scripts) t))))
     (when options
       (multiple-value-bind (value present) (%oval options "minimumAmount")
-        (when present (setf min-amount (bl.rpc::%amount-from-value value))))
+        (when present (setf min-amount (bl.rpc:amount-from-value value))))
       (multiple-value-bind (value present) (%oval options "maximumAmount")
-        (when present (setf max-amount (bl.rpc::%amount-from-value value))))
+        (when present (setf max-amount (bl.rpc:amount-from-value value))))
       (multiple-value-bind (value present) (%oval options "minimumSumAmount")
-        (when present (setf min-sum-amount (bl.rpc::%amount-from-value value))))
+        (when present (setf min-sum-amount (bl.rpc:amount-from-value value))))
       (multiple-value-bind (value present) (%oval options "maximumCount")
         (when present
           (unless (integerp value)
-            (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                               :message "maximumCount must be an integer"))
           (setf max-count value)))
       (multiple-value-bind (value present) (%oval options "include_immature_coinbase")
         (when present (setf include-immature (and value t)))))
-    (bl.rpc::with-node-lock (node)   ; mempool ancestry reads; node -> wallet order
+    (bl.rpc:with-node-lock (node)   ; mempool ancestry reads; node -> wallet order
       (with-wallet-lock (wallet)
         (let ((coins (wallet-available-coins
                       wallet
@@ -719,48 +719,48 @@ include_unsafe query_options)."
   "Lock or unlock unspent outputs (Bitcoin Core lockunspent). PARAMS:
 (unlock transactions persistent)."
   (let ((wallet (wallet-for-request node))
-        (unlock (bl.rpc::%positional-bool (first params)))
+        (unlock (bl.rpc:positional-bool (first params)))
         (outputs-param (second params))
-        (persistent (bl.rpc::%positional-bool (third params))))
+        (persistent (bl.rpc:positional-bool (third params))))
     (with-wallet-lock (wallet)
       (when (null outputs-param)
         (when unlock (wallet-unlock-all-coins wallet))
         (return-from rpc-lockunspent t))
       (unless (listp outputs-param)
-        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                           :message "transactions must be an array"))
       (let ((outputs '()))
         (dolist (o outputs-param)
           (multiple-value-bind (txid-value txid-present) (%oval o "txid")
             (multiple-value-bind (vout-value vout-present) (%oval o "vout")
               (unless (and txid-present (stringp txid-value))
-                (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                   :message "Missing txid key"))
               (unless (and vout-present (integerp vout-value))
-                (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                   :message "Missing vout key"))
               (when (minusp vout-value)
-                (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                   :message "Invalid parameter, vout cannot be negative"))
               (let* ((txid (%wallet-parse-txid txid-value))
                      (wtx (wallet-get-wallet-tx wallet txid)))
                 (unless wtx
-                  (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                     :message "Invalid parameter, unknown transaction"))
                 (unless (< vout-value
                            (length (bl.ser:transaction-outputs
                                     (wallet-tx-tx wtx))))
-                  (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                     :message "Invalid parameter, vout index out of bounds"))
                 (when (wallet-outpoint-spent-p wallet txid vout-value)
-                  (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                     :message "Invalid parameter, expected unspent output"))
                 (let ((locked (wallet-locked-coin-p wallet txid vout-value)))
                   (when (and unlock (not locked))
-                    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                       :message "Invalid parameter, expected locked output"))
                   (when (and (not unlock) locked (not persistent))
-                    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                       :message "Invalid parameter, output already locked")))
                 (push (cons txid vout-value) outputs)))))
         (dolist (outpoint (nreverse outputs))
@@ -775,7 +775,7 @@ include_unsafe query_options)."
   (let ((wallet (wallet-for-request node)))
     (with-wallet-lock (wallet)
       (or (mapcar (lambda (entry)
-                    `(("txid" . ,(bl.rpc::hash-to-hex (first entry)))
+                    `(("txid" . ,(bl.rpc:hash-to-hex (first entry)))
                       ("vout" . ,(second entry))))
                   (reverse (wallet-locked-utxos wallet)))
           #()))))
@@ -814,7 +814,7 @@ known redeem/witness script. Returns (values fields hoisted-pubkey-hex)."
     (let ((fields
             `(("script" . ,(bl.val:script-type-to-string type))
               ("hex" . ,(bl.crypto:bytes-to-hex sub-script))))
-          (sub-address (bl.rpc::%script->address sub-script (wallet-network wallet)))
+          (sub-address (bl.rpc:script->address sub-script (wallet-network wallet)))
           (hoisted nil))
       (cond
         (sub-address
@@ -876,13 +876,13 @@ for a wallet-solvable destination."
 GetKeyForDestination's supported classes: P2PKH, P2WPKH, P2SH-P2WPKH, and
 key-path-only P2TR."
   (let* ((desc (desc-spkm-desc spkm))
-         (kind (bl.rpc::out-desc-kind desc))
+         (kind (bl.rpc:out-desc-kind desc))
          (pos (spkm-is-mine spkm script)))
     (when (and pos
                (case type
                  ((:p2pkh :p2wpkh) (member kind '(:pkh :wpkh :combo)))
                  (:p2sh (or (and (eq kind :sh)
-                                 (eq (bl.rpc::out-desc-kind (bl.rpc::out-desc-sub desc)) :wpkh))
+                                 (eq (bl.rpc:out-desc-kind (bl.rpc:out-desc-sub desc)) :wpkh))
                             (eq kind :combo)))
                  ;; Key-path-ONLY tr(). Core requires spenddata.merkle_root
                  ;; .IsNull() here (signingprovider.cpp:290): a taproot output
@@ -890,7 +890,7 @@ key-path-only P2TR."
                  ;; reports no hdkeypath/hdmasterfingerprint for it. Without the
                  ;; tree test we would report the INTERNAL key's origin, which
                  ;; names a key that cannot by itself spend the output.
-                 (:p2tr (and (eq kind :tr) (null (bl.rpc::out-desc-tree desc))))
+                 (:p2tr (and (eq kind :tr) (null (bl.rpc:out-desc-tree desc))))
                  (t nil)))
       (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
         (declare (ignore scripts))
@@ -906,7 +906,7 @@ PARAMS: (address)."
         (and (stringp address)
              (bl.crypto:decode-address address (wallet-network wallet)))
       (unless type
-        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                           :message "Invalid address"))
       (with-wallet-lock (wallet)
         (multiple-value-bind (spkm pos) (%wallet-owning-spkm wallet script)
@@ -935,7 +935,7 @@ PARAMS: (address)."
                     (multiple-value-bind (fpr path)
                         (%desc-key-origin-info key pubkey key-pos)
                       `(("timestamp" . ,(desc-spkm-creation-time spkm))
-                        ("hdkeypath" . ,(format nil "m~A" (bl.rpc::%format-key-path path nil)))
+                        ("hdkeypath" . ,(format nil "m~A" (bl.rpc:format-key-path path nil)))
                         ;; Descriptor wallets have no HD seed; Core reports
                         ;; the null id (CKeyMetadata default).
                         ("hdseedid" . ,(make-string 40 :initial-element #\0))
@@ -957,7 +957,7 @@ PARAMS: (address)."
         (and (stringp address)
              (bl.crypto:decode-address address (wallet-network wallet)))
       (unless type
-        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                           :message "Invalid Bitcoin address"))
       (let ((label (%label-from-value (second params))))
         (with-wallet-lock (wallet)
@@ -983,7 +983,7 @@ PARAMS: (address)."
                            result)))
                  (wallet-address-book wallet))
         (unless result
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-invalid-label-name+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-invalid-label-name+
                             :message (format nil "No addresses with label ~A" label)))
         (sort result #'string< :key #'car)))))
 
@@ -995,7 +995,7 @@ listlabels). PARAMS: (purpose)."
         (purpose nil))
     (when (and purpose-arg (stringp purpose-arg) (plusp (length purpose-arg)))
       (unless (member purpose-arg '("send" "receive" "refund") :test #'equal)
-        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                           :message "Invalid 'purpose' argument, must be a known purpose string, typically 'send', or 'receive'."))
       (setf purpose purpose-arg))
     (with-wallet-lock (wallet)
@@ -1019,10 +1019,10 @@ listlabels). PARAMS: (purpose)."
     (with-wallet-lock (wallet)
       (let ((wtx (wallet-get-wallet-tx wallet txid)))
         (unless wtx
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                             :message "Invalid or non-wallet transaction id"))
         (unless (wallet-abandon-transaction wallet wtx)
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                             :message "Transaction not eligible for abandonment"))))
     nil))
 
@@ -1087,16 +1087,16 @@ address with a label (BY-LABEL t). PARAMS: (address|label minconf
 include_immature_coinbase)."
   (let* ((wallet (wallet-for-request node))
          (min-depth (if (second params) (second params) 1))
-         (include-immature (bl.rpc::%positional-bool (third params))))
+         (include-immature (bl.rpc:positional-bool (third params))))
     (unless (integerp min-depth)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+ :message "minconf must be an integer"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+ :message "minconf must be an integer"))
     (with-wallet-lock (wallet)
       (let ((output-scripts (make-hash-table :test 'equalp)))
         (if by-label
             (let ((addresses (%wallet-addresses-for-label
                               wallet (%label-from-value (first params)))))
               (unless addresses
-                (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                   :message "Label not found in wallet"))
               (dolist (address addresses)
                 (multiple-value-bind (type script)
@@ -1110,14 +1110,14 @@ include_immature_coinbase)."
                      (bl.crypto:decode-address (first params)
                                                          (wallet-network wallet)))
               (unless type
-                (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                                   :message "Invalid Bitcoin address"))
               (when (%wallet-script-mine-p wallet script)
                 (setf (gethash script output-scripts) t))))
         (when (zerop (hash-table-count output-scripts))
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                             :message "Address not found in wallet"))
-        (bl.rpc::%btc (%wallet-received-total wallet output-scripts min-depth
+        (bl.rpc:satoshi->btc (%wallet-received-total wallet output-scripts min-depth
                                       include-immature))))))
 
 (bl.rpc:define-rpc "getreceivedbyaddress" (node params)
@@ -1156,7 +1156,7 @@ Caller holds the wallet lock."
                                     (wallet-tx-tx wtx))
                  for script = (bl.ser:tx-out-script-pubkey
                                output)
-                 for address = (bl.rpc::%script->address script (wallet-network wallet))
+                 for address = (bl.rpc:script->address script (wallet-network wallet))
                  do (when (and address
                                (or (null filter-address)
                                    (equal address filter-address))
@@ -1177,11 +1177,11 @@ Caller holds the wallet lock."
   (let ((amount (if item (received-tally-amount item) 0))
         (conf (if item (received-tally-conf item) most-positive-fixnum)))
     `(("address" . ,address)
-      ("amount" . ,(bl.rpc::%btc amount))
+      ("amount" . ,(bl.rpc:satoshi->btc amount))
       ("confirmations" . ,(if (= conf most-positive-fixnum) 0 conf))
       ("label" . ,label)
       ("txids" . ,(if (and item (received-tally-txids item))
-                      (mapcar #'bl.rpc::hash-to-hex (reverse (received-tally-txids item)))
+                      (mapcar #'bl.rpc:hash-to-hex (reverse (received-tally-txids item)))
                       #())))))
 
 (bl.rpc:define-rpc "listreceivedbyaddress" (node params)
@@ -1190,18 +1190,18 @@ PARAMS: (minconf include_empty include_watchonly address_filter
 include_immature_coinbase)."
   (let* ((wallet (wallet-for-request node))
          (min-depth (if (first params) (first params) 1))
-         (include-empty (bl.rpc::%positional-bool (second params)))
+         (include-empty (bl.rpc:positional-bool (second params)))
          (address-filter (fourth params))
-         (include-immature (bl.rpc::%positional-bool (fifth params))))
+         (include-immature (bl.rpc:positional-bool (fifth params))))
     (unless (integerp min-depth)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+ :message "minconf must be an integer"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+ :message "minconf must be an integer"))
     (with-wallet-lock (wallet)
       (let ((filter-address nil))
         (when (and address-filter (stringp address-filter)
                    (plusp (length address-filter)))
           (unless (nth-value 0 (bl.crypto:decode-address
                                 address-filter (wallet-network wallet)))
-            (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                               :message "address_filter parameter was invalid"))
           (setf filter-address address-filter))
         (let ((tally (%wallet-received-map-tally
@@ -1230,10 +1230,10 @@ include_immature_coinbase)."
 (minconf include_empty include_watchonly include_immature_coinbase)."
   (let* ((wallet (wallet-for-request node))
          (min-depth (if (first params) (first params) 1))
-         (include-empty (bl.rpc::%positional-bool (second params)))
-         (include-immature (bl.rpc::%positional-bool (fourth params))))
+         (include-empty (bl.rpc:positional-bool (second params)))
+         (include-immature (bl.rpc:positional-bool (fourth params))))
     (unless (integerp min-depth)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+ :message "minconf must be an integer"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+ :message "minconf must be an integer"))
     (with-wallet-lock (wallet)
       (let ((tally (%wallet-received-map-tally wallet min-depth include-immature nil))
             (label-amount (make-hash-table :test 'equal))
@@ -1255,7 +1255,7 @@ include_immature_coinbase)."
          (wallet-address-book wallet))
         (maphash (lambda (label amount)
                    (let ((conf (gethash label label-conf most-positive-fixnum)))
-                     (push `(("amount" . ,(bl.rpc::%btc amount))
+                     (push `(("amount" . ,(bl.rpc:satoshi->btc amount))
                              ("confirmations" . ,(if (= conf most-positive-fixnum)
                                                      0 conf))
                              ("label" . ,label))
@@ -1281,9 +1281,9 @@ keypoolrefill). PARAMS: (newsize). 0/omitted uses the wallet's keypool size."
   (let ((wallet (wallet-for-request node))
         (newsize (first params)))
     (when (and newsize (not (integerp newsize)))
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+ :message "newsize must be an integer"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+ :message "newsize must be an integer"))
     (when (and (integerp newsize) (minusp newsize))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "Invalid parameter, expected valid size."))
     (with-wallet-lock (wallet)
       ;; Refilling derives new keys, which a locked wallet cannot do.
@@ -1296,7 +1296,7 @@ keypoolrefill). PARAMS: (newsize). 0/omitted uses the wallet's keypool size."
         ;; GetKeyPoolSize (sum across active SPKMs) must reach the request.
         (when (< (reduce #'+ spkms :key #'spkm-keypool-count :initial-value 0)
                  kp-size)
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                             :message "Error refreshing keypool."))
         (wallet-refresh-all-txos wallet)
         nil))))
@@ -1311,22 +1311,22 @@ reject inputs that are missing or already spent on-chain; here the delta is
 computed from wallet-owned prevouts (GetDebit) and the in-array new_utxos,
 which yields the same balance_change without touching the chain UTXO set."
   (let ((wallet (wallet-for-request node))
-        (rawtxs (bl.rpc::%positional-array (first params))))
+        (rawtxs (bl.rpc:positional-array (first params))))
     (unless (or (null rawtxs) (listp rawtxs))
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+ :message "rawtxs must be an array"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+ :message "rawtxs must be an array"))
     (with-wallet-lock (wallet)
       (let ((changes 0)
             (new-utxos (make-hash-table :test 'equalp))  ; outpoint-key -> value
             (spent (make-hash-table :test 'equalp)))
         (dolist (raw rawtxs)
           (unless (stringp raw)
-            (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                               :message "Transaction hex string decoding failure."))
           (let ((tx (handler-case
                         (bl.ser:parse-tx-payload
                          (bl.crypto:hex-to-bytes raw))
                       (error ()
-                        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+                        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                                           :message "Transaction hex string decoding failure.")))))
             ;; Debit: these inputs are spent when the tx is broadcast.
             (bl.ser:dovector
@@ -1336,7 +1336,7 @@ which yields the same balance_change without touching the chain UTXO set."
                            (bl.ser:outpoint-hash prevout)
                            (bl.ser:outpoint-index prevout))))
                 (when (gethash key spent)
-                  (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                     :message "Transaction(s) are spending the same output more than once"))
                 (multiple-value-bind (utxo-value present) (gethash key new-utxos)
                   (if present
@@ -1356,7 +1356,7 @@ which yields the same balance_change without touching the chain UTXO set."
                                         0)))
                          (setf (gethash (%wtx-outpoint-key hash i) new-utxos) value)
                          (incf changes value))))))
-        `(("balance_change" . ,(bl.rpc::%btc changes)))))))
+        `(("balance_change" . ,(bl.rpc:satoshi->btc changes)))))))
 
 ;;; --- listaddressgroupings (addresses.cpp:157; receive.cpp:276,304) ---
 
@@ -1378,7 +1378,7 @@ a spent TXO contributes 0. Caller holds the wallet lock."
                     (not (wallet-tx-immature-coinbase-p wallet wtx))
                     (>= (wallet-tx-depth wallet wtx)
                         (if (wallet-tx-from-me-cached wallet wtx) 0 1)))
-           (let ((address (bl.rpc::%script->address script (wallet-network wallet))))
+           (let ((address (bl.rpc:script->address script (wallet-network wallet))))
              (when address
                (incf (gethash address balances 0)
                      (if (%wallet-outpoint-key-spent-p wallet key)
@@ -1396,7 +1396,7 @@ NIL (Core InputIsMine + ExtractDestination on the mapWallet prevout)."
                         (bl.ser:outpoint-hash prevout)
                         (bl.ser:outpoint-index prevout))
       (when pwtx
-        (values (bl.rpc::%script->address
+        (values (bl.rpc:script->address
                  (bl.ser:tx-out-script-pubkey
                   (aref (bl.ser:transaction-outputs
                          (wallet-tx-tx pwtx))
@@ -1426,7 +1426,7 @@ holds the wallet lock."
              (when any-mine
                (loop for output across (bl.ser:transaction-outputs tx)
                      do (when (%wallet-output-change-p wallet output)
-                          (let ((address (bl.rpc::%script->address
+                          (let ((address (bl.rpc:script->address
                                           (bl.ser:tx-out-script-pubkey
                                            output)
                                           (wallet-network wallet))))
@@ -1436,7 +1436,7 @@ holds the wallet lock."
          (loop for output across (bl.ser:transaction-outputs tx)
                for script = (bl.ser:tx-out-script-pubkey output)
                do (when (%wallet-script-mine-p wallet script)
-                    (let ((address (bl.rpc::%script->address script (wallet-network wallet))))
+                    (let ((address (bl.rpc:script->address script (wallet-network wallet))))
                       (when address (push (list address) groupings)))))))
      (wallet-map-wallet wallet))
     groupings))
@@ -1479,7 +1479,7 @@ emits an array, not an object."
                    (multiple-value-bind (label purpose found)
                        (wallet-find-address-book-entry wallet address :allow-change t)
                      (declare (ignore purpose))
-                     (apply #'vector address (bl.rpc::%btc (gethash address balances 0))
+                     (apply #'vector address (bl.rpc:satoshi->btc (gethash address balances 0))
                             (when found (list label)))))
                  (sort (copy-list grouping) #'string<))
                 result))

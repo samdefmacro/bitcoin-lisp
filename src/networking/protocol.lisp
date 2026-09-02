@@ -8,13 +8,13 @@
   "Execute BODY while holding the node lock for thread-safe state access.
 Guards shared state (chain-state, UTXO set, mempool, peer list) against
 concurrent access from RPC and sync threads. The node is read from
-bl::*node* into a private binding: BODY's own NODE variables are untouched
+bl:*node* into a private binding: BODY's own NODE variables are untouched
 (the first version bound the literal name NODE around BODY). RPC handlers,
-which always hold a node, use bl.rpc::with-node-lock (node) instead."
+which always hold a node, use bl.rpc:with-node-lock (node) instead."
   (let ((node (gensym "NODE")))
-    `(let ((,node bl::*node*))
-       (if (and ,node (bl::node-lock ,node))
-           (bt:with-recursive-lock-held ((bl::node-lock ,node))
+    `(let ((,node bl:*node*))
+       (if (and ,node (bl:node-lock ,node))
+           (bt:with-recursive-lock-held ((bl:node-lock ,node))
              ,@body)
            (progn ,@body)))))
 
@@ -216,7 +216,7 @@ Returns T if message was handled, NIL otherwise."
          "net" "mempool request with bloom filters disabled — disconnecting peer ~A"
          (peer-address peer))
         (disconnect-peer peer))
-       ((bl.net::outbound-target-reached-p nil)
+       ((bl.net:outbound-target-reached-p nil)
         (bl:log-cat
          "net" "mempool request with bandwidth limit reached from ~A"
          (peer-address peer))
@@ -822,7 +822,7 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
            ;; Per-peer availability: announcing a block hash counts as
            ;; "peer has it" — update best-known-block (or stage
            ;; hash-last-unknown if we don't have the header yet).
-           (bl.net::update-block-availability peer chain-state hash)
+           (bl.net:update-block-availability peer chain-state hash)
            (unless (bl.store:get-block-index-entry chain-state hash)
              (setf unknown-block-hash hash)))
           ;; Transaction announcement. MSG_TX / MSG_WITNESS_TX carry a
@@ -1875,7 +1875,7 @@ cannot be."
   (let* ((tip-proof (max 1 (bl.store:calculate-chain-work tip-bits 0)))
          (sign (if (> to-work from-work) 1 -1))
          (r (abs (- to-work from-work)))
-         (spacing bl::+pow-target-spacing-seconds+))
+         (spacing bl:+pow-target-spacing-seconds+))
     (* sign (floor (* r spacing) tip-proof))))
 
 (defun %block-request-allowed-p (chain-state entry best-header)
@@ -1917,7 +1917,7 @@ into a disconnect."
   (let ((services (local-services)))
     (and (plusp (logand services bl.ser:+node-network-limited+))
          (zerop (logand services bl.ser:+node-network+))
-         (let ((tip-height (bl.store::chain-state-best-height chain-state))
+         (let ((tip-height (bl.store:chain-state-best-height chain-state))
                (height (bl.store:block-index-entry-height entry)))
            (> (- tip-height height) (+ +node-network-limited-min-blocks+ 2))))))
 
@@ -1947,7 +1947,7 @@ Core refuses to build a compact block for."
          (> (bl.ser:block-header-timestamp
              (bl.store:block-index-entry-header tip))
             (- (bl.ser:get-unix-time)
-               (* 20 bl::+pow-target-spacing-seconds+))))))
+               (* 20 bl:+pow-target-spacing-seconds+))))))
 
 (defun %serve-compact-p (chain-state entry)
   "T when a MSG_CMPCT_BLOCK request for ENTRY should be answered compactly:
@@ -2089,7 +2089,7 @@ handling of unavailable blocks."
                  ;; following the tip is unaffected, and a peer holding the
                  ;; "download" permission may exceed the target outright.
                  ((and entry
-                       (bl.net::outbound-target-reached-p t)
+                       (bl.net:outbound-target-reached-p t)
                        (not (peer-has-permission-p peer +perm-download+))
                        (let ((best (best-header)))
                          (flet ((btime (e)
@@ -2153,8 +2153,8 @@ handling of unavailable blocks."
   "The block filter index to serve BIP157 requests from, or NIL when serving is
 off (-peerblockfilters absent) or the index is unavailable."
   (and bl:*peer-block-filters*
-       bl::*node*
-       (let ((bfi (bl::node-blockfilterindex bl::*node*)))
+       bl:*node*
+       (let ((bfi (bl:node-blockfilterindex bl:*node*)))
          (and bfi (bl.store:blockfilterindex-enabled bfi) bfi))))
 
 (defun %cf-active-hash (chain-state height)
@@ -2530,8 +2530,8 @@ elicit more than one reply regardless of whether we had addresses to send."
              (not (peer-getaddr-sent peer)))
     (setf (peer-getaddr-sent peer) t)
     (let ((book (or address-book
-                    (let ((node bl::*node*))
-                      (and node (bl::node-address-book node))))))
+                    (let ((node bl:*node*))
+                      (and node (bl:node-address-book node))))))
       (when book
         ;; Served from the per-network cache: every requestor arriving on this
         ;; network sees the SAME snapshot for 21-27h, so reconnecting harvests

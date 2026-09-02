@@ -181,5 +181,5 @@ Kept free of node state so it is directly unit-testable."
          (seconds (if (plusp last)
                       (max 0 (- (bl.ser:get-node-time) last))
                       most-positive-fixnum))
-         (synced (not bl.net::*cached-is-ibd*)))
+         (synced (not bl.net:*cached-is-ibd*)))
     (values (health-ok-p alive seconds) seconds synced)))

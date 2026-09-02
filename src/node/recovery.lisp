@@ -52,9 +52,9 @@ than proceed on a tip we cannot place."
                           (bl.crypto:bytes-to-hex
                            (bl.crypto:reverse-bytes recorded))
                           tip-height)
-                (setf (bl.store::chain-state-best-block-hash chainstate)
+                (setf (bl.store:chain-state-best-block-hash chainstate)
                       (copy-seq recorded)
-                      (bl.store::chain-state-best-height chainstate)
+                      (bl.store:chain-state-best-height chainstate)
                       coins-height)
                 (bl.store:save-state chainstate :in-transition nil)
                 (log-warn "Recovered: chainstate.dat moved to the UTXO set's own block; sync will re-validate the gap")
@@ -138,7 +138,7 @@ disk on the snapshot side."
         ;; an ordinary from-genesis sync (or rebuilds from stored blocks if
         ;; -reindex-chainstate is passed again after IBD re-covers the tip).
         ((and (not snapshot-base)
-              (equalp new-hash (bl.store::chain-state-genesis-hash
+              (equalp new-hash (bl.store:chain-state-genesis-hash
                                 chain-state)))
          (let ((view (bl.store:chain-state-coins-view chain-state)))
            (when (typep view 'bl.store:coins-view-cache)
@@ -171,8 +171,8 @@ disk on the snapshot side."
                 ;; pruned-height is left as recorded — pruning is monotone and
                 ;; lags the tip by the whole block window, so it is far below
                 ;; this rewind point and those files are gone regardless.
-                (setf (bl.store::chain-state-best-block-hash chain-state) hash
-                      (bl.store::chain-state-best-height chain-state) h)
+                (setf (bl.store:chain-state-best-block-hash chain-state) hash
+                      (bl.store:chain-state-best-height chain-state) h)
                 (bl.store:save-state chain-state :in-transition nil)
                 (log-warn "Chainstate recovery: UTXO set at h=~D (recorded tip h=~D); rewound chainstate.dat ~D block~:P, will re-validate the gap"
                           h new-height (- new-height h))

@@ -46,8 +46,8 @@ startup re-detection (load-snapshot-chainstate)."
   (let ((primary (node-current-chainstate node)))
     (bl.store:make-chain-state
      :base-path (node-data-directory node)
-     :genesis-hash (bl.store::chain-state-genesis-hash primary)
-     :block-index (bl.store::chain-state-block-index primary)
+     :genesis-hash (bl.store:chain-state-genesis-hash primary)
+     :block-index (bl.store:chain-state-block-index primary)
      :from-snapshot-blockhash (copy-seq base-hash)
      :assumeutxo-status :unvalidated
      :storage-suffix "_snapshot")))

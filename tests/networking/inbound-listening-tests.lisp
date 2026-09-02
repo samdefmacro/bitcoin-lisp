@@ -101,14 +101,14 @@ clearnet, Tor and I2P identities and every reconnect."
   "The VERSION we push must carry THIS connection's nonce, not a fresh
 throwaway — otherwise the registry holds a value that never goes on the wire
 and self-connection is undetectable while every test still passes."
-  (let* ((peer (bl.net::make-peer))
+  (let* ((peer (bl.net:make-peer))
          (nonce (bl.net::%fresh-local-nonce)))
     (setf (bl.net::peer-local-nonce peer) nonce)
     (let* ((payload (bl.ser:make-version-message-bytes
                      :nonce (bl.net::peer-local-nonce peer)))
            (parsed (bl.bytes:with-byte-reader (s payload)
                      (bl.ser:read-version-message s))))
-      (is (= nonce (bl.ser::version-message-nonce parsed))
+      (is (= nonce (bl.ser:version-message-nonce parsed))
           "the nonce on the wire must be the peer's own"))))
 
 (test inbound-handshake-refuses-self-connection

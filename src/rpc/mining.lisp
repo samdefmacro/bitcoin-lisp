@@ -138,7 +138,7 @@ AFTER the proposal branch has already returned (rpc/mining.cpp:729-758) — a
 proposal is a validation request, not a request for work."
   (let ((rules (%gbt-client-rules params)))
     (flet ((declared-p (name) (and (member name rules :test #'string=) t)))
-      (when (and (eq (bl::node-network node) :signet)
+      (when (and (eq (bl:node-network node) :signet)
                  (not (declared-p "signet")))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message "getblocktemplate must be called with the signet rule set (call with {\"rules\": [\"segwit\", \"signet\"]})"))
@@ -276,7 +276,7 @@ socket timeout."
                       (/= now-updated watched-updated))
               (return)))
           ;; A node on its way down answers rather than holding the socket.
-          (unless (bl::node-running node)
+          (unless (bl:node-running node)
             (error 'rpc-error :code +rpc-client-not-connected+
                               :message "Shutting down"))
           (when (>= (get-universal-time) deadline)
@@ -311,7 +311,7 @@ miner."
   ;; holding a request open for a node that cannot mine anyway is exactly what
   ;; Core avoids by checking first. This file previously did the reverse and
   ;; said it was Core's order.
-  (when (eq (bl::node-network node) :mainnet)
+  (when (eq (bl:node-network node) :mainnet)
     (when (zerop (length (rpc-get-peers node)))
       (error 'rpc-error :code +rpc-client-not-connected+
                         :message "Bitcoin is not connected!"))
@@ -401,9 +401,9 @@ cache above wraps exactly the expensive part and nothing else."
       ;; signet miner cannot build the block's signet solution without it, so
       ;; omitting it made signet mining against this node impossible; we
       ;; reported the challenge from getmininginfo only, which no miner reads.
-      ,@(when (eq (bl::node-network node) :signet)
+      ,@(when (eq (bl:node-network node) :signet)
           (let ((challenge (bl.val:signet-challenge-for-network
-                            (bl::node-network node))))
+                            (bl:node-network node))))
             (when challenge
               (list (cons "signet_challenge"
                           (bl.crypto:bytes-to-hex challenge))))))
@@ -413,7 +413,7 @@ cache above wraps exactly the expensive part and nothing else."
       ;; Active soft-fork rules + versionbits signaling state. No BIP9
       ;; deployment is currently pending on any of our networks, so
       ;; vbavailable is empty and vbrequired is 0.
-      ("rules" . ,(%gbt-rules (bl::node-network node)
+      ("rules" . ,(%gbt-rules (bl:node-network node)
                               (bl.mining:block-template-height template)))
       ("vbavailable" . ,(make-hash-table :test 'equal))
       ("vbrequired" . 0)
@@ -441,7 +441,7 @@ cache above wraps exactly the expensive part and nothing else."
          ;; Report the last assembled template (Bitcoin Core m_last_block_*),
          ;; rather than re-assembling on every status call.
          (template bl.mining:*last-block-template*)
-         (network (bl::node-network node))
+         (network (bl:node-network node))
          ;; Core getmininginfo "next" (rpc/mining.cpp:450-458): the block that
          ;; would extend the tip, timed as the assembler times it — UpdateTime's
          ;; max(GetMinimumTime, now) — so its bits match getblocktemplate's.
@@ -471,7 +471,7 @@ cache above wraps exactly the expensive part and nothing else."
             `(("signet_challenge" . ,(bl.crypto:bytes-to-hex challenge))))
         ("warnings" . #())))))
 
-(defun %activate-submitted-block (node block)
+(defun activate-submitted-block (node block)
   "Validate+activate BLOCK through the consensus path, then ANNOUNCE it if it
 became the tip. Returns the activate-block (values ok reason). Holds the node
 lock: activation mutates the chainstate, UTXO set, and mempool exactly like a
@@ -500,7 +500,7 @@ agree on a tip, timed out on a node that was working perfectly in isolation."
                      :mempool (rpc-get-mempool node)))))
       (when (first result)
         (let ((header (bl.ser:bitcoin-block-header block))
-              (peers (bl::node-peers node)))
+              (peers (bl:node-peers node)))
           ;; Only when it is the ACTIVE tip, which is the same condition the
           ;; P2P path applies (protocol.lisp): a stored side block announces
           ;; nothing.
@@ -508,7 +508,7 @@ agree on a tip, timed out on a node that was working perfectly in isolation."
                      (equalp (bl.store:best-block-hash chain-state)
                              (bl.ser:block-header-hash header)))
             (handler-case
-                (bl.net::relay-block header nil peers)
+                (bl.net:relay-block header nil peers)
               ;; A send failure must not turn an accepted block into a
               ;; submitblock error: the block IS connected either way.
               (error (e)
@@ -536,7 +536,7 @@ stored without becoming the tip, or a BIP22 reject reason string. Routes through
       ;; Node lock: the duplicate probe and the activation must see one
       ;; chain state (Core submitblock reads the index and calls
       ;; ProcessNewBlock under cs_main); the lock is recursive, so the
-      ;; nested %activate-submitted-block lock is free.
+      ;; nested activate-submitted-block lock is free.
       (with-node-lock (node)
        (let* ((hash (bl.ser:block-header-hash
                     (bl.ser:bitcoin-block-header block)))
@@ -555,7 +555,7 @@ stored without becoming the tip, or a BIP22 reject reason string. Routes through
             (when (and store (bl.store:block-exists-p store hash))
               (return-from rpc-submitblock "duplicate"))))
         (bl.val:update-uncommitted-block-structures block chain-state)
-        (multiple-value-bind (ok reason) (%activate-submitted-block node block)
+        (multiple-value-bind (ok reason) (activate-submitted-block node block)
           (cond
             (ok nil)                        ; accepted → JSON null (BIP22 success)
             ;; A valid block stored on a side chain never reaches Core's
@@ -576,7 +576,7 @@ header); errors if the parent is missing or the header fails validation."
     (let ((header (handler-case
                       (let ((bytes (bl.crypto:hex-to-bytes hex)))
                         (flexi-streams:with-input-from-sequence (s bytes)
-                          (bl.ser::read-block-header s)))
+                          (bl.ser:read-block-header s)))
                     (error ()
                       (error 'rpc-error :code +rpc-deserialization-error+
                                         :message "Block header decode failed"))))
@@ -597,11 +597,11 @@ header); errors if the parent is missing or the header fails validation."
                                              (hash-to-hex prev))))
         ;; Validate (PoW/MTP/difficulty) then add to the index.
         (multiple-value-bind (valid err)
-            (bl.net::validate-header-chain (list header) chain-state)
+            (bl.net:validate-header-chain (list header) chain-state)
           (unless valid
             (error 'rpc-error :code +rpc-verify-error+
                               :message (or err "header validation failed")))
-          (bl.net::process-headers valid chain-state))
+          (bl.net:process-headers valid chain-state))
         nil)))))
 
 (defun %generate-to-script-pubkey (node script-pubkey nblocks maxtries)
@@ -623,7 +623,7 @@ by generatetoaddress and generatetodescriptor."
                       :utxo-set (rpc-get-utxo-set node)))))
         (unless (bl.mining:mine-block block :max-tries maxtries)
           (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
-        (multiple-value-bind (ok reason) (%activate-submitted-block node block)
+        (multiple-value-bind (ok reason) (activate-submitted-block node block)
           (unless ok
             (error 'rpc-error :code +rpc-misc-error+
                               :message (format nil "Mined block rejected: ~A" reason)))
@@ -638,7 +638,7 @@ generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
   (let ((nblocks (first params))
         (address (second params))
         (maxtries (or (third params) 1000000))
-        (network (bl::node-network node)))
+        (network (bl:node-network node)))
     (unless (and (integerp nblocks) (plusp nblocks))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "nblocks must be a positive integer"))
@@ -660,7 +660,7 @@ script. Returns an array of the mined block hashes (hex)."
   (let ((nblocks (first params))
         (descriptor (second params))
         (maxtries (or (third params) 1000000))
-        (network (bl::node-network node)))
+        (network (bl:node-network node)))
     (unless (and (integerp nblocks) (plusp nblocks))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "num_blocks must be a positive integer"))
@@ -729,8 +729,8 @@ so submit=false hex is consensus-valid too, not just decodable. When SUBMIT
 and {hash} is returned; otherwise {hash, hex}."
   (let ((output (first params))
         (txs-arg (second params))
-        (submit (%positional-bool-or (third params) t))
-        (network (bl::node-network node)))
+        (submit (positional-bool-or (third params) t))
+        (network (bl:node-network node)))
     (unless (stringp output)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "output must be a string"))
     (unless (listp txs-arg)
@@ -782,7 +782,7 @@ and {hash} is returned; otherwise {hash, hex}."
       (let ((hash-hex (hash-to-hex (bl.ser:block-header-hash
                                     (bl.ser:bitcoin-block-header block)))))
         (if submit
-            (multiple-value-bind (ok reason) (%activate-submitted-block node block)
+            (multiple-value-bind (ok reason) (activate-submitted-block node block)
               (unless (or ok (eq reason :weaker-chain))
                 ;; Validity was already dry-run above; a failure here is the
                 ;; activation itself (Core "ProcessNewBlock, block not
@@ -862,7 +862,7 @@ mempool acceptance and RBF scoring; the fee is not actually paid. Returns T."
         (let ((tx (bl.mp:mempool-entry-transaction entry)))
           (loop for out across (bl.ser:transaction-outputs tx)
                 do (when (< (bl.ser:tx-out-value out)
-                            (bl.val::dust-threshold
+                            (bl.val:dust-threshold
                              (bl.ser:tx-out-script-pubkey out)))
                      (error 'rpc-error :code +rpc-invalid-parameter+
                                        :message "Priority is not supported for transactions with dust outputs.")))))

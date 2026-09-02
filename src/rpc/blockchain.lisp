@@ -94,9 +94,9 @@ matching Bitcoin Core's uint256::GetHex."
     ;; it. This is the third place the challenge belongs — getmininginfo had
     ;; it, getblocktemplate now does, and a client that only reads chain info
     ;; had no way to learn it.
-    (when (eq (bl::node-network node) :signet)
+    (when (eq (bl:node-network node) :signet)
       (let ((challenge (bl.val:signet-challenge-for-network
-                        (bl::node-network node))))
+                        (bl:node-network node))))
         (when challenge
           (setf result
                 (append result
@@ -131,7 +131,7 @@ for a snapshot chainstate, and validated reflects its assumeutxo status."
       ;; sync splits it — Core MaybeRebalanceCaches) for the tip cache and 0
       ;; for the db cache.
       ("coins_db_cache_bytes" . 0)
-      ("coins_tip_cache_bytes" . ,(bl::chainstate-coins-cache-budget
+      ("coins_tip_cache_bytes" . ,(bl:chainstate-coins-cache-budget
                                    chain-state))
       ,@(when snapshot-hash
           `(("snapshot_blockhash" . ,(hash-to-hex snapshot-hash))))
@@ -407,7 +407,7 @@ rpc/blockchain.cpp:185-200): version, locktime, the input's sequence and
 scriptSig hex, and — only when the coinbase carries one — the single witness
 stack item (the segwit reserved value, BIP141)."
   (let* ((vin0 (aref (bl.ser:transaction-inputs coinbase-tx) 0))
-         (witness (%tx-input-witness coinbase-tx 0)))
+         (witness (tx-input-witness coinbase-tx 0)))
     (append
      `(("version" . ,(bl.ser:transaction-version coinbase-tx))
        ("locktime" . ,(bl.ser:transaction-lock-time coinbase-tx))
@@ -421,7 +421,7 @@ stack item (the segwit reserved value, BIP141)."
   "Get transaction ID as hex string."
   (hash-to-hex (bl.ser:transaction-hash tx)))
 
-(defun %script-type (script)
+(defun script-type (script)
   "Bitcoin Core scriptPubKey 'type' name for a standard SCRIPT, else
 \"nonstandard\"."
   (let ((len (length script)))
@@ -441,7 +441,7 @@ stack item (the segwit reserved value, BIP141)."
         ((and (or (= len 35) (= len 67)) (= (b (1- len)) #xac)) "pubkey")
         (t "nonstandard")))))
 
-(defun %tx-input-witness (tx index)
+(defun tx-input-witness (tx index)
   "The witness stack (vector of byte vectors) for input INDEX of TX, or NIL."
   (let ((w (bl.ser:transaction-witness tx)))
     (when (and w (< index (length w)))
@@ -471,7 +471,7 @@ verbosity-2 caller gets the fee and no prevout objects."
       ("locktime" . ,(bl.ser:transaction-lock-time tx))
       ("vin" . ,(loop for input across inputs
                       for i from 0
-                      collect (input-to-json input (%tx-input-witness tx i)
+                      collect (input-to-json input (tx-input-witness tx i)
                                              :prevout (and prevouts
                                                            (nth i spent-coins))
                                              :network network)))
@@ -517,11 +517,11 @@ verbosity-3 prevout object (core_io.cpp:478-488)."
                             ("value" . ,(/ (bl.store:utxo-entry-value prevout)
                                            100000000.0d0))
                             ("scriptPubKey"
-                             . ,(let ((addr (and network (%script->address spk network))))
+                             . ,(let ((addr (and network (script->address spk network))))
                                   (append
                                    `(("asm" . ,(bl.val:disassemble-script spk))
                                      ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                                     ("type" . ,(%script-type spk)))
+                                     ("type" . ,(script-type spk)))
                                    (when addr `(("address" . ,addr)))))))))))))
     (when (and witness-stack (plusp (length witness-stack)))
       (setf base (append base
@@ -533,11 +533,11 @@ verbosity-3 prevout object (core_io.cpp:478-488)."
   "Convert transaction output to JSON, with scriptPubKey type and (when NETWORK
 is supplied and the script is addressable) address."
   (let* ((spk (bl.ser:tx-out-script-pubkey output))
-         (addr (and network (%script->address spk network)))
+         (addr (and network (script->address spk network)))
          (spk-json `(("asm" . ,(bl.val:disassemble-script spk))
                      ,@(when network `(("desc" . ,(scriptpubkey-desc spk network))))
                      ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                     ("type" . ,(%script-type spk)))))
+                     ("type" . ,(script-type spk)))))
     (when addr
       (setf spk-json (append spk-json `(("address" . ,addr)))))
     `(("value" . ,(/ (bl.ser:tx-out-value output) 100000000.0d0))
@@ -547,7 +547,7 @@ is supplied and the script is addressable) address."
 (define-rpc "getblockheader" (node params)
   "Return block header data."
   (let ((hash-str (first params))
-        (verbose (%positional-bool-or (second params) t)))
+        (verbose (positional-bool-or (second params) t)))
     (unless (valid-hex-hash-p hash-str)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid block hash"))
@@ -621,7 +621,7 @@ count on the entry."
   (declare (ignore params))
   (let* ((chain-state (rpc-get-chain-state node))
          (block-store (rpc-get-block-store node))
-         (index (bl.store::chain-state-block-index chain-state))
+         (index (bl.store:chain-state-block-index chain-state))
          (best-hash (bl.store:best-block-hash chain-state))
          (has-child (make-hash-table :test 'equalp))
          (active (make-hash-table :test 'equalp))
@@ -702,7 +702,7 @@ accepted but ignored."
         ;; Default true; JSON false and null both fold to NIL here, matching
         ;; Core's params[2].isNull() ? true : params[2].get_bool() closely
         ;; enough for the false case that matters.
-        (include-mempool (%positional-bool-or (third params) t)))
+        (include-mempool (positional-bool-or (third params) t)))
     (unless (valid-hex-hash-p txid-str)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid txid"))
@@ -738,7 +738,7 @@ accepted but ignored."
                  (utxo-height (bl.store:utxo-entry-height entry))
                  (spk (bl.store:utxo-entry-script-pubkey entry))
                  (network (rpc-get-network node))
-                 (addr (%script->address spk network)))
+                 (addr (script->address spk network)))
             `(("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
               ;; Mempool coins report 0 confirmations (Core: nHeight ==
               ;; MEMPOOL_HEIGHT -> 0).
@@ -751,7 +751,7 @@ accepted but ignored."
               ("scriptPubKey" . (("asm" . ,(bl.val:disassemble-script spk))
                                  ("desc" . ,(scriptpubkey-desc spk network))
                                  ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                                 ("type" . ,(%script-type spk))
+                                 ("type" . ,(script-type spk))
                                  ,@(when addr `(("address" . ,addr)))))
               ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))))
           nil))))) ; Return null for spent/absent outputs
@@ -850,7 +850,7 @@ the RPC worker thread."
            (deadline (when (plusp timeout)
                        (+ (get-internal-real-time)
                           (floor (* timeout internal-time-units-per-second) 1000)))))
-      (loop while (and (bl::node-running node)
+      (loop while (and (bl:node-running node)
                        (equalp (bl.store:best-block-hash chain-state)
                                start-hash)
                        (or (null deadline)
@@ -889,7 +889,7 @@ RPC worker thread."
                           :message "blockhash must be a 64-character hex string"))
       (let* ((chain-state (rpc-get-chain-state node))
              (deadline (%wait-deadline timeout)))
-        (loop while (and (bl::node-running node)
+        (loop while (and (bl:node-running node)
                          (not (equalp (bl.store:best-block-hash chain-state)
                                       target))
                          (or (null deadline) (< (get-internal-real-time) deadline)))
@@ -909,7 +909,7 @@ indefinitely. Returns the tip on reaching the height, timeout, or node shutdown.
       (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
     (let* ((chain-state (rpc-get-chain-state node))
            (deadline (%wait-deadline timeout)))
-      (loop while (and (bl::node-running node)
+      (loop while (and (bl:node-running node)
                        (< (bl.store:current-height chain-state) height)
                        (or (null deadline) (< (get-internal-real-time) deadline)))
             do (sleep 0.25))
@@ -1048,7 +1048,7 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
           (block-store (rpc-get-block-store node))
           (utxo-set (rpc-get-utxo-set node))
           (mempool (rpc-get-mempool node))
-          (was-active (bl::node-network-active node)))
+          (was-active (bl:node-network-active node)))
       ;; NetworkDisable: skipped when the network is already off, so we don't
       ;; re-enable it behind the user's back at the end.
       (when was-active
@@ -1268,7 +1268,7 @@ base entry's tx-count is seeded from the commitment's nChainTx (Core
 validation.cpp:5938-5967), and the chainstate is adopted as current. Any
 failure tears the snapshot chainstate down (dir deleted) via FAIL, a
 function of (format-string &rest args) that must signal."
-  (let ((snap (bl::create-snapshot-chainstate node base-hash))
+  (let ((snap (bl:create-snapshot-chainstate node base-hash))
         (adopted nil))
     (unwind-protect
          (let* ((view (bl.store:chain-state-coins-view snap))
@@ -1284,7 +1284,7 @@ function of (format-string &rest args) that must signal."
                                processed))
                     (bl.store:coins-view-batch-put
                      batch
-                     (bl.store::make-utxo-key txid vout)
+                     (bl.store:make-utxo-key txid vout)
                      (bl.store:make-utxo-entry
                       :value value :script-pubkey script
                       :height height :coinbase coinbase))
@@ -1329,20 +1329,20 @@ function of (format-string &rest args) that must signal."
            ;; in the same batch as the coins — so a crash after adoption leaves
            ;; a populated database claiming no block at all, and the startup
            ;; comparison of the two records has nothing to compare.
-           (setf (bl.store::cvc-best-block view) (copy-seq base-hash))
+           (setf (bl.store:cvc-best-block view) (copy-seq base-hash))
            (bl.store:coins-view-cache-flush view :sync t)
            (bl.store:update-chain-tip snap base-hash base-height)
            (bl.store:write-snapshot-base-blockhash snap)
            (bl.store:save-state snap)
            (setf (bl.store:block-index-entry-tx-count base-entry)
                  (bl:assumeutxo-data-chain-tx-count au))
-           (bl::add-snapshot-chainstate node snap)
+           (bl:add-snapshot-chainstate node snap)
            (setf adopted t)
-           (bl::node-log
+           (bl:node-log
             :info "RPC loadtxoutset: loaded ~D coins, hash_serialized_3 verified, snapshot chainstate active at h=~D"
             coins-count base-height))
       (unless adopted
-        (bl::abort-snapshot-chainstate node snap)))))
+        (bl:abort-snapshot-chainstate node snap)))))
 
 (define-rpc "loadtxoutset" (node params)
   "Load a Bitcoin Core-format UTXO snapshot (loadtxoutset). PARAMS: (path).
@@ -1439,7 +1439,7 @@ chainstate exists (effective-prune-target-bytes)."
                 ;; --- Populate + verify into a NEW snapshot chainstate ---
                 ;; (see %populate-snapshot-chainstate). Any failure leaves
                 ;; the node untouched.
-                (bl::call-with-sync-paused
+                (bl:call-with-sync-paused
                  node
                  (lambda ()
                    (%populate-snapshot-chainstate
@@ -1494,7 +1494,7 @@ mirroring Core."
           (when *txoutset-scan-running*
             (setf *txoutset-scan-abort* t)))))
       ((equal action "start")
-       (let ((scanobjects (%positional-array (second params))))
+       (let ((scanobjects (positional-array (second params))))
          ;; An EMPTY scanobjects array is legal and means "scan for nothing":
          ;; Core still walks the UTXO set and reports success with the chain's
          ;; height, txouts and bestblock, which is what rpc_scantxoutset.py:62
@@ -1823,7 +1823,7 @@ coinstatsindex (Core's use_index path)."
   "Core PER_UTXO_OVERHEAD (rpc/blockchain.cpp:1932):
 sizeof(COutPoint) + sizeof(uint32_t) + sizeof(bool) = 36 + 4 + 1.")
 
-(defun %txout-serialize-size (script-pubkey)
+(defun txout-serialize-size (script-pubkey)
   "GetSerializeSize(CTxOut) for an output with SCRIPT-PUBKEY: the 8-byte amount
 plus the compact-size-prefixed script."
   (+ 8 (bl.ser:compact-size-length (length script-pubkey))
@@ -1943,7 +1943,7 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
                    (bl.ser:dovector
                        (out (bl.ser:transaction-outputs tx))
                      (let* ((spk (bl.ser:tx-out-script-pubkey out))
-                            (out-size (+ (%txout-serialize-size spk) +per-utxo-overhead+)))
+                            (out-size (+ (txout-serialize-size spk) +per-utxo-overhead+)))
                        (incf tx-total-out (bl.ser:tx-out-value out))
                        (incf utxo-size-inc out-size)
                        ;; Genesis and the BIP30-repeated coinbases never enter
@@ -1952,7 +1952,7 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
                        ;; figures (Core :2064-2072).
                        (unless (or (zerop height)
                                    (and coinbase-p
-                                        (bl.val::bip30-repeat-block-p height))
+                                        (bl.val:bip30-repeat-block-p height))
                                    (bl.store:script-unspendable-p spk))
                          (incf utxos)
                          (incf utxo-size-inc-actual out-size))))
@@ -1975,7 +1975,7 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
                        (bl.ser:dovector
                            (in (bl.ser:transaction-inputs tx))
                          (let* ((outpoint (bl.ser:tx-in-previous-output in))
-                                (coin (gethash (%outpoint-key
+                                (coin (gethash (outpoint-key
                                                 (bl.ser:outpoint-hash outpoint)
                                                 (bl.ser:outpoint-index outpoint))
                                                prevouts)))
@@ -1985,7 +1985,7 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
                              (error 'rpc-error :code +rpc-misc-error+
                                                :message "Can't read undo data from disk"))
                            (let ((prevout-size
-                                   (+ (%txout-serialize-size
+                                   (+ (txout-serialize-size
                                        (bl.store:utxo-entry-script-pubkey coin))
                                       +per-utxo-overhead+)))
                              (incf tx-total-in (bl.store:utxo-entry-value coin))
@@ -2068,7 +2068,7 @@ Returns the height of the last pruned block."
            (pruned (bl.store:prune-blocks-to-height
                     block-store chain-state target-height
                     :on-prune #'bl.val:delete-undo-file)))
-      (bl::node-log :info "RPC pruneblockchain: pruned ~D blocks to height ~D"
+      (bl:node-log :info "RPC pruneblockchain: pruned ~D blocks to height ~D"
                               pruned target-height)
       ;; Return the last pruned block height (matching Bitcoin Core).
       ;; Note: getblockchaininfo.pruneheight returns (1+ this) = first UNpruned block.
@@ -2109,7 +2109,7 @@ block connection for as long as that takes. Prefer several small calls."
              (lambda (entry)
                (bl.val:migrate-undo-to-flat
                 (bl.store:block-index-entry-hash entry))))
-          (bl::node-log
+          (bl:node-log
            :info "RPC migrateblocks: converted ~D block~:P; resume at height ~D; ~D legacy file~:P left"
            migrated next remaining)
           `(("migrated" . ,migrated)
@@ -2185,7 +2185,7 @@ ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
          (json-bool
           (when *scanblocks-running* (setf *scanblocks-abort* t) t))))
       ((equal action "start")
-       (let ((scanobjects (%positional-array (second params)))
+       (let ((scanobjects (positional-array (second params)))
              (filtertype (or (fifth params) "basic"))
              (bfi (rpc-get-blockfilterindex node)))
          ;; Empty is an array, as in scantxoutset above; null/omitted is not.
@@ -2274,7 +2274,7 @@ risk a false negative."
   `(("hex" . ,(bl.crypto:bytes-to-hex script))
     ,@(let ((desc (gethash script needles))) (when desc `(("desc" . ,desc))))))
 
-(defun %outpoint-key (txid index)
+(defun outpoint-key (txid index)
   (let ((k (make-array 36 :element-type '(unsigned-byte 8))))
     (replace k txid)
     (dotimes (i 4) (setf (aref k (+ 32 i)) (logand (ash index (* -8 i)) #xff)))
@@ -2284,7 +2284,7 @@ risk a false negative."
   "Map (outpoint txid+index) -> utxo-entry for an undo list, for spend lookups."
   (let ((table (make-hash-table :test 'equalp)))
     (dolist (e undo table)
-      (setf (gethash (%outpoint-key (first e) (second e)) table) (third e)))))
+      (setf (gethash (outpoint-key (first e) (second e)) table) (third e)))))
 
 (defun %tx-activity (tx needles prevout-fn base-fields)
   "Collect spend+receive activity entries for TX. NEEDLES maps script->desc;
@@ -2333,9 +2333,9 @@ common fields (blockhash/height, or nil for mempool). Returns a list of entries.
   "Return spend/receive activity for descriptors within the given blocks (and
 optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
 [options]). Mirrors Bitcoin Core getdescriptoractivity."
-  (let* ((blockhashes (%positional-array (first params)))
-         (scanobjects (%positional-array (second params)))
-         (include-mempool (%positional-bool-or (third params) t))
+  (let* ((blockhashes (positional-array (first params)))
+         (scanobjects (positional-array (second params)))
+         (include-mempool (positional-bool-or (third params) t))
          (network (rpc-get-network node))
          (chain-state (rpc-get-chain-state node))
          (block-store (rpc-get-block-store node))
@@ -2377,7 +2377,7 @@ optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
                   (base `(("blockhash" . ,(hash-to-hex hash)) ("height" . ,height))))
               (dolist (tx (bl.ser:bitcoin-block-transactions block))
                 (push (%tx-activity tx needles
-                                    (lambda (th ti) (gethash (%outpoint-key th ti) prevouts))
+                                    (lambda (th ti) (gethash (outpoint-key th ti) prevouts))
                                     base)
                       chunks))))))
       ;; Mempool (blockhash/height omitted).
@@ -2462,7 +2462,7 @@ optional blockhash param (Bitcoin Core getdeploymentinfo, rpc/blockchain.cpp:
 1489-1540). Reports the buried deployments (bip34/bip66/bip65/csv/segwit/
 taproot) using this node's per-network activation heights."
   (let* ((chain-state (rpc-get-chain-state node))
-         (network (bl::node-network node))
+         (network (bl:node-network node))
          ;; Core takes a hash only (no height form), hence the stringp guard
          ;; in front of the shared hash-or-height parser.
          (entry (let ((hex (first params)))
@@ -2609,9 +2609,9 @@ the cross-thread send safe."
                           :message "In prune mode, only blocks that the node has already synced previously can be fetched from a peer"))
       (when (and block-store (bl.store:block-exists-p block-store hash))
         (error 'rpc-error :code +rpc-misc-error+ :message "Block already downloaded"))
-      (let ((peer (bt:with-recursive-lock-held ((bl::node-lock node))
-                    (find peer-id (bl::node-peers node)
-                          :key #'bl.net::peer-id))))
+      (let ((peer (bt:with-recursive-lock-held ((bl:node-lock node))
+                    (find peer-id (bl:node-peers node)
+                          :key #'bl.net:peer-id))))
         (unless peer
           (error 'rpc-error :code +rpc-misc-error+ :message "Peer does not exist"))
         (bl.net:send-message

@@ -105,7 +105,7 @@ txid=0xAB*32, vout=1, height=100, coinbase, amount=5e9, script=OP_TRUE."
 (test muhash-empty-set
   "The empty set finalizes to a stable, specific hash (denominator = numerator
 = 1, so value = 1, SHA256 of the 384-byte LE encoding of 1)."
-  (let* ((one (bl.crypto::%le-integer-to-bytes 1 384))
+  (let* ((one (bl.crypto:le-integer-to-bytes 1 384))
          (expected (bl.crypto:bytes-to-hex
                     (bl.crypto:reverse-bytes (bl.crypto:sha256 one)))))
     (is (string= expected (%mh-hex (bl.crypto:make-muhash))))))

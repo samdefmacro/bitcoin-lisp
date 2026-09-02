@@ -49,7 +49,7 @@ the 4-byte SIGNET_HEADER when present)."
   "Serialize a signet solution: scriptSig (CScript) then the witness stack,
 matching Core's SpanReader >> scriptSig >> scriptWitness.stack."
   (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-    (bl.ser::write-var-bytes s script-sig-content)
+    (bl.ser:write-var-bytes s script-sig-content)
     (bl.ser::write-witness-stack s witness-list)))
 
 (defparameter +sig-dummy-genesis+ (%sig-fill 32 #xff)
@@ -118,7 +118,7 @@ parse/clear, and the legacy sighash all lining up."
         (bl.val:make-signet-txs block0 challenge)
       (declare (ignore to-spend))
       (is-true to-sign)
-      (let* ((sighash (bl.interop::compute-legacy-sighash
+      (let* ((sighash (bl.interop:compute-legacy-sighash
                        to-sign 0 challenge #x01))                          ; SIGHASH_ALL
              (der (bl.crypto:sign-ecdsa privkey sighash))
              (full-sig (%sig-cat der (%sig-bv #x01)))                      ; DER || SIGHASH_ALL
@@ -193,14 +193,14 @@ reject and 2015 of every 2016 blocks failed :bad-difficulty."
                                            :initial-element 7)
                       :height 100 :header prev-header :chain-work 1 :status :valid)))
     (let ((bl:*network* :signet))
-      (is (= bits (bl.val::get-expected-bits 101 prev-entry))
+      (is (= bits (bl.val:get-expected-bits 101 prev-entry))
           "signet must inherit the previous block's bits at a non-boundary"))
     ;; Unchanged for the networks that DO allow min-difficulty blocks: they
     ;; must still get NIL so validate-difficulty takes the timestamp branch.
     (dolist (net '(:testnet3 :testnet4))
       (let ((bl:*network* net))
-        (is-false (bl.val::get-expected-bits 101 prev-entry)
+        (is-false (bl.val:get-expected-bits 101 prev-entry)
                   "~A must still defer to the min-difficulty branch" net)))
     ;; And mainnet keeps inheriting, as before.
     (let ((bl:*network* :mainnet))
-      (is (= bits (bl.val::get-expected-bits 101 prev-entry))))))
+      (is (= bits (bl.val:get-expected-bits 101 prev-entry))))))

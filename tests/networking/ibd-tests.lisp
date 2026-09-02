@@ -9,10 +9,10 @@
 
 (test checkpoint-data-exists
   "Test that testnet checkpoint data is defined."
-  (is (not (null (bl.net::network-checkpoints :testnet3))))
-  (is (listp (bl.net::network-checkpoints :testnet3)))
+  (is (not (null (bl.net:network-checkpoints :testnet3))))
+  (is (listp (bl.net:network-checkpoints :testnet3)))
   ;; Check first checkpoint at height 546
-  (let ((first (first (bl.net::network-checkpoints :testnet3))))
+  (let ((first (first (bl.net:network-checkpoints :testnet3))))
     (is (= 546 (car first)))
     (is (stringp (cdr first)))))
 
@@ -20,23 +20,23 @@
   "Test checkpoint hash retrieval."
   (let ((bl:*network* :testnet3))
     ;; Known testnet3 checkpoint should return a hash
-    (let ((hash (bl.net::get-checkpoint-hash 546)))
+    (let ((hash (bl.net:get-checkpoint-hash 546)))
       (is (not (null hash)))
       (is (= 32 (length hash))))
     ;; Non-checkpoint height should return NIL
-    (is (null (bl.net::get-checkpoint-hash 547)))))
+    (is (null (bl.net:get-checkpoint-hash 547)))))
 
 (test last-checkpoint-height
   "Test getting the last checkpoint height."
   (let ((bl:*network* :testnet3))
-    (let ((height (bl.net::last-checkpoint-height)))
+    (let ((height (bl.net:last-checkpoint-height)))
       (is (integerp height))
       (is (> height 0)))))
 
 (test validate-checkpoint-match
   "Test checkpoint validation when hash matches."
   (let ((bl:*network* :testnet3))
-    (let ((hash (bl.net::get-checkpoint-hash 546)))
+    (let ((hash (bl.net:get-checkpoint-hash 546)))
       (is (bl.net::validate-checkpoint hash 546)))))
 
 (test validate-checkpoint-mismatch
@@ -57,7 +57,7 @@
   "Test that PoW validation function exists and handles edge cases."
   ;; Create a minimal mock header with easy target (high bits)
   (let* ((easy-bits #x1d00ffff)  ; Easy target for testing
-         (header (bl.ser::make-block-header
+         (header (bl.ser:make-block-header
                   :version 1
                   :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                   :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
@@ -75,13 +75,13 @@
   (let ((ctx (bl.net::make-ibd)))
     (is (not (null ctx)))
     (is (eq :idle (bl.net::ibd-context-state ctx)))
-    (is (= 0 (bl.net::ibd-context-headers-received ctx)))
+    (is (= 0 (bl.net:ibd-context-headers-received ctx)))
     (is (= 0 (bl.net::ibd-context-blocks-received ctx)))
     (is (= 16 (bl.net::ibd-context-max-in-flight ctx)))))
 
 (test ibd-state-transitions
   "Test IBD state machine transitions."
-  (let ((bl.net::*ibd-context* (bl.net::make-ibd)))
+  (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
     (is (eq :idle (bl.net::ibd-state)))
     (bl.net::set-ibd-state :syncing-headers)
     (is (eq :syncing-headers (bl.net::ibd-state)))
@@ -102,49 +102,49 @@
 
 (test in-flight-tracking
   "Test tracking in-flight block requests."
-  (let ((bl.net::*ibd-context* (bl.net::make-ibd))
+  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
         (mock-peer :peer))
 
     ;; Add to pending
-    (setf (gethash hash (bl.net::ibd-context-pending-blocks
-                         bl.net::*ibd-context*)) 100)
+    (setf (gethash hash (bl.net:ibd-context-pending-blocks
+                         bl.net:*ibd-context*)) 100)
 
     ;; Mark as in-flight
     (bl.net::mark-block-in-flight hash mock-peer)
 
     ;; Check it's now in-flight
-    (let ((in-flight (bl.net::ibd-context-in-flight
-                      bl.net::*ibd-context*)))
+    (let ((in-flight (bl.net:ibd-context-in-flight
+                      bl.net:*ibd-context*)))
       (is (= 1 (hash-table-count in-flight)))
       (let ((entry (gethash hash in-flight)))
         (is (eq mock-peer (car entry)))))))
 
 (test block-received-tracking
   "Test marking blocks as received."
-  (let ((bl.net::*ibd-context* (bl.net::make-ibd))
+  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
 
     ;; Add to pending and in-flight
-    (setf (gethash hash (bl.net::ibd-context-pending-blocks
-                         bl.net::*ibd-context*)) 100)
-    (bl.net::mark-block-in-flight hash (bl.net::make-peer))
+    (setf (gethash hash (bl.net:ibd-context-pending-blocks
+                         bl.net:*ibd-context*)) 100)
+    (bl.net::mark-block-in-flight hash (bl.net:make-peer))
 
     ;; Initial blocks received count
     (is (= 0 (bl.net::ibd-context-blocks-received
-              bl.net::*ibd-context*)))
+              bl.net:*ibd-context*)))
 
     ;; Mark as received
     (bl.net::mark-block-received hash)
 
     ;; Should be removed from pending and in-flight
-    (is (= 0 (hash-table-count (bl.net::ibd-context-pending-blocks
-                                bl.net::*ibd-context*))))
-    (is (= 0 (hash-table-count (bl.net::ibd-context-in-flight
-                                bl.net::*ibd-context*))))
+    (is (= 0 (hash-table-count (bl.net:ibd-context-pending-blocks
+                                bl.net:*ibd-context*))))
+    (is (= 0 (hash-table-count (bl.net:ibd-context-in-flight
+                                bl.net:*ibd-context*))))
     ;; Blocks received should increment
     (is (= 1 (bl.net::ibd-context-blocks-received
-              bl.net::*ibd-context*)))))
+              bl.net:*ibd-context*)))))
 
 ;;;; (The byte-aware request-window tests that lived here exercised the
 ;;;; retired height-based scheduler. The per-peer walk's window is Core's
@@ -177,11 +177,11 @@ ignores zero (unknown) sizes."
   "When queue >= 90% of cap and tip hasn't advanced in
 +stuck-tip-halt-seconds+, check-stuck-tip returns T."
   (let* ((ctx (bl.net::make-ibd))
-         (bl.net::*ibd-context* ctx)
+         (bl.net:*ibd-context* ctx)
          (cap bl.net::+max-block-queue-size+)
          (threshold (floor (* cap 9/10))))
     ;; Plant queue at threshold
-    (let ((q (bl.net::ibd-context-block-queue ctx)))
+    (let ((q (bl.net:ibd-context-block-queue ctx)))
       (loop for i from 0 below threshold
             do (setf (gethash i q) i)))
     ;; Set last-tip-advance well in the past
@@ -198,9 +198,9 @@ server 2026-05-21 06:46–07:07 hit this 3 times in 21 min before a
 13-block reorg completed; the OOM backstop fired and forced peer
 rotation each cycle, slowing recovery."
   (let* ((ctx (bl.net::make-ibd))
-         (bl.net::*ibd-context* ctx))
+         (bl.net:*ibd-context* ctx))
     ;; Plant 14 fork blocks (well below cap of 1024)
-    (let ((q (bl.net::ibd-context-block-queue ctx)))
+    (let ((q (bl.net:ibd-context-block-queue ctx)))
       (loop for i from 0 below 14
             do (setf (gethash i q) i)))
     ;; Tip stalled for 10 minutes (2x the threshold)
@@ -214,9 +214,9 @@ pins the queue count at ~170 modern blocks, far below 90% of the 1024
 count cap, so a count-only near-cap check never fired. The halt must
 also trigger when queue BYTES are near +max-block-queue-bytes+."
   (let* ((ctx (bl.net::make-ibd))
-         (bl.net::*ibd-context* ctx))
+         (bl.net:*ibd-context* ctx))
     ;; Small count (150 entries), bytes at the cap
-    (let ((q (bl.net::ibd-context-block-queue ctx)))
+    (let ((q (bl.net:ibd-context-block-queue ctx)))
       (loop for i from 0 below 150
             do (setf (gethash i q) i)))
     (setf (bl.net::ibd-context-block-queue-bytes ctx)
@@ -230,10 +230,10 @@ also trigger when queue BYTES are near +max-block-queue-bytes+."
   "If tip advanced recently, check-stuck-tip never fires regardless of
 queue size."
   (let* ((ctx (bl.net::make-ibd))
-         (bl.net::*ibd-context* ctx)
+         (bl.net:*ibd-context* ctx)
          (cap bl.net::+max-block-queue-size+))
     ;; Plant queue at cap
-    (let ((q (bl.net::ibd-context-block-queue ctx)))
+    (let ((q (bl.net:ibd-context-block-queue ctx)))
       (loop for i from 0 below cap
             do (setf (gethash i q) i)))
     ;; Tip advanced just now
@@ -259,7 +259,7 @@ peer and returns T."
                 :connection conn :state :ready :address "10.0.0.1")))
     (is (eq t (bl.net::handle-peer-fin peer)))
     (is (eq :disconnected (bl.net:peer-state peer)))
-    (is (null (bl.net::peer-connection peer)))))
+    (is (null (bl.net:peer-connection peer)))))
 
 (test handle-peer-fin-noop-on-healthy-connection
   "When connection-connected is T (no FIN seen), handle-peer-fin leaves
@@ -270,7 +270,7 @@ the peer untouched and returns NIL."
                 :connection conn :state :ready :address "10.0.0.2")))
     (is (null (bl.net::handle-peer-fin peer)))
     (is (eq :ready (bl.net:peer-state peer)))
-    (is (eq conn (bl.net::peer-connection peer)))))
+    (is (eq conn (bl.net:peer-connection peer)))))
 
 (test handle-peer-fin-noop-when-no-connection
   "Already-disconnected peers (peer-connection NIL) are a no-op — no
@@ -299,7 +299,7 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
                 :connection conn :state :ready :address "10.0.0.4")))
     (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) ctx)
     (is (eq :disconnected (bl.net:peer-state peer)))
-    (is (null (bl.net::peer-connection peer)))))
+    (is (null (bl.net:peer-connection peer)))))
 
 (test drain-and-reap-peer-noop-when-no-connection
   "A peer with peer-connection NIL is a no-op — no crash, state untouched."
@@ -313,18 +313,18 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
 
 (test timeout-detection
   "Test detecting timed out requests."
-  (let ((bl.net::*ibd-context* (bl.net::make-ibd))
+  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
 
     ;; Set a very short timeout for testing (1 second)
     (setf (bl.net::ibd-context-request-timeout
-           bl.net::*ibd-context*) 1)
+           bl.net:*ibd-context*) 1)
 
     ;; Add to in-flight with old timestamp
     (let ((old-time (- (get-internal-real-time)
                        (* 2 internal-time-units-per-second))))  ; 2 seconds ago
-      (setf (gethash hash (bl.net::ibd-context-in-flight
-                           bl.net::*ibd-context*))
+      (setf (gethash hash (bl.net:ibd-context-in-flight
+                           bl.net:*ibd-context*))
             (cons :peer old-time)))
 
     ;; Should detect timeout
@@ -336,12 +336,12 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
   "A block in-flight ~40s is timed out under the near-tip
 +block-stalling-timeout+ (30s) but NOT under the full per-block timeout
 (120s) — so near the tip a silent peer's block is retried elsewhere fast."
-  (let ((bl.net::*ibd-context* (bl.net::make-ibd))
+  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
     (setf (bl.net::ibd-context-request-timeout
-           bl.net::*ibd-context*) 120)
-    (setf (gethash hash (bl.net::ibd-context-in-flight
-                         bl.net::*ibd-context*))
+           bl.net:*ibd-context*) 120)
+    (setf (gethash hash (bl.net:ibd-context-in-flight
+                         bl.net:*ibd-context*))
           (cons :peer (- (get-internal-real-time)
                          (* 40 internal-time-units-per-second))))  ; 40s ago
     ;; Default (full 120s) timeout: not yet timed out.
@@ -354,80 +354,80 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
 
 (test retry-timed-out-requests
   "Test retrying timed out requests."
-  (let ((bl.net::*ibd-context* (bl.net::make-ibd))
+  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
 
     ;; Set short timeout and add old request
     (setf (bl.net::ibd-context-request-timeout
-           bl.net::*ibd-context*) 1)
+           bl.net:*ibd-context*) 1)
     (let ((old-time (- (get-internal-real-time)
                        (* 2 internal-time-units-per-second))))
-      (setf (gethash hash (bl.net::ibd-context-in-flight
-                           bl.net::*ibd-context*))
+      (setf (gethash hash (bl.net:ibd-context-in-flight
+                           bl.net:*ibd-context*))
             (cons :peer old-time)))
 
     ;; Also add to pending so it can be retried
-    (setf (gethash hash (bl.net::ibd-context-pending-blocks
-                         bl.net::*ibd-context*)) 100)
+    (setf (gethash hash (bl.net:ibd-context-pending-blocks
+                         bl.net:*ibd-context*)) 100)
 
     ;; Retry should remove from in-flight
     (let ((count (bl.net::retry-timed-out-requests)))
       (is (= 1 count))
-      (is (= 0 (hash-table-count (bl.net::ibd-context-in-flight
-                                  bl.net::*ibd-context*))))
+      (is (= 0 (hash-table-count (bl.net:ibd-context-in-flight
+                                  bl.net:*ibd-context*))))
       ;; Should still be in pending
-      (is (= 1 (hash-table-count (bl.net::ibd-context-pending-blocks
-                                  bl.net::*ibd-context*)))))))
+      (is (= 1 (hash-table-count (bl.net:ibd-context-pending-blocks
+                                  bl.net:*ibd-context*)))))))
 
 (test retry-timed-out-requests-drops-after-N-attempts
   "After +max-block-request-timeouts+ retries, a block is dropped from
 the pending queue. Without this, competing-fork blocks that peers
 won't serve would keep IBD's main loop spinning forever."
-  (let ((bl.net::*ibd-context* (bl.net::make-ibd))
+  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
     (setf (bl.net::ibd-context-request-timeout
-           bl.net::*ibd-context*) 1)
-    (setf (gethash hash (bl.net::ibd-context-pending-blocks
-                         bl.net::*ibd-context*)) 100)
+           bl.net:*ibd-context*) 1)
+    (setf (gethash hash (bl.net:ibd-context-pending-blocks
+                         bl.net:*ibd-context*)) 100)
     ;; Simulate N timeouts. Each iteration: put the request back
     ;; in-flight with an old timestamp, then retry — retry-timed-out-
     ;; requests removes it from in-flight and bumps the counter.
     (let ((old-time (- (get-internal-real-time)
                        (* 2 internal-time-units-per-second))))
       (loop repeat (1- bl.net::+max-block-request-timeouts+)
-            do (setf (gethash hash (bl.net::ibd-context-in-flight
-                                     bl.net::*ibd-context*))
+            do (setf (gethash hash (bl.net:ibd-context-in-flight
+                                     bl.net:*ibd-context*))
                      (cons :peer old-time))
                (bl.net::retry-timed-out-requests)))
     ;; After N-1 timeouts, still in pending.
     (is (= 1 (hash-table-count
-              (bl.net::ibd-context-pending-blocks
-               bl.net::*ibd-context*))))
+              (bl.net:ibd-context-pending-blocks
+               bl.net:*ibd-context*))))
     ;; One more timeout should drop it from pending.
     (let ((old-time (- (get-internal-real-time)
                        (* 2 internal-time-units-per-second))))
-      (setf (gethash hash (bl.net::ibd-context-in-flight
-                           bl.net::*ibd-context*))
+      (setf (gethash hash (bl.net:ibd-context-in-flight
+                           bl.net:*ibd-context*))
             (cons :peer old-time)))
     (bl.net::retry-timed-out-requests)
     (is (= 0 (hash-table-count
-              (bl.net::ibd-context-pending-blocks
-               bl.net::*ibd-context*))))))
+              (bl.net:ibd-context-pending-blocks
+               bl.net:*ibd-context*))))))
 
 (test mark-block-received-clears-timeout-counter
   "A successful receive clears the per-hash timeout counter so a future
 re-request (e.g. after a reorg) starts fresh."
-  (let ((bl.net::*ibd-context* (bl.net::make-ibd))
+  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
     ;; Plant a non-zero counter directly.
     (setf (gethash hash (bl.net::ibd-context-request-timeouts
-                         bl.net::*ibd-context*)) 3)
-    (setf (gethash hash (bl.net::ibd-context-pending-blocks
-                         bl.net::*ibd-context*)) 100)
+                         bl.net:*ibd-context*)) 3)
+    (setf (gethash hash (bl.net:ibd-context-pending-blocks
+                         bl.net:*ibd-context*)) 100)
     (bl.net::mark-block-received hash)
     (is (= 0 (hash-table-count
               (bl.net::ibd-context-request-timeouts
-               bl.net::*ibd-context*))))))
+               bl.net:*ibd-context*))))))
 
 ;;;; Per-peer block-availability tracking
 ;;;;
@@ -439,8 +439,8 @@ re-request (e.g. after a reorg) starts fresh."
 (defun %make-peer-with-state (state-key)
   "Construct a minimal peer struct for availability tests, with the
 :state slot set so callers can pretend it's :ready."
-  (let ((p (bl.net::make-peer :address "test")))
-    (setf (bl.net::peer-state p) state-key)
+  (let ((p (bl.net:make-peer :address "test")))
+    (setf (bl.net:peer-state p) state-key)
     p))
 
 (test block-relay-targets-skips-source-and-nonready
@@ -458,7 +458,7 @@ relay-off node never propagates blocks."
   (let ((bl:*network* :mainnet)
         (bl:*mainnet-relay-enabled* nil)
         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (is (null (bl.net::relay-block
+    (is (null (bl.net:relay-block
                (bl.ser:make-block-header
                 :version 1 :prev-block zeros :merkle-root zeros
                 :timestamp 1700000000 :bits #x1d00ffff :nonce 0)
@@ -468,45 +468,45 @@ relay-off node never propagates blocks."
   "tx-request-wanted-p requests from the first announcer only; a second peer
 announcing the same txid is recorded as a failover candidate (no duplicate
 request). After the tx is received, a later announce requests again."
-  (bl.net::reset-tx-requests)
+  (bl.net:reset-tx-requests)
   (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
         (p1 (%make-peer-with-state :ready))
         (p2 (%make-peer-with-state :ready)))
-    (is (eq t (bl.net::tx-request-wanted-p txid p1)))
-    (is (null (bl.net::tx-request-wanted-p txid p2)))
-    (bl.net::tx-request-received txid)
-    (is (eq t (bl.net::tx-request-wanted-p txid p1)))
-    (bl.net::reset-tx-requests)))
+    (is (eq t (bl.net:tx-request-wanted-p txid p1)))
+    (is (null (bl.net:tx-request-wanted-p txid p2)))
+    (bl.net:tx-request-received txid)
+    (is (eq t (bl.net:tx-request-wanted-p txid p1)))
+    (bl.net:reset-tx-requests)))
 
 (test tx-request-retry-reroutes-to-next-announcer
   "A timed-out tx request is re-routed to another ready announcer."
-  (bl.net::reset-tx-requests)
+  (bl.net:reset-tx-requests)
   (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8))
         (p1 (%make-peer-with-state :ready))
         (p2 (%make-peer-with-state :ready)))
-    (bl.net::tx-request-wanted-p txid p1)
-    (bl.net::tx-request-wanted-p txid p2)
+    (bl.net:tx-request-wanted-p txid p1)
+    (bl.net:tx-request-wanted-p txid p2)
     ;; backdate the in-flight timestamp by >timeout to force a re-route
     ;; (internal-real-time is image-relative, so use a real elapsed delta)
     (setf (gethash txid bl.net::*tx-in-flight*)
           (cons p1 (- (get-internal-real-time)
                       (* 120 internal-time-units-per-second))))
-    (is (= 1 (bl.net::retry-timed-out-tx-requests)))
+    (is (= 1 (bl.net:retry-timed-out-tx-requests)))
     (is (eq p2 (car (gethash txid bl.net::*tx-in-flight*))))
-    (bl.net::reset-tx-requests)))
+    (bl.net:reset-tx-requests)))
 
 (test tx-request-retry-drops-when-no-other-announcer
   "A timed-out tx request with no other announcer is dropped from tracking."
-  (bl.net::reset-tx-requests)
+  (bl.net:reset-tx-requests)
   (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
         (p1 (%make-peer-with-state :ready)))
-    (bl.net::tx-request-wanted-p txid p1)
+    (bl.net:tx-request-wanted-p txid p1)
     (setf (gethash txid bl.net::*tx-in-flight*)
           (cons p1 (- (get-internal-real-time)
                       (* 120 internal-time-units-per-second))))
-    (is (= 0 (bl.net::retry-timed-out-tx-requests)))
+    (is (= 0 (bl.net:retry-timed-out-tx-requests)))
     (is (null (gethash txid bl.net::*tx-in-flight*)))
-    (bl.net::reset-tx-requests)))
+    (bl.net:reset-tx-requests)))
 
 (test update-block-availability-known-hash
   "When the announced hash is already in the index with positive
@@ -517,8 +517,8 @@ chain-work, peer's best-known-block-hash is set to it."
     (bl.store:add-block-index-entry
      state (bl.store:make-block-index-entry
             :hash hash :height 5 :chain-work 100 :status :header-valid))
-    (bl.net::update-block-availability peer state hash)
-    (is (equalp hash (bl.net::peer-best-known-block-hash peer)))
+    (bl.net:update-block-availability peer state hash)
+    (is (equalp hash (bl.net:peer-best-known-block-hash peer)))
     (is (null (bl.net::peer-hash-last-unknown-block peer)))))
 
 (test update-block-availability-unknown-hash-staged
@@ -527,8 +527,8 @@ hash-last-unknown-block for later resolution."
   (let* ((state (bl.store:make-chain-state))
          (peer (%make-peer-with-state :ready))
          (mystery-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xCC)))
-    (bl.net::update-block-availability peer state mystery-hash)
-    (is (null (bl.net::peer-best-known-block-hash peer)))
+    (bl.net:update-block-availability peer state mystery-hash)
+    (is (null (bl.net:peer-best-known-block-hash peer)))
     (is (equalp mystery-hash
                 (bl.net::peer-hash-last-unknown-block peer)))))
 
@@ -539,7 +539,7 @@ process-block-availability promotes it to best-known."
          (peer (%make-peer-with-state :ready))
          (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8)))
     ;; Stage hash before the index has it.
-    (bl.net::update-block-availability peer state hash)
+    (bl.net:update-block-availability peer state hash)
     (is (equalp hash (bl.net::peer-hash-last-unknown-block peer)))
     ;; Index catches up.
     (bl.store:add-block-index-entry
@@ -547,7 +547,7 @@ process-block-availability promotes it to best-known."
             :hash hash :height 10 :chain-work 200 :status :header-valid))
     ;; Process resolves the staged hash.
     (bl.net::process-block-availability peer state)
-    (is (equalp hash (bl.net::peer-best-known-block-hash peer)))
+    (is (equalp hash (bl.net:peer-best-known-block-hash peer)))
     (is (null (bl.net::peer-hash-last-unknown-block peer)))))
 
 (test update-block-availability-does-not-downgrade
@@ -564,41 +564,41 @@ sending us an old announcement; we keep the strongest claim)."
     (bl.store:add-block-index-entry
      state (bl.store:make-block-index-entry
             :hash weak-hash :height 50 :chain-work 1000 :status :header-valid))
-    (bl.net::update-block-availability peer state strong-hash)
+    (bl.net:update-block-availability peer state strong-hash)
     (is (equalp strong-hash
-                (bl.net::peer-best-known-block-hash peer)))
-    (bl.net::update-block-availability peer state weak-hash)
+                (bl.net:peer-best-known-block-hash peer)))
+    (bl.net:update-block-availability peer state weak-hash)
     ;; best-known should still be the strong one.
     (is (equalp strong-hash
-                (bl.net::peer-best-known-block-hash peer)))))
+                (bl.net:peer-best-known-block-hash peer)))))
 
 (test queue-missing-fork-blocks-adds-with-reset-timeout
   "queue-missing-fork-blocks adds each hash to pending and clears its
 timeout counter so the existing scheduler retries with a fresh budget."
-  (let ((bl.net::*ibd-context* (bl.net::make-ibd))
+  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
         (h1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
         (h2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
     ;; Plant a stale timeout count for h1 to ensure it gets reset.
     (setf (gethash h1 (bl.net::ibd-context-request-timeouts
-                       bl.net::*ibd-context*)) 7)
+                       bl.net:*ibd-context*)) 7)
     (let ((queued (bl.net::queue-missing-fork-blocks
                    (list (cons h1 100) (cons h2 101)))))
       (is (= 2 queued))
       (is (= 2 (hash-table-count
-                (bl.net::ibd-context-pending-blocks
-                 bl.net::*ibd-context*))))
+                (bl.net:ibd-context-pending-blocks
+                 bl.net:*ibd-context*))))
       ;; Timeout counter for h1 was reset.
       (is (= 0 (hash-table-count
                 (bl.net::ibd-context-request-timeouts
-                 bl.net::*ibd-context*)))))))
+                 bl.net:*ibd-context*)))))))
 
 (test queue-missing-fork-blocks-skips-already-queued
   "If a hash is already in pending or in-flight, queue-missing-fork-blocks
 doesn't add it again."
-  (let ((bl.net::*ibd-context* (bl.net::make-ibd))
+  (let ((bl.net:*ibd-context* (bl.net::make-ibd))
         (h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
-    (setf (gethash h (bl.net::ibd-context-pending-blocks
-                      bl.net::*ibd-context*)) 50)
+    (setf (gethash h (bl.net:ibd-context-pending-blocks
+                      bl.net:*ibd-context*)) 50)
     (is (= 0 (bl.net::queue-missing-fork-blocks
               (list (cons h 50)))))))
 
@@ -612,7 +612,7 @@ block when in the index, and NIL when availability is unknown."
     (bl.store:add-block-index-entry
      state (bl.store:make-block-index-entry
             :hash hash :height 42 :chain-work 100 :status :header-valid))
-    (setf (bl.net::peer-best-known-block-hash peer) hash)
+    (setf (bl.net:peer-best-known-block-hash peer) hash)
     (is (= 42 (bl.net::peer-best-known-height peer state)))))
 
 ;; NOTE: the block-notfound disclaim machinery (and its tests) was retired:
@@ -635,37 +635,37 @@ block when in the index, and NIL when availability is unknown."
 (test release-orphaned-in-flight-reclaims-disconnected-peer-blocks
   "Releases in-flight blocks held by a non-:ready peer (still in pending),
 leaving a live peer's in-flight untouched."
-  (let* ((bl.net::*ibd-context* (bl.net::make-ibd))
-         (ctx bl.net::*ibd-context*)
+  (let* ((bl.net:*ibd-context* (bl.net::make-ibd))
+         (ctx bl.net:*ibd-context*)
          (live (%make-peer-with-state :ready))
          (dead (%make-peer-with-state :disconnected))
          (live-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
          (dead-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
-    (setf (gethash live-hash (bl.net::ibd-context-pending-blocks ctx)) 10
-          (gethash dead-hash (bl.net::ibd-context-pending-blocks ctx)) 11)
-    (setf (gethash live-hash (bl.net::ibd-context-in-flight ctx))
+    (setf (gethash live-hash (bl.net:ibd-context-pending-blocks ctx)) 10
+          (gethash dead-hash (bl.net:ibd-context-pending-blocks ctx)) 11)
+    (setf (gethash live-hash (bl.net:ibd-context-in-flight ctx))
           (cons live (get-internal-real-time))
-          (gethash dead-hash (bl.net::ibd-context-in-flight ctx))
+          (gethash dead-hash (bl.net:ibd-context-in-flight ctx))
           (cons dead (get-internal-real-time)))
     (is (= 1 (bl.net::release-orphaned-in-flight)))
     ;; Dead peer's block freed from in-flight but kept in pending.
-    (is (null (gethash dead-hash (bl.net::ibd-context-in-flight ctx))))
-    (is (= 11 (gethash dead-hash (bl.net::ibd-context-pending-blocks ctx))))
+    (is (null (gethash dead-hash (bl.net:ibd-context-in-flight ctx))))
+    (is (= 11 (gethash dead-hash (bl.net:ibd-context-pending-blocks ctx))))
     ;; Live peer's in-flight is untouched.
-    (is (eq live (car (gethash live-hash (bl.net::ibd-context-in-flight ctx)))))))
+    (is (eq live (car (gethash live-hash (bl.net:ibd-context-in-flight ctx)))))))
 
 ;;;; Progress Reporting Tests
 
 (test ibd-progress-reporting
   "Test IBD progress reporting."
-  (let ((bl.net::*ibd-context* (bl.net::make-ibd)))
+  (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
     ;; Set some state
     (setf (bl.net::ibd-context-target-height
-           bl.net::*ibd-context*) 1000)
+           bl.net:*ibd-context*) 1000)
     (setf (bl.net::ibd-context-blocks-received
-           bl.net::*ibd-context*) 500)
-    (setf (bl.net::ibd-context-headers-received
-           bl.net::*ibd-context*) 1000)
+           bl.net:*ibd-context*) 500)
+    (setf (bl.net:ibd-context-headers-received
+           bl.net:*ibd-context*) 1000)
 
     (let ((progress (bl.net::ibd-progress)))
       (is (not (null progress)))
@@ -681,7 +681,7 @@ leaving a live peer's in-flight untouched."
   "Test processing empty header list."
   (let ((state (bl.store:init-chain-state
                 (merge-pathnames "test-chain/" (uiop:temporary-directory)))))
-    (is (= 0 (bl.net::process-headers '() state)))))
+    (is (= 0 (bl.net:process-headers '() state)))))
 
 (test minimum-chain-work-constants
   "minimum-chain-work returns Core's exact nMinimumChainWork per network, and
@@ -691,7 +691,7 @@ the override takes precedence (for tests / custom chains)."
   (is (= #x0000000000000000000000000000000000000000000009a0fe15d0177d086304
          (bl:minimum-chain-work :testnet4)))
   (is (= 0 (bl:minimum-chain-work :regtest)))
-  (let ((bl::*minimum-chain-work-override* 42))
+  (let ((bl:*minimum-chain-work-override* 42))
     (is (= 42 (bl:minimum-chain-work :mainnet)))))
 
 (test process-headers-minimum-chain-work-gate
@@ -725,14 +725,14 @@ a header extending the high-work tip is accepted."
                      :timestamp 1296688700 :bits #x207fffff :nonce 0
                      :cached-hash tip-hash)))
     (bl.store:update-chain-tip state tip-hash 1)
-    (let ((bl::*minimum-chain-work-override* 500000000000))
+    (let ((bl:*minimum-chain-work-override* 500000000000))
       ;; A header forking off genesis: chain-work ~= genesis + 1 regtest block,
       ;; far below the 5e11 floor -> rejected.
       (let* ((fork-hdr (bl.ser:make-block-header
                         :version 1 :prev-block genesis-hash :merkle-root zeros
                         :timestamp 1296688800 :bits #x207fffff :nonce 1))
              (fork-hash (bl.ser:block-header-hash fork-hdr)))
-        (bl.net::process-headers (list fork-hdr) state)
+        (bl.net:process-headers (list fork-hdr) state)
         (is (null (bl.store:get-block-index-entry state fork-hash))
             "low-work fork header should be refused"))
       ;; A header extending the high-work tip: chain-work > floor -> accepted.
@@ -740,7 +740,7 @@ a header extending the high-work tip is accepted."
                        :version 1 :prev-block tip-hash :merkle-root zeros
                        :timestamp 1296688900 :bits #x207fffff :nonce 2))
              (ext-hash (bl.ser:block-header-hash ext-hdr)))
-        (bl.net::process-headers (list ext-hdr) state)
+        (bl.net:process-headers (list ext-hdr) state)
         (is (not (null (bl.store:get-block-index-entry state ext-hash)))
             "tip-extending header should be admitted")))))
 
@@ -773,7 +773,7 @@ the median-time-past, which fails the timestamp>MTP rule deterministically."
            (bad-hash (bl.ser:block-header-hash bad-hdr)))
       ;; (a) the shared validation gate rejects it.
       (multiple-value-bind (valid-headers error)
-          (bl.net::validate-header-chain (list bad-hdr) state)
+          (bl.net:validate-header-chain (list bad-hdr) state)
         (is (null valid-headers) "invalid header must not pass validate-header-chain")
         (is (not (null error))))
       ;; (b) routing: handle-headers must not admit it to the index. (nil peer is
@@ -825,7 +825,7 @@ refuses at admission."
                    :timestamp (+ (bl.ser:get-unix-time) 7201)
                    :bits #x207fffff :nonce 0))))
         (multiple-value-bind (valid error)
-            (bl.net::validate-header-chain (list hdr) state)
+            (bl.net:validate-header-chain (list hdr) state)
           (is (null valid) "future-dated header must be rejected")
           (is (and error (search "future" error)) "reason should be the future timestamp")))
       ;; --- version below BIP34 minimum (regtest BIP34 activates at height 1) ---
@@ -843,7 +843,7 @@ refuses at admission."
                      :version 1 :prev-block parent-hash :merkle-root zeros
                      :timestamp 1296690100 :bits #x207fffff :nonce 0))))
           (multiple-value-bind (valid error)
-              (bl.net::validate-header-chain (list hdr) state)
+              (bl.net:validate-header-chain (list hdr) state)
             (is (null valid) "version<2 at/after BIP34 height must be rejected")
             (is (and error (search "version" error)) "reason should be the bad version")))))))
 
@@ -904,22 +904,22 @@ rejected once its parent is indexed — proving the fixture really violates MTP.
             ;; violates the rule.
             (h2 (%mtp-header h1-hash (+ +mtp-batch-genesis-time+ 500))))
        (multiple-value-bind (valid error)
-           (bl.net::validate-header-chain (list h1 h2) state)
+           (bl.net:validate-header-chain (list h1 h2) state)
          (is (= 1 (length valid)) "only the first header may be admitted")
          (is (equalp h1 (first valid)))
          (is (and error (search "median-time-past" error))))
        ;; Control, part 1: H1 on its own is a valid batch.
        (multiple-value-bind (valid error)
-           (bl.net::validate-header-chain (list h1) state)
+           (bl.net:validate-header-chain (list h1) state)
          (is (= 1 (length valid)))
          (is (null error)))
        ;; Control, part 2: with H1 indexed, the hash lookup finds a median and
        ;; H2 is rejected — the behaviour a second batch always had.
-       (bl.net::process-headers (list h1) state)
+       (bl.net:process-headers (list h1) state)
        (is (not (null (bl.store:get-block-index-entry state h1-hash)))
            "H1 must be indexed for the control to mean anything")
        (multiple-value-bind (valid error)
-           (bl.net::validate-header-chain (list h2) state)
+           (bl.net:validate-header-chain (list h2) state)
          (is (null valid))
          (is (and error (search "median-time-past" error))))))))
 
@@ -934,7 +934,7 @@ median-time-past is admitted whole."
             (h3 (%mtp-header (bl.ser:block-header-hash h2)
                              (+ +mtp-batch-genesis-time+ 3000))))
        (multiple-value-bind (valid error)
-           (bl.net::validate-header-chain (list h1 h2 h3) state)
+           (bl.net:validate-header-chain (list h1 h2 h3) state)
          (is (null error))
          (is (= 3 (length valid))))))))
 
@@ -966,7 +966,7 @@ of them needed the same fix."
                             (%mtp-header h1-hash good-time :version 1))))
          (destructuring-bind (reason h2) case
            (multiple-value-bind (valid error)
-               (bl.net::validate-header-chain (list h1 h2) state)
+               (bl.net:validate-header-chain (list h1 h2) state)
              (is (= 1 (length valid)) "~A: header 2 must not be admitted" reason)
              (is (and error (search reason error))
                  "~A: rejection reason should name it, got ~A" reason error))))))))
@@ -1016,7 +1016,7 @@ of them needed the same fix."
     ;; (We can't fully test block validation here without a complete chain setup,
     ;; but we verify the parameter is wired through correctly by checking that
     ;; validate-block accepts it and the checkpoint height is accessible.)
-    (is (> (bl.net::last-checkpoint-height) 0)
+    (is (> (bl.net:last-checkpoint-height) 0)
         "Last checkpoint height should be positive")
     ;; Verify validate-block accepts the :skip-scripts keyword
     ;; (It will fail on header validation since our mock block isn't fully valid,
@@ -1034,7 +1034,7 @@ of them needed the same fix."
   (let ((state (bl.store:init-chain-state
                 (merge-pathnames "test-chain/" (uiop:temporary-directory)))))
     (multiple-value-bind (valid-headers error)
-        (bl.net::validate-header-chain '() state)
+        (bl.net:validate-header-chain '() state)
       (is (null valid-headers))
       (is (null error)))))
 
@@ -1117,7 +1117,7 @@ order and rotates past any that STALL, stopping at the first that answers."
 (test run-ibd-honors-stop-request
   "run-ibd with pending work and a stop requested returns immediately
 instead of cycling the no-peer grace (~6s) or downloading."
-  (let* ((bl.net::*ibd-context* (bl.net::make-ibd))
+  (let* ((bl.net:*ibd-context* (bl.net::make-ibd))
          (state (bl.store:make-chain-state))
          (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
     ;; A header-valid entry above the current tip gives run-ibd pending
@@ -1247,7 +1247,7 @@ and spamming the log (the testnet4 wedge produced 6.5M lines / 1.1GB this way)."
     (bl.store:add-block-index-entry
      state (bl.store:make-block-index-entry
             :hash hash :height 1 :chain-work work :status :valid
-            :header (bl.ser::make-block-header
+            :header (bl.ser:make-block-header
                      :version 1
                      :prev-block (make-array 32 :element-type '(unsigned-byte 8)
                                                 :initial-element 0)
@@ -1260,33 +1260,33 @@ and spamming the log (the testnet4 wedge produced 6.5M lines / 1.1GB this way)."
 (test initial-block-download-latch
   "T while the tip is stale or low-work; latches NIL once the tip is
 recent with enough chain work; never flips back until reset-ibd-stop."
-  (let ((bl.net::*cached-is-ibd* t)
+  (let ((bl.net:*cached-is-ibd* t)
         (bl:*network* :regtest)  ; minimum-chain-work 0
         (bl:*minimum-chain-work-override* nil)
         (now (bl.ser:get-unix-time)))
     ;; Tip two days old => still in IBD.
-    (is-true (bl.net::initial-block-download-p
+    (is-true (bl.net:initial-block-download-p
               (%make-ibd-latch-state (- now (* 48 60 60)))))
     ;; Fresh tip but below minimum chain work => still in IBD.
     (let ((bl:*minimum-chain-work-override* (expt 2 100)))
-      (is-true (bl.net::initial-block-download-p
+      (is-true (bl.net:initial-block-download-p
                 (%make-ibd-latch-state now))))
     ;; Fresh tip with enough work => leaves IBD and latches.
-    (is-false (bl.net::initial-block-download-p
+    (is-false (bl.net:initial-block-download-p
                (%make-ibd-latch-state now)))
-    (is-false bl.net::*cached-is-ibd*)
+    (is-false bl.net:*cached-is-ibd*)
     ;; Latched: a stale tip no longer flips it back.
-    (is-false (bl.net::initial-block-download-p
+    (is-false (bl.net:initial-block-download-p
                (%make-ibd-latch-state (- now (* 48 60 60)))))
     ;; reset-ibd-stop (node start) re-arms the latch.
     (bl.net:reset-ibd-stop)
-    (is-true (bl.net::initial-block-download-p
+    (is-true (bl.net:initial-block-download-p
               (%make-ibd-latch-state (- now (* 48 60 60)))))))
 
 (test handle-inv-tx-fetch-gated-during-ibd
   "During IBD, tx invs are not recorded in the request tracker and no
 getdata is attempted (Core net_processing.cpp:4176-4180)."
-  (let* ((bl.net::*cached-is-ibd* t)
+  (let* ((bl.net:*cached-is-ibd* t)
          (bl:*network* :regtest)
          (bl:*minimum-chain-work-override* nil)
          (now (bl.ser:get-unix-time))
@@ -1307,7 +1307,7 @@ getdata is attempted (Core net_processing.cpp:4176-4180)."
     (finishes (bl.net::handle-inv announcer payload (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     ;; Nothing was recorded for the hash: a fresh request from another
     ;; peer is still "wanted" (no outstanding in-flight entry).
-    (is-true (bl.net::tx-request-wanted-p tx-hash probe))
+    (is-true (bl.net:tx-request-wanted-p tx-hash probe))
     (bl.net:reset-tx-requests)))
 
 (test handle-inv-wtx-announcement-requested
@@ -1316,7 +1316,7 @@ peers send (net_processing.cpp:6009) — are matched and recorded in the
 request tracker; MSG_TX announcements still work. Regression test: the
 tx branch previously matched only types 1/0x40000001, so every
 announcement from a wtxidrelay peer was silently dropped."
-  (let* ((bl.net::*cached-is-ibd* t)
+  (let* ((bl.net:*cached-is-ibd* t)
          (bl:*network* :regtest)
          (bl:*minimum-chain-work-override* nil)
          (now (bl.ser:get-unix-time))
@@ -1346,18 +1346,18 @@ announcement from a wtxidrelay peer was silently dropped."
     (ignore-errors
       (bl.net::handle-inv wtx-announcer (funcall inv-payload bl.ser:+inv-type-wtx+ wtxid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     ;; Recorded: a probe from another peer sees the request outstanding.
-    (is-false (bl.net::tx-request-wanted-p wtxid probe))
+    (is-false (bl.net:tx-request-wanted-p wtxid probe))
     ;; MSG_TX (txid) announcements keep working alongside.
     (ignore-errors
       (bl.net::handle-inv tx-announcer (funcall inv-payload bl.ser:+inv-type-tx+ txid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
-    (is-false (bl.net::tx-request-wanted-p txid probe))
+    (is-false (bl.net:tx-request-wanted-p txid probe))
     (bl.net:reset-tx-requests)))
 
 (test handle-inv-ignores-wtxidrelay-mismatch
   "Invs that don't match the wtxidrelay negotiation are ignored: MSG_TX from
 a wtxidrelay peer, MSG_WTX from a non-wtxidrelay peer (Core
 net_processing.cpp:4145-4152)."
-  (let* ((bl.net::*cached-is-ibd* t)
+  (let* ((bl.net:*cached-is-ibd* t)
          (bl:*network* :regtest)
          (bl:*minimum-chain-work-override* nil)
          (now (bl.ser:get-unix-time))
@@ -1379,12 +1379,12 @@ net_processing.cpp:4145-4152)."
     ;; MSG_TX from a wtxidrelay peer: ignored, nothing recorded.
     (finishes
       (bl.net::handle-inv wtx-peer (funcall inv-payload bl.ser:+inv-type-tx+ h1) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
-    (is-true (bl.net::tx-request-wanted-p h1 probe))
+    (is-true (bl.net:tx-request-wanted-p h1 probe))
     ;; MSG_WTX from a non-wtxidrelay peer: ignored too.
     (bl.net:reset-tx-requests)
     (finishes
       (bl.net::handle-inv legacy-peer (funcall inv-payload bl.ser:+inv-type-wtx+ h2) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
-    (is-true (bl.net::tx-request-wanted-p h2 probe))
+    (is-true (bl.net:tx-request-wanted-p h2 probe))
     (bl.net:reset-tx-requests)))
 
 ;;;; Relay polish: wtxid-keyed rejects, getaddr, BIP35 mempool
@@ -1482,16 +1482,16 @@ wtxid hash got notfound and failover never worked for segwit txs."
         (p1 (%wave8-witness-peer))
         (p2 (%wave8-witness-peer)))
     ;; One wtxid-based and one txid-based announcement, two candidates each.
-    (is-true (bl.net::tx-request-wanted-p wtxid p1 t))
-    (is-false (bl.net::tx-request-wanted-p wtxid p2 t))
-    (is-true (bl.net::tx-request-wanted-p txid p1 nil))
-    (is-false (bl.net::tx-request-wanted-p txid p2 nil))
+    (is-true (bl.net:tx-request-wanted-p wtxid p1 t))
+    (is-false (bl.net:tx-request-wanted-p wtxid p2 t))
+    (is-true (bl.net:tx-request-wanted-p txid p1 nil))
+    (is-false (bl.net:tx-request-wanted-p txid p2 nil))
     ;; Backdate both in-flight entries past the timeout to force failover.
     (let ((stale (- (get-internal-real-time)
                     (* 120 internal-time-units-per-second))))
       (setf (gethash wtxid bl.net::*tx-in-flight*) (cons p1 stale))
       (setf (gethash txid bl.net::*tx-in-flight*) (cons p1 stale)))
-    (is (= 2 (bl.net::retry-timed-out-tx-requests)))
+    (is (= 2 (bl.net:retry-timed-out-tx-requests)))
     ;; Both rerouted to p2 with the id type preserved.
     (is (eq p2 (car (gethash wtxid bl.net::*tx-in-flight*))))
     (is (eq p2 (car (gethash txid bl.net::*tx-in-flight*))))
@@ -1537,7 +1537,7 @@ with the parent's real txid, so the orphan could never resolve."
     ;; The parent request is registered with the tx-request tracker (txid-
     ;; based), so another announcer doesn't trigger a duplicate getdata and
     ;; timeout failover applies to parent fetches too.
-    (is-false (bl.net::tx-request-wanted-p
+    (is-false (bl.net:tx-request-wanted-p
                (first parents) (%make-peer-with-state :ready)))
     (is-false (gethash (first parents)
                        bl.net::*tx-request-wtxid-p*))
@@ -1597,7 +1597,7 @@ and the tx itself is not cached as a reject."
     (is-false (bl:recent-reject-p
                rejects (bl.ser:transaction-wtxid tx)))
     ;; Parent fetch registered as a txid-based tracker entry.
-    (is-false (bl.net::tx-request-wanted-p
+    (is-false (bl.net:tx-request-wanted-p
                parent-txid (%make-peer-with-state :ready)))
     (bl.net:reset-tx-requests)))
 
@@ -1648,7 +1648,7 @@ genuinely failing non-witness-program spend IS still cached (wtxid-keyed)."
   "BIP35 'mempool' requests get a disconnect: we never advertise
 NODE_BLOOM, matching Core's no-bloom path (net_processing.cpp:4940-4951)."
   (let ((peer (bl.net:make-peer :state :ready)))
-    (is-true (bl.net::handle-message peer "mempool" #() (bl.ctx:make-node-context)))
+    (is-true (bl.net:handle-message peer "mempool" #() (bl.ctx:make-node-context)))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
 (test getaddr-message-format
@@ -1669,9 +1669,9 @@ until flush time."
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 21))
          (wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 22)))
     ;; Peer has no connection: an immediate send would error, a queue won't.
-    (finishes (bl.net::relay-transaction
+    (finishes (bl.net:relay-transaction
                txid nil (list peer) :fee-rate 2 :wtxid wtxid))
-    (is (= 1 (length (bl.net::peer-tx-inv-queue peer))))
+    (is (= 1 (length (bl.net:peer-tx-inv-queue peer))))
     (is-false (bl:recent-reject-p
                (bl.net:peer-announced-txs peer) txid))))
 
@@ -1684,16 +1684,16 @@ the connectionless peer are swallowed."
          (peer (bl.net:make-peer :state :ready :wtxid-relay t))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 23))
          (wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 24)))
-    (bl.net::relay-transaction
+    (bl.net:relay-transaction
      txid nil (list peer) :fee-rate 2 :wtxid wtxid)
     ;; Arm pass: timer initialized, nothing flushed.
     (bl.net:flush-tx-announcements (list peer) nil)
     (is (plusp (bl.net::peer-next-inv-send-time peer)))
-    (is (= 1 (length (bl.net::peer-tx-inv-queue peer))))
+    (is (= 1 (length (bl.net:peer-tx-inv-queue peer))))
     ;; Deadline in the past: flush drains and marks announced.
     (setf (bl.net::peer-next-inv-send-time peer) 1)
     (bl.net:flush-tx-announcements (list peer) nil)
-    (is (null (bl.net::peer-tx-inv-queue peer)))
+    (is (null (bl.net:peer-tx-inv-queue peer)))
     (is-true (bl:recent-reject-p
               (bl.net:peer-announced-txs peer) txid))))
 
@@ -1706,11 +1706,11 @@ m_tx_inventory_to_send the same way)."
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 25)))
     (setf (bl.net:peer-feefilter-rate peer) 1000000)
     ;; fee-rate 1 sat/vB = 1000 sat/kvB < 1000000 filter.
-    (bl.net::relay-transaction txid nil (list peer) :fee-rate 1)
-    (is (= 1 (length (bl.net::peer-tx-inv-queue peer))))
+    (bl.net:relay-transaction txid nil (list peer) :fee-rate 1)
+    (is (= 1 (length (bl.net:peer-tx-inv-queue peer))))
     (setf (bl.net::peer-next-inv-send-time peer) 1)
     (bl.net:flush-tx-announcements (list peer) nil)
-    (is (null (bl.net::peer-tx-inv-queue peer)))
+    (is (null (bl.net:peer-tx-inv-queue peer)))
     (is-false (bl:recent-reject-p
                (bl.net:peer-announced-txs peer) txid))))
 
@@ -1763,9 +1763,9 @@ net_processing.cpp:1625-1643)."
     (setf (gethash stale (bl.mp:mempool-unbroadcast mempool)) t)
     (bl.net:reattempt-initial-broadcast (list peer) mempool)
     ;; The live tx was queued for announcement (wtxid rides along)...
-    (is (= 1 (length (bl.net::peer-tx-inv-queue peer))))
+    (is (= 1 (length (bl.net:peer-tx-inv-queue peer))))
     (destructuring-bind (qtxid qwtxid fee-rate-per-kb)
-        (first (bl.net::peer-tx-inv-queue peer))
+        (first (bl.net:peer-tx-inv-queue peer))
       (declare (ignore fee-rate-per-kb))
       (is (equalp txid qtxid))
       (is (equalp (bl.ser:transaction-wtxid tx) qwtxid)))
@@ -1788,11 +1788,11 @@ the pass runs and the timer re-arms."
     ;; Arm pass: nothing queued yet.
     (bl.net:maybe-reattempt-initial-broadcast (list peer) mempool)
     (is (plusp bl.net::*next-initial-broadcast-time*))
-    (is (null (bl.net::peer-tx-inv-queue peer)))
+    (is (null (bl.net:peer-tx-inv-queue peer)))
     ;; Deadline in the past: the pass runs and re-arms.
     (setf bl.net::*next-initial-broadcast-time* 1)
     (bl.net:maybe-reattempt-initial-broadcast (list peer) mempool)
-    (is (= 1 (length (bl.net::peer-tx-inv-queue peer))))
+    (is (= 1 (length (bl.net:peer-tx-inv-queue peer))))
     (is (> bl.net::*next-initial-broadcast-time* 1))
     (bl.net:reset-initial-broadcast-schedule)))
 
@@ -1985,11 +1985,11 @@ disconnect when -txreconciliation is on (net_processing.cpp:3969-3973);
 ignored when it is off (:3964-3967)."
   (let ((bl:*tx-reconciliation* nil)
         (peer (bl.net:make-peer :state :ready)))
-    (is-true (bl.net::handle-message peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) (bl.ctx:make-node-context)))
+    (is-true (bl.net:handle-message peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) (bl.ctx:make-node-context)))
     (is (eq :ready (bl.net:peer-state peer))))
   (let ((bl:*tx-reconciliation* t)
         (peer (bl.net:make-peer :state :ready)))
-    (is-true (bl.net::handle-message peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) (bl.ctx:make-node-context)))
+    (is-true (bl.net:handle-message peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) (bl.ctx:make-node-context)))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
 (test txreconciliation-config-flag-wiring
@@ -2048,10 +2048,10 @@ blocksonly peer gets us disconnected)."
          (frelay1 (bl.net:make-peer
                    :state :ready :version (%w9-version-msg :relay t)))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 91)))
-    (bl.net::relay-transaction
+    (bl.net:relay-transaction
      txid nil (list frelay0 frelay1) :fee-rate 2)
-    (is (null (bl.net::peer-tx-inv-queue frelay0)))
-    (is (= 1 (length (bl.net::peer-tx-inv-queue frelay1))))))
+    (is (null (bl.net:peer-tx-inv-queue frelay0)))
+    (is (= 1 (length (bl.net:peer-tx-inv-queue frelay1))))))
 
 (test handle-tx-disconnects-when-relay-disabled
   "A tx message arriving where we advertised fRelay=0 (mainnet with relay
@@ -2117,9 +2117,9 @@ ignore_incoming_txs gate; only the receive side is switched off."
          (frelay1 (bl.net:make-peer
                    :state :ready :version (%w9-version-msg :relay t)))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 95)))
-    (bl.net::relay-transaction
+    (bl.net:relay-transaction
      txid nil (list frelay1) :fee-rate 2)
-    (is (= 1 (length (bl.net::peer-tx-inv-queue frelay1))))))
+    (is (= 1 (length (bl.net:peer-tx-inv-queue frelay1))))))
 
 ;;;; Tx-request tracker: Core txrequest caps, delays, cleanup
 
@@ -2131,7 +2131,7 @@ it once the delay passes (Core txdownloadman_impl.cpp:216)."
   (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 93))
         (inbound (bl.net:make-peer :state :ready :inbound t)))
     ;; Deferred: no immediate request, nothing in flight.
-    (is-false (bl.net::tx-request-wanted-p txid inbound))
+    (is-false (bl.net:tx-request-wanted-p txid inbound))
     (is (null (gethash txid bl.net::*tx-in-flight*)))
     ;; Not due yet: the scheduler sends nothing.
     (is (= 0 (bl.net:process-tx-requests)))
@@ -2151,10 +2151,10 @@ txdownloadman_impl.cpp:217)."
         (wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 95))
         (outbound (bl.net:make-peer :state :ready)))
     ;; num-wtxid-peers = 1: txid announcement deferred...
-    (is-false (bl.net::tx-request-wanted-p txid outbound nil 1))
+    (is-false (bl.net:tx-request-wanted-p txid outbound nil 1))
     (is (null (gethash txid bl.net::*tx-in-flight*)))
     ;; ...wtxid announcement immediate.
-    (is-true (bl.net::tx-request-wanted-p wtxid outbound t 1))
+    (is-true (bl.net:tx-request-wanted-p wtxid outbound t 1))
     (bl.net:reset-tx-requests)))
 
 (test tx-request-overloaded-peer-delayed
@@ -2166,7 +2166,7 @@ txdownloadman_impl.cpp:218-219)."
         (outbound (bl.net:make-peer :state :ready)))
     (setf (gethash outbound bl.net::*tx-peer-in-flight*)
           bl.net::+max-peer-tx-request-in-flight+)
-    (is-false (bl.net::tx-request-wanted-p txid outbound))
+    (is-false (bl.net:tx-request-wanted-p txid outbound))
     (is (null (gethash txid bl.net::*tx-in-flight*)))
     (bl.net:reset-tx-requests)))
 
@@ -2179,7 +2179,7 @@ outright — not recorded, not requested (Core txdownloadman_impl.cpp:204-207)."
     ;; Simulate a full announcement budget without 5000 inserts.
     (setf (gethash peer bl.net::*tx-peer-announcements*)
           bl.net::+max-peer-tx-announcements+)
-    (is-false (bl.net::tx-request-wanted-p over peer))
+    (is-false (bl.net:tx-request-wanted-p over peer))
     (is (null (gethash over bl.net::*tx-announcers*)))
     (is (null (gethash over bl.net::*tx-in-flight*)))
     (bl.net:reset-tx-requests)))
@@ -2192,8 +2192,8 @@ request over to another announcer (Core TxRequestTracker::DisconnectedPeer)."
   (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 98))
         (p1 (bl.net:make-peer :state :ready))
         (p2 (bl.net:make-peer :state :ready)))
-    (is-true (bl.net::tx-request-wanted-p txid p1))
-    (is-false (bl.net::tx-request-wanted-p txid p2))
+    (is-true (bl.net:tx-request-wanted-p txid p1))
+    (is-false (bl.net:tx-request-wanted-p txid p2))
     (bl.net:tx-request-disconnected-peer p1)
     ;; p1's request was released and its announcement forgotten.
     (is (null (gethash txid bl.net::*tx-in-flight*)))
@@ -2210,7 +2210,7 @@ peer's entries."
   (bl.net:reset-tx-requests)
   (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 99))
         (peer (bl.net:make-peer :state :ready)))
-    (is-true (bl.net::tx-request-wanted-p txid peer))
+    (is-true (bl.net:tx-request-wanted-p txid peer))
     (is (= 1 (bl.net:tx-request-count peer)))
     (bl.net:disconnect-peer peer)
     (is (= 0 (bl.net:tx-request-count peer)))
@@ -2230,8 +2230,8 @@ ReceivedResponse; handle-notfound re-runs the scheduler)."
                                   :type bl.ser:+inv-type-witness-tx+
                                   :hash txid)))
                           24)))
-    (is-true (bl.net::tx-request-wanted-p txid p1))
-    (is-false (bl.net::tx-request-wanted-p txid p2))
+    (is-true (bl.net:tx-request-wanted-p txid p1))
+    (is-false (bl.net:tx-request-wanted-p txid p2))
     (bl.net::handle-notfound p1 payload)
     ;; Failed over to p2; p1's announcement is gone.
     (is (eq p2 (car (gethash txid bl.net::*tx-in-flight*))))
@@ -2276,7 +2276,7 @@ confirmed (Core BlockConnected) and rebuilds the most-recent-block tx map
 (test handle-inv-skips-recently-confirmed
   "A tx announcement for a recently-confirmed tx is not requested (Core
 AlreadyHaveTx's recent-confirmed check, txdownloadman_impl.cpp:144)."
-  (let* ((bl.net::*cached-is-ibd* t)
+  (let* ((bl.net:*cached-is-ibd* t)
          (bl:*network* :regtest)
          (bl:*minimum-chain-work-override* nil)
          (now (bl.ser:get-unix-time))
@@ -2297,7 +2297,7 @@ AlreadyHaveTx's recent-confirmed check, txdownloadman_impl.cpp:144)."
           (bl.val:note-block-connected (%w9-block-with-tx tx))
           (finishes (bl.net::handle-inv announcer payload (bl.ctx:make-node-context :chain-state state :mempool mempool)))
           ;; Nothing recorded: a fresh probe still gets an immediate request.
-          (is-true (bl.net::tx-request-wanted-p wtxid probe t)))
+          (is-true (bl.net:tx-request-wanted-p wtxid probe t)))
       (bl.net:reset-tx-requests)
       (bl.val:reset-recent-confirmed)
       (setf bl.val::*most-recent-block-txs* nil))))
@@ -2399,7 +2399,7 @@ the tx even though it is old enough to serve."
 orphan-resolution candidate: its missing parents are requested from that
 peer (txid-based) and the peer is recorded as an additional announcer (Core
 AddTxAnnouncement's orphan branch + MaybeAddOrphanResolutionCandidate)."
-  (let* ((bl.net::*cached-is-ibd* t)
+  (let* ((bl.net:*cached-is-ibd* t)
          (bl:*network* :regtest)
          (bl:*minimum-chain-work-override* nil)
          (now (bl.ser:get-unix-time))
@@ -2540,7 +2540,7 @@ its availability with no block transfer. It recorded nothing."
     (bl.store:add-block-index-entry
      state (bl.store:make-block-index-entry
             :hash hash :height 5 :chain-work 100 :status :header-valid))
-    (is (null (bl.net::peer-best-known-block-hash peer))
+    (is (null (bl.net:peer-best-known-block-hash peer))
         "precondition: peer has no recorded best block")
     ;; FULL-BATCH t: Core's may_have_more_headers. The sibling half of
     ;; UpdatePeerStateForReceivedHeaders — the IBD sub-minchainwork outbound
@@ -2548,7 +2548,7 @@ its availability with no block transfer. It recorded nothing."
     ;; alone (that drop has its own tests in ECLIPSE-DOS-TESTS).
     (bl.net::%store-validated-headers
      peer state (list hdr) t (lambda (n) (declare (ignore n))) "test")
-    (is (equalp hash (bl.net::peer-best-known-block-hash peer))
+    (is (equalp hash (bl.net:peer-best-known-block-hash peer))
         "an all-already-known batch must still record the peer's best block")))
 
 ;;;; ============================================================
@@ -2559,10 +2559,10 @@ its availability with no block transfer. It recorded nothing."
                         (conn-type :outbound-full-relay))
   "A :ready peer that has completed a version handshake at VERSION, with a
 capturing transport so sends can be observed without sockets."
-  (let ((p (bl.net::make-peer :address "test")))
-    (setf (bl.net::peer-state p) :ready
-          (bl.net::peer-conn-type p) conn-type
-          (bl.net::peer-version p)
+  (let ((p (bl.net:make-peer :address "test")))
+    (setf (bl.net:peer-state p) :ready
+          (bl.net:peer-conn-type p) conn-type
+          (bl.net:peer-version p)
           (bl.bytes:with-byte-reader (s (bl.ser:make-version-message-bytes :version version))
             (bl.ser:read-version-message s)))
     p))
@@ -2570,10 +2570,10 @@ capturing transport so sends can be observed without sockets."
 (defmacro %g715-capturing ((sent) &body body)
   "Run BODY capturing every feefilter value sent, into the list SENT."
   `(let ((,sent '()))
-     (let ((real (fdefinition 'bl.net::send-message)))
+     (let ((real (fdefinition 'bl.net:send-message)))
        (unwind-protect
             (progn
-              (setf (fdefinition 'bl.net::send-message)
+              (setf (fdefinition 'bl.net:send-message)
                     (lambda (peer msg)
                       (declare (ignore peer))
                       (when (string= "feefilter"
@@ -2584,7 +2584,7 @@ capturing transport so sends can be observed without sockets."
                                (subseq msg 24))
                               ,sent))))
               ,@body)
-         (setf (fdefinition 'bl.net::send-message) real)))
+         (setf (fdefinition 'bl.net:send-message) real)))
      (setf ,sent (nreverse ,sent))))
 
 (test g7-15-fee-filter-buckets-match-core
@@ -2607,12 +2607,12 @@ buckets, or our quantization would become a fingerprint."
 returns a non-bucket value, and is never above the requested fee's bucket."
   (dotimes (i 200)
     (declare (ignore i))
-    (let ((r (bl.net::fee-filter-round 1000)))
+    (let ((r (bl.net:fee-filter-round 1000)))
       (is (find (float r 1d0) bl.net::*fee-filter-buckets*
                 :test (lambda (x b) (= x (floor b))))
           "every rounded value must be an actual bucket")))
   (is (= (bl.net::%feefilter-max-value)
-         (bl.net::fee-filter-round most-positive-fixnum))
+         (bl.net:fee-filter-round most-positive-fixnum))
       "above the top bucket must clamp deterministically"))
 
 (test g7-15-ibd-sends-top-bucket-then-resends-on-exit
@@ -2625,7 +2625,7 @@ without that, peers keep withholding txs from us for up to another 10 minutes."
          (peer (%g715-peer)))
     ;; --- in IBD ---
     (%g715-capturing (sent)
-      (let ((bl.net::*cached-is-ibd* t))
+      (let ((bl.net:*cached-is-ibd* t))
         (bl.net:maybe-send-feefilter peer mempool state 1000))
       (is (equal (list (bl.net::%feefilter-max-value)) sent)
           "IBD must put the top bucket on the wire, not MAX_MONEY"))
@@ -2633,7 +2633,7 @@ without that, peers keep withholding txs from us for up to another 10 minutes."
         "the next-send time must be advanced")
     ;; --- out of IBD: forced resend regardless of the schedule ---
     (%g715-capturing (sent)
-      (let ((bl.net::*cached-is-ibd* nil))
+      (let ((bl.net:*cached-is-ibd* nil))
         (bl.net:maybe-send-feefilter peer mempool state 1001))
       (is (= 1 (length sent))
           "leaving IBD must force an immediate resend")
@@ -2645,7 +2645,7 @@ without that, peers keep withholding txs from us for up to another 10 minutes."
 even when the value is unchanged and nothing is sent. Omitting that turns the
 tick into a per-second re-evaluation of every peer."
   (let* ((bl:*network* :regtest)
-         (bl.net::*cached-is-ibd* nil)
+         (bl.net:*cached-is-ibd* nil)
          (mempool (bl.mp:make-mempool))
          (state (bl.store:make-chain-state))
          (peer (%g715-peer)))
@@ -2666,7 +2666,7 @@ tick into a per-second re-evaluation of every peer."
   "Core skips feefilter for peers below FEEFILTER_VERSION (70013) and for
 outbound block-relay-only peers, which never announce txs to us anyway."
   (let* ((bl:*network* :regtest)
-         (bl.net::*cached-is-ibd* nil)
+         (bl.net:*cached-is-ibd* nil)
          (mempool (bl.mp:make-mempool))
          (state (bl.store:make-chain-state)))
     (%g715-capturing (sent)
@@ -2750,7 +2750,7 @@ and a second getheaders would desynchronise it."
              (is (= 1 sent) "no pindexLast means no advancing locator")
              ;; Full batch while a low-work sync owns this peer: that driver
              ;; sends its own follow-up, so this one must stay quiet.
-             (setf (bl.net::peer-headers-sync peer) :in-progress
+             (setf (bl.net:peer-headers-sync peer) :in-progress
                    (bl.net::peer-last-getheaders-time peer) 0)
              (bl.net::%maybe-request-more-headers peer state entry t)
              (is (= 1 sent) "a low-work sync owns its own follow-up"))
@@ -2769,7 +2769,7 @@ moment we caught up."
     ;; The counter is the transport's own per-command byte tally, so record an
     ;; empty headers message the way the reader would.
     (bl.net::%account-message
-     (bl.net::peer-recv-per-msg peer) nil "headers" 1)
+     (bl.net:peer-recv-per-msg peer) nil "headers" 1)
     (is (plusp (bl.net::%peer-headers-bytes peer))
         "an empty answer is still an answer")))
 
@@ -2805,8 +2805,8 @@ messages and check the drain leaves some behind for the next pass."
            (force-output (usocket:socket-stream client))
            (sleep 0.3)
            (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context :chain-state state :utxo-set (bl.store:make-utxo-set)) ctx)
-           (let ((took (bl.net::connection-bytes-received
-                        (bl.net::peer-connection peer))))
+           (let ((took (bl.net:connection-bytes-received
+                        (bl.net:peer-connection peer))))
              (is (plusp took) "the drain served this peer")
              (is (< took (* (length msg) queued))
                  "but yielded before draining everything it had"))
@@ -3029,14 +3029,14 @@ setBlockIndexCandidates and inserts it into m_blocks_unlinked keyed by the
 block it is waiting for — \"so that if the block arrives in the future we can
 try adding to setBlockIndexCandidates again\" (validation.cpp:3184-3190). The
 retry is not the problem; the retry with no event to wait for is."
-  (let ((bl.net::*ibd-context*
+  (let ((bl.net:*ibd-context*
           (bl.net::make-ibd-context)))
     (let ((candidate (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
           (missing (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
           (set (bl.net::ibd-context-reorg-candidates
-                bl.net::*ibd-context*))
+                bl.net:*ibd-context*))
           (parked (bl.net::ibd-context-unlinked-reorg-candidates
-                   bl.net::*ibd-context*)))
+                   bl.net:*ibd-context*)))
       (setf (gethash candidate set) t)
       (bl.net::%park-unlinked-reorg-candidate candidate missing)
       ;; It stays a CANDIDATE — several paths read that set to mean "recoverable,
@@ -3057,7 +3057,7 @@ retry is not the problem; the retry with no event to wait for is."
   "The event that makes parking safe. If the body never arrives the branch
 costs nothing; if it does, the branch must come back — otherwise this trades an
 unbounded retry for a reorg that never happens, which is strictly worse."
-  (let ((bl.net::*ibd-context*
+  (let ((bl.net:*ibd-context*
           (bl.net::make-ibd-context)))
     (multiple-value-bind (cs tip) (%gd-chain-state 10)
       ;; A candidate entry with MORE work than the tip, so note-reorg-candidate
@@ -3078,27 +3078,27 @@ unbounded retry for a reorg that never happens, which is strictly worse."
                   cs)))
         (is-true (gethash cand-hash
                           (bl.net::ibd-context-parked-reorg-candidates
-                           bl.net::*ibd-context*)))
+                           bl.net:*ibd-context*)))
         ;; The awaited block arriving un-parks it.
         (is (= 1 (bl.net::%rearm-unlinked-reorg-candidates missing cs)))
         (is-false (gethash cand-hash
                            (bl.net::ibd-context-parked-reorg-candidates
-                            bl.net::*ibd-context*))
+                            bl.net:*ibd-context*))
                   "the parked fork is still being skipped after its body landed")
         (is-true (gethash cand-hash
                           (bl.net::ibd-context-reorg-candidates
-                           bl.net::*ibd-context*)))
+                           bl.net:*ibd-context*)))
         ;; The parked entry is consumed, not left to fire again.
         (is-false (gethash missing
                            (bl.net::ibd-context-unlinked-reorg-candidates
-                            bl.net::*ibd-context*)))))))
+                            bl.net:*ibd-context*)))))))
 
 (test re-arming-re-applies-the-tests-that-admit-a-candidate
   "Re-arming goes through NOTE-REORG-CANDIDATE rather than writing to the set
 directly, so a branch that went stale or was rejected while it waited does not
 come back. Putting it back unconditionally would resurrect exactly the
 candidates the rejected set exists to keep out."
-  (let ((bl.net::*ibd-context*
+  (let ((bl.net:*ibd-context*
           (bl.net::make-ibd-context)))
     (multiple-value-bind (cs tip) (%gd-chain-state 10)
       (let* ((stale (%gd-entry :height 11
@@ -3115,7 +3115,7 @@ candidates the rejected set exists to keep out."
         (bl.net::%rearm-unlinked-reorg-candidates missing cs)
         (is-false (gethash stale-hash
                            (bl.net::ibd-context-reorg-candidates
-                            bl.net::*ibd-context*))
+                            bl.net:*ibd-context*))
                   "a branch that went stale while parked came back as a candidate")))))
 
 (test a-body-that-arrived-by-another-route-un-parks-the-branch-anyway
@@ -3133,7 +3133,7 @@ than the bug this fixes."
               (merge-pathnames (format nil "bl-unpark-~D/" (get-internal-real-time))
                                (uiop:temporary-directory)))))
     (unwind-protect
-         (let* ((bl.net::*ibd-context*
+         (let* ((bl.net:*ibd-context*
                   (bl.net::make-ibd-context))
                 (store (bl.store:init-block-store dir))
                 (cand (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
@@ -3155,10 +3155,10 @@ than the bug this fixes."
 (test the-parked-map-is-bounded-like-every-other-candidate-map
   "A pathological header topology must not be able to grow this without limit —
 the same reason the candidate and rejected sets are capped."
-  (let ((bl.net::*ibd-context*
+  (let ((bl.net:*ibd-context*
           (bl.net::make-ibd-context)))
     (let ((parked (bl.net::ibd-context-unlinked-reorg-candidates
-                   bl.net::*ibd-context*)))
+                   bl.net:*ibd-context*)))
       (loop for i from 0 below (+ bl.net::+reorg-candidates-cap+ 50)
             do (let ((missing (make-array 32 :element-type '(unsigned-byte 8))))
                  (setf (aref missing 0) (ldb (byte 8 0) i)

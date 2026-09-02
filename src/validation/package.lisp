@@ -162,7 +162,36 @@ can. src/validation/.")
    #:+max-money+
    ;; Coinbase / subsidy (for the block assembler)
    #:calculate-block-subsidy
-   #:encode-bip34-height))
+   #:encode-bip34-height)
+  ;; Reached from another package with :: before the second-round review
+  ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
+  (:export
+   #:*ms-key-parser*
+   #:*require-standard*
+   #:+parallel-validation-workers+
+   #:bip30-repeat-block-p
+   #:make-ms-satisfier
+   #:miniscript-parse-error
+   #:ms-check-after
+   #:ms-check-older
+   #:ms-find-insane-sub
+   #:ms-from-script
+   #:ms-node-duplicate-keys-p
+   #:ms-node-get-stack-size
+   #:ms-node-get-witness-size
+   #:ms-node-needs-signature-p
+   #:ms-node-non-malleable-p
+   #:ms-node-not-satisfiable-p
+   #:ms-node-sane-p
+   #:ms-node-script
+   #:ms-node-timelock-mix-p
+   #:ms-node-to-string
+   #:ms-node-valid-p
+   #:ms-node-valid-satisfactions-p
+   #:ms-parse
+   #:ms-satisfy
+   #:output-witness-program-p
+   #:parse-par-threads))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

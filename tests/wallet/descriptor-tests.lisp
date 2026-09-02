@@ -16,10 +16,10 @@
 (in-suite descriptor-tests)
 
 (defun %desc-parse (s &optional (net :mainnet))
-  (bl.rpc::parse-descriptor s net))
+  (bl.rpc:parse-descriptor s net))
 
 (defun %desc-pub (s &optional (net :mainnet))
-  (bl.rpc::out-desc-string (%desc-parse s net)))
+  (bl.rpc:out-desc-string (%desc-parse s net)))
 
 (defun %desc-scripts (s net pos)
   (mapcar #'bl.crypto:bytes-to-hex
@@ -32,12 +32,12 @@ RANGE = expected isrange; HARDENED = expansion needs private keys, so the
 PUB form must fail to expand."
   (let ((prv-desc (%desc-parse prv net))
         (pub-desc (%desc-parse pub net)))
-    (is (string= pub (bl.rpc::out-desc-string prv-desc))
+    (is (string= pub (bl.rpc:out-desc-string prv-desc))
         "private form ~A canonicalizes to ~A, wanted ~A"
-        prv (bl.rpc::out-desc-string prv-desc) pub)
-    (is (string= pub (bl.rpc::out-desc-string pub-desc)))
-    (is (eq (and range t) (and (bl.rpc::out-desc-ranged-p prv-desc) t)))
-    (is (eq t (bl.rpc::out-desc-solvable-p prv-desc)))
+        prv (bl.rpc:out-desc-string prv-desc) pub)
+    (is (string= pub (bl.rpc:out-desc-string pub-desc)))
+    (is (eq (and range t) (and (bl.rpc:out-desc-ranged-p prv-desc) t)))
+    (is (eq t (bl.rpc:out-desc-solvable-p prv-desc)))
     (when (string/= prv pub)
       (is (eq t (bl.rpc::out-desc-has-privkeys-p prv-desc)))
       (is (null (bl.rpc::out-desc-has-privkeys-p pub-desc))))
@@ -47,7 +47,7 @@ PUB form must fail to expand."
                  "~A at index ~D expands to ~S, wanted ~S"
                  prv i (%desc-scripts prv net i) expected)
              (if hardened
-                 (signals bl.rpc::descriptor-derivation-error
+                 (signals bl.rpc:descriptor-derivation-error
                    (bl.rpc::out-desc-expand pub-desc i))
                  (is (equal expected (%desc-scripts pub net i)))))))
 
@@ -61,11 +61,11 @@ must be exactly MESSAGE."
           do (handler-case
                  (progn (%desc-parse s net)
                         (fail "~A parsed but should have failed with: ~A" s message))
-               (bl.rpc::rpc-error (e)
+               (bl.rpc:rpc-error (e)
                  (when last-p
-                   (is (string= message (bl.rpc::rpc-error-message e))
+                   (is (string= message (bl.rpc:rpc-error-message e))
                        "~A failed with ~S, wanted ~S"
-                       s (bl.rpc::rpc-error-message e) message)))))))
+                       s (bl.rpc:rpc-error-message e) message)))))))
 
 ;;; --- descriptor_tests.cpp: single keys ---
 
@@ -404,9 +404,9 @@ plain sh(); >3 rejected bare; >20 rejected everywhere."
                                          (subseq prv 10)
                                          "#ggrsrxfy"))
                (fail "bad payload accepted"))
-      (bl.rpc::rpc-error (e)
+      (bl.rpc:rpc-error (e)
         (is (alexandria:starts-with-subseq "Provided checksum 'ggrsrxfy' does not match computed checksum"
-                                           (bl.rpc::rpc-error-message e)))))
+                                           (bl.rpc:rpc-error-message e)))))
     ;; Error in checksum detected
     (%check-unparsable (concatenate 'string prv "#ggssrxfy") ""
                        "Provided checksum 'ggssrxfy' does not match computed checksum 'ggrsrxfy'")
@@ -529,7 +529,7 @@ the cache; different descriptors/indices don't collide."
     (let ((r (bl.rpc::rpc-getdescriptorinfo node (list "raw(51)"))))
       (is (eq 'yason:false (cdr (assoc "issolvable" r :test #'string=)))))
     ;; Bad checksum still rejected.
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getdescriptorinfo node (list "raw(51)#deadbeef")))))
 
 ;;; --- deriveaddresses (Core test/functional/rpc_deriveaddresses.py) ---
@@ -554,14 +554,14 @@ in the Core test (bech32 HRP differs between our testnet node and Core's
 regtest node, the underlying scriptPubKeys must match exactly)."
   (let* ((node (make-test-node))     ; :testnet3
          (tprv "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK")
-         (descsum (lambda (body) (bl.rpc::descriptor-add-checksum body))))
+         (descsum (lambda (body) (bl.rpc:descriptor-add-checksum body))))
     (flet ((expect-error (message &rest args)
              (handler-case
                  (progn (bl.rpc::rpc-deriveaddresses node args)
                         (fail "expected error ~S for ~S" message args))
-               (bl.rpc::rpc-error (e)
-                 (is (string= message (bl.rpc::rpc-error-message e))
-                     "got ~S wanted ~S" (bl.rpc::rpc-error-message e) message)))))
+               (bl.rpc:rpc-error (e)
+                 (is (string= message (bl.rpc:rpc-error-message e))
+                     "got ~S wanted ~S" (bl.rpc:rpc-error-message e) message)))))
       ;; No checksum -> error
       (expect-error "Missing checksum" "a")
       ;; Single wpkh
@@ -615,9 +615,9 @@ regtest node, the underlying scriptPubKeys must match exactly)."
   "scantxoutset expands ranged descriptors over their range (default
 [0,1000]); an explicit range object narrows/widens the window."
   (let* ((node (make-test-node))
-         (utxo (bl::node-utxo-set node))
+         (utxo (bl:node-utxo-set node))
          (desc "wpkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/1/*)")
-         (parsed (bl.rpc::parse-descriptor desc :testnet3))
+         (parsed (bl.rpc:parse-descriptor desc :testnet3))
          (script-at-5 (first (bl.rpc::out-desc-expand parsed 5)))
          (script-at-1500 (first (bl.rpc::out-desc-expand parsed 1500)))
          (txid-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
@@ -646,7 +646,7 @@ regtest node, the underlying scriptPubKeys must match exactly)."
     (let ((obj (make-hash-table :test 'equal)))
       (setf (gethash "desc" obj) desc
             (gethash "range" obj) (list 0 2000000))
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-scantxoutset node (list "start" (list obj)))))))
 
 ;;; --- generatetodescriptor-style consumers reject ranged descriptors ---
@@ -659,9 +659,9 @@ Core's 'Ranged descriptor not accepted' behavior."
               "wpkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/*)"
               :testnet3)
              (fail "ranged descriptor accepted"))
-    (bl.rpc::rpc-error (e)
+    (bl.rpc:rpc-error (e)
       (is (string= "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?"
-                   (bl.rpc::rpc-error-message e)))))
+                   (bl.rpc:rpc-error-message e)))))
   ;; Unranged xpub descriptors now expand fine on this path.
   (let ((pairs (bl.rpc::parse-output-descriptor
                 "wpkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/1/0)"
@@ -672,9 +672,9 @@ Core's 'Ranged descriptor not accepted' behavior."
 ;;;; Multipath descriptors (BIP389)
 
 (defun %mp-expand (s)
-  (handler-case (bl.rpc::expand-multipath-descriptor s)
-    (bl.rpc::rpc-error (e)
-      (list :error (bl.rpc::rpc-error-message e)))))
+  (handler-case (bl.rpc:expand-multipath-descriptor s)
+    (bl.rpc:rpc-error (e)
+      (list :error (bl.rpc:rpc-error-message e)))))
 
 (test multipath-descriptors-expand-into-one-descriptor-each
   "`wpkh(xpub/<0;1>/*)` is ONE string meaning TWO descriptors — the receive
@@ -775,11 +775,11 @@ the reason a multipath import cannot carry a label (:203-206)."
 (defun %dt-expand-pairs (desc-string)
   "(values desc scripts pairs) for DESC-STRING at index 0, the way
 %SPKM-EXPANSION-PAIRS builds them for the wallet."
-  (let ((d (bl.rpc::parse-descriptor desc-string :mainnet)))
+  (let ((d (bl.rpc:parse-descriptor desc-string :mainnet)))
     (multiple-value-bind (scripts pubkeys)
         (bl.rpc::%out-desc-expand-cached d 0)
       (values d scripts
-              (mapcar #'cons (bl.rpc::out-desc-ordered-keys d) pubkeys)))))
+              (mapcar #'cons (bl.rpc:out-desc-ordered-keys d) pubkeys)))))
 
 (test expansion-pubkeys-come-back-in-key-expression-order
   "%SPKM-EXPANSION-PAIRS zips the expansion's pubkey list against
@@ -799,7 +799,7 @@ consulted when signing."
       (declare (ignore desc scripts))
       ;; Every pair must hold a key and the pubkey that key derives to.
       (dolist (pair pairs)
-        (is (equalp (bl.rpc::desc-key-pubkey (car pair)) (cdr pair))
+        (is (equalp (bl.rpc:desc-key-pubkey (car pair)) (cdr pair))
             "key expression paired with another expression's pubkey")))))
 
 (test wsh-miniscript-can-be-inferred-instead-of-crashing
@@ -910,7 +910,7 @@ leaf as pk(xpub.../1/*) while pushing the 32-byte form into the script. Deciding
 the script from the print flag silently gives a 33-byte push here — a different
 leaf hash, a different merkle root, and therefore a different ADDRESS."
   (let* ((d (%desc-parse (format nil "tr(~A/0/*,pk(~A/1/*))" +tr-xpub+ +tr-xpub+)))
-         (leaf (cdr (first (bl.rpc::out-desc-tree d))))
+         (leaf (cdr (first (bl.rpc:out-desc-tree d))))
          (script (first (bl.rpc::out-desc-expand leaf 0))))
     (is (= 34 (length script))
         "leaf script is ~D bytes, wanted 34 (push32 + CHECKSIG)" (length script))
@@ -918,7 +918,7 @@ leaf hash, a different merkle root, and therefore a different ADDRESS."
     (is (= #xac (aref script 33)))
     ;; And the key still prints as an xpub, which is the half that must NOT
     ;; follow the script.
-    (is-true (search +tr-xpub+ (bl.rpc::out-desc-string d))
+    (is-true (search +tr-xpub+ (bl.rpc:out-desc-string d))
              "the leaf key stopped printing as an xpub")))
 
 (test tr-tree-inference-names-each-leafs-own-key
@@ -968,9 +968,9 @@ wallet backup is identified by."
     (is (eq t (cdr (assoc "issolvable" r :test #'string=))))
     ;; JSON false is a SENTINEL OBJECT, which is true in Lisp: IS-FALSE here
     ;; would pass on any value the RPC could ever return.
-    (is (eq bl.rpc::+json-false+
+    (is (eq bl.rpc:+json-false+
             (cdr (assoc "isrange" r :test #'string=))))
-    (is (eq bl.rpc::+json-false+
+    (is (eq bl.rpc:+json-false+
             (cdr (assoc "hasprivatekeys" r :test #'string=))))
     ;; The reported form keeps the tree and round-trips to itself.
     (is-true (search "{pk(" reported) "the tree vanished from ~S" reported)
@@ -994,12 +994,12 @@ The interpreter is the oracle here: it is held to Core's script/sighash/BIP341
 vectors by the rest of this battery, so a witness it accepts under standard
 flags is one Core accepts. A hand-written expected witness would only re-assert
 whatever the signer happened to build."
-  (let* ((desc (bl.rpc::parse-descriptor desc-str :mainnet))
+  (let* ((desc (bl.rpc:parse-descriptor desc-str :mainnet))
          (spk (first (bl.rpc::out-desc-expand desc 0)))
          (amount 100000)
          (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (multiple-value-bind (output-key leaves)
-        (bl.rpc::tr-spend-data
+        (bl.rpc:tr-spend-data
          desc 0 (lambda (k) (bl.rpc::%desc-key-pubkey-at k 0)))
       (let* ((prev-txid (make-array 32 :element-type '(unsigned-byte 8)
                                        :initial-element 7))
@@ -1023,7 +1023,7 @@ whatever the signer happened to build."
              (tr-scripts (make-hash-table :test 'equalp))
              (pairs (mapcar (lambda (k)
                               (cons k (bl.rpc::%desc-key-pubkey-at k 0)))
-                            (bl.rpc::out-desc-ordered-keys desc)))
+                            (bl.rpc:out-desc-ordered-keys desc)))
              (next (bl.wallet::%pairs-splitter (rest pairs))))
         (setf (gethash (cons prev-txid 0) prevmap) (list spk amount nil nil))
         (dolist (wif held-wifs)
@@ -1033,11 +1033,11 @@ whatever the signer happened to build."
             (setf (gethash (bl.crypto:hash160 pub) keymap) (cons sk pub))))
         (setf (gethash output-key tr-scripts)
               (loop for (script leaf-hash control) in leaves
-                    for (nil . leaf) in (bl.rpc::out-desc-tree desc)
+                    for (nil . leaf) in (bl.rpc:out-desc-tree desc)
                     for own = (funcall next leaf)
                     collect (list script leaf-hash control leaf
                                   (mapcar #'cdr own))))
-        (let ((errs (bl.rpc::%sign-tx-inputs
+        (let ((errs (bl.rpc:sign-tx-inputs
                      tx prevmap keymap pubmap tr-keymap 1 tr-scripts)))
           (values (mapcar #'cdr errs)
                   (map 'list (lambda (st) (mapcar #'length st))
@@ -1140,18 +1140,18 @@ precisely why the guard needs a test of its own rather than a caller."
     (is (= 32 (length (bl.rpc::%taproot-tree
                        (list (cons 1 (funcall h 1)) (cons 1 (funcall h 2)))))))
     ;; Propagating past the root.
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::%taproot-tree
        (list (cons 1 (funcall h 1)) (cons 1 (funcall h 2)) (cons 0 (funcall h 3)))))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::%taproot-tree
        (list (cons 0 (funcall h 1)) (cons 0 (funcall h 2)))))
     ;; A leaf above an unfinished deeper branch.
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::%taproot-tree
        (list (cons 2 (funcall h 1)) (cons 1 (funcall h 2)))))
     ;; And an incomplete tree is still incomplete.
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::%taproot-tree (list (cons 1 (funcall h 1)))))))
 
 ;;;; --- musig() key aggregation (BIP327/BIP328) -----------------------------
@@ -1244,10 +1244,10 @@ would be unspendable while the descriptor looked fine."
         (b "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
         (i "a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd"))
     ;; multi_a inside wsh(): rejected.
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (%desc-parse (format nil "wsh(multi_a(1,~A,~A))" a b)))
     ;; multi inside a tr() leaf: rejected.
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (%desc-parse (format nil "tr(~A,multi(1,~A,~A))" i a b)))
     ;; And each in its own context parses.
     (finishes (%desc-parse (format nil "wsh(multi(1,~A,~A))" a b)))
@@ -1261,7 +1261,7 @@ the same split that produced a wrong address twice in the tr() work."
   (let* ((a "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc")
          (i "a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd")
          (d (%desc-parse (format nil "tr(~A,and_v(v:pk(~A),older(42)))" i a)))
-         (leaf (cdr (first (bl.rpc::out-desc-tree d))))
+         (leaf (cdr (first (bl.rpc:out-desc-tree d))))
          (script (first (bl.rpc::out-desc-expand leaf 0))))
     ;; <32> <x> CHECKSIGVERIFY <42> CHECKSEQUENCEVERIFY
     (is (= 32 (aref script 0))

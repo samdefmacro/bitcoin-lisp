@@ -91,7 +91,7 @@ whose target package exists. Called after each file that defines packages."
         (loop for (nickname . target) in *package-nicknames*
               for target-package = (find-package target)
               ;; a package nicknames itself too: files in the top package
-              ;; write bl::*node* like everyone else
+              ;; write bl:*node* like everyone else
               when target-package
                 do (sb-ext:add-package-local-nickname nickname target-package package))))))
 

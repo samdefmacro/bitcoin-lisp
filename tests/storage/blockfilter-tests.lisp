@@ -151,7 +151,7 @@ an unrelated script (almost surely) does not."
 ;;; --- Persistent index + RPCs (regtest integration) ---
 ;;;
 ;;; Reuses the regtest fixture from mining-tests.lisp (with-network (:regtest),
-;;; regtest-node-fixture). Binding bl::*node* lets the connect-time
+;;; regtest-node-fixture). Binding bl:*node* lets the connect-time
 ;;; hook (index-block-connected) fire as generatetodescriptor mines blocks.
 
 (defun %bfi-regtest-node ()
@@ -164,12 +164,12 @@ genesis filter from chain parameters before any block connects."
          (idxbase (merge-pathnames (format nil "test-bfi-~A/" tag)
                                    (uiop:temporary-directory))))
     (ensure-directories-exist idxbase)
-    (setf (bl::node-blockfilterindex node)
+    (setf (bl:node-blockfilterindex node)
           (bl.store:init-blockfilterindex idxbase :enabled t))
     (bl.store:build-blockfilterindex
-     (bl::node-blockfilterindex node)
-     (bl::node-chain-state node)
-     (bl::node-block-store node)
+     (bl:node-blockfilterindex node)
+     (bl:node-chain-state node)
+     (bl:node-block-store node)
      #'bl.val:get-undo-data)
     node))
 
@@ -201,18 +201,18 @@ nothing."
 recomputation, and a filter header; unknown type / missing block error."
   (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (let ((hashes (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)")))
-             (bfi (bl::node-blockfilterindex node)))
+             (bfi (bl:node-blockfilterindex node)))
          (is (= 3 (length hashes)))
          (is (= 3 (bl.store:blockfilterindex-height bfi)))
          (dolist (h hashes)
            (let* ((res (bl.rpc::rpc-getblockfilter node (list h)))
                   (filt-hex (cdr (assoc "filter" res :test #'equal)))
                   (hdr-hex (cdr (assoc "header" res :test #'equal)))
-                  (hash (bl.rpc::parse-hex-hash h))
+                  (hash (bl.rpc:parse-hex-hash h))
                   (block (bl.store:get-block
-                          (bl::node-block-store node) hash))
+                          (bl:node-block-store node) hash))
                   (undo (bl.val:get-undo-data hash))
                   (spent (mapcar (lambda (e)
                                    (bl.store:utxo-entry-script-pubkey (third e)))
@@ -222,21 +222,21 @@ recomputation, and a filter header; unknown type / missing block error."
              (is (= 64 (length hdr-hex)))
              (is (string= filt-hex (bl.crypto:bytes-to-hex recomputed)))))
          ;; unknown filtertype
-         (signals bl.rpc::rpc-error
+         (signals bl.rpc:rpc-error
            (bl.rpc::rpc-getblockfilter node (list (first hashes) "foo")))
          ;; unknown block
-         (signals bl.rpc::rpc-error
+         (signals bl.rpc:rpc-error
            (bl.rpc::rpc-getblockfilter
-            node (list (bl.rpc::hash-to-hex (%bfi-zeros32))))))))))
+            node (list (bl.rpc:hash-to-hex (%bfi-zeros32))))))))))
 
 (test blockfilterindex-header-chain
   "Each block's stored filter header chains off its parent's (BIP157)."
   (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
-       (let ((bfi (bl::node-blockfilterindex node))
-             (cs (bl::node-chain-state node)))
+       (let ((bfi (bl:node-blockfilterindex node))
+             (cs (bl:node-chain-state node)))
          (loop for h from 1 to 3
                for hash = (bl.store:block-index-entry-hash
                            (bl.store:get-block-at-height cs h))
@@ -254,7 +254,7 @@ recomputation, and a filter header; unknown type / missing block error."
 filter_false_positives keeps the true matches; idle status is null."
   (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (let ((hashes (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))))
          (let* ((res (bl.rpc::rpc-scanblocks node (list "start" (list "raw(51)"))))
                 (blocks (cdr (assoc "relevant_blocks" res :test #'equal))))
@@ -275,9 +275,9 @@ filter_false_positives keeps the true matches; idle status is null."
          ;; idle status is null
          (is (null (bl.rpc::rpc-scanblocks node (list "status"))))
          ;; out-of-range / reversed heights error rather than silently clamp
-         (signals bl.rpc::rpc-error
+         (signals bl.rpc:rpc-error
            (bl.rpc::rpc-scanblocks node (list "start" (list "raw(51)") 999999)))
-         (signals bl.rpc::rpc-error
+         (signals bl.rpc:rpc-error
            (bl.rpc::rpc-scanblocks node (list "start" (list "raw(51)") 3 1))))))))
 
 (test blockfilterindex-backfill-seeks-first-indexable
@@ -291,10 +291,10 @@ contiguous."
    ;; Mine 5 blocks on a node with NO filter index attached, so the connect
    ;; hook indexes nothing and the backfill does all the work.
    (let ((node (regtest-node-fixture (format nil "bfb~D" (get-internal-real-time)))))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
-       (let* ((cs (bl::node-chain-state node))
-              (store (bl::node-block-store node))
+       (let* ((cs (bl:node-chain-state node))
+              (store (bl:node-block-store node))
               (idxbase (merge-pathnames
                         (format nil "test-bfb-~D/" (get-internal-real-time))
                         (uiop:temporary-directory)))
@@ -370,10 +370,10 @@ marker (observed live after a mid-backfill crash). An empty index still seeds
 from the zero header, and filling the gap in order is then accepted."
   (with-network (:regtest)
    (let ((node (regtest-node-fixture (format nil "bfc~D" (get-internal-real-time)))))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
-       (let* ((cs (bl::node-chain-state node))
-              (store (bl::node-block-store node))
+       (let* ((cs (bl:node-chain-state node))
+              (store (bl:node-block-store node))
               (idxbase (merge-pathnames
                         (format nil "test-bfc-~D/" (get-internal-real-time))
                         (uiop:temporary-directory)))
@@ -405,7 +405,7 @@ from the zero header, and filling the gap in order is then accepted."
   "getdescriptoractivity reports a receive for a matching coinbase output."
   (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (let* ((hashes (bl.rpc::rpc-generatetodescriptor node (list 2 "raw(51)")))
               (res (bl.rpc::rpc-getdescriptoractivity
                     node (list hashes (list "raw(51)") nil)))
@@ -419,9 +419,9 @@ from the zero header, and filling the gap in order is then accepted."
            (is-true (assoc "height" e :test #'equal))
            (is-true (assoc "output_spk" e :test #'equal)))
          ;; an unknown block hash errors (Core parity)
-         (signals bl.rpc::rpc-error
+         (signals bl.rpc:rpc-error
            (bl.rpc::rpc-getdescriptoractivity
-            node (list (list (bl.rpc::hash-to-hex (%bfi-zeros32)))
+            node (list (list (bl.rpc:hash-to-hex (%bfi-zeros32)))
                        (list "raw(51)") nil))))))))
 
 (test bip157-serving-request-validation-and-messages
@@ -430,11 +430,11 @@ range bounds; the cfilter/cfheaders/cfcheckpt builders and parsers round-trip
 against a real backfilled index. peer-block-filters gates %cf-serving-index."
   (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
-     (let ((bl::*node* node)
+     (let ((bl:*node* node)
            (bl:*peer-block-filters* t))
        (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
-       (let* ((cs (bl::node-chain-state node))
-              (bfi (bl::node-blockfilterindex node))
+       (let* ((cs (bl:node-chain-state node))
+              (bfi (bl:node-blockfilterindex node))
               (h3 (bl.store:block-index-entry-hash
                    (bl.store:get-block-at-height cs 3))))
          ;; gate: off when peer-block-filters is nil
@@ -466,7 +466,7 @@ against a real backfilled index. peer-block-filters gates %cf-serving-index."
                       (bl.bytes:with-byte-reader (s msg)
                         (bl.ser:read-message-header s)))))
            (is (string= "cfcheckpt" cmd))))
-       (bl.store:close-blockfilterindex (bl::node-blockfilterindex node))))))
+       (bl.store:close-blockfilterindex (bl:node-blockfilterindex node))))))
 
 ;;; --- BIP157 genesis anchor ---
 ;;;
@@ -552,10 +552,10 @@ alone; a pruned node's legacy index is kept (rebuild impossible) with a
 warning."
   (with-network (:regtest)
    (let ((node (regtest-node-fixture (format nil "bfm~D" (get-internal-real-time)))))
-     (let ((bl::*node* node))
+     (let ((bl:*node* node))
        (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
-       (let* ((cs (bl::node-chain-state node))
-              (store (bl::node-block-store node))
+       (let* ((cs (bl:node-chain-state node))
+              (store (bl:node-block-store node))
               (ghash (bl.store:network-genesis-hash :regtest))
               (idxbase (merge-pathnames
                         (format nil "test-bfm-~D/" (get-internal-real-time))

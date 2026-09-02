@@ -37,7 +37,7 @@ blocks to rebuild an index would read the entire chain into memory."
                         :key-offset (flat-file-pos-pos pos))
             (handler-case
                 (let ((header (flexi-streams:with-input-from-sequence (hs bytes)
-                                (bl.ser::read-block-header hs))))
+                                (bl.ser:read-block-header hs))))
                   (values header (bl.crypto:hash256 bytes)))
               (error () nil))))))))
 

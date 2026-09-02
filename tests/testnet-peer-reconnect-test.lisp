@@ -22,7 +22,7 @@
 
 ;; Enable console output
 (setf bl:*log-stream* *standard-output*)
-(setf bl.log::*current-log-level* :info)
+(setf bl.log:*current-log-level* :info)
 
 (format t "~%========================================~%")
 (format t "Testnet Peer Reconnection Test~%")
@@ -40,12 +40,12 @@
 (force-output)
 (bl::connect-to-peers bl:*node* 4 :timeout 30 :min-peers 2)
 
-(defparameter *initial-peers* (copy-list (bl::node-peers bl:*node*)))
+(defparameter *initial-peers* (copy-list (bl:node-peers bl:*node*)))
 (defparameter *initial-peer-count* (length *initial-peers*))
 
 (format t "~%Initial peer count: ~D~%" *initial-peer-count*)
 (dolist (peer *initial-peers*)
-  (format t "  - ~A~%" (bl::peer-address peer)))
+  (format t "  - ~A~%" (bl.net:peer-address peer)))
 (force-output)
 
 (when (< *initial-peer-count* 2)
@@ -58,7 +58,7 @@
   (sb-thread:make-thread
    (lambda ()
      (handler-case
-         (bl::sync-blockchain bl:*node*)
+         (bl:sync-blockchain bl:*node*)
        (error (e)
          (format t "Sync error: ~A~%" e))))
    :name "sync-thread"))
@@ -70,15 +70,15 @@
 (loop
   (sleep 5)
   (let ((height (bl.store:current-height
-                 (bl::node-chain-state bl:*node*))))
+                 (bl:node-chain-state bl:*node*))))
     (format t "  Height: ~D, Peers: ~D~%"
-            height (length (bl::node-peers bl:*node*)))
+            height (length (bl:node-peers bl:*node*)))
     (force-output)
     (when (>= height 50)
       (return))))
 
 ;; Get current peers before disconnect
-(defparameter *peers-before* (copy-list (bl::node-peers bl:*node*)))
+(defparameter *peers-before* (copy-list (bl:node-peers bl:*node*)))
 (defparameter *peer-count-before* (length *peers-before*))
 
 (format t "~%=== DISCONNECTING A PEER ===~%")
@@ -88,7 +88,7 @@
 ;; Disconnect the first peer
 (let ((peer-to-disconnect (first *peers-before*)))
   (when peer-to-disconnect
-    (format t "Disconnecting peer: ~A~%" (bl::peer-address peer-to-disconnect))
+    (format t "Disconnecting peer: ~A~%" (bl.net:peer-address peer-to-disconnect))
     (force-output)
     ;; Close the socket to simulate disconnect
     (handler-case
@@ -96,12 +96,12 @@
           (when (bl::peer-socket peer-to-disconnect)
             (usocket:socket-close (bl::peer-socket peer-to-disconnect)))
           ;; Remove from peer list
-          (setf (bl::node-peers bl:*node*)
-                (remove peer-to-disconnect (bl::node-peers bl:*node*))))
+          (setf (bl:node-peers bl:*node*)
+                (remove peer-to-disconnect (bl:node-peers bl:*node*))))
       (error (e)
         (format t "  (Disconnect error: ~A)~%" e)))))
 
-(defparameter *peers-after-disconnect* (length (bl::node-peers bl:*node*)))
+(defparameter *peers-after-disconnect* (length (bl:node-peers bl:*node*)))
 (format t "Peers immediately after disconnect: ~D~%" *peers-after-disconnect*)
 (force-output)
 
@@ -114,13 +114,13 @@
 (defparameter *sync-continued* nil)
 (defparameter *height-at-disconnect*
   (bl.store:current-height
-   (bl::node-chain-state bl:*node*)))
+   (bl:node-chain-state bl:*node*)))
 
 (loop for i from 1 to 12 do  ; 12 * 5 = 60 seconds
   (sleep 5)
-  (let* ((current-peers (length (bl::node-peers bl:*node*)))
+  (let* ((current-peers (length (bl:node-peers bl:*node*)))
          (current-height (bl.store:current-height
-                          (bl::node-chain-state bl:*node*))))
+                          (bl:node-chain-state bl:*node*))))
     (format t "  [~2D] Height: ~D, Peers: ~D~%" (* i 5) current-height current-peers)
     (force-output)
 
@@ -137,10 +137,10 @@
       (setf *sync-continued* t))))
 
 ;; Final status
-(defparameter *final-peer-count* (length (bl::node-peers bl:*node*)))
+(defparameter *final-peer-count* (length (bl:node-peers bl:*node*)))
 (defparameter *final-height*
   (bl.store:current-height
-   (bl::node-chain-state bl:*node*)))
+   (bl:node-chain-state bl:*node*)))
 
 (format t "~%========================================~%")
 (format t "TEST RESULTS~%")

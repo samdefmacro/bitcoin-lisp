@@ -1170,7 +1170,7 @@ header's cached hash)."
                (not (bl.ser:transaction-has-witness-p coinbase)))
       (setf (bl.ser:transaction-witness coinbase)
             (vector (list (witness-reserved-value)))
-            (bl.ser::transaction-cached-weight coinbase) nil))))
+            (bl.ser:transaction-cached-weight coinbase) nil))))
 
 (defun block-witness-stripped-p (block)
   "T if BLOCK carries a witness commitment in its coinbase outputs but its coinbase
@@ -1757,7 +1757,7 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
             (loop for output across (bl.ser:transaction-outputs coinbase-tx)
                   for idx from 0
                   do (setf (gethash (cons txid idx) pending-utxos)
-                           (bl.store::make-utxo-entry
+                           (bl.store:make-utxo-entry
                             :value (bl.ser:tx-out-value output)
                             :script-pubkey (bl.ser:tx-out-script-pubkey output)
                             :height current-height
@@ -1798,7 +1798,7 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
                    (loop for output across (bl.ser:transaction-outputs tx)
                          for idx from 0
                          do (setf (gethash (cons txid idx) pending-utxos)
-                                  (bl.store::make-utxo-entry
+                                  (bl.store:make-utxo-entry
                                    :value (bl.ser:tx-out-value output)
                                    :script-pubkey (bl.ser:tx-out-script-pubkey output)
                                    :height current-height
@@ -2561,7 +2561,7 @@ Handles chain reorganizations when a competing chain has more work."
                       ;; a failure as fatal. Writing blocks onto a full disk is
                       ;; how a truncated-but-indexed .blk gets created, which
                       ;; this node has seen.
-                      (bl::%gate-block-write-on-disk-space)
+                      (bl:gate-block-write-on-disk-space)
                       (nth-value 1 (bl.store:store-block
                                     block-store block :height new-height)))))
 
@@ -2605,7 +2605,7 @@ Handles chain reorganizations when a competing chain has more work."
       (bl.store:add-block-index-entry chain-state entry)
       ;; nFile/nDataPos, now that the entry is in the index (Core
       ;; ReceivedBlockTransactions).
-      (bl.store::%record-block-position entry stored-at)
+      (bl.store:%record-block-position entry stored-at)
 
       ;; Check if we need a reorganization. REORG-OUTCOME captures perform-reorg's
       ;; result so callers can act on a refused reorg: NIL for a tip extension or
@@ -3607,7 +3607,7 @@ comparison is what the block index is keyed by anyway."
   (let ((result '()))
     (maphash (lambda (h e) (declare (ignore h))
                (when (block-descends-from-p e entry) (push e result)))
-             (bl.store::chain-state-block-index chain-state))
+             (bl.store:chain-state-block-index chain-state))
     result))
 
 (defun best-valid-tip (chain-state block-store &optional (min-work 0))
@@ -3635,7 +3635,7 @@ is zero probes."
                              block-store (bl.store:block-index-entry-hash e)))
                    (setf best e
                          best-work w))))
-             (bl.store::chain-state-block-index chain-state))
+             (bl.store:chain-state-block-index chain-state))
     best))
 
 (defconstant +activation-step-blocks+ 1000
@@ -3818,7 +3818,7 @@ reorganize to the best valid chain if it now outweighs the active tip. Returns
                                 (or (block-descends-from-p e entry)
                                     (block-descends-from-p entry e)))
                        (setf (bl.store:block-index-entry-status e) :header-valid)))
-                   (bl.store::chain-state-block-index chain-state))
+                   (bl.store:chain-state-block-index chain-state))
           (let ((tip (bl.store:get-block-index-entry
                       chain-state (bl.store:best-block-hash chain-state)))
                 (target (best-valid-tip chain-state block-store)))
@@ -3940,7 +3940,7 @@ can neither wedge on an equal-work sibling nor advance past the base."
         (unless (and entry
                      (bl.store:entry-target-ancestor-p chain-state entry))
           (unless (block-witness-stripped-p block)
-            (bl.store::%record-block-position
+            (bl.store:%record-block-position
              entry
              (nth-value 1 (bl.store:store-block
                            block-store block
@@ -4104,7 +4104,7 @@ can neither wedge on an equal-work sibling nor advance past the base."
               (let ((entry (bl.store:get-block-index-entry
                             chain-state
                             (bl.ser:block-header-hash header))))
-                (bl.store::%record-block-position
+                (bl.store:%record-block-position
                  entry
                  (nth-value 1 (bl.store:store-block
                                block-store block

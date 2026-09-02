@@ -554,7 +554,7 @@ cached TxGetCredit."
 (change-only book records don't count — allow_change=false lookup)."
   (let ((script (bl.ser:tx-out-script-pubkey output)))
     (and (%wallet-script-mine-p wallet script)
-         (let ((address (bl.rpc::%script->address script (wallet-network wallet))))
+         (let ((address (bl.rpc:script->address script (wallet-network wallet))))
            (or (null address)
                (not (nth-value 2 (wallet-find-address-book-entry wallet address))))))))
 
@@ -597,7 +597,7 @@ address-book record and write (or erase) its destdata \"used\" record."
 address-representable scripts are tracked; Core additionally keys bare
 pubkey/nonstandard destinations whose encoded form can never be spent to
 again anyway."
-  (let ((address (bl.rpc::%script->address script (wallet-network wallet))))
+  (let ((address (bl.rpc:script->address script (wallet-network wallet))))
     (and address (wallet-address-previously-spent-p wallet address))))
 
 (defun %wallet-set-spent-key-state (wallet batch txid n used tx-destinations)
@@ -612,7 +612,7 @@ collect into TX-DESTINATIONS (an equal-set of address strings)."
                       (aref (bl.ser:transaction-outputs
                              (wallet-tx-tx srctx))
                             n)))
-             (address (bl.rpc::%script->address script (wallet-network wallet))))
+             (address (bl.rpc:script->address script (wallet-network wallet))))
         (when (and address (%wallet-script-mine-p wallet script))
           (unless (eq (and used t)
                       (wallet-address-previously-spent-p wallet address))
@@ -629,7 +629,7 @@ paying one of TX-DESTINATIONS (address-string set)."
           do (unless (wallet-tx-cache-empty wtx)
                (loop for output across (bl.ser:transaction-outputs
                                         (wallet-tx-tx wtx))
-                     for address = (bl.rpc::%script->address
+                     for address = (bl.rpc:script->address
                                     (bl.ser:tx-out-script-pubkey
                                      output)
                                     (wallet-network wallet))
@@ -794,7 +794,7 @@ where Core asserts the existing mapValue is what it keeps."
                                (= old-index new-index))
                     (bl:log-warn
                      "AddToWallet: same-kind state mismatch for ~A (kept existing)"
-                     (bl.rpc::hash-to-hex txid)))))))
+                     (bl.rpc:hash-to-hex txid)))))))
         ;; Witness upgrade: replace a stored witness-stripped version.
         (when (and (bl.ser:transaction-has-witness-p tx)
                    (not (bl.ser:transaction-has-witness-p
@@ -825,12 +825,12 @@ the literal \"unconfirmed\"/-1."
     (when command
       (multiple-value-bind (block-hash height)
           (if (eq (wallet-tx-state wtx) :confirmed)
-              (values (bl.rpc::hash-to-hex (wallet-tx-block-hash wtx))
+              (values (bl.rpc:hash-to-hex (wallet-tx-block-hash wtx))
                       (princ-to-string (wallet-tx-block-height wtx)))
               (values "unconfirmed" "-1"))
         (bl:run-notify-command
          command
-         :substitutions (list (cons #\s (bl.rpc::hash-to-hex (wallet-tx-txid wtx)))
+         :substitutions (list (cons #\s (bl.rpc:hash-to-hex (wallet-tx-txid wtx)))
                               (cons #\w (wallet-name wallet))
                               (cons #\b block-hash)
                               (cons #\h height)))))))
@@ -847,13 +847,13 @@ Returns the newly-marked addresses."
     (when index
       (when (>= index (desc-spkm-next-index spkm))
         (loop while (>= index (desc-spkm-next-index spkm))
-              do (let ((scripts (bl.rpc::out-desc-expand-from-cache
+              do (let ((scripts (bl.rpc:out-desc-expand-from-cache
                                  (desc-spkm-desc spkm)
                                  (desc-spkm-next-index spkm)
                                  (desc-spkm-cache spkm))))
                    (unless scripts
                      (wallet-error "MarkUnusedAddresses: unable to expand descriptor from cache"))
-                   (let ((address (bl.rpc::%script->address (first scripts)
+                   (let ((address (bl.rpc:script->address (first scripts)
                                                     (wallet-network wallet))))
                      (when address (push address result)))
                    (incf (desc-spkm-next-index spkm)))))
@@ -881,8 +881,8 @@ Returns the newly-marked addresses."
               (unless (equalp spender txid)
                 (bl:log-info
                  "Wallet ~A: tx ~A in block ~A conflicts with wallet tx ~A"
-                 (wallet-name wallet) (bl.rpc::hash-to-hex txid)
-                 (bl.rpc::hash-to-hex block-hash) (bl.rpc::hash-to-hex spender))
+                 (wallet-name wallet) (bl.rpc:hash-to-hex txid)
+                 (bl.rpc:hash-to-hex block-hash) (bl.rpc:hash-to-hex spender))
                 (wallet-mark-conflicted wallet block-hash height spender)))))))
     (let ((existed (and (wallet-get-wallet-tx wallet txid) t)))
       (cond
@@ -1250,7 +1250,7 @@ LoadToWallet). TX-RECORDS is (txid . value-bytes) pairs. Returns WARNINGS."
                (push "Wallet tx record hash mismatch; record skipped (rescan to recover)"
                      warnings))
               ((wallet-get-wallet-tx wallet txid)
-               (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+               (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                  :message "Error: Corrupt transaction found. This can be fixed by removing transactions from wallet and rescanning."))
               (t
                (when chain-state
@@ -1415,7 +1415,7 @@ UpdateIfNeeded can fold in scripts a mid-rescan TopUp creates."
                ;; Core guards this on IsHDEnabled() == descriptor IsRange()
                ;; (scriptpubkeyman.cpp:1162-1166): a non-ranged descriptor can
                ;; never grow, so it needs no re-poll.
-               (when (bl.rpc::out-desc-ranged-p (desc-spkm-desc spkm))
+               (when (bl.rpc:out-desc-ranged-p (desc-spkm-desc spkm))
                  (setf (gethash (desc-spkm-id spkm) (rescan-filter-last-ends rf))
                        (%spkm-end-range spkm)))))
     rf))
@@ -1485,7 +1485,7 @@ away) / :user-abort."
         ;; height: the per-block :unknown fallback already covers a lagging or
         ;; gappy index, and a whole-scan guard would disable the fast path
         ;; whenever the index trails the tip by even one block.
-        (bfi (let ((b (bl.rpc::rpc-get-blockfilterindex node)))
+        (bfi (let ((b (bl.rpc:rpc-get-blockfilterindex node)))
                (and b (bl.store:blockfilterindex-enabled b) b)))
         (rf nil)
         (skipped 0))
@@ -1501,9 +1501,9 @@ away) / :user-abort."
           (setf status :user-abort)
           (return-from scan))
         (let ((done nil))
-          (bl.rpc::with-node-lock (node)
-            (let* ((chain-state (bl::node-current-chainstate node))
-                   (store (bl::node-block-store node))
+          (bl.rpc:with-node-lock (node)
+            (let* ((chain-state (bl:node-current-chainstate node))
+                   (store (bl:node-block-store node))
                    (entry (and chain-state
                                (bl.store:get-block-index-entry
                                 chain-state block-hash))))
@@ -1599,8 +1599,8 @@ away) / :user-abort."
           (when done (return-from scan)))))
     ;; Scanning reached the tip: fold the current mempool in.
     (when (and (null max-height) (not (eq status :user-abort)))
-      (bl.rpc::with-node-lock (node)
-        (let ((mempool (bl::node-mempool node)))
+      (bl.rpc:with-node-lock (node)
+        (let ((mempool (bl:node-mempool node)))
           (when mempool
             (bl.mp:mempool-for-each
              mempool
@@ -1624,8 +1624,8 @@ contain a tx with timestamp START-TIME. Returns the earliest timestamp that
 was successfully covered (> START-TIME when blocks could not be read). The
 caller holds the rescan reservation."
   (let (start-entry-hash start-entry-height)
-    (bl.rpc::with-node-lock (node)
-      (let* ((chain-state (bl::node-current-chainstate node))
+    (bl.rpc:with-node-lock (node)
+      (let* ((chain-state (bl:node-current-chainstate node))
              (entry (and chain-state
                          (find-first-block-with-time
                           chain-state (- start-time +wallet-timestamp-window+) 0))))
@@ -1641,8 +1641,8 @@ caller holds the rescan reservation."
           (if (eq status :failure)
               ;; Core reads the last FAILED block's max time; our scan aborts
               ;; the segment on failure, so the segment start bounds it.
-              (bl.rpc::with-node-lock (node)
-                (let ((chain-state (bl::node-current-chainstate node)))
+              (bl.rpc:with-node-lock (node)
+                (let ((chain-state (bl:node-current-chainstate node)))
                   (+ (%entry-chain-time-max chain-state start-entry-hash)
                      +wallet-timestamp-window+ 1)))
               start-time)))))
@@ -1656,8 +1656,8 @@ connect during the scan reach the wallet through them, exactly like Core's
 pending notifications. Returns NIL on success or an error string (the wallet
 should then be unloaded, like Core's failed AttachChain)."
   (let (rescan-height tip-height start-hash)
-    (bl.rpc::with-node-lock (node)
-      (let ((chain-state (bl::node-current-chainstate node)))
+    (bl.rpc:with-node-lock (node)
+      (let ((chain-state (bl:node-current-chainstate node)))
         (unless (and chain-state
                      (bl.store:best-block-hash chain-state))
           (return-from wallet-attach-chain nil))
@@ -1706,8 +1706,8 @@ should then be unloaded, like Core's failed AttachChain)."
              ;; Last block scanned = last block processed (may differ from
              ;; the pre-scan tip after a reorg), persisted.
              (when last-hash
-               (bl.rpc::with-node-lock (node)
-                 (let ((chain-state (bl::node-current-chainstate node)))
+               (bl.rpc:with-node-lock (node)
+                 (let ((chain-state (bl:node-current-chainstate node)))
                    (with-wallet-lock (wallet)
                      (setf (wallet-last-block-hash wallet) last-hash
                            (wallet-last-block-height wallet) last-height)
@@ -1719,15 +1719,15 @@ should then be unloaded, like Core's failed AttachChain)."
 ;;; --- Transaction RPCs (wallet/rpc/transactions.cpp) ---
 
 (defun %wallet-parse-txid (value)
-  (unless (and (stringp value) (bl.rpc::valid-hex-hash-p value))
-    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+  (unless (and (stringp value) (bl.rpc:valid-hex-hash-p value))
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                       :message "txid must be of length 64 (not including any '0x' prefix)"))
-  (bl.rpc::parse-hex-hash value))
+  (bl.rpc:parse-hex-hash value))
 
 (defun %wallet-block-time (node block-hash)
   "The timestamp of BLOCK-HASH's header via the block index (WalletTxToJSON's
 chain.findBlock time lookup). Caller holds the node-lock."
-  (let* ((chain-state (bl::node-current-chainstate node))
+  (let* ((chain-state (bl:node-current-chainstate node))
          (entry (and chain-state
                      (bl.store:get-block-index-entry chain-state
                                                                  block-hash)))
@@ -1742,14 +1742,14 @@ chain.findBlock time lookup). Caller holds the node-lock."
   (if (plusp confirms)
       "no"
       (let ((tx (wallet-tx-tx wtx))
-            (mempool (bl::node-mempool node)))
+            (mempool (bl:node-mempool node)))
         (cond
           ((bl.mp:tx-signals-rbf-p tx) "yes")
           ((or (null mempool)
                (not (bl.mp:mempool-has mempool
                                                       (wallet-tx-txid wtx))))
            "unknown")
-          ((bl.mp::mempool-tx-or-ancestor-signals-rbf-p
+          ((bl.mp:mempool-tx-or-ancestor-signals-rbf-p
             mempool (wallet-tx-txid wtx))
            "yes")
           (t "no")))))
@@ -1760,17 +1760,17 @@ chain.findBlock time lookup). Caller holds the node-lock."
     `(("confirmations" . ,confirms)
       ,@(when (%wtx-coinbase-p wtx) `(("generated" . t)))
       ,@(if (eq (wallet-tx-state wtx) :confirmed)
-            `(("blockhash" . ,(bl.rpc::hash-to-hex (wallet-tx-block-hash wtx)))
+            `(("blockhash" . ,(bl.rpc:hash-to-hex (wallet-tx-block-hash wtx)))
               ("blockheight" . ,(wallet-tx-block-height wtx))
               ("blockindex" . ,(wallet-tx-block-index wtx))
               ("blocktime" . ,(%wallet-block-time node (wallet-tx-block-hash wtx))))
             `(("trusted" . ,(bl.rpc:json-bool (%wallet-tx-trusted-p wallet wtx)))))
-      ("txid" . ,(bl.rpc::hash-to-hex (wallet-tx-txid wtx)))
-      ("wtxid" . ,(bl.rpc::hash-to-hex (%tx-witness-hash (wallet-tx-tx wtx))))
-      ("walletconflicts" . ,(or (mapcar #'bl.rpc::hash-to-hex
+      ("txid" . ,(bl.rpc:hash-to-hex (wallet-tx-txid wtx)))
+      ("wtxid" . ,(bl.rpc:hash-to-hex (%tx-witness-hash (wallet-tx-tx wtx))))
+      ("walletconflicts" . ,(or (mapcar #'bl.rpc:hash-to-hex
                                         (wallet-tx-conflicts wallet wtx))
                                 #()))
-      ("mempoolconflicts" . ,(or (mapcar #'bl.rpc::hash-to-hex
+      ("mempoolconflicts" . ,(or (mapcar #'bl.rpc:hash-to-hex
                                          (alexandria:hash-table-keys
                                           (wallet-tx-mempool-conflicts wtx)))
                                  #()))
@@ -1787,7 +1787,7 @@ canonical form if normalization fails."
   (loop for spkm being the hash-values of (wallet-spkms wallet)
         when (spkm-is-mine spkm script)
           collect (handler-case (%spkm-descriptor-string wallet spkm nil)
-                    (bl.rpc::rpc-error () (desc-spkm-desc-string spkm)))))
+                    (bl.rpc:rpc-error () (desc-spkm-desc-string spkm)))))
 
 (defun %wallet-tx-amounts (wallet wtx include-change)
   "receive.cpp CachedTxGetAmounts: (values received sent fee-sat) where
@@ -1806,7 +1806,7 @@ the tx."
                                 (not include-change)
                                 (%wallet-output-change-p wallet output))
                            (and (not (plusp debit)) (not mine)))
-                 (let ((entry (list (bl.rpc::%script->address script (wallet-network wallet))
+                 (let ((entry (list (bl.rpc:script->address script (wallet-network wallet))
                                     (bl.ser:tx-out-value output)
                                     i script)))
                    (when (plusp debit) (push entry sent))
@@ -1873,12 +1873,12 @@ push order."
 gettransaction). PARAMS: (txid include_watchonly verbose)."
   (let ((wallet (wallet-for-request node))
         (txid (%wallet-parse-txid (first params)))
-        (verbose (bl.rpc::%positional-bool (third params))))
-    (bl.rpc::with-node-lock (node)
+        (verbose (bl.rpc:positional-bool (third params))))
+    (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
         (let ((wtx (wallet-get-wallet-tx wallet txid)))
           (unless wtx
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                               :message "Invalid or non-wallet transaction id"))
           (let* ((tx (wallet-tx-tx wtx))
                  (credit (wallet-tx-credit wallet wtx))
@@ -1896,11 +1896,11 @@ gettransaction). PARAMS: (txid include_watchonly verbose)."
               ("hex" . ,(bl.crypto:bytes-to-hex
                          (bl.ser:transaction-wire-bytes tx)))
               ,@(when verbose
-                  `(("decoded" . ,(remove "hex" (bl.rpc::tx-to-json tx (wallet-network wallet))
+                  `(("decoded" . ,(remove "hex" (bl.rpc:tx-to-json tx (wallet-network wallet))
                                           :key #'car :test #'equal))))
               ("lastprocessedblock"
                . (("hash" . ,(if (wallet-last-block-hash wallet)
-                                 (bl.rpc::hash-to-hex (wallet-last-block-hash wallet))
+                                 (bl.rpc:hash-to-hex (wallet-last-block-hash wallet))
                                  (make-string 64 :initial-element #\0)))
                   ("height" . ,(wallet-last-block-height wallet)))))))))))
 
@@ -1915,13 +1915,13 @@ gettransaction). PARAMS: (txid include_watchonly verbose)."
       (when (and label-arg (not (equal label-arg "*")))
         (setf filter-label (%label-from-value label-arg))
         (when (zerop (length filter-label))
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Label argument must be a valid label name or \"*\"."))))
     (unless (and (integerp count) (>= count 0))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "Negative count"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "Negative count"))
     (unless (and (integerp skip) (>= skip 0))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "Negative from"))
-    (bl.rpc::with-node-lock (node)
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "Negative from"))
+    (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
         (let ((ret '())
               (ordered (wallet-tx-ordered wallet)))
@@ -1945,16 +1945,16 @@ include_removed include_change label)."
         (target-confirms (if (and (>= (length params) 2) (second params))
                              (second params)
                              1))
-        (include-removed (bl.rpc::%positional-bool-or (fourth params) t))
-        (include-change (bl.rpc::%positional-bool (fifth params)))
+        (include-removed (bl.rpc:positional-bool-or (fourth params) t))
+        (include-change (bl.rpc:positional-bool (fifth params)))
         (filter-label (when (and (>= (length params) 6) (sixth params))
                         (%label-from-value (sixth params)))))
     (unless (and (integerp target-confirms) (>= target-confirms 1))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "Invalid parameter"))
-    (bl.rpc::with-node-lock (node)
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "Invalid parameter"))
+    (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
-        (let* ((chain-state (bl::node-current-chainstate node))
-               (store (bl::node-block-store node))
+        (let* ((chain-state (bl:node-current-chainstate node))
+               (store (bl:node-block-store node))
                (wallet-tip-entry
                  (and chain-state (wallet-last-block-hash wallet)
                       (bl.store:get-block-index-entry
@@ -1973,7 +1973,7 @@ include_removed include_change label)."
                                  (bl.val:find-fork-point
                                   block-entry wallet-tip-entry))))
                   (unless fork
-                    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                                       :message "Block not found"))
                   (setf height (bl.store:block-index-entry-height fork)
                         altheight (bl.store:block-index-entry-height
@@ -2001,7 +2001,7 @@ include_removed include_change label)."
                                            (bl.store:get-block
                                             store walk-hash))))
                              (unless blk
-                               (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-internal-error+
+                               (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-internal-error+
                                                  :message "Can't read block from disk"))
                              (dolist (tx (bl.ser:bitcoin-block-transactions blk))
                                (let ((wtx (wallet-get-wallet-tx
@@ -2027,7 +2027,7 @@ include_removed include_change label)."
                 `(("transactions" . ,(or transactions #()))
                   ,@(when include-removed `(("removed" . ,(or removed #()))))
                   ("lastblock" . ,(if lastblock-entry
-                                      (bl.rpc::hash-to-hex
+                                      (bl.rpc:hash-to-hex
                                        (bl.store:block-index-entry-hash
                                         lastblock-entry))
                                       (make-string 64 :initial-element #\0))))))))))))
@@ -2039,15 +2039,15 @@ rescanblockchain). PARAMS: (start_height stop_height)."
         (start-height (or (first params) 0))
         (stop-height (second params)))
     (unless (integerp start-height)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                         :message "start_height must be an integer"))
     (when (and stop-height (not (integerp stop-height)))
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                         :message "stop_height must be an integer"))
     (with-wallet-lock (wallet)
       (wallet-ensure-unlocked wallet))
     (unless (wallet-reserve-rescan wallet)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                         :message "Wallet is currently rescanning. Abort existing rescan or wait."))
     ;; The scan drops and retakes the wallet lock between segments, so
     ;; suspend the relock for its duration (Core m_scanning_with_passphrase):
@@ -2059,31 +2059,31 @@ rescanblockchain). PARAMS: (start_height stop_height)."
             (not (wallet-is-locked-p wallet))))
     (unwind-protect
          (let (start-hash)
-           (bl.rpc::with-node-lock (node)
+           (bl.rpc:with-node-lock (node)
              (let ((tip-height (with-wallet-lock (wallet)
                                  (wallet-last-block-height wallet)))
-                   (chain-state (bl::node-current-chainstate node)))
+                   (chain-state (bl:node-current-chainstate node)))
                (when (or (minusp start-height) (> start-height tip-height))
-                 (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                    :message "Invalid start_height"))
                (when stop-height
                  (when (or (minusp stop-height) (> stop-height tip-height))
-                   (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                      :message "Invalid stop_height"))
                  (when (< stop-height start-height)
-                   (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                      :message "stop_height must be greater than start_height")))
                (when (and (bl:pruning-enabled-p) chain-state
                           (< start-height
                              (bl.store:chain-state-pruned-height
                               chain-state)))
-                 (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-misc-error+
+                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-misc-error+
                                    :message "Can't rescan beyond pruned data. Use RPC call getblockchaininfo to determine your pruned height."))
                (let ((entry (and chain-state
                                  (bl.store:get-block-at-height
                                   chain-state start-height))))
                  (unless entry
-                   (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-misc-error+
+                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-misc-error+
                                      :message "Failed to rescan unavailable blocks, potentially caused by data corruption. If the issue persists you may want to reindex (see -reindex option)."))
                  (setf start-hash
                        (bl.store:block-index-entry-hash entry)))))
@@ -2095,10 +2095,10 @@ rescanblockchain). PARAMS: (start_height stop_height)."
                 `(("start_height" . ,start-height)
                   ("stop_height" . ,last-height)))
                (:failure
-                (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-misc-error+
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-misc-error+
                                   :message "Rescan failed. Potentially corrupted data files."))
                (:user-abort
-                (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-misc-error+
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-misc-error+
                                   :message "Rescan aborted.")))))
       (wallet-release-rescan wallet))))
 

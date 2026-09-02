@@ -101,7 +101,7 @@ and is not done here."
             *last-block-disk-check-ok* (check-disk-space directory)))
     *last-block-disk-check-ok*))
 
-(defun %gate-block-write-on-disk-space ()
+(defun gate-block-write-on-disk-space ()
   "Abort the node when the block directory has no room left, before a block
 write rather than after (Core FindBlockPos -> CheckDiskSpace -> FatalError,
 blockstorage.cpp:337). A no-op when there is no node or no data directory,

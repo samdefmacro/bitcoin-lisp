@@ -349,23 +349,23 @@ could split us from the testnet network."
   "A period-boundary block >600s earlier than its predecessor violates BIP 94."
   (let ((bl:*network* :testnet4)
         (prev (%timewarp-entry 2015 100000)))
-    (is (bl.val::bip94-timewarp-violation-p
+    (is (bl.val:bip94-timewarp-violation-p
          (make-mock-header :timestamp (- 100000 601)) 2016 prev))))
 
 (test bip94-timewarp-allowed-within-tolerance
   "Exactly 600s early is allowed (strict <), and so is a later timestamp."
   (let ((bl:*network* :testnet4)
         (prev (%timewarp-entry 2015 100000)))
-    (is (null (bl.val::bip94-timewarp-violation-p
+    (is (null (bl.val:bip94-timewarp-violation-p
                (make-mock-header :timestamp (- 100000 600)) 2016 prev)))
-    (is (null (bl.val::bip94-timewarp-violation-p
+    (is (null (bl.val:bip94-timewarp-violation-p
                (make-mock-header :timestamp 100000) 2016 prev)))))
 
 (test bip94-timewarp-only-at-period-boundary
   "Non-boundary heights are exempt even with a wildly early timestamp."
   (let ((bl:*network* :testnet4)
         (prev (%timewarp-entry 2014 100000)))
-    (is (null (bl.val::bip94-timewarp-violation-p
+    (is (null (bl.val:bip94-timewarp-violation-p
                (make-mock-header :timestamp (- 100000 5000)) 2015 prev)))))
 
 (test bip94-timewarp-not-enforced-off-testnet4
@@ -373,13 +373,13 @@ could split us from the testnet network."
   (dolist (net '(:mainnet :testnet3))
     (let ((bl:*network* net)
           (prev (%timewarp-entry 2015 100000)))
-      (is (null (bl.val::bip94-timewarp-violation-p
+      (is (null (bl.val:bip94-timewarp-violation-p
                  (make-mock-header :timestamp (- 100000 601)) 2016 prev))))))
 
 (test bip94-timewarp-excludes-genesis
   "Height 0 satisfies the modulo but is excluded (no predecessor)."
   (let ((bl:*network* :testnet4))
-    (is (null (bl.val::bip94-timewarp-violation-p
+    (is (null (bl.val:bip94-timewarp-violation-p
                (make-mock-header :timestamp 0) 0 nil)))))
 
 ;;;; nBits range validation (derive-target / check-proof-of-work)
@@ -389,12 +389,12 @@ could split us from the testnet network."
 (test derive-target-valid-within-limit
   "A normal compact target decodes; pow-limit bits decode to exactly the
 pow-limit target."
-  (is (= bl.store::+pow-limit-target+
+  (is (= bl.store:+pow-limit-target+
          (bl.store:derive-target #x1d00ffff)))
   ;; a harder (smaller) historical target is valid and below the limit
   (let ((tgt (bl.store:derive-target #x1b0404cb)))
     (is (not (null tgt)))
-    (is (< tgt bl.store::+pow-limit-target+))))
+    (is (< tgt bl.store:+pow-limit-target+))))
 
 (test derive-target-rejects-negative
   "Sign bit (0x00800000) set on a non-zero mantissa => negative => NIL."
@@ -416,7 +416,7 @@ pow-limit target."
   "check-proof-of-work returns NIL for nBits out of range, regardless of
 the hash (negative / above-limit), and is not fooled by the old
 24-bit-mantissa decode."
-  (is (null (bl.val::check-proof-of-work
+  (is (null (bl.val:check-proof-of-work
              (make-mock-header :bits #x1d80ffff))))   ; negative
-  (is (null (bl.val::check-proof-of-work
+  (is (null (bl.val:check-proof-of-work
              (make-mock-header :bits #x1e00ffff)))))  ; above pow limit

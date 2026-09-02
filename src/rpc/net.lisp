@@ -39,9 +39,9 @@ regardless of its socket address (127.0.0.1); otherwise the address's
 network, or \"not_publicly_routable\" when it isn't a routable literal."
   (multiple-value-bind (net bytes)
       (bl.net:parse-network-address
-       (bl::peer-address peer))
+       (bl.net:peer-address peer))
     (cond
-      ((bl.net::peer-inbound-onion peer) "onion")
+      ((bl.net:peer-inbound-onion peer) "onion")
       ((and net (bl.net:address-routable-p bytes net))
        (ecase net
          (:ipv4 "ipv4") (:ipv6 "ipv6") (:torv3 "onion")
@@ -57,8 +57,8 @@ it opened against the node's getpeerinfo row by comparing addrbind to the
 address it dialled. Taken from the socket rather than from configuration —
 with -bind=0.0.0.0 the configured address names no interface, and the bind
 address of an OUTBOUND connection is whichever local address the kernel chose."
-  (let* ((connection (bl.net::peer-connection peer))
-         (socket (and connection (bl.net::connection-socket connection))))
+  (let* ((connection (bl.net:peer-connection peer))
+         (socket (and connection (bl.net:connection-socket connection))))
     (when socket
       (ignore-errors
        (let ((address (usocket:get-local-address socket))
@@ -84,12 +84,12 @@ in getpeerinfo output without it, which on regtest is every peer.
 Read from the socket, like ADDRBIND: an outbound connection knows the port it
 dialled, and an inbound one only learns the remote's ephemeral port from the
 accepted socket."
-  (let* ((connection (bl.net::peer-connection peer))
-         (socket (and connection (bl.net::connection-socket connection)))
-         (host (bl::peer-address peer))
+  (let* ((connection (bl.net:peer-connection peer))
+         (socket (and connection (bl.net:connection-socket connection)))
+         (host (bl.net:peer-address peer))
          (port (or (ignore-errors (and socket (usocket:get-peer-port socket)))
                    (let ((p (and connection
-                                 (bl.net::connection-port connection))))
+                                 (bl.net:connection-port connection))))
                      (and p (plusp p) p)))))
     (cond ((null port) host)
           ;; A v6 literal is bracketed before the port, as Core's
@@ -102,11 +102,11 @@ accepted socket."
 (Core addrLocal, set from the version addrMe for outbound peers when
 routable, net_processing.cpp:3651-3654). Returns \"ip:port\" or NIL — the
 field is optional in Core and omitted when unknown."
-  (let ((vmsg (bl::peer-version peer)))
-    (when (and vmsg (not (bl.net::peer-inbound peer)))
-      (let* ((addr-me (bl.ser::version-message-addr-recv vmsg))
+  (let ((vmsg (bl.net:peer-version peer)))
+    (when (and vmsg (not (bl.net:peer-inbound peer)))
+      (let* ((addr-me (bl.ser:version-message-addr-recv vmsg))
              (ip (bl.ser:net-addr-ip addr-me))
-             (net (and (= (length ip) 16) (bl.net::ip-network ip))))
+             (net (and (= (length ip) 16) (bl.net:ip-network ip))))
         (when (and net (bl.net:address-routable-p ip net))
           (format nil "~A:~D"
                   (bl.net:network-address-to-string net ip)
@@ -160,26 +160,26 @@ whatever the cadence is."
   (let ((peers (sort (remove-if (lambda (p)
                                   (eq (bl.net:peer-state p) :disconnected))
                                 (rpc-get-peers node))
-                     #'< :key #'bl.net::peer-id))
+                     #'< :key #'bl.net:peer-id))
         (chain-state (rpc-get-chain-state node))
         (now (get-internal-real-time)))
     (mapcar
      (lambda (peer)
        ;; peer-version holds the received version *message* struct, not a
        ;; number — pull the numeric protocol version out of it.
-       (let* ((vmsg (bl::peer-version peer))
-              (conn (bl.net::peer-connection peer))
-              (ping (bl.net::peer-ping-latency peer))
-              (minping (bl.net::peer-min-ping-latency peer))
-              (ping-nonce (bl.net::peer-ping-nonce peer))
-              (services (or (bl::peer-services peer) 0))
-              (sh (or (bl::peer-start-height peer) -1))
-              (hss (bl.net::peer-headers-sync peer))
-              (transport (and conn (bl.net::connection-transport conn)))
+       (let* ((vmsg (bl.net:peer-version peer))
+              (conn (bl.net:peer-connection peer))
+              (ping (bl.net:peer-ping-latency peer))
+              (minping (bl.net:peer-min-ping-latency peer))
+              (ping-nonce (bl.net:peer-ping-nonce peer))
+              (services (or (bl.net:peer-services peer) 0))
+              (sh (or (bl.net:peer-start-height peer) -1))
+              (hss (bl.net:peer-headers-sync peer))
+              (transport (and conn (bl.net:connection-transport conn)))
               ;; Last header we have in common: the peer's best known block
               ;; per its inv/headers announcements (Core pindexBestKnownBlock
               ;; -> nSyncHeight), -1 while unknown.
-              (best-known (bl.net::peer-best-known-block-hash peer))
+              (best-known (bl.net:peer-best-known-block-hash peer))
               (best-entry (and best-known chain-state
                                (bl.store:get-block-index-entry
                                 chain-state best-known)))
@@ -187,14 +187,14 @@ whatever the cadence is."
               ;; vHeightInFlight), ascending; hashes whose header vanished
               ;; (reorged index) are skipped.
               (inflight
-                (sort (loop for hash in (bl.net::peer-inflight-block-hashes peer)
+                (sort (loop for hash in (bl.net:peer-inflight-block-hashes peer)
                             for entry = (and chain-state
                                              (bl.store:get-block-index-entry
                                               chain-state hash))
                             when entry
                               collect (bl.store:block-index-entry-height entry))
                       #'<)))
-         `(("id" . ,(bl.net::peer-id peer))
+         `(("id" . ,(bl.net:peer-id peer))
            ("addr" . ,(%peer-addr peer))
            ,@(let ((addrlocal (%peer-addrlocal peer)))
                (when addrlocal `(("addrlocal" . ,addrlocal))))
@@ -211,19 +211,19 @@ whatever the cadence is."
            ;; Mempool sequence snapshot of our last inv flush to this peer +
            ;; queued-but-unsent announcements (Core m_last_inv_sequence /
            ;; m_inv_to_send).
-           ("last_inv_sequence" . ,(bl.net::peer-last-inv-sequence peer))
-           ("inv_to_send" . ,(length (bl.net::peer-tx-inv-queue peer)))
+           ("last_inv_sequence" . ,(bl.net:peer-last-inv-sequence peer))
+           ("inv_to_send" . ,(length (bl.net:peer-tx-inv-queue peer)))
            ("lastsend" . ,(%universal-to-unix
-                           (if conn (bl.net::connection-last-send-time conn) 0)))
+                           (if conn (bl.net:connection-last-send-time conn) 0)))
            ("lastrecv" . ,(%universal-to-unix
-                           (if conn (bl.net::connection-last-recv-time conn) 0)))
-           ("last_transaction" . ,(bl.net::peer-last-tx-time peer))
-           ("last_block" . ,(bl.net::peer-last-block-time peer))
-           ("bytessent" . ,(if conn (bl.net::connection-bytes-sent conn) 0))
-           ("bytesrecv" . ,(if conn (bl.net::connection-bytes-received conn) 0))
-           ("conntime" . ,(bl.net::peer-connected-at peer))
+                           (if conn (bl.net:connection-last-recv-time conn) 0)))
+           ("last_transaction" . ,(bl.net:peer-last-tx-time peer))
+           ("last_block" . ,(bl.net:peer-last-block-time peer))
+           ("bytessent" . ,(if conn (bl.net:connection-bytes-sent conn) 0))
+           ("bytesrecv" . ,(if conn (bl.net:connection-bytes-received conn) 0))
+           ("conntime" . ,(bl.net:peer-connected-at peer))
            ;; Peer's version-message timestamp vs our clock at receipt.
-           ("timeoffset" . ,(bl.net::peer-time-offset peer))
+           ("timeoffset" . ,(bl.net:peer-time-offset peer))
            ;; ping stats are in internal-time units; report seconds. All
            ;; three are optional in Core: pingtime/minping only once a pong
            ;; arrived, pingwait only while a ping is outstanding.
@@ -232,26 +232,26 @@ whatever the cadence is."
            ,@(when (plusp minping)
                `(("minping" . ,(/ minping internal-time-units-per-second 1.0d0))))
            ,@(when ping-nonce
-               `(("pingwait" . ,(/ (- now (bl.net::peer-last-ping-time peer))
+               `(("pingwait" . ,(/ (- now (bl.net:peer-last-ping-time peer))
                                    internal-time-units-per-second 1.0d0))))
            ("version" . ,(if vmsg
                              (bl.ser:version-message-version vmsg)
                              0))
-           ("subver" . ,(or (bl::peer-user-agent peer) ""))
-           ("inbound" . ,(json-bool (bl.net::peer-inbound peer)))
+           ("subver" . ,(or (bl.net:peer-user-agent peer) ""))
+           ("inbound" . ,(json-bool (bl.net:peer-inbound peer)))
            ;; BIP152 high-bandwidth selection, both directions (Core
            ;; m_bip152_highbandwidth_to / _from).
            ("bip152_hb_to" . ,(json-bool
-                               (bl.net::peer-compact-block-high-bandwidth-to peer)))
+                               (bl.net:peer-compact-block-high-bandwidth-to peer)))
            ("bip152_hb_from" . ,(json-bool
-                                 (bl.net::peer-compact-block-high-bandwidth peer)))
+                                 (bl.net:peer-compact-block-high-bandwidth peer)))
            ;; Kept unconditionally (Core gates it behind -deprecatedrpc).
            ("startingheight" . ,sh)
            ;; Low-work headers presync progress (Core presync_height): the
            ;; current height of an in-progress PRESYNC phase, else -1.
            ("presynced_headers"
-            . ,(if (and hss (eq (bl.net::hss-state hss) :presync))
-                   (bl.net::hss-current-height hss)
+            . ,(if (and hss (eq (bl.net:hss-state hss) :presync))
+                   (bl.net:hss-current-height hss)
                    -1))
            ("synced_headers" . ,(if best-entry
                                     (bl.store:block-index-entry-height best-entry)
@@ -260,27 +260,27 @@ whatever the cadence is."
            ("synced_blocks" . -1)
            ("inflight" . ,(coerce inflight 'vector))
            ("addr_relay_enabled" . ,(json-bool
-                                     (bl.net::peer-addr-relay-enabled peer)))
+                                     (bl.net:peer-addr-relay-enabled peer)))
            ;; Addr intake counters (Core m_addr_processed /
            ;; m_addr_rate_limited; the rate-limited count is addresses
            ;; dropped by the per-address token bucket).
-           ("addr_processed" . ,(bl.net::peer-addr-processed peer))
-           ("addr_rate_limited" . ,(bl.net::peer-addr-rate-limited peer))
+           ("addr_processed" . ,(bl.net:peer-addr-processed peer))
+           ("addr_rate_limited" . ,(bl.net:peer-addr-rate-limited peer))
            ;; The -whitelist / -whitebind permissions this peer holds (Core
            ;; getpeerinfo "permissions", rpc/net.cpp). Was hardcoded empty.
            ("permissions"
             . ,(let ((names (bl.net:permission-flag-names
                              (bl.net:peer-permission-flags
                               (bl.net:peer-address peer)
-                              (bl.net::peer-inbound peer)))))
+                              (bl.net:peer-inbound peer)))))
                  (if names (coerce names 'vector) #())))
            ;; BIP133: the peer's advertised fee floor, sat/kvB -> BTC/kvB.
-           ("minfeefilter" . ,(/ (bl.net::peer-feefilter-rate peer)
+           ("minfeefilter" . ,(/ (bl.net:peer-feefilter-rate peer)
                                  100000000.0d0))
-           ("bytessent_per_msg" . ,(bl.net::snapshot-per-msg-table
-                                    (bl.net::peer-sent-per-msg peer)))
-           ("bytesrecv_per_msg" . ,(bl.net::snapshot-per-msg-table
-                                    (bl.net::peer-recv-per-msg peer)))
+           ("bytessent_per_msg" . ,(bl.net:snapshot-per-msg-table
+                                    (bl.net:peer-sent-per-msg peer)))
+           ("bytesrecv_per_msg" . ,(bl.net:snapshot-per-msg-table
+                                    (bl.net:peer-recv-per-msg peer)))
            ;; Core ConnectionType string (block-relay-only/feeler peers get
            ;; no tx relay -- #216).
            ;; A manual peer's TYPE is "manual" in Core — ConnectionType::MANUAL
@@ -290,7 +290,7 @@ whatever the cadence is."
            ;; against the automatic types, and Core's manual peer likewise
            ;; occupies none of them; what has to agree is the REPORT.
            ("connection_type" . ,(if (and (bl.net:peer-manual peer)
-                                          (not (bl.net::peer-inbound peer)))
+                                          (not (bl.net:peer-inbound peer)))
                                      "manual"
                                      (%connection-type-string
                                       (bl.net:peer-conn-type peer))))
@@ -301,9 +301,9 @@ whatever the cadence is."
            ;; BIP324 session id (v2 only; "" otherwise, like Core).
            ("session_id"
             . ,(let ((sid (and transport
-                               (bl.net::v2-transport-p transport)
+                               (bl.net:v2-transport-p transport)
                                (bl.crypto:bip324-cipher-session-id
-                                (bl.net::v2-transport-cipher transport)))))
+                                (bl.net:v2-transport-cipher transport)))))
                  (if sid (bl.crypto:bytes-to-hex sid) ""))))))
      peers)))
 
@@ -315,15 +315,15 @@ whatever the cadence is."
          ;; THE service bits we advertise on the wire (peer.lisp local-services,
          ;; Core g_local_services) — the one composition; do not duplicate it
          ;; here. Names via the shared %service-names (Core GetServicesNames).
-         (services (bl.net::local-services))
+         (services (bl.net:local-services))
          (service-names (%service-names services))
-         (in (count-if #'bl.net::peer-inbound peers))
+         (in (count-if #'bl.net:peer-inbound peers))
          ;; The EFFECTIVE -minrelaytxfee (sat/kvB -> BTC/kvB); Core reports
          ;; ::minRelayTxFee.GetFeePerK(), not the compile-time default.
          (relayfee (/ bl.mp:*min-relay-fee-rate*
                       100000000.0d0))
          ;; +incremental-relay-fee-rate+ is sat/kvB -> BTC/kvB.
-         (incfee (/ bl.mp::+incremental-relay-fee-rate+ 100000000.0d0)))
+         (incfee (/ bl.mp:+incremental-relay-fee-rate+ 100000000.0d0)))
     `(("version" . ,bl.ser:+client-version+)
       ("subversion" . ,bl.ser:*user-agent*)
       ("protocolversion" . 70016)
@@ -334,7 +334,7 @@ whatever the cadence is."
       ;; serializes as JSON true/false (never null).
       ("localrelay" . ,(json-bool (not (bl.net:ignore-incoming-txs-p))))
       ("timeoffset" . 0)
-      ("networkactive" . ,(json-bool (bl::node-network-active node)))
+      ("networkactive" . ,(json-bool (bl:node-network-active node)))
       ("connections" . ,(length peers))
       ("connections_in" . ,in)
       ("connections_out" . ,(- (length peers) in))
@@ -374,7 +374,7 @@ peer disconnecting mid-send."
   "Return known peer addresses from the address book (Bitcoin Core
 getnodeaddresses). PARAMS: ([count]) — max addresses (default 1; 0 = all)."
   (let* ((count (if (integerp (first params)) (first params) 1))
-         (book (bl::node-address-book node))
+         (book (bl:node-address-book node))
          ;; count=0 => all known addresses; count>0 => up to that many.
          (limited (and book (bl.net:address-book-get-addr
                              book :max (max count 0) :pct 100))))
@@ -405,7 +405,7 @@ aggregate (Bitcoin Core getaddrmaninfo). Like Core, every standard network key
 is always present (0 when empty); all_networks uses the address book's
 authoritative running counts."
   (declare (ignore params))
-  (let ((book (bl::node-address-book node))
+  (let ((book (bl:node-address-book node))
         ;; name -> (new . tried)
         (tally (make-hash-table :test 'equal))
         (networks '("ipv4" "ipv6" "onion" "i2p" "cjdns")))
@@ -420,15 +420,15 @@ authoritative running counts."
                (if (bl.net:peer-address-in-tried pa)
                    (incf (cdr cell))
                    (incf (car cell)))))))
-       (bl.net::address-book-info book)))
+       (bl.net:address-book-info book)))
     (flet ((entry (new tried)
              `(("new" . ,new) ("tried" . ,tried) ("total" . ,(+ new tried)))))
       (let ((result (mapcar (lambda (n)
                               (let ((cell (gethash n tally)))
                                 (cons n (entry (car cell) (cdr cell)))))
                             networks))
-            (nn (if book (bl.net::address-book-n-new book) 0))
-            (nt (if book (bl.net::address-book-n-tried book) 0)))
+            (nn (if book (bl.net:address-book-n-new book) 0))
+            (nt (if book (bl.net:address-book-n-tried book) 0)))
         (append result (list (cons "all_networks" (entry nn nt))))))))
 
 (defparameter %addconnection-types
@@ -449,11 +449,11 @@ ADDR-FETCH and FEELER have no cap in Core — the first because -seednode has
 none either, the second because feelers are short-lived — so they always fit."
   (case conn-type
     (:outbound-full-relay
-     (< (bl::peers-of-conn-type node :outbound-full-relay)
-        (bl::node-max-peers node)))
+     (< (bl:peers-of-conn-type node :outbound-full-relay)
+        (bl:node-max-peers node)))
     (:block-relay
-     (< (bl::peers-of-conn-type node :block-relay)
-        bl::+target-block-relay-peers+))
+     (< (bl:peers-of-conn-type node :block-relay)
+        bl:+target-block-relay-peers+))
     (t t)))
 
 (define-rpc "addconnection" (node params)
@@ -486,15 +486,15 @@ capacity check runs synchronously, because that is the answer the caller needs."
                           :message "Type of connection to open (\"outbound-full-relay\", \"block-relay-only\", \"addr-fetch\" or \"feeler\")."))
       ;; Core refuses a v2 request when the node was not started with
       ;; -v2transport, rather than silently dialing v1 (rpc/net.cpp).
-      (when (and (%positional-bool v2transport)
-                 (not (bl.net::v2-available-p)))
+      (when (and (positional-bool v2transport)
+                 (not (bl.net:v2-available-p)))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message "Error: Adding v2transport connections requires -v2transport init flag to be set."))
       (unless (%addconnection-capacity-left-p node conn-type)
         (error 'rpc-error :code +rpc-client-node-capacity-reached+
                           :message "Error: Already at capacity for specified connection type."))
-      (bt:with-recursive-lock-held ((bl::node-lock node))
-        (push (cons address conn-type) bl::*pending-test-connections*))
+      (bt:with-recursive-lock-held ((bl:node-lock node))
+        (push (cons address conn-type) bl:*pending-test-connections*))
       `(("address" . ,address)
         ("connection_type" . ,trimmed)))))
 
@@ -512,22 +512,22 @@ transport is not implemented."
     (unless (member command '("add" "remove" "onetry") :test #'equal)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "command must be \"add\", \"remove\", or \"onetry\""))
-    (bt:with-recursive-lock-held ((bl::node-lock node))
+    (bt:with-recursive-lock-held ((bl:node-lock node))
       (cond
         ((equal command "onetry")
-         (push spec (bl::node-pending-onetry node)))
+         (push spec (bl:node-pending-onetry node)))
         ((equal command "add")
-         (when (member spec (bl::node-added-nodes node) :test #'string=)
+         (when (member spec (bl:node-added-nodes node) :test #'string=)
            (error 'rpc-error :code +rpc-client-node-already-added+
                              :message "Error: Node already added"))
-         (setf (bl::node-added-nodes node)
-               (append (bl::node-added-nodes node) (list spec))))
+         (setf (bl:node-added-nodes node)
+               (append (bl:node-added-nodes node) (list spec))))
         ((equal command "remove")
-         (unless (member spec (bl::node-added-nodes node) :test #'string=)
+         (unless (member spec (bl:node-added-nodes node) :test #'string=)
            (error 'rpc-error :code +rpc-client-node-not-added+
                              :message "Error: Node could not be removed. It has not been added previously."))
-         (setf (bl::node-added-nodes node)
-               (remove spec (bl::node-added-nodes node) :test #'string=)))))
+         (setf (bl:node-added-nodes node)
+               (remove spec (bl:node-added-nodes node) :test #'string=)))))
     nil))
 
 (define-rpc "getaddednodeinfo" (node params)
@@ -537,8 +537,8 @@ was never added). Returns an array of {addednode, connected, addresses}."
   (let ((filter (first params)))
     (when (and filter (not (stringp filter)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "node must be a string"))
-    (let ((added (bt:with-recursive-lock-held ((bl::node-lock node))
-                   (copy-list (bl::node-added-nodes node)))))
+    (let ((added (bt:with-recursive-lock-held ((bl:node-lock node))
+                   (copy-list (bl:node-added-nodes node)))))
       (when filter
         (unless (member filter added :test #'string=)
           (error 'rpc-error :code +rpc-client-node-not-added+
@@ -548,9 +548,9 @@ was never added). Returns an array of {addednode, connected, addresses}."
       (json-array
        (mapcar
         (lambda (spec)
-          (let* ((host (bl::parse-node-endpoint node spec))
-                 (peer (bt:with-recursive-lock-held ((bl::node-lock node))
-                         (find host (bl::node-peers node)
+          (let* ((host (bl:parse-node-endpoint node spec))
+                 (peer (bt:with-recursive-lock-held ((bl:node-lock node))
+                         (find host (bl:node-peers node)
                                :key #'bl.net:peer-address :test #'string=))))
             `(("addednode" . ,spec)
               ("connected" . ,(json-bool peer))
@@ -561,7 +561,7 @@ was never added). Returns an array of {addednode, connected, addresses}."
                . ,(json-array
                    (when peer
                      (list `(("address" . ,(bl.net:peer-address peer))
-                             ("connected" . ,(if (bl.net::peer-inbound peer)
+                             ("connected" . ,(if (bl.net:peer-inbound peer)
                                                  "inbound" "outbound"))))))))))
         added)))))
 
@@ -572,10 +572,10 @@ Core's socket thread does the same as a consequence of the cleared flag
 (net.cpp DisconnectNodes); the sync thread reaps them from node-peers,
 keeping it single-writer. Shared by setnetworkactive and dumptxoutset's
 rollback-time NetworkDisable. Returns STATE."
-  (setf (bl::node-network-active node) state)
+  (setf (bl:node-network-active node) state)
   (unless state
-    (dolist (peer (bt:with-recursive-lock-held ((bl::node-lock node))
-                    (copy-list (bl::node-peers node))))
+    (dolist (peer (bt:with-recursive-lock-held ((bl:node-lock node))
+                    (copy-list (bl:node-peers node))))
       (ignore-errors (bl.net:disconnect-peer peer))))
   state)
 
@@ -586,7 +586,7 @@ connections until re-enabled. Returns the new state."
   (when (endp params)
     (error 'rpc-error :code +rpc-invalid-parameter+ :message "state is required"))
   ;; Bare JSON boolean result (Core net.cpp:907) — false must not be null.
-  (json-bool (%set-network-active node (%positional-bool (first params)))))
+  (json-bool (%set-network-active node (positional-bool (first params)))))
 
 (define-rpc "disconnectnode" (node params)
   "Disconnect a connected peer by ADDRESS or by NODEID (Bitcoin Core
@@ -609,17 +609,17 @@ parameter the caller never sent."
          (have-nodeid (integerp nodeid)))
     ;; Atomic against the sync thread's node-peers mutations: hold node-lock
     ;; across the find + disconnect so we don't act on a peer mid-removal.
-    (bt:with-recursive-lock-held ((bl::node-lock node))
+    (bt:with-recursive-lock-held ((bl:node-lock node))
       (let ((target
               (cond
                 ((and have-address (not have-nodeid))
-                 (find address (bl::node-peers node)
-                       :key (lambda (p) (bl::peer-address p))
+                 (find address (bl:node-peers node)
+                       :key (lambda (p) (bl.net:peer-address p))
                        :test #'string=))
                 ((and have-nodeid (or (null address)
                                       (and (stringp address) (zerop (length address)))))
-                 (find nodeid (bl::node-peers node)
-                       :key (lambda (p) (bl.net::peer-id p))
+                 (find nodeid (bl:node-peers node)
+                       :key (lambda (p) (bl.net:peer-id p))
                        :test #'eql))
                 (t
                  (error 'rpc-error :code +rpc-invalid-params+
@@ -635,8 +635,8 @@ parameter the caller never sent."
         ;; is already out of m_nodes; ours would otherwise linger in
         ;; node-peers for as long as a sync cycle takes. We already hold
         ;; node-lock, which is the only thing that made this awkward before.
-        (setf (bl::node-peers node)
-              (remove target (bl::node-peers node)))
+        (setf (bl:node-peers node)
+              (remove target (bl:node-peers node)))
         nil))))
 
 ;;; --- Manual ban management (Bitcoin Core setban/listbanned/clearbanned) ---
@@ -658,7 +658,7 @@ subnet syntax is rejected as invalid. Returns null."
   (let ((address (first params))
         (command (second params))
         (bantime (third params))
-        (absolute (%positional-bool (fourth params))))
+        (absolute (positional-bool (fourth params))))
     (unless (and (stringp address) (plusp (length address)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "address required"))
     ;; Core: unparseable IP/subnet -> RPC_CLIENT_INVALID_IP_OR_SUBNET (-30),
@@ -693,9 +693,9 @@ subnet syntax is rejected as invalid. Returns null."
        ;; that address). Same node-lock discipline as rpc-disconnectnode:
        ;; hold it across the scan + disconnects so we never act on a peer
        ;; mid-removal by the sync thread.
-       (bt:with-recursive-lock-held ((bl::node-lock node))
-         (dolist (peer (bl::node-peers node))
-           (when (string= address (bl::peer-address peer))
+       (bt:with-recursive-lock-held ((bl:node-lock node))
+         (dolist (peer (bl:node-peers node))
+           (when (string= address (bl.net:peer-address peer))
              (bl.net:disconnect-peer peer))))
        nil)
       ((equal command "remove")
@@ -736,16 +736,16 @@ subnet syntax is rejected as invalid. Returns null."
     ;; field reads as Core's disabled shape, because Core's own accessors
     ;; short-circuit on nMaxOutboundLimit == 0.
     ("uploadtarget"
-     . (("timeframe" . ,bl.net::+max-upload-timeframe-seconds+)
-        ("target" . ,bl.net::*max-upload-target*)
+     . (("timeframe" . ,bl.net:+max-upload-timeframe-seconds+)
+        ("target" . ,bl.net:*max-upload-target*)
         ("target_reached"
-         . ,(json-bool (bl.net::outbound-target-reached-p nil)))
+         . ,(json-bool (bl.net:outbound-target-reached-p nil)))
         ("serve_historical_blocks"
-         . ,(json-bool (not (bl.net::outbound-target-reached-p t))))
+         . ,(json-bool (not (bl.net:outbound-target-reached-p t))))
         ("bytes_left_in_cycle"
-         . ,(bl.net::outbound-target-bytes-left))
+         . ,(bl.net:outbound-target-bytes-left))
         ("time_left_in_cycle"
-         . ,(bl.net::max-outbound-time-left-in-cycle))))))
+         . ,(bl.net:max-outbound-time-left-in-cycle))))))
 
 ;;; --- addpeeraddress, sendmsgtopeer (Core rpc/net.cpp) ---
 
@@ -759,7 +759,7 @@ legitimately fail (the tried bucket position may be occupied and queued for a
 collision test), and reporting success for that would misinform the test."
   (let ((address (first params))
         (port (second params))
-        (tried (%positional-bool (third params))))
+        (tried (positional-bool (third params))))
     (unless (and (stringp address) (plusp (length address)))
       (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for address"))
     (unless (and (integerp port) (<= 0 port 65535))
@@ -769,7 +769,7 @@ collision test), and reporting success for that would misinform the test."
       (unless (and net bytes)
         (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
                           :message "Invalid IP address"))
-      (let ((book (bl::node-address-book node)))
+      (let ((book (bl:node-address-book node)))
         (unless book
           (error 'rpc-error :code +rpc-misc-error+ :message "Address manager unavailable"))
         (let* ((pa (bl.net:make-peer-address
@@ -811,9 +811,9 @@ PARAMS: (peer_id msg_type msg). Returns an empty object."
                  (every (lambda (c) (digit-char-p c 16)) msg-hex))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Error parsing input for msg"))
-    (let ((peer (bt:with-recursive-lock-held ((bl::node-lock node))
-                  (find peer-id (bl::node-peers node)
-                        :key #'bl.net::peer-id))))
+    (let ((peer (bt:with-recursive-lock-held ((bl:node-lock node))
+                  (find peer-id (bl:node-peers node)
+                        :key #'bl.net:peer-id))))
       (unless peer
         (error 'rpc-error :code +rpc-misc-error+
                           :message "Error: Could not send message to peer"))

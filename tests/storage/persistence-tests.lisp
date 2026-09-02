@@ -656,7 +656,7 @@ one entry."
           (is (eq :valid (bl.store:block-index-entry-status
                           (bl.store:get-block-index-entry cs2 h1))))
           (is (= 2 (hash-table-count
-                    (bl.store::chain-state-block-index cs2)))))))))
+                    (bl.store:chain-state-block-index cs2)))))))))
 
 (test header-index-stale-delta-is-discarded-not-replayed
   "A delta orphaned by a crash between 'write new snapshot' and 'remove old
@@ -804,34 +804,34 @@ one unanswered for TIMEOUT_INTERVAL (20 min) disconnects the peer."
   (is (= 1200 bl.net::+ping-timeout-seconds+))
   (flet ((peer-with-ping (age-seconds &key (nonce 7))
            (let ((peer (bl.net:make-peer :state :ready)))
-             (setf (bl.net::peer-ping-nonce peer) nonce
-                   (bl.net::peer-last-ping-time peer)
+             (setf (bl.net:peer-ping-nonce peer) nonce
+                   (bl.net:peer-last-ping-time peer)
                    (- (get-internal-real-time)
                       (* age-seconds internal-time-units-per-second)))
              peer)))
     ;; Outstanding for 100 s: left alone — no new ping, no disconnect.
     (let ((peer (peer-with-ping 100)))
       (is (eq :ok (bl.net:check-peer-health peer)))
-      (is (= 7 (bl.net::peer-ping-nonce peer))))
+      (is (= 7 (bl.net:peer-ping-nonce peer))))
     ;; Outstanding for 1201 s: disconnect on the first timeout, no retry count.
     (is (eq :disconnect (bl.net:check-peer-health
                          (peer-with-ping 1201))))
     ;; A pong clears the outstanding ping.
     (let ((peer (peer-with-ping 1)))
       (bl.net::handle-pong peer 7)
-      (is (null (bl.net::peer-ping-nonce peer)))))
+      (is (null (bl.net:peer-ping-nonce peer)))))
   ;; A peer that has NEVER been pinged is due now, not in two minutes. Core
   ;; encodes this as m_ping_start{0us} against an absolute clock, so
   ;; `now > m_ping_start + PING_INTERVAL` holds on a fresh peer
   ;; (net_processing.cpp:5508).
   (let ((peer (bl.net:make-peer :state :ready)))
-    (is (null (bl.net::peer-last-ping-time peer))
+    (is (null (bl.net:peer-last-ping-time peer))
         "a fresh peer must record NO ping, not a ping at time zero")
     (is (eq :ping-sent (bl.net:check-peer-health peer)))
-    (is (bl.net::peer-ping-nonce peer))
+    (is (bl.net:peer-ping-nonce peer))
     ;; And having just pinged, it does not ping again.
     (bl.net::handle-pong
-     peer (bl.net::peer-ping-nonce peer))
+     peer (bl.net:peer-ping-nonce peer))
     (is (eq :ok (bl.net:check-peer-health peer))))
   ;; The positive control for the bug this replaced: the old code compared
   ;; against a 0 initform on INTERNAL-REAL-TIME, whose zero is process start.
@@ -839,7 +839,7 @@ one unanswered for TIMEOUT_INTERVAL (20 min) disconnects the peer."
   ;; internal time 0 — under the old rule that read as "pinged at boot, not due
   ;; yet" and no ping went out for the node's first two minutes.
   (let ((peer (bl.net:make-peer :state :ready)))
-    (setf (bl.net::peer-last-ping-time peer) 0)
+    (setf (bl.net:peer-last-ping-time peer) 0)
     (is (eq (if (> (get-internal-real-time)
                    (* bl.net::+ping-interval-seconds+
                       internal-time-units-per-second))
@@ -1047,33 +1047,33 @@ accumulating score); discouragement is NOT a hard ban."
 
 (test timed-out-blocks-become-re-requestable
   "After retry-timed-out-requests, timed-out blocks should be requestable again."
-  (let* ((bl.net::*ibd-context*
+  (let* ((bl.net:*ibd-context*
            (bl.net::make-ibd))
-         (ctx bl.net::*ibd-context*)
+         (ctx bl.net:*ibd-context*)
          (hash1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xF1))
          (hash2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xF2))
          (peer (bl.net:make-peer)))
     (setf (bl.net:peer-state peer) :ready)
     ;; Add blocks to pending
-    (setf (gethash hash1 (bl.net::ibd-context-pending-blocks ctx)) 10)
-    (setf (gethash hash2 (bl.net::ibd-context-pending-blocks ctx)) 11)
+    (setf (gethash hash1 (bl.net:ibd-context-pending-blocks ctx)) 10)
+    (setf (gethash hash2 (bl.net:ibd-context-pending-blocks ctx)) 11)
     ;; Mark both as in-flight from the peer with an old timestamp (simulating timeout)
     (let ((old-time (- (get-internal-real-time)
                        (* 120 internal-time-units-per-second))))
-      (setf (gethash hash1 (bl.net::ibd-context-in-flight ctx))
+      (setf (gethash hash1 (bl.net:ibd-context-in-flight ctx))
             (cons peer old-time))
-      (setf (gethash hash2 (bl.net::ibd-context-in-flight ctx))
+      (setf (gethash hash2 (bl.net:ibd-context-in-flight ctx))
             (cons peer old-time)))
     ;; Verify both are in-flight
-    (is (= 2 (hash-table-count (bl.net::ibd-context-in-flight ctx))))
+    (is (= 2 (hash-table-count (bl.net:ibd-context-in-flight ctx))))
     ;; Retry timed-out requests
     (let ((retried (bl.net::retry-timed-out-requests)))
       (is (= 2 retried)))
     ;; In-flight should be empty now
-    (is (= 0 (hash-table-count (bl.net::ibd-context-in-flight ctx))))
+    (is (= 0 (hash-table-count (bl.net:ibd-context-in-flight ctx))))
     ;; Blocks should still be in pending (and, no longer being in-flight,
     ;; the next per-peer download walk can re-request them).
-    (is (= 2 (hash-table-count (bl.net::ibd-context-pending-blocks ctx))))))
+    (is (= 2 (hash-table-count (bl.net:ibd-context-pending-blocks ctx))))))
 
 ;;;; Sync Resume Simulation Test
 
@@ -1366,7 +1366,7 @@ header; these synthetic fixtures must too."
 
 (test drain-block-queue-empty
   "Draining an empty queue should return 0."
-  (let ((bl.net::*ibd-context*
+  (let ((bl.net:*ibd-context*
           (bl.net::make-ibd)))
     (let ((state (bl.store:init-chain-state
                   (merge-pathnames "test-drain/" (uiop:temporary-directory))))
@@ -1417,11 +1417,11 @@ LevelDB batch that committed through that height). Returns the node."
          (utxo (bl.store:make-coins-view-cache
                 (bl.store:open-coins-view-db
                  (ensure-directories-exist (merge-pathnames "chainstate/" base)))))
-         (node (bl::make-node))
+         (node (bl:make-node))
          (genesis-hash (bl.store:best-block-hash chain-state)))
-    (setf (bl::node-chain-state node) chain-state
-          (bl::node-block-store node) block-store
-          (bl::node-utxo-set node) utxo)
+    (setf (bl:node-chain-state node) chain-state
+          (bl:node-block-store node) block-store
+          (bl:node-utxo-set node) utxo)
     (bl.store:add-block-index-entry
      chain-state (bl.store:make-block-index-entry
                   :hash genesis-hash :height 0 :chain-work 0 :status :valid))
@@ -1455,11 +1455,11 @@ the marker, height unchanged, chainstate.dat reloads clean."
   (let ((node (%recovery-fixture 3)))   ; coins present through block 3
     (is (eq t (bl::recover-inconsistent-chainstate node)))
     (is (= 3 (bl.store:current-height
-              (bl::node-chain-state node))))
+              (bl:node-chain-state node))))
     ;; Marker cleared: a fresh load returns T, not :inconsistent.
     (let ((reload (bl.store:init-chain-state
                    (bl.store::chain-state-base-path
-                    (bl::node-chain-state node)))))
+                    (bl:node-chain-state node)))))
       (is (eq t (bl.store:load-state reload)))
       (is (= 3 (bl.store:current-height reload))))))
 
@@ -1469,10 +1469,10 @@ chainstate.dat to the highest ancestor whose coins ARE committed."
   (let ((node (%recovery-fixture 2)))   ; coins present only through block 2
     (is (eq t (bl::recover-inconsistent-chainstate node)))
     (is (= 2 (bl.store:current-height
-              (bl::node-chain-state node))))
+              (bl:node-chain-state node))))
     (let ((reload (bl.store:init-chain-state
                    (bl.store::chain-state-base-path
-                    (bl::node-chain-state node)))))
+                    (bl:node-chain-state node)))))
       (is (eq t (bl.store:load-state reload)))
       (is (= 2 (bl.store:current-height reload))))))
 
@@ -1532,11 +1532,11 @@ coins view is closed."
                 (merge-pathnames (format nil "test-shutdown-flush-~D/"
                                          (get-universal-time))
                                  (uiop:temporary-directory))))
-         (node (bl::make-node))
+         (node (bl:make-node))
          (mid-window '()))
     (unwind-protect
          (let ((cs (%shutdown-fixture-chainstate base "" 7)))
-           (setf (bl::node-chainstates node) (list cs))
+           (setf (bl:node-chainstates node) (list cs))
            (let ((bl::*flush-mid-commit-hook*
                    (lambda (flushing)
                      ;; Probe the ON-DISK state file from a fresh struct, as
@@ -1568,7 +1568,7 @@ own tips afterwards with their coins durable."
                 (merge-pathnames (format nil "test-shutdown-flush2-~D/"
                                          (get-universal-time))
                                  (uiop:temporary-directory))))
-         (node (bl::make-node))
+         (node (bl:make-node))
          (mid-window '()))
     (unwind-protect
          (let ((primary (%shutdown-fixture-chainstate base "" 1))
@@ -1578,7 +1578,7 @@ own tips afterwards with their coins durable."
                       (make-array 32 :element-type '(unsigned-byte 8)
                                      :initial-element 5)
                       :assumeutxo-status :unvalidated)))
-           (setf (bl::node-chainstates node) (list primary snap))
+           (setf (bl:node-chainstates node) (list primary snap))
            (let ((bl::*flush-mid-commit-hook*
                    (lambda (flushing)
                      (let* ((suffix (bl.store:chain-state-storage-suffix
@@ -1619,18 +1619,18 @@ own tips afterwards with their coins durable."
 (defun %shutdown-test-node (base)
   "A minimal running node over BASE with the state stop-node persists: one
 chainstate with a dirty coin, a mempool, an address book, a data directory."
-  (let ((node (bl::make-node :network :regtest)))
-    (setf (bl::node-data-directory node) base
-          (bl::node-chainstates node)
+  (let ((node (bl:make-node :network :regtest)))
+    (setf (bl:node-data-directory node) base
+          (bl:node-chainstates node)
           (list (%shutdown-fixture-chainstate base "" 3))
-          (bl::node-mempool node) (bl.mp:make-mempool)
-          (bl::node-address-book node)
+          (bl:node-mempool node) (bl.mp:make-mempool)
+          (bl:node-address-book node)
           (bl.net:make-address-book)
-          (bl::node-running node) t)
+          (bl:node-running node) t)
     node))
 
 (defmacro %with-shutdown-node ((node-var base-var) &body body)
-  "Run BODY with NODE-VAR installed as the GLOBAL bl::*node* (other
+  "Run BODY with NODE-VAR installed as the GLOBAL bl:*node* (other
 threads read the global, so a LET binding would be invisible to them), and
 every global stop-node mutates restored afterwards."
   `(let* ((,base-var (ensure-directories-exist
@@ -1638,14 +1638,14 @@ every global stop-node mutates restored afterwards."
                                                (get-internal-real-time))
                                        (uiop:temporary-directory))))
           (,node-var (%shutdown-test-node ,base-var))
-          (saved-node bl::*node*)
+          (saved-node bl:*node*)
           (saved-banlist bl.net:*banlist-path*))
-     (setf bl::*node* ,node-var
+     (setf bl:*node* ,node-var
            bl::*shutdown-request* nil
            bl::*shutdown-complete* nil
            bl::*stop-node-in-progress* nil)
      (unwind-protect (progn ,@body)
-       (setf bl::*node* saved-node
+       (setf bl:*node* saved-node
              bl.net:*banlist-path* saved-banlist
              bl::*shutdown-request* nil
              bl::*shutdown-complete* nil
@@ -1678,9 +1678,9 @@ the node died out from under it."
                      (lambda (&rest args) (note :peers) (apply real-peers args)))
                ;; The shipped RPC entry point, not a re-implementation of it.
                (bl.rpc::rpc-stop node nil)
-               (let ((code (bl::run-node-watchdog :poll-seconds 0.05
+               (let ((code (bl:run-node-watchdog :poll-seconds 0.05
                                                             :exit nil)))
-                 (is (= bl::+node-exit-clean+ code)
+                 (is (= bl:+node-exit-clean+ code)
                      "watchdog exit code (0 = deliberate stop, 7 = died unasked)")))
           (setf (fdefinition 'bl::%shutdown-flush-chainstates) real-flush
                 (fdefinition 'bl.mp:save-mempool-file) real-mempool
@@ -1693,7 +1693,7 @@ the node died out from under it."
             "a persistence step ran at or after *shutdown-complete*: ~S" order))
       ;; The latch is set only once the teardown is done, and the node is down.
       (is (eq t bl::*shutdown-complete*))
-      (is (null bl::*node*))
+      (is (null bl:*node*))
       ;; The chainstate was committed clean by that teardown.
       (let ((reload (bl.store:make-chain-state :base-path base)))
         (is (eq t (bl.store:load-state reload)))
@@ -1709,11 +1709,11 @@ turn a clean stop into a respawn."
     ;; Pretend the main-thread watchdog is polling, so the request does NOT
     ;; fall back to running stop-node on a thread of its own.
     (setf bl::*shutdown-watchdog-running* t)
-    (is (eq t (bl::request-node-shutdown "first")))
-    (is (null (bl::request-node-shutdown
-               "second" :exit-code bl::+node-exit-error+)))
-    (is (string= "first" (bl::node-shutdown-requested-p)))
-    (is (= bl::+node-exit-clean+
+    (is (eq t (bl:request-node-shutdown "first")))
+    (is (null (bl:request-node-shutdown
+               "second" :exit-code bl:+node-exit-error+)))
+    (is (string= "first" (bl:node-shutdown-requested-p)))
+    (is (= bl:+node-exit-clean+
            (bl::%pending-shutdown-exit-code)))))
 
 (test stop-node-is-idempotent-under-concurrent-calls
@@ -1738,7 +1738,7 @@ run the teardown again — it waits for the owner and returns NIL."
              (let ((threads (loop repeat 2
                                   collect (bt:make-thread
                                            (lambda ()
-                                             (let ((r (bl::stop-node)))
+                                             (let ((r (bl:stop-node)))
                                                (bt:with-lock-held (lock)
                                                  (push r results))))))))
                (dolist (th threads) (bt:join-thread th))))
@@ -1785,8 +1785,8 @@ Drive the real handler with the log path booby-trapped: if it emits, it dies."
     ;; It did register the request, using the PREALLOCATED cell — the identity
     ;; check is the assertion that the handler did not cons a fresh one.
     (is (eq bl::*signal-shutdown-request* bl::*shutdown-request*))
-    (is (string= "SIGTERM/SIGINT" (bl::node-shutdown-requested-p)))
-    (is (= bl::+node-exit-clean+
+    (is (string= "SIGTERM/SIGINT" (bl:node-shutdown-requested-p)))
+    (is (= bl:+node-exit-clean+
            (bl::%pending-shutdown-exit-code)))))
 
 (test the-stop-signal-handler-writes-exactly-one-wake-up-token
@@ -1833,7 +1833,7 @@ takes a SIGTERM registers the request and then sits there forever."
 recursive only because the signal handler logged; Core's BCLog::Logger::m_cs is
 a plain StdMutex. A recursive lock here would hide a genuine re-entrant emit
 instead of deadlocking on it, which is how a logging bug becomes invisible."
-  (is (typep bl.log::*log-lock* 'sb-thread:mutex))
+  (is (typep bl.log:*log-lock* 'sb-thread:mutex))
   ;; And no source file may take it recursively again.
   (dolist (rel (cons "src/logging.lisp" (%node-source-files)))
     (let ((src (uiop:read-file-string
@@ -1861,7 +1861,7 @@ running means neither path makes a thread of its own."
              (setf (fdefinition 'bl::%write-shutdown-token)
                    (lambda () (incf tokens) nil))
              (setf bl::*shutdown-watchdog-running* nil)
-             (is (eq t (bl::request-node-shutdown "rpc stop")))
+             (is (eq t (bl:request-node-shutdown "rpc stop")))
              (is (= 1 tokens) "the stop request did not wake the servicer")
              (is (= 0 threads)))
         (setf (fdefinition 'bl::%write-shutdown-token) real-write)
@@ -1885,10 +1885,10 @@ crash-restart, which is the path that most needs to be fast."
              (setf (fdefinition 'bl::%write-shutdown-token)
                    (lambda () (incf tokens) nil))
              ;; No request at all: the watchdog stops because the node is gone.
-             (setf bl::*node* nil)
-             (let ((code (bl::run-node-watchdog :poll-seconds 0.05
+             (setf bl:*node* nil)
+             (let ((code (bl:run-node-watchdog :poll-seconds 0.05
                                                           :exit nil)))
-               (is (= bl::+node-exit-watchdog+ code)
+               (is (= bl:+node-exit-watchdog+ code)
                    "expected the respawn code for a node that died unasked")))
         (setf (fdefinition 'bl::%write-shutdown-token) real-write))
       (is (= 1 tokens)

@@ -213,8 +213,8 @@ m_addr_rate_limited)."
     (let ((added (bl.net::%process-gossiped-addresses
                   p (%addr-entries 20) 20 book nil)))
       (is (= 5 added) "only 5 addresses fit the bucket")
-      (is (= 5 (bl.net::peer-addr-processed p)))
-      (is (= 15 (bl.net::peer-addr-rate-limited p)))
+      (is (= 5 (bl.net:peer-addr-processed p)))
+      (is (= 15 (bl.net:peer-addr-rate-limited p)))
       ;; Upper bound only: the 20 test addresses share one /16 and one
       ;; source, so addrman maps them all into a single 64-slot new bucket
       ;; (bucket keys on the (addr-group, source-group) pair) and 5 inserts
@@ -236,8 +236,8 @@ nothing is rate-limited."
     (let ((added (bl.net::%process-gossiped-addresses
                   p (%addr-entries 10) 10 book nil)))
       (is (= 10 added))
-      (is (= 10 (bl.net::peer-addr-processed p)))
-      (is (= 0 (bl.net::peer-addr-rate-limited p))))))
+      (is (= 10 (bl.net:peer-addr-processed p)))
+      (is (= 0 (bl.net:peer-addr-rate-limited p))))))
 
 (test getaddr-solicitation-clears-on-nonfull-message
   "A non-full (<1000) addr message answers our outstanding getaddr (clears
@@ -272,7 +272,7 @@ net_processing.cpp:3772)."
     (let ((added (bl.net::%process-gossiped-addresses
                   p (%addr-entries 500) 500 book nil)))
       (is (= 500 added) "solicited addresses processed under the bump")
-      (is (= 0 (bl.net::peer-addr-rate-limited p))))))
+      (is (= 0 (bl.net:peer-addr-rate-limited p))))))
 
 (test handle-addr-ignores-block-relay-peer
   "A block-relay-only peer participates in no addr relay: handle-addr /
@@ -523,7 +523,7 @@ batch rather than storing it. A full batch additionally yields a sync object."
           bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-presync-lw/")
       ;; Force the anti-DoS threshold sky-high so any real chain is "low work".
-      (let* ((bl::*minimum-chain-work-override* (expt 2 240))
+      (let* ((bl:*minimum-chain-work-override* (expt 2 240))
              (h1 (%pow-header genesis-hash)))
         ;; Sub-batch (full-batch-p nil): low-work-p T, but no sync started.
         (multiple-value-bind (sync low-work)
@@ -546,11 +546,11 @@ to the index because the validated-tip work gate was off during IBD."
         (bl.store:*pow-limit-target*
           bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-presync-ignore/")
-      (let* ((bl::*minimum-chain-work-override* (expt 2 240))
+      (let* ((bl:*minimum-chain-work-override* (expt 2 240))
              (p (bl.net:make-peer :conn-type :outbound-full-relay))
              (h1 (%pow-header genesis-hash))
              (h1-hash (bl.ser:block-header-hash h1)))
-        (let ((added (bl.net::ingest-headers-from-peer p (list h1) state)))
+        (let ((added (bl.net:ingest-headers-from-peer p (list h1) state)))
           (is (= 0 added) "sub-threshold low-work headers must not be stored")
           (is (null (bl.store:get-block-index-entry state h1-hash))
               "the low-work header must not enter the block index"))))))
@@ -563,11 +563,11 @@ steady-state tip announcements are unaffected by the anti-DoS gate."
           bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-presync-store/")
       ;; Threshold 0 (regtest default): the genesis-anchored chain meets it.
-      (let* ((bl::*minimum-chain-work-override* 0)
+      (let* ((bl:*minimum-chain-work-override* 0)
              (p (bl.net:make-peer :conn-type :outbound-full-relay))
              (h1 (%pow-header genesis-hash :timestamp 1296688700))
              (h1-hash (bl.ser:block-header-hash h1)))
-        (let ((added (bl.net::ingest-headers-from-peer p (list h1) state)))
+        (let ((added (bl.net:ingest-headers-from-peer p (list h1) state)))
           (is (= 1 added) "above-threshold header is stored")
           (is (not (null (bl.store:get-block-index-entry state h1-hash)))
               "above-threshold header enters the block index"))))))
@@ -581,13 +581,13 @@ getheaders and stages availability, committing nothing."
           bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-presync-unconn/")
       (declare (ignore genesis-hash))
-      (let* ((bl::*minimum-chain-work-override* 0)
+      (let* ((bl:*minimum-chain-work-override* 0)
              (p (bl.net:make-peer :conn-type :outbound-full-relay))
              (orphan-prev (make-array 32 :element-type '(unsigned-byte 8)
                                          :initial-element 99))
              (h1 (%pow-header orphan-prev))
              (h1-hash (bl.ser:block-header-hash h1)))
-        (let ((added (bl.net::ingest-headers-from-peer p (list h1) state)))
+        (let ((added (bl.net:ingest-headers-from-peer p (list h1) state)))
           (is (= 0 added))
           (is (null (bl.store:get-block-index-entry state h1-hash))
               "an unconnecting header must not enter the index"))))))
@@ -612,7 +612,7 @@ whose best-known block is that entry."
           (bl.net:peer-manual p) manual
           (bl.net:peer-state p) :ready)
     (when best-hash
-      (setf (bl.net::peer-best-known-block-hash p) best-hash))
+      (setf (bl.net:peer-best-known-block-hash p) best-hash))
     p))
 
 (defmacro %with-whitelist ((&key entries (whitebind 0)) &body body)
@@ -620,12 +620,12 @@ whose best-known block is that entry."
 installed, and WHITEBIND as the -whitebind flags. Bound, not set: the whitelist
 is global start-up configuration, and a test that leaked it would grant
 permissions to every peer in every later test."
-  `(let ((bl.net::*whitelist-entries*
+  `(let ((bl.net:*whitelist-entries*
            (mapcar (lambda (spec)
                      (or (bl.net:parse-whitelist-entry spec)
                          (error "test fixture: unparseable -whitelist ~S" spec)))
                    ,entries))
-         (bl.net::*whitebind-flags* ,whitebind))
+         (bl.net:*whitebind-flags* ,whitebind))
      ,@body))
 
 (test net-permission-flags-parse-as-cores-do
@@ -644,29 +644,29 @@ less than the operator asked for, silently."
     (is (equal "1.2.3.0/24" (rest-of "noban@1.2.3.0/24")))
     ;; forcerelay implies relay; noban implies download.
     (let ((f (flags "forcerelay@1.2.3.4")))
-      (is (= bl.net::+perm-relay+
-             (logand f bl.net::+perm-relay+))))
+      (is (= bl.net:+perm-relay+
+             (logand f bl.net:+perm-relay+))))
     (let ((f (flags "noban@1.2.3.4")))
-      (is (= bl.net::+perm-download+
-             (logand f bl.net::+perm-download+))))
+      (is (= bl.net:+perm-download+
+             (logand f bl.net:+perm-download+))))
     ;; "all" covers every named permission.
     (let ((f (flags "all@1.2.3.4")))
-      (dolist (bit (list bl.net::+perm-bloom-filter+
-                         bl.net::+perm-relay+
-                         bl.net::+perm-force-relay+
-                         bl.net::+perm-noban+
-                         bl.net::+perm-mempool+
-                         bl.net::+perm-download+
-                         bl.net::+perm-addr+))
+      (dolist (bit (list bl.net:+perm-bloom-filter+
+                         bl.net:+perm-relay+
+                         bl.net:+perm-force-relay+
+                         bl.net:+perm-noban+
+                         bl.net:+perm-mempool+
+                         bl.net:+perm-download+
+                         bl.net:+perm-addr+))
         (is (= bit (logand f bit)))))
     ;; Core accepts both spellings of bloomfilter.
     (is (= (flags "bloom@1.2.3.4") (flags "bloomfilter@1.2.3.4")))
     ;; Multiple permissions, comma-separated.
     (let ((f (flags "noban,mempool@1.2.3.4")))
-      (is (= bl.net::+perm-mempool+
-             (logand f bl.net::+perm-mempool+)))
-      (is (= bl.net::+perm-noban+
-             (logand f bl.net::+perm-noban+))))
+      (is (= bl.net:+perm-mempool+
+             (logand f bl.net:+perm-mempool+)))
+      (is (= bl.net:+perm-noban+
+             (logand f bl.net:+perm-noban+))))
     ;; An unknown permission is refused outright rather than ignored.
     (is-false (flags "nosuchperm@1.2.3.4"))
     (is-false (bl.net:parse-whitelist-entry "nosuchperm@1.2.3.4"))
@@ -679,7 +679,7 @@ less than the operator asked for, silently."
   ;; permission and is never listed.
   (is (equal '("noban" "download")
              (bl.net:permission-flag-names
-              bl.net::+perm-noban+)))
+              bl.net:+perm-noban+)))
   (is (null (bl.net:permission-flag-names
              bl.net::+perm-implicit+))))
 
@@ -689,9 +689,9 @@ direction the operator named — \"noban@...,out\" grants nothing to an inbound
 peer from that range. -whitebind's flags reach inbound peers only, since they
 describe a listening socket."
   (%with-whitelist (:entries '("noban@10.0.0.0/8"))
-    (is (= bl.net::+perm-noban+
+    (is (= bl.net:+perm-noban+
            (logand (bl.net:peer-permission-flags "10.1.2.3" t)
-                   bl.net::+perm-noban+)))
+                   bl.net:+perm-noban+)))
     ;; Outside the range: nothing.
     (is (= 0 (bl.net:peer-permission-flags "11.1.2.3" t)))
     ;; An address that does not parse is refused, never defaulted in.
@@ -701,7 +701,7 @@ describe a listening socket."
         "an out-only grant reached an inbound peer")
     (is (plusp (bl.net:peer-permission-flags "10.1.2.3" nil))))
   ;; -whitebind: inbound only.
-  (%with-whitelist (:entries '() :whitebind bl.net::+perm-mempool+)
+  (%with-whitelist (:entries '() :whitebind bl.net:+perm-mempool+)
     (is (plusp (bl.net:peer-permission-flags "10.1.2.3" t)))
     (is (= 0 (bl.net:peer-permission-flags "10.1.2.3" nil)))))
 
@@ -768,7 +768,7 @@ unlimited addresses; everyone else spends tokens."
              (%with-whitelist (:entries entries)
                (bl.net::%process-gossiped-addresses
                 p addrs (length addrs) book nil))
-             (bl.net::peer-addr-rate-limited p))))
+             (bl.net:peer-addr-rate-limited p))))
     ;; Control: an empty bucket rate-limits every address.
     (is (= 40 (rate-limited-count "11.1.2.3" '("noban@10.0.0.0/8"))))
     ;; With the addr permission, none of them are.
@@ -882,7 +882,7 @@ occupying a slot we need for syncing."
         (bl:*minimum-chain-work-override* 1000))
     (multiple-value-bind (state hash) (%g718-state-with-work 10)
       ;; Force the IBD latch off for this check.
-      (let ((bl.net::*cached-is-ibd* nil)
+      (let ((bl.net:*cached-is-ibd* nil)
             (p (%g718-peer :best-hash hash)))
         (is-false (bl.net::maybe-disconnect-low-work-outbound
                    p state nil)
@@ -915,7 +915,7 @@ claim as its best-known."
           (bl.net:peer-state p) :ready
           (bl.net::peer-chain-sync-protect p) protect)
     (when best-hash
-      (setf (bl.net::peer-best-known-block-hash p) best-hash))
+      (setf (bl.net:peer-best-known-block-hash p) best-hash))
     p))
 
 (test g7-08-chain-sync-arms-probes-then-disconnects
@@ -928,10 +928,10 @@ pins us on a stale tip indefinitely."
     (declare (ignore tip-hash))
     (let ((peer (%g708-peer :best-hash low-hash))
           (sent 0))
-      (let ((real (fdefinition 'bl.net::send-message)))
+      (let ((real (fdefinition 'bl.net:send-message)))
         (unwind-protect
              (progn
-               (setf (fdefinition 'bl.net::send-message)
+               (setf (fdefinition 'bl.net:send-message)
                      (lambda (p m) (declare (ignore p m)) (incf sent)))
                ;; First sweep arms the timer.
                (is (eq :armed (bl.net:consider-chain-sync-eviction
@@ -950,7 +950,7 @@ pins us on a stale tip indefinitely."
                (is (eq :disconnected (bl.net:consider-chain-sync-eviction
                                       peer state (+ 1000 1201 121))))
                (is (eq :disconnected (bl.net:peer-state peer))))
-          (setf (fdefinition 'bl.net::send-message) real))))))
+          (setf (fdefinition 'bl.net:send-message) real))))))
 
 (test g7-08-good-chain-clears-the-timer
   "A peer whose best-known work reaches our tip clears its timer entirely — it
@@ -1139,8 +1139,8 @@ so the only thing that differs is the peer's liveness."
              ;; Its chain-work lands above the tip's, so the grant condition
              ;; (best-known >= tip) holds for whichever peer delivers it.
              (multiple-value-bind (state genesis-hash) (%regtest-chain-state dir)
-               (let ((bl::*minimum-chain-work-override* 0))
-                 (bl.net::ingest-headers-from-peer
+               (let ((bl:*minimum-chain-work-override* 0))
+                 (bl.net:ingest-headers-from-peer
                   peer (list (%pow-header genesis-hash)) state)))))
       ;; Control: a live peer earns protection from this batch.
       (let ((bl.net::*protected-outbound-count* 0)
@@ -1191,7 +1191,7 @@ so the only thing that differs is the peer's liveness."
 assertions cannot be made vacuous by whatever an earlier test left in the
 globals."
   `(with-network (:regtest)
-     (let ((bl.net::*cached-is-ibd* t))
+     (let ((bl.net:*cached-is-ibd* t))
        ,@body)))
 
 (defun %w3-stored-header (dir)
@@ -1203,7 +1203,7 @@ proof), so raising the floor afterwards makes it sub-minchainwork."
     (let* ((bl:*minimum-chain-work-override* 0)
            (h1 (%pow-header genesis-hash))
            (h1-hash (bl.ser:block-header-hash h1)))
-      (bl.net::ingest-headers-from-peer
+      (bl.net:ingest-headers-from-peer
        (%g718-peer) (list h1) state)
       (values state genesis-hash h1 h1-hash))))
 
@@ -1228,7 +1228,7 @@ could be churned this way during the most eclipse-sensitive phase."
              (announced (%pow-header orphan-prev)))
         (is-true (bl.net:initial-block-download-p state)
                  "fixture must be in IBD, or the whole assertion is vacuous")
-        (is (= 0 (bl.net::ingest-headers-from-peer
+        (is (= 0 (bl.net:ingest-headers-from-peer
                   p (list announced) state))
             "an unconnecting header stores nothing")
         (is (eq :ready (bl.net:peer-state p))
@@ -1243,7 +1243,7 @@ peer answering \"I have nothing more\" during IBD was dropped on the spot."
         (%regtest-chain-state "test-w3-empty-nodrop/")
       (let ((bl:*minimum-chain-work-override* 1000)
             (p (%g718-peer :best-hash genesis-hash)))
-        (is (= 0 (bl.net::ingest-headers-from-peer p nil state)))
+        (is (= 0 (bl.net:ingest-headers-from-peer p nil state)))
         (is (eq :ready (bl.net:peer-state p))
             "an empty headers message must NOT drop the peer")))))
 
@@ -1260,7 +1260,7 @@ pindexLast to judge the peer on."
              (p (%g718-peer :best-hash genesis-hash))
              (h1 (%pow-header genesis-hash))
              (h1-hash (bl.ser:block-header-hash h1)))
-        (is (= 0 (bl.net::ingest-headers-from-peer
+        (is (= 0 (bl.net:ingest-headers-from-peer
                   p (list h1) state)))
         (is (null (bl.store:get-block-index-entry state h1-hash))
             "the low-work header must not enter the index")
@@ -1281,10 +1281,10 @@ below the floor IS dropped. Deleting the check outright would redden this."
           "fixture must have stored H1, or the already-known branch is not taken")
       (let ((bl:*minimum-chain-work-override* 1000)
             (p (%g718-peer)))
-        (is (= 0 (bl.net::ingest-headers-from-peer
+        (is (= 0 (bl.net:ingest-headers-from-peer
                   p (list h1) state))
             "an already-known header adds nothing to the index")
-        (is (equalp h1-hash (bl.net::peer-best-known-block-hash p))
+        (is (equalp h1-hash (bl.net:peer-best-known-block-hash p))
             "the stored path must have refreshed availability first")
         (is (eq :disconnected (bl.net:peer-state p))
             "a stored non-full batch leaving best-known below the floor must drop")))))
@@ -1356,9 +1356,9 @@ a-headers b-headers)."
            (b1 (%pow-header genesis-hash :timestamp 1296688701 :merkle 11))
            (b2 (%pow-header (bl.ser:block-header-hash b1)
                             :timestamp 1296689301 :merkle 12)))
-      (bl.net::ingest-headers-from-peer
+      (bl.net:ingest-headers-from-peer
        (%g718-peer) (list a1 a2 a3) state)
-      (bl.net::ingest-headers-from-peer
+      (bl.net:ingest-headers-from-peer
        (%g718-peer) (list b1 b2) state)
       (values state (list a1 a2 a3) (list b1 b2)))))
 
@@ -1437,7 +1437,7 @@ starts a presync whose own locator anchors on the peer's chain and advances."
         ;; request from the one that produced this batch. Guarded, so that a
         ;; regression reads as failed assertions rather than an error inside
         ;; hss-locator-hashes.
-        (let ((hss (bl.net::peer-headers-sync p)))
+        (let ((hss (bl.net:peer-headers-sync p)))
           (is (not (null hss))
               "it must divert into a presync, as Core's TryLowWorkHeadersSync does")
           (when hss
@@ -1465,7 +1465,7 @@ instead and dropped an outbound peer Core keeps."
         (is-true (bl.net::handle-header-batch
                   p state b-headers nil (lambda (n) (declare (ignore n))))
                  "an ignored low-work batch ends header sync with this peer")
-        (is (null (bl.net::peer-best-known-block-hash p))
+        (is (null (bl.net:peer-best-known-block-hash p))
             "an ignored batch must not update availability (Core never gets there)")
         (is (eq :ready (bl.net:peer-state p))
             "and must NOT drop the peer")))))
@@ -1489,11 +1489,11 @@ at us)."
         (is-true (bl.net::handle-header-batch
                   p state a-headers t (lambda (n) (incf added n)))
                  "an all-known FULL batch on our own chain must still end sync")
-        (is (null (bl.net::peer-headers-sync p))
+        (is (null (bl.net:peer-headers-sync p))
             "and must NOT start a presync — that is the suppression's whole point")
         (is (= 0 added) "an already-known batch adds nothing to the index")
         (is (equalp a-last-hash
-                    (bl.net::peer-best-known-block-hash p))
+                    (bl.net:peer-best-known-block-hash p))
             "the store path still ran, refreshing availability")
         (is (eq :ready (bl.net:peer-state p))
             "a full batch must not drop the peer")))))
@@ -1515,10 +1515,10 @@ peer that has nothing more to give."
              (p (%g718-peer)))
         (is-true (bl.net:initial-block-download-p state)
                  "fixture must be in IBD, or the whole assertion is vacuous")
-        (is (= 0 (bl.net::ingest-headers-from-peer
+        (is (= 0 (bl.net:ingest-headers-from-peer
                   p (list a1) state))
             "an already-known header adds nothing to the index")
-        (is (equalp a1-hash (bl.net::peer-best-known-block-hash p))
+        (is (equalp a1-hash (bl.net:peer-best-known-block-hash p))
             "the store path must have refreshed availability from the known ancestor")
         (is (eq :disconnected (bl.net:peer-state p))
             "a sub-minchainwork outbound peer with nothing more to give is dropped")))))
@@ -1539,8 +1539,8 @@ peer that has nothing more to give."
           (bl.net:peer-manual p) manual
           (bl.net::peer-chain-sync-protect p) protect
           (bl.net:peer-last-block-announcement p) announcement
-          (bl.net::peer-last-block-time p) last-block
-          (bl.net::peer-connected-at p) connected)
+          (bl.net:peer-last-block-time p) last-block
+          (bl.net:peer-connected-at p) connected)
     p))
 
 (test g7-08-p3-full-relay-rotation-picks-the-stalest-announcer
@@ -1604,8 +1604,8 @@ restart the entire outbound set ties and this comparison IS the policy. Higher
 id = most recently connected = least invested."
   (let* ((older (%p3-peer :address "1.0.0.1"))   ; ids are handed out in order
          (newer (%p3-peer :address "1.0.0.2")))
-    (is (< (bl.net::peer-id older)
-           (bl.net::peer-id newer))
+    (is (< (bl.net:peer-id older)
+           (bl.net:peer-id newer))
         "sanity: ids really are monotonic in connection order")
     ;; Both at stamp 0, and the list order is deliberately reversed so a
     ;; first-wins reduce would pick the older one.
@@ -1632,7 +1632,7 @@ delivering blocks is the entire job they are kept for."
     (is (eq youngest (bl.net:select-extra-block-relay-eviction peers))
         "the youngest goes when it has not out-delivered the second-youngest")
     ;; Now make the youngest the more recent deliverer: the second-youngest goes.
-    (setf (bl.net::peer-last-block-time youngest) 500)
+    (setf (bl.net:peer-last-block-time youngest) 500)
     (is (eq second (bl.net:select-extra-block-relay-eviction peers))
         "a youngest peer that is delivering earns its slot; the runner-up pays")
     ;; The announcement stamp must have no influence here at all.
@@ -1684,16 +1684,16 @@ Core's and is preserved deliberately."
         "the chosen peer is too new to evict, and the sweep does not fall through
          to the next-stalest — Core drops at most one per half per call")
     ;; Age it past the threshold and it goes.
-    (setf (bl.net::peer-connected-at fresh) (- now 31))
+    (setf (bl.net:peer-connected-at fresh) (- now 31))
     (is (equal (list fresh) (bl.net:evict-extra-outbound-peers
                              peers now 2 2)))
     ;; With a block in flight from the chosen peer, it stays.
     (let ((fresh2 (%p3-peer :address "1.0.0.4" :connected 0))
           (ctx (bl.net::make-ibd-context)))
       (setf (gethash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)
-                     (bl.net::ibd-context-in-flight ctx))
+                     (bl.net:ibd-context-in-flight ctx))
             (cons fresh2 now))
-      (let ((bl.net::*ibd-context* ctx))
+      (let ((bl.net:*ibd-context* ctx))
         (is (= 1 (bl.net::count-peer-in-flight fresh2))
             "sanity: the in-flight seam is actually connected")
         (is (null (bl.net:evict-extra-outbound-peers
@@ -1715,13 +1715,13 @@ happy path stamps correctly either way."
         (bl.store:*pow-limit-target*
           bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-p3-stamp/")
-      (let ((bl::*minimum-chain-work-override* 0)
+      (let ((bl:*minimum-chain-work-override* 0)
             (peer (%g708-peer))
             (header (%pow-header genesis-hash)))
         (is (= 0 (bl.net:peer-last-block-announcement peer))
             "a fresh peer has never announced")
         ;; A header we did not have, on a chain beating our genesis-only tip.
-        (is (= 1 (bl.net::ingest-headers-from-peer
+        (is (= 1 (bl.net:ingest-headers-from-peer
                   peer (list header) state))
             "control: the header must actually be stored")
         (is (plusp (bl.net:peer-last-block-announcement peer))
@@ -1730,7 +1730,7 @@ happy path stamps correctly either way."
         ;; received_new_header is false and the stamp must not move — even
         ;; though the work comparison still holds.
         (setf (bl.net:peer-last-block-announcement peer) 12345)
-        (bl.net::ingest-headers-from-peer peer (list header) state)
+        (bl.net:ingest-headers-from-peer peer (list header) state)
         (is (= 12345 (bl.net:peer-last-block-announcement peer))
             "re-announcing a header we already hold must earn nothing")))))
 
@@ -1759,7 +1759,7 @@ decided :ACCEPT; asked afterwards it would always say `known'."
           (is-true credits "an unseen header beating our tip credits its announcer"))
         ;; Now we hold it. Same header, same work, still accepted — but no
         ;; longer new, so no credit.
-        (bl.net::process-headers (list header) state)
+        (bl.net:process-headers (list header) state)
         (multiple-value-bind (verdict reason credits)
             (bl.net::compact-block-header-verdict
              state header hash genesis-hash)
@@ -1784,13 +1784,13 @@ the rest of this file."
         (bl.store:*pow-limit-target*
           bl.store:+regtest-pow-limit-target+))
     (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-p3-sibling/")
-      (let* ((bl::*minimum-chain-work-override* 0)
+      (let* ((bl:*minimum-chain-work-override* 0)
              (peer (%g708-peer))
              ;; Our tip: one block off genesis, made the ACTIVE tip so the
              ;; comparison has something real to sit at.
              (mine (%pow-header genesis-hash :merkle 1))
              (mine-hash (bl.ser:block-header-hash mine)))
-        (bl.net::process-headers (list mine) state)
+        (bl.net:process-headers (list mine) state)
         (bl.store:update-chain-tip state mine-hash 1)
         (let* ((tip (bl.store:get-block-index-entry state mine-hash))
                (tip-work (bl.store:block-index-entry-chain-work tip))
@@ -1801,7 +1801,7 @@ the rest of this file."
           (is (not (equalp mine-hash sib-hash)) "sanity: it is a different block")
           (bl.net:credit-block-announcement peer)
           (setf (bl.net:peer-last-block-announcement peer) 12345)
-          (bl.net::ingest-headers-from-peer peer (list sibling) state)
+          (bl.net:ingest-headers-from-peer peer (list sibling) state)
           (let ((sib (bl.store:get-block-index-entry state sib-hash)))
             (is-true sib "control: the sibling must actually be stored")
             (is (= tip-work (bl.store:block-index-entry-chain-work sib))
@@ -1815,7 +1815,7 @@ the rest of this file."
           ;; reusing it makes the header time-too-old and it never stores —
           ;; which looks exactly like "the credit did not fire".
           (let ((better (%pow-header mine-hash :merkle 3 :timestamp 1296689000)))
-            (bl.net::ingest-headers-from-peer peer (list better) state)
+            (bl.net:ingest-headers-from-peer peer (list better) state)
             (is (/= 12345 (bl.net:peer-last-block-announcement peer))
                 "a header beating our tip must still credit")))))))
 
@@ -1837,37 +1837,37 @@ lands on five hours if copied literally and makes the check effectively dead."
   ;; shipped. 1800 seconds is thirty minutes; 18000 is five hours.
   (is (= 1800 bl::+stale-tip-age-seconds+)
       "the stale-tip threshold is nPowTargetSpacing * 3 = 1800s, factor THREE")
-  (is (= 600 bl::+pow-target-spacing-seconds+)
+  (is (= 600 bl:+pow-target-spacing-seconds+)
       "and nPowTargetSpacing is 600s on every network Core ships")
-  (let ((node (bl::make-node :network :regtest)))
+  (let ((node (bl:make-node :network :regtest)))
     ;; Never advanced: Core stamps the clock and reports fresh rather than
     ;; declaring every freshly started node eclipsed.
-    (is (= 0 (bl::node-last-tip-advance-time node)))
+    (is (= 0 (bl:node-last-tip-advance-time node)))
     (is-false (bl::tip-may-be-stale-p node)
               "a node whose tip has never advanced is not yet stale")
-    (is (plusp (bl::node-last-tip-advance-time node))
+    (is (plusp (bl:node-last-tip-advance-time node))
         "and the clock must have been stamped, or it is stale forever after")
     ;; Recent advance: fresh.
-    (setf (bl::node-last-tip-advance-time node) (get-universal-time))
+    (setf (bl:node-last-tip-advance-time node) (get-universal-time))
     (is-false (bl::tip-may-be-stale-p node))
     ;; Old enough, nothing in flight: stale.
-    (setf (bl::node-last-tip-advance-time node)
+    (setf (bl:node-last-tip-advance-time node)
           (- (get-universal-time) (1+ bl::+stale-tip-age-seconds+)))
     (is-true (bl::tip-may-be-stale-p node))
     ;; Same age, but a block is in flight: NOT stale.
     (let ((ctx (bl.net::make-ibd-context))
           (peer (%p3-peer)))
       (setf (gethash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)
-                     (bl.net::ibd-context-in-flight ctx))
+                     (bl.net:ibd-context-in-flight ctx))
             (cons peer 1))
-      (let ((bl.net::*ibd-context* ctx))
+      (let ((bl.net:*ibd-context* ctx))
         (is-true (bl.net:any-blocks-in-flight-p)
                  "sanity: the in-flight seam is actually connected")
         (is-false (bl::tip-may-be-stale-p node)
                   "a download in progress means the tip is not stuck")))
     ;; Just under the threshold stays fresh, so the constant is exercised in
     ;; both directions rather than only from far away.
-    (setf (bl::node-last-tip-advance-time node)
+    (setf (bl:node-last-tip-advance-time node)
           (- (get-universal-time) (1- bl::+stale-tip-age-seconds+)))
     (is-false (bl::tip-may-be-stale-p node))))
 
@@ -1877,17 +1877,17 @@ that inverts the feature: without it the first stale episode raises the dialing
 budget permanently, and the rotation — which measures against the UNRAISED
 target — then spends every sweep evicting a peer we just dialled. It would
 present as endless outbound churn with no stale tip anywhere in sight."
-  (let ((node (bl::make-node :network :regtest))
+  (let ((node (bl:make-node :network :regtest))
         (bl::*try-new-outbound-peer* nil)
         (bl::*last-stale-tip-check* 0))
-    (setf (bl::node-network-active node) t)
+    (setf (bl:node-network-active node) t)
     ;; Stale: the slot is granted.
-    (setf (bl::node-last-tip-advance-time node)
+    (setf (bl:node-last-tip-advance-time node)
           (- (get-universal-time) (1+ bl::+stale-tip-age-seconds+)))
     (bl::check-for-stale-tip node 1000)
     (is-true bl::*try-new-outbound-peer*)
     ;; The tip advances. The next evaluation must hand the slot back.
-    (setf (bl::node-last-tip-advance-time node) (get-universal-time))
+    (setf (bl:node-last-tip-advance-time node) (get-universal-time))
     (bl::check-for-stale-tip node (+ 1000 bl::+stale-tip-check-interval-seconds+ 1))
     (is-false bl::*try-new-outbound-peer*
               "the extra slot must be released once the tip moves again")))
@@ -1896,17 +1896,17 @@ present as endless outbound churn with no stale tip anywhere in sight."
   "Core gates the stale-tip half on STALE_CHECK_INTERVAL (10 min) INSIDE the 45s
 sweep (:5468). The two cadences are different and both real; collapsing them
 re-evaluates an 1800-second-old condition forty times before it can change."
-  (let ((node (bl::make-node :network :regtest))
+  (let ((node (bl:make-node :network :regtest))
         (bl::*try-new-outbound-peer* nil)
         (bl::*last-stale-tip-check* 0))
-    (setf (bl::node-network-active node) t
-          (bl::node-last-tip-advance-time node)
+    (setf (bl:node-network-active node) t
+          (bl:node-last-tip-advance-time node)
           (- (get-universal-time) (1+ bl::+stale-tip-age-seconds+)))
     (bl::check-for-stale-tip node 1000)
     (is-true bl::*try-new-outbound-peer* "first evaluation grants")
     ;; Tip is healthy again, but we are still inside the 10-minute window:
     ;; the state must NOT be re-evaluated yet.
-    (setf (bl::node-last-tip-advance-time node) (get-universal-time))
+    (setf (bl:node-last-tip-advance-time node) (get-universal-time))
     (bl::check-for-stale-tip node 1100)
     (is-true bl::*try-new-outbound-peer*
              "a second call inside the interval must not re-evaluate")))
@@ -1921,14 +1921,14 @@ REPLACEMENT.
 Raise both together — the intuitive reading — and the extra connection becomes
 permanent while the rotation never fires at all, which is the opposite of the
 feature: more peers, none of them ever rotated."
-  (let ((node (bl::make-node :network :regtest)))
-    (setf (bl::node-max-peers node) 8)
+  (let ((node (bl:make-node :network :regtest)))
+    (setf (bl:node-max-peers node) 8)
     (let ((bl::*try-new-outbound-peer* nil))
       (is (= 8 (bl::outbound-dial-budget node))))
     (let ((bl::*try-new-outbound-peer* t))
       (is (= 9 (bl::outbound-dial-budget node))
           "the dialing budget rises by exactly one")
-      (is (= 8 (bl::node-max-peers node))
+      (is (= 8 (bl:node-max-peers node))
           "and the eviction target, which is node-max-peers, does not move")
       ;; Nine full-relay peers against the unraised target of 8 means the
       ;; rotation fires — that is what makes it a replacement.
@@ -1937,7 +1937,7 @@ feature: more peers, none of them ever rotated."
                                            :announcement (* i 100)
                                            :connected 0))))
         (is (= 1 (length (bl.net:evict-extra-outbound-peers
-                          peers 10000 (bl::node-max-peers node) 2)))
+                          peers 10000 (bl:node-max-peers node) 2)))
             "the extra peer must put us over the eviction target, not under it")))))
 
 ;;;; GA9 S2-4 / S2-5: two addrman and discouragement parity gaps

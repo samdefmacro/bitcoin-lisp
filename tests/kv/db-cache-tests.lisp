@@ -270,7 +270,7 @@ to need."
   (let* ((sighash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
          (pubkey (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2))
          (sig (make-array 71 :element-type '(unsigned-byte 8) :initial-element 3))
-         (bl.interop::*script-flags* nil)
+         (bl.interop:*script-flags* nil)
          (under-salt-a
            (let ((bl.interop::*sig-cache-salt*
                    (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA)))
@@ -312,7 +312,7 @@ rules change at soft-fork heights."
   (let ((wtxid-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
         (wtxid-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
     (flet ((key (wtxid flags)
-             (bl.interop::make-script-execution-cache-key
+             (bl.interop:make-script-execution-cache-key
               wtxid flags)))
       (is (equalp (key wtxid-a "P2SH") (key wtxid-a "P2SH")))
       (is (not (equalp (key wtxid-a "P2SH") (key wtxid-b "P2SH")))
@@ -339,10 +339,10 @@ transaction that passed under pre-fork rules would be waved through after the
 fork."
   (let ((tx (make-mempool-test-tx :input-id 55))
         (runs 0)
-        (real (symbol-function 'bl.val::validate-input-script)))
+        (real (symbol-function 'bl.val:validate-input-script)))
     (unwind-protect
          (progn
-           (setf (symbol-function 'bl.val::validate-input-script)
+           (setf (symbol-function 'bl.val:validate-input-script)
                  (lambda (&rest args) (declare (ignore args)) (incf runs) t))
            (bl.interop::clear-script-execution-cache)
            (let ((utxo (bl.store:make-utxo-set))
@@ -375,18 +375,18 @@ fork."
                ;; And that result is cached under ITS flags.
                (is-true (check "P2SH,TAPROOT"))
                (is (= 2 runs)))))
-      (setf (symbol-function 'bl.val::validate-input-script) real)
+      (setf (symbol-function 'bl.val:validate-input-script) real)
       (bl.interop::clear-script-execution-cache))))
 
 (test script-execution-cache-never-stores-a-partial-success
   "A transaction whose SECOND input fails must leave no entry — otherwise the
 next pass short-circuits on the first input's success and accepts it."
   (let ((tx (make-mempool-test-tx :input-id 56))
-        (real (symbol-function 'bl.val::validate-input-script)))
+        (real (symbol-function 'bl.val:validate-input-script)))
     (unwind-protect
          (progn
            (bl.interop::clear-script-execution-cache)
-           (setf (symbol-function 'bl.val::validate-input-script)
+           (setf (symbol-function 'bl.val:validate-input-script)
                  (lambda (&rest args) (declare (ignore args)) nil))
            (let ((utxo (bl.store:make-utxo-set))
                  (coins (make-hash-table :test 'equalp)))
@@ -404,11 +404,11 @@ next pass short-circuits on the first input's success and accepts it."
                         tx utxo :extra-coins coins :flags "P2SH"))
              ;; Nothing cached, so a later pass still runs the scripts — and
              ;; still fails.
-             (is-false (bl.interop::script-execution-cached-p
-                        (bl.interop::make-script-execution-cache-key
+             (is-false (bl.interop:script-execution-cached-p
+                        (bl.interop:make-script-execution-cache-key
                          (bl.ser:transaction-wtxid tx) "P2SH"))
                        "a failed validation left a cache entry")))
-      (setf (symbol-function 'bl.val::validate-input-script) real)
+      (setf (symbol-function 'bl.val:validate-input-script) real)
       (bl.interop::clear-script-execution-cache))))
 
 (test sig-cache-key-carries-no-script-flags
@@ -425,9 +425,9 @@ asserts the property the key format now depends on. Neither is safe alone."
   (let* ((sighash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 4))
          (pubkey (make-array 33 :element-type '(unsigned-byte 8) :initial-element 5))
          (sig (make-array 71 :element-type '(unsigned-byte 8) :initial-element 6))
-         (lax (let ((bl.interop::*script-flags* nil))
+         (lax (let ((bl.interop:*script-flags* nil))
                 (bl.interop::make-sig-cache-key #x45 sighash sig pubkey)))
-         (strict (let ((bl.interop::*script-flags* "DERSIG,LOW_S"))
+         (strict (let ((bl.interop:*script-flags* "DERSIG,LOW_S"))
                    (bl.interop::make-sig-cache-key #x45 sighash sig pubkey))))
     (is (equalp lax strict)
         "the cache key still varies with the script flags")))
@@ -443,7 +443,7 @@ that ran strict first would pass against a broken cache."
          (pubkey (bl.crypto:derive-public-key privkey))
          (sighash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
          (der (bl.crypto:sign-ecdsa privkey sighash)))
-    (bl.interop::clear-signature-cache)
+    (bl.interop:clear-signature-cache)
     ;; A well-formed signature verifies and caches under either flag set.
     (is-true (bl.interop::cached-verify-ecdsa sighash der pubkey))
     (is-true (bl.interop::cached-verify-ecdsa
@@ -452,7 +452,7 @@ that ran strict first would pass against a broken cache."
     ;; laxly and NOT fine strictly. A trailing byte makes it invalid DER while
     ;; leaving the lax parse intact.
     (let ((padded (concatenate '(simple-array (unsigned-byte 8) (*)) der #(0))))
-      (bl.interop::clear-signature-cache)
+      (bl.interop:clear-signature-cache)
       ;; Lax: accepted, and now in the cache.
       (is-true (bl.interop::cached-verify-ecdsa sighash padded pubkey)
                "the lax case must succeed or this test asserts nothing")

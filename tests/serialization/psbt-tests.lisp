@@ -93,7 +93,7 @@ equality)."
     (if (null data)
         (skip "refs/bitcoin rpc_psbt.json not present")
         (let* ((c (first (gethash "creator" data)))
-               (node (bl::make-node :network :regtest))
+               (node (bl:make-node :network :regtest))
                ;; Core's rpc_psbt.py generates this vector with replaceable=False
                ;; (explicit false = the +json-false+ sentinel; a null would
                ;; take Core's default true and signal RBF).
@@ -107,7 +107,7 @@ equality)."
   (let ((data (%psbt-vectors)))
     (if (null data)
         (skip "refs/bitcoin rpc_psbt.json not present")
-        (let* ((node (bl::make-node :network :regtest))
+        (let* ((node (bl:make-node :network :regtest))
                (res (bl.wallet::rpc-decodepsbt
                      node (list (first (gethash "valid" data))))))
           (is-true (assoc "tx" res :test #'equal))
@@ -123,7 +123,7 @@ tx is rejected unless permitsigdata."
   (let ((data (%psbt-vectors)))
     (if (null data)
         (skip "refs/bitcoin rpc_psbt.json not present")
-        (let* ((node (bl::make-node :network :regtest))
+        (let* ((node (bl:make-node :network :regtest))
                ;; unsigned tx from the creator result
                (tx (bl.ser:psbt-tx
                     (bl.ser:decode-psbt
@@ -162,7 +162,7 @@ tx is rejected unless permitsigdata."
   (let ((data (%psbt-vectors)))
     (if (null data)
         (skip "refs/bitcoin rpc_psbt.json not present")
-        (let ((node (bl::make-node :network :regtest)))
+        (let ((node (bl:make-node :network :regtest)))
           (dolist (c (gethash "combiner" data))
             (let ((got (bl.ser:decode-psbt
                         (bl.wallet::rpc-combinepsbt node (list (gethash "combine" c)))))
@@ -171,7 +171,7 @@ tx is rejected unless permitsigdata."
 
 (test psbt-joinpsbts-and-analyze
   "joinpsbts concatenates distinct PSBTs; analyzepsbt reports structure."
-  (let ((node (bl::make-node :network :regtest)))
+  (let ((node (bl:make-node :network :regtest)))
     (let* ((a (bl.wallet::rpc-createpsbt
                node (list (list (list (cons "txid" (make-string 64 :initial-element #\a))
                                       (cons "vout" 0)))
@@ -195,7 +195,7 @@ tx is rejected unless permitsigdata."
   (let ((data (%psbt-vectors)))
     (if (null data)
         (skip "refs/bitcoin rpc_psbt.json not present")
-        (let* ((node (bl::make-node :network :regtest))
+        (let* ((node (bl:make-node :network :regtest))
                (f (first (gethash "finalizer" data)))
                (out (bl.wallet::rpc-finalizepsbt
                      node (list (gethash "finalize" f)
@@ -211,14 +211,14 @@ vector."
   (let ((data (%psbt-vectors)))
     (if (null data)
         (skip "refs/bitcoin rpc_psbt.json not present")
-        (let* ((node (bl::make-node :network :regtest))
+        (let* ((node (bl:make-node :network :regtest))
                (e (first (gethash "extractor" data)))
                (out (bl.wallet::rpc-finalizepsbt node (list (gethash "extract" e)))))
           (is (string= (cdr (assoc "hex" out :test #'equal)) (gethash "result" e)))))))
 
 (test combinerawtransaction-merges
   "combinerawtransaction keeps the most-complete scriptSig per input."
-  (let* ((node (bl::make-node :network :regtest))
+  (let* ((node (bl:make-node :network :regtest))
          (prevout (bl.ser:make-outpoint
                    :hash (make-array 32 :element-type '(unsigned-byte 8)) :index 0))
          (out (bl.ser:make-tx-out
@@ -296,7 +296,7 @@ compared). NOTE: requires the vendored rpc_psbt.json — runs at integration."
   "descriptorprocesspsbt signs a P2WPKH input from a wpkh(WIF) descriptor and the
 PSBT's own witness_utxo, completing into a network tx whose witness verifies
 under the consensus script verifier. Runs WITHOUT vendored vectors."
-  (let* ((node (bl::make-node :network :regtest))
+  (let* ((node (bl:make-node :network :regtest))
          (sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
          (wif (bl.crypto:private-key-to-wif sk :network :regtest :compressed t))
          (pub (bl.crypto:derive-public-key sk :compressed t))
@@ -351,7 +351,7 @@ under the consensus script verifier. Runs WITHOUT vendored vectors."
 (test psbt-createpsbt-defaults-and-validation
   "createpsbt sequence follows Core (replaceable default true -> RBF; explicit
 false honors locktime), and duplicate outputs are rejected."
-  (let* ((node (bl::make-node :network :regtest))
+  (let* ((node (bl:make-node :network :regtest))
          (txid (make-string 64 :initial-element #\a))
          (in (list (list (cons "txid" txid) (cons "vout" 0))))
          (seq-of (lambda (params)
@@ -375,7 +375,7 @@ false honors locktime), and duplicate outputs are rejected."
     ;; duplicate output address is rejected
     (let ((addr (bl.crypto:encode-p2pkh-address
                  (make-array 20 :element-type '(unsigned-byte 8) :initial-element 5) :regtest)))
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.wallet::rpc-createpsbt
          node (list in (list (list (cons addr 0.1)) (list (cons addr 0.2)))))))))
 

@@ -24,12 +24,12 @@
 (defun %psbt-decode-arg (b64 &optional (what "psbt"))
   "Decode a base64 PSBT argument, mapping any failure to a deserialization error."
   (unless (stringp b64)
-    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                       :message (format nil "~A must be a base64 string" what)))
   (handler-case (bl.ser:decode-psbt b64)
-    (bl.rpc::rpc-error (e) (error e))
+    (bl.rpc:rpc-error (e) (error e))
     (error (e)
-      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                         :message (format nil "~A decode failed: ~A" what e)))))
 
 ;;; --- createpsbt ---
@@ -45,37 +45,37 @@ when locktime>0, else 0xffffffff."
 (defun %psbt-build-unsigned-tx (inputs outputs locktime replaceable network)
   "Build an unsigned transaction from RPC INPUTS/OUTPUTS (Core createpsbt shape)."
   (unless (listp inputs)
-    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "Invalid inputs"))
+    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "Invalid inputs"))
   (let ((locktime (or locktime 0))
         (tx-outputs '())
         (seen-addrs (make-hash-table :test 'equal))
         (data-seen nil))
     (let ((tx-inputs
             (loop for inp in inputs
-                  for txid = (bl.rpc::%obj-get inp "txid")
-                  for vout = (bl.rpc::%obj-get inp "vout")
-                  for seq = (or (bl.rpc::%obj-get inp "sequence")
+                  for txid = (bl.rpc:obj-get inp "txid")
+                  for vout = (bl.rpc:obj-get inp "vout")
+                  for seq = (or (bl.rpc:obj-get inp "sequence")
                                 (%psbt-default-sequence replaceable locktime))
-                  do (unless (bl.rpc::valid-hex-hash-p txid)
-                       (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                  do (unless (bl.rpc:valid-hex-hash-p txid)
+                       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                          :message "Invalid input txid"))
                      (unless (and (integerp vout) (>= vout 0))
-                       (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                          :message "Invalid input vout"))
                   collect (bl.ser:make-tx-in
                            :previous-output (bl.ser:make-outpoint
-                                             :hash (bl.rpc::parse-hex-hash txid) :index vout)
+                                             :hash (bl.rpc:parse-hex-hash txid) :index vout)
                            :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                            :sequence seq))))
       (dolist (out (if (listp outputs) outputs
-                       (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                          :message "Invalid outputs")))
         (dolist (pair (%obj-pairs out))
           (destructuring-bind (key . val) pair
             (if (string= key "data")
                 (progn
                   (when data-seen
-                    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                       :message "Duplicate key: data"))
                   (setf data-seen t)
                   (push (bl.ser:make-tx-out
@@ -86,14 +86,14 @@ when locktime>0, else 0xffffffff."
                         tx-outputs))
                 (multiple-value-bind (type spk) (bl.crypto:decode-address key network)
                   (unless type
-                    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                                       :message (format nil "Invalid address: ~A" key)))
                   (when (gethash key seen-addrs)
-                    (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                       :message (format nil "Invalid parameter, duplicated address: ~A" key)))
                   (setf (gethash key seen-addrs) t)
                   (unless (and (numberp val) (<= 0 val 21000000))
-                    (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-invalid-amount+ :message "Invalid amount"))
+                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-amount+ :message "Invalid amount"))
                   (push (bl.ser:make-tx-out
                          :value (round (* val 100000000)) :script-pubkey spk)
                         tx-outputs))))))
@@ -111,11 +111,11 @@ PARAMS: (inputs outputs [locktime] [replaceable]). Mirrors Core createpsbt."
   ;; `[]' from a missing argument (server.lisp:349). Passing the sentinel on
   ;; reaches code expecting a LIST and surfaces as RPC -32603 Internal error —
   ;; which is what `createpsbt([], {...})' did, and rpc_psbt.py opens with it.
-  (let ((tx (%psbt-build-unsigned-tx (bl.rpc::%positional-array (first params))
+  (let ((tx (%psbt-build-unsigned-tx (bl.rpc:positional-array (first params))
                                      (second params)
                                      (or (third params) 0)
-                                     (bl.rpc::%positional-bool-or (fourth params) t)
-                                     (bl.rpc::rpc-get-network node))))
+                                     (bl.rpc:positional-bool-or (fourth params) t)
+                                     (bl.rpc:rpc-get-network node))))
     (bl.ser:encode-psbt
      (bl.ser:make-empty-psbt tx))))
 
@@ -126,21 +126,21 @@ PARAMS: (inputs outputs [locktime] [replaceable]). Mirrors Core createpsbt."
 PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
   (declare (ignore node))
   (let* ((hexstr (first params))
-         (permitsigdata (bl.rpc::%positional-bool (second params))))
+         (permitsigdata (bl.rpc:positional-bool (second params))))
     (unless (stringp hexstr)
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "hexstring required"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "hexstring required"))
     (let ((tx (handler-case
                   (bl.ser:br-read-transaction
                    (bl.ser:make-byte-reader-from
                     (coerce (bl.crypto:hex-to-bytes hexstr)
                             '(simple-array (unsigned-byte 8) (*)))))
-                (error () (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+                (error () (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                                             :message "TX decode failed")))))
       (let ((has-sig (or (bl.ser:transaction-has-witness-p tx)
                          (some (lambda (in) (plusp (length (bl.ser:tx-in-script-sig in))))
                                (bl.ser:transaction-inputs tx)))))
         (when (and has-sig (not permitsigdata))
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Inputs must not have scriptSigs and scriptwitnesses. To convert anyway, permitsigdata must be set to true.")))
       (let ((stripped (bl.ser:make-transaction
                        :version (bl.ser:transaction-version tx)
@@ -166,8 +166,8 @@ PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
 (defun %psbt-spk-obj (spk network)
   (let ((o `(("asm" . ,(bl.val:disassemble-script spk))
              ("hex" . ,(bl.crypto:bytes-to-hex spk))
-             ("type" . ,(bl.rpc::%script-type spk))))
-        (addr (and network (bl.rpc::%script->address spk network))))
+             ("type" . ,(bl.rpc:script-type spk))))
+        (addr (and network (bl.rpc:script->address spk network))))
     (if addr (append o `(("address" . ,addr))) o)))
 
 (defun %psbt-keypath-json (pubkey value)
@@ -386,7 +386,7 @@ fingerprint><path>."
          (leaves (loop repeat count
                        collect (bl.crypto:bytes-to-hex
                                 (bl.ser:br-read-bytes br 32))))
-         (rest (subseq value (bl.ser::br-pos br))))
+         (rest (subseq value (bl.ser:br-pos br))))
     ;; %PSBT-KEYPATH-JSON already renders pubkey/fingerprint/path; the leaf
     ;; hashes are what BIP371 adds on top, so its output is reused rather than
     ;; re-derived.
@@ -400,7 +400,7 @@ fingerprint><path>."
                   map bl.ser:+psbt-in-non-witness-utxo+)))
         (when nwu
           (add "non_witness_utxo"
-               (bl.rpc::tx-to-json (bl.ser:br-read-transaction
+               (bl.rpc:tx-to-json (bl.ser:br-read-transaction
                             (bl.ser:make-byte-reader-from nwu))
                            network))))
       (let ((wu (bl.ser:psbt-map-find
@@ -475,13 +475,13 @@ fingerprint><path>."
 
 (bl.rpc:define-rpc "decodepsbt" (node params)
   "Decode a PSBT to JSON. PARAMS: (psbt). Mirrors Core decodepsbt."
-  (let* ((network (bl.rpc::rpc-get-network node))
+  (let* ((network (bl.rpc:rpc-get-network node))
          (psbt (%psbt-decode-arg (first params)))
          (tx (bl.ser:psbt-tx psbt))
          (in-maps (bl.ser:psbt-inputs psbt))
          (out-maps (bl.ser:psbt-outputs psbt))
          (tx-ins (bl.ser:transaction-inputs tx))
-         (result `(("tx" . ,(bl.rpc::tx-to-json tx network)))))
+         (result `(("tx" . ,(bl.rpc:tx-to-json tx network)))))
     ;; version
     (let ((ver (bl.ser:psbt-map-find
                 (bl.ser:psbt-global psbt)
@@ -528,9 +528,9 @@ key hash-set + a single append."
 (bl.rpc:define-rpc "combinepsbt" (node params)
   "Combine PSBTs for the same unsigned tx into one. PARAMS: (txs). Mirrors Core."
   (declare (ignore node))
-  (let ((b64s (bl.rpc::%positional-array (first params))))
+  (let ((b64s (bl.rpc:positional-array (first params))))
     (unless (and (listp b64s) (>= (length b64s) 1))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "txs must be an array of base64 PSBTs"))
     (let* ((psbts (mapcar #'%psbt-decode-arg b64s))
            (base (first psbts))
@@ -539,7 +539,7 @@ key hash-set + a single append."
       (dolist (p (rest psbts))
         (unless (equalp base-tx (bl.ser:serialize-transaction
                                  (bl.ser:psbt-tx p)))
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "PSBTs not compatible (different transactions)"))
         (%psbt-merge-map! (bl.ser:psbt-global base)
                           (bl.ser:psbt-global p))
@@ -556,9 +556,9 @@ key hash-set + a single append."
 Mirrors Core joinpsbts (version=max, locktime=min, concatenated inputs/outputs;
 we do not shuffle indices)."
   (declare (ignore node))
-  (let ((b64s (bl.rpc::%positional-array (first params))))
+  (let ((b64s (bl.rpc:positional-array (first params))))
     (unless (and (listp b64s) (>= (length b64s) 2))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "At least two PSBTs are required"))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "At least two PSBTs are required"))
     (let ((psbts (mapcar #'%psbt-decode-arg b64s))
           (version 1) (locktime #xffffffff)
           (ins '()) (outs '()) (in-maps '()) (out-maps '())
@@ -571,10 +571,10 @@ we do not shuffle indices)."
           (loop for in across (bl.ser:transaction-inputs tx)
                 for i from 0
                 for op = (bl.ser:tx-in-previous-output in)
-                for key = (bl.rpc::%outpoint-key (bl.ser:outpoint-hash op)
+                for key = (bl.rpc:outpoint-key (bl.ser:outpoint-hash op)
                                          (bl.ser:outpoint-index op))
                 do (when (gethash key seen)
-                     (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                     (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                        :message "Input exists in multiple PSBTs"))
                    (setf (gethash key seen) t)
                    (push in ins)
@@ -608,7 +608,7 @@ we do not shuffle indices)."
 ;;; --- utxoupdatepsbt ---
 
 (defun %psbt-witness-spk-p (spk)
-  (member (bl.rpc::%script-type spk)
+  (member (bl.rpc:script-type spk)
           '("witness_v0_keyhash" "witness_v0_scripthash" "witness_v1_taproot")
           :test #'string=))
 
@@ -715,7 +715,7 @@ can never come from different sources."
 (defun %psbt-multisig-sigs (script map)
   "Ordered available signatures for the m-of-n multisig SCRIPT, or NIL if fewer
 than m are present."
-  (multiple-value-bind (m n pubkeys) (bl.rpc::%parse-multisig script)
+  (multiple-value-bind (m n pubkeys) (bl.rpc:parse-multisig script)
     (declare (ignore n))
     (when m
       (let ((ordered (loop for pk in pubkeys
@@ -858,7 +858,7 @@ fields (partial sigs, sighash, redeem/witness scripts, derivations)."
 return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
   (declare (ignore node))
   (let* ((psbt (%psbt-decode-arg (first params)))
-         (extract (bl.rpc::%positional-bool-or (second params) t))
+         (extract (bl.rpc:positional-bool-or (second params) t))
          (tx (bl.ser:psbt-tx psbt))
          (ins (bl.ser:transaction-inputs tx))
          (complete t))
@@ -886,9 +886,9 @@ return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
 and witness per input (prevout script types come from the UTXO set / mempool).
 PARAMS: (txs). Mirrors Core combinerawtransaction."
   (declare (ignore node))
-  (let ((hexes (bl.rpc::%positional-array (first params))))
+  (let ((hexes (bl.rpc:positional-array (first params))))
     (unless (and (listp hexes) (>= (length hexes) 1))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "txs must be a non-empty array of hex transactions"))
     (let ((txs (mapcar (lambda (h)
                          (handler-case
@@ -896,7 +896,7 @@ PARAMS: (txs). Mirrors Core combinerawtransaction."
                               (bl.ser:make-byte-reader-from
                                (coerce (bl.crypto:hex-to-bytes h)
                                        '(simple-array (unsigned-byte 8) (*)))))
-                           (error () (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+                           (error () (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                                                        :message "TX decode failed"))))
                        hexes)))
       (let* ((base (first txs))
@@ -906,7 +906,7 @@ PARAMS: (txs). Mirrors Core combinerawtransaction."
              (any-witness nil))
         (dolist (tx (rest txs))
           (unless (= (length (bl.ser:transaction-inputs tx)) nin)
-            (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-deserialization-error+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
                               :message "Input count mismatch between transactions")))
         (dotimes (i nin)
           (let ((best-ss (bl.ser:tx-in-script-sig
@@ -916,7 +916,7 @@ PARAMS: (txs). Mirrors Core combinerawtransaction."
             (dolist (tx txs)
               (let* ((in (aref (bl.ser:transaction-inputs tx) i))
                      (ss (bl.ser:tx-in-script-sig in))
-                     (w (bl.rpc::%tx-input-witness tx i)))
+                     (w (bl.rpc:tx-input-witness tx i)))
                 (when (> (length ss) (length best-ss)) (setf best-ss ss))
                 (when (and w (plusp (length w))
                            (or (null best-wit) (> (length w) (length best-wit))))
@@ -1089,7 +1089,7 @@ must be written to the input (taproot: != DEFAULT; else != DEFAULT and != ALL)."
   "True when the input-sig SIG is a segwit (witness) signature — the kinds for
 which Core's ProduceSignature sets SignatureData.witness. Legacy kinds (:p2pkh,
 :multisig, :p2sh-multisig) are false."
-  (and (member (bl.rpc::input-sig-kind sig)
+  (and (member (bl.rpc:input-sig-kind sig)
                '(:p2wpkh :p2tr :p2wsh :p2sh-p2wpkh :p2sh-p2wsh))
        t))
 
@@ -1229,10 +1229,10 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
   (let* ((tx (bl.ser:psbt-tx psbt))
          (inputs (bl.ser:transaction-inputs tx))
          (n (length inputs))
-         (spent-utxos (bl.rpc::%build-spent-utxos inputs coins))
-         (bl.interop::*current-tx* tx)
-         (bl.interop::*current-spent-utxos* spent-utxos)
-         (precomp (bl.interop::init-precomputed-sighash tx spent-utxos))
+         (spent-utxos (bl.rpc:build-spent-utxos inputs coins))
+         (bl.interop:*current-tx* tx)
+         (bl.interop:*current-spent-utxos* spent-utxos)
+         (precomp (bl.interop:init-precomputed-sighash tx spent-utxos))
          (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (dotimes (i n)
       (let* ((map (aref (bl.ser:psbt-inputs psbt) i))
@@ -1251,7 +1251,7 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                                        (%psbt-input-sighash-stored map))
             (unless sherr
               (multiple-value-bind (sig err)
-                  (bl.rpc::%compute-input-signatures tx i prev keymap pubmap tr-keymap
+                  (bl.rpc:compute-input-signatures tx i prev keymap pubmap tr-keymap
                                              (if (zerop eff) #x01 eff)
                                              precomp spent-utxos eff tr-scripts)
                 ;; Core SignPSBTInput's require_witness_sig gate: never record a
@@ -1261,18 +1261,18 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                 (unless (or err
                             (and (%psbt-require-witness-sig-p map)
                                  (not (%input-sig-witness-p sig))))
-                  (when (and (bl.rpc::input-sig-redeem sig)
+                  (when (and (bl.rpc:input-sig-redeem sig)
                              (not (bl.ser:psbt-map-find
                                    map bl.ser:+psbt-in-redeem-script+)))
                     (bl.ser:psbt-map-set
                      map bl.ser:+psbt-in-redeem-script+ empty
-                     (bl.rpc::input-sig-redeem sig)))
-                  (when (and (bl.rpc::input-sig-witness-script sig)
+                     (bl.rpc:input-sig-redeem sig)))
+                  (when (and (bl.rpc:input-sig-witness-script sig)
                              (not (bl.ser:psbt-map-find
                                    map bl.ser:+psbt-in-witness-script+)))
                     (bl.ser:psbt-map-set
                      map bl.ser:+psbt-in-witness-script+ empty
-                     (bl.rpc::input-sig-witness-script sig)))
+                     (bl.rpc:input-sig-witness-script sig)))
                   (when record-p
                     (bl.ser:psbt-map-set
                      map bl.ser:+psbt-in-sighash+ empty
@@ -1281,24 +1281,24 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                   ;; (input.FillSignatureData loads existing partial_sigs) rather
                   ;; than re-signing — so an input already signed by this pubkey
                   ;; keeps its existing sig. Never overwrite one we already hold.
-                  (dolist (pair (bl.rpc::input-sig-ecdsa sig))
+                  (dolist (pair (bl.rpc:input-sig-ecdsa sig))
                     (unless (%psbt-sig-for map (car pair))
                       (bl.ser:psbt-map-set
                        map bl.ser:+psbt-in-partial-sig+
                        (car pair) (cdr pair))))
-                  (when (and (bl.rpc::input-sig-tap sig)
+                  (when (and (bl.rpc:input-sig-tap sig)
                              (not (bl.ser:psbt-map-find
                                    map bl.ser:+psbt-in-tap-key-sig+)))
                     (bl.ser:psbt-map-set
                      map bl.ser:+psbt-in-tap-key-sig+ empty
-                     (bl.rpc::input-sig-tap sig)))
+                     (bl.rpc:input-sig-tap sig)))
                   ;; A taproot SCRIPT path is recorded in parts, never as the
                   ;; finished witness: PSBT_IN_TAP_SCRIPT_SIG keyed by
                   ;; <xonly><leaf hash>, plus the PSBT_IN_TAP_LEAF_SCRIPT the
                   ;; next signer needs to reach the same leaf. Storing the
                   ;; assembled stack instead would finalize the input and lock
                   ;; every other participant out of a k-of-n leaf.
-                  (dolist (entry (bl.rpc::input-sig-tap-script-sigs sig))
+                  (dolist (entry (bl.rpc:input-sig-tap-script-sigs sig))
                     (destructuring-bind (xonly leaf-hash tap-sig) entry
                       (let ((keydata (concatenate '(vector (unsigned-byte 8))
                                                   xonly leaf-hash)))
@@ -1308,7 +1308,7 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                           (bl.ser:psbt-map-set
                            map bl.ser:+psbt-in-tap-script-sig+
                            keydata tap-sig)))))
-                  (let ((leaf (bl.rpc::input-sig-tap-leaf sig)))
+                  (let ((leaf (bl.rpc:input-sig-tap-leaf sig)))
                     (when leaf
                       (destructuring-bind (script . control) leaf
                         (unless (%psbt-record-present-p
@@ -1319,7 +1319,7 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                            control
                            (concatenate '(vector (unsigned-byte 8))
                                         script
-                                        (vector bl.rpc::+tapleaf-version-tapscript+))))))))))))))))
+                                        (vector bl.rpc:+tapleaf-version-tapscript+))))))))))))))))
 
 (defun %psbt-add-map-derivs (map spk pos pairs)
   "Add +psbt-in-bip32+ (ECDSA) / +psbt-in-tap-internal-key+ (taproot) records to
@@ -1331,7 +1331,7 @@ MAP for the (desc-key . pubkey) PAIRS expanded at POS for scriptPubKey SPK."
           do (if taproot
                  (bl.ser:psbt-map-set
                   map bl.ser:+psbt-in-tap-internal-key+ empty
-                  (bl.rpc::%key-xonly-bytes pubkey))
+                  (bl.rpc:key-xonly-bytes pubkey))
                  (multiple-value-bind (fpr path) (%desc-key-origin-info key pubkey pos)
                    (bl.ser:psbt-map-set
                     map bl.ser:+psbt-in-bip32+ pubkey
@@ -1380,7 +1380,7 @@ outputs so an offline signer can identify change (Core UpdatePSBTOutput)."
                            do (if taproot
                                   (bl.ser:psbt-map-set
                                    map bl.ser:+psbt-out-tap-internal-key+
-                                   empty (bl.rpc::%key-xonly-bytes pubkey))
+                                   empty (bl.rpc:key-xonly-bytes pubkey))
                                   (multiple-value-bind (fpr path)
                                       (%desc-key-origin-info key pubkey pos)
                                     (bl.ser:psbt-map-set
@@ -1435,17 +1435,17 @@ every input can be finalized, even without finalize=true)."
 walletprocesspsbt). PARAMS: (psbt [sign] [sighashtype] [bip32derivs] [finalize]).
 Returns {psbt, complete, hex?}."
   (let ((wallet (wallet-for-request node)))
-    (bl.rpc::with-node-lock (node)
+    (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
         (let* ((psbt (%psbt-decode-arg (first params)))
-               (sign (bl.rpc::%positional-bool-or (second params) t))
+               (sign (bl.rpc:positional-bool-or (second params) t))
                (user-sighash (multiple-value-bind (byte default-p)
                                  (%wallet-sighash-byte (third params))
                                (if default-p nil byte)))
-               (bip32derivs (bl.rpc::%positional-bool-or (fourth params) t))
-               (finalize (bl.rpc::%positional-bool-or (fifth params) t)))
+               (bip32derivs (bl.rpc:positional-bool-or (fourth params) t))
+               (finalize (bl.rpc:positional-bool-or (fifth params) t)))
           (when (and sign (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
-            (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                               :message "Error: Private keys are disabled for this wallet"))
           (when sign (wallet-ensure-unlocked wallet))
           (%psbt-fill-wallet-utxos psbt wallet)
@@ -1469,7 +1469,7 @@ produce over their ranges (EvalDescriptorStringOrObject: default [0,1000] ranged
 the input to %sign-map-add-key! and the derivations."
   (let ((table (make-hash-table :test 'equalp)))
     (unless (listp descs)
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "descriptors must be an array"))
     (dolist (d descs table)
       (multiple-value-bind (desc-str range)
@@ -1478,24 +1478,24 @@ the input to %sign-map-add-key! and the derivations."
                 ((and (consp d) (consp (car d)))
                  (values (cdr (assoc "desc" d :test #'string=))
                          (cdr (assoc "range" d :test #'string=))))
-                (t (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                (t (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                      :message "Descriptor needs to be provided in the object")))
         (unless (stringp desc-str)
-          (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Descriptor needs to be provided in the object"))
-        (let ((desc (bl.rpc::parse-descriptor desc-str network)))
+        (let ((desc (bl.rpc:parse-descriptor desc-str network)))
           (multiple-value-bind (low high)
-              (cond ((not (bl.rpc::out-desc-ranged-p desc)) (values 0 0))
-                    (range (bl.rpc::%parse-descriptor-range range))
+              (cond ((not (bl.rpc:out-desc-ranged-p desc)) (values 0 0))
+                    (range (bl.rpc:parse-descriptor-range range))
                     (t (values 0 1000)))
             (loop for pos from low to high
-                  do (let ((cache (bl.rpc::make-descriptor-cache)))
+                  do (let ((cache (bl.rpc:make-descriptor-cache)))
                        (multiple-value-bind (scripts pubkeys)
                            (handler-case
-                               (bl.rpc::out-desc-expand-with-provider desc pos nil cache)
+                               (bl.rpc:out-desc-expand-with-provider desc pos nil cache)
                              (error () (values nil nil)))
                          (when scripts
-                           (let ((pairs (mapcar #'cons (bl.rpc::out-desc-ordered-keys desc)
+                           (let ((pairs (mapcar #'cons (bl.rpc:out-desc-ordered-keys desc)
                                                 pubkeys)))
                              (dolist (s scripts)
                                (unless (gethash s table)
@@ -1546,15 +1546,15 @@ through the shared %sign-map-add-key!."
   "Update a PSBT's segwit inputs from output descriptors + the UTXO set, then
 sign the inputs the descriptors can (Bitcoin Core descriptorprocesspsbt).
 PARAMS: (psbt descriptors [sighashtype] [bip32derivs] [finalize])."
-  (bl.rpc::with-node-lock (node)
-    (let* ((network (bl.rpc::rpc-get-network node))
+  (bl.rpc:with-node-lock (node)
+    (let* ((network (bl.rpc:rpc-get-network node))
            (psbt (%psbt-decode-arg (first params)))
            (expansions (%psbt-descriptor-expansions (second params) network))
            (user-sighash (multiple-value-bind (byte default-p)
                              (%wallet-sighash-byte (third params))
                            (if default-p nil byte)))
-           (bip32derivs (bl.rpc::%positional-bool-or (fourth params) t))
-           (finalize (bl.rpc::%positional-bool-or (fifth params) t)))
+           (bip32derivs (bl.rpc:positional-bool-or (fourth params) t))
+           (finalize (bl.rpc:positional-bool-or (fifth params) t)))
       (%psbt-fill-node-utxos psbt node)
       (let ((coins (%psbt-coins-map psbt)))
         (when bip32derivs
@@ -1612,7 +1612,7 @@ input/output bip32 derivations. Mirrors Core FillPSBT(sign=false)."
 outputs arrive as hash tables whose key order is not preserved; use the
 array-of-objects form when output order matters."
   (let ((wallet (wallet-for-request node)))
-    (bl.rpc::with-node-lock (node)
+    (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
         (let* ((options (or (nth 3 params) '()))
                (version (let ((v (nth 5 params))) (if (integerp v) v 2)))
@@ -1622,14 +1622,14 @@ array-of-objects form when output order matters."
                (locktime (or (nth 2 params) 0))
                ;; Same sentinel: walletcreatefundedpsbt([], ...) is the very
                ;; first call rpc_psbt.py makes.
-               (inputs (%parse-rpc-inputs (or (bl.rpc::%positional-array (first params)) '())))
-               (bip32derivs (bl.rpc::%positional-bool-or (nth 4 params) t))
+               (inputs (%parse-rpc-inputs (or (bl.rpc:positional-array (first params)) '())))
+               (bip32derivs (bl.rpc:positional-bool-or (nth 4 params) t))
                (cc (make-wcc :version version)))
           (unless (and (integerp locktime) (<= 0 locktime #xffffffff))
-            (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                               :message "Invalid parameter, locktime out of range"))
           (multiple-value-bind (recipients keys)
-              (bl.rpc::%parse-outputs (wallet-network wallet) (second params))
+              (bl.rpc:parse-outputs (wallet-network wallet) (second params))
             (%interpret-sffo (%opt options "subtractFeeFromOutputs") keys recipients)
             (%apply-rpc-inputs cc inputs rbf locktime)
             (setf (wcc-allow-other-inputs cc) (null inputs))
@@ -1640,9 +1640,9 @@ array-of-objects form when output order matters."
               (multiple-value-bind (tx fee change-pos)
                   (%create-transaction node wallet recipients change-position cc nil)
                 (unless tx
-                  (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+ :message fee))
+                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+ :message fee))
                 `(("psbt" . ,(%wallet-unsigned-psbt node wallet tx bip32derivs))
-                  ("fee" . ,(bl.rpc::%btc fee))
+                  ("fee" . ,(bl.rpc:satoshi->btc fee))
                   ("changepos" . ,(or change-pos -1)))))))))))
 
 ;;; --- feebumper (wallet/feebumper.cpp) ---
@@ -1657,7 +1657,7 @@ proofs against network incremental-fee changes the node may not know).")
 book entry."
   (and (wallet-is-mine wallet script)
        (not (nth-value 2 (wallet-find-address-book-entry
-                          wallet (bl.rpc::%script->address script (wallet-network wallet)))))))
+                          wallet (bl.rpc:script->address script (wallet-network wallet)))))))
 
 (defun %all-inputs-mine (node wallet tx)
   "Core AllInputsMine: every input of TX spends a wallet-owned output."
@@ -1684,7 +1684,7 @@ book entry."
   "Core feebumper::PreconditionChecks. Returns (values ok error-code error-msg).
 Adds the task-mandated BIP125-replaceable requirement on the original tx."
   (let ((tx (wallet-tx-tx wtx))
-        (mempool (bl::node-mempool node)))
+        (mempool (bl:node-mempool node)))
     (cond
       ((%wallet-has-spend wallet tx)
        (values nil bl.rpc:+rpc-invalid-parameter+ "Transaction has descendants in the wallet"))
@@ -1693,18 +1693,18 @@ Adds the task-mandated BIP125-replaceable requirement on the original tx."
                              mempool (wallet-tx-txid wtx)))))
        (values nil bl.rpc:+rpc-invalid-parameter+ "Transaction has descendants in the mempool"))
       ((/= (wallet-tx-depth wallet wtx) 0)
-       (values nil bl.rpc::+rpc-wallet-error+
+       (values nil bl.rpc:+rpc-wallet-error+
                "Transaction has been mined, or is conflicted with a mined transaction"))
       ((assoc "replaced_by_txid" (wallet-tx-map-value wtx) :test #'string=)
-       (values nil bl.rpc::+rpc-wallet-error+
+       (values nil bl.rpc:+rpc-wallet-error+
                (format nil "Cannot bump transaction ~A which was already bumped by transaction ~A"
-                       (bl.rpc::hash-to-hex (wallet-tx-txid wtx))
+                       (bl.rpc:hash-to-hex (wallet-tx-txid wtx))
                        (cdr (assoc "replaced_by_txid" (wallet-tx-map-value wtx) :test #'string=)))))
       ((not (bl.mp:tx-signals-rbf-p tx))
-       (values nil bl.rpc::+rpc-wallet-error+
+       (values nil bl.rpc:+rpc-wallet-error+
                "Transaction is not BIP 125 replaceable"))
       ((and require-mine (not (%all-inputs-mine node wallet tx)))
-       (values nil bl.rpc::+rpc-wallet-error+
+       (values nil bl.rpc:+rpc-wallet-error+
                "Transaction contains inputs that don't belong to this wallet"))
       (t (values t nil nil)))))
 
@@ -1714,7 +1714,7 @@ max(node incremental, wallet incremental), floored at GetMinimumFeeRate."
   (declare (ignore wallet))
   (let* ((txsize (bl.ser:transaction-vsize orig))
          (base (if (plusp txsize) (floor (* old-fee 1000) txsize) 0))
-         (feerate (+ base 1 (max bl.mp::+incremental-relay-fee-rate+
+         (feerate (+ base 1 (max bl.mp:+incremental-relay-fee-rate+
                                  +wallet-incremental-relay-fee-rate+)))
          (min-rate (%wallet-minimum-fee-rate node cc)))
     (max feerate min-rate)))
@@ -1741,7 +1741,7 @@ Caller holds node + wallet locks."
           (unless txout
             (return-from %create-rate-bump
               (values nil bl.rpc:+rpc-misc-error+
-                      (format nil "~A:~D is already spent" (bl.rpc::hash-to-hex thash) n))))
+                      (format nil "~A:~D is already spent" (bl.rpc:hash-to-hex thash) n))))
           (let ((preset (wcc-select cc thash n)))
             (unless (wallet-is-mine wallet (bl.ser:tx-out-script-pubkey txout))
               (setf (wcc-preset-txout preset) txout)))
@@ -1762,9 +1762,9 @@ Caller holds node + wallet locks."
           (let ((spk (bl.ser:tx-out-script-pubkey out)))
             (if (%output-is-change wallet spk)
                 (setf (wcc-dest-change cc) spk)
-                (push (bl.rpc::make-recipient :script spk
+                (push (bl.rpc:make-recipient :script spk
                                       :amount (bl.ser:tx-out-value out)
-                                      :address (bl.rpc::%script->address spk network))
+                                      :address (bl.rpc:script->address spk network))
                       recipients))))
         (setf recipients (nreverse recipients))
         (when (null recipients)
@@ -1772,8 +1772,8 @@ Caller holds node + wallet locks."
             (return-from %create-rate-bump
               (values nil bl.rpc:+rpc-invalid-parameter+
                       "Unable to create transaction. Transaction must have at least one recipient")))
-          (push (bl.rpc::make-recipient :script (wcc-dest-change cc) :amount output-value :sffo t
-                                :address (bl.rpc::%script->address (wcc-dest-change cc) network))
+          (push (bl.rpc:make-recipient :script (wcc-dest-change cc) :amount output-value :sffo t
+                                :address (bl.rpc:script->address (wcc-dest-change cc) network))
                 recipients)
           (setf (wcc-dest-change cc) nil))
         ;; Feerate: user-provided (already on CC) or estimated from the old fee.
@@ -1791,7 +1791,7 @@ Caller holds node + wallet locks."
         (multiple-value-bind (new-tx new-fee) (%create-transaction node wallet recipients nil cc nil)
           (unless new-tx
             (return-from %create-rate-bump
-              (values nil bl.rpc::+rpc-wallet-error+
+              (values nil bl.rpc:+rpc-wallet-error+
                       (format nil "Unable to create transaction. ~A" new-fee))))
           ;; BIP125 rule 3/4 (feebumper::CheckFeeRate minTotalFee): the new total
           ;; fee must be at least the old fee plus one incremental relay fee over
@@ -1799,14 +1799,14 @@ Caller holds node + wallet locks."
           ;; it here so a too-low bump fails BEFORE we sign / mark the original
           ;; replaced (%create-transaction already caps at -maxtxfee).
           (let ((min-total (+ old-fee
-                              (bl.rpc::%feerate-fee bl.mp::+incremental-relay-fee-rate+
+                              (bl.rpc:feerate-fee bl.mp:+incremental-relay-fee-rate+
                                             (bl.ser:transaction-vsize new-tx)))))
             (when (< new-fee min-total)
               (return-from %create-rate-bump
                 (values nil bl.rpc:+rpc-invalid-parameter+
                         (format nil "Insufficient total fee ~A, must be at least ~A (oldFee ~A + incrementalFee)"
-                                (bl.rpc::%format-money new-fee) (bl.rpc::%format-money min-total)
-                                (bl.rpc::%format-money old-fee))))))
+                                (bl.rpc:format-money new-fee) (bl.rpc:format-money min-total)
+                                (bl.rpc:format-money old-fee))))))
           (values new-tx old-fee new-fee))))))
 
 (defun %bumpfee-options->cc (options cc)
@@ -1825,56 +1825,56 @@ estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
   "Shared body of bumpfee / psbtbumpfee. PARAMS: (txid [options])."
   (let ((wallet (wallet-for-request node))
         (txid-hex (first params)))
-    (unless (and (stringp txid-hex) (bl.rpc::valid-hex-hash-p txid-hex))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "txid must be a hex string"))
-    (bl.rpc::with-node-lock (node)
+    (unless (and (stringp txid-hex) (bl.rpc:valid-hex-hash-p txid-hex))
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+ :message "txid must be a hex string"))
+    (bl.rpc:with-node-lock (node)
       (with-wallet-lock (wallet)
         (when (and (not want-psbt)
                    (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                             :message "bumpfee is not available with wallets that have private keys disabled. Use psbtbumpfee instead."))
         ;; Core gates BOTH bumpfee and psbtbumpfee: building the
         ;; replacement needs the keypool and, for bumpfee, the signature.
         (wallet-ensure-unlocked wallet)
-        (let ((txid (bl.rpc::parse-hex-hash txid-hex))
+        (let ((txid (bl.rpc:parse-hex-hash txid-hex))
               (cc (make-wcc)))
           (setf (wcc-signal-bip125-rbf cc) t)   ; Core: default true, RBF replacement
           (%bumpfee-options->cc (second params) cc)
           (multiple-value-bind (mtx old-fee new-fee code msg)
               (%create-rate-bump node wallet txid cc (not want-psbt))
             (unless mtx
-              (error 'bl.rpc::rpc-error :code code :message msg))
+              (error 'bl.rpc:rpc-error :code code :message msg))
             (if want-psbt
                 `(("psbt" . ,(%wallet-unsigned-psbt node wallet mtx t))
-                  ("origfee" . ,(bl.rpc::%btc old-fee))
-                  ("fee" . ,(bl.rpc::%btc new-fee))
+                  ("origfee" . ,(bl.rpc:satoshi->btc old-fee))
+                  ("fee" . ,(bl.rpc:satoshi->btc new-fee))
                   ("errors" . ,#()))
                 (progn
                   ;; Sign in place with the wallet keys, then verify.
                   (let ((coins (%wallet-input-coins node wallet mtx cc)))
                     (when (%wallet-sign-transaction wallet mtx coins)
-                      (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+ :message "Can't sign transaction."))
+                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+ :message "Can't sign transaction."))
                     (multiple-value-bind (verified bad) (%verify-tx-scripts mtx coins)
                       (unless verified
-                        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+                        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                           :message (format nil "Internal bug detected: bumped transaction fails script verification at input ~D" bad)))))
                   ;; Re-check preconditions, commit + broadcast, mark replaced.
                   (let ((old-wtx (wallet-get-wallet-tx wallet txid)))
                     (multiple-value-bind (ok code2 msg2)
                         (%bump-precondition-checks node wallet old-wtx nil)
-                      (unless ok (error 'bl.rpc::rpc-error :code code2 :message msg2)))
+                      (unless ok (error 'bl.rpc:rpc-error :code code2 :message msg2)))
                     (let ((new-txid (bl.ser:transaction-hash mtx)))
                       (%wallet-commit-transaction
                        node wallet mtx
-                       (list (cons "replaces_txid" (bl.rpc::hash-to-hex txid))))
+                       (list (cons "replaces_txid" (bl.rpc:hash-to-hex txid))))
                       ;; MarkReplaced: record the bump on the original tx.
                       (setf (wallet-tx-map-value old-wtx)
                             (append (remove "replaced_by_txid" (wallet-tx-map-value old-wtx)
                                             :key #'car :test #'string=)
-                                    (list (cons "replaced_by_txid" (bl.rpc::hash-to-hex new-txid)))))
-                      `(("txid" . ,(bl.rpc::hash-to-hex new-txid))
-                        ("origfee" . ,(bl.rpc::%btc old-fee))
-                        ("fee" . ,(bl.rpc::%btc new-fee))
+                                    (list (cons "replaced_by_txid" (bl.rpc:hash-to-hex new-txid)))))
+                      `(("txid" . ,(bl.rpc:hash-to-hex new-txid))
+                        ("origfee" . ,(bl.rpc:satoshi->btc old-fee))
+                        ("fee" . ,(bl.rpc:satoshi->btc new-fee))
                         ("errors" . ,#()))))))))))))
 
 (bl.rpc:define-rpc "bumpfee" (node params)

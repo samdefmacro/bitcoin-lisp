@@ -267,8 +267,8 @@ it, so they run on a network where relay is on."
     ;; the peer's version fRelay. A default peer is neither block-relay nor
     ;; feeler and has no stored version, which counts as relaying — Core's
     ;; pre-70001 default — so nothing needs setting for it.
-    (setf (bl.net::peer-state p) :ready
-          (bl.net::peer-inbound p) inbound
+    (setf (bl.net:peer-state p) :ready
+          (bl.net:peer-inbound p) inbound
           (bl.net::peer-recon-registered p) registered
           (bl.net::peer-recon-we-initiate p) we-initiate)
     (when registered
@@ -285,9 +285,9 @@ leaking into the default configuration."
     (let ((peer (%rc-peer :registered nil))
           (txid (%rc-wtxid 1))
           (wtxid (%rc-wtxid 2)))
-      (bl.net::relay-transaction txid nil (list peer)
+      (bl.net:relay-transaction txid nil (list peer)
                                                   :wtxid wtxid :fee-rate 1)
-      (is (= 1 (length (bl.net::peer-tx-inv-queue peer)))
+      (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))
           "an unregistered peer must be announced to, not reconciled with")
       (is-false (bl.net::peer-recon-set peer)
                 "and no reconciliation set is even created"))))
@@ -306,10 +306,10 @@ what keeps the first announcement from revealing the origin."
            (held 0) (announced 0))
       (dotimes (i 60)
         (let ((wtxid (%rc-wtxid i)))
-          (setf (bl.net::peer-tx-inv-queue peer) '())
-          (bl.net::relay-transaction
+          (setf (bl.net:peer-tx-inv-queue peer) '())
+          (bl.net:relay-transaction
            wtxid nil peers :wtxid wtxid :fee-rate 1)
-          (if (bl.net::peer-tx-inv-queue peer)
+          (if (bl.net:peer-tx-inv-queue peer)
               (incf announced)
               (incf held))))
       (is (plusp held) "reconciliation must actually hold transactions back")
@@ -329,9 +329,9 @@ else would only delay them, which is the opposite of the point."
    (let ((peer (%rc-peer :registered t)))
      (dotimes (i 10)
        (let ((wtxid (%rc-wtxid i)))
-         (bl.net::relay-transaction
+         (bl.net:relay-transaction
           wtxid nil (list peer) :wtxid wtxid :fee-rate 1)))
-     (is (= 10 (length (bl.net::peer-tx-inv-queue peer))))
+     (is (= 10 (length (bl.net:peer-tx-inv-queue peer))))
      (is-false (bl.net::peer-recon-set peer)))))
 
 (test a-transaction-without-a-wtxid-is-never-held-back
@@ -341,9 +341,9 @@ vanishing into a set that can never describe it."
   (%with-relay-network
     (let ((peer (%rc-peer :registered t))
           (txid (%rc-wtxid 3)))
-      (bl.net::relay-transaction txid nil (list peer)
+      (bl.net:relay-transaction txid nil (list peer)
                                                   :wtxid nil :fee-rate 1)
-      (is (= 1 (length (bl.net::peer-tx-inv-queue peer)))))))
+      (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))))))
 
 (test only-the-dialling-side-opens-a-round
   "Both ends opening rounds against each other at once would waste a sketch

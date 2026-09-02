@@ -421,7 +421,7 @@ block-relay peer. Core answers this shape with MaybeSendGetHeaders and an early
 return, before anything can be scored (net_processing.cpp:4571-4577); its
 BLOCK_MISSING_PREV punishment (:1938-1944) is unreachable via the compact path."
   (with-network (:regtest)
-   (let* ((bl.net::*cached-is-ibd* nil)
+   (let* ((bl.net:*cached-is-ibd* nil)
           (addr "203.0.113.41")
           (peer (%cbp-peer addr))
           (state (bl.store:make-chain-state))
@@ -445,7 +445,7 @@ still hold. Without this test the IBD gate is an unasserted clause: the
 unknown-parent test above pins *cached-is-ibd* to NIL and cannot distinguish a
 gated getheaders from an ungated one."
   (with-network (:regtest)
-   (let* ((bl.net::*cached-is-ibd* t)
+   (let* ((bl.net:*cached-is-ibd* t)
           (addr "203.0.113.47")
           (peer (%cbp-peer addr))
           ;; No tip at all ⇒ initial-block-download-p stays latched at T.
@@ -455,7 +455,7 @@ gated getheaders from an ungated one."
           (sent (%cbp-capture-sends
                  (lambda ()
                    (bl.net::handle-cmpctblock peer (%cbp-payload cb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool (bl.mp:make-mempool)))))))
-     (is-true bl.net::*cached-is-ibd*
+     (is-true bl.net:*cached-is-ibd*
               "fixture must still be in IBD or this test asserts nothing")
      (is (null sent)
          "no getheaders may be sent for an unknown-parent cmpctblock during IBD, sent: ~S"
@@ -479,7 +479,7 @@ Doubles as the anti-vacuity control for the unknown-parent test above: the
 parent guard must be narrow enough that a KNOWN parent still reaches
 reconstruction -- otherwise this test would see a getheaders here."
   (with-network (:regtest)
-   (let* ((bl.net::*cached-is-ibd* nil)
+   (let* ((bl.net:*cached-is-ibd* nil)
           (bl.net::*compact-block-success-count* 0)
           (bl.net::*compact-block-failure-count* 0)
           (addr "203.0.113.42")
@@ -511,7 +511,7 @@ produce it. Before this change our reconstruction reported it as :COLLISION,
 i.e. the same value as an innocent short-ID clash in our own mempool, so it got
 a polite full-block getdata instead."
   (with-network (:regtest)
-   (let* ((bl.net::*cached-is-ibd* nil)
+   (let* ((bl.net:*cached-is-ibd* nil)
           (addr "203.0.113.43")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA2))
@@ -655,7 +655,7 @@ mempool entry under a key derived from the attacker's own header+nonce, so it
 must happen only after the header is known good. The valid-header control at the
 end proves the counter is wired to something real (it goes to exactly 1)."
   (with-network (:regtest)
-   (let* ((bl.net::*cached-is-ibd* nil)
+   (let* ((bl.net:*cached-is-ibd* nil)
           (bl.net::*compact-block-success-count* 0)
           (bl.net::*compact-block-failure-count* 0)
           (addr "203.0.113.48")
@@ -709,7 +709,7 @@ fix that special-cased PoW would be a different bug. A timestamp at or below the
 median-time-past is Core's time-too-old (validation.cpp:4125): same arm, same
 unconditional Misbehaving. The header's PoW is mined, so nothing pre-empts it."
   (with-network (:regtest)
-   (let* ((bl.net::*cached-is-ibd* nil)
+   (let* ((bl.net:*cached-is-ibd* nil)
           (addr "203.0.113.50")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA5))
@@ -738,7 +738,7 @@ unconditional Misbehaving. The header's PoW is mined, so nothing pre-empts it."
 is Core's bad-prevblk (validation.cpp:4251-4255), the arm right beside
 BLOCK_INVALID_HEADER and equally exempt from the via_compact_block amnesty."
   (with-network (:regtest)
-   (let* ((bl.net::*cached-is-ibd* nil)
+   (let* ((bl.net:*cached-is-ibd* nil)
           (addr "203.0.113.51")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA6))
@@ -766,7 +766,7 @@ getdata would deliver the same block on the BLOCK path, where HANDLE-BLOCK
 punishes unconditionally, converting Core's no-op into an exile one message
 later."
   (with-network (:regtest)
-   (let* ((bl.net::*cached-is-ibd* nil)
+   (let* ((bl.net:*cached-is-ibd* nil)
           (addr "203.0.113.52")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA7))
@@ -798,7 +798,7 @@ invalid. Core exempts it whenever via_compact_block is true
 re-downloading a block we have already rejected is a self-inflicted DoS. Checked
 before the parent lookup, mirroring AcceptBlockHeader (validation.cpp:4229-4237)."
   (with-network (:regtest)
-   (let* ((bl.net::*cached-is-ibd* nil)
+   (let* ((bl.net:*cached-is-ibd* nil)
           (addr "203.0.113.53")
           (peer (%cbp-peer addr))
           (parent (%cbp-hash #xA8))
@@ -857,19 +857,19 @@ an exiled honest peer."
 ;;;; ============================================================
 
 (defun %g716-peer (&key inbound (version 2))
-  (let ((p (bl.net::make-peer :inbound inbound)))
-    (setf (bl.net::peer-compact-block-version p) version
-          (bl.net::peer-state p) :ready)
+  (let ((p (bl.net:make-peer :inbound inbound)))
+    (setf (bl.net:peer-compact-block-version p) version
+          (bl.net:peer-state p) :ready)
     p))
 
 (defmacro %g716-quiet (&body body)
   "Run BODY with send-message stubbed out (no sockets)."
-  `(let ((real (fdefinition 'bl.net::send-message)))
+  `(let ((real (fdefinition 'bl.net:send-message)))
      (unwind-protect
-          (progn (setf (fdefinition 'bl.net::send-message)
+          (progn (setf (fdefinition 'bl.net:send-message)
                        (lambda (peer msg) (declare (ignore peer msg)) t))
                  ,@body)
-       (setf (fdefinition 'bl.net::send-message) real))))
+       (setf (fdefinition 'bl.net:send-message) real))))
 
 (test g7-16-initial-sendcmpct-is-low-bandwidth
   "G7-16: high bandwidth is a SCARCE SELECTION (BIP152 allows 3), not a
@@ -878,13 +878,13 @@ every one of them pushed an unsolicited cmpctblock for every block instead of
 about three."
   (let ((sent '())
         (peer (%g716-peer)))
-    (let ((real (fdefinition 'bl.net::send-message)))
+    (let ((real (fdefinition 'bl.net:send-message)))
       (unwind-protect
            (progn
-             (setf (fdefinition 'bl.net::send-message)
+             (setf (fdefinition 'bl.net:send-message)
                    (lambda (p msg) (declare (ignore p)) (push msg sent)))
-             (bl.net::send-compact-block-negotiation peer))
-        (setf (fdefinition 'bl.net::send-message) real)))
+             (bl.net:send-compact-block-negotiation peer))
+        (setf (fdefinition 'bl.net:send-message) real)))
     (is (= 1 (length sent)))
     ;; Assert on the ACTUAL sendcmpct byte on the wire, and on the peer that
     ;; was negotiated — checking a fresh peer's default-NIL flag would pass no
@@ -892,7 +892,7 @@ about three."
     (let ((payload (subseq (first sent) 24)))
       (is (zerop (aref payload 0))
           "the high-bandwidth byte of the initial sendcmpct must be 0"))
-    (is (null (bl.net::peer-compact-block-high-bandwidth-to peer))
+    (is (null (bl.net:peer-compact-block-high-bandwidth-to peer))
         "negotiation must not mark the peer HB")))
 
 (test g7-16-hb-selection-capped-at-three-demoting-oldest
@@ -906,7 +906,7 @@ protocol anomaly."
         (dolist (p (list a b c))
           (bl.net:maybe-set-peer-announcing-hb p))
         (is (equal (list a b c) bl.net::*hb-announcing-peers*))
-        (is (every #'bl.net::peer-compact-block-high-bandwidth-to
+        (is (every #'bl.net:peer-compact-block-high-bandwidth-to
                    (list a b c)))
         ;; Re-selecting an existing peer only reorders it.
         (bl.net:maybe-set-peer-announcing-hb a)
@@ -915,7 +915,7 @@ protocol anomaly."
         ;; A fourth peer evicts the oldest (now b).
         (bl.net:maybe-set-peer-announcing-hb d)
         (is (equal (list c a d) bl.net::*hb-announcing-peers*))
-        (is (null (bl.net::peer-compact-block-high-bandwidth-to b))
+        (is (null (bl.net:peer-compact-block-high-bandwidth-to b))
             "the evicted peer must be demoted to low bandwidth")))))
 
 (test g7-16-inbound-promotion-protects-last-outbound-hb-peer
@@ -940,8 +940,8 @@ the wrong end of the reorg disconnect pool."
         (bl.net:maybe-set-peer-announcing-hb in3)
         (is (member out bl.net::*hb-announcing-peers*)
             "the last outbound HB peer must be protected from inbound eviction")
-        (is-true (bl.net::peer-compact-block-high-bandwidth-to out))
-        (is (null (bl.net::peer-compact-block-high-bandwidth-to in1))
+        (is-true (bl.net:peer-compact-block-high-bandwidth-to out))
+        (is (null (bl.net:peer-compact-block-high-bandwidth-to in1))
             "the inbound peer in slot 1 is evicted instead")))))
 
 (test g7-16-non-signalling-and-blocksonly-peers-not-promoted
@@ -977,7 +977,7 @@ promotion; only the liveness of `out' differs, and it must flip the outcome."
         (bl.net:maybe-set-peer-announcing-hb in3)
         (is (equal (list out in2 in3) bl.net::*hb-announcing-peers*)
             "control: a LIVE lone outbound HB peer is protected, in1 is evicted")
-        (is (null (bl.net::peer-compact-block-high-bandwidth-to in1)))))
+        (is (null (bl.net:peer-compact-block-high-bandwidth-to in1)))))
     ;; FIX — identical shape, but `out' goes away through the production
     ;; disconnect path first. Nothing calls into the HB code on disconnect: the
     ;; list's only reader re-reads liveness, so it does not matter WHICH of the
@@ -996,7 +996,7 @@ promotion; only the liveness of `out' differs, and it must flip the outcome."
             "a dead peer must not be counted as outbound, protected, or kept")
         (is (null (member out bl.net::*hb-announcing-peers*))
             "the dead peer's slot must be reclaimed, not squatted")
-        (is-true (bl.net::peer-compact-block-high-bandwidth-to in1)
+        (is-true (bl.net:peer-compact-block-high-bandwidth-to in1)
                  "a LIVE inbound HB peer must not be evicted to defend a corpse")
         (is (= 3 (count-if #'bl.net::%hb-peer-live-p
                            bl.net::*hb-announcing-peers*))
@@ -1010,8 +1010,8 @@ promotion; only the liveness of `out' differs, and it must flip the outcome."
   "Assemble + PoW-mine a block on NODE's tip paying the coinbase to SPK,
 without connecting it."
   (let ((blk (bl.mining:assemble-full-block
-              (bl::node-chain-state node)
-              (bl::node-mempool node)
+              (bl:node-chain-state node)
+              (bl:node-mempool node)
               :coinbase-script-pubkey spk)))
     (bl.mining:mine-block blk)
     blk))
@@ -1062,7 +1062,7 @@ shape an attacker uses to buy an HB slot with a block we will never connect."
 deliverer skips everything during IBD, so a test that left it on would pass
 whatever the promotion code did."
   `(let ((bl.net::*hb-announcing-peers* '())
-         (bl.net::*cached-is-ibd* nil))
+         (bl.net:*cached-is-ibd* nil))
      ,@body))
 
 (test g7-16-compact-block-promotes-only-after-the-block-validates
@@ -1073,10 +1073,10 @@ delivered a reconstructible-but-INVALID compact block bought an HB slot — and
 through the cap-of-3 eviction could demote an honest HB peer at will."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "g716-cb"))
-          (cs (bl::node-chain-state node))
-          (utxo (bl::node-utxo-set node))
-          (store (bl::node-block-store node))
-          (mp (bl::node-mempool node))
+          (cs (bl:node-chain-state node))
+          (utxo (bl:node-utxo-set node))
+          (store (bl:node-block-store node))
+          (mp (bl:node-mempool node))
           (good (%g716-mine-on node (p2sh-optrue-script-pubkey)))
           (bad (%g716-corrupt-block good)))
      (%g716-quiet
@@ -1088,7 +1088,7 @@ through the cap-of-3 eviction could demote an honest HB peer at will."
               "the bogus block must not have connected")
           (is (null bl.net::*hb-announcing-peers*)
               "a peer delivering an INVALID compact block must not be promoted")
-          (is (null (bl.net::peer-compact-block-high-bandwidth-to peer)))))
+          (is (null (bl.net:peer-compact-block-high-bandwidth-to peer)))))
        ;; CONTROL: the same path with a VALID block does promote — otherwise the
        ;; assertion above would hold even if promotion were deleted outright.
        (%g716-with-fresh-hb
@@ -1098,7 +1098,7 @@ through the cap-of-3 eviction could demote an honest HB peer at will."
               "the good block connected")
           (is (equal (list peer) bl.net::*hb-announcing-peers*)
               "a peer delivering a VALID compact block earns high bandwidth")
-          (is-true (bl.net::peer-compact-block-high-bandwidth-to
+          (is-true (bl.net:peer-compact-block-high-bandwidth-to
                     peer))))))))
 
 (test cmpctblock-message-round-trips-through-our-own-parser
@@ -1146,12 +1146,12 @@ of the tip a cmpctblock, deeper the full witness block, because a peer asking
 for old blocks has no mempool that could reconstruct one (:2463-2476)."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "cb-getdata"))
-          (cs (bl::node-chain-state node))
-          (store (bl::node-block-store node))
+          (cs (bl:node-chain-state node))
+          (store (bl:node-block-store node))
           ;; Seven blocks, so the first sits deeper than the depth rule allows.
           (hashes (bl.rpc::%generate-to-script-pubkey
                    node (p2sh-optrue-script-pubkey) 7 1000000))
-          (deep-hash (bl.rpc::parse-hex-hash (first hashes))))
+          (deep-hash (bl.rpc:parse-hex-hash (first hashes))))
      (progn
        (is (= 7 (bl.store:current-height cs)))
        (let ((peer (%cbp-peer "198.51.100.30"))
@@ -1181,10 +1181,10 @@ same defect and needs its own coverage: a dropped hunk there would disable the
 fix on half the compact traffic without failing the cmpctblock test."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "g716-btxn"))
-          (cs (bl::node-chain-state node))
-          (utxo (bl::node-utxo-set node))
-          (store (bl::node-block-store node))
-          (mp (bl::node-mempool node))
+          (cs (bl:node-chain-state node))
+          (utxo (bl:node-utxo-set node))
+          (store (bl:node-block-store node))
+          (mp (bl:node-mempool node))
           (good (%g716-mine-on node (p2sh-optrue-script-pubkey)))
           (hash (bl.ser:block-header-hash
                  (bl.ser:bitcoin-block-header good))))
@@ -1193,7 +1193,7 @@ fix on half the compact traffic without failing the cmpctblock test."
               ;; leaves it when the mempool holds none of the block's txs, then
               ;; feed the blocktxn that completes it.
               (setf (bl.net:peer-pending-compact-block peer)
-                    (bl.net::make-pending-compact-block
+                    (bl.net:make-pending-compact-block
                      :block-hash hash
                      :header (bl.ser:bitcoin-block-header good)
                      :transactions (make-array (length txs) :initial-element nil)
@@ -1231,10 +1231,10 @@ generic dispatcher, reached from the header-sync drains) and
 dispatch-ibd-message's `block' branch (the block-download path)."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "g716-full"))
-          (cs (bl::node-chain-state node))
-          (utxo (bl::node-utxo-set node))
-          (store (bl::node-block-store node))
-          (mp (bl::node-mempool node))
+          (cs (bl:node-chain-state node))
+          (utxo (bl:node-utxo-set node))
+          (store (bl:node-block-store node))
+          (mp (bl:node-mempool node))
           (spk (p2sh-optrue-script-pubkey))
           (b1 (%g716-mine-on node spk)))
      (%g716-quiet
@@ -1254,7 +1254,7 @@ dispatch-ibd-message's `block' branch (the block-download path)."
               "the full block connected")
           (is (equal (list peer) bl.net::*hb-announcing-peers*)
               "a full-block delivery earns high bandwidth, like a compact one")
-          (is-true (bl.net::peer-compact-block-high-bandwidth-to peer))))
+          (is-true (bl.net:peer-compact-block-high-bandwidth-to peer))))
        ;; The block-download path (dispatch-ibd-message "block"): its header is
        ;; in the index first, exactly as the real pipeline has it.
        (let ((b2 (%g716-mine-on node spk)))
@@ -1270,14 +1270,14 @@ dispatch-ibd-message's `block' branch (the block-download path)."
                              (bl.store:block-index-entry-chain-work prev))
                 :status :header-valid)))
          (%g716-with-fresh-hb
-          (let ((bl.net::*ibd-context* (bl.net::make-ibd))
+          (let ((bl.net:*ibd-context* (bl.net::make-ibd))
                 (peer (%g716-delivering-peer "198.51.100.20")))
-            (bl.net::dispatch-ibd-message peer "block" (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store) bl.net::*ibd-context*)
+            (bl.net::dispatch-ibd-message peer "block" (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store) bl.net:*ibd-context*)
             (is (= 2 (bl.store:current-height cs))
                 "the downloaded block connected")
             (is (equal (list peer) bl.net::*hb-announcing-peers*)
                 "the block-download path promotes too")
-            (is-true (bl.net::peer-compact-block-high-bandwidth-to
+            (is-true (bl.net:peer-compact-block-high-bandwidth-to
                       peer)))))))))
 
 ;;;; ------------------------------------------------------------
@@ -1302,7 +1302,7 @@ reconstruction exactly as handle-cmpctblock leaves it when our mempool holds
 none of the block's transactions, then feed the blocktxn carrying TXS."
   (let ((hash (%g716-block-hash block)))
     (setf (bl.net:peer-pending-compact-block peer)
-          (bl.net::make-pending-compact-block
+          (bl.net:make-pending-compact-block
            :block-hash hash
            :header (bl.ser:bitcoin-block-header block)
            :transactions (make-array (length txs) :initial-element nil)
@@ -1325,10 +1325,10 @@ replay was already harmless to the chain and expensive to us, which is exactly
 why the hole survived this long."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "cb-replay-cost"))
-          (cs (bl::node-chain-state node))
-          (utxo (bl::node-utxo-set node))
-          (store (bl::node-block-store node))
-          (mp (bl::node-mempool node))
+          (cs (bl:node-chain-state node))
+          (utxo (bl:node-utxo-set node))
+          (store (bl:node-block-store node))
+          (mp (bl:node-mempool node))
           (spk (p2sh-optrue-script-pubkey))
           (b1 (%g716-mine-on node spk))
           (builds 0)
@@ -1341,7 +1341,7 @@ why the hole survived this long."
           ;; eclipse-dos-tests went red in the cold battery while this suite
           ;; stayed green. The neighbouring g7-16 tests get the same
           ;; protection from %g716-with-fresh-hb.
-          (bl.net::*cached-is-ibd* nil))
+          (bl.net:*cached-is-ibd* nil))
     (%g716-quiet
       ;; Count every shortid map built, whoever builds it.
       (let ((real (symbol-function 'bl.net::build-shortid-map)))
@@ -1399,10 +1399,10 @@ own control: the FIRST, genuinely-connecting delivery of the same block on the
 same path must promote."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "g716-replay"))
-          (cs (bl::node-chain-state node))
-          (utxo (bl::node-utxo-set node))
-          (store (bl::node-block-store node))
-          (mp (bl::node-mempool node))
+          (cs (bl:node-chain-state node))
+          (utxo (bl:node-utxo-set node))
+          (store (bl:node-block-store node))
+          (mp (bl:node-mempool node))
           (spk (p2sh-optrue-script-pubkey))
           (b1 (%g716-mine-on node spk)))
      (is (= 0 (bl.store:current-height cs)) "fixture starts at genesis")
@@ -1420,11 +1420,11 @@ same path must promote."
           (bl.net::handle-cmpctblock b (%g716-cmpctblock-payload b1) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
           (is (= 1 (bl.store:current-height cs))
               "the replay connected nothing")
-          (is (eq :ready (bl.net::peer-state b))
+          (is (eq :ready (bl.net:peer-state b))
               "the replayer is NOT punished, so nothing else stops the promotion")
           (is (null bl.net::*hb-announcing-peers*)
               "replaying our own tip as a cmpctblock must not buy an HB slot")
-          (is (null (bl.net::peer-compact-block-high-bandwidth-to b)))))
+          (is (null (bl.net:peer-compact-block-high-bandwidth-to b)))))
        ;;; --- full block (handle-block) ---------------------------------
        (let ((b2 (%g716-mine-on node spk)))
          (%g716-with-fresh-hb
@@ -1439,11 +1439,11 @@ same path must promote."
             (bl.net::handle-block d (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store :mempool mp))
             (is (= 2 (bl.store:current-height cs))
                 "the replay connected nothing")
-            (is (eq :ready (bl.net::peer-state d))
+            (is (eq :ready (bl.net:peer-state d))
                 "the replayer is NOT punished")
             (is (null bl.net::*hb-announcing-peers*)
                 "replaying our own tip as a full block must not buy an HB slot")
-            (is (null (bl.net::peer-compact-block-high-bandwidth-to d))))))
+            (is (null (bl.net:peer-compact-block-high-bandwidth-to d))))))
        ;;; --- blocktxn completion ---------------------------------------
        (let* ((b3 (%g716-mine-on node spk))
               (txs (bl.ser:bitcoin-block-transactions b3)))
@@ -1459,11 +1459,11 @@ same path must promote."
             (%g716-blocktxn-deliver f b3 txs cs utxo store mp)
             (is (= 3 (bl.store:current-height cs))
                 "the replay connected nothing")
-            (is (eq :ready (bl.net::peer-state f))
+            (is (eq :ready (bl.net:peer-state f))
                 "the replayer is NOT punished")
             (is (null bl.net::*hb-announcing-peers*)
                 "replaying our own tip as a blocktxn completion must not buy an HB slot")
-            (is (null (bl.net::peer-compact-block-high-bandwidth-to
+            (is (null (bl.net:peer-compact-block-high-bandwidth-to
                        f))))))))))
 
 (test g7-16-side-branch-block-earns-no-hb-promotion
@@ -1475,10 +1475,10 @@ addressable by any dedup guard — the block is genuinely new to us — so it pi
 the connection gate on its own."
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "g716-side"))
-          (cs (bl::node-chain-state node))
-          (utxo (bl::node-utxo-set node))
-          (store (bl::node-block-store node))
-          (mp (bl::node-mempool node))
+          (cs (bl:node-chain-state node))
+          (utxo (bl:node-utxo-set node))
+          (store (bl:node-block-store node))
+          (mp (bl:node-mempool node))
           ;; Two SIBLINGS assembled on genesis before either is connected:
           ;; equal work, so the second is stored and first-seen wins.
           (main (%g716-mine-on node (p2sh-optrue-script-pubkey)))
@@ -1504,9 +1504,9 @@ the connection gate on its own."
                     cs (%g716-block-hash sibling))
                    "...but the side block WAS accepted and stored — this is the
 valid-yet-unconnected case, not a rejection")
-          (is (eq :ready (bl.net::peer-state b))
+          (is (eq :ready (bl.net:peer-state b))
               "storing a side branch is not misbehaviour")
           (is (null bl.net::*hb-announcing-peers*)
               "a stored-but-unconnected block must not earn high bandwidth")
-          (is (null (bl.net::peer-compact-block-high-bandwidth-to
+          (is (null (bl.net:peer-compact-block-high-bandwidth-to
                      b)))))))))

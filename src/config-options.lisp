@@ -275,16 +275,16 @@
 ;; -dustrelayfee: BTC/kvB below which an output is dust (Core
 ;; DUST_RELAY_TX_FEE). Relay policy, not consensus, which is why the value it
 ;; sets is a DEFPARAMETER rather than a DEFCONSTANT.
-(define-option "dustrelayfee" :type :money :global bl.val::+dust-relay-fee-rate+)
+(define-option "dustrelayfee" :type :money :global bl.val:+dust-relay-fee-rate+)
 ;; -incrementalrelayfee: BTC/kvB a replacement must beat the original by
 ;; (Core DEFAULT_INCREMENTAL_RELAY_FEE).
-(define-option "incrementalrelayfee" :type :money :global bl.mp::+incremental-relay-fee-rate+)
+(define-option "incrementalrelayfee" :type :money :global bl.mp:+incremental-relay-fee-rate+)
 ;; -bytespersigop: equivalent bytes charged per weighted sigop (Core
 ;; DEFAULT_BYTES_PER_SIGOP, policy.h:49).
-(define-option "bytespersigop" :type :int :min 1 :global bl.mp::+bytes-per-sigop+)
+(define-option "bytespersigop" :type :int :min 1 :global bl.mp:+bytes-per-sigop+)
 ;; -maxtipage: how old the tip may be before the node still calls itself in
 ;; IBD (Core DEFAULT_MAX_TIP_AGE, kernel/chainstatemanager_opts.h:24).
-(define-option "maxtipage" :type :int :min 0 :global bl.net::+max-tip-age-seconds+)
+(define-option "maxtipage" :type :int :min 0 :global bl.net:+max-tip-age-seconds+)
 ;; -maxsigcachesize: MiB of signature cache (Core's knob is bytes split
 ;; across two caches; ours is one, counted in ENTRIES). A cache entry is a
 ;; 32-byte key, which is what Core's CuckooCache element is too, so the
@@ -293,7 +293,7 @@
 ;; than a promise about memory.
 (define-option "maxsigcachesize" :type :int :min 1
   :apply (lambda (n)
-           (setf bl.interop::+signature-cache-max-entries+
+           (setf bl.interop:+signature-cache-max-entries+
                  (max 1 (floor (* n 1024 1024) 32)))))
 ;; -fastprune: tiny block files so a pruning test can produce many of them
 ;; without mining a real chain (Core blockstorage.cpp:857-862). Test-only.
@@ -307,11 +307,11 @@
 ;; is in KILOBYTES and it multiplies by 1000, not 1024 (init.cpp:2105,
 ;; DEFAULT_MAXSENDBUFFER = 1000 -> 1,000,000 bytes).
 (define-option "maxsendbuffer" :type :int :min 1
-  :apply (lambda (n) (setf bl.net::+max-send-buffer-bytes+ (* n 1000))))
+  :apply (lambda (n) (setf bl.net:+max-send-buffer-bytes+ (* n 1000))))
 ;; -maxuploadtarget: the 24h outbound budget. Core parses it with
 ;; ParseByteUnits defaulting to M, so a bare number is MEBIbytes -- reading it
 ;; as bytes would silence the option on every ordinary command line.
-(define-option "maxuploadtarget" :type :byte-units :global bl.net::*max-upload-target*)
+(define-option "maxuploadtarget" :type :byte-units :global bl.net:*max-upload-target*)
 ;; RPC server and wallet knobs, read by name in START-NODE-FROM-ARGS.
 (define-option "rpccookiefile")
 (define-option "rpccookieperms")
@@ -346,7 +346,7 @@
            (when (and accept (member *network* '(:mainnet)))
              (config-error "acceptnonstdtxn is not currently supported for ~(~A~) chain"
                     *network*))
-           (setf bl.val::*require-standard* (not accept))))
+           (setf bl.val:*require-standard* (not accept))))
 ;; -par: how many script-check worker threads. Core's semantics -- 0 means
 ;; one per core, a NEGATIVE value leaves that many cores free, and the
 ;; result is clamped to MAX_SCRIPTCHECK_THREADS. Reading the negative form
@@ -354,13 +354,13 @@
 ;; to leave headroom on.
 (define-option "par" :type :int
   :apply (lambda (v)
-           (let ((n (bl.val::parse-par-threads v)))
-             (setf bl.val::+parallel-validation-workers+ n)
+           (let ((n (bl.val:parse-par-threads v)))
+             (setf bl.val:+parallel-validation-workers+ n)
              ;; Core: -par=1 means no extra threads at all.
              (setf *parallel-block-validation* (> n 1)))))
 ;; -whitelistrelay / -whitelistforcerelay (Core net_permissions.h:20-22).
-(define-option "whitelistrelay" :type :bool :global bl.net::*whitelist-relay*)
-(define-option "whitelistforcerelay" :type :bool :global bl.net::*whitelist-force-relay*)
+(define-option "whitelistrelay" :type :bool :global bl.net:*whitelist-relay*)
+(define-option "whitelistforcerelay" :type :bool :global bl.net:*whitelist-force-relay*)
 ;; -stopatheight: shut down once the tip reaches this height (Core
 ;; kernel_notifications.cpp:61-66).
 (define-option "stopatheight" :type :int :global *stop-at-height*)

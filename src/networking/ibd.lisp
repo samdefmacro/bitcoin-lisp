@@ -955,7 +955,7 @@ Walks the header chain and adds block hashes to the pending queue."
                             (not (gethash hash pending)))
                    (setf (gethash hash pending) height)
                    (incf queued))))
-             (bl.store::chain-state-block-index chain-state))
+             (bl.store:chain-state-block-index chain-state))
     queued))
 
 (defun queue-historical-blocks (historical-chainstate)
@@ -1962,7 +1962,7 @@ Asking a peer for headers here returns zero and costs a full round trip."
                             (> (bl.store:block-index-entry-chain-work entry)
                                best-header-work))
                    (setf best-header-work (bl.store:block-index-entry-chain-work entry))))
-               (bl.store::chain-state-block-index chain-state))
+               (bl.store:chain-state-block-index chain-state))
       (setf (ibd-context-header-tip-height ctx) best-header-height
             (ibd-context-best-header-work ctx) best-header-work))
 
@@ -2257,7 +2257,7 @@ Asking a peer for headers here returns zero and costs a full round trip."
                (when (> (bl.store:block-index-entry-height entry) best-height)
                  (setf best-height (bl.store:block-index-entry-height entry))
                  (setf best-entry entry)))
-             (bl.store::chain-state-block-index chain-state))
+             (bl.store:chain-state-block-index chain-state))
     best-entry))
 
 (defun %locator-from-entry (entry chain-state)

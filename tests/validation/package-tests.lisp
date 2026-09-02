@@ -263,7 +263,7 @@ OUT-VALUE to one P2SH(OP_TRUE) output."
 
 (test rpc-submitpackage-cpfp-shape
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
-    (let* ((node (bl::make-node :network :testnet3))
+    (let* ((node (bl:make-node :network :testnet3))
            (parent (%pkg-tx funding-txid 0 (- 100000000 50)))
            (pid (bl.ser:transaction-hash parent))
            (child (%pkg-tx pid 0 (- (- 100000000 50) 50000)))
@@ -271,9 +271,9 @@ OUT-VALUE to one P2SH(OP_TRUE) output."
                   (bl.ser:serialize-transaction parent)))
            (chex (bl.crypto:bytes-to-hex
                   (bl.ser:serialize-transaction child))))
-      (setf (bl::node-chain-state node) chain-state
-            (bl::node-utxo-set node) utxo-set
-            (bl::node-mempool node) mempool)
+      (setf (bl:node-chain-state node) chain-state
+            (bl:node-utxo-set node) utxo-set
+            (bl:node-mempool node) mempool)
       (let* ((result (bl.rpc::rpc-submitpackage node (list (list phex chex))))
              (msg (cdr (assoc "package_msg" result :test #'string=)))
              (tx-results (cdr (assoc "tx-results" result :test #'string=))))
@@ -290,7 +290,7 @@ unbroadcast set: they are already in the pool when broadcast runs, so
 Core's already-in-mempool branch (node/transaction.cpp:63-72) relays
 without AddUnbroadcastTx — matched exactly."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
-    (let* ((node (bl::make-node :network :testnet3))
+    (let* ((node (bl:make-node :network :testnet3))
            (peer (bl.net:make-peer :state :ready))
            (parent (%pkg-tx funding-txid 0 (- 100000000 50)))
            (pid (bl.ser:transaction-hash parent))
@@ -299,14 +299,14 @@ without AddUnbroadcastTx — matched exactly."
                   (bl.ser:serialize-transaction parent)))
            (chex (bl.crypto:bytes-to-hex
                   (bl.ser:serialize-transaction child))))
-      (setf (bl::node-chain-state node) chain-state
-            (bl::node-utxo-set node) utxo-set
-            (bl::node-mempool node) mempool
-            (bl::node-peers node) (list peer))
+      (setf (bl:node-chain-state node) chain-state
+            (bl:node-utxo-set node) utxo-set
+            (bl:node-mempool node) mempool
+            (bl:node-peers node) (list peer))
       (let ((result (bl.rpc::rpc-submitpackage node (list (list phex chex)))))
         (is (string= "success" (cdr (assoc "package_msg" result :test #'string=)))))
       ;; Both members queued for announcement to the relay peer.
-      (let ((queued (bl.net::peer-tx-inv-queue peer)))
+      (let ((queued (bl.net:peer-tx-inv-queue peer)))
         (is (= 2 (length queued)))
         (is-true (find pid queued :key #'first :test #'equalp))
         (is-true (find (bl.ser:transaction-hash child)

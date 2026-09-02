@@ -210,11 +210,11 @@ Returns (VALUES chain-state entries) with ENTRIES ascending (genesis first)."
 
 (defun %make-test-peer-address (a b c d port)
   (bl.net:make-peer-address
-   :ip (bl.net::ipv4-to-mapped-ipv6 a b c d)
+   :ip (bl.net:ipv4-to-mapped-ipv6 a b c d)
    :port port :services 1 :last-seen 1700000000))
 
 (test getaddr-only-once-and-inbound-only
-  (let ((bl::*node* nil))    ; book resolves to NIL: gating only, no send
+  (let ((bl:*node* nil))    ; book resolves to NIL: gating only, no send
     ;; Outbound peer: never marked as answered.
     (let ((outbound (bl.net:make-peer :inbound nil)))
       (bl.net::handle-getaddr outbound #() (bl.ctx:make-node-context))
@@ -320,7 +320,7 @@ these tests never assert an exact count (a standing rule in this project)."
     (dotimes (i n)
       (bl.net:address-book-add
        book (bl.net:make-peer-address
-             :ip (bl.net::ipv4-to-mapped-ipv6
+             :ip (bl.net:ipv4-to-mapped-ipv6
                   203 (mod i 250) (floor i 250) 7)
              :port (+ 18333 i) :services 1 :last-seen now)))
     book))
@@ -377,7 +377,7 @@ fingerprinting signal the cache exists to erase. The visible consequence is
 that a banned address keeps being gossiped for up to 27h. That is
 Core-identical and intended, so it is asserted here rather than 'fixed'."
   (bl.net::clear-addr-response-caches)
-  (bl.net::clear-discouraged)
+  (bl.net:clear-discouraged)
   (let* ((book (%g720-book 40))
          (now 1700000000)
          (filled (bl.net::cached-getaddr-response book :ipv4 now)))
@@ -395,7 +395,7 @@ Core-identical and intended, so it is asserted here rather than 'fixed'."
                       (string= victim (bl.net:peer-address-string pa)))
                     refilled)
             "a refill must apply the ban/discourage filter"))
-      (bl.net::clear-discouraged))))
+      (bl.net:clear-discouraged))))
 
 (test g7-20-getnodeaddresses-stays-uncached
   "Core's rpc/net.cpp:956 deliberately calls the UNCACHED GetAddressesUnsafe:
@@ -435,9 +435,9 @@ stored, where it would silently suppress every announcement to the peer."
         (ok (%message-payload (bl.ser:make-feefilter-message 1000)))
         (absurd (%message-payload (bl.ser:make-feefilter-message
                                    (1+ bl.val:+max-money+)))))
-    (bl.net::handle-message peer "feefilter" ok (bl.ctx:make-node-context))
+    (bl.net:handle-message peer "feefilter" ok (bl.ctx:make-node-context))
     (is (= 1000 (bl.net:peer-feefilter-rate peer)))
-    (bl.net::handle-message peer "feefilter" absurd (bl.ctx:make-node-context))
+    (bl.net:handle-message peer "feefilter" absurd (bl.ctx:make-node-context))
     (is (= 1000 (bl.net:peer-feefilter-rate peer)))))
 
 (test automatic-inbound-capacity-follows-core

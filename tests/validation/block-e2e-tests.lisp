@@ -185,14 +185,14 @@
 (test block-weight-single-coinbase
   "Block with single coinbase should have weight = 4 * tx_size + overhead."
   (let* ((coinbase (make-e2e-coinbase-tx))
-         (weight (bl.val::calculate-block-weight (list coinbase))))
+         (weight (bl.val:calculate-block-weight (list coinbase))))
     (is (plusp weight))
     (is (< weight 4000000))))  ; Well under limit
 
 (test block-subsidy-calculation
   "Block subsidy should halve every 210,000 blocks."
-  (is (= 5000000000 (bl.val::calculate-block-subsidy 0)))
-  (is (= 5000000000 (bl.val::calculate-block-subsidy 209999)))
-  (is (= 2500000000 (bl.val::calculate-block-subsidy 210000)))
-  (is (= 1250000000 (bl.val::calculate-block-subsidy 420000)))
-  (is (= 0 (bl.val::calculate-block-subsidy (* 64 210000)))))
+  (is (= 5000000000 (bl.val:calculate-block-subsidy 0)))
+  (is (= 5000000000 (bl.val:calculate-block-subsidy 209999)))
+  (is (= 2500000000 (bl.val:calculate-block-subsidy 210000)))
+  (is (= 1250000000 (bl.val:calculate-block-subsidy 420000)))
+  (is (= 0 (bl.val:calculate-block-subsidy (* 64 210000)))))

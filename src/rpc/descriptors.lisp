@@ -463,7 +463,7 @@ Every error message here is Core's, verbatim."
 
 ;;; --- Key expression printing (public form, Core's ToString) ---
 
-(defun %format-key-path (path apostrophe)
+(defun format-key-path (path apostrophe)
   (with-output-to-string (s)
     (dolist (i path)
       (format s "/~D" (logand i #x7fffffff))
@@ -484,7 +484,7 @@ used only for DescriptorID stability across versions)."
       (format nil "musig(~{~A~^,~})~A~A"
               (mapcar (lambda (p) (desc-key-string p style))
                       (desc-key-musig-participants key))
-              (%format-key-path (desc-key-path key)
+              (format-key-path (desc-key-path key)
                                 (if (eq style :compat) t (desc-key-apostrophe key)))
               (ecase (desc-key-derive key)
                 (:none "")
@@ -496,7 +496,7 @@ used only for DescriptorID stability across versions)."
      (if (desc-key-origin-fingerprint key)
          (format nil "[~A~A]"
                  (bl.crypto:bytes-to-hex (desc-key-origin-fingerprint key))
-                 (%format-key-path (desc-key-origin-path key) apostrophe))
+                 (format-key-path (desc-key-origin-path key) apostrophe))
          "")
      (if (desc-key-pubkey key)
          (bl.crypto:bytes-to-hex
@@ -505,7 +505,7 @@ used only for DescriptorID stability across versions)."
               (desc-key-pubkey key)))
          (bl.crypto:bip32-serialize (desc-key-extkey key)))
      (if (desc-key-extkey key)
-         (%format-key-path (desc-key-path key) apostrophe)
+         (format-key-path (desc-key-path key) apostrophe)
          "")
      (ecase (desc-key-derive key)
        (:none "")
@@ -540,7 +540,7 @@ same descriptor written two ways would be two different ADDRESSES."
          (pubkeys (mapcar (lambda (p) (%desc-key-pubkey-at p (if ranged pos 0)))
                           participants))
          (aggregate (bl.crypto:musig-aggregate-pubkeys
-                     (sort (copy-list pubkeys) #'%pubkey-lessp))))
+                     (sort (copy-list pubkeys) #'pubkey-lessp))))
     (unless aggregate
       (error 'descriptor-derivation-error))
     (if (and (null (desc-key-path key)) (eq (desc-key-derive key) :none))
@@ -898,7 +898,7 @@ rules, its legal fragments and its resource limits are all stated per context,
 which is why the context travels with the node rather than being assumed."
   (let* ((keys '())
          (node (handler-case
-                   (let ((bl.val::*ms-key-parser*
+                   (let ((bl.val:*ms-key-parser*
                            (lambda (text)
                              (let ((key (%with-desc-error-prefix
                                          "miniscript: "
@@ -912,13 +912,13 @@ which is why the context travels with the node rather than being assumed."
                                             network)))))
                                (push key keys)
                                key))))
-                     (bl.val::ms-parse expr :ctx ms-ctx))
+                     (bl.val:ms-parse expr :ctx ms-ctx))
                  ;; Not a miniscript expression at all -- a bare pubkey, say.
                  ;; Core only reports a miniscript error when the expression
                  ;; PARSED and then failed its rules (descriptor.cpp:2600);
                  ;; an unparseable one falls through to the generic message,
                  ;; which is far more useful for the common typo.
-                 (bl.val::miniscript-parse-error ()
+                 (bl.val:miniscript-parse-error ()
                    (%desc-error "A function is needed within ~A"
                                 (if (eq ms-ctx :tapscript) "P2TR" "P2WSH"))))))
     (%check-miniscript-sane node)
@@ -941,34 +941,34 @@ The branch ORDER is Core's and is load-bearing: malleability is reported ahead
 of the missing signature, and NeedsSignature is only ever blamed on the TOP
 node (`insane_node == &node.value()'), because a sub that needs no signature is
 fine as long as the whole expression does."
-  (let ((v (bl.val::ms-node-sane-p node))
-        (satisfiable (not (bl.val::ms-node-not-satisfiable-p node))))
+  (let ((v (bl.val:ms-node-sane-p node))
+        (satisfiable (not (bl.val:ms-node-not-satisfiable-p node))))
     (when (and v satisfiable)
       (return-from %check-miniscript-sane node))
-    (let* ((sub (bl.val::ms-find-insane-sub node))
+    (let* ((sub (bl.val:ms-find-insane-sub node))
            (blamed (or sub node))
-           (text (bl.val::ms-node-to-string
+           (text (bl.val:ms-node-to-string
                   blamed (lambda (k) (desc-key-string k :public)))))
       (%desc-error
        "~A"
        (concatenate
         'string text
         (cond
-          ((not (bl.val::ms-node-valid-p blamed)) " is invalid")
+          ((not (bl.val:ms-node-valid-p blamed)) " is invalid")
           ((not v)
            (concatenate
             'string " is not sane"
             (cond
-              ((not (bl.val::ms-node-non-malleable-p blamed))
+              ((not (bl.val:ms-node-non-malleable-p blamed))
                ": malleable witnesses exist")
               ((and (null sub)
-                    (not (bl.val::ms-node-needs-signature-p blamed)))
+                    (not (bl.val:ms-node-needs-signature-p blamed)))
                ": witnesses without signature exist")
-              ((bl.val::ms-node-timelock-mix-p blamed)
+              ((bl.val:ms-node-timelock-mix-p blamed)
                ": contains mixes of timelocks expressed in blocks and seconds")
-              ((bl.val::ms-node-duplicate-keys-p blamed)
+              ((bl.val:ms-node-duplicate-keys-p blamed)
                ": contains duplicate public keys")
-              ((not (bl.val::ms-node-valid-satisfactions-p blamed))
+              ((not (bl.val:ms-node-valid-satisfactions-p blamed))
                ": needs witnesses that may exceed resource limits")
               (t ""))))
           (t " is not satisfiable")))))))
@@ -1108,7 +1108,7 @@ by StringType, descriptor.cpp:909)."
     ;; private and normalized forms differ in exactly the way every other
     ;; descriptor's do.
     (:miniscript
-     (bl.val::ms-node-to-string (out-desc-node desc) keyfn))))
+     (bl.val:ms-node-to-string (out-desc-node desc) keyfn))))
 
 (defun tr-tree-string (tree render-leaf)
   "Re-emit a taproot script tree's braces from its depth sequence — the inverse
@@ -1229,7 +1229,7 @@ different leaf hash, a different merkle root and a different ADDRESS."
         (coerce (cons (length bytes) bytes)
                 '(vector (unsigned-byte 8))))))
 
-(defun %pubkey-lessp (a b)
+(defun pubkey-lessp (a b)
   "Lexicographic pubkey compare (CPubKey operator<; BIP67 sort order)."
   (loop for i below (min (length a) (length b))
         do (cond ((< (aref a i) (aref b i)) (return t))
@@ -1245,7 +1245,7 @@ different leaf hash, a different merkle root and a different ADDRESS."
                          pubkeys)
                  (list (%script-num (length pubkeys)) #(#xae)))))
 
-(defun %key-xonly-bytes (pubkey)
+(defun key-xonly-bytes (pubkey)
   "The 32-byte x-only form of a 33-byte compressed pubkey."
   (subseq pubkey 1 33))
 
@@ -1254,7 +1254,7 @@ different leaf hash, a different merkle root and a different ADDRESS."
 \(Core's m_xonly), the full 33/65-byte form everywhere else."
   (let ((pubkey (funcall keyfn (first (out-desc-keys desc)))))
     (if (out-desc-xonly-script-p desc)
-        (%key-xonly-bytes pubkey)
+        (key-xonly-bytes pubkey)
         pubkey)))
 
 (defun %script-multi-a (threshold xkeys)
@@ -1390,7 +1390,7 @@ and OP_CHECKSIG/OP_CHECKSIGADD each pop the signature from the TOP of the
 stack. The witness elements go on bottom-first, so x1 -- checked first --
 consumes the LAST element. A stack in key order spends nothing and, if it did,
 would spend it with the wrong signatures against the wrong keys."
-  (let ((xonly (mapcar #'%key-xonly-bytes pubkeys)))
+  (let ((xonly (mapcar #'key-xonly-bytes pubkeys)))
     ;; CASE and not ECASE: an unknown leaf kind is UNSATISFIABLE, which the
     ;; signer already reports, and not a type error surfacing as RPC -32603
     ;; in the middle of signing. This is also the single place the satisfiable
@@ -1410,7 +1410,7 @@ would spend it with the wrong signatures against the wrong keys."
               (when sig (list sig (first xonly)))))
       ((:multi-a :sortedmulti-a)
        (let* ((keys (if (eq (out-desc-kind leaf) :sortedmulti-a)
-                        (sort (copy-list xonly) #'%pubkey-lessp)
+                        (sort (copy-list xonly) #'pubkey-lessp)
                         xonly))
               (threshold (out-desc-threshold leaf))
               (empty (make-array 0 :element-type '(unsigned-byte 8)))
@@ -1435,7 +1435,7 @@ can never disagree, and the leaf hashes the tree was folded from are handed
 back rather than recomputed by the signer.
 
 PATHS is NIL unless TRACK-PATHS — see %TAPROOT-TREE."
-  (let* ((internal (%key-xonly-bytes (funcall keyfn (first (out-desc-keys desc)))))
+  (let* ((internal (key-xonly-bytes (funcall keyfn (first (out-desc-keys desc)))))
          (leaves (loop for entry in (out-desc-tree desc)
                        for script = (first (%out-desc-expand-1 (cdr entry) pos keyfn))
                        collect (cons script
@@ -1504,7 +1504,7 @@ resolving each key expression's pubkey via (KEYFN desc-key)."
     ((:multi :sortedmulti)
      (let ((pubkeys (mapcar keyfn (out-desc-keys desc))))
        (when (eq (out-desc-kind desc) :sortedmulti)
-         (setf pubkeys (sort (copy-list pubkeys) #'%pubkey-lessp)))
+         (setf pubkeys (sort (copy-list pubkeys) #'pubkey-lessp)))
        (list (%script-multisig (out-desc-threshold desc) pubkeys))))
     (:sh (list (%script-p2sh (first (%out-desc-expand-1 (out-desc-sub desc) pos keyfn)))))
     (:wsh (list (%script-p2wsh (first (%out-desc-expand-1 (out-desc-sub desc) pos keyfn)))))
@@ -1513,18 +1513,18 @@ resolving each key expression's pubkey via (KEYFN desc-key)."
     ;; (descriptor.cpp:1325-1337). sortedmulti_a sorts the X-ONLY keys, after
     ;; the conversion, not the 33-byte forms.
     ((:multi-a :sortedmulti-a)
-     (let ((xkeys (mapcar (lambda (k) (%key-xonly-bytes (funcall keyfn k)))
+     (let ((xkeys (mapcar (lambda (k) (key-xonly-bytes (funcall keyfn k)))
                           (out-desc-keys desc))))
        (when (eq (out-desc-kind desc) :sortedmulti-a)
-         (setf xkeys (sort (copy-list xkeys) #'%pubkey-lessp)))
+         (setf xkeys (sort (copy-list xkeys) #'pubkey-lessp)))
        (list (%script-multi-a (out-desc-threshold desc) xkeys))))
     (:rawtr
-     (list (%script-p2tr (%key-xonly-bytes
+     (list (%script-p2tr (key-xonly-bytes
                           (funcall keyfn (first (out-desc-keys desc)))))))
     (:miniscript
      ;; One parsed node, a different script per range index: the converter is
      ;; what turns each key expression into the pubkey for THIS position.
-     (list (bl.val::ms-node-script
+     (list (bl.val:ms-node-script
             (out-desc-node desc) nil keyfn)))))
 
 (defun %out-desc-expand-uncached (desc pos)
@@ -1666,7 +1666,7 @@ which the wallet stores the root private key."
   (bl.crypto:hash160
    (bl.crypto:ext-key-public-bytes (desc-key-extkey key))))
 
-(defun %desc-key-root-xprv (key privkey-provider)
+(defun desc-key-root-xprv (key privkey-provider)
   "The root extended PRIVATE key for a BIP32 key expression, or NIL. Prefers
 the xprv embedded at parse time; otherwise reconstructs it from the 32-byte
 secret PRIVKEY-PROVIDER returns for the root pubkey's keyid (Core
@@ -1717,7 +1717,7 @@ derived / last-hardened xpubs exactly as Core caches them."
                                         (bl.crypto:bip32-derive-child p pos)
                                         p)))))))
           (hardened-p
-           (let ((xprv (%desc-key-root-xprv key privkey-provider)))
+           (let ((xprv (desc-key-root-xprv key privkey-provider)))
              (unless xprv (error 'descriptor-derivation-error))
              (let ((k xprv) (lh nil))
                (dolist (entry path)
@@ -1801,7 +1801,7 @@ descriptor-derivation-error when required private keys are unavailable."
 ;;; --- Private / normalized descriptor strings (Core ToPrivateString /
 ;;; ToNormalizedString) ---
 
-(defun %desc-key-privkey-for (key privkey-provider)
+(defun desc-key-privkey-for (key privkey-provider)
   "The (values priv32 compressed-p) for a const-pubkey KEY, from the parse
 itself or PRIVKEY-PROVIDER. X-only keys try both parities (Core
 XOnlyPubKey::GetKeyIDs)."
@@ -1831,12 +1831,12 @@ returned with HAS-PRIV-P nil."
                     (format nil "[~A~A]"
                             (bl.crypto:bytes-to-hex
                              (desc-key-origin-fingerprint key))
-                            (%format-key-path (desc-key-origin-path key)
+                            (format-key-path (desc-key-origin-path key)
                                               (desc-key-apostrophe key)))
                     "")))
     (if (desc-key-pubkey key)
         (multiple-value-bind (priv compressed)
-            (%desc-key-privkey-for key privkey-provider)
+            (desc-key-privkey-for key privkey-provider)
           (if priv
               (values (concatenate 'string origin
                                    (bl.crypto:private-key-to-wif
@@ -1845,12 +1845,12 @@ returned with HAS-PRIV-P nil."
                                     :compressed compressed))
                       t)
               (values (desc-key-string key) nil)))
-        (let ((xprv (%desc-key-root-xprv key privkey-provider)))
+        (let ((xprv (desc-key-root-xprv key privkey-provider)))
           (if xprv
               (values (concatenate
                        'string origin
                        (bl.crypto:bip32-serialize xprv)
-                       (%format-key-path (desc-key-path key)
+                       (format-key-path (desc-key-path key)
                                          (desc-key-apostrophe key))
                        (ecase (desc-key-derive key)
                          (:none "")
@@ -1873,7 +1873,7 @@ entry and no private key)."
                (let ((origin (format nil "~A~A"
                                      (bl.crypto:bytes-to-hex
                                       (desc-key-origin-fingerprint key))
-                                     (%format-key-path (desc-key-origin-path key) nil))))
+                                     (format-key-path (desc-key-origin-path key) nil))))
                  (if (and (plusp (length sub)) (char= (char sub 0) #\[))
                      ;; strip "[" + 8-char fingerprint from SUB, keep its path
                      (concatenate 'string "[" origin (subseq sub 9))
@@ -1888,7 +1888,7 @@ entry and no private key)."
        (values (wrap-origin
                 (concatenate 'string
                              (bl.crypto:bip32-serialize (desc-key-extkey key))
-                             (%format-key-path (desc-key-path key) nil)
+                             (format-key-path (desc-key-path key) nil)
                              "/*h"))
                t))
       (t
@@ -1902,7 +1902,7 @@ entry and no private key)."
                     (end-path (subseq path (1+ last-hardened-pos)))
                     (fingerprint (subseq (%desc-key-root-keyid key) 0 4))
                     (xpub (or (and cache (descriptor-cache-last-hardened cache expr-index))
-                              (let ((xprv (%desc-key-root-xprv key privkey-provider)))
+                              (let ((xprv (desc-key-root-xprv key privkey-provider)))
                                 (when xprv
                                   (let ((k xprv))
                                     (dolist (entry origin-path
@@ -1915,9 +1915,9 @@ entry and no private key)."
                             (concatenate
                              'string
                              "[" (bl.crypto:bytes-to-hex fingerprint)
-                             (%format-key-path origin-path nil) "]"
+                             (format-key-path origin-path nil) "]"
                              (bl.crypto:bip32-serialize xpub)
-                             (%format-key-path end-path nil)
+                             (format-key-path end-path nil)
                              (if (eq (desc-key-derive key) :unhardened) "/*" "")))
                            t)))))))))
 
@@ -1956,7 +1956,7 @@ prints its private form when available, its public form otherwise. Returns
   (error 'rpc-error :code +rpc-invalid-parameter+
                     :message (apply #'format nil fmt args)))
 
-(defun %parse-descriptor-range (value)
+(defun parse-descriptor-range (value)
   "Parse a deriveaddresses/scan range parameter: N means [0,N]; or [begin,end].
 Returns (values begin end); Core's ParseRange + ParseDescriptorRange checks."
   (multiple-value-bind (low high)
@@ -2010,7 +2010,7 @@ ranged descriptors, [0,0] for unranged."
             (t (error 'rpc-error :code +rpc-invalid-parameter+
                                  :message "Scan object needs to be either a string or an object")))
     (multiple-value-bind (low high)
-        (if range (%parse-descriptor-range range) (values 0 1000))
+        (if range (parse-descriptor-range range) (values 0 1000))
       (let* ((desc (parse-descriptor desc-str network))
              (canonical (descriptor-add-checksum (out-desc-string desc))))
         (unless (out-desc-ranged-p desc)
@@ -2037,7 +2037,7 @@ mapping each expanded script (byte vector) to its canonical descriptor
 
 ;;; --- Script -> address / inferred descriptor ---
 
-(defun %script->address (script network)
+(defun script->address (script network)
   "Address string for a standard scriptPubKey SCRIPT, or NIL if the script
 has no address representation (raw/pk/bare-multisig). Inverse of the
 encoders in crypto/address.lisp."
@@ -2074,7 +2074,7 @@ encoders in crypto/address.lisp."
 addressable script infers to addr(<address>), anything else to raw(<hex>), each
 with the appended descriptor checksum. This is the `desc` field on decoded
 outputs (gettxout, decoderawtransaction, getblock verbosity 2, decodescript)."
-  (let ((addr (%script->address script network)))
+  (let ((addr (script->address script network)))
     (descriptor-add-checksum
      (if addr
          (format nil "addr(~A)" addr)
@@ -2135,7 +2135,7 @@ rejected for unranged ones; combo() P2PK scripts are skipped like Core."
   "The single-descriptor half of DERIVEADDRESSES: DESC-STR's addresses over
 RANGE, as a list."
   (multiple-value-bind (low high)
-      (if range-given (%parse-descriptor-range range) (values 0 0))
+      (if range-given (parse-descriptor-range range) (values 0 0))
     (let ((desc (parse-descriptor desc-str network :require-checksum require-checksum)))
         (when (and (not (out-desc-ranged-p desc)) range-given)
           (error 'rpc-error :code +rpc-invalid-parameter+
@@ -2151,7 +2151,7 @@ RANGE, as a list."
                                            :code +rpc-invalid-address-or-key+
                                            :message "Cannot derive script without private keys")))))
                    (dolist (script scripts)
-                     (let ((addr (%script->address script network)))
+                     (let ((addr (script->address script network)))
                        (cond (addr (push addr addresses))
                              ;; combo() emits P2PK; Core skips it rather than
                              ;; failing when other scripts have addresses.

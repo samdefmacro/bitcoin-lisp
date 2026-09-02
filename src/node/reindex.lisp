@@ -53,7 +53,7 @@ a crash loaded it silently over garbage."
       ;; and resolved by recover-inconsistent-chainstate's genesis branch
       ;; (re-wipe + clear), never loaded as clean state over a gutted set.
       (bl.store:update-chain-tip
-       cs (bl.store::chain-state-genesis-hash cs) 0)
+       cs (bl.store:chain-state-genesis-hash cs) 0)
       (bl.store:save-state cs :in-transition t)
       ;; Empty the coins view.
       (let ((erased (bl.store:coins-view-cache-wipe utxo)))

@@ -96,7 +96,7 @@ process RNG. Without the call the node runs on SBCL's build-time stream."
     (unwind-protect
          ;; init-node also assigns the network globals; bind them so this test
          ;; hands the suite back exactly the environment it found.
-         (let* ((bl::*network* bl::*network*)
+         (let* ((bl:*network* bl:*network*)
                 (bl.store:*pow-limit-target* bl.store:*pow-limit-target*)
                 (bl.ser:*network-magic* bl.ser:*network-magic*)
                 (bl.net:*current-port* bl.net:*current-port*)
@@ -105,7 +105,7 @@ process RNG. Without the call the node runs on SBCL's build-time stream."
                 (would-have (%entropy-draws 8 (sb-ext:seed-random-state 424242)))
                 (*random-state* (sb-ext:seed-random-state 424242))
                 (node (bl::init-node dir :network :regtest)))
-           (is-true (bl::node-p node))
+           (is-true (bl:node-p node))
            (is-true (integerp bl::*random-state-seed*)
                     "init-node left *random-state-seed* ~S: it never seeded the RNG"
                     bl::*random-state-seed*)

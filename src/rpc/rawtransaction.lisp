@@ -235,7 +235,7 @@ all of them silently:
 
 ;;; --- signrawtransactionwithkey (non-wallet, P2PKH + P2WPKH) ---
 
-(defun %parse-sighash-type (s)
+(defun parse-sighash-type (s)
   "Map a sighashtype string (default \"ALL\") to its byte: ALL=1 NONE=2 SINGLE=3,
 with |ANYONECANPAY setting 0x80."
   (let* ((str (string-upcase (or s "ALL")))
@@ -247,7 +247,7 @@ with |ANYONECANPAY setting 0x80."
                                           :message "Invalid sighashtype")))))
     (logior base (if acp #x80 0))))
 
-(defun %parse-multisig (script)
+(defun parse-multisig (script)
   "If SCRIPT is a bare multisig (OP_m <pubkey>...<pubkey> OP_n OP_CHECKMULTISIG),
 return (values m n pubkeys) — pubkeys a list of the n 33/65-byte key vectors in
 order; else NIL."
@@ -262,9 +262,9 @@ order; else NIL."
                   while (< i (- len 2))
                   do (let ((plen (aref script i)))
                        (unless (or (= plen 33) (= plen 65))
-                         (return-from %parse-multisig nil))
+                         (return-from parse-multisig nil))
                        (when (> (+ i 1 plen) (- len 2))
-                         (return-from %parse-multisig nil))
+                         (return-from parse-multisig nil))
                        (push (subseq script (1+ i) (+ i 1 plen)) pubkeys)
                        (incf i (+ 1 plen))))
             (when (and (= i (- len 2)) (= (length pubkeys) n))
@@ -289,15 +289,15 @@ signer therefore records at most M partial sigs per multisig input."
 
 ;;; --- Per-input signing split into (compute signatures) + (finalize) ---
 ;;;
-;;; %sign-tx-inputs historically both computed each input's signature(s) AND
+;;; sign-tx-inputs historically both computed each input's signature(s) AND
 ;;; finalized them into scriptSig/witness in one pass. Wallet P5's PSBT signer
 ;;; needs the FIRST half alone (record partial sigs without finalizing), so the
-;;; per-input work is factored into %compute-input-signatures (the funds-critical
+;;; per-input work is factored into compute-input-signatures (the funds-critical
 ;;; sighash + sign dispatch) and %finalize-input-signatures (assembly). The spend
 ;;; path still runs both back-to-back and its output is byte-identical.
 
 (defstruct (input-sig (:constructor %make-input-sig))
-  "Signature material for one input, produced by %compute-input-signatures
+  "Signature material for one input, produced by compute-input-signatures
 without finalizing. KIND selects the finalize shape; ECDSA is an ordered list of
 (pubkey . sig) pairs (sig = DER || sighash-byte); TAP is a taproot key-path
 signature; NEEDED is the m-of-n threshold finalize enforces (1 for single-key);
@@ -350,8 +350,8 @@ the caller -- the sighash commits to all of them."
                  ;; "no codeseparator executed" -- our tapscript leaves contain
                  ;; none, and a leaf that did would need the position it
                  ;; actually reached at execution time.
-                 (bl.interop::*tapscript-codesep-pos* #xFFFFFFFF)
-                 (sighash (bl.interop::compute-bip341-sighash
+                 (bl.interop:*tapscript-codesep-pos* #xFFFFFFFF)
+                 (sighash (bl.interop:compute-bip341-sighash
                            amount tap-sighash-type leaf-hash 0)))
             (when sighash
               (let ((satisfaction
@@ -382,13 +382,13 @@ the caller -- the sighash commits to all of them."
                             best-sigs (reverse signed-by)))))))))))
     (values best best-sigs best-leaf)))
 
-(defun %compute-input-signatures (tx i prev keymap pubmap tr-keymap sighash-byte
+(defun compute-input-signatures (tx i prev keymap pubmap tr-keymap sighash-byte
                                   precomp spent-utxos &optional (tap-sighash-type #x00)
                                                                 tr-scripts)
   "Compute the signature material for input I of TX spending PREV
 = (script-pubkey amount redeem witness-script), using the key maps. Returns
 (values input-sig error-string): the funds-critical sighash + sign dispatch
-shared by the in-place spend signer (%sign-tx-inputs, which then finalizes) and
+shared by the in-place spend signer (sign-tx-inputs, which then finalizes) and
 the PSBT signer (which records the partial sigs). It never applies the m-of-n
 completeness threshold — %finalize-input-signatures does — so the PSBT signer can
 record the partial sigs it managed to produce. TAP-SIGHASH-TYPE is the taproot
@@ -397,39 +397,39 @@ historical DEFAULT-only taproot signing). *current-tx* / *current-spent-utxos*
 must be bound by the caller."
   (let* ((spk (first prev)) (amount (second prev))
          (redeem (third prev)) (witness-script (fourth prev))
-         (type (%script-type spk))
-         (bl.interop::*current-input-index* i)
-         (bl.interop::*precomputed-sighash* precomp))
+         (type (script-type spk))
+         (bl.interop:*current-input-index* i)
+         (bl.interop:*precomputed-sighash* precomp))
     (macrolet ((fail (msg)
-                 `(return-from %compute-input-signatures (values nil ,msg))))
+                 `(return-from compute-input-signatures (values nil ,msg))))
       (labels ((legacy-sig (subscript key)
                  (concatenate '(vector (unsigned-byte 8))
                               (bl.crypto:sign-ecdsa
-                               key (bl.interop::compute-legacy-sighash
+                               key (bl.interop:compute-legacy-sighash
                                     tx i subscript sighash-byte))
                               (vector sighash-byte)))
                (bip143-sig (script-code key)
                  (concatenate '(vector (unsigned-byte 8))
                               (bl.crypto:sign-ecdsa
-                               key (bl.interop::compute-bip143-sighash
+                               key (bl.interop:compute-bip143-sighash
                                     script-code amount sighash-byte))
                               (vector sighash-byte)))
                (p2wpkh-scriptcode (pkh)
                  (concatenate '(vector (unsigned-byte 8))
                               (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
                (legacy-multisig (subscript)
-                 (multiple-value-bind (m nn pubkeys) (%parse-multisig subscript)
+                 (multiple-value-bind (m nn pubkeys) (parse-multisig subscript)
                    (declare (ignore nn))
                    (values (%collect-multisig-sig-pairs
-                            (bl.interop::compute-legacy-sighash
+                            (bl.interop:compute-legacy-sighash
                              tx i subscript sighash-byte)
                             pubmap pubkeys m sighash-byte)
                            m)))
                (bip143-multisig (witscript)
-                 (multiple-value-bind (m nn pubkeys) (%parse-multisig witscript)
+                 (multiple-value-bind (m nn pubkeys) (parse-multisig witscript)
                    (declare (ignore nn))
                    (values (%collect-multisig-sig-pairs
-                            (bl.interop::compute-bip143-sighash
+                            (bl.interop:compute-bip143-sighash
                              witscript amount sighash-byte)
                             pubmap pubkeys m sighash-byte)
                            m)))
@@ -444,12 +444,12 @@ must be bound by the caller."
                  ;; second value says a third party could rewrite the witness
                  ;; into another equally valid one, which changes the txid of a
                  ;; transaction already in flight.
-                 (let ((node (bl.val::ms-from-script witscript)))
+                 (let ((node (bl.val:ms-from-script witscript)))
                    (when node
                      (multiple-value-bind (stack malleable)
-                         (bl.val::ms-satisfy
+                         (bl.val:ms-satisfy
                           node
-                          (bl.val::make-ms-satisfier
+                          (bl.val:make-ms-satisfier
                            :sign-fn
                            (lambda (pubkey)
                              (let ((sk (gethash pubkey pubmap)))
@@ -457,9 +457,9 @@ must be bound by the caller."
                            ;; No preimage source exists on this path; a hash
                            ;; branch is simply unavailable rather than faked.
                            :check-older-fn
-                           (lambda (v) (bl.val::ms-check-older tx i v))
+                           (lambda (v) (bl.val:ms-check-older tx i v))
                            :check-after-fn
-                           (lambda (v) (bl.val::ms-check-after tx i v))))
+                           (lambda (v) (bl.val:ms-check-after tx i v))))
                        (and stack (not malleable) stack))))))
         (cond
           ((string= type "pubkeyhash")
@@ -490,7 +490,7 @@ must be bound by the caller."
                ;; (sign.cpp:558-608): a key-path spend is both cheaper and
                ;; smaller, and reveals nothing about the tree.
                (sk
-                (let ((sighash (bl.interop::compute-bip341-sighash
+                (let ((sighash (bl.interop:compute-bip341-sighash
                                 amount tap-sighash-type nil nil)))
                   ;; No sighash is defined for SIGHASH_SINGLE at an input
                   ;; index with no matching output. Signing the
@@ -533,7 +533,7 @@ must be bound by the caller."
                 ((not (equalp (bl.crypto:sha256 witness-script) (subseq redeem 2 34)))
                  (fail "witnessScript hash mismatch (P2SH-P2WSH)"))
                 ;; Not multisig: Core's fallback is miniscript, not a refusal.
-                ((not (%parse-multisig witness-script))
+                ((not (parse-multisig witness-script))
                  (cond
                    ((null amount) (fail "P2WSH requires amount"))
                    (t (let ((stack (miniscript-stack witness-script)))
@@ -547,7 +547,7 @@ must be bound by the caller."
                      (values (%make-input-sig :kind :p2sh-p2wsh :needed m :redeem redeem
                                               :witness-script witness-script :ecdsa pairs))))))
              ;; P2SH-multisig (legacy)
-             ((%parse-multisig redeem)
+             ((parse-multisig redeem)
               (multiple-value-bind (pairs m) (legacy-multisig redeem)
                 (values (%make-input-sig :kind :p2sh-multisig :needed m :redeem redeem
                                          :ecdsa pairs))))
@@ -558,7 +558,7 @@ must be bound by the caller."
              ((not (equalp (bl.crypto:sha256 witness-script) (subseq spk 2 34)))
               (fail "witnessScript hash mismatch"))
              ;; Not multisig: Core's fallback is miniscript, not a refusal.
-             ((not (%parse-multisig witness-script))
+             ((not (parse-multisig witness-script))
               (cond
                 ((null amount) (fail "P2WSH requires amount"))
                 (t (let ((stack (miniscript-stack witness-script)))
@@ -571,7 +571,7 @@ must be bound by the caller."
              (t (multiple-value-bind (pairs m) (bip143-multisig witness-script)
                   (values (%make-input-sig :kind :p2wsh :needed m
                                            :witness-script witness-script :ecdsa pairs))))))
-          ((%parse-multisig spk)   ; bare multisig
+          ((parse-multisig spk)   ; bare multisig
            (multiple-value-bind (pairs m) (legacy-multisig spk)
              (values (%make-input-sig :kind :multisig :needed m :ecdsa pairs))))
           (t (fail (format nil "unsupported scriptPubKey type ~A" type))))))))
@@ -582,7 +582,7 @@ byte-identical to the historical in-place signer's per-arm assembly. A NIL
 scriptsig leaves the input's scriptSig untouched; a NIL witness sets no witness.
 ERROR (a string) means the m-of-n threshold was not met — the same 'multisig
 needs N sigs, have K' report the old signer produced; single-key kinds never
-error here (a missing key already failed in %compute-input-signatures)."
+error here (a missing key already failed in compute-input-signatures)."
   (let ((empty (make-array 0 :element-type '(unsigned-byte 8))))
     (labels ((sigs () (mapcar #'cdr (input-sig-ecdsa sig)))
              (threshold-error (prefix)
@@ -644,7 +644,7 @@ error here (a missing key already failed in %compute-input-signatures)."
                                                      (list (bl.ser:script-push-data (input-sig-redeem sig)))))
                                       nil nil))))))))
 
-(defun %build-spent-utxos (inputs prevmap)
+(defun build-spent-utxos (inputs prevmap)
   "Vector of storage:utxo-entry for every input (the spent outputs, needed for the
 BIP341/taproot sighash which commits to all input amounts + scriptPubKeys), or NIL
 if any input lacks a prevout-with-amount."
@@ -657,13 +657,13 @@ if any input lacks a prevout-with-amount."
                                   (bl.ser:outpoint-index op))
                             prevmap)))
         (unless (and prev (second prev))
-          (return-from %build-spent-utxos nil))
+          (return-from build-spent-utxos nil))
         (setf (aref vec i)
               (bl.store:make-utxo-entry
                :value (second prev)
                :script-pubkey (coerce (first prev) '(simple-array (unsigned-byte 8) (*)))))))))
 
-(defun %sign-tx-inputs (tx prevmap keymap pubmap tr-keymap sighash-byte
+(defun sign-tx-inputs (tx prevmap keymap pubmap tr-keymap sighash-byte
                         &optional tr-scripts)
   "Sign every input of TX the key maps can satisfy, in place: scriptSigs are
 set on TX's inputs, witness stacks installed on TX (existing witness entries
@@ -687,10 +687,10 @@ Returns a list of (input-index . error-message), NIL when every input signed."
     ;; Precompute is built once for the whole tx; pass spent-utxos (all
     ;; inputs' outputs) so the BIP341 amount/scriptPubKey commitments are
     ;; available for taproot inputs.
-    (let* ((spent-utxos (%build-spent-utxos inputs prevmap))
-           (bl.interop::*current-tx* tx)
-           (bl.interop::*current-spent-utxos* spent-utxos)
-           (precomp (bl.interop::init-precomputed-sighash tx spent-utxos)))
+    (let* ((spent-utxos (build-spent-utxos inputs prevmap))
+           (bl.interop:*current-tx* tx)
+           (bl.interop:*current-spent-utxos* spent-utxos)
+           (precomp (bl.interop:init-precomputed-sighash tx spent-utxos)))
       (dotimes (i n)
         (let* ((in (aref inputs i))
                (op (bl.ser:tx-in-previous-output in))
@@ -703,7 +703,7 @@ Returns a list of (input-index . error-message), NIL when every input signed."
           (if (null prev)
               (push (cons i "no prevtx scriptPubKey provided") errors)
               (multiple-value-bind (sig err)
-                  (%compute-input-signatures tx i prev keymap pubmap tr-keymap
+                  (compute-input-signatures tx i prev keymap pubmap tr-keymap
                                              sighash-byte precomp spent-utxos
                                              #x00 tr-scripts)
                 (if err
@@ -755,9 +755,9 @@ amounts on ALL inputs; redeemScript for P2SH; witnessScript for P2WSH). P2TR sig
 with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
   (declare (ignore node))
   (let ((hexstring (first params))
-        (wifs (%positional-array (second params)))
-        (prevtxs (%positional-array (third params)))
-        (sighash-byte (%parse-sighash-type (fourth params))))
+        (wifs (positional-array (second params)))
+        (prevtxs (positional-array (third params)))
+        (sighash-byte (parse-sighash-type (fourth params))))
     (unless (stringp hexstring)
       (error 'rpc-error :code +rpc-deserialization-error+ :message "tx hex string required"))
     (unless (listp wifs)
@@ -793,12 +793,12 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
       ;; that), while every unit test passed by handing it alists. Same defect
       ;; and same fix as createrawtransaction's inputs in #491.
       (dolist (pt (and (listp prevtxs) prevtxs))
-        (let ((txid (%obj-get pt "txid"))
-              (vout (%obj-get pt "vout"))
-              (spk-hex (%obj-get pt "scriptPubKey"))
-              (amount (%obj-get pt "amount"))
-              (redeem-hex (%obj-get pt "redeemScript"))
-              (ws-hex (%obj-get pt "witnessScript")))
+        (let ((txid (obj-get pt "txid"))
+              (vout (obj-get pt "vout"))
+              (spk-hex (obj-get pt "scriptPubKey"))
+              (amount (obj-get pt "amount"))
+              (redeem-hex (obj-get pt "redeemScript"))
+              (ws-hex (obj-get pt "witnessScript")))
           (when (and (stringp txid) (valid-hex-hash-p txid) (integerp vout) (stringp spk-hex))
             (setf (gethash (cons (parse-hex-hash txid) vout) prevmap)
                   (list (bl.crypto:hex-to-bytes spk-hex)
@@ -806,7 +806,7 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
                         (when (stringp redeem-hex) (bl.crypto:hex-to-bytes redeem-hex))
                         (when (stringp ws-hex) (bl.crypto:hex-to-bytes ws-hex)))))))
       ;; Sign whatever the supplied keys can satisfy (shared machinery).
-      (let ((sign-errors (%sign-tx-inputs tx prevmap keymap pubmap tr-keymap
+      (let ((sign-errors (sign-tx-inputs tx prevmap keymap pubmap tr-keymap
                                           sighash-byte)))
         (let ((bytes (bl.ser:transaction-wire-bytes tx)))
           (append
@@ -820,7 +820,7 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
 
 (define-rpc "createrawtransaction" (node params)
   "Create an unsigned raw transaction."
-  (let ((inputs (%positional-array (first params)))
+  (let ((inputs (positional-array (first params)))
         (outputs (second params))
         (locktime (or (third params) 0))
         (network (rpc-get-network node)))
@@ -840,9 +840,9 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
     ;; docstring naming this exact split; it just had the wrong callers.
     (let ((tx-inputs
             (loop for inp in inputs
-                  for txid-str = (%obj-get inp "txid")
-                  for vout = (%obj-get inp "vout")
-                  for sequence = (or (%obj-get inp "sequence") #xffffffff)
+                  for txid-str = (obj-get inp "txid")
+                  for vout = (obj-get inp "vout")
+                  for sequence = (or (obj-get inp "sequence") #xffffffff)
                   do (unless (valid-hex-hash-p txid-str)
                        (error 'rpc-error :code +rpc-invalid-parameter+
                                          :message "Invalid input txid"))
@@ -871,7 +871,7 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
                       (bl.ser:make-tx-out
                        :value (recipient-amount r)
                        :script-pubkey (recipient-script r)))
-                    (%parse-outputs network outputs))))
+                    (parse-outputs network outputs))))
       ;; Create transaction
       (let ((tx (bl.ser:make-transaction
                  :version 2

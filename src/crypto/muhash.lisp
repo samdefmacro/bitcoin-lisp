@@ -32,7 +32,7 @@
     (declare (type (unsigned-byte 64) w))
     (dotimes (k n w) (setf w (logior w (ash (aref bytes (+ i k)) (* 8 k)))))))
 
-(defun %bytes-to-le-integer (bytes)
+(defun bytes-to-le-integer (bytes)
   "Interpret BYTES as an unsigned little-endian integer via a balanced
 divide-and-conquer combine of 8-byte words. The naive high-to-low
 (logior (ash acc 8) byte) loop is O(n^2) on the growing bignum, and even
@@ -55,7 +55,7 @@ per-UTXO on the coinstatsindex backfill (384-byte inputs, millions of calls)."
                                   (* 8 lo-bytes)))))))
       (if (zerop len) 0 (combine 0 len)))))
 
-(defun %le-integer-to-bytes (value n)
+(defun le-integer-to-bytes (value n)
   "Encode VALUE as N little-endian bytes (VALUE must fit in N bytes)."
   (ironclad:integer-to-octets value :big-endian nil :n-bits (* 8 n)))
 
@@ -103,9 +103,9 @@ reduce-on-multiply, so reducing here is equivalent and keeps values bounded.)"
          (keystream (make-array +muhash-byte-size+ :element-type '(unsigned-byte 8)))
          (cipher (make-chacha20 key)))
     (chacha20-keystream cipher keystream)
-    (mod (%bytes-to-le-integer keystream) +muhash-modulus+)))
+    (mod (bytes-to-le-integer keystream) +muhash-modulus+)))
 
-(defstruct (muhash (:constructor %make-muhash))
+(defstruct (muhash (:constructor make-muhash-raw))
   "A MuHash3072 accumulator, held as the fraction numerator/denominator mod the
 modulus (both default 1 = the empty set)."
   (numerator 1 :type integer)
@@ -114,8 +114,8 @@ modulus (both default 1 = the empty set)."
 (defun make-muhash (&optional data)
   "An empty MuHash, or a singleton containing the one element DATA."
   (if data
-      (%make-muhash :numerator (muhash-element-num data))
-      (%make-muhash)))
+      (make-muhash-raw :numerator (muhash-element-num data))
+      (make-muhash-raw)))
 
 (defun muhash-insert (mu data)
   "Add element DATA to the set (multiply it into the numerator)."
@@ -153,4 +153,4 @@ SHA256 of the 384-byte little-endian encoding of numerator * denominator^-1
 mod the modulus. Does not modify MU."
   (let* ((value (%muhash-mulmod (muhash-numerator mu)
                                 (%mod-inverse (muhash-denominator mu) +muhash-modulus+))))
-    (sha256 (%le-integer-to-bytes value +muhash-byte-size+))))
+    (sha256 (le-integer-to-bytes value +muhash-byte-size+))))

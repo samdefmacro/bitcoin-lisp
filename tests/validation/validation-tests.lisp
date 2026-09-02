@@ -219,29 +219,29 @@ THREE workers, not one; reading it as an absolute value would oversubscribe the
 very machine the operator asked to leave headroom on."
   (let ((cores (bl.val::available-processor-count)))
     (is (plusp cores) "the processor count must be positive or -par=0 is broken")
-    (is (= (min cores 15) (bl.val::parse-par-threads 0)))
-    (is (= (min (1- cores) 15) (bl.val::parse-par-threads -1)))
-    (is (= 2 (bl.val::parse-par-threads 2)))
+    (is (= (min cores 15) (bl.val:parse-par-threads 0)))
+    (is (= (min (1- cores) 15) (bl.val:parse-par-threads -1)))
+    (is (= 2 (bl.val:parse-par-threads 2)))
     ;; Clamped to Core's maximum.
-    (is (= 15 (bl.val::parse-par-threads 99)))
+    (is (= 15 (bl.val:parse-par-threads 99)))
     ;; Never negative, however deep the subtraction goes.
-    (is (= 0 (bl.val::parse-par-threads (- (+ cores 5))))))
+    (is (= 0 (bl.val:parse-par-threads (- (+ cores 5))))))
   ;; -par reaches the worker count AND the on/off switch: Core's -par=1 means
   ;; no extra threads at all, which is not the same as "one worker".
-  (let ((saved-n bl.val::+parallel-validation-workers+)
+  (let ((saved-n bl.val:+parallel-validation-workers+)
         (saved-p bl:*parallel-block-validation*))
     (unwind-protect
          (progn
            (bl::apply-config-globals '(("par" . "3")))
-           (is (= 3 bl.val::+parallel-validation-workers+))
+           (is (= 3 bl.val:+parallel-validation-workers+))
            (is-true bl:*parallel-block-validation*)
            (bl::apply-config-globals '(("par" . "1")))
            (is-false bl:*parallel-block-validation*
                      "-par=1 must disable the extra threads, as Core's does"))
-      (setf bl.val::+parallel-validation-workers+ saved-n
+      (setf bl.val:+parallel-validation-workers+ saved-n
             bl:*parallel-block-validation* saved-p)))
-  (is-true (bl::known-config-option-p "par"))
-  (is-false (bl::core-only-option-p "par")))
+  (is-true (bl:known-config-option-p "par"))
+  (is-false (bl.cfg:core-only-option-p "par")))
 
 (test prefetched-coins-are-what-the-workers-validate-against
   "Core copies each spent Coin into its CScriptCheck BEFORE queuing it
@@ -280,10 +280,10 @@ wasted work that fixes nothing."
                    :value 42
                    :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))
                    :height 1 :coinbase nil))
-           (real (symbol-function 'bl.val::validate-input-script)))
+           (real (symbol-function 'bl.val:validate-input-script)))
       (unwind-protect
            (progn
-             (setf (symbol-function 'bl.val::validate-input-script)
+             (setf (symbol-function 'bl.val:validate-input-script)
                    (lambda (tx idx utxo) (declare (ignore tx idx))
                      (setf seen utxo) t))
              (bl.val::validate-tx-scripts
@@ -291,7 +291,7 @@ wasted work that fixes nothing."
              (is (eq other seen)
                  "validate-tx-scripts ignored the coins it was handed and ~
 re-resolved them from the coins view"))
-        (setf (symbol-function 'bl.val::validate-input-script)
+        (setf (symbol-function 'bl.val:validate-input-script)
               real)))))
 
 (test valid-transaction-structure
@@ -630,7 +630,7 @@ upper bound rejected real mainnet block 544,085 and halted IBD."
     (multiple-value-bind (valid error)
         (bl.val:validate-block-header
          (make-test-block-header :version 1) state current-time
-         :height (+ 1 (bl.val::get-bip34-activation-height
+         :height (+ 1 (bl.val:get-bip34-activation-height
                        bl:*network*)))
       (is (null valid))
       (is (member error '(:bad-version :bad-proof-of-work))))))
@@ -1367,7 +1367,7 @@ so their historical duplicate coinbases aren't wrongly rejected."
   ;; The exemption is mainnet-specific — no other network treats those
   ;; heights as repeat blocks.
   (let ((bl:*network* :testnet3))
-    (is (not (bl.val::bip30-repeat-block-p 91842)))))
+    (is (not (bl.val:bip30-repeat-block-p 91842)))))
 
 (test bip30-testnet4-not-enforced-at-current-heights
   "testnet4 has BIP 34 active from height 1, so BIP 30 is skipped for all
@@ -1405,16 +1405,16 @@ normal heights until the 1,983,702 re-enable."
 (test encode-bip34-height-forms
   "encode-bip34-height matches Core's CScript() << height: OP_0/OP_N for
 0..16, minimal CScriptNum data push otherwise (incl. sign byte)."
-  (is (equalp (%bytes #x00) (bl.val::encode-bip34-height 0)))
-  (is (equalp (%bytes #x51) (bl.val::encode-bip34-height 1)))
-  (is (equalp (%bytes #x60) (bl.val::encode-bip34-height 16)))
-  (is (equalp (%bytes #x01 #x11) (bl.val::encode-bip34-height 17)))
+  (is (equalp (%bytes #x00) (bl.val:encode-bip34-height 0)))
+  (is (equalp (%bytes #x51) (bl.val:encode-bip34-height 1)))
+  (is (equalp (%bytes #x60) (bl.val:encode-bip34-height 16)))
+  (is (equalp (%bytes #x01 #x11) (bl.val:encode-bip34-height 17)))
   ;; 21111 = 0x5277 -> LE 0x77 0x52
-  (is (equalp (%bytes #x02 #x77 #x52) (bl.val::encode-bip34-height 21111)))
+  (is (equalp (%bytes #x02 #x77 #x52) (bl.val:encode-bip34-height 21111)))
   ;; 227931 = 0x037A5B -> LE 0x5b 0x7a 0x03
-  (is (equalp (%bytes #x03 #x5b #x7a #x03) (bl.val::encode-bip34-height 227931)))
+  (is (equalp (%bytes #x03 #x5b #x7a #x03) (bl.val:encode-bip34-height 227931)))
   ;; 128 = 0x80 -> needs 0x00 sign byte
-  (is (equalp (%bytes #x02 #x80 #x00) (bl.val::encode-bip34-height 128))))
+  (is (equalp (%bytes #x02 #x80 #x00) (bl.val:encode-bip34-height 128))))
 
 (test validate-coinbase-height-accepts-exact-prefix
   "A coinbase whose scriptSig starts with the exact serialized height
@@ -1577,7 +1577,7 @@ then are promoted and survive a second rotation, untouched ones age out."
           (bl.interop::%make-sig-cache-table))
         (bl.interop:*signature-cache-prev*
           (bl.interop::%make-sig-cache-table))
-        (bl.interop::+signature-cache-max-entries+ 4))
+        (bl.interop:+signature-cache-max-entries+ 4))
     (loop for n from 1 to 4
           do (bl.interop::sig-cache-store (%sig-key n)))
     ;; 5th store rotates: prev = {1..4}, cur = {5}
@@ -1921,7 +1921,7 @@ executing anything, which accepts blocks Core rejects."
     ;; would silently inherit the first's verdict. Turn the cache off rather
     ;; than rely on picking a prevout no other test happens to use.
     (flet ((spends-p (spk sig)
-             (let* ((bl.interop::*script-execution-cache-enabled* nil)
+             (let* ((bl.interop:*script-execution-cache-enabled* nil)
                     (utxo-set (bl.store:make-utxo-set))
                     (prev-txid (make-array 32 :element-type '(unsigned-byte 8)
                                               :initial-element #xC7))

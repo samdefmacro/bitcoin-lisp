@@ -17,7 +17,21 @@ through the lower packages; the node reaches it only through these exports.")
    #:wallets-block-disconnected
    #:wallets-maybe-resend
    #:wallets-mempool-tx-added
-   #:wallets-mempool-tx-removed))
+   #:wallets-mempool-tx-removed)
+  ;; Reached from another package with :: before the second-round review
+  ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
+  (:export
+   #:*wallet-confirm-target*
+   #:*wallet-consolidate-feerate*
+   #:*wallet-directory*
+   #:*wallet-discard-rate*
+   #:*wallet-max-aps-fee*
+   #:*wallet-min-tx-fee*
+   #:*wallet-notify-command*
+   #:*wallet-reject-long-chains*
+   #:*wallet-signal-rbf*
+   #:*wallet-spend-zero-conf-change*
+   #:+default-keypool-size+))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

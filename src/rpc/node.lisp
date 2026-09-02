@@ -9,13 +9,13 @@
 (define-rpc "uptime" (node params)
   "Seconds the node has been running (Bitcoin Core uptime)."
   (declare (ignore node params))
-  (if bl::*node-start-time*
+  (if bl:*node-start-time*
       ;; Real clock on BOTH sides. Core's uptime is SteadyClock::now() minus a
       ;; steady startup stamp (common/system.cpp:134), so setmocktime does not
       ;; move it; reading the mockable clock here would make uptime jump — or
       ;; clamp to 0 — the moment a test set the clock backwards.
       (max 0 (- (bl.ser:get-real-unix-time)
-                bl::*node-start-time*))
+                bl:*node-start-time*))
       0))
 
 (define-rpc "stop" (node params)
@@ -31,7 +31,7 @@ this response flush before the RPC server goes away."
   (bt:make-thread (lambda ()
                     (sleep 0.3)
                     (ignore-errors
-                     (bl::request-node-shutdown "RPC stop")))
+                     (bl:request-node-shutdown "RPC stop")))
                   :name "rpc-stop")
   "Bitcoin-lisp server stopping")
 
@@ -87,22 +87,22 @@ under the \"locked\" object Core uses."
 (or \"1\") toggles every category. Returns an object mapping every category to
 whether it is currently enabled. Errors on an unknown category."
   (declare (ignore node))
-  (let ((include (%positional-array (first params)))
-        (exclude (%positional-array (second params))))
+  (let ((include (positional-array (first params)))
+        (exclude (positional-array (second params))))
     (when (and include (not (listp include)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "include must be an array"))
     (when (and exclude (not (listp exclude)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "exclude must be an array"))
     (dolist (cat include)
-      (unless (and (stringp cat) (bl::enable-log-category cat))
+      (unless (and (stringp cat) (bl.log:enable-log-category cat))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message (format nil "unknown logging category ~A" cat))))
     (dolist (cat exclude)
-      (unless (and (stringp cat) (bl::disable-log-category cat))
+      (unless (and (stringp cat) (bl.log:disable-log-category cat))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message (format nil "unknown logging category ~A" cat))))
     (mapcar (lambda (c) (cons c (json-bool (bl:log-category-enabled-p c))))
-            bl::+log-categories+)))
+            bl.log:+log-categories+)))
 
 (define-rpc "mockscheduler" (node params)
   "Advance the scheduler by DELTA_TIME seconds (Core mockscheduler,
@@ -151,8 +151,8 @@ shutdown, so a node reporting none hangs that test forever."
      . ,(json-array
          (mapcar (lambda (c) `(("method" . ,(car c)) ("duration" . ,(cdr c))))
                  (active-rpc-commands))))
-    ("logpath" . ,(or (and bl::*log-file-path*
-                           (namestring bl::*log-file-path*))
+    ("logpath" . ,(or (and bl:*log-file-path*
+                           (namestring bl:*log-file-path*))
                       ""))))
 
 (define-rpc "echojson" (node params)
@@ -221,7 +221,7 @@ its best indexed block has reached the current tip."
     ;; txindex's height is resolved against the chain (its marker is a
     ;; hash), so under assumeutxo it reports the validated tip it is really
     ;; at rather than claiming the snapshot tip.
-    (dolist (index (bl::node-indexes node))
+    (dolist (index (bl:node-indexes node))
       (let ((key (bl.store:index-name index))
             (height (bl.store:index-height index cs)))
         (when (or (null name) (string= name key))
@@ -243,5 +243,5 @@ when a -zmqpub* option asks for it."
                `(("type" . ,type)
                  ("address" . ,address)
                  ("hwm" . ,hwm))))
-           (bl::zmq-notifications-info))))
+           (bl:zmq-notifications-info))))
 

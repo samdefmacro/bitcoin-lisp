@@ -34,7 +34,7 @@
 (defun %au-close-chainstate-dbs (node)
   "Close every chainstate's coins LevelDB so the same datadir can be
 re-opened by a second in-process node (simulated restart)."
-  (dolist (cs (bl::node-chainstates node))
+  (dolist (cs (bl:node-chainstates node))
     (bl.store:close-chainstate-coins-view cs)))
 
 ;;;; Target-ancestor index + activate-block target guard
@@ -150,18 +150,18 @@ retargeted at the base."
              (snap-path (namestring (merge-pathnames "utxo.dat" src-dir))))
         ;; Produce a 1-coin snapshot from the source node.
         (bl.store:update-chain-tip
-         (bl::node-chain-state src) h5 5)
-        (bl.store:add-utxo (bl::node-utxo-set src)
+         (bl:node-chain-state src) h5 5)
+        (bl.store:add-utxo (bl:node-utxo-set src)
                                        txid 0 1000 spk 1)
         (bl.rpc::rpc-dumptxoutset src (list snap-path "latest"))
         (let ((hash (bl.store:compute-utxo-set-hash
-                     (bl::node-utxo-set src))))
+                     (bl:node-utxo-set src))))
           ;; Load it into the destination node (activation).
           (let ((node (%snap-node dir h5 5))
                 (bl:*assumeutxo-data-override*
                   (list (%snap-au 5 h5 hash 7))))
             (bl.rpc::rpc-loadtxoutset node (list snap-path))
-            (is (= 2 (length (bl::node-chainstates node))))
+            (is (= 2 (length (bl:node-chainstates node))))
             ;; "Restart": close the LevelDBs, build a fresh node over the
             ;; same datadir (header index recreated by %snap-node), detect.
             (%au-close-chainstate-dbs node)
@@ -169,9 +169,9 @@ retargeted at the base."
               (unwind-protect
                    (let ((snap-cs (bl::load-snapshot-chainstate fresh)))
                      (is (not (null snap-cs)))
-                     (is (= 2 (length (bl::node-chainstates fresh))))
-                     (let ((current (bl::node-current-chainstate fresh))
-                           (historical (bl::node-historical-chainstate fresh)))
+                     (is (= 2 (length (bl:node-chainstates fresh))))
+                     (let ((current (bl:node-current-chainstate fresh))
+                           (historical (bl:node-historical-chainstate fresh)))
                        (is (eq current snap-cs))
                        (is (eq :unvalidated
                                (bl.store:chain-state-assumeutxo-status
@@ -188,8 +188,8 @@ retargeted at the base."
                        (is (= 5 (bl.store:chain-state-target-height
                                  historical)))
                        ;; Shared block index.
-                       (is (eq (bl.store::chain-state-block-index current)
-                               (bl.store::chain-state-block-index historical)))
+                       (is (eq (bl.store:chain-state-block-index current)
+                               (bl.store:chain-state-block-index historical)))
                        ;; Coins reopened from chainstate_snapshot/.
                        (let ((c (bl.store:get-utxo
                                  (bl.store:chain-state-coins-view current)
@@ -205,9 +205,9 @@ second chainstate (single-chainstate startup, dir left for later adoption)."
     ;; Case 1: dir exists but no marker.
     (ensure-directories-exist (merge-pathnames "chainstate_snapshot/" dir))
     (let ((node (make-test-node)))
-      (setf (bl::node-data-directory node) (pathname dir))
+      (setf (bl:node-data-directory node) (pathname dir))
       (is (null (bl::load-snapshot-chainstate node)))
-      (is (= 1 (length (bl::node-chainstates node))))
+      (is (= 1 (length (bl:node-chainstates node))))
       ;; Case 2: marker present but the base header is unknown.
       (with-open-file (out (bl.store:snapshot-base-blockhash-path
                             (merge-pathnames "chainstate_snapshot/" dir))
@@ -215,9 +215,9 @@ second chainstate (single-chainstate startup, dir left for later adoption)."
                            :if-exists :supersede)
         (write-sequence (%au-hash #x77) out))
       (is (null (bl::load-snapshot-chainstate node)))
-      (is (= 1 (length (bl::node-chainstates node))))
+      (is (= 1 (length (bl:node-chainstates node))))
       (is (null (bl.store:chain-state-target-blockhash
-                 (bl::node-chain-state node)))))))
+                 (bl:node-chain-state node)))))))
 
 ;;;; Dual-cursor download queue + base-in-chain peer filter
 
@@ -235,16 +235,16 @@ TryDownloadingHistoricalBlocks)."
          (e4 (%au-entry (%au-hash 4) 4 e3))
          (e5 (%au-entry (%au-hash 5) 5 e4))      ; snapshot base
          (hist (bl.store:make-chain-state))
-         (bl.net::*ibd-context*
+         (bl.net:*ibd-context*
            (bl.net::make-ibd)))
     (dolist (e (list g e1 e2 e3 s3 e4 e5))
       (bl.store:add-block-index-entry hist e))
     (bl.store:update-chain-tip hist (%au-hash 1) 1)
     (bl.store:set-chainstate-target hist e5)
-    (let ((ctx bl.net::*ibd-context*))
+    (let ((ctx bl.net:*ibd-context*))
       ;; Queue the historical range: exactly e2..e5, sibling excluded.
       (is (= 4 (bl.net::queue-historical-blocks hist)))
-      (let ((pending (bl.net::ibd-context-pending-blocks ctx)))
+      (let ((pending (bl.net:ibd-context-pending-blocks ctx)))
         (is (= 4 (hash-table-count pending)))
         (is (gethash (%au-hash 2) pending))
         (is (gethash (%au-hash 5) pending))
@@ -260,13 +260,13 @@ TryDownloadingHistoricalBlocks)."
         ;; contains the base yields exactly the target-ancestor range
         ;; [hist-tip+1 .. base] ascending — e2..e5, sibling s3 excluded —
         ;; and a peer on a chain without the base yields nothing.
-        (let ((probe-store (bl.store::make-block-store
+        (let ((probe-store (bl.store:make-block-store
                             :base-path #p"/nonexistent/au-hist-walk/"))
-              (p-base (bl.net::make-peer))
-              (p-fork (bl.net::make-peer)))
-          (setf (bl.net::peer-best-known-block-hash p-base)
+              (p-base (bl.net:make-peer))
+              (p-fork (bl.net:make-peer)))
+          (setf (bl.net:peer-best-known-block-hash p-base)
                 (%au-hash 5)
-                (bl.net::peer-best-known-block-hash p-fork)
+                (bl.net:peer-best-known-block-hash p-fork)
                 (%au-hash 3 99))
           (let ((got (bl.net::find-historical-blocks-to-download
                       p-base hist probe-store 10)))
@@ -289,20 +289,20 @@ of the base pass, sibling-branch tips and no-availability peers fail."
          (s2 (%au-entry (%au-hash 2 99) 2 e1))   ; sibling branch
          (s3 (%au-entry (%au-hash 3 99) 3 s2))
          (cs (bl.store:make-chain-state))
-         (bl.net::*ibd-context*
+         (bl.net:*ibd-context*
            (bl.net::make-ibd)))
     (dolist (e (list g e1 e2 e3 s2 s3))
       (bl.store:add-block-index-entry cs e))
     (setf (bl.net::ibd-context-snapshot-base-entry
-           bl.net::*ibd-context*)
+           bl.net:*ibd-context*)
           e2)
-    (let ((p-good (bl.net::make-peer))
-          (p-base (bl.net::make-peer))
-          (p-fork (bl.net::make-peer))
-          (p-none (bl.net::make-peer)))
-      (setf (bl.net::peer-best-known-block-hash p-good) (%au-hash 3)
-            (bl.net::peer-best-known-block-hash p-base) (%au-hash 2)
-            (bl.net::peer-best-known-block-hash p-fork) (%au-hash 3 99))
+    (let ((p-good (bl.net:make-peer))
+          (p-base (bl.net:make-peer))
+          (p-fork (bl.net:make-peer))
+          (p-none (bl.net:make-peer)))
+      (setf (bl.net:peer-best-known-block-hash p-good) (%au-hash 3)
+            (bl.net:peer-best-known-block-hash p-base) (%au-hash 2)
+            (bl.net:peer-best-known-block-hash p-fork) (%au-hash 3 99))
       (is (eq t (bl.net::peer-chain-contains-base-p p-good cs)))
       ;; The base itself IS in a chain ending at the base.
       (is (eq t (bl.net::peer-chain-contains-base-p p-base cs)))
@@ -332,8 +332,8 @@ verified snapshot — never below it."
                   :from-snapshot-blockhash base-hash
                   :assumeutxo-status :unvalidated
                   :storage-suffix "_snapshot")))
-      (setf (bl::node-data-directory node) (pathname dir)
-            (bl::node-block-store node)
+      (setf (bl:node-data-directory node) (pathname dir)
+            (bl:node-block-store node)
             (bl.store:init-block-store dir))
       (dolist (e (list g e5 e6 e7))
         (bl.store:add-block-index-entry snap e))
@@ -378,9 +378,9 @@ chainstate.dat in-transition, and vice versa."
                   :from-snapshot-blockhash (%au-hash 5)
                   :assumeutxo-status :unvalidated
                   :storage-suffix "_snapshot"))
-           (node (bl::make-node :network :testnet3))
-           (bl::*node* node))
-      (setf (bl::node-chainstates node) (list primary snap))
+           (node (bl:make-node :network :testnet3))
+           (bl:*node* node))
+      (setf (bl:node-chainstates node) (list primary snap))
       ;; Flush the snapshot chainstate only.
       (bl::do-flush snap)
       (is (not (null (probe-file (merge-pathnames "chainstate_snapshot.dat" dir)))))
@@ -414,9 +414,9 @@ sync in progress)."
         (network bl.ser:+node-network+)
         (witness bl.ser:+node-witness+))
     ;; No node at all: full service (not pruning).
-    (let ((bl::*node* nil)
-          (bl::*prune-target-mib* nil))
-      (let ((bits (bl.net::local-services)))
+    (let ((bl:*node* nil)
+          (bl:*prune-target-mib* nil))
+      (let ((bits (bl.net:local-services)))
         (is (logtest bits network))
         (is (logtest bits limited))
         (is (logtest bits witness))))
@@ -426,13 +426,13 @@ sync in progress)."
                   :from-snapshot-blockhash (%au-hash 5)
                   :assumeutxo-status :unvalidated
                   :storage-suffix "_snapshot"))
-           (node (bl::make-node :network :testnet3)))
+           (node (bl:make-node :network :testnet3)))
       (setf (bl.store:chain-state-target-blockhash primary) (%au-hash 5))
-      (setf (bl::node-chainstates node) (list primary snap))
-      (let ((bl::*node* node)
-            (bl::*prune-target-mib* nil))
-        (is (not (null (bl::node-historical-chainstate node))))
-        (let ((bits (bl.net::local-services)))
+      (setf (bl:node-chainstates node) (list primary snap))
+      (let ((bl:*node* node)
+            (bl:*prune-target-mib* nil))
+        (is (not (null (bl:node-historical-chainstate node))))
+        (let ((bits (bl.net:local-services)))
           (is (not (logtest bits network)))
           (is (logtest bits limited))
           (is (logtest bits witness)))))))
@@ -452,15 +452,15 @@ sync in progress)."
                    :best-block-hash (%au-hash 1) :best-height 1))
          (snap (bl.store:make-chain-state
                 :best-block-hash base-hash :best-height 5
-                :block-index (bl.store::chain-state-block-index primary)
+                :block-index (bl.store:chain-state-block-index primary)
                 :from-snapshot-blockhash base-hash
                 :assumeutxo-status :unvalidated
                 :storage-suffix "_snapshot"))
-         (node (bl::make-node :network :testnet3)))
+         (node (bl:make-node :network :testnet3)))
     (dolist (e (list g e1 e5 e6))
       (bl.store:add-block-index-entry primary e))
     (bl.store:set-chainstate-target primary e5)
-    (setf (bl::node-chainstates node) (list primary snap))
+    (setf (bl:node-chainstates node) (list primary snap))
     (let* ((r (bl.rpc::rpc-getchainstates node nil))
            (entries (cdr (assoc "chainstates" r :test #'string=)))
            (hist-entry (first entries))
@@ -475,7 +475,7 @@ sync in progress)."
       ;; Current entry: the snapshot chainstate, unvalidated, hash present.
       (is (= 5 (cdr (assoc "blocks" cur-entry :test #'string=))))
       (is (eq 'yason:false (cdr (assoc "validated" cur-entry :test #'string=))))
-      (is (string= (bl.rpc::hash-to-hex base-hash)
+      (is (string= (bl.rpc:hash-to-hex base-hash)
                    (cdr (assoc "snapshot_blockhash" cur-entry :test #'string=)))))))
 
 ;;;; P5: background-validation completion + promotion
@@ -503,13 +503,13 @@ the assumeutxo-data-override hash."
          (snap (bl.store:make-chain-state
                 :base-path (pathname dir)
                 :best-block-hash base-hash :best-height 5
-                :block-index (bl.store::chain-state-block-index historical)
+                :block-index (bl.store:chain-state-block-index historical)
                 :from-snapshot-blockhash base-hash
                 :assumeutxo-status :unvalidated
                 :storage-suffix "_snapshot"))
-         (node (bl::make-node :network :testnet3))
+         (node (bl:make-node :network :testnet3))
          (hv (bl.store:make-utxo-set)))
-    (setf (bl::node-data-directory node) (pathname dir))
+    (setf (bl:node-data-directory node) (pathname dir))
     (dolist (e (list g e5))
       (bl.store:add-block-index-entry historical e))
     (bl.store:add-utxo hv (%snap-fill 32 #x44) 0 1000 (%snap-cat #(#x51)) 1)
@@ -517,7 +517,7 @@ the assumeutxo-data-override hash."
           (bl.store:chain-state-coins-view snap)
           (bl.store:make-coins-view-cache
            (bl.store:open-coins-view-db snap-dir))
-          (bl::node-chainstates node) (list historical snap))
+          (bl:node-chainstates node) (list historical snap))
     (bl.store:set-chainstate-target historical e5)
     (values node historical snap base-hash)))
 
@@ -542,13 +542,13 @@ SUCCESS, validation.cpp:6088-6095). A second call is a no-op."
            (snap (bl.store:make-chain-state
                   :base-path (pathname dir)
                   :best-block-hash (%au-hash 6) :best-height 6
-                  :block-index (bl.store::chain-state-block-index historical)
+                  :block-index (bl.store:chain-state-block-index historical)
                   :from-snapshot-blockhash base-hash
                   :assumeutxo-status :unvalidated
                   :storage-suffix "_snapshot"))
-           (node (bl::make-node :network :testnet3))
-           (bl::*node* node)
-           (bl::*prune-target-mib* nil))
+           (node (bl:make-node :network :testnet3))
+           (bl:*node* node)
+           (bl:*prune-target-mib* nil))
       (dolist (e (list g e5 e6))
         (bl.store:add-block-index-entry historical e))
       (let ((hv (bl.store:make-utxo-set)))
@@ -556,27 +556,27 @@ SUCCESS, validation.cpp:6088-6095). A second call is a no-op."
         (setf (bl.store:chain-state-coins-view historical) hv))
       (setf (bl.store:chain-state-coins-view snap)
             (bl.store:make-utxo-set)
-            (bl::node-chainstates node) (list historical snap))
+            (bl:node-chainstates node) (list historical snap))
       ;; Retarget the historical at the base (it becomes the historical cs).
       (bl.store:set-chainstate-target historical e5)
-      (is (eq historical (bl::node-historical-chainstate node)))
-      (is (eq snap (bl::node-current-chainstate node)))
+      (is (eq historical (bl:node-historical-chainstate node)))
+      (is (eq snap (bl:node-current-chainstate node)))
       ;; P6 pre-state: a floored prune cursor above the base and a split
       ;; cache budget, to prove promotion rewinds/releases them.
       (setf (bl.store:chain-state-pruned-height snap) 100
             (bl.store:chain-state-pruned-height historical) 3
             (bl.store:chain-state-coins-cache-bytes snap) 12345)
       ;; While background validation is in progress, NODE_NETWORK is dropped.
-      (is (not (logtest (bl.net::local-services)
+      (is (not (logtest (bl.net:local-services)
                         bl.ser:+node-network+)))
       ;; Commit the historical's real hash and run the completion hook.
       (let* ((hash (bl.store:compute-utxo-set-hash
                     (bl.store:chain-state-coins-view historical)))
              (bl:*assumeutxo-data-override*
                (list (%snap-au 5 base-hash hash 7))))
-        (is (eq :success (bl::maybe-validate-snapshot historical)))
+        (is (eq :success (bl:maybe-validate-snapshot historical)))
         ;; Idempotent: the snapshot is already validated now.
-        (is (eq :skipped (bl::maybe-validate-snapshot historical))))
+        (is (eq :skipped (bl:maybe-validate-snapshot historical))))
       ;; Snapshot chainstate promoted; historical marked done.
       (is (eq :validated (bl.store:chain-state-assumeutxo-status snap)))
       (is (not (null (bl.store:chain-state-target-utxohash historical))))
@@ -587,11 +587,11 @@ SUCCESS, validation.cpp:6088-6095). A second call is a no-op."
       (is (= 3 (bl.store:chain-state-pruned-height snap)))
       (is (null (bl.store:chain-state-coins-cache-bytes snap)))
       ;; No historical chainstate remains; the snapshot cs is now validated.
-      (is (null (bl::node-historical-chainstate node)))
-      (is (eq snap (bl::node-current-chainstate node)))
-      (is (eq snap (bl::node-validated-chainstate node)))
+      (is (null (bl:node-historical-chainstate node)))
+      (is (eq snap (bl:node-current-chainstate node)))
+      (is (eq snap (bl:node-validated-chainstate node)))
       ;; Services regain NODE_NETWORK (unpruned + no historical chainstate).
-      (is (logtest (bl.net::local-services)
+      (is (logtest (bl.net:local-services)
                    bl.ser:+node-network+))
       ;; getchainstates now reports a single validated chainstate.
       (let* ((r (bl.rpc::rpc-getchainstates node nil))
@@ -610,15 +610,15 @@ validation.cpp:6006-6036). The decision path is exercised via a rebound
   (with-temp-directory (dir)
     (multiple-value-bind (node historical snap base-hash)
         (%snap-validation-fixture dir)
-      (let ((bl::*node* node)
-            (bl::*prune-target-mib* nil)
+      (let ((bl:*node* node)
+            (bl:*prune-target-mib* nil)
             (fatal-msg nil))
         ;; Commit a DIFFERENT hash than the historical set actually produces.
         (let ((bl:*assumeutxo-data-override*
                 (list (%snap-au 5 base-hash (%au-hash #x99) 7)))
               (bl::*snapshot-fatal-hook*
                 (lambda (msg) (setf fatal-msg msg))))
-          (is (eq :hash-mismatch (bl::maybe-validate-snapshot historical))))
+          (is (eq :hash-mismatch (bl:maybe-validate-snapshot historical))))
         ;; The fatal DECISION fired (message recorded) — but no process exit.
         (is (not (null fatal-msg)))
         (is (search "hash mismatch" fatal-msg))
@@ -626,8 +626,8 @@ validation.cpp:6006-6036). The decision path is exercised via a rebound
         (is (eq :invalid (bl.store:chain-state-assumeutxo-status snap)))
         (is (null (bl.store:chain-state-target-blockhash historical)))
         ;; Reverts to the validated chain: no historical; current = historical.
-        (is (null (bl::node-historical-chainstate node)))
-        (is (eq historical (bl::node-current-chainstate node)))
+        (is (null (bl:node-historical-chainstate node)))
+        (is (eq historical (bl:node-current-chainstate node)))
         ;; Coins dir renamed aside for forensics; the original name is gone.
         (is (null (bl.store:find-assumeutxo-chainstate-dir dir)))
         (is (not (null (probe-file (merge-pathnames "chainstate_snapshot_INVALID/" dir)))))))))
@@ -656,14 +656,14 @@ chainstate whose coins view is the (formerly snapshot) promoted set."
            (snap (bl.store:make-chain-state
                   :base-path (pathname dir)
                   :best-block-hash base-hash :best-height 5
-                  :block-index (bl.store::chain-state-block-index historical)
+                  :block-index (bl.store:chain-state-block-index historical)
                   :from-snapshot-blockhash base-hash
                   :assumeutxo-status :unvalidated
                   :storage-suffix "_snapshot"))
-           (node (bl::make-node :network :testnet3))
-           (bl::*node* node)
-           (bl::*prune-target-mib* nil))
-      (setf (bl::node-data-directory node) (pathname dir))
+           (node (bl:make-node :network :testnet3))
+           (bl:*node* node)
+           (bl:*prune-target-mib* nil))
+      (setf (bl:node-data-directory node) (pathname dir))
       (dolist (e (list g e5))
         (bl.store:add-block-index-entry historical e))
       ;; Background chainstate coins at chainstate/ (its hash is committed).
@@ -682,7 +682,7 @@ chainstate whose coins view is the (formerly snapshot) promoted set."
       (bl.store:write-snapshot-base-blockhash snap)
       (bl.store:save-state historical)
       (bl.store:save-state snap)
-      (setf (bl::node-chainstates node) (list historical snap))
+      (setf (bl:node-chainstates node) (list historical snap))
       (bl.store:set-chainstate-target historical e5)
       (let* ((hash (bl.store:compute-utxo-set-hash
                     (bl.store:chain-state-coins-view historical)))
@@ -690,14 +690,14 @@ chainstate whose coins view is the (formerly snapshot) promoted set."
                (list (%snap-au 5 base-hash hash 7))))
         (is (eq :success (bl::finalize-snapshot-validation-at-startup node))))
       ;; A single fully-validated chainstate remains.
-      (is (= 1 (length (bl::node-chainstates node))))
-      (is (null (bl::node-historical-chainstate node)))
-      (let ((cs (bl::node-current-chainstate node)))
+      (is (= 1 (length (bl:node-chainstates node))))
+      (is (null (bl:node-historical-chainstate node)))
+      (let ((cs (bl:node-current-chainstate node)))
         (is (string= "" (bl.store:chain-state-storage-suffix cs)))
         (is (null (bl.store:chain-state-from-snapshot-blockhash cs)))
         (is (null (bl.store:chain-state-target-blockhash cs)))
         (is (eq :validated (bl.store:chain-state-assumeutxo-status cs)))
-        (is (eq cs (bl::node-validated-chainstate node)))
+        (is (eq cs (bl:node-validated-chainstate node)))
         ;; The promoted coins view is the (formerly snapshot) set at chainstate/.
         (let ((s (bl.store:get-utxo
                   (bl.store:chain-state-coins-view cs) txid-s 0))
@@ -720,8 +720,8 @@ node/chainstate.cpp:231-235) and still renames the snapshot dir aside."
     (multiple-value-bind (node historical snap base-hash)
         (%snap-validation-fixture dir)
       (declare (ignore historical))
-      (let ((bl::*node* node)
-            (bl::*prune-target-mib* nil))
+      (let ((bl:*node* node)
+            (bl:*prune-target-mib* nil))
         (let ((bl:*assumeutxo-data-override*
                 (list (%snap-au 5 base-hash (%au-hash #x99) 7))))
           (signals error (bl::finalize-snapshot-validation-at-startup node)))
@@ -746,29 +746,29 @@ budget)."
                    :best-block-hash (%au-hash 0) :best-height 0))
          (snap (bl.store:make-chain-state
                 :best-block-hash base-hash :best-height 5
-                :block-index (bl.store::chain-state-block-index primary)
+                :block-index (bl.store:chain-state-block-index primary)
                 :from-snapshot-blockhash base-hash
                 :assumeutxo-status :unvalidated
                 :storage-suffix "_snapshot"))
-         (node (bl::make-node :network :testnet3))
+         (node (bl:make-node :network :testnet3))
          (total (* 1000 1048576))
          (bl::*coins-cache-budget-bytes* total))
     (dolist (e (list g e5))
       (bl.store:add-block-index-entry primary e))
     (bl.store:set-chainstate-target primary e5)
-    (setf (bl::node-chainstates node) (list primary snap))
+    (setf (bl:node-chainstates node) (list primary snap))
     ;; During IBD: 95% to the snapshot (current) chainstate.
-    (let ((bl.net::*cached-is-ibd* t))
+    (let ((bl.net:*cached-is-ibd* t))
       (bl::maybe-rebalance-caches node))
     (is (= (floor (* total 0.95d0))
            (bl.store:chain-state-coins-cache-bytes snap)))
     (is (= (floor (* total 0.05d0))
            (bl.store:chain-state-coins-cache-bytes primary)))
     (is (= (floor (* total 0.95d0))
-           (bl::chainstate-coins-cache-budget snap)))
+           (bl:chainstate-coins-cache-budget snap)))
     ;; IBD exit flips the split toward the historical chainstate.
-    (let ((bl.net::*cached-is-ibd* nil)
-          (bl::*node* node))
+    (let ((bl.net:*cached-is-ibd* nil)
+          (bl:*node* node))
       (bl:rebalance-caches-on-ibd-exit))
     (is (= (floor (* total 0.05d0))
            (bl.store:chain-state-coins-cache-bytes snap)))
@@ -779,8 +779,8 @@ budget)."
     (setf (bl.store:chain-state-target-utxohash primary) (%au-hash 9))
     (bl::maybe-rebalance-caches node)
     (is (null (bl.store:chain-state-coins-cache-bytes snap)))
-    (is (= total (bl::chainstate-coins-cache-budget snap)))
+    (is (= total (bl:chainstate-coins-cache-budget snap)))
     ;; A no-op when no historical chainstate exists and *node* is unset.
-    (let ((bl::*node* nil))
+    (let ((bl:*node* nil))
       (bl:rebalance-caches-on-ibd-exit))
     (is (null (bl.store:chain-state-coins-cache-bytes snap)))))

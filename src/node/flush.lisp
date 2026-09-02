@@ -172,26 +172,26 @@ accounts for ~700 MB. This logger surfaces the gap."
                                  1048576.0)))
          (header-count (and (node-chain-state *node*)
                             (hash-table-count
-                             (bl.store::chain-state-block-index
+                             (bl.store:chain-state-block-index
                               (node-chain-state *node*)))))
          (sig-cache-count
            (+ (hash-table-count bl.interop:*signature-cache*)
               (hash-table-count bl.interop:*signature-cache-prev*)))
          (ibd-pending
-           (and bl.net::*ibd-context*
+           (and bl.net:*ibd-context*
                 (hash-table-count
-                 (bl.net::ibd-context-pending-blocks
-                  bl.net::*ibd-context*))))
+                 (bl.net:ibd-context-pending-blocks
+                  bl.net:*ibd-context*))))
          (ibd-queue
-           (and bl.net::*ibd-context*
+           (and bl.net:*ibd-context*
                 (hash-table-count
-                 (bl.net::ibd-context-block-queue
-                  bl.net::*ibd-context*))))
+                 (bl.net:ibd-context-block-queue
+                  bl.net:*ibd-context*))))
          (ibd-in-flight
-           (and bl.net::*ibd-context*
+           (and bl.net:*ibd-context*
                 (hash-table-count
-                 (bl.net::ibd-context-in-flight
-                  bl.net::*ibd-context*))))
+                 (bl.net:ibd-context-in-flight
+                  bl.net:*ibd-context*))))
          (dyn-bytes (sb-ext:dynamic-space-size))
          (used-bytes (sb-kernel:dynamic-usage)))
     (log-info "MEM[~A]: utxo=~D coins-cache=~,1FMB headers=~D sigcache=~D ibd-pend=~A queue=~A inflight=~A heap-used=~,1FMB heap-cap=~,1FMB"

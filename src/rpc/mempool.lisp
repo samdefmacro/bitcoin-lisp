@@ -20,7 +20,7 @@ lists every announcer's peer id (Core OrphanInfo::announcers)."
                  ("weight" . ,(bl.ser:transaction-weight tx))
                  ("from" . ,(loop for peer in announcers
                                   when peer
-                                    collect (bl.net::peer-id peer))))))
+                                    collect (bl.net:peer-id peer))))))
     (if verbose2
         (append base `(("hex" . ,(bl.crypto:bytes-to-hex ser))))
         base)))
@@ -44,14 +44,14 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
          (lambda (wtxid entry)
            (declare (ignore wtxid))
            (let ((tx (bl.mp:orphan-entry-transaction entry))
-                 (from (mapcar #'bl.mp::orphan-announcement-peer
-                               (bl.mp::orphan-entry-announcements entry))))
+                 (from (mapcar #'bl.mp:orphan-announcement-peer
+                               (bl.mp:orphan-entry-announcements entry))))
              (push (case verbosity
                      (0 (hash-to-hex (bl.ser:transaction-hash tx)))
                      (1 (%orphan-tx-json tx from nil))
                      (t (%orphan-tx-json tx from t)))
                    result)))
-         (bl.mp::orphan-pool-by-wtxid pool))))
+         (bl.mp:orphan-pool-by-wtxid pool))))
     ;; Core returns a UniValue VARR: an empty orphanage is [], not null.
     (json-array (nreverse result))))
 
@@ -59,7 +59,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
   "Return mempool statistics."
   (declare (ignore params))
   (let ((mempool (rpc-get-mempool node))
-        (incfee (/ bl.mp::+incremental-relay-fee-rate+ 100000000.0d0)))
+        (incfee (/ bl.mp:+incremental-relay-fee-rate+ 100000000.0d0)))
     (if mempool
         ;; Rates are sat/kvB (Core CFeeRate); convert to BTC/kvB via /1e8.
         ;; Node lock: count/bytes/total-fee must be one consistent snapshot
@@ -87,7 +87,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
             ;; -maxmempool cap is keyed on (rpc/mempool.cpp:1041).
             ("usage" . ,(bl.mp:mempool-dynamic-usage mempool))
             ("total_fee" . ,(/ total-fee-sat 100000000.0d0))
-            ("maxmempool" . ,(bl.mp::mempool-max-size mempool))
+            ("maxmempool" . ,(bl.mp:mempool-max-size mempool))
             ("mempoolminfee" . ,min-fee-btc-kvb)
             ("minrelaytxfee" . ,relay-fee-btc-kvb)
             ("incrementalrelayfee" . ,incfee)
@@ -112,7 +112,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
 
 (define-rpc "getrawmempool" (node params)
   "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t)."
-  (let ((verbose (%positional-bool (first params)))
+  (let ((verbose (positional-bool (first params)))
         (mempool (rpc-get-mempool node)))
     ;; Node lock: iterating entries (and, verbose, walking each entry's
     ;; ancestors/descendants/chunk) must not race the sync thread's
@@ -189,14 +189,14 @@ Core's GetTxSize-based reporting."
           ("spentby" . ,(let ((sb '()))
                           (maphash (lambda (c v) (declare (ignore v))
                                      (push (hash-to-hex c) sb))
-                                   (bl.mp::mempool-entry-children entry))
+                                   (bl.mp:mempool-entry-children entry))
                           sb))
           ;; BIP125: whether the tx or any unconfirmed ancestor SIGNALS
           ;; replaceability (Core IsRBFOptIn, reporting only — acceptance is
           ;; unconditionally full-RBF; rpc/mempool.cpp:456,567, DEPRECATED).
           ("bip125-replaceable"
            . ,(json-bool
-               (bl.mp::mempool-tx-or-ancestor-signals-rbf-p mempool txid)))
+               (bl.mp:mempool-tx-or-ancestor-signals-rbf-p mempool txid)))
           ;; Core IsUnbroadcastTx (rpc/mempool.cpp:568) — was hardcoded nil,
           ;; which both lied for locally-submitted txs and encoded as null.
           ("unbroadcast" . ,(json-bool
@@ -244,7 +244,7 @@ Core's empty VARR/VOBJ ([] / {}), never null."
   "Return the in-mempool ancestors of TXID (Bitcoin Core getmempoolancestors).
 PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
   (let ((mempool (rpc-get-mempool node))
-        (verbose (%positional-bool (second params))))
+        (verbose (positional-bool (second params))))
     (with-node-lock (node)
       (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
         (declare (ignore entry))
@@ -254,7 +254,7 @@ PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
   "Return the in-mempool descendants of TXID (Bitcoin Core getmempooldescendants).
 PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
   (let ((mempool (rpc-get-mempool node))
-        (verbose (%positional-bool (second params))))
+        (verbose (positional-bool (second params))))
     (with-node-lock (node)
       (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
         (declare (ignore entry))
@@ -341,10 +341,10 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
                       false when it is — so the answer improves by enabling the
                       index rather than by changing the call.
   return_spending_tx  default false; adds the full spending transaction as hex."
-  (let* ((outpoints (%positional-array (first params)))
+  (let* ((outpoints (positional-array (first params)))
          (options (second params))
          (mempool (rpc-get-mempool node))
-         (index (bl::node-txospenderindex node))
+         (index (bl:node-txospenderindex node))
          (index-live (and index (bl.store:txospender-index-enabled index)))
          (mempool-only (if (and (hash-table-p options)
                                 (nth-value 1 (gethash "mempool_only" options)))
@@ -417,7 +417,7 @@ before it is believed — Core does the same for the same reason
 outpoint is a hash collision; one whose block is no longer on the active chain
 is a reorg the index has not been told about, and both are skipped."
   (let ((chain-state (rpc-get-chain-state node))
-        (block-store (bl::node-block-store node)))
+        (block-store (bl:node-block-store node)))
     (dolist (locator (bl.store:txospenderindex-locators index txid vout))
       (destructuring-bind (block-hash . position) locator
         (let ((block (and block-store
@@ -475,7 +475,7 @@ Returns satoshis per kvB, where 0 means the caller disabled the rail."
   (let ((v (and (> (length params) index) (nth index params))))
     (if (null v)
         +default-max-raw-tx-fee-rate+
-        (let ((sat (%amount-from-value v)))
+        (let ((sat (amount-from-value v)))
           (when (>= sat 100000000)
             (error 'rpc-error :code +rpc-invalid-parameter+
                               :message "Fee rates larger than or equal to 1BTC/kvB are not accepted"))
@@ -485,7 +485,7 @@ Returns satoshis per kvB, where 0 means the caller disabled the rail."
   "Core's maxburnamount at INDEX (rpc/mempool.cpp:92), a BTC amount defaulting
 to DEFAULT_MAX_BURN_AMOUNT (0) -- no burn is tolerated unless asked for."
   (let ((v (and (> (length params) index) (nth index params))))
-    (if (null v) 0 (%amount-from-value v))))
+    (if (null v) 0 (amount-from-value v))))
 
 (defun %check-max-burn (tx max-burn)
   "Signal Core's MAX_BURN_EXCEEDED when an output of TX commits more than
@@ -506,7 +506,7 @@ reaches the mempool."
 array of {txid, wtxid, allowed, reject-reason?, vsize, fees{base}} without adding
 anything to the mempool. Each tx is checked independently against current state
 (package interdependence is not modeled — that needs submitpackage)."
-  (let ((txs (%positional-array (first params)))
+  (let ((txs (positional-array (first params)))
         (txs-arg (first params))
         (utxo-set (rpc-get-utxo-set node))
         (mempool (rpc-get-mempool node))
@@ -564,7 +564,7 @@ anything to the mempool. Each tx is checked independently against current state
                          (let* ((vsize (bl.mp:sigop-adjusted-vsize
                                         (bl.ser:transaction-weight tx)
                                         sigops))
-                                (max-fee (%feerate-fee max-fee-rate vsize)))
+                                (max-fee (feerate-fee max-fee-rate vsize)))
                            (cond
                              ((and (plusp max-fee) (> (or fee 0) max-fee))
                               (setf exit-early t)
@@ -578,7 +578,7 @@ anything to the mempool. Each tx is checked independently against current state
                                 ("allowed" . t)
                                 ("vsize" . ,vsize)
                                 ("fees"
-                                 . (("base" . ,(%btc (or fee 0)))
+                                 . (("base" . ,(satoshi->btc (or fee 0)))
                                     ;; The feerate the acceptance decision
                                     ;; actually used: CFeeRate(m_modified_fees,
                                     ;; m_vsize).GetFeePerK() for a single
@@ -589,7 +589,7 @@ anything to the mempool. Each tx is checked independently against current state
                                     ;; satoshis per kvB (feerate.cpp) and
                                     ;; rendered in BTC.
                                     ("effective-feerate"
-                                     . ,(%btc (let ((modified
+                                     . ,(satoshi->btc (let ((modified
                                                       (+ (or fee 0)
                                                          (gethash txid (bl.mp:mempool-deltas mempool) 0))))
                                                 (if (plusp vsize)
@@ -652,7 +652,7 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                   ;; The cap is taken on the PLAIN BIP141 vsize here
                   ;; (GetVirtualTransactionSize, :109) -- not the
                   ;; sigop-adjusted vsize testmempoolaccept reports.
-                  (max-fee (%feerate-fee
+                  (max-fee (feerate-fee
                             (%parse-max-fee-rate params 1)
                             (bl.ser:transaction-vsize tx))))
             ;; Validate transaction for mempool
@@ -665,7 +665,7 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                 ;; entry's wtxid (a same-txid/different-witness submission must
                 ;; advertise the witness we can actually serve). No unbroadcast
                 ;; add — Core's already-in-mempool branch skips it too.
-                (bl::broadcast-transaction-to-peers node txid)
+                (bl:broadcast-transaction-to-peers node txid)
                 (return-from rpc-sendrawtransaction (hash-to-hex txid)))
               (unless valid
                 ;; Core reports the state's own reject reason, with no prefix
@@ -703,7 +703,7 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                 ;; node/transaction.cpp:100-104), then queue the announcement
                 ;; to all relay peers.
                 (bl.mp:mempool-add-unbroadcast mempool txid)
-                (bl::broadcast-transaction-to-peers node txid)
+                (bl:broadcast-transaction-to-peers node txid)
                 (hash-to-hex txid))))))
       ;; Re-raise our own rpc-errors (the -26 rejections above) unchanged; only a
       ;; genuine parse/deserialization failure maps to RPC_DESERIALIZATION_ERROR
@@ -757,7 +757,7 @@ submitpackage: returns {package_msg, tx-results{wtxid -> {...}},
 replaced-transactions}. maxfeerate caps each member's modified feerate and
 aborts the whole package on the first breach; maxburnamount caps the value any
 member may send to a script that can never spend it."
-  (let ((hexes (%positional-array (first params)))
+  (let ((hexes (positional-array (first params)))
         (utxo-set (rpc-get-utxo-set node))
         (mempool (rpc-get-mempool node))
         (chain-state (rpc-get-chain-state node)))
@@ -811,7 +811,7 @@ member may send to a script that can never spend it."
               (dolist (tx package)
                 (let ((txid (bl.ser:transaction-hash tx)))
                   (when (bl.mp:mempool-has mempool txid)
-                    (bl::broadcast-transaction-to-peers node txid))))))
+                    (bl:broadcast-transaction-to-peers node txid))))))
         `(("package_msg" . ,(if (eq msg :success) "success"
                                 (string-downcase (symbol-name msg))))
           ("tx-results"
@@ -829,7 +829,7 @@ member may send to a script that can never spend it."
 The same dump runs automatically on graceful shutdown."
   (declare (ignore params))
   (let ((path (bl.mp:mempool-dat-path
-               (bl::node-data-directory node))))
+               (bl:node-data-directory node))))
     (unless path
       (error 'rpc-error :code +rpc-misc-error+
                         :message "Node has no data directory"))
@@ -880,7 +880,7 @@ separates them."
       ;; thread (Core importmempool holds cs_main + pool.cs through
       ;; LoadMempool, rpc/mempool.cpp:1130).
       (unless (with-node-lock (node)
-                (bl::load-mempool-from-disk
+                (bl:load-mempool-from-disk
                  node path
                  :apply-unbroadcast apply-unbroadcast
                  :apply-fee-delta-priority apply-fee-delta

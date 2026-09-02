@@ -195,7 +195,7 @@ parse or has trailing bytes."
       (let ((br (bl.ser:make-byte-reader-from solution)))
         (let ((script-sig (bl.ser:br-read-var-bytes br))
               (witness (bl.ser:br-read-witness-stack br)))
-          (if (bl.ser::br-eof-p br)
+          (if (bl.ser:br-eof-p br)
               (values script-sig witness)
               (values nil nil))))        ; extraneous data
     (error () (values nil nil))))

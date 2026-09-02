@@ -35,14 +35,14 @@
     (loop for spkm being the hash-values of (bl.wallet::wallet-spkms wallet)
           for index = (bl.wallet::spkm-is-mine spkm script)
           when index
-            do (let* ((key (first (bl.rpc::out-desc-ordered-keys
+            do (let* ((key (first (bl.rpc:out-desc-ordered-keys
                                    (bl.wallet::desc-spkm-desc spkm))))
-                      (k (bl.rpc::%desc-key-root-xprv
+                      (k (bl.rpc:desc-key-root-xprv
                           key (bl.wallet::spkm-privkey-provider
                                wallet spkm))))
-                 (dolist (entry (bl.rpc::desc-key-path key))
+                 (dolist (entry (bl.rpc:desc-key-path key))
                    (setf k (bl.crypto:bip32-derive-child k entry)))
-                 (when (eq (bl.rpc::desc-key-derive key) :unhardened)
+                 (when (eq (bl.rpc:desc-key-derive key) :unhardened)
                    (setf k (bl.crypto:bip32-derive-child k index)))
                  (return (bl.crypto:private-key-to-wif
                           (subseq (bl.crypto:ext-key-key k) 1 33)
@@ -74,12 +74,12 @@ keys and broadcasts. Returns (values txid signed-hex)."
                :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                :sequence #xffffffff)
               tx-inputs)
-        (push `(("txid" . ,(bl.rpc::hash-to-hex (car input)))
+        (push `(("txid" . ,(bl.rpc:hash-to-hex (car input)))
                 ("vout" . ,(cdr input))
                 ("scriptPubKey" . ,(bl.crypto:bytes-to-hex spk))
                 ("amount" . ,(/ value 100000000.0d0)))
               prevtxs)
-        (let ((address (bl.rpc::%script->address spk :regtest)))
+        (let ((address (bl.rpc:script->address spk :regtest)))
           (push (%wb-wallet-wif node name address) wifs))))
     (let* ((tx (bl.ser:make-transaction
                 :version 2
@@ -100,15 +100,15 @@ keys and broadcasts. Returns (values txid signed-hex)."
       (unless (eq t (%wb-aval "complete" result))
         (error "wallet spend signing incomplete: ~S" result))
       (let ((txid-hex (bl.rpc::rpc-sendrawtransaction node (list hex))))
-        (values (bl.rpc::parse-hex-hash txid-hex) hex)))))
+        (values (bl.rpc:parse-hex-hash txid-hex) hex)))))
 
 (defun %wb-evict-tx (node txid)
   "Evict TXID (recursively, with descendants) from the mempool as a
 non-conflict removal (reason :expiry), firing the wallet hooks."
-  (bl.rpc::with-node-lock (node)
-    (let ((mempool (bl::node-mempool node))
-          (bl.mp::*mempool-removal-reason* :expiry))
-      (bl.mp::mempool-remove-recursive mempool txid))))
+  (bl.rpc:with-node-lock (node)
+    (let ((mempool (bl:node-mempool node))
+          (bl.mp:*mempool-removal-reason* :expiry))
+      (bl.mp:mempool-remove-recursive mempool txid))))
 
 (defun %wb-balances (node)
   (%wb-aval "mine" (bl.wallet::rpc-getbalances node nil)))
@@ -122,24 +122,24 @@ non-conflict removal (reason :expiry), firing the wallet hooks."
 (test wallet-amount-from-value
   "AmountFromValue: numbers and decimal strings in BTC, 8 fraction digits,
 MoneyRange enforced."
-  (is (= 500000 (bl.rpc::%amount-from-value 0.005)))
-  (is (= 500000 (bl.rpc::%amount-from-value "0.005")))
-  (is (= 1 (bl.rpc::%amount-from-value "0.00000001")))
-  (is (= 100000000 (bl.rpc::%amount-from-value 1)))
-  (is (= 100000000 (bl.rpc::%amount-from-value "1")))
-  (is (= 2100000000000000 (bl.rpc::%amount-from-value 21000000)))
-  (is (= bl.rpc::+rpc-type-error+
+  (is (= 500000 (bl.rpc:amount-from-value 0.005)))
+  (is (= 500000 (bl.rpc:amount-from-value "0.005")))
+  (is (= 1 (bl.rpc:amount-from-value "0.00000001")))
+  (is (= 100000000 (bl.rpc:amount-from-value 1)))
+  (is (= 100000000 (bl.rpc:amount-from-value "1")))
+  (is (= 2100000000000000 (bl.rpc:amount-from-value 21000000)))
+  (is (= bl.rpc:+rpc-type-error+
          (%rpc-error-code
-          (lambda () (bl.rpc::%amount-from-value 21000001)))))
-  (is (= bl.rpc::+rpc-type-error+
+          (lambda () (bl.rpc:amount-from-value 21000001)))))
+  (is (= bl.rpc:+rpc-type-error+
          (%rpc-error-code
-          (lambda () (bl.rpc::%amount-from-value "x")))))
-  (is (= bl.rpc::+rpc-type-error+
+          (lambda () (bl.rpc:amount-from-value "x")))))
+  (is (= bl.rpc:+rpc-type-error+
          (%rpc-error-code
-          (lambda () (bl.rpc::%amount-from-value "0.000000001")))))
-  (is (= bl.rpc::+rpc-type-error+
+          (lambda () (bl.rpc:amount-from-value "0.000000001")))))
+  (is (= bl.rpc:+rpc-type-error+
          (%rpc-error-code
-          (lambda () (bl.rpc::%amount-from-value -1))))))
+          (lambda () (bl.rpc:amount-from-value -1))))))
 
 ;;; --- Balance rollups (wallet_balance.py) ---
 
@@ -174,7 +174,7 @@ trusted-change transitions exactly like Core's wallet_balance.py."
             (is (%wb= 50.0d0 (%wb-aval "trusted" mine)))
             (is (%wb= 0.0d0 (%wb-aval "immature" mine))))
           ;; Core rejects a non-"*" dummy with RPC_METHOD_DEPRECATED.
-          (is (= bl.rpc::+rpc-method-deprecated+
+          (is (= bl.rpc:+rpc-method-deprecated+
                  (%rpc-error-code
                   (lambda () (bl.wallet::rpc-getbalance node '(""))))))
           ;; Untrusted pending: an external (not-from-me) mempool payment.
@@ -257,7 +257,7 @@ lockunspent/listlockunspent with persistence across reload."
           (let ((entry (find addr1 coins :key (lambda (e) (%wb-aval "address" e))
                                          :test #'string=)))
             (is (not (null entry)))
-            (is (string= (bl.rpc::hash-to-hex cb1) (%wb-aval "txid" entry)))
+            (is (string= (bl.rpc:hash-to-hex cb1) (%wb-aval "txid" entry)))
             (is (= 0 (%wb-aval "vout" entry)))
             (is (= 103 (%wb-aval "confirmations" entry)))
             (is (%wb= 50.0d0 (%wb-aval "amount" entry)))
@@ -272,10 +272,10 @@ lockunspent/listlockunspent with persistence across reload."
         (let ((only (%wb-listunspent node 1 9999999 (list addr2))))
           (is (= 1 (length only)))
           (is (string= addr2 (%wb-aval "address" (first only)))))
-        (is (= bl.rpc::+rpc-invalid-address-or-key+
+        (is (= bl.rpc:+rpc-invalid-address-or-key+
                (%rpc-error-code
                 (lambda () (%wb-listunspent node 1 9999999 '("bogus"))))))
-        (is (= bl.rpc::+rpc-invalid-parameter+
+        (is (= bl.rpc:+rpc-invalid-parameter+
                (%rpc-error-code
                 (lambda () (%wb-listunspent node 1 9999999 (list addr1 addr1))))))
         ;; Depth windows.
@@ -294,51 +294,51 @@ lockunspent/listlockunspent with persistence across reload."
         (is (= 1 (length (%wb-listunspent node nil nil nil t
                                           (%ht "minimumSumAmount" 50)))))
         ;; Locking.
-        (let ((outpoint (%ht "txid" (bl.rpc::hash-to-hex cb1) "vout" 0)))
+        (let ((outpoint (%ht "txid" (bl.rpc:hash-to-hex cb1) "vout" 0)))
           (is (eq t (bl.wallet::rpc-lockunspent
                      node (list nil (list outpoint)))))
           (is (= 1 (length (%wb-listunspent node))))
           (let ((locked (bl.wallet::rpc-listlockunspent node nil)))
             (is (= 1 (length locked)))
-            (is (string= (bl.rpc::hash-to-hex cb1)
+            (is (string= (bl.rpc:hash-to-hex cb1)
                          (%wb-aval "txid" (first locked)))))
           ;; Already locked (non-persistent relock) / expected locked.
-          (is (= bl.rpc::+rpc-invalid-parameter+
+          (is (= bl.rpc:+rpc-invalid-parameter+
                  (%rpc-error-code
                   (lambda () (bl.wallet::rpc-lockunspent
                               node (list nil (list outpoint)))))))
           (is (eq t (bl.wallet::rpc-lockunspent
                      node (list t (list outpoint)))))
-          (is (= bl.rpc::+rpc-invalid-parameter+
+          (is (= bl.rpc:+rpc-invalid-parameter+
                  (%rpc-error-code
                   (lambda () (bl.wallet::rpc-lockunspent
                               node (list t (list outpoint)))))))
           ;; Unknown tx / out-of-bounds vout.
-          (is (= bl.rpc::+rpc-invalid-parameter+
+          (is (= bl.rpc:+rpc-invalid-parameter+
                  (%rpc-error-code
                   (lambda ()
                     (bl.wallet::rpc-lockunspent
                      node (list nil (list (%ht "txid" (make-string 64 :initial-element #\7)
                                                "vout" 0))))))))
-          (is (= bl.rpc::+rpc-invalid-parameter+
+          (is (= bl.rpc:+rpc-invalid-parameter+
                  (%rpc-error-code
                   (lambda ()
                     (bl.wallet::rpc-lockunspent
-                     node (list nil (list (%ht "txid" (bl.rpc::hash-to-hex cb1)
+                     node (list nil (list (%ht "txid" (bl.rpc:hash-to-hex cb1)
                                                "vout" 5))))))))
           ;; Persistent vs memory locks across a crash + reload.
           (is (eq t (bl.wallet::rpc-lockunspent
                      node (list nil (list outpoint) t))))
           (is (eq t (bl.wallet::rpc-lockunspent
                      node (list nil
-                                (list (%ht "txid" (bl.rpc::hash-to-hex cb2)
+                                (list (%ht "txid" (bl.rpc:hash-to-hex cb2)
                                            "vout" 0))))))
           (is (= 2 (length (bl.wallet::rpc-listlockunspent node nil))))
           (%crash-close-wallet node "w")
           (bl.wallet::rpc-loadwallet node '("w"))
           (let ((locked (bl.wallet::rpc-listlockunspent node nil)))
             (is (= 1 (length locked)))
-            (is (string= (bl.rpc::hash-to-hex cb1)
+            (is (string= (bl.rpc:hash-to-hex cb1)
                          (%wb-aval "txid" (first locked)))))
           ;; Unlock-all clears persistent locks too.
           (is (eq t (bl.wallet::rpc-lockunspent node (list t))))
@@ -368,7 +368,7 @@ to the same address."
                    (bl.wallet::rpc-listlabels node nil)))
         (is (equal '("" "gold")
                    (bl.wallet::rpc-listlabels node '("receive"))))
-        (is (= bl.rpc::+rpc-invalid-parameter+
+        (is (= bl.rpc:+rpc-invalid-parameter+
                (%rpc-error-code
                 (lambda () (bl.wallet::rpc-listlabels node '("bogus"))))))
         (let ((by-label (bl.wallet::rpc-getaddressesbylabel node '("gold"))))
@@ -377,7 +377,7 @@ to the same address."
           (is (string= "receive" (%wb-aval "purpose" (cdr (first by-label))))))
         ;; Relabel an own address: purpose stays receive.
         (bl.wallet::rpc-setlabel node (list bech32 "silver"))
-        (is (= bl.rpc::+rpc-wallet-invalid-label-name+
+        (is (= bl.rpc:+rpc-wallet-invalid-label-name+
                (%rpc-error-code
                 (lambda () (bl.wallet::rpc-getaddressesbylabel node '("gold"))))))
         (is (string= "receive"
@@ -391,10 +391,10 @@ to the same address."
                      (%wb-aval "purpose"
                                (cdr (first (bl.wallet::rpc-getaddressesbylabel
                                             node '("them")))))))
-        (is (= bl.rpc::+rpc-wallet-invalid-label-name+
+        (is (= bl.rpc:+rpc-wallet-invalid-label-name+
                (%rpc-error-code
                 (lambda () (bl.wallet::rpc-getaddressesbylabel node '("*"))))))
-        (is (= bl.rpc::+rpc-invalid-address-or-key+
+        (is (= bl.rpc:+rpc-invalid-address-or-key+
                (%rpc-error-code
                 (lambda () (bl.wallet::rpc-setlabel node '("bogus" "x"))))))
         ;; --- getaddressinfo per address type ---
@@ -467,7 +467,7 @@ to the same address."
             (is (null (%wb-aval "desc" i)))
             (is (null (%wb-aval "hdkeypath" i)))
             (is (equal '("them") (%wb-aval "labels" i)))))
-        (is (= bl.rpc::+rpc-invalid-address-or-key+
+        (is (= bl.rpc:+rpc-invalid-address-or-key+
                (%rpc-error-code
                 (lambda () (bl.wallet::rpc-getaddressinfo node '("nope"))))))))))
 
@@ -487,14 +487,14 @@ walletconflicts on both sides."
              (fund-txid (%wc-coinbase-txid node fund)))
         (%wc-mine node 101 (%wc-optrue-address))                   ; tip 103
         ;; Not-in-wallet txid; confirmed tx: both -5.
-        (is (= bl.rpc::+rpc-invalid-address-or-key+
+        (is (= bl.rpc:+rpc-invalid-address-or-key+
                (%rpc-error-code
                 (lambda () (bl.wallet::rpc-abandontransaction
                             node (list (make-string 64 :initial-element #\f)))))))
-        (is (= bl.rpc::+rpc-invalid-address-or-key+
+        (is (= bl.rpc:+rpc-invalid-address-or-key+
                (%rpc-error-code
                 (lambda () (bl.wallet::rpc-abandontransaction
-                            node (list (bl.rpc::hash-to-hex cb-txid)))))))
+                            node (list (bl.rpc:hash-to-hex cb-txid)))))))
         ;; Parent P spends our coinbase; child C spends P. Both in mempool.
         (let* ((addr-p (bl.wallet::rpc-getnewaddress node nil))
                (addr-c (bl.wallet::rpc-getnewaddress node nil)))
@@ -508,10 +508,10 @@ walletconflicts on both sides."
                                        4999980000)))
               (declare (ignore hex-c))
               ;; In-mempool: not eligible.
-              (is (= bl.rpc::+rpc-invalid-address-or-key+
+              (is (= bl.rpc:+rpc-invalid-address-or-key+
                      (%rpc-error-code
                       (lambda () (bl.wallet::rpc-abandontransaction
-                                  node (list (bl.rpc::hash-to-hex txid-p)))))))
+                                  node (list (bl.rpc:hash-to-hex txid-p)))))))
               (is (%wb= 49.9998d0 (bl.wallet::rpc-getbalance node nil)))
               ;; Evict both without a conflict: balance collapses (inputs
               ;; spent, change unavailable), coins vanish from listunspent.
@@ -523,7 +523,7 @@ walletconflicts on both sides."
               (is (= 0 (length (%wb-listunspent node 0))))
               ;; Abandon P: descendants abandoned, inputs respendable.
               (is (null (bl.wallet::rpc-abandontransaction
-                         node (list (bl.rpc::hash-to-hex txid-p)))))
+                         node (list (bl.rpc:hash-to-hex txid-p)))))
               (let ((wallet (%wc-wallet node "w")))
                 (is (eq t (bl.wallet::wallet-tx-abandoned
                            (bl.wallet::wallet-get-wallet-tx wallet txid-p))))
@@ -554,7 +554,7 @@ walletconflicts on both sides."
               ;; unspent-coinbase state.
               (%wb-evict-tx node txid-p)
               (bl.wallet::rpc-abandontransaction
-               node (list (bl.rpc::hash-to-hex txid-p)))))
+               node (list (bl.rpc:hash-to-hex txid-p)))))
           ;; --- Part 2: double spend -> walletconflicts on both sides ---
           (let* ((addr3 (bl.wallet::rpc-getnewaddress node nil))
                  (addr3x (bl.wallet::rpc-getnewaddress node nil))
@@ -571,16 +571,16 @@ walletconflicts on both sides."
             (let ((g3 (%wc-gettx node txid3))
                   (g3x (%wc-gettx node txid3x)))
               (is (= -1 (%wb-aval "confirmations" g3)))
-              (is (equal (list (bl.rpc::hash-to-hex txid3x))
+              (is (equal (list (bl.rpc:hash-to-hex txid3x))
                          (%wb-aval "walletconflicts" g3)))
               (is (= 1 (%wb-aval "confirmations" g3x)))
-              (is (equal (list (bl.rpc::hash-to-hex txid3))
+              (is (equal (list (bl.rpc:hash-to-hex txid3))
                          (%wb-aval "walletconflicts" g3x))))
             ;; Conflicted tx not eligible for abandonment (depth < 0).
-            (is (= bl.rpc::+rpc-invalid-address-or-key+
+            (is (= bl.rpc:+rpc-invalid-address-or-key+
                    (%rpc-error-code
                     (lambda () (bl.wallet::rpc-abandontransaction
-                                node (list (bl.rpc::hash-to-hex txid3)))))))
+                                node (list (bl.rpc:hash-to-hex txid3)))))))
             ;; Balance counts only the confirmed double spend.
             (let ((mine (%wb-balances node)))
               (is (%wb= 99.9998d0 (%wb-aval "trusted" mine)))))))))) ; 50 + 49.9998
@@ -632,7 +632,7 @@ listunspent flags them reused, and the destdata record survives reload."
             ;; getbalance avoid_reuse=true on a wallet without the flag: -4.
             (bl.wallet::rpc-createwallet node '("plain"))
             (let ((bl.wallet::*rpc-wallet-name* "plain"))
-              (is (= bl.rpc::+rpc-wallet-error+
+              (is (= bl.rpc:+rpc-wallet-error+
                      (%rpc-error-code
                       (lambda () (bl.wallet::rpc-getbalance
                                   node '("*" 0 nil t)))))))

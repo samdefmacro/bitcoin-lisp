@@ -152,7 +152,7 @@ The nesting rule is the one explicit false already follows — top level only."
     ;; iterate as the empty list.
     (is-true (bl.rpc::%positional-array-p bl.rpc::+json-empty-array+))
     (is-false (bl.rpc::%positional-array-p nil))
-    (is (null (bl.rpc::%positional-array bl.rpc::+json-empty-array+)))))
+    (is (null (bl.rpc:positional-array bl.rpc::+json-empty-array+)))))
 
 (test rpc-empty-array-argument-reaches-core-behaviour
   "What the distinction is FOR, at the two methods Core's suite checks.
@@ -170,34 +170,34 @@ empty array, so it earns the COUNT error, not a type error
         (progn (bl.rpc::rpc-getrawtransaction
                 node (list txid bl.rpc::+json-empty-array+))
                (fail "an empty array verbosity raised nothing"))
-      (bl.rpc::rpc-error (e)
-        (is (= -3 (bl.rpc::rpc-error-code e)))
+      (bl.rpc:rpc-error (e)
+        (is (= -3 (bl.rpc:rpc-error-code e)))
         (is (search "not of expected type number"
-                    (bl.rpc::rpc-error-message e))
-            "message was: ~A" (bl.rpc::rpc-error-message e))))
+                    (bl.rpc:rpc-error-message e))
+            "message was: ~A" (bl.rpc:rpc-error-message e))))
     ;; Null still means the default verbosity, so it gets past the check and
     ;; fails on the transaction being absent instead.
     (handler-case
         (progn (bl.rpc::rpc-getrawtransaction node (list txid nil))
                (fail "expected a lookup failure"))
-      (bl.rpc::rpc-error (e)
-        (is (/= -3 (bl.rpc::rpc-error-code e))
+      (bl.rpc:rpc-error (e)
+        (is (/= -3 (bl.rpc:rpc-error-code e))
             "null verbosity must not be read as a type error")))
     ;; The other direction: empty is an array, so the count error.
     (handler-case
         (progn (bl.rpc::rpc-testmempoolaccept
                 node (list bl.rpc::+json-empty-array+))
                (fail "expected the count error"))
-      (bl.rpc::rpc-error (e)
-        (is (= -8 (bl.rpc::rpc-error-code e)))
+      (bl.rpc:rpc-error (e)
+        (is (= -8 (bl.rpc:rpc-error-code e)))
         (is (search "Array must contain between"
-                    (bl.rpc::rpc-error-message e)))))
+                    (bl.rpc:rpc-error-message e)))))
     ;; And null is not an array at all.
     (handler-case
         (progn (bl.rpc::rpc-testmempoolaccept node (list nil))
                (fail "expected a type error"))
-      (bl.rpc::rpc-error (e)
-        (is (= -3 (bl.rpc::rpc-error-code e)))))))
+      (bl.rpc:rpc-error (e)
+        (is (= -3 (bl.rpc:rpc-error-code e)))))))
 
 (test getrawtransaction-not-found-speaks-cores-sentence
   "Core selects one of four not-found messages and appends the same sentence to
@@ -209,23 +209,23 @@ advice in a spelling no caller matching Core could find."
     (handler-case
         (progn (bl.rpc::rpc-getrawtransaction node (list txid))
                (fail "expected a not-found error"))
-      (bl.rpc::rpc-error (e)
-        (is (= -5 (bl.rpc::rpc-error-code e)))
+      (bl.rpc:rpc-error (e)
+        (is (= -5 (bl.rpc:rpc-error-code e)))
         (is (string= (concatenate 'string
                                   "No such mempool transaction. Use -txindex or provide a block "
                                   "hash to enable blockchain transaction queries. Use "
                                   "gettransaction for wallet transactions.")
-                     (bl.rpc::rpc-error-message e))
-            "message was: ~A" (bl.rpc::rpc-error-message e))))))
+                     (bl.rpc:rpc-error-message e))
+            "message was: ~A" (bl.rpc:rpc-error-message e))))))
 
 (test json-rpc-parse-invalid-json
   "Test parsing invalid JSON returns parse error"
-  (signals bl.rpc::rpc-error
+  (signals bl.rpc:rpc-error
     (bl.rpc::parse-json-rpc-request "not valid json")))
 
 (test json-rpc-parse-missing-method
   "Test parsing request without method returns error"
-  (signals bl.rpc::rpc-error
+  (signals bl.rpc:rpc-error
     (bl.rpc::parse-json-rpc-request "{\"jsonrpc\":\"2.0\",\"id\":1}")))
 
 ;;; --- Hash Hex Helper Tests ---
@@ -235,13 +235,13 @@ advice in a spelling no caller matching Core could find."
   (let* ((bytes (make-array 32 :element-type '(unsigned-byte 8)
                                :initial-contents (loop for i from 0 below 32
                                                        collect (+ #xe0 (mod i 16)))))
-         (hex (bl.rpc::hash-to-hex bytes)))
+         (hex (bl.rpc:hash-to-hex bytes)))
     (is (string= hex (string-downcase hex)))
     ;; Reversed: last byte (#xef) prints first.
     (is (string= "ef" (subseq hex 0 2)))
     ;; Round-trips through parse-hex-hash, which accepts either case.
-    (is (equalp bytes (bl.rpc::parse-hex-hash hex)))
-    (is (equalp bytes (bl.rpc::parse-hex-hash (string-upcase hex))))))
+    (is (equalp bytes (bl.rpc:parse-hex-hash hex)))
+    (is (equalp bytes (bl.rpc:parse-hex-hash (string-upcase hex))))))
 
 ;;; --- savemempool RPC Test ---
 
@@ -250,7 +250,7 @@ advice in a spelling no caller matching Core could find."
   (let* ((dir (merge-pathnames (format nil "savemempool-test-~D/" (get-universal-time))
                                (uiop:temporary-directory)))
          (node (make-test-node)))
-    (setf (bl::node-data-directory node) dir)
+    (setf (bl:node-data-directory node) dir)
     (unwind-protect
          (let ((r (bl.rpc::rpc-savemempool node nil)))
            (is (stringp (cdr (assoc "filename" r :test #'string=))))
@@ -276,9 +276,9 @@ the no-wallet/no-range constants; bad descriptors error."
                              (bl.rpc::rpc-getdescriptorinfo
                               node (list (concatenate 'string body "#fm24fxxy")))
                              :test #'string=))))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getdescriptorinfo node (list (concatenate 'string body "#deadbeef"))))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getdescriptorinfo node (list "sh(multi(2,03aa,03bb))")))))
 
 (test rpc-deriveaddresses
@@ -288,9 +288,9 @@ address-less scripts error; range on an unranged descriptor rejected."
   (let* ((node (make-test-node))   ; make-test-node is :testnet3
          (pk "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
          (keyhash (bl.crypto:hash160 (bl.crypto:hex-to-bytes pk))))
-    (flet ((descsum (body) (bl.rpc::descriptor-add-checksum body)))
+    (flet ((descsum (body) (bl.rpc:descriptor-add-checksum body)))
       ;; checksum is required (Core: "Missing checksum")
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-deriveaddresses node (list (format nil "pkh(~A)" pk))))
       ;; pkh -> single P2PKH address; matches the direct encoder.
       (let ((addrs (bl.rpc::rpc-deriveaddresses
@@ -306,10 +306,10 @@ address-less scripts error; range on an unranged descriptor rejected."
       (is (= 3 (length (bl.rpc::rpc-deriveaddresses
                         node (list (descsum (format nil "combo(~A)" pk)))))))
       ;; raw() non-standard script -> no address -> error
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-deriveaddresses node (list (descsum "raw(51)"))))
       ;; range argument rejected for an unranged descriptor
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-deriveaddresses
          node (list (descsum (format nil "wpkh(~A)" pk)) 5))))))
 
@@ -319,14 +319,14 @@ address-less scripts error; range on an unranged descriptor rejected."
   "prioritisetransaction adjusts the mempool delta map; getprioritisedtransactions
 reports fee_delta/in_mempool/modified_fee; getmempoolentry exposes fees.modified."
   (let* ((node (make-test-node))
-         (mempool (bl::node-mempool node))
+         (mempool (bl:node-mempool node))
          (txid-hex (make-string 64 :initial-element #\a)))
     ;; dummy must be 0/null; fee_delta must be an integer
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-prioritisetransaction node (list txid-hex 1 1000)))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-prioritisetransaction node (list txid-hex 0 "x")))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-prioritisetransaction node (list "nothex" 0 1000)))
     ;; Delta for a not-in-mempool tx is recorded and reported
     (is (eq t (bl.rpc::rpc-prioritisetransaction node (list txid-hex 0 2500))))
@@ -345,7 +345,7 @@ reports fee_delta/in_mempool/modified_fee; getmempoolentry exposes fees.modified
 error mapping (400 bad request / 404 not found / unknown endpoint)."
   (let ((node (make-test-node))
         (hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
-    (setf (bl::node-block-store node)
+    (setf (bl:node-block-store node)
           (bl.store:init-block-store
            (ensure-directories-exist
             (merge-pathnames (format nil "rest-test-~D/" (get-universal-time))
@@ -471,12 +471,12 @@ recovers exactly the matched leaves, across tree sizes and match sets."
   "gettxoutproof builds a proof a real block, verifytxoutproof confirms it
 when the block is on the active chain and rejects a root-mismatched proof."
   (let* ((node (make-test-node))
-         (chain-state (bl::node-chain-state node))
+         (chain-state (bl:node-chain-state node))
          (dir (ensure-directories-exist
                (merge-pathnames (format nil "txoutproof-~D/" (get-universal-time))
                                 (uiop:temporary-directory))))
          (block-store (bl.store:init-block-store dir)))
-    (setf (bl::node-block-store node) block-store)
+    (setf (bl:node-block-store node) block-store)
     ;; Build a 4-tx block (distinct coinbase-shaped txs).
     (let* ((txs (loop for i from 0 below 4
                       collect (bl.ser:make-transaction
@@ -514,14 +514,14 @@ when the block is on the active chain and rejects a root-mismatched proof."
                            :tx-count 4
                            :chain-work 1 :status :valid))
              (bl.store:update-chain-tip chain-state block-hash 0)
-             (let* ((target (bl.rpc::hash-to-hex (second txids)))
+             (let* ((target (bl.rpc:hash-to-hex (second txids)))
                     (proof (bl.rpc::rpc-gettxoutproof
-                            node (list (list target) (bl.rpc::hash-to-hex block-hash))))
+                            node (list (list target) (bl.rpc:hash-to-hex block-hash))))
                     (verified (bl.rpc::rpc-verifytxoutproof node (list proof))))
                (is (stringp proof))
                (is (equal (list target) verified))
                ;; Corrupt the proof's last hex nibble -> root/parse mismatch -> error.
-               (signals bl.rpc::rpc-error
+               (signals bl.rpc:rpc-error
                  (bl.rpc::rpc-verifytxoutproof
                   node (list (concatenate 'string (subseq proof 0 (- (length proof) 2)) "ff"))))
                ;; Same proof once its block is off the active chain. Core
@@ -542,7 +542,7 @@ when the block is on the active chain and rejects a root-mismatched proof."
                                :hash sibling :height 0 :header header
                                :chain-work 2 :status :valid))
                  (bl.store:update-chain-tip chain-state sibling 0)
-                 (signals bl.rpc::rpc-error
+                 (signals bl.rpc:rpc-error
                    (bl.rpc::rpc-verifytxoutproof node (list proof))))))
         (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
 
@@ -557,11 +557,11 @@ when the block is on the active chain and rejects a root-mismatched proof."
   (let ((body "raw(76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac)"))
     (is (string= "fm24fxxy" (bl.rpc::descriptor-checksum body)))
     (is (string= (concatenate 'string body "#fm24fxxy")
-                 (bl.rpc::descriptor-add-checksum body)))
+                 (bl.rpc:descriptor-add-checksum body)))
     ;; Correct checksum accepted, wrong checksum rejected.
     (finishes (bl.rpc::parse-output-descriptor
                (concatenate 'string body "#fm24fxxy") :mainnet))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::parse-output-descriptor
        (concatenate 'string body "#fm24fxxx") :mainnet))))
 
@@ -617,11 +617,11 @@ documented in descriptor.cpp as the address of the raw() example script."
       (is (not (equalp (bl.crypto:hex-to-bytes xonly-hex)
                        (subseq script 2)))))
     ;; Unsupported / invalid forms signal rpc-error
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::parse-output-descriptor "sh(multi(2,03aa,03bb))" :mainnet))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::parse-output-descriptor "addr(notanaddress)" :mainnet))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::parse-output-descriptor
        (format nil "wpkh(04~A)" (subseq pubkey-hex 2)) :mainnet))))
 
@@ -629,7 +629,7 @@ documented in descriptor.cpp as the address of the raw() example script."
   "scantxoutset start scans the UTXO set against descriptor needles;
 status with no scan running returns null; abort with no scan is a no-op."
   (let* ((node (make-test-node))
-         (utxo (bl::node-utxo-set node))
+         (utxo (bl:node-utxo-set node))
          (keyhash (make-array 20 :element-type '(unsigned-byte 8)
                                  :initial-element 7))
          (address (bl.crypto:encode-p2pkh-address keyhash :testnet3))
@@ -659,9 +659,9 @@ status with no scan running returns null; abort with no scan is a no-op."
     (is (null (bl.rpc::rpc-scantxoutset node (list "status"))))
     (is (eq 'yason:false (bl.rpc::rpc-scantxoutset node (list "abort"))))
     ;; Bad action / missing scanobjects -> errors.
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-scantxoutset node (list "frobnicate")))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-scantxoutset node (list "start")))))
 
 ;;; --- Response Formatting Tests ---
@@ -686,20 +686,20 @@ status with no scan running returns null; abort with no scan is a no-op."
 
 (test valid-hex-hash
   "Test hex hash validation"
-  (is (bl.rpc::valid-hex-hash-p
+  (is (bl.rpc:valid-hex-hash-p
        "0000000000000000000000000000000000000000000000000000000000000000"))
-  (is (bl.rpc::valid-hex-hash-p
+  (is (bl.rpc:valid-hex-hash-p
        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"))
-  (is (not (bl.rpc::valid-hex-hash-p "tooshort")))
-  (is (not (bl.rpc::valid-hex-hash-p
+  (is (not (bl.rpc:valid-hex-hash-p "tooshort")))
+  (is (not (bl.rpc:valid-hex-hash-p
             "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))
-  (is (not (bl.rpc::valid-hex-hash-p nil))))
+  (is (not (bl.rpc:valid-hex-hash-p nil))))
 
 ;;; --- Method Registry Tests ---
 
 (test method-dispatch-unknown
   "Test dispatching unknown method returns error"
-  (signals bl.rpc::rpc-error
+  (signals bl.rpc:rpc-error
     (bl.rpc:dispatch-rpc-method nil "unknownmethod" nil)))
 
 ;;; --- Integration Tests ---
@@ -713,7 +713,7 @@ status with no scan running returns null; abort with no scan is a no-op."
   ;; Start on an unusual port to avoid conflicts
   (with-temp-directory (dir)
     (let ((node (make-test-node)))
-      (setf (bl::node-data-directory node) dir)
+      (setf (bl:node-data-directory node) dir)
       (bl.rpc:start-rpc-server node :port 19999)
       (is (not (null bl.rpc:*rpc-server*)))
 
@@ -761,30 +761,30 @@ status with no scan running returns null; abort with no scan is a no-op."
   "Test getblockhash with invalid height returns error"
   (let ((node (make-test-node)))
     ;; Negative height
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockhash node '(-1)))
     ;; Non-integer height
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockhash node '("abc")))))
 
 (test rpc-getblock-invalid-hash
   "Test getblock with invalid hash returns error"
   (let ((node (make-test-node)))
     ;; Too short
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblock node '("abc")))
     ;; Invalid characters
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblock node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))
     ;; Non-integer/non-bool verbosity (Core: type error; any integer is valid)
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblock node
         '("0000000000000000000000000000000000000000000000000000000000000000" "5")))))
 
 (test rpc-getblockheader-invalid-hash
   "Test getblockheader with invalid hash returns error"
   (let ((node (make-test-node)))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockheader node '("tooshort")))))
 
 ;;; --- getrawtransaction verbosity + witness-complete hex ---
@@ -795,12 +795,12 @@ EncodeHexTx — and the verbosity argument follows Core ParseVerbosity: 0, false
 and absent return hex (verbosity 0 is Core's default but was truthy in Lisp);
 1, true and 2 return the decoded object; a string errors."
   (let* ((node (make-test-node))
-         (mempool (bl::node-mempool node))
+         (mempool (bl:node-mempool node))
          (raw (make-witness-test-tx-bytes))
          (tx (flexi-streams:with-input-from-sequence (s raw)
                (bl.ser:read-transaction s)))
          (txid (bl.ser:transaction-hash tx))
-         (txid-hex (bl.rpc::hash-to-hex txid)))
+         (txid-hex (bl.rpc:hash-to-hex txid)))
     (is (eq :ok (bl.mp:mempool-add
                  mempool txid (bl.mp:make-entry-from-tx tx 1000 0))))
     ;; Hex-returning verbosities: absent, 0, false (NIL).
@@ -822,7 +822,7 @@ and absent return hex (verbosity 0 is Core's default but was truthy in Lisp);
         (is (equalp raw (bl.crypto:hex-to-bytes
                          (cdr (assoc "hex" r :test #'string=)))))))
     ;; Non-integer/non-bool verbosity → type error (Core getInt<int> throw).
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getrawtransaction node (list txid-hex "abc")))))
 
 ;;; --- getorphantxs wire hex + verbosity validation ---
@@ -843,9 +843,9 @@ out-of-range or boolean verbosity like Core (ParseVerbosity allow_bool=false)."
     ;; (null ...), i.e. the bug: NIL encodes as JSON null, not [].
     (is (equalp #() (bl.rpc::rpc-getorphantxs node nil)))
     (is (equalp #() (bl.rpc::rpc-getorphantxs node (list 2))))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getorphantxs node (list 3)))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getorphantxs node (list t)))))
 
 ;;; --- Empty collections render [] / {} , never null ---
@@ -865,7 +865,7 @@ producing site coerces with json-array / json-object. Verified live before the
 fix: listbanned and getaddednodeinfo answered result:null."
   (bl.net:clear-ban-list)
   (let* ((node (make-test-node))
-         (mempool (bl::node-mempool node)))
+         (mempool (bl:node-mempool node)))
     ;; The premise: a bare NIL really does encode as null. Without this the
     ;; assertions below could pass for the wrong reason.
     (is (string= "null" (%encode-rpc-result nil)))
@@ -906,14 +906,14 @@ fix: listbanned and getaddednodeinfo answered result:null."
           (car site) (%encode-rpc-result (cdr site))))
     ;; A node with no mempool at all takes getrawmempool's other early branch,
     ;; which must still pick the shape by verbosity.
-    (setf (bl::node-mempool node) nil)
+    (setf (bl:node-mempool node) nil)
     (is (string= "[]" (%encode-rpc-result (bl.rpc::rpc-getrawmempool node nil))))
     (is (string= "{}" (%encode-rpc-result (bl.rpc::rpc-getrawmempool node (list t))))))
   ;; CONTROL 1 — populated collections keep their existing shape: an array of
   ;; JSON objects, not a vector of unencodable dotted pairs.
   (let ((node (make-test-node)))
-    (setf (bl::node-peers node)
-          (list (bl::make-peer :address "1.2.3.4:48333" :user-agent "/t/" :state :ready)))
+    (setf (bl:node-peers node)
+          (list (bl.net:make-peer :address "1.2.3.4:48333" :user-agent "/t/" :state :ready)))
     (bl.rpc::rpc-addnode node (list "192.0.2.10:48333" "add"))
     (bl.rpc::rpc-setban node (list "1.2.3.4" "add"))
     (let ((peers (%encode-rpc-result (bl.rpc::rpc-getpeerinfo node nil)))
@@ -937,21 +937,21 @@ fix: listbanned and getaddednodeinfo answered result:null."
   "Test gettxout with invalid txid returns error"
   (let ((node (make-test-node)))
     ;; Too short txid
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-gettxout node '("abc" 0)))
     ;; Invalid characters
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-gettxout node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" 0)))))
 
 (test rpc-gettxout-invalid-vout
   "Test gettxout with invalid vout returns error"
   (let ((node (make-test-node)))
     ;; Negative vout
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-gettxout node
         '("0000000000000000000000000000000000000000000000000000000000000000" -1)))
     ;; Non-integer vout
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-gettxout node
         '("0000000000000000000000000000000000000000000000000000000000000000" "abc")))))
 
@@ -972,11 +972,11 @@ used to emit it verbatim, which yason cannot encode."
   (let* ((node (make-test-node))
          (vmsg (bl.ser::make-version-message
                 :version 70016 :start-height 42 :user-agent "/test/"))
-         (peer (bl::make-peer :address "1.2.3.4:48333" :state :ready
+         (peer (bl.net:make-peer :address "1.2.3.4:48333" :state :ready
                                         :version vmsg
                                         :user-agent "/test/"
                                         :start-height 42)))
-    (setf (bl::node-peers node) (list peer))
+    (setf (bl:node-peers node) (list peer))
     (let* ((result (bl.rpc::rpc-getpeerinfo node nil))
            (entry (first result)))
       (is (listp result))
@@ -1056,7 +1056,7 @@ node, not null (it used to assert only LISTP, which NIL satisfies)."
   "getrawmempool verbose returns a per-tx detail alist (txid -> fields) that the
 RPC layer normalizes into a JSON object."
   (let* ((node (make-test-node))
-         (mempool (bl::node-mempool node))
+         (mempool (bl:node-mempool node))
          (tx (make-mempool-test-tx :input-id 200))
          (txid (bl.ser:transaction-hash tx)))
     ;; Empty mempool -> Core's empty VOBJ, i.e. an empty JSON object, not
@@ -1068,7 +1068,7 @@ RPC layer normalizes into a JSON object."
     (bl.mp:mempool-add
      mempool txid (bl.mp:make-entry-from-tx tx 1000 0))
     (let* ((result (bl.rpc::rpc-getrawmempool node '(t)))
-           (entry (cdr (assoc (bl.rpc::hash-to-hex txid) result :test #'string=))))
+           (entry (cdr (assoc (bl.rpc:hash-to-hex txid) result :test #'string=))))
       (is (listp result))
       (is (not (null entry)))
       (is (assoc "vsize" entry :test #'string=))
@@ -1082,14 +1082,14 @@ RPC layer normalizes into a JSON object."
 RPC_DESERIALIZATION_ERROR (-22), matching Core."
   (let ((node (make-test-node)))
     ;; Empty string
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-sendrawtransaction node '("")))
     ;; Invalid hex -> deserialization error code -22
     (handler-case
         (progn (bl.rpc::rpc-sendrawtransaction node '("not-valid-hex"))
                (fail "expected rpc-error"))
-      (bl.rpc::rpc-error (e)
-        (is (= -22 (bl.rpc::rpc-error-code e)))))))
+      (bl.rpc:rpc-error (e)
+        (is (= -22 (bl.rpc:rpc-error-code e)))))))
 
 (test rpc-sendrawtransaction-rejection-speaks-core
   "The rejection carries Core's reject reason and Core's split of codes.
@@ -1107,12 +1107,12 @@ code, carrying an uppercased Lisp keyword no client can match on."
     (handler-case
         (progn (bl.rpc::rpc-sendrawtransaction node (list hex))
                (fail "expected rpc-error"))
-      (bl.rpc::rpc-error (e)
+      (bl.rpc:rpc-error (e)
         ;; Note this surface says bad-txns-inputs-missingorspent, NOT
         ;; testmempoolaccept's "missing-inputs".
-        (is (= -25 (bl.rpc::rpc-error-code e)))
+        (is (= -25 (bl.rpc:rpc-error-code e)))
         (is (string= "bad-txns-inputs-missingorspent"
-                     (bl.rpc::rpc-error-message e)))))))
+                     (bl.rpc:rpc-error-message e)))))))
 
 ;;; --- sendrawtransaction broadcast (unbroadcast set + peer announcement) ---
 ;;;
@@ -1121,11 +1121,11 @@ code, carrying an uppercased Lisp keyword no client can match on."
 
 (defun %broadcast-test-node (utxo-set mempool chain-state peer)
   "A test node wired to the fixture state with one ready relay peer."
-  (let ((node (bl::make-node :network :testnet3)))
-    (setf (bl::node-chain-state node) chain-state
-          (bl::node-utxo-set node) utxo-set
-          (bl::node-mempool node) mempool
-          (bl::node-peers node) (list peer))
+  (let ((node (bl:make-node :network :testnet3)))
+    (setf (bl:node-chain-state node) chain-state
+          (bl:node-utxo-set node) utxo-set
+          (bl:node-mempool node) mempool
+          (bl:node-peers node) (list peer))
     node))
 
 (test rpc-sendrawtransaction-broadcasts
@@ -1142,19 +1142,19 @@ unbroadcast set."
            (hex (bl.crypto:bytes-to-hex
                  (bl.ser:serialize-transaction tx))))
       (let ((r (bl.rpc::rpc-sendrawtransaction node (list hex))))
-        (is (string= (bl.rpc::hash-to-hex txid) r)))
+        (is (string= (bl.rpc:hash-to-hex txid) r)))
       (is-true (bl.mp:mempool-has mempool txid))
       ;; Tracked for initial broadcast...
       (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))
       (is-true (gethash txid (bl.mp:mempool-unbroadcast mempool)))
       ;; ...and queued to the relay peer (flushed later by the Poisson timer).
-      (is (= 1 (length (bl.net::peer-tx-inv-queue peer))))
-      (is (equalp txid (first (first (bl.net::peer-tx-inv-queue peer)))))
+      (is (= 1 (length (bl.net:peer-tx-inv-queue peer))))
+      (is (equalp txid (first (first (bl.net:peer-tx-inv-queue peer)))))
       ;; Resubmission: same txid returned, another announcement queued,
       ;; unbroadcast set unchanged.
       (let ((r2 (bl.rpc::rpc-sendrawtransaction node (list hex))))
-        (is (string= (bl.rpc::hash-to-hex txid) r2)))
-      (is (= 2 (length (bl.net::peer-tx-inv-queue peer))))
+        (is (string= (bl.rpc:hash-to-hex txid) r2)))
+      (is (= 2 (length (bl.net:peer-tx-inv-queue peer))))
       (is (= 1 (bl.mp:mempool-unbroadcast-count mempool))))))
 
 (test rpc-testmempoolaccept-does-not-broadcast
@@ -1170,7 +1170,7 @@ the unbroadcast set, and no announcement is queued."
         (is (eq t (cdr (assoc "allowed" r :test #'string=)))))
       (is (= 0 (bl.mp:mempool-count mempool)))
       (is (= 0 (bl.mp:mempool-unbroadcast-count mempool)))
-      (is (null (bl.net::peer-tx-inv-queue peer))))))
+      (is (null (bl.net:peer-tx-inv-queue peer))))))
 
 (test rpc-testmempoolaccept-policy-script-reject-reason
   "A consensus-valid but policy-invalid spend (CLEANSTACK: extra scriptSig
@@ -1204,9 +1204,9 @@ validation.cpp:2117) through testmempoolaccept."
 (defun %rails-error (thunk)
   "(values code message) of the rpc-error THUNK signals, or NIL if it returns."
   (handler-case (progn (funcall thunk) nil)
-    (bl.rpc::rpc-error (e)
-      (values (bl.rpc::rpc-error-code e)
-              (bl.rpc::rpc-error-message e)))))
+    (bl.rpc:rpc-error (e)
+      (values (bl.rpc:rpc-error-code e)
+              (bl.rpc:rpc-error-message e)))))
 
 (defun %burn-tx (funding-txid value)
   "A P2SH(OP_TRUE) spend paying VALUE to a provably-unspendable OP_RETURN."
@@ -1243,13 +1243,13 @@ test_accept first and only submits once the fee is under the rail
         (is-true (search "Fee exceeds maximum" msg)))
       ;; The control that matters: the rail ran BEFORE submission.
       (is (= 0 (bl.mp:mempool-count mempool)))
-      (is (null (bl.net::peer-tx-inv-queue peer)))
+      (is (null (bl.net:peer-tx-inv-queue peer)))
       ;; Disabled explicitly -> the very same tx is accepted and announced.
-      (is (string= (bl.rpc::hash-to-hex
+      (is (string= (bl.rpc:hash-to-hex
                     (bl.ser:transaction-hash tx))
                    (bl.rpc::rpc-sendrawtransaction node (list hex 0))))
       (is (= 1 (bl.mp:mempool-count mempool)))
-      (is (= 1 (length (bl.net::peer-tx-inv-queue peer)))))))
+      (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))))))
 
 (test rpc-sendrawtransaction-maxfeerate-rejects-one-btc
   "ParseFeeRate refuses a rate at or above 1 BTC/kvB with -8
@@ -1374,7 +1374,7 @@ unlocked RPC mutation would interleave with them.)"
          (txid-hex (format nil "~64,'0d" 1))
          (done (cons nil nil))
          (thread nil))
-    (bt:with-recursive-lock-held ((bl::node-lock node))
+    (bt:with-recursive-lock-held ((bl:node-lock node))
       (setf thread
             (bt:make-thread
              (lambda ()
@@ -1390,9 +1390,9 @@ unlocked RPC mutation would interleave with them.)"
     ;; Lock released — the handler must now complete and take effect.
     (bt:join-thread thread)
     (is (eq t (car done)))
-    (is (= 12345 (gethash (bl.rpc::parse-hex-hash txid-hex)
+    (is (= 12345 (gethash (bl.rpc:parse-hex-hash txid-hex)
                           (bl.mp:mempool-deltas
-                           (bl::node-mempool node))
+                           (bl:node-mempool node))
                           0)))))
 
 (test rpc-concurrent-mempool-smoke
@@ -1473,7 +1473,7 @@ with zero thread errors and every submitted tx in the pool exactly once."
   "getmempoolinfo reports the live unbroadcast set size (Core
 rpc/mempool.cpp:1047)."
   (let* ((node (make-test-node))
-         (mempool (bl::node-mempool node))
+         (mempool (bl:node-mempool node))
          (tx (make-mempool-test-tx :input-id 201))
          (txid (bl.ser:transaction-hash tx)))
     (is (= 0 (cdr (assoc "unbroadcastcount"
@@ -1489,7 +1489,7 @@ rpc/mempool.cpp:1047)."
 (defun %mempool-node (&optional (funding-outputs 1))
   "A test node on a fresh make-package-fixture whose UTXO set holds FUNDING-OUTPUTS
 confirmed spendable coins (vouts 0..n-1 of the fixture's funding txid), so a
-saved mempool can be reloaded against it. Use (bl::node-mempool node)
+saved mempool can be reloaded against it. Use (bl:node-mempool node)
 for the pool."
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (make-package-fixture)
     (declare (ignore mempool))
@@ -1504,7 +1504,7 @@ for the pool."
   "Write a mempool.dat holding three INDEPENDENT txs (so reload order cannot
 matter), one of them unbroadcast. Returns the list of txids."
   (multiple-value-bind (node funding-txid) (%mempool-node 3)
-    (let ((mempool (bl::node-mempool node))
+    (let ((mempool (bl:node-mempool node))
           (txids '()))
       (dotimes (i 3)
         (let* ((tx (%pkg-tx funding-txid i (- 100000000 10000)))
@@ -1531,11 +1531,11 @@ restored for transactions that never came back."
          (let ((txids (%write-mempool-file path)))
            ;; Interrupted: fires once the first tx is in, so exactly one loads.
            (let* ((node (%mempool-node 3))
-                  (mempool (bl::node-mempool node))
+                  (mempool (bl:node-mempool node))
                   (bl:*interrupt-check*
                     (lambda () (plusp (bl.mp:mempool-count mempool)))))
              (multiple-value-bind (accepted failed residual)
-                 (bl::load-mempool-from-disk node path)
+                 (bl:load-mempool-from-disk node path)
                (declare (ignore failed))
                (is (= 1 accepted) "the load stops at the first boundary after the flag")
                (is (= 0 residual)))
@@ -1546,8 +1546,8 @@ restored for transactions that never came back."
            ;; this the assertions above would also pass on a file that never
            ;; had three loadable txs in it.
            (let* ((node (%mempool-node 3))
-                  (mempool (bl::node-mempool node)))
-             (is (= 3 (bl::load-mempool-from-disk node path)))
+                  (mempool (bl:node-mempool node)))
+             (is (= 3 (bl:load-mempool-from-disk node path)))
              (is (= 3 (bl.mp:mempool-count mempool)))
              (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))
              (dolist (txid txids)
@@ -1567,7 +1567,7 @@ Registering is also what lets the polling loops abandon their work."
         (bl::*shutdown-request* nil))
     (is-true (bl::%handle-stop-signal)
              "mid-startup: register only, never tear down")
-    (is (equal "SIGTERM/SIGINT" (bl::node-shutdown-requested-p)))
+    (is (equal "SIGTERM/SIGINT" (bl:node-shutdown-requested-p)))
     ;; …and that registration is exactly what the cooperative loops poll.
     (is-true (bl:interrupt-requested-p)))
   ;; The other branch — neither latch set, so the handler tears down inline —
@@ -1593,7 +1593,7 @@ the total and reports every 10% (mempool_persist.cpp:77-86)."
            (let* ((node (%mempool-node 3))
                   (logged (with-output-to-string (out)
                             (let ((bl:*log-stream* out))
-                              (bl::load-mempool-from-disk node path)))))
+                              (bl:load-mempool-from-disk node path)))))
              (is (search "Loading 3 mempool transactions" logged)
                  "the size is announced before the work starts")
              (is (search "Progress loading mempool transactions" logged)
@@ -1623,13 +1623,13 @@ rpc/mempool.cpp:1115-1116)."
                (bl.mp:save-mempool-file mempool path)))
            ;; importmempool default: entries load, unbroadcast NOT applied.
            (let* ((node (%mempool-node))
-                  (mempool (bl::node-mempool node)))
+                  (mempool (bl:node-mempool node)))
              (bl.rpc::rpc-importmempool node (list (namestring path)))
              (is-true (bl.mp:mempool-has mempool txid))
              (is (= 0 (bl.mp:mempool-unbroadcast-count mempool))))
            ;; importmempool with apply_unbroadcast_set=true restores the set.
            (let* ((node (%mempool-node))
-                  (mempool (bl::node-mempool node))
+                  (mempool (bl:node-mempool node))
                   (opts (make-hash-table :test 'equal)))
              (setf (gethash "apply_unbroadcast_set" opts) t)
              (bl.rpc::rpc-importmempool node (list (namestring path) opts))
@@ -1637,8 +1637,8 @@ rpc/mempool.cpp:1115-1116)."
              (is-true (gethash txid (bl.mp:mempool-unbroadcast mempool))))
            ;; Startup path (load-mempool-from-disk) applies it by default.
            (let* ((node (%mempool-node))
-                  (mempool (bl::node-mempool node)))
-             (bl::load-mempool-from-disk node path)
+                  (mempool (bl:node-mempool node)))
+             (bl:load-mempool-from-disk node path)
              (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))
              (is-true (gethash txid (bl.mp:mempool-unbroadcast mempool)))))
       (ignore-errors (delete-file path)))))
@@ -1648,10 +1648,10 @@ rpc/mempool.cpp:1115-1116)."
 a hardcoded 1."
   (multiple-value-bind (cs entries) (%make-served-chain 5)  ; genesis..height 5
     (let ((node (make-test-node)))
-      (setf (bl::node-chain-state node) cs)
+      (setf (bl:node-chain-state node) cs)
       ;; height 3 -> 5 - 3 + 1 = 3 confirmations, plus the shared chain-header fields
       (let ((r (bl.rpc::rpc-getblockheader
-                node (list (bl.rpc::hash-to-hex (%entry-hash entries 3))))))
+                node (list (bl.rpc:hash-to-hex (%entry-hash entries 3))))))
         (is (= 3 (cdr (assoc "height" r :test #'string=))))
         (is (= 3 (cdr (assoc "confirmations" r :test #'string=))))
         (is (= 8 (length (cdr (assoc "versionHex" r :test #'string=)))))
@@ -1664,7 +1664,7 @@ a hardcoded 1."
         (is (assoc "nextblockhash" r :test #'string=)))
       ;; tip (height 5) -> 1 confirmation, no nextblockhash
       (let ((r (bl.rpc::rpc-getblockheader
-                node (list (bl.rpc::hash-to-hex (%entry-hash entries 5))))))
+                node (list (bl.rpc:hash-to-hex (%entry-hash entries 5))))))
         (is (= 1 (cdr (assoc "confirmations" r :test #'string=))))
         (is (null (assoc "nextblockhash" r :test #'string=)))))))
 
@@ -1705,7 +1705,7 @@ active tip). G, A and B are bound to (block . hash) conses."
                    (merge-pathnames (format nil "hdrfields-~D/" (get-internal-real-time))
                                     (uiop:temporary-directory))))
             (,store (bl.store:init-block-store ,dir)))
-       (setf (bl::node-block-store ,node) ,store)
+       (setf (bl:node-block-store ,node) ,store)
        (unwind-protect
             (let* ((gb (%hdrfields-block (list (%hdrfields-tx 1)) (make-32-byte-hash 0) 1700000000))
                    (gh (bl.ser:block-header-hash
@@ -1717,9 +1717,9 @@ active tip). G, A and B are bound to (block . hash) conses."
                    (bh (bl.ser:block-header-hash
                         (bl.ser:bitcoin-block-header bb)))
                    (,g (cons gb gh)) (,a (cons ab ah)) (,b (cons bb bh))
-                   (cs (bl::node-chain-state ,node)))
+                   (cs (bl:node-chain-state ,node)))
               (declare (ignorable ,g ,a ,b))
-              (setf (bl.store::chain-state-genesis-hash cs) gh)
+              (setf (bl.store:chain-state-genesis-hash cs) gh)
               ;; B is header-only on purpose: its body is never stored.
               (bl.store:store-block ,store gb)
               (bl.store:store-block ,store ab)
@@ -1747,7 +1747,7 @@ missing key; given the all-zero hash it asks for a block nobody has and errors."
   (%with-hdrfields-chain (node store g a b)
     (flet ((hdr (hash)
              (bl.rpc::rpc-getblockheader
-              node (list (bl.rpc::hash-to-hex hash)))))
+              node (list (bl.rpc:hash-to-hex hash)))))
       (let ((gj (hdr (cdr g))) (aj (hdr (cdr a))) (bj (hdr (cdr b))))
         ;; nTx is always present. Genesis carries its coinbase; A's index entry
         ;; predates the tx-count field and is backfilled from the block store;
@@ -1760,9 +1760,9 @@ missing key; given the all-zero hash it asks for a block nobody has and errors."
         (is (not (search "previousblockhash" (%encode-rpc-result gj))))
         ;; ...CONTROL: every other header still carries it, naming the real
         ;; parent (so the omission is genesis-specific, not a blanket drop).
-        (is (string= (bl.rpc::hash-to-hex (cdr g))
+        (is (string= (bl.rpc:hash-to-hex (cdr g))
                      (cdr (assoc "previousblockhash" aj :test #'string=))))
-        (is (string= (bl.rpc::hash-to-hex (cdr a))
+        (is (string= (bl.rpc:hash-to-hex (cdr a))
                      (cdr (assoc "previousblockhash" bj :test #'string=))))
         ;; The fields survive the encoder.
         (is (search "\"nTx\":2" (%encode-rpc-result aj)))))))
@@ -1776,7 +1776,7 @@ too."
   (%with-hdrfields-chain (node store g a b)
     (flet ((blk (hash &optional (verbosity 1))
              (bl.rpc::rpc-getblock
-              node (list (bl.rpc::hash-to-hex hash) verbosity))))
+              node (list (bl.rpc:hash-to-hex hash) verbosity))))
       (let* ((gj (blk (cdr g)))
              (cb (cdr (assoc "coinbase_tx" gj :test #'string=))))
         (is (not (null cb)) "getblock must emit coinbase_tx")
@@ -1791,7 +1791,7 @@ too."
         ;; Genesis omits previousblockhash here as well...
         (is (null (assoc "previousblockhash" gj :test #'string=)))
         ;; ...CONTROL: a non-genesis block still reports it.
-        (is (string= (bl.rpc::hash-to-hex (cdr g))
+        (is (string= (bl.rpc:hash-to-hex (cdr g))
                      (cdr (assoc "previousblockhash" (blk (cdr a)) :test #'string=))))
         ;; Verbosity 2 (full tx detail) carries coinbase_tx too; verbosity 0 is
         ;; untouched raw hex.
@@ -1806,7 +1806,7 @@ reserved value), matching Core's `if (!witness_stack.empty())`."
                (merge-pathnames (format nil "cbwitness-~D/" (get-internal-real-time))
                                 (uiop:temporary-directory))))
          (store (bl.store:init-block-store dir)))
-    (setf (bl::node-block-store node) store)
+    (setf (bl:node-block-store node) store)
     (unwind-protect
          (let* ((reserved (make-32-byte-hash 0))
                 (blk (%hdrfields-block (list (%hdrfields-tx 8 :witness reserved))
@@ -1816,7 +1816,7 @@ reserved value), matching Core's `if (!witness_stack.empty())`."
            (bl.store:store-block store blk)
            (let ((cb (cdr (assoc "coinbase_tx"
                                  (bl.rpc::rpc-getblock
-                                  node (list (bl.rpc::hash-to-hex hash) 1))
+                                  node (list (bl.rpc:hash-to-hex hash) 1))
                                  :test #'string=))))
              (is (not (null cb)))
              (when cb
@@ -2132,12 +2132,12 @@ silently: a list is an \"array\", a hash-table an \"object\", and the false
 sentinel a \"bool\"."
   (flet ((message (value expected)
            (handler-case (progn (bl.rpc::%json-type-error value expected) nil)
-             (bl.rpc::rpc-error (e)
-               (bl.rpc::rpc-error-message e))))
+             (bl.rpc:rpc-error (e)
+               (bl.rpc:rpc-error-message e))))
          (code (value expected)
            (handler-case (progn (bl.rpc::%json-type-error value expected) nil)
-             (bl.rpc::rpc-error (e)
-               (bl.rpc::rpc-error-code e)))))
+             (bl.rpc:rpc-error (e)
+               (bl.rpc:rpc-error-code e)))))
     (is (equal "JSON value of type string is not of expected type array"
                (message "abc" "array")))
     (is (equal "JSON value of type number is not of expected type string"
@@ -2147,10 +2147,10 @@ sentinel a \"bool\"."
     (is (equal "JSON value of type object is not of expected type array"
                (message (make-hash-table :test 'equal) "array")))
     (is (equal "JSON value of type bool is not of expected type number"
-               (message bl.rpc::+json-false+ "number"))
+               (message bl.rpc:+json-false+ "number"))
         "the false sentinel must name itself bool, not null")
     ;; Core answers RPC_TYPE_ERROR (-3) for these, not a generic parameter error.
-    (is (eql bl.rpc::+rpc-type-error+ (code "abc" "array")))))
+    (is (eql bl.rpc:+rpc-type-error+ (code "abc" "array")))))
 
 (test createrawtransaction-accepts-real-json-objects
   "A JSON object reaches an RPC handler as a HASH-TABLE from the decoder and as
@@ -2167,7 +2167,7 @@ the correct code was present and unused.
 Both shapes must produce the SAME transaction, which is the property that
 makes the tests meaningful again."
   (let* ((bl:*network* :regtest)
-         (node (bl::make-node :network :regtest))
+         (node (bl:make-node :network :regtest))
          (txid "0000000000000000000000000000000000000000000000000000000000000001")
          (addr "bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy")
          (as-hash (bl.rpc::rpc-createrawtransaction
@@ -2200,7 +2200,7 @@ answered \"Invalid outputs format\", a data output was impossible, and duplicate
 addresses passed silently. The twelfth time this wave that the code existed and
 the caller that needed it did not use it."
   (let* ((bl:*network* :regtest)
-         (node (bl::make-node :network :regtest))
+         (node (bl:make-node :network :regtest))
          (txid "0000000000000000000000000000000000000000000000000000000000000001")
          (addr "bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy")
          (addr2 "bcrt1qqurswpc8qurswpc8qurswpc8qurswpc8dxm0gk"))
@@ -2240,7 +2240,7 @@ the caller that needed it did not use it."
         (is (= 0 (bl.ser:tx-out-value out)))
         (is (= #x6a (aref spk 0)) "a data output must be an OP_RETURN"))
       ;; Duplicates are refused, where the old loop accepted them silently.
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-createrawtransaction
          node (list (ins) (list (obj addr 0.5d0) (obj addr 0.25d0))))))))
 
@@ -2257,7 +2257,7 @@ Signing needs a key we do not have here; what this pins is that the prevout map
 is BUILT from either shape, so the two must fail identically and never with an
 internal error."
   (let* ((bl:*network* :regtest)
-         (node (bl::make-node :network :regtest))
+         (node (bl:make-node :network :regtest))
          (txid "0000000000000000000000000000000000000000000000000000000000000001")
          (spk "76a91460baa0f494b38ce3c940dea67f3804dc52d1fb9488ac")
          (raw (bl.rpc::rpc-createrawtransaction
@@ -2295,7 +2295,7 @@ The checksum is validated ONCE, on the multipath form it actually covers; the
 expansions carry none by construction, so requiring one per expansion answers
 \"Missing checksum\" for a descriptor whose checksum was correct."
   (let* ((bl:*network* :regtest)
-         (node (bl::make-node :network :regtest))
+         (node (bl:make-node :network :regtest))
          (body (concatenate 'string
                             "wpkh(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZ"
                             "mbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRv"
@@ -2371,12 +2371,12 @@ this rule is ours, and it has to mean what it says."
         (behind (bl.net:make-peer :address "10.2.2.3" :state :ready
                                                    :start-height 5)))
     ;; Unknown is not "behind", at any height of ours.
-    (is-false (bl.net::consider-peer-eviction unknown 100000)
+    (is-false (bl.net:consider-peer-eviction unknown 100000)
               "a peer advertising an unknown height was evicted as if it were behind")
     ;; A peer that really is far behind still goes.
-    (is-true (bl.net::consider-peer-eviction behind 100000))
+    (is-true (bl.net:consider-peer-eviction behind 100000))
     ;; ...and one that is only a little behind stays.
-    (is-false (bl.net::consider-peer-eviction behind 500)))
+    (is-false (bl.net:consider-peer-eviction behind 500)))
   ;; The hazard is real: the slot is (UNSIGNED-BYTE 32), so a raw -1 signals.
   ;; Asserted rather than assumed, because if the slot type ever widened this
   ;; test would otherwise keep passing while testing nothing.
@@ -2429,15 +2429,15 @@ We keep it as a flag internally on purpose: the outbound-slot budgets are
 written against the automatic types, and a manual peer occupies none of them in
 Core either. What has to agree is the report."
   (let ((node (make-test-node))
-        (manual (bl::make-peer :address "10.1.1.1" :state :ready))
-        (auto (bl::make-peer :address "10.1.1.2" :state :ready
+        (manual (bl.net:make-peer :address "10.1.1.1" :state :ready))
+        (auto (bl.net:make-peer :address "10.1.1.2" :state :ready
                                        :conn-type :outbound-full-relay))
-        (inbound (bl::make-peer :address "10.1.1.3" :state :ready :inbound t)))
+        (inbound (bl.net:make-peer :address "10.1.1.3" :state :ready :inbound t)))
     (setf (bl.net:peer-manual manual) t)
     ;; An INBOUND peer is never "manual", whatever flags it carries: Core's
     ;; inbound connections are ConnectionType::INBOUND, full stop.
     (setf (bl.net:peer-manual inbound) t)
-    (setf (bl::node-peers node) (list manual auto inbound))
+    (setf (bl:node-peers node) (list manual auto inbound))
     (let* ((rows (bl.rpc::%peerinfo-rows node))
            (types (mapcar (lambda (r) (cdr (assoc "connection_type" r :test #'string=)))
                           rows)))
@@ -2459,7 +2459,7 @@ tip, timed out against a node working perfectly in isolation.
 Two halves, because either alone would pass against the bug: that a NIL source
 peer excludes nobody (a locally mined block has no source to skip), and that
 the submitblock path actually makes the call."
-  (let ((peer (bl::make-peer :address "10.9.9.9" :state :ready)))
+  (let ((peer (bl.net:make-peer :address "10.9.9.9" :state :ready)))
     ;; A ready peer with no connection: SEND-MESSAGE is a no-op on it, so the
     ;; count is taken from the relay target list instead.
     (is (equal (list peer)
@@ -2487,10 +2487,10 @@ different connections."
         (peers '()))
     (dolist (addr '("10.0.0.1" "10.0.0.2" "10.0.0.3"))
       ;; PUSH, which is how the sync thread builds the list.
-      (push (bl::make-peer :address addr :state :ready) peers))
-    (setf (bl::node-peers node) peers)
-    (let* ((ids (mapcar (lambda (p) (bl.net::peer-id p))
-                        (bl::node-peers node)))
+      (push (bl.net:make-peer :address addr :state :ready) peers))
+    (setf (bl:node-peers node) peers)
+    (let* ((ids (mapcar (lambda (p) (bl.net:peer-id p))
+                        (bl:node-peers node)))
            (rows (bl.rpc::%peerinfo-rows node))
            (row-ids (mapcar (lambda (r) (cdr (assoc "id" r :test #'string=))) rows)))
       ;; The precondition: the stored list really is newest-first, so this test
@@ -2513,14 +2513,14 @@ on regtest is every peer."
     ;; No connection at all: the host alone is all there is, and that must not
     ;; become \"host:0\" or an error.
     (is (string= "203.0.113.4" (bl.rpc::%peer-addr peer)))
-    (setf (bl.net::peer-connection peer)
+    (setf (bl.net:peer-connection peer)
           (bl.net::make-connection
            :host "203.0.113.4" :port 8333 :connected t))
     (is (string= "203.0.113.4:8333" (bl.rpc::%peer-addr peer)))
     ;; A v6 literal is bracketed before the port, as CService::ToStringAddrPort
     ;; does — an unbracketed \"::1:8333\" is a different, valid v6 address.
     (let ((v6 (bl.net:make-peer :address "::1" :state :ready)))
-      (setf (bl.net::peer-connection v6)
+      (setf (bl.net:peer-connection v6)
             (bl.net::make-connection :host "::1" :port 8333 :connected t))
       (is (string= "[::1]:8333" (bl.rpc::%peer-addr v6))))))
 
@@ -2547,18 +2547,18 @@ connection recording port 0 while a dialed one records the port it dialed."
     (flet ((peer-at (host port &key inbound)
              (let ((p (bl.net:make-peer :address host :state :ready
                                                          :inbound inbound)))
-               (setf (bl.net::peer-connection p)
+               (setf (bl.net:peer-connection p)
                      (bl.net::make-connection
                       :host host :port port :connected t))
                p)))
       ;; An INBOUND peer from 127.0.0.1 (source port recorded as 0).
-      (setf (bl::node-peers node) (list (peer-at "127.0.0.1" 0 :inbound t)))
+      (setf (bl:node-peers node) (list (peer-at "127.0.0.1" 0 :inbound t)))
       (is-true (bl::peer-connected-to-host-p node "127.0.0.1")
                "the address-only guard should still see it")
       (is-false (bl::peer-connected-to-endpoint-p node "127.0.0.1" 11133)
                 "an inbound peer blocked an outbound dial to the same host")
       ;; An OUTBOUND peer to a DIFFERENT port on the same host.
-      (setf (bl::node-peers node) (list (peer-at "127.0.0.1" 11132)))
+      (setf (bl:node-peers node) (list (peer-at "127.0.0.1" 11132)))
       (is-false (bl::peer-connected-to-endpoint-p node "127.0.0.1" 11133)
                 "a peer on another port of the same host blocked the dial")
       ;; The same endpoint IS deduped — the guard still does its job.
@@ -2580,31 +2580,31 @@ The combination rule is Core's (rpc/net.cpp:471-479), empty string included —
 positionally."
   (let* ((node (make-test-node))
          (peer (bl.net:make-peer :address "203.0.113.9" :state :ready)))
-    (setf (bl.net::peer-id peer) 4242)
-    (setf (bl::node-peers node) (list peer))
+    (setf (bl.net:peer-id peer) 4242)
+    (setf (bl:node-peers node) (list peer))
     ;; Both given: Core's exact refusal.
     (handler-case
         (progn (bl.rpc::rpc-disconnectnode node '("203.0.113.9" 4242))
                (is-true nil "address+nodeid was accepted"))
-      (bl.rpc::rpc-error (e)
+      (bl.rpc:rpc-error (e)
         (is (string= "Only one of address and nodeid should be provided."
-                     (bl.rpc::rpc-error-message e)))
-        (is (= bl.rpc::+rpc-invalid-params+
-               (bl.rpc::rpc-error-code e)))))
+                     (bl.rpc:rpc-error-message e)))
+        (is (= bl.rpc:+rpc-invalid-params+
+               (bl.rpc:rpc-error-code e)))))
     ;; Unknown id: Core's not-connected code, not a type error.
     (handler-case
         (progn (bl.rpc::rpc-disconnectnode node '(nil 999))
                (is-true nil "an unknown nodeid was accepted"))
-      (bl.rpc::rpc-error (e)
+      (bl.rpc:rpc-error (e)
         (is (= bl.rpc::+rpc-client-node-not-connected+
-               (bl.rpc::rpc-error-code e)))))
+               (bl.rpc:rpc-error-code e)))))
     ;; By id, the framework's spelling: named nodeid only.
     (is (null (bl.rpc::rpc-disconnectnode node '(nil 4242))))
     ;; And Core's positional spelling for the same thing.
-    (setf (bl::node-peers node) (list peer))
+    (setf (bl:node-peers node) (list peer))
     (is (null (bl.rpc::rpc-disconnectnode node '("" 4242))))
     ;; By address still works.
-    (setf (bl::node-peers node) (list peer))
+    (setf (bl:node-peers node) (list peer))
     (is (null (bl.rpc::rpc-disconnectnode node '("203.0.113.9"))))))
 
 (test rpcservertimeout-reaches-the-acceptor
@@ -2625,7 +2625,7 @@ not against the special."
   (bl.rpc:stop-rpc-server)
   (with-temp-directory (dir)
     (let ((node (make-test-node)))
-      (setf (bl::node-data-directory node) dir)
+      (setf (bl:node-data-directory node) dir)
       ;; Core's default, not hunchentoot's.
       (is (= 30 bl.rpc:*rpc-server-timeout*))
       (let ((bl.rpc:*rpc-server-timeout* 99000))
@@ -2836,13 +2836,13 @@ reading the output."
       (is-false (assoc "short" r :test #'string=)
                 "the short horizon answered for a target it does not track"))
     ;; Range and type checks.
-    (is (= bl.rpc::+rpc-invalid-parameter+
+    (is (= bl.rpc:+rpc-invalid-parameter+
            (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '(0))))))
-    (is (= bl.rpc::+rpc-invalid-parameter+
+    (is (= bl.rpc:+rpc-invalid-parameter+
            (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '(2 1.5))))))
-    (is (= bl.rpc::+rpc-invalid-parameter+
+    (is (= bl.rpc:+rpc-invalid-parameter+
            (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '(2 -0.1))))))
-    (is (= bl.rpc::+rpc-type-error+
+    (is (= bl.rpc:+rpc-type-error+
            (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '("2"))))))))
 
 (test addconnection-opens-the-named-connection-type
@@ -2850,7 +2850,7 @@ reading the output."
 its own P2P connections of a CHOSEN type — a block-relay or feeler slot a test
 cannot ask for any other way — so the type reaching the dial is the point, not
 just that something connected."
-  (let ((bl::*pending-test-connections* '()))
+  (let ((bl:*pending-test-connections* '()))
     ;; Regtest only, with Core's exact text.
     (dolist (network '(:mainnet :testnet4 :signet))
       (let ((bl:*network* network))
@@ -2858,29 +2858,29 @@ just that something connected."
             (progn (bl.rpc::rpc-addconnection
                     nil '("1.2.3.4:1" "outbound-full-relay" t))
                    (is-true nil "addconnection was accepted on ~A" network))
-          (bl.rpc::rpc-error (e)
+          (bl.rpc:rpc-error (e)
             (is (string= "addconnection is for regression testing (-regtest mode) only."
-                         (bl.rpc::rpc-error-message e))
+                         (bl.rpc:rpc-error-message e))
                 "~A" network)))))
-    (is-false bl::*pending-test-connections*
+    (is-false bl:*pending-test-connections*
               "a refused addconnection still queued a dial")
     (let* ((bl:*network* :regtest)
-           (node (bl::make-node :network :regtest)))
+           (node (bl:make-node :network :regtest)))
       ;; Each of Core's four types maps to a peer conn-type and is queued for
       ;; the sync thread, newest LAST (the queue is drained in request order).
       (dolist (pair '(("outbound-full-relay" . :outbound-full-relay)
                       ("block-relay-only"    . :block-relay)
                       ("addr-fetch"          . :addr-fetch)
                       ("feeler"              . :feeler)))
-        (setf bl::*pending-test-connections* '())
+        (setf bl:*pending-test-connections* '())
         (let ((result (bl.rpc::rpc-addconnection
                        node (list "1.2.3.4:1" (car pair) nil))))
           (is (equal (car pair) (cdr (assoc "connection_type" result :test #'string=))))
           (is (equal "1.2.3.4:1" (cdr (assoc "address" result :test #'string=))))
           (is (equal (list (cons "1.2.3.4:1" (cdr pair)))
-                     bl::*pending-test-connections*)
+                     bl:*pending-test-connections*)
               "~A did not queue its own connection type" (car pair))))
-      (setf bl::*pending-test-connections* '())
+      (setf bl:*pending-test-connections* '())
       ;; Core trims the type before matching.
       (is (equal "outbound-full-relay"
                  (cdr (assoc "connection_type"
@@ -2890,7 +2890,7 @@ just that something connected."
       ;; MANUAL and INBOUND are not offerable — Core's AddConnection returns
       ;; false for them, because addconnection exists for the AUTOMATIC kinds.
       (dolist (bad '("manual" "inbound" "" "outbound" "block-relay"))
-        (is (= bl.rpc::+rpc-invalid-parameter+
+        (is (= bl.rpc:+rpc-invalid-parameter+
                (%rpc-error-code
                 (lambda () (bl.rpc::rpc-addconnection
                             node (list "1.2.3.4:1" bad nil))))))))
@@ -2898,24 +2898,24 @@ just that something connected."
     ;; dialing v1 (Core rpc/net.cpp).
     (let ((bl:*network* :regtest)
           (bl.net:*v2-transport-enabled* nil)
-          (node (bl::make-node :network :regtest)))
-      (setf bl::*pending-test-connections* '())
+          (node (bl:make-node :network :regtest)))
+      (setf bl:*pending-test-connections* '())
       (handler-case
           (progn (bl.rpc::rpc-addconnection
                   node '("1.2.3.4:1" "outbound-full-relay" t))
                  (is-true nil "a v2 addconnection was accepted with v2 disabled"))
-        (bl.rpc::rpc-error (e)
-          (is (= bl.rpc::+rpc-invalid-parameter+
-                 (bl.rpc::rpc-error-code e)))
+        (bl.rpc:rpc-error (e)
+          (is (= bl.rpc:+rpc-invalid-parameter+
+                 (bl.rpc:rpc-error-code e)))
           (is (string= "Error: Adding v2transport connections requires -v2transport init flag to be set."
-                       (bl.rpc::rpc-error-message e)))))
-      (is-false bl::*pending-test-connections*))
+                       (bl.rpc:rpc-error-message e)))))
+      (is-false bl:*pending-test-connections*))
     ;; Capacity: the outbound full-relay and block-relay types are capped, the
     ;; other two are not (Core: none for addr-fetch, since -seednode has none,
     ;; and none for feeler, since feelers are short-lived).
     (let* ((bl:*network* :regtest)
-           (node (bl::make-node :network :regtest :max-peers 0)))
-      (setf bl::*pending-test-connections* '())
+           (node (bl:make-node :network :regtest :max-peers 0)))
+      (setf bl:*pending-test-connections* '())
       (is (= bl.rpc::+rpc-client-node-capacity-reached+
              (%rpc-error-code
               (lambda () (bl.rpc::rpc-addconnection
@@ -2924,13 +2924,13 @@ just that something connected."
         (is-true (bl.rpc::rpc-addconnection
                   node (list "1.2.3.4:1" uncapped nil))
                  "~A was capacity-limited" uncapped)))
-    (setf bl::*pending-test-connections* '()))
+    (setf bl:*pending-test-connections* '()))
   ;; And the queue is actually drained where peers are dialed — a request that
   ;; is only ever queued is exactly the shape of bug this repo keeps finding.
   (is-true (member 'bl::connect-added-nodes
                    (mapcar #'car
                            (sb-introspect:who-sets
-                            'bl::*pending-test-connections*)))))
+                            'bl:*pending-test-connections*)))))
 
 (test setmocktime-is-regtest-only
   "Core gates setmocktime on IsMockableChain, which only regtest sets
@@ -2943,9 +2943,9 @@ functional framework and operators actually see, so it is asserted verbatim."
       (handler-case
           (progn (bl.rpc::rpc-setmocktime nil '(1000))
                  (is-true nil "setmocktime was accepted on ~A" network))
-        (bl.rpc::rpc-error (e)
+        (bl.rpc:rpc-error (e)
           (is (string= "setmocktime is for regression testing (-regtest mode) only"
-                       (bl.rpc::rpc-error-message e))
+                       (bl.rpc:rpc-error-message e))
               "~A" network)))
       (is-false bl.ser:*mock-time*
                 "the refused call still moved the clock on ~A" network))))
@@ -2987,19 +2987,19 @@ the ban gone — no sleeping, exactly as rpc_setban.py does it."
       (is (= (+ 1700000000 bl.ser:+universal-unix-epoch-offset+)
              (bl.ser:get-node-time)))))
   ;; And the decision itself moves with it.
-  (bl.net::clear-ban-list)
+  (bl.net:clear-ban-list)
   (unwind-protect
        (let ((bl.ser:*mock-time* 1700000000))
-         (bl.net::ban-address "203.0.113.7" 3600)
-         (is-true (bl.net::peer-banned-p "203.0.113.7")
+         (bl.net:ban-address "203.0.113.7" 3600)
+         (is-true (bl.net:peer-banned-p "203.0.113.7")
                   "the ban did not take under a mocked clock")
-         (is (= 1 (length (bl.net::list-bans))))
+         (is (= 1 (length (bl.net:list-bans))))
          ;; Core's tests never sleep an hour; they move the clock.
          (let ((bl.ser:*mock-time* (+ 1700000000 3601)))
-           (is-false (bl.net::peer-banned-p "203.0.113.7")
+           (is-false (bl.net:peer-banned-p "203.0.113.7")
                      "the ban outlived its expiry when the clock was moved past it")
-           (is (= 0 (length (bl.net::list-bans))))))
-    (bl.net::clear-ban-list)))
+           (is (= 0 (length (bl.net:list-bans))))))
+    (bl.net:clear-ban-list)))
 
 (test the-node-clock-split-matches-cores
   "Core splits its clocks and the split is the point: NodeClock returns the
@@ -3045,16 +3045,16 @@ from max_time = Ticks<seconds>(nanoseconds::max()) (rpc/node.cpp:63-69)."
       (handler-case
           (progn (bl.rpc::rpc-setmocktime nil (list bad))
                  (is-true nil "accepted out-of-range ~D" bad))
-        (bl.rpc::rpc-error (e)
+        (bl.rpc:rpc-error (e)
           (is (string= (format nil "Mocktime must be in the range [0, ~D], not ~D."
                                bl.rpc::+max-mock-time+ bad)
-                       (bl.rpc::rpc-error-message e))
+                       (bl.rpc:rpc-error-message e))
               "~D" bad))))
     ;; the boundary itself is accepted
     (bl.rpc::rpc-setmocktime nil (list bl.rpc::+max-mock-time+))
     (is (eql bl.rpc::+max-mock-time+ bl.ser:*mock-time*))
     ;; a non-integer is a type error, not a range error
-    (signals bl.rpc::rpc-error (bl.rpc::rpc-setmocktime nil '("now")))
+    (signals bl.rpc:rpc-error (bl.rpc::rpc-setmocktime nil '("now")))
     (setf bl.ser:*mock-time* nil)))
 
 (test uptime-does-not-follow-the-mock-clock
@@ -3066,7 +3066,7 @@ one setting it forward made the node claim years of uptime. rpc_uptime.py is a
 first-wave target, so this had to be right before the harness could use it."
   (let* ((bl:*network* :regtest)
          (bl.ser:*mock-time* nil)
-         (bl::*node-start-time*
+         (bl:*node-start-time*
            (- (bl.ser:get-real-unix-time) 42))
          (before (bl.rpc::rpc-uptime nil nil)))
     (is (<= 42 before 44))
@@ -3102,8 +3102,8 @@ has to EXIST, and it has to answer JSON null rather than erroring."
   (let ((h (make-hash-table :test 'equal)))
     (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
     (handler-case (bl.rpc::%named-params-to-positional method h)
-      (bl.rpc::rpc-error (e)
-        (list :error (bl.rpc::rpc-error-message e))))))
+      (bl.rpc:rpc-error (e)
+        (list :error (bl.rpc:rpc-error-message e))))))
 
 (test named-params-map-onto-core-s-argument-names
   "Core's own client sends named parameters for every call
@@ -3212,23 +3212,23 @@ refused and monitoring saw a dead node."
   (let ((bl.rpc::*rpc-warmup-status* "Replaying mempool..."))
     (dolist (method '("getblockcount" "uptime" "help" "stop" "nosuchmethod"))
       (handler-case
-          (progn (bl.rpc::dispatch-rpc-method nil method '())
+          (progn (bl.rpc:dispatch-rpc-method nil method '())
                  (is-true nil "~A was dispatched during warmup" method))
-        (bl.rpc::rpc-error (e)
+        (bl.rpc:rpc-error (e)
           (is (= bl.rpc::+rpc-in-warmup+
-                 (bl.rpc::rpc-error-code e))
+                 (bl.rpc:rpc-error-code e))
               "~A did not answer -28" method)
           (is (string= "Replaying mempool..."
-                       (bl.rpc::rpc-error-message e))
+                       (bl.rpc:rpc-error-message e))
               "~A did not report the current status" method)))))
   ;; Cleared, dispatch resumes — including the honest "no such method".
   (let ((bl.rpc::*rpc-warmup-status* nil))
     (handler-case
-        (progn (bl.rpc::dispatch-rpc-method nil "nosuchmethod" '())
+        (progn (bl.rpc:dispatch-rpc-method nil "nosuchmethod" '())
                (is-true nil "an unknown method was accepted"))
-      (bl.rpc::rpc-error (e)
-        (is (= bl.rpc::+rpc-method-not-found+
-               (bl.rpc::rpc-error-code e)))))))
+      (bl.rpc:rpc-error (e)
+        (is (= bl.rpc:+rpc-method-not-found+
+               (bl.rpc:rpc-error-code e)))))))
 
 (test warmup-status-tracks-startup-and-clears
   "-28's message is whatever startup is currently doing (Core wires
@@ -3256,7 +3256,7 @@ in stop-node, and every subsequent request in the image answered -28."
     (is-true bl.rpc::*rpc-warmup-status*))
   ;; stop-rpc-server clears it even when no server is running.
   (let ((bl.rpc::*rpc-warmup-status* "Loading...")
-        (bl.rpc::*rpc-server* nil))
+        (bl.rpc:*rpc-server* nil))
     (bl.rpc:stop-rpc-server)
     ;; With no server the teardown is a no-op, so the binding is untouched;
     ;; what matters is the RUNNING case, asserted by the live test below.
@@ -3342,18 +3342,18 @@ verbosity-2 caller prevout objects Core does not send."
                        :script-pubkey (coerce #(#x51) '(simple-array (unsigned-byte 8) (*)))
                        :height 12 :coinbase nil))))
     ;; No coins: neither field, exactly as before this change.
-    (let ((j (bl.rpc::tx-to-json tx :regtest)))
+    (let ((j (bl.rpc:tx-to-json tx :regtest)))
       (is-false (assoc "fee" j :test #'string=))
       (is-false (assoc "prevout" (first (cdr (assoc "vin" j :test #'string=)))
                        :test #'string=)))
     ;; Verbosity 2: fee, no prevout.
-    (let* ((j (bl.rpc::tx-to-json tx :regtest :spent-coins coins))
+    (let* ((j (bl.rpc:tx-to-json tx :regtest :spent-coins coins))
            (vin0 (first (cdr (assoc "vin" j :test #'string=)))))
       (is-true (assoc "fee" j :test #'string=) "verbosity 2 must report the fee")
       (is-false (assoc "prevout" vin0 :test #'string=)
                 "verbosity 2 must NOT carry prevout objects"))
     ;; Verbosity 3: both, and the prevout carries Core's four fields.
-    (let* ((j (bl.rpc::tx-to-json tx :regtest :spent-coins coins :prevouts t))
+    (let* ((j (bl.rpc:tx-to-json tx :regtest :spent-coins coins :prevouts t))
            (vin0 (first (cdr (assoc "vin" j :test #'string=))))
            (p (cdr (assoc "prevout" vin0 :test #'string=))))
       (is-true (assoc "fee" j :test #'string=))
@@ -3392,7 +3392,7 @@ coin that never existed."
          (coins (list (bl.store:make-utxo-entry
                        :value 1 :script-pubkey (coerce #(#x51) '(simple-array (unsigned-byte 8) (*)))
                        :height 1 :coinbase t)))
-         (j (bl.rpc::tx-to-json coinbase :regtest :spent-coins coins :prevouts t))
+         (j (bl.rpc:tx-to-json coinbase :regtest :spent-coins coins :prevouts t))
          (vin0 (first (cdr (assoc "vin" j :test #'string=)))))
     (is-true (assoc "coinbase" vin0 :test #'string=) "not a coinbase input")
     (is-false (assoc "prevout" vin0 :test #'string=)
@@ -3431,7 +3431,7 @@ shutdown — so a node reporting none hangs that test forever."
   "Each entry is {method, duration}; logpath is the debug.log the node is
 actually writing."
   (let ((bl.rpc::*active-rpc-commands* '())
-        (bl::*log-file-path* #P"/tmp/bl-test/debug.log"))
+        (bl:*log-file-path* #P"/tmp/bl-test/debug.log"))
     (bl.rpc::with-active-rpc-command ("getblockcount")
       (let* ((info (bl.rpc::rpc-getrpcinfo nil nil))
              (cmds (cdr (assoc "active_commands" info :test #'string=)))
@@ -3456,7 +3456,7 @@ active_commands from INSIDE the handler."
               (declare (ignore node params))
               (setf seen (bl.rpc::active-rpc-commands))
               42))
-      (is (= 42 (bl.rpc::dispatch-rpc-method nil "peekself" '()))))
+      (is (= 42 (bl.rpc:dispatch-rpc-method nil "peekself" '()))))
     (is (equal '("peekself") (mapcar #'car seen))
         "the running command was not visible from inside its own handler")
     (is-false (bl.rpc::active-rpc-commands)
@@ -3545,9 +3545,9 @@ safe version — asserted here with a size large enough to have overflowed a
         (push (bt:make-thread
                (lambda ()
                  ;; Call various accessors
-                 (bl.rpc::rpc-get-chain-state node)
-                 (bl.rpc::rpc-get-utxo-set node)
-                 (bl.rpc::rpc-get-peers node)
+                 (bl.rpc:rpc-get-chain-state node)
+                 (bl.rpc:rpc-get-utxo-set node)
+                 (bl.rpc:rpc-get-peers node)
                  (setf (aref results idx) t)))
               threads)))
     ;; Wait for all threads to complete
@@ -3588,13 +3588,13 @@ safe version — asserted here with a size large enough to have overflowed a
 (test rpc-error-codes-match-bitcoin-core
   "Test that error codes match Bitcoin Core specification"
   ;; Standard JSON-RPC 2.0 error codes
-  (is (= bl.rpc::+rpc-parse-error+ -32700))
-  (is (= bl.rpc::+rpc-invalid-request+ -32600))
-  (is (= bl.rpc::+rpc-method-not-found+ -32601))
-  (is (= bl.rpc::+rpc-internal-error+ -32603))
+  (is (= bl.rpc:+rpc-parse-error+ -32700))
+  (is (= bl.rpc:+rpc-invalid-request+ -32600))
+  (is (= bl.rpc:+rpc-method-not-found+ -32601))
+  (is (= bl.rpc:+rpc-internal-error+ -32603))
   ;; Bitcoin Core specific error codes
-  (is (= bl.rpc::+rpc-invalid-parameter+ -8))  ; RPC_INVALID_PARAMETER
-  (is (= bl.rpc::+rpc-misc-error+ -1)))
+  (is (= bl.rpc:+rpc-invalid-parameter+ -8))  ; RPC_INVALID_PARAMETER
+  (is (= bl.rpc:+rpc-misc-error+ -1)))
 
 (test rpc-error-response-format
   "Test error response matches Bitcoin Core format"
@@ -3630,10 +3630,10 @@ safe version — asserted here with a size large enough to have overflowed a
   "Test decoderawtransaction with invalid hex returns error"
   (let ((node (make-test-node)))
     ;; Empty string
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-decoderawtransaction node '("")))
     ;; Invalid hex characters
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-decoderawtransaction node '("zzzz")))))
 
 ;;; getrawtransaction tests
@@ -3642,17 +3642,17 @@ safe version — asserted here with a size large enough to have overflowed a
   "Test getrawtransaction with invalid txid returns error"
   (let ((node (make-test-node)))
     ;; Too short
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getrawtransaction node '("abc")))
     ;; Invalid characters
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getrawtransaction node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))))
 
 (test rpc-getrawtransaction-not-found
   "Test getrawtransaction for unknown txid returns error"
   (let ((node (make-test-node)))
     ;; Valid txid but not in mempool
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getrawtransaction node
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
 
@@ -3732,9 +3732,9 @@ transaction it just priced."
         (is (= (/ 10000 100000000.0d0)
                (cdr (assoc "feerate" result :test #'string=)))))
       ;; Floor above the estimate: the floor wins.
-      (let ((mempool (bl.rpc::rpc-get-mempool node)))
+      (let ((mempool (bl.rpc:rpc-get-mempool node)))
         (when mempool
-          (setf (bl.mp::mempool-min-fee-rate mempool) 50000)
+          (setf (bl.mp:mempool-min-fee-rate mempool) 50000)
           (let ((result (bl.rpc::rpc-estimatesmartfee node '(6))))
             (is (= (/ 50000 100000000.0d0)
                    (cdr (assoc "feerate" result :test #'string=)))
@@ -3757,19 +3757,19 @@ covers a horizon it does not."
 fixed constant (ParseConfirmTarget, rpc/util.cpp:369-377), and its message
 names the range."
   (let ((node (make-test-node)))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-estimatesmartfee node '(0)))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-estimatesmartfee node '(-1)))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-estimatesmartfee node
                                               (list (1+ (bl.mp:highest-target-tracked)))))
     ;; And an unknown mode names the three Core accepts.
     (handler-case (bl.rpc::rpc-estimatesmartfee node '(6 "cheap"))
-      (bl.rpc::rpc-error (e)
-        (is (search "unset" (bl.rpc::rpc-error-message e))
+      (bl.rpc:rpc-error (e)
+        (is (search "unset" (bl.rpc:rpc-error-message e))
             "the invalid-mode message should list Core's three modes: ~A"
-            (bl.rpc::rpc-error-message e))))))
+            (bl.rpc:rpc-error-message e))))))
 
 ;;; validateaddress tests
 
@@ -3882,7 +3882,7 @@ regtest node printed mainnet addresses."
 
 (test rpc-decodescript-invalid-hex
   "Test decodescript with invalid hex returns error"
-  (signals bl.rpc::rpc-error (%decodescript "xyz")))
+  (signals bl.rpc:rpc-error (%decodescript "xyz")))
 
 ;;; createrawtransaction tests
 
@@ -3902,7 +3902,7 @@ regtest node printed mainnet addresses."
 (test rpc-createrawtransaction-invalid-txid
   "Test createrawtransaction with invalid input txid"
   (let ((node (make-test-node)))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-createrawtransaction node
         '(((("txid" . "invalid") ("vout" . 0)))
           (("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" . 0.01)))))))
@@ -3910,7 +3910,7 @@ regtest node printed mainnet addresses."
 (test rpc-createrawtransaction-invalid-address
   "Test createrawtransaction with invalid output address"
   (let ((node (make-test-node)))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-createrawtransaction node
         '(((("txid" . "0000000000000000000000000000000000000000000000000000000000000001")
             ("vout" . 0)))
@@ -3919,7 +3919,7 @@ regtest node printed mainnet addresses."
 (test rpc-createrawtransaction-negative-amount
   "Test createrawtransaction with negative amount"
   (let ((node (make-test-node)))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-createrawtransaction node
         '(((("txid" . "0000000000000000000000000000000000000000000000000000000000000001")
             ("vout" . 0)))
@@ -3946,7 +3946,7 @@ regtest node printed mainnet addresses."
 (test rpc-gettxoutsetinfo-with-utxos
   "Test gettxoutsetinfo with UTXOs in set"
   (let* ((node (make-test-node))
-         (utxo-set (bl::node-utxo-set node))
+         (utxo-set (bl:node-utxo-set node))
          (txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
          (txid2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))
          (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -3970,7 +3970,7 @@ regtest node printed mainnet addresses."
 distinct from hash_serialized_3), and inserting then removing a coin restores
 the value."
   (let* ((node (make-test-node))
-         (utxo-set (bl::node-utxo-set node))
+         (utxo-set (bl:node-utxo-set node))
          (txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
          (txid2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))
          (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -3996,7 +3996,7 @@ the value."
                                (bl.rpc::rpc-gettxoutsetinfo node (list "muhash"))
                                :test #'string=)))))
     ;; An unknown hash_type still errors.
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-gettxoutsetinfo node (list "bogus")))))
 
 ;;; --- getblockstats Tests ---
@@ -4005,20 +4005,20 @@ the value."
   "Test getblockstats with invalid parameters"
   (let ((node (make-test-node)))
     ;; Missing parameter
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockstats node nil))
     ;; Invalid hash format
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockstats node '("invalid")))
     ;; Negative height
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockstats node '(-1)))))
 
 (test rpc-getblockstats-block-not-found
   "Test getblockstats with non-existent block"
   (let ((node (make-test-node)))
     ;; Valid hash format but block doesn't exist
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockstats node
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
 
@@ -4084,14 +4084,14 @@ COINBASE-ONLY) with its undo data, and bind NODE / HASH-HEX / SPENDER."
             (%gbs-blk (%hdrfields-block %gbs-txs (make-32-byte-hash 5) 1700000000))
             (,hash (bl.ser:block-header-hash
                     (bl.ser:bitcoin-block-header %gbs-blk)))
-            (,hash-hex (bl.rpc::hash-to-hex ,hash)))
+            (,hash-hex (bl.rpc:hash-to-hex ,hash)))
        (declare (ignorable ,spender))
-       (setf (bl::node-block-store ,node) ,store)
+       (setf (bl:node-block-store ,node) ,store)
        (unwind-protect
             (progn
               (bl.store:store-block ,store %gbs-blk)
               (bl.store:add-block-index-entry
-               (bl::node-chain-state ,node)
+               (bl:node-chain-state ,node)
                (bl.store:make-block-index-entry
                 :hash ,hash :height 100 :chain-work 1 :status :valid
                 :header (bl.ser:bitcoin-block-header %gbs-blk)))
@@ -4121,8 +4121,8 @@ summed the coinbase's outputs into total_out."
            (weight (bl.ser:transaction-weight spender))
            (whole-block (length (bl.ser:serialize
                                  (bl.store:get-block
-                                  (bl::node-block-store node)
-                                  (bl.rpc::parse-hex-hash hex))))))
+                                  (bl:node-block-store node)
+                                  (bl.rpc:parse-hex-hash hex))))))
       ;; --- sizes ---
       (is (= wire (funcall stat "total_size")))
       ;; ...which is witness-INCLUSIVE (the stripped form is strictly smaller)
@@ -4209,14 +4209,14 @@ silently, so a typo read as 'that statistic is unavailable for this block'."
                     (progn (bl.rpc::rpc-getblockstats
                             node (list hex (list "totalfee" "bogus")))
                            :no-error)
-                  (bl.rpc::rpc-error (e) (bl.rpc::rpc-error-code e)))))
+                  (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e)))))
       (is (eql -8 code)))
     ;; CONTROL: a known name still selects exactly that key.
     (let ((r (bl.rpc::rpc-getblockstats node (list hex (list "totalfee")))))
       (is (= 1 (length r)))
       (is (= 30000 (cdr (assoc "totalfee" r :test #'string=)))))
     ;; A non-array stats argument is Core's type error.
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockstats node (list hex "totalfee")))))
 
 (test rpc-getblockstats-requires-undo-data
@@ -4225,7 +4225,7 @@ silently, so a typo read as 'that statistic is unavailable for this block'."
 whose undo data is missing is an error, never a silently wrong fee total.
 CONTROL: the identical block WITH its undo data answers (previous test)."
   (%with-gbs-block (node hex spender :with-undo nil)
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockstats node (list hex)))))
 
 (test rpc-calculate-block-subsidy
@@ -4247,7 +4247,7 @@ CONTROL: the identical block WITH its undo data answers (previous test)."
   "Test getrawtransaction with invalid blockhash parameter"
   (let ((node (make-test-node)))
     ;; Valid txid but invalid blockhash format
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getrawtransaction node
         '("0000000000000000000000000000000000000000000000000000000000000001" nil "invalid-hash")))))
 
@@ -4255,7 +4255,7 @@ CONTROL: the identical block WITH its undo data answers (previous test)."
   "Test getrawtransaction returns error when txindex needed but disabled"
   (let ((node (make-test-node)))
     ;; Node has no txindex, looking for non-mempool tx should fail
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getrawtransaction node
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
 
@@ -4308,7 +4308,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
 (test rpc-getchaintips
   "getchaintips reports the active tip (branchlen 0) and side branches."
   (let* ((node (make-test-node))
-         (chain-state (bl::node-chain-state node))
+         (chain-state (bl:node-chain-state node))
          (g-hash (make-32-byte-hash 0))
          (a-hash (make-32-byte-hash 1))
          (b-hash (make-32-byte-hash 2))
@@ -4360,7 +4360,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       ;; "missing-input", which was neither — it was our keyword downcased.
       (is (string= "missing-inputs" (cdr (assoc "reject-reason" r :test #'string=)))))
     ;; Nothing was added to the mempool.
-    (is (= 0 (bl.mp:mempool-count (bl::node-mempool node))))))
+    (is (= 0 (bl.mp:mempool-count (bl:node-mempool node))))))
 
 ;;; --- Mempool introspection RPCs ---
 
@@ -4368,14 +4368,14 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
   ;; A parent + chained child in the mempool exercise getmempoolentry,
   ;; getmempoolancestors/descendants, and gettxspendingprevout.
   (let* ((node (make-test-node))
-         (mempool (bl::node-mempool node))
+         (mempool (bl:node-mempool node))
          (funding (%txid-array 99))
          (parent (%mp-spending-tx funding :vout 0 :value 50000000))
          (pid (bl.ser:transaction-hash parent))
          (child (%mp-spending-tx pid :vout 0 :value 40000000))
          (cid (bl.ser:transaction-hash child))
-         (pid-hex (bl.rpc::hash-to-hex pid))
-         (cid-hex (bl.rpc::hash-to-hex cid)))
+         (pid-hex (bl.rpc:hash-to-hex pid))
+         (cid-hex (bl.rpc:hash-to-hex cid)))
     (%add-tx mempool parent :fee 1000)
     (%add-tx mempool child :fee 2000)
     ;; getmempoolentry: parent has 2 descendants (self+child), 1 ancestor (self)
@@ -4398,40 +4398,40 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
              (let ((h (make-hash-table :test 'equal)))
                (setf (gethash "txid" h) txid-hex (gethash "vout" h) vout) h)))
       (let ((r (bl.rpc::rpc-gettxspendingprevout
-                node (list (list (op (bl.rpc::hash-to-hex funding) 0))))))
+                node (list (list (op (bl.rpc:hash-to-hex funding) 0))))))
         (is (= 1 (length r)))
         (is (string= pid-hex (cdr (assoc "spendingtxid" (first r) :test #'string=)))))
       ;; an unspent outpoint -> no spendingtxid key
       (let ((r (bl.rpc::rpc-gettxspendingprevout
-                node (list (list (op (bl.rpc::hash-to-hex (%txid-array 200)) 0))))))
+                node (list (list (op (bl.rpc:hash-to-hex (%txid-array 200)) 0))))))
         (is (null (assoc "spendingtxid" (first r) :test #'string=)))))
     ;; getmempoolentry for an absent tx -> error
     (signals error
       (bl.rpc::rpc-getmempoolentry
-       node (list (bl.rpc::hash-to-hex (%txid-array 201)))))))
+       node (list (bl.rpc:hash-to-hex (%txid-array 201)))))))
 
 ;;; --- Node / chain info RPCs ---
 
 (test rpc-node-info
   (let* ((node (make-test-node))
-         (net (bl::node-network node)))
+         (net (bl:node-network node)))
     ;; getdifficulty: a positive number (no tip -> fallback bits 0x1d00ffff -> 1.0)
     (let ((d (bl.rpc::rpc-getdifficulty node nil)))
       (is (numberp d))
       (is (plusp d)))
     ;; uptime: 0 when start-time unset; >= elapsed when set
-    (let ((bl::*node-start-time* nil))
+    (let ((bl:*node-start-time* nil))
       (is (= 0 (bl.rpc::rpc-uptime node nil))))
-    (let ((bl::*node-start-time*
+    (let ((bl:*node-start-time*
             (- (bl.ser:get-unix-time) 5)))
       (is (>= (bl.rpc::rpc-uptime node nil) 5)))
     ;; getindexinfo: no active index -> empty JSON object (hash-table)
     (is (hash-table-p (bl.rpc::rpc-getindexinfo node nil)))
     ;; With block-filter + coinstats indexes present, both are reported (bare
     ;; structs have a nil db -> height -1); an index-name arg filters to one.
-    (setf (bl::node-blockfilterindex node)
+    (setf (bl:node-blockfilterindex node)
           (bl.store:make-blockfilterindex :enabled t)
-          (bl::node-coinstatsindex node)
+          (bl:node-coinstatsindex node)
           (bl.store::make-coinstatsindex :enabled t))
     (let ((all (bl.rpc::rpc-getindexinfo node nil)))
       (is (assoc "basic block filter index" all :test #'string=))
@@ -4465,11 +4465,11 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
     (let ((book (bl.net:make-address-book)))
       (bl.net:address-book-add
        book (bl.net:make-peer-address
-             :ip (bl.net::ipv4-to-mapped-ipv6 1 2 3 4)
+             :ip (bl.net:ipv4-to-mapped-ipv6 1 2 3 4)
              :port 48333 :services 9
              ;; recent so getnodeaddresses (GetAddr) doesn't filter it as terrible
              :last-seen (bl.ser:get-unix-time)))
-      (setf (bl::node-address-book node) book)
+      (setf (bl:node-address-book node) book)
       (let ((r (bl.rpc::rpc-getnodeaddresses node (list 0))))  ; 0 = all
         (is (= 1 (length r)))
         (is (string= "1.2.3.4" (cdr (assoc "address" (first r) :test #'string=))))
@@ -4480,7 +4480,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
                  :connection (bl.net::make-connection
                               :host "5.6.7.8" :port 48333 :connected t)
                  :state :ready :address "5.6.7.8")))
-      (setf (bl::node-peers node) (list peer))
+      (setf (bl:node-peers node) (list peer))
       (is (null (bl.rpc::rpc-disconnectnode node (list "5.6.7.8"))))
       (is (eq :disconnected (bl.net:peer-state peer)))
       ;; an unknown address errors
@@ -4513,9 +4513,9 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
     (is (null (bl.rpc::rpc-setban node (list "1.2.3.4" "remove"))))
     (is (not (bl.net:peer-banned-p "1.2.3.4")))
     ;; remove a non-existent ban / bad command -> error
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-setban node (list "9.9.9.9" "remove")))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-setban node (list "1.2.3.4" "bogus")))
     ;; clearbanned empties the list
     (bl.rpc::rpc-setban node (list "5.6.7.8" "add"))
@@ -4540,14 +4540,14 @@ longer needs to chain a disconnectnode. Other peers are untouched."
   (let* ((node (make-test-node))
          (conn (bl.net::make-connection
                 :host "203.0.113.9" :port 8333 :connected t))
-         (target (bl::make-peer :address "203.0.113.9" :state :ready
+         (target (bl.net:make-peer :address "203.0.113.9" :state :ready
                                           :connection conn))
-         (other (bl::make-peer :address "198.51.100.3" :state :ready)))
-    (setf (bl::node-peers node) (list target other))
+         (other (bl.net:make-peer :address "198.51.100.3" :state :ready)))
+    (setf (bl:node-peers node) (list target other))
     (is (null (bl.rpc::rpc-setban node (list "203.0.113.9" "add"))))
     (is-true (bl.net:peer-banned-p "203.0.113.9"))
     (is (eq :disconnected (bl.net:peer-state target)))
-    (is (null (bl.net::peer-connection target)))
+    (is (null (bl.net:peer-connection target)))
     (is (eq :ready (bl.net:peer-state other)))
     (bl.net:clear-ban-list)))
 
@@ -4570,9 +4570,9 @@ slots are (almost) full."
     (bl.net:discourage-peer "198.51.100.77")
     (is-true (bl::inbound-connection-allowed-p node "198.51.100.77"))
     ;; Discouraged at inbound capacity: dropped.
-    (setf (bl::node-peers node)
+    (setf (bl:node-peers node)
           (loop for i from 1 to bl::*max-inbound-connections*
-                collect (bl::make-peer
+                collect (bl.net:make-peer
                          :address (format nil "10.~D.1.1" i) :inbound t)))
     (multiple-value-bind (ok reason)
         (bl::inbound-connection-allowed-p node "198.51.100.77")
@@ -4600,15 +4600,15 @@ Core boolean — never null)."
   "waitfornewblock returns on timeout, rejects negative timeouts, and returns
 early when the tip changes."
   (let ((node (make-test-node)))
-    (setf (bl::node-running node) t)
+    (setf (bl:node-running node) t)
     ;; Timeout path: the tip never changes; returns after ~300ms.
     (let ((r (bl.rpc::rpc-waitfornewblock node (list 300))))
       (is (integerp (cdr (assoc "height" r :test #'string=)))))
     ;; Negative timeout errors (Core).
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-waitfornewblock node (list -1)))
     ;; Change path: a thread advances the tip; the wait returns the new height.
-    (let ((cs (bl::node-chain-state node))
+    (let ((cs (bl:node-chain-state node))
           (new-hash (make-array 32 :element-type '(unsigned-byte 8)
                                    :initial-element 9)))
       (bt:make-thread (lambda ()
@@ -4620,12 +4620,12 @@ early when the tip changes."
 (test rpc-dumptxoutset-writes-snapshot
   "dumptxoutset streams the UTXO set to a new file and refuses to overwrite."
   (let* ((node (make-test-node))
-         (utxo (bl::node-utxo-set node))
+         (utxo (bl:node-utxo-set node))
          (path (namestring (merge-pathnames
                             (format nil "txoutset-~D.dat" (get-universal-time))
                             (uiop:temporary-directory)))))
     (bl.store:update-chain-tip
-     (bl::node-chain-state node)
+     (bl:node-chain-state node)
      (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9) 1)
     (dotimes (i 3)
       (bl.store:add-utxo
@@ -4638,7 +4638,7 @@ early when the tip changes."
              (is (= 3 (cdr (assoc "coins_written" r :test #'string=))))
              (is (not (null (probe-file path)))))
            ;; Existing path -> error (Core).
-           (signals bl.rpc::rpc-error
+           (signals bl.rpc:rpc-error
              (bl.rpc::rpc-dumptxoutset node (list path "latest"))))
       (ignore-errors (delete-file path)))))
 
@@ -4668,7 +4668,7 @@ this test used to do — describes no reachable configuration."
   (with-temp-directory (dir)
     (let ((node (make-test-node))
           (cookie-file (merge-pathnames ".cookie" dir)))
-      (setf (bl::node-data-directory node) dir)
+      (setf (bl:node-data-directory node) dir)
       (unwind-protect
            (progn
              ;; (a) no rpcuser/rpcpassword: the cookie is the credential
@@ -4703,7 +4703,7 @@ the credential readable node-wide even with auth enforced."
   (bl.rpc:stop-rpc-server)
   (with-temp-directory (dir)
     (let ((node (make-test-node)))
-      (setf (bl::node-data-directory node) dir)
+      (setf (bl:node-data-directory node) dir)
       (unwind-protect
            (progn
              (is (not (null (bl.rpc:start-rpc-server node :port 19995))))
@@ -4809,7 +4809,7 @@ gets 401 from a node that is perfectly fine, and nothing logs anything."
     (let* ((port 19993)
            (node (make-test-node))
            (cookie-file (merge-pathnames ".cookie" dir)))
-      (setf (bl::node-data-directory node) dir)
+      (setf (bl:node-data-directory node) dir)
       (unwind-protect
            (progn
              ;; the healthy node: bound, cookie written, credential live
@@ -4821,7 +4821,7 @@ gets 401 from a node that is perfectly fine, and nothing logs anything."
                ;; the second process: same data directory, same port. The
                ;; "already running" guard is per-process, so unbind it to reach
                ;; the code a second process would run.
-               (let ((bl.rpc::*rpc-server* nil))
+               (let ((bl.rpc:*rpc-server* nil))
                  (is (null (bl.rpc:start-rpc-server node :port port))
                      "the second start must fail: the port is taken"))
                ;; nothing about the running node changed
@@ -4852,7 +4852,7 @@ getblockcount returned 200, and so did a wrong Basic credential."
     (let ((port 19996)
           (node (make-test-node))
           (body "{\"method\":\"getblockcount\",\"id\":1}"))
-      (setf (bl::node-data-directory node) dir)
+      (setf (bl:node-data-directory node) dir)
       (unwind-protect
            (progn
              (is (not (null (bl.rpc:start-rpc-server node :port port))))
@@ -4886,7 +4886,7 @@ InitRPCAuthentication fails (httprpc.cpp:300-302). Starting anyway would leave
 a listener that 401s everything."
   (bl.rpc:stop-rpc-server)
   (let ((node (make-test-node)))
-    (is (null (bl::node-data-directory node))
+    (is (null (bl:node-data-directory node))
         "fixture must have nowhere to write a cookie, or this test is vacuous")
     (unwind-protect
          (progn
@@ -4903,7 +4903,7 @@ bind before giving up.)"
   (bl.rpc:stop-rpc-server)
   (let ((port 19992)
         (no-datadir-node (make-test-node)))
-    (is (null (bl::node-data-directory no-datadir-node))
+    (is (null (bl:node-data-directory no-datadir-node))
         "fixture must have nowhere to write a cookie, or this test is vacuous")
     (unwind-protect
          (progn
@@ -4912,7 +4912,7 @@ bind before giving up.)"
            (is (null bl.rpc:*rpc-server*))
            (with-temp-directory (dir)
              (let ((node (make-test-node)))
-               (setf (bl::node-data-directory node) dir)
+               (setf (bl:node-data-directory node) dir)
                (is (not (null (bl.rpc:start-rpc-server node :port port)))
                    "the aborted start leaked its listening socket"))))
       (bl.rpc:stop-rpc-server))))
@@ -4943,7 +4943,7 @@ a single -rpcbind would put the whole RPC surface on the public internet."
   "tx-to-json emits the size/weight/hex/wtxid fields and per-output type +
 address (with network), and per-input sequence — the fields explorers expect."
   (let* ((tx (make-mempool-test-tx :input-id 50))
-         (j (bl.rpc::tx-to-json tx :regtest)))
+         (j (bl.rpc:tx-to-json tx :regtest)))
     (is (stringp (cdr (assoc "hash" j :test #'string=))))
     (is (integerp (cdr (assoc "vsize" j :test #'string=))))
     (is (integerp (cdr (assoc "weight" j :test #'string=))))
@@ -5003,7 +5003,7 @@ hash; waitforblockheight returns immediately when the tip is already at/above th
 target. Both return {hash,height}; an unreached height with a short timeout
 returns the current tip; bad inputs error."
   (let* ((node (make-test-node))
-         (cs (bl.rpc::rpc-get-chain-state node))
+         (cs (bl.rpc:rpc-get-chain-state node))
          (tip-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
          (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
     ;; make-test-node's chain-state has no tip; plant one at height 5.
@@ -5014,7 +5014,7 @@ returns the current tip; bad inputs error."
                   :version 1 :prev-block zeros :merkle-root zeros
                   :timestamp 1296688600 :bits #x207fffff :nonce 0 :cached-hash tip-hash)))
     (bl.store:update-chain-tip cs tip-hash 5)
-    (let ((tip-hex (bl.rpc::hash-to-hex tip-hash)))
+    (let ((tip-hex (bl.rpc:hash-to-hex tip-hash)))
       ;; waitforblock with the current tip hash -> immediate match.
       (let ((r (bl.rpc::rpc-waitforblock node (list tip-hex))))
         (is (string= tip-hex (cdr (assoc "hash" r :test #'string=))))
@@ -5026,16 +5026,16 @@ returns the current tip; bad inputs error."
       (let ((r (bl.rpc::rpc-waitforblockheight node (list 1005 50))))
         (is (= 5 (cdr (assoc "height" r :test #'string=)))))
       ;; bad inputs error.
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-waitforblock node (list "not-a-valid-hash")))
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-waitforblockheight node (list -1))))))
 
 (test rpc-gettxout-scriptpubkey-fields
   "gettxout's scriptPubKey now carries asm/hex/type and (for address-bearing
 scripts) address — previously only hex."
   (let* ((node (make-test-node))   ; testnet3
-         (utxo-set (bl.rpc::rpc-get-utxo-set node))
+         (utxo-set (bl.rpc:rpc-get-utxo-set node))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
          (keyhash (make-array 20 :element-type '(unsigned-byte 8) :initial-element 7))
          ;; P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
@@ -5043,7 +5043,7 @@ scripts) address — previously only hex."
                            (vector #x76 #xa9 #x14) keyhash (vector #x88 #xac))))
     (bl.store:add-utxo utxo-set txid 0 50000 spk 0)
     (let* ((r (bl.rpc::rpc-gettxout
-               node (list (bl.rpc::hash-to-hex txid) 0)))
+               node (list (bl.rpc:hash-to-hex txid) 0)))
            (sp (cdr (assoc "scriptPubKey" r :test #'string=))))
       (is (string= "pubkeyhash" (cdr (assoc "type" sp :test #'string=))))
       (is (string= (bl.crypto:encode-p2pkh-address keyhash :testnet3)
@@ -5077,8 +5077,8 @@ localservices is the SAME composition the version message advertises
 (peer.lisp local-services) — Core keeps NODE_NETWORK_LIMITED set alongside
 NODE_NETWORK on a full node (init.cpp:863,1946), so both names appear."
   (let* ((node (make-test-node))
-         (bl::*node* node)
-         (bl::*prune-target-mib* nil)
+         (bl:*node* node)
+         (bl:*prune-target-mib* nil)
          (r (bl.rpc::rpc-getnetworkinfo node nil))
          (names (cdr (assoc "localservicesnames" r :test #'string=))))
     (is (= 16 (length (cdr (assoc "localservices" r :test #'string=)))))
@@ -5086,7 +5086,7 @@ NODE_NETWORK on a full node (init.cpp:863,1946), so both names appear."
     (is (member "NETWORK" names :test #'string=))
     (is (member "NETWORK_LIMITED" names :test #'string=))
     ;; And the hex field decodes to exactly the wire bits.
-    (is (= (bl.net::local-services)
+    (is (= (bl.net:local-services)
            (parse-integer (cdr (assoc "localservices" r :test #'string=))
                           :radix 16)))
     (is (assoc "localrelay" r :test #'string=))
@@ -5106,12 +5106,12 @@ to \"block-relay-only\" with relaytxes false. synced_headers/synced_blocks are
 -1 while unknown (Core), and pingtime is absent until a pong arrived (Core
 emits it conditionally)."
   (let* ((node (make-test-node))
-         (peer (bl::make-peer :address "1.2.3.4:8333" :state :ready
+         (peer (bl.net:make-peer :address "1.2.3.4:8333" :state :ready
                                         :inbound t :start-height 99 :services #x409))
-         (br (bl::make-peer :address "5.6.7.8:8333" :state :ready
+         (br (bl.net:make-peer :address "5.6.7.8:8333" :state :ready
                                       :conn-type :block-relay))
          (ct (lambda (r) (cdr (assoc "connection_type" r :test #'string=)))))
-    (setf (bl::node-peers node) (list peer br))
+    (setf (bl:node-peers node) (list peer br))
     (let* ((rows (bl.rpc::rpc-getpeerinfo node nil))
            (e (find "inbound" rows :key ct :test #'string=))
            (b (find "block-relay-only" rows :key ct :test #'string=)))
@@ -5134,7 +5134,7 @@ emits it conditionally)."
       ;; transport_protocol_type (Core TransportTypeAsString): "v1" without a
       ;; BIP324 session, "v2" when the connection carries one.
       (is (string= "v1" (cdr (assoc "transport_protocol_type" e :test #'string=))))
-      (setf (bl.net::peer-connection br)
+      (setf (bl.net:peer-connection br)
             (bl.net::make-connection :host "5.6.7.8" :port 8333
                                                       :transport t))
       (let* ((rows2 (bl.rpc::rpc-getpeerinfo node nil))
@@ -5153,30 +5153,30 @@ through yason."
                 :version 70016 :start-height 42 :user-agent "/parity/"))
          (conn (bl.net::make-connection
                 :host "203.0.113.5" :port 8333 :connected t))
-         (peer (bl::make-peer :address "203.0.113.5" :state :ready
+         (peer (bl.net:make-peer :address "203.0.113.5" :state :ready
                                         :version vmsg
                                         :services #x409
                                         :connection conn)))
     ;; Simulate live state: one pong observed, one ping outstanding, a
     ;; feefilter received, a queued announcement, addr relay set up, and
     ;; some per-command traffic.
-    (setf (bl.net::peer-ping-latency peer)
+    (setf (bl.net:peer-ping-latency peer)
           internal-time-units-per-second        ; 1.0s last ping
-          (bl.net::peer-min-ping-latency peer)
+          (bl.net:peer-min-ping-latency peer)
           (floor internal-time-units-per-second 2) ; 0.5s best
-          (bl.net::peer-ping-nonce peer) 7
-          (bl.net::peer-last-ping-time peer)
+          (bl.net:peer-ping-nonce peer) 7
+          (bl.net:peer-last-ping-time peer)
           (get-internal-real-time)
-          (bl.net::peer-feefilter-rate peer) 1000
-          (bl.net::peer-time-offset peer) -3
-          (bl.net::peer-addr-relay-enabled peer) t
-          (bl.net::peer-tx-inv-queue peer)
+          (bl.net:peer-feefilter-rate peer) 1000
+          (bl.net:peer-time-offset peer) -3
+          (bl.net:peer-addr-relay-enabled peer) t
+          (bl.net:peer-tx-inv-queue peer)
           (let ((txid (make-array 32 :element-type '(unsigned-byte 8))))
             (list (list txid txid 0)))
-          (bl.net::connection-last-send-time conn)
+          (bl.net:connection-last-send-time conn)
           (get-universal-time))
-    (incf (gethash "ping" (bl.net::peer-sent-per-msg peer) 0) 32)
-    (setf (bl::node-peers node) (list peer))
+    (incf (gethash "ping" (bl.net:peer-sent-per-msg peer) 0) 32)
+    (setf (bl:node-peers node) (list peer))
     (let* ((rows (bl.rpc::rpc-getpeerinfo node nil))
            (e (first rows))
            (f (lambda (k) (cdr (assoc k e :test #'string=)))))
@@ -5227,15 +5227,15 @@ through yason."
   "synced_headers reports the height of the peer's best known block (Core
 pindexBestKnownBlock -> nSyncHeight) once an announcement recorded one."
   (let* ((node (make-test-node))
-         (chain-state (bl.rpc::rpc-get-chain-state node))
+         (chain-state (bl.rpc:rpc-get-chain-state node))
          (bhash (make-array 32 :element-type '(unsigned-byte 8)
                                :initial-element 33))
-         (peer (bl::make-peer :address "198.51.100.9" :state :ready)))
+         (peer (bl.net:make-peer :address "198.51.100.9" :state :ready)))
     (bl.store:add-block-index-entry
      chain-state (bl.store:make-block-index-entry
                   :hash bhash :height 7 :status :valid))
-    (setf (bl.net::peer-best-known-block-hash peer) bhash)
-    (setf (bl::node-peers node) (list peer))
+    (setf (bl.net:peer-best-known-block-hash peer) bhash)
+    (setf (bl:node-peers node) (list peer))
     (let ((e (first (bl.rpc::rpc-getpeerinfo node nil))))
       (is (= 7 (cdr (assoc "synced_headers" e :test #'string=))))
       (is (= -1 (cdr (assoc "synced_blocks" e :test #'string=)))))))
@@ -5245,7 +5245,7 @@ pindexBestKnownBlock -> nSyncHeight) once an announcement recorded one."
 detail objects (txid/wtxid/bytes/vsize/weight/from); 2 -> details plus raw hex.
 The single announcer peer's id appears in \"from\"."
   (let* ((node (make-test-node))
-         (peer (bl::make-peer :address "9.9.9.9:8333"))
+         (peer (bl.net:make-peer :address "9.9.9.9:8333"))
          (txid0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
          (tx (bl.ser:make-transaction
               :version 2
@@ -5258,9 +5258,9 @@ The single announcer peer's id appears in \"from\"."
                                 :value 90000
                                 :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
               :lock-time 0))
-         (mempool (bl.rpc::rpc-get-mempool node))
+         (mempool (bl.rpc:rpc-get-mempool node))
          (pool (bl.mp:mempool-orphan-pool mempool))
-         (txid-hex (bl.rpc::hash-to-hex
+         (txid-hex (bl.rpc:hash-to-hex
                     (bl.ser:transaction-hash tx))))
     (bl.mp:orphan-add pool tx peer)
     ;; verbosity 0 (default): array of txid hex strings
@@ -5272,7 +5272,7 @@ The single announcer peer's id appears in \"from\"."
       (is (plusp (cdr (assoc "bytes" v1 :test #'string=))))
       (is (plusp (cdr (assoc "vsize" v1 :test #'string=))))
       (is (plusp (cdr (assoc "weight" v1 :test #'string=))))
-      (is (equal (list (bl.net::peer-id peer))
+      (is (equal (list (bl.net:peer-id peer))
                  (cdr (assoc "from" v1 :test #'string=))))
       (is (null (assoc "hex" v1 :test #'string=))))
     ;; verbosity 2: adds the raw hex
@@ -5291,9 +5291,9 @@ address, and a malformed signature all fail. The signature is deterministic."
          (pub (bl.crypto:derive-public-key k1))   ; compressed
          (addr (bl.crypto:encode-p2pkh-address
                 (bl.crypto:hash160 pub) :testnet3))
-         (sig (bl.rpc::rpc-signmessagewithprivkey node (list wif msg))))
+         (sig (bl.rpc:rpc-signmessagewithprivkey node (list wif msg))))
     (is (stringp sig))
-    (is (string= sig (bl.rpc::rpc-signmessagewithprivkey node (list wif msg))))
+    (is (string= sig (bl.rpc:rpc-signmessagewithprivkey node (list wif msg))))
     (is (eq t (bl.rpc::rpc-verifymessage node (list addr sig msg))))
     ;; Bare Core booleans: failures are JSON false, never null (wave 10).
     (is (eq 'yason:false (bl.rpc::rpc-verifymessage node (list addr sig "tampered"))))
@@ -5308,8 +5308,8 @@ address, and a malformed signature all fail. The signature is deterministic."
     (handler-case
         (progn (bl.rpc::rpc-verifymessage node (list addr "not-a-valid-sig" msg))
                (fail "malformed base64 should signal"))
-      (bl.rpc::rpc-error (e)
-        (is (= -5 (bl.rpc::rpc-error-code e)))))))
+      (bl.rpc:rpc-error (e)
+        (is (= -5 (bl.rpc:rpc-error-code e)))))))
 
 (test rpc-signrawtransactionwithkey-p2pkh-p2wpkh
   "signrawtransactionwithkey signs a P2WPKH input (input 0) and a P2PKH input
@@ -5344,11 +5344,11 @@ verifies under the SAME sighash the validator computes (legacy + BIP143)."
               :lock-time 0))
          (tx-hex (bl.crypto:bytes-to-hex
                   (bl.ser:serialize-transaction tx)))
-         (prevtxs (list (list (cons "txid" (bl.rpc::hash-to-hex txid0))
+         (prevtxs (list (list (cons "txid" (bl.rpc:hash-to-hex txid0))
                               (cons "vout" 0)
                               (cons "scriptPubKey" (bl.crypto:bytes-to-hex p2wpkh))
                               (cons "amount" 0.001d0))   ; 100000 sats
-                        (list (cons "txid" (bl.rpc::hash-to-hex txid1))
+                        (list (cons "txid" (bl.rpc:hash-to-hex txid1))
                               (cons "vout" 0)
                               (cons "scriptPubKey" (bl.crypto:bytes-to-hex p2pkh)))))
          (result (bl.rpc::rpc-signrawtransactionwithkey
@@ -5362,11 +5362,11 @@ verifies under the SAME sighash the validator computes (legacy + BIP143)."
       (let* ((stack (aref wit 0))
              (sig (first stack))
              (der (subseq sig 0 (1- (length sig))))
-             (sighash (let ((bl.interop::*current-tx* tx2)
-                            (bl.interop::*current-input-index* 0)
-                            (bl.interop::*precomputed-sighash*
-                             (bl.interop::init-precomputed-sighash tx2)))
-                        (bl.interop::compute-bip143-sighash p2pkh-code 100000 1))))
+             (sighash (let ((bl.interop:*current-tx* tx2)
+                            (bl.interop:*current-input-index* 0)
+                            (bl.interop:*precomputed-sighash*
+                             (bl.interop:init-precomputed-sighash tx2)))
+                        (bl.interop:compute-bip143-sighash p2pkh-code 100000 1))))
         (is (equalp pub (second stack)))
         (is-true (bl.crypto:verify-signature sighash der pub)))
       ;; Input 1 (P2PKH): scriptSig = push(sig) push(pubkey); sig verifies under legacy sighash.
@@ -5374,7 +5374,7 @@ verifies under the SAME sighash the validator computes (legacy + BIP143)."
              (siglen (aref ss 0))
              (sig (subseq ss 1 (1+ siglen)))
              (der (subseq sig 0 (1- (length sig))))
-             (sighash (bl.interop::compute-legacy-sighash tx2 1 p2pkh 1)))
+             (sighash (bl.interop:compute-legacy-sighash tx2 1 p2pkh 1)))
         (is-true (bl.crypto:verify-signature sighash der pub))))))
 
 (test rpc-signrawtransactionwithkey-p2tr-keypath
@@ -5401,7 +5401,7 @@ key-path verifier (validate-taproot-key-path) for the recomputed BIP341 sighash.
               :lock-time 0))
          (tx-hex (bl.crypto:bytes-to-hex
                   (bl.ser:serialize-transaction tx)))
-         (prevtxs (list (list (cons "txid" (bl.rpc::hash-to-hex txid0))
+         (prevtxs (list (list (cons "txid" (bl.rpc:hash-to-hex txid0))
                               (cons "vout" 0)
                               (cons "scriptPubKey" (bl.crypto:bytes-to-hex p2tr))
                               (cons "amount" 0.001d0))))   ; 100000 sats
@@ -5418,12 +5418,12 @@ key-path verifier (validate-taproot-key-path) for the recomputed BIP341 sighash.
       (let* ((spent (vector (bl.store:make-utxo-entry
                              :value 100000
                              :script-pubkey (coerce p2tr '(simple-array (unsigned-byte 8) (*))))))
-             (bl.interop::*current-tx* tx2)
-             (bl.interop::*current-input-index* 0)
-             (bl.interop::*current-spent-utxos* spent)
-             (bl.interop::*precomputed-sighash*
-              (bl.interop::init-precomputed-sighash tx2 spent)))
-        (is-true (bl.interop::validate-taproot-key-path stack qx 100000))))))
+             (bl.interop:*current-tx* tx2)
+             (bl.interop:*current-input-index* 0)
+             (bl.interop:*current-spent-utxos* spent)
+             (bl.interop:*precomputed-sighash*
+              (bl.interop:init-precomputed-sighash tx2 spent)))
+        (is-true (bl.interop:validate-taproot-key-path stack qx 100000))))))
 
 (defun %verify-tx-input (tx index spent-vec flags)
   "Run the full consensus interpreter (verify-script) on input INDEX of TX, with
@@ -5437,8 +5437,8 @@ SPENT-VEC supplying amounts/scriptPubKeys. Returns verify-script's result."
          (witness-stack (when (and wit (< index (length wit))) (elt wit index)))
          (bl.interop:*current-tx* tx)
          (bl.interop:*current-input-index* index)
-         (bl.interop::*current-spent-utxos* spent-vec)
-         (bl.interop::*precomputed-sighash* nil)
+         (bl.interop:*current-spent-utxos* spent-vec)
+         (bl.interop:*precomputed-sighash* nil)
          (bl.interop:*witness-input-amount* amount))
     (bl.interop:set-script-flags flags)
     (unwind-protect
@@ -5500,7 +5500,7 @@ DERSIG+LOW_S)."
               :lock-time 0))
          (tx-hex (bl.crypto:bytes-to-hex
                   (bl.ser:serialize-transaction tx)))
-         (h2 (lambda (j) (bl.rpc::hash-to-hex
+         (h2 (lambda (j) (bl.rpc:hash-to-hex
                           (make-array 32 :element-type '(unsigned-byte 8) :initial-element (+ 20 j)))))
          (prevtxs (list
                    ;; 0 P2SH-P2WPKH
@@ -5632,22 +5632,22 @@ DERSIG+LOW_S)."
   (multiple-value-bind (k1 k2) (%cms-keys)
     (let ((node (make-test-node)))
       ;; not enough keys for the threshold
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-createmultisig node (list 3 (list k1 k2))))
       ;; nrequired < 1
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-createmultisig node (list 0 (list k1))))
       ;; too many keys (> 20)
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-createmultisig node (list 1 (make-list 21 :initial-element k1))))
       ;; bech32m explicitly rejected
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-createmultisig node (list 2 (list k1 k2) "bech32m")))
       ;; unknown address type
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-createmultisig node (list 2 (list k1 k2) "p2tr")))
       ;; invalid public key
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-createmultisig node (list 1 (list "00")))))))
 
 ;;; --- ping (Bitcoin Core ping) ---
@@ -5675,15 +5675,15 @@ node has no address book."
   "Added routable IPv4 addresses land in the ipv4 new table and the
 all_networks aggregate; counts stay consistent with the address book."
   (let* ((node (make-test-node))
-         (book (bl.net::make-address-book)))
-    (setf (bl::node-address-book node) book)
-    (bl.net::address-book-add
-     book (bl.net::make-peer-address
-           :ip (bl.net::string-to-ip-bytes "1.2.3.4") :port 8333))
-    (bl.net::address-book-add
-     book (bl.net::make-peer-address
-           :ip (bl.net::string-to-ip-bytes "5.6.7.8") :port 8333))
-    (let* ((n-new (bl.net::address-book-n-new book))
+         (book (bl.net:make-address-book)))
+    (setf (bl:node-address-book node) book)
+    (bl.net:address-book-add
+     book (bl.net:make-peer-address
+           :ip (bl.net:string-to-ip-bytes "1.2.3.4") :port 8333))
+    (bl.net:address-book-add
+     book (bl.net:make-peer-address
+           :ip (bl.net:string-to-ip-bytes "5.6.7.8") :port 8333))
+    (let* ((n-new (bl.net:address-book-n-new book))
            (r (bl.rpc::rpc-getaddrmaninfo node nil))
            (ipv4 (cdr (assoc "ipv4" r :test #'string=)))
            (all (cdr (assoc "all_networks" r :test #'string=))))
@@ -5703,13 +5703,13 @@ all_networks aggregate; counts stay consistent with the address book."
 
 (defun %rpc-fake-peer (address &key inbound)
   "A peer struct usable in node-peers for RPC tests (no live connection)."
-  (bl.net::make-peer
+  (bl.net:make-peer
    :address address :state :ready :connection nil :inbound inbound))
 
 (test parse-node-endpoint-forms
   "parse-node-endpoint splits host/host:port/[ipv6]:port, defaulting the port."
   (let ((node (make-test-node)))               ; testnet3 default P2P port 18333
-    (flet ((p (spec) (multiple-value-list (bl::parse-node-endpoint node spec))))
+    (flet ((p (spec) (multiple-value-list (bl:parse-node-endpoint node spec))))
       (is (equal (p "1.2.3.4") '("1.2.3.4" 18333)))
       (is (equal (p "1.2.3.4:8333") '("1.2.3.4" 8333)))
       (is (equal (p "seed.example.com") '("seed.example.com" 18333)))
@@ -5723,24 +5723,24 @@ all_networks aggregate; counts stay consistent with the address book."
   (let ((node (make-test-node)))
     ;; add
     (is (null (bl.rpc::rpc-addnode node '("1.2.3.4:18333" "add"))))
-    (is (member "1.2.3.4:18333" (bl::node-added-nodes node) :test #'string=))
+    (is (member "1.2.3.4:18333" (bl:node-added-nodes node) :test #'string=))
     ;; duplicate add errors
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-addnode node '("1.2.3.4:18333" "add")))
     ;; onetry queues a one-shot dial without touching added-nodes
     (is (null (bl.rpc::rpc-addnode node '("9.9.9.9" "onetry"))))
-    (is (member "9.9.9.9" (bl::node-pending-onetry node) :test #'string=))
-    (is (not (member "9.9.9.9" (bl::node-added-nodes node) :test #'string=)))
+    (is (member "9.9.9.9" (bl:node-pending-onetry node) :test #'string=))
+    (is (not (member "9.9.9.9" (bl:node-added-nodes node) :test #'string=)))
     ;; remove
     (is (null (bl.rpc::rpc-addnode node '("1.2.3.4:18333" "remove"))))
-    (is (not (member "1.2.3.4:18333" (bl::node-added-nodes node) :test #'string=)))
+    (is (not (member "1.2.3.4:18333" (bl:node-added-nodes node) :test #'string=)))
     ;; remove of a node never added errors
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-addnode node '("1.2.3.4:18333" "remove")))
     ;; bad command + non-string node error
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-addnode node '("1.2.3.4" "frobnicate")))
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-addnode node '(42 "add")))))
 
 (test rpc-getaddednodeinfo-reports-state
@@ -5749,7 +5749,7 @@ all_networks aggregate; counts stay consistent with the address book."
     (bl.rpc::rpc-addnode node '("1.2.3.4" "add"))
     (bl.rpc::rpc-addnode node '("5.6.7.8:18333" "add"))
     ;; Mark 1.2.3.4 connected with an outbound peer.
-    (push (%rpc-fake-peer "1.2.3.4") (bl::node-peers node))
+    (push (%rpc-fake-peer "1.2.3.4") (bl:node-peers node))
     (let ((r (bl.rpc::rpc-getaddednodeinfo node nil)))
       (is (= 2 (length r)))
       (let ((a (find "1.2.3.4" r :key (lambda (e) (cdr (assoc "addednode" e :test #'string=)))
@@ -5767,27 +5767,27 @@ all_networks aggregate; counts stay consistent with the address book."
         ;; [] rather than null (this used to assert (null ...), the bug).
         (is (equalp #() (cdr (assoc "addresses" b :test #'string=))))))
     ;; filtering for a never-added node errors
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getaddednodeinfo node '("10.0.0.1")))))
 
 (test rpc-setnetworkactive-toggles-and-drops-peers
   "setnetworkactive flips node-network-active and drops peers when disabling."
   (let ((node (make-test-node))
         (peer (%rpc-fake-peer "1.2.3.4")))
-    (push peer (bl::node-peers node))
-    (is (bl::node-network-active node))      ; default enabled
+    (push peer (bl:node-peers node))
+    (is (bl:node-network-active node))      ; default enabled
     ;; disable
     (is (eq 'yason:false (bl.rpc::rpc-setnetworkactive node '(nil))))
-    (is (null (bl::node-network-active node)))
+    (is (null (bl:node-network-active node)))
     (is (eq :disconnected (bl.net:peer-state peer)))
     ;; getnetworkinfo reflects the disabled state
     (is (eq 'yason:false (cdr (assoc "networkactive"
                           (bl.rpc::rpc-getnetworkinfo node nil) :test #'string=))))
     ;; re-enable
     (is (eq t (bl.rpc::rpc-setnetworkactive node '(t))))
-    (is (bl::node-network-active node))
+    (is (bl:node-network-active node))
     ;; missing state errors
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-setnetworkactive node '()))))
 
 ;;; --- getchainstates ---
@@ -5821,17 +5821,17 @@ field shape."
 missing file or non-string path errors."
   (let* ((node (make-test-node))
          (path (merge-pathnames "bl-importmempool-test.dat" (uiop:temporary-directory))))
-    (bl.mp:save-mempool-file (bl::node-mempool node) path)
+    (bl.mp:save-mempool-file (bl:node-mempool node) path)
     (unwind-protect
          (let ((r (bl.rpc::rpc-importmempool node (list (namestring path)))))
            (is (hash-table-p r))                 ; serializes as {}
            (is (= 0 (hash-table-count r))))
       (ignore-errors (delete-file path)))
     ;; nonexistent file
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-importmempool node (list "/no/such/bl-mempool-file.dat")))
     ;; non-string filepath
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-importmempool node (list 123)))))
 
 ;;; --- peer id (getpeerinfo) + getblockfrompeer ---
@@ -5839,15 +5839,15 @@ missing file or non-string path errors."
 (test rpc-getpeerinfo-includes-id
   "getpeerinfo exposes a numeric peer id (Bitcoin Core's CNode::id)."
   (let ((node (make-test-node)))
-    (push (%rpc-fake-peer "1.2.3.4") (bl::node-peers node))
+    (push (%rpc-fake-peer "1.2.3.4") (bl:node-peers node))
     (let ((info (first (bl.rpc::rpc-getpeerinfo node nil))))
       (is (integerp (cdr (assoc "id" info :test #'string=)))))))
 
 (test rpc-getblockfrompeer-paths
   "getblockfrompeer validates header/peer and dispatches a witness-block getdata."
-  (let* ((bl::*prune-target-mib* nil)   ; deterministic: pruning off
+  (let* ((bl:*prune-target-mib* nil)   ; deterministic: pruning off
          (node (make-test-node))
-         (cs (bl::node-chain-state node))
+         (cs (bl:node-chain-state node))
          (store-dir (ensure-directories-exist
                      (merge-pathnames "bl-gbfp-test/" (uiop:temporary-directory))))
          (store (bl.store:init-block-store store-dir))
@@ -5857,28 +5857,28 @@ missing file or non-string path errors."
                :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                :timestamp 1 :bits #x1d00ffff :nonce 0))
          (hash (bl.ser:block-header-hash hdr))
-         (hash-hex (bl.rpc::hash-to-hex hash)))
-    (setf (bl::node-block-store node) store)
+         (hash-hex (bl.rpc:hash-to-hex hash)))
+    (setf (bl:node-block-store node) store)
     ;; header not in index yet → "Block header missing"
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockfrompeer node (list hash-hex 1)))
     ;; register the header
     (bl.store:add-block-index-entry
      cs (bl.store:make-block-index-entry
          :hash hash :height 1 :header hdr :status :header-valid :chain-work 1))
     ;; no peer with that id → "Peer does not exist"
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockfrompeer node (list hash-hex 999999)))
     ;; connected peer by id → returns {} (empty hash-table); send is a no-op on
     ;; the fake peer's nil connection.
     (let ((peer (%rpc-fake-peer "1.2.3.4")))
-      (push peer (bl::node-peers node))
+      (push peer (bl:node-peers node))
       (let ((r (bl.rpc::rpc-getblockfrompeer
-                node (list hash-hex (bl.net::peer-id peer)))))
+                node (list hash-hex (bl.net:peer-id peer)))))
         (is (hash-table-p r))
         (is (= 0 (hash-table-count r)))))
     ;; bad peer_id type → error
-    (signals bl.rpc::rpc-error
+    (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockfrompeer node (list hash-hex "notanint")))))
 
 ;;; --- logging (Bitcoin Core logging) ---
@@ -5891,7 +5891,7 @@ all/none and unknown-category handling."
        (let ((node (make-test-node)))
          ;; default: all categories present, none enabled
          (let ((r (bl.rpc::rpc-logging node nil)))
-           (is (= (length bl.log::+log-categories+) (length r)))
+           (is (= (length bl.log:+log-categories+) (length r)))
            (is (assoc "net" r :test #'string=))
            ;; category states are JSON booleans — false, never null (wave 10)
            (is (eq 'yason:false (cdr (assoc "net" r :test #'string=)))))
@@ -5909,7 +5909,7 @@ all/none and unknown-category handling."
          (let ((r (bl.rpc::rpc-logging node (list nil (list "all")))))
            (is (every (lambda (pair) (eq 'yason:false (cdr pair))) r)))
          ;; unknown category errors
-         (signals bl.rpc::rpc-error
+         (signals bl.rpc:rpc-error
            (bl.rpc::rpc-logging node (list (list "boguscat") nil))))
     (clrhash bl.log::*debug-categories*)))
 
@@ -5919,10 +5919,10 @@ the global level threshold)."
   (clrhash bl.log::*debug-categories*)
   (unwind-protect
        (let ((s (make-string-output-stream)))
-         (let ((bl.log::*log-stream* s)
-               (bl.log::*current-log-level* :info))  ; debug normally hidden
+         (let ((bl.log:*log-stream* s)
+               (bl.log:*current-log-level* :info))  ; debug normally hidden
            (bl:log-cat "net" "MARKER-DISABLED-~D" 1)   ; off -> nothing
-           (bl.log::enable-log-category "net")
+           (bl.log:enable-log-category "net")
            (bl:log-cat "net" "MARKER-ENABLED-~D" 2)    ; on -> emitted
            (bl:log-cat "mempool" "MARKER-OTHER-~D" 3)) ; still off
          (let ((out (get-output-stream-string s)))
@@ -5939,13 +5939,13 @@ the global level threshold)."
 diagram, over a CPFP pair that shares one chunk. Sizes are in vB (our
 txgraph unit; Core uses sigops-adjusted weight)."
   (let* ((node (make-test-node))
-         (mempool (bl::node-mempool node))
+         (mempool (bl:node-mempool node))
          (parent (%mp-spending-tx (%txid-array 210) :vout 0 :value 50000000))
          (pid (bl.ser:transaction-hash parent))
-         (pid-hex (bl.rpc::hash-to-hex pid))
+         (pid-hex (bl.rpc:hash-to-hex pid))
          (child (%mp-spending-tx pid :vout 0 :value 40000000))
          (cid (bl.ser:transaction-hash child))
-         (cid-hex (bl.rpc::hash-to-hex cid))
+         (cid-hex (bl.rpc:hash-to-hex cid))
          (pvsize (bl.ser:transaction-vsize parent))
          (cvsize (bl.ser:transaction-vsize child)))
     ;; Empty mempool: the diagram is just the (0, 0) origin.
@@ -5985,18 +5985,18 @@ txgraph unit; Core uses sigops-adjusted weight)."
     ;; getmempoolcluster on an absent txid errors like getmempoolentry.
     (signals error
       (bl.rpc::rpc-getmempoolcluster
-       node (list (bl.rpc::hash-to-hex (%txid-array 212)))))))
+       node (list (bl.rpc:hash-to-hex (%txid-array 212)))))))
 
 (test rpc-mempool-cluster-two-chunks
   "A cluster whose child does NOT absorb its parent reports two chunks in
 mining order (parent's first)."
   (let* ((node (make-test-node))
-         (mempool (bl::node-mempool node))
+         (mempool (bl:node-mempool node))
          (parent (%mp-spending-tx (%txid-array 213) :vout 0 :value 50000000))
          (pid (bl.ser:transaction-hash parent))
-         (pid-hex (bl.rpc::hash-to-hex pid))
+         (pid-hex (bl.rpc:hash-to-hex pid))
          (child (%mp-spending-tx pid :vout 0 :value 40000000))
-         (cid-hex (bl.rpc::hash-to-hex
+         (cid-hex (bl.rpc:hash-to-hex
                    (bl.ser:transaction-hash child))))
     (%add-tx mempool parent :fee 20000)
     (%add-tx mempool child :fee 100)
@@ -6039,7 +6039,7 @@ structural."
     (let* ((node (make-test-node))
            (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
            (genesis (first entries))
-           (genesis-hex (bl.rpc::hash-to-hex
+           (genesis-hex (bl.rpc:hash-to-hex
                          (bl.store:block-index-entry-hash genesis)))
            ;; A competing block at height 1, off the active chain.
            (fork-header (bl.ser:make-block-header
@@ -6048,8 +6048,8 @@ structural."
                          :merkle-root (make-32-byte-hash 99)
                          :timestamp 1700000500 :bits #x1d00ffff :nonce 4242))
            (fork-hash (bl.ser:block-header-hash fork-header))
-           (fork-hex (bl.rpc::hash-to-hex fork-hash)))
-      (setf (bl::node-chain-state node) cs)
+           (fork-hex (bl.rpc:hash-to-hex fork-hash)))
+      (setf (bl:node-chain-state node) cs)
       (bl.store:add-block-index-entry
        cs (bl.store:make-block-index-entry
            :hash fork-hash :height 1 :header fork-header
@@ -6107,9 +6107,9 @@ AND the tip advanced within the staleness threshold; HTTP 503 otherwise."
 (test rest-health-liveness-report
   "node-tip-liveness on a fresh, unstarted node: no sync thread -> unhealthy,
 and a never-advanced tip reads as a large seconds-since-tip."
-  (let ((node (bl::make-node :network :testnet4)))
+  (let ((node (bl:make-node :network :testnet4)))
     (multiple-value-bind (healthy seconds synced)
-        (bl::node-tip-liveness node)
+        (bl:node-tip-liveness node)
       (declare (ignore synced))
       ;; No sync thread has been started, so the probe reports unhealthy.
       (is-false healthy)
@@ -6136,7 +6136,7 @@ and a never-advanced tip reads as a large seconds-since-tip."
 (defun call-with-jsonrpc-shape-method (thunk)
   "Register an always-succeeding dispatch target, run THUNK, then remove it so
 the global method registry (which the /ui help test enumerates) is unchanged."
-  (bl.rpc::register-rpc-method
+  (bl.rpc:register-rpc-method
    *jsonrpc-shape-method*
    (lambda (node params) (declare (ignore node params)) 42))
   (unwind-protect (funcall thunk)
@@ -6220,7 +6220,7 @@ response[\"error\"] must EXIST and be null on success."
           (let ((err (gethash "error" reply)))
             (is (hash-table-p err) "expected an error object, got ~S" err)
             (when (hash-table-p err)
-              (is (eql bl.rpc::+rpc-method-not-found+
+              (is (eql bl.rpc:+rpc-method-not-found+
                        (gethash "code" err)))
               (is (equal "Method not found" (gethash "message" err)))))
           (is (eql 7 (gethash "id" reply))))))))
@@ -6327,7 +6327,7 @@ and the HTTP-level refusals rpc-json-error builds — take Core's default
 V1_LEGACY/null-id JSONRPCRequest (httprpc.cpp:41-59, request.h:55,63), so they
 carry result+error and no \"jsonrpc\"."
   (let* ((response (bl.rpc::make-rpc-error-response
-                    bl.rpc::+rpc-parse-error+ "Parse error" nil :v1))
+                    bl.rpc:+rpc-parse-error+ "Parse error" nil :v1))
          (json (with-output-to-string (s) (yason:encode response s)))
          (reply (yason:parse json)))
     (is-false (jsonrpc-shape-key-present-p reply "jsonrpc") "~A" json)
@@ -6338,7 +6338,7 @@ carry result+error and no \"jsonrpc\"."
     (let ((err (gethash "error" reply)))
       (is (hash-table-p err))
       (when (hash-table-p err)
-        (is (eql bl.rpc::+rpc-parse-error+ (gethash "code" err)))))))
+        (is (eql bl.rpc:+rpc-parse-error+ (gethash "code" err)))))))
 
 ;;;; ---------------------------------------------------------------------
 ;;;; The same rules, asserted at the HTTP HANDLER — the call site the bug
@@ -6397,10 +6397,10 @@ everything a method itself signals.")
 (defun call-with-jsonrpc-handler-methods (thunk)
   "Register the handler tests' throwaway dispatch targets, run THUNK, then
 remove them so the global method registry is unchanged."
-  (bl.rpc::register-rpc-method
+  (bl.rpc:register-rpc-method
    *jsonrpc-shape-method*
    (lambda (node params) (declare (ignore node params)) 42))
-  (bl.rpc::register-rpc-method
+  (bl.rpc:register-rpc-method
    *jsonrpc-handler-dotted-method*
    (lambda (node params) (declare (ignore node params)) (cons 1 2)))
   (unwind-protect (funcall thunk)
@@ -6523,7 +6523,7 @@ wave repairs — changes these bytes."
          (format nil "{~A\"method\":\"ga8shapenosuchmethod\",\"id\":7}" version-member)
          404
          (format nil "{\"result\":null,\"error\":{\"code\":~D,\"message\":\"Method not found\"},\"id\":7}"
-                 bl.rpc::+rpc-method-not-found+)))
+                 bl.rpc:+rpc-method-not-found+)))
       ;; --- 2.0 control: unchanged, and always HTTP 200 even for an error. ---
       (jsonrpc-handler-check
        (format nil "{\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"params\":[],\"id\":7}" echo)
@@ -6532,7 +6532,7 @@ wave repairs — changes these bytes."
        "{\"jsonrpc\":\"2.0\",\"method\":\"ga8shapenosuchmethod\",\"id\":7}"
        200
        (format nil "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":~D,\"message\":\"Method not found\"},\"id\":7}"
-               bl.rpc::+rpc-method-not-found+))
+               bl.rpc:+rpc-method-not-found+))
       ;; --- The reply is the same on a /wallet/<name> endpoint. ---
       (jsonrpc-handler-check
        (format nil "{\"method\":\"~A\",\"id\":7}" echo)
@@ -6575,7 +6575,7 @@ null, so the empty array has to be spelled #(). Batch replies are per member."
       (jsonrpc-handler-check
        "[7]" 200
        (format nil "[~A]"
-               (jsonrpc-legacy-error-json bl.rpc::+rpc-invalid-request+
+               (jsonrpc-legacy-error-json bl.rpc:+rpc-invalid-request+
                                           "Invalid request format"))))))
 
 (test jsonrpc-handler-pre-dispatch-errors-use-the-legacy-shape
@@ -6592,23 +6592,23 @@ content-type guard in that chain; see the last case."
     ;; Malformed JSON -> -32700, HTTP 500.
     (jsonrpc-handler-check
      "not valid json" 500
-     (jsonrpc-legacy-error-json bl.rpc::+rpc-parse-error+ "Parse error"))
+     (jsonrpc-legacy-error-json bl.rpc:+rpc-parse-error+ "Parse error"))
     ;; Missing method -> -32600, HTTP 400. Note the request says 2.0 and still
     ;; gets the legacy shape: pre-dispatch failures carry no version (the
     ;; documented deviation from Core, which has already recorded V2 here).
     (jsonrpc-handler-check
      "{\"jsonrpc\":\"2.0\",\"id\":1}" 400
-     (jsonrpc-legacy-error-json bl.rpc::+rpc-invalid-request+
+     (jsonrpc-legacy-error-json bl.rpc:+rpc-invalid-request+
                                 "Missing or invalid method"))
     ;; A result yason cannot encode reaches the handler's outermost clause.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-handler-dotted-method*)
      500
-     (jsonrpc-legacy-error-json bl.rpc::+rpc-internal-error+ "Internal error"))
+     (jsonrpc-legacy-error-json bl.rpc:+rpc-internal-error+ "Internal error"))
     ;; Oversized body (Content-Length over the 32 MiB cap) -> 400.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 400
-     (jsonrpc-legacy-error-json bl.rpc::+rpc-misc-error+ "Request body too large")
+     (jsonrpc-legacy-error-json bl.rpc:+rpc-misc-error+ "Request body too large")
      :content-length (princ-to-string (1+ bl:+max-rpc-body-size+)))
     ;; A credential that does not match -> 401 with an empty body, decided
     ;; before the body is even looked at. This assertion is also what keeps
@@ -6623,7 +6623,7 @@ content-type guard in that chain; see the last case."
     ;; 401 here and this check would fail.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 403
-     (jsonrpc-legacy-error-json bl.rpc::+rpc-misc-error+
+     (jsonrpc-legacy-error-json bl.rpc:+rpc-misc-error+
                                 "Origin does not match Host")
      :auth nil
      :headers (list (cons :origin "http://evil.example")))
@@ -6635,7 +6635,7 @@ content-type guard in that chain; see the last case."
     ;; An exhausted bucket (rate 0, burst 0) with a BAD credential -> 429.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 429
-     (jsonrpc-legacy-error-json bl.rpc::+rpc-misc-error+ "Rate limit exceeded")
+     (jsonrpc-legacy-error-json bl.rpc:+rpc-misc-error+ "Rate limit exceeded")
      :auth (concatenate 'string *jsonrpc-handler-rpc-user* ":wrong")
      :rate-limiter (bl:make-rate-limiter 0 0))
     ;; The same exhausted bucket with a VALID credential is served. This is the
@@ -6661,10 +6661,10 @@ content-type guard in that chain; see the last case."
 sets the status and application/json, and its body is the V1_LEGACY shape."
   (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
     (let ((json (bl.rpc::rpc-json-error
-                 429 bl.rpc::+rpc-misc-error+ "Rate limit exceeded")))
+                 429 bl.rpc:+rpc-misc-error+ "Rate limit exceeded")))
       (is (eql 429 (hunchentoot:return-code*)))
       (is (equal "application/json" (hunchentoot:content-type*)))
-      (is (string= (jsonrpc-legacy-error-json bl.rpc::+rpc-misc-error+
+      (is (string= (jsonrpc-legacy-error-json bl.rpc:+rpc-misc-error+
                                               "Rate limit exceeded")
                    json)
           "rpc-json-error body: ~S" json))))
@@ -6774,7 +6774,7 @@ on the wire gets back."
     (let ((port 19987)
           (node (make-test-node))
           (cookie nil))
-      (setf (bl::node-data-directory node) dir)
+      (setf (bl:node-data-directory node) dir)
       (unwind-protect
            (progn
              (is (not (null (bl.rpc:start-rpc-server node :port port))))
@@ -6834,7 +6834,7 @@ divergence a conformance test catches and a human never does."
            (cdr (assoc "active" (bl.rpc::%buried-deployment activation tip)
                        :test #'string=))))
     ;; Two below: not yet.
-    (is (eq bl.rpc::+json-false+ (active 498 500)))
+    (is (eq bl.rpc:+json-false+ (active 498 500)))
     ;; ONE below: Core says active. This is the case that was wrong.
     (is (eq t (active 499 500)))
     ;; At and above: active.
@@ -6871,4 +6871,4 @@ approximation."
       (is-true (hash-table-p (second out))
                "mempool_only did not reach the options slot: ~S" out))
     ;; A name that is neither positional nor a member is still unknown.
-    (signals bl.rpc::rpc-error (call "send" "outputs" 1 "nonesuch" 2))))
+    (signals bl.rpc:rpc-error (call "send" "outputs" 1 "nonesuch" 2))))

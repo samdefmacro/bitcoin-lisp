@@ -32,63 +32,63 @@
   "Execute BODY holding NODE's recursive state lock. Use around any RPC
 handler section that mutates — or must consistently read — the mempool,
 chainstate, or peer list (see the locking discipline above)."
-  `(bt:with-recursive-lock-held ((bl::node-lock ,node))
+  `(bt:with-recursive-lock-held ((bl:node-lock ,node))
      ,@body))
 
 (defun rpc-get-chain-state (node)
   "Get the current (active) chainstate with lock protection. RPC reports the
 active chainstate (Core getblockchaininfo reports CurrentChainstate)."
-  (bt:with-recursive-lock-held ((bl::node-lock node))
-    (bl::node-current-chainstate node)))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (bl:node-current-chainstate node)))
 
 (defun rpc-get-utxo-set (node)
   "Get the current chainstate's coins view with lock protection."
-  (bt:with-recursive-lock-held ((bl::node-lock node))
-    (let ((cs (bl::node-current-chainstate node)))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (let ((cs (bl:node-current-chainstate node)))
       (and cs (bl.store:chain-state-coins-view cs)))))
 
 (defun rpc-get-chainstates (node)
   "Get a copy of the full chainstates list with lock protection (for
 getchainstates, which reports every chainstate)."
-  (bt:with-recursive-lock-held ((bl::node-lock node))
-    (copy-list (bl::node-chainstates node))))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (copy-list (bl:node-chainstates node))))
 
 (defun rpc-get-peers (node)
   "Get a copy of the peer list with lock protection."
-  (bt:with-recursive-lock-held ((bl::node-lock node))
-    (copy-list (bl::node-peers node))))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (copy-list (bl:node-peers node))))
 
 (defun rpc-get-mempool (node)
   "Get mempool with lock protection."
-  (bt:with-recursive-lock-held ((bl::node-lock node))
-    (bl::node-mempool node)))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (bl:node-mempool node)))
 
 (defun rpc-get-block-store (node)
   "Get block-store with lock protection."
-  (bt:with-recursive-lock-held ((bl::node-lock node))
-    (bl::node-block-store node)))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (bl:node-block-store node)))
 
 (defun rpc-get-network (node)
   "Get network type with lock protection."
-  (bt:with-recursive-lock-held ((bl::node-lock node))
-    (bl::node-network node)))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (bl:node-network node)))
 
 (defun rpc-is-syncing (node)
   "Check if node is currently syncing."
-  (bt:with-recursive-lock-held ((bl::node-lock node))
-    (bl::node-syncing node)))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (bl:node-syncing node)))
 
 (defun rpc-get-tx-index (node)
   "Get tx-index with lock protection."
-  (bt:with-recursive-lock-held ((bl::node-lock node))
-    (bl::node-tx-index node)))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (bl:node-tx-index node)))
 
 (defun rpc-get-blockfilterindex (node)
   "Get the block filter index with lock protection."
-  (bt:with-recursive-lock-held ((bl::node-lock node))
-    (bl::node-blockfilterindex node)))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (bl:node-blockfilterindex node)))
 
 (defun rpc-get-coinstatsindex (node)
   "Get the coinstats index with lock protection."
-  (bt:with-recursive-lock-held ((bl::node-lock node))
-    (bl::node-coinstatsindex node)))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (bl:node-coinstatsindex node)))

@@ -83,7 +83,7 @@ a list of (value script-pubkey). WITNESS is a vector of per-input stacks."
   "scriptSig <sig> <pubkey> spending a P2PKH output at INPUT-INDEX of TX with
 SIGHASH_ALL. With CORRUPT, one byte inside the DER r value is flipped: the
 encoding stays canonical and low-S, so only the ECDSA check can reject it."
-  (let* ((sighash (bl.interop::compute-legacy-sighash
+  (let* ((sighash (bl.interop:compute-legacy-sighash
                    tx input-index (%ib-p2pkh-spk) 1))
          (sig (%ib-bytes (bl.crypto:sign-ecdsa +ib-privkey+ sighash) 1)))
     (when corrupt
@@ -95,12 +95,12 @@ encoding stays canonical and low-S, so only the ECDSA check can reject it."
   "BIP341 key-path witness (SIGHASH_DEFAULT) for INPUT-INDEX of TX. SPENT-UTXOS
 is the utxo-entry vector for every input — the BIP341 sighash commits to all of
 their amounts and scriptPubKeys, so it is exactly what a chained spend needs."
-  (let* ((bl.interop::*current-tx* tx)
-         (bl.interop::*current-spent-utxos* spent-utxos)
-         (bl.interop::*current-input-index* input-index)
-         (bl.interop::*precomputed-sighash*
+  (let* ((bl.interop:*current-tx* tx)
+         (bl.interop:*current-spent-utxos* spent-utxos)
+         (bl.interop:*current-input-index* input-index)
+         (bl.interop:*precomputed-sighash*
            (bl.interop:init-precomputed-sighash tx spent-utxos))
-         (sighash (bl.interop::compute-bip341-sighash
+         (sighash (bl.interop:compute-bip341-sighash
                    (bl.store:utxo-entry-value (aref spent-utxos input-index))
                    0 nil nil))
          (sig (bl.crypto:sign-schnorr
@@ -112,7 +112,7 @@ their amounts and scriptPubKeys, so it is exactly what a chained spend needs."
 
 (defun %ib-entry (value script-pubkey height)
   "A utxo-entry, as the block's intra-block overlay stores one."
-  (bl.store::make-utxo-entry :value value
+  (bl.store:make-utxo-entry :value value
                                          :script-pubkey script-pubkey
                                          :height height
                                          :coinbase nil))
@@ -122,9 +122,9 @@ their amounts and scriptPubKeys, so it is exactly what a chained spend needs."
 P2SH(OP_TRUE) coin of +IB-COIN-VALUE+ at ((%ib-coin) . 0). Returns
 (values chain-state utxo-set prev-hash bits now subsidy)."
   (let* ((node (regtest-node-fixture suffix))
-         (cs (bl::node-chain-state node))
+         (cs (bl:node-chain-state node))
          (utxo (bl.store:make-utxo-set)))
-    (setf (bl::node-utxo-set node) utxo)
+    (setf (bl:node-utxo-set node) utxo)
     (bl.store:add-utxo utxo (%ib-coin) 0 +ib-coin-value+
                                    (p2sh-optrue-script-pubkey) 0 :coinbase nil)
     (values cs utxo
@@ -132,7 +132,7 @@ P2SH(OP_TRUE) coin of +IB-COIN-VALUE+ at ((%ib-coin) . 0). Returns
             (bl.ser:block-header-bits
              (bl::make-genesis-header :regtest))
             (bl.ser:get-unix-time)
-            (bl.val::calculate-block-subsidy 1))))
+            (bl.val:calculate-block-subsidy 1))))
 
 (defun %ib-block (txs prev bits timestamp cb-value)
   "A mined height-1 regtest block: coinbase (BIP34 height, BIP141 witness

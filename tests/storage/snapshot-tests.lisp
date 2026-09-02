@@ -50,10 +50,10 @@ creates its chainstate_snapshot/ LevelDB there."
                      :hash tip-hash :height tip-height
                      :chain-work (* tip-height 100) :status :valid
                      :prev-entry genesis-entry)))
-    (setf (bl::node-data-directory node) (pathname dir)
-          (bl::node-chain-state node) chain-state
-          (bl::node-utxo-set node) utxo
-          (bl::node-block-store node)
+    (setf (bl:node-data-directory node) (pathname dir)
+          (bl:node-chain-state node) chain-state
+          (bl:node-utxo-set node) utxo
+          (bl:node-block-store node)
           (bl.store:init-block-store dir))
     (bl.store:add-block-index-entry chain-state genesis-entry)
     (bl.store:add-block-index-entry chain-state tip-entry)
@@ -108,12 +108,12 @@ each coin (vout height coinbase value script)."
   (handler-case
       (progn (bl.rpc::rpc-loadtxoutset node (list (namestring path)))
              nil)
-    (bl.rpc::rpc-error (e) e)))
+    (bl.rpc:rpc-error (e) e)))
 
 (defun %snap-err-matches (err code substring)
   (and err
-       (= code (bl.rpc::rpc-error-code err))
-       (search substring (bl.rpc::rpc-error-message err))))
+       (= code (bl.rpc:rpc-error-code err))
+       (search substring (bl.rpc:rpc-error-message err))))
 
 (defun %snap-hash (coins)
   "hash_serialized_3 over COINS ((txid vout height coinbase value script)),
@@ -147,16 +147,16 @@ expected bytes are assembled by hand from the format spec."
            (txid-a (%snap-fill 32 #x11))
            (txid-b (%snap-fill 32 #x22))
            (node (%snap-node dir h5 5))
-           (utxo (bl::node-utxo-set node))
+           (utxo (bl:node-utxo-set node))
            (snap (namestring (merge-pathnames "utxo.dat" dir))))
       ;; Give the tip entry a known per-block tx count so nchaintx (walk
       ;; to genesis: 3 + genesis' 1) is reportable.
       (setf (bl.store:block-index-entry-tx-count
              (bl.store:get-block-index-entry
-              (bl::node-chain-state node) h5))
+              (bl:node-chain-state node) h5))
             3)
       (bl.store:update-chain-tip
-       (bl::node-chain-state node) h5 5)
+       (bl:node-chain-state node) h5 5)
       ;; Insert in scrambled order; the dump cursor must normalize to
       ;; txid-lex + numeric-vout order (incl. vout 300 > 255, whose LE
       ;; byte order differs from numeric order).
@@ -195,21 +195,21 @@ expected bytes are assembled by hand from the format spec."
         (is (equalp expected (%snap-file-bytes snap)))
         (is (= 3 (cdr (assoc "coins_written" r :test #'string=))))
         (is (= 5 (cdr (assoc "base_height" r :test #'string=))))
-        (is (string= (bl.rpc::hash-to-hex h5)
+        (is (string= (bl.rpc:hash-to-hex h5)
                      (cdr (assoc "base_hash" r :test #'string=))))
         ;; Same-pass hash matches the P1 whole-set hasher.
-        (is (string= (bl.rpc::hash-to-hex
+        (is (string= (bl.rpc:hash-to-hex
                       (bl.store:compute-utxo-set-hash utxo))
                      (cdr (assoc "txoutset_hash" r :test #'string=))))
         ;; nchaintx = tip 3 + genesis 1.
         (is (= 4 (cdr (assoc "nchaintx" r :test #'string=)))))
       ;; Existing path, rollback type, and unknown type are all refused.
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-dumptxoutset node (list snap "latest")))
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-dumptxoutset
          node (list (namestring (merge-pathnames "r.dat" dir)) "rollback")))
-      (signals bl.rpc::rpc-error
+      (signals bl.rpc:rpc-error
         (bl.rpc::rpc-dumptxoutset
          node (list (namestring (merge-pathnames "t.dat" dir)) "bogus")))
       ;; The failed calls above must not leave .incomplete litter.
@@ -233,19 +233,19 @@ at the base (historical). The base entry's tx-count is seeded from nChainTx."
              (src (%snap-node src-dir h5 5))
              (snap (namestring (merge-pathnames "utxo.dat" src-dir))))
         (bl.store:update-chain-tip
-         (bl::node-chain-state src) h5 5)
-        (let ((utxo (bl::node-utxo-set src)))
+         (bl:node-chain-state src) h5 5)
+        (let ((utxo (bl:node-utxo-set src)))
           (bl.store:add-utxo utxo txid-a 0 4200000000 spk-a 3 :coinbase t)
           (bl.store:add-utxo utxo txid-a 300 999 spk-raw 4)
           (bl.store:add-utxo utxo txid-b 1 12345 spk-raw 5))
         (let* ((expected-hash (bl.store:compute-utxo-set-hash
-                               (bl::node-utxo-set src)))
+                               (bl:node-utxo-set src)))
                (r (bl.rpc::rpc-dumptxoutset src (list snap "latest"))))
-          (is (string= (bl.rpc::hash-to-hex expected-hash)
+          (is (string= (bl.rpc:hash-to-hex expected-hash)
                        (cdr (assoc "txoutset_hash" r :test #'string=))))
           (let* ((dst (%snap-node dst-dir h5 5))
-                 (primary (bl::node-chain-state dst))
-                 (primary-utxo (bl::node-utxo-set dst)))
+                 (primary (bl:node-chain-state dst))
+                 (primary-utxo (bl:node-utxo-set dst)))
             ;; Pre-existing primary-chainstate coin: must NOT appear in the
             ;; snapshot chainstate's view, but survives in the primary's.
             (bl.store:add-utxo primary-utxo txid-s 0 777 spk-raw 1)
@@ -255,16 +255,16 @@ at the base (historical). The base entry's tx-count is seeded from nChainTx."
               (let ((r2 (bl.rpc::rpc-loadtxoutset dst (list snap))))
                 (is (= 3 (cdr (assoc "coins_loaded" r2 :test #'string=))))
                 (is (= 5 (cdr (assoc "base_height" r2 :test #'string=))))
-                (is (string= (bl.rpc::hash-to-hex h5)
+                (is (string= (bl.rpc:hash-to-hex h5)
                              (cdr (assoc "tip_hash" r2 :test #'string=)))))
               ;; The CURRENT chainstate is now the snapshot chainstate at the
               ;; base; the primary became historical (target = base).
-              (let ((current (bl::node-current-chainstate dst))
-                    (historical (bl::node-historical-chainstate dst))
-                    (dst-utxo (bl::node-utxo-set dst)))
+              (let ((current (bl:node-current-chainstate dst))
+                    (historical (bl:node-historical-chainstate dst))
+                    (dst-utxo (bl:node-utxo-set dst)))
                 (is (not (eq current primary)))
                 (is (eq historical primary))
-                (is (= 2 (length (bl::node-chainstates dst))))
+                (is (= 2 (length (bl:node-chainstates dst))))
                 (is (equalp h5 (bl.store:chain-state-from-snapshot-blockhash
                                 current)))
                 (is (eq :unvalidated
@@ -273,10 +273,10 @@ at the base (historical). The base entry's tx-count is seeded from nChainTx."
                              (bl.store:chain-state-storage-suffix current)))
                 (is (equalp h5 (bl.store:chain-state-target-blockhash
                                 primary)))
-                (is (eq primary (bl::node-validated-chainstate dst)))
+                (is (eq primary (bl:node-validated-chainstate dst)))
                 ;; Both chainstates share ONE block index (Core m_blockman).
-                (is (eq (bl.store::chain-state-block-index primary)
-                        (bl.store::chain-state-block-index current)))
+                (is (eq (bl.store:chain-state-block-index primary)
+                        (bl.store:chain-state-block-index current)))
                 ;; Tip fast-forwarded; nChainTx seeded on the base entry.
                 (is (= 5 (bl.store:current-height current)))
                 (is (equalp h5 (bl.store:best-block-hash current)))
@@ -331,8 +331,8 @@ that made every real multi-batch public snapshot (>100k coins) fail before."
              (src (%snap-node src-dir h5 5))
              (snap (namestring (merge-pathnames "utxo.dat" src-dir))))
         (bl.store:update-chain-tip
-         (bl::node-chain-state src) h5 5)
-        (let ((utxo (bl::node-utxo-set src)))
+         (bl:node-chain-state src) h5 5)
+        (let ((utxo (bl:node-utxo-set src)))
           ;; txid-a: 3 coins (straddles batch size 2); txid-b: 2 coins.
           (bl.store:add-utxo utxo txid-a 0 4200000000 spk-a 3 :coinbase t)
           (bl.store:add-utxo utxo txid-a 1 999 spk-raw 4)
@@ -340,7 +340,7 @@ that made every real multi-batch public snapshot (>100k coins) fail before."
           (bl.store:add-utxo utxo txid-b 0 12345 spk-raw 5)
           (bl.store:add-utxo utxo txid-b 1 6789 spk-raw 5))
         (let ((expected-hash (bl.store:compute-utxo-set-hash
-                              (bl::node-utxo-set src))))
+                              (bl:node-utxo-set src))))
           (bl.rpc::rpc-dumptxoutset src (list snap "latest"))
           (let ((dst (%snap-node dst-dir h5 5))
                 (bl:*assumeutxo-data-override*
@@ -348,7 +348,7 @@ that made every real multi-batch public snapshot (>100k coins) fail before."
             (let ((r (bl.rpc::rpc-loadtxoutset dst (list snap))))
               (is (= 5 (cdr (assoc "coins_loaded" r :test #'string=))))
               (is (= 5 (cdr (assoc "base_height" r :test #'string=)))))
-            (let ((dst-utxo (bl::node-utxo-set dst)))
+            (let ((dst-utxo (bl:node-utxo-set dst)))
               ;; Every coin landed and the set re-hashes to the commitment.
               (is (equalp expected-hash
                           (bl.store:compute-utxo-set-hash dst-utxo)))
@@ -402,7 +402,7 @@ a non-empty mempool — all rejected before the coin stream is touched."
            (h7 (%snap-fill 32 7))
            (zero32 (%snap-fill 32 0))
            (node (%snap-node dir h5 5))
-           (chain (bl::node-chain-state node))
+           (chain (bl:node-chain-state node))
            (snap5 (%snap-write-file (merge-pathnames "b5.dat" dir)
                                     :base-hash h5 :count 0))
            (snap7 (%snap-write-file (merge-pathnames "b7.dat" dir)
@@ -439,7 +439,7 @@ a non-empty mempool — all rejected before the coin stream is touched."
                     :outputs (vector (bl.ser:make-tx-out
                                       :value 1000 :script-pubkey (%snap-cat #(#x6A))))
                     :lock-time 0))
-               (mp (bl::node-mempool node)))
+               (mp (bl:node-mempool node)))
           ;; make-entry-from-tx: raw make-mempool-entry has vsize 0, which
           ;; the shadow txgraph (added in cluster mempool P3) rejects.
           (bl.mp:mempool-add
@@ -447,7 +447,7 @@ a non-empty mempool — all rejected before the coin stream is touched."
            (bl.mp:make-entry-from-tx tx 0 0))
           (is (%snap-err-matches (%snap-load-err node snap5)
                                  -32603 "mempool not empty"))
-          (setf (bl::node-mempool node) (bl.mp:make-mempool)))
+          (setf (bl:node-mempool node) (bl.mp:make-mempool)))
         ;; Tip already at the base height.
         (bl.store:update-chain-tip chain h5 5)
         (is (%snap-err-matches (%snap-load-err node snap5)
@@ -466,8 +466,8 @@ leaves the node's UTXO set and tip untouched."
            (txid-s (%snap-fill 32 #xEE))
            (spk (%snap-cat #(#x51)))
            (node (%snap-node dir h5 5))
-           (chain (bl::node-chain-state node))
-           (utxo (bl::node-utxo-set node))
+           (chain (bl:node-chain-state node))
+           (utxo (bl:node-utxo-set node))
            (good-coin (list txid 0 1 nil 1000 spk))
            (good-hash (%snap-hash (list good-coin)))
            (f (merge-pathnames "c.dat" dir)))
@@ -481,7 +481,7 @@ leaves the node's UTXO set and tip untouched."
                  (let ((err (%snap-load-err node f)))
                    (is (%snap-err-matches err -32603 substring)
                        "expected ~S in: ~A" substring
-                       (and err (bl.rpc::rpc-error-message err))))))
+                       (and err (bl.rpc:rpc-error-message err))))))
           ;; Coin height above the snapshot base.
           (rejects "Bad snapshot data after deserializing 0 coins"
                    :count 1 :groups `((,txid (0 6 nil 1000 ,spk))))
@@ -516,15 +516,15 @@ leaves the node's UTXO set and tip untouched."
         (let ((stale (bl.store:get-utxo utxo txid-s 0)))
           (is (and stale (= 777 (bl.store:utxo-entry-value stale)))))
         (is (= 0 (bl.store:current-height chain)))
-        (is (= 1 (length (bl::node-chainstates node))))
+        (is (= 1 (length (bl:node-chainstates node))))
         (is (null (bl.store:find-assumeutxo-chainstate-dir dir)))
         ;; Control: the same 1-coin file with the right hash loads cleanly
         ;; into a snapshot chainstate that becomes current.
         (%snap-write-file f :base-hash h5 :count 1
                             :groups `((,txid (0 1 nil 1000 ,spk))))
         (is (null (%snap-load-err node f)))
-        (let ((current (bl::node-chain-state node))
-              (current-utxo (bl::node-utxo-set node)))
+        (let ((current (bl:node-chain-state node))
+              (current-utxo (bl:node-utxo-set node)))
           (is (not (eq current chain)))
           (is (= 5 (bl.store:current-height current)))
           (is (= 0 (bl.store:current-height chain)))
@@ -626,22 +626,22 @@ MaybeRebalanceCaches via ActivateSnapshot)."
              (src (%snap-node src-dir h5 5))
              (snap-path (namestring (merge-pathnames "utxo.dat" src-dir))))
         (bl.store:update-chain-tip
-         (bl::node-chain-state src) h5 5)
-        (bl.store:add-utxo (bl::node-utxo-set src)
+         (bl:node-chain-state src) h5 5)
+        (bl.store:add-utxo (bl:node-utxo-set src)
                                        txid 0 1000 spk 1)
         (bl.rpc::rpc-dumptxoutset src (list snap-path "latest"))
         (let* ((hash (bl.store:compute-utxo-set-hash
-                      (bl::node-utxo-set src)))
+                      (bl:node-utxo-set src)))
                (dst (%snap-node dst-dir h5 5))
                (bl:*assumeutxo-data-override*
                  (list (%snap-au 5 h5 hash 7)))
-               (bl.net::*cached-is-ibd* t))
+               (bl.net:*cached-is-ibd* t))
           (let ((r (bl.rpc::rpc-loadtxoutset dst (list snap-path))))
             (is (= 1 (cdr (assoc "coins_loaded" r :test #'string=)))))
-          (is (= 2 (length (bl::node-chainstates dst))))
-          (let ((current (bl::node-current-chainstate dst))
-                (historical (bl::node-historical-chainstate dst))
-                (store (bl::node-block-store dst)))
+          (is (= 2 (length (bl:node-chainstates dst))))
+          (let ((current (bl:node-current-chainstate dst))
+                (historical (bl:node-historical-chainstate dst))
+                (store (bl:node-block-store dst)))
             ;; Per-chainstate prune ranges: the snapshot chainstate may never
             ;; prune at or below its base; the historical prunes from 0.
             (is (= 5 (bl.store:chain-state-prune-floor current)))
@@ -650,7 +650,7 @@ MaybeRebalanceCaches via ActivateSnapshot)."
             ;; chainstate deletes nothing at or below the base.
             (setf (bl.store:block-store-total-bytes store)
                   (* 600 1048576))
-            (let ((bl::*node* dst))
+            (let ((bl:*node* dst))
               (is (= 0 (bl.store:prune-old-blocks
                         store current
                         :target-bytes (bl:effective-prune-target-bytes))))
@@ -669,7 +669,7 @@ MaybeRebalanceCaches via ActivateSnapshot)."
               (is (= (floor (* total 0.05d0))
                      (bl.store:chain-state-coins-cache-bytes historical)))
               (is (= (floor (* total 0.95d0))
-                     (bl::chainstate-coins-cache-budget current))))))))))
+                     (bl:chainstate-coins-cache-budget current))))))))))
 
 (test snapshot-dump-rollback-roundtrip
   "dumptxoutset with a rollback target (Core rpc/blockchain.cpp:3034-3196):
@@ -683,13 +683,13 @@ verification gate on a fresh node."
      (multiple-value-bind (cs utxo store genesis-hash)
          (make-activate-block-fixture "rollback-dump")
        (let* ((bl:*prune-target-mib* nil)
-              (node (bl::make-node :network :testnet3))
+              (node (bl:make-node :network :testnet3))
               (hashes (make-test-chain-hashes #xD1 4))
               (h2 (second hashes))
               (dump-path (namestring (merge-pathnames "rollback.dat" dst-dir))))
          (setf (bl.store:chain-state-coins-view cs) utxo
-               (bl::node-chainstates node) (list cs)
-               (bl::node-block-store node) store)
+               (bl:node-chainstates node) (list cs)
+               (bl:node-block-store node) store)
          (build-and-connect cs store utxo genesis-hash hashes)
          (is (= 4 (bl.store:current-height cs)))
          (let ((tip-hash (bl.store:best-block-hash cs))
@@ -698,21 +698,21 @@ verification gate on a fresh node."
            (setf (gethash "rollback" opts) 2)
            ;; --- Parameter/precondition matrix (before any state change) ---
            ;; A non-rollback type conflicting with the rollback option.
-           (signals bl.rpc::rpc-error
+           (signals bl.rpc:rpc-error
              (bl.rpc::rpc-dumptxoutset
               node (list (namestring (merge-pathnames "x1.dat" dst-dir))
                          "latest" opts)))
            ;; Rollback target above the tip.
            (let ((bad (make-hash-table :test 'equal)))
              (setf (gethash "rollback" bad) 99)
-             (signals bl.rpc::rpc-error
+             (signals bl.rpc:rpc-error
                (bl.rpc::rpc-dumptxoutset
                 node (list (namestring (merge-pathnames "x2.dat" dst-dir))
                            "rollback" bad))))
            ;; Negative rollback target.
            (let ((bad (make-hash-table :test 'equal)))
              (setf (gethash "rollback" bad) -1)
-             (signals bl.rpc::rpc-error
+             (signals bl.rpc:rpc-error
                (bl.rpc::rpc-dumptxoutset
                 node (list (namestring (merge-pathnames "x3.dat" dst-dir))
                            "rollback" bad))))
@@ -725,15 +725,15 @@ verification gate on a fresh node."
                                                 (merge-pathnames "x4.dat" dst-dir))
                                                "rollback" opts))
                                    nil)
-                          (bl.rpc::rpc-error (e) e))))
+                          (bl.rpc:rpc-error (e) e))))
                (is (%snap-err-matches err -1 "already pruned")))
              (setf (bl.store:chain-state-pruned-height cs) 0))
            ;; --- The real rollback dump (positional options form) ---
-           (is (eq t (bl::node-network-active node)))
+           (is (eq t (bl:node-network-active node)))
            (let ((r (bl.rpc::rpc-dumptxoutset
                      node (list dump-path "rollback" opts))))
              (is (= 2 (cdr (assoc "base_height" r :test #'string=))))
-             (is (string= (bl.rpc::hash-to-hex h2)
+             (is (string= (bl.rpc:hash-to-hex h2)
                           (cdr (assoc "base_hash" r :test #'string=))))
              (is (= 2 (cdr (assoc "coins_written" r :test #'string=))))
              ;; Chain fully restored: original tip, nothing left invalid,
@@ -746,23 +746,23 @@ verification gate on a fresh node."
                                      cs (third hashes))))))
              (is (equalp pre-dump-hash
                          (bl.store:compute-utxo-set-hash utxo)))
-             (is (eq t (bl::node-network-active node)))
+             (is (eq t (bl:node-network-active node)))
              ;; --- Verified re-load of the historical dump ---
-             (let* ((dump-hash (bl.rpc::parse-hex-hash
+             (let* ((dump-hash (bl.rpc:parse-hex-hash
                                 (cdr (assoc "txoutset_hash" r :test #'string=))))
                     (dst (%snap-node dst-dir h2 2))
                     (bl:*assumeutxo-data-override*
                       (list (%snap-au 2 h2 dump-hash 3)))
-                    (bl.net::*cached-is-ibd* t))
+                    (bl.net:*cached-is-ibd* t))
                (let ((r2 (bl.rpc::rpc-loadtxoutset dst (list dump-path))))
                  (is (= 2 (cdr (assoc "coins_loaded" r2 :test #'string=))))
                  (is (= 2 (cdr (assoc "base_height" r2 :test #'string=)))))
-               (let ((current (bl::node-current-chainstate dst)))
+               (let ((current (bl:node-current-chainstate dst)))
                  (is (= 2 (bl.store:current-height current)))
                  (is (equalp h2 (bl.store:best-block-hash current)))
                  (is (equalp dump-hash
                              (bl.store:compute-utxo-set-hash
-                              (bl::node-utxo-set dst)))))))
+                              (bl:node-utxo-set dst)))))))
            ;; --- Bare type "rollback": defaults to the highest available
            ;; assumeutxo snapshot height (GetAvailableSnapshotHeights) ---
            (let* ((bl:*assumeutxo-data-override*
@@ -772,10 +772,10 @@ verification gate on a fresh node."
              (is (= 2 (cdr (assoc "base_height" r :test #'string=))))
              (is (= 4 (bl.store:current-height cs))))
            ;; --- An already-disabled network stays disabled afterwards ---
-           (setf (bl::node-network-active node) nil)
+           (setf (bl:node-network-active node) nil)
            (let ((path3 (namestring (merge-pathnames "rollback3.dat" dst-dir))))
              (bl.rpc::rpc-dumptxoutset node (list path3 "" opts))
-             (is (eq nil (bl::node-network-active node)))
+             (is (eq nil (bl:node-network-active node)))
              (is (= 4 (bl.store:current-height cs))))
-           (setf (bl::node-network-active node) t))
+           (setf (bl:node-network-active node) t))
          (clrhash bl.val::*block-undo-data*))))))

@@ -127,7 +127,16 @@
    #:is-op-success-p
    #:scan-for-op-success
    #:run-tapscript
-   #:increment-script-number))
+   #:increment-script-number)
+  ;; Reached from another package with :: before the second-round review
+  ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
+  (:export
+   #:*script-execution-cache-enabled*
+   #:*tapscript-codesep-pos*
+   #:+signature-cache-max-entries+
+   #:make-script-execution-cache-key
+   #:script-execution-cache-store
+   #:script-execution-cached-p))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))
@@ -151,34 +160,34 @@
   "Serialize a CL outpoint struct to a Coalton byte vector."
   (cl-array-to-coalton-vector
    (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-     (bl.ser::write-outpoint s outpoint))))
+     (bl.ser:write-outpoint s outpoint))))
 
 (defun outpoint-from-coalton (vec)
   "Deserialize a Coalton byte vector to a CL outpoint struct."
   (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
-    (bl.ser::read-outpoint s)))
+    (bl.ser:read-outpoint s)))
 
 (defun tx-in-to-coalton (tx-in)
   "Serialize a CL tx-in struct to a Coalton byte vector."
   (cl-array-to-coalton-vector
    (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-     (bl.ser::write-tx-in s tx-in))))
+     (bl.ser:write-tx-in s tx-in))))
 
 (defun tx-in-from-coalton (vec)
   "Deserialize a Coalton byte vector to a CL tx-in struct."
   (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
-    (bl.ser::read-tx-in s)))
+    (bl.ser:read-tx-in s)))
 
 (defun tx-out-to-coalton (tx-out)
   "Serialize a CL tx-out struct to a Coalton byte vector."
   (cl-array-to-coalton-vector
    (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-     (bl.ser::write-tx-out s tx-out))))
+     (bl.ser:write-tx-out s tx-out))))
 
 (defun tx-out-from-coalton (vec)
   "Deserialize a Coalton byte vector to a CL tx-out struct."
   (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
-    (bl.ser::read-tx-out s)))
+    (bl.ser:read-tx-out s)))
 
 (defun transaction-to-coalton (tx)
   "Serialize a CL transaction struct to a Coalton byte vector."
@@ -198,7 +207,7 @@
 (defun block-header-from-coalton (vec)
   "Deserialize a Coalton byte vector to a CL block-header struct."
   (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
-    (bl.ser::read-block-header s)))
+    (bl.ser:read-block-header s)))
 
 ;;; Bitcoin constants
 (defconstant +coin+ 100000000

@@ -42,18 +42,18 @@ PRIVATE_KEY_NOT_AVAILABLE)."
         (address (first params))
         (message (second params)))
     (unless (and (stringp address) (stringp message))
-      (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-parameter+
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "address and message are required"))
     (multiple-value-bind (type script wit-ver keyid)
         (bl.crypto:decode-address address (wallet-network wallet))
       (declare (ignore wit-ver))
       ;; DecodeDestination / IsValidDestination.
       (unless type
-        (error 'bl.rpc::rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
                           :message "Invalid address"))
       ;; std::get_if<PKHash>: only a P2PKH destination refers to a key.
       (unless (eq type :p2pkh)
-        (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-type-error+
+        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                           :message "Address does not refer to key"))
       ;; CWallet::SignMessage: locate the signing key.
       (let ((wif (with-wallet-lock (wallet)
@@ -61,6 +61,6 @@ PRIVATE_KEY_NOT_AVAILABLE)."
                    (%wallet-signmessage-wif wallet script keyid))))
         (unless wif
           ;; SigningResult::PRIVATE_KEY_NOT_AVAILABLE -> RPC_WALLET_ERROR.
-          (error 'bl.rpc::rpc-error :code bl.rpc::+rpc-wallet-error+
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                             :message "Private key not available"))
-        (bl.rpc::rpc-signmessagewithprivkey node (list wif message))))))
+        (bl.rpc:rpc-signmessagewithprivkey node (list wif message))))))
