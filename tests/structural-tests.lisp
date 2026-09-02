@@ -1064,7 +1064,7 @@ in 8 files before src/util/chainparams.lisp."
         "~D chain dispatch form~:P outside the table: ~S -- add a field to ~
 chain-params instead" (length forms) forms)))
 
-(defparameter +test-internal-reference-ceiling+ 4422
+(defparameter +test-internal-reference-ceiling+ 4417
   "How many package-qualified INTERNAL references (a :: token) the test
 tree may contain: 7,136 when the cleanup started. White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not

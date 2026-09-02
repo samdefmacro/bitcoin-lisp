@@ -236,6 +236,7 @@ this same package."
                  ;; validation, so the mempool loads first.
                  (:module "validation"
                   :components ((:file "script")
+                               (:file "solver")
                                (:file "miniscript")
                                (:file "transaction")
                                (:file "packages")

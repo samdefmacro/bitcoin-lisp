@@ -51,6 +51,7 @@ can. src/validation/.")
    #:disassemble-script
    #:classify-script
    #:script-type-to-string
+   #:script-type-name
    ;; Block validation
    #:validate-block-header
    #:validate-block

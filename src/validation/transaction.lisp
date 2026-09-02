@@ -263,28 +263,6 @@ transactions, which a 64-byte internal merkle node can be confused with
 (defconstant +taproot-leaf-tapscript+ #xc0
   "BIP 342 tapscript leaf version (Bitcoin Core TAPROOT_LEAF_TAPSCRIPT).")
 
-(defun output-witness-program-p (script-pubkey)
-  "True if SCRIPT-PUBKEY is a witness program: a version byte (OP_0, or
-OP_1..OP_16) followed by a single push of 2-40 bytes that consumes the rest
-of the script."
-  (let ((len (length script-pubkey)))
-    (and (>= len 4) (<= len 42)
-         (let ((v (aref script-pubkey 0)))
-           (or (= v #x00) (<= #x51 v #x60)))   ; OP_0 or OP_1..OP_16
-         (let ((push (aref script-pubkey 1)))
-           (and (<= 2 push 40) (= len (+ 2 push)))))))
-
-(defun pay-to-anchor-p (script-pubkey)
-  "True for a pay-to-anchor (P2A) output: the witness-v1 program OP_1 <push-2
-0x4e73>, byte-exactly #x51 #x02 #x4e #x73 (Core CScript::IsPayToAnchor,
-script/script.h). Spending a P2A never requires witness data, so it is
-excluded from the witness-stripped classification below."
-  (and (= (length script-pubkey) 4)
-       (= (aref script-pubkey 0) #x51)
-       (= (aref script-pubkey 1) #x02)
-       (= (aref script-pubkey 2) #x4e)
-       (= (aref script-pubkey 3) #x73)))
-
 (defun spends-non-anchor-witness-program-p (tx utxo-set extra-coins)
   "True if any input of TX spends a witness-program output (any version,
 including not-yet-defined ones) other than pay-to-anchor — directly, or via
@@ -433,136 +411,6 @@ walking past pushed data. Bitcoin Core CScript::IsPushOnly."
                  (t (incf i)))))         ; OP_0, OP_1NEGATE, OP_1..OP_16
     t))
 
-(defun %op-return-push-only-p (script)
-  "T if the bytes after the leading OP_RETURN in SCRIPT are push-only (only data
-pushes / OP_0 / OP_1NEGATE / OP_1..OP_16), matching Core CScript::IsPushOnly.
-Any non-push opcode -- or a push that runs past the end -- fails."
-  (let ((len (length script)) (i 1))    ; skip OP_RETURN at index 0
-    (loop while (< i len) do
-      (let ((op (aref script i)))
-        (cond
-          ((<= op #x4b) (incf i (+ 1 op)))                          ; OP_0 / direct push
-          ((= op #x4c) (if (< (1+ i) len)                           ; OP_PUSHDATA1
-                           (incf i (+ 2 (aref script (1+ i))))
-                           (return-from %op-return-push-only-p nil)))
-          ((= op #x4d) (if (< (+ i 2) len)                          ; OP_PUSHDATA2
-                           (incf i (+ 3 (aref script (1+ i)) (ash (aref script (+ i 2)) 8)))
-                           (return-from %op-return-push-only-p nil)))
-          ((= op #x4e) (if (< (+ i 4) len)                          ; OP_PUSHDATA4
-                           (incf i (+ 5 (aref script (1+ i)) (ash (aref script (+ i 2)) 8)
-                                      (ash (aref script (+ i 3)) 16) (ash (aref script (+ i 4)) 24)))
-                           (return-from %op-return-push-only-p nil)))
-          ((<= op #x60) (incf i))                                   ; OP_1NEGATE / OP_1..OP_16
-          (t (return-from %op-return-push-only-p nil)))))           ; non-push opcode
-    (= i len)))                          ; NIL if a push overran the script end
-
-(defun null-data-script-p (script-pubkey)
-  "True for a NULL_DATA (OP_RETURN data-carrier) scriptPubKey: a leading
-OP_RETURN whose remaining bytes are push-only (Core Solver's NULL_DATA
-classification, script/solver.cpp). Size is deliberately NOT considered —
-the -datacarriersize limit is a shared per-transaction budget, checked in
-VALIDATE-TRANSACTION-FOR-MEMPOOL against each such output's whole script
-size (Core IsStandardTx, policy.cpp:136-150)."
-  (and (>= (length script-pubkey) 1)
-       (= (aref script-pubkey 0) #x6a)   ; OP_RETURN
-       (%op-return-push-only-p script-pubkey)))
-
-(defun %match-p2pkh (script)
-  "T for OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG (Core
-MatchPayToPubkeyHash, solver.cpp:50-57)."
-  (and (= (length script) 25)
-       (= (aref script 0) #x76)    ; OP_DUP
-       (= (aref script 1) #xa9)    ; OP_HASH160
-       (= (aref script 2) #x14)    ; push 20 bytes
-       (= (aref script 23) #x88)   ; OP_EQUALVERIFY
-       (= (aref script 24) #xac))) ; OP_CHECKSIG
-
-(defun %match-p2pk (script)
-  "Pubkey length for a bare pay-to-pubkey SCRIPT (<push key> OP_CHECKSIG), or
-NIL. Core MatchPayToPubkey (solver.cpp:36-47) accepts only the two sizes whose
-header byte AGREES with the length, via CPubKey::ValidSize/GetLen: 0x02 or
-0x03 for the 33-byte compressed form, 0x04/0x06/0x07 for the 65-byte
-uncompressed form. A 33-byte push starting 0x04 is NOT a pubkey."
-  (let ((len (length script)))
-    (cond ((and (= len 35)
-                (= (aref script 0) 33)
-                (= (aref script 34) #xac)                  ; OP_CHECKSIG
-                (member (aref script 1) '(#x02 #x03)))
-           33)
-          ((and (= len 67)
-                (= (aref script 0) 65)
-                (= (aref script 66) #xac)                  ; OP_CHECKSIG
-                (member (aref script 1) '(#x04 #x06 #x07)))
-           65))))
-
-(defun %match-multisig (script)
-  "(values m n) when SCRIPT is bare multisig — OP_m <key>.. OP_n
-OP_CHECKMULTISIG with 1<=m<=n<=16 and every key a 33/65-byte push — else NIL.
-
-This is Core MatchMultisig: the SHAPE only. The n<=3 cap is an IsStandard
-rule for OUTPUTS, not part of the classification, and an input SPENDING a
-larger bare multisig is still standard (AreInputsStandard only rejects
-NONSTANDARD/WITNESS_UNKNOWN)."
-  (let ((len (length script)))
-    (when (and (>= len 4)
-               (= (aref script (1- len)) #xae)          ; OP_CHECKMULTISIG
-               (<= #x51 (aref script 0) #x60)           ; OP_m (1..16)
-               (<= #x51 (aref script (- len 2)) #x60))  ; OP_n (1..16)
-      (let ((m (- (aref script 0) #x50))
-            (n (- (aref script (- len 2)) #x50))
-            (pos 1)
-            (keys 0))
-        (when (<= 1 m n 16)
-          ;; Walk the n key pushes between OP_m and OP_n.
-          (loop while (< pos (- len 2))
-                do (let ((plen (aref script pos)))
-                     (unless (or (= plen 33) (= plen 65))
-                       (return-from %match-multisig nil))
-                     (incf pos (1+ plen))
-                     (incf keys)
-                     (when (> keys n)
-                       (return-from %match-multisig nil))))
-          (when (and (= pos (- len 2)) (= keys n))
-            (values m n)))))))
-
-(defun classify-output-script (script-pubkey)
-  "Classify SCRIPT-PUBKEY the way Bitcoin Core's Solver does (solver.cpp:141),
-returning a TxoutType keyword: :scripthash, :witness-v0-keyhash,
-:witness-v0-scripthash, :witness-v1-taproot, :anchor, :witness-unknown,
-:null-data, :pubkey, :pubkeyhash, :multisig, or :nonstandard.
-
-The ORDER is Solver's and matters. P2SH is matched first (it is the most
-constrained form). Witness programs come next, and note the asymmetry that
-makes this classifier necessary: an IRREGULAR version-0 program is
-:nonstandard, while v1..v16 are :witness-unknown — standard as an OUTPUT (the
-forward-compat mechanism that let segwit and taproot outputs relay before
-activation) but NOT standard to SPEND. Only after that do the bare key forms
-match, so an OP_RETURN or witness program can never be read as a key script."
-  (if (script-is-p2sh-p script-pubkey)
-      :scripthash
-      (multiple-value-bind (version program) (witness-program-parts script-pubkey)
-        (cond
-          (version
-           (cond ((and (= version 0) (= (length program) 20)) :witness-v0-keyhash)
-                 ((and (= version 0) (= (length program) 32)) :witness-v0-scripthash)
-                 ((and (= version 1) (= (length program) 32)) :witness-v1-taproot)
-                 ((pay-to-anchor-p script-pubkey) :anchor)
-                 ((/= version 0) :witness-unknown)
-                 ;; Irregular v0 program: reserved, never relayed.
-                 (t :nonstandard)))
-          ;; OP_RETURN data carrier. Core's Solver classifies NULL_DATA whenever
-          ;; the bytes after OP_RETURN are push-only (solver.cpp:185) — with no
-          ;; size cap and no -datacarrier gate here: those live in the SHARED
-          ;; per-transaction byte budget that IsStandardTx tracks across all
-          ;; NULL_DATA outputs (policy.cpp:136-150), enforced in
-          ;; validate-transaction-for-mempool's output loop. An OP_RETURN
-          ;; carrying any non-push opcode is NONSTANDARD.
-          ((null-data-script-p script-pubkey) :null-data)
-          ((%match-p2pk script-pubkey) :pubkey)
-          ((%match-p2pkh script-pubkey) :pubkeyhash)
-          ((%match-multisig script-pubkey) :multisig)
-          (t :nonstandard)))))
-
 (defun standard-output-script-p (script-pubkey)
   "Whether SCRIPT-PUBKEY is a standard OUTPUT script type (Core IsStandard,
 policy.cpp:79-97): everything Solver classifies except NONSTANDARD, plus
@@ -573,7 +421,7 @@ NOT here: Core applies that separately, in IsStandardTx's output loop
 (policy.cpp:151-153), and reports it as its own \"bare-multisig\" reason rather
 than \"scriptpubkey\". Folding the two together here reported one reason for
 both, which mempool_accept.py:311 reads as a divergence."
-  (case (classify-output-script script-pubkey)
+  (case (classify-script script-pubkey)
     (:nonstandard nil)
     (:multisig (bare-multisig-standard-p script-pubkey))
     (t t)))
@@ -586,14 +434,6 @@ multisig remain standard — see %match-multisig."
   (multiple-value-bind (m n) (%match-multisig script)
     (declare (ignore m))
     (and n (<= n 3) t)))
-
-(defun witness-program-parts (script)
-  "If SCRIPT is a witness program, return (VALUES version program-bytes);
-otherwise NIL. Version is 0 for OP_0, 1..16 for OP_1..OP_16."
-  (when (output-witness-program-p script)
-    (let ((v (aref script 0)))
-      (values (if (= v #x00) 0 (- v #x50))   ; OP_1 (#x51) -> version 1
-              (subseq script 2)))))
 
 (defun p2wsh-witness-standard-p (wstack)
   "P2WSH limits: witnessScript (the last stack item) <=
@@ -758,7 +598,7 @@ reuse standard-output-script-p — and a P2SH redeem script may carry at most
                          (bl.ser:outpoint-hash prevout)
                          (bl.ser:outpoint-index prevout))))
       (when spk
-        (case (classify-output-script spk)
+        (case (classify-script spk)
           ((:nonstandard :witness-unknown)
            (return-from are-inputs-standard-p nil)))
         (when (script-is-p2sh-p spk)
@@ -849,7 +689,7 @@ transaction is refused even on a node told to relay non-standard ones."
              (return-from %is-standard-tx
                (values nil :datacarrier)))
            (decf datacarrier-bytes-left (length spk)))
-          ((and (eq (classify-output-script spk) :multisig)
+          ((and (eq (classify-script spk) :multisig)
                 (not bl:*permit-bare-multisig*))
            (return-from %is-standard-tx
              (values nil :bare-multisig)))))))

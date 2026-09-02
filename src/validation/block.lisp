@@ -1391,13 +1391,6 @@ correctly, which is what marks this as an oversight rather than a decision."
 
 ;;;; Sigops cost calculation
 
-(defun script-is-p2sh-p (script)
-  "Check if SCRIPT is a P2SH scriptPubKey: OP_HASH160 <20 bytes> OP_EQUAL."
-  (and (= (length script) 23)
-       (= (aref script 0) +op-hash160+)
-       (= (aref script 1) 20)       ; Push 20 bytes
-       (= (aref script 22) +op-equal+)))
-
 (defun extract-last-push (script)
   "Extract the data from the last push operation in SCRIPT.
 Used to get the redeemScript from a P2SH scriptSig.

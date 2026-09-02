@@ -166,7 +166,7 @@ PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
 (defun %psbt-spk-obj (spk network)
   (let ((o `(("asm" . ,(bl.val:disassemble-script spk))
              ("hex" . ,(bl.crypto:bytes-to-hex spk))
-             ("type" . ,(bl.rpc:script-type spk))))
+             ("type" . ,(bl.val:script-type-name spk))))
         (addr (and network (bl.rpc:script->address spk network))))
     (if addr (append o `(("address" . ,addr))) o)))
 
@@ -608,7 +608,7 @@ we do not shuffle indices)."
 ;;; --- utxoupdatepsbt ---
 
 (defun %psbt-witness-spk-p (spk)
-  (member (bl.rpc:script-type spk)
+  (member (bl.val:script-type-name spk)
           '("witness_v0_keyhash" "witness_v0_scripthash" "witness_v1_taproot")
           :test #'string=))
 

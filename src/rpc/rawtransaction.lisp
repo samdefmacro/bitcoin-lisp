@@ -249,26 +249,11 @@ with |ANYONECANPAY setting 0x80."
 
 (defun parse-multisig (script)
   "If SCRIPT is a bare multisig (OP_m <pubkey>...<pubkey> OP_n OP_CHECKMULTISIG),
-return (values m n pubkeys) — pubkeys a list of the n 33/65-byte key vectors in
-order; else NIL."
-  (let ((len (length script)))
-    (when (and (>= len 3) (= (aref script (1- len)) #xae))   ; OP_CHECKMULTISIG
-      (let ((m-op (aref script 0))
-            (n-op (aref script (- len 2))))
-        (when (and (<= #x51 m-op #x60) (<= #x51 n-op #x60))  ; OP_1..OP_16
-          (let ((m (- m-op #x50)) (n (- n-op #x50))
-                (pubkeys '()) (i 1))
-            (loop repeat n
-                  while (< i (- len 2))
-                  do (let ((plen (aref script i)))
-                       (unless (or (= plen 33) (= plen 65))
-                         (return-from parse-multisig nil))
-                       (when (> (+ i 1 plen) (- len 2))
-                         (return-from parse-multisig nil))
-                       (push (subseq script (1+ i) (+ i 1 plen)) pubkeys)
-                       (incf i (+ 1 plen))))
-            (when (and (= i (- len 2)) (= (length pubkeys) n))
-              (values m n (nreverse pubkeys)))))))))
+return (values m n pubkeys) -- pubkeys a list of the n key vectors in order;
+else NIL. The classification is CLASSIFY-SCRIPT's (Core MatchMultisig)."
+  (multiple-value-bind (type data) (bl.val:classify-script script)
+    (when (eq type :multisig)
+      (values (getf data :m) (getf data :n) (getf data :pubkeys)))))
 
 (defun %collect-multisig-sig-pairs (sighash pubmap pubkeys m sighash-byte)
   "ECDSA (pubkey . DER||sighash-byte) pairs for the keys we hold among PUBKEYS,
@@ -397,7 +382,7 @@ historical DEFAULT-only taproot signing). *current-tx* / *current-spent-utxos*
 must be bound by the caller."
   (let* ((spk (first prev)) (amount (second prev))
          (redeem (third prev)) (witness-script (fourth prev))
-         (type (script-type spk))
+         (type (bl.val:script-type-name spk))
          (bl.interop:*current-input-index* i)
          (bl.interop:*precomputed-sighash* precomp))
     (macrolet ((fail (msg)

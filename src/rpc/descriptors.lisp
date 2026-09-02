@@ -2039,35 +2039,16 @@ mapping each expanded script (byte vector) to its canonical descriptor
 
 (defun script->address (script network)
   "Address string for a standard scriptPubKey SCRIPT, or NIL if the script
-has no address representation (raw/pk/bare-multisig). Inverse of the
-encoders in crypto/address.lisp."
-  (let ((len (length script)))
-    (flet ((b (i) (aref script i)))
-      (cond
-        ;; P2PKH: OP_DUP OP_HASH160 14 <20> OP_EQUALVERIFY OP_CHECKSIG
-        ((and (= len 25) (= (b 0) #x76) (= (b 1) #xa9) (= (b 2) #x14)
-              (= (b 23) #x88) (= (b 24) #xac))
-         (bl.crypto:encode-p2pkh-address (subseq script 3 23) network))
-        ;; P2SH: OP_HASH160 14 <20> OP_EQUAL
-        ((and (= len 23) (= (b 0) #xa9) (= (b 1) #x14) (= (b 22) #x87))
-         (bl.crypto:encode-p2sh-address (subseq script 2 22) network))
-        ;; P2WPKH: OP_0 14 <20>
-        ((and (= len 22) (= (b 0) #x00) (= (b 1) #x14))
-         (bl.crypto:encode-p2wpkh-address (subseq script 2 22) network))
-        ;; P2WSH: OP_0 20 <32>
-        ((and (= len 34) (= (b 0) #x00) (= (b 1) #x20))
-         (bl.crypto:encode-p2wsh-address (subseq script 2 34) network))
-        ;; P2TR: OP_1 20 <32>
-        ((and (= len 34) (= (b 0) #x51) (= (b 1) #x20))
-         (bl.crypto:encode-p2tr-address (subseq script 2 34) network))
-        (t nil)))))
-
-(defun %script-p2pk-p (script)
-  "True for a pay-to-pubkey script: <33/65-byte push> OP_CHECKSIG."
-  (let ((len (length script)))
-    (and (member len '(35 67))
-         (= (aref script 0) (- len 2))
-         (= (aref script (1- len)) #xac))))
+has no address representation (raw/pk/bare-multisig/anchor). Inverse of the
+encoders in crypto/address.lisp, keyed on CLASSIFY-SCRIPT."
+  (multiple-value-bind (type data) (bl.val:classify-script script)
+    (case type
+      (:pubkeyhash (bl.crypto:encode-p2pkh-address (getf data :hash) network))
+      (:scripthash (bl.crypto:encode-p2sh-address (getf data :hash) network))
+      (:witness-v0-keyhash (bl.crypto:encode-p2wpkh-address (getf data :witness-program) network))
+      (:witness-v0-scripthash (bl.crypto:encode-p2wsh-address (getf data :witness-program) network))
+      (:witness-v1-taproot (bl.crypto:encode-p2tr-address (getf data :witness-program) network))
+      (t nil))))
 
 (defun scriptpubkey-desc (script network)
   "Core InferDescriptor for a bare scriptPubKey (no key material available): an
@@ -2155,7 +2136,7 @@ RANGE, as a list."
                        (cond (addr (push addr addresses))
                              ;; combo() emits P2PK; Core skips it rather than
                              ;; failing when other scripts have addresses.
-                             ((and (> (length scripts) 1) (%script-p2pk-p script)))
+                             ((and (> (length scripts) 1) (eq (bl.val:classify-script script) :pubkey)))
                              (t (error 'rpc-error
                                        :code +rpc-invalid-address-or-key+
                                        :message "Descriptor does not have a corresponding address")))))))
