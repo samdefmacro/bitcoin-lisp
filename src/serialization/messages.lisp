@@ -341,43 +341,40 @@ divergence from Core's empty CService.)"
   "Create a serialized verack message (empty payload)."
   (serialize-message "verack" #()))
 
+(defun %nonce-payload (nonce)
+  "The 8-byte payload ping and pong share (BIP 31)."
+  (with-byte-buf (stream) (bb-write-u64-le stream nonce)))
+
 (defun make-ping-message (&optional (nonce (random (expt 2 64))))
   "Create a serialized ping message."
-  (let ((payload (with-byte-buf (stream)
-                   (bb-write-u64-le stream nonce))))
-    (serialize-message "ping" payload)))
+  (serialize-message "ping" (%nonce-payload nonce)))
 
 (defun make-pong-message (nonce)
   "Create a serialized pong message."
-  (let ((payload (with-byte-buf (stream)
-                   (bb-write-u64-le stream nonce))))
-    (serialize-message "pong" payload)))
+  (serialize-message "pong" (%nonce-payload nonce)))
+
+(defun %locator-payload (block-locator-hashes stop-hash)
+  "The payload getblocks and getheaders share: protocol version, the block
+locator (most recent hash first), and the hash to stop at -- all zeros for
+\"as many as you have\"."
+  (with-byte-buf (stream)
+    (bb-write-u32-le stream +protocol-version+)
+    (bb-write-varint stream (length block-locator-hashes))
+    (dolist (hash block-locator-hashes)
+      (bb-write-hash256 stream hash))
+    (bb-write-hash256 stream (or stop-hash
+                                 (make-array 32 :element-type '(unsigned-byte 8)
+                                                :initial-element 0)))))
 
 (defun make-getblocks-message (block-locator-hashes &optional stop-hash)
   "Create a getblocks message.
 BLOCK-LOCATOR-HASHES is a list of block hashes (most recent first).
 STOP-HASH is the hash to stop at (or zeros to get maximum blocks)."
-  (let ((payload (with-byte-buf (stream)
-                   (bb-write-u32-le stream +protocol-version+)
-                   (bb-write-varint stream (length block-locator-hashes))
-                   (dolist (hash block-locator-hashes)
-                     (bb-write-hash256 stream hash))
-                   (bb-write-hash256 stream (or stop-hash
-                                             (make-array 32 :element-type '(unsigned-byte 8)
-                                                         :initial-element 0))))))
-    (serialize-message "getblocks" payload)))
+  (serialize-message "getblocks" (%locator-payload block-locator-hashes stop-hash)))
 
 (defun make-getheaders-message (block-locator-hashes &optional stop-hash)
-  "Create a getheaders message."
-  (let ((payload (with-byte-buf (stream)
-                   (bb-write-u32-le stream +protocol-version+)
-                   (bb-write-varint stream (length block-locator-hashes))
-                   (dolist (hash block-locator-hashes)
-                     (bb-write-hash256 stream hash))
-                   (bb-write-hash256 stream (or stop-hash
-                                             (make-array 32 :element-type '(unsigned-byte 8)
-                                                         :initial-element 0))))))
-    (serialize-message "getheaders" payload)))
+  "Create a getheaders message (same payload shape as getblocks)."
+  (serialize-message "getheaders" (%locator-payload block-locator-hashes stop-hash)))
 
 (defun make-headers-message (headers)
   "Create a headers message from a list of block headers.
@@ -391,30 +388,25 @@ serializes header-only CBlocks, which append nTx=0)."
                      (bb-write-varint stream 0)))))
     (serialize-message "headers" payload)))
 
+(defun %inv-list-payload (inv-vectors)
+  "The payload inv, getdata and notfound share: a count and the inv vectors."
+  (with-byte-buf (stream)
+    (bb-write-varint stream (length inv-vectors))
+    (dolist (inv inv-vectors)
+      (write-inv-vector stream inv))))
+
 (defun make-getdata-message (inv-vectors)
   "Create a getdata message from a list of inv-vectors."
-  (let ((payload (with-byte-buf (stream)
-                   (bb-write-varint stream (length inv-vectors))
-                   (dolist (inv inv-vectors)
-                     (write-inv-vector stream inv)))))
-    (serialize-message "getdata" payload)))
+  (serialize-message "getdata" (%inv-list-payload inv-vectors)))
 
 (defun make-inv-message (inv-vectors)
   "Create an inv message from a list of inv-vectors."
-  (let ((payload (with-byte-buf (stream)
-                   (bb-write-varint stream (length inv-vectors))
-                   (dolist (inv inv-vectors)
-                     (write-inv-vector stream inv)))))
-    (serialize-message "inv" payload)))
+  (serialize-message "inv" (%inv-list-payload inv-vectors)))
 
 (defun make-notfound-message (inv-vectors)
   "Create a notfound message (same payload shape as inv): tells a peer we cannot
 serve the objects it requested via getdata."
-  (let ((payload (with-byte-buf (stream)
-                   (bb-write-varint stream (length inv-vectors))
-                   (dolist (inv inv-vectors)
-                     (write-inv-vector stream inv)))))
-    (serialize-message "notfound" payload)))
+  (serialize-message "notfound" (%inv-list-payload inv-vectors)))
 
 ;;;; Transaction message
 
