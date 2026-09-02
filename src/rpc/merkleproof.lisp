@@ -158,115 +158,112 @@ vBits serialization)."
 
 ;;; --- RPCs ---
 
-(define-rpc "gettxoutproof" (node params)
+(define-rpc "gettxoutproof" (node ((txids :array) blockhash-hex))
   "Build a merkle proof that the given TXIDs are in a block (Bitcoin Core
 gettxoutproof). PARAMS: (txids [blockhash]). On this pruned node the block
 must be locatable: pass BLOCKHASH, or have txindex enabled. Returns the
 hex-encoded CMerkleBlock."
-  (let ((txids (positional-array (first params)))
-        (blockhash-hex (second params)))
-    (unless (and (listp txids) txids)
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "txids must be a non-empty array"))
-    (let ((wanted (mapcar (lambda (h)
-                            (unless (valid-hex-hash-p h)
-                              (error 'rpc-error :code +rpc-invalid-parameter+
-                                                :message (format nil "Invalid txid ~A" h)))
-                            (parse-hex-hash h))
-                          txids))
-          (chain-state (rpc-get-chain-state node))
-          (block-store (rpc-get-block-store node)))
-      ;; Locate the block: explicit hash, else txindex on the first txid.
-      (let* ((block-hash
-               (cond
-                 (blockhash-hex
-                  (unless (valid-hex-hash-p blockhash-hex)
-                    (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid blockhash"))
-                  (parse-hex-hash blockhash-hex))
-                 ((let ((ti (rpc-get-tx-index node)))
-                    (and ti (bl.store:tx-index-enabled ti)))
-                  (let ((loc (bl.store:txindex-lookup
-                              (rpc-get-tx-index node) (first wanted))))
-                    (unless loc
-                      (error 'rpc-error :code +rpc-invalid-address-or-key+
-                                        :message "Transaction not in txindex; pass a blockhash"))
-                    (bl.store:tx-location-block-hash loc)))
-                 (t (error 'rpc-error :code +rpc-invalid-parameter+
-                                      :message "Need a blockhash (no txindex on this node)"))))
-             (block (bl.store:get-block block-store block-hash)))
-        (unless block
-          (error 'rpc-error :code +rpc-invalid-address-or-key+
-                            :message "Block not found (pruned?)"))
-        (let* ((txs (bl.ser:bitcoin-block-transactions block))
-               (txids-vec (map 'vector #'bl.ser:transaction-hash txs))
-               (match (make-array (length txids-vec) :initial-element nil)))
-          ;; Flag the requested txids; every one must be in the block.
-          (dolist (w wanted)
-            (let ((idx (position w txids-vec :test #'equalp)))
-              (unless idx
-                (error 'rpc-error :code +rpc-invalid-address-or-key+
-                                  :message "Not all txids found in the specified block"))
-              (setf (aref match idx) t)))
-          (multiple-value-bind (bits hashes) (build-partial-merkle-tree txids-vec match)
-            (let ((header-bytes (bl.ser:serialize-block-header
-                                 (bl.ser:bitcoin-block-header block))))
-              (bl.crypto:bytes-to-hex
-               (serialize-merkle-block header-bytes (length txids-vec) hashes bits)))))))))
+  (unless (and (listp txids) txids)
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "txids must be a non-empty array"))
+  (let ((wanted (mapcar (lambda (h)
+                          (unless (valid-hex-hash-p h)
+                            (error 'rpc-error :code +rpc-invalid-parameter+
+                                              :message (format nil "Invalid txid ~A" h)))
+                          (parse-hex-hash h))
+                        txids))
+        (chain-state (rpc-get-chain-state node))
+        (block-store (rpc-get-block-store node)))
+    ;; Locate the block: explicit hash, else txindex on the first txid.
+    (let* ((block-hash
+             (cond
+               (blockhash-hex
+                (unless (valid-hex-hash-p blockhash-hex)
+                  (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid blockhash"))
+                (parse-hex-hash blockhash-hex))
+               ((let ((ti (rpc-get-tx-index node)))
+                  (and ti (bl.store:tx-index-enabled ti)))
+                (let ((loc (bl.store:txindex-lookup
+                            (rpc-get-tx-index node) (first wanted))))
+                  (unless loc
+                    (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                      :message "Transaction not in txindex; pass a blockhash"))
+                  (bl.store:tx-location-block-hash loc)))
+               (t (error 'rpc-error :code +rpc-invalid-parameter+
+                                    :message "Need a blockhash (no txindex on this node)"))))
+           (block (bl.store:get-block block-store block-hash)))
+      (unless block
+        (error 'rpc-error :code +rpc-invalid-address-or-key+
+                          :message "Block not found (pruned?)"))
+      (let* ((txs (bl.ser:bitcoin-block-transactions block))
+             (txids-vec (map 'vector #'bl.ser:transaction-hash txs))
+             (match (make-array (length txids-vec) :initial-element nil)))
+        ;; Flag the requested txids; every one must be in the block.
+        (dolist (w wanted)
+          (let ((idx (position w txids-vec :test #'equalp)))
+            (unless idx
+              (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                :message "Not all txids found in the specified block"))
+            (setf (aref match idx) t)))
+        (multiple-value-bind (bits hashes) (build-partial-merkle-tree txids-vec match)
+          (let ((header-bytes (bl.ser:serialize-block-header
+                               (bl.ser:bitcoin-block-header block))))
+            (bl.crypto:bytes-to-hex
+             (serialize-merkle-block header-bytes (length txids-vec) hashes bits))))))))
 
-(define-rpc "verifytxoutproof" (node params)
+(define-rpc "verifytxoutproof" (node (proof-hex))
   "Verify a merkle proof from gettxoutproof and return the txids it proves,
 provided the proof's block is on the active chain (Bitcoin Core
 verifytxoutproof). PARAMS: (proof-hex). Returns the list of txid hex
 strings, or an empty list if the block isn't in the active chain."
-  (let ((proof-hex (first params)))
-    (unless (stringp proof-hex)
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "proof must be a hex string"))
-    (let ((bytes (handler-case (bl.crypto:hex-to-bytes proof-hex)
-                   (error () (error 'rpc-error :code +rpc-invalid-parameter+
-                                              :message "Invalid proof hex")))))
-      (multiple-value-bind (header-bytes ntx hashes bits) (parse-merkle-block bytes)
-        (multiple-value-bind (root matched) (extract-partial-merkle-tree ntx bits hashes)
-          (unless root
-            (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid merkle proof"))
-          ;; The recomputed root must equal the header's, and the block must
-          ;; be a known active-chain block (Core checks it's in mapBlockIndex
-          ;; and on the active chain).
-          (let* ((header-root (subseq header-bytes 36 68))
-                 (chain-state (rpc-get-chain-state node))
-                 (block-hash (bl.crypto:hash256 header-bytes))
-                 (entry (bl.store:get-block-index-entry chain-state block-hash)))
-            (unless (equalp root header-root)
-              (error 'rpc-error :code +rpc-invalid-parameter+
-                                :message "Merkle root mismatch — proof does not match its header"))
-            ;; Core throws here rather than returning an empty result
-            ;; (rpc/txoutproof.cpp:160-163):
-            ;;
-            ;;   if (!pindex || !ActiveChain().Contains(pindex) || pindex->nTx == 0)
-            ;;       throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found in chain");
-            ;;
-            ;; The comment previously here asserted "Core returns []", which is
-            ;; simply not what Core does. A caller asking whether a txid is
-            ;; committed to by a block cannot distinguish "no" from "I have no
-            ;; idea what block that is" when both render as [].
-            (unless (and entry
-                         (bl.store:entry-on-active-chain-p chain-state entry)
-                         (plusp (bl.store:block-index-entry-tx-count entry)))
-              (error 'rpc-error :code +rpc-invalid-address-or-key+
-                                :message "Block not found in chain"))
-            ;; THE proof check (rpc/txoutproof.cpp:165-170, "Check if proof is
-            ;; valid, only add results if so"): the count the proof CLAIMS must
-            ;; equal the count the block actually has.
-            ;;
-            ;; Without this the RPC could be made to prove anything about a
-            ;; real block. CPartialMerkleTree's shape is a pure function of the
-            ;; claimed nTransactions, so understating it reinterprets INTERNAL
-            ;; nodes of the real tree as leaves: for a 4-tx block with root
-            ;; H(H(t0,t1), H(t2,t3)), a proof claiming 2 transactions with
-            ;; hashes [H(t0||t1), H(t2||t3)] recomputes the header's real root
-            ;; exactly, passes every structural bound we have, and made us
-            ;; return an internal node as a "proven txid". Anyone running
-            ;; deposit, bridge or attestation logic through this RPC got a
-            ;; forged yes for the cost of one call -- no chain access, no
-            ;; hashpower.
-            (if (= ntx (bl.store:block-index-entry-tx-count entry))
-                (json-array (mapcar #'hash-to-hex matched))
-                (json-array nil))))))))
+  (unless (stringp proof-hex)
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "proof must be a hex string"))
+  (let ((bytes (handler-case (bl.crypto:hex-to-bytes proof-hex)
+                 (error () (error 'rpc-error :code +rpc-invalid-parameter+
+                                            :message "Invalid proof hex")))))
+    (multiple-value-bind (header-bytes ntx hashes bits) (parse-merkle-block bytes)
+      (multiple-value-bind (root matched) (extract-partial-merkle-tree ntx bits hashes)
+        (unless root
+          (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid merkle proof"))
+        ;; The recomputed root must equal the header's, and the block must
+        ;; be a known active-chain block (Core checks it's in mapBlockIndex
+        ;; and on the active chain).
+        (let* ((header-root (subseq header-bytes 36 68))
+               (chain-state (rpc-get-chain-state node))
+               (block-hash (bl.crypto:hash256 header-bytes))
+               (entry (bl.store:get-block-index-entry chain-state block-hash)))
+          (unless (equalp root header-root)
+            (error 'rpc-error :code +rpc-invalid-parameter+
+                              :message "Merkle root mismatch — proof does not match its header"))
+          ;; Core throws here rather than returning an empty result
+          ;; (rpc/txoutproof.cpp:160-163):
+          ;;
+          ;;   if (!pindex || !ActiveChain().Contains(pindex) || pindex->nTx == 0)
+          ;;       throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found in chain");
+          ;;
+          ;; The comment previously here asserted "Core returns []", which is
+          ;; simply not what Core does. A caller asking whether a txid is
+          ;; committed to by a block cannot distinguish "no" from "I have no
+          ;; idea what block that is" when both render as [].
+          (unless (and entry
+                       (bl.store:entry-on-active-chain-p chain-state entry)
+                       (plusp (bl.store:block-index-entry-tx-count entry)))
+            (error 'rpc-error :code +rpc-invalid-address-or-key+
+                              :message "Block not found in chain"))
+          ;; THE proof check (rpc/txoutproof.cpp:165-170, "Check if proof is
+          ;; valid, only add results if so"): the count the proof CLAIMS must
+          ;; equal the count the block actually has.
+          ;;
+          ;; Without this the RPC could be made to prove anything about a
+          ;; real block. CPartialMerkleTree's shape is a pure function of the
+          ;; claimed nTransactions, so understating it reinterprets INTERNAL
+          ;; nodes of the real tree as leaves: for a 4-tx block with root
+          ;; H(H(t0,t1), H(t2,t3)), a proof claiming 2 transactions with
+          ;; hashes [H(t0||t1), H(t2||t3)] recomputes the header's real root
+          ;; exactly, passes every structural bound we have, and made us
+          ;; return an internal node as a "proven txid". Anyone running
+          ;; deposit, bridge or attestation logic through this RPC got a
+          ;; forged yes for the cost of one call -- no chain access, no
+          ;; hashpower.
+          (if (= ntx (bl.store:block-index-entry-tx-count entry))
+              (json-array (mapcar #'hash-to-hex matched))
+              (json-array nil)))))))

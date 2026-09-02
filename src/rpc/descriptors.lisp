@@ -2058,13 +2058,12 @@ outputs (gettxout, decoderawtransaction, getblock verbosity 2, decodescript)."
 
 ;;; --- Descriptor RPCs (getdescriptorinfo / deriveaddresses) ---
 
-(define-rpc "getdescriptorinfo" (node params)
+(define-rpc "getdescriptorinfo" (node (desc-str))
   "Analyse a descriptor (Bitcoin Core getdescriptorinfo). PARAMS: (descriptor).
 Reports the canonical public form (private keys stripped to public) with its
 checksum, the checksum of the input as given, and the
 isrange/issolvable/hasprivatekeys flags."
-  (let ((desc-str (first params))
-        (network (rpc-get-network node)))
+  (let ((network (rpc-get-network node)))
     (unless (stringp desc-str)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))
     (multiple-value-bind (desc input-checksum) (parse-descriptor desc-str network)
@@ -2074,14 +2073,12 @@ isrange/issolvable/hasprivatekeys flags."
         ("issolvable" . ,(json-bool (out-desc-solvable-p desc)))
         ("hasprivatekeys" . ,(json-bool (out-desc-has-privkeys-p desc)))))))
 
-(define-rpc "deriveaddresses" (node params)
+(define-rpc "deriveaddresses" (node (desc-str range))
   "Derive the address(es) for a descriptor (Bitcoin Core deriveaddresses).
 PARAMS: (descriptor [range]). The descriptor must carry a checksum. RANGE is
 required for ranged descriptors (an end N meaning [0,N], or [begin,end]) and
 rejected for unranged ones; combo() P2PK scripts are skipped like Core."
-  (let* ((desc-str (first params))
-         (range (second params))
-         (range-given (and (> (length params) 1) (and range t)))
+  (let* ((range-given (and (> (length params) 1) range t))
          (network (rpc-get-network node)))
     (unless (stringp desc-str)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))

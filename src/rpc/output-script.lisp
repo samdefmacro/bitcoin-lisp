@@ -41,17 +41,14 @@ rpc-error otherwise."
                         :message (format nil "Invalid public key: ~A" hex)))
     bytes))
 
-(define-rpc "createmultisig" (node params)
+(define-rpc "createmultisig" (node (nrequired (keys :array) (address-type :or "legacy")))
   "Create an m-of-n multisig address (Bitcoin Core createmultisig). PARAMS:
 (nrequired [\"pubkeyhex\",...] [address_type]). address_type is \"legacy\" (P2SH,
 default), \"p2sh-segwit\" (P2SH-P2WSH), or \"bech32\" (P2WSH). Returns
 {address, redeemScript, descriptor [, warnings]}. The redeemScript is always the
 bare multisig script regardless of address type. Uncompressed keys force legacy
 (with a warning if another type was requested), matching Core."
-  (let ((nrequired (first params))
-        (keys (positional-array (second params)))
-        (address-type (or (third params) "legacy"))
-        (network (rpc-get-network node)))
+  (let ((network (rpc-get-network node)))
     (unless (integerp nrequired)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "nrequired must be an integer"))
     (unless (listp keys)
@@ -125,12 +122,11 @@ string; none of address/scriptPubKey/isscript/iswitness appear."
     ("error_locations" . #())
     ("error" . "Invalid or unsupported Segwit (Bech32) or Base58 encoding.")))
 
-(define-rpc "validateaddress" (node params)
+(define-rpc "validateaddress" (node (address))
   "Validate a Bitcoin address and return metadata (Core validateaddress).
 Booleans are real JSON booleans; the invalid shape carries error/
 error_locations like Core's."
-  (let ((address (first params))
-        (network (rpc-get-network node)))
+  (let ((network (rpc-get-network node)))
     (unless (and (stringp address) (> (length address) 0))
       (return-from rpc-validateaddress (%validateaddress-invalid)))
     (multiple-value-bind (type script-pubkey wit-ver wit-prog)

@@ -498,72 +498,69 @@ capacity check runs synchronously, because that is the answer the caller needs."
       `(("address" . ,address)
         ("connection_type" . ,trimmed)))))
 
-(define-rpc "addnode" (node params)
+(define-rpc "addnode" (node (spec command))
   "Manage manually-added peers (Bitcoin Core addnode). PARAMS:
 (node command [v2transport]). COMMAND is \"add\" (remember the peer and keep it
 connected), \"remove\", or \"onetry\" (dial once now). The actual dialing is
 handed to the sync thread (via added-nodes / pending-onetry) so node-peers stays
 single-writer. Returns null. v2transport is accepted and ignored — BIP324 v2
 transport is not implemented."
-  (let ((spec (first params))
-        (command (second params)))
-    (unless (and (stringp spec) (plusp (length spec)))
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "node must be a string"))
-    (unless (member command '("add" "remove" "onetry") :test #'equal)
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "command must be \"add\", \"remove\", or \"onetry\""))
-    (bt:with-recursive-lock-held ((bl:node-lock node))
-      (cond
-        ((equal command "onetry")
-         (push spec (bl:node-pending-onetry node)))
-        ((equal command "add")
-         (when (member spec (bl:node-added-nodes node) :test #'string=)
-           (error 'rpc-error :code +rpc-client-node-already-added+
-                             :message "Error: Node already added"))
-         (setf (bl:node-added-nodes node)
-               (append (bl:node-added-nodes node) (list spec))))
-        ((equal command "remove")
-         (unless (member spec (bl:node-added-nodes node) :test #'string=)
-           (error 'rpc-error :code +rpc-client-node-not-added+
-                             :message "Error: Node could not be removed. It has not been added previously."))
-         (setf (bl:node-added-nodes node)
-               (remove spec (bl:node-added-nodes node) :test #'string=)))))
-    nil))
+  (unless (and (stringp spec) (plusp (length spec)))
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "node must be a string"))
+  (unless (member command '("add" "remove" "onetry") :test #'equal)
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "command must be \"add\", \"remove\", or \"onetry\""))
+  (bt:with-recursive-lock-held ((bl:node-lock node))
+    (cond
+      ((equal command "onetry")
+       (push spec (bl:node-pending-onetry node)))
+      ((equal command "add")
+       (when (member spec (bl:node-added-nodes node) :test #'string=)
+         (error 'rpc-error :code +rpc-client-node-already-added+
+                           :message "Error: Node already added"))
+       (setf (bl:node-added-nodes node)
+             (append (bl:node-added-nodes node) (list spec))))
+      ((equal command "remove")
+       (unless (member spec (bl:node-added-nodes node) :test #'string=)
+         (error 'rpc-error :code +rpc-client-node-not-added+
+                           :message "Error: Node could not be removed. It has not been added previously."))
+       (setf (bl:node-added-nodes node)
+             (remove spec (bl:node-added-nodes node) :test #'string=)))))
+  nil)
 
-(define-rpc "getaddednodeinfo" (node params)
+(define-rpc "getaddednodeinfo" (node (filter))
   "Report manually-added peers and their connection state (Bitcoin Core
 getaddednodeinfo). PARAMS: ([node]) — restrict to one added node (errors if it
 was never added). Returns an array of {addednode, connected, addresses}."
-  (let ((filter (first params)))
-    (when (and filter (not (stringp filter)))
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "node must be a string"))
-    (let ((added (bt:with-recursive-lock-held ((bl:node-lock node))
-                   (copy-list (bl:node-added-nodes node)))))
-      (when filter
-        (unless (member filter added :test #'string=)
-          (error 'rpc-error :code +rpc-client-node-not-added+
-                            :message "Error: Node has not been added."))
-        (setf added (list filter)))
-      ;; Core pushes a VARR: no added nodes is [], not null.
-      (json-array
-       (mapcar
-        (lambda (spec)
-          (let* ((host (bl:parse-node-endpoint node spec))
-                 (peer (bt:with-recursive-lock-held ((bl:node-lock node))
-                         (find host (bl:node-peers node)
-                               :key #'bl.net:peer-address :test #'string=))))
-            `(("addednode" . ,spec)
-              ("connected" . ,(json-bool peer))
-              ;; A list (not a vector) when populated, so rpc-result->json
-              ;; recurses into it and normalizes the nested address object;
-              ;; json-array renders the disconnected case as [], not null.
-              ("addresses"
-               . ,(json-array
-                   (when peer
-                     (list `(("address" . ,(bl.net:peer-address peer))
-                             ("connected" . ,(if (bl.net:peer-inbound peer)
-                                                 "inbound" "outbound"))))))))))
-        added)))))
+  (when (and filter (not (stringp filter)))
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "node must be a string"))
+  (let ((added (bt:with-recursive-lock-held ((bl:node-lock node))
+                 (copy-list (bl:node-added-nodes node)))))
+    (when filter
+      (unless (member filter added :test #'string=)
+        (error 'rpc-error :code +rpc-client-node-not-added+
+                          :message "Error: Node has not been added."))
+      (setf added (list filter)))
+    ;; Core pushes a VARR: no added nodes is [], not null.
+    (json-array
+     (mapcar
+      (lambda (spec)
+        (let* ((host (bl:parse-node-endpoint node spec))
+               (peer (bt:with-recursive-lock-held ((bl:node-lock node))
+                       (find host (bl:node-peers node)
+                             :key #'bl.net:peer-address :test #'string=))))
+          `(("addednode" . ,spec)
+            ("connected" . ,(json-bool peer))
+            ;; A list (not a vector) when populated, so rpc-result->json
+            ;; recurses into it and normalizes the nested address object;
+            ;; json-array renders the disconnected case as [], not null.
+            ("addresses"
+             . ,(json-array
+                 (when peer
+                   (list `(("address" . ,(bl.net:peer-address peer))
+                           ("connected" . ,(if (bl.net:peer-inbound peer)
+                                               "inbound" "outbound"))))))))))
+      added))))
 
 (defun %set-network-active (node state)
   "Flip the node's network-active flag (Core CConnman::SetNetworkActive).
@@ -579,16 +576,16 @@ rollback-time NetworkDisable. Returns STATE."
       (ignore-errors (bl.net:disconnect-peer peer))))
   state)
 
-(define-rpc "setnetworkactive" (node params)
+(define-rpc "setnetworkactive" (node ((state :bool)))
   "Enable or disable all P2P network activity (Bitcoin Core setnetworkactive).
 PARAMS: (state). Disabling drops all current peers and stops new inbound/outbound
 connections until re-enabled. Returns the new state."
   (when (endp params)
     (error 'rpc-error :code +rpc-invalid-parameter+ :message "state is required"))
   ;; Bare JSON boolean result (Core net.cpp:907) — false must not be null.
-  (json-bool (%set-network-active node (positional-bool (first params)))))
+  (json-bool (%set-network-active node state)))
 
-(define-rpc "disconnectnode" (node params)
+(define-rpc "disconnectnode" (node (address nodeid))
   "Disconnect a connected peer by ADDRESS or by NODEID (Bitcoin Core
 disconnectnode, rpc/net.cpp:462-486). PARAMS: (address nodeid).
 
@@ -603,9 +600,7 @@ disconnect_nodes calls `disconnectnode(nodeid=peer_id)` for every peer it wants
 gone (test_framework.py:616). With only the address form, that arrived as a
 NIL address and answered \"address must be a string\" — an error about a
 parameter the caller never sent."
-  (let* ((address (first params))
-         (nodeid (second params))
-         (have-address (and (stringp address) (plusp (length address))))
+  (let* ((have-address (and (stringp address) (plusp (length address))))
          (have-nodeid (integerp nodeid)))
     ;; Atomic against the sync thread's node-peers mutations: hold node-lock
     ;; across the find + disconnect so we don't act on a peer mid-removal.
@@ -645,7 +640,7 @@ parameter the caller never sent."
 ;;; ephemeral discouragement filter (see record-misbehavior); these RPCs only
 ;;; touch manual bans. Addresses are matched exactly (no subnet/CIDR support).
 
-(define-rpc "setban" (node params)
+(define-rpc "setban" (node (address command bantime (absolute :bool)))
   "Add or remove a manual ban (Bitcoin Core setban). PARAMS:
 (address command [bantime] [absolute]). COMMAND is \"add\" or \"remove\". For add,
 BANTIME is seconds from now (default -bantime, 24h), or an absolute Unix time
@@ -655,57 +650,53 @@ mirror Core (net.cpp:766-812): a non-address (-30
 RPC_CLIENT_INVALID_IP_OR_SUBNET), re-banning (-23), a failed unban (-30).
 Subnet (CIDR) bans are not supported — bans match exact addresses — so
 subnet syntax is rejected as invalid. Returns null."
-  (let ((address (first params))
-        (command (second params))
-        (bantime (third params))
-        (absolute (positional-bool (fourth params))))
-    (unless (and (stringp address) (plusp (length address)))
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "address required"))
-    ;; Core: unparseable IP/subnet -> RPC_CLIENT_INVALID_IP_OR_SUBNET (-30),
-    ;; net.cpp:781. parse-network-address accepts IPv4/IPv6/onion/i2p
-    ;; literals; hostnames and CIDR subnets are rejected.
-    (unless (bl.net:parse-network-address address)
-      (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
-                        :message "Error: Invalid IP/Subnet"))
-    (cond
-      ((equal command "add")
-       ;; Core: already banned -> RPC_CLIENT_NODE_ALREADY_ADDED (-23),
-       ;; net.cpp:786.
-       (when (bl.net:peer-banned-p address)
-         (error 'rpc-error :code +rpc-client-node-already-added+
-                           :message "Error: IP/Subnet already banned"))
-       (cond
-         ((null bantime) (bl.net:ban-address address))
-         ((not (integerp bantime))
-          (error 'rpc-error :code +rpc-invalid-parameter+ :message "bantime must be an integer"))
-         (absolute
-          ;; Core: an absolute time in the past is -8, net.cpp:796.
-          (let ((offset (- bantime (bl.ser:get-unix-time))))
-            (when (minusp offset)
-              (error 'rpc-error :code +rpc-invalid-parameter+
-                                :message "Error: Absolute timestamp is in the past"))
-            (bl.net:ban-address address offset)))
-         ;; Core: bantime <= 0 falls back to -bantime (banman.cpp:130-140).
-         ((<= bantime 0) (bl.net:ban-address address))
-         (t (bl.net:ban-address address bantime)))
-       ;; Core: a fresh ban disconnects every matching connected peer itself
-       ;; (net.cpp:803-810, CConnman::DisconnectNode marks ALL nodes with
-       ;; that address). Same node-lock discipline as rpc-disconnectnode:
-       ;; hold it across the scan + disconnects so we never act on a peer
-       ;; mid-removal by the sync thread.
-       (bt:with-recursive-lock-held ((bl:node-lock node))
-         (dolist (peer (bl:node-peers node))
-           (when (string= address (bl.net:peer-address peer))
-             (bl.net:disconnect-peer peer))))
-       nil)
-      ((equal command "remove")
-       (unless (bl.net:unban-address address)
-         ;; Core: RPC_CLIENT_INVALID_IP_OR_SUBNET (-30), net.cpp:812.
-         (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
-                           :message "Error: Unban failed. Requested address/subnet was not previously manually banned."))
-       nil)
-      (t (error 'rpc-error :code +rpc-invalid-parameter+
-                           :message "command must be \"add\" or \"remove\"")))))
+  (unless (and (stringp address) (plusp (length address)))
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "address required"))
+  ;; Core: unparseable IP/subnet -> RPC_CLIENT_INVALID_IP_OR_SUBNET (-30),
+  ;; net.cpp:781. parse-network-address accepts IPv4/IPv6/onion/i2p
+  ;; literals; hostnames and CIDR subnets are rejected.
+  (unless (bl.net:parse-network-address address)
+    (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
+                      :message "Error: Invalid IP/Subnet"))
+  (cond
+    ((equal command "add")
+     ;; Core: already banned -> RPC_CLIENT_NODE_ALREADY_ADDED (-23),
+     ;; net.cpp:786.
+     (when (bl.net:peer-banned-p address)
+       (error 'rpc-error :code +rpc-client-node-already-added+
+                         :message "Error: IP/Subnet already banned"))
+     (cond
+       ((null bantime) (bl.net:ban-address address))
+       ((not (integerp bantime))
+        (error 'rpc-error :code +rpc-invalid-parameter+ :message "bantime must be an integer"))
+       (absolute
+        ;; Core: an absolute time in the past is -8, net.cpp:796.
+        (let ((offset (- bantime (bl.ser:get-unix-time))))
+          (when (minusp offset)
+            (error 'rpc-error :code +rpc-invalid-parameter+
+                              :message "Error: Absolute timestamp is in the past"))
+          (bl.net:ban-address address offset)))
+       ;; Core: bantime <= 0 falls back to -bantime (banman.cpp:130-140).
+       ((<= bantime 0) (bl.net:ban-address address))
+       (t (bl.net:ban-address address bantime)))
+     ;; Core: a fresh ban disconnects every matching connected peer itself
+     ;; (net.cpp:803-810, CConnman::DisconnectNode marks ALL nodes with
+     ;; that address). Same node-lock discipline as rpc-disconnectnode:
+     ;; hold it across the scan + disconnects so we never act on a peer
+     ;; mid-removal by the sync thread.
+     (bt:with-recursive-lock-held ((bl:node-lock node))
+       (dolist (peer (bl:node-peers node))
+         (when (string= address (bl.net:peer-address peer))
+           (bl.net:disconnect-peer peer))))
+     nil)
+    ((equal command "remove")
+     (unless (bl.net:unban-address address)
+       ;; Core: RPC_CLIENT_INVALID_IP_OR_SUBNET (-30), net.cpp:812.
+       (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
+                         :message "Error: Unban failed. Requested address/subnet was not previously manually banned."))
+     nil)
+    (t (error 'rpc-error :code +rpc-invalid-parameter+
+                         :message "command must be \"add\" or \"remove\""))))
 
 (define-rpc "listbanned" (node params)
   "List active manual bans (Bitcoin Core listbanned)."
@@ -749,7 +740,7 @@ subnet syntax is rejected as invalid. Returns null."
 
 ;;; --- addpeeraddress, sendmsgtopeer (Core rpc/net.cpp) ---
 
-(define-rpc "addpeeraddress" (node params)
+(define-rpc "addpeeraddress" (node (address port (tried :bool)))
   "Add an address to the address manager (Core addpeeraddress, rpc/net.cpp).
 For testing only: it is how a functional test seeds addrman without a peer.
 
@@ -757,72 +748,66 @@ PARAMS: (address port [tried]). Returns {\"success\": bool} and, when TRIED was
 asked for and refused, Core's \"error\" string alongside it — the promotion can
 legitimately fail (the tried bucket position may be occupied and queued for a
 collision test), and reporting success for that would misinform the test."
-  (let ((address (first params))
-        (port (second params))
-        (tried (positional-bool (third params))))
-    (unless (and (stringp address) (plusp (length address)))
-      (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for address"))
-    (unless (and (integerp port) (<= 0 port 65535))
-      (error 'rpc-error :code +rpc-type-error+ :message "Expected type number for port"))
-    (multiple-value-bind (net bytes)
-        (bl.net:parse-network-address address)
-      (unless (and net bytes)
-        (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
-                          :message "Invalid IP address"))
-      (let ((book (bl:node-address-book node)))
-        (unless book
-          (error 'rpc-error :code +rpc-misc-error+ :message "Address manager unavailable"))
-        (let* ((pa (bl.net:make-peer-address
-                    :net net :ip bytes :port port
-                    ;; Core stores NODE_NETWORK|NODE_WITNESS for the address.
-                    :services (logior 1 8)
-                    :last-seen (bl.ser:get-unix-time)))
-               (added (bl.net:address-book-add book pa)))
-          (cond
-            ((not added) `(("success" . ,(json-bool nil))))
-            ((not tried) `(("success" . ,(json-bool t))))
-            ((bl.net:address-book-good
-              book bytes port (bl.ser:get-unix-time) net)
-             `(("success" . ,(json-bool t))))
-            (t `(("success" . ,(json-bool nil))
-                 ("error" . "failed-adding-to-tried")))))))))
+  (unless (and (stringp address) (plusp (length address)))
+    (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for address"))
+  (unless (and (integerp port) (<= 0 port 65535))
+    (error 'rpc-error :code +rpc-type-error+ :message "Expected type number for port"))
+  (multiple-value-bind (net bytes)
+      (bl.net:parse-network-address address)
+    (unless (and net bytes)
+      (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
+                        :message "Invalid IP address"))
+    (let ((book (bl:node-address-book node)))
+      (unless book
+        (error 'rpc-error :code +rpc-misc-error+ :message "Address manager unavailable"))
+      (let* ((pa (bl.net:make-peer-address
+                  :net net :ip bytes :port port
+                  ;; Core stores NODE_NETWORK|NODE_WITNESS for the address.
+                  :services (logior 1 8)
+                  :last-seen (bl.ser:get-unix-time)))
+             (added (bl.net:address-book-add book pa)))
+        (cond
+          ((not added) `(("success" . ,(json-bool nil))))
+          ((not tried) `(("success" . ,(json-bool t))))
+          ((bl.net:address-book-good
+            book bytes port (bl.ser:get-unix-time) net)
+           `(("success" . ,(json-bool t))))
+          (t `(("success" . ,(json-bool nil))
+               ("error" . "failed-adding-to-tried"))))))))
 
 (defconstant +max-message-type-size+ 12
   "Core CMessageHeader::MESSAGE_TYPE_SIZE.")
 
-(define-rpc "sendmsgtopeer" (node params)
+(define-rpc "sendmsgtopeer" (node (peer-id msg-type msg-hex))
   "Send a raw P2P message to a connected peer (Core sendmsgtopeer,
 rpc/net.cpp). For testing only: it lets a functional test put an arbitrary
 message on the wire without writing a P2P client.
 
 PARAMS: (peer_id msg_type msg). Returns an empty object."
-  (let ((peer-id (first params))
-        (msg-type (second params))
-        (msg-hex (third params)))
-    (unless (integerp peer-id)
-      (error 'rpc-error :code +rpc-type-error+ :message "Expected type number for peer_id"))
-    (unless (stringp msg-type)
-      (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for msg_type"))
-    (when (> (length msg-type) +max-message-type-size+)
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message (format nil "Error: msg_type too long, max length is ~D"
-                                         +max-message-type-size+)))
-    (unless (and (stringp msg-hex) (evenp (length msg-hex))
-                 (every (lambda (c) (digit-char-p c 16)) msg-hex))
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Error parsing input for msg"))
-    (let ((peer (bt:with-recursive-lock-held ((bl:node-lock node))
-                  (find peer-id (bl:node-peers node)
-                        :key #'bl.net:peer-id))))
-      (unless peer
+  (unless (integerp peer-id)
+    (error 'rpc-error :code +rpc-type-error+ :message "Expected type number for peer_id"))
+  (unless (stringp msg-type)
+    (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for msg_type"))
+  (when (> (length msg-type) +max-message-type-size+)
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message (format nil "Error: msg_type too long, max length is ~D"
+                                       +max-message-type-size+)))
+  (unless (and (stringp msg-hex) (evenp (length msg-hex))
+               (every (lambda (c) (digit-char-p c 16)) msg-hex))
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Error parsing input for msg"))
+  (let ((peer (bt:with-recursive-lock-held ((bl:node-lock node))
+                (find peer-id (bl:node-peers node)
+                      :key #'bl.net:peer-id))))
+    (unless peer
+      (error 'rpc-error :code +rpc-misc-error+
+                        :message "Error: Could not send message to peer"))
+    (handler-case
+        (bl.net:send-message
+         peer (bl.ser:serialize-message
+               msg-type (bl.crypto:hex-to-bytes msg-hex)))
+      (error ()
         (error 'rpc-error :code +rpc-misc-error+
-                          :message "Error: Could not send message to peer"))
-      (handler-case
-          (bl.net:send-message
-           peer (bl.ser:serialize-message
-                 msg-type (bl.crypto:hex-to-bytes msg-hex)))
-        (error ()
-          (error 'rpc-error :code +rpc-misc-error+
-                            :message "Error: Could not send message to peer")))
-      ;; Core returns an empty object; an empty hash-table serializes as {}.
-      (make-hash-table :test (quote equal)))))
+                          :message "Error: Could not send message to peer")))
+    ;; Core returns an empty object; an empty hash-table serializes as {}.
+    (make-hash-table :test (quote equal))))

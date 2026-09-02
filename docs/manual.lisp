@@ -518,7 +518,8 @@
   the server never names them.
 
   Traps: `+json-false+` is TRUTHY -- read positional booleans through
-  the `%positional-bool` helpers, never raw truthiness. A nested JSON
+  the `positional-bool` helpers or a `(var :bool)` spec in the handler's
+  DEFINE-RPC lambda list, never raw truthiness. A nested JSON
   array reaches a handler as a LIST, a top-level one as the empty-array
   sentinel; build test parameters through the request normalizer, not by
   hand. The wallet learns its `/wallet/<name>` endpoint from

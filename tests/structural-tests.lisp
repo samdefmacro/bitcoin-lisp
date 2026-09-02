@@ -869,6 +869,86 @@ byte-buf; the stream codecs and interop's private buffer only lose call sites."
                             "+RETIRING-SERIALIZATION-FAMILY-BASELINE+"
                             "use the byte-reader/byte-buf"))))
 
+;;; --- define-rpc parameter specs vs Core's argument table -------------
+
+(defun %blank-char-p (c)
+  (member c '(#\Space #\Newline #\Tab)))
+
+(defun %rpc-spec-overruns (text table)
+  "The (method . spec-length) pairs in TEXT -- source text holding define-rpc
+forms -- whose positional parameter spec names more positions than TABLE
+(the *rpc-named-arg-names* alist: method name then Core's argument names in
+order) gives the method. A method TABLE does not list is not judged."
+  (let ((overruns '()) (start 0))
+    (loop
+      (let ((at (search "(define-rpc " text :start2 start)))
+        (unless at (return))
+        (setf start (+ at (length "(define-rpc ")))
+        ;; the method name: "name", or ("name" "alias" ...) -- the first string
+        (let* ((q1 (position #\" text :start start))
+               (q2 (and q1 (position #\" text :start (1+ q1))))
+               (name (and q2 (subseq text (1+ q1) q2)))
+               (lam (and q2 (search "(node (" text :start2 q2))))
+          ;; only a spec form -- (node (...)) -- and only when nothing but
+          ;; whitespace and the rest of an alias list ("echo" "echojson")
+          ;; separates the name from it: an opening paren in between means
+          ;; this handler uses the symbol form and LAM is a later handler's
+          (when (and name lam
+                     (every (lambda (c) (or (member c '(#\Space #\Newline #\Tab #\" #\) #\_ #\-))
+                                            (alphanumericp c)))
+                            (subseq text (1+ q2) lam)))
+            (let ((depth 0) (positions 0) (in-spec nil) (i (+ lam (length "(node "))))
+              ;; walk the spec list: a top-level element is a symbol or a (var kind ...) list
+              (loop for c = (char text i)
+                    do (cond ((char= c #\()
+                              (incf depth)
+                              (when (= depth 2) (incf positions)))
+                             ((char= c #\))
+                              (decf depth)
+                              (when (zerop depth) (return)))
+                             ((and (= depth 1) (not in-spec) (not (%blank-char-p c)))
+                              (incf positions) (setf in-spec t))
+                             ((and (= depth 1) in-spec (%blank-char-p c))
+                              (setf in-spec nil)))
+                       (when (= depth 2) (setf in-spec nil))
+                       (incf i))
+              (let ((core (assoc name table :test #'string=)))
+                (when (and core (> positions (length (cdr core))))
+                  (push (cons name positions) overruns))))))))
+    (nreverse overruns)))
+
+(defun %core-rpc-arg-names ()
+  "Core's argument names per RPC method, read from the quoted alist that
+src/rpc/core-tables.lisp sets *rpc-named-arg-names* to -- strings and lists
+only, so the source text reads in any package."
+  (let* ((text (%source-text))
+         (at (search "(setf *rpc-named-arg-names*" text))
+         ;; read from the quote, so only strings and lists are read -- no
+         ;; symbol is interned into the test package
+         (table (second (read-from-string text t nil :start (position #\' text :start at)))))
+    (assert (and (consp table) (stringp (car (first table)))))
+    table))
+
+(test rpc-specs-stay-within-core-arity
+  "A define-rpc parameter spec names the method's positions in Core's order,
+so it can never claim MORE positions than Core's RPCHelpMan declares
+(src/rpc/core-tables.lisp, generated from Core): a longer spec is a
+handler reading an argument the method does not have. Positive control: a
+spec with one position too many is reported."
+  (let ((table (%core-rpc-arg-names)))
+    (is (equal '("getblockhash" "height") (assoc "getblockhash" table :test #'string=))
+        "Core's table must have been read from core-tables.lisp")
+    (is (equal '(("getblockhash" . 2))
+               (%rpc-spec-overruns "(define-rpc \"getblockhash\" (node (height (extra :bool))) \"doc\" height)"
+                                   table))
+        "the checker must report a spec longer than Core's argument list")
+    (is (null (%rpc-spec-overruns "(define-rpc \"getblockhash\" (node (height)) \"doc\" height)
+(define-rpc (\"echo\" \"echojson\") (node params) \"doc\" params)" table))
+        "a spec within Core's arity, an alias list and the symbol form are not overruns")
+    (let ((overruns (%rpc-spec-overruns (%source-text) table)))
+      (is (null overruns)
+          "define-rpc specs longer than Core's argument list: ~S" overruns))))
+
 ;;; --- bare error strings -------------------------------------------------
 
 (defparameter +bare-error-baseline+

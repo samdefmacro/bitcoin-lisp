@@ -177,22 +177,21 @@ first (when assumeutxo background validation is in progress), the current
   (let ((chain-state (rpc-get-chain-state node)))
     (bl.store:current-height chain-state)))
 
-(define-rpc "getblockhash" (node params)
+(define-rpc "getblockhash" (node (height))
   "Return the hash of block at given height."
-  (let ((height (first params)))
-    (unless (and (integerp height) (>= height 0))
+  (unless (and (integerp height) (>= height 0))
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Invalid height parameter"))
+  (let* ((chain-state (rpc-get-chain-state node))
+         (current-height (bl.store:current-height chain-state)))
+    (when (> height current-height)
       (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid height parameter"))
-    (let* ((chain-state (rpc-get-chain-state node))
-           (current-height (bl.store:current-height chain-state)))
-      (when (> height current-height)
-        (error 'rpc-error :code +rpc-invalid-parameter+
-                          :message (format nil "Block height ~A out of range" height)))
-      (let ((entry (bl.store:get-block-at-height chain-state height)))
-        (if entry
-            (hash-to-hex (bl.store:block-index-entry-hash entry))
-            (error 'rpc-error :code +rpc-misc-error+
-                              :message "Block not found"))))))
+                        :message (format nil "Block height ~A out of range" height)))
+    (let ((entry (bl.store:get-block-at-height chain-state height)))
+      (if entry
+          (hash-to-hex (bl.store:block-index-entry-hash entry))
+          (error 'rpc-error :code +rpc-misc-error+
+                            :message "Block not found")))))
 
 (defun %parse-verbosity (params index default &key allow-bool)
   "Core's ParseVerbosity (rpc/util.cpp:83) for the positional argument at INDEX
@@ -244,34 +243,33 @@ different sentence saying the same thing, so no caller could match any of them."
                     :message (format nil "JSON value of type ~A is not of expected type ~A"
                                      (%json-type-name value) expected)))
 
-(define-rpc "getblock" (node params)
+(define-rpc "getblock" (node (hash-str))
   "Return block data (Bitcoin Core getblock). Verbosity <= 0 (or false) returns
 the serialized block hex; 1 (or true) a JSON object with txids; 2 the object
 with full transaction details and each transaction's fee; 3 additionally the
 prevout object per input (Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT)."
-  (let ((hash-str (first params)))
-    (unless (valid-hex-hash-p hash-str)
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid block hash"))
-    (let* ((verbosity (%parse-verbosity params 1 1 :allow-bool t))
-           (hash-bytes (parse-hex-hash hash-str))
-           (block-store (rpc-get-block-store node))
-           (block (and block-store
-                       (bl.store:get-block block-store hash-bytes))))
-      (unless block
-        ;; Core getblock: RPC_INVALID_ADDRESS_OR_KEY (-5), blockchain.cpp:855.
-        (error 'rpc-error :code +rpc-invalid-address-or-key+
-                          :message "Block not found"))
-      (cond
-        ((<= verbosity 0) ;; Hex of the block's wire (witness-complete) bytes
-         (bl.crypto:bytes-to-hex
-          (bl.ser:serialize-witness-block block)))
-        ((= verbosity 1) ;; JSON with txids only
-         (block-to-json block hash-str nil (rpc-get-chain-state node) (rpc-get-network node)))
-        (t ;; verbosity 2: full tx details + fee; 3 adds the prevout objects
-         (block-to-json block hash-str t (rpc-get-chain-state node)
-                        (rpc-get-network node)
-                        :prevouts (>= verbosity 3)))))))
+  (unless (valid-hex-hash-p hash-str)
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Invalid block hash"))
+  (let* ((verbosity (%parse-verbosity params 1 1 :allow-bool t))
+         (hash-bytes (parse-hex-hash hash-str))
+         (block-store (rpc-get-block-store node))
+         (block (and block-store
+                     (bl.store:get-block block-store hash-bytes))))
+    (unless block
+      ;; Core getblock: RPC_INVALID_ADDRESS_OR_KEY (-5), blockchain.cpp:855.
+      (error 'rpc-error :code +rpc-invalid-address-or-key+
+                        :message "Block not found"))
+    (cond
+      ((<= verbosity 0) ;; Hex of the block's wire (witness-complete) bytes
+       (bl.crypto:bytes-to-hex
+        (bl.ser:serialize-witness-block block)))
+      ((= verbosity 1) ;; JSON with txids only
+       (block-to-json block hash-str nil (rpc-get-chain-state node) (rpc-get-network node)))
+      (t ;; verbosity 2: full tx details + fee; 3 adds the prevout objects
+       (block-to-json block hash-str t (rpc-get-chain-state node)
+                      (rpc-get-network node)
+                      :prevouts (>= verbosity 3))))))
 
 (defun %tx-spent-coins-in-block (block tx)
   "The coins TX's inputs spent, from BLOCK's undo data, or NIL when unavailable.
@@ -524,30 +522,28 @@ is supplied and the script is addressable) address."
       ("n" . ,index)
       ("scriptPubKey" . ,spk-json))))
 
-(define-rpc "getblockheader" (node params)
+(define-rpc "getblockheader" (node (hash-str (verbose :bool-or t)))
   "Return block header data."
-  (let ((hash-str (first params))
-        (verbose (positional-bool-or (second params) t)))
-    (unless (valid-hex-hash-p hash-str)
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid block hash"))
-    (let* ((hash-bytes (parse-hex-hash hash-str))
-           (chain-state (rpc-get-chain-state node))
-           (entry (bl.store:get-block-index-entry chain-state hash-bytes)))
-      (unless entry
-        ;; Core getblockheader: RPC_INVALID_ADDRESS_OR_KEY (-5),
-        ;; blockchain.cpp:655.
-        (error 'rpc-error :code +rpc-invalid-address-or-key+
-                          :message "Block not found"))
-      (if verbose
-          (block-header-entry-to-json entry hash-str chain-state
-                                      (rpc-get-block-store node))
-          ;; Non-verbose: serialize the header straight from the index entry
-          ;; (Core serializes pblockindex->GetBlockHeader() — no block-store
-          ;; read, so header-only/pruned entries work too).
-          (bl.crypto:bytes-to-hex
-           (bl.ser:serialize
-            (bl.store:block-index-entry-header entry)))))))
+  (unless (valid-hex-hash-p hash-str)
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Invalid block hash"))
+  (let* ((hash-bytes (parse-hex-hash hash-str))
+         (chain-state (rpc-get-chain-state node))
+         (entry (bl.store:get-block-index-entry chain-state hash-bytes)))
+    (unless entry
+      ;; Core getblockheader: RPC_INVALID_ADDRESS_OR_KEY (-5),
+      ;; blockchain.cpp:655.
+      (error 'rpc-error :code +rpc-invalid-address-or-key+
+                        :message "Block not found"))
+    (if verbose
+        (block-header-entry-to-json entry hash-str chain-state
+                                    (rpc-get-block-store node))
+        ;; Non-verbose: serialize the header straight from the index entry
+        ;; (Core serializes pblockindex->GetBlockHeader() — no block-store
+        ;; read, so header-only/pruned entries work too).
+        (bl.crypto:bytes-to-hex
+         (bl.ser:serialize
+          (bl.store:block-index-entry-header entry))))))
 
 (defun %previousblockhash-field (entry header)
   "Core blockheaderToJSON (rpc/blockchain.cpp:177-178) pushes previousblockhash
@@ -670,71 +666,65 @@ CCoinsViewMemPool::GetCoin), or NIL."
              :height +mempool-coin-height+
              :coinbase nil)))))))
 
-(define-rpc "gettxout" (node params)
+(define-rpc "gettxout" (node (txid-str vout (include-mempool :bool-or t)))
   "Return UTXO info for given outpoint (Core gettxout). PARAMS: (txid n
 [include_mempool]). With include_mempool (the default), an outpoint SPENT by
 a mempool transaction reports null, and an outpoint CREATED by one is
 visible with 0 confirmations (Core's CCoinsViewMemPool +
 mempool.isSpent, rpc/blockchain.cpp gettxout) — previously the argument was
 accepted but ignored."
-  (let ((txid-str (first params))
-        (vout (second params))
-        ;; Default true; JSON false and null both fold to NIL here, matching
-        ;; Core's params[2].isNull() ? true : params[2].get_bool() closely
-        ;; enough for the false case that matters.
-        (include-mempool (positional-bool-or (third params) t)))
-    (unless (valid-hex-hash-p txid-str)
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid txid"))
-    (unless (and (integerp vout) (>= vout 0))
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid vout"))
-    ;; Node lock: the coin lookup and the bestblock/height it is reported
-    ;; against must come from one consistent chain state (Core gettxout
-    ;; holds cs_main, rpc/blockchain.cpp).
-    (with-node-lock (node)
-     (let* ((txid-bytes (parse-hex-hash txid-str))
-            (utxo-set (rpc-get-utxo-set node))
-            (mempool (and include-mempool (rpc-get-mempool node)))
-            (entry (cond
-                     ;; include_mempool: a mempool spend hides the coin ...
-                     ((and mempool
-                           (bl.mp:mempool-spending-tx
-                            mempool txid-bytes vout))
-                      nil)
-                     ;; ... and a mempool-created output is visible.
-                     (t (or (bl.store:get-utxo utxo-set txid-bytes vout)
-                            (and mempool
-                                 (%mempool-view-coin mempool txid-bytes vout)))))))
-      (if entry
-          (let* ((chain-state (rpc-get-chain-state node))
-                 ;; The COINS VIEW's own best block, not the chain tip: they
-                 ;; differ partway through a reorg's disconnect phase, and Core
-                 ;; reports the view's (rpc/blockchain.cpp:1083). Falls back to
-                 ;; the tip for a view that tracks no pointer.
-                 (best-hash (or (bl.store:coins-view-best-block utxo-set)
-                                (bl.store:best-block-hash chain-state)))
-                 (height (bl.store:current-height chain-state))
-                 (utxo-height (bl.store:utxo-entry-height entry))
-                 (spk (bl.store:utxo-entry-script-pubkey entry))
-                 (network (rpc-get-network node))
-                 (addr (script->address spk network)))
-            `(("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
-              ;; Mempool coins report 0 confirmations (Core: nHeight ==
-              ;; MEMPOOL_HEIGHT -> 0).
-              ("confirmations" . ,(if (= utxo-height +mempool-coin-height+)
-                                      0
-                                      (1+ (- height utxo-height))))
-              ("value" . ,(/ (bl.store:utxo-entry-value entry) 100000000.0d0))
-              ;; Core's scriptPubKey shape: asm/hex/type plus address when the
-              ;; script encodes to one (previously only hex was returned).
-              ("scriptPubKey" . (("asm" . ,(bl.val:disassemble-script spk))
-                                 ("desc" . ,(scriptpubkey-desc spk network))
-                                 ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                                 ("type" . ,(bl.val:script-type-name spk))
-                                 ,@(when addr `(("address" . ,addr)))))
-              ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))))
-          nil))))) ; Return null for spent/absent outputs
+  (unless (valid-hex-hash-p txid-str)
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Invalid txid"))
+  (unless (and (integerp vout) (>= vout 0))
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Invalid vout"))
+  ;; Node lock: the coin lookup and the bestblock/height it is reported
+  ;; against must come from one consistent chain state (Core gettxout
+  ;; holds cs_main, rpc/blockchain.cpp).
+  (with-node-lock (node)
+   (let* ((txid-bytes (parse-hex-hash txid-str))
+          (utxo-set (rpc-get-utxo-set node))
+          (mempool (and include-mempool (rpc-get-mempool node)))
+          (entry (cond
+                   ;; include_mempool: a mempool spend hides the coin ...
+                   ((and mempool
+                         (bl.mp:mempool-spending-tx
+                          mempool txid-bytes vout))
+                    nil)
+                   ;; ... and a mempool-created output is visible.
+                   (t (or (bl.store:get-utxo utxo-set txid-bytes vout)
+                          (and mempool
+                               (%mempool-view-coin mempool txid-bytes vout)))))))
+    (if entry
+        (let* ((chain-state (rpc-get-chain-state node))
+               ;; The COINS VIEW's own best block, not the chain tip: they
+               ;; differ partway through a reorg's disconnect phase, and Core
+               ;; reports the view's (rpc/blockchain.cpp:1083). Falls back to
+               ;; the tip for a view that tracks no pointer.
+               (best-hash (or (bl.store:coins-view-best-block utxo-set)
+                              (bl.store:best-block-hash chain-state)))
+               (height (bl.store:current-height chain-state))
+               (utxo-height (bl.store:utxo-entry-height entry))
+               (spk (bl.store:utxo-entry-script-pubkey entry))
+               (network (rpc-get-network node))
+               (addr (script->address spk network)))
+          `(("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
+            ;; Mempool coins report 0 confirmations (Core: nHeight ==
+            ;; MEMPOOL_HEIGHT -> 0).
+            ("confirmations" . ,(if (= utxo-height +mempool-coin-height+)
+                                    0
+                                    (1+ (- height utxo-height))))
+            ("value" . ,(/ (bl.store:utxo-entry-value entry) 100000000.0d0))
+            ;; Core's scriptPubKey shape: asm/hex/type plus address when the
+            ;; script encodes to one (previously only hex was returned).
+            ("scriptPubKey" . (("asm" . ,(bl.val:disassemble-script spk))
+                               ("desc" . ,(scriptpubkey-desc spk network))
+                               ("hex" . ,(bl.crypto:bytes-to-hex spk))
+                               ("type" . ,(bl.val:script-type-name spk))
+                               ,@(when addr `(("address" . ,addr)))))
+            ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))))
+        nil)))) ; Return null for spent/absent outputs
 
 ;;; --- Chain control RPCs ---
 
@@ -852,48 +842,44 @@ the RPC worker thread."
     (+ (get-internal-real-time)
        (floor (* timeout-ms internal-time-units-per-second) 1000))))
 
-(define-rpc "waitforblock" (node params)
+(define-rpc "waitforblock" (node (hash-hex (timeout :integer-or 0)))
   "Wait until the given block hash becomes the chain tip (Bitcoin Core
 waitforblock). PARAMS: (blockhash [timeout-ms]); timeout 0 (default) waits
 indefinitely. Returns the tip on match, timeout, or node shutdown. Polls on the
 RPC worker thread."
-  (let ((hash-hex (first params))
-        (timeout (if (integerp (second params)) (second params) 0)))
-    (unless (stringp hash-hex)
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "blockhash (hex string) required"))
-    (when (minusp timeout)
-      (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
-    (let ((target (parse-hex-hash hash-hex)))
-      (unless target
-        (error 'rpc-error :code +rpc-invalid-parameter+
-                          :message "blockhash must be a 64-character hex string"))
-      (let* ((chain-state (rpc-get-chain-state node))
-             (deadline (%wait-deadline timeout)))
-        (loop while (and (bl:node-running node)
-                         (not (equalp (bl.store:best-block-hash chain-state)
-                                      target))
-                         (or (null deadline) (< (get-internal-real-time) deadline)))
-              do (sleep 0.25))
-        (%tip-result chain-state)))))
-
-(define-rpc "waitforblockheight" (node params)
-  "Wait until the chain tip reaches at least HEIGHT (Bitcoin Core
-waitforblockheight). PARAMS: (height [timeout-ms]); timeout 0 (default) waits
-indefinitely. Returns the tip on reaching the height, timeout, or node shutdown."
-  (let ((height (first params))
-        (timeout (if (integerp (second params)) (second params) 0)))
-    (unless (and (integerp height) (>= height 0))
+  (unless (stringp hash-hex)
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "blockhash (hex string) required"))
+  (when (minusp timeout)
+    (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
+  (let ((target (parse-hex-hash hash-hex)))
+    (unless target
       (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "height must be a non-negative integer"))
-    (when (minusp timeout)
-      (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
+                        :message "blockhash must be a 64-character hex string"))
     (let* ((chain-state (rpc-get-chain-state node))
            (deadline (%wait-deadline timeout)))
       (loop while (and (bl:node-running node)
-                       (< (bl.store:current-height chain-state) height)
+                       (not (equalp (bl.store:best-block-hash chain-state)
+                                    target))
                        (or (null deadline) (< (get-internal-real-time) deadline)))
             do (sleep 0.25))
       (%tip-result chain-state))))
+
+(define-rpc "waitforblockheight" (node (height (timeout :integer-or 0)))
+  "Wait until the chain tip reaches at least HEIGHT (Bitcoin Core
+waitforblockheight). PARAMS: (height [timeout-ms]); timeout 0 (default) waits
+indefinitely. Returns the tip on reaching the height, timeout, or node shutdown."
+  (unless (and (integerp height) (>= height 0))
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "height must be a non-negative integer"))
+  (when (minusp timeout)
+    (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
+  (let* ((chain-state (rpc-get-chain-state node))
+         (deadline (%wait-deadline timeout)))
+    (loop while (and (bl:node-running node)
+                     (< (bl.store:current-height chain-state) height)
+                     (or (null deadline) (< (get-internal-real-time) deadline)))
+          do (sleep 0.25))
+    (%tip-result chain-state)))
 
 ;;; --- UTXO-set snapshots (Bitcoin Core dumptxoutset / loadtxoutset) ---
 ;;;
@@ -1067,7 +1053,7 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
         (when was-active
           (%set-network-active node t))))))
 
-(define-rpc "dumptxoutset" (node params)
+(define-rpc "dumptxoutset" (node (path (type :string-or "") options))
   "Write the UTXO set to PATH in Bitcoin Core's snapshot v2 format
 (dumptxoutset, rpc/blockchain.cpp:3052-3323). PARAMS: (path [type]
 [options]) — type \"latest\" dumps at the current tip; \"rollback\" (or an
@@ -1079,27 +1065,24 @@ coins-cache flush, then streams coins in cursor order while accumulating
 hash_serialized_3 over the same pass. Writes to PATH.incomplete and renames
 on completion. nchaintx is omitted when some block's tx count is unknown
 (header-only/pruned ancestors; Core reports its cached nChainTx)."
-  (let ((path (first params))
-        (type (if (stringp (second params)) (second params) ""))
-        (options (third params)))
-    (unless (and (stringp path) (plusp (length path)))
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
-    (let* ((chain-state (rpc-get-chain-state node))
-           (tip-hash (or (bl.store:best-block-hash chain-state)
-                         (error 'rpc-error :code +rpc-misc-error+
-                                           :message "Chain has no tip")))
-           (tip-entry (bl.store:get-block-index-entry
-                       chain-state tip-hash))
-           (target-entry (%dump-rollback-target-entry
-                          node chain-state tip-entry type options)))
-      (when (probe-file path)
-        (error 'rpc-error :code +rpc-invalid-parameter+
-                          :message (format nil "~A already exists. If you are sure this is what you want, move it out of the way first" path)))
-      ;; Dumping at the current tip needs no rollback at all (Core
-      ;; rpc/blockchain.cpp:3136-3138).
-      (if (eq target-entry tip-entry)
-          (%write-utxo-snapshot node chain-state (rpc-get-utxo-set node) path)
-          (%dump-txoutset-with-rollback node chain-state target-entry path)))))
+  (unless (and (stringp path) (plusp (length path)))
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
+  (let* ((chain-state (rpc-get-chain-state node))
+         (tip-hash (or (bl.store:best-block-hash chain-state)
+                       (error 'rpc-error :code +rpc-misc-error+
+                                         :message "Chain has no tip")))
+         (tip-entry (bl.store:get-block-index-entry
+                     chain-state tip-hash))
+         (target-entry (%dump-rollback-target-entry
+                        node chain-state tip-entry type options)))
+    (when (probe-file path)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message (format nil "~A already exists. If you are sure this is what you want, move it out of the way first" path)))
+    ;; Dumping at the current tip needs no rollback at all (Core
+    ;; rpc/blockchain.cpp:3136-3138).
+    (if (eq target-entry tip-entry)
+        (%write-utxo-snapshot node chain-state (rpc-get-utxo-set node) path)
+        (%dump-txoutset-with-rollback node chain-state target-entry path))))
 
 (defun %write-utxo-snapshot (node chain-state utxo-set path)
   "Stream CHAIN-STATE's UTXO set to PATH in snapshot v2 format at its
@@ -1323,7 +1306,7 @@ function of (format-string &rest args) that must signal."
       (unless adopted
         (bl:abort-snapshot-chainstate node snap)))))
 
-(define-rpc "loadtxoutset" (node params)
+(define-rpc "loadtxoutset" (node (path))
   "Load a Bitcoin Core-format UTXO snapshot (loadtxoutset). PARAMS: (path).
 
 This is Core's ActivateSnapshot + PopulateAndValidateSnapshot flow
@@ -1348,86 +1331,85 @@ prune floor (chain-state-prune-floor — Core Chainstate::GetPruneRange) keeps
 every block at or below the base on disk until background validation
 completes, and the automatic prune target is halved while the historical
 chainstate exists (effective-prune-target-bytes)."
-  (let ((path (first params)))
-    (unless (and (stringp path) (plusp (length path)))
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
-    (unless (probe-file path)
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message (format nil "Couldn't open file ~A for reading." path)))
-    (flet ((load-error (fmt &rest args)
-             ;; Core wraps every activation failure as RPC_INTERNAL_ERROR
-             ;; "Unable to load UTXO snapshot: <reason>. (<path>)".
-             (error 'rpc-error :code +rpc-internal-error+
-                               :message (format nil "Unable to load UTXO snapshot: ~A. (~A)"
-                                                (apply #'format nil fmt args) path))))
-      (let* ((network (rpc-get-network node))
-             (chain-state (rpc-get-chain-state node))
-             (mempool (rpc-get-mempool node)))
-        (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
-          (multiple-value-bind (base-hash coins-count)
-              (%read-snapshot-metadata in network)
-            ;; --- Preconditions (ActivateSnapshot, validation.cpp:5616-5650) ---
-            (when (bl.store:chain-state-from-snapshot-blockhash chain-state)
-              (load-error "Can't activate a snapshot-based chainstate more than once"))
-            (let ((au (bl:assumeutxo-data-for-blockhash network base-hash))
-                  (base-entry (bl.store:get-block-index-entry
-                               chain-state base-hash)))
-              (unless au
-                (load-error "assumeutxo block hash in snapshot metadata not recognized (hash: ~A). The following snapshot heights are available: ~{~D~^, ~}"
-                            (hash-to-hex base-hash)
-                            (sort (mapcar #'bl:assumeutxo-data-height
-                                          (bl:network-assumeutxo-data network))
-                                  #'<)))
-              (unless base-entry
-                (load-error "The base block header (~A) must appear in the headers chain. Make sure all headers are syncing, and call loadtxoutset again"
-                            (hash-to-hex base-hash)))
-              (when (eq (bl.store:block-index-entry-status base-entry) :invalid)
-                (load-error "The base block header (~A) is part of an invalid chain"
-                            (hash-to-hex base-hash)))
-              (let ((base-height (bl.store:block-index-entry-height base-entry)))
-                (unless (= base-height (bl:assumeutxo-data-height au))
-                  (load-error "Assumeutxo height in snapshot metadata not recognized (~D) - refusing to load snapshot"
-                              base-height))
-                ;; The base must lie on the best header chain (Core
-                ;; m_best_header->GetAncestor(height) == base).
-                (let ((best (bl.store:best-header-entry chain-state)))
-                  (unless (and best
-                               (eq (bl.store:entry-ancestor-at-height
-                                    best base-height)
-                                   base-entry))
-                    (load-error "A forked headers-chain with more work than the chain with the snapshot base block header exists. Please proceed to sync without AssumeUtxo.")))
-                ;; The snapshot must be a more-work chain than the active tip
-                ;; (Core CBlockIndexWorkComparator; height as the tiebreak
-                ;; for work-less synthetic chains in tests).
-                (let* ((tip-entry (bl.store:get-block-index-entry
-                                   chain-state
-                                   (bl.store:best-block-hash chain-state)))
-                       (tip-height (bl.store:current-height chain-state))
-                       (tip-work (if tip-entry
-                                     (bl.store:block-index-entry-chain-work
-                                      tip-entry)
-                                     0))
-                       (base-work (bl.store:block-index-entry-chain-work
-                                   base-entry)))
-                  (unless (or (> base-work tip-work)
-                              (and (= base-work tip-work) (> base-height tip-height)))
-                    (load-error "Work does not exceed active chainstate (node already at or past height ~D)"
-                                base-height)))
-                (when (and mempool (plusp (bl.mp:mempool-count mempool)))
-                  (load-error "Can't activate a snapshot when mempool not empty"))
-                ;; --- Populate + verify into a NEW snapshot chainstate ---
-                ;; (see %populate-snapshot-chainstate). Any failure leaves
-                ;; the node untouched.
-                (bl:call-with-sync-paused
-                 node
-                 (lambda ()
-                   (%populate-snapshot-chainstate
-                    node in au base-hash base-entry base-height coins-count
-                    #'load-error)))
-                `(("coins_loaded" . ,coins-count)
-                  ("tip_hash" . ,(hash-to-hex base-hash))
-                  ("base_height" . ,base-height)
-                  ("path" . ,(namestring (truename path))))))))))))
+  (unless (and (stringp path) (plusp (length path)))
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
+  (unless (probe-file path)
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message (format nil "Couldn't open file ~A for reading." path)))
+  (flet ((load-error (fmt &rest args)
+           ;; Core wraps every activation failure as RPC_INTERNAL_ERROR
+           ;; "Unable to load UTXO snapshot: <reason>. (<path>)".
+           (error 'rpc-error :code +rpc-internal-error+
+                             :message (format nil "Unable to load UTXO snapshot: ~A. (~A)"
+                                              (apply #'format nil fmt args) path))))
+    (let* ((network (rpc-get-network node))
+           (chain-state (rpc-get-chain-state node))
+           (mempool (rpc-get-mempool node)))
+      (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+        (multiple-value-bind (base-hash coins-count)
+            (%read-snapshot-metadata in network)
+          ;; --- Preconditions (ActivateSnapshot, validation.cpp:5616-5650) ---
+          (when (bl.store:chain-state-from-snapshot-blockhash chain-state)
+            (load-error "Can't activate a snapshot-based chainstate more than once"))
+          (let ((au (bl:assumeutxo-data-for-blockhash network base-hash))
+                (base-entry (bl.store:get-block-index-entry
+                             chain-state base-hash)))
+            (unless au
+              (load-error "assumeutxo block hash in snapshot metadata not recognized (hash: ~A). The following snapshot heights are available: ~{~D~^, ~}"
+                          (hash-to-hex base-hash)
+                          (sort (mapcar #'bl:assumeutxo-data-height
+                                        (bl:network-assumeutxo-data network))
+                                #'<)))
+            (unless base-entry
+              (load-error "The base block header (~A) must appear in the headers chain. Make sure all headers are syncing, and call loadtxoutset again"
+                          (hash-to-hex base-hash)))
+            (when (eq (bl.store:block-index-entry-status base-entry) :invalid)
+              (load-error "The base block header (~A) is part of an invalid chain"
+                          (hash-to-hex base-hash)))
+            (let ((base-height (bl.store:block-index-entry-height base-entry)))
+              (unless (= base-height (bl:assumeutxo-data-height au))
+                (load-error "Assumeutxo height in snapshot metadata not recognized (~D) - refusing to load snapshot"
+                            base-height))
+              ;; The base must lie on the best header chain (Core
+              ;; m_best_header->GetAncestor(height) == base).
+              (let ((best (bl.store:best-header-entry chain-state)))
+                (unless (and best
+                             (eq (bl.store:entry-ancestor-at-height
+                                  best base-height)
+                                 base-entry))
+                  (load-error "A forked headers-chain with more work than the chain with the snapshot base block header exists. Please proceed to sync without AssumeUtxo.")))
+              ;; The snapshot must be a more-work chain than the active tip
+              ;; (Core CBlockIndexWorkComparator; height as the tiebreak
+              ;; for work-less synthetic chains in tests).
+              (let* ((tip-entry (bl.store:get-block-index-entry
+                                 chain-state
+                                 (bl.store:best-block-hash chain-state)))
+                     (tip-height (bl.store:current-height chain-state))
+                     (tip-work (if tip-entry
+                                   (bl.store:block-index-entry-chain-work
+                                    tip-entry)
+                                   0))
+                     (base-work (bl.store:block-index-entry-chain-work
+                                 base-entry)))
+                (unless (or (> base-work tip-work)
+                            (and (= base-work tip-work) (> base-height tip-height)))
+                  (load-error "Work does not exceed active chainstate (node already at or past height ~D)"
+                              base-height)))
+              (when (and mempool (plusp (bl.mp:mempool-count mempool)))
+                (load-error "Can't activate a snapshot when mempool not empty"))
+              ;; --- Populate + verify into a NEW snapshot chainstate ---
+              ;; (see %populate-snapshot-chainstate). Any failure leaves
+              ;; the node untouched.
+              (bl:call-with-sync-paused
+               node
+               (lambda ()
+                 (%populate-snapshot-chainstate
+                  node in au base-hash base-entry base-height coins-count
+                  #'load-error)))
+              `(("coins_loaded" . ,coins-count)
+                ("tip_hash" . ,(hash-to-hex base-hash))
+                ("base_height" . ,base-height)
+                ("path" . ,(namestring (truename path)))))))))))
 
 ;;; --- UTXO set scanning (Bitcoin Core scantxoutset) ---
 
@@ -1451,7 +1433,7 @@ already running."
   (bt:with-lock-held (*txoutset-scan-lock*)
     (setf *txoutset-scan-running* nil)))
 
-(define-rpc "scantxoutset" (node params)
+(define-rpc "scantxoutset" (node (action (scanobjects :array)))
   "Scan the UTXO set for outputs matching descriptors (Bitcoin Core
 scantxoutset). PARAMS: (action [scanobjects]) — action is \"start\",
 \"status\" or \"abort\". Scanobjects are descriptor strings or
@@ -1459,103 +1441,101 @@ scantxoutset). PARAMS: (action [scanobjects]) — action is \"start\",
 their range (default [0,1000], like Core). The scan runs synchronously on
 the calling RPC thread; status/abort act from another connection,
 mirroring Core."
-  (let ((action (first params)))
-    (cond
-      ((equal action "status")
-       (if (bt:with-lock-held (*txoutset-scan-lock*) *txoutset-scan-running*)
-           `(("progress" . ,*txoutset-scan-progress*))
-           nil))
-      ((equal action "abort")
-       ;; Bare bool: true when a running scan was told to abort, false when
-       ;; none was running (Core scantxoutset abort returns the reserve test).
-       (json-bool
-        (bt:with-lock-held (*txoutset-scan-lock*)
-          (when *txoutset-scan-running*
-            (setf *txoutset-scan-abort* t)))))
-      ((equal action "start")
-       (let ((scanobjects (positional-array (second params))))
-         ;; An EMPTY scanobjects array is legal and means "scan for nothing":
-         ;; Core still walks the UTXO set and reports success with the chain's
-         ;; height, txouts and bestblock, which is what rpc_scantxoutset.py:62
-         ;; asserts. Only null/omitted is the missing argument. Our decoder
-         ;; used to give NIL for both, so the legal call was refused.
-         (unless (%positional-array-p (second params))
-           (error 'rpc-error :code +rpc-misc-error+
-                             :message "scanobjects argument is required for the start action"))
-         (unless (%reserve-txoutset-scan)
-           (error 'rpc-error :code +rpc-invalid-parameter+
-                             :message "Scan already in progress, use action \"abort\" or \"status\""))
-         (unwind-protect
-              (let ((needles (%needle-scripts scanobjects (rpc-get-network node))))
-                (let* ((chain-state (rpc-get-chain-state node))
-                       (utxo-set (rpc-get-utxo-set node))
-                       (tip-height (bl.store:current-height chain-state))
-                       (best-hash (bl.store:best-block-hash chain-state))
-                       (count 0) (total-amount 0) (unspents '())
-                       (height-hashes nil)
-                       (aborted nil))
-                  (flet ((blockhash-at (height)
-                           ;; get-block-at-height walks tip->height, so per-match
-                           ;; lookups would be O(matches * tip). One backward walk
-                           ;; on first use builds the whole height->hex table.
-                           (unless height-hashes
-                             (setf height-hashes (make-hash-table))
-                             (loop with e = (and best-hash
-                                                 (bl.store:get-block-index-entry
-                                                  chain-state best-hash))
-                                   while e
-                                   do (setf (gethash (bl.store:block-index-entry-height e)
-                                                     height-hashes)
-                                            (hash-to-hex
-                                             (bl.store:block-index-entry-hash e)))
-                                      (setf e (bl.store:block-index-entry-prev-entry e))))
-                           (gethash height height-hashes)))
-                  (block scan
-                    (bl.store:utxo-set-iterate
-                     utxo-set
-                     (lambda (txid vout entry)
-                       (when *txoutset-scan-abort*
-                         (setf aborted t)
-                         (return-from scan))
-                       (incf count)
-                       ;; Iteration is txid-lex-ordered (utxo-set-iterate's
-                       ;; documented contract): the txid prefix is the scan
-                       ;; position (Core's g_scan_progress).
-                       (setf *txoutset-scan-progress*
-                             (floor (* 100 (+ (* 256 (aref txid 0)) (aref txid 1)))
-                                    65536))
-                       (let ((desc (gethash
-                                    (bl.store:utxo-entry-script-pubkey entry)
-                                    needles)))
-                         (when desc
-                           (let ((height (bl.store:utxo-entry-height entry))
-                                 (value (bl.store:utxo-entry-value entry)))
-                             (incf total-amount value)
-                             (push
-                              `(("txid" . ,(hash-to-hex txid))
-                                ("vout" . ,vout)
-                                ("scriptPubKey"
-                                 . ,(bl.crypto:bytes-to-hex
-                                     (bl.store:utxo-entry-script-pubkey entry)))
-                                ("desc" . ,desc)
-                                ("amount" . ,(/ value 100000000.0d0))
-                                ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))
-                                ("height" . ,height)
-                                ,@(let ((hex (blockhash-at height)))
-                                    (when hex `(("blockhash" . ,hex))))
-                                ("confirmations" . ,(1+ (- tip-height height))))
-                              unspents))))))))
-                  `(("success" . ,(json-bool (not aborted)))
-                    ("txouts" . ,count)
-                    ("height" . ,tip-height)
-                    ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
-                    ;; Core pushes a VARR: no matches is [], not null.
-                    ("unspents" . ,(json-array (nreverse unspents)))
-                    ("total_amount" . ,(/ total-amount 100000000.0d0)))))
-           (%release-txoutset-scan))))
-      (t
+  (cond
+    ((equal action "status")
+     (if (bt:with-lock-held (*txoutset-scan-lock*) *txoutset-scan-running*)
+         `(("progress" . ,*txoutset-scan-progress*))
+         nil))
+    ((equal action "abort")
+     ;; Bare bool: true when a running scan was told to abort, false when
+     ;; none was running (Core scantxoutset abort returns the reserve test).
+     (json-bool
+      (bt:with-lock-held (*txoutset-scan-lock*)
+        (when *txoutset-scan-running*
+          (setf *txoutset-scan-abort* t)))))
+    ((equal action "start")
+     ;; An EMPTY scanobjects array is legal and means "scan for nothing":
+     ;; Core still walks the UTXO set and reports success with the chain's
+     ;; height, txouts and bestblock, which is what rpc_scantxoutset.py:62
+     ;; asserts. Only null/omitted is the missing argument. Our decoder
+     ;; used to give NIL for both, so the legal call was refused.
+     (unless (%positional-array-p (second params))
+       (error 'rpc-error :code +rpc-misc-error+
+                         :message "scanobjects argument is required for the start action"))
+     (unless (%reserve-txoutset-scan)
        (error 'rpc-error :code +rpc-invalid-parameter+
-                         :message (format nil "Invalid action '~A'" action))))))
+                         :message "Scan already in progress, use action \"abort\" or \"status\""))
+     (unwind-protect
+          (let ((needles (%needle-scripts scanobjects (rpc-get-network node))))
+            (let* ((chain-state (rpc-get-chain-state node))
+                   (utxo-set (rpc-get-utxo-set node))
+                   (tip-height (bl.store:current-height chain-state))
+                   (best-hash (bl.store:best-block-hash chain-state))
+                   (count 0) (total-amount 0) (unspents '())
+                   (height-hashes nil)
+                   (aborted nil))
+              (flet ((blockhash-at (height)
+                       ;; get-block-at-height walks tip->height, so per-match
+                       ;; lookups would be O(matches * tip). One backward walk
+                       ;; on first use builds the whole height->hex table.
+                       (unless height-hashes
+                         (setf height-hashes (make-hash-table))
+                         (loop with e = (and best-hash
+                                             (bl.store:get-block-index-entry
+                                              chain-state best-hash))
+                               while e
+                               do (setf (gethash (bl.store:block-index-entry-height e)
+                                                 height-hashes)
+                                        (hash-to-hex
+                                         (bl.store:block-index-entry-hash e)))
+                                  (setf e (bl.store:block-index-entry-prev-entry e))))
+                       (gethash height height-hashes)))
+              (block scan
+                (bl.store:utxo-set-iterate
+                 utxo-set
+                 (lambda (txid vout entry)
+                   (when *txoutset-scan-abort*
+                     (setf aborted t)
+                     (return-from scan))
+                   (incf count)
+                   ;; Iteration is txid-lex-ordered (utxo-set-iterate's
+                   ;; documented contract): the txid prefix is the scan
+                   ;; position (Core's g_scan_progress).
+                   (setf *txoutset-scan-progress*
+                         (floor (* 100 (+ (* 256 (aref txid 0)) (aref txid 1)))
+                                65536))
+                   (let ((desc (gethash
+                                (bl.store:utxo-entry-script-pubkey entry)
+                                needles)))
+                     (when desc
+                       (let ((height (bl.store:utxo-entry-height entry))
+                             (value (bl.store:utxo-entry-value entry)))
+                         (incf total-amount value)
+                         (push
+                          `(("txid" . ,(hash-to-hex txid))
+                            ("vout" . ,vout)
+                            ("scriptPubKey"
+                             . ,(bl.crypto:bytes-to-hex
+                                 (bl.store:utxo-entry-script-pubkey entry)))
+                            ("desc" . ,desc)
+                            ("amount" . ,(/ value 100000000.0d0))
+                            ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))
+                            ("height" . ,height)
+                            ,@(let ((hex (blockhash-at height)))
+                                (when hex `(("blockhash" . ,hex))))
+                            ("confirmations" . ,(1+ (- tip-height height))))
+                          unspents))))))))
+              `(("success" . ,(json-bool (not aborted)))
+                ("txouts" . ,count)
+                ("height" . ,tip-height)
+                ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
+                ;; Core pushes a VARR: no matches is [], not null.
+                ("unspents" . ,(json-array (nreverse unspents)))
+                ("total_amount" . ,(/ total-amount 100000000.0d0)))))
+       (%release-txoutset-scan)))
+    (t
+     (error 'rpc-error :code +rpc-invalid-parameter+
+                       :message (format nil "Invalid action '~A'" action)))))
 
 ;;; --- Chain tx statistics (Bitcoin Core getchaintxstats) ---
 
@@ -1738,13 +1718,11 @@ that block's deltas. Only the muhash hash_type is index-backed."
                     ("scripts" . ,(%csi-amount-btc d-uns-scripts))
                     ("unclaimed_rewards" . ,(%csi-amount-btc d-uns-unclaimed))))))))))))
 
-(define-rpc "gettxoutsetinfo" (node params)
+(define-rpc "gettxoutsetinfo" (node ((hash-type :or "hash_serialized_3") hash-or-height))
   "Return statistics about the UTXO set. With a second argument (height or
 block hash) the stats are served for that historical height from the
 coinstatsindex (Core's use_index path)."
-  (let ((hash-type (or (first params) "hash_serialized_3"))
-        (hash-or-height (second params))
-        (utxo-set (rpc-get-utxo-set node))
+  (let ((utxo-set (rpc-get-utxo-set node))
         (chain-state (rpc-get-chain-state node)))
     (unless (member hash-type '("hash_serialized_3" "muhash" "none") :test #'string=)
       (error 'rpc-error :code +rpc-invalid-parameter+
@@ -1868,158 +1846,156 @@ unavailable in this block'."
                               :message (format nil "Invalid selected statistic '~A'" name))))
       stats-filter))))
 
-(define-rpc "getblockstats" (node params)
+(define-rpc "getblockstats" (node (hash-or-height stats-filter))
   "Per-block statistics (Bitcoin Core getblockstats, rpc/blockchain.cpp:1934-2190).
 PARAMS: (hash_or_height [stats]) — STATS selects a subset of the keys; an
 unknown name is an error. All amounts are in satoshis, feerates in sat/vB.
 The fee statistics come from the block's undo data, so — as in Core, whose
 GetUndoChecked runs unconditionally (:2016) — a spending block whose undo data
 is unavailable (pruned) is an error rather than a silently wrong answer."
-  (let ((hash-or-height (first params))
-        (stats-filter (second params)))
-    (unless hash-or-height
-      (error 'rpc-error :code +rpc-invalid-params+
-                        :message "Missing required parameter hash_or_height"))
-    (let* ((chain-state (rpc-get-chain-state node))
-           (block-store (rpc-get-block-store node)))
-      (unless block-store
-        (error 'rpc-error :code +rpc-misc-error+
-                          :message "Block data not available"))
-      ;; Core resolves through ParseHashOrHeight, so the block must be in the
-      ;; index — the old height-0 fallback for an unindexed block reported a
-      ;; wrong subsidy and mediantime instead of erroring.
-      (let* ((entry (%parse-hash-or-height-entry chain-state hash-or-height))
-             (block-hash (bl.store:block-index-entry-hash entry))
-             (block (bl.store:get-block block-store block-hash)))
-        (unless block
-          (error 'rpc-error :code +rpc-invalid-address-or-key+
-                            :message "Block not found"))
-        (let* ((height (bl.store:block-index-entry-height entry))
-               (header (bl.ser:bitcoin-block-header block))
-               (txs (bl.ser:bitcoin-block-transactions block))
-               (ntx (length txs))
-               (undo (bl.val:get-undo-data block-hash)))
-          (when (and (> ntx 1) (null undo))
-            ;; Core GetUndoChecked, rpc/blockchain.cpp:730-732.
-            (error 'rpc-error :code +rpc-misc-error+
-                              :message "Can't read undo data from disk"))
-          (let ((prevouts (%undo-prevout-table undo))
-                (maxfee 0) (minfee nil) (maxfeerate 0) (minfeerate nil)
-                (total-out 0) (totalfee 0) (inputs 0) (outputs 0)
-                (maxtxsize 0) (mintxsize nil)
-                (swtotal-size 0) (swtotal-weight 0) (swtxs 0)
-                (total-size 0) (total-weight 0)
-                (utxos 0) (utxo-size-inc 0) (utxo-size-inc-actual 0)
-                (fee-array '()) (feerate-array '()) (txsize-array '()))
-            (loop
-              for tx in txs
-              for i from 0
-              for coinbase-p = (zerop i)
-              do (let ((tx-total-out 0))
-                   ;; Outputs are counted for EVERY transaction, coinbase
-                   ;; included — Core :2054, before the coinbase continue.
-                   (incf outputs (length (bl.ser:transaction-outputs tx)))
-                   (bl.ser:dovector
-                       (out (bl.ser:transaction-outputs tx))
-                     (let* ((spk (bl.ser:tx-out-script-pubkey out))
-                            (out-size (+ (txout-serialize-size spk) +per-utxo-overhead+)))
-                       (incf tx-total-out (bl.ser:tx-out-value out))
-                       (incf utxo-size-inc out-size)
-                       ;; Genesis and the BIP30-repeated coinbases never enter
-                       ;; the UTXO set, and unspendable outputs are dropped
-                       ;; from it, so neither counts toward the *_actual
-                       ;; figures (Core :2064-2072).
-                       (unless (or (zerop height)
-                                   (and coinbase-p
-                                        (bl.val:bip30-repeat-block-p height))
-                                   (bl.store:script-unspendable-p spk))
-                         (incf utxos)
-                         (incf utxo-size-inc-actual out-size))))
-                   ;; Everything below is non-coinbase only (Core :2075-2077).
-                   (unless coinbase-p
-                     (let* ((tx-size (length (bl.ser:transaction-wire-bytes tx)))
-                            (weight (bl.ser:transaction-weight tx))
-                            (tx-total-in 0))
-                       (incf inputs (length (bl.ser:transaction-inputs tx)))
-                       (incf total-out tx-total-out)
-                       (push tx-size txsize-array)
-                       (setf maxtxsize (max maxtxsize tx-size))
-                       (setf mintxsize (if mintxsize (min mintxsize tx-size) tx-size))
-                       (incf total-size tx-size)
-                       (incf total-weight weight)
-                       (when (bl.ser:transaction-has-witness-p tx)
-                         (incf swtxs)
-                         (incf swtotal-size tx-size)
-                         (incf swtotal-weight weight))
-                       (bl.ser:dovector
-                           (in (bl.ser:transaction-inputs tx))
-                         (let* ((outpoint (bl.ser:tx-in-previous-output in))
-                                (coin (gethash (outpoint-key
-                                                (bl.ser:outpoint-hash outpoint)
-                                                (bl.ser:outpoint-index outpoint))
-                                               prevouts)))
-                           (unless coin
-                             ;; Incomplete undo data: fail closed rather than
-                             ;; report a fee total that is silently too high.
-                             (error 'rpc-error :code +rpc-misc-error+
-                                               :message "Can't read undo data from disk"))
-                           (let ((prevout-size
-                                   (+ (txout-serialize-size
-                                       (bl.store:utxo-entry-script-pubkey coin))
-                                      +per-utxo-overhead+)))
-                             (incf tx-total-in (bl.store:utxo-entry-value coin))
-                             (decf utxo-size-inc prevout-size)
-                             (decf utxo-size-inc-actual prevout-size))))
-                       (let* ((txfee (- tx-total-in tx-total-out))
-                              (feerate (if (plusp weight)
-                                           (truncate (* txfee 4) weight)
-                                           0)))
-                         (push txfee fee-array)
-                         (setf maxfee (max maxfee txfee))
-                         (setf minfee (if minfee (min minfee txfee) txfee))
-                         (incf totalfee txfee)
-                         (push (cons feerate weight) feerate-array)
-                         (setf maxfeerate (max maxfeerate feerate))
-                         (setf minfeerate (if minfeerate (min minfeerate feerate) feerate)))))))
-            (let* ((non-coinbase (max 0 (1- ntx)))
-                   (all-stats
-                     `(("avgfee" . ,(if (plusp non-coinbase) (truncate totalfee non-coinbase) 0))
-                       ("avgfeerate" . ,(if (plusp total-weight)
-                                            (truncate (* totalfee 4) total-weight)
-                                            0))
-                       ("avgtxsize" . ,(if (plusp non-coinbase)
-                                           (truncate total-size non-coinbase)
-                                           0))
-                       ("blockhash" . ,(hash-to-hex block-hash))
-                       ("feerate_percentiles" . ,(%feerate-percentiles feerate-array total-weight))
-                       ("height" . ,height)
-                       ("ins" . ,inputs)
-                       ("maxfee" . ,maxfee)
-                       ("maxfeerate" . ,maxfeerate)
-                       ("maxtxsize" . ,maxtxsize)
-                       ("medianfee" . ,(%truncated-median fee-array))
-                       ("mediantime" . ,(bl.val:compute-median-time-past
-                                         chain-state block-hash))
-                       ("mediantxsize" . ,(%truncated-median txsize-array))
-                       ("minfee" . ,(or minfee 0))
-                       ("minfeerate" . ,(or minfeerate 0))
-                       ("mintxsize" . ,(or mintxsize 0))
-                       ("outs" . ,outputs)
-                       ("subsidy" . ,(bl.val:calculate-block-subsidy height))
-                       ("swtotal_size" . ,swtotal-size)
-                       ("swtotal_weight" . ,swtotal-weight)
-                       ("swtxs" . ,swtxs)
-                       ("time" . ,(bl.ser:block-header-timestamp header))
-                       ("total_out" . ,total-out)
-                       ("total_size" . ,total-size)
-                       ("total_weight" . ,total-weight)
-                       ("totalfee" . ,totalfee)
-                       ("txs" . ,ntx)
-                       ("utxo_increase" . ,(- outputs inputs))
-                       ("utxo_size_inc" . ,utxo-size-inc)
-                       ("utxo_increase_actual" . ,(- utxos inputs))
-                       ("utxo_size_inc_actual" . ,utxo-size-inc-actual))))
-              (%select-block-stats all-stats stats-filter))))))))
+  (unless hash-or-height
+    (error 'rpc-error :code +rpc-invalid-params+
+                      :message "Missing required parameter hash_or_height"))
+  (let* ((chain-state (rpc-get-chain-state node))
+         (block-store (rpc-get-block-store node)))
+    (unless block-store
+      (error 'rpc-error :code +rpc-misc-error+
+                        :message "Block data not available"))
+    ;; Core resolves through ParseHashOrHeight, so the block must be in the
+    ;; index — the old height-0 fallback for an unindexed block reported a
+    ;; wrong subsidy and mediantime instead of erroring.
+    (let* ((entry (%parse-hash-or-height-entry chain-state hash-or-height))
+           (block-hash (bl.store:block-index-entry-hash entry))
+           (block (bl.store:get-block block-store block-hash)))
+      (unless block
+        (error 'rpc-error :code +rpc-invalid-address-or-key+
+                          :message "Block not found"))
+      (let* ((height (bl.store:block-index-entry-height entry))
+             (header (bl.ser:bitcoin-block-header block))
+             (txs (bl.ser:bitcoin-block-transactions block))
+             (ntx (length txs))
+             (undo (bl.val:get-undo-data block-hash)))
+        (when (and (> ntx 1) (null undo))
+          ;; Core GetUndoChecked, rpc/blockchain.cpp:730-732.
+          (error 'rpc-error :code +rpc-misc-error+
+                            :message "Can't read undo data from disk"))
+        (let ((prevouts (%undo-prevout-table undo))
+              (maxfee 0) (minfee nil) (maxfeerate 0) (minfeerate nil)
+              (total-out 0) (totalfee 0) (inputs 0) (outputs 0)
+              (maxtxsize 0) (mintxsize nil)
+              (swtotal-size 0) (swtotal-weight 0) (swtxs 0)
+              (total-size 0) (total-weight 0)
+              (utxos 0) (utxo-size-inc 0) (utxo-size-inc-actual 0)
+              (fee-array '()) (feerate-array '()) (txsize-array '()))
+          (loop
+            for tx in txs
+            for i from 0
+            for coinbase-p = (zerop i)
+            do (let ((tx-total-out 0))
+                 ;; Outputs are counted for EVERY transaction, coinbase
+                 ;; included — Core :2054, before the coinbase continue.
+                 (incf outputs (length (bl.ser:transaction-outputs tx)))
+                 (bl.ser:dovector
+                     (out (bl.ser:transaction-outputs tx))
+                   (let* ((spk (bl.ser:tx-out-script-pubkey out))
+                          (out-size (+ (txout-serialize-size spk) +per-utxo-overhead+)))
+                     (incf tx-total-out (bl.ser:tx-out-value out))
+                     (incf utxo-size-inc out-size)
+                     ;; Genesis and the BIP30-repeated coinbases never enter
+                     ;; the UTXO set, and unspendable outputs are dropped
+                     ;; from it, so neither counts toward the *_actual
+                     ;; figures (Core :2064-2072).
+                     (unless (or (zerop height)
+                                 (and coinbase-p
+                                      (bl.val:bip30-repeat-block-p height))
+                                 (bl.store:script-unspendable-p spk))
+                       (incf utxos)
+                       (incf utxo-size-inc-actual out-size))))
+                 ;; Everything below is non-coinbase only (Core :2075-2077).
+                 (unless coinbase-p
+                   (let* ((tx-size (length (bl.ser:transaction-wire-bytes tx)))
+                          (weight (bl.ser:transaction-weight tx))
+                          (tx-total-in 0))
+                     (incf inputs (length (bl.ser:transaction-inputs tx)))
+                     (incf total-out tx-total-out)
+                     (push tx-size txsize-array)
+                     (setf maxtxsize (max maxtxsize tx-size))
+                     (setf mintxsize (if mintxsize (min mintxsize tx-size) tx-size))
+                     (incf total-size tx-size)
+                     (incf total-weight weight)
+                     (when (bl.ser:transaction-has-witness-p tx)
+                       (incf swtxs)
+                       (incf swtotal-size tx-size)
+                       (incf swtotal-weight weight))
+                     (bl.ser:dovector
+                         (in (bl.ser:transaction-inputs tx))
+                       (let* ((outpoint (bl.ser:tx-in-previous-output in))
+                              (coin (gethash (outpoint-key
+                                              (bl.ser:outpoint-hash outpoint)
+                                              (bl.ser:outpoint-index outpoint))
+                                             prevouts)))
+                         (unless coin
+                           ;; Incomplete undo data: fail closed rather than
+                           ;; report a fee total that is silently too high.
+                           (error 'rpc-error :code +rpc-misc-error+
+                                             :message "Can't read undo data from disk"))
+                         (let ((prevout-size
+                                 (+ (txout-serialize-size
+                                     (bl.store:utxo-entry-script-pubkey coin))
+                                    +per-utxo-overhead+)))
+                           (incf tx-total-in (bl.store:utxo-entry-value coin))
+                           (decf utxo-size-inc prevout-size)
+                           (decf utxo-size-inc-actual prevout-size))))
+                     (let* ((txfee (- tx-total-in tx-total-out))
+                            (feerate (if (plusp weight)
+                                         (truncate (* txfee 4) weight)
+                                         0)))
+                       (push txfee fee-array)
+                       (setf maxfee (max maxfee txfee))
+                       (setf minfee (if minfee (min minfee txfee) txfee))
+                       (incf totalfee txfee)
+                       (push (cons feerate weight) feerate-array)
+                       (setf maxfeerate (max maxfeerate feerate))
+                       (setf minfeerate (if minfeerate (min minfeerate feerate) feerate)))))))
+          (let* ((non-coinbase (max 0 (1- ntx)))
+                 (all-stats
+                   `(("avgfee" . ,(if (plusp non-coinbase) (truncate totalfee non-coinbase) 0))
+                     ("avgfeerate" . ,(if (plusp total-weight)
+                                          (truncate (* totalfee 4) total-weight)
+                                          0))
+                     ("avgtxsize" . ,(if (plusp non-coinbase)
+                                         (truncate total-size non-coinbase)
+                                         0))
+                     ("blockhash" . ,(hash-to-hex block-hash))
+                     ("feerate_percentiles" . ,(%feerate-percentiles feerate-array total-weight))
+                     ("height" . ,height)
+                     ("ins" . ,inputs)
+                     ("maxfee" . ,maxfee)
+                     ("maxfeerate" . ,maxfeerate)
+                     ("maxtxsize" . ,maxtxsize)
+                     ("medianfee" . ,(%truncated-median fee-array))
+                     ("mediantime" . ,(bl.val:compute-median-time-past
+                                       chain-state block-hash))
+                     ("mediantxsize" . ,(%truncated-median txsize-array))
+                     ("minfee" . ,(or minfee 0))
+                     ("minfeerate" . ,(or minfeerate 0))
+                     ("mintxsize" . ,(or mintxsize 0))
+                     ("outs" . ,outputs)
+                     ("subsidy" . ,(bl.val:calculate-block-subsidy height))
+                     ("swtotal_size" . ,swtotal-size)
+                     ("swtotal_weight" . ,swtotal-weight)
+                     ("swtxs" . ,swtxs)
+                     ("time" . ,(bl.ser:block-header-timestamp header))
+                     ("total_out" . ,total-out)
+                     ("total_size" . ,total-size)
+                     ("total_weight" . ,total-weight)
+                     ("totalfee" . ,totalfee)
+                     ("txs" . ,ntx)
+                     ("utxo_increase" . ,(- outputs inputs))
+                     ("utxo_size_inc" . ,utxo-size-inc)
+                     ("utxo_increase_actual" . ,(- utxos inputs))
+                     ("utxo_size_inc_actual" . ,utxo-size-inc-actual))))
+            (%select-block-stats all-stats stats-filter)))))))
 
 ;; calculate-block-subsidy lives in bitcoin-lisp.validation (consensus, now
 ;; network-aware incl. the regtest 150-block halving). The duplicate that lived
@@ -2053,7 +2029,7 @@ Returns the height of the last pruned block."
       ;; Note: getblockchaininfo.pruneheight returns (1+ this) = first UNpruned block.
       (bl.store:chain-state-pruned-height chain-state)))))
 
-(define-rpc "migrateblocks" (node params)
+(define-rpc "migrateblocks" (node ((nblocks :or 1000) (start :or 0)))
   "Convert legacy per-block files into flat blk?????.dat files.
 PARAMS: [nblocks]  (default 1000)
 
@@ -2066,43 +2042,39 @@ them. Run it again until \"remaining\" is 0.
 The node lock is held for the whole call, so the budget is not a formality:
 converting means reading and rewriting every block, and a large nblocks stalls
 block connection for as long as that takes. Prefer several small calls."
-  (let ((nblocks (or (first params) 1000))
-        (start (or (second params) 0)))
-    (unless (and (integerp nblocks) (plusp nblocks))
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "nblocks must be a positive integer"))
-    (unless (and (integerp start) (>= start 0))
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "start_height must be a non-negative integer"))
-    ;; The node lock for the same reason pruneblockchain takes it: this rewrites
-    ;; the block store and its index under the sync thread's feet.
-    (with-node-lock (node)
-      (let ((store (rpc-get-block-store node))
-            (chain-state (rpc-get-chain-state node)))
-        (multiple-value-bind (migrated next remaining)
-            (bl.store:migrate-blocks-to-flat-files
-             store chain-state :max-blocks nblocks :start-height start
-             ;; Each block's undo data follows it into the matching rev file.
-             ;; Storage cannot do this itself: the undo format lives above it.
-             :on-migrated
-             (lambda (entry)
-               (bl.val:migrate-undo-to-flat
-                (bl.store:block-index-entry-hash entry))))
-          (bl:node-log
-           :info "RPC migrateblocks: converted ~D block~:P; resume at height ~D; ~D legacy file~:P left"
-           migrated next remaining)
-          `(("migrated" . ,migrated)
-            ("next_height" . ,next)
-            ("remaining" . ,remaining)))))))
+  (unless (and (integerp nblocks) (plusp nblocks))
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "nblocks must be a positive integer"))
+  (unless (and (integerp start) (>= start 0))
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "start_height must be a non-negative integer"))
+  ;; The node lock for the same reason pruneblockchain takes it: this rewrites
+  ;; the block store and its index under the sync thread's feet.
+  (with-node-lock (node)
+    (let ((store (rpc-get-block-store node))
+          (chain-state (rpc-get-chain-state node)))
+      (multiple-value-bind (migrated next remaining)
+          (bl.store:migrate-blocks-to-flat-files
+           store chain-state :max-blocks nblocks :start-height start
+           ;; Each block's undo data follows it into the matching rev file.
+           ;; Storage cannot do this itself: the undo format lives above it.
+           :on-migrated
+           (lambda (entry)
+             (bl.val:migrate-undo-to-flat
+              (bl.store:block-index-entry-hash entry))))
+        (bl:node-log
+         :info "RPC migrateblocks: converted ~D block~:P; resume at height ~D; ~D legacy file~:P left"
+         migrated next remaining)
+        `(("migrated" . ,migrated)
+          ("next_height" . ,next)
+          ("remaining" . ,remaining))))))
 
 ;;; --- BIP157/158 block filter RPCs ---
 
-(define-rpc "getblockfilter" (node params)
+(define-rpc "getblockfilter" (node (blockhash-hex (filtertype :or "basic")))
   "Return the BIP157 basic filter and filter header for a block.
 PARAMS: (blockhash [filtertype]). Mirrors Bitcoin Core getblockfilter."
-  (let* ((blockhash-hex (first params))
-         (filtertype (or (second params) "basic"))
-         (hash (and (stringp blockhash-hex) (parse-hex-hash blockhash-hex))))
+  (let* ((hash (and (stringp blockhash-hex) (parse-hex-hash blockhash-hex))))
     (unless hash
       ;; Core ParseHashV: parse failures are -8 (util.cpp:117-125); only the
       ;; well-formed-but-unknown lookup below is -5.
@@ -2147,90 +2119,85 @@ PARAMS: (blockhash [filtertype]). Mirrors Bitcoin Core getblockfilter."
 (defun %hash-table-keys (ht)
   (loop for k being the hash-keys of ht collect k))
 
-(define-rpc "scanblocks" (node params)
+(define-rpc "scanblocks" (node (action (scanobjects :array) (start :or 0) stop (filtertype :or "basic") options))
   "Return blockhashes relevant to a descriptor set using the block filter index.
 PARAMS: (action [scanobjects] [start_height] [stop_height] [filtertype] [options]).
 ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
-  (let ((action (first params)))
-    (cond
-      ((equal action "status")
-       (bt:with-lock-held (*scanblocks-lock*)
-         (if *scanblocks-running*
-             `(("progress" . ,*scanblocks-progress*)
-               ("current_height" . ,*scanblocks-current-height*))
-             nil)))
-      ((equal action "abort")
-       (bt:with-lock-held (*scanblocks-lock*)
-         (json-bool
-          (when *scanblocks-running* (setf *scanblocks-abort* t) t))))
-      ((equal action "start")
-       (let ((scanobjects (positional-array (second params)))
-             (filtertype (or (fifth params) "basic"))
-             (bfi (rpc-get-blockfilterindex node)))
-         ;; Empty is an array, as in scantxoutset above; null/omitted is not.
-         (unless (%positional-array-p (second params))
-           (error 'rpc-error :code +rpc-misc-error+
-                             :message "scanobjects argument is required for the start action"))
-         (unless (string-equal filtertype "basic")
-           (error 'rpc-error :code +rpc-invalid-address-or-key+
-                             :message (format nil "Unknown filtertype ~A" filtertype)))
-         (unless (and bfi (bl.store:blockfilterindex-enabled bfi))
-           (error 'rpc-error :code +rpc-misc-error+
-                             :message "Index is not enabled for filtertype basic"))
-         (unless (%reserve-scanblocks)
-           (error 'rpc-error :code +rpc-invalid-parameter+
-                             :message "Scan already in progress, use action \"abort\" or \"status\""))
-         (unwind-protect
-              (let* ((chain-state (rpc-get-chain-state node))
-                     (block-store (rpc-get-block-store node))
-                     (network (rpc-get-network node))
-                     (tip (bl.store:current-height chain-state))
-                     (start (or (third params) 0))
-                     (stop (or (fourth params) tip))
-                     (options (sixth params))
-                     (fp-check (and (hash-table-p options)
-                                    (gethash "filter_false_positives" options)))
-                     (needles (%needle-scripts scanobjects network))
-                     (needle-list (%hash-table-keys needles))
-                     (relevant '())
-                     (scanned-to start)
-                     (aborted nil))
-                ;; Height bounds, matching Core (errors rather than clamping).
-                (unless (and (integerp start) (<= 0 start tip))
-                  (error 'rpc-error :code +rpc-misc-error+ :message "Invalid start_height"))
-                (unless (and (integerp stop) (<= start stop tip))
-                  (error 'rpc-error :code +rpc-misc-error+ :message "Invalid stop_height"))
-                (loop for height from start to stop do
-                  (when *scanblocks-abort* (setf aborted t) (return))
-                  (setf *scanblocks-current-height* height
-                        *scanblocks-progress*
-                        (if (> stop start)
-                            (floor (* 100 (- height start)) (- stop start))
-                            100))
-                  (let ((entry (bl.store:get-block-at-height chain-state height)))
-                    (when entry
-                      (let* ((hash (bl.store:block-index-entry-hash entry))
-                             (filter (bl.store:blockfilterindex-get-filter bfi hash)))
-                        (when filter
-                          (multiple-value-bind (k0 k1)
-                              (bl.store:block-filter-siphash-keys hash)
-                            (when (bl.store:gcs-filter-match-any
-                                   filter k0 k1 needle-list)
-                              (when (or (not fp-check)
-                                        (%block-matches-needles-p
-                                         (bl.store:get-block block-store hash)
-                                         hash needles))
-                                (push (hash-to-hex hash) relevant))))))))
-                  ;; Last fully-scanned height; on abort this is where we stopped.
-                  (setf scanned-to height))
-                `(("from_height" . ,start)
-                  ("to_height" . ,scanned-to)
-                  ("relevant_blocks" . ,(nreverse relevant))
-                  ("completed" . ,(json-bool (not aborted)))))
-           (%release-scanblocks))))
-      (t
-       (error 'rpc-error :code +rpc-invalid-parameter+
-                         :message (format nil "Invalid action '~A'" action))))))
+  (cond
+    ((equal action "status")
+     (bt:with-lock-held (*scanblocks-lock*)
+       (if *scanblocks-running*
+           `(("progress" . ,*scanblocks-progress*)
+             ("current_height" . ,*scanblocks-current-height*))
+           nil)))
+    ((equal action "abort")
+     (bt:with-lock-held (*scanblocks-lock*)
+       (json-bool
+        (when *scanblocks-running* (setf *scanblocks-abort* t) t))))
+    ((equal action "start")
+     (let ((bfi (rpc-get-blockfilterindex node)))
+       ;; Empty is an array, as in scantxoutset above; null/omitted is not.
+       (unless (%positional-array-p (second params))
+         (error 'rpc-error :code +rpc-misc-error+
+                           :message "scanobjects argument is required for the start action"))
+       (unless (string-equal filtertype "basic")
+         (error 'rpc-error :code +rpc-invalid-address-or-key+
+                           :message (format nil "Unknown filtertype ~A" filtertype)))
+       (unless (and bfi (bl.store:blockfilterindex-enabled bfi))
+         (error 'rpc-error :code +rpc-misc-error+
+                           :message "Index is not enabled for filtertype basic"))
+       (unless (%reserve-scanblocks)
+         (error 'rpc-error :code +rpc-invalid-parameter+
+                           :message "Scan already in progress, use action \"abort\" or \"status\""))
+       (unwind-protect
+            (let* ((chain-state (rpc-get-chain-state node))
+                   (block-store (rpc-get-block-store node))
+                   (network (rpc-get-network node))
+                   (tip (bl.store:current-height chain-state))
+                   (stop (or stop tip))
+                   (fp-check (and (hash-table-p options)
+                                  (gethash "filter_false_positives" options)))
+                   (needles (%needle-scripts scanobjects network))
+                   (needle-list (%hash-table-keys needles))
+                   (relevant '())
+                   (scanned-to start)
+                   (aborted nil))
+              ;; Height bounds, matching Core (errors rather than clamping).
+              (unless (and (integerp start) (<= 0 start tip))
+                (error 'rpc-error :code +rpc-misc-error+ :message "Invalid start_height"))
+              (unless (and (integerp stop) (<= start stop tip))
+                (error 'rpc-error :code +rpc-misc-error+ :message "Invalid stop_height"))
+              (loop for height from start to stop do
+                (when *scanblocks-abort* (setf aborted t) (return))
+                (setf *scanblocks-current-height* height
+                      *scanblocks-progress*
+                      (if (> stop start)
+                          (floor (* 100 (- height start)) (- stop start))
+                          100))
+                (let ((entry (bl.store:get-block-at-height chain-state height)))
+                  (when entry
+                    (let* ((hash (bl.store:block-index-entry-hash entry))
+                           (filter (bl.store:blockfilterindex-get-filter bfi hash)))
+                      (when filter
+                        (multiple-value-bind (k0 k1)
+                            (bl.store:block-filter-siphash-keys hash)
+                          (when (bl.store:gcs-filter-match-any
+                                 filter k0 k1 needle-list)
+                            (when (or (not fp-check)
+                                      (%block-matches-needles-p
+                                       (bl.store:get-block block-store hash)
+                                       hash needles))
+                              (push (hash-to-hex hash) relevant))))))))
+                ;; Last fully-scanned height; on abort this is where we stopped.
+                (setf scanned-to height))
+              `(("from_height" . ,start)
+                ("to_height" . ,scanned-to)
+                ("relevant_blocks" . ,(nreverse relevant))
+                ("completed" . ,(json-bool (not aborted)))))
+         (%release-scanblocks))))
+    (t
+     (error 'rpc-error :code +rpc-invalid-parameter+
+                       :message (format nil "Invalid action '~A'" action)))))
 
 (defun %block-matches-needles-p (block block-hash needles)
   "T if BLOCK genuinely touches any script in NEEDLES (false-positive check).
@@ -2308,14 +2275,11 @@ common fields (blockhash/height, or nil for mempool). Returns a list of entries.
                      acc))
     (nreverse acc)))
 
-(define-rpc "getdescriptoractivity" (node params)
+(define-rpc "getdescriptoractivity" (node ((blockhashes :array) (scanobjects :array) (include-mempool :bool-or t)))
   "Return spend/receive activity for descriptors within the given blocks (and
 optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
 [options]). Mirrors Bitcoin Core getdescriptoractivity."
-  (let* ((blockhashes (positional-array (first params)))
-         (scanobjects (positional-array (second params)))
-         (include-mempool (positional-bool-or (third params) t))
-         (network (rpc-get-network node))
+  (let* ((network (rpc-get-network node))
          (chain-state (rpc-get-chain-state node))
          (block-store (rpc-get-block-store node))
          (utxo-set (rpc-get-utxo-set node))
@@ -2562,42 +2526,40 @@ in their initial state."
               collect (cons (bl.val:vb-deployment-name d)
                             (%bip9-deployment chain-state entry d))))))
 
-(define-rpc "getblockfrompeer" (node params)
+(define-rpc "getblockfrompeer" (node (blockhash-hex peer-id))
   "Request block BLOCKHASH from the connected peer with id PEER-ID (Bitcoin Core
 getblockfrompeer). PARAMS: (blockhash peer_id). We must already have the header,
 the block must not already be downloaded, and the peer must be connected. Sends a
 getdata(MSG_WITNESS_BLOCK) to that peer; the block arrives through the normal
 block-processing path. Returns an empty object. The per-connection send lock makes
 the cross-thread send safe."
-  (let ((blockhash-hex (first params))
-        (peer-id (second params)))
-    (unless (and (stringp blockhash-hex) (valid-hex-hash-p blockhash-hex))
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "blockhash must be a hex string"))
-    (unless (integerp peer-id)
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "peer_id must be an integer"))
-    (let* ((hash (parse-hex-hash blockhash-hex))
-           (chain-state (rpc-get-chain-state node))
-           (block-store (rpc-get-block-store node))
-           (entry (bl.store:get-block-index-entry chain-state hash)))
-      (unless entry
-        (error 'rpc-error :code +rpc-misc-error+ :message "Block header missing"))
-      (when (and (bl:pruning-enabled-p)
-                 (> (bl.store:block-index-entry-height entry)
-                    (bl.store:current-height chain-state)))
-        (error 'rpc-error :code +rpc-misc-error+
-                          :message "In prune mode, only blocks that the node has already synced previously can be fetched from a peer"))
-      (when (and block-store (bl.store:block-exists-p block-store hash))
-        (error 'rpc-error :code +rpc-misc-error+ :message "Block already downloaded"))
-      (let ((peer (bt:with-recursive-lock-held ((bl:node-lock node))
-                    (find peer-id (bl:node-peers node)
-                          :key #'bl.net:peer-id))))
-        (unless peer
-          (error 'rpc-error :code +rpc-misc-error+ :message "Peer does not exist"))
-        (bl.net:send-message
-         peer
-         (bl.ser:make-getdata-message
-          (list (bl.ser:make-inv-vector
-                 :type bl.ser:+inv-type-witness-block+
-                 :hash hash)))))
-      ;; Core returns an empty object; an empty hash-table serializes as {}.
-      (make-hash-table :test 'equal))))
+  (unless (and (stringp blockhash-hex) (valid-hex-hash-p blockhash-hex))
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "blockhash must be a hex string"))
+  (unless (integerp peer-id)
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "peer_id must be an integer"))
+  (let* ((hash (parse-hex-hash blockhash-hex))
+         (chain-state (rpc-get-chain-state node))
+         (block-store (rpc-get-block-store node))
+         (entry (bl.store:get-block-index-entry chain-state hash)))
+    (unless entry
+      (error 'rpc-error :code +rpc-misc-error+ :message "Block header missing"))
+    (when (and (bl:pruning-enabled-p)
+               (> (bl.store:block-index-entry-height entry)
+                  (bl.store:current-height chain-state)))
+      (error 'rpc-error :code +rpc-misc-error+
+                        :message "In prune mode, only blocks that the node has already synced previously can be fetched from a peer"))
+    (when (and block-store (bl.store:block-exists-p block-store hash))
+      (error 'rpc-error :code +rpc-misc-error+ :message "Block already downloaded"))
+    (let ((peer (bt:with-recursive-lock-held ((bl:node-lock node))
+                  (find peer-id (bl:node-peers node)
+                        :key #'bl.net:peer-id))))
+      (unless peer
+        (error 'rpc-error :code +rpc-misc-error+ :message "Peer does not exist"))
+      (bl.net:send-message
+       peer
+       (bl.ser:make-getdata-message
+        (list (bl.ser:make-inv-vector
+               :type bl.ser:+inv-type-witness-block+
+               :hash hash)))))
+    ;; Core returns an empty object; an empty hash-table serializes as {}.
+    (make-hash-table :test 'equal)))

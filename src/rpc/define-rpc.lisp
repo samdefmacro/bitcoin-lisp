@@ -48,10 +48,50 @@ top level (Core rpc/server.cpp:408-415).")
   "Define the handler for the JSON-RPC method NAMES -- a string, or a list of
 strings for a method with aliases (\"echo\" and \"echojson\") -- as the
 function RPC-<first name> of NODE and PARAMS, and register it. BODY is a defun
-body: docstring, declarations, forms."
+body: docstring, declarations, forms.
+
+PARAMS is either a symbol, bound to the positional parameter list as the
+wire sent it, or a list of parameter specs, one per position in the
+method's argument order (Core RPCHelpMan), with the list itself still
+available as PARAMS. A spec is VAR, bound to the parameter as sent (NIL
+when omitted), or (VAR KIND ...) applying one of the positional coercions:
+  (VAR :bool)          POSITIONAL-BOOL -- null and explicit false are NIL
+  (VAR :bool-or D)     POSITIONAL-BOOL-OR -- null yields D
+  (VAR :array)         POSITIONAL-ARRAY -- the empty-array sentinel is NIL
+  (VAR :or D)          the parameter, or D when null
+  (VAR :integer-or D)  the parameter when it is an integer, else D
+  (VAR :string-or D)   the parameter when it is a string, else D
+A position the handler reads through PARAMS itself (a verbosity that
+%PARSE-VERBOSITY interprets) still gets a name, so the signature stays
+complete; the variables are IGNORABLE. So a handler's signature says what
+it takes instead of opening with
+(let ((a (first params)) (b (positional-bool (second params)))) ...)."
   (let* ((names (if (listp names) names (list names)))
-         (fn (intern (format nil "RPC-~A" (string-upcase (first names))))))
-    `(progn
-       (defun ,fn (,node ,params) ,@body)
-       ,@(loop for name in names collect `(%record-rpc ,name ',fn))
-       ',fn)))
+         (fn (intern (format nil "RPC-~A" (string-upcase (first names)))))
+         (specs (mapcar #'alexandria:ensure-list (and (listp params) params)))
+         (vars (mapcar #'first specs))
+         (params-var (if (listp params) 'params params)))
+    (flet ((coercion (spec)
+             (destructuring-bind (var &optional kind default) spec
+               (when kind
+                 (list var
+                       (ecase kind
+                         (:bool `(positional-bool ,var))
+                         (:bool-or `(positional-bool-or ,var ,default))
+                         (:array `(positional-array ,var))
+                         (:or `(or ,var ,default))
+                         (:integer-or `(if (integerp ,var) ,var ,default))
+                         (:string-or `(if (stringp ,var) ,var ,default))))))))
+      (multiple-value-bind (forms decls doc) (alexandria:parse-body body :documentation t)
+        `(progn
+           (defun ,fn (,node ,params-var)
+             ,@(when doc (list doc))
+             ,@decls
+             ,@(if specs
+                   `((destructuring-bind (&optional ,@vars &rest more) ,params-var
+                       (declare (ignore more) (ignorable ,@vars))
+                       (let* ,(remove nil (mapcar #'coercion specs))
+                         ,@forms)))
+                   forms))
+           ,@(loop for name in names collect `(%record-rpc ,name ',fn))
+           ',fn)))))
