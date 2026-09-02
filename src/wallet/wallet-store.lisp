@@ -267,9 +267,8 @@ chaincode(32) pubkey(33)."
                  do (setf r (logior (ash r 8) (aref bytes i)))
                  finally (return r))))
     (bl.crypto:make-ext-key
-     :version (if (eq network :mainnet)
-                  bl.crypto:+xpub-mainnet+
-                  bl.crypto:+xpub-testnet+)
+     :version (bl.chain:chain-params-ext-public-prefix
+               (bl.chain:find-chain-params network))
      :depth (aref bytes 0)
      :parent-fingerprint (be32 1)
      :child-number (be32 5)

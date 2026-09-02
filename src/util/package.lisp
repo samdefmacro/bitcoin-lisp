@@ -200,7 +200,17 @@ FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
    #:chain-params-assumevalid-hex
    #:chain-params-assumeutxo
    #:chain-params-prune-after-height
-   #:chain-params-bech32-hrp))
+   #:chain-params-bech32-hrp
+   #:chain-params-base58-pubkey-prefix
+   #:chain-params-base58-script-prefix
+   #:chain-params-base58-secret-prefix
+   #:chain-params-ext-public-prefix
+   #:chain-params-ext-secret-prefix
+   #:chain-params-bip44-coin-type
+   #:chain-params-of-ext-prefix
+   #:secret-prefix-known-p
+   #:ext-public-prefix-known-p
+   #:ext-secret-prefix-known-p))
 
 (defpackage #:bitcoin-lisp.context
   (:documentation "node-context (Core NodeContext): the references a message

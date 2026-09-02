@@ -713,7 +713,7 @@ sh(wpkh) 49h, wpkh 84h, tr 86h; coin 0h mainnet / 1h test chains; account 0h;
     (format nil "~A~A/~Ah/~Ah/0h/~A~A"
             prefix master-xpub-string
             (ecase type (:legacy 44) (:p2sh-segwit 49) (:bech32 84) (:bech32m 86))
-            (if (eq network :mainnet) 0 1)
+            (bl.chain:chain-params-bip44-coin-type (bl.chain:find-chain-params network))
             (if internal 1 0)
             suffix)))
 
@@ -927,7 +927,7 @@ GenerateRandomKey -> CExtKey::SetSeed over the 32 secret bytes)."
         (when (< 0 n bl.crypto:+secp256k1-order+)
           (return (bl.crypto:bip32-master-key
                    seed
-                   :network (if (eq network :mainnet) :mainnet :testnet))))))))
+                   :network network)))))))
 
 ;;; --- Best block records (Core WriteBestBlock, walletdb.cpp:180-191) ---
 

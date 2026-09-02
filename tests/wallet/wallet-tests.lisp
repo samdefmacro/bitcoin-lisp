@@ -135,7 +135,7 @@ byte for byte."
          (xpub (bl.crypto:bip32-neuter
                 (bl.crypto:bip32-master-key
                  (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)
-                 :network :testnet)))
+                 :network :testnet3)))
          (written '()))
     (unwind-protect
          (progn
@@ -255,7 +255,7 @@ cache)."
            (seed (make-array 32 :element-type '(unsigned-byte 8)
                                 :initial-contents (loop for i below 32
                                                         collect (+ 10 i))))
-           (master (bl.crypto:bip32-master-key seed :network :testnet))
+           (master (bl.crypto:bip32-master-key seed :network :testnet3))
            (xpub-str (bl.crypto:bip32-serialize
                       (bl.crypto:bip32-neuter master)))
            (xprv-str (bl.crypto:bip32-serialize master))
@@ -769,7 +769,7 @@ throws out of the whole call."
       (let* ((wif (bl.crypto:private-key-to-wif
                    (make-array 32 :element-type '(unsigned-byte 8)
                                   :initial-element 7)
-                   :network :testnet :compressed t))
+                   :network :testnet3 :compressed t))
              (results (bl.wallet::rpc-importdescriptors
                        node (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum
                                                      (format nil "wpkh(~A)" wif))
