@@ -23,13 +23,18 @@ directory calls MAKE-TEMP-DIRECTORY, which is already unique.")
            :data-directory wallet-dir :network :regtest :keypool-size keypool))
     node))
 
-(defmacro with-wallet-chain-node ((node suffix &key (keypool 5)) &body body)
+(defmacro with-wallet-chain-node ((node suffix &key (keypool 5) wallet) &body body)
   "Run BODY under regtest bindings with NODE bound to a make-wallet-chain-node and
-bl:*node* bound so the wallet chain hooks fire."
+bl:*node* bound so the wallet chain hooks fire. With WALLET, a wallet of that
+name is created first and *RPC-WALLET-NAME* is bound to NIL, so the wallet RPCs
+in BODY address it the way an unqualified /wallet/ request does."
   `(with-network (:regtest)
     (let* ((,node (make-wallet-chain-node ,suffix :keypool ,keypool))
-           (bl:*node* ,node))
-      (unwind-protect (progn ,@body)
+           (bl:*node* ,node)
+           ,@(when wallet '((bl.wallet::*rpc-wallet-name* nil))))
+      (unwind-protect
+           (progn ,@(when wallet `((bl.wallet::rpc-createwallet ,node (list ,wallet))))
+                  ,@body)
         (ignore-errors
          (bl.wallet:close-wallet-manager
           (bl:node-wallet-manager ,node)))))))

@@ -65,3 +65,46 @@ dependence on the global *random-state*, so runs are reproducible."
       (setf state (logxor state (ash state -7)))
       (setf state (ldb (byte 64 0) (logxor state (ash state 17))))
       (mod state n))))
+
+;;;; The IBD context
+
+(defmacro with-ibd-context (&body body)
+  "Run BODY with BL.NET:*IBD-CONTEXT* bound to a fresh IBD context -- the
+binding every headers-sync, block-download and reorg-through-IBD test opens
+with; nineteen of them wrote the LET themselves."
+  `(let ((bl.net:*ibd-context* (bl.net::make-ibd)))
+     ,@body))
+
+;;;; RPC errors
+
+(defmacro signals-rpc-error ((&key code message exact-message) &body body)
+  "Assert that BODY signals an RPC-ERROR carrying Core error CODE and/or a
+message containing MESSAGE (or equal to EXACT-MESSAGE); BODY returning
+normally is a failure. At least one check is required: the plain
+(signals bl.rpc:rpc-error ...) accepts any RPC error, which is how a test
+stays green when a type-check error preempts the check it was written for."
+  (unless (or code message exact-message)
+    (error "signals-rpc-error needs :code, :message or :exact-message -- a ~
+bare form is (signals bl.rpc:rpc-error ...)"))
+  (let ((e (gensym "E")))
+    `(handler-case (progn ,@body
+                          (fiveam:fail "expected an rpc-error~@[ with code ~D~]~@[ mentioning ~S~], got a normal return"
+                                       ,code ,(or message exact-message)))
+       (bl.rpc:rpc-error (,e)
+         ,@(when code
+             `((fiveam:is (= ,code (bl.rpc:rpc-error-code ,e))
+                          "expected rpc-error code ~D, got ~D (~A)"
+                          ,code (bl.rpc:rpc-error-code ,e) (bl.rpc:rpc-error-message ,e))))
+         ,@(when message
+             `((fiveam:is (search ,message (bl.rpc:rpc-error-message ,e))
+                          "expected the rpc-error message to mention ~S, got ~S"
+                          ,message (bl.rpc:rpc-error-message ,e))))
+         ,@(when exact-message
+             `((fiveam:is (string= ,exact-message (bl.rpc:rpc-error-message ,e))
+                          "expected the rpc-error message ~S, got ~S"
+                          ,exact-message (bl.rpc:rpc-error-message ,e))))))))
+
+(defun rpc-error-code-of (thunk)
+  "The rpc-error code THUNK signals, or NIL if it returns normally."
+  (handler-case (progn (funcall thunk) nil)
+    (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e))))

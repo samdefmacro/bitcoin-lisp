@@ -654,14 +654,10 @@ regtest node, the underlying scriptPubKeys must match exactly)."
 (test desc-ranged-rejected-where-core-rejects
   "parse-output-descriptor (generatetodescriptor / generateblock path) keeps
 Core's 'Ranged descriptor not accepted' behavior."
-  (handler-case
-      (progn (bl.rpc::parse-output-descriptor
-              "wpkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/*)"
-              :testnet3)
-             (fail "ranged descriptor accepted"))
-    (bl.rpc:rpc-error (e)
-      (is (string= "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?"
-                   (bl.rpc:rpc-error-message e)))))
+  (signals-rpc-error (:exact-message "Ranged descriptor not accepted. Maybe pass through deriveaddresses first?")
+    (bl.rpc::parse-output-descriptor
+     "wpkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/*)"
+     :testnet3))
   ;; Unranged xpub descriptors now expand fine on this path.
   (let ((pairs (bl.rpc::parse-output-descriptor
                 "wpkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/1/0)"

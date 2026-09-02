@@ -166,15 +166,9 @@ empty array, so it earns the COUNT error, not a type error
   (let ((node (make-test-node))
         (txid "0000000000000000000000000000000000000000000000000000000000000001"))
     ;; -3, and it names the type it actually got.
-    (handler-case
-        (progn (bl.rpc::rpc-getrawtransaction
-                node (list txid bl.rpc::+json-empty-array+))
-               (fail "an empty array verbosity raised nothing"))
-      (bl.rpc:rpc-error (e)
-        (is (= -3 (bl.rpc:rpc-error-code e)))
-        (is (search "not of expected type number"
-                    (bl.rpc:rpc-error-message e))
-            "message was: ~A" (bl.rpc:rpc-error-message e))))
+    (signals-rpc-error (:code -3 :message "not of expected type number")
+      (bl.rpc::rpc-getrawtransaction
+       node (list txid bl.rpc::+json-empty-array+)))
     ;; Null still means the default verbosity, so it gets past the check and
     ;; fails on the transaction being absent instead.
     (handler-case
@@ -184,20 +178,12 @@ empty array, so it earns the COUNT error, not a type error
         (is (/= -3 (bl.rpc:rpc-error-code e))
             "null verbosity must not be read as a type error")))
     ;; The other direction: empty is an array, so the count error.
-    (handler-case
-        (progn (bl.rpc::rpc-testmempoolaccept
-                node (list bl.rpc::+json-empty-array+))
-               (fail "expected the count error"))
-      (bl.rpc:rpc-error (e)
-        (is (= -8 (bl.rpc:rpc-error-code e)))
-        (is (search "Array must contain between"
-                    (bl.rpc:rpc-error-message e)))))
+    (signals-rpc-error (:code -8 :message "Array must contain between")
+      (bl.rpc::rpc-testmempoolaccept
+       node (list bl.rpc::+json-empty-array+)))
     ;; And null is not an array at all.
-    (handler-case
-        (progn (bl.rpc::rpc-testmempoolaccept node (list nil))
-               (fail "expected a type error"))
-      (bl.rpc:rpc-error (e)
-        (is (= -3 (bl.rpc:rpc-error-code e)))))))
+    (signals-rpc-error (:code -3)
+      (bl.rpc::rpc-testmempoolaccept node (list nil)))))
 
 (test getrawtransaction-not-found-speaks-cores-sentence
   "Core selects one of four not-found messages and appends the same sentence to
@@ -1085,11 +1071,8 @@ RPC_DESERIALIZATION_ERROR (-22), matching Core."
     (signals bl.rpc:rpc-error
       (bl.rpc::rpc-sendrawtransaction node '("")))
     ;; Invalid hex -> deserialization error code -22
-    (handler-case
-        (progn (bl.rpc::rpc-sendrawtransaction node '("not-valid-hex"))
-               (fail "expected rpc-error"))
-      (bl.rpc:rpc-error (e)
-        (is (= -22 (bl.rpc:rpc-error-code e)))))))
+    (signals-rpc-error (:code -22)
+      (bl.rpc::rpc-sendrawtransaction node '("not-valid-hex")))))
 
 (test rpc-sendrawtransaction-rejection-speaks-core
   "The rejection carries Core's reject reason and Core's split of codes.
@@ -1104,15 +1087,8 @@ code, carrying an uppercased Lisp keyword no client can match on."
          (tx (make-mempool-test-tx :input-id 211))
          (hex (bl.crypto:bytes-to-hex
                (bl.ser:serialize-transaction tx))))
-    (handler-case
-        (progn (bl.rpc::rpc-sendrawtransaction node (list hex))
-               (fail "expected rpc-error"))
-      (bl.rpc:rpc-error (e)
-        ;; Note this surface says bad-txns-inputs-missingorspent, NOT
-        ;; testmempoolaccept's "missing-inputs".
-        (is (= -25 (bl.rpc:rpc-error-code e)))
-        (is (string= "bad-txns-inputs-missingorspent"
-                     (bl.rpc:rpc-error-message e)))))))
+    (signals-rpc-error (:code -25 :exact-message "bad-txns-inputs-missingorspent")
+      (bl.rpc::rpc-sendrawtransaction node (list hex)))))
 
 ;;; --- sendrawtransaction broadcast (unbroadcast set + peer announcement) ---
 ;;;
@@ -2837,13 +2813,13 @@ reading the output."
                 "the short horizon answered for a target it does not track"))
     ;; Range and type checks.
     (is (= bl.rpc:+rpc-invalid-parameter+
-           (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '(0))))))
+           (rpc-error-code-of (lambda () (bl.rpc::rpc-estimaterawfee nil '(0))))))
     (is (= bl.rpc:+rpc-invalid-parameter+
-           (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '(2 1.5))))))
+           (rpc-error-code-of (lambda () (bl.rpc::rpc-estimaterawfee nil '(2 1.5))))))
     (is (= bl.rpc:+rpc-invalid-parameter+
-           (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '(2 -0.1))))))
+           (rpc-error-code-of (lambda () (bl.rpc::rpc-estimaterawfee nil '(2 -0.1))))))
     (is (= bl.rpc:+rpc-type-error+
-           (%rpc-error-code (lambda () (bl.rpc::rpc-estimaterawfee nil '("2"))))))))
+           (rpc-error-code-of (lambda () (bl.rpc::rpc-estimaterawfee nil '("2"))))))))
 
 (test addconnection-opens-the-named-connection-type
   "addconnection (Core rpc/net.cpp). The functional framework uses it to attach
@@ -2891,7 +2867,7 @@ just that something connected."
       ;; false for them, because addconnection exists for the AUTOMATIC kinds.
       (dolist (bad '("manual" "inbound" "" "outbound" "block-relay"))
         (is (= bl.rpc:+rpc-invalid-parameter+
-               (%rpc-error-code
+               (rpc-error-code-of
                 (lambda () (bl.rpc::rpc-addconnection
                             node (list "1.2.3.4:1" bad nil))))))))
     ;; v2transport=true without -v2transport is refused rather than silently
@@ -2917,7 +2893,7 @@ just that something connected."
            (node (bl:make-node :network :regtest :max-peers 0)))
       (setf bl:*pending-test-connections* '())
       (is (= bl.rpc::+rpc-client-node-capacity-reached+
-             (%rpc-error-code
+             (rpc-error-code-of
               (lambda () (bl.rpc::rpc-addconnection
                           node '("1.2.3.4:1" "outbound-full-relay" nil))))))
       (dolist (uncapped '("addr-fetch" "feeler"))
@@ -5305,11 +5281,8 @@ address, and a malformed signature all fail. The signature is deterministic."
       (is (eq 'yason:false (bl.rpc::rpc-verifymessage node (list addr2 sig msg)))))
     ;; Malformed base64 is an ERROR in Core (-5 "Malformed base64 encoding"),
     ;; not a false result (rpc/signmessage.cpp ERR_MALFORMED_SIGNATURE).
-    (handler-case
-        (progn (bl.rpc::rpc-verifymessage node (list addr "not-a-valid-sig" msg))
-               (fail "malformed base64 should signal"))
-      (bl.rpc:rpc-error (e)
-        (is (= -5 (bl.rpc:rpc-error-code e)))))))
+    (signals-rpc-error (:code -5)
+      (bl.rpc::rpc-verifymessage node (list addr "not-a-valid-sig" msg)))))
 
 (test rpc-signrawtransactionwithkey-p2pkh-p2wpkh
   "signrawtransactionwithkey signs a P2WPKH input (input 0) and a P2PKH input

@@ -2057,7 +2057,7 @@ the retry, not eager arrival-time activation, is what performs the reorg."
                     (bl.store:add-block-index-entry csa e)
                     (setf prev e))))
        (bl.store:store-block storea (fifth h-blocks))
-       (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
+       (with-ibd-context
          (let ((set (bl.net::ibd-context-reorg-candidates
                      bl.net:*ibd-context*)))
            ;; Both are candidates; H5 outranks G3 by work.
@@ -2119,7 +2119,7 @@ same deterministic fork failure as reorg-rejects-fork-carrying-invalid-block."
               :hash b2-hash :height 2 :prev-entry b1-entry
               :chain-work (+ a1-work 1000) :status :header-valid
               :header (bl.ser:bitcoin-block-header b2-block)))
-         (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
+         (with-ibd-context
            (let ((set (bl.net::ibd-context-reorg-candidates
                        bl.net:*ibd-context*))
                  (rej (bl.net::ibd-context-rejected-reorg-candidates
@@ -2180,7 +2180,7 @@ rejected set. The active tip is untouched until the bodies arrive."
                                  (bl.ser:bitcoin-block-header blk)))
                               b-blocks))
             (b4-hash (fourth b-hashes)))
-       (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
+       (with-ibd-context
          (let ((ctx bl.net:*ibd-context*))
            ;; Feed B4 (height 4 = tip+1). It outweighs A3, but B1-B3 bodies are
            ;; missing -> perform-reorg refuses -> :reorg-refused + missing list.
@@ -2246,7 +2246,7 @@ re-fetched; an unsolicited stripped copy does not."
             :hash above-uns-hash :height 6 :prev-entry a2-entry :chain-work 9000
             :status :header-valid
             :header (bl.ser:bitcoin-block-header above-uns)))
-       (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
+       (with-ibd-context
          (let ((ctx bl.net:*ibd-context*))
            ;; sanity: all four copies really are witness-stripped.
            (dolist (blk (list below tip1 above-req above-uns))
@@ -2665,7 +2665,7 @@ queued for download; a header on a valid parent is still admitted normally."
           (v-header (bl.ser:bitcoin-block-header
                      (make-reorg-test-block genesis-hash v-hash 1))))
      (bl.store:add-block-index-entry cs x-entry)
-     (let ((bl.net:*ibd-context* (bl.net::make-ibd)))
+     (with-ibd-context
        (let ((ctx bl.net:*ibd-context*))
          ;; Feed Y (FAILED_CHILD) and V (valid) together. Only V counts as "added".
          (let ((added (bl.net:process-headers (list y-header v-header) cs)))
