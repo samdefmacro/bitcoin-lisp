@@ -110,10 +110,9 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           ("fullrbf" . t)
           ("permitbaremultisig" . ,(json-bool bl:*permit-bare-multisig*))))))
 
-(define-rpc "getrawmempool" (node params)
+(define-rpc "getrawmempool" (node ((verbose :bool)))
   "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t)."
-  (let ((verbose (positional-bool (first params)))
-        (mempool (rpc-get-mempool node)))
+  (let ((mempool (rpc-get-mempool node)))
     ;; Node lock: iterating entries (and, verbose, walking each entry's
     ;; ancestors/descendants/chunk) must not race the sync thread's
     ;; add/evict/reorg mutations (Core getrawmempool takes pool.cs).
@@ -326,7 +325,7 @@ weight; ours is BIP141 virtual bytes (~ Core / 4)."
             (bl.mp:block-builder-finish builder)))))
     (nreverse points)))
 
-(define-rpc "gettxspendingprevout" (node params)
+(define-rpc "gettxspendingprevout" (node ((outpoints :array) options))
   "For each {txid, vout} outpoint in the array PARAM, report the transaction
 spending it, if any (Bitcoin Core gettxspendingprevout). Returns an array of
 {txid, vout, spendingtxid?, spendingtx?}.
@@ -341,9 +340,7 @@ OPTIONS mirror Core (rpc/mempool.cpp:912-916):
                       false when it is — so the answer improves by enabling the
                       index rather than by changing the call.
   return_spending_tx  default false; adds the full spending transaction as hex."
-  (let* ((outpoints (positional-array (first params)))
-         (options (second params))
-         (mempool (rpc-get-mempool node))
+  (let* ((mempool (rpc-get-mempool node))
          (index (bl:node-txospenderindex node))
          (index-live (and index (bl.store:txospender-index-enabled index)))
          (mempool-only (if (and (hash-table-p options)
@@ -501,21 +498,19 @@ reaches the mempool."
           do (error 'rpc-error :code +rpc-verify-error+
                                :message "Unspendable output exceeds maximum configured by user (maxburnamount)")))
 
-(define-rpc "testmempoolaccept" (node params)
+(define-rpc "testmempoolaccept" (node ((txs :array)))
   "Dry-run mempool acceptance for one or more raw transactions (hex). Returns an
 array of {txid, wtxid, allowed, reject-reason?, vsize, fees{base}} without adding
 anything to the mempool. Each tx is checked independently against current state
 (package interdependence is not modeled — that needs submitpackage)."
-  (let ((txs (positional-array (first params)))
-        (txs-arg (first params))
-        (utxo-set (rpc-get-utxo-set node))
+  (let ((utxo-set (rpc-get-utxo-set node))
         (mempool (rpc-get-mempool node))
         (chain-state (rpc-get-chain-state node)))
     ;; An empty array IS an array, and gets the count error below rather than
     ;; the type error — which is what mempool_accept.py:100 asserts. NIL here
     ;; now means null/omitted only, so it is a type error as Core has it.
-    (unless (%positional-array-p txs-arg)
-      (%json-type-error txs-arg "array"))
+    (unless (%positional-array-p (first params))
+      (%json-type-error (first params) "array"))
     ;; Core caps the batch at package size (rpc/mempool.cpp:322).
     (when (or (null txs) (> (length txs) bl.val:+max-package-count+))
       (error 'rpc-error :code +rpc-invalid-parameter+
@@ -617,17 +612,14 @@ anything to the mempool. Each tx is checked independently against current state
                                    (bl.val:tx-reject-reason-string error))))))))
              results)))))))
 
-(define-rpc "sendrawtransaction" (node params)
+(define-rpc "sendrawtransaction" (node (hex-str))
   "Submit a raw transaction to the mempool AND broadcast it: on acceptance the
 txid joins the mempool's unbroadcast set and an announcement is queued to every
 relay-capable peer (Core sendrawtransaction -> BroadcastTransaction,
 node/transaction.cpp:100-135: AddUnbroadcastTx + InitiateTxBroadcastToAll). A
 tx already in the mempool is not resubmitted but IS re-announced, so the RPC
 doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
-  (let ((hex-str (first params))
-        ;; Core parses maxburnamount BEFORE decoding the hex (rpc/mempool.cpp:92),
-        ;; so a malformed rail is reported ahead of a malformed transaction.
-        (max-burn (%parse-max-burn-amount params 2)))
+  (let ((max-burn (%parse-max-burn-amount params 2)))
     (unless (and (stringp hex-str) (> (length hex-str) 0))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid transaction hex"))
@@ -749,7 +741,7 @@ per-wtxid object. Status drives which fields are present."
                                      (bl.val:tx-reject-reason-string e)
                                      "rejected"))))))))))
 
-(define-rpc "submitpackage" (node params)
+(define-rpc "submitpackage" (node ((hexes :array)))
   "Submit a package of raw transactions (a child with its unconfirmed parents)
 to the mempool. PARAMS: (package-hex-array [maxfeerate] [maxburnamount]). The
 array is topologically sorted with the child last. Mirrors Bitcoin Core's
@@ -757,8 +749,7 @@ submitpackage: returns {package_msg, tx-results{wtxid -> {...}},
 replaced-transactions}. maxfeerate caps each member's modified feerate and
 aborts the whole package on the first breach; maxburnamount caps the value any
 member may send to a script that can never spend it."
-  (let ((hexes (positional-array (first params)))
-        (utxo-set (rpc-get-utxo-set node))
+  (let ((utxo-set (rpc-get-utxo-set node))
         (mempool (rpc-get-mempool node))
         (chain-state (rpc-get-chain-state node)))
     (unless (and (listp hexes) hexes)
@@ -840,7 +831,7 @@ The same dump runs automatically on graceful shutdown."
       (bl.mp:save-mempool-file (rpc-get-mempool node) path))
     `(("filename" . ,(namestring path)))))
 
-(define-rpc "importmempool" (node params)
+(define-rpc "importmempool" (node (filepath options))
   "Load transactions from a mempool.dat-format file at FILEPATH through the normal
 acceptance path (Bitcoin Core importmempool). PARAMS: (filepath [options]).
 Entries are validated against the current UTXO set; their prioritisation deltas
@@ -859,16 +850,14 @@ and a foreign timestamp would misdate the entry.
 told apart — and a nested JSON false folds to NIL exactly like an absent key
 (%NORMALIZE-RPC-PARAMS, rpc/server.lisp). GETHASH's second value is the only thing that
 separates them."
-  (let ((filepath (first params))
-        (options (second params)))
-    (unless (and (stringp filepath) (plusp (length filepath)))
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "filepath must be a string"))
-    (flet ((opt (name default)
-             (if (hash-table-p options)
-                 (multiple-value-bind (v present) (gethash name options)
-                   (if present (and v t) default))
-                 default)))
-    (let ((path (probe-file filepath))
+  (unless (and (stringp filepath) (plusp (length filepath)))
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "filepath must be a string"))
+  (flet ((opt (name default)
+           (if (hash-table-p options)
+               (multiple-value-bind (v present) (gethash name options)
+                 (if present (and v t) default))
+               default)))
+  (let ((path (probe-file filepath))
           (apply-unbroadcast (opt "apply_unbroadcast_set" nil))
           (apply-fee-delta (opt "apply_fee_delta_priority" nil))
           (use-current-time (opt "use_current_time" t)))
@@ -887,5 +876,5 @@ separates them."
                  :use-current-time use-current-time))
         (error 'rpc-error :code +rpc-misc-error+
                           :message "Unable to import mempool file (unreadable or corrupt)"))))
-    ;; Core returns an empty object; an empty hash-table serializes as {}.
-    (make-hash-table :test 'equal)))
+  ;; Core returns an empty object; an empty hash-table serializes as {}.
+  (make-hash-table :test 'equal))

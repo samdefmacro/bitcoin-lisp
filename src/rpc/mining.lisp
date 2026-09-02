@@ -514,94 +514,92 @@ agree on a tip, timed out on a node that was working perfectly in isolation."
                 (bl:log-warn "Announcing submitted block failed: ~A" e))))))
       (values-list result))))
 
-(define-rpc "submitblock" (node params)
+(define-rpc "submitblock" (node (hex))
   "Submit a mined block (Bitcoin Core submitblock). PARAMS: (block-hex). Returns
 JSON null on acceptance, \"duplicate\" if already known, \"duplicate-invalid\"
 if already known to be invalid, \"inconclusive\" for a valid block that was
 stored without becoming the tip, or a BIP22 reject reason string. Routes through the same activate-block consensus path as network blocks."
-  (let ((hex (first params)))
-    (unless (and (stringp hex) (plusp (length hex)))
-      ;; Core: RPC_DESERIALIZATION_ERROR (-22) "Block decode failed".
-      (error 'rpc-error :code +rpc-deserialization-error+
-                        :message "Block decode failed"))
-    (let ((block (handler-case
-                     (let ((bytes (bl.crypto:hex-to-bytes hex)))
-                       (flexi-streams:with-input-from-sequence (s bytes)
-                         (bl.ser:read-bitcoin-block s)))
-                   (error ()
-                     (error 'rpc-error :code +rpc-deserialization-error+
-                                       :message "Block decode failed"))))
-          (chain-state (rpc-get-chain-state node)))
-      ;; Node lock: the duplicate probe and the activation must see one
-      ;; chain state (Core submitblock reads the index and calls
-      ;; ProcessNewBlock under cs_main); the lock is recursive, so the
-      ;; nested activate-submitted-block lock is free.
-      (with-node-lock (node)
-       (let* ((hash (bl.ser:block-header-hash
-                    (bl.ser:bitcoin-block-header block)))
-             (entry (bl.store:get-block-index-entry chain-state hash)))
-        (when entry
-          ;; A known-invalid block short-circuits (Core AcceptBlockHeader,
-          ;; validation.cpp:4231-4235 — BLOCK_FAILED_VALID → "duplicate-invalid").
-          (when (eq (bl.store:block-index-entry-status entry) :invalid)
-            (return-from rpc-submitblock "duplicate-invalid"))
-          ;; "duplicate" only when we already HAVE the block data (Core
-          ;; AcceptBlock fAlreadyHave = BLOCK_HAVE_DATA, validation.cpp:4351;
-          ;; submitblock's accepted && !new_block, rpc/mining.cpp:1091-1093).
-          ;; A header-only index entry (headers-sync / submitheader) must
-          ;; proceed to full processing or the mined block is silently lost.
-          (let ((store (rpc-get-block-store node)))
-            (when (and store (bl.store:block-exists-p store hash))
-              (return-from rpc-submitblock "duplicate"))))
-        (bl.val:update-uncommitted-block-structures block chain-state)
-        (multiple-value-bind (ok reason) (activate-submitted-block node block)
-          (cond
-            (ok nil)                        ; accepted → JSON null (BIP22 success)
-            ;; A valid block stored on a side chain never reaches Core's
-            ;; submitblock_StateCatcher (BlockChecked fires only on a connect
-            ;; attempt), so Core reports it "inconclusive" (rpc/mining.cpp:
-            ;; 1091-1095): neither rejected nor the new tip.
-            ((eq reason :weaker-chain) "inconclusive")
-            (t (string-downcase (symbol-name reason))))))))))
+  (unless (and (stringp hex) (plusp (length hex)))
+    ;; Core: RPC_DESERIALIZATION_ERROR (-22) "Block decode failed".
+    (error 'rpc-error :code +rpc-deserialization-error+
+                      :message "Block decode failed"))
+  (let ((block (handler-case
+                   (let ((bytes (bl.crypto:hex-to-bytes hex)))
+                     (flexi-streams:with-input-from-sequence (s bytes)
+                       (bl.ser:read-bitcoin-block s)))
+                 (error ()
+                   (error 'rpc-error :code +rpc-deserialization-error+
+                                     :message "Block decode failed"))))
+        (chain-state (rpc-get-chain-state node)))
+    ;; Node lock: the duplicate probe and the activation must see one
+    ;; chain state (Core submitblock reads the index and calls
+    ;; ProcessNewBlock under cs_main); the lock is recursive, so the
+    ;; nested activate-submitted-block lock is free.
+    (with-node-lock (node)
+     (let* ((hash (bl.ser:block-header-hash
+                  (bl.ser:bitcoin-block-header block)))
+           (entry (bl.store:get-block-index-entry chain-state hash)))
+      (when entry
+        ;; A known-invalid block short-circuits (Core AcceptBlockHeader,
+        ;; validation.cpp:4231-4235 — BLOCK_FAILED_VALID → "duplicate-invalid").
+        (when (eq (bl.store:block-index-entry-status entry) :invalid)
+          (return-from rpc-submitblock "duplicate-invalid"))
+        ;; "duplicate" only when we already HAVE the block data (Core
+        ;; AcceptBlock fAlreadyHave = BLOCK_HAVE_DATA, validation.cpp:4351;
+        ;; submitblock's accepted && !new_block, rpc/mining.cpp:1091-1093).
+        ;; A header-only index entry (headers-sync / submitheader) must
+        ;; proceed to full processing or the mined block is silently lost.
+        (let ((store (rpc-get-block-store node)))
+          (when (and store (bl.store:block-exists-p store hash))
+            (return-from rpc-submitblock "duplicate"))))
+      (bl.val:update-uncommitted-block-structures block chain-state)
+      (multiple-value-bind (ok reason) (activate-submitted-block node block)
+        (cond
+          (ok nil)                        ; accepted → JSON null (BIP22 success)
+          ;; A valid block stored on a side chain never reaches Core's
+          ;; submitblock_StateCatcher (BlockChecked fires only on a connect
+          ;; attempt), so Core reports it "inconclusive" (rpc/mining.cpp:
+          ;; 1091-1095): neither rejected nor the new tip.
+          ((eq reason :weaker-chain) "inconclusive")
+          (t (string-downcase (symbol-name reason)))))))))
 
-(define-rpc "submitheader" (node params)
+(define-rpc "submitheader" (node (hex))
   "Validate and add a block header to the header index (Bitcoin Core
 submitheader). PARAMS: (hexdata) — an 80-byte serialized header. The previous
 header must already be known. Returns null on success (including an already-known
 header); errors if the parent is missing or the header fails validation."
-  (let ((hex (first params)))
-    (unless (and (stringp hex) (plusp (length hex)))
-      (error 'rpc-error :code +rpc-deserialization-error+ :message "Block header decode failed"))
-    (let ((header (handler-case
-                      (let ((bytes (bl.crypto:hex-to-bytes hex)))
-                        (flexi-streams:with-input-from-sequence (s bytes)
-                          (bl.ser:read-block-header s)))
-                    (error ()
-                      (error 'rpc-error :code +rpc-deserialization-error+
-                                        :message "Block header decode failed"))))
-          (chain-state (rpc-get-chain-state node)))
-      ;; Node lock: process-headers mutates the header index the sync
-      ;; thread's headers-sync also writes (Core ProcessNewBlockHeaders
-      ;; takes cs_main).
-      (with-node-lock (node)
-       (let ((hash (bl.ser:block-header-hash header))
-            (prev (bl.ser:block-header-prev-block header)))
-        ;; Already known → success (Core returns null).
-        (when (bl.store:get-block-index-entry chain-state hash)
-          (return-from rpc-submitheader nil))
-        ;; Parent must be present first (Core's LookupBlockIndex check).
-        (unless (bl.store:get-block-index-entry chain-state prev)
+  (unless (and (stringp hex) (plusp (length hex)))
+    (error 'rpc-error :code +rpc-deserialization-error+ :message "Block header decode failed"))
+  (let ((header (handler-case
+                    (let ((bytes (bl.crypto:hex-to-bytes hex)))
+                      (flexi-streams:with-input-from-sequence (s bytes)
+                        (bl.ser:read-block-header s)))
+                  (error ()
+                    (error 'rpc-error :code +rpc-deserialization-error+
+                                      :message "Block header decode failed"))))
+        (chain-state (rpc-get-chain-state node)))
+    ;; Node lock: process-headers mutates the header index the sync
+    ;; thread's headers-sync also writes (Core ProcessNewBlockHeaders
+    ;; takes cs_main).
+    (with-node-lock (node)
+     (let ((hash (bl.ser:block-header-hash header))
+          (prev (bl.ser:block-header-prev-block header)))
+      ;; Already known → success (Core returns null).
+      (when (bl.store:get-block-index-entry chain-state hash)
+        (return-from rpc-submitheader nil))
+      ;; Parent must be present first (Core's LookupBlockIndex check).
+      (unless (bl.store:get-block-index-entry chain-state prev)
+        (error 'rpc-error :code +rpc-verify-error+
+                          :message (format nil "Must submit previous header (~A) first"
+                                           (hash-to-hex prev))))
+      ;; Validate (PoW/MTP/difficulty) then add to the index.
+      (multiple-value-bind (valid err)
+          (bl.net:validate-header-chain (list header) chain-state)
+        (unless valid
           (error 'rpc-error :code +rpc-verify-error+
-                            :message (format nil "Must submit previous header (~A) first"
-                                             (hash-to-hex prev))))
-        ;; Validate (PoW/MTP/difficulty) then add to the index.
-        (multiple-value-bind (valid err)
-            (bl.net:validate-header-chain (list header) chain-state)
-          (unless valid
-            (error 'rpc-error :code +rpc-verify-error+
-                              :message (or err "header validation failed")))
-          (bl.net:process-headers valid chain-state))
-        nil)))))
+                            :message (or err "header validation failed")))
+        (bl.net:process-headers valid chain-state))
+      nil))))
 
 (defun %generate-to-script-pubkey (node script-pubkey nblocks maxtries)
   "Mine NBLOCKS blocks whose coinbase pays SCRIPT-PUBKEY, activating each through
@@ -630,14 +628,11 @@ by generatetoaddress and generatetodescriptor."
                               (bl.ser:bitcoin-block-header block)))
                 hashes))))))
 
-(define-rpc "generatetoaddress" (node params)
+(define-rpc "generatetoaddress" (node (nblocks address (maxtries :or 1000000)))
   "Mine NBLOCKS blocks paying to ADDRESS and add them to the chain (Bitcoin Core
 generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
 [maxtries]). Returns an array of the mined block hashes (hex)."
-  (let ((nblocks (first params))
-        (address (second params))
-        (maxtries (or (third params) 1000000))
-        (network (bl:node-network node)))
+  (let ((network (bl:node-network node)))
     (unless (and (integerp nblocks) (plusp nblocks))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "nblocks must be a positive integer"))
@@ -651,15 +646,12 @@ generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
                           :message "Error: Invalid address"))
       (%generate-to-script-pubkey node script-pubkey nblocks maxtries))))
 
-(define-rpc "generatetodescriptor" (node params)
+(define-rpc "generatetodescriptor" (node (nblocks descriptor (maxtries :or 1000000)))
   "Mine NUM-BLOCKS blocks whose coinbase pays the scriptPubKey of DESCRIPTOR
 (Bitcoin Core generatetodescriptor; CPU mining, intended for regtest). PARAMS:
 (num_blocks descriptor [maxtries]). The descriptor must expand to a single
 script. Returns an array of the mined block hashes (hex)."
-  (let ((nblocks (first params))
-        (descriptor (second params))
-        (maxtries (or (third params) 1000000))
-        (network (bl:node-network node)))
+  (let ((network (bl:node-network node)))
     (unless (and (integerp nblocks) (plusp nblocks))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "num_blocks must be a positive integer"))
@@ -716,7 +708,7 @@ zero and whose remaining transactions are TXS (Core GenerateCoinbaseCommitment).
     (bl.mining:build-witness-commitment-script
      (bl.crypto:hash256 combined))))
 
-(define-rpc "generateblock" (node params)
+(define-rpc "generateblock" (node (output txs-arg (submit :bool-or t)))
   "Mine a single block containing exactly the given transactions (Bitcoin Core
 generateblock; CPU mining, intended for regtest). PARAMS: (output [tx,...]
 [submit]). OUTPUT is an address or descriptor for the coinbase, which is paid the
@@ -726,10 +718,7 @@ TestBlockValidity BEFORE mining, exactly like Core (rpc/mining.cpp:389-393) —
 so submit=false hex is consensus-valid too, not just decodable. When SUBMIT
 (default true) the block is then activated through the normal consensus path
 and {hash} is returned; otherwise {hash, hex}."
-  (let ((output (first params))
-        (txs-arg (second params))
-        (submit (positional-bool-or (third params) t))
-        (network (bl:node-network node)))
+  (let ((network (bl:node-network node)))
     (unless (stringp output)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "output must be a string"))
     (unless (listp txs-arg)
@@ -830,15 +819,12 @@ absence."
 
 ;;; --- Transaction prioritisation (Bitcoin Core prioritisetransaction) ---
 
-(define-rpc "prioritisetransaction" (node params)
+(define-rpc "prioritisetransaction" (node (txid-hex dummy fee-delta))
   "Adjust TXID's effective fee for mining selection by FEE-DELTA satoshis
 (Bitcoin Core prioritisetransaction). PARAMS: (txid [dummy] fee-delta) —
 dummy must be 0 or null (legacy priority is gone). The delta also counts for
 mempool acceptance and RBF scoring; the fee is not actually paid. Returns T."
-  (let* ((txid-hex (first params))
-         (dummy (second params))
-         (fee-delta (third params))
-         (txid (and (stringp txid-hex) (parse-hex-hash txid-hex))))
+  (let* ((txid (and (stringp txid-hex) (parse-hex-hash txid-hex))))
     (unless txid
       ;; Core ParseHashV: parse/format failures are -8, util.cpp:117-125.
       (error 'rpc-error :code +rpc-invalid-parameter+
