@@ -398,15 +398,11 @@ plain sh(); >3 rejected bare; >20 rejected everywhere."
                        (concatenate 'string pub "#tjg09x5")
                        "Expected 8 character checksum, not 7 characters")
     ;; Error in payload (2 -> 3) detected
-    (handler-case
-        (progn (%desc-parse (concatenate 'string
-                                         "sh(multi(3"
-                                         (subseq prv 10)
-                                         "#ggrsrxfy"))
-               (fail "bad payload accepted"))
-      (bl.rpc:rpc-error (e)
-        (is (alexandria:starts-with-subseq "Provided checksum 'ggrsrxfy' does not match computed checksum"
-                                           (bl.rpc:rpc-error-message e)))))
+    (signals-rpc-error (:message "Provided checksum 'ggrsrxfy' does not match computed checksum")
+      (%desc-parse (concatenate 'string
+                                "sh(multi(3"
+                                (subseq prv 10)
+                                "#ggrsrxfy")))
     ;; Error in checksum detected
     (%check-unparsable (concatenate 'string prv "#ggssrxfy") ""
                        "Provided checksum 'ggssrxfy' does not match computed checksum 'ggrsrxfy'")
@@ -556,12 +552,8 @@ regtest node, the underlying scriptPubKeys must match exactly)."
          (tprv "tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK")
          (descsum (lambda (body) (bl.rpc:descriptor-add-checksum body))))
     (flet ((expect-error (message &rest args)
-             (handler-case
-                 (progn (bl.rpc::rpc-deriveaddresses node args)
-                        (fail "expected error ~S for ~S" message args))
-               (bl.rpc:rpc-error (e)
-                 (is (string= message (bl.rpc:rpc-error-message e))
-                     "got ~S wanted ~S" (bl.rpc:rpc-error-message e) message)))))
+             (signals-rpc-error (:exact-message message)
+               (bl.rpc::rpc-deriveaddresses node args))))
       ;; No checksum -> error
       (expect-error "Missing checksum" "a")
       ;; Single wpkh

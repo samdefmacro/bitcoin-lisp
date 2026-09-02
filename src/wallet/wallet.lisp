@@ -96,8 +96,7 @@ to, or NIL when it has none (bare pk/multi/combo)."
              :p2sh-segwit
              :legacy))
     (:wsh :bech32)
-    ((:tr :rawtr) :bech32m)
-    (t nil)))
+    ((:tr :rawtr) :bech32m)))
 
 (defun out-desc-single-type-p (desc)
   "Core IsSingleType: false only for combo()."
@@ -1071,7 +1070,7 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                                                       range-start range-end
                                                       next-index)))
                ;; The stored id must round-trip; guard against corruption.
-               (unless (equalp (desc-spkm-id spkm) fields)
+               (unless (equalp (desc-spkm-id spkm) (wdb-parse-descriptor-fields fields))
                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                    :message "Wallet descriptor record id mismatch"))
                (setf (gethash (desc-spkm-id spkm) (wallet-spkms wallet)) spkm))))
@@ -1098,20 +1097,17 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
           ((equal type +wdb-key-lockedutxo+)
            ;; Records on disk are the persistent locks (lockunspent
            ;; persistent=true); memory-only locks never reach the DB.
-           (push (%wparse (s fields)
-                   (list (bl.ser:read-bytes s 32)
-                         (bl.ser:read-uint32-le s)
-                         t))
-                 (wallet-locked-utxos wallet)))
+           (multiple-value-bind (txid n) (wdb-parse-lockedutxo-fields fields)
+             (push (list txid n t) (wallet-locked-utxos wallet))))
           ((equal type +wdb-key-tx+)
-           (push (cons fields (cdr rec)) tx-records))
+           (push (cons (wdb-parse-tx-fields fields) (cdr rec)) tx-records))
           ((equal type +wdb-key-name+)
            (setf (addr-book-entry-label
-                  (%wallet-book-entry wallet (wdb-parse-string-value fields)))
+                  (%wallet-book-entry wallet (wdb-parse-address-string-fields fields)))
                  (wdb-parse-string-value (cdr rec))))
           ((equal type +wdb-key-purpose+)
            (setf (addr-book-entry-purpose
-                  (%wallet-book-entry wallet (wdb-parse-string-value fields)))
+                  (%wallet-book-entry wallet (wdb-parse-address-string-fields fields)))
                  (wdb-parse-string-value (cdr rec))))
           ((equal type +wdb-key-destdata+)
            ;; Core LoadRecords DESTDATA: "used" -> previously-spent marker;
@@ -1130,9 +1126,8 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
       (multiple-value-bind (type fields) (wdb-parse-key (car rec))
         (cond
           ((equal type +wdb-key-walletdescriptorkey+)
-           (let* ((id (subseq fields 0 32))
-                  (pubkey (subseq fields 33))   ; skip compactsize byte
-                  (spkm (gethash id (wallet-spkms wallet))))
+           (multiple-value-bind (id pubkey) (wdb-parse-descriptor-key-fields fields)
+            (let* ((spkm (gethash id (wallet-spkms wallet))))
              (if spkm
                  (let ((priv (wdb-parse-descriptor-key-value (cdr rec) pubkey)))
                    (unless priv
@@ -1141,15 +1136,14 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                    (setf (gethash (bl.crypto:hash160 pubkey)
                                   (desc-spkm-keys spkm))
                          (cons priv (= (length pubkey) 33))))
-                 (push "Found a descriptor key for an unknown descriptor" warnings))))
+                 (push "Found a descriptor key for an unknown descriptor" warnings)))))
           ((equal type +wdb-key-walletdescriptorckey+)
            ;; The mirror of the plaintext branch above. Nothing is
            ;; decrypted here — there is no passphrase at load time — so
            ;; corruption of the ciphertext surfaces at the first unlock,
            ;; via CHECK-DECRYPTION-KEY.
-           (let* ((id (subseq fields 0 32))
-                  (pubkey (subseq fields 33))   ; skip compactsize byte
-                  (spkm (gethash id (wallet-spkms wallet))))
+           (multiple-value-bind (id pubkey) (wdb-parse-descriptor-key-fields fields)
+            (let* ((spkm (gethash id (wallet-spkms wallet))))
              (cond
                ((null spkm)
                 (push "Found a descriptor key for an unknown descriptor" warnings))
@@ -1159,30 +1153,33 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                (t
                 (setf (gethash (bl.crypto:hash160 pubkey)
                                (desc-spkm-crypted-keys spkm))
-                      (cons pubkey (wdb-parse-vector-value (cdr rec))))))))
+                      (cons pubkey (wdb-parse-vector-value (cdr rec)))))))))
           ((equal type +wdb-key-walletdescriptorcache+)
            (let* ((id (subseq fields 0 32))
                   (cache (or (gethash id caches)
                              (setf (gethash id caches) (bl.rpc:make-descriptor-cache))))
                   (xpub (wdb-parse-xpub-value (cdr rec) network)))
-             (%wparse (s fields)
-               (bl.ser:read-bytes s 32)
-               (let ((key-exp (bl.ser:read-uint32-le s)))
-                 (if (= (length fields) 40)      ; id + keyexp + derindex
-                     (setf (bl.rpc:descriptor-cache-derived
-                            cache key-exp (bl.ser:read-uint32-le s))
-                           xpub)
-                     (setf (bl.rpc:descriptor-cache-parent cache key-exp) xpub))))))
+             ;; One type string, two record shapes, told apart by length:
+             ;; id + keyexp (36) is a parent, id + keyexp + derindex (40)
+             ;; a derived key.
+             (if (= (length fields) 40)
+                 (multiple-value-bind (id key-exp der-index)
+                     (wdb-parse-descriptor-derived-cache-fields fields)
+                   (declare (ignore id))
+                   (setf (bl.rpc:descriptor-cache-derived cache key-exp der-index) xpub))
+                 (multiple-value-bind (id key-exp)
+                     (wdb-parse-descriptor-parent-cache-fields fields)
+                   (declare (ignore id))
+                   (setf (bl.rpc:descriptor-cache-parent cache key-exp) xpub)))))
           ((equal type +wdb-key-walletdescriptorlhcache+)
            (let* ((id (subseq fields 0 32))
                   (cache (or (gethash id caches)
                              (setf (gethash id caches) (bl.rpc:make-descriptor-cache))))
                   (xpub (wdb-parse-xpub-value (cdr rec) network)))
-             (%wparse (s fields)
-               (bl.ser:read-bytes s 32)
-               (setf (bl.rpc:descriptor-cache-last-hardened
-                      cache (bl.ser:read-uint32-le s))
-                     xpub))))
+             (multiple-value-bind (id key-exp)
+                 (wdb-parse-descriptor-parent-cache-fields fields)
+               (declare (ignore id))
+               (setf (bl.rpc:descriptor-cache-last-hardened cache key-exp) xpub))))
           ((or (equal type +wdb-key-activeexternalspk+)
                (equal type +wdb-key-activeinternalspk+))
            (push (list (equal type +wdb-key-activeinternalspk+)

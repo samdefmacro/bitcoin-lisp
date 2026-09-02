@@ -485,14 +485,9 @@ holding the socket."
                           (bl.rpc:hash-to-hex
                            (bl.store:best-block-hash cs))
                           (bl.mp:mempool-transactions-updated mp))))
-          (handler-case
-              (progn (bl.rpc::%gbt-wait-for-change node id)
-                     (is-true nil "the wait did not end on shutdown"))
-            (bl.rpc:rpc-error (e)
-              (is (= bl.rpc::+rpc-client-not-connected+
-                     (bl.rpc:rpc-error-code e)))
-              (is (string= "Shutting down"
-                           (bl.rpc:rpc-error-message e))))))))
+          (signals-rpc-error (:code bl.rpc::+rpc-client-not-connected+
+                              :exact-message "Shutting down")
+            (bl.rpc::%gbt-wait-for-change node id)))))
     ;; And getblocktemplate reaches the wait at all — a longpollid that is
     ;; parsed and then ignored is the failure mode this repo keeps finding.
     (is-true (member 'bl.rpc::rpc-getblocktemplate

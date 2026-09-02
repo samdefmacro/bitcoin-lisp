@@ -172,3 +172,19 @@ row E's wording only claims the 7 struct-slot tables + sig-cache, which is not a
    and after the transformation", applicable to any reader-driven bulk rewrite.
 7. Write the p2p_sendheaders attribution (§2: pre-existing, not a refactor regression -- an unsolicited
    block that becomes the tip is not announced to other peers) into `docs/functional-triage`.
+
+## 8. Status (2026-09-03)
+
+Follow-ups 1-5 and 7 are done in one PR: ledger row F carries the three behaviour changes and the manual's util
+section explains the hook placement; `available-processor-count` falls back to 4 only on a file it cannot open
+or read, and `prune-stale-undo-files` parses a filename explicitly and says so when it deletes one that is not a
+block hash (the finding asked to keep such a file; `prune-deletes-undo-files-and-stale-sweep` documents deleting
+garbage in `undo/` as intended, so the silent path went and the contract stayed); the three generated parsers have their callers and a new ratchet `wdb-schema-functions-are-called` keeps
+it so; 15 of the 26 inline rpc-error handlers became `signals-rpc-error` (the 11 left are helpers that return
+the error or its fields, or assert something the fixture cannot say, such as "any code but -3"), and the three
+`*ibd-context*` lets became `with-ibd-context`; the three comments are back on a documented `(t nil)`, the ten
+undocumented `(t nil)` clauses in `case` forms are gone, `types.lisp:186` and the `%btc` comment are fixed, and
+the 2.1 count reads 16. Follow-up 6 is `scripts/refactor/check-comments-kept.sh`: it lists every comment text
+present at a base revision and missing from the working tree, per file, for any batch rewrite to account for
+before committing. The p2p_sendheaders attribution is in `docs/functional-triage-2026-08-25.md`.
+

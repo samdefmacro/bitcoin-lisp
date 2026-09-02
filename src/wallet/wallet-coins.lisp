@@ -164,8 +164,7 @@ witnessScript fields and getaddressinfo's embedded object."
          (let ((scripts (bl.rpc:out-desc-expand-from-cache desc pos cache)))
            (when (and scripts (= (length scripts) 4)
                       (equalp script (fourth scripts)))
-             (values (third scripts) nil))))
-        (t nil)))))
+             (values (third scripts) nil))))))))
 
 (defun %wallet-coin-output-type (wallet script)
   "Core GetOutputType over Solver's class, reclassifying a solvable P2SH
@@ -461,8 +460,7 @@ expression order. NIL when the descriptor kind cannot be inferred."
            (0 (format nil "pk(~A)" ks))
            (1 (format nil "pkh(~A)" ks))
            (2 (format nil "wpkh(~A)" ks))
-           (3 (format nil "sh(wpkh(~A))" ks))
-           (t nil))))
+           (3 (format nil "sh(wpkh(~A))" ks)))))
       ((:multi :sortedmulti :multi-a :sortedmulti-a)
        ;; Core infers the EXPANDED script, which no longer records that the
        ;; keys were sorted for it, so sortedmulti() reports as multi() with the
@@ -868,8 +866,7 @@ for a wallet-solvable destination."
            (and spkm (%spkm-sub-scripts spkm script))
          (let ((sub (if (eq type :p2sh) redeem witness)))
            (when sub
-             (%process-sub-script wallet sub pairs)))))
-      (t nil))))
+             (%process-sub-script wallet sub pairs))))))))
 
 (defun %wallet-dest-key-origin (spkm script type)
   "(values desc-key pubkey pos) for single-key destinations —
@@ -890,8 +887,7 @@ key-path-only P2TR."
                  ;; reports no hdkeypath/hdmasterfingerprint for it. Without the
                  ;; tree test we would report the INTERNAL key's origin, which
                  ;; names a key that cannot by itself spend the output.
-                 (:p2tr (and (eq kind :tr) (null (bl.rpc:out-desc-tree desc))))
-                 (t nil)))
+                 (:p2tr (and (eq kind :tr) (null (bl.rpc:out-desc-tree desc))))))
       (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
         (declare (ignore scripts))
         (when pairs

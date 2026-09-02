@@ -192,17 +192,12 @@ no-txindex variant in FULL. Ours stopped at \"provide a blockhash\" — the righ
 advice in a spelling no caller matching Core could find."
   (let ((node (make-test-node))
         (txid "0000000000000000000000000000000000000000000000000000000000000009"))
-    (handler-case
-        (progn (bl.rpc::rpc-getrawtransaction node (list txid))
-               (fail "expected a not-found error"))
-      (bl.rpc:rpc-error (e)
-        (is (= -5 (bl.rpc:rpc-error-code e)))
-        (is (string= (concatenate 'string
-                                  "No such mempool transaction. Use -txindex or provide a block "
-                                  "hash to enable blockchain transaction queries. Use "
-                                  "gettransaction for wallet transactions.")
-                     (bl.rpc:rpc-error-message e))
-            "message was: ~A" (bl.rpc:rpc-error-message e))))))
+    (signals-rpc-error (:code -5
+                        :exact-message (concatenate 'string
+                                                    "No such mempool transaction. Use -txindex or provide a block "
+                                                    "hash to enable blockchain transaction queries. Use "
+                                                    "gettransaction for wallet transactions."))
+      (bl.rpc::rpc-getrawtransaction node (list txid)))))
 
 (test json-rpc-parse-invalid-json
   "Test parsing invalid JSON returns parse error"
@@ -2559,21 +2554,12 @@ positionally."
     (setf (bl.net:peer-id peer) 4242)
     (setf (bl:node-peers node) (list peer))
     ;; Both given: Core's exact refusal.
-    (handler-case
-        (progn (bl.rpc::rpc-disconnectnode node '("203.0.113.9" 4242))
-               (is-true nil "address+nodeid was accepted"))
-      (bl.rpc:rpc-error (e)
-        (is (string= "Only one of address and nodeid should be provided."
-                     (bl.rpc:rpc-error-message e)))
-        (is (= bl.rpc:+rpc-invalid-params+
-               (bl.rpc:rpc-error-code e)))))
+    (signals-rpc-error (:code bl.rpc:+rpc-invalid-params+
+                        :exact-message "Only one of address and nodeid should be provided.")
+      (bl.rpc::rpc-disconnectnode node '("203.0.113.9" 4242)))
     ;; Unknown id: Core's not-connected code, not a type error.
-    (handler-case
-        (progn (bl.rpc::rpc-disconnectnode node '(nil 999))
-               (is-true nil "an unknown nodeid was accepted"))
-      (bl.rpc:rpc-error (e)
-        (is (= bl.rpc::+rpc-client-node-not-connected+
-               (bl.rpc:rpc-error-code e)))))
+    (signals-rpc-error (:code bl.rpc::+rpc-client-node-not-connected+)
+      (bl.rpc::rpc-disconnectnode node '(nil 999)))
     ;; By id, the framework's spelling: named nodeid only.
     (is (null (bl.rpc::rpc-disconnectnode node '(nil 4242))))
     ;; And Core's positional spelling for the same thing.
@@ -2830,14 +2816,9 @@ just that something connected."
     ;; Regtest only, with Core's exact text.
     (dolist (network '(:mainnet :testnet4 :signet))
       (let ((bl:*network* network))
-        (handler-case
-            (progn (bl.rpc::rpc-addconnection
-                    nil '("1.2.3.4:1" "outbound-full-relay" t))
-                   (is-true nil "addconnection was accepted on ~A" network))
-          (bl.rpc:rpc-error (e)
-            (is (string= "addconnection is for regression testing (-regtest mode) only."
-                         (bl.rpc:rpc-error-message e))
-                "~A" network)))))
+        (signals-rpc-error (:exact-message "addconnection is for regression testing (-regtest mode) only.")
+          (bl.rpc::rpc-addconnection
+           nil '("1.2.3.4:1" "outbound-full-relay" t)))))
     (is-false bl:*pending-test-connections*
               "a refused addconnection still queued a dial")
     (let* ((bl:*network* :regtest)
@@ -2876,15 +2857,10 @@ just that something connected."
           (bl.net:*v2-transport-enabled* nil)
           (node (bl:make-node :network :regtest)))
       (setf bl:*pending-test-connections* '())
-      (handler-case
-          (progn (bl.rpc::rpc-addconnection
-                  node '("1.2.3.4:1" "outbound-full-relay" t))
-                 (is-true nil "a v2 addconnection was accepted with v2 disabled"))
-        (bl.rpc:rpc-error (e)
-          (is (= bl.rpc:+rpc-invalid-parameter+
-                 (bl.rpc:rpc-error-code e)))
-          (is (string= "Error: Adding v2transport connections requires -v2transport init flag to be set."
-                       (bl.rpc:rpc-error-message e)))))
+      (signals-rpc-error (:code bl.rpc:+rpc-invalid-parameter+
+                          :exact-message "Error: Adding v2transport connections requires -v2transport init flag to be set.")
+        (bl.rpc::rpc-addconnection
+         node '("1.2.3.4:1" "outbound-full-relay" t)))
       (is-false bl:*pending-test-connections*))
     ;; Capacity: the outbound full-relay and block-relay types are capped, the
     ;; other two are not (Core: none for addr-fetch, since -seednode has none,
@@ -2916,13 +2892,8 @@ functional framework and operators actually see, so it is asserted verbatim."
   (dolist (network '(:mainnet :testnet4 :signet))
     (let ((bl:*network* network)
           (bl.ser:*mock-time* nil))
-      (handler-case
-          (progn (bl.rpc::rpc-setmocktime nil '(1000))
-                 (is-true nil "setmocktime was accepted on ~A" network))
-        (bl.rpc:rpc-error (e)
-          (is (string= "setmocktime is for regression testing (-regtest mode) only"
-                       (bl.rpc:rpc-error-message e))
-              "~A" network)))
+      (signals-rpc-error (:exact-message "setmocktime is for regression testing (-regtest mode) only")
+        (bl.rpc::rpc-setmocktime nil '(1000)))
       (is-false bl.ser:*mock-time*
                 "the refused call still moved the clock on ~A" network))))
 
@@ -3018,14 +2989,9 @@ from max_time = Ticks<seconds>(nanoseconds::max()) (rpc/node.cpp:63-69)."
   (let ((bl:*network* :regtest)
         (bl.ser:*mock-time* nil))
     (dolist (bad (list -1 (1+ bl.rpc::+max-mock-time+)))
-      (handler-case
-          (progn (bl.rpc::rpc-setmocktime nil (list bad))
-                 (is-true nil "accepted out-of-range ~D" bad))
-        (bl.rpc:rpc-error (e)
-          (is (string= (format nil "Mocktime must be in the range [0, ~D], not ~D."
-                               bl.rpc::+max-mock-time+ bad)
-                       (bl.rpc:rpc-error-message e))
-              "~D" bad))))
+      (signals-rpc-error (:exact-message (format nil "Mocktime must be in the range [0, ~D], not ~D."
+                                                 bl.rpc::+max-mock-time+ bad))
+        (bl.rpc::rpc-setmocktime nil (list bad))))
     ;; the boundary itself is accepted
     (bl.rpc::rpc-setmocktime nil (list bl.rpc::+max-mock-time+))
     (is (eql bl.rpc::+max-mock-time+ bl.ser:*mock-time*))
@@ -3187,24 +3153,13 @@ node was alive, working and answering nothing — bitcoin-cli got connection
 refused and monitoring saw a dead node."
   (let ((bl.rpc::*rpc-warmup-status* "Replaying mempool..."))
     (dolist (method '("getblockcount" "uptime" "help" "stop" "nosuchmethod"))
-      (handler-case
-          (progn (bl.rpc:dispatch-rpc-method nil method '())
-                 (is-true nil "~A was dispatched during warmup" method))
-        (bl.rpc:rpc-error (e)
-          (is (= bl.rpc::+rpc-in-warmup+
-                 (bl.rpc:rpc-error-code e))
-              "~A did not answer -28" method)
-          (is (string= "Replaying mempool..."
-                       (bl.rpc:rpc-error-message e))
-              "~A did not report the current status" method)))))
+      (signals-rpc-error (:code bl.rpc::+rpc-in-warmup+
+                          :exact-message "Replaying mempool...")
+        (bl.rpc:dispatch-rpc-method nil method '()))))
   ;; Cleared, dispatch resumes — including the honest "no such method".
   (let ((bl.rpc::*rpc-warmup-status* nil))
-    (handler-case
-        (progn (bl.rpc:dispatch-rpc-method nil "nosuchmethod" '())
-               (is-true nil "an unknown method was accepted"))
-      (bl.rpc:rpc-error (e)
-        (is (= bl.rpc:+rpc-method-not-found+
-               (bl.rpc:rpc-error-code e)))))))
+    (signals-rpc-error (:code bl.rpc:+rpc-method-not-found+)
+      (bl.rpc:dispatch-rpc-method nil "nosuchmethod" '()))))
 
 (test warmup-status-tracks-startup-and-clears
   "-28's message is whatever startup is currently doing (Core wires
@@ -3740,11 +3695,8 @@ names the range."
       (bl.rpc::rpc-estimatesmartfee node
                                               (list (1+ (bl.mp:highest-target-tracked)))))
     ;; And an unknown mode names the three Core accepts.
-    (handler-case (bl.rpc::rpc-estimatesmartfee node '(6 "cheap"))
-      (bl.rpc:rpc-error (e)
-        (is (search "unset" (bl.rpc:rpc-error-message e))
-            "the invalid-mode message should list Core's three modes: ~A"
-            (bl.rpc:rpc-error-message e))))))
+    (signals-rpc-error (:message "unset")
+      (bl.rpc::rpc-estimatesmartfee node '(6 "cheap")))))
 
 ;;; validateaddress tests
 
@@ -4180,12 +4132,8 @@ its output is still counted in outs."
 selected statistic' (rpc/blockchain.cpp:2183-2186); we used to drop it
 silently, so a typo read as 'that statistic is unavailable for this block'."
   (%with-gbs-block (node hex spender)
-    (let ((code (handler-case
-                    (progn (bl.rpc::rpc-getblockstats
-                            node (list hex (list "totalfee" "bogus")))
-                           :no-error)
-                  (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e)))))
-      (is (eql -8 code)))
+    (signals-rpc-error (:code -8)
+      (bl.rpc::rpc-getblockstats node (list hex (list "totalfee" "bogus"))))
     ;; CONTROL: a known name still selects exactly that key.
     (let ((r (bl.rpc::rpc-getblockstats node (list hex (list "totalfee")))))
       (is (= 1 (length r)))

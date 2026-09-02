@@ -687,10 +687,8 @@ it is unlocked."
                     (lambda () (bl.wallet::rpc-importdescriptors
                                 node (list (list (%ht "desc" "x" "timestamp" 0))))))))
         ;; The exact Core message.
-        (handler-case (bl.wallet::rpc-keypoolrefill node '(10))
-          (bl.rpc:rpc-error (e)
-            (is (equal "Error: Please enter the wallet passphrase with walletpassphrase first."
-                       (bl.rpc:rpc-error-message e)))))
+        (signals-rpc-error (:exact-message "Error: Please enter the wallet passphrase with walletpassphrase first.")
+          (bl.wallet::rpc-keypoolrefill node '(10)))
         ;; The public form of listdescriptors keeps working while locked.
         (is (%aval "descriptors" (bl.wallet::rpc-listdescriptors node '())))
         (bl.wallet::rpc-walletpassphrase node '("hunter2" 600))

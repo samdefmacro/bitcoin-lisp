@@ -1366,8 +1366,7 @@ header; these synthetic fixtures must too."
 
 (test drain-block-queue-empty
   "Draining an empty queue should return 0."
-  (let ((bl.net:*ibd-context*
-          (bl.net::make-ibd)))
+  (with-ibd-context
     (let ((state (bl.store:init-chain-state
                   (merge-pathnames "test-drain/" (uiop:temporary-directory))))
           (utxo-set (bl.store:make-utxo-set))

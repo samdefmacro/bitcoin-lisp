@@ -2042,8 +2042,7 @@ encoders in crypto/address.lisp, keyed on CLASSIFY-SCRIPT."
       (:scripthash (bl.crypto:encode-p2sh-address (getf data :hash) network))
       (:witness-v0-keyhash (bl.crypto:encode-p2wpkh-address (getf data :witness-program) network))
       (:witness-v0-scripthash (bl.crypto:encode-p2wsh-address (getf data :witness-program) network))
-      (:witness-v1-taproot (bl.crypto:encode-p2tr-address (getf data :witness-program) network))
-      (t nil))))
+      (:witness-v1-taproot (bl.crypto:encode-p2tr-address (getf data :witness-program) network)))))
 
 (defun scriptpubkey-desc (script network)
   "Core InferDescriptor for a bare scriptPubKey (no key material available): an
