@@ -771,7 +771,7 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
       ;; LIST" — signrawtransactionwithkey could not be called with prevtxs by
       ;; any real client (rpc_signrawtransactionwithkey.py:71 does exactly
       ;; that), while every unit test passed by handing it alists. Same defect
-      ;; and same fix as createrawtransaction's inputs in #491.
+      ;; and same fix as createrawtransaction's inputs.
       (dolist (pt (and (listp prevtxs) prevtxs))
         (let ((txid (obj-get pt "txid"))
               (vout (obj-get pt "vout"))

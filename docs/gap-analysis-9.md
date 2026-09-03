@@ -32,8 +32,8 @@ than resting on a single agent's reading; each is marked **[verified]**.
 | crypto & canonical encoding | ✅ complete (part 2) | 4 S3 |
 
 The seven missing dimensions include the three where the newest, least-reviewed code lives —
-the resumable v1/v2 readers (#340–#342), the coins-DB alignment series (#333–#338), and Wallet
-P6 encryption (#343). **Re-running those seven is the first task of GA9 part 2**, and the brief
+the resumable v1/v2 readers (340–342), the coins-DB alignment series (333–338), and Wallet
+P6 encryption (PR 343). **Re-running those seven is the first task of GA9 part 2**, and the brief
 that drives them is preserved (see "Reproducing this round" at the end).
 
 Two findings below were independently confirmed by me directly against both source trees rather
@@ -438,16 +438,16 @@ else. **Fix:** narrow the `.gitignore` rule (`/data/` or an explicit path) and c
 
 ### Four items recorded open are actually done
 
-**G7-15** (BIP133 feefilter, PR #312), **G7-19** (self-connection detection, #309), **G7-20**
-(GetAddr response cache, #310) and **G7-38** (fast rescan via BIP158) are all implemented **and
+**G7-15** (BIP133 feefilter, PR 312), **G7-19** (self-connection detection, PR 309), **G7-20**
+(GetAddr response cache, PR 310) and **G7-38** (fast rescan via BIP158) are all implemented **and
 wired to production call sites** — the agent checked callers specifically, since inert-but-merged
-is this project's documented failure mode. GA8 recorded "six items in #309–#314" but only credited
-#311/#313/#314. Three of these are exactly the kind of item a future round would otherwise
+is this project's documented failure mode. GA8 recorded "six items in 309–314" but only credited
+PRs 311/313/314. Three of these are exactly the kind of item a future round would otherwise
 re-implement from scratch.
 
 ### Notable partials
 
-**G7-06** premise partly overtaken by #335–#337: the abort GA7 asked for now exists, but only via
+**G7-06** premise partly overtaken by 335–337: the abort GA7 asked for now exists, but only via
 the coins-DB pointer — a chainstate whose coins DB has no pointer yet still proceeds on an empty
 index, and no blk-file reindex path exists. **G7-08**: P1/P2 are genuinely wired (the GA8
 "counter only increments" defect is fixed and the grant is reached from production, not just
@@ -706,7 +706,7 @@ The sharpest path is not a natural reorg: `dumptxoutset` with a rollback target 
 disconnects tens of thousands of blocks in one uninterrupted, unflushed loop. `invalidateblock` with
 a deep hash does the same.
 
-Not a consensus divergence — a self-inflicted node kill, sitting exactly where PRs #333–#338 made
+Not a consensus divergence — a self-inflicted node kill, sitting exactly where PRs 333–338 made
 mid-reorg flushing *safe for the first time*.
 
 **Fix:** call the size check at the bottom of both reorg loop bodies — **after** the coins mutation
@@ -731,7 +731,7 @@ MAPHASH may not be visited, and the following CLRHASH drops them unwritten — a
 leaves a spent coin alive in LevelDB (we would accept a double-spend Core rejects); a dropped add
 loses a real UTXO. And the batch also stages `cvc-best-block`, which `apply-block-to-utxo-set` only
 moves *after* the whole block is applied — so a flush landing mid-apply commits half of block N
-under the pointer for N-1, precisely the coins/pointer disagreement #333–#338 exist to make
+under the pointer for N-1, precisely the coins/pointer disagreement 333–338 exist to make
 impossible. Concurrent SBCL hash-table mutation during MAPHASH/CLRHASH is undefined behaviour on
 its own terms.
 
@@ -784,7 +784,7 @@ Core's comment calls out as *"Important that we set this"* (`validation.cpp:5884
 Core even stamps with a placeholder mid-load so its `assert(!hashBlock.IsNull())` can never fire.
 Our populate path writes coins straight to LevelDB, bypassing the cache, and never sets it, so the
 newly populated DB has a full UTXO set and no `DB_BEST_BLOCK`. Narrow window, but it silently opts
-the assumeutxo chainstate out of the very invariant #333–#338 established.
+the assumeutxo chainstate out of the very invariant 333–338 established.
 
 `gettxoutsetinfo` makes **three** independent flush-and-rescan passes (distinct txids, total amount,
 set hash) where Core computes all of it in one cursor pass, and reports the *chain* tip as
@@ -1389,7 +1389,7 @@ offsets of 1–2 lines, mechanisms unchanged).
 7. **S1-3 BIP68 version gate** — verified; add an executable regression control with the fix.
 8. **The storage cluster (S2-10, S2-11)** — the unflushed reorg is a self-inflicted OOM on the
    deepest rollback paths; the unlocked `gettxoutsetinfo` can drop UTXO writes. Both sit on the code
-   #333–#338 just rewrote.
+   333–338 just rewrote.
 9. **S2-14 PSBT UTXO precedence with S3's `FillPSBT` fix** — they are two halves of one defence.
 10. **S2-1 signet**, then the config cluster (S2-7 and its S3 siblings), then peer hygiene
     (S2-4/5/6), then the remainder.

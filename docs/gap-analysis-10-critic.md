@@ -51,7 +51,7 @@ Ranked by (Core LOC × consequence). Each names our counterpart so GA11 can assi
 | `src/validation/miniscript.lisp` | 1983 | see B above |
 | `src/node/indexes.lisp` | 367 | The index hook *drive sites* + coinstatsindex crash-consistency. Dim 4 read every index body and none of its drivers. |
 | `src/coalton/serialization.lisp` | 479 | The consensus script layer's data plumbing, under a `script.lisp` + `interop.lisp` that *were* read in full |
-| `src/coalton/binary.lisp` | 284 | Same. GA10's #1 unverified S1 is a signed/unsigned bug *at this exact boundary* (`buf-set-u32-le` vs `(signed-byte 32)`) |
+| `src/coalton/binary.lisp` | 284 | Same. GA10's first unverified S1 is a signed/unsigned bug *at this exact boundary* (`buf-set-u32-le` vs `(signed-byte 32)`) |
 | `src/node/state.lisp` | 185 | Defines the `node` struct **and the locks** |
 | `src/serialization/message-macro.lisp` | 178 | A **macro** generating every P2P struct/reader/writer. A bug here is systemic — and per CLAUDE.md a macro change survives warm rebuild, restart *and* an ordinary cold run, so it is also the file most able to produce a false green |
 | `src/node/logging.lisp` | 187 | Dim 2 flagged the logging-option surface as uncovered; the cleartext-password S2 lives one file away |
@@ -115,7 +115,7 @@ Reading two trees side by side compares **definitions**. It cannot compare **exe
 
 **7. Timing, cadence, and scheduling.** Poisson addr/tx broadcast timers, feeler cadence, ping timeouts, headers-sync timeouts, fee-estimator decay, the eviction rotation. Reading gives the constant; only a run gives the emergent behaviour. GA10's addr-relay finding ("no queue, no poisson timer") is the visible half; whether the resulting cadence leaks topology is not knowable statically.
 
-**8. SBCL-specific numeric and type behaviour.** Bignum promotion where Core wraps; `(signed-byte 32)` vs `(unsigned-byte 32)`; whether a declared type check *signals* or is *elided* at the current safety setting. GA10's #1 unverified S1 is precisely this — and its finder wrote that he could not confirm the runtime symptom because Docker was down. Also in this family: `%script-num` missing the CScriptNum sign byte; `CastToBool` on multi-byte negative zero; `(null #())` being false; SBCL eliding `coerce`+`reverse`. *Tool:* one `dev.sh eval` per claim. Cheapest verification available and this round did zero of it.
+**8. SBCL-specific numeric and type behaviour.** Bignum promotion where Core wraps; `(signed-byte 32)` vs `(unsigned-byte 32)`; whether a declared type check *signals* or is *elided* at the current safety setting. GA10's first unverified S1 is precisely this — and its finder wrote that he could not confirm the runtime symptom because Docker was down. Also in this family: `%script-num` missing the CScriptNum sign byte; `CastToBool` on multi-byte negative zero; `(null #())` being false; SBCL eliding `coerce`+`reverse`. *Tool:* one `dev.sh eval` per claim. Cheapest verification available and this round did zero of it.
 
 **9. Crash consistency and environment.** fsync ordering, partial writes, disk-full, file permissions, the flush/prune/index-write interleaving. `src/kv/fsync.lisp` and `src/kv/datadir.lisp` were not read; `src/node/indexes.lisp`'s own header describes an abandoned-chain window after a process kill and nobody checked it. *Tool:* a `kill -9`-at-each-phase restart matrix.
 
@@ -129,7 +129,7 @@ Ordered so the cheapest confirmations come first.
 
 1. **Settle the two S1s empirically before anything else** (~1 hour, Docker is up). Pruned-node restart for `%scan-flat-block-files`; `gettxoutsetinfo` → spend → re-lookup for the FRESH/DIRTY flag. Both are reproducible in minutes and both are on the default configuration.
 2. **Run the ~15 findings that cite a Core functional test.** `scripts/conformance.sh rpc_users.py feature_config_args.py …` converts reading into verdicts for free.
-3. **Run the refactor-regression dimension** (GA10's own #1) — still never executed.
+3. **Run the refactor-regression dimension** (GA10's own item 1) — still never executed.
 4. **Assign the five orphaned Core subsystems** as first-class dimensions: descriptors+signing (A), miniscript (B), cluster-mempool/txgraph (C), tx-relay/txrequest (D), wallet persistence + the 62 wallet RPCs (E/F).
 5. **One dimension for the 42 never-opened files**, ordered by the risk table in §2 — `indexes.lisp`, `state.lisp`+`accessors.lisp`, `message-macro.lisp`, the four `coalton/` support files, `entropy.lisp`.
 6. **Audit all 55 accept-and-drop options with the `-rpcwhitelist` lens.** For each: what does the operator believe, and what do we do? At least fifteen have no implementation at all. Mechanical, high yield, one afternoon.

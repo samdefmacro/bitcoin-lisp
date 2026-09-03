@@ -1,7 +1,7 @@
 # 10th gap analysis — bitcoin-lisp vs Bitcoin Core (refs/bitcoin @ d3056bc)
 
 Date: 2026-09-01. Baseline: `main` @ `3470694`, clean tree — immediately after the 43-PR
-cleanup refactor (#521–#562), so this round doubles as a post-refactor check.
+cleanup refactor (521–562), so this round doubles as a post-refactor check.
 Oracle: Bitcoin Core @ `d3056bc` — the same revision GA7–GA9 used, so severities and
 coverage are directly comparable across four rounds.
 
@@ -61,7 +61,7 @@ verdict was reached by RUNNING code in the container, not only by reading.**
 | 3 | block bodies persisted with no CheckBlock on both IBD paths | **confirmed** | **S1** |
 | 4 | BIP143/BIP341 sighash writes nVersion through a `(unsigned-byte 32)`-declared writer | **confirmed by execution** | **S1** |
 
-**#4 was decided by running it.** Its finder wrote "I could not execute the image to determine
+**Finding 4 was decided by running it.** Its finder wrote "I could not execute the image to determine
 which" -- whether SBCL elides the declaration or signals. A verifier ran it:
 `(buf-set-u32-le b 0 -2147483648)` -> `SIMPLE-TYPE-ERROR`, and both
 `compute-bip143-sighash-real` and `compute-bip341-sighash-real` abort the same way on a real
@@ -70,7 +70,7 @@ segwit/taproot spend inside a transaction with bit 31 set -- valid to Core, whic
 rule on version -- and our validation aborts. The verifier also corrected the finder: at `d3056bc`
 Core's `CTransaction::version` is `uint32_t`, not `int32_t`, which *strengthens* the finding.
 
-**#2 is why the verification pass exists.** Both lenses confirmed the parse divergence exactly as
+**Finding 2 is why the verification pass exists.** Both lenses confirmed the parse divergence exactly as
 filed -- and both downgraded it, because the *consequence* does not follow. Every outbound path
 re-serializes from the struct rather than echoing received bytes (`store-block` writes
 `serialize-witness-block`, blocks.lisp:387; `make-block-message` re-serializes, messages.lisp:431).
@@ -79,7 +79,7 @@ same header hash, same merkle root. So we *launder* the block into the encoding 
 than following a chain the network rejects. The attacker gains nothing over publishing the
 canonical form. It is a strictness gap, not a chain split.
 
-**#1 was measured, and the finder's magnitude was wrong in both directions.** Executed against a
+**Finding 1 was measured, and the finder's magnitude was wrong in both directions.** Executed against a
 50,000-entry mempool: a replay costs ~13-15 ms and 6.4-16 MB, not the claimed 0.2-0.3 s and 50 MB
 (`transaction-wtxid` is cached). The DoS is real and unrate-limited -- `check-peer-rate-limit`
 returned T for 10,000 consecutive `cmpctblock` calls -- but it is a smaller constant than filed.
@@ -91,14 +91,14 @@ A verifier also found the finding *understated* elsewhere: a replay matching an 
 Three findings, one of them a regression introduced by the refactor itself and now fixed in this
 same branch:
 
-1. **`bl:token-bucket` and `bl:make-token-bucket` were exported but named nothing.** P6d (#551)
+1. **`bl:token-bucket` and `bl:make-token-bucket` were exported but named nothing.** P6d (PR 551)
    moved the struct to `bitcoin-lisp.ratelimit`; `src/package.lisp`'s `:import-from` list was
    retyped with six names while the `:export` list beside it was carried over verbatim with eight.
    Executed: `eq` NIL, no class, not `fbound`. A caller writing `bl:token-bucket` got a reader
    error. **Fixed here**, plus a new structural ratchet `every-export-names-something` so the shape
    cannot recur -- the orphan-export sweep could never have caught it, because that test asks who
    *calls* an exported **function** and these were not functions.
-2. **`fsync-parent-directory` was wired into 3 of its 7 drive sites.** #525 split a file-path and a
+2. **`fsync-parent-directory` was wired into 3 of its 7 drive sites.** PR 525 split a file-path and a
    directory-path fsync that had previously collided, but scoped the fix to the file the losing
    definition lived in rather than to the callers' argument shape. Four `rename-file` paths still
    pass a *file* to the *directory* function -- `settings.json` (twice), `mempool.dat`, and the
@@ -200,17 +200,17 @@ warnings were the agents echoing a `[S2] ` prefix I had stripped from the stored
    allocator -- the one site we get right), and its own settings writer does `RenameOver` with no
    directory sync at all. Our settings path is *more* durable than Core's. **S3, pre-existing,
    not a regression.**
-2. **My commit message for #564 said a caller "got a reader error".** Wrong -- the symbol exists
+2. **My commit message for PR 564 said a caller "got a reader error".** Wrong -- the symbol exists
    and reads fine; you get an undefined-function or unknown-type at compile or run time. The
    original finder said "signals", which was right; I introduced the error while writing it up.
-   That message also labels #551 as "P6d"; P6d is #562.
+   That message also labels PR 551 as "P6d"; P6d is PR 562.
 3. **The positive control for `every-export-names-something` existed only in that commit message.**
    `refactoring-ratchets-can-actually-fail` carries a control for every other scanner and had none
    for this one -- so the sweep could have silently gone vacuous again and nothing in the tree would
    have said so. Fixed in this change: `%dead-exports` is factored out and the control feeds it a
    probe package whose only export names nothing.
 
-The verifier also confirmed the #564 fix is complete: sweeping all 28 `BITCOIN-LISP*` packages
+The verifier also confirmed the PR 564 fix is complete: sweeping all 28 `BITCOIN-LISP*` packages
 (2,360 external symbols, wider than the ratchet's own scope) finds no other dead export, and no
 exported name anywhere resolves to two different symbol objects -- so no other "export list carried
 over, import list retyped" residue exists.
@@ -572,7 +572,7 @@ Read on Core's side for comparison: validation.cpp PreChecks/ReplacementChecks/P
 
 NOT covered (no findings claimed there): the cluster-mempool machinery itself — src/mempool/txgraph.lisp, cluster-linearize.lisp, spanning-forest.lisp, feefrac.lisp — i.e. chunk/linearization correctness, txgraph-get-worst-main-chunk eviction ordering, txgraph-rbf-diagrams, and mempool-package-fits-cluster-limits-p; I read their call sites but not the algorithms against Core's txgraph.cpp/cluster_linearize.h. Also not covered: the internal math of block-policy-estimator (TxConfirmStats decay/estimate-median, fee_estimates.dat format), the mempool.dat serialization details, src/mempool/fee-estimator.lisp, and the script-standardness predicates in detail (classify-output-script, input-witness-standard-p, +standard-script-verify-flags+) — those overlap the script dimension. Verified-equivalent and deliberately NOT reported: the RBF rules 3/4/5 and ImprovesFeerateDiagram port, EntriesAndTxidsDisjoint semantics, SingleTRUCChecks including sibling eviction, PackageTRUCChecks, PreCheckEphemeralTx/CheckEphemeralSpends, GetDustThreshold, IsStandardTx incl. the shared datacarrier budget, GetVirtualTransactionSize, the orphanage DoS-score/limit model, and every policy constant in policy.h.
 
-6. Read in full on our side: src/validation/block.lisp lines 1-70 and 2500-4114 (trim-disconnect-pool, connect-block, find-fork-point, collect-chain-entries, the mempool reorg filter/re-add, %rollback-partial-reorg, the deterministic-invalid allowlist, the REORG struct and %reorg-disconnect/%reorg-connect/%reorg-commit, perform-reorg, best-valid-tip, %activation-step-target, activate-best-chain, invalidate-block/reconsider-block/precious-block, activate-block); src/networking/headers-sync.lisp in full; the reorg-relevant parts of src/networking/ibd.lisp (activate-best-chain call site, process-received-block, retry-best-reorg-candidate, note/reject-reorg-candidate); src/mempool/mempool.lisp mempool-remove-for-block / mempool-remove-spenders / mempool-update-for-reorg; src/rpc/blockchain.lisp chain-control RPCs; src/zmq.lisp notify functions. Read on Core's side: validation.cpp 285-400 (MaybeUpdateMempoolForReorg), 1985-1994 (InvalidBlockFound), 2925-3145 (DisconnectTip/ConnectTip/ConnectTrace), 3145-3360 (FindMostWorkChain, PruneBlockIndexCandidates, ActivateBestChainStep), 3400-3500 (ActivateBestChain), 3553-3700 (InvalidateBlock); headerssync.cpp in full; kernel/disconnected_transactions.cpp in full; rpc/blockchain.cpp 1695-1786; zmq/zmqnotificationinterface.cpp 148-205. I also reviewed the PR #562 diff to confirm the refactor was mechanical — the phase boundaries, rollback list ordering and interrupt/truncation logic check out against Core's ActivateBestChainStep and I found no regression introduced by the split itself. NOT covered: block-index status persistence and startup roll-forward reconciliation between the coins-view best-block pointer and the chain tip (src/storage/chain.lisp, node/flush.lisp) — the PHASE A critical-flush safety argument depends on that and I did not verify it; the full deep-reorg candidate machinery in ibd.lisp (%best-completable-reorg-target, parking/re-arming) beyond what finding 3 needed; headerssync driver integration in sync-headers/net_processing TryLowWorkHeadersSync; and the assumeutxo snapshot-promotion interaction with perform-reorg. One deliberate divergence I checked and accepted: Core stays on the partially-connected chain after a ConnectTip failure while we roll back in memory — documented in %reorg-connect's note and internally consistent. Also checked and NOT reported (ours is equivalent or better): the disconnect-pool trim direction (matches Core's LimitMemoryUsage front-pop), reconsider-block's ancestor+descendant clearing, header bad-prevblk admission (protocol.lisp:997-1007), and headerssync's redownload previous_nBits (ours tracks the true last header rather than reverting to chain_start.nBits on an emptied buffer).
+6. Read in full on our side: src/validation/block.lisp lines 1-70 and 2500-4114 (trim-disconnect-pool, connect-block, find-fork-point, collect-chain-entries, the mempool reorg filter/re-add, %rollback-partial-reorg, the deterministic-invalid allowlist, the REORG struct and %reorg-disconnect/%reorg-connect/%reorg-commit, perform-reorg, best-valid-tip, %activation-step-target, activate-best-chain, invalidate-block/reconsider-block/precious-block, activate-block); src/networking/headers-sync.lisp in full; the reorg-relevant parts of src/networking/ibd.lisp (activate-best-chain call site, process-received-block, retry-best-reorg-candidate, note/reject-reorg-candidate); src/mempool/mempool.lisp mempool-remove-for-block / mempool-remove-spenders / mempool-update-for-reorg; src/rpc/blockchain.lisp chain-control RPCs; src/zmq.lisp notify functions. Read on Core's side: validation.cpp 285-400 (MaybeUpdateMempoolForReorg), 1985-1994 (InvalidBlockFound), 2925-3145 (DisconnectTip/ConnectTip/ConnectTrace), 3145-3360 (FindMostWorkChain, PruneBlockIndexCandidates, ActivateBestChainStep), 3400-3500 (ActivateBestChain), 3553-3700 (InvalidateBlock); headerssync.cpp in full; kernel/disconnected_transactions.cpp in full; rpc/blockchain.cpp 1695-1786; zmq/zmqnotificationinterface.cpp 148-205. I also reviewed the PR 562 diff to confirm the refactor was mechanical — the phase boundaries, rollback list ordering and interrupt/truncation logic check out against Core's ActivateBestChainStep and I found no regression introduced by the split itself. NOT covered: block-index status persistence and startup roll-forward reconciliation between the coins-view best-block pointer and the chain tip (src/storage/chain.lisp, node/flush.lisp) — the PHASE A critical-flush safety argument depends on that and I did not verify it; the full deep-reorg candidate machinery in ibd.lisp (%best-completable-reorg-target, parking/re-arming) beyond what finding 3 needed; headerssync driver integration in sync-headers/net_processing TryLowWorkHeadersSync; and the assumeutxo snapshot-promotion interaction with perform-reorg. One deliberate divergence I checked and accepted: Core stays on the partially-connected chain after a ConnectTip failure while we roll back in memory — documented in %reorg-connect's note and internally consistent. Also checked and NOT reported (ours is equivalent or better): the disconnect-pool trim direction (matches Core's LimitMemoryUsage front-pop), reconsider-block's ancestor+descendant clearing, header bad-prevblk admission (protocol.lisp:997-1007), and headerssync's redownload previous_nBits (ours tracks the true last header rather than reverting to chain_start.nBits on an emptied buffer).
 
 7. Read in full, ours: src/mining/assembler.lisp (270 lines), src/mining/builder.lisp (132), src/mining/package.lisp, src/rpc/mining.lisp (893 — getblocktemplate incl. proposal/longpoll/cache, getmininginfo, submitblock, submitheader, generatetoaddress/todescriptor/generateblock, getnetworkhashps, prioritisetransaction, getprioritisedtransactions), plus the difficulty and template-validation helpers they call: src/validation/block.lisp:420-590 (testnet-min-difficulty-allowed-p, testnet-walk-back-bits, get-retarget-ancestor, get-expected-bits, validate-difficulty, check-proof-of-work), :629-644 (bip94-timewarp-violation-p), :1152-1173 (update-uncommitted-block-structures), :1922-1969 (test-block-validity, calculate-block-subsidy), src/storage/chain.lisp:500-548 (target-to-bits, calculate-next-work-required), src/mempool/mempool.lisp:77-120 (entry fee/sigops/vsize semantics), src/validation/versionbits.lisp:1-110, src/config-options.lisp:225-252 (-blockmaxweight/-blockreservedweight/-blockmintxfee).
 

@@ -2222,7 +2222,7 @@ hash-table, and the error escaped to the client as \"-32603 Internal error: The
 value #<HASH-TABLE ...> is not of type LIST\" — so the method could not be
 called with prevtxs at all, which is how
 rpc_signrawtransactionwithkey.py:71 calls it. Every unit test passed by handing
-it alists. Same defect as createrawtransaction's inputs in #491, one file over.
+it alists. Same defect as createrawtransaction's inputs, one file over.
 
 Signing needs a key we do not have here; what this pins is that the prevout map
 is BUILT from either shape, so the two must fail identically and never with an
@@ -2257,7 +2257,7 @@ internal error."
 deriveaddresses returns one address array per expansion — an array of arrays
 (rpc_deriveaddresses.py:32-33).
 
-#426 built EXPAND-MULTIPATH-DESCRIPTOR for the wallet's import path, and
+The multipath PR built EXPAND-MULTIPATH-DESCRIPTOR for the wallet's import path, and
 deriveaddresses went on refusing multipath outright, because the refusal lives
 in the key-path parser it reaches first. Another instance of the code existing
 and the caller that needed it not using it.
@@ -2304,7 +2304,7 @@ feature_logging.py starts a node with -debuglogfile=foo.log and then looks for
 <datadir>/<chain>/foo.log.
 
 Ours took a relative path as given, so the log landed wherever the process
-happened to be started from — for a supervised service, /. #478 moved the
+happened to be started from — for a supervised service, /. The debug.log move put the
 DEFAULT debug.log into the network directory and stopped there; this is the
 other half of the same rule."
   (flet ((resolve (log-file) (bl::%resolve-log-file log-file "/tmp/dd/" :regtest)))
@@ -5023,7 +5023,7 @@ NODE_NETWORK on a full node (init.cpp:863,1946), so both names appear."
 
 (test rpc-getpeerinfo-fields
   "getpeerinfo reports a real inbound flag plus startingheight/bytessent/
-bytesrecv, and (since #216) each peer's connection_type + relaytxes. An inbound
+bytesrecv, and each peer's connection_type + relaytxes. An inbound
 peer defaults to conn-type :inbound and relays txs; a block-relay-only peer maps
 to \"block-relay-only\" with relaytxes false. synced_headers/synced_blocks are
 -1 while unknown (Core), and pingtime is absent until a pong arrived (Core
@@ -6003,7 +6003,7 @@ structural."
           (is (= (1+ (* 3 160)) (length (rest-get genesis-hex "hex"))))
           (is (= (* 3 80) (length (rest-get genesis-hex "bin")))))))))
 
-;;; --- /rest/health liveness decision (item #6) ---
+;;; --- /rest/health liveness decision (item 6) ---
 
 (test rest-health-decision-logic
   "health-ok-p feeds /rest/health: HTTP 200 only when the sync thread is alive

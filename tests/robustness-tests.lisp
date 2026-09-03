@@ -148,7 +148,7 @@ connection — enough to drive dispatch + disconnect without a real socket."
   ;; Drive an oversized inv (count 50001 > MAX_INV_SZ) through the REAL per-peer
   ;; dispatch isolation used by the drain loop (safely-dispatch-peer-message).
   ;; The parse error must be caught and disconnect only this peer — never escape
-  ;; to the caller (which in production is the sync thread). Validates #109.
+  ;; to the caller (which in production is the sync thread). Validates the per-peer isolation.
   (let ((peer (%fake-ready-peer))
         (ctx (bl.net::make-ibd)))
     (let ((still-connected

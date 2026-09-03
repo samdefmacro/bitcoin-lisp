@@ -512,14 +512,14 @@ filter, where discover-peers only ever produces IP literals."
       (is (null (bl::%reachable-seed-addresses
                  '("seed.example.invalid" "not an address")))))))
 
-;;; --- GA8: proxied DNS seeding (bootstrap regression from #306) --------------
+;;; --- GA8: proxied DNS seeding (bootstrap regression, GA7 G7-03) --------------
 
 (test reachable-seed-addresses-proxy-hostnames
   "Under -proxy the seed list is deliberately the seed HOSTNAMES, left
 unresolved so the SOCKS5 proxy resolves them inside the tunnel (ATYP
 DOMAINNAME) — Core's `if (HaveNameProxy()) AddAddrFetch(seed)`
 (net.cpp:2356-2357), where a proxied seed stays dialable BY NAME. Dropping
-every candidate parse-network-address cannot classify (#306) therefore
+every candidate parse-network-address cannot classify therefore
 discarded every DNS seed of a proxied node."
   (let ((seeds (bl:network-dns-seeds :mainnet)))
     ;; The affected matrix, asserted rather than assumed: mainnet DNS seeds are
@@ -694,7 +694,7 @@ this node at all."
     (finishes (bl:check-cli-args (list "-regtest" option))
               "~A was rejected" option))
   ;; Accepting is not implementing: the option is reported as supplied.
-  ;; -asmap and -par have both since been IMPLEMENTED (#456, #462), so the
+  ;; -asmap and -par have both since been IMPLEMENTED, so the
   ;; duplicate-collapsing behaviour is asserted with one that is still only
   ;; accepted. That an option LEAVES this list as it gains an implementation is
   ;; the point of the list, and this assertion has now been rewritten twice for

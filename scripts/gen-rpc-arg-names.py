@@ -3,7 +3,7 @@ declarations, in declaration order.
 
 The names are what transformNamedArguments matches a JSON-RPC named parameter
 against (rpc/server.cpp), so they are the table a server needs to accept named
-parameters at all. Core's client.cpp — the source #458 generates the type
+parameters at all. Core's client.cpp — the source the conversion table generates the type
 conversion table from — deliberately lists only arguments that need JSON
 conversion, which structurally excludes every STRING argument. Deriving named
 parameters from it therefore loses `scantxoutset action`, `setban subnet`, and

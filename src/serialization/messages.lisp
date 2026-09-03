@@ -788,7 +788,7 @@ address length, or any address longer than +max-addrv2-address-size+."
          ;; (protocol.h:446), i.e. NO range check. The default cap here
          ;; (+max-compact-size+) made us treat any peer advertising a
          ;; service bit >= 26 as malformed and disconnect it; exposed in
-         ;; production when #245's getaddr started soliciting 1000-entry
+         ;; production when the getaddr fetch started soliciting 1000-entry
          ;; addrv2 replies on mainnet (2026-07-12).
          (services (br-read-compact-size stream :range-check nil))
          (network-id (br-read-u8 stream))

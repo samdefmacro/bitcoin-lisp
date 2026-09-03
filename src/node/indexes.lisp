@@ -275,7 +275,7 @@ why this method lives here rather than in storage."
 init.cpp \"Step 8: start indexers\" -- our catch-ups are synchronous, see
 CATCH-UP-INDEX). Prune locks are re-registered from scratch."
   ;; Transaction index. The catch-up is what makes enabling -txindex on a
-  ;; synced node index history (build-tx-index had no caller until #356);
+  ;; synced node index history (build-tx-index had no caller until the txindex fix);
   ;; it resumes from the best-block marker, so a current index costs one
   ;; marker lookup (ga9-txindex-startup-catch-up-is-wired pins the call).
   (when txindex

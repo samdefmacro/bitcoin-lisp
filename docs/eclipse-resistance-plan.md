@@ -36,7 +36,7 @@ the exact regression its own risk notes forbid.
 
 *Resolved*: `peer-manual` is a slot on the peer struct and
 `peer-outbound-or-block-relay-p` is the shared predicate, both landed with
-G7-18 (PR #311). Use them; do not add a node-scoped variant.
+G7-18 (PR 311). Use them; do not add a node-scoped variant.
 
 **(b) The sweep must not live in `run-ibd`'s download loop.** The original spec
 anchored it at the `consider-peer-eviction` block inside `run-ibd`'s
@@ -94,10 +94,10 @@ checking the stated result against Core sees 1800 and agrees. Core:
 
 ### P0 — prerequisites (DONE)
 
-- `update-block-availability` fed Core's `pindexLast` (PR #308). **Everything
+- `update-block-availability` fed Core's `pindexLast` (PR 308). **Everything
   below reads `peer-best-known-block-hash`; without this it is stale or NIL and
   the whole subsystem silently no-ops.**
-- `peer-manual` + `peer-outbound-or-block-relay-p` (PR #311).
+- `peer-manual` + `peer-outbound-or-block-relay-p` (PR 311).
 
 ### P1 — ConsiderEviction (chain-sync timeout)
 

@@ -537,7 +537,7 @@ DIAL onion peers, not just serve them."
 
 (defun tor-add-onion-command (ctl)
   "The ADD_ONION command line: the cached private key (or NEW:ED25519-V3 on
-first run — key type explicit, Core issue #9214) with the virtual port fixed
+first run — key type explicit, Core issue bitcoin/bitcoin#9214) with the virtual port fixed
 at the chain default, forwarding to our local onion listener."
   (format nil "ADD_ONION ~A Port=~D,~A:~D"
           (or (tor-controller-private-key ctl) "NEW:ED25519-V3")

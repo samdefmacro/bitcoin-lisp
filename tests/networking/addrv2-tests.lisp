@@ -399,7 +399,7 @@ be dropped before delivering anything useful."
 ;;; Our default read-compact-size cap made any peer advertising a service
 ;;; bit >= 26 look malformed, and the whole addrv2 message (e.g. a
 ;;; 1000-entry getaddr reply) was dropped and the peer disconnected.
-;;; Observed live on mainnet 2026-07-12 after #245 started sending getaddr.
+;;; Observed live on mainnet 2026-07-12 after the getaddr fetch started sending getaddr.
 (test parse-addrv2-large-services-bitmask
   "addrv2 entries with high service bits (>= bit 26) must parse."
   (let* ((services (logior (ash 1 26) (ash 1 30) 1033)) ; > +max-compact-size+

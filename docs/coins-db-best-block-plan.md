@@ -62,7 +62,7 @@ artifacts can disagree. Consequences already observed:
   path uses at `:1860` — cannot fix the `destroy-thread` hazard (GA8 S2).
 - A corrupt or missing `chainstate.dat` made the node replay from genesis over
   a populated UTXO set, tripping BIP30 on mainnet and leaving no best-valid-tip
-  (GA8 S1). PR #334 now refuses to start in that case — a guard, not a cure.
+  (GA8 S1). PR 334 now refuses to start in that case — a guard, not a cure.
 - `node.lisp:849` already carries a recovery hack for "UTXO set at h=X, recorded
   tip h=Y", i.e. the divergence is being papered over at runtime.
 
@@ -181,5 +181,5 @@ source of truth.
   placement. The 600s `destroy-thread` fallback is now reached only if a single
   block's validation (plus the bounded mempool re-add) outlasts it — rare rather
   than strictly unreachable, and no longer corrupting when it does fire.
-- Keep PR #334's `:corrupt` refusal after P2 lands: it covers a chainstate file
+- Keep PR 334's `:corrupt` refusal after P2 lands: it covers a chainstate file
   that is unreadable for reasons a replay cannot fix.

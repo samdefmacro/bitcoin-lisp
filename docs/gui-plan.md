@@ -1,6 +1,6 @@
 # GUI — Implementation Plan (web UI served by the node)
 
-Date: 2026-07-15. Status (2026-08-22): **P0-P4 and P6a-d DONE** (PRs #282-#301; see §5); P5 (SSE push) not built.
+Date: 2026-07-15. Status (2026-08-22): **P0-P4 and P6a-d DONE** (PRs 282-301; see §5); P5 (SSE push) not built.
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (`src/qt/` feature inventory).
 Researched via 2 agents (bitcoin-qt screens/architecture; CL GUI toolkit landscape with
 web-verified maintenance status). Companion plan: `docs/wallet-plan.md` (P6 here gates on it).
@@ -101,20 +101,20 @@ Wallet threat model (applies once P6 + wallet-plan land):
 
 | Phase | Deliverable | Test strategy | Size |
 |-------|-------------|---------------|------|
-| **P0** | **DONE (PR #282)** **Serving + auth plumbing**: `/ui/` folder dispatcher + config flag (`-webui`/`-webuipath`); page shell/nav; JS rpc helper (batch, error surfaces) + login screen (Authorization-header auth, no ambient creds); Origin check on RPC POSTs (403 before auth); auto-open-browser-on-startup config flag (`-webuiopen`) for local runs (§4) | unit: dispatcher auth/404 paths; manual: tunnel from Mac to testnet4 node | S |
-| **P1** | **DONE (PR #282)** **Node dashboard**: sync/IBD card (progress, ETA, headers-vs-blocks via getchainstates), peers/mempool/traffic cards, recent-blocks list, warnings banner; 3s batched poll (visibility-paused) | eyeball vs `getblockchaininfo` etc. on both nodes; IBD view exercised on a fresh regtest/testnet sync | S-M |
-| **P2** | **DONE (PR #284)** **Explorer**: block page (header fields, paginated tx list), tx page (inputs w/ client-side prevout resolution — our getblock/getrawtransaction emit no prevout data at any verbosity — outputs, witness, fee/feerate, RBF signal), universal search box; permalinks | spot-check rendering vs the node's own getblock/getrawtransaction JSON (genesis, BIP143 segwit, coinbase edge cases) via a jsdom+stub-RPC harness | M |
-| **P3** | **DONE (PR #286)** **Peers & network ops**: sortable peer table + detail drawer, ban list w/ setban/unban/disconnect, network-active toggle — the write actions of Qt's Peers tab | zero-dep node harness (tests/ui/peers.test.mjs: DOM shim + stubbed fetch drive the real modules — rendering, sorting, action→RPC params) + Lisp serving/wiring tests; manual against testnet4 node post-merge | S-M |
-| **P4** | **DONE (PR #289)** **RPC console**: method autocomplete from `help`, JSON or space-separated params, history, result pretty-print; (wallet selector dropdown arrives with P6) | zero-dep node harness (tests/ui/console.test.mjs: arg parsing, autocomplete, history, result/error rendering, exact RPC POSTs) + Lisp serving/wiring tests; manual against testnet4 node post-merge | S |
+| **P0** | **DONE (PR 282)** **Serving + auth plumbing**: `/ui/` folder dispatcher + config flag (`-webui`/`-webuipath`); page shell/nav; JS rpc helper (batch, error surfaces) + login screen (Authorization-header auth, no ambient creds); Origin check on RPC POSTs (403 before auth); auto-open-browser-on-startup config flag (`-webuiopen`) for local runs (§4) | unit: dispatcher auth/404 paths; manual: tunnel from Mac to testnet4 node | S |
+| **P1** | **DONE (PR 282)** **Node dashboard**: sync/IBD card (progress, ETA, headers-vs-blocks via getchainstates), peers/mempool/traffic cards, recent-blocks list, warnings banner; 3s batched poll (visibility-paused) | eyeball vs `getblockchaininfo` etc. on both nodes; IBD view exercised on a fresh regtest/testnet sync | S-M |
+| **P2** | **DONE (PR 284)** **Explorer**: block page (header fields, paginated tx list), tx page (inputs w/ client-side prevout resolution — our getblock/getrawtransaction emit no prevout data at any verbosity — outputs, witness, fee/feerate, RBF signal), universal search box; permalinks | spot-check rendering vs the node's own getblock/getrawtransaction JSON (genesis, BIP143 segwit, coinbase edge cases) via a jsdom+stub-RPC harness | M |
+| **P3** | **DONE (PR 286)** **Peers & network ops**: sortable peer table + detail drawer, ban list w/ setban/unban/disconnect, network-active toggle — the write actions of Qt's Peers tab | zero-dep node harness (tests/ui/peers.test.mjs: DOM shim + stubbed fetch drive the real modules — rendering, sorting, action→RPC params) + Lisp serving/wiring tests; manual against testnet4 node post-merge | S-M |
+| **P4** | **DONE (PR 289)** **RPC console**: method autocomplete from `help`, JSON or space-separated params, history, result pretty-print; (wallet selector dropdown arrives with P6) | zero-dep node harness (tests/ui/console.test.mjs: arg parsing, autocomplete, history, result/error rendering, exact RPC POSTs) + Lisp serving/wiring tests; manual against testnet4 node post-merge | S |
 | **P5** | *(optional)* **Push channel**: SSE endpoint streaming tip/mempool/peer-count events (hunchentoot chunked stream fed by a small node-side event ring), UI falls back to polling | soak: leave dashboard open through several blocks; kill/restore tunnel | S-M |
-| **P6** | **Wallet screens**, sub-phased to track wallet-plan: **6a DONE (PR #292)** overview+receive+history+address book (needs wallet P1-P3; wallet selector over /wallet/<name>, client-side QR encoder vector-tested byte-exact, mask-values toggle, disabled/empty states); **6b DONE (PR #301)** send + fee UI (wallet P4); **6c DONE** PSBT panel + bumpfee (wallet P5; Core psbtoperationsdialog port); **6d DONE** lifecycle/encryption dialogs (wallet P1/P6; Security tab + UnlockContext port, see §5.1) | 6a: zero-dep node harness (tests/ui/wallet.test.mjs + qr.test.mjs vs machine-generated reference vectors) + Lisp serving/wiring tests; regtest wallet driven end-to-end from the browser; testnet4 send round-trip at 6b | M-L total |
+| **P6** | **Wallet screens**, sub-phased to track wallet-plan: **6a DONE (PR 292)** overview+receive+history+address book (needs wallet P1-P3; wallet selector over /wallet/<name>, client-side QR encoder vector-tested byte-exact, mask-values toggle, disabled/empty states); **6b DONE (PR 301)** send + fee UI (wallet P4); **6c DONE** PSBT panel + bumpfee (wallet P5; Core psbtoperationsdialog port); **6d DONE** lifecycle/encryption dialogs (wallet P1/P6; Security tab + UnlockContext port, see §5.1) | 6a: zero-dep node harness (tests/ui/wallet.test.mjs + qr.test.mjs vs machine-generated reference vectors) + Lisp serving/wiring tests; regtest wallet driven end-to-end from the browser; testnet4 send round-trip at 6b | M-L total |
 
 P1-P5 have **zero dependency on the wallet plan** — ship them now in any order after P0
 (P2 is the most useful day-to-day; P5 can be dropped if polling feels fine).
 
 ### 5.1 6d — the Bitcoin Core cross-reference
 
-Wallet P6 shipped (PR #343), so 6d is unblocked. Core's Qt GUI already contains this
+Wallet P6 shipped (PR 343), so 6d is unblocked. Core's Qt GUI already contains this
 exact dialog set; port its *logic*, not its widgets. Anchors at `refs/bitcoin` d3056bc:
 
 | Core (`src/qt/`) | 6d piece |

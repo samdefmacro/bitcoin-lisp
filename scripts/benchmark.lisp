@@ -42,7 +42,7 @@ trees, depending on whether a GC landed inside the window (observed
 
 (defun bench-signature-cache ()
   (multiple-value-bind (sighash der pubkey) (%bench-fixture)
-    (format t "~&Signature verification (secp256k1 + the #453 cache)~%")
+    (format t "~&Signature verification (secp256k1 + the sigcache)~%")
     (let* ((miss (let ((bitcoin-lisp.coalton.interop::*signature-cache-enabled* nil))
                    (%bench "verify, cache disabled" 2000
                      (bitcoin-lisp.coalton.interop::cached-verify-ecdsa
@@ -63,7 +63,7 @@ that hit is key construction~%"
               (if (plusp hit) (round (* 100 (/ keying hit))) 0)))))
 
 (defun bench-script-execution-cache ()
-  (format t "~&~%Script-execution cache (#454)~%")
+  (format t "~&~%Script-execution cache~%")
   (let ((wtxid (%bytes 32 3)))
     (let ((keying (%bench "cache key construction" 20000
                     (bitcoin-lisp.coalton.interop::make-script-execution-cache-key

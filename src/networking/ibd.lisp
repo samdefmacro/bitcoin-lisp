@@ -357,7 +357,7 @@ info for it yet. Used as a cheap routing proxy for Bitcoin Core's
 FindNextBlocksToDownload ancestor test (net_processing.cpp:1437): a peer
 whose best-known tip is below a block's height cannot have that block.
 Deliberately height-only — no chain ancestor walk — because the
-skip-list ancestor index was reverted for a live regression (PR #71)."
+skip-list ancestor index was reverted for a live regression."
   (let ((bk (peer-best-known-block-hash peer)))
     (when bk
       (let ((entry (bl.store:get-block-index-entry chain-state bk)))
@@ -2180,7 +2180,7 @@ Asking a peer for headers here returns zero and costs a full round trip."
     ;; But peers that FIN during a fork-recovery window do so precisely at
     ;; tip, leaving sockets in CLOSE-WAIT with peer-state stuck :ready and
     ;; the node spinning the empty header poll forever (incident 2026-05-22;
-    ;; recurred 2026-05-24 because PR #73 wired the reap only into the
+    ;; recurred 2026-05-24 because an earlier change wired the reap only into the
     ;; block-download loop). Pump every peer's readable socket once per
     ;; run-ibd invocation — i.e. once per outer 30s sync poll
     ;; (node/state.lisp) — so a dead connection surfaces (zero-progress
@@ -2754,7 +2754,7 @@ threads read/write under the same lock."
 (defun %entry-ancestor-at-height (entry height)
   "ENTRY's ancestor at HEIGHT, walking prev-entry links (Core
 CBlockIndex::GetAncestor without its skip list — this project reverted the
-skip-list walk, #71). NIL when HEIGHT is above ENTRY or the links run out."
+skip-list walk). NIL when HEIGHT is above ENTRY or the links run out."
   (let ((e entry))
     (loop while (and e (> (bl.store:block-index-entry-height e) height))
           do (setf e (bl.store:block-index-entry-prev-entry e)))

@@ -282,7 +282,7 @@ whatever the cadence is."
            ("bytesrecv_per_msg" . ,(bl.net:snapshot-per-msg-table
                                     (bl.net:peer-recv-per-msg peer)))
            ;; Core ConnectionType string (block-relay-only/feeler peers get
-           ;; no tx relay -- #216).
+           ;; no tx relay).
            ;; A manual peer's TYPE is "manual" in Core — ConnectionType::MANUAL
            ;; is a first-class member of the enum (node/connection_types.cpp:13),
            ;; not an outbound-full-relay peer carrying a flag. We keep it as a

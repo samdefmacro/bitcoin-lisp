@@ -780,10 +780,10 @@ fully-downloaded 149120 branch with strictly more work lay on disk."
 
 (test activation-steps-report-the-new-tip-to-stopatheight
   "-stopatheight is checked from CONNECT-BLOCK's tip-EXTENSION arm and, since
-#478, between ACTIVATION STEPS — because every block of an offline reindex is
+the stopatheight fix, between ACTIVATION STEPS — because every block of an offline reindex is
 connected through PERFORM-REORG instead, where the extension arm never runs.
 
-#478 was verified by reading. A benchmark reindex then ran straight past
+That fix was verified by reading. A benchmark reindex then ran straight past
 -stopatheight=134000 to 134898, so the reading was not enough. This probes the
 SEAM: it replaces MAYBE-STOP-AT-HEIGHT with a recorder and asserts
 ACTIVATE-BEST-CHAIN calls it with the height it just activated to. Stubbing is
@@ -2074,7 +2074,7 @@ the retry, not eager arrival-time activation, is what performs the reorg."
                                     bl.net:*ibd-context*)))))))))
 
 ;;;; ===========================================================================
-;;;; Item #12 — Layer-5 reorg / download REGRESSION SUITE
+;;;; Item 12 — Layer-5 reorg / download REGRESSION SUITE
 ;;;;
 ;;;; Locks in the just-shipped layer-5 invariants (per-peer chain-aware
 ;;;; download, AcceptBlock persist gate, deep-reorg candidate set, witness-
@@ -2087,7 +2087,7 @@ the retry, not eager arrival-time activation, is what performs the reorg."
 ;;;; ===========================================================================
 
 (test l5-invalid-reorg-candidate-rejected-and-never-retried
-  "Item #12(1): a consensus-INVALID completable fork noted as a reorg candidate
+  "Item 12(1): a consensus-INVALID completable fork noted as a reorg candidate
 is PERMANENTLY rejected by retry-best-reorg-candidate — it moves to
 ibd-context-rejected-reorg-candidates, the active tip rolls back untouched, and
 it is never re-selected (note-reorg-candidate refuses to re-add a rejected
@@ -2145,7 +2145,7 @@ same deterministic fork failure as reorg-rejects-fork-carrying-invalid-block."
        (clrhash bl.val::*block-undo-data*)))))
 
 (test l5-refused-reorg-requeues-missing-and-keeps-candidate
-  "Item #12(1) contrast: a tip+1 block that WINS on work but whose intermediate
+  "Item 12(1) contrast: a tip+1 block that WINS on work but whose intermediate
 fork bodies are absent yields a transient :reorg-refused. process-received-block
 re-queues the missing (hash . height) blocks into pending (queue-missing-fork-
 blocks) and records the winner as a reorg CANDIDATE (recoverable) — never in the
@@ -2203,7 +2203,7 @@ rejected set. The active tip is untouched until the bodies arrive."
            (is (= 3 (bl.store:current-height csa)))))))))
 
 (test l5-witness-stripped-block-never-persisted
-  "Item #12(2): a witness-stripped block is NEVER persisted at any chain position
+  "Item 12(2): a witness-stripped block is NEVER persisted at any chain position
 — below the tip (competing fork), at tip+1, or above tip (out-of-order) — since a
 stripped body on disk fails every later reorg (the original testnet4 wedge).
 block-exists-p stays NIL for the stripped copy in all three cases. An above-tip
@@ -2274,7 +2274,7 @@ re-fetched; an unsolicited stripped copy does not."
      (clrhash bl.val::*block-undo-data*))))
 
 (test l5-out-of-order-acceptable-boundaries
-  "Item #12(3): %out-of-order-block-acceptable-p boundary cases beyond the
+  "Item 12(3): %out-of-order-block-acceptable-p boundary cases beyond the
 existing coverage. Height boundary: a more-work unsolicited block exactly at
 tip + +min-blocks-to-keep+ is accepted; one height further is rejected (but a
 REQUESTED copy bypasses the gate). Min-work boundary: a more-work in-window
@@ -2322,7 +2322,7 @@ index — no Bitcoin Core vectors."
          (is (bl.net::%out-of-order-block-acceptable-p cand 1 t cs)))))))
 
 (test l5-multi-peer-same-chain-dedups-in-flight
-  "Item #12(4): two ready peers whose best-known block is the SAME fork tip do
+  "Item 12(4): two ready peers whose best-known block is the SAME fork tip do
 not both get the same block in one request-blocks-from-peers pass. Each peer's
 chosen blocks are marked in-flight before the next peer is walked (Core
 FindNextBlocksToDownload marks mapBlocksInFlight), so the two peers PARTITION the
@@ -2378,7 +2378,7 @@ fork range — no hash is requested twice."
              (is-true (gethash h in-flight)))))))))
 
 (test l5-gap-only-backpressure-clamps-to-one-request
-  "Item #12(5): when the out-of-order block-queue is at capacity and the
+  "Item 12(5): when the out-of-order block-queue is at capacity and the
 next-needed (gap) block is absent from it, request-blocks-from-peers lifts
 backpressure for only ONE block — the over-cap gap-only path clamps the total
 request budget to 1, so peers can't flood blocks above a stalled gap (the heap
@@ -2422,7 +2422,7 @@ exhaustion this gate exists to prevent)."
                      (bl.net:ibd-context-in-flight ctx))))))))))
 
 (test l5-historical-download-only-for-base-containing-peer
-  "Item #12(6): find-historical-blocks-to-download returns the assumeutxo
+  "Item 12(6): find-historical-blocks-to-download returns the assumeutxo
 target-ancestor range [hist-tip+1 .. base] ONLY for a peer whose best-known chain
 contains the snapshot base (Core GetAncestor(base->nHeight) == base). A peer on a
 fork that does not contain the base gets nothing. Synthetic chainstates, no
@@ -2482,7 +2482,7 @@ Bitcoin Core vectors."
                       fork-peer cs store 16)))))))))
 
 ;;;; ===========================================================================
-;;;; Item #14 — Mark deterministically-invalid fork blocks :invalid + propagate
+;;;; Item 14 — Mark deterministically-invalid fork blocks :invalid + propagate
 ;;;;            to descendants (Core BLOCK_FAILED_VALID / BLOCK_FAILED_CHILD)
 ;;;;
 ;;;; The ENTIRE risk is classification: poison ONLY on a deterministic consensus

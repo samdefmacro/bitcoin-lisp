@@ -1,6 +1,6 @@
 export const meta = {
   name: 'gap-analysis-10',
-  description: 'Gap analysis #10: bitcoin-lisp vs Bitcoin Core, 13 dimensions, adversarially verified',
+  description: 'Gap analysis 10: bitcoin-lisp vs Bitcoin Core, 13 dimensions, adversarially verified',
   phases: [
     { title: 'Survey', detail: '13 dimension finders, each seeded with GA1-GA9 exclusions' },
     { title: 'Verify', detail: 'refute-biased panel per finding (3 lenses for S1/S2, 1 for S3)' },
@@ -70,7 +70,7 @@ const VERDICT_SCHEMA = {
 const DIMENSIONS = [
   { key: 'consensus-block-tx', scope: 'Block and transaction consensus validation. Ours: src/validation/block.lisp (note it was JUST refactored: %check-block / %contextual-check-block / %reorg-* / connect-block / activate-block), src/validation/transaction.lisp. Core: validation.cpp CheckBlock/ContextualCheckBlock/ConnectBlock/CheckTxInputs, consensus/tx_check.cpp, consensus/tx_verify.cpp.' },
   { key: 'script-interpreter', scope: 'Script interpreter, tapscript, sighash, signature encoding. Ours: src/coalton/script.lisp, src/coalton/interop.lisp, src/validation/script.lisp. Core: script/interpreter.cpp, script/script.cpp, script/sigcache.cpp.' },
-  { key: 'chain-reorg', scope: 'Chain selection, headers, reorg. Ours: src/validation/block.lisp perform-reorg + %reorg-disconnect/%reorg-connect/%reorg-commit (JUST REFACTORED in PR #562 -- scrutinise the phase boundaries, the rollback path and the interrupt handling especially), activate-block, src/networking/headers-sync.lisp. Core: validation.cpp ActivateBestChain/ActivateBestChainStep/DisconnectTip/ConnectTip/FindMostWorkChain, headerssync.cpp.' },
+  { key: 'chain-reorg', scope: 'Chain selection, headers, reorg. Ours: src/validation/block.lisp perform-reorg + %reorg-disconnect/%reorg-connect/%reorg-commit (JUST REFACTORED in PR PR 562 -- scrutinise the phase boundaries, the rollback path and the interrupt handling especially), activate-block, src/networking/headers-sync.lisp. Core: validation.cpp ActivateBestChain/ActivateBestChainStep/DisconnectTip/ConnectTip/FindMostWorkChain, headerssync.cpp.' },
   { key: 'mempool-policy', scope: 'Mempool and policy. Ours: src/mempool/*.lisp, src/validation/transaction.lisp validate-transaction-for-mempool, src/validation/packages.lisp. Core: txmempool.cpp, validation.cpp MemPoolAccept (PreChecks/PolicyScriptChecks/ConsensusScriptChecks), policy/rbf.cpp, policy/truc_policy.cpp, policy/packages.cpp, policy/fees.cpp.' },
   { key: 'p2p-protocol', scope: 'P2P message handling and transport. Ours: src/networking/protocol.lisp, peer.lisp, ibd.lisp, v2-transport.lisp, connection.lisp. Core: net_processing.cpp, net.cpp, bip324.cpp, protocol.cpp.' },
   { key: 'peer-addrman', scope: 'Peer management, addrman, eviction, ban/discourage. Ours: src/networking/addrman.lisp, netaddress.lisp, peerdb.lisp, torcontrol.lisp, socks5.lisp, src/node/peers.lisp. Core: addrman.cpp, net.cpp eviction, netaddress.cpp, torcontrol.cpp, netbase.cpp.' },
@@ -80,7 +80,7 @@ const DIMENSIONS = [
   { key: 'crypto-encoding', scope: 'Crypto primitives and canonical encodings. Ours: src/crypto/*.lisp, src/serialization/*.lisp. Core: crypto/*, key.cpp, pubkey.cpp, serialize.h, primitives/*, compressor.cpp, psbt.cpp.' },
   { key: 'mining', scope: 'Block template assembly, coinbase, witness commitment, difficulty. Ours: src/mining/*.lisp, src/rpc/mining.lisp. Core: node/miner.cpp, rpc/mining.cpp, pow.cpp.' },
   { key: 'config-lifecycle', scope: 'Option parsing, parameter interactions, init order, shutdown. Ours: src/config/*.lisp, src/config-options.lisp, src/config.lisp, src/node/args.lisp, init.lisp, shutdown.lisp. Core: common/args.cpp, common/config.cpp, common/settings.cpp, init.cpp.' },
-  { key: 'refactor-regression', scope: 'REFACTOR-INDUCED REGRESSION. In the last week 43 PRs (#521-#562) restructured this tree: src/ split into nine ASDF sub-systems, symbols moved down layers (*network*, network-magic, the pruning knobs, the token bucket, *interrupt-check*, compute-crc32, the config parsers), src/node/ and src/rpc/ were carved up, validate-block and perform-reorg were split, and tests/ moved into per-module directories. Read `git log --oneline 3470694 -60` and `git diff` on the riskiest of those commits. Hunt for BEHAVIOUR that changed as a side effect of a move: a re-exported symbol that is now a different object, a special read before it is set, an :apply/:global option row that no longer fires, a hook that lost its caller, a phase boundary that changed evaluation order. This dimension has no Core counterpart -- compare against our own pre-refactor behaviour (git show <old>:<path>).' },
+  { key: 'refactor-regression', scope: 'REFACTOR-INDUCED REGRESSION. In the last week 43 PRs (the cleanup refactor) restructured this tree: src/ split into nine ASDF sub-systems, symbols moved down layers (*network*, network-magic, the pruning knobs, the token bucket, *interrupt-check*, compute-crc32, the config parsers), src/node/ and src/rpc/ were carved up, validate-block and perform-reorg were split, and tests/ moved into per-module directories. Read `git log --oneline 3470694 -60` and `git diff` on the riskiest of those commits. Hunt for BEHAVIOUR that changed as a side effect of a move: a re-exported symbol that is now a different object, a special read before it is set, an :apply/:global option row that no longer fires, a hook that lost its caller, a phase boundary that changed evaluation order. This dimension has no Core counterpart -- compare against our own pre-refactor behaviour (git show <old>:<path>).' },
 ]
 
 const finderPrompt = (d) => `You are one of thirteen finders in the 10th gap analysis of bitcoin-lisp,
@@ -220,7 +220,7 @@ const [report, critic] = await parallel([
   () => agent(`Write the 10th gap analysis report for bitcoin-lisp vs ${CORE}, to be saved as
 docs/gap-analysis-10.md in ${REPO}. WRITE THE FILE with the Write tool.
 
-Baseline: main @ 3470694 (immediately after a 43-PR refactor, #521-#562).
+Baseline: main @ 3470694 (immediately after a 43-PR refactor, the cleanup refactor).
 Prior rounds: docs/gap-analysis-8.md, docs/gap-analysis-9.md. Unlike GA9, this round DID run an
 adversarial refute-biased verification pass -- say so, and give the numbers.
 
