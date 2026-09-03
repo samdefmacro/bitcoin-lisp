@@ -1169,7 +1169,7 @@ literal do not end a string."
   "The project packages LINES name with an explicit prefix -- a full name or
 a local nickname, followed by a colon -- in CODE: string literals and ;
 comments are blanked first, so a prefix quoted in a docstring (a user-agent
-\"/bl:0.1.0/\", an example call) does not count."
+\"/bitcoin-lisp:0.1.0/\", an example call) does not count."
   (let ((found '()) (in-string nil))
     (flet ((name-char-p (c) (or (alphanumericp c) (find c ".-"))))
       (loop for raw across lines
