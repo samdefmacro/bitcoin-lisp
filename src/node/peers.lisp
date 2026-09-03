@@ -177,7 +177,7 @@ and make-tcp-connection hands each one to the proxy inside the SOCKS5 CONNECT
 (ATYP DOMAINNAME, socks5.lisp) for the proxy to resolve. That mirrors Core's
 'if (HaveNameProxy()) AddAddrFetch(seed)' (net.cpp:2356-2357): a proxied seed
 stays dialable BY NAME. Dropping those unconditionally (this filter's behaviour
-as first written, PR #306) left a proxied node with a fresh datadir zero dial
+as first written) left a proxied node with a fresh datadir zero dial
 candidates on mainnet/signet/testnet3 — they have hostname DNS seeds and no
 fixed-seed list, so it could not bootstrap at all.
 

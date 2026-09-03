@@ -9,7 +9,7 @@
 ;;;; and everything we draw from it whose whole value is unpredictability —
 ;;;; addr-relay Poisson timers, initial-broadcast jitter, addrman bucket
 ;;;; selection and the GetAddr shuffle, ping/reconciliation nonces, and (once
-;;;; merged) #310's getaddr-cache expiry jitter and #312's feefilter delays —
+;;;; merged) the getaddr-cache expiry jitter and the feefilter delays —
 ;;;; becomes a stable cross-restart fingerprint. Core draws all of these from
 ;;;; OS-seeded contexts: FastRandomContext (random.h:394, net.cpp:3728) and
 ;;;; PeerManagerImpl::m_rng (net_processing.cpp:2009), deterministic only under

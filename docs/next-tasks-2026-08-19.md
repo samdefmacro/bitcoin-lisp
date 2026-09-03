@@ -16,9 +16,9 @@ waves. Verified against the tree at `0b39885`:
 | Item | Evidence in tree |
 |---|---|
 | G7-04 wallet auto-load / `load_on_startup` | `src/rpc/wallet.lisp:1145-1250` (settings.json) |
-| G7-05 txindex startup catch-up | PR #356, `src/node.lisp` catch-up call |
+| G7-05 txindex startup catch-up | PR 356, `src/node.lisp` catch-up call |
 | G7-07 wallet encryption + backup | wallet P6 (2026-08-17) |
-| G7-08 outbound eclipse resistance | PR #348 |
+| G7-08 outbound eclipse resistance | PR 348 |
 | G7-12 `AreInputsStandard` prevout gate | `src/validation/transaction.lisp:888` |
 | G7-13 bare P2PK standard | `classify-output-script` → `:pubkey` |
 | G7-14 P2A classification | `pay-to-anchor-p` in the same solver |
@@ -45,8 +45,8 @@ G7-61, G7-62..69 (8 test-vector corpora).
 
 ## 1. The executable list — status
 
-Done and merged this session: **G7-09** (#357), **G7-06 / G7-29 / G7-30 /
-G7-31 / G7-57** (#358), **G7-25 / G7-63 / G7-64** (#359). G7-63 found and fixed
+Done and merged this session: **G7-09** (PR 357), **G7-06 / G7-29 / G7-30 /
+G7-31 / G7-57** (PR 358), **G7-25 / G7-63 / G7-64** (PR 359). G7-63 found and fixed
 a real defect: `bech32-decode` never enforced BIP173's `[33,126]` character
 range, so a space or high byte in the HRP decoded fine.
 

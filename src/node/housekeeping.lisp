@@ -27,7 +27,7 @@ respawning straight back into the same trigger."
   (when (and chainstate (bl.store:chain-state-target-blockhash chainstate))
     (return-from maybe-stop-at-height nil))
   ;; Under -debug=net, say WHICH guard declined when the height has been
-  ;; reached. #478 wired this into the activation-step loop and a benchmark
+  ;; reached. The stopatheight fix wired this into the activation-step loop and a benchmark
   ;; reindex then ran straight past -stopatheight=134000 to 134898. The seam is
   ;; connected — ACTIVATION-STEPS-REPORT-THE-NEW-TIP-TO-STOPATHEIGHT proves
   ;; activate-best-chain calls this with the height it reached — so the refusal

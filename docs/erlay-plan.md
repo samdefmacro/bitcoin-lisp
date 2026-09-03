@@ -1,6 +1,6 @@
 # Erlay / BIP330 Transaction Reconciliation — Implementation Plan
 
-Date: 2026-07-10. Status (2026-08-22): **P0-P4 DONE** — P0 live-loop wiring (#242/#243), P1 handshake, P2-P4 (PRs #387-#390) behind default-off `-txreconciliation`; minisketch interop with Core's C library is UNVERIFIED (no Core reference exists beyond the handshake). See §6.
+Date: 2026-07-10. Status (2026-08-22): **P0-P4 DONE** — P0 live-loop wiring (PRs 242/243), P1 handshake, P2-P4 (PRs 387-390) behind default-off `-txreconciliation`; minisketch interop with Core's C library is UNVERIFIED (no Core reference exists beyond the handshake). See §6.
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (v30-dev). Researched via 2 agents
 (Core Erlay/BIP330 + minisketch; our networking layer).
 
@@ -29,10 +29,10 @@ getdata on `mempool` (handle-inv :131→:344), compact-block paths on `mempool`,
 serving in `handle-getdata` on `mempool`, and addr/addrv2/getaddr on `address-book`/`peers`
 (:161-175). Net effect in production: **loose-tx ingestion, tx-inv requesting, tx serving,
 compact-block relay, addr-gossip ingestion/relay, and `relay-transaction` are all inert** —
-they run only from unit tests and RPC. (PR #236/#239 paths included.)
+they run only from unit tests and RPC. (PR 236/239 paths included.)
 
 Related dead wiring, also verified: `maintain-peers` (src/node.lisp:1993) has **zero callers** —
-so block-relay slots + feelers (PR #216) and outgoing pings (`check-peers-health`) never run
+so block-relay slots + feelers (PR 216) and outgoing pings (`check-peers-health`) never run
 live; `peer-send-queue` (peer.lisp:31) is declared but unused.
 
 **P0 below fixes this first.** Any relay feature (Erlay included) is meaningless until then.
@@ -105,7 +105,7 @@ missing wtxids; failure: one extension round (`reqsketchext`) then full-flood fa
 
 | Phase | Deliverable | Size | Status vs Core |
 |-------|-------------|------|----------------|
-| **P0** | ✅ **DONE 2026-07-10** (PRs #242 + #243, deployed): live-loop wiring + `maintain-peers` + Core `IsInitialBlockDownload` latch; deploy verification exposed that `handle-inv` also dropped all MSG_WTX announcements — fixed (BIP339 announce/request both directions). testnet4 mempool fills from P2P; latch logged | S-M | **bug fix — done** |
+| **P0** | ✅ **DONE 2026-07-10** (PRs 242 + 243, deployed): live-loop wiring + `maintain-peers` + Core `IsInitialBlockDownload` latch; deploy verification exposed that `handle-inv` also dropped all MSG_WTX announcements — fixed (BIP339 announce/request both directions). testnet4 mempool fills from P2P; latch logged | S-M | **bug fix — done** |
 | **P1** | Core-parity sendtxrcncl: config flag (default off, DEBUG-style), message codec + handshake send/receive rules + verack forget + salt storage; `compute-recon-salt` tagged-hash with a vector generated from Core | S-M | Core parity ✅ |
 | P2 | (parked) per-peer recon sets + AddToSet in relay-transaction + fanout selection + timer | M | beyond Core |
 | P3 | (parked) pure-Lisp minisketch (GF(2^32), BM, trace roots) byte-exact vs C vectors | M | beyond Core |

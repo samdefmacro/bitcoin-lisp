@@ -967,7 +967,7 @@ hex+psbt without committing."
             (is (= 1 (length (bl.ser:transaction-inputs
                               (bl.ser:psbt-tx psbt)))))))))))
 
-;;; --- Adversarial-review regression tests (PR #293 review round) ---
+;;; --- Adversarial-review regression tests (review round) ---
 
 (test ws-sffo-negative-data-output-rejected
   "B2: SFFO driving an OP_RETURN output negative is DUST (threshold 0) and

@@ -278,7 +278,7 @@ drift cannot turn this control into a false alarm."
 ;;;; Global hash tables and thread safety
 ;;;;
 ;;;; A plain SBCL hash table taking concurrent read-through inserts corrupts
-;;;; silently. #462 fixed one instance (the coins view's CVC-ENTRIES, written
+;;;; silently. The parallel-validation work fixed one instance (the coins view's CVC-ENTRIES, written
 ;;;; by parallel script-check workers through COLLECT-SPENT-UTXOS) by resolving
 ;;;; the coins on the validation thread first. Two more survived that audit
 ;;;; because they live a layer down, inside the interpreter and the crypto

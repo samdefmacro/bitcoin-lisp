@@ -178,7 +178,7 @@ quietly.")
 ;;; which walks src/rpc/*.cpp and src/wallet/rpc/*.cpp. Do not hand-edit: rerun the
 ;;; script against refs/bitcoin.
 ;;;
-;;; It has to come from RPCHelpMan and not from client.cpp, which is where #458's
+;;; It has to come from RPCHelpMan and not from client.cpp, which is where the earlier
 ;;; type-conversion table comes from. client.cpp lists only arguments that need
 ;;; JSON CONVERSION, so it structurally omits every STRING argument. A named-parameter
 ;;; table derived from it is missing `scantxoutset action`, `setban subnet`,

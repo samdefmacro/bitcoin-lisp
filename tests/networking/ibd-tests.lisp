@@ -1392,7 +1392,7 @@ net_processing.cpp:4145-4152)."
 (test recent-rejects-are-wtxid-keyed
   "A rejected witness tx lands in the rejects filter under its WTXID,
 never its txid — the witness can be malleated, so the same txid with a
-different witness could still be valid (Core issue #8279,
+different witness could still be valid (Core issue bitcoin/bitcoin#8279,
 txdownloadman_impl.cpp MempoolRejectedTx). No-witness txs are covered
 since wtxid = txid there."
   (let* ((input (bl.ser:make-tx-in

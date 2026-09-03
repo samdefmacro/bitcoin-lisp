@@ -615,7 +615,7 @@ not mutation evidence."
      (is (eq :disconnected (bl.net:peer-state peer))))))
 
 ;;;; ====================================================================
-;;;; Per-reason punishment on the compact path (GA8 W4, review finding on #326)
+;;;; Per-reason punishment on the compact path (GA8 W4, review finding)
 ;;;;
 ;;;; Core's MaybePunishNodeForBlock is a SWITCH, and via_compact_block exempts
 ;;;; three of its seven arms (net_processing.cpp:1908-1950): BLOCK_CONSENSUS,

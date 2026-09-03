@@ -1,7 +1,7 @@
 # 8th gap analysis — bitcoin-lisp vs Bitcoin Core (refs/bitcoin @ d3056bc)
 
 Date: 2026-07-26. Baseline: `main` @ `0074bf1` plus the merged wave-4 work and the
-six open PRs #309–#314 (working tree on `net-g7-08-eclipse`).
+six open PRs 309–314 (working tree on `net-g7-08-eclipse`).
 
 **Method.** 8 parallel finder agents (one per dimension), each seeded with an
 exclusion list of the 69 known GA7 items so it would only report *new* findings,
@@ -137,7 +137,7 @@ Direction is strictly we-reject / Core-accepts: our budget is short by
 `CompactSize(len) + len`, so an annex sized to push the total past a multiple of
 50 costs us a sigop and we reject a block Core accepts. Annexes are non-standard
 for relay, so this arrives only in a mined block — the pure split vector.
-PR #304 rewrote the *decrement* side as an exact transliteration but never
+PR 304 rewrote the *decrement* side as an exact transliteration but never
 touched the *initialisation* side. No test covers budget initialisation; the
 BIP341 tests all bind the weight variable directly.
 
@@ -263,7 +263,7 @@ our address book directly, this is the sole chokepoint for every solicited
 ~2.5 months. This silently undercuts the entire GA7 anti-eclipse investment,
 since addrman diversity is the substrate those mechanisms select from.
 
-**A bootstrap regression from PR #306.** `%reachable-seed-addresses` drops
+**A bootstrap regression from PR 306.** `%reachable-seed-addresses` drops
 anything `parse-network-address` cannot classify, but under `-proxy` the seed
 list is deliberately *hostnames* so SOCKS5 can resolve them. With `-proxy` set
 and no `-onlynet`, every DNS seed is filtered out. Testnet4 survives on its fixed
@@ -282,15 +282,15 @@ unknown-parent compact block with `getheaders`. No attacker is needed: fall one
 block behind, receive the next block from a high-bandwidth peer, and we exile our
 fastest honest block-relay peer.
 
-**Open-PR defects, catchable before merge.** In #314 the P2 protection counter
+**Open-PR defects, catchable before merge.** In PR 314 the P2 protection counter
 only ever increments — `release-outbound-protection` has no production caller —
 so after one round of peer churn no peer can ever earn eclipse protection again,
-inverting the feature's purpose. In #311 the low-work disconnect runs after
+inverting the feature's purpose. In PR 311 the low-work disconnect runs after
 *every* branch of header ingestion, including shapes where Core returns early, so
 an outbound peer sending a normal BIP130 announcement during early IBD can be
 dropped; the in-code comment justifying the placement is factually wrong.
-Also: #309 and #312 both insert a peer struct field at the same spot, so the
-second merge needs a careful re-diff, and #310/#312 draw from SBCL's unseeded
+Also: PR 309 and PR 312 both insert a peer struct field at the same spot, so the
+second merge needs a careful re-diff, and PRs 310/312 draw from SBCL's unseeded
 `*random-state*`, making their anti-fingerprinting jitter deterministic across
 restarts.
 
@@ -417,7 +417,7 @@ seven times:
 
 ## GA7 backlog status
 
-Of the 69 GA7 items: **10 merged, 6 in the open PRs #309–#314, 53 remaining** —
+Of the 69 GA7 items: **10 merged, 6 in the open PRs 309–314, 53 remaining** —
 12 S2 and 41 S3, with no S1s left from that round. The heaviest remaining are
 G7-07 (wallet encryption and backup, still the bar to a mainnet wallet), G7-21
 (fee estimator port), G7-23 (ZMQ), G7-24 (taproot script-path descriptors), and
@@ -437,7 +437,7 @@ Core-faithful either.
 3. **The three script/consensus S1s (S1-3, S1-4, S1-5)** — independent of each
    other, each small, each a clean chain-split cell.
 4. **Header MTP (S1-7)** — one-line primary fix plus the fail-loud change.
-5. **The open-PR defects** before merging #309–#314, then the network S2 cluster
+5. **The open-PR defects** before merging 309–314, then the network S2 cluster
    (addr window, proxy seeds, compact-block punishment), which together restore
    the anti-eclipse posture GA7 wave 4 was meant to deliver.
 6. Supervisor and coinstatsindex together, since the first triggers the second.

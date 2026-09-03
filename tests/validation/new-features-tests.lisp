@@ -1,7 +1,7 @@
 (in-package #:bitcoin-lisp.tests)
 
 (def-suite :new-features-tests
-  :description "Tests for Bitcoin Core comparison features (PRs #13-#21)"
+  :description "Tests for Bitcoin Core comparison features (the Core-comparison PRs)"
   :in :bitcoin-lisp-tests)
 
 (in-suite :new-features-tests)

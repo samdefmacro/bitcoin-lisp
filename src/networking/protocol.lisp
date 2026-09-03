@@ -3457,7 +3457,7 @@ does the IO (getheaders / getdata / disconnect) outside."
       ;; Core also re-requests the block by plain getdata here when it had
       ;; asked THIS peer for it. We do not track that per-peer state, and the
       ;; block-download timeout is the single mechanism that re-routes a
-      ;; request here (see the notfound removal in PR #402), so there is
+      ;; request here (see the notfound removal), so there is
       ;; nothing to send.
       ((and known
             (let ((tip-hash (bl.store:best-block-hash chain-state)))

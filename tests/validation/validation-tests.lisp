@@ -1881,7 +1881,7 @@ accepting e.g. an OP_0 scriptPubKey spent with an empty scriptSig."
   "validate-transaction-scripts (the mempool consensus-script entry, shared
 with the block path via validate-input-script) also rejects a witnessless
 v0 spend post-activation. The mempool additionally pre-gates these as
-:witness-stripped BEFORE reaching the script engine (PR #273) so the P2P
+:witness-stripped BEFORE reaching the script engine so the P2P
 reject classification is preserved; this test pins the engine-level
 agreement underneath that gate."
   (let* ((bl:*network* :mainnet)

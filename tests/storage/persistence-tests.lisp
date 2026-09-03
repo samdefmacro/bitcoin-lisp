@@ -239,7 +239,7 @@ place. Then the next save must write v3 and reload cleanly."
              (is (null (bl.store:block-index-entry-data-pos ea)))
              (is (null (bl.store:block-index-entry-undo-pos ea))))
            ;; A v2 load must leave the index clean, or every start would write a
-           ;; full snapshot and undo the delta-log work of #366.
+           ;; full snapshot and undo the delta-log work of the delta-log change.
            (is (null (bl.store::%changed-header-index-entries state)))
            ;; Now give one entry a position and save; the file becomes v3.
            (let ((ea (bl.store:get-block-index-entry state a)))
@@ -849,7 +849,7 @@ one unanswered for TIMEOUT_INTERVAL (20 min) disconnects the peer."
         "a 0 last-ping-time must be read as a TIME, not as \"never\" — the two ~
 must stay distinguishable or the fix is indistinguishable from the bug")))
 
-;;;; Misbehavior Tests (binary model — Bitcoin Core PRs #25325 / #26294)
+;;;; Misbehavior Tests (binary model — bitcoin/bitcoin#25325 / bitcoin/bitcoin#26294)
 
 (test peer-misbehavior-is-binary
   "A single misbehavior event discourages and disconnects the peer (no

@@ -5,7 +5,7 @@
 # Core's test/functional suite is this project's behavioural oracle
 # (docs/next-wave-2026-08-22.md track B): it drives a real node over RPC and
 # P2P and asserts on what it observes, which is the class of defect a
-# 33k-check unit suite structurally cannot see. #417 proved one test passes;
+# 33k-check unit suite structurally cannot see. The first run proved one test passes;
 # this makes the whole suite runnable on demand, which is what turns it into an
 # oracle rather than an anecdote.
 #

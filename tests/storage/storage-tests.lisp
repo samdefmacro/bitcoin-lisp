@@ -136,7 +136,7 @@ addressed through the block store and chain state instead: a rev record is
 found by the block index entry that points at it, never by scanning a
 directory.
 
-#466 briefly routed this through a resolver that preferred blocks/ whenever
+A later change briefly routed this through a resolver that preferred blocks/ whenever
 blocks/ held anything. blocks/ ALWAYS holds something — the block files — so on
 a real testnet4 node it pointed undo storage at blocks/ while 154,198 legacy
 per-block records sat in undo/, making every one of them unreachable and every
@@ -159,7 +159,7 @@ cannot be repeated as a refactor."
 
 (test datadir-resolvers-have-callers
   "Every resolver in kv/datadir.lisp must be REACHED by the node, not
-merely defined. #461 shipped DATADIR-UNDO-PATH with no caller — the undo site
+merely defined. The datadir-layout change shipped DATADIR-UNDO-PATH with no caller — the undo site
 still hardcoded \"undo/\" — so the resolver was dead code and the option it
 implements did nothing. That was found by starting a real node and reading its
 log, not by any unit test, which is why this one exists."

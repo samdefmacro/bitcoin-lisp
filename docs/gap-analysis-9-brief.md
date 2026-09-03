@@ -85,12 +85,12 @@ omitting Core's timelock commitment; non-async-signal-safe SIGTERM handler; unsy
 stream writes. Plus: tests/data untracked via a bare `data/` gitignore rule, so the taproot
 spend-vector test hard-errors in a fresh clone; and G7-15/19/20/38 recorded open but actually done.
 
-## GA8 (2026-07-26) — all 7 S1s fixed (PRs #316–#320), S2s addressed (#321–#329)
+## GA8 (2026-07-26) — all 7 S1s fixed (PRs 316–320), S2s addressed (321–329)
 Same-block chained spends skipping script validation; intra-block double-spend + inflation;
 tapscript 520B/1000-item limits; tapscript weight budget omitting the annex; P2SH sigop counting;
 RPC auth never enforced; header MTP unenforced mid-batch. S2s: 3-hour gossip window discarding
-addresses; proxied seed hostnames dropped; compact blocks punishing honest peers; #314 protection
-counter; #311 low-work disconnect placement; supervisor/flush race; coinstatsindex rewind;
+addresses; proxied seed hostnames dropped; compact blocks punishing honest peers; PR 314 protection
+counter; PR 311 low-work disconnect placement; supervisor/flush race; coinstatsindex rewind;
 JSON-RPC 1.x reply shape; empty collections as null; getblockheader nTx; getblockstats fields;
 /rest/headers non-contiguity; 1p1c package relay + reconsiderable-rejects; bumpfee CheckFeeRate;
 unseeded *random-state*; txindex torn tail; corrupt chainstate.dat / BIP30 replay brick;
@@ -99,11 +99,11 @@ unseeded *random-state*; txindex torn tail; corrupt chainstate.dat / BIP30 repla
 ## GA7 (2026-07-23) — roadmap G7-01..G7-69, ALL KNOWN
 G7-01 tapscript CHECKSIG ordering (FIXED) · G7-02 BIP341 SIGHASH_SINGLE out-of-range (FIXED) ·
 G7-03 -onlynet DNS leak (FIXED) · G7-04 wallet auto-load (FIXED) · G7-05 txindex no startup
-catch-up · G7-06 corrupt headerindex.dat · G7-07 wallet encryption+backup (DONE, PR #343) ·
+catch-up · G7-06 corrupt headerindex.dat · G7-07 wallet encryption+backup (DONE, PR 343) ·
 G7-08 outbound eclipse resistance (P1/P2 done, **P3 open**) · G7-09 maxfeerate/maxburnamount ·
-G7-10 handle-getdata guards · G7-11..14 relay policy (FIXED) · G7-15 BIP133 feefilter (DONE #312) ·
+G7-10 handle-getdata guards · G7-11..14 relay policy (FIXED) · G7-15 BIP133 feefilter (DONE PR 312) ·
 G7-16 BIP152 HB mode (partial) · G7-17 named RPC args · G7-18 sub-minchainwork drop (DONE) ·
-G7-19 self-connection detection (DONE #309) · G7-20 GetAddr cache (DONE #310) · G7-21 fee estimator ·
+G7-19 self-connection detection (DONE PR 309) · G7-20 GetAddr cache (DONE PR 310) · G7-21 fee estimator ·
 G7-22 estimatesmartfee contract · G7-23 ZMQ · G7-24 taproot script-path descriptors ·
 G7-25 key_io vectors · G7-26 taproot script-assets corpus · G7-27 VerifyDB · G7-28 flush failures
 swallowed · G7-29 datadir .lock · G7-30 debug-log management · G7-31 -maxmempool ·
@@ -129,13 +129,13 @@ coinstatsindex, BIP158 GCS, sigcache, skip-list ancestor. RPC: the ~140-method s
 tor onion, txgraph, BIP155, Erlay handshake, SOCKS5.
 
 ## New since GA8 (2026-08-16/17) — the fixes are IN SCOPE for new defects
-PR #332 live-node wedges (receive-bytes blocking forever, %socks5-recv, sync-blockchain NIL peer,
-inbound admission queue). PRs #333–#338 coins-DB alignment (streamed UTXO hash, corrupt chainstate
+PR 332 live-node wedges (receive-bytes blocking forever, %socks5-recv, sync-blockchain NIL peer,
+inbound admission queue). PRs 333–338 coins-DB alignment (streamed UTXO hash, corrupt chainstate
 detection, coins-DB best block, same-batch write, startup reconciliation, reorg block-boundary
-interrupt via `*interrupt-check*`). PR #339 mempool import progress + signal trapping.
-PRs #340–#342 resumable v1 reader, resumable v2/BIP324 reader with MAX_RESERVE_AHEAD, header sync
-on the shared pump with per-pass byte bounds and %maybe-send-getheaders throttling. PR #343 Wallet
-P6 (crypter, encryption lifecycle, relock timer, logical-dump backup). PRs #344–#347 GUI 6c/6d.
+interrupt via `*interrupt-check*`). PR 339 mempool import progress + signal trapping.
+PRs 340–342 resumable v1 reader, resumable v2/BIP324 reader with MAX_RESERVE_AHEAD, header sync
+on the shared pump with per-pass byte bounds and %maybe-send-getheaders throttling. PR 343 Wallet
+P6 (crypter, encryption lifecycle, relock timer, logical-dump backup). PRs 344–347 GUI 6c/6d.
 Already-found defects in that work — do NOT re-report: locked wallet still signing via the embedded
 xprv; backupwallet RENAME-FILE writing nothing; walletpassphrasechange making a timed unlock
 permanent; wallet-db-records not checking leveldb_iter_get_error; %path-under-p defeated by `..`;
@@ -187,7 +187,7 @@ Scope: `src/networking/{protocol,connection,v2-transport,socks5}.lisp`,
 Oracle: `src/net.cpp` (V1Transport/V2Transport/CNode/SocketHandler), `src/net_processing.cpp`
 (ProcessMessage — every handler), `src/protocol.cpp`, `src/bip324.cpp`,
 `src/crypto/chacha20poly1305.cpp`.
-PRs #332/#340/#341/#342 rewrote the whole read path days before this analysis. Read them
+PRs 332/340/341/PR 342 rewrote the whole read path days before this analysis. Read them
 adversarially (`git log -p`, worktree only).
 Hunt: resumable v1/v2 state-machine holes — a message of declared length 0, exactly at the boundary,
 a valid header followed by a different message's bytes; can the accumulated buffer, `recv-framing`,
@@ -203,7 +203,7 @@ Core's rejection of messages before VERSION/VERACK, duplicate VERSION, the `fSuc
 gate. Checksum and unknown-command handling, and whether a malformed message desynchronises the
 stream rather than being skipped cleanly. SOCKS5 reply bounds, auth negotiation, domain-name length.
 
-## storage — storage & indexes  ← newest code (#333–#338)
+## storage — storage & indexes  ← newest code (333–338)
 Scope: `src/storage/*.lisp`, `src/serialization/compressor.lisp`.
 Oracle: `src/txdb.cpp`, `src/coins.{cpp,h}`, `src/dbwrapper.cpp`, `src/node/blockstorage.cpp`,
 `src/index/{base,blockfilterindex,coinstatsindex,txindex}.cpp`, `src/compressor.cpp`,
@@ -223,7 +223,7 @@ removal inverse. Block file magic/size prefix, `-prune` interaction with indexes
 detection. LevelDB CFFI: iterator lifetime, `leveldb_free` ownership, error-string handling,
 use-after-close.
 
-## wallet — wallet  ← newest code (#343)
+## wallet — wallet  ← newest code (PR 343)
 Scope: `src/rpc/{wallet,wallet-store,wallet-coins,wallet-spend,wallet-tx,wallet-crypt,descriptors,
 psbt}.lisp`, `src/crypto/{crypter,bip32,address}.lisp`, `src/serialization/psbt.lisp`.
 Oracle: `src/wallet/{wallet,scriptpubkeyman,spend,coinselection,feebumper,crypter,walletdb,receive,
@@ -250,7 +250,7 @@ the input's prevout txid** — missing that is how wallets get tricked into sign
 Scope: `src/rpc/{server,methods,accessors,rest,merkleproof,ui}.lisp`, `ui/`, `tests/ui/`.
 Oracle: `src/rpc/{server,request,blockchain,mempool,net,rawtransaction,mining,util}.cpp`,
 `src/httpserver.cpp`, `src/httprpc.cpp`, `src/rest.cpp`, `src/univalue/`.
-Hunt: the HTTP server as an attack surface now that auth is enforced (#318) and the UI is served
+Hunt: the HTTP server as an attack surface now that auth is enforced (PR 318) and the UI is served
 from the same place — header parsing bounds, request-body size limits, chunked encoding, keep-alive
 state, concurrent connections and worker queue depth (`-rpcthreads`, `-rpcworkqueue`), slow-loris on
 the RPC port, and whether an unauthenticated request can make us allocate or work **before** the

@@ -409,18 +409,18 @@ before this fix are never re-validated (the already-have branch skips them).
 
 ---
 
-## Wave 3 — open PR defects (do before merging #309–#314)
+## Wave 3 — open PR defects (do before merging 309–314)
 
 Edit the existing PR branches; these are corrections to unmerged work.
 
-- **#314 — protection slots leak (S2).** `release-outbound-protection`
+- **PR 314 — protection slots leak (S2).** `release-outbound-protection`
   (`ibd.lisp:2352-2357`) has no production caller, so `*protected-outbound-count*`
   only ever increments; after one churn cycle no peer can earn eclipse protection
   again, inverting the feature. Call it from `disconnect-peer`
   (`peer.lisp:339-359`) and the node.lisp replace/health paths, asserting it never
   goes negative (Core `FinalizeNode`, `net_processing.cpp:1717-1718`). Test:
   protect 4 peers, disconnect them, verify a fifth can then be protected.
-- **#311 — disconnect fires on shapes Core never evaluates (S2).**
+- **PR 311 — disconnect fires on shapes Core never evaluates (S2).**
   `maybe-disconnect-low-work-outbound` runs after *every* branch of
   `ingest-headers-from-peer` (`ibd.lisp:2576`, `:2640-2641`). Core early-returns
   for empty batches (`net_processing.cpp:2969-2981`), unconnecting headers
@@ -429,17 +429,17 @@ Edit the existing PR branches; these are corrections to unmerged work.
   (`:3113`). Move it there and delete the incorrect justification comment at
   `ibd.lisp:2634-2639`. Test: a BIP130 announcement with an unknown parent during
   IBD must not disconnect.
-- **#313 — HB selection (S3).** `forget-hb-announcing-peer` has no call site;
+- **PR 313 — HB selection (S3).** `forget-hb-announcing-peer` has no call site;
   promotion happens before block validation (Core promotes only on
   `state.IsValid()`, `net_processing.cpp:2219-2223`); full-block deliveries never
   promote. Wire the first, move promotion after validation, and add the
   full-block path.
-- **Unseeded `*random-state*` (S3).** #310's cache-expiry jitter and #312's
+- **Unseeded `*random-state*` (S3).** PR 310's cache-expiry jitter and PR 312's
   feefilter draws are identical on every start. Seed from the CSPRNG at startup,
-  as #309 correctly did. This is a **generic SBCL lesson** — add it to
+  as PR 309 correctly did. This is a **generic SBCL lesson** — add it to
   `~/.claude/skills/common-lisp/SKILL.md` per that file's §0.
-- **Merge order.** #309 and #312 both insert a peer `defstruct` field immediately
-  after `(version nil)`; #312's node.lisp hunk was cut against a pre-`06384db`
+- **Merge order.** PR 309 and PR 312 both insert a peer `defstruct` field immediately
+  after `(version nil)`; PR 312's node.lisp hunk was cut against a pre-`06384db`
   base. Textual conflicts are guaranteed — re-diff the second merge, because a
   silently dropped hunk disables a feature without failing a test.
 
@@ -456,7 +456,7 @@ Edit the existing PR branches; these are corrections to unmerged work.
   handles them, at selection time (`addr-info-terrible-p`). Also add Core's
   service-bit filter (`:4087`). Test: an address with a 20-day-old timestamp is
   stored but not relayed.
-- **Proxied DNS seeding (regression from #306).** `%reachable-seed-addresses`
+- **Proxied DNS seeding (regression from PR 306).** `%reachable-seed-addresses`
   (`node.lisp:3011-3030`) drops hostnames, but under `-proxy` the seed list is
   deliberately hostnames for SOCKS5 to resolve. Change the predicate to
   `(if net (reachable-network-p net) proxy-configured-p)`, mirroring
@@ -475,7 +475,7 @@ Edit the existing PR branches; these are corrections to unmerged work.
   literally and produced a *demonstrated* DoS regression where a peer replays
   invalid-PoW compact blocks indefinitely on one connection, each costing a full
   `build-shortid-map` SipHash pass over every mempool entry. Measured: `origin/main`
-  discourages and disconnects on message #1; the over-broad fix left the peer
+  discourages and disconnects on the first message; the over-broad fix left the peer
   `:READY` and merely sent a getdata.) Core's `via_compact_block` exemption covers
   only `BLOCK_CONSENSUS`, `BLOCK_MUTATED` and conditionally `BLOCK_CACHED_INVALID`
   (`net_processing.cpp:1920-1926`) — two of seven switch arms.

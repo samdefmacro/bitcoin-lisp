@@ -5,7 +5,7 @@
 ;;;; The capability the flat block files were worth having for. Until now a
 ;;;; corrupt or lost headerindex.dat meant re-downloading the chain: the node
 ;;;; refuses to start rather than run with an empty index that contradicts its
-;;;; chainstate (#358), and there was nothing to rebuild it from — one file per
+;;;; chainstate, and there was nothing to rebuild it from — one file per
 ;;;; block, named by a hash, with no way to know what was in them without
 ;;;; opening all of them.
 ;;;;

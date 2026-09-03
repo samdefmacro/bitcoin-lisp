@@ -688,7 +688,7 @@ connect."
   ;; STORE and chain state instead (a rev record is found by the block index
   ;; entry that points at it, never by scanning a directory).
   ;;
-  ;; #466 briefly routed this through a DATADIR-UNDO-PATH resolver that
+  ;; An earlier change briefly routed this through a DATADIR-UNDO-PATH resolver that
   ;; preferred blocks/ whenever blocks/ held anything. blocks/ ALWAYS holds
   ;; something — the block files — so on a real testnet4 node it moved the undo
   ;; directory to blocks/ while 154,198 legacy per-block records sat in undo/,
@@ -994,7 +994,7 @@ end now: new headers arrived, or the node is behind known work and
     ;; block instead of waiting out the
     ;; 30s poll.
     ;; Record a tip advance observed this
-    ;; second (item #6 durable liveness).
+    ;; second (item 6 durable liveness).
     (note-node-tip-progress *node*)
     (when (plusp (bl.net:ibd-context-headers-received pump))
       (return-from %sync-idle-tick t))
@@ -1038,7 +1038,7 @@ block is noticed within a tick, ended early by new headers or known work."
   (unwind-protect
        (sync-blockchain *node*)
     (setf (node-syncing *node*) nil))
-  ;; Durable at-tip liveness signal (item #6):
+  ;; Durable at-tip liveness signal (item 6):
   ;; record a tip advance whenever this sync pass
   ;; raised the active-chain height.
   (note-node-tip-progress *node*)
@@ -1047,7 +1047,7 @@ block is noticed within a tick, ended early by new headers or known work."
   ;; retry, slot refill, dedicated block-relay
   ;; slots, and feeler probes. maintain-peers was
   ;; previously dead code — nothing called it, so
-  ;; the PR #216 block-relay/feeler conns and
+  ;; the block-relay/feeler conns and
   ;; ping-timeout eviction never ran live.
   (maintain-peers *node*)
   ;; Periodic peers.dat dump (Core DumpAddresses
@@ -1060,7 +1060,7 @@ block is noticed within a tick, ended early by new headers or known work."
   ;; announced block can be noticed, and a
   ;; propagation spans two of them — which is the
   ;; flat 2s diag/propagation_probe.py still
-  ;; measures after #507 removed the header round
+  ;; measures after the propagation work removed the header round
   ;; trip.
   ;;
   ;; Sub-second ticks, with the same 30s ceiling: the
@@ -1131,7 +1131,7 @@ thread."
         ;; new tips via sendheaders (BIP 130); %SYNC-PASS's 30s poll is
         ;; the backstop for inv-only peers and missed announcements.
         (loop while (node-running *node*)
-              ;; Per-iteration error containment (item #5): a
+              ;; Per-iteration error containment (item 5): a
               ;; transient error must retry the loop, never unwind
               ;; out of it and end the thread. handler-bind logs a
               ;; live-stack backtrace at the error site; the
@@ -1250,7 +1250,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
     ;; Fresh recent-confirmed filter (Core builds it per process; covers
     ;; in-image restarts).
     (bl.val:reset-recent-confirmed)
-    ;; Seed the durable at-tip liveness signal (item #6) so a freshly-started,
+    ;; Seed the durable at-tip liveness signal (item 6) so a freshly-started,
     ;; already-at-tip node reports healthy on /rest/health before its first new
     ;; block. last-tip-height starts at the current tip so only genuine advances
     ;; bump the timestamp.

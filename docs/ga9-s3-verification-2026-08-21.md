@@ -23,9 +23,9 @@ listed as such rather than assumed either way.
 
 | Cluster | Status |
 |---|---|
-| Config & lifecycle (8 findings) | Fixed, PR #395 |
-| Signal safety + log interleaving | Fixed, PRs #373 and #394 |
-| Basic-auth latin-1 decode | Fixed, PR #396 |
+| Config & lifecycle (8 findings) | Fixed, PR 395 |
+| Signal safety + log interleaving | Fixed, PRs 373 and 394 |
+| Basic-auth latin-1 decode | Fixed, PR 396 |
 | N4 fork-body retry | Fixed, this wave |
 
 ---
@@ -147,7 +147,7 @@ these has been verified in either direction** — they are as GA9 wrote them.
   are not exempt from discouragement and can never be redialled; outbound
   netgroup diversity frozen at startup over a candidate list fixed at boot.
 - Storage: `loadtxoutset` never writes the snapshot coins-DB best-block pointer
-  (opts assumeutxo out of the invariant PRs #335-#338 established);
+  (opts assumeutxo out of the invariant PRs 335-338 established);
   `coins-view-cache-add` marks a slot FRESH under `:allow-overwrite` where Core
   guards with a `logic_error`.
 - Script: the single-CHECKSIG `FindAndDelete` pattern disagrees with

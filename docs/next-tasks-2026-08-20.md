@@ -15,10 +15,10 @@ report (`docs/gap-analysis-9.md`), the GA8 Wave 8 triage
 
 | Track | State |
 |---|---|
-| Consensus | GA9's 9 S1s all fixed and deployed (#352). No known consensus divergence. |
-| GA9 S2 | All 14 fixed and deployed (#354). Three follow-ups deliberately deferred (below). |
+| Consensus | GA9's 9 S1s all fixed and deployed (PR 352). No known consensus divergence. |
+| GA9 S2 | All 14 fixed and deployed (PR 354). Three follow-ups deliberately deferred (below). |
 | GA9 S3 | **~43 open, and no adversarial-verification pass has ever run on this round.** |
-| GA8 Wave 8 (= GA7 backlog) | 19 were already fixed incidentally; 13 fixed since (#357-#360, #365-#370); **~30 open**. |
+| GA8 Wave 8 (= GA7 backlog) | 19 were already fixed incidentally; 13 fixed since (357-360, 365-370); **~30 open**. |
 | Wallet | P0-P4 + P6 done; P5 RPCs all present; P7 partial (4 RPCs missing = G7-42); Sparrow acceptance never run. |
 | Web UI | P0-P4 + P6a-d done. P5 (SSE push) optional, not built. |
 | Big features | assumeutxo P0-P6 done; cluster mempool P0-P9 (P10 optional); Tor P0-P3 done (**the plan doc is stale and says P2+ not started**); Erlay = handshake only; block-file-format deferred. |
@@ -90,7 +90,7 @@ on, so an SBCL type-error is emitted like this:
                                                                           10)
 ```
 
-That is the *fd > 1023 select() bug* (PR #351) reported by the very mechanism
+That is the *fd > 1023 select() bug* (PR 351) reported by the very mechanism
 written to catch it — and it took a session to diagnose partly because grep on
 the log returns only `... non-I/O error: The`. Bind `*print-pretty*` to nil (or
 squash newlines) when a condition goes into a log line. Pairs with GA9's S3
@@ -118,10 +118,10 @@ from us and work against Core. Found by having it happen during today's survey.
 ## 2a. Found while deploying the fix for the above
 
 **N6. Five of the six block-activation call sites on the IBD path never passed
-the transaction index.** PR #372 fixed the *arrival* path
+the transaction index.** PR 372 fixed the *arrival* path
 (`accept-downloaded-block`); the deploy of the observability PR immediately
 rescanned the whole txindex from genesis again, and the diagnostic added in
-#371 said why: `marker-off-chain`. `activate-best-chain` and the four
+PR 371 said why: `marker-off-chain`. `activate-best-chain` and the four
 `activate-block` calls in `src/networking/ibd.lisp` all take `:tx-index` and all
 omitted it, so every block reaching the chain through the drain, retry, reorg
 and periodic-activation paths was connected with the index switched off — its
@@ -199,7 +199,7 @@ is the single most reliable error-catcher this project has.
   rejects; `anchors.dat` is never consumed on read; outbound netgroup diversity
   frozen at startup.
 - **Storage**: `loadtxoutset` never writes the snapshot coins-DB best-block
-  pointer (opts assumeutxo out of the invariant #333-#338 established);
+  pointer (opts assumeutxo out of the invariant 333-338 established);
   `gettxoutsetinfo` makes three flush-and-rescan passes and mixes chain tip with
   coins-DB pointer, so its `(height, hash_serialized_3)` pair can be
   self-inconsistent — and that hash is the assumeutxo commitment; three LevelDB

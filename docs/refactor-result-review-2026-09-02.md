@@ -1,6 +1,6 @@
 # Refactoring results review (2026-09-02)
 
-Object: the 14 PRs executed against `docs/refactoring-review-2026-09-02.md` (#567-#581, main `3be72c2`), ledger
+Object: the 14 PRs executed against `docs/refactoring-review-2026-09-02.md` (567-581, main `3be72c2`), ledger
 `docs/refactor-ledger.md` rows A, B1, B2, C1, C2, C3, C4, D1, D2, D3, E, F, F2, G. Starting commit `0a7dd5f`.
 
 ## 1. Conclusion

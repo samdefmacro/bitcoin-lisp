@@ -1545,7 +1545,7 @@ are likely unproductive. Returns T if the peer should be disconnected."
 ;;;    ephemeral rolling filter. We never dial it, prefer it for inbound
 ;;;    eviction, and don't gossip it — but it is not hard-banned (which
 ;;;    previously let a peer grow our banned map without bound). Bitcoin Core's
-;;;    misbehavior model is BINARY (PRs #25325 / #26294): a single protocol
+;;;    misbehavior model is BINARY (PRs bitcoin/bitcoin#25325 / bitcoin/bitcoin#26294): a single protocol
 ;;;    violation marks the peer for discouragement — there is no accumulating
 ;;;    ban score, and loose (non-block) transaction-validation failures do not
 ;;;    count as misbehavior at all.

@@ -873,7 +873,7 @@ script-check worker calls it — the P2SH/WITNESS/SIGPUSHONLY gates run on every
 script, so this table is on the hottest path a worker has. Concurrent
 read-through inserts into a plain SBCL hash table corrupt it silently.
 
-This is the same defect #462 fixed for the coins view (COLLECT-SPENT-UTXOS
+This is the same defect the parallel-validation work fixed for the coins view (COLLECT-SPENT-UTXOS
 inserting into a non-synchronized CVC-ENTRIES), missed because it lives a layer
 down in the interpreter rather than in the validation code that was audited.
 The signature and script-execution caches were already synchronized
@@ -1164,7 +1164,7 @@ the table's own structure.")
   ;; process-global value visible to other threads during execution and
   ;; relied on unwind-protect to restore — racy across workers and a
   ;; suspected source of the intermittent h=67100-67105 tapscript bug
-  ;; (Task #22). With dynamic let, each thread gets its own binding
+  ;; (task 22). With dynamic let, each thread gets its own binding
   ;; stack and globals are never observably mutated.
   ;; *tapscript-validation-weight-left* is bound by the caller
   ;; (validate-taproot-script-path); we don't rebind it here so decf
@@ -2966,7 +2966,7 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
                 ;; used setf on the global (no rebind) and relied on
                 ;; run-tapscript's unwind-protect to restore — racy
                 ;; across worker threads and a suspected cause of the
-                ;; intermittent h=67100-67105 tapscript bug (Task #22).
+                ;; intermittent h=67100-67105 tapscript bug (task 22).
                 ;; The budget is GetSerializeSize(witness.stack)
                 ;; (interpreter.cpp:1979) — the annex, control block and script
                 ;; all still counted, because Core's pops are SpanPopBack on a

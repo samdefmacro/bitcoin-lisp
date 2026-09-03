@@ -78,7 +78,7 @@ const refactor = await agent(
 `You are the finder for the one gap-analysis dimension that never ran: REFACTOR-INDUCED REGRESSION.
 Working directory: ${REPO}. This is a Bitcoin full node in Common Lisp.
 
-In the last week 43 PRs (#521-#562) restructured this tree:
+In the last week 43 PRs (the cleanup refactor) restructured this tree:
 - src/ was split into nine ASDF sub-systems (util, crypto, logging, config, kv, serialization,
   storage, net, rpc-server), each compiled before the next.
 - Symbols MOVED DOWN layers and are re-exported from the top package: *network*, network-magic,

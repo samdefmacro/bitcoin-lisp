@@ -2083,7 +2083,7 @@ rejected for unranged ones; combo() P2PK scripts are skipped like Core."
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))
     ;; A multipath descriptor denotes SEVERAL descriptors, and Core returns one
     ;; address array per expansion — an array of arrays (rpc_deriveaddresses.py
-    ;; :32-33). #426 built the expander for the wallet's import path;
+    ;; :32-33). The multipath PR built the expander for the wallet's import path;
     ;; deriveaddresses went on refusing multipath outright, because the refusal
     ;; lives in the key-path parser it reaches first.
     (let ((expansions (expand-multipath-descriptor desc-str)))

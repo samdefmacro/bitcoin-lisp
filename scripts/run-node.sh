@@ -65,7 +65,7 @@ case "$NETWORK" in
     # exercise the LevelDB txindex from GA9 S2-13 against a real chain -- the
     # previous in-memory implementation could not run at mainnet scale at all,
     # so this path has never had production exposure.
-    # :flat-block-files is the LIBRARY DEFAULT since 2026-08-26 (PR #513), so
+    # :flat-block-files is the LIBRARY DEFAULT since 2026-08-26, so
     # this is now redundant here and kept only because it states the intent at
     # the place an operator reads. New blocks go into Core's numbered
     # blk?????.dat instead of one file per block; the existing per-block files
@@ -75,8 +75,8 @@ case "$NETWORK" in
   mainnet)
     HEAP=5120; RPC_PORT=8332
     DATA_DIR="$BL_DATA_ROOT/mainnet-prune/"; LOG="$BL_LOG_ROOT/mainnet.log"
-    # :flat-block-files EXPLICITLY OFF. It became the library default in PR
-    # #513, and this line said nothing about it — so that change would have
+    # :flat-block-files EXPLICITLY OFF. It became the library default on
+    # 2026-08-26, and this line said nothing about it — so that change would have
     # switched mainnet's on-disk format on its next restart, silently, with no
     # line in this file to say so. Mainnet is the PRUNED node and the one
     # carrying years of per-block files; the block-file plan stages it behind a

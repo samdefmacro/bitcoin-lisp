@@ -58,7 +58,7 @@
   ;; addnode "onetry": one-shot dial requests handed off to the sync thread so
   ;; node-peers stays single-writer (only the sync thread pushes to it).
   (pending-onetry '() :type list)
-  ;; Durable at-tip liveness signal (item #6). last-tip-advance-time is the
+  ;; Durable at-tip liveness signal (item 6). last-tip-advance-time is the
   ;; node clock (get-node-time, so setmocktime reaches it) of the last observed active-chain tip
   ;; advance; last-tip-height is the tip height at that observation. Unlike the
   ;; ibd-context copy (nil between sync passes), these persist so the
@@ -130,7 +130,7 @@ never clobbered utxo-set)."
 (defvar *node-start-time* nil
   "Unix time the node was started (set by start-node); basis for the uptime RPC.")
 
-;;;; At-tip liveness signal (item #6): a durable, node-level record of when the
+;;;; At-tip liveness signal (item 6): a durable, node-level record of when the
 ;;;; active chain tip last advanced, plus the /rest/health decision it feeds.
 ;;;; The ibd-context copy (networking) is nil between sync passes; these node
 ;;;; slots persist so an external monitor can distinguish a live, progressing
