@@ -59,7 +59,7 @@ the real yason pipeline."
               (search "\"localrelay\":false" net)))
       ;; subversion comes from the shared user-agent variable (slash-free
       ;; probe: yason may escape '/').
-      (is (search "bl:0.1.0" net)))
+      (is (search "bitcoin-lisp:0.1.0" net)))
     (let ((mem (wave10-encode (bl.rpc::rpc-getmempoolinfo node nil))))
       (is (search "\"loaded\":true" mem))
       (is (search "\"permitbaremultisig\":" mem)))))
@@ -587,7 +587,7 @@ hex digits, left-padded; junk/overlong -> NIL."
         (bl:*dns-seed-enabled* t)
         (bl:*fixed-seeds-enabled* t)
         (bl:*stop-at-height* 0)
-        (bl.ser:*user-agent* "/bl:0.1.0/")
+        (bl.ser:*user-agent* "/bitcoin-lisp:0.1.0/")
         (bl.net:*external-ips* '())
         ;; reachability tail scratch state
         (bl.net:*reachable-networks* '())
@@ -629,7 +629,7 @@ hex digits, left-padded; junk/overlong -> NIL."
     (is (= 12345 bl:*stop-at-height*))
     ;; -uacomment (repeatable, BIP14)
     (bl::apply-config-globals '(("uacomment" . "alpha") ("uacomment" . "beta")))
-    (is (string= "/bl:0.1.0(alpha; beta)/"
+    (is (string= "/bitcoin-lisp:0.1.0(alpha; beta)/"
                  bl.ser:*user-agent*))
     (signals error (bl::apply-config-globals '(("uacomment" . "bad(char)"))))
     (signals error (bl::apply-config-globals
@@ -642,11 +642,11 @@ hex digits, left-padded; junk/overlong -> NIL."
 (test wave10-format-subversion
   "FormatSubVersion parity (Core clientversion.cpp:67-72) + sanitizer; the
 user agent is built from the one client version constant."
-  (is (string= "/bl:0.1.0/" (bl.ser:format-user-agent '())))
-  (is (string= "/bl:0.1.0(a; b)/"
+  (is (string= "/bitcoin-lisp:0.1.0/" (bl.ser:format-user-agent '())))
+  (is (string= "/bitcoin-lisp:0.1.0(a; b)/"
                (bl.ser:format-user-agent '("a" "b"))))
   ;; Unstamped build: the build-rev composition is the plain user agent.
-  (is (string= "/bl:0.1.0(a; b)/"
+  (is (string= "/bitcoin-lisp:0.1.0(a; b)/"
                (bl.ser:subversion-with-build-rev '("a" "b"))))
   (is-true (bl:ua-comment-safe-p "Safe comment .,;-_?@ 123"))
   (is-false (bl:ua-comment-safe-p "bad(char)")))
