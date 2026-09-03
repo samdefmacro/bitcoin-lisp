@@ -143,7 +143,7 @@ an ordinary cold run (observed 2026-08-19: three misdiagnoses including a
 false bisect). `cl-workbench validation run cold-unit-fresh`
 (= `scripts/docker-test.sh --fresh-fasl`) runs the battery on a brand-new
 volume that is removed afterwards; it costs the Coalton build, a few minutes.
-Any PR that changes a macro or a defstruct verifies with it.
+Any change to a macro or a defstruct verifies with it before it is merged.
 
 Eval exit codes: 0 ok / 1 lisp error (+backtrace) / 2 connection (image down,
 NOT your code — dev.sh start) / 3 timed out+interrupted (image survives;
@@ -162,7 +162,7 @@ import, or delete it.
 When you write a `⚠️` in a commit message or a doc because something here was
 a trap, record it in the same turn:
 
-    ~/.claude/skills/develop-common-lisp/scripts/lesson add SLUG "what happened and what to do" "bitcoin-lisp#<PR> or docs/<file>"
+    ~/.claude/skills/develop-common-lisp/scripts/lesson add SLUG "what happened and what to do" "bitcoin-lisp <commit subject or date> or docs/<file>"
 
 (blockchain-specific traps: add `--skill develop-blockchain-with-common-lisp`
 before SLUG). No branch, review, or approval is needed for the log line. Exit 3
