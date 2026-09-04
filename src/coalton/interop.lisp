@@ -724,27 +724,23 @@ Returns (values success error-keyword)."
   (let ((*original-script-pubkey* script-pubkey)
         (had-witness nil))
 
-    ;; Step 0a: CONST_SCRIPTCODE pre-check on scriptPubKey
-    ;; Must check before Coalton engine executes and strips OP_CODESEPARATOR
-    (when (flag-enabled-p "CONST_SCRIPTCODE")
-      (let ((i 0) (slen (length script-pubkey)))
-        (loop while (< i slen)
-              do (let ((op (aref script-pubkey i)))
-                   (when (= op #xab)
-                     (return-from verify-script (values nil :op-codeseparator)))
-                   (cond
-                     ((and (>= op 1) (<= op 75)) (incf i (1+ op)))
-                     ((= op 76) (if (< (1+ i) slen) (incf i (+ 2 (aref script-pubkey (1+ i)))) (incf i)))
-                     ((= op 77) (if (< (+ i 2) slen)
-                                    (incf i (+ 3 (aref script-pubkey (1+ i))
-                                                (ash (aref script-pubkey (+ i 2)) 8)))
-                                    (incf i)))
-                     (t (incf i)))))))
-
-    ;; Step 0b: SIGPUSHONLY check on scriptSig (before execution)
+    ;; Step 0a: SIGPUSHONLY check on scriptSig — Core tests it before any
+    ;; script runs (interpreter.cpp:2012-2014).
     (when (flag-enabled-p "SIGPUSHONLY")
       (unless (script-is-push-only-p script-sig)
         (return-from verify-script (values nil :sig-pushonly))))
+
+    ;; Step 0b: CONST_SCRIPTCODE rejects OP_CODESEPARATOR in EVERY legacy script
+    ;; EvalScript runs, executed or not: the check sits in the opcode loop ABOVE
+    ;; the fExec guard (interpreter.cpp:474-476), and EvalScript runs three times
+    ;; per legacy input — scriptSig (:2020), scriptPubKey (:2023) and the P2SH
+    ;; redeem script (:2069, step 5b below). SigVersion::BASE only; witness v0
+    ;; and tapscript keep OP_CODESEPARATOR. We pre-scan because the Coalton
+    ;; engine consumes the opcode as it executes.
+    (when (and (flag-enabled-p "CONST_SCRIPTCODE")
+               (or (script-contains-codeseparator-p script-sig)
+                   (script-contains-codeseparator-p script-pubkey)))
+      (return-from verify-script (values nil :op-codeseparator)))
 
     ;; Step 1-3: Execute scriptSig + scriptPubKey (+ P2SH if enabled)
     (let ((p2sh-enabled (and (flag-enabled-p "P2SH")
@@ -776,12 +772,25 @@ Returns (values success error-keyword)."
               (unless wok
                 (return-from verify-script (values nil werr))))))
 
-        ;; Step 6: P2SH-wrapped witness handling (interpreter.cpp:2050-2092)
-        (when (and (flag-enabled-p "WITNESS") p2sh-enabled (not had-witness))
-          ;; Core reads the redeem script off the stack top (see
-          ;; p2sh-redeem-script), never off the scriptSig bytes.
+        ;; Steps 5b and 6 both read the P2SH redeem script, which Core takes off
+        ;; the stack top (see p2sh-redeem-script), never off the scriptSig bytes.
+        ;; Derived once, and only when one of the two will look at it — the
+        ;; derivation runs the scriptSig through the engine.
+        (when (and p2sh-enabled
+                   (or (flag-enabled-p "CONST_SCRIPTCODE")
+                       (and (flag-enabled-p "WITNESS") (not had-witness))))
           (let ((redeem-script (p2sh-redeem-script script-sig)))
-            (when (and redeem-script (is-witness-program-p redeem-script))
+            ;; Step 5b: the redeem script is the third script EvalScript runs
+            ;; (interpreter.cpp:2069), so CONST_SCRIPTCODE rejects an
+            ;; OP_CODESEPARATOR in it too — this is the arm a spender can
+            ;; actually reach, a scriptSig carrying one not being push-only.
+            (when (and (flag-enabled-p "CONST_SCRIPTCODE")
+                       redeem-script
+                       (script-contains-codeseparator-p redeem-script))
+              (return-from verify-script (values nil :op-codeseparator)))
+            ;; Step 6: P2SH-wrapped witness handling (interpreter.cpp:2050-2092)
+            (when (and (flag-enabled-p "WITNESS") (not had-witness)
+                       redeem-script (is-witness-program-p redeem-script))
               (setf had-witness t)
               ;; BIP141 (consensus — WITNESS is a MANDATORY flag): the scriptSig
               ;; must be EXACTLY a single canonical push of the witness program.
@@ -1494,6 +1503,23 @@ CScript::GetOp returning false."
           nil                                     ; truncated push payload
           p))))
 
+(defun script-contains-codeseparator-p (script)
+  "T when SCRIPT carries OP_CODESEPARATOR as an OPCODE. A 0xab byte inside a
+push payload is data and does not count, so the walk steps over pushes with
+%script-next-op — Core\'s GetOp — and stops where GetOp fails on a truncated
+push, which is where Core\'s EvalScript loop reports BAD_OPCODE and reads no
+further."
+  (let ((len (length script))
+        (pc 0))
+    (loop while (< pc len)
+          do (when (= (aref script pc) #xab)
+               (return-from script-contains-codeseparator-p t))
+             (let ((next (%script-next-op script pc)))
+               (unless next
+                 (return-from script-contains-codeseparator-p nil))
+               (setf pc next)))
+    nil))
+
 (defun find-and-delete (script pattern)
   "Remove occurrences of PATTERN from SCRIPT at OPCODE BOUNDARIES ONLY
 (Core FindAndDelete, script/interpreter.cpp:229-256).
@@ -2053,26 +2079,10 @@ encoded it separately and disagreed above 75 bytes."
       (when pk-err
         (return-from verify-checksig (values nil pk-err))))
 
-    ;; CONST_SCRIPTCODE: reject if the scriptCode carries OP_CODESEPARATOR as an
-    ;; opcode. LEGACY ONLY: Core gates it on sigversion == SigVersion::BASE
-    ;; (interpreter.cpp:474-476) — in witness v0 scripts OP_CODESEPARATOR is
-    ;; legal. tx_valid.json's segwit codeseparator vectors fail without it.
-    (when (and (flag-enabled-p "CONST_SCRIPTCODE")
-               (not *witness-v0-mode*))
-      (let ((sc (or *current-script-code* script-pubkey)))
-        ;; Check for OP_CODESEPARATOR opcodes (walking script properly)
-        (let ((i 0) (slen (length sc)))
-          (loop while (< i slen)
-                do (let ((op (aref sc i)))
-                     (when (= op #xab)
-                       (return-from verify-checksig (values nil :op-codeseparator)))
-                     (cond
-                       ((and (>= op 1) (<= op 75)) (incf i (1+ op)))
-                       ((= op 76) (if (< (1+ i) slen) (incf i (+ 2 (aref sc (1+ i)))) (incf i)))
-                       ((= op 77) (if (< (+ i 2) slen)
-                                      (incf i (+ 3 (aref sc (1+ i)) (ash (aref sc (+ i 2)) 8)))
-                                      (incf i)))
-                       (t (incf i))))))))
+    ;; CONST_SCRIPTCODE's OP_CODESEPARATOR rule is not checked here: Core keeps
+    ;; it in EvalScript's opcode loop, not in EvalChecksigPreTapscript, so it
+    ;; covers scripts and branches no CHECKSIG ever reaches. verify-script
+    ;; step 0b/5b scans all three legacy scripts before any of them runs.
 
     ;; Compute sighash and verify
     (let* ((subscript-raw (or *current-script-code* script-pubkey))
