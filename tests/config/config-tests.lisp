@@ -1813,14 +1813,18 @@ compares against, and scripts/conformance-config.sh publishes bitcoin-lisp."
 
 (test settings-json-false-becomes-a-negation
   "A JSON false is how Core stores -nofoo, so it has to reach the config layer
-as the \"0\" the option readers understand — not as the string \"false\"."
-  (let ((cells (bl:settings-alist->config-alist
-                (bl:parse-settings-json
-                 "{\"listen\": false, \"prune\": \"550\", \"txindex\": true}"
-                 "/d/settings.json"))))
-    (is (string= "0" (cdr (assoc "listen" cells :test #'string=))))
-    (is (string= "550" (cdr (assoc "prune" cells :test #'string=))))
-    (is (string= "1" (cdr (assoc "txindex" cells :test #'string=))))))
+as the \"0\" the option readers understand — not as the string \"false\" — while
+the row keeps the stored `false` that tells the merge it is a NEGATION."
+  (let ((rows (bl:settings-config-rows
+               (bl:parse-settings-json
+                "{\"listen\": false, \"prune\": \"550\", \"txindex\": true}"
+                "/d/settings.json"))))
+    (flet ((row (name) (assoc name rows :test #'string=)))
+      (is (equal '("listen" "0" "false") (row "listen")))
+      (is (equal '("prune" "550" "\"550\"") (row "prune")))
+      (is (equal '("txindex" "1" "true") (row "txindex")))
+      (is-true (bl.cfg:setting-row-negated-p (row "listen")))
+      (is-false (bl.cfg:setting-row-negated-p (row "prune"))))))
 
 (test settings-json-unknown-keys-are-reported
   "Core logs one `Ignoring unknown rw_settings value` per unrecognized key and
@@ -1898,6 +1902,124 @@ string \"x\" (args.cpp:105-126, 880-884)."
   (let ((globals (bl.cfg:conf-global-entries
                   (format nil "nolisten=1~%regtest=1~%"))))
     (is (string= "0" (cdr (assoc "listen" globals :test #'string=))))))
+
+(test a-negated-repeatable-option-clears-its-span
+  "For a list option Core's GetSettingsList erases the span up to and including
+the last negation (SettingsSpan::begin() = data + negated(), settings.cpp:264-274)
+and stops reading lower-precedence sources (`done |= span.negated() > 0`, :240),
+so `-rpcauth=a -rpcauth=b -norpcauth` answers with an EMPTY list.
+
+We appended the negation to the list as the literal string \"0\", and every
+consumer that parses a list element then chokes on it. rpc_users.py:178-181
+restarts a node with exactly those three arguments and expects a live RPC
+server with both credentials revoked; here PARSE-RPCAUTH-ENTRY rejected \"0\",
+%PARSE-RPCAUTH-CREDENTIALS returned :INVALID and START-RPC-SERVER returned NIL
+— the node came up with no RPC at all. -noonlynet and -nodebugexclude were
+worse: `Unknown network specified in -onlynet: \"0\"` and `Unsupported logging
+category -debugexclude=0.` are startup FAILURES on command lines Core accepts."
+  (let ((auth (getf (start-node-plist
+                     '("-rpcauth=u1:aa$bb" "-rpcauth=u2:cc$dd" "-norpcauth"))
+                    :rpc-auth)))
+    (is (null auth))
+    ;; The consequence the finding names: an empty list is valid, ("0") is not.
+    (is-false (eq :invalid (bl.rpc::%parse-rpcauth-credentials auth)))
+    (is (eq :invalid (bl.rpc::%parse-rpcauth-credentials '("0")))))
+  ;; -noonlynet leaves no network name to parse.
+  (is-false (assoc "onlynet" (nth-value 1 (start-node-plist
+                                           '("-onlynet=ipv4" "-noonlynet")))
+                   :test #'string=))
+  (is (null (getf (start-node-plist '("-debugexclude=libevent" "-nodebugexclude"))
+                  :debug-exclude)))
+  ;; A value AFTER the negation survives it — the span begins where the last
+  ;; negation ends, it is not simply emptied.
+  (is (equal '("libevent")
+             (getf (start-node-plist '("-nodebugexclude" "-debugexclude=libevent"))
+                   :debug-exclude))))
+
+(test a-negation-blocks-the-lower-precedence-sources
+  "A negation sets Core's `done` flag, so the config file's values for that
+option are not read at all (settings.cpp:240), and the `prev_negated_empty`
+gate at :243 suppresses even the \"zombie\" values a config file would
+otherwise contribute. feature_config_args.py:395 restarts with -noconnect
+against the framework's own bitcoin.conf, which already carries connect=0
+(test_framework/util.py:580-581): we produced (\"0\" \"0\"), which is not EQUAL
+to '(\"0\"), so instead of disabling outbound connections the node logged
+`Connecting only to -connect peers: 0, 0` and dialed a host named \"0\".
+
+With a real peer in the file the same shape meant -noconnect did not clear it:
+we kept dialing the peer the operator had just disabled."
+  (is (equal '("0") (getf (start-node-plist '("-noconnect" "-chain=regtest")
+                                            '("connect=0"))
+                          :connect-nodes)))
+  (is (equal '("0") (getf (start-node-plist '("-noconnect" "-chain=regtest")
+                                            '("connect=10.0.0.5"))
+                          :connect-nodes)))
+  ;; settings.json is a source of negations too (a JSON false).
+  (is (null (getf (start-node-plist '("-chain=regtest") '("rpcauth=u:s$h")
+                                    (bl:settings-config-rows '(("rpcauth" . yason:false))))
+                  :rpc-auth)))
+  ;; Core's own documented exception: a non-negated value AFTER the negation
+  ;; brings the config file's values back from the dead (settings.cpp:210-217).
+  (is (equal '("9.9.9.9" "10.0.0.5")
+             (getf (start-node-plist '("-noconnect" "-connect=9.9.9.9" "-chain=regtest")
+                                     '("connect=10.0.0.5"))
+                   :connect-nodes))))
+
+(test noconnect-still-disables-automatic-connections
+  "-noconnect is -connect=0 at every drive site Core has: with an empty list and
+IsArgNegated true, init.cpp:2215-2224 clears m_use_addrman_outgoing and leaves
+m_specified_outgoing empty, exactly as the single value \"0\" does, and
+init.cpp:777 tests the two the same way. doc/bitcoin-conf.md:66 names -connect
+as the list whose negation has a side effect beyond clearing it — so clearing
+the span must not also lose the side effect."
+  (dolist (args '(("-noconnect") ("-connect=0")))
+    (is (equal '("0") (getf (start-node-plist args) :connect-nodes))
+        "~S did not disable outbound connections" args)
+    ;; The -listen soft-set half of the same interaction (init.cpp:777).
+    (is-false (getf (start-node-plist args) :listen)
+              "~S did not soft-set -listen=0" args)))
+
+(test the-span-readers-follow-core-settings-cpp
+  "MERGE-SETTING and MERGE-SETTINGS-LIST are Core's GetSetting and
+GetSettingsList; the rules they encode are easier to pin here than through a
+command line. A row is (name value json), and only the JSON `false` is a
+negation — `connect=0` is an ordinary value."
+  (flet ((row (value &optional (json (format nil "~S" value)))
+           (list "x" value json))
+         (neg () (list "x" "0" "false")))
+    ;; A config-file span takes its FIRST value, a command-line span its LAST
+    ;; (settings.cpp:165-169).
+    (is (equal "a" (second (bl.cfg:merge-setting
+                            (list (cons :network-section
+                                        (list (row "a") (row "b"))))))))
+    (is (equal "b" (second (bl.cfg:merge-setting
+                            (list (cons :command-line
+                                        (list (row "a") (row "b"))))))))
+    ;; A trailing negation makes the span empty and the setting negated.
+    (is (equal '(nil t) (multiple-value-list
+                         (bl.cfg:merge-setting
+                          (list (cons :command-line (list (row "a") (neg))))))))
+    ;; ... and a value after it is an ordinary value again.
+    (is (equal "b" (second (bl.cfg:merge-setting
+                            (list (cons :command-line
+                                        (list (row "a") (neg) (row "b"))))))))
+    ;; The list reader drops everything up to the last negation, in every
+    ;; source, and a "0" that is not a negation stays.
+    (is (equal '("b") (mapcar #'second
+                              (bl.cfg:merge-settings-list
+                               (list (cons :command-line
+                                           (list (row "a") (neg) (row "b"))))))))
+    (is (equal '("0") (mapcar #'second
+                              (bl.cfg:merge-settings-list
+                               (list (cons :command-line (list (row "0"))))))))
+    (is-false (bl.cfg:setting-row-negated-p (row "0")))
+    (is-true (bl.cfg:setting-row-negated-p (neg)))
+    ;; Without a negation the sources ACCUMULATE — GetArgs concatenates them.
+    (is (equal '("a" "b")
+               (mapcar #'second
+                       (bl.cfg:merge-settings-list
+                        (list (cons :command-line (list (row "a")))
+                              (cons :default-section (list (row "b"))))))))))
 
 (test settings-json-wallet-must-be-strings
   "Core validates the JSON TYPE of the wallet list rather than coercing it

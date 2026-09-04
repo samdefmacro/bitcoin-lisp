@@ -1557,8 +1557,7 @@ file location."
          (settings-cells (and settings-path (%read-settings-file settings-path))))
     (multiple-value-bind (plist merged)
         (args->start-node-plist args conf-texts
-                                (bl:settings-alist->config-alist
-                                 settings-cells))
+                                (bl:settings-config-rows settings-cells))
       ;; Unknown CONFIG-FILE keys only warn (Core ReadConfigFiles with
       ;; ignore_invalid_keys=true, common/init.cpp:38: "Ignoring unknown
       ;; configuration value") — unlike unknown CLI options, which error.

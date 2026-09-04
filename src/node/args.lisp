@@ -244,45 +244,66 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
               (*dns-seed-enabled*
                (config-error "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6")))))))
 
-(defun args->start-node-plist (args &optional conf-text settings-cells)
+(defun config-sources (args texts settings-rows network)
+  "The four settings sources, as MERGED-CONFIG-ALIST wants them: (kind . rows)
+in Core's precedence order — command line, read-write settings file, config
+file [network] section, config file default section (settings.cpp:34-36).
+
+Sections from EVERY config file form ONE span, and so do the default areas,
+because Core accumulates all the files into a single ro_config[section][name]
+map: the file boundary is not part of the precedence, only the section is."
+  (let ((rows (loop for text in texts append (conf-settings-rows text)))
+        (want (conf-section-name network)))
+    (flet ((of-section (name)
+             ;; Drop the section field: from here on a row is (name value json).
+             (loop for (section . row) in rows
+                   when (string= section name) collect row)))
+      (list (cons :command-line (cli-settings-rows args))
+            (cons :settings settings-rows)
+            (cons :network-section (of-section want))
+            (cons :default-section (of-section ""))))))
+
+(defun args->start-node-plist (args &optional conf-text settings-rows)
   ;; CONF-TEXT is the main bitcoin.conf, or a LIST of texts when -includeconf
   ;; pulled in more (main file first). See the docstring below.
   "Pure assembly of a start-node keyword plist from Bitcoin Core-style CLI ARGS
  (a list of strings) and CONF-TEXT — one bitcoin.conf's contents, or a LIST of
 them (main file first) when -includeconf pulled in more.
 
-Precedence is Core's (settings.cpp:36): command line, then SETTINGS-CELLS
- (the read-write settings file, already flattened to (name . string) cells by
-SETTINGS-ALIST->CONFIG-ALIST), then the [network] section of any config file,
-then the global area of any config file.
+SETTINGS-ROWS are the read-write settings file's rows (SETTINGS-CONFIG-ROWS).
+Precedence is Core's (settings.cpp:36): command line, then the settings file,
+then the [network] section of any config file, then its default section —
+MERGED-CONFIG-ALIST resolves every option name across the four.
 
-SETTINGS-CELLS deliberately does NOT take part in resolving the network: Core
+SETTINGS-ROWS deliberately does NOT take part in resolving the network: Core
 reads its chain selectors from the command line and the config file's global
 area only, and the settings file lives INSIDE the network directory — letting it
 choose the network would make its own location depend on its contents.
 Returns (VALUES plist merged-alist network); start-node-from-args (node/init.lisp)
 wraps this with the file I/O, apply-config-globals, and launch."
-  (let* ((cli (parse-cli-args args))
+  (let* ((texts (cond ((null conf-text) nil)
+                      ((listp conf-text) conf-text)
+                      (t (list conf-text))))
          ;; The network is resolved from the CLI plus the config file's GLOBAL
          ;; area — never from inside a section, which is Core's rule (it reads
          ;; the chain selectors with section="", args.cpp:825-829). Resolving it
          ;; from the CLI alone, as this used to, meant a `testnet4=1` written in
          ;; bitcoin.conf left us scoping the file to the DEFAULT network's
          ;; section and silently dropping the whole [testnet4] block.
-         (texts (cond ((null conf-text) nil)
-                      ((listp conf-text) conf-text)
-                      (t (list conf-text))))
-         (globals (loop for text in texts append (conf-global-entries text)))
-         (network (resolve-network-from-config (append cli globals)))
-         ;; Sections from EVERY file outrank globals from every file, because
-         ;; Core accumulates them all into one ro_config[section][name] map and
-         ;; then consults section before "" — the file boundary is not part of
-         ;; the precedence, only the section is.
-         (conf (append (loop for text in texts
-                             append (parse-bitcoin-conf-sections text network))
-                       globals))
-         ;; CLI > settings.json > [network] section > global area (Core
-         ;; settings.cpp:36, MergeSettings' Source order), which
-         ;; PARSE-BITCOIN-CONF has already ordered; first ASSOC wins.
-         (merged (append cli settings-cells conf)))
-    (values (config-alist->start-node-plist merged network) merged network)))
+         (network (resolve-network-from-config
+                   (append (parse-cli-args args)
+                           (loop for text in texts append (conf-global-entries text)))))
+         (sources (config-sources args texts settings-rows network)))
+    (multiple-value-bind (merged negated) (merged-config-alist sources)
+      ;; `-noconnect` is `-connect=0` at every drive site Core has: with an
+      ;; empty list and IsArgNegated true, init.cpp:2215-2224 clears
+      ;; m_use_addrman_outgoing and leaves m_specified_outgoing empty, which is
+      ;; exactly what the single value "0" produces, and init.cpp:777 tests the
+      ;; two the same way. doc/bitcoin-conf.md:66 names -connect as the list
+      ;; whose negation has a side effect beyond clearing it. Rendering it as
+      ;; that one value keeps the three readers of -connect here — the plist,
+      ;; the -dnsseed soft-set and the -listen soft-set — reading one thing;
+      ;; the negation always empties the list, so there is nothing to shadow.
+      (when (member "connect" negated :test #'string=)
+        (push (cons "connect" "0") merged))
+      (values (config-alist->start-node-plist merged network) merged network))))

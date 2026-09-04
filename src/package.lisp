@@ -83,7 +83,7 @@ init.cpp, node/. src/node/.")
    #:render-settings-json
    #:render-json-value
    #:settings-file-warning
-   #:settings-alist->config-alist
+   #:settings-config-rows
    #:unknown-settings-keys
    #:validate-settings-values
    #:+settings-warning-key+
