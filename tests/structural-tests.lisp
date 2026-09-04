@@ -1420,23 +1420,19 @@ name here.")
 keys or sighashes wants bl.bytes:make-octets-hash-table"
         now +equalp-hash-table-ceiling+)))
 
-(defparameter +test-internal-reference-ceiling+ 4305
+(defparameter +test-internal-reference-ceiling+ 4254
   "How many package-qualified INTERNAL references (a :: token) the files of
-the tests system may contain: 7,136 when the cleanup started, over a glob of
-tests/; 4,394 when the corpus became the declared files (%test-system-files);
-4,380 once the compact-block tests drove the handler through one helper;
-4,370 when deliver-block in tests/support/ replaced the reorg tests' reaches;
-4,365 when the GA10 peers/eviction tests folded the eviction entry point, the
-inbound cap, the admission gate and IsFullOutboundConn into one helper each;
-4,320 once start-node-plist in tests/support/ replaced the 54 reaches into
-args->start-node-plist; 4,315 with the peers and config batches merged;
-4,305 with the mining batch.
-Then the mining tests called the mining tests called the generate* and getmininginfo handlers
-through BL.RPC:DISPATCH-RPC-METHOD, which is both exported and the wire path.
-4,330 when make-wallet-rng in tests/support/ replaced the 38 reaches for the
-spend path's PRNG constructor in the two wallet test files; 4,316 once the
-PSBT and spend suites drove createpsbt and sendtoaddress through one helper
-each.
+the tests system may contain. The count is measured over the declared test
+files (%test-system-files), never a glob. History, so a reader can see what
+each fall bought: 7,136 when the cleanup started; 4,394 when the corpus became
+the declared files; 4,380 once the compact-block tests drove their handler
+through one helper; 4,370 when deliver-block in tests/support/ replaced the
+reorg tests' reaches; 4,365 after the peers/eviction tests folded four entry
+points into one helper each; 4,320 once start-node-plist in tests/support/
+replaced 54 reaches into args->start-node-plist; 4,305 when the mining tests
+called their handlers through the exported dispatcher; 4,254 when make-wallet-rng
+in tests/support/ replaced 38 reaches and the PSBT and spend suites drove
+createpsbt and sendtoaddress through one helper each.
 White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the
