@@ -1362,6 +1362,89 @@ string."
                               pooled utxo mempool 200
                               :chain-state chain-state))))))))
 
+(test mempool-checktxinputs-runs-before-the-input-policy-checks
+  "Core's order for the checks that read the spent coins (validation.cpp:892-905)
+is Consensus::CheckTxInputs, then AreInputsStandard, then IsWitnessStandard,
+then the sigop cost. A transaction that breaks a consensus rule and a policy
+rule at once must report the CONSENSUS one: TX_CONSENSUS is a permanent
+property of the transaction, TX_INPUTS_NOT_STANDARD only this node's relay
+policy, and src/networking/protocol.lisp caches the txid IN ADDITION to the
+wtxid for :nonstandard-inputs alone -- so the swap changed which identifiers
+were remembered as well as what the client was told."
+  (let* ((utxo (bl.store:make-utxo-set))
+         (mempool (bl.mp:make-mempool))
+         (chain-state (bl.store:make-chain-state :best-height 100))
+         (cb-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+         (bare-true (%spk #x51)))
+    ;; Spend height is tip+1 = 101, so a coin mined at 100 is one block old.
+    (bl.store:add-utxo utxo cb-txid 0 50000000 bare-true 100 :coinbase t)
+    (bl.store:add-utxo utxo cb-txid 1 50000000 (%p2pkh-spk) 100 :coinbase t)
+    ;; ...while a coin mined at 0 is 101 blocks old, i.e. mature.
+    (bl.store:add-utxo utxo cb-txid 2 50000000 bare-true 0 :coinbase t)
+    (flet ((err-of (index)
+             (nth-value 1
+                        (bl.val:validate-transaction-for-mempool
+                         (bl.ser:make-transaction
+                          :version 2
+                          :inputs (vector (bl.ser:make-tx-in
+                                           :previous-output (bl.ser:make-outpoint
+                                                             :hash cb-txid :index index)
+                                           :script-sig (%spk #x01 #x51)
+                                           :sequence #xFFFFFFFF))
+                          :outputs (vector (bl.ser:make-tx-out
+                                            :value 49000000
+                                            :script-pubkey (%p2pkh-spk)))
+                          :lock-time 0)
+                         utxo mempool 100 :chain-state chain-state))))
+      ;; Immature AND nonstandard to spend: the consensus reason wins.
+      (is (eq :coinbase-not-mature (err-of 0)))
+      ;; Immature alone: unchanged.
+      (is (eq :coinbase-not-mature (err-of 1)))
+      ;; Control: with maturity satisfied, the standardness gate still fires --
+      ;; CheckTxInputs running first did not disable it.
+      (is (eq :nonstandard-inputs (err-of 2))))))
+
+(test mempool-witness-standardness-is-checked-before-the-sigop-cap
+  "Core computes the sigop cost only AFTER IsWitnessStandard
+(validation.cpp:901-905), so a witness-nonstandard spend that is also
+sigop-dense is \"bad-witness-nonstandard\", not \"bad-txns-too-many-sigops\".
+The fixture is one P2WSH input whose witness script is 3,600 bare
+OP_CHECKMULTISIG (72,000 witness sigops against a 16,000 cap) and whose stack
+carries 101 items, one past MAX_STANDARD_P2WSH_STACK_ITEMS."
+  (let* ((utxo (bl.store:make-utxo-set))
+         (mempool (bl.mp:make-mempool))
+         (chain-state (bl.store:make-chain-state :best-height 100))
+         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 21))
+         (witness-script (make-array 3600 :element-type '(unsigned-byte 8)
+                                          :initial-element #xae))
+         (p2wsh (%w8d-script #x00 #x20 (bl.crypto:sha256 witness-script))))
+    (bl.store:add-utxo utxo txid 0 100000000 p2wsh 0)
+    (flet ((err-of (stack-items)
+             (nth-value 1
+                        (bl.val:validate-transaction-for-mempool
+                         (bl.ser:make-transaction
+                          :version 2
+                          :inputs (vector (bl.ser:make-tx-in
+                                           :previous-output (bl.ser:make-outpoint
+                                                             :hash txid :index 0)
+                                           :script-sig (%spk)
+                                           :sequence #xFFFFFFFF))
+                          :outputs (vector (bl.ser:make-tx-out
+                                            :value 90000000
+                                            :script-pubkey (%p2pkh-spk)))
+                          :witness (vector (append
+                                            (make-list stack-items
+                                                       :initial-element (%spk #x01))
+                                            (list witness-script)))
+                          :lock-time 0)
+                         utxo mempool 100 :chain-state chain-state))))
+      ;; 101 stack items: nonstandard witness, and sigop-dense.
+      (is (eq :bad-witness-nonstandard (err-of 101)))
+      ;; Control: at 100 items the witness is standard, so the same 72,000
+      ;; sigops now reach the cap -- proving both checks are live and that the
+      ;; assertion above is about which one runs first.
+      (is (eq :too-many-sigops (err-of 100))))))
+
 ;;;; Wave 8A: witness-stripped classification + coinbase maturity at tip+1
 
 (test spends-non-anchor-witness-program-p-cases

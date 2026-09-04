@@ -1075,60 +1075,68 @@ decide (Core PreChecks, validation.cpp:950-970)."
             (return-from validate-transaction-for-mempool
               (values nil :non-bip68-final nil))))))
 
-    ;; Policy: bounded sigop cost (now that spent scripts are available). The
-    ;; computed cost is kept — it is returned to the caller and recorded on
-    ;; the mempool entry, exactly as Core's PreChecks computes nSigOpsCost
-    ;; once and stages it into the entry (validation.cpp:905,924), so the
-    ;; block assembler's sigop budget sees real numbers.
-    (let ((sigops-cost
-            (flet ((spent-script (txid index)
-                     (let ((u (or (bl.store:get-utxo utxo-set txid index)
-                                  (gethash (cons txid index) extra-coins))))
-                       (when u (bl.store:utxo-entry-script-pubkey u)))))
-              ;; Core AreInputsStandard → TX_INPUTS_NOT_STANDARD
-              ;; "bad-txns-nonstandard-inputs", checked BEFORE the total
-              ;; sigop-cost cap as in PreChecks (validation.cpp), so a tx
-              ;; failing both reports the reason Core reports. Distinct from
-              ;; the TX_NOT_STANDARD cost cap below because this failure
-              ;; depends only on the txid (spent scriptPubKeys + scriptSig) —
-              ;; the P2P reject cache may key it by txid too.
-              (when (and *require-standard*
-                         (not (are-inputs-standard-p tx #'spent-script)))
-                (return-from validate-transaction-for-mempool
-                  (values nil :nonstandard-inputs nil)))
-              ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST.
-              (let ((cost (count-transaction-sigops-cost tx #'spent-script)))
-                (when (> cost +max-standard-tx-sigops-cost+)
+    ;; Consensus: Core's Consensus::CheckTxInputs (validation.cpp:892-895) —
+    ;; coinbase maturity, input-value range, fee. It runs FIRST of the checks
+    ;; that read the spent coins, ahead of every policy one, and the order is
+    ;; observable: a transaction that fails a consensus rule AND a standardness
+    ;; rule must report the CONSENSUS reason, because that is the verdict
+    ;; callers act on — TX_CONSENSUS is a permanent property of the
+    ;; transaction, TX_INPUTS_NOT_STANDARD only this node's relay policy.
+    ;;
+    ;; EXTRA-COINS is passed as pending-utxos so chained-spend inputs resolve.
+    ;; The spend height is the NEXT block's height, not the tip's: Core's
+    ;; PreChecks calls Consensus::CheckTxInputs with nSpendHeight =
+    ;; m_active_chainstate.m_chain.Height() + 1 (validation.cpp, PreChecks:
+    ;; "m_view.GetBestBlock() is the tip; a tx enters a block one higher"),
+    ;; and maturity is nSpendHeight - coin.nHeight < COINBASE_MATURITY
+    ;; (consensus/tx_verify.cpp) — so a coinbase spend maturing at tip+1
+    ;; must be accepted NOW. Same tip+1 the finality/BIP68 checks above and
+    ;; mempool-extra-coins already use. Block connection is untouched: there
+    ;; current-height IS the connecting block's height, already the spend
+    ;; height.
+    (multiple-value-bind (valid error fee)
+        (validate-transaction-contextual tx utxo-set (1+ current-height)
+                                         :pending-utxos extra-coins)
+      (unless valid
+        (return-from validate-transaction-for-mempool
+          (values nil error nil)))
+
+      ;; The policy checks that need the spent scriptPubKeys, in Core's order
+      ;; (validation.cpp:896-905): AreInputsStandard, then IsWitnessStandard,
+      ;; then the sigop cost. The computed cost is kept — it is returned to the
+      ;; caller and recorded on the mempool entry, exactly as Core's PreChecks
+      ;; computes nSigOpsCost once and stages it into the entry
+      ;; (validation.cpp:905,924), so the block assembler's sigop budget sees
+      ;; real numbers.
+      (let ((sigops-cost
+              (flet ((spent-script (txid index)
+                       (let ((u (or (bl.store:get-utxo utxo-set txid index)
+                                    (gethash (cons txid index) extra-coins))))
+                         (when u (bl.store:utxo-entry-script-pubkey u)))))
+                ;; Core AreInputsStandard → TX_INPUTS_NOT_STANDARD
+                ;; "bad-txns-nonstandard-inputs" (:896-899). Distinct from the
+                ;; TX_NOT_STANDARD cost cap below because this failure depends
+                ;; only on the txid (spent scriptPubKeys + scriptSig) — the P2P
+                ;; reject cache may key it by txid too.
+                (when (and *require-standard*
+                           (not (are-inputs-standard-p tx #'spent-script)))
                   (return-from validate-transaction-for-mempool
-                    (values nil :too-many-sigops nil)))
+                    (values nil :nonstandard-inputs nil)))
                 ;; Policy: witness must be standard (P2WSH/Taproot stack &
-                ;; script limits, no annex). Needs the spent scriptPubKeys,
-                ;; hence inside this flet.
+                ;; script limits, no annex), :901-903 — BEFORE the sigop cost
+                ;; is even computed, so a witness-nonstandard spend that is
+                ;; also sigop-dense reports the witness reason.
                 (when (and (bl.ser:transaction-has-witness-p tx)
                            *require-standard*
                            (not (is-witness-standard-p tx #'spent-script)))
                   (return-from validate-transaction-for-mempool
                     (values nil :bad-witness-nonstandard nil)))
-                cost))))
-
-      ;; Contextual validation (consensus): coinbase maturity, fee calculation.
-      ;; EXTRA-COINS is passed as pending-utxos so chained-spend inputs resolve.
-      ;; The spend height is the NEXT block's height, not the tip's: Core's
-      ;; PreChecks calls Consensus::CheckTxInputs with nSpendHeight =
-      ;; m_active_chainstate.m_chain.Height() + 1 (validation.cpp, PreChecks:
-      ;; "m_view.GetBestBlock() is the tip; a tx enters a block one higher"),
-      ;; and maturity is nSpendHeight - coin.nHeight < COINBASE_MATURITY
-      ;; (consensus/tx_verify.cpp) — so a coinbase spend maturing at tip+1
-      ;; must be accepted NOW. Same tip+1 the finality/BIP68 checks above and
-      ;; mempool-extra-coins already use. Block connection is untouched: there
-      ;; current-height IS the connecting block's height, already the spend
-      ;; height.
-      (multiple-value-bind (valid error fee)
-          (validate-transaction-contextual tx utxo-set (1+ current-height)
-                                           :pending-utxos extra-coins)
-        (unless valid
-          (return-from validate-transaction-for-mempool
-            (values nil error nil)))
+                ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST.
+                (let ((cost (count-transaction-sigops-cost tx #'spent-script)))
+                  (when (> cost +max-standard-tx-sigops-cost+)
+                    (return-from validate-transaction-for-mempool
+                      (values nil :too-many-sigops nil)))
+                  cost))))
 
         ;; Convert typed fee to integer. Policy fee checks (floor, RBF) run on
         ;; the prioritisation-modified fee (Core's ws.m_modified_fees); the
