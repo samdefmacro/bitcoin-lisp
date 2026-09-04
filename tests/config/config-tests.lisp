@@ -2069,6 +2069,54 @@ string \"x\" (args.cpp:105-126, 880-884)."
     (is (string= "\"550\"" (cdr (assoc "prune" cells :test #'string=))))
     (is (string= "\"\"" (cdr (assoc "txindex" cells :test #'string=))))))
 
+(test sensitive-option-values-are-masked-in-the-arg-log
+  "GA10 801f2ad3. Core tags -torpassword (init.cpp:602), -rpcauth (:707),
+-rpcpassword (:712) and -rpcuser (:716) with ArgsManager::SENSITIVE, and
+logArgsPrefix substitutes `****` for the value of any option carrying it:
+`value_str = (*flags & SENSITIVE) ? \"****\" : value.write()`
+(common/args.cpp:883). feature_config_args.py:236-254 asserts both halves --
+the four masked lines, and that -rpcbind and -rpcallowip are NOT masked.
+
+We logged the raw JSON for every known option, so every start wrote the RPC
+password, the rpcauth salt$HMAC and the Tor control password into debug.log:
+the file operators tail, ship to log aggregators and paste into bug reports."
+  (dolist (name '("rpcuser" "rpcpassword" "rpcauth" "torpassword"))
+    (is-true (bl.cfg:sensitive-config-option-p name) "-~A is not masked" name))
+  ;; Tagging more than Core is a divergence of its own: these are asserted
+  ;; UNMASKED by feature_config_args.py.
+  (dolist (name '("rpcbind" "rpcallowip" "addnode" "rpcport" "server" "prune"))
+    (is-false (bl.cfg:sensitive-config-option-p name) "-~A is masked" name))
+  (is-false (bl.cfg:sensitive-config-option-p "notanoption"))
+  ;; The wiring: the lines %LOG-ARGS queues for debug.log, from all three
+  ;; sources Core logs.
+  (let* ((bl:*deferred-log-lines* nil)
+         (lines (progn
+                  (bl::%log-args
+                   '("-rpcpassword=clisecret" "-rpcuser=cliuser"
+                     "-torpassword=torsecret" "-rpcauth=cliuser:d3adb33f$c0ffee"
+                     "-rpcbind=127.0.0.1" "-addnode=some.node")
+                   (list (format nil "rpcpassword=filesecret~%server=1~%"))
+                   (list (cons "rpcuser" "settingsecret"))
+                   :regtest)
+                  (mapcar #'second bl:*deferred-log-lines*)))
+         (log (format nil "~{~A~%~}" lines)))
+    (dolist (secret '("clisecret" "cliuser" "torsecret" "d3adb33f" "c0ffee"
+                      "filesecret" "settingsecret"))
+      (is-false (search secret log) "~A reached the log" secret))
+    (dolist (line '("Command-line arg: rpcpassword=****"
+                    "Command-line arg: rpcuser=****"
+                    "Command-line arg: rpcauth=****"
+                    "Command-line arg: torpassword=****"
+                    "Config file arg: rpcpassword=****"
+                    "Setting file arg: rpcuser = ****"))
+      (is-true (search line log) "missing ~S" line))
+    ;; Positive control for the mask itself: the log DID run, and the options
+    ;; Core leaves alone still carry their value.
+    (dolist (line '("Command-line arg: rpcbind=\"127.0.0.1\""
+                    "Command-line arg: addnode=\"some.node\""
+                    "Config file arg: server=\"1\""))
+      (is-true (search line log) "missing ~S" line))))
+
 (test conf-file-negation-works-in-the-global-area-too
   "The global area is parsed by the same loop, so a negation before any
 [section] header has to behave the same way."

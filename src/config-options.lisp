@@ -23,6 +23,14 @@
 ;;; (init.cpp:539), -bind (:548), -connect (:550), -port (:575), -rpcbind
 ;;; (:708), -rpcport (:713), -wallet and -walletdir (wallet/init.cpp:71,73).
 
+;;; A row marked :SENSITIVE carries Core's ArgsManager::SENSITIVE flag: the
+;;; VALUE is a secret, so the startup arg log prints `****` in its place
+;;; (logArgsPrefix, common/args.cpp:883). bitcoind tags exactly four --
+;;; -torpassword (init.cpp:602), -rpcauth (:707), -rpcpassword (:712) and
+;;; -rpcuser (:716); nothing else in the tree, the wallet included. Tagging
+;;; more is not free: feature_config_args.py asserts that -rpcbind and
+;;; -rpcallowip are logged UNMASKED.
+
 ;;; --- Network selection and entry-point specials -------------------------
 ;;; Handled before and around the spec scan (RESOLVE-NETWORK-FROM-CONFIG,
 ;;; ARGS->START-NODE-PLIST, START-NODE-FROM-ARGS).
@@ -57,8 +65,8 @@
 (define-option "maxconnections" :key :max-connections :type :int)
 (define-option "rpcport" :key :rpc-port :type :int :network-only t)
 (define-option "rpcbind" :key :rpc-bind :type :string :network-only t)
-(define-option "rpcuser" :key :rpc-user :type :string)
-(define-option "rpcpassword" :key :rpc-password :type :string)
+(define-option "rpcuser" :key :rpc-user :type :string :sensitive t)
+(define-option "rpcpassword" :key :rpc-password :type :string :sensitive t)
 (define-option "listen" :key :listen :type :bool)
 ;; -bind is scanned for its LAST occurrence into :listen-bind (the single
 ;; address we actually bind); every occurrence is also kept, so a multi-bind
@@ -67,7 +75,7 @@
 (define-option "bind" :key :listen-bind :type :string :repeatable t :network-only t)
 (define-option "listenonion" :key :listen-onion :type :bool)
 (define-option "torcontrol" :key :tor-control :type :string)
-(define-option "torpassword" :key :tor-password :type :string)
+(define-option "torpassword" :key :tor-password :type :string :sensitive t)
 (define-option "v2transport" :key :v2transport :type :bool)
 (define-option "reindexchainstate" :key :reindex-chainstate :type :bool)
 (define-option "reindex-chainstate" :key :reindex-chainstate :type :bool)
@@ -130,7 +138,7 @@
 (define-option "addnode" :collect :addnode :repeatable t :network-only t)
 ;; -rpcauth (g_rpcauth, httprpc.cpp:289), -rpcallowip (rpc_allow_subnets,
 ;; httpserver.cpp:153).
-(define-option "rpcauth" :collect :rpc-auth :repeatable t)
+(define-option "rpcauth" :collect :rpc-auth :repeatable t :sensitive t)
 (define-option "rpcallowip" :collect :rpc-allow-ip :repeatable t)
 (define-option "testactivationheight" :collect :test-activation-heights :repeatable t)
 ;; -debug: categories; also raises the log level (see the plist assembly).

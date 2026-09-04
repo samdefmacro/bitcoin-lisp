@@ -26,6 +26,7 @@
   (repeatable nil :type boolean)
   (kind :start-node :type keyword)
   (network-only nil :type boolean)         ; Core ArgsManager::NETWORK_ONLY
+  (sensitive nil :type boolean)            ; Core ArgsManager::SENSITIVE
   (global nil :type symbol)                ; the special a :global row sets
   (apply nil :type (or null function))     ; the function a :apply row calls
   (core nil :type (or null string)))       ; Core reference, documentation only
@@ -58,7 +59,7 @@ same name in place so a warm reload never duplicates a row."
 at macroexpansion time."))
 
 (defmacro define-option (name &key key type min collect repeatable (kind nil kind-p)
-                                   network-only global apply core)
+                                   network-only sensitive global apply core)
   "Register the option NAME (lower-case, as it appears after the dash).
 
 KEY/TYPE: the start-node keyword and value type of a scalar option, MIN the
@@ -73,7 +74,11 @@ is given, :GLOBAL otherwise.
 NETWORK-ONLY is Core's ArgsManager::NETWORK_ONLY flag (args.h:113-124): the
 option means something different on every chain, so off mainnet its value in
 a shared bitcoin.conf's DEFAULT section is ignored and the node refuses to
-start. See USE-DEFAULT-SECTION-P and UNSUITABLE-SECTION-ONLY-OPTIONS."
+start. See USE-DEFAULT-SECTION-P and UNSUITABLE-SECTION-ONLY-OPTIONS.
+
+SENSITIVE is Core's ArgsManager::SENSITIVE flag (args.h:126): the VALUE is a
+secret, so the startup arg log prints `****` in its place. See
+SENSITIVE-CONFIG-OPTION-P."
   (check-type name string)
   (flet ((bad (detail) (error 'option-definition-error :name name :detail detail)))
     (when (and collect (not repeatable)) (bad "a :collect option must be :repeatable"))
@@ -87,6 +92,7 @@ start. See USE-DEFAULT-SECTION-P and UNSUITABLE-SECTION-ONLY-OPTIONS."
                          :repeatable ,(and repeatable t)
                          :kind ,(if kind-p kind (if (or key collect) :start-node :global))
                          :network-only ,(and network-only t)
+                         :sensitive ,(and sensitive t)
                          :global ',global
                          :apply ,apply
                          :core ,core)))
@@ -115,6 +121,17 @@ repeated config-FILE key instead keeps the FIRST, which parse-bitcoin-conf's
 in-order alist gives assoc for free)."
   (let ((o (find-config-option name)))
     (and o (config-option-repeatable o))))
+
+(defun sensitive-config-option-p (name)
+  "T when NAME's VALUE is a secret -- Core's ArgsManager::SENSITIVE (args.h:126).
+
+Core tags exactly four: -torpassword (init.cpp:602), -rpcauth (:707),
+-rpcpassword (:712) and -rpcuser (:716). logArgsPrefix (common/args.cpp:883)
+prints `****` in place of the value for those and the value itself for
+everything else, which is why -rpcbind and -rpcallowip -- named in
+feature_config_args.py's unexpected_msgs -- must NOT be tagged."
+  (let ((o (find-config-option name)))
+    (and o (config-option-sensitive o))))
 
 (defun core-only-option-p (name)
   "T when NAME is an option bitcoind accepts and we do not implement.
