@@ -1426,7 +1426,7 @@ name here.")
 keys or sighashes wants bl.bytes:make-octets-hash-table"
         now +equalp-hash-table-ceiling+)))
 
-(defparameter +test-internal-reference-ceiling+ 4254
+(defparameter +test-internal-reference-ceiling+ 4248
   "How many package-qualified INTERNAL references (a :: token) the files of
 the tests system may contain. The count is measured over the declared test
 files (%test-system-files), never a glob. History, so a reader can see what
@@ -1438,7 +1438,8 @@ points into one helper each; 4,320 once start-node-plist in tests/support/
 replaced 54 reaches into args->start-node-plist; 4,305 when the mining tests
 called their handlers through the exported dispatcher; 4,254 when make-wallet-rng
 in tests/support/ replaced 38 reaches and the PSBT and spend suites drove
-createpsbt and sendtoaddress through one helper each.
+createpsbt and sendtoaddress through one helper each; 4,248 with the BIP9
+signalling batch.
 White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the
