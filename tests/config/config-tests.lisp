@@ -121,7 +121,7 @@ configuration value` warning: a config Core reads and applies, discarded."
   (let ((text (format nil "regtest=1~%rpcport=2000~%regtest.rpcport=3000~%~
                            ~%[regtest]~%rpcport=4000~%")))
     (is (string= "3000" (cfg "rpcport" (bl.cfg:parse-bitcoin-conf text :regtest))))
-    (is (= 3000 (getf (bl::args->start-node-plist '() text) :rpc-port)))
+    (is (= 3000 (getf (start-node-plist '() text) :rpc-port)))
     (is-false (member "regtest.rpcport" (bl:unknown-config-file-keys
                                          (bl.cfg:parse-bitcoin-conf text))
                       :test #'string=)))
@@ -189,7 +189,7 @@ Core reads the chain selectors from the global area only (section=\"\",
 args.cpp:825-829) and then scopes, which is what this now does."
   (let ((text (format nil "testnet4=1~%rpcport=1111~%[testnet4]~%rpcport=48332~%")))
     (multiple-value-bind (plist merged network)
-        (bl::args->start-node-plist '() text)
+        (start-node-plist '() text)
       (declare (ignore plist))
       (is (eq :testnet4 network))
       (is (string= "48332" (cfg "rpcport" merged))
@@ -221,7 +221,7 @@ outranks a global in the main one."
   (let ((main (format nil "includeconf=extra.conf~%rpcport=1111~%"))
         (extra (format nil "txindex=1~%[main]~%rpcport=8888~%")))
     (multiple-value-bind (plist merged network)
-        (bl::args->start-node-plist '("-chain=main") (list main extra))
+        (start-node-plist '("-chain=main") (list main extra))
       (declare (ignore plist))
       (is (eq :mainnet network))
       (is (string= "1" (cfg "txindex" merged))
@@ -237,7 +237,7 @@ global keys to the first file's last section."
   (let ((main (format nil "[regtest]~%rpcport=1111~%"))
         (extra (format nil "txindex=1~%")))
     (multiple-value-bind (plist merged)
-        (bl::args->start-node-plist '("-chain=main") (list main extra))
+        (start-node-plist '("-chain=main") (list main extra))
       (declare (ignore plist))
       (is (string= "1" (cfg "txindex" merged))
           "the second file's global key was swallowed by the first file's section")
@@ -311,26 +311,26 @@ network resolved from the CLI and scoping the conf's [network] section."
   ;; CLI selects mainnet and overrides dbcache; conf provides txindex and a
   ;; [main]-scoped rpcport (a [test] rpcport must be ignored).
   (let* ((conf-text (format nil "txindex=1~%dbcache=300~%[main]~%rpcport=8888~%[test]~%rpcport=7777~%"))
-         (plist (bl::args->start-node-plist
+         (plist (start-node-plist
                  '("-chain=main" "-dbcache=1000") conf-text)))
     (is (eq :mainnet (getf plist :network)))
     (is (eq t (getf plist :txindex)))               ; from conf
     (is (= 1000 (getf plist :dbcache-mib)))          ; CLI overrides conf's 300
     (is (= 8888 (getf plist :rpc-port))))            ; [main] section, not [test]
   ;; With no conf text, only CLI applies.
-  (let ((plist (bl::args->start-node-plist '("-regtest" "-txindex") nil)))
+  (let ((plist (start-node-plist '("-regtest" "-txindex") nil)))
     (is (eq :regtest (getf plist :network)))
     (is (eq t (getf plist :txindex)))))
 
 (test config-blocksonly-option
   "-blocksonly wires through to start-node's :blocksonly keyword (Core
 DEFAULT_BLOCKSONLY = false: absent unless given; -noblocksonly negates)."
-  (let ((plist (bl::args->start-node-plist '("-regtest" "-blocksonly") nil)))
+  (let ((plist (start-node-plist '("-regtest" "-blocksonly") nil)))
     (is (eq t (getf plist :blocksonly))))
-  (let ((plist (bl::args->start-node-plist '("-regtest" "-blocksonly=0") nil)))
+  (let ((plist (start-node-plist '("-regtest" "-blocksonly=0") nil)))
     (is (null (getf plist :blocksonly)))
     (is-true (member :blocksonly plist)))          ; explicitly given as off
-  (let ((plist (bl::args->start-node-plist '("-regtest") nil)))
+  (let ((plist (start-node-plist '("-regtest") nil)))
     (is (null (member :blocksonly plist)))))       ; default: not passed at all
 
 (test config-apply-globals
@@ -379,7 +379,7 @@ count is hard-capped at 64 like Core (mempool_args.cpp:110-112)."
   "args->start-node-plist returns the merged config alist as a second value, so
 start-node-from-args can apply the global-only options."
   (multiple-value-bind (plist merged)
-      (bl::args->start-node-plist '("-datacarrier=0" "-signetchallenge=5121ff"))
+      (start-node-plist '("-datacarrier=0" "-signetchallenge=5121ff"))
     (declare (ignore plist))
     (is (equal "0" (cdr (assoc "datacarrier" merged :test #'string=))))
     (is (equal "5121ff" (cdr (assoc "signetchallenge" merged :test #'string=))))))
@@ -688,7 +688,7 @@ command line and from bitcoin.conf alike (Core GetArgs -> g_rpcauth,
 httprpc.cpp:289; rpc_allow_subnets, httpserver.cpp:153). Collapsing them to the
 last occurrence — what every non-repeatable option does here — would silently
 drop all but one credential and all but one allowed subnet."
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest"
                   "-rpcauth=alice:aaaa$1111" "-rpcauth=bob:bbbb$2222"
                   "-rpcallowip=10.0.0.0/8" "-rpcallowip=192.168.1.5")
@@ -696,14 +696,14 @@ drop all but one credential and all but one allowed subnet."
     (is (equal '("alice:aaaa$1111" "bob:bbbb$2222") (getf plist :rpc-auth)))
     (is (equal '("10.0.0.0/8" "192.168.1.5") (getf plist :rpc-allow-ip))))
   ;; from the config file, where the same key repeats on separate lines
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest")
                 (format nil "rpcauth=alice:aaaa$1111~%rpcauth=bob:bbbb$2222~%~
 rpcallowip=10.0.0.0/8~%rpcallowip=::/0~%"))))
     (is (equal '("alice:aaaa$1111" "bob:bbbb$2222") (getf plist :rpc-auth)))
     (is (equal '("10.0.0.0/8" "::/0") (getf plist :rpc-allow-ip))))
   ;; absent means absent, not an empty list that looks configured
-  (let ((plist (bl::args->start-node-plist '("-regtest") nil)))
+  (let ((plist (start-node-plist '("-regtest") nil)))
     (is-false (member :rpc-auth plist))
     (is-false (member :rpc-allow-ip plist)))
   ;; and both are known options, so neither trips the unknown-option check
@@ -803,15 +803,15 @@ feature_config_args.py:232 looks for."
 (test disablewallet-turns-the-wallet-off
   "Core's -disablewallet is the negation of our -wallet. 62 functional tests
 run wallet-less nodes with it."
-  (let ((plist (bl::args->start-node-plist '("-regtest" "-disablewallet") nil)))
+  (let ((plist (start-node-plist '("-regtest" "-disablewallet") nil)))
     (is-true (member :wallet plist) "-disablewallet did not reach :wallet")
     (is-false (getf plist :wallet))
     (is-false (member :disable-wallet plist) "the raw key leaked into start-node"))
   ;; An explicit -wallet wins, as it does in Core.
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest" "-disablewallet" "-wallet=1") nil)))
     (is-true (getf plist :wallet)))
-  (let ((plist (bl::args->start-node-plist '("-regtest") nil)))
+  (let ((plist (start-node-plist '("-regtest") nil)))
     (is-false (member :disable-wallet plist))))
 
 (test bind-option-parses-core-s-forms
@@ -837,23 +837,23 @@ Core — otherwise ::1 would parse as host \"\" port 1."
 (test bind-reaches-the-listener-address-and-port
   "The parsed host and port must actually reach start-node: a -bind carrying a
 port overrides -port for the listener, as it does in Core."
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest" "-bind=127.0.0.1:18445") nil)))
     (is (string= "127.0.0.1" (getf plist :listen-bind)))
     (is (= 18445 (getf plist :port))))
   ;; No port on -bind leaves -port alone.
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest" "-bind=127.0.0.1" "-port=12345") nil)))
     (is (string= "127.0.0.1" (getf plist :listen-bind)))
     (is (= 12345 (getf plist :port))))
   ;; An =onion bind names a Tor-only listener, not an address to bind: the raw
   ;; string must not survive as one, or the node would try to bind
   ;; "127.0.0.1:18445=onion" as a hostname.
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest" "-bind=127.0.0.1:18445=onion") nil)))
     (is-false (getf plist :listen-bind)))
   ;; Repeatable: the first plain bind is used, and neither occurrence errors.
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest" "-bind=127.0.0.1:18445" "-bind=127.0.0.2:18446") nil)))
     (is (string= "127.0.0.1" (getf plist :listen-bind)))
     (is (= 18445 (getf plist :port)))))
@@ -875,7 +875,7 @@ at all without an explicit -logfile."
   ;; No datadir, no default.
   (is-false (bl::%resolve-log-file nil nil))
   ;; -debuglogfile is Core's spelling of -logfile and reaches the same key.
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest" "-debuglogfile=/tmp/x.log") nil)))
     (is (string= "/tmp/x.log" (getf plist :log-file)))))
 
@@ -962,7 +962,7 @@ very height it was trying to move, and passes for the wrong reason."
   "-testactivationheight is a LIST option: Core reads it with GetArgs and moves
 one deployment per occurrence (chainparams.cpp:49). Collapsing to the last
 occurrence would silently drop every override but one."
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest" "-testactivationheight=csv@5"
                   "-testactivationheight=segwit@7" "-mocktime=1700000000")
                 nil)))
@@ -1021,7 +1021,7 @@ option has no other effect to notice."
   "-debug is REPEATABLE and carries a category. The previous read was
 CONF-PARSE-BOOL of its value — and atoi(\"net\") is 0 — so -debug=net set no
 category AND did not raise the level: it did nothing whatsoever."
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest" "-debug=net" "-debug=mempool"
                   "-debugexclude=libevent" "-logtimemicros" "-logthreadnames")
                 nil)))
@@ -1035,14 +1035,14 @@ category AND did not raise the level: it did nothing whatsoever."
   ;; A bare -debug still means "everything", as it always did. PARSE-CLI-ARGS
   ;; normalizes a valueless flag to "1", which APPLY-LOG-CATEGORIES treats as
   ;; all — same as Core, where -debug with no value is the "1" spelling.
-  (let ((plist (bl::args->start-node-plist '("-regtest" "-debug") nil)))
+  (let ((plist (start-node-plist '("-regtest" "-debug") nil)))
     (is (equal '("1") (getf plist :debug-categories)))
     (is (eq :debug (getf plist :log-level))))
   ;; -debug=0 must NOT raise the level: that spelling turns logging off.
-  (let ((plist (bl::args->start-node-plist '("-regtest" "-debug=0") nil)))
+  (let ((plist (start-node-plist '("-regtest" "-debug=0") nil)))
     (is-false (eq :debug (getf plist :log-level))))
   ;; An explicit -loglevel wins.
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest" "-debug=net" "-loglevel=info") nil)))
     (is (eq :info (getf plist :log-level)))))
 
@@ -1254,7 +1254,7 @@ instead shell-escapes %w and substitutes the rest raw."
 (test notify-commands-reach-the-plist
   "-shutdownnotify is repeatable — Core reads it with GetArgs and joins EVERY
 one (init.cpp:257-265) — while -blocknotify is a single command."
-  (let ((p (bl::args->start-node-plist
+  (let ((p (start-node-plist
             '("-regtest" "-blocknotify=echo %s" "-startupnotify=touch /tmp/a"
               "-shutdownnotify=touch /tmp/b" "-shutdownnotify=touch /tmp/c")
             nil)))
@@ -1337,9 +1337,9 @@ option this repo keeps finding."
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name))
   ;; -printtoconsole reaches the plist as :console-log, and is ABSENT when not
   ;; given so START-NODE's default (on, since we never daemonize) applies.
-  (is-false (getf (bl::args->start-node-plist '("-printtoconsole=0"))
+  (is-false (getf (start-node-plist '("-printtoconsole=0"))
                   :console-log))
-  (is (eq :absent (getf (bl::args->start-node-plist '("-regtest"))
+  (is (eq :absent (getf (start-node-plist '("-regtest"))
                         :console-log :absent))))
 
 (test connect-disables-every-self-chosen-outbound-connection
@@ -1392,23 +1392,23 @@ one Core's ThreadOpenConnections would have taken."
                                   'bl::connect-specified-nodes))))
   ;; Every occurrence reaches the plist (Core reads -connect with GetArgs), and
   ;; -noconnect is the single "0" Core tests for.
-  (let ((p (bl::args->start-node-plist
+  (let ((p (start-node-plist
             '("-regtest" "-connect=1.2.3.4" "-connect=5.6.7.8:1234") nil)))
     (is (equal '("1.2.3.4" "5.6.7.8:1234") (getf p :connect-nodes)))
     ;; Parameter interaction: -listen soft-set to 0.
     (is-false (getf p :listen)))
-  (is (equal '("0") (getf (bl::args->start-node-plist '("-noconnect") nil)
+  (is (equal '("0") (getf (start-node-plist '("-noconnect") nil)
                           :connect-nodes)))
-  (is (equal '("0") (getf (bl::args->start-node-plist '("-connect=0") nil)
+  (is (equal '("0") (getf (start-node-plist '("-connect=0") nil)
                           :connect-nodes)))
   ;; Soft, not forced: an explicit -listen=1 still wins, which is the whole
   ;; difference between Core's SoftSetBoolArg and a plain assignment.
-  (is-true (getf (bl::args->start-node-plist
+  (is-true (getf (start-node-plist
                   '("-connect=1.2.3.4" "-listen=1") nil)
                  :listen))
   ;; -maxconnections=0 takes the same interaction (Core's condition is one
   ;; disjunction covering both).
-  (is-false (getf (bl::args->start-node-plist '("-maxconnections=0") nil)
+  (is-false (getf (start-node-plist '("-maxconnections=0") nil)
                   :listen))
   ;; And the -dnsseed half, which lives in apply-config-globals because that is
   ;; what owns *dns-seed-enabled*.
@@ -1434,7 +1434,7 @@ one Core's ThreadOpenConnections would have taken."
   "-whitelist / -whitebind (Core init.cpp + net_permissions.cpp). Both are
 repeatable — Core reads them with GetArgs — and a malformed spec is FATAL, as
 Core's is: a typo'd range grants nothing and the operator never finds out."
-  (let ((p (bl::args->start-node-plist
+  (let ((p (start-node-plist
             '("-regtest" "-whitelist=noban@10.0.0.0/8"
               "-whitelist=relay,mempool@192.168.0.0/16"
               "-whitebind=noban@127.0.0.1:1234")
@@ -1470,7 +1470,7 @@ connection and disconnects the moment it delivers more than one address. That
 disconnect is the part worth pinning — without it -seednode would silently
 become a second -addnode."
   ;; -seednode is repeatable and reaches the plist; -forcednsseed is a flag.
-  (let ((p (bl::args->start-node-plist
+  (let ((p (start-node-plist
             '("-regtest" "-seednode=1.2.3.4" "-seednode=5.6.7.8:1234"
               "-forcednsseed=1")
             nil)))
@@ -1931,7 +1931,7 @@ drives all six shapes below and requires the node to refuse each one."
 the subsystem switch is -disablewallet. Ours treated -wallet as a boolean, so
 `-wallet=w1` said nothing about w1 — it just meant \"true\"."
   (multiple-value-bind (plist)
-      (bl::args->start-node-plist '("-regtest" "-wallet=w1" "-wallet=w2"))
+      (start-node-plist '("-regtest" "-wallet=w1" "-wallet=w2"))
     (is (equal '("w1" "w2") (getf plist :wallet-names)))
     ;; Naming a wallet is also the opt-in to wallet support, which matters on
     ;; mainnet where the default is off.
@@ -1941,7 +1941,7 @@ the subsystem switch is -disablewallet. Ours treated -wallet as a boolean, so
   "Core reads it with GetArgs, so a repeated -wallet does not collapse to the
 last one the way an ordinary option does."
   (is (equal '("a" "b" "c")
-             (getf (bl::args->start-node-plist
+             (getf (start-node-plist
                     '("-regtest" "-wallet=a" "-wallet=b" "-wallet=c"))
                    :wallet-names))))
 
@@ -1953,21 +1953,21 @@ wallets\". The wallet RPC surface stays up; -disablewallet is what removes it.
 Treating -nowallet as a subsystem switch made wallet_multiwallet.py fail on its
 FIRST call: it starts node0 with exactly -nowallet and then calls wallet RPCs
 on it, and got 'Method not found (wallet support is disabled)'."
-  (let ((plist (bl::args->start-node-plist '("-regtest" "-nowallet"))))
+  (let ((plist (start-node-plist '("-regtest" "-nowallet"))))
     (is (null (getf plist :wallet-names)) "-nowallet names no wallet")
     ;; Not present at all, so START-NODE's network default decides — which on
     ;; regtest means wallet support stays ON.
     (is (eq :unset (getf plist :wallet :unset))
         "-nowallet must not decide whether the subsystem runs"))
   ;; -disablewallet is the one that does turn it off, and it says so explicitly.
-  (let ((plist (bl::args->start-node-plist '("-regtest" "-disablewallet"))))
+  (let ((plist (start-node-plist '("-regtest" "-disablewallet"))))
     (is (null (getf plist :wallet :unset)))))
 
 (test bare-wallet-flag-is-the-mainnet-opt-in
   "Wallet support is default-OFF on mainnet here (docs/wallet-plan.md), so a
 bare -wallet has to keep meaning \"turn it on\" even though -wallet is now a
 name list. INTERPRET-ARG renders a bare flag as \"1\", which names nothing."
-  (let ((plist (bl::args->start-node-plist '("-mainnet" "-wallet"))))
+  (let ((plist (start-node-plist '("-mainnet" "-wallet"))))
     (is (null (getf plist :wallet-names)))
     (is-true (getf plist :wallet))))
 
@@ -1976,7 +1976,7 @@ name list. INTERPRET-ARG renders a bare flag as \"1\", which names nothing."
 the accepted-but-unimplemented table, so passing one started the node and
 imported nothing."
   (is (equal '("/a/one.dat" "/b/two.dat")
-             (getf (bl::args->start-node-plist
+             (getf (start-node-plist
                     '("-regtest" "-loadblock=/a/one.dat" "-loadblock=/b/two.dat"))
                    :load-block)))
   (is-false (bl.cfg:core-only-option-p "loadblock")

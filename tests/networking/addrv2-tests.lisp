@@ -286,7 +286,7 @@ operator was trying to close."
       (ignore-errors (delete-file path))))
   ;; And it reaches the plist as an ordinary option.
   (is (equal "peers.map"
-             (getf (bl::args->start-node-plist
+             (getf (start-node-plist
                     '("-regtest" "-asmap=peers.map") nil)
                    :asmap)))
   (is-true (bl:known-config-option-p "asmap"))
