@@ -108,6 +108,41 @@ dial time via proxy-for-target."
     (:torv3 (and *onion-proxy* t))
     (:cjdns *cjdns-reachable*)))
 
+(alexandria:define-constant +bad-ports+
+    #(1 7 9 11 13 15 17 19 20 21 22 23 25 37 42 43 53 69 77 79 87 95 101 102
+      103 104 109 110 111 113 115 117 119 123 135 137 139 143 161 179 389 427
+      465 512 513 514 515 526 530 531 532 540 548 554 556 563 587 601 636 989
+      990 993 995 1719 1720 1723 2049 3306 3389 3659 4045 5060 5061 5432 5900
+      6000 6566 6665 6666 6667 6668 6669 6697 10080 27017)
+  :test #'equalp
+  :documentation
+  "Core's IsBadPort deny-list, netbase.cpp:847-935, in Core's own order —
+tcpmux, echo, discard, ftp, ssh, telnet, smtp, dns, pop3, nntp, ntp, netbios,
+imap, snmp, bgp, ldap, printer, syslog, nfs, MySQL, RDP, sip, PostgreSQL, VNC,
+X11, IRC, MongoDB and the rest, documented service by service in
+doc/p2p-bad-ports.md. Extracted from that switch mechanically rather than
+transcribed: 85 entries, and a hand-copied one would be wrong in a way nothing
+here could catch.")
+
+(defun bad-port-p (port)
+  "T if PORT is one Core refuses to make an AUTOMATIC outbound connection to
+(IsBadPort, netbase.cpp:847-935; the dial-side gate is net.cpp:2854, `nTries <
+50 && (addr.IsIPv4() || addr.IsIPv6()) && IsBadPort(addr.GetPort())').
+
+The point is not that such a peer is useless — it is that anyone may gossip
+`victim:25' or `victim:22', and a node that dials it speaks the Bitcoin
+protocol at some third party's SMTP or SSH daemon on the gossiper's behalf.
+That is what doc/p2p-bad-ports.md exists for, and it is why the filter belongs
+on the DIAL and not on storage or relay: Core stores and re-gossips these
+records exactly as we do.
+
+Divergence: Core drops the check after 50 rejected draws in one
+ThreadOpenConnections pass, so a node whose addrman is nothing but bad ports
+still dials eventually. SELECT-DIALABLE-ADDRESS returns NIL when its draws are
+exhausted instead of looping, so there is no loop for that escape hatch to
+break."
+  (and (find port +bad-ports+) t))
+
 (defun maybe-flip-ipv6-to-cjdns (network bytes)
   "Retag an :ipv6 address whose first byte is 0xFC as :cjdns when the CJDNS
 network is reachable — Core's exact gate is g_reachable_nets.Contains(NET_CJDNS)

@@ -535,17 +535,25 @@ entries via GetChance; alternates new/tried roughly 50/50 when both are present.
   "address-book-select restricted to AUTOMATIC-outbound-eligible addresses:
 the network must be dialable by our transport stack (dialable-network-p —
 config-aware: torv3 needs a Tor proxy, cjdns needs -cjdnsreachable, i2p is
-never dialable until P4) AND reachable per -onlynet. Every automatic
-selection path (outbound slots, feelers, block-relay slots) must go through
-this, never raw address-book-select: post-BIP155 the book can hold records
-nothing can connect to under the current config. Manual connections
-(addnode) bypass addrman entirely and are unaffected. Returns a
-peer-address or NIL after TRIES draws."
+never dialable until P4), reachable per -onlynet, and — for IPv4/IPv6 — not on
+a port Core refuses to dial (bad-port-p). Every automatic selection path
+(outbound slots, feelers, block-relay slots) must go through this, never raw
+address-book-select: post-BIP155 the book can hold records nothing can connect
+to under the current config, and any peer may gossip a record naming a third
+party's SSH or SMTP port. Manual connections (addnode) bypass addrman entirely
+and are unaffected, which is Core's split too — IsBadPort is applied inside
+ThreadOpenConnections (net.cpp:2854), not in Select and not on the paths that
+name a destination. Returns a peer-address or NIL after TRIES draws."
   (dotimes (_ tries nil)
     (let ((pa (address-book-select book :new-only new-only)))
       (when pa
         (let ((net (peer-address-network pa)))
-          (when (and (dialable-network-p net) (reachable-network-p net))
+          (when (and (dialable-network-p net)
+                     (reachable-network-p net)
+                     ;; Core applies IsBadPort to IPv4/IPv6 only: a port
+                     ;; number means nothing for an onion or I2P destination.
+                     (not (and (member net '(:ipv4 :ipv6))
+                               (bad-port-p (peer-address-port pa)))))
             (return pa)))))))
 
 (defun address-book-get-addr (book &key (max +addrman-getaddr-max+)
