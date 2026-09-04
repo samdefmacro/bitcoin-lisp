@@ -1604,6 +1604,63 @@ own tips afterwards with their coins durable."
            (is (eq t (%shutdown-fixture-coin-durable-p base "_snapshot" 5))))
       (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
 
+(test the-coins-best-block-pointer-never-outruns-the-persisted-block-index
+  "Core's FlushStateToDisk writes the block files, then the block-index
+database, and only THEN calls CoinsTip().Sync() (validation.cpp:2780-2812),
+precisely so the coins database can never name a block the block index does not
+hold. %FLUSH-CHAINSTATE has that order; the RPC read path did not.
+
+gettxoutsetinfo, dumptxoutset, scantxoutset and the assumeutxo hash check all
+sync the live coins cache before walking the base LevelDB, and that sync stages
+the cache's own best-block pointer. Nothing on that path wrote the header
+index, whose only other writers are the periodic flush and start-up -- so an
+unclean shutdown any time in the following 600 s left the coins DB naming a
+block RECONCILE-COINS-DB-BEST-BLOCK cannot place, and init.lisp turns its
+:unresolvable into a refusal to start: a read-only RPC converted an ordinary
+crash into a mandatory reindex.
+
+Driven through the shipped entry point (UTXO-SET-ITERATE) with the node's own
+hook installed, so this covers the wiring and not just the ordering."
+  (with-network (:mainnet)
+    (with-temp-directory (base "bl-coins-order")
+      (let* ((node (bl:make-node))
+             (cs (bl.store:init-chain-state base))
+             (hash (make-array 32 :element-type '(unsigned-byte 8)
+                                  :initial-element #xAB)))
+        (setf (bl:node-chainstates node) (list cs))
+        ;; A block index entry accepted since the last flush: in memory only,
+        ;; which is the ordinary state between flushes.
+        (bl.store:add-block-index-entry
+         cs (bl.store:make-block-index-entry
+             :hash hash :height 7 :chain-work 9 :status :valid))
+        (bl.store:open-chainstate-coins-view cs)
+        (unwind-protect
+             (let ((view (bl.store:chain-state-coins-view cs)))
+               ;; The coins now correspond to that block, as COIN-VIEW-APPLY-BLOCK
+               ;; would have left them, with one dirty coin to write.
+               (setf (bl.store:cvc-best-block view) (copy-seq hash))
+               (bl.store:coin-view-add
+                view (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element 3)
+                0 5000
+                (make-array 1 :element-type '(unsigned-byte 8)
+                              :initial-element #x51)
+                7 :coinbase nil :allow-overwrite nil)
+               (let ((bl:*node* node))
+                 (bl.store:utxo-set-iterate
+                  view (lambda (txid vout entry)
+                         (declare (ignore txid vout entry)))))
+               (is (equalp hash (bl.store:coins-view-db-best-block
+                                 (bl.store:coins-view-cache-base view)))
+                   "the RPC sync is expected to advance the stored pointer")
+               ;; And a restart must be able to place the block it names.
+               (let ((reload (bl.store:init-chain-state base)))
+                 (bl.store:load-header-index reload)
+                 (is-true (bl.store:get-block-index-entry reload hash)
+                          "the coins DB names a block the persisted index does ~
+                           not hold, so start-up would refuse to run")))
+          (bl.store:close-chainstate-coins-view cs))))))
+
 ;;;; Shutdown coordination: the internal stop paths only REQUEST a shutdown,
 ;;;; and the main thread performs it (GA8 wave 5).
 ;;;;

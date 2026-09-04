@@ -299,6 +299,37 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
       (%abort-on-flush-failure label c)
       nil)))
 
+(defun persist-block-index-for-coins-write ()
+  "Durably write the block index, as Core's WriteBlockIndexDB does immediately
+before CoinsTip().Sync() (validation.cpp:2789-2812).
+
+Installed as BL.STORE:*PERSIST-BLOCK-INDEX-HOOK*, which the coins view calls
+from the one place the best-block pointer is staged. Phase 1 of
+%FLUSH-CHAINSTATE is not the only writer of that pointer: gettxoutsetinfo,
+dumptxoutset, scantxoutset and the assumeutxo hash check all sync the live
+coins cache before iterating it, and loadtxoutset flushes the adopted snapshot
+base — none of which passes through the flush. Left unordered, a crash after
+one of those and before the next periodic flush (up to 600 s or 25 000 blocks)
+leaves the coins DB naming a block the header index was never told about, and
+start-up refuses to run until the node is reindexed.
+
+The block index is ONE table shared by every chainstate (a snapshot chainstate
+is created on the primary's, and headerindex.dat takes no storage suffix), so
+writing the current chainstate's writes the whole of it.
+
+Runs under COINS-VIEW-CACHE-SYNC's caller contract -- the node lock held across
+the call -- which is what keeps it from racing the periodic flush's own
+header-index write. dumptxoutset and the periodic flush hold it; gettxoutsetinfo
+and scantxoutset do not, which is a gap in those two handlers rather than in
+this ordering, and its worst case is a delta-log frame the next start-up's
+replay stops at, leaving the index exactly as stale as it was before this hook
+existed."
+  (let ((chainstate (and *node* (node-current-chainstate *node*))))
+    (when chainstate
+      (bl.store:save-header-index chainstate))))
+
+(setf bl.store:*persist-block-index-hook* 'persist-block-index-for-coins-write)
+
 (defun do-flush (&optional (chainstate (and *node* (node-current-chainstate *node*))))
   "Flush CHAINSTATE (default: the node's current chainstate) and run the
 per-cycle bookkeeping: reset the periodic-flush triggers, request a major GC

@@ -333,6 +333,25 @@ erased."
         (cvc-mem-bytes cache) 0)
   (coins-view-db-erase-all-coins (cvc-base cache)))
 
+(defvar *persist-block-index-hook* nil
+  "Thunk that durably writes the block index, installed by the node; NIL for a
+test fixture or an offline tool that has no index to write.
+
+Core's FlushStateToDisk writes the block files and then the block-index
+database BEFORE CoinsTip().Sync()/Flush() (validation.cpp:2780-2812), so the
+coins database can never name a block the block index does not hold. Our
+periodic flush has that order in %FLUSH-CHAINSTATE's Phase 1, but the coins
+pointer is also written from paths that never reach it: every RPC that walks
+the UTXO set syncs the cache first (gettxoutsetinfo, dumptxoutset,
+scantxoutset, the assumeutxo hash check), and loadtxoutset stamps the snapshot
+base and flushes. Hooking the ONE place the pointer is staged, rather than
+those call sites, is what keeps the two from drifting apart again.
+
+What it costs when the pointer outruns the index: the coins DB names a block
+the header index cannot place, RECONCILE-COINS-DB-BEST-BLOCK returns
+:unresolvable, and start-up refuses to run until the node is reindexed — so a
+read-only RPC plus an ordinary unclean shutdown becomes a mandatory reindex.")
+
 (defun %stage-dirty-coins (cache batch best-block)
   "Stage every dirty entry of CACHE into BATCH — a put for a coin, an erase for
 a spent tombstone — plus BEST-BLOCK when the caller has one. Returns the number
@@ -351,6 +370,11 @@ this half is shared here as well and cannot drift between them."
                  (incf count)))
              (cvc-entries cache))
     (when best-block
+      ;; The block index reaches disk BEFORE the pointer that names one of its
+      ;; entries — Core's WriteBlockIndexDB / CoinsTip().Sync() order. Inside
+      ;; the periodic flush this is a second look at an index Phase 1 has just
+      ;; written, which finds nothing changed and writes nothing.
+      (when *persist-block-index-hook* (funcall *persist-block-index-hook*))
       (coins-view-batch-set-best-block batch best-block))
     count))
 

@@ -234,6 +234,7 @@ src/storage/.")
    #:coins-view-cache-spend
    #:coins-view-cache-flush
    #:coins-view-cache-sync
+   #:*persist-block-index-hook*
    #:coins-view-cache-uncache
    #:with-coins-to-uncache
    #:coins-view-best-block
