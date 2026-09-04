@@ -2043,9 +2043,17 @@ encoded it separately and disagreed above 75 bytes."
                                             sig-bytes))
       (return-from verify-checksig (values nil :sig-findanddelete))))
 
-  ;; Empty signature - no DER to check, no NULLFAIL violation
+  ;; Empty signature: nothing to parse, and NULLFAIL is gated on a non-empty
+  ;; signature (interpreter.cpp:341), so the only verdict left is "did not
+  ;; verify". The PUBKEY ENCODING is still checked: Core's
+  ;; CheckSignatureEncoding merely answers true for an empty signature
+  ;; (interpreter.cpp:186-188) and EvalChecksigPreTapscript goes straight on to
+  ;; CheckPubKeyEncoding (:335), so under STRICTENC an ill-encoded key fails
+  ;; PUBKEYTYPE whatever the signature is. Returning a plain NIL here made
+  ;; `<0x00> <bad key> CHECKSIG NOT' succeed for us and fail for Core.
   (when (zerop (length sig-bytes))
-    (return-from verify-checksig (values nil nil)))
+    (return-from verify-checksig
+      (values nil (check-pubkey-encoding pubkey-bytes))))
 
   ;; Extract sighash type from signature (last byte)
   (let* ((sighash-type (aref sig-bytes (1- (length sig-bytes))))
@@ -2609,9 +2617,13 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
 (defun verify-checksig-witness (sig-bytes pubkey-bytes script-code amount)
   "Verify a CHECKSIG operation for witness input using BIP 143 sighash.
    Returns (values result error-type)."
-  ;; Empty signature
+  ;; Empty signature: as in VERIFY-CHECKSIG, Core's CheckSignatureEncoding
+  ;; passes it and CheckPubKeyEncoding still runs (interpreter.cpp:335).
+  ;; WITNESS_PUBKEYTYPE is already applied by the P2WPKH caller, which is the
+  ;; only one that reaches here, so this is CheckPubKeyEncoding's STRICTENC arm.
   (when (zerop (length sig-bytes))
-    (return-from verify-checksig-witness (values nil nil)))
+    (return-from verify-checksig-witness
+      (values nil (check-pubkey-encoding pubkey-bytes))))
 
   (let* ((sighash-type (aref sig-bytes (1- (length sig-bytes))))
          (der-sig (subseq sig-bytes 0 (1- (length sig-bytes))))

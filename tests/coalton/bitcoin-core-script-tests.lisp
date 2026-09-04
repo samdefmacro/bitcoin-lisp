@@ -775,3 +775,45 @@ reach the same verdict either way."
                "with no NOPs at all the failure is still the stack"))
       (bl.interop:set-script-flags nil))))
 
+(test empty-signature-still-checks-the-pubkey-encoding
+  "CONSENSUS (Core interpreter.cpp:335): EvalChecksigPreTapscript runs
+CheckSignatureEncoding -- which answers true for an EMPTY signature (:186-188)
+-- and then CheckPubKeyEncoding for every signature, empty ones included, so
+under STRICTENC an ill-encoded key fails PUBKEYTYPE whatever the signature is.
+We returned a plain `did not verify' for an empty signature and never looked at
+the key. script_tests.json 1086/1087 are this shape and pass either way, because
+both trees reject and the corpus runner compares only pass/fail; appending
+OP_NOT turns it into an accept/reject split, and Core has no such vector.
+The keys are those vectors': 33 bytes with the uncompressed 0x04 prefix, and a
+valid compressed one as the control."
+  (let* ((bad-key (bl.crypto:hex-to-bytes
+                   "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
+         (good-key (bl.crypto:hex-to-bytes
+                    "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
+         (empty-sig (%w8d-script #x00)))
+    (flet ((p2pk (key &rest tail)
+             (apply #'%w8d-script #x21 key #xac tail))
+           (verify (sig spk flags)
+             (bl.interop:set-script-flags flags)
+             (unwind-protect (multiple-value-list
+                              (bl.interop:verify-script sig spk))
+               (bl.interop:set-script-flags nil))))
+      ;; The accept/reject split: with OP_NOT the skipped check decided the
+      ;; verdict, not just the error name.
+      (is (equal '(nil :error)
+                 (verify empty-sig (p2pk bad-key #x91) "STRICTENC"))
+          "empty sig against a bad key with NOT must fail (Core PUBKEYTYPE)")
+      ;; Same script without NOT: the error name is observable here too --
+      ;; a script ERROR, not a false result.
+      (is (equal '(nil :error)
+                 (verify empty-sig (p2pk bad-key) "STRICTENC"))
+          "empty sig against a bad key is a script error, not EVAL_FALSE")
+      ;; Control 1: without STRICTENC, Core's CheckPubKeyEncoding passes and the
+      ;; empty signature simply fails to verify, so NOT succeeds. This is what
+      ;; makes the test above about the encoding check and not about empty
+      ;; signatures in general.
+      (is (equal '(t nil) (verify empty-sig (p2pk bad-key #x91) ""))
+          "without STRICTENC the same script must still succeed")
+      ;; Control 2: a well-encoded key under STRICTENC behaves the same way.
+      (is (equal '(t nil) (verify empty-sig (p2pk good-key #x91) "STRICTENC"))
+          "a valid compressed key with an empty signature must still succeed"))))
