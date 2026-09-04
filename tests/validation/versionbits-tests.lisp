@@ -14,14 +14,18 @@
 
 (in-suite :versionbits-tests)
 
+(defun %dep (name network)
+  "NETWORK's deployment called NAME. One reach for the whole file: the lookup
+is internal to BL.VAL (getdeploymentinfo walks the whole list instead), and
+eleven copies of the same :: is what the structural ratchet exists to collapse."
+  (bl.val::versionbits-deployment name network))
+
 (test versionbits-special-start-times-short-circuit
   "ALWAYS_ACTIVE and NEVER_ACTIVE are answered before any chain walk
 (versionbits.cpp:33-40), which is what lets them be evaluated with no block
 index at all."
-  (let ((always (bl.val::versionbits-deployment
-                 "taproot" :regtest))
-        (never (bl.val::versionbits-deployment
-                "testdummy" :mainnet)))
+  (let ((always (%dep "taproot" :regtest))
+        (never (%dep "testdummy" :mainnet)))
     (is (= bl.val:+vb-always-active+
            (bl.val:vb-deployment-start-time always)))
     (is (eq :active (bl.val:versionbits-state nil nil always)))
@@ -35,7 +39,7 @@ exactly this wrong: regtest counts over 144 blocks needing 108, where mainnet
 counts over 2016 needing 1815 (kernel/chainparams.cpp:106-107 vs :590-591).
 Transcription errors here are invisible until a functional test on regtest
 disagrees about when a fork locks in."
-  (flet ((dep (net name) (bl.val::versionbits-deployment name net)))
+  (flet ((dep (net name) (%dep name net)))
     ;; Core's five chains, the values that differ between them.
     (is (= 2016 (bl.val:vb-deployment-period (dep :mainnet "taproot"))))
     (is (= 1815 (bl.val:vb-deployment-threshold (dep :mainnet "taproot"))))
@@ -113,34 +117,6 @@ has already shipped twice."
   (is (string= "active" (bl.val:versionbits-state-name :active)))
   (is (string= "failed" (bl.val:versionbits-state-name :failed))))
 
-(defun %vb-chain (n &key (network :regtest) (signal-bit nil) (base-time 1000000))
-  "(values chain-state last-entry) for a synthetic chain of N blocks.
-
-Every header carries the versionbits top bits, and SIGNAL-BIT additionally sets
-that deployment bit — which is what CONDITION counts."
-  (declare (ignore network))
-  (let ((cs (bl.store:make-chain-state))
-        (prev nil))
-    (dotimes (i n)
-      (let* ((version (logior #x20000000 (if signal-bit (ash 1 signal-bit) 0)))
-             (header (bl.ser:make-block-header
-                      :version version
-                      :prev-block (make-array 32 :element-type '(unsigned-byte 8)
-                                                 :initial-element 0)
-                      :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
-                                                  :initial-element 0)
-                      :timestamp (+ base-time (* i 600))
-                      :bits #x207fffff :nonce 0))
-             (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
-        (setf (aref hash 0) (logand i #xFF)
-              (aref hash 1) (logand (ash i -8) #xFF))
-        (let ((e (bl.store:make-block-index-entry
-                  :hash hash :height i :prev-entry prev :header header
-                  :status :valid)))
-          (bl.store:add-block-index-entry cs e)
-          (setf prev e))))
-    (values cs prev)))
-
 (test versionbits-elapsed-counts-the-way-core-counts
   "⚠️ Core computes blocks_in_period as `1 + (nHeight %% period)' and counts it
 down, so ELAPSED ends at that value (versionbits.cpp:129-150). Writing it as
@@ -149,8 +125,8 @@ where Core reports a full period elapsed and that reports ZERO — and zero
 elapsed means zero count and a `possible' computed from nothing.
 
 regtest's period is 144, so height 143 is the case that separates them."
-  (let ((dep (bl.val::versionbits-deployment "testdummy" :regtest)))
-    (multiple-value-bind (cs last) (%vb-chain 144 :signal-bit 28)
+  (let ((dep (%dep "testdummy" :regtest)))
+    (multiple-value-bind (cs last) (make-versionbits-chain 144 :signal-bit 28)
       ;; Height 143 is the last block of the first period.
       (is (= 143 (bl.store:block-index-entry-height last)))
       (multiple-value-bind (period threshold elapsed count possible)
@@ -162,7 +138,7 @@ regtest's period is 144, so height 143 is the case that separates them."
         ;; Every header signals bit 28, so the count is the whole window.
         (is (= 144 count))))
     ;; And one block earlier, elapsed is 143 — the formulas agree here.
-    (multiple-value-bind (cs last) (%vb-chain 143 :signal-bit 28)
+    (multiple-value-bind (cs last) (make-versionbits-chain 143 :signal-bit 28)
       (multiple-value-bind (period threshold elapsed)
           (bl.val:versionbits-statistics cs last dep)
         (declare (ignore period threshold))
@@ -175,7 +151,7 @@ count zero and `possible' FALSE — default-initialised, never computed
 
 Without that early return the corrected elapsed formula is a trap: `(mod -1 144)'
 is 143 in Common Lisp, so it would walk a NIL entry a whole period of times."
-  (let ((dep (bl.val::versionbits-deployment "testdummy" :regtest)))
+  (let ((dep (%dep "testdummy" :regtest)))
     (multiple-value-bind (period threshold elapsed count possible)
         (bl.val:versionbits-statistics nil nil dep)
       (is (= 144 period))
@@ -188,11 +164,22 @@ is 143 in Common Lisp, so it would walk a NIL entry a whole period of times."
   "CONDITION requires both the versionbits top bits and the deployment's own
 bit; a chain that sets neither counts zero, which is what makes `possible' go
 false once the window cannot be reached."
-  (let ((dep (bl.val::versionbits-deployment "testdummy" :regtest)))
-    (multiple-value-bind (cs last) (%vb-chain 144)   ; top bits only, no bit 28
+  (let ((dep (%dep "testdummy" :regtest)))
+    (multiple-value-bind (cs last) (make-versionbits-chain 144)   ; top bits only, no bit 28
       (multiple-value-bind (period threshold elapsed count possible)
           (bl.val:versionbits-statistics cs last dep)
         (declare (ignore period threshold))
         (is (= 144 elapsed))
         (is (= 0 count))
         (is (null possible) "a full period with no signal cannot still be possible")))))
+
+(test versionbits-mtp-is-computed-from-the-entry-alone
+  "⚠️ COMPUTE-MEDIAN-TIME-PAST-FROM-ENTRY takes ONE argument. %VB-MTP passed it
+the chain-state as well, so every state that needs a real MTP signalled
+SB-INT:SIMPLE-PROGRAM-ERROR — and nothing noticed, because both callers reach
+MTP only past a short circuit (ALWAYS_ACTIVE / NEVER_ACTIVE return first, and an
+empty chain has no period boundary to walk to). A chain long enough to have one,
+carrying a deployment with a real start time, is the case that executes it."
+  (multiple-value-bind (cs last) (make-versionbits-chain 144 :signal-bit 28)
+    (let ((testdummy (%dep "testdummy" :regtest)))
+      (is (eq :started (bl.val:versionbits-state cs last testdummy))))))

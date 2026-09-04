@@ -138,7 +138,19 @@ also reachable through /rest/deploymentinfo.")
       (funcall thunk)))
 
 (defun %vb-mtp (chain-state entry)
-  (and entry (compute-median-time-past-from-entry chain-state entry)))
+  "ENTRY's median time past, or NIL for the block before genesis.
+
+⚠️ COMPUTE-MEDIAN-TIME-PAST-FROM-ENTRY takes the entry ALONE — it walks
+PREV-ENTRY and never consults the index. Passing CHAIN-STATE as well made this
+a two-argument call to a one-argument function, so every state that needs a
+real MTP signalled SB-INT:SIMPLE-PROGRAM-ERROR at run time. Nothing caught it
+because both callers reach MTP only past a short circuit: a deployment with
+ALWAYS_ACTIVE or NEVER_ACTIVE returns before any walk, and an empty chain has
+no period boundary to walk to — which is every case the tests and the four
+non-mainnet chains' tables produce. CHAIN-STATE stays in the signature because
+it is part of VERSIONBITS-STATE's, which getdeploymentinfo calls."
+  (declare (ignore chain-state))
+  (and entry (compute-median-time-past-from-entry entry)))
 
 (defun versionbits-state (chain-state entry deployment)
   "The BIP9 state of the block that would follow ENTRY — Core's
