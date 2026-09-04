@@ -102,11 +102,20 @@ response. Caller has already validated EXT is one of those."
         :hex/bin (%rest-hex-or-bin ext hash-hex)))))
 
 (defun %rest-block (node body ext &key notxdetails)
+  "/rest/block/<hash> and /rest/block/notxdetails/<hash>.
+
+The JSON verbosities are Core's TxVerbosity, not getblock's defaults:
+rest_block_extended passes SHOW_DETAILS_AND_PREVOUT (rest.cpp:470-473), which
+getblock reaches only at verbosity 3 (rpc/blockchain.cpp:867-874) and which
+gives every non-coinbase vin its `prevout` object, while
+rest_block_notxdetails passes SHOW_TXID, i.e. verbosity 1. Serving verbosity 2
+here answered without any prevout, so a block explorer had to fetch every
+spent output itself."
   (unless (valid-hex-hash-p body)
     (return-from %rest-block (%rest-error 400 "Invalid block hash")))
   (handler-case
       (%rest-by-ext ext
-        :json (%rest-json (rpc-getblock node (list body (if notxdetails 1 2))))
+        :json (%rest-json (rpc-getblock node (list body (if notxdetails 1 3))))
         :hex/bin (%rest-hex-or-bin ext (rpc-getblock node (list body 0))))
     (rpc-error () (%rest-error 404 "Block not found"))))
 

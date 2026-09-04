@@ -4566,6 +4566,31 @@ prevouts as the coinbase's and finds none for the last transaction."
           (is (string= (bl.crypto:bytes-to-hex *gbs-p2pkh*)
                        (gethash "hex" (gethash "scriptPubKey" coin)))))))))
 
+(test rest-block-json-is-core-s-verbosity-3
+  "/rest/block/<hash>.json is rest_block_extended, which passes
+TxVerbosity::SHOW_DETAILS_AND_PREVOUT (rest.cpp:470-473) -- the level getblock
+reaches only at verbosity 3 (rpc/blockchain.cpp:867-874), where every
+non-coinbase vin carries a `prevout` object. We asked for verbosity 2, so the
+endpoint served vins with no prevout at all and an explorer had to fetch every
+spent output itself. /rest/block/notxdetails/ stays at SHOW_TXID."
+  (%with-gbs-block (node hex spender)
+    (let* ((parsed (yason:parse (rest-request node (format nil "/rest/block/~A.json" hex))))
+           (spend (second (gethash "tx" parsed)))
+           (prevout (gethash "prevout" (first (gethash "vin" spend)))))
+      (is-true prevout "the vin has no prevout: this is verbosity 2, not 3")
+      (is (= 50 (gethash "height" prevout)))
+      (is (< (abs (- 0.001d0 (gethash "value" prevout))) 1d-12))
+      (is (string= (bl.crypto:bytes-to-hex *gbs-p2pkh*)
+                   (gethash "hex" (gethash "scriptPubKey" prevout))))
+      ;; The fee verbosity 2 already carried is still there.
+      (is-true (gethash "fee" spend))
+      ;; The coinbase spends nothing, so Core gives it no prevout.
+      (is-false (gethash "prevout" (first (gethash "vin" (first (gethash "tx" parsed)))))))
+    ;; notxdetails is SHOW_TXID: bare txid strings, no transaction objects.
+    (let ((parsed (yason:parse
+                   (rest-request node (format nil "/rest/block/notxdetails/~A.json" hex)))))
+      (is-true (every #'stringp (gethash "tx" parsed))
+               "notxdetails must stay at Core's SHOW_TXID"))))
 
 (test rpc-calculate-block-subsidy
   "Test block subsidy calculation"
