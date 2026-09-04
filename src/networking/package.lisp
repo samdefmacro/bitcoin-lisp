@@ -264,6 +264,7 @@ headerssync.cpp. src/networking/.")
    #:permission-flag-names
    #:peer-permission-flags
    #:peer-has-permission-p
+   #:permission-flag-set-p
    #:+perm-bloom-filter+
    #:+perm-relay+
    #:+perm-force-relay+
