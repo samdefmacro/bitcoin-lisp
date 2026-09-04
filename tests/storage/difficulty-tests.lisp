@@ -376,6 +376,51 @@ could split us from the testnet network."
       (is (null (bl.val:bip94-timewarp-violation-p
                  (make-mock-header :timestamp (- 100000 601)) 2016 prev))))))
 
+(test enforce-bip94-is-a-per-chain-fact-plus-a-regtest-option
+  "Core's consensus.enforce_BIP94 is true on testnet4 and, on regtest, exactly
+when -test=bip94 was given (kernel/chainparams.cpp:344 and :579,
+chainparams.cpp:47). ContextualCheckBlockHeader's comment says the rule is
+\"Testnet4 and regtest only\"; we had it hardcoded to testnet4, so no option
+could turn it on."
+  (let ((bl.chain:*enforce-bip94-on-regtest* nil))
+    (is-true (bl.chain:enforce-bip94-p :testnet4))
+    (is-false (bl.chain:enforce-bip94-p :regtest))
+    (dolist (net '(:mainnet :testnet3 :signet))
+      (is-false (bl.chain:enforce-bip94-p net) "~A must not enforce BIP94" net)))
+  (let ((bl.chain:*enforce-bip94-on-regtest* t))
+    (is-true (bl.chain:enforce-bip94-p :regtest))
+    ;; The option is regtest's alone: it cannot switch the rule on elsewhere.
+    (dolist (net '(:mainnet :testnet3 :signet))
+      (is-false (bl.chain:enforce-bip94-p net)))))
+
+(test bip94-timewarp-enforced-on-regtest-under-the-test-option
+  "⚠️ Both chain-dependent halves of the rule were hardcoded: the gate to
+testnet4 and the period to 2016. regtest retargets every 144 blocks
+(nPowTargetTimespan 86400 / nPowTargetSpacing 600), so with -test=bip94 Core
+rejects a timewarped header at height 144 and we accepted it -- and at 144 we
+would not even have looked. mining_basic.py:193-247 drives exactly this and
+expects -25 'time-timewarp-attack'."
+  (let ((bl:*network* :regtest)
+        (prev (%timewarp-entry 143 100000))
+        (early (make-mock-header :timestamp (- 100000 601))))
+    (let ((bl.chain:*enforce-bip94-on-regtest* t))
+      (is-true (bl.val:bip94-timewarp-violation-p early 144 prev)
+               "144 is a regtest retarget boundary")
+      ;; Exactly MAX_TIMEWARP early is still allowed (strict <).
+      (is-false (bl.val:bip94-timewarp-violation-p
+                 (make-mock-header :timestamp (- 100000 600)) 144 prev))
+      ;; Off-boundary heights are exempt even with the rule on.
+      (is-false (bl.val:bip94-timewarp-violation-p early 143 prev))
+      (is-false (bl.val:bip94-timewarp-violation-p early 100 prev)))
+    ;; Without the option regtest is exempt, which is the default.
+    (let ((bl.chain:*enforce-bip94-on-regtest* nil))
+      (is-false (bl.val:bip94-timewarp-violation-p early 144 prev))))
+  ;; And testnet4 keeps its own 2016-block period: 144 is not a boundary there.
+  (let ((bl:*network* :testnet4)
+        (prev (%timewarp-entry 143 100000)))
+    (is-false (bl.val:bip94-timewarp-violation-p
+               (make-mock-header :timestamp (- 100000 601)) 144 prev))))
+
 (test bip94-timewarp-excludes-genesis
   "Height 0 satisfies the modulo but is excluded (no predecessor)."
   (let ((bl:*network* :testnet4))

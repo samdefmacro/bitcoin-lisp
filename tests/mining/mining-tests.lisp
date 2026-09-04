@@ -1038,10 +1038,13 @@ timestamps 1000000..1000009 (so MTP is 1000005, far below TIP-TIME)."
     (values cs (bl.mp:make-mempool))))
 
 (test assembler-bip94-timewarp-clamp-at-retarget
-  "At a retarget height (height % 2016 == 0) the template's mintime is
-clamped to prev-block-time - MAX_TIMEWARP when that exceeds MTP+1 (Core
-GetMinimumTime, miner.cpp:36-47), and curtime is floored to mintime
-(UpdateTime, miner.cpp:49-57). Off-boundary the floor stays MTP+1."
+  "At a retarget height the template's mintime is clamped to prev-block-time -
+MAX_TIMEWARP when that exceeds MTP+1 (Core GetMinimumTime, miner.cpp:36-47),
+and curtime is floored to mintime (UpdateTime, miner.cpp:49-57). Off-boundary
+the floor stays MTP+1.
+
+The period is the CHAIN's: regtest retargets every 144 blocks, so both heights
+here are boundaries on it (2016 = 14 * 144) and 2017 is not."
   (let ((bl:*network* :regtest))
     ;; Tip at 2015 -> template height 2016, a retarget boundary.
     (multiple-value-bind (cs mp) (%timewarp-fixture 2015 2000000)
@@ -1062,6 +1065,34 @@ GetMinimumTime, miner.cpp:36-47), and curtime is floored to mintime
         (is (= (1+ 1000005)                ; MTP+1
                (bl.mining:block-template-mintime tmpl)))
         (is (= 1000010 (bl.mining:block-template-curtime tmpl)))))))
+
+(test assembler-timewarp-floor-uses-the-chains-retarget-period
+  "⚠️ Core takes the period as a parameter -- DifficultyAdjustmentInterval(),
+nPowTargetTimespan / nPowTargetSpacing -- and applies the floor on every
+network whether or not BIP94 is consensus there (\"Account for BIP94 timewarp
+rule on all networks\", miner.cpp:41-45). On regtest that period is 144, not
+2016, so height 144 IS a boundary for Core and was not for us: our template
+offered a mintime 2,999 s below the one Core reports, and mining_basic.py's
+timewarp case asserts curtime == mintime at exactly such a height.
+
+Height 144 is the discriminating case: a multiple of 144 and not of 2016."
+  (multiple-value-bind (cs mp) (%timewarp-fixture 143 2000000)
+    (let ((clamped (- 2000000 bl.val:+max-timewarp+)))
+      (let ((bl:*network* :regtest))
+        (let ((tmpl (bl.mining:assemble-block-template cs mp :block-time 1000010)))
+          (is (= 144 (bl.mining:block-template-height tmpl)))
+          (is (= clamped (bl.mining:block-template-mintime tmpl))
+              "regtest retargets at 144, so the BIP94 floor applies")
+          (is (= clamped (bl.mining:block-template-curtime tmpl)))))
+      ;; The chains whose period is 2016 must NOT clamp at height 144.
+      (dolist (net '(:mainnet :testnet4))
+        (let ((bl:*network* net))
+          (is (= (1+ 1000005)               ; MTP+1
+                 (bl.mining:next-block-mintime
+                  (bl.store:get-block-index-entry
+                   cs (bl.store:best-block-hash cs))
+                  144 1000005))
+              "~A retargets every 2016 blocks: height 144 is not a boundary" net))))))
 
 (test template-testblockvalidity-catches-bad-mempool-tx
   "A consensus-invalid tx smuggled into the mempool (validation bypassed —

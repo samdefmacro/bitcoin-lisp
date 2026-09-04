@@ -1102,6 +1102,43 @@ filter server waited on a getcfilters that is dropped without a reply."
   (is-true (getf (start-node-plist '("-testnet4" "-peerblockfilters=1"))
                  :peer-block-filters)))
 
+(test test-option-is-a-repeatable-regtest-only-switch
+  "-test=<option> is a LIST option (Core reads it with GetArgs,
+common/args.cpp:751), it is an ERROR off regtest (init.cpp:1109-1111) and only
+a WARNING for a value the node does not know (:1117-1119) -- Core keeps
+starting. It sat in the accepted-but-not-implemented list, so -test=bip94 was
+silently a no-op and the BIP94 rule had no way to be turned on."
+  (let ((plist (start-node-plist
+                '("-regtest" "-test=bip94" "-test=nosuch") nil)))
+    (is (equal '("bip94" "nosuch") (getf plist :test-options))))
+  (is-false (bl.cfg:core-only-option-p "test"))
+  (is-true (bl:known-config-option-p "test"))
+  (unwind-protect
+       (let ((bl.chain:*enforce-bip94-on-regtest* nil))
+         (bl::%apply-test-options :regtest '("bip94"))
+         (is-true bl.chain:*enforce-bip94-on-regtest*)
+         ;; An unknown value warns and is otherwise ignored -- the node starts.
+         (bl::%apply-test-options :regtest '("nosuch" "bip94"))
+         (is-true bl.chain:*enforce-bip94-on-regtest*)
+         ;; Absent, the flag is cleared: a previous run must not leak into this
+         ;; one, and nothing else ever sets it back.
+         (bl::%apply-test-options :regtest nil)
+         (is-false bl.chain:*enforce-bip94-on-regtest*)
+         ;; Off regtest the option is refused outright, on every other chain.
+         (dolist (net '(:mainnet :testnet3 :testnet4 :signet))
+           (signals error (bl::%apply-test-options net '("bip94")))))
+    (setf bl.chain:*enforce-bip94-on-regtest* nil)))
+
+(test blockversion-is-a-known-option-that-sets-the-template-override
+  "-blockversion is Core's forking-scenario knob (miner.cpp:141-145,
+mining_basic.py:85). It was in the accepted-but-not-implemented list, so the
+value was read and thrown away."
+  (is-false (bl.cfg:core-only-option-p "blockversion"))
+  (is-true (bl:known-config-option-p "blockversion"))
+  (let ((bl.mining:*block-version-override* nil))
+    (bl.cfg:apply-option-globals '(("blockversion" . "1337")))
+    (is (= 1337 bl.mining:*block-version-override*))))
+
 (defmacro %with-clean-log-categories (&body body)
   "Run BODY with every logging category off, and restore them afterwards."
   `(let ((saved (remove-if-not #'bl:log-category-enabled-p

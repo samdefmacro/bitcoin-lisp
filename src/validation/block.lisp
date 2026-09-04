@@ -638,16 +638,21 @@ NOT a mutation, only genuine equal adjacent pairs are. Single-value callers
 ;;;; Block header validation
 
 (defun bip94-timewarp-violation-p (header height prev-entry)
-  "T if HEADER violates the BIP 94 timewarp-attack rule: on testnet4, the
-first block of each difficulty-adjustment period (HEIGHT a nonzero
-multiple of the adjustment interval) must be timestamped no more than
+  "T if HEADER violates the BIP 94 timewarp-attack rule: where the rule is
+consensus, the first block of each difficulty-adjustment period (HEIGHT a
+nonzero multiple of the period) must be timestamped no more than
 +max-timewarp+ seconds before its predecessor's ACTUAL time (not MTP).
-enforce_BIP94 is true only on testnet4 among our networks. Genesis is
-excluded — it satisfies the modulo but has no predecessor. Mirrors
-Bitcoin Core ContextualCheckBlockHeader (validation.cpp:4129-4136)."
-  (and (eq bl:*network* :testnet4)
+Genesis is excluded — it satisfies the modulo but has no predecessor. Mirrors
+Bitcoin Core ContextualCheckBlockHeader (validation.cpp:4127-4137).
+
+Both chain-dependent values come from the chain: BL.CHAIN:ENFORCE-BIP94-P is
+Core's consensus.enforce_BIP94, true on testnet4 and on regtest under
+-test=bip94, and the period is Core's DifficultyAdjustmentInterval(), which is
+144 on regtest and 2016 elsewhere. Hardcoding either one leaves regtest unable
+to run the rule at the heights Core's own timewarp test drives it at."
+  (and (bl.chain:enforce-bip94-p bl:*network*)
        height prev-entry (plusp height)
-       (zerop (mod height bl.store:+difficulty-adjustment-interval+))
+       (zerop (mod height (bl.store:difficulty-adjustment-interval bl:*network*)))
        (< (bl.ser:block-header-timestamp header)
           (- (bl.ser:block-header-timestamp
               (bl.store:block-index-entry-header prev-entry))
