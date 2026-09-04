@@ -1547,6 +1547,26 @@ truncate scripts ending in a malformed push."
               ;; Core only replaces the script when nFound > 0.
               script)))))
 
+(defun find-and-delete-sig (script-code sig-bytes)
+  "Core\'s `FindAndDelete(scriptCode, CScript() << vchSig)\': drop every
+opcode-boundary occurrence of the signature\'s PUSH from SCRIPT-CODE. Returns
+(values cleaned-script found-p), FOUND-P being Core\'s `found > 0\' — which
+SCRIPT_VERIFY_CONST_SCRIPTCODE turns into SCRIPT_ERR_SIG_FINDANDDELETE
+(interpreter.cpp:329-332 for CHECKSIG, :1141-1150 for CHECKMULTISIG).
+
+The pattern is the signature\'s PUSH, never its bare bytes, and
+BL.SER:SCRIPT-PUSH-DATA is Core\'s `CScript() << vchSig\' down to the encoding
+boundaries. An EMPTY signature therefore has the one-byte pattern 0x00 (OP_0):
+CScript::AppendDataSize (script.h:407-410) takes the `size < OP_PUSHDATA1\'
+branch for size 0, so FindAndDelete\'s `if (b.empty()) return nFound\' early-out
+(interpreter.cpp:230-231) never fires and an OP_0 standing at an opcode
+boundary in the scriptCode IS deleted.
+
+The single place a CHECK(MULTI)SIG delete pattern is built: the two paths once
+encoded it separately and disagreed above 75 bytes."
+  (let ((cleaned (find-and-delete script-code (bl.ser:script-push-data sig-bytes))))
+    (values cleaned (< (length cleaned) (length script-code)))))
+
 (defun compute-legacy-sighash (tx input-index subscript sighash-type)
   "Compute legacy sighash from actual transaction data.
    TX is a transaction structure from bitcoin-lisp.serialization.
@@ -1984,6 +2004,18 @@ truncate scripts ending in a malformed push."
    When LOW_S flag is set, rejects signatures with high-S values.
    Returns (values result error-type) where error-type is :sig-der, :sig-hashtype,
    :pubkeytype, :nullfail, :sig-high-s, or NIL."
+  ;; CONST_SCRIPTCODE: FindAndDelete must not modify the scriptCode. Core runs
+  ;; this FIRST in EvalChecksigPreTapscript (interpreter.cpp:326-333), ahead of
+  ;; CheckSignatureEncoding, and for EVERY signature — an EMPTY one included,
+  ;; whose pattern is the one byte OP_0. LEGACY ONLY: Core gates the whole
+  ;; FindAndDelete step on sigversion == SigVersion::BASE, so a witness v0
+  ;; scriptCode is serialized untouched (BIP 143).
+  (when (and (flag-enabled-p "CONST_SCRIPTCODE")
+             (not *witness-v0-mode*))
+    (when (nth-value 1 (find-and-delete-sig (or *current-script-code* script-pubkey)
+                                            sig-bytes))
+      (return-from verify-checksig (values nil :sig-findanddelete))))
+
   ;; Empty signature - no DER to check, no NULLFAIL violation
   (when (zerop (length sig-bytes))
     (return-from verify-checksig (values nil nil)))
@@ -2021,12 +2053,10 @@ truncate scripts ending in a malformed push."
       (when pk-err
         (return-from verify-checksig (values nil pk-err))))
 
-    ;; CONST_SCRIPTCODE: reject if scriptCode contains OP_CODESEPARATOR as an opcode
-    ;; Also reject if FindAndDelete would modify the scriptCode (sig found in scriptCode)
-    ;; LEGACY ONLY: Core gates both on sigversion == SigVersion::BASE
-    ;; (interpreter.cpp:475 codesep, :1042 FindAndDelete) — in witness v0
-    ;; scripts OP_CODESEPARATOR is legal and FindAndDelete never runs.
-    ;; tx_valid.json's segwit codeseparator vectors fail without this gate.
+    ;; CONST_SCRIPTCODE: reject if the scriptCode carries OP_CODESEPARATOR as an
+    ;; opcode. LEGACY ONLY: Core gates it on sigversion == SigVersion::BASE
+    ;; (interpreter.cpp:474-476) — in witness v0 scripts OP_CODESEPARATOR is
+    ;; legal. tx_valid.json's segwit codeseparator vectors fail without it.
     (when (and (flag-enabled-p "CONST_SCRIPTCODE")
                (not *witness-v0-mode*))
       (let ((sc (or *current-script-code* script-pubkey)))
@@ -2042,15 +2072,7 @@ truncate scripts ending in a malformed push."
                        ((= op 77) (if (< (+ i 2) slen)
                                       (incf i (+ 3 (aref sc (1+ i)) (ash (aref sc (+ i 2)) 8)))
                                       (incf i)))
-                       (t (incf i)))))))
-      ;; Check if FindAndDelete would modify the scriptCode
-      (let* ((sc (or *current-script-code* script-pubkey))
-             (siglen (length sig-bytes))
-             (pattern (when (<= siglen 75)
-                        (concatenate '(vector (unsigned-byte 8))
-                                     (vector siglen) sig-bytes))))
-        (when (and pattern (search pattern sc))
-          (return-from verify-checksig (values nil :sig-findanddelete)))))
+                       (t (incf i))))))))
 
     ;; Compute sighash and verify
     (let* ((subscript-raw (or *current-script-code* script-pubkey))
@@ -2077,18 +2099,12 @@ truncate scripts ending in a malformed push."
                                                sighash-type))
                       ;; Legacy/P2SH: legacy sighash with FindAndDelete
                       (*current-tx*
-                       (let ((sig-push-pattern
-                               (let ((siglen (length sig-bytes)))
-                                 (if (<= siglen 75)
-                                     (concatenate '(vector (unsigned-byte 8))
-                                                  (vector siglen) sig-bytes)
-                                     sig-bytes))))
-                         (setf subscript-for-hash
-                               (find-and-delete subscript-raw sig-push-pattern))
-                         (compute-legacy-sighash *current-tx*
-                                                 *current-input-index*
-                                                 subscript-for-hash
-                                                 sighash-type)))
+                       (setf subscript-for-hash
+                             (find-and-delete-sig subscript-raw sig-bytes))
+                       (compute-legacy-sighash *current-tx*
+                                               *current-input-index*
+                                               subscript-for-hash
+                                               sighash-type))
                       ;; Unit tests: test transaction format
                       (t (compute-test-sighash script-pubkey sighash-type))))
            (require-low-s (flag-enabled-p "LOW_S")))
@@ -2323,35 +2339,19 @@ acceptable (or the flags are off)."
   (coerce vec '(simple-array (unsigned-byte 8) (*))))
 
 (defun strip-sigs-from-script-code (script-code sigs)
-  "FindAndDelete each sig (with its push-encoding) from SCRIPT-CODE.
-Returns (values cleaned-script any-found-p) where ANY-FOUND-P is T if
-any sig was actually found and removed. Used by CHECKMULTISIG to
-mirror Bitcoin Core's per-sig FindAndDelete loop
-(interpreter.cpp:1142-1150)."
+  "FindAndDelete each sig (with its push encoding) from SCRIPT-CODE.
+Returns (values cleaned-script any-found-p) where ANY-FOUND-P is T if any sig
+was actually found and removed. Mirrors Bitcoin Core's per-sig FindAndDelete
+loop in OP_CHECKMULTISIG (interpreter.cpp:1141-1150), which runs for EVERY one
+of the nSigsCount signatures — an empty one included, its pattern being the
+single byte OP_0 (see FIND-AND-DELETE-SIG)."
   (let ((script script-code)
         (any-found nil))
     (dolist (sig sigs)
-      (let* ((siglen (length sig))
-             (pattern
-               (cond
-                 ((zerop siglen) nil)
-                 ((<= siglen 75)
-                  (concatenate '(vector (unsigned-byte 8))
-                               (vector siglen) sig))
-                 ((<= siglen 255)
-                  (concatenate '(vector (unsigned-byte 8))
-                               (vector #x4c siglen) sig))
-                 (t
-                  (concatenate '(vector (unsigned-byte 8))
-                               (vector #x4d
-                                       (logand siglen #xff)
-                                       (logand (ash siglen -8) #xff))
-                               sig)))))
-        (when pattern
-          (let ((after (find-and-delete script pattern)))
-            (when (< (length after) (length script))
-              (setf any-found t))
-            (setf script after)))))
+      (multiple-value-bind (cleaned found) (find-and-delete-sig script sig)
+        (setf script cleaned)
+        (when found
+          (setf any-found t))))
     (values script any-found)))
 
 (defun do-checkmultisig-stack-op (stack script-pubkey)
