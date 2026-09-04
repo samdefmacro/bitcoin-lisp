@@ -108,3 +108,34 @@ bare form is (signals bl.rpc:rpc-error ...)"))
   "The rpc-error code THUNK signals, or NIL if it returns normally."
   (handler-case (progn (funcall thunk) nil)
     (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e))))
+
+;;;; Coins-view-cache white-box readers
+
+;;; The cache's DIRTY/FRESH bookkeeping is internal to BL.STORE, and both
+;;; tests/storage/ and tests/kv/ assert on it. Naming each accessor once here
+;;; keeps those `::' out of the test files (the structural ratchet
+;;; TEST-INTERNAL-REFERENCES-DO-NOT-GROW) and gives the assertions one
+;;; vocabulary for the flags whose meaning is stated in coins-view-cache.lisp.
+
+(defun coins-cache-entries (cache)
+  "The cache's entry table, keyed by utxo-key. HASH-TABLE-COUNT it for the
+cache's size, GETHASH a key out of it for one entry, MAPHASH it for all."
+  (bl.store::cvc-entries cache))
+
+(defun coins-cache-fresh-count (cache)
+  "How many entries the cache counts as FRESH — absent from the base view, so
+a spend may drop them outright instead of staging an erase."
+  (bl.store::cvc-fresh-count cache))
+
+(defun coins-cache-dirty-count (cache)
+  "How many entries the cache counts as DIRTY — changed since the last write
+to the base view."
+  (bl.store::cvc-dirty-count cache))
+
+(defun coins-cache-entry-fresh-p (entry)
+  "Whether one cache entry carries the FRESH flag."
+  (bl.store::ce-fresh entry))
+
+(defun coins-cache-entry-dirty-p (entry)
+  "Whether one cache entry carries the DIRTY flag."
+  (bl.store::ce-dirty entry))

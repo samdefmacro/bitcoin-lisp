@@ -1007,12 +1007,12 @@ cache entry entirely — flush has nothing to do."
     (let ((k (%sample-utxo-key 4 0))
           (e (%sample-utxo-entry)))
       (bl.store:coins-view-cache-add cache k e)
-      (is (= 1 (bl.store::cvc-fresh-count cache)))
-      (is (= 1 (bl.store::cvc-dirty-count cache)))
+      (is (= 1 (coins-cache-fresh-count cache)))
+      (is (= 1 (coins-cache-dirty-count cache)))
       (bl.store:coins-view-cache-spend cache k)
-      (is (= 0 (bl.store::cvc-fresh-count cache)))
-      (is (= 0 (bl.store::cvc-dirty-count cache)))
-      (is (= 0 (hash-table-count (bl.store::cvc-entries cache)))))))
+      (is (= 0 (coins-cache-fresh-count cache)))
+      (is (= 0 (coins-cache-dirty-count cache)))
+      (is (= 0 (hash-table-count (coins-cache-entries cache)))))))
 
 (test coins-view-cache-spend-non-fresh-keeps-tombstone
   "Spending a coin that came from base leaves a NIL tombstone in
@@ -1025,9 +1025,9 @@ cache (so flush issues the erase). FRESH-count stays zero."
       (bl.store:with-coins-view-db (base path)
         (let ((cache (bl.store:make-coins-view-cache base)))
           (bl.store:coins-view-cache-spend cache k)
-          (is (= 1 (bl.store::cvc-dirty-count cache)))
-          (is (= 0 (bl.store::cvc-fresh-count cache)))
-          (is (= 1 (hash-table-count (bl.store::cvc-entries cache)))))))))
+          (is (= 1 (coins-cache-dirty-count cache)))
+          (is (= 0 (coins-cache-fresh-count cache)))
+          (is (= 1 (hash-table-count (coins-cache-entries cache)))))))))
 
 (test coins-view-cache-flush-writes-and-clears
   "Flush writes dirty entries to base, then clears the cache."
@@ -1043,7 +1043,7 @@ cache (so flush issues the erase). FRESH-count stays zero."
           (let ((written (bl.store:coins-view-cache-flush cache)))
             (is (= 2 written)))
           ;; Cache is empty after flush.
-          (is (= 0 (hash-table-count (bl.store::cvc-entries cache))))
+          (is (= 0 (hash-table-count (coins-cache-entries cache))))
           ;; Base now has both entries.
           (is (not (null (bl.store:coins-view-db-get base k1))))
           (is (not (null (bl.store:coins-view-db-get base k2)))))))))
@@ -1617,21 +1617,124 @@ the bug. Iteration runs from RPC threads (gettxoutsetinfo, dumptxoutset) while
 the validation thread mutates the same table under the node lock: MAPHASH
 followed by CLRHASH could drop an entry inserted mid-walk WITHOUT writing it,
 and a lost tombstone leaves a spent coin alive in LevelDB — a double-spend Core
-rejects. Keeping the entries means a missed one stays dirty and is written by
-the next flush. It also stops a read-only RPC discarding the warm cache
-mid-IBD. Core's equivalent is Sync (write dirty, keep) rather than Flush
-(rpc/blockchain.cpp:1075-1084 uses ForceFlushStateToDisk with wipe_cache=false)."
+rejects. Keeping the entries means a missed one is not discarded unwritten. It
+also stops a read-only RPC discarding the warm cache mid-IBD. Core's equivalent
+is Sync (write dirty, keep) rather than Flush (rpc/blockchain.cpp:1075-1084
+uses ForceFlushStateToDisk with wipe_cache=false)."
   (%with-tmp-cache (cache)
     (%seed-three-coins cache)
-    (is (= 3 (hash-table-count
-              (bl.store::cvc-entries cache))))
+    ;; %seed-three-coins goes through ADD-UTXO, which permits an overwrite and
+    ;; is therefore never FRESH; one direct add puts a FRESH entry in the walk.
+    (bl.store:coin-view-add cache (%sample-txid #xCC) 0 400 (%sample-script) 1
+                            :allow-overwrite nil)
+    (is (= 4 (hash-table-count
+              (coins-cache-entries cache))))
+    (is (= 1 (coins-cache-fresh-count cache)))
     (bl.store:utxo-set-iterate
      cache (lambda (txid vout entry)
              (declare (ignore txid vout entry))))
-    (is (= 3 (hash-table-count (bl.store::cvc-entries cache)))
+    (is (= 4 (hash-table-count (coins-cache-entries cache)))
         "entries are retained, not cleared")
-    (is (zerop (bl.store::cvc-dirty-count cache))
-        "but they are no longer dirty — the sync committed them")))
+    (is (zerop (coins-cache-dirty-count cache))
+        "but they are no longer dirty — the sync committed them")
+    ;; BOTH flags clear, not just DIRTY: Core's SetClean is `m_flags = 0'
+    ;; (coins.h:173-181). A surviving FRESH says the base has no such coin,
+    ;; which the sync just made false — see the double-spend test below.
+    (is (zerop (coins-cache-fresh-count cache))
+        "and no longer FRESH — the sync put them in the base")
+    (maphash (lambda (key ce)
+               (declare (ignore key))
+               (is-false (coins-cache-entry-fresh-p ce))
+               (is-false (coins-cache-entry-dirty-p ce)))
+             (coins-cache-entries cache))))
+
+(test coins-view-cache-sync-clears-fresh-so-the-next-spend-cannot-repeat
+  "A coin added the way block application adds one, then SYNCED, must not stay
+FRESH — or the outpoint can be spent TWICE.
+
+FRESH means `the base view does not have this coin' (Core coins.h:150-159), so
+COINS-VIEW-CACHE-SPEND drops a FRESH entry outright instead of staging an
+erase. COINS-VIEW-CACHE-SYNC writes the coin to LevelDB, which makes FRESH a
+lie; Core clears it in the same walk (CoinsViewCacheCursor::NextAndMaybeErase,
+coins.h:279-295). While it survived, the spend removed the cache entry and
+staged nothing, the next read pulled the still-unspent coin back out of
+LevelDB, and a SECOND spend of the same outpoint was accepted — a consensus
+split plus UTXO inflation, reachable from gettxoutsetinfo, dumptxoutset,
+scantxoutset and the assumeutxo hash check, all of which sync the live
+chainstate coins view."
+  (%with-tmp-cache (cache)
+    (let* ((base (bl.store:coins-view-cache-base cache))
+           (txid (%sample-txid #xC0))
+           (key (bl.store:make-utxo-key txid 0)))
+      ;; COIN-VIEW-APPLY-BLOCK adds every non-coinbase output exactly so.
+      (bl.store:coin-view-add cache txid 0 5000 (%sample-script) 101
+                              :coinbase nil :allow-overwrite nil)
+      (is-true (coins-cache-entry-fresh-p (gethash key (coins-cache-entries cache)))
+               "the add is FRESH before the sync")
+      (bl.store:utxo-set-iterate cache (lambda (a b c) (declare (ignore a b c))))
+      (is-true (bl.store:coins-view-db-get base key)
+               "the sync wrote the coin to the base")
+      (let ((ce (gethash key (coins-cache-entries cache))))
+        (is-false (coins-cache-entry-fresh-p ce) "and cleared FRESH")
+        (is-false (coins-cache-entry-dirty-p ce)))
+      (is (zerop (coins-cache-fresh-count cache)))
+      ;; The spend must leave a tombstone that stages the base erase, not
+      ;; silently drop the entry.
+      (is (eq t (bl.store:coins-view-cache-spend cache key)))
+      (is-true (nth-value 1 (gethash key (coins-cache-entries cache)))
+               "the spend leaves a tombstone")
+      (is (= 1 (coins-cache-dirty-count cache)))
+      (is-false (bl.store:coins-view-cache-has-p cache key))
+      (is-false (bl.store:coins-view-cache-spend cache key)
+                "a second spend of the same outpoint must be refused")
+      (bl.store:coins-view-cache-flush cache)
+      (is-false (bl.store:coins-view-db-get base key)
+                "and the flushed erase removed it from the base"))))
+
+(test coins-view-cache-sync-drops-spent-tombstones
+  "A spent entry does not survive the sync: its erase is in the batch, so
+keeping it would only hold memory and leave a flagged entry behind. Core erases
+it from the map in the same walk and asserts the coin is already empty
+(coins.h:279-295)."
+  (%with-tmp-cache (cache)
+    (let* ((base (bl.store:coins-view-cache-base cache))
+           (txid (%sample-txid #xD0))
+           (key (bl.store:make-utxo-key txid 0)))
+      ;; Flush first, so the spend below sees a NON-fresh coin and tombstones it.
+      (bl.store:coin-view-add cache txid 0 7000 (%sample-script) 202
+                              :coinbase nil :allow-overwrite nil)
+      (bl.store:coins-view-cache-flush cache)
+      (is (eq t (bl.store:coins-view-cache-spend cache key)))
+      (is (= 1 (hash-table-count (coins-cache-entries cache))))
+      (bl.store:utxo-set-iterate cache (lambda (a b c) (declare (ignore a b c))))
+      (is (zerop (hash-table-count (coins-cache-entries cache)))
+          "the tombstone is gone from the table")
+      (is (zerop (coins-cache-dirty-count cache)))
+      (is (zerop (coins-cache-fresh-count cache)))
+      (is (zerop (bl.store:view-mem-bytes cache))
+          "and its slot overhead was returned to the memory estimate")
+      (is-false (bl.store:coins-view-db-get base key)
+                "the sync committed the erase"))))
+
+(test coins-view-cache-sync-signals-when-the-flag-counts-drift
+  "The sync's post-condition — Core's Sync throws `Not all unspent flagged
+entries were cleared' (coins.cpp:291-300). Our walk decrements the two
+counters entry by entry, so a leftover means the counts the mutators maintain
+disagree with the flags in the table.
+
+The first sync here is the positive control's counterpart: it must return
+normally, so the drifted count and not the check itself is what fails."
+  (%with-tmp-cache (cache)
+    (%seed-three-coins cache)
+    (is (= 3 (bl.store:coins-view-cache-sync cache)))
+    ;; Drop a FRESH entry behind the cache's back, so the counters now claim
+    ;; flags the table no longer holds.
+    (let ((txid (%sample-txid #xE0)))
+      (bl.store:coin-view-add cache txid 0 11 (%sample-script) 3
+                              :allow-overwrite nil)
+      (is (= 1 (coins-cache-fresh-count cache)))
+      (remhash (bl.store:make-utxo-key txid 0) (coins-cache-entries cache))
+      (signals bl.err:internal-error (bl.store:coins-view-cache-sync cache)))))
 
 (test polymorphic-iterate-cache-merges-flushed-base-and-recent-adds
   "After a partial flush, the next iterate still sees everything —

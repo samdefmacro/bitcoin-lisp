@@ -333,6 +333,27 @@ erased."
         (cvc-mem-bytes cache) 0)
   (coins-view-db-erase-all-coins (cvc-base cache)))
 
+(defun %stage-dirty-coins (cache batch best-block)
+  "Stage every dirty entry of CACHE into BATCH — a put for a coin, an erase for
+a spent tombstone — plus BEST-BLOCK when the caller has one. Returns the number
+of entries staged.
+
+Core writes both Sync and Flush through the one CCoinsViewCache::BatchWrite
+(coins.cpp:208); the two differ only in what they then do with the entries, so
+this half is shared here as well and cannot drift between them."
+  (declare (type coins-view-cache cache))
+  (let ((count 0))
+    (maphash (lambda (key ce)
+               (when (ce-dirty ce)
+                 (if (ce-entry ce)
+                     (coins-view-batch-put batch key (ce-entry ce))
+                     (coins-view-batch-erase batch key))
+                 (incf count)))
+             (cvc-entries cache))
+    (when best-block
+      (coins-view-batch-set-best-block batch best-block))
+    count))
+
 (defun coins-view-cache-sync (cache &key sync (best-block (cvc-best-block cache)))
   "Write dirty entries to the base view and KEEP them in the cache — Core's
 CCoinsViewCache::Sync, as opposed to Flush which also drops the entries.
@@ -343,9 +364,11 @@ validation thread mutates that same table under the node lock, so entries
 inserted while the RPC thread was inside the MAPHASH might never be visited and
 the following CLRHASH then dropped them UNWRITTEN. A dropped tombstone leaves a
 spent coin alive in LevelDB — we would accept a double-spend Core rejects — and
-a dropped add loses a real UTXO. Keeping the entries removes that class
-entirely: an entry the MAPHASH misses simply stays dirty and is written by the
-next flush.
+a dropped add loses a real UTXO. Keeping the entries removes that class: an
+entry the MAPHASH misses is still in the table afterwards instead of being
+discarded unwritten. Holding the node lock across the call — the contract
+below — is what then makes the write walk and the flag-clearing walk after it
+agree on which entries the batch committed.
 
 It also stops a `gettxoutsetinfo' throwing away the warm cache mid-IBD, which
 Flush did as a side effect of answering a read-only question.
@@ -357,20 +380,50 @@ otherwise be in neither the snapshot nor the write."
   (declare (type coins-view-cache cache))
   (let ((count 0))
     (with-coins-view-batch (batch (cvc-base cache) :sync sync)
+      (setf count (%stage-dirty-coins cache batch best-block)))
+    ;; The entries stay, but nothing about them may still say `unwritten'.
+    ;; Core's CoinsViewCacheCursor::NextAndMaybeErase with will_erase = false
+    ;; (coins.h:279-295) drops a SPENT entry from the map and calls SetClean()
+    ;; on every other one — and SetClean is `m_flags = 0' (coins.h:173-181),
+    ;; which clears FRESH as well as DIRTY.
+    ;;
+    ;; FRESH is the half that costs a consensus split when it survives. It
+    ;; asserts `the base view does not have this coin' (coins.h:150-159), which
+    ;; the batch above just made false, and COINS-VIEW-CACHE-SPEND drops a
+    ;; FRESH entry outright instead of staging an erase. A coin left FRESH here
+    ;; is therefore spent in the cache and still unspent in LevelDB: the next
+    ;; read pulls it back from the base and a SECOND spend of the same outpoint
+    ;; is accepted. A spent tombstone that survives is the milder half — its
+    ;; erase is already committed, so it costs only memory — but Core drops it
+    ;; and so do we, which is also what keeps FRESH honest for a later re-add.
+    ;;
+    ;; The tombstone keys are collected and removed afterwards: removing an
+    ;; entry from inside MAPHASH is defined only for the entry being visited,
+    ;; and the cost is one cons per tombstone on a path that is about to walk
+    ;; the whole of LevelDB anyway.
+    (let ((spent '()))
       (maphash (lambda (key ce)
-                 (when (ce-dirty ce)
-                   (if (ce-entry ce)
-                       (coins-view-batch-put batch key (ce-entry ce))
-                       (coins-view-batch-erase batch key))
-                   (incf count)))
+                 (when (ce-dirty ce) (decf (cvc-dirty-count cache)))
+                 (when (ce-fresh ce) (decf (cvc-fresh-count cache)))
+                 (cond ((ce-entry ce)
+                        (setf (ce-dirty ce) nil
+                              (ce-fresh ce) nil))
+                       (t
+                        (decf (cvc-mem-bytes cache) (cache-entry-mem-bytes ce))
+                        (push key spent))))
                (cvc-entries cache))
-      (when best-block
-        (coins-view-batch-set-best-block batch best-block)))
-    ;; Entries stay; only their dirty marks clear, so the next flush does not
-    ;; rewrite what this one already committed.
-    (maphash (lambda (key ce) (declare (ignore key)) (setf (ce-dirty ce) nil))
-             (cvc-entries cache))
-    (setf (cvc-dirty-count cache) 0)
+      (dolist (key spent)
+        (remhash key (cvc-entries cache))))
+    ;; Core's post-condition: Sync throws `Not all unspent flagged entries were
+    ;; cleared' when a flagged entry survived BatchWrite (coins.cpp:291-300).
+    ;; The walk above decrements the two counters entry by entry rather than
+    ;; zeroing them, so a non-zero remainder means the counts the mutators
+    ;; maintain have drifted from the flags actually in the table — the drift
+    ;; whose FRESH half is the double-spend above.
+    (unless (and (zerop (cvc-dirty-count cache)) (zerop (cvc-fresh-count cache)))
+      (internal-error
+       "coins-view-cache-sync: ~D dirty and ~D fresh entries unaccounted for after the sync"
+       (cvc-dirty-count cache) (cvc-fresh-count cache)))
     count))
 
 (defun coins-view-cache-flush (cache &key sync (best-block (cvc-best-block cache)))
@@ -389,15 +442,10 @@ left untouched rather than invented."
   (declare (type coins-view-cache cache))
   (let ((count 0))
     (with-coins-view-batch (batch (cvc-base cache) :sync sync)
-      (maphash (lambda (key ce)
-                 (when (ce-dirty ce)
-                   (if (ce-entry ce)
-                       (coins-view-batch-put batch key (ce-entry ce))
-                       (coins-view-batch-erase batch key))
-                   (incf count)))
-               (cvc-entries cache))
-      (when best-block
-        (coins-view-batch-set-best-block batch best-block)))
+      (setf count (%stage-dirty-coins cache batch best-block)))
+    ;; Core's cursor with will_erase = true leaves the entries alone precisely
+    ;; because the caller wipes the whole map next (coins.h:260-268), so no
+    ;; per-entry flag needs clearing here: nothing survives to carry one.
     (clrhash (cvc-entries cache))
     (setf (cvc-dirty-count cache) 0
           (cvc-fresh-count cache) 0
@@ -891,8 +939,8 @@ utxo-set-iterate layers Core's numeric-vout cursor order on top."
   ;; dumptxoutset) while the validation thread mutates the same entries table
   ;; under the node lock. Flush CLRHASHes it, so an entry inserted while we
   ;; were inside its MAPHASH could be dropped unwritten -- a lost tombstone
-  ;; leaves a spent coin alive in LevelDB. Sync keeps the entries, so a missed
-  ;; one stays dirty and is written by the next flush.
+  ;; leaves a spent coin alive in LevelDB. Sync keeps the entries instead of
+  ;; clearing the table, so nothing can be discarded unwritten.
   (coins-view-cache-sync cache)
   (with-leveldb-iterator (iter (cvdb-db (cvc-base cache)))
     ;; SEEK to the coin prefix rather than seeking to the first key. The loop

@@ -224,11 +224,11 @@ this was reachable on the reorg path, not a corner."
       ;; Brand-new slot WITH overwrite permitted: not fresh.
       (bl.store:coin-view-add cache txid 0 1000 script 5
                                           :allow-overwrite t)
-      (is (zerop (bl.store::cvc-fresh-count cache))
+      (is (zerop (coins-cache-fresh-count cache))
           "an overwrite-permitted add was marked FRESH")
       ;; Brand-new slot WITHOUT it: fresh, as before.
       (bl.store:coin-view-add cache txid 1 1000 script 5)
-      (is (= 1 (bl.store::cvc-fresh-count cache))
+      (is (= 1 (coins-cache-fresh-count cache))
           "a plain add stopped being FRESH"))))
 
 (test coins-view-best-block-is-the-view-s-own-pointer

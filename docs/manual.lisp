@@ -376,7 +376,9 @@
   database) is what makes a crash recoverable; an index is only as
   current as its recorded best block; pruning keeps
   `+min-blocks-to-keep+` and never touches a block under a prune lock
-  (assumeutxo, rescans).
+  (assumeutxo, rescans); a coins-cache entry that survives a sync carries
+  neither DIRTY nor FRESH, since FRESH claims the base view has no such
+  coin and the sync just wrote it there.
 
   Traps: `prune-old-blocks` takes its byte target as an argument because
   the node halves it while a historical chainstate exists -- storage
