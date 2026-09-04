@@ -246,7 +246,11 @@
   -- and MERGED-CONFIG-ALIST resolves each option name across all four in
   Core's precedence order; a NEGATION (`-nofoo`, the JSON `false`) erases
   the values before it in its source and blocks the sources below it,
-  which is why the merge cannot be an APPEND of the four alists.
+  which is why the merge cannot be an APPEND of the four alists. A
+  `:network-only` row (Core NETWORK_ONLY: -port, -rpcport, -bind, -rpcbind,
+  -connect, -addnode, -wallet, -walletdir) does not read the config file's
+  default section off mainnet, and refuses to start when that is the only
+  place it is set.
 
   Traps: before changing an option, read Core's READER for it (GetArg,
   GetArgs, GetBoolArg decide the semantics, not the declaration); moving
@@ -271,6 +275,9 @@
   (bitcoin-lisp.config:merged-config-alist function)
   (bitcoin-lisp.config:merge-setting function)
   (bitcoin-lisp.config:merge-settings-list function)
+  (bitcoin-lisp.config:network-only-option-p function)
+  (bitcoin-lisp.config:use-default-section-p function)
+  (bitcoin-lisp.config:unsuitable-section-only-options function)
   (bitcoin-lisp.config:resolve-network-from-config function)
   (bitcoin-lisp.config:parse-settings-json function)
   (bitcoin-lisp.config:render-settings-json function)

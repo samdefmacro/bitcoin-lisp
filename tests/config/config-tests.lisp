@@ -1948,11 +1948,15 @@ to '(\"0\"), so instead of disabling outbound connections the node logged
 
 With a real peer in the file the same shape meant -noconnect did not clear it:
 we kept dialing the peer the operator had just disabled."
+  ;; -connect is network-only, so the framework's conf writes it under the
+  ;; chain's [section] and so does this.
   (is (equal '("0") (getf (start-node-plist '("-noconnect" "-chain=regtest")
-                                            '("connect=0"))
+                                            '("[regtest]
+connect=0"))
                           :connect-nodes)))
   (is (equal '("0") (getf (start-node-plist '("-noconnect" "-chain=regtest")
-                                            '("connect=10.0.0.5"))
+                                            '("[regtest]
+connect=10.0.0.5"))
                           :connect-nodes)))
   ;; settings.json is a source of negations too (a JSON false).
   (is (null (getf (start-node-plist '("-chain=regtest") '("rpcauth=u:s$h")
@@ -1962,8 +1966,71 @@ we kept dialing the peer the operator had just disabled."
   ;; brings the config file's values back from the dead (settings.cpp:210-217).
   (is (equal '("9.9.9.9" "10.0.0.5")
              (getf (start-node-plist '("-noconnect" "-connect=9.9.9.9" "-chain=regtest")
-                                     '("connect=10.0.0.5"))
+                                     '("[regtest]
+connect=10.0.0.5"))
                    :connect-nodes))))
+
+(test network-only-options-do-not-leak-out-of-the-default-section
+  "Core marks eight bitcoind options ArgsManager::NETWORK_ONLY -- -addnode
+(init.cpp:539), -bind (:548), -connect (:550), -port (:575), -rpcbind (:708),
+-rpcport (:713), -wallet and -walletdir (wallet/init.cpp:71,73). Off mainnet
+UseDefaultSection (args.cpp:855-857) returns false for them, so a value in the
+config file's DEFAULT section is dropped (settings.cpp:181-184); and if that is
+the only place the option is set, GetUnsuitableSectionOnlyArgs (args.cpp:134-146)
+makes init.cpp:944-951 refuse to start.
+
+We had neither half. A shared bitcoin.conf whose global area carries
+rpcport=8332, port=8333 or connect=<mainnet peer> was applied verbatim to a
+testnet4 node, which then bound the mainnet RPC port or dialled the wrong
+chain's peers -- exactly the accident the flag exists to prevent."
+  (flet ((refusal (args conf)
+           (handler-case (progn (start-node-plist args conf) nil)
+             (bl.err:config-error (e) (princ-to-string e))))
+         (only-on (name) (format nil "Config setting for -~A only applied on ~
+testnet4 network when in [testnet4] section." name)))
+    (let ((conf (format nil "rpcport=8332~%port=8333~%connect=1.2.3.4~%~
+                             addnode=5.6.7.8~%wallet=mainwallet~%~
+                             [testnet4]~%maxconnections=40~%")))
+      ;; Core's message, one line per option, in table order.
+      (let ((text (refusal '("-testnet4") conf)))
+        (is-true text "a testnet4 node started on a mainnet default section")
+        (dolist (name '("rpcport" "port" "connect" "addnode" "wallet"))
+          (is-true (search (only-on name) (or text "")) "no line for -~A" name)))
+      ;; On mainnet the default section IS the chain's section, so nothing is
+      ;; unsuitable and every value applies.
+      (let ((plist (start-node-plist '("-chain=main") conf)))
+        (is (= 8332 (getf plist :rpc-port)))
+        (is (equal '("1.2.3.4") (getf plist :connect-nodes)))))
+    ;; Set on the command line too, so there is nothing to refuse -- and the
+    ;; default section's value must then be IGNORED rather than merged in. A
+    ;; list option is where that shows, because GetSettingsList concatenates
+    ;; every source it does read.
+    (let ((conf (format nil "connect=1.2.3.4~%")))
+      (is-false (refusal '("-testnet4" "-connect=9.9.9.9") conf))
+      (is (equal '("9.9.9.9")
+                 (getf (start-node-plist '("-testnet4" "-connect=9.9.9.9") conf)
+                       :connect-nodes)))
+      (is (equal '("9.9.9.9" "1.2.3.4")
+                 (getf (start-node-plist '("-chain=main" "-connect=9.9.9.9") conf)
+                       :connect-nodes)))))
+  ;; An option that is NOT network-only reads the default section on every
+  ;; chain, which is the whole point of the flag sitting on only eight rows.
+  (is (= 300 (getf (start-node-plist '("-testnet4") (format nil "dbcache=300~%"))
+                   :dbcache-mib)))
+  (dolist (name '("addnode" "bind" "connect" "port" "rpcbind" "rpcport"
+                  "wallet" "walletdir"))
+    (is-true (bl.cfg:network-only-option-p name) "-~A is not network-only" name)
+    (is-false (bl.cfg:use-default-section-p name :testnet4))
+    (is-true (bl.cfg:use-default-section-p name :mainnet)))
+  (is-false (bl.cfg:network-only-option-p "dbcache"))
+  ;; Weird behaviour Core preserves on purpose (settings.cpp:156-159): a
+  ;; NEGATED default-section value still applies to a network-only option,
+  ;; even though an ordinary value there does not.
+  (let ((negation (list (cons :default-section (list (list "port" "0" "false")))))
+        (value (list (cons :default-section (list (list "port" "8333" "\"8333\""))))))
+    (is (equal '(nil t) (multiple-value-list (bl.cfg:merge-setting negation t))))
+    (is (equal '(nil nil) (multiple-value-list (bl.cfg:merge-setting value t))))
+    (is (equal "8333" (second (bl.cfg:merge-setting value nil))))))
 
 (test noconnect-still-disables-automatic-connections
   "-noconnect is -connect=0 at every drive site Core has: with an empty list and
