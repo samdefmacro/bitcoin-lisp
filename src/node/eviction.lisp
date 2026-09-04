@@ -305,6 +305,17 @@ address is dropped only when the inbound slots are (almost) full; and no
 connection is admitted while the hand-off queue is already full. Returns T,
 or (VALUES NIL REASON) when the connection must be dropped.
 
+BOTH ban arms are exempted for a peer holding NoBan, which is Core's shape:
+each drop is guarded by `!NetPermissions::HasFlag(permission_flags,
+NetPermissionFlags::NoBan)' (net.cpp:1798-1812), the flags having been filled
+from vWhitelistedRangeIncoming at :1771. Surviving our own ban list is the
+whole point of -whitelist=noban@..., and this was the one place in the tree
+that consulted neither the flag nor the -whitebind grant, so an operator's
+explicitly trusted peer was still refused at accept time by a `setban' (or a
+banlist.json entry persisted from before the whitelist was configured). The
+backlog arm is NOT exempted: it is ours, not Core's, and it bounds file
+descriptors rather than expressing an opinion about the peer.
+
 The backlog arm matters because *MAX-INBOUND-CONNECTIONS* is otherwise enforced only
 at MERGE time, by the sync thread. Accepted peers hold a socket while they wait
 in PENDING-INBOUND-PEERS, so anything that stalls that thread turns every new
@@ -313,16 +324,20 @@ connection into a leaked descriptor — the live wedge of 2026-08-16 accumulated
 twice the inbound cap no matter what the rest of the node is doing."
   ;; Ban check first and lock-free: a connect flood is exactly when the listener
   ;; must not contend with the sync thread and RPC readers for the node lock.
-  (cond
-    ((bl.net:peer-banned-p host)
-     (values nil :banned))
-    ((>= (bt:with-recursive-lock-held ((node-lock node))
-           (length (node-pending-inbound-peers node)))
-         *max-inbound-connections*)
-     (values nil :backlog))
-    ((and (bl.net:peer-discouraged-p host)
-          (>= (1+ (bt:with-recursive-lock-held ((node-lock node))
-                    (count-inbound-peers node)))
-              *max-inbound-connections*))
-     (values nil :discouraged))
-    (t t)))
+  (let ((noban (bl.net:permission-flag-set-p
+                (bl.net:peer-permission-flags host t)
+                bl.net:+perm-noban+)))
+    (cond
+      ((and (not noban) (bl.net:peer-banned-p host))
+       (values nil :banned))
+      ((>= (bt:with-recursive-lock-held ((node-lock node))
+             (length (node-pending-inbound-peers node)))
+           *max-inbound-connections*)
+       (values nil :backlog))
+      ((and (not noban)
+            (bl.net:peer-discouraged-p host)
+            (>= (1+ (bt:with-recursive-lock-held ((node-lock node))
+                      (count-inbound-peers node)))
+                *max-inbound-connections*))
+       (values nil :discouraged))
+      (t t))))

@@ -747,6 +747,14 @@ socket."
                                        (list (whitelist-entry-subnet entry))))
         (setf flags (logior flags (whitelist-entry-flags entry)))))))
 
+(defun permission-flag-set-p (flags flag)
+  "T when FLAGS grants FLAG — Core NetPermissions::HasFlag,
+`(flags & f) == f' (net_permissions.h). The equality is load-bearing: an
+enumerator can be several bits (\"noban ... implies download\", so
++PERM-NOBAN+ is +PERM-NOBAN-ONLY+ | +PERM-DOWNLOAD+), and a LOGTEST would
+then report noban for a peer granted only `download'."
+  (= flag (logand flags flag)))
+
 (defun permission-flag-names (flags)
   "FLAGS as Core renders them in getpeerinfo.permissions (NetPermissions::
 ToStrings). \"implicit\" is not a permission and is never listed."

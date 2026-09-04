@@ -1628,8 +1628,9 @@ the loopback itself and takes every onion peer with it."
 (defun peer-has-permission-p (peer flag)
   "T when PEER holds FLAG (Core CNode::HasPermission). Derived from the peer's
 address and direction — see the divergence note in netaddress.lisp."
-  (let ((flags (peer-permission-flags (peer-address peer) (peer-inbound peer))))
-    (= flag (logand flags flag))))
+  (permission-flag-set-p
+   (peer-permission-flags (peer-address peer) (peer-inbound peer))
+   flag))
 
 (defun record-misbehavior (peer &optional reason)
   "Discourage and disconnect PEER for a protocol violation. Bitcoin Core's

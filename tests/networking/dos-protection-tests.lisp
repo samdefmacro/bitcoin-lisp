@@ -880,6 +880,15 @@ nineteen days."
     (is (= 0 (bl:sync-blockchain node))
         "the cycle is skipped cleanly instead of signalling a type error")))
 
+(defun %inbound-cap ()
+  "The inbound connection cap the admission gate enforces."
+  bl::*max-inbound-connections*)
+
+(defun %admit-inbound (node host)
+  "(VALUES ALLOWED REASON) from the accept-time admission gate. The one reach
+into it in this file."
+  (bl::inbound-connection-allowed-p node host))
+
 (test inbound-admission-counts-the-pending-handoff-queue
   "Accepted peers wait in PENDING-INBOUND-PEERS until the sync thread merges
 them. Admission used to count only merged peers, so a stalled sync thread let
@@ -887,14 +896,79 @@ the queue — and its file descriptors — grow without bound: the live wedge le
 751 sockets rotting in CLOSE-WAIT. Admission must count the backlog too."
   (let ((node (bl:make-node)))
     ;; Control: an empty backlog admits.
-    (is-true (bl::inbound-connection-allowed-p node "198.51.100.7"))
+    (is-true (%admit-inbound node "198.51.100.7"))
     (setf (bl:node-pending-inbound-peers node)
-          (loop repeat bl::*max-inbound-connections*
+          (loop repeat (%inbound-cap)
                 collect (bl.net:make-peer :inbound t)))
     (multiple-value-bind (allowed reason)
-        (bl::inbound-connection-allowed-p node "198.51.100.7")
+        (%admit-inbound node "198.51.100.7")
       (is-false allowed "a full hand-off queue must stop admitting")
       (is (eq :backlog reason)))))
+
+(test inbound-admission-exempts-noban-from-the-ban-and-discourage-drops
+  "GA10 ff51e9d5. Core guards BOTH accept-time drops with
+`!NetPermissions::HasFlag(permission_flags, NetPermissionFlags::NoBan)'
+(net.cpp:1798-1812), the flags coming from vWhitelistedRangeIncoming (:1771).
+Ours consulted neither, so a peer the operator had explicitly pinned with
+-whitelist=noban@... was still refused the moment its address appeared in our
+ban list — which an operator `setban', or a banlist.json persisted from before
+the whitelist was configured, is enough to do. Surviving our own opinion of the
+address is the entire point of the option.
+
+The backlog arm is ours, not Core's, and is deliberately NOT exempted: it
+bounds file descriptors rather than expressing an opinion about the peer."
+  (bl.net:clear-ban-list)
+  (bl.net:clear-discouraged)
+  (let ((node (bl:make-node))
+        (noban "198.51.100.9")
+        (ordinary "198.51.100.10"))
+    (unwind-protect
+         (let ((bl.net:*whitelist-entries*
+                 (list (bl.net:parse-whitelist-entry "noban@198.51.100.9/32"))))
+           (bl.net:ban-address noban 3600)
+           (bl.net:ban-address ordinary 3600)
+           ;; Controls: the ban really is in force, and the permission really
+           ;; is granted — without both, "admitted" would prove nothing.
+           (is-true (bl.net:peer-banned-p noban))
+           (is-true (bl.net:peer-has-permission-p
+                     (bl.net:make-peer :address noban :inbound t)
+                     bl.net:+perm-noban+))
+           (is-true (%admit-inbound node noban)
+                    "a banned noban peer must still be admitted")
+           (multiple-value-bind (allowed reason) (%admit-inbound node ordinary)
+             (is-false allowed "an ordinary banned peer is still refused")
+             (is (eq :banned reason)))
+           ;; +PERM-NOBAN+ is TWO bits ("noban ... implies download"), so a
+           ;; LOGTEST here would grant the exemption to a peer whitelisted for
+           ;; `download' alone. Core's HasFlag requires every bit.
+           (let ((bl.net:*whitelist-entries*
+                   (list (bl.net:parse-whitelist-entry
+                          "download@198.51.100.10/32"))))
+             (multiple-value-bind (allowed reason) (%admit-inbound node ordinary)
+               (is-false allowed
+                         "a `download'-only whitelist must not confer noban")
+               (is (eq :banned reason))))
+           ;; The discourage arm, which fires only near the inbound cap.
+           (bl.net:clear-ban-list)
+           (bl.net:discourage-peer noban)
+           (bl.net:discourage-peer ordinary)
+           (setf (bl:node-peers node)
+                 (loop repeat (%inbound-cap)
+                       collect (bl.net:make-peer :inbound t)))
+           (is-true (%admit-inbound node noban)
+                    "a discouraged noban peer must still be admitted at capacity")
+           (multiple-value-bind (allowed reason) (%admit-inbound node ordinary)
+             (is-false allowed "an ordinary discouraged peer is refused at capacity")
+             (is (eq :discouraged reason)))
+           ;; The backlog arm is not a ban opinion and stays absolute.
+           (setf (bl:node-pending-inbound-peers node)
+                 (loop repeat (%inbound-cap)
+                       collect (bl.net:make-peer :inbound t)))
+           (multiple-value-bind (allowed reason) (%admit-inbound node noban)
+             (is-false allowed "noban must not exempt a peer from the fd backlog cap")
+             (is (eq :backlog reason))))
+      (bl.net:clear-ban-list)
+      (bl.net:clear-discouraged))))
 
 (test receive-bytes-tolerates-a-slow-but-progressing-peer
   "TIMEOUT bounds stalling, not total transfer time. A 1 MiB message arriving
