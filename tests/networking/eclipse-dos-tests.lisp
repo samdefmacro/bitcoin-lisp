@@ -23,21 +23,25 @@
                                      :inbound inbound
                                      :state state))
 
+(defun %full-outbound-p (peer)
+  "Core CNode::IsFullOutboundConn. The one reach into it in this file."
+  (bl::outbound-full-relay-peer-p peer))
+
 (test outbound-full-relay-peer-p-classification
   "Only a ready, non-inbound, outbound-full-relay peer counts as an outbound
 full-relay slot (Core IsFullOutboundConn)."
-  (is-true  (bl::outbound-full-relay-peer-p
+  (is-true  (%full-outbound-p
              (%mk-peer :outbound-full-relay nil)))
   ;; Inbound peers never count, even if mislabeled full-relay.
-  (is-false (bl::outbound-full-relay-peer-p
+  (is-false (%full-outbound-p
              (%mk-peer :outbound-full-relay t)))
   ;; Block-relay and feeler outbound peers are a separate pool.
-  (is-false (bl::outbound-full-relay-peer-p
+  (is-false (%full-outbound-p
              (%mk-peer :block-relay nil)))
-  (is-false (bl::outbound-full-relay-peer-p
+  (is-false (%full-outbound-p
              (%mk-peer :feeler nil)))
   ;; Not-yet-ready peers don't count.
-  (is-false (bl::outbound-full-relay-peer-p
+  (is-false (%full-outbound-p
              (%mk-peer :outbound-full-relay nil :handshaking))))
 
 (test inbound-peers-do-not-satisfy-outbound-target
@@ -1962,29 +1966,179 @@ every present and future onion peer, silently disabling onion reachability."
       (is (eq (and (bl.net:loopback-address-p addr) t) (and local t))
           "~A: ~A" addr reason))))
 
-(test ga9-s2-5-every-dial-path-records-an-addrman-attempt
-  "Core calls addrman.Attempt() on EVERY dial, in ConnectNode, immediately after
-the attempt and before the socket is examined (net.cpp:492-497). We recorded
-only from the failure branch of connect-to-peers, which runs at startup and when
-the peer count hits zero — so replace-disconnected-peers, establish-outbound-peer
-(and thus maintain-block-relay-peers) and the feeler recorded nothing.
+;;; ============================================================
+;;; 5. The automatic-dial decision: which candidate, and who is
+;;;    charged for the failure (Core ThreadOpenConnections)
+;;; ============================================================
 
-nAttempts is addrman's entire quality signal: without it selection cannot age
-out dead addresses, the feeler that exists to prove the tried table can never
-mark anything bad, and we re-dial and re-gossip corpses. Asserted structurally,
-because the alternative is standing up four live dials in a unit test."
-  (let ((src (%node-source-text)))
-    (is (search "%record-dial-attempt" src) "the recorder must exist")
-    ;; One definition plus one call per dial path.
-    (is (>= (length (bl.tests::%count-substring "%record-dial-attempt" src)) 4)
-        "every dial path must record: definition + 3 steady-state call sites")))
+(defparameter *dial-candidate* "203.0.113.9"
+  "The single dial candidate the sweeps below are offered, in TEST-NET-3
+documentation space. Its /16 is 203.0, which no fixture peer shares unless the
+test means it to.")
 
-(defun %count-substring (needle haystack)
-  "All start positions of NEEDLE in HAYSTACK, as a list."
-  (loop with n = (length needle)
-        for start = 0 then (1+ pos)
-        for pos = (search needle haystack :start2 start)
-        while pos collect pos))
+(defun %dial-probe-node (peers candidates &optional book)
+  "A node wired for one automatic-dial sweep: networking on, PEERS as the peer
+list, CANDIDATES as the frozen dial-candidate list REPLACE-DISCONNECTED-PEERS
+walks, BOOK as the addrman. The three reaches into node internals in this
+section."
+  (let ((node (bl:make-node)))
+    (setf (bl:node-network-active node) t
+          (bl:node-peers node) peers
+          (bl::node-known-addresses node) candidates
+          (bl::node-address-book node) book)
+    node))
+
+(defun %refill-outbound (node)
+  "Drive the shipped steady-state refill — our ThreadOpenConnections."
+  (bl::replace-disconnected-peers node))
+
+(defun %dial-named-destination (node host port)
+  "Drive the shipped dial for a destination somebody NAMED: -addnode,
+-connect, `addnode onetry', -seednode and the addconnection RPC all land here."
+  (bl::establish-outbound-peer node host port :manual t))
+
+(defun %hosts-dialed-by (thunk)
+  "The hosts the code under test asked BL.NET:CONNECT-PEER for while THUNK ran.
+The stub returns NIL, so the dial fails the way an unreachable address does and
+nothing past the connect runs — which is what lets a unit test drive the real
+sweep instead of a re-implementation of it."
+  (let ((dialed '())
+        (real (fdefinition 'bl.net:connect-peer)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bl.net:connect-peer)
+                 (lambda (host &optional port &rest more)
+                   (declare (ignore port more))
+                   (push host dialed)
+                   nil))
+           (funcall thunk))
+      (setf (fdefinition 'bl.net:connect-peer) real))
+    (nreverse dialed)))
+
+(defun %candidate-book ()
+  "An addrman holding *DIAL-CANDIDATE* at the P2P port, and nothing else."
+  (let ((book (bl.net:make-address-book)))
+    (bl.net:address-book-add
+     book (bl.net:make-peer-address
+           :ip (bl.net:ipv4-to-mapped-ipv6 203 0 113 9)
+           :port 8333 :services 1
+           :last-seen (bl.ser:get-unix-time)))
+    book))
+
+(defun %candidate-record (book)
+  "BOOK's entry for *DIAL-CANDIDATE*, whose last_try and nAttempts are what the
+failure-counting test reads."
+  (bl.net:address-book-lookup
+   book (bl.net:ipv4-to-mapped-ipv6 203 0 113 9) 8333 :ipv4))
+
+(defun %outbound-peer (address)
+  "A ready OUTBOUND_FULL_RELAY peer at ADDRESS — the only kind that occupies a
+netgroup in Core's diversity set."
+  (bl.net:make-peer :address address :state :ready
+                    :conn-type :outbound-full-relay))
+
+(test ga10-2f0cf648-inbound-peers-do-not-veto-a-replacement-dial
+  "Core builds outbound_ipv46_peer_netgroups by switching on m_conn_type and
+contributing NOTHING for INBOUND, ADDR_FETCH, FEELER and PRIVATE_BROADCAST
+(net.cpp:2657-2687), with the reason in the source: \"We currently don't take
+inbound connections into account. Since they are free to make, an attacker
+could make them to prevent us from connecting to certain peers.\" Only that set
+vetoes a candidate (:2825-2827).
+
+We built it from every peer's address, inbound included. node-known-addresses
+is written once, at start-up, so an attacker holding inbound slots — 114 by
+default, and free — across the /16 groups of that frozen list could veto every
+replacement dial and watch the outbound set drain. The neighbouring arithmetic
+(count-outbound-full-relay-peers) had already been fixed for this exact reason;
+the netgroup set had not.
+
+An ADDR_FETCH peer is in the same position: -seednode peers reach node-peers
+through establish-outbound-peer, so a plain not-inbound test would still let a
+short-lived seed dial veto a full-relay slot."
+  (let ((candidates (list (cons *dial-candidate* 8333))))
+    (flet ((dialed (peer)
+             (%hosts-dialed-by
+              (lambda ()
+                (%refill-outbound
+                 (%dial-probe-node (and peer (list peer)) candidates))))))
+      (is (equal (list *dial-candidate*) (dialed nil))
+          "control: with no peers at all the candidate is dialed")
+      (is (equal (list *dial-candidate*)
+                 (dialed (bl.net:make-peer :address "203.0.113.44"
+                                           :inbound t :state :ready)))
+          "an inbound peer sharing the candidate's /16 vetoed the dial")
+      (is (equal (list *dial-candidate*)
+                 (dialed (bl.net:make-peer :address "203.0.113.45"
+                                           :state :ready
+                                           :conn-type :addr-fetch)))
+          "a short-lived addr-fetch peer vetoed the dial")
+      ;; The veto itself must survive: an OUTBOUND peer in the group still
+      ;; blocks it, or the fix has simply deleted the diversity rule.
+      (is (null (dialed (%outbound-peer "203.0.113.46")))
+          "an outbound peer in the candidate's /16 must still veto it")
+      (is (equal (list *dial-candidate*) (dialed (%outbound-peer "198.51.100.46")))
+          "an outbound peer in another /16 must not veto it"))))
+
+(test ga10-42dacfaf-addrman-failures-are-counted-only-when-online
+  "Core stamps addrman.Attempt() on EVERY dial (net.cpp:492-497) but passes
+fCountFailure from the call site, and ThreadOpenConnections computes it as
+`((int)outbound_ipv46_peer_netgroups.size() + outbound_privacy_network_peers)
+>= std::min(m_max_automatic_connections - 1, 2)' with the comment \"Don't
+record addrman failure attempts when node is offline\" (:2884-2891). Every
+other OpenNetworkConnection site — ADDR_FETCH (:2422), -connect MANUAL (:2541),
+added nodes (:2986), addconnection (:1905), the reconnect queue (:4157) —
+passes literal false.
+
+We hard-coded true. A link that is down, a resumed laptop or a node started
+before the network is charged a real failure to every address it cycled
+through, and so did a manual -addnode target that was merely switched off;
+nAttempts past +ADDRMAN-RETRIES+ with no success makes an entry terrible, at
+which point getaddr drops it, it becomes a preferred overwrite target and its
+GetChance collapses.
+
+last_try is the witness that the dial path really ran: Core stamps it either
+way, so an unchanged nAttempts cannot be confused with a sweep that never
+reached the recorder."
+  (let ((candidates (list (cons *dial-candidate* 8333))))
+    (flet ((sweep (peers)
+             (let ((book (%candidate-book)))
+               (%hosts-dialed-by
+                (lambda ()
+                  (%refill-outbound (%dial-probe-node peers candidates book))))
+               (%candidate-record book)))
+           (named (peers)
+             (let ((book (%candidate-book)))
+               (%hosts-dialed-by
+                (lambda ()
+                  (%dial-named-destination
+                   (%dial-probe-node peers candidates book)
+                   *dial-candidate* 8333)))
+               (%candidate-record book))))
+      (dolist (case (list (list "the offline refill" (sweep '()) 0
+                                "a node with no outbound netgroups must not \
+charge a failure")
+                          (list "the online refill"
+                                (sweep (list (%outbound-peer "198.51.100.1")
+                                             (%outbound-peer "192.0.2.1")))
+                                1
+                                "with two outbound netgroups Core does count \
+the failure")
+                          (list "the manual dial"
+                                (named (list (%outbound-peer "198.51.100.1")
+                                             (%outbound-peer "192.0.2.1")))
+                                0
+                                "a named destination must never be charged an \
+addrman failure")))
+        (destructuring-bind (what record expected why) case
+          ;; Bound and gated: once one of these goes red the follow-ups would
+          ;; otherwise dereference NIL and bury the assertion that named the
+          ;; defect.
+          (is-true record "~A: the addrman record must still be there" what)
+          (when record
+            (is (plusp (bl.net:peer-address-last-attempt record))
+                "witness: ~A did reach the recorder" what)
+            (is (= expected (bl.net:peer-address-n-attempts record))
+                "~A: ~A" what why)))))))
 
 (test ga9-s2-6-onion-inbounds-are-not-the-default-eviction-victim
   "All inbound onion peers arrive through the local Tor daemon, so ip-netgroup

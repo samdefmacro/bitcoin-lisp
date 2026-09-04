@@ -487,9 +487,15 @@
   the token bucket per message class, then discouraged, then
   disconnected. Outbound eclipse resistance rotates the extra outbound
   slot on a stale tip (`*max-tip-age-seconds*` is Core's
-  nPowTargetSpacing * 3). A compact-block announcement is admitted in
-  Core's handler order -- parent lookup, the anti-DoS work floor (the
-  greater of nMinimumChainWork and tip work minus 144 tip proofs), then
+  nPowTargetSpacing * 3). Everything that decides an outbound dial reads
+  OUTBOUND peers only -- the full-relay count, the /16 netgroup set a
+  candidate is vetoed against, and the online test that says whether an
+  addrman FAILURE may be charged -- because inbound connections are free
+  for an attacker to make; the inbound eviction reserve likewise protects
+  each disadvantaged network's LONGEST-connected peers, which is what
+  \"precludes attacks that start later\" means. A compact-block
+  announcement is admitted in Core's handler order -- parent lookup, the
+  anti-DoS work floor (the greater of nMinimumChainWork and tip work minus 144 tip proofs), then
   the header goes INTO the block index -- because everything past those
   gates is work a ~100-byte message buys: the shortid map SipHashes the
   whole mempool, and a header that never reaches the index is unknown

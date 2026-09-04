@@ -85,6 +85,17 @@ Core's -port only moves the listening/advertised side."
   "Inbound connections we keep (excess are disconnected at merge time). Set by
 start-node via automatic-inbound-capacity; the default is Core's 125 - 11.")
 
+(defvar *max-automatic-connections* 125
+  "Core -maxconnections / CConnman::m_max_automatic_connections (net.h:1078):
+the automatic connection TOTAL, outbound plus inbound. Set by start-node from
+-maxconnections; the default is Core's DEFAULT_MAX_PEER_CONNECTIONS.
+
+Kept beside the two figures derived from it — the outbound target is
+NODE-MAX-PEERS and the inbound capacity *MAX-INBOUND-CONNECTIONS* — because
+Core's addrman failure-counting gate reads the TOTAL and neither derived
+number can be turned back into it (net.cpp:2888, `std::min(
+m_max_automatic_connections - 1, 2)').")
+
 (defconstant +node-exit-clean+ 0
   "Process exit code for a deliberate, completed stop (`stop` RPC, SIGTERM,
 -stopatheight). The supervisor must NOT respawn on this.")

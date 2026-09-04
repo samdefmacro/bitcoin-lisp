@@ -316,7 +316,10 @@ to move them (the node must be stopped)."
 -networkactive, -asmap, -whitelist / -whitebind, -acceptstalefeeestimates
 (Core Step 6) and -addnode / -connect / -seednode (Step 12's connection setup)."
   ;; Core -maxconnections is the automatic TOTAL (net.h:81); MAX-PEERS stays
-  ;; the outbound full-relay count and the remainder is inbound capacity.
+  ;; the outbound full-relay count and the remainder is inbound capacity. The
+  ;; total itself is kept too: Core's addrman failure-counting gate is stated
+  ;; against it, not against either derived figure (net.cpp:2888).
+  (setf *max-automatic-connections* max-connections)
   (setf *max-inbound-connections* (automatic-inbound-capacity max-connections max-peers))
   ;; Core -acceptstalefeeestimates is regtest-only (init.cpp:1654-1656).
   (when accept-stale-fee-estimates
