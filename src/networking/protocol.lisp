@@ -1167,6 +1167,15 @@ to this one bit test."
   (logtest services (logior bl.ser:+node-network+
                             bl.ser:+node-network-limited+)))
 
+(defun address-banned-or-discouraged-p (pa)
+  "T when the PEER-ADDRESS PA is one this node has decided is hostile: banned
+(setban) or discouraged (the rolling misbehaviour filter). Core's BanMan tests
+are CNetAddr-typed, so the port plays no part -- PEER-ADDRESS-STRING renders
+network and address only, exactly like the ban list's own keys."
+  (let ((address (peer-address-string pa)))
+    (or (peer-discouraged-p address)
+        (peer-banned-p address))))
+
 (defun %ingest-gossiped-address (net-addr timestamp address-book source-group now
                                  &optional source-net source-ip)
   "Shared addr/addrv2 ingestion for one gossiped NET-ADDR (Core's per-address
@@ -1182,7 +1191,8 @@ Age gates RELAY only, never storage. An absurd timestamp (unset, or more than
 (net_processing.cpp:4090-4092) rather than dropped; the stored copy carries
 the 2h gossip penalty, waived for a peer announcing itself. Addresses whose
 services bits promise no useful address DB are skipped entirely — neither
-stored nor relayed, as in Core.
+stored nor relayed, as in Core — and so are addresses this node has banned or
+discouraged (net_processing.cpp:4094-4097).
 
 Returns (VALUES stored relay-entry): STORED is 1/0 for the caller's log count,
 RELAY-ENTRY a (peer-address . max-targets) cons when the address should be
@@ -1209,6 +1219,13 @@ gossiped onward."
                            (equalp source-ip (peer-address-ip pa)))
                       0
                       +addr-gossip-time-penalty-seconds+)))
+    ;; Core: "Do not process banned/discouraged addresses beyond remembering we
+    ;; received them" (net_processing.cpp:4094-4097). Its `continue` skips BOTH
+    ;; the RelayAddress call and the vAddrOk push that feeds addrman, so a
+    ;; hostile address neither takes a bucket from a good one nor gets gossiped
+    ;; onward by the node that decided it was hostile.
+    (when (address-banned-or-discouraged-p pa)
+      (return-from %ingest-gossiped-address (values 0 nil)))
     (when reachable
       (address-book-add address-book pa source-group penalty))
     (values (if reachable 1 0)
@@ -2444,10 +2461,7 @@ address book is rebuilt)."
   "Take a fresh addrman sample for the cache, filtered as Core's
 GetAddressesUnsafe filters it (net.cpp:3686-3690): banned AND discouraged
 addresses are dropped HERE, at fill time."
-  (remove-if (lambda (pa)
-               (let ((s (peer-address-string pa)))
-                 (or (peer-discouraged-p s)
-                     (peer-banned-p s))))
+  (remove-if #'address-banned-or-discouraged-p
              (address-book-get-addr book :max +addrman-getaddr-max+
                                          :pct +addrman-getaddr-pct+)))
 
