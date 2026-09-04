@@ -433,6 +433,57 @@ wallet nor a coin control is needed to solve the scripts below."
     (setf (aref v 0) 2)
     v))
 
+(defun %ws-coin-control-with (txid vout txout)
+  "A coin control that has pre-selected TXID/VOUT, its preset carrying TXOUT
+when one is given -- Core's PreselectedInput with and without a tx-out of its
+own, which is the whole of IsExternalSelected."
+  (let* ((cc (bl.wallet::make-wcc))
+         (preset (bl.wallet::wcc-select cc txid vout)))
+    (when txout (setf (bl.wallet::wcc-preset-txout preset) txout))
+    cc))
+
+(defun %ws-tx-weight (wallet cc tx txouts)
+  "Core CalculateMaximumSignedTxSize's weight for TX under CC."
+  (nth-value 1 (bl.wallet::%max-signed-tx-size wallet cc tx txouts)))
+
+(test ws-external-selected-input-is-sized-for-a-foreign-signature
+  "Core's UseMaxSig (spend.cpp:54-58) is CCoinControl::IsExternalSelected, and
+GetSignedTxinWeight passes the txin so it can fire (spend.cpp:138): a
+pre-selected input carrying its own tx-out belongs to someone else, so its
+ECDSA satisfaction is sized at 72 even though our own signer grinds.
+IsExternalSelected is `selected AND HasTxOut` (coincontrol.cpp:25-29), so
+being pre-selected alone must not move the estimate -- an input we do own
+would then be overpaid for again."
+  (with-wallet-chain-node (node "ws-extsize" :wallet "w")
+    (let* ((wallet (%wc-wallet node "w"))
+           (pubkey (%ws-dummy-pubkey))
+           (spk (concatenate '(simple-array (unsigned-byte 8) (*))
+                             (vector #x00 #x14) (bl.crypto:hash160 pubkey)))
+           (txid (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element 9))
+           (tx (bl.ser:make-transaction
+                :version 2
+                :inputs (vector (bl.ser:make-tx-in
+                                 :previous-output
+                                 (bl.ser:make-outpoint :hash txid :index 0)
+                                 :script-sig (make-array 0 :element-type
+                                                           '(unsigned-byte 8))
+                                 :sequence #xffffffff))
+                :outputs (vector (bl.ser:make-tx-out :value 99000
+                                                     :script-pubkey spk))
+                :lock-time 0))
+           (txouts (list (cons spk nil)))
+           (txout (bl.ser:make-tx-out :value 100000 :script-pubkey spk))
+           (ours (%ws-tx-weight wallet nil tx txouts)))
+      (is (= ours (%ws-tx-weight wallet (%ws-coin-control-with txid 0 nil)
+                                 tx txouts)))
+      (is (= (1+ ours) (%ws-tx-weight wallet (%ws-coin-control-with txid 0 txout)
+                                      tx txouts)))
+      ;; The other input of the pair: a different outpoint is not the
+      ;; pre-selected one, so nothing changes.
+      (is (= ours (%ws-tx-weight wallet (%ws-coin-control-with txid 1 txout)
+                                 tx txouts))))))
+
 (test ws-ecdsa-satisfaction-is-71-unless-core-uses-max-sig
   "Core sizes an ECDSA satisfaction at `use_max_sig ? 72 : 71`
 (descriptor.cpp:1163, 1196, 1229, 1299). Our signer grinds low-R exactly as
@@ -457,6 +508,11 @@ each byte here is paid to the miner once per ECDSA input."
     (is (= 461 (%ws-input-weight multi t)))))
 
 ;;; --- Regtest end-to-end ---
+
+(defun %ws-sendtoaddress (node params)
+  "The sendtoaddress RPC (Core wallet/rpc/spend.cpp): named once so the
+fourteen end-to-end assertions that drive it share one reach."
+  (bl.wallet::rpc-sendtoaddress node params))
 
 (defun %ws-mempool-tx (node txid)
   (bl.rpc:with-node-lock (node)
@@ -528,7 +584,7 @@ balances that reconcile to the satoshi before and after confirmation."
              (dest-spk (nth-value 1 (bl.crypto:decode-address
                                      dest :regtest)))
              (tip-height 102)
-             (txid-hex (bl.wallet::rpc-sendtoaddress
+             (txid-hex (%ws-sendtoaddress
                         node (list dest 1 nil nil nil nil nil nil nil 10)))
              (txid (bl.rpc:parse-hex-hash txid-hex))
              (tx (%ws-mempool-tx node txid)))
@@ -590,7 +646,7 @@ remainder."
                                      dest :regtest))))
         ;; Single-recipient SFFO.
         (let* ((txid (bl.rpc:parse-hex-hash
-                      (bl.wallet::rpc-sendtoaddress
+                      (%ws-sendtoaddress
                        node (list dest 1 nil nil t nil nil nil nil 10))))
                (tx (%ws-mempool-tx node txid))
                (fee (%ws-tx-fee node wallet tx))
@@ -648,7 +704,7 @@ tx gets no change output and overpays exactly the remainder."
              (dest (%wc-optrue-address))
              (amount-sat (- 5000000000 900))
              (txid (bl.rpc:parse-hex-hash
-                    (bl.wallet::rpc-sendtoaddress
+                    (%ws-sendtoaddress
                      node (list dest (format nil "~D.~8,'0D"
                                              (truncate amount-sat 100000000)
                                              (mod amount-sat 100000000))
@@ -770,7 +826,7 @@ complete:false with Core's per-input errors array."
                (bl.wallet::*wallet-rng* (make-wallet-rng 8))
                (fund-txid (bl.rpc:parse-hex-hash
                            (let ((bl.wallet::*rpc-wallet-name* "w"))
-                             (bl.wallet::rpc-sendtoaddress
+                             (%ws-sendtoaddress
                               node (list wo-address 1 nil nil nil nil nil nil
                                          nil 10))))))
           (%wc-mine node 1 (%wc-optrue-address))
@@ -828,7 +884,7 @@ bounds are enforced with Core's messages."
         ;; maxtxfee: a 10 sat/vB spend costs ~1400+ sats; cap at 100.
         (let ((bl:*wallet-max-tx-fee* 100))
           (signals-rpc-error (:code -6 :message "Fee exceeds maximum configured by user")
-            (bl.wallet::rpc-sendtoaddress
+            (%ws-sendtoaddress
              node (list dest 1 nil nil nil nil nil nil nil 10))))
         ;; Weight caps via send's max_tx_weight.
         (signals-rpc-error (:message "Maximum transaction weight must be between")
@@ -856,11 +912,11 @@ PayTxFee."
             (dest (%wc-optrue-address)))
         ;; Fallback disabled (default): estimation failure.
         (signals-rpc-error (:code -6 :message "Fallbackfee is disabled")
-          (bl.wallet::rpc-sendtoaddress
+          (%ws-sendtoaddress
            node (list dest 1)))
         ;; Fallback enabled: 20 sat/vB fallback, verbose reports the reason.
         (let* ((bl:*wallet-fallback-fee* 20000)
-               (result (bl.wallet::rpc-sendtoaddress
+               (result (%ws-sendtoaddress
                         node (list dest 1 nil nil nil nil nil nil nil nil t)))
                (txid (bl.rpc:parse-hex-hash (%aval "txid" result)))
                (tx (%ws-mempool-tx node txid)))
@@ -870,7 +926,7 @@ PayTxFee."
                  (bl.rpc:feerate-fee
                   20000 (%ws-est-vsize node wallet tx)))))
         ;; Explicit fee rate reports PayTxFee.
-        (let ((result (bl.wallet::rpc-sendtoaddress
+        (let ((result (%ws-sendtoaddress
                        node (list dest 1 nil nil nil nil nil nil nil 10 t))))
           (is (string= "PayTxFee set" (%aval "fee_reason" result))))))))
 
@@ -958,7 +1014,7 @@ mempool; the resend scheduler windows land in [12h, 36h)."
       (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 51))
              (dest (%wc-optrue-address))
              (txid (bl.rpc:parse-hex-hash
-                    (bl.wallet::rpc-sendtoaddress
+                    (%ws-sendtoaddress
                      node (list dest 1 nil nil nil nil nil nil nil 10)))))
         (is (not (null (%ws-mempool-tx node txid))))
         (%wb-evict-tx node txid)
@@ -1095,7 +1151,7 @@ wallet without the flag errors."
       (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 23))
              (dest (%wc-optrue-address))
              (txid (bl.rpc:parse-hex-hash
-                    (bl.wallet::rpc-sendtoaddress
+                    (%ws-sendtoaddress
                      node (list dest 1 nil nil nil
                                 bl.rpc:+json-false+
                                 nil nil nil 10))))
@@ -1138,7 +1194,7 @@ stores only the 32-byte x coordinate)."
       (%wc-mine node 1 addr-tr)
       (%wc-mine node 101 (%wc-optrue-address))
       (let* ((txid (bl.rpc:parse-hex-hash
-                    (bl.wallet::rpc-sendtoaddress
+                    (%ws-sendtoaddress
                      node (list dest 1 nil nil nil nil nil nil nil 10))))
              (tx (%ws-mempool-tx node txid)))
         (is (not (null tx)))
@@ -1170,7 +1226,7 @@ stores only the 32-byte x coordinate)."
                         node (list (list request)))))
           (is (eq t (%aval "success" (first results)))))
         ;; Fund the imported odd-Y taproot address from the same wallet.
-        (bl.wallet::rpc-sendtoaddress
+        (%ws-sendtoaddress
          node (list tr-address 1 nil nil nil nil nil nil nil 10))
         (%wc-mine node 1 (%wc-optrue-address))
         ;; Crash-close + reload: the imported descriptor comes back from its
@@ -1199,11 +1255,11 @@ doing unbounded validation in one housekeeping tick."
       (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 37))
              (dest (%wc-optrue-address))
              (txid1 (bl.rpc:parse-hex-hash
-                     (bl.wallet::rpc-sendtoaddress
+                     (%ws-sendtoaddress
                       node (list dest 1 nil nil nil nil nil nil nil 10)))))
         (%wb-evict-tx node txid1)
         (let ((txid2 (bl.rpc:parse-hex-hash
-                      (bl.wallet::rpc-sendtoaddress
+                      (%ws-sendtoaddress
                        node (list dest 2 nil nil nil nil nil nil nil 10)))))
           (%wb-evict-tx node txid2)
           (is (null (%ws-mempool-tx node txid1)))
