@@ -110,35 +110,56 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           ("fullrbf" . t)
           ("permitbaremultisig" . ,(json-bool bl:*permit-bare-multisig*))))))
 
-(define-rpc "getrawmempool" (node ((verbose :bool)))
-  "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t)."
+(define-rpc "getrawmempool" (node ((verbose :bool) (mempool-sequence :bool)))
+  "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t).
+
+MEMPOOL_SEQUENCE (Core MempoolToJSON, rpc/mempool.cpp:571-605) wraps the
+non-verbose id list in the snapshot object {\"txids\": [...],
+\"mempool_sequence\": N}: it is what doc/zmq.md tells a mempool-mirroring
+client to call so it can apply the ZMQ sequence stream from a known point,
+with no gap and no duplicate. It is incompatible with VERBOSE, which Core
+answers with -8 rather than a partial result."
+  ;; Core raises this before it reads the pool at all (mempool.cpp:572-576).
+  (when (and verbose mempool-sequence)
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Verbose results cannot contain mempool sequence values."))
   (let ((mempool (rpc-get-mempool node)))
     ;; Node lock: iterating entries (and, verbose, walking each entry's
     ;; ancestors/descendants/chunk) must not race the sync thread's
-    ;; add/evict/reorg mutations (Core getrawmempool takes pool.cs).
+    ;; add/evict/reorg mutations (Core getrawmempool takes pool.cs). The
+    ;; sequence counter is read under that same hold, as Core reads it inside
+    ;; the pool.cs block that built the id list (:588-605) — a snapshot that
+    ;; straddled an add or an eviction would defeat the argument's purpose.
     (with-node-lock (node)
-     (cond
-      ;; Empty (or absent) mempool: Core still answers with a collection of
-      ;; the right shape — a VOBJ ({}) when verbose, a VARR ([]) otherwise.
-      ;; A bare NIL would encode as null.
-      ((null mempool) (if verbose (json-object nil) (json-array nil)))
-      ((not verbose)
-       (let ((ids '()))
-         (bl.mp:mempool-for-each
-          mempool (lambda (txid entry)
-                    (declare (ignore entry))
-                    (push (hash-to-hex txid) ids)))
-         (json-array (nreverse ids))))
-      (t
-       ;; Verbose: an alist (txid -> field-alist); the RPC normalizer turns it
-       ;; into nested JSON objects.
-       (let ((result '()))
-         (bl.mp:mempool-for-each
-          mempool
-          (lambda (txid entry)
-            (push (cons (hash-to-hex txid) (%mempool-entry-fields mempool txid entry))
-                  result)))
-         (json-object result)))))))
+      (let ((rows '()))
+        (when mempool
+          (bl.mp:mempool-for-each
+           mempool
+           (lambda (txid entry)
+             (push (if verbose
+                       ;; (txid . field-alist); the RPC normalizer turns the
+                       ;; whole thing into nested JSON objects.
+                       (cons (hash-to-hex txid)
+                             (%mempool-entry-fields mempool txid entry))
+                       (hash-to-hex txid))
+                   rows))))
+        (setf rows (nreverse rows))
+        ;; An empty (or absent) mempool still answers with a collection of
+        ;; the right shape — a VOBJ ({}) when verbose, a VARR ([]) otherwise.
+        ;; A bare NIL would encode as null.
+        (cond
+          (verbose (json-object rows))
+          (mempool-sequence
+           ;; The id list is tagged as an array by BEING a vector: an alist
+           ;; entry whose value is a list of strings is exactly the shape
+           ;; RPC-OBJECT-ALIST-P cannot tell from a nested object, and a
+           ;; vector settles it for yason either way.
+           (json-object
+            `(("txids" . ,(coerce rows 'vector))
+              ("mempool_sequence" . ,(if mempool
+                                         (bl.mp:mempool-sequence mempool)
+                                         0)))))
+          (t (json-array rows)))))))
 
 (defun %mempool-entry-fields (mempool txid entry)
   "The verbose field alist for one mempool ENTRY (TXID) — vsize/weight/time/
