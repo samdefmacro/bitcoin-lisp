@@ -1070,11 +1070,11 @@ that gets through cannot leave a cache split or a prune target behind."
         (bl:*prune-target-mib* bl:*prune-target-mib*)
         (bl:*p2p-port-override* bl:*p2p-port-override*))
     ;; network txindex blockfilterindex prune dbcache mocktime
-    ;; testactivationheight coinstatsindex txospenderindex reindex-chainstate
-    ;; peerblockfilters port
+    ;; testactivationheight test-options coinstatsindex txospenderindex
+    ;; reindex-chainstate peerblockfilters port
     (%config-refusal
       (bl::%init-parameters :testnet4 nil blockfilterindex prune
-                            nil nil nil nil nil nil peer-block-filters nil))))
+                            nil nil nil nil nil nil nil peer-block-filters nil))))
 
 (test peerblockfilters-without-blockfilterindex-is-refused-on-any-node
   "GA10 d2099b36. Core runs the check UNCONDITIONALLY and gates the service bit
