@@ -1011,8 +1011,17 @@ wallet's known sub-scripts. Inputs with no UTXO are absent."
     coins))
 
 (defun %psbt-input-signed-p (map)
-  "Core PSBTInputSigned (psbt.h): the input already carries a final scriptSig
-or final scriptWitness, so a filler has nothing left to add."
+  "Core PSBTInputSigned (psbt.cpp:320-323): the input already carries a final
+scriptSig or final scriptWitness, so a filler has nothing left to add.
+
+Presence is deliberately all this asks, because presence is what Core's loops
+skip on: CWallet::FillPSBT (wallet.cpp:2192-2194),
+DescriptorScriptPubKeyMan::FillPSBT and ProcessPSBT
+(rawtransaction.cpp:191-193) all step over an input whose final fields are
+set, whatever they contain -- and an input carrying them short-circuits
+FillSignatureData/ProduceSignature anyway. The predicate that VERIFIES is
+%psbt-inputs-signed-and-verified-p, and it belongs where Core puts it: the
+complete walletprocesspsbt reports."
   (or (bl.ser:psbt-map-find
        map bl.ser:+psbt-in-final-scriptsig+)
       (bl.ser:psbt-map-find
