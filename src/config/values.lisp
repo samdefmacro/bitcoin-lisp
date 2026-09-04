@@ -307,8 +307,12 @@ without step 1 leaves every node deaf, every multi-node test times out in
 connect_nodes, and the node logs nothing wrong because from its own point of
 view it did what it was told.
 
--listen=0 then soft-disables -listenonion (:808-809), and the explicit
-contradiction -listen=0 -listenonion=1 is an init ERROR (:1022-1024)."
+-listen=0 then soft-disables -listenonion (:808-809). Two contradictions
+survive the chain and are init ERRORS rather than a silently discarded
+option, in Core's order: -bind / -whitebind with -listen=0 (:1016-1020) and
+-listen=0 with -listenonion=1 (:1022-1024). The first can only mean an
+EXPLICIT -listen=0, because step 1 above soft-sets -listen=1 for a -bind that
+nothing else has already answered."
   (flet ((lk (k) (let ((c (assoc k alist :test #'string=))) (and c (cdr c)))))
     (let ((listen nil))                 ; NIL = nothing has set it yet
       (flet ((soft-set (value)
@@ -329,7 +333,15 @@ contradiction -listen=0 -listenonion=1 is an init ERROR (:1022-1024)."
       (let* ((listen-p (if listen (first listen) t)) ; Core DEFAULT_LISTEN
              (lo (lk "listenonion"))
              (lo-p (and lo (conf-parse-bool lo))))
-        (when (and (not listen-p) lo-p)
-          (config-error "Cannot set -listen=0 together with -listenonion=1"))
+        ;; Both refusals are conditions on a node that will not listen, in
+        ;; Core's order. The first is nUserBind != 0 && !GetBoolArg("-listen")
+        ;; (init.cpp:1016-1020): the address the operator explicitly asked to
+        ;; bind would otherwise be recorded and never listened on -- and with
+        ;; -whitebind it carries net permissions that go with it.
+        (unless listen-p
+          (when (or (lk "bind") (lk "whitebind"))
+            (config-error "Cannot set -bind or -whitebind together with -listen=0"))
+          (when lo-p
+            (config-error "Cannot set -listen=0 together with -listenonion=1")))
         (values listen-p
                 (and listen-p (if lo lo-p t)))))))

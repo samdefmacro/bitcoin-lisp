@@ -866,6 +866,48 @@ port overrides -port for the listener, as it does in Core."
     (is (string= "127.0.0.1" (getf plist :listen-bind)))
     (is (= 18445 (getf plist :port)))))
 
+(defun %start-node-plist-refusal (&rest args)
+  "The message ARGS->START-NODE-PLIST refuses the command line ARGS with, or
+NIL when it accepts it. The plist assembly is pure, so no global needs saving."
+  (%config-refusal (start-node-plist args)))
+
+(test bind-or-whitebind-with-listen-0-is-an-init-error
+  "GA10 3911beba. `nUserBind != 0 && !GetBoolArg(\"-listen\", DEFAULT_LISTEN)`
+=> InitError(\"Cannot set -bind or -whitebind together with -listen=0\")
+(init.cpp:1016-1020), asserted by p2p_permissions.py:102.
+
+Only an EXPLICIT -listen=0 can reach it: -bind soft-sets -listen=1 first
+(init.cpp:768-775), so the pair is always something the operator asked for
+twice. We used to record the bind address and start deaf on it, discarding the
+-whitebind net permissions with it."
+  (let ((message "Cannot set -bind or -whitebind together with -listen=0"))
+    (is (string= message (%start-node-plist-refusal
+                          "-regtest" "-bind=127.0.0.1" "-listen=0")))
+    (is (string= message (%start-node-plist-refusal
+                          "-regtest" "-bind=127.0.0.1" "-nolisten")))
+    (is (string= message (%start-node-plist-refusal
+                          "-regtest" "-whitebind=noban@127.0.0.1:19444" "-listen=0")))
+    ;; Core sums the two lists, so either one alone is enough.
+    (is (string= message (%start-node-plist-refusal
+                          "-regtest" "-bind=127.0.0.1" "-whitebind=noban@127.0.0.1:19444"
+                          "-listen=0"))))
+  ;; The soft-set side is untouched: -bind still WINS over -connect and
+  ;; -proxy, and a bind with no -listen at all listens.
+  (is-false (%start-node-plist-refusal "-regtest" "-bind=127.0.0.1"))
+  (is-true (getf (start-node-plist '("-regtest" "-bind=127.0.0.1"
+                                     "-connect=1.2.3.4"))
+                 :listen))
+  ;; -listen=0 without a bind is an ordinary non-listening node.
+  (is-false (%start-node-plist-refusal "-regtest" "-listen=0"))
+  ;; A config-file bind is the same option through another source. -bind is
+  ;; network-only, so off mainnet it has to be written in the [regtest]
+  ;; section or a different init error refuses it first.
+  (is (string= "Cannot set -bind or -whitebind together with -listen=0"
+               (%config-refusal
+                 (start-node-plist
+                  '("-regtest")
+                  (format nil "[regtest]~%bind=127.0.0.1~%listen=0~%"))))))
+
 (test log-file-defaults-to-debug-log-in-the-datadir
   "Core writes <datadir>/debug.log unless -debuglogfile says otherwise, and its
 functional framework reads that file for every node it starts. We wrote no file
