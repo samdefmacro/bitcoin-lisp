@@ -450,22 +450,21 @@ This is the double-SHA256 of the legacy serialized transaction (no witness)."
         hash)))
 
 (defun transaction-wtxid (tx)
-  "Compute the witness transaction ID (wtxid).
-For transactions with witness data, this is the double-SHA256 of the
-witness-serialized transaction. For coinbase transactions, returns 32 zero bytes.
-For legacy transactions without witness, wtxid equals txid. Cached on the tx."
+  "The witness transaction id (BIP 141): TX's txid when it carries no witness,
+otherwise the double-SHA256 of its witness serialization. Cached on the tx.
+
+This is Core's CTransaction::ComputeWitnessHash (primitives/transaction.cpp:
+88-95), which has NO coinbase case. The all-zero value is a rule of the
+witness MERKLE TREE alone (BlockWitnessMerkleRoot, consensus/merkle.cpp:80,
+\"The witness hash of the coinbase is 0\") and not of a transaction's
+identity, so it belongs in COMPUTE-WITNESS-MERKLE-ROOT and nowhere else --
+returning it here made getblock verbosity 2/3 and getrawtransaction report
+hash=000...0 for the coinbase of every block."
   (or (transaction-cached-wtxid tx)
       (setf (transaction-cached-wtxid tx)
-            (cond
-              ;; Coinbase: wtxid is all zeros
-              ((and (plusp (length (transaction-inputs tx)))
-                    (coinbase-input-p (aref (transaction-inputs tx) 0)))
-               (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
-              ;; Has witness: hash the witness serialization
-              ((transaction-has-witness-p tx)
-               (bl.crypto:hash256 (serialize-witness-transaction tx)))
-              ;; No witness: wtxid = txid
-              (t (transaction-hash tx))))))
+            (if (transaction-has-witness-p tx)
+                (bl.crypto:hash256 (serialize-witness-transaction tx))
+                (transaction-hash tx)))))
 
 (defun transaction-weight (tx)
   "Calculate the weight of a transaction in weight units (BIP 141).

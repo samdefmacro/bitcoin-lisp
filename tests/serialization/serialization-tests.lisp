@@ -143,8 +143,13 @@ marker/flag (byte 4, the input count, must be non-zero)."
     (let ((re-serialized (bl.ser:serialize-transaction tx)))
       (is (equalp legacy-bytes re-serialized)))))
 
-(test coinbase-wtxid-is-zero
-  "Coinbase transaction wtxid should be 32 zero bytes."
+(test coinbase-wtxid-is-its-real-witness-hash
+  "A coinbase's wtxid is its own GetWitnessHash, never the merkle tree's zero.
+
+transaction-wtxid special-cased the coinbase and returned 32 zero bytes, so
+getblock verbosity 2/3 and getrawtransaction reported hash=000...0 for the
+coinbase of every block (Core core_io.cpp:435 emits GetWitnessHash there).
+The zero belongs to BlockWitnessMerkleRoot alone."
   (let ((coinbase-tx (bl.ser:make-transaction
                       :version 1
                       :inputs (vector (bl.ser:make-tx-in
@@ -159,9 +164,27 @@ marker/flag (byte 4, the input count, must be non-zero)."
                                       :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                  :initial-element #x76)))
                       :lock-time 0)))
+    ;; Core's ComputeWitnessHash has no coinbase case: a witnessless coinbase
+    ;; reports its TXID (primitives/transaction.cpp:88-95). The all-zero value
+    ;; is the witness MERKLE leaf (consensus/merkle.cpp:80), not this.
     (let ((wtxid (bl.ser:transaction-wtxid coinbase-tx)))
       (is (= 32 (length wtxid)))
-      (is (every #'zerop wtxid)))))
+      (is (notevery #'zerop wtxid)
+          "the coinbase's own wtxid is never the merkle tree's zero leaf")
+      (is (equalp (bl.ser:transaction-hash coinbase-tx) wtxid)))
+    ;; With a witness it is the hash of the witness serialization, which the
+    ;; wallet, getblock and getrawtransaction all report as "hash"/"wtxid".
+    (let* ((witnessed (bl.ser:make-transaction
+                       :version (bl.ser:transaction-version coinbase-tx)
+                       :inputs (bl.ser:transaction-inputs coinbase-tx)
+                       :outputs (bl.ser:transaction-outputs coinbase-tx)
+                       :witness (vector (list (make-array 32 :element-type '(unsigned-byte 8)
+                                                             :initial-element 0)))
+                       :lock-time 0))
+           (wtxid (bl.ser:transaction-wtxid witnessed)))
+      (is (equalp (bl.crypto:hash256 (bl.ser:serialize-witness-transaction witnessed))
+                  wtxid))
+      (is (not (equalp (bl.ser:transaction-hash witnessed) wtxid))))))
 
 (test witness-stack-content-correct
   "Witness stack items should have correct byte content."
