@@ -26,6 +26,14 @@
   (or *max-money-satoshi*
       (setf *max-money-satoshi* (bl.interop:wrap-satoshi +max-money+))))
 
+(defun money-range-p (value)
+  "Core MoneyRange (consensus/amount.h:24-30): 0 <= VALUE <= MAX_MONEY.
+Every consensus site that derives an amount from data it did not itself bound
+re-asks this question, because an amount outside the band is not a Bitcoin
+value at all. Core's own reason for asking is CAmount's int64 overflow; ours
+is that the value reached us from a coins view we do not otherwise check."
+  (and (not (minusp value)) (<= value +max-money+)))
+
 ;;;; Structure validation (context-free)
 
 (defun validate-transaction-structure (tx)
@@ -168,10 +176,23 @@ FEE is returned as a Satoshi type."
                 (return-from validate-transaction-contextual
                   (values nil :coinbase-not-mature nil)))))
 
-          ;; Use typed addition for input sum
-          (setf total-input
-                (bl.interop:satoshi+ total-input
-                          (bl.interop:wrap-satoshi (bl.store:utxo-entry-value utxo)))))))
+          ;; Use typed addition for input sum, then "check for negative or
+          ;; overflow input values" — Core CheckTxInputs (consensus/
+          ;; tx_verify.cpp:184-188), asked AFTER the addition and of BOTH
+          ;; terms: the coin's own value and the running sum. Core needs it
+          ;; because CAmount is an int64 that wraps; our Satoshi is an
+          ;; unbounded Integer, so nothing here can overflow. The REJECTION is
+          ;; the consensus rule either way — a coins view holding an
+          ;; out-of-range value (a corrupted chainstate record) must not have
+          ;; it counted into a fee, and thence into a block's coinbase cap.
+          (let ((coin-value (bl.store:utxo-entry-value utxo)))
+            (setf total-input
+                  (bl.interop:satoshi+ total-input
+                                       (bl.interop:wrap-satoshi coin-value)))
+            (unless (and (money-range-p coin-value)
+                         (money-range-p (bl.interop:unwrap-satoshi total-input)))
+              (return-from validate-transaction-contextual
+                (values nil :input-values-out-of-range nil)))))))
 
     ;; Sum outputs with typed addition
     (bl.ser:dovector (output outputs)
@@ -186,7 +207,19 @@ FEE is returned as a Satoshi type."
           (values nil :insufficient-funds nil))))
 
     ;; Return fee as Satoshi type
-    (values t nil (bl.interop:satoshi- total-input total-output))))
+    (let ((fee (bl.interop:satoshi- total-input total-output)))
+      ;; The last statement of Core's CheckTxInputs (tx_verify.cpp:202-209):
+      ;; the derived fee must be in MoneyRange. Core annotates its own guard
+      ;; as unreachable given the input-range loop above and CheckTransaction's
+      ;; output-side checks, and so is ours — but only for a NON-coinbase, and
+      ;; only where those preconditions hold. A coinbase has no input sum at
+      ;; all (its "fee" here is negative by construction), and Core never calls
+      ;; CheckTxInputs on one: PreChecks rejects it at validation.cpp:804 and
+      ;; ConnectBlock guards the call with !tx.IsCoinBase().
+      (unless (or is-coinbase (money-range-p (bl.interop:unwrap-satoshi fee)))
+        (return-from validate-transaction-contextual
+          (values nil :fee-out-of-range nil)))
+      (values t nil fee))))
 
 ;;;; Mempool acceptance validation
 
@@ -737,7 +770,9 @@ transaction is refused even on a node told to relay non-standard ones."
     (:bad-coinbase-length      . "bad-cb-length")                    ; :50
     (:bad-prevout-null         . "bad-txns-prevout-null")            ; :56
     (:coinbase-not-mature      . "bad-txns-premature-spend-of-coinbase") ; tx_verify.cpp:180
+    (:input-values-out-of-range . "bad-txns-inputvalues-outofrange")  ; :187
     (:insufficient-funds       . "bad-txns-in-belowout")             ; :197
+    (:fee-out-of-range         . "bad-txns-fee-outofrange")          ; :209
     (:coinbase-not-allowed     . "coinbase")                         ; validation.cpp:804
     (:tx-size-small            . "tx-size-small")                    ; :814
     (:non-final                . "non-final")                        ; :820

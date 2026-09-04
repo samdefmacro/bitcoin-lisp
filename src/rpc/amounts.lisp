@@ -56,7 +56,7 @@ where a double's nearest representation may be off by up to ~0.4 sat."
                       0))))
             (t (error 'rpc-error :code +rpc-type-error+
                                  :message "Amount is not a number or string")))))
-    (unless (<= 0 satoshis bl.val:+max-money+)
+    (unless (bl.val:money-range-p satoshis)
       (error 'rpc-error :code +rpc-type-error+ :message "Amount out of range"))
     satoshis))
 

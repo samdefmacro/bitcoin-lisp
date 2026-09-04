@@ -581,6 +581,117 @@ exactly the set the old mechanical rendering got wrong."
         (is (null valid))
         (is (eq :insufficient-funds error))))))
 
+;;;; MoneyRange, the three places Core asks for it on the INPUT side
+;;;;
+;;;; Core's CAmount is an int64 that wraps, so CheckTxInputs range-checks each
+;;;; coin value and the running input sum (tx_verify.cpp:184-188) and the
+;;;; derived fee (:202-209), and ConnectBlock range-checks the accumulated block
+;;;; fee after every transaction (validation.cpp:2539-2544). Our Satoshi is an
+;;;; unbounded Integer, so nothing here can overflow -- but the REJECTION is the
+;;;; consensus rule, not the overflow it happens to prevent: an amount outside
+;;;; MoneyRange must not be counted into a fee, and thence into the cap on what
+;;;; a block's coinbase may pay itself. On a chain built from genesis the
+;;;; output-side checks bound the supply inductively and none of these can fire;
+;;;; what they add is a defence against a coins view seeded from elsewhere.
+
+(defun %money-range-spend (prev-txid output-value)
+  "A 1-in-1-out spend of PREV-TXID:0 paying OUTPUT-VALUE."
+  (let ((script (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
+    (bl.ser:make-transaction
+     :version 1
+     :inputs (vector (bl.ser:make-tx-in
+                      :previous-output (bl.ser:make-outpoint :hash prev-txid :index 0)
+                      :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                      :sequence #xFFFFFFFF))
+     :outputs (vector (bl.ser:make-tx-out :value output-value :script-pubkey script))
+     :lock-time 0)))
+
+(test transaction-input-value-out-of-range
+  "Core CheckTxInputs (tx_verify.cpp:184-188) rejects
+bad-txns-inputvalues-outofrange when a spent coin's value, or the running sum of
+them, leaves MoneyRange. Both the utxo-entry value slot and Core's CAmount are
+signed 64-bit, so a coins view really can hold such a value."
+  (let ((script (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
+    (flet ((err-of (coin-value)
+             (let ((utxo-set (bl.store:make-utxo-set))
+                   (txid (make-array 32 :element-type '(unsigned-byte 8)
+                                        :initial-element 1)))
+               (bl.store:add-utxo utxo-set txid 0 coin-value script 10)
+               (nth-value 1 (bl.val:validate-transaction-contextual
+                             (%money-range-spend txid 1) utxo-set 100)))))
+      (is (eq :input-values-out-of-range (err-of (* 3 bl.val:+max-money+))))
+      (is (eq :input-values-out-of-range (err-of -1)))
+      ;; Control: exactly MAX_MONEY is IN range (Core's MoneyRange is
+      ;; inclusive), so the guard is a band and not a rejection of every large
+      ;; coin.
+      (is (null (err-of bl.val:+max-money+))))))
+
+(test transaction-fee-out-of-range
+  "The last statement of Core's CheckTxInputs (tx_verify.cpp:202-209): the
+derived fee must be in MoneyRange. Core annotates its own guard as unreachable
+GIVEN that CheckTransaction's output-side checks ran first -- so this test
+reaches it the only way either implementation can, by calling CheckTxInputs
+directly with an output value CheckTransaction would have refused."
+  (let ((utxo-set (bl.store:make-utxo-set))
+        (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+        (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
+    (bl.store:add-utxo utxo-set txid 0 bl.val:+max-money+ script 10)
+    ;; A negative output makes the fee MAX_MONEY + 1.
+    (is (eq :fee-out-of-range
+            (nth-value 1 (bl.val:validate-transaction-contextual
+                          (%money-range-spend txid -1) utxo-set 100))))
+    ;; Control: the same in-range coin with an ordinary output is accepted and
+    ;; its fee reported, so the fixture is not simply unspendable.
+    (multiple-value-bind (valid error fee)
+        (bl.val:validate-transaction-contextual
+         (%money-range-spend txid 1) utxo-set 100)
+      (is-true valid)
+      (is (null error))
+      (is (= (1- bl.val:+max-money+) (bl.interop:unwrap-satoshi fee))))))
+
+(test block-accumulated-fee-out-of-range
+  "Core ConnectBlock (validation.cpp:2539-2544) range-checks the RUNNING fee sum
+after every transaction, because that sum is what MAX-COINBASE-VALUE is derived
+from: an out-of-range total would raise the cap on what the coinbase may pay
+itself. Two transactions each paying a fee just under MAX_MONEY are individually
+fine and together are not."
+  (let* ((bl:*network* :mainnet)
+         (height 800000)
+         (chain-state (bl.store:make-chain-state))
+         (utxo-set (bl.store:make-utxo-set))
+         (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76))
+         (txids (loop for i below 2
+                      collect (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element (+ 40 i)))))
+    (dolist (txid txids)
+      (bl.store:add-utxo utxo-set txid 0 bl.val:+max-money+ script 5))
+    (flet ((verdict (spends)
+             (let* ((txs (cons (bl.mining:build-coinbase-transaction
+                                height 100000000
+                                :script-pubkey script :segwit-active nil)
+                               spends))
+                    (blk (bl.ser:make-bitcoin-block
+                          :header (bl.ser:make-block-header
+                                   :version #x20000000
+                                   :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                              :initial-element 0)
+                                   :merkle-root (bl.val:compute-merkle-root
+                                                 (mapcar #'bl.ser:transaction-hash txs))
+                                   :timestamp 1700000000 :bits #x1d00ffff :nonce 0)
+                          :transactions txs)))
+               ;; The header and the input scripts are not what is under test;
+               ;; the block is synthetic and unmined.
+               (nth-value 1 (bl.val:validate-block
+                             blk chain-state utxo-set height 1700000000
+                             :skip-header t :skip-scripts t)))))
+      ;; Control first: ONE such transaction leaves the running total in range,
+      ;; so the block is accepted and the fixture is proven buildable.
+      (is (null (verdict (list (%money-range-spend (first txids) 1)))))
+      ;; Two of them do not.
+      (is (eq :accumulated-fee-out-of-range
+              (verdict (list (%money-range-spend (first txids) 1)
+                             (%money-range-spend (second txids) 1))))))))
+
 ;;;; Block Validation Tests
 
 (defun make-test-block-header (&key (version 1) (timestamp (get-universal-time))
