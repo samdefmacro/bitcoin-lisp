@@ -449,6 +449,20 @@ the position once it exists."
 (defconstant +pow-target-timespan+ 1209600
   "Target time for one retarget period in seconds (2 weeks = 14 * 24 * 60 * 60).")
 
+(defun difficulty-adjustment-interval (network)
+  "Blocks in one retarget period on NETWORK -- Core's
+Consensus::Params::DifficultyAdjustmentInterval(), nPowTargetTimespan /
+nPowTargetSpacing. Two weeks over ten minutes is 2016 on every chain but
+regtest, whose timespan is one DAY (kernel/chainparams.cpp:576-577) and whose
+period is therefore 144.
+
++DIFFICULTY-ADJUSTMENT-INTERVAL+ is the 2016 the retarget arithmetic applies
+directly; regtest never retargets (Core fPowNoRetargeting), so the two only
+part company where a caller REPORTS the period instead of retargeting on it --
+getnetworkhashps's `nblocks = -1', whose window is the blocks mined since the
+last difficulty change."
+  (if (eq network :regtest) 144 +difficulty-adjustment-interval+))
+
 (defconstant +pow-limit-bits+
   (bl.chain:chain-params-pow-limit-bits (bl.chain:find-chain-params :mainnet))
   "Minimum difficulty (maximum target) in compact bits format, #x1d00ffff.
