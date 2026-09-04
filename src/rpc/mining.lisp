@@ -784,27 +784,85 @@ and {hash} is returned; otherwise {hash, hex}."
 
 ;;; --- getnetworkhashps, generate (Core rpc/mining.cpp) ---
 
-(define-rpc "getnetworkhashps" (node params)
-  "Estimated network hashes/sec over the last N blocks (default 120), from the
-chain-work and time spanned (Bitcoin Core getnetworkhashps)."
-  (let* ((nblocks (let ((n (first params))) (if (and (integerp n) (> n 0)) n 120)))
-         (chain-state (rpc-get-chain-state node))
-         (height (bl.store:current-height chain-state))
-         (tip (bl.store:get-block-index-entry
-               chain-state (bl.store:best-block-hash chain-state))))
-    (if (or (null tip) (<= height 0))
+(defun %number-arg (value default)
+  "VALUE as an integer parameter, DEFAULT when it was omitted (JSON null).
+Anything else present is Core's RPC_TYPE_ERROR: its argument dispatcher
+type-checks an RPCArg::Type::NUM before the handler runs, so
+`getnetworkhashps(\"a\", [])' is -3 rather than an answer computed from the
+defaults the bad arguments were silently replaced by."
+  (cond ((null value) default)
+        ((integerp value) value)
+        (t (%json-type-error value "number"))))
+
+(defun %block-entry-time (entry)
+  "ENTRY's header timestamp (Core CBlockIndex::GetBlockTime)."
+  (bl.ser:block-header-timestamp (bl.store:block-index-entry-header entry)))
+
+(defun %network-hash-ps (chain-state network nblocks height)
+  "Average network hashes per second over the NBLOCKS blocks ending at HEIGHT
+-- Bitcoin Core GetNetworkHashPS (rpc/mining.cpp:65-109).
+
+NBLOCKS is -1 for \"since the last difficulty change\", which expands to
+`pb->nHeight % DifficultyAdjustmentInterval() + 1'; HEIGHT is -1 for the tip,
+and any other height ANCHORS the window there, so the answer is the rate at the
+time that block was found rather than the rate now. Out-of-range arguments are
+errors, not defaults: a monitoring caller asking about a height that does not
+exist must not be handed a plausible number about a different block.
+
+Two details of the arithmetic are Core's and both matter. The result is a
+DOUBLE: an integer division reports 0 for every rate below 0.5 H/s, which is
+every rate a regtest chain ever has. And the timespan is max(block time) -
+min(block time) OVER THE WINDOW, not the difference of its endpoints -- block
+timestamps are not monotonic, so the endpoints can span less time than the
+window really covers, or none at all."
+  (when (or (< nblocks -1) (zerop nblocks))
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Invalid nblocks. Must be a positive number or -1."))
+  (when (or (< height -1) (> height (bl.store:current-height chain-state)))
+    (error 'rpc-error :code +rpc-invalid-parameter+
+                      :message "Block does not exist at specified height"))
+  (let ((pb (if (minusp height)
+                (bl.store:get-block-index-entry
+                 chain-state (bl.store:best-block-hash chain-state))
+                (bl.store:get-block-at-height chain-state height))))
+    ;; No chain, or the genesis block: no work has been done yet.
+    (if (or (null pb) (zerop (bl.store:block-index-entry-height pb)))
         0
-        (let* ((window (min nblocks height))
-               (start (bl.store:get-block-at-height chain-state (- height window))))
-          (if start
-              (let ((dwork (- (bl.store:block-index-entry-chain-work tip)
-                              (bl.store:block-index-entry-chain-work start)))
-                    (dtime (- (bl.ser:block-header-timestamp
-                               (bl.store:block-index-entry-header tip))
-                              (bl.ser:block-header-timestamp
-                               (bl.store:block-index-entry-header start)))))
-                (if (<= dtime 0) 0 (round dwork dtime)))
-              0)))))
+        (let* ((pb-height (bl.store:block-index-entry-height pb))
+               (lookup (min pb-height
+                            (if (= nblocks -1)
+                                (1+ (mod pb-height
+                                         (bl.store:difficulty-adjustment-interval network)))
+                                nblocks)))
+               (pb0 pb)
+               (min-time (%block-entry-time pb))
+               (max-time min-time))
+          ;; LOOKUP is clamped to PB's height, so this walk reaches genesis at
+          ;; the earliest and every step has a predecessor; a broken index
+          ;; shortens the window rather than erroring out of a status RPC.
+          (dotimes (i lookup)
+            (let ((prev (bl.store:block-index-entry-prev-entry pb0)))
+              (unless prev (return))
+              (setf pb0 prev)
+              (let ((time (%block-entry-time pb0)))
+                (setf min-time (min time min-time)
+                      max-time (max time max-time)))))
+          (if (= min-time max-time)
+              0                         ; Core's divide-by-zero guard.
+              (/ (float (- (bl.store:block-index-entry-chain-work pb)
+                           (bl.store:block-index-entry-chain-work pb0))
+                        1d0)
+                 (- max-time min-time)))))))
+
+(define-rpc "getnetworkhashps" (node (nblocks height))
+  "Estimated network hashes/sec over the last NBLOCKS blocks (default 120, or
+-1 for the blocks since the last difficulty change) as of HEIGHT (default -1,
+the tip), from the chain work and the time spanned (Bitcoin Core
+getnetworkhashps)."
+  (%network-hash-ps (rpc-get-chain-state node)
+                    (bl:node-network node)
+                    (%number-arg nblocks 120)
+                    (%number-arg height -1)))
 
 (define-rpc "generate" (node params)
   "Core keeps `generate' registered ONLY so that calling it explains itself

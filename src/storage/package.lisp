@@ -127,6 +127,7 @@ src/storage/.")
    #:calculate-next-work-required
    ;; Difficulty constants
    #:+difficulty-adjustment-interval+
+   #:difficulty-adjustment-interval
    #:+pow-target-timespan+
    #:+pow-limit-bits+
    #:+pow-limit-target+

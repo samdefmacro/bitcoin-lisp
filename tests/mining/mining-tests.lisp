@@ -1325,3 +1325,135 @@ real normalizer, so it cannot be satisfied by a shape no client can send."
       (let ((params (wire-params "{\"params\":[{\"rules\":[7]}]}")))
         (is-true (search "not of expected type string"
                          (or (%gbt-error-message (%gbt-node) params) "")))))))
+
+;;;; getnetworkhashps (Core rpc/mining.cpp GetNetworkHashPS, :65-121),
+;;;; getmininginfo's optional last-template fields, and the generate* family's
+;;;; try budget.
+
+(defun %hashps-node (work-deltas &key (spacing 600) tip-time)
+  "A regtest node whose block index holds heights 0..N, N being the length of
+WORK-DELTAS: height h carries the cumulative chain work of the first h deltas
+and the timestamp 1000000 + h*SPACING, TIP-TIME overriding the tip's. Genesis
+carries no work, as every chain's genesis does — GetNetworkHashPS reports 0
+when its window anchor is the genesis block."
+  (let* ((node (make-test-node :network :regtest))
+         (cs (bl:node-chain-state node))
+         (top (length work-deltas))
+         (prev nil)
+         (work 0))
+    (loop for h from 0 to top
+          do (when (plusp h) (incf work (elt work-deltas (1- h))))
+             (let* ((hash (let ((v (%zeros 32)))
+                            (setf (aref v 0) (logand h #xff)
+                                  (aref v 1) (logand (ash h -8) #xff)
+                                  (aref v 2) #x5a)
+                            v))
+                    (header (bl.ser:make-block-header
+                             :version 1
+                             :prev-block (if prev
+                                             (bl.store:block-index-entry-hash prev)
+                                             (%zeros 32))
+                             :merkle-root (%zeros 32)
+                             :timestamp (if (and tip-time (= h top))
+                                            tip-time
+                                            (+ 1000000 (* h spacing)))
+                             :bits #x207fffff :nonce 0
+                             :cached-hash hash))
+                    (entry (bl.store:make-block-index-entry
+                            :hash hash :height h :chain-work work :status :valid
+                            :header header :prev-entry prev)))
+               (bl.store:add-block-index-entry cs entry)
+               (bl.store:update-chain-tip cs hash h)
+               (setf prev entry)))
+    node))
+
+(defun %hashps (node &rest params)
+  "getnetworkhashps through the registered wire handler."
+  (bl.rpc:dispatch-rpc-method node "getnetworkhashps" params))
+
+(test getnetworkhashps-rejects-out-of-range-arguments
+  "Core GetNetworkHashPS raises before it computes anything (rpc/mining.cpp:
+66-72): nblocks 0 or below -1 is -8 \"Invalid nblocks. Must be a positive
+number or -1.\", a height outside [-1, chain height] is -8 \"Block does not
+exist at specified height\", and a non-number argument is the argument
+dispatcher's -3.
+
+Every one of these used to return the tip-window estimate. That is the worst
+failure mode a status RPC has: a plausible number about a block the caller did
+not ask about, with nothing signalled. rpc_blockchain.py:496-528 asserts all
+five."
+  (with-network (:regtest)
+    (let ((node (%hashps-node (make-list 10 :initial-element 1000000))))
+      (signals-rpc-error
+          (:code -8 :exact-message "Invalid nblocks. Must be a positive number or -1.")
+        (%hashps node 0))
+      (signals-rpc-error
+          (:code -8 :exact-message "Invalid nblocks. Must be a positive number or -1.")
+        (%hashps node -100))
+      (signals-rpc-error (:code -8 :exact-message "Block does not exist at specified height")
+        (%hashps node 100 11))
+      (signals-rpc-error (:code -8 :exact-message "Block does not exist at specified height")
+        (%hashps node 100 -10))
+      (signals-rpc-error (:code -3 :message "not of expected type number")
+        (%hashps node "a"))
+      ;; -1 is a legal nblocks and -1 a legal height: both mean "the default".
+      (is (plusp (%hashps node -1 -1))))))
+
+(test getnetworkhashps-anchors-at-height-and-expands-nblocks--1
+  "The second argument ANCHORS the window (Core rpc/mining.cpp:74-78): the
+answer is the rate when that block was found, not the rate now, and the
+genesis block reports 0. nblocks -1 means the blocks since the last difficulty
+change, `pb->nHeight % DifficultyAdjustmentInterval() + 1' (:83-85) — 144 on
+regtest, not the 2016 the retarget arithmetic uses (kernel/chainparams.cpp:
+576-577). Neither argument was read at all before.
+
+The work density changes at height 144 so that the -1 window and the default
+120-block window cannot agree by accident; rpc_blockchain.py:539-543 asserts
+exactly this equality."
+  (with-network (:regtest)
+    (let ((node (%hashps-node (loop for h from 1 to 200
+                                    collect (if (<= h 144) 1000000 5000000)))))
+      (is (= 144 (bl.store:difficulty-adjustment-interval :regtest)))
+      (is (= 2016 (bl.store:difficulty-adjustment-interval :mainnet)))
+      ;; Anchored at genesis: no work has been done yet.
+      (is (= 0 (%hashps node 100 0)))
+      ;; Anchored at height 100, entirely inside the low-work stretch:
+      ;; 50 * 1e6 over 50 * 600 s.
+      (is (= (/ 1000000d0 600) (%hashps node 50 100)))
+      ;; The same window at the tip is the high-work stretch.
+      (is (= (/ 5000000d0 600) (%hashps node 50 200)))
+      ;; -1 is 200 % 144 + 1 = 57 blocks, and that is not the 120-block answer.
+      (is (= (%hashps node 57) (%hashps node -1)))
+      (is (/= (%hashps node 120) (%hashps node -1)))
+      ;; A lookup past the chain is clamped to its length, not an error.
+      (is (= (%hashps node 200) (%hashps node 100000))))))
+
+(test getnetworkhashps-divides-as-a-double-over-the-windows-time-span
+  "Two arithmetic details, both Core's (rpc/mining.cpp:91-108).
+
+The result is `workDiff.getdouble() / timeDiff', a DOUBLE. Rounding to an
+integer reported 0 for every rate below 0.5 H/s, which is every rate a regtest
+chain has — mining_basic.py:399 wants 0.00333 and rpc_blockchain.py:534-536
+wants hps*300 within 0.0001 of 1.
+
+And the timespan is max(block time) - min(block time) over the WINDOW, not the
+difference of its endpoints. Block timestamps are not monotonic, so a tip
+stamped before its parent shrinks the endpoint difference (here to a 54th of
+the real span) and inflates the rate by the same factor, or collapses it to 0
+outright."
+  (with-network (:regtest)
+    ;; Regtest's own numbers: work 2 per block, 600 s apart -> 1/300 H/s.
+    (let ((node (%hashps-node (make-list 200 :initial-element 2))))
+      (is (< (abs (- (* 300 (%hashps node)) 1)) 0.0001d0))
+      (is (= (/ 2d0 600) (%hashps node))
+          "an integer division reports 0 for every rate a regtest chain has"))
+    ;; A tip stamped 100 s after the window start, with the real span 5400 s.
+    (let ((node (%hashps-node (make-list 9 :initial-element 1000000)
+                              :tip-time 1000100)))
+      (is (= (/ 9000000d0 (* 8 600)) (%hashps node)))
+      (is (/= (/ 9000000d0 100) (%hashps node))
+          "the endpoint difference inflated the rate by a factor of 48"))
+    ;; And a tip stamped BEFORE the window start still spans the window.
+    (let ((node (%hashps-node (make-list 9 :initial-element 1000000)
+                              :tip-time 999000)))
+      (is (= (/ 9000000d0 (- (+ 1000000 (* 8 600)) 999000)) (%hashps node))))))
