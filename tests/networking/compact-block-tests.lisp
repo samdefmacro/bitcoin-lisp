@@ -45,6 +45,12 @@
 
 ;;;; Protocol Negotiation Tests
 
+(defun %cb-sendcmpct (peer high-bandwidth version)
+  "Deliver a sendcmpct(HIGH-BANDWIDTH, VERSION) to PEER through the handler the
+dispatch table names -- the one place these tests reach for it."
+  (bl.net::handle-sendcmpct
+   peer (subseq (bl.ser:make-sendcmpct-message high-bandwidth version) 24) nil))
+
 (test sendcmpct-updates-peer-version
   "handle-sendcmpct accepts ONLY compact-block version 2 (witness), matching
 Bitcoin Core's CMPCTBLOCKS_VERSION gate. A v1 (non-witness) sendcmpct is ignored:
@@ -55,12 +61,10 @@ is what wedged the testnet4 node ~1800 blocks behind the chain."
     ;; Initially no compact block support
     (is (= (bl.net:peer-compact-block-version peer) 0))
     ;; v1 is ignored — peer stays unsupported (we fall back to full witness blocks)
-    (let ((payload (subseq (bl.ser:make-sendcmpct-message nil 1) 24)))
-      (bl.net::handle-sendcmpct peer payload nil))
+    (%cb-sendcmpct peer nil 1)
     (is (= (bl.net:peer-compact-block-version peer) 0))
     ;; v2 is accepted
-    (let ((payload (subseq (bl.ser:make-sendcmpct-message nil 2) 24)))
-      (bl.net::handle-sendcmpct peer payload nil))
+    (%cb-sendcmpct peer nil 2)
     (is (= (bl.net:peer-compact-block-version peer) 2))))
 
 (test sendcmpct-rejects-invalid-version
@@ -68,25 +72,37 @@ is what wedged the testnet4 node ~1800 blocks behind the chain."
 versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
   (let ((peer (make-mock-peer)))
     ;; v3 (unknown/future) ignored
-    (let ((payload (bl.bytes:with-byte-buf (s)
-                     (bl.bytes:bb-write-u8 s 0)  ; low-bandwidth
-                     (bl.bytes:bb-write-u64-le s 3))))  ; version 3
-      (bl.net::handle-sendcmpct peer payload nil))
+    (%cb-sendcmpct peer nil 3)
     (is (= (bl.net:peer-compact-block-version peer) 0))
     ;; v1 ignored too
-    (let ((payload (subseq (bl.ser:make-sendcmpct-message nil 1) 24)))
-      (bl.net::handle-sendcmpct peer payload nil))
+    (%cb-sendcmpct peer nil 1)
     (is (= (bl.net:peer-compact-block-version peer) 0))))
 
-(test sendcmpct-tracks-high-bandwidth
-  "handle-sendcmpct tracks the high-bandwidth preference from a (v2) sendcmpct."
+(test sendcmpct-high-bandwidth-follows-the-message
+  "The flag recording that the PEER selected US as its BIP152 high-bandwidth
+announcer follows the message in BOTH directions: Core assigns it
+unconditionally (net_processing.cpp:3917-3921), so sendcmpct(1,2) selects us
+and sendcmpct(0,2) deselects us again. The demotion is ordinary traffic rather
+than a corner case — Core sends it itself to whichever peer it drops from
+lNodesAnnouncingHeaderAndIDs (:1317). We used to write the slot only on 1,
+which left getpeerinfo's bip152_hb_from stuck at T for the life of any
+connection whose peer promoted us and later demoted us."
   (let ((peer (make-mock-peer)))
-    (is (null (bl.net:peer-compact-block-high-bandwidth peer)))
-    ;; Receive high-bandwidth request (v2 — the only version we accept)
-    (let ((payload (subseq (bl.ser:make-sendcmpct-message t 2) 24)))
-      (bl.net::handle-sendcmpct peer payload nil))
-    (is (bl.net:peer-compact-block-high-bandwidth peer))
-    (is (= 2 (bl.net:peer-compact-block-version peer)))))
+    (is-false (bl.net:peer-compact-block-high-bandwidth peer))
+    (%cb-sendcmpct peer t 2)
+    (is-true (bl.net:peer-compact-block-high-bandwidth peer))
+    (is (= 2 (bl.net:peer-compact-block-version peer)))
+    ;; The demotion Core itself sends on eviction from its HB list.
+    (%cb-sendcmpct peer nil 2)
+    (is-false (bl.net:peer-compact-block-high-bandwidth peer))
+    (is (= 2 (bl.net:peer-compact-block-version peer))
+        "a demoting sendcmpct must not retract compact-block support")
+    ;; A version we never negotiated returns before either assignment, so it
+    ;; can neither promote nor demote.
+    (%cb-sendcmpct peer t 2)
+    (%cb-sendcmpct peer nil 1)
+    (is-true (bl.net:peer-compact-block-high-bandwidth peer)
+             "sendcmpct(0,1) must not demote: Core returns on the version gate")))
 
 ;;;; Short ID Map Building Tests
 
