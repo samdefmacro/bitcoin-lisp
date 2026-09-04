@@ -378,7 +378,9 @@
   `+min-blocks-to-keep+` and never touches a block under a prune lock
   (assumeutxo, rescans); a coins-cache entry that survives a sync carries
   neither DIRTY nor FRESH, since FRESH claims the base view has no such
-  coin and the sync just wrote it there.
+  coin and the sync just wrote it there; and the restart scan ENUMERATES
+  the blk/rev files that exist instead of counting from 0, because
+  pruning deletes the lowest-numbered pair first and leaves a hole.
 
   Traps: `prune-old-blocks` takes its byte target as an argument because
   the node halves it while a historical chainstate exists -- storage

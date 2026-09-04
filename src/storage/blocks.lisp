@@ -307,13 +307,22 @@ caller fall back or re-derive."
                                   (undo-record-checksum prev-block-hash payload))
                       payload)))))))))))
 
-(defun %existing-rev-file-numbers (store)
-  "The file numbers that actually have a rev?????.dat, ascending."
-  (sort (loop for path in (directory
-                           (merge-pathnames "rev*.dat" (ensure-directories store)))
+(defun %existing-flat-file-numbers (store prefix)
+  "The file numbers that actually have a PREFIX?????.dat, ascending; PREFIX is
+\"blk\" or \"rev\".
+
+Enumerated, not counted from 0 until one is missing: both numberings have
+holes. PRUNE-FLAT-BLOCK-FILE deletes the lowest-numbered blk/rev pair first, so
+the very first name a counting scan reaches is the one that is gone, and a blk
+file holding only never-connected side-chain blocks never gets a rev sibling at
+all."
+  (sort (loop with skip = (length prefix)
+              for path in (directory
+                           (merge-pathnames (concatenate 'string prefix "*.dat")
+                                            (ensure-directories store)))
               for name = (pathname-name path)
-              for number = (and (> (length name) 3)
-                                (parse-integer name :start 3 :junk-allowed t))
+              for number = (and (> (length name) skip)
+                                (parse-integer name :start skip :junk-allowed t))
               when number collect number)
         #'<))
 
@@ -330,13 +339,11 @@ safely go, so a restart does not overwrite live undo data."
         (key (block-store-xor-key store))
         (magic (block-network-magic))
         (bytes 0))
-    ;; Enumerated, not counted from 0 until one is missing: rev numbering has
-    ;; holes. Pruning deletes the lowest-numbered files first, and a blk file
-    ;; holding only never-connected side-chain blocks never gets a rev sibling
-    ;; at all. Stopping at the first gap would leave every file above it with
-    ;; an UNDO-SIZE of 0, and the next undo record written there would
-    ;; preallocate a chunk of zeros over the records already in it.
-    (dolist (file (%existing-rev-file-numbers store))
+    ;; Enumerated (see %EXISTING-FLAT-FILE-NUMBERS): stopping at the first gap
+    ;; would leave every file above it with an UNDO-SIZE of 0, and the next
+    ;; undo record written there would preallocate a chunk of zeros over the
+    ;; records already in it.
+    (dolist (file (%existing-flat-file-numbers store "rev"))
       (let ((path (flat-file-name seq (make-flat-file-pos file 0))))
           (with-open-file (in path :direction :input
                                       :element-type '(unsigned-byte 8))
@@ -528,46 +535,58 @@ This is most of what a full -reindex does, and it is cheap: each record is
 found by hopping over the previous one's length, and identifying a block needs
 only its 80-byte header, never a full deserialization. Walking a file stops at
 the first header that is not a record — which is exactly what the preallocated
-zero tail of the file currently being appended to looks like."
+zero tail of the file currently being appended to looks like.
+
+Core does not scan at all outside -reindex: LoadBlockIndexGuts restores every
+CBlockIndex's nFile/nDataPos from the block-index database, so a hole in the
+blk numbering is simply irrelevant to it (node/blockstorage.cpp:120-145 and
+:529-610). Re-deriving the map from the files themselves is the same thing by
+another route, but only if it ENUMERATES the files that exist — the numbering
+has holes for exactly the reason %SCAN-FLAT-UNDO-FILES was already given
+%EXISTING-FLAT-FILE-NUMBERS. Counting from 0 and stopping at the first missing
+name lost the whole store on the first restart after a prune: every block in
+the surviving higher-numbered files went missing from the index (unservable,
+unreadable for undo, invisible to crash recovery), the byte total read 0 so
+automatic pruning stopped, and the cursor rewound to (0, 0) so a later rollover
+would open a live file with :IF-EXISTS :OVERWRITE at offset 0."
   (let ((seq (%blk-seq store))
         (key (block-store-xor-key store))
         (magic (block-network-magic))
         (bytes 0)
         (last-file 0)
         (last-pos 0))
-    (loop for file from 0
-          for path = (flat-file-name seq (make-flat-file-pos file 0))
-          while (probe-file path)
-          do (with-open-file (in path :direction :input
-                                      :element-type '(unsigned-byte 8))
-               (let ((size (file-length in))
-                     (offset 0)
-                     (header (make-array +storage-header-bytes+
-                                         :element-type '(unsigned-byte 8)))
-                     (hdr80 (make-array 80 :element-type '(unsigned-byte 8))))
-                 (loop
-                   (when (> (+ offset +storage-header-bytes+) size) (return))
-                   (file-position in offset)
-                   (read-sequence header in)
-                   (obfuscate! header key :key-offset offset)
-                   (multiple-value-bind (found length) (parse-flat-record-header header)
-                     (unless (and (equalp found magic)
-                                  (plusp length)
-                                  (>= length 80)
-                                  (<= (+ offset +storage-header-bytes+ length) size))
-                       (return))
-                     (read-sequence hdr80 in)
-                     (obfuscate! hdr80 key
-                                 :key-offset (+ offset +storage-header-bytes+))
-                     (let ((hash (bl.crypto:hash256 hdr80)))
-                       (setf (gethash hash (block-store-index store))
-                             (make-flat-file-pos file (+ offset +storage-header-bytes+))))
-                     (incf bytes (+ +storage-header-bytes+ length))
-                     (setf offset (+ offset +storage-header-bytes+ length)
-                           last-file file
-                           last-pos offset)))))
-          finally (setf (block-store-cursor-file store) last-file
-                        (block-store-cursor-pos store) last-pos))
+    (dolist (file (%existing-flat-file-numbers store "blk"))
+      (let ((path (flat-file-name seq (make-flat-file-pos file 0))))
+        (with-open-file (in path :direction :input
+                                 :element-type '(unsigned-byte 8))
+          (let ((size (file-length in))
+                (offset 0)
+                (header (make-array +storage-header-bytes+
+                                    :element-type '(unsigned-byte 8)))
+                (hdr80 (make-array 80 :element-type '(unsigned-byte 8))))
+            (loop
+              (when (> (+ offset +storage-header-bytes+) size) (return))
+              (file-position in offset)
+              (read-sequence header in)
+              (obfuscate! header key :key-offset offset)
+              (multiple-value-bind (found length) (parse-flat-record-header header)
+                (unless (and (equalp found magic)
+                             (plusp length)
+                             (>= length 80)
+                             (<= (+ offset +storage-header-bytes+ length) size))
+                  (return))
+                (read-sequence hdr80 in)
+                (obfuscate! hdr80 key
+                            :key-offset (+ offset +storage-header-bytes+))
+                (let ((hash (bl.crypto:hash256 hdr80)))
+                  (setf (gethash hash (block-store-index store))
+                        (make-flat-file-pos file (+ offset +storage-header-bytes+))))
+                (incf bytes (+ +storage-header-bytes+ length))
+                (setf offset (+ offset +storage-header-bytes+ length)
+                      last-file file
+                      last-pos offset)))))))
+    (setf (block-store-cursor-file store) last-file
+          (block-store-cursor-pos store) last-pos)
     bytes))
 
 (defun init-block-store (base-path)
@@ -886,7 +905,13 @@ Returns the number of blocks pruned."
         ;; file and the test is that its ENTIRE height range sits inside the
         ;; window. Legacy per-block files are handled by the walk below; a
         ;; store mid-transition holds both.
-        (dolist (file (%prunable-flat-files store (1+ start) min-keep-height))
+        ;;
+        ;; The floor is Core's prune_start, NOT the walk cursor: a file is
+        ;; selected by the range it holds, so a cursor that has already marched
+        ;; past a retained file's first height would exclude that file forever.
+        (dolist (file (%prunable-flat-files
+                       store (chain-state-prune-range-start chain-state)
+                       min-keep-height))
           (when (<= (block-store-total-bytes store) target-bytes)
             (return))
           (let ((info (gethash file (block-store-file-info store))))
@@ -958,7 +983,9 @@ Returns the number of blocks pruned."
     ;; format: every block went to PRUNE-BLOCK, which refuses for a flat record
     ;; and returns NIL, so the RPC reported success and freed nothing. That is
     ;; what blocked rolling the flat format out to the pruned mainnet node.
-    (dolist (file (%prunable-flat-files store 0 effective-target))
+    (dolist (file (%prunable-flat-files
+                   store (chain-state-prune-range-start chain-state)
+                   effective-target))
       (let* ((info (gethash file (block-store-file-info store)))
              (last (and info (block-file-info-height-last info)))
              (blocks (if info (block-file-info-blocks info) 0)))
