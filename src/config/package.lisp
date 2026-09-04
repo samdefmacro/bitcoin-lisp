@@ -85,9 +85,13 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:render-json-value
    #:parse-settings-json
    #:render-settings-json
-   #:settings-alist->config-alist
+   #:settings-config-rows
    #:validate-settings-values
-   #:unknown-settings-keys))
+   #:unknown-settings-keys
+   #:setting-row-negated-p
+   #:merge-setting
+   #:merge-settings-list
+   #:merged-config-alist))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

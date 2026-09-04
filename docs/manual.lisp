@@ -242,7 +242,11 @@
   command-line occurrence and its FIRST config-file one. A config-file key
   carries its own section when it is dotted (`main.rpcport=8332`), so a
   line's section is CONF-SETTINGS-ROWS' answer rather than the `[header]`
-  above it.
+  above it. Every source is parsed into settings ROWS -- (name value json)
+  -- and MERGED-CONFIG-ALIST resolves each option name across all four in
+  Core's precedence order; a NEGATION (`-nofoo`, the JSON `false`) erases
+  the values before it in its source and blocks the sources below it,
+  which is why the merge cannot be an APPEND of the four alists.
 
   Traps: before changing an option, read Core's READER for it (GetArg,
   GetArgs, GetBoolArg decide the semantics, not the declaration); moving
@@ -263,6 +267,10 @@
   (bitcoin-lisp.config:interpret-arg function)
   (bitcoin-lisp.config:conf-settings-rows function)
   (bitcoin-lisp.config:parse-bitcoin-conf function)
+  (bitcoin-lisp.config:settings-config-rows function)
+  (bitcoin-lisp.config:merged-config-alist function)
+  (bitcoin-lisp.config:merge-setting function)
+  (bitcoin-lisp.config:merge-settings-list function)
   (bitcoin-lisp.config:resolve-network-from-config function)
   (bitcoin-lisp.config:parse-settings-json function)
   (bitcoin-lisp.config:render-settings-json function)

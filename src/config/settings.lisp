@@ -115,16 +115,24 @@ setting in the order given (Core WriteSettings, common/settings.cpp:123-142)."
               (%json-escape (car cell)) (render-json-value (cdr cell))))
     (format out "~%}~%")))
 
-(defun settings-alist->config-alist (settings)
-  "SETTINGS (name -> parsed JSON value) as the (name . string) cells the rest
-of the config layer speaks. A JSON false is Core's negation, i.e. \"0\"."
+(defun settings-config-rows (settings)
+  "SETTINGS (name -> parsed JSON value) as the settings ROWS — (name
+string-value json) — that MERGED-CONFIG-ALIST resolves alongside the command
+line and the config file. This is Core's `m_settings.rw_settings` source
+(settings.cpp:50-53).
+
+A JSON false is Core's negation: it reaches the option readers as \"0\" and it
+is what ends a settings span, which is why the row carries the stored JSON as
+well as the string. The values come straight from yason's parser, so
+RENDER-JSON-VALUE gives back exactly what Core would have written."
   (loop for (name . value) in settings
-        collect (cons name
+        collect (list name
                       (cond ((eq value 'yason:false) "0")
                             ((eq value 'yason:true) "1")
                             ((null value) "0")
                             ((stringp value) value)
-                            (t (render-json-value value))))))
+                            (t (render-json-value value)))
+                      (render-json-value value))))
 
 (defun validate-settings-values (settings)
   "The Core-worded init error a settings file's VALUES earn, or NIL.

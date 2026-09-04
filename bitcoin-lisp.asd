@@ -66,7 +66,8 @@ which the chain above supplies (src/config-options.lisp)."
                              (:file "values")     ; one option value: ints, bools, money, hex, proxies, binds
                              (:file "args")       ; the command line
                              (:file "conf")       ; bitcoin.conf
-                             (:file "settings"))))) ; settings.json
+                             (:file "settings")   ; settings.json
+                             (:file "merge"))))) ; one merged alist from all three
 
 (defsystem "bitcoin-lisp/kv"
   :description "Persistence primitives: the LevelDB binding, flat file
