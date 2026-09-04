@@ -213,3 +213,35 @@ being the canonical single push Core requires."
       (%sf-p2sh-spend (%sf-script "00" "21" +sf-pubkey-hex+ "ac" "91"))
     (is (equal '(t nil) (%sf-verify script-sig script-pubkey "P2SH")))
     (is (equal '(nil :error) (%sf-verify script-sig script-pubkey "P2SH,CONST_SCRIPTCODE")))))
+
+(test const-scriptcode-rejects-a-codeseparator-in-every-legacy-script
+  ;; Core's OP_CODESEPARATOR check sits in EvalScript's opcode loop ABOVE the
+  ;; fExec guard (interpreter.cpp:474-476), and VerifyScript runs EvalScript
+  ;; three times per legacy input: scriptSig (:2020), scriptPubKey (:2023) and
+  ;; the P2SH redeem script (:2069). One in any of them is rejected, executed
+  ;; or not. Only the scriptPubKey arm used to be checked.
+  (let ((codesep-then-true (%sf-script "ab" "51"))          ; CODESEPARATOR 1
+        (true-script (%sf-script "51"))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (destructuring-bind (p2sh-sig p2sh-pubkey) (%sf-p2sh-spend codesep-then-true)
+      (is (equal '(nil :op-codeseparator)
+                 (%sf-verify empty codesep-then-true "CONST_SCRIPTCODE")))
+      (is (equal '(nil :op-codeseparator)
+                 (%sf-verify codesep-then-true true-script "CONST_SCRIPTCODE")))
+      ;; The redeem script is the arm a spender can reach: a scriptSig carrying
+      ;; OP_CODESEPARATOR is not push-only and is non-standard already.
+      (is (equal '(nil :op-codeseparator)
+                 (%sf-verify p2sh-sig p2sh-pubkey "P2SH,CONST_SCRIPTCODE")))
+      ;; Policy, not consensus: all three spend fine under the block flags.
+      (is (equal '(t nil) (%sf-verify empty codesep-then-true "")))
+      (is (equal '(t nil) (%sf-verify codesep-then-true true-script "")))
+      (is (equal '(t nil) (%sf-verify p2sh-sig p2sh-pubkey "P2SH"))))))
+
+(test const-scriptcode-codeseparator-check-ignores-fexec-and-push-payloads
+  ;; Above the fExec guard means an unexecuted branch counts...
+  (let ((unexecuted (%sf-script "00" "63" "ab" "68" "51"))  ; 0 IF CODESEP ENDIF 1
+        ;; ...and 0xab inside a push payload is data, not an opcode.
+        (payload (%sf-script "01ab" "75" "51")))            ; <0xab> DROP 1
+    (is (equal '(nil :op-codeseparator) (%sf-verify (%sf-script "") unexecuted "CONST_SCRIPTCODE")))
+    (is (equal '(t nil) (%sf-verify (%sf-script "") unexecuted "")))
+    (is (equal '(t nil) (%sf-verify (%sf-script "") payload "CONST_SCRIPTCODE")))))
