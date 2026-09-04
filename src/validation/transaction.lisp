@@ -777,6 +777,7 @@ transaction is refused even on a node told to relay non-standard ones."
     (:tx-size-small            . "tx-size-small")                    ; :814
     (:non-final                . "non-final")                        ; :820
     (:already-in-mempool       . "txn-already-in-mempool")           ; :825
+    (:same-nonwitness-data-in-mempool . "txn-same-nonwitness-data-in-mempool") ; :829
     (:already-known            . "txn-already-known")                ; :862
     (:missing-input            . "bad-txns-inputs-missingorspent")   ; :866
     (:non-bip68-final          . "non-BIP68-final")                  ; :888
@@ -866,6 +867,72 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
         (values nil :block-script-verify-flag-failed))))
   (values t nil))
 
+(defun %mempool-precheck-context-free (tx)
+  "The first four checks of Core's MemPoolAccept::PreChecks (validation.cpp:
+798-815) — the ones that read only the transaction, before any chain or pool
+state. Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD).
+
+PRECHECK ORDER IS CORE'S ORDER, and it is observable: each of these rejects a
+transaction the next one would also reject, so whichever runs first is the
+reason the client is told. The functional suite reads those reasons, and
+mempool_accept.py:302 is a transaction that is BOTH non-standard and under 65
+bytes."
+  ;; 1. CheckTransaction (:798) — consensus structure.
+  (multiple-value-bind (valid error) (validate-transaction-structure tx)
+    (unless valid
+      (return-from %mempool-precheck-context-free (values nil error))))
+
+  ;; 2. Coinbase is only valid in a block (:802-804), and AFTER
+  ;;    CheckTransaction: a malformed coinbase is reported as malformed.
+  (when (and (= (length (bl.ser:transaction-inputs tx)) 1)
+             (bl.ser:coinbase-input-p
+              (aref (bl.ser:transaction-inputs tx) 0)))
+    (return-from %mempool-precheck-context-free
+      (values nil :coinbase-not-allowed)))
+
+  ;; 3. The standardness battery, behind Core's single require_standard flag
+  ;;    (-acceptnonstdtxn, :807-810). Everything it covers lives in
+  ;;    %IS-STANDARD-TX; the size check below does not, because Core's does not.
+  (when *require-standard*
+    (multiple-value-bind (ok reason) (%is-standard-tx tx)
+      (unless ok
+        (return-from %mempool-precheck-context-free (values nil reason)))))
+
+  ;; 4. Minimum non-witness size (:813-815, CVE-2017-12842). LAST of the four,
+  ;;    and outside require_standard so it holds even for a node told to relay
+  ;;    non-standard transactions. SERIALIZE-TRANSACTION emits the legacy
+  ;;    (non-witness) encoding, so its length is the stripped size Core measures.
+  (when (< (length (bl.ser:serialize-transaction tx))
+           +min-standard-tx-nonwitness-size+)
+    (return-from %mempool-precheck-context-free (values nil :tx-size-small)))
+
+  (values t nil))
+
+(defun %mempool-lock-context (chain-state current-height)
+  "The tip context Core's PreChecks judges both locktime rules against.
+A mempool transaction is evaluated as if it were in the NEXT block (tip+1)
+with the tip's median-time-past, so the pool never holds a transaction that
+cannot yet be mined. Returns (VALUES EVAL-HEIGHT LOCKTIME-TIME MTP
+CSV-ACTIVE).
+
+Core reads these off one CBlockIndex (CheckFinalTxAtTip and
+CheckSequenceLocksAtTip both take the tip); ours are two calls at two
+positions in PreChecks — \"non-final\" before the mempool duplicate probe and
+BIP68 after the input lookups — so the context they share is derived here
+rather than at either site."
+  (let* ((eval-height (1+ current-height))
+         (mtp (or (compute-median-time-past
+                   chain-state (bl.store:best-block-hash chain-state))
+                  0))
+         (csv-active (>= eval-height (get-csv-activation-height bl:*network*))))
+    ;; BIP113: locktime compares against MTP once CSV is active (true on all
+    ;; our networks at tip); fall back to wall-clock for the pre-activation
+    ;; window.
+    (values eval-height
+            (if csv-active mtp (bl.ser:get-unix-time))
+            mtp
+            csv-active)))
+
 (defun validate-transaction-for-mempool (tx utxo-set mempool current-height
                                          &key package-coins skip-fee-check chain-state
                                               bypass-limits skip-rbf-check
@@ -917,49 +984,48 @@ contexts, validation.cpp:487-497) lets a TRUC descendant-limit failure fall
 through to the RBF path when SINGLE-TRUC-CHECKS identifies an evictable
 sibling: the sibling is added to the conflict set and replacement economics
 decide (Core PreChecks, validation.cpp:950-970)."
-  ;; PRECHECK ORDER IS CORE'S ORDER (validation.cpp:798-815), and it is
-  ;; observable: each of these rejects a transaction the next one would also
-  ;; reject, so whichever runs first is the reason the client is told. The
-  ;; functional suite reads those reasons, and mempool_accept.py:302 is a
-  ;; transaction that is BOTH non-standard and under 65 bytes.
+  ;; 1-4, the checks that read only the transaction (Core validation.cpp:
+  ;; 798-815). See %MEMPOOL-PRECHECK-CONTEXT-FREE for the order and why it is
+  ;; observable.
+  (multiple-value-bind (ok reason) (%mempool-precheck-context-free tx)
+    (unless ok
+      (return-from validate-transaction-for-mempool (values nil reason nil))))
+
+  ;; 5. Relay finality (:817-821, CheckFinalTxAtTip). It runs HERE, ahead of
+  ;;    the mempool duplicate probe and of the coins lookup, and the position
+  ;;    is the point: a transaction that cannot be mined into the next block
+  ;;    is rejected as non-final EVEN IF its parents are unknown to us. Report
+  ;;    :missing-input instead and the transaction enters the orphanage
+  ;;    (src/networking/protocol.lisp branches on that one keyword) and draws
+  ;;    getdatas for parents Core never asks for; Core instead remembers the
+  ;;    wtxid in RecentRejectsFilter (txdownloadman_impl.cpp:468).
   ;;
-  ;; 1. CheckTransaction (:798) — consensus structure.
-  (multiple-value-bind (valid error)
-      (validate-transaction-structure tx)
-    (unless valid
-      (return-from validate-transaction-for-mempool
-        (values nil error nil))))
+  ;;    BIP68 sequence locks are NOT part of this: they need the spent coins'
+  ;;    heights, and Core runs them further down at :886-889, after the input
+  ;;    lookups. See the second half of the pair below.
+  (when chain-state
+    (multiple-value-bind (eval-height locktime-time)
+        (%mempool-lock-context chain-state current-height)
+      (unless (check-transaction-final tx eval-height locktime-time)
+        (return-from validate-transaction-for-mempool
+          (values nil :non-final nil)))))
 
-  ;; 2. Coinbase is only valid in a block (:802-804), and AFTER
-  ;;    CheckTransaction: a malformed coinbase is reported as malformed.
-  (when (and (= (length (bl.ser:transaction-inputs tx)) 1)
-             (bl.ser:coinbase-input-p
-              (aref (bl.ser:transaction-inputs tx) 0)))
-    (return-from validate-transaction-for-mempool
-      (values nil :coinbase-not-allowed nil)))
-
-  ;; 3. The standardness battery, behind Core's single require_standard flag
-  ;;    (-acceptnonstdtxn, :807-810). Everything it covers lives in
-  ;;    %IS-STANDARD-TX; the size check below does not, because Core's does not.
-  (when *require-standard*
-    (multiple-value-bind (ok reason) (%is-standard-tx tx)
-      (unless ok
-        (return-from validate-transaction-for-mempool (values nil reason nil)))))
-
-  ;; 4. Minimum non-witness size (:813-815, CVE-2017-12842). LAST of the four,
-  ;;    and outside require_standard so it holds even for a node told to relay
-  ;;    non-standard transactions. SERIALIZE-TRANSACTION emits the legacy
-  ;;    (non-witness) encoding, so its length is the stripped size Core measures.
-  (when (< (length (bl.ser:serialize-transaction tx))
-           +min-standard-tx-nonwitness-size+)
-    (return-from validate-transaction-for-mempool
-      (values nil :tx-size-small nil)))
-
-  ;; Check for duplicate in mempool
-  (let ((txid (bl.ser:transaction-hash tx)))
-    (when (bl.mp:mempool-has mempool txid)
-      (return-from validate-transaction-for-mempool
-        (values nil :already-in-mempool nil))))
+  ;; 6. Already in the mempool (:823-830) — two probes, in Core's order, and
+  ;;    they say different things. The WTXID probe means we hold this exact
+  ;;    transaction, byte for byte. Only if that misses does the TXID probe
+  ;;    run, and a hit there means we hold a transaction with the same
+  ;;    non-witness data under a different witness: the submitter's witness
+  ;;    was replaced somewhere in transit, which is the only signal Core gives
+  ;;    that malleation is happening (mempool_accept_wtxid.py asserts on the
+  ;;    exact string). A txid hit is a superset of a wtxid hit, so a single
+  ;;    txid probe rejects the same set — it just cannot tell the two apart.
+  (cond
+    ((bl.mp:mempool-get-by-wtxid mempool (bl.ser:transaction-wtxid tx))
+     (return-from validate-transaction-for-mempool
+       (values nil :already-in-mempool nil)))
+    ((bl.mp:mempool-has mempool (bl.ser:transaction-hash tx))
+     (return-from validate-transaction-for-mempool
+       (values nil :same-nonwitness-data-in-mempool nil))))
 
   ;; Conflicts with existing mempool entries are handled by BIP125 RBF after
   ;; the fee is known (see the fee section below).
@@ -992,25 +1058,17 @@ decide (Core PreChecks, validation.cpp:950-970)."
       (return-from validate-transaction-for-mempool
         (values nil :missing-input nil)))
 
-    ;; Relay finality + BIP68 sequence-locks, evaluated as if the tx were in
-    ;; the NEXT block (tip+1) with the tip's median-time-past (BIP113) —
-    ;; Bitcoin Core's PreChecks "non-final" / "non-BIP68-final". Without this
-    ;; the mempool accepts timelocked txs that can't yet be mined. Same helpers
-    ;; the block connect path uses; gated on CHAIN-STATE being supplied.
+    ;; BIP68 sequence-locks, the second half of the finality pair (the first,
+    ;; "non-final", ran before the mempool probe above). This half needs the
+    ;; spent coins' heights, so Core runs it only here, once the inputs are in
+    ;; the view (validation.cpp:886-889) — and immediately BEFORE CheckTxInputs
+    ;; (:892). Evaluated as if the tx were in the NEXT block (tip+1) with the
+    ;; tip's median-time-past (BIP113); same helpers the block connect path
+    ;; uses, gated on CHAIN-STATE being supplied.
     (when chain-state
-      (let* ((eval-height (1+ current-height))
-             (tip-hash (bl.store:best-block-hash chain-state))
-             (mtp (or (compute-median-time-past chain-state tip-hash) 0))
-             (csv-active (>= eval-height
-                             (get-csv-activation-height bl:*network*)))
-             ;; BIP113: locktime compares against MTP once CSV is active
-             ;; (true on all our networks at tip); fall back to wall-clock
-             ;; for the pre-activation window.
-             (locktime-time (if csv-active mtp
-                                (bl.ser:get-unix-time))))
-        (unless (check-transaction-final tx eval-height locktime-time)
-          (return-from validate-transaction-for-mempool
-            (values nil :non-final nil)))
+      (multiple-value-bind (eval-height locktime-time mtp csv-active)
+          (%mempool-lock-context chain-state current-height)
+        (declare (ignore locktime-time))
         (when csv-active
           (unless (check-sequence-locks tx utxo-set eval-height mtp chain-state
                                         :pending-utxos extra-coins)

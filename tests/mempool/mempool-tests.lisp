@@ -1260,6 +1260,108 @@ PreChecks). Without chain-state the finality check is skipped."
           (declare (ignore valid))
           (is (not (eq err :non-final))))))))
 
+;;;; PreChecks ORDER: which rule a transaction that breaks several is told about
+;;;;
+;;;; Every check in Core's MemPoolAccept::PreChecks returns on first failure, so
+;;;; the accepted set does not depend on their order -- but the reason a caller
+;;;; is given does, and so does what our own P2P layer then DOES with the
+;;;; transaction. The three tests below pin the three orderings that were wrong.
+
+(test mempool-non-final-is-decided-before-the-inputs-are-looked-up
+  "Core runs CheckFinalTxAtTip at validation.cpp:817-821 -- before the mempool
+duplicate probe (:823) and before the coin-availability loop that yields
+TX_MISSING_INPUTS (:866). So a transaction that is BOTH non-final and naming
+parents we do not have is \"non-final\", never \"missing-inputs\".
+
+The vocabulary is the smaller half of it: :missing-input is the one keyword
+src/networking/protocol.lisp routes to the orphanage, so reporting it here puts
+a transaction Core drops outright into our orphan pool and spends parent-getdata
+slots fetching parents that may not exist. Core instead remembers the wtxid in
+RecentRejectsFilter (txdownloadman_impl.cpp:468)."
+  (let ((bl:*network* :regtest))
+    (multiple-value-bind (state utxo tip-height)
+        (%mempool-final-fixture "test-mp-nonfinal-order/")
+      (let* ((mempool (bl.mp:make-mempool))
+             (final (make-mempool-test-tx :input-id 91))
+             (prevout (bl.ser:tx-in-previous-output
+                       (elt (bl.ser:transaction-inputs final) 0)))
+             ;; Same unknown prevout, but a far-future locktime and a non-final
+             ;; sequence: two rules broken at once.
+             (non-final (bl.ser:make-transaction
+                         :version 1
+                         :inputs (vector (bl.ser:make-tx-in
+                                          :previous-output prevout
+                                          :script-sig (make-array
+                                                       10 :element-type '(unsigned-byte 8)
+                                                          :initial-element 0)
+                                          :sequence 0))
+                         :outputs (bl.ser:transaction-outputs final)
+                         :lock-time 9999999)))
+        ;; The prevout is deliberately absent from the UTXO set.
+        (is (eq :non-final
+                (nth-value 1 (bl.val:validate-transaction-for-mempool
+                              non-final utxo mempool tip-height
+                              :chain-state state))))
+        ;; Control: a FINAL transaction naming the same unknown prevout still
+        ;; reports :missing-input, so the orphan route is intact and the
+        ;; assertion above is about the ORDER, not about finality swallowing
+        ;; every missing-input verdict.
+        (is (eq :missing-input
+                (nth-value 1 (bl.val:validate-transaction-for-mempool
+                              final utxo mempool tip-height
+                              :chain-state state))))))))
+
+(test mempool-duplicate-probe-tells-a-malleated-witness-apart
+  "Core probes the pool twice, in this order (validation.cpp:823-830):
+exists(wtxid) -> \"txn-already-in-mempool\" for the byte-identical transaction,
+and only then exists(txid) -> \"txn-same-nonwitness-data-in-mempool\" for a
+same-txid-different-witness variant of something we already hold.
+
+A txid hit is a strict superset of a wtxid hit, so one txid probe rejects the
+same set -- it just cannot tell the two apart, and that distinction is the only
+signal a submitter gets that its witness was replaced in transit.
+refs/bitcoin/test/functional/mempool_accept_wtxid.py:66-72 asserts on the exact
+string."
+  (multiple-value-bind (utxo mempool chain-state funding-txid)
+      (make-package-fixture :current-height 200)
+    (flet ((spend (&key witness)
+             (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint
+                                                 :hash funding-txid :index 0)
+                               ;; push the OP_TRUE redeem script
+                               :script-sig (%spk #x01 #x51)
+                               :sequence #xFFFFFFFF))
+              :outputs (vector (bl.ser:make-tx-out
+                                :value 99000000
+                                :script-pubkey (%p2pkh-spk)))
+              :witness witness
+              :lock-time 0)))
+      (let* ((pooled (spend))
+             (malleated (spend :witness (vector (list (%spk #x01))))))
+        (bl.mp:accept-validated-tx mempool (bl.ser:transaction-hash pooled)
+                                   pooled 1000 200)
+        ;; The premise: same txid, different wtxid, and the variant's wtxid is
+        ;; genuinely absent from the pool -- otherwise the first probe would hit
+        ;; and this test would pass for the wrong reason.
+        (is (equalp (bl.ser:transaction-hash pooled)
+                    (bl.ser:transaction-hash malleated)))
+        (is (not (equalp (bl.ser:transaction-wtxid pooled)
+                         (bl.ser:transaction-wtxid malleated))))
+        (is-false (bl.mp:mempool-get-by-wtxid
+                   mempool (bl.ser:transaction-wtxid malleated)))
+        (is (eq :same-nonwitness-data-in-mempool
+                (nth-value 1 (bl.val:validate-transaction-for-mempool
+                              malleated utxo mempool 200
+                              :chain-state chain-state))))
+        ;; Control: resubmitting the byte-identical transaction still takes the
+        ;; wtxid branch.
+        (is (eq :already-in-mempool
+                (nth-value 1 (bl.val:validate-transaction-for-mempool
+                              pooled utxo mempool 200
+                              :chain-state chain-state))))))))
+
 ;;;; Wave 8A: witness-stripped classification + coinbase maturity at tip+1
 
 (test spends-non-anchor-witness-program-p-cases
