@@ -452,8 +452,15 @@ cache above wraps exactly the expensive part and nothing else."
                         bits))
          (challenge (bl.val:signet-challenge-for-network network)))
       `(("blocks" . ,height)
-        ("currentblockweight" . ,(if template (bl.mining:block-template-total-weight template) 0))
-        ("currentblocktx" . ,(if template (length (bl.mining:block-template-transactions template)) 0))
+        ;; OMITTED, not zero, until a template has been assembled: Core's
+        ;; m_last_block_weight / m_last_block_num_txs are std::optional and
+        ;; getmininginfo pushes each key only when it holds a value
+        ;; (rpc/mining.cpp:466-467, node/miner.h:95-99). A caller must be able
+        ;; to tell "nothing assembled yet" from "the last template held no
+        ;; transactions", and 0 says both.
+        ,@(when template
+            `(("currentblockweight" . ,(bl.mining:block-template-total-weight template))
+              ("currentblocktx" . ,(length (bl.mining:block-template-transactions template)))))
         ("bits" . ,(%bits-hex bits))
         ("difficulty" . ,(%difficulty-from-bits bits))
         ("target" . ,(%bits-to-target-hex bits))
