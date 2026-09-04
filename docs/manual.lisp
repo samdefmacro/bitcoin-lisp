@@ -720,8 +720,14 @@
   Invariants: the template honours `-blockmaxweight`,
   `-blockreservedweight` and `-blockmintxfee` exactly as Core's
   BlockAssembler does; getblocktemplate follows the miner contract of
-  BIP22/BIP23. Trap: the reserved weight exists because the header and
-  the transaction-count varint count toward the block weight."
+  BIP22/BIP23.
+
+  Traps: the reserved weight exists because the header and the
+  transaction-count varint count toward the block weight. MINE-BLOCK
+  returns the number of FAILED nonces as a second value, because
+  `maxtries' is one budget for a whole generate* call rather than a fresh
+  allowance per block, and an exhausted budget returns the blocks already
+  mined instead of erroring."
   (bitcoin-lisp.mining package)
   (bitcoin-lisp.mining:assemble-block-template function)
   (bitcoin-lisp.mining:block-template class)

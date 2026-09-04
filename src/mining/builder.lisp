@@ -120,13 +120,28 @@ assembly against synthetic chain states with no coins view)."
     (values block template)))
 
 (defun mine-block (block &key (max-tries 10000000))
-  "Grind the header nonce until BLOCK meets its PoW target. Returns BLOCK (header
-mutated) on success, or NIL if MAX-TRIES is exhausted. Trivial on regtest, where
-nonce 0 almost always satisfies the target."
-  (let ((header (bl.ser:bitcoin-block-header block)))
-    (dotimes (nonce (min max-tries #x100000000) nil)
+  "Grind the header nonce until BLOCK meets its PoW target. Returns
+(VALUES BLOCK TRIES) with the header mutated on success, and (VALUES NIL TRIES)
+when MAX-TRIES runs out or the node is asked to stop. Trivial on regtest, where
+nonce 0 almost always satisfies the target.
+
+TRIES is the number of nonces that FAILED the target, which is what a caller
+holding one budget across several blocks subtracts: Core threads a single
+`uint64_t& max_tries' through every block generateBlocks mines and decrements
+it only on a failed hash (rpc/mining.cpp:142-147), so `generatetoaddress(10,
+addr, 1)' is one try for the whole call, not one per block.
+
+The grind polls BL:INTERRUPT-REQUESTED-P, Core's `!chainman.m_interrupt' in the
+same loop condition (rpc/mining.cpp:142): off regtest this loop is the
+longest-running thing an RPC worker does, and without the poll it keeps a
+worker busy straight through shutdown."
+  (let ((header (bl.ser:bitcoin-block-header block))
+        (limit (min max-tries #x100000000)))
+    (dotimes (nonce limit (values nil limit))
+      (when (bl:interrupt-requested-p)
+        (return (values nil nonce)))
       ;; block-header-hash caches; clear it so each nonce is actually rehashed.
       (setf (bl.ser:block-header-nonce header) nonce
             (bl.ser:block-header-cached-hash header) nil)
       (when (bl.val:check-proof-of-work header)
-        (return block)))))
+        (return (values block nonce))))))
