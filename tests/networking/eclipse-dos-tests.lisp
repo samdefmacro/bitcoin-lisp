@@ -202,6 +202,18 @@ the 1000-token soft cap."
                          :port 8333)
                         now))))
 
+(defun %addr-payload (ips &key (services 1) (port 8333))
+  "A v1 addr message payload (no header) announcing each 16-byte IP in IPS
+with a fresh timestamp."
+  (let ((now (bl.ser:get-unix-time)))
+    (coerce (bl.bytes:with-byte-buf (s)
+              (bl.bytes:bb-write-varint s (length ips))
+              (dolist (ip ips)
+                (bl.ser:write-net-addr
+                 s (bl.ser:make-net-addr :services services :ip ip :port port)
+                 :with-timestamp t :timestamp now)))
+            '(simple-array (unsigned-byte 8) (*)))))
+
 (test addr-beyond-bucket-are-dropped
   "Addresses beyond the token bucket are dropped, not queued: with a bucket of
 5, exactly 5 of 20 announced addresses are processed and 15 are rate-limited,
@@ -283,19 +295,63 @@ net_processing.cpp:3772)."
 handle-addrv2 ignore its addresses entirely (Core SetupAddressRelay)."
   (let ((book (bl.net:make-address-book))
         (p (bl.net:make-peer :conn-type :block-relay))
-        (payload (coerce
-                  (bl.bytes:with-byte-buf (s)
-                    (bl.bytes:bb-write-varint s 1)
-                    (bl.ser:write-net-addr
-                     s (bl.ser:make-net-addr
-                        :services 1
-                        :ip (bl.net:ipv4-to-mapped-ipv6 10 0 0 1)
-                        :port 8333)
-                     :with-timestamp t
-                     :timestamp (bl.ser:get-unix-time)))
-                  '(simple-array (unsigned-byte 8) (*)))))
+        (payload (%addr-payload (list (bl.net:ipv4-to-mapped-ipv6 10 0 0 1)))))
     (is (= 0 (bl.net:handle-addr p payload (bl.ctx:make-node-context :address-book book))))
     (is (= 0 (bl.net:address-book-count book)))))
+
+(test gossiped-banned-addresses-are-neither-stored-nor-relayed
+  "Core skips a banned or discouraged address inside the per-address ADDR loop:
+`if (m_banman && (IsDiscouraged(addr) || IsBanned(addr))) continue;`, under the
+comment \"Do not process banned/discouraged addresses beyond remembering we
+received them\" (net_processing.cpp:4094-4097). That continue skips BOTH the
+RelayAddress call (:4102) and the vAddrOk push that feeds addrman (:4106), so a
+hostile address neither takes an addrman bucket from a good one nor gets
+gossiped onward by the node that decided it was hostile. Our only ban filter
+was the getaddr-response cache fill, which is the pull path.
+
+The third address is clean and rides in the same message: it is the positive
+control, so a setup that never reached the loop at all cannot pass this test by
+asserting absences. Relay is observed through the relay target's
+known-addrs, which RELAY-ADDRESS marks for every peer it picks, before it
+writes anything — a test peer owns no socket."
+  (bl.net:clear-discouraged)
+  ;; Three distinct /16s: addrman buckets on the (address group, source group)
+  ;; pair, so same-group fixtures share one 64-slot bucket and a slot collision
+  ;; would silently drop an entry the assertion is counting.
+  (let* ((bl.net:*reachable-networks* '(:ipv4 :ipv6))
+         (book (bl.net:make-address-book))
+         (banned-ip (bl.net:ipv4-to-mapped-ipv6 198 51 100 41))
+         (discouraged-ip (bl.net:ipv4-to-mapped-ipv6 203 0 113 42))
+         (clean-ip (bl.net:ipv4-to-mapped-ipv6 192 0 2 43))
+         (target (bl.net:make-peer :state :ready :address "198.51.100.44"))
+         (ctx (bl.ctx:make-node-context :address-book book :peers (list target))))
+    (setf (bl.net:peer-addr-relay-enabled target) t)
+    (bl.net:ban-address "198.51.100.41" 3600)
+    (bl.net:discourage-peer "203.0.113.42")
+    (unwind-protect
+         (let ((added (bl.net:handle-addr
+                       nil
+                       (%addr-payload (list banned-ip discouraged-ip clean-ip))
+                       ctx)))
+           (is (= 1 added)
+               "only the clean address may be stored, stored: ~D" added)
+           (is (= 1 (bl.net:address-book-count book))
+               "only the clean address may reach addrman, book holds ~D"
+               (bl.net:address-book-count book))
+           (is-true (bl.net:address-book-lookup book clean-ip 8333)
+                    "control: the clean address must be the one that is there")
+           (flet ((relayed-p (ip)
+                    (bl:recent-reject-p
+                     (bl.net:peer-known-addrs target)
+                     (bl.net:make-address-key ip 8333 :ipv4))))
+             (is-true (relayed-p clean-ip)
+                      "control: the clean address must still be relayed onward")
+             (is-false (relayed-p banned-ip)
+                       "a banned address must not be gossiped onward")
+             (is-false (relayed-p discouraged-ip)
+                       "a discouraged address must not be gossiped onward")))
+      (bl.net:unban-address "198.51.100.41")
+      (bl.net:clear-discouraged))))
 
 (test handle-addr-oversized-is-misbehavior
   "An addr message announcing more than 1000 addresses is misbehavior (Core
