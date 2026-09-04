@@ -439,6 +439,61 @@ automatic selection even though IPv4 is dialable."
     (let ((bl.net:*reachable-networks* '(:ipv4)))
       (is (not (null (bl.net:select-dialable-address book :tries 200)))))))
 
+(defun %bad-port-p (port)
+  "Core IsBadPort. The one reach into the deny-list predicate in this file."
+  (bl.net::bad-port-p port))
+
+(defun %book-with-record (net ip port)
+  "An address book holding exactly one record."
+  (let ((book (bl.net:make-address-book)))
+    (bl.net:address-book-add
+     book (bl.net:make-peer-address
+           :net net :ip ip :port port :services 1
+           :last-seen (bl.ser:get-unix-time)))
+    book))
+
+(test bad-ports-are-never-selected-for-an-automatic-dial
+  "GA10 d9aadbc5. Core refuses an automatic outbound connection to a port on
+IsBadPort's deny-list — `nTries < 50 && (addr.IsIPv4() || addr.IsIPv6()) &&
+IsBadPort(addr.GetPort())' (net.cpp:2854), the list itself at
+netbase.cpp:847-935 and documented service by service in
+doc/p2p-bad-ports.md. Nothing in this tree implemented it, so any peer could
+gossip `victim:25' / `:22' / `:3306' / `:6667' and we would store it, select
+it, open a TCP connection and speak the Bitcoin protocol at a third party's
+SMTP, SSH, MySQL or IRC daemon — the cross-protocol abuse that document exists
+for — while wasting an automatic outbound slot on an address that can never
+complete a handshake.
+
+SELECT-DIALABLE-ADDRESS is the choke point every automatic path is required to
+go through (outbound refill, block-relay slots, feelers), which is where Core
+applies it too: not in Select, and not on the paths that name a destination, so
+-addnode to a strange port still works."
+  (is (= 85 (loop for port from 0 to 65535 count (%bad-port-p port)))
+      "Core's IsBadPort switch has 85 cases and the list is extracted from it; ~
+a different total means an entry was added, dropped or mistyped")
+  (dolist (port '(1 7 22 23 25 53 110 119 123 143 179 389 465 587 636 993 995
+                  3306 3389 5432 5900 6000 6667 6697 10080 27017))
+    (is-true (%bad-port-p port) "port ~D must be on the deny-list" port))
+  (dolist (port '(0 2 8333 18333 18444 38333 9050 4444 65535))
+    (is-false (%bad-port-p port) "port ~D must NOT be on the deny-list" port))
+  ;; Through the shipped filter: an SMTP record never comes out, however many
+  ;; draws, and a good-port record from the same address does.
+  (let ((bl.net:*reachable-networks* (copy-list bl.net:+bip155-networks+)))
+    (let ((smtp (%book-with-record :ipv4 (bl.net:ipv4-to-mapped-ipv6 198 51 100 7) 25)))
+      (is (not (null (bl.net:address-book-select smtp)))
+          "control: raw select still sees the record, so the filter is what drops it")
+      (is (null (bl.net:select-dialable-address smtp :tries 200))
+          "an SMTP-port record reached the automatic dial filter"))
+    (let ((good (%book-with-record :ipv4 (bl.net:ipv4-to-mapped-ipv6 198 51 100 7) 8333)))
+      (is (not (null (bl.net:select-dialable-address good :tries 200)))
+          "control: the same address on the P2P port is still selectable"))
+    ;; Core applies the check to IPv4/IPv6 only — a port number says nothing
+    ;; about an onion destination, and Core's guard names the two IP families.
+    (let ((bl.net:*onion-proxy* (bl.net:make-proxy :host "127.0.0.1" :port 9050))
+          (onion (%book-with-record :torv3 (%na-hex +onion-pubkey-1+) 25)))
+      (is (not (null (bl.net:select-dialable-address onion :tries 200)))
+          "an onion record must not be filtered on its port"))))
+
 ;;;; IPv6 text parsing (string-to-ip-bytes / %parse-ipv6-string)
 ;;;;
 ;;;; Address strings are Core's own test inputs (netbase_tests.cpp

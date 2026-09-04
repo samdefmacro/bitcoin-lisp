@@ -436,7 +436,13 @@
   peer cannot stall the node (a 24-byte header followed by silence once
   froze every peer). Readiness is `poll(2)`, never `select()`. The
   address book is tried/new tables with Core's bucketing, so nothing
-  asserts an exact count.
+  asserts an exact count. Every AUTOMATIC dial is drawn through one
+  filter, SELECT-DIALABLE-ADDRESS: the network must be dialable by our
+  transport and reachable under -onlynet, and an ipv4/ipv6 record must
+  not name a port on Core's IsBadPort deny-list, or a gossiped
+  `victim:25' turns the node into someone else's SMTP client. Storage
+  and relay are deliberately unfiltered, as in Core, and manual
+  connections bypass addrman entirely.
 
   Trap: a test that drives two real connections without a pump hangs
   until its timeout, because nothing ever sends; drain the send queue."
