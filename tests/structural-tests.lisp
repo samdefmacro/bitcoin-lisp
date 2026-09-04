@@ -1416,21 +1416,37 @@ name here.")
 keys or sighashes wants bl.bytes:make-octets-hash-table"
         now +equalp-hash-table-ceiling+)))
 
-(defparameter +test-internal-reference-ceiling+ 4402
-  "How many package-qualified INTERNAL references (a :: token) the test
-tree may contain: 7,136 when the cleanup started. White-box tests reaching
+(defparameter +test-internal-reference-ceiling+ 4394
+  "How many package-qualified INTERNAL references (a :: token) the files of
+the tests system may contain: 7,136 when the cleanup started, over a glob of
+tests/; 4,394 when the corpus became the declared files (%test-system-files). White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the
 same internal was reached from a copy of the same helper in several files.
 Do not shrink it by exporting an internal only a test uses -- that symbol
 becomes an orphan export, and the two ratchets would fight.")
 
+(defun %test-system-files ()
+  "The source files of the bitcoin-lisp/tests system, as ASDF declares them.
+This, not a glob over tests/, is the ratchet's corpus: a scratch file left
+in a checkout (git ignores two such names) or a manual network script that
+no suite loads would otherwise move a count that was measured in a clean
+worktree -- the merged tree of two green branches failed this way on
+2026-09-04, over three :: in files no test ever compiled."
+  (let ((files '()))
+    (labels ((walk (component)
+               (if (typep component 'asdf:parent-component)
+                   (mapc #'walk (asdf:component-children component))
+                   (when (typep component 'asdf:cl-source-file)
+                     (push (asdf:component-pathname component) files)))))
+      (walk (asdf:find-system "bitcoin-lisp/tests")))
+    (nreverse files)))
+
 (defun %test-internal-references ()
-  "The number of :: references in the code of every file under tests/
-(strings and comments blanked)."
-  (let ((root (asdf:system-source-directory :bitcoin-lisp))
-        (count 0))
-    (dolist (file (directory (merge-pathnames "tests/**/*.lisp" root)))
+  "The number of :: references in the code of every file of the tests
+system (strings and comments blanked)."
+  (let ((count 0))
+    (dolist (file (%test-system-files))
       (with-open-file (in file)
         (let ((in-string nil))
           (loop for raw = (read-line in nil)
