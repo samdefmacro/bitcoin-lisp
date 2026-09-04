@@ -22,6 +22,11 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:signals-rpc-error
    #:rpc-error-code-of
    #:make-deterministic-rng
+   #:coins-cache-entries
+   #:coins-cache-fresh-count
+   #:coins-cache-dirty-count
+   #:coins-cache-entry-fresh-p
+   #:coins-cache-entry-dirty-p
    ;; transactions.lisp
    #:make-mempool-test-tx
    #:make-witness-test-tx-bytes

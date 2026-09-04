@@ -1416,7 +1416,7 @@ name here.")
 keys or sighashes wants bl.bytes:make-octets-hash-table"
         now +equalp-hash-table-ceiling+)))
 
-(defparameter +test-internal-reference-ceiling+ 4417
+(defparameter +test-internal-reference-ceiling+ 4402
   "How many package-qualified INTERNAL references (a :: token) the test
 tree may contain: 7,136 when the cleanup started. White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
