@@ -158,17 +158,35 @@ fifty-four reaches into the same internal."
   "Drive one /rest/ URI through the REST router (Core's rest.cpp dispatch) and
 return (values body status content-type).
 
-Outside a real HTTP request nothing has bound the reply object the handlers
-write their status and content type onto, so this binds one; a caller that
-already bound its own keeps it, which is what lets a test make several
-requests and go on reading HUNCHENTOOT:RETURN-CODE* itself.
+URI may carry a query string. REST-HANDLE takes the script name, as it does
+under Hunchentoot, while the parameters reach the handlers the way they do in
+a live request -- through HUNCHENTOOT:GET-PARAMETER on the bound request, which
+is how /rest/headers, /rest/blockpart and /rest/mempool read theirs.
+
+Outside a real HTTP request nothing has bound the request and reply objects the
+handlers read their parameters from and write their status and content type
+onto, so this binds them; a caller that already bound its own reply keeps it,
+which is what lets a test make several requests and go on reading
+HUNCHENTOOT:RETURN-CODE* itself. The acceptor binding is what makes the request
+object constructible at all: HUNCHENTOOT:REQUEST's initializer reaches for
+*ACCEPTOR* and fails to build a request without one.
 
 Two test files ask this question, which is why it is a fixture rather than a
 reach into the router from each of them."
-  (let ((hunchentoot:*reply*
-          (if (boundp 'hunchentoot:*reply*)
-              hunchentoot:*reply*
-              (make-instance 'hunchentoot:reply))))
-    (values (bl.rpc::rest-handle node uri)
+  (let* ((hunchentoot:*acceptor* (make-instance 'hunchentoot:acceptor))
+         (hunchentoot:*request*
+           (make-instance 'hunchentoot:request
+                          :uri uri
+                          :acceptor hunchentoot:*acceptor*
+                          :headers-in nil
+                          :method :get
+                          :server-protocol :http/1.1
+                          :remote-addr "127.0.0.1"
+                          :remote-port 0))
+         (hunchentoot:*reply*
+           (if (boundp 'hunchentoot:*reply*)
+               hunchentoot:*reply*
+               (make-instance 'hunchentoot:reply))))
+    (values (bl.rpc::rest-handle node (hunchentoot:script-name*))
             (hunchentoot:return-code*)
             (hunchentoot:content-type*))))
