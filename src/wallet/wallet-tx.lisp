@@ -1635,6 +1635,35 @@ caller holds the rescan reservation."
               start-time))
         start-time)))
 
+(defvar *wallet-cross-chain* nil
+  "Core -walletcrosschain (DEFAULT_WALLETCROSSCHAIN = false, wallet/wallet.h:135):
+allow attaching a wallet whose stored best-block locator belongs to another
+chain (%WALLET-FOREIGN-CHAIN-P). Off, as in Core: such a wallet is refused
+instead of being rescanned onto this chain.")
+
+(defun %wallet-foreign-chain-p (wallet chain-state)
+  "T when WALLET's stored best-block locator belongs to a different chain.
+
+Core AttachChain (wallet.cpp:3179-3189) asks whether locator.vHave.back() is
+chain.getBlockHash(0): a CBlockLocator always ends at the genesis of the
+chain it was built on, so its last hash IS the wallet's genesis. Ours ends
+there too when it came from BUILD-BLOCK-LOCATOR, which pushes the genesis in
+explicitly -- but the unload path writes a single-hash locator naming only
+the wallet's last processed block (WALLET-WRITE-BEST-BLOCK), and that is what
+a wallet written by this node usually carries. So the question is asked of
+the whole list: a locator NO hash of which this block index has ever seen
+names a history this node does not have. On a Core-shaped locator that is the
+same test, since our own genesis is always in the index; on a single-hash one
+it still says yes only for a block this chain never had.
+
+A wallet merely STALE or on a reorged-away branch is not foreign: those
+blocks stay in the index, and find-fork-in-active-chain handles them."
+  (let ((locator (wallet-loaded-locator wallet)))
+    (and locator
+         (notany (lambda (hash)
+                   (bl.store:get-block-index-entry chain-state hash))
+                 locator))))
+
 (defun wallet-attach-chain (node wallet)
   "Port of CWallet::AttachChain's catch-up (wallet.cpp:3171): find the fork
 of the wallet's stored locator with the active chain, rescan from there
@@ -1649,6 +1678,17 @@ should then be unloaded, like Core's failed AttachChain)."
         (unless (and chain-state
                      (bl.store:best-block-hash chain-state))
           (return-from wallet-attach-chain nil))
+        ;; Unless -walletcrosschain, a wallet from another chain is REFUSED
+        ;; rather than rescanned onto this one (Core wallet.cpp:3178-3190).
+        ;; Without this the foreign locator simply found no fork, the rescan
+        ;; started at the birthday, every stored confirmation was demoted to
+        ;; :inactive, the balance read as zero-and-pending, and the wallet's
+        ;; persisted best block was overwritten with THIS chain's locator --
+        ;; a wallet shown as emptied instead of an operator told why.
+        (when (and (not *wallet-cross-chain*)
+                   (%wallet-foreign-chain-p wallet chain-state))
+          (return-from wallet-attach-chain
+            "Wallet files should not be reused across chains. Restart bitcoind with -walletcrosschain to override."))
         (setf tip-height (max (bl.store:current-height chain-state) 0))
         (let ((fork (and (wallet-loaded-locator wallet)
                          (bl.store:find-fork-in-active-chain

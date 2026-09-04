@@ -71,6 +71,7 @@ APPLY-CONFIG-GLOBALS."
       (bool-knob "walletrbf" bl.wallet:*wallet-signal-rbf*)
       (bool-knob "spendzeroconfchange" bl.wallet:*wallet-spend-zero-conf-change*)
       (bool-knob "walletrejectlongchains" bl.wallet:*wallet-reject-long-chains*)
+      (bool-knob "walletcrosschain" bl.wallet:*wallet-cross-chain*)
       ;; -keypool sizes the keypool of wallets created AFTER it is set; an
       ;; existing wallet keeps the size it was made with, as in Core, where the
       ;; keypool size is per-wallet state.

@@ -611,3 +611,44 @@ range-end and NOT next-index."
         (ignore-errors
          (bl.wallet:close-wallet-manager
           (bl:node-wallet-manager node)))))))
+
+(test wallet-from-another-chain-is-refused-without-walletcrosschain
+  "Core AttachChain (wallet.cpp:3178-3190) refuses a wallet whose stored
+best-block locator ends at a genesis block that is not this chain's, unless
+-walletcrosschain (DEFAULT_WALLETCROSSCHAIN = false, wallet.h:135) says
+otherwise; wallet_crosschain.py is the oracle.
+
+We compared nothing and kept -walletcrosschain in the accept-and-ignore
+table, so we behaved as if it were permanently on: the foreign locator found
+no fork, the wallet was rescanned from its birthday, every stored
+confirmation was demoted to :inactive by %wtx-update-state-from-chain, its
+own transactions were pushed at this node's mempool, and the persisted
+locator was overwritten with THIS chain's -- a wallet shown as emptied
+instead of an operator told why."
+  (with-wallet-chain-node (node "xchain" :wallet "xchainw")
+    (%wc-mine node 2 (%wc-optrue-address))
+    (let ((foreign-genesis (make-array 32 :element-type '(unsigned-byte 8)
+                                          :initial-element #xfe))
+          (message (concatenate
+                    'string
+                    "Wallet files should not be reused across chains. "
+                    "Restart bitcoind with -walletcrosschain to override.")))
+      ;; Control: this chain's own locator reloads without complaint.
+      (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "xchainw"))
+      (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw")))
+      ;; unload-wallet writes a single-hash locator for the wallet's last
+      ;; processed block, so stamping that hash makes the STORED locator's
+      ;; oldest -- and only -- entry a block this chain has never seen.
+      (setf (bl.wallet::wallet-last-block-hash (%wc-wallet node "xchainw"))
+            foreign-genesis)
+      (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "xchainw"))
+      (signals-rpc-error (:code -4 :exact-message message)
+        (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw")))
+      ;; A refused wallet is not left half-loaded (Core unloads it too).
+      (is (null (%wc-wallet node "xchainw")))
+      ;; -walletcrosschain is the documented override, and taking it rewrites
+      ;; the locator, so the wallet loads unaided afterwards.
+      (let ((bl.wallet:*wallet-cross-chain* t))
+        (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw"))))
+      (bl.rpc:dispatch-rpc-method node "unloadwallet" (list "xchainw"))
+      (finishes (bl.rpc:dispatch-rpc-method node "loadwallet" (list "xchainw"))))))

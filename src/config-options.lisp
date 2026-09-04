@@ -361,6 +361,11 @@
 (define-option "walletrbf")
 (define-option "spendzeroconfchange")
 (define-option "walletrejectlongchains")
+;; -walletcrosschain: allow loading a wallet whose stored best-block locator
+;; belongs to a DIFFERENT chain (Core wallet/init.cpp:82,
+;; DEFAULT_WALLETCROSSCHAIN = false). Accepting and ignoring it made us behave
+;; as if it were permanently on.
+(define-option "walletcrosschain")
 (define-option "keypool")
 (define-option "walletdir" :network-only t)
 (define-option "walletnotify")
@@ -441,4 +446,4 @@
   "signer" "signetseednode"
   "stopafterblockimport" "timeout"
   "unsafesqlitesync" "vbparams"
-  "version" "walletbroadcast" "walletcrosschain")
+  "version" "walletbroadcast")
