@@ -360,9 +360,11 @@ compared). NOTE: requires the vendored rpc_psbt.json — runs at integration."
               (incf n)))
           (is (>= n 5) "expected the signer vectors, got ~D" n)))))
 
-(defun %psbt-spending (spk value)
+(defun %psbt-spending (spk value &key (utxo t))
   "A 1-in/1-out v2 PSBT spending an output of SPK worth VALUE, carried as the
-input's witness_utxo -- the smallest PSBT the signer path acts on."
+input's witness_utxo -- the smallest PSBT the signer path acts on. Without
+UTXO the input names no spent output at all, which is what Core's
+PSBTInputSignedAndVerified rejects before it verifies anything."
   (let* ((prevout (bl.ser:make-outpoint
                    :hash (make-array 32 :element-type '(unsigned-byte 8)
                                         :initial-element #x11)
@@ -378,13 +380,14 @@ input's witness_utxo -- the smallest PSBT the signer path acts on."
               :lock-time 0))
          (psbt (bl.ser:make-empty-psbt tx))
          (bb (bl.ser:make-byte-buf)))
-    (bl.ser:bb-write-tx-out
-     bb (bl.ser:make-tx-out :value value :script-pubkey spk))
-    (bl.ser:psbt-map-set
-     (aref (bl.ser:psbt-inputs psbt) 0)
-     bl.ser:+psbt-in-witness-utxo+
-     (make-array 0 :element-type '(unsigned-byte 8))
-     (bl.ser:bb-finish bb))
+    (when utxo
+      (bl.ser:bb-write-tx-out
+       bb (bl.ser:make-tx-out :value value :script-pubkey spk))
+      (bl.ser:psbt-map-set
+       (aref (bl.ser:psbt-inputs psbt) 0)
+       bl.ser:+psbt-in-witness-utxo+
+       (make-array 0 :element-type '(unsigned-byte 8))
+       (bl.ser:bb-finish bb)))
     psbt))
 
 (defun %psbt-process-with-descriptors (node psbt descriptors)
@@ -444,6 +447,62 @@ side indistinguishable from any other."
                        (make-array length :element-type '(unsigned-byte 8)
                                           :initial-element 9))
   psbt)
+
+(defun %psbt-signer-result-of (psbt verify)
+  "The {psbt, complete, hex?} object the process RPCs build. VERIFY is what
+separates walletprocesspsbt from descriptorprocesspsbt."
+  (bl.wallet::%psbt-signer-result psbt t verify))
+
+(defun %psbt-with-final-scriptsig (psbt bytes)
+  "Put BYTES on the PSBT's first input as its final scriptSig, the way a
+counterparty hands back an input it claims to have finished."
+  (bl.ser:psbt-map-set (aref (bl.ser:psbt-inputs psbt) 0)
+                       bl.ser:+psbt-in-final-scriptsig+
+                       (make-array 0 :element-type '(unsigned-byte 8))
+                       (coerce bytes '(simple-array (unsigned-byte 8) (*))))
+  psbt)
+
+(test psbt-complete-requires-the-scripts-to-verify
+  "walletprocesspsbt reports complete as the AND of PSBTInputSignedAndVerified
+(wallet.cpp:2231-2235), which resolves the spent output -- false outright when
+neither utxo record is there -- and runs VerifyScript over the final
+scriptSig/scriptWitness under the standard flags (psbt.cpp:325-355). Answering
+complete from `the finalizer assembled something` hands the caller a hex to
+broadcast that the node will reject. descriptorprocesspsbt keeps Core's weaker
+PSBTInputSigned test (rawtransaction.cpp:2060-2063), so the two answers differ
+on the same PSBT."
+  (let* ((node (bl:make-node :network :regtest))
+         (sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (wif (bl.crypto:private-key-to-wif sk :network :regtest :compressed t))
+         (pub (bl.crypto:derive-public-key sk :compressed t))
+         (value 100000)
+         (spk (concatenate '(simple-array (unsigned-byte 8) (*))
+                           #(#x00 #x14) (bl.crypto:hash160 pub)))
+         (op-1 #(#x51)))
+    (flet ((field (result name) (cdr (assoc name result :test #'equal))))
+      ;; A garbage final scriptSig, on an input that names no spent output at
+      ;; all: Core returns false on the missing-UTXO branch alone.
+      (let* ((no-utxo (%psbt-with-final-scriptsig
+                       (%psbt-spending spk value :utxo nil) op-1))
+             (verified (%psbt-signer-result-of no-utxo t)))
+        (is (eq bl.rpc:+json-false+ (field verified "complete")))
+        (is (null (field verified "hex")))
+        ;; Same PSBT, descriptorprocesspsbt's weaker test: the field is there.
+        (is (eq t (field (%psbt-signer-result-of no-utxo nil) "complete"))))
+      ;; With the utxo present, the garbage scriptSig still cannot spend it.
+      (let ((bad (%psbt-with-final-scriptsig (%psbt-spending spk value) op-1)))
+        (is (eq bl.rpc:+json-false+
+                (field (%psbt-signer-result-of bad t) "complete"))))
+      ;; Control: a PSBT our own signer finalized verifies, so complete stands
+      ;; and the hex comes back.
+      (let* ((signed (bl.ser:decode-psbt
+                      (field (%psbt-process-with-descriptors
+                              node (%psbt-spending spk value)
+                              (list (format nil "wpkh(~A)" wif)))
+                             "psbt")))
+             (result (%psbt-signer-result-of signed t)))
+        (is (eq t (field result "complete")))
+        (is (stringp (field result "hex")))))))
 
 (test psbt-signing-refuses-a-foreign-sighash
   "Core SignPSBTInput checks every signature already on the input against the
