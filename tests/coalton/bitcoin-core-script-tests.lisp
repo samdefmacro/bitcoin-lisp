@@ -693,3 +693,48 @@ DISCOURAGE vectors cover NOP, NOP1 and NOP4..NOP10, never NOP2/NOP3."
                              "CHECKSEQUENCEVERIFY,DISCOURAGE_UPGRADABLE_NOPS"))
       "with CHECKSEQUENCEVERIFY set the opcode must run BIP112, not pass"))
 
+(test is-push-only-counts-op-reserved-as-push
+  "CONSENSUS (Core script.cpp:266-281): CScript::IsPushOnly walks the script and
+rejects on `opcode > OP_16', so OP_RESERVED (0x50 <= OP_16 = 0x60) IS push-type
+-- Core's own comment says so, and notes that executing OP_RESERVED fails
+anyway, which is why P2SH is unaffected. We rejected it, so a P2SH spend whose
+scriptSig starts with OP_RESERVED was refused as SIG_PUSHONLY where Core refuses
+it as BAD_OPCODE (interpreter.cpp:1217-1218, the switch default). No
+script_tests.json vector covers it: the one at line 1139 puts OP_RESERVED in the
+redeem script, not in the scriptSig."
+  (is-true (bl.interop:script-is-push-only-p (%w8d-script #x50))
+           "OP_RESERVED is push-type for IsPushOnly")
+  (is-true (bl.interop:script-is-push-only-p (%w8d-script #x4f))
+           "OP_1NEGATE is push-type")
+  (is-true (bl.interop:script-is-push-only-p (%w8d-script #x60))
+           "OP_16 is push-type")
+  ;; Control: the predicate still says NO one opcode past the boundary, and for
+  ;; a push that runs off the end (Core's GetOp failure).
+  (is-false (bl.interop:script-is-push-only-p (%w8d-script #x61))
+            "OP_NOP (0x61 > OP_16) is not push-type")
+  (is-false (bl.interop:script-is-push-only-p (%w8d-script #x02 #x51))
+            "a truncated push is not push-only")
+  ;; End to end: P2SH(OP_1) spent with OP_RESERVED ahead of the redeem push.
+  ;; Core runs the scriptSig and dies on the opcode; we must reach the engine
+  ;; too, i.e. report the engine's error and not SIG_PUSHONLY.
+  (let* ((redeem (%w8d-script #x51))
+         (spk (%w8d-script #xa9 #x14 (bl.crypto:hash160 redeem) #x87)))
+    (bl.interop:set-script-flags "P2SH")
+    (unwind-protect
+         (progn
+           (multiple-value-bind (ok err)
+               (bl.interop:verify-script (%w8d-script #x50 #x01 #x51) spk)
+             (is (null ok))
+             (is (eq err :error)
+                 "OP_RESERVED must fail in the engine (Core BAD_OPCODE), got ~A" err))
+           ;; Control: a scriptSig opcode Core really does call non-push still
+           ;; short-circuits as SIG_PUSHONLY, and a plain push still verifies.
+           (multiple-value-bind (ok err)
+               (bl.interop:verify-script (%w8d-script #x61 #x01 #x51) spk)
+             (is (null ok))
+             (is (eq err :sig-pushonly) "OP_NOP in the scriptSig, got ~A" err))
+           (multiple-value-bind (ok err)
+               (bl.interop:verify-script (%w8d-script #x01 #x51) spk)
+             (is (eq ok t) "the ordinary P2SH(OP_1) spend must verify, got ~A" err)))
+      (bl.interop:set-script-flags nil))))
+
