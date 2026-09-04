@@ -10,6 +10,34 @@
                   (setf (aref h 1) i)
                   h)))
 
+(defun make-versionbits-chain (n &key (network :regtest) (signal-bit nil) (base-time 1000000))
+  "(values chain-state last-entry) for a synthetic chain of N blocks.
+
+Every header carries the versionbits top bits, and SIGNAL-BIT additionally sets
+that deployment bit — which is what CONDITION counts."
+  (declare (ignore network))
+  (let ((cs (bl.store:make-chain-state))
+        (prev nil))
+    (dotimes (i n)
+      (let* ((version (logior #x20000000 (if signal-bit (ash 1 signal-bit) 0)))
+             (header (bl.ser:make-block-header
+                      :version version
+                      :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                 :initial-element 0)
+                      :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                  :initial-element 0)
+                      :timestamp (+ base-time (* i 600))
+                      :bits #x207fffff :nonce 0))
+             (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+        (setf (aref hash 0) (logand i #xFF)
+              (aref hash 1) (logand (ash i -8) #xFF))
+        (let ((e (bl.store:make-block-index-entry
+                  :hash hash :height i :prev-entry prev :header header
+                  :status :valid)))
+          (bl.store:add-block-index-entry cs e)
+          (setf prev e))))
+    (values cs prev)))
+
 (defun make-reorg-test-block (prev-hash block-hash height
                               &key (value 5000000000)
                                    (timestamp (+ 1231006505 (* height 600)))
