@@ -212,25 +212,41 @@ the behaviour, not decoration."
   (bl:log-cat "net" "ignoring redundant verack message from peer=~A"
               (peer-id peer)))
 
+(defun %disconnect-after-verack (peer command)
+  "Drop PEER for sending the feature-negotiation message COMMAND after VERACK.
+BIP155 (sendaddrv2), BIP339 (wtxidrelay) and BIP330 (sendtxrcncl) all place
+their negotiation strictly between VERSION and VERACK: switching announcement
+protocol on a live connection is the relay problem the window exists to
+prevent, and Core enforces it by dropping the connection from each of the
+three handlers (net_processing.cpp:3928-3933, :3950-3955, :3969-3973).
+HANDLE-MESSAGE is only ever reached post-handshake -- the window itself is
+%await-verack, which handles these three inline -- so arriving here IS the
+violation and no state check is needed.
+
+The line is Core's own, CNode::DisconnectMsg with fLogIPs off
+(net.cpp:709-713); p2p_addrv2_relay.py:81 greps for it verbatim and
+p2p_sendtxrcncl.py:217 for its prefix, so the wording is behaviour."
+  (bl:log-cat "net" "~A received after verack, disconnecting peer=~A"
+              command (peer-id peer))
+  (disconnect-peer peer))
+
 (define-p2p-handler "sendaddrv2" (peer payload ctx)
-  "No-op post-handshake (only meaningful during handshake)."
-  (declare (ignore peer payload ctx)))
+  "BIP 155: post-verack, so the negotiation window is over -- disconnect."
+  (declare (ignore payload ctx))
+  (%disconnect-after-verack peer "sendaddrv2"))
 
 (define-p2p-handler "wtxidrelay" (peer payload ctx)
-  "BIP 339: No-op post-handshake (only meaningful during handshake)."
-  (declare (ignore peer payload ctx)))
+  "BIP 339: post-verack, so the negotiation window is over -- disconnect."
+  (declare (ignore payload ctx))
+  (%disconnect-after-verack peer "wtxidrelay"))
 
 (define-p2p-handler "sendtxrcncl" (peer payload ctx)
-  "BIP 330: feature negotiation is only valid between VERSION and VERACK
-(handled in %await-verack). Receiving it here -- post-verack -- is a
-protocol violation: Core disconnects (net_processing.cpp:3969-3973),
-unlike the sendaddrv2/wtxidrelay no-op stubs. With -txreconciliation off,
-Core ignores the message instead (:3964-3967)."
+  "BIP 330: as sendaddrv2/wtxidrelay above, except that Core reaches the
+post-verack check only with txreconciliation enabled -- with the flag off
+the message is ignored outright (net_processing.cpp:3964-3967)."
   (declare (ignore payload ctx))
   (when bl:*tx-reconciliation*
-    (bl:log-cat "net" "sendtxrcncl received after verack — disconnecting peer ~A"
-                (peer-address peer))
-    (disconnect-peer peer)))
+    (%disconnect-after-verack peer "sendtxrcncl")))
 
 ;;; BIP-330 reconciliation. Every one of these is ignored unless the peer
 ;;; completed the sendtxrcncl handshake, which needs -txreconciliation on
