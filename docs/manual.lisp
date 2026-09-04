@@ -482,7 +482,13 @@
   the token bucket per message class, then discouraged, then
   disconnected. Outbound eclipse resistance rotates the extra outbound
   slot on a stale tip (`*max-tip-age-seconds*` is Core's
-  nPowTargetSpacing * 3).
+  nPowTargetSpacing * 3). A compact-block announcement is admitted in
+  Core's handler order -- parent lookup, the anti-DoS work floor (the
+  greater of nMinimumChainWork and tip work minus 144 tip proofs), then
+  the header goes INTO the block index -- because everything past those
+  gates is work a ~100-byte message buys: the shortid map SipHashes the
+  whole mempool, and a header that never reaches the index is unknown
+  again on every replay.
 
   Traps: `getheaders` must send the locator of the LAST header the peer
   gave us, never our own tip, or an ordinary lagging peer loops forever.

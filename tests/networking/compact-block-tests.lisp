@@ -795,8 +795,10 @@ later."
   "GA8 W4. BLOCK_CACHED_INVALID: a compact block for a hash we already marked
 invalid. Core exempts it whenever via_compact_block is true
 (net_processing.cpp:1926-1935), so no discouragement — and no refetch, since
-re-downloading a block we have already rejected is a self-inflicted DoS. Checked
-before the parent lookup, mirroring AcceptBlockHeader (validation.cpp:4229-4237)."
+re-downloading a block we have already rejected is a self-inflicted DoS. Core
+reaches it inside AcceptBlockHeader (validation.cpp:4229-4237), i.e. after the
+handler's own parent lookup and anti-DoS work floor, which is where our verdict
+checks it too."
   (with-network (:regtest)
    (let* ((bl.net:*cached-is-ibd* nil)
           (addr "203.0.113.53")
@@ -823,6 +825,210 @@ before the parent lookup, mirroring AcceptBlockHeader (validation.cpp:4229-4237)
        (is (null sent)
            "a block we already rejected must not be re-requested, sent: ~S" sent)
        (is (zerop passes) "passes: ~D" passes)))))
+
+;;;; =============================================================
+;;;; The cmpctblock admission gates Core runs before the mempool (GA10 S1)
+;;;;
+;;;; Core's handler order (net_processing.cpp:4569-4593) is: look the PARENT
+;;;; up, apply GetAntiDoSWorkThreshold to
+;;;; `prev_block->nChainWork + GetBlockProof(header)', THEN call
+;;;; ProcessNewBlockHeaders -- which validates the header and, on success,
+;;;; AddToBlockIndex'es it. We had neither the work floor nor the index write,
+;;;; so a header ground at the minimum target reached BUILD-SHORTID-MAP and
+;;;; stayed unknown across every replay.
+;;;; =============================================================
+
+(defun %cbp-compact-block-missing-one (header prefilled-tx)
+  "A compact block on HEADER with PREFILLED-TX at index 0 and one short ID at
+index 1 that no mempool entry can match (the test mempools below are empty).
+Reconstruction returns missing index (1), which is the shape that sends a
+getblocktxn and leaves a pending reconstruction behind — our counterpart of
+Core's `already_in_flight' state for this peer."
+  (bl.ser:make-compact-block
+   :header header
+   :nonce 7
+   :short-ids (list #x112233445566)
+   :prefilled-txs (list (bl.ser:make-prefilled-tx
+                         :index 0 :transaction prefilled-tx))))
+
+(defun %cbp-deliver (peer payload state utxo mempool)
+  "One cmpctblock delivery, on the node context the tests in this section build
+from the same four pieces every time."
+  (bl.net::handle-cmpctblock
+   peer payload
+   (bl.ctx:make-node-context :chain-state state :utxo-set utxo
+                            :mempool mempool)))
+
+(test cmpctblock-low-work-header-is-ignored-before-the-mempool
+  "GA10 S1. Core ignores a compact block whose announced chain misses the
+anti-DoS work floor — `prev_block->nChainWork + GetBlockProof(cmpctblock.header)
+< GetAntiDoSWorkThreshold()' (net_processing.cpp:4578-4582) — outright, before
+ProcessNewBlockHeaders and long before the mempool.
+
+We had no such floor anywhere on the compact path. A header ground at the
+network's MINIMUM target, which costs its sender nothing, reached
+BUILD-SHORTID-MAP: a SipHash of every mempool entry under a key derived from the
+attacker's own header and nonce. Roughly 100 bytes of message, repeatable
+without limit, with no misbehaviour score anywhere along it.
+
+The control is the SAME message with the floor back at regtest's real value of
+zero: it must reach the mempool exactly once, so a green run cannot come from a
+fixture that never reconstructs anything."
+  (with-network (:regtest)
+   (let* ((bl.net:*cached-is-ibd* nil)
+          (addr "203.0.113.60")
+          (parent (%cbp-hash #xB1))
+          (state (%cbp-state-with-parent parent 1296688600))
+          (utxo (bl.store:make-utxo-set))
+          (mempool (bl.mp:make-mempool))
+          (cb (%cbp-one-tx-compact-block parent 0 (make-simple-tx #x51)))
+          (payload (%cbp-payload cb))
+          (block-hash (bl.ser:block-header-hash
+                       (bl.ser:compact-block-header cb))))
+     ;; A floor no synthetic regtest header can clear. Same shape as a live
+     ;; node's, where the threshold is max(nMinimumChainWork, tip work minus
+     ;; 144 tip proofs) and every mainnet/testnet header is far below it.
+     (let ((bl:*minimum-chain-work-override* (expt 2 240))
+           (peer (%cbp-peer addr)))
+       (is (< (bl.store:calculate-chain-work
+               (bl.ser:block-header-bits (bl.ser:compact-block-header cb))
+               1)
+              (bl.net::anti-dos-work-threshold state))
+           "fixture must sit below the floor or this test asserts nothing")
+       (multiple-value-bind (sent passes)
+           (%cbp-count-shortid-passes
+            (lambda ()
+              (%cbp-capture-sends
+               (lambda ()
+                 (dotimes (i 5)
+                   (%cbp-deliver peer payload state utxo mempool))))))
+         (is (zerop passes)
+             "5 low-work cmpctblocks hashed the mempool ~D time(s); the floor must be applied first"
+             passes)
+         (is (null sent)
+             "a low-work compact block must not earn a message either, sent: ~S" sent)
+         (is-false (bl.store:get-block-index-entry state block-hash)
+                   "a header below the floor must not enter the block index")
+         (is-false (bl.net:peer-discouraged-p addr)
+                   "Core logs and returns: a peer far behind us relays low-work blocks honestly")
+         (is (eq :ready (bl.net:peer-state peer)))))
+     ;; Control: with regtest's real floor (0) the identical message IS
+     ;; admitted and reaches the mempool exactly once.
+     (let ((peer (%cbp-peer "203.0.113.61")))
+       (multiple-value-bind (sent passes)
+           (%cbp-count-shortid-passes
+            (lambda ()
+              (%cbp-capture-sends
+               (lambda ()
+                 (%cbp-deliver peer payload state utxo mempool)))))
+         (declare (ignore sent))
+         (is (= 1 passes)
+             "control: with the floor at zero the same header must reach the mempool, passes: ~D"
+             passes))))))
+
+(test cmpctblock-indexes-the-announced-header-and-drops-the-replay
+  "GA10 S1, the other half. Core's handler calls
+ProcessNewBlockHeaders({{cmpctblock.header}}) (net_processing.cpp:4590), whose
+AcceptBlockHeader ends in AddToBlockIndex — so the announced header is in the
+index from the FIRST message on and every later copy is answered by the
+already-known gates.
+
+We never inserted it. `known' stayed NIL for an unseen header however many times
+it arrived, which made the whole :ALREADY-HAVE arm unreachable on this path, and
+each copy re-ran the header battery and then BUILD-SHORTID-MAP over the entire
+mempool.
+
+The replay pinned here is the one that survives the index write as well: a
+header that beats our tip and whose body never arrived comes back through the
+:ACCEPT arm, and Core drops it at \"Peer sent us compact block we were already
+syncing!\" (:4670) because the peer already has that reconstruction in flight.
+
+Both controls are inside the assertions: the first message must index the header
+AND reach the mempool exactly once, so neither the index check nor the pass
+count can pass on a fixture that does nothing."
+  (with-network (:regtest)
+   (let* ((bl.net:*cached-is-ibd* nil)
+          (peer (%cbp-peer "203.0.113.62"))
+          (parent (%cbp-hash #xB2))
+          (state (%cbp-state-with-parent parent 1296688600))
+          (utxo (bl.store:make-utxo-set))
+          (mempool (bl.mp:make-mempool))
+          (hdr (%cbp-grind (%cbp-header parent 1296688700)))
+          (cb (%cbp-compact-block-missing-one hdr (make-simple-tx #x52)))
+          (payload (%cbp-payload cb))
+          (block-hash (bl.ser:block-header-hash hdr)))
+     (is-true (bl.val:check-proof-of-work hdr)
+              "fixture must pass PoW or it would test the wrong arm")
+     (multiple-value-bind (sent passes)
+         (%cbp-count-shortid-passes
+          (lambda ()
+            (%cbp-capture-sends
+             (lambda ()
+               (dotimes (i 5)
+                 (%cbp-deliver peer payload state utxo mempool))))))
+       (let ((entry (bl.store:get-block-index-entry state block-hash)))
+         (is-true entry
+                  "the announced header must be in the block index after the first cmpctblock")
+         (when entry
+           (is (eq :header-valid (bl.store:block-index-entry-status entry))
+               "an announced header enters the index header-valid, not as a block we hold")
+           (is (= 1 (bl.store:block-index-entry-height entry)))))
+       (is (= 1 passes)
+           "5 copies of one cmpctblock hashed the mempool ~D time(s); only the first may"
+           passes)
+       (is (equal '("getblocktxn") sent)
+           "only the first copy may ask for the missing transactions, sent: ~S" sent)
+       (is-false (bl.net:peer-discouraged-p "203.0.113.62")
+                 "a replayed compact block is not a fault Core scores")
+       (is (eq :ready (bl.net:peer-state peer)))))))
+
+(test cmpctblock-invalid-header-is-punished-and-never-indexed
+  "The risk the index write creates: the announced header may be inserted only
+AFTER it passes the header battery. Core's order is exactly that —
+AcceptBlockHeader inserts at its end, after CheckBlockHeader and
+ContextualCheckBlockHeader, and returns without an insertion when either fails
+(validation.cpp:4239-4259).
+
+So a bad-PoW header must still discourage its sender (MaybePunishNodeForBlock at
+net_processing.cpp:4589-4593, BLOCK_INVALID_HEADER, which via_compact_block does
+not excuse) and must leave the index untouched: a peer able to plant index
+entries by announcing junk headers would have traded a bounded mempool pass for
+unbounded memory.
+
+The control is a valid header on the same parent, which IS indexed — without it
+the absence above could be a lookup that never had anything to find."
+  (with-network (:regtest)
+   (let* ((bl.net:*cached-is-ibd* nil)
+          (addr "203.0.113.63")
+          (peer (%cbp-peer addr))
+          (parent (%cbp-hash #xB3))
+          (state (%cbp-state-with-parent parent 1296688600))
+          (utxo (bl.store:make-utxo-set))
+          (mempool (bl.mp:make-mempool))
+          (bad (%cbp-bad-pow-header parent))
+          (bad-cb (%cbp-one-tx-compact-block-with-header
+                   bad 0 (make-simple-tx #x53)))
+          (good-cb (%cbp-one-tx-compact-block parent 0 (make-simple-tx #x54))))
+     (is-false (bl.val:check-proof-of-work bad)
+               "fixture must actually fail PoW or this test asserts nothing")
+     (%cbp-capture-sends
+      (lambda ()
+        (%cbp-deliver peer (%cbp-payload bad-cb) state utxo mempool)))
+     (is-true (bl.net:peer-discouraged-p addr)
+              "an invalid-PoW cmpctblock header must still discourage its sender")
+     (is-false (bl.store:get-block-index-entry
+                state (bl.ser:block-header-hash bad))
+               "a header we reject must never reach the block index")
+     ;; Control: the accepted header on the same parent IS indexed, so the
+     ;; assertion above is a verdict and not an empty index.
+     (let ((ok-peer (%cbp-peer "203.0.113.64")))
+       (%cbp-capture-sends
+        (lambda ()
+          (%cbp-deliver ok-peer (%cbp-payload good-cb) state utxo mempool)))
+       (is-true (bl.store:get-block-index-entry
+                 state (bl.ser:block-header-hash
+                        (bl.ser:compact-block-header good-cb)))
+                "control: an accepted header must be indexed")))))
 
 (test compact-block-failure-action-matches-core-arms
   "GA8 W4. The mapping table itself, arm by arm against MaybePunishNodeForBlock
