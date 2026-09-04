@@ -566,7 +566,10 @@
   -- the persistent volume keeps stale expansions through a warm rebuild,
   an image restart and an ordinary cold run. The script-execution cache
   must key on everything that decides validity, including the spent
-  scriptPubKey."
+  scriptPubKey. The transaction version and the spent amount are SIGNED
+  slots -- that is what the wire format reads back -- while Core streams
+  them as raw words, so the BIP 143 and BIP 341 preimages write their bit
+  patterns: a version with bit 31 set is legal and arrives here negative."
   (bitcoin-lisp.coalton.script package)
   (bitcoin-lisp.coalton.interop package)
   (bitcoin-lisp.validation:execute-script function)
