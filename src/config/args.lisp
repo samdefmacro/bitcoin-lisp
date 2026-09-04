@@ -118,7 +118,7 @@ The caller warns about each, so accepting them never passes for implementing
 them."
   (remove-duplicates
    (loop for (k . nil) in alist
-         when (core-only-option-p k) collect (string-downcase k))
+         when (core-only-option-p k) collect k)
    :test #'string= :from-end t))
 
 (defun known-config-option-p (name)
@@ -127,11 +127,17 @@ DEFINE-OPTION row, including the recognised-but-unimplemented Core options
 (accepted so an ordinary bitcoind command line starts this node, warned
 about at startup so nobody mistakes that for support). check-cli-args uses
 this to reject unknown command-line options at startup, like Core
-ArgsManager::ParseParameters (common/args.cpp:229-238)."
+ArgsManager::ParseParameters (common/args.cpp:229-238).
+
+Every comparison here is case-SENSITIVE, as Core's GetArgFlags is off WIN32
+(args.cpp:200-204, :258-268), and so is CORE-ONLY-OPTION-P. The parsers hand
+both predicates lower-case names; the settings file is the one source neither
+Core nor we fold, so an unrecognised spelling there earns the same
+`Ignoring unknown configuration value` line it earns in Core."
   (and (or (find-config-option name)
            ;; -nokey negation of a known key parses to key=0 before this
            ;; check, but tolerate the raw \"noKEY\" spelling too.
-           (and (> (length name) 2) (string-equal (subseq name 0 2) "no")
+           (and (> (length name) 2) (string= (subseq name 0 2) "no")
                 (known-config-option-p (subseq name 2))))
        t))
 
