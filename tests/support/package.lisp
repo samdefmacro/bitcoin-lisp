@@ -28,6 +28,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:coins-cache-entry-fresh-p
    #:coins-cache-entry-dirty-p
    #:start-node-plist
+   #:rest-request
    ;; transactions.lisp
    #:make-mempool-test-tx
    #:make-witness-test-tx-bytes
