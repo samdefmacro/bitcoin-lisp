@@ -1769,6 +1769,19 @@ truncate scripts ending in a malformed push."
     ;; Build BIP 143 preimage with direct buffer writes (buf-set-*,
     ;; src/util/bytes.lisp). Fixed segments total 156 bytes; variable
     ;; scriptCode adds varint+bytes.
+    ;;
+    ;; CONSENSUS: the version and the amount are written as the bit patterns
+    ;; Core writes, not as our slot types read them. Core's version is
+    ;; `uint32_t\' (primitives/transaction.h:293) and its amount a CAmount =
+    ;; int64_t; SignatureHash streams both raw (`ss << txTo.version\',
+    ;; `ss << amount\', script/interpreter.cpp:1646,1655), so the preimage
+    ;; carries plain little-endian words. Our slots are signed -- (signed-byte
+    ;; 32) for the version, (signed-byte 64) for the value -- because that is
+    ;; what the wire format reads back, so a version with bit 31 set (0x80000002
+    ;; is a valid version: Core imposes no rule on it) arrives here NEGATIVE and
+    ;; the positional writers, declared unsigned for the hot path, TYPE-ERROR on
+    ;; it. That aborts block validation for a block Core accepts. Reinterpret
+    ;; the same bits at the write, as check-sequence-locks does at its gate.
     (let* ((script-len (length script-code))
            (preimage (make-array
                       (+ 156 9 script-len)  ; 156 fixed + max varint(9) + scriptCode
@@ -1777,7 +1790,7 @@ truncate scripts ending in a malformed push."
       (declare (type (simple-array (unsigned-byte 8) (*)) preimage)
                (type fixnum pos))
       (setf pos (buf-set-u32-le preimage pos
-                                (bl.ser:transaction-version tx)))
+                                (ldb (byte 32 0) (bl.ser:transaction-version tx))))
       (setf pos (buf-set-bytes preimage pos hash-prevouts))
       (setf pos (buf-set-bytes preimage pos hash-sequence))
       (setf pos (buf-set-bytes preimage pos
@@ -1786,7 +1799,7 @@ truncate scripts ending in a malformed push."
                                 (bl.ser:outpoint-index current-prevout)))
       (setf pos (buf-set-varint preimage pos script-len))
       (setf pos (buf-set-bytes preimage pos script-code))
-      (setf pos (buf-set-u64-le preimage pos amount))
+      (setf pos (buf-set-u64-le preimage pos (ldb (byte 64 0) amount)))
       (setf pos (buf-set-u32-le preimage pos
                                 (bl.ser:tx-in-sequence current-input)))
       (setf pos (buf-set-bytes preimage pos hash-outputs))
@@ -3096,6 +3109,16 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
     ;; Max preimage size: 1+1+4+4+128+32+1+(36+8+9+520+4)+32+37 ≈ 820 bytes.
     ;; ANYONECANPAY adds spent scriptPubKey which can be large; use spent
     ;; script length to size precisely.
+    ;;
+    ;; CONSENSUS: the version and the spent amount go in as the bit patterns
+    ;; Core writes. SignatureHashSchnorr streams `ss << tx_to.version\'
+    ;; (script/interpreter.cpp:1520) over a `uint32_t\' version
+    ;; (primitives/transaction.h:293) and `ss << cache.m_spent_outputs[in_pos]\'
+    ;; (:1539), whose CTxOut nValue is a CAmount = int64_t. Our slots are signed
+    ;; -- what the wire format reads -- so a version with bit 31 set arrives
+    ;; NEGATIVE and the positional writers, declared unsigned for the hot path,
+    ;; TYPE-ERROR on it, aborting validation of a block Core accepts. Same
+    ;; reinterpretation as the BIP 143 preimage above.
     (let* ((spent-script (when anyonecanpay
                            (bl.store:utxo-entry-script-pubkey current-spent)))
            (preimage (make-array (+ 256
@@ -3112,7 +3135,7 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
       (setf pos (buf-set-u8 preimage pos 0))                         ; epoch
       (setf pos (buf-set-u8 preimage pos sighash-type))              ; hash_type
       (setf pos (buf-set-u32-le preimage pos
-                                (bl.ser:transaction-version tx)))
+                                (ldb (byte 32 0) (bl.ser:transaction-version tx))))
       (setf pos (buf-set-u32-le preimage pos
                                 (bl.ser:transaction-lock-time tx)))
       (unless anyonecanpay
@@ -3130,7 +3153,8 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
          (setf pos (buf-set-u32-le preimage pos
                                    (bl.ser:outpoint-index current-prevout)))
          (setf pos (buf-set-u64-le preimage pos
-                                   (bl.store:utxo-entry-value current-spent)))
+                                   (ldb (byte 64 0)
+                                        (bl.store:utxo-entry-value current-spent))))
          (setf pos (buf-set-varint preimage pos (length spent-script)))
          (setf pos (buf-set-bytes preimage pos spent-script))
          (setf pos (buf-set-u32-le preimage pos

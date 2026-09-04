@@ -993,7 +993,11 @@ code (height << 1 | coinbase) as LE32, then the amount as LE64, then the
 scriptPubKey with a compactsize length prefix. Used for gettxoutsetinfo
 muhash mode and (per added/removed coin) the coinstats index. Built directly
 into a byte vector -- this is per-UTXO on the coinstatsindex backfill, where
-the flexi-streams gray-stream path was measurable overhead."
+the flexi-streams gray-stream path was measurable overhead.
+
+AMOUNT is the utxo-entry value, a (signed-byte 64) because Core's CAmount is
+an int64_t that `ss << coin.out\' streams raw; the positional writers are
+declared unsigned, so write its 64-bit pattern rather than the signed value."
   (declare (type (simple-array (unsigned-byte 8) (*)) txid script))
   (let* ((slen (length script))
          (out (make-array (+ 32 4 4 8 (bl.ser:compact-size-length slen) slen)
@@ -1004,7 +1008,7 @@ the flexi-streams gray-stream path was measurable overhead."
     (setf i (bl.bytes:buf-set-bytes out i txid))
     (setf i (bl.bytes:buf-set-u32-le out i vout))
     (setf i (bl.bytes:buf-set-u32-le out i code))
-    (setf i (bl.bytes:buf-set-u64-le out i amount))
+    (setf i (bl.bytes:buf-set-u64-le out i (ldb (byte 64 0) amount)))
     (setf i (bl.bytes:buf-set-varint out i slen))
     (bl.bytes:buf-set-bytes out i script)
     out))
