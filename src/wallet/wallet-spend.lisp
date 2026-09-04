@@ -577,10 +577,16 @@ incl. outpoint/sequence/length prefixes, or NIL when unsolvable."
                               (if tx-is-segwit 1 0))))
         (+ (* 4 (+ 32 4 4 scriptsig-len)) witstack-len sat)))))
 
-(defun %max-signed-input-vsize (wallet cc script use-max-sig)
+(defun %max-signed-input-vsize (wallet cc script
+                                &optional (use-max-sig
+                                           (%wallet-use-max-sig-p wallet)))
   "Core CalculateMaximumSignedInputSize: signed input vsize, or -1. Core calls
 MaxInputWeight with an EMPTY txin here (spend.cpp:97), so UseMaxSig cannot
-fire and USE-MAX-SIG is the wallet's !CanGrindR alone."
+fire and USE-MAX-SIG is the wallet's !CanGrindR alone -- which is why it
+defaults to exactly that, as Core's wallet overload does
+(spend.cpp:106-109). The explicit form is for the caller whose solving data
+is the coin control's external provider and whose WALLET is therefore NIL
+(spend.cpp:92-104, called at :305)."
   (let ((weight (%max-input-weight wallet cc script use-max-sig
                                    :tx-is-segwit t)))
     (if weight (ceiling weight 4) -1)))
@@ -1660,8 +1666,8 @@ inputs, in selection order. Caller holds node + wallet locks."
                (when (minusp input-bytes)
                  (setf input-bytes
                        (%max-signed-input-vsize
-                        wallet cc (bl.ser:tx-out-script-pubkey txout)
-                        (%wallet-use-max-sig-p wallet))))
+                        wallet cc (bl.ser:tx-out-script-pubkey
+                                   txout))))
                ;; TRUC version mixing on unconfirmed preset inputs
                ;; (spend.cpp:286-293).
                (when (zerop (wallet-tx-depth wallet wtx))
@@ -1980,9 +1986,7 @@ Caller holds node + wallet locks."
                   (setf (csel-params-change-output-size params)
                         (bl.rpc:txout-serialize-size change-script))
                   (let ((change-spend-size
-                          (%max-signed-input-vsize
-                           wallet nil change-script
-                           (%wallet-use-max-sig-p wallet))))
+                          (%max-signed-input-vsize wallet nil change-script)))
                     (setf (csel-params-change-spend-size params)
                           (if (minusp change-spend-size)
                               +dummy-nested-p2wpkh-input-size+
@@ -2057,9 +2061,7 @@ Caller holds node + wallet locks."
                                       :feerate feerate
                                       :input-bytes-fn
                                       (lambda (script)
-                                        (%max-signed-input-vsize
-                                         wallet cc script
-                                         (%wallet-use-max-sig-p wallet)))
+                                        (%max-signed-input-vsize wallet cc script))
                                       :allow-used-addresses
                                       (or (not (wallet-flag-set-p
                                                 wallet +wallet-flag-avoid-reuse+))
@@ -3465,9 +3467,7 @@ estimate_mode fee_rate options)."
                                          :feerate fee-rate
                                          :input-bytes-fn
                                          (lambda (script)
-                                           (%max-signed-input-vsize
-                                            wallet cc script
-                                            (%wallet-use-max-sig-p wallet)))
+                                           (%max-signed-input-vsize wallet cc script))
                                          ;; Core sendall ALWAYS sweeps reused
                                          ;; coins: AvailableCoins' allow_used
                                          ;; = !AVOID_REUSE || (cc &&
