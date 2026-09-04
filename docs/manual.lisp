@@ -675,6 +675,8 @@
   (bitcoin-lisp.validation:activate-best-chain function)
   (bitcoin-lisp.validation:perform-reorg function)
   (bitcoin-lisp.validation:versionbits-state function)
+  (bitcoin-lisp.validation:compute-block-version function)
+  (bitcoin-lisp.validation:versionbits-gbt-status function)
   (bitcoin-lisp.validation:check-signet-block-solution function))
 
 (defsection @mempool (:title "mempool: the pool and its policy")
@@ -728,6 +730,13 @@
   is unconditional, the WITNESS is not, and a block carrying one below
   the segwit height is rejected `:unexpected-witness'.
 
+  The template's nVersion is Core's ComputeBlockVersion over the
+  versionbits state machine -- every STARTED or LOCKED_IN deployment's bit
+  -- and `-blockversion' replaces it on regtest alone, as Core gates that
+  on MineBlocksOnDemand(). getblocktemplate reports the same machine's
+  three groups: signalling and locked-in in `vbavailable', active in
+  `rules'.
+
   Traps: the reserved weight exists because the header and the
   transaction-count varint count toward the block weight. MINE-BLOCK
   returns the number of FAILED nonces as a second value, because
@@ -741,6 +750,8 @@
   (bitcoin-lisp.mining:assemble-full-block function)
   (bitcoin-lisp.mining:mine-block function)
   (bitcoin-lisp.mining:next-block-required-bits function)
+  (bitcoin-lisp.mining:next-block-version function)
+  (bitcoin-lisp.mining:*block-version-override* variable)
   (bitcoin-lisp.mining:*block-max-weight* variable)
   (bitcoin-lisp.mining:*block-reserved-weight* variable)
   (bitcoin-lisp.mining:*block-min-tx-fee-rate* variable))

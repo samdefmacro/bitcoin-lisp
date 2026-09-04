@@ -173,6 +173,9 @@ false once the window cannot be reached."
         (is (= 0 count))
         (is (null possible) "a full period with no signal cannot still be possible")))))
 
+;;;; What the miner and getblocktemplate read out of the state machine
+;;;; (Core ComputeBlockVersion versionbits.cpp:265-279, GBTStatus :228-257).
+
 (test versionbits-mtp-is-computed-from-the-entry-alone
   "⚠️ COMPUTE-MEDIAN-TIME-PAST-FROM-ENTRY takes ONE argument. %VB-MTP passed it
 the chain-state as well, so every state that needs a real MTP signalled
@@ -183,3 +186,85 @@ carrying a deployment with a real start time, is the case that executes it."
   (multiple-value-bind (cs last) (make-versionbits-chain 144 :signal-bit 28)
     (let ((testdummy (%dep "testdummy" :regtest)))
       (is (eq :started (bl.val:versionbits-state cs last testdummy))))))
+
+(test compute-block-version-signals-started-and-locked-in-deployments
+  "Core ComputeBlockVersion ORs in the bit of every STARTED or LOCKED_IN
+deployment and of no other (versionbits.cpp:271-275). regtest's testdummy walks
+all three states in three 144-block periods, so one chain length per state
+covers the whole rule — and the ACTIVE case is the one that must NOT signal.
+
+Every template this node produced carried the bare constant #x20000000, so a
+regtest template of ours differed from Core's in the first field a miner reads."
+  (flet ((version (n) (multiple-value-bind (cs last)
+                          (make-versionbits-chain n :signal-bit 28)
+                        (bl.val:compute-block-version cs last :regtest))))
+    (is (= #x30000000 (version 144)) "STARTED must signal bit 28")
+    (is (= #x30000000 (version 288)) "LOCKED_IN must signal bit 28")
+    (is (= #x20000000 (version 432)) "ACTIVE must not signal"))
+  ;; taproot is ALWAYS_ACTIVE on regtest and testdummy is NEVER_ACTIVE on the
+  ;; four other chains, so those chains signal nothing at all — which is why
+  ;; the hardcoded constant was right everywhere except regtest.
+  (multiple-value-bind (cs last) (make-versionbits-chain 144 :signal-bit 28)
+    (dolist (net '(:mainnet :testnet3 :testnet4 :signet))
+      (is (= #x20000000 (bl.val:compute-block-version cs last net))
+          "~A must not signal any deployment" net))))
+
+(test versionbits-gbt-status-groups-by-state-and-sorts-by-name
+  "GBTStatus splits the deployments into signalling / locked_in / active and
+exposes DEFINED and FAILED to nobody (versionbits.cpp:240-255). Its groups are
+std::maps keyed by the deployment name, so getblocktemplate's `rules' array is
+in NAME order — taproot before testdummy, the reverse of the order the
+deployments are declared in, which is what makes the sort observable."
+  (flet ((names (list) (mapcar #'bl.val:vb-deployment-name list)))
+    (multiple-value-bind (cs last) (make-versionbits-chain 144 :signal-bit 28)
+      (multiple-value-bind (signalling locked-in active)
+          (bl.val:versionbits-gbt-status cs last :regtest)
+        (is (equal '("testdummy") (names signalling)))
+        (is (null locked-in))
+        (is (equal '("taproot") (names active)))))
+    (multiple-value-bind (cs last) (make-versionbits-chain 288 :signal-bit 28)
+      (multiple-value-bind (signalling locked-in active)
+          (bl.val:versionbits-gbt-status cs last :regtest)
+        (is (null signalling))
+        (is (equal '("testdummy") (names locked-in)))
+        (is (equal '("taproot") (names active)))))
+    (multiple-value-bind (cs last) (make-versionbits-chain 432 :signal-bit 28)
+      (multiple-value-bind (signalling locked-in active)
+          (bl.val:versionbits-gbt-status cs last :regtest)
+        (is (null signalling))
+        (is (null locked-in))
+        (is (equal '("taproot" "testdummy") (names active))
+            "the groups are name-ordered, not declaration-ordered")))
+    ;; A chain whose deployments are all DEFINED or FAILED reports nothing.
+    (multiple-value-bind (cs last) (make-versionbits-chain 144)
+      (multiple-value-bind (signalling locked-in active)
+          (bl.val:versionbits-gbt-status cs last :mainnet)
+        (is (null signalling))
+        (is (null locked-in))
+        (is (null active))))))
+
+(test vb-gbt-rule-name-prefixes-only-mandatory-rules
+  "gbt_rule_value prefixes `!' unless the deployment's VBDeploymentInfo says
+gbt_optional_rule (deploymentinfo.cpp:11-20, rpc/mining.cpp:605-612). Both of
+Core's deployments are optional, so the mandatory branch has no live vector —
+binding the table empty is its positive control, and it also proves the default
+for a name nobody classified is MANDATORY rather than a silent pass."
+  (let ((taproot (%dep "taproot" :regtest))
+        (testdummy (%dep "testdummy" :regtest)))
+    (is-true (bl.val:vb-deployment-optional-rule-p taproot))
+    (is-true (bl.val:vb-deployment-optional-rule-p testdummy))
+    (is (string= "taproot" (bl.val:vb-gbt-rule-name taproot)))
+    (is (string= "testdummy" (bl.val:vb-gbt-rule-name testdummy)))
+    (let ((bl.val::*vb-gbt-optional-rules* '()))
+      (is-false (bl.val:vb-deployment-optional-rule-p taproot))
+      (is (string= "!taproot" (bl.val:vb-gbt-rule-name taproot)))
+      (is (string= "!testdummy" (bl.val:vb-gbt-rule-name testdummy))))))
+
+(test vb-deployment-mask-is-the-single-signalling-bit
+  "Core ThresholdConditionChecker::Mask is 1 << bit, and it is what
+ComputeBlockVersion ORs and what getblocktemplate clears for an unsupported
+mandatory rule."
+  (is (= (ash 1 28) (bl.val:vb-deployment-mask
+                     (%dep "testdummy" :regtest))))
+  (is (= (ash 1 2) (bl.val:vb-deployment-mask
+                    (%dep "taproot" :mainnet)))))

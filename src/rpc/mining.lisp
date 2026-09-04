@@ -59,12 +59,14 @@ selected tx with data/txid/hash/depends/fee/sigops/weight. `depends` holds the
                     ("sigops" . ,(bl.mp:mempool-entry-sigops e))
                     ("weight" . ,(bl.ser:transaction-weight tx))))))
 
-(defun %gbt-rules (network height)
-  "Active versionbits soft-fork rule names for a block at HEIGHT on NETWORK, as
-Bitcoin Core's getblocktemplate \"rules\" array. segwit carries the \"!\" prefix
-(mandatory: a miner that doesn't understand it must not build the template),
-mirroring Core. Without this array, segwit/taproot-aware miners reject the
-template outright.
+(defun %gbt-rules (network height active-deployments)
+  "Active soft-fork rule names for a block at HEIGHT on NETWORK, as Bitcoin
+Core's getblocktemplate \"rules\" array (rpc/mining.cpp:949-955, :977-984). The
+buried rules come first, then one entry per ACTIVE-DEPLOYMENTS deployment,
+spelled by BL.VAL:VB-GBT-RULE-NAME — which is where the \"!\" prefix comes from,
+for segwit and signet as much as for a bip9 rule: it marks a rule a miner that
+does not understand it must not build on. Without this array,
+segwit/taproot-aware miners reject the template outright.
 
 NETWORK is a parameter rather than a read of the global `*network*' because the
 other two places in this same response that depend on the chain — the
@@ -83,12 +85,57 @@ template cache is keyed on the node."
     ;; no way to know, which is half of why signet mining could not work here.
     (when (eq net :signet)
       (push "!signet" rules))
-    ;; taproot carries NO "!" prefix: its VersionBitsDeploymentInfo sets
-    ;; gbt_optional_rule = true (deploymentinfo.cpp:17-18), and gbt_rule_value
-    ;; only prefixes the mandatory ones (rpc/mining.cpp:605-611).
-    (when (>= height (bl.val:get-taproot-activation-height net))
-      (push "taproot" rules))
+    ;; The bip9 deployments the versionbits state machine reports ACTIVE, in
+    ;; Core's order (its groups are std::maps, so by name). taproot carries no
+    ;; "!": its VersionBitsDeploymentInfo sets gbt_optional_rule = true
+    ;; (deploymentinfo.cpp:17-18).
+    (dolist (deployment active-deployments)
+      (push (bl.val:vb-gbt-rule-name deployment) rules))
     (nreverse rules)))
+
+(defun %gbt-versionbits (network chain-state prev-entry base-version client-rules)
+  "The versionbits half of one getblocktemplate reply for the block extending
+PREV-ENTRY (Core rpc/mining.cpp:958-984). Returns (VALUES version vbavailable
+active-deployments), where VBAVAILABLE is a (rule-name . bit) alist and
+BASE-VERSION is the nVersion the assembler already computed.
+
+Core's three rules, in its order:
+  STARTED   -- offer the bit in vbavailable;
+  LOCKED_IN -- offer it AND set it in the version (the miner has no choice
+               left, so the template signals it whether or not it was asked);
+  ACTIVE    -- name it in `rules' instead, and refuse a client that has not
+               declared a MANDATORY one, because it would mine a block under
+               rules it does not implement.
+A mandatory rule the client did not declare is also cleared from the version
+in the first two cases: signalling for a fork the miner cannot enforce is
+exactly what the declaration exists to prevent."
+  (multiple-value-bind (signalling locked-in active)
+      (bl.val:versionbits-gbt-status chain-state prev-entry network)
+    (let ((version base-version)
+          (vbavailable '()))
+      (flet ((unsupported-p (deployment)
+               (and (not (bl.val:vb-deployment-optional-rule-p deployment))
+                    (not (member (bl.val:vb-deployment-name deployment)
+                                 client-rules :test #'string=))))
+             (offer (deployment)
+               (push (cons (bl.val:vb-gbt-rule-name deployment)
+                           (bl.val:vb-deployment-bit deployment))
+                     vbavailable)))
+        (dolist (deployment locked-in)
+          (setf version (logior version (bl.val:vb-deployment-mask deployment))))
+        ;; Core writes the offer-and-mask twice, once per group, and its two
+        ;; copies differ only in that lock-in ORs the bit first; signalling
+        ;; before locked-in is the order its vbavailable comes out in.
+        (dolist (deployment (append signalling locked-in))
+          (offer deployment)
+          (when (unsupported-p deployment)
+            (setf version (logandc2 version (bl.val:vb-deployment-mask deployment)))))
+        (dolist (deployment active)
+          (when (unsupported-p deployment)
+            (error 'rpc-error :code +rpc-invalid-parameter+
+                              :message (format nil "Support for '~A' rule requires explicit client support"
+                                               (bl.val:vb-deployment-name deployment))))))
+      (values version (nreverse vbavailable) active))))
 
 (defun %gbt-client-rules (params)
   "The rule names the caller declared support for, as a list of strings.
@@ -328,11 +375,18 @@ miner."
          (mempool (rpc-get-mempool node))
          (tip-hex (hash-to-hex (bl.store:best-block-hash chain-state)))
          (txs-updated (bl.mp:mempool-transactions-updated mempool))
-         (cached (%gbt-cached-result node tip-hex txs-updated)))
+         ;; The rules the client declared are part of what the answer depends
+         ;; on: an ACTIVE mandatory rule it has not declared is refused, and a
+         ;; signalling one it has not declared is masked out of `version'
+         ;; (rpc/mining.cpp:963-983). Core rebuilds the reply every call and
+         ;; caches only the block; ours caches the reply, so the rules belong
+         ;; in its key or a second miner would be served the first one's.
+         (rules (sort (copy-list (%gbt-client-rules params)) #'string<))
+         (cached (%gbt-cached-result node tip-hex txs-updated rules)))
     (when cached (return-from rpc-getblocktemplate cached))
-    (%gbt-build-and-cache node chain-state mempool tip-hex txs-updated)))
+    (%gbt-build-and-cache node chain-state mempool tip-hex txs-updated rules)))
 
-(defun %gbt-cached-result (node tip-hex txs-updated)
+(defun %gbt-cached-result (node tip-hex txs-updated rules)
   "The cached template when it is still good, else NIL (Core rpc/mining.cpp's
 `if (!pindexPrev || pindexPrev->GetBlockHash() != tip || (txsUpdated != last &&
 GetTime() - time_start > 5))`).
@@ -344,24 +398,30 @@ getblocktemplate call reassemble a block."
   (bt:with-lock-held (*gbt-cache-lock*)
     (let ((cache *gbt-cache*))
       (when cache
-        (destructuring-bind (cached-node cached-tip cached-updated built-at . result) cache
+        (destructuring-bind (cached-node cached-tip cached-updated cached-rules built-at . result) cache
           (when (and (eq cached-node node)
                      (string= cached-tip tip-hex)
+                     (equal cached-rules rules)
                      (or (= cached-updated txs-updated)
                          (<= (- (bl.ser:get-unix-time) built-at)
                              +gbt-cache-seconds+)))
             result))))))
 
-(defun %gbt-build-and-cache (node chain-state mempool tip-hex txs-updated)
+(defun %gbt-build-and-cache (node chain-state mempool tip-hex txs-updated rules)
   "Assemble a fresh template and cache it under the state it was built from."
-  (let ((result (%gbt-assemble node chain-state mempool tip-hex txs-updated)))
+  ;; One versionbits memo around the whole assembly: the assembler computes the
+  ;; template's nVersion from the state machine and the reply below re-reads the
+  ;; same states for vbavailable and rules, which on mainnet is a chain walk
+  ;; each (BL.VAL:*VERSIONBITS-STATE-CACHE*).
+  (let ((result (bl.val:with-versionbits-cache
+                  (%gbt-assemble node chain-state mempool tip-hex txs-updated rules))))
     (bt:with-lock-held (*gbt-cache-lock*)
-      (setf *gbt-cache* (list* node tip-hex txs-updated
+      (setf *gbt-cache* (list* node tip-hex txs-updated rules
                                (bl.ser:get-unix-time)
                                result)))
     result))
 
-(defun %gbt-assemble (node chain-state mempool tip-hex txs-updated)
+(defun %gbt-assemble (node chain-state mempool tip-hex txs-updated rules)
   "Build one getblocktemplate result. Split out of RPC-GETBLOCKTEMPLATE so the
 cache above wraps exactly the expensive part and nothing else."
   (declare (ignorable tip-hex))
@@ -378,51 +438,61 @@ cache above wraps exactly the expensive part and nothing else."
                                    (make-array 1 :element-type '(unsigned-byte 8)
                                                  :initial-element #x51) ; OP_TRUE
                                    :utxo-set (rpc-get-utxo-set node)))))
-         (bits (bl.mining:block-template-bits template)))
-    `(("capabilities" . ("proposal"))
-      ("version" . ,(bl.mining:block-template-version template))
-      ("previousblockhash" . ,(hash-to-hex (bl.mining:block-template-prev-hash template)))
-      ("transactions" . ,(%gbt-transactions template))
-      ("coinbaseaux" . ,(make-hash-table :test 'equal))
-      ("coinbasevalue" . ,(bl.mining:block-template-coinbase-value template))
-      ("target" . ,(%bits-to-target-hex bits))
-      ("mintime" . ,(bl.mining:block-template-mintime template))
-      ("mutable" . ("time" "transactions" "prevblock"))
-      ("noncerange" . "00000000ffffffff")
-      ("sigoplimit" . ,bl.val:+max-block-sigops-cost+)
-      ("sizelimit" . 4000000)          ; MAX_BLOCK_SERIALIZED_SIZE
-      ("weightlimit" . ,bl.val:+max-block-weight+)
-      ("curtime" . ,(bl.mining:block-template-curtime template))
-      ("bits" . ,(%bits-hex bits))
-      ("height" . ,(bl.mining:block-template-height template))
-      ;; Core emits signet_challenge on a signet chain and nowhere else
-      ;; (rpc/mining.cpp:1017-1019), as the raw challenge script in hex. A
-      ;; signet miner cannot build the block's signet solution without it, so
-      ;; omitting it made signet mining against this node impossible; we
-      ;; reported the challenge from getmininginfo only, which no miner reads.
-      ,@(when (eq (bl:node-network node) :signet)
-          (let ((challenge (bl.val:signet-challenge-for-network
-                            (bl:node-network node))))
-            (when challenge
-              (list (cons "signet_challenge"
-                          (bl.crypto:bytes-to-hex challenge))))))
-      ("default_witness_commitment"
-       . ,(bl.crypto:bytes-to-hex
-           (bl.mining:block-template-default-witness-commitment-script template)))
-      ;; Active soft-fork rules + versionbits signaling state. No BIP9
-      ;; deployment is currently pending on any of our networks, so
-      ;; vbavailable is empty and vbrequired is 0.
-      ("rules" . ,(%gbt-rules (bl:node-network node)
-                              (bl.mining:block-template-height template)))
-      ("vbavailable" . ,(make-hash-table :test 'equal))
-      ("vbrequired" . 0)
-      ;; longpoll id: <best chain hash><nTransactionsUpdatedLast> (Core
-      ;; rpc/mining.cpp:995). The second half MUST be the mempool counter, not
-      ;; the height: a miner longpolling on a height-derived id would never be
-      ;; woken by mempool churn, which is most of what a new template is for.
-      ("longpollid" . ,(format nil "~A~D"
-                               (hash-to-hex (bl.mining:block-template-prev-hash template))
-                               txs-updated)))))
+         (bits (bl.mining:block-template-bits template))
+         ;; The block the template extends, by the hash the template itself
+         ;; recorded -- not a fresh read of the tip, which can already have
+         ;; moved by the time the assembly returns.
+         (prev-entry (bl.store:get-block-index-entry
+                      chain-state (bl.mining:block-template-prev-hash template))))
+    (multiple-value-bind (version vbavailable active-deployments)
+        (%gbt-versionbits (bl:node-network node) chain-state prev-entry
+                          (bl.mining:block-template-version template) rules)
+      `(("capabilities" . ("proposal"))
+        ("version" . ,version)
+        ("previousblockhash" . ,(hash-to-hex (bl.mining:block-template-prev-hash template)))
+        ("transactions" . ,(%gbt-transactions template))
+        ("coinbaseaux" . ,(make-hash-table :test 'equal))
+        ("coinbasevalue" . ,(bl.mining:block-template-coinbase-value template))
+        ("target" . ,(%bits-to-target-hex bits))
+        ("mintime" . ,(bl.mining:block-template-mintime template))
+        ("mutable" . ("time" "transactions" "prevblock"))
+        ("noncerange" . "00000000ffffffff")
+        ("sigoplimit" . ,bl.val:+max-block-sigops-cost+)
+        ("sizelimit" . 4000000)          ; MAX_BLOCK_SERIALIZED_SIZE
+        ("weightlimit" . ,bl.val:+max-block-weight+)
+        ("curtime" . ,(bl.mining:block-template-curtime template))
+        ("bits" . ,(%bits-hex bits))
+        ("height" . ,(bl.mining:block-template-height template))
+        ;; Core emits signet_challenge on a signet chain and nowhere else
+        ;; (rpc/mining.cpp:1017-1019), as the raw challenge script in hex. A
+        ;; signet miner cannot build the block's signet solution without it, so
+        ;; omitting it made signet mining against this node impossible; we
+        ;; reported the challenge from getmininginfo only, which no miner reads.
+        ,@(when (eq (bl:node-network node) :signet)
+            (let ((challenge (bl.val:signet-challenge-for-network
+                              (bl:node-network node))))
+              (when challenge
+                (list (cons "signet_challenge"
+                            (bl.crypto:bytes-to-hex challenge))))))
+        ("default_witness_commitment"
+         . ,(bl.crypto:bytes-to-hex
+             (bl.mining:block-template-default-witness-commitment-script template)))
+        ;; Active soft-fork rules and the versionbits signalling state, both
+        ;; from the versionbits state machine (rpc/mining.cpp:949-989).
+        ;; vbrequired is the constant 0 Core emits: it never asks a miner to set
+        ;; a bit, it only offers them in vbavailable.
+        ("rules" . ,(%gbt-rules (bl:node-network node)
+                                (bl.mining:block-template-height template)
+                                active-deployments))
+        ("vbavailable" . ,(json-object vbavailable))
+        ("vbrequired" . 0)
+        ;; longpoll id: <best chain hash><nTransactionsUpdatedLast> (Core
+        ;; rpc/mining.cpp:995). The second half MUST be the mempool counter, not
+        ;; the height: a miner longpolling on a height-derived id would never be
+        ;; woken by mempool churn, which is most of what a new template is for.
+        ("longpollid" . ,(format nil "~A~D"
+                                 (hash-to-hex (bl.mining:block-template-prev-hash template))
+                                 txs-updated))))))
 
 (define-rpc "getmininginfo" (node params)
   "Return mining-related state (Bitcoin Core getmininginfo)."

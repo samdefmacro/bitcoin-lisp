@@ -107,7 +107,13 @@
     "bitcoin-lisp.storage:utxo-exists-p"
     "bitcoin-lisp.storage:write-utxo-entry-fields"
     "bitcoin-lisp.validation:decode-coinbase-height"
-    "bitcoin-lisp.validation:execute-script")
+    "bitcoin-lisp.validation:execute-script"
+    ;; Superseded by the versionbits state machine: getblocktemplate's "rules"
+    ;; array was its only caller, and Core builds that array from the bip9
+    ;; ACTIVE group (rpc/mining.cpp:977-984), not from an activation height.
+    ;; Kept exported because it is still the only reader of the chain-params
+    ;; taproot-height column, which several chains carry a real value in.
+    "bitcoin-lisp.validation:get-taproot-activation-height")
   "Exported functions with no caller in src/ as of 2026-08-22, as
 \"package:name\" strings -- strings rather than symbols so that unexporting one
 is an ordinary test failure and not a READ error that kills compilation.")

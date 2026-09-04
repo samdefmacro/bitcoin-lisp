@@ -30,6 +30,13 @@ vectors passed this entire suite while answering every real miner -8."
     (loop for (k v) on extra by #'cddr do (setf (gethash k req) v))
     (bl.rpc::%normalize-rpc-params (vector req))))
 
+(defun %gbt (node &optional (params (%gbt-params)))
+  "getblocktemplate through its handler, with PARAMS defaulting to a
+segwit-declaring request. One reach for the whole file: the handler is
+internal to BL.RPC (only DISPATCH-RPC-METHOD is exported), and sixteen copies
+of the same :: is what the structural ratchet exists to collapse."
+  (bl.rpc::rpc-getblocktemplate node params))
+
 ;;;; Regtest network parameters
 
 (test regtest-network-params
@@ -378,7 +385,7 @@ chunk feerate diagram, not boundary knapsack optimality."
         (setf (bl:node-chain-state node) cs
               (bl:node-mempool node) mp
               (bl:node-utxo-set node) (bl.store:make-utxo-set))
-        (let ((r (bl.rpc::rpc-getblocktemplate node (%gbt-params))))
+        (let ((r (%gbt node (%gbt-params))))
           (is (= 1 (cdr (assoc "height" r :test #'string=))))
           (is (stringp (cdr (assoc "previousblockhash" r :test #'string=))))
           (is (= (bl.val:calculate-block-subsidy 1)
@@ -412,7 +419,7 @@ mempool churn, which is most of what a new template exists to report."
         (setf (bl:node-chain-state node) cs
               (bl:node-mempool node) mp
               (bl:node-utxo-set node) (bl.store:make-utxo-set))
-        (let* ((r (bl.rpc::rpc-getblocktemplate node (%gbt-params)))
+        (let* ((r (%gbt node (%gbt-params)))
                (id (cdr (assoc "longpollid" r :test #'string=))))
           (is (= (+ 64 (length (princ-to-string
                                 (bl.mp:mempool-transactions-updated mp))))
@@ -503,37 +510,42 @@ which is what stops a busy mempool from reassembling a block on every call."
   (let ((bl:*network* :regtest)
         (bl.rpc::*gbt-cache* nil))
     (let ((now (bl.ser:get-unix-time))
+          (rules '("segwit"))
           (node-a (bl:make-node :network :regtest))
           (node-b (bl:make-node :network :regtest)))
-      ;; Same node, same tip, same counter: hit.
-      (setf bl.rpc::*gbt-cache* (list* node-a "aa" 5 now '(("marker" . 1))))
+      ;; Same node, same tip, same counter, same client rules: hit.
+      (setf bl.rpc::*gbt-cache* (list* node-a "aa" 5 rules now '(("marker" . 1))))
       (is (equal '(("marker" . 1))
-                 (bl.rpc::%gbt-cached-result node-a "aa" 5)))
+                 (bl.rpc::%gbt-cached-result node-a "aa" 5 rules)))
       ;; A DIFFERENT node never hits, however well the tip and counter match.
       ;; Core's cache is a function-local static in a one-node process; here
       ;; the RPC layer serves whatever node it is handed, and two regtest nodes
       ;; share a genesis tip hash — so a node-blind key hands one node the
       ;; other's template. (Found by a suite failure, not by review: the test
       ;; passed alone and failed after another test had primed the cache.)
-      (is-false (bl.rpc::%gbt-cached-result node-b "aa" 5))
+      (is-false (bl.rpc::%gbt-cached-result node-b "aa" 5 rules))
+      ;; Nor do DIFFERENT client rules: the reply's version and vbavailable
+      ;; depend on them, so a second miner must not be served the first one's
+      ;; template (rpc/mining.cpp:963-983).
+      (is-false (bl.rpc::%gbt-cached-result node-a "aa" 5 '("segwit" "signet")))
       ;; Same tip, CHANGED counter, still fresh: hit, per Core's condition.
       (is (equal '(("marker" . 1))
-                 (bl.rpc::%gbt-cached-result node-a "aa" 9)))
+                 (bl.rpc::%gbt-cached-result node-a "aa" 9 rules)))
       ;; Same tip, changed counter, older than five seconds: miss.
       (setf bl.rpc::*gbt-cache*
-            (list* node-a "aa" 5 (- now bl.rpc::+gbt-cache-seconds+ 1)
+            (list* node-a "aa" 5 rules (- now bl.rpc::+gbt-cache-seconds+ 1)
                    '(("marker" . 1))))
-      (is-false (bl.rpc::%gbt-cached-result node-a "aa" 9))
+      (is-false (bl.rpc::%gbt-cached-result node-a "aa" 9 rules))
       ;; But an unchanged counter keeps the old template however stale — Core
       ;; has nothing new to put in it.
       (is (equal '(("marker" . 1))
-                 (bl.rpc::%gbt-cached-result node-a "aa" 5)))
+                 (bl.rpc::%gbt-cached-result node-a "aa" 5 rules)))
       ;; A changed TIP always misses, whatever the age.
-      (setf bl.rpc::*gbt-cache* (list* node-a "aa" 5 now '(("marker" . 1))))
-      (is-false (bl.rpc::%gbt-cached-result node-a "bb" 5))
+      (setf bl.rpc::*gbt-cache* (list* node-a "aa" 5 rules now '(("marker" . 1))))
+      (is-false (bl.rpc::%gbt-cached-result node-a "bb" 5 rules))
       ;; An empty cache never hits.
       (setf bl.rpc::*gbt-cache* nil)
-      (is-false (bl.rpc::%gbt-cached-result node-a "aa" 5)))
+      (is-false (bl.rpc::%gbt-cached-result node-a "aa" 5 rules)))
     ;; End to end: two calls in a row against an unchanged node return the
     ;; SAME object, which is what proves the assembly was skipped.
     (multiple-value-bind (cs mp) (%mining-fixture)
@@ -542,8 +554,8 @@ which is what stops a busy mempool from reassembling a block on every call."
               (bl:node-mempool node) mp
               (bl:node-utxo-set node) (bl.store:make-utxo-set)
               bl.rpc::*gbt-cache* nil)
-        (let ((a (bl.rpc::rpc-getblocktemplate node (%gbt-params)))
-              (b (bl.rpc::rpc-getblocktemplate node (%gbt-params))))
+        (let ((a (%gbt node (%gbt-params)))
+              (b (%gbt node (%gbt-params))))
           (is (eq a b) "getblocktemplate reassembled an unchanged template"))))))
 
 (test rpc-getmininginfo-shape
@@ -1069,7 +1081,7 @@ the generate* paths pass the UTXO set, so all live templates are dry-run
         :coinbase-script-pubkey (p2sh-optrue-script-pubkey)
         :utxo-set (bl:node-utxo-set node)))
      ;; getblocktemplate takes the same guarded path.
-     (signals error (bl.rpc::rpc-getblocktemplate node (%gbt-params)))
+     (signals error (%gbt node (%gbt-params)))
      ;; generatetoaddress refuses to mine it.
      (signals error
        (bl.rpc:dispatch-rpc-method
@@ -1135,14 +1147,14 @@ because a proposal is by definition unmined."
              (let ((req (make-hash-table :test 'equal)))
                (setf (gethash "mode" req) "proposal")
                (when data (setf (gethash "data" req) data))
-               (handler-case (bl.rpc::rpc-getblocktemplate node (list req))
+               (handler-case (%gbt node (list req))
                  (bl.rpc:rpc-error (e)
                    (list :error (bl.rpc:rpc-error-code e)
                          (bl.rpc:rpc-error-message e)))))))
       ;; A template this node just produced must validate as a proposal —
       ;; anything else means getblocktemplate is handing miners work the node
       ;; would itself reject.
-      (let* ((tmpl (bl.rpc::rpc-getblocktemplate node (%gbt-params)))
+      (let* ((tmpl (%gbt node (%gbt-params)))
              (prev (cdr (assoc "previousblockhash" tmpl :test #'string=))))
         (is-true prev "the template has no previousblockhash"))
       ;; Missing data is Core's type error, not a crash.
@@ -1181,7 +1193,7 @@ would otherwise hand it."
 
 (defun %gbt-error-message (node params)
   "The rpc-error message getblocktemplate signals for PARAMS, or NIL."
-  (handler-case (progn (bl.rpc::rpc-getblocktemplate node params) nil)
+  (handler-case (progn (%gbt node params) nil)
     (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-message e))))
 
 (test gbt-requires-the-client-to-declare-segwit
@@ -1233,7 +1245,7 @@ The output \"rules\" array must also carry \"!signet\" (rpc/mining.cpp:951-955).
          (node (%gbt-node :signet))
          (req (make-hash-table :test 'equal)))
     (setf (gethash "rules" req) (vector "segwit" "signet"))
-    (let* ((r (bl.rpc::rpc-getblocktemplate node (%gbt-norm req)))
+    (let* ((r (%gbt node (%gbt-norm req)))
            (challenge (cdr (assoc "signet_challenge" r :test #'string=)))
            (rules (cdr (assoc "rules" r :test #'string=))))
       (is-true (stringp challenge) "no signet_challenge in a signet template")
@@ -1246,7 +1258,7 @@ The output \"rules\" array must also carry \"!signet\" (rpc/mining.cpp:951-955).
       (is-true (member "!signet" rules :test #'string=))))
   ;; And nowhere else.
   (let* ((bl:*network* :regtest)
-         (r (bl.rpc::rpc-getblocktemplate (%gbt-node) (%gbt-params))))
+         (r (%gbt (%gbt-node) (%gbt-params))))
     (is-false (assoc "signet_challenge" r :test #'string=))
     (is-false (member "!signet" (cdr (assoc "rules" r :test #'string=)) :test #'string=))))
 
@@ -1280,7 +1292,7 @@ activation height, and taproot carries NO \"!\" prefix because its
 VersionBitsDeploymentInfo sets gbt_optional_rule = true
 (deploymentinfo.cpp:17-18, gbt_rule_value at rpc/mining.cpp:605-611)."
   (let* ((bl:*network* :regtest)
-         (r (bl.rpc::rpc-getblocktemplate (%gbt-node) (%gbt-params)))
+         (r (%gbt (%gbt-node) (%gbt-params)))
          (rules (cdr (assoc "rules" r :test #'string=))))
     (is-true (member "csv" rules :test #'string=)
              "csv must be present even at a height below its activation")
@@ -1600,3 +1612,108 @@ exact bug; the fix had simply never reached the second constructor."
                   node "generateblock" (%wire-params "raw(51)" (vector)))))
           (is (stringp (cdr (assoc "hash" r :test #'string=))))
           (is (= 1 (bl.store:current-height (bl:node-chain-state node)))))))))
+
+;;;; Block-template nVersion and the getblocktemplate versionbits fields
+;;;; (Core CreateNewBlock node/miner.cpp:140-145, rpc/mining.cpp:958-989)
+
+(defun %versionbits-node (blocks)
+  "A regtest node whose chain is BLOCKS long and signals bit 28 throughout."
+  (multiple-value-bind (cs tip) (make-versionbits-chain blocks :signal-bit 28)
+    (bl.store:update-chain-tip cs (bl.store:block-index-entry-hash tip)
+                               (bl.store:block-index-entry-height tip))
+    (let ((node (bl:make-node :network :regtest)))
+      (setf (bl:node-chain-state node) cs
+            (bl:node-mempool node) (bl.mp:make-mempool)
+            (bl:node-utxo-set node) (bl.store:make-utxo-set))
+      node)))
+
+(test template-version-comes-from-the-versionbits-cache
+  "Core sets pblock->nVersion from ComputeBlockVersion (miner.cpp:140). This
+node emitted the bare constant #x20000000 from a defstruct default that nothing
+ever set, so it could not signal a BIP9 deployment at all -- not a future soft
+fork, and not regtest's testdummy, which is permanently STARTED and which Core
+signals on bit 28 in every regtest template (mining_basic.py:87)."
+  (let ((bl:*network* :regtest))
+    (multiple-value-bind (cs tip) (make-versionbits-chain 144 :signal-bit 28)
+      (bl.store:update-chain-tip cs (bl.store:block-index-entry-hash tip) 143)
+      (let ((tmpl (bl.mining:assemble-block-template cs (bl.mp:make-mempool)
+                                                     :block-time 1090000)))
+        (is (= #x30000000 (bl.mining:block-template-version tmpl)))))
+    ;; At genesis testdummy is still DEFINED, so the constant is the right
+    ;; answer there -- which is why the bug was invisible in this suite.
+    (multiple-value-bind (cs mp) (%mining-fixture)
+      (is (= #x20000000 (bl.mining:block-template-version
+                         (bl.mining:assemble-block-template cs mp)))))))
+
+(test blockversion-override-applies-on-regtest-only
+  "-blockversion replaces the computed nVersion, and Core applies it on
+MineBlocksOnDemand() chains -- fPowNoRetargeting, so regtest alone
+(miner.cpp:141-145). mining_basic.py:85 asserts the 1337 it sets."
+  (let ((bl.mining:*block-version-override* 1337))
+    (let ((bl:*network* :regtest))
+      (is (= 1337 (bl.mining:next-block-version nil nil))))
+    (dolist (net '(:mainnet :testnet3 :testnet4 :signet))
+      (let ((bl:*network* net))
+        (is (= #x20000000 (bl.mining:next-block-version nil nil))
+            "-blockversion must not reach ~A" net))))
+  ;; Unset, the computed version stands on regtest too.
+  (let ((bl:*network* :regtest)
+        (bl.mining:*block-version-override* nil))
+    (is (= #x20000000 (bl.mining:next-block-version nil nil)))))
+
+(test gbt-reports-signalling-deployments-in-vbavailable
+  "getblocktemplate walks GBTStatus: a STARTED deployment is offered in
+vbavailable and set in the version, an ACTIVE one is named in rules instead
+(rpc/mining.cpp:958-984). Both fields were hardcoded -- an empty object and 0 --
+so a pool driven by this node could not learn a pending deployment's bit."
+  (let ((bl:*network* :regtest)
+        (bl.rpc::*gbt-cache* nil))
+    (let* ((node (%versionbits-node 144))
+           (r (%gbt node (%gbt-params)))
+           (vbavailable (cdr (assoc "vbavailable" r :test #'string=)))
+           (rules (cdr (assoc "rules" r :test #'string=))))
+      (is (= #x30000000 (cdr (assoc "version" r :test #'string=))))
+      (is (= 28 (cdr (assoc "testdummy" vbavailable :test #'string=)))
+          "a STARTED deployment must offer its bit in vbavailable")
+      (is (= 0 (cdr (assoc "vbrequired" r :test #'string=))))
+      ;; taproot is ALWAYS_ACTIVE on regtest, so it is a rule, not an offer.
+      (is (member "taproot" rules :test #'string=))
+      (is (not (member "testdummy" rules :test #'string=))
+          "a STARTED deployment is not an active rule")
+      (is (null (assoc "taproot" vbavailable :test #'string=))
+          "an ACTIVE deployment is not offered in vbavailable"))))
+
+(test gbt-refuses-an-active-mandatory-rule-the-client-did-not-declare
+  "Core throws \"Support for '%s' rule requires explicit client support\" for an
+ACTIVE deployment whose gbt_optional_rule is false and which the client did not
+name in its rules array, and masks a STARTED one out of the version instead
+(rpc/mining.cpp:963-983).
+
+Both of Core's deployments are optional, so this branch has no live vector:
+emptying the optional-rules table is its positive control. Without one the
+whole mandatory path would be untested code that reads as covered."
+  (let ((bl:*network* :regtest)
+        (bl.rpc::*gbt-cache* nil)
+        (bl.val::*vb-gbt-optional-rules* '()))
+    ;; taproot is ACTIVE on regtest from genesis, and the client declares only
+    ;; segwit -- so the request is refused.
+    (let ((node (%versionbits-node 144)))
+      (signals-rpc-error (:code bl.rpc:+rpc-invalid-parameter+
+                          :message "requires explicit client support")
+        (%gbt node (%gbt-params))))
+    ;; Declaring it is enough to be served -- and then the STARTED testdummy,
+    ;; still undeclared, is offered as "!testdummy" and masked OUT of version.
+    (let* ((node (%versionbits-node 144))
+           (r (%gbt node (%gbt-params "rules" (vector "segwit" "taproot"))))
+           (vbavailable (cdr (assoc "vbavailable" r :test #'string=))))
+      (is (= #x20000000 (cdr (assoc "version" r :test #'string=)))
+          "an undeclared mandatory rule must not be signalled")
+      (is (= 28 (cdr (assoc "!testdummy" vbavailable :test #'string=))))
+      (is (member "!taproot" (cdr (assoc "rules" r :test #'string=))
+                  :test #'string=)))
+    ;; And declaring both leaves the bit set: the mask is about client support,
+    ;; not about the deployment.
+    (let* ((node (%versionbits-node 144))
+           (r (%gbt node (%gbt-params "rules"
+                                      (vector "segwit" "taproot" "testdummy")))))
+      (is (= #x30000000 (cdr (assoc "version" r :test #'string=)))))))

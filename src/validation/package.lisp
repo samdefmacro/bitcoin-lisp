@@ -131,6 +131,11 @@ can. src/validation/.")
    #:vb-deployment-min-activation-height
    #:vb-deployment-threshold
    #:vb-deployment-period
+   #:vb-deployment-mask
+   #:vb-deployment-optional-rule-p
+   #:vb-gbt-rule-name
+   #:compute-block-version
+   #:versionbits-gbt-status
    #:+vb-always-active+
    #:+vb-never-active+
    #:+vb-no-timeout+
