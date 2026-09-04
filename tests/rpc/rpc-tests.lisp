@@ -6524,6 +6524,50 @@ null, so the empty array has to be spelled #(). Batch replies are per member."
                (jsonrpc-legacy-error-json bl.rpc:+rpc-invalid-request+
                                           "Invalid request format"))))))
 
+(test jsonrpc-batch-members-get-the-named-argument-transform
+  "A batch member reaches its handler through the same per-request path as a
+singleton, the named-argument transform included: Core runs both through
+JSONRPCExec -> CRPCTable::execute -> ExecuteCommand, and ExecuteCommand is
+where transformNamedArguments happens (rpc/server.cpp:502-512, reached from
+both HTTPReq_JSONRPC branches, httprpc.cpp:151-201). Ours skipped it for batch
+members, so a member whose \"params\" was a JSON object handed the handler a
+raw hash-table; every handler reads positionally, so the reply was -32603 with
+a Lisp type error in the message — a client could not even tell that the
+transport shape was at fault.
+
+Core catches a member's own error into that member's reply rather than failing
+the batch (httprpc.cpp:202-206), so a named parameter that names no slot is
+that member's -8 and its neighbours still run."
+  (flet ((echo-member (id params)
+           (format nil "{\"jsonrpc\":\"2.0\",\"id\":~D,\"method\":\"echo\",\"params\":~A}"
+                   id params))
+         (reply (body)
+           (multiple-value-bind (status json) (jsonrpc-handler-reply body)
+             (is (= 200 status) "~A answered ~D: ~S" body status json)
+             (yason:parse json))))
+    (let ((named (echo-member 1 "{\"arg1\":\"b\",\"arg0\":\"a\"}"))
+          ;; Core's \"args\" convenience: positional arguments alongside named
+          ;; ones (doc/JSON-RPC-interface.md#parameter-passing).
+          (prefixed (echo-member 2 "{\"args\":[\"a\"],\"arg1\":\"b\"}"))
+          (unknown (echo-member 3 "{\"nosuchargument\":1}")))
+      ;; CONTROL: as a SINGLETON the same member has always been transformed,
+      ;; so the batch assertions below cannot pass because of echo itself.
+      (is (equal '("a" "b") (gethash "result" (reply named))))
+      ;; Both shapes now reach the handler as the positional list it takes,
+      ;; and the slots are filled by NAME, not by the order they were written.
+      (let ((replies (reply (format nil "[~A,~A]" named prefixed))))
+        (is (= 2 (length replies)))
+        (dolist (r replies)
+          (is (equal '("a" "b") (gethash "result" r))
+              "member answered ~S" (gethash "error" r))))
+      ;; One member's transform failing is that member's error, not the
+      ;; batch's: the other member still runs and the batch is still 200.
+      (let ((replies (reply (format nil "[~A,~A]" unknown named))))
+        (is (= 2 (length replies)))
+        (is (= bl.rpc:+rpc-invalid-parameter+
+               (gethash "code" (gethash "error" (first replies)))))
+        (is (equal '("a" "b") (gethash "result" (second replies))))))))
+
 (test jsonrpc-handler-pre-dispatch-errors-use-the-legacy-shape
   "Every reply rpc-handler sends before (or instead of) dispatching — origin
 refusal, rate limit, oversized body, parse error, invalid request, and the

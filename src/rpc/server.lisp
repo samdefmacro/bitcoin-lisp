@@ -259,6 +259,18 @@ positional and named argument" hit-key)))
                  (named (mapcar (lambda (s) (if (eq s :absent) nil s)) kept)))
             (append positional (nthcdr (length positional) named)))))))
 
+(defun %request-params (method params)
+  "One request's PARAMS as the positional list every handler takes: METHOD's
+named-argument transform first, then normalization.
+
+Both halves belong to a REQUEST, not to the transport that carried it: Core
+reaches transformNamedArguments through ExecuteCommand (rpc/server.cpp:502-512),
+which a batch member and a singleton alike arrive at through
+JSONRPCExec -> CRPCTable::execute (httprpc.cpp:151-201). The order is fixed --
+the transform reads RAW parse output, so normalizing first would fold a named
+`false` to NIL before the slot it fills is a top-level positional argument."
+  (%normalize-rpc-params (%named-params-to-positional method params)))
+
 (defun parse-json-rpc-request (body)
   "Parse JSON-RPC request body. Returns (values :single method params id
 version id-present-p) or (values :batch requests). VERSION is :v2 when the
@@ -296,12 +308,7 @@ argument was `[]`."
                                  :message "Missing or invalid method"))
              (multiple-value-bind (id id-present) (gethash "id" json)
                (values :single method
-                       ;; Named parameters become positional here, before
-                       ;; normalization, so every handler keeps taking a plain
-                       ;; positional list (Core does the same transform in
-                       ;; ExecuteCommand, rpc/server.cpp:508).
-                       (%normalize-rpc-params
-                        (%named-params-to-positional method (or params '())))
+                       (%request-params method (or params '()))
                        id version
                        (and id-present t)))))
           (t
@@ -389,6 +396,14 @@ see %MAKE-RPC-REPLY for the version-dependent shape."
       (setf (gethash "data" error-obj) (rpc-result->json data)))
     (%make-rpc-reply nil error-obj id version id-present)))
 
+(defun rpc-error-response (condition id version &key (id-present t))
+  "The reply an RPC-ERROR CONDITION becomes for a request of VERSION."
+  (make-rpc-error-response (rpc-error-code condition)
+                           (rpc-error-message condition)
+                           id version
+                           :data (rpc-error-data condition)
+                           :id-present id-present))
+
 (defun handle-single-request (node method params id version &key (id-present t))
   "Handle a single RPC request. VERSION and ID-PRESENT come from the parsed
 request and shape the reply (see MAKE-RPC-RESPONSE)."
@@ -396,11 +411,7 @@ request and shape the reply (see MAKE-RPC-RESPONSE)."
       (let ((result (dispatch-rpc-method node method params)))
         (make-rpc-response result id version :id-present id-present))
     (rpc-error (e)
-      (make-rpc-error-response (rpc-error-code e)
-                               (rpc-error-message e)
-                               id version
-                               :data (rpc-error-data e)
-                               :id-present id-present))
+      (rpc-error-response e id version :id-present id-present))
     (error (e)
       (bl.log:node-log :error "RPC internal error: ~A" e)
       (make-rpc-error-response +rpc-internal-error+
@@ -412,23 +423,36 @@ request and shape the reply (see MAKE-RPC-RESPONSE)."
   "Handle a batch of RPC requests, returning the list of replies to send.
 Core re-parses every batch member on its own (httprpc.cpp:194-206), so version
 and id-presence are PER MEMBER; a 2.0 notification (no id member) is executed
-but contributes no reply at all (:207-209)."
+but contributes no reply at all (:207-209).
+
+A member takes the SAME per-request path as a singleton, %REQUEST-PARAMS
+included: Core runs both through JSONRPCExec -> execute -> ExecuteCommand,
+where transformNamedArguments lives (rpc/server.cpp:502-512). Skipping it here
+left a member whose \"params\" was a JSON object handing the handler a raw
+hash-table, which every handler read positionally and answered with -32603 and
+a Lisp type error in the message. The transform can itself signal (an unknown
+named parameter is -8), and Core catches a member's error into that member's
+reply rather than failing the batch (httprpc.cpp:202-206), which is what the
+handler-case around it does."
   (let ((responses '()))
     (dolist (req requests (nreverse responses))
       (if (hash-table-p req)
           (let ((method (gethash "method" req))
-                (params (%normalize-rpc-params
-                         (or (gethash "params" req) '())))
                 (version (request-json-version req)))
             (multiple-value-bind (id id-present) (gethash "id" req)
               (let ((response
-                      (if (stringp method)
-                          (handle-single-request node method params id version
-                                                 :id-present id-present)
-                          (make-rpc-error-response +rpc-invalid-request+
-                                                   "Missing or invalid method"
-                                                   id version
-                                                   :id-present id-present))))
+                      (handler-case
+                          (if (stringp method)
+                              (handle-single-request
+                               node method
+                               (%request-params method (or (gethash "params" req) '()))
+                               id version :id-present id-present)
+                              (make-rpc-error-response +rpc-invalid-request+
+                                                       "Missing or invalid method"
+                                                       id version
+                                                       :id-present id-present))
+                        (rpc-error (e)
+                          (rpc-error-response e id version :id-present id-present)))))
                 (unless (and (eq version :v2) (not id-present))
                   (push response responses)))))
           ;; A non-object member has no version of its own; Core's default is
