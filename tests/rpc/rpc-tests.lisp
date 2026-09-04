@@ -167,12 +167,12 @@ empty array, so it earns the COUNT error, not a type error
         (txid "0000000000000000000000000000000000000000000000000000000000000001"))
     ;; -3, and it names the type it actually got.
     (signals-rpc-error (:code -3 :message "not of expected type number")
-      (bl.rpc::rpc-getrawtransaction
-       node (list txid bl.rpc::+json-empty-array+)))
+      (bl.rpc:dispatch-rpc-method
+       node "getrawtransaction" (list txid bl.rpc::+json-empty-array+)))
     ;; Null still means the default verbosity, so it gets past the check and
     ;; fails on the transaction being absent instead.
     (handler-case
-        (progn (bl.rpc::rpc-getrawtransaction node (list txid nil))
+        (progn (bl.rpc:dispatch-rpc-method node "getrawtransaction" (list txid nil))
                (fail "expected a lookup failure"))
       (bl.rpc:rpc-error (e)
         (is (/= -3 (bl.rpc:rpc-error-code e))
@@ -197,7 +197,7 @@ advice in a spelling no caller matching Core could find."
                                                     "No such mempool transaction. Use -txindex or provide a block "
                                                     "hash to enable blockchain transaction queries. Use "
                                                     "gettransaction for wallet transactions."))
-      (bl.rpc::rpc-getrawtransaction node (list txid)))))
+      (bl.rpc:dispatch-rpc-method node "getrawtransaction" (list txid)))))
 
 (test json-rpc-parse-invalid-json
   "Test parsing invalid JSON returns parse error"
@@ -816,7 +816,7 @@ and absent return hex (verbosity 0 is Core's default but was truthy in Lisp);
     (dolist (params (list (list txid-hex)
                           (list txid-hex 0)
                           (list txid-hex nil)))
-      (let ((hex (bl.rpc::rpc-getrawtransaction node params)))
+      (let ((hex (bl.rpc:dispatch-rpc-method node "getrawtransaction" params)))
         (is (stringp hex))
         ;; Byte-exact wire bytes: witnesses intact through a round-trip.
         (is (equalp raw (bl.crypto:hex-to-bytes hex)))))
@@ -824,7 +824,7 @@ and absent return hex (verbosity 0 is Core's default but was truthy in Lisp);
     (dolist (params (list (list txid-hex 1)
                           (list txid-hex t)
                           (list txid-hex 2)))
-      (let ((r (bl.rpc::rpc-getrawtransaction node params)))
+      (let ((r (bl.rpc:dispatch-rpc-method node "getrawtransaction" params)))
         (is (consp r))
         (is (string= txid-hex (cdr (assoc "txid" r :test #'string=))))
         ;; The object's hex field is the wire encoding too.
@@ -832,7 +832,92 @@ and absent return hex (verbosity 0 is Core's default but was truthy in Lisp);
                          (cdr (assoc "hex" r :test #'string=)))))))
     ;; Non-integer/non-bool verbosity → type error (Core getInt<int> throw).
     (signals bl.rpc:rpc-error
-      (bl.rpc::rpc-getrawtransaction node (list txid-hex "abc")))))
+      (bl.rpc:dispatch-rpc-method node "getrawtransaction" (list txid-hex "abc")))))
+
+(test getrawtransaction-with-a-blockhash-answers-from-that-block-alone
+  "The third argument is a containment check, not a hint.
+
+Core resolves it FIRST, under cs_main, and throws -5 \"Block hash not found\"
+for a block its index does not know (rawtransaction.cpp:298-305) before any
+transaction lookup; GetTransaction then skips the mempool entirely because a
+block index was supplied (`if (mempool && !block_index)`,
+node/transaction.cpp:143-145) and refuses a txindex hit from a different block
+(:150-156). A block the index knows but whose body is not on disk is -1
+\"Block not available\" (rawtransaction.cpp:317-320).
+
+We probed the mempool first and returned its transaction whatever the caller
+asked about, and an unknown block fell through to the txindex — so both a
+typo'd blockhash and a mempool transaction answered the containment question
+with a false yes."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "getrawtx-blockhash"))
+           (chain-state (bl:node-chain-state node))
+           (block-store (bl:node-block-store node))
+           (built (build-and-connect chain-state block-store
+                                     (bl:node-utxo-set node)
+                                     (bl.store:best-block-hash chain-state)
+                                     (make-test-chain-hashes #xb2 2)))
+           (block1 (car (first built)))
+           (block1-hash (bl.rpc:hash-to-hex
+                         (bl.store:block-index-entry-hash (cdr (first built)))))
+           ;; A header the index knows with no body in the store: Core's
+           ;; BLOCK_HAVE_DATA-unset state (pruned, or not yet downloaded).
+           (bodyless (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element #xd7))
+           (bodyless-hex (bl.rpc:hash-to-hex bodyless))
+           (raw (make-witness-test-tx-bytes))
+           (pool-tx (flexi-streams:with-input-from-sequence (s raw)
+                      (bl.ser:read-transaction s)))
+           (pool-txid (bl.ser:transaction-hash pool-tx))
+           (pool-txid-hex (bl.rpc:hash-to-hex pool-txid))
+           (coinbase-txid-hex (bl.rpc:hash-to-hex
+                               (bl.ser:transaction-hash
+                                (elt (bl.ser:bitcoin-block-transactions block1) 0))))
+           (unknown-hash (make-string 64 :initial-element #\a)))
+      (bl.store:add-block-index-entry
+       chain-state
+       (bl.store:make-block-index-entry
+        :hash bodyless :height 1 :chain-work 1 :status :valid
+        :header (bl.store:block-index-entry-header (cdr (first built)))))
+      (is (eq :ok (bl.mp:mempool-add
+                   (bl:node-mempool node) pool-txid
+                   (bl.mp:make-entry-from-tx pool-tx 1000 0)))
+          "the mempool transaction is the one the old code answered with")
+      ;; An unknown block loses before the mempool is even consulted.
+      (dolist (verbosity '(0 1))
+        (signals-rpc-error (:code -5 :exact-message "Block hash not found")
+          (bl.rpc:dispatch-rpc-method
+           node "getrawtransaction"
+           (list pool-txid-hex verbosity unknown-hash))))
+      ;; A known block that does not contain it: Core's in-block message, not
+      ;; the mempool copy.
+      (signals-rpc-error
+          (:code -5
+           :exact-message
+           (concatenate 'string "No such transaction found in the provided block"
+                        ". Use gettransaction for wallet transactions."))
+        (bl.rpc:dispatch-rpc-method
+         node "getrawtransaction" (list pool-txid-hex 0 block1-hash)))
+      ;; A known block with no body on disk.
+      (signals-rpc-error (:code -1 :exact-message "Block not available")
+        (bl.rpc:dispatch-rpc-method
+         node "getrawtransaction" (list pool-txid-hex 0 bodyless-hex)))
+      ;; Positive control: the transaction that IS in that block still answers,
+      ;; and carries in_active_chain (Core adds it whenever the argument was
+      ;; given, rawtransaction.cpp:338-341).
+      (is (stringp (bl.rpc:dispatch-rpc-method
+                    node "getrawtransaction"
+                    (list coinbase-txid-hex 0 block1-hash))))
+      (let ((r (bl.rpc:dispatch-rpc-method
+                node "getrawtransaction"
+                (list coinbase-txid-hex 1 block1-hash))))
+        (is (string= coinbase-txid-hex (cdr (assoc "txid" r :test #'string=))))
+        (is (string= block1-hash (cdr (assoc "blockhash" r :test #'string=))))
+        (is (eq t (cdr (assoc "in_active_chain" r :test #'string=)))
+            "in_active_chain is json-bool's true, not a missing key"))
+      ;; And with no blockhash at all the mempool still answers.
+      (is (stringp (bl.rpc:dispatch-rpc-method
+                    node "getrawtransaction" (list pool-txid-hex 0)))))))
 
 ;;; --- getorphantxs wire hex + verbosity validation ---
 
@@ -3748,17 +3833,17 @@ safe version — asserted here with a size large enough to have overflowed a
   (let ((node (make-test-node)))
     ;; Too short
     (signals bl.rpc:rpc-error
-      (bl.rpc::rpc-getrawtransaction node '("abc")))
+      (bl.rpc:dispatch-rpc-method node "getrawtransaction" '("abc")))
     ;; Invalid characters
     (signals bl.rpc:rpc-error
-      (bl.rpc::rpc-getrawtransaction node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))))
+      (bl.rpc:dispatch-rpc-method node "getrawtransaction" '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))))
 
 (test rpc-getrawtransaction-not-found
   "Test getrawtransaction for unknown txid returns error"
   (let ((node (make-test-node)))
     ;; Valid txid but not in mempool
     (signals bl.rpc:rpc-error
-      (bl.rpc::rpc-getrawtransaction node
+      (bl.rpc:dispatch-rpc-method node "getrawtransaction"
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
 
 ;;; estimatesmartfee tests
@@ -4345,7 +4430,7 @@ CONTROL: the identical block WITH its undo data answers (previous test)."
   (let ((node (make-test-node)))
     ;; Valid txid but invalid blockhash format
     (signals bl.rpc:rpc-error
-      (bl.rpc::rpc-getrawtransaction node
+      (bl.rpc:dispatch-rpc-method node "getrawtransaction"
         '("0000000000000000000000000000000000000000000000000000000000000001" nil "invalid-hash")))))
 
 (test rpc-getrawtransaction-txindex-disabled
@@ -4353,7 +4438,7 @@ CONTROL: the identical block WITH its undo data answers (previous test)."
   (let ((node (make-test-node)))
     ;; Node has no txindex, looking for non-mempool tx should fail
     (signals bl.rpc:rpc-error
-      (bl.rpc::rpc-getrawtransaction node
+      (bl.rpc:dispatch-rpc-method node "getrawtransaction"
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
 
 ;;; --- JSON Result Normalization (regression) ---

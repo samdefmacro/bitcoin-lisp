@@ -20,13 +20,51 @@
       (error 'rpc-error :code +rpc-deserialization-error+
                         :message (format nil "TX decode failed: ~A" e)))))
 
+(defun %not-found-transaction-message (reason)
+  "REASON plus the sentence Core appends to every one of getrawtransaction's
+four not-found messages (rawtransaction.cpp:315-329). Its tests match on the
+WHOLE string: rpc_rawtransaction.py:129 asserts the no-txindex variant in
+full, so the suffix is not decoration."
+  (concatenate 'string reason ". Use gettransaction for wallet transactions."))
+
+(defun %getrawtransaction-in-block (node block-entry txid verbose prevouts)
+  "getrawtransaction's answer when the caller named a block: the transaction
+comes from THAT block or the call fails.
+
+Core's GetTransaction skips the mempool entirely once a block index is
+supplied (`if (mempool && !block_index)`, node/transaction.cpp:143-145) and
+drops a txindex hit whose block hash differs (:150-156), so the third
+argument is a containment check and not a hint. A block the index knows but
+whose body is not on disk is Core's -1 \"Block not available\"
+(rawtransaction.cpp:317-320) — we carry no BLOCK_HAVE_DATA bit, and a block
+the store cannot produce (pruned, or not yet downloaded) is exactly that
+state. The object carries in_active_chain, which Core adds whenever the
+argument was given."
+  (let* ((block-hash (bl.store:block-index-entry-hash block-entry))
+         (block (bl.store:get-block (rpc-get-block-store node) block-hash)))
+    (unless block
+      (error 'rpc-error :code +rpc-misc-error+ :message "Block not available"))
+    (let ((found-tx (find-tx-in-block block txid)))
+      (unless found-tx
+        (error 'rpc-error :code +rpc-invalid-address-or-key+
+                          :message (%not-found-transaction-message
+                                    "No such transaction found in the provided block")))
+      (if verbose
+          (append (tx-to-json-confirmed found-tx node block-hash
+                                        :block block :prevouts prevouts)
+                  `(("in_active_chain"
+                     . ,(json-bool (%block-on-active-chain-p
+                                    block-entry (rpc-get-chain-state node))))))
+          (bl.crypto:bytes-to-hex (bl.ser:transaction-wire-bytes found-tx))))))
+
 (define-rpc "getrawtransaction" (node (txid-str verbosity blockhash-hint))
   "Get raw transaction data by txid (Bitcoin Core getrawtransaction).
 Verbosity <= 0 (or false, the default) returns the wire-serialized (witness-
 complete) tx hex — Core's EncodeHexTx; 1 (or true) the decoded object; 2 adds
 the fee and each input's prevout for a CONFIRMED transaction
 (rawtransaction.cpp:346-371).
-Searches mempool first, then blockhash hint, then txindex (if enabled)."
+With a blockhash the answer comes from that block alone; without one, the
+mempool first and then the txindex (if enabled)."
   (unless (valid-hex-hash-p txid-str)
     (error 'rpc-error :code +rpc-invalid-parameter+
                       :message "Invalid transaction id"))
@@ -40,89 +78,65 @@ Searches mempool first, then blockhash hint, then txindex (if enabled)."
          ;; data, so it stays at the verbosity-1 shape there.
          (prevouts (>= verbosity 2))
          (txid-bytes (parse-hex-hash txid-str))
-         (mempool (rpc-get-mempool node))
-         (mempool-entry (when mempool
-                          (bl.mp:mempool-get mempool txid-bytes))))
-    ;; Check mempool first
-    (when mempool-entry
-      (let ((tx (bl.mp:mempool-entry-transaction mempool-entry)))
+         ;; Core resolves the blockhash FIRST, under cs_main, and refuses an
+         ;; unknown one before any transaction lookup at all
+         ;; (rawtransaction.cpp:298-305). Answering from the txindex instead
+         ;; hands a caller using this argument as a containment check the
+         ;; transaction from a completely different block.
+         (block-entry (when blockhash-hint
+                        (or (bl.store:get-block-index-entry
+                             (rpc-get-chain-state node)
+                             (parse-hex-hash blockhash-hint))
+                            (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                              :message "Block hash not found")))))
+    (when block-entry
+      (return-from rpc-getrawtransaction
+        (%getrawtransaction-in-block node block-entry txid-bytes
+                                     verbose prevouts)))
+
+    ;; No blockhash: the mempool, then the txindex (Core GetTransaction,
+    ;; node/transaction.cpp:143-158).
+    (let* ((mempool (rpc-get-mempool node))
+           (mempool-entry (when mempool
+                            (bl.mp:mempool-get mempool txid-bytes))))
+      (when mempool-entry
+        (let ((tx (bl.mp:mempool-entry-transaction mempool-entry)))
+          (return-from rpc-getrawtransaction
+            (if verbose
+                (tx-to-json tx (rpc-get-network node))
+                (bl.crypto:bytes-to-hex
+                 (bl.ser:transaction-wire-bytes tx)))))))
+
+    ;; No block was named and the mempool has missed, so the txindex is the
+    ;; last place to look — and whether it is enabled also decides which of
+    ;; Core's not-found messages applies.
+    (let* ((tx-index (rpc-get-tx-index node))
+           (indexed (and tx-index (bl.store:tx-index-enabled tx-index)))
+           (location (and indexed (bl.store:txindex-lookup tx-index txid-bytes)))
+           (block-hash (and location (bl.store:tx-location-block-hash location)))
+           (block (and block-hash
+                       (bl.store:get-block (rpc-get-block-store node) block-hash)))
+           (found-tx (and block (find-tx-in-block block txid-bytes))))
+      (when found-tx
         (return-from rpc-getrawtransaction
           (if verbose
-              (tx-to-json tx (rpc-get-network node))
+              (tx-to-json-confirmed found-tx node block-hash
+                                    :block block :prevouts prevouts)
               (bl.crypto:bytes-to-hex
-               (bl.ser:transaction-wire-bytes tx))))))
-
-    ;; Try blockhash hint if provided
-    (when blockhash-hint
-      (let* ((block-hash-bytes (parse-hex-hash blockhash-hint))
-             (block-store (rpc-get-block-store node))
-             (block (bl.store:get-block block-store block-hash-bytes)))
-        (when block
-          (let ((found-tx (find-tx-in-block block txid-bytes)))
-            (when found-tx
-              (return-from rpc-getrawtransaction
-                (if verbose
-                    ;; With an explicit blockhash, Core adds in_active_chain.
-                    (let* ((cs (rpc-get-chain-state node))
-                           (entry (bl.store:get-block-index-entry cs block-hash-bytes)))
-                      (append (tx-to-json-confirmed found-tx node block-hash-bytes
-                                                    :block block :prevouts prevouts)
-                              `(("in_active_chain"
-                                 . ,(json-bool
-                                     (and entry (%block-on-active-chain-p entry cs)))))))
-                    (bl.crypto:bytes-to-hex
-                     (bl.ser:transaction-wire-bytes found-tx)))))))))
-
-    ;; Try txindex if enabled
-    (let ((tx-index (rpc-get-tx-index node)))
-      (when (and tx-index (bl.store:tx-index-enabled tx-index))
-        (let ((location (bl.store:txindex-lookup tx-index txid-bytes)))
-          (when location
-            (let* ((block-hash (bl.store:tx-location-block-hash location))
-                   (block-store (rpc-get-block-store node))
-                   (block (bl.store:get-block block-store block-hash)))
-              (when block
-                (let ((found-tx (find-tx-in-block block txid-bytes)))
-                  (when found-tx
-                    (return-from rpc-getrawtransaction
-                      (if verbose
-                          (tx-to-json-confirmed found-tx node block-hash
-                                                :block block :prevouts prevouts)
-                          (bl.crypto:bytes-to-hex
-                           (bl.ser:transaction-wire-bytes found-tx))))))))))))
-
-    ;; Not found. Core selects one of FOUR messages and appends the same
-    ;; sentence to every one of them (rawtransaction.cpp:315-329), and its
-    ;; tests match on the WHOLE string: rpc_rawtransaction.py:129 asserts the
-    ;; no-txindex variant in full. Ours said "provide a blockhash" and
-    ;; stopped there — the right advice, spelled so that no caller matching
-    ;; Core's text could find it.
-    ;;
-    ;; Three of the four are here. The one left out is Core's
-    ;; "Blockchain transactions are still in the process of being indexed",
-    ;; which needs f_txindex_ready — a readiness flag distinct from
-    ;; "enabled", which this txindex does not carry. Inventing an answer for
-    ;; a state we cannot observe would be worse than answering the
-    ;; enabled-and-absent case, which is what a caught-up node is in.
-    (let ((tx-index (rpc-get-tx-index node)))
+               (bl.ser:transaction-wire-bytes found-tx)))))
+      ;; Not found. Two of Core's four messages are reachable here; the
+      ;; blockhash pair answered above, and the one left out is
+      ;; "Blockchain transactions are still in the process of being indexed",
+      ;; which needs f_txindex_ready — a readiness flag distinct from
+      ;; "enabled", which this txindex does not carry. Inventing an answer for
+      ;; a state we cannot observe would be worse than answering the
+      ;; enabled-and-absent case, which is what a caught-up node is in.
       (error 'rpc-error :code +rpc-invalid-address-or-key+
                         :message
-                        (concatenate
-                         'string
-                         (cond
-                           ;; A blockhash was given and the transaction is
-                           ;; not in that block. (Core also answers -1
-                           ;; "Block not available" when the block is known
-                           ;; but its data is not on disk; that check lives
-                           ;; in the hint branch above, which treats an
-                           ;; unreadable block as not-found.)
-                           (blockhash-hint
-                            "No such transaction found in the provided block")
-                           ((not (and tx-index
-                                      (bl.store:tx-index-enabled tx-index)))
-                            "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries")
-                           (t "No such mempool or blockchain transaction"))
-                         ". Use gettransaction for wallet transactions.")))))
+                        (%not-found-transaction-message
+                         (if indexed
+                             "No such mempool or blockchain transaction"
+                             "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries"))))))
 
 (defun find-tx-in-block (block txid)
   "Find a transaction in a block by txid. Returns the transaction or NIL."
