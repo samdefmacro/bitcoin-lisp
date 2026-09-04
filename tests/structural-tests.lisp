@@ -1429,7 +1429,10 @@ tests/; 4,394 when the corpus became the declared files (%test-system-files);
 4,365 when the GA10 peers/eviction tests folded the eviction entry point, the
 inbound cap, the admission gate and IsFullOutboundConn into one helper each;
 4,320 once start-node-plist in tests/support/ replaced the 54 reaches into
-args->start-node-plist; 4,315 with the peers and config batches merged. White-box tests reaching
+args->start-node-plist; 4,315 with the peers and config batches merged.
+Then the mining tests called the mining tests called the generate* and getmininginfo handlers
+through BL.RPC:DISPATCH-RPC-METHOD, which is both exported and the wire path.
+White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the
 same internal was reached from a copy of the same helper in several files.

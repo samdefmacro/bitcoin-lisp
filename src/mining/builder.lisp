@@ -90,13 +90,12 @@ assembly against synthetic chain states with no coins view)."
                     :script-pubkey coinbase-script-pubkey
                     :witness-commitment-script
                     (block-template-default-witness-commitment-script template)
-                    ;; The same expression validation uses, so assembly and
-                    ;; consensus cannot disagree about the regime this block
-                    ;; is being built for.
+                    ;; The same predicate validation applies, so assembly
+                    ;; and consensus cannot disagree about the regime this
+                    ;; block is being built for.
                     :segwit-active
-                    (>= (block-template-height template)
-                        (bl.val:get-segwit-activation-height
-                         bl:*network*))))
+                    (bl.val:segwit-active-at-height-p
+                     (block-template-height template))))
          (txs (cons coinbase
                     (mapcar #'bl.mp:mempool-entry-transaction
                             (block-template-transactions template))))

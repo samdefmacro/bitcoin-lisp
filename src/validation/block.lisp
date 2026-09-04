@@ -251,6 +251,19 @@ name is one of ~{~A~^, ~} and height is a non-negative integer."
   (%activation-height "segwit"
    (bl.chain:chain-params-segwit-height (bl.chain:find-chain-params network))))
 
+(defun segwit-active-at-height-p (height &optional (network bl:*network*))
+  "T when BIP141 is active for a block at HEIGHT on NETWORK -- Core's
+DeploymentActiveAfter(pindexPrev, DEPLOYMENT_SEGWIT), evaluated for the block
+that follows pindexPrev.
+
+One function rather than the expression written out per site, because the two
+sides of it must agree: a coinbase builder decides whether to attach the BIP141
+reserved witness value, and CONTEXTUAL validation decides whether a coinbase
+carrying one is legal (:UNEXPECTED-WITNESS below the activation height). The
+node could not mine at all under `-testactivationheight=segwit@N' the last time
+a construction site was left behind."
+  (>= height (get-segwit-activation-height network)))
+
 ;;; Policy vs Consensus Flag Separation
 ;;;
 ;;; Bitcoin Core distinguishes MANDATORY (consensus) flags from STANDARD (policy) flags.
@@ -1166,8 +1179,8 @@ header's cached hash)."
                 chain-state (bl.ser:block-header-prev-block header)))
          (coinbase (first (bl.ser:bitcoin-block-transactions block))))
     (when (and prev coinbase
-               (>= (1+ (bl.store:block-index-entry-height prev))
-                   (get-segwit-activation-height bl:*network*))
+               (segwit-active-at-height-p
+                (1+ (bl.store:block-index-entry-height prev)))
                (find-witness-commitment coinbase)
                (not (bl.ser:transaction-has-witness-p coinbase)))
       (setf (bl.ser:transaction-witness coinbase)
@@ -1727,7 +1740,7 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
     ;; DeploymentActiveAfter(prev, SEGWIT).
     (validate-witness-commitment
      block
-     (>= current-height (get-segwit-activation-height bl:*network*)))))
+     (segwit-active-at-height-p current-height))))
 
 (defun %contextual-check-block (block chain-state utxo-set current-height
                                &key skip-scripts)
