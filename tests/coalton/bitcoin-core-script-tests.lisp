@@ -657,3 +657,39 @@ program as the redeem script, and rejected the spend as WITNESS_MALLEATED_P2SH
                (is (null ok))
                (is (eq err :witness-program-mismatch) "got ~A" err)))
         (bl.interop:set-script-flags nil)))))
+
+;;;; Consensus-divergence regression guards (GA10 script opcodes, 2026-09-05)
+
+(test cltv-csv-are-plain-nops-without-their-own-flag
+  "CONSENSUS (Core interpreter.cpp:521-526 and :560-565): when
+SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY / _CHECKSEQUENCEVERIFY is off, the opcode is
+`if (!(flags & ...)) { /* not enabled; treat as a NOP2|NOP3 */ break; }' and
+consults nothing else. SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS is read only in
+the OP_NOP1 / OP_NOP4..OP_NOP10 case (:594-599) -- BIP65 and BIP112 removed it
+from these two branches when they gave the opcodes their own flags. We called
+the shared discourage helper instead, so a flag set carrying DISCOURAGE without
+CLTV/CSV rejected a script Core accepts. script_tests.json cannot see this: its
+DISCOURAGE vectors cover NOP, NOP1 and NOP4..NOP10, never NOP2/NOP3."
+  ;; The divergent case: DISCOURAGE on, CLTV/CSV off.
+  (multiple-value-bind (ok err) (run-script-test "1" "CHECKLOCKTIMEVERIFY"
+                                                 "DISCOURAGE_UPGRADABLE_NOPS")
+    (is (eq ok t) "NOP2 without the CLTV flag is a plain NOP, got ~A" err))
+  (multiple-value-bind (ok err) (run-script-test "1" "CHECKSEQUENCEVERIFY"
+                                                 "DISCOURAGE_UPGRADABLE_NOPS")
+    (is (eq ok t) "NOP3 without the CSV flag is a plain NOP, got ~A" err))
+  ;; Control 1: the discourage machinery is genuinely armed by this flag string
+  ;; -- an upgradable NOP under it still fails, so the two above are not passing
+  ;; because the flag went missing.
+  (is (null (run-script-test "1" "NOP1" "DISCOURAGE_UPGRADABLE_NOPS"))
+      "NOP1 must still be discouraged")
+  (is (null (run-script-test "1" "NOP10" "DISCOURAGE_UPGRADABLE_NOPS"))
+      "NOP10 must still be discouraged")
+  ;; Control 2: with its own flag on, the opcode is not a NOP at all -- stack
+  ;; top 1 against the test transaction's nLockTime 0 is UNSATISFIED_LOCKTIME.
+  (is (null (run-script-test "1" "CHECKLOCKTIMEVERIFY"
+                             "CHECKLOCKTIMEVERIFY,DISCOURAGE_UPGRADABLE_NOPS"))
+      "with CHECKLOCKTIMEVERIFY set the opcode must run BIP65, not pass")
+  (is (null (run-script-test "1" "CHECKSEQUENCEVERIFY"
+                             "CHECKSEQUENCEVERIFY,DISCOURAGE_UPGRADABLE_NOPS"))
+      "with CHECKSEQUENCEVERIFY set the opcode must run BIP112, not pass"))
+
