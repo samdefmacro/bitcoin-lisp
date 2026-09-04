@@ -612,6 +612,12 @@
   exception table for the historical blocks that violate one; the
   Bitcoin Core `script_tests.json` corpus runs in full in the cold lane
   (1,222 vectors). CastToBool treats a multi-byte negative zero as false.
+  That corpus compares Core's ACCEPT/REJECT verdict and NOT its error
+  name: the engine's ScriptError set is ours, not Core's `SCRIPT_ERR_*'
+  (SE-VerifyFailed alone stands in for thirteen of Core's errors, and
+  run-scripts-with-p2sh collapses every engine error to `:error'), so a
+  divergence that changes only which error is reported is invisible to
+  it and needs a test of its own.
 
   Traps: a Coalton or defstruct layout change needs a FRESH FASL volume
   -- the persistent volume keeps stale expansions through a warm rebuild,
@@ -625,6 +631,15 @@
   legacy scripts (scriptSig, scriptPubKey, P2SH redeem script) and to
   unexecuted branches: CONST_SCRIPTCODE's OP_CODESEPARATOR rejection is
   pre-scanned in verify-script for exactly that reason.
+  An opcode that carries its OWN verify flag is a PLAIN NOP when that
+  flag is off, never a discouraged one -- DISCOURAGE_UPGRADABLE_NOPS is
+  OP_NOP1 and OP_NOP4..OP_NOP10's alone, and CLTV/CSV lost it when BIP65
+  and BIP112 gave them flags. Core's IsPushOnly asks only whether the
+  opcode is `> OP_16', which makes OP_RESERVED push-TYPE. CHECKMULTISIG
+  charges its key count against the 201-op budget the moment it reads
+  it, before any verification. CheckPubKeyEncoding runs for EVERY
+  signature, an empty one included, so an ill-encoded key fails under
+  STRICTENC with no signature to check at all.
   The transaction version and the spent amount are SIGNED
   slots -- that is what the wire format reads back -- while Core streams
   them as raw words, so the BIP 143 and BIP 341 preimages write their bit
