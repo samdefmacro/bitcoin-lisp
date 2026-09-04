@@ -25,6 +25,7 @@
   (collect nil :type (or null keyword))    ; start-node keyword of a list
   (repeatable nil :type boolean)
   (kind :start-node :type keyword)
+  (network-only nil :type boolean)         ; Core ArgsManager::NETWORK_ONLY
   (global nil :type symbol)                ; the special a :global row sets
   (apply nil :type (or null function))     ; the function a :apply row calls
   (core nil :type (or null string)))       ; Core reference, documentation only
@@ -57,7 +58,7 @@ same name in place so a warm reload never duplicates a row."
 at macroexpansion time."))
 
 (defmacro define-option (name &key key type min collect repeatable (kind nil kind-p)
-                                   global apply core)
+                                   network-only global apply core)
   "Register the option NAME (lower-case, as it appears after the dash).
 
 KEY/TYPE: the start-node keyword and value type of a scalar option, MIN the
@@ -67,7 +68,12 @@ sets to the parsed value when the option is present; APPLY: a function it
 calls instead -- with the parsed value (the raw string when there is no
 TYPE) for a scalar option, with the list of every raw value, present or
 not, for a repeatable one. KIND defaults to :START-NODE when KEY or COLLECT
-is given, :GLOBAL otherwise."
+is given, :GLOBAL otherwise.
+
+NETWORK-ONLY is Core's ArgsManager::NETWORK_ONLY flag (args.h:113-124): the
+option means something different on every chain, so off mainnet its value in
+a shared bitcoin.conf's DEFAULT section is ignored and the node refuses to
+start. See USE-DEFAULT-SECTION-P and UNSUITABLE-SECTION-ONLY-OPTIONS."
   (check-type name string)
   (flet ((bad (detail) (error 'option-definition-error :name name :detail detail)))
     (when (and collect (not repeatable)) (bad "a :collect option must be :repeatable"))
@@ -80,6 +86,7 @@ is given, :GLOBAL otherwise."
     (make-config-option :name ,name :key ,key :type ,type :min ,min :collect ,collect
                          :repeatable ,(and repeatable t)
                          :kind ,(if kind-p kind (if (or key collect) :start-node :global))
+                         :network-only ,(and network-only t)
                          :global ',global
                          :apply ,apply
                          :core ,core)))

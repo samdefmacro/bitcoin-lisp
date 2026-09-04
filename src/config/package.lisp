@@ -24,6 +24,7 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:config-option-collect
    #:config-option-repeatable
    #:config-option-kind
+   #:config-option-network-only
    #:config-option-global
    #:config-option-apply
    #:config-option-core
@@ -91,6 +92,9 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:setting-row-negated-p
    #:merge-setting
    #:merge-settings-list
+   #:network-only-option-p
+   #:use-default-section-p
+   #:unsuitable-section-only-options
    #:merged-config-alist))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)

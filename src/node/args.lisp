@@ -263,6 +263,24 @@ map: the file boundary is not part of the precedence, only the section is."
             (cons :network-section (of-section want))
             (cons :default-section (of-section ""))))))
 
+(defun check-unsuitable-section-only-options (sources network)
+  "Refuse to start when a network-only option is set ONLY in bitcoin.conf's
+default section and we are not on mainnet — Core init.cpp:944-951, one line
+per option, verbatim. The alternative is what we used to do: apply a shared
+config file's `rpcport=8332`, `port=8333` or `connect=<mainnet peer>` to a
+testnet node, which binds the mainnet RPC port or isolates the node on the
+wrong chain's peers. That accident is the whole reason the NETWORK_ONLY flag
+and this error exist."
+  (let ((unsuitable (unsuitable-section-only-options sources network)))
+    (when unsuitable
+      (let ((chain (conf-section-name network)))
+        (config-error
+         "~{~A~^~%~}"
+         (loop for name in unsuitable
+               collect (format nil "Config setting for -~A only applied on ~A ~
+                                    network when in [~A] section."
+                               name chain chain)))))))
+
 (defun args->start-node-plist (args &optional conf-text settings-rows)
   ;; CONF-TEXT is the main bitcoin.conf, or a LIST of texts when -includeconf
   ;; pulled in more (main file first). See the docstring below.
@@ -294,7 +312,8 @@ wraps this with the file I/O, apply-config-globals, and launch."
                    (append (parse-cli-args args)
                            (loop for text in texts append (conf-global-entries text)))))
          (sources (config-sources args texts settings-rows network)))
-    (multiple-value-bind (merged negated) (merged-config-alist sources)
+    (check-unsuitable-section-only-options sources network)
+    (multiple-value-bind (merged negated) (merged-config-alist sources network)
       ;; `-noconnect` is `-connect=0` at every drive site Core has: with an
       ;; empty list and IsArgNegated true, init.cpp:2215-2224 clears
       ;; m_use_addrman_outgoing and leaves m_specified_outgoing empty, which is

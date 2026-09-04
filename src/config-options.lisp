@@ -16,6 +16,13 @@
 ;;; Step 2 "parameter interactions") keep their present-case row here and
 ;;; their soft-set / consistency half in APPLY-PARAMETER-INTERACTIONS.
 
+;;; A row marked :NETWORK-ONLY carries Core's ArgsManager::NETWORK_ONLY flag:
+;;; a value in a shared bitcoin.conf's DEFAULT section is ignored off mainnet
+;;; and, if it is the only place the option is set, the node refuses to start
+;;; (init.cpp:944-951). bitcoind registers exactly eight -- -addnode
+;;; (init.cpp:539), -bind (:548), -connect (:550), -port (:575), -rpcbind
+;;; (:708), -rpcport (:713), -wallet and -walletdir (wallet/init.cpp:71,73).
+
 ;;; --- Network selection and entry-point specials -------------------------
 ;;; Handled before and around the spec scan (RESOLVE-NETWORK-FROM-CONFIG,
 ;;; ARGS->START-NODE-PLIST, START-NODE-FROM-ARGS).
@@ -48,8 +55,8 @@
 (define-option "blocknotify" :key :block-notify :type :string)
 (define-option "logthreadnames" :key :log-thread-names :type :bool)
 (define-option "maxconnections" :key :max-connections :type :int)
-(define-option "rpcport" :key :rpc-port :type :int)
-(define-option "rpcbind" :key :rpc-bind :type :string)
+(define-option "rpcport" :key :rpc-port :type :int :network-only t)
+(define-option "rpcbind" :key :rpc-bind :type :string :network-only t)
 (define-option "rpcuser" :key :rpc-user :type :string)
 (define-option "rpcpassword" :key :rpc-password :type :string)
 (define-option "listen" :key :listen :type :bool)
@@ -57,7 +64,7 @@
 ;; address we actually bind); every occurrence is also kept, so a multi-bind
 ;; command line is reported rather than silently reduced
 ;; (CONFIG-ALIST->START-NODE-PLIST re-derives the address from all of them).
-(define-option "bind" :key :listen-bind :type :string :repeatable t)
+(define-option "bind" :key :listen-bind :type :string :repeatable t :network-only t)
 (define-option "listenonion" :key :listen-onion :type :bool)
 (define-option "torcontrol" :key :tor-control :type :string)
 (define-option "torpassword" :key :tor-password :type :string)
@@ -109,7 +116,7 @@
 (define-option "logratelimit" :key :log-rate-limit :type :bool)
 (define-option "flatblockfiles" :key :flat-block-files :type :bool)
 (define-option "reindex" :key :reindex :type :bool)
-(define-option "port" :key :port :type :int)
+(define-option "port" :key :port :type :int :network-only t)
 (define-option "networkactive" :key :network-active :type :bool)
 (define-option "rest" :key :rest :type :bool)
 (define-option "blocksonly" :key :blocksonly :type :bool)
@@ -120,7 +127,7 @@
 ;;; Each is validated where it is used, not here.
 
 ;; -addnode (m_added_node_params, init.cpp:2107).
-(define-option "addnode" :collect :addnode :repeatable t)
+(define-option "addnode" :collect :addnode :repeatable t :network-only t)
 ;; -rpcauth (g_rpcauth, httprpc.cpp:289), -rpcallowip (rpc_allow_subnets,
 ;; httpserver.cpp:153).
 (define-option "rpcauth" :collect :rpc-auth :repeatable t)
@@ -135,7 +142,7 @@
 (define-option "startupnotify" :collect :startup-notify :repeatable t)
 ;; -connect: Core reads it with GetArgs and dials every one as a MANUAL
 ;; connection (net.cpp ThreadOpenConnections).
-(define-option "connect" :collect :connect-nodes :repeatable t)
+(define-option "connect" :collect :connect-nodes :repeatable t :network-only t)
 ;; -seednode: Core reads it with GetArgs into connOptions.vSeedNodes
 ;; (init.cpp:2212).
 (define-option "seednode" :collect :seednode :repeatable t)
@@ -144,7 +151,7 @@
 (define-option "loadblock" :collect :load-block :repeatable t)
 ;; -wallet=<name>: every name is loaded at startup, alongside the ones
 ;; settings.json records (wallet/load.cpp:81, chain.getSettingsList).
-(define-option "wallet" :collect :wallet-names :repeatable t)
+(define-option "wallet" :collect :wallet-names :repeatable t :network-only t)
 ;; -whitelist / -whitebind: Core reads both with GetArgs (init.cpp).
 (define-option "whitelist" :collect :whitelist :repeatable t)
 (define-option "whitebind" :collect :whitebind :repeatable t)
@@ -326,7 +333,7 @@
 (define-option "spendzeroconfchange")
 (define-option "walletrejectlongchains")
 (define-option "keypool")
-(define-option "walletdir")
+(define-option "walletdir" :network-only t)
 (define-option "walletnotify")
 ;; -dnsseed / -fixedseeds: peer-discovery source gates (Core net.h:96-97).
 ;; -dnsseed's soft-set half (-connect, -maxconnections<=0, a -onlynet with
