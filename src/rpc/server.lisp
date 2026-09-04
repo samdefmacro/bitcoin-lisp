@@ -669,7 +669,8 @@ to name it."
   "Refuse a START-RPC-SERVER keyword neither the server nor any registered
 surface reads -- the check &ALLOW-OTHER-KEYS gave away."
   (let ((known (append '(:port :bind :bind-supplied-p :user :password
-                         :rpc-auth :allow-ip :warmup)
+                         :rpc-auth :allow-ip :rpc-whitelist
+                         :rpc-whitelist-default :warmup)
                        (loop for surface in *http-surfaces*
                              append (http-surface-options surface)))))
     (loop for (key nil) on options by #'cddr
@@ -863,6 +864,118 @@ is returned rather than just T because Core threads it out of RPCAuthorized
                          return (rpc-credential-user credential)))))
          (error () nil))))
 
+;;; --- -rpcwhitelist: which methods each user may call ----------------------
+
+(defvar *rpc-whitelist* (make-hash-table :test 'equal)
+  "Which methods each -rpcwhitelist user may call: the authenticated user name
+-> the list of method names (Core's g_rpc_whitelist, httprpc.cpp:37). A user
+with NO entry here was named by no -rpcwhitelist, and *RPC-WHITELIST-DEFAULT*
+decides what it may call.")
+
+(defvar *rpc-whitelist-default* nil
+  "What a user with no -rpcwhitelist entry may call: with NIL everything, with
+T nothing at all (Core's g_rpc_whitelist_default, httprpc.cpp:38).
+
+Core derives it from the whitelists themselves -- GetBoolArg
+\"-rpcwhitelistdefault\" defaulting to \"any -rpcwhitelist was given\"
+(httprpc.cpp:306) -- so the first whitelist an operator writes locks out every
+OTHER user, __cookie__ (and with it bitcoin-cli and the web UI) included.
+That is why Core's own rpc_whitelist.py has to whitelist __cookie__ explicitly
+as soon as it turns the default on.")
+
+(defun %split-rpc-whitelist-methods (string)
+  "STRING split on a comma or a space, empty pieces kept.
+
+Core splits a whitelist's method list with SplitString(s, \", \"), whose second
+argument is a SET of separator characters (util/string.h:116-134): the \", \"
+an operator naturally writes therefore yields an EMPTY piece between the two
+names, and so does a trailing comma. Core keeps those in the std::set, where
+they name no method and never match; dropping them here would be a difference
+without a distinction, while trimming instead would accept a spelling Core
+does not."
+  (loop with start = 0
+        for separator = (position-if (lambda (c) (member c '(#\, #\Space)))
+                                     string :start start)
+        collect (subseq string start separator)
+        while separator
+        do (setf start (1+ separator))))
+
+(defun %parse-rpc-whitelist (specs)
+  "The user -> allowed-methods table for the -rpcwhitelist SPECS
+(InitRPCAuthentication, httprpc.cpp:307-325). A spec is
+USERNAME[:<method>[,<method>...]], and three details are Core's:
+
+- a spec with NO colon still CREATES the user's entry -- Core indexes
+  g_rpc_whitelist with operator[] before it looks at the colon and then
+  assigns nothing -- so a user mentioned that way has an EMPTY whitelist and
+  may call nothing at all;
+- a SECOND spec for the same user is INTERSECTED with what it already had, so
+  repeating the option can only narrow a whitelist, never widen it;
+- `user:' is a one-element list holding the empty method name, which matches
+  no method: the user may call nothing."
+  (let ((table (make-hash-table :test 'equal)))
+    (dolist (spec specs table)
+      (let* ((colon (position #\: spec))
+             (user (subseq spec 0 (or colon (length spec))))
+             (methods (when colon
+                        (remove-duplicates
+                         (%split-rpc-whitelist-methods (subseq spec (1+ colon)))
+                         :test #'string=))))
+        (multiple-value-bind (existing listed) (gethash user table)
+          (setf (gethash user table)
+                (cond ((null colon) (if listed existing '()))
+                      (listed (intersection methods existing :test #'string=))
+                      (t methods))))))))
+
+(defun reset-rpc-whitelist ()
+  "Forget the -rpcwhitelist configuration. It belongs to the server it was
+given to, so a stop -- or a start that failed after installing it -- must drop
+it rather than leave it restricting the next server, which was never told to."
+  (setf *rpc-whitelist* (make-hash-table :test 'equal)
+        *rpc-whitelist-default* nil))
+
+(defun rpc-method-allowed-p (user method)
+  "T when the authenticated USER may call METHOD (HTTPReq_JSONRPC,
+httprpc.cpp:144-158). A user WITH a -rpcwhitelist may call exactly what it
+lists; a user without one may call everything, unless -rpcwhitelistdefault is
+in force, in which case it may call nothing."
+  (multiple-value-bind (methods listed) (gethash user *rpc-whitelist*)
+    (if listed
+        (and (member method methods :test #'string=) t)
+        (not *rpc-whitelist-default*))))
+
+(defun %rpc-request-allowed-p (user request-type method-or-batch)
+  "T when USER's -rpcwhitelist admits this whole request, else NIL after
+logging the refusal Core logs (httprpc.cpp:145,155,186).
+
+Core checks every member of a BATCH before it runs any of them
+(httprpc.cpp:176-189), so one forbidden method refuses the batch as a unit
+with HTTP 403 rather than answering that one member with an error -- a batch
+is not a way to smuggle a method past the whitelist and read the rest of the
+results anyway."
+  (flet ((refuse (method)
+           (if method
+               (bl.log:node-log
+                :warn "RPC User ~A not allowed to call method ~A" user method)
+               (bl.log:node-log
+                :warn "RPC User ~A not allowed to call any methods" user))
+           nil))
+    (let ((listed (nth-value 1 (gethash user *rpc-whitelist*))))
+      (cond ((not listed) (or (not *rpc-whitelist-default*) (refuse nil)))
+            ((eq request-type :single)
+             (or (rpc-method-allowed-p user method-or-batch)
+                 (refuse method-or-batch)))
+            (t
+             ;; A member that is not an object, or whose "method" is not a
+             ;; string, is left to HANDLE-BATCH-REQUEST's -32600: Core reaches
+             ;; for its method name here and throws instead, so neither tree
+             ;; answers 403 for it.
+             (dolist (req method-or-batch t)
+               (let ((method (and (hash-table-p req) (gethash "method" req))))
+                 (when (and (stringp method)
+                            (not (rpc-method-allowed-p user method)))
+                   (return (refuse method))))))))))
+
 (defun rpc-json-error (http-status code message)
   "Return a JSON-RPC error response string with the given HTTP status.
 These are pre-dispatch HTTP-level refusals (origin, rate limit, body size), so
@@ -921,8 +1034,12 @@ must stay a value test (NIL = success), not a key-presence test."
     ;; the work a stranger can make us do, and slowing credential guessing.
     ;; That is preserved exactly, and it now composes with Core's 250ms
     ;; brute-force pause rather than duplicating it a layer later.
-    (let ((auth-header (hunchentoot:header-in :authorization request)))
-      (unless (check-auth auth-header)
+    (let* ((auth-header (hunchentoot:header-in :authorization request))
+           ;; The USER, not just a yes: it is what -rpcwhitelist keys on, which
+           ;; is why check-auth returns it (Core threads it out of
+           ;; RPCAuthorized into jreq.authUser, httprpc.cpp:84,121).
+           (user (check-auth auth-header)))
+      (unless user
         (unless (rpc-rate-limit-check)
           (return-from rpc-handler
             (rpc-json-error 429 +rpc-misc-error+ "Rate limit exceeded")))
@@ -935,97 +1052,110 @@ must stay a value test (NIL = success), not a key-presence test."
           (sleep 0.25))
         (setf (hunchentoot:return-code*) hunchentoot:+http-authorization-required+)
         (setf (hunchentoot:header-out :www-authenticate) "Basic realm=\"bitcoin-lisp\"")
-        (return-from rpc-handler "")))
+        (return-from rpc-handler ""))
+      (%rpc-handle-authorized request user))))
 
-    ;; Check body size limit: 32 MiB (Core evhttp_set_max_body_size(MAX_SIZE),
-    ;; httpserver.cpp:410). libevent answers an oversized body with 400.
-    (let* ((content-length-str (hunchentoot:header-in :content-length request))
-           (content-length (and content-length-str
-                                (parse-integer content-length-str :junk-allowed t))))
-      (when (and content-length
-                 (> content-length +max-rpc-body-size+))
-        (return-from rpc-handler
-          (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
-                          "Request body too large"))))
+(defun %rpc-handle-authorized (request user)
+  "Answer REQUEST, which USER has already authenticated for. Everything from
+the body-size limit onwards; split out of RPC-HANDLER so the authenticated
+user name reaches the -rpcwhitelist gate without the whole body having to
+nest inside the auth check."
+  ;; Check body size limit: 32 MiB (Core evhttp_set_max_body_size(MAX_SIZE),
+  ;; httpserver.cpp:410). libevent answers an oversized body with 400.
+  (let* ((content-length-str (hunchentoot:header-in :content-length request))
+         (content-length (and content-length-str
+                              (parse-integer content-length-str :junk-allowed t))))
+    (when (and content-length
+               (> content-length +max-rpc-body-size+))
+      (return-from %rpc-handle-authorized
+        (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
+                        "Request body too large"))))
 
-    ;; No Content-Type check. Core's HTTPReq_JSONRPC (httprpc.cpp:104-165) never
-    ;; inspects the request's Content-Type at all — it writes one on the
-    ;; RESPONSE and reads the body as JSON regardless. We required
-    ;; application/json or text/plain and answered 415 otherwise, so a plain
-    ;; `curl -d ...` (which defaults to application/x-www-form-urlencoded) and
-    ;; any client that omits the header were refused here and worked against
-    ;; Core. A body that is not JSON already fails at the parse below with a
-    ;; -32700, which is the accurate answer; 415 blamed the header instead.
+  ;; No Content-Type check. Core's HTTPReq_JSONRPC (httprpc.cpp:104-165) never
+  ;; inspects the request's Content-Type at all — it writes one on the
+  ;; RESPONSE and reads the body as JSON regardless. We required
+  ;; application/json or text/plain and answered 415 otherwise, so a plain
+  ;; `curl -d ...` (which defaults to application/x-www-form-urlencoded) and
+  ;; any client that omits the header were refused here and worked against
+  ;; Core. A body that is not JSON already fails at the parse below with a
+  ;; -32700, which is the accurate answer; 415 blamed the header instead.
 
-    ;; Process request. The request path is exposed to the handlers as
-    ;; *RPC-REQUEST-URI* (Core JSONRPCRequest::URI): a /wallet/<name> endpoint
-    ;; is how the wallet routes a call to one of its wallets (httprpc.cpp:340
-    ;; registers the same handler under /wallet/); every other method
-    ;; ignores it.
-    (setf (hunchentoot:content-type*) "application/json")
-    (let ((*rpc-request-uri* (hunchentoot:script-name*))
-          (body (hunchentoot:raw-post-data :force-text t)))
-      ;; Post-read body size check (in case Content-Length was absent or wrong)
-      (when (and body (> (length body) +max-rpc-body-size+))
-        (return-from rpc-handler
-          (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
-                          "Request body too large")))
-      (handler-case
-          (multiple-value-bind (request-type method-or-batch params id version id-present)
-              (parse-json-rpc-request body)
-            (case request-type
-              (:single
-               (let ((response (handle-single-request *rpc-node* method-or-batch
-                                                      params id version
-                                                      :id-present id-present)))
-                 ;; A JSON-RPC 2.0 notification (no id member) answers 204
-                 ;; with no body after executing (Core httprpc.cpp:169);
-                 ;; otherwise the 1.x error->status mapping applies
-                 ;; (rpc-response-http-status; 2.0 is always 200).
-                 (cond
-                   ((and (eq version :v2) (not id-present))
-                    (setf (hunchentoot:return-code*) hunchentoot:+http-no-content+)
-                    "")
-                   (t
-                    (setf (hunchentoot:return-code*)
-                          (rpc-response-http-status response version))
-                    (with-output-to-string (s)
-                      (yason:encode response s))))))
-              (:batch
-               ;; Batches always answer HTTP 200 (Core httprpc.cpp:196-206),
-               ;; except a non-empty all-notification batch, which answers 204
-               ;; with no body (:220). An EMPTY batch keeps answering [] for
-               ;; backwards compatibility (:211-219) — note NIL encodes as JSON
-               ;; null, so the empty array must be spelled #().
-               (let ((responses (handle-batch-request *rpc-node* method-or-batch)))
-                 (cond
-                   ((and (null responses) method-or-batch)
-                    (setf (hunchentoot:return-code*) hunchentoot:+http-no-content+)
-                    "")
-                   (t
-                    (with-output-to-string (s)
-                      (yason:encode (or responses #()) s))))))))
-        (rpc-error (e)
-          ;; Body-level failures (parse error -32700, invalid request -32600)
-          ;; have no version context; Core treats them as 1.x — both for the
-          ;; status mapping (parse error -> 500, invalid request -> 400) and
-          ;; for the reply shape, since JSONErrorReply passes the still-default
-          ;; V1_LEGACY/null-id JSONRPCRequest (httprpc.cpp:41-59).
-          (setf (hunchentoot:return-code*)
-                (rpc-error-http-status (rpc-error-code e)))
-          (with-output-to-string (s)
-            (yason:encode (make-rpc-error-response (rpc-error-code e)
-                                                   (rpc-error-message e)
-                                                   nil :v1)
-                          s)))
-        (error (e)
-          (bl.log:node-log :error "RPC handler error: ~A" e)
-          (setf (hunchentoot:return-code*) hunchentoot:+http-internal-server-error+)
-          (with-output-to-string (s)
-            (yason:encode (make-rpc-error-response +rpc-internal-error+
-                                                   "Internal error"
-                                                   nil :v1)
-                          s)))))))
+  ;; Process request. The request path is exposed to the handlers as
+  ;; *RPC-REQUEST-URI* (Core JSONRPCRequest::URI): a /wallet/<name> endpoint
+  ;; is how the wallet routes a call to one of its wallets (httprpc.cpp:340
+  ;; registers the same handler under /wallet/); every other method
+  ;; ignores it.
+  (setf (hunchentoot:content-type*) "application/json")
+  (let ((*rpc-request-uri* (hunchentoot:script-name*))
+        (body (hunchentoot:raw-post-data :force-text t)))
+    ;; Post-read body size check (in case Content-Length was absent or wrong)
+    (when (and body (> (length body) +max-rpc-body-size+))
+      (return-from %rpc-handle-authorized
+        (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
+                        "Request body too large")))
+    (handler-case
+        (multiple-value-bind (request-type method-or-batch params id version id-present)
+            (parse-json-rpc-request body)
+          ;; -rpcwhitelist, in Core's position: the body has parsed, nothing
+          ;; has run yet (httprpc.cpp:144-189). Core's answer is a bare HTTP
+          ;; 403 with no body — it names neither the method it refused nor
+          ;; whether one exists.
+          (unless (%rpc-request-allowed-p user request-type method-or-batch)
+            (setf (hunchentoot:return-code*) hunchentoot:+http-forbidden+)
+            (return-from %rpc-handle-authorized ""))
+          (case request-type
+            (:single
+             (let ((response (handle-single-request *rpc-node* method-or-batch
+                                                    params id version
+                                                    :id-present id-present)))
+               ;; A JSON-RPC 2.0 notification (no id member) answers 204
+               ;; with no body after executing (Core httprpc.cpp:169);
+               ;; otherwise the 1.x error->status mapping applies
+               ;; (rpc-response-http-status; 2.0 is always 200).
+               (cond
+                 ((and (eq version :v2) (not id-present))
+                  (setf (hunchentoot:return-code*) hunchentoot:+http-no-content+)
+                  "")
+                 (t
+                  (setf (hunchentoot:return-code*)
+                        (rpc-response-http-status response version))
+                  (with-output-to-string (s)
+                    (yason:encode response s))))))
+            (:batch
+             ;; Batches always answer HTTP 200 (Core httprpc.cpp:196-206),
+             ;; except a non-empty all-notification batch, which answers 204
+             ;; with no body (:220). An EMPTY batch keeps answering [] for
+             ;; backwards compatibility (:211-219) — note NIL encodes as JSON
+             ;; null, so the empty array must be spelled #().
+             (let ((responses (handle-batch-request *rpc-node* method-or-batch)))
+               (cond
+                 ((and (null responses) method-or-batch)
+                  (setf (hunchentoot:return-code*) hunchentoot:+http-no-content+)
+                  "")
+                 (t
+                  (with-output-to-string (s)
+                    (yason:encode (or responses #()) s))))))))
+      (rpc-error (e)
+        ;; Body-level failures (parse error -32700, invalid request -32600)
+        ;; have no version context; Core treats them as 1.x — both for the
+        ;; status mapping (parse error -> 500, invalid request -> 400) and
+        ;; for the reply shape, since JSONErrorReply passes the still-default
+        ;; V1_LEGACY/null-id JSONRPCRequest (httprpc.cpp:41-59).
+        (setf (hunchentoot:return-code*)
+              (rpc-error-http-status (rpc-error-code e)))
+        (with-output-to-string (s)
+          (yason:encode (make-rpc-error-response (rpc-error-code e)
+                                                 (rpc-error-message e)
+                                                 nil :v1)
+                        s)))
+      (error (e)
+        (bl.log:node-log :error "RPC handler error: ~A" e)
+        (setf (hunchentoot:return-code*) hunchentoot:+http-internal-server-error+)
+        (with-output-to-string (s)
+          (yason:encode (make-rpc-error-response +rpc-internal-error+
+                                                 "Internal error"
+                                                 nil :v1)
+                        s))))))
 
 (defclass rpc-acceptor (hunchentoot:easy-acceptor)
   ()
@@ -1181,7 +1311,9 @@ Callers must have bound the listening socket first — this writes .cookie, and
 
 (defun start-rpc-server (node &rest options
                          &key port (bind "127.0.0.1") (bind-supplied-p nil)
-                              user password rpc-auth allow-ip warmup
+                              user password rpc-auth allow-ip
+                              rpc-whitelist (rpc-whitelist-default :unset)
+                              warmup
                          &allow-other-keys)
   "Start the RPC server.
 PORT defaults to 18332 for testnet, 8332 for mainnet.
@@ -1192,6 +1324,11 @@ InitRPCAuthentication fails (httprpc.cpp:300-302). RPC-AUTH holds -rpcauth
 specs, additional USERNAME:SALT$HMAC credentials accepted alongside that pair.
 ALLOW-IP holds -rpcallowip specs; loopback is always allowed, and a
 non-loopback BIND is honoured only when ALLOW-IP is non-empty.
+RPC-WHITELIST holds -rpcwhitelist specs (USERNAME:<method>,...), which restrict
+what each named user may call. RPC-WHITELIST-DEFAULT is what a user NOT named
+by any of them may call: :UNSET is Core's own default, \"whether any
+-rpcwhitelist was given at all\" (GetBoolArg, httprpc.cpp:306), so the first
+whitelist locks out every other user until it is whitelisted too.
 The remaining keywords belong to the registered HTTP surfaces
 (REGISTER-HTTP-SURFACE): :REST-ENABLED to the /rest/ interface (rest.lisp),
 :UI-ENABLED and :UI-DIRECTORY to the web UI (ui.lisp). Each surface reads
@@ -1199,7 +1336,14 @@ its own from OPTIONS; an option nobody reads is an error."
   (%check-surface-options options)
   (let ((port (or port (bl.chain:network-rpc-port bl.chain:*network*)))
         (acl nil)
-        (rpcauth-credentials nil))
+        (rpcauth-credentials nil)
+        (whitelist (%parse-rpc-whitelist rpc-whitelist))
+        ;; Core: GetBoolArg("-rpcwhitelistdefault", !GetArgs("-rpcwhitelist")
+        ;; .empty()) -- the option when it was given, otherwise "a whitelist
+        ;; exists" (httprpc.cpp:306).
+        (whitelist-default (if (eq rpc-whitelist-default :unset)
+                               (and rpc-whitelist t)
+                               (and rpc-whitelist-default t))))
     (when *rpc-server*
       (bl.log:node-log :warn "RPC server already running")
       (return-from start-rpc-server nil))
@@ -1260,7 +1404,8 @@ its own from OPTIONS; an option nobody reads is an error."
                (when credential-installed
                  (delete-rpc-cookie)
                  (setf *rpc-credentials* '() *rpc-cookie-path* nil
-                       *rpc-allow-subnets* *rpc-loopback-subnets*))
+                       *rpc-allow-subnets* *rpc-loopback-subnets*)
+                 (reset-rpc-whitelist))
                nil))
         (handler-case
             (progn
@@ -1314,7 +1459,9 @@ its own from OPTIONS; an option nobody reads is an error."
                                                rpcauth-credentials)
                 (return-from start-rpc-server (abort-start)))
               (setf credential-installed t
-                    *rpc-allow-subnets* acl)
+                    *rpc-allow-subnets* acl
+                    *rpc-whitelist* whitelist
+                    *rpc-whitelist-default* whitelist-default)
 
               ;; Register methods
               (register-all-methods)
@@ -1378,6 +1525,7 @@ its own from OPTIONS; an option nobody reads is an error."
     ;; image answer -28.
     (setf *rpc-warmup-status* nil)
     (setf *rpc-allow-subnets* *rpc-loopback-subnets*)
+    (reset-rpc-whitelist)
     (setf *rpc-dispatcher* nil)
     (%stop-http-surfaces)
     (setf *rpc-rate-limiter* nil)))

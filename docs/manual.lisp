@@ -565,8 +565,11 @@
   Core's order, so a second process on a running node's datadir cannot
   clobber the live secret. The ACL gates the whole acceptor, so `/rest/`
   and `/ui/` inherit it. The rate limiter throttles the UNAUTHENTICATED
-  side only. A method is registered by its DEFINE-RPC form -- there is no
-  list to forget it in. The REST interface and the web UI register their
+  side only. `-rpcwhitelist` gates the JSON-RPC surface only (Core
+  registers the whitelist inside HTTPReq_JSONRPC, not around `/rest/`),
+  keyed by the user name CHECK-AUTH returns, and a batch is refused as a
+  unit when any member is off the list. A method is registered by its
+  DEFINE-RPC form -- there is no list to forget it in. The REST interface and the web UI register their
   HTTP surfaces with REGISTER-HTTP-SURFACE at the end of their files;
   the server never names them.
 

@@ -67,6 +67,11 @@
 (define-option "rpcbind" :key :rpc-bind :type :string :network-only t)
 (define-option "rpcuser" :key :rpc-user :type :string :sensitive t)
 (define-option "rpcpassword" :key :rpc-password :type :string :sensitive t)
+;; -rpcwhitelistdefault: what a user named by no -rpcwhitelist may call. Core
+;; reads it with GetBoolArg and DEFAULTS it to "any -rpcwhitelist was given"
+;; (httprpc.cpp:306), so the absent case is not the same as =0 -- START-NODE
+;; keeps them apart with an :UNSET default and START-RPC-SERVER derives it.
+(define-option "rpcwhitelistdefault" :key :rpc-whitelist-default :type :bool)
 (define-option "listen" :key :listen :type :bool)
 ;; -bind is scanned for its LAST occurrence into :listen-bind (the single
 ;; address we actually bind); every occurrence is also kept, so a multi-bind
@@ -140,6 +145,12 @@
 ;; httpserver.cpp:153).
 (define-option "rpcauth" :collect :rpc-auth :repeatable t :sensitive t)
 (define-option "rpcallowip" :collect :rpc-allow-ip :repeatable t)
+;; -rpcwhitelist=<user>:<method>,... (g_rpc_whitelist, httprpc.cpp:307-325):
+;; read with GetArgs, and Core INTERSECTS the specs given for one user, so
+;; every occurrence has to reach the server. It is not SENSITIVE in Core (only
+;; -rpcauth, -rpcuser, -rpcpassword and -torpassword are), and it names no
+;; per-chain resource, so it is not NETWORK-ONLY either.
+(define-option "rpcwhitelist" :collect :rpc-whitelist :repeatable t)
 (define-option "testactivationheight" :collect :test-activation-heights :repeatable t)
 ;; -test=<option>: Core reads it with GetArgs, so it is a LIST, and every
 ;; value is a separate test-only switch (common/args.cpp:743-747
@@ -426,7 +437,6 @@
   "natpmp" "peerbloomfilters" "persistmempool"
   "persistmempoolv1" "printpriority"
   "privatebroadcast" "rpcdoccheck"
-  "rpcwhitelist" "rpcwhitelistdefault"
   "rpcworkqueue" "shrinkdebugfile"
   "signer" "signetseednode"
   "stopafterblockimport" "timeout"

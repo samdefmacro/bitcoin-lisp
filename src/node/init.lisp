@@ -771,7 +771,7 @@ connect."
     (do-reindex-chainstate)))
 
 
-(defun %init-services (network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled)
+(defun %init-services (network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled)
   "The RPC server, up early (Core Step 4a AppInitServers, answering
 RPC_IN_WARMUP while the rest loads); the recent-rejects filter, the fee
 estimator, the address book and banlist (Step 6); mempool.dat (Step 11); the
@@ -812,6 +812,7 @@ anchors (Step 12); the coins-DB tip reconciliation; the indexes (Step 8) and
   (when rpc-port
     (%start-rpc-early *node* rpc-port rpc-bind rpc-bind-supplied-p
                       rpc-user rpc-password rpc-auth rpc-allow-ip
+                      rpc-whitelist rpc-whitelist-default
                       rest-enabled network webui webui-supplied-p
                       webui-path webui-open))
 
@@ -1327,6 +1328,8 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (rpc-password nil)
                         (rpc-auth nil)
                         (rpc-allow-ip nil)
+                        (rpc-whitelist nil)
+                        (rpc-whitelist-default :unset)
                         (listen t)
                         (listen-bind "0.0.0.0")
                         (listen-onion t)
@@ -1394,6 +1397,11 @@ RPC-AUTH: list of -rpcauth specs (USERNAME:SALT$HMAC), extra credentials
 RPC-ALLOW-IP: list of -rpcallowip specs allowed to reach the RPC port;
   loopback is always allowed, and a non-loopback RPC-BIND is honoured only
   when this is non-empty
+RPC-WHITELIST: list of -rpcwhitelist specs (USERNAME:<method>,...) restricting
+  what each named user may call
+RPC-WHITELIST-DEFAULT: -rpcwhitelistdefault, what a user named by no
+  -rpcwhitelist may call. :UNSET (the default) is Core's own default, \"whether
+  any -rpcwhitelist was given\" — the absent case is NOT the same as =0
 LISTEN-ONION: If T (default, like Core -listenonion) and LISTEN is on,
   connect to the local Tor control port, create a v3 onion service forwarding
   to a loopback listener on port+1, and advertise the .onion address
@@ -1461,7 +1469,7 @@ Returns the node instance."
   (%init-lock-and-banner network)
   (%init-load-chain network reindex)
   (%init-recover-chain reindex-chainstate)
-  (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled)
+  (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled)
   (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p wallet-names)
   (%finish-init-and-start-sync rpc-port startup-notify sync max-peers)
 

@@ -91,6 +91,7 @@ APPLY-CONFIG-GLOBALS."
 
 (defun %start-rpc-early (node rpc-port rpc-bind rpc-bind-supplied-p
                          rpc-user rpc-password rpc-auth rpc-allow-ip
+                         rpc-whitelist rpc-whitelist-default
                          rest-enabled network webui webui-supplied-p
                          webui-path webui-open)
   "Bring the RPC server up before the slow parts of startup.
@@ -112,6 +113,9 @@ point and answers -28 for every method until FINISH-RPC-WARMUP."
                                                     :password rpc-password
                                                     :rpc-auth rpc-auth
                                                     :allow-ip rpc-allow-ip
+                                                    :rpc-whitelist rpc-whitelist
+                                                    :rpc-whitelist-default
+                                                    rpc-whitelist-default
                                                     :rest-enabled rest-enabled
                                                     :ui-enabled webui-enabled
                                                     :ui-directory webui-path
