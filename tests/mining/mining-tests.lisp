@@ -552,7 +552,7 @@ which is what stops a busy mempool from reassembling a block on every call."
       (let ((node (bl:make-node :network :regtest)))
         (setf (bl:node-chain-state node) cs
               (bl:node-mempool node) mp)
-        (let ((r (bl.rpc::rpc-getmininginfo node nil)))
+        (let ((r (bl.rpc:dispatch-rpc-method node "getmininginfo" nil)))
           (is (= 0 (cdr (assoc "blocks" r :test #'string=))))
           (is (string= "regtest" (cdr (assoc "chain" r :test #'string=))))
           (is (= 0 (cdr (assoc "pooledtx" r :test #'string=))))
@@ -1457,3 +1457,27 @@ outright."
     (let ((node (%hashps-node (make-list 9 :initial-element 1000000)
                               :tip-time 999000)))
       (is (= (/ 9000000d0 (- (+ 1000000 (* 8 600)) 999000)) (%hashps node))))))
+
+(test getmininginfo-omits-the-last-template-fields-until-one-exists
+  "currentblockweight and currentblocktx are std::optional in Core and
+getmininginfo pushes each key only when the assembler has set it
+(rpc/mining.cpp:466-467, node/miner.h:95-99); a node that has never assembled
+a template omits both. Reporting 0 instead cannot be told apart from a
+template that held no transactions, and mining_basic.py:388-389 asserts the
+keys are absent."
+  (with-network (:regtest)
+    (multiple-value-bind (cs mp) (%mining-fixture)
+      (let ((node (bl:make-node :network :regtest)))
+        (setf (bl:node-chain-state node) cs
+              (bl:node-mempool node) mp)
+        (let ((bl.mining:*last-block-template* nil))
+          (let ((r (bl.rpc:dispatch-rpc-method node "getmininginfo" nil)))
+            (is (null (assoc "currentblockweight" r :test #'string=)))
+            (is (null (assoc "currentblocktx" r :test #'string=)))))
+        ;; Once a template has been assembled both keys are present, and the
+        ;; weight carries the reserved allowance (Core's counter does too).
+        (let ((bl.mining:*last-block-template* (bl.mining:assemble-block-template cs mp)))
+          (let ((r (bl.rpc:dispatch-rpc-method node "getmininginfo" nil)))
+            (is (= bl.mining:*block-reserved-weight*
+                   (cdr (assoc "currentblockweight" r :test #'string=))))
+            (is (= 0 (cdr (assoc "currentblocktx" r :test #'string=))))))))))
