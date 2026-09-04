@@ -617,7 +617,15 @@
   -- the persistent volume keeps stale expansions through a warm rebuild,
   an image restart and an ordinary cold run. The script-execution cache
   must key on everything that decides validity, including the spent
-  scriptPubKey. The transaction version and the spent amount are SIGNED
+  scriptPubKey. What FindAndDelete deletes is the signature's PUSH
+  (Core `CScript() << vchSig'), never its bare bytes, and an EMPTY
+  signature's pattern is the one byte OP_0 -- so it deletes something;
+  every call site builds it through one helper because three of them
+  once disagreed. A rule Core keeps in EvalScript applies to all three
+  legacy scripts (scriptSig, scriptPubKey, P2SH redeem script) and to
+  unexecuted branches: CONST_SCRIPTCODE's OP_CODESEPARATOR rejection is
+  pre-scanned in verify-script for exactly that reason.
+  The transaction version and the spent amount are SIGNED
   slots -- that is what the wire format reads back -- while Core streams
   them as raw words, so the BIP 143 and BIP 341 preimages write their bit
   patterns: a version with bit 31 set is legal and arrives here negative."
