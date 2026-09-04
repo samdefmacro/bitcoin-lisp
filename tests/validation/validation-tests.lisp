@@ -2043,3 +2043,97 @@ would be rejected for the wrong reason and prove nothing about the bound."
       (is-true (bl.interop::check-der-signature-format largest)
                "72 bytes with the hashtype is legal — the fix must not
                 over-tighten and start rejecting valid signatures"))))
+
+;;;; ACCEPT-BLOCK-BODY -- Core AcceptBlock's pre-write gate
+
+(test accept-block-body-is-the-gate-every-persist-path-runs
+  "Core writes a block body in one place, AcceptBlock, and the two lines before
+the write are CheckBlock and ContextualCheckBlock (validation.cpp:4381-4389).
+ACCEPT-BLOCK-BODY is that pair, so every persist path can run it instead of
+remembering both. It accepts an honest body; it rejects a forged one
+(bad-txnmrklroot) without touching the honest header's index entry, a
+consensus-invalid one (bad-cb-multiple) with the entry marked :invalid, and a
+non-final coinbase -- which no context-free check can see, so that case is what
+proves the CONTEXTUAL half runs here too."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash)
+        (make-activate-block-fixture "accept-block-body-gate")
+      (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA4 2))
+      (let* ((tip-entry (bl.store:get-block-index-entry
+                         cs (bl.store:best-block-hash cs)))
+             (tip-hash (bl.store:block-index-entry-hash tip-entry)))
+        (destructuring-bind (honest-h forged-h consensus-h nonfinal-h)
+            (make-test-chain-hashes #xB3 4)
+          (let ((honest (make-reorg-test-block tip-hash honest-h 3))
+                (forged (make-forged-body-block tip-hash forged-h 3))
+                (consensus (make-two-coinbase-block tip-hash consensus-h 3))
+                (nonfinal (make-reorg-test-block tip-hash nonfinal-h 3
+                                                 :lock-time 500000
+                                                 :sequence 0)))
+            (dolist (row (list (list honest honest-h)
+                               (list forged forged-h)
+                               (list consensus consensus-h)
+                               (list nonfinal nonfinal-h)))
+              (bl.store:add-block-index-entry
+               cs (bl.store:make-block-index-entry
+                   :hash (second row) :height 3 :prev-entry tip-entry
+                   :chain-work 900000 :status :header-valid
+                   :header (bl.ser:bitcoin-block-header (first row)))))
+            ;; Positive control: an honest body passes, so a rejection below is
+            ;; the gate finding a defect and not the fixture being unbuildable.
+            (is-true (bl.val:accept-block-body honest cs)
+                     "the gate refused an honest body")
+            ;; CheckBlock, mutation class: refused, honest header untouched.
+            (is (eq :bad-merkle-root
+                    (nth-value 1 (bl.val:accept-block-body forged cs)))
+                "a forged body was accepted")
+            (is (eq :header-valid
+                    (bl.store:block-index-entry-status
+                     (bl.store:get-block-index-entry cs forged-h)))
+                "a mutated verdict poisoned the honest header (Core keeps
+                 BLOCK_MUTATED off BLOCK_FAILED_VALID)")
+            ;; CheckBlock, consensus class: refused AND the entry marked.
+            (is (eq :multiple-coinbase
+                    (nth-value 1 (bl.val:accept-block-body consensus cs)))
+                "a two-coinbase body was accepted")
+            (is (eq :invalid
+                    (bl.store:block-index-entry-status
+                     (bl.store:get-block-index-entry cs consensus-h)))
+                "a consensus verdict did not mark the entry invalid")
+            ;; ContextualCheckBlock: invisible to any context-free check.
+            (is-true (bl.val:validate-block nonfinal cs utxo 3
+                                            (bl.ser:get-unix-time)
+                                            :context-free-only t)
+                     "control: CheckBlock alone cannot see a non-final coinbase")
+            (is (eq :non-final-tx
+                    (nth-value 1 (bl.val:accept-block-body nonfinal cs)))
+                "the gate skipped Core's ContextualCheckBlock half")))))))
+
+(test activate-block-does-not-store-a-body-that-fails-the-gate
+  "ACTIVATE-BLOCK's weaker-chain case stores a block without connecting it, and
+did so with no CheckBlock at all -- the same hole as the two IBD persist paths,
+reached instead from the relay and submitblock sides. It must now refuse."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash)
+        (make-activate-block-fixture "activate-block-gate")
+      (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA5 2))
+      (let ((genesis-entry (bl.store:get-block-index-entry cs genesis-hash)))
+        (destructuring-bind (forged-h honest-h) (make-test-chain-hashes #xB4 2)
+          (let ((forged (make-forged-body-block genesis-hash forged-h 1))
+                (ok (make-reorg-test-block genesis-hash honest-h 1)))
+            (dolist (row (list (list forged forged-h) (list ok honest-h)))
+              (bl.store:add-block-index-entry
+               cs (bl.store:make-block-index-entry
+                   :hash (second row) :height 1 :prev-entry genesis-entry
+                   :chain-work 50 :status :header-valid
+                   :header (bl.ser:bitcoin-block-header (first row)))))
+            (is (eq :bad-merkle-root
+                    (nth-value 1 (bl.val:activate-block forged cs store utxo)))
+                "activate-block accepted a forged weaker-chain body")
+            (is-false (bl.store:block-exists-p store forged-h)
+                      "a forged weaker-chain body reached disk")
+            (is (eq :weaker-chain
+                    (nth-value 1 (bl.val:activate-block ok cs store utxo)))
+                "positive control: an honest weaker-chain body must be stored")
+            (is-true (bl.store:block-exists-p store honest-h)
+                     "positive control: the honest body did not reach disk")))))))

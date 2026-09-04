@@ -73,6 +73,7 @@ can. src/validation/.")
    #:*signet-challenge*
    #:*default-signet-challenge*
    #:connect-block
+   #:accept-block-body
    #:activate-block
    #:find-fork-point
    ;; Tx-relay tip structures (Core recent-confirmed filter +

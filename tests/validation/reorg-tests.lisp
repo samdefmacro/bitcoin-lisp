@@ -1884,8 +1884,7 @@ would let the ordinary tip+1 path preempt the scenario)."
            ;; B4 arrives FIRST (out of order, above tip+1): persisted to
            ;; disk, recorded as reorg candidate — but gated (fork bodies
            ;; incomplete), so the tip must not move.
-           (bl.net::process-received-block
-            (fourth b-blocks) csa utxoa storea :requested t)
+           (deliver-block (fourth b-blocks) csa utxoa storea :requested t)
            (is (bl.store:block-exists-p storea (fourth b-hashes)))
            (is (gethash (fourth b-hashes)
                         (bl.net::ibd-context-reorg-candidates ctx)))
@@ -1894,18 +1893,15 @@ would let the ordinary tip+1 path preempt the scenario)."
            ;; missing), so the candidate retry on each arrival still can't
            ;; fire — tip stays A2. This is exactly where the pre-fix node
            ;; livelocked (winning bodies present but no reorg attempted).
-           (bl.net::process-received-block
-            (first b-blocks) csa utxoa storea :requested t)
-           (bl.net::process-received-block
-            (second b-blocks) csa utxoa storea :requested t)
+           (deliver-block (first b-blocks) csa utxoa storea :requested t)
+           (deliver-block (second b-blocks) csa utxoa storea :requested t)
            (is (equalp a2-hash (bl.store:best-block-hash csa)))
            ;; B3 (tip+1, cumulatively weaker) completes B1..B3 on disk. Its
            ;; own activate-block stays :weaker-chain, but the candidate retry
            ;; it triggers now finds B4's fork complete and performs the reorg
            ;; eagerly (Core-style: ActivateBestChain after every accepted
            ;; block) -> tip = B4, candidate consumed.
-           (bl.net::process-received-block
-            (third b-blocks) csa utxoa storea :requested t)
+           (deliver-block (third b-blocks) csa utxoa storea :requested t)
            (is (= 4 (bl.store:current-height csa)))
            (is (equalp (fourth b-hashes) (bl.store:best-block-hash csa)))
            (is (null (gethash (fourth b-hashes)
@@ -1951,14 +1947,14 @@ post-persist without the fallback, stranded on disk forever)."
        (with-ibd-context
          (let ((ctx bl.net:*ibd-context*))
            ;; A4 arrives out of order: persisted + RAM-queued + recorded.
-           (bl.net::process-received-block a4 csa utxoa storea)
+           (deliver-block a4 csa utxoa storea)
            (is (bl.store:block-exists-p storea h4))
            (is (gethash 4 (bl.net:ibd-context-block-queue ctx)))
            ;; Simulate the RAM slot being lost (cap-drop / restart).
            (remhash 4 (bl.net:ibd-context-block-queue ctx))
            (setf (bl.net::ibd-context-block-queue-bytes ctx) 0)
            ;; A3 connects at tip+1; drain must then pull A4 from DISK.
-           (bl.net::process-received-block a3 csa utxoa storea)
+           (deliver-block a3 csa utxoa storea)
            (is (= 4 (bl.store:current-height csa)))
            (is (equalp h4 (bl.store:best-block-hash csa)))
            ;; The consumed disk-map entry is gone.
@@ -2186,8 +2182,7 @@ rejected set. The active tip is untouched until the bodies arrive."
          (let ((ctx bl.net:*ibd-context*))
            ;; Feed B4 (height 4 = tip+1). It outweighs A3, but B1-B3 bodies are
            ;; missing -> perform-reorg refuses -> :reorg-refused + missing list.
-           (bl.net::process-received-block
-            (fourth b-blocks) csa utxoa storea :requested t)
+           (deliver-block (fourth b-blocks) csa utxoa storea :requested t)
            ;; The three missing sub-tip fork bodies were re-queued for download.
            (is (= 3 (hash-table-count
                      (bl.net:ibd-context-pending-blocks ctx))))
@@ -2254,20 +2249,20 @@ re-fetched; an unsolicited stripped copy does not."
            (dolist (blk (list below tip1 above-req above-uns))
              (is-true (bl.val:block-witness-stripped-p blk)))
            ;; (a) below the tip (competing fork, height 1) — dropped, not stored.
-           (bl.net::process-received-block below cs utxo store :requested t)
+           (deliver-block below cs utxo store :requested t)
            (is (null (bl.store:block-exists-p store below-hash)))
            ;; (b) tip+1 (height 3) — dropped, not stored.
-           (bl.net::process-received-block tip1 cs utxo store :requested t)
+           (deliver-block tip1 cs utxo store :requested t)
            (is (null (bl.store:block-exists-p store tip1-hash)))
            ;; (c) above tip (height 5), REQUESTED — dropped, not stored, but the
            ;; requested block re-enters pending for a witness-complete re-fetch.
-           (bl.net::process-received-block above-req cs utxo store :requested t)
+           (deliver-block above-req cs utxo store :requested t)
            (is (null (bl.store:block-exists-p store above-req-hash)))
            (is (eql 5 (gethash above-req-hash
                                (bl.net:ibd-context-pending-blocks ctx))))
            ;; (d) above tip (height 6), UNSOLICITED — dropped, not stored, and NOT
            ;; re-queued (only a requested stripped copy re-arms a fetch).
-           (bl.net::process-received-block above-uns cs utxo store)
+           (deliver-block above-uns cs utxo store)
            (is (null (bl.store:block-exists-p store above-uns-hash)))
            (is (null (gethash above-uns-hash
                               (bl.net:ibd-context-pending-blocks ctx)))))))

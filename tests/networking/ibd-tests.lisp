@@ -3181,3 +3181,130 @@ if something actually re-arms. Assert the persist path calls the drain."
                                (asdf:system-source-directory :bitcoin-lisp)))))
     (is (search "(%rearm-unlinked-reorg-candidates hash chain-state)" src)
         "no caller drains the parked map, so a parked fork never comes back")))
+
+;;;; Core AcceptBlock's pre-write gate on the two IBD persist paths
+;;;;
+;;;; PROCESS-RECEIVED-BLOCK wrote every body to disk with no CheckBlock at all:
+;;;; the competing-fork path (h <= tip) checked only BLOCK-WITNESS-STRIPPED-P,
+;;;; and the out-of-order path (h > tip+1) only that plus the anti-DoS gate.
+;;;; Core runs CheckBlock and ContextualCheckBlock immediately before its one
+;;;; write (validation.cpp:4381-4389), so a peer could put an arbitrary body on
+;;;; disk under an honest header's hash -- and BLOCK-EXISTS-P then told the
+;;;; per-peer download walk we had that height, so the real block was never
+;;;; re-requested and the tip could not pass it without a reindex.
+
+(defun %forged-body-fixture (suffix)
+  "(values CHAIN-STATE UTXO STORE GENESIS-HASH TIP-ENTRY GENESIS-ENTRY): a
+mainnet fixture with an active chain of two blocks. Mainnet on purpose --
+BIP34 and segwit are inactive at these heights, so a synthetic coinbase is a
+valid body and the positive controls really do persist."
+  (multiple-value-bind (cs utxo store genesis-hash)
+      (make-activate-block-fixture suffix)
+    (build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 2))
+    (values cs utxo store genesis-hash
+            (bl.store:get-block-index-entry cs (bl.store:best-block-hash cs))
+            (bl.store:get-block-index-entry cs genesis-hash))))
+
+(defun %index-header (chain-state block hash height prev-entry work)
+  "Index BLOCK's header the way AcceptBlockHeader would, before its body
+arrives."
+  (bl.store:add-block-index-entry
+   chain-state
+   (bl.store:make-block-index-entry
+    :hash hash :height height :prev-entry prev-entry :chain-work work
+    :status :header-valid
+    :header (bl.ser:bitcoin-block-header block))))
+
+(test s1-a-forged-body-is-never-persisted-by-either-ibd-persist-path
+  "GA10 S1. A body whose transactions are not the ones its header commits to is
+refused before BL.STORE:STORE-BLOCK on BOTH of PROCESS-RECEIVED-BLOCK's persist
+paths -- the competing-fork arm (h <= tip) and the out-of-order arm (h > tip+1)
+-- and the honest block the same header names still persists through each of
+them, so the gate rejects the lie rather than the path."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash tip-entry genesis-entry)
+        (%forged-body-fixture "s1-forged-body")
+      (destructuring-bind (fork-h fork-ok-h ooo-h ooo-ok-h)
+          (make-test-chain-hashes #xB1 4)
+        (let ((tip-hash (bl.store:block-index-entry-hash tip-entry)))
+          (multiple-value-bind (fork-forged fork-honest)
+              (make-forged-body-block genesis-hash fork-h 1)
+            (multiple-value-bind (ooo-forged ooo-honest)
+                (make-forged-body-block tip-hash ooo-h 5)
+              (let ((fork-ok (make-reorg-test-block genesis-hash fork-ok-h 1))
+                    (ooo-ok (make-reorg-test-block tip-hash ooo-ok-h 5)))
+                ;; Headers only: the bodies are what is under test.
+                (%index-header cs fork-forged fork-h 1 genesis-entry 50)
+                (%index-header cs fork-ok fork-ok-h 1 genesis-entry 50)
+                (%index-header cs ooo-forged ooo-h 5 tip-entry 900000)
+                (%index-header cs ooo-ok ooo-ok-h 5 tip-entry 900000)
+                (with-ibd-context
+                  ;; Competing-fork arm (height 1, tip is at 2).
+                  (deliver-block fork-forged cs utxo store :requested t)
+                  (is-false (bl.store:block-exists-p store fork-h)
+                            "a forged competing-fork body reached disk")
+                  (deliver-block fork-honest cs utxo store :requested t)
+                  (is-true (bl.store:block-exists-p store fork-h)
+                           "positive control: the honest body must still persist")
+                  ;; Out-of-order arm (height 5, tip is at 2).
+                  (deliver-block ooo-forged cs utxo store :requested t)
+                  (is-false (bl.store:block-exists-p store ooo-h)
+                            "a forged out-of-order body reached disk")
+                  (deliver-block ooo-honest cs utxo store :requested t)
+                  (is-true (bl.store:block-exists-p store ooo-h)
+                           "positive control: the honest body must still persist")
+                  ;; And the second positive control, a body nobody forged.
+                  (deliver-block ooo-ok cs utxo store :requested t)
+                  (is-true (bl.store:block-exists-p store ooo-ok-h)
+                           "positive control: an ordinary body must persist"))))))))))
+
+(test s1-a-refused-body-punishes-its-peer-and-marks-only-a-non-mutated-verdict
+  "Core MaybePunishNodeForBlock misbehaves on BLOCK_CONSENSUS and BLOCK_MUTATED
+alike (net_processing.cpp:1908-1949), so either verdict costs the sending peer
+its connection. InvalidBlockFound does NOT: it skips BLOCK_FAILED_VALID for
+BLOCK_MUTATED (validation.cpp:1985-1993), because the block hash does not
+commit to what the mutated checks read -- marking one would let a peer that
+mangles a body in transit poison an honest header permanently. So a forged body
+leaves its entry downloadable, while two coinbases -- which the merkle root
+authenticates -- poison the entry and its indexed descendants."
+  (with-network (:mainnet)
+    (multiple-value-bind (cs utxo store genesis-hash tip-entry)
+        (%forged-body-fixture "s1-refused-body")
+      (declare (ignore genesis-hash))
+      (destructuring-bind (mutated-h consensus-h child-h)
+          (make-test-chain-hashes #xB2 3)
+        (let* ((tip-hash (bl.store:block-index-entry-hash tip-entry))
+               (mutated (make-forged-body-block tip-hash mutated-h 5))
+               (consensus (make-two-coinbase-block tip-hash consensus-h 5))
+               (child (make-reorg-test-block consensus-h child-h 6))
+               (mutated-peer (bl.net:make-peer))
+               (consensus-peer (bl.net:make-peer)))
+          (%index-header cs mutated mutated-h 5 tip-entry 900000)
+          (%index-header cs consensus consensus-h 5 tip-entry 900000)
+          (%index-header cs child child-h 6
+                         (bl.store:get-block-index-entry cs consensus-h) 900001)
+          (with-ibd-context
+            ;; BLOCK_MUTATED: peer punished, header left alone.
+            (deliver-block mutated cs utxo store
+                           :requested t :peer mutated-peer)
+            (is (eq :disconnected (bl.net:peer-state mutated-peer))
+                "a peer that sent a forged body was not punished")
+            (is (eq :header-valid
+                    (bl.store:block-index-entry-status
+                     (bl.store:get-block-index-entry cs mutated-h)))
+                "a mutated body poisoned the honest header it was sent under")
+            ;; BLOCK_CONSENSUS: peer punished AND the subtree marked invalid.
+            (deliver-block consensus cs utxo store
+                           :requested t :peer consensus-peer)
+            (is (eq :disconnected (bl.net:peer-state consensus-peer))
+                "a peer that sent a consensus-invalid body was not punished")
+            (is-false (bl.store:block-exists-p store consensus-h)
+                      "a consensus-invalid body reached disk")
+            (is (eq :invalid
+                    (bl.store:block-index-entry-status
+                     (bl.store:get-block-index-entry cs consensus-h)))
+                "the entry was not marked invalid (Core InvalidBlockFound)")
+            (is (eq :invalid
+                    (bl.store:block-index-entry-status
+                     (bl.store:get-block-index-entry cs child-h)))
+                "the doomed subtree was not marked (Core BLOCK_FAILED_CHILD)")))))))

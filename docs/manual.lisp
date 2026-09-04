@@ -611,7 +611,14 @@
   push (a consensus split when it was the latter). Block weight includes
   the header and the transaction-count varint. Witness and taproot are
   height-gated for us and always on in Core -- the exception table, not
-  the gate, is the source of truth."
+  the gate, is the source of truth. Every path that writes a block BODY
+  to disk runs ACCEPT-BLOCK-BODY first (Core AcceptBlock's CheckBlock +
+  ContextualCheckBlock pair); BL.STORE:STORE-BLOCK validates nothing, and
+  four persist paths once reached it with no check at all. A rejected body
+  marks its index entry :invalid unless the verdict is mutation-class,
+  which Core's InvalidBlockFound also exempts -- the block hash does not
+  commit to what those checks read, so marking one would let a peer poison
+  an honest header by mangling the body in transit."
   (bitcoin-lisp.validation package)
   (bitcoin-lisp.validation:validate-transaction-structure function)
   (bitcoin-lisp.validation:validate-transaction-contextual function)
@@ -622,6 +629,7 @@
   (bitcoin-lisp.validation:tx-reject-reason-string function)
   (bitcoin-lisp.validation:validate-block-header function)
   (bitcoin-lisp.validation:validate-block function)
+  (bitcoin-lisp.validation:accept-block-body function)
   (bitcoin-lisp.validation:test-block-validity function)
   (bitcoin-lisp.validation:connect-block function)
   (bitcoin-lisp.validation:activate-best-chain function)

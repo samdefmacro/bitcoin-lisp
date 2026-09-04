@@ -610,7 +610,9 @@ fall out of step."
   "A structural guard, for the same reason as the txindex one. A block stored
 without its height silently makes its whole FILE unprunable, and a pruned node
 that stops reclaiming space says nothing about it until the disk fills. There
-are five call sites; a sixth that forgets is how this returns."
+are four call sites -- two in ACTIVATE-BLOCK collapsed onto
+%STORE-ACCEPTED-BLOCK-BODY when Core's AcceptBlock gate landed in front of
+them -- and a fifth that forgets is how this returns."
   (let ((sites '()))
     (dolist (rel '("src/validation/block.lisp" "src/networking/ibd.lisp"))
       (let ((src (uiop:read-file-string
@@ -620,8 +622,8 @@ are five call sites; a sixth that forgets is how this returns."
               while pos
               do (push (subseq src pos (min (length src) (+ pos 400))) sites)
                  (setf start (+ pos 10)))))
-    (is (= 5 (length sites))
-        "expected 5 store-block call sites; a new one needs :height too")
+    (is (= 4 (length sites))
+        "expected 4 store-block call sites; a new one needs :height too")
     (dolist (form sites)
       (is (search ":height" form)
           "a store-block call omits :height, which makes its block file
