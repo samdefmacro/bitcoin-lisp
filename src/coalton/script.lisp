@@ -1065,7 +1065,12 @@
   ;; Helper: check DISCOURAGE_UPGRADABLE_NOPS and return error or pass
   (declare check-discouraged-nop (ScriptContext -> (ScriptResult ScriptContext)))
   (define (check-discouraged-nop ctx)
-    "If DISCOURAGE_UPGRADABLE_NOPS flag is set, return error; otherwise pass."
+    "If DISCOURAGE_UPGRADABLE_NOPS flag is set, return error; otherwise pass.
+For OP_NOP1 and OP_NOP4..OP_NOP10 ONLY -- Core reads that flag in exactly that
+one case (interpreter.cpp:594-599). OP_CHECKLOCKTIMEVERIFY and
+OP_CHECKSEQUENCEVERIFY are NOT upgradable NOPs: each has its own flag, and with
+that flag off Core leaves the branch as a plain NOP without consulting anything
+else. Wiring either of them here rejects scripts Core accepts."
     (let ((discourage (lisp Boolean ()
                         (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
                                     "DISCOURAGE_UPGRADABLE_NOPS"))))
@@ -2106,8 +2111,13 @@
       ;; CHECKLOCKTIMEVERIFY (BIP 65)
       ((OP-CHECKLOCKTIMEVERIFY)
        (if (not (flag-enabled "CHECKLOCKTIMEVERIFY"))
-           ;; No CLTV flag - treat as NOP2
-           (check-discouraged-nop ctx)
+           ;; Not enabled; treat as a NOP2 — a PLAIN one. Core's branch is
+           ;; `if (!(flags & SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY)) { break; }`
+           ;; (interpreter.cpp:521-526) and consults nothing else;
+           ;; DISCOURAGE_UPGRADABLE_NOPS is read only in the OP_NOP1 /
+           ;; OP_NOP4..OP_NOP10 case (:594-599). BIP65 gave this opcode its own
+           ;; flag and the discourage test left the branch with it.
+           (ScriptOk ctx)
            ;; CLTV flag enabled - full BIP 65 validation
              ;; Does NOT pop the stack value
              (match (stack-top (context-main-stack ctx))
@@ -2139,8 +2149,9 @@
       ;; CHECKSEQUENCEVERIFY (BIP 112)
       ((OP-CHECKSEQUENCEVERIFY)
        (if (not (flag-enabled "CHECKSEQUENCEVERIFY"))
-           ;; No CSV flag - treat as NOP3
-           (check-discouraged-nop ctx)
+           ;; Not enabled; treat as a NOP3 — a PLAIN one, exactly as for
+           ;; OP_CHECKLOCKTIMEVERIFY above (Core interpreter.cpp:560-565).
+           (ScriptOk ctx)
            ;; CSV flag enabled - full BIP 112 validation
              ;; Does NOT pop the stack value
              (match (stack-top (context-main-stack ctx))
