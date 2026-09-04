@@ -1749,7 +1749,8 @@ Returns the number of transactions removed."
 Also removes any transactions that conflict with block transactions,
 together with their in-mempool descendants (Core removeForBlock ->
 removeConflicts -> removeRecursive, txmempool.cpp:388-424: a conflicted
-tx's descendants spend outputs that no longer exist)."
+tx's descendants spend outputs that no longer exist). Both the confirmed
+and the conflicting transaction lose their prioritisation delta."
   (%with-graph-verify-batch (mempool)
     (let ((block-outpoints (make-hash-table :test 'equalp)))
       ;; Collect all outpoints spent by block transactions
@@ -1772,7 +1773,11 @@ tx's descendants spend outputs that no longer exist)."
 
       ;; Remove conflicting transactions (mempool txs that spend same outpoints
       ;; as block txs), recursively: their descendants are conflicted too
-      ;; (Core removeConflicts, MemPoolRemovalReason::CONFLICT).
+      ;; (Core removeConflicts, MemPoolRemovalReason::CONFLICT). The delta of
+      ;; the conflicting tx goes with it — ClearPrioritisation before
+      ;; removeRecursive (txmempool.cpp:395-401), since a double-spent txid
+      ;; can never come back — and only that one: removeRecursive drops the
+      ;; descendants without touching mapDeltas, and they can be resubmitted.
       (let ((to-remove '())
             (*mempool-removal-reason* :conflict))
         (maphash (lambda (outpoint-key spending-txid)
@@ -1780,6 +1785,7 @@ tx's descendants spend outputs that no longer exist)."
                      (pushnew spending-txid to-remove :test #'equalp)))
                  (mempool-spent-outpoints mempool))
         (dolist (txid to-remove)
+          (remhash txid (mempool-deltas mempool))
           (mempool-remove-recursive mempool txid))))))
 
 (defun mempool-remove-spenders (mempool txid n-outputs)
