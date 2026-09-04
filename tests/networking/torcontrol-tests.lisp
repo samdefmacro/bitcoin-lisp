@@ -522,24 +522,24 @@ dummy; addr_from is always the all-zero dummy, exactly like modern Core."
 -listen=0 soft-disables -listenonion (init.cpp:808) and the explicit
 combination -listen=0 -listenonion=1 is an init error (init.cpp:1022-1024);
 -proxy's listen soft-off cascades to listenonion."
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-torcontrol=127.0.0.1:9151" "-torpassword=hunter2"))))
     (is (string= "127.0.0.1:9151" (getf plist :tor-control)))
     (is (string= "hunter2" (getf plist :tor-password)))
     ;; Default: listenonion not forced off (absent -> start-node default T).
     (is (eq 'unset (getf plist :listen-onion 'unset))))
-  (let ((plist (bl::args->start-node-plist '("-listen=0"))))
+  (let ((plist (start-node-plist '("-listen=0"))))
     (is (null (getf plist :listen)))
     (is (null (getf plist :listen-onion 'unset))))
-  (let ((plist (bl::args->start-node-plist '("-proxy=127.0.0.1:9050"))))
+  (let ((plist (start-node-plist '("-proxy=127.0.0.1:9050"))))
     (is (null (getf plist :listen)))
     (is (null (getf plist :listen-onion 'unset))))
   (signals error
-    (bl::args->start-node-plist '("-listen=0" "-listenonion=1")))
+    (start-node-plist '("-listen=0" "-listenonion=1")))
   (signals error
-    (bl::args->start-node-plist '("-proxy=127.0.0.1:9050" "-listenonion")))
+    (start-node-plist '("-proxy=127.0.0.1:9050" "-listenonion")))
   ;; Explicit listen=1 with listenonion stays on.
-  (let ((plist (bl::args->start-node-plist '("-listen=1" "-listenonion=1"))))
+  (let ((plist (start-node-plist '("-listen=1" "-listenonion=1"))))
     (is (eq t (getf plist :listen-onion)))))
 
 (test tor-config-onion-explicit-and-onlynet

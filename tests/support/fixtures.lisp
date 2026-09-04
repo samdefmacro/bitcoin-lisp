@@ -139,3 +139,15 @@ to the base view."
 (defun coins-cache-entry-dirty-p (entry)
   "Whether one cache entry carries the DIRTY flag."
   (bl.store::ce-dirty entry))
+
+;;;; The configuration a command line and a bitcoin.conf produce
+
+(defun start-node-plist (&optional args conf-text settings-rows)
+  "The START-NODE keyword plist ARGS and CONF-TEXT resolve to, plus the merged
+config alist and the network as second and third values — the pure half of
+START-NODE-FROM-ARGS. CONF-TEXT is one bitcoin.conf's contents or a list of
+them; SETTINGS-ROWS is a settings.json source (BL:SETTINGS-CONFIG-ROWS).
+
+Five test files ask this question, which is why it is a fixture rather than
+fifty-four reaches into the same internal."
+  (bl::args->start-node-plist args conf-text settings-rows))

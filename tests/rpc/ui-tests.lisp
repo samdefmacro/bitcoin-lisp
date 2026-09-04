@@ -264,15 +264,15 @@ else (foreign authority, \"null\", junk) is rejected."
 (test webui-config-plumbing
   "-webui/-webuipath/-webuiopen map onto start-node keywords; -nowebui is a
 supplied-but-false :webui; nothing is supplied when the flags are absent."
-  (let ((plist (bl::args->start-node-plist
+  (let ((plist (start-node-plist
                 '("-regtest" "-webui" "-webuiopen" "-webuipath=/x/ui/" "-rpcport=1"))))
     (is (eq t (getf plist :webui)))
     (is (eq t (getf plist :webui-open)))
     (is (string= "/x/ui/" (getf plist :webui-path))))
-  (let ((plist (bl::args->start-node-plist '("-regtest" "-nowebui"))))
+  (let ((plist (start-node-plist '("-regtest" "-nowebui"))))
     (is (null (getf plist :webui)))
     (is (not (null (member :webui plist)))))
-  (let ((plist (bl::args->start-node-plist '("-regtest"))))
+  (let ((plist (start-node-plist '("-regtest"))))
     (is (null (member :webui plist)))
     (is (null (member :webui-open plist)))))
 

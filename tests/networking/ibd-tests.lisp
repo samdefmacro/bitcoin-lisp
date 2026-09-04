@@ -1996,12 +1996,12 @@ ignored when it is off (:3964-3967)."
   "-txreconciliation maps to start-node's :tx-reconciliation keyword like the
 other boolean flags (Core: DEBUG_ONLY, default off)."
   (multiple-value-bind (plist merged network)
-      (bl::args->start-node-plist '("-txreconciliation" "-regtest"))
+      (start-node-plist '("-txreconciliation" "-regtest"))
     (declare (ignore merged))
     (is (eq :regtest network))
     (is (eq t (getf plist :tx-reconciliation))))
   (multiple-value-bind (plist merged network)
-      (bl::args->start-node-plist '("-regtest"))
+      (start-node-plist '("-regtest"))
     (declare (ignore merged network))
     (is (eq nil (getf plist :tx-reconciliation)))))
 
