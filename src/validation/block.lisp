@@ -1680,14 +1680,63 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
         (return-from %check-block (values nil :bad-blk-sigops))))
     (values t nil)))
 
+(defun %contextual-check-block-no-utxo (block chain-state current-height)
+  "Core ContextualCheckBlock (validation.cpp:4161-4216) minus the block-weight
+limit, which %CHECK-BLOCK already applies: transaction finality against the
+BIP113 cutoff, the BIP34 coinbase height, and the BIP141 witness commitment /
+malleation checks, in Core's order.
+
+Every check here reads only the block, its parent's median time past and the
+block's own height -- never the UTXO set -- so it is correct for a block on ANY
+branch. That is what lets ACCEPT-BLOCK-BODY run it before a body is written to
+disk, exactly where Core runs it (AcceptBlock, validation.cpp:4381-4389).
+
+Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (transactions (bl.ser:bitcoin-block-transactions block))
+         (prev-hash (bl.ser:block-header-prev-block header))
+         (csv-active (>= current-height
+                         (get-csv-activation-height bl:*network*)))
+         ;; For IsFinalTx: use MTP after BIP 113 activation, block timestamp before
+         (locktime-check-time
+           (if csv-active
+               (or (compute-median-time-past chain-state prev-hash) 0)
+               (bl.ser:block-header-timestamp header))))
+    ;; Finality covers EVERY transaction including the coinbase: Core's
+    ;; ContextualCheckBlock iterates block.vtx with no IsCoinBase guard
+    ;; (validation.cpp:4176-4181). This skipped vtx[0], so a coinbase with an
+    ;; nLockTime past the cutoff and a non-final nSequence connected here while
+    ;; Core rejected the block bad-txns-nonfinal.
+    ;;
+    ;; The coinbase exclusion belongs to the BIP68 sequence-lock loop in
+    ;; %CONTEXTUAL-CHECK-BLOCK, which Core really does guard with
+    ;; `if (!tx.IsCoinBase())' (validation.cpp:2528) — it was applied to the
+    ;; wrong one of the two loops. Keep them different; making them agree
+    ;; reintroduces one bug or the other.
+    (loop for tx in transactions
+          unless (check-transaction-final tx current-height locktime-check-time)
+            do (return-from %contextual-check-block-no-utxo
+                 (values nil :non-final-tx)))
+    ;; BIP 34 coinbase height
+    (multiple-value-bind (valid error)
+        (validate-coinbase-height block current-height)
+      (unless valid
+        (return-from %contextual-check-block-no-utxo (values nil error))))
+    ;; Witness commitment / malleation (BIP 141), gated on segwit activation
+    ;; for this height — Core's expect_witness_commitment =
+    ;; DeploymentActiveAfter(prev, SEGWIT).
+    (validate-witness-commitment
+     block
+     (>= current-height (get-segwit-activation-height bl:*network*)))))
+
 (defun %contextual-check-block (block chain-state utxo-set current-height
                                &key skip-scripts)
-  "Core ContextualCheckBlock plus the UTXO-dependent half of ConnectBlock:
-BIP30, per-input validation and fee accumulation, sequence locks, scripts,
-the BIP34 coinbase height and the coinbase value cap. Every check here
-reads the ACTIVE UTXO set or the chain height, so it is only correct for a
-block that extends the tip -- a fork block gets these from PERFORM-REORG
-instead, fork-to-tip against the rewound set.
+  "The UTXO-dependent half of ConnectBlock -- BIP30, per-input validation and
+fee accumulation, sequence locks, scripts and the coinbase value cap -- around
+%CONTEXTUAL-CHECK-BLOCK-NO-UTXO, which contributes Core's ContextualCheckBlock.
+Every check added here reads the ACTIVE UTXO set or the chain height, so it is
+only correct for a block that extends the tip -- a fork block gets these from
+PERFORM-REORG instead, fork-to-tip against the rewound set.
 
 Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
   (let* ((header (bl.ser:bitcoin-block-header block))
@@ -1799,31 +1848,21 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
                                    :height current-height
                                    :coinbase nil))))))
 
-      ;; Transaction finality check (IsFinalTx) and BIP 68 sequence locks
-      (let* ((prev-hash (bl.ser:block-header-prev-block header))
-             (mtp (or (compute-median-time-past chain-state prev-hash) 0))
-             (csv-height (get-csv-activation-height bl:*network*))
-             (csv-active (>= current-height csv-height))
-             ;; For IsFinalTx: use MTP after BIP 113 activation, block timestamp before
-             (locktime-check-time (if csv-active
-                                      mtp
-                                      (bl.ser:block-header-timestamp header))))
-        ;; Finality covers EVERY transaction including the coinbase: Core's
-        ;; ContextualCheckBlock iterates block.vtx with no IsCoinBase guard
-        ;; (validation.cpp:4176-4181). This skipped vtx[0], so a coinbase with
-        ;; an nLockTime past the cutoff and a non-final nSequence connected
-        ;; here while Core rejected the block bad-txns-nonfinal.
-        ;;
-        ;; The coinbase exclusion belongs to the BIP68 loop directly below,
-        ;; which Core really does guard with `if (!tx.IsCoinBase())'
-        ;; (validation.cpp:2528) — it was applied to the wrong one of two
-        ;; adjacent loops. Keep them different; making them agree reintroduces
-        ;; one bug or the other.
-        (loop for tx in transactions
-              unless (check-transaction-final tx current-height locktime-check-time)
-                do (return-from %contextual-check-block (values nil :non-final-tx nil)))
-        ;; BIP 68 sequence lock enforcement (only at or above CSV activation)
-        (when csv-active
+      ;; Core's ContextualCheckBlock: finality, the BIP34 coinbase height and
+      ;; the BIP141 witness commitment. Shared verbatim with ACCEPT-BLOCK-BODY,
+      ;; the pre-write gate, so the two can never drift.
+      (multiple-value-bind (valid error)
+          (%contextual-check-block-no-utxo block chain-state current-height)
+        (unless valid
+          (return-from %contextual-check-block (values nil error nil))))
+
+      ;; BIP 68 sequence lock enforcement (Core ConnectBlock's
+      ;; CheckSequenceLocks, validation.cpp:2528 — only at or above CSV
+      ;; activation, and never for the coinbase).
+      (when (>= current-height (get-csv-activation-height bl:*network*))
+        (let ((mtp (or (compute-median-time-past
+                        chain-state (bl.ser:block-header-prev-block header))
+                       0)))
           (loop for tx in (rest transactions)
                 unless (check-sequence-locks tx utxo-set current-height mtp chain-state
                                              :pending-utxos pending-utxos)
@@ -1837,23 +1876,6 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
                                                    :extra-coins pending-utxos)
           (unless valid
             (return-from %contextual-check-block (values nil error nil)))))
-
-      ;; Validate witness commitment / malleation (BIP 141). Gated on
-      ;; segwit activation for this height, matching Core's
-      ;; expect_witness_commitment = DeploymentActiveAfter(prev, SEGWIT).
-      (multiple-value-bind (valid error)
-          (validate-witness-commitment
-           block
-           (>= current-height
-               (get-segwit-activation-height bl:*network*)))
-        (unless valid
-          (return-from %contextual-check-block (values nil error nil))))
-
-      ;; Validate BIP 34 coinbase height
-      (multiple-value-bind (valid error)
-          (validate-coinbase-height block current-height)
-        (unless valid
-          (return-from %contextual-check-block (values nil error nil))))
 
       ;; Validate coinbase value
       (let* ((coinbase-tx (first transactions))
@@ -3026,6 +3048,134 @@ includes ENTRY itself."
   (dolist (e (block-index-descendants chain-state entry))
     (setf (bl.store:block-index-entry-status e) :invalid)))
 
+;;;; ---------------------------------------------------------------------------
+;;;; ACCEPT-BLOCK-BODY: the gate every block-body write runs first
+;;;;
+;;;; Core writes a block body in exactly one place, ChainstateManager::AcceptBlock
+;;;; (validation.cpp:4381-4389), and the two lines before the write are
+;;;;
+;;;;   if (!CheckBlock(...) || !ContextualCheckBlock(..., pindex->pprev)) {
+;;;;       InvalidBlockFound(pindex, state); LogError(...); return false; }
+;;;;
+;;;; so no unchecked body ever reaches disk. Our persist paths grew separately
+;;;; (out-of-order IBD, competing-fork IBD, ACTIVATE-BLOCK's weaker-chain case,
+;;;; and its historical-chainstate target filter) and none of them ran either
+;;;; check: BL.STORE:STORE-BLOCK validates nothing, so a peer could put an
+;;;; arbitrary body on disk under an honest header's hash. It then wedged the
+;;;; download: BLOCK-EXISTS-P says we have that height, so the per-peer walk
+;;;; advances past it and the real block is never re-requested.
+;;;;
+;;;; ACCEPT-BLOCK-BODY is that pair of checks, and it is what a persist site
+;;;; calls instead of remembering two of them.
+
+(defparameter *mutated-block-errors*
+  '(:bad-merkle-root          ; Core bad-txnmrklroot
+    :bad-txns-duplicate       ; CVE-2012-2459, Core bad-txns-duplicate
+    :bad-witness-nonce-size   ; Core CheckWitnessMalleation
+    :bad-witness-merkle-match ;   "
+    :unexpected-witness       ;   "
+    ;; Core checks the block weight AFTER CheckWitnessMalleation precisely so
+    ;; the verdict can be permanent (validation.cpp:4210-4214: "before we've
+    ;; checked the coinbase witness, it would be possible for the weight to be
+    ;; too large by filling up the coinbase witness, which doesn't change the
+    ;; block hash"). Ours is in %CHECK-BLOCK, i.e. BEFORE it, so an honest
+    ;; block whose coinbase witness a relaying peer stuffed would fail weight
+    ;; first. Keeping the verdict transient restores Core's guarantee without
+    ;; splitting the weight check out of the shared CheckBlock.
+    :block-too-heavy)
+  "VALIDATE-BLOCK error keywords that correspond to Core's BLOCK_MUTATED: the
+block hash does NOT commit to what they read, so a clean re-download of the
+same hash can succeed. Core's InvalidBlockFound (validation.cpp:1985-1993)
+skips BLOCK_FAILED_VALID for exactly this class -- marking one would let a peer
+that mangles a block in transit permanently poison the honest header. The
+sending peer is still punished (MaybePunishNodeForBlock treats BLOCK_MUTATED
+and BLOCK_CONSENSUS alike).
+
+Not the same question as *DETERMINISTIC-INVALID-BLOCK-ERRORS*, which asks it
+of a block already ON DISK failing at reorg time: such a block PASSED
+CheckBlock when it was stored, so failing one now means the bytes changed and
+every CheckBlock verdict is transient there. Here the body has never been
+stored and the verdict is its first, so only the mutation class is exempt.")
+
+(defun %mutated-block-error-p (error)
+  "T iff ERROR is one of *MUTATED-BLOCK-ERRORS* (Core BLOCK_MUTATED)."
+  (and (keywordp error)
+       (member error *mutated-block-errors*)
+       t))
+
+(defun accept-block-body (block chain-state &key current-time)
+  "Bitcoin Core ChainstateManager::AcceptBlock's validity gate
+(validation.cpp:4381-4389), run by every path that is about to write BLOCK's
+body to disk: %CHECK-BLOCK (Core CheckBlock -- header, coinbase structure,
+signet solution, merkle root and the CVE-2012-2459 mutation flag, weight,
+legacy size, CheckTransaction per transaction, the legacy sigop budget) and
+then %CONTEXTUAL-CHECK-BLOCK-NO-UTXO (Core ContextualCheckBlock -- finality,
+the BIP34 coinbase height, the BIP141 witness commitment). Neither reads the
+UTXO set, so the gate is correct for a block on ANY branch, which is what makes
+it usable everywhere a body is stored.
+
+BLOCK's height comes from its own block-index entry, or one above its parent's
+when only the parent is indexed. With neither -- a case Core cannot reach,
+since AcceptBlockHeader always creates the entry first -- there is no chain to
+place the block on, so only the structural (SKIP-HEADER) half of CheckBlock
+runs; that still rejects the forged bodies this gate exists for.
+
+On failure the block-index entry is marked :invalid, and its descendants with
+it, unless the verdict is mutation-class (see *MUTATED-BLOCK-ERRORS*) -- Core
+InvalidBlockFound, which makes the same exception for BLOCK_MUTATED. Punishing
+the peer that sent the body is the caller's job (Core MaybePunishNodeForBlock,
+at the caller too); a caller with no peer to punish simply does not.
+
+Returns (VALUES T NIL) when the body may be written, (VALUES NIL ERROR-KEYWORD)
+when it may not."
+  (let* ((header (bl.ser:bitcoin-block-header block))
+         (hash (bl.ser:block-header-hash header))
+         (entry (bl.store:get-block-index-entry chain-state hash))
+         (height (or (and entry (bl.store:block-index-entry-height entry))
+                     (let ((prev (bl.store:get-block-index-entry
+                                  chain-state
+                                  (bl.ser:block-header-prev-block header))))
+                       (and prev (1+ (bl.store:block-index-entry-height prev))))))
+         (now (or current-time (bl.ser:get-unix-time))))
+    (multiple-value-bind (valid error)
+        (multiple-value-bind (checked check-error)
+            (%check-block block chain-state height now :skip-header (null height))
+          (cond ((not checked) (values nil check-error))
+                ((null height) (values t nil))
+                (t (%contextual-check-block-no-utxo block chain-state height))))
+      (when valid
+        (return-from accept-block-body (values t nil)))
+      (bl:log-warn "Block ~A rejected before storage: ~A"
+                   (bl.crypto:bytes-to-hex hash) error)
+      (when (and entry (not (%mutated-block-error-p error)))
+        (%mark-block-subtree-invalid chain-state entry))
+      (values nil error))))
+
+(defun %store-accepted-block-body (block chain-state block-store
+                                   &key current-time)
+  "Core AcceptBlock's write step for a block ACTIVATE-BLOCK is storing without
+connecting: run ACCEPT-BLOCK-BODY and, only if it passes, write the body and
+record where it landed on the block-index entry.
+Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
+  (multiple-value-bind (acceptable error)
+      (accept-block-body block chain-state :current-time current-time)
+    (if (not acceptable)
+        (values nil error)
+        (let ((entry (bl.store:get-block-index-entry
+                      chain-state
+                      (bl.ser:block-header-hash
+                       (bl.ser:bitcoin-block-header block)))))
+          (bl.store:%record-block-position
+           entry
+           (nth-value 1 (bl.store:store-block
+                         block-store block
+                         ;; NIL when the header is not indexed yet, which
+                         ;; leaves the file unprunable rather than guessing.
+                         :height (and entry
+                                      (bl.store:block-index-entry-height
+                                       entry)))))
+          (values t nil)))))
+
 ;;;; Cooperative shutdown inside a reorg (plan phase 3b).
 ;;;;
 ;;;; Core checks m_chainman.m_interrupt BETWEEN ActivateBestChainStep calls
@@ -3916,15 +4066,12 @@ can neither wedge on an equal-work sibling nor advance past the base."
         (unless (and entry
                      (bl.store:entry-target-ancestor-p chain-state entry))
           (unless (block-witness-stripped-p block)
-            (bl.store:%record-block-position
-             entry
-             (nth-value 1 (bl.store:store-block
-                           block-store block
-                           ;; NIL when the header is not indexed yet, which
-                           ;; leaves the file unprunable rather than guessing.
-                           :height (and entry
-                                        (bl.store:block-index-entry-height
-                                         entry))))))
+            ;; Core AcceptBlock's gate: no body reaches disk unchecked.
+            (multiple-value-bind (stored error)
+                (%store-accepted-block-body block chain-state block-store
+                                            :current-time now)
+              (unless stored
+                (return-from activate-block (values nil error)))))
           (return-from activate-block (values nil :weaker-chain)))))
     (cond
       ;; Case 1: extends current tip — normal path.
@@ -4077,14 +4224,10 @@ can neither wedge on an equal-work sibling nor advance past the base."
            ;; the target-filter guard above (block.lisp ~2428).
            (t
             (unless (block-witness-stripped-p block)
-              (let ((entry (bl.store:get-block-index-entry
-                            chain-state
-                            (bl.ser:block-header-hash header))))
-                (bl.store:%record-block-position
-                 entry
-                 (nth-value 1 (bl.store:store-block
-                               block-store block
-                               :height (and entry
-                                            (bl.store:block-index-entry-height
-                                             entry)))))))
+              ;; Core AcceptBlock's gate: no body reaches disk unchecked.
+              (multiple-value-bind (stored error)
+                  (%store-accepted-block-body block chain-state block-store
+                                              :current-time now)
+                (unless stored
+                  (return-from activate-block (values nil error)))))
             (values nil :weaker-chain))))))))

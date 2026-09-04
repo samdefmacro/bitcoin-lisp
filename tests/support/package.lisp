@@ -33,10 +33,13 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    ;; chain.lisp
    #:make-test-chain-hashes
    #:make-reorg-test-block
+   #:make-forged-body-block
+   #:make-two-coinbase-block
    #:regtest-node-fixture
    #:activate-block-base-path
    #:make-activate-block-fixture
    #:build-and-connect
+   #:deliver-block
    ;; mempool-fixtures.lisp
    #:+optrue-redeem+
    #:p2sh-optrue-script-pubkey

@@ -1674,7 +1674,12 @@ handler. Shared by the block-download drain and the at-tip reap pass."
                                            :fee-estimator fee-estimator
                                            :recent-rejects recent-rejects
                                            :wire-size (length payload)
-                                           :requested (and requested t))))
+                                           :requested (and requested t)
+                                           ;; Core's mapBlockSource: the peer a
+                                           ;; body came from, so a body that
+                                           ;; fails AcceptBlock's gate punishes
+                                           ;; whoever sent it.
+                                           :peer peer)))
              ;; Earned BIP152 high-bandwidth promotion. Core's BlockChecked
              ;; drives this off mapBlockSource (net_processing.cpp:2202,
              ;; 2218-2223), which is filled for FULL blocks as well as
@@ -3571,13 +3576,61 @@ candidate activated."
              (%reject-reorg-candidate cand-hash)
              nil)))))))
 
+(defun %block-body-acceptable-p (block chain-state peer)
+  "Core AcceptBlock's pre-write gate (validation.cpp:4381-4389) for a body that
+just arrived from PEER: T when BL.VAL:ACCEPT-BLOCK-BODY passes and the body may
+be written to disk, NIL when it does not -- and then PEER is punished.
+
+This is what a persist path calls instead of remembering CheckBlock and
+ContextualCheckBlock itself. Without it a peer wrote an arbitrary body under an
+honest header's hash, and BLOCK-EXISTS-P then made the real block unreachable
+for the rest of the sync: one forged block wedged IBD at that height until a
+reindex. The punishment is Core MaybePunishNodeForBlock
+(net_processing.cpp:1908-1949), which misbehaves on BLOCK_CONSENSUS and
+BLOCK_MUTATED alike for a body that did not arrive via a compact block, which
+is every body on this path. PEER is NIL when no peer is attributable (a drain
+from disk, a test) and then nobody is punished; the body is still refused."
+  (multiple-value-bind (acceptable error)
+      (with-current-node-lock (bl.val:accept-block-body block chain-state))
+    (when (and (not acceptable) peer)
+      (record-misbehavior peer (format nil "invalid block (~(~A~))" error)))
+    acceptable))
+
+(defun %requeue-unpersisted-block (hash height entry chain-state
+                                   stripped requested)
+  "Re-enter an out-of-order block we did NOT persist into pending, so it is
+re-fetched -- but only when it is one we still genuinely want:
+  - a stripped copy of a REQUESTED block (await a witness-complete one), or
+  - a legit heavy-fork block (outweighs the tip, meets minimum chain work) that
+    failed the anti-DoS gate only for sitting more than +MIN-BLOCKS-TO-KEEP+
+    above the tip while unsolicited. Its `pending' backstop was dropped after 5
+    timeouts under the persistent-wedge context; without this re-add it could
+    bounce request -> timeout -> late-deliver -> drop indefinitely.
+The DoS gate on DISK persistence is untouched: this re-arms a request intent,
+never a store."
+  (when *ibd-context*
+    (let ((tip-entry (bl.store:get-block-index-entry
+                      chain-state
+                      (bl.store:best-block-hash chain-state))))
+      (when (or (and stripped requested)
+                (and (not stripped)
+                     tip-entry
+                     (> (bl.store:block-index-entry-chain-work entry)
+                        (bl.store:block-index-entry-chain-work tip-entry))
+                     (>= (bl.store:block-index-entry-chain-work entry)
+                         (bl:minimum-chain-work bl:*network*))))
+        (setf (gethash hash (ibd-context-pending-blocks *ibd-context*))
+              height)))))
+
 (defun process-received-block (block chain-state utxo-set block-store
                                 &key fee-estimator recent-rejects
-                                  (wire-size 0) requested)
+                                  (wire-size 0) requested peer)
   "Process a received block - validate and connect to chain.
 After connecting, drains the queue of any children that can now be connected.
 REQUESTED is T when this block was in-flight/pending (we asked for it); it
-lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
+lifts the AcceptBlock anti-DoS gate on the out-of-order persist path.
+PEER, when given, is the peer the body arrived from and is punished if the
+body fails BL.VAL:ACCEPT-BLOCK-BODY (Core MaybePunishNodeForBlock)."
   (let* ((header (bl.ser:bitcoin-block-header block))
          (hash (bl.ser:block-header-hash header))
          (entry (bl.store:get-block-index-entry chain-state hash))
@@ -3614,71 +3667,77 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
         ;; every reorg attempt — exactly what wedged testnet4. Drop this copy; a
         ;; witness-complete copy arrives via v2 compact blocks / full witness
         ;; downloads if the fork ever becomes relevant.
-        (if (bl.val:block-witness-stripped-p block)
-            (bl:log-debug
-             "Competing-fork block ~D arrived witness-stripped; not storing" height)
-            ;; Node lock: activation mutates chainstate/UTXO/mempool state
-            ;; the RPC threads access under the same lock.
-            (progn
-              (with-current-node-lock
-                (bl.store:note-block-position
-                 chain-state hash
-                 (nth-value 1 (bl.store:store-block
-                               block-store block :height height))))
-              ;; Same event as the out-of-order path: a body landed, so any fork
-              ;; candidate parked waiting for it can be tried again. BOTH persist
-              ;; sites must drain, or a fork whose last missing body arrives
-              ;; through this one stays parked forever — which is precisely the
-              ;; deep-reorg livelock this file already has a regression test for.
-              (when *ibd-context*
-                (%rearm-unlinked-reorg-candidates hash chain-state))
-              (multiple-value-bind (activated error missing-blocks)
-                  (with-current-node-lock
-                    (bl.val:activate-block
-                     block chain-state block-store utxo-set
-                     :skip-scripts (bl.val:script-checks-skippable-p
-                                 chain-state
-                                 (bl.ser:block-header-hash
-                                  (bl.ser:bitcoin-block-header block))
-                                 height)
-                     :fee-estimator fee-estimator
-                     :recent-rejects recent-rejects
-                     :mempool mempool))
-                (cond
-                  ;; A heavier-shorter fork can win the reorg with its tip at or
-                  ;; below our height (real-difficulty fork vs min-difficulty
-                  ;; spam) — activate-block case 2 then fires here.
-                  (activated
-                   (clear-block-failure hash)
-                   (note-tip-advanced chain-state)
-                   (drain-block-queue chain-state utxo-set block-store
+        (when (bl.val:block-witness-stripped-p block)
+          (bl:log-debug
+           "Competing-fork block ~D arrived witness-stripped; not storing" height)
+          (return-from process-received-block nil))
+        ;; Nor one that fails Core's AcceptBlock gate: this arm stores BEFORE
+        ;; any validation (a fork block's own is deferred to the reorg that
+        ;; needs it), so the gate is the only thing between a peer and an
+        ;; arbitrary body on disk under this honest header's hash.
+        (unless (%block-body-acceptable-p block chain-state peer)
+          (return-from process-received-block nil))
+        ;; Node lock: activation mutates chainstate/UTXO/mempool state
+        ;; the RPC threads access under the same lock.
+        (with-current-node-lock
+          (bl.store:note-block-position
+           chain-state hash
+           (nth-value 1 (bl.store:store-block
+                         block-store block :height height))))
+        ;; Same event as the out-of-order path: a body landed, so any fork
+        ;; candidate parked waiting for it can be tried again. BOTH persist
+        ;; sites must drain, or a fork whose last missing body arrives
+        ;; through this one stays parked forever — which is precisely the
+        ;; deep-reorg livelock this file already has a regression test for.
+        (when *ibd-context*
+          (%rearm-unlinked-reorg-candidates hash chain-state))
+        (multiple-value-bind (activated error missing-blocks)
+            (with-current-node-lock
+              (bl.val:activate-block
+               block chain-state block-store utxo-set
+               :skip-scripts (bl.val:script-checks-skippable-p
+                           chain-state
+                           (bl.ser:block-header-hash
+                            (bl.ser:bitcoin-block-header block))
+                           height)
+               :fee-estimator fee-estimator
+               :recent-rejects recent-rejects
+               :mempool mempool))
+          (cond
+            ;; A heavier-shorter fork can win the reorg with its tip at or
+            ;; below our height (real-difficulty fork vs min-difficulty
+            ;; spam) — activate-block case 2 then fires here.
+            (activated
+             (clear-block-failure hash)
+             (note-tip-advanced chain-state)
+             (drain-block-queue chain-state utxo-set block-store
+                                :fee-estimator fee-estimator
+                                :recent-rejects recent-rejects))
+            ;; Stored, doesn't yet outweigh the tip: note it so the
+            ;; per-cycle retry re-evaluates once its fork completes
+            ;; (the crossover-at-or-below-tip case — F3).
+            ;; :corrupt-undo is our own disconnect-side undo fault, not
+            ;; the incoming block's — note it as a candidate (the retry
+            ;; below re-attempts once the undo is re-derived) rather than
+            ;; blaming the innocent block.
+            ;; :interrupted is a stop request truncating the reorg, not a
+            ;; verdict on this block either — note the candidate so the
+            ;; reorg is re-attempted once the node resumes.
+            ((member error '(:weaker-chain :corrupt-undo :interrupted))
+             (note-reorg-candidate entry chain-state))
+            ;; Outweighs but intermediate bodies missing: re-queue the
+            ;; hole (cursors rewound) and note for retry.
+            ((eq error :reorg-refused)
+             (queue-missing-fork-blocks missing-blocks)
+             (note-reorg-candidate entry chain-state))
+            (t
+             (bl:log-debug "Competing-fork block ~D activate result: ~A"
+                                     height error)))
+          ;; Try the best completable candidate now that this block is on
+          ;; disk (may complete a fork whose bodies just filled in).
+          (retry-best-reorg-candidate chain-state block-store utxo-set
                                       :fee-estimator fee-estimator
                                       :recent-rejects recent-rejects))
-                  ;; Stored, doesn't yet outweigh the tip: note it so the
-                  ;; per-cycle retry re-evaluates once its fork completes
-                  ;; (the crossover-at-or-below-tip case — F3).
-                  ;; :corrupt-undo is our own disconnect-side undo fault, not
-                  ;; the incoming block's — note it as a candidate (the retry
-                  ;; below re-attempts once the undo is re-derived) rather than
-                  ;; blaming the innocent block.
-                  ;; :interrupted is a stop request truncating the reorg, not a
-                  ;; verdict on this block either — note the candidate so the
-                  ;; reorg is re-attempted once the node resumes.
-                  ((member error '(:weaker-chain :corrupt-undo :interrupted))
-                   (note-reorg-candidate entry chain-state))
-                  ;; Outweighs but intermediate bodies missing: re-queue the
-                  ;; hole (cursors rewound) and note for retry.
-                  ((eq error :reorg-refused)
-                   (queue-missing-fork-blocks missing-blocks)
-                   (note-reorg-candidate entry chain-state))
-                  (t
-                   (bl:log-debug "Competing-fork block ~D activate result: ~A"
-                                           height error)))
-                ;; Try the best completable candidate now that this block is on
-                ;; disk (may complete a fork whose bodies just filled in).
-                (retry-best-reorg-candidate chain-state block-store utxo-set
-                                            :fee-estimator fee-estimator
-                                            :recent-rejects recent-rejects))))
         (return-from process-received-block nil))
 
       ;; Check if this is the next block we need
@@ -3785,12 +3844,12 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
           ;; block to disk immediately (AcceptBlock -> SaveBlockToDisk,
           ;; BLOCK_HAVE_DATA) and connects from disk; we do the same — the RAM
           ;; block-queue below is only the in-order fast path for
-          ;; drain-block-queue. But we persist ONLY if the block passes Core's
-          ;; AcceptBlock anti-DoS gate: it must be REQUESTED, or (unsolicited)
-          ;; carry more work than our tip, sit within +min-blocks-to-keep+ of
-          ;; it, and meet minimum chain work (validation.cpp:4367-4378).
-          ;; Without this an attacker fills our disk with unsolicited
-          ;; far-ahead min-difficulty fork bodies. Witness-stripped copies are
+          ;; drain-block-queue. But we persist ONLY if the block clears both
+          ;; halves of AcceptBlock: the anti-DoS gate (REQUESTED, or more work
+          ;; than our tip, within +min-blocks-to-keep+ of it, and past minimum
+          ;; chain work -- validation.cpp:4367-4378, without which an attacker
+          ;; fills our disk with far-ahead fork bodies) and then the validity
+          ;; gate at validation.cpp:4381-4389. Witness-stripped copies are
           ;; never persisted (a stripped block on disk fails every later reorg
           ;; — the original testnet4 wedge). Persisted blocks that miss the RAM
           ;; queue (cap, same-height fork collision) stay reachable through
@@ -3802,36 +3861,20 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
             (let* ((stripped (bl.val:block-witness-stripped-p block))
                    (accept (and (not stripped)
                                 (%out-of-order-block-acceptable-p
-                                 entry current-height requested chain-state))))
+                                 entry current-height requested chain-state)))
+                   ;; Core's AcceptBlock gate sits between the anti-DoS test
+                   ;; above and the write below.
+                   (body-ok (and accept
+                                 (%block-body-acceptable-p
+                                  block chain-state peer))))
               (cond
                 ((not accept)
                  (bl:log-debug
                   "Out-of-order block ~D not persisted (~:[unsolicited/low-work/too-far~;stripped~], tip ~D)"
                   height stripped current-height)
-                 ;; Re-enter pending for a re-fetch when it is a block we still
-                 ;; genuinely want but didn't persist this copy of:
-                 ;;   - a stripped copy of a requested block (await complete), or
-                 ;;   - a legit heavy-fork block (outweighs tip, meets minimum
-                 ;;     chain work) that failed the gate only for being >288
-                 ;;     above the tip while unsolicited (its `pending` backstop
-                 ;;     was dropped after 5 timeouts under the persistent wedge
-                 ;;     context; without this re-add it could bounce
-                 ;;     request->timeout->late-deliver->drop indefinitely).
-                 ;; The DoS gate on DISK persistence is preserved — this only
-                 ;; re-arms a request intent, not a store.
-                 (when *ibd-context*
-                   (let ((tip-entry (bl.store:get-block-index-entry
-                                     chain-state
-                                     (bl.store:best-block-hash chain-state))))
-                     (when (or (and stripped requested)
-                               (and (not stripped)
-                                    tip-entry
-                                    (> (bl.store:block-index-entry-chain-work entry)
-                                       (bl.store:block-index-entry-chain-work tip-entry))
-                                    (>= (bl.store:block-index-entry-chain-work entry)
-                                        (bl:minimum-chain-work bl:*network*))))
-                       (setf (gethash hash (ibd-context-pending-blocks *ibd-context*))
-                             height)))))
+                 (%requeue-unpersisted-block hash height entry chain-state
+                                             stripped requested))
+                ((not body-ok) nil)  ; gate refused it; peer already punished
                 (t
                  (with-current-node-lock
                    (bl.store:note-block-position

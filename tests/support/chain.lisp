@@ -12,8 +12,14 @@
 
 (defun make-reorg-test-block (prev-hash block-hash height
                               &key (value 5000000000)
-                                   (timestamp (+ 1231006505 (* height 600))))
+                                   (timestamp (+ 1231006505 (* height 600)))
+                                   (lock-time 0)
+                                   (sequence #xFFFFFFFF))
   "Create a minimal test block for reorg tests.
+
+LOCK-TIME and SEQUENCE default to the always-final coinbase every caller
+wants; pass a future LOCK-TIME with a non-final SEQUENCE to build a block
+Core's ContextualCheckBlock rejects bad-txns-nonfinal.
 
 The coinbase's script-sig is derived from BLOCK-HASH so each block's
 coinbase tx SERIALIZES uniquely. Without that, every coinbase produced
@@ -39,12 +45,13 @@ script-sig makes the serialization deterministic per block."
                                                         :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                           :initial-element 0)
                                                         :index #xFFFFFFFF)
-                                      :script-sig script-sig))
+                                      :script-sig script-sig
+                                      :sequence sequence))
                        :outputs (vector (bl.ser:make-tx-out
                                        :value value
                                        :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                   :initial-element #x76)))
-                       :lock-time 0))
+                       :lock-time lock-time))
          (merkle-root (bl.val:compute-merkle-root
                        (list (bl.ser:transaction-hash coinbase-tx))))
          (header (bl.ser:make-block-header
@@ -58,6 +65,66 @@ script-sig makes the serialization deterministic per block."
     (bl.ser:make-bitcoin-block
      :header header
      :transactions (list coinbase-tx))))
+
+(defun %sibling-block-hash (block-hash)
+  "A hash differing from BLOCK-HASH in a byte MAKE-REORG-TEST-BLOCK reads into
+the coinbase script-sig, so the sibling's coinbase serializes -- and therefore
+hashes -- differently. Flipping a byte outside those four would leave the two
+coinbases identical and every forged body below would silently be honest."
+  (let ((h (copy-seq block-hash)))
+    (setf (aref h 2) (logxor (aref h 2) #xFF))
+    h))
+
+(defun make-forged-body-block (prev-hash block-hash height)
+  "(values FORGED HONEST): a forged BODY under an HONEST header. FORGED carries
+the header of the block MAKE-REORG-TEST-BLOCK would build at HEIGHT over an
+unrelated block's transaction list, so the header's merkle root commits to a
+different tx set -- Core CheckMerkleRoot's bad-txnmrklroot, classed
+BLOCK_MUTATED because the header itself is untouched. HONEST is the block that
+header really commits to, the positive control for any assertion about FORGED."
+  (let ((honest (make-reorg-test-block prev-hash block-hash height))
+        (other (make-reorg-test-block prev-hash
+                                      (%sibling-block-hash block-hash)
+                                      height)))
+    (values (bl.ser:make-bitcoin-block
+             :header (bl.ser:bitcoin-block-header honest)
+             :transactions (bl.ser:bitcoin-block-transactions other))
+            honest)))
+
+(defun make-two-coinbase-block (prev-hash block-hash height)
+  "A block carrying TWO coinbase transactions, with a merkle root that commits
+to both. Core CheckBlock's bad-cb-multiple: a BLOCK_CONSENSUS verdict the block
+hash authenticates, so unlike a forged body it is safe to mark permanently
+invalid."
+  (let* ((a (make-reorg-test-block prev-hash block-hash height))
+         (b (make-reorg-test-block prev-hash
+                                   (%sibling-block-hash block-hash)
+                                   height))
+         (txs (list (first (bl.ser:bitcoin-block-transactions a))
+                    (first (bl.ser:bitcoin-block-transactions b))))
+         (header (bl.ser:bitcoin-block-header a)))
+    (bl.ser:make-bitcoin-block
+     :header (bl.ser:make-block-header
+              :version (bl.ser:block-header-version header)
+              :prev-block (bl.ser:block-header-prev-block header)
+              :merkle-root (bl.val:compute-merkle-root
+                            (mapcar #'bl.ser:transaction-hash txs))
+              :timestamp (bl.ser:block-header-timestamp header)
+              :bits (bl.ser:block-header-bits header)
+              :nonce (bl.ser:block-header-nonce header)
+              :cached-hash block-hash)
+     :transactions txs)))
+
+(defun deliver-block (block chain-state utxo-set block-store
+                      &key requested peer)
+  "Hand BLOCK to the IBD receive path the way DISPATCH-IBD-MESSAGE does when a
+`block' message arrives. REQUESTED says we had asked for this block, which
+lifts the out-of-order anti-DoS gate; PEER is the peer that sent the body, and
+is punished when the body fails Core's AcceptBlock gate. Call inside
+WITH-IBD-CONTEXT. Returns what PROCESS-RECEIVED-BLOCK returns: T only when the
+block became the new active tip."
+  (bl.net::process-received-block block chain-state utxo-set block-store
+                                  :requested requested :peer peer))
 
 (defun regtest-node-fixture (suffix)
   ;; The directory is keyed by SUFFIX on purpose: a test that stops a node

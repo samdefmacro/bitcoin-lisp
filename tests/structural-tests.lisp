@@ -749,11 +749,15 @@ to make on purpose, so the set is pinned."
     ;; (ProcessMessage 1594, SendMessages 508). There is no Core boundary to
     ;; copy, so a split here would be invented rather than mirrored.
     ("run-ibd" . 345)                            ; networking/ibd.lisp (+2: keeps node-context peers live, P2c)
-    ("process-received-block" . 300)             ; networking/ibd.lisp
+    ("process-received-block" . 290)             ; networking/ibd.lisp (-10:
+                                                 ; the unpersisted-block re-queue
+                                                 ; became %requeue-unpersisted-block
+                                                 ; when the AcceptBlock body gate
+                                                 ; landed here)
 
-    ;; BORDERLINE -- 210 against Core's ActivateBestChain 167. Left alone
+    ;; BORDERLINE -- 203 against Core's ActivateBestChain 167. Left alone
     ;; until perform-reorg is split, since the two share the same phases.
-    ("activate-block" . 214))                    ; validation/block.lisp
+    ("activate-block" . 203))                    ; validation/block.lisp
   "(name . lines) of every top-level definition over +LONG-FUNCTION-LINES+,
 each annotated above with its Bitcoin Core counterpart and the verdict.
 
