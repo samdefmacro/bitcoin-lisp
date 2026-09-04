@@ -19,7 +19,7 @@
 ;;;   /rest/tx/<txid>.<json|hex|bin>
 ;;;   /rest/headers/<hash>.<json|hex|bin>?count=<n>   (default 5, max 2000)
 ;;;   /rest/mempool/info.json
-;;;   /rest/mempool/contents.json
+;;;   /rest/mempool/contents.json?verbose=<bool>&mempool_sequence=<bool>
 ;;;   /rest/getutxos[/checkmempool]/<txid>-<n>/...  .<json|hex|bin>
 ;;;     (BIP64: bitmap + coins; GET-URI input only, no POST body)
 ;;;   /rest/deploymentinfo[/<hash>].json
@@ -180,12 +180,49 @@ hash it does not know at all (LookupBlockIndex returns nullptr); we keep the
                     ext (bl.crypto:bytes-to-hex
                          (bl.ser:bb-finish bb))))))))
 
+(defun %rest-bool-parameter (name default)
+  "One of Core's rest_mempool query flags (rest.cpp:804-820). The parameter
+must be the literal string \"true\" or \"false\"; DEFAULT stands in when it
+is absent. Returns (values flag message) -- MESSAGE is Core's 400 text and is
+NIL when the parameter parsed, so a caller cannot mistake a refused parameter
+for a false one."
+  (let ((raw (or (hunchentoot:get-parameter name) default)))
+    (cond ((string= raw "true") (values t nil))
+          ((string= raw "false") (values nil nil))
+          (t (values nil
+                     (format nil "The \"~A\" query parameter must be either ~
+\"true\" or \"false\"." name))))))
+
+(defun %rest-mempool-contents (node)
+  "/rest/mempool/contents.json?verbose=<bool>&mempool_sequence=<bool> --
+Core's rest_mempool contents arm (rest.cpp:802-825).
+
+Both flags reach GETRAWMEMPOOL, which is our MempoolToJSON: Core's REST and
+RPC surfaces call that one function with the same two booleans, so the shapes
+cannot diverge. verbose defaults to true and mempool_sequence to false, and
+the pair is refused, because a verbose result is keyed by txid and has nowhere
+to carry the sequence."
+  (multiple-value-bind (verbose verbose-message)
+      (%rest-bool-parameter "verbose" "true")
+    (multiple-value-bind (sequence sequence-message)
+        (%rest-bool-parameter "mempool_sequence" "false")
+      (cond
+        ;; Core validates verbose first, so its message wins when both are bad.
+        ((or verbose-message sequence-message)
+         (%rest-error 400 (or verbose-message sequence-message)))
+        ((and verbose sequence)
+         ;; FORMAT, not a bare literal: a tilde-newline continues a format
+         ;; CONTROL string, and %REST-ERROR passes its message through ~A.
+         (%rest-error 400 (format nil "Verbose results cannot contain mempool ~
+sequence values. (hint: set \"verbose=false\")")))
+        (t (%rest-json (rpc-getrawmempool node (list verbose sequence))))))))
+
 (defun %rest-mempool (node body ext)
   (unless (string= ext "json")
     (return-from %rest-mempool (%rest-format-not-found "json")))
   (cond
     ((string= body "info") (%rest-json (rpc-getmempoolinfo node nil)))
-    ((string= body "contents") (%rest-json (rpc-getrawmempool node (list t))))
+    ((string= body "contents") (%rest-mempool-contents node))
     (t (%rest-error 400 "Expected /rest/mempool/<info|contents>.json"))))
 
 (defconstant +max-getutxos-outpoints+ 15

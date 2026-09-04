@@ -3616,6 +3616,56 @@ serving something wrong or signalling out of the handler."
         (is-true (and (stringp b) (search "output format not found" b))
                  "deploymentinfo served a non-JSON format: ~S" b)))))
 
+(test rest-mempool-contents-reads-core-s-query-parameters
+  "rest_mempool parses ?verbose= (default \"true\") and ?mempool_sequence=
+(default \"false\"), refuses anything but those two literal strings with a 400
+naming the parameter, refuses the pair together with Core's hint, and passes
+both to MempoolToJSON (rest.cpp:796-821) -- the same function getrawmempool
+calls, which is why REST and RPC cannot answer different shapes.
+
+We hardcoded verbose, so a client asking for the cheap txid ARRAY was served
+the verbose OBJECT: a different JSON type its parser cannot read at all, and
+an order of magnitude larger on a full mempool."
+  (let* ((node (make-test-node))
+         (tx (make-mempool-test-tx :input-id 201))
+         (txid (bl.ser:transaction-hash tx)))
+    (bl.mp:mempool-add (bl:node-mempool node) txid
+                       (bl.mp:make-entry-from-tx tx 1000 0))
+    (let ((id (bl.rpc:hash-to-hex txid)))
+      ;; Core's default is verbose: a JSON object keyed by txid.
+      (let ((parsed (yason:parse (rest-request node "/rest/mempool/contents.json"))))
+        (is (hash-table-p parsed) "the default must stay Core's verbose object")
+        (is-true (gethash id parsed)))
+      ;; verbose=false is the txid ARRAY, which is what this test exists for.
+      (let ((parsed (yason:parse
+                     (rest-request node "/rest/mempool/contents.json?verbose=false"))))
+        (is (equal (list id) parsed)
+            "?verbose=false must answer the txid array, not the verbose object")))
+    ;; Neither flag accepts anything but the two literals, and each 400 names
+    ;; the parameter it refused.
+    (dolist (probe '(("verbose=1" . "verbose")
+                     ("verbose=yes" . "verbose")
+                     ("mempool_sequence=1" . "mempool_sequence")))
+      (multiple-value-bind (body status)
+          (rest-request node (format nil "/rest/mempool/contents.json?~A" (car probe)))
+        (is (= 400 status) "~A was accepted" (car probe))
+        (is (string= (format nil "The \"~A\" query parameter must be either ~
+\"true\" or \"false\".~%" (cdr probe))
+                     body))))
+    ;; The two together are Core's 400 with its hint, verbatim.
+    (multiple-value-bind (body status)
+        (rest-request node
+                      "/rest/mempool/contents.json?verbose=true&mempool_sequence=true")
+      (is (= 400 status))
+      (is (string= (format nil "Verbose results cannot contain mempool sequence ~
+values. (hint: set \"verbose=false\")~%")
+                   body)))
+    ;; CONTROL: the same pair with verbose=false is allowed through (its
+    ;; sequence field comes from getrawmempool).
+    (is (= 200 (nth-value 1 (rest-request
+                             node
+                             "/rest/mempool/contents.json?verbose=false&mempool_sequence=true"))))))
+
 (test tx-to-json-gates-fee-and-prevout-separately
   "Core reads the block's undo data at verbosity 2 AND 3, and pushes `fee`
 whenever it has the coins — but the `prevout` OBJECT only at verbosity 3
