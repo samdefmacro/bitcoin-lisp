@@ -1433,6 +1433,8 @@ args->start-node-plist; 4,315 with the peers and config batches merged;
 4,305 with the mining batch.
 Then the mining tests called the mining tests called the generate* and getmininginfo handlers
 through BL.RPC:DISPATCH-RPC-METHOD, which is both exported and the wire path.
+4,330 when make-wallet-rng in tests/support/ replaced the 38 reaches for the
+spend path's PRNG constructor in the two wallet test files.
 White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the

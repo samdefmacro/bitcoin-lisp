@@ -46,6 +46,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:p2sh-optrue-script-pubkey
    #:make-package-fixture
    ;; wallet.lisp
+   #:make-wallet-rng
    #:make-wallet-chain-node
    #:with-wallet-chain-node))
 

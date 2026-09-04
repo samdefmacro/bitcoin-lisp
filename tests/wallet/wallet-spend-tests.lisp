@@ -191,21 +191,21 @@ folding; the %positional-bool helpers decode all three states."
 ;;; --- RNG determinism ---
 
 (test ws-rng-determinism
-  (let ((a (bl.wallet::make-wrng 42))
-        (b (bl.wallet::make-wrng 42)))
+  (let ((a (make-wallet-rng 42))
+        (b (make-wallet-rng 42)))
     (is (equal (loop repeat 16 collect (bl.wallet::wrng-next64 a))
                (loop repeat 16 collect (bl.wallet::wrng-next64 b))))
     (is (equal (bl.wallet::wrng-shuffle
-                (bl.wallet::make-wrng 7) '(1 2 3 4 5 6 7 8))
+                (make-wallet-rng 7) '(1 2 3 4 5 6 7 8))
                (bl.wallet::wrng-shuffle
-                (bl.wallet::make-wrng 7) '(1 2 3 4 5 6 7 8))))
+                (make-wallet-rng 7) '(1 2 3 4 5 6 7 8))))
     (loop repeat 200
           do (is (< (bl.wallet::wrng-randrange a 10) 10)))))
 
 (test ws-generate-change-target
   "Core GenerateChangeTarget: fixed floor for small payments, else
 change_fee + [CHANGE_LOWER, min(2*payment, CHANGE_UPPER))."
-  (let ((rng (bl.wallet::make-wrng 1)))
+  (let ((rng (make-wallet-rng 1)))
     ;; payment <= CHANGE_LOWER/2 -> exactly change_fee + CHANGE_LOWER
     (is (= 50030 (bl.wallet::generate-change-target 25000 30 rng)))
     (loop repeat 100
@@ -351,7 +351,7 @@ after adding a normal 5-cent coin BnB finds {8, 5, 3}."
 ;;; --- Knapsack ---
 
 (test ws-knapsack-basics
-  (let ((rng (bl.wallet::make-wrng 99))
+  (let ((rng (make-wallet-rng 99))
         (max-weight bl.val:+max-standard-tx-weight+)
         (change +ws-cent+))
     ;; Empty pool.
@@ -392,7 +392,7 @@ after adding a normal 5-cent coin BnB finds {8, 5, 3}."
         (bl.wallet::select-coins-srd
          (%ws-groups (make-list 10 :initial-element (* 1 +ws-cent+)))
          (- (* 10 +ws-cent+) 50000) 0
-         (bl.wallet::make-wrng 3) max-weight)
+         (make-wallet-rng 3) max-weight)
       (is (not (null result)))
       (is (= (* 10 +ws-cent+)
              (bl.wallet::sel-result-selected-value result))))
@@ -401,7 +401,7 @@ after adding a normal 5-cent coin BnB finds {8, 5, 3}."
         (bl.wallet::select-coins-srd
          (%ws-groups (make-list 10 :initial-element (* 1 +ws-cent+)))
          (- (* 10 +ws-cent+) 49999) 0
-         (bl.wallet::make-wrng 3) max-weight)
+         (make-wallet-rng 3) max-weight)
       (is (null result))
       (is (null error)))
     ;; Deterministic under a fixed seed.
@@ -410,11 +410,51 @@ after adding a normal 5-cent coin BnB finds {8, 5, 3}."
                                     (* 5 +ws-cent+)))))
       (multiple-value-bind (a)
           (bl.wallet::select-coins-srd
-           groups (* 2 +ws-cent+) 0 (bl.wallet::make-wrng 11) max-weight)
+           groups (* 2 +ws-cent+) 0 (make-wallet-rng 11) max-weight)
         (multiple-value-bind (b)
             (bl.wallet::select-coins-srd
-             groups (* 2 +ws-cent+) 0 (bl.wallet::make-wrng 11) max-weight)
+             groups (* 2 +ws-cent+) 0 (make-wallet-rng 11) max-weight)
           (is (equal (%ws-result-values a) (%ws-result-values b))))))))
+
+;;; --- Signed-size estimation (spend.cpp MaxInputWeight) ---
+
+(defun %ws-use-max-sig-p (wallet)
+  "Whether WALLET's ECDSA estimates take Core's use_max_sig size."
+  (bl.wallet::%wallet-use-max-sig-p wallet))
+
+(defun %ws-input-weight (script use-max-sig)
+  "Core MaxInputWeight for SCRIPT under its use_max_sig flag. Neither a
+wallet nor a coin control is needed to solve the scripts below."
+  (bl.wallet::%max-input-weight nil nil script use-max-sig))
+
+(defun %ws-dummy-pubkey ()
+  "A well-formed 33-byte compressed pubkey; nothing here verifies a signature."
+  (let ((v (make-array 33 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (setf (aref v 0) 2)
+    v))
+
+(test ws-ecdsa-satisfaction-is-71-unless-core-uses-max-sig
+  "Core sizes an ECDSA satisfaction at `use_max_sig ? 72 : 71`
+(descriptor.cpp:1163, 1196, 1229, 1299). Our signer grinds low-R exactly as
+CKey::Sign(grind=true) does, so a private-key wallet gets 71 and the flag
+only fires where Core fires it. The estimate is what the fee loop pays, so
+each byte here is paid to the miner once per ECDSA input."
+  (let* ((pubkey (%ws-dummy-pubkey))
+         (p2pk (concatenate '(simple-array (unsigned-byte 8) (*))
+                            (bl.ser:script-push-data pubkey) (vector #xac)))
+         (p2wpkh (concatenate '(simple-array (unsigned-byte 8) (*))
+                              (vector #x00 #x14)
+                              (bl.crypto:hash160 pubkey)))
+         (multi (concatenate '(simple-array (unsigned-byte 8) (*))
+                             (vector #x51) (bl.ser:script-push-data pubkey)
+                             (vector #x51 #xae))))
+    ;; 4 * (32 + 4 + 4 + 1) + witness-stack length + satisfaction.
+    (is (= 453 (%ws-input-weight p2pk nil)))       ; 4 * (1 + 71)
+    (is (= 457 (%ws-input-weight p2pk t)))         ; 4 * (1 + 72)
+    (is (= 271 (%ws-input-weight p2wpkh nil)))     ; 1 + 71 + 1 + 33
+    (is (= 272 (%ws-input-weight p2wpkh t)))
+    (is (= 457 (%ws-input-weight multi nil)))      ; 4 * (1 + (1 + 71))
+    (is (= 461 (%ws-input-weight multi t)))))
 
 ;;; --- Regtest end-to-end ---
 
@@ -483,7 +523,7 @@ balances that reconcile to the satoshi before and after confirmation."
   (with-wallet-chain-node (node "ws-send")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (is (= 50.0d0 (bl.wallet::rpc-getbalance node '())))
-      (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 12345))
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 12345))
              (dest (%wc-optrue-address))
              (dest-spk (nth-value 1 (bl.crypto:decode-address
                                      dest :regtest)))
@@ -544,7 +584,7 @@ multi-recipient splits it with the first (in built-tx order) paying the
 remainder."
   (with-wallet-chain-node (node "ws-sffo")
     (multiple-value-bind (wallet) (%ws-fund-wallet node :blocks 2)
-      (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 777))
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 777))
              (dest (%wc-optrue-address))
              (dest-spk (nth-value 1 (bl.crypto:decode-address
                                      dest :regtest))))
@@ -604,7 +644,7 @@ remainder."
 tx gets no change output and overpays exactly the remainder."
   (with-wallet-chain-node (node "ws-dust")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
-      (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 5))
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 5))
              (dest (%wc-optrue-address))
              (amount-sat (- 5000000000 900))
              (txid (bl.rpc:parse-hex-hash
@@ -624,7 +664,7 @@ tx gets no change output and overpays exactly the remainder."
 output of total - fee, wallet empty afterwards."
   (with-wallet-chain-node (node "ws-sendall")
     (multiple-value-bind (wallet) (%ws-fund-wallet node :blocks 2)
-      (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 21))
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 21))
              (dest (%wc-optrue-address))
              (result (bl.wallet::rpc-sendall
                       node (list (list dest) nil nil 10)))
@@ -651,7 +691,7 @@ sendrawtransaction accepts it. Preset locktime/sequence survive."
   (with-wallet-chain-node (node "ws-fund")
     (multiple-value-bind (wallet address) (%ws-fund-wallet node)
       (declare (ignore address))
-      (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 31))
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 31))
              (coins (bl.wallet::with-wallet-lock (wallet)
                       (bl.wallet::wallet-available-coins wallet)))
              (coin (first coins))
@@ -703,6 +743,12 @@ complete:false with Core's per-input errors array."
       (declare (ignore wallet))
       ;; Watch-only wallet from an xpub descriptor.
       (bl.wallet::rpc-createwallet node '("wo" t t))
+      ;; Core CanGrindR (wallet.cpp:4119-4121) is the only thing that makes a
+      ;; whole wallet's ECDSA estimates use_max_sig: a wallet without private
+      ;; keys is signed for by someone whose nonces we cannot assume are
+      ;; ground.
+      (is-false (%ws-use-max-sig-p (%wc-wallet node "w")))
+      (is-true (%ws-use-max-sig-p (%wc-wallet node "wo")))
       (let* ((seed (make-array 32 :element-type '(unsigned-byte 8)
                                   :initial-element 7))
              (xprv (bl.crypto:bip32-master-key seed :network :testnet3))
@@ -721,7 +767,7 @@ complete:false with Core's per-input errors array."
         (let* ((wo-address (let ((bl.wallet::*rpc-wallet-name* "wo"))
                              (bl.wallet::rpc-getnewaddress
                               node '("" "bech32"))))
-               (bl.wallet::*wallet-rng* (bl.wallet::make-wrng 8))
+               (bl.wallet::*wallet-rng* (make-wallet-rng 8))
                (fund-txid (bl.rpc:parse-hex-hash
                            (let ((bl.wallet::*rpc-wallet-name* "w"))
                              (bl.wallet::rpc-sendtoaddress
@@ -777,7 +823,7 @@ bounds are enforced with Core's messages."
   (with-wallet-chain-node (node "ws-caps")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (declare (ignore wallet))
-      (let ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 61))
+      (let ((bl.wallet::*wallet-rng* (make-wallet-rng 61))
             (dest (%wc-optrue-address)))
         ;; maxtxfee: a 10 sat/vB spend costs ~1400+ sats; cap at 100.
         (let ((bl:*wallet-max-tx-fee* 100))
@@ -806,7 +852,7 @@ disabled fallback errors with Core's message; explicit feerates report
 PayTxFee."
   (with-wallet-chain-node (node "ws-fees")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
-      (let ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 77))
+      (let ((bl.wallet::*wallet-rng* (make-wallet-rng 77))
             (dest (%wc-optrue-address)))
         ;; Fallback disabled (default): estimation failure.
         (signals-rpc-error (:code -6 :message "Fallbackfee is disabled")
@@ -851,40 +897,40 @@ on the 1-in-10 branch; a FINAL sequence is an internal-bug error."
            ;; Find seeds whose FIRST randrange(10) draw is nonzero / zero.
            (seed-tip (loop for seed from 1
                            when (plusp (bl.wallet::wrng-randrange
-                                        (bl.wallet::make-wrng seed) 10))
+                                        (make-wallet-rng seed) 10))
                              return seed))
            (seed-back (loop for seed from 1
                             when (zerop (bl.wallet::wrng-randrange
-                                         (bl.wallet::make-wrng seed) 10))
+                                         (make-wallet-rng seed) 10))
                               return seed)))
       (bl.rpc:with-node-lock (node)
         ;; Non-backdated branch: locktime = tip height.
         (let ((tx (funcall make-tx #xFFFFFFFD)))
           (bl.wallet::discourage-fee-sniping
-           tx (bl.wallet::make-wrng seed-tip) node tip-hash tip-height)
+           tx (make-wallet-rng seed-tip) node tip-hash tip-height)
           (is (= tip-height
                  (bl.ser:transaction-lock-time tx))))
         ;; Backdated branch: exactly height - randrange(100), replayed.
         (let ((tx (funcall make-tx #xFFFFFFFE))
-              (replay (bl.wallet::make-wrng seed-back)))
+              (replay (make-wallet-rng seed-back)))
           (bl.wallet::wrng-randrange replay 10)
           (let ((expected (max 0 (- tip-height
                                     (bl.wallet::wrng-randrange replay 100)))))
             (bl.wallet::discourage-fee-sniping
-             tx (bl.wallet::make-wrng seed-back) node tip-hash tip-height)
+             tx (make-wallet-rng seed-back) node tip-hash tip-height)
             (is (= expected
                    (bl.ser:transaction-lock-time tx)))))
         ;; FINAL sequence violates the anti-fee-sniping contract.
         (signals bl.rpc:rpc-error
           (bl.wallet::discourage-fee-sniping
            (funcall make-tx #xFFFFFFFF)
-           (bl.wallet::make-wrng seed-tip) node tip-hash tip-height))))))
+           (make-wallet-rng seed-tip) node tip-hash tip-height))))))
 
 (test ws-nonfinal-sequence-when-rbf-off
   "With BIP125 signaling off, inputs carry MAX_SEQUENCE_NONFINAL."
   (with-wallet-chain-node (node "ws-seq")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
-      (let ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 4)))
+      (let ((bl.wallet::*wallet-rng* (make-wallet-rng 4)))
         (bl.rpc:with-node-lock (node)
           (bl.wallet::with-wallet-lock (wallet)
             (multiple-value-bind (tx)
@@ -909,7 +955,7 @@ on the 1-in-10 branch; a FINAL sequence is an internal-bug error."
 mempool; the resend scheduler windows land in [12h, 36h)."
   (with-wallet-chain-node (node "ws-resend")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
-      (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 51))
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 51))
              (dest (%wc-optrue-address))
              (txid (bl.rpc:parse-hex-hash
                     (bl.wallet::rpc-sendtoaddress
@@ -933,7 +979,7 @@ mempool; the resend scheduler windows land in [12h, 36h)."
         ;; Resend scheduling window.
         (let* ((now (bl.ser:get-unix-time))
                (next (bl.wallet::%wallet-default-next-resend
-                      (bl.wallet::make-wrng 9))))
+                      (make-wallet-rng 9))))
           (is (<= (+ now (* 12 3600)) next))
           (is (< next (+ now (* 36 3600) 2))))))))
 
@@ -942,7 +988,7 @@ mempool; the resend scheduler windows land in [12h, 36h)."
 hex+psbt without committing."
   (with-wallet-chain-node (node "ws-sendrpc")
     (multiple-value-bind (wallet) (%ws-fund-wallet node :blocks 2)
-      (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 43))
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 43))
              (dest (%wc-optrue-address))
              (result (bl.wallet::rpc-send
                       node (list (list (cons dest 1)) nil nil 10 nil))))
@@ -975,7 +1021,7 @@ must error with Core's too-small-to-pay-the-fee message instead of
 committing a mempool-invalid transaction as success."
   (with-wallet-chain-node (node "ws-sffo-neg")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
-      (let ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 13))
+      (let ((bl.wallet::*wallet-rng* (make-wallet-rng 13))
             (dest (%wc-optrue-address))
             (mempool-before
               (bl.rpc:with-node-lock (node)
@@ -1006,7 +1052,7 @@ coin control; excluding them would strand funds)."
     (let* ((wallet (%wc-wallet node "w"))
            (addr-a (bl.wallet::rpc-getnewaddress node '("" "bech32")))
            (addr-b (bl.wallet::rpc-getnewaddress node '("" "bech32")))
-           (bl.wallet::*wallet-rng* (bl.wallet::make-wrng 17)))
+           (bl.wallet::*wallet-rng* (make-wallet-rng 17)))
       (is (bl.wallet::wallet-flag-set-p
            wallet bl.wallet::+wallet-flag-avoid-reuse+))
       ;; Fund A, spend from A (marks A previously-spent), then fund A again
@@ -1046,7 +1092,7 @@ wallet without the flag errors."
   (with-wallet-chain-node (node "ws-bools")
     (multiple-value-bind (wallet) (%ws-fund-wallet node)
       (declare (ignore wallet))
-      (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 23))
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 23))
              (dest (%wc-optrue-address))
              (txid (bl.rpc:parse-hex-hash
                     (bl.wallet::rpc-sendtoaddress
@@ -1085,7 +1131,7 @@ stores only the 32-byte x coordinate)."
     (bl.wallet::rpc-createwallet node '("w"))
     (let* ((wallet (%wc-wallet node "w"))
            (addr-tr (bl.wallet::rpc-getnewaddress node '("" "bech32m")))
-           (bl.wallet::*wallet-rng* (bl.wallet::make-wrng 29))
+           (bl.wallet::*wallet-rng* (make-wallet-rng 29))
            (dest (%wc-optrue-address)))
       ;; Fund the default 86h tr() descriptor and spend from it (BIP86
       ;; keypath through the wallet signer + script verifier).
@@ -1150,7 +1196,7 @@ stores only the 32-byte x coordinate)."
 doing unbounded validation in one housekeeping tick."
   (with-wallet-chain-node (node "ws-chunk")
     (multiple-value-bind (wallet) (%ws-fund-wallet node :blocks 2)
-      (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 37))
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 37))
              (dest (%wc-optrue-address))
              (txid1 (bl.rpc:parse-hex-hash
                      (bl.wallet::rpc-sendtoaddress

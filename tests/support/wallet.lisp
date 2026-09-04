@@ -1,5 +1,13 @@
 (in-package #:bitcoin-lisp.test-support)
 
+;;;; The wallet spend path's deterministic PRNG
+
+(defun make-wallet-rng (seed)
+  "The wallet spend path's PRNG at SEED -- the value a test binds
+*WALLET-RNG* to so coin selection and change positioning replay. Named once
+here because two wallet test files draw from it."
+  (bl.wallet::make-wrng seed))
+
 ;;;; A regtest node with a wallet manager, for the chain-hook tests
 
 (defvar *wallet-chain-counter* 0
