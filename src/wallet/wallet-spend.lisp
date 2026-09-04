@@ -46,21 +46,17 @@
 ;;; with-wallet-lock (wallet.lisp).
 ;;;
 ;;; Known divergences from Core (each justified inline at its site):
-;;;  1. ECDSA size estimation assumes 72-byte signatures (Core use_max_sig):
-;;;     our signer does not grind low-R nonces, so 71-byte estimates could
-;;;     undershoot. Safe direction: estimated size >= actual, paid feerate
-;;;     >= target.
-;;;  2. CoinGrinder deferred (above).
-;;;  3. No unconfirmed-ancestor bump fees (Core calculateIndividualBumpFees/
+;;;  1. CoinGrinder deferred (above).
+;;;  2. No unconfirmed-ancestor bump fees (Core calculateIndividualBumpFees/
 ;;;     calculateCombinedBumpFee): our node has no bump-fee calculator, so
 ;;;     bump fees are 0. Spending unconfirmed inputs pays the target feerate
 ;;;     on the new tx itself but does not additionally bump its ancestors
 ;;;     (slower confirmation possible; never overpays).
-;;;  4. -walletrejectlongchains' pre-commit checkChainLimits simulation is
+;;;  3. -walletrejectlongchains' pre-commit checkChainLimits simulation is
 ;;;     not run; the mempool applies the real cluster limits at broadcast,
 ;;;     and a rejected tx stays in the wallet as unbroadcast (Core commits
 ;;;     wallet-first on broadcast failure too).
-;;;  5. Before commit we run our own script verifier over every input (an
+;;;  4. Before commit we run our own script verifier over every input (an
 ;;;     EXTRA rail Core does not have): a tx that does not verify against
 ;;;     the exact spent scriptPubKeys/amounts is never stored or relayed.
 
@@ -297,6 +293,16 @@ decimal string with at most 3 fraction digits, to integer sat/kvB."
 (defun wcc-selected-p (cc txid vout)
   (nth-value 1 (gethash (cons txid vout) (wcc-presets cc))))
 
+(defun wcc-external-selected-p (cc tx-in)
+  "Core CCoinControl::IsExternalSelected (coincontrol.cpp:25-29): TX-IN's
+outpoint is pre-selected AND its preset carries its own tx-out, i.e. the
+coin is not one of ours and we cannot assume our own signer will sign it."
+  (let* ((prevout (bl.ser:tx-in-previous-output tx-in))
+         (preset (and cc (gethash (cons (bl.ser:outpoint-hash prevout)
+                                        (bl.ser:outpoint-index prevout))
+                                  (wcc-presets cc)))))
+    (and preset (wcc-preset-txout preset) t)))
+
 (defun %wcc-signal-rbf (cc)
   (if (eq (wcc-signal-bip125-rbf cc) :unset)
       *wallet-signal-rbf*
@@ -389,14 +395,40 @@ Core's full-target string."
 ;;; --- Maximum signed input/tx size estimation (spend.cpp:49-192 +
 ;;; script/descriptor.cpp MaxSatSize/MaxSatisfactionWeight/-Elems) ---
 ;;;
-;;; ECDSA satisfactions are estimated at 72 bytes incl. the sighash byte
-;;; (Core's use_max_sig): our signer produces RFC6979 signatures WITHOUT
-;;; low-R grinding, so ~half of all signatures are 72 bytes — Core's
-;;; can_grind_r 71-byte estimate would undershoot. DIVERGENCE (safe): the
-;;; estimate upper-bounds the real size, so the realized feerate is >= the
-;;; target, never below.
+;;; An ECDSA satisfaction is sized at 71 bytes incl. the sighash byte, and at
+;;; 72 only where Core's use_max_sig says so (descriptor.cpp:1163, 1196, 1229,
+;;; 1299 all read `use_max_sig ? 72 : 71`). Core passes
+;;; `!can_grind_r || UseMaxSig(txin, coin_control)` (spend.cpp:72), where
+;;; CanGrindR() is `!IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)`
+;;; (wallet.cpp:4119-4121) and UseMaxSig is true only for an input the coin
+;;; control selected externally (spend.cpp:54-58). Neither test is about
+;;; whether the signer grinds — a wallet holding private keys signs through
+;;; sign-ecdsa, which is Core's CKey::Sign(grind=true) (crypto/secp256k1.lisp),
+;;; so its signatures never reach 72: 200 signatures over distinct hashes
+;;; measured 70 DER bytes (198 of them) or 69 (2), i.e. 71 or 70 with the
+;;; sighash byte.
+;;;
+;;; Miniscript satisfactions keep the flat 72 at every signature (Core's
+;;; MiniscriptDescriptor::MaxSatSize ignores use_max_sig, descriptor.cpp:1684:
+;;; "For Miniscript we always assume high-R ECDSA signatures"), which is why
+;;; %miniscript-sat-size-and-elems takes no flag.
 
-(defconstant +ecdsa-max-sig-size+ 72)
+(defconstant +ecdsa-max-sig-size+ 72
+  "Core's use_max_sig ECDSA satisfaction: a high-R DER signature plus the
+sighash byte.")
+
+(defconstant +ecdsa-low-r-sig-size+ 71
+  "The satisfaction of a low-R ground ECDSA signature, plus the sighash byte.")
+
+(defun %ecdsa-sig-size (use-max-sig)
+  "Core's `use_max_sig ? 72 : 71` (descriptor.cpp:1163)."
+  (if use-max-sig +ecdsa-max-sig-size+ +ecdsa-low-r-sig-size+))
+
+(defun %wallet-use-max-sig-p (wallet)
+  "Core's !CWallet::CanGrindR (wallet.cpp:4119-4121): only a wallet with
+WALLET_FLAG_DISABLE_PRIVATE_KEYS has to be sized for a high-R signature,
+because whoever signs for it is not our grinding signer."
+  (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
 
 (defun %known-pubkey-for-script (wallet cc script keyhash)
   "The pubkey with HASH160 = KEYHASH, from the owning SPKM's expansion at
@@ -433,10 +465,11 @@ SCRIPT's position, or the coin control's external solving data."
                                       (wcc-external-scripts cc))))))))
       (values redeem witness))))
 
-(defun %multisig-sat-size (script)
-  "1 + (1 + 72) * m for an m-of-n multisig SCRIPT, or NIL."
+(defun %multisig-sat-size (script use-max-sig)
+  "1 + (1 + sig) * m for an m-of-n multisig SCRIPT, or NIL (Core
+MultisigDescriptor::MaxSatSize, descriptor.cpp:1299)."
   (multiple-value-bind (m) (bl.rpc:parse-multisig script)
-    (when m (+ 1 (* (+ 1 +ecdsa-max-sig-size+) m)))))
+    (when m (+ 1 (* (+ 1 (%ecdsa-sig-size use-max-sig)) m)))))
 
 (defun %miniscript-sat-size-and-elems (witness-script)
   "(values sat-bytes elems) for a miniscript WITNESS-SCRIPT, or NIL.
@@ -460,78 +493,81 @@ GetWitnessSize deliberately excludes."
         (when (and bytes stack)
           (values bytes (1+ stack)))))))
 
-(defun %script-sat-weight (wallet cc script)
+(defun %script-sat-weight (wallet cc script use-max-sig)
   "(values sat-weight segwit-p elems) for the maximum satisfaction of
 SCRIPT, mirroring the descriptor MaxSatisfactionWeight arithmetic on the
-descriptor InferDescriptor would produce; NIL when not solvable."
+descriptor InferDescriptor would produce; NIL when not solvable.
+USE-MAX-SIG is Core's flag of the same name (see the section header)."
   (multiple-value-bind (type data)
       (bl.val:classify-script script)
-    (case type
-      (:pubkey (values (* 4 (+ 1 +ecdsa-max-sig-size+)) nil 1))
-      (:pubkeyhash
-       (let ((pub (%known-pubkey-for-script wallet cc script (getf data :hash))))
-         (when pub
-           (values (* 4 (+ 1 +ecdsa-max-sig-size+ 1 (length pub))) nil 2))))
-      (:witness-v0-keyhash
-       (values (+ 1 +ecdsa-max-sig-size+ 1 33) t 2))
-      (:witness-v1-taproot
-       ;; Keypath spend assumed, like Core's TRDescriptor (FIXME parity).
-       (values (+ 1 65) t 1))
-      (:multisig
-       (let ((sat (%multisig-sat-size script)))
-         (when sat (values (* 4 sat) nil (+ 1 (getf data :m))))))
-      (:scripthash
-       (multiple-value-bind (redeem witness) (%known-sub-scripts wallet cc script)
-         (when redeem
-           (cond
-             ;; sh(wpkh(...))
-             ((and (= (length redeem) 22)
-                   (= (aref redeem 0) #x00) (= (aref redeem 1) #x14))
-              (values (+ (* 4 (+ 1 (length redeem)))
-                         (+ 1 +ecdsa-max-sig-size+ 1 33))
-                      t 3))
-             ;; sh(wsh(multi(...)))
-             ((and (= (length redeem) 34)
-                   (= (aref redeem 0) #x00) (= (aref redeem 1) #x20))
-              (let ((sat (and witness (%multisig-sat-size witness))))
-                (when sat
-                  (multiple-value-bind (m) (bl.rpc:parse-multisig witness)
-                    (values (+ (* 4 (+ 1 (length redeem)))
-                               (+ (bl.ser:compact-size-length (length witness))
-                                  (length witness) sat))
-                            t (+ 3 m))))))
-             ;; sh(multi(...)) — legacy
-             (t
-              (let ((sat (%multisig-sat-size redeem)))
-                (when sat
-                  (multiple-value-bind (m) (bl.rpc:parse-multisig redeem)
-                    (values (* 4 (+ (+ 1 (length redeem)) sat))
-                            nil (+ 2 m))))))))))
-      (:witness-v0-scripthash
-       (multiple-value-bind (redeem witness) (%known-sub-scripts wallet cc script)
-         (declare (ignore redeem))
-         (when witness
-           (let ((sat (%multisig-sat-size witness)))
-             (if sat
-                 (multiple-value-bind (m) (bl.rpc:parse-multisig witness)
-                   (values (+ (bl.ser:compact-size-length (length witness))
-                              (length witness) sat)
-                           t (+ 2 m)))
-                 ;; Not multisig: try miniscript, or the coin looks unsolvable
-                 ;; and coin selection silently skips it — which is what kept a
-                 ;; funded policy descriptor unspendable through the wallet's
-                 ;; own send path even once signing worked.
-                 (multiple-value-bind (msat elems)
-                     (%miniscript-sat-size-and-elems witness)
-                   (when msat
+    (let ((sig (%ecdsa-sig-size use-max-sig)))
+      (case type
+        (:pubkey (values (* 4 (+ 1 sig)) nil 1))
+        (:pubkeyhash
+         (let ((pub (%known-pubkey-for-script wallet cc script (getf data :hash))))
+           (when pub
+             (values (* 4 (+ 1 sig 1 (length pub))) nil 2))))
+        (:witness-v0-keyhash
+         (values (+ 1 sig 1 33) t 2))
+        (:witness-v1-taproot
+         ;; Keypath spend assumed, like Core's TRDescriptor (FIXME parity).
+         (values (+ 1 65) t 1))
+        (:multisig
+         (let ((sat (%multisig-sat-size script use-max-sig)))
+           (when sat (values (* 4 sat) nil (+ 1 (getf data :m))))))
+        (:scripthash
+         (multiple-value-bind (redeem witness) (%known-sub-scripts wallet cc script)
+           (when redeem
+             (cond
+               ;; sh(wpkh(...))
+               ((and (= (length redeem) 22)
+                     (= (aref redeem 0) #x00) (= (aref redeem 1) #x14))
+                (values (+ (* 4 (+ 1 (length redeem)))
+                           (+ 1 sig 1 33))
+                        t 3))
+               ;; sh(wsh(multi(...)))
+               ((and (= (length redeem) 34)
+                     (= (aref redeem 0) #x00) (= (aref redeem 1) #x20))
+                (let ((sat (and witness (%multisig-sat-size witness use-max-sig))))
+                  (when sat
+                    (multiple-value-bind (m) (bl.rpc:parse-multisig witness)
+                      (values (+ (* 4 (+ 1 (length redeem)))
+                                 (+ (bl.ser:compact-size-length (length witness))
+                                    (length witness) sat))
+                              t (+ 3 m))))))
+               ;; sh(multi(...)) — legacy
+               (t
+                (let ((sat (%multisig-sat-size redeem use-max-sig)))
+                  (when sat
+                    (multiple-value-bind (m) (bl.rpc:parse-multisig redeem)
+                      (values (* 4 (+ (+ 1 (length redeem)) sat))
+                              nil (+ 2 m))))))))))
+        (:witness-v0-scripthash
+         (multiple-value-bind (redeem witness) (%known-sub-scripts wallet cc script)
+           (declare (ignore redeem))
+           (when witness
+             (let ((sat (%multisig-sat-size witness use-max-sig)))
+               (if sat
+                   (multiple-value-bind (m) (bl.rpc:parse-multisig witness)
                      (values (+ (bl.ser:compact-size-length (length witness))
-                                (length witness) msat)
-                             t elems)))))))))))
+                                (length witness) sat)
+                             t (+ 2 m)))
+                   ;; Not multisig: try miniscript, or the coin looks unsolvable
+                   ;; and coin selection silently skips it — which is what kept a
+                   ;; funded policy descriptor unspendable through the wallet's
+                   ;; own send path even once signing worked.
+                   (multiple-value-bind (msat elems)
+                       (%miniscript-sat-size-and-elems witness)
+                     (when msat
+                       (values (+ (bl.ser:compact-size-length (length witness))
+                                  (length witness) msat)
+                               t elems))))))))))))
 
-(defun %max-input-weight (wallet cc script &key (tx-is-segwit t))
+(defun %max-input-weight (wallet cc script use-max-sig &key (tx-is-segwit t))
   "Core MaxInputWeight (spend.cpp:69-90): full weight of the signed input
 incl. outpoint/sequence/length prefixes, or NIL when unsolvable."
-  (multiple-value-bind (sat segwit elems) (%script-sat-weight wallet cc script)
+  (multiple-value-bind (sat segwit elems)
+      (%script-sat-weight wallet cc script use-max-sig)
     (when sat
       (let ((scriptsig-len (if segwit
                                1
@@ -541,9 +577,12 @@ incl. outpoint/sequence/length prefixes, or NIL when unsolvable."
                               (if tx-is-segwit 1 0))))
         (+ (* 4 (+ 32 4 4 scriptsig-len)) witstack-len sat)))))
 
-(defun %max-signed-input-vsize (wallet cc script)
-  "Core CalculateMaximumSignedInputSize: signed input vsize, or -1."
-  (let ((weight (%max-input-weight wallet cc script :tx-is-segwit t)))
+(defun %max-signed-input-vsize (wallet cc script use-max-sig)
+  "Core CalculateMaximumSignedInputSize: signed input vsize, or -1. Core calls
+MaxInputWeight with an EMPTY txin here (spend.cpp:97), so UseMaxSig cannot
+fire and USE-MAX-SIG is the wallet's !CanGrindR alone."
+  (let ((weight (%max-input-weight wallet cc script use-max-sig
+                                   :tx-is-segwit t)))
     (if weight (ceiling weight 4) -1)))
 
 (defun %txout-script-segwit-p (wallet cc script)
@@ -556,7 +595,8 @@ witness program."
   (case (bl.val:classify-script script)
     ((:witness-v0-keyhash :witness-v0-scripthash :witness-v1-taproot) t)
     (:scripthash
-     (multiple-value-bind (sat segwit) (%script-sat-weight wallet cc script)
+     ;; Only the segwit-ness is read, which no signature size can change.
+     (multiple-value-bind (sat segwit) (%script-sat-weight wallet cc script nil)
        (and sat segwit t)))))
 
 (defun %max-signed-tx-size (wallet cc tx txouts)
@@ -578,9 +618,17 @@ control's explicit input weight or NIL). Returns (values vsize weight) or
                                 (bl.ser:tx-out-script-pubkey
                                  output)))))
     (loop for txo in txouts
+          for in across inputs
           for override = (cdr txo)
           for w = (or override
                       (%max-input-weight wallet cc (car txo)
+                                         ;; Core GetSignedTxinWeight passes the
+                                         ;; txin (spend.cpp:138), so UseMaxSig
+                                         ;; applies here: an externally selected
+                                         ;; input is sized for a signature the
+                                         ;; wallet does not produce.
+                                         (or (%wallet-use-max-sig-p wallet)
+                                             (wcc-external-selected-p cc in))
                                          :tx-is-segwit is-segwit))
           do (if w
                  (incf weight w)
@@ -1249,7 +1297,7 @@ Returns (values sel-result error-message)."
         (return-from %choose-selection-result
           (values nil (first (last errors)))))
       ;; Bump-fee synergy discount: no bump-fee machinery — discount 0
-      ;; (divergence 3 in the file header).
+      ;; (divergence 2 in the file header).
       (dolist (result results)
         (sel-result-recalculate-waste result
                                       (csel-params-min-viable-change params)
@@ -1612,8 +1660,8 @@ inputs, in selection order. Caller holds node + wallet locks."
                (when (minusp input-bytes)
                  (setf input-bytes
                        (%max-signed-input-vsize
-                        wallet cc (bl.ser:tx-out-script-pubkey
-                                   txout))))
+                        wallet cc (bl.ser:tx-out-script-pubkey txout)
+                        (%wallet-use-max-sig-p wallet))))
                ;; TRUC version mixing on unconfirmed preset inputs
                ;; (spend.cpp:286-293).
                (when (zerop (wallet-tx-depth wallet wtx))
@@ -1638,9 +1686,12 @@ inputs, in selection order. Caller holds node + wallet locks."
                                        (%outpoint-string txid vout)))))))
             (when (minusp input-bytes)
               (setf input-bytes
+                    ;; Core sizes a preset input from the coin control's
+                    ;; external provider alone (spend.cpp:305); the grinding
+                    ;; question is still the wallet's.
                     (%max-signed-input-vsize
-                     nil cc (bl.ser:tx-out-script-pubkey
-                             txout))))
+                     nil cc (bl.ser:tx-out-script-pubkey txout)
+                     (%wallet-use-max-sig-p wallet))))
             (when (minusp input-bytes)
               (return-from %fetch-selected-inputs
                 (values nil (format nil "Not solvable pre-selected input ~A"
@@ -1929,7 +1980,9 @@ Caller holds node + wallet locks."
                   (setf (csel-params-change-output-size params)
                         (bl.rpc:txout-serialize-size change-script))
                   (let ((change-spend-size
-                          (%max-signed-input-vsize wallet nil change-script)))
+                          (%max-signed-input-vsize
+                           wallet nil change-script
+                           (%wallet-use-max-sig-p wallet))))
                     (setf (csel-params-change-spend-size params)
                           (if (minusp change-spend-size)
                               +dummy-nested-p2wpkh-input-size+
@@ -2004,7 +2057,9 @@ Caller holds node + wallet locks."
                                       :feerate feerate
                                       :input-bytes-fn
                                       (lambda (script)
-                                        (%max-signed-input-vsize wallet cc script))
+                                        (%max-signed-input-vsize
+                                         wallet cc script
+                                         (%wallet-use-max-sig-p wallet)))
                                       :allow-used-addresses
                                       (or (not (wallet-flag-set-p
                                                 wallet +wallet-flag-avoid-reuse+))
@@ -2269,7 +2324,7 @@ Caller holds node + wallet locks."
                                             (when (%wallet-sign-transaction
                                                    wallet tx coins)
                                               (fail "Signing transaction failed"))
-                                            ;; EXTRA rail (divergence 5): the
+                                            ;; EXTRA rail (divergence 4): the
                                             ;; fully-signed tx must verify
                                             ;; against the exact spent
                                             ;; scripts/amounts before it can
@@ -2292,7 +2347,7 @@ Caller holds node + wallet locks."
                                           (fail +max-fee-exceeded-message+))
                                         ;; -walletrejectlongchains'
                                         ;; checkChainLimits simulation is not
-                                        ;; run pre-commit (divergence 4).
+                                        ;; run pre-commit (divergence 3).
                                         (setf keep-reservation t)
                                         (bl:log-info
                                          "Coin Selection: Algorithm:~(~A~), Waste Metric Score:~D; fee ~D sat over ~D vB"
@@ -3410,7 +3465,9 @@ estimate_mode fee_rate options)."
                                          :feerate fee-rate
                                          :input-bytes-fn
                                          (lambda (script)
-                                           (%max-signed-input-vsize wallet cc script))
+                                           (%max-signed-input-vsize
+                                            wallet cc script
+                                            (%wallet-use-max-sig-p wallet)))
                                          ;; Core sendall ALWAYS sweeps reused
                                          ;; coins: AvailableCoins' allow_used
                                          ;; = !AVOID_REUSE || (cc &&

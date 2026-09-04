@@ -1346,7 +1346,7 @@ input, no sigs); walletprocesspsbt signs + finalizes it into a valid network tx
 that our own script verifier accepts and the mempool relays."
   (%with-pp-node (node "pp-wcfp")
     (let ((wallet (%pp-fund-wallet node)))
-      (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 42))
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 42))
              (dest (%pp-optrue-address))
              (created (bl.wallet::rpc-walletcreatefundedpsbt
                        node (list '() (list (%ht dest 1))
@@ -1383,7 +1383,7 @@ that our own script verifier accepts and the mempool relays."
 second call with sign=true (default) completes it."
   (%with-pp-node (node "pp-signflag")
     (%pp-fund-wallet node)
-    (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 99))
+    (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 99))
            (dest (%pp-optrue-address))
            (b64 (%aval "psbt" (bl.wallet::rpc-walletcreatefundedpsbt
                                node (list '() (list (%ht dest 1)) 0 (%ht "fee_rate" 5)))))
@@ -1412,7 +1412,7 @@ to cosign it. The v0 inputs here also pin RemoveUnnecessaryTransactions
 (psbt.cpp:514-549): with a segwit-v0 input present nothing may be dropped."
   (%with-pp-node (node "pp-nwutxo")
     (%pp-fund-wallet node)
-    (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 17))
+    (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 17))
            (dest (%pp-optrue-address))
            (b64 (%aval "psbt" (bl.wallet::rpc-walletcreatefundedpsbt
                                node (list '() (list (%ht dest 1)) 0 (%ht "fee_rate" 5)))))
@@ -1464,7 +1464,7 @@ signs + broadcasts it (RBF-evicting the original), records replaced_by_txid, and
 refuses to bump an already-bumped tx."
   (%with-pp-node (node "pp-bump")
     (let ((wallet (%pp-fund-wallet node :blocks 2)))
-      (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 7))
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 7))
              (dest (%pp-optrue-address))
              (txid-hex (bl.wallet::rpc-sendtoaddress
                         node (list dest 1 nil nil nil nil nil nil nil 5)))
@@ -1502,7 +1502,7 @@ refuses to bump an already-bumped tx."
 the original stays in the mempool, and walletprocesspsbt completes the PSBT."
   (%with-pp-node (node "pp-psbtbump")
     (%pp-fund-wallet node :blocks 2)
-    (let* ((bl.wallet::*wallet-rng* (bl.wallet::make-wrng 13))
+    (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 13))
            (dest (%pp-optrue-address))
            (txid-hex (bl.wallet::rpc-sendtoaddress
                       node (list dest 1 nil nil nil nil nil nil nil 5)))
