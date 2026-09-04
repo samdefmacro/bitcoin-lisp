@@ -1426,7 +1426,7 @@ name here.")
 keys or sighashes wants bl.bytes:make-octets-hash-table"
         now +equalp-hash-table-ceiling+)))
 
-(defparameter +test-internal-reference-ceiling+ 4227
+(defparameter +test-internal-reference-ceiling+ 4209
   "How many package-qualified INTERNAL references (a :: token) the files of
 the tests system may contain. The count is measured over the declared test
 files (%test-system-files), never a glob. History, so a reader can see what
@@ -1440,7 +1440,8 @@ called their handlers through the exported dispatcher; 4,254 when make-wallet-rn
 in tests/support/ replaced 38 reaches and the PSBT and spend suites drove
 createpsbt and sendtoaddress through one helper each; 4,248 with the BIP9
 signalling batch; 4,227 once rest-request in tests/support/ replaced 27 reaches
-into rest-handle.
+into rest-handle; 4,209 once the getrawtransaction and getrawmempool tests
+went through the exported dispatcher.
 White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the
