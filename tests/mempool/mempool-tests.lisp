@@ -8,6 +8,17 @@
   "Create a mempool entry for a test transaction (computes size/vsize/wtxid)."
   (bl.mp:make-entry-from-tx tx fee 0 :entry-time 1000000))
 
+(defun %mp-block (txs)
+  "A block carrying TXS. MEMPOOL-REMOVE-FOR-BLOCK reads the transaction list
+and nothing else, so the header is a placeholder."
+  (bl.ser:make-bitcoin-block
+   :header (bl.ser:make-block-header
+            :version 1
+            :prev-block (make-array 32 :element-type '(unsigned-byte 8))
+            :merkle-root (make-array 32 :element-type '(unsigned-byte 8))
+            :timestamp 0 :bits 0 :nonce 0)
+   :transactions txs))
+
 ;;;; Shared acceptance tail (accept-validated-tx)
 ;;;;
 ;;;; The evict-replaced + build-entry + mempool-add sequence used to be
@@ -77,14 +88,7 @@ deltas stack, and a net-zero delta is dropped from the map."
       (is (eq :ok (bl.mp:mempool-add mempool txid entry)))
       (is (= 8000 (bl.mp:mempool-entry-modified-fee entry))))
     ;; Mined in a block -> delta cleared (Core ClearPrioritisation).
-    (let ((block (bl.ser:make-bitcoin-block
-                  :header (bl.ser:make-block-header
-                           :version 1
-                           :prev-block (make-array 32 :element-type '(unsigned-byte 8))
-                           :merkle-root (make-array 32 :element-type '(unsigned-byte 8))
-                           :timestamp 0 :bits 0 :nonce 0)
-                  :transactions (list tx))))
-      (bl.mp:mempool-remove-for-block mempool block))
+    (bl.mp:mempool-remove-for-block mempool (%mp-block (list tx)))
     (is (null (bl.mp:mempool-get mempool txid)))
     (is (zerop (hash-table-count (bl.mp:mempool-deltas mempool))))))
 
@@ -226,14 +230,7 @@ removal (eviction/expiry funnel through mempool-remove, Core removeUnchecked
     (is (eq :ok (bl.mp:mempool-add
                  mempool txid (make-mempool-entry-for-tx tx))))
     (bl.mp:mempool-add-unbroadcast mempool txid)
-    (let ((block (bl.ser:make-bitcoin-block
-                  :header (bl.ser:make-block-header
-                           :version 1
-                           :prev-block (make-array 32 :element-type '(unsigned-byte 8))
-                           :merkle-root (make-array 32 :element-type '(unsigned-byte 8))
-                           :timestamp 0 :bits 0 :nonce 0)
-                  :transactions (list tx))))
-      (bl.mp:mempool-remove-for-block mempool block))
+    (bl.mp:mempool-remove-for-block mempool (%mp-block (list tx)))
     (is (null (bl.mp:mempool-get mempool txid)))
     (is (= 0 (bl.mp:mempool-unbroadcast-count mempool)))))
 
@@ -390,18 +387,7 @@ removal (eviction/expiry funnel through mempool-remove, Core removeUnchecked
                          :inputs (vector coinbase-input)
                          :outputs (vector coinbase-output)
                          :lock-time 0))
-           (block-header (bl.ser:make-block-header
-                          :version 1
-                          :prev-block (make-array 32 :element-type '(unsigned-byte 8)
-                                                  :initial-element 0)
-                          :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
-                                                   :initial-element 0)
-                          :timestamp 1000000
-                          :bits #x1d00ffff
-                          :nonce 0))
-           (block (bl.ser:make-bitcoin-block
-                   :header block-header
-                   :transactions (list coinbase-tx tx1))))
+           (block (%mp-block (list coinbase-tx tx1))))
       ;; Remove for block
       (bl.mp:mempool-remove-for-block mempool block)
       ;; tx1 should be removed, tx2 should remain
@@ -438,18 +424,7 @@ removal (eviction/expiry funnel through mempool-remove, Core removeUnchecked
                          :inputs (vector coinbase-input)
                          :outputs (vector coinbase-output)
                          :lock-time 0))
-           (block-header (bl.ser:make-block-header
-                          :version 1
-                          :prev-block (make-array 32 :element-type '(unsigned-byte 8)
-                                                  :initial-element 0)
-                          :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
-                                                   :initial-element 0)
-                          :timestamp 1000000
-                          :bits #x1d00ffff
-                          :nonce 0))
-           (block (bl.ser:make-bitcoin-block
-                   :header block-header
-                   :transactions (list coinbase-tx block-tx))))
+           (block (%mp-block (list coinbase-tx block-tx))))
       (bl.mp:mempool-remove-for-block mempool block)
       ;; Conflicting mempool tx should be removed
       (is (not (bl.mp:mempool-has mempool mempool-txid)))
@@ -2273,13 +2248,7 @@ output of the same parent tx survives."
          (conflicted (%mp-spending-tx parent :vout 0))
          (unrelated (%mp-spending-tx parent :vout 1))
          (block-tx (%mp-spending-tx parent :vout 0 :value 123456))
-         (block (bl.ser:make-bitcoin-block
-                 :header (bl.ser:make-block-header
-                          :version 1
-                          :prev-block (%txid-array 0)
-                          :merkle-root (%txid-array 0)
-                          :timestamp 1700000000 :bits #x1d00ffff :nonce 0)
-                 :transactions (list block-tx))))
+         (block (%mp-block (list block-tx))))
     (bl.mp:orphan-add pool conflicted (list :p))
     (bl.mp:orphan-add pool unrelated (list :p))
     (is (= 2 (bl.mp:orphan-pool-count pool)))
@@ -3369,3 +3338,49 @@ truncated file, decides it is corrupt, and logs a scary line about it forever."
            (with-open-file (in path :element-type '(unsigned-byte 8))
              (is (= 27 (file-length in)))))
       (ignore-errors (delete-file path)))))
+
+;;;; ============================================================
+;;;; GA10 S3: block conflicts and the rolling minimum fee
+;;;; ============================================================
+
+(test block-conflict-clears-the-conflicted-tx-prioritisation
+  "A block that double-spends a prioritised mempool transaction drops its
+delta with it (Core removeConflicts calls ClearPrioritisation before
+removeRecursive, txmempool.cpp:395-401). A conflicted txid can never be
+resubmitted, so a surviving delta is ballast forever: counted in
+mempool-dynamic-usage, reported by getprioritisedtransactions, and written
+to — and reloaded from — mempool.dat's residual-delta section."
+  (let* ((mempool (bl.mp:make-mempool))
+         (tx (make-mempool-test-tx :input-id 205))
+         (txid (bl.ser:transaction-hash tx))
+         ;; A different transaction spending the same outpoint.
+         (block-tx (make-mempool-test-tx :input-id 205 :value 30000000)))
+    (is (eq :ok (%add-tx mempool tx)))
+    (is (= 100000 (bl.mp:mempool-prioritise mempool txid 100000)))
+    (bl.mp:mempool-remove-for-block mempool (%mp-block (list block-tx)))
+    (is-false (bl.mp:mempool-has mempool txid))
+    (is (zerop (hash-table-count (bl.mp:mempool-deltas mempool)))
+        "the conflicted tx's delta outlived it")
+    (is (zerop (bl.mp:mempool-dynamic-usage mempool))
+        "a residual delta keeps charging the pool's usage accounting")))
+
+(test block-conflict-keeps-the-descendants-prioritisation
+  "Only the DIRECTLY conflicting transaction loses its delta: Core clears
+the one txid it hands to removeRecursive (txmempool.cpp:395-401) and
+removeUnchecked never touches mapDeltas, so a descendant evicted with it
+keeps its prioritisation — it spends an output that still exists, and can
+be resubmitted once its parent is."
+  (let* ((mempool (bl.mp:make-mempool))
+         (parent (make-mempool-test-tx :input-id 206))
+         (parent-txid (bl.ser:transaction-hash parent))
+         (child (%mp-spending-tx parent-txid))
+         (child-txid (bl.ser:transaction-hash child))
+         (block-tx (make-mempool-test-tx :input-id 206 :value 30000000)))
+    (is (eq :ok (%add-tx mempool parent)))
+    (is (eq :ok (%add-tx mempool child)))
+    (bl.mp:mempool-prioritise mempool parent-txid 100000)
+    (bl.mp:mempool-prioritise mempool child-txid 7000)
+    (bl.mp:mempool-remove-for-block mempool (%mp-block (list block-tx)))
+    (is (zerop (bl.mp:mempool-count mempool)))
+    (is-false (gethash parent-txid (bl.mp:mempool-deltas mempool)))
+    (is (eql 7000 (gethash child-txid (bl.mp:mempool-deltas mempool))))))
