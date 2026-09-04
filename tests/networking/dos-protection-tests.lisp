@@ -44,8 +44,11 @@
     (is (bl:token-bucket-allow-p bucket))))
 
 (test token-bucket-burst-caps-refill
-  "Refilled tokens should not exceed burst capacity."
-  (let ((bucket (bl:make-rate-limiter 1000.0 3.0)))
+  "Refilled tokens should not exceed burst capacity. The rate is one token a
+second on purpose: at 1000/s a single millisecond between the third draw and
+the fourth refilled a token, and the final rejection failed once in a cold
+run on a loaded machine (2026-09-05)."
+  (let ((bucket (bl:make-rate-limiter 1.0 3.0)))
     ;; Consume one token
     (bl:token-bucket-allow-p bucket)
     ;; Simulate long delay
