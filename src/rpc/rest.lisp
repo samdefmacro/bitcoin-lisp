@@ -15,16 +15,19 @@
 ;;;   /rest/blockhashbyheight/<height>.<json|hex|bin>
 ;;;   /rest/block/<hash>.<json|hex|bin>
 ;;;   /rest/block/notxdetails/<hash>.json
+;;;   /rest/blockpart/<hash>.<hex|bin>?offset=<n>&size=<n>
 ;;;   /rest/tx/<txid>.<json|hex|bin>
 ;;;   /rest/headers/<hash>.<json|hex|bin>?count=<n>   (default 5, max 2000)
 ;;;   /rest/mempool/info.json
 ;;;   /rest/mempool/contents.json
 ;;;   /rest/getutxos[/checkmempool]/<txid>-<n>/...  .<json|hex|bin>
 ;;;     (BIP64: bitmap + coins; GET-URI input only, no POST body)
+;;;   /rest/deploymentinfo[/<hash>].json
+;;;   /rest/blockfilter/<filtertype>/<hash>.<json|hex|bin>
+;;;   /rest/blockfilterheaders/<filtertype>/<hash>.<json|hex|bin>?count=<n>
+;;;   /rest/spenttxouts/<hash>.<json|hex|bin>
 ;;;
-;;; NOT supported (out of scope here): /rest/blockfilter*,
-;;; /rest/blockfilterheaders* (BIP157/158), /rest/spenttxouts (needs undo,
-;;; pruned away), /rest/deploymentinfo, POST-body getutxos input.
+;;; NOT supported (out of scope here): POST-body getutxos input.
 
 (defconstant +rest-max-headers+ 2000
   "Cap on headers returned by /rest/headers, matching Core's MAX_REST_HEADERS.")
@@ -480,13 +483,40 @@ sequence that never existed."
                               ext (apply #'concatenate 'string headers))))
               (rpc-error (e) (%rest-error 404 (rpc-error-message e)))))))))))
 
+(defun %rest-spent-txouts-bytes (tx-undos)
+  "TX-UNDOS as Core's SerializeBlockUndo (rest.cpp:277-289): CompactSize of the
+transaction count PLUS ONE, then CompactSize(0) standing in for the coinbase,
+which CBlockUndo does not carry; then, per transaction, the CompactSize input
+count followed by each spent coin as a BARE CTxOut — int64 value and
+CompactSize-prefixed scriptPubKey (CTxOut::SERIALIZE_METHODS,
+primitives/transaction.h:152).
+
+Deliberately NOT BL.STORE:SERIALIZE-BLOCK-UNDO. That is the rev-file codec —
+Core VARINT(height*2+coinbase), the dummy byte, and TxOutCompression of the
+amount and script — and Core does not use it here: this endpoint's format
+carries no height, no coinbase flag and no compression, and its leading count
+is one larger. Serving the disk codec makes every .bin/.hex response
+undecodable by a client written against Core, with the coins reading as
+plausible garbage rather than failing."
+  (let ((bb (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-varint bb (1+ (length tx-undos)))
+    (bl.ser:bb-write-varint bb 0)
+    (dolist (tx-undo tx-undos)
+      (bl.ser:bb-write-varint bb (length tx-undo))
+      (dolist (entry tx-undo)
+        (bl.ser:bb-write-tx-out
+         bb (bl.ser:make-tx-out
+             :value (bl.store:utxo-entry-value entry)
+             :script-pubkey (bl.store:utxo-entry-script-pubkey entry)))))
+    (bl.ser:bb-finish bb)))
+
 (defun %rest-spenttxouts (node body ext)
   "/rest/spenttxouts/<blockhash> — the block's CBlockUndo, i.e. the coins its
-inputs spent (rest_spent_txouts, rest.cpp).
+inputs spent (rest_spent_txouts, rest.cpp:311-379).
 
-The bin/hex forms are Core's CBlockUndo serialization, which is the same codec
-the rev files use; the JSON form is one array per non-coinbase transaction, in
-input order, as BlockUndoToJSON produces."
+Both forms carry Core's REST-specific shape, which leads with a placeholder
+for the coinbase: %REST-SPENT-TXOUTS-BYTES for .bin/.hex and %BLOCK-UNDO-JSON
+for .json."
   (unless (valid-hex-hash-p body)
     (return-from %rest-spenttxouts (%rest-error 400 "Invalid block hash")))
   (let* ((hash (parse-hex-hash body))
@@ -500,10 +530,10 @@ input order, as BlockUndoToJSON produces."
              (let ((tx-undos (bl.store:block-undo-from-spent-utxos
                               block (or undo '()))))
                (%rest-by-ext ext
-                 :json (%rest-json (json-array (%block-undo-json tx-undos node)))
+                 :json (%rest-json (%block-undo-json tx-undos node))
                  :hex/bin (%rest-hex-or-bin
                            ext (bl.crypto:bytes-to-hex
-                                (bl.store:serialize-block-undo tx-undos)))))
+                                (%rest-spent-txouts-bytes tx-undos)))))
            (error ()
              ;; block-undo-from-spent-utxos refuses undo data that does not
              ;; account for exactly this block's inputs, which is what a pruned
@@ -511,29 +541,35 @@ input order, as BlockUndoToJSON produces."
              (%rest-error 404 (format nil "~A undo not available" body)))))))))
 
 (defun %block-undo-json (tx-undos node)
-  "TX-UNDOS as Core's BlockUndoToJSON: one array per non-coinbase transaction,
-each a list of the coins that transaction's inputs spent."
+  "TX-UNDOS as Core's BlockUndoToJSON (rest.cpp:293-311): an EMPTY array
+first — CBlockUndo has no entry for the coinbase, and Core pushes the
+placeholder so that result[i] is block transaction i's coins — then one array
+per non-coinbase transaction, each holding the coins that transaction's inputs
+spent. Without the placeholder every array is attributed to the transaction
+before it."
   (let ((network (rpc-get-network node)))
-    (mapcar
-     (lambda (tx-undo)
-       (json-array
-        (mapcar
-         (lambda (entry)
-           (let ((spk (bl.store:utxo-entry-script-pubkey entry)))
-             `(("value" . ,(/ (bl.store:utxo-entry-value entry)
-                              100000000.0d0))
-               ;; Core's ScriptToUniv with include_hex and
-               ;; include_address, which is the shape OUTPUT-TO-JSON already
-               ;; builds for a tx-out.
-               ("scriptPubKey"
-                . ,(let ((addr (and network (script->address spk network))))
-                     (append
-                      `(("asm" . ,(bl.val:disassemble-script spk))
-                        ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                        ("type" . ,(bl.val:script-type-name spk)))
-                      (when addr `(("address" . ,addr)))))))))
-         tx-undo)))
-     tx-undos)))
+    (cons
+     (json-array '())
+     (mapcar
+      (lambda (tx-undo)
+        (json-array
+         (mapcar
+          (lambda (entry)
+            (let ((spk (bl.store:utxo-entry-script-pubkey entry)))
+              `(("value" . ,(/ (bl.store:utxo-entry-value entry)
+                               100000000.0d0))
+                ;; Core's ScriptToUniv with include_hex and
+                ;; include_address, which is the shape OUTPUT-TO-JSON already
+                ;; builds for a tx-out.
+                ("scriptPubKey"
+                 . ,(let ((addr (and network (script->address spk network))))
+                      (append
+                       `(("asm" . ,(bl.val:disassemble-script spk))
+                         ("hex" . ,(bl.crypto:bytes-to-hex spk))
+                         ("type" . ,(bl.val:script-type-name spk)))
+                       (when addr `(("address" . ,addr)))))))))
+          tx-undo)))
+      tx-undos))))
 
 (defun rest-handle (node uri)
   "Route a /rest/... URI (script-name, query already stripped by Hunchentoot)

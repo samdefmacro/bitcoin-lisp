@@ -4506,6 +4506,67 @@ CONTROL: the identical block WITH its undo data answers (previous test)."
     (signals bl.rpc:rpc-error
       (bl.rpc::rpc-getblockstats node (list hex)))))
 
+;;; --- REST: the two endpoints that render a block's spent coins ---
+;;;
+;;; Both reuse %WITH-GBS-BLOCK above: it is this file's one fixture that stores
+;;; a block together with its undo data, which is the whole subject here.
+
+(test rest-spenttxouts-is-core-s-rest-format-not-the-rev-file-codec
+  "/rest/spenttxouts/<hash>.bin|.hex is Core's SerializeBlockUndo
+(rest.cpp:277-289): CompactSize(vtxundo.size() + 1), CompactSize(0) for the
+coinbase CBlockUndo does not carry, then per transaction
+CompactSize(vprevout.size()) and each coin as a BARE CTxOut -- int64 value plus
+CompactSize-prefixed script (primitives/transaction.h:152).
+
+We served the rev-file codec instead, whose outer count is short by one, whose
+coinbase placeholder is missing, and whose coins carry a
+VARINT(height*2+coinbase), a dummy byte and a COMPRESSED amount and script. No
+client written against Core can decode that, and it does not error: the coins
+read as plausible garbage."
+  (%with-gbs-block (node hex spender)
+    (let ((expected (concatenate 'string
+                                 "02"               ; one CTxUndo, plus the coinbase
+                                 "00"               ; ... which spends nothing
+                                 "01"               ; the spend has one input
+                                 "a086010000000000" ; 100000 sat as int64 LE
+                                 "19"               ; a 25-byte script
+                                 (bl.crypto:bytes-to-hex *gbs-p2pkh*))))
+      (is (string= (format nil "~A~%" expected)
+                   (rest-request node (format nil "/rest/spenttxouts/~A.hex" hex))))
+      ;; .bin is those bytes, unhexed.
+      (is (equalp (bl.crypto:hex-to-bytes expected)
+                  (rest-request node (format nil "/rest/spenttxouts/~A.bin" hex))))
+      ;; CONTROL: the disk codec answers something else for the same undo
+      ;; record, so a future "just reuse SERIALIZE-BLOCK-UNDO" cannot pass.
+      (is (string/= expected
+                    (bl.crypto:bytes-to-hex
+                     (bl.store:serialize-block-undo
+                      (list (list (bl.store:make-utxo-entry
+                                   :value 100000 :script-pubkey *gbs-p2pkh*
+                                   :height 50 :coinbase nil))))))))))
+
+(test rest-spenttxouts-json-leads-with-the-coinbase-s-empty-array
+  "BlockUndoToJSON pushes an EMPTY array first (rest.cpp:295) because
+CBlockUndo has no entry for the coinbase. That placeholder is what makes
+result[i] the coins of block transaction i; without it every array is
+attributed to the transaction before it, so a client reads transaction 1's
+prevouts as the coinbase's and finds none for the last transaction."
+  (%with-gbs-block (node hex spender)
+    (let* ((body (rest-request node (format nil "/rest/spenttxouts/~A.json" hex)))
+           (parsed (yason:parse body)))
+      (is (= 2 (length parsed))
+          "one array per block transaction, coinbase included: ~S" body)
+      (is-true (alexandria:starts-with-subseq "[[]," body)
+               "the coinbase's placeholder array is missing: ~S" body)
+      (let ((coins (second parsed)))
+        (is (= 1 (length coins)) "the spend's coins landed at the wrong index")
+        (let ((coin (first coins)))
+          ;; Core's prevout object: the amount in BTC and ScriptToUniv.
+          (is (< (abs (- 0.001d0 (gethash "value" coin))) 1d-12))
+          (is (string= (bl.crypto:bytes-to-hex *gbs-p2pkh*)
+                       (gethash "hex" (gethash "scriptPubKey" coin)))))))))
+
+
 (test rpc-calculate-block-subsidy
   "Test block subsidy calculation"
   ;; Initial subsidy: 50 BTC = 5000000000 satoshis
