@@ -611,34 +611,54 @@ header); errors if the parent is missing or the header fails validation."
 (defun %generate-to-script-pubkey (node script-pubkey nblocks maxtries)
   "Mine NBLOCKS blocks whose coinbase pays SCRIPT-PUBKEY, activating each through
 the normal consensus path. Returns the list of mined block hashes (hex). Shared
-by generatetoaddress and generatetodescriptor."
+by generatetoaddress and generatetodescriptor.
+
+Two things about MAXTRIES, both Core's (rpc/mining.cpp:161-181). It is ONE
+budget for the whole call, threaded through every block, not a fresh allowance
+per block. And running out of it is a NORMAL RESULT, not an error: Core's
+generateBlocks breaks out of its loop and returns the array it has, so a
+deliberately bounded call like `generatetoaddress(1, addr, 0)' answers [] and a
+call that solved two of three blocks answers those two. Signalling instead
+threw away blocks that were already mined AND activated.
+
+The loop also gives up when the node is asked to stop (Core's
+`!chainman.m_interrupt' at the head of the same loop), returning what it has."
   (let ((chain-state (rpc-get-chain-state node))
         (mempool (rpc-get-mempool node))
+        (tries-left maxtries)
         (hashes '()))
-    (dotimes (i nblocks (nreverse hashes))
-      ;; Assemble under the node lock (one consistent tip+mempool view);
-      ;; grind the nonce OUTSIDE it — Core likewise drops cs_main between
-      ;; CreateNewBlock and ProcessNewBlock (rpc/mining.cpp GenerateBlocks),
-      ;; and a stale-template block simply fails activation below.
-      (let ((block (with-node-lock (node)
-                     (bl.mining:assemble-full-block
-                      chain-state mempool :coinbase-script-pubkey script-pubkey
-                      ;; TestBlockValidity before mining (Core CreateNewBlock).
-                      :utxo-set (rpc-get-utxo-set node)))))
-        (unless (bl.mining:mine-block block :max-tries maxtries)
-          (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
-        (multiple-value-bind (ok reason) (activate-submitted-block node block)
-          (unless ok
-            (error 'rpc-error :code +rpc-misc-error+
-                              :message (format nil "Mined block rejected: ~A" reason)))
-          (push (hash-to-hex (bl.ser:block-header-hash
-                              (bl.ser:bitcoin-block-header block)))
-                hashes))))))
+    (loop repeat nblocks
+          until (bl:interrupt-requested-p)
+          ;; Assemble under the node lock (one consistent tip+mempool view);
+          ;; grind the nonce OUTSIDE it — Core likewise drops cs_main between
+          ;; CreateNewBlock and ProcessNewBlock (rpc/mining.cpp GenerateBlocks),
+          ;; and a stale-template block simply fails activation below.
+          do (let ((block (with-node-lock (node)
+                            (bl.mining:assemble-full-block
+                             chain-state mempool
+                             :coinbase-script-pubkey script-pubkey
+                             ;; TestBlockValidity before mining (Core
+                             ;; CreateNewBlock).
+                             :utxo-set (rpc-get-utxo-set node)))))
+               (multiple-value-bind (mined tries)
+                   (bl.mining:mine-block block :max-tries tries-left)
+                 (decf tries-left tries)
+                 (unless mined (loop-finish)))
+               (multiple-value-bind (ok reason) (activate-submitted-block node block)
+                 (unless ok
+                   (error 'rpc-error :code +rpc-misc-error+
+                                     :message (format nil "Mined block rejected: ~A" reason)))
+                 (push (hash-to-hex (bl.ser:block-header-hash
+                                     (bl.ser:bitcoin-block-header block)))
+                       hashes)))
+          finally (return (nreverse hashes)))))
 
 (define-rpc "generatetoaddress" (node (nblocks address (maxtries :or 1000000)))
   "Mine NBLOCKS blocks paying to ADDRESS and add them to the chain (Bitcoin Core
 generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
-[maxtries]). Returns an array of the mined block hashes (hex)."
+[maxtries]). Returns an array of the mined block hashes (hex) -- shorter than
+NBLOCKS, and empty when MAXTRIES was 0, if the try budget ran out or the node
+is stopping."
   (let ((network (bl:node-network node)))
     (unless (and (integerp nblocks) (plusp nblocks))
       (error 'rpc-error :code +rpc-invalid-parameter+
@@ -651,13 +671,16 @@ generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
         ;; Core: RPC_INVALID_ADDRESS_OR_KEY (-5), rpc/mining.cpp:291.
         (error 'rpc-error :code +rpc-invalid-address-or-key+
                           :message "Error: Invalid address"))
-      (%generate-to-script-pubkey node script-pubkey nblocks maxtries))))
+      (json-array
+       (%generate-to-script-pubkey node script-pubkey nblocks maxtries)))))
 
 (define-rpc "generatetodescriptor" (node (nblocks descriptor (maxtries :or 1000000)))
   "Mine NUM-BLOCKS blocks whose coinbase pays the scriptPubKey of DESCRIPTOR
 (Bitcoin Core generatetodescriptor; CPU mining, intended for regtest). PARAMS:
 (num_blocks descriptor [maxtries]). The descriptor must expand to a single
-script. Returns an array of the mined block hashes (hex)."
+script. Returns an array of the mined block hashes (hex) -- shorter than
+NUM-BLOCKS, and empty when MAXTRIES was 0, if the try budget ran out or the
+node is stopping."
   (let ((network (bl:node-network node)))
     (unless (and (integerp nblocks) (plusp nblocks))
       (error 'rpc-error :code +rpc-invalid-parameter+
@@ -671,7 +694,8 @@ script. Returns an array of the mined block hashes (hex)."
       (unless script-pubkey
         (error 'rpc-error :code +rpc-invalid-address-or-key+
                           :message "Descriptor does not expand to a script"))
-      (%generate-to-script-pubkey node script-pubkey nblocks maxtries))))
+      (json-array
+       (%generate-to-script-pubkey node script-pubkey nblocks maxtries)))))
 
 (defun %resolve-coinbase-output-script (output network)
   "scriptPubKey for generateblock's OUTPUT — a descriptor (tried first, like

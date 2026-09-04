@@ -838,7 +838,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
           (addr (bl.crypto:encode-p2pkh-address
                  (make-array 20 :element-type '(unsigned-byte 8) :initial-element 3)
                  :regtest))
-          (hashes (bl.rpc::rpc-generatetoaddress node (list 3 addr))))
+          (hashes (bl.rpc:dispatch-rpc-method node "generatetoaddress" (list 3 addr))))
      (is (= 3 (length hashes)))
      (is (every #'stringp hashes))
      (is (= 3 (bl.store:current-height
@@ -854,7 +854,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
   ;; the chain advances, mirroring generatetoaddress.
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "gendesc"))
-          (hashes (bl.rpc::rpc-generatetodescriptor node (list 2 "raw(51)"))))
+          (hashes (bl.rpc:dispatch-rpc-method node "generatetodescriptor" (list 2 "raw(51)"))))
      (is (= 2 (length hashes)))
      (is (every #'stringp hashes))
      (is (= 2 (bl.store:current-height
@@ -865,9 +865,9 @@ not active; contextual validation rejects that block as :unexpected-witness")
                     (bl:node-chain-state node)))))
      ;; bad descriptor + non-positive count error
      (signals bl.rpc:rpc-error
-       (bl.rpc::rpc-generatetodescriptor node (list 1 "frobnicate(03ab)")))
+       (bl.rpc:dispatch-rpc-method node "generatetodescriptor" (list 1 "frobnicate(03ab)")))
      (signals bl.rpc:rpc-error
-       (bl.rpc::rpc-generatetodescriptor node (list 0 "raw(51)"))))))
+       (bl.rpc:dispatch-rpc-method node "generatetodescriptor" (list 0 "raw(51)"))))))
 
 (test submitheader-accepts-valid-rejects-orphan
   ;; A mined header whose parent is known validates and is added to the index;
@@ -1072,11 +1072,12 @@ the generate* paths pass the UTXO set, so all live templates are dry-run
      (signals error (bl.rpc::rpc-getblocktemplate node (%gbt-params)))
      ;; generatetoaddress refuses to mine it.
      (signals error
-       (bl.rpc::rpc-generatetoaddress
-        node (list 1 (bl.crypto:encode-p2pkh-address
-                      (make-array 20 :element-type '(unsigned-byte 8)
-                                     :initial-element 3)
-                      :regtest)))))))
+       (bl.rpc:dispatch-rpc-method
+        node "generatetoaddress"
+        (list 1 (bl.crypto:encode-p2pkh-address
+                 (make-array 20 :element-type '(unsigned-byte 8)
+                                :initial-element 3)
+                 :regtest)))))))
 
 (test test-block-validity-accepts-valid-and-rejects-stale-prev
   "TEST-BLOCK-VALIDITY passes a freshly assembled valid block (PoW not yet
@@ -1481,3 +1482,74 @@ keys are absent."
             (is (= bl.mining:*block-reserved-weight*
                    (cdr (assoc "currentblockweight" r :test #'string=))))
             (is (= 0 (cdr (assoc "currentblocktx" r :test #'string=))))))))))
+
+(test mine-block-reports-its-tries-and-gives-up-when-asked-to-stop
+  "MINE-BLOCK returns (VALUES BLOCK TRIES), TRIES being the number of nonces
+that FAILED — the quantity Core subtracts from the single `uint64_t& max_tries'
+it threads through every block generateBlocks mines (rpc/mining.cpp:142-147),
+so a budget spans the whole call instead of being handed out afresh per block.
+The grind also polls the node's stop flag, Core's `!chainman.m_interrupt' in
+the same loop condition.
+
+The unsolvable header carries difficulty-1 bits rather than regtest's, so the
+grind fails deterministically: against regtest's ~2^255 target nonce 0 solves
+about half the time."
+  (with-network (:regtest)
+    (flet ((block-with-bits (bits)
+             (bl.ser:make-bitcoin-block
+              :header (bl.ser:make-block-header
+                       :version 1 :prev-block (%zeros 32) :merkle-root (%zeros 32)
+                       :timestamp 1296688602 :bits bits :nonce 0)
+              :transactions '())))
+      (multiple-value-bind (mined tries)
+          (bl.mining:mine-block (block-with-bits #x1d00ffff) :max-tries 7)
+        (is (null mined))
+        (is (= 7 tries) "an exhausted grind must report the whole budget spent"))
+      ;; A zero budget hashes nothing at all (Core's `while (max_tries > 0)').
+      (multiple-value-bind (mined tries)
+          (bl.mining:mine-block (block-with-bits #x1d00ffff) :max-tries 0)
+        (is (null mined))
+        (is (= 0 tries)))
+      ;; Stopping node: give up at once, with nothing spent.
+      (let ((bl:*interrupt-check* (constantly t)))
+        (multiple-value-bind (mined tries)
+            (bl.mining:mine-block (block-with-bits #x1d00ffff) :max-tries 1000000)
+          (is (null mined))
+          (is (= 0 tries))))
+      ;; On success TRIES is the solving nonce: every nonce before it failed.
+      (let ((block (block-with-bits #x207fffff)))
+        (multiple-value-bind (mined tries) (bl.mining:mine-block block :max-tries 100000)
+          (is-true mined)
+          (is (= tries (bl.ser:block-header-nonce
+                        (bl.ser:bitcoin-block-header block)))))))))
+
+(test generate-to-address-returns-the-blocks-it-actually-mined
+  "An exhausted try budget is a NORMAL RESULT in Core, not an error: GenerateBlock
+returns false, generateBlocks breaks out of its loop and returns the array it
+has (rpc/mining.cpp:142-148, 161-181), so `generatetoaddress(2, addr, 0)'
+answers []. Signalling instead also discarded the hashes of blocks earlier
+iterations had already mined AND activated — the chain moved and the reply said
+so had nothing happened.
+
+The same break covers the stop flag, which is why the interrupted call below
+keeps the block it did mine."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "gen-budget"))
+           (cs (bl:node-chain-state node))
+           (addr (bl.crypto:encode-p2pkh-address
+                  (make-array 20 :element-type '(unsigned-byte 8) :initial-element 3)
+                  :regtest)))
+      (is (equalp #() (bl.rpc:dispatch-rpc-method
+                       node "generatetoaddress" (list 2 addr 0))))
+      (is (= 0 (bl.store:current-height cs)))
+      (is (equalp #() (bl.rpc:dispatch-rpc-method
+                       node "generatetodescriptor" (list 2 "raw(51)" 0))))
+      (is (= 0 (bl.store:current-height cs)))
+      ;; Asked to stop once the first block is in, the call reports that block
+      ;; rather than losing it.
+      (let* ((bl:*interrupt-check* (lambda () (plusp (bl.store:current-height cs))))
+             (hashes (bl.rpc:dispatch-rpc-method node "generatetoaddress" (list 3 addr))))
+        (is (= 1 (length hashes)))
+        (is (= 1 (bl.store:current-height cs)))
+        (is (string= (first hashes)
+                     (bl.rpc:hash-to-hex (bl.store:best-block-hash cs))))))))
