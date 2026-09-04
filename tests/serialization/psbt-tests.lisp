@@ -51,10 +51,73 @@ field-length checks are not implemented, so we require the bulk, not all."
                              nil)
                     (error () t))
               (incf rejected)))
-          ;; ~28/41: structural + v0 field-content checks. The rest are BIP371
+          ;; 30/41: structural + v0 field-content checks. The rest are BIP371
           ;; taproot / BIP327 musig deep field-length checks we don't implement.
-          (is (>= rejected 27)
+          (is (>= rejected 30)
               "expected to reject most invalid PSBTs, got ~D/~D" rejected total)))))
+
+(defun %psbt-hand-built-bytes (&key version (prevout-index 0))
+  "A hand-built 1-in/1-out PSBT spending PREVOUT-INDEX of a previous
+transaction that has exactly ONE output, carried as the input's
+non_witness_utxo, plus (when VERSION) a PSBT_GLOBAL_VERSION record declaring
+it. The defaults produce a PSBT Core accepts."
+  (let* ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+         (anyone (coerce #(#x51)          ; OP_TRUE
+                         '(simple-array (unsigned-byte 8) (*))))
+         (prev-tx (bl.ser:make-transaction
+                   :version 1
+                   :inputs (vector (bl.ser:make-tx-in
+                                    :previous-output
+                                    (bl.ser:make-outpoint
+                                     :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                          :initial-element 0)
+                                     :index #xffffffff)
+                                    :script-sig anyone
+                                    :sequence #xffffffff))
+                   :outputs (vector (bl.ser:make-tx-out :value 100000
+                                                        :script-pubkey anyone))
+                   :lock-time 0 :witness nil))
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output
+                               (bl.ser:make-outpoint
+                                :hash (bl.ser:transaction-hash prev-tx)
+                                :index prevout-index)
+                               :script-sig empty
+                               :sequence #xffffffff))
+              :outputs (vector (bl.ser:make-tx-out :value 90000
+                                                   :script-pubkey anyone))
+              :lock-time 0 :witness nil))
+         (psbt (bl.ser:make-empty-psbt tx)))
+    (when version
+      (bl.ser:psbt-map-set (bl.ser:psbt-global psbt) bl.ser:+psbt-global-version+
+                           empty
+                           (coerce (vector version 0 0 0)
+                                   '(simple-array (unsigned-byte 8) (*)))))
+    (bl.ser:psbt-map-set (aref (bl.ser:psbt-inputs psbt) 0)
+                         bl.ser:+psbt-in-non-witness-utxo+ empty
+                         (bl.ser:serialize-transaction prev-tx))
+    (bl.ser:serialize-psbt psbt)))
+
+(defun %psbt-parse-failure (bytes)
+  "The report of the error PARSE-PSBT signals on BYTES, or NIL when it parses."
+  (handler-case (progn (bl.ser:parse-psbt bytes) nil)
+    (error (e) (princ-to-string e))))
+
+(test psbt-parser-enforces-core-global-map-checks
+  "parse-psbt refuses an unsupported PSBT version and an outpoint index past
+the end of the input's own non_witness_utxo (Core psbt.h:1322-1323 and
+:1375-1377). The unmutated PSBT parses, so the rejections are the mutations."
+  (is (null (%psbt-parse-failure (%psbt-hand-built-bytes))))
+  (let ((bad-version (%psbt-parse-failure (%psbt-hand-built-bytes :version 2)))
+        (bad-index (%psbt-parse-failure (%psbt-hand-built-bytes :prevout-index 5))))
+    (is-true (and bad-version (search "Unsupported version number" bad-version))
+             "expected Core's version message, got ~S" bad-version)
+    (is-true (and bad-index
+                  (search "Input specifies output index that does not exist"
+                          bad-index))
+             "expected Core's index message, got ~S" bad-index)))
 
 (test psbt-make-empty
   "make-empty-psbt wraps an unsigned tx and round-trips; input/output map counts

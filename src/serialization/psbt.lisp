@@ -24,6 +24,10 @@
 (defconstant +psbt-global-version+ #xfb)
 (defconstant +psbt-global-proprietary+ #xfc)
 
+(defconstant +psbt-highest-version+ 0
+  "Core PSBT_HIGHEST_VERSION (psbt.h:80): the highest PSBT_GLOBAL_VERSION this
+decoder understands. A PSBT declaring more is refused, not read as a v0.")
+
 ;; Input key types.
 (defconstant +psbt-in-non-witness-utxo+ #x00)
 (defconstant +psbt-in-witness-utxo+ #x01)
@@ -188,11 +192,19 @@ inputs would otherwise have its 0x00 input-count misread as the segwit marker."
   (let ((nwu (psbt-map-find map +psbt-in-non-witness-utxo+)))
     (when nwu
       (let* ((br (make-byte-reader-from nwu))
-             (prev (br-read-transaction br)))
+             (prev (br-read-transaction br))
+             (prevout (tx-in-previous-output tx-in)))
         (unless (br-eof-p br)
           (serialization-error "PSBT non_witness_utxo has trailing data"))
-        (unless (equalp (transaction-hash prev) (outpoint-hash (tx-in-previous-output tx-in)))
-          (serialization-error "PSBT non_witness_utxo does not match the input outpoint")))))
+        (unless (equalp (transaction-hash prev) (outpoint-hash prevout))
+          (serialization-error "PSBT non_witness_utxo does not match the input outpoint"))
+        ;; The outpoint must name an output the previous transaction actually
+        ;; has (Core psbt.h:1375-1377). Without this a PSBT can claim an index
+        ;; past the end of its own authenticated previous tx, and every
+        ;; consumer that resolves the prevout falls back to the UNAUTHENTICATED
+        ;; witness_utxo instead.
+        (unless (< (outpoint-index prevout) (length (transaction-outputs prev)))
+          (serialization-error "Input specifies output index that does not exist")))))
   (dolist (ps (psbt-map-collect map +psbt-in-partial-sig+))
     (unless (member (length (car ps)) '(33 65))
       (serialization-error "PSBT partial signature has an invalid public key")))
@@ -211,8 +223,14 @@ inputs would otherwise have its 0x00 input-count misread as the segwit marker."
            (ver (psbt-map-find global +psbt-global-version+)))
       (unless tx-bytes
         (serialization-error "PSBT is missing the global unsigned transaction"))
-      (when (and ver (/= (length ver) 4))
-        (serialization-error "PSBT global version must be 4 bytes"))
+      (when ver
+        (when (/= (length ver) 4)
+          (serialization-error "PSBT global version must be 4 bytes"))
+        ;; Core psbt.h:1322-1323: a version above PSBT_HIGHEST_VERSION is
+        ;; refused, never silently decoded with the v0 rules.
+        (when (> (br-read-u32-le (make-byte-reader-from ver))
+                 +psbt-highest-version+)
+          (serialization-error "Unsupported version number")))
       (let ((tx (%psbt-read-unsigned-tx tx-bytes)))
         ;; The global tx must be unsigned: empty scriptSigs (the legacy reader
         ;; above already rejects witness data).
