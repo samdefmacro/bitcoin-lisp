@@ -117,7 +117,20 @@ resolved network. Honors -server (enable RPC on the default port when no
           (conf-effective-listen-flags alist)
         (setf (getf plist :listen) listen-p)
         (unless listen-onion-p
-          (setf (getf plist :listen-onion) nil))))
+          (setf (getf plist :listen-onion) nil)))
+      ;; -maxconnections: Core refuses a negative value outright
+      ;; (init.cpp:1032-1036), AFTER the listen chain above has read it -- a
+      ;; -maxconnections<=0 still soft-sets -listen=0 and -dnsseed=0, which is
+      ;; how 0 stays a meaningful "no peer connections" setting. Below zero it
+      ;; is a typo or a mangled shell argument, and clamping it to 0 (which
+      ;; AUTOMATIC-INBOUND-CAPACITY does) starts a node with no inbound
+      ;; capacity, no listener and no DNS seeding, with nothing in the log
+      ;; naming the cause. Not the option table's :MIN, which carries the other
+      ;; Core wording ("Invalid value for -x=y (must be a non-negative
+      ;; integer)"); this option has an error message of its own.
+      (let ((n (getf plist :max-connections)))
+        (when (and n (minusp n))
+          (config-error "-maxconnections must be greater or equal than zero"))))
     plist))
 
 (defun apply-config-globals (merged)
@@ -138,7 +151,8 @@ applied after APPLY-OPTION-GLOBALS so each present-case row has already
 run and only the soft-set and consistency halves remain, in this order:
 the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
 -connect / -maxconnections, -proxy / -onion / -proxyrandomize,
--cjdnsreachable, and -onlynet with its clearnet privacy check."
+-cjdnsreachable, -onlynet with its clearnet privacy check, and last
+-forcednsseed against the -dnsseed every one of those may have turned off."
   (flet ((lk (k) (let ((c (assoc k merged :test #'string=))) (and c (cdr c)))))
     ;; -zmqpub<topic>=<address> [+ -zmqpub<topic>hwm]: recorded now, bound by
     ;; start-node. Nothing is loaded or opened here, so a node with no ZMQ
@@ -242,7 +256,17 @@ the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
         (cond ((not (lk "dnsseed"))
                (setf *dns-seed-enabled* nil))
               (*dns-seed-enabled*
-               (config-error "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6")))))))
+               (config-error "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6")))))
+    ;; -forcednsseed with seeding off is a contradiction Core refuses to start
+    ;; on (init.cpp:1010-1013), and it reads the EFFECTIVE -dnsseed, so it also
+    ;; fires for the soft-set forms: -connect, -maxconnections<=0
+    ;; (init.cpp:777-784) and a clearnet-free -onlynet (:833-842). Hence its
+    ;; place here, after every one of those has run -- Core's own check sits
+    ;; after all of InitParameterInteraction for the same reason. Without it
+    ;; -forcednsseed silently does nothing (its one consumer requires
+    ;; *DNS-SEED-ENABLED* too) and the operator believes seeding is forced.
+    (when (and *force-dns-seed* (not *dns-seed-enabled*))
+      (config-error "Cannot set -forcednsseed to true when setting -dnsseed to false."))))
 
 (defun config-sources (args texts settings-rows network)
   "The four settings sources, as MERGED-CONFIG-ALIST wants them: (kind . rows)

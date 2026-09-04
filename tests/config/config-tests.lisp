@@ -476,6 +476,7 @@ tests cannot leak reachability or seed state into each other."
          (bl.net:*proxy* nil)
          (bl.net:*onion-proxy* nil)
          (bl:*dns-seed-enabled* t)
+         (bl::*force-dns-seed* nil)
          (bl:*fixed-seeds-enabled* t))
      ,@body))
 
@@ -484,6 +485,18 @@ tests cannot leak reachability or seed state into each other."
   (%with-net-config-globals
     (bl::apply-config-globals (bl.cfg:parse-cli-args cli))
     bl:*dns-seed-enabled*))
+
+(defun %force-dns-seed-after (&rest cli)
+  "Value of *force-dns-seed* after applying CLI, from a clean NIL default."
+  (%with-net-config-globals
+    (bl::apply-config-globals (bl.cfg:parse-cli-args cli))
+    bl::*force-dns-seed*))
+
+(defun %config-globals-refusal (&rest cli)
+  "The message APPLY-CONFIG-GLOBALS refuses CLI with, or NIL when it accepts
+CLI."
+  (%with-net-config-globals
+    (%config-refusal (bl::apply-config-globals (bl.cfg:parse-cli-args cli)))))
 
 (test config-onlynet-clearnet-exclusion-disables-dnsseed
   "G7-03: -onlynet excluding IPv4 and IPv6 soft-sets -dnsseed=0
@@ -907,6 +920,29 @@ twice. We used to record the bind address and start deaf on it, discarding the
                  (start-node-plist
                   '("-regtest")
                   (format nil "[regtest]~%bind=127.0.0.1~%listen=0~%"))))))
+
+(test negative-maxconnections-is-an-init-error
+  "GA10 32758a48. `if (user_max_connection < 0) return
+InitError(\"-maxconnections must be greater or equal than zero\")`
+(init.cpp:1032-1036).
+
+Zero stays legal and keeps its meaning -- it soft-sets -listen=0 and
+-dnsseed=0 (init.cpp:777-784), which is how an operator turns peer connections
+off. Below zero is a typo or a mangled shell argument, and we used to clamp it:
+AUTOMATIC-INBOUND-CAPACITY takes (max 0 ...), so the node started with no
+inbound capacity, no listener and no DNS seeding, and nothing in the log said
+why."
+  (let ((message "-maxconnections must be greater or equal than zero"))
+    (is (string= message (%start-node-plist-refusal "-regtest" "-maxconnections=-1")))
+    (is (string= message (%start-node-plist-refusal "-regtest" "-maxconnections=-125"))))
+  ;; Zero and above are accepted, and 0 still means "no peer connections".
+  (is-false (%start-node-plist-refusal "-regtest" "-maxconnections=0"))
+  (is-false (%start-node-plist-refusal "-regtest" "-maxconnections=125"))
+  (let ((plist (start-node-plist '("-regtest" "-maxconnections=0"))))
+    (is (= 0 (getf plist :max-connections)))
+    (is-false (getf plist :listen)))
+  (is (= 125 (getf (start-node-plist '("-regtest" "-maxconnections=125"))
+                   :max-connections))))
 
 (test log-file-defaults-to-debug-log-in-the-datadir
   "Core writes <datadir>/debug.log unless -debuglogfile says otherwise, and its
@@ -1568,14 +1604,8 @@ become a second -addnode."
             nil)))
     (is (equal '("1.2.3.4" "5.6.7.8:1234") (getf p :seednode))))
   (is-true (bl.cfg:config-option-repeatable-p "seednode"))
-  (let ((saved bl::*force-dns-seed*))
-    (unwind-protect
-         (progn
-           (bl::apply-config-globals '(("forcednsseed" . "1")))
-           (is-true bl::*force-dns-seed*)
-           (bl::apply-config-globals '(("forcednsseed" . "0")))
-           (is-false bl::*force-dns-seed*))
-      (setf bl::*force-dns-seed* saved)))
+  (is-true (%force-dns-seed-after "-forcednsseed=1"))
+  (is-false (%force-dns-seed-after "-forcednsseed=0"))
   ;; The seed dial is gated on -connect exactly as Core's is by construction:
   ;; with -connect, ThreadOpenConnections never reaches the seed queue.
   (let ((saved-addrman bl::*use-addrman-outgoing*)
@@ -1591,21 +1621,35 @@ become a second -addnode."
            (is-true (%reached-from-start-node-p 'bl::connect-seed-nodes)))
       (setf bl::*use-addrman-outgoing* saved-addrman
             bl::*seed-nodes* saved-seeds)))
-  ;; -forcednsseed does not override -dnsseed=0: a node told not to use DNS
-  ;; must not be made to use it by a second flag.
-  (let ((saved-force bl::*force-dns-seed*)
-        (saved-dns bl:*dns-seed-enabled*))
-    (unwind-protect
-         (progn
-           (bl::apply-config-globals
-            '(("forcednsseed" . "1") ("dnsseed" . "0")))
-           (is-true bl::*force-dns-seed*)
-           (is-false bl:*dns-seed-enabled*))
-      (setf bl::*force-dns-seed* saved-force
-            bl:*dns-seed-enabled* saved-dns)))
   (dolist (name '("seednode" "forcednsseed"))
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
+
+(test forcednsseed-without-dnsseed-is-an-init-error
+  "GA10 631b90f9. Core refuses to start on the contradiction rather than
+letting -forcednsseed quietly do nothing: `if (GetBoolArg(\"-forcednsseed\") &&
+!GetBoolArg(\"-dnsseed\")) return InitError(...)` (init.cpp:1010-1013), asserted
+verbatim by p2p_dns_seeds.py:39-51.
+
+It reads the EFFECTIVE -dnsseed, so every soft-set that turns seeding off
+fires it too: -connect and -maxconnections<=0 (init.cpp:777-784) and an
+-onlynet with no clearnet (:833-842). Ours used to apply *FORCE-DNS-SEED* and
+stop there; its one consumer also requires *DNS-SEED-ENABLED*, so the operator
+who asked for forced seeding got none and was never told."
+  (let ((message "Cannot set -forcednsseed to true when setting -dnsseed to false."))
+    (is (string= message (%config-globals-refusal "-forcednsseed=1" "-dnsseed=0")))
+    (is (string= message (%config-globals-refusal "-forcednsseed=1" "-connect=1.2.3.4")))
+    (is (string= message (%config-globals-refusal "-forcednsseed=1" "-maxconnections=0")))
+    (is (string= message (%config-globals-refusal "-forcednsseed=1" "-onlynet=onion"
+                                                  "-listenonion=1"))))
+  ;; The other side of the gate: neither flag alone, nor the two agreeing, is
+  ;; refused -- so the assertions above cannot be passing on some other error.
+  (is-false (%config-globals-refusal "-forcednsseed=1"))
+  (is-false (%config-globals-refusal "-forcednsseed=1" "-dnsseed=1"))
+  (is-false (%config-globals-refusal "-dnsseed=0"))
+  (is-false (%config-globals-refusal "-connect=1.2.3.4"))
+  ;; -forcednsseed=0 never contradicts anything, whatever -dnsseed says.
+  (is-false (%config-globals-refusal "-forcednsseed=0" "-dnsseed=0")))
 
 (test maxuploadtarget-limits-what-the-node-serves
   "-maxuploadtarget (Core net.cpp:3877-3941, net_processing.cpp:2376-2383).
