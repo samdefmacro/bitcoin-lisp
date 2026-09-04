@@ -1811,14 +1811,16 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
                      bl.wallet:*wallet-confirm-target*
                      bl.wallet:*wallet-signal-rbf*
                      bl.wallet:*wallet-spend-zero-conf-change*
-                     bl.wallet:*wallet-reject-long-chains*)))
+                     bl.wallet:*wallet-reject-long-chains*
+                     bl.wallet:*wallet-cross-chain*)))
     (unwind-protect
          (progn
            (bl::apply-rpc-config-globals
             '(("mintxfee" . "0.00002") ("discardfee" . "0.0002")
               ("consolidatefeerate" . "0.0003") ("maxapsfee" . "0.0001")
               ("txconfirmtarget" . "12") ("walletrbf" . "0")
-              ("spendzeroconfchange" . "0") ("walletrejectlongchains" . "0")))
+              ("spendzeroconfchange" . "0") ("walletrejectlongchains" . "0")
+              ("walletcrosschain" . "1")))
            (is (= 2000 bl.wallet:*wallet-min-tx-fee*))
            (is (= 20000 bl.wallet:*wallet-discard-rate*))
            (is (= 30000 bl.wallet:*wallet-consolidate-feerate*))
@@ -1829,7 +1831,10 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
            ;; setting them to 0 is what proves the wiring.
            (is-false bl.wallet:*wallet-signal-rbf*)
            (is-false bl.wallet:*wallet-spend-zero-conf-change*)
-           (is-false bl.wallet:*wallet-reject-long-chains*))
+           (is-false bl.wallet:*wallet-reject-long-chains*)
+           ;; -walletcrosschain defaults FALSE (Core DEFAULT_WALLETCROSSCHAIN,
+           ;; wallet.h:135), so setting it to 1 is what proves ITS wiring.
+           (is-true bl.wallet:*wallet-cross-chain*))
       (setf bl.wallet:*wallet-min-tx-fee* (first saved)
             bl.wallet:*wallet-discard-rate* (second saved)
             bl.wallet:*wallet-consolidate-feerate* (third saved)
@@ -1837,14 +1842,15 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
             bl.wallet:*wallet-confirm-target* (fifth saved)
             bl.wallet:*wallet-signal-rbf* (sixth saved)
             bl.wallet:*wallet-spend-zero-conf-change* (seventh saved)
-            bl.wallet:*wallet-reject-long-chains* (eighth saved))))
+            bl.wallet:*wallet-reject-long-chains* (eighth saved)
+            bl.wallet:*wallet-cross-chain* (ninth saved))))
   ;; Malformed values are refused rather than silently leaving the default.
   (dolist (bad '((("mintxfee" . "notanumber")) (("txconfirmtarget" . "0"))
                  (("txconfirmtarget" . "x")) (("maxapsfee" . "zz"))))
     (signals error (bl::apply-rpc-config-globals bad)))
   (dolist (name '("mintxfee" "discardfee" "consolidatefeerate" "maxapsfee"
                   "txconfirmtarget" "walletrbf" "spendzeroconfchange"
-                  "walletrejectlongchains"))
+                  "walletrejectlongchains" "walletcrosschain"))
     (is-true (bl:known-config-option-p name) "~A unknown" name)
     (is-false (bl.cfg:core-only-option-p name) "~A still ignored" name)))
 

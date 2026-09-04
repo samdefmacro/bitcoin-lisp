@@ -23,6 +23,7 @@ through the lower packages; the node reaches it only through these exports.")
   (:export
    #:*wallet-confirm-target*
    #:*wallet-consolidate-feerate*
+   #:*wallet-cross-chain*
    #:*wallet-directory*
    #:*wallet-discard-rate*
    #:*wallet-max-aps-fee*
