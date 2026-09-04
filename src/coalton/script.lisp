@@ -1957,14 +1957,19 @@ else. Wiring either of them here rejects scripts Core accepts."
        ;; m-of-n multisig verification
        ;; Stack: ... dummy sig1..sigM M pubkey1..pubkeyN N
        ;; Pops all, pushes true/false
-       ;; Note: CHECKMULTISIG adds pubkey_count to op count for limit checking
+       ;; Note: CHECKMULTISIG charges pubkey_count against the op-count budget
+       ;; INSIDE do-checkmultisig-stack-op, the instant the count is read and
+       ;; before any signature is verified (Core interpreter.cpp:1119-1121);
+       ;; status 7 is that overrun.
        ;; BIP 342: Disabled in Tapscript context
        (let ((is-tapscript (lisp Boolean ()
                              (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
                                          "TAPSCRIPT"))))
          (if is-tapscript
              (ScriptErr SE-TapscriptCheckmultisig)
-             (let ((result (lisp (Tuple3 UFix ScriptStack UFix) (ctx)
+             (let ((spent (context-op-count ctx))
+                   (budget +max-ops-per-script+)
+                   (result (lisp (Tuple3 UFix ScriptStack UFix) (ctx spent budget)
                        (cl:let* ((stack (context-main-stack ctx))
                                  (script (context-script ctx))
                                  (codesep-pos (context-codesep-pos ctx))
@@ -1973,7 +1978,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                                  (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                                  (fn (cl:fdefinition (cl:intern "DO-CHECKMULTISIG-STACK-OP" "BITCOIN-LISP.COALTON.INTEROP"))))
                          (cl:multiple-value-bind (status new-stack pubkey-count)
-                             (cl:funcall fn stack subscript)
+                             (cl:funcall fn stack subscript spent budget)
                            (cl:case status
                              (:ok (Tuple3 0 new-stack pubkey-count))        ; success
                              (:fail (Tuple3 1 new-stack pubkey-count))      ; verify failed, push false
@@ -1981,38 +1986,36 @@ else. Wiring either of them here rejects scripts Core accepts."
                              (:underflow (Tuple3 3 stack pubkey-count))     ; stack underflow
                              (:pubkey-count (Tuple3 4 stack 0))  ; invalid pubkey count
                              (:sig-count (Tuple3 5 stack pubkey-count))     ; invalid sig count
+                             (:op-count (Tuple3 7 stack pubkey-count))      ; key count busts MAX_OPS_PER_SCRIPT
                              (cl:otherwise (Tuple3 6 stack 0)))))))) ; unknown error
-         (match result
-           ((Tuple3 0 new-stack n-pubkeys)
-            ;; Add pubkey count to op count and check limit
-            (let ((new-op-count (+ (context-op-count ctx) n-pubkeys)))
-              (if (> new-op-count +max-ops-per-script+)
-                  (ScriptErr SE-TooManyOps)
-                  (ScriptOk (context-with-op-count new-op-count
-                              (context-with-main-stack new-stack ctx))))))
-           ((Tuple3 1 new-stack n-pubkeys)
-            ;; Add pubkey count to op count and check limit
-            (let ((new-op-count (+ (context-op-count ctx) n-pubkeys)))
-              (if (> new-op-count +max-ops-per-script+)
-                  (ScriptErr SE-TooManyOps)
-                  (ScriptOk (context-with-op-count new-op-count
-                              (context-with-main-stack new-stack ctx))))))
-           ((Tuple3 2 _ _) (ScriptErr SE-VerifyFailed))
-           ((Tuple3 3 _ _) (ScriptErr SE-StackUnderflow))
-           ((Tuple3 4 _ _) (ScriptErr SE-VerifyFailed))  ; invalid pubkey count
-           ((Tuple3 5 _ _) (ScriptErr SE-VerifyFailed))  ; invalid sig count
-           (_ (ScriptErr SE-UnknownOpcode)))))))
+             (match result
+               ((Tuple3 0 new-stack n-pubkeys)
+                (ScriptOk (context-with-op-count (+ spent n-pubkeys)
+                            (context-with-main-stack new-stack ctx))))
+               ((Tuple3 1 new-stack n-pubkeys)
+                (ScriptOk (context-with-op-count (+ spent n-pubkeys)
+                            (context-with-main-stack new-stack ctx))))
+               ((Tuple3 2 _ _) (ScriptErr SE-VerifyFailed))
+               ((Tuple3 3 _ _) (ScriptErr SE-StackUnderflow))
+               ((Tuple3 4 _ _) (ScriptErr SE-VerifyFailed))  ; invalid pubkey count
+               ((Tuple3 5 _ _) (ScriptErr SE-VerifyFailed))  ; invalid sig count
+               ((Tuple3 7 _ _) (ScriptErr SE-TooManyOps))
+               (_ (ScriptErr SE-UnknownOpcode)))))))
 
       ((OP-CHECKMULTISIGVERIFY)
        ;; CHECKMULTISIG then VERIFY - fail if result is false
-       ;; Note: CHECKMULTISIGVERIFY adds pubkey_count to op count for limit checking
+       ;; Note: the pubkey_count charge and its MAX_OPS_PER_SCRIPT test happen
+       ;; inside do-checkmultisig-stack-op, before any verification, exactly as
+       ;; for OP_CHECKMULTISIG above; status 7 is that overrun.
        ;; BIP 342: Disabled in Tapscript context
        (let ((is-tapscript (lisp Boolean ()
                              (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
                                          "TAPSCRIPT"))))
          (if is-tapscript
              (ScriptErr SE-TapscriptCheckmultisig)
-             (let ((result (lisp (Tuple3 UFix ScriptStack UFix) (ctx)
+             (let ((spent (context-op-count ctx))
+                   (budget +max-ops-per-script+)
+                   (result (lisp (Tuple3 UFix ScriptStack UFix) (ctx spent budget)
                        (cl:let* ((stack (context-main-stack ctx))
                                  (script (context-script ctx))
                                  (codesep-pos (context-codesep-pos ctx))
@@ -2021,7 +2024,7 @@ else. Wiring either of them here rejects scripts Core accepts."
                                  (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                                  (fn (cl:fdefinition (cl:intern "DO-CHECKMULTISIG-STACK-OP" "BITCOIN-LISP.COALTON.INTEROP"))))
                          (cl:multiple-value-bind (status new-stack pubkey-count)
-                             (cl:funcall fn stack subscript)
+                             (cl:funcall fn stack subscript spent budget)
                            (cl:case status
                              (:ok (Tuple3 0 new-stack pubkey-count))
                              (:fail (Tuple3 1 new-stack pubkey-count))
@@ -2029,25 +2032,23 @@ else. Wiring either of them here rejects scripts Core accepts."
                              (:underflow (Tuple3 3 stack pubkey-count))
                              (:pubkey-count (Tuple3 4 stack 0))
                              (:sig-count (Tuple3 5 stack pubkey-count))
+                             (:op-count (Tuple3 7 stack pubkey-count))
                              (cl:otherwise (Tuple3 6 stack 0))))))))
-         (match result
-           ((Tuple3 0 new-stack n-pubkeys)
-            ;; Add pubkey count to op count and check limit
-            (let ((new-op-count (+ (context-op-count ctx) n-pubkeys)))
-              (if (> new-op-count +max-ops-per-script+)
-                  (ScriptErr SE-TooManyOps)
-                  ;; Success - pop the true value that was pushed and continue
-                  (match (stack-pop new-stack)
-                    ((None) (ScriptErr SE-StackUnderflow))
-                    ((Some (Tuple _ final-stack))
-                     (ScriptOk (context-with-op-count new-op-count
-                                 (context-with-main-stack final-stack ctx))))))))
-           ((Tuple3 1 _ _) (ScriptErr SE-VerifyFailed))  ; multisig failed
-           ((Tuple3 2 _ _) (ScriptErr SE-VerifyFailed))  ; STRICTENC/NULLDUMMY error
-           ((Tuple3 3 _ _) (ScriptErr SE-StackUnderflow))
-           ((Tuple3 4 _ _) (ScriptErr SE-VerifyFailed))  ; invalid pubkey count
-           ((Tuple3 5 _ _) (ScriptErr SE-VerifyFailed))  ; invalid sig count
-           (_ (ScriptErr SE-UnknownOpcode)))))))
+             (match result
+               ((Tuple3 0 new-stack n-pubkeys)
+                ;; Success - pop the true value that was pushed and continue
+                (match (stack-pop new-stack)
+                  ((None) (ScriptErr SE-StackUnderflow))
+                  ((Some (Tuple _ final-stack))
+                   (ScriptOk (context-with-op-count (+ spent n-pubkeys)
+                               (context-with-main-stack final-stack ctx))))))
+               ((Tuple3 1 _ _) (ScriptErr SE-VerifyFailed))  ; multisig failed
+               ((Tuple3 2 _ _) (ScriptErr SE-VerifyFailed))  ; STRICTENC/NULLDUMMY error
+               ((Tuple3 3 _ _) (ScriptErr SE-StackUnderflow))
+               ((Tuple3 4 _ _) (ScriptErr SE-VerifyFailed))  ; invalid pubkey count
+               ((Tuple3 5 _ _) (ScriptErr SE-VerifyFailed))  ; invalid sig count
+               ((Tuple3 7 _ _) (ScriptErr SE-TooManyOps))
+               (_ (ScriptErr SE-UnknownOpcode)))))))
 
       ;; OP_CHECKSIGADD (BIP 342) - only valid in Tapscript context
       ;; Stack: sig n pubkey -> n' (n+1 if valid, n if empty sig, fail if invalid)
