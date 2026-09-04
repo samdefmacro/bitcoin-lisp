@@ -12,13 +12,15 @@
 ;;;; getdeploymentinfo to learn a deployment's bit, window or signalling count
 ;;;; got nothing from us at all.
 ;;;;
-;;;; ⚠️ SCOPE. This file computes and REPORTS state. It is deliberately not
-;;;; wired into any activation decision: get-taproot-activation-height and the
+;;;; ⚠️ SCOPE. This file computes and REPORTS state, and tells the MINER what
+;;;; to signal. It is deliberately not wired into any activation decision: the
 ;;;; buried heights in block.lisp remain the only thing that decides when a
 ;;;; rule applies to a block. Replacing those with a computed state machine
 ;;;; could change when a rule activates on a chain two live nodes are synced
 ;;;; to, and there is no reason to take that risk for a deployment that
-;;;; activated years ago.
+;;;; activated years ago. COMPUTE-BLOCK-VERSION and VERSIONBITS-GBT-STATUS are
+;;;; inside the scope line, not across it: what a template of ours signals is
+;;;; a statement about the block we are proposing, never about one we accept.
 
 (defconstant +vb-always-active+ -1
   "Core BIP9Deployment::ALWAYS_ACTIVE (consensus/params.h:73).")
@@ -273,3 +275,69 @@ which is what getdeploymentinfo gates it on."
     (:locked-in "locked_in")
     (:active "active")
     (:failed "failed")))
+
+;;;; --- What the miner and getblocktemplate read (versionbits.cpp:228-286) ---
+
+(defparameter *vb-gbt-optional-rules* '("testdummy" "taproot")
+  "The deployments whose getblocktemplate rule name carries NO `!' prefix --
+Core's VersionBitsDeploymentInfo entries with gbt_optional_rule = true
+(deploymentinfo.cpp:11-20). Both of Core's deployments are optional today.
+
+A name absent from this list is MANDATORY, which is the safe default for one
+nobody has classified: getblocktemplate then prefixes its rule with `!' and
+refuses a client that has not declared it, rather than handing out work the
+client cannot mine.")
+
+(defun vb-deployment-optional-rule-p (deployment)
+  "Core VBDeploymentInfo::gbt_optional_rule for DEPLOYMENT."
+  (and (member (vb-deployment-name deployment) *vb-gbt-optional-rules*
+               :test #'string=)
+       t))
+
+(defun vb-deployment-mask (deployment)
+  "Core ThresholdConditionChecker::Mask: the single nVersion bit DEPLOYMENT
+signals on."
+  (ash 1 (vb-deployment-bit deployment)))
+
+(defun compute-block-version (chain-state entry &optional (network bl:*network*))
+  "The nVersion a block extending ENTRY should carry -- Core
+VersionBitsCache::ComputeBlockVersion (versionbits.cpp:265-279): the
+versionbits top bits, plus the bit of every deployment that is STARTED or
+LOCKED_IN for that block.
+
+⚠️ This is the ONE place where the state machine feeds a decision rather than a
+report, and it is a decision about what WE mine, never about what we accept:
+nothing in validation reads it. Core computes the same value the same way, so a
+template of ours signals exactly what Core's does on the same chain."
+  (let ((version +vb-top-bits+))
+    (dolist (deployment (versionbits-deployments network) version)
+      (when (member (versionbits-state chain-state entry deployment)
+                    '(:started :locked-in))
+        (setf version (logior version (vb-deployment-mask deployment)))))))
+
+(defun versionbits-gbt-status (chain-state entry &optional (network bl:*network*))
+  "(values SIGNALLING LOCKED-IN ACTIVE), the deployments getblocktemplate must
+report for a block extending ENTRY -- Core VersionBitsCache::GBTStatus
+(versionbits.cpp:228-257). DEFINED and FAILED are not exposed to GBT at all.
+
+Each list is sorted by deployment name, because Core's three groups are
+std::map keyed by that name and the `rules' array it emits is therefore in
+name order, not in the order the deployments are declared."
+  (let ((signalling '()) (locked-in '()) (active '()))
+    (dolist (deployment (versionbits-deployments network))
+      (case (versionbits-state chain-state entry deployment)
+        (:started (push deployment signalling))
+        (:locked-in (push deployment locked-in))
+        (:active (push deployment active))))
+    (flet ((by-name (list)
+             (sort list #'string< :key #'vb-deployment-name)))
+      (values (by-name signalling) (by-name locked-in) (by-name active)))))
+
+(defun vb-gbt-rule-name (deployment)
+  "DEPLOYMENT's name as getblocktemplate spells it in `rules' and
+`vbavailable' -- Core gbt_rule_value (rpc/mining.cpp:605-612), which prefixes
+`!' when the rule is mandatory."
+  (let ((name (vb-deployment-name deployment)))
+    (if (vb-deployment-optional-rule-p deployment)
+        name
+        (concatenate 'string "!" name))))

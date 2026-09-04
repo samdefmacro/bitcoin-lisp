@@ -15,6 +15,8 @@ and the regtest miner. Core node/miner.cpp. src/mining/.")
    #:assemble-block-template
    #:next-block-required-bits
    #:next-block-mintime
+   #:next-block-version
+   #:*block-version-override*
    #:build-witness-commitment-script
    #:*last-block-template*
    #:*block-min-tx-fee-rate*

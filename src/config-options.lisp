@@ -265,6 +265,11 @@
              (config-error "Specified -blockreservedweight (~D) is lower than minimum safety value of (~D)"
                     w bl.mining:+minimum-block-reserved-weight+))
            (setf bl.mining:*block-reserved-weight* w)))
+;; -blockversion: override the template's computed nVersion. Core reads it
+;; with GetIntArg inside CreateNewBlock and applies it on MineBlocksOnDemand()
+;; chains only (node/miner.cpp:141-145), so the value is stored here and the
+;; regtest gate lives at the use site, as Core's does.
+(define-option "blockversion" :type :int :global bl.mining:*block-version-override*)
 ;; -maxtxfee: BTC, absolute cap on any wallet tx fee (Core init: BTC via
 ;; ParseMoney, default DEFAULT_TRANSACTION_MAXFEE = 0.1 BTC).
 (define-option "maxtxfee" :type :money :global *wallet-max-tx-fee*)
@@ -403,7 +408,7 @@
 (define-core-only-options
   "addresstype" "alertnotify" "allowignoredconf"
   "avoidpartialspends" "blockreconstructionextratxn"
-  "blocksdir" "blockversion" "capturemessages"
+  "blocksdir" "capturemessages"
   "changetype" "checkaddrman" "checkblockindex" "checkblocks" "checklevel"
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "dbbatchsize" "deprecatedrpc"

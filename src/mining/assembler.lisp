@@ -52,7 +52,16 @@ less (Bitcoin Core blockMinFeeRate / -blockmintxfee, default
 DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/kvB, node/miner.cpp:299-303).")
 
 (defconstant +versionbits-top-bits+ #x20000000
-  "Block version with the BIP9 top bits set and no deployment signaling.")
+  "Block version with the BIP9 top bits set and no deployment signaling. The
+floor COMPUTE-BLOCK-VERSION starts from, and the version of a template built
+with no chain behind it.")
+
+(defvar *block-version-override* nil
+  "Core -blockversion: the nVersion a template carries instead of the computed
+one. Core applies it on MineBlocksOnDemand() chains only -- that is
+fPowNoRetargeting, so regtest and nothing else (kernel/chainparams.cpp:580) --
+which is what keeps a forking-scenario test from being expressible on a live
+chain (node/miner.cpp:141-145).")
 
 (defvar *last-block-template* nil
   "The most recently assembled block-template (Bitcoin Core's
@@ -93,6 +102,19 @@ block so the two cannot disagree on the next block's bits."
                  (bl.store:block-index-entry-header tip))
                 bl.val:+max-timewarp+))
         mtp-floor)))
+
+(defun next-block-version (chain-state tip)
+  "The nVersion of the block extending TIP (Core CreateNewBlock,
+node/miner.cpp:140-145): the versionbits cache's ComputeBlockVersion, then
+-blockversion where Core allows it to win.
+
+Before this, every template carried the bare +versionbits-top-bits+ constant,
+so this node could not signal a BIP9 deployment at all -- not a pending soft
+fork, and not regtest's permanently-STARTED testdummy, which Core signals on
+bit 28 in every regtest template it hands out."
+  ;; -regtest only, as Core gates it on MineBlocksOnDemand().
+  (or (and (eq bl:*network* :regtest) *block-version-override*)
+      (bl.val:compute-block-version chain-state tip)))
 
 (defun next-block-required-bits (chain-state prev-entry block-time)
   "The compact difficulty bits the block after PREV-ENTRY must carry, mirroring
@@ -256,13 +278,14 @@ the per-tx ceiling."
          (curtime (max now mintime))
          (bits (if tip
                    (next-block-required-bits chain-state tip curtime)
-                   bl.store:+pow-limit-bits+)))
+                   bl.store:+pow-limit-bits+))
+         (version (next-block-version chain-state tip)))
     (multiple-value-bind (selected fees weight sigops)
         (%select-chunks mempool height mtp)
       (multiple-value-bind (commitment script) (%default-witness-commitment selected)
         (setf *last-block-template*
               (make-block-template
-               :height height :prev-hash prev-hash :bits bits
+               :height height :prev-hash prev-hash :bits bits :version version
                :curtime curtime :mintime mintime
                :transactions selected :total-fees fees :total-weight weight :total-sigops sigops
                :coinbase-value (+ (bl.val:calculate-block-subsidy height) fees)
