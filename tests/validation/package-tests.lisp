@@ -84,6 +84,69 @@ OUT-VALUE to one P2SH(OP_TRUE) output."
         (is (eq nil ok))
         (is (eq :conflict-in-package reason))))))
 
+(test package-well-formed-leaves-duplicate-inputs-to-check-transaction
+  "Core IsConsistentPackage (policy/packages.cpp:69-73) adds a transaction's
+prevouts a TRANSACTION AT A TIME, once the whole transaction has been compared
+against what came before, and says why: adding them one input at a time would
+make a transaction that spends a single outpoint twice collide with ITSELF, and
+duplicate inputs are \"a more severe, consensus error\" that CheckTransaction
+should report per-transaction as bad-txns-inputs-duplicate. Core pins the same
+behaviour in refs/bitcoin/src/test/txpackage_tests.cpp:192-201 -- alone and
+alongside a second member.
+
+Reporting it as a package conflict instead costs the caller the attribution: a
+package-level verdict names no member, where the per-transaction one does."
+  (multiple-value-bind (u m c funding-txid) (make-package-fixture)
+    (declare (ignore u m c))
+    (let* ((one-input (bl.ser:make-tx-in
+                       :previous-output (bl.ser:make-outpoint
+                                         :hash funding-txid :index 0)
+                       :script-sig (%p2sh-optrue-scriptsig)
+                       :sequence #xffffffff))
+           (self-dup (bl.ser:make-transaction
+                      :version 2
+                      :inputs (vector one-input one-input)
+                      :outputs (vector (bl.ser:make-tx-out
+                                        :value 99990000
+                                        :script-pubkey (p2sh-optrue-script-pubkey)))
+                      :lock-time 0))
+           (other (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
+                                          :initial-element 3)
+                           0 1000)))
+      (is (eq t (bl.val:package-well-formed (list self-dup))))
+      (is (eq t (bl.val:package-well-formed (list self-dup other))))
+      ;; The consensus error is still reported, by the check Core delegates it
+      ;; to -- so nothing is being let through, only re-attributed.
+      (is (eq :duplicate-inputs
+              (nth-value 1 (bl.val:validate-transaction-structure self-dup)))))))
+
+(test package-well-formed-rejects-an-empty-vin-member
+  "Core IsConsistentPackage returns false for a member with no inputs
+(policy/packages.cpp:56-62): the check reasons about inputs and there are none
+to reason about, and two such transactions are not consistent with each other
+either. IsWellFormedPackage maps that to the package-level \"conflict-in-package\"
+(:112-114)."
+  (let ((empty-vin (bl.ser:make-transaction
+                    :version 2
+                    :inputs (vector)
+                    :outputs (vector (bl.ser:make-tx-out
+                                      :value 1000
+                                      :script-pubkey (p2sh-optrue-script-pubkey)))
+                    :lock-time 0))
+        (funded (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
+                                        :initial-element 4)
+                         0 1000)))
+    (multiple-value-bind (ok reason) (bl.val:package-well-formed (list empty-vin))
+      (is (eq nil ok))
+      (is (eq :conflict-in-package reason)))
+    (multiple-value-bind (ok reason)
+        (bl.val:package-well-formed (list funded empty-vin))
+      (is (eq nil ok))
+      (is (eq :conflict-in-package reason)))
+    ;; Control: the funded member alone is well-formed, so the rejections above
+    ;; are about the empty vin and not about the fixture.
+    (is (eq t (bl.val:package-well-formed (list funded))))))
+
 (test package-child-with-parents-tree-accepts-valid
   (multiple-value-bind (u m c funding-txid) (make-package-fixture)
     (declare (ignore u m c))

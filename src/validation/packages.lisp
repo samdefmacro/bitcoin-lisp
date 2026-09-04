@@ -92,7 +92,8 @@ fields Bitcoin Core's submitpackage reports per wtxid."
   "Mirror Bitcoin Core IsWellFormedPackage. PACKAGE is a list of transactions.
 Returns (values ok-p reason): count within bounds, total weight within bounds,
 no duplicate txids, topologically sorted (no tx spends an output of a tx that
-appears later), and no two txs spend the same prevout."
+appears later), no member with an empty vin, and no two txs spend the same
+prevout."
   (let ((n (length package)))
     (cond
       ((zerop n) (values nil :package-empty))
@@ -125,15 +126,31 @@ appears later), and no two txs spend the same prevout."
                             later)
                (return-from package-well-formed (values nil :package-not-sorted))))
            (remhash (bl.ser:transaction-hash tx) later)))
-       ;; No two txs spend the same prevout.
+       ;; No two txs spend the same prevout — Core IsConsistentPackage
+       ;; (policy/packages.cpp:52-74). Two rules, both of them exact:
+       ;;
+       ;;  * An empty vin makes the package inconsistent (:56-62). The question
+       ;;    this check asks is about inputs and there are none to ask it of,
+       ;;    and two such transactions are not consistent with each other.
+       ;;  * The prevouts of a transaction are added a TRANSACTION AT A TIME,
+       ;;    once the whole transaction has been checked against what came
+       ;;    before (:69-73). Adding them one input at a time would make a
+       ;;    transaction that spends a single outpoint twice collide with
+       ;;    ITSELF, and Core says why that is wrong: duplicate inputs are "a
+       ;;    more severe, consensus error", to be reported per-transaction by
+       ;;    CheckTransaction as bad-txns-inputs-duplicate rather than as a
+       ;;    package-wide verdict with no per-member attribution.
        (let ((spent (make-hash-table :test 'equalp)))
          (dolist (tx package)
-           (bl.ser:dovector (in (bl.ser:transaction-inputs tx))
-             (let* ((p (bl.ser:tx-in-previous-output in))
-                    (key (cons (bl.ser:outpoint-hash p)
-                               (bl.ser:outpoint-index p))))
-               (when (gethash key spent)
-                 (return-from package-well-formed (values nil :conflict-in-package)))
+           (let ((keys (map 'list (lambda (in)
+                                    (let ((p (bl.ser:tx-in-previous-output in)))
+                                      (cons (bl.ser:outpoint-hash p)
+                                            (bl.ser:outpoint-index p))))
+                            (bl.ser:transaction-inputs tx))))
+             (when (or (null keys)
+                       (some (lambda (key) (gethash key spent)) keys))
+               (return-from package-well-formed (values nil :conflict-in-package)))
+             (dolist (key keys)
                (setf (gethash key spent) t)))))
        (values t nil)))))
 
