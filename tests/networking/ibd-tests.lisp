@@ -1979,6 +1979,24 @@ wtxidrelay negotiated the state survives."
       (bl.net::%verack-finalize-recon peer)
       (is-true (bl.net::peer-recon-registered peer)))))
 
+(defun %post-verack-delivery (peer command payload)
+  "Deliver COMMAND to PEER through the shipped dispatcher; return (VALUES
+handled-p net-log-text). Core's functional tests grep debug.log for these
+lines -- p2p_addrv2_relay.py:81 for the whole sendaddrv2 line,
+p2p_sendtxrcncl.py:217 for the sendtxrcncl prefix -- so the wording is
+behaviour and gets asserted, not just the disconnect."
+  (let ((out (make-string-output-stream))
+        (was-on (bl.log:log-category-enabled-p "net")))
+    (unwind-protect
+         (let ((bl.log:*log-stream* out))
+           (bl.log:enable-log-category "net")
+           ;; VALUES is left-to-right, so the message is handled before the
+           ;; stream is drained.
+           (values (bl.net:handle-message
+                    peer command payload (bl.ctx:make-node-context))
+                   (get-output-stream-string out)))
+      (unless was-on (bl.log:disable-log-category "net")))))
+
 (test sendtxrcncl-post-verack-disconnects
   "Post-verack sendtxrcncl via handle-message is a protocol violation:
 disconnect when -txreconciliation is on (net_processing.cpp:3969-3973);
@@ -1988,9 +2006,40 @@ ignored when it is off (:3964-3967)."
     (is-true (bl.net:handle-message peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) (bl.ctx:make-node-context)))
     (is (eq :ready (bl.net:peer-state peer))))
   (let ((bl:*tx-reconciliation* t)
-        (peer (bl.net:make-peer :state :ready)))
-    (is-true (bl.net:handle-message peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) (bl.ctx:make-node-context)))
-    (is (eq :disconnected (bl.net:peer-state peer)))))
+        (peer (bl.net:make-peer :state :ready :id 3)))
+    (multiple-value-bind (handled log)
+        (%post-verack-delivery peer "sendtxrcncl" (%sendtxrcncl-payload 1 2))
+      (is-true handled)
+      (is (eq :disconnected (bl.net:peer-state peer)))
+      (is-true (search "sendtxrcncl received after verack, disconnecting peer=3" log)
+               "sendtxrcncl disconnect line, logged: ~S" log))))
+
+(test feature-negotiation-after-verack-disconnects
+  "BIP155 (sendaddrv2) and BIP339 (wtxidrelay) negotiate strictly between
+VERSION and VERACK, and Core drops a peer that sends either afterwards
+(net_processing.cpp:3928-3933 and :3950-3955). Our negotiation window is
+%await-verack, which handles both inline, so reaching HANDLE-MESSAGE at all
+IS the violation -- these two were inert no-ops returning T, which let a peer
+spam them post-handshake at zero cost. The flag each message negotiates must
+stay untouched on the way out, and the log line is p2p_addrv2_relay.py's
+oracle verbatim."
+  (let ((empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (dolist (command '("sendaddrv2" "wtxidrelay"))
+      (let ((peer (bl.net:make-peer :state :ready :id 0)))
+        (multiple-value-bind (handled log)
+            (%post-verack-delivery peer command empty)
+          (is-true handled "~A must still dispatch as a handled message" command)
+          (is (eq :disconnected (bl.net:peer-state peer))
+              "~A after verack must disconnect the peer, state: ~S"
+              command (bl.net:peer-state peer))
+          (is-true (search (format nil "~A received after verack, disconnecting peer=0"
+                                   command)
+                           log)
+                   "~A disconnect line, logged: ~S" command log))
+        ;; Neither message may flip the relay mode it negotiates: Core returns
+        ;; before touching m_wants_addrv2 / m_wtxid_relay.
+        (is-false (bl.net:peer-wants-addrv2 peer))
+        (is-false (bl.net:peer-wtxid-relay peer))))))
 
 (test txreconciliation-config-flag-wiring
   "-txreconciliation maps to start-node's :tx-reconciliation keyword like the
