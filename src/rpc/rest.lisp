@@ -537,7 +537,22 @@ each a list of the coins that transaction's inputs spent."
 
 (defun rest-handle (node uri)
   "Route a /rest/... URI (script-name, query already stripped by Hunchentoot)
-to its handler. Returns the response body; sets status/content-type."
+to its handler. Returns the response body; sets status/content-type.
+
+Warmup is checked FIRST, for every endpoint, and answers Core's HTTP 503
+\"Service temporarily unavailable: <status>\" (CheckWarmup, rest.cpp:170-176).
+Core writes `if (!CheckWarmup(req)) return false;` at the head of each of its
+eleven handlers; one gate on the single dispatch point is the same rule with
+no handler left to forget it in, and it is the REST twin of the -28
+DISPATCH-RPC-METHOD answers on the JSON-RPC path. The REST surface is
+installed by the same START-RPC-SERVER call that enters warmup, long before
+the mempool replay and the index catch-ups, so without this a client polling
+/rest/chaininfo.json across a restart was served 200 with content computed
+against a chainstate that was not consistent yet."
+  (let ((warmup *rpc-warmup-status*))
+    (when warmup
+      (return-from rest-handle
+        (%rest-error 503 (format nil "Service temporarily unavailable: ~A" warmup)))))
   (let ((rest (cond ((alexandria:starts-with-subseq "/rest/" uri) (subseq uri 6))
                     (t (return-from rest-handle (%rest-error 400 "Not a /rest/ path"))))))
     (flet ((after (prefix) (subseq rest (length prefix))))

@@ -151,3 +151,24 @@ them; SETTINGS-ROWS is a settings.json source (BL:SETTINGS-CONFIG-ROWS).
 Five test files ask this question, which is why it is a fixture rather than
 fifty-four reaches into the same internal."
   (bl::args->start-node-plist args conf-text settings-rows))
+
+;;;; The REST interface
+
+(defun rest-request (node uri)
+  "Drive one /rest/ URI through the REST router (Core's rest.cpp dispatch) and
+return (values body status content-type).
+
+Outside a real HTTP request nothing has bound the reply object the handlers
+write their status and content type onto, so this binds one; a caller that
+already bound its own keeps it, which is what lets a test make several
+requests and go on reading HUNCHENTOOT:RETURN-CODE* itself.
+
+Two test files ask this question, which is why it is a fixture rather than a
+reach into the router from each of them."
+  (let ((hunchentoot:*reply*
+          (if (boundp 'hunchentoot:*reply*)
+              hunchentoot:*reply*
+              (make-instance 'hunchentoot:reply))))
+    (values (bl.rpc::rest-handle node uri)
+            (hunchentoot:return-code*)
+            (hunchentoot:content-type*))))

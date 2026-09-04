@@ -335,36 +335,65 @@ error mapping (400 bad request / 404 not found / unknown endpoint)."
            (ctype () (hunchentoot:content-type*)))
       ;; chaininfo.json -> 200 application/json, parseable, reuses
       ;; rpc-getblockchaininfo (so has its keys).
-      (let ((body (bl.rpc::rest-handle node "/rest/chaininfo.json")))
+      (let ((body (rest-request node "/rest/chaininfo.json")))
         (is (= 200 (status)))
         (is (string= "application/json" (ctype)))
         (let ((parsed (yason:parse body)))
           (is (hash-table-p parsed))
           (is (integerp (gethash "blocks" parsed)))))
       ;; mempool/info.json -> 200 json
-      (is (= 200 (progn (bl.rpc::rest-handle node "/rest/mempool/info.json")
+      (is (= 200 (progn (rest-request node "/rest/mempool/info.json")
                         (status))))
       ;; chaininfo only supports .json -> unknown format is Core's 404
       ;; "output format not found"
-      (bl.rpc::rest-handle node "/rest/chaininfo.hex")
+      (rest-request node "/rest/chaininfo.hex")
       (is (= 404 (status)))
       ;; malformed block hash -> 400
-      (bl.rpc::rest-handle node "/rest/block/nothex.json")
+      (rest-request node "/rest/block/nothex.json")
       (is (= 400 (status)))
       ;; well-formed but absent block -> 404
-      (bl.rpc::rest-handle
+      (rest-request
        node (format nil "/rest/block/~A.json" (make-string 64 :initial-element #\a)))
       (is (= 404 (status)))
       ;; absent tx -> 404
-      (bl.rpc::rest-handle
+      (rest-request
        node (format nil "/rest/tx/~A.hex" (make-string 64 :initial-element #\b)))
       (is (= 404 (status)))
       ;; unknown endpoint -> 404
-      (bl.rpc::rest-handle node "/rest/frobnicate.json")
+      (rest-request node "/rest/frobnicate.json")
       (is (= 404 (status)))
       ;; getutxos with a bad outpoint -> 400
-      (bl.rpc::rest-handle node "/rest/getutxos/notanoutpoint.json")
+      (rest-request node "/rest/getutxos/notanoutpoint.json")
       (is (= 400 (status))))))
+
+(test rest-refuses-every-endpoint-during-warmup
+  "While the node is still starting, /rest/ answers Core's HTTP 503 \"Service
+temporarily unavailable: <status>\" — CheckWarmup (rest.cpp:170-176), which
+Core calls at the head of all eleven of its handlers, and the REST twin of the
+-28 the JSON-RPC path answers. The REST surface is installed by the same
+start-rpc-server call that enters warmup, so before this gate a client polling
+across a restart was answered 200 with content computed against a chainstate
+the mempool replay and the index catch-ups had not finished with."
+  (let ((node (make-test-node)))
+    (unwind-protect
+         (progn
+           ;; CONTROL: these are the answers the gate has to change, so a 503
+           ;; below cannot come from the endpoints being broken anyway.
+           (bl.rpc:finish-rpc-warmup)
+           (is (= 200 (nth-value 1 (rest-request node "/rest/chaininfo.json"))))
+           (is (= 404 (nth-value 1 (rest-request node "/rest/frobnicate.json"))))
+           (bl.rpc:set-rpc-warmup-status "Replaying mempool...")
+           ;; An unknown endpoint is in the list on purpose: the gate precedes
+           ;; routing, so warmup answers before a 404 can.
+           (dolist (uri '("/rest/chaininfo.json" "/rest/mempool/info.json"
+                          "/rest/health" "/rest/frobnicate.json"))
+             (multiple-value-bind (body status content-type) (rest-request node uri)
+               (is (= 503 status) "~A answered ~D during warmup" uri status)
+               (is (string= "text/plain" content-type) "~A: ~S" uri content-type)
+               (is-true (search "Service temporarily unavailable: Replaying mempool..."
+                                body)
+                        "~A body: ~S" uri body))))
+      (bl.rpc:finish-rpc-warmup))))
 
 (test rest-getutxos-reports-absence
   "BIP64 getutxos: an unknown outpoint yields an empty utxos array and a
@@ -372,8 +401,7 @@ error mapping (400 bad request / 404 not found / unknown endpoint)."
   (let ((node (make-test-node))
         (hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
     (let* ((txid (make-string 64 :initial-element #\c))
-           (body (bl.rpc::rest-handle
-                  node (format nil "/rest/getutxos/~A-0.json" txid)))
+           (body (rest-request node (format nil "/rest/getutxos/~A-0.json" txid)))
            (parsed (yason:parse body)))
       (is (= 200 (hunchentoot:return-code*)))
       (is (integerp (gethash "chainHeight" parsed)))
@@ -3202,7 +3230,7 @@ answer that is not the unknown-endpoint 404."
   (let ((node (make-test-node)))
     (flet ((routed-p (uri)
              (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
-               (let ((body (handler-case (bl.rpc::rest-handle node uri)
+               (let ((body (handler-case (rest-request node uri)
                              (error () :signalled))))
                  (not (and (stringp body)
                            (search "Unknown REST endpoint" body)))))))
@@ -3232,8 +3260,7 @@ by the blockfilter handler, which then reads the filter type as
     ;; A blockfilterheaders URI must not reach the blockfilter handler's
     ;; \"expected /rest/blockfilter/<filtertype>/<blockhash>\" complaint.
     (let ((body (handler-case
-                    (bl.rpc::rest-handle
-                     node "/rest/blockfilterheaders/basic/notahash.json")
+                    (rest-request node "/rest/blockfilterheaders/basic/notahash.json")
                   (error () ""))))
       (is-false (search "Expected /rest/blockfilter/" body)
                 "blockfilterheaders was routed to the blockfilter handler"))))
@@ -3244,7 +3271,7 @@ serving something wrong or signalling out of the handler."
   (let ((node (make-test-node)))
     (flet ((body-of (uri)
              (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
-               (handler-case (bl.rpc::rest-handle node uri)
+               (handler-case (rest-request node uri)
                  (error () :signalled)))))
       ;; A bad hash is a 400, not a crash.
       (dolist (uri '("/rest/spenttxouts/nothex.json"
@@ -3412,7 +3439,7 @@ shorter route would swallow every blockpart request and try to read
                       (progn
                         (setf (symbol-function 'hunchentoot:get-parameter)
                               (lambda (name) (cdr (assoc name params :test #'string=))))
-                        (handler-case (bl.rpc::rest-handle node uri)
+                        (handler-case (rest-request node uri)
                           (error () :signalled)))
                    (setf (symbol-function 'hunchentoot:get-parameter) original))))))
       ;; Routed at all — an unrouted URI answers "Unknown REST endpoint".
@@ -5980,8 +6007,7 @@ structural."
       (is-false (bl.store:entry-on-active-chain-p
                  cs (bl.store:get-block-index-entry cs fork-hash)))
       (flet ((rest-get (hex ext)
-               (bl.rpc::rest-handle
-                node (format nil "/rest/headers/~A.~A" hex ext))))
+               (rest-request node (format nil "/rest/headers/~A.~A" hex ext))))
         (%with-rest-count ("3")
           ;; Fork start: empty, in every representation. Before the fix this
           ;; was [fork@1, active@2] — two headers that are not a chain.

@@ -421,7 +421,7 @@ height/value/scriptPubKey (Core interface_rest.py expectations)."
   (multiple-value-bind (node txid-hex spk) (wave10-getutxos-node)
     (let* ((hunchentoot:*reply* (make-instance 'hunchentoot:reply))
            (miss (make-string 64 :initial-element #\e))
-           (body (bl.rpc::rest-handle
+           (body (rest-request
                   node (format nil "/rest/getutxos/~A-0/~A-1.json" txid-hex miss)))
            (parsed (yason:parse body)))
       (is (= 200 (hunchentoot:return-code*)))
@@ -442,8 +442,7 @@ CompactSize(n) | per coin u32 dummy 0, u32 LE height, i64 LE value,
 CompactSize+spk (Core rest.cpp:56-68,1034-1043)."
   (multiple-value-bind (node txid-hex spk) (wave10-getutxos-node)
     (let* ((hunchentoot:*reply* (make-instance 'hunchentoot:reply))
-           (bytes (bl.rpc::rest-handle
-                   node (format nil "/rest/getutxos/~A-0.bin" txid-hex))))
+           (bytes (rest-request node (format nil "/rest/getutxos/~A-0.bin" txid-hex))))
       (is (= 200 (hunchentoot:return-code*)))
       (is (typep bytes '(vector (unsigned-byte 8))))
       (is (= (+ 4 32 2 1 (+ 4 4 8 1 (length spk))) (length bytes)))
@@ -491,21 +490,21 @@ checkmempool view at MEMPOOL_HEIGHT (Core rest.cpp CCoinsViewMemPool)."
                    mempool (bl.ser:transaction-hash spender)
                    (make-mempool-entry-for-tx spender))))
       ;; Plain view: funding coin still there.
-      (let ((parsed (yason:parse (bl.rpc::rest-handle
+      (let ((parsed (yason:parse (rest-request
                                   node (format nil "/rest/getutxos/~A-0.json" txid-hex)))))
         (is (string= "1" (gethash "bitmap" parsed))))
       ;; checkmempool: hidden.
-      (let ((parsed (yason:parse (bl.rpc::rest-handle
+      (let ((parsed (yason:parse (rest-request
                                   node (format nil "/rest/getutxos/checkmempool/~A-0.json"
-                                               txid-hex)))))
+                                        txid-hex)))))
         (is (string= "0" (gethash "bitmap" parsed))))
       ;; Mempool-created coin: only via checkmempool, at MEMPOOL_HEIGHT.
-      (let ((parsed (yason:parse (bl.rpc::rest-handle
+      (let ((parsed (yason:parse (rest-request
                                   node (format nil "/rest/getutxos/~A-0.json" spender-hex)))))
         (is (string= "0" (gethash "bitmap" parsed))))
-      (let* ((parsed (yason:parse (bl.rpc::rest-handle
+      (let* ((parsed (yason:parse (rest-request
                                    node (format nil "/rest/getutxos/checkmempool/~A-0.json"
-                                                spender-hex))))
+                                         spender-hex))))
              (utxos (gethash "utxos" parsed)))
         (is (string= "1" (gethash "bitmap" parsed)))
         (is (= 1 (length utxos)))
@@ -521,26 +520,24 @@ unknown output format (Core rest.cpp:919-947)."
       ;; 16 outpoints -> 400 max exceeded
       (let ((body (with-output-to-string (s)
                     (dotimes (i 16) (format s "/~A-~D" txid i)))))
-        (let ((resp (bl.rpc::rest-handle
-                     node (format nil "/rest/getutxos~A.json" body))))
+        (let ((resp (rest-request node (format nil "/rest/getutxos~A.json" body))))
           (is (= 400 (status)))
           (is (search "max outpoints exceeded" resp))))
       ;; malformed vout (sign / junk / missing)
-      (bl.rpc::rest-handle node (format nil "/rest/getutxos/~A-+1.json" txid))
+      (rest-request node (format nil "/rest/getutxos/~A-+1.json" txid))
       (is (= 400 (status)))
-      (bl.rpc::rest-handle node (format nil "/rest/getutxos/~A-1x.json" txid))
+      (rest-request node (format nil "/rest/getutxos/~A-1x.json" txid))
       (is (= 400 (status)))
-      (bl.rpc::rest-handle node (format nil "/rest/getutxos/~A-.json" txid))
+      (rest-request node (format nil "/rest/getutxos/~A-.json" txid))
       (is (= 400 (status)))
       ;; short txid
-      (bl.rpc::rest-handle node "/rest/getutxos/abcd-0.json")
+      (rest-request node "/rest/getutxos/abcd-0.json")
       (is (= 400 (status)))
       ;; empty request
-      (bl.rpc::rest-handle node "/rest/getutxos/.json")
+      (rest-request node "/rest/getutxos/.json")
       (is (= 400 (status)))
       ;; unknown format -> Core's 404 "output format not found"
-      (let ((resp (bl.rpc::rest-handle
-                   node (format nil "/rest/getutxos/~A-0.xml" txid))))
+      (let ((resp (rest-request node (format nil "/rest/getutxos/~A-0.xml" txid))))
         (is (= 404 (status)))
         (is (search "output format not found" resp))))))
 

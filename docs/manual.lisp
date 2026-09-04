@@ -775,7 +775,9 @@
   Invariants: every method is a DEFINE-RPC form; the node lock is the
   OUTERMOST lock, so a handler that mutates node state holds it for the
   whole operation and a long-polling handler never holds it across its
-  wait. Error codes and messages are Core's.
+  wait. Error codes and messages are Core's. REST checks RPC warmup at
+  its single dispatch point (Core calls CheckWarmup at the head of every
+  handler) and answers HTTP 503 until the node is ready.
 
   Trap: the recurring failure shape in this tree is correct code with
   the wrong or missing caller -- an index built but never maintained, a
