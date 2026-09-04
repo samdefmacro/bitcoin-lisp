@@ -1240,8 +1240,7 @@ function of (format-string &rest args) that must signal."
                     (when (or (> height base-height) (>= vout #xFFFFFFFF))
                       (funcall fail "Bad snapshot data after deserializing ~D coins"
                                processed))
-                    (when (or (minusp value)
-                              (> value bl.val:+max-money+))
+                    (unless (bl.val:money-range-p value)
                       (funcall fail "Bad snapshot data after deserializing ~D coins - bad tx out value"
                                processed))
                     (bl.store:coins-view-batch-put

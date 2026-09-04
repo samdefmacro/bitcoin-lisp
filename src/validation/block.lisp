@@ -1843,7 +1843,21 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
                    (unless valid
                      (return-from %contextual-check-block (values nil error nil)))
                    ;; fee is now a Satoshi type, use typed addition
-                   (setf total-fees (bl.interop:satoshi+ total-fees fee)))
+                   (setf total-fees (bl.interop:satoshi+ total-fees fee))
+                   ;; Core ConnectBlock (validation.cpp:2539-2544) range-checks
+                   ;; the RUNNING sum after every transaction, not once at the
+                   ;; end: "bad-txns-accumulated-fee-outofrange". The sum feeds
+                   ;; MAX-COINBASE-VALUE below, so an out-of-range total would
+                   ;; raise the cap on what the coinbase may pay itself. Our
+                   ;; Satoshi cannot overflow, so this can only fire on a coins
+                   ;; view that already holds an out-of-range value — which is
+                   ;; why the keyword is deliberately NOT in
+                   ;; *DETERMINISTIC-INVALID-BLOCK-ERRORS*: the fault is then in
+                   ;; our chainstate, not in the block, and marking the block
+                   ;; permanently invalid would poison a recoverable one.
+                   (unless (money-range-p (bl.interop:unwrap-satoshi total-fees))
+                     (return-from %contextual-check-block
+                       (values nil :accumulated-fee-out-of-range nil))))
                  ;; Accumulate sigops cost and check limit (early exit for DoS protection)
                  (incf total-sigops-cost
                        (count-transaction-sigops-cost tx #'get-spent-script

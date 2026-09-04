@@ -168,6 +168,7 @@ can. src/validation/.")
    ;; Constants
    #:+coinbase-maturity+
    #:+max-money+
+   #:money-range-p
    ;; Coinbase / subsidy (for the block assembler)
    #:calculate-block-subsidy
    #:encode-bip34-height)
