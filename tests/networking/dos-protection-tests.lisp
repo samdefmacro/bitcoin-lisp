@@ -538,6 +538,11 @@ a dial target iff a Tor proxy is configured."
       (bl::load-anchors node)
       (is (null bl::*pending-anchor-addresses*)))))
 
+(defun %evict-one (node)
+  "Drive the shipped inbound eviction (Core AttemptToEvictConnection); T if a
+peer was dropped. The one reach into it in this file."
+  (bl::evict-least-valuable-inbound node))
+
 (defun %evict-peer (addr &key (ping 1000) (connect-time 5000)
                               (min-ping nil) (tx-time 0) (block-time 0)
                               (relay t))
@@ -594,7 +599,7 @@ which only passed because our k was half Core's."
       ;; compares only the key, and equal keys fall to std::sort's unspecified
       ;; order), so this is the fixture's problem to avoid, not the code's.
       (setf (bl:node-peers node) (cons victim filler))
-      (is (eq t (bl::evict-least-valuable-inbound node)))
+      (is (eq t (%evict-one node)))
       (is (not (member victim (bl:node-peers node)))
           "the newest peer in the most populous netgroup survived")))
   ;; A small inbound set is left alone entirely, because every pass protects
@@ -603,7 +608,7 @@ which only passed because our k was half Core's."
     (setf (bl:node-peers node)
           (list (%evict-peer "1.1.1.1" :ping 10 :connect-time 100)
                 (%evict-peer "2.2.2.2" :ping 20 :connect-time 200)))
-    (is (null (bl::evict-least-valuable-inbound node)))
+    (is (null (%evict-one node)))
     (is (= 2 (length (bl:node-peers node))))))
 
 (test eviction-protects-noban-peers-absolutely
@@ -624,7 +629,7 @@ peer the operator explicitly trusted was as evictable as any other."
       ;; First, for the tie-break reason in the test above — the point here is
       ;; that noban protects it even when nothing else would.
       (setf (bl:node-peers node) (cons protected filler))
-      (bl::evict-least-valuable-inbound node)
+      (%evict-one node)
       (is (member protected (bl:node-peers node))
           "a noban peer was evicted despite being the worst candidate"))))
 
@@ -640,7 +645,7 @@ idle one — and block-relay-only links are the anti-partition insurance."
                                      :block-time 999999 :relay nil))
          (filler (%evict-filler 40)))
     (setf (bl:node-peers node) (cons br filler))
-    (bl::evict-least-valuable-inbound node)
+    (%evict-one node)
     (is (member br (bl:node-peers node))
         "a block-relay-only peer that delivered a block was evicted")))
 
@@ -663,7 +668,7 @@ fixed the symptom but meant an all-onion inbound set could never make room."
          (filler (%evict-filler 40)))
     (setf (bl:node-peers node) (append onions filler))
     ;; Repeated admissions must not strip the onion peers out.
-    (dotimes (i 5) (bl::evict-least-valuable-inbound node))
+    (dotimes (i 5) (%evict-one node))
     (let ((left (count-if #'bl.net:peer-inbound-onion
                           (bl:node-peers node))))
       (is (plusp left)
@@ -678,8 +683,51 @@ fixed the symptom but meant an all-onion inbound set could never make room."
                                                 :connect-time (+ 100000 i))))
                             (setf (bl.net:peer-inbound-onion p) t)
                             p)))
-      (is (eq t (bl::evict-least-valuable-inbound only-onion))
+      (is (eq t (%evict-one only-onion))
           "an all-onion inbound set could not evict anything"))))
+
+(defun %evict-ratio-survivors (candidates)
+  "The connect-times ProtectEvictionCandidatesByRatio leaves EVICTABLE. The one
+reach into the ratio pass in this file."
+  (mapcar #'bl.net:peer-connect-time
+          (bl::%evict-protect-by-ratio candidates)))
+
+(test eviction-ratio-reserve-protects-the-longest-connected-of-each-network
+  "GA10 abae237b. Core's per-network reserve sorts with CompareNodeNetworkTime,
+whose final term is `a.m_connected > b.m_connected' (eviction.cpp:64-72), and
+EraseLastKElements protects the LAST k — so the reserved slots go to that
+network's LONGEST-connected peers. Ours compared `<', which sorts the newest
+last and therefore protected the newest: an attacker reopening fresh inbound
+connections over Tor (or from localhost, or CJDNS) took the reserved quarter of
+our inbound slots on every admission, while established peers on those same
+networks fell back into the eviction pool. Exactly the inverse of the pass's
+stated purpose, \"precludes attacks that start later\" (:105-107). The uptime
+half two lines below used `>' all along, so the two passes disagreed.
+
+The fixture is 16 candidates — 8 clearnet, 4 long-lived onion, 4 fresh onion —
+so total_protect is 8 and max_protect_by_network 4: the whole reserve goes to
+onion peers and there are twice as many as slots, which is what makes the
+direction observable. The reserve tests above assert only that SOME onion peer
+survives, so they pass either way.
+
+Hand-evaluating Core on this input: only onion has a non-zero count, so
+protect_per_network = 4; its members sort DESCENDING by m_connected, so the
+last four are 10..13, the long-lived ones. The general uptime half then
+protects clearnet 1..4, leaving exactly the list below."
+  (flet ((onion (connect-time)
+           (let ((p (%evict-peer "127.0.0.1" :connect-time connect-time)))
+             (setf (bl.net:peer-inbound-onion p) t)
+             p)))
+    (let* ((clearnet (loop for i from 1 to 8
+                           collect (%evict-peer (format nil "10.0.0.~D" i)
+                                                :connect-time i)))
+           (long-lived (loop for i from 10 to 13 collect (onion i)))
+           (fresh (loop for i from 20 to 23 collect (onion i)))
+           (evictable (%evict-ratio-survivors
+                       (append clearnet long-lived fresh))))
+      (is (equal '(5 6 7 8 20 21 22 23) evictable)
+          "the reserve must protect the LONGEST-connected onion peers (10-13) ~
+and leave the freshest (20-23) evictable; got ~S" evictable))))
 
 (test ban-lock-concurrent-stress
   "Many threads hammering the discourage/ban globals do not crash or corrupt

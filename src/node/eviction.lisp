@@ -93,6 +93,22 @@ attacker knows which groups sort first and can arrange to be outside them."
   "Per-process secret behind %EVICT-KEYED-NETGROUP; Core derives its equivalent
 from the node's own random key.")
 
+(defun %evict-newest-first (a b)
+  "Order two eviction candidates most-recently-connected FIRST — Core's
+ReverseCompareNodeTimeConnected, `a.m_connected > b.m_connected'
+(eviction.cpp:21-24), which is also the final term of CompareNodeNetworkTime
+(:71) and the tie-break of every other comparator in that file.
+
+%EVICT-ERASE-LAST-K protects the LAST K, so this order is what makes the
+protected set the LONGEST-connected peers — Core's stated point, \"protect the
+half of the remaining nodes which have been connected the longest ... and
+precludes attacks that start later\" (:105-107). BOTH ratio passes use it, and
+one function rather than two lambdas so they cannot drift apart again: the
+disadvantaged-network reserve ran with the comparison reversed, which handed
+the reserved quarter of the inbound slots to whoever had connected MOST
+recently — the exact attack the pass exists to preclude."
+  (> (bl.net:peer-connect-time a) (bl.net:peer-connect-time b)))
+
 (defun %evict-disadvantaged-network (peer)
   "Which of Core's four disadvantaged networks PEER belongs to, or NIL
 (eviction.cpp:118-119): CJDNS, I2P, localhost, onion. These \"tend to be
@@ -119,6 +135,10 @@ Protects the half of the remaining candidates connected longest, and reserves
 up to half of THAT (a quarter of the candidates) for the four disadvantaged
 networks — giving the network with the FEWEST candidates first claim on unused
 slots, so a single onion peer is not crowded out by a dozen I2P ones.
+
+Within the reserve the peers protected are that network's LONGEST-connected
+ones, the same measure as the general half; both passes go through
+%EVICT-NEWEST-FIRST, which is where the direction is stated once.
 
 This replaces an ad-hoc onion exemption that predated it here. The exemption
 worked for the case it was written for — every inbound onion peer shares the
@@ -150,9 +170,7 @@ than proportionally, so an all-onion inbound set could not make room at all."
                             (before (length remaining))
                             (after (%evict-erase-last-k
                                     remaining
-                                    (lambda (a b)
-                                      (< (bl.net:peer-connect-time a)
-                                         (bl.net:peer-connect-time b)))
+                                    #'%evict-newest-first
                                     per-network
                                     (lambda (p) (eq net (%evict-disadvantaged-network p))))))
                        (setf remaining after)
@@ -165,9 +183,7 @@ than proportionally, so an all-onion inbound set could not make room at all."
                  (unless protected-any (return)))))
     ;; Whatever is left of the half goes to the longest-connected.
     (%evict-erase-last-k remaining
-                         (lambda (a b)
-                           (> (bl.net:peer-connect-time a)
-                              (bl.net:peer-connect-time b)))
+                         #'%evict-newest-first
                          (max 0 (- total-protect num-protected)))))
 
 (defun select-inbound-peer-to-evict (inbound)
