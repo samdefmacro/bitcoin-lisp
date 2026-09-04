@@ -141,6 +141,11 @@
 (define-option "rpcauth" :collect :rpc-auth :repeatable t :sensitive t)
 (define-option "rpcallowip" :collect :rpc-allow-ip :repeatable t)
 (define-option "testactivationheight" :collect :test-activation-heights :repeatable t)
+;; -test=<option>: Core reads it with GetArgs, so it is a LIST, and every
+;; value is a separate test-only switch (common/args.cpp:743-747
+;; TEST_OPTIONS_DOC). Regtest only; validated in %INIT-PARAMETERS, which
+;; knows the network.
+(define-option "test" :collect :test-options :repeatable t)
 ;; -debug: categories; also raises the log level (see the plist assembly).
 (define-option "debug" :collect :debug-categories :repeatable t)
 (define-option "debugexclude" :collect :debug-exclude :repeatable t)
@@ -424,6 +429,6 @@
   "rpcwhitelist" "rpcwhitelistdefault"
   "rpcworkqueue" "shrinkdebugfile"
   "signer" "signetseednode"
-  "stopafterblockimport" "test" "timeout"
+  "stopafterblockimport" "timeout"
   "unsafesqlitesync" "vbparams"
   "version" "walletbroadcast" "walletcrosschain")

@@ -361,6 +361,27 @@ MAKE-CHAIN-PARAMS, replacing an earlier definition of the same name."
   "NETWORK's default RPC port (chain-params-rpc-port)."
   (chain-params-rpc-port (find-chain-params network)))
 
+(defvar *enforce-bip94-on-regtest* nil
+  "Core CChainParams::RegTestOptions::enforce_bip94, set by -test=bip94
+(chainparams.cpp:47). Regtest's enforce_BIP94 is the one consensus value here
+that is not a constant of the chain -- Core reads it off the command line while
+building the regtest parameters -- so it is a special rather than a column of
+the table, the way -testactivationheight's overrides are.")
+
+(defun enforce-bip94-p (&optional (network *network*))
+  "Is the BIP94 timewarp rule consensus on NETWORK (Core
+consensus.enforce_BIP94)? True on testnet4 (kernel/chainparams.cpp:344, where
+it also gates the block-storm mitigation) and on regtest when -test=bip94 was
+given (kernel/chainparams.cpp:579, `consensus.enforce_BIP94 = opts.enforce_bip94');
+false on mainnet, testnet3 and signet, which have no timewarp mitigation.
+
+ContextualCheckBlockHeader's own comment for the rule reads \"Testnet4 and
+regtest only\" (validation.cpp:4127)."
+  (case network
+    (:testnet4 t)
+    (:regtest *enforce-bip94-on-regtest*)
+    (t nil)))
+
 (defun chain-params-of-ext-prefix (version)
   "The chain whose BIP32 extended-key prefix (public or secret) is VERSION,
 or NIL. The test chains share one pair, so the first of them answers for all."

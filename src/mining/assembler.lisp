@@ -93,10 +93,18 @@ weight/sigops totals already include the reserved coinbase allowance."
   "Core GetMinimumTime (node/miner.cpp:36-47) for the block at HEIGHT on TIP:
 MTP+1, raised at retarget heights to TIP's actual time minus MAX_TIMEWARP (the
 BIP94 floor). Shared by the template assembler and getmininginfo's \"next\"
-block so the two cannot disagree on the next block's bits."
+block so the two cannot disagree on the next block's bits.
+
+Core takes the period as a parameter and applies the floor on EVERY network,
+whether or not BIP94 is consensus there -- \"Account for BIP94 timewarp rule on
+all networks. This makes future activation safer\" (miner.cpp:41-45) -- so the
+period must be the chain's, DifficultyAdjustmentInterval(): 144 on regtest,
+2016 elsewhere. With the flat 2016 the floor fired at heights regtest never
+retargets at, and the template offered a mintime Core would not."
   (let ((mtp-floor (1+ mtp)))
     (if (and tip
-             (zerop (mod height bl.store:+difficulty-adjustment-interval+)))
+             (zerop (mod height (bl.store:difficulty-adjustment-interval
+                                 bl:*network*))))
         (max mtp-floor
              (- (bl.ser:block-header-timestamp
                  (bl.store:block-index-entry-header tip))
@@ -267,12 +275,10 @@ the per-tx ceiling."
          ;; Header time floor (Core GetMinimumTime, miner.cpp:36-47): MTP+1,
          ;; raised at retarget heights to the previous block's ACTUAL time
          ;; minus MAX_TIMEWARP — the BIP94 timewarp rule, applied on ALL
-         ;; networks ("makes future activation safer"); testnet4 already
-         ;; enforces it in consensus, so a template without the clamp can be
-         ;; a block everyone rejects. Divergence: Core's clamp fires at
-         ;; height % DifficultyAdjustmentInterval == 0 per network; ours uses
-         ;; the fixed 2016, which matches every network except regtest
-         ;; (Core: 144), where BIP94 is off and the extra floor is moot.
+         ;; networks ("makes future activation safer") at the chain's own
+         ;; retarget period; testnet4 and regtest under -test=bip94 enforce it
+         ;; in consensus, so a template without the clamp can be a block
+         ;; everyone rejects.
          (mintime (next-block-mintime tip height mtp))
          ;; Core UpdateTime (miner.cpp:49-57): nTime = max(mintime, now).
          (curtime (max now mintime))

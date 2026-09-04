@@ -658,7 +658,12 @@
   marks its index entry :invalid unless the verdict is mutation-class,
   which Core's InvalidBlockFound also exempts -- the block hash does not
   commit to what those checks read, so marking one would let a peer poison
-  an honest header by mangling the body in transit."
+  an honest header by mangling the body in transit. Every chain-dependent
+  consensus value comes from the chain, never from a constant: the BIP94
+  timewarp rule is gated on `bl.chain:enforce-bip94-p' (testnet4, and
+  regtest under -test=bip94) and fires at the chain's own retarget period,
+  144 on regtest and 2016 elsewhere. The versionbits state machine REPORTS
+  and tells the miner what to signal; it decides no activation."
   (bitcoin-lisp.validation package)
   (bitcoin-lisp.validation:validate-transaction-structure function)
   (bitcoin-lisp.validation:validate-transaction-contextual function)
@@ -738,7 +743,9 @@
   `rules'.
 
   Traps: the reserved weight exists because the header and the
-  transaction-count varint count toward the block weight. MINE-BLOCK
+  transaction-count varint count toward the block weight. The BIP94
+  mintime floor applies on EVERY network, whether or not the rule is
+  consensus there, at the chain's own retarget period. MINE-BLOCK
   returns the number of FAILED nonces as a second value, because
   `maxtries' is one budget for a whole generate* call rather than a fresh
   allowance per block, and an exhausted budget returns the blocks already
@@ -751,6 +758,7 @@
   (bitcoin-lisp.mining:mine-block function)
   (bitcoin-lisp.mining:next-block-required-bits function)
   (bitcoin-lisp.mining:next-block-version function)
+  (bitcoin-lisp.mining:next-block-mintime function)
   (bitcoin-lisp.mining:*block-version-override* variable)
   (bitcoin-lisp.mining:*block-max-weight* variable)
   (bitcoin-lisp.mining:*block-reserved-weight* variable)

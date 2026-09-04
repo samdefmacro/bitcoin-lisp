@@ -173,12 +173,40 @@ log line of the node itself."
       (log-info "Debug logging categories: ~{~A~^ ~}" enabled))))
 
 
-(defun %init-parameters (network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
+(alexandria:define-constant +test-options+ '("bip94")
+  :test #'equal
+  :documentation "The values -test=<option> is honoured for, a subset of Core's
+TEST_OPTIONS_DOC (common/args.cpp:743-747). Core's other two -- `addrman' (a
+deterministic addrman) and `reindex_after_failure_noninteractive_yes' -- are
+deliberately absent: an option we cannot honour must warn like any other
+unrecognised one rather than be accepted and silently ignored, which is what
+makes -test=bip94 mean something.")
+
+(defun %apply-test-options (network options)
+  "Apply -test=<option> (Core init.cpp:1107-1121 plus chainparams.cpp
+ReadRegTestArgs). Core reads -test with GetArgs, so it is a LIST and every
+value is a separate switch; it is an ERROR off regtest and a WARNING for a
+value the node does not know."
+  (setf bl.chain:*enforce-bip94-on-regtest* nil)
+  (when options
+    (unless (eq network :regtest)
+      (config-error "-test=<option> can only be used with regtest"))
+    (dolist (option options)
+      (unless (member option +test-options+ :test #'string=)
+        (log-warn "Unrecognised option \"~A\" provided in -test=<option>." option)))
+    ;; -test=bip94 turns the BIP94 timewarp rule into consensus on regtest,
+    ;; exactly as testnet4 has it (chainparams.cpp:47).
+    (when (member "bip94" options :test #'string=)
+      (setf bl.chain:*enforce-bip94-on-regtest* t)
+      (log-info "BIP94 timewarp rules enforced (-test=bip94)"))))
+
+(defun %init-parameters (network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights test-options coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
   "The startup parameters applied before any database opens: test activation
-heights, -mocktime, the -peerblockfilters/-blockfilterindex gate, -prune
-validation and -port (Core init.cpp Steps 3-4), the -dbcache split (Core's
-Step 7 CalculateCacheSizes) and the -externalip resolvability check (its
-Step 6)."
+heights, -test, -mocktime, the -peerblockfilters/-blockfilterindex gate,
+-prune validation and -port (Core init.cpp Steps 3-4), the -dbcache split
+(Core's Step 7 CalculateCacheSizes) and the -externalip resolvability check
+(its Step 6)."
+  (%apply-test-options network test-options)
   ;; -testactivationheight=name@height moves a buried deployment so a regtest
   ;; chain can be driven across it in a handful of blocks (Core
   ;; chainparams.cpp:49-67). Applied before anything validates a block. A
@@ -1322,6 +1350,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (log-time-micros nil)
                         (log-thread-names nil)
                         (test-activation-heights nil)
+                        (test-options nil)
                         (v2transport nil)
                         (coinstatsindex nil)
                         (txospenderindex nil)
@@ -1421,7 +1450,7 @@ Returns the node instance."
   (%ensure-wallets-subdirectory data-directory network)
 
   (%init-logging data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-level-specs)
-  (%init-parameters network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
+  (%init-parameters network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights test-options coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
   (%init-datadir-layout data-directory network migrate-datadir)
   ;; Initialize node: the node struct and its databases; the chain itself is
   ;; loaded by %init-load-chain below.
