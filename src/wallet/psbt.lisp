@@ -1069,20 +1069,63 @@ set (descriptorprocesspsbt updates segwit inputs from the UTXO set / mempool)."
              map bl.ser:+psbt-in-sighash+)))
     (and sh (loop for j below 4 sum (ash (aref sh j) (* 8 j))))))
 
-(defun %psbt-effective-sighash (spk user-sighash stored-sighash)
-  "(values effective-byte record-p error). Core SignPSBTInput: effective = USER
+(defun %psbt-sighash-mismatch ()
+  "Core PSBTError::SIGHASH_MISMATCH. Both drive sites abort the whole call
+with it rather than skipping the input -- ProcessPSBT throws it explicitly
+(rawtransaction.cpp:203-204, \"it is critical that the sighash to sign with
+matches the PSBT's\") and DescriptorScriptPubKeyMan::FillPSBT returns
+anything but OK/INCOMPLETE up through CWallet::FillPSBT to
+walletprocesspsbt's JSONRPCPSBTError. rpc/util.cpp:379-405 maps it to
+RPC_DESERIALIZATION_ERROR with common/messages.cpp:110-111's text."
+  (error 'bl.rpc:rpc-error
+         :code bl.rpc:+rpc-deserialization-error+
+         :message "Specified sighash value does not match value stored in PSBT"))
+
+(defun %psbt-check-existing-sighashes (map effective)
+  "Core SignPSBTInput's \"Check all existing signatures use the sighash type\"
+(psbt.cpp:459-475). Under SIGHASH_DEFAULT every taproot signature must be a
+bare 64 bytes; otherwise every taproot signature is 65 bytes ending in the
+sighash byte, and every ECDSA partial signature ends in it too.
+
+This is the only signal an operator gets that a co-signer committed to
+different transaction fields than the ones we are about to sign, which is why
+Core aborts the call (its comment: \"For user safety\") instead of co-signing
+next to the foreign signature."
+  (flet ((tagged-p (sig)
+           (and (plusp (length sig))
+                (= (aref sig (1- (length sig))) effective)))
+         (sigs (keytype)
+           (mapcar #'cdr (bl.ser:psbt-map-collect map keytype))))
+    (let* ((key-sig (bl.ser:psbt-map-find map bl.ser:+psbt-in-tap-key-sig+))
+           ;; Core tests m_tap_key_sig with !empty(), so an empty record is
+           ;; absent rather than a zero-length signature to reject.
+           (tap-sigs (append (when (plusp (length key-sig)) (list key-sig))
+                             (sigs bl.ser:+psbt-in-tap-script-sig+))))
+      (if (zerop effective)
+          (dolist (sig tap-sigs)
+            (unless (= (length sig) 64) (%psbt-sighash-mismatch)))
+          (progn
+            (dolist (sig tap-sigs)
+              (unless (and (= (length sig) 65) (tagged-p sig))
+                (%psbt-sighash-mismatch)))
+            (dolist (sig (sigs bl.ser:+psbt-in-partial-sig+))
+              (unless (tagged-p sig) (%psbt-sighash-mismatch))))))))
+
+(defun %psbt-effective-sighash (map spk user-sighash)
+  "(values effective-byte record-p). Core SignPSBTInput: effective = USER
 param, else SIGHASH_DEFAULT(0) for taproot / SIGHASH_ALL(1) otherwise; a stored
-+psbt-in-sighash+ must match. RECORD-P is true when EFFECTIVE is non-default and
-must be written to the input (taproot: != DEFAULT; else != DEFAULT and != ALL)."
++psbt-in-sighash+ must match, and so must every signature already on the input.
+RECORD-P is true when EFFECTIVE is non-default and must be written to the input
+(taproot: != DEFAULT; else != DEFAULT and != ALL)."
   (let* ((taproot (eq (bl.val:classify-script spk)
                       :witness-v1-taproot))
-         (eff (or user-sighash (if taproot #x00 #x01))))
-    (when (and stored-sighash (/= stored-sighash eff))
-      (return-from %psbt-effective-sighash
-        (values nil nil "Specified sighash and sighash in PSBT do not match.")))
+         (eff (or user-sighash (if taproot #x00 #x01)))
+         (stored (%psbt-input-sighash-stored map)))
+    (when (and stored (/= stored eff))
+      (%psbt-sighash-mismatch))
+    (%psbt-check-existing-sighashes map eff)
     (values eff
-            (if taproot (/= eff #x00) (and (/= eff #x00) (/= eff #x01)))
-            nil)))
+            (if taproot (/= eff #x00) (and (/= eff #x00) (/= eff #x01))))))
 
 (defun %input-sig-witness-p (sig)
   "True when the input-sig SIG is a segwit (witness) signature — the kinds for
@@ -1245,80 +1288,78 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                      map bl.ser:+psbt-in-final-scriptsig+)
                     (bl.ser:psbt-map-find
                      map bl.ser:+psbt-in-final-scriptwitness+))
-          (multiple-value-bind (eff record-p sherr)
-              (%psbt-effective-sighash (first prev) user-sighash
-                                       (%psbt-input-sighash-stored map))
-            (unless sherr
-              (multiple-value-bind (sig err)
-                  (bl.rpc:compute-input-signatures tx i prev keymap pubmap tr-keymap
-                                             (if (zerop eff) #x01 eff)
-                                             precomp spent-utxos eff tr-scripts)
-                ;; Core SignPSBTInput's require_witness_sig gate: never record a
-                ;; legacy (non-witness) signature for an input sourced only from
-                ;; the witness_utxo — Core refuses it (a witness_utxo cannot
-                ;; authenticate a non-witness spend).
-                (unless (or err
-                            (and (%psbt-require-witness-sig-p map)
-                                 (not (%input-sig-witness-p sig))))
-                  (when (and (bl.rpc:input-sig-redeem sig)
-                             (not (bl.ser:psbt-map-find
-                                   map bl.ser:+psbt-in-redeem-script+)))
+          (multiple-value-bind (eff record-p)
+              (%psbt-effective-sighash map (first prev) user-sighash)
+            (multiple-value-bind (sig err)
+                (bl.rpc:compute-input-signatures tx i prev keymap pubmap tr-keymap
+                                           (if (zerop eff) #x01 eff)
+                                           precomp spent-utxos eff tr-scripts)
+              ;; Core SignPSBTInput's require_witness_sig gate: never record a
+              ;; legacy (non-witness) signature for an input sourced only from
+              ;; the witness_utxo — Core refuses it (a witness_utxo cannot
+              ;; authenticate a non-witness spend).
+              (unless (or err
+                          (and (%psbt-require-witness-sig-p map)
+                               (not (%input-sig-witness-p sig))))
+                (when (and (bl.rpc:input-sig-redeem sig)
+                           (not (bl.ser:psbt-map-find
+                                 map bl.ser:+psbt-in-redeem-script+)))
+                  (bl.ser:psbt-map-set
+                   map bl.ser:+psbt-in-redeem-script+ empty
+                   (bl.rpc:input-sig-redeem sig)))
+                (when (and (bl.rpc:input-sig-witness-script sig)
+                           (not (bl.ser:psbt-map-find
+                                 map bl.ser:+psbt-in-witness-script+)))
+                  (bl.ser:psbt-map-set
+                   map bl.ser:+psbt-in-witness-script+ empty
+                   (bl.rpc:input-sig-witness-script sig)))
+                (when record-p
+                  (bl.ser:psbt-map-set
+                   map bl.ser:+psbt-in-sighash+ empty
+                   (%psbt-uint32-le eff)))
+                ;; Core CreateSig reuses a signature already present for a key
+                ;; (input.FillSignatureData loads existing partial_sigs) rather
+                ;; than re-signing — so an input already signed by this pubkey
+                ;; keeps its existing sig. Never overwrite one we already hold.
+                (dolist (pair (bl.rpc:input-sig-ecdsa sig))
+                  (unless (%psbt-sig-for map (car pair))
                     (bl.ser:psbt-map-set
-                     map bl.ser:+psbt-in-redeem-script+ empty
-                     (bl.rpc:input-sig-redeem sig)))
-                  (when (and (bl.rpc:input-sig-witness-script sig)
-                             (not (bl.ser:psbt-map-find
-                                   map bl.ser:+psbt-in-witness-script+)))
-                    (bl.ser:psbt-map-set
-                     map bl.ser:+psbt-in-witness-script+ empty
-                     (bl.rpc:input-sig-witness-script sig)))
-                  (when record-p
-                    (bl.ser:psbt-map-set
-                     map bl.ser:+psbt-in-sighash+ empty
-                     (%psbt-uint32-le eff)))
-                  ;; Core CreateSig reuses a signature already present for a key
-                  ;; (input.FillSignatureData loads existing partial_sigs) rather
-                  ;; than re-signing — so an input already signed by this pubkey
-                  ;; keeps its existing sig. Never overwrite one we already hold.
-                  (dolist (pair (bl.rpc:input-sig-ecdsa sig))
-                    (unless (%psbt-sig-for map (car pair))
-                      (bl.ser:psbt-map-set
-                       map bl.ser:+psbt-in-partial-sig+
-                       (car pair) (cdr pair))))
-                  (when (and (bl.rpc:input-sig-tap sig)
-                             (not (bl.ser:psbt-map-find
-                                   map bl.ser:+psbt-in-tap-key-sig+)))
-                    (bl.ser:psbt-map-set
-                     map bl.ser:+psbt-in-tap-key-sig+ empty
-                     (bl.rpc:input-sig-tap sig)))
-                  ;; A taproot SCRIPT path is recorded in parts, never as the
-                  ;; finished witness: PSBT_IN_TAP_SCRIPT_SIG keyed by
-                  ;; <xonly><leaf hash>, plus the PSBT_IN_TAP_LEAF_SCRIPT the
-                  ;; next signer needs to reach the same leaf. Storing the
-                  ;; assembled stack instead would finalize the input and lock
-                  ;; every other participant out of a k-of-n leaf.
-                  (dolist (entry (bl.rpc:input-sig-tap-script-sigs sig))
-                    (destructuring-bind (xonly leaf-hash tap-sig) entry
-                      (let ((keydata (concatenate '(vector (unsigned-byte 8))
-                                                  xonly leaf-hash)))
-                        (unless (%psbt-record-present-p
-                                 map bl.ser:+psbt-in-tap-script-sig+
-                                 keydata)
-                          (bl.ser:psbt-map-set
-                           map bl.ser:+psbt-in-tap-script-sig+
-                           keydata tap-sig)))))
-                  (let ((leaf (bl.rpc:input-sig-tap-leaf sig)))
-                    (when leaf
-                      (destructuring-bind (script . control) leaf
-                        (unless (%psbt-record-present-p
-                                 map bl.ser:+psbt-in-tap-leaf-script+
-                                 control)
-                          (bl.ser:psbt-map-set
-                           map bl.ser:+psbt-in-tap-leaf-script+
-                           control
-                           (concatenate '(vector (unsigned-byte 8))
-                                        script
-                                        (vector bl.rpc:+tapleaf-version-tapscript+))))))))))))))))
+                     map bl.ser:+psbt-in-partial-sig+
+                     (car pair) (cdr pair))))
+                (when (and (bl.rpc:input-sig-tap sig)
+                           (not (bl.ser:psbt-map-find
+                                 map bl.ser:+psbt-in-tap-key-sig+)))
+                  (bl.ser:psbt-map-set
+                   map bl.ser:+psbt-in-tap-key-sig+ empty
+                   (bl.rpc:input-sig-tap sig)))
+                ;; A taproot SCRIPT path is recorded in parts, never as the
+                ;; finished witness: PSBT_IN_TAP_SCRIPT_SIG keyed by
+                ;; <xonly><leaf hash>, plus the PSBT_IN_TAP_LEAF_SCRIPT the
+                ;; next signer needs to reach the same leaf. Storing the
+                ;; assembled stack instead would finalize the input and lock
+                ;; every other participant out of a k-of-n leaf.
+                (dolist (entry (bl.rpc:input-sig-tap-script-sigs sig))
+                  (destructuring-bind (xonly leaf-hash tap-sig) entry
+                    (let ((keydata (concatenate '(vector (unsigned-byte 8))
+                                                xonly leaf-hash)))
+                      (unless (%psbt-record-present-p
+                               map bl.ser:+psbt-in-tap-script-sig+
+                               keydata)
+                        (bl.ser:psbt-map-set
+                         map bl.ser:+psbt-in-tap-script-sig+
+                         keydata tap-sig)))))
+                (let ((leaf (bl.rpc:input-sig-tap-leaf sig)))
+                  (when leaf
+                    (destructuring-bind (script . control) leaf
+                      (unless (%psbt-record-present-p
+                               map bl.ser:+psbt-in-tap-leaf-script+
+                               control)
+                        (bl.ser:psbt-map-set
+                         map bl.ser:+psbt-in-tap-leaf-script+
+                         control
+                         (concatenate '(vector (unsigned-byte 8))
+                                      script
+                                      (vector bl.rpc:+tapleaf-version-tapscript+)))))))))))))))
 
 (defun %psbt-add-map-derivs (map spk pos pairs)
   "Add +psbt-in-bip32+ (ECDSA) / +psbt-in-tap-internal-key+ (taproot) records to

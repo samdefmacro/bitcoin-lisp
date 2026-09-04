@@ -142,6 +142,11 @@ match the tx."
 
 ;;; --- creator / decoder / converter RPCs ---
 
+(defun %psbt-createpsbt (node params)
+  "The createpsbt RPC (Core rawtransaction.cpp): named once so the seven
+tests that drive the creator share one reach."
+  (bl.wallet::rpc-createpsbt node params))
+
 (defun %psbt-ser (b64-or-psbt)
   "Serialized bytes of a PSBT given as base64 or a struct (for order-independent
 equality)."
@@ -160,7 +165,7 @@ equality)."
                ;; Core's rpc_psbt.py generates this vector with replaceable=False
                ;; (explicit false = the +json-false+ sentinel; a null would
                ;; take Core's default true and signal RBF).
-               (out (bl.wallet::rpc-createpsbt
+               (out (%psbt-createpsbt
                      node (list (gethash "inputs" c) (gethash "outputs" c) 0
                                 bl.rpc:+json-false+))))
           (is (equalp (%psbt-ser out) (%psbt-ser (gethash "result" c))))))))
@@ -235,11 +240,11 @@ tx is rejected unless permitsigdata."
 (test psbt-joinpsbts-and-analyze
   "joinpsbts concatenates distinct PSBTs; analyzepsbt reports structure."
   (let ((node (bl:make-node :network :regtest)))
-    (let* ((a (bl.wallet::rpc-createpsbt
+    (let* ((a (%psbt-createpsbt
                node (list (list (list (cons "txid" (make-string 64 :initial-element #\a))
                                       (cons "vout" 0)))
                           '())))
-           (b (bl.wallet::rpc-createpsbt
+           (b (%psbt-createpsbt
                node (list (list (list (cons "txid" (make-string 64 :initial-element #\b))
                                       (cons "vout" 1)))
                           '())))
@@ -355,6 +360,38 @@ compared). NOTE: requires the vendored rpc_psbt.json — runs at integration."
               (incf n)))
           (is (>= n 5) "expected the signer vectors, got ~D" n)))))
 
+(defun %psbt-spending (spk value)
+  "A 1-in/1-out v2 PSBT spending an output of SPK worth VALUE, carried as the
+input's witness_utxo -- the smallest PSBT the signer path acts on."
+  (let* ((prevout (bl.ser:make-outpoint
+                   :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                        :initial-element #x11)
+                   :index 0))
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output prevout
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bl.ser:make-tx-out
+                                :value (- value 1000) :script-pubkey spk))
+              :lock-time 0))
+         (psbt (bl.ser:make-empty-psbt tx))
+         (bb (bl.ser:make-byte-buf)))
+    (bl.ser:bb-write-tx-out
+     bb (bl.ser:make-tx-out :value value :script-pubkey spk))
+    (bl.ser:psbt-map-set
+     (aref (bl.ser:psbt-inputs psbt) 0)
+     bl.ser:+psbt-in-witness-utxo+
+     (make-array 0 :element-type '(unsigned-byte 8))
+     (bl.ser:bb-finish bb))
+    psbt))
+
+(defun %psbt-process-with-descriptors (node psbt descriptors)
+  "The descriptorprocesspsbt RPC over a psbt struct."
+  (bl.wallet::rpc-descriptorprocesspsbt
+   node (list (bl.ser:encode-psbt psbt) descriptors)))
+
 (test descriptorprocesspsbt-wpkh-hermetic
   "descriptorprocesspsbt signs a P2WPKH input from a wpkh(WIF) descriptor and the
 PSBT's own witness_utxo, completing into a network tx whose witness verifies
@@ -367,31 +404,9 @@ under the consensus script verifier. Runs WITHOUT vendored vectors."
          (spk (concatenate '(simple-array (unsigned-byte 8) (*))
                            #(#x00 #x14) pkh))
          (value 100000)
-         (prevout (bl.ser:make-outpoint
-                   :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11)
-                   :index 0))
-         (tx (bl.ser:make-transaction
-              :version 2
-              :inputs (vector (bl.ser:make-tx-in
-                               :previous-output prevout
-                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
-                               :sequence #xffffffff))
-              :outputs (vector (bl.ser:make-tx-out
-                                :value (- value 1000) :script-pubkey spk))
-              :lock-time 0))
-         (psbt (bl.ser:make-empty-psbt tx)))
-    ;; Provide the input's witness_utxo directly in the PSBT.
-    (let ((bb (bl.ser:make-byte-buf)))
-      (bl.ser:bb-write-tx-out
-       bb (bl.ser:make-tx-out :value value :script-pubkey spk))
-      (bl.ser:psbt-map-set
-       (aref (bl.ser:psbt-inputs psbt) 0)
-       bl.ser:+psbt-in-witness-utxo+
-       (make-array 0 :element-type '(unsigned-byte 8))
-       (bl.ser:bb-finish bb)))
-    (let* ((b64 (bl.ser:encode-psbt psbt))
-           (result (bl.wallet::rpc-descriptorprocesspsbt
-                    node (list b64 (list (format nil "wpkh(~A)" wif)))))
+         (psbt (%psbt-spending spk value)))
+    (let* ((result (%psbt-process-with-descriptors
+                    node psbt (list (format nil "wpkh(~A)" wif))))
            (hex (cdr (assoc "hex" result :test #'equal))))
       (is (eq t (cdr (assoc "complete" result :test #'equal))))
       (is (stringp hex))
@@ -411,6 +426,77 @@ under the consensus script verifier. Runs WITHOUT vendored vectors."
                (bl.interop:*current-spent-utxos* spent))
           (is-true (bl.val:validate-input-script tx2 0 (aref spent 0))))))))
 
+(defun %psbt-add-partial-sig (psbt pubkey sighash-byte)
+  "Put a foreign 71-byte ECDSA partial signature ending in SIGHASH-BYTE on the
+PSBT's first input, keyed by PUBKEY -- a co-signer's contribution, from our
+side indistinguishable from any other."
+  (let ((sig (make-array 71 :element-type '(unsigned-byte 8) :initial-element #x30)))
+    (setf (aref sig 70) sighash-byte)
+    (bl.ser:psbt-map-set (aref (bl.ser:psbt-inputs psbt) 0)
+                         bl.ser:+psbt-in-partial-sig+ pubkey sig)
+    psbt))
+
+(defun %psbt-add-tap-key-sig (psbt length)
+  "Put a taproot key-path signature of LENGTH bytes on the PSBT's first input."
+  (bl.ser:psbt-map-set (aref (bl.ser:psbt-inputs psbt) 0)
+                       bl.ser:+psbt-in-tap-key-sig+
+                       (make-array 0 :element-type '(unsigned-byte 8))
+                       (make-array length :element-type '(unsigned-byte 8)
+                                          :initial-element 9))
+  psbt)
+
+(test psbt-signing-refuses-a-foreign-sighash
+  "Core SignPSBTInput checks every signature already on the input against the
+sighash it is about to sign with (psbt.cpp:459-475) and both drive sites turn
+a mismatch into a thrown SIGHASH_MISMATCH -- ProcessPSBT explicitly
+(rawtransaction.cpp:203-204), FillPSBT by returning it. Co-signing next to a
+signature that commits to other fields would lose the only signal an operator
+gets that the other participants are not signing the same transaction."
+  (let* ((node (bl:make-node :network :regtest))
+         (sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (wif (bl.crypto:private-key-to-wif sk :network :regtest :compressed t))
+         (descs (list (format nil "wpkh(~A)" wif)))
+         (pub (bl.crypto:derive-public-key sk :compressed t))
+         (other (bl.crypto:derive-public-key
+                 (make-array 32 :element-type '(unsigned-byte 8)
+                                :initial-element 2)
+                 :compressed t))
+         (value 100000)
+         (spk (concatenate '(simple-array (unsigned-byte 8) (*))
+                           #(#x00 #x14) (bl.crypto:hash160 pub)))
+         (taproot-spk (concatenate '(simple-array (unsigned-byte 8) (*))
+                                   #(#x51 #x20)
+                                   (make-array 32 :element-type '(unsigned-byte 8)
+                                                  :initial-element 3))))
+    ;; ECDSA: the effective sighash is ALL, so a co-signer's SIGHASH_NONE
+    ;; (0x02) signature aborts the call.
+    (signals-rpc-error (:code -22
+                        :exact-message
+                        "Specified sighash value does not match value stored in PSBT")
+      (%psbt-process-with-descriptors
+       node (%psbt-add-partial-sig (%psbt-spending spk value) other #x02)
+       descs))
+    ;; Control: the same PSBT with a SIGHASH_ALL co-signature is processed.
+    (is-true (%psbt-process-with-descriptors
+              node (%psbt-add-partial-sig (%psbt-spending spk value) other #x01)
+              descs))
+    ;; Taproot under SIGHASH_DEFAULT: a key-path signature must be a bare 64
+    ;; bytes; 65 means it carries a sighash byte, i.e. another type.
+    (signals-rpc-error (:code -22
+                        :exact-message
+                        "Specified sighash value does not match value stored in PSBT")
+      (%psbt-process-with-descriptors
+       node (%psbt-add-tap-key-sig (%psbt-spending taproot-spk value) 65)
+       descs))
+    (is-true (%psbt-process-with-descriptors
+              node (%psbt-add-tap-key-sig (%psbt-spending taproot-spk value) 64)
+              descs))
+    ;; An EMPTY key-signature record is absent, not a zero-length signature:
+    ;; Core guards the check with !m_tap_key_sig.empty().
+    (is-true (%psbt-process-with-descriptors
+              node (%psbt-add-tap-key-sig (%psbt-spending taproot-spk value) 0)
+              descs))))
+
 (test psbt-createpsbt-defaults-and-validation
   "createpsbt sequence follows Core (replaceable default true -> RBF; explicit
 false honors locktime), and duplicate outputs are rejected."
@@ -422,7 +508,7 @@ false honors locktime), and duplicate outputs are rejected."
                     (aref (bl.ser:transaction-inputs
                            (bl.ser:psbt-tx
                             (bl.ser:decode-psbt
-                             (bl.wallet::rpc-createpsbt node params))))
+                             (%psbt-createpsbt node params))))
                           0)))))
     ;; default (no replaceable) -> RBF-signaling 0xfffffffd
     (is (= #xfffffffd (funcall seq-of (list in '()))))
@@ -439,7 +525,7 @@ false honors locktime), and duplicate outputs are rejected."
     (let ((addr (bl.crypto:encode-p2pkh-address
                  (make-array 20 :element-type '(unsigned-byte 8) :initial-element 5) :regtest)))
       (signals bl.rpc:rpc-error
-        (bl.wallet::rpc-createpsbt
+        (%psbt-createpsbt
          node (list in (list (list (cons addr 0.1)) (list (cons addr 0.2)))))))))
 
 ;;;; BIP371 taproot fields in decodepsbt (rawtransaction.cpp:1253-1314)
@@ -609,13 +695,13 @@ whole test out before it asserted anything."
     ;; The sentinel must behave exactly like an omitted/empty input list.
     (let ((with-sentinel
             (handler-case
-                (bl.wallet::rpc-createpsbt
+                (%psbt-createpsbt
                  (make-test-node)
                  (list bl.rpc::+json-empty-array+ outputs))
               (error (e) (format nil "ERR: ~A" e))))
           (with-nil
             (handler-case
-                (bl.wallet::rpc-createpsbt (make-test-node) (list nil outputs))
+                (%psbt-createpsbt (make-test-node) (list nil outputs))
               (error (e) (format nil "ERR: ~A" e)))))
       (is-true (stringp with-sentinel)
                "createpsbt([]) raised instead of building: ~A" with-sentinel)
