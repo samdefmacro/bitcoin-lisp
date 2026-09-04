@@ -738,3 +738,40 @@ redeem script, not in the scriptSig."
              (is (eq ok t) "the ordinary P2SH(OP_1) spend must verify, got ~A" err)))
       (bl.interop:set-script-flags nil))))
 
+(test checkmultisig-charges-the-key-count-before-verifying
+  "CONSENSUS (Core interpreter.cpp:1116-1121): OP_CHECKMULTISIG does
+`nOpCount += nKeysCount; if (nOpCount > MAX_OPS_PER_SCRIPT) return
+set_error(SCRIPT_ERR_OP_COUNT);' the moment the key count has been read and
+range-checked -- ahead of the FindAndDelete loop and ahead of the verification
+loop, so a script that busts the 201-op budget costs zero ECDSA verifications.
+We charged it after running the whole multisig, so the budget overrun was
+reported as whatever the stack ran out of first. The script below is
+`<n OP_NOP> <push 20> OP_CHECKMULTISIG': the budget is n + 1 (the CHECKMULTISIG
+opcode itself) + 20 (the keys), so Core busts at n = 181 and nowhere earlier.
+script_tests.json's OP_COUNT vectors all have the keys on the stack, so they
+reach the same verdict either way."
+  (flet ((engine-error (n-nops)
+           (let ((r (bl.script:execute-script
+                     (concatenate 'vector
+                                  (make-array n-nops :initial-element #x61)
+                                  (vector #x01 #x14 #xae)))))
+             (and (not (bl.script:script-result-ok-p r))
+                  (bl.script:script-result-error r)))))
+    (bl.interop:set-script-flags "")
+    (unwind-protect
+         (progn
+           ;; 181 + 1 + 20 = 202 > 201: the charge fires before the keys are read.
+           (is (eq (engine-error 181) bl.script:se-toomanyops)
+               "n=181 must bust the op budget before touching the stack")
+           (is (eq (engine-error 182) bl.script:se-toomanyops)
+               "n=182 likewise")
+           ;; Control: one opcode below the boundary, 180 + 1 + 20 = 201, is NOT
+           ;; over the limit, so execution proceeds and the missing keys are a
+           ;; stack underflow -- exactly Core's INVALID_STACK_OPERATION. Without
+           ;; this the test would pass against a charge made anywhere at all.
+           (is (eq (engine-error 180) bl.script:se-stackunderflow)
+               "n=180 is exactly at the limit and must proceed to the stack")
+           (is (eq (engine-error 0) bl.script:se-stackunderflow)
+               "with no NOPs at all the failure is still the stack"))
+      (bl.interop:set-script-flags nil))))
+

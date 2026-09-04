@@ -2365,8 +2365,10 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
           (setf any-found t))))
     (values script any-found)))
 
-(defun do-checkmultisig-stack-op (stack script-pubkey)
+(defun do-checkmultisig-stack-op (stack script-pubkey op-count max-ops)
   "Perform the full CHECKMULTISIG stack operation.
+   OP-COUNT is the opcode budget the script has already spent and MAX-OPS is
+   the ceiling (MAX_OPS_PER_SCRIPT).
    Returns (values status new-stack pubkey-count) where:
    - status is :ok (success), :fail (verification failed), or :error (script error)
    - new-stack is the stack after operation (with result pushed for :ok/:fail)
@@ -2388,6 +2390,17 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
       ;; Validate n: must be 0-20
       (when (or (< n 0) (> n 20))
         (return-from do-checkmultisig-stack-op (values :pubkey-count nil 0)))
+
+      ;; Charge the key count against the opcode budget HERE, the instant the
+      ;; count has been read and range-checked: Core's
+      ;;   nOpCount += nKeysCount;
+      ;;   if (nOpCount > MAX_OPS_PER_SCRIPT) return set_error(SCRIPT_ERR_OP_COUNT);
+      ;; (interpreter.cpp:1119-1121) sits ahead of both the FindAndDelete loop
+      ;; and the verification loop, so a script that busts the budget costs zero
+      ;; ECDSA verifications and reports OP_COUNT rather than whatever the stack
+      ;; runs out of first.
+      (when (> (+ op-count n) max-ops)
+        (return-from do-checkmultisig-stack-op (values :op-count nil n)))
 
       ;; Pop n pubkeys
       (let ((pubkeys nil))
