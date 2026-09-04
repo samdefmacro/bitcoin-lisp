@@ -84,17 +84,6 @@ abandoned TxStateInactive (transaction.h:85-103).")
     (and (plusp (length inputs))
          (bl.ser:coinbase-input-p (aref inputs 0)))))
 
-(defun %tx-witness-hash (tx)
-  "The tx's real witness hash for the RPC wtxid field. transaction-wtxid
-returns 32 zero bytes for a coinbase (the merkle-computation convention);
-Core's GetWitnessHash reports the actual hash."
-  (if (%tx-coinbase-p tx)
-      (if (bl.ser:transaction-has-witness-p tx)
-          (bl.crypto:hash256
-           (bl.ser:serialize-witness-transaction tx))
-          (bl.ser:transaction-hash tx))
-      (bl.ser:transaction-wtxid tx)))
-
 ;;; --- wallet-tx: CWalletTx (transaction.h:194) ---
 
 (defstruct wallet-tx
@@ -1765,7 +1754,7 @@ chain.findBlock time lookup). Caller holds the node-lock."
               ("blocktime" . ,(%wallet-block-time node (wallet-tx-block-hash wtx))))
             `(("trusted" . ,(bl.rpc:json-bool (%wallet-tx-trusted-p wallet wtx)))))
       ("txid" . ,(bl.rpc:hash-to-hex (wallet-tx-txid wtx)))
-      ("wtxid" . ,(bl.rpc:hash-to-hex (%tx-witness-hash (wallet-tx-tx wtx))))
+      ("wtxid" . ,(bl.rpc:hash-to-hex (bl.ser:transaction-wtxid (wallet-tx-tx wtx))))
       ("walletconflicts" . ,(or (mapcar #'bl.rpc:hash-to-hex
                                         (wallet-tx-conflicts wallet wtx))
                                 #()))

@@ -919,6 +919,60 @@ with a false yes."
       (is (stringp (bl.rpc:dispatch-rpc-method
                     node "getrawtransaction" (list pool-txid-hex 0)))))))
 
+(test rpc-tx-json-reports-the-coinbases-real-witness-hash
+  "The \"hash\" field is Core's GetWitnessHash, for the coinbase too.
+
+core_io.cpp:435 emits `tx.GetWitnessHash().GetHex()` and
+CTransaction::ComputeWitnessHash has no coinbase case
+(primitives/transaction.cpp:88-95): the all-zero value belongs to
+BlockWitnessMerkleRoot alone (consensus/merkle.cpp:80). We returned 32 zero
+bytes for every coinbase, so getblock verbosity 2/3 and getrawtransaction
+reported hash=000...0 for the coinbase of every block. Driven through
+decoderawtransaction because TX-TO-JSON is the one serializer all three
+share (blockchain.lisp \"hash\" field)."
+  (let* ((node (make-test-node))
+         (coinbase-in (bl.ser:make-tx-in
+                       :previous-output (bl.ser:make-outpoint
+                                         :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                              :initial-element 0)
+                                         :index #xFFFFFFFF)
+                       :script-sig (make-array 4 :element-type '(unsigned-byte 8)
+                                                 :initial-element 1)
+                       :sequence #xFFFFFFFF))
+         (outputs (vector (bl.ser:make-tx-out
+                           :value 5000000000
+                           :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                         :initial-element #x76))))
+         (witnessed (bl.ser:make-transaction
+                     :version 2 :inputs (vector coinbase-in) :outputs outputs
+                     ;; BIP 141's witness reserved value.
+                     :witness (vector (list (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element 0)))
+                     :lock-time 0))
+         (bare (bl.ser:make-transaction
+                :version 2 :inputs (vector coinbase-in) :outputs outputs
+                :lock-time 0)))
+    (is-true (bl.ser:coinbase-input-p coinbase-in)
+             "the fixture must really be a coinbase, or this test is vacuous")
+    (dolist (tx (list witnessed bare))
+      (let* ((hex (bl.crypto:bytes-to-hex (bl.ser:transaction-wire-bytes tx)))
+             (r (bl.rpc:dispatch-rpc-method node "decoderawtransaction" (list hex)))
+             (hash-field (cdr (assoc "hash" r :test #'string=)))
+             (txid-field (cdr (assoc "txid" r :test #'string=))))
+        (is (string/= (make-string 64 :initial-element #\0) hash-field)
+            "a coinbase's hash field must not be the merkle tree's zero leaf")
+        (is (string= (bl.rpc:hash-to-hex
+                      (bl.crypto:hash256
+                       (if (bl.ser:transaction-has-witness-p tx)
+                           (bl.ser:serialize-witness-transaction tx)
+                           (bl.ser:serialize-transaction tx))))
+                     hash-field)
+            "hash is hash256 of the witness serialization, or the txid without one")
+        (is (string= (bl.rpc:hash-to-hex (bl.ser:transaction-hash tx)) txid-field))
+        (if (bl.ser:transaction-has-witness-p tx)
+            (is (string/= txid-field hash-field))
+            (is (string= txid-field hash-field)))))))
+
 ;;; --- getorphantxs wire hex + verbosity validation ---
 
 (test rpc-getorphantxs-wire-hex-and-verbosity

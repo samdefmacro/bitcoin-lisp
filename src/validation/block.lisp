@@ -1109,10 +1109,17 @@ header 0xaa21a9ed. Returns the 32-byte commitment hash or NIL."
         (bl.ser:bitcoin-block-transactions block)))
 
 (defun compute-witness-merkle-root (transactions)
-  "Compute the witness merkle root from a list of transactions.
-Uses wtxids for all transactions. The coinbase wtxid is 32 zero bytes (per BIP 141)."
-  (let ((wtxids (mapcar #'bl.ser:transaction-wtxid transactions)))
-    (compute-merkle-root wtxids)))
+  "The witness merkle root over TRANSACTIONS, a block's transaction list with
+the coinbase first (Core BlockWitnessMerkleRoot, consensus/merkle.cpp:76-85).
+
+The coinbase's LEAF is 32 zero bytes, as BIP 141 requires -- its real witness
+hash cannot appear here, since the commitment over this very root lives in
+that transaction. The zero is this computation's rule and not the coinbase's
+identity: TRANSACTION-WTXID reports its true GetWitnessHash, which is what
+the RPCs serialize."
+  (compute-merkle-root
+   (cons (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+         (mapcar #'bl.ser:transaction-wtxid (rest transactions)))))
 
 (defun validate-witness-commitment (block segwit-active)
   "BIP 141 witness-malleation check. Mirrors Bitcoin Core's
