@@ -1955,6 +1955,153 @@ must keep working when the other is absent."
     (let ((bl.rpc::*rpc-credentials* '()))
       (is (not (bl.rpc::check-auth (%basic-auth-header "alice:swordfish")))))))
 
+;;; --- -rpcwhitelist / -rpcwhitelistdefault (Core httprpc.cpp) ---
+
+(defparameter *core-whitelist-users*
+  ;; (username plaintext-password -rpcauth-spec). The specs and passwords are
+  ;; lifted verbatim from Core's test/functional/rpc_whitelist.py, so the
+  ;; credentials this test authenticates with are Core's own rpcauth.py output
+  ;; rather than something we generated to match ourselves.
+  '(("user1" "12345"
+     "user1:50358aa884c841648e0700b073c32b2e$b73e95fff0748cc0b517859d2ca47d9bac1aa78231f3e48fa9222b612bd2083e")
+    ("user2" "54321"
+     "user2:8650ba41296f62092377a38547f361de$4620db7ba063ef4e2f7249853e9f3c5c3592a9619a759e3e6f1c63f2e22f1d21")
+    ("strangedude6" "N4SziYbHmhC1"
+     "strangedude6:67e5583538958883291f6917883eca64$8a866953ef9c5b7d078a62c64754a4eb74f47c2c17821eb4237021d7ef44f991"))
+  "The -rpcauth users the whitelist tests authorize as, from rpc_whitelist.py.")
+
+(defun core-whitelist-credential (user)
+  "USER's \"user:pass\" credential from *CORE-WHITELIST-USERS*."
+  (let ((row (assoc user *core-whitelist-users* :test #'string=)))
+    (concatenate 'string (first row) ":" (second row))))
+
+(test rpc-whitelist-parses-cores-own-specs
+  "-rpcwhitelist parsing, against every spec shape rpc_whitelist.py writes and
+the verdict it asserts (httprpc.cpp:307-325 for the parse, :144-158 for the
+check). The shapes are the point: Core splits the method list on a comma OR a
+space and keeps the empty pieces, a spec with no colon leaves the user with an
+EMPTY whitelist, and a second spec for one user INTERSECTS with the first, so
+repeating the option can only narrow it."
+  (let ((bl.rpc::*rpc-whitelist*
+          (bl.rpc::%parse-rpc-whitelist
+           ;; rpc_whitelist.py's users and its four "strange" cases.
+           '("user1:getbestblockhash,getblockcount,"
+             "user2:getblockcount"
+             "strangedude:"
+             "strangedude2"
+             "strangedude3:getblockcount,"
+             "strangedude4:getblockcount, getbestblockhash"
+             "strangedude4:getblockcount"
+             "strangedude5:getblockcount,getblockcount"))))
+    (flet ((allowed (user method) (bl.rpc::rpc-method-allowed-p user method)))
+      ;; The two ordinary users: exactly what they list, nothing else. The
+      ;; trailing comma in user1's list is an empty method name, not a wildcard.
+      (is-true (allowed "user1" "getbestblockhash"))
+      (is-true (allowed "user1" "getblockcount"))
+      (is-false (allowed "user1" "getblockchaininfo"))
+      (is-false (allowed "user1" "getnetworkinfo"))
+      (is-true (allowed "user2" "getblockcount"))
+      (is-false (allowed "user2" "getblockchaininfo"))
+      ;; "user:" and a spec with no colon at all both mean an EMPTY whitelist.
+      (is-false (allowed "strangedude" "getnetworkinfo"))
+      (is-false (allowed "strangedude2" "getnetworkinfo"))
+      ;; Trailing comma, and a name repeated inside one spec.
+      (is-true (allowed "strangedude3" "getblockcount"))
+      (is-true (allowed "strangedude5" "getblockcount"))
+      ;; Two specs for one user INTERSECT: the second one drops
+      ;; getbestblockhash, which the ", " separator of the first had admitted.
+      (is-false (allowed "strangedude4" "getbestblockhash"))
+      (is-true (allowed "strangedude4" "getblockcount"))
+      ;; A user no spec names is governed by -rpcwhitelistdefault alone.
+      (let ((bl.rpc::*rpc-whitelist-default* nil))
+        (is-true (allowed "strangedude6" "getbestblockhash")))
+      (let ((bl.rpc::*rpc-whitelist-default* t))
+        (is-false (allowed "strangedude6" "getbestblockhash"))))))
+
+(test rpc-whitelist-refuses-off-whitelist-methods-with-403
+  "On the wire: a restricted credential gets Core's HTTP 403 for a method its
+-rpcwhitelist does not list, and for EVERY method when it has no whitelist
+while -rpcwhitelistdefault is in force (HTTPReq_JSONRPC, httprpc.cpp:144-158).
+Both options were accepted and dropped here, so an operator following Core's
+documented least-privilege recipe — an -rpcauth user for a monitoring process
+plus -rpcwhitelist=monitor:getblockcount — got a credential with the FULL RPC
+surface: stop, sendrawtransaction, setban and every wallet method. An
+authorization control that fails OPEN.
+
+A batch is refused as a unit, because Core checks every member's method before
+running any of them (:176-189) — otherwise a batch would be a way to call a
+forbidden method and read the permitted members' results anyway."
+  (bl.rpc:stop-rpc-server)
+  (with-temp-directory (dir)
+    (let ((node (make-test-node))
+          (port 19992)
+          (cookie nil))
+      (setf (bl:node-data-directory node) dir)
+      (labels ((start (&rest whitelist-args)
+                 (is (not (null (apply #'bl.rpc:start-rpc-server node
+                                       :port port
+                                       :rpc-auth (mapcar #'third *core-whitelist-users*)
+                                       whitelist-args)))
+                     "the server did not start for ~S" whitelist-args)
+                 (setf cookie (alexandria:read-file-into-string
+                               (merge-pathnames ".cookie" dir))))
+               (status (credential method)
+                 (%http-status
+                  (%http-post-rpc port (format nil "{\"method\":\"~A\",\"id\":1}" method)
+                                  :auth credential)))
+               (user-status (user method)
+                 (status (core-whitelist-credential user) method))
+               (whitelist-batch (&rest methods)
+                 (format nil "[~{{\"method\":\"~A\",\"id\":1}~^,~}]" methods)))
+        (unwind-protect
+             (progn
+               ;; CONTROL: with no -rpcwhitelist at all every authenticated
+               ;; user calls everything, which is what this node did for every
+               ;; configuration before the gate existed.
+               (start)
+               (is (= 200 (user-status "user1" "getnetworkinfo")))
+               (is (= 200 (user-status "strangedude6" "getnetworkinfo")))
+               (bl.rpc:stop-rpc-server)
+
+               ;; Two whitelists, and no -rpcwhitelistdefault: Core defaults it
+               ;; to ON as soon as any whitelist is given (httprpc.cpp:306).
+               (start :rpc-whitelist '("user1:getblockcount,uptime,"
+                                       "user2:getblockcount"))
+               (is (= 200 (user-status "user1" "getblockcount")))
+               (is (= 200 (user-status "user1" "uptime")))
+               (is (= 403 (user-status "user1" "getnetworkinfo")))
+               (is (= 200 (user-status "user2" "getblockcount")))
+               (is (= 403 (user-status "user2" "uptime")))
+               ;; A user no whitelist names may call NOTHING under that
+               ;; default — the cookie user, and so bitcoin-cli and the web UI,
+               ;; included. rpc_whitelist.py whitelists __cookie__ explicitly
+               ;; for exactly this reason.
+               (is (= 403 (user-status "strangedude6" "getblockcount")))
+               (is (= 403 (status cookie "getblockcount")))
+               ;; A wrong password is still 401: the whitelist is consulted
+               ;; only once a credential has authenticated.
+               (is (= 401 (status "user1:wrong" "getblockcount")))
+               ;; Batches: refused as a unit if ANY member is off the list.
+               (is (= 403 (%http-status
+                           (%http-post-rpc
+                            port (whitelist-batch "getblockcount" "getnetworkinfo")
+                            :auth (core-whitelist-credential "user1")))))
+               (is (= 200 (%http-status
+                           (%http-post-rpc
+                            port (whitelist-batch "getblockcount" "uptime")
+                            :auth (core-whitelist-credential "user1")))))
+               (bl.rpc:stop-rpc-server)
+
+               ;; -rpcwhitelistdefault=0: the same whitelists restrict only the
+               ;; users they name, and everyone else is unrestricted again.
+               (start :rpc-whitelist '("user1:getblockcount,uptime,"
+                                       "user2:getblockcount")
+                      :rpc-whitelist-default nil)
+               (is (= 403 (user-status "user1" "getnetworkinfo")))
+               (is (= 200 (user-status "strangedude6" "getnetworkinfo")))
+               (is (= 200 (status cookie "getnetworkinfo"))))
+          (bl.rpc:stop-rpc-server))))))
+
 (test rpc-allowip-acl-matching
   "The RPC ACL matches the way Core's CSubNet does: only within the same
 network, bytewise under the netmask (netaddress.cpp CSubNet::Match), over a list
