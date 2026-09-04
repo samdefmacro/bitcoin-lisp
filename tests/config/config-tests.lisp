@@ -8,6 +8,14 @@
 
 (defun cfg (key alist) (cdr (assoc key alist :test #'string=)))
 
+(defmacro %config-refusal (&body body)
+  "The message the config-error BODY signals carries, or NIL when BODY
+returns. Core's functional tests assert on the exact init error text, and so
+do the tests here: (SIGNALS ERROR ...) is satisfied by any error at all,
+including one raised for a different reason entirely."
+  `(handler-case (progn ,@body nil)
+     (bl.err:config-error (e) (princ-to-string e))))
+
 ;;; --- value coercion ---------------------------------------------------------
 
 (test conf-parse-bool-is-core-s-interpretbool-not-a-lenient-reading
@@ -973,6 +981,48 @@ occurrence would silently drop every override but one."
   (is-false (bl.cfg:core-only-option-p "testactivationheight"))
   (is-true (bl:known-config-option-p "mocktime"))
   (is-true (bl:known-config-option-p "testactivationheight")))
+
+(defun %peerblockfilters-init (blockfilterindex peer-block-filters prune)
+  "The message %INIT-PARAMETERS refuses this -blockfilterindex /
+-peerblockfilters / -prune combination with, or NIL when it accepts it. Every
+global the function assigns on its way past the gate is rebound, so a call
+that gets through cannot leave a cache split or a prune target behind."
+  (let ((bl.kv:*cache-sizes* bl.kv:*cache-sizes*)
+        (bl::*coins-cache-budget-bytes* bl::*coins-cache-budget-bytes*)
+        (bl:*prune-target-mib* bl:*prune-target-mib*)
+        (bl:*p2p-port-override* bl:*p2p-port-override*))
+    ;; network txindex blockfilterindex prune dbcache mocktime
+    ;; testactivationheight coinstatsindex txospenderindex reindex-chainstate
+    ;; peerblockfilters port
+    (%config-refusal
+      (bl::%init-parameters :testnet4 nil blockfilterindex prune
+                            nil nil nil nil nil nil peer-block-filters nil))))
+
+(test peerblockfilters-without-blockfilterindex-is-refused-on-any-node
+  "GA10 d2099b36. Core runs the check UNCONDITIONALLY and gates the service bit
+on it: `if (GetBoolArg(\"-peerblockfilters\")) { if (!filter types contain BASIC)
+return InitError(...); g_local_services |= NODE_COMPACT_FILTERS; }`
+(init.cpp:992-999), above and outside the -prune block at :1001-1008.
+p2p_blockfilters.py:266-270 starts an UNPRUNED node to assert it.
+
+Ours had the refusal nested inside `(when prune ...)`, so an unpruned
+`-peerblockfilters=1` started happily and advertised NODE_COMPACT_FILTERS
+while %CF-SERVING-INDEX returned NIL: every BIP157 client that picked us as a
+filter server waited on a getcfilters that is dropped without a reply."
+  (let ((message "Cannot set -peerblockfilters without -blockfilterindex."))
+    ;; No -prune: the case the gate used to miss entirely.
+    (is (string= message (%peerblockfilters-init nil t nil)))
+    ;; With -prune: the case it did catch, still caught.
+    (is (string= message (%peerblockfilters-init nil t 550))))
+  ;; With the index, or without the serving flag, there is nothing to refuse --
+  ;; so the assertions above are not passing on some unrelated error.
+  (is-false (%peerblockfilters-init t t nil))
+  (is-false (%peerblockfilters-init t t 550))
+  (is-false (%peerblockfilters-init nil nil nil))
+  (is-false (%peerblockfilters-init t nil nil))
+  ;; And the flag really does reach that argument from a command line.
+  (is-true (getf (start-node-plist '("-testnet4" "-peerblockfilters=1"))
+                 :peer-block-filters)))
 
 (defmacro %with-clean-log-categories (&body body)
   "Run BODY with every logging category off, and restore them afterwards."

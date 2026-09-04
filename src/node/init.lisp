@@ -175,9 +175,10 @@ log line of the node itself."
 
 (defun %init-parameters (network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
   "The startup parameters applied before any database opens: test activation
-heights, -mocktime, -prune validation and -port (Core init.cpp Steps 3-4),
-the -dbcache split (Core's Step 7 CalculateCacheSizes) and the -externalip
-resolvability check (its Step 6)."
+heights, -mocktime, the -peerblockfilters/-blockfilterindex gate, -prune
+validation and -port (Core init.cpp Steps 3-4), the -dbcache split (Core's
+Step 7 CalculateCacheSizes) and the -externalip resolvability check (its
+Step 6)."
   ;; -testactivationheight=name@height moves a buried deployment so a regtest
   ;; chain can be driven across it in a handful of blocks (Core
   ;; chainparams.cpp:49-67). Applied before anything validates a block. A
@@ -201,6 +202,17 @@ resolvability check (its Step 6)."
     (setf bl.ser:*mock-time*
           (if (zerop mocktime) nil mocktime))
     (log-info "Mock time set to ~D" mocktime))
+
+  ;; -peerblockfilters is what advertises NODE_COMPACT_FILTERS, and a filter
+  ;; server with no filter index answers nothing: %CF-SERVING-INDEX returns NIL
+  ;; and handle-getcfilters/getcfheaders/getcfcheckpt drop the request without
+  ;; a reply, so every BIP157 client that picked us stalls forever. Core refuses
+  ;; the pair UNCONDITIONALLY, in AppInitParameterInteraction and BEFORE the
+  ;; -prune block (init.cpp:992-999, above :1001-1008) -- this check used to sit
+  ;; INSIDE our `(when prune ...)`, so an unpruned node started happily and
+  ;; advertised a service it could not serve.
+  (when (and peer-block-filters (not blockfilterindex))
+    (config-error "Cannot set -peerblockfilters without -blockfilterindex."))
 
   ;; -dbcache, split across the coins cache AND every database's block cache
   ;; the way Core splits it (CalculateCacheSizes, node/caches.cpp:57-72, then
@@ -250,8 +262,6 @@ txindex ~D MiB, per-index ~D MiB"
     ;; Bitcoin Core init.cpp: -prune is incompatible with -reindex-chainstate --
     ;; the wipe leaves the UTXO set to be replayed from stored blocks, but early
     ;; blocks are pruned, so a pruned reindex-chainstate wedges at the first gap.
-    (when (and peer-block-filters (not blockfilterindex))
-      (config-error "Cannot set -peerblockfilters without -blockfilterindex."))
     (when (and prune reindex-chainstate)
       (config-error "Prune mode is incompatible with -reindex-chainstate (pruned blocks cannot be replayed). Use a full resync instead.")))
   (setf *prune-target-mib* prune)
@@ -833,8 +843,10 @@ anchors (Step 12); the coins-DB tip reconciliation; the indexes (Step 8) and
 reconciliation, BIP324 v2 transport; Core Steps 3 and 6), the secp256k1
 context (Step 4) and, Core Step 9, the wallet manager with the wallets
 recorded for startup."
-  ;; BIP157 filter serving (-peerblockfilters): gated in %INIT-PARAMETERS on the block filter
-  ;; index being enabled; advertised as NODE_COMPACT_FILTERS in our version.
+  ;; BIP157 filter serving (-peerblockfilters): %INIT-PARAMETERS has already
+  ;; refused to start without the block filter index, on every chain and with
+  ;; or without -prune, so reaching here means we can serve what the service
+  ;; bit promises; advertised as NODE_COMPACT_FILTERS in our version.
   (setf bl:*peer-block-filters* (and peer-block-filters t))
   (when peer-block-filters
     (log-info "BIP157 compact filter serving enabled (NODE_COMPACT_FILTERS)"))
