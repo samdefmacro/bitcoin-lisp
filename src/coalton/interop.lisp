@@ -1236,8 +1236,12 @@ the table's own structure.")
 ;;; ============================================================
 
 (defun script-is-push-only-p (script-bytes)
-  "Check if a script contains only push operations (no other opcodes).
-   Used for SIGPUSHONLY flag validation of scriptSig."
+  "Bitcoin Core CScript::IsPushOnly (script.cpp:266-281): walk the script with
+GetOp and answer NIL as soon as an opcode is `> OP_16' or a push runs off the
+end. OP_RESERVED (0x50) is therefore push-TYPE, which Core's own comment calls
+out as deliberate -- executing it fails, so a scriptSig carrying one is
+rejected by EvalScript before the P2SH branch ever consults this predicate.
+Used for the SIGPUSHONLY flag and for BIP16's push-only scriptSig rule."
   (let ((len (length script-bytes))
         (pos 0))
     (loop while (< pos len)
@@ -1279,14 +1283,11 @@ the table's own structure.")
                     (incf pos (+ 5 data-len))
                     (when (> pos len)
                       (return-from script-is-push-only-p nil))))
-                 ;; OP_1NEGATE (0x4f) - push -1
-                 ((= op #x4f)
-                  (incf pos))
-                 ;; OP_RESERVED (0x50) - NOT a push
-                 ((= op #x50)
-                  (return-from script-is-push-only-p nil))
-                 ;; OP_1 through OP_16 (0x51-0x60)
-                 ((and (>= op #x51) (<= op #x60))
+                 ;; OP_1NEGATE (0x4f), OP_RESERVED (0x50) and OP_1..OP_16
+                 ;; (0x51-0x60): one byte each, no data. OP_RESERVED belongs
+                 ;; here because Core's test is `opcode > OP_16' and nothing
+                 ;; finer (see the docstring).
+                 ((<= op #x60)
                   (incf pos))
                  ;; Anything else is NOT a push operation
                  (t
