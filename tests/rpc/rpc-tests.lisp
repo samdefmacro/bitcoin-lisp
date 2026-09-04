@@ -1026,7 +1026,7 @@ fix: listbanned and getaddednodeinfo answered result:null."
                         (cons "getaddednodeinfo"
                               (bl.rpc::rpc-getaddednodeinfo node nil))
                         (cons "getrawmempool"
-                              (bl.rpc::rpc-getrawmempool node nil))
+                              (bl.rpc:dispatch-rpc-method node "getrawmempool" nil))
                         (cons "getmempoolancestors"
                               (bl.rpc::%mempool-set->result
                                mempool (make-hash-table :test 'equalp) nil))
@@ -1045,7 +1045,7 @@ fix: listbanned and getaddednodeinfo answered result:null."
     ;; Objects (Core VOBJ): getrawmempool's VERBOSE form is a txid-keyed
     ;; object, so its empty case is {} and NOT [].
     (dolist (site (list (cons "getrawmempool verbose"
-                              (bl.rpc::rpc-getrawmempool node (list t)))
+                              (bl.rpc:dispatch-rpc-method node "getrawmempool" (list t)))
                         (cons "getmempooldescendants verbose"
                               (bl.rpc::%mempool-set->result
                                mempool (make-hash-table :test 'equalp) t))))
@@ -1055,8 +1055,8 @@ fix: listbanned and getaddednodeinfo answered result:null."
     ;; A node with no mempool at all takes getrawmempool's other early branch,
     ;; which must still pick the shape by verbosity.
     (setf (bl:node-mempool node) nil)
-    (is (string= "[]" (%encode-rpc-result (bl.rpc::rpc-getrawmempool node nil))))
-    (is (string= "{}" (%encode-rpc-result (bl.rpc::rpc-getrawmempool node (list t))))))
+    (is (string= "[]" (%encode-rpc-result (bl.rpc:dispatch-rpc-method node "getrawmempool" nil))))
+    (is (string= "{}" (%encode-rpc-result (bl.rpc:dispatch-rpc-method node "getrawmempool" (list t))))))
   ;; CONTROL 1 — populated collections keep their existing shape: an array of
   ;; JSON objects, not a vector of unencodable dotted pairs.
   (let ((node (make-test-node)))
@@ -1197,7 +1197,7 @@ default, json-false under -blocksonly."
   "getrawmempool non-verbose returns a JSON array of txids — [] for a new
 node, not null (it used to assert only LISTP, which NIL satisfies)."
   (let* ((node (make-test-node))
-         (result (bl.rpc::rpc-getrawmempool node '(nil))))
+         (result (bl.rpc:dispatch-rpc-method node "getrawmempool" '(nil))))
     (is (equalp #() result))))
 
 (test rpc-getrawmempool-verbose
@@ -1209,13 +1209,13 @@ RPC layer normalizes into a JSON object."
          (txid (bl.ser:transaction-hash tx)))
     ;; Empty mempool -> Core's empty VOBJ, i.e. an empty JSON object, not
     ;; null (this used to assert (null ...), the bug).
-    (let ((empty (bl.rpc::rpc-getrawmempool node '(t))))
+    (let ((empty (bl.rpc:dispatch-rpc-method node "getrawmempool" '(t))))
       (is (hash-table-p empty))
       (is (zerop (hash-table-count empty))))
     ;; Populate and check the entry + a couple of fields.
     (bl.mp:mempool-add
      mempool txid (bl.mp:make-entry-from-tx tx 1000 0))
-    (let* ((result (bl.rpc::rpc-getrawmempool node '(t)))
+    (let* ((result (bl.rpc:dispatch-rpc-method node "getrawmempool" '(t)))
            (entry (cdr (assoc (bl.rpc:hash-to-hex txid) result :test #'string=))))
       (is (listp result))
       (is (not (null entry)))
@@ -1224,6 +1224,48 @@ RPC layer normalizes into a JSON object."
       ;; serializes cleanly through the RPC response normalizer
       (let ((response (bl.rpc::make-rpc-response result "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
+
+(test getrawmempool-reads-its-mempool-sequence-argument
+  "The second argument is the atomic-snapshot half of the ZMQ sequence
+workflow, and it was accepted and dropped.
+
+Core MempoolToJSON (rpc/mempool.cpp:571-605): with verbose=false and
+mempool_sequence=true the result is the OBJECT {\"txids\": [...],
+\"mempool_sequence\": N}, N read under the same pool.cs as the id list; with
+verbose=true it is -8 \"Verbose results cannot contain mempool sequence
+values.\" Ours bound only (first params), so a client following doc/zmq.md
+got a bare array and no way to tell that the argument it passed — which our
+own table advertises (core-tables.lisp \"getrawmempool\" slot 1) — had been
+ignored."
+  (let* ((node (make-test-node))
+         (mempool (bl:node-mempool node))
+         (tx (make-mempool-test-tx :input-id 201))
+         (txid (bl.ser:transaction-hash tx))
+         (txid-hex (bl.rpc:hash-to-hex txid)))
+    ;; The conflict is raised before the pool is read at all.
+    (signals-rpc-error
+        (:code -8
+         :exact-message "Verbose results cannot contain mempool sequence values.")
+      (bl.rpc:dispatch-rpc-method node "getrawmempool" (list t t)))
+    ;; An empty mempool still answers with the object, and its txids is [].
+    ;; The counter starts at 1, as Core's m_sequence_number does (txmempool.h:202).
+    (is (string= "{\"txids\":[],\"mempool_sequence\":1}"
+                 (%encode-rpc-result
+                  (bl.rpc:dispatch-rpc-method node "getrawmempool" (list nil t))))
+        "the id list must encode as a JSON array, not as a nested object")
+    (bl.mp:mempool-add mempool txid (bl.mp:make-entry-from-tx tx 1000 0))
+    (let* ((r (bl.rpc:dispatch-rpc-method node "getrawmempool" (list nil t)))
+           (sequence (cdr (assoc "mempool_sequence" r :test #'string=))))
+      (is (equalp (vector txid-hex) (cdr (assoc "txids" r :test #'string=))))
+      ;; The counter is the pool's own, not a constant: an add moves it.
+      (is (= (bl.mp:mempool-sequence mempool) sequence))
+      (is (plusp sequence)))
+    ;; Without the argument the answer is Core's bare array, unchanged.
+    (is (equal (list txid-hex)
+               (bl.rpc:dispatch-rpc-method node "getrawmempool" (list nil))))
+    ;; And the argument reaches slot 1 by name, as Core's own client sends it.
+    (is (equal '(nil t) (%named-params "getrawmempool"
+                                       "verbose" nil "mempool_sequence" t)))))
 
 (test rpc-sendrawtransaction-invalid
   "Test sendrawtransaction with invalid hex returns error; a decode failure uses
@@ -1585,7 +1627,7 @@ with zero thread errors and every submitted tx in the pool exactly once."
                  (guarded
                   (lambda ()
                     (dotimes (j 40)
-                      (bl.rpc::rpc-getrawmempool node (list t))
+                      (bl.rpc:dispatch-rpc-method node "getrawmempool" (list t))
                       (bl.rpc::rpc-getmempoolinfo node nil)
                       (bl.rpc::rpc-getprioritisedtransactions node nil))))
                  :name "smoke-reader")
