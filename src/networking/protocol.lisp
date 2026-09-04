@@ -3412,11 +3412,15 @@ its own inside REQUEST-FULL-BLOCK). Returns the action taken."
     action))
 
 (defun compact-block-header-verdict (chain-state header block-hash prev-hash)
-  "Core's ProcessNewBlockHeaders({{cmpctblock.header}}) step, run BEFORE any
-reconstruction (net_processing.cpp:4571-4593). Returns
+  "Core's cmpctblock header admission — the parent lookup, the anti-DoS work
+floor and ProcessNewBlockHeaders({{cmpctblock.header}}) — run BEFORE any
+reconstruction (net_processing.cpp:4569-4593). Returns
 (VALUES VERDICT REASON CREDITS-ANNOUNCEMENT):
 
   :NO-PARENT — parent absent from the index; the caller answers with getheaders
+  :LOW-WORK  — the announced chain does not clear the anti-DoS work floor; the
+               caller drops it silently
+  :ALREADY-HAVE — in the index and nothing to gain from it; the caller drops it
   :ACCEPT    — the header is admissible, go on and reconstruct
   :REJECT    — REASON says what HANDLE-COMPACT-BLOCK-FAILURE must do with it
 
@@ -3429,19 +3433,54 @@ because the `unknown to us' half must be answered from the SAME lookup the
 :ACCEPT/:REJECT decision used. Answering it after the caller has processed the
 block would always say `known'.
 
-Order mirrors AcceptBlockHeader (validation.cpp:4226-4259): a header we already
-hold short-circuits (BLOCK_CACHED_INVALID when we marked it invalid, otherwise
-accepted without re-checking), then CheckBlockHeader's PoW, then the parent's
-own validity, then ContextualCheckBlockHeader. Doing this before the mempool is
-touched is what makes an invalid header cheap for us and expensive for nobody:
-BUILD-SHORTID-MAP hashes the whole mempool under a key derived from the
-attacker's header, so it must not run for a header we are going to reject.
+Order is the handler's, not AcceptBlockHeader's: Core looks the PARENT up first
+(:4570-4577), then applies the anti-DoS work floor (:4578-4582), and only then
+calls ProcessNewBlockHeaders, whose AcceptBlockHeader short-circuits a header we
+already hold (BLOCK_CACHED_INVALID when we marked it invalid, otherwise accepted
+without re-checking) and otherwise runs CheckBlockHeader's PoW, the parent's own
+validity and ContextualCheckBlockHeader (validation.cpp:4226-4259). The two
+handler gates come FIRST on purpose: they are the ones that cost the sender
+nothing to trigger, so a header below the work floor must be dropped before it
+can be scored, logged per-arm, or reach the mempool. Doing all of this before
+the mempool is touched is what makes a junk header cheap for us and expensive
+for nobody: BUILD-SHORTID-MAP hashes the whole mempool under a key derived from
+the attacker's header, so it must not run for a header we are going to drop.
 
-Pure reads of the block index — the caller holds the node lock across it and
-does the IO (getheaders / getdata / disconnect) outside."
-  (let ((known (bl.store:get-block-index-entry chain-state block-hash))
-        (prev-entry (bl.store:get-block-index-entry chain-state prev-hash)))
+Pure reads of the block index — the caller holds the node lock across it, does
+the index INSERTION for an accepted header (Core's ProcessNewBlockHeaders write
+half) and does the IO (getheaders / getdata / disconnect) outside."
+  (let* ((known (bl.store:get-block-index-entry chain-state block-hash))
+         (prev-entry (bl.store:get-block-index-entry chain-state prev-hash))
+         ;; Core's `prev_block->nChainWork + GetBlockProof(cmpctblock.header)'
+         ;; (:4578) — the work the announced chain would carry. Used by both
+         ;; the anti-DoS floor below and the announcement credit at the end,
+         ;; which is the same quantity in Core.
+         (announced-work
+           (and prev-entry
+                (bl.store:calculate-chain-work
+                 (bl.ser:block-header-bits header)
+                 (bl.store:block-index-entry-chain-work prev-entry)))))
     (cond
+      ;; Parent not in the index: the announcement outran our header chain.
+      ;; The ORDINARY case, not an attack — high-bandwidth compact relay beats
+      ;; headers announcements by design, so falling one block behind while a
+      ;; getblocktxn round-trip is in flight is enough. Core asks for deeper
+      ;; headers and returns before anything can be DoS-scored (:4571-4577);
+      ;; reconstructing instead would hand ACCEPT-DOWNLOADED-BLOCK a block whose
+      ;; parent entry is missing, i.e. :ORPHAN-BLOCK, and permanently exile our
+      ;; fastest honest block-relay peer.
+      ((null prev-entry) (values :no-parent nil))
+      ;; "Ignoring low-work compact block" (:4578-4582), the gate that makes
+      ;; the whole handler affordable. Everything below this line — the header
+      ;; battery, the index write, the shortid map over the mempool — is work
+      ;; a peer can ask for with a ~100-byte message, and PoW at the announced
+      ;; header's own claimed difficulty is the only thing that bounds how
+      ;; often it may. Without it a header at the minimum regtest/testnet
+      ;; target, ground in microseconds, buys a full mempool pass every time.
+      ;; Silent: Core logs and returns, with no misbehaviour score, because a
+      ;; peer far behind us relays low-work blocks honestly.
+      ((< announced-work (anti-dos-work-threshold chain-state))
+       (values :low-work nil nil))
       ;; Already-known header. Core returns true early for it, except when we
       ;; marked it invalid: BLOCK_CACHED_INVALID (validation.cpp:4229-4237).
       ((and known (eq (bl.store:block-index-entry-status known) :invalid))
@@ -3473,15 +3512,6 @@ does the IO (getheaders / getdata / disconnect) outside."
       ;; reconstructing. received_new_header is false, so no announcement
       ;; credit however much work it carries.
       (known (values :accept nil nil))
-      ;; Parent not in the index: the announcement outran our header chain.
-      ;; The ORDINARY case, not an attack — high-bandwidth compact relay beats
-      ;; headers announcements by design, so falling one block behind while a
-      ;; getblocktxn round-trip is in flight is enough. Core asks for deeper
-      ;; headers and returns before anything can be DoS-scored (:4571-4577);
-      ;; reconstructing instead would hand ACCEPT-DOWNLOADED-BLOCK a block whose
-      ;; parent entry is missing, i.e. :ORPHAN-BLOCK, and permanently exile our
-      ;; fastest honest block-relay peer.
-      ((null prev-entry) (values :no-parent nil))
       ;; Building on a block we rejected: BLOCK_INVALID_PREV (validation.cpp:
       ;; 4251-4255), punished regardless of via_compact_block.
       ((eq (bl.store:block-index-entry-status prev-entry) :invalid)
@@ -3503,20 +3533,44 @@ does the IO (getheaders / getdata / disconnect) outside."
                      ;; KNOWN is NIL on this branch, so received_new_header
                      ;; holds; all that remains is the work comparison. The
                      ;; header is not in the index yet (this function is pure
-                     ;; reads), so its work is computed the way Core computes
-                     ;; it a few lines earlier for the anti-DoS floor (:4578):
-                     ;; the parent's work plus this header's own proof.
+                     ;; reads), so its work is ANNOUNCED-WORK above — the way
+                     ;; Core computes it a few lines earlier for the anti-DoS
+                     ;; floor (:4578).
                      (let* ((tip-hash (bl.store:best-block-hash chain-state))
                             (tip (and tip-hash
                                       (bl.store:get-block-index-entry
                                        chain-state tip-hash))))
                        (and tip
-                            (> (bl.store:calculate-chain-work
-                                (bl.ser:block-header-bits header)
-                                (bl.store:block-index-entry-chain-work
-                                 prev-entry))
+                            (> announced-work
                                (bl.store:block-index-entry-chain-work tip)))))
              (values :reject reason)))))))
+
+(defun admit-compact-block-header (peer chain-state header block-hash prev-hash)
+  "COMPACT-BLOCK-HEADER-VERDICT plus, for an accepted header, the WRITE half of
+Core's ProcessNewBlockHeaders({{cmpctblock.header}}, min_pow_checked=true)
+(net_processing.cpp:4590) and the UpdateBlockAvailability that follows it
+(:4617). Returns the verdict's three values unchanged. Must be called under the
+node lock: it mutates the block index.
+
+AcceptBlockHeader ends in AddToBlockIndex, so in Core the announced header is in
+the index from the FIRST cmpctblock on and a replay is answered by the
+already-known gates. We used to run the verdict and never insert anything, which
+left KNOWN permanently NIL for an unseen header — the :ALREADY-HAVE arm was
+unreachable on this path, and every copy of one message re-ran the header
+battery and then BUILD-SHORTID-MAP over the whole mempool.
+
+PROCESS-HEADERS is our AddToBlockIndex: it skips a header we already hold,
+computes the chain work, stores it :HEADER-VALID and queues the body for
+download. Core's min_pow_checked=true here means `the caller already applied the
+work floor', which the verdict's :LOW-WORK arm is; process-headers' own floor
+agrees with it (the anti-DoS threshold is never below nMinimumChainWork), so it
+cannot drop a header the verdict accepted."
+  (multiple-value-bind (verdict reason credits-announcement)
+      (compact-block-header-verdict chain-state header block-hash prev-hash)
+    (when (eq verdict :accept)
+      (process-headers (list header) chain-state)
+      (update-block-availability peer chain-state block-hash))
+    (values verdict reason credits-announcement)))
 
 (define-p2p-handler ("cmpctblock" :needs-mempool t) (peer payload ctx)
   "Handle a cmpctblock message: validate the announced header, then attempt
@@ -3545,7 +3599,8 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
     ;; keeps per-block in-flight state, so it has no such cross-talk).
     (multiple-value-bind (verdict reason credits-announcement)
         (with-current-node-lock
-          (compact-block-header-verdict chain-state header block-hash prev-hash))
+          (admit-compact-block-header peer chain-state header block-hash
+                                      prev-hash))
       (ecase verdict
         (:accept
          ;; Core net_processing.cpp:4623. The stamp is credited HERE, on the
@@ -3565,6 +3620,14 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
           "net" "cmpctblock ~A from ~A: already known and no better than our tip"
           (bl.crypto:bytes-to-hex block-hash) (peer-address peer))
          (return-from handle-cmpctblock nil))
+        (:low-work
+         ;; Core "Ignoring low-work compact block from peer %d" (:4581):
+         ;; LogDebug and return, with no misbehaviour score — a peer whose
+         ;; chain is far behind ours relays such blocks in good faith.
+         (bl:log-cat
+          "net" "cmpctblock ~A from ~A: ignoring low-work compact block"
+          (bl.crypto:bytes-to-hex block-hash) (peer-address peer))
+         (return-from handle-cmpctblock nil))
         (:no-parent
          (bl:log-cat "net"
                                "cmpctblock ~A: parent ~A not in index — getheaders to ~A"
@@ -3581,12 +3644,25 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
                                        "invalid header via cmpctblock")
          (return-from handle-cmpctblock nil))))
 
-    ;; Clear any old pending reconstruction for different block
-    (when (peer-pending-compact-block peer)
-      (let ((pending-hash (pending-compact-block-block-hash
-                           (peer-pending-compact-block peer))))
-        (unless (equalp pending-hash block-hash)
-          (setf (peer-pending-compact-block peer) nil))))
+    ;; Core "Peer sent us compact block we were already syncing!" (:4670): a
+    ;; second cmpctblock for a reconstruction this peer already has in flight
+    ;; is dropped, because BlockRequested finds the block in flight from it and
+    ;; the queued entry already holds a PartiallyDownloadedBlock. Ours is the
+    ;; per-peer pending reconstruction, and it is the arm that bounds a replay
+    ;; whose header we DID index above but whose body never arrived: that
+    ;; header beats our tip and has no body, so the already-known arms send it
+    ;; back here, and without this it would rebuild the shortid map and re-send
+    ;; the same getblocktxn on every copy. An announcement for a DIFFERENT
+    ;; block still clears the stale pending state, as before.
+    (let ((pending (peer-pending-compact-block peer)))
+      (when pending
+        (cond
+          ((equalp (pending-compact-block-block-hash pending) block-hash)
+           (bl:log-cat
+            "net" "cmpctblock ~A from ~A: already syncing this compact block"
+            (bl.crypto:bytes-to-hex block-hash) (peer-address peer))
+           (return-from handle-cmpctblock nil))
+          (t (setf (peer-pending-compact-block peer) nil)))))
 
     ;; (Core's dedup — `pindex->nChainWork <= tip->nChainWork || pindex->nTx
     ;; != 0` — now lives in COMPACT-BLOCK-HEADER-VERDICT's :ALREADY-HAVE arm,
