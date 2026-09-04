@@ -250,7 +250,9 @@
   `:network-only` row (Core NETWORK_ONLY: -port, -rpcport, -bind, -rpcbind,
   -connect, -addnode, -wallet, -walletdir) does not read the config file's
   default section off mainnet, and refuses to start when that is the only
-  place it is set.
+  place it is set. A `:sensitive` row (Core SENSITIVE: -rpcuser,
+  -rpcpassword, -rpcauth, -torpassword) has its VALUE replaced by `****` in
+  the startup arg log, so a secret never reaches debug.log.
 
   Traps: before changing an option, read Core's READER for it (GetArg,
   GetArgs, GetBoolArg decide the semantics, not the declaration); moving
@@ -276,6 +278,7 @@
   (bitcoin-lisp.config:merge-setting function)
   (bitcoin-lisp.config:merge-settings-list function)
   (bitcoin-lisp.config:network-only-option-p function)
+  (bitcoin-lisp.config:sensitive-config-option-p function)
   (bitcoin-lisp.config:use-default-section-p function)
   (bitcoin-lisp.config:unsuitable-section-only-options function)
   (bitcoin-lisp.config:resolve-network-from-config function)

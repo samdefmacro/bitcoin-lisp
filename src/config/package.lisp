@@ -25,6 +25,7 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:config-option-repeatable
    #:config-option-kind
    #:config-option-network-only
+   #:config-option-sensitive
    #:config-option-global
    #:config-option-apply
    #:config-option-core
@@ -38,6 +39,7 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:find-config-option
    #:config-option-repeatable-p
    #:core-only-option-p
+   #:sensitive-config-option-p
    #:scalar-key-options
    #:collected-key-options
    #:global-options

@@ -1489,25 +1489,45 @@ blocks, it does not trust them."
            (log-info "Imported ~D of ~D block~:P from ~A"
                      accepted loaded (namestring file))))))))
 
+(defun %logged-arg-value (name json)
+  "The value an arg-log line carries for option NAME: `****` when the option is
+registered SENSITIVE, the stored JSON rendering otherwise.
+
+Core's logArgsPrefix (common/args.cpp:883): `value_str = (*flags & SENSITIVE) ?
+\"****\" : value.write()`. Unconditional — feature_config_args.py starts a node
+with a bare `-rpcpassword=` and still expects `rpcpassword=****`, so an empty
+secret is masked like any other. Without this the RPC password, the -rpcauth
+salt$HMAC and the Tor control password went into debug.log in cleartext, which
+is the file operators tail, ship to aggregators and paste into bug reports."
+  (if (bl.cfg:sensitive-config-option-p name) "****" json))
+
 (defun %log-args (args conf-texts settings-cells network)
   "Core's LogArgs(): every option that actually took effect, tagged with where
-it came from and rendered as the JSON value that was stored.
+it came from and rendered as the JSON value that was stored — except a
+SENSITIVE option's value, which %LOGGED-ARG-VALUE replaces with `****`.
 
 Only KNOWN options are logged for the config file and the command line — Core
 skips anything GetArgFlags does not recognise (args.cpp:880-884) — while EVERY
-settings-file entry is logged, known or not."
+settings-file entry is logged, known or not. Core masks only the two
+logArgsPrefix sources and writes the settings-file value verbatim
+(args.cpp:895); we mask there too, because the same secret hand-written into
+settings.json reaches the same debug.log, and no Core test reads a sensitive
+settings row back."
   (dolist (text conf-texts)
     (dolist (cell (bl.cfg:config-arg-log-cells text network))
       (destructuring-bind (section name json) cell
         (when (known-config-option-p name)
           (defer-log :info "Config file arg: ~:[~;[~:*~A] ~]~A=~A"
-                     (and (plusp (length section)) section) name json)))))
+                     (and (plusp (length section)) section) name
+                     (%logged-arg-value name json))))))
   (dolist (cell settings-cells)
     (defer-log :info "Setting file arg: ~A = ~A"
-               (car cell) (bl:render-json-value (cdr cell))))
+               (car cell)
+               (%logged-arg-value (car cell) (bl:render-json-value (cdr cell)))))
   (dolist (cell (bl.cfg:cli-arg-log-cells args))
     (when (known-config-option-p (car cell))
-      (defer-log :info "Command-line arg: ~A=~A" (car cell) (cdr cell)))))
+      (defer-log :info "Command-line arg: ~A=~A"
+                 (car cell) (%logged-arg-value (car cell) (cdr cell))))))
 
 (defun start-node-from-args (&optional (args (rest sb-ext:*posix-argv*)))
   "Start the node from Bitcoin Core-style options: a list of CLI ARGS
