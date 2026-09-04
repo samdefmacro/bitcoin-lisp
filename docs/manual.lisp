@@ -378,7 +378,9 @@
   `+min-blocks-to-keep+` and never touches a block under a prune lock
   (assumeutxo, rescans); a coins-cache entry that survives a sync carries
   neither DIRTY nor FRESH, since FRESH claims the base view has no such
-  coin and the sync just wrote it there; and the restart scan ENUMERATES
+  coin and the sync just wrote it there; the block index reaches disk
+  BEFORE the coins pointer that names one of its entries, which is what
+  `*persist-block-index-hook*` is for; and the restart scan ENUMERATES
   the blk/rev files that exist instead of counting from 0, because
   pruning deletes the lowest-numbered pair first and leaves a hole.
 
@@ -405,6 +407,7 @@
   (bitcoin-lisp.storage:utxo-entry class)
   (bitcoin-lisp.storage:get-utxo function)
   (bitcoin-lisp.storage:coins-view-cache class)
+  (bitcoin-lisp.storage:*persist-block-index-hook* variable)
   (bitcoin-lisp.storage:coin-view-get function)
   (bitcoin-lisp.storage:disconnect-block-from-utxo-set function)
   (bitcoin-lisp.storage:save-utxo-set function)
