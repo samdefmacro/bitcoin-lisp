@@ -817,8 +817,9 @@ fields (partial sigs, sighash, redeem/witness scripts, derivations)."
        map bl.ser:+psbt-in-final-scriptwitness+
        (make-array 0 :element-type '(unsigned-byte 8)) (bl.ser:bb-finish bb)))))
 
-(defun %psbt-extract-hex (psbt)
-  "Extract the fully-signed network transaction from a finalized PSBT as hex."
+(defun %psbt-extract-tx (psbt)
+  "The network transaction a finalized PSBT extracts to: the unsigned tx with
+each input's final scriptSig / scriptWitness put back on it."
   (let* ((tx (bl.ser:psbt-tx psbt))
          (ins (bl.ser:transaction-inputs tx))
          (nin (length ins))
@@ -843,14 +844,31 @@ fields (partial sigs, sighash, redeem/witness scripts, derivations)."
                 (aref witnesses i)
                 (bl.ser:br-read-witness-stack
                  (bl.ser:make-byte-reader-from fw))))))
-    (let ((final-tx (bl.ser:make-transaction
-                     :version (bl.ser:transaction-version tx)
-                     :inputs new-ins
-                     :outputs (bl.ser:transaction-outputs tx)
-                     :lock-time (bl.ser:transaction-lock-time tx)
-                     :witness (if any-witness witnesses nil))))
-      (bl.crypto:bytes-to-hex
-       (bl.ser:transaction-wire-bytes final-tx)))))
+    (bl.ser:make-transaction
+     :version (bl.ser:transaction-version tx)
+     :inputs new-ins
+     :outputs (bl.ser:transaction-outputs tx)
+     :lock-time (bl.ser:transaction-lock-time tx)
+     :witness (if any-witness witnesses nil))))
+
+(defun %psbt-extract-hex (psbt)
+  "Extract the fully-signed network transaction from a finalized PSBT as hex."
+  (bl.crypto:bytes-to-hex
+   (bl.ser:transaction-wire-bytes (%psbt-extract-tx psbt))))
+
+(defun %psbt-inputs-signed-and-verified-p (psbt)
+  "Core's `complete` in CWallet::FillPSBT (wallet.cpp:2231-2235): the AND of
+PSBTInputSignedAndVerified (psbt.cpp:325-355) over every input. Each spent
+output is resolved as Core resolves it -- non_witness_utxo first, with the
+txid and prevout-index checks, then witness_utxo, and FALSE outright when
+neither is present -- and the assembled final scriptSig / scriptWitness must
+VERIFY against that output under the standard flags. That last step is what
+separates this from `the finalizer produced some bytes`: a garbage
+final_scriptSig, or a co-signer's malformed partial signature that our
+finalizer still assembles, is caught here rather than handed back as a `hex`
+the caller is invited to broadcast."
+  (nth-value 0 (%verify-tx-scripts (%psbt-extract-tx psbt)
+                                   (%psbt-coins-map psbt))))
 
 (bl.rpc:define-rpc "finalizepsbt" (node params)
   "Finalize every input possible; if all are final and EXTRACT (default true),
@@ -1455,14 +1473,26 @@ Returns T when EVERY input is final."
   (bl.ser:decode-psbt
    (bl.ser:encode-psbt psbt)))
 
-(defun %psbt-signer-result (psbt finalize)
+(defun %psbt-signer-result (psbt finalize verify)
   "The {psbt, complete, hex?} object of walletprocesspsbt / descriptorprocesspsbt.
-When FINALIZE, PSBT is finalized in place; completeness + the extracted hex are
-computed from a finalized COPY either way (Core returns the network tx whenever
-every input can be finalized, even without finalize=true)."
+When FINALIZE, PSBT is finalized in place; completeness and the extracted hex
+are computed from a finalized COPY either way.
+
+VERIFY is the difference between Core's two callers. walletprocesspsbt reports
+the AND of PSBTInputSignedAndVerified (wallet.cpp:2231-2235), so an input
+counts only once its assembled scripts VERIFY against the spent output;
+descriptorprocesspsbt reports the AND of PSBTInputSigned
+(rawtransaction.cpp:2060-2063), where the final fields being present is
+enough.
+
+DIVERGENCE: Core computes both over the psbt it returns, so with
+finalize=false its complete is false and no hex comes back. We answer from
+the finalized copy, so the caller still learns whether the PSBT is ready."
   (when finalize (%psbt-finalize-in-place psbt))
   (let* ((trial (%psbt-copy psbt))
-         (complete (%psbt-finalize-in-place trial)))
+         (complete (and (%psbt-finalize-in-place trial)
+                        (or (not verify)
+                            (%psbt-inputs-signed-and-verified-p trial)))))
     (append `(("psbt" . ,(bl.ser:encode-psbt psbt))
               ("complete" . ,(bl.rpc:json-bool complete)))
             (when complete
@@ -1498,7 +1528,7 @@ Returns {psbt, complete, hex?}."
                   (%wallet-sign-maps wallet (bl.ser:psbt-tx psbt) coins)
                 (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash
                                          tr-scripts)))
-            (%psbt-signer-result psbt finalize)))))))
+            (%psbt-signer-result psbt finalize t)))))))
 
 ;;; --- descriptorprocesspsbt (rpc/rawtransaction.cpp:1992) ---
 
@@ -1602,7 +1632,7 @@ PARAMS: (psbt descriptors [sighashtype] [bip32derivs] [finalize])."
         (multiple-value-bind (keymap pubmap tr-keymap)
             (%descriptor-sign-maps expansions (bl.ser:psbt-tx psbt) coins)
           (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash))
-        (%psbt-signer-result psbt finalize)))))
+        (%psbt-signer-result psbt finalize nil)))))
 
 ;;; --- The PSBT-from-wallet path (shared by walletcreatefundedpsbt +
 ;;; psbtbumpfee): an UNSIGNED PSBT with UTXOs + bip32 derivations. ---
