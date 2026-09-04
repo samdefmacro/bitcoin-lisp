@@ -349,23 +349,24 @@ file offset, write it, read it back, de-obfuscate, and get the payload."
 
 ;;; --- The block store on top of it -------------------------------------------
 
+(defun %ff-unlabelled (block)
+  "BLOCK with the reorg fixture's cached-hash LABEL cleared, so the real hash
+stands. Every fixture here needs it: a flat file holds bytes, and both the
+startup scan and a rebuilt index recover a block's identity by hashing the 80
+header bytes they find, which is what production data always has."
+  (setf (bl.ser:block-header-cached-hash
+         (bl.ser:bitcoin-block-header block))
+        nil)
+  block)
+
 (defun %ff-test-block (seed)
   "A small but real block, so the store's own serializer and deserializer are
-what round-trips.
-
-The reorg fixture stamps a LABEL into the header's cached hash rather than the
-real one, which is fine for tests that only compare labels — but a flat file
-holds bytes, and the startup scan recovers a block's identity by hashing the 80
-header bytes it finds. So clear the label and let the real hash stand, which is
-what production data always has."
-  (let ((block (make-reorg-test-block
-                (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)
-                (make-array 32 :element-type '(unsigned-byte 8) :initial-element (1+ seed))
-                1)))
-    (setf (bl.ser:block-header-cached-hash
-           (bl.ser:bitcoin-block-header block))
-          nil)
-    block))
+what round-trips. SEED is a byte; %FF-NUMBERED-BLOCK covers a wider range."
+  (%ff-unlabelled
+   (make-reorg-test-block
+    (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)
+    (make-array 32 :element-type '(unsigned-byte 8) :initial-element (1+ seed))
+    1)))
 
 (defmacro %with-flat-store ((store dir &key (flat t)) &body body)
   `(with-temp-directory (,dir)
@@ -416,6 +417,80 @@ find a block again. This is most of what a full -reindex does."
            (dolist (h hashes)
              (is-true (bl.store:get-block store2 h)
                       "an append must not have landed on top of an existing record"))))))))
+
+(defun %ff-numbered-block (n)
+  "A test block unique in N for any N below 2^24, so a few hundred of them fit
+in one store. %FF-TEST-BLOCK's byte seed runs out at 256."
+  (flet ((label (m)
+           (let ((a (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element 0)))
+             (setf (aref a 0) (ldb (byte 8 0) m)
+                   (aref a 1) (ldb (byte 8 8) m)
+                   (aref a 2) (ldb (byte 8 16) m))
+             a)))
+    (%ff-unlabelled (make-reorg-test-block (label 0) (label n) n))))
+
+(defun %ff-fill-two-blk-files (store)
+  "Store blocks into STORE until it has rolled over into blk00001.dat, under
+-fastprune's 64 KiB file cap -- Core's own way of producing several block files
+without mining a real chain. Returns the hashes that landed above file 0.
+500 blocks of about 180 bytes each clear the cap with room to spare."
+  (let ((survivors '()))
+    (loop for n from 1 to 500
+          do (multiple-value-bind (hash pos)
+                 (bl.store:store-block store (%ff-numbered-block n) :height n)
+               (when (and (bl.kv:flat-file-pos-p pos)
+                          (plusp (bl.store:flat-file-pos-file pos)))
+                 (push hash survivors))))
+    (nreverse survivors)))
+
+(test a-prune-hole-in-the-blk-numbering-keeps-the-later-files-addressable
+  "Pruning deletes the lowest-numbered blk/rev pair first, so the blk numbering
+has holes -- and the restart scan used to count from 0 and stop at the first
+name that was not there, which after the first prune is blk00000.dat. Every
+block in the surviving files then vanished from the index: unservable to peers,
+unreadable for undo and reorg, invisible to the coinbase-probe crash recovery;
+BLOCK-STORE-TOTAL-BYTES read 0 so automatic pruning stopped; and the write
+cursor rewound to (0, 0), so a later rollover would open a live higher-numbered
+file at offset 0 with :IF-EXISTS :OVERWRITE.
+
+Core never has the problem: LoadBlockIndexGuts restores nFile/nDataPos from the
+block-index database and it scans blk files only under -reindex
+(node/blockstorage.cpp:120-145). Re-deriving the map by walking is the same
+thing by another route, but only if the walk ENUMERATES what is on disk --
+which is what %SCAN-FLAT-UNDO-FILES was already doing next door."
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
+     (let ((survivors '()))
+       (let* ((bl.store:*flat-block-files* t)
+              (bl.store:*fast-prune* t)
+              (store (bl.store:init-block-store dir)))
+         (setf survivors (%ff-fill-two-blk-files store)))
+       (is-true (probe-file (merge-pathnames "blocks/blk00001.dat" dir))
+                "the fixture must actually have rolled over to a second file")
+       (is (plusp (length survivors))
+           "the fixture must have put blocks above file 0")
+       ;; Exactly what an automatic prune leaves behind.
+       (delete-file (merge-pathnames "blocks/blk00000.dat" dir))
+       (let* ((bl.store:*flat-block-files* t)
+              (bl.store:*fast-prune* t)
+              (store2 (bl.store:init-block-store dir)))
+         (dolist (h survivors)
+           (is-true (bl.store:block-exists-p store2 h)
+                    "a block in a surviving file is missing from the index")
+           (is-true (bl.store:get-block store2 h)
+                    "a block in a surviving file cannot be read back"))
+         (is (plusp (bl.store:block-store-total-bytes store2))
+             "the byte total must account for the surviving files, or ~
+              automatic pruning stops")
+         ;; The cursor resumed past the last surviving record rather than
+         ;; rewinding to (0, 0): the next append must not land on live data.
+         (let ((extra (bl.store:store-block store2 (%ff-numbered-block 9999)
+                                            :height 9999)))
+           (is-true (bl.store:get-block store2 extra))
+           (dolist (h survivors)
+             (is-true (bl.store:get-block store2 h)
+                      "an append overwrote a record in a surviving file"))))))))
 
 (test the-store-reads-both-forms-at-once
   "Dual read, which is what makes the transition survivable: blocks written
@@ -684,20 +759,62 @@ require the file to be gone."
            (is (= 3 (bl.store:chain-state-pruned-height cs))
                "the prune horizon advances to the file's last height")))))))
 
+(test the-flat-prune-window-starts-at-genesis-as-cores-does
+  "Core's GetPruneRange returns prune_start = 0 for an ordinary chainstate
+(validation.cpp:6366-6379) and FindFilesToPrune skips a file only when
+`nHeightFirst < min_block_to_prune' (node/blockstorage.cpp:386), so the file
+holding genesis -- nHeightFirst 0 -- is prunable like any other once its whole
+range is inside the window.
+
+We passed the prune WALK cursor as the floor instead, read as `1+', so the
+floor was 1 on a node that had never pruned and blk00000.dat failed the test
+forever. Its height-first is 0 because ENSURE-GENESIS-ON-DISK writes genesis
+into it, and the cursor only rises, so the pair was retained for the life of
+the datadir while an equal volume of NEWER history was pruned in its place --
+and its permanent presence is what shaped the restart-scan failure above."
+  (with-network (:mainnet)
+   (with-temp-directory (dir)
+     (let* ((bl.store:*flat-block-files* t)
+            (store (bl.store:init-block-store dir))
+            (cs (bl.store:init-chain-state dir))
+            (genesis (bl.store:best-block-hash cs))
+            (prev (bl.store:make-block-index-entry
+                   :hash genesis :height 0 :chain-work 1 :status :valid)))
+       ;; Genesis into blk00000.dat, exactly as node start-up leaves it.
+       (bl.store:ensure-genesis-on-disk store)
+       (bl.store:add-block-index-entry cs prev)
+       (loop for h from 1 to 3
+             do (let* ((b (%ff-test-block (+ 210 h)))
+                       (hash (bl.store:store-block store b :height h))
+                       (entry (bl.store:make-block-index-entry
+                               :hash hash :height h :chain-work (1+ h)
+                               :status :valid :prev-entry prev)))
+                  (bl.store:add-block-index-entry cs entry)
+                  (setf prev entry)))
+       (bl.store:update-chain-tip
+        cs (bl.store:block-index-entry-hash prev)
+        (+ bl:+min-blocks-to-keep+ 40))
+       (let ((info (gethash 0 (bl.store:block-store-file-info store))))
+         (is (= 0 (bl.store:block-file-info-height-first info))
+             "genesis is what makes the first file's range start at 0")
+         (is (= 3 (bl.store:block-file-info-height-last info))))
+       (let ((bl:*prune-target-mib* 550)
+             (bl:*prune-after-height* 0))
+         (setf (bl.store:block-store-total-bytes store) (* 600 1024 1024))
+         (is (= 4 (bl.store:prune-old-blocks store cs))
+             "the file holding genesis must be prunable like any other")
+         (is-false (probe-file (merge-pathnames "blocks/blk00000.dat" dir))))))))
+
 ;;; --- Rebuilding the index from the files (P5) ---------------------------------
 
 (defun %ff-chain-block (prev-hash seed height)
   "A block whose header genuinely links to PREV-HASH, so a rebuilt index can
-follow the chain. The reorg fixture's cached-hash label is cleared for the same
-reason as elsewhere: reindexing recovers identity from BYTES."
-  (let ((b (make-reorg-test-block
-            prev-hash
-            (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)
-            height)))
-    (setf (bl.ser:block-header-cached-hash
-           (bl.ser:bitcoin-block-header b))
-          nil)
-    b))
+follow the chain."
+  (%ff-unlabelled
+   (make-reorg-test-block
+    prev-hash
+    (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)
+    height)))
 
 (test the-block-index-can-be-rebuilt-from-the-block-files
   "The capability the flat files were worth having for. Delete the whole header

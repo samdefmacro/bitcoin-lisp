@@ -183,11 +183,11 @@ drift apart from the snapshot constructor when a slot is added. Returns STATE."
 
 (defun chain-state-prune-floor (state)
   "Height of the last UNprunable block for STATE — the per-chainstate prune
-range's lower bound (Core Chainstate::GetPruneRange, validation.cpp:6366-6391,
-whose prune_start is this + 1). An unvalidated snapshot chainstate must never
-prune a block at or below its snapshot base: the historical chainstate still
-has to download and validate those blocks, and deleting one wedges the
-background sync permanently. Every other chainstate prunes from genesis (0).
+range's lower bound (Core Chainstate::GetPruneRange, validation.cpp:6366-6391;
+CHAIN-STATE-PRUNE-RANGE-START turns this into Core's prune_start). An
+unvalidated snapshot chainstate must never prune a block at or below its
+snapshot base: the historical chainstate still has to download and validate
+those blocks, and deleting one wedges the background sync permanently. Every other chainstate prunes from genesis (0).
 If the base header is somehow missing from the shared index, refuse to prune
 anything (most conservative)."
   (let ((base (chain-state-from-snapshot-blockhash state)))
@@ -198,11 +198,33 @@ anything (most conservative)."
               most-positive-fixnum))
         0)))
 
+(defun chain-state-prune-range-start (state)
+  "The LOWEST height a prune of STATE may delete — Core GetPruneRange's
+prune_start (validation.cpp:6366-6379), which both FindFilesToPrune and
+FindFilesToPruneManual apply per file as `nHeightFirst < min_block_to_prune ->
+skip' (node/blockstorage.cpp:386 and :308).
+
+0 for an ordinary chainstate, so the file holding genesis is prunable like any
+other once its whole range is inside the window; the snapshot base + 1 for an
+unvalidated snapshot chainstate, whose earlier blocks the historical chainstate
+still has to download and validate.
+
+NOT interchangeable with CHAIN-STATE-PRUNE-WALK-START, which also folds in the
+monotone PRUNED-HEIGHT cursor. That cursor is our resume optimization for the
+per-block legacy walk and has no counterpart in Core, and using it as the flat
+window's floor made blk00000.dat unprunable for the life of the datadir:
+PRUNED-HEIGHT starts at 0 so the floor was 1, while that file's height-first is
+0 because ENSURE-GENESIS-ON-DISK writes genesis into it, and the floor only
+ever rises. The node then retained that pair and pruned an equal volume of
+NEWER history in its place."
+  (let ((floor (chain-state-prune-floor state)))
+    (if (plusp floor) (1+ floor) 0)))
+
 (defun chain-state-prune-walk-start (state)
-  "The height a prune walk over STATE resumes ABOVE: the max of the monotone
-pruned-height cursor and the per-chainstate prune floor. Shared by the
-automatic and manual prune paths (Core: FindFilesToPrune and
-FindFilesToPruneManual both consume the same GetPruneRange)."
+  "The height a per-block prune walk over STATE resumes ABOVE: the max of the
+monotone pruned-height cursor and the per-chainstate prune floor. The legacy
+per-block format only; whole-file selection uses
+CHAIN-STATE-PRUNE-RANGE-START, which is Core's window floor."
   (max (chain-state-pruned-height state)
        (chain-state-prune-floor state)))
 
