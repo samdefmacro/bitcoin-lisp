@@ -528,7 +528,14 @@
   the header goes INTO the block index -- because everything past those
   gates is work a ~100-byte message buys: the shortid map SipHashes the
   whole mempool, and a header that never reaches the index is unknown
-  again on every replay.
+  again on every replay. The three feature negotiations BIP155, BIP330 and
+  BIP339 place strictly between VERSION and VERACK -- sendaddrv2,
+  sendtxrcncl, wtxidrelay -- are handled inside that window by
+  %AWAIT-VERACK, so their table rows exist only to drop a peer that sends
+  one afterwards, with Core's own log line. A gossiped address this node
+  has banned or discouraged is dropped at ingest, before addrman and
+  before relay, so the node never re-propagates an address it has itself
+  judged hostile.
 
   Traps: `getheaders` must send the locator of the LAST header the peer
   gave us, never our own tip, or an ordinary lagging peer loops forever.
