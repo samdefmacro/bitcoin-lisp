@@ -239,7 +239,10 @@
   table is an `Invalid parameter` at startup, exactly as in Core, and the
   table is the only place that knows an option's name. Every occurrence of
   a repeatable option counts (Core GetArgs); a scalar takes its LAST
-  command-line occurrence and its FIRST config-file one.
+  command-line occurrence and its FIRST config-file one. A config-file key
+  carries its own section when it is dotted (`main.rpcport=8332`), so a
+  line's section is CONF-SETTINGS-ROWS' answer rather than the `[header]`
+  above it.
 
   Traps: before changing an option, read Core's READER for it (GetArg,
   GetArgs, GetBoolArg decide the semantics, not the declaration); moving
@@ -254,9 +257,11 @@
   (bitcoin-lisp.config:find-config-option function)
   (bitcoin-lisp.config:parse-option-value function)
   (bitcoin-lisp.config:apply-option-globals function)
+  (bitcoin-lisp.config:cli-settings-rows function)
   (bitcoin-lisp.config:parse-cli-args function)
   (bitcoin-lisp.config:check-cli-args function)
   (bitcoin-lisp.config:interpret-arg function)
+  (bitcoin-lisp.config:conf-settings-rows function)
   (bitcoin-lisp.config:parse-bitcoin-conf function)
   (bitcoin-lisp.config:resolve-network-from-config function)
   (bitcoin-lisp.config:parse-settings-json function)

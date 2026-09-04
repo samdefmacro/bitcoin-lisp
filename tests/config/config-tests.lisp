@@ -110,6 +110,39 @@ should win; getting it backwards silently ignores the more specific setting."
       (is (string= "1" (cfg "txindex" a)))
       (is (string= "8888" (cfg "rpcport" a))))))
 
+(test a-dotted-key-is-a-section-setting-wherever-it-is-written
+  "Core prefixes every config line with the current [header] and then splits the
+result at its FIRST dot (config.cpp:47-56 + args.cpp:78-84), so a chain name
+written into the key scopes it with no header at all —
+doc/bitcoin-conf.md:44-46 documents the spelling and gives this worked example,
+where `regtest.rpcport` is 3000. We handed `regtest.rpcport` to the option
+lookup whole, failed it, and dropped the line with one `Ignoring unknown
+configuration value` warning: a config Core reads and applies, discarded."
+  (let ((text (format nil "regtest=1~%rpcport=2000~%regtest.rpcport=3000~%~
+                           ~%[regtest]~%rpcport=4000~%")))
+    (is (string= "3000" (cfg "rpcport" (bl.cfg:parse-bitcoin-conf text :regtest))))
+    (is (= 3000 (getf (bl::args->start-node-plist '() text) :rpc-port)))
+    (is-false (member "regtest.rpcport" (bl:unknown-config-file-keys
+                                         (bl.cfg:parse-bitcoin-conf text))
+                      :test #'string=)))
+  ;; The split happens BEFORE the `no` prefix is stripped (args.cpp:80-90), so a
+  ;; dotted key can negate too.
+  (is (string= "0" (cfg "listen" (bl.cfg:parse-bitcoin-conf
+                                  (format nil "main.nolisten=1~%") :mainnet))))
+  ;; Inside a section the header is the prefix, so the rest of a dotted key is
+  ;; the NAME — unknown, exactly as in Core.
+  (is (equal '(("main" "test.rpcport" "1" "\"1\""))
+             (bl.cfg:conf-settings-rows (format nil "[main]~%test.rpcport=1~%")))))
+
+(test a-dotted-key-is-not-a-command-line-option
+  "Core refuses any command-line key that InterpretKey split into a section:
+`Invalid parameter` (args.cpp:232-237). The refusal is CHECK-CLI-ARGS' job, and
+the parser must not quietly store it under the bare name either."
+  (signals bl.cfg:cli-parse-error (bl.cfg:check-cli-args '("-main.rpcport=8332")))
+  (is-false (bl.cfg:parse-cli-args '("-main.rpcport=8332")))
+  (is (equal '(("txindex" . "1"))
+             (bl.cfg:parse-cli-args '("-regtest.txindex=0" "-txindex")))))
+
 (test an-inline-hash-comment-is-stripped
   "Core cuts the line at the first # wherever it appears (config.cpp:41-44). We
 only skipped whole-line comments, so `datadir=/srv/btc  # mainnet` yielded a

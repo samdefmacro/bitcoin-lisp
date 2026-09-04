@@ -27,32 +27,32 @@ rather than refused, a silent resync from genesis into a junk directory."
         (values (subseq line 0 pos) t)
         (values line nil))))
 
-(defun parse-bitcoin-conf-sections (text &optional network)
-  "Parse bitcoin.conf TEXT into (values section-entries global-entries
-section-json global-json). The first two are in-order alists of
- (lower-case-key . value-string); the last two are the same keys paired with
-the JSON rendering Core would have stored, for LogArgs.
+(defun conf-settings-rows (text)
+  "Parse bitcoin.conf TEXT into settings ROWS — (section name string-value
+json), in file order. SECTION is \"\" for the default section, i.e. the area
+before any [section] header.
 
-GLOBAL-ENTRIES are the keys before any [section]; SECTION-ENTRIES are the keys
-in the [section] matching NETWORK (all sections when NETWORK is NIL). Core keeps
-the same split — it prefixes section keys and stores them under
-`ro_config[section][name]` (config.cpp:48-65) — because the two are consulted in
-a definite order, not merged blindly. See PARSE-BITCOIN-CONF.
+Core prefixes EVERY line with the current header (`prefix = section + '.'`,
+config.cpp:47-56) and then runs the result through InterpretKey
+(config.cpp:99), which splits the key at its FIRST dot. So the section of a
+line is not decided by the header alone: `main.rpcport=8332` written anywhere
+in the file — with no header at all — is a [main] setting, the spelling
+doc/bitcoin-conf.md:44-46 documents and argsman_tests.cpp:788 exercises. We used
+to hand the whole `main.rpcport` to the option lookup, fail it, and drop the
+line with an `Ignoring unknown configuration value` warning. A dotted key
+written INSIDE a section keeps the header as its section and the whole rest of
+the key as its name, which is then unknown — in Core too, for the same reason.
+
+STRING-VALUE is what the option readers consume; JSON is the value Core stored,
+which is what the `Config file arg:` lines print. They differ exactly where a
+negation happened — `nolisten=1` is the string \"0\" to an option reader and
+`false` in a log line — and the log wording is a contract Core's functional
+tests read back.
 
 Signals CONFIG-PARSE-ERROR on the three lines Core refuses:
 a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword."
-  (let ((sections nil)
-        (globals nil)
-        ;; The same cells again, but carrying the JSON rendering Core stored
-        ;; rather than the string the config layer wants. They differ exactly
-        ;; where a negation happened — `nolisten=1` is the string "0" to an
-        ;; option reader and `false` in a `Config file arg:` line — and the log
-        ;; wording is a contract Core's functional tests read back.
-        (sections-json nil)
-        (globals-json nil)
-        (in-section nil)
-        (active t)
-        (want (and network (conf-section-name network)))
+  (let ((rows nil)
+        (prefix "")
         (linenr 0))
     (with-input-from-string (in text)
       (loop for raw = (read-line in nil nil)
@@ -64,11 +64,12 @@ a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword."
                      ((zerop (length line)))
                      ((and (char= (char line 0) #\[)
                            (char= (char line (1- (length line))) #\]))
-                      (let ((sec (string-downcase
-                                  (string-trim '(#\Space)
-                                               (subseq line 1 (1- (length line)))))))
-                        (setf in-section t
-                              active (or (null want) (string= sec want)))))
+                      (setf prefix
+                            (concatenate 'string
+                                         (string-downcase
+                                          (string-trim '(#\Space)
+                                                       (subseq line 1 (1- (length line)))))
+                                         ".")))
                      ((char= (char line 0) #\-)
                       (error 'config-parse-error
                              :message (format nil "parse error on line ~D: ~A, options in ~
@@ -87,15 +88,17 @@ a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword."
                                                    line)))))
                         ;; Core runs InterpretKey/InterpretValue over
                         ;; config-file keys exactly as over command-line ones
-                        ;; (common/config.cpp:63 calls InterpretKey), so this is
+                        ;; (common/config.cpp:99 calls InterpretKey), so this is
                         ;; the same INTERPRET-ARG the command line uses. Without
                         ;; it, `nolisten=1` in bitcoin.conf set an option called
                         ;; "nolisten" that nothing reads, so the file could not
                         ;; negate anything at all.
-                        (multiple-value-bind (key value json)
+                        (multiple-value-bind (key value json section)
                             (interpret-arg
-                             (string-downcase
-                              (string-trim '(#\Space #\Tab) (subseq line 0 eq-pos)))
+                             (concatenate 'string prefix
+                                          (string-downcase
+                                           (string-trim '(#\Space #\Tab)
+                                                        (subseq line 0 eq-pos))))
                              (string-trim '(#\Space #\Tab) (subseq line (1+ eq-pos))))
                           (when (and used-hash (search "rpcpassword" key))
                             (error 'config-parse-error
@@ -103,12 +106,30 @@ a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword."
                                    (format nil "parse error on line ~D, using # in ~
                                                 rpcpassword can be ambiguous and should ~
                                                 be avoided" linenr)))
-                          (when active
-                            (if in-section
-                                (progn (push (cons key value) sections)
-                                       (push (cons key json) sections-json))
-                                (progn (push (cons key value) globals)
-                                       (push (cons key json) globals-json))))))))))))
+                          (push (list section key value json) rows)))))))))
+    (nreverse rows)))
+
+(defun parse-bitcoin-conf-sections (text &optional network)
+  "Parse bitcoin.conf TEXT into (values section-entries global-entries
+section-json global-json). The first two are in-order alists of
+ (lower-case-key . value-string); the last two are the same keys paired with
+the JSON rendering Core would have stored, for LogArgs.
+
+GLOBAL-ENTRIES are the default section's keys; SECTION-ENTRIES are the keys of
+the section matching NETWORK (all sections when NETWORK is NIL). Which section
+a line belongs to is CONF-SETTINGS-ROWS' answer, not the [header] alone. Core
+keeps the same split — it stores section keys under `ro_config[section][name]`
+(config.cpp:110) — because the two are consulted in a definite order, not
+merged blindly. See PARSE-BITCOIN-CONF."
+  (let ((want (and network (conf-section-name network)))
+        (sections nil) (globals nil) (sections-json nil) (globals-json nil))
+    (loop for (section name value json) in (conf-settings-rows text)
+          do (cond ((string= section "")
+                    (push (cons name value) globals)
+                    (push (cons name json) globals-json))
+                   ((or (null want) (string= section want))
+                    (push (cons name value) sections)
+                    (push (cons name json) sections-json))))
     (values (nreverse sections) (nreverse globals)
             (nreverse sections-json) (nreverse globals-json))))
 

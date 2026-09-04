@@ -62,6 +62,7 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:conf-effective-listen-flags
    #:split-option-token
    #:interpret-arg
+   #:cli-settings-rows
    #:parse-cli-args
    #:supplied-core-only-options
    #:known-config-option-p
@@ -71,6 +72,7 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:cli-arg-log-cells
    #:config-parse-error
    #:config-parse-error-message
+   #:conf-settings-rows
    #:parse-bitcoin-conf-sections
    #:parse-bitcoin-conf
    #:conf-global-entries
