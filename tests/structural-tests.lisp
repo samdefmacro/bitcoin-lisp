@@ -1420,15 +1420,16 @@ name here.")
 keys or sighashes wants bl.bytes:make-octets-hash-table"
         now +equalp-hash-table-ceiling+)))
 
-(defparameter +test-internal-reference-ceiling+ 4365
+(defparameter +test-internal-reference-ceiling+ 4320
   "How many package-qualified INTERNAL references (a :: token) the files of
 the tests system may contain: 7,136 when the cleanup started, over a glob of
 tests/; 4,394 when the corpus became the declared files (%test-system-files);
 4,380 once the compact-block tests drove the handler through one helper;
 4,370 when deliver-block in tests/support/ replaced the reorg tests' reaches;
 4,365 when the GA10 peers/eviction tests folded the eviction entry point, the
-inbound cap, the admission gate and IsFullOutboundConn into one helper each.
-White-box tests reaching
+inbound cap, the admission gate and IsFullOutboundConn into one helper each;
+4,320 once start-node-plist in tests/support/ replaced the 54 reaches into
+args->start-node-plist. White-box tests reaching
 an internal are legitimate, so this is not driven to zero; it must not
 GROW, and the shared fixtures in tests/support/ bring it down where the
 same internal was reached from a copy of the same helper in several files.
