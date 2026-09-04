@@ -203,7 +203,77 @@ deliberately exempt from -onlynet, matching Core."
                            name-proxy-p)))
                    addresses)))
 
-(defun %record-dial-attempt (node host port)
+(defun %diversity-counted-peer-p (peer)
+  "T for the connection types that contribute to the outbound netgroup set —
+Core's switch on pnode->m_conn_type in ThreadOpenConnections
+(net.cpp:2657-2687): MANUAL, OUTBOUND_FULL_RELAY and BLOCK_RELAY insert a
+group, and INBOUND, ADDR_FETCH, FEELER and PRIVATE_BROADCAST explicitly break
+out contributing nothing.
+
+The INBOUND case carries Core's reason verbatim: \"We currently don't take
+inbound connections into account. Since they are free to make, an attacker
+could make them to prevent us from connecting to certain peers.\" ADDR_FETCH
+and FEELER are excluded as \"short-lived outbound connections [that] should
+not affect how we select outbound peers from addrman\" — ours reach
+NODE-PEERS through establish-outbound-peer's -seednode call, so the
+conn-type test is doing real work and a plain not-inbound test would not.
+Manual peers are typed :outbound-full-relay here and so are counted, which
+is Core's MANUAL case."
+  (and (not (bl.net:peer-inbound peer))
+       (member (bl.net:peer-conn-type peer) '(:outbound-full-relay :block-relay))
+       t))
+
+(defun %outbound-netgroup-diversity (peers)
+  "(VALUES NETGROUPS PRIVACY-COUNT) for PEERS — Core's
+outbound_ipv46_peer_netgroups and outbound_privacy_network_peers, built in one
+pass over m_nodes (net.cpp:2651-2688).
+
+NETGROUPS is the set of /16 netgroups our ipv4/ipv6 outbound peers occupy; a
+candidate whose group is in it is skipped (net.cpp:2825-2827). PRIVACY-COUNT is
+how many outbound peers are on Tor/I2P/CJDNS: Core deliberately does NOT give
+those a group, \"since our addrman-groups for these networks are random,
+without relation to the route we take\", and counts them instead, where the
+count feeds the addrman failure gate only.
+
+This set used to be every peer's group, inbound included, which is the eclipse
+primitive Core's comment names: inbound slots are free, so an attacker holding
+114 of them across the /16s of our candidate list could veto every replacement
+dial while our outbound peers died off. The neighbouring arithmetic
+(COUNT-OUTBOUND-FULL-RELAY-PEERS) had already been fixed the same way; the
+netgroup set had not."
+  (let ((groups '())
+        (privacy 0))
+    (dolist (peer peers (values groups privacy))
+      (when (%diversity-counted-peer-p peer)
+        (let ((address (bl.net:peer-address peer)))
+          (if (member (bl.net:parse-network-address address)
+                      '(:torv3 :i2p :cjdns))
+              (incf privacy)
+              (let ((group (bl.net:ip-netgroup address)))
+                (when group (pushnew group groups :test #'equal)))))))))
+
+(defun %count-addrman-failures-p (netgroups privacy-count)
+  "Core's count_failures (net.cpp:2884-2891): record addrman FAILURES only once
+this node has at least min(m_max_automatic_connections - 1, 2) outbound
+netgroups plus privacy-network peers.
+
+Core's comment is the whole rationale: \"Don't record addrman failure attempts
+when node is offline. This can be identified since all local network
+connections (if any) belong in the same netgroup, and the size of
+`outbound_ipv46_peer_netgroups` would only be 1.\" A link that is down, a
+resumed laptop, or a node started before the network is, otherwise charges a
+real failure to every address it cycles through; a few such episodes push
+nAttempts past +ADDRMAN-RETRIES+ with no success recorded, at which point
+addr-info-terrible-p is true for those entries — getaddr stops returning them,
+they become preferred overwrite targets, and their GetChance collapses.
+
+The threshold is stated against the automatic connection TOTAL, so it is
+*MAX-AUTOMATIC-CONNECTIONS* here and not NODE-MAX-PEERS; for any -maxconnections
+above 2 it is simply 2."
+  (>= (+ (length netgroups) privacy-count)
+      (min (1- *max-automatic-connections*) 2)))
+
+(defun %record-dial-attempt (node host port count-failure)
   "Stamp an addrman dial attempt for HOST:PORT — Core CConnman::ConnectNode
 calls addrman.Attempt() on EVERY dial, immediately after the attempt and before
 the socket is examined (net.cpp:492-497).
@@ -220,7 +290,25 @@ the same corpses. That is an eclipse-resistance and getaddr-hygiene loss, not a
 crash.
 
 Good() resets the counter on a successful VERSION, so stamping every dial does
-not penalise addresses that work."
+not penalise addresses that work.
+
+COUNT-FAILURE is Core's fCountFailure, and it is a REQUIRED argument for the
+same reason Core makes it one of OpenNetworkConnection's parameters: only
+ThreadOpenConnections ever passes true (%COUNT-ADDRMAN-FAILURES-P), and
+every other call site — ADDR_FETCH/-seednode (net.cpp:2422), -connect MANUAL
+(:2541), added nodes (:2986), addconnection (:1905), the reconnect queue
+(:4157) — passes literal false. Attempt() stamps m_last_try either way; it is
+only nAttempts, the counter addr-info-terrible-p and GetChance read, that
+COUNT-FAILURE gates. Hard-coding it true charged a real failure to every
+address a link-down node cycled through, and to manual targets that were
+merely switched off, which Core never does.
+
+Divergence: Core's Attempt() call is additionally guarded by
+`!proxyConnectionFailed', so a dead SOCKS5 proxy blames nothing. We stamp
+BEFORE the dial and make-tcp-connection reports a proxy failure and a target
+failure the same way (NIL), so we have no signal to carry that guard; a whole
+onion set behind a dead Tor proxy still accrues last_try stamps, and failures
+too once the gate below is open."
   (let ((address-book (node-address-book node)))
     (when address-book
       (multiple-value-bind (net ip-bytes)
@@ -228,7 +316,8 @@ not penalise addresses that work."
         (when net
           (ignore-errors
            (bl.net:address-book-attempt
-            address-book ip-bytes port :count-failure t :net net)))))))
+            address-book ip-bytes port
+            :count-failure count-failure :net net)))))))
 
 (defun %seed-address-book-from-dns (node)
   "Query the DNS seeds and put what they return into the address book, the way
@@ -265,12 +354,19 @@ seeds."
              (log-warn "DNS seeding failed: ~A" e))))
        :name "bitcoin-dnsseed-thread"))))
 
-(defun %record-outbound-result (address-book addr port peer success)
+(defun %record-outbound-result (address-book addr port peer success
+                                &key count-failure)
   "Record an outbound dial outcome for ADDR:PORT in ADDRESS-BOOK, adding the
 entry if new (network-typed, so IPv6/onion/cjdns peers get addrman credit
-too): SUCCESS => Good + Connected, failure => Attempt with count-failure
+too): SUCCESS => Good + Connected, failure => Attempt
 (Core CConnman's addrman feedback in ConnectNode/OpenNetworkConnection).
-Hostname dial targets (unparseable as addresses) are skipped."
+Hostname dial targets (unparseable as addresses) are skipped.
+
+COUNT-FAILURE is Core's fCountFailure and defaults to NIL, which is what every
+OpenNetworkConnection call site but ThreadOpenConnections passes; only the
+caller that is ThreadOpenConnections states it, from
+%COUNT-ADDRMAN-FAILURES-P. It reaches the failure branch alone — a success
+resets nAttempts to 0 anyway."
   (when address-book
     (multiple-value-bind (net ip-bytes)
         (bl.net:parse-network-address addr)
@@ -294,7 +390,8 @@ Hostname dial targets (unparseable as addresses) are skipped."
                address-book ip-bytes port
                (bl.ser:get-unix-time) net))
             (bl.net:address-book-attempt
-             address-book ip-bytes port :count-failure t :net net))))))
+             address-book ip-bytes port
+             :count-failure count-failure :net net))))))
 
 (defun connect-to-peers (node max-peers &key (timeout 60) (min-peers 1))
   "Connect to Bitcoin network peers.
@@ -451,8 +548,15 @@ Returns the number of peers connected."
                     (bl.net:disconnect-peer peer))))
             (error (c)
               (log-debug "Failed to connect to ~A: ~A" addr c)
-              ;; Record failure in address book (add if not present)
-              (%record-outbound-result address-book addr dial-port nil nil)))))
+              ;; Record failure in address book (add if not present). This loop
+              ;; IS Core's ThreadOpenConnections for the initial fill, so the
+              ;; failure counts only once the node looks online — recomputed
+              ;; per candidate, as Core rescans m_nodes on every iteration.
+              (multiple-value-bind (groups privacy)
+                  (%outbound-netgroup-diversity (node-peers node))
+                (%record-outbound-result
+                 address-book addr dial-port nil nil
+                 :count-failure (%count-addrman-failures-p groups privacy)))))))
 
       (log-info "Connected to ~D peer~:P" connected)
       connected)))
@@ -643,49 +747,71 @@ Returns the number of new peers connected."
     (when (<= needed 0)
       (return-from replace-disconnected-peers 0))
 
-    ;; Get addresses already in use
-    (let* ((used-addrs (mapcar #'bl.net:peer-address
-                               (node-peers node)))
-           (used-groups (remove nil (mapcar #'bl.net:ip-netgroup
-                                            used-addrs)))
+    ;; Addresses already in use, and the netgroups our OUTBOUND peers hold.
+    ;;
+    ;; The two lists are deliberately different populations, and Core draws the
+    ;; same line: AlreadyConnectedToAddress (net.cpp:347-351, consulted from
+    ;; OpenNetworkConnection) compares against every node, inbound included,
+    ;; because a second connection to one address is pointless either way —
+    ;; while outbound_ipv46_peer_netgroups is built only from MANUAL /
+    ;; OUTBOUND_FULL_RELAY / BLOCK_RELAY peers. Folding inbound peers into the
+    ;; netgroup set, which this did, is the primitive Core's own comment names:
+    ;; inbound slots are free to fill, so an attacker spread across the /16s of
+    ;; node-known-addresses (a candidate list built once, at start-up) could
+    ;; veto every replacement dial and watch our outbound set drain away.
+    (let* ((peers (node-peers node))
+           (used-addrs (mapcar #'bl.net:peer-address peers))
            (connected 0))
-      ;; Core ThreadOpenConnections skips a candidate whose /16 netgroup
-      ;; already holds an outbound peer (setConnected, net.cpp:2651, 2685,
-      ;; 2826). connect-to-peers spreads the INITIAL set, but replacements
-      ;; had no netgroup test at all, so hours of churn could concentrate the
-      ;; outbound set in one group — half of an eclipse's preconditions.
-      (dolist (candidate (node-known-addresses node))
-        ;; Stop attempting new connect+handshake cycles the moment shutdown is
-        ;; requested — each one can otherwise block (connect timeout + handshake
-        ;; read) and delay the sync thread reaching its node-running checkpoint.
-        (when (or (>= connected needed)
-                  (bl.net:ibd-stop-requested-p))
-          (return))
-        (let ((addr (car candidate)))
-          (unless (or (member addr used-addrs :test #'string=)
-                      (let ((g (bl.net:ip-netgroup addr)))
-                        (and g (member g used-groups :test #'equal))))
-            (handler-case
-                (let* ((dial-port (or (cdr candidate)
-                                      (network-port (node-network node))))
-                       (peer (progn
-                               (%record-dial-attempt node addr dial-port)
-                               (bl.net:connect-peer addr dial-port))))
-                  (when peer
-                    (setf (bl.net:peer-address peer) addr)
-                    (when (bl.net:perform-handshake peer :near-tip (bl.net:near-tip-p (node-chain-state node)))
-                      (log-info "Replacement peer connected: ~A" addr)
-                      ;; Send feature negotiation messages
-                      (bl.net:send-post-handshake-messages peer)
-                      ;; Send compact block negotiation (BIP 152)
-                      (bl.net:send-compact-block-negotiation peer)
-                      (bt:with-recursive-lock-held ((node-lock node))
-                        (push peer (node-peers node)))
-                      (incf connected))
-                    (unless (eq (bl.net:peer-state peer) :ready)
-                      (bl.net:disconnect-peer peer))))
-              (error (c)
-                (declare (ignore c)))))))
+      (multiple-value-bind (used-groups privacy-peers)
+          (%outbound-netgroup-diversity peers)
+        ;; Core ThreadOpenConnections skips a candidate whose /16 netgroup
+        ;; already holds an outbound peer (net.cpp:2825-2827). connect-to-peers
+        ;; spreads the INITIAL set, but replacements had no netgroup test at
+        ;; all, so hours of churn could concentrate the outbound set in one
+        ;; group — half of an eclipse's preconditions.
+        (dolist (candidate (node-known-addresses node))
+          ;; Stop attempting new connect+handshake cycles the moment shutdown is
+          ;; requested — each one can otherwise block (connect timeout + handshake
+          ;; read) and delay the sync thread reaching its node-running checkpoint.
+          (when (or (>= connected needed)
+                    (bl.net:ibd-stop-requested-p))
+            (return))
+          (let ((addr (car candidate)))
+            (unless (or (member addr used-addrs :test #'string=)
+                        (let ((g (bl.net:ip-netgroup addr)))
+                          (and g (member g used-groups :test #'equal))))
+              (handler-case
+                  (let* ((dial-port (or (cdr candidate)
+                                        (network-port (node-network node))))
+                         (peer (progn
+                                 (%record-dial-attempt
+                                  node addr dial-port
+                                  (%count-addrman-failures-p used-groups
+                                                             privacy-peers))
+                                 (bl.net:connect-peer addr dial-port))))
+                    (when peer
+                      (setf (bl.net:peer-address peer) addr)
+                      (when (bl.net:perform-handshake peer :near-tip (bl.net:near-tip-p (node-chain-state node)))
+                        (log-info "Replacement peer connected: ~A" addr)
+                        ;; Send feature negotiation messages
+                        (bl.net:send-post-handshake-messages peer)
+                        ;; Send compact block negotiation (BIP 152)
+                        (bl.net:send-compact-block-negotiation peer)
+                        (bt:with-recursive-lock-held ((node-lock node))
+                          (push peer (node-peers node)))
+                        ;; Core rebuilds both accumulators from m_nodes on
+                        ;; every iteration, so the peer just added occupies its
+                        ;; group for the rest of this refill; without carrying
+                        ;; it forward a single pass could fill several outbound
+                        ;; slots from one /16.
+                        (multiple-value-setq (used-groups privacy-peers)
+                          (%outbound-netgroup-diversity (node-peers node)))
+                        (push addr used-addrs)
+                        (incf connected))
+                      (unless (eq (bl.net:peer-state peer) :ready)
+                        (bl.net:disconnect-peer peer))))
+                (error (c)
+                  (declare (ignore c))))))))
       connected)))
 
 ;;;; Manually-added peers (addnode)
@@ -770,7 +896,8 @@ talking to."
                   (node-peers node))
          t)))
 
-(defun establish-outbound-peer (node host port &key (conn-type :outbound-full-relay) manual)
+(defun establish-outbound-peer (node host port &key (conn-type :outbound-full-relay)
+                                                    manual count-failure)
   "Full outbound connect + handshake to HOST:PORT, pushing the ready peer onto
 node-peers. CONN-TYPE (:outbound-full-relay or :block-relay) sets the peer's
 connection type; MANUAL tags an operator-pinned (-addnode / addnode onetry)
@@ -778,10 +905,19 @@ peer, Core's ConnectionType::MANUAL — set BEFORE the handshake, because the
 VERSION-time services gate exempts manual peers (Core ExpectServicesFromConn)
 and connect-added-nodes redials a missing added node every ~30 s, so gating one
 would loop forever. Returns the peer or NIL. MUST run on the sync thread so
-node-peers stays single-writer. No-op when networking is disabled."
+node-peers stays single-writer. No-op when networking is disabled.
+
+COUNT-FAILURE defaults to NIL, and every caller that names a destination — the
+-seednode addr-fetch, -connect, -addnode, `addnode onetry' and the
+addconnection test RPC — leaves it there, because Core passes literal false at
+each of those OpenNetworkConnection sites (net.cpp:2422, 2541, 2986, 1905): a
+manual target that is merely switched off must not have addrman failures
+charged against it. MAINTAIN-BLOCK-RELAY-PEERS is the one caller drawing from
+addrman on its own initiative, i.e. the one that is ThreadOpenConnections, and
+it passes %COUNT-ADDRMAN-FAILURES-P."
   (when (node-network-active node)
     (handler-case
-        (let ((peer (progn (%record-dial-attempt node host port)
+        (let ((peer (progn (%record-dial-attempt node host port count-failure)
                            (bl.net:connect-peer host port))))
           (when peer
             (setf (bl.net:peer-address peer) host)
@@ -907,20 +1043,32 @@ Each carries blocks/headers only (relay=0), never tx relay."
              (addrman-outgoing-enabled-p))
     (loop while (< (peers-of-conn-type node :block-relay) +target-block-relay-peers+)
           do (multiple-value-bind (ip port) (%addrman-pick-unconnected node)
-               (unless (and ip (establish-outbound-peer
-                                node ip (or port (network-port (node-network node)))
-                                :conn-type :block-relay))
+               (unless (and ip
+                            (multiple-value-bind (groups privacy)
+                                (%outbound-netgroup-diversity (node-peers node))
+                              ;; The one establish-outbound-peer caller that is
+                              ;; ThreadOpenConnections: nobody named this
+                              ;; destination, addrman chose it.
+                              (establish-outbound-peer
+                               node ip (or port (network-port (node-network node)))
+                               :conn-type :block-relay
+                               :count-failure (%count-addrman-failures-p
+                                               groups privacy))))
                  ;; No candidate, or the connect failed: stop trying this cycle.
                  (return))
                (log-info "Opened block-relay-only peer ~A" ip)))))
 
-(defun do-feeler-connection (node host port)
+(defun do-feeler-connection (node host port count-failure)
   "Open a short-lived feeler connection: connect, handshake, and on success mark
 the address good (promoting it new -> tried). Always disconnects afterward --
 feelers exist only to validate addrman's tried table (Core anti-eclipse), never
-to join the peer set."
+to join the peer set.
+
+COUNT-FAILURE is Core's fCountFailure: a feeler leaves ThreadOpenConnections
+through the same OpenNetworkConnection call as any other automatic dial
+(net.cpp:2891), so it is gated on the same online test and never hard-coded."
   (handler-case
-      (let ((peer (progn (%record-dial-attempt node host port)
+      (let ((peer (progn (%record-dial-attempt node host port count-failure)
                          (bl.net:connect-peer host port))))
         (when peer
           (setf (bl.net:peer-address peer) host)
@@ -965,7 +1113,11 @@ feeler on the new table instead."
                                (and (plusp p) p)))
                 (%addrman-pick-unconnected node :new-only t))
           (when ip
-            (do-feeler-connection node ip (or port (network-port (node-network node))))))))))
+            (multiple-value-bind (groups privacy)
+                (%outbound-netgroup-diversity (node-peers node))
+              (do-feeler-connection
+                  node ip (or port (network-port (node-network node)))
+                (%count-addrman-failures-p groups privacy)))))))))
 
 (defvar *last-chain-sync-check* 0
   "Unix time of the last chain-sync eviction sweep. Node-scoped, NOT local to
