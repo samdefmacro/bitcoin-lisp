@@ -1826,6 +1826,43 @@ the row keeps the stored `false` that tells the merge it is a NEGATION."
       (is-true (bl.cfg:setting-row-negated-p (row "listen")))
       (is-false (bl.cfg:setting-row-negated-p (row "prune"))))))
 
+(test option-name-lookups-are-case-sensitive-like-core
+  "Core folds an option name only on WIN32 (args.cpp:200-204), so
+GetArgFlags (:258-268) is a case-SENSITIVE map lookup: `-LogSourceLocations`
+is `Invalid parameter` on the command line, `Ignoring unknown configuration
+value` in a file, and `Ignoring unknown rw_settings value` in settings.json.
+
+CORE-ONLY-OPTION-P downcased its argument while FIND-CONFIG-OPTION, the
+lookup KNOWN-CONFIG-OPTION-P uses, did not — so the two disagreed about the
+same name. A settings.json key spelled `LogSourceLocations` was core-only and
+unknown at once: reported as an ignored option AND warned about as
+unrecognised. Both follow Core now, which for that key means the warning."
+  (dolist (name '("LogSourceLocations" "CheckBlockIndex" "DataDir" "DbCache"))
+    (is-false (bl.cfg:core-only-option-p name) "~A matched a table row" name)
+    (is-false (bl:known-config-option-p name) "~A matched a table row" name))
+  (is-true (bl.cfg:core-only-option-p "logsourcelocations"))
+  (is-true (bl:known-config-option-p "logsourcelocations"))
+  (is-true (bl:known-config-option-p "dbcache"))
+  ;; The two predicates agree on every spelling, which is the invariant the
+  ;; refactor broke.
+  (dolist (name '("logsourcelocations" "LogSourceLocations" "dbcache" "DbCache"))
+    (is (eq (and (bl.cfg:core-only-option-p name) t)
+            (and (bl:known-config-option-p name) (bl.cfg:core-only-option-p name) t))
+        "~A is core-only and unknown at once" name))
+  ;; One reachable consequence: settings.json keys are the only ones no parser
+  ;; downcases (Core does not fold them either, args.cpp:420-423).
+  (is (equal '("LogSourceLocations")
+             (bl:unknown-settings-keys '(("LogSourceLocations" . "1")
+                                         ("logsourcelocations" . "1")
+                                         ("dbcache" . "100")))))
+  ;; And the CLI/config parsers still hand both predicates lower-case names,
+  ;; so a mixed-case spelling from those sources keeps working.
+  (is (equal '(("logsourcelocations" . "1"))
+             (bl.cfg:parse-cli-args '("-LogSourceLocations=1"))))
+  (is (equal '("logsourcelocations")
+             (bl.cfg:supplied-core-only-options
+              (bl.cfg:parse-cli-args '("-LogSourceLocations=1"))))))
+
 (test settings-json-unknown-keys-are-reported
   "Core logs one `Ignoring unknown rw_settings value` per unrecognized key and
 carries on (args.cpp:420-423) — unknown settings never abort startup."

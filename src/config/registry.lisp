@@ -117,8 +117,22 @@ in-order alist gives assoc for free)."
     (and o (config-option-repeatable o))))
 
 (defun core-only-option-p (name)
-  "T when NAME is an option bitcoind accepts and we do not implement."
-  (let ((o (find-config-option (string-downcase name))))
+  "T when NAME is an option bitcoind accepts and we do not implement.
+
+Case-SENSITIVE, like every other lookup here and like Core's own: outside
+WIN32, ArgsManager never folds an option name (args.cpp:200-204 lower-cases
+the command line only there), so GetArgFlags (:258-268) misses
+`-LogSourceLocations` and Core reports `Invalid parameter` for it on the
+command line and `Ignoring unknown configuration value` in a file. This
+function used to downcase while FIND-CONFIG-OPTION did not, so the two
+disagreed about the same name: a settings.json key spelled
+`LogSourceLocations` was core-only and unknown at once, and the warning
+KNOWN-CONFIG-OPTION-P drives was emitted for a key this predicate claimed to
+recognise. The CLI and config-file parsers downcase their keys before either
+predicate sees them (SPLIT-OPTION-TOKEN, CONF-SETTINGS-ROWS), which is this
+tree's one deviation from that case-sensitivity and is deliberate; the
+settings file is the source Core does not downcase either."
+  (let ((o (find-config-option name)))
     (and o (eq (config-option-kind o) :core-only))))
 
 (defun scalar-key-options ()
