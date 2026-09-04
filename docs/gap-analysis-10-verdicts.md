@@ -3,6 +3,23 @@
 Every finding, its final severity, and whether the verdict was reached by executing code.
 `refuted` means a skeptic killed it; nothing here is un-judged.
 
+## Fixed on 2026-09-04: the four S1s
+
+Each fix landed on main with its own reproduction, tests that fail on the pre-fix
+source, and a green cold battery; every fix cites its Core lines in the commit.
+
+| finding | commit subject | note |
+|---|---|---|
+| BIP143/BIP341 sighash TYPE-ERROR on a version with bit 31 set | Consensus: the witness sighash preimages write the version's 32-bit pattern | the audit found one sibling, the muhash element's amount |
+| `2279d91b` coins-view-cache-sync leaves FRESH set | Storage: the coins-cache sync clears FRESH, not only DIRTY | Core's Sync post-condition ported as an internal-error |
+| cmpctblock has no anti-DoS work threshold, replay gate unreachable | Net: the cmpctblock gate applies Core's work floor and indexes the header | Core's per-block in-flight accounting is still absent (deliberate gap, next-wave-2026-08-22) |
+| block bodies persisted with no CheckBlock on the IBD paths | Validation: every block-body write runs Core's AcceptBlock gate first | Core does not mark a BLOCK_MUTATED verdict failed, so neither does the gate; the peer is punished either way |
+
+The two structural-ratchet corrections these merges forced are in the same span of
+main: the `::` ratchet now counts the files the tests system declares (a glob had
+counted two git-ignored scratch files), and the compact-block tests reach their
+handler through one helper. The S2s below remain open.
+
 | id | final | exec | finding |
 |---|---|---|---|
 | `2279d91b` | **S1** | Y | coins-view-cache-sync clears DIRTY but leaves FRESH set, so coins already written to LevelDB are later dropped on spend without an eras |
