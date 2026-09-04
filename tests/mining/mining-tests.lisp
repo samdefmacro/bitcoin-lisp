@@ -914,7 +914,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
   ;; output and (submit=true) advances the chain.
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "genblk"))
-          (r (bl.rpc::rpc-generateblock node (list "raw(51)" '()))))
+          (r (bl.rpc:dispatch-rpc-method node "generateblock" (list "raw(51)" '()))))
      (is (stringp (cdr (assoc "hash" r :test #'string=))))
      (is (null (assoc "hex" r :test #'string=)))   ; no hex when submitted
      (is (= 1 (bl.store:current-height
@@ -929,8 +929,8 @@ not active; contextual validation rejects that block as :unexpected-witness")
   (with-network (:regtest)
    (let* ((node (regtest-node-fixture "genblk-ns"))
           (h0 (bl.store:current-height (bl:node-chain-state node)))
-          (r (bl.rpc::rpc-generateblock
-              node (list "raw(51)" '() bl.rpc:+json-false+))))
+          (r (bl.rpc:dispatch-rpc-method
+              node "generateblock" (list "raw(51)" '() bl.rpc:+json-false+))))
      (is (stringp (cdr (assoc "hash" r :test #'string=))))
      (is (stringp (cdr (assoc "hex" r :test #'string=))))
      ;; the hex round-trips to a block whose header hashes to the reported hash
@@ -960,9 +960,9 @@ not active; contextual validation rejects that block as :unexpected-witness")
      (bl.store:add-utxo (bl:node-utxo-set node)
                                     funding 0 100000000 (p2sh-optrue-script-pubkey) 0
                                     :coinbase nil)
-     (let* ((r (bl.rpc::rpc-generateblock
-                node (list "raw(51)" (list tx-hex)
-                           bl.rpc:+json-false+)))
+     (let* ((r (bl.rpc:dispatch-rpc-method
+                node "generateblock" (list "raw(51)" (list tx-hex)
+                                           bl.rpc:+json-false+)))
             (blk (flexi-streams:with-input-from-sequence
                      (s (bl.crypto:hex-to-bytes (cdr (assoc "hex" r :test #'string=))))
                    (bl.ser:read-bitcoin-block s))))
@@ -970,7 +970,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
        (is (= 2 (length (bl.ser:bitcoin-block-transactions blk)))))
      ;; bogus output (neither address nor descriptor) errors
      (signals bl.rpc:rpc-error
-       (bl.rpc::rpc-generateblock node (list "not-an-output" '()))))))
+       (bl.rpc:dispatch-rpc-method node "generateblock" (list "not-an-output" '()))))))
 
 (test generateblock-testblockvalidity-rejects-bad-tx
   ;; A raw tx spending a nonexistent outpoint fails the pre-mining
@@ -985,7 +985,7 @@ not active; contextual validation rejects that block as :unexpected-witness")
           (hex (bl.crypto:bytes-to-hex
                 (bl.ser:serialize-transaction bogus))))
      (signals bl.rpc:rpc-error
-       (bl.rpc::rpc-generateblock node (list "raw(51)" (list hex) nil)))
+       (bl.rpc:dispatch-rpc-method node "generateblock" (list "raw(51)" (list hex) nil)))
      ;; tip unchanged — nothing was mined or activated
      (is (= 0 (bl.store:current-height
                (bl:node-chain-state node)))))))
@@ -1331,6 +1331,16 @@ real normalizer, so it cannot be satisfied by a shape no client can send."
 ;;;; getmininginfo's optional last-template fields, and the generate* family's
 ;;;; try budget.
 
+(defun %wire-params (&rest values)
+  "VALUES shaped the way the WIRE shapes a positional params array.
+
+⚠️ Routed through %NORMALIZE-RPC-PARAMS deliberately, as %GBT-PARAMS is: an
+empty JSON array at a TOP-LEVEL positional slot does not arrive as NIL but as
+the truthy +JSON-EMPTY-ARRAY+ sentinel, so a handler that reads it with LISTP
+answers a request every real client sends with -8, while a test that passed
+NIL by hand never sees it."
+  (bl.rpc::%normalize-rpc-params (coerce values 'vector)))
+
 (defun %hashps-node (work-deltas &key (spacing 600) tip-time)
   "A regtest node whose block index holds heights 0..N, N being the length of
 WORK-DELTAS: height h carries the cumulative chain work of the first h deltas
@@ -1553,3 +1563,40 @@ keeps the block it did mine."
         (is (= 1 (bl.store:current-height cs)))
         (is (string= (first hashes)
                      (bl.rpc:hash-to-hex (bl.store:best-block-hash cs))))))))
+
+(test generateblock-gates-the-coinbase-witness-on-segwit-activation
+  "Core's RegenerateCommitments (node/miner.cpp:67-77) reaches
+GenerateCoinbaseCommitment, which appends the commitment OUTPUT with no
+deployment check at all and installs the reserved coinbase WITNESS only under
+DeploymentActiveAfter(pindexPrev, DEPLOYMENT_SEGWIT) (validation.cpp:4016-4049).
+
+generateblock built its coinbase itself and never passed that gate, so under
+-testactivationheight=segwit@N it produced a coinbase carrying witness data
+below N, its own TestBlockValidity dry run rejected it as :unexpected-witness,
+and every call answered -25 — on a chain where Core mines happily. The sibling
+site in ASSEMBLE-FULL-BLOCK had been fixed and its docstring describes this
+exact bug; the fix had simply never reached the second constructor."
+  (with-network (:regtest)
+    (let ((bl.val:*test-activation-heights* (make-hash-table :test 'equal)))
+      (bl.val:apply-test-activation-heights '("segwit@5"))
+      (is (= 5 (bl.val:get-segwit-activation-height :regtest)))
+      (is-false (bl.val:segwit-active-at-height-p 1))
+      (let* ((node (regtest-node-fixture "genblk-presegwit"))
+             (unsubmitted (bl.rpc:dispatch-rpc-method
+                           node "generateblock"
+                           (%wire-params "raw(51)" (vector) bl.rpc:+json-false+)))
+             (blk (flexi-streams:with-input-from-sequence
+                      (s (bl.crypto:hex-to-bytes
+                          (cdr (assoc "hex" unsubmitted :test #'string=))))
+                    (bl.ser:read-bitcoin-block s)))
+             (coinbase (first (bl.ser:bitcoin-block-transactions blk))))
+        ;; The commitment OUTPUT is there either way; the WITNESS is not.
+        (is (= 2 (length (bl.ser:transaction-outputs coinbase))))
+        (is-false (bl.ser:transaction-has-witness-p coinbase)
+                  "the coinbase carried witness data below the segwit height")
+        ;; And the block passes the dry run and activates, where it used to
+        ;; take the whole RPC down with -25.
+        (let ((r (bl.rpc:dispatch-rpc-method
+                  node "generateblock" (%wire-params "raw(51)" (vector)))))
+          (is (stringp (cdr (assoc "hash" r :test #'string=))))
+          (is (= 1 (bl.store:current-height (bl:node-chain-state node)))))))))

@@ -140,6 +140,7 @@ can. src/validation/.")
    #:+always-on-block-script-flags+
    #:+standard-script-verify-flags+
    #:get-segwit-activation-height
+   #:segwit-active-at-height-p
    ;; Difficulty validation
    #:validate-difficulty
    #:bip94-timewarp-violation-p

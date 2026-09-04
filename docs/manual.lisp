@@ -720,7 +720,10 @@
   Invariants: the template honours `-blockmaxweight`,
   `-blockreservedweight` and `-blockmintxfee` exactly as Core's
   BlockAssembler does; getblocktemplate follows the miner contract of
-  BIP22/BIP23.
+  BIP22/BIP23; every coinbase-construction site gates the BIP141 reserved
+  witness on `bl.val:segwit-active-at-height-p` -- the commitment OUTPUT
+  is unconditional, the WITNESS is not, and a block carrying one below
+  the segwit height is rejected `:unexpected-witness'.
 
   Traps: the reserved weight exists because the header and the
   transaction-count varint count toward the block weight. MINE-BLOCK

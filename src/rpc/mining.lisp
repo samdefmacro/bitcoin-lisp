@@ -76,7 +76,7 @@ template cache is keyed on the node."
     ;; Core pushes "csv" UNCONDITIONALLY (rpc/mining.cpp:949), not gated on its
     ;; activation height.
     (push "csv" rules)
-    (when (>= height (bl.val:get-segwit-activation-height net))
+    (when (bl.val:segwit-active-at-height-p height net)
       (push "!segwit" rules))
     ;; "!signet" tells the miner it must understand signet rules to mine this
     ;; template at all (rpc/mining.cpp:951-955). Without it a signet miner has
@@ -739,7 +739,7 @@ zero and whose remaining transactions are TXS (Core GenerateCoinbaseCommitment).
     (bl.mining:build-witness-commitment-script
      (bl.crypto:hash256 combined))))
 
-(define-rpc "generateblock" (node (output txs-arg (submit :bool-or t)))
+(define-rpc "generateblock" (node (output (txs-arg :array) (submit :bool-or t)))
   "Mine a single block containing exactly the given transactions (Bitcoin Core
 generateblock; CPU mining, intended for regtest). PARAMS: (output [tx,...]
 [submit]). OUTPUT is an address or descriptor for the coinbase, which is paid the
@@ -752,6 +752,11 @@ and {hash} is returned; otherwise {hash, hex}."
   (let ((network (bl:node-network node)))
     (unless (stringp output)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "output must be a string"))
+    ;; :ARRAY, so an explicit empty array reaches this as NIL. The wire
+    ;; delivers `[]' at a TOP-LEVEL positional slot as +json-empty-array+, a
+    ;; truthy symbol that is not a list, and reading it with LISTP answered
+    ;; `generateblock(addr, [])' -- the form Core's own callers send for a
+    ;; block with no extra transactions -- with -8.
     (unless (listp txs-arg)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "transactions must be an array"))
     (let* ((script-pubkey (%resolve-coinbase-output-script output network))
@@ -774,7 +779,22 @@ and {hash} is returned; otherwise {hash, hex}."
                                  height
                                  (bl.val:calculate-block-subsidy height)
                                  :script-pubkey script-pubkey
-                                 :witness-commitment-script (%witness-commitment-script-for-txs txs)))
+                                 :witness-commitment-script
+                                 (%witness-commitment-script-for-txs txs)
+                                 ;; Core's RegenerateCommitments (node/miner.cpp:
+                                 ;; 67-77) reaches GenerateCoinbaseCommitment,
+                                 ;; which appends the commitment OUTPUT with no
+                                 ;; deployment check but installs the reserved
+                                 ;; WITNESS only under DeploymentActiveAfter(...,
+                                 ;; DEPLOYMENT_SEGWIT) (validation.cpp:4016-4049).
+                                 ;; Without the gate this second construction
+                                 ;; site built a coinbase carrying witness data
+                                 ;; below the segwit height, which the dry run
+                                 ;; below then rejected as :unexpected-witness --
+                                 ;; generateblock could not mine at all under
+                                 ;; -testactivationheight=segwit@N.
+                                 :segwit-active
+                                 (bl.val:segwit-active-at-height-p height)))
                       (all-txs (cons coinbase txs))
                       (merkle (bl.val:compute-merkle-root
                                (mapcar #'bl.ser:transaction-hash all-txs)))
