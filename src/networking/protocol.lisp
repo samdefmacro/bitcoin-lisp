@@ -3211,16 +3211,22 @@ than silently approximated away."
 (define-p2p-handler "sendcmpct" (peer payload ctx)
   "Handle a sendcmpct message from a peer. We support only compact block version 2;
 any other version is ignored entirely, mirroring Bitcoin Core
-(net_processing.cpp: `if (sendcmpct_version != CMPCTBLOCKS_VERSION) return;`). A
-v1 compact block would deliver a witness-stripped coinbase."
+(net_processing.cpp:3913 `if (sendcmpct_version != CMPCTBLOCKS_VERSION) return;`). A
+v1 compact block would deliver a witness-stripped coinbase.
+
+The high-bandwidth flag FOLLOWS the message in both directions
+(net_processing.cpp:3917-3921): sendcmpct(1) selects us as the peer's BIP152
+high-bandwidth announcer, sendcmpct(0) deselects us again. Core sends the
+deselecting one itself, to the peer it drops from lNodesAnnouncingHeaderAndIDs
+(MaybeSetPeerAsAnnouncingHeaderAndIDs, :1317), so a promote-then-demote is
+ordinary traffic rather than a corner case. Setting the slot only on 1 left
+getpeerinfo's bip152_hb_from stuck at T for the life of such a connection."
   (declare (ignore ctx))
   (multiple-value-bind (high-bandwidth version)
       (bl.ser:parse-sendcmpct-payload payload)
     (when (= version +compact-blocks-version+)
       (setf (peer-compact-block-version peer) version)
-      ;; Track high-bandwidth mode preference
-      (when high-bandwidth
-        (setf (peer-compact-block-high-bandwidth peer) t)))
+      (setf (peer-compact-block-high-bandwidth peer) high-bandwidth))
     (bl:log-debug "Peer ~A sendcmpct v~D (high-bw: ~A)"
                             (peer-address peer) version high-bandwidth)))
 
