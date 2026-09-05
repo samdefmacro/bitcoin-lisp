@@ -439,6 +439,13 @@
   because pruning deletes the lowest-numbered pair first and leaves a
   hole.
 
+  The header index and its delta log are shared by every chainstate on a
+  datadir (they take no storage-suffix), so what binds the delta to the
+  snapshot it extends is a per-BASE-PATH record, not a chain-state slot:
+  Core keeps the block index in BlockManager, outside any chainstate, and
+  a per-chainstate copy of that binding let a snapshot chainstate and the
+  primary invalidate each other's log.
+
   Traps: `prune-old-blocks` takes its byte target as an argument because
   the node halves it while a historical chainstate exists -- storage
   never reads the node. An index whose startup catch-up is not wired is

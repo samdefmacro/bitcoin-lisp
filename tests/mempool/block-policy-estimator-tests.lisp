@@ -296,7 +296,7 @@ transactions are still tracked. Drives the real connect-block."
            "connect-block must report the block to the estimator")
        (is (= 0 (hash-table-count
                  (bl.mp::block-policy-estimator-tracked est)))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 ;;;; --- Persistence ---
 

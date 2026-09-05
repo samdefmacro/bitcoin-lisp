@@ -174,7 +174,7 @@ block-store / utxo-set, ready for activate-block. Call inside (with-network (:re
          (ghash (bl.store:best-block-hash cs))
          (ghdr (bl::make-genesis-header :regtest))
          (node (bl:make-node :network :regtest)))
-    (clrhash bl.val::*block-undo-data*)
+    (clear-undo-cache)
     (bl.store:add-block-index-entry
      cs (bl.store:make-block-index-entry
          :hash ghash :height 0 :chain-work 1 :status :valid :header ghdr))
@@ -240,7 +240,7 @@ utxo-set (pass a coins-view-cache to exercise the LevelDB surface)."
                                         :initial-element 0)
             :timestamp 1231006505 :bits #x1d00ffff :nonce 0
             :cached-hash genesis-hash)))
-    (clrhash bl.val::*block-undo-data*)
+    (clear-undo-cache)
     (bl.store:add-block-index-entry
      chain-state
      (bl.store:make-block-index-entry

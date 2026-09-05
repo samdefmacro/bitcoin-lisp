@@ -54,13 +54,21 @@ BIP34 at height 1)."
           (bl.mp:make-mempool))
     node))
 
-;;;; Reproducible randomness
+;;;; Node-global state a fixture has to reset
+
+(defun clear-undo-cache ()
+  "Empty the in-memory undo cache validation keeps for recently connected
+blocks. Every fixture that builds a chain starts from an empty one, or a
+previous test's undo entries answer for a block this one just built."
+  (clrhash bl.val::*block-undo-data*))
 
 (defun release-datadir-lock ()
   "Drop the datadir lock a running node holds, without any of the flushing
 STOP-NODE does -- what a killed process leaves behind, and what a test that
 restarts a node over the same directory needs before it can."
   (bl::unlock-data-directory))
+
+;;;; Reproducible randomness
 
 (defun make-deterministic-rng (seed)
   "Deterministic xorshift64 PRNG closure: (funcall rng n) => [0, n). No

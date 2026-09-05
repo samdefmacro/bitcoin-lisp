@@ -64,7 +64,7 @@ normal scripts (P2PKH, P2WPKH, bare pubkey, empty) are not."
            ;; Store
            (bl.val::store-undo-data block-hash spent-utxos 500)
            ;; Clear in-memory cache to force disk load
-           (clrhash bl.val::*block-undo-data*)
+           (clear-undo-cache)
            (clrhash bl.val::*undo-cache-heights*)
            ;; Load from disk
            (let ((loaded (bl.val:get-undo-data block-hash)))
@@ -120,7 +120,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
          (progn
            (bl.val:initialize-undo-storage base-path)
            (bl.val::store-undo-data block-hash spent-utxos 503)
-           (clrhash bl.val::*block-undo-data*)
+           (clear-undo-cache)
            (clrhash bl.val::*undo-cache-heights*)
            (let ((loaded (bl.val:get-undo-data block-hash)))
              (is (= 2 (length loaded))))
@@ -139,7 +139,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
            (bl.val:initialize-undo-storage base-path)
            (bl.val::store-undo-data block-hash spent-utxos 502)
            ;; Clear cache
-           (clrhash bl.val::*block-undo-data*)
+           (clear-undo-cache)
            (clrhash bl.val::*undo-cache-heights*)
            ;; Corrupt the file
            (let ((path (bl.val::undo-file-path block-hash)))
@@ -162,7 +162,7 @@ of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
     (unwind-protect
          (progn
            (bl.val:initialize-undo-storage base-path)
-           (clrhash bl.val::*block-undo-data*)
+           (clear-undo-cache)
            (is (null (bl.val:get-undo-data block-hash))))
       (setf bl.val::*undo-base-path* nil)
       (uiop:delete-directory-tree base-path :validate t :if-does-not-exist :ignore))))

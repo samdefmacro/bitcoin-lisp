@@ -294,7 +294,7 @@ should extend the chain normally."
         (is (null error))
         (is (= 3 (bl.store:current-height chain-state)))
         (is (equalp a3-hash (bl.store:best-block-hash chain-state)))))
-    (clrhash bl.val::*block-undo-data*))))
+    (clear-undo-cache))))
 
 (test activate-block-pre-reorgs-on-stronger-fork
   "When the incoming block's parent sits on a competing fork that, with
@@ -346,7 +346,7 @@ block. Chain tip should land on the new fork's tip."
           ;; present; A1, A2 absent. (Each coinbase txid is unique per
           ;; make-reorg-test-block, derived from block-hash.)
           (is (= 3 (bl.store:utxo-count utxo-set))))))
-    (clrhash bl.val::*block-undo-data*))))
+    (clear-undo-cache))))
 
 (test reorg-rejects-fork-carrying-invalid-block
   "CC-1 regression. A competing fork with strictly more work but carrying an
@@ -408,7 +408,7 @@ block into the chainstate."
                                (first (make-test-chain-hashes #xB0 2))
                                b2-hash 2 :value 5000000001))))
                      0)))))
-      (clrhash bl.val::*block-undo-data*)))))
+      (clear-undo-cache)))))
 
 (test activate-block-stores-weaker-fork-without-activating
   "When the incoming block's parent sits on a competing fork whose
@@ -442,7 +442,7 @@ update the chain tip."
             (is (= 3 (bl.store:current-height chain-state)))
             ;; B2 IS in the block store for future reorg consideration.
             (is (not (null (bl.store:get-block block-store b2-hash))))))))
-    (clrhash bl.val::*block-undo-data*))))
+    (clear-undo-cache))))
 
 (test activate-block-unknown-parent
   "When the incoming block's parent isn't in the chain index,
@@ -465,7 +465,7 @@ activate-block returns :unknown-parent without doing anything."
         (is (eq error :unknown-parent))
         ;; Chain unchanged.
         (is (= 1 (bl.store:current-height chain-state)))))
-    (clrhash bl.val::*block-undo-data*))))
+    (clear-undo-cache))))
 
 (test invalidate-and-reconsider-block
   "invalidate-block marks a block + descendants invalid and reorgs to its parent;
@@ -502,7 +502,7 @@ reconsider-block clears the flags and reorgs back to the best valid chain."
      (multiple-value-bind (ok reason)
          (bl.val:invalidate-block chain-state block-store utxo-set genesis-hash)
        (is (null ok)) (is (eq :cannot-invalidate-genesis reason)))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test precious-block
   "preciousblock reorgs to a chosen block of >= the tip's work; equal-work
@@ -548,7 +548,7 @@ equal-work forks."
               chain-state block-store utxo-set
               (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xEE))
            (is (null ok)) (is (eq :block-not-found reason)))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test rpc-verifychain-reads-stored-blocks
   "verifychain (checklevel 0) confirms the last N stored blocks read back from
@@ -562,7 +562,7 @@ the block store."
        (setf (bl:node-chain-state node) chain-state)
        (setf (bl:node-block-store node) block-store)
        (is (eq t (bl.rpc::rpc-verifychain node (list 0 3)))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test rpc-getchaintxstats-window
   "getchaintxstats computes window tx counts over connected blocks (coinbase-only
@@ -591,7 +591,7 @@ test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
        ;; blockcount >= height -> error (Core's bound).
        (signals bl.rpc:rpc-error
          (bl.rpc::rpc-getchaintxstats node (list 99))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test rpc-getchaintxstats-genesis-backfill
   "txcount stays known on a v1-upgraded index: genesis is never in the block
@@ -615,7 +615,7 @@ coinbase) instead of being dropped as unreadable."
            (is (= 2 (cdr (assoc "window_tx_count" r :test #'string=))))))
        ;; The definitional count is cached back onto the entry.
        (is (= 1 (bl.store:block-index-entry-tx-count genesis-entry))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 ;;;; Self-heal: prune a stored witness-stripped fork block during reorg
 
@@ -698,7 +698,7 @@ failing the reorg forever and wedging the node (testnet4 stuck ~1800 blocks behi
              (is (= 2 (bl.store:current-height chain-state)))
              (is (equalp (bl.store:block-index-entry-hash a2-entry)
                          (bl.store:best-block-hash chain-state)))))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test activate-best-chain-switches-to-a-downloaded-heavier-fork
   "The defect this closes: a strictly-heavier fork whose blocks are ALL already
@@ -776,7 +776,7 @@ fully-downloaded 149120 branch with strictly more work lay on disk."
                (is (null switched2))
                (is (null missing2)))
              (is (= 3 (bl.store:current-height chain-state)))))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test activation-steps-report-the-new-tip-to-stopatheight
   "-stopatheight is checked from CONNECT-BLOCK's tip-EXTENSION arm and, since
@@ -814,7 +814,7 @@ ask the node to stop."
                        "activate-best-chain never reported its new tip to ~
 maybe-stop-at-height; heights seen: ~S" seen))
               (setf (symbol-function 'bl:maybe-stop-at-height) real)))
-       (clrhash bl.val::*block-undo-data*)))))
+       (clear-undo-cache)))))
 
 (defun %stage-heavier-downloaded-fork (chain-state block-store genesis-hash)
   "Put a 3-block fork on disk with strictly more work than the current tip, as
@@ -863,7 +863,7 @@ move the tip) and require that the heavier downloaded fork gets activated."
          (bl.net::run-ibd nil (bl.ctx:make-node-context :chain-state chain-state :utxo-set utxo-set :block-store block-store)))
        (is (= 3 (bl.store:current-height chain-state)))
        (is (equalp fork-tip (bl.store:best-block-hash chain-state))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test run-ibd-activation-carries-the-txindex
   "The reorg driven by run-ibd's periodic activation must carry the transaction
@@ -903,7 +903,7 @@ asserts the marker, which is the thing that was wrong."
                             (bl.store:txindex-best-block txindex)))))
          (bl.store:close-tx-index txindex)
          (uiop:delete-directory-tree txdir :validate t :if-does-not-exist :ignore)))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (defun %reorg-relay-state (targeted suffix)
   "Run a reorg on a chainstate that is targeted (the assumeutxo background
@@ -1017,7 +1017,7 @@ below the floor is ever returned."
                    (bl.store:block-index-entry-hash
                     (bl.val:best-valid-tip
                      chain-state block-store (1- tip-work))))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (defun %make-2tx-reorg-block (prev-hash block-hash height)
   "A reorg test block with a coinbase PLUS a dummy second tx, so tx-count > 1 —
@@ -1088,7 +1088,7 @@ missing-block list."
          (bl.store:add-block-index-entry chain-state b2-entry)
          (bl.store:update-chain-tip chain-state a2-hash 2)
          ;; Ensure no undo exists for A2 (the corruption).
-         (clrhash bl.val::*block-undo-data*)
+         (clear-undo-cache)
          (multiple-value-bind (ok detail)
              (bl.val:perform-reorg
               chain-state block-store utxo-set a2-entry b2-entry)
@@ -1097,7 +1097,7 @@ missing-block list."
            ;; No mutation on a refused reorg — tip still A2.
            (is (= 2 (bl.store:current-height chain-state)))
            (is (equalp a2-hash (bl.store:best-block-hash chain-state))))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 ;;;; Reorg mempool bulk re-add (cluster mempool P8 — Core
 ;;;; MaybeUpdateMempoolForReorg, validation.cpp:294-389)
@@ -1318,7 +1318,7 @@ semantics and re-points entries left stale by a crash."
                             (bl.store:tx-location-block-hash loc)))))
          (bl.store:close-tx-index txindex)
          (ignore-errors (delete-file (merge-pathnames "txindex.dat" txdir)))
-         (clrhash bl.val::*block-undo-data*))))))
+         (clear-undo-cache))))))
 
 (test txindex-marker-rewinds-to-the-parent-on-disconnect
   "Core BaseIndex::Rewind moves the index's locator back to the fork when
@@ -1409,7 +1409,7 @@ confirmations."
                   (is (eql 2 (cdr (assoc "confirmations" r :test #'string=)))))))
          (bl.store:close-tx-index txindex)
          (ignore-errors (delete-file (merge-pathnames "txindex.dat" txdir)))
-         (clrhash bl.val::*block-undo-data*))))))
+         (clear-undo-cache))))))
 
 ;;;; Wave 8A: recent-rejects reset on EVERY tip advance (not just reorgs)
 
@@ -1439,7 +1439,7 @@ Previously only the reorg path cleared it."
        ;; And the filter still works after the reset.
        (bl:add-recent-reject rejects cached)
        (is-true (bl:recent-reject-p rejects cached)))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 ;;;; Wave 9C: removeForReorg — re-filter PRE-EXISTING entries after a reorg
 ;;;; (Core CTxMemPool::removeForReorg, txmempool.cpp:360-386, driven by
@@ -2206,7 +2206,7 @@ same deterministic fork failure as reorg-rejects-fork-carrying-invalid-block."
              (is (null (gethash b2-hash set)))
              (is (null (bl.net::retry-best-reorg-candidate cs store utxo)))
              (is (equalp a1-hash (bl.store:best-block-hash cs))))))
-       (clrhash bl.val::*block-undo-data*)))))
+       (clear-undo-cache)))))
 
 (test l5-refused-reorg-requeues-missing-and-keeps-candidate
   "Item 12(1) contrast: a tip+1 block that WINS on work but whose intermediate
@@ -2334,7 +2334,7 @@ re-fetched; an unsolicited stripped copy does not."
            (is (null (bl.store:block-exists-p store above-uns-hash)))
            (is (null (gethash above-uns-hash
                               (bl.net:ibd-context-pending-blocks ctx)))))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test l5-out-of-order-acceptable-boundaries
   "Item 12(3): %out-of-order-block-acceptable-p boundary cases beyond the
@@ -2647,7 +2647,7 @@ recoverable (:header-valid). Directly exercises the perform-reorg poisoning hook
            (is-true bvt)
            (is (not (eq bvt b2-entry)))
            (is (not (eq bvt b3-entry)))))
-       (clrhash bl.val::*block-undo-data*)))))
+       (clear-undo-cache)))))
 
 (test item14-download-walk-aborts-above-invalid-block
   "Verifies the already-wired hook fires: find-blocks-to-download-for-peer aborts
@@ -2788,7 +2788,7 @@ node (the exact class of bug this project has fought)."
          ;; Active chain untouched.
          (is (equalp a2-hash (bl.store:best-block-hash cs)))
          (is (= 2 (bl.store:current-height cs))))
-       (clrhash bl.val::*block-undo-data*)))))
+       (clear-undo-cache)))))
 
 (test item14-negative-corrupt-undo-not-poisoned
   "CRITICAL NEGATIVE: a reorg refused because a to-DISCONNECT spending block's undo
@@ -2831,7 +2831,7 @@ the fork. It marks NOTHING :invalid; the competing fork stays recoverable."
          (bl.store:add-block-index-entry chain-state b2-entry)
          (bl.store:update-chain-tip chain-state a2-hash 2)
          ;; No undo for the spending A2 (the modelled corruption).
-         (clrhash bl.val::*block-undo-data*)
+         (clear-undo-cache)
          (multiple-value-bind (ok detail)
              (bl.val:perform-reorg chain-state block-store utxo-set
                                                     a2-entry b2-entry)
@@ -2844,7 +2844,7 @@ the fork. It marks NOTHING :invalid; the competing fork stays recoverable."
          (is (eq :valid (bl.store:block-index-entry-status a1-entry)))
          (is (eq :valid (bl.store:block-index-entry-status a2-entry)))
          (is (= 2 (bl.store:current-height chain-state)))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 ;;;; Median-time-past on the reorg path (GA8 S1-7)
 
@@ -2914,7 +2914,7 @@ Control: the same block through validate-block WITHOUT :skip-header is
          (is (eq :valid (bl.store:block-index-entry-status a1-entry)))
          (is (eq :header-valid (bl.store:block-index-entry-status b1-entry)))
          (is (eq :header-valid (bl.store:block-index-entry-status b2-entry))))
-       (clrhash bl.val::*block-undo-data*)))))
+       (clear-undo-cache)))))
 
 (test reconsider-block-refuses-mtp-violating-target
   "GA8 S1-7, the case with no descendant: reconsider-block hands its target
@@ -2945,7 +2945,7 @@ The reorg must refuse and reconsiderblock report :reorg-failed."
          (is (eq :reorg-failed reason)))
        (is (equalp a1-hash (bl.store:best-block-hash cs)))
        (is (= 1 (bl.store:current-height cs)))
-       (clrhash bl.val::*block-undo-data*)))))
+       (clear-undo-cache)))))
 
 ;;;; Cooperative stop inside a reorg (coins-DB alignment plan, phase 3b)
 ;;;;
@@ -3026,7 +3026,7 @@ those tests could pass on a reorg that never worked at all."
                  (bl.store:best-block-hash chain-state)))
      ;; Chain A's three coinbases out, chain B's three in.
      (is (= 3 (bl.store:utxo-count utxo-set)))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test reorg-stop-truncates-the-disconnect-at-a-block-boundary
   "A stop request during PHASE A must stop the disconnect on a block boundary and
@@ -3062,7 +3062,7 @@ UTXO set that did not match the recorded tip."
                          :key #'bl.store:block-index-entry-status)))
        (is (eq :valid (bl.store:block-index-entry-status a1)))
        (is (not (%p3b-coinbase-in-utxo-set-p utxo-set block-store (first b-entries)))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test reorg-stop-truncates-the-connect-without-rolling-back
   "A stop request during PHASE B must stop after the last fully connected fork
@@ -3097,7 +3097,7 @@ block). The next start simply reorgs the rest of the way."
        ;; B2 connected, B3 did not — the truncation is exactly one block deep.
        (is (%p3b-coinbase-in-utxo-set-p utxo-set block-store (second b-entries)))
        (is (not (%p3b-coinbase-in-utxo-set-p utxo-set block-store (third b-entries)))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test reorg-stop-leaves-the-coins-pointer-and-the-tip-naming-one-block
   "The whole point of truncating on a boundary: the coins-DB best-block pointer
@@ -3133,7 +3133,7 @@ actually exists."
                        (bl.store:best-block-hash chain-state))
                "the coins pointer and the chain tip must name one block")
            (is (= 1 (bl.store:current-height chain-state)))))
-       (clrhash bl.val::*block-undo-data*)))))
+       (clear-undo-cache)))))
 
 ;;;; GA9 S1-4: an invalidated entry must never be resurrected
 
@@ -3291,4 +3291,4 @@ it."
                       height))))
          (bl.store:close-tx-index txindex)
          (uiop:delete-directory-tree txdir :validate t :if-does-not-exist :ignore)))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))

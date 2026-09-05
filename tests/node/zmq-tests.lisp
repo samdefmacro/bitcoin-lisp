@@ -293,7 +293,7 @@ non-block inclusion reasons\")."
                               (string= wanted (third (uiop:split-string l :separator " "))))
                             (%zmq-drain sub))
                       "connect-block must publish the connected block's hash")))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test zmq-connect-block-publishes-each-transaction-in-the-block
   "The per-transaction half of BlockConnected, which the hashblock test above
@@ -325,7 +325,7 @@ executed it."
                             (%zmq-drain sub))
                       "connect-block must publish the txid of every transaction
                        in the connected block")))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 (test zmq-publisher-specs-reach-the-node-from-config
   "apply-config-globals must record what -zmqpub* asked for, or start-node has

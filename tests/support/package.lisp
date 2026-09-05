@@ -23,6 +23,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:rpc-error-code-of
    #:make-deterministic-rng
    #:release-datadir-lock
+   #:clear-undo-cache
    #:coins-cache-entries
    #:coins-cache-fresh-count
    #:coins-cache-dirty-count
