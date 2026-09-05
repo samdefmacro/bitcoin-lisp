@@ -109,6 +109,15 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (recv-per-msg (make-hash-table :test 'equal #+sbcl :synchronized #+sbcl t)
                 :type hash-table)
   (send-queue '() :type list)
+  ;; Inv vectors from getdata messages this peer has sent that are not
+  ;; answered yet, oldest first (Core Peer::m_getdata_requests,
+  ;; net_processing.cpp:398). The getdata handler appends the whole message
+  ;; and then serves from the front; serving STOPS while the peer is
+  ;; send-paused, and whatever is left waits here until the next message pass
+  ;; drains it (Core ProcessMessages, net_processing.cpp:5222-5227). Dropping
+  ;; the remainder instead would make the peer wait out its own request
+  ;; timeout for a block we had already read off disk.
+  (getdata-queue '() :type list)
   ;; Bounded set of txids announced to this peer. Was an unbounded hash-table --
   ;; a per-peer memory leak on long-lived relay connections. Core bounds the
   ;; equivalent m_tx_inventory_known_filter at CRollingBloomFilter{50000}; we use

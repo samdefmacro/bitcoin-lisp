@@ -152,6 +152,41 @@ Five test files ask this question, which is why it is a fixture rather than
 fifty-four reaches into the same internal."
   (bl::args->start-node-plist args conf-text settings-rows))
 
+;;;; P2P message handlers
+
+(defun deliver-getdata (peer payload ctx)
+  "Drive one getdata message PAYLOAD through the shipped handler (Core's
+GETDATA branch, which appends the invs to the peer's pending queue and then
+runs ProcessGetData over it).
+
+Three test files ask this question, which is why it is a fixture rather than
+a reach into the handler from each of them."
+  (bl.net::handle-getdata peer payload ctx))
+
+(defun drain-peer-once (peer node-ctx &optional ibd-ctx)
+  "Run the shipped per-peer message pump over PEER exactly once (Core's
+per-peer ProcessMessages pass): serve whatever getdata the last pass left
+parked, then read and dispatch what is readable, then reap the peer if its
+connection has died.
+
+Three test files ask this question, which is why it is a fixture rather than
+a reach into the pump from each of them."
+  (bl.net::drain-and-reap-peer peer node-ctx ibd-ctx))
+
+(defun peer-pending-getdata (peer)
+  "The inv vectors PEER has asked for and we have not answered yet (Core
+Peer::m_getdata_requests) -- what a send-paused serve left behind."
+  (bl.net::peer-getdata-queue peer))
+
+(defun send-buffer-bytes (conn)
+  "CONN's buffered-unsent-byte counter (Core CNode::m_send_memusage).
+SETF-able so a test can put a connection over the send-pause cap without a
+jammed socket."
+  (bl.net::connection-send-queue-bytes conn))
+
+(defun (setf send-buffer-bytes) (n conn)
+  (setf (bl.net::connection-send-queue-bytes conn) n))
+
 ;;;; The REST interface
 
 (defun rest-request (node uri)

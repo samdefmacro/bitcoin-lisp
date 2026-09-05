@@ -66,25 +66,16 @@ dials). Only the two genuine outbound full-relay peers are counted."
 ;;; 2. Non-blocking send path
 ;;; ============================================================
 
-(defun %send-queue-bytes (conn)
-  "CONN's buffered-unsent-byte counter (Core CNode::m_send_memusage). The one
-reach into it in this file; SETF-able so a test can put a connection over the
-pause cap without a jammed socket."
-  (bl.net::connection-send-queue-bytes conn))
-
-(defun (setf %send-queue-bytes) (n conn)
-  (setf (bl.net::connection-send-queue-bytes conn) n))
-
 (test send-paused-predicate-tracks-cap
   "connection-send-paused-p flips exactly at the send-buffer cap (Core
 fPauseSend on nSendBufferMaxSize)."
   (let ((conn (bl.net::make-connection)))
-    (setf (%send-queue-bytes conn) 0)
+    (setf (send-buffer-bytes conn) 0)
     (is-false (bl.net:connection-send-paused-p conn))
-    (setf (%send-queue-bytes conn)
+    (setf (send-buffer-bytes conn)
           bl.net:*max-send-buffer-bytes*)
     (is-false (bl.net:connection-send-paused-p conn))
-    (setf (%send-queue-bytes conn)
+    (setf (send-buffer-bytes conn)
           (1+ bl.net:*max-send-buffer-bytes*))
     (is-true (bl.net:connection-send-paused-p conn))))
 
@@ -94,13 +85,13 @@ has made no send progress for the stall timeout (Core socket sending timeout)."
   (let ((conn (bl.net::make-connection))
         (units internal-time-units-per-second))
     ;; No pending data: never stalled, even with an ancient progress time.
-    (setf (%send-queue-bytes conn) 0
+    (setf (send-buffer-bytes conn) 0
           (bl.net::connection-last-send-progress conn)
           (- (get-internal-real-time)
              (* (1+ bl.net::+send-stall-timeout-seconds+) units)))
     (is-false (bl.net:connection-send-stalled-p conn))
     ;; Pending data but recent progress: not stalled.
-    (setf (%send-queue-bytes conn) 500
+    (setf (send-buffer-bytes conn) 500
           (bl.net::connection-last-send-progress conn)
           (get-internal-real-time))
     (is-false (bl.net:connection-send-stalled-p conn))
@@ -117,11 +108,11 @@ has made no send progress for the stall timeout (Core socket sending timeout)."
           (list #(1 2 3))
           (bl.net::connection-send-queue-out conn)
           (list #(4 5))
-          (%send-queue-bytes conn) 5)
+          (send-buffer-bytes conn) 5)
     (bl.net:close-connection conn)
     (is (null (bl.net::connection-send-queue-in conn)))
     (is (null (bl.net::connection-send-queue-out conn)))
-    (is (= 0 (%send-queue-bytes conn)))))
+    (is (= 0 (send-buffer-bytes conn)))))
 
 (test send-bytes-buffers-and-never-blocks-on-jammed-socket
   "A peer whose TCP window is jammed must not pin the caller: send-bytes writes
@@ -165,14 +156,14 @@ us reading that peer's input (70502bf3)."
               (bl.net:join-thread-or-destroy worker :timeout 10)
               (is-true sends-done "send-bytes must not block on a jammed socket")
               ;; Data backed up into the per-connection buffer.
-              (is-true (plusp (%send-queue-bytes conn)))
+              (is-true (plusp (send-buffer-bytes conn)))
               ;; The buffer went over the cap, so the peer is send-paused.
               (is-true (bl.net:connection-send-paused-p conn))
               (is-false dropped "an over-cap message must be queued, not dropped")
               ;; Every byte is accounted for: what the kernel took plus what is
               ;; still buffered is the whole 4 MB. A drop would lose a chunk here.
               (is (= total (+ (bl.net:connection-bytes-sent conn)
-                              (%send-queue-bytes conn)))
+                              (send-buffer-bytes conn)))
                   "queued + sent must equal what was handed to send-bytes")
               (bl.net:close-connection conn)
               (ignore-errors (usocket:socket-close server-conn))))
@@ -207,21 +198,122 @@ else changed, the SAME pending message is read."
                (force-output (usocket:socket-stream sender))
                (sleep 0.2)
                ;; Paused: the pump must not touch it.
-               (setf (%send-queue-bytes conn)
+               (setf (send-buffer-bytes conn)
                      (1+ bl.net:*max-send-buffer-bytes*))
                (is-true (bl.net:connection-send-paused-p conn))
-               (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) nil)
+               (drain-peer-once peer (bl.ctx:make-node-context) nil)
                (is (= 0 (bl.net:connection-bytes-received conn))
                    "a send-paused peer's input is left unread")
                (is-true (bl.net:connection-connected conn)
                         "and the pause is not a reason to disconnect it")
                ;; Positive control: unpause and the same message is consumed.
-               (setf (%send-queue-bytes conn) 0)
-               (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) nil)
+               (setf (send-buffer-bytes conn) 0)
+               (drain-peer-once peer (bl.ctx:make-node-context) nil)
                (is (plusp (bl.net:connection-bytes-received conn))
                    "and once drained the pending message is read after all")
                (is (plusp (gethash "ping" (bl.net:peer-recv-per-msg peer) 0))
                    "the message the pause deferred is the one dispatched"))
+          (bl.net:close-connection conn)
+          (ignore-errors (usocket:socket-close sender))
+          (bl.net:close-listener srv))))))
+
+(defun %gdq-tx (n)
+  "A distinct segwit tx for the deferred-getdata tests (N picks the outpoint,
+so two calls give two different txids)."
+  (bl.ser:make-transaction
+   :version 2
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
+                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element n)
+                                      :index 0)
+                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                    :sequence #xffffffff))
+   :outputs (vector (bl.ser:make-tx-out
+                     :value 1000
+                     :script-pubkey (make-array 1 :element-type '(unsigned-byte 8)
+                                                  :initial-element #x51)))
+   :witness (vector (list (make-array 4 :element-type '(unsigned-byte 8)
+                                        :initial-contents '(1 2 3 4))))
+   :lock-time 0))
+
+(defun %gdq-payload (txids)
+  "The payload of a getdata asking for TXIDS as MSG_WITNESS_TX."
+  (subseq (bl.ser:make-getdata-message
+           (mapcar (lambda (h)
+                     (bl.ser:make-inv-vector
+                      :type bl.ser:+inv-type-witness-tx+ :hash h))
+                   txids))
+          24))
+
+(test send-paused-getdata-waits-in-the-peer-queue-and-resumes
+  "A getdata whose peer goes send-paused part-way through is PARKED, not
+dropped: Core answers from the front of peer.m_getdata_requests, breaks out on
+fPauseSend and erases only the prefix it answered (net_processing.cpp:2532-2536,
+:2558, :2570), then drains the rest at the top of the next ProcessMessages
+(:5222-5227) -- before the fPauseSend return that stops it reading the peer at
+all (:5244-5245). Dropping the remainder instead makes the peer wait out its
+own request timeout for data we had already looked up.
+
+Two txs are asked for in one getdata and the first answer fills the outgoing
+buffer past the cap. The unbroadcast set is the witness of a serve on either
+side: it loses an entry on every successful answer (Core ProcessGetData
+RemoveUnbroadcastTx), so 1 of 2 means exactly one tx went out."
+  (let* ((bl:*network* :regtest)
+         (mempool (bl.mp:make-mempool))
+         (srv (bl.net:open-listener "127.0.0.1" 0)))
+    (is-true srv)
+    (when srv
+      (let* ((port (usocket:get-local-port srv))
+             (sender (usocket:socket-connect "127.0.0.1" port
+                                             :element-type '(unsigned-byte 8)))
+             (accepted (usocket:socket-accept srv :element-type '(unsigned-byte 8)))
+             (conn (bl.net::make-connection
+                    :socket accepted :host "127.0.0.1" :port port :connected t))
+             (peer (bl.net:make-peer :state :ready :address "127.0.0.1:8333"
+                                     :connection conn))
+             (txs (list (%gdq-tx 41) (%gdq-tx 42)))
+             (txids (mapcar #'bl.ser:transaction-hash txs))
+             (ctx (bl.ctx:make-node-context :mempool mempool))
+             (answers 0)
+             (real (fdefinition 'bl.net:send-message)))
+        (unwind-protect
+             (progn
+               (dolist (tx txs)
+                 (%add-tx mempool tx)
+                 (bl.mp:mempool-add-unbroadcast
+                  mempool (bl.ser:transaction-hash tx)))
+               ;; Both txs predate our last inv flush, so both are servable
+               ;; (the anti-probing gate would otherwise refuse them).
+               (setf (bl.net:peer-last-inv-sequence peer)
+                     (bl.mp:mempool-sequence mempool))
+               (unwind-protect
+                    (progn
+                      ;; Answering the FIRST request fills the send buffer past
+                      ;; the cap, which is what Core's fPauseSend break sees.
+                      (setf (fdefinition 'bl.net:send-message)
+                            (lambda (p bytes)
+                              (declare (ignore bytes))
+                              (incf answers)
+                              (setf (send-buffer-bytes (bl.net:peer-connection p))
+                                    (1+ bl.net:*max-send-buffer-bytes*))
+                              t))
+                      (deliver-getdata peer (%gdq-payload txids) ctx))
+                 (setf (fdefinition 'bl.net:send-message) real))
+               (is (= 1 answers) "the pause stops the serve after one answer")
+               (is (= 1 (bl.mp:mempool-unbroadcast-count mempool))
+                   "exactly one of the two txs was answered")
+               (is (= 1 (length (peer-pending-getdata peer)))
+                   "and the unanswered request is parked on the peer, not dropped")
+               ;; The buffer drains; the shipped pump resumes the parked request
+               ;; before it decides whether to read this peer at all.
+               (setf (send-buffer-bytes conn) 0)
+               (drain-peer-once peer ctx nil)
+               (is (= 0 (bl.mp:mempool-unbroadcast-count mempool))
+                   "the parked request is answered once the buffer drains")
+               (is (null (peer-pending-getdata peer)) "and the queue is empty again")
+               (is-true (bl.net:connection-connected conn)
+                        "the peer is not disconnected by any of this"))
           (bl.net:close-connection conn)
           (ignore-errors (usocket:socket-close sender))
           (bl.net:close-listener srv))))))

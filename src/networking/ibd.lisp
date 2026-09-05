@@ -1761,12 +1761,34 @@ stops talking. The half-read-message reaper below is skipped with it: it
 measures from the last byte that ARRIVED, so running it while we are
 deliberately not reading would disconnect a healthy peer for our own
 pause. A peer that never drains is disconnected by check-peer-health's
-send-stall timeout instead."
+send-stall timeout instead.
+
+The ONE thing that pause does not defer is the peer's own pending getdata:
+that runs first, above the gate, because it is the work the previous pass
+stopped mid-way (Core ProcessMessages calls ProcessGetData before its
+fPauseSend return, net_processing.cpp:5222-5245). It is also why the queue
+cannot grow without bound: it is only ever left non-empty by a pause, and a
+paused peer's input is not read, so nothing can add to it until it drains."
     ;; Read the connection ONCE. An RPC-thread disconnect (disconnectnode, setban)
   ;; between two reads of the slot would hand (connection-connected NIL) a NIL —
   ;; a TYPE-ERROR outside the handler-case below, which aborts the whole sync
   ;; cycle. Latent before; header sync now runs this several times a second.
   (let ((conn (peer-connection peer)))
+   ;; Whatever a send-paused pass left in this peer's getdata queue is served
+   ;; FIRST, before the pause gate below decides whether to read the peer at
+   ;; all -- Core's ProcessMessages runs ProcessGetData at the top and only
+   ;; then returns on fPauseSend (net_processing.cpp:5222-5245). Doing it
+   ;; after the gate would never resume a peer that is still paused, and the
+   ;; queue is what the pause exists to defer; PROCESS-PEER-GETDATA re-checks
+   ;; the pause itself and stops again if the buffer has not drained.
+   (when (and (eq (peer-state peer) :ready)
+              conn
+              (connection-connected conn)
+              (peer-getdata-queue peer))
+     (handler-case (process-peer-getdata peer node-ctx)
+       (error (c)
+         (bl:log-warn "Peer ~A: error serving a deferred getdata: ~A"
+                      (peer-address peer) c))))
    (when (and (eq (peer-state peer) :ready)
               conn
               ;; Only drain a connection still believed live. If a previous

@@ -1972,16 +1972,36 @@ form would waste the construction on both ends."
 the -maxuploadtarget serving limit (Core HISTORICAL_BLOCK_AGE,
 net_processing.cpp:120).")
 
+(defun queue-getdata (peer invs)
+  "Append INVS to PEER's pending getdata queue, oldest first (Core
+peer.m_getdata_requests.insert / push_back, net_processing.cpp:4260 and
+:4389). INVS is a fresh list in both callers, so it is spliced rather than
+copied."
+  (setf (peer-getdata-queue peer)
+        (nconc (peer-getdata-queue peer) invs)))
+
 (define-p2p-handler ("getdata" :rate-bucket peer-rate-limit-getdata) (peer payload ctx)
-  "Handle a getdata message. Respond with requested transactions or blocks.
-Does not respond to transaction requests when relay is disabled (mainnet default).
-Blocks are served from BLOCK-STORE — MSG_BLOCK legacy, MSG_WITNESS_BLOCK with
-witness — so the node is a serving peer, not just a leech. A requested block we
-do not have on disk (pruned or unknown) is silently skipped, like Bitcoin Core's
-handling of unavailable blocks."
+  "Handle a getdata message: append every requested inv to the peer's pending
+getdata queue and serve what we can right now (Core's GETDATA branch,
+net_processing.cpp:4258-4262 — the insert and the ProcessGetData call are one
+step). PROCESS-PEER-GETDATA is the serving half and the resume point."
+  (queue-getdata peer (bl.ser:parse-inv-payload payload))
+  (process-peer-getdata peer ctx))
+
+(defun process-peer-getdata (peer ctx)
+  "Serve PEER's pending getdata queue (Core ProcessGetData,
+net_processing.cpp:2517-2589). Responds with the requested transactions or
+blocks; a tx request is ignored entirely when relay is disabled (mainnet
+default) or the peer has no tx-relay state, and blocks are served from
+BLOCK-STORE — MSG_BLOCK legacy, MSG_WITNESS_BLOCK with witness — so the node
+is a serving peer, not just a leech. A requested block we do not have on disk
+(pruned or unknown) is silently skipped, like Bitcoin Core's handling of
+unavailable blocks.
+
+Called from HANDLE-GETDATA and, for whatever a send-paused peer left behind,
+from DRAIN-AND-REAP-PEER before it decides whether to read that peer at all."
   (bl.ctx:with-node-context (chain-state mempool block-store) ctx
-  (let ((inv-vectors (bl.ser:parse-inv-payload payload))
-        (blocks-served 0)
+  (let ((blocks-served 0)
         (not-found '())
         ;; Computed at most once per getdata, and only if an off-chain block is
         ;; actually asked for: BEST-HEADER-ENTRY is an O(index) scan and this is
@@ -1993,18 +2013,22 @@ handling of unavailable blocks."
                      (and chain-state
                           (bl.store:best-header-entry chain-state))))
              best-header))
-    (dolist (inv inv-vectors)
-      ;; Stop serving a send-paused peer (its outgoing buffer is over the
-      ;; cap) — Core breaks out of ProcessGetData on fPauseSend
-      ;; (net_processing.cpp:2536). Core parks the rest of the getdata for
-      ;; later; we drop it and the peer re-requests, which its own request
-      ;; timeout already handles. The notfound for what WAS processed still
-      ;; goes out below, as in Core.
+    (loop
+      ;; Serve from the front of the queue and stop while the peer is
+      ;; send-paused (its outgoing buffer is over the cap) — Core breaks out
+      ;; of ProcessGetData on fPauseSend (net_processing.cpp:2532-2536,
+      ;; :2558) and erases only the prefix it answered
+      ;; (net_processing.cpp:2570), so the rest waits in m_getdata_requests
+      ;; until the buffer drains. Popping as we go leaves exactly that
+      ;; remainder on the peer, whichever branch below ends the pass. The
+      ;; notfound for what WAS processed still goes out at the end, as in Core.
       (let ((conn (peer-connection peer)))
-        (when (and conn (connection-send-paused-p conn))
+        (when (or (null (peer-getdata-queue peer))
+                  (and conn (connection-send-paused-p conn)))
           (return)))
-      (let ((inv-type (bl.ser:inv-vector-type inv))
-            (hash (bl.ser:inv-vector-hash inv)))
+      (let* ((inv (pop (peer-getdata-queue peer)))
+             (inv-type (bl.ser:inv-vector-type inv))
+             (hash (bl.ser:inv-vector-hash inv)))
         (cond
           ;; Transaction request - only respond if relay is enabled. Resolve the
           ;; hash by the id its inv type implies: MSG_TX by txid (legacy
@@ -2301,23 +2325,20 @@ sending the whole block — never to a free deep read."
                   (>= (bl.store:block-index-entry-height entry)
                       (- tip-height +max-blocktxn-depth+)))))
       (unless within-depth
-        ;; Core queues a full MSG_WITNESS_BLOCK on the peer\'s getdata list, so
-        ;; the block goes out through the getdata path and inherits its
-        ;; backpressure. We send it here instead, which means we must apply
-        ;; that backpressure ourselves: HANDLE-GETDATA refuses to serve another
-        ;; block once the send side is paused, and without the same guard this
-        ;; fallback would just trade a disk-read DoS for a queue one — a peer
-        ;; that never drains could still make us read and serialize 4 MB
-        ;; blocks, only now they pile up in memory.
-        ;;
-        ;; Paused means no reply at all; the peer re-requests, exactly as the
-        ;; getdata path already relies on.
-        (let ((conn (peer-connection peer)))
-          (unless (and conn (connection-send-paused-p conn))
-            (let ((block (bl.store:get-block block-store block-hash)))
-              (when block
-                (send-message peer (bl.ser:make-block-message
-                                    block :witness t))))))
+        ;; Core pushes a full MSG_WITNESS_BLOCK onto the peer's getdata queue
+        ;; and returns (net_processing.cpp:4387-4390, "the message processing
+        ;; loop will go around again ... and we will respond then"), so the
+        ;; block goes out through the getdata path and inherits its
+        ;; backpressure instead of needing its own copy of it. Sending here
+        ;; would trade a disk-read DoS for a queue one — a peer that never
+        ;; drains could make us read and serialize 4 MB blocks that then pile
+        ;; up in memory.
+        (bl:log-cat "net" "Peer ~A sent us a getblocktxn for a block > ~D deep"
+                    (peer-id peer) +max-blocktxn-depth+)
+        (queue-getdata peer (list (bl.ser:make-inv-vector
+                                   :type bl.ser:+inv-type-witness-block+
+                                   :hash block-hash)))
+        (process-peer-getdata peer ctx)
         (return-from handle-getblocktxn nil))
       (let ((block (bl.store:get-block block-store block-hash)))
       (when block
