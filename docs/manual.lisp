@@ -629,8 +629,16 @@
   Traps: a Coalton or defstruct layout change needs a FRESH FASL volume
   -- the persistent volume keeps stale expansions through a warm rebuild,
   an image restart and an ordinary cold run. The script-execution cache
-  must key on everything that decides validity, including the spent
-  scriptPubKey. What FindAndDelete deletes is the signature's PUSH
+  keys on (wtxid, flags) and NOTHING else -- not the spent scriptPubKeys
+  -- because the wtxid commits to every input's OUTPOINT and an outpoint
+  names one output of one transaction, whose txid commits to that
+  output's script and amount (Core states the assumption at
+  validation.cpp:2069-2073 and asserts it on its only writing path,
+  CheckInputsFromMempoolAndCache, :405-430). Block connect CONSULTS that
+  cache and never writes it -- ConnectBlock sets `fCacheResults =
+  fJustCheck' -- so the mempool's consensus pass is the only writer and
+  both readers must pass the flag set the block will use.
+  What FindAndDelete deletes is the signature's PUSH
   (Core `CScript() << vchSig'), never its bare bytes, and an EMPTY
   signature's pattern is the one byte OP_0 -- so it deletes something;
   every call site builds it through one helper because three of them
