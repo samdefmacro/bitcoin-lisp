@@ -800,13 +800,20 @@
   consensus: a rule here decides what we relay and mine, not what is
   valid.
 
-  Invariants: the cluster mempool keeps every cluster linearized; RBF
-  and TRUC checks run in Core's order with Core's limits; mempool.dat is
-  written in Core's format so the two implementations can exchange one.
+  Invariants: the cluster mempool keeps every cluster linearized; the
+  mining chunk index is maintained incrementally -- one extract and one
+  insert per changed chunk, never a rebuild over the pool; RBF and TRUC
+  checks run in Core's order with Core's limits; mempool.dat is written
+  in Core's format so the two implementations can exchange one.
 
   Traps: an 83 MB mempool.dat turns a restart into a long silent replay
   -- load in batches and log progress. Fee estimation reads the block
-  policy estimator, not the pool's current fee rates."
+  policy estimator, not the pool's current fee rates. The mining index
+  finds a chunk by its mining key, so a cluster's chunks must leave the
+  index before anything changes that key -- a relinearization, a depgraph
+  edit, or a re-pointing of its handles; that is also why a handle's
+  caller payload is passed to `txgraph-add-transaction` instead of being
+  assigned to the handle it returns."
   (bitcoin-lisp.mempool package)
   (bitcoin-lisp.mempool:mempool class)
   (bitcoin-lisp.mempool:make-mempool function)

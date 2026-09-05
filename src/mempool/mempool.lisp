@@ -967,8 +967,7 @@ runs unconditionally (validation.cpp:1338-1342)."
     ;; are RPC-reporting-only (Core init.cpp:650-659).
     (let ((handle (txgraph-add-transaction
                    graph (mempool-entry-modified-fee entry)
-                   (mempool-entry-vsize entry))))
-      (setf (tx-handle-data handle) txid)
+                   (mempool-entry-vsize entry) txid)))
       (dolist (p parent-txids)
         (txgraph-add-dependency
          graph (mempool-entry-graph-handle (mempool-get mempool p)) handle))
@@ -1361,10 +1360,9 @@ further)."
          (progn
            (dolist (m members)
              (destructuring-bind (tx fee vsize) m
-               (let ((handle (txgraph-add-transaction graph fee vsize))
-                     (txid (bl.ser:transaction-hash tx)))
-                 (setf (tx-handle-data handle) txid
-                       (gethash txid staged) handle)
+               (let* ((txid (bl.ser:transaction-hash tx))
+                      (handle (txgraph-add-transaction graph fee vsize txid)))
+                 (setf (gethash txid staged) handle)
                  (push handle handles)
                  (dolist (p (mempool-find-parents mempool tx))
                    (txgraph-add-dependency
