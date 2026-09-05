@@ -231,10 +231,41 @@ CCoinsViewDB::BatchWrite, txdb.cpp:100-159)."
   (declare (type coins-view-db view) (type utxo-key utxo-key))
   (and (leveldb-get (cvdb-db view) (encode-coin-key utxo-key)) t))
 
+(defun coins-view-db-any-coin-p (view)
+  "T iff the base LevelDB holds at least one coin ('C'-prefixed) entry.
+
+Core's is_coinsview_empty asks GetBestBlock().IsNull() (node/chainstate.cpp:69),
+which is enough there because DB_BEST_BLOCK lives in the database the wipe
+destroys. This is the same question asked of the coins themselves, for the
+databases an older build could leave with coins gone and a pointer standing.
+One iterator seek, no full scan."
+  (declare (type coins-view-db view))
+  (with-leveldb-iterator (iter (cvdb-db view))
+    (leveldb-iter-seek iter (make-array 1 :element-type '(unsigned-byte 8)
+                                          :initial-element +db-prefix-coin+))
+    (and (leveldb-iter-valid-p iter)
+         (let ((k (leveldb-iter-key iter)))
+           (and (>= (length k) 1) (= (aref k 0) +db-prefix-coin+))))))
+
 (defun coins-view-db-erase-all-coins (view)
-  "Delete every coin ('C'-prefixed) entry from the base LevelDB, in bounded
-writebatches, leaving non-coin keys (e.g. the 'M' migration marker) intact.
-Used by chainstate reindex to empty the UTXO set. Returns the count erased."
+  "Empty the base LevelDB: delete every coin ('C') entry AND the best-block
+('B') pointer, in bounded writebatches, keeping only the 'M' migration marker.
+Used by chainstate reindex. Returns the count of COINS erased.
+
+The pointer goes with the coins, and that is the whole point rather than a
+tidy-up: Core's -reindex-chainstate opens the coins DB with should_wipe, a
+leveldb::DestroyDB of the whole database (node/chainstate.cpp:93,
+dbwrapper.cpp:39-41), and CCoinsViewDB::BatchWrite erases and rewrites
+DB_BEST_BLOCK inside the coin batch (txdb.cpp:128,159) -- so an emptied coins
+DB can never name a block. Ours could: the pointer survived a wipe that only
+deleted 'C' keys, and a crash before the rebuild's first flush then left the
+node claiming the pre-reindex tip over an EMPTY UTXO set, with startup
+reconciliation moving chainstate.dat FORWARD onto it and logging 'Recovered'.
+
+The keep-list is explicit ('M' only) rather than a delete-'C'-only rule, so a
+prefix added later is erased by default instead of silently surviving. 'B'
+sorts before 'C', so it also leaves in the FIRST committed chunk: from the
+first commit onward a partially-wiped database names no block either."
   (declare (type coins-view-db view))
   (let ((db (cvdb-db view))
         (erased 0)
@@ -242,15 +273,20 @@ Used by chainstate reindex to empty the UTXO set. Returns the count erased."
         (pending 0))
     (unwind-protect
          (progn
+           ;; Staged before the walk so it is in the first chunk regardless of
+           ;; where the key sorts; deleting an absent key is a no-op.
+           (leveldb-writebatch-delete batch (encode-best-block-key))
+           (incf pending)
            (with-leveldb-iterator (iter db)
              (leveldb-iter-seek-to-first iter)
              (loop
                (unless (leveldb-iter-valid-p iter) (return))
                (let ((k (leveldb-iter-key iter)))
-                 (when (and (>= (length k) 1) (= (aref k 0) +db-prefix-coin+))
+                 (when (and (>= (length k) 1)
+                            (/= (aref k 0) +db-prefix-migration-marker+))
                    (leveldb-writebatch-delete batch k)
                    (incf pending)
-                   (incf erased)
+                   (when (= (aref k 0) +db-prefix-coin+) (incf erased))
                    ;; Commit in chunks so the writebatch can't grow unbounded
                    ;; across a multi-million-entry set.
                    (when (>= pending 100000)

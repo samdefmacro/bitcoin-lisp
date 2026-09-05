@@ -568,7 +568,8 @@ index, -reindex, and the block-store <-> header-index position map."
 
   ;; Genesis block index entry is ensured after load-header-index below
 
-  (setf *pending-chainstate-recovery* nil)
+  (setf *pending-chainstate-recovery* nil
+        *chainstates-reset-to-genesis* nil)
   (let ((load-result (bl.store:load-state (node-chain-state *node*))))
     (case load-result
       ((:inconsistent)

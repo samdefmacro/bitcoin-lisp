@@ -1,11 +1,25 @@
 (in-package #:bitcoin-lisp)
 
+(defvar *chainstates-reset-to-genesis* nil
+  "Chainstates RECOVER-INCONSISTENT-CHAINSTATE reset to an empty UTXO set at
+genesis during THIS startup (its interrupted-reindex-chainstate branch).
+
+The two recoveries run several steps apart -- %INIT-RECOVER-CHAIN resolves the
+interrupted reindex, %INIT-SERVICES then reconciles the coins pointer -- and
+the later one used to undo the earlier one: it read the pointer the old wipe
+had left standing, placed it, and moved chainstate.dat FORWARD to the
+pre-reindex tip over the empty set it had just been reset from. A chainstate
+listed here has already been settled by the branch that understands why it is
+empty, so the reconcile leaves it alone.")
+
 (defun reconcile-coins-db-best-block (node)
   "Make chainstate.dat agree with where the coins actually are.
 
 Returns :match, :reconciled, :unresolvable, :unrecorded (a chainstate written
-before the coins DB carried the pointer) or NIL when there is nothing to
-compare.
+before the coins DB carried the pointer), :empty (the coins view holds nothing,
+so there is no state to reconcile toward), :reset (this chainstate was just
+reset to genesis by the interrupted-reindex recovery) or NIL when there is
+nothing to compare.
 
 The coins DB records the block its UTXO state corresponds to, moved with the
 coins themselves, so a disagreement with chainstate.dat is not ambiguous: the
@@ -21,12 +35,22 @@ the expensive one and let normal sync re-validate the gap.
 
 Unresolvable means the coins name a block we have no index entry for, which no
 amount of local reasoning can fix; the caller should treat that as fatal rather
-than proceed on a tip we cannot place."
+than proceed on a tip we cannot place.
+
+An EMPTY coins view is never reconciled toward, in either direction: Core's
+is_coinsview_empty (node/chainstate.cpp:69-70) is exactly \"wipe requested OR
+GetBestBlock().IsNull()\", and LoadChainTip is SKIPPED under it, so an empty
+UTXO set leaves the chain where it is and the rebuild supplies the tip. A
+pointer left standing over an emptied database by an older build's reindex
+wipe is that case wearing a hash."
   (let* ((chainstate (node-chain-state node))
          (view (and chainstate
                     (bl.store:chain-state-coins-view chainstate))))
     (unless (typep view 'bl.store:coins-view-cache)
       (return-from reconcile-coins-db-best-block nil))
+    (when (member chainstate *chainstates-reset-to-genesis*)
+      (log-info "Chainstate was just reset to genesis by reindex recovery; not reconciling its coins pointer")
+      (return-from reconcile-coins-db-best-block :reset))
     (let ((recorded (bl.store:coins-view-db-best-block
                      (bl.store:coins-view-cache-base view)))
           (tip (bl.store:best-block-hash chainstate)))
@@ -36,6 +60,19 @@ than proceed on a tip we cannot place."
          :unrecorded)
         ((and tip (equalp recorded tip))
          :match)
+        ;; Core's is_coinsview_empty gate. The genesis pointer is exempt: an
+        ;; empty set AT genesis is the correct, ordinary state of a node that
+        ;; has connected nothing, and moving the tip record back to it is what
+        ;; a from-genesis restart needs.
+        ((and (bl.store:coins-view-empty-p view)
+              (not (equalp recorded (bl.store:chain-state-genesis-hash
+                                     chainstate))))
+         (log-warn "Coins DB best-block names ~A but the UTXO set is EMPTY; leaving chainstate.dat at height ~D"
+                   (bl.crypto:bytes-to-hex
+                    (bl.crypto:reverse-bytes recorded))
+                   (bl.store:current-height chainstate))
+         (log-warn "Rebuild the UTXO set with -reindex-chainstate; blocks marked invalid while the set was empty need reconsiderblock")
+         :empty)
         (t
          (let ((entry (bl.store:get-block-index-entry chainstate recorded)))
            (cond
@@ -147,7 +184,11 @@ disk on the snapshot side."
                  (log-info "Chainstate recovery: erased ~D leftover coin~:P from the interrupted wipe"
                            erased)))))
          (bl.store:save-state chain-state :in-transition nil)
+         ;; Tell RECONCILE-COINS-DB-BEST-BLOCK, which runs later in startup,
+         ;; that this chainstate's emptiness is understood and settled.
+         (pushnew chain-state *chainstates-reset-to-genesis*)
          (log-warn "Chainstate recovery: interrupted reindex-chainstate; UTXO set reset to empty at genesis (chain will re-sync)")
+         (log-warn "Any block marked invalid while the UTXO set was empty stays marked; clear it with reconsiderblock")
          t)
         ;; Phase 2 committed the new tip — chainstate.dat already holds it,
         ;; just drop the marker.

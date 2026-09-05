@@ -202,7 +202,7 @@ recomputation, and a filter header; unknown type / missing block error."
   (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
      (let ((bl:*node* node))
-       (let ((hashes (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)")))
+       (let ((hashes (generate-regtest-blocks node 3))
              (bfi (bl:node-blockfilterindex node)))
          (is (= 3 (length hashes)))
          (is (= 3 (bl.store:blockfilterindex-height bfi)))
@@ -234,7 +234,7 @@ recomputation, and a filter header; unknown type / missing block error."
   (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
      (let ((bl:*node* node))
-       (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
+       (generate-regtest-blocks node 3)
        (let ((bfi (bl:node-blockfilterindex node))
              (cs (bl:node-chain-state node)))
          (loop for h from 1 to 3
@@ -255,7 +255,7 @@ filter_false_positives keeps the true matches; idle status is null."
   (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
      (let ((bl:*node* node))
-       (let ((hashes (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))))
+       (let ((hashes (generate-regtest-blocks node 3)))
          (let* ((res (bl.rpc::rpc-scanblocks node (list "start" (list "raw(51)"))))
                 (blocks (cdr (assoc "relevant_blocks" res :test #'equal))))
            (is-true (cdr (assoc "completed" res :test #'equal)))
@@ -292,7 +292,7 @@ contiguous."
    ;; hook indexes nothing and the backfill does all the work.
    (let ((node (regtest-node-fixture (format nil "bfb~D" (get-internal-real-time)))))
      (let ((bl:*node* node))
-       (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
+       (generate-regtest-blocks node 5)
        (let* ((cs (bl:node-chain-state node))
               (store (bl:node-block-store node))
               (idxbase (merge-pathnames
@@ -371,7 +371,7 @@ from the zero header, and filling the gap in order is then accepted."
   (with-network (:regtest)
    (let ((node (regtest-node-fixture (format nil "bfc~D" (get-internal-real-time)))))
      (let ((bl:*node* node))
-       (bl.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
+       (generate-regtest-blocks node 3)
        (let* ((cs (bl:node-chain-state node))
               (store (bl:node-block-store node))
               (idxbase (merge-pathnames
@@ -406,7 +406,7 @@ from the zero header, and filling the gap in order is then accepted."
   (with-network (:regtest)
    (let ((node (%bfi-regtest-node)))
      (let ((bl:*node* node))
-       (let* ((hashes (bl.rpc::rpc-generatetodescriptor node (list 2 "raw(51)")))
+       (let* ((hashes (generate-regtest-blocks node 2))
               (res (bl.rpc::rpc-getdescriptoractivity
                     node (list hashes (list "raw(51)") nil)))
               (activity (cdr (assoc "activity" res :test #'equal))))
@@ -432,7 +432,7 @@ against a real backfilled index. peer-block-filters gates %cf-serving-index."
    (let ((node (%bfi-regtest-node)))
      (let ((bl:*node* node)
            (bl:*peer-block-filters* t))
-       (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
+       (generate-regtest-blocks node 4)
        (let* ((cs (bl:node-chain-state node))
               (bfi (bl:node-blockfilterindex node))
               (h3 (bl.store:block-index-entry-hash
@@ -553,7 +553,7 @@ warning."
   (with-network (:regtest)
    (let ((node (regtest-node-fixture (format nil "bfm~D" (get-internal-real-time)))))
      (let ((bl:*node* node))
-       (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
+       (generate-regtest-blocks node 4)
        (let* ((cs (bl:node-chain-state node))
               (store (bl:node-block-store node))
               (ghash (bl.store:network-genesis-hash :regtest))

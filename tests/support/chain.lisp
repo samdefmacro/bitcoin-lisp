@@ -178,6 +178,15 @@ block-store / utxo-set, ready for activate-block. Call inside (with-network (:re
           (bl:node-mempool node) (bl.mp:make-mempool))
     node))
 
+(defun generate-regtest-blocks (node n)
+  "Mine N regtest blocks to the anyone-can-spend descriptor raw(51) through the
+shipped generatetodescriptor handler, returning its list of block hashes.
+
+The same three-token call had been copied into every suite that needs a real
+mined chain (reindex, coinstatsindex, blockfilter); one helper is what keeps
+the handler's argument shape in one place."
+  (bl.rpc::rpc-generatetodescriptor node (list n "raw(51)")))
+
 (defun activate-block-base-path (suffix)
   "The directory an activate-block fixture with SUFFIX lives in -- keyed by
 SUFFIX so a test can reopen the same on-disk state with a second fixture."
