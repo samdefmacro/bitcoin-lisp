@@ -325,6 +325,29 @@ exec_workbench_eval_client() {
     sbcl --script /dev/stdin "$@" <"$client"
 }
 
+# A batch eval is read in COMMON-LISP-USER, which has no package-local
+# nicknames: a `bl.rpc:' prefix is a SIMPLE-READER-PACKAGE-ERROR whose
+# ten-frame backtrace hides the offending token, so eval_form names the token
+# before the image sees it. Prints the first nickname token in the form, or
+# nothing; never fails (grep's no-match status must not reach set -e -- the
+# first version of this guard did exactly that and every plain eval exited 1
+# with empty output, observed 2026-09-05).
+eval_nickname_in_form() {
+  printf '%s ' "$@" | { grep -oE '(^|[^A-Za-z0-9.-])bl(\.[a-z]+)?::?' || true; } | head -1 | sed -E 's/^[^a-z]*//'
+}
+
+# Positive AND negative control for the detector, run before every eval: a
+# guard that cannot fail either way is no guard.
+eval_nickname_selftest() {
+  local hit miss
+  hit=$(eval_nickname_in_form '(bl.rpc:foo (bl:bar))')
+  miss=$(eval_nickname_in_form '(+ 1 2) (bitcoin-lisp.rpc:foo "bl.x")')
+  if [[ "$hit" != "bl.rpc:" || -n "$miss" ]]; then
+    echo "ERROR: dev.sh eval nickname guard self-test failed (hit='$hit' miss='$miss')" >&2
+    return 1
+  fi
+}
+
 eval_form() {
   if [[ $# -eq 0 ]]; then
     echo "eval requires a Lisp FORM argument" >&2
@@ -340,13 +363,9 @@ eval_form() {
     echo "ERROR: cl-workbench is unavailable; host Lisp fallback is forbidden" >&2
     return 2
   fi
-  # A batch eval is read in COMMON-LISP-USER, which has no package-local
-  # nicknames: a `bl.rpc:' prefix is a SIMPLE-READER-PACKAGE-ERROR whose
-  # ten-frame backtrace hides the offending token. Observed 2026-09-05 costing
-  # two agents four evals each; the lesson line did not prevent the repeat,
-  # so the wrapper names the token before the image sees it.
+  eval_nickname_selftest || return 2
   local nick
-  nick=$(printf '%s ' "$@" | grep -oE '(^|[^A-Za-z0-9.-])bl(\.[a-z]+)?::?' | head -1 | sed -E 's/^[^a-z]*//')
+  nick=$(eval_nickname_in_form "$@")
   if [[ -n "$nick" ]]; then
     echo "WARNING: '$nick' is a package-local nickname; dev.sh eval reads in CL-USER," >&2
     echo "         where it does not resolve -- write the full package name (bitcoin-lisp.rpc:, ...)." >&2
