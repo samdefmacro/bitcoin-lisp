@@ -1,0 +1,138 @@
+{
+  "dimension": "tx-relay",
+  "findings": [
+    {
+      "id": "dd85e71f",
+      "title": "Receiving any transaction forgets EVERY peer's announcement of its hash, not just the sender's",
+      "severity": "S2",
+      "our_ref": "src/networking/protocol.lisp:463 (tx-request-received), driven unconditionally at src/networking/protocol.lisp:1848-1851 (handle-tx)",
+      "core_ref": "refs/bitcoin/src/node/txdownloadman_impl.cpp:505-513 (ReceivedTx) and refs/bitcoin/src/txrequest.cpp:671-679 (ReceivedResponse), vs ForgetTxHash at refs/bitcoin/src/txrequest.cpp:560-566 and its documented contract at refs/bitcoin/src/txrequest.h:47-49",
+      "core_does": "ReceivedTx calls m_txrequest.ReceivedResponse(nodeid, txid) (and wtxid) which MakeCompleted's ONLY the delivering peer's announcement. Every other peer's announcement of that txhash stays CANDIDATE, so if the delivered transaction turns out useless the request is immediately re-routed to another announcer. ForgetTxHash (all peers) is reserved for the points where the tx is genuinely resolved: MempoolAcceptedTx (:327-328), the orphan-intake and rejected-parents branches (:419-420, :434-435), the cached-rejection branch (:470, :483) and BlockConnected (:107-108).",
+      "we_do": "handle-tx calls tx-request-received on the txid AND the wtxid of whatever transaction just arrived, before any validation and regardless of whether we asked this peer for it. tx-request-received is ForgetTxHash: it clears *tx-in-flight* and drops every announcer's entry for that hash.",
+      "impact": "For TXID-keyed tracker entries -- orphan-parent fetches (request-orphan-parents) and announcements from non-wtxidrelay peers -- an attacker only needs a transaction with the same TXID, i.e. a witness-malleated copy of the parent. Sending it unsolicited wipes every honest announcer of that parent; the malleated copy then fails validation and is cached under its own (different) wtxid, so nothing re-requests the real parent and the orphan is never resolved. Core recovers on the next GetRequestsToSend pass. Wtxid-keyed entries are safe (the wtxid commits to the witness).",
+      "executed": "scripts/dev.sh eval: three peers announce one txid (announcer list length 3, tx-request-count 1 each); one call to bl.net:tx-request-received leaves (:ANNOUNCERS 0 :ENTRY-PRESENT NIL :P1 0 :P2 0 :P3 0) and the following process-tx-requests sends 0 requests.",
+      "confidence": "executed"
+    },
+    {
+      "id": "931a5184",
+      "title": "A failed announcement is deleted rather than kept COMPLETED, so one peer can be granted the same txhash again and again",
+      "severity": "S2",
+      "our_ref": "src/networking/protocol.lisp:476-486 (tx-request-notfound) and src/networking/protocol.lisp:586-637 (retry-timed-out-tx-requests), both calling %tx-request-drop-announcer (src/networking/protocol.lisp:411)",
+      "core_ref": "refs/bitcoin/src/txrequest.cpp:456-478 (MakeCompleted), :578-592 (ReceivedInv), :484-500 (SetTimePoint expiry) and the rationale at refs/bitcoin/src/txrequest.h:45-58",
+      "core_does": "A notfound or an expiry turns the announcement into State::COMPLETED; it is only deleted when it is the LAST non-COMPLETED announcement for that txhash. A COMPLETED announcement still occupies the (peer, txhash) slot of the ByPeer index, so ReceivedInv's emplace fails and a re-announcement from the same peer is a no-op. txrequest.h states the rule verbatim: 'The same transaction is never requested twice from the same peer, unless the announcement was forgotten in between' -- 'giving a peer multiple chances to announce a transaction would allow them to bias requests in their favor, worsening transaction censoring attacks.'",
+      "we_do": "Both the notfound path and the 60s expiry path call %tx-request-drop-announcer, which REMOVES the announcement and decrements the peer's *tx-peer-announcements* budget. Nothing records that this peer already failed, so the peer's next inv for the same hash is a fresh candidate and can win the request again.",
+      "impact": "One peer can burn an unbounded number of GETDATA_TX_INTERVAL windows on the same transaction (announce, take the request, stall or notfound, re-announce), where Core caps a peer at one failed attempt per txhash per connection. It also gives back the per-peer announcement budget the cap exists to charge, so MAX_PEER_TX_ANNOUNCEMENTS no longer bounds how many failed requests a peer can cause.",
+      "executed": "scripts/dev.sh eval: with only the attacker announcing, 1000 announce/notfound rounds produced 1000 getdata grants to the same peer (:GETDATAS-GRANTED-TO-SAME-PEER 1000). With an honest peer permanently in the candidate pool and six 60s expiry cycles, the attacker was granted the request 3 times out of 6 (:ATTACKER-GRANTED 3 :HONEST-GRANTED 3); in Core it can be granted at most once while the honest announcement is alive.",
+      "confidence": "executed"
+    },
+    {
+      "id": "87e5fccf",
+      "title": "tx messages are fully validated, admitted to the mempool and relayed during initial block download",
+      "severity": "S2",
+      "our_ref": "src/networking/protocol.lisp:1816-1953 (handle-tx) -- no initial-block-download-p gate anywhere in the handler",
+      "core_ref": "refs/bitcoin/src/net_processing.cpp:4479-4483 ('Stop processing the transaction early if we are still in IBD since we don't have enough information to validate it yet.')",
+      "core_does": "The TX branch of ProcessMessage returns immediately while IsInitialBlockDownload() is true, after the RejectIncomingTxs check and before deserialising the transaction. No validation, no orphan intake, no relay, and deliberately no punishment.",
+      "we_do": "handle-tx has the RejectIncomingTxs equivalent but no IBD gate. The message is parsed, run through validate-transaction-for-mempool against a stale UTXO set, admitted to the mempool on success, relayed to every other peer, and on :missing-input stored in the orphanage with a getdata burst for its parents (request-orphan-parents). handle-inv IS gated (protocol.lisp:820-823), so the two halves of the same Core gate disagree.",
+      "impact": "During the whole IBD window a peer can drive full script validation and coins-view lookups at the tx rate limit, populate the orphanage and both reject filters, and make us announce and relay transactions whose validity we cannot judge (our UTXO set is at a stale height, so an already-spent or already-mined transaction can enter our mempool and be relayed onward). None of this work can be correct, which is exactly why Core refuses it.",
+      "executed": "scripts/dev.sh eval with bl.net::*cached-is-ibd* bound to T on a package fixture: (:IBD-P T :IN-MEMPOOL T :QUEUED-FOR-RELAY 1) -- the transaction entered the mempool and was queued for announcement to a second peer while initial-block-download-p reported T.",
+      "confidence": "executed"
+    },
+    {
+      "id": "27695ef5",
+      "title": "Every notfound message re-runs a full scan of the global tx-request tracker under its lock, and notfound is not rate limited",
+      "severity": "S2",
+      "our_ref": "src/networking/protocol.lisp:855-882 (handle-notfound: no :rate-bucket, calls process-tx-requests once per message) and src/networking/protocol.lisp:530-562 (process-tx-requests maphashes all of *tx-announcers* holding *tx-request-lock*)",
+      "core_ref": "refs/bitcoin/src/node/txdownloadman_impl.cpp:287-293 (ReceivedNotFound) and refs/bitcoin/src/net_processing.cpp:5150-5164 (the NOTFOUND branch, incl. its MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER size guard)",
+      "core_does": "ReceivedNotFound is O(k log n): one indexed ReceivedResponse per item, nothing more. Requests are re-issued from SendMessages' per-peer GetRequestsToSend, whose GetRequestable walks only that peer's CANDIDATE_BEST announcements. Core also ignores the tx entries of any notfound carrying more than 5016 invs.",
+      "we_do": "handle-notfound has no rate bucket (check-peer-rate-limit allows any command whose handler declares none, src/networking/peer.lisp:1874-1876), processes up to +max-inv-count+ = 50,000 entries with no Core-style size guard, and then calls process-tx-requests, which maphashes EVERY tracked txhash across ALL peers while holding the single global *tx-request-lock* that handle-inv also needs per announcement.",
+      "impact": "A 61-byte notfound buys a full-tracker scan. Measured 9.6 ms per message with 50,000 tracked hashes (10 peers at MAX_PEER_TX_ANNOUNCEMENTS); the scan is linear, so the 125-peer worst case is ~120 ms per message. The pump admits +max-messages-per-peer-per-cycle+ = 32 messages per peer per pass, so one peer converts ~2 KB of traffic into ~0.3 s of sync-thread CPU per pass, held under the lock the whole relay path serialises on.",
+      "executed": "scripts/dev.sh eval: filled the tracker from 1/5/10 peers at 5000 announcements each and timed process-tx-requests -> ((:PEERS 1 :TRACKED 5000 :MS-PER-SCAN 0.9) (:PEERS 5 :TRACKED 25000 :MS-PER-SCAN 4.9) (:PEERS 10 :TRACKED 50000 :MS-PER-SCAN 9.6)); driving handle-notfound with a one-entry payload at 50,000 tracked hashes measured 9.6 ms per message.",
+      "confidence": "executed"
+    },
+    {
+      "id": "c65becf1",
+      "title": "Request candidate selection is deterministic (preferred, then earliest ready) where Core picks by a salted per-(txhash,peer) priority",
+      "severity": "S2",
+      "our_ref": "src/networking/protocol.lisp:513-528 (%tx-request-best-candidate) and its use in process-tx-requests (:530) and retry-timed-out-tx-requests (:586); acknowledged in the file comment at src/networking/protocol.lisp:321-325",
+      "core_ref": "refs/bitcoin/src/txrequest.cpp:103-124 (PriorityComputer: SipHash(m_k0,m_k1,txhash,peer) with the preferred bit in bit 63, 'Higher priorities are selected first') and refs/bitcoin/src/txrequest.h:66-72 ('Pick a uniformly random peer among the candidates. Rationale: random assignments are hard to influence for attackers.')",
+      "core_does": "Among ready candidates Core restricts to preferred peers if any exist and then picks by a salted hash of (txhash, peer) -- effectively a uniformly random pick that an attacker cannot predict or influence, and that differs per transaction so no peer wins systematically.",
+      "we_do": "%tx-request-best-candidate prefers outbound peers and then takes the EARLIEST ready time, i.e. the peer that announced first within the same preference class. Announcement order is entirely under the announcer's control.",
+      "impact": "A peer that races the network's announcements wins the request for every transaction deterministically instead of with probability 1/(number of preferred candidates). It converts Core's probabilistic censoring model (txrequest.h's k ~ 1 + NHG(...)) into a guaranteed one: an attacker with one fast preferred connection takes the first request for every transaction and can hold each for GETDATA_TX_INTERVAL. Combined with the previous finding (a failed announcement is deleted, not completed) the same peer can repeat that indefinitely.",
+      "executed": "Not separately executed; the ordering is read directly from %tx-request-best-candidate and the probe for the previous finding shows the earliest-ready announcer taking the request each cycle.",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "2be715a4",
+      "title": "An inv never enters the announcing peer's known-tx filter, so we announce the transaction straight back to the peer that told us about it",
+      "severity": "S3",
+      "our_ref": "src/networking/protocol.lisp:754-853 (handle-inv) -- peer-announced-txs is only written at src/networking/protocol.lisp:1851 (tx receipt), :3048 and :3105 (flush time)",
+      "core_ref": "refs/bitcoin/src/net_processing.cpp:4174 (AddKnownTx(peer, inv.hash) on every gen-tx inv, before the IBD gate), :3143 (AddKnownTx for each unique parent of a rejected orphan), :4492 (on tx receipt, keyed by the peer's preferred id) and the filter's read side in PushTxInventory",
+      "core_does": "Core inserts the announced hash into that peer's m_tx_inventory_known_filter the moment the inv arrives, so PushTxInventory never queues a transaction back to the peer that announced it. The filter is keyed by the peer's preferred id (wtxid for wtxidrelay peers, txid otherwise), which is the same id the inv carried.",
+      "we_do": "handle-inv records the announcement in the tx-request tracker but leaves peer-announced-txs untouched. Our filter is also txid-keyed at every site, while a wtxidrelay peer's inv carries a wtxid, so even inserting inv.hash here would not match the txid the relay path checks.",
+      "impact": "Every transaction we accept is announced back to each peer that had already announced it to us -- roughly a doubling of outbound inv volume in steady state, and an unnecessary confirmation to the peer that its announcement reached us. It also loses Core's orphan-parent AddKnownTx, so parents we have just failed to use are re-announced to the peer that supplied the child.",
+      "executed": "scripts/dev.sh eval: handle-inv for one txid from a peer, then relay-transaction of the same txid to that peer -> (:TRACKED-ANNOUNCEMENT 1 :KNOWN-FILTER-HIT-TXID NIL :QUEUED-BACK 1).",
+      "confidence": "executed"
+    },
+    {
+      "id": "9e4e0a16",
+      "title": "Connecting a block leaves the confirmed transactions in the tx-request tracker, and the scheduler has no AlreadyHaveTx re-check before sending the getdata",
+      "severity": "S3",
+      "our_ref": "src/validation/block.lisp:2624-2646 (note-block-connected: inserts into *recent-confirmed-txs* but never touches the tracker) and src/networking/protocol.lisp:530-562 (process-tx-requests takes no mempool/filter arguments, so it cannot re-check)",
+      "core_ref": "refs/bitcoin/src/node/txdownloadman_impl.cpp:98-110 (BlockConnected does ForgetTxHash for the txid and wtxid of every block transaction) and :264-284 (GetRequestsToSend re-checks AlreadyHaveTx and ForgetTxHash's anything it already has, described in-tree as 'belt-and-suspenders')",
+      "core_does": "Core forgets every tracked announcement of a confirmed transaction at block connection, and re-checks AlreadyHaveTx one last time immediately before turning a requestable announcement into a getdata.",
+      "we_do": "note-block-connected fills the recently-confirmed filter, rebuilds the most-recent-block tx map and clears the compact-block cache, but the tracker is in a later-loaded package and is never called. The scheduler then has no way to notice: process-tx-requests and retry-timed-out-tx-requests are argument-less and consult only their own tables.",
+      "impact": "After every block we send getdata for transactions we already know are confirmed; a Core peer answers them in full from m_most_recent_block_txs, so we pay the download for transactions handle-tx then drops on the recently-confirmed check. The same gap covers a transaction that entered the mempool by any route other than the P2P handler (an RPC submission, a 1p1c package member).",
+      "executed": "scripts/dev.sh eval: announce a txid from an inbound peer, note-block-connected a block containing that transaction, backdate the candidate's ready time -> (:RECENTLY-CONFIRMED T :TRACKER-ENTRY-SURVIVED T :GETDATAS-SENT-FOR-A-CONFIRMED-TX 1).",
+      "confidence": "executed"
+    },
+    {
+      "id": "1dc189a8",
+      "title": "Orphan intake registers only the delivering peer for parent resolution, and its parent list is not filtered by AlreadyHaveTx",
+      "severity": "S3",
+      "our_ref": "src/networking/protocol.lisp:1895-1907 (the :missing-input branch of handle-tx) and src/networking/protocol.lisp:1620-1636 (missing-parent-txids)",
+      "core_ref": "refs/bitcoin/src/node/txdownloadman_impl.cpp:392-416 (the orphan branch of MempoolRejectedTx: std::erase_if(unique_parents, AlreadyHaveTx) then GetCandidatePeers over the txid and wtxid, and MaybeAddOrphanResolutionCandidate for EVERY resulting nodeid) and refs/bitcoin/src/txrequest.cpp:568-576 (GetCandidatePeers)",
+      "core_does": "Core first erases the parents it already has (mempool, orphanage, recently-confirmed, recent-rejects), then collects the delivering peer PLUS every peer with a live announcement of the orphan's txid or wtxid and makes each one an orphan-resolution candidate, adding it as an orphanage announcer.",
+      "we_do": "handle-tx passes the raw missing-parent-txids list (filtered only against the UTXO set and the mempool) to request-orphan-parents for the delivering peer alone. Other peers that announced the same orphan are never enrolled -- our only orphan-resolution enrolment happens later, if such a peer re-announces the orphan by wtxid (%maybe-add-orphan-resolution-candidate).",
+      "impact": "Orphan resolution depends on a single peer per orphan: if it stalls we wait the full expiry with no alternative announcer registered, which is the censorship case GetCandidatePeers exists to blunt. The unfiltered parent list also re-requests a parent we are already holding as an orphan or that was confirmed in the last block.",
+      "executed": "Not executed; read from both trees.",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "98f80da8",
+      "title": "The per-peer tx announcement queue silently drops its OLDEST entries at 5000, and is a list with O(n) append and O(n) length per relayed transaction per peer",
+      "severity": "S3",
+      "our_ref": "src/networking/protocol.lisp:2873-2919 (relay-transaction: nconc, then (length ...) and nthcdr against +max-tx-inv-queue+ at src/networking/protocol.lisp:2859)",
+      "core_ref": "refs/bitcoin/src/net_processing.cpp:6032-6053 (m_tx_inventory_to_send is a std::set drained with broadcast_max = INVENTORY_BROADCAST_TARGET + (size/1000)*5, capped at INVENTORY_BROADCAST_MAX) and PushTxInventory's set insert",
+      "core_does": "Core's send queue is an ordered set with logarithmic insertion, is never truncated, and drains FASTER as it backs up: broadcast_max grows with the backlog up to INVENTORY_BROADCAST_MAX.",
+      "we_do": "relay-transaction appends to a Lisp list with nconc (walking it), then calls length on it and nthcdr's the excess away, discarding the OLDEST queued announcements once the queue passes 5000. The flush target is a fixed 70 per pass with no backlog scaling.",
+      "impact": "Under sustained inflow above the drain rate (about 14/s inbound, 35/s outbound), queued announcements are silently discarded -- those transactions are simply never announced to that peer -- while Core would only lag. The list representation also costs two full walks of a 5000-entry queue per peer per relayed transaction.",
+      "executed": "scripts/dev.sh eval: 8 peers driven to the cap, then 100 further relay-transaction calls -> (:CAP 5000 :QUEUE-LEN-AFTER 5000 :MS-PER-RELAYED-TX-ACROSS-8-PEERS 0.48), i.e. the queue stays pinned at the cap (older entries dropped) and each relayed transaction costs ~0.06 ms per peer at that depth.",
+      "confidence": "executed"
+    },
+    {
+      "id": "490e6e59",
+      "title": "Trickled announcements are flushed in FIFO order; Core sends them fee-rate first",
+      "severity": "S3",
+      "our_ref": "src/networking/protocol.lisp:3027-3072 (%flush-peer-tx-invs pops the queue front)",
+      "core_ref": "refs/bitcoin/src/net_processing.cpp:5671-5690 (CompareInvMempoolOrder) and :6040-6053 (make_heap / pop_heap over the pending set before the broadcast_max cut)",
+      "core_does": "Core heap-sorts the pending inventory by mempool ancestor feerate (highest first) so the broadcast_max cut keeps the most valuable announcements, and describes the ordering as being for 'privacy and priority reasons'.",
+      "we_do": "We drain the queue strictly in insertion order and drop the tail past +inv-broadcast-target+ to the next flush.",
+      "impact": "When a peer's queue exceeds the per-flush target, low-feerate announcements delay high-feerate ones by whole flush intervals, and the announcement order leaks arrival order rather than the mempool ordering Core normalises to. Insertion order is already topological (parents accepted before children), so no orphan is created by this.",
+      "executed": "Not executed; read from both trees.",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "2686f00d",
+      "title": "Reconciliation sets never shed the entries both sides already had, so a reconciling peer's set grows monotonically",
+      "severity": "S3",
+      "our_ref": "src/networking/protocol.lisp:2975-2996 (%handle-reconcildiff removes only the short ids the initiator ASKED for) and src/networking/txreconciliation-set.lisp:246-261 (recon-finish-round removes only the ids the peer was missing)",
+      "core_ref": "no counterpart at d3056bc: refs/bitcoin/src/node/txreconciliation.cpp is 170 lines implementing only the sendtxrcncl handshake (PreRegisterPeer / RegisterPeer / ForgetPeer / IsPeerRegistered), with its own TODOs saying the fields are unused; BIP-330 is the only specification",
+      "core_does": "Core has no reconciliation set at all -- this file is built from BIP-330, not ported, and the file says so in its own header comment. There is no reference implementation to check it against, so this is a self-consistency finding, not a Core divergence.",
+      "we_do": "After a successful round both roles delete only the short ids in the symmetric difference. The ids present on BOTH sides -- which cancel in the sketch and are therefore never in the difference -- stay in our per-peer set for the life of the connection, and recon-set-add (called from relay-transaction) has no cap.",
+      "impact": "With -txreconciliation negotiated on both ends, each reconciling peer accumulates one 32-byte wtxid plus hash-table overhead for every transaction we ever relayed to it and it already had -- monotonic per-peer growth for the life of the connection, with no eviction on mempool removal either. Bounded in practice only because the flag is default-off and no Core peer can negotiate it.",
+      "executed": "Not executed; read from our tree only (no Core oracle exists).",
+      "confidence": "read-ours-only"
+    }
+  ],
+  "coverage_note": "Covered by reading both trees and executing probes in the project container (warm image, bitcoin-lisp-sbcl:2.6.5-4): the tx-request tracker in src/networking/protocol.lisp:321-637 against refs/bitcoin/src/txrequest.{h,cpp} and refs/bitcoin/src/node/txdownloadman_impl.cpp (announcement delays, the per-peer caps, expiry/notfound/disconnect handling, candidate selection, ForgetTxHash vs ReceivedResponse); handle-inv, handle-tx, handle-notfound and process-peer-getdata's tx arm; the reject / reconsiderable / recently-confirmed filters and %cache-tx-rejection against MempoolRejectedTx; 1p1c package relay against Find1P1CPackage / ProcessPackageResult; the orphanage (src/mempool/orphan.lisp) against refs/bitcoin/src/node/txorphanage.cpp; the outbound trickle (relay-transaction, %flush-peer-tx-invs, flush-tx-announcements, the unbroadcast reattempt, handle-mempool-request) against SendMessages' inventory block; and the Erlay files src/networking/txreconciliation-set.lisp / minisketch.lisp. Six of the eleven findings are execution-backed; two ordering/enrolment findings and the flush-order one are read-both-trees; the Erlay one is read-ours-only because Core ships only the sendtxrcncl handshake at d3056bc and there is no reference implementation for the sketch exchange, the fanout rule or the round timer. NOT covered, with the GA11 dimension that inherits each: minisketch.lisp's field arithmetic and decode correctness (no Core counterpart; it is a from-scratch implementation and deserves its own differential harness, not this dimension) -- inherits to the harness lane; the BIP133 feefilter sender in src/networking/peer.lisp:1289-1400 and the fee-rate rounder it depends on -- inherits to dimension 8 (rpc/util + fees + versionbits reporting); the mempool policy that decides the reject REASONS this dimension only routes (which failures are TX_RECONSIDERABLE, RBF, TRUC, cluster limits) -- inherits to dimension 3 (cluster mempool); the block-relay half of protocol.lisp (cmpctblock, blocktxn, getblocktxn, the high-bandwidth peer set) and the peer/connection liveness and backpressure seam -- inherits to dimension 10 (second reader: protocol.lisp + peer.lisp + connection.lisp); mempool.dat persistence of the unbroadcast set -- inherits to dimension 5 (wallet/store persistence) or dimension 9. Concurrency was not exercised: every probe drove the handlers on one thread, so lock-ordering and races between the sync pump, the RPC broadcast path and the tx-request lock are untested here."
+}
