@@ -1921,6 +1921,19 @@ CTX's recent-rejects, when present, caches recently rejected txs."
                           (peer-address peer))
     (disconnect-peer peer)
     (return-from handle-tx nil))
+  ;; "Stop processing the transaction early if we are still in IBD since we
+  ;; don't have enough information to validate it yet. Sending unsolicited
+  ;; transactions is not considered a protocol violation, so don't punish the
+  ;; peer" (net_processing.cpp:4479-4483) — before the parse, and with no
+  ;; reject reason, no rejects-cache entry and no orphan intake, exactly as
+  ;; Core returns there. This is the same predicate the inv half of the gate
+  ;; already calls (handle-inv gates AddTxAnnouncement on it), so the two
+  ;; halves of one Core rule cannot drift apart again: without it a peer could
+  ;; make us validate a transaction against a UTXO view at a stale height,
+  ;; admit the result, announce it onward, and cache a wrong reject in the
+  ;; MAIN rejects filter, which the end of IBD does not clear.
+  (when (initial-block-download-p chain-state)
+    (return-from handle-tx nil))
   (handler-case
       (let ((tx (bl.ser:parse-tx-payload payload)))
         (when tx

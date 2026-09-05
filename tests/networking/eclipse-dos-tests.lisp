@@ -1089,7 +1089,10 @@ turn a link they meant to keep block-only into a tx firehose."
     (flet ((dropped-p (address conn-type)
              (let ((p (%g718-peer :conn-type conn-type :inbound t)))
                (setf (bl.net:peer-address p) address)
-               (deliver-tx p (make-array 0 :element-type '(unsigned-byte 8)) (bl.ctx:make-node-context))
+               ;; The permission question is asked BEFORE Core's IBD gate, so
+               ;; the node has to be out of IBD for the answer to be visible.
+               (with-tx-relay-out-of-ibd
+                 (deliver-tx p (make-array 0 :element-type '(unsigned-byte 8)) (bl.ctx:make-node-context)))
                (eq :disconnected (bl.net:peer-state p)))))
       (%with-whitelist (:entries '("relay@10.0.0.0/8"))
         ;; Control: without the permission, -blocksonly drops the sender.
@@ -1180,7 +1183,11 @@ operator pinned."
 disconnected it, so a toy-chain peer could pin an outbound slot for the whole
 of IBD — a step toward IBD eclipse."
   (let ((bl:*network* :regtest)
-        (bl:*minimum-chain-work-override* 1000))
+        (bl:*minimum-chain-work-override* 1000)
+        ;; The rule is IBD-only, and the IBD answer is a process-wide LATCH
+        ;; that any earlier test leaving it may have flipped: say so here
+        ;; rather than inherit whatever ran before.
+        (bl.net:*cached-is-ibd* t))
     (multiple-value-bind (state hash) (%g718-state-with-work 10)
       ;; Low work + non-full batch + outbound + IBD => dropped.
       (let ((p (%g718-peer :best-hash hash)))
@@ -1212,7 +1219,11 @@ of IBD — a step toward IBD eclipse."
 exactly meets the floor is kept. (The obvious version of this test — pointing a
 FRESH peer at a raised floor — asserts nothing, because a fresh peer has no
 best-known block and is skipped for that reason rather than the work one.)"
-  (let ((bl:*network* :regtest))
+  (let ((bl:*network* :regtest)
+        ;; The rule is IBD-only, and the IBD answer is a process-wide LATCH
+        ;; that any earlier test leaving it may have flipped: say so here
+        ;; rather than inherit whatever ran before.
+        (bl.net:*cached-is-ibd* t))
     ;; Work exactly equal to the floor: kept.
     (multiple-value-bind (state hash) (%g718-state-with-work 1000)
       (let ((bl:*minimum-chain-work-override* 1000)
