@@ -461,6 +461,129 @@ were mined catches up from its stored locator on load."
                 (is (= 5 (length entries)))))))))))
 
 ;;;; ============================================================
+;;;; GA11 4e92ca22: a tx record that fails to load is Core's NEED_RESCAN
+;;;; ============================================================
+
+(defun %wc-damage-tx-record (path action)
+  "Damage the single stored tx record of the closed wallet at PATH. :FLIP
+XORs #xFF into a middle byte, which is what a torn write or a bad block looks
+like on load; :DELETE removes the record outright."
+  (let ((db (bl.wallet::wallet-db-open path)))
+    (unwind-protect
+         (dolist (record (bl.wallet::wallet-db-records db))
+           (when (equal (bl.wallet::wdb-parse-key (car record))
+                        bl.wallet::+wdb-key-tx+)
+             (return
+               (ecase action
+                 (:delete (bl.store:leveldb-delete db (car record) :sync t))
+                 (:flip
+                  (let* ((value (copy-seq (cdr record)))
+                         (at (floor (length value) 2)))
+                    (setf (aref value at) (logxor #xFF (aref value at)))
+                    (bl.store:leveldb-put db (car record) value :sync t)))))))
+      (bl.store:leveldb-close db))))
+
+(defun %wc-fund-and-damage (node action)
+  "Create wallet w, mine it one mature coinbase, assert the 50 BTC balance,
+unload it, and apply ACTION (:flip, :delete or :none) to its tx record. The
+wallet is left UNLOADED, so each caller can bring it back its own way."
+  (with-rpc-wallet (nil)
+    (bl.wallet::rpc-createwallet node '("w"))
+    (let* ((address (bl.wallet::rpc-getnewaddress node '("" "bech32")))
+           (path (bl.wallet::wallet-path (%wc-wallet node "w"))))
+      (%wc-mine node 1 address)
+      (%wc-mine node 101 (%wc-optrue-address))
+      (is (= 50.0d0 (bl.wallet::rpc-getbalance node '())))
+      (bl.wallet::rpc-unloadwallet node '("w"))
+      (unless (eq action :none)
+        (%wc-damage-tx-record path action))
+      path)))
+
+(defun %wc-balance-and-txcount (node)
+  (with-rpc-wallet (nil)
+    (values (bl.wallet::rpc-getbalance node '())
+            (%aval "txcount" (bl.wallet::rpc-getwalletinfo node nil)))))
+
+(defun %wc-mentions-p (needle lines)
+  (find-if (lambda (line) (search needle line)) lines))
+
+(defun %wc-capture-log (thunk)
+  "The log lines THUNK emits, read out of a ring buffer private to this call."
+  (let ((bl.log:*log-buffer* (make-array bl.log:+log-buffer-size+
+                                         :initial-element nil))
+        (bl.log:*log-buffer-index* 0)
+        (bl.log:*log-buffer-count* 0))
+    (funcall thunk)
+    (remove nil (coerce bl.log:*log-buffer* 'list))))
+
+(test wallet-corrupt-tx-record-rescans-from-height-zero
+  "GA11 4e92ca22. Core's LoadTxRecords turns a tx row that will not
+deserialize, or whose hash is not the key it was stored under, into
+DBErrors::NEED_RESCAN (walletdb.cpp:1015-1030); CreateWalletFromFile keeps the
+wallet, warns, and AttachChain then leaves rescan_height at 0 instead of
+consulting the stored locator (wallet.cpp:3140-3142, 3200-3211), so the block
+that carried the lost transaction is read again. We only pushed a warning
+string: the wallet came up with a balance of 0, a history of nothing, and no
+way back except an operator noticing and running rescanblockchain by hand."
+  (with-wallet-chain-node (node "corrupt-tx")
+    (%wc-fund-and-damage node :flip)
+    (multiple-value-bind (wallet warnings)
+        (bl.wallet::%load-and-attach-wallet
+         node (bl:node-wallet-manager node) "w")
+      (declare (ignore wallet))
+      (multiple-value-bind (balance txcount) (%wc-balance-and-txcount node)
+        ;; The whole finding: the coin is on chain and the descriptors are
+        ;; intact, so the rescan rebuilds what the damaged record held.
+        (is (= 50.0d0 balance))
+        (is (= 1 txcount)))
+      (is-true (%wc-mentions-p "hash mismatch" warnings))
+      ;; Core's own wording, added alongside ours (wallet.cpp:2383-2386).
+      (is-true (%wc-mentions-p "Rescanning wallet." warnings))))
+  ;; The control that keeps the assertion honest: a record that is GONE is not
+  ;; a record that failed to load. Core does not rescan for that either, so
+  ;; this half must still read 0 -- otherwise the test above would pass on any
+  ;; wallet whose transaction went missing, for any reason.
+  (with-wallet-chain-node (node "deleted-tx")
+    (%wc-fund-and-damage node :delete)
+    (multiple-value-bind (wallet warnings)
+        (bl.wallet::%load-and-attach-wallet
+         node (bl:node-wallet-manager node) "w")
+      (declare (ignore wallet))
+      (multiple-value-bind (balance txcount) (%wc-balance-and-txcount node)
+        (is (= 0.0d0 balance))
+        (is (= 0 txcount)))
+      (is (null warnings)))))
+
+(test wallet-startup-load-reports-the-warnings-it-used-to-drop
+  "The startup auto-load discarded the warnings it got back, so on the path
+an operator actually takes -- a restart -- the divergence above left no trace
+at all. Core joins them into one initWarning (load.cpp:149)."
+  (with-wallet-chain-node (node "startup-warn")
+    (%wc-fund-and-damage node :flip)
+    (let ((lines (%wc-capture-log
+                  (lambda ()
+                    (bl.wallet:load-wallets-on-startup node '("w"))))))
+      (is-true (%wc-mentions-p "hash mismatch" lines))
+      (is-true (%wc-mentions-p "Rescanning wallet." lines))
+      ;; The load still succeeded, and it rescanned.
+      (is-true (%wc-mentions-p "Loaded wallet" lines))
+      (multiple-value-bind (balance txcount) (%wc-balance-and-txcount node)
+        (is (= 50.0d0 balance))
+        (is (= 1 txcount)))))
+  ;; Control: an undamaged wallet says none of it, so the lines above come
+  ;; from the damage and not from every startup load.
+  (with-wallet-chain-node (node "startup-clean")
+    (%wc-fund-and-damage node :none)
+    (let ((lines (%wc-capture-log
+                  (lambda ()
+                    (bl.wallet:load-wallets-on-startup node '("w"))))))
+      (is-true (%wc-mentions-p "Loaded wallet" lines))
+      (is-false (%wc-mentions-p "Rescanning wallet." lines))
+      (multiple-value-bind (balance txcount) (%wc-balance-and-txcount node)
+        (is (= 50.0d0 balance))
+        (is (= 1 txcount))))))
+
+;;;; ============================================================
 ;;;; G7-38: fast wallet rescan via the BIP158 filter index
 ;;;; ============================================================
 
