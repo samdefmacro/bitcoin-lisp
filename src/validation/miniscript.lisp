@@ -1749,14 +1749,117 @@ CScriptNum."
        (ms-op-data (aref ops i))
        (length (ms-op-data (aref ops i)))))
 
-(defun ms-from-script (script)
-  "Infer a miniscript from SCRIPT, or NIL.
+(defun %ms-op-num-at (ops i)
+  (and (< i (length ops)) (%ms-op-number (aref ops i))))
+
+(defun %ms-key-push-size (ctx)
+  "The only size a bare key push may have in CTX.
+
+Core has no such test: DecodeScript accepts 32 or 33 bytes (miniscript.h:2326)
+and lets the context's FromPKBytes refuse the other one — a CPubKey built from
+32 bytes is invalid (sign.cpp Satisfier::FromPKBytes), and TapSatisfier's
+requires exactly 32 (sign.cpp:506). One size per context is the same gate with
+the two halves joined."
+  (if (ms-tapscript-p ctx) 32 33))
+
+(defun %ms-decode-hash (ops in)
+  "Core DecodeScript's hash arm (miniscript.h:2354-2373) reading the reversed
+SIZE <32> EQUALVERIFY <hashop> <hash> EQUAL at OPS[IN], as (fragment . hash) or
+NIL.
+
+The push LENGTH is part of the match, not a later check: ripemd160 and hash160
+commit to 20 bytes and sha256 and hash256 to 32, so a 20-byte sha256 is not
+this fragment at all and must be left for the arms below."
+  (let ((last (length ops)))
+    (when (and (>= (- last in) 7)
+               (%ms-op-is ops in +op-equal+)
+               (%ms-op-is ops (+ in 3) +op-verify+)
+               (%ms-op-is ops (+ in 4) +op-equal+)
+               (eql 32 (%ms-op-num-at ops (+ in 5)))
+               (%ms-op-is ops (+ in 6) +ms-op-size+))
+      (let ((h (ms-op-opcode (aref ops (+ in 2))))
+            (sz (%ms-op-push-size ops (+ in 1)))
+            (data (ms-op-data (aref ops (+ in 1)))))
+        (cond ((and (= h +op-sha256+) (eql sz 32)) (cons :sha256 data))
+              ((and (= h +op-ripemd160+) (eql sz 20)) (cons :ripemd160 data))
+              ((and (= h +op-hash256+) (eql sz 32)) (cons :hash256 data))
+              ((and (= h +op-hash160+) (eql sz 20)) (cons :hash160 data)))))))
+
+(defun %ms-decode-multi (ops in ctx)
+  "Core DecodeScript's MULTI arm (miniscript.h:2374-2392) reading the reversed
+<k> <key>... <n> CHECKMULTISIG at OPS[IN], as (values keys k consumed) or NIL.
+
+CHECKMULTISIG does not exist in tapscript, so the arm refuses there
+(miniscript.h:2375). The keys come back in SOURCE order: reading backwards
+sees the last key first, and PUSH restores the order Core gets from
+std::reverse."
+  (let ((count (%ms-op-num-at ops (+ in 1)))
+        (last (length ops)))
+    (when (and (not (ms-tapscript-p ctx))
+               count
+               (>= (- last in) (+ 3 count))
+               (>= count 1)
+               (<= count +ms-max-pubkeys-per-multisig+))
+      (let ((keys '()))
+        (dotimes (j count)
+          (unless (eql 33 (%ms-op-push-size ops (+ in 2 j)))
+            (return-from %ms-decode-multi nil))
+          (push (ms-op-data (aref ops (+ in 2 j))) keys))
+        (let ((threshold (%ms-op-num-at ops (+ in 2 count))))
+          (when (and threshold (>= threshold 1) (<= threshold count))
+            (values keys threshold (+ 3 count))))))))
+
+(defun %ms-decode-multi-a (ops in ctx)
+  "Core DecodeScript's MULTI_A arm (miniscript.h:2394-2420) reading the reversed
+<x1> CHECKSIG (<xi> CHECKSIGADD)* <k> NUMEQUAL chain at OPS[IN], as
+(values keys k consumed) or NIL.
+
+multi_a is BIP342's replacement for CHECKMULTISIG and exists only there, so the
+arm refuses outside tapscript (miniscript.h:2397). Core bounds the walk by
+MAX_PUBKEYS_PER_MULTI_A as it goes rather than afterwards, so an arbitrarily
+long CHECKSIGADD chain cannot be parsed before it is refused; the key order is
+SOURCE order for the same reason as MULTI."
+  (let ((k (%ms-op-num-at ops (+ in 1)))
+        (last (length ops)))
+    (when (and (ms-tapscript-p ctx)
+               k
+               (>= k 1)
+               (<= k +ms-max-pubkeys-per-multi-a+)
+               (>= (- last in) (+ 2 (* k 2))))
+      (let ((keys '())
+            (nkeys 0))
+        (loop for pos from 2 by 2
+              do (when (< (- last in) (+ pos 2))
+                   (return-from %ms-decode-multi-a nil))
+                 (let ((op (ms-op-opcode (aref ops (+ in pos)))))
+                   (unless (and (or (= op +ms-op-checksigadd+) (= op +op-checksig+))
+                                (eql 32 (%ms-op-push-size ops (+ in pos 1))))
+                     (return-from %ms-decode-multi-a nil))
+                   (push (ms-op-data (aref ops (+ in pos 1))) keys)
+                   (incf nkeys)
+                   (when (> nkeys +ms-max-pubkeys-per-multi-a+)
+                     (return-from %ms-decode-multi-a nil))
+                   ;; OP_CHECKSIG is the head of the chain, so this key was the
+                   ;; last one to read.
+                   (when (= op +op-checksig+) (return))))
+        (when (>= nkeys k)
+          (values keys k (+ 2 (* nkeys 2))))))))
+
+(defun ms-from-script (script &key (ctx *ms-context*))
+  "Infer a miniscript from SCRIPT under CTX, or NIL.
 
 Returns a node that is valid at top level; anything else — a script that is not
 miniscript at all, one whose types do not check out, or one written in a
 non-minimal encoding — comes back NIL rather than as an error, because callers
-ask this question about arbitrary scripts."
-  (let ((ops (ms-decompose-script script)))
+ask this question about arbitrary scripts.
+
+CTX is Core's context parameter on FromScript (miniscript.h:2288): the same
+bytes are a different miniscript in P2WSH and in tapscript — a key push is 33
+bytes in one and 32 in the other, multi exists only in the first and multi_a
+only in the second — so it is an argument rather than whatever *MS-CONTEXT*
+happened to be bound to at the call."
+  (let ((*ms-context* ctx)
+        (ops (ms-decompose-script script)))
     (when ops
       (let ((in 0)
             (last (length ops))
@@ -1764,8 +1867,8 @@ ask this question about arbitrary scripts."
             (constructed '()))
         (macrolet ((fail () '(return-from ms-from-script nil))
                    (emit (form) `(push ,form constructed))
-                   (want (ctx &optional (n -1) (k -1))
-                     `(push (list ,ctx ,n ,k) to-parse)))
+                   (want (state &optional (n -1) (k -1))
+                     `(push (list ,state ,n ,k) to-parse)))
           (labels ((op-at (i) (and (< (+ in i) last) (aref ops (+ in i))))
                    (opcode-at (i) (let ((o (op-at i))) (and o (ms-op-opcode o))))
                    (num-at (i) (let ((o (op-at i))) (and o (%ms-op-number o))))
@@ -1788,16 +1891,23 @@ ask this question about arbitrary scripts."
                        ;; silently and would otherwise be discovered only at
                        ;; the very end, after arbitrary work.
                        (fail))
-                     (destructuring-bind (ctx n k) (pop to-parse)
-                       (ecase ctx
+                     ;; CUR-CONTEXT and not CTX (Core's own name for it,
+                     ;; miniscript.h:2307): CTX is the miniscript context this
+                     ;; whole decode runs in, and shadowing it here would hand
+                     ;; the key-size and multi arms a decoder state instead.
+                     (destructuring-bind (cur-context n k) (pop to-parse)
+                       (ecase cur-context
                          (:single-bkv-expr
                           (when (>= in last) (fail))
-                          (let ((op (opcode-at 0)))
+                          (let ((op (opcode-at 0))
+                                (hash (%ms-decode-hash ops in)))
                             (cond
                               ((= op +op-1+) (incf in) (emit (make-ms-node :just-1)))
                               ((= op +op-0+) (incf in) (emit (make-ms-node :just-0)))
-                              ;; A bare 33-byte push is a key.
-                              ((eql 33 (%ms-op-push-size ops in))
+                              ;; A bare key push: 33 bytes, or the x-only 32 a
+                              ;; tapscript leaf writes (%MS-KEY-PUSH-SIZE).
+                              ((eql (%ms-key-push-size ctx)
+                                    (%ms-op-push-size ops in))
                                (let ((key (data-at 0))) (incf in)
                                  (emit (make-ms-node :pk-k :keys (list key)))))
                               ;; DUP HASH160 <20> EQUAL VERIFY, reversed.
@@ -1830,45 +1940,24 @@ ask this question about arbitrary scripts."
                                  (unless (and (>= v 1) (<= v #x7FFFFFFF)) (fail))
                                  (emit (make-ms-node :after :k v))))
                               ;; SIZE <32> EQUAL VERIFY <hashop> <hash> EQUAL.
-                              ((and (>= (remaining) 7)
-                                    (= op +op-equal+)
-                                    (%ms-op-is ops (+ in 3) +op-verify+)
-                                    (%ms-op-is ops (+ in 4) +op-equal+)
-                                    (eql 32 (num-at 5))
-                                    (%ms-op-is ops (+ in 6) +ms-op-size+)
-                                    (let ((h (opcode-at 2)) (sz (%ms-op-push-size ops (+ in 1))))
-                                      (or (and (= h +op-sha256+) (eql sz 32))
-                                          (and (= h +op-ripemd160+) (eql sz 20))
-                                          (and (= h +op-hash256+) (eql sz 32))
-                                          (and (= h +op-hash160+) (eql sz 20)))))
-                               (let ((h (opcode-at 2)) (data (data-at 1)))
-                                 (incf in 7)
-                                 (emit (make-ms-node
-                                        (cond ((= h +op-sha256+) :sha256)
-                                              ((= h +op-ripemd160+) :ripemd160)
-                                              ((= h +op-hash256+) :hash256)
-                                              (t :hash160))
-                                        :data data))))
+                              (hash
+                               (incf in 7)
+                               (emit (make-ms-node (car hash) :data (cdr hash))))
                               ;; <k> <key>... <n> CHECKMULTISIG, reversed.
                               ((and (>= (remaining) 3) (= op +op-checkmultisig+))
-                               (let ((count (num-at 1)))
-                                 (unless (and count (>= (remaining) (+ 3 count))
-                                              (>= count 1)
-                                              (<= count +ms-max-pubkeys-per-multisig+))
-                                   (fail))
-                                 (let ((keys '()))
-                                   (dotimes (j count)
-                                     (unless (eql 33 (%ms-op-push-size ops (+ in 2 j))) (fail))
-                                     (push (data-at (+ 2 j)) keys))
-                                   (let ((threshold (num-at (+ 2 count))))
-                                     (unless (and threshold (>= threshold 1)
-                                                  (<= threshold count))
-                                       (fail))
-                                     (incf in (+ 3 count))
-                                     ;; Collected while walking backwards, so
-                                     ;; PUSH already restored source order.
-                                     (emit (make-ms-node :multi :k threshold
-                                                                :keys keys))))))
+                               (multiple-value-bind (keys k consumed)
+                                   (%ms-decode-multi ops in ctx)
+                                 (unless keys (fail))
+                                 (incf in consumed)
+                                 (emit (make-ms-node :multi :k k :keys keys))))
+                              ;; <x1> CHECKSIG (<xi> CHECKSIGADD)* <k>
+                              ;; NUMEQUAL, reversed: tapscript's multi.
+                              ((and (>= (remaining) 4) (= op +ms-op-numequal+))
+                               (multiple-value-bind (keys k consumed)
+                                   (%ms-decode-multi-a ops in ctx)
+                                 (unless keys (fail))
+                                 (incf in consumed)
+                                 (emit (make-ms-node :multi-a :k k :keys keys))))
                               ;; Wrappers. SINGLE_BKV_EXPR, not BKV_EXPR: and_v
                               ;; commutes with these, so c:and_v(X,Y) and
                               ;; and_v(X,c:Y) compile identically and the and_v
