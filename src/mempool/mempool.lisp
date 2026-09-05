@@ -259,22 +259,62 @@ fields (handle-tx, sendrawtransaction, reorg re-add)."
    :height height
    :entry-time entry-time))
 
+(defconstant +int64-max+ (1- (ash 1 63))
+  "Largest CAmount / FeeFrac fee (Core int64_t).")
+(defconstant +int64-min+ (- (ash 1 63))
+  "Smallest CAmount / FeeFrac fee (Core int64_t).")
+
+(defun %saturating-add-int64 (a b)
+  "A + B clamped to the int64 range (Core SaturatingAdd, util/overflow.h:42-58).
+CAmount is int64_t and Core's prioritisation arithmetic saturates rather than
+wrapping or throwing, so a delta that would leave the range pins at the bound."
+  (let ((sum (+ a b)))
+    (cond ((> sum +int64-max+) +int64-max+)
+          ((< sum +int64-min+) +int64-min+)
+          (t sum))))
+
 (defun mempool-prioritise (mempool txid fee-delta)
-  "Add FEE-DELTA satoshis to TXID's prioritisation (Core's
-PrioritiseTransaction). Deltas stack; a net-zero delta is dropped. Applies
-immediately to the in-mempool entry's modified fee when present. Returns the
-accumulated delta."
-  (let* ((delta (+ (gethash txid (mempool-deltas mempool) 0) fee-delta))
+  "Add FEE-DELTA satoshis to TXID's prioritisation (Core
+PrioritiseTransaction, txmempool.cpp:630-655). Deltas stack; a net-zero delta
+is dropped. Applies immediately to the in-mempool entry's modified fee when
+present. Returns the accumulated delta.
+
+Both sums SATURATE at the int64 range, as Core's do: the accumulated delta
+through SaturatingAdd on mapDeltas (txmempool.cpp:635) and the entry's
+modified fee through CTxMemPoolEntry::UpdateModifiedFee, itself a
+SaturatingAdd (kernel/mempool_entry.h:125-128). Nothing here can therefore
+hand the txgraph a fee outside the (SIGNED-BYTE 64) domain its FeeFrac shares
+with CAmount.
+
+The two fee views move together. Both new values are computed before either is
+written, the txgraph is written first (it is the only one of the three that
+can signal), and the deltas table follows, so no escaping condition can leave
+the entry's modified fee and the graph's fee disagreeing -- a split that
+neither this RPC nor any other could repair."
+  (let* ((delta (%saturating-add-int64
+                 (gethash txid (mempool-deltas mempool) 0) fee-delta))
          (entry (mempool-get mempool txid)))
     (when entry
-      (incf (mempool-entry-modified-fee entry) fee-delta)
-      ;; Keep the shadow txgraph's (chunk) feerates honest (Core
-      ;; PrioritiseTransaction -> SetTransactionFee, txmempool.cpp:641).
-      (let ((handle (mempool-entry-graph-handle entry)))
+      (let ((handle (mempool-entry-graph-handle entry))
+            (modified (%saturating-add-int64
+                       (mempool-entry-modified-fee entry) fee-delta)))
+        ;; Keep the shadow txgraph's (chunk) feerates honest (Core
+        ;; PrioritiseTransaction -> SetTransactionFee, txmempool.cpp:641).
+        ;; It goes first because it is the only one of the writes that can
+        ;; signal, so a failure leaves nothing half-applied.
         (when handle
-          (txgraph-set-transaction-fee (mempool-graph mempool) handle
-                                       (mempool-entry-modified-fee entry))))
-      (%mempool-graph-verify mempool))
+          (txgraph-set-transaction-fee (mempool-graph mempool) handle modified))
+        (setf (mempool-entry-modified-fee entry) modified)
+        ;; This is the only place the entry's modified fee and the graph's fee
+        ;; move, so the agreement they are supposed to keep is asserted here,
+        ;; on the success path, where nothing can skip it.
+        (when handle
+          (let ((graph-fee (feefrac-fee (txgraph-get-individual-feerate
+                                         (mempool-graph mempool) handle))))
+            (unless (= graph-fee modified)
+              (internal-error "prioritise: entry modified fee ~D but graph fee ~D"
+                              modified graph-fee))))
+        (%mempool-graph-verify mempool)))
     (if (zerop delta)
         (remhash txid (mempool-deltas mempool))
         (setf (gethash txid (mempool-deltas mempool)) delta))
