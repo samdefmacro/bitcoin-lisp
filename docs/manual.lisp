@@ -455,7 +455,12 @@
   `torcontrol.cpp`, `bip324.cpp` and `net.cpp`'s V2Transport.
 
   Invariants: `send-bytes` NEVER blocks -- it queues, and the pump
-  flushes; `receive-bytes` is resumable and bounded per pass, so one slow
+  flushes -- and it never DISCARDS: past the send-buffer cap the peer is
+  send-paused, which stops the pump reading that peer's INPUT (Core's
+  fPauseSend gate in ProcessMessages), so the work is deferred instead of
+  a reply we already decided to send going missing; a peer that never
+  drains is dropped by the 20-minute socket-sending timeout, as in Core.
+  `receive-bytes` is resumable and bounded per pass, so one slow
   peer cannot stall the node (a 24-byte header followed by silence once
   froze every peer). Readiness is `poll(2)`, never `select()`. The
   address book is tried/new tables with Core's bucketing, so nothing

@@ -66,16 +66,25 @@ dials). Only the two genuine outbound full-relay peers are counted."
 ;;; 2. Non-blocking send path
 ;;; ============================================================
 
+(defun %send-queue-bytes (conn)
+  "CONN's buffered-unsent-byte counter (Core CNode::m_send_memusage). The one
+reach into it in this file; SETF-able so a test can put a connection over the
+pause cap without a jammed socket."
+  (bl.net::connection-send-queue-bytes conn))
+
+(defun (setf %send-queue-bytes) (n conn)
+  (setf (bl.net::connection-send-queue-bytes conn) n))
+
 (test send-paused-predicate-tracks-cap
   "connection-send-paused-p flips exactly at the send-buffer cap (Core
 fPauseSend on nSendBufferMaxSize)."
   (let ((conn (bl.net::make-connection)))
-    (setf (bl.net::connection-send-queue-bytes conn) 0)
+    (setf (%send-queue-bytes conn) 0)
     (is-false (bl.net:connection-send-paused-p conn))
-    (setf (bl.net::connection-send-queue-bytes conn)
+    (setf (%send-queue-bytes conn)
           bl.net:*max-send-buffer-bytes*)
     (is-false (bl.net:connection-send-paused-p conn))
-    (setf (bl.net::connection-send-queue-bytes conn)
+    (setf (%send-queue-bytes conn)
           (1+ bl.net:*max-send-buffer-bytes*))
     (is-true (bl.net:connection-send-paused-p conn))))
 
@@ -85,13 +94,13 @@ has made no send progress for the stall timeout (Core socket sending timeout)."
   (let ((conn (bl.net::make-connection))
         (units internal-time-units-per-second))
     ;; No pending data: never stalled, even with an ancient progress time.
-    (setf (bl.net::connection-send-queue-bytes conn) 0
+    (setf (%send-queue-bytes conn) 0
           (bl.net::connection-last-send-progress conn)
           (- (get-internal-real-time)
              (* (1+ bl.net::+send-stall-timeout-seconds+) units)))
     (is-false (bl.net:connection-send-stalled-p conn))
     ;; Pending data but recent progress: not stalled.
-    (setf (bl.net::connection-send-queue-bytes conn) 500
+    (setf (%send-queue-bytes conn) 500
           (bl.net::connection-last-send-progress conn)
           (get-internal-real-time))
     (is-false (bl.net:connection-send-stalled-p conn))
@@ -108,17 +117,19 @@ has made no send progress for the stall timeout (Core socket sending timeout)."
           (list #(1 2 3))
           (bl.net::connection-send-queue-out conn)
           (list #(4 5))
-          (bl.net::connection-send-queue-bytes conn) 5)
+          (%send-queue-bytes conn) 5)
     (bl.net:close-connection conn)
     (is (null (bl.net::connection-send-queue-in conn)))
     (is (null (bl.net::connection-send-queue-out conn)))
-    (is (= 0 (bl.net::connection-send-queue-bytes conn)))))
+    (is (= 0 (%send-queue-bytes conn)))))
 
 (test send-bytes-buffers-and-never-blocks-on-jammed-socket
   "A peer whose TCP window is jammed must not pin the caller: send-bytes writes
-what the kernel takes, queues the rest, and returns promptly. Once the buffer
-exceeds the cap the peer is send-paused and further messages are dropped
-(returns NIL) instead of blocking the shared thread."
+what the kernel takes, queues the rest, and returns promptly instead of
+blocking the shared thread. Past the cap the peer is send-paused, and the
+message is still QUEUED — Core's PushMessage (net.cpp:4088-4113) never
+discards a message it decided to send; it only sets fPauseSend, which stops
+us reading that peer's input (70502bf3)."
   (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
     (is-true srv)
     (when srv
@@ -138,6 +149,7 @@ exceeds the cap the peer is send-paused and further messages are dropped
             ;; write) can be caught as a timeout rather than hanging the suite.
             (let* ((chunk (make-array 200000 :element-type '(unsigned-byte 8)
                                              :initial-element 7))
+                   (total (* 20 (length chunk)))
                    (dropped nil)
                    (sends-done nil)
                    (worker (bt:make-thread
@@ -153,14 +165,66 @@ exceeds the cap the peer is send-paused and further messages are dropped
               (bl.net:join-thread-or-destroy worker :timeout 10)
               (is-true sends-done "send-bytes must not block on a jammed socket")
               ;; Data backed up into the per-connection buffer.
-              (is-true (plusp (bl.net::connection-send-queue-bytes conn)))
-              ;; The buffer went over the cap, so the peer is send-paused and at
-              ;; least one later message was dropped rather than queued forever.
+              (is-true (plusp (%send-queue-bytes conn)))
+              ;; The buffer went over the cap, so the peer is send-paused.
               (is-true (bl.net:connection-send-paused-p conn))
-              (is-true dropped "over-cap messages must be dropped, not queued")
+              (is-false dropped "an over-cap message must be queued, not dropped")
+              ;; Every byte is accounted for: what the kernel took plus what is
+              ;; still buffered is the whole 4 MB. A drop would lose a chunk here.
+              (is (= total (+ (bl.net:connection-bytes-sent conn)
+                              (%send-queue-bytes conn)))
+                  "queued + sent must equal what was handed to send-bytes")
               (bl.net:close-connection conn)
               (ignore-errors (usocket:socket-close server-conn))))
         (bl.net:close-listener srv)))))
+
+(test send-paused-peer-has-its-input-left-unread
+  "Core's backpressure runs on the INPUT side: ProcessMessages returns before
+polling a new message from a peer whose send buffer is over the cap
+(net_processing.cpp:5244-5245), so the work is deferred rather than answered
+into a socket that cannot take it. The pump must therefore leave a
+send-paused peer's readable message where it is, and pick it up once the
+buffer drains (70502bf3).
+
+The second half is the positive control: with the pause cleared and nothing
+else changed, the SAME pending message is read."
+  (let ((srv (bl.net:open-listener "127.0.0.1" 0)))
+    (is-true srv)
+    (when srv
+      (let* ((port (usocket:get-local-port srv))
+             (sender (usocket:socket-connect "127.0.0.1" port
+                                             :element-type '(unsigned-byte 8)))
+             (accepted (usocket:socket-accept srv :element-type '(unsigned-byte 8)))
+             (conn (bl.net::make-connection
+                    :socket accepted :host "127.0.0.1" :port port :connected t))
+             (peer (bl.net:make-peer :state :ready :address "127.0.0.1:8333"
+                                     :connection conn)))
+        (unwind-protect
+             (progn
+               ;; A whole, well-formed message is waiting to be read.
+               (write-sequence (bl.ser:make-ping-message 42)
+                               (usocket:socket-stream sender))
+               (force-output (usocket:socket-stream sender))
+               (sleep 0.2)
+               ;; Paused: the pump must not touch it.
+               (setf (%send-queue-bytes conn)
+                     (1+ bl.net:*max-send-buffer-bytes*))
+               (is-true (bl.net:connection-send-paused-p conn))
+               (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) nil)
+               (is (= 0 (bl.net:connection-bytes-received conn))
+                   "a send-paused peer's input is left unread")
+               (is-true (bl.net:connection-connected conn)
+                        "and the pause is not a reason to disconnect it")
+               ;; Positive control: unpause and the same message is consumed.
+               (setf (%send-queue-bytes conn) 0)
+               (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) nil)
+               (is (plusp (bl.net:connection-bytes-received conn))
+                   "and once drained the pending message is read after all")
+               (is (plusp (gethash "ping" (bl.net:peer-recv-per-msg peer) 0))
+                   "the message the pause deferred is the one dispatched"))
+          (bl.net:close-connection conn)
+          (ignore-errors (usocket:socket-close sender))
+          (bl.net:close-listener srv))))))
 
 ;;; ============================================================
 ;;; 3. Per-address addr/addrv2 rate limit
