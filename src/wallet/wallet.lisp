@@ -1049,7 +1049,10 @@ left LOCKED."
 then keys/caches/active mappings (LevelDB iteration order does not guarantee
 descriptor-before-key). Transaction records load last — RefreshTXOs needs
 the IsMine script maps the cache install builds. CHAIN-STATE (when given)
-resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
+resolves stored confirmed/conflicted block heights (CWalletTx::updateState).
+
+Returns (values warnings rescan-required); the second value is Core's
+DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
   (let ((records (wallet-db-records (wallet-db wallet)))
         (network (wallet-network wallet))
         (caches (make-hash-table :test 'equalp))   ; id -> descriptor-cache
@@ -1220,15 +1223,19 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
     ;; Transaction records last: RefreshTXOs consults the IsMine maps built
     ;; by the cache installs above (Core LoadTxRecords runs after descriptor
     ;; records too).
-    (setf warnings (wallet-load-tx-records wallet (nreverse tx-records)
-                                           chain-state warnings))
-    warnings))
+    (wallet-load-tx-records wallet (nreverse tx-records) chain-state warnings)))
 
 (defun load-wallet (manager name &key chain-state)
   "Load an existing wallet from <wallets>/<name>/ and register it. Returns
-(values wallet warnings). CHAIN-STATE resolves stored tx block heights; the
-locator catch-up rescan is a separate step (wallet-attach-chain) run by the
-RPC after registration, mirroring Core's LoadWallet -> AttachChain split."
+(values wallet warnings rescan-required). CHAIN-STATE resolves stored tx block
+heights; the locator catch-up rescan is a separate step (wallet-attach-chain)
+run by the RPC after registration, mirroring Core's LoadWallet -> AttachChain
+split.
+
+RESCAN-REQUIRED is Core's DBErrors::NEED_RESCAN. Like CreateWalletFromFile
+(wallet.cpp:3140-3142) this is not a load failure: the wallet comes up, and
+the caller hands the flag to WALLET-ATTACH-CHAIN, which then rescans from
+height 0 rather than from a locator that no longer describes what loaded."
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (when (gethash name (wallet-manager-wallets manager))
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-already-loaded+
@@ -1245,11 +1252,19 @@ RPC after registration, mirroring Core's LoadWallet -> AttachChain split."
              (wallet (make-wallet :name name :path path :db db
                                   :network (wallet-manager-network manager)
                                   :keypool-size (wallet-manager-keypool-size manager)))
-             (warnings '()))
+             (warnings '())
+             (rescan-required nil))
         (handler-case
             (with-wallet-lock (wallet)
-              (setf warnings (%load-wallet-records wallet warnings
-                                                   :chain-state chain-state))
+              (multiple-value-setq (warnings rescan-required)
+                (%load-wallet-records wallet warnings :chain-state chain-state))
+              ;; Core's NEED_RESCAN warning, verbatim in shape
+              ;; (wallet.cpp:2383-2386). It is the operator's only notice that
+              ;; a stored transaction was dropped and is being rebuilt.
+              (when rescan-required
+                (push (format nil "Error reading ~A! Transaction data may be missing or incorrect. Rescanning wallet."
+                              name)
+                      warnings))
               (when (and (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+)
                          (loop for spkm being the hash-values of (wallet-spkms wallet)
                                thereis (spkm-have-private-keys-p spkm)))
@@ -1268,7 +1283,7 @@ RPC after registration, mirroring Core's LoadWallet -> AttachChain split."
         (setf (wallet-manager-wallet-order manager)
               (append (wallet-manager-wallet-order manager) (list name)))
         (%refresh-wallet-snapshot manager)
-        (values wallet (nreverse warnings))))))
+        (values wallet (nreverse warnings) rescan-required)))))
 
 (defun unload-wallet (manager wallet &key force)
   "Write the best-block marker, close the database, and deregister. Refuses
@@ -1617,14 +1632,17 @@ sequence has exactly one definition."
   ;; Record load under the node-lock (outermost; manager/wallet locks nest
   ;; inside): tx-state resolution reads the chain, and no block may connect
   ;; between the load and the wallet becoming hook-visible.
-  (multiple-value-bind (wallet warnings)
+  (multiple-value-bind (wallet warnings rescan-required)
       (bl.rpc:with-node-lock (node)
         (load-wallet manager name
                      :chain-state (bl:node-current-chainstate node)))
     ;; Catch up from the stored locator OUTSIDE the node-lock hold — the
     ;; scan takes it per segment; blocks connecting meanwhile reach the
     ;; wallet through the hooks (Core registers notifications pre-rescan).
-    (let ((error-message (wallet-attach-chain node wallet)))
+    ;; RESCAN-REQUIRED replaces the locator with height 0, Core's
+    ;; AttachChain(rescan_required) branch.
+    (let ((error-message (wallet-attach-chain node wallet
+                                              :rescan-required rescan-required)))
       (when error-message
         (ignore-errors (unload-wallet manager wallet :force t))
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+ :message error-message)))
@@ -1676,8 +1694,16 @@ whose wallet is missing and loudly logged."
                                  (length names) names))
         (dolist (name names)
           (handler-case
-              (progn (%load-and-attach-wallet node manager name)
-                     (bl:log-info "Loaded wallet ~S" name))
+              (multiple-value-bind (wallet warnings)
+                  (%load-and-attach-wallet node manager name)
+                (declare (ignore wallet))
+                ;; Core reports every load warning here (load.cpp:149,
+                ;; chain.initWarning over the joined list). Dropping them made
+                ;; a wallet that had lost a transaction record look like a
+                ;; clean start on the one path an operator actually takes.
+                (dolist (warning warnings)
+                  (bl:log-warn "Wallet ~S: ~A" name warning))
+                (bl:log-info "Loaded wallet ~S" name))
             (error (e)
               (bl:log-warn "Could not load wallet ~S at startup, skipping it: ~A"
                                      name e))))))))

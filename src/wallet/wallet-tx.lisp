@@ -1221,8 +1221,17 @@ away while the wallet was closed."
 
 (defun wallet-load-tx-records (wallet tx-records chain-state warnings)
   "Replay the stored CWalletTx records into mapWallet (Core LoadTxRecords +
-LoadToWallet). TX-RECORDS is (txid . value-bytes) pairs. Returns WARNINGS."
-  (let ((any-unordered nil))
+LoadToWallet). TX-RECORDS is (txid . value-bytes) pairs. Returns
+(values warnings rescan-required).
+
+RESCAN-REQUIRED is Core's DBErrors::NEED_RESCAN and it is set on exactly
+Core's two conditions: LoadToWallet returns false when the value fails to
+deserialize or when the transaction's own hash is not the key it was stored
+under (walletdb.cpp:1015-1030). The wallet still loads -- the caller rescans
+from height 0 instead of from the stored locator, which is the only thing
+that can rebuild the lost record."
+  (let ((any-unordered nil)
+        (rescan-required nil))
     (dolist (rec tx-records)
       (destructuring-bind (txid . value) rec
         (multiple-value-bind (wtx state-warning)
@@ -1230,13 +1239,15 @@ LoadToWallet). TX-RECORDS is (txid . value-bytes) pairs. Returns WARNINGS."
               (error (e)
                 (push (format nil "Error reading wallet tx record: ~A" e)
                       warnings)
+                (setf rescan-required t)
                 nil))
           (when state-warning (push state-warning warnings))
           (when wtx
             (cond
               ((not (equalp (wallet-tx-txid wtx) txid))
                (push "Wallet tx record hash mismatch; record skipped (rescan to recover)"
-                     warnings))
+                     warnings)
+               (setf rescan-required t))
               ((wallet-get-wallet-tx wallet txid)
                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                  :message "Error: Corrupt transaction found. This can be fixed by removing transactions from wallet and rescanning."))
@@ -1286,7 +1297,7 @@ LoadToWallet). TX-RECORDS is (txid . value-bytes) pairs. Returns WARNINGS."
           do (when (and (%wtx-coinbase-p wtx)
                         (eq (wallet-tx-state wtx) :inactive))
                (wallet-abandon-transaction wallet wtx)))
-    warnings))
+    (values warnings rescan-required)))
 
 ;;; --- Rescanning (wallet.cpp:1813,1857 + AttachChain:3171) ---
 
@@ -1664,14 +1675,21 @@ blocks stay in the index, and find-fork-in-active-chain handles them."
                    (bl.store:get-block-index-entry chain-state hash))
                  locator))))
 
-(defun wallet-attach-chain (node wallet)
+(defun wallet-attach-chain (node wallet &key rescan-required)
   "Port of CWallet::AttachChain's catch-up (wallet.cpp:3171): find the fork
 of the wallet's stored locator with the active chain, rescan from there
 (birth-time gated) to the tip, and persist the new best block. The hooks are
 global, so there is no per-wallet notification registration; blocks that
 connect during the scan reach the wallet through them, exactly like Core's
 pending notifications. Returns NIL on success or an error string (the wallet
-should then be unloaded, like Core's failed AttachChain)."
+should then be unloaded, like Core's failed AttachChain).
+
+RESCAN-REQUIRED is the DBErrors::NEED_RESCAN the record load reports: a tx
+record that would not parse, or whose hash was not its key, was dropped, so
+the stored locator no longer describes what the wallet holds. Core's answer
+is one line -- \"If rescan_required = true, rescan_height remains equal to 0\"
+(wallet.cpp:3200-3211) -- and everything downstream of it, the birth-time
+gate, the prune refusal and the reserver, is unchanged."
   (let (rescan-height tip-height start-hash)
     (bl.rpc:with-node-lock (node)
       (let ((chain-state (bl:node-current-chainstate node)))
@@ -1690,7 +1708,8 @@ should then be unloaded, like Core's failed AttachChain)."
           (return-from wallet-attach-chain
             "Wallet files should not be reused across chains. Restart bitcoind with -walletcrosschain to override."))
         (setf tip-height (max (bl.store:current-height chain-state) 0))
-        (let ((fork (and (wallet-loaded-locator wallet)
+        (let ((fork (and (not rescan-required)
+                         (wallet-loaded-locator wallet)
                          (bl.store:find-fork-in-active-chain
                           chain-state (wallet-loaded-locator wallet)))))
           (setf rescan-height

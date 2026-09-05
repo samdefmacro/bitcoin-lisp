@@ -918,7 +918,10 @@
   Invariants: a wallet's chain view is driven by the node's block and
   mempool notifications (the `wallets-*` entry points), never by polling;
   the descriptor expansion is cached by descriptor STRING, and every
-  script construction change must invalidate it.
+  script construction change must invalidate it; a stored transaction
+  record that will not load is Core's `NEED_RESCAN` -- the wallet still
+  loads, and the catch-up rescans from height 0 instead of from the
+  stored locator, which no longer describes what is in memory.
 
   Traps: a locked wallet could once still sign because a parsed
   descriptor kept its embedded xprv; the key-provider is the only source
