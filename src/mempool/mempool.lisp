@@ -368,9 +368,21 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   (min-fee-rate *min-relay-fee-rate* :type integer)
   ;; Rolling dynamic minimum fee rate (sat/kvB), raised when the mempool is full
   ;; and trims, decaying back toward the relay floor over time. Bitcoin Core's
-  ;; rolling minimum fee.
-  (rolling-min-fee-rate 0 :type integer)
+  ;; rolling minimum fee. A DOUBLE, like Core's rollingMinimumFeeRate
+  ;; (txmempool.h:197): the decay is applied to the stored value and written
+  ;; back on every read, so keeping it as an integer would truncate once per
+  ;; read and the sum of those truncations dwarfs the decay itself.
+  (rolling-min-fee-rate 0.0d0 :type double-float)
+  ;; When the rolling minimum was last decayed (Core lastRollingFeeUpdate);
+  ;; a connected block restarts it.
   (rolling-min-fee-time 0 :type integer)
+  ;; Has a block connected since the last bump (Core
+  ;; blockSinceLastRollingFeeBump, txmempool.h:196, false at construction)?
+  ;; While this is NIL the rolling minimum does not decay at all: the floor
+  ;; stays at the feerate that was just trimmed until a block has come in, so
+  ;; that "we don't allow txn to enter mempool with feerate equal to txn which
+  ;; were removed with no block in between" (TrimToSize, txmempool.cpp:873-875).
+  (block-since-rolling-fee-bump nil :type boolean)
   ;; txid -> satoshi fee delta from prioritisetransaction (Core's mapDeltas).
   ;; Deltas may exist for txs not (yet) in the mempool; applied on acceptance.
   (deltas (bl.bytes:make-octets-hash-table) :type hash-table)
@@ -451,42 +463,67 @@ non-decreasing, since each half only ever grows."
   "Effective minimum fee rate to enter the mempool, in SAT/KVB: the relay floor,
 or the decayed rolling minimum if higher (Bitcoin Core CTxMemPool::GetMinFee,
 CFeeRate::GetFeePerK units). Compare as (>= (* fee 1000) (* rate vsize)).
-The decay half-life is divided by 4 (2) while the pool's dynamic usage sits
-below 1/4 (1/2) of the memory cap — a near-empty pool forgets fee spikes
-faster (txmempool.cpp:836-840) — and a rolling minimum that decays below
-half the incremental relay fee resets to zero (txmempool.cpp:845-848)."
+MEMPOOL-DECAYED-ROLLING-MIN-FEE-RATE has the decay rules; the half-life is
+divided by 4 (2) while the pool's dynamic usage sits below 1/4 (1/2) of the
+memory cap, so a near-empty pool forgets fee spikes faster."
   (max (mempool-min-fee-rate mempool)
        (mempool-decayed-rolling-min-fee-rate mempool now)))
+
+(defun %round-fee-rate (rate)
+  "RATE (a non-negative double) as Core reports it: llround, which rounds a
+half away from zero. CL's ROUND rounds a half to EVEN, so it answers 100
+where Core answers 101."
+  (floor (+ rate 1/2)))
 
 (defun mempool-decayed-rolling-min-fee-rate (mempool
                                              &optional (now (bl.ser:get-unix-time)))
   "The DECAYED rolling minimum ALONE, in sat/kvB, or 0 when there is none.
 
-This is exactly Core's CTxMemPool::GetMinFee, which does NOT fold in
--minrelaytxfee — callers that need the relay floor apply it themselves
-(MEMPOOL-EFFECTIVE-MIN-FEE-RATE does). BIP133 needs the unfolded value: Core
-rounds GetMinFee and only then takes the max with the relay floor, so feeding
-it the already-floored number would round 100 up into the next bucket a third
-of the time and put 107 on the wire where Core puts a flat 100.
+This is exactly Core's CTxMemPool::GetMinFee (txmempool.cpp:829-851), which
+does NOT fold in -minrelaytxfee — callers that need the relay floor apply it
+themselves (MEMPOOL-EFFECTIVE-MIN-FEE-RATE does). BIP133 needs the unfolded
+value: Core rounds GetMinFee and only then takes the max with the relay floor,
+so feeding it the already-floored number would round 100 up into the next
+bucket a third of the time and put 107 on the wire where Core puts a flat 100.
 
-A rolling minimum that decays below half the incremental relay fee resets to
-zero (txmempool.cpp:845-848)."
-  (let ((rolling (mempool-rolling-min-fee-rate mempool)))
-    (if (<= rolling 0)
-        0
-        (let* ((age (max 0 (- now (mempool-rolling-min-fee-time mempool))))
-               (usage (mempool-dynamic-usage mempool))
-               (limit (mempool-max-size mempool))
-               (halflife (cond ((< usage (floor limit 4))
-                                (floor +rolling-fee-halflife-seconds+ 4))
-                               ((< usage (floor limit 2))
-                                (floor +rolling-fee-halflife-seconds+ 2))
-                               (t +rolling-fee-halflife-seconds+)))
-               (decayed (floor (* rolling (expt 0.5d0 (/ age halflife))))))
-          (cond ((< decayed (floor *incremental-relay-fee-rate* 2))
-                 (setf (mempool-rolling-min-fee-rate mempool) 0)
-                 0)
-                (t decayed))))))
+A READ, and also a WRITE. Three properties come with that, and all three are
+Core's:
+
+- nothing decays while no block has connected since the last bump, so the
+  floor stays at what was just trimmed until a block has come in (:831-832);
+- a decay step runs at most once per 10 seconds (:835), and it decays the
+  STORED rate over the interval since the last step at the half-life in force
+  now, writing both back (:842-843) — so a pool that sits full for 12 h and
+  then drains keeps the 12 h half-life for those hours instead of having the
+  shortened one applied retroactively to them;
+- a rolling minimum that decays below half the incremental relay fee resets
+  to zero (:845-848), and any other answer is at least the incremental relay
+  fee (:850)."
+  (let ((rolling (mempool-rolling-min-fee-rate mempool))
+        (last (mempool-rolling-min-fee-time mempool)))
+    (cond
+      ((or (not (mempool-block-since-rolling-fee-bump mempool))
+           (zerop rolling))
+       (%round-fee-rate rolling))
+      ((<= now (+ last 10))
+       (max (%round-fee-rate rolling) *incremental-relay-fee-rate*))
+      (t
+       (let* ((usage (mempool-dynamic-usage mempool))
+              (limit (mempool-max-size mempool))
+              (halflife (cond ((< usage (floor limit 4))
+                               (floor +rolling-fee-halflife-seconds+ 4))
+                              ((< usage (floor limit 2))
+                               (floor +rolling-fee-halflife-seconds+ 2))
+                              (t +rolling-fee-halflife-seconds+)))
+              (decayed (/ rolling (expt 2.0d0 (/ (- now last) halflife)))))
+         (setf (mempool-rolling-min-fee-time mempool) now)
+         (cond ((< decayed (/ *incremental-relay-fee-rate* 2.0d0))
+                (setf (mempool-rolling-min-fee-rate mempool) 0.0d0)
+                0)
+               (t
+                (setf (mempool-rolling-min-fee-rate mempool) decayed)
+                (max (%round-fee-rate decayed)
+                     *incremental-relay-fee-rate*))))))))
 
 ;;;; Shadow txgraph checks (cluster mempool P3, kept through the P4-P6 flips)
 ;;;;
@@ -1694,7 +1731,8 @@ DynamicMemoryUsage() > sizelimit). A high-fee child still protects its
 low-fee parent (CPFP): they share a chunk, evicted only as a unit. Each
 evicted chunk raises the rolling minimum fee (sat/kvB) to its feerate plus
 the incremental relay fee, so newcomers must beat what was just trimmed
-(Core trackPackageRemoved). Returns the number of transactions removed."
+(Core trackPackageRemoved) — and holds it there, undecayed, until a block
+connects. Returns the number of transactions removed."
   (let ((graph (mempool-graph mempool))
         (removed 0)
         (*mempool-removal-reason* :size-limit))
@@ -1709,10 +1747,14 @@ the incremental relay fee, so newcomers must beat what was just trimmed
                  (let ((rate (+ (truncate (* (feefrac-fee feerate) 1000)
                                           (feefrac-size feerate))
                                 *incremental-relay-fee-rate*)))
+                   ;; Core trackPackageRemoved (txmempool.cpp:853-858): the
+                   ;; bump also STOPS the decay clock. Nothing lowers the
+                   ;; floor again until a block connects, or a newcomer at
+                   ;; the feerate just evicted walks straight back in.
                    (when (> rate (mempool-rolling-min-fee-rate mempool))
-                     (setf (mempool-rolling-min-fee-rate mempool) rate
-                           (mempool-rolling-min-fee-time mempool)
-                           (bl.ser:get-unix-time))))
+                     (setf (mempool-rolling-min-fee-rate mempool)
+                           (coerce rate 'double-float)
+                           (mempool-block-since-rolling-fee-bump mempool) nil)))
                  ;; The worst chunk is the tail of its own cluster's
                  ;; linearization, so it contains every in-mempool descendant
                  ;; of its members: removing its transactions (delivered
@@ -1786,7 +1828,16 @@ and the conflicting transaction lose their prioritisation delta."
                  (mempool-spent-outpoints mempool))
         (dolist (txid to-remove)
           (remhash txid (mempool-deltas mempool))
-          (mempool-remove-recursive mempool txid))))))
+          (mempool-remove-recursive mempool txid)))
+
+      ;; A connected block restarts the rolling minimum's decay clock, and it
+      ;; is the only thing that does: Core's removeForBlock sets both
+      ;; lastRollingFeeUpdate and blockSinceLastRollingFeeBump at
+      ;; txmempool.cpp:426-427, unconditionally — even a block that removed
+      ;; nothing from the pool counts.
+      (setf (mempool-rolling-min-fee-time mempool) (bl.ser:get-unix-time)
+            (mempool-block-since-rolling-fee-bump mempool) t)
+      (values))))
 
 (defun mempool-remove-spenders (mempool txid n-outputs)
   "Remove, with their descendants, any mempool transactions spending an output
