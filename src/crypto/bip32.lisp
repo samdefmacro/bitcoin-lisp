@@ -175,7 +175,10 @@ Every rejection below corresponds to one of those vectors:
   - depth 0 with a non-zero parent fingerprint, or with a non-zero child index.
     A master key has no parent and is nobody's child; claiming otherwise makes
     the fingerprint chain a lie."
-  (let ((bytes (base58-decode str)))
+  ;; Core DecodeExtKey / DecodeExtPubKey (key_io.cpp:248, :271) call
+  ;; DecodeBase58Check with 78 -- the 4-byte version prefix and
+  ;; BIP32_EXTKEY_SIZE -- which is 82 raw bytes once the checksum is counted.
+  (let ((bytes (base58-decode str 82)))
     (when (and bytes (= (length bytes) 82)
                (equalp (subseq bytes 78 82) (subseq (hash256 (subseq bytes 0 78)) 0 4)))
       (let* ((version (%be->int (subseq bytes 0 4)))

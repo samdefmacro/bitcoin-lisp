@@ -58,7 +58,7 @@ not refer to key\", and malformed base64 -5 \"Malformed base64 encoding\"."
   ;; must decode, and must be base58 P2PKH (only key-hash addresses can be
   ;; message-verified). base58check-decode's payload is the 20-byte key-id.
   (multiple-value-bind (ver payload)
-      (handler-case (bl.crypto:base58check-decode address)
+      (handler-case (bl.crypto:base58check-decode address 21)
         (error () (values nil nil)))
     (declare (ignore ver))
     (unless (and payload (= (length payload) 20))
