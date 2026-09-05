@@ -851,6 +851,16 @@ T — declining to offer never fails the handshake."
                       (bl.ser:make-sendtxrcncl-message salt)))))
   t)
 
+(defun %log-sendtxrcncl-ignored (peer)
+  "Core's line for a sendtxrcncl arriving with -txreconciliation off
+(net_processing.cpp:3964-3967). p2p_sendtxrcncl.py:181 greps the debug log
+for its tail, so the wording is behaviour, not decoration. Both ignore paths
+-- inside the handshake window and after VERACK -- reach Core's single
+`if (!m_txreconciliation)` early return, so both say this."
+  (bl:log-cat "net" "sendtxrcncl from peer=~A ignored, as our node does not ~
+have txreconciliation enabled"
+              (peer-id peer)))
+
 (defun %handle-handshake-sendtxrcncl (peer payload)
   "Process a pre-verack sendtxrcncl (Core net_processing.cpp:3963-4014 +
 txreconciliation.cpp:97-126 RegisterPeer). Disconnects PEER and returns NIL
@@ -862,8 +872,9 @@ ignored)."
            (disconnect-peer peer)
            nil))
     (cond
-      ;; Feature disabled: ignored entirely (net_processing.cpp:3964-3967).
-      ((not bl:*tx-reconciliation*) t)
+      ;; Feature disabled: ignored entirely, with Core's log line
+      ;; (net_processing.cpp:3964-3967).
+      ((not bl:*tx-reconciliation*) (%log-sendtxrcncl-ignored peer) t)
       ;; Our VERSION indicated no tx relay on this connection (block-relay/
       ;; feeler) — Core's RejectIncomingTxs check (:3976-3980).
       ((not (peer-relays-txs-p peer))

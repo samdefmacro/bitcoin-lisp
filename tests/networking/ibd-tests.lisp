@@ -1979,32 +1979,62 @@ wtxidrelay negotiated the state survives."
       (bl.net::%verack-finalize-recon peer)
       (is-true (bl.net::peer-recon-registered peer)))))
 
-(defun %post-verack-delivery (peer command payload)
-  "Deliver COMMAND to PEER through the shipped dispatcher; return (VALUES
-handled-p net-log-text). Core's functional tests grep debug.log for these
-lines -- p2p_addrv2_relay.py:81 for the whole sendaddrv2 line,
-p2p_sendtxrcncl.py:217 for the sendtxrcncl prefix -- so the wording is
-behaviour and gets asserted, not just the disconnect."
+(defun %net-log-of (thunk)
+  "Call THUNK with the \"net\" log category enabled and the log stream
+captured; return (VALUES thunk-result log-text). Core's functional tests grep
+debug.log for these lines -- p2p_addrv2_relay.py:81 for the whole sendaddrv2
+line, p2p_sendtxrcncl.py:217 and :181 for the sendtxrcncl ones -- so the
+wording is behaviour and gets asserted, not just the effect."
   (let ((out (make-string-output-stream))
         (was-on (bl.log:log-category-enabled-p "net")))
     (unwind-protect
          (let ((bl.log:*log-stream* out))
            (bl.log:enable-log-category "net")
-           ;; VALUES is left-to-right, so the message is handled before the
-           ;; stream is drained.
-           (values (bl.net:handle-message
-                    peer command payload (bl.ctx:make-node-context))
-                   (get-output-stream-string out)))
+           ;; VALUES is left-to-right, so THUNK runs before the stream is
+           ;; drained.
+           (values (funcall thunk) (get-output-stream-string out)))
       (unless was-on (bl.log:disable-log-category "net")))))
 
-(test sendtxrcncl-post-verack-disconnects
-  "Post-verack sendtxrcncl via handle-message is a protocol violation:
-disconnect when -txreconciliation is on (net_processing.cpp:3969-3973);
-ignored when it is off (:3964-3967)."
+(defun %post-verack-delivery (peer command payload)
+  "Deliver COMMAND to PEER through the shipped dispatcher; return (VALUES
+handled-p net-log-text)."
+  (%net-log-of
+   (lambda ()
+     (bl.net:handle-message peer command payload (bl.ctx:make-node-context)))))
+
+(test sendtxrcncl-ignored-with-the-feature-off-says-so
+  "With -txreconciliation off Core returns from the SENDTXRCNCL branch at once
+and logs WHY (net_processing.cpp:3964-3967). p2p_sendtxrcncl.py:181 asserts
+that line, so staying silent is a divergence even though the message is
+correctly ignored. Both of our ignore paths reach Core\'s single early return
+-- inside the handshake window, which is where the functional test\'s
+PeerNoVerack sends it, and after VERACK -- so both say it."
   (let ((bl:*tx-reconciliation* nil)
-        (peer (bl.net:make-peer :state :ready)))
-    (is-true (bl.net:handle-message peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) (bl.ctx:make-node-context)))
-    (is (eq :ready (bl.net:peer-state peer))))
+        (phrase "ignored, as our node does not have txreconciliation enabled"))
+    (let ((peer (%recon-test-peer :local-salt nil)))
+      (multiple-value-bind (ok log)
+          (%net-log-of (lambda ()
+                         (bl.net::%handle-handshake-sendtxrcncl
+                          peer (%sendtxrcncl-payload 1 2))))
+        (is-true ok "the message is ignored, not treated as a violation")
+        (is (not (eq :disconnected (bl.net:peer-state peer))))
+        (is-true (search (format nil "sendtxrcncl from peer=~A ~A"
+                                 (bl.net:peer-id peer) phrase)
+                         log)
+                 "handshake-window ignore line, logged: ~S" log)))
+    (let ((peer (bl.net:make-peer :state :ready :id 7)))
+      (multiple-value-bind (handled log)
+          (%post-verack-delivery peer "sendtxrcncl" (%sendtxrcncl-payload 1 2))
+        (is-true handled)
+        (is (eq :ready (bl.net:peer-state peer))
+            "the feature being off is not a reason to drop the peer")
+        (is-true (search (format nil "sendtxrcncl from peer=7 ~A" phrase) log)
+                 "post-verack ignore line, logged: ~S" log)))))
+
+(test sendtxrcncl-post-verack-disconnects
+  "Post-verack sendtxrcncl via handle-message is a protocol violation with
+-txreconciliation on: disconnect (net_processing.cpp:3969-3973). The
+feature-off path is the test above."
   (let ((bl:*tx-reconciliation* t)
         (peer (bl.net:make-peer :state :ready :id 3)))
     (multiple-value-bind (handled log)

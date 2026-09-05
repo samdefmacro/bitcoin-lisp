@@ -243,10 +243,11 @@ p2p_sendtxrcncl.py:217 for its prefix, so the wording is behaviour."
 (define-p2p-handler "sendtxrcncl" (peer payload ctx)
   "BIP 330: as sendaddrv2/wtxidrelay above, except that Core reaches the
 post-verack check only with txreconciliation enabled -- with the flag off
-the message is ignored outright (net_processing.cpp:3964-3967)."
+the message is ignored outright, and says so (net_processing.cpp:3964-3967)."
   (declare (ignore payload ctx))
-  (when bl:*tx-reconciliation*
-    (%disconnect-after-verack peer "sendtxrcncl")))
+  (if bl:*tx-reconciliation*
+      (%disconnect-after-verack peer "sendtxrcncl")
+      (%log-sendtxrcncl-ignored peer)))
 
 ;;; BIP-330 reconciliation. Every one of these is ignored unless the peer
 ;;; completed the sendtxrcncl handshake, which needs -txreconciliation on
