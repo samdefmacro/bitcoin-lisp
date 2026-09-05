@@ -887,10 +887,11 @@ nineteen days."
   "The inbound connection cap the admission gate enforces."
   bl::*max-inbound-connections*)
 
-(defun %admit-inbound (node host)
+(defun %admit-inbound (node host &optional onion)
   "(VALUES ALLOWED REASON) from the accept-time admission gate. The one reach
-into it in this file."
-  (bl::inbound-connection-allowed-p node host))
+into it in this file. ONION is the accepting listener's onion-ness, which Core
+computes before the whitelist lookup both ban arms read (net.cpp:1767-1772)."
+  (bl::inbound-connection-allowed-p node host onion))
 
 (test inbound-admission-counts-the-pending-handoff-queue
   "Accepted peers wait in PENDING-INBOUND-PEERS until the sync thread merges
@@ -970,6 +971,36 @@ bounds file descriptors rather than expressing an opinion about the peer."
            (multiple-value-bind (allowed reason) (%admit-inbound node noban)
              (is-false allowed "noban must not exempt a peer from the fd backlog cap")
              (is (eq :backlog reason))))
+      (bl.net:clear-ban-list)
+      (bl.net:clear-discouraged))))
+
+(test inbound-admission-ignores-a-range-grant-for-an-onion-listener
+  "Core computes inbound_onion from the accepting socket's bind and hands the
+whitelist lookup NO address for it (net.cpp:1767-1772), BEFORE the two ban
+arms read the resulting flags (:1798-1812). The address a Tor inbound presents
+belongs to the local Tor daemon, not to the peer: every onion connection
+arrives on the loopback onion listener, so one range grant covering 127.0.0.1
+would hand every anonymous onion peer an exemption from this node's own ban
+list — and `setban 127.0.0.1' could then never keep one out.
+
+The flag has to travel to the admission gate and not only onto the peer, since
+the gate runs before any peer object exists."
+  (bl.net:clear-ban-list)
+  (bl.net:clear-discouraged)
+  (let ((node (bl:make-node))
+        (tor "127.0.0.1"))
+    (unwind-protect
+         (let ((bl.net:*whitelist-entries*
+                 (list (bl.net:parse-whitelist-entry "noban@127.0.0.1/32"))))
+           (bl.net:ban-address tor 3600)
+           (is-true (bl.net:peer-banned-p tor)
+                    "control: the ban really is in force")
+           (is-true (%admit-inbound node tor)
+                    "control: a CLEARNET inbound in the range keeps its noban exemption")
+           (multiple-value-bind (allowed reason) (%admit-inbound node tor t)
+             (is-false allowed
+                       "an onion inbound must not inherit the loopback range's noban")
+             (is (eq :banned reason))))
       (bl.net:clear-ban-list)
       (bl.net:clear-discouraged))))
 

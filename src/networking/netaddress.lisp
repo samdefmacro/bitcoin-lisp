@@ -766,14 +766,37 @@ transactions are relayed even in -blocksonly.")
 (defvar *whitelist-force-relay* nil
   "-whitelistforcerelay (Core DEFAULT_WHITELISTFORCERELAY = false).")
 
-(defun peer-permission-flags (address inbound)
+(defun peer-permission-flags (address inbound &optional inbound-onion)
   "The permissions a peer at ADDRESS holds (Core CNode::m_permission_flags).
 
 An entry applies when its direction covers this connection's direction, so
 \"noban@1.2.3.4/32,out\" grants nothing to an inbound peer from that range.
 -whitebind's flags apply to inbound peers only, since they describe a listening
-socket."
+socket.
+
+INBOUND-ONION (Core CNode::m_inbound_onion) drops the -whitelist RANGE match
+entirely, which is Core's own carve-out and its comment says why:
+
+    // Tor inbound connections do not reveal the peer's actual network address.
+    // Therefore do not apply address-based whitelist permissions to them.
+    AddWhitelistPermissionFlags(permission_flags,
+                                inbound_onion ? std::optional<CNetAddr>{} : addr,
+                                vWhitelistedRangeIncoming);   (net.cpp:1770-1772)
+
+passing no address at all, so no subnet in the loop can match
+(net.cpp:572-578). The address such a peer presents is not its own: every
+inbound onion connection arrives from the LOCAL Tor daemon, so all of them
+share one address — 127.0.0.1 here, the onion listener's bind. Matching that
+against the ranges made a single loopback grant, which -whitelist=noban@... or
+a bare -whitelist=127.0.0.0/8 is enough to write, hand every anonymous onion
+peer on earth the operator's trusted-peer permissions: exemption from
+misbehaviour discouragement, from the accept-time ban and discourage drops,
+and from inbound eviction. Only ranges are skipped; -whitebind's flags belong
+to the LISTENING SOCKET, not to an address, so they still apply — Core fills
+them in before this call and never revisits them (net.cpp:1755-1758)."
   (let ((flags (if inbound *whitebind-flags* 0)))
+    (when inbound-onion
+      (return-from peer-permission-flags flags))
     (dolist (entry *whitelist-entries* flags)
       (when (and (or (eq (whitelist-entry-direction entry) :both)
                      (eq (whitelist-entry-direction entry)

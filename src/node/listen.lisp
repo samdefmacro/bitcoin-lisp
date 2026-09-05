@@ -20,10 +20,12 @@ network is :torv3, Core CNode::m_inbound_onion)."
                  (when conn
                    ;; Banned/discouraged admission gate BEFORE the handshake
                    ;; (Core drops these in CreateNodeFromAcceptedSocket,
-                   ;; net.cpp:1801-1813).
+                   ;; net.cpp:1801-1813). ONION travels with it because the
+                   ;; permission lookup those drops consult must ignore the
+                   ;; address of a Tor inbound (net.cpp:1770-1772).
                    (multiple-value-bind (allowed reason)
                        (inbound-connection-allowed-p
-                        node (bl.net:connection-host conn))
+                        node (bl.net:connection-host conn) onion)
                      (if (not allowed)
                          (progn
                            (log-info "Inbound connection from ~A dropped (~(~A~))"

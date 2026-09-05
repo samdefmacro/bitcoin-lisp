@@ -828,6 +828,66 @@ describe a listening socket."
     (is (plusp (bl.net:peer-permission-flags "10.1.2.3" t)))
     (is (= 0 (bl.net:peer-permission-flags "10.1.2.3" nil)))))
 
+(test an-inbound-onion-peers-address-earns-it-no-permissions
+  "Core skips the address-range whitelist for a Tor inbound, and its comment
+is the whole argument:
+
+    // Tor inbound connections do not reveal the peer's actual network address.
+    // Therefore do not apply address-based whitelist permissions to them.
+    AddWhitelistPermissionFlags(permission_flags,
+                                inbound_onion ? std::optional<CNetAddr>{} : addr,
+                                vWhitelistedRangeIncoming);   (net.cpp:1770-1772)
+
+Passing no address means no subnet in the loop can match (net.cpp:572-578).
+
+We matched every inbound peer's address against the ranges. Every inbound
+onion connection arrives from the LOCAL Tor daemon and so presents the onion
+listener's own bind — 127.0.0.1 for all of them — which turned one loopback
+grant, a bare -whitelist=127.0.0.0/8 among them, into the operator's
+trusted-peer permissions for every anonymous onion peer on earth: exemption
+from misbehaviour discouragement, from the accept-time ban and discourage
+drops, and from inbound eviction.
+
+-whitebind is deliberately NOT skipped: those flags describe the listening
+SOCKET, not an address, and Core fills them in before this call."
+  (%with-whitelist (:entries '("noban@127.0.0.1/32"))
+    (is (= bl.net:+perm-noban+ (bl.net:peer-permission-flags "127.0.0.1" t))
+        "control: an ordinary inbound peer at that address is granted noban")
+    (is (= 0 (bl.net:peer-permission-flags "127.0.0.1" t t))
+        "an inbound onion peer must earn nothing from the range"))
+  ;; A permissive range is the realistic operator mistake, and it must not
+  ;; reach the onion peers either.
+  (%with-whitelist (:entries '("all@127.0.0.0/8"))
+    (is (plusp (bl.net:peer-permission-flags "127.0.0.1" t))
+        "control: the wide range does grant a clearnet loopback peer")
+    (is (= 0 (bl.net:peer-permission-flags "127.0.0.1" t t))))
+  ;; -whitebind survives: the socket said so, not the address.
+  (%with-whitelist (:entries '("noban@127.0.0.1/32")
+                    :whitebind bl.net:+perm-mempool+)
+    (is (= bl.net:+perm-mempool+
+           (bl.net:peer-permission-flags "127.0.0.1" t t))))
+  ;; And through the accessor the rest of the tree consults.
+  (%with-whitelist (:entries '("noban@127.0.0.1/32"))
+    (let ((onion (%g718-peer :inbound t))
+          (clearnet (%g718-peer :inbound t)))
+      (setf (bl.net:peer-address onion) "127.0.0.1"
+            (bl.net:peer-address clearnet) "127.0.0.1"
+            (bl.net:peer-inbound-onion onion) t)
+      (is-true (bl.net:peer-has-permission-p clearnet bl.net:+perm-noban+)
+               "control: the clearnet peer at the same address holds noban")
+      (is-false (bl.net:peer-has-permission-p onion bl.net:+perm-noban+))
+      ;; What that exemption was buying: a misbehaving onion peer could not be
+      ;; disconnected at all, because RECORD-MISBEHAVIOR returns early on
+      ;; noban. (Discouragement is separately withheld from every loopback
+      ;; address, Core net_processing.cpp:5194-5201, so only the disconnect
+      ;; distinguishes the two peers here.)
+      (is-true (bl.net:record-misbehavior onion "test")
+               "a misbehaving onion peer must still be disconnected")
+      (is (eq :disconnected (bl.net:peer-state onion)))
+      (is-false (bl.net:record-misbehavior clearnet "test")
+                "control: the noban clearnet peer is still spared")
+      (is (eq :ready (bl.net:peer-state clearnet))))))
+
 (test noban-peer-is-neither-discouraged-nor-disconnected
   "Core clears m_should_discourage for a noban peer AND keeps the connection
 (MaybeDiscourageAndDisconnect). Stopping at \"not discouraged\" while still
