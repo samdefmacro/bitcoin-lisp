@@ -8,6 +8,16 @@
 here because two wallet test files draw from it."
   (bl.wallet::make-wrng seed))
 
+;;;; Addressing one wallet through the RPC handlers
+
+(defmacro with-rpc-wallet ((name) &body body)
+  "Run BODY with the /wallet/<name> endpoint selected, so the wallet RPC
+handlers called inside address NAME. NIL selects the single loaded wallet, the
+way an unqualified /wallet/ request does. Named here because five wallet test
+files bind the same special."
+  `(let ((bl.wallet::*rpc-wallet-name* ,name))
+     ,@body))
+
 ;;;; A regtest node with a wallet manager, for the chain-hook tests
 
 (defvar *wallet-chain-counter* 0

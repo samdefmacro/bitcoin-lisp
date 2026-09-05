@@ -319,11 +319,15 @@
   `DirectoryCommit` log and return false; the datadir layout is Core's, so
   a Core node can read what we write.
 
-  Trap: LevelDB `max-open-files` is Core's 1000 on purpose. A larger
+  Traps: LevelDB `max-open-files` is Core's 1000 on purpose. A larger
   value pushes LevelDB out of mmap into real file descriptors and a
   socket then gets fd > 1023 -- which `select()` cannot represent. The
   readiness poll is `poll(2)`-based so the ceiling cannot come back, but
-  the LevelDB knob stays."
+  the LevelDB knob stays. And `leveldb-compact` is not an erasure
+  primitive: `CompactRange` reads the top level that has files BEFORE it
+  flushes the memtable, so on a young database the flush lands above
+  everything the compaction then rewrites. Bytes that must leave the disk
+  need a rebuild into a new directory (`wallet-db-rewrite`)."
   (bitcoin-lisp.kv package)
   (bitcoin-lisp.kv:ensure-libleveldb-loaded function)
   (bitcoin-lisp.kv:leveldb-open function)
@@ -341,6 +345,7 @@
   (bitcoin-lisp.kv:fsync-file function)
   (bitcoin-lisp.kv:fsync-directory function)
   (bitcoin-lisp.kv:fsync-parent-directory function)
+  (bitcoin-lisp.kv:rename-path function)
   (bitcoin-lisp.kv:calculate-cache-sizes function)
   (bitcoin-lisp.kv:datadir-layout-report function)
   (bitcoin-lisp.kv:*blocks-xor* variable)
@@ -919,7 +924,10 @@
   descriptor kept its embedded xprv; the key-provider is the only source
   now. RENAME-FILE merges a target pathname with the source, so a backup
   that renamed wrote nothing. Core SORTS musig participants (BIP328); an
-  x-only print flag is not the 32-vs-33-byte push decision."
+  x-only print flag is not the 32-vs-33-byte push decision. `encryptwallet`
+  ends in a database REWRITE, not a compaction: deleting the plaintext key
+  records only tombstones them, and the compaction that stood there left the
+  master secret in a live `.ldb` on every wallet young enough to matter."
   (bitcoin-lisp.wallet package)
   (bitcoin-lisp.wallet:wallet-manager class)
   (bitcoin-lisp.wallet:init-wallet-manager function)
