@@ -375,9 +375,9 @@ was the getaddr-response cache fill, which is the pull path.
 
 The third address is clean and rides in the same message: it is the positive
 control, so a setup that never reached the loop at all cannot pass this test by
-asserting absences. Relay is observed through the relay target's
-known-addrs, which RELAY-ADDRESS marks for every peer it picks, before it
-writes anything — a test peer owns no socket."
+asserting absences. Relay is observed through the relay target's outgoing addr
+queue, which RELAY-ADDRESS fills for every peer it picks — a test peer owns no
+socket, and the queue is where an address waits for its flush anyway."
   (bl.net:clear-discouraged)
   ;; Three distinct /16s: addrman buckets on the (address group, source group)
   ;; pair, so same-group fixtures share one 64-slot bucket and a slot collision
@@ -405,9 +405,8 @@ writes anything — a test peer owns no socket."
            (is-true (bl.net:address-book-lookup book clean-ip 8333)
                     "control: the clean address must be the one that is there")
            (flet ((relayed-p (ip)
-                    (bl:recent-reject-p
-                     (bl.net:peer-known-addrs target)
-                     (bl.net:make-address-key ip 8333 :ipv4))))
+                    (find ip (bl.net::peer-addrs-to-send target)
+                          :key #'bl.net:peer-address-ip :test #'equalp)))
              (is-true (relayed-p clean-ip)
                       "control: the clean address must still be relayed onward")
              (is-false (relayed-p banned-ip)

@@ -80,6 +80,8 @@ headerssync.cpp. src/networking/.")
    #:*highest-header-seen*
    ;; Trickled tx announcement flushing
    #:flush-tx-announcements
+   ;; Batched addr gossip flushing (Core MaybeSendAddr)
+   #:flush-addr-announcements
    ;; Local-submission broadcast (unbroadcast set)
    #:announce-mempool-tx
    #:reattempt-initial-broadcast

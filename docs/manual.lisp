@@ -540,7 +540,11 @@
   one afterwards, with Core's own log line. A gossiped address this node
   has banned or discouraged is dropped at ingest, before addrman and
   before relay, so the node never re-propagates an address it has itself
-  judged hostile.
+  judged hostile. Relaying an address only QUEUES it on the chosen peers
+  (Core RelayAddress -> PushAddress); one addr/addrv2 per peer carries the
+  whole queue when that peer's own exponential 30s deadline passes, because
+  sending at receive time would tell an observer when and from whom we
+  learned each address.
 
   Traps: `getheaders` must send the locator of the LAST header the peer
   gave us, never our own tip, or an ordinary lagging peer loops forever.
