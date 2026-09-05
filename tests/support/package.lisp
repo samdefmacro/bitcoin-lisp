@@ -57,6 +57,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:with-rpc-wallet
    #:make-wallet-chain-node
    #:with-wallet-chain-node
+   #:regtest-wif
    #:descriptor-spend-e2e))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)

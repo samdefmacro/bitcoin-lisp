@@ -45,10 +45,18 @@ directory calls MAKE-TEMP-DIRECTORY, which is already unique.")
   "Run BODY under regtest bindings with NODE bound to a make-wallet-chain-node and
 bl:*node* bound so the wallet chain hooks fire. With WALLET, a wallet of that
 name is created first and *RPC-WALLET-NAME* is bound to NIL, so the wallet RPCs
-in BODY address it the way an unqualified /wallet/ request does."
+in BODY address it the way an unqualified /wallet/ request does.
+
+*CACHED-IS-IBD* is BOUND here, not merely left alone: it is a process-global
+ONE-WAY latch that connecting a block clears, so any test that mines under this
+fixture leaves the whole image reporting 'not in initial block download' for
+every suite that runs after it. Observed 2026-09-06: a new wallet end-to-end
+test that mined 103 regtest blocks ran before the eclipse/DoS suite and turned
+two of its IBD-only assertions red, in a file nothing had touched."
   `(with-network (:regtest)
     (let* ((,node (make-wallet-chain-node ,suffix :keypool ,keypool))
            (bl:*node* ,node)
+           (bl.net:*cached-is-ibd* bl.net:*cached-is-ibd*)
            ,@(when wallet '((bl.wallet::*rpc-wallet-name* nil))))
       (unwind-protect
            (progn ,@(when wallet `((bl.wallet::rpc-createwallet ,node (list ,wallet))))
@@ -56,6 +64,14 @@ in BODY address it the way an unqualified /wallet/ request does."
         (ignore-errors
          (bl.wallet:close-wallet-manager
           (bl:node-wallet-manager ,node)))))))
+
+(defun regtest-wif (byte)
+  "A deterministic regtest WIF, for the descriptor strings the wallet RPCs
+parse. Regtest and not mainnet: DecodeSecret reads the network's own prefix,
+so a mainnet WIF is simply not a key here."
+  (bl.crypto:private-key-to-wif
+   (make-array 32 :element-type '(unsigned-byte 8) :initial-element byte)
+   :network :regtest))
 
 ;;;; The question every "the wallet gave out an address it cannot spend" finding asks
 

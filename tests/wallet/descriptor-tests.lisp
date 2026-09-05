@@ -971,10 +971,11 @@ wallet backup is identified by."
 
 ;;;; --- tr() script-path spending -------------------------------------------
 
-(defun %tr-sign-and-verify (desc-str held-wifs)
+(defun %tr-sign-and-verify (desc-str held-wifs &key (sequence #xffffffff))
   "Sign a spend of DESC-STR's output at index 0 holding only HELD-WIFS, through
 the real signer (%SIGN-TX-INPUTS), and verify the result with our own script
-interpreter under STANDARD flags.
+interpreter under STANDARD flags. SEQUENCE is the spending input's, which is
+what a leaf carrying older() is satisfied (or not) against.
 
 Returns (values error-messages witness-element-sizes verified-p).
 
@@ -997,7 +998,7 @@ whatever the signer happened to build."
                                    :previous-output
                                    (bl.ser:make-outpoint
                                     :hash prev-txid :index 0)
-                                   :script-sig empty :sequence #xffffffff))
+                                   :script-sig empty :sequence sequence))
                   :outputs (vector (bl.ser:make-tx-out
                                     :value (- amount 1000)
                                     :script-pubkey
@@ -1023,7 +1024,7 @@ whatever the signer happened to build."
               (loop for (script leaf-hash control) in leaves
                     for (nil . leaf) in (bl.rpc:out-desc-tree desc)
                     for own = (funcall next leaf)
-                    collect (list script leaf-hash control leaf
+                    collect (list script leaf-hash control
                                   (mapcar #'cdr own))))
         (let ((errs (bl.rpc:sign-tx-inputs
                      tx prevmap keymap pubmap tr-keymap 1 tr-scripts)))
@@ -1057,10 +1058,16 @@ produce a well-formed witness that simply does not spend."
       (spends "pk leaf" (format nil "tr(~A,pk(~A))" i a) (list a) '(64 34 33))
       ;; sig, revealed 32-byte key, 25-byte pkh leaf, control block.
       (spends "pkh leaf" (format nil "tr(~A,pkh(~A))" i a) (list a) '(64 32 25 33))
-      ;; Two signatures and one empty placeholder, in REVERSE key order.
+      ;; Two signatures and one empty placeholder, in REVERSE key order: the
+      ;; elements go on bottom-first and <a> CHECKSIG pops from the top, so
+      ;; the LAST element is the FIRST key's slot. Which key gets the empty
+      ;; slot is Core's tie-break, not a free choice -- where signing the
+      ;; current key and dissatisfying it cost the same, operator| keeps the
+      ;; stack that dissatisfies it (miniscript.h:1259-1284), so a 2-of-3
+      ;; holding everything signs b and c and leaves a's slot empty.
       (spends "multi_a 2-of-3"
               (format nil "tr(~A,multi_a(2,~A,~A,~A))" i a b c) (list a b c)
-              '(0 64 64 104 33))
+              '(64 64 0 104 33))
       (spends "sortedmulti_a 1-of-2"
               (format nil "tr(~A,sortedmulti_a(1,~A,~A))" i a b) (list b))
       ;; A depth-2 leaf: the control block carries two merkle path elements,
@@ -1069,6 +1076,87 @@ produce a well-formed witness that simply does not spend."
       (spends "nested tree, depth-2 leaf"
               (format nil "tr(~A,{multi_a(2,~A,~A),{pk(~A),pk(~A)}})" i a b c a)
               (list c) '(64 34 97)))))
+
+(test tr-miniscript-leaves-spend-the-way-core-signs-them
+  "A tr() leaf written as a miniscript parsed, passed the sanity gate and got
+an address, and then could never be spent: TR-LEAF-SATISFACTION was a CASE over
+four leaf KINDS and a :MINISCRIPT leaf fell through it as unsatisfiable. Core
+has no such table -- SignTaprootScript infers a miniscript back out of the leaf
+SCRIPT and satisfies that (sign.cpp:528-540) -- so every shape below now signs
+through the same code the pk and multi_a leaves above do.
+
+The interpreter is the oracle for each one; a witness that assembles is not a
+witness that spends."
+  (let ((i "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
+        (a "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1")
+        (b "KzoAz5CanayRKex3fSLQ2BwJpN7U52gZvxMyk78nDMHuqrUxuSJy")
+        (c "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S"))
+    (flet ((spends (label desc held sizes &key (sequence #xffffffff))
+             (multiple-value-bind (errs witness verified)
+                 (%tr-sign-and-verify desc held :sequence sequence)
+               (is (null errs) "~A: signing reported ~S" label errs)
+               (is-true verified "~A: the signed spend does not verify" label)
+               (is (equal sizes (first witness))
+                   "~A: witness element sizes ~S, wanted ~S"
+                   label (first witness) sizes)))
+           (cannot (label desc held &key (sequence #xffffffff))
+             (multiple-value-bind (errs witness verified)
+                 (%tr-sign-and-verify desc held :sequence sequence)
+               (is (equal '("no satisfiable script path for P2TR") errs)
+                   "~A: reported ~S" label errs)
+               (is (null (first witness)) "~A: emitted a witness anyway" label)
+               (is-false verified label))))
+      ;; The finding's own shape: a miniscript leaf beside a pk() leaf, spent
+      ;; through the miniscript one. and_v puts the SECOND branch's elements
+      ;; first, so c's signature is at the bottom and b's on top.
+      (spends "and_v leaf in a two-leaf tree"
+              (format nil "tr(~A,{pk(~A),and_v(v:pk(~A),pk(~A))})" i a b c)
+              (list b c) '(64 64 68 65))
+      ;; pkh() inside a tapscript leaf: the revealed key is 32 bytes, not 33,
+      ;; and it is found by HASH160 OF THE X-ONLY key -- Core's
+      ;; TapSatisfier::FromPKHBytes (sign.cpp:514-518), which is a different
+      ;; index from the P2WSH one.
+      (spends "pkh inside a miniscript leaf"
+              (format nil "tr(~A,and_v(v:pkh(~A),pk(~A)))" i b c)
+              (list b c) '(64 64 32 59 33))
+      ;; A timelock leaf is satisfied against the SPENDING INPUT, which is why
+      ;; the satisfier needs Core's TapSatisfier CheckOlder rather than
+      ;; treating older() as free.
+      (spends "matured older() leaf"
+              (format nil "tr(~A,and_v(v:pk(~A),older(1)))" i b)
+              (list b) '(64 36 33) :sequence 1)
+      (cannot "older() not yet matured"
+              (format nil "tr(~A,and_v(v:pk(~A),older(5)))" i b) (list b)
+              :sequence 1)
+      ;; A branching leaf takes the branch it holds a key for.
+      (spends "or_d leaf, immediate branch"
+              (format nil "tr(~A,or_d(pk(~A),and_v(v:pk(~A),older(1))))" i b c)
+              (list b) '(64 73 33))
+      ;; And holding the wrong key still reports itself rather than emitting
+      ;; something that does not spend.
+      (cannot "miniscript leaf, wrong key"
+              (format nil "tr(~A,and_v(v:pk(~A),pk(~A)))" i b c) (list a)))))
+
+(test tr-miniscript-leaf-is-spendable-through-the-wallet-rpcs
+  "The finding end to end, in the terms an operator sees. Before this the
+wallet imported the descriptor, deriveaddresses handed out a bech32m address,
+the funding wallet's own sendtoaddress paid it, getbalance counted it -- and
+signrawtransactionwithwallet answered complete:false with \"no satisfiable
+script path for P2TR\", leaving the coins recoverable only by moving the
+descriptor and keys to another implementation."
+  (let ((result (descriptor-spend-e2e
+                 (format nil "tr(50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d5~
+47bfee9ace803ac0,and_v(v:pk(~A),pk(~A)))"
+                         (regtest-wif 21) (regtest-wif 22))
+                 :suffix "tr-ms")))
+    (is-true (getf result :imported) "importdescriptors refused: ~S" result)
+    (is-true (getf result :address))
+    (is (= 1.0d0 (getf result :balance))
+        "the wallet must count the coin before the spend is even attempted")
+    (is-true (getf result :complete)
+             "signrawtransactionwithwallet reported ~S" (getf result :errors))
+    (is-true (getf result :accepted)
+             "the node refused the spend the wallet signed")))
 
 (test tr-script-path-fails-loudly-without-the-keys
   "A leaf we cannot satisfy must report itself, never emit a witness. multi_a
