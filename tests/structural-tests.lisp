@@ -77,7 +77,6 @@
     "bitcoin-lisp.mempool:txgraph-compare-main-order"
     "bitcoin-lisp.mempool:txgraph-get-ancestors-union"
     "bitcoin-lisp.mempool:txgraph-get-descendants-union"
-    "bitcoin-lisp.mempool:txgraph-get-individual-feerate"
     "bitcoin-lisp.networking:ban-peer"
     "bitcoin-lisp.networking:clear-discouraged"
     "bitcoin-lisp.networking:clear-pending-compact-block"

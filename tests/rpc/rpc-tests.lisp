@@ -376,6 +376,83 @@ reports fee_delta/in_mempool/modified_fee; getmempoolentry exposes fees.modified
     (is (hash-table-p (bl.rpc::rpc-getprioritisedtransactions node nil)))
     (is (zerop (hash-table-count (bl.mp:mempool-deltas mempool))))))
 
+(test rpc-prioritisetransaction-cannot-split-the-mempool-from-the-txgraph
+  "An out-of-int64 fee_delta is refused before any state moves, and in-range
+deltas whose sum leaves int64 saturate instead of type-erroring halfway
+through, so the entry's modified fee and the txgraph's fee for it can never
+end up disagreeing.
+
+Core reads the parameter as UniValue::getInt<int64_t> before touching the
+mempool and answers -1 \"JSON integer out of range\" (rpc/mining.cpp:526,
+univalue.h:139-149, rpc/server.cpp:512-516, asserted by rpc_net.py:362), and
+PrioritiseTransaction saturates both mapDeltas and the entry's modified fee
+through SaturatingAdd (txmempool.cpp:630-655, kernel/mempool_entry.h:125-128,
+util/overflow.h:42-58)."
+  (let* ((node (make-test-node))
+         (mempool (bl:node-mempool node))
+         (tx (make-mempool-test-tx :input-id 77))
+         (txid (bl.ser:transaction-hash tx))
+         (hex (bl.rpc:hash-to-hex txid))
+         (int64-max (1- (ash 1 63)))
+         (int64-min (- (ash 1 63))))
+    (is (eq :ok (bl.mp:mempool-add
+                 mempool txid
+                 (bl.mp:make-entry-from-tx tx 10000 0 :entry-time 1000000))))
+    (labels ((entry-fee ()
+               (bl.mp:mempool-entry-modified-fee (bl.mp:mempool-get mempool txid)))
+             (graph-fee ()
+               (bl.mp:feefrac-fee
+                (bl.mp:txgraph-get-individual-feerate
+                 (bl.mp:mempool-graph mempool)
+                 (bl.mp:mempool-entry-graph-handle
+                  (bl.mp:mempool-get mempool txid)))))
+             (delta ()
+               (gethash txid (bl.mp:mempool-deltas mempool)))
+             (prioritise (amount)
+               (bl.rpc:dispatch-rpc-method node "prioritisetransaction"
+                                           (list hex 0 amount))))
+      (is (= 10000 (entry-fee)))
+      (is (= 10000 (graph-fee)))
+      ;; Positive control: an ordinary delta moves all three together.
+      (is (eq t (prioritise 1000)))
+      (is (= 11000 (entry-fee)))
+      (is (= 11000 (graph-fee)))
+      (is (= 1000 (delta)))
+      ;; An out-of-int64 literal is refused, with Core's code and text, and
+      ;; nothing moved.
+      (let ((raised (handler-case (progn (prioritise (ash 1 70)) nil)
+                      (bl.rpc:rpc-error (e) e))))
+        (is-true raised)
+        (is (= -1 (bl.rpc:rpc-error-code raised)))
+        (is (string= "JSON integer out of range"
+                     (bl.rpc:rpc-error-message raised))))
+      (is (= 11000 (entry-fee)))
+      (is (= 11000 (graph-fee)))
+      (is (= 1000 (delta)))
+      (is (= 1 (hash-table-count (bl.mp:mempool-deltas mempool))))
+      ;; The entry is not poisoned: an ordinary call still works afterwards.
+      (is (eq t (prioritise 100)))
+      (is (= 11100 (entry-fee)))
+      (is (= 11100 (graph-fee)))
+      (is (= 1100 (delta)))
+      ;; An in-range delta whose SUM leaves int64 saturates on both sides.
+      (is (eq t (prioritise int64-max)))
+      (is (= int64-max (entry-fee)))
+      (is (= int64-max (graph-fee)))
+      (is (= int64-max (delta)))
+      ;; A net-zero accumulated delta is dropped, and the two fee views stay
+      ;; equal across that too.
+      (is (eq t (prioritise (- int64-max))))
+      (is-false (delta))
+      (is (zerop (entry-fee)))
+      (is (zerop (graph-fee)))
+      ;; Two more of the same saturate at the negative bound.
+      (is (eq t (prioritise (- int64-max))))
+      (is (eq t (prioritise (- int64-max))))
+      (is (= int64-min (entry-fee)))
+      (is (= int64-min (graph-fee)))
+      (is (= int64-min (delta))))))
+
 (test rest-interface-routing-and-content-types
   "REST router: content-type negotiation, JSON reuse of RPC bodies, and
 error mapping (400 bad request / 404 not found / unknown endpoint)."

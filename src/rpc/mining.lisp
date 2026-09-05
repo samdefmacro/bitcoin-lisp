@@ -1018,6 +1018,14 @@ mempool acceptance and RBF scoring; the fee is not actually paid. Returns T."
     (unless (integerp fee-delta)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid fee_delta"))
+    ;; Core reads the delta as UniValue::getInt<int64_t> (rpc/mining.cpp:526)
+    ;; BEFORE touching any state; a literal outside int64 makes that throw
+    ;; "JSON integer out of range" (univalue.h:139-149), which the server
+    ;; reports as -1 (rpc/server.cpp:512-516, asserted by rpc_net.py:362).
+    ;; So an out-of-range delta never reaches the mempool at all.
+    (unless (typep fee-delta '(signed-byte 64))
+      (error 'rpc-error :code +rpc-misc-error+
+                        :message "JSON integer out of range"))
     ;; Node lock: mempool-prioritise mutates the deltas table and the
     ;; entry's modified fee/txgraph position (Core PrioritiseTransaction
     ;; takes pool.cs).
