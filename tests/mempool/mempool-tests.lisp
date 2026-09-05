@@ -1392,39 +1392,51 @@ were remembered as well as what the client was told."
       ;; CheckTxInputs running first did not disable it.
       (is (eq :nonstandard-inputs (err-of 2))))))
 
+(defun %add-sigop-dense-p2wsh-coin (utxo txid)
+  "Add a 1-BTC P2WSH coin to UTXO at (TXID, 0) whose witness script is 3,600
+bare OP_CHECKMULTISIG: 72,000 witness sigops against the 16,000 of
+MAX_STANDARD_TX_SIGOPS_COST, so every spend of it is over the cap. Returns
+the witness script."
+  (let* ((witness-script (make-array 3600 :element-type '(unsigned-byte 8)
+                                          :initial-element #xae))
+         (p2wsh (%w8d-script #x00 #x20 (bl.crypto:sha256 witness-script))))
+    (bl.store:add-utxo utxo txid 0 100000000 p2wsh 0)
+    witness-script))
+
+(defun %sigop-dense-spend (txid witness-script stack-items outputs)
+  "A spend of that coin: one input, OUTPUTS, and a witness of STACK-ITEMS
+one-byte items below WITNESS-SCRIPT, which Core does not count against
+MAX_STANDARD_P2WSH_STACK_ITEMS."
+  (bl.ser:make-transaction
+   :version 2
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint :hash txid :index 0)
+                    :script-sig (%spk)
+                    :sequence #xFFFFFFFF))
+   :outputs outputs
+   :witness (vector (append (make-list stack-items :initial-element (%spk #x01))
+                            (list witness-script)))
+   :lock-time 0))
+
 (test mempool-witness-standardness-is-checked-before-the-sigop-cap
   "Core computes the sigop cost only AFTER IsWitnessStandard
 (validation.cpp:901-905), so a witness-nonstandard spend that is also
 sigop-dense is \"bad-witness-nonstandard\", not \"bad-txns-too-many-sigops\".
-The fixture is one P2WSH input whose witness script is 3,600 bare
-OP_CHECKMULTISIG (72,000 witness sigops against a 16,000 cap) and whose stack
-carries 101 items, one past MAX_STANDARD_P2WSH_STACK_ITEMS."
+The fixture is one sigop-dense P2WSH input whose stack carries 101 items, one
+past MAX_STANDARD_P2WSH_STACK_ITEMS."
   (let* ((utxo (bl.store:make-utxo-set))
          (mempool (bl.mp:make-mempool))
          (chain-state (bl.store:make-chain-state :best-height 100))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 21))
-         (witness-script (make-array 3600 :element-type '(unsigned-byte 8)
-                                          :initial-element #xae))
-         (p2wsh (%w8d-script #x00 #x20 (bl.crypto:sha256 witness-script))))
-    (bl.store:add-utxo utxo txid 0 100000000 p2wsh 0)
+         (witness-script (%add-sigop-dense-p2wsh-coin utxo txid)))
     (flet ((err-of (stack-items)
              (nth-value 1
                         (bl.val:validate-transaction-for-mempool
-                         (bl.ser:make-transaction
-                          :version 2
-                          :inputs (vector (bl.ser:make-tx-in
-                                           :previous-output (bl.ser:make-outpoint
-                                                             :hash txid :index 0)
-                                           :script-sig (%spk)
-                                           :sequence #xFFFFFFFF))
-                          :outputs (vector (bl.ser:make-tx-out
-                                            :value 90000000
-                                            :script-pubkey (%p2pkh-spk)))
-                          :witness (vector (append
-                                            (make-list stack-items
-                                                       :initial-element (%spk #x01))
-                                            (list witness-script)))
-                          :lock-time 0)
+                         (%sigop-dense-spend
+                          txid witness-script stack-items
+                          (vector (bl.ser:make-tx-out
+                                   :value 90000000
+                                   :script-pubkey (%p2pkh-spk))))
                          utxo mempool 100 :chain-state chain-state))))
       ;; 101 stack items: nonstandard witness, and sigop-dense.
       (is (eq :bad-witness-nonstandard (err-of 101)))
@@ -1432,6 +1444,45 @@ carries 101 items, one past MAX_STANDARD_P2WSH_STACK_ITEMS."
       ;; sigops now reach the cap -- proving both checks are live and that the
       ;; assertion above is about which one runs first.
       (is (eq :too-many-sigops (err-of 100))))))
+
+(test mempool-ephemeral-dust-is-checked-before-the-sigop-cap
+  "Core's PreChecks calls PreCheckEphemeralTx at validation.cpp:933 and tests
+nSigOpsCost against MAX_STANDARD_TX_SIGOPS_COST only afterwards, at :937-939.
+So a fee-paying transaction that carries dust AND is sigop-dense is refused
+\"dust\", not \"bad-txns-too-many-sigops\". Both verdicts are TX_NOT_STANDARD,
+so the order decides nothing but the reason the submitter is told -- which is
+what mempool_accept.py and every client matching on the string read.
+
+The fixture is the witness-standardness test's, with a second output of one
+satoshi to a P2PKH script -- below the 546-sat dust threshold -- and a fee
+that varies with the first."
+  (let* ((utxo (bl.store:make-utxo-set))
+         (mempool (bl.mp:make-mempool))
+         (chain-state (bl.store:make-chain-state :best-height 100))
+         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 22))
+         (witness-script (%add-sigop-dense-p2wsh-coin utxo txid)))
+    (flet ((err-of (change)
+             ;; CHANGE plus the 1-sat dust output is what the 100,000,000-sat
+             ;; input pays out, so it is what sets the fee.
+             (nth-value 1
+                        (bl.val:validate-transaction-for-mempool
+                         (%sigop-dense-spend
+                          txid witness-script 100
+                          (vector (bl.ser:make-tx-out
+                                   :value change
+                                   :script-pubkey (%p2pkh-spk))
+                                  (bl.ser:make-tx-out
+                                   :value 1
+                                   :script-pubkey (%p2pkh-spk))))
+                         utxo mempool 100 :chain-state chain-state))))
+      ;; A 10,000,000-sat fee: the dust may not be paid for, and Core says so
+      ;; before it looks at the sigop cost.
+      (is (eq :dust (err-of 90000000)))
+      ;; Control: the same transaction paying NO fee is legal ephemeral dust,
+      ;; so it passes PreCheckEphemeralTx and the same 72,000 sigops then reach
+      ;; the cap -- both checks are live, and the assertion above is only about
+      ;; which one runs first.
+      (is (eq :too-many-sigops (err-of 99999999))))))
 
 ;;;; Wave 8A: witness-stripped classification + coinbase maturity at tip+1
 
