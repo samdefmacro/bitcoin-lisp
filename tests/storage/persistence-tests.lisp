@@ -1882,7 +1882,11 @@ takes a SIGTERM registers the request and then sits there forever."
       (bl::%write-shutdown-token)
       (is-true (bt:wait-on-semaphore woke :timeout 10)
                "a written token did not wake the reader")
-      (ignore-errors (bt:join-thread reader :timeout 5)))))
+      ;; bt:join-thread takes the thread and nothing else, so the :timeout this
+      ;; used to pass made every join a SIMPLE-PROGRAM-ERROR that the
+      ;; ignore-errors then hid -- the reader was never joined, and SBCL said
+      ;; so only as a STYLE-WARNING in the build transcript.
+      (bl.net:join-thread-or-destroy reader :timeout 5))))
 
 (test the-log-lock-is-plain-now-that-nothing-re-enters-it
   "The payoff, and a guard against silently going back. *LOG-LOCK* was made
