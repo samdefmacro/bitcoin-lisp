@@ -268,3 +268,199 @@ mandatory rule."
                      (%dep "testdummy" :regtest))))
   (is (= (ash 1 2) (bl.val:vb-deployment-mask
                     (%dep "taproot" :mainnet)))))
+
+;;;; --- -vbparams (Core ReadRegTestArgs, chainparams.cpp:68-106) -----------
+
+(defun %testdummy-window (&optional (network :regtest))
+  "NETWORK's testdummy (start timeout min-activation-height) as the deployment
+table currently has it. Reading it must not go through
+APPLY-VERSIONBITS-PARAMETERS: calling that with no specs is how the overrides
+are CLEARED."
+  (let ((d (%dep "testdummy" network)))
+    (list (bl.val:vb-deployment-start-time d)
+          (bl.val:vb-deployment-timeout d)
+          (bl.val:vb-deployment-min-activation-height d))))
+
+(defun %vbparams-testdummy (specs)
+  "Apply SPECS and read regtest testdummy's window back."
+  (bl.val:apply-versionbits-parameters specs)
+  (%testdummy-window))
+
+(defun %vbparams-refusal (specs)
+  "The message APPLY-VERSIONBITS-PARAMETERS refuses SPECS with, or NIL."
+  (handler-case (progn (bl.val:apply-versionbits-parameters specs) nil)
+    (error (e) (princ-to-string e))))
+
+(test vbparams-refuses-exactly-what-core-refuses
+  "Core's ReadRegTestArgs splits on ':', demands three or four fields, parses
+each number with ToIntegral (the WHOLE string, `-' allowed, `+' and junk not)
+and looks the name up in VersionBitsDeploymentInfo, raising one of four
+messages (chainparams.cpp:69-105). Every message below is Core's, verbatim: a
+functional test that greets a malformed -vbparams by matching Core's stderr
+cannot match a paraphrase.
+
+Skipping a bad entry instead of raising is the failure mode this shape exists
+to prevent -- the run then proceeds against the default window it was trying
+to move and passes for the wrong reason."
+  (unwind-protect
+       (progn
+         (is (equal '(1199145601 1230767999 0)
+                    (%vbparams-testdummy '("testdummy:1199145601:1230767999"))))
+         (is (equal '(1199145601 1230767999 403200)
+                    (%vbparams-testdummy '("testdummy:1199145601:1230767999:403200"))))
+         ;; Negative values reach the fields Core declares signed.
+         (is (equal '(-1 -2 0) (%vbparams-testdummy '("testdummy:-1:-2"))))
+         (dolist (spec '("testdummy:1" "testdummy" "testdummy:1:2:3:4" "" nil))
+           (is (equal "Version bits parameters malformed, expecting deployment:start:end[:min_activation_height]"
+                      (%vbparams-refusal (list spec)))
+               "wrong refusal for ~S" spec))
+         (is (equal "Invalid nStartTime (x)" (%vbparams-refusal '("testdummy:x:2"))))
+         (is (equal "Invalid nStartTime (+1)" (%vbparams-refusal '("testdummy:+1:2"))))
+         (is (equal "Invalid nStartTime ()" (%vbparams-refusal '("testdummy::2"))))
+         (is (equal "Invalid nTimeout (2x)" (%vbparams-refusal '("testdummy:1:2x"))))
+         (is (equal "Invalid min_activation_height (z)"
+                    (%vbparams-refusal '("testdummy:1:2:z"))))
+         (is (equal "Invalid deployment (frobnicate)"
+                    (%vbparams-refusal '("frobnicate:1:2"))))
+         ;; Core matches the name case-sensitively.
+         (is (equal "Invalid deployment (TestDummy)"
+                    (%vbparams-refusal '("TestDummy:1:2"))))
+         ;; Last occurrence of a deployment wins; the other one is untouched.
+         (bl.val:apply-versionbits-parameters
+          '("testdummy:1:2" "taproot:3:4" "testdummy:5:6"))
+         (is (equal '(5 6 0) (%testdummy-window))))
+    (bl.val:apply-versionbits-parameters nil)))
+
+(test vbparams-reaches-regtest-only-and-does-not-outlive-its-run
+  "Core parses -vbparams in ReadRegTestArgs and writes it into RegTestOptions,
+which only CChainParams::RegTest reads (chainparams.cpp:129-133,
+kernel/chainparams.cpp:628-632), so no other chain can see it. Clearing on the
+next call matters as much: an override that outlived its run would silently
+move the window for every later chain in the same image."
+  (unwind-protect
+       (progn
+         (bl.val:apply-versionbits-parameters '("testdummy:77:88:99"))
+         (is (equal '(77 88 99) (%testdummy-window)))
+         (dolist (network '(:mainnet :testnet3 :testnet4 :signet))
+           (let ((d (%dep "testdummy" network)))
+             (is (= bl.val:+vb-never-active+ (bl.val:vb-deployment-start-time d))
+                 "-vbparams reached ~A" network)))
+         ;; Bit, threshold and period are not the option's to move.
+         (let ((d (%dep "testdummy" :regtest)))
+           (is (= 28 (bl.val:vb-deployment-bit d)))
+           (is (= 108 (bl.val:vb-deployment-threshold d)))
+           (is (= 144 (bl.val:vb-deployment-period d)))))
+    (bl.val:apply-versionbits-parameters nil))
+  (is (equal (list 0 (1- (expt 2 63)) 0) (%testdummy-window))))
+
+(defun %versionbits-chain-with-tip (n &rest args)
+  "MAKE-VERSIONBITS-CHAIN, plus the chain-state tip pointers that
+GET-BLOCK-AT-HEIGHT walks back from -- without them every height lookup on the
+synthetic chain answers NIL, and VERSIONBITS-STATE reads NIL as `the block
+before genesis' and reports DEFINED for the whole ladder."
+  (multiple-value-bind (chain-state last) (apply #'make-versionbits-chain n args)
+    (setf (bl.store:chain-state-best-block-hash chain-state)
+          (bl.store:block-index-entry-hash last)
+          (bl.store:chain-state-best-height chain-state)
+          (bl.store:block-index-entry-height last))
+    (values chain-state last)))
+
+(defun %vbparams-ladder (chain-state entries specs)
+  "The BIP9 state of regtest testdummy after each of ENTRIES, under SPECS."
+  (bl.val:apply-versionbits-parameters specs)
+  (let ((d (%dep "testdummy" :regtest)))
+    (append (mapcar (lambda (e) (bl.val:versionbits-state chain-state e d)) entries)
+            (list (bl.val:versionbits-since-height
+                   chain-state (car (last entries)) d)))))
+
+(test vbparams-drives-testdummy-through-the-bip9-ladder
+  "The point of the option: a regtest chain walks DEFINED -> STARTED ->
+LOCKED_IN -> ACTIVE on the window -vbparams gave it, one transition per
+144-block period (versionbits.cpp:69-110).
+
+Both custom runs are read against the DEFAULT run on the SAME chain, which is
+the control that the chain -- not the option -- is not what moved the states: a
+start time one period into the chain delays every transition by one period, and
+a min_activation_height beyond the tip holds LOCKED_IN where the default is
+already ACTIVE. Block i is timestamped 1000000 + 600i, so the median time past
+at the boundaries 143/287/431 is 1082800/1169200/1255600."
+  (with-network (:regtest)
+    (multiple-value-bind (cs last) (%versionbits-chain-with-tip 576 :signal-bit 28)
+      (let ((boundaries (list (bl.store:get-block-at-height cs 143)
+                              (bl.store:get-block-at-height cs 287)
+                              (bl.store:get-block-at-height cs 431)
+                              last)))
+        (unwind-protect
+             (progn
+               (is (equal '(:started :locked-in :active :active 432)
+                          (%vbparams-ladder cs boundaries nil)))
+               (is (equal '(:defined :started :locked-in :active 576)
+                          (%vbparams-ladder
+                           cs boundaries '("testdummy:1100000:9223372036854775807"))))
+               (is (equal '(:started :locked-in :locked-in :locked-in 288)
+                          (%vbparams-ladder
+                           cs boundaries '("testdummy:0:9223372036854775807:600"))))
+               ;; A timeout the chain passes without signalling is FAILED, which
+               ;; the regtest default (NO_TIMEOUT) can never reach.
+               (multiple-value-bind (quiet-cs quiet-last)
+                   (%versionbits-chain-with-tip 432)
+                 (let ((quiet (list (bl.store:get-block-at-height quiet-cs 143)
+                                    quiet-last)))
+                   (is (equal '(:started :started 144)
+                              (%vbparams-ladder quiet-cs quiet nil)))
+                   (is (equal '(:started :failed 288)
+                              (%vbparams-ladder quiet-cs quiet
+                                                '("testdummy:0:1100000")))))))
+          (bl.val:apply-versionbits-parameters nil))))))
+
+(test vbparams-shows-up-in-getdeploymentinfo-and-the-block-version
+  "getdeploymentinfo echoes start_time, timeout and min_activation_height from
+the deployment table (rpc/blockchain.cpp:1345-1360) and reports the status the
+window produces, and getblocktemplate reads the same table through
+VERSIONBITS-GBT-STATUS and COMPUTE-BLOCK-VERSION (rpc/mining.cpp:598-640): an
+override nothing reads is not an override."
+  (with-network (:regtest)
+    (multiple-value-bind (cs last) (%versionbits-chain-with-tip 576 :signal-bit 28)
+      (let ((node (make-test-node :network :regtest)))
+        (setf (bl:node-chain-state node) cs)
+        (unwind-protect
+             (flet ((bip9 (specs)
+                      (bl.val:apply-versionbits-parameters specs)
+                      (let* ((reply (bl.rpc:dispatch-rpc-method
+                                     node "getdeploymentinfo" nil))
+                             (deployments (cdr (assoc "deployments" reply
+                                                      :test #'string=)))
+                             (testdummy (cdr (assoc "testdummy" deployments
+                                                    :test #'string=))))
+                        (list (cdr (assoc "active" testdummy :test #'string=))
+                              (cdr (assoc "height" testdummy :test #'string=))
+                              (let ((b (cdr (assoc "bip9" testdummy :test #'string=))))
+                                (list (cdr (assoc "status" b :test #'string=))
+                                      (cdr (assoc "start_time" b :test #'string=))
+                                      (cdr (assoc "timeout" b :test #'string=))
+                                      (cdr (assoc "min_activation_height" b
+                                                  :test #'string=)))))))
+                    (gbt-names ()
+                      (mapcar (lambda (group)
+                                (mapcar #'bl.val:vb-deployment-name group))
+                              (multiple-value-list
+                               (bl.val:versionbits-gbt-status cs last :regtest)))))
+               (is (equal (list t 432 (list "active" 0 (1- (expt 2 63)) 0))
+                          (bip9 nil)))
+               ;; JSON-BOOL renders false as YASON:FALSE, and Core omits the
+               ;; `height' key entirely while the deployment is not active.
+               (is (equal (list 'yason:false nil
+                                (list "locked_in" 0 (1- (expt 2 63)) 600))
+                          (bip9 '("testdummy:0:9223372036854775807:600")))
+                   "getdeploymentinfo did not report the -vbparams window")
+               ;; LOCKED_IN, so the template still signals bit 28 and lists
+               ;; testdummy as locked_in rather than active.
+               (is (= (logior #x20000000 (ash 1 28))
+                      (bl.val:compute-block-version cs last :regtest)))
+               (is (equal '(nil ("testdummy") ("taproot")) (gbt-names)))
+               ;; Under the defaults the same chain has testdummy ACTIVE, so
+               ;; the template stops signalling it.
+               (bl.val:apply-versionbits-parameters nil)
+               (is (= #x20000000 (bl.val:compute-block-version cs last :regtest)))
+               (is (equal '(nil nil ("taproot" "testdummy")) (gbt-names))))
+          (bl.val:apply-versionbits-parameters nil))))))

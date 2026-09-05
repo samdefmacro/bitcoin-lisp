@@ -733,7 +733,10 @@
   background chainstate reaches the reorg path whenever it fast-forwards
   more than one block, and its blocks are ancient. The versionbits state
   machine REPORTS and tells the miner what to signal; it decides no
-  activation."
+  activation. Its regtest deployment windows are the one thing an option
+  can move: -vbparams=deployment:start:end[:min_activation_height] rewrites
+  them through APPLY-VERSIONBITS-PARAMETERS, on regtest only, exactly as
+  Core's ReadRegTestArgs feeds RegTestOptions."
   (bitcoin-lisp.validation package)
   (bitcoin-lisp.validation:validate-transaction-structure function)
   (bitcoin-lisp.validation:validate-transaction-contextual function)
@@ -750,6 +753,7 @@
   (bitcoin-lisp.validation:activate-best-chain function)
   (bitcoin-lisp.validation:perform-reorg function)
   (bitcoin-lisp.validation:versionbits-state function)
+  (bitcoin-lisp.validation:apply-versionbits-parameters function)
   (bitcoin-lisp.validation:compute-block-version function)
   (bitcoin-lisp.validation:versionbits-gbt-status function)
   (bitcoin-lisp.validation:check-signet-block-solution function))
