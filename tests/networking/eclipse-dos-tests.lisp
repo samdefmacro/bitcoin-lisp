@@ -888,6 +888,26 @@ SOCKET, not an address, and Core fills them in before this call."
                 "control: the noban clearnet peer is still spared")
       (is (eq :ready (bl.net:peer-state clearnet))))))
 
+(test getpeerinfo-reports-the-permissions-the-node-enforces
+  "Core's getpeerinfo prints the STORED m_permission_flags, so it can never
+disagree with what the node enforces. Ours recomputes them per row, which
+makes the agreement a thing to keep: the row must ask the same question the
+enforcement sites ask, onion-ness included, or an inbound onion peer is
+reported holding a loopback range's grant that nothing will honour — the
+operator reads `noban' on a peer this node would still ban."
+  (%with-whitelist (:entries '("noban@127.0.0.1/32"))
+    (let* ((node (bl:make-node))
+           (onion (bl.net:make-peer :address "127.0.0.1" :inbound t :state :ready))
+           (clearnet (bl.net:make-peer :address "127.0.0.1" :inbound t :state :ready)))
+      (setf (bl.net:peer-inbound-onion onion) t
+            (bl:node-peers node) (list onion clearnet))
+      (let ((rows (mapcar (lambda (row)
+                            (cdr (assoc "permissions" row :test #'string=)))
+                          (bl.rpc:dispatch-rpc-method node "getpeerinfo" '()))))
+        (is (equalp '(#() #("noban" "download")) rows)
+            "the onion row must be empty and the clearnet row at the same \
+address must still say noban")))))
+
 (test noban-peer-is-neither-discouraged-nor-disconnected
   "Core clears m_should_discourage for a noban peer AND keeps the connection
 (MaybeDiscourageAndDisconnect). Stopping at \"not discouraged\" while still
