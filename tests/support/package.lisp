@@ -56,7 +56,8 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:make-wallet-rng
    #:with-rpc-wallet
    #:make-wallet-chain-node
-   #:with-wallet-chain-node))
+   #:with-wallet-chain-node
+   #:descriptor-spend-e2e))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (bitcoin-lisp.nicknames:install-package-nicknames))

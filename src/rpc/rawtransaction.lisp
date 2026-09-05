@@ -404,6 +404,15 @@ the caller -- the sighash commits to all of them."
                             best-sigs (reverse signed-by)))))))))))
     (values best best-sigs best-leaf)))
 
+(defun %wsh-pkh-resolver (keymap)
+  "Core's WshSatisfier::FromPKHBytes (sign.cpp:428-436) as MS-FROM-SCRIPT wants
+it: a pkh() branch commits to HASH160 of a key rather than to the key, so the
+key comes back out of the signing provider -- here KEYMAP, which the P2PKH and
+P2WPKH arms already index by exactly that hash. Without it the inferred node
+carries no key at all, the satisfier's sign-fn is called with NIL, and a policy
+this node holds every private key for is reported unsignable."
+  (lambda (hash) (cdr (gethash hash keymap))))
+
 (defun compute-input-signatures (tx i prev keymap pubmap tr-keymap sighash-byte
                                   precomp spent-utxos &optional (tap-sighash-type #x00)
                                                                 tr-scripts)
@@ -466,7 +475,9 @@ must be bound by the caller."
                  ;; second value says a third party could rewrite the witness
                  ;; into another equally valid one, which changes the txid of a
                  ;; transaction already in flight.
-                 (let ((node (bl.val:ms-from-script witscript)))
+                 (let ((node (bl.val:ms-from-script
+                              witscript
+                              :pkh-resolver (%wsh-pkh-resolver keymap))))
                    (when node
                      (multiple-value-bind (stack malleable)
                          (bl.val:ms-satisfy
