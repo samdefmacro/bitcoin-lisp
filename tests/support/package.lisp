@@ -22,6 +22,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:signals-rpc-error
    #:rpc-error-code-of
    #:make-deterministic-rng
+   #:release-datadir-lock
    #:coins-cache-entries
    #:coins-cache-fresh-count
    #:coins-cache-dirty-count
@@ -58,7 +59,9 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:make-forged-body-block
    #:make-two-coinbase-block
    #:regtest-node-fixture
+   #:regtest-node-base-path
    #:generate-regtest-blocks
+   #:coins-db-node-fixture
    #:activate-block-base-path
    #:make-activate-block-fixture
    #:build-and-connect

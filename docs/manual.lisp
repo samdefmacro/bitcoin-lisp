@@ -790,7 +790,15 @@
   AddCoin drops (provably unspendable) is never staged and a same-block
   spend of one fails as a MISSING INPUT rather than in the script engine.
   Long loops poll `interrupt-requested-p`
-  between blocks so shutdown and the assumeutxo pause can cut in.
+  between blocks so shutdown and the assumeutxo pause can cut in. VERIFY-DB
+  is Core's CVerifyDB over the last `-checkblocks` blocks at `-checklevel`
+  (defaults 6 and 3, the level clamped to 0-4): it runs at startup over
+  every chainstate whose coins view names a block, and a
+  :CORRUPTED-BLOCK-DB result refuses the start, as Core's "Corrupted block
+  database detected" does. Level 3 is the one that compares the two
+  databases -- it disconnects the tail into a scratch coins view over the
+  chainstate's own LevelDB, never flushed -- so it is what catches a UTXO
+  set that lost its coins under an unchanged tip.
 
   Traps: the P2SH-witness redeem script is the STACK TOP, not the last
   push (a consensus split when it was the latter). Block weight includes
@@ -828,6 +836,7 @@
   (bitcoin-lisp.validation:validate-block-header function)
   (bitcoin-lisp.validation:validate-block function)
   (bitcoin-lisp.validation:accept-block-body function)
+  (bitcoin-lisp.validation:verify-db function)
   (bitcoin-lisp.validation:test-block-validity function)
   (bitcoin-lisp.validation:connect-block function)
   (bitcoin-lisp.validation:activate-best-chain function)

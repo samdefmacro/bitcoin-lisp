@@ -773,37 +773,34 @@ it (Bitcoin Core invalidateblock). PARAMS: (blockhash). Returns null."
 ;;; --- Chain verification (Bitcoin Core verifychain) ---
 
 (define-rpc "verifychain" (node params)
-  "Re-verify the last NBLOCKS blocks from the block store (Bitcoin Core
-verifychain). PARAMS: ([checklevel] [nblocks]). At checklevel >= 1 each block is
-re-read and its merkle root + proof-of-work re-checked; level 0 only confirms the
-block reads back. Returns T if all checks pass, NIL otherwise."
-  (let* ((checklevel (if (integerp (first params)) (first params) 3))
-         (nblocks (if (integerp (second params)) (second params) 6))
+  "Verify the block database against the UTXO set (Bitcoin Core verifychain).
+PARAMS: ([checklevel] [nblocks]) -- checklevel defaults to 3 and is clamped to
+0-4, nblocks defaults to 6 and 0 means the whole chain. Level 0 reads each
+block back, 1 adds CheckBlock, 2 its undo record, 3 a clean disconnect against
+a scratch coins view, 4 a reconnect back to the tip. Returns T when the run
+finished successfully and JSON false otherwise -- Core compares the result
+against SUCCESS alone, so a run that skipped level 3 (dbcache too small) or
+stopped at pruned history answers false too."
+  (let* ((checklevel (if (integerp (first params))
+                         (first params)
+                         bl.val:+default-checklevel+))
+         (nblocks (if (integerp (second params))
+                      (second params)
+                      bl.val:+default-checkblocks+))
          (chain-state (rpc-get-chain-state node))
          (block-store (rpc-get-block-store node)))
     ;; Node lock: walk one consistent chain — a concurrent reorg on the
     ;; sync thread could otherwise splice entries from two tips (Core
     ;; VerifyDB holds cs_main throughout).
     (with-node-lock (node)
-     (let ((tip (bl.store:current-height chain-state)))
-      (when (or (<= nblocks 0) (> nblocks (1+ tip)))
-        (setf nblocks (1+ tip)))
-      (loop for height from tip downto (max 0 (- tip (1- nblocks)))
-            do (let ((entry (bl.store:get-block-at-height chain-state height)))
-                 (unless entry (return-from rpc-verifychain +json-false+))
-                 (let ((block (bl.store:get-block
-                               block-store
-                               (bl.store:block-index-entry-hash entry))))
-                   (unless block (return-from rpc-verifychain +json-false+))
-                   (when (>= checklevel 1)
-                     (let* ((header (bl.ser:bitcoin-block-header block))
-                            (txids (mapcar #'bl.ser:transaction-hash
-                                           (bl.ser:bitcoin-block-transactions block))))
-                       (unless (and (equalp (bl.val:compute-merkle-root txids)
-                                            (bl.ser:block-header-merkle-root header))
-                                    (bl.val:check-proof-of-work header))
-                         (return-from rpc-verifychain +json-false+)))))))
-      t))))
+      (if (eq :success
+              (bl.val:verify-db chain-state block-store
+                                :check-level checklevel
+                                :check-depth nblocks
+                                :coins-cache-bytes
+                                (bl:chainstate-coins-cache-budget chain-state)))
+          t
+          +json-false+))))
 
 ;;; --- waitfornewblock / dumptxoutset (Bitcoin Core rpc/blockchain.cpp) ---
 

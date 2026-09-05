@@ -917,6 +917,13 @@ production store, so the size trigger never fires for it."
     (coins-view-cache (cvc-mem-bytes view))))
 
 (defun disconnect-block-from-utxo-set (view block previous-utxos &key height)
+  "Reverse BLOCK's effect on VIEW using PREVIOUS-UTXOS, its undo data.
+
+Returns T when the disconnect was CLEAN and NIL when it was not -- Core's
+DISCONNECT_OK vs DISCONNECT_UNCLEAN, the distinction COIN-VIEW-DISCONNECT-BLOCK
+draws and logs. Only a plain UTXO-SET, which has no such observation to make,
+always answers T. VerifyDB's level 3 is the caller that acts on the answer; the
+reorg paths log it and carry on, as Core does."
   (etypecase view
     (utxo-set
      ;; Same intra-block-deps reasoning as coin-view-disconnect-block:
@@ -935,18 +942,23 @@ production store, so the size trigger never fires for it."
          (loop for out-idx from 0
                below (length (bl.ser:transaction-outputs tx))
                do (remhash (make-utxo-key txid out-idx)
-                           (utxo-set-entries view))))))
+                           (utxo-set-entries view)))))
+     t)
     (coins-view-cache
-     (coin-view-disconnect-block view block previous-utxos :height height)
-     ;; These coins now correspond to the PARENT block — Core's
-     ;; DisconnectBlock ends with SetBestBlock(pindex->pprev->GetBlockHash())
-     ;; (validation.cpp:2242), and hashPrevBlock is that same hash. Moving the
-     ;; pointer here, with the coins, is what keeps a flush honest partway
-     ;; through a reorg's disconnect phase, when the chain's tip still names the
-     ;; block we are rewinding away from.
-     (setf (cvc-best-block view)
-           (copy-seq (bl.ser:block-header-prev-block
-                      (bl.ser:bitcoin-block-header block)))))))
+     (let ((clean (coin-view-disconnect-block view block previous-utxos
+                                              :height height)))
+       ;; These coins now correspond to the PARENT block — Core's
+       ;; DisconnectBlock ends with SetBestBlock(pindex->pprev->GetBlockHash())
+       ;; (validation.cpp:2242), and hashPrevBlock is that same hash. Moving the
+       ;; pointer here, with the coins, is what keeps a flush honest partway
+       ;; through a reorg's disconnect phase, when the chain's tip still names the
+       ;; block we are rewinding away from.
+       (setf (cvc-best-block view)
+             (copy-seq (bl.ser:block-header-prev-block
+                        (bl.ser:bitcoin-block-header block))))
+       ;; ...and the pointer move must not become the answer: this used to be
+       ;; the last form, so every disconnect reported CLEAN.
+       clean))))
 
 ;;;; Polymorphic iteration + full-set statistics.
 ;;;;

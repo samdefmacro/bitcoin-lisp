@@ -154,15 +154,21 @@ block became the new active tip."
   (bl.net::process-received-block block chain-state utxo-set block-store
                                   :requested requested :peer peer))
 
+(defun regtest-node-base-path (suffix)
+  "Where REGTEST-NODE-FIXTURE with SUFFIX keeps its chain state and block
+store. Keyed by SUFFIX on purpose: a test that stops a node and builds a
+second one with the same suffix reopens the same on-disk state."
+  (ensure-directories-exist
+   (merge-pathnames (format nil "test-regtest-mine-~A/" suffix)
+                    (uiop:temporary-directory))))
+
 (defun regtest-node-fixture (suffix)
   ;; The directory is keyed by SUFFIX on purpose: a test that stops a node
   ;; and builds a second one with the same suffix reopens the same on-disk
   ;; state. Callers pick a suffix unique to the test.
   "(values node) — a regtest node at genesis with disk-backed chain-state /
 block-store / utxo-set, ready for activate-block. Call inside (with-network (:regtest) ...)."
-  (let* ((base (ensure-directories-exist
-                (merge-pathnames (format nil "test-regtest-mine-~A/" suffix)
-                                 (uiop:temporary-directory))))
+  (let* ((base (regtest-node-base-path suffix))
          (cs (bl.store:init-chain-state base :network :regtest))
          (store (bl.store:init-block-store base))
          (ghash (bl.store:best-block-hash cs))
@@ -186,6 +192,27 @@ The same three-token call had been copied into every suite that needs a real
 mined chain (reindex, coinstatsindex, blockfilter); one helper is what keeps
 the handler's argument shape in one place."
   (bl.rpc::rpc-generatetodescriptor node (list n "raw(51)")))
+
+(defun coins-db-node-fixture (tag)
+  "(values node coins-db-path chain-base-path) — a regtest node whose UTXO set
+is a LevelDB-backed coins-view-cache (matching the live node), with undo
+storage initialized so mining can connect blocks. The fixture the reindex and
+VerifyDB suites share: both need the coins DATABASE, not the in-memory
+utxo-set that REGTEST-NODE-FIXTURE gives on its own. The third value is where
+REGTEST-NODE-FIXTURE put the block store, for a test that has to reach the
+blk files themselves."
+  (let* ((node (regtest-node-fixture tag))
+         (base (merge-pathnames (format nil "test-reindex-~A/" tag)
+                                (uiop:temporary-directory)))
+         (cspath (namestring (merge-pathnames "chainstate/" base)))
+         (undopath (merge-pathnames "undo/" base)))
+    (ensure-directories-exist cspath)
+    (ensure-directories-exist undopath)
+    (setf (bl:node-utxo-set node)
+          (bl.store:make-coins-view-cache
+           (bl.store:open-coins-view-db cspath)))
+    (bl.val:initialize-undo-storage undopath)
+    (values node cspath (regtest-node-base-path tag))))
 
 (defun activate-block-base-path (suffix)
   "The directory an activate-block fixture with SUFFIX lives in -- keyed by

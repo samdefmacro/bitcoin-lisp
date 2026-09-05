@@ -13,29 +13,12 @@
 
 (in-suite :reindex-tests)
 
-(defun %reindex-node-fixture (tag)
-  "(values node coins-db-path) — a regtest node whose UTXO set is a
-LevelDB-backed coins-view-cache (matching the live node), with undo storage
-initialized so mining can connect blocks."
-  (let* ((node (regtest-node-fixture tag))
-         (base (merge-pathnames (format nil "test-reindex-~A/" tag)
-                                (uiop:temporary-directory)))
-         (cspath (namestring (merge-pathnames "chainstate/" base)))
-         (undopath (merge-pathnames "undo/" base)))
-    (ensure-directories-exist cspath)
-    (ensure-directories-exist undopath)
-    (setf (bl:node-utxo-set node)
-          (bl.store:make-coins-view-cache
-           (bl.store:open-coins-view-db cspath)))
-    (bl.val:initialize-undo-storage undopath)
-    (values node cspath)))
-
 (test reindex-chainstate-rebuilds-utxo-set
   "Mining builds a UTXO set; polluting the coins view then reindexing restores
 the exact set (same whole-set MuHash) and the same chain tip."
   (with-network (:regtest)
    (let* ((tag (format nil "rbld~D" (get-internal-real-time)))
-          (node (%reindex-node-fixture tag)))
+          (node (coins-db-node-fixture tag)))
      (let ((bl:*node* node))
        (generate-regtest-blocks node 8)
        (let* ((cs (bl:node-chain-state node))
@@ -80,7 +63,7 @@ the exact set (same whole-set MuHash) and the same chain tip."
 blocks + index intact, chainstate DB wiped)."
   (with-network (:regtest)
    (let* ((tag (format nil "recov~D" (get-internal-real-time)))
-          (node (%reindex-node-fixture tag)))
+          (node (coins-db-node-fixture tag)))
      (let ((bl:*node* node))
        (generate-regtest-blocks node 5)
        (let* ((utxo (bl:node-utxo-set node))
@@ -103,7 +86,7 @@ replay height, coins batch not yet committed) is detected at load-state and
 recovered to exactly the height the coins DB last committed."
   (with-network (:regtest)
    (let ((tag (format nil "crashr~D" (get-internal-real-time))))
-     (multiple-value-bind (node cspath) (%reindex-node-fixture tag)
+     (multiple-value-bind (node cspath) (coins-db-node-fixture tag)
        (let ((bl:*node* node))
          (generate-regtest-blocks node 8)
          (let* ((cs (bl:node-chain-state node))
@@ -149,7 +132,7 @@ recovers to a clean EMPTY set at genesis -- the leftovers are re-wiped, never
 loaded as live state."
   (with-network (:regtest)
    (let* ((tag (format nil "crashw~D" (get-internal-real-time)))
-          (node (%reindex-node-fixture tag)))
+          (node (coins-db-node-fixture tag)))
      (let ((bl:*node* node))
        (generate-regtest-blocks node 5)
        (let* ((cs (bl:node-chain-state node))
@@ -222,7 +205,7 @@ GENESIS with an empty UTXO set -- never at the pre-reindex tip."
              (is (null (bl.store:coins-view-db-best-block
                         (bl.store:coins-view-cache-base utxo))))
              (bl.store:close-chainstate-coins-view cs)
-             (bl::unlock-data-directory)
+             (release-datadir-lock)
              (setf bl:*node* nil))
            ;; Ordinary restart, no flags.
            (bl.net:reset-ibd-stop)
@@ -251,7 +234,7 @@ naming the old tip -- must not be reconciled toward. Core's is_coinsview_empty
 chainstate.dat where the recovery put it and says a rebuild is needed."
   (with-network (:regtest)
     (let* ((tag (format nil "recempty~D" (get-internal-real-time)))
-           (node (%reindex-node-fixture tag)))
+           (node (coins-db-node-fixture tag)))
       (let ((bl:*node* node))
         (generate-regtest-blocks node 5)
         (let* ((cs (bl:node-chain-state node))
