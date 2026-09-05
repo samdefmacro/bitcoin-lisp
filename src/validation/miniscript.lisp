@@ -163,12 +163,23 @@ merely expensive, so that the size comparison never picks it."
 (defun ms-check-older (tx input-index value)
   "Core's CheckSequence (interpreter.cpp:1781-1826), which is what a satisfier
 answers for `older(VALUE)': is this relative timelock already satisfied by the
-input's own nSequence?"
+input's own nSequence?
+
+The version is read UNSIGNED, as a uint32_t, because that is the type Core
+compares (see the version gate below)."
   (let ((inputs (bl.ser:transaction-inputs tx)))
     (and
      (< input-index (length inputs))
-     ;; BIP68 only applies from version 2.
-     (>= (bl.ser:transaction-version tx) 2)
+     ;; BIP68 only applies from version 2, and CheckSequence gates on
+     ;; `txTo->version < 2\' where version is a `const uint32_t\'
+     ;; (interpreter.cpp:1789-1791, primitives/transaction.h:293), so every
+     ;; version with bit 31 set is >= 2 there. Our slot is (signed-byte 32) --
+     ;; correct, it is what the wire carries -- so the same bytes come back
+     ;; negative and a signed compare made the satisfier decline older() for a
+     ;; transaction whose relative locktime Core considers satisfied.
+     ;; Reinterpret at the comparison, as the sequence-lock gate in block.lisp
+     ;; does; the slot stays signed so serialization keeps round-tripping.
+     (>= (ldb (byte 32 0) (bl.ser:transaction-version tx)) 2)
      (let ((seq (bl.ser:tx-in-sequence
                  (aref inputs input-index))))
        (and
