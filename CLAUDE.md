@@ -133,7 +133,14 @@ somewhere in the tree (`scripts/check-undefined-variables.sh`): ASDF's
 compilation unit defers those warnings past compile-file's failure-p, so a
 from-scratch build otherwise passes with them buried in the transcript —
 2026-08-28 it hid a `setf` of a deleted defvar and six docstrings cut short
-by an unescaped `"` whose remaining prose had become code.
+by an unescaped `"` whose remaining prose had become code. It fails the same
+way on a call that hands an ALREADY-KNOWN function the wrong number of
+arguments (`scripts/check-wrong-arity-calls.sh`, attributing each warning to
+the file being compiled so one from `refs/coalton` is not ours): SBCL reports
+that as a STYLE-WARNING only, so the build passes and the call signals
+`SB-INT:SIMPLE-PROGRAM-ERROR` when it runs — or, inside an `ignore-errors`,
+nothing at all, which is how a test's `(bt:join-thread th :timeout 5)` sat
+there never joining the thread it named.
 
 **Changing a MACRO (or a defstruct's layout) needs a FRESH FASL volume** —
 the cold lane is not "compiles fresh": it mounts a persistent per-checkout
