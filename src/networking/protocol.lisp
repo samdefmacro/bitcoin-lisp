@@ -318,19 +318,44 @@ MAX_MONEY would otherwise silently suppress all relay to this peer."
 ;;;     cleanup: a disconnecting peer's announcements are forgotten and its
 ;;;     in-flight requests become immediately re-schedulable.
 ;;;
-;;; Simplified vs Core's full 3-state priority machinery (txrequest.cpp):
-;;; no per-(peer,txhash) priority hashing — candidate selection is preferred-
-;;; first then earliest-ready; expiry failover selects among currently-ready
-;;; candidates instead of promoting the exact next-by-priority announcement;
-;;; and the scheduler runs on a ~1s cadence rather than per SendMessages pass.
+;;; Core's announcement STATES are here (txrequest.cpp:52-100), split across
+;;; two tables rather than one multi-index container: CANDIDATE_DELAYED and
+;;; CANDIDATE_READY are an announcement whose ready time is in the future or
+;;; the past, REQUESTED is the *TX-IN-FLIGHT* entry naming that peer, and
+;;; COMPLETED is the announcement's own flag. CANDIDATE_BEST is not stored --
+;;; the scheduler recomputes it, which is what %TX-REQUEST-BEST-CANDIDATE is.
+;;; The scheduler runs on a ~1s cadence rather than per SendMessages pass.
 
 (defvar *tx-in-flight* (make-hash-table :test 'equalp)
   "txid -> (peer . request-internal-real-time); at most one per txid.")
+
+(defstruct (tx-announcement (:constructor %make-tx-announcement (peer ready))
+                            (:conc-name tx-ann-))
+  "One peer's announcement of one txhash — Core's txrequest Announcement
+(txrequest.cpp:52-100). READY is the internal-real-time at which it becomes
+requestable (Core m_time as a reqtime: CANDIDATE_DELAYED until then,
+CANDIDATE_READY after). COMPLETED is Core's State::COMPLETED: the peer
+answered notfound, let its request expire, or delivered something for this
+hash, so the announcement is never selected again — but the SLOT STAYS, which
+is the point. Deleting it instead would let that peer re-announce its way
+straight back into the candidate set and would refund the
+MAX_PEER_TX_ANNOUNCEMENTS budget its failure spent, and Core's data structure
+exists to prevent exactly that: \"The same transaction is never requested
+twice from the same peer, unless the announcement was forgotten in between
+... giving a peer multiple chances to announce a transaction would allow them
+to bias requests in their favor, worsening transaction censoring attacks\"
+(txrequest.h:45-58)."
+  (peer nil)
+  (ready 0 :type integer)
+  (completed nil :type boolean))
+
 (defvar *tx-announcers* (make-hash-table :test 'equalp)
-  "hash -> list of (peer . ready-internal-real-time) announcements — failover
-candidates, each requestable once its ready time (announcement time + Core's
-NONPREF/TXID/OVERLOADED delays) passes. The peer currently in flight stays in
-this list; its cons is the record that it announced the hash.")
+  "hash -> list of TX-ANNOUNCEMENT — failover candidates, each requestable
+once its ready time (announcement time + Core's NONPREF/TXID/OVERLOADED
+delays) passes. The peer currently in flight stays in this list; its
+announcement is the record that it announced the hash. A COMPLETED
+announcement stays too, until the hash is forgotten or its last
+non-completed sibling completes.")
 (defvar *tx-request-wtxid-p* (make-hash-table :test 'equalp)
   "hash -> T when the tracked announcement is wtxid-based (BIP339 MSG_WTX).
 Core's TxRequestTracker stores GenTxids, so every entry remembers whether it
@@ -408,21 +433,55 @@ computes in AddTxAnnouncement (txdownloadman_impl.cpp:210-219)."
             (remhash (car entry) *tx-peer-in-flight*)))
       (remhash hash *tx-in-flight*))))
 
+(defun %tx-announcement-for (hash peer)
+  "Lock held: PEER's announcement of HASH, completed or not (Core's ByPeer
+lookup, which searches both the CANDIDATE_BEST and the non-best key), or NIL."
+  (find peer (gethash hash *tx-announcers*) :key #'tx-ann-peer :test #'eq))
+
+(defun %decf-peer-announcements (peer)
+  "Lock held: charge one announcement back to PEER's MAX_PEER_TX_ANNOUNCEMENTS
+budget (Core m_peerinfo[peer].m_total--)."
+  (let ((n (1- (gethash peer *tx-peer-announcements* 1))))
+    (if (plusp n)
+        (setf (gethash peer *tx-peer-announcements*) n)
+        (remhash peer *tx-peer-announcements*))))
+
+(defun %tx-announcers-erase (hash)
+  "Lock held: erase EVERY announcement of HASH, completed or not, fixing each
+peer's count — Core ForgetTxHash (txrequest.cpp:560-566) and the branch of
+MakeCompleted that fires when the last non-completed announcement completes."
+  (dolist (ann (gethash hash *tx-announcers*))
+    (%decf-peer-announcements (tx-ann-peer ann)))
+  (remhash hash *tx-announcers*)
+  (remhash hash *tx-request-wtxid-p*))
+
+(defun %tx-request-make-completed (hash peer)
+  "Lock held: Core MakeCompleted (txrequest.cpp:456-478). PEER's announcement
+of HASH becomes COMPLETED — kept, so a re-announcement from PEER is still
+refused by the (peer, txhash) uniqueness of Core's ByPeer index and its
+budget stays charged — UNLESS it was the last non-COMPLETED announcement for
+the hash, in which case every announcement of the hash is erased
+(IsOnlyNonCompleted, :463-470; \"If for a given txhash only already-failed
+announcements remain, they are all forgotten\", txrequest.h:52)."
+  (let ((ann (%tx-announcement-for hash peer)))
+    (when (and ann (not (tx-ann-completed ann)))
+      (if (find-if (lambda (a) (and (not (eq a ann)) (not (tx-ann-completed a))))
+                   (gethash hash *tx-announcers*))
+          (setf (tx-ann-completed ann) t)
+          (%tx-announcers-erase hash)))))
+
 (defun %tx-request-drop-announcer (hash peer)
   "Lock held: remove PEER's announcement of HASH (if any), fixing its count.
-Removes the whole entry when no announcers remain."
-  (let* ((anns (gethash hash *tx-announcers*))
-         (ann (assoc peer anns :test #'eq)))
+When only COMPLETED announcements would be left — or none — the whole entry
+goes, which is where Core's DisconnectedPeer arrives by calling MakeCompleted
+before erasing (txrequest.cpp:549-556)."
+  (let ((ann (%tx-announcement-for hash peer)))
     (when ann
-      (let ((rest (remove ann anns)))
-        (if rest
-            (setf (gethash hash *tx-announcers*) rest)
-            (progn (remhash hash *tx-announcers*)
-                   (remhash hash *tx-request-wtxid-p*))))
-      (let ((n (1- (gethash peer *tx-peer-announcements* 1))))
-        (if (plusp n)
-            (setf (gethash peer *tx-peer-announcements*) n)
-            (remhash peer *tx-peer-announcements*))))))
+      (let ((rest (remove ann (gethash hash *tx-announcers*))))
+        (setf (gethash hash *tx-announcers*) rest)
+        (%decf-peer-announcements peer)
+        (unless (find-if-not #'tx-ann-completed rest)
+          (%tx-announcers-erase hash))))))
 
 (defun tx-request-count (peer)
   "Number of announcements tracked for PEER (Core m_txrequest.Count)."
@@ -440,49 +499,56 @@ announced hash itself and is remembered for the lifetime of the entry, so a
 timed-out request fails over with the SAME id type. NUM-WTXID-PEERS is the
 count of connected wtxid-relay peers, driving Core's TXID_RELAY_DELAY."
   (bt:with-lock-held (*tx-request-lock*)
-    (let ((anns (gethash hash *tx-announcers*)))
-      ;; Duplicate announcement from the same peer: nothing new to record.
-      (when (assoc peer anns :test #'eq)
-        (return-from tx-request-wanted-p nil))
-      ;; MAX_PEER_TX_ANNOUNCEMENTS: drop, don't record
-      ;; (txdownloadman_impl.cpp:204-207).
-      (when (>= (gethash peer *tx-peer-announcements* 0)
-                +max-peer-tx-announcements+)
-        (return-from tx-request-wanted-p nil))
-      (let* ((now (get-internal-real-time))
-             (ready (+ now (%tx-announcement-delay-ticks peer wtxidp
-                                                         num-wtxid-peers))))
-        (push (cons peer ready) (gethash hash *tx-announcers*))
-        (incf (gethash peer *tx-peer-announcements* 0))
-        (setf (gethash hash *tx-request-wtxid-p*) wtxidp)
-        (cond ((gethash hash *tx-in-flight*) nil)
-              ((> ready now) nil)        ; deferred; scheduler sends when due
-              (t (%tx-request-mark-in-flight hash peer now)
-                 t))))))
+    ;; Another announcement from the same peer — live or COMPLETED — is
+    ;; refused by the (peer, txhash) uniqueness of Core's ByPeer index
+    ;; (ReceivedInv's failed emplace, txrequest.cpp:578-592): nothing new is
+    ;; recorded, and a peer whose request failed does not get a second one.
+    (when (%tx-announcement-for hash peer)
+      (return-from tx-request-wanted-p nil))
+    ;; MAX_PEER_TX_ANNOUNCEMENTS: drop, don't record
+    ;; (txdownloadman_impl.cpp:204-207).
+    (when (>= (gethash peer *tx-peer-announcements* 0)
+              +max-peer-tx-announcements+)
+      (return-from tx-request-wanted-p nil))
+    (let* ((now (get-internal-real-time))
+           (ready (+ now (%tx-announcement-delay-ticks peer wtxidp
+                                                       num-wtxid-peers))))
+      (push (%make-tx-announcement peer ready) (gethash hash *tx-announcers*))
+      (incf (gethash peer *tx-peer-announcements* 0))
+      (setf (gethash hash *tx-request-wtxid-p*) wtxidp)
+      (cond ((gethash hash *tx-in-flight*) nil)
+            ((> ready now) nil)          ; deferred; scheduler sends when due
+            (t (%tx-request-mark-in-flight hash peer now)
+               t)))))
 
 (defun tx-request-received (hash)
-  "Clear tracking for HASH once the tx arrives (or is otherwise resolved) —
-Core ForgetTxHash: every peer's announcement of it is released."
+  "Forget HASH entirely — Core ForgetTxHash (txrequest.cpp:560-566): the
+outstanding request and EVERY peer's announcement of it are released.
+
+This is for a hash that is genuinely RESOLVED, and only for those: it entered
+the mempool, a block confirmed it, it went into the orphanage, or it failed
+in a way that will not be reconsidered. A transaction merely ARRIVING is not
+that — see TX-REQUEST-RECEIVED-RESPONSE, which is what a delivery calls."
   (bt:with-lock-held (*tx-request-lock*)
     (%tx-request-clear-in-flight hash)
-    (dolist (ann (gethash hash *tx-announcers*))
-      (let ((n (1- (gethash (car ann) *tx-peer-announcements* 1))))
-        (if (plusp n)
-            (setf (gethash (car ann) *tx-peer-announcements*) n)
-            (remhash (car ann) *tx-peer-announcements*))))
-    (remhash hash *tx-announcers*)
-    (remhash hash *tx-request-wtxid-p*)))
+    (%tx-announcers-erase hash)))
 
-(defun tx-request-notfound (peer hash)
-  "PEER answered notfound for HASH: mark its announcement completed (Core
-ReceivedNotFound -> m_txrequest.ReceivedResponse) so the request fails over
-to another announcer on the next scheduler pass instead of burning the full
-timeout."
+(defun tx-request-received-response (peer hash)
+  "PEER answered our request for HASH — with the transaction, or with a
+notfound. Core ReceivedResponse (txrequest.cpp:667-676): ONLY this peer's
+announcement is completed, so every other announcer stays a candidate and the
+next scheduler pass re-routes to one of them.
+
+It is deliberately not ForgetTxHash. A peer that sends an unsolicited copy of
+a transaction — or a witness-malleated twin, same txid and a different wtxid
+— would otherwise release every honest announcer of that txid and the
+scheduler would issue no further request for it."
   (bt:with-lock-held (*tx-request-lock*)
     (let ((entry (gethash hash *tx-in-flight*)))
       (when (and entry (eq (car entry) peer))
         (%tx-request-clear-in-flight hash)))
-    (%tx-request-drop-announcer hash peer)))
+    (%tx-request-make-completed hash peer)))
+
 
 (defun tx-request-disconnected-peer (peer)
   "Forget every announcement PEER made and release its in-flight requests so
@@ -500,7 +566,8 @@ thread. Registered as *peer-disconnect-hook*."
     ;; Forget its announcements.
     (let ((announced '()))
       (maphash (lambda (hash anns)
-                 (when (assoc peer anns :test #'eq) (push hash announced)))
+                 (when (find peer anns :key #'tx-ann-peer :test #'eq)
+                   (push hash announced)))
                *tx-announcers*)
       (dolist (hash announced) (%tx-request-drop-announcer hash peer)))
     (remhash peer *tx-peer-announcements*)
@@ -510,22 +577,61 @@ thread. Registered as *peer-disconnect-hook*."
 ;;; first): the tracker must observe every disconnect path.
 (setf *peer-disconnect-hook* #'tx-request-disconnected-peer)
 
-(defun %tx-request-best-candidate (anns now &optional exclude)
-  "The best requestable announcement in ANNS at NOW: ready (delay passed),
-peer :ready, not EXCLUDE — preferred (outbound) peers first, then earliest
-ready time (Core GetRequestable's CANDIDATE_BEST selection, simplified)."
+(defun %tx-request-selectable-p (ann now)
+  "Core IsSelectable (txrequest.cpp:88-92) in our two-table form: the
+announcement is not COMPLETED, its delay has passed (CANDIDATE_READY rather
+than CANDIDATE_DELAYED), and its peer is still usable."
+  (and (not (tx-ann-completed ann))
+       (<= (tx-ann-ready ann) now)
+       (eq (peer-state (tx-ann-peer ann)) :ready)))
+
+(defun %tx-request-best-candidate (anns now)
+  "The best selectable announcement in ANNS at NOW — preferred (outbound)
+peers first, then earliest ready time (Core GetRequestable's CANDIDATE_BEST
+selection, simplified)."
   (let ((best nil))
     (dolist (ann anns best)
-      (destructuring-bind (peer . ready) ann
-        (when (and (not (eq peer exclude))
-                   (<= ready now)
-                   (eq (peer-state peer) :ready))
-          (when (or (null best)
-                    (let ((bp (tx-request-preferred-p (car best)))
-                          (ap (tx-request-preferred-p peer)))
-                      (or (and ap (not bp))
-                          (and (eq ap bp) (< ready (cdr best))))))
-            (setf best ann)))))))
+      (when (%tx-request-selectable-p ann now)
+        (when (or (null best)
+                  (let ((bp (tx-request-preferred-p (tx-ann-peer best)))
+                        (ap (tx-request-preferred-p (tx-ann-peer ann))))
+                    (or (and ap (not bp))
+                        (and (eq ap bp)
+                             (< (tx-ann-ready ann) (tx-ann-ready best))))))
+          (setf best ann))))))
+
+(defun %tx-request-schedule (hash now to-send)
+  "Lock held: grant HASH to its best candidate at NOW and add the getdata inv
+to TO-SEND, an alist of peer -> invs, which is returned. Nothing happens when
+a request for HASH is already outstanding or no announcement is selectable —
+Core GetRequestable's CANDIDATE_BEST pick followed by RequestedTx."
+  (if (gethash hash *tx-in-flight*)
+      to-send
+      (let ((best (%tx-request-best-candidate (gethash hash *tx-announcers*) now)))
+        (if (null best)
+            to-send
+            (let* ((peer (tx-ann-peer best))
+                   (inv (tx-request-inv hash (gethash hash *tx-request-wtxid-p*) peer))
+                   (bucket (assoc peer to-send :test #'eq)))
+              (%tx-request-mark-in-flight hash peer now)
+              (cond (bucket (push inv (cdr bucket)) to-send)
+                    (t (cons (list peer inv) to-send))))))))
+
+(defun %send-tx-getdatas (to-send)
+  "Send TO-SEND (peer -> invs, as %TX-REQUEST-SCHEDULE builds it) as one
+getdata per peer, OUTSIDE the tracker lock, and return the number of invs
+sent. Each inv carries the id type its entry was announced under: a wtxid
+entry as MSG_WTX, a txid entry as MSG_TX|witness-flag. Sending every failover
+as MSG_WITNESS_TX regardless — which this used to do — is read by a Core peer
+as a TXID lookup, so a wtxid hash got a notfound back and failover silently
+never worked for segwit txs (a first-announcer-wins censorship primitive)."
+  (let ((sent 0))
+    (loop for (peer . invs) in to-send
+          do (incf sent (length invs))
+             (handler-case
+                 (send-message peer (bl.ser:make-getdata-message invs))
+               (error () nil)))
+    sent))
 
 (defun process-tx-requests ()
   "Send getdatas for announcements whose delay has passed and that have no
@@ -536,30 +642,11 @@ of requests sent."
   (let ((now (get-internal-real-time))
         (to-send '()))                  ; (peer . list-of-invs)
     (bt:with-lock-held (*tx-request-lock*)
-      (maphash
-       (lambda (hash anns)
-         (unless (gethash hash *tx-in-flight*)
-           (let ((best (%tx-request-best-candidate anns now)))
-             (when best
-               (let ((peer (car best))
-                     (wtxidp (gethash hash *tx-request-wtxid-p*)))
-                 (%tx-request-mark-in-flight hash peer now)
-                 (let ((bucket (assoc peer to-send :test #'eq)))
-                   (if bucket
-                       (push (tx-request-inv hash wtxidp peer) (cdr bucket))
-                       (push (list peer (tx-request-inv hash wtxidp peer))
-                             to-send))))))))
-       *tx-announcers*))
-    ;; Send outside the lock, one getdata per peer.
-    (let ((sent 0))
-      (loop for (peer . invs) in to-send
-            do (incf sent (length invs))
-               (handler-case
-                   (send-message peer
-                                 (bl.ser:make-getdata-message
-                                  invs))
-                 (error () nil)))
-      sent)))
+      (maphash (lambda (hash anns)
+                 (declare (ignore anns))
+                 (setf to-send (%tx-request-schedule hash now to-send)))
+               *tx-announcers*))
+    (%send-tx-getdatas to-send)))
 
 (defun tx-fetch-inv-type (peer)
   "Inv type for a TXID-based tx getdata to PEER: MSG_TX|MSG_WITNESS_FLAG when
@@ -585,54 +672,37 @@ wtxid-based entry, MSG_TX|witness-flag for a txid-based one — Core's
 
 (defun retry-timed-out-tx-requests ()
   "Re-route each in-flight tx getdata outstanding longer than
-GETDATA_TX_INTERVAL to the next ready announcer (the timed-out peer's
-announcement is dropped — Core's expiry marks it COMPLETED); drop tracking
-for a tx with no other ready announcer. Returns the number re-requested."
+GETDATA_TX_INTERVAL to the next ready announcer; drop tracking for a tx whose
+announcers have all gone away. The expired announcement is marked COMPLETED,
+which is what Core's SetTimePoint does to a REQUESTED entry whose expiry has
+passed (txrequest.cpp:485-500) — the peer keeps the slot it burned, so it may
+not re-announce its way into a second GETDATA_TX_INTERVAL window on the same
+transaction. Returns the number re-requested."
   (let ((now (get-internal-real-time))
         (timeout-ticks (* +tx-request-timeout-seconds+ internal-time-units-per-second))
-        (reroutes '()))
+        (to-send '()))
     (bt:with-lock-held (*tx-request-lock*)
       (let ((timed-out '()))
         (maphash (lambda (txid entry)
                    (when (> (- now (cdr entry)) timeout-ticks)
-                     (push (cons txid entry) timed-out)))
+                     (push (cons txid (car entry)) timed-out)))
                  *tx-in-flight*)
         (dolist (item timed-out)
-          (let* ((txid (car item))
-                 (old-peer (cadr item)))
+          (let ((txid (car item))
+                (old-peer (cdr item)))
             (%tx-request-clear-in-flight txid)
-            ;; The expired announcement is completed (Core txrequest expiry).
-            (%tx-request-drop-announcer txid old-peer)
-            (let ((next (%tx-request-best-candidate
-                         (gethash txid *tx-announcers*) now old-peer)))
-              (if next
-                  (progn (%tx-request-mark-in-flight txid (car next) now)
-                         (push (list txid (car next)
-                                     (gethash txid *tx-request-wtxid-p*))
-                               reroutes))
-                  ;; No READY candidate right now. Entries with only delayed
-                  ;; candidates stay for the scheduler; entries with no
-                  ;; announcers at all were already dropped above.
-                  (let ((anns (gethash txid *tx-announcers*)))
-                    (unless (find-if (lambda (ann)
-                                       (eq (peer-state (car ann)) :ready))
-                                     anns)
-                      (dolist (ann anns)
-                        (%tx-request-drop-announcer txid (car ann)))))))))))
-    ;; Send getdata outside the lock. The re-request must carry the id type the
-    ;; entry was announced under: a wtxid entry as MSG_WTX, a txid entry as
-    ;; MSG_TX|witness-flag. Previously every failover went out as
-    ;; MSG_WITNESS_TX regardless — Core interprets MSG_WITNESS_TX getdata as a
-    ;; TXID lookup, so a wtxid hash got a notfound and failover never worked
-    ;; for segwit txs (first-announcer-wins censorship primitive).
-    (dolist (entry reroutes)
-      (destructuring-bind (txid next wtxidp) entry
-        (handler-case
-            (send-message next
-                          (bl.ser:make-getdata-message
-                           (list (tx-request-inv txid wtxidp next))))
-          (error () nil))))
-    (length reroutes)))
+            (%tx-request-make-completed txid old-peer)
+            (setf to-send (%tx-request-schedule txid now to-send))
+            (unless (gethash txid *tx-in-flight*)
+              ;; No selectable candidate right now. Entries with only delayed
+              ;; candidates stay for the scheduler; an entry whose every
+              ;; announcer has gone away is dropped.
+              (let ((anns (gethash txid *tx-announcers*)))
+                (unless (find-if (lambda (ann)
+                                   (eq (peer-state (tx-ann-peer ann)) :ready))
+                                 anns)
+                  (%tx-announcers-erase txid))))))))
+    (%send-tx-getdatas to-send)))
 
 ;;; Initial-block-download status (Core ChainstateManager::IsInitialBlockDownload)
 
@@ -872,7 +942,7 @@ handled by the block-download timeout like any other stalled request."
           ((or (= inv-type bl.ser:+inv-type-tx+)
                (= inv-type bl.ser:+inv-type-witness-tx+)
                (= inv-type bl.ser:+inv-type-wtx+))
-           (tx-request-notfound peer hash)
+           (tx-request-received-response peer hash)
            (setf tx-completed t)))))
     ;; Fail over promptly: re-run the scheduler so another announcer's
     ;; candidate is requested now rather than on the next 1s tick.

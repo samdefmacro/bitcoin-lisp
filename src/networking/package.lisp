@@ -70,7 +70,7 @@ headerssync.cpp. src/networking/.")
    #:reset-tx-requests
    #:tx-request-wanted-p
    #:tx-request-received
-   #:tx-request-notfound
+   #:tx-request-received-response
    #:tx-request-disconnected-peer
    #:tx-request-count
    #:process-tx-requests

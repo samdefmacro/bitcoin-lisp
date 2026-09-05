@@ -30,6 +30,17 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:start-node-plist
    #:rest-request
    #:deliver-getdata
+   #:deliver-tx
+   #:deliver-inv
+   #:deliver-notfound
+   #:tx-request-in-flight-peer
+   #:tx-request-announcement-peers
+   #:tx-request-completed-p
+   #:tx-request-wtxid-entry-p
+   #:backdate-tx-announcements
+   #:expire-tx-request
+   #:tx-request-peer-count
+   #:tx-request-peer-in-flight-count
    #:drain-peer-once
    #:ingest-gossiped-addresses
    #:peer-pending-getdata
