@@ -2647,6 +2647,29 @@ recent-confirmed filter (Core BlockConnected, txdownloadman_impl.cpp:98-110,
                                     block)
           *most-recent-cmpctblock* nil)))
 
+(defun historical-chainstate-p (chain-state)
+  "T when CHAIN-STATE is a TARGETED chainstate -- the assumeutxo background
+chainstate re-deriving pre-snapshot history -- and so must not touch the
+mempool or the tx-relay filters. Core's ChainstateRole.historical.
+
+Core keeps that chainstate out of both by construction. It has no mempool at
+all (`assert(!curr_chainstate.m_mempool)', validation.cpp:6203; every mempool
+call in ConnectTip and DisconnectTip sits under `if (m_mempool)'), and it
+passes the role with every BlockConnected so net_processing can drop it
+before the tx-download manager sees it (`if (!role.historical &&
+!m_chainman.IsInitialBlockDownload())', net_processing.cpp:2086-2092).
+UpdatedBlockTip and the blockTip notification are gated the same way, on
+`this == &m_chainman.ActiveChainstate()' (validation.cpp:3452).
+
+The blocks such a chainstate connects are ancient, so recording them as the
+relay's most-recent block or their txids as recently confirmed would suppress
+the relay of live transactions; the node has ONE shared mempool, which is the
+active chainstate's. Both of this file's connect paths -- CONNECT-BLOCK and
+%REORG-COMMIT -- ask this one question. The other subscribers carry their own
+role guards (node/wallet-hooks.lisp, node/indexes.lisp, node/notify.lisp,
+zmq.lisp), as Core's do by ChainstateRole."
+  (and (bl.store:chain-state-target-blockhash chain-state) t))
+
 ;;;; Block connection
 
 (defun connect-block (block chain-state block-store utxo-set
@@ -2794,7 +2817,7 @@ Handles chain reorganizations when a competing chain has more work."
            ;; these: its "tip" blocks are ancient, and Core only wires the
            ;; validation-interface tx-relay callbacks to the ACTIVE chainstate
            ;; (BlockConnected checks role, net_processing.cpp:2149-2157).
-           (unless (bl.store:chain-state-target-blockhash chain-state)
+           (unless (historical-chainstate-p chain-state)
              (when mempool
                (bl.mp:mempool-expire mempool)
                (bl.mp:orphan-erase-for-block
@@ -3541,7 +3564,14 @@ indexes, the fee estimator, the mempool removals and the disconnected-tx
 re-add. Deferred to here so a rolled-back reorg leaves every one of them
 untouched, and an INTERRUPTED one commits exactly the blocks that moved.
 
-Returns PERFORM-REORG's value: T, or (VALUES NIL :INTERRUPTED)."
+Returns PERFORM-REORG's value: T, or (VALUES NIL :INTERRUPTED).
+
+The mempool and tx-relay side effects here carry CONNECT-BLOCK's
+background-chainstate guard, HISTORICAL-CHAINSTATE-P: a targeted chainstate
+reaches this function whenever it fast-forwards more than one block at a time
+(ACTIVATE-BLOCK case 2 with the intermediate body already on disk), and Core
+never lets such a chainstate move the node's single shared mempool or the
+relay filters."
 ;; PHASE C — commit side effects, only now the whole fork is valid
 ;; and applied. Oldest-to-newest for chain-order indexing.
 ;;
@@ -3551,7 +3581,8 @@ Returns PERFORM-REORG's value: T, or (VALUES NIL :INTERRUPTED)."
 ;; Filter().reset(), txdownloadman_impl.cpp:112-123). Deferred to
 ;; the commit phase alongside the other side effects: a rolled-back
 ;; reorg never disconnected anything observably.
-(reset-recent-confirmed)
+(unless (historical-chainstate-p chain-state)
+  (reset-recent-confirmed))
 ;; Core fires BlockDisconnected per DisconnectTip — tip-first, before
 ;; the fork's BlockConnected signals — and the wallet, ZMQ and the
 ;; spender index subscribe to it. Deferred here with the other side
@@ -3577,13 +3608,14 @@ Returns PERFORM-REORG's value: T, or (VALUES NIL :INTERRUPTED)."
     ;; recomputed header hash is a fresh object, not the one the
     ;; connect path / index entries key by.
     (let ((hash (bl.store:block-index-entry-hash entry)))
-      (when mempool
-        (bl.mp:mempool-remove-for-block mempool block)
-        (bl.mp:orphan-erase-for-block
-         (bl.mp:mempool-orphan-pool mempool) block))
-      ;; Each reconnected block counts as connected for the tx-relay
-      ;; tip structures; the LAST one leaves the map at the new tip.
-      (note-block-connected block)
+      (unless (historical-chainstate-p chain-state)
+        (when mempool
+          (bl.mp:mempool-remove-for-block mempool block)
+          (bl.mp:orphan-erase-for-block
+           (bl.mp:mempool-orphan-pool mempool) block))
+        ;; Each reconnected block counts as connected for the tx-relay
+        ;; tip structures; the LAST one leaves the map at the new tip.
+        (note-block-connected block))
       ;; The fork's blocks connect oldest-to-newest, after that block's
       ;; mempool conflict removals (Core order): the indexes, ZMQ and the
       ;; wallet hear it here. Reconnected in order, so a filter header
@@ -3613,9 +3645,10 @@ Returns PERFORM-REORG's value: T, or (VALUES NIL :INTERRUPTED)."
 ;; NEW-HEIGHT on the normal path, and the truncation point when a stop
 ;; request cut the reorg short.
 (let ((reached (bl.store:current-height chain-state)))
-  (readd-disconnected-txs-to-mempool
-   mempool (loop for entry in (reorg-disconnected-block-txs r) append (car entry))
-   utxo-set reached chain-state)
+  (unless (historical-chainstate-p chain-state)
+    (readd-disconnected-txs-to-mempool
+     mempool (loop for entry in (reorg-disconnected-block-txs r) append (car entry))
+     utxo-set reached chain-state))
 
   (cond
     ((reorg-interrupted r)
