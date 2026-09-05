@@ -56,6 +56,12 @@ BIP34 at height 1)."
 
 ;;;; Reproducible randomness
 
+(defun release-datadir-lock ()
+  "Drop the datadir lock a running node holds, without any of the flushing
+STOP-NODE does -- what a killed process leaves behind, and what a test that
+restarts a node over the same directory needs before it can."
+  (bl::unlock-data-directory))
+
 (defun make-deterministic-rng (seed)
   "Deterministic xorshift64 PRNG closure: (funcall rng n) => [0, n). No
 dependence on the global *random-state*, so runs are reproducible."

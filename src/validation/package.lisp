@@ -74,6 +74,9 @@ can. src/validation/.")
    #:*default-signet-challenge*
    #:connect-block
    #:accept-block-body
+   #:verify-db
+   #:+default-checkblocks+
+   #:+default-checklevel+
    #:activate-block
    #:find-fork-point
    ;; Tx-relay tip structures (Core recent-confirmed filter +

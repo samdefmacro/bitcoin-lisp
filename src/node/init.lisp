@@ -791,12 +791,50 @@ connect."
     (do-reindex-chainstate)))
 
 
-(defun %init-services (network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled)
+(defun %verify-loaded-chainstates (check-blocks check-level
+                                   require-full-verification reindex-chainstate)
+  "Core's VerifyLoadedChainstate (node/chainstate.cpp:240-276): run VerifyDB
+over every non-empty chainstate and refuse to start on a corrupted result.
+
+Skipped exactly where Core skips it, on both halves of is_coinsview_empty
+(`wipe_chainstate_db || CoinsTip().GetBestBlock().IsNull()`): when
+-reindex-chainstate was given, since the wipe flag is true for that whole boot,
+and per chainstate whose coins view names no block. The pointer, not the coin
+count, is the test here -- a view that names a block is one VerifyDB can walk
+down from, and whether the coins behind it are there is the question being
+asked. A skipped level 3 is a warning unless -checkblocks or -checklevel was
+given explicitly, Core's require_full_verification (init.cpp:1390)."
+  (unless reindex-chainstate
+    (dolist (cs (node-chainstates *node*))
+      (let ((view (bl.store:chain-state-coins-view cs)))
+        (unless (or (null view) (null (bl.store:coins-view-best-block view)))
+          (let ((result (bl.val:verify-db
+                         cs (node-block-store *node*)
+                         :check-level (or check-level bl.val:+default-checklevel+)
+                         :check-depth (or check-blocks bl.val:+default-checkblocks+)
+                         :coins-cache-bytes (chainstate-coins-cache-budget cs))))
+            (ecase result
+              ((:success :skipped-missing-blocks) nil)
+              (:interrupted
+               (log-warn "Block verification was interrupted"))
+              (:skipped-l3-checks
+               (if require-full-verification
+                   (progn
+                     (log-error "Refusing to start: insufficient dbcache for block verification.")
+                     (init-error "Insufficient dbcache for block verification"))
+                   (log-warn "Block verification skipped level >= 3; consider raising -dbcache")))
+              (:corrupted-block-db
+               (log-error "Corrupted block database detected.")
+               (log-error "Recover by reindexing from the block files (-reindex-chainstate rebuilds the UTXO set), or restore a backup.")
+               (init-error "Corrupted block database detected in ~A"
+                           (node-data-directory *node*))))))))))
+
+(defun %init-services (network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level require-full-verification)
   "The RPC server, up early (Core Step 4a AppInitServers, answering
 RPC_IN_WARMUP while the rest loads); the recent-rejects filter, the fee
 estimator, the address book and banlist (Step 6); mempool.dat (Step 11); the
-anchors (Step 12); the coins-DB tip reconciliation; the indexes (Step 8) and
--forcecompactdb."
+anchors (Step 12); the coins-DB tip reconciliation and the VerifyDB pass over
+it; the indexes (Step 8) and -forcecompactdb."
   ;; Initialize recent rejects filter (DoS protection)
   (setf (node-recent-rejects *node*) (make-rejects-filter))
 
@@ -873,6 +911,14 @@ anchors (Step 12); the coins-DB tip reconciliation; the indexes (Step 8) and
     (log-error "Refusing to start: the UTXO set names a block this node cannot place.")
     (log-error "Recover by reindexing from the block files, or restore a backup.")
     (init-error "Unplaceable UTXO set in ~A" (node-data-directory *node*)))
+
+  ;; Core's VerifyLoadedChainstate (node/chainstate.cpp:240-276), and here for
+  ;; the same reason it is there: this is the first moment every chainstate's
+  ;; tip agrees with its coins, so a block database that disagrees with its
+  ;; UTXO set can be detected before anything acts on either. It runs after
+  ;; the reconciliation above, which is our LoadChainTip.
+  (%verify-loaded-chainstates check-blocks check-level require-full-verification
+                              reindex-chainstate)
 
   ;; Step 8 of Core's init (indexes): open every enabled index and catch it
   ;; up over the blocks already on disk before the sync thread starts.
@@ -1396,6 +1442,8 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (coinstatsindex nil)
                         (txospenderindex nil)
                         (reindex-chainstate nil)
+                        (check-blocks nil check-blocks-supplied-p)
+                        (check-level nil check-level-supplied-p)
                         (force-compact-db nil)
                         (peer-block-filters nil)
                         (tx-reconciliation nil)
@@ -1426,6 +1474,11 @@ TXINDEX: If T, enable transaction index for getrawtransaction lookups
 BLOCKFILTERINDEX: If T, enable the BIP158 basic block filter index (getblockfilter,
   scanblocks, getdescriptoractivity)
 PRUNE: Block pruning target in MiB (nil=off, 1=manual-only, >=550=automatic)
+CHECK-BLOCKS / CHECK-LEVEL: Core -checkblocks / -checklevel, the VerifyDB pass
+  that runs once the chain is loaded (defaults 6 and 3, 0 blocks = the whole
+  chain, level clamped to 0-4). Giving either is Core's
+  require_full_verification: a run that had to skip level 3 for want of
+  dbcache then refuses to start instead of warning
 RPC-PORT: Port for RPC server (nil = no RPC, default 18332 testnet / 8332 mainnet)
 RPC-BIND: Address to bind RPC server (default 127.0.0.1)
 RPC-USER: RPC authentication username (nil = no auth)
@@ -1507,7 +1560,7 @@ Returns the node instance."
   (%init-lock-and-banner network)
   (%init-load-chain network reindex)
   (%init-recover-chain reindex-chainstate)
-  (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled)
+  (%init-services network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level (or check-blocks-supplied-p check-level-supplied-p))
   (%init-peer-features-and-wallet network v2transport peer-block-filters tx-reconciliation wallet wallet-supplied-p wallet-names)
   (%finish-init-and-start-sync rpc-port startup-notify sync max-peers)
 

@@ -5192,10 +5192,14 @@ slots are (almost) full."
     (is (integerp (cdr (assoc "timemillis" r :test #'string=))))
     (is (consp (cdr (assoc "uploadtarget" r :test #'string=))))))
 
-(test rpc-verifychain-empty-node-returns-false
-  "verifychain on a node with no stored blocks returns JSON false (a bare
-Core boolean — never null)."
-  (is (eq 'yason:false (bl.rpc::rpc-verifychain (make-test-node) (list 0 1)))))
+(test rpc-verifychain-empty-node-returns-true
+  "verifychain on a node with no stored blocks returns a bare boolean, never
+null -- and the boolean is TRUE: Core's VerifyDB short-circuits to SUCCESS
+when the chain has no tip or the tip is genesis (validation.cpp:4651), so
+there is nothing to disagree about. The false answers this RPC can give are
+pinned in :verifydb-tests, over a chainstate that really does disagree with
+its blocks."
+  (is (eq t (bl.rpc::rpc-verifychain (make-test-node) (list 0 1)))))
 
 ;;; --- waitfornewblock / dumptxoutset ---
 

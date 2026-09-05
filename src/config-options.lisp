@@ -82,6 +82,14 @@
 (define-option "torcontrol" :key :tor-control :type :string)
 (define-option "torpassword" :key :tor-password :type :string :sensitive t)
 (define-option "v2transport" :key :v2transport :type :bool)
+;; -checkblocks / -checklevel: how much of the block database VerifyDB
+;; compares against the UTXO set at startup (Core init.cpp:1388-1389, read
+;; with GetIntArg, defaults DEFAULT_CHECKBLOCKS 6 and DEFAULT_CHECKLEVEL 3).
+;; Left unset they take those defaults; SET, either of them also makes Core's
+;; require_full_verification true, so a run that had to skip level 3 for want
+;; of dbcache is a startup failure instead of a warning.
+(define-option "checkblocks" :key :check-blocks :type :int)
+(define-option "checklevel" :key :check-level :type :int)
 (define-option "reindexchainstate" :key :reindex-chainstate :type :bool)
 (define-option "reindex-chainstate" :key :reindex-chainstate :type :bool)
 (define-option "forcecompactdb" :key :force-compact-db :type :bool)
@@ -435,7 +443,7 @@
   "addresstype" "alertnotify" "allowignoredconf"
   "avoidpartialspends" "blockreconstructionextratxn"
   "blocksdir" "capturemessages"
-  "changetype" "checkaddrman" "checkblockindex" "checkblocks" "checklevel"
+  "changetype" "checkaddrman" "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "dbbatchsize" "deprecatedrpc"
   "discover" "dns"

@@ -254,6 +254,7 @@ this same package."
                                (:file "transaction")
                                (:file "packages")
                                (:file "block")
+                               (:file "verifydb")
                                (:file "versionbits")
                                (:file "signet")))
                  (:module "mining"
@@ -437,6 +438,7 @@ this same package."
                              ;; Bitcoin Core sighash test vectors
                              (:file "coalton/bitcoin-core-sighash-tests")
                              ;; Chain reorganization tests
+                             (:file "validation/verifydb-tests")
                              (:file "validation/reorg-tests")
                              ;; Block validation end-to-end tests
                              (:file "validation/block-e2e-tests")
