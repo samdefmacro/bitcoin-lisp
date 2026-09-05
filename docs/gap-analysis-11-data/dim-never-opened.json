@@ -2,7 +2,7 @@
   "dimension": "never-opened",
   "findings": [
     {
-      "id": "7ed37ede",
+      "id": "6c83742d",
       "title": "Eviction netgroup secret is drawn at load time and frozen into the saved executable",
       "severity": "S1",
       "our_ref": "src/node/eviction.lisp:92 (also src/node/entropy.lisp:33, src/node/init.lisp:11-17, scripts/build-node-core.lisp:16-29, src/node/eviction.lisp:88-97 and :56-58)",
@@ -14,7 +14,7 @@
       "confidence": "executed"
     },
     {
-      "id": "3bd33136",
+      "id": "1052063f",
       "title": "VERSION user agent has neither Core's 256-byte cap nor SanitizeString, so a peer forges debug.log lines",
       "severity": "S2",
       "our_ref": "src/serialization/message-macro.lisp:114-116 (the :var-string codec row), src/serialization/messages.lisp:204 (user-agent field), src/networking/peer.lisp:1115-1116 (stored raw), src/node/listen.lisp:44-47 and src/node/peers.lisp:569 (logged raw), src/rpc/net.lisp:240 (getpeerinfo \"subver\"), src/logging.lisp:100-115 (%log-escape-message passes newline through, like Core's LogEscapeMessage)",
@@ -26,7 +26,7 @@
       "confidence": "executed"
     },
     {
-      "id": "b401c06d",
+      "id": "c537a699",
       "title": "-blocknotify fires on every connected block including IBD and reindex",
       "severity": "S2",
       "our_ref": "src/node/notify.lisp:20-28 (the :updated-block-tip hook), src/validation/block.lisp:2835 (notify-updated-block-tip fires after EVERY connect-block), src/validation/block.lisp:4016 (and after every activation step), src/logging.lisp:567-586 (run-notify-command -> uiop:launch-program, detached)",
@@ -38,7 +38,7 @@
       "confidence": "read-both-trees"
     },
     {
-      "id": "670fe529",
+      "id": "be1b5ed4",
       "title": "txospenderindex has no startup rewind, so a marker off the active chain leaves abandoned-branch spenders",
       "severity": "S3",
       "our_ref": "src/node/indexes.lisp:89-115 (catch-up-index), src/node/indexes.lisp:22-50 (index-prepare-sync methods exist for blockfilterindex and coinstatsindex ONLY), src/storage/index-base.lisp:115-121 (the default index-prepare-sync is a no-op), src/storage/txospenderindex.lisp:55-57 (index-height ignores the chainstate and returns the stored height), src/storage/txospenderindex.lisp:64-71",
@@ -50,7 +50,7 @@
       "confidence": "read-both-trees"
     },
     {
-      "id": "40a3a840",
+      "id": "4a05974e",
       "title": "P2P nonces, addrman selection and relay jitter all draw from one MT19937 stream where Core uses FastRandomContext",
       "severity": "S2",
       "our_ref": "src/node/entropy.lisp:33-61 (seed-global-random-state installs one sb-ext:seed-random-state into the global CL:*RANDOM-STATE*), and the consumers: src/serialization/messages.lisp:333 (VERSION nonce), :348 (ping nonce), :624/:648 (compact-block nonce), src/networking/peer.lisp:848 (sendtxrcncl salt), :1329/:1346/:1395/:1435, src/networking/addrman.lisp:425,508,520,521,527,532,575,595 (new/tried bucket + position selection, acceptance probability, GetAddr shuffle), src/networking/protocol.lisp:1100,2630,2871,3205 (addr-relay reservoir, response-cache jitter, Poisson timers, initial-broadcast jitter), src/mempool/mempool.lisp:1535 (mempool.dat obfuscation key)",
@@ -62,7 +62,7 @@
       "confidence": "executed"
     },
     {
-      "id": "76b5541b",
+      "id": "2cae91f5",
       "title": "define-message :var-string is Latin-1, not bytes: a wallet label above U+00FF is a TYPE-ERROR",
       "severity": "S3",
       "our_ref": "src/serialization/message-macro.lisp:114-116, src/wallet/wallet-store.lisp:96 and :340 (define-wdb-value string), src/wallet/wallet.lisp:664-680 (wallet-set-address-book writes the label through wdb-string-value), src/wallet/wallet.lisp:1104-1107 (read back), src/rpc/server.lisp:1090 (hunchentoot raw-post-data :force-text t decodes the JSON body as UTF-8)",
@@ -74,7 +74,7 @@
       "confidence": "executed"
     },
     {
-      "id": "1a98b2df",
+      "id": "d9ca7c2f",
       "title": "A boolean wire field is true only for the byte 1; Core treats every nonzero byte as true",
       "severity": "S3",
       "our_ref": "src/serialization/message-macro.lisp:109 (the :bool codec row), src/serialization/messages.lisp:206-210 (the version message's relay flag repeats the same (= ... 1) test in its :read form), src/serialization/messages.lisp:604-610 (parse-sendcmpct-payload)",
