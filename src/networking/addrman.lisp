@@ -48,6 +48,19 @@ specific buckets); falls back to the Lisp PRNG only if /dev/urandom is absent."
         (dotimes (i 32) (setf (aref k i) (random 256))))
     k))
 
+(defun random-siphash-key ()
+  "A fresh per-process SipHash key as (K0 . K1), two 64-bit words drawn from
+the OS CSPRNG -- Core's `CSipHasher(m_k0, m_k1)' salts, each drawn once from a
+FastRandomContext at start-up (txrequest.cpp:107-110, net.cpp nSeed0/nSeed1).
+
+Drawn by a FUNCTION, never a toplevel initform: an initform is evaluated at
+LOAD time, so it would be frozen into a saved image and every process started
+from that binary would share one 'per-process secret'."
+  (let ((k (make-addrman-key)))
+    (flet ((word (offset)
+             (loop for i below 8 sum (ash (aref k (+ offset i)) (* 8 i)))))
+      (cons (word 0) (word 8)))))
+
 (defun make-bucket-table (n-buckets)
   "A flat fixnum table for N-BUCKETS × bucket-size, all slots empty (-1)."
   (make-array (* n-buckets +addrman-bucket-size+)

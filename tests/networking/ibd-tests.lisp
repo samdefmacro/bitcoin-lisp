@@ -2417,6 +2417,91 @@ however many rounds it ran and the cap never bound it at all."
                (tx-request-announcement-peers last-hash :completed t)))
     (bl.net:reset-tx-requests)))
 
+(defun %w9-request-winner (hash order peers)
+  "The index in PEERS of the announcer the scheduler grants HASH to when the
+announcements arrive in ORDER and every delay has elapsed. Announced as
+txid-based entries with a wtxid-relay peer connected, so EVERY announcement
+carries TXID_RELAY_DELAY and none is granted at announcement time -- the
+scheduler makes the choice, which is what is under test."
+  (bl.net:reset-tx-requests)
+  (dolist (p order) (bl.net:tx-request-wanted-p hash p nil 1))
+  (backdate-tx-announcements hash)
+  (bl.net:process-tx-requests)
+  (position (tx-request-in-flight-peer hash) peers))
+
+(test tx-request-candidate-is-a-salted-hash-not-the-announcement-order
+  "Core's PriorityComputer is SipHash(k0, k1, txhash || peer) >> 1 with the
+preferred bit in bit 63, and the highest priority wins (txrequest.cpp:112-118,
+:595-624). The winner is therefore uniform over the candidates, different for
+each transaction, and unpredictable without the node's salt.
+
+Selecting preferred-then-earliest-ready instead handed the choice to the
+announcer: whoever announced first won EVERY transaction, so an attacker
+racing the network's announcements held every GETDATA_TX_INTERVAL window it
+could rather than a random share of them."
+  (let ((peers (loop repeat 5 collect (%make-peer-with-state :ready)))
+        (hashes (loop for i below 200 collect (%w9-hash (+ 700000 i)))))
+    (with-tx-request-salt (#x0123456789abcdef #xfedcba9876543210)
+      (let* ((rotated (append (cddr peers) (subseq peers 0 2)))
+             (in-order (mapcar (lambda (h) (%w9-request-winner h peers peers))
+                               hashes))
+             (in-rotated-order
+               (mapcar (lambda (h) (%w9-request-winner h rotated peers))
+                       hashes))
+             (moved (count nil (mapcar #'eql in-order in-rotated-order)))
+             (distinct (length (remove-duplicates in-order))))
+        ;; The decisive one: rotating the announcement order moves no winner.
+        ;; Before the port every winner moved with the order, exactly.
+        (is (= 0 moved)
+            "~D of ~D winners moved when the announcement order rotated"
+            moved (length hashes))
+        ;; And the choice really varies with the transaction rather than
+        ;; landing on one peer -- the positive control that the priority is
+        ;; not simply constant.
+        (is (>= distinct 4)
+            "only ~D of 5 announcers ever won over ~D transactions: ~S"
+            distinct (length hashes)
+            (loop for i below 5 collect (count i in-order)))
+        ;; A fixed salt makes it reproducible; a different salt re-ranks.
+        (is (equal in-order
+                   (mapcar (lambda (h) (%w9-request-winner h peers peers))
+                           hashes)))
+        (let ((other (with-tx-request-salt (#xdeadbeefcafef00d #x0f1e2d3c4b5a6978)
+                       (mapcar (lambda (h) (%w9-request-winner h peers peers))
+                               hashes))))
+          (is (not (equal in-order other))
+              "a different node salt must produce a different ranking"))))
+    (bl.net:reset-tx-requests)))
+
+(test tx-request-preferred-announcers-outrank-every-other
+  "The preferred flag is bit 63 of the priority, so an outbound announcer
+beats every inbound one whatever the txhash -- Core's \"restrict to preferred
+peers if any exist, then pick uniformly at random among them\"
+(txrequest.h:66-72)."
+  (let* ((inbound (loop repeat 4 collect
+                        (bl.net:make-peer :address "test" :state :ready
+                                                    :inbound t)))
+         (outbound (%make-peer-with-state :ready))
+         (peers (append inbound (list outbound))))
+    (with-tx-request-salt (#x0123456789abcdef #xfedcba9876543210)
+      (let ((wins (loop for i below 30
+                        count (eql 4 (%w9-request-winner
+                                      (%w9-hash (+ 800000 i))
+                                      ;; the preferred peer announces LAST,
+                                      ;; so order cannot be what elects it
+                                      peers peers)))))
+        (is (= 30 wins)
+            "the preferred announcer won ~D of 30" wins)))
+    ;; Control: with the preferred peer removed the inbound ones do win, so
+    ;; the count above is the preferred bit and not a dead fixture.
+    (with-tx-request-salt (#x0123456789abcdef #xfedcba9876543210)
+      (let ((winners (loop for i below 30
+                           collect (%w9-request-winner
+                                    (%w9-hash (+ 800000 i))
+                                    inbound inbound))))
+        (is (>= (length (remove-duplicates winners)) 2))))
+    (bl.net:reset-tx-requests)))
+
 (test tx-request-expiry-completes-the-timed-out-announcement
   "A request that burns the whole GETDATA_TX_INTERVAL completes the
 announcement rather than deleting it (Core SetTimePoint -> MakeCompleted,
