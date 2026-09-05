@@ -199,6 +199,61 @@ advice in a spelling no caller matching Core could find."
                                                     "gettransaction for wallet transactions."))
       (bl.rpc:dispatch-rpc-method node "getrawtransaction" (list txid)))))
 
+(defun %genesis-coinbase-txid-hex (network)
+  "The hex txid of NETWORK's genesis coinbase, read from the genesis block
+itself: a one-transaction block's merkle root IS its coinbase's txid."
+  (bl.rpc:hash-to-hex
+   (bl.ser:block-header-merkle-root
+    (bl.ser:bitcoin-block-header (bl.store:make-genesis-block network)))))
+
+(test getrawtransaction-refuses-the-genesis-coinbase
+  "Core refuses the genesis block coinbase outright, with -5 and its own
+sentence, before it parses the verbosity or resolves the blockhash
+(rawtransaction.cpp:288-293, `hash == Params().GenesisBlock().hashMerkleRoot').
+The comparison is against THIS chain's genesis merkle root, so the answer is
+per network -- testnet4's coinbase carries a different pszTimestamp and hashes
+differently -- and a node must not refuse another chain's genesis coinbase.
+
+Without the branch the caller gets whichever not-found message this node's
+txindex configuration selects, and naming the genesis block hash as the third
+argument answers \"No such transaction found in the provided block\" for a
+transaction that is in that block."
+  (let ((message (concatenate 'string
+                              "The genesis block coinbase is not considered an "
+                              "ordinary transaction and cannot be retrieved")))
+    (dolist (network '(:mainnet :testnet3 :testnet4 :signet :regtest))
+      (let ((node (make-test-node :network network)))
+        (signals-rpc-error (:code -5 :exact-message message)
+          (bl.rpc:dispatch-rpc-method
+           node "getrawtransaction" (list (%genesis-coinbase-txid-hex network))))
+        (signals-rpc-error (:code -5 :exact-message message)
+          (bl.rpc:dispatch-rpc-method
+           node "getrawtransaction" (list (%genesis-coinbase-txid-hex network) 2)))))
+    ;; The hashes Core asserts for its own genesis blocks
+    ;; (kernel/chainparams.cpp:137, 263, 379, 519, 637), so this test is not
+    ;; comparing the implementation with itself. testnet4 is the one that
+    ;; differs, and it is the control for "the comparison is per chain": a
+    ;; mainnet node treats that txid as an ordinary unknown transaction.
+    (dolist (network '(:mainnet :testnet3 :signet :regtest))
+      (is (string= "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+                   (%genesis-coinbase-txid-hex network))
+          "wrong genesis merkle root for ~A" network))
+    (is (string= "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"
+                 (%genesis-coinbase-txid-hex :testnet4)))
+    (signals-rpc-error (:code -5 :message "No such mempool transaction")
+      (bl.rpc:dispatch-rpc-method
+       (make-test-node :network :mainnet) "getrawtransaction"
+       (list (%genesis-coinbase-txid-hex :testnet4))))
+    ;; The blockhash argument is not a way in either.
+    (with-network (:regtest)
+      (let ((node (regtest-node-fixture "grtx-genesis")))
+        (signals-rpc-error (:code -5 :exact-message message)
+          (bl.rpc:dispatch-rpc-method
+           node "getrawtransaction"
+           (list (%genesis-coinbase-txid-hex :regtest) 0
+                 (bl.rpc:hash-to-hex
+                  (bl.store:best-block-hash (bl:node-chain-state node))))))))))
+
 (test json-rpc-parse-invalid-json
   "Test parsing invalid JSON returns parse error"
   (signals bl.rpc:rpc-error

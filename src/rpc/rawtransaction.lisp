@@ -27,6 +27,32 @@ WHOLE string: rpc_rawtransaction.py:129 asserts the no-txindex variant in
 full, so the suffix is not decoration."
   (concatenate 'string reason ". Use gettransaction for wallet transactions."))
 
+(defun %genesis-coinbase-txid (network)
+  "NETWORK's genesis block merkle root, in internal byte order.
+
+The genesis block carries exactly one transaction, so its merkle root IS that
+coinbase's txid -- the value Core compares the requested hash against
+(rawtransaction.cpp:290, `hash == Params().GenesisBlock().hashMerkleRoot').
+Computed per network from the real coinbase (bl.store:make-genesis-block):
+testnet4's pszTimestamp differs, so its root does too."
+  (bl.ser:block-header-merkle-root
+   (bl.ser:bitcoin-block-header (bl.store:make-genesis-block network))))
+
+(defun %refuse-genesis-coinbase (node txid-str)
+  "Core's special exception for the genesis block coinbase
+(rawtransaction.cpp:288-293): -5, with no lookup attempted anywhere.
+
+It runs before the verbosity and the blockhash argument are read, and it is
+not an optimisation -- the genesis coinbase is in no index and in no UTXO set,
+so without it the caller gets whichever not-found message this node's txindex
+configuration happens to select, and a caller who names the genesis block hash
+as the third argument is told the transaction is not in a block that contains
+it."
+  (when (equalp (parse-hex-hash txid-str)
+                (%genesis-coinbase-txid (rpc-get-network node)))
+    (error 'rpc-error :code +rpc-invalid-address-or-key+
+                      :message "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved")))
+
 (defun %getrawtransaction-in-block (node block-entry txid verbose prevouts)
   "getrawtransaction's answer when the caller named a block: the transaction
 comes from THAT block or the call fails.
@@ -64,10 +90,12 @@ complete) tx hex — Core's EncodeHexTx; 1 (or true) the decoded object; 2 adds
 the fee and each input's prevout for a CONFIRMED transaction
 (rawtransaction.cpp:346-371).
 With a blockhash the answer comes from that block alone; without one, the
-mempool first and then the txindex (if enabled)."
+mempool first and then the txindex (if enabled). The genesis block coinbase is
+refused before any of that (rawtransaction.cpp:288-293)."
   (unless (valid-hex-hash-p txid-str)
     (error 'rpc-error :code +rpc-invalid-parameter+
                       :message "Invalid transaction id"))
+  (%refuse-genesis-coinbase node txid-str)
   (when (and blockhash-hint (not (valid-hex-hash-p blockhash-hint)))
     (error 'rpc-error :code +rpc-invalid-parameter+
                       :message "Invalid blockhash"))
