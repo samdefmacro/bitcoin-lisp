@@ -668,7 +668,13 @@
   charges its key count against the 201-op budget the moment it reads
   it, before any verification. CheckPubKeyEncoding runs for EVERY
   signature, an empty one included, so an ill-encoded key fails under
-  STRICTENC with no signature to check at all.
+  STRICTENC with no signature to check at all. Both CHECKSIG paths --
+  legacy/P2WSH and P2WPKH -- run ONE encoding check in Core's order
+  (`check-checksig-encodings'): DER, then low-S, then the hashtype byte,
+  and only then the pubkey arms, STRICTENC before WITNESS_PUBKEYTYPE.
+  Low-S is an ENCODING rule, decided before any pubkey is looked at and
+  before the verify; the P2WPKH path decides the pubkey encoding inside
+  the CHECKSIG, as Core does, not ahead of the program match.
   The transaction version and the spent amount are SIGNED
   slots -- that is what the wire format reads back -- while Core streams
   them as raw words, so the BIP 143 and BIP 341 preimages write their bit

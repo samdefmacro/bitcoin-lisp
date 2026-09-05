@@ -2045,15 +2045,15 @@ encoded it separately and disagreed above 75 bytes."
 
   ;; Empty signature: nothing to parse, and NULLFAIL is gated on a non-empty
   ;; signature (interpreter.cpp:341), so the only verdict left is "did not
-  ;; verify". The PUBKEY ENCODING is still checked: Core's
-  ;; CheckSignatureEncoding merely answers true for an empty signature
-  ;; (interpreter.cpp:186-188) and EvalChecksigPreTapscript goes straight on to
-  ;; CheckPubKeyEncoding (:335), so under STRICTENC an ill-encoded key fails
-  ;; PUBKEYTYPE whatever the signature is. Returning a plain NIL here made
-  ;; `<0x00> <bad key> CHECKSIG NOT' succeed for us and fail for Core.
+  ;; verify". The ENCODING CHECKS still run: Core's CheckSignatureEncoding
+  ;; merely answers true for an empty signature (interpreter.cpp:186-188) and
+  ;; EvalChecksigPreTapscript goes straight on to CheckPubKeyEncoding (:335),
+  ;; so under STRICTENC an ill-encoded key fails PUBKEYTYPE whatever the
+  ;; signature is. Returning a plain NIL here made `<0x00> <bad key> CHECKSIG
+  ;; NOT' succeed for us and fail for Core.
   (when (zerop (length sig-bytes))
     (return-from verify-checksig
-      (values nil (check-pubkey-encoding pubkey-bytes))))
+      (values nil (check-checksig-encodings sig-bytes pubkey-bytes))))
 
   ;; Extract sighash type from signature (last byte)
   (let* ((sighash-type (aref sig-bytes (1- (length sig-bytes))))
@@ -2064,29 +2064,11 @@ encoded it separately and disagreed above 75 bytes."
                          (flag-enabled-p "STRICTENC")
                          (flag-enabled-p "LOW_S"))))
 
-    ;; DERSIG/STRICTENC/LOW_S: Check DER format BEFORE anything else
-    ;; This ensures we error on bad DER even with empty pubkey
-    (when strict-der
-      (unless (check-der-signature-format der-sig)
-        (return-from verify-checksig (values nil :sig-der))))
-
-    ;; Empty pubkey - with STRICTENC, this is a format error
-    (when (zerop (length pubkey-bytes))
-      (if (flag-enabled-p "STRICTENC")
-          (return-from verify-checksig (values nil :pubkeytype))
-          (return-from verify-checksig (values nil nil))))
-
-    ;; STRICTENC: signature hashtype byte must be valid (part of Bitcoin Core's
-    ;; CheckSignatureEncoding; pubkey encoding is checked just below).
-    (when (and (flag-enabled-p "STRICTENC")
-               (not (valid-sighash-type-p sighash-type)))
-      (return-from verify-checksig (values nil :sig-hashtype)))
-
-    ;; Pubkey encoding (STRICTENC / WITNESS_PUBKEYTYPE) — Bitcoin Core
-    ;; CheckPubKeyEncoding. Shared with the CHECKMULTISIG path.
-    (let ((pk-err (check-pubkey-encoding pubkey-bytes)))
-      (when pk-err
-        (return-from verify-checksig (values nil pk-err))))
+    ;; CheckSignatureEncoding then CheckPubKeyEncoding, in Core's order and
+    ;; through the one implementation of both (interpreter.cpp:336-339).
+    (let ((enc-err (check-checksig-encodings sig-bytes pubkey-bytes)))
+      (when enc-err
+        (return-from verify-checksig (values nil enc-err))))
 
     ;; CONST_SCRIPTCODE's OP_CODESEPARATOR rule is not checked here: Core keeps
     ;; it in EvalScript's opcode loop, not in EvalChecksigPreTapscript, so it
@@ -2194,20 +2176,62 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 ;;; CHECKMULTISIG Support
 ;;; ============================================================
 
-(defun check-pubkey-encoding (pubkey-bytes)
-  "Mirror Bitcoin Core CheckPubKeyEncoding (interpreter.cpp): under STRICTENC
-the pubkey must be a valid compressed/uncompressed encoding; under
+(defun check-pubkey-encoding (pubkey-bytes &optional (witness-v0 *witness-v0-mode*))
+  "Mirror Bitcoin Core CheckPubKeyEncoding (interpreter.cpp:218-227): under
+STRICTENC the pubkey must be a valid compressed/uncompressed encoding; under
 WITNESS_PUBKEYTYPE in a witness-v0 context it must be compressed. Returns an
 error keyword (:pubkeytype / :witness-pubkeytype) or NIL when the encoding is
-acceptable (or the flags are off)."
+acceptable (or the flags are off).
+
+The arms are in Core's order and the STRICTENC one is first, which is
+observable: a pubkey that is neither compressed nor uncompressed is
+PUBKEYTYPE, not WITNESS_PUBKEYTYPE. WITNESS-V0 is Core's sigversion argument,
+defaulting to the dynamic *WITNESS-V0-MODE* the P2WSH executor binds; the
+P2WPKH path has no such binding and passes it explicitly."
   (cond
     ((and (flag-enabled-p "STRICTENC")
           (not (valid-pubkey-format-p pubkey-bytes)))
      :pubkeytype)
-    ((and *witness-v0-mode*
+    ((and witness-v0
           (flag-enabled-p "WITNESS_PUBKEYTYPE")
           (not (is-compressed-pubkey-p pubkey-bytes)))
      :witness-pubkeytype)))
+
+(defun check-checksig-encodings (sig-bytes pubkey-bytes
+                                 &optional (witness-v0 *witness-v0-mode*))
+  "Core's CheckSignatureEncoding + CheckPubKeyEncoding pair, in the order
+EvalChecksigPreTapscript runs them (interpreter.cpp:336-339) -- one `if\', both
+before CheckECDSASignature. Returns an error keyword or NIL.
+
+CheckSignatureEncoding (interpreter.cpp:202-216) is three arms in this order:
+an empty signature passes; then DERSIG|LOW_S|STRICTENC require a valid DER
+encoding (SIG_DER); then LOW_S requires a low S (SIG_HIGH_S); then STRICTENC
+requires a defined hashtype byte (SIG_HASHTYPE). The LOW_S arm therefore
+decides BEFORE the pubkey is looked at and before any verification: our
+witness path used to reach it only through the verify, and both paths ran the
+pubkey arms first, so a high-S signature with a badly encoded key was reported
+as PUBKEYTYPE where Core reports SIG_HIGH_S.
+
+The LOW_S verdict is the same call the verify path makes
+(BL.CRYPTO:CHECK-SIGNATURE-ENCODING with the same arguments), so only its
+position changes; CACHED-VERIFY-ECDSA still runs its own, which is what keeps
+the signature-cache key free of script flags."
+  (unless (zerop (length sig-bytes))
+    (let ((der-sig (subseq sig-bytes 0 (1- (length sig-bytes))))
+          (strict-der (or (flag-enabled-p "DERSIG")
+                          (flag-enabled-p "STRICTENC")
+                          (flag-enabled-p "LOW_S"))))
+      (when (and strict-der (not (check-der-signature-format der-sig)))
+        (return-from check-checksig-encodings :sig-der))
+      (when (and (flag-enabled-p "LOW_S")
+                 (eq :high-s (nth-value 1 (bl.crypto:check-signature-encoding
+                                           der-sig :strict strict-der :low-s t))))
+        (return-from check-checksig-encodings :sig-high-s))
+      (when (and (flag-enabled-p "STRICTENC")
+                 (not (valid-sighash-type-p
+                       (aref sig-bytes (1- (length sig-bytes))))))
+        (return-from check-checksig-encodings :sig-hashtype))))
+  (check-pubkey-encoding pubkey-bytes witness-v0))
 
 (defun verify-checkmultisig (sigs pubkeys script-pubkey)
   "Verify m-of-n multisig. SIGS and PUBKEYS are lists of byte arrays.
@@ -2618,12 +2642,11 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
   "Verify a CHECKSIG operation for witness input using BIP 143 sighash.
    Returns (values result error-type)."
   ;; Empty signature: as in VERIFY-CHECKSIG, Core's CheckSignatureEncoding
-  ;; passes it and CheckPubKeyEncoding still runs (interpreter.cpp:335).
-  ;; WITNESS_PUBKEYTYPE is already applied by the P2WPKH caller, which is the
-  ;; only one that reaches here, so this is CheckPubKeyEncoding's STRICTENC arm.
+  ;; passes it and CheckPubKeyEncoding still runs (interpreter.cpp:335), so
+  ;; the pair below decides on the pubkey alone.
   (when (zerop (length sig-bytes))
     (return-from verify-checksig-witness
-      (values nil (check-pubkey-encoding pubkey-bytes))))
+      (values nil (check-checksig-encodings sig-bytes pubkey-bytes t))))
 
   (let* ((sighash-type (aref sig-bytes (1- (length sig-bytes))))
          (der-sig (subseq sig-bytes 0 (1- (length sig-bytes))))
@@ -2632,28 +2655,14 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
                          (flag-enabled-p "STRICTENC")
                          (flag-enabled-p "LOW_S"))))
 
-    ;; DER format check
-    (when strict-der
-      (unless (check-der-signature-format der-sig)
-        (return-from verify-checksig-witness (values nil :sig-der))))
-
-    ;; Empty pubkey check
-    (when (zerop (length pubkey-bytes))
-      (if (flag-enabled-p "STRICTENC")
-          (return-from verify-checksig-witness (values nil :pubkeytype))
-          (return-from verify-checksig-witness (values nil nil))))
-
-    ;; WITNESS_PUBKEYTYPE: witness requires compressed pubkeys
-    (when (flag-enabled-p "WITNESS_PUBKEYTYPE")
-      (unless (is-compressed-pubkey-p pubkey-bytes)
-        (return-from verify-checksig-witness (values nil :witness-pubkeytype))))
-
-    ;; STRICTENC validation
-    (when (flag-enabled-p "STRICTENC")
-      (unless (valid-sighash-type-p sighash-type)
-        (return-from verify-checksig-witness (values nil :sig-hashtype)))
-      (unless (valid-pubkey-format-p pubkey-bytes)
-        (return-from verify-checksig-witness (values nil :pubkeytype))))
+    ;; CheckSignatureEncoding then CheckPubKeyEncoding, in Core's order and
+    ;; through the same implementation the legacy path uses. T is Core's
+    ;; sigversion argument: everything here is SigVersion::WITNESS_V0, which
+    ;; is what makes the WITNESS_PUBKEYTYPE arm apply -- and it applies AFTER
+    ;; the STRICTENC one, where this function had it first.
+    (let ((enc-err (check-checksig-encodings sig-bytes pubkey-bytes t)))
+      (when enc-err
+        (return-from verify-checksig-witness (values nil enc-err))))
 
     ;; Compute BIP 143 sighash. scriptCode as-is — v0 never strips
     ;; codeseparator bytes (see verify-checksig's v0 branch); for the
@@ -2687,10 +2696,13 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
 
   (let ((sig (first witness))
         (pubkey (second witness)))
-    ;; WITNESS_PUBKEYTYPE: pubkey must be compressed
-    (when (flag-enabled-p "WITNESS_PUBKEYTYPE")
-      (unless (is-compressed-pubkey-p pubkey)
-        (return-from validate-p2wpkh (values nil :witness-pubkeytype))))
+    ;; No pubkey-encoding check here. Core builds the P2PKH scriptCode and
+    ;; runs it (interpreter.cpp:1938-1946), so both STRICTENC and
+    ;; WITNESS_PUBKEYTYPE are decided inside the CHECKSIG below --
+    ;; CheckPubKeyEncoding, after CheckSignatureEncoding and after the
+    ;; program's OP_EQUALVERIFY. A copy of the WITNESS_PUBKEYTYPE rule here
+    ;; ran before both and answered WITNESS_PUBKEYTYPE for keys Core calls
+    ;; PUBKEYTYPE.
 
     ;; Verify HASH160(pubkey) == program
     (let ((pubkey-hash (bl.crypto:hash160 pubkey)))
