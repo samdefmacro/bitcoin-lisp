@@ -37,7 +37,7 @@ the exact set (same whole-set MuHash) and the same chain tip."
    (let* ((tag (format nil "rbld~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
      (let ((bl:*node* node))
-       (bl.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
+       (generate-regtest-blocks node 8)
        (let* ((cs (bl:node-chain-state node))
               (utxo (bl:node-utxo-set node))
               (tip (bl.store:current-height cs))
@@ -82,7 +82,7 @@ blocks + index intact, chainstate DB wiped)."
    (let* ((tag (format nil "recov~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
      (let ((bl:*node* node))
-       (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
+       (generate-regtest-blocks node 5)
        (let* ((utxo (bl:node-utxo-set node))
               (truth (bl.store:compute-utxo-set-muhash utxo)))
          ;; Nuke the coins view entirely, then reindex.
@@ -105,7 +105,7 @@ recovered to exactly the height the coins DB last committed."
    (let ((tag (format nil "crashr~D" (get-internal-real-time))))
      (multiple-value-bind (node cspath) (%reindex-node-fixture tag)
        (let ((bl:*node* node))
-         (bl.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
+         (generate-regtest-blocks node 8)
          (let* ((cs (bl:node-chain-state node))
                 (flushes 0)
                 ;; Budget 0 => size trigger after EVERY replayed block, so
@@ -151,7 +151,7 @@ loaded as live state."
    (let* ((tag (format nil "crashw~D" (get-internal-real-time)))
           (node (%reindex-node-fixture tag)))
      (let ((bl:*node* node))
-       (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
+       (generate-regtest-blocks node 5)
        (let* ((cs (bl:node-chain-state node))
               (utxo (bl:node-utxo-set node))
               (genesis (bl.store:chain-state-genesis-hash cs)))
@@ -172,3 +172,107 @@ loaded as live state."
                         :base-path (bl.store::chain-state-base-path cs))))
            (is (eq t (bl.store:load-state reload)))
            (is (= 0 (bl.store:current-height reload)))))))))
+
+;;;; The interrupted reindex must not resurrect the pre-reindex tip.
+;;;;
+;;;; GA11 bbf6e679 (S1). The coins DB's best-block pointer used to survive the
+;;;; reindex wipe (only 'C' keys were deleted), so after a crash between the
+;;;; wipe and the first replay flush the node started at genesis with an empty
+;;;; set -- correct -- and then RECONCILE-COINS-DB-BEST-BLOCK read the standing
+;;;; pointer, placed it, moved chainstate.dat FORWARD to the pre-reindex tip and
+;;;; logged "Recovered". Every UTXO-set answer was then an empty set at that
+;;;; height, and the first competing fork marked the honest chain :invalid.
+;;;; Core cannot reach it: -reindex-chainstate destroys the whole coins LevelDB
+;;;; (node/chainstate.cpp:93, dbwrapper.cpp:39-41), DB_BEST_BLOCK lives inside
+;;;; the coin batch (txdb.cpp:128,159), and is_coinsview_empty skips LoadChainTip
+;;;; over an empty view (node/chainstate.cpp:69-70).
+
+(test reindex-crash-before-first-flush-restarts-at-genesis
+  "End to end through bl:start-node: mine, run the reindex prefix, die before
+the first replay flush, restart with no flags. The node must come back AT
+GENESIS with an empty UTXO set -- never at the pre-reindex tip."
+  (let ((base (merge-pathnames (format nil "test-reindex-crash-~D/"
+                                       (get-internal-real-time))
+                               (uiop:temporary-directory))))
+    (ensure-directories-exist base)
+    (unwind-protect
+         (progn
+           ;; A chain on disk, committed by a clean shutdown.
+           (bl.net:reset-ibd-stop)
+           (bl:start-node :data-directory base :network :regtest :sync nil
+                          :rpc-port nil :listen nil :console-log nil)
+           (generate-regtest-blocks bl:*node* 8)
+           (is (= 8 (bl.store:current-height (bl:node-chain-state bl:*node*))))
+           (bl:stop-node)
+           ;; Restart, then reproduce do-reindex-chainstate's prefix (rewind to
+           ;; genesis with the marker, wipe) and die with nothing flushed --
+           ;; exactly what a killed process leaves behind.
+           (bl.net:reset-ibd-stop)
+           (bl:start-node :data-directory base :network :regtest :sync nil
+                          :rpc-port nil :listen nil :console-log nil)
+           (let ((cs (bl:node-chain-state bl:*node*))
+                 (utxo (bl:node-utxo-set bl:*node*)))
+             (is (= 8 (bl.store:current-height cs)))
+             (is (= 40000000000 (bl.store:utxo-set-total-amount utxo)))
+             (bl.store:update-chain-tip
+              cs (bl.store:chain-state-genesis-hash cs) 0)
+             (bl.store:save-state cs :in-transition t)
+             (bl.store:coins-view-cache-wipe utxo)
+             ;; The emptied database names no block: that is the invariant.
+             (is (null (bl.store:coins-view-db-best-block
+                        (bl.store:coins-view-cache-base utxo))))
+             (bl.store:close-chainstate-coins-view cs)
+             (bl::unlock-data-directory)
+             (setf bl:*node* nil))
+           ;; Ordinary restart, no flags.
+           (bl.net:reset-ibd-stop)
+           (bl:start-node :data-directory base :network :regtest :sync nil
+                          :rpc-port nil :listen nil :console-log nil)
+           (let ((cs (bl:node-chain-state bl:*node*))
+                 (utxo (bl:node-utxo-set bl:*node*)))
+             (is (= 0 (bl.store:current-height cs))
+                 "the node re-advanced onto the pre-reindex tip over an empty set")
+             (is (equalp (bl.store:chain-state-genesis-hash cs)
+                         (bl.store:best-block-hash cs)))
+             (is (= 0 (bl.store:utxo-set-total-amount utxo)))
+             (is (null (bl.store:coins-view-db-best-block
+                        (bl.store:coins-view-cache-base utxo)))))
+           (bl:stop-node))
+      (progn
+        (ignore-errors (when bl:*node* (bl:stop-node)))
+        (bl.net:reset-ibd-stop)
+        (ignore-errors (uiop:delete-directory-tree
+                        base :validate t :if-does-not-exist :ignore))))))
+
+(test reconcile-never-places-a-pointer-over-an-empty-utxo-set
+  "A datadir an OLDER build left in the bad shape -- coins gone, pointer still
+naming the old tip -- must not be reconciled toward. Core's is_coinsview_empty
+(node/chainstate.cpp:69-70) skips LoadChainTip over an empty view; ours leaves
+chainstate.dat where the recovery put it and says a rebuild is needed."
+  (with-network (:regtest)
+    (let* ((tag (format nil "recempty~D" (get-internal-real-time)))
+           (node (%reindex-node-fixture tag)))
+      (let ((bl:*node* node))
+        (generate-regtest-blocks node 5)
+        (let* ((cs (bl:node-chain-state node))
+               (utxo (bl:node-utxo-set node))
+               (tip (bl.store:best-block-hash cs)))
+          (bl.store:coins-view-cache-flush utxo :sync t)
+          ;; The pre-fix on-disk shape, rebuilt by hand: every coin gone, the
+          ;; pointer re-stamped at the old tip, chainstate.dat still at genesis
+          ;; where the interrupted-reindex recovery left it.
+          (bl.store:coins-view-cache-wipe utxo)
+          (bl.store:coins-view-cache-sync utxo :sync t :best-block tip)
+          (is (equalp tip (bl.store:coins-view-db-best-block
+                           (bl.store:coins-view-cache-base utxo))))
+          (bl.store:update-chain-tip
+           cs (bl.store:chain-state-genesis-hash cs) 0)
+          (let ((bl::*chainstates-reset-to-genesis* '()))
+            (is (eq :empty (bl::reconcile-coins-db-best-block node))))
+          (is (= 0 (bl.store:current-height cs)))
+          ;; And the ordering guard: a chainstate the interrupted-reindex
+          ;; branch has just reset is skipped outright, whatever the pointer
+          ;; says, so the later recovery cannot undo the earlier one.
+          (let ((bl::*chainstates-reset-to-genesis* (list cs)))
+            (is (eq :reset (bl::reconcile-coins-db-best-block node))))
+          (is (= 0 (bl.store:current-height cs))))))))

@@ -323,15 +323,38 @@ Mirrors CCoinsViewCache::SpendCoin (coins.cpp:153)."
 
 (defun coins-view-cache-wipe (cache)
   "Empty the entire UTXO set: drop the in-memory cache (discarding any dirty
-entries -- the caller is rebuilding from scratch) and erase every coin from
-the base LevelDB. Used only by chainstate reindex. Returns the base count
-erased."
+entries -- the caller is rebuilding from scratch), forget the block the coins
+corresponded to, and erase the coins AND the best-block pointer from the base
+LevelDB. Used only by chainstate reindex. Returns the base count erased.
+
+Clearing the cache's own pointer is half of the same invariant the base wipe
+carries (see COINS-VIEW-DB-ERASE-ALL-COINS): an empty UTXO set names no block,
+so a flush that happens before the rebuild has re-applied anything cannot
+re-stamp the pre-wipe tip over the empty database."
   (declare (type coins-view-cache cache))
   (clrhash (cvc-entries cache))
   (setf (cvc-dirty-count cache) 0
         (cvc-fresh-count cache) 0
-        (cvc-mem-bytes cache) 0)
+        (cvc-mem-bytes cache) 0
+        (cvc-best-block cache) nil)
   (coins-view-db-erase-all-coins (cvc-base cache)))
+
+(defun coins-view-empty-p (view)
+  "T iff VIEW currently holds no unspent coin at all.
+
+Core asks this as `CoinsTip().GetBestBlock().IsNull()` (is_coinsview_empty,
+node/chainstate.cpp:69-70) and skips LoadChainTip under it, so an empty coins
+database leaves the chain at genesis instead of adopting a tip it has no coins
+for. Ours asks the coins directly, because a database written by a build whose
+reindex wipe kept the pointer can be empty and still name a block."
+  (etypecase view
+    (utxo-set (zerop (hash-table-count (utxo-set-entries view))))
+    (coins-view-cache
+     ;; A tombstone (entry NIL) is a coin the cache has SPENT, so it counts
+     ;; toward emptiness rather than against it.
+     (and (loop for ce being the hash-values of (cvc-entries view)
+                never (ce-entry ce))
+          (not (coins-view-db-any-coin-p (cvc-base view)))))))
 
 (defvar *persist-block-index-hook* nil
   "Thunk that durably writes the block index, installed by the node; NIL for a

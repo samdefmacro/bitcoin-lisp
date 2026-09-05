@@ -239,6 +239,7 @@ src/storage/.")
    #:coins-view-cache-uncache
    #:with-coins-to-uncache
    #:coins-view-best-block
+   #:coins-view-empty-p
    #:coins-view-db-best-block
    #:coins-view-cache-load-best-block
    #:coins-view-batch-set-best-block

@@ -431,9 +431,13 @@
   neither DIRTY nor FRESH, since FRESH claims the base view has no such
   coin and the sync just wrote it there; the block index reaches disk
   BEFORE the coins pointer that names one of its entries, which is what
-  `*persist-block-index-hook*` is for; and the restart scan ENUMERATES
-  the blk/rev files that exist instead of counting from 0, because
-  pruning deletes the lowest-numbered pair first and leaves a hole.
+  `*persist-block-index-hook*` is for; an EMPTIED coins database names no
+  block, because the reindex wipe erases the best-block pointer with the
+  coins and nothing reconciles a tip record toward an empty view (Core's
+  is_coinsview_empty, node/chainstate.cpp:69-70); and the restart scan
+  ENUMERATES the blk/rev files that exist instead of counting from 0,
+  because pruning deletes the lowest-numbered pair first and leaves a
+  hole.
 
   Traps: `prune-old-blocks` takes its byte target as an argument because
   the node halves it while a historical chainstate exists -- storage

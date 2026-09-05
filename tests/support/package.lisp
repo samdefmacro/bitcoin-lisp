@@ -58,6 +58,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:make-forged-body-block
    #:make-two-coinbase-block
    #:regtest-node-fixture
+   #:generate-regtest-blocks
    #:activate-block-base-path
    #:make-activate-block-fixture
    #:build-and-connect

@@ -23,7 +23,7 @@ set's txout count and total amount."
      (let ((bl:*node* node))
        ;; Mine spendable coinbases, then a chain of blocks. Coinbase outputs on
        ;; regtest raw(51) are spendable, so this builds a non-trivial UTXO set.
-       (bl.rpc::rpc-generatetodescriptor node (list 8 "raw(51)"))
+       (generate-regtest-blocks node 8)
        (let* ((cs (bl:node-chain-state node))
               (store (bl:node-block-store node))
               (utxo (bl:node-utxo-set node))
@@ -61,7 +61,7 @@ height's MuHash is retrievable and distinct from its predecessor."
   (with-network (:regtest)
    (let ((node (regtest-node-fixture (format nil "csih~D" (get-internal-real-time)))))
      (let ((bl:*node* node))
-       (bl.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
+       (generate-regtest-blocks node 4)
        (let* ((cs (bl:node-chain-state node))
               (store (bl:node-block-store node))
               (tip (bl.store:current-height cs))
@@ -104,7 +104,7 @@ stats from the index (muhash equal to the direct whole-set muhash at the tip)."
       (bl.store:network-genesis-hash :regtest))
      (let ((bl:*node* node))
        ;; The connect hook fires as generatetodescriptor connects each block.
-       (bl.rpc::rpc-generatetodescriptor node (list 6 "raw(51)"))
+       (generate-regtest-blocks node 6)
        (let* ((csi (bl:node-coinstatsindex node))
               (cs (bl:node-chain-state node))
               (utxo (bl:node-utxo-set node))
@@ -139,7 +139,7 @@ the spendable coinbase reward outputs."
   (with-network (:regtest)
    (let ((node (regtest-node-fixture (format nil "unsp~D" (get-internal-real-time)))))
      (let ((bl:*node* node))
-       (bl.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
+       (generate-regtest-blocks node 5)
        (let ((utxo (bl:node-utxo-set node))
              (unspendable-found 0)
              (total 0))
@@ -205,7 +205,7 @@ coinstats index built over them, installed on the node. Call inside
          (idxbase (merge-pathnames (format nil "test-csi-rw-~A/" tag)
                                    (uiop:temporary-directory))))
     (let ((bl:*node* node))
-      (bl.rpc::rpc-generatetodescriptor node (list blocks "raw(51)")))
+      (generate-regtest-blocks node blocks))
     (let* ((cs (bl:node-chain-state node))
            (csi (bl.store:init-coinstatsindex idxbase :enabled t)))
       (bl.store:build-coinstatsindex
