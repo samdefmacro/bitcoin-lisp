@@ -581,6 +581,53 @@ zero element's POSITION in the witness is exercised too."
     (is-false (bl.val:ms-satisfy
                node (bl.val:make-ms-satisfier)))))
 
+(test multi-a-satisfaction-signs-the-keys-backwards-and-seeds-empty
+  "multi_a's dynamic program is NOT multi's with a different opcode. Core keeps
+them as separate arms (miniscript.h:1259-1284 against :1285-1310) because three
+things differ, and each one is a witness that looks right and does not spend:
+
+  - the keys are signed in REVERSE order, since CHECKSIG reads the FIRST key's
+    signature off the top of the stack and CHECKMULTISIG reads it from the
+    bottom;
+  - sats[0] starts EMPTY, because there is no CHECKMULTISIG off-by-one element
+    to absorb;
+  - each key contributes one element either way, so a dissatisfied key leaves
+    an empty vector in its place rather than nothing.
+
+The exact stacks below are Core's, tie-break included: where signing the
+current key and dissatisfying it cost the same, operator| keeps the stack that
+dissatisfies it, so 2-of-3 with all three keys signs the LAST two."
+  (let* ((k1 "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
+         (k2 "03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556")
+         (k3 "023c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1")
+         (empty (make-array 0 :element-type '(unsigned-byte 8)))
+         (two-of-three (format nil "multi_a(2,~A,~A,~A)" k1 k2 k3)))
+    (flet ((sat (expr keys &optional (ctx :tapscript))
+             (bl.val:ms-satisfy (bl.val:ms-parse expr :ctx ctx)
+                                (%ms-satisfier :keys keys))))
+      ;; All three keys: signatures for K3 and K2, and the empty slot on top,
+      ;; where OP_CHECKSIG reads K1's.
+      (is (equalp (list (%ms-fake-sig 3) (%ms-fake-sig 2) empty)
+                  (sat two-of-three (list k1 k2 k3))))
+      ;; K1 and K3, so the empty slot is K2's, in the MIDDLE. Signature 2 here
+      ;; is K3's -- the satisfier numbers by the list it was given.
+      (is (equalp (list (%ms-fake-sig 2) empty (%ms-fake-sig 1))
+                  (sat two-of-three (list k1 k3))))
+      ;; Below the threshold there is no satisfaction, rather than a short one.
+      (is-false (sat (format nil "multi_a(2,~A,~A)" k1 k2) (list k1)))
+      ;; The seed: 1-of-2 costs two elements either way, but multi_a's zero is
+      ;; the UNUSED KEY'S slot at the top while multi's is CHECKMULTISIG's
+      ;; dummy at the bottom -- and the key each signs with differs with it.
+      (is (equalp (list (%ms-fake-sig 2) empty)
+                  (sat (format nil "multi_a(1,~A,~A)" k1 k2) (list k1 k2))))
+      (is (equalp (list empty (%ms-fake-sig 1))
+                  (sat (format nil "multi(1,~A,~A)" k1 k2) (list k1 k2) :p2wsh)))
+      ;; The DISSATISFACTION is one empty vector per key, reached here through
+      ;; an or_b whose other branch is the one that can be satisfied.
+      (is (equalp (list (%ms-fake-sig 1) empty empty)
+                  (sat (format nil "or_b(multi_a(1,~A,~A),a:multi_a(1,~A))" k1 k2 k3)
+                       (list k3)))))))
+
 ;;; --- Inference: script bytes back to a miniscript -----------------------------
 
 (test every-corpus-script-round-trips-through-inference-in-tapscript

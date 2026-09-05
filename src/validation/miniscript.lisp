@@ -1581,6 +1581,42 @@ letting the size comparison pick it."
                (dotimes (i (ms-node-k node))
                  (setf nsat (ms-stack+ nsat (ms-stack-zero))))
                (res (nth (ms-node-k node) sats) nsat))))
+          (:multi-a
+           ;; The same dynamic program as :MULTI, and three things differ --
+           ;; exactly the three that a copy of :MULTI gets wrong (Core
+           ;; miniscript.h:1259-1284 against :1285-1310):
+           ;;
+           ;; - the keys are signed in REVERSE order, because CHECKSIG reads
+           ;;   the FIRST key's signature off the TOP of the stack while
+           ;;   CHECKMULTISIG reads it from the bottom;
+           ;; - SATS[0] starts EMPTY, not as one zero, because there is no
+           ;;   CHECKMULTISIG off-by-one element to absorb;
+           ;; - every step appends something for the current key -- its
+           ;;   signature or a zero -- so the stack carries exactly one
+           ;;   element per key, and dissatisfying is signing none of them.
+           (let* ((keys (ms-node-keys node))
+                  (nkeys (length keys))
+                  (sats (list (ms-stack-empty))))
+             (dotimes (i nkeys)
+               (let ((sig (%ms-sig-stack sat (nth (- nkeys 1 i) keys)))
+                     (next '()))
+                 (push (ms-stack+ (first sats) (ms-stack-zero)) next)
+                 (loop for j from 1 below (length sats)
+                       do (push (ms-stack-or
+                                 (ms-stack+ (nth j sats) (ms-stack-zero))
+                                 (ms-stack+ (nth (1- j) sats) sig))
+                                next))
+                 (push (ms-stack+ (car (last sats)) sig) next)
+                 (setf sats (nreverse next))))
+             ;; Core CHECK_NONFATAL(node.k != 0) plus assert(k < sats.size()).
+             ;; Neither the parser nor the decoder can build such a node, and
+             ;; answering SATS[0] for k = 0 would hand a caller the
+             ;; DISSATISFACTION as though it were a spend.
+             (let ((k (ms-node-k node)))
+               (unless (and (plusp k) (< k (length sats)))
+                 (internal-error "multi_a threshold ~D outside its ~D keys"
+                                 k nkeys))
+               (res (nth k sats) (first sats)))))
           (:thresh
            ;; SATS[j] is the best stack satisfying j of the subexpressions seen
            ;; so far, walking them in REVERSE because the witness is built
