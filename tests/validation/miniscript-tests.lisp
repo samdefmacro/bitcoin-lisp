@@ -24,14 +24,24 @@
 (defun %ms-flag (vector name)
   (and (member name (gethash "flags" vector) :test #'string=) t))
 
-(defun %ms-try-parse (expr)
-  "Parse EXPR, returning NIL if it is not even well-formed. An expression that
-parses but does not type is a node, not an error — the caller distinguishes."
-  (handler-case (bl.val:ms-parse expr)
+(defun %ms-try-parse (expr &optional (ctx :p2wsh))
+  "Parse EXPR in CTX, returning NIL if it is not even well-formed. An expression
+that parses but does not type is a node, not an error — the caller
+distinguishes."
+  (handler-case (bl.val:ms-parse expr :ctx ctx)
     (bl.val:miniscript-parse-error () nil)
     ;; Some invalid vectors are malformed in ways that surface as ordinary
     ;; errors (a wrapper letter that does not exist, a bad argument count).
     (error () nil)))
+
+;;; The node accessors these tests read back are internal to BL.VAL, so each
+;;; is reached ONCE, here, rather than once per assertion.
+
+(defun %ms-frag (node) (bl.val::ms-node-fragment node))
+(defun %ms-subs (node) (bl.val::ms-node-subs node))
+(defun %ms-keys (node) (bl.val::ms-node-keys node))
+(defun %ms-threshold (node) (bl.val::ms-node-k node))
+(defun %ms-top-level-p (node) (bl.val::ms-node-valid-top-level-p node))
 
 (test miniscript-validity-matches-core-s-corpus
   "Which expressions type, and which do not."
@@ -46,7 +56,7 @@ parses but does not type is a node, not an error — the caller distinguishes."
              (node (%ms-try-parse expr))
              (got-valid (and node
                              (bl.val:ms-node-valid-p node)
-                             (bl.val::ms-node-valid-top-level-p node))))
+                             (%ms-top-level-p node))))
         (unless (eq (and got-valid t) expect-valid)
           (push (format nil "~A: expected ~:[invalid~;valid~], got ~:[invalid~;valid~]"
                         expr expect-valid got-valid)
@@ -85,7 +95,7 @@ rather than just the four base types."
              (node (and (%ms-flag v "VALID")
                         (not (%ms-flag v "P2WSH_INVALID"))
                         (%ms-try-parse expr))))
-        (when (and node (bl.val::ms-node-valid-top-level-p node))
+        (when (and node (%ms-top-level-p node))
           (unless (eq (and (bl.val:ms-node-non-malleable-p node) t)
                       (%ms-flag v "NONMAL"))
             (push expr nonmal))
@@ -106,10 +116,10 @@ rather than just the four base types."
 represents them as their expansions, so anything walking the tree sees only
 canonical forms. If they were kept as distinct fragments, every consumer would
 have to know about them."
-  (flet ((frag (expr) (bl.val::ms-node-fragment
+  (flet ((frag (expr) (%ms-frag
                        (bl.val:ms-parse expr)))
-         (subfrags (expr) (mapcar #'bl.val::ms-node-fragment
-                                  (bl.val::ms-node-subs
+         (subfrags (expr) (mapcar #'%ms-frag
+                                  (%ms-subs
                                    (bl.val:ms-parse expr)))))
     (let ((key "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65"))
       ;; pk(K) = c:pk_k(K)
@@ -133,11 +143,11 @@ have to know about them."
 often still types, so it has to be checked directly."
   (let* ((key "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
          (node (bl.val:ms-parse (format nil "vc:pk_k(~A)" key))))
-    (is (eq :wrap-v (bl.val::ms-node-fragment node)))
-    (let ((inner (first (bl.val::ms-node-subs node))))
-      (is (eq :wrap-c (bl.val::ms-node-fragment inner)))
-      (is (eq :pk-k (bl.val::ms-node-fragment
-                     (first (bl.val::ms-node-subs inner))))))))
+    (is (eq :wrap-v (%ms-frag node)))
+    (let ((inner (first (%ms-subs node))))
+      (is (eq :wrap-c (%ms-frag inner)))
+      (is (eq :pk-k (%ms-frag
+                     (first (%ms-subs inner))))))))
 
 (test miniscript-verify-wrapper-converts-rather-than-appending
   "`v:' is free on an expression whose last opcode has a -VERIFY form — Core
@@ -564,7 +574,7 @@ zero element's POSITION in the witness is exercised too."
                               (cond ((equalp hash (first hashes)) (first pres))
                                     ((equalp hash (second hashes)) (second pres))))))
          (witness (bl.val:ms-satisfy node sat)))
-    (is-true (bl.val::ms-node-valid-top-level-p node))
+    (is-true (%ms-top-level-p node))
     (is (= 3 (length witness)))
     (is-true (%ms-verify-p2wsh script witness 100000))
     ;; With no preimages at all, below the threshold: no satisfaction.
@@ -572,6 +582,123 @@ zero element's POSITION in the witness is exercised too."
                node (bl.val:make-ms-satisfier)))))
 
 ;;; --- Inference: script bytes back to a miniscript -----------------------------
+
+(test every-corpus-script-round-trips-through-inference-in-tapscript
+  "The tapscript half of Core's round trip. Test() runs EVERY fixed_tests
+vector through both converters (miniscript_tests.cpp:485-489, wsh_converter
+and tap_converter) and asserts a byte-exact FromScript round trip in each, so
+the P2WSH test below is only half the oracle.
+
+It is the only check that reaches the decoder's tapscript arms at all: a
+tapscript leaf writes its keys x-only, so a 33-byte push is not a key there and
+a 32-byte one is. Before those arms existed every vector holding a key inferred
+NIL here while the P2WSH half stayed green."
+  (let ((checked 0) (bad '()))
+    (dolist (v (%ms-vectors))
+      (let ((expr (gethash "ms" v)))
+        (when (and (%ms-flag v "VALID") (not (%ms-flag v "TAPSCRIPT_INVALID")))
+          (let ((node (%ms-try-parse expr :tapscript)))
+            (when (and node (%ms-top-level-p node))
+              (incf checked)
+              (let* ((script (bl.val:ms-node-script node))
+                     (back (bl.val:ms-from-script script :ctx :tapscript)))
+                (cond
+                  ((null back) (push (format nil "~A: not inferred" expr) bad))
+                  ((not (equalp script (bl.val:ms-node-script back)))
+                   (push (format nil "~A: re-compiled differently" expr) bad)))))))))
+    (is (= 56 checked)
+        "expected 56 tapscript-inferable corpus vectors, checked ~D" checked)
+    (is (null bad) "~{~A~^~%~}" (reverse bad))))
+
+(test tapscript-multi-a-decodes-into-its-keys-and-threshold
+  "multi_a is BIP342's replacement for CHECKMULTISIG, and Core decodes it with
+an arm of its own (miniscript.h:2394-2420) that walks
+  <x1> CHECKSIG (<xi> CHECKSIGADD)* <k> NUMEQUAL
+from the NUMEQUAL end. Reading backwards sees the LAST key first, so the
+recovered order is the one Core reaches through std::reverse — an order that
+decides which signature the witness has to carry for which key."
+  (let* ((k1 "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
+         (k2 "03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556")
+         (k3 "023c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1")
+         (expr (format nil "multi_a(2,~A,~A,~A)" k1 k2 k3))
+         (script (bl.val:ms-node-script (bl.val:ms-parse expr :ctx :tapscript)))
+         (back (bl.val:ms-from-script script :ctx :tapscript)))
+    (is-true back "a multi_a leaf script must infer")
+    (when back
+      (is (eq :multi-a (%ms-frag back)))
+      (is (= 2 (%ms-threshold back)))
+      (is (equal (list (subseq k1 2) (subseq k2 2) (subseq k3 2))
+                 (mapcar (lambda (b) (string-downcase (bl.crypto:bytes-to-hex b)))
+                         (%ms-keys back)))
+          "the keys must come back x-only and in source order")
+      (is (equalp script (bl.val:ms-node-script back))))
+    ;; One key: the chain is a single <x> CHECKSIG pair with no CHECKSIGADD.
+    (let* ((one (bl.val:ms-node-script
+                 (bl.val:ms-parse (format nil "multi_a(1,~A)" k1) :ctx :tapscript)))
+           (back1 (bl.val:ms-from-script one :ctx :tapscript)))
+      (is-true back1)
+      (when back1
+        (is (eq :multi-a (%ms-frag back1)))
+        (is (equalp one (bl.val:ms-node-script back1)))))))
+
+(test inference-reads-a-script-in-the-context-it-is-given
+  "A script is not miniscript on its own — it is miniscript IN A CONTEXT, and
+the same bytes decode differently or not at all in the other one. Core passes
+that context in (FromScript's ctx, miniscript.h:2288); inheriting whatever the
+caller's special happened to hold is how a tapscript leaf gets read with P2WSH
+rules and comes back NIL."
+  (let* ((key "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
+         (key2 "03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556")
+         (wsh-pk (bl.val:ms-node-script
+                  (bl.val:ms-parse (format nil "pk(~A)" key) :ctx :p2wsh)))
+         (tap-pk (bl.val:ms-node-script
+                  (bl.val:ms-parse (format nil "pk(~A)" key) :ctx :tapscript)))
+         (multi (bl.val:ms-node-script
+                 (bl.val:ms-parse (format nil "multi(1,~A,~A)" key key2) :ctx :p2wsh)))
+         (multi-a (bl.val:ms-node-script
+                   (bl.val:ms-parse (format nil "multi_a(1,~A,~A)" key key2)
+                                    :ctx :tapscript))))
+    ;; The key push size is the context's, both ways round.
+    (is-true (bl.val:ms-from-script wsh-pk :ctx :p2wsh))
+    (is-false (bl.val:ms-from-script wsh-pk :ctx :tapscript)
+              "a 33-byte push is not a key in tapscript")
+    (is-true (bl.val:ms-from-script tap-pk :ctx :tapscript))
+    (is-false (bl.val:ms-from-script tap-pk :ctx :p2wsh)
+              "a 32-byte push is not a key in P2WSH")
+    ;; CHECKMULTISIG does not exist in tapscript and multi_a does not exist
+    ;; outside it (miniscript.h:2375, :2397).
+    (is-true (bl.val:ms-from-script multi :ctx :p2wsh))
+    (is-false (bl.val:ms-from-script multi :ctx :tapscript))
+    (is-true (bl.val:ms-from-script multi-a :ctx :tapscript))
+    (is-false (bl.val:ms-from-script multi-a :ctx :p2wsh))
+    ;; And the default is the P2WSH one the two shipped script callers want.
+    (is-true (bl.val:ms-from-script wsh-pk))
+    (is-false (bl.val:ms-from-script tap-pk))))
+
+(test a-malformed-checksigadd-chain-is-not-a-multi-a
+  "Everything the multi_a arm refuses, each built by editing one byte of a
+script that decodes. A decoder that answered anyway would hand the satisfier a
+threshold or a key list the leaf does not have."
+  (let* ((k1 "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
+         (k2 "03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556")
+         (good (bl.val:ms-node-script
+                (bl.val:ms-parse (format nil "multi_a(1,~A,~A)" k1 k2)
+                                 :ctx :tapscript)))
+         (n (length good)))
+    (flet ((edited (index byte)
+             (let ((copy (copy-seq good)))
+               (setf (aref copy index) byte)
+               (bl.val:ms-from-script copy :ctx :tapscript))))
+      ;; The control: untouched, it decodes.
+      (is-true (bl.val:ms-from-script good :ctx :tapscript))
+      ;; k = 0 (OP_0 where OP_1 stood): Core refuses *k < 1.
+      (is-false (edited (- n 2) #x00))
+      ;; k = 3 with two keys: the chain cannot be that long.
+      (is-false (edited (- n 2) #x53))
+      ;; No OP_CHECKSIG head, so the chain never ends.
+      (is-false (edited 33 #xba))
+      ;; Truncated before the last pair.
+      (is-false (bl.val:ms-from-script (subseq good 34) :ctx :tapscript)))))
 
 (test every-corpus-script-round-trips-through-inference
   "Core's own round-trip check, over its own corpus: compile each expression to
@@ -586,7 +713,7 @@ mis-parses almost always produces a different script rather than none."
       (let ((expr (gethash "ms" v)))
         (when (and (%ms-flag v "VALID") (not (%ms-flag v "P2WSH_INVALID")))
           (let ((node (%ms-try-parse expr)))
-            (when (and node (bl.val::ms-node-valid-top-level-p node))
+            (when (and node (%ms-top-level-p node))
               (incf checked)
               (let* ((script (bl.val:ms-node-script node))
                      (back (bl.val:ms-from-script script)))
@@ -648,13 +775,13 @@ would hash it again and produce a different script."
     (is-true back)
     (is (equalp script (bl.val:ms-node-script back))
         "the inferred node must still compile to the same script")
-    (let ((inner (first (bl.val::ms-node-subs back))))
-      (is (eq :pk-h (bl.val::ms-node-fragment inner)))
+    (let ((inner (first (%ms-subs back))))
+      (is (eq :pk-h (%ms-frag inner)))
       (is (equalp (bl.crypto:hash160
                    (bl.crypto:hex-to-bytes *ms-desc-key-a*))
                   (bl.val::ms-node-data inner))
           "the node carries the hash the script committed to")
-      (is (null (bl.val::ms-node-keys inner))
+      (is (null (%ms-keys inner))
           "and no key, because the script does not contain one"))))
 
 (test non-miniscript-and-non-minimal-scripts-are-refused
