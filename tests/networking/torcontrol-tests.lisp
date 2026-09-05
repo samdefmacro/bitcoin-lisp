@@ -778,3 +778,66 @@ no retry, no disconnect)."
             (ignore-errors (bt:join-thread thread))
             (uiop:delete-directory-tree dir :validate t
                                             :if-does-not-exist :ignore)))))))
+
+;;;; ============================================================
+;;;; Self-announcement of our own local address (Core MaybeSendAddr's
+;;;; local half). It lives here because the local-address map is this
+;;;; file's fixture.
+;;;; ============================================================
+
+(defun %local-addr-deadline (peer)
+  "PEER's next self-announcement deadline (Core Peer::m_next_local_addr_send;
+0 = never announced). SETF-able so a test can make a peer due again without
+waiting out an exponential draw."
+  (bl.net::peer-next-local-addr-send peer))
+
+(defun (setf %local-addr-deadline) (ticks peer)
+  (setf (bl.net::peer-next-local-addr-send peer) ticks))
+
+(test self-announcement-is-alone-once-then-rides-the-gossip-queue
+  "Core sends only the FIRST self-announcement as its own message -- its
+comment: \"this makes sure rate-limiting with limited start-tokens doesn't
+ignore it if the first message ends up containing multiple addresses\" -- and
+PushAddress's every later one onto the peer's ordinary gossip queue, having
+first reset that peer's addr-known filter so the queue's own filter cannot
+drop the repeat (net_processing.cpp:5537-5566).
+
+Ours sent every announcement as its own message and marked the address known.
+Each repeat was therefore a lone addr arriving exactly when our 24h timer
+fired -- the correlation the batched flush exists to destroy -- and the mark
+was never lifted, so our address could never have ridden the queue at all."
+  (with-tor-globals
+    ;; Core gates the self-announcement on !IsInitialBlockDownload; the latch
+    ;; is already off here so the pass reaches the announcement at all.
+    (let ((bl.net::*cached-is-ibd* nil)
+          (ip (bl.net:ipv4-to-mapped-ipv6 1 2 3 4)))
+      (bl.net:add-local :ipv4 ip 8333 bl.net:+local-manual+)
+      (let ((peer (bl.net:make-peer :state :ready :addr-relay-enabled t
+                                    :address "192.0.2.70:8333")))
+        (%with-captured-sends (sends)
+          ;; First: its own single-address message, nothing queued.
+          (is (= 1 (bl.net:maybe-advertise-local-address (list peer) nil)))
+          (is (= 1 (length sends))
+              "the first self-announcement is its own message")
+          (is (= 0 (length (%addr-queue peer)))
+              "and does not go through the gossip queue")
+          (is (plusp (%local-addr-deadline peer)) "the ~24h timer is armed")
+          ;; Due again: the repeat is QUEUED, not sent.
+          (setf (%local-addr-deadline peer) 1)
+          (is (= 1 (bl.net:maybe-advertise-local-address (list peer) nil)))
+          (is (= 1 (length sends)) "a repeat puts nothing on the wire of its own")
+          (is (= 1 (length (%addr-queue peer)))
+              "it waits in the gossip queue with everything else")
+          ;; And the repeat survives the queue's own known-address filter,
+          ;; which is what the reset is for: mark our address known (what a
+          ;; flush of the previous one does) and it must still be queued.
+          (setf (fill-pointer (%addr-queue peer)) 0)
+          (bl:add-recent-reject
+           (bl.net:peer-known-addrs peer)
+           (bl.net::%addr-gossip-key
+            (bl.net:make-peer-address :net :ipv4 :ip ip :port 8333)))
+          (setf (%local-addr-deadline peer) 1)
+          (is (= 1 (bl.net:maybe-advertise-local-address (list peer) nil)))
+          (is (= 1 (length (%addr-queue peer)))
+              "the addr-known filter is reset first, so a peer that already ~
+               knows our address is still told again"))))))

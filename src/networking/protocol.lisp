@@ -2697,45 +2697,55 @@ have no -discover support (fDiscover permanently false), so it never fires."
                                    (local-address-network la)))
       la)))
 
-(defun %announce-local-address (peer)
-  "Send our best local address for PEER as a single-address addr/addrv2
-message; T when one actually went out. build-addr-response drops a torv3
-address for a peer without addrv2 (Core IsAddrCompatible); the sent address
-is marked into the peer's known-addrs (Core AddAddressKnown at the queue
-flush) so relay-address won't echo it back."
+(defun %announce-local-address (peer firstp)
+  "Announce our best local address for PEER (Core MaybeSendAddr's local half,
+net_processing.cpp:5547-5565); T when an announcement was actually made.
+
+The FIRST announcement on a connection is its own single-address addr/addrv2,
+for the reason Core gives: \"this makes sure rate-limiting with limited
+start-tokens doesn't ignore it if the first message ends up containing
+multiple addresses\". Every LATER one is PUSHED onto the peer's ordinary
+gossip queue instead, so it leaves with that batch on the flush's exponential
+schedule rather than as a lone message whose arrival announces, by itself,
+that our 24h timer has just fired.
+
+BUILD-ADDR-RESPONSE drops a torv3 address for a peer without addrv2 and
+PUSH-ADDRESS skips one it cannot encode, so both arms carry Core's
+IsAddrCompatible test."
   (let ((la (get-local-addr-for-peer peer)))
     (when la
-      (let* ((pa (make-peer-address
-                  :net (local-address-network la)
-                  :ip (local-address-bytes la)
-                  :port (local-address-port la)
-                  :services (local-services)
-                  :last-seen (bl.ser:get-unix-time)))
-             (msg (build-addr-response peer (list pa))))
-        (when msg
-          (bl:add-recent-reject (peer-known-addrs peer)
-                                          (%addr-gossip-key pa))
-          (when (send-message peer msg)
-            (bl:log-cat "net" "Advertising address ~A:~D to peer ~A"
-                                  (peer-address-string pa)
-                                  (peer-address-port pa)
-                                  (peer-address peer))
-            t))))))
+      (let ((pa (make-peer-address
+                 :net (local-address-network la)
+                 :ip (local-address-bytes la)
+                 :port (local-address-port la)
+                 :services (local-services)
+                 :last-seen (bl.ser:get-unix-time))))
+        (if firstp
+            (let ((msg (build-addr-response peer (list pa))))
+              (when (and msg (send-message peer msg))
+                (bl:log-cat "net" "Advertising address ~A:~D to peer ~A"
+                            (peer-address-string pa)
+                            (peer-address-port pa)
+                            (peer-address peer))
+                t))
+            (and (push-address peer pa) t))))))
 
 (defun maybe-advertise-local-address (peers chain-state)
   "Advertise our own best local address to each due addr-relay peer (Core
-MaybeSendAddr's periodic local-address push): per peer, every ~24h on an
-exponential schedule, with the first announcement due as soon as the peer is
-ready. All our announcements are their own single-address message. Core sends
-only the FIRST that way and lets the repeats ride the gossip queue, which
-needs its addr-known bloom cleared beforehand or the queue's own filter would
-drop the repeat; ours marks the address known and keeps its own message
-instead, which costs one small extra message per peer per day and never
-un-marks addresses the peer has already been told about. Eligibility matches
-our addr gossip: ready + tx-relaying. Gated on !IBD like Core; the fListen gate
-is implicit — the local-address map only gains entries while the onion
-service (which requires listening) is up. Call ~1x/second from the sync
-loop. Returns the number of peers announced to."
+MaybeSendAddr's local half, net_processing.cpp:5535-5567): per peer, every
+~24h on an exponential schedule, with the first announcement due as soon as
+the peer is ready. Only the first is its own message; the repeats ride the
+gossip queue (see %ANNOUNCE-LOCAL-ADDRESS), which is why the peer's
+addr-known filter is RESET first -- the previous announcement marked our own
+address known, and the flush's filter would silently drop the repeat.
+Core's own comment: \"if we've sent before, clear the bloom filter for the
+peer, so that our self-announcement will actually go out\"; it costs the peer
+a few re-sent gossip addresses once a day on average.
+
+Eligibility matches our addr gossip: ready + address relay enabled. Gated on
+!IBD like Core; the fListen gate is implicit -- the local-address map only
+gains entries while the onion service (which requires listening) is up. Call
+~1x/second from the sync loop. Returns the number of peers announced to."
   ;; Fast path first: an empty map is the steady state of every node without
   ;; a Tor daemon, and this runs every second — don't touch the chainstate
   ;; (initial-block-download-p) or the peer list for it. (Consequence, unlike
@@ -2753,8 +2763,13 @@ loop. Returns the number of peers announced to."
                  ;; peers (net_processing.cpp:5533).
                  (peer-addr-relay-enabled peer)
                  (<= (peer-next-local-addr-send peer) now))
-        (when (%announce-local-address peer)
-          (incf sent))
+        (let ((firstp (zerop (peer-next-local-addr-send peer))))
+          ;; The reset happens whether or not we end up with an address to
+          ;; announce, as it does in Core (it precedes GetLocalAddrForPeer).
+          (unless firstp
+            (bl:clear-recent-rejects (peer-known-addrs peer)))
+          (when (%announce-local-address peer firstp)
+            (incf sent)))
         ;; Reschedule whether or not anything was sent (Core sets
         ;; m_next_local_addr_send unconditionally once due).
         (setf (peer-next-local-addr-send peer)
