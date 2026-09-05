@@ -974,14 +974,6 @@ exactly the expressions the property exists to catch."
 
 ;;;; --- Signing a wsh(<miniscript>) output ----------------------------------
 
-(defun %ms-regtest-wif (byte)
-  "A deterministic regtest WIF, for the descriptor strings the wallet RPCs
-parse. Regtest and not mainnet: DecodeSecret reads the network's own prefix,
-so a mainnet WIF is simply not a key here."
-  (bl.crypto:private-key-to-wif
-   (make-array 32 :element-type '(unsigned-byte 8) :initial-element byte)
-   :network :regtest))
-
 (defun %ms-sign-p2wsh (expr &key (version 2) (sequence 42) (have-key t)
                                  (lock-time 0) (key-count 1) (held key-count))
   "Build a P2WSH output for EXPR, spend it with one input, and run the wallet
@@ -996,8 +988,6 @@ expressed; HAVE-KEY NIL gives it none of them."
                     collect (make-array 32 :element-type '(unsigned-byte 8)
                                            :initial-element (+ 7 i))))
          (pks (mapcar #'bl.crypto:derive-public-key sks))
-         (sk (first sks))
-         (pk (first pks))
          (node (bl.val:ms-parse
                 (apply #'format nil expr
                        (mapcar #'bl.crypto:bytes-to-hex pks))))
@@ -1019,7 +1009,6 @@ expressed; HAVE-KEY NIL gives it none of them."
               :lock-time lock-time))
          (pubmap (make-hash-table :test 'equalp))
          (keymap (make-hash-table :test 'equalp)))
-    (declare (ignorable sk pk))
     (when have-key
       (loop for s in sks
             for p in pks
@@ -1102,7 +1091,7 @@ deriveaddresses and getbalance both looked healthy -- coins the wallet counted
 as its own and could not move."
   (let ((result (descriptor-spend-e2e
                  (format nil "wsh(and_v(v:pk(~A),pkh(~A)))"
-                         (%ms-regtest-wif 11) (%ms-regtest-wif 12)))))
+                         (regtest-wif 11) (regtest-wif 12)))))
     (is-true (getf result :imported) "importdescriptors refused: ~S" result)
     (is-true (getf result :address))
     (is (= 1.0d0 (getf result :balance))

@@ -1809,7 +1809,7 @@ the wrong keys."
                   for (nil . leaf) in (bl.rpc:out-desc-tree desc)
                   for own = (funcall next leaf)
                   when own
-                    collect (list script leaf-hash control leaf
+                    collect (list script leaf-hash control
                                   (mapcar #'cdr own)))))))))
 
 (defun %wallet-sign-maps (wallet tx coins)

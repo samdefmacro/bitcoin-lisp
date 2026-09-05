@@ -352,9 +352,11 @@ byte appended (Core's CreateSchnorrSig, sign.cpp:340)."
 (defun %tr-script-path-witness (leaves amount tap-sighash-type pubmap)
   "The complete witness stack for a taproot SCRIPT-path spend, or NIL when no
 leaf can be satisfied. LEAVES is a list of
-(SCRIPT LEAF-HASH CONTROL-BLOCK LEAF-DESC LEAF-PUBKEYS) -- what TR-SPEND-DATA
-produced for this output, each entry extended with the parsed leaf descriptor
-and its pubkeys at this range index.
+(SCRIPT LEAF-HASH CONTROL-BLOCK LEAF-PUBKEYS) -- what TR-SPEND-DATA produced
+for this output, each entry extended with the leaf's pubkeys at this range
+index. The leaf DESCRIPTOR is not among them: Core satisfies a tapscript leaf
+from its script alone (SignTaprootScript, sign.cpp:528-540), so what the leaf
+was written as does not enter the signing.
 
 Core tries every leaf and keeps the SMALLEST serialized result
 (sign.cpp:601-612); so do we, because which leaf is cheapest depends on both
@@ -364,7 +366,7 @@ its script and its merkle depth and neither dominates.
 the caller -- the sighash commits to all of them."
   (let ((best nil) (best-size nil) (best-leaf nil) (best-sigs nil) (signed-by nil))
     (dolist (entry leaves)
-      (destructuring-bind (script leaf-hash control leaf pubkeys) entry
+      (destructuring-bind (script leaf-hash control pubkeys) entry
         (progn
           (setf signed-by nil)
           (let* (;; BIP341 script-path tail: the tapleaf hash, key version 0,
@@ -378,7 +380,7 @@ the caller -- the sighash commits to all of them."
             (when sighash
               (let ((satisfaction
                       (tr-leaf-satisfaction
-                       leaf pubkeys
+                       script pubkeys
                        (lambda (xonly)
                          ;; PUBMAP is keyed by the 33-byte pubkey and an x-only
                          ;; key names both parities, so both are tried. SIGN-
@@ -393,7 +395,15 @@ the caller -- the sighash commits to all of them."
                            (when sk
                              (let ((sig (%tap-sig sk sighash tap-sighash-type)))
                                (push (list xonly leaf-hash sig) signed-by)
-                               sig)))))))
+                               sig))))
+                       :check-older-fn
+                       (lambda (v) (bl.val:ms-check-older
+                                    bl.interop:*current-tx*
+                                    bl.interop:*current-input-index* v))
+                       :check-after-fn
+                       (lambda (v) (bl.val:ms-check-after
+                                    bl.interop:*current-tx*
+                                    bl.interop:*current-input-index* v)))))
                 (when satisfaction
                   (let* ((stack (append satisfaction (list script control)))
                          (size (reduce #'+ stack :key #'length)))

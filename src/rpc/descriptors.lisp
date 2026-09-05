@@ -1366,62 +1366,53 @@ its low bit, the 32-byte internal key, then the merkle path leaf-upwards."
          internal-key
          path))
 
-(defun tr-leaf-satisfaction (leaf pubkeys sigfn)
-  "The witness elements that satisfy the taproot script LEAF, or NIL when the
-available keys cannot satisfy it.
+(defun tr-leaf-satisfaction (script pubkeys sigfn &key check-older-fn check-after-fn)
+  "The witness elements that satisfy the taproot leaf SCRIPT, or NIL when the
+available keys cannot satisfy it. Core SignTaprootScript (sign.cpp:528-540).
 
-PUBKEYS is the leaf's 33-byte pubkeys in LEAF's own key-expression order (what
-the expansion produced for this range index). SIGFN is called with one 32-byte
-x-only key and returns its 64/65-byte Schnorr signature, or NIL when that key is
-not available for signing.
+Core has no per-kind table here, and neither does this any more: EVERY tapscript
+leaf is satisfied by inferring a miniscript back out of the leaf script and
+running the satisfier over it, so pk, pkh and multi_a are ordinary fragments
+rather than cases, and an arbitrary miniscript leaf -- which tr() has accepted,
+addressed and funded since the tapscript miniscript context was added -- signs
+by the same code.
 
-⚠️ Core reaches every leaf through miniscript::Satisfy on the leaf SCRIPT
-(sign.cpp:529-540). We have no tapscript miniscript, so the leaf kinds our
-tr() grammar can actually build are satisfied directly here, and anything else
-reports UNSATISFIABLE rather than guessing at a witness.
+PUBKEYS is the leaf's 33-byte pubkeys at this range index, in its own key
+order, and stands in for Core's signing provider: MiniscriptDescriptor::
+MakeScripts fills that with Hash160(XOnlyPubKey) -> key for exactly these
+(descriptor.cpp:1636), which is what a pkh() leaf's FromPKHBytes reads. SIGFN
+is called with one 32-byte x-only key and returns its 64/65-byte Schnorr
+signature, or NIL when that key is not available for signing. The two
+CHECK-*-FN are Core's TapSatisfier CheckOlder/CheckAfter, passed in because the
+transaction being built is the caller's.
 
-⚠️ The multi_a stack is REVERSED against key order, and it is worth deriving
-rather than trusting: the script is
-    <x1> CHECKSIG <x2> CHECKSIGADD ... <xn> CHECKSIGADD <k> NUMEQUAL
-and OP_CHECKSIG/OP_CHECKSIGADD each pop the signature from the TOP of the
-stack. The witness elements go on bottom-first, so x1 -- checked first --
-consumes the LAST element. A stack in key order spends nothing and, if it did,
-would spend it with the wrong signatures against the wrong keys."
-  (let ((xonly (mapcar #'key-xonly-bytes pubkeys)))
-    ;; CASE and not ECASE: an unknown leaf kind is UNSATISFIABLE, which the
-    ;; signer already reports, and not a type error surfacing as RPC -32603
-    ;; in the middle of signing. This is also the single place the satisfiable
-    ;; kinds are named -- a second list to keep in step is a leaf that becomes
-    ;; either silently unspendable or an unhandled ECASE.
-    (case (out-desc-kind leaf)
-      ;; <x> CHECKSIG
-      (:pk (let ((sig (funcall sigfn (first xonly))))
-             (when sig (list sig))))
-      ;; DUP HASH160 <hash160(x)> EQUALVERIFY CHECKSIG.
-      ;;
-      ;; ⚠️ The key goes on TOP, i.e. LAST in the element list: DUP acts on the
-      ;; stack top, so the script reads the key before the signature. Witness
-      ;; elements are pushed bottom-first, so "revealed key, then signature"
-      ;; reads the right way round in prose and the wrong way round here.
-      (:pkh (let ((sig (funcall sigfn (first xonly))))
-              (when sig (list sig (first xonly)))))
-      ((:multi-a :sortedmulti-a)
-       (let* ((keys (if (eq (out-desc-kind leaf) :sortedmulti-a)
-                        (sort (copy-list xonly) #'pubkey-lessp)
-                        xonly))
-              (threshold (out-desc-threshold leaf))
-              (empty (make-array 0 :element-type '(unsigned-byte 8)))
-              (taken 0)
-              (elements
-                (loop for key in keys
-                      collect (let ((sig (and (< taken threshold)
-                                              (funcall sigfn key))))
-                                (cond (sig (incf taken) sig)
-                                      (t empty))))))
-         ;; Exactly THRESHOLD signatures: OP_NUMEQUAL tests equality, so an
-         ;; extra valid signature fails the script just as a missing one does.
-         (when (= taken threshold)
-           (reverse elements)))))))
+The witness element ORDERS this used to write out by hand are DERIVED by the
+satisfier, and they are worth stating because each one is a witness that looks
+right and does not spend: multi_a's stack runs OPPOSITE to key order, since
+<x1> CHECKSIG <x2> CHECKSIGADD ... pops each signature off the TOP and the
+elements go on bottom-first; and pkh() reveals the key ABOVE its signature,
+since DUP acts on the stack top. TR-SCRIPT-PATH-SPENDS-VERIFY in
+tests/wallet/descriptor-tests.lisp still pins both, now through the script
+interpreter rather than against this function's own arithmetic.
+
+A malleable satisfaction is refused, which is Core's Satisfy default
+(miniscript.h:1704-1709): a third party could rewrite the witness into another
+equally valid one, changing the txid of a transaction already in flight."
+  (let ((by-hash (bl.bytes:make-octets-hash-table)))
+    (dolist (pub pubkeys)
+      (let ((xonly (key-xonly-bytes pub)))
+        (setf (gethash (bl.crypto:hash160 xonly) by-hash) xonly)))
+    (let ((node (bl.val:ms-from-script
+                 script
+                 :ctx :tapscript
+                 :pkh-resolver (lambda (hash) (gethash hash by-hash)))))
+      (when node
+        (multiple-value-bind (stack malleable)
+            (bl.val:ms-satisfy node (bl.val:make-ms-satisfier
+                                     :sign-fn sigfn
+                                     :check-older-fn check-older-fn
+                                     :check-after-fn check-after-fn))
+          (and stack (not malleable) stack))))))
 
 (defun %tr-tree-parts (desc pos keyfn track-paths)
   "The shared taproot computation behind %TR-OUTPUT-KEY and TR-SPEND-DATA, as
