@@ -275,8 +275,9 @@ above 2 it is simply 2."
 
 (defun %record-dial-attempt (node host port count-failure)
   "Stamp an addrman dial attempt for HOST:PORT — Core CConnman::ConnectNode
-calls addrman.Attempt() after the connect has been made and failed, before the
-socket is examined (net.cpp:492-497).
+calls addrman.Attempt() once the connect has RETURNED, whatever it returned,
+and before the socket is examined (net.cpp:492-497) — so a dial that SUCCEEDS
+is stamped too.
 
 We recorded attempts from exactly one place, the failure branch of
 connect-to-peers, and that function runs only at startup and when the peer
