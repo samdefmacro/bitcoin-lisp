@@ -323,8 +323,10 @@ MAX_MONEY would otherwise silently suppress all relay to this peer."
 ;;; CANDIDATE_READY are an announcement whose ready time is in the future or
 ;;; the past, REQUESTED is the *TX-IN-FLIGHT* entry naming that peer, and
 ;;; COMPLETED is the announcement's own flag. CANDIDATE_BEST is not stored --
-;;; the scheduler recomputes it, which is what %TX-REQUEST-BEST-CANDIDATE is.
-;;; The scheduler runs on a ~1s cadence rather than per SendMessages pass.
+;;; the scheduler recomputes it, which is what %TX-REQUEST-BEST-CANDIDATE is,
+;;; from the same salted priority Core sorts the ByTxHash index by
+;;; (%TX-REQUEST-PRIORITY). The scheduler runs on a ~1s cadence rather than
+;;; per SendMessages pass.
 
 (defvar *tx-in-flight* (make-hash-table :test 'equalp)
   "txid -> (peer . request-internal-real-time); at most one per txid.")
@@ -577,6 +579,50 @@ thread. Registered as *peer-disconnect-hook*."
 ;;; first): the tracker must observe every disconnect path.
 (setf *peer-disconnect-hook* #'tx-request-disconnected-peer)
 
+(defvar *tx-request-salt* nil
+  "The node-lifetime SipHash key (K0 . K1) that orders tx-request candidates
+-- Core PriorityComputer's m_k0/m_k1, two FastRandomContext draws kept for
+the life of the process (txrequest.cpp:105-110). Drawn lazily so nothing in
+start-up ordering depends on it; two threads racing the first draw is benign
+(both values are equally good). A test binds it to fix the ranking.")
+
+(defun %tx-request-salt ()
+  "The node's tx-request SipHash key, drawn from the OS CSPRNG on first use."
+  (or *tx-request-salt*
+      (setf *tx-request-salt* (random-siphash-key))))
+
+(defun %tx-request-priority (hash peer)
+  "Core's PriorityComputer (txrequest.cpp:112-118):
+
+    SipHash(k0, k1, txhash || peer) >> 1  |  preferred << 63
+
+and the HIGHEST priority wins. Two properties follow, and both are the point
+(txrequest.h:66-84). Preferred (outbound) announcers outrank every
+non-preferred one, because their bit is the most significant. Within a class
+the winner is a function of the transaction and of a per-process secret, so
+it is uniform over the candidates, DIFFERENT for each transaction, and not
+computable by anyone else.
+
+Selecting by announcement order instead -- preferred first, then earliest
+ready -- put the choice entirely in the announcer's hands: a peer that races
+the network's announcements took the request for EVERY transaction rather
+than for a random 1/(number of preferred candidates) of them, and A such
+connections held A consecutive GETDATA_TX_INTERVAL windows with no variance.
+Core models that delay as k * GETDATA_TX_INTERVAL with k hypergeometric
+precisely because the pick is random; announcement order made k its maximum,
+deterministically, at the attacker's choosing.
+
+Announcement TIME keeps its other role -- gating readiness through the
+NONPREF / TXID_RELAY / OVERLOADED delays -- and stops deciding the winner."
+  (let* ((salt (%tx-request-salt))
+         (message (concatenate '(vector (unsigned-byte 8))
+                               hash (int-to-le-bytes (peer-id peer) 8)))
+         (low-bits (ash (bl.crypto:siphash-2-4 (car salt) (cdr salt) message)
+                        -1)))
+    (if (tx-request-preferred-p peer)
+        (logior low-bits (ash 1 63))
+        low-bits)))
+
 (defun %tx-request-selectable-p (ann now)
   "Core IsSelectable (txrequest.cpp:88-92) in our two-table form: the
 announcement is not COMPLETED, its delay has passed (CANDIDATE_READY rather
@@ -585,20 +631,18 @@ than CANDIDATE_DELAYED), and its peer is still usable."
        (<= (tx-ann-ready ann) now)
        (eq (peer-state (tx-ann-peer ann)) :ready)))
 
-(defun %tx-request-best-candidate (anns now)
-  "The best selectable announcement in ANNS at NOW — preferred (outbound)
-peers first, then earliest ready time (Core GetRequestable's CANDIDATE_BEST
-selection, simplified)."
-  (let ((best nil))
+(defun %tx-request-best-candidate (hash anns now)
+  "The selectable announcement of HASH in ANNS with the highest
+%TX-REQUEST-PRIORITY at NOW — Core's CANDIDATE_BEST (GetRequestable,
+txrequest.cpp:595-624, over an index sorted by that same priority)."
+  (let ((best nil)
+        (best-priority -1))
     (dolist (ann anns best)
       (when (%tx-request-selectable-p ann now)
-        (when (or (null best)
-                  (let ((bp (tx-request-preferred-p (tx-ann-peer best)))
-                        (ap (tx-request-preferred-p (tx-ann-peer ann))))
-                    (or (and ap (not bp))
-                        (and (eq ap bp)
-                             (< (tx-ann-ready ann) (tx-ann-ready best))))))
-          (setf best ann))))))
+        (let ((priority (%tx-request-priority hash (tx-ann-peer ann))))
+          (when (> priority best-priority)
+            (setf best ann
+                  best-priority priority)))))))
 
 (defun %tx-request-schedule (hash now to-send)
   "Lock held: grant HASH to its best candidate at NOW and add the getdata inv
@@ -607,7 +651,7 @@ a request for HASH is already outstanding or no announcement is selectable —
 Core GetRequestable's CANDIDATE_BEST pick followed by RequestedTx."
   (if (gethash hash *tx-in-flight*)
       to-send
-      (let ((best (%tx-request-best-candidate (gethash hash *tx-announcers*) now)))
+      (let ((best (%tx-request-best-candidate hash (gethash hash *tx-announcers*) now)))
         (if (null best)
             to-send
             (let* ((peer (tx-ann-peer best))
@@ -1197,11 +1241,7 @@ that stands). A test binds it to fix the ranking.")
 (defun %address-relay-salt ()
   "The node's address-relay SipHash key, drawn from the OS CSPRNG on first use."
   (or *address-relay-salt*
-      (setf *address-relay-salt*
-            (let ((k (make-addrman-key)))
-              (flet ((word (offset)
-                       (loop for i below 8 sum (ash (aref k (+ offset i)) (* 8 i)))))
-                (cons (word 0) (word 8)))))))
+      (setf *address-relay-salt* (random-siphash-key))))
 
 (defun %addr-relay-hash (key)
   "Core's hash_addr = CServiceHash(0, 0)(addr) (netaddress.h:571-589): the

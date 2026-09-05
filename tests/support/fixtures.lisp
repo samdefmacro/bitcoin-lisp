@@ -182,6 +182,13 @@ branch: block availability, AddTxAnnouncement, and the getdata it triggers)."
 NOTFOUND branch -> ReceivedNotFound)."
   (bl.net::handle-notfound peer payload ctx))
 
+(defmacro with-tx-request-salt ((k0 k1) &body body)
+  "Run BODY with the node's tx-request SipHash key fixed at (K0 . K1), so the
+candidate ranking is reproducible (Core PriorityComputer's m_k0/m_k1, drawn
+once per process from a FastRandomContext)."
+  `(let ((bl.net::*tx-request-salt* (cons ,k0 ,k1)))
+     ,@body))
+
 (defmacro with-tx-relay-out-of-ibd (&body body)
   "Run BODY as a node that has LEFT initial block download. Core's TX handler
 returns before deserialising the transaction while IsInitialBlockDownload()
