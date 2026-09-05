@@ -2417,6 +2417,90 @@ however many rounds it ran and the cap never bound it at all."
                (tx-request-announcement-peers last-hash :completed t)))
     (bl.net:reset-tx-requests)))
 
+(test notfound-drains-the-serve-bucket
+  "An unsolicited response message must cost the sender something. The
+notfound handler declared no rate bucket, and check-peer-rate-limit lets any
+command whose row declares none straight through, so this was the one
+uncharged command on the tx-relay path."
+  (let ((peer (bl.net:init-peer-rate-limiters (bl.net:make-peer))))
+    ;; Positive control: the bucket starts full.
+    (is-true (bl.net:check-peer-rate-limit peer "notfound"))
+    (loop repeat 200 do (bl.net:check-peer-rate-limit peer "notfound"))
+    (is-false (bl.net:check-peer-rate-limit peer "notfound"))
+    ;; It is the SERVE bucket, shared with the other unsolicited-work
+    ;; commands, so draining it here also stops a getaddr flood.
+    (is-false (bl.net:check-peer-rate-limit peer "getaddr"))
+    ;; ...and not some other peer's, nor every bucket on this one.
+    (is-true (bl.net:check-peer-rate-limit peer "inv"))
+    (is-true (bl.net:check-peer-rate-limit
+              (bl.net:init-peer-rate-limiters (bl.net:make-peer))
+              "notfound"))))
+
+(test an-oversized-notfound-has-its-tx-items-ignored
+  "Core's NOTFOUND arm discards the tx entries of a message carrying more than
+MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER invs
+(net_processing.cpp:5150-5164): no peer can have more than that outstanding,
+so a larger message is answering nothing we asked for. Our parser allows
++MAX-INV-COUNT+ (50,000)."
+  (bl.net:reset-tx-requests)
+  (let* ((txid (%w9-hash 500001))
+         (p1 (%make-peer-with-state :ready))
+         (p2 (%make-peer-with-state :ready))
+         (limit (+ bl.net::+max-peer-tx-announcements+
+                   bl.net::+max-blocks-in-transit-per-peer+))
+         (padding (loop for i below (1- limit) collect (%w9-hash (+ 510000 i)))))
+    (is-true (bl.net:tx-request-wanted-p txid p1))
+    (is-false (bl.net:tx-request-wanted-p txid p2))
+    ;; One item over the limit: the whole tx half of the message is ignored.
+    (deliver-notfound p1 (%w9-notfound-payload (cons txid (cons txid padding)))
+                      nil)
+    (is-false (tx-request-completed-p txid p1))
+    (is (eq p1 (tx-request-in-flight-peer txid)))
+    ;; Positive control: exactly at the limit it is processed as usual.
+    (deliver-notfound p1 (%w9-notfound-payload (cons txid padding)) nil)
+    (is-true (tx-request-completed-p txid p1))
+    (is (eq p2 (tx-request-in-flight-peer txid)))
+    (bl.net:reset-tx-requests)))
+
+(test notfound-failover-costs-the-message-not-the-tracker
+  "The failover re-selects only the hashes the message named. Re-running the
+whole scheduler here turned a 61-byte notfound into a walk of every tracked
+announcement under the single tx-relay lock -- about 1 ms at the 5,000
+announcements one connection can reach by itself, 10 ms at 50,000, times the
+32 messages the pump admits per peer per pass, unauthenticated and uncharged.
+
+Counted rather than timed: %TX-REQUEST-BEST-CANDIDATE is called once per hash
+considered, and the full scheduler pass over the same tracker is the positive
+control that the counter is live and that the tracker really holds them all."
+  (bl.net:reset-tx-requests)
+  (let* ((tracked 300)
+         (inbound (bl.net:make-peer :address "test" :state :ready :inbound t))
+         (hashes (loop for i below tracked collect (%w9-hash (+ 520000 i))))
+         (considered 0)
+         (real (fdefinition 'bl.net::%tx-request-best-candidate)))
+    ;; Inbound announcements carry NONPREF_PEER_TX_DELAY, so every hash is a
+    ;; candidate the scheduler must look at rather than an in-flight request.
+    (dolist (h hashes) (bl.net:tx-request-wanted-p h inbound))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bl.net::%tx-request-best-candidate)
+                 (lambda (&rest args) (incf considered) (apply real args)))
+           (deliver-notfound inbound (%w9-notfound-payload (list (first hashes)))
+                             nil)
+           (is (= 1 considered)
+               "a one-item notfound considered ~D of ~D tracked hashes"
+               considered tracked)
+           (setf considered 0)
+           (bl.net:process-tx-requests)
+           ;; One less than TRACKED: the notfound above completed the only
+           ;; announcement of its hash, which forgets the hash entirely
+           ;; (IsOnlyNonCompleted).
+           (is (= (1- tracked) considered)
+               "the scheduler pass considered ~D of ~D tracked hashes -- the ~
+counter or the fixture is dead" considered tracked))
+      (setf (fdefinition 'bl.net::%tx-request-best-candidate) real))
+    (bl.net:reset-tx-requests)))
+
 (defun %w9-request-winner (hash order peers)
   "The index in PEERS of the announcer the scheduler grants HASH to when the
 announcements arrive in ORDER and every delay has elapsed. Announced as
