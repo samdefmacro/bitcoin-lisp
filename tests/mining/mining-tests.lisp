@@ -875,11 +875,43 @@ not active; contextual validation rejects that block as :unexpected-witness")
                   (bl.rpc:hash-to-hex
                    (bl.store:best-block-hash
                     (bl:node-chain-state node)))))
-     ;; bad descriptor + non-positive count error
+     ;; A bad descriptor errors; a count of zero does not (see
+     ;; GENERATE-ASKED-FOR-NO-BLOCKS-MINES-NONE-AND-SAYS-SO).
      (signals bl.rpc:rpc-error
-       (bl.rpc:dispatch-rpc-method node "generatetodescriptor" (list 1 "frobnicate(03ab)")))
-     (signals bl.rpc:rpc-error
-       (bl.rpc:dispatch-rpc-method node "generatetodescriptor" (list 0 "raw(51)"))))))
+       (bl.rpc:dispatch-rpc-method node "generatetodescriptor" (list 1 "frobnicate(03ab)"))))))
+
+(test generate-asked-for-no-blocks-mines-none-and-says-so
+  "Core's generateBlocks loop is `while (nGenerate > 0 && !chainman.m_interrupt)'
+(rpc/mining.cpp:169) and neither RPC checks the count before it, so
+`generatetoaddress(0, addr)' -- and a negative count -- returns the empty
+array. We answered -8 \"nblocks must be a positive integer\", which is a
+failure for a call Core treats as a request that asked for nothing: a caller
+looping over a list of counts saw an error for the empty one.
+
+The argument checks that DO run before the loop still run: Core decodes the
+destination and expands the descriptor first, so a bad address is still -5 even
+with a count of zero."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "gen-zero"))
+           (cs (bl:node-chain-state node))
+           (addr (bl.crypto:encode-p2pkh-address
+                  (make-array 20 :element-type '(unsigned-byte 8) :initial-element 3)
+                  :regtest)))
+      (dolist (count '(0 -1))
+        (is (equalp #() (bl.rpc:dispatch-rpc-method
+                         node "generatetoaddress" (list count addr))))
+        (is (equalp #() (bl.rpc:dispatch-rpc-method
+                         node "generatetodescriptor" (list count "raw(51)"))))
+        (is (= 0 (bl.store:current-height cs))))
+      ;; A count that is not an integer at all is still refused.
+      (signals-rpc-error (:code -8)
+        (bl.rpc:dispatch-rpc-method node "generatetoaddress" (list "1" addr)))
+      (signals-rpc-error (:code -8)
+        (bl.rpc:dispatch-rpc-method node "generatetodescriptor" (list nil "raw(51)")))
+      ;; Core's own order: the destination is decoded before generateBlocks.
+      (signals-rpc-error (:code -5 :exact-message "Error: Invalid address")
+        (bl.rpc:dispatch-rpc-method node "generatetoaddress" (list 0 "notanaddress")))
+      (is (= 0 (bl.store:current-height cs))))))
 
 (test submitheader-accepts-valid-rejects-orphan
   ;; A mined header whose parent is known validates and is added to the index;

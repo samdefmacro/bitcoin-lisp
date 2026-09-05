@@ -692,7 +692,11 @@ call that solved two of three blocks answers those two. Signalling instead
 threw away blocks that were already mined AND activated.
 
 The loop also gives up when the node is asked to stop (Core's
-`!chainman.m_interrupt' at the head of the same loop), returning what it has."
+`!chainman.m_interrupt' at the head of the same loop), returning what it has.
+
+NBLOCKS of zero, or negative, is that same normal result and not an error:
+Core's loop is `while (nGenerate > 0 && !chainman.m_interrupt)'
+(rpc/mining.cpp:169), so it never runs and the empty array is the answer."
   (let ((chain-state (rpc-get-chain-state node))
         (mempool (rpc-get-mempool node))
         (tries-left maxtries)
@@ -727,12 +731,12 @@ The loop also gives up when the node is asked to stop (Core's
   "Mine NBLOCKS blocks paying to ADDRESS and add them to the chain (Bitcoin Core
 generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
 [maxtries]). Returns an array of the mined block hashes (hex) -- shorter than
-NBLOCKS, and empty when MAXTRIES was 0, if the try budget ran out or the node
-is stopping."
+NBLOCKS, and empty when NBLOCKS or MAXTRIES was 0, if the try budget ran out or
+the node is stopping."
   (let ((network (bl:node-network node)))
-    (unless (and (integerp nblocks) (plusp nblocks))
+    (unless (integerp nblocks)
       (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "nblocks must be a positive integer"))
+                        :message "nblocks must be an integer"))
     (unless (stringp address)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "address must be a string"))
     (multiple-value-bind (type script-pubkey) (bl.crypto:decode-address address network)
@@ -749,12 +753,12 @@ is stopping."
 (Bitcoin Core generatetodescriptor; CPU mining, intended for regtest). PARAMS:
 (num_blocks descriptor [maxtries]). The descriptor must expand to a single
 script. Returns an array of the mined block hashes (hex) -- shorter than
-NUM-BLOCKS, and empty when MAXTRIES was 0, if the try budget ran out or the
-node is stopping."
+NUM-BLOCKS, and empty when NUM-BLOCKS or MAXTRIES was 0, if the try budget ran
+out or the node is stopping."
   (let ((network (bl:node-network node)))
-    (unless (and (integerp nblocks) (plusp nblocks))
+    (unless (integerp nblocks)
       (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "num_blocks must be a positive integer"))
+                        :message "num_blocks must be an integer"))
     (unless (stringp descriptor)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))
     ;; parse-output-descriptor signals rpc-error on a bad descriptor; take the
