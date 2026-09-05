@@ -671,6 +671,50 @@ MaybeRebalanceCaches via ActivateSnapshot)."
               (is (= (floor (* total 0.95d0))
                      (bl:chainstate-coins-cache-budget current))))))))))
 
+(test snapshot-dump-rollback-target-is-matched-by-hash
+  "GA11 b07c72f4, second half. dumptxoutset's rollback guard compared the
+hash-resolved target with the ACTIVE-CHAIN WALK by object identity, and the two
+views are only ever EQ by construction: a hash resolves through the index table
+while the walk follows prev-entry. Let one hash hold two objects -- which delta
+replay used to produce on every restart after an unclean stop -- and an
+operator's rollback to a block that IS on the active chain was refused. The
+guard now compares hashes, like ENTRY-ON-ACTIVE-CHAIN-P."
+  (with-network (:mainnet)
+   (with-temp-directory (dst-dir)
+     (multiple-value-bind (cs utxo store genesis-hash)
+         (make-activate-block-fixture "rollback-identity")
+       (let* ((bl:*prune-target-mib* nil)
+              (node (bl:make-node :network :testnet3))
+              (hashes (make-test-chain-hashes #xE7 4))
+              (h2 (second hashes))
+              (opts (make-hash-table :test 'equal)))
+         (setf (bl.store:chain-state-coins-view cs) utxo
+               (bl:node-chainstates node) (list cs)
+               (bl:node-block-store node) store)
+         (build-and-connect cs store utxo genesis-hash hashes)
+         ;; Two objects for one hash: the table gets a copy, while the child
+         ;; entries keep pointing at the original through prev-entry.
+         (let* ((original (bl.store:get-block-index-entry cs h2))
+                (copy (bl.store:make-block-index-entry
+                       :hash (bl.store:block-index-entry-hash original)
+                       :height (bl.store:block-index-entry-height original)
+                       :header (bl.store:block-index-entry-header original)
+                       :prev-entry (bl.store:block-index-entry-prev-entry original)
+                       :chain-work (bl.store:block-index-entry-chain-work original)
+                       :status (bl.store:block-index-entry-status original)
+                       :tx-count (bl.store:block-index-entry-tx-count original))))
+           (bl.store:add-block-index-entry cs copy)
+           (is (not (eq copy (bl.store:get-block-at-height cs 2)))
+               "the fixture did not actually split the two views"))
+         ;; Rollback by HASH, so the target comes out of the index table.
+         (setf (gethash "rollback" opts) (bl.rpc:hash-to-hex h2))
+         (let ((r (bl.rpc::rpc-dumptxoutset
+                   node (list (namestring (merge-pathnames "id.dat" dst-dir))
+                              "rollback" opts))))
+           (is (= 2 (cdr (assoc "base_height" r :test #'string=))))
+           (is (= 4 (bl.store:current-height cs))))
+         (clear-undo-cache))))))
+
 (test snapshot-dump-rollback-roundtrip
   "dumptxoutset with a rollback target (Core rpc/blockchain.cpp:3034-3196):
 the active chain is temporarily rolled back via invalidateblock (network

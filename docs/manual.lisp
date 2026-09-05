@@ -444,7 +444,11 @@
   snapshot it extends is a per-BASE-PATH record, not a chain-state slot:
   Core keeps the block index in BlockManager, outside any chainstate, and
   a per-chainstate copy of that binding let a snapshot chainstate and the
-  primary invalidate each other's log.
+  primary invalidate each other's log. Replaying that log MUTATES the entry
+  a hash already has -- Core's InsertBlockIndex is a try_emplace, so there
+  is exactly one object per hash and a prev-entry pointer can never
+  disagree with a lookup; installing a second object left every ancestry
+  walk handing out the superseded copy.
 
   Traps: `prune-old-blocks` takes its byte target as an argument because
   the node halves it while a historical chainstate exists -- storage

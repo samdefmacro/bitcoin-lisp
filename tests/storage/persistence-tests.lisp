@@ -875,6 +875,89 @@ a full snapshot instead."
       (is-false (bl.store::%append-header-index-delta
                  cs (list (bl.store:get-block-index-entry cs h)))))))
 
+(defun %hidx-linked-chain (cs n)
+  "N linked, positioned, :valid entries in CS's index, oldest first. The shape
+a replay has to preserve: every child's PREV-ENTRY points at the one object
+its parent's hash resolves to."
+  (let ((prev nil) (entries '()))
+    (dotimes (i n)
+      (let* ((hash (make-array 32 :element-type '(unsigned-byte 8)
+                                  :initial-element (1+ i)))
+             (e (bl.store:make-block-index-entry
+                 :hash hash :height (1+ i) :chain-work (* 10 (1+ i))
+                 :status :valid :prev-entry prev
+                 :file 0 :data-pos (* 100 (1+ i)) :undo-pos (* 10 (1+ i)))))
+        (bl.store:add-block-index-entry cs e)
+        (push e entries)
+        (setf prev e)))
+    (nreverse entries)))
+
+(defun %hidx-graph-is-single-valued-p (cs)
+  "T when no entry's PREV-ENTRY is a different object from what its parent's
+hash resolves to -- Core's InsertBlockIndex invariant, one object per hash.
+Second value: the offending entries."
+  (let ((bad '()))
+    (maphash (lambda (hash e)
+               (declare (ignore hash))
+               (let ((prev (bl.store:block-index-entry-prev-entry e)))
+                 (when (and prev
+                            (not (eq prev
+                                     (bl.store:get-block-index-entry
+                                      cs (bl.store:block-index-entry-hash prev)))))
+                   (push e bad))))
+             (bl.store:chain-state-block-index cs))
+    (values (null bad) bad)))
+
+(test header-index-delta-replay-keeps-one-object-per-hash
+  "GA11 b07c72f4. Replay must MUTATE the entry a hash already has, not install
+a second object for it -- Core's InsertBlockIndex is a try_emplace and resolves
+every pprev through the same function, so a pprev pointer and a map lookup can
+never disagree (node/blockstorage.cpp:407-421,425-426). Replay used to build a
+fresh entry per record and relink only the hashes the delta carried, so an
+unchanged CHILD kept pointing at its parent's superseded copy; every ancestry
+walk follows prev-entry, so the active-chain walk handed out the orphan while
+the hash table held the current one, and a status written through such a walk
+was invisible to the next save.
+
+The reachable producer is pruning: forget-undo-data clears file/data-pos/
+undo-pos on an OLD entry whose already-connected child has not changed since
+the last full snapshot."
+  (multiple-value-bind (cs) (%hidx-fixture "replay-identity")
+    (let* ((chain (%hidx-linked-chain cs 4))
+           (parent (second chain)))
+      (bl.store:save-header-index cs)
+      ;; Prune the height-2 body: the parent changes, its child does not.
+      (setf (bl.store:block-index-entry-file parent) nil
+            (bl.store:block-index-entry-data-pos parent) nil
+            (bl.store:block-index-entry-undo-pos parent) nil)
+      (bl.store:save-header-index cs)
+      (is-true (plusp (%hidx-size (bl.store::header-index-delta-path cs))))
+      (let ((reload (bl.store:init-chain-state
+                     (bl.store::chain-state-base-path cs))))
+        (bl.store:load-header-index reload)
+        ;; The sweep below is only worth anything over a linked graph, and a
+        ;; replay that dropped every prev-entry would pass it vacuously.
+        (is (= 3 (let ((n 0))
+                   (maphash (lambda (h e)
+                              (declare (ignore h))
+                              (when (bl.store:block-index-entry-prev-entry e)
+                                (incf n)))
+                            (bl.store:chain-state-block-index reload))
+                   n))
+            "the reloaded graph is not linked, so the identity sweep is vacuous")
+        (multiple-value-bind (ok bad) (%hidx-graph-is-single-valued-p reload)
+          (is-true ok "~D entr~:@P whose prev-entry is not the indexed object"
+                   (length bad)))
+        ;; And the walked view agrees with the indexed one about the prune.
+        (let* ((hash (bl.store:block-index-entry-hash parent))
+               (indexed (bl.store:get-block-index-entry reload hash))
+               (child (bl.store:get-block-index-entry
+                       reload (bl.store:block-index-entry-hash (third chain))))
+               (walked (bl.store:block-index-entry-prev-entry child)))
+          (is (eq indexed walked))
+          (is (null (bl.store:block-index-entry-data-pos walked))
+              "the walk still reports a data-pos for a pruned body"))))))
+
 (test header-index-absent-is-not-corruption
   "No headerindex.dat at all is a legitimate first run: NIL loaded, and NO
 reason — the caller must not confuse it with a file it cannot read, or every

@@ -989,9 +989,13 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
   (let ((target-height (bl.store:block-index-entry-height target-entry))
         (target-hash (bl.store:block-index-entry-hash target-entry)))
     ;; A hash-resolved target must lie on the active chain — Core takes
-    ;; ActiveChain().Next(target), which has no answer off-chain.
-    (unless (eq (bl.store:get-block-at-height chain-state target-height)
-                target-entry)
+    ;; ActiveChain().Next(target), which has no answer off-chain. Compared by
+    ;; HASH, as ENTRY-ON-ACTIVE-CHAIN-P does: a hash-resolved entry comes out
+    ;; of the index table and a walked one out of the prev-entry graph, so they
+    ;; are only ever EQ by construction, and an identity test refuses a block
+    ;; that IS on the active chain the moment the two views hold different
+    ;; objects for one hash.
+    (unless (bl.store:entry-on-active-chain-p chain-state target-entry)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Block is not in the active chain"))
     ;; Pruned node: rolling back needs every block in (target, tip] (and its
