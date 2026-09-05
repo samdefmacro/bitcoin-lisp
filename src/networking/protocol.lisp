@@ -1185,8 +1185,11 @@ inside the same two destinations for the day.
 The chosen peers are QUEUED to, never sent to (Core RelayAddress calls
 PushAddress and nothing else): sending here would weld the moment we pass an
 address on to the moment we learned it, which is the timing correlation the
-flush's exponential schedule exists to destroy. Returns the number of peers
-the address was actually queued on."
+flush's exponential schedule exists to destroy. Marking the ANNOUNCER as
+knowing the address is not done here either -- Core does it in the ADDR
+handler, for every address the message carried rather than only the few that
+are relayed onward (see %INGEST-GOSSIPED-ADDRESS). Returns the number of
+peers the address was actually queued on."
   (let* ((key (%addr-gossip-key peer-addr))
          (hash-addr (%addr-relay-hash key))
          ;; Core: "Adding address hash makes exact rotation time different per
@@ -1200,8 +1203,6 @@ the address was actually queued on."
              (bl.crypto:siphash-2-4 (car salt) (cdr salt)
                                     (%addr-relay-message hash-addr time-addr
                                                          peer-id))))
-      (when source-peer
-        (bl:add-recent-reject (peer-known-addrs source-peer) key))
       (let ((n-relay (if (or reachable (logbitp 0 (rank))) 2 1))
             (ranked
               (sort (loop for p in peers
@@ -1273,11 +1274,11 @@ network and address only, exactly like the ban list's own keys."
     (or (peer-discouraged-p address)
         (peer-banned-p address))))
 
-(defun %ingest-gossiped-address (net-addr timestamp address-book source-group now
-                                 &optional source-net source-ip)
+(defun %ingest-gossiped-address (peer net-addr timestamp address-book source-group
+                                 now &optional source-net source-ip)
   "Shared addr/addrv2 ingestion for one gossiped NET-ADDR (Core's per-address
-loop in the ADDR handler, net_processing.cpp:4056-4098) learned from a peer
-with net-group key SOURCE-GROUP and own address SOURCE-NET/SOURCE-IP. Stores
+loop in the ADDR handler, net_processing.cpp:4069-4104) learned from PEER,
+whose net-group key is SOURCE-GROUP and own address SOURCE-NET/SOURCE-IP. Stores
 it in ADDRESS-BOOK only when its network is REACHABLE (-onlynet; Core \"Do not
 store addresses outside our network\"), but fresh (10-min) ROUTABLE addresses
 are relay candidates regardless — an unreachable-net address still relays,
@@ -1291,14 +1292,22 @@ services bits promise no useful address DB are skipped entirely — neither
 stored nor relayed, as in Core — and so are addresses this node has banned or
 discouraged (net_processing.cpp:4094-4097).
 
-Returns (VALUES stored relay-entry): STORED is 1/0 for the caller's log count,
-RELAY-ENTRY a (peer-address . reachable) cons when the address should be
-gossiped onward -- REACHABLE being Core's fReachable argument to RelayAddress,
-which decides the fan-out."
+PEER is marked as knowing the address (Core AddAddressKnown, :4092) after the
+timestamp is fixed up and BEFORE the ban test, so a peer is never told back an
+address it has just told us, whether or not we go on to store or relay it. It
+is also the reason the mark is here and not in RELAY-ADDRESS, which only ever
+saw the small fresh-and-routable subset that gets gossiped onward.
+
+Returns (VALUES stored relay-entry processed): STORED is 1/0 for the caller's
+log count, RELAY-ENTRY a (peer-address . reachable) cons when the address
+should be gossiped onward -- REACHABLE being Core's fReachable argument to
+RelayAddress, which decides the fan-out -- and PROCESSED is Core's ++num_proc,
+true for an address that reached the relay/store stage. A banned one has not:
+Core counts it in neither num_proc nor num_rate_limit."
   (unless (and address-book timestamp
                (may-have-useful-address-db-p
                 (bl.ser:net-addr-services net-addr)))
-    (return-from %ingest-gossiped-address (values 0 nil)))
+    (return-from %ingest-gossiped-address (values 0 nil nil)))
   (let* ((time (if (or (<= timestamp +addr-time-init+)
                        (> timestamp (+ now 600)))
                    (max 0 (- now +addr-absurd-time-replacement-seconds+))
@@ -1317,13 +1326,20 @@ which decides the fan-out."
                            (equalp source-ip (peer-address-ip pa)))
                       0
                       +addr-gossip-time-penalty-seconds+)))
+    ;; Core AddAddressKnown (net_processing.cpp:4092), on the announcing peer,
+    ;; for EVERY address that got past the service filter and before the ban
+    ;; test below -- "remembering we received them" is exactly what the next
+    ;; comment means by it.
+    (when peer
+      (bl:add-recent-reject (peer-known-addrs peer) (%addr-gossip-key pa)))
     ;; Core: "Do not process banned/discouraged addresses beyond remembering we
-    ;; received them" (net_processing.cpp:4094-4097). Its `continue` skips BOTH
-    ;; the RelayAddress call and the vAddrOk push that feeds addrman, so a
-    ;; hostile address neither takes a bucket from a good one nor gets gossiped
-    ;; onward by the node that decided it was hostile.
+    ;; received them" (net_processing.cpp:4093-4096). Its `continue` skips the
+    ;; ++num_proc, the RelayAddress call and the vAddrOk push that feeds
+    ;; addrman, so a hostile address neither takes a bucket from a good one nor
+    ;; gets gossiped onward by the node that decided it was hostile -- and it
+    ;; is not reported as processed either.
     (when (address-banned-or-discouraged-p pa)
-      (return-from %ingest-gossiped-address (values 0 nil)))
+      (return-from %ingest-gossiped-address (values 0 nil nil)))
     (when reachable
       (address-book-add address-book pa source-group penalty))
     (values (if reachable 1 0)
@@ -1332,7 +1348,8 @@ which decides the fan-out."
             ;; itself relay by claiming a future time.
             (when (and (> time (- now 600))
                        (address-routable-p (peer-address-ip pa) network))
-              (cons pa reachable)))))
+              (cons pa reachable))
+            t)))
 
 (defun %refill-addr-token-bucket (peer &optional (now (get-internal-real-time)))
   "Refill PEER's addr token bucket from elapsed time, once per addr/addrv2
@@ -1379,19 +1396,29 @@ the number stored."
       ;; `rate_limited = !pfrom.HasPermission(NetPermissionFlags::Addr)`).
       (let ((rate-limited (and peer (not (peer-has-permission-p peer +perm-addr+)))))
       (dolist (entry (alexandria:shuffle (copy-list entries)))
-        (cond
-          ((and rate-limited (< (peer-addr-token-bucket peer) 1.0d0))
-           (incf num-rate-limit))
-          (t
-           (when peer
-             (decf (peer-addr-token-bucket peer) 1.0d0)
-             (incf num-proc))
-           (multiple-value-bind (stored relay)
-               (%ingest-gossiped-address (car entry) (cdr entry)
-                                         address-book source-group now
-                                         source-net source-ip)
-             (incf added stored)
-             (when relay (push relay relay-candidates)))))))
+        ;; Core's rate-limit branch verbatim (net_processing.cpp:4074-4082):
+        ;; below one token a rate-limited peer's address is dropped and
+        ;; counted, while a peer holding the Addr permission is let through
+        ;; and spends NOTHING -- only the else branch takes a token.
+        (let ((below-a-token (and peer (< (peer-addr-token-bucket peer) 1.0d0))))
+          (cond
+            ((and below-a-token rate-limited)
+             (incf num-rate-limit))
+            (t
+             (when (and peer (not below-a-token))
+               (decf (peer-addr-token-bucket peer) 1.0d0))
+             ;; num_proc counts what reached the relay/store stage, so it is
+             ;; incremented by the ingest's verdict and not here: Core's
+             ;; ++num_proc sits AFTER the service filter and the ban test
+             ;; (net_processing.cpp:4097), and counting on the way in reported
+             ;; addresses we had refused as processed.
+             (multiple-value-bind (stored relay processed)
+                 (%ingest-gossiped-address peer (car entry) (cdr entry)
+                                           address-book source-group now
+                                           source-net source-ip)
+               (incf added stored)
+               (when processed (incf num-proc))
+               (when relay (push relay relay-candidates))))))))
       (when peer
         (incf (peer-addr-processed peer) num-proc)
         (incf (peer-addr-rate-limited peer) num-rate-limit)

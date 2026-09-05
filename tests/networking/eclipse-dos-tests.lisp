@@ -382,7 +382,7 @@ m_addr_rate_limited)."
     (setf (bl.net::peer-addr-token-bucket p) 5.0d0
           (bl.net::peer-addr-token-timestamp p)
           (get-internal-real-time))
-    (let ((added (bl.net::%process-gossiped-addresses
+    (let ((added (ingest-gossiped-addresses
                   p (%addr-entries 20) 20 book nil)))
       (is (= 5 added) "only 5 addresses fit the bucket")
       (is (= 5 (bl.net:peer-addr-processed p)))
@@ -405,7 +405,7 @@ nothing is rate-limited."
     (setf (bl.net::peer-addr-token-bucket p) 1000.0d0
           (bl.net::peer-addr-token-timestamp p)
           (get-internal-real-time))
-    (let ((added (bl.net::%process-gossiped-addresses
+    (let ((added (ingest-gossiped-addresses
                   p (%addr-entries 10) 10 book nil)))
       (is (= 10 added))
       (is (= 10 (bl.net:peer-addr-processed p)))
@@ -419,12 +419,12 @@ m_getaddr_sent); a full (1000) one does not."
     (setf (bl.net::peer-addr-token-bucket p) 1000.0d0
           (bl.net::peer-getaddr-requested p) t)
     ;; Non-full announced-count clears the flag.
-    (bl.net::%process-gossiped-addresses p (%addr-entries 3) 3 book nil)
+    (ingest-gossiped-addresses p (%addr-entries 3) 3 book nil)
     (is-false (bl.net::peer-getaddr-requested p))
     ;; A full 1000-count message leaves it set (more may follow).
     (setf (bl.net::peer-getaddr-requested p) t
           (bl.net::peer-addr-token-bucket p) 1000.0d0)
-    (bl.net::%process-gossiped-addresses p (%addr-entries 3) 1000 book nil)
+    (ingest-gossiped-addresses p (%addr-entries 3) 1000 book nil)
     (is-true (bl.net::peer-getaddr-requested p))))
 
 (test getaddr-bump-exempts-solicited-response-from-bucket
@@ -441,7 +441,7 @@ net_processing.cpp:3772)."
           (get-internal-real-time))
     (incf (bl.net::peer-addr-token-bucket p)
           (coerce bl.ser:+max-addr-count+ 'double-float))
-    (let ((added (bl.net::%process-gossiped-addresses
+    (let ((added (ingest-gossiped-addresses
                   p (%addr-entries 500) 500 book nil)))
       (is (= 500 added) "solicited addresses processed under the bump")
       (is (= 0 (bl.net:peer-addr-rate-limited p))))))
@@ -508,6 +508,61 @@ socket, and the queue is where an address waits for its flush anyway."
       (bl.net:unban-address "198.51.100.41")
       (bl.net:clear-discouraged))))
 
+(test addr-ingest-counts-and-marks-what-core-does
+  "Core\'s per-address loop marks the ANNOUNCER as knowing an address right
+after the timestamp fix-up and BEFORE the ban test (AddAddressKnown,
+net_processing.cpp:4092), and reaches ++num_proc only past that test (:4097).
+We did neither. num_proc was incremented on the way in, so getpeerinfo\'s
+addr_processed counted addresses we had refused -- for their service bits, or
+for being banned -- as processed. And the announcer was marked only inside
+RELAY-ADDRESS, which sees just the fresh-and-routable few that are gossiped
+onward, so a peer could be handed back addresses it had told us a moment
+earlier, which is precisely what m_addr_known exists to prevent.
+
+Three addresses in one message: one ordinary, one banned, one whose service
+bits promise no useful address DB. Core\'s answer is addr_processed = 1, with
+the announcer marked for the first two -- the banned one is remembered as
+received, the service-refused one is skipped before the mark."
+  (bl.net:clear-discouraged)
+  (let* ((bl.net:*reachable-networks* (list :ipv4 :ipv6))
+         (book (bl.net:make-address-book))
+         (peer (bl.net:make-peer :state :ready :conn-type :outbound-full-relay
+                                 :address "192.0.2.60"))
+         (now (bl.ser:get-unix-time))
+         (clean (%gossip-net-addr (bl.net:ipv4-to-mapped-ipv6 192 0 2 61)))
+         (banned (%gossip-net-addr (bl.net:ipv4-to-mapped-ipv6 198 51 100 62)))
+         (junk (%gossip-net-addr (bl.net:ipv4-to-mapped-ipv6 203 0 113 63)
+                                 :services 0)))
+    ;; A bucket big enough that the rate limiter decides nothing here.
+    (setf (bl.net::peer-addr-token-bucket peer) 10.0d0)
+    (bl.net:ban-address "198.51.100.62" 3600)
+    (unwind-protect
+         (flet ((knows (na)
+                  (bl:recent-reject-p
+                   (bl.net:peer-known-addrs peer)
+                   (bl.net::%addr-gossip-key
+                    (bl.net:make-peer-address
+                     :net (bl.ser:net-addr-net na)
+                     :ip (bl.ser:net-addr-ip na)
+                     :port (bl.ser:net-addr-port na))))))
+           (is (= 1 (ingest-gossiped-addresses
+                     peer (list (cons clean now) (cons banned now)
+                                (cons junk now))
+                     3 book nil))
+               "only the clean address is stored")
+           (is (= 1 (bl.net:peer-addr-processed peer))
+               "addr_processed counts only what got past both the service ~
+                filter and the ban test")
+           (is (= 0 (bl.net:peer-addr-rate-limited peer))
+               "control: nothing was rate-limited, so that count is the loop\'s")
+           (is-true (knows clean)
+                    "the announcer is marked as knowing a stored address")
+           (is-true (knows banned)
+                    "and a banned one -- Core remembers we received it")
+           (is-false (knows junk)
+                     "but not one refused before AddAddressKnown ever runs"))
+      (bl.net:unban-address "198.51.100.62"))))
+
 (test handle-addr-oversized-is-misbehavior
   "An addr message announcing more than 1000 addresses is misbehavior (Core
 Misbehaving on vAddr.size() > MAX_ADDR_TO_SEND): the peer is disconnected and
@@ -551,10 +606,13 @@ through the constructor rather than derandomising production."
                                  (port 8333))
   (bl.ser:make-net-addr :services services :ip ip :port port))
 
-(defun %gossip-ingest (book net-addr timestamp now &key source-net source-ip)
-  "One address through the production ingestion path; (VALUES stored relay)."
+(defun %gossip-ingest (book net-addr timestamp now
+                       &key peer source-net source-ip)
+  "One address through the production ingestion path;
+(VALUES stored relay processed). PEER is the announcer, which the path marks
+as knowing the address (Core AddAddressKnown)."
   (bl.net::%ingest-gossiped-address
-   net-addr timestamp book nil now source-net source-ip))
+   peer net-addr timestamp book nil now source-net source-ip))
 
 (defun %gossip-last-seen (book ip &optional (port 8333))
   "Stored nTime for IP:PORT in BOOK, or NIL when absent."
@@ -650,7 +708,7 @@ self-announcement\")."
            (p (bl.net:make-peer :conn-type :outbound-full-relay
                                                  :address "198.51.100.32")))
       (setf (bl.net::peer-addr-token-bucket p) 10.0d0)
-      (bl.net::%process-gossiped-addresses
+      (ingest-gossiped-addresses
        p (list (cons (%gossip-net-addr ip) ts)) 1 book nil)
       (is (eql ts (%gossip-last-seen book ip))
           "a peer announcing its own address is not time-penalised"))))
@@ -1061,7 +1119,7 @@ unlimited addresses; everyone else spends tokens."
              ;; An EMPTY bucket, so any processing at all proves the exemption.
              (setf (bl.net::peer-addr-token-bucket p) 0d0)
              (%with-whitelist (:entries entries)
-               (bl.net::%process-gossiped-addresses
+               (ingest-gossiped-addresses
                 p addrs (length addrs) book nil))
              (bl.net:peer-addr-rate-limited p))))
     ;; Control: an empty bucket rate-limits every address.
