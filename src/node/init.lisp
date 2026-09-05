@@ -939,9 +939,9 @@ sync thread with node-running still T is a socket-reading zombie)."
   "One sub-second tick of the sync thread's wait between sync passes (Core's
 per-peer ProcessMessages / SendMessages duties, bounded): flush unsent bytes,
 pump every peer's readable messages with the full node context, run the
-tx-request scheduler, trickle announcements, rebroadcasts, the wallet resend
-timer, local-address adverts, feefilter and reconciliation rounds, and the
-at-tip liveness signal; SECOND is the whole second (1..30) this tick falls
+tx-request scheduler, trickle tx and addr announcements, rebroadcasts, the
+wallet resend timer, local-address adverts, feefilter and reconciliation
+rounds, and the at-tip liveness signal; SECOND is the whole second (1..30) this tick falls
 in, and only gates the behind-known-work exit. Returns T when the wait should
 end now: new headers arrived, or the node is behind known work and
 +BEHIND-RETRY-SECONDS+ have passed."
@@ -1010,6 +1010,15 @@ end now: new headers arrived, or the node is behind known work and
     (bl.net:maybe-advertise-local-address
      (node-peers *node*)
      (node-chain-state *node*))
+    ;; Batched addr gossip: drain each
+    ;; peer's queued relay addresses on
+    ;; its own ~30s Poisson schedule, the
+    ;; other half of Core MaybeSendAddr.
+    ;; Runs right after the self-
+    ;; advertisement, as in Core, and is
+    ;; a cheap no-op most ticks.
+    (bl.net:flush-addr-announcements
+     (node-peers *node*))
     ;; BIP133 feefilter refresh (Core
     ;; MaybeSendFeefilter on the message
     ;; loop): per-peer ~10min Poisson

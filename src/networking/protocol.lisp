@@ -1067,6 +1067,35 @@ ones, so promotion must not be a compact-block-only privilege."
   (make-address-key (peer-address-ip peer-addr) (peer-address-port peer-addr)
                     (peer-address-network peer-addr)))
 
+(defun addr-compatible-p (peer peer-addr)
+  "T when PEER can carry PEER-ADDR at all (Core IsAddrCompatible,
+net_processing.cpp:1117-1120): a peer that never negotiated addrv2 has no
+encoding for onion/i2p/cjdns, so those addresses are never selected for it and
+never queued to it."
+  (or (peer-wants-addrv2 peer)
+      (bl.ser:v1-compatible-network-p (peer-address-network peer-addr))))
+
+(defun push-address (peer peer-addr)
+  "Queue PEER-ADDR for PEER's next addr flush (Core PushAddress,
+net_processing.cpp:1128-1141). Nothing goes on the wire here — that is
+FLUSH-ADDR-ANNOUNCEMENTS's job, and the delay between the two is the point
+(see +avg-address-broadcast-interval+).
+
+Skipped for an address the peer already knows (Core: \"only to save space from
+duplicates\" — the flush filters again, because the peer can learn an address
+between the push and the flush) and for one it cannot encode. Once the queue
+holds bl.ser:+max-addr-count+ entries (Core MAX_ADDR_TO_SEND, the same 1000
+that bounds an addr message) a new address REPLACES a uniformly random one
+rather than being appended or dropped, so a peer flooding us with addresses
+cannot decide which of the queued ones we pass on."
+  (let ((queue (peer-addrs-to-send peer)))
+    (when (and (not (bl:recent-reject-p (peer-known-addrs peer)
+                                        (%addr-gossip-key peer-addr)))
+               (addr-compatible-p peer peer-addr))
+      (if (>= (fill-pointer queue) bl.ser:+max-addr-count+)
+          (setf (aref queue (random (fill-pointer queue))) peer-addr)
+          (vector-push-extend peer-addr queue)))))
+
 (defun relay-address (peer-addr source-peer peers
                       &key (now (bl.ser:get-unix-time))
                            (max-targets 2))
@@ -1080,9 +1109,14 @@ sha256(addr || day || peer-id), so the same address takes the same hops
 network-wide for a day. Core relays an address OUTSIDE our reachable set to
 only 1 peer instead of 2 (net_processing.cpp:2303) — callers pass
 :max-targets 1 for those. Per-peer dedup via the bounded known-addrs set (the
-source is marked as knowing it too). Returns the number of peers sent to."
+source is marked as knowing it too).
+
+The chosen peers are QUEUED to, never sent to (Core RelayAddress calls
+PushAddress and nothing else): sending here would weld the moment we pass an
+address on to the moment we learned it, which is the timing correlation the
+flush's exponential schedule exists to destroy. Returns the number of peers
+queued to."
   (let* ((key (%addr-gossip-key peer-addr))
-         (network (peer-address-network peer-addr))
          (day (floor now 86400))
          (sent 0))
     (when source-peer
@@ -1097,9 +1131,7 @@ source is marked as knowing it too). Returns the number of peers sent to."
                              ;; inbound peer that never sent addr/getaddr
                              ;; receives no gossip.
                              (peer-addr-relay-enabled p)
-                             (or (peer-wants-addrv2 p)
-                                 (bl.ser:v1-compatible-network-p
-                                  network)))
+                             (addr-compatible-p p peer-addr))
                      collect (cons (let* ((material (concatenate '(vector (unsigned-byte 8))
                                                                  key
                                                                  (int-to-le-bytes day 8)
@@ -1111,13 +1143,12 @@ source is marked as knowing it too). Returns the number of peers sent to."
       ;; Take the best <=MAX-TARGETS peers that don't already know the address;
       ;; count the chosen targets (Core queues to exactly its picked nodes)
       ;; rather than successful writes, so a dropped connection can't widen the
-      ;; fan-out.
+      ;; fan-out. The known-addrs mark is made by the flush, on the same pass
+      ;; that filters (Core MaybeSendAddr's addr_already_known lambda).
       (loop for (nil . p) in ranked
             while (< sent max-targets)
             unless (bl:recent-reject-p (peer-known-addrs p) key)
-              do (bl:add-recent-reject (peer-known-addrs p) key)
-                 (let ((msg (build-addr-response p (list peer-addr))))
-                   (when msg (send-message p msg)))
+              do (push-address p peer-addr)
                  (incf sent)))
     sent))
 
@@ -2580,11 +2611,13 @@ flush) so relay-address won't echo it back."
   "Advertise our own best local address to each due addr-relay peer (Core
 MaybeSendAddr's periodic local-address push): per peer, every ~24h on an
 exponential schedule, with the first announcement due as soon as the peer is
-ready. All our announcements are their own single-address message (Core only
-distinguishes the first because later ones ride its outgoing addr queue,
-which we don't have; its addr-known bloom reset before repeats is unneeded
-here because this path never consults known-addrs). Eligibility matches our
-addr gossip: ready + tx-relaying. Gated on !IBD like Core; the fListen gate
+ready. All our announcements are their own single-address message. Core sends
+only the FIRST that way and lets the repeats ride the gossip queue, which
+needs its addr-known bloom cleared beforehand or the queue's own filter would
+drop the repeat; ours marks the address known and keeps its own message
+instead, which costs one small extra message per peer per day and never
+un-marks addresses the peer has already been told about. Eligibility matches
+our addr gossip: ready + tx-relaying. Gated on !IBD like Core; the fListen gate
 is implicit — the local-address map only gains entries while the onion
 service (which requires listening) is up. Call ~1x/second from the sync
 loop. Returns the number of peers announced to."
@@ -2612,6 +2645,59 @@ loop. Returns the number of peers announced to."
         (setf (peer-next-local-addr-send peer)
               (+ now (%next-exp-interval-ticks
                       +avg-local-address-broadcast-interval+)))))))
+
+;;; Gossiped-address flush (Core MaybeSendAddr's queue half,
+;;; net_processing.cpp:5570-5604)
+
+(defconstant +avg-address-broadcast-interval+ 30
+  "Mean seconds between addr flushes to one peer (Core
+AVG_ADDRESS_BROADCAST_INTERVAL = 30s, net_processing.cpp:160). The deadline
+is redrawn from an exponential distribution after every flush, so the gap
+between an address arriving and our passing it on carries no information
+about when it arrived — the property RELAY-ADDRESS's queue exists for.")
+
+(defun %flush-peer-addrs (peer)
+  "Send PEER everything RELAY-ADDRESS queued for it as ONE addr/addrv2 message
+and empty the queue. Assumes the peer is due; FLUSH-ADDR-ANNOUNCEMENTS owns
+the schedule. Core MaybeSendAddr, net_processing.cpp:5575-5604."
+  (let ((queue (peer-addrs-to-send peer)))
+    ;; Core's Assume + resize: the push path already bounds this, so a queue
+    ;; over the cap is a bug rather than an input, and trimming recovers.
+    (when (> (fill-pointer queue) bl.ser:+max-addr-count+)
+      (setf (fill-pointer queue) bl.ser:+max-addr-count+))
+    ;; Drop what the peer has learned since the push, marking the rest known
+    ;; on the same pass — which is exactly ADD-RECENT-REJECT's contract
+    ;; (NIL when the key was already there, T once it has been inserted), so
+    ;; Core's addr_already_known lambda is one clause here.
+    (let ((fresh (loop for pa across queue
+                       when (bl:add-recent-reject (peer-known-addrs peer)
+                                                  (%addr-gossip-key pa))
+                         collect pa)))
+      (setf (fill-pointer queue) 0)
+      (let ((msg (and fresh (build-addr-response peer fresh))))
+        (when msg
+          (send-message peer msg))))))
+
+(defun flush-addr-announcements (peers)
+  "Flush due per-peer addr gossip queues (call ~1x/second from the sync loop,
+next to FLUSH-TX-ANNOUNCEMENTS). Core MaybeSendAddr, net_processing.cpp:5570-
+5573: a peer is skipped while its deadline has not passed, and the deadline is
+redrawn as an exponential with mean +avg-address-broadcast-interval+ every
+time it does — including on a pass that finds the queue empty, which is what
+arms a freshly-ready peer's first interval. Returns the number of peers a
+message actually went out to."
+  (let ((now (get-internal-real-time))
+        (sent 0))
+    (dolist (peer peers sent)
+      (when (and (eq (peer-state peer) :ready)
+                 ;; Core MaybeSendAddr's first line: nothing to do for a peer
+                 ;; without address relay (net_processing.cpp:5533).
+                 (peer-addr-relay-enabled peer)
+                 (> now (peer-next-addr-send peer)))
+        (setf (peer-next-addr-send peer)
+              (+ now (%next-exp-interval-ticks +avg-address-broadcast-interval+)))
+        (when (%flush-peer-addrs peer)
+          (incf sent))))))
 
 ;;; Transaction relay
 ;;;

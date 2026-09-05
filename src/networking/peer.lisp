@@ -120,6 +120,19 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; m_addr_known CRollingBloomFilter{5000}.
   (known-addrs (bl:make-rejects-filter 5000)
                :type bl:recent-rejects)
+  ;; Addresses waiting to be gossiped to this peer, in push order (Core
+  ;; Peer::m_addrs_to_send, net_processing.cpp:343). RELAY-ADDRESS appends
+  ;; here instead of sending; FLUSH-ADDR-ANNOUNCEMENTS empties the whole
+  ;; vector into ONE addr/addrv2 on the peer's Poisson schedule, which is
+  ;; what breaks the correlation between when we LEARNED an address and when
+  ;; we pass it on. Bounded by +max-addr-to-send+ with random replacement,
+  ;; so a flood cannot choose which addresses survive.
+  (addrs-to-send (make-array 0 :adjustable t :fill-pointer 0)
+                 :type (array t (*)))
+  ;; internal-real-time deadline of the next addr flush to this peer (Core
+  ;; Peer::m_next_addr_send, net_processing.cpp:374). 0 = due now, which is
+  ;; Core's initial value too.
+  (next-addr-send 0 :type integer)
   ;; Pending tx announcements, flushed in batches on a Poisson schedule
   ;; instead of per-tx immediate invs (Core m_tx_inventory_to_send +
   ;; m_next_inv_send_time). Entries are (txid wtxid fee-rate-per-kb),

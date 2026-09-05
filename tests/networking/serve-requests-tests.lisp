@@ -262,10 +262,51 @@ inv vectors (same shape as inv) -- the reply for unserved tx getdata."
       (is (equalp (%uniq-hash 777)
                   (bl.ser:inv-vector-hash (first parsed)))))))
 
+(defun %relay-address (peer-addr source peers &rest args)
+  "Core RelayAddress. The one reach into it in this file."
+  (apply #'bl.net::relay-address peer-addr source peers args))
+
+(defun %addr-queue (peer)
+  "PEER's pending addr gossip (Core Peer::m_addrs_to_send)."
+  (bl.net::peer-addrs-to-send peer))
+
+(defun %addr-send-deadline (peer)
+  "PEER's next addr-flush deadline (Core Peer::m_next_addr_send). SETF-able so
+a test can make a peer due without waiting out an exponential draw."
+  (bl.net::peer-next-addr-send peer))
+
+(defun (setf %addr-send-deadline) (ticks peer)
+  (setf (bl.net::peer-next-addr-send peer) ticks))
+
+(defun %flush-addrs-now (peers)
+  "Drive the shipped addr flush (Core MaybeSendAddr's queue half) with every
+peer's Poisson deadline already expired."
+  (dolist (peer peers)
+    (setf (%addr-send-deadline peer) 0))
+  (bl.net:flush-addr-announcements peers))
+
+(defmacro %with-captured-sends ((sends) &body body)
+  "Run BODY with SEND-MESSAGE recording instead of writing. SENDS is bound to a
+fill-pointer vector collecting (peer . message-bytes) in send order, which is
+what tells \"queued for later\" apart from \"already on the wire\"."
+  (let ((real (gensym "REAL")))
+    `(let ((,sends (make-array 0 :adjustable t :fill-pointer 0))
+           (,real (fdefinition 'bl.net:send-message)))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'bl.net:send-message)
+                    (lambda (peer bytes)
+                      (vector-push-extend (cons peer bytes) ,sends)
+                      t))
+              ,@body)
+         (setf (fdefinition 'bl.net:send-message) ,real)))))
+
 (test relay-address-fanout-and-dedup
   "relay-address (Core RelayAddress) forwards a fresh address to exactly 2
 eligible peers -- skipping the source, block-relay/feeler peers, and peers that
-already know it -- and marks the source + targets in their known-addrs sets."
+already know it. The source is marked at once; a target is marked when its
+outgoing queue is flushed, on the pass that filters it (Core MaybeSendAddr,
+net_processing.cpp:5582-5589)."
   (let* ((source (bl.net:make-peer :state :ready :address "9.9.9.9:8333"))
          (full (loop for i below 4
                      collect (bl.net:make-peer
@@ -280,12 +321,18 @@ already know it -- and marks the source + targets in their known-addrs sets."
               :port 8333 :services 1
               :last-seen (bl.ser:get-unix-time)))
          (key (bl.net::%addr-gossip-key pa))
-         (sent (bl.net::relay-address pa source peers)))
+         (sent (%relay-address pa source peers)))
     ;; exactly 2 targets chosen (4 eligible; source + block-relay excluded)
     (is (= 2 sent))
     ;; the source is marked as knowing the address
     (is-true (bl:recent-reject-p
               (bl.net:peer-known-addrs source) key))
+    ;; ...but no target is, yet: the address is only QUEUED to them.
+    (is (= 0 (count-if (lambda (p)
+                         (bl:recent-reject-p
+                          (bl.net:peer-known-addrs p) key))
+                       full)))
+    (%flush-addrs-now peers)
     ;; exactly 2 of the full-relay peers know it; the block-relay peer doesn't
     (is (= 2 (count-if (lambda (p)
                          (bl:recent-reject-p
@@ -295,14 +342,96 @@ already know it -- and marks the source + targets in their known-addrs sets."
                (bl.net:peer-known-addrs br) key))
     ;; relaying the same address again the same day: all targets already know
     ;; it or get deduped -- at most the remaining 2 fresh peers are picked
-    (let ((sent2 (bl.net::relay-address pa source peers)))
+    (let ((sent2 (%relay-address pa source peers)))
       (is (= 2 sent2))
+      (%flush-addrs-now peers)
       (is (= 4 (count-if (lambda (p)
                            (bl:recent-reject-p
                             (bl.net:peer-known-addrs p) key))
                          full)))
       ;; third time: everyone knows it -> nothing sent
-      (is (= 0 (bl.net::relay-address pa source peers))))))
+      (is (= 0 (%relay-address pa source peers))))))
+
+(test relay-address-queues-and-only-the-flush-sends
+  "a4680ae1 / 0c05f5d0: Core RelayAddress calls PushAddress and nothing else
+(net_processing.cpp:2325-2327, 1128-1141). The address lands in the chosen
+peer's m_addrs_to_send and waits for MaybeSendAddr's exponential deadline;
+sending inside the relay call instead welds the instant we pass an address on
+to the instant we learned it, which is the timing correlation
+AVG_ADDRESS_BROADCAST_INTERVAL exists to destroy."
+  (let* ((source (bl.net:make-peer :state :ready :address "9.9.9.9:8333"))
+         (targets (loop for i below 2
+                        collect (bl.net:make-peer
+                                 :state :ready :addr-relay-enabled t
+                                 :address (format nil "1.1.1.~D:8333" i))))
+         (peers (cons source targets))
+         (pa (%make-test-peer-address 8 0 0 1 8333)))
+    (%with-captured-sends (sends)
+      (is (= 2 (%relay-address pa source peers)))
+      (is (= 0 (length sends))
+          "relay-address must put nothing on the wire")
+      (is (= 2 (count-if (lambda (p) (plusp (length (%addr-queue p)))) targets))
+          "both chosen peers must have it queued instead")
+      ;; The flush is what sends, and it is one message per peer.
+      (%flush-addrs-now peers)
+      (is (= 2 (length sends)) "the flush sends, once per peer")
+      (is (= 0 (count-if (lambda (p) (plusp (length (%addr-queue p)))) targets))
+          "and empties the queues it sent"))))
+
+(test addr-flush-batches-its-queue-into-one-message
+  "Core MaybeSendAddr flushes the WHOLE accumulated vector as ONE addr/addrv2
+(net_processing.cpp:5592-5599). Three separately-relayed addresses reach a
+peer as one message carrying three entries, not as three messages."
+  (let* ((source (bl.net:make-peer :state :ready :address "9.9.9.9:8333"))
+         (target (bl.net:make-peer :state :ready :addr-relay-enabled t
+                                   :wants-addrv2 t :address "1.1.1.1:8333"))
+         (peers (list source target)))
+    (%with-captured-sends (sends)
+      (dotimes (i 3)
+        (%relay-address (%make-test-peer-address 8 0 0 (1+ i) 8333) source peers))
+      (is (= 0 (length sends)))
+      (%flush-addrs-now peers)
+      (is (= 1 (length sends)) "one message, not one per address")
+      (let ((msg (cdr (aref sends 0))))
+        (is (string= "addrv2" (%message-command msg)))
+        (is (= 3 (length (bl.ser:parse-addrv2-payload (%message-payload msg)))))))))
+
+(test addr-flush-waits-out-its-poisson-deadline
+  "The flush is a schedule, not a drain: a peer whose m_next_addr_send has not
+passed is skipped and keeps its queue (net_processing.cpp:5571-5573). The
+deadline is re-drawn on every due pass, including one that finds the queue
+empty -- which is what arms a freshly-ready peer's first interval."
+  (let* ((source (bl.net:make-peer :state :ready :address "9.9.9.9:8333"))
+         (target (bl.net:make-peer :state :ready :addr-relay-enabled t
+                                   :address "1.1.1.1:8333"))
+         (peers (list source target))
+         (pa (%make-test-peer-address 8 0 0 1 8333)))
+    (%with-captured-sends (sends)
+      ;; Nothing queued yet, but the pass still arms the timer.
+      (bl.net:flush-addr-announcements peers)
+      (is (= 0 (length sends)))
+      (is (plusp (%addr-send-deadline target))
+          "an empty pass still re-draws the deadline")
+      (%relay-address pa source peers)
+      ;; Not due: skipped, and the queue is kept rather than dropped.
+      (bl.net:flush-addr-announcements peers)
+      (is (= 0 (length sends)) "an undue peer is skipped")
+      (is (= 1 (length (%addr-queue target))) "and keeps what was queued")
+      ;; Due: the same queue goes out.
+      (%flush-addrs-now peers)
+      (is (= 1 (length sends))))))
+
+(test addr-queue-is-bounded-at-max-addr-to-send
+  "Core PushAddress replaces a uniformly random entry once m_addrs_to_send
+holds MAX_ADDR_TO_SEND (net_processing.cpp:1135-1138), so the queue is
+bounded and which addresses survive a flood is not the flooder's choice."
+  (let ((peer (bl.net:make-peer :state :ready :addr-relay-enabled t
+                               :address "1.1.1.1:8333")))
+    (dotimes (i (+ bl.ser:+max-addr-count+ 5))
+      (bl.net::push-address peer (%make-test-peer-address
+                                  10 0 (ldb (byte 8 8) i) (ldb (byte 8 0) i)
+                                  8333)))
+    (is (= bl.ser:+max-addr-count+ (length (%addr-queue peer))))))
 
 ;;;; ============================================================
 ;;;; G7-20: per-network getaddr response cache
@@ -421,7 +550,8 @@ transactions."
                                                       :address "1.1.1.2:8333"))
          (pa (%make-test-peer-address 8 0 0 0 8333))
          (key (bl.net::%addr-gossip-key pa)))
-    (is (= 1 (bl.net::relay-address pa source (list source with without))))
+    (is (= 1 (%relay-address pa source (list source with without))))
+    (%flush-addrs-now (list source with without))
     (is-true (bl:recent-reject-p
               (bl.net:peer-known-addrs with) key))
     (is-false (bl:recent-reject-p
