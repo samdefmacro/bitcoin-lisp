@@ -567,7 +567,16 @@
   (Core RelayAddress -> PushAddress); one addr/addrv2 per peer carries the
   whole queue when that peer's own exponential 30s deadline passes, because
   sending at receive time would tell an observer when and from whom we
-  learned each address.
+  learned each address. Those peers are the top one or two of a ranking
+  keyed by a PER-NODE secret (`*ADDRESS-RELAY-SALT*`, Core nSeed0/nSeed1) --
+  an unsalted ranking over public inputs lets an attacker compute the
+  destinations in advance and pick addresses to steer them -- and the
+  rotation epoch that fixes the ranking for a day carries the address\'s own
+  hash, so each address turns its destinations over at its own instant
+  rather than the whole topology rotating at 00:00 UTC. The relay stops at
+  those picks: a peer that already knows the address is simply not queued
+  to, never replaced by the next peer down the ranking, which is what keeps
+  a repeated address inside its two destinations for the period.
 
   Traps: `getheaders` must send the locator of the LAST header the peer
   gave us, never our own tip, or an ordinary lagging peer loops forever.

@@ -1084,7 +1084,10 @@ FLUSH-ADDR-ANNOUNCEMENTS's job, and the delay between the two is the point
 
 Skipped for an address the peer already knows (Core: \"only to save space from
 duplicates\" — the flush filters again, because the peer can learn an address
-between the push and the flush) and for one it cannot encode. Once the queue
+between the push and the flush) and for one it cannot encode; T is returned
+only when the address was actually queued, which is how RELAY-ADDRESS counts
+what it passed on without widening its own fan-out to make the count up. Once
+the queue
 holds bl.ser:+max-addr-count+ entries (Core MAX_ADDR_TO_SEND, the same 1000
 that bounds an addr message) a new address REPLACES a uniformly random one
 rather than being appended or dropped, so a peer flooding us with addresses
@@ -1095,62 +1098,124 @@ cannot decide which of the queued ones we pass on."
                (addr-compatible-p peer peer-addr))
       (if (>= (fill-pointer queue) bl.ser:+max-addr-count+)
           (setf (aref queue (random (fill-pointer queue))) peer-addr)
-          (vector-push-extend peer-addr queue)))))
+          (vector-push-extend peer-addr queue))
+      t)))
+
+(defconstant +randomizer-id-address-relay+ #x3cac0035b5866b90
+  "Core RANDOMIZER_ID_ADDRESS_RELAY (net_processing.cpp:114). The domain
+separator written into the node's deterministic randomizer before anything
+else, so address-relay ranking shares no key material with the other users of
+the same per-node seed.")
+
+(defconstant +rotate-addr-relay-dest-interval-seconds+ (* 24 60 60)
+  "Core ROTATE_ADDR_RELAY_DEST_INTERVAL (net_processing.cpp:162). One address
+keeps the same relay destinations for this long, which is what lets those
+destinations' own addr-known filters suppress the repeats: a peer sending us
+the same address over and over gains it no extra propagation.")
+
+(defvar *address-relay-salt* nil
+  "The node-lifetime SipHash key (K0 . K1) for address-relay destination
+ranking -- Core's CConnman::nSeed0/nSeed1, drawn once per process and reached
+through GetDeterministicRandomizer. The ranking must not be computable by
+anyone else: with an unsalted hash over public inputs, which is what this used
+to be, an attacker knows in advance which two of our peers any address reaches
+and can pick addresses to steer the fan-out. Drawn lazily so nothing in
+start-up ordering depends on it; two threads racing the first draw is benign
+(both values are equally good, and the loser's ranking is simply the one
+that stands). A test binds it to fix the ranking.")
+
+(defun %address-relay-salt ()
+  "The node's address-relay SipHash key, drawn from the OS CSPRNG on first use."
+  (or *address-relay-salt*
+      (setf *address-relay-salt*
+            (let ((k (make-addrman-key)))
+              (flet ((word (offset)
+                       (loop for i below 8 sum (ash (aref k (+ offset i)) (* 8 i)))))
+                (cons (word 0) (word 8)))))))
+
+(defun %addr-relay-hash (key)
+  "Core's hash_addr = CServiceHash(0, 0)(addr) (netaddress.h:571-589): the
+UNSALTED per-address hash, which both offsets the rotation instant and feeds
+the ranking below. Core hashes the network, the port and the address bytes; we
+hash our own canonical gossip key, which carries exactly those three. Byte
+compatibility with Core is not available here anyway -- what the value ends up
+keying is a per-node secret."
+  (bl.crypto:siphash-2-4 0 0 key))
+
+(defun %addr-relay-message (hash-addr time-addr &optional peer-id)
+  "The SipHash message Core assembles for address relay: the randomizer id,
+the address hash and the rotation epoch, each a little-endian uint64 word
+(CSipHasher::Write(uint64_t)), plus the peer id for the per-peer ranking
+(net_processing.cpp:2298-2313). Without PEER-ID this is the base hasher Core
+finalizes to decide the fan-out of an unreachable address."
+  (let ((words (list (int-to-le-bytes +randomizer-id-address-relay+ 8)
+                     (int-to-le-bytes hash-addr 8)
+                     (int-to-le-bytes time-addr 8))))
+    (apply #'concatenate '(vector (unsigned-byte 8))
+           (if peer-id
+               (append words (list (int-to-le-bytes peer-id 8)))
+               words))))
 
 (defun relay-address (peer-addr source-peer peers
-                      &key (now (bl.ser:get-unix-time))
-                           (max-targets 2))
-  "Forward a freshly-learned address to up to MAX-TARGETS deterministically-
-chosen peers (Core RelayAddress, net_processing.cpp:2298-2337): eligibility is
-ready + tx-relaying (block-relay-only/feeler peers get no addr gossip) + not
-the announcing peer + able to carry the address at all (a peer that has not
-negotiated addrv2 never receives onion/i2p/cjdns addresses — Core
-IsAddrCompatible, net_processing.cpp:1117/2311). Selection ranks peers by
-sha256(addr || day || peer-id), so the same address takes the same hops
-network-wide for a day. Core relays an address OUTSIDE our reachable set to
-only 1 peer instead of 2 (net_processing.cpp:2303) — callers pass
-:max-targets 1 for those. Per-peer dedup via the bounded known-addrs set (the
-source is marked as knowing it too).
+                      &key (now (bl.ser:get-unix-time)) (reachable t))
+  "Forward a freshly-learned address to the deterministically-chosen best one
+or two peers (Core RelayAddress, net_processing.cpp:2279-2337): eligibility is
+ready + address relay set up (block-relay-only/feeler peers get no addr gossip,
+and neither does an inbound peer that never sent addr/getaddr -- Core
+:2311) + not the announcing peer + able to carry the address at all (a peer
+that has not negotiated addrv2 never receives onion/i2p/cjdns addresses, Core
+IsAddrCompatible :1117).
+
+REACHABLE is Core's fReachable: a reachable address goes to 2 peers, an
+unreachable one to 1 or 2 depending on the low bit of the same hasher
+(:2301-2302), so an address on a network we cannot dial still spreads, just
+at half the average fan-out.
+
+Selection ranks the eligible peers by SipHash(node secret; randomizer id,
+address hash, rotation epoch, peer id) and takes the top N -- Core's `best'
+array, filled by strict improvement. Two details of that are the whole point:
+the rank is keyed by a PER-NODE secret (see *ADDRESS-RELAY-SALT*), and the
+rotation epoch carries the address's own hash, so every address rotates its
+destinations at its own instant in the 24h cycle instead of the whole network
+turning over at 00:00 UTC. Walking further down the ranking to find N peers
+that do not already know the address is NOT what Core does: PushAddress simply
+does nothing for a peer that knows it, which is how repeats of an address stay
+inside the same two destinations for the day.
 
 The chosen peers are QUEUED to, never sent to (Core RelayAddress calls
 PushAddress and nothing else): sending here would weld the moment we pass an
 address on to the moment we learned it, which is the timing correlation the
 flush's exponential schedule exists to destroy. Returns the number of peers
-queued to."
+the address was actually queued on."
   (let* ((key (%addr-gossip-key peer-addr))
-         (day (floor now 86400))
+         (hash-addr (%addr-relay-hash key))
+         ;; Core: "Adding address hash makes exact rotation time different per
+         ;; address, while preserving periodicity" (net_processing.cpp:2296).
+         ;; Masked to 64 bits because Core's sum is uint64 and wraps.
+         (time-addr (floor (logand (+ now hash-addr) #xFFFFFFFFFFFFFFFF)
+                           +rotate-addr-relay-dest-interval-seconds+))
+         (salt (%address-relay-salt))
          (sent 0))
-    (when source-peer
-      (bl:add-recent-reject (peer-known-addrs source-peer) key))
-    (let ((ranked
-            (sort
-             (loop for p in peers
-                   when (and (eq (peer-state p) :ready)
-                             (not (eq p source-peer))
-                             ;; Core RelayAddress: only peers with address
-                             ;; relay set up (net_processing.cpp:2311) — an
-                             ;; inbound peer that never sent addr/getaddr
-                             ;; receives no gossip.
-                             (peer-addr-relay-enabled p)
-                             (addr-compatible-p p peer-addr))
-                     collect (cons (let* ((material (concatenate '(vector (unsigned-byte 8))
-                                                                 key
-                                                                 (int-to-le-bytes day 8)
-                                                                 (int-to-le-bytes (peer-id p) 8)))
-                                          (h (bl.crypto:sha256 material)))
-                                     (loop for i below 8 sum (ash (aref h i) (* 8 i))))
-                                   p))
-             #'> :key #'car)))
-      ;; Take the best <=MAX-TARGETS peers that don't already know the address;
-      ;; count the chosen targets (Core queues to exactly its picked nodes)
-      ;; rather than successful writes, so a dropped connection can't widen the
-      ;; fan-out. The known-addrs mark is made by the flush, on the same pass
-      ;; that filters (Core MaybeSendAddr's addr_already_known lambda).
-      (loop for (nil . p) in ranked
-            while (< sent max-targets)
-            unless (bl:recent-reject-p (peer-known-addrs p) key)
-              do (push-address p peer-addr)
-                 (incf sent)))
+    (flet ((rank (&optional peer-id)
+             (bl.crypto:siphash-2-4 (car salt) (cdr salt)
+                                    (%addr-relay-message hash-addr time-addr
+                                                         peer-id))))
+      (when source-peer
+        (bl:add-recent-reject (peer-known-addrs source-peer) key))
+      (let ((n-relay (if (or reachable (logbitp 0 (rank))) 2 1))
+            (ranked
+              (sort (loop for p in peers
+                          when (and (eq (peer-state p) :ready)
+                                    (not (eq p source-peer))
+                                    (peer-addr-relay-enabled p)
+                                    (addr-compatible-p p peer-addr))
+                            collect (cons (rank (peer-id p)) p))
+                    #'> :key #'car)))
+        ;; The known-addrs mark for a target is made by the FLUSH, on the same
+        ;; pass that filters (Core MaybeSendAddr's addr_already_known lambda).
+        (loop for (nil . p) in ranked
+              repeat n-relay
+              when (push-address p peer-addr) do (incf sent))))
     sent))
 
 (defun peer-source-address (peer)
@@ -1227,8 +1292,9 @@ stored nor relayed, as in Core — and so are addresses this node has banned or
 discouraged (net_processing.cpp:4094-4097).
 
 Returns (VALUES stored relay-entry): STORED is 1/0 for the caller's log count,
-RELAY-ENTRY a (peer-address . max-targets) cons when the address should be
-gossiped onward."
+RELAY-ENTRY a (peer-address . reachable) cons when the address should be
+gossiped onward -- REACHABLE being Core's fReachable argument to RelayAddress,
+which decides the fan-out."
   (unless (and address-book timestamp
                (may-have-useful-address-db-p
                 (bl.ser:net-addr-services net-addr)))
@@ -1266,7 +1332,7 @@ gossiped onward."
             ;; itself relay by claiming a future time.
             (when (and (> time (- now 600))
                        (address-routable-p (peer-address-ip pa) network))
-              (cons pa (if reachable 2 1))))))
+              (cons pa reachable)))))
 
 (defun %refill-addr-token-bucket (peer &optional (now (get-internal-real-time)))
   "Refill PEER's addr token bucket from elapsed time, once per addr/addrv2
@@ -1346,8 +1412,8 @@ the number stored."
                                 (peer-address peer))
           (disconnect-peer peer)))
       (when (and peers unsolicited (<= announced-count 10))
-        (loop for (pa . max-targets) in relay-candidates
-              do (relay-address pa peer peers :now now :max-targets max-targets)))
+        (loop for (pa . reachable) in relay-candidates
+              do (relay-address pa peer peers :now now :reachable reachable)))
       added)))
 
 (define-p2p-handler ("addr" :rate-bucket peer-rate-limit-addr) (peer payload ctx)
