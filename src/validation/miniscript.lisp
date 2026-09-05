@@ -1505,9 +1505,23 @@ letting the size comparison pick it."
           (:pk-h
            ;; The key itself is on the stack under the signature, because the
            ;; script only committed to its hash.
-           (let ((key (ms-stack-of (funcall key-fn (first (ms-node-keys node))))))
-             (res (ms-stack+ (%ms-sig-stack sat (first (ms-node-keys node))) key)
-                  (ms-stack+ (ms-stack-zero) key))))
+           ;;
+           ;; No key at all is a node inference produced with no resolver: the
+           ;; hash is known and the key is not, so the branch can be neither
+           ;; satisfied nor dissatisfied. Core cannot reach this state -- its
+           ;; DecodeScript refuses the script instead (miniscript.h:2331-2339)
+           ;; -- and building an element out of the missing key would put a
+           ;; Lisp NIL where a witness wants bytes.
+           (let ((k (first (ms-node-keys node))))
+             (if (null k)
+                 (res (ms-stack-invalid) (ms-stack-invalid))
+                 ;; Core's ctx.ToPKBytes (miniscript.h:1252): the revealed key
+                 ;; is written the way the CONTEXT writes keys, x-only under
+                 ;; tapscript, so it hashes back to what the script checks.
+                 (let ((key (ms-stack-of (%ms-key-bytes (funcall key-fn k)
+                                                        (ms-node-ctx node)))))
+                   (res (ms-stack+ (%ms-sig-stack sat k) key)
+                        (ms-stack+ (ms-stack-zero) key))))))
           (:older (res (if (and (ms-satisfier-check-older-fn sat)
                                 (funcall (ms-satisfier-check-older-fn sat) (ms-node-k node)))
                            (ms-stack-empty)
@@ -1798,6 +1812,27 @@ requires exactly 32 (sign.cpp:506). One size per context is the same gate with
 the two halves joined."
   (if (ms-tapscript-p ctx) 32 33))
 
+(defun %ms-decode-pk-h (ops in)
+  "Core DecodeScript's PK_H arm SHAPE (miniscript.h:2331-2339) reading the
+reversed DUP HASH160 <20> EQUALVERIFY at OPS[IN]: the 20-byte key hash, or NIL
+when this is not that arm.
+
+Resolving that hash back to a key is the CALLER's half, because the two answers
+are not the same kind of no. A shape that does not match falls through to the
+arms below; a hash the context cannot resolve fails the WHOLE decode, which is
+what Core does -- a pkh() branch commits to HASH160 of a key and not to the
+key, so a signer asks its signing provider for it (WshSatisfier::FromPKHBytes
+and TapSatisfier's, sign.cpp:428-436 and :514-518, the tapscript one resolving
+Hash160 of the X-ONLY key), and a decoder that returned a keyless node anyway
+would be reporting a script it has not understood."
+  (and (>= (- (length ops) in) 5)
+       (%ms-op-is ops in +op-verify+)
+       (%ms-op-is ops (+ in 1) +op-equal+)
+       (%ms-op-is ops (+ in 3) +op-hash160+)
+       (%ms-op-is ops (+ in 4) +op-dup+)
+       (eql 20 (%ms-op-push-size ops (+ in 2)))
+       (ms-op-data (aref ops (+ in 2)))))
+
 (defun %ms-decode-hash (ops in)
   "Core DecodeScript's hash arm (miniscript.h:2354-2373) reading the reversed
 SIZE <32> EQUALVERIFY <hashop> <hash> EQUAL at OPS[IN], as (fragment . hash) or
@@ -1881,7 +1916,7 @@ SOURCE order for the same reason as MULTI."
         (when (>= nkeys k)
           (values keys k (+ 2 (* nkeys 2))))))))
 
-(defun ms-from-script (script &key (ctx *ms-context*))
+(defun ms-from-script (script &key (ctx *ms-context*) pkh-resolver)
   "Infer a miniscript from SCRIPT under CTX, or NIL.
 
 Returns a node that is valid at top level; anything else — a script that is not
@@ -1893,7 +1928,15 @@ CTX is Core's context parameter on FromScript (miniscript.h:2288): the same
 bytes are a different miniscript in P2WSH and in tapscript — a key push is 33
 bytes in one and 32 in the other, multi exists only in the first and multi_a
 only in the second — so it is an argument rather than whatever *MS-CONTEXT*
-happened to be bound to at the call."
+happened to be bound to at the call.
+
+PKH-RESOLVER is Core's FromPKHBytes seam (see %MS-DECODE-PK-H): it takes a
+pkh() branch's 20-byte hash and returns the key as the CONTEXT serializes it —
+33 bytes in P2WSH, x-only 32 in tapscript — or NIL, which fails the decode.
+Passing none makes the decode STRUCTURAL, which is what a caller asking what an
+arbitrary script SAYS wants; the resulting node cannot be satisfied at all (see
+MS-PRODUCE-INPUT's :PK-H), so an absent resolver can never build a witness
+around a key nobody supplied."
   (let ((*ms-context* ctx)
         (ops (ms-decompose-script script)))
     (when ops
@@ -1936,7 +1979,8 @@ happened to be bound to at the call."
                          (:single-bkv-expr
                           (when (>= in last) (fail))
                           (let ((op (opcode-at 0))
-                                (hash (%ms-decode-hash ops in)))
+                                (hash (%ms-decode-hash ops in))
+                                (keyhash (%ms-decode-pk-h ops in)))
                             (cond
                               ((= op +op-1+) (incf in) (emit (make-ms-node :just-1)))
                               ((= op +op-0+) (incf in) (emit (make-ms-node :just-0)))
@@ -1947,20 +1991,18 @@ happened to be bound to at the call."
                                (let ((key (data-at 0))) (incf in)
                                  (emit (make-ms-node :pk-k :keys (list key)))))
                               ;; DUP HASH160 <20> EQUAL VERIFY, reversed.
-                              ((and (>= (remaining) 5)
-                                    (= op +op-verify+)
-                                    (%ms-op-is ops (+ in 1) +op-equal+)
-                                    (%ms-op-is ops (+ in 3) +op-hash160+)
-                                    (%ms-op-is ops (+ in 4) +op-dup+)
-                                    (eql 20 (%ms-op-push-size ops (+ in 2))))
-                               (let ((keyhash (data-at 2)))
+                              (keyhash
+                               ;; The script committed to a HASH, so the node
+                               ;; keeps it in DATA — script generation uses it
+                               ;; directly rather than hashing a key back — and
+                               ;; the key itself comes from the resolver, or
+                               ;; the decode fails the way Core's does.
+                               (let ((key (and pkh-resolver
+                                               (funcall pkh-resolver keyhash))))
+                                 (when (and pkh-resolver (null key)) (fail))
                                  (incf in 5)
-                                 ;; The script committed to a HASH, so the key
-                                 ;; itself is not recoverable. The node carries
-                                 ;; the hash in DATA — which script generation
-                                 ;; uses directly rather than hashing a key —
-                                 ;; and a satisfier looks the key up by it.
-                                 (emit (make-ms-node :pk-h :data keyhash))))
+                                 (emit (make-ms-node :pk-h :data keyhash
+                                                           :keys (and key (list key))))))
                               ((and (>= (remaining) 2)
                                     (= op +ms-op-checksequenceverify+)
                                     (num-at 1))

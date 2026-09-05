@@ -56,3 +56,74 @@ in BODY address it the way an unqualified /wallet/ request does."
         (ignore-errors
          (bl.wallet:close-wallet-manager
           (bl:node-wallet-manager ,node)))))))
+
+;;;; The question every "the wallet gave out an address it cannot spend" finding asks
+
+(defun descriptor-spend-e2e (descriptor &key (pay 100000000) (suffix "e2e"))
+  "Import DESCRIPTOR into a private-key wallet on a fresh regtest node, pay it
+PAY satoshis from a second wallet's own sendtoaddress, mine the payment in, and
+spend that output back out through signrawtransactionwithwallet.
+
+Returns a plist: :ADDRESS what deriveaddresses handed out, :BALANCE what the
+receiving wallet counted, :COMPLETE and :ERRORS what the signer reported, and
+:ACCEPTED the node's own sendrawtransaction verdict -- which is the full script
+verification of the witness the wallet produced, over a real chain.
+
+Shared because a funds finding of this shape is only answered in these terms:
+an in-process call to the signer proves nothing about what an operator sees, so
+the address, the balance and the signature all come out of the shipped RPCs
+through DISPATCH-RPC-METHOD. A pre-fix run answers :COMPLETE NIL with the
+address and the balance unchanged, which is exactly the trap -- the coins look
+like the wallet's and are not spendable by it."
+  (with-wallet-chain-node (node suffix)
+    (flet ((rpc (wallet method &rest params)
+             (let ((bl.wallet::*rpc-wallet-name* wallet))
+               (bl.rpc:dispatch-rpc-method node method params)))
+           (aval (key alist) (cdr (assoc key alist :test #'string=))))
+      (rpc nil "createwallet" "fund")
+      ;; Blank, so getbalance counts the imported descriptor and nothing else.
+      (rpc nil "createwallet" "desc" nil t)
+      (let ((optrue (bl.crypto:encode-p2sh-address
+                     (bl.crypto:hash160 +optrue-redeem+) :regtest)))
+        (rpc nil "generatetoaddress" 1 (rpc "fund" "getnewaddress" "" "bech32"))
+        (rpc nil "generatetoaddress" 101 optrue)
+        (let* ((checksummed (bl.rpc:descriptor-add-checksum descriptor))
+               (request (let ((h (make-hash-table :test 'equal)))
+                          (setf (gethash "desc" h) checksummed
+                                (gethash "timestamp" h) "now")
+                          h))
+               (imported (first (rpc "desc" "importdescriptors" (list request))))
+               (address (first (rpc nil "deriveaddresses" checksummed)))
+               ;; An explicit fee rate: regtest has no fee history, and the
+               ;; fallback is disabled.
+               (bl.wallet::*wallet-rng* (make-wallet-rng 77)))
+          (rpc "fund" "sendtoaddress" address (bl.rpc:satoshi->btc pay)
+               nil nil nil nil nil nil nil 10)
+          (rpc nil "generatetoaddress" 1 optrue)
+          (let* ((balance (rpc "desc" "getbalance"))
+                 (coin (first (rpc "desc" "listunspent")))
+                 (spend (bl.ser:make-transaction
+                         :version 2
+                         :inputs (vector (bl.ser:make-tx-in
+                                          :previous-output
+                                          (bl.ser:make-outpoint
+                                           :hash (bl.rpc:parse-hex-hash (aval "txid" coin))
+                                           :index (aval "vout" coin))
+                                          :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                          :sequence #xfffffffd))
+                         :outputs (vector (bl.ser:make-tx-out
+                                           :value (- pay 10000)
+                                           :script-pubkey (p2sh-optrue-script-pubkey)))
+                         :lock-time 0))
+                 (signed (rpc "desc" "signrawtransactionwithwallet"
+                              (bl.crypto:bytes-to-hex
+                               (bl.ser:transaction-wire-bytes spend))))
+                 (complete (eq t (aval "complete" signed))))
+            (list :imported (eq t (aval "success" imported))
+                  :address address
+                  :balance balance
+                  :complete complete
+                  :errors (mapcar (lambda (e) (aval "error" e)) (aval "errors" signed))
+                  :accepted (and complete
+                                 (stringp (rpc nil "sendrawtransaction"
+                                               (aval "hex" signed)))))))))))

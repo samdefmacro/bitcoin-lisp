@@ -811,25 +811,49 @@ script rather than merely validating it."
                     (bl.val:ms-node-to-string back))))
           "~A: printing and re-parsing must preserve the script" expr))))
 
-(test a-pkh-script-yields-the-hash-because-that-is-all-it-holds
-  "pkh commits to HASH160(key), not to the key. Inference can only recover the
-hash, and the node has to say so — a node that pretended the hash was a key
-would hash it again and produce a different script."
+(test a-pkh-script-yields-the-hash-and-the-key-the-resolver-gives-back
+  "pkh commits to HASH160(key), not to the key, so the script alone cannot say
+which key it is. Core asks its context: DecodeScript calls FromPKHBytes and
+FAILS the whole decode when the provider does not have that key
+(miniscript.h:2331-2339), because a pk_h node without one cannot be signed and
+a decoder that returned it anyway would report a script it has not understood.
+
+With no resolver the decode is structural — the hash, and no key — which is
+what a caller asking what an unknown script SAYS wants. Either way the node
+keeps the hash in DATA, so regenerating the script cannot hash a key twice."
   (let* ((expr (format nil "c:pk_h(~A)" *ms-desc-key-a*))
-         (node (bl.val:ms-parse expr))
-         (script (bl.val:ms-node-script node))
-         (back (bl.val:ms-from-script script)))
-    (is-true back)
-    (is (equalp script (bl.val:ms-node-script back))
-        "the inferred node must still compile to the same script")
-    (let ((inner (first (%ms-subs back))))
-      (is (eq :pk-h (%ms-frag inner)))
-      (is (equalp (bl.crypto:hash160
-                   (bl.crypto:hex-to-bytes *ms-desc-key-a*))
-                  (bl.val::ms-node-data inner))
-          "the node carries the hash the script committed to")
-      (is (null (%ms-keys inner))
-          "and no key, because the script does not contain one"))))
+         (key (bl.crypto:hex-to-bytes *ms-desc-key-a*))
+         (hash (bl.crypto:hash160 key))
+         (script (bl.val:ms-node-script (bl.val:ms-parse expr))))
+    ;; Structural: hash, no key, same script back.
+    (let ((back (bl.val:ms-from-script script)))
+      (is-true back)
+      (is (equalp script (bl.val:ms-node-script back))
+          "the inferred node must still compile to the same script")
+      (let ((inner (first (%ms-subs back))))
+        (is (eq :pk-h (%ms-frag inner)))
+        (is (equalp hash (bl.val::ms-node-data inner))
+            "the node carries the hash the script committed to")
+        (is (null (%ms-keys inner))
+            "and no key, because the script does not contain one")))
+    ;; With a resolver: the key comes back, and the script still does too.
+    (let ((back (bl.val:ms-from-script
+                 script :pkh-resolver (lambda (h) (and (equalp h hash) key)))))
+      (is-true back)
+      (is (equalp script (bl.val:ms-node-script back))
+          "resolving a key must not change the bytes the node compiles to")
+      (let ((inner (first (%ms-subs back))))
+        (is (equalp (list key) (%ms-keys inner)))
+        (is (equalp hash (bl.val::ms-node-data inner)))))
+    ;; A resolver that cannot answer fails the decode, rather than handing
+    ;; back a node whose key is NIL.
+    (is-false (bl.val:ms-from-script script :pkh-resolver (constantly nil)))
+    ;; And a node with no key can be neither satisfied nor dissatisfied: the
+    ;; witness element would be the Lisp NIL.
+    (is-false (bl.val:ms-satisfy
+               (bl.val:ms-from-script script)
+               (bl.val:make-ms-satisfier
+                :sign-fn (lambda (k) (declare (ignore k)) (%ms-fake-sig 1)))))))
 
 (test non-miniscript-and-non-minimal-scripts-are-refused
   "Inference answers a question about ARBITRARY scripts, so a wrong answer is
@@ -950,16 +974,33 @@ exactly the expressions the property exists to catch."
 
 ;;;; --- Signing a wsh(<miniscript>) output ----------------------------------
 
+(defun %ms-regtest-wif (byte)
+  "A deterministic regtest WIF, for the descriptor strings the wallet RPCs
+parse. Regtest and not mainnet: DecodeSecret reads the network's own prefix,
+so a mainnet WIF is simply not a key here."
+  (bl.crypto:private-key-to-wif
+   (make-array 32 :element-type '(unsigned-byte 8) :initial-element byte)
+   :network :regtest))
+
 (defun %ms-sign-p2wsh (expr &key (version 2) (sequence 42) (have-key t)
-                                 (lock-time 0))
+                                 (lock-time 0) (key-count 1) (held key-count))
   "Build a P2WSH output for EXPR, spend it with one input, and run the wallet
 signer over it. Returns (values kind witness-length verified-p error), where
 VERIFIED-P is the script engine's verdict on the witness that came out — the
-only evidence that matters, since a signer can always produce SOMETHING."
-  (let* ((sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
-         (pk (bl.crypto:derive-public-key sk))
+only evidence that matters, since a signer can always produce SOMETHING.
+
+EXPR is a format control taking KEY-COUNT key hexes. The signer is given the
+first HELD of them, which is how a policy the node can satisfy only part of is
+expressed; HAVE-KEY NIL gives it none of them."
+  (let* ((sks (loop for i from 0 below key-count
+                    collect (make-array 32 :element-type '(unsigned-byte 8)
+                                           :initial-element (+ 7 i))))
+         (pks (mapcar #'bl.crypto:derive-public-key sks))
+         (sk (first sks))
+         (pk (first pks))
          (node (bl.val:ms-parse
-                (format nil expr (bl.crypto:bytes-to-hex pk))))
+                (apply #'format nil expr
+                       (mapcar #'bl.crypto:bytes-to-hex pks))))
          (witscript (coerce (bl.val:ms-node-script node)
                             '(vector (unsigned-byte 8))))
          (spk (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x20)
@@ -978,9 +1019,13 @@ only evidence that matters, since a signer can always produce SOMETHING."
               :lock-time lock-time))
          (pubmap (make-hash-table :test 'equalp))
          (keymap (make-hash-table :test 'equalp)))
+    (declare (ignorable sk pk))
     (when have-key
-      (setf (gethash pk pubmap) sk)
-      (setf (gethash (bl.crypto:hash160 pk) keymap) (cons sk pk)))
+      (loop for s in sks
+            for p in pks
+            repeat held
+            do (setf (gethash p pubmap) s)
+               (setf (gethash (bl.crypto:hash160 p) keymap) (cons s p))))
     (let ((bl.interop:*current-tx* tx))
       (multiple-value-bind (sig err)
           (bl.rpc:compute-input-signatures
@@ -1019,6 +1064,53 @@ witness the signer produced."
     ;; satisfaction (one signature) plus the witnessScript Core always appends.
     (is (= 2 len))
     (is-true verified "the script engine rejected the witness we produced")))
+
+(test wsh-miniscript-with-a-pkh-branch-signs-and-spends
+  "A pkh() branch inside a wsh(<miniscript>) was never signed, even holding
+every private key: inference produced a pk_h node with an EMPTY key list, the
+satisfier called its sign-fn with NIL, and the signer reported the misleading
+\"witnessScript is not multisig\". Core resolves the hash through the signing
+provider before the node is built at all (WshSatisfier::FromPKHBytes,
+sign.cpp:428-436), which is now what COMPUTE-INPUT-SIGNATURES passes in --
+KEYMAP is already indexed by exactly that hash for the P2PKH and P2WPKH arms.
+
+The witness order is the load-bearing part and it is DERIVED, not templated:
+and_v puts the second branch's elements first, and pk_h reveals the key ABOVE
+its signature because DUP reads the stack top. Only the script engine can say
+whether that came out right."
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),pkh(~a))" :key-count 2)
+    (is (null err) "signing failed: ~A" err)
+    (is (eq :p2wsh-miniscript kind))
+    ;; sig(B), key(B), sig(A), witnessScript.
+    (is (= 4 len))
+    (is-true verified "the script engine rejected the witness we produced"))
+  ;; Holding only the pk() branch's key, the provider cannot resolve the other
+  ;; branch's hash, so the script is not understood and nothing is signed --
+  ;; Core's own answer for a provider missing a pkh key.
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),pkh(~a))" :key-count 2 :held 1)
+    (declare (ignore kind len verified))
+    (is-true (stringp err) "an unresolvable pkh must not yield a witness")))
+
+(test wsh-pkh-policy-is-spendable-through-the-wallet-rpcs
+  "The finding end to end, in the terms an operator sees: import the
+descriptor, let the funding wallet's own sendtoaddress pay the address the
+wallet handed out, and spend it back. Before the FromPKHBytes seam this
+answered complete:false with \"witnessScript is not multisig\" while
+deriveaddresses and getbalance both looked healthy -- coins the wallet counted
+as its own and could not move."
+  (let ((result (descriptor-spend-e2e
+                 (format nil "wsh(and_v(v:pk(~A),pkh(~A)))"
+                         (%ms-regtest-wif 11) (%ms-regtest-wif 12)))))
+    (is-true (getf result :imported) "importdescriptors refused: ~S" result)
+    (is-true (getf result :address))
+    (is (= 1.0d0 (getf result :balance))
+        "the wallet must count the coin before the spend is even attempted")
+    (is-true (getf result :complete)
+             "signrawtransactionwithwallet reported ~S" (getf result :errors))
+    (is-true (getf result :accepted)
+             "the node refused the spend the wallet signed")))
 
 (test miniscript-signing-refuses-an-unsatisfiable-branch
   "A satisfier that claims a timelock is met when it is not produces a witness
