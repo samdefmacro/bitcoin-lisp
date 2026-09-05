@@ -47,6 +47,9 @@ Commands:
   status             Show whether the dev container is running
   doctor             Verify the Docker boundary and required project assets
   identity FIELD     Print checkout-id|session-id|container|image|port|fasl-volume
+  load FILE          Load a Lisp file into the warm image with warnings muffled,
+                     reporting only a real ERROR (a probe's benign redefinition
+                     warning must not abort the load).
   eval FORM          Evaluate FORM in the warm image (via cl-workbench)
   test NAME          Run one fiveam suite (raw designator, e.g. :script-tests)
   test-all           Run the full :bitcoin-lisp-tests suite (long)
@@ -348,6 +351,24 @@ eval_nickname_selftest() {
   fi
 }
 
+# Agents wrapping (load "probe.lisp") in a handler-case on CONDITION saw the
+# load aborted by SBCL's benign redefinition / style warnings and read the
+# abort as a failure of the probe -- observed three times on 2026-09-05 after
+# the lesson was written. This is the guarded form; the file path is the
+# container-visible one (the repo is mounted at /workspace).
+load_file() {
+  if [[ $# -ne 1 ]]; then
+    echo "load requires exactly one FILE argument" >&2
+    return 2
+  fi
+  local file="$1"
+  case "$file" in
+    /*) ;;
+    *) file="/workspace/$file" ;;
+  esac
+  eval_form "(handler-case (handler-bind ((warning (function muffle-warning))) (load \"$file\") (list :loaded \"$file\")) (error (e) (list :load-error (princ-to-string e))))"
+}
+
 eval_form() {
   if [[ $# -eq 0 ]]; then
     echo "eval requires a Lisp FORM argument" >&2
@@ -433,6 +454,7 @@ case "$cmd" in
   identity) identity_field "$@" ;;
   adapter-eval) exec_workbench_eval_client "$@" ;;
   eval) eval_form "$@" ;;
+  load) load_file "$@" ;;
   test) test_one "$@" ;;
   test-all) test_all ;;
   docs-check) docs_check ;;
