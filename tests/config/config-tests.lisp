@@ -1811,8 +1811,11 @@ over budget from the first message."
                    (mapcar #'car
                            (sb-introspect:who-calls
                             'bl.net::%record-outbound-cycle-bytes))))
-  ;; And the historical-block gate is consulted where blocks are served.
-  (is-true (member 'bl.net::handle-getdata
+  ;; And the historical-block gate is consulted where blocks are served --
+  ;; which is the getdata QUEUE's server, not the message handler: a getdata
+  ;; parked by send-pause is answered from PROCESS-PEER-GETDATA on a later
+  ;; pass, and a gate wired only to the handler would let that answer past it.
+  (is-true (member 'bl.net::process-peer-getdata
                    (mapcar #'car
                            (sb-introspect:who-calls
                             'bl.net:outbound-target-reached-p))))
