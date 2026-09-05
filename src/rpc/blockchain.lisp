@@ -1432,6 +1432,93 @@ already running."
   (bt:with-lock-held (*txoutset-scan-lock*)
     (setf *txoutset-scan-running* nil)))
 
+(defun %scan-utxo-set-for-needles (node needles)
+  "scantxoutset's `start' pass: one walk of the UTXO set, collecting the coins
+whose scriptPubKey is a key of NEEDLES, and returning the reply alist.
+
+Held under the node lock, for the reason Core holds cs_main over the same
+span: Core takes it across the coins-cache flush, the cursor creation and the
+tip read (rpc/blockchain.cpp:2410-2418) and only then walks. UTXO-SET-ITERATE
+calls COINS-VIEW-CACHE-SYNC, whose documented caller contract is exactly that
+pair -- the sync MAPHASHes and rewrites the live cache table that the
+validation thread mutates under this same lock, so running it unlocked races
+that thread over a hash table neither side is synchronising. Holding it also
+makes the tip reported here (`height', `bestblock' and every
+`confirmations') the tip the coins were read at, instead of one a block
+connect could have moved underneath the walk.
+
+Ours spans the walk as well, which Core's does not, because our iterator is
+created inside UTXO-SET-ITERATE and cannot be handed out under the lock and
+walked after it. The walk is bounded local work with no network I/O, and
+`scantxoutset status'/`abort' from another connection take only
+*TXOUTSET-SCAN-LOCK*, so they still answer while it runs."
+  (with-node-lock (node)
+    (let* ((chain-state (rpc-get-chain-state node))
+           (utxo-set (rpc-get-utxo-set node))
+           (tip-height (bl.store:current-height chain-state))
+           (best-hash (bl.store:best-block-hash chain-state))
+           (count 0) (total-amount 0) (unspents '())
+           (height-hashes nil)
+           (aborted nil))
+      (flet ((blockhash-at (height)
+               ;; get-block-at-height walks tip->height, so per-match
+               ;; lookups would be O(matches * tip). One backward walk
+               ;; on first use builds the whole height->hex table.
+               (unless height-hashes
+                 (setf height-hashes (make-hash-table))
+                 (loop with e = (and best-hash
+                                     (bl.store:get-block-index-entry
+                                      chain-state best-hash))
+                       while e
+                       do (setf (gethash (bl.store:block-index-entry-height e)
+                                         height-hashes)
+                                (hash-to-hex
+                                 (bl.store:block-index-entry-hash e)))
+                          (setf e (bl.store:block-index-entry-prev-entry e))))
+               (gethash height height-hashes)))
+        (block scan
+          (bl.store:utxo-set-iterate
+           utxo-set
+           (lambda (txid vout entry)
+             (when *txoutset-scan-abort*
+               (setf aborted t)
+               (return-from scan))
+             (incf count)
+             ;; Iteration is txid-lex-ordered (utxo-set-iterate's
+             ;; documented contract): the txid prefix is the scan
+             ;; position (Core's g_scan_progress).
+             (setf *txoutset-scan-progress*
+                   (floor (* 100 (+ (* 256 (aref txid 0)) (aref txid 1)))
+                          65536))
+             (let ((desc (gethash
+                          (bl.store:utxo-entry-script-pubkey entry)
+                          needles)))
+               (when desc
+                 (let ((height (bl.store:utxo-entry-height entry))
+                       (value (bl.store:utxo-entry-value entry)))
+                   (incf total-amount value)
+                   (push
+                    `(("txid" . ,(hash-to-hex txid))
+                      ("vout" . ,vout)
+                      ("scriptPubKey"
+                       . ,(bl.crypto:bytes-to-hex
+                           (bl.store:utxo-entry-script-pubkey entry)))
+                      ("desc" . ,desc)
+                      ("amount" . ,(/ value 100000000.0d0))
+                      ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))
+                      ("height" . ,height)
+                      ,@(let ((hex (blockhash-at height)))
+                          (when hex `(("blockhash" . ,hex))))
+                      ("confirmations" . ,(1+ (- tip-height height))))
+                    unspents))))))))
+      `(("success" . ,(json-bool (not aborted)))
+        ("txouts" . ,count)
+        ("height" . ,tip-height)
+        ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
+        ;; Core pushes a VARR: no matches is [], not null.
+        ("unspents" . ,(json-array (nreverse unspents)))
+        ("total_amount" . ,(/ total-amount 100000000.0d0))))))
+
 (define-rpc "scantxoutset" (node (action (scanobjects :array)))
   "Scan the UTXO set for outputs matching descriptors (Bitcoin Core
 scantxoutset). PARAMS: (action [scanobjects]) — action is \"start\",
@@ -1465,72 +1552,8 @@ mirroring Core."
        (error 'rpc-error :code +rpc-invalid-parameter+
                          :message "Scan already in progress, use action \"abort\" or \"status\""))
      (unwind-protect
-          (let ((needles (%needle-scripts scanobjects (rpc-get-network node))))
-            (let* ((chain-state (rpc-get-chain-state node))
-                   (utxo-set (rpc-get-utxo-set node))
-                   (tip-height (bl.store:current-height chain-state))
-                   (best-hash (bl.store:best-block-hash chain-state))
-                   (count 0) (total-amount 0) (unspents '())
-                   (height-hashes nil)
-                   (aborted nil))
-              (flet ((blockhash-at (height)
-                       ;; get-block-at-height walks tip->height, so per-match
-                       ;; lookups would be O(matches * tip). One backward walk
-                       ;; on first use builds the whole height->hex table.
-                       (unless height-hashes
-                         (setf height-hashes (make-hash-table))
-                         (loop with e = (and best-hash
-                                             (bl.store:get-block-index-entry
-                                              chain-state best-hash))
-                               while e
-                               do (setf (gethash (bl.store:block-index-entry-height e)
-                                                 height-hashes)
-                                        (hash-to-hex
-                                         (bl.store:block-index-entry-hash e)))
-                                  (setf e (bl.store:block-index-entry-prev-entry e))))
-                       (gethash height height-hashes)))
-              (block scan
-                (bl.store:utxo-set-iterate
-                 utxo-set
-                 (lambda (txid vout entry)
-                   (when *txoutset-scan-abort*
-                     (setf aborted t)
-                     (return-from scan))
-                   (incf count)
-                   ;; Iteration is txid-lex-ordered (utxo-set-iterate's
-                   ;; documented contract): the txid prefix is the scan
-                   ;; position (Core's g_scan_progress).
-                   (setf *txoutset-scan-progress*
-                         (floor (* 100 (+ (* 256 (aref txid 0)) (aref txid 1)))
-                                65536))
-                   (let ((desc (gethash
-                                (bl.store:utxo-entry-script-pubkey entry)
-                                needles)))
-                     (when desc
-                       (let ((height (bl.store:utxo-entry-height entry))
-                             (value (bl.store:utxo-entry-value entry)))
-                         (incf total-amount value)
-                         (push
-                          `(("txid" . ,(hash-to-hex txid))
-                            ("vout" . ,vout)
-                            ("scriptPubKey"
-                             . ,(bl.crypto:bytes-to-hex
-                                 (bl.store:utxo-entry-script-pubkey entry)))
-                            ("desc" . ,desc)
-                            ("amount" . ,(/ value 100000000.0d0))
-                            ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))
-                            ("height" . ,height)
-                            ,@(let ((hex (blockhash-at height)))
-                                (when hex `(("blockhash" . ,hex))))
-                            ("confirmations" . ,(1+ (- tip-height height))))
-                          unspents))))))))
-              `(("success" . ,(json-bool (not aborted)))
-                ("txouts" . ,count)
-                ("height" . ,tip-height)
-                ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
-                ;; Core pushes a VARR: no matches is [], not null.
-                ("unspents" . ,(json-array (nreverse unspents)))
-                ("total_amount" . ,(/ total-amount 100000000.0d0)))))
+          (%scan-utxo-set-for-needles
+           node (%needle-scripts scanobjects (rpc-get-network node)))
        (%release-txoutset-scan)))
     (t
      (error 'rpc-error :code +rpc-invalid-parameter+
@@ -1729,37 +1752,49 @@ coinstatsindex (Core's use_index path)."
     (when hash-or-height
       (return-from rpc-gettxoutsetinfo
         (%gettxoutsetinfo-from-index node hash-type hash-or-height)))
-    (let* ((height (bl.store:current-height chain-state))
-           ;; The COINS VIEW's own best block, as Core reports
-           ;; (rpc/blockchain.cpp:1083). hash_serialized_3 IS the assumeutxo
-           ;; commitment, so hashing one set of coins and labelling it with a
-           ;; different block's hash commits to nothing — and the two genuinely
-           ;; differ partway through a reorg's disconnect phase.
-           (best-hash (or (bl.store:coins-view-best-block utxo-set)
-                          (bl.store:best-block-hash chain-state)))
-           (txout-count (bl.store:utxo-count utxo-set))
-           (tx-count (bl.store:utxo-set-distinct-txids utxo-set))
-           (total-satoshis (bl.store:utxo-set-total-amount utxo-set))
-           (total-btc (/ total-satoshis 100000000.0d0))
-           (result `(("height" . ,height)
-                     ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
-                     ("transactions" . ,tx-count)
-                     ("txouts" . ,txout-count)
-                     ("total_amount" . ,total-btc))))
-      ;; Add hash if requested (both hashes present the digest in display
-      ;; byte order via hash-to-hex, matching Core's uint256 GetHex()).
-      (cond
-        ((string= hash-type "hash_serialized_3")
-         (setf result (append result
-                              `(("hash_serialized_3"
-                                 . ,(hash-to-hex (bl.store:compute-utxo-set-hash
-                                                  utxo-set)))))))
-        ((string= hash-type "muhash")
-         (setf result (append result
-                              `(("muhash"
-                                 . ,(hash-to-hex (bl.store:compute-utxo-set-muhash
-                                                  utxo-set))))))))
-      result)))
+    ;; Core holds cs_main across the coins-cache flush and the reads that
+    ;; follow it (rpc/blockchain.cpp:1075-1084: ForceFlushStateToDisk, then
+    ;; the coins view and the pindex it labels the answer with), and
+    ;; COINS-VIEW-CACHE-SYNC -- which every walk below calls through
+    ;; UTXO-SET-ITERATE -- states that contract for its own callers: the sync
+    ;; MAPHASHes and rewrites the live cache table the validation thread
+    ;; mutates under this lock. Unlocked, the three walks below (distinct
+    ;; txids, total amount, set hash) each raced that thread over an
+    ;; unsynchronised hash table AND each saw a different moment of the chain,
+    ;; so the height, the coin count and the hash need not describe one UTXO
+    ;; set at all. Local work only, no network I/O.
+    (with-node-lock (node)
+      (let* ((height (bl.store:current-height chain-state))
+             ;; The COINS VIEW's own best block, as Core reports
+             ;; (rpc/blockchain.cpp:1083). hash_serialized_3 IS the assumeutxo
+             ;; commitment, so hashing one set of coins and labelling it with a
+             ;; different block's hash commits to nothing — and the two genuinely
+             ;; differ partway through a reorg's disconnect phase.
+             (best-hash (or (bl.store:coins-view-best-block utxo-set)
+                            (bl.store:best-block-hash chain-state)))
+             (txout-count (bl.store:utxo-count utxo-set))
+             (tx-count (bl.store:utxo-set-distinct-txids utxo-set))
+             (total-satoshis (bl.store:utxo-set-total-amount utxo-set))
+             (total-btc (/ total-satoshis 100000000.0d0))
+             (result `(("height" . ,height)
+                       ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
+                       ("transactions" . ,tx-count)
+                       ("txouts" . ,txout-count)
+                       ("total_amount" . ,total-btc))))
+        ;; Add hash if requested (both hashes present the digest in display
+        ;; byte order via hash-to-hex, matching Core's uint256 GetHex()).
+        (cond
+          ((string= hash-type "hash_serialized_3")
+           (setf result (append result
+                                `(("hash_serialized_3"
+                                   . ,(hash-to-hex (bl.store:compute-utxo-set-hash
+                                                    utxo-set)))))))
+          ((string= hash-type "muhash")
+           (setf result (append result
+                                `(("muhash"
+                                   . ,(hash-to-hex (bl.store:compute-utxo-set-muhash
+                                                    utxo-set))))))))
+        result))))
 
 ;;; --- Block Statistics ---
 ;;;

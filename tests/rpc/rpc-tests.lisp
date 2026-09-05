@@ -728,6 +728,63 @@ status with no scan running returns null; abort with no scan is a no-op."
     (signals bl.rpc:rpc-error
       (bl.rpc::rpc-scantxoutset node (list "start")))))
 
+(defun %utxo-iterate-lock-observations (node thunk)
+  "Run THUNK with BL.STORE:UTXO-SET-ITERATE instrumented, and return one
+answer per call it made: was NODE's lock held when the walk was entered?"
+  (let ((observations '())
+        (real (fdefinition 'bl.store:utxo-set-iterate)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bl.store:utxo-set-iterate)
+                 (lambda (view callback)
+                   (push (sb-thread:holding-mutex-p (bl:node-lock node)) observations)
+                   (funcall real view callback)))
+           (funcall thunk))
+      (setf (fdefinition 'bl.store:utxo-set-iterate) real))
+    (nreverse observations)))
+
+(test utxo-set-walking-rpcs-hold-the-node-lock
+  "BL.STORE:COINS-VIEW-CACHE-SYNC -- which UTXO-SET-ITERATE calls on a
+coins-view-cache -- documents its caller contract: hold the node lock across
+the sync and the iterator that follows it. Core holds cs_main over the same
+span, in scantxoutset around the flush, the cursor and the tip read
+(rpc/blockchain.cpp:2410-2418) and in gettxoutsetinfo around
+ForceFlushStateToDisk and the coins view it labels the answer with
+(:1075-1084). These two walked unlocked, so the sync's MAPHASH over the live
+cache table ran against the validation thread's writes to that same table, and
+gettxoutsetinfo's three separate walks could each report a different moment of
+the chain.
+
+The probe records whether the lock is held at the moment each walk starts.
+Its positive control is the last clause: an ordinary unlocked call must be
+reported as unlocked, or a probe that answered T unconditionally would pass
+this test against either version of the source."
+  (let* ((node (make-test-node))
+         (utxo (bl:node-utxo-set node)))
+    (bl.store:add-utxo utxo
+                       (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)
+                       0 1000 (coerce #(#x51) '(vector (unsigned-byte 8))) 0)
+    (let ((seen (%utxo-iterate-lock-observations
+                 node (lambda ()
+                        (bl.rpc:dispatch-rpc-method node "gettxoutsetinfo" nil)))))
+      (is (plusp (length seen)))
+      (is (every #'identity seen)
+          "gettxoutsetinfo walked the UTXO set without the node lock: ~S" seen))
+    (let ((seen (%utxo-iterate-lock-observations
+                 node (lambda ()
+                        (bl.rpc:dispatch-rpc-method
+                         node "scantxoutset" (list "start" (list "raw(51)")))))))
+      (is (plusp (length seen)))
+      (is (every #'identity seen)
+          "scantxoutset walked the UTXO set without the node lock: ~S" seen))
+    ;; Positive control for the probe itself.
+    (is (equal '(nil)
+               (%utxo-iterate-lock-observations
+                node (lambda ()
+                       (bl.store:utxo-set-iterate
+                        utxo (lambda (txid vout entry)
+                               (declare (ignore txid vout entry))))))))))
+
 ;;; --- Response Formatting Tests ---
 
 (test json-rpc-response-success
