@@ -297,7 +297,7 @@ AttemptToEvictConnection pass for pass."
             (bl.net:disconnect-peer victim)
             t))))))
 
-(defun inbound-connection-allowed-p (node host)
+(defun inbound-connection-allowed-p (node host &optional onion)
   "Admission check for a freshly-accepted inbound connection from HOST,
 before any handshake work (Core CConnman::CreateNodeFromAcceptedSocket,
 net.cpp:1801-1813): a banned address is always dropped; a discouraged
@@ -316,6 +316,14 @@ banlist.json entry persisted from before the whitelist was configured). The
 backlog arm is NOT exempted: it is ours, not Core's, and it bounds file
 descriptors rather than expressing an opinion about the peer.
 
+ONION is the accepting listener's onion-ness (Core's inbound_onion, computed
+from m_onion_binds at :1767 and passed to the whitelist lookup at :1770-1772,
+which is BEFORE both ban arms read the flags). It must be threaded here and
+not only onto the peer: every inbound onion connection presents the local Tor
+daemon's loopback address, so without it a range grant covering 127.0.0.1
+would exempt every anonymous onion peer from this node's own ban list. See
+PEER-PERMISSION-FLAGS.
+
 The backlog arm matters because *MAX-INBOUND-CONNECTIONS* is otherwise enforced only
 at MERGE time, by the sync thread. Accepted peers hold a socket while they wait
 in PENDING-INBOUND-PEERS, so anything that stalls that thread turns every new
@@ -325,7 +333,7 @@ twice the inbound cap no matter what the rest of the node is doing."
   ;; Ban check first and lock-free: a connect flood is exactly when the listener
   ;; must not contend with the sync thread and RPC readers for the node lock.
   (let ((noban (bl.net:permission-flag-set-p
-                (bl.net:peer-permission-flags host t)
+                (bl.net:peer-permission-flags host t onion)
                 bl.net:+perm-noban+)))
     (cond
       ((and (not noban) (bl.net:peer-banned-p host))

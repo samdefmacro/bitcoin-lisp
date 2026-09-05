@@ -537,7 +537,12 @@
   addrman FAILURE may be charged -- because inbound connections are free
   for an attacker to make; the inbound eviction reserve likewise protects
   each disadvantaged network's LONGEST-connected peers, which is what
-  \"precludes attacks that start later\" means. A compact-block
+  \"precludes attacks that start later\" means. An inbound ONION peer is
+  granted no -whitelist permission by its address, because the address is
+  not its own: every one of them arrives from the local Tor daemon on the
+  onion listener, so one loopback range would hand the operator's trusted-peer
+  flags to every anonymous onion peer (Core's inbound_onion carve-out).
+  -whitebind still applies -- it describes the listening socket. A compact-block
   announcement is admitted in Core's handler order -- parent lookup, the
   anti-DoS work floor (the greater of nMinimumChainWork and tip work minus 144 tip proofs), then
   the header goes INTO the block index -- because everything past those

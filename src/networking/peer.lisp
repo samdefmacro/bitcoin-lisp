@@ -1647,9 +1647,12 @@ the loopback itself and takes every onion peer with it."
 
 (defun peer-has-permission-p (peer flag)
   "T when PEER holds FLAG (Core CNode::HasPermission). Derived from the peer's
-address and direction — see the divergence note in netaddress.lisp."
+address, direction and onion-ness — see the divergence note in netaddress.lisp
+for why the flags are computed rather than stored, and PEER-PERMISSION-FLAGS
+for what an inbound onion peer's address is worth."
   (permission-flag-set-p
-   (peer-permission-flags (peer-address peer) (peer-inbound peer))
+   (peer-permission-flags (peer-address peer) (peer-inbound peer)
+                          (peer-inbound-onion peer))
    flag))
 
 (defun record-misbehavior (peer &optional reason)
