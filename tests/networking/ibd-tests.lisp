@@ -297,7 +297,7 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
                 :host "10.0.0.4" :port 48333 :connected nil :socket nil))
          (peer (bl.net:make-peer
                 :connection conn :state :ready :address "10.0.0.4")))
-    (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) ctx)
+    (drain-peer-once peer (bl.ctx:make-node-context) ctx)
     (is (eq :disconnected (bl.net:peer-state peer)))
     (is (null (bl.net:peer-connection peer)))))
 
@@ -306,7 +306,7 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
   (let* ((ctx (bl.net::make-ibd))
          (peer (bl.net:make-peer
                 :connection nil :state :disconnected :address "10.0.0.5")))
-    (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) ctx)
+    (drain-peer-once peer (bl.ctx:make-node-context) ctx)
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
 ;;;; Timeout Tests
@@ -1740,10 +1740,10 @@ net_processing.cpp:2550). An unrelated getdata leaves the set alone."
                              :hash hash)))
                      24)))
       ;; A request for some OTHER tx (not served) doesn't clear ours.
-      (bl.net::handle-getdata peer (getdata-payload other) (bl.ctx:make-node-context :mempool mempool))
+      (deliver-getdata peer (getdata-payload other) (bl.ctx:make-node-context :mempool mempool))
       (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))
       ;; A request for the unbroadcast tx clears it.
-      (bl.net::handle-getdata peer (getdata-payload txid) (bl.ctx:make-node-context :mempool mempool))
+      (deliver-getdata peer (getdata-payload txid) (bl.ctx:make-node-context :mempool mempool))
       (is (= 0 (bl.mp:mempool-unbroadcast-count mempool))))))
 
 (test reattempt-initial-broadcast-relays-only-in-mempool
@@ -2385,12 +2385,12 @@ info_for_relay): the unbroadcast set keeps the tx, proving no serve fired."
     (%add-tx mempool tx)
     (bl.mp:mempool-add-unbroadcast mempool txid)
     ;; Peer's last flush predates the tx (default sequence snapshot 1).
-    (bl.net::handle-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
+    (deliver-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
     (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))
     ;; After a flush-time snapshot, the same request is served.
     (setf (bl.net:peer-last-inv-sequence peer)
           (bl.mp:mempool-sequence mempool))
-    (bl.net::handle-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
+    (deliver-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
     (is (= 0 (bl.mp:mempool-unbroadcast-count mempool)))))
 
 (test getdata-serves-most-recent-block-tx
@@ -2414,7 +2414,7 @@ observed via the unbroadcast-set removal that fires on every serve."
           ;; Track it as unbroadcast via the raw table (the public adder
           ;; requires pool membership) so the serve signal is observable.
           (setf (gethash txid (bl.mp:mempool-unbroadcast mempool)) t)
-          (bl.net::handle-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
+          (deliver-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
           (is (= 0 (bl.mp:mempool-unbroadcast-count mempool))))
       (bl.val:reset-recent-confirmed)
       (setf bl.val::*most-recent-block-txs* nil))))
@@ -2438,7 +2438,7 @@ the tx even though it is old enough to serve."
     (bl.mp:mempool-add-unbroadcast mempool txid)
     (setf (bl.net:peer-last-inv-sequence peer)
           (bl.mp:mempool-sequence mempool))
-    (bl.net::handle-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
+    (deliver-getdata peer payload (bl.ctx:make-node-context :mempool mempool))
     (is (= 1 (bl.mp:mempool-unbroadcast-count mempool)))))
 
 ;;;; Orphan resolution candidates via MSG_WTX announcements
@@ -2853,7 +2853,7 @@ messages and check the drain leaves some behind for the next pass."
              (write-sequence msg (usocket:socket-stream client)))
            (force-output (usocket:socket-stream client))
            (sleep 0.3)
-           (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context :chain-state state :utxo-set (bl.store:make-utxo-set)) ctx)
+           (drain-peer-once peer (bl.ctx:make-node-context :chain-state state :utxo-set (bl.store:make-utxo-set)) ctx)
            (let ((took (bl.net:connection-bytes-received
                         (bl.net:peer-connection peer))))
              (is (plusp took) "the drain served this peer")

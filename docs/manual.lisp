@@ -552,7 +552,15 @@
   BIP339 place strictly between VERSION and VERACK -- sendaddrv2,
   sendtxrcncl, wtxidrelay -- are handled inside that window by
   %AWAIT-VERACK, so their table rows exist only to drop a peer that sends
-  one afterwards, with Core's own log line. A gossiped address this node
+  one afterwards, with Core's own log line. A getdata is answered from a
+  per-peer QUEUE (Core Peer::m_getdata_requests): serving stops while the
+  peer is send-paused and the rest waits there until the next pump pass,
+  which drains it before it decides whether to read that peer at all --
+  dropping the remainder instead made the peer wait out its own request
+  timeout for data we had already looked up, and the queue is what lets the
+  deep-getblocktxn full-block fallback inherit the getdata path's
+  backpressure and serving guards rather than carry a private copy of them.
+  A gossiped address this node
   has banned or discouraged is dropped at ingest, before addrman and
   before relay, so the node never re-propagates an address it has itself
   judged hostile. Relaying an address only QUEUES it on the chosen peers

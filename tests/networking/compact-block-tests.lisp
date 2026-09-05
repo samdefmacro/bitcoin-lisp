@@ -1386,10 +1386,14 @@ for old blocks has no mempool that could reconstruct one (:2463-2476)."
          (flet ((serve (hash type)
                   (%cbp-capture-sends
                    (lambda ()
-                     (bl.net::handle-getdata peer (subseq (bl.ser:make-getdata-message
-                                    (list (bl.ser:make-inv-vector
-                                           :type type :hash hash)))
-                                   24) (bl.ctx:make-node-context :chain-state cs :block-store store))))))
+                     (deliver-getdata
+                      peer
+                      (subseq (bl.ser:make-getdata-message
+                               (list (bl.ser:make-inv-vector
+                                      :type type :hash hash)))
+                              24)
+                      (bl.ctx:make-node-context
+                       :chain-state cs :block-store store))))))
            (is (equal '("cmpctblock")
                       (serve tip bl.ser:+inv-type-cmpct-block+))
                "MSG_CMPCT_BLOCK at the tip is answered compactly")
@@ -1401,6 +1405,57 @@ for old blocks has no mempool that could reconstruct one (:2463-2476)."
                       (serve tip bl.ser:+inv-type-witness-block+)))
            (is (equal '("block")
                       (serve tip bl.ser:+inv-type-block+)))))))))
+
+(test getblocktxn-too-deep-answers-through-the-getdata-queue
+  "A getblocktxn for a block deeper than MAX_BLOCKTXN_DEPTH is answered with
+the whole block, and Core answers it by pushing a MSG_WITNESS_BLOCK onto the
+peer\'s getdata queue and letting the message loop come round again
+(net_processing.cpp:4387-4390) -- so the reply inherits ProcessGetData\'s
+backpressure and its serving guards instead of carrying a private copy of
+them. Sending it inline meant a send-paused peer got NOTHING and had to wait
+out its own timeout for a 4 MB block we had already read off disk.
+
+Twelve blocks, so the first is 11 deep: past the depth rule, which is where
+the fallback lives."
+  (with-network (:regtest)
+   (let* ((node (regtest-node-fixture "cb-gbt-deep"))
+          (cs (bl:node-chain-state node))
+          (store (bl:node-block-store node))
+          (hashes (bl.rpc::%generate-to-script-pubkey
+                   node (p2sh-optrue-script-pubkey) 12 1000000))
+          (deep-hash (bl.rpc:parse-hex-hash (first hashes)))
+          (peer (%cbp-peer "198.51.100.31"))
+          (conn (bl.net::make-connection))
+          (ctx (bl.ctx:make-node-context :chain-state cs :block-store store))
+          (payload (subseq (bl.ser:make-getblocktxn-message deep-hash (list 0))
+                           24)))
+     (setf (bl.net:peer-connection peer) conn)
+     (flet ((ask ()
+              (%cbp-capture-sends
+               (lambda () (bl.net::handle-getblocktxn peer payload ctx)))))
+       ;; Unpaused, the answer is the same as before: the whole block.
+       (is (equal (list "block") (ask))
+           "a too-deep getblocktxn is answered with the full block")
+       (is (null (peer-pending-getdata peer))
+           "and nothing is left pending when the peer can take it")
+       ;; Send-paused, the request is PARKED rather than dropped.
+       (setf (send-buffer-bytes conn) (1+ bl.net:*max-send-buffer-bytes*))
+       (is (null (ask)) "a send-paused peer is not written to")
+       (let ((pending (peer-pending-getdata peer)))
+         (is (= 1 (length pending)) "the block request waits on the peer")
+         (when pending
+           (is (= bl.ser:+inv-type-witness-block+
+                  (bl.ser:inv-vector-type (first pending)))
+               "as Core\'s MSG_WITNESS_BLOCK")
+           (is (equalp deep-hash (bl.ser:inv-vector-hash (first pending))))))
+       ;; Buffer drained: the parked request is answered.
+       (setf (send-buffer-bytes conn) 0)
+       (is (equal (list "block")
+                  (%cbp-capture-sends
+                   (lambda () (bl.net::process-peer-getdata peer ctx))))
+           "and the parked request is answered once the buffer drains")
+       (is (null (peer-pending-getdata peer)))))))
+
 
 (test g7-16-blocktxn-completion-promotes-only-after-the-block-validates
   "The OTHER compact path — a reconstruction completed by blocktxn — carried the

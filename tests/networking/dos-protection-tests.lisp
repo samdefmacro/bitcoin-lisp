@@ -1220,7 +1220,7 @@ Announce just under the limit."
                        internal-time-units-per-second)))
            (is-true (bl.net::connection-receive-expired-p conn)
                     "an abandoned message eventually expires")
-           (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) nil)
+           (drain-peer-once peer (bl.ctx:make-node-context) nil)
            (is-false (bl.net:connection-connected conn)
                      "and the pump drops the peer")
            (is (eq :disconnected (bl.net:peer-state peer))
@@ -1352,7 +1352,7 @@ consults expiry."
            (is-false (bl.net::connection-receive-expired-p conn)
                      "a peer whose bytes are already here is not stalled")
            ;; And the drain — not a disconnect — is what happens next.
-           (bl.net::drain-and-reap-peer peer (bl.ctx:make-node-context) nil)
+           (drain-peer-once peer (bl.ctx:make-node-context) nil)
            (is-true (bl.net:connection-connected conn)
                     "a busy pump must not cost a healthy peer its connection"))
       (usocket:socket-close sender)
