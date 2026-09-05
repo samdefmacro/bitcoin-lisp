@@ -101,9 +101,80 @@ base58_tests.cpp)."
           (is (string= b58 (bl.crypto:base58-encode bytes))
               "encoding ~S gave ~S, expected ~S"
               hex (bl.crypto:base58-encode bytes) b58)
-          (is (equalp bytes (bl.crypto:base58-decode b58))
+          (is (equalp bytes (bl.crypto:base58-decode b58 256))
               "decoding ~S did not give ~S" b58 hex))))
     (is (= 21 checked) "expected Core's 21 base58 vectors, ran ~D" checked)))
+
+(defun %base58-test-string (&rest parts)
+  "PARTS joined, with an integer standing for the character of that code --
+Core's base58_tests.cpp writes the six whitespace characters as C escapes, and
+only space and tab have portable Lisp character names."
+  (apply #'concatenate 'string
+         (mapcar (lambda (p) (if (integerp p) (string (code-char p)) p)) parts)))
+
+(test core-base58-decode-bounds-and-whitespace
+  "base58_tests.cpp:64-83, the half of Core's DecodeBase58 contract that is not
+about round-tripping: an invalid character or an embedded NUL is a rejection,
+leading and trailing whitespace is skipped, whitespace anywhere else is not,
+and MAX-RET-LEN is a real bound rather than a check on the finished result."
+  (let ((nul (string (code-char 0))))
+    ;; Invalid characters and NULs (base58.cpp:127-130 tests the whole string
+    ;; for a NUL; our decoder reaches the same answer because NUL is not a
+    ;; base58 digit).
+    (is (null (bl.crypto:base58-decode "invalid" 100)))
+    (is (null (bl.crypto:base58-decode (concatenate 'string "invalid" nul) 100)))
+    (is (null (bl.crypto:base58-decode (concatenate 'string nul "invalid") 100)))
+    (is-true (bl.crypto:base58-decode "good" 100))
+    (is (null (bl.crypto:base58-decode "bad0IOl" 100)))
+    (is (null (bl.crypto:base58-decode "goodbad0IOl" 100)))
+    (is (null (bl.crypto:base58-decode
+               (concatenate 'string "good" nul "bad0IOl") 100))))
+  ;; " \t\n\v\f\r skip \r\f\v\n\t " decodes; the same string with a
+  ;; trailing "a" does not, because the digits ended at the first space.
+  (let ((skip (%base58-test-string " " 9 10 11 12 13 " skip " 13 12 11 10 9 " ")))
+    (is (null (bl.crypto:base58-decode (concatenate 'string skip "a") 3)))
+    (is (equalp (bl.crypto:hex-to-bytes "971a55")
+                (bl.crypto:base58-decode skip 3))))
+  ;; DecodeBase58Check's bound excludes the four checksum bytes.
+  (is-true (bl.crypto:base58check-decode "3vQB7B6MrGQZaxCuFg4oh" 100))
+  (is (null (bl.crypto:base58check-decode "3vQB7B6MrGQZaxCuFg4oi" 100)))
+  (is (null (bl.crypto:base58check-decode "3vQB7B6MrGQZaxCuFg4oh0IOl" 100)))
+  (is (null (bl.crypto:base58check-decode
+             (concatenate 'string "3vQB7B6MrGQZaxCuFg4oh" (string (code-char 0)) "0IOl")
+             100)))
+  ;; The bound bites one byte early, on a string that is otherwise valid.
+  (let ((addr "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"))
+    (is (= 25 (length (bl.crypto:base58-decode addr 25))))
+    (is (null (bl.crypto:base58-decode addr 24)))
+    (is-true (bl.crypto:base58check-decode addr 21))
+    (is (null (bl.crypto:base58check-decode addr 20))))
+  ;; And leading '1's count against it before a single digit is processed
+  ;; (base58.cpp:48-50).
+  (is (null (bl.crypto:base58-decode (make-string 5000 :initial-element #\1) 21))))
+
+(test address-decoding-follows-cores-whitespace-and-cost-rules
+  "The two consequences at the entry point RPC callers reach. Core's
+DecodeDestination accepts an address with whitespace around it (base58.cpp:42-43,
+:73-74) and gives up on an over-long one after about thirty characters
+(base58.cpp:71); before the bound existed this decoder accumulated one big
+integer over the whole argument, which is quadratic -- 200,000 characters cost
+3.0 s of the handler thread, and an RPC body may be 32 MiB."
+  (is (eq :p2pkh (bl.crypto:decode-address "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2" :mainnet)))
+  (is (eq :p2pkh (bl.crypto:decode-address " 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2 " :mainnet))
+      "Core skips the whitespace around an address; we must decode the same string")
+  (is (eq :p2pkh (bl.crypto:decode-address
+                  (%base58-test-string 9 13 "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2" 10 12) :mainnet)))
+  (is (null (bl.crypto:decode-address "1BvB MSEYstWetqTFn5Au4m4GFg7xJaNVN2" :mainnet))
+      "whitespace inside the digits still ends the string")
+  (let* ((long (make-string 400000 :initial-element #\z))
+         (start (get-internal-real-time))
+         (result (bl.crypto:decode-address long :mainnet))
+         (seconds (/ (- (get-internal-real-time) start)
+                     internal-time-units-per-second)))
+    (is (null result))
+    (is (< seconds 3)
+        "a ~D-character address argument took ~,2F s; the bound is what keeps ~
+         this from being quadratic" (length long) seconds)))
 
 ;;;; BIP173 / BIP350 bech32 and bech32m vectors (Core bech32_tests.cpp).
 ;;;;

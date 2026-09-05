@@ -48,7 +48,8 @@
   "Test Base58 encode/decode round-trip."
   (let* ((original #(1 2 3 4 5 6 7 8 9 10))
          (encoded (bl.crypto:base58-encode original))
-         (decoded (bl.crypto:base58-decode encoded)))
+         ;; Core base58_tests.cpp:60 decodes its vectors with 256.
+         (decoded (bl.crypto:base58-decode encoded 256)))
     (is (stringp encoded))
     (is (vectorp decoded))
     (is (equalp original decoded))))
@@ -67,7 +68,7 @@
          (version 111)  ; Testnet P2PKH
          (encoded (bl.crypto:base58check-encode version payload)))
     (multiple-value-bind (dec-version dec-payload)
-        (bl.crypto:base58check-decode encoded)
+        (bl.crypto:base58check-decode encoded 21)
       (is (= dec-version version))
       (is (equalp dec-payload payload)))))
 
@@ -75,7 +76,7 @@
   "Test Base58Check detects invalid checksum."
   ;; A valid address with modified character to corrupt checksum
   (let ((invalid "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfX"))  ; Changed last char
-    (is (null (bl.crypto:base58check-decode invalid)))))
+    (is (null (bl.crypto:base58check-decode invalid 21)))))
 
 (test bech32-encode-decode-v0
   "Test Bech32 encode/decode for witness v0."

@@ -40,32 +40,75 @@ Preserves leading zeros as '1' characters."
                  (make-string leading-zeros :initial-element #\1)
                  (coerce result 'string))))
 
-(defun base58-decode (str)
-  "Decode a Base58 string to byte vector.
-Returns NIL if string contains invalid characters."
-  (let ((leading-ones 0))
-    ;; Count leading '1's (representing zero bytes)
-    (loop for c across str
-          while (char= c #\1)
-          do (incf leading-ones))
-    ;; Convert from base58 to big integer
-    (let ((num 0))
-      (loop for c across str
-            for code = (char-code c)
-            for digit = (if (< code 128) (aref *base58-decode-map* code) -1)
-            do (when (minusp digit)
+(defun %base58-space-p (code)
+  "Core's IsSpace (util/strencodings.h:166): space, form feed, newline,
+carriage return, tab, vertical tab -- and nothing else, locale independently."
+  (or (= code 32) (= code 12) (= code 10) (= code 13) (= code 9) (= code 11)))
+
+(defun base58-decode (str max-ret-len)
+  "Decode a Base58 string to a byte vector of at most MAX-RET-LEN bytes, or
+NIL. Core's DecodeBase58 (base58.cpp:40-84), argument for argument.
+
+MAX-RET-LEN is not a post-hoc length check: the decoder gives up inside the
+per-character loop the moment the accumulated result would pass the bound
+(base58.cpp:50 for the leading '1's, :71 for the digits), so the cost stays
+linear in a string it is going to reject. Accumulating one big integer over
+the whole string instead is quadratic -- measured on this tree before the
+bound existed: 200,000 'z's took 3.0 s, and an address argument reaches this
+through an RPC body that may be 32 MiB.
+
+Leading and trailing whitespace is skipped, as Core does (base58.cpp:42-43
+and :73-74); whitespace in the middle ends the digits and then fails the
+end-of-string check. An invalid character -- NUL included, which is why Core
+tests the string for one up front -- returns NIL."
+  (let ((n (length str))
+        (i 0)
+        (zeroes 0)
+        (out-len 0))
+    (flet ((skip-spaces ()
+             (loop while (and (< i n) (%base58-space-p (char-code (char str i))))
+                   do (incf i))))
+      (skip-spaces)
+      ;; Leading '1's are zero bytes and count against the bound directly.
+      (loop while (and (< i n) (char= (char str i) #\1))
+            do (incf zeroes)
+               (when (> zeroes max-ret-len)
                  (return-from base58-decode nil))
-               (setf num (+ (* num 58) digit)))
-      ;; Convert big integer to bytes
-      (let ((result-bytes '()))
-        (loop while (plusp num)
-              do (push (logand num #xff) result-bytes)
-                 (setf num (ash num -8)))
-        ;; Add leading zero bytes
-        (concatenate '(vector (unsigned-byte 8))
-                     (make-array leading-ones :element-type '(unsigned-byte 8)
-                                              :initial-element 0)
-                     (coerce result-bytes '(vector (unsigned-byte 8))))))))
+               (incf i))
+      ;; Big-endian base-256 accumulator. Core sizes it from what is left of
+      ;; the string (log(58)/log(256) rounded up); capping that at
+      ;; MAX-RET-LEN+1 is the same buffer for every string that can still
+      ;; succeed, because the loop below stops as soon as OUT-LEN passes the
+      ;; bound and one carry can extend the result by at most one byte.
+      (let* ((size (max 1 (min (1+ (floor (* (- n i) 733) 1000))
+                               (1+ max-ret-len))))
+             (b256 (make-array size :element-type '(unsigned-byte 8)
+                                    :initial-element 0)))
+        (loop while (< i n)
+              do (let ((code (char-code (char str i))))
+                   (when (%base58-space-p code) (return))
+                   (let ((carry (if (< code 128) (aref *base58-decode-map* code) -1))
+                         (used 0))
+                     (when (minusp carry)
+                       (return-from base58-decode nil))
+                     ;; b256 = b256 * 58 + carry, high byte last.
+                     (loop for j downfrom (1- size) to 0
+                           while (or (plusp carry) (< used out-len))
+                           do (incf carry (* 58 (aref b256 j)))
+                              (setf (aref b256 j) (logand carry #xff))
+                              (setf carry (ash carry -8))
+                              (incf used))
+                     (setf out-len used)
+                     (when (> (+ out-len zeroes) max-ret-len)
+                       (return-from base58-decode nil))))
+                 (incf i))
+        (skip-spaces)
+        (unless (= i n)
+          (return-from base58-decode nil))
+        (let ((out (make-array (+ zeroes out-len) :element-type '(unsigned-byte 8)
+                                                  :initial-element 0)))
+          (replace out b256 :start1 zeroes :start2 (- size out-len))
+          out)))))
 
 ;;; ============================================================
 ;;; Base58Check Encoding/Decoding
@@ -82,10 +125,15 @@ Adds checksum (first 4 bytes of double SHA256)."
                                      versioned checksum)))
     (base58-encode with-checksum)))
 
-(defun base58check-decode (str)
+(defun base58check-decode (str max-ret-len)
   "Decode a Base58Check string.
-Returns (VALUES version payload) or NIL if invalid."
-  (let ((bytes (base58-decode str)))
+Returns (VALUES version payload) or NIL if invalid.
+
+MAX-RET-LEN bounds the decoded bytes WITHOUT the four checksum bytes -- the
+version byte plus the payload -- so it is the number Core's callers pass to
+DecodeBase58Check (21 for a destination, 34 for WIF, 78 for an extended key);
+like Core (base58.cpp:146-148) it hands the raw decoder that bound plus four."
+  (let ((bytes (base58-decode str (+ max-ret-len 4))))
     (when (and bytes (>= (length bytes) 5))
       (let* ((version (aref bytes 0))
              (payload (subseq bytes 1 (- (length bytes) 4)))
@@ -114,7 +162,9 @@ meaning the corresponding public key is the 33-byte form."
 or NIL if invalid. VERSION-BYTE is the chainparams SECRET_KEY prefix the key
 was encoded under -- compare it with the expected chain's, as Core's
 DecodeSecret does; the byte alone cannot tell the test chains apart."
-  (multiple-value-bind (version payload) (base58check-decode wif)
+  ;; Core DecodeSecret (key_io.cpp:214-217) bounds this at 34: the
+  ;; SECRET_KEY prefix, the 32-byte scalar and the compression flag.
+  (multiple-value-bind (version payload) (base58check-decode wif 34)
     (when (and version payload
                (bl.chain:secret-prefix-known-p version)
                (or (= (length payload) 32)
@@ -316,7 +366,9 @@ NETWORK is :testnet3, :testnet4, :signet, or :mainnet."
           (return-from decode-address
             (values type script-pubkey wit-ver wit-prog)))))
     ;; Try Base58Check
-    (multiple-value-bind (version payload) (base58check-decode address)
+    ;; Core DecodeDestination (key_io.cpp:93) bounds this at 21: the version
+    ;; byte and a 20-byte hash160.
+    (multiple-value-bind (version payload) (base58check-decode address 21)
       (when version
         ;; Core DecodeDestination: the version byte must be THIS chain's
         ;; PUBKEY_ADDRESS or SCRIPT_ADDRESS prefix (the test chains share one pair).

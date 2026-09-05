@@ -119,7 +119,7 @@ a legal character and the parser sees genuinely arbitrary text."
              (s (map 'string #'code-char bytes)))
         (let ((caught (handler-case
                           (progn (bl.crypto:bech32-decode s)
-                                 (bl.crypto:base58-decode s)
+                                 (bl.crypto:base58-decode s 21)
                                  (bl.crypto:decode-address s :mainnet)
                                  (ignore-errors (bl.rpc:parse-descriptor s :mainnet))
                                  nil)
@@ -138,7 +138,7 @@ hand-written vector and fails here."
     (dotimes (i 3000)
       (let* ((bytes (%fuzz-bytes 64))
              (encoded (bl.crypto:base58-encode bytes))
-             (decoded (ignore-errors (bl.crypto:base58-decode encoded))))
+             (decoded (ignore-errors (bl.crypto:base58-decode encoded 64))))
         (unless (and decoded (equalp (coerce decoded 'list) (coerce bytes 'list)))
           (push (list i (bl.crypto:bytes-to-hex bytes) encoded) bad))))
     (is (null bad) "~D of 3000 base58 roundtrips lost data; first ~S"
