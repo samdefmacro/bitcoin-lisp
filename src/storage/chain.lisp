@@ -42,14 +42,13 @@ fully-validated chainstate — but the slots below already carry the
 assumeutxo identity a snapshot chainstate (a future ActivateSnapshot)
 needs, so the node can hold several in a list and select between them."
   (block-index (make-hash-table :test 'equalp) :type hash-table)
-  ;; CRC32 of the header-index SNAPSHOT the current delta log is bound to, and
-  ;; how many entries that delta holds. The CRC is the snapshot's identity: a
-  ;; delta whose recorded CRC does not match the snapshot on disk was left by a
-  ;; crash between "write snapshot" and "remove delta", and replaying it would
-  ;; roll entries BACK to older statuses. Binding by CRC makes that impossible
-  ;; without adding a field to the snapshot format.
-  (header-index-snapshot-crc nil)
-  (header-index-delta-entries 0 :type (unsigned-byte 32))
+  ;; The delta log's binding to the snapshot it extends does NOT live here:
+  ;; headerindex.dat and headerindex.delta are shared by every chainstate on
+  ;; one base path (they take no storage-suffix, since the block index itself
+  ;; is shared -- Core keeps it in BlockManager, outside any chainstate), so a
+  ;; per-struct copy of that binding gave two chainstates two answers about one
+  ;; pair of files and each invalidated the other's log. See
+  ;; HEADER-INDEX-PERSISTENCE.
   (best-block-hash nil)
   (best-height 0 :type (unsigned-byte 32))
   (genesis-hash nil)
@@ -926,6 +925,50 @@ full snapshot rather than relying on this key."
           (ash (if (block-index-entry-data-pos entry) 1 0) 59)
           (ash (if (block-index-entry-undo-pos entry) 1 0) 60)))
 
+(defstruct (header-index-persistence (:conc-name hip-))
+  "How the header-index delta log beside one headerindex.dat is bound to it.
+
+SNAPSHOT-CRC is the CRC32 of the SNAPSHOT the current delta extends -- the
+snapshot's identity. A delta whose recorded CRC does not match the snapshot on
+disk was orphaned by a crash between \"write snapshot\" and \"remove delta\", and
+replaying it would roll entries BACK to older statuses; binding by CRC makes
+that impossible without adding a field to the snapshot format. DELTA-ENTRIES
+is how many entries that log holds, which is what decides when a full rewrite
+is cheaper.
+
+One record per FILE PAIR, not per chainstate. This lived on the chain-state
+struct, and %MAKE-SNAPSHOT-CHAINSTATE shares the block index with the primary
+but copied neither slot -- so the snapshot chainstate started with a NIL crc,
+its first flush rewrote the shared index, deleted the delta and adopted the new
+CRC for itself alone, and the primary's crc then named a snapshot that no
+longer existed. Every block-index change since the last full snapshot -- an
+operator's invalidateblock included -- was dropped at the next unclean stop.
+Core has no such state to duplicate: BlockManager owns one m_block_index and
+one WriteBlockIndexDB (node/blockstorage.cpp:407-421,510-527)."
+  (snapshot-crc nil)
+  (delta-entries 0 :type (unsigned-byte 32)))
+
+(defvar *header-index-persistence* (make-hash-table :test 'equal :synchronized t)
+  "HEADER-INDEX-PERSISTENCE records, keyed by chain-state base path -- the
+directory that owns one headerindex.dat and one headerindex.delta. Two
+chainstates on one datadir share the entry because they share the files.
+
+Synchronized: SAVE-HEADER-INDEX runs on the sync thread through the periodic
+flush and on an RPC worker through *PERSIST-BLOCK-INDEX-HOOK* (every UTXO-set
+RPC syncs the coins cache, which stages the pointer and persists the index
+first), so two threads can reach the same entry.")
+
+(defun header-index-persistence (state)
+  "STATE's header-index persistence record, created on first use. Keyed by base
+path rather than by chainstate: the header index takes no storage-suffix, so
+every chainstate on a datadir writes the same two files. A base-path-less
+chain-state (a bare MAKE-CHAIN-STATE in a test) resolves the same relative
+paths as every other one, so they correctly share one record too."
+  (let ((key (namestring (or (chain-state-base-path state) #p""))))
+    (or (gethash key *header-index-persistence*)
+        (setf (gethash key *header-index-persistence*)
+              (make-header-index-persistence)))))
+
 (defun header-index-delta-path (state)
   "Path to the header index delta log."
   (merge-pathnames "headerindex.delta" (chain-state-base-path state)))
@@ -1052,8 +1095,9 @@ rebinds the (now empty) delta to the NEW snapshot's CRC."
                (setf (block-index-entry-persisted-key entry)
                      (%entry-persist-key entry)))
              (chain-state-block-index state))
-    (setf (chain-state-header-index-snapshot-crc state) (%file-trailing-crc path)
-          (chain-state-header-index-delta-entries state) 0)
+    (let ((hip (header-index-persistence state)))
+      (setf (hip-snapshot-crc hip) (%file-trailing-crc path)
+            (hip-delta-entries hip) 0))
     t))
 
 (defun %changed-header-index-entries (state)
@@ -1067,6 +1111,20 @@ rebinds the (now empty) delta to the NEW snapshot's CRC."
              (chain-state-block-index state))
     changed))
 
+(defun %delta-log-header-crc (path)
+  "The snapshot CRC recorded in the 12-byte header of the delta log at PATH,
+or NIL when the file is too short, is not a delta log, or cannot be read."
+  (handler-case
+      (with-open-file (in path :direction :input
+                               :element-type '(unsigned-byte 8)
+                               :if-does-not-exist nil)
+        (when (and in (>= (file-length in) 12))
+          (let ((head (make-array 12 :element-type '(unsigned-byte 8))))
+            (read-sequence head in)
+            (when (equalp (subseq head 0 4) *header-index-delta-magic*)
+              (subseq head 8 12)))))
+    (error () nil)))
+
 (defun %append-header-index-delta (state entries)
   "Append one CRC-framed batch of ENTRIES to the delta log. Returns T on
 success, NIL if the log could not be written (the caller then falls back to a
@@ -1074,11 +1132,20 @@ full snapshot).
 
 Frame: count(4) + count*entry(185) + CRC32(4) over that payload. The loader
 stops at the first frame that is short or fails its CRC, which is exactly what
-a crash mid-append leaves behind."
+a crash mid-append leaves behind.
+
+An EXISTING log's 12-byte header is re-checked against our own snapshot CRC
+before anything is appended. The header is only WRITTEN when the log is fresh,
+so without this a writer bound to a superseded snapshot could append frames
+into a log the loader will discard whole -- taking with it every frame a
+healthy writer had contributed. A mismatch answers NIL, and the caller writes
+a full snapshot instead."
   (let* ((path (header-index-delta-path state))
-         (crc (chain-state-header-index-snapshot-crc state))
+         (crc (hip-snapshot-crc (header-index-persistence state)))
          (fresh (not (probe-file path))))
     (unless crc
+      (return-from %append-header-index-delta nil))
+    (unless (or fresh (equalp crc (%delta-log-header-crc path)))
       (return-from %append-header-index-delta nil))
     (handler-case
         (let ((bb (bl.ser:make-byte-buf)))
@@ -1106,7 +1173,7 @@ a crash mid-append leaves behind."
                       (sb-posix:fsync (sb-sys:fd-stream-fd out)))))
           (dolist (e entries)
             (setf (block-index-entry-persisted-key e) (%entry-persist-key e)))
-          (incf (chain-state-header-index-delta-entries state) (length entries))
+          (incf (hip-delta-entries (header-index-persistence state)) (length entries))
           t)
       (error () nil))))
 
@@ -1115,7 +1182,7 @@ a crash mid-append leaves behind."
 Bounded by a fraction of the index so the delta can never approach the size of
 the thing it is an optimisation over."
   (let ((count (hash-table-count (chain-state-block-index state))))
-    (>= (+ (chain-state-header-index-delta-entries state) pending)
+    (>= (+ (hip-delta-entries (header-index-persistence state)) pending)
         (max 20000 (floor count 16)))))
 
 (defun save-header-index (state &key force-full)
@@ -1134,7 +1201,7 @@ mainnet, measured 2026-08-19."
   (let ((path (header-index-file-path state)))
     (ensure-directories-exist path)
     (when (or force-full
-              (null (chain-state-header-index-snapshot-crc state))
+              (null (hip-snapshot-crc (header-index-persistence state)))
               (not (probe-file path)))
       (return-from save-header-index (%write-header-index-snapshot state)))
     (let ((changed (%changed-header-index-entries state)))
@@ -1197,7 +1264,7 @@ shape of a crash mid-append — and keeps everything before it."
                                  (ash (aref bytes 6) 16)
                                  (ash (aref bytes 7) 24))))
                   (not (equalp (subseq bytes 8 12)
-                               (or (chain-state-header-index-snapshot-crc state)
+                               (or (hip-snapshot-crc (header-index-persistence state))
                                    #()))))
               ;; Not ours — a stale log from a superseded snapshot, or one
               ;; written in an older entry layout.
@@ -1283,9 +1350,9 @@ loading block database\" rather than an empty index (init.cpp)."
             (when ok
               ;; Bind the delta to this snapshot and replay whatever of it is
               ;; intact, then take every entry as persisted at its loaded state.
-              (setf (chain-state-header-index-snapshot-crc state)
-                    (%file-trailing-crc path)
-                    (chain-state-header-index-delta-entries state) 0)
+              (let ((hip (header-index-persistence state)))
+                (setf (hip-snapshot-crc hip) (%file-trailing-crc path)
+                      (hip-delta-entries hip) 0))
               (%replay-header-index-delta state)
               (maphash (lambda (h entry)
                          (declare (ignore h))

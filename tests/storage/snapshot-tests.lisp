@@ -778,4 +778,4 @@ verification gate on a fresh node."
              (is (eq nil (bl:node-network-active node)))
              (is (= 4 (bl.store:current-height cs))))
            (setf (bl:node-network-active node) t))
-         (clrhash bl.val::*block-undo-data*))))))
+         (clear-undo-cache))))))

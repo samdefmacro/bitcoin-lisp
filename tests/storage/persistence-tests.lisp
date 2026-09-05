@@ -751,7 +751,129 @@ thing it optimises."
         (bl.store:save-header-index cs :force-full t)
         (is (null (%hidx-size delta)))
         (is (= snap-size (%hidx-size snap)))
-        (is (zerop (bl.store::chain-state-header-index-delta-entries cs)))))))
+        (is (zerop (bl.store::hip-delta-entries
+                    (bl.store::header-index-persistence cs))))))))
+
+(defun %hidx-crc (cs)
+  "The snapshot CRC the delta log beside CS's header index is bound to."
+  (bl.store::hip-snapshot-crc (bl.store::header-index-persistence cs)))
+
+(defun (setf %hidx-crc) (value cs)
+  (setf (bl.store::hip-snapshot-crc (bl.store::header-index-persistence cs))
+        value))
+
+(defun %hidx-second-chainstate (cs)
+  "A second chain-state on CS's base path with CS's block index, built exactly
+as %MAKE-SNAPSHOT-CHAINSTATE builds a snapshot chainstate: same directory,
+shared index, its own storage suffix. The header index takes no suffix, so the
+two write the SAME headerindex.dat and headerindex.delta."
+  (bl.store:make-chain-state
+   :base-path (bl.store::chain-state-base-path cs)
+   :genesis-hash (bl.store:chain-state-genesis-hash cs)
+   :block-index (bl.store:chain-state-block-index cs)
+   :storage-suffix "_snapshot"))
+
+(defun %hidx-reload-status (cs hash)
+  "Load the header index from CS's base path into a fresh chain-state (replaying
+whatever delta is intact) and report HASH's status, as a restart would see it."
+  (let ((reload (bl.store:init-chain-state (bl.store::chain-state-base-path cs))))
+    (bl.store:load-header-index reload)
+    (let ((e (bl.store:get-block-index-entry reload hash)))
+      (and e (bl.store:block-index-entry-status e)))))
+
+(test header-index-delta-binding-is-per-file-not-per-chainstate
+  "GA11 dc27ca3a. Two chainstates on one datadir share one headerindex.dat and
+one headerindex.delta -- Core keeps the block index in BlockManager, outside
+any chainstate (node/blockstorage.cpp:407-421,510-527) -- so the CRC that binds
+the delta to its snapshot belongs to the FILE PAIR. While it lived on the
+chain-state struct, %make-snapshot-chainstate copied neither slot, so the
+snapshot chainstate's first flush rewrote the shared index, deleted the delta
+and took the new CRC for itself, leaving the primary bound to a snapshot that
+no longer existed; every later frame the primary wrote was then discarded at
+the next start, an operator's invalidateblock included."
+  (multiple-value-bind (cs1) (%hidx-fixture "shared")
+    (let* ((h1 (%hidx-add cs1 1 :valid))
+           (h2 (%hidx-add cs1 2 :valid))
+           (h3 (%hidx-add cs1 3 :valid))
+           (cs2 (%hidx-second-chainstate cs1))
+           (delta (bl.store::header-index-delta-path cs1)))
+      ;; One record, reached from either chainstate.
+      (bl.store:save-header-index cs1)
+      (is (eq (bl.store::header-index-persistence cs1)
+              (bl.store::header-index-persistence cs2)))
+      (is-true (%hidx-crc cs2))
+      ;; Alternating saves: each appends to the log the other created rather
+      ;; than rewriting the snapshot out from under it.
+      (setf (bl.store:block-index-entry-status
+             (bl.store:get-block-index-entry cs1 h1)) :header-valid)
+      (bl.store:save-header-index cs1)
+      (is-true (plusp (%hidx-size delta)))
+      (setf (bl.store:block-index-entry-status
+             (bl.store:get-block-index-entry cs1 h2)) :header-valid)
+      (bl.store:save-header-index cs2)
+      (is-true (plusp (%hidx-size delta)) "cs2's save deleted the shared delta")
+      ;; The mark that matters, persisted through the chainstate that did NOT
+      ;; create the log, and read back by a restart.
+      (setf (bl.store:block-index-entry-status
+             (bl.store:get-block-index-entry cs1 h3)) :invalid)
+      (bl.store:save-header-index cs2)
+      (is (eq :invalid (%hidx-reload-status cs1 h3)))
+      (is (eq :header-valid (%hidx-reload-status cs1 h1))))))
+
+(test header-index-per-chainstate-binding-loses-the-mark
+  "The positive control for the test above: give each chainstate its OWN
+persistence record -- the pre-fix shape, reproduced by rebinding the registry
+around each save rather than by editing the struct -- and the same sequence
+loses the :invalid mark at the next load. The snapshot chainstate, starting
+with no CRC, rewrites the shared index and takes the new one for itself; the
+primary then opens a delta stamped with the snapshot it replaced, and the
+loader discards the whole log."
+  (multiple-value-bind (cs1) (%hidx-fixture "unshared")
+    (let* ((h1 (%hidx-add cs1 1 :valid))
+           (h3 (progn (%hidx-add cs1 2 :valid) (%hidx-add cs1 3 :valid)))
+           (cs2 (%hidx-second-chainstate cs1))
+           (per-cs1 (make-hash-table :test 'equal))
+           (per-cs2 (make-hash-table :test 'equal)))
+      (flet ((save (cs table)
+               (let ((bl.store::*header-index-persistence* table))
+                 (bl.store:save-header-index cs)))
+             (mark (hash status)
+               (setf (bl.store:block-index-entry-status
+                      (bl.store:get-block-index-entry cs1 hash))
+                     status)))
+        (save cs1 per-cs1)
+        ;; cs2 has never seen a snapshot, so it rewrites the index and adopts
+        ;; the new CRC alone; cs1's record still names the one just replaced.
+        ;; The change is what makes the new snapshot a DIFFERENT file.
+        (mark h1 :header-valid)
+        (save cs2 per-cs2)
+        (mark h3 :invalid)
+        (save cs1 per-cs1)
+        (is (eq :valid (%hidx-reload-status cs1 h3))
+            "the pre-fix shape kept the mark, so the test above proves nothing")))))
+
+(test header-index-delta-append-rechecks-the-log-header
+  "The other half of dc27ca3a: %append-header-index-delta writes the 12-byte
+header only when the log is FRESH, so a writer bound to a superseded snapshot
+used to append frames into a log the loader will discard whole -- taking with
+it every frame a healthy writer had contributed. An existing log's recorded
+CRC is now re-checked, and a mismatch refuses the append so the caller writes
+a full snapshot instead."
+  (multiple-value-bind (cs) (%hidx-fixture "logcrc")
+    (let ((h (%hidx-add cs 1 :valid))
+          (delta (bl.store::header-index-delta-path cs)))
+      (bl.store:save-header-index cs)
+      (setf (bl.store:block-index-entry-status
+             (bl.store:get-block-index-entry cs h)) :header-valid)
+      (is-true (bl.store::%append-header-index-delta
+                cs (list (bl.store:get-block-index-entry cs h))))
+      (is (equalp (%hidx-crc cs) (bl.store::%delta-log-header-crc delta)))
+      ;; Pretend our snapshot is a different one: the existing log is no longer
+      ;; ours to extend.
+      (setf (%hidx-crc cs)
+            (make-array 4 :element-type '(unsigned-byte 8) :initial-element 7))
+      (is-false (bl.store::%append-header-index-delta
+                 cs (list (bl.store:get-block-index-entry cs h)))))))
 
 (test header-index-absent-is-not-corruption
   "No headerindex.dat at all is a legitimate first run: NIL loaded, and NO
@@ -1174,7 +1296,7 @@ header; these synthetic fixtures must too."
          (block-store (bl.store:init-block-store base-path))
          (genesis-hash (bl.store:best-block-hash chain-state)))
     ;; Clear undo data
-    (clrhash bl.val::*block-undo-data*)
+    (clear-undo-cache)
     ;; Add genesis index entry
     (bl.store:add-block-index-entry
      chain-state
@@ -1212,7 +1334,7 @@ header; these synthetic fixtures must too."
         ;; UTXOs: chain A's 3 coinbase outputs disconnected, chain B's 4 connected
         (is (= 4 (bl.store:utxo-count utxo-set)))))
     ;; Cleanup
-    (clrhash bl.val::*block-undo-data*)))
+    (clear-undo-cache)))
 
 (test reorg-missing-undo-data-graceful
   "Reorg with missing undo data should not corrupt the UTXO set or crash."
@@ -1226,7 +1348,7 @@ header; these synthetic fixtures must too."
          (utxo-set (bl.store:make-utxo-set))
          (block-store (bl.store:init-block-store base-path))
          (genesis-hash (bl.store:best-block-hash chain-state)))
-    (clrhash bl.val::*block-undo-data*)
+    (clear-undo-cache)
     (bl.store:add-block-index-entry
      chain-state
      (bl.store:make-block-index-entry
@@ -1242,7 +1364,7 @@ header; these synthetic fixtures must too."
                     block chain-state block-store utxo-set)
                    (setf prev-hash block-hash))))
       ;; Deliberately clear undo data to simulate missing undo
-      (clrhash bl.val::*block-undo-data*)
+      (clear-undo-cache)
       ;; Now build chain B with more work: genesis -> B1 -> B2 -> B3
       (let ((chain-b-hashes (make-test-chain-hashes #xD0 3)))
         (let ((prev-hash genesis-hash))
@@ -1256,7 +1378,7 @@ header; these synthetic fixtures must too."
         (is (= 3 (bl.store:current-height chain-state)))
         (is (equalp (third chain-b-hashes)
                     (bl.store:best-block-hash chain-state)))))
-    (clrhash bl.val::*block-undo-data*)))
+    (clear-undo-cache)))
 
 (test persistence-round-trip-after-reorg
   "Chain state and UTXO set should be consistent after save/load following a reorg."
@@ -1270,7 +1392,7 @@ header; these synthetic fixtures must too."
          (utxo-set (bl.store:make-utxo-set))
          (block-store (bl.store:init-block-store base-path))
          (genesis-hash (bl.store:best-block-hash chain-state)))
-    (clrhash bl.val::*block-undo-data*)
+    (clear-undo-cache)
     (bl.store:add-block-index-entry
      chain-state
      (bl.store:make-block-index-entry
@@ -1321,7 +1443,7 @@ header; these synthetic fixtures must too."
             (is (not (null tip-entry)))
             (is (= 3 (bl.store:block-index-entry-height tip-entry)))))))
     ;; Cleanup
-    (clrhash bl.val::*block-undo-data*)
+    (clear-undo-cache)
     (dolist (file '("chainstate.dat" "utxoset.dat" "headerindex.dat"))
       (let ((path (merge-pathnames file base-path)))
         (when (probe-file path) (delete-file path))))))

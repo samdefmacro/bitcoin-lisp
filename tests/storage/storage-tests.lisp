@@ -2183,6 +2183,17 @@ cache is afterwards flushed cleanly."
                            :hash (car pair) :height (cdr pair)
                            :chain-work 0 :status :valid)))
            (bl.store:update-chain-tip chain-state tip-hash 200)
+           ;; One real coin, because an EMPTY view is a different case: it is
+           ;; Core's is_coinsview_empty (node/chainstate.cpp:69-70), under
+           ;; which the tip record is left where it is and a rebuild is asked
+           ;; for instead (pinned by
+           ;; RECONCILE-NEVER-PLACES-A-POINTER-OVER-AN-EMPTY-UTXO-SET).
+           (bl.store:coin-view-add
+            cache (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element #xA1)
+            0 5000 (make-array 1 :element-type '(unsigned-byte 8)
+                                 :initial-element #x51)
+            150 :coinbase t :allow-overwrite nil)
            ;; Control: with no pointer recorded there is nothing to reconcile.
            (is (eq :unrecorded (bl::reconcile-coins-db-best-block node)))
            (is (= 200 (bl.store:current-height chain-state))

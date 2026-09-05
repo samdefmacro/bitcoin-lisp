@@ -912,11 +912,9 @@ it; the indexes (Step 8) and -forcecompactdb."
     (log-error "Recover by reindexing from the block files, or restore a backup.")
     (init-error "Unplaceable UTXO set in ~A" (node-data-directory *node*)))
 
-  ;; Core's VerifyLoadedChainstate (node/chainstate.cpp:240-276), and here for
-  ;; the same reason it is there: this is the first moment every chainstate's
-  ;; tip agrees with its coins, so a block database that disagrees with its
-  ;; UTXO set can be detected before anything acts on either. It runs after
-  ;; the reconciliation above, which is our LoadChainTip.
+  ;; Core's VerifyLoadedChainstate (node/chainstate.cpp:240-276), placed as Core
+  ;; places it: right after the reconciliation above, which is our LoadChainTip,
+  ;; and so the first moment every chainstate's tip agrees with its coins.
   (%verify-loaded-chainstates check-blocks check-level require-full-verification
                               reindex-chainstate)
 

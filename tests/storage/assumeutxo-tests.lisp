@@ -129,7 +129,7 @@ is any block past the target (ReachedTarget stops the chainstate)."
          (is (eq t ok))
          (is (null err)))
        (is (= 3 (bl.store:current-height cs))))
-     (clrhash bl.val::*block-undo-data*))))
+     (clear-undo-cache))))
 
 ;;;; Startup re-detection of a persisted snapshot chainstate
 
