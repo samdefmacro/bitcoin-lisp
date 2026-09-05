@@ -340,17 +340,124 @@ net_processing.cpp:5582-5589)."
                        full)))
     (is-false (bl:recent-reject-p
                (bl.net:peer-known-addrs br) key))
-    ;; relaying the same address again the same day: all targets already know
-    ;; it or get deduped -- at most the remaining 2 fresh peers are picked
+    ;; Relaying the same address again inside its rotation period: the SAME
+    ;; two peers are picked, both know it, and PushAddress does nothing --
+    ;; Core queues to its picked nodes and stops there (net_processing.cpp:
+    ;; 2322-2336). Walking further down the ranking for two peers that do not
+    ;; know it yet, which is what this did, hands a peer that repeats an
+    ;; address the wider propagation the 24h rotation exists to deny it.
     (let ((sent2 (%relay-address pa source peers)))
-      (is (= 2 sent2))
+      (is (= 0 sent2) "a repeat inside the rotation period queues nothing")
       (%flush-addrs-now peers)
-      (is (= 4 (count-if (lambda (p)
+      (is (= 2 (count-if (lambda (p)
                            (bl:recent-reject-p
                             (bl.net:peer-known-addrs p) key))
-                         full)))
-      ;; third time: everyone knows it -> nothing sent
+                         full))
+          "and the address still has exactly two destinations")
       (is (= 0 (%relay-address pa source peers))))))
+
+(defmacro %with-relay-salt ((k0 k1) &body body)
+  "Run BODY with the node's address-relay SipHash key fixed at (K0 . K1), so
+the destination ranking is reproducible (Core CConnman::nSeed0/nSeed1, drawn
+once per process)."
+  `(let ((bl.net::*address-relay-salt* (cons ,k0 ,k1)))
+     ,@body))
+
+(defun %relay-destinations (pa source peers &rest args)
+  "The ids of the peers RELAY-ADDRESS queues PA on, every queue emptied first
+so the answer belongs to this call. Nothing is flushed, so no target is ever
+marked as knowing the address and repeated measurements stay comparable."
+  (dolist (p peers) (setf (fill-pointer (%addr-queue p)) 0))
+  (apply #'%relay-address pa source peers args)
+  (sort (loop for p in peers
+              when (plusp (length (%addr-queue p)))
+                collect (bl.net:peer-id p))
+        #'<))
+
+(defun %relay-peer-set (n)
+  "SOURCE plus N eligible addr-relay peers, as (VALUES source peers)."
+  (let* ((source (bl.net:make-peer :state :ready :address "9.9.9.9:8333"))
+         (targets (loop for i below n
+                        collect (bl.net:make-peer
+                                 :state :ready :addr-relay-enabled t
+                                 :address (format nil "1.1.~D.~D:8333"
+                                                  (floor i 256) (mod i 256))))))
+    (values source (cons source targets))))
+
+(test relay-address-rotation-instant-is-per-address
+  "Core offsets the rotation epoch by the address\'s own hash --
+`(count_seconds(current_time) + hash_addr) / count_seconds(
+ROTATE_ADDR_RELAY_DEST_INTERVAL)`, net_processing.cpp:2293-2297, commented
+\"adding address hash makes exact rotation time different per address, while
+preserving periodicity\". Ours divided the bare clock, so EVERY address in the
+network changed destinations at the same instant, 00:00 UTC: one moment a day
+when the whole gossip topology turns over at once.
+
+Two instants inside one UTC day. Under the old rule no address can differ
+between them, because both floor to the same epoch. The salt is pinned so the
+ranking is reproducible."
+  (%with-relay-salt (#x0706050403020100 #x0f0e0d0c0b0a0908)
+    (multiple-value-bind (source peers) (%relay-peer-set 6)
+      (let* ((day-start (* 20000 86400))
+             (rotated
+               (loop for i below 24
+                     for pa = (%make-test-peer-address 8 0 (floor i 256)
+                                                       (mod i 256) 8333)
+                     count (not (equal (%relay-destinations pa source peers
+                                                            :now (+ day-start 10))
+                                       (%relay-destinations pa source peers
+                                                            :now (+ day-start 86000)))))))
+        (is (plusp rotated)
+            "no address rotated inside the day: the epoch ignores the address ~
+             hash, so all ~D of them turn over together at 00:00 UTC" 24)))))
+
+(test relay-address-ranking-is-keyed-by-the-node-secret
+  "Core ranks relay destinations with the node\'s deterministic randomizer --
+CSipHasher(nSeed0, nSeed1).Write(RANDOMIZER_ID_ADDRESS_RELAY)...
+(net_processing.cpp:2298-2313) -- so which peers an address reaches cannot be
+computed from public inputs. Ours ranked by a bare sha256 over the address,
+the day and the peer id, all of them public: an attacker could work out in
+advance which two of our peers any address would reach, and choose addresses
+to steer its own fan-out.
+
+The same address and the same peers, under two node secrets, must not always
+pick the same destinations."
+  (multiple-value-bind (source peers) (%relay-peer-set 6)
+    (let ((differing
+            (loop for i below 12
+                  for pa = (%make-test-peer-address 9 0 (floor i 256)
+                                                    (mod i 256) 8333)
+                  count (not (equal
+                              (%with-relay-salt (1 2)
+                                (%relay-destinations pa source peers))
+                              (%with-relay-salt (#xdeadbeefcafef00d #x0123456789abcdef)
+                                (%relay-destinations pa source peers)))))))
+      (is (plusp differing)
+          "the destination ranking ignored the node secret for all 12 addresses"))))
+
+(test relay-address-unreachable-fanout-is-one-or-two
+  "Core: `unsigned int nRelayNodes = (fReachable || (hasher.Finalize() & 1))
+? 2 : 1` (net_processing.cpp:2301-2302) -- a reachable address always goes to
+two peers, an unreachable one to one OR two, decided by the low bit of the
+same hasher. Ours took a caller-supplied count and the ingest path passed a
+flat 1 for every unreachable address, so an address on a network we cannot
+dial propagated at half Core\'s rate with no exceptions."
+  (%with-relay-salt (#x1122334455667788 #x99aabbccddeeff00)
+    (multiple-value-bind (source peers) (%relay-peer-set 6)
+      (let ((reachable-counts '())
+            (unreachable-counts '()))
+        (dotimes (i 24)
+          (let ((pa (%make-test-peer-address 10 0 (floor i 256) (mod i 256) 8333)))
+            (push (length (%relay-destinations pa source peers :reachable t))
+                  reachable-counts)
+            (push (length (%relay-destinations pa source peers :reachable nil))
+                  unreachable-counts)))
+        (is (every (lambda (n) (= n 2)) reachable-counts)
+            "a reachable address always reaches two peers")
+        (is-true (member 1 unreachable-counts)
+                 "some unreachable addresses reach one peer")
+        (is-true (member 2 unreachable-counts)
+                 "and some reach two -- a flat 1 is not Core\'s rule")))))
 
 (test relay-address-queues-and-only-the-flush-sends
   "a4680ae1 / 0c05f5d0: Core RelayAddress calls PushAddress and nothing else
