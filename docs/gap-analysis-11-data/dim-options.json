@@ -1,0 +1,162 @@
+{
+  "dimension": "options",
+  "findings": [
+    {
+      "id": "c053f780",
+      "title": "-alertnotify is accepted and dropped, and the whole kernel warning system behind it is absent",
+      "severity": "S2",
+      "our_ref": "src/config-options.lisp:435",
+      "core_ref": "refs/bitcoin/src/node/kernel_notifications.cpp:30-47,79-83; refs/bitcoin/src/validation.cpp:1952,2905; refs/bitcoin/src/kernel/warning.h:9-12",
+      "core_does": "GetArg(\"-alertnotify\", \"\") is read inside AlertNotify, which is called from KernelNotifications::warningSet whenever a kernel warning is newly SET. Two warnings exist: LARGE_WORK_INVALID_CHAIN (validation.cpp:1952, InvalidChainFound - a competing chain with more work than our tip was found invalid, i.e. a probable consensus split or an obsolete node) and UNKNOWN_NEW_RULES_ACTIVATED (validation.cpp:2905 - unknown version bits activated, i.e. this node may be following the wrong chain). The same warnings are also surfaced in getnetworkinfo/getblockchaininfo 'warnings'.",
+      "we_do": "-alertnotify is a :core-only row. There is no AlertNotify, no warning registry and no LARGE_WORK_INVALID_CHAIN / UNKNOWN_NEW_RULES_ACTIVATED detection anywhere in the tree; the 'warnings' field of getblockchaininfo (src/rpc/blockchain.lisp:79), getnetworkinfo (src/rpc/net.lisp:359) and getmininginfo (src/rpc/mining.lisp:548) is the constant empty vector #().",
+      "impact": "An operator who wires -alertnotify to a pager (the standard exchange/merchant practice) gets no alert when the node sees a higher-work invalid chain or when unknown consensus rules activate, and the polling fallback is a hardcoded empty array, so nothing on the node ever reports the condition. Deposits keep being credited through a chain split that Core would have paged about.",
+      "executed": "scripts/dev.sh eval over the warm image: a do-all-symbols scan for any fbound symbol whose name contains ALERT returned NIL; the same command line resolved by start-node-plist shows -alertnotify dropped from the plist and named in supplied-core-only-options.",
+      "confidence": "executed"
+    },
+    {
+      "id": "9e7729b8",
+      "title": "A bitcoin.conf in the datadir shadowed by -conf or by a conf-set datadir= is silently ignored; -allowignoredconf implies an error that does not exist",
+      "severity": "S2",
+      "our_ref": "src/node/init.lisp:1615-1628",
+      "core_ref": "refs/bitcoin/src/common/init.cpp:65-95",
+      "core_does": "After the config file is read and the datadir resolved, Core checks whether <datadir>/bitcoin.conf exists and is not the file it actually read (either because -conf named another file, or because the file it read set datadir= and pointed at a directory holding a second bitcoin.conf). If so it returns ConfigStatus::FAILED - a fatal startup error naming both files - and only downgrades it to a LogWarning when -allowignoredconf=1 is set.",
+      "we_do": "conf-path is -conf when given, else <datadir>/bitcoin.conf; whichever file that is gets read and nothing ever checks for a second, shadowed bitcoin.conf. -allowignoredconf is a :core-only row.",
+      "impact": "An operator whose launcher passes -conf=/etc/bitcoin/bitcoin.conf, or whose config sets datadir=, silently loses the entire second config file: prune target, rpcauth/rpcpassword, port, bind, txindex - the node runs on defaults with no line saying so. Core made this fatal precisely because the failure is invisible: the node comes up, listens on the wrong port with cookie-only RPC auth, and starts an unpruned sync on a disk sized for a pruned one. Setting allowignoredconf=1 is also a no-op that tells the operator the check exists.",
+      "executed": "no - read both trees. The absence was established by grep over src/ for Core's message text and by reading the whole of start-node-from-args' config path (src/node/init.lisp:1605-1648).",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "ebb73768",
+      "title": "-blocksdir is dropped: blocks always go to <datadir>/blocks, filling the datadir volume",
+      "severity": "S2",
+      "our_ref": "src/storage/blocks.lisp:77-79",
+      "core_ref": "refs/bitcoin/src/common/args.cpp:294-297; refs/bitcoin/src/init.cpp:967-970",
+      "core_does": "ArgsManager::GetBlocksDirPath() uses GetPathArg(\"-blocksdir\") when -blocksdir is set, so blk/rev/xor files and blocks/index live under that path instead of the datadir; init.cpp additionally makes a non-existent -blocksdir a fatal InitError before anything is opened.",
+      "we_do": "ENSURE-DIRECTORIES merges the literal \"blocks/\" against the block store's base path, which is always the datadir; *blocks-directory* is declared in src/storage/blocks.lisp:11 and never assigned anywhere in the tree. -blocksdir is a :core-only row, and no init check looks at it.",
+      "impact": "The classic deployment is a small fast datadir volume plus a large disk for block data. An operator who writes blocksdir=/mnt/blocks gets every blk*.dat on the datadir volume instead. On mainnet that is hundreds of GB onto a disk sized for the chainstate; the node fills it and dies mid-write, which is the case our own storage layer is least able to recover from cleanly. Core also would have refused to start if the directory did not exist.",
+      "executed": "no - read both trees. Established by grep: *blocks-directory* has no setf site, and the only blocks path construction is the merge at blocks.lisp:77.",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "212b060f",
+      "title": "-persistmempool / -persistmempoolv1 are dropped: mempool.dat is always loaded at startup and always written at shutdown",
+      "severity": "S2",
+      "our_ref": "src/node/init.lisp:833; src/node/shutdown.lisp:498-501",
+      "core_ref": "refs/bitcoin/src/node/mempool_persist_args.cpp:13-16; refs/bitcoin/src/init.cpp:338,2047; refs/bitcoin/src/node/mempool_args.cpp:106",
+      "core_does": "ShouldPersistMempool(args) = GetBoolArg(\"-persistmempool\", DEFAULT_PERSIST_MEMPOOL) gates BOTH drive sites: LoadMempool is handed an empty path when it is false (init.cpp:2047) and DumpMempool is skipped entirely at shutdown (init.cpp:338). -persistmempoolv1 separately selects the older on-disk format so an older node can read the file.",
+      "we_do": "load-mempool-from-disk is called unconditionally during startup and save-mempool-file unconditionally during shutdown; neither function takes or consults any enable flag. Both options are :core-only rows. Our writer always emits Core's version-2 layout.",
+      "impact": "This is the option an operator reaches for after exactly the outage this project has already had: an 83 MB mempool.dat turned a restart into a ~45-minute replay during which the node was unreachable. -persistmempool=0 is Core's documented remedy and it does nothing here. It also means the mempool - including the node's own unbroadcast wallet transactions - is always written to disk in plaintext at shutdown, which an operator who set persistmempool=0 believes is not happening, and that every restart replays it through full acceptance.",
+      "executed": "scripts/dev.sh eval: (sb-introspect:function-lambda-list #'bitcoin-lisp::load-mempool-from-disk) => (NODE &OPTIONAL PATH &KEY APPLY-UNBROADCAST APPLY-FEE-DELTA-PRIORITY USE-CURRENT-TIME) and #'bl.mp:save-mempool-file => (MEMPOOL PATH) - no gate parameter on either. start-node-plist for a line containing -persistmempool=0 drops it and reports it as unimplemented.",
+      "confidence": "executed"
+    },
+    {
+      "id": "8c442ee3",
+      "title": "-walletbroadcast is dropped and -blocksonly does not soft-set it: the wallet always submits and announces its own transactions",
+      "severity": "S2",
+      "our_ref": "src/wallet/wallet-spend.lisp:2494-2500",
+      "core_ref": "refs/bitcoin/src/wallet/wallet.cpp:2341-2343,3068; refs/bitcoin/src/wallet/init.cpp:95-97; refs/bitcoin/src/wallet/wallet.cpp:2064,2109",
+      "core_does": "SetBroadcastTransactions(GetBoolArg(\"-walletbroadcast\", DEFAULT_WALLETBROADCAST)) sets fBroadcastTransactions. With it false, CommitTransaction returns before even submitting to the local mempool (wallet.cpp:2341), SubmitTxMemoryPoolAndRelay returns false immediately (:2064) and the resend timer does nothing (:2109). Core also SOFT-SETS -walletbroadcast=0 whenever -blocksonly=1 (wallet/init.cpp:95), so an operator never has to ask for it in that mode.",
+      "we_do": "%wallet-submit-tx always validates, accepts into the mempool and calls broadcast-transaction-to-peers; there is no fBroadcastTransactions analogue - a do-symbols scan of the :bitcoin-lisp package for a bound special whose name contains BROADCAST returns nothing. -walletbroadcast is a :core-only row, and apply-parameter-interactions (src/node/args.lisp:147-270) implements the -blocksonly interaction for -maxmempool only.",
+      "impact": "-walletbroadcast=0 is how an operator keeps a signed transaction off the wire - broadcasting it later through another node, a paid submission service, or not at all (the PSBT / air-gapped and coinjoin workflows). We put it on the wire to every peer the instant it is created, which is irreversible and links the transaction to this node's IP. The -blocksonly node gets the same treatment despite Core turning the wallet broadcaster off for it.",
+      "executed": "scripts/dev.sh eval: a do-symbols scan of :BITCOIN-LISP for bound specials matching BROADCAST returned NIL, so no flag exists to gate the call. start-node-plist for a line containing -walletbroadcast=0 drops it and reports it as unimplemented.",
+      "confidence": "executed"
+    },
+    {
+      "id": "21cf40de",
+      "title": "-checkblocks / -checklevel are dropped: no startup VerifyDB runs at all, and the require_full_verification init failure cannot fire",
+      "severity": "S2",
+      "our_ref": "src/node/init.lisp:1495-1502",
+      "core_ref": "refs/bitcoin/src/init.cpp:1388-1390; refs/bitcoin/src/node/chainstate.cpp:250-275",
+      "core_does": "options.check_blocks = GetIntArg(\"-checkblocks\", DEFAULT_CHECKBLOCKS) and options.check_level = GetIntArg(\"-checklevel\", DEFAULT_CHECKLEVEL) drive CVerifyDB::VerifyDB during LoadChainstate, BEFORE the node is declared up: level 1 re-checks each block, level 2 checks the undo data, level 3 disconnects and level 4 reconnects them against the UTXO set. options.require_full_verification is set when EITHER option is explicitly given, which turns a downgraded verification into a startup FAILURE rather than a log line.",
+      "we_do": "Startup runs the datadir/index/mempool/peers sequence and %import-external-block-files, and never verifies anything. The mechanism exists under another name and in reduced form: the verifychain RPC (src/rpc/blockchain.lisp:775-805) re-reads the last N blocks and re-checks merkle root + PoW - level 0/1 only, no undo or disconnect/reconnect - but nothing calls it at startup. Both options are :core-only rows.",
+      "impact": "After an unclean shutdown or a suspected disk problem, -checkblocks/-checklevel is the operator's way of asking the node to prove its chainstate before it serves. They get no verification, no log line, and no init failure - the node comes up and starts answering RPC and relaying against a chainstate nothing has checked. GA10's confirmed S1s in exactly this seam (a FRESH-flag coins-cache bug that silently dropped written coins, a coins best-block pointer advanced without the block index) are the class of corruption this check exists to catch.",
+      "executed": "no - read both trees. Established by grep for any verification call in src/node/init.lisp (none) and by reading the verifychain RPC.",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "7f6337e2",
+      "title": "-signetseednode is dropped and -signetchallenge rewrites none of Core's derived signet params (magic, seeds, min chain work, assumevalid)",
+      "severity": "S2",
+      "our_ref": "src/util/chainparams.lisp:257-290",
+      "core_ref": "refs/bitcoin/src/chainparams.cpp:26-32; refs/bitcoin/src/kernel/chainparams.cpp:439-473,507-511",
+      "core_does": "ReadSigNetArgs puts GetArgs(\"-signetseednode\") into options.seeds and -signetchallenge into options.challenge. SigNetParams then: clears vSeeds and adds the two public signet DNS seeds ONLY when there is no custom challenge (:439-445); zeroes nMinimumChainWork and defaultAssumeValid for a custom challenge (:458-462); replaces vSeeds outright with -signetseednode when given (:471-473); and derives pchMessageStart as the first 4 bytes of sha256d of the serialized challenge (:507-511), so every custom signet is a separate p2p network.",
+      "we_do": "-signetchallenge is a real option but its only effect is (setf bl.val:*signet-challenge*). The :signet chain-params row hardcodes magic 0A03CF40, the two public signet DNS seeds, minimum-chain-work 0x...b463ea0a4b8 and the public signet assumevalid, and none of them is recomputed. -signetseednode is a :core-only row, so the seed the operator named is dropped.",
+      "impact": "A custom signet node speaks the PUBLIC signet's p2p magic, queries the public signet DNS seeds, dials public signet nodes and completes handshakes with them - announcing a private test network's node to the public network - while the one peer the operator named with -signetseednode is discarded. It then cannot follow its own chain either: the inherited nMinimumChainWork is the public signet's accumulated work, which a fresh private signet will never exceed. Distinct from the GA9 S2 'signet cannot follow its own chain', which was the DEFAULT signet's PoW limit and non-boundary difficulty rule (both since fixed); this is the CUSTOM-challenge parameter derivation.",
+      "executed": "scripts/dev.sh eval: applied -signetchallenge=5121...52ae through apply-option-globals with *network* = :signet, then read the params back - :CHALLENGE-SET T but :MAGIC #(10 3 207 64), :DNS-SEEDS (\"seed.signet.bitcoin.sprovoost.nl\" \"seed.signet.achownodes.xyz\"), :MIN-CHAIN-WORK 12396326331576, :GENESIS f61eee3b...08000000 - every one of them the public signet's, unchanged.",
+      "confidence": "executed"
+    },
+    {
+      "id": "559c86ad",
+      "title": "-logips is dropped and peer addresses are logged unconditionally at info/warn, where Core's default log carries none",
+      "severity": "S3",
+      "our_ref": "src/networking/peer.lisp:620-629",
+      "core_ref": "refs/bitcoin/src/init/common.cpp:34,57; refs/bitcoin/src/net.cpp:704-707,709+",
+      "core_does": "fLogIPs = GetBoolArg(\"-logips\", DEFAULT_LOGIPS) with DEFAULT_LOGIPS false. CNode::LogIP(fLogIPs) returns \" peeraddr=<addr>\" only when it is on, and DisconnectMsg(fLogIPs) is what every net.cpp connection log line uses - so by default the log identifies peers by numeric id (peer=7) and never by address, and those lines are LogDebug(BCLog::NET) besides.",
+      "we_do": "-logips is a :core-only row. peer.lisp alone has 13 log calls at :info or :warn whose format argument is (peer-address peer) - bad magic, oversized message, handshake failures, eviction, protection underflow - and (peer-address peer) appears 82 times across src/. None is gated on a category or a flag, so they all reach debug.log at the default level.",
+      "impact": "The default debug.log becomes a record of every address that has connected to this node and every address it dialed. Core deliberately made that opt-in and prints a 'Log output may contain privacy-sensitive information' banner; a log shared for support or captured from a backup discloses the operator's full peer set, and for an inbound-listening node the set of clients using it.",
+      "executed": "no - read both trees. Counted with grep -B2 over src/networking/peer.lisp: 6 log-info and 7 log-warn call sites take (peer-address peer).",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "1f1f28b7",
+      "title": "-dns is dropped: a named -addnode/-connect/-seednode target is still resolved through the local resolver",
+      "severity": "S3",
+      "our_ref": "src/networking/connection.lisp:238,274-276",
+      "core_ref": "refs/bitcoin/src/init.cpp:1696; refs/bitcoin/src/net.cpp:406; refs/bitcoin/src/netbase.h:23,28",
+      "core_does": "fNameLookup = GetBoolArg(\"-dns\", DEFAULT_NAME_LOOKUP). CConnman::ConnectNode resolves a named destination with Lookup(pszDest, port, fNameLookup && !HaveNameProxy(), 256), so with -dns=0 a hostname target is never resolved and never dialed.",
+      "we_do": "-dns is a :core-only row. make-tcp-connection hands the raw host string to usocket:socket-connect whenever no proxy applies, which resolves it through the system resolver. The proxy half of Core's condition IS honoured - with a proxy set the name goes into the SOCKS5 CONNECT as ATYP DOMAINNAME and never to the local resolver.",
+      "impact": "An operator who sets -dns=0 (the documented way to stop a node making plaintext DNS queries for its peer list) still emits one lookup per named -addnode / -connect / -seednode target to whatever resolver the host uses, disclosing which peers this node is configured to reach. Bounded: with -proxy configured the names already go through the proxy, so the leak is limited to the no-proxy case.",
+      "executed": "scripts/dev.sh eval: (sb-introspect:function-lambda-list #'bl.net:make-tcp-connection) => (HOST PORT &KEY (TIMEOUT 10)) - no name-lookup gate; the resolution happens inside usocket:socket-connect at connection.lisp:274.",
+      "confidence": "executed"
+    },
+    {
+      "id": "3be511c4",
+      "title": "-privatebroadcast is dropped: own-transaction broadcast over dedicated private connections does not exist",
+      "severity": "S3",
+      "our_ref": "src/config-options.lisp:449",
+      "core_ref": "refs/bitcoin/src/net.cpp:3554; refs/bitcoin/src/init.cpp:1037,2257; refs/bitcoin/src/net_processing.h:96; refs/bitcoin/src/rpc/mempool.cpp:115",
+      "core_does": "GetBoolArg(\"-privatebroadcast\", DEFAULT_PRIVATE_BROADCAST) (default false) reserves a pool of PRIVATE_BROADCAST connections, raises the connection budget for them (init.cpp:1037), turns the feature on in PeerManager options, and makes the node announce its OWN transactions only over those short-lived connections rather than to its ordinary peer set.",
+      "we_do": "-privatebroadcast is a :core-only row; there is no private-broadcast connection type and own transactions go out through the same announce path as relayed ones.",
+      "impact": "An operator who enables it believes their own transactions are announced over dedicated connections that do not reveal the origin node to its long-lived peers. They are instead announced to every peer from the node's own address, which is the deanonymization the option exists to prevent. Bounded by Core's default being off, so only an operator who asked for it is affected - and the startup line names the option as unimplemented.",
+      "executed": "no - read both trees. Established by grep: no private-broadcast connection type or option consumer anywhere in src/networking/.",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "e9d39df8",
+      "title": "-shrinkdebugfile is dropped and the log is scrolled unconditionally, including under -debug where Core does not",
+      "severity": "S3",
+      "our_ref": "src/node/logging.lisp:141-146",
+      "core_ref": "refs/bitcoin/src/init/common.cpp:108-113; refs/bitcoin/src/logging.cpp:167-170,514",
+      "core_does": "StartLogging calls ShrinkDebugFile only when GetBoolArg(\"-shrinkdebugfile\", DefaultShrinkDebugFile()) is true, and DefaultShrinkDebugFile() is (m_categories == BCLog::NONE) - so a node started with ANY -debug category does not scroll its log, and -shrinkdebugfile=0 keeps it whole in every case.",
+      "we_do": "start-file-logging calls shrink-log-file unconditionally before opening the file; the function itself is a faithful port of ShrinkDebugFile (10 MB tail at 110% of the threshold), but it has no gate and takes only a path. -shrinkdebugfile is a :core-only row.",
+      "impact": "The operator debugging an intermittent fault runs with -debug=net and restarts to reproduce; the restart discards everything but the last 10 MB of the evidence, which is exactly the case Core's default excludes. -shrinkdebugfile=0 does not stop it either. The reverse direction is safe (we never grow unbounded across restarts).",
+      "executed": "scripts/dev.sh eval: (sb-introspect:function-lambda-list #'bitcoin-lisp::start-file-logging) => (PATH) - no flag to gate the shrink-log-file call at logging.lisp:146.",
+      "confidence": "executed"
+    },
+    {
+      "id": "4d28b231",
+      "title": "-addresstype / -changetype are dropped: getnewaddress and getrawchangeaddress hardcode bech32 as the default",
+      "severity": "S3",
+      "our_ref": "src/wallet/wallet.lisp:1822,1846",
+      "core_ref": "refs/bitcoin/src/wallet/wallet.cpp:2956-2972; refs/bitcoin/src/wallet/init.cpp:46,48",
+      "core_does": "GetArg(\"-addresstype\", \"\") is parsed into m_default_address_type and GetArg(\"-changetype\", \"\") into m_default_change_type (which otherwise follows the address type); both are validated at load time with an 'Unknown address type' / 'Unknown change type' error. Every getnewaddress / getrawchangeaddress with no explicit type, and every change output, uses them.",
+      "we_do": "Both are :core-only rows. (%address-type-arg (second params) :bech32) hardcodes the fallback in getnewaddress and getrawchangeaddress; the per-call address_type argument IS implemented, so the mechanism exists and only its configured default is missing.",
+      "impact": "An operator who set addresstype=bech32m to receive on taproot keeps getting P2WPKH addresses from a bare getnewaddress, and changetype is ignored so change can land on a different script type than the payment - which is the heuristic that lets a chain analyst pick the change output out of a transaction. No funds are at risk; the loss is the privacy property and the configured default.",
+      "executed": "no - read both trees. Established by reading the two RPC bodies and confirming both options are :core-only rows.",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "feecc533",
+      "title": "-avoidpartialspends is dropped: the coin-control default never reads it, so address grouping is off unless avoid_reuse is set",
+      "severity": "S3",
+      "our_ref": "src/wallet/wallet-spend.lisp:3129-3131",
+      "core_ref": "refs/bitcoin/src/wallet/coincontrol.cpp:9-13; refs/bitcoin/src/wallet/init.cpp:47",
+      "core_does": "Every CCoinControl constructor sets m_avoid_partial_spends = GetBoolArg(\"-avoidpartialspends\", DEFAULT_AVOIDPARTIALSPENDS), so the option is the default for every spend the wallet builds, and per-call options and the avoid_reuse wallet flag can only raise it.",
+      "we_do": "-avoidpartialspends is a :core-only row. wcc-avoid-partial-spends starts NIL and is only ever raised from the per-call option or from the wallet's avoid_reuse flag (wallet-spend.lisp:3129-3131). The grouping machinery itself is fully implemented (csel-params-avoid-partial-spends at :809 and :1381, the -maxapsfee retry at :2385-2390, output-group-max-entries), and -maxapsfee IS wired - so the option's own switch is the only missing piece.",
+      "impact": "An operator who set avoidpartialspends=1 expects every spend from a reused address to sweep that address's outputs together. Instead coins are selected per output, leaving the rest of the reused address behind to be linked to the next spend - the exact linkage the option is documented to remove. Funds are unaffected; the loss is the wallet privacy property the operator configured.",
+      "executed": "no - read both trees. Established by tracing every writer of wcc-avoid-partial-spends in src/wallet/wallet-spend.lisp (lines 2390, 3129) - neither reads config.",
+      "confidence": "read-both-trees"
+    }
+  ],
+  "coverage_note": "All 49 names in define-core-only-options (src/config-options.lisp:434-454) were reviewed against Core's AddArg registration, its reader (GetArg/GetArgs/GetBoolArg/GetIntArg) and its drive sites; the full per-option table with the a/b/c class is docs/gap-analysis-11-data/dim-options.md. Classes, counted over the 49 options: 33 (a) harmless, 6 (b) misleading, 10 (c) implemented elsewhere and unwired (10 options across 7 distinct mechanisms). One mitigation applies to the whole dimension and was verified by execution: start-node-from-args logs a WARN naming every core-only option actually supplied (src/node/init.lisp:1664-1668), so an operator who reads the startup log is told the option had no effect. That warning does NOT cover the two cases where Core derives a value from a DIFFERENT option, which is where the (c) findings bite: -blocksonly soft-setting -walletbroadcast=0 and -debug defaulting -shrinkdebugfile to 0. The REAL option table was also audited for the reverse defect. Already correct and re-verified: -maxuploadtarget parses a bare number as MiB (executed: -maxuploadtarget=500 => 524288000); -par honours 0 and negative values; the -listen/-listenonion soft-set chain (-bind beats -connect beats -proxy) is centralised in conf-effective-listen-flags; -dnsseed under -connect/-maxconnections<=0/clearnet-free -onlynet; -forcednsseed's contradiction check; the four -prune conflicts (-txindex, -txospenderindex, -reindex-chainstate, the 550 MiB floor); NETWORK_ONLY and SENSITIVE tagging; and every 'read by name in START-NODE-FROM-ARGS' row does have a reader in src/node/rpc-config.lisp. The one real-option semantics defect found is -signetchallenge (7f6337e2): its Core reader rewrites four derived chain params and ours rewrites none. NOT covered by this dimension, with the inheriting GA11 dimension named: whether the accepted-and-dropped DEBUG_ONLY self-checks (-checkaddrman, -checkblockindex, -checkmempool) would have caught a live invariant break belongs to dimension 9 (validation/chain second reader); getnetworkinfo's 'localaddresses' being the constant #() even though src/networking/netaddress.lisp:510-526 maintains a real *local-addresses* map written by the torcontrol client belongs to dimension 8 (rpc/util); the -maxreceivebuffer question (Core bounds a per-peer PROCESS QUEUE, we have no queue and bound one in-flight message by +max-message-payload+ at src/networking/peer.lisp:624) was judged harmless here but the aggregate inbound memory bound across peers belongs to dimension 10 (protocol/peer second reader). Nothing in this survey was fixed and no file under src/ or tests/ was touched."
+}
