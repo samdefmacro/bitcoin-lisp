@@ -1051,6 +1051,29 @@ graph equivalent to the model."
 (defun %tg-rbf (g removed parents fee size)
   (bl.mp:txgraph-rbf-diagrams g removed parents fee size))
 
+(defun %tg-secs (thunk)
+  "Wall-clock seconds one call of THUNK takes."
+  (let ((start (get-internal-real-time)))
+    (funcall thunk)
+    (float (/ (- (get-internal-real-time) start)
+              internal-time-units-per-second)
+           1d0)))
+
+(defun %tg-chain-depgraph (n)
+  "A bare depgraph of N transactions in one chain, with the same spread of
+feerates the staging fixture below uses."
+  (let ((dg (bl.mp:make-depgraph)))
+    (dotimes (i n dg)
+      (bl.mp:depgraph-add-transaction
+       dg (bl.mp:make-feefrac (+ 1000 (mod (* i 7919) 100003)) 141))
+      (when (plusp i)
+        (bl.mp:depgraph-add-dependencies dg (ash 1 (1- i)) i)))))
+
+(defun %tg-diagram-size (diagram)
+  "Total size covered by a diagram's chunks: every staged transaction appears
+in exactly one chunk, so this counts what the staging actually looked at."
+  (reduce #'+ diagram :key #'bl.mp:feefrac-size :initial-value 0))
+
 (test rbf-diagrams-replace-singleton
   "Replacing a lone tx: old diagram is its chunk, new is the candidate's."
   (let* ((g (%tg-new))
@@ -1198,3 +1221,61 @@ staged diagram uncalculable (Core CheckMemPoolPolicyLimits failing,
       (is (null new)))
     (is-false (%tg-oversized g))
     (is-true (%tg-sane g))))
+
+(test rbf-diagrams-staging-keeps-a-bridged-dependency
+  "Staging COPIES the affected cluster's depgraph instead of replaying its
+edges (Core Cluster::CopyToStaging, txgraph.cpp:1221-1237), and
+DEPGRAPH-REMOVE-TRANSACTIONS only masks the removed positions out of the
+closures, so evicting the middle of a chain leaves the grandparent an ancestor
+of the grandchild. A and C therefore stay ONE staged cluster and chunk
+together at 1100/200; had the copy dropped the bridge they would be two
+singleton clusters and the new diagram would carry one chunk more."
+  (let* ((g (%tg-new))
+         (a (%tg-add g 100 100))        ; feerate 1
+         (b (%tg-add g 100 100))        ; feerate 1, the evicted middle
+         (c (%tg-add g 1000 100)))      ; feerate 10
+    (%tg-dep g a b)
+    (%tg-dep g b c)
+    (multiple-value-bind (old new) (%tg-rbf g (list b) '() 5000 100)
+      (is (equal '((1200 . 300)) (%tg-diag old)))
+      (is (equal '((5000 . 100) (1100 . 200)) (%tg-diag new))))
+    (is-true (%tg-sane g))
+    (is (= 3 (%tg-count g)))))
+
+(test rbf-diagrams-staging-costs-about-one-relinearization-per-cluster
+  "TIMING-SENSITIVE, and calibrated rather than absolute. At the rule-5
+maximum shape - 100 clusters (Core MAX_REPLACEMENT_CANDIDATES) of 64
+transactions (the largest cluster that can exist), the candidate conflicting
+with every cluster's tail - staging must cost about what Core pays after
+CopyToStaging: one relinearization per affected cluster
+(txgraph.cpp:1221-1237,1693-1706). The yardstick is 100 fresh optimal
+LINEARIZE calls on the same 64-transaction chain - the work no implementation
+can avoid - measured on the same machine in the same run, so a slow or loaded
+container moves both sides together. Rebuilding each staged cluster
+transaction by transaction, which is what this replaced, cost about 33 times
+the yardstick."
+  (let ((g (%tg-new))
+        (tails '()))
+    (dotimes (i 100)
+      (let ((prev nil))
+        (dotimes (k 64)
+          (let ((h (%tg-add g (+ 1000 (mod (* (+ (* i 64) k) 7919) 100003)) 141)))
+            (when prev (%tg-dep g prev h))
+            (setf prev h)))
+        (push prev tails)))
+    (is (= 6400 (%tg-count g)))
+    ;; One settling call, which also carries the positive control: the
+    ;; diagrams account for every transaction on each side, so a staging that
+    ;; quietly did nothing could not pass the cost assertion below.
+    (multiple-value-bind (old new) (%tg-rbf g tails '() 100000000 200)
+      (is (= (* 6400 141) (%tg-diagram-size old)))
+      (is (= (+ (* 6300 141) 200) (%tg-diagram-size new))))
+    (let* ((chain (%tg-chain-depgraph 64))
+           (staged (%tg-secs (lambda () (%tg-rbf g tails '() 100000000 200))))
+           (yardstick (%tg-secs (lambda ()
+                                  (dotimes (i 100) (bl.mp:linearize chain))))))
+      (is (< staged (* 5 yardstick))
+          "staging 100 clusters of 64 took ~,4F s against ~,4F s for the 100 ~
+relinearizations it cannot avoid -- ~,1Fx, so the staged clusters are being ~
+rebuilt rather than copied"
+          staged yardstick (/ staged (max yardstick 1d-9))))))
