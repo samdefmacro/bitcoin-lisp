@@ -1227,6 +1227,37 @@ the log can revert a block from :invalid back to :valid. That is the failure
     (1 185)   ; hash+height+header+chainwork+status+prev+tx-count
     (2 197)))   ; ... + file + data-pos + undo-pos
 
+(defun %refresh-block-index-entry (entry record)
+  "Copy RECORD's fields into ENTRY, leaving ENTRY's identity and its children's
+PREV-ENTRY pointers alone.
+
+This is Core's InsertBlockIndex invariant: LoadBlockIndexGuts materialises
+every CBlockIndex through a try_emplace on m_block_index and resolves each
+pprev through the SAME function, so there is exactly one object per hash and a
+pprev pointer and a map lookup can never disagree
+(node/blockstorage.cpp:407-421,425-426). Delta replay used to install a BRAND
+NEW object per refreshed hash and relink only the entries the delta carried,
+so an unchanged child kept pointing at the SUPERSEDED parent -- and every
+ancestry walk follows prev-entry, so the active-chain walk handed out the
+orphan while the hash table held the current one. A status written through such
+a walk (%reorg-disconnect, %reorg-connect) was then invisible to the save, and
+a flat-file position read off one described a body that pruning had deleted.
+
+PREV-ENTRY is deliberately NOT copied: RECORD carries only a prev HASH, which
+the caller resolves, and ENTRY's pointer is already correct. The header is
+copied only when RECORD has one, since a header that failed to parse reads as
+NIL and must not clobber a good one."
+  (setf (block-index-entry-height entry) (block-index-entry-height record)
+        (block-index-entry-chain-work entry) (block-index-entry-chain-work record)
+        (block-index-entry-status entry) (block-index-entry-status record)
+        (block-index-entry-tx-count entry) (block-index-entry-tx-count record)
+        (block-index-entry-file entry) (block-index-entry-file record)
+        (block-index-entry-data-pos entry) (block-index-entry-data-pos record)
+        (block-index-entry-undo-pos entry) (block-index-entry-undo-pos record))
+  (when (block-index-entry-header record)
+    (setf (block-index-entry-header entry) (block-index-entry-header record)))
+  entry)
+
 (defun %replay-header-index-delta (state)
   "Apply the delta log beside the snapshot, if it belongs to THIS snapshot.
 Returns the number of entries applied.
@@ -1300,19 +1331,28 @@ shape of a crash mid-append — and keeps everything before it."
                           (dotimes (i count)
                             (read-single-header-entry stream batch prevs t
                                                       with-position)))
-                        ;; Each record REPLACES the entry of that hash, so later
-                        ;; frames win: the log is last-writer-wins.
+                        ;; Each record refreshes the entry of that hash, so
+                        ;; later frames win: the log is last-writer-wins. A
+                        ;; hash already in the index is MUTATED, never replaced
+                        ;; -- see %REFRESH-BLOCK-INDEX-ENTRY. Only a genuinely
+                        ;; new hash joins the relink pass, since only a new
+                        ;; object has a prev-entry to resolve.
                         (maphash (lambda (hash e)
-                                   (setf (gethash hash index) e)
+                                   (let ((existing (gethash hash index)))
+                                     (cond
+                                       (existing
+                                        (%refresh-block-index-entry existing e))
+                                       (t
+                                        (setf (gethash hash index) e)
+                                        (let ((ph (gethash hash prevs)))
+                                          (when ph
+                                            (setf (gethash hash prev-all) ph))))))
                                    (incf applied))
-                                 batch)
-                        (maphash (lambda (hash ph)
-                                   (setf (gethash hash prev-all) ph))
-                                 prevs)))
+                                 batch)))
                     (setf pos frame-end)))
                 ;; Re-link once, after every frame is in: a replayed entry must
                 ;; point at the real parent object, not at nothing.
-                (when (plusp applied)
+                (when (plusp (hash-table-count prev-all))
                   (link-header-entries index prev-all))
                 applied)))
       (error () applied))))
