@@ -340,6 +340,17 @@ eval_form() {
     echo "ERROR: cl-workbench is unavailable; host Lisp fallback is forbidden" >&2
     return 2
   fi
+  # A batch eval is read in COMMON-LISP-USER, which has no package-local
+  # nicknames: a `bl.rpc:' prefix is a SIMPLE-READER-PACKAGE-ERROR whose
+  # ten-frame backtrace hides the offending token. Observed 2026-09-05 costing
+  # two agents four evals each; the lesson line did not prevent the repeat,
+  # so the wrapper names the token before the image sees it.
+  local nick
+  nick=$(printf '%s ' "$@" | grep -oE '(^|[^A-Za-z0-9.-])bl(\.[a-z]+)?::?' | head -1 | sed -E 's/^[^a-z]*//')
+  if [[ -n "$nick" ]]; then
+    echo "WARNING: '$nick' is a package-local nickname; dev.sh eval reads in CL-USER," >&2
+    echo "         where it does not resolve -- write the full package name (bitcoin-lisp.rpc:, ...)." >&2
+  fi
   "$workbench" repl eval "$@"
 }
 
