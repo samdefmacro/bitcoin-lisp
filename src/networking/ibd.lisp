@@ -1750,7 +1750,18 @@ error escaped run-ibd and killed the sync thread — incident 2026-05-09).
 
 Draining a peer whose remote has FIN'd eventually hits a zero-progress
 read, which flips connection-connected to NIL; handle-peer-fin then
-disconnects it so replace-disconnected-peers can refill the slot."
+disconnects it so replace-disconnected-peers can refill the slot.
+
+A SEND-PAUSED peer is skipped entirely — this is Core's backpressure
+(`if (node.fPauseSend) return false;` before PollMessage,
+net_processing.cpp:5244-5245). Answering a peer whose socket has already
+taken all it can only buries the answer, so we stop consuming its input
+until the buffer drains; TCP then closes our receive window and the peer
+stops talking. The half-read-message reaper below is skipped with it: it
+measures from the last byte that ARRIVED, so running it while we are
+deliberately not reading would disconnect a healthy peer for our own
+pause. A peer that never drains is disconnected by check-peer-health's
+send-stall timeout instead."
     ;; Read the connection ONCE. An RPC-thread disconnect (disconnectnode, setban)
   ;; between two reads of the slot would hand (connection-connected NIL) a NIL —
   ;; a TYPE-ERROR outside the handler-case below, which aborts the whole sync
@@ -1762,7 +1773,11 @@ disconnects it so replace-disconnected-peers can refill the slot."
               ;; read already flipped connection-connected to NIL (and may
               ;; have NILed the socket), skip straight to handle-peer-fin —
               ;; no point waiting for input on a dead/closed socket.
-              (connection-connected conn))
+              (connection-connected conn)
+              ;; Send backpressure: while this peer's own send buffer is
+              ;; over the cap we process none of its messages (see the
+              ;; docstring).
+              (not (connection-send-paused-p conn)))
     (handler-case
         ;; Drain only as long as the socket actually has data ready
         ;; (usocket:wait-for-input :timeout 0 is non-blocking). This lets us

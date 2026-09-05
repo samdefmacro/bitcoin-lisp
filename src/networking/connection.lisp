@@ -9,8 +9,18 @@
 send-paused (Bitcoin Core CNode::fPauseSend; cap = -maxsendbuffer default,
 1000 * DEFAULT_MAXSENDBUFFER(1000) bytes, net.h:99 / init.cpp:2105). A single
 message may take the buffer past the cap (Core queues it the same way — a
->1MB block message must still be servable); while over it, send-bytes drops
-further messages instead of queueing without bound.")
+>1MB block message must still be servable).
+
+Going over the cap never costs a message. Core's CConnman::PushMessage
+(net.cpp:4088-4113) queues unconditionally and only SETS fPauseSend as a
+consequence; the backpressure is applied on the INPUT side, where
+ProcessMessages returns before polling a new message from a send-paused peer
+(net_processing.cpp:5244-5245). Deferring the work instead of dropping it is
+what keeps a reply we already decided to send — a getheaders answer, a pong,
+a tx we just invd — from being silently lost while a large block streams to
+a slow peer, with nothing to retry it and the peer waiting forever on a
+request we had already consumed. What bounds a peer that never drains is the
+20-minute send-stall disconnect below, not a dropped message.")
 
 (defconstant +send-stall-timeout-seconds+ (* 20 60)
   "Disconnect a peer whose socket has accepted no bytes for this long while
@@ -451,8 +461,10 @@ after a hard send failure (connection marked dead). Caller holds SEND-LOCK."
 (defun connection-send-paused-p (conn)
   "T while CONN's buffered unsent data exceeds the send-buffer cap (Core
 CNode::fPauseSend). Bulk producers (block serving in handle-getdata, exactly
-where Core checks it in ProcessGetData) stop sending to a paused peer;
-send-bytes drops further messages until the buffer drains below the cap."
+where Core checks it in ProcessGetData) stop sending to a paused peer, and
+the pump stops reading that peer's INBOUND messages (drain-and-reap-peer,
+Core's `if (node.fPauseSend) return false;` in ProcessMessages) until the
+buffer drains below the cap. Nothing already queued is discarded."
   (> (connection-send-queue-bytes conn) *max-send-buffer-bytes*))
 
 (defun connection-send-stalled-p (conn)
@@ -477,8 +489,10 @@ remains usable."
   "Send raw bytes over the connection without ever blocking the calling
 thread: bytes the kernel won't take immediately are queued on the connection
 and retried by later sends / flush passes. Returns the number of bytes
-accepted (sent or queued), or NIL when the message was dropped — connection
-dead, or send-paused with the buffer over +max-send-buffer-bytes+."
+accepted (sent or queued), or NIL only when the connection is dead: a message
+handed to this function is never discarded because the buffer is full (Core
+PushMessage, net.cpp:4088-4113). Overflowing *max-send-buffer-bytes* pauses
+the peer instead, which stops us reading its input."
   (when (zerop (length bytes))
     (return-from send-bytes 0))
   (handler-case
@@ -490,11 +504,11 @@ dead, or send-paused with the buffer over +max-send-buffer-bytes+."
           (return-from send-bytes nil))
         (cond
           ((plusp (connection-send-queue-bytes conn))
-           ;; Still backed up. Queue behind it — unless over the cap, in
-           ;; which case the message is dropped (see pause note above).
-           (cond ((connection-send-paused-p conn) nil)
-                 (t (%enqueue-send-bytes conn bytes)
-                    (length bytes))))
+           ;; Still backed up: queue behind it. Going over the cap only
+           ;; send-pauses the peer (see connection-send-paused-p); the
+           ;; message itself is kept, as in Core.
+           (%enqueue-send-bytes conn bytes)
+           (length bytes))
           (t
            ;; Queue empty: optimistic direct send (Core PushMessage's
            ;; optimistic SocketSendData), buffering any remainder.
