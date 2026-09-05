@@ -685,7 +685,11 @@
   disconnect side tip-first in the reorg's commit phase) and calls nothing
   in `src/node/` by name. Signature validation of a block's
   scripts is batched and cached but never skipped -- same-block chained
-  spends once bypassed it. Long loops poll `interrupt-requested-p`
+  spends once bypassed it. A block's intra-block coin overlay obeys the
+  same rules as the coins view it stands in for, so an output Core's
+  AddCoin drops (provably unspendable) is never staged and a same-block
+  spend of one fails as a MISSING INPUT rather than in the script engine.
+  Long loops poll `interrupt-requested-p`
   between blocks so shutdown and the assumeutxo pause can cut in.
 
   Traps: the P2SH-witness redeem script is the STACK TOP, not the last

@@ -1751,6 +1751,34 @@ Returns (VALUES T NIL) or (VALUES NIL ERROR-KEYWORD)."
         (return-from %check-block (values nil :bad-blk-sigops))))
     (values t nil)))
 
+(defun %stage-block-outputs (tx pending-utxos height &key coinbase)
+  "Add TX's outputs to PENDING-UTXOS, the block's intra-block coin overlay --
+the half of Core's UpdateCoins that AddCoins performs (validation.cpp:2589 ->
+coins.cpp AddCoins/AddCoin).
+
+A provably-unspendable output is DROPPED, exactly as AddCoin drops it (`if
+(coin.out.scriptPubKey.IsUnspendable()) return;'), so a later transaction of
+the same block that names such an outpoint fails Core's HaveInputs and the
+block is rejected bad-txns-inputs-missingorspent. The persistent view already
+applies that rule when the block is really connected (COIN-VIEW-APPLY-BLOCK,
+storage/coins-view-cache.lisp), and the overlay has to agree with it: keeping
+the coin here resolves a same-block spend of an OP_RETURN or oversize-script
+output as a PRESENT input, so it reaches script validation instead of the
+input-availability check, and its value is credited into the block's fee
+total -- which is the cap on what the coinbase may pay itself. With script
+checks skipped that block was accepted outright."
+  (let ((txid (bl.ser:transaction-hash tx)))
+    (loop for output across (bl.ser:transaction-outputs tx)
+          for idx from 0
+          for spk = (bl.ser:tx-out-script-pubkey output)
+          unless (bl.store:script-unspendable-p spk)
+            do (setf (gethash (cons txid idx) pending-utxos)
+                     (bl.store:make-utxo-entry
+                      :value (bl.ser:tx-out-value output)
+                      :script-pubkey spk
+                      :height height
+                      :coinbase coinbase)))))
+
 (defun %contextual-check-block-no-utxo (block chain-state current-height)
   "Core ContextualCheckBlock (validation.cpp:4161-4216) minus the block-weight
 limit, which %CHECK-BLOCK already applies: transaction finality against the
@@ -1868,15 +1896,7 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
           ;; Coinbase sigops: legacy only (no inputs to look up), scaled by witness factor
           (incf total-sigops-cost (* (count-legacy-sigops coinbase-tx) +witness-scale-factor+))
           ;; Add coinbase outputs to pending (for intra-block spending)
-          (let ((txid (bl.ser:transaction-hash coinbase-tx)))
-            (loop for output across (bl.ser:transaction-outputs coinbase-tx)
-                  for idx from 0
-                  do (setf (gethash (cons txid idx) pending-utxos)
-                           (bl.store:make-utxo-entry
-                            :value (bl.ser:tx-out-value output)
-                            :script-pubkey (bl.ser:tx-out-script-pubkey output)
-                            :height current-height
-                            :coinbase t)))))
+          (%stage-block-outputs coinbase-tx pending-utxos current-height :coinbase t))
 
         ;; Validate other transactions. Per-tx structure (CheckTransaction)
         ;; already ran context-free above; here we do the contextual checks
@@ -1923,15 +1943,7 @@ Returns (VALUES T NIL FEES) or (VALUES NIL ERROR-KEYWORD NIL)."
                                           (bl.ser:outpoint-index prevout))
                                     spent-outpoints)
                            t)))
-                 (let ((txid (bl.ser:transaction-hash tx)))
-                   (loop for output across (bl.ser:transaction-outputs tx)
-                         for idx from 0
-                         do (setf (gethash (cons txid idx) pending-utxos)
-                                  (bl.store:make-utxo-entry
-                                   :value (bl.ser:tx-out-value output)
-                                   :script-pubkey (bl.ser:tx-out-script-pubkey output)
-                                   :height current-height
-                                   :coinbase nil))))))
+                 (%stage-block-outputs tx pending-utxos current-height)))
 
       ;; Core's ContextualCheckBlock: finality, the BIP34 coinbase height and
       ;; the BIP141 witness commitment. Shared verbatim with ACCEPT-BLOCK-BODY,
