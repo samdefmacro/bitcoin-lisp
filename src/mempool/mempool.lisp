@@ -1614,7 +1614,7 @@ understand."
       (finish-output out))
     (bl.kv:fsync-file tmp)
     (rename-file tmp path)
-    (bl.kv:fsync-directory path)))
+    (bl.kv:fsync-parent-directory path)))
 
 (defun save-mempool-file (mempool path)
   "Persist MEMPOOL (entries + prioritisation deltas + the unbroadcast txid

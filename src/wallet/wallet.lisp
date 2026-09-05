@@ -1344,7 +1344,7 @@ the operator can still repair by hand."
   "Replace settings.json with TABLE atomically: write a temp file, fsync it,
 rename over the destination, then fsync the directory. Without the fsyncs a
 crash can leave the renamed file empty or revert the rename entirely
-(see storage:fsync-file / fsync-directory). Returns T on success."
+(see bl.kv:fsync-file / bl.kv:fsync-parent-directory). Returns T on success."
   (let* ((path (settings-json-path data-directory))
          (tmp (merge-pathnames "settings.json.tmp"
                                (uiop:ensure-directory-pathname data-directory))))
@@ -1357,7 +1357,7 @@ crash can leave the renamed file empty or revert the rename entirely
             (terpri s))
           (bl.kv:fsync-file tmp)
           (rename-file tmp path)
-          (bl.kv:fsync-directory path)
+          (bl.kv:fsync-parent-directory path)
           t)
       (error (e)
         (bl:log-warn "could not write ~A: ~A" path e)

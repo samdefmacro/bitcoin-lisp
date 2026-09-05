@@ -73,7 +73,7 @@ which the chain above supplies (src/config-options.lisp)."
   :description "Persistence primitives: the LevelDB binding, flat file
 sequences with XOR obfuscation, the datadir layout, fsync. Package
 bitcoin-lisp.kv, which bitcoin-lisp.storage :USEs and re-exports."
-  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "cffi" "bordeaux-threads" "ironclad" "alexandria")
+  :depends-on ("bitcoin-lisp/util" "bitcoin-lisp/crypto" "bitcoin-lisp/logging" "cffi" "bordeaux-threads" "ironclad" "alexandria")
   :pathname "src"
   :serial t
   :components ((:file "kv/package")
