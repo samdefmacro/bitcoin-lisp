@@ -246,7 +246,7 @@ so the two compose rather than clobbering each other."
           (write-string (bl:render-settings-json alist) out))
         (bl.kv:fsync-file tmp)
         (rename-file tmp path)
-        (bl.kv:fsync-directory path))
+        (bl.kv:fsync-parent-directory path))
     (error (e)
       (init-error "Settings file could not be written: ~A" e))))
 

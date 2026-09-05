@@ -1395,6 +1395,41 @@ are blanked first."
         "~D reference~:P to the pseudo-network :testnet: ~S -- pass the real chain ~
 and read its prefix from chain-params" (length hits) hits)))
 
+(defun %fsync-directory-call-sites (&optional (corpus (%source-corpus)))
+  "Every (file . line) in CORPUS outside src/kv/fsync.lisp whose code CALLS
+FSYNC-DIRECTORY. Strings and comments are blanked first; the #:FSYNC-DIRECTORY
+of an export list is not a call, and FSYNC-PARENT-DIRECTORY does not contain
+the name at all."
+  (let ((hits '()))
+    (loop for (file . lines) in corpus
+          unless (search "kv/fsync.lisp" file)
+            do (let ((in-string nil))
+                 (loop for raw across lines
+                       for n from 1
+                       do (multiple-value-bind (code next) (%code-only raw in-string)
+                            (setf in-string next)
+                            (let ((pos (search "fsync-directory" code :test #'char-equal)))
+                              (when (and pos
+                                         (not (and (>= pos 2)
+                                                   (string= "#:" code :start2 (- pos 2)
+                                                                      :end2 pos))))
+                                (push (cons file n) hits)))))))
+    (nreverse hits)))
+
+(test fsync-directory-is-called-only-where-a-directory-is-in-hand
+  "Core calls DirectoryCommit from exactly one place -- flatfile.cpp:108, the
+block/undo allocator, which holds the sequence's directory. Every other
+temp+fsync+rename hands FSYNC-PARENT-DIRECTORY the FILE's path, because
+FSYNC-DIRECTORY given a file path opens that file, fsyncs it and reports
+success: four writers (settings.json from the node and from the wallet,
+mempool.dat, the wallet backup) sat under a comment claiming the directory was
+synced while the rename itself stayed undurable, and nothing could see it."
+  (let ((sites (%fsync-directory-call-sites)))
+    (is (equal '("src/kv/flatfile.lisp")
+               (remove-duplicates (mapcar #'car sites) :test #'string=))
+        "fsync-directory is called from ~S; only the flat-file allocator has a ~
+directory to hand it -- every other site takes fsync-parent-directory" sites)))
+
 (defun %equalp-hash-tables (&optional (corpus (%source-corpus)))
   "Every (file . line) in CORPUS that makes a hash table with the EQUALP test
 (strings and comments blanked). Keyed by octet vectors that is the slow
@@ -1605,6 +1640,14 @@ the measuring functions must measure a known shape correctly."
                           (vector "(bl:request-node-shutdown x) (bl.store:chain-state y) (bl:*network* z) (bl:node-lock w) ; bl:maybe-critical-flush"
                                   "\"bl:maybe-critical-flush\"")))))
       "positive control: a validation file naming a src/node/ function (shutdown.lisp) is upward; a re-exported chainparams special and the node struct's accessor (state.lisp loads early since wave F2) are not")
+  (is (equal '(("probe.lisp" . 1))
+             (%fsync-directory-call-sites
+              (list (cons "probe.lisp"
+                          (vector "(bl.kv:fsync-directory dir) ; fsync-directory"
+                                  "(bl.kv:fsync-parent-directory path)"
+                                  "   #:fsync-directory"
+                                  "\"fsync-directory\"")))))
+      "positive control: the fsync scanner must see the call and not fsync-parent-directory, an export-list #:name, the comment or the string")
   (is (equal '(("probe.lisp" . 1))
              (%equalp-hash-tables
               (list (cons "probe.lisp"

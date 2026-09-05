@@ -312,8 +312,10 @@
   XOR obfuscation.
 
   Invariants: a record on disk is framed and checksummed; a directory
-  fsync follows every file rename that must survive a crash; the datadir
-  layout is Core's, so a Core node can read what we write.
+  fsync follows every file rename that must survive a crash -- through
+  `fsync-parent-directory` wherever the caller holds the file's path, since
+  `fsync-directory` given a file syncs that file and reports success; the
+  datadir layout is Core's, so a Core node can read what we write.
 
   Trap: LevelDB `max-open-files` is Core's 1000 on purpose. A larger
   value pushes LevelDB out of mmap into real file descriptors and a
@@ -336,6 +338,7 @@
   (bitcoin-lisp.kv:compute-crc32 function)
   (bitcoin-lisp.kv:fsync-file function)
   (bitcoin-lisp.kv:fsync-directory function)
+  (bitcoin-lisp.kv:fsync-parent-directory function)
   (bitcoin-lisp.kv:calculate-cache-sizes function)
   (bitcoin-lisp.kv:datadir-layout-report function)
   (bitcoin-lisp.kv:*blocks-xor* variable)

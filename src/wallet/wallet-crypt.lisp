@@ -673,7 +673,7 @@ user asked for."
              ;; POSIX does not make the rename itself durable until the
              ;; containing directory is synced (storage/utxo.lisp does the
              ;; same for the same reason).
-             (bl.kv:fsync-directory path)
+             (bl.kv:fsync-parent-directory path)
              (setf temp nil))
         ;; A failed dump must not leave a partial file that looks like a
         ;; backup (Core dump.cpp:104-106 removes its temp the same way).

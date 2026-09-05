@@ -2414,3 +2414,18 @@ directory. The helper must accept a plain file path and a bare name."
            (finishes (bl.kv:fsync-directory
                       (namestring (uiop:temporary-directory)))))
       (delete-file path))))
+
+(test fsync-directory-reports-a-failure-instead-of-swallowing-it
+  "A directory fsync that fails has to say so. It still may not break the write
+it was protecting -- the file is renamed into place by then -- but returning a
+silent NIL is how a node loses durability with nothing in the log to find it by."
+  (flet ((fsync-log (dir)
+           (let ((out (make-string-output-stream)))
+             (let ((bl.log:*log-stream* out))
+               (bl.kv:fsync-directory dir))
+             (get-output-stream-string out))))
+    (let ((quiet (fsync-log (namestring (uiop:temporary-directory)))))
+      (is (string= "" quiet) "an fsync that succeeded logged ~S" quiet))
+    (let ((complaint (fsync-log "/no-such-directory-for-the-fsync-test/")))
+      (is-true (search "fsync" complaint)
+               "a directory that cannot be opened logged ~S" complaint))))
