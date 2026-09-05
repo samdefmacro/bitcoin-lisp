@@ -1112,6 +1112,111 @@ at mainnet scale), so only this test exercises it."
             (is (null valid))
             (is (eq :script-failed error))))))))
 
+;;;; The script-execution cache on the BLOCK path
+;;;
+;;; Core's CheckInputScripts answers from the script-execution cache before it
+;;; resolves a single coin -- `if (validation_cache.m_script_execution_cache.
+;;; contains(hashCacheEntry, !cacheFullScriptStore)) return true;'
+;;; (validation.cpp:2077-2081) -- over an entry that is
+;;; SHA256(salt | wtxid | flags). ConnectBlock reaches it for every
+;;; non-coinbase transaction with `fCacheResults = fJustCheck', whose comment
+;;; states both halves of the contract: "Don't cache results if we're actually
+;;; connecting blocks (still consult the cache, though)" (:2571).
+;;;
+;;; Ours read that cache only from the mempool path, so the entry the mempool
+;;; wrote was read by nobody and every confirmed transaction was interpreted a
+;;; second time.
+
+(defvar *sec-spend-serial* 0
+  "Serial number behind %SEC-SPEND-BLOCK's funding txid.")
+
+(defun %sec-spend-block (script-pubkey script-sig height)
+  "(values block utxo-set spend-tx flags): a block whose one non-coinbase
+transaction spends a single SCRIPT-PUBKEY coin with SCRIPT-SIG, plus the flag
+string the block's own hash and HEIGHT select.
+
+Every call gets a FRESH funding txid, and so a fresh spend WTXID. The
+script-execution cache is process-global, keyed by wtxid, and these tests
+STORE into it -- including in their controls -- so a fixed txid would make the
+test pass once per image and fail on the next run against its own leftovers."
+  (let* ((utxo-set (bl.store:make-utxo-set))
+         (prev-txid (let ((h (make-array 32 :element-type '(unsigned-byte 8)
+                                            :initial-element #xE1))
+                          (n (incf *sec-spend-serial*)))
+                      (dotimes (i 4 h)
+                        (setf (aref h i) (ldb (byte 8 (* 8 i)) n)))))
+         (spend (%w8d-spend-tx prev-txid script-sig nil))
+         (blk (bl.ser:make-bitcoin-block
+               :header (make-test-block-header)
+               :transactions (list (make-coinbase-transaction
+                                    :value 5000000000 :height height)
+                                   spend))))
+    (bl.store:add-utxo utxo-set prev-txid 0 1000000 script-pubkey 5)
+    (values blk utxo-set spend
+            (bl.val:block-script-flags
+             (bl.ser:block-header-hash (bl.ser:bitcoin-block-header blk))
+             height))))
+
+(test block-scripts-consult-the-script-execution-cache
+  "A transaction already verified under the block's exact flag set must not be
+interpreted again -- Core returns true straight out of the cache. The block
+path went to the interpreter unconditionally, so the cache the mempool's
+consensus pass fills was never read and its own docstring claim (\"the
+confirming block verifies again, so this turns the second pass into ONE
+lookup\") did not hold.
+
+Poisoning the cache is how Core's own txvalidationcache_tests prove the probe
+runs: the block here is one an empty scriptSig can never satisfy, so an
+acceptance can only have come from the entry. Two controls keep that from
+being vacuous -- with no entry the block is rejected, and an entry stored
+under a DIFFERENT flag string does not hit, since the flags are in the key."
+  (let ((p2pkh (%w8d-script #x76 #xa9 #x14
+                            (make-array 20 :element-type '(unsigned-byte 8)
+                                           :initial-element 3)
+                            #x88 #xac))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    ;; CONTROL: nothing cached, so the interpreter rejects it.
+    (multiple-value-bind (blk utxo-set)
+        (%sec-spend-block p2pkh empty 800000)
+      (multiple-value-bind (valid error)
+          (bl.val:validate-block-scripts blk utxo-set :height 800000)
+        (is (null valid))
+        (is (eq :script-failed error))))
+    ;; CONTROL: an entry under other flags is a different key.
+    (multiple-value-bind (blk utxo-set spend)
+        (%sec-spend-block p2pkh empty 800000)
+      (bl.interop:script-execution-cache-store
+       (bl.interop:make-script-execution-cache-key
+        (bl.ser:transaction-wtxid spend) "P2SH"))
+      (is (null (bl.val:validate-block-scripts blk utxo-set :height 800000))))
+    ;; THE assertion: the entry under the block's own flags is honoured.
+    (multiple-value-bind (blk utxo-set spend flags)
+        (%sec-spend-block p2pkh empty 800000)
+      (bl.interop:script-execution-cache-store
+       (bl.interop:make-script-execution-cache-key
+        (bl.ser:transaction-wtxid spend) flags))
+      (is (eq t (bl.val:validate-block-scripts blk utxo-set :height 800000))))))
+
+(test block-scripts-do-not-populate-the-script-execution-cache
+  "Connecting a block CONSULTS the cache and writes nothing into it: Core
+passes `fCacheResults = fJustCheck' from ConnectBlock, so the insert at
+validation.cpp:2124-2128 belongs to the mempool's consensus pass alone. A
+block whose scripts genuinely pass must therefore leave no entry behind.
+Control: the very same key is present the moment something stores it, so the
+absence measured above is a real absence and not a mistyped key."
+  (let ((op-true (make-array 1 :element-type '(unsigned-byte 8)
+                               :initial-element #x51))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (multiple-value-bind (blk utxo-set spend flags)
+        (%sec-spend-block op-true empty 800000)
+      (let ((key (bl.interop:make-script-execution-cache-key
+                  (bl.ser:transaction-wtxid spend) flags)))
+        (is (eq t (bl.val:validate-block-scripts blk utxo-set :height 800000)))
+        (is (null (bl.interop:script-execution-cached-p key)))
+        ;; CONTROL: the key is the one the block path would have used.
+        (bl.interop:script-execution-cache-store key)
+        (is-true (bl.interop:script-execution-cached-p key))))))
+
 ;;;; Witness Validation Tests
 
 (defun make-witness-p2wpkh-script ()

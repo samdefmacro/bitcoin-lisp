@@ -810,6 +810,45 @@ care in the script interpreter can make that safe."
                     utxo-set extra-coins)))
     out))
 
+(defun script-execution-cache-hit-p (tx script-flags)
+  "T when TX's input scripts have ALL already been verified under SCRIPT-FLAGS.
+
+Core's CheckInputScripts asks this before it resolves a single coin --
+`if (validation_cache.m_script_execution_cache.contains(hashCacheEntry,
+!cacheFullScriptStore)) return true;' (validation.cpp:2077-2081) -- over an
+entry that is SHA256(salt | wtxid | flags).
+
+Three properties make (wtxid, flags) the WHOLE key, with no spent scriptPubKey
+in it, and all three are Core's own reasoning:
+
+  - the wtxid commits to every input's outpoint, and an outpoint names one
+    output of one transaction, whose txid commits to that output's script and
+    amount. Core states the assumption at validation.cpp:2069-2073 and enforces
+    it on the ONLY path that WRITES the cache: CheckInputsFromMempoolAndCache
+    asserts each coin equals the mempool parent's output or the chainstate's
+    own coin before calling CheckInputScripts with cacheFullScriptStore
+    (validation.cpp:405-430). Ours writes from that same single place, the
+    mempool's %CONSENSUS-SCRIPT-CHECKS pass.
+  - the flags are in the key, so an entry written under the standard (policy)
+    flag set is never served to a block, and a soft-fork activation retires the
+    entries whose rules changed instead of silently reusing them.
+  - an entry means every input SUCCEEDED, so a hit can only accept what a
+    re-run would accept.
+
+The block path only READS. Core sets `fCacheResults = fJustCheck' in
+ConnectBlock -- \"Don't cache results if we're actually connecting blocks
+(still consult the cache, though)\" (validation.cpp:2571) -- so connecting a
+block consults what the mempool wrote and adds nothing. Core's `erase'
+argument on the probe has no analogue here either: CuckooCache's erase only
+sets a garbage-collect bit that a later contains() still reads as present
+(cuckoocache.h:449-463, \"a great property for re-org performance\"), while
+this cache is two generations of a hash table with no eviction priority to
+set, so dropping the entry would be strictly worse than Core."
+  (and bl.interop:*script-execution-cache-enabled*
+       (bl.interop:script-execution-cached-p
+        (bl.interop:make-script-execution-cache-key
+         (bl.ser:transaction-wtxid tx) script-flags))))
+
 (defun validate-tx-scripts (tx tx-idx utxo-set script-flags height
                             &key extra-coins spent-utxos)
   "Validate all input scripts of a single transaction. Returns
@@ -820,7 +859,14 @@ which are not in UTXO-SET yet.
 SPENT-UTXOS, when supplied, is this transaction's already-resolved coins from
 PREFETCH-BLOCK-SPENT-COINS. Passing it is what makes a worker thread safe: the
 coins view is never touched here, so its non-synchronized cache is never
-written concurrently."
+written concurrently.
+
+A transaction the mempool already verified under these exact flags is not
+interpreted again: SCRIPT-EXECUTION-CACHE-HIT-P is Core's CheckInputScripts
+short-circuit, and it comes first so a hit costs neither the coin resolution
+nor the sighash precomputation below."
+  (when (script-execution-cache-hit-p tx script-flags)
+    (return-from validate-tx-scripts t))
   (let* ((tx-inputs (bl.ser:transaction-inputs tx))
          (spent-utxos (or spent-utxos
                           (collect-spent-utxos tx-inputs utxo-set extra-coins)))
