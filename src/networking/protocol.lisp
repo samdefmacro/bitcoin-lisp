@@ -1086,12 +1086,12 @@ Skipped for an address the peer already knows (Core: \"only to save space from
 duplicates\" — the flush filters again, because the peer can learn an address
 between the push and the flush) and for one it cannot encode; T is returned
 only when the address was actually queued, which is how RELAY-ADDRESS counts
-what it passed on without widening its own fan-out to make the count up. Once
-the queue
-holds bl.ser:+max-addr-count+ entries (Core MAX_ADDR_TO_SEND, the same 1000
-that bounds an addr message) a new address REPLACES a uniformly random one
-rather than being appended or dropped, so a peer flooding us with addresses
-cannot decide which of the queued ones we pass on."
+what it passed on without widening its own fan-out to make the count up.
+
+Once the queue holds bl.ser:+max-addr-count+ entries (Core MAX_ADDR_TO_SEND,
+the same 1000 that bounds an addr message) a new address REPLACES a uniformly
+random one rather than being appended or dropped, so a peer flooding us with
+addresses cannot decide which of the queued ones we pass on."
   (let ((queue (peer-addrs-to-send peer)))
     (when (and (not (bl:recent-reject-p (peer-known-addrs peer)
                                         (%addr-gossip-key peer-addr)))
@@ -1277,7 +1277,7 @@ network and address only, exactly like the ban list's own keys."
 (defun %ingest-gossiped-address (peer net-addr timestamp address-book source-group
                                  now &optional source-net source-ip)
   "Shared addr/addrv2 ingestion for one gossiped NET-ADDR (Core's per-address
-loop in the ADDR handler, net_processing.cpp:4069-4104) learned from PEER,
+loop in the ADDR handler, net_processing.cpp:4069-4106) learned from PEER,
 whose net-group key is SOURCE-GROUP and own address SOURCE-NET/SOURCE-IP. Stores
 it in ADDRESS-BOOK only when its network is REACHABLE (-onlynet; Core \"Do not
 store addresses outside our network\"), but fresh (10-min) ROUTABLE addresses
@@ -1292,7 +1292,7 @@ services bits promise no useful address DB are skipped entirely — neither
 stored nor relayed, as in Core — and so are addresses this node has banned or
 discouraged (net_processing.cpp:4094-4097).
 
-PEER is marked as knowing the address (Core AddAddressKnown, :4092) after the
+PEER is marked as knowing the address (Core AddAddressKnown, :4093) after the
 timestamp is fixed up and BEFORE the ban test, so a peer is never told back an
 address it has just told us, whether or not we go on to store or relay it. It
 is also the reason the mark is here and not in RELAY-ADDRESS, which only ever
@@ -1326,14 +1326,14 @@ Core counts it in neither num_proc nor num_rate_limit."
                            (equalp source-ip (peer-address-ip pa)))
                       0
                       +addr-gossip-time-penalty-seconds+)))
-    ;; Core AddAddressKnown (net_processing.cpp:4092), on the announcing peer,
+    ;; Core AddAddressKnown (net_processing.cpp:4093), on the announcing peer,
     ;; for EVERY address that got past the service filter and before the ban
     ;; test below -- "remembering we received them" is exactly what the next
     ;; comment means by it.
     (when peer
       (bl:add-recent-reject (peer-known-addrs peer) (%addr-gossip-key pa)))
     ;; Core: "Do not process banned/discouraged addresses beyond remembering we
-    ;; received them" (net_processing.cpp:4093-4096). Its `continue` skips the
+    ;; received them" (net_processing.cpp:4094-4097). Its `continue` skips the
     ;; ++num_proc, the RelayAddress call and the vAddrOk push that feeds
     ;; addrman, so a hostile address neither takes a bucket from a good one nor
     ;; gets gossiped onward by the node that decided it was hostile -- and it
@@ -1396,7 +1396,7 @@ the number stored."
       ;; `rate_limited = !pfrom.HasPermission(NetPermissionFlags::Addr)`).
       (let ((rate-limited (and peer (not (peer-has-permission-p peer +perm-addr+)))))
       (dolist (entry (alexandria:shuffle (copy-list entries)))
-        ;; Core's rate-limit branch verbatim (net_processing.cpp:4074-4082):
+        ;; Core's rate-limit branch verbatim (net_processing.cpp:4076-4083):
         ;; below one token a rate-limited peer's address is dropped and
         ;; counted, while a peer holding the Addr permission is let through
         ;; and spends NOTHING -- only the else branch takes a token.
@@ -1410,7 +1410,7 @@ the number stored."
              ;; num_proc counts what reached the relay/store stage, so it is
              ;; incremented by the ingest's verdict and not here: Core's
              ;; ++num_proc sits AFTER the service filter and the ban test
-             ;; (net_processing.cpp:4097), and counting on the way in reported
+             ;; (net_processing.cpp:4098), and counting on the way in reported
              ;; addresses we had refused as processed.
              (multiple-value-bind (stored relay processed)
                  (%ingest-gossiped-address peer (car entry) (cdr entry)

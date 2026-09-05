@@ -511,7 +511,7 @@ socket, and the queue is where an address waits for its flush anyway."
 (test addr-ingest-counts-and-marks-what-core-does
   "Core\'s per-address loop marks the ANNOUNCER as knowing an address right
 after the timestamp fix-up and BEFORE the ban test (AddAddressKnown,
-net_processing.cpp:4092), and reaches ++num_proc only past that test (:4097).
+net_processing.cpp:4093), and reaches ++num_proc only past that test (:4098).
 We did neither. num_proc was incremented on the way in, so getpeerinfo\'s
 addr_processed counted addresses we had refused -- for their service bits, or
 for being banned -- as processed. And the announcer was marked only inside

@@ -1456,7 +1456,6 @@ the fallback lives."
            "and the parked request is answered once the buffer drains")
        (is (null (peer-pending-getdata peer)))))))
 
-
 (test g7-16-blocktxn-completion-promotes-only-after-the-block-validates
   "The OTHER compact path — a reconstruction completed by blocktxn — carried the
 same defect and needs its own coverage: a dropped hunk there would disable the
