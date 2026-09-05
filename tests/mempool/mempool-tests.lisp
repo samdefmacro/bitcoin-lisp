@@ -8,6 +8,19 @@
   "Create a mempool entry for a test transaction (computes size/vsize/wtxid)."
   (bl.mp:make-entry-from-tx tx fee 0 :entry-time 1000000))
 
+(defun %rolling-min-fee (mempool)
+  "The mempool's stored rolling minimum fee rate (Core rollingMinimumFeeRate)."
+  (bl.mp::mempool-rolling-min-fee-rate mempool))
+
+(defun %set-rolling-min-fee (mempool rate time)
+  "Plant a rolling minimum of RATE sat/kvB last decayed at TIME, with a block
+since the bump — the state a trim followed by a connected block leaves (Core
+trackPackageRemoved then removeForBlock)."
+  (setf (bl.mp::mempool-rolling-min-fee-rate mempool) (coerce rate 'double-float)
+        (bl.mp::mempool-rolling-min-fee-time mempool) time
+        (bl.mp::mempool-block-since-rolling-fee-bump mempool) t)
+  rate)
+
 (defun %mp-block (txs)
   "A block carrying TXS. MEMPOOL-REMOVE-FOR-BLOCK reads the transaction list
 and nothing else, so the header is a placeholder."
@@ -1825,7 +1838,7 @@ the evicted chunk's feerate plus the incremental relay fee (Core TrimToSize
     ;; Rolling minimum fee: evicted chunk feerate (sat/kvB, truncated) +
     ;; incremental relay fee (100 sat/kvB).
     (is (= (+ (truncate (* 2000 1000) m-vsize) 100)
-           (bl.mp::mempool-rolling-min-fee-rate mempool)))))
+           (%rolling-min-fee mempool)))))
 
 (test mempool-full-self-eviction-bumps-rolling-fee
   "A newcomer whose own chunk is the worst evicts itself (Core: add, trim,
@@ -1842,7 +1855,7 @@ minimum fee past its feerate, so an equal-feerate retry cannot loop."
     (is (not (bl.mp:mempool-has
               mempool (bl.ser:transaction-hash poor))))
     (is (= (+ (truncate (* 30 1000) poor-vsize) 100)
-           (bl.mp::mempool-rolling-min-fee-rate mempool)))))
+           (%rolling-min-fee mempool)))))
 
 ;;;; PR4 RBF (BIP125)
 
@@ -2300,9 +2313,7 @@ minimum."
     ;; DEFAULT_MIN_RELAY_TX_FEE).
     (is (= 100 (bl.mp:mempool-effective-min-fee-rate mempool)))
     ;; Set a fresh rolling minimum -> used as-is.
-    (setf (bl.mp::mempool-rolling-min-fee-rate mempool) 5000
-          (bl.mp::mempool-rolling-min-fee-time mempool)
-          (bl.ser:get-unix-time))
+    (%set-rolling-min-fee mempool 5000 (bl.ser:get-unix-time))
     (is (= 5000 (bl.mp:mempool-effective-min-fee-rate mempool)))
     ;; Far in the future it decays back below the floor -> floor.
     (is (= 100 (bl.mp:mempool-effective-min-fee-rate
@@ -2826,15 +2837,14 @@ incremental relay fee resets to zero (txmempool.cpp:845-848)."
         (now (bl.ser:get-unix-time)))
     ;; Empty pool -> usage 0 < cap/4 -> halflife 43200/4 = 10800. One full
     ;; 43200 s window is then FOUR half-lives: 16000 -> 1000.
-    (setf (bl.mp::mempool-rolling-min-fee-rate mempool) 16000
-          (bl.mp::mempool-rolling-min-fee-time mempool) now)
+    (%set-rolling-min-fee mempool 16000 now)
     (is (= 1000 (bl.mp:mempool-effective-min-fee-rate
                  mempool (+ now 43200))))
     ;; Decayed below incremental/2 (= 50): resets the slot to 0 and the
     ;; relay floor applies.
     (is (= 100 (bl.mp:mempool-effective-min-fee-rate
                 mempool (+ now (* 20 43200)))))
-    (is (= 0 (bl.mp::mempool-rolling-min-fee-rate mempool)))))
+    (is (= 0 (%rolling-min-fee mempool)))))
 
 (test getmempoolinfo-reports-usage-and-vsize-bytes
   "getmempoolinfo: \"bytes\" is the summed sigop-adjusted VIRTUAL size (Core
@@ -3384,3 +3394,84 @@ be resubmitted once its parent is."
     (is (zerop (bl.mp:mempool-count mempool)))
     (is-false (gethash parent-txid (bl.mp:mempool-deltas mempool)))
     (is (eql 7000 (gethash child-txid (bl.mp:mempool-deltas mempool))))))
+
+(defun %trimmed-mempool (now)
+  "A mempool whose rolling minimum has just been bumped by a real trim at
+NOW: an 800-byte pool holding one 704-byte transaction, after a newcomer
+that evicted itself. Returns the pool and the surviving transaction's txid."
+  (let* ((mempool (bl.mp:make-mempool :max-size 800))
+         (rich (make-mempool-test-tx :input-id 211))
+         (poor (make-mempool-test-tx :input-id 212))
+         (bl.ser:*mock-time* now))
+    (is (eq :ok (%add-tx mempool rich :fee 50000)))
+    (is (eq :mempool-full (%add-tx mempool poor :fee 300)))
+    (values mempool (bl.ser:transaction-hash rich))))
+
+(test rolling-min-fee-does-not-decay-before-a-block
+  "The bump freezes the rolling minimum until a block connects: Core's
+trackPackageRemoved clears blockSinceLastRollingFeeBump (txmempool.cpp:
+853-858) and GetMinFee returns the UNDECAYED rate while it is clear
+(:831-832), which is what makes TrimToSize's promise hold — \"we don't allow
+txn to enter mempool with feerate equal to txn which were removed with no
+block in between\". removeForBlock then restarts the clock (:426-427)."
+  (let* ((t0 1700000000)
+         (mempool (%trimmed-mempool t0))
+         (bumped (%rolling-min-fee mempool)))
+    (is (plusp bumped))
+    ;; Twelve hours pass with no block: the floor has not moved.
+    (is (= bumped (bl.mp:mempool-decayed-rolling-min-fee-rate
+                   mempool (+ t0 43200)))
+        "the floor decayed with no block since the bump")
+    ;; A block — carrying a transaction the pool never held — starts it.
+    (let ((bl.ser:*mock-time* t0))
+      (bl.mp:mempool-remove-for-block
+       mempool (%mp-block (list (make-mempool-test-tx :input-id 213)))))
+    ;; 704 of 800 bytes in use, so this interval runs at the full 12 h
+    ;; half-life.
+    (is (= (floor (+ (/ bumped 2) 1/2))
+           (bl.mp:mempool-decayed-rolling-min-fee-rate
+            mempool (+ t0 43200)))
+        "a connected block did not restart the decay")))
+
+(test rolling-min-fee-decays-at-the-half-life-that-was-in-force
+  "Core's GetMinFee decays the STORED rate over the interval since its last
+step and writes both back (txmempool.cpp:842-843), so the shortened
+half-life of a drained pool applies only to the interval it is drained for.
+Recomputing from the original bump instead would apply the current
+half-life retroactively to hours the pool spent full."
+  (let ((t0 1700000000))
+    (multiple-value-bind (mempool rich-txid) (%trimmed-mempool t0)
+      (let ((bumped (%rolling-min-fee mempool)))
+        (let ((bl.ser:*mock-time* t0))
+          (bl.mp:mempool-remove-for-block
+           mempool (%mp-block (list (make-mempool-test-tx :input-id 214)))))
+        ;; Twelve hours at 704/800 bytes: one full half-life, one halving.
+        (is (= (floor (+ (/ bumped 2) 1/2))
+               (bl.mp:mempool-decayed-rolling-min-fee-rate
+                mempool (+ t0 43200))))
+        ;; Now the pool empties, which shortens the half-life to 3 h for the
+        ;; NEXT interval only — the twelve hours already elapsed keep the
+        ;; half-life they ran under.
+        (bl.mp:mempool-remove mempool rich-txid)
+        (is (zerop (bl.mp:mempool-dynamic-usage mempool)))
+        (is (= (floor (+ (/ bumped 4) 1/2))
+               (bl.mp:mempool-decayed-rolling-min-fee-rate
+                mempool (+ t0 43200 10800)))
+            "the shortened half-life was applied to the hours the pool was full")))))
+
+(test rolling-min-fee-answers-zero-after-an-enormous-gap
+  "A gap wide enough to take the decay factor out of the double range answers
+0 rather than signalling, the way Core's `rate / pow(2.0, dt/halflife)` does:
+the divisor is an infinity, the rate goes to zero, and the reset below half
+the incremental relay fee clears the slot (txmempool.cpp:842-848). Worth
+pinning because SBCL traps floating-point overflow by default in arithmetic
+it compiles inline — EXPT hands back the infinity instead, so the ported
+expression can keep Core's shape."
+  (let ((t0 1700000000)
+        (mempool (bl.mp:make-mempool)))
+    (%set-rolling-min-fee mempool 16000 t0)
+    ;; An empty pool decays at a 3 h half-life, so 400 days is ~3200 of them
+    ;; and 2^3200 is not a double.
+    (is (zerop (bl.mp:mempool-decayed-rolling-min-fee-rate
+                mempool (+ t0 (* 400 86400)))))
+    (is (zerop (%rolling-min-fee mempool)))))
