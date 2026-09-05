@@ -307,7 +307,7 @@ eligible peers -- skipping the source, block-relay/feeler peers, and peers that
 already know it. A target is marked when its outgoing queue is flushed, on the
 pass that filters it (Core MaybeSendAddr, net_processing.cpp:5582-5589); the
 ANNOUNCER is marked by the ADDR handler, not here (Core AddAddressKnown,
-:4092 -- see ADDR-INGEST-COUNTS-AND-MARKS-WHAT-CORE-DOES)."
+:4093 -- see ADDR-INGEST-COUNTS-AND-MARKS-WHAT-CORE-DOES)."
   (let* ((source (bl.net:make-peer :state :ready :address "9.9.9.9:8333"))
          (full (loop for i below 4
                      collect (bl.net:make-peer
