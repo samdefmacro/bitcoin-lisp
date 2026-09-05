@@ -1,0 +1,138 @@
+{
+  "dimension": "wallet",
+  "findings": [
+    {
+      "id": "dd92141d",
+      "title": "encryptwallet's post-encryption leveldb-compact does not remove the deleted plaintext descriptor keys",
+      "severity": "S1",
+      "our_ref": "src/wallet/wallet-crypt.lisp:402-408",
+      "core_ref": "refs/bitcoin/src/wallet/wallet.cpp:872-876; refs/bitcoin/src/wallet/sqlite.cpp:336-341",
+      "core_does": "EncryptWallet writes the ckeys, deletes the plaintext key rows, rotates the seed, and then calls GetDatabase().Rewrite() with the comment \"Need to completely rewrite the wallet file; if we don't, the database might keep bits of the unencrypted private key in slack space\". SQLiteDatabase::Rewrite() runs VACUUM, which rebuilds the file so the deleted rows are not in any live database page.",
+      "we_do": "encrypt-wallet puts the ckeys and deletes the walletdescriptorkey rows in one batch, then calls (bl.store:leveldb-compact (wallet-db wallet)) as its \"best-effort analogue of Core's database Rewrite\". Measured, that call does not erase anything: leveldb's DBImpl::CompactRange first flushes the memtable -- which is where the plaintext CPrivKey rows still live on a young wallet -- into a fresh SST, then compacts only levels [0, max_level_with_files), so the newly written top-level file is the compaction OUTPUT and is never rewritten. The plaintext 32-byte secret ends up in a live .ldb file and stays there.",
+      "impact": "After the operator runs encryptwallet the wallet directory still contains, in cleartext, the master secret of the pre-encryption descriptors -- and those descriptors stay loaded and spendable so they can still hold funds. Anyone who later obtains the wallet directory (a datadir backup, a stolen disk, a cloud sync, a support bundle) recovers it. Executed: a regtest wallet's 8 walletdescriptorkey rows all carry the same root secret; after encryptwallet the raw 32 bytes were found in 000005.ldb, and they were still there after three unload/loadwallet cycles, 300 getnewaddress calls and another reload. Two further leveldb-compact calls on the same open handle also left it in place; only close + reopen + compact removed it. The fix primitive already exists in-tree (bl.kv:leveldb-compact), it is being invoked at the wrong moment.",
+      "executed": "scripts/dev.sh eval probes in a regtest datadir: read every walletdescriptorkey value's CPrivKey before encryptwallet, call encryptwallet, then byte-scan every file in <wallets>/<name>/ for the 32-byte secret. Results: BEFORE-ENCRYPT hits=(000003.log); AFTER-ENCRYPT hits=(000005.ldb); AFTER-2ND-COMPACT-SAME-HANDLE hits=(000005.ldb); AFTER-3RD-COMPACT-SAME-HANDLE hits=(000005.ldb); AFTER-3-RELOADS hits=(000005.ldb); AFTER-300-ADDRESSES hits=(000005.ldb); AFTER-MORE-USE-AND-RELOAD hits=(000005.ldb). Positive control in a separate run: encrypt -> unloadwallet -> loadwallet -> leveldb-compact => hits=NIL.",
+      "confidence": "executed"
+    },
+    {
+      "id": "04bea49c",
+      "title": "A tx record that fails to parse is skipped with a warning instead of Core's NEED_RESCAN rescan",
+      "severity": "S2",
+      "our_ref": "src/wallet/wallet-tx.lisp:1228-1242; src/wallet/wallet-tx.lisp:1667-1745",
+      "core_ref": "refs/bitcoin/src/wallet/walletdb.cpp:1026-1029; refs/bitcoin/src/wallet/wallet.cpp:3141-3142, 3200-3202",
+      "core_does": "LoadTxRecords: if LoadToWallet returns false for a TX row (deserialization threw, or the stored txid does not match the transaction's hash) the record result becomes DBErrors::NEED_RESCAN. CreateWalletFromFile turns that into rescan_required=true, still loads the wallet, warns \"Error reading %s! Transaction data may be missing or incorrect. Rescanning wallet.\", and AttachChain then leaves rescan_height at 0 instead of using the stored locator -- i.e. it rescans the whole chain from the wallet birthday and rebuilds the lost transaction.",
+      "we_do": "wallet-load-tx-records pushes the string \"Wallet tx record hash mismatch; record skipped (rescan to recover)\" (or \"Error reading wallet tx record: ...\") into the warnings list and moves on. wallet-attach-chain takes no rescan-required argument at all: it always resolves the stored locator's fork and rescans only from there, so the damaged transaction is never recovered.",
+      "impact": "The wallet loads and reports a balance and a history that are silently wrong, with only a warning string in the loadwallet reply to say so. Executed on regtest: a wallet holding one mature 50 BTC coinbase, with one byte of its single tx record flipped, reloaded with getbalances mine.trusted = 0.00000000, txcount 0, listtransactions empty, and warnings [\"Wallet tx record hash mismatch; record skipped (rescan to recover)\"]. Core would have reported 50 BTC after its automatic rescan. An operator reading a zero balance can conclude the coins are gone, or re-derive addresses and reuse them.",
+      "executed": "regtest probe: %ws-fund-wallet, unloadwallet, reopen the wallet LevelDB directly and XOR one byte in the middle of the \"tx\" record value, loadwallet. Before: mine.trusted 50.0. After: mine.trusted 0.0, txcount 0, listtransactions 0 entries, one warning. The control case (deleting the record entirely) also yields 0.0, which is what Core does too -- only the CORRUPT case diverges.",
+      "confidence": "executed"
+    },
+    {
+      "id": "ac7e4f05",
+      "title": "A wallet database that cannot be opened or read answers -32603 Internal error",
+      "severity": "S3",
+      "our_ref": "src/wallet/wallet.lisp:1236; src/wallet/wallet-store.lisp:411-419, 429-445",
+      "core_ref": "refs/bitcoin/src/wallet/rpc/util.cpp:127-157; refs/bitcoin/src/wallet/wallet.cpp:2388-2390",
+      "core_does": "MakeWalletDatabase / LoadWallet map every database failure onto a DatabaseStatus, and HandleWalletError turns that into a typed JSON-RPC error: RPC_WALLET_NOT_FOUND (-18) for a missing or bad-format database, RPC_WALLET_ERROR (-4) with \"Error loading %s: Wallet corrupted\" for a CORRUPT load. The client always sees a wallet error code.",
+      "we_do": "load-wallet calls wallet-db-open and wallet-db-records without translating their conditions. Both signal bl.err:storage-error, which is not an rpc-error, so handle-single-request's generic handler turns it into +rpc-internal-error+ (-32603) with the message \"Internal error: LevelDB error: ...\".",
+      "impact": "A corrupt or unreadable wallet reaches the client as a JSON-RPC transport-level internal error carrying a raw LevelDB string, so tooling that switches on -18/-4 (and Core's own functional tests) sees the wrong class of failure. Executed: a wallet directory containing a CURRENT file with garbage answered loadwallet with the raw condition BITCOIN-LISP.CONDITIONS:STORAGE-ERROR \"LevelDB error: Corruption: CURRENT file does not end with newline\", which handle-single-request wraps as -32603.",
+      "executed": "regtest probe: create <wallets>/junk/CURRENT containing \"garbage\", then loadwallet \"junk\". The handler signalled STORAGE-ERROR rather than an rpc-error; src/rpc/server.lisp:407-420 shows the generic branch that maps it to +rpc-internal-error+.",
+      "confidence": "executed"
+    },
+    {
+      "id": "1f186e72",
+      "title": "listsinceblock parses its blockhash with the txid helper, so a bad hash reports \"txid must be of length 64\"",
+      "severity": "S3",
+      "our_ref": "src/wallet/wallet-tx.lisp:1996; src/wallet/wallet-tx.lisp:1749-1753",
+      "core_ref": "refs/bitcoin/src/wallet/rpc/transactions.cpp:595",
+      "core_does": "listsinceblock uses ParseHashV(request.params[0], \"blockhash\"), whose message is \"blockhash must be of length 64 (not including any '0x' prefix)\".",
+      "we_do": "The handler calls %wallet-parse-txid on the blockhash argument, and that helper hardcodes the field name \"txid\" in its error message.",
+      "impact": "Error-string divergence on a user-facing argument; a caller is told the wrong parameter is malformed. Executed: listsinceblock \"00\" returned -8 \"txid must be of length 64 (not including any '0x' prefix)\".",
+      "executed": "regtest probe: dispatch-rpc-method \"listsinceblock\" with \"00\" -> (:RPC -8 \"txid must be of length 64 (not including any '0x' prefix)\").",
+      "confidence": "executed"
+    },
+    {
+      "id": "d73111fb",
+      "title": "importprunedfunds and removeprunedfunds are not implemented",
+      "severity": "S3",
+      "our_ref": "src/wallet/wallet-tx.lisp:1747 (the wallet transaction RPC section; no define-rpc for either name anywhere under src/wallet/)",
+      "core_ref": "refs/bitcoin/src/wallet/rpc/backup.cpp:39, 94; refs/bitcoin/src/wallet/rpc/wallet.cpp:929, 945",
+      "core_does": "Registers importprunedfunds (add a transaction to the wallet from a raw tx plus a txoutproof, for a pruned node that cannot rescan) and removeprunedfunds (delete a wallet transaction with WalletBatch::EraseTx / RemoveTxs). Both are descriptor-wallet RPCs, unrelated to the legacy wallet.",
+      "we_do": "Neither name has a handler, so dispatch-rpc-method answers \"Method not found\". Their argument rows are present in the generated src/rpc/core-tables.lisp (lines 294, 322) only because that table is derived from Core.",
+      "impact": "A pruned node -- which we support -- has no way to add a known transaction to a wallet whose blocks are gone, and no way to remove a wallet transaction. This is a capability gap rather than a wrong answer, but it is one of the two remaining wallet RPCs Core ships that are in scope for a descriptor-only wallet (migratewallet and walletdisplayaddress are legitimately out of scope).",
+      "executed": "grep over src/ for both names: only src/rpc/core-tables.lisp matches. Not exercised over RPC.",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "dc6e515d",
+      "title": "A corrupt walletdescriptor record surfaces the descriptor parser's message, not Core's UNKNOWN_DESCRIPTOR text",
+      "severity": "S3",
+      "our_ref": "src/wallet/wallet.lisp:1066-1075",
+      "core_ref": "refs/bitcoin/src/wallet/walletdb.cpp:778-789; refs/bitcoin/src/wallet/wallet.cpp:2400-2404",
+      "core_does": "A WALLETDESCRIPTOR value that will not deserialize yields DBErrors::UNKNOWN_DESCRIPTOR, LoadWallet returns early before the ACTIVE*SPK records can produce a misleading corruption error, and the user gets \"Unrecognized descriptor found. Loading wallet %s\\n\\nThe wallet might have been created on a newer version.\\nPlease try running the latest software version.\"",
+      "we_do": "%load-wallet-records calls bl.rpc:parse-descriptor on the stored string and lets whatever the parser signals escape. A flipped byte inside the descriptor string produced RPC error -5 \"Invalid characters in payload\" -- a base58/bech32 payload message with no mention of the wallet, the descriptor, or a possible version mismatch.",
+      "impact": "An operator whose wallet was written by a newer build, or whose descriptor row is damaged, gets an address-decoding error instead of the diagnosis Core gives, and the code is RPC_INVALID_ADDRESS_OR_KEY (-5) rather than a wallet error.",
+      "executed": "regtest probe: XOR one byte in the middle of a walletdescriptor record value, then loadwallet -> (:RPC -5 \"Invalid characters in payload\").",
+      "confidence": "executed"
+    },
+    {
+      "id": "228b2030",
+      "title": "The version record is written once at creation and never read or refreshed; minversion is never used",
+      "severity": "S3",
+      "our_ref": "src/wallet/wallet.lisp:1004-1005; src/wallet/wallet-store.lisp:39-40",
+      "core_ref": "refs/bitcoin/src/wallet/walletdb.cpp:1121-1123, 1176-1177",
+      "core_does": "LoadWallet reads DBKeys::VERSION into last_client, logs \"Last client version = %d\", passes it down so the descriptor-load failure can say \"The wallet might have been created on a newer version\" rather than \"the database might be corrupted\", and rewrites VERSION with CLIENT_VERSION whenever it is absent or stale.",
+      "we_do": "create-wallet writes a \"version\" record and nothing ever reads it; %load-wallet-records has no branch for +wdb-key-version+ or +wdb-key-minversion+, and the constants for both are defined but the minversion record is never written either.",
+      "impact": "The wallet cannot tell a too-new file from a corrupt one, so no load-time diagnostic distinguishes the two, and the on-disk version stamp goes stale after the first upgrade. Purely diagnostic; nothing is mis-loaded.",
+      "executed": "Record dump of a freshly created wallet shows (\"version\" . 1); grep shows +wdb-key-version+ referenced only at the write site and +wdb-key-minversion+ nowhere but its own defconstant.",
+      "confidence": "executed"
+    },
+    {
+      "id": "5d08da5e",
+      "title": "blockDisconnected updates the best block in memory only; Core persists the rolled-back locator",
+      "severity": "S3",
+      "our_ref": "src/wallet/wallet-tx.lisp:1162-1165",
+      "core_ref": "refs/bitcoin/src/wallet/wallet.cpp:1599; refs/bitcoin/src/wallet/wallet.cpp:681-687",
+      "core_does": "CWallet::blockDisconnected ends with SetLastBlockProcessed(block.height - 1, *block.prev_hash), and SetLastBlockProcessed is SetLastBlockProcessedInMem followed by WriteBestBlock() -- so every disconnect writes the rolled-back locator to disk.",
+      "we_do": "wallet-block-disconnected sets wallet-last-block-hash / wallet-last-block-height and returns. Only wallet-block-connected persists a locator (and only when a wallet tx changed or every 144 blocks), so between a reorg and the next qualifying connection the on-disk locator names a block on the abandoned branch.",
+      "impact": "Bounded: the persisted value is still a locator whose ancestors are on the active chain, so a load after a crash in that window finds a fork and rescans from it -- correct, just from further back. The exception is the unload path, which writes a single-hash locator (wallet.lisp:933-953, a documented divergence); a crash-free unload right after a reorg then forces a rescan from genesis instead of from the fork.",
+      "executed": "Read both trees; no probe (reproducing the window needs a crash between a disconnect and the next connect).",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "73d4c5fc",
+      "title": "Extraneous mkey records are not removed from a disable_private_keys wallet on load",
+      "severity": "S3",
+      "our_ref": "src/wallet/wallet.lisp:1245-1251",
+      "core_ref": "refs/bitcoin/src/wallet/walletdb.cpp:1191-1201",
+      "core_does": "After a clean load, if the wallet has WALLET_FLAG_DISABLE_PRIVATE_KEYS and HasEncryptionKeys() but no crypted keys, LoadWallet logs \"Detected extraneous encryption keys in this wallet without private keys\", erases every mkey row, and clears mapMasterKeys -- returning CORRUPT if an erase fails. It exists because it used to be possible to \"encrypt\" a wallet with private keys disabled.",
+      "we_do": "load-wallet's post-load pass only warns when a disable-private-keys wallet still holds private keys; there is no branch that drops leftover mkey records.",
+      "impact": "Such a wallet keeps reporting unlocked_until in getwalletinfo and keeps demanding a passphrase for operations that need none, because wallet-has-encryption-keys-p stays true. It cannot be produced by our own code paths (encryptwallet refuses a disable-private-keys wallet), so this only bites a hand-edited or externally produced wallet.",
+      "executed": "Read both trees; grep for mkey erase sites under src/wallet/ found none.",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "d6adea51",
+      "title": "The whole wallet database is materialized in memory on every load and backup",
+      "severity": "S3",
+      "our_ref": "src/wallet/wallet-store.lisp:429-445; src/wallet/wallet.lisp:1044",
+      "core_ref": "refs/bitcoin/src/wallet/walletdb.cpp:471-512",
+      "core_does": "LoadRecords opens one prefix cursor per record type and streams the rows, so peak memory is one key/value pair regardless of wallet size, and unrelated record types are never touched.",
+      "we_do": "wallet-db-records builds a list of every (key . value) byte-vector pair in the database, and %load-wallet-records holds that list while iterating it twice; %write-wallet-dump uses the same function for backupwallet.",
+      "impact": "Peak memory during load and backup is proportional to the entire wallet file (every tx record, every cache row) rather than constant. A wallet with a large transaction history costs a corresponding transient heap spike on every loadwallet and backupwallet. No wrong answer, and the signalling behaviour on a truncated scan (leveldb-iter-check-error) is deliberately safer than a silent short read.",
+      "executed": "Read both trees; not measured against a large wallet.",
+      "confidence": "read-both-trees"
+    },
+    {
+      "id": "c318f98f",
+      "title": "signmessage validates the address before requiring the passphrase; Core unlocks first",
+      "severity": "S3",
+      "our_ref": "src/wallet/signmessage.lisp:48-58",
+      "core_ref": "refs/bitcoin/src/wallet/rpc/signmessage.cpp:44-56",
+      "core_does": "The handler takes cs_wallet, calls EnsureWalletIsUnlocked(*pwallet) -- error -13 -- and only then decodes the address and checks that it is a PKHash.",
+      "we_do": "The handler decodes the address, raises -5 \"Invalid address\" or -3 \"Address does not refer to key\" as appropriate, and only reaches wallet-ensure-unlocked afterwards, inside %wallet-signmessage-wif's caller.",
+      "impact": "On a locked wallet the error code and message for a malformed or non-P2PKH address differ from Core's -13, so a caller distinguishing \"locked\" from \"bad address\" gets the wrong one. Cosmetic ordering only; no state changes before either check.",
+      "executed": "Read both trees; the unlocked-wallet paths were exercised (signmessage on a bech32 address returned -3 \"Address does not refer to key\", matching Core), the locked-wallet ordering was not.",
+      "confidence": "read-both-trees"
+    }
+  ],
+  "coverage_note": "Executed against a regtest node in the project container (13 probe scripts driving the handlers through bl.rpc:dispatch-rpc-method with %normalize-rpc-params). Covered: the wallet record schema in src/wallet/wallet-store.lisp against walletdb.cpp's DBKeys and Write*/Erase* set; %load-wallet-records against LoadWallet / LoadWalletFlags / LoadDescriptorWalletRecords / LoadAddressBookRecords / LoadActiveSPKMs / LoadDecryptionKeys / LoadTxRecords, including the six DBErrors classes, by corrupting a tx, a walletdescriptor, a walletdescriptorkey, a walletdescriptorcache and the flags record and reloading each; a full write/unload/reload round trip (labels, purpose, persistent locks, tx records, orderposnext, birthtime, avoid_reuse flag) which was byte-identical; the encryptwallet key-material lifecycle on disk; backupwallet/restorewallet's dump format and its containment and checksum guards; and the field sets and error strings of getwalletinfo, getbalances, getbalance, listunspent, lockunspent, listlockunspent, getaddressinfo, setlabel, getaddressesbylabel, listlabels, listdescriptors, gethdkeys, createwalletdescriptor, setwalletflag, createwallet, loadwallet, unloadwallet, listwalletdir, listwallets, restorewallet, backupwallet, gettransaction (plain and verbose, plus details entries), listtransactions, listsinceblock, listreceivedbyaddress, listaddressgroupings, rescanblockchain, abandontransaction, getreceivedbyaddress, getreceivedbylabel, keypoolrefill, simulaterawtransaction, signmessage, sendtoaddress, send, sendall, importdescriptors, encryptwallet, walletpassphrase, walletpassphrasechange and walletlock. Argument NAMES are already generated from Core into src/rpc/core-tables.lisp, so this pass compared RESULT field sets and semantics instead. Two candidate findings were dropped after reading Core: listunspent's hard-coded \"spendable\": true is exactly what Core does (rpc/coins.cpp:675, the field is documented DEPRECATED and always true), and rejecting createwallet \"\" matches Core (wallet.cpp:381 uses the same \"Wallet name cannot be empty\" string; Core's own wallet_startup.py works around it). NOT covered, with the dimension that inherits each: coin selection, fee estimation, change handling and the whole of src/wallet/wallet-spend.lisp beyond its RPC surface (3,702 lines) -- descriptors+signing (dimension 1) and cluster mempool (dimension 3); src/wallet/psbt.lisp's 14 PSBT RPCs beyond confirming they dispatch, and bumpfee/psbtbumpfee/walletcreatefundedpsbt/fundrawtransaction/walletprocesspsbt result shapes -- descriptors+signing (dimension 1); descriptor parsing, expansion, the descriptor cache and inferred descriptors (bl.rpc:parse-descriptor, %wallet-inferred-descriptor) -- dimension 1; src/wallet/wallet-hooks.lisp and the manager fan-outs -- dimension 6 (never-opened files); the rescan/blockfilter fast path in scan-for-wallet-transactions -- dimension 9 (validation/storage second reader); wallet option parsing (-wallet, -walletdir, -keypool, -walletcrosschain, -fallbackfee) -- dimension 7 (accept-and-drop options); concurrency between unloadwallet --force and a running rescan (suspected use-after-close window between the abort check at the top of each rescan segment and the DB close, not reproduced, so not reported); and the durability of the few non-:sync writes (orderposnext, destdata \"used\", purpose) under a real crash."
+}
