@@ -47,6 +47,28 @@
   (bl.mp:feefrac= f (bl.mp:make-feefrac fee size)))
 (defun %tg-empty-ff-p (f) (bl.mp:feefrac-empty-p f))
 
+(defun %tg-index-oracle-agree-p (g)
+  "True when the incrementally maintained mining index holds exactly the
+chunks a from-scratch collect-and-sort holds, in the same order. The rebuild
+is the correctness oracle the incremental index replaced."
+  (let ((live (bl.mp::%chunk-index-vector g))
+        (oracle (bl.mp::%chunk-index-full-rebuild g)))
+    (and (= (length live) (length oracle))
+         (every #'eq live oracle))))
+
+(defun %tg-drop-one-index-chunk (g)
+  "Extract one chunk from the live mining index behind the graph's back,
+leaving its cluster untouched: the planted corruption that proves the
+index-vs-oracle check in TXGRAPH-SANITY-CHECK can actually fail."
+  (bl.mp::%ci-delete g (bl.mp::txgraph-chunk-index g)
+                     (aref (bl.mp::%chunk-index-vector g) 0)))
+
+(defun %tg-fill-singletons (n)
+  "A graph of N independent single-transaction clusters with spread-out fees."
+  (let ((g (%tg-new)))
+    (dotimes (i n g)
+      (%tg-add g (+ 1000 (mod (* i 7919) 100003)) 141))))
+
 (defun %tg-chunks (g)
   "The full mining-order chunk walk (include everything) as a list of
 (handles . feerate)."
@@ -561,6 +583,84 @@ m_main_chunkindex_observers); after finish they work again."
       (bl.mp:block-builder-finish b))
     (is (%tg-add g 1 1))
     (is (= 2 (%tg-count g)))))
+
+;;;; The incremental mining index (Core m_main_chunkindex)
+
+(test txgraph-chunk-index-is-maintained-incrementally
+  "Every mutation path leaves the mining index equal to a from-scratch
+rebuild: Core clears a cluster's ChunkData before touching it and creates the
+new chunks afterwards (txgraph.cpp:881-900 driven from Cluster::Updated,
+txgraph.cpp:1072-1146), and the index is never recomputed from the whole
+pool. Covers add, cross-cluster merge, in-cluster dependency, fee change,
+split by removal, cluster drop and the empty graph."
+  (let* ((g (%tg-new))
+         (a (%tg-add g 1000 100))
+         (b (%tg-add g 3000 100))
+         (c (%tg-add g 2000 100))
+         (d (%tg-add g 500 100)))
+    (is-true (%tg-index-oracle-agree-p g))
+    (is-true (%tg-sane g))
+    ;; Merge two singleton clusters, then grow the merged one.
+    (%tg-dep g a b)
+    (is-true (%tg-index-oracle-agree-p g))
+    (%tg-dep g b c)
+    (is-true (%tg-index-oracle-agree-p g))
+    ;; Two chunks in the merged a<-b<-c cluster (b lifts a into its chunk),
+    ;; plus the untouched singleton D.
+    (is (= 3 (length (%tg-chunks g))))
+    ;; A fee change rechunks in place.
+    (%tg-setfee g a 9000)
+    (is-true (%tg-index-oracle-agree-p g))
+    (%tg-setfee g a 1000)
+    (is-true (%tg-index-oracle-agree-p g))
+    ;; Removing the middle transaction splits the cluster.
+    (%tg-rm g b)
+    (is-true (%tg-index-oracle-agree-p g))
+    (is-true (%tg-sane g))
+    ;; Dropping singleton clusters, down to an empty graph.
+    (%tg-rm g d)
+    (is-true (%tg-index-oracle-agree-p g))
+    (%tg-rm g a)
+    (%tg-rm g c)
+    (is-true (%tg-index-oracle-agree-p g))
+    (is (zerop (%tg-count g)))
+    (is-true (%tg-empty-ff-p (nth-value 1 (%tg-worst g)))))
+  ;; Positive control: the oracle comparison is not vacuous. Extract one
+  ;; chunk from the live index without touching its cluster and both the
+  ;; agreement predicate and TXGRAPH-SANITY-CHECK must notice.
+  (let ((g (%tg-new)))
+    (%tg-add g 1000 100)
+    (%tg-add g 2000 100)
+    (is-true (%tg-index-oracle-agree-p g))
+    (is-true (%tg-sane g))
+    (%tg-drop-one-index-chunk g)
+    (is-false (%tg-index-oracle-agree-p g))
+    (signals error (%tg-sane g))))
+
+(test txgraph-eviction-cost-does-not-scale-with-the-pool
+  "TIMING-SENSITIVE. One eviction is an O(log C) read of the mining index's
+last node plus one removal (Core GetWorstMainChunk reading
+m_main_chunkindex.rbegin(), txgraph.cpp:3258-3266) - it must not re-sort the
+pool. 200 evictions from a 50,000-transaction graph finish in about 0.2 ms
+here; the ceiling is a full second, a ~5,000x margin, so a loaded shared
+container cannot make this flake. When the index was rebuilt on every
+mutation the same loop cost about 6.8 s (0.034 s per eviction) and grew
+linearly with the pool."
+  (let* ((g (%tg-fill-singletons 50000))
+         (start (get-internal-real-time)))
+    (dotimes (i 200)
+      (multiple-value-bind (handles feerate) (%tg-worst g)
+        (declare (ignore feerate))
+        (dolist (h handles) (%tg-rm g h))))
+    (let ((secs (float (/ (- (get-internal-real-time) start)
+                          internal-time-units-per-second))))
+      ;; Positive control for the cost assertion: the loop really evicted 200
+      ;; transactions, so an empty or short-circuiting eviction path cannot
+      ;; pass the ceiling vacuously.
+      (is (= 49800 (%tg-count g)))
+      (is (< secs 1)
+          "200 evictions from a 50,000-transaction graph took ~,3F s -- the ~
+mining index is being rebuilt instead of maintained" secs))))
 
 ;;;; Oversized behavior
 

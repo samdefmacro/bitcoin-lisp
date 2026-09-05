@@ -17,6 +17,12 @@ a list of (parent-index . child-index)."
       (bl.mp:depgraph-add-dependencies g (ash 1 (car d)) (cdr d)))
     g))
 
+(defun %sfl (depgraph &rest args)
+  "SFL-LINEARIZE through one reach: the spanning-forest linearizer under test,
+passing ARGS (:rng-seed, :iterations, ...) and returning its
+(values linearization optimal-p cost) unchanged."
+  (apply #'bl.mp::sfl-linearize depgraph args))
+
 (defun %sf-chunks (g lin)
   (bl.mp:chunk-linearization g lin))
 
@@ -57,7 +63,7 @@ so it is acyclic by construction."
   "With no dependencies every transaction is its own chunk, so the answer is
 simply decreasing feerate."
   (let ((g (%sf-graph '((10 . 1) (30 . 1) (20 . 1)))))
-    (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 42)
+    (multiple-value-bind (lin optimal) (%sfl g :rng-seed 42)
       (is (equalp #(1 2 0) lin))
       (is-true optimal))))
 
@@ -65,7 +71,7 @@ simply decreasing feerate."
   "A high-feerate child cannot come before its low-feerate parent."
   ;; tx0 pays 1/1, tx1 pays 100/1 and depends on tx0.
   (let ((g (%sf-graph '((1 . 1) (100 . 1)) '((0 . 1)))))
-    (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 1)
+    (multiple-value-bind (lin optimal) (%sfl g :rng-seed 1)
       (is (equalp #(0 1) lin))
       (is-true optimal)
       ;; They chunk together: the pair's feerate beats tx0 alone.
@@ -73,9 +79,9 @@ simply decreasing feerate."
 
 (test sfl-handles-the-empty-and-singleton-cases
   (let ((g (%sf-graph '())))
-    (is (equalp #() (bl.mp::sfl-linearize g :rng-seed 3))))
+    (is (equalp #() (%sfl g :rng-seed 3))))
   (let ((g (%sf-graph '((5 . 2)))))
-    (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 3)
+    (multiple-value-bind (lin optimal) (%sfl g :rng-seed 3)
       (is (equalp #(0) lin))
       (is-true optimal))))
 
@@ -85,7 +91,7 @@ no optimality guarantee for. Both linearizers in fact solve it; the assertion is
 the one that matters either way -- SFL is never worse."
   (let* ((g (%sf-graph '((1 . 1) (9 . 1) (2 . 1) (9 . 1))
                        '((0 . 1) (0 . 2) (1 . 3) (2 . 3)))))
-    (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 5)
+    (multiple-value-bind (lin optimal) (%sfl g :rng-seed 5)
       (is-true optimal)
       (is-true (bl.mp:linearization-topological-p g lin))
       (let ((cmp (bl.mp:compare-chunks
@@ -103,7 +109,7 @@ the one that matters either way -- SFL is never worse."
         (bad-topo 0))
     (dotimes (trial 400)
       (multiple-value-bind (g n) (%sf-random-graph rng 10)
-        (let ((lin (bl.mp::sfl-linearize g :rng-seed (1+ trial))))
+        (let ((lin (%sfl g :rng-seed (1+ trial))))
           (unless (and (= n (length lin))
                        (= n (length (remove-duplicates (coerce lin 'list)))))
             (incf bad-count))
@@ -147,7 +153,7 @@ bought with the algorithm, and it is what this asserts."
       (multiple-value-bind (g n) (%sf-random-graph-sized rng 40 64 15)
         (declare (ignore n))
         (case (bl.mp:compare-chunks
-               (%sf-chunks g (bl.mp::sfl-linearize g :rng-seed (1+ trial)))
+               (%sf-chunks g (%sfl g :rng-seed (1+ trial)))
                (%sf-chunks g (%sf-incumbent g)))
           (:less (incf worse))
           (:greater (incf better))
@@ -170,7 +176,7 @@ so the claim stays true rather than remaining a note in a commit message."
       (dotimes (trial 60)
         (multiple-value-bind (g n) (%sf-random-graph-sized rng 2 7 density)
           (incf checked)
-          (let ((cs (%sf-chunks g (bl.mp::sfl-linearize g :rng-seed (1+ trial))))
+          (let ((cs (%sf-chunks g (%sfl g :rng-seed (1+ trial))))
                 (co (%sf-chunks g (%sf-incumbent g)))
                 (all (%sf-all-topological-orders g n)))
             (when (some (lambda (c) (eq :greater (bl.mp:compare-chunks
@@ -198,8 +204,8 @@ by index -- and require the result beat or match it."
         ;; Index order is topological here by construction, and it is a poor
         ;; linearization because it ignores feerate entirely.
         (let* ((seed-lin (coerce (loop for i below n collect i) 'simple-vector))
-               (lin (bl.mp::sfl-linearize
-                     g :rng-seed (1+ trial) :old-linearization seed-lin)))
+               (lin (%sfl g :rng-seed (1+ trial)
+                          :old-linearization seed-lin)))
           (is-true (bl.mp:linearization-topological-p g lin))
           (when (eq :less (bl.mp:compare-chunks
                            (%sf-chunks g lin) (%sf-chunks g seed-lin)))
@@ -214,8 +220,7 @@ every topologically valid order and confirm none has a better diagram."
         (violations 0))
     (dotimes (trial 60)
       (multiple-value-bind (g n) (%sf-random-graph rng 6)
-        (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize
-                                            g :rng-seed (1+ trial))
+        (multiple-value-bind (lin optimal) (%sfl g :rng-seed (1+ trial))
           (when optimal
             (incf checked)
             (let ((best (%sf-chunks g lin)))
@@ -251,14 +256,13 @@ the tiny clusters the optimality test uses."
 linearization -- just not a provably optimal one."
   (let ((g (%sf-graph (loop for i below 20 collect (cons (1+ (* 7 (mod i 13))) (1+ (mod i 3))))
                       (loop for i below 19 collect (cons i (1+ i))))))
-    (multiple-value-bind (lin optimal cost) (bl.mp::sfl-linearize
-                                             g :rng-seed 9 :max-cost 1)
+    (multiple-value-bind (lin optimal cost) (%sfl g :rng-seed 9 :max-cost 1)
       (is (= 20 (length lin)))
       (is-true (bl.mp:linearization-topological-p g lin))
       (is-false optimal "no budget means no optimality claim")
       (is (plusp cost)))
     ;; With a real budget the same cluster is solved and reported optimal.
-    (multiple-value-bind (lin optimal) (bl.mp::sfl-linearize g :rng-seed 9)
+    (multiple-value-bind (lin optimal) (%sfl g :rng-seed 9)
       (is-true optimal)
       (is-true (bl.mp:linearization-topological-p g lin)))))
 
@@ -269,8 +273,8 @@ source of run-to-run variation."
     (dotimes (trial 30)
       (multiple-value-bind (g n) (%sf-random-graph rng 8)
         (declare (ignore n))
-        (is (equalp (bl.mp::sfl-linearize g :rng-seed 77)
-                    (bl.mp::sfl-linearize g :rng-seed 77)))))))
+        (is (equalp (%sfl g :rng-seed 77)
+                    (%sfl g :rng-seed 77)))))))
 
 ;;; --- The seam ---------------------------------------------------------------
 
@@ -288,7 +292,7 @@ produce SFL's answer and not the incumbent's."
       (unless found
         (multiple-value-bind (g n) (%sf-random-graph-sized rng 40 64 15)
           (declare (ignore n))
-          (let ((sfl (%sf-chunks g (bl.mp::sfl-linearize g :rng-seed (1+ trial))))
+          (let ((sfl (%sf-chunks g (%sfl g :rng-seed (1+ trial))))
                 (inc (%sf-chunks g (%sf-incumbent g))))
             (when (eq :greater (bl.mp:compare-chunks sfl inc))
               (setf found (list g (1+ trial))))))))

@@ -20,9 +20,9 @@
 ;;;   Core - is a dependency whose would-be merged cluster exceeds the
 ;;;   count/size limits: it is held in PENDING-DEPS and the graph reports
 ;;;   oversized until removals or TXGRAPH-TRIM make it applicable (or drop
-;;;   it). The global chunk index is rebuilt lazily on first access after a
-;;;   mutation; per-cluster chunk data is always eagerly up to date, so this
-;;;   is unobservable.
+;;;   it). The global chunk index is maintained INCREMENTALLY, as Core
+;;;   maintains m_main_chunkindex: a mutation extracts only the chunks of
+;;;   the clusters it touches and re-inserts their replacements.
 ;;;
 ;;; - HANDLES, not Refs. Core's TxGraph::Ref removes its transaction from
 ;;;   the graph in its destructor. Lisp has no destructors: every mempool
@@ -53,7 +53,7 @@ policy/policy.h). Non-negotiable for future relay compatibility.")
 
 ;;;; Handles
 
-(defstruct (tx-handle (:constructor %make-tx-handle (graph id)))
+(defstruct (tx-handle (:constructor %make-tx-handle (graph id data)))
   "A transaction within a TXGRAPH (Core TxGraph::Ref, txgraph.h:232-253,
 plus its Entry, txgraph.cpp:602-625). Callers hold these and pass them back
 to the txgraph API; all slots except ID are graph-managed. There is no
@@ -61,11 +61,16 @@ destructor: the holder must call TXGRAPH-REMOVE-TRANSACTION explicitly."
   (graph nil :read-only t)
   ;; Creation sequence number; basis of the default fallback order.
   (id 0 :type fixnum :read-only t)
-  ;; Opaque caller slot, ignored by the graph. Core's mempool entry IS its
-  ;; handle (CTxMemPoolEntry : public TxGraph::Ref, kernel/mempool_entry.h:65),
-  ;; so callbacks like the fallback order can reach entry data; our mempool
-  ;; stores the entry's txid here for its txid fallback order and the P3
-  ;; shadow checks.
+  ;; Opaque caller slot, ignored by the graph itself but read by the
+  ;; FALLBACK-ORDER callback. Core's mempool entry IS its handle
+  ;; (CTxMemPoolEntry : public TxGraph::Ref, kernel/mempool_entry.h:65), so
+  ;; the fallback order can reach entry data; our mempool stores the entry's
+  ;; txid here for its txid fallback order and the P3 shadow checks. It is
+  ;; supplied to TXGRAPH-ADD-TRANSACTION, not assigned afterwards: the
+  ;; transaction's chunk enters the mining index before that call returns,
+  ;; and comparing it against an existing chunk of another cluster calls the
+  ;; fallback order (Core Assumes m_ref != nullptr in CreateChunkData,
+  ;; txgraph.cpp:894-896).
   (data nil)
   ;; Cluster this transaction is in; NIL = removed (Core Locator).
   (cluster nil)
@@ -127,6 +132,54 @@ the same via %GRAPH-TXID-ORDER (mempool.lisp)."
     (format stream "#~D (~D txs)"
             (%cluster-sequence c) (depgraph-tx-count (%cluster-depgraph c)))))
 
+;;;; The mining-ordered chunk index (Core m_main_chunkindex)
+;;;;
+;;;; One node per chunk of every cluster, ordered by the mining comparator
+;;;; %COMPARE-MAIN applied to the chunk's last transaction (Core's ChunkData
+;;;; and ChunkOrder, txgraph.cpp:466-547), maintained INCREMENTALLY: a
+;;;; mutation extracts only the chunks of the clusters it touches and
+;;;; re-inserts their replacements (Core ClearChunkData / CreateChunkData,
+;;;; txgraph.cpp:881-900, driven from Cluster::Updated at
+;;;; txgraph.cpp:1072-1146). Eviction then costs O(log C) per evicted chunk
+;;;; instead of one sort of every chunk in the pool.
+;;;;
+;;;; Core's container is a std::set (a red-black tree); ours is a skiplist,
+;;;; which gives the same O(log C) insert / erase / maximum and an O(C)
+;;;; in-order walk with far less code. Node heights come from a per-index
+;;;; xorshift64 stream rather than the global random state, so a graph's
+;;;; internal shape is reproducible across runs; nothing observable depends
+;;;; on it, because iteration order is decided by %COMPARE-MAIN alone. Keys
+;;;; are unique - each %CHUNK has its own last transaction, and %COMPARE-MAIN
+;;;; is a strong order over distinct handles - so a node is located by its
+;;;; key, which is why a chunk must leave the index BEFORE anything changes
+;;;; that key (%CLUSTER-CLEAR-CHUNK-DATA). TXGRAPH-SANITY-CHECK checks the
+;;;; live index against %CHUNK-INDEX-FULL-REBUILD, the from-scratch
+;;;; collect-and-sort this replaced, which stays as the correctness oracle.
+
+(defconstant +chunk-index-max-level+ 24
+  "Skiplist height cap. At p = 1/2 this indexes far more chunks than a 300 MB
+mempool's ~312,000 without degrading (2^24 = 16.7 million).")
+
+(defstruct (%ci-node (:constructor %make-ci-node (chunk next)))
+  "One skiplist node: a %CHUNK plus one forward pointer per level. The head
+node carries a NIL chunk and the maximum number of levels."
+  (chunk nil)
+  (next #() :type simple-vector))
+
+(defstruct (%chunk-index (:constructor %make-chunk-index ()))
+  "The mining-ordered index itself (Core's ChunkIndex, txgraph.cpp:545-547)."
+  (head (%make-ci-node nil (make-array +chunk-index-max-level+
+                                       :initial-element nil))
+   :type %ci-node)
+  ;; Scratch predecessor vector shared by insert and delete: the index is
+  ;; only ever touched under the node lock, and neither operation re-enters.
+  (preds (make-array +chunk-index-max-level+ :initial-element nil)
+   :type simple-vector)
+  (level 1 :type (integer 1 #.+chunk-index-max-level+))
+  (count 0 :type unsigned-byte)
+  ;; xorshift64 state for node heights; never zero.
+  (rng-state #x2545F4914F6CDD1D :type (unsigned-byte 64)))
+
 ;;;; The graph
 
 (defstruct (txgraph (:constructor %make-txgraph
@@ -149,9 +202,9 @@ chunk index. Create with MAKE-TXGRAPH."
   ;; Number of transactions whose own size exceeds MAX-CLUSTER-SIZE (Core
   ;; m_txcount_oversized).
   (oversized-tx-count 0 :type unsigned-byte)
-  ;; Sorted vector of every cluster's %CHUNKs in mining order; NIL = stale,
-  ;; rebuilt on demand (Core m_main_chunkindex).
-  (chunk-index nil :type (or null simple-vector))
+  ;; Every cluster's %CHUNKs in mining order, maintained incrementally
+  ;; (Core m_main_chunkindex).
+  (chunk-index (%make-chunk-index) :type %chunk-index)
   ;; Active block builders (Core m_main_chunkindex_observers): mutations are
   ;; disallowed while any exist.
   (builder-count 0 :type unsigned-byte))
@@ -226,10 +279,170 @@ Available even when oversized."
     (do-bits (i bits) (push (aref mapping i) out))
     (nreverse out)))
 
+(defun %compare-main (graph a b)
+  "Mining-order comparison of handles A and B: -1 when A mines first (Core
+CompareMainTransactions, txgraph.cpp:492-524). Keys: chunk feerate
+descending; equal-feerate chunk prefix size ascending; for distinct
+clusters the fallback order of the chunks' maximal elements; within a
+chunk, linearization position."
+  (if (eq a b)
+      0
+      (let ((feerate-cmp (feerate-compare (tx-handle-chunk-feerate b)
+                                          (tx-handle-chunk-feerate a))))
+        (cond ((not (zerop feerate-cmp)) feerate-cmp)
+              ((/= (tx-handle-chunk-prefix-size a) (tx-handle-chunk-prefix-size b))
+               (signum (- (tx-handle-chunk-prefix-size a)
+                          (tx-handle-chunk-prefix-size b))))
+              ((not (eq (tx-handle-cluster a) (tx-handle-cluster b)))
+               (let ((c (funcall (txgraph-fallback-order graph)
+                                 (tx-handle-chunk-fallback a)
+                                 (tx-handle-chunk-fallback b))))
+                 (if (zerop c)
+                     ;; Unreachable with a strong fallback order
+                     ;; (txgraph.cpp:518-520).
+                     (signum (- (%cluster-sequence (tx-handle-cluster a))
+                                (%cluster-sequence (tx-handle-cluster b))))
+                     c)))
+              (t (signum (- (tx-handle-lin-index a) (tx-handle-lin-index b))))))))
+
+(defun %ci-random-level (index)
+  "A node height drawn from INDEX's own xorshift64 stream: height L with
+probability 2^-L, capped at +CHUNK-INDEX-MAX-LEVEL+."
+  (let ((s (%chunk-index-rng-state index)))
+    (setf s (logand #xFFFFFFFFFFFFFFFF (logxor s (ash s 13))))
+    (setf s (logxor s (ash s -7)))
+    (setf s (logand #xFFFFFFFFFFFFFFFF (logxor s (ash s 17))))
+    (setf (%chunk-index-rng-state index) s)
+    (let ((level 1))
+      (loop while (and (< level +chunk-index-max-level+) (logbitp (1- level) s))
+            do (incf level))
+      level)))
+
+(defun %ci-locate (graph index chunk)
+  "Fill INDEX's scratch predecessor vector with the last node before CHUNK at
+each live level, and return the level-0 node at CHUNK's position - the node
+holding CHUNK when it is present, otherwise the first node after it, or NIL."
+  (let ((preds (%chunk-index-preds index))
+        (key (%chunk-end chunk))
+        (node (%chunk-index-head index)))
+    (loop for level from (1- (%chunk-index-level index)) downto 0
+          do (loop for next = (svref (%ci-node-next node) level)
+                   while (and next
+                              (minusp (%compare-main
+                                       graph
+                                       (%chunk-end (%ci-node-chunk next))
+                                       key)))
+                   do (setf node next))
+             (setf (svref preds level) node))
+    (svref (%ci-node-next node) 0)))
+
+(defun %ci-insert (graph index chunk)
+  "Insert CHUNK at its mining-order position (Core CreateChunkData,
+txgraph.cpp:891-900)."
+  (%ci-locate graph index chunk)
+  (let ((preds (%chunk-index-preds index))
+        (level (%ci-random-level index)))
+    (when (> level (%chunk-index-level index))
+      (loop for l from (%chunk-index-level index) below level
+            do (setf (svref preds l) (%chunk-index-head index)))
+      (setf (%chunk-index-level index) level))
+    (let ((node (%make-ci-node chunk (make-array level :initial-element nil))))
+      (dotimes (l level)
+        (setf (svref (%ci-node-next node) l)
+              (svref (%ci-node-next (svref preds l)) l)
+              (svref (%ci-node-next (svref preds l)) l)
+              node))
+      (incf (%chunk-index-count index))))
+  (values))
+
+(defun %ci-delete (graph index chunk)
+  "Extract CHUNK from the index (Core ClearChunkData, txgraph.cpp:881-889).
+CHUNK's mining key must be unchanged since it was inserted; that is what makes
+the clear-before-mutating discipline below mandatory."
+  (let ((node (%ci-locate graph index chunk))
+        (preds (%chunk-index-preds index)))
+    (assert (and node (eq (%ci-node-chunk node) chunk)) ()
+            "txgraph: chunk index cannot find ~S - its mining key changed ~
+before the chunk was cleared" chunk)
+    (dotimes (l (length (%ci-node-next node)))
+      (setf (svref (%ci-node-next (svref preds l)) l)
+            (svref (%ci-node-next node) l)))
+    (loop while (and (> (%chunk-index-level index) 1)
+                     (null (svref (%ci-node-next (%chunk-index-head index))
+                                  (1- (%chunk-index-level index)))))
+          do (decf (%chunk-index-level index)))
+    (decf (%chunk-index-count index)))
+  (values))
+
+(defun %ci-last (index)
+  "The last chunk in mining order, or NIL when the index is empty (Core
+m_main_chunkindex.rbegin(), txgraph.cpp:3262). The head node's NIL chunk is
+the empty-index answer."
+  (let ((node (%chunk-index-head index)))
+    (loop for level from (1- (%chunk-index-level index)) downto 0
+          do (loop for next = (svref (%ci-node-next node) level)
+                   while next do (setf node next)))
+    (%ci-node-chunk node)))
+
+(defun %chunk-index-vector (graph)
+  "Every chunk in mining order as a fresh simple-vector: one forward walk of
+the index, no sort. Core's BlockBuilderImpl walks the same nodes through an
+iterator; we materialize because BLOCK-BUILDER addresses chunks by position,
+and mutation is forbidden while a builder exists either way."
+  (let* ((index (txgraph-chunk-index graph))
+         (out (make-array (%chunk-index-count index)))
+         (i 0))
+    (loop for node = (svref (%ci-node-next (%chunk-index-head index)) 0)
+            then (svref (%ci-node-next node) 0)
+          while node
+          do (setf (svref out i) (%ci-node-chunk node))
+             (incf i))
+    (assert (= i (%chunk-index-count index)))
+    out))
+
+(defun %chunk-index-full-rebuild (graph)
+  "The chunk index computed from scratch: every cluster's chunks collected and
+sorted by %COMPARE-MAIN. This is what the index used to be recomputed by after
+every mutation; it survives as the correctness oracle TXGRAPH-SANITY-CHECK
+compares the incrementally maintained index against."
+  (let ((entries '()))
+    (loop for cluster being the hash-keys of (txgraph-clusters graph)
+          do (loop for chunk across (%cluster-chunks cluster)
+                   do (push chunk entries)))
+    (sort (coerce entries 'simple-vector)
+          (lambda (x y)
+            (minusp (%compare-main graph (%chunk-end x) (%chunk-end y)))))))
+
+(defun %cluster-clear-chunk-data (graph cluster)
+  "Extract CLUSTER's chunks from the mining index (Core ClearChunkData over
+the cluster's entries, txgraph.cpp:1055-1063). Must run BEFORE anything that
+can change the mining key of one of CLUSTER's transactions - a
+relinearization, a depgraph edit, or a re-pointing of its handles - because
+the index locates a node by that key. Idempotent: CLUSTER is left with no
+chunks."
+  (let ((index (txgraph-chunk-index graph)))
+    (loop for chunk across (%cluster-chunks cluster)
+          do (%ci-delete graph index chunk)))
+  (setf (%cluster-chunks cluster) #())
+  (values))
+
+(defun %cluster-create-chunk-data (graph cluster)
+  "Insert CLUSTER's freshly computed chunks into the mining index (Core
+CreateChunkData at the end of Cluster::Updated, txgraph.cpp:1139-1143). Every
+member handle's cached mining data must already be current."
+  (let ((index (txgraph-chunk-index graph)))
+    (loop for chunk across (%cluster-chunks cluster)
+          do (%ci-insert graph index chunk)))
+  (values))
+
 (defun %cluster-updated (graph cluster)
   "Relinearize CLUSTER and recompute its chunks and its handles' cached
 mining-order data (Core Cluster::Updated, txgraph.cpp:1072-1146, done
-eagerly in place of Relinearize/MakeAcceptable)."
+eagerly in place of Relinearize/MakeAcceptable). CLUSTER's chunks leave the
+mining index first and its new ones are inserted at the end, exactly as Core
+brackets Cluster::Updated with ClearChunkData/CreateChunkData
+(txgraph.cpp:1072-1146)."
+  (%cluster-clear-chunk-data graph cluster)
   (let* ((dg (%cluster-depgraph cluster))
          (mapping (%cluster-mapping cluster))
          ;; Core hands Linearize a fallback order over DepGraph positions,
@@ -277,60 +490,25 @@ eagerly in place of Relinearize/MakeAcceptable)."
         (incf lin-index count)
         (incf chunk-idx)))
     (setf (%cluster-chunks cluster) chunks
-          (%cluster-tx-size cluster) total-size
-          (txgraph-chunk-index graph) nil)
+          (%cluster-tx-size cluster) total-size)
+    (%cluster-create-chunk-data graph cluster)
     cluster))
-
-(defun %compare-main (graph a b)
-  "Mining-order comparison of handles A and B: -1 when A mines first (Core
-CompareMainTransactions, txgraph.cpp:492-524). Keys: chunk feerate
-descending; equal-feerate chunk prefix size ascending; for distinct
-clusters the fallback order of the chunks' maximal elements; within a
-chunk, linearization position."
-  (if (eq a b)
-      0
-      (let ((feerate-cmp (feerate-compare (tx-handle-chunk-feerate b)
-                                          (tx-handle-chunk-feerate a))))
-        (cond ((not (zerop feerate-cmp)) feerate-cmp)
-              ((/= (tx-handle-chunk-prefix-size a) (tx-handle-chunk-prefix-size b))
-               (signum (- (tx-handle-chunk-prefix-size a)
-                          (tx-handle-chunk-prefix-size b))))
-              ((not (eq (tx-handle-cluster a) (tx-handle-cluster b)))
-               (let ((c (funcall (txgraph-fallback-order graph)
-                                 (tx-handle-chunk-fallback a)
-                                 (tx-handle-chunk-fallback b))))
-                 (if (zerop c)
-                     ;; Unreachable with a strong fallback order
-                     ;; (txgraph.cpp:518-520).
-                     (signum (- (%cluster-sequence (tx-handle-cluster a))
-                                (%cluster-sequence (tx-handle-cluster b))))
-                     c)))
-              (t (signum (- (tx-handle-lin-index a) (tx-handle-lin-index b))))))))
-
-(defun %ensure-chunk-index (graph)
-  "The mining-ordered index of every cluster's chunks, rebuilding it if a
-mutation invalidated it (Core m_main_chunkindex; rebuilt rather than
-incrementally maintained - unobservable, as the per-cluster chunk data the
-order is derived from is always eagerly current)."
-  (or (txgraph-chunk-index graph)
-      (let ((entries '()))
-        (loop for cluster being the hash-keys of (txgraph-clusters graph)
-              do (loop for chunk across (%cluster-chunks cluster)
-                       do (push chunk entries)))
-        (setf (txgraph-chunk-index graph)
-              (sort (coerce entries 'simple-vector)
-                    (lambda (x y)
-                      (minusp (%compare-main graph (%chunk-end x) (%chunk-end y)))))))))
 
 ;;;; Mutations
 
-(defun txgraph-add-transaction (graph fee size)
+(defun txgraph-add-transaction (graph fee size &optional data)
   "Add a new transaction with the given fee (satoshis, may be negative) and
 size (virtual bytes, > 0) and return its handle (Core AddTransaction,
-txgraph.cpp:2230-2260). The transaction starts as a singleton cluster."
+txgraph.cpp:2230-2260). The transaction starts as a singleton cluster.
+
+DATA is the handle's opaque caller payload (Core's Ref, which AddTransaction
+binds before the Cluster is Updated). Pass it here rather than assigning it to
+the returned handle: the new chunk joins the mining index before this call
+returns, and ordering it against another cluster's chunk calls the graph's
+FALLBACK-ORDER, which is what reads DATA."
   (%assert-no-builder graph)
   (assert (plusp size))
-  (let ((handle (%make-tx-handle graph (txgraph-next-id graph)))
+  (let ((handle (%make-tx-handle graph (txgraph-next-id graph) data))
         (cluster (%graph-new-cluster graph)))
     (incf (txgraph-next-id graph))
     (depgraph-add-transaction (%cluster-depgraph cluster) (make-feefrac fee size))
@@ -348,10 +526,12 @@ replace it with one masked copy per component."
   (let* ((dg (%cluster-depgraph cluster))
          (todo (depgraph-positions dg)))
     (cond ((zerop todo)
+           (%cluster-clear-chunk-data graph cluster)
            (remhash cluster (txgraph-clusters graph)))
           ((depgraph-connected-p dg)
            (%cluster-updated graph cluster))
           (t
+           (%cluster-clear-chunk-data graph cluster)
            (remhash cluster (txgraph-clusters graph))
            (loop until (zerop todo)
                  do (let* ((component (depgraph-find-connected-component dg todo))
@@ -375,6 +555,10 @@ that removals may have made applicable."
   (%assert-no-builder graph)
   (let ((cluster (tx-handle-cluster handle)))
     (when cluster
+      ;; The removal changes the mining keys of this cluster's transactions
+      ;; (and unlinks HANDLE, which may be a chunk end), so its chunks leave
+      ;; the index before anything else moves.
+      (%cluster-clear-chunk-data graph cluster)
       (let* ((dg (%cluster-depgraph cluster))
              (pos (tx-handle-pos handle)))
         (when (> (feefrac-size (depgraph-tx-feerate dg pos))
@@ -384,8 +568,7 @@ that removals may have made applicable."
         (setf (tx-handle-cluster handle) nil)
         (decf (txgraph-tx-count graph))
         (%split-cluster graph cluster)
-        (%resolve-pending graph)
-        (setf (txgraph-chunk-index graph) nil))))
+        (%resolve-pending graph))))
   (values))
 
 (defun %pending-groups (graph &key include-oversized-singletons)
@@ -436,6 +619,9 @@ count size) with COUNT/SIZE the would-be merged totals."
 closure, then apply the (parent-handle . child-handle) DEPS (the eager
 equivalent of Core Merge + Cluster::ApplyDependencies,
 txgraph.cpp:2068-2155). The caller has checked the combined limits."
+  ;; Every cluster in the group is about to have its transactions re-pointed
+  ;; or relinearized, so all of their chunks leave the mining index first.
+  (dolist (c clusters) (%cluster-clear-chunk-data graph c))
   (let ((target
           (if (rest clusters)
               (let* ((total (reduce #'+ clusters
@@ -816,12 +1002,11 @@ element preceded by all its descendants); (values NIL empty-feefrac) when
 the graph is empty (Core GetWorstMainChunk, txgraph.cpp:3258-3283). The
 graph must not be oversized."
   (%assert-not-oversized graph 'txgraph-get-worst-main-chunk)
-  (let ((index (%ensure-chunk-index graph)))
-    (if (zerop (length index))
+  (let ((chunk (%ci-last (txgraph-chunk-index graph))))
+    (if (null chunk)
         (values '() (make-feefrac))
-        (let ((chunk (svref index (1- (length index)))))
-          (values (reverse (coerce (%chunk-txs chunk) 'list))
-                  (copy-feefrac (%chunk-feerate chunk)))))))
+        (values (reverse (coerce (%chunk-txs chunk) 'list))
+                (copy-feefrac (%chunk-feerate chunk))))))
 
 (defstruct (block-builder (:constructor %make-block-builder (graph index)))
   "Iterator over the chunk index in mining order (Core BlockBuilderImpl,
@@ -846,7 +1031,7 @@ destructor)."
 The graph must not be oversized, and must not be mutated until
 BLOCK-BUILDER-FINISH is called."
   (%assert-not-oversized graph 'make-block-builder)
-  (let ((index (%ensure-chunk-index graph)))
+  (let ((index (%chunk-index-vector graph)))
     (incf (txgraph-builder-count graph))
     (%make-block-builder graph index)))
 
@@ -1046,8 +1231,8 @@ unless the graph is oversized."
   "Verify GRAPH's internal invariants (Core TxGraphImpl::SanityCheck,
 txgraph.cpp:2932+): cluster/handle/mapping consistency, connectivity,
 acyclicity, limits, eagerly-cached chunk data, pending-dependency
-bookkeeping, and chunk-index order. Signals an error on violation;
-returns T."
+bookkeeping, and the chunk index (order, coverage, and equality with a
+from-scratch rebuild). Signals an error on violation; returns T."
   (let ((tx-total 0)
         (oversized-txs 0))
     (loop for cluster being the hash-keys of (txgraph-clusters graph) do
@@ -1119,12 +1304,17 @@ returns T."
           (assert (or (> count (txgraph-max-cluster-count graph))
                       (> size (txgraph-max-cluster-size graph)))))))
     ;; The chunk index covers every chunk exactly once, in strictly
-    ;; ascending mining order.
-    (let ((index (%ensure-chunk-index graph))
+    ;; ascending mining order, and holds exactly the chunks a from-scratch
+    ;; rebuild would - the oracle for the incremental maintenance.
+    (let ((index (%chunk-index-vector graph))
+          (oracle (%chunk-index-full-rebuild graph))
           (expected 0))
       (loop for cluster being the hash-keys of (txgraph-clusters graph)
             do (incf expected (length (%cluster-chunks cluster))))
       (assert (= expected (length index)))
+      (assert (= (length oracle) (length index)))
+      (dotimes (k (length index))
+        (assert (eq (svref index k) (svref oracle k))))
       (loop for k from 1 below (length index)
             do (assert (minusp (%compare-main graph
                                               (%chunk-end (svref index (1- k)))
