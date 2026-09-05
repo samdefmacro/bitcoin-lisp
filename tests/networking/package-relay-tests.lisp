@@ -23,10 +23,12 @@
 (in-suite :package-relay-tests)
 
 (defun %pr-peer ()
-  "A :ready peer advertising NODE_WITNESS, like every modern Core peer."
-  (bl.net:make-peer
-   :address "pkgrelay" :state :ready
-   :services bl.ser:+node-witness+))
+  "A :ready peer advertising NODE_WITNESS, like every modern Core peer, with
+its token buckets installed so the shipped dispatcher can meter it."
+  (bl.net:init-peer-rate-limiters
+   (bl.net:make-peer
+    :address "pkgrelay" :state :ready
+    :services bl.ser:+node-witness+)))
 
 (defun %pr-payload (tx &key witness)
   "The `tx` message payload for TX (header stripped), as handle-tx sees it.
@@ -79,8 +81,13 @@ relay half) the peer list."
   "Run BODY with a fresh main rejects filter bound to REJECTS and the
 node-global reconsiderable filter rebound to a fresh one, so reject state
 never leaks between tests. Also brackets BODY with reset-tx-requests, since
-handle-tx and the orphan-parent fetch both touch the shared tracker."
+handle-tx and the orphan-parent fetch both touch the shared tracker, and
+declares the node OUT of initial block download: Core's TX handler returns
+before deserialising while IsInitialBlockDownload() is true
+(net_processing.cpp:4479-4483), so relay behaviour is only observable
+afterwards. The gate itself is tested with the binding left alone."
   `(let ((,rejects (bl:make-rejects-filter 100))
+         (bl.net:*cached-is-ibd* nil)
          (bl.val:*recent-rejects-reconsiderable*
            (bl:make-rejects-filter 100)))
      (bl.net:reset-tx-requests)
@@ -713,3 +720,49 @@ the reason the malleated twin above cannot blacklist the real transaction."
         (is (null (tx-request-announcement-peers twin-wtxid :completed t)))
         ;; The txid entry keeps its announcer.
         (is (equal (list announcer) (tx-request-announcement-peers txid)))))))
+
+;;;; Core's IBD gate on the TX message (net_processing.cpp:4479-4483)
+
+(test tx-and-inv-are-both-refused-during-ibd
+  "Core's TX branch returns while IsInitialBlockDownload() is true, before the
+transaction is even deserialised, and with no punishment. Our inv half of the
+same rule was implemented and the tx half was not, so throughout the IBD
+window any peer could make us validate a transaction against a UTXO view at a
+stale height, admit it, queue it for relay, and cache a wrong reject in the
+MAIN rejects filter -- which the end of IBD does not clear.
+
+Both halves are driven through the shipped IBD dispatcher, and the run with
+IBD off is the positive control that the fixture can produce every effect the
+in-IBD run must not."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let* ((tx (%pr-tx (list (cons funding 0)) (- 100000000 50000)))
+           (txid (bl.ser:transaction-hash tx))
+           (peer (%pr-peer))
+           (relay-target (%pr-peer))
+           (inv (subseq (bl.ser:make-inv-message
+                         (list (bl.ser:make-inv-vector
+                                :type bl.ser:+inv-type-witness-tx+ :hash txid)))
+                        24)))
+      (%with-fresh-rejects (rejects)
+        (with-ibd-context
+          (let ((ctx (%pr-ctx state utxo mempool rejects
+                              (list peer relay-target))))
+            ;; --- still in IBD: neither message does anything ---
+            (let ((bl.net:*cached-is-ibd* t))
+              (ignore-errors (deliver-ibd-message peer "inv" inv ctx))
+              (deliver-ibd-message peer "tx" (%pr-payload tx) ctx)
+              (is-false (bl.mp:mempool-has mempool txid))
+              (is-false (bl.mp:orphan-have
+                         (bl.mp:mempool-orphan-pool mempool) txid))
+              (is-false (bl:recent-reject-p rejects txid))
+              (is-false (bl.val:reconsiderable-reject-p txid))
+              (is (null (tx-request-announcement-peers txid :completed t)))
+              (is (null (tx-request-in-flight-peer txid)))
+              (is (null (bl.net:peer-tx-inv-queue relay-target))))
+            ;; --- positive control: out of IBD the same fixture does it all ---
+            (let ((bl.net:*cached-is-ibd* nil))
+              (ignore-errors (deliver-ibd-message peer "inv" inv ctx))
+              (is (equal (list peer) (tx-request-announcement-peers txid)))
+              (deliver-ibd-message peer "tx" (%pr-payload tx) ctx)
+              (is-true (bl.mp:mempool-has mempool txid))
+              (is (= 1 (length (bl.net:peer-tx-inv-queue relay-target)))))))))))

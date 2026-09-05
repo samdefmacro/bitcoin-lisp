@@ -1423,7 +1423,8 @@ since wtxid = txid there."
     ;; Sanity: this is a witness tx, ids differ.
     (is-false (equalp txid wtxid))
     (bl.net:reset-tx-requests)
-    (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects))
+    (with-tx-relay-out-of-ibd
+      (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects)))
     (is-true (bl:recent-reject-p rejects wtxid))
     (is-false (bl:recent-reject-p rejects txid))))
 
@@ -1556,7 +1557,8 @@ parents', txdownloadman_impl.cpp:422-436)."
     (is-false (equalp txid wtxid))
     ;; The missing parent was recently rejected.
     (bl:add-recent-reject rejects parent-txid)
-    (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+    (with-tx-relay-out-of-ibd
+      (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects)))
     ;; Rejected under both ids; never admitted to the orphan pool; the
     ;; parent was NOT re-requested.
     (is-true (bl:recent-reject-p rejects txid))
@@ -1582,7 +1584,8 @@ and the tx itself is not cached as a reject."
          (parent-txid (make-array 32 :element-type '(unsigned-byte 8)
                                      :initial-element #xB3))
          (payload (subseq (bl.ser:make-tx-message tx :witness t) 24)))
-    (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+    (with-tx-relay-out-of-ibd
+      (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects)))
     ;; The orphanage is wtxid-keyed (Core TxOrphanage).
     (is-true (bl.mp:orphan-tx
               (bl.mp:mempool-orphan-pool mempool)

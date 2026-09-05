@@ -1553,7 +1553,7 @@ dispatch-ibd-message's `block' branch (the block-download path)."
          (%g716-with-fresh-hb
           (with-ibd-context
             (let ((peer (%g716-delivering-peer "198.51.100.20")))
-              (bl.net::dispatch-ibd-message peer "block" (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store) bl.net:*ibd-context*)
+              (deliver-ibd-message peer "block" (%g716-block-payload b2) (bl.ctx:make-node-context :chain-state cs :utxo-set utxo :block-store store))
               (is (= 2 (bl.store:current-height cs))
                   "the downloaded block connected")
               (is (equal (list peer) bl.net::*hb-announcing-peers*)

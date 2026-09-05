@@ -182,6 +182,23 @@ branch: block availability, AddTxAnnouncement, and the getdata it triggers)."
 NOTFOUND branch -> ReceivedNotFound)."
   (bl.net::handle-notfound peer payload ctx))
 
+(defmacro with-tx-relay-out-of-ibd (&body body)
+  "Run BODY as a node that has LEFT initial block download. Core's TX handler
+returns before deserialising the transaction while IsInitialBlockDownload()
+is true (net_processing.cpp:4479-4483), and a synthetic chainstate carrying no
+chain work is in IBD by construction -- so a test that drives a transaction
+through the P2P path has to say which side of that gate it stands on. The
+gate's own test leaves the latch alone."
+  `(let ((bl.net:*cached-is-ibd* nil))
+     ,@body))
+
+(defun deliver-ibd-message (peer command payload node-ctx
+                            &optional (ibd-ctx bl.net:*ibd-context*))
+  "Drive one wire message through the IBD dispatcher -- the routing a live
+node uses while it is still syncing, which handles block and headers itself
+and hands everything else to the generic handler."
+  (bl.net::dispatch-ibd-message peer command payload node-ctx ibd-ctx))
+
 ;;;; The tx-request tracker (Core TxRequestTracker)
 ;;;
 ;;; White-box readers for a structure with no public accessors: the state a
