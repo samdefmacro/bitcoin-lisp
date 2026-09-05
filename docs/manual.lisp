@@ -563,7 +563,10 @@
   A gossiped address this node
   has banned or discouraged is dropped at ingest, before addrman and
   before relay, so the node never re-propagates an address it has itself
-  judged hostile. Relaying an address only QUEUES it on the chosen peers
+  judged hostile -- but the announcer is still marked as knowing it, which
+  is Core\'s order (AddAddressKnown before the ban test, ++num_proc after
+  it): a peer is never handed back an address it has just told us, and
+  `addr_processed` counts only what got past both filters. Relaying an address only QUEUES it on the chosen peers
   (Core RelayAddress -> PushAddress); one addr/addrv2 per peer carries the
   whole queue when that peer's own exponential 30s deadline passes, because
   sending at receive time would tell an observer when and from whom we

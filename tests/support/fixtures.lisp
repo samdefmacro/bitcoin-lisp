@@ -173,6 +173,18 @@ Three test files ask this question, which is why it is a fixture rather than
 a reach into the pump from each of them."
   (bl.net::drain-and-reap-peer peer node-ctx ibd-ctx))
 
+(defun ingest-gossiped-addresses (peer entries announced-count address-book peers)
+  "Drive the shipped addr/addrv2 ingestion loop over ENTRIES, a list of
+(net-addr . timestamp) as the parsers produce them (Core's per-address loop in
+the ADDR handler: the token bucket, the shuffle, storage and relay). PEER is
+the announcer, ANNOUNCED-COUNT the message's declared address count, PEERS the
+relay candidates. Returns the number of addresses stored.
+
+Two test files ask this question, which is why it is a fixture rather than a
+reach into the loop from each of them."
+  (bl.net::%process-gossiped-addresses peer entries announced-count
+                                       address-book peers))
+
 (defun peer-pending-getdata (peer)
   "The inv vectors PEER has asked for and we have not answered yet (Core
 Peer::m_getdata_requests) -- what a send-paused serve left behind."

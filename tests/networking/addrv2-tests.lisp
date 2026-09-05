@@ -314,7 +314,7 @@ be dropped before delivering anything useful."
              ;; A generous token bucket, so the rate limiter is not what
              ;; decides the outcome here.
              (setf (bl.net::peer-addr-token-bucket peer) 100d0)
-             (bl.net::%process-gossiped-addresses
+             (ingest-gossiped-addresses
               peer entries count book nil)
              (bl.net:peer-state peer))))
     (is (eq :disconnected (deliver :addr-fetch 5))

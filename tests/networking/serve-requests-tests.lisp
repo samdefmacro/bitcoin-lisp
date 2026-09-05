@@ -304,9 +304,10 @@ what tells \"queued for later\" apart from \"already on the wire\"."
 (test relay-address-fanout-and-dedup
   "relay-address (Core RelayAddress) forwards a fresh address to exactly 2
 eligible peers -- skipping the source, block-relay/feeler peers, and peers that
-already know it. The source is marked at once; a target is marked when its
-outgoing queue is flushed, on the pass that filters it (Core MaybeSendAddr,
-net_processing.cpp:5582-5589)."
+already know it. A target is marked when its outgoing queue is flushed, on the
+pass that filters it (Core MaybeSendAddr, net_processing.cpp:5582-5589); the
+ANNOUNCER is marked by the ADDR handler, not here (Core AddAddressKnown,
+:4092 -- see ADDR-INGEST-COUNTS-AND-MARKS-WHAT-CORE-DOES)."
   (let* ((source (bl.net:make-peer :state :ready :address "9.9.9.9:8333"))
          (full (loop for i below 4
                      collect (bl.net:make-peer
@@ -324,10 +325,7 @@ net_processing.cpp:5582-5589)."
          (sent (%relay-address pa source peers)))
     ;; exactly 2 targets chosen (4 eligible; source + block-relay excluded)
     (is (= 2 sent))
-    ;; the source is marked as knowing the address
-    (is-true (bl:recent-reject-p
-              (bl.net:peer-known-addrs source) key))
-    ;; ...but no target is, yet: the address is only QUEUED to them.
+    ;; no target is marked yet: the address is only QUEUED to them.
     (is (= 0 (count-if (lambda (p)
                          (bl:recent-reject-p
                           (bl.net:peer-known-addrs p) key))

@@ -31,6 +31,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:rest-request
    #:deliver-getdata
    #:drain-peer-once
+   #:ingest-gossiped-addresses
    #:peer-pending-getdata
    #:send-buffer-bytes
    ;; transactions.lisp
