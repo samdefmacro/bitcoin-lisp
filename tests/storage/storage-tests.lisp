@@ -2415,17 +2415,40 @@ directory. The helper must accept a plain file path and a bare name."
                       (namestring (uiop:temporary-directory)))))
       (delete-file path))))
 
+(defun %fsync-log (fsync target)
+  "Everything FSYNC logs while syncing TARGET, as a string."
+  (let ((out (make-string-output-stream)))
+    (let ((bl.log:*log-stream* out))
+      (funcall fsync target))
+    (get-output-stream-string out)))
+
 (test fsync-directory-reports-a-failure-instead-of-swallowing-it
   "A directory fsync that fails has to say so. It still may not break the write
 it was protecting -- the file is renamed into place by then -- but returning a
 silent NIL is how a node loses durability with nothing in the log to find it by."
-  (flet ((fsync-log (dir)
-           (let ((out (make-string-output-stream)))
-             (let ((bl.log:*log-stream* out))
-               (bl.kv:fsync-directory dir))
-             (get-output-stream-string out))))
-    (let ((quiet (fsync-log (namestring (uiop:temporary-directory)))))
-      (is (string= "" quiet) "an fsync that succeeded logged ~S" quiet))
-    (let ((complaint (fsync-log "/no-such-directory-for-the-fsync-test/")))
-      (is-true (search "fsync" complaint)
-               "a directory that cannot be opened logged ~S" complaint))))
+  (let ((quiet (%fsync-log #'bl.kv:fsync-directory
+                           (namestring (uiop:temporary-directory)))))
+    (is (string= "" quiet) "an fsync that succeeded logged ~S" quiet))
+  (let ((complaint (%fsync-log #'bl.kv:fsync-directory
+                               "/no-such-directory-for-the-fsync-test/")))
+    (is-true (search "fsync" complaint)
+             "a directory that cannot be opened logged ~S" complaint)))
+
+(test fsync-file-reports-a-failure-instead-of-swallowing-it
+  "The same rule for the data half of the pair: every branch of Core's
+FileCommit that fails logs and returns false (util/fs_helpers.cpp:102-131).
+The file fsync is what makes a temp file's CONTENTS durable before the
+rename, so a failure swallowed here loses the write itself, not merely its
+name."
+  (let ((path (merge-pathnames "fsync-file-probe.dat" (uiop:temporary-directory))))
+    (with-open-file (o path :direction :output :if-exists :supersede
+                            :element-type '(unsigned-byte 8))
+      (write-byte 1 o))
+    (unwind-protect
+         (let ((quiet (%fsync-log #'bl.kv:fsync-file (namestring path))))
+           (is (string= "" quiet) "an fsync that succeeded logged ~S" quiet))
+      (delete-file path)))
+  (let ((complaint (%fsync-log #'bl.kv:fsync-file
+                               "/no-such-directory-for-the-fsync-test/probe.dat")))
+    (is-true (search "fsync" complaint)
+             "a file that cannot be opened logged ~S" complaint)))

@@ -3,15 +3,26 @@
 ;;;; fsync helpers: the durability half of every temp+rename atomic write.
 
 (defun fsync-file (path)
-  "Force the OS to flush PATH's data to durable storage. Without this,
-   a temp+rename atomic write can still leave the destination empty after
-   a crash because the kernel hadn't flushed the buffered writes yet."
+  "Force the OS to flush PATH's data to durable storage (Core FileCommit,
+util/fs_helpers.cpp:102-131). Without this, a temp+rename atomic write can
+still leave the destination empty after a crash because the kernel had not
+flushed the buffered writes yet.
+
+A failure is logged rather than swallowed, the same way FSYNC-DIRECTORY logs
+its own: every branch of Core's FileCommit that fails writes a LogError line
+and returns false. It still may not break the write it was protecting -- each
+caller has just written a temp file it is about to rename into place -- but a
+silent NIL is how a node loses durability with nothing in the log to find it
+by. No caller reads the return value, so the log line IS the report."
   #+sbcl
   (handler-case
       (with-open-file (s path :direction :input
                               :element-type '(unsigned-byte 8))
         (sb-posix:fsync (sb-sys:fd-stream-fd s)))
-    (error () nil)))
+    (error (e)
+      (bl.log:log-warn "fsync of file ~A failed: ~A" path e)
+      nil))
+  #-sbcl nil)
 
 (defun fsync-directory (dir)
   "fsync directory DIR so newly created or renamed names in it are durable
