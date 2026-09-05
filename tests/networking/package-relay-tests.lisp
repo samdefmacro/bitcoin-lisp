@@ -28,9 +28,25 @@
    :address "pkgrelay" :state :ready
    :services bl.ser:+node-witness+))
 
-(defun %pr-payload (tx)
-  "The `tx` message payload for TX (header stripped), as handle-tx sees it."
-  (subseq (bl.ser:make-tx-message tx) 24))
+(defun %pr-payload (tx &key witness)
+  "The `tx` message payload for TX (header stripped), as handle-tx sees it.
+With WITNESS, the BIP144 witness serialization -- what a getdata for MSG_WTX
+or MSG_WITNESS_TX is answered with."
+  (subseq (bl.ser:make-tx-message tx :witness witness) 24))
+
+(defun %pr-witness-twin (tx witness-length)
+  "TX with its witness replaced by a single WITNESS-LENGTH-byte element: the
+SAME txid, a different wtxid -- a witness-malleated twin. At 450,000 bytes
+the twin is over the weight limit, so it is rejected without the real
+transaction's own validity being at stake."
+  (bl.ser:make-transaction
+   :version (bl.ser:transaction-version tx)
+   :inputs (bl.ser:transaction-inputs tx)
+   :outputs (bl.ser:transaction-outputs tx)
+   :lock-time (bl.ser:transaction-lock-time tx)
+   :witness (vector (list (make-array witness-length
+                                      :element-type '(unsigned-byte 8)
+                                      :initial-element 3)))))
 
 (defun %pr-tx (inputs out-value)
   "A non-witness P2SH(OP_TRUE) transaction spending INPUTS — a list of
@@ -50,6 +66,14 @@
                      :value out-value
                      :script-pubkey (p2sh-optrue-script-pubkey)))
    :lock-time 0))
+
+(defun %pr-ctx (state utxo mempool rejects &optional peers)
+  "The node-context handle-tx and handle-inv act on in this file: the
+chainstate, its coins view, the mempool, the main rejects filter and (for the
+relay half) the peer list."
+  (bl.ctx:make-node-context :chain-state state :utxo-set utxo
+                            :mempool mempool :recent-rejects rejects
+                            :peers peers))
 
 (defmacro %with-fresh-rejects ((rejects) &body body)
   "Run BODY with a fresh main rejects filter bound to REJECTS and the
@@ -116,18 +140,18 @@ step 3 to the mempool."
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
         ;; 1. The parent on its own: below the floor, reconsiderable.
-        (deliver-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
         (is-false (bl.mp:mempool-has mempool pid))
         (is-true (bl.val:reconsiderable-reject-p
                   (bl.ser:transaction-wtxid parent)))
         (is-false (bl:recent-reject-p
                    rejects (bl.ser:transaction-wtxid parent)))
         ;; 2. The child: an orphan, not a reject.
-        (deliver-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool rejects))
         (is-true (%pr-orphan-p mempool child))
         (is-false (bl:recent-reject-p rejects cid))
         ;; 3. The parent again: accepted as a package with the orphan child.
-        (deliver-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
         (is-true (bl.mp:mempool-has mempool pid))
         (is-true (bl.mp:mempool-has mempool cid))
         ;; The child left the orphanage when it entered the mempool
@@ -147,9 +171,9 @@ txdownloadman_impl.cpp:460-465). No re-announcement is needed."
            (cid (bl.ser:transaction-hash child))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
-        (deliver-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool rejects))
         (is-true (%pr-orphan-p mempool child))
-        (deliver-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
         (is-true (bl.mp:mempool-has mempool pid))
         (is-true (bl.mp:mempool-has mempool cid))
         (is-false (%pr-orphan-p mempool child))))))
@@ -163,8 +187,8 @@ re-arriving low-fee parent is still not accepted. The fee floor is intact —
            (pid (bl.ser:transaction-hash parent))
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
-        (deliver-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
-        (deliver-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
+        (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
         (is-false (bl.mp:mempool-has mempool pid))
         (is (zerop (bl.mp:mempool-count mempool)))))))
 
@@ -181,10 +205,10 @@ comes from peer B, the parent from peer A: no package is formed."
            (peer-a (%pr-peer))
            (peer-b (%pr-peer)))
       (%with-fresh-rejects (rejects)
-        (deliver-tx peer-a (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
-        (deliver-tx peer-b (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (deliver-tx peer-a (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
+        (deliver-tx peer-b (%pr-payload child) (%pr-ctx state utxo mempool rejects))
         (is-true (%pr-orphan-p mempool child))
-        (deliver-tx peer-a (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (deliver-tx peer-a (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
         (is-false (bl.mp:mempool-has mempool pid))
         (is-false (bl.mp:mempool-has mempool cid))))))
 
@@ -206,8 +230,8 @@ blacklisted under both of its own ids — permanently, until the next block."
       ;; The precondition that makes this case distinct.
       (is (equalp pid (bl.ser:transaction-wtxid parent)))
       (%with-fresh-rejects (rejects)
-        (deliver-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
-        (deliver-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
+        (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool rejects))
         (is-true (%pr-orphan-p mempool child))
         (is-false (bl:recent-reject-p rejects cid))
         (is-false (bl:recent-reject-p
@@ -234,12 +258,12 @@ rejects the child under both ids rather than holding it in the orphanage."
                           (- (* 2 (- 100000000 5)) 50000)))
            (cid (bl.ser:transaction-hash child)))
       (%with-fresh-rejects (rejects)
-        (deliver-tx peer (%pr-payload pa) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
-        (deliver-tx peer (%pr-payload pb) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (deliver-tx peer (%pr-payload pa) (%pr-ctx state utxo mempool rejects))
+        (deliver-tx peer (%pr-payload pb) (%pr-ctx state utxo mempool rejects))
         ;; Both parents are reconsiderable — the precondition.
         (is-true (bl.val:reconsiderable-reject-p paid))
         (is-true (bl.val:reconsiderable-reject-p pbid))
-        (deliver-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+        (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool rejects))
         (is-false (%pr-orphan-p mempool child))
         (is-true (bl:recent-reject-p rejects cid))
         (is-true (bl:recent-reject-p
@@ -262,12 +286,12 @@ zero on the second would prove nothing."
            (bad-id (bl.ser:transaction-hash bad)))
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
-          (deliver-tx peer (%pr-payload bad) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload bad) (%pr-ctx state utxo mempool rejects))
           (is (= 1 calls) "first arrival must reach validation" calls)
           (is-true (bl:recent-reject-p rejects bad-id))
           (is-false (bl.val:reconsiderable-reject-p bad-id))
           ;; Re-announced: dropped at the precheck, never re-validated.
-          (deliver-tx peer (%pr-payload bad) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload bad) (%pr-ctx state utxo mempool rejects))
           (is (= 1 calls) "re-arrival must not be re-validated" calls)
           (is-false (bl.mp:mempool-has mempool bad-id)))))))
 
@@ -291,12 +315,12 @@ carry it — and be dropped before validation on re-arrival."
            (txid (bl.ser:transaction-hash tx)))
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
-          (deliver-tx peer (%pr-payload tx) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload tx) (%pr-ctx state utxo mempool rejects))
           (is (= 1 calls) "first arrival must reach validation" calls)
           (is-false (bl.mp:mempool-has mempool txid))
           (is-true (bl.val:reconsiderable-reject-p txid))
           (is-false (bl:recent-reject-p rejects txid))
-          (deliver-tx peer (%pr-payload tx) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload tx) (%pr-ctx state utxo mempool rejects))
           (is (= 1 calls) "re-arrival must not be re-validated" calls))))))
 
 ;;;; (e) A FAILED 1p1c package must not black-hole its members
@@ -386,16 +410,16 @@ one."
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
           ;; RIVAL wins the outpoint honestly.
-          (deliver-tx peer (%pr-payload rival) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload rival) (%pr-ctx state utxo mempool rejects))
           (is-true (bl.mp:mempool-has mempool rid))
           ;; The sub-floor double-spending PARENT: reconsiderable, not main.
-          (deliver-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
           (is-true (bl.val:reconsiderable-reject-p pwtxid))
           ;; The CHILD: held as an orphan (one reconsiderable parent is fine).
-          (deliver-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool rejects))
           (is-true (%pr-orphan-p mempool child))
           ;; The parent again — this forms the package, and it FAILS.
-          (deliver-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
           ;; The package path really ran and really failed as a package.
           (is-true (bl.val:reconsiderable-reject-p
                     (bl.val:package-hash (list parent child)))
@@ -425,7 +449,7 @@ one."
           ;; ...and the re-sent child must reach validation instead of being
           ;; dropped at handle-tx's precheck, and be held as an orphan again.
           (let ((before calls))
-            (deliver-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+            (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool rejects))
             (is (= (1+ before) calls)
                 "re-sent child must reach validation, not the reject precheck"
                 before calls))
@@ -436,7 +460,7 @@ one."
           (bl.mp:mempool-remove mempool rid)
           (bl:clear-recent-rejects rejects)
           (bl.val:clear-reconsiderable-rejects)
-          (deliver-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
           (is-true (bl.mp:mempool-has mempool pid))
           (is-true (bl.mp:mempool-has mempool cid)))))))
 
@@ -477,14 +501,14 @@ goes to the reconsiderable filter — CONTROL (b) again, on this path."
            (peer (%pr-peer)))
       (%with-fresh-rejects (rejects)
         (%counting-tx-validations (calls)
-          (deliver-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
           (is-true (bl.val:reconsiderable-reject-p pwtxid))
-          (deliver-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool rejects))
           (is-true (%pr-orphan-p mempool child)
                    "the bad child must be an orphan first, or the package
 never forms and this control asserts nothing")
           ;; Form the package; the child fails hard inside it.
-          (deliver-tx peer (%pr-payload parent) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+          (deliver-tx peer (%pr-payload parent) (%pr-ctx state utxo mempool rejects))
           (is (zerop (bl.mp:mempool-count mempool)))
           (is-true (bl:recent-reject-p rejects cwtxid)
                    "a hard package failure must still be cached")
@@ -496,7 +520,7 @@ never forms and this control asserts nothing")
           (is-false (bl:recent-reject-p rejects pwtxid))
           ;; Re-announced: dropped at the precheck, never re-validated.
           (let ((before calls))
-            (deliver-tx peer (%pr-payload child) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+            (deliver-tx peer (%pr-payload child) (%pr-ctx state utxo mempool rejects))
             (is (= before calls)
                 "a cached hard failure must not be re-validated" before calls))
           (is-false (%pr-orphan-p mempool child))
@@ -566,3 +590,126 @@ with the filter empty, which IS requested."
       (ignore-errors
        (deliver-inv announcer (funcall inv-payload fresh) (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects)))
       (is-false (bl.net:tx-request-wanted-p fresh probe t)))))
+
+;;;; Tx-request tracking across a delivery: ReceivedResponse vs ForgetTxHash
+;;;
+;;; Core's ReceivedTx completes the DELIVERING peer's announcement only
+;;; (txdownloadman_impl.cpp:505-513 -> txrequest.cpp:667-676) and reserves
+;;; ForgetTxHash for the points where the transaction is genuinely resolved:
+;;; mempool acceptance (:325-328), orphan intake and rejected parents
+;;; (:418-419, :434-435), a non-reconsiderable rejection (:470, :483-484) and
+;;; block connection (:107-108).
+
+(test tx-delivery-completes-only-the-delivering-peers-announcement
+  "An unsolicited, witness-malleated copy of a transaction must not release
+the peers that announced its TXID. The twin has the same txid and a different
+wtxid, so it is rejected and cached under its OWN wtxid while the real
+transaction is neither in the mempool nor blacklisted -- and before this fix
+every honest announcer had been forgotten, so no further request went out and
+the transaction (or the orphan whose parent it is) waited for an entirely new
+announcer."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let* ((real (%pr-tx (list (cons funding 0)) (- 100000000 50000)))
+           (txid (bl.ser:transaction-hash real))
+           (twin (%pr-witness-twin real 450000))
+           (a (%pr-peer)) (b (%pr-peer)) (c (%pr-peer))
+           (attacker (%pr-peer)))
+      (is (equalp txid (bl.ser:transaction-hash twin)))
+      (is-false (equalp (bl.ser:transaction-wtxid real)
+                        (bl.ser:transaction-wtxid twin)))
+      (%with-fresh-rejects (rejects)
+        ;; Three peers announce the txid; the first holds the request.
+        (is-true (bl.net:tx-request-wanted-p txid a))
+        (is-false (bl.net:tx-request-wanted-p txid b))
+        (is-false (bl.net:tx-request-wanted-p txid c))
+        (is (eq a (tx-request-in-flight-peer txid)))
+        (is (= 3 (length (tx-request-announcement-peers txid))))
+        ;; A fourth peer, which announced nothing, sends the twin.
+        (deliver-tx attacker (%pr-payload twin :witness t)
+                    (%pr-ctx state utxo mempool rejects))
+        ;; Witness that the delivery really reached the handler and really
+        ;; was rejected for the malleation: the sender is marked as knowing
+        ;; the txid, and the TWIN's wtxid -- not the txid -- is cached.
+        (is-true (bl:recent-reject-p (bl.net:peer-announced-txs attacker) txid))
+        (is-true (bl:recent-reject-p rejects (bl.ser:transaction-wtxid twin)))
+        (is-false (bl:recent-reject-p rejects txid))
+        (is-false (bl.mp:mempool-has mempool txid))
+        ;; Every honest announcement survives; the attacker completed nothing
+        ;; because it had nothing to complete.
+        (is (= 3 (length (tx-request-announcement-peers txid))))
+        (is (eq a (tx-request-in-flight-peer txid)))
+        ;; And the transaction is still fetchable: a's window expiring hands
+        ;; it to one of the other two.
+        (is (eq a (expire-tx-request txid)))
+        (is (= 1 (bl.net:retry-timed-out-tx-requests)))
+        (is-true (member (tx-request-in-flight-peer txid) (list b c)))))))
+
+(test tx-delivery-from-an-announcer-completes-its-own-slot
+  "The other half of ReceivedResponse: when the DELIVERER is an announcer,
+its own announcement completes -- the in-flight request is released and the
+next scheduler pass re-routes to a co-announcer, which is what makes a peer
+that answers with a useless transaction lose its window."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let* ((real (%pr-tx (list (cons funding 0)) (- 100000000 50000)))
+           (txid (bl.ser:transaction-hash real))
+           (twin (%pr-witness-twin real 450000))
+           (a (%pr-peer)) (b (%pr-peer)))
+      (%with-fresh-rejects (rejects)
+        (is-true (bl.net:tx-request-wanted-p txid a))
+        (is-false (bl.net:tx-request-wanted-p txid b))
+        (deliver-tx a (%pr-payload twin :witness t)
+                    (%pr-ctx state utxo mempool rejects))
+        (is-true (tx-request-completed-p txid a))
+        (is (equal (list b) (tx-request-announcement-peers txid)))
+        (is (null (tx-request-in-flight-peer txid)))
+        ;; Two announcements are moved: b's live one and a's completed one,
+        ;; which the scheduler must skip.
+        (is (= 2 (backdate-tx-announcements txid)))
+        (is (= 1 (bl.net:process-tx-requests)))
+        (is (eq b (tx-request-in-flight-peer txid)))))))
+
+(test mempool-acceptance-forgets-every-announcer
+  "ForgetTxHash belongs where the transaction is RESOLVED. Mempool acceptance
+is Core's first such point (MempoolAcceptedTx, txdownloadman_impl.cpp:325-328,
+\"as this version of the transaction was acceptable, we can forget about any
+requests for it\"), so every peer's announcement goes, not only the
+deliverer's."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let* ((tx (%pr-tx (list (cons funding 0)) (- 100000000 50000)))
+           (txid (bl.ser:transaction-hash tx))
+           (a (%pr-peer)) (b (%pr-peer)) (c (%pr-peer)))
+      (%with-fresh-rejects (rejects)
+        (is-true (bl.net:tx-request-wanted-p txid a))
+        (is-false (bl.net:tx-request-wanted-p txid b))
+        (is (= 2 (length (tx-request-announcement-peers txid))))
+        (deliver-tx c (%pr-payload tx) (%pr-ctx state utxo mempool rejects))
+        (is-true (bl.mp:mempool-has mempool txid))
+        (is (null (tx-request-announcement-peers txid :completed t)))
+        (is (null (tx-request-in-flight-peer txid)))
+        (is (= 0 (bl.net:tx-request-count a)))
+        (is (= 0 (bl.net:tx-request-count b)))))))
+
+(test a-non-reconsiderable-rejection-forgets-the-wtxid-only
+  "Core ForgetTxHash's the WTXID of a non-reconsiderable failure (:470) and
+adds the TXID only for TX_INPUTS_NOT_STANDARD, whose verdict the txid alone
+decides (:483-484). Anything else may be a verdict on this witness, so the
+txid keeps its announcers -- the same rule the rejects filter follows, and
+the reason the malleated twin above cannot blacklist the real transaction."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (let* ((real (%pr-tx (list (cons funding 0)) (- 100000000 50000)))
+           (txid (bl.ser:transaction-hash real))
+           (twin (%pr-witness-twin real 450000))
+           (twin-wtxid (bl.ser:transaction-wtxid twin))
+           (announcer (%pr-peer))
+           (deliverer (%pr-peer)))
+      (%with-fresh-rejects (rejects)
+        ;; The twin's own wtxid was announced too, by the peer that sends it.
+        (is-true (bl.net:tx-request-wanted-p twin-wtxid deliverer t))
+        (is-true (bl.net:tx-request-wanted-p txid announcer))
+        (deliver-tx deliverer (%pr-payload twin :witness t)
+                    (%pr-ctx state utxo mempool rejects))
+        ;; The wtxid entry is forgotten outright: no witness can make this
+        ;; one acceptable.
+        (is (null (tx-request-announcement-peers twin-wtxid :completed t)))
+        ;; The txid entry keeps its announcer.
+        (is (equal (list announcer) (tx-request-announcement-peers txid)))))))

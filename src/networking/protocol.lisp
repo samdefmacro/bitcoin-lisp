@@ -1629,18 +1629,29 @@ callers this node has (txdownloadman_impl.cpp:350-484):
     tx, so caching would poison the TXID of the real, witnessed transaction.
   - Everything else is cached in the main filter under the WTXID only —
     the witness is malleable (Core issue #8279) — plus the TXID for
-    :nonstandard-inputs, a failure that depends only on the txid (:471-484)."
+    :nonstandard-inputs, a failure that depends only on the txid (:471-484).
+
+The tracker follows the same ids, and for the same reason. Core
+ForgetTxHash's the WTXID of every non-reconsiderable-or-missing-input
+failure (:470) and adds the TXID only for TX_INPUTS_NOT_STANDARD (:483-484):
+that verdict is decided by the scriptPubKey being spent, which the txid
+covers, so no witness can change it and no peer should be asked for the
+transaction again under either id. Any other failure may be a verdict on
+THIS witness alone, so the txid keeps its announcements."
   (let ((txid (bl.ser:transaction-hash tx))
         (wtxid (bl.ser:transaction-wtxid tx)))
     (cond
       ((eq reason :missing-input) nil)
       ((eq reason :witness-stripped) nil)
       ((%reconsiderable-failure-p reason)
-       (bl.val:add-reconsiderable-reject wtxid))
+       (bl.val:add-reconsiderable-reject wtxid)
+       (tx-request-received wtxid))
       (t
        (bl:add-recent-reject recent-rejects wtxid)
+       (tx-request-received wtxid)
        (when (and (eq reason :nonstandard-inputs) (not (equalp wtxid txid)))
-         (bl:add-recent-reject recent-rejects txid))))))
+         (bl:add-recent-reject recent-rejects txid)
+         (tx-request-received txid))))))
 
 (defun process-orphans (accepted-txid utxo-set mempool chain-state peers
                         &key recent-rejects)
@@ -1761,11 +1772,18 @@ over like any other (Core routes them through the same m_txrequest)."
                               recent-rejects)
   "The shared tail for a transaction that has just entered the mempool from
 the P2P path (Core ProcessValidTx -> MempoolAcceptedTx,
-txdownloadman_impl.cpp:323-333): forget it as an orphan, relay it, and run
-the de-orphan cascade over the children waiting on it. PEER is the source,
-excluded from relay."
+txdownloadman_impl.cpp:323-333): forget every peer's request for it, forget
+it as an orphan, relay it, and run the de-orphan cascade over the children
+waiting on it. PEER is the source, excluded from relay."
   (let ((txid (bl.ser:transaction-hash tx))
         (wtxid (bl.ser:transaction-wtxid tx)))
+    ;; "As this version of the transaction was acceptable, we can forget about
+    ;; any requests for it" (:325-328): ForgetTxHash under BOTH ids, which is
+    ;; the point at which the transaction is genuinely resolved and every
+    ;; announcer's slot may be released. A no-op if it was never tracked.
+    (tx-request-received txid)
+    (unless (equalp wtxid txid)
+      (tx-request-received wtxid))
     ;; It may have been in our orphanage (announced by another peer, or held
     ;; while a parent was fetched); Core's EraseTx is a no-op otherwise.
     (bl.mp:orphan-remove
@@ -1910,13 +1928,21 @@ CTX's recent-rejects, when present, caches recently rejected txs."
             (let ((txid (bl.ser:transaction-hash tx))
                   (wtxid (bl.ser:transaction-wtxid tx))
                   (current-height (bl.store:current-height chain-state)))
-              ;; The requested tx arrived — clear its in-flight/announcer
-              ;; tracking. MSG_WTX announcements are tracked under the wtxid,
-              ;; so clear that key too (txids and wtxids never collide; for
+              ;; A response arrived from THIS peer — Core ReceivedTx's first
+              ;; act (txdownloadman_impl.cpp:505-513). ReceivedResponse, not
+              ;; ForgetTxHash: only the delivering peer's announcement
+              ;; completes, and every other announcer stays a candidate.
+              ;; Forgetting the hash here instead let any peer evict every
+              ;; honest announcer of a TXID by sending one unsolicited
+              ;; witness-malleated twin -- same txid, different wtxid, so the
+              ;; twin is rejected and cached under its own wtxid while the
+              ;; real transaction is neither in the mempool nor requestable
+              ;; any more. MSG_WTX announcements are tracked under the wtxid,
+              ;; so answer that key too (txids and wtxids never collide; for
               ;; no-witness txs they are equal and one call suffices).
-              (tx-request-received txid)
+              (tx-request-received-response peer txid)
               (unless (equalp wtxid txid)
-                (tx-request-received wtxid))
+                (tx-request-received-response peer wtxid))
               ;; Mark as announced by this peer (bounded set)
               (bl:add-recent-reject (peer-announced-txs peer) txid)
               ;; Check recent rejects and recently-confirmed before expensive
@@ -1967,12 +1993,23 @@ CTX's recent-rejects, when present, caches recently rejected txs."
                        (if (%orphan-parents-rejected-p parents recent-rejects)
                            (progn
                              (bl:add-recent-reject recent-rejects txid)
-                             (bl:add-recent-reject recent-rejects wtxid))
+                             (bl:add-recent-reject recent-rejects wtxid)
+                             ;; :434-435, beside the two filter inserts.
+                             (tx-request-received txid)
+                             (tx-request-received wtxid))
                            (progn
                              (bl.mp:orphan-add
                               (bl.mp:mempool-orphan-pool mempool) tx peer)
                              (request-orphan-parents
-                              peer parents (count-wtxid-relay-peers peers))))))
+                              peer parents (count-wtxid-relay-peers peers))
+                             ;; "Once added to the orphan pool, a tx is
+                             ;; considered AlreadyHave, and we shouldn't
+                             ;; request it anymore" (:418-419) — ForgetTxHash
+                             ;; here rather than at receipt, after the
+                             ;; announcers have had their chance to be read.
+                             (tx-request-received txid)
+                             (unless (equalp wtxid txid)
+                               (tx-request-received wtxid))))))
                     (t
                      ;; Cache the failure so we don't re-request it (see
                      ;; %cache-tx-rejection for which filter and which ids).
