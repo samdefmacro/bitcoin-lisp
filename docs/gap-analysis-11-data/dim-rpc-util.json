@@ -14,7 +14,7 @@
       "confidence": "executed"
     },
     {
-      "id": "cdc3ffa6",
+      "id": "fa699133",
       "title": "createrawtransaction ignores replaceable and version and defaults sequence to SEQUENCE_FINAL, making nLockTime inert",
       "severity": "S2",
       "our_ref": "src/rpc/rawtransaction.lisp:843,864,896",
@@ -26,7 +26,7 @@
       "confidence": "executed"
     },
     {
-      "id": "af43c50a",
+      "id": "dd5787ca",
       "title": "Fee estimator tracks every mempool entry: none of Core's validForFeeEstimation gates nor the txHeight == nBestSeenHeight gate",
       "severity": "S2",
       "our_ref": "src/mempool/block-policy-estimator.lisp:352-362; src/mempool/mempool.lisp:906-909",
@@ -38,7 +38,7 @@
       "confidence": "executed"
     },
     {
-      "id": "ca8f2582",
+      "id": "95edd4e7",
       "title": "decodescript returns the pre-v22 shape and offers p2sh/segwit wrappers Core refuses to print",
       "severity": "S2",
       "our_ref": "src/rpc/rawtransaction.lisp:964-1013",
@@ -50,7 +50,7 @@
       "confidence": "executed"
     },
     {
-      "id": "57836a33",
+      "id": "2453fab8",
       "title": "decoderawtransaction accepts trailing bytes and has no legacy/witness disambiguation or iswitness argument",
       "severity": "S2",
       "our_ref": "src/rpc/rawtransaction.lisp:9-21",
@@ -62,7 +62,7 @@
       "confidence": "executed"
     },
     {
-      "id": "4d479f07",
+      "id": "c1649d3d",
       "title": "Script ASM renders small pushes as hex and OP_0/OP_1..16/OP_1NEGATE as opcode names",
       "severity": "S2",
       "our_ref": "src/validation/script.lisp:573-650",
@@ -74,7 +74,7 @@
       "confidence": "executed"
     },
     {
-      "id": "232749f2",
+      "id": "c9835924",
       "title": "estimatesmartfee falls back to a block-percentile estimate where Core reports no estimate",
       "severity": "S2",
       "our_ref": "src/mempool/fee-estimator.lisp:337-370; src/rpc/rawtransaction.lisp:206",
@@ -86,7 +86,7 @@
       "confidence": "executed"
     },
     {
-      "id": "56f081de",
+      "id": "adfc52aa",
       "title": "No ParseHashV/ParseHexV: every hash-argument error is ad hoc, and getchaintxstats returns -5 instead of -8",
       "severity": "S3",
       "our_ref": "src/rpc/blockchain.lisp:12-26",
@@ -98,7 +98,7 @@
       "confidence": "executed"
     },
     {
-      "id": "b30e147a",
+      "id": "ac99774f",
       "title": "amount-from-value's string path is not ParseFixedPoint: leading zeros accepted, exponents rejected, negative strings mis-coded",
       "severity": "S3",
       "our_ref": "src/rpc/amounts.lisp:8-61",
@@ -110,7 +110,7 @@
       "confidence": "executed"
     },
     {
-      "id": "fbeedd9a",
+      "id": "63b42740",
       "title": "estimaterawfee omits decay and scale and reports feerate 0 where Core omits feerate and reports the fail bucket",
       "severity": "S3",
       "our_ref": "src/rpc/rawtransaction.lisp:916-962",
@@ -122,7 +122,7 @@
       "confidence": "executed"
     },
     {
-      "id": "3df05044",
+      "id": "bc10de29",
       "title": "getdeploymentinfo never emits the bip9 signalling string",
       "severity": "S3",
       "our_ref": "src/rpc/blockchain.lisp:2494-2540",
@@ -134,7 +134,7 @@
       "confidence": "executed"
     },
     {
-      "id": "71799a3b",
+      "id": "ef28c178",
       "title": "getdeploymentinfo reports threshold and possible in LOCKED_IN where Core omits both",
       "severity": "S3",
       "our_ref": "src/validation/versionbits.lisp:308-338; src/rpc/blockchain.lisp:2530-2537",
@@ -146,7 +146,7 @@
       "confidence": "executed"
     },
     {
-      "id": "53bc3c92",
+      "id": "be96017b",
       "title": "No RPCHelpMan type gate: wrong-typed arguments never produce -3 Wrong type passed, extra arguments are ignored",
       "severity": "S3",
       "our_ref": "src/rpc/define-rpc.lisp:47-100; src/rpc/server.lisp:68-86",
@@ -158,7 +158,7 @@
       "confidence": "executed"
     },
     {
-      "id": "9129723b",
+      "id": "ce1283b3",
       "title": "createrawtransaction sequence out of range escapes as a Lisp TYPE-ERROR reported as -32603",
       "severity": "S3",
       "our_ref": "src/rpc/rawtransaction.lisp:864-876",
@@ -170,7 +170,7 @@
       "confidence": "executed"
     },
     {
-      "id": "27995246",
+      "id": "54578659",
       "title": "Amounts render as JSON doubles instead of Core's ValueFromAmount fixed 8-decimal form",
       "severity": "S3",
       "our_ref": "src/rpc/amounts.lisp:63-65",
@@ -182,7 +182,7 @@
       "confidence": "executed"
     },
     {
-      "id": "c8805e1e",
+      "id": "d426a155",
       "title": "Data must be hexadecimal string omits Core's (not '<value>') suffix",
       "severity": "S3",
       "our_ref": "src/rpc/amounts.lisp:130-137",
@@ -194,7 +194,7 @@
       "confidence": "executed"
     },
     {
-      "id": "fed0005a",
+      "id": "b276a1e0",
       "title": "Verbosity-3 prevout scriptPubKey omits the desc field Core's ScriptToUniv always emits",
       "severity": "S3",
       "our_ref": "src/rpc/blockchain.lisp:470-508",

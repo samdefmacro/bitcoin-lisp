@@ -36,7 +36,7 @@ present, matching `init.cpp:1002-1009`); `housekeeping.lisp`'s 50 MiB disk floor
 ## Not covered - and who inherits it
 
 - **Crash consistency.** No kill-then-restart matrix was run, so the coinstatsindex rewind and the
-  txospenderindex gap (`670fe529`) are both unreproduced. GA11 dimension 9 (validation/block.lisp +
+  txospenderindex gap (`be1b5ed4`) are both unreproduced. GA11 dimension 9 (validation/block.lisp +
   chain.lisp + coins-view-cache.lisp) inherits it.
 - **The full lock audit.** 140 `node-lock` sites across 23 files were enumerated but not all read.
   `accessors.lisp` documents five leaf locks; the tree has at least twelve. Dimensions 10 (peer /

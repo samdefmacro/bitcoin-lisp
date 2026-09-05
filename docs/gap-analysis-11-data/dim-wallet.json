@@ -14,7 +14,7 @@
       "confidence": "executed"
     },
     {
-      "id": "04bea49c",
+      "id": "4e92ca22",
       "title": "A tx record that fails to parse is skipped with a warning instead of Core's NEED_RESCAN rescan",
       "severity": "S2",
       "our_ref": "src/wallet/wallet-tx.lisp:1228-1242; src/wallet/wallet-tx.lisp:1667-1745",
@@ -26,7 +26,7 @@
       "confidence": "executed"
     },
     {
-      "id": "ac7e4f05",
+      "id": "5b7d945a",
       "title": "A wallet database that cannot be opened or read answers -32603 Internal error",
       "severity": "S3",
       "our_ref": "src/wallet/wallet.lisp:1236; src/wallet/wallet-store.lisp:411-419, 429-445",
@@ -38,7 +38,7 @@
       "confidence": "executed"
     },
     {
-      "id": "1f186e72",
+      "id": "c7a9a092",
       "title": "listsinceblock parses its blockhash with the txid helper, so a bad hash reports \"txid must be of length 64\"",
       "severity": "S3",
       "our_ref": "src/wallet/wallet-tx.lisp:1996; src/wallet/wallet-tx.lisp:1749-1753",
@@ -50,7 +50,7 @@
       "confidence": "executed"
     },
     {
-      "id": "d73111fb",
+      "id": "71d5aa9f",
       "title": "importprunedfunds and removeprunedfunds are not implemented",
       "severity": "S3",
       "our_ref": "src/wallet/wallet-tx.lisp:1747 (the wallet transaction RPC section; no define-rpc for either name anywhere under src/wallet/)",
@@ -62,7 +62,7 @@
       "confidence": "read-both-trees"
     },
     {
-      "id": "dc6e515d",
+      "id": "69862ba9",
       "title": "A corrupt walletdescriptor record surfaces the descriptor parser's message, not Core's UNKNOWN_DESCRIPTOR text",
       "severity": "S3",
       "our_ref": "src/wallet/wallet.lisp:1066-1075",
@@ -74,7 +74,7 @@
       "confidence": "executed"
     },
     {
-      "id": "228b2030",
+      "id": "b314f13a",
       "title": "The version record is written once at creation and never read or refreshed; minversion is never used",
       "severity": "S3",
       "our_ref": "src/wallet/wallet.lisp:1004-1005; src/wallet/wallet-store.lisp:39-40",
@@ -86,7 +86,7 @@
       "confidence": "executed"
     },
     {
-      "id": "5d08da5e",
+      "id": "652d565b",
       "title": "blockDisconnected updates the best block in memory only; Core persists the rolled-back locator",
       "severity": "S3",
       "our_ref": "src/wallet/wallet-tx.lisp:1162-1165",
@@ -98,7 +98,7 @@
       "confidence": "read-both-trees"
     },
     {
-      "id": "73d4c5fc",
+      "id": "2ea896f4",
       "title": "Extraneous mkey records are not removed from a disable_private_keys wallet on load",
       "severity": "S3",
       "our_ref": "src/wallet/wallet.lisp:1245-1251",
@@ -110,7 +110,7 @@
       "confidence": "read-both-trees"
     },
     {
-      "id": "d6adea51",
+      "id": "e05d644b",
       "title": "The whole wallet database is materialized in memory on every load and backup",
       "severity": "S3",
       "our_ref": "src/wallet/wallet-store.lisp:429-445; src/wallet/wallet.lisp:1044",
@@ -122,7 +122,7 @@
       "confidence": "read-both-trees"
     },
     {
-      "id": "c318f98f",
+      "id": "7aea0d09",
       "title": "signmessage validates the address before requiring the passphrase; Core unlocks first",
       "severity": "S3",
       "our_ref": "src/wallet/signmessage.lisp:48-58",
