@@ -163,10 +163,12 @@ commitment over TXS) followed by TXS."
       (or (bl.mining:mine-block blk)
           (error "%ib-block: could not mine")))))
 
-(defun %ib-validate (blk cs utxo now)
-  "VALIDATE-BLOCK at height 1, returning (values valid error fee-integer)."
+(defun %ib-validate (blk cs utxo now &key skip-scripts)
+  "VALIDATE-BLOCK at height 1, returning (values valid error fee-integer).
+SKIP-SCRIPTS is the IBD/assumevalid path, where the script engine is not there
+to catch anything the coin bookkeeping lets through."
   (multiple-value-bind (valid error fees)
-      (bl.val:validate-block blk cs utxo 1 now)
+      (bl.val:validate-block blk cs utxo 1 now :skip-scripts skip-scripts)
     (values valid error
             (and fees (bl.interop:unwrap-satoshi fees)))))
 
@@ -386,3 +388,58 @@ legitimate single spend must still report exactly its own fee."
                          cs utxo now)
          (is (null valid))
          (is (eq :coinbase-too-large error)))))))
+
+;;; ------------------------------------------------------------------
+;;; GA10 ccac3137: an output Core's AddCoin never adds
+;;; ------------------------------------------------------------------
+
+(test intrablock-unspendable-output-is-not-staged
+  "Core's UpdateCoins -> AddCoins -> AddCoin DROPS an output whose scriptPubKey
+IsUnspendable -- a leading OP_RETURN, or a script over MAX_SCRIPT_SIZE
+(coins.cpp AddCoin, reached from validation.cpp:2589). A later transaction of
+the SAME block that names such an outpoint therefore fails HaveInputs and the
+block is rejected bad-txns-inputs-missingorspent (tx_verify.cpp:167-169) --
+our :MISSING-INPUT.
+
+Our overlay staged every output with no filter, though the persistent view it
+stands in for applies exactly that rule when the block is really connected
+(COIN-VIEW-APPLY-BLOCK). Two consequences, both asserted here: with scripts on
+the block was still rejected but for the WRONG reason and only after the full
+script work; and with scripts skipped nothing caught it at all -- the spend
+resolved, its 10,000,000 satoshi were credited into the block's fee total, and
+the coinbase cap rose by an amount Core never grants.
+
+Control: the identical block whose staged output is SPENDABLE is accepted in
+both modes, so the rejection is attributable to unspendability alone."
+  (with-network (:regtest)
+    (flet ((%run (spk suffix skip)
+             (multiple-value-bind (cs utxo prev bits now subsidy) (%ib-env suffix)
+               (let* ((tx-a (%ib-tx (list (list (%ib-coin) 0 (%p2sh-optrue-scriptsig)))
+                                    (list (list 90000000 spk))))
+                      (a-txid (bl.ser:transaction-hash tx-a))
+                      (tx-b (%ib-tx (list (list a-txid 0 (%p2sh-optrue-scriptsig)))
+                                    (list (list 80000000 (p2sh-optrue-script-pubkey)))))
+                      (blk (%ib-block (list tx-a tx-b) prev bits now
+                                      (+ subsidy 20000000))))
+                 (multiple-value-list
+                  (%ib-validate blk cs utxo now :skip-scripts skip))))))
+      (let ((op-return (%ib-bytes #x6a #x04 1 2 3 4))
+            ;; MAX_SCRIPT_SIZE is 10000; one byte past it is unspendable.
+            (oversize (make-array 10001 :element-type '(unsigned-byte 8)
+                                        :initial-element #x51)))
+        (dolist (spec (list (list op-return "ib-unspend-or" nil)
+                            (list op-return "ib-unspend-or-skip" t)
+                            (list oversize "ib-unspend-big" nil)
+                            (list oversize "ib-unspend-big-skip" t)))
+          (destructuring-bind (spk suffix skip) spec
+            (is (equal (list nil :missing-input nil)
+                       (%run spk suffix skip))
+                "~A: a same-block spend of an unspendable output must be ~
+                 :MISSING-INPUT, not a script failure and not an acceptance"
+                suffix)))
+        ;; CONTROL: a spendable staged output, same shape, is accepted and
+        ;; reports both spends' fees.
+        (dolist (skip '(nil t))
+          (is (equal (list t nil 20000000)
+                     (%run (p2sh-optrue-script-pubkey)
+                           (format nil "ib-unspend-ctl-~A" skip) skip))))))))
