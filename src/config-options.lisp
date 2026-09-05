@@ -152,6 +152,11 @@
 ;; per-chain resource, so it is not NETWORK-ONLY either.
 (define-option "rpcwhitelist" :collect :rpc-whitelist :repeatable t)
 (define-option "testactivationheight" :collect :test-activation-heights :repeatable t)
+;; -vbparams=deployment:start:end[:min_activation_height]: Core reads it with
+;; GetArgs, so every occurrence counts and the last one for a deployment wins
+;; (chainparams.cpp:68-106). Regtest only -- ReadRegTestArgs is called for no
+;; other chain -- and parsed in %INIT-PARAMETERS, which knows the network.
+(define-option "vbparams" :collect :vbparams :repeatable t)
 ;; -test=<option>: Core reads it with GetArgs, so it is a LIST, and every
 ;; value is a separate test-only switch (common/args.cpp:743-747
 ;; TEST_OPTIONS_DOC). Regtest only; validated in %INIT-PARAMETERS, which
@@ -445,5 +450,5 @@
   "rpcworkqueue" "shrinkdebugfile"
   "signer" "signetseednode"
   "stopafterblockimport" "timeout"
-  "unsafesqlitesync" "vbparams"
+  "unsafesqlitesync"
   "version" "walletbroadcast")

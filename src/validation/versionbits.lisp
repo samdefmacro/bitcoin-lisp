@@ -44,7 +44,10 @@ consensus/params.h:45-79)."
   (bit 28 :type (integer 0 31))
   (start-time 0 :type integer)
   (timeout 0 :type integer)
-  (min-activation-height 0 :type (integer 0))
+  ;; int64 out of -vbparams, narrowed to Core's `int min_activation_height';
+  ;; nothing constrains it to be positive there, and the only test on it is
+  ;; `pindexPrev->nHeight + 1 >= min_activation_height'.
+  (min-activation-height 0 :type integer)
   (threshold 1916 :type (integer 0))
   (period 2016 :type (integer 1)))
 
@@ -78,9 +81,76 @@ consensus/params.h:45-79)."
      ,(%vb "taproot"   2  +vb-always-active+ +vb-no-timeout+ 0 108 144)))
   "Per-chain BIP9 deployments, in Core's order.")
 
+(defvar *vbparams-deployments* nil
+  "The regtest deployment list with -vbparams applied, or NIL when the option
+was not given. Built ONCE by APPLY-VERSIONBITS-PARAMETERS, the way Core builds
+the regtest chainparams once, so every caller shares the same structs:
+VERSIONBITS-STATE's per-call memo is an EQ table keyed on the deployment
+object, and a list rebuilt per call would defeat it.")
+
 (defun versionbits-deployments (&optional (network bl:*network*))
-  "The BIP9 deployments defined for NETWORK."
-  (rest (assoc network *versionbits-deployments*)))
+  "The BIP9 deployments defined for NETWORK.
+
+On regtest these are the deployments -vbparams edited, when it was given.
+Core reads that option in ReadRegTestArgs (chainparams.cpp:68-106) into
+RegTestOptions::version_bits_parameters, and kernel/chainparams.cpp:628-632
+writes each entry's start_time, timeout and min_activation_height into
+consensus.vDeployments while building the regtest params. It reaches no other
+chain because ReadRegTestArgs is called for no other chain."
+  (if (and *vbparams-deployments* (eq network :regtest))
+      *vbparams-deployments*
+      (rest (assoc network *versionbits-deployments*))))
+
+(defun %vbparams-integer (string)
+  "STRING as an integer, or NIL. Core parses each field with
+ToIntegral<int64_t> (util/strencodings.h), which consumes the WHOLE string:
+digits, optionally preceded by `-'; no `+', no whitespace, no trailing junk."
+  (let ((n (length string)))
+    (when (plusp n)
+      (let ((start (if (char= (char string 0) #\-) 1 0)))
+        (when (and (> n start)
+                   (every #'digit-char-p (subseq string start)))
+          (parse-integer string))))))
+
+(defun apply-versionbits-parameters (specs)
+  "Install the -vbparams overrides in SPECS, each `deployment:start:end' or
+`deployment:start:end:min_activation_height' (Core ReadRegTestArgs,
+chainparams.cpp:68-106). Every message below is Core's.
+
+Applied to the REGTEST deployments only, which is the whole of the option:
+Core's parse lives in ReadRegTestArgs and the values land in RegTestOptions,
+so on any other chain the option is inert. An unparsable field or an unknown
+deployment name raises rather than being skipped -- a silently ignored typo
+leaves the test running against the window it was trying to move."
+  (setf *vbparams-deployments* nil)
+  (when specs
+    (let ((deployments (mapcar #'copy-vb-deployment
+                               (rest (assoc :regtest *versionbits-deployments*)))))
+      (dolist (spec specs)
+        (let ((parts (and (stringp spec) (uiop:split-string spec :separator ":"))))
+          (unless (<= 3 (length parts) 4)
+            (config-error "Version bits parameters malformed, expecting deployment:start:end[:min_activation_height]"))
+          (destructuring-bind (name start-string timeout-string &optional min-string) parts
+            (let ((start (%vbparams-integer start-string))
+                  (timeout (%vbparams-integer timeout-string))
+                  (min-activation-height (if min-string
+                                             (%vbparams-integer min-string)
+                                             0)))
+              (unless start (config-error "Invalid nStartTime (~A)" start-string))
+              (unless timeout (config-error "Invalid nTimeout (~A)" timeout-string))
+              (unless min-activation-height
+                (config-error "Invalid min_activation_height (~A)" min-string))
+              (let ((deployment (find name deployments :key #'vb-deployment-name
+                                                       :test #'string=)))
+                (unless deployment
+                  (config-error "Invalid deployment (~A)" name))
+                (setf (vb-deployment-start-time deployment) start
+                      (vb-deployment-timeout deployment) timeout
+                      (vb-deployment-min-activation-height deployment)
+                      min-activation-height)
+                (bl:log-info "Setting version bits activation parameters for ~A to start=~D, timeout=~D, min_activation_height=~D"
+                             name start timeout min-activation-height))))))
+      (setf *vbparams-deployments* deployments))))
 
 (defun versionbits-deployment (name &optional (network bl:*network*))
   (find name (versionbits-deployments network) :key #'vb-deployment-name

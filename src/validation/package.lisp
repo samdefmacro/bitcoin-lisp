@@ -119,6 +119,7 @@ can. src/validation/.")
    #:compute-script-flags-for-height
    ;; BIP9 / versionbits (reporting only; activation stays height-based)
    #:versionbits-deployments
+   #:apply-versionbits-parameters
    #:versionbits-state
    #:with-versionbits-cache
    #:versionbits-state-name

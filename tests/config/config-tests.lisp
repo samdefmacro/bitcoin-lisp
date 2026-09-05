@@ -1060,6 +1060,58 @@ occurrence would silently drop every override but one."
   (is-true (bl:known-config-option-p "mocktime"))
   (is-true (bl:known-config-option-p "testactivationheight")))
 
+(defun %init-parameters-refusal (network txindex blockfilterindex prune
+                                 dbcache-mib mocktime test-activation-heights
+                                 vbparams test-options coinstatsindex
+                                 txospenderindex reindex-chainstate
+                                 peer-block-filters port)
+  "The message %INIT-PARAMETERS refuses this start-up configuration with, or
+NIL when it accepts it. The parameters are its own, in its own order, so a
+signature change fails the wrong-arity gate here rather than silently shifting
+a caller's arguments -- and one reach for the file, which is what the ::
+ratchet asks of a second copy."
+  (%config-refusal
+    (bl::%init-parameters network txindex blockfilterindex prune dbcache-mib
+                          mocktime test-activation-heights vbparams test-options
+                          coinstatsindex txospenderindex reindex-chainstate
+                          peer-block-filters port)))
+
+(defun %vbparams-init (network specs)
+  "The message %INIT-PARAMETERS refuses -vbparams=SPECS with on NETWORK, or
+NIL when it accepts them. The override is cleared afterwards either way."
+  (unwind-protect
+       (%init-parameters-refusal network nil nil nil nil nil nil specs
+                                 nil nil nil nil nil nil)
+    (bl.val:apply-versionbits-parameters nil)))
+
+(test vbparams-is-a-repeatable-regtest-only-option
+  "-vbparams=deployment:start:end[:min_activation_height] is Core's
+regtest-only BIP9 window override (chainparamsbase.cpp:22, parsed in
+chainparams.cpp:69-105). Core reads it with GetArgs, so every occurrence
+counts; it sat in this node's accept-and-drop table, which is a silent no-op
+for a functional test that sets a deployment window and then asserts the
+states that follow from it."
+  (let ((plist (start-node-plist
+                '("-regtest" "-vbparams=testdummy:1:2"
+                  "-vbparams=taproot:3:4:5"))))
+    (is (equal '("testdummy:1:2" "taproot:3:4:5") (getf plist :vbparams))))
+  (is-false (bl.cfg:core-only-option-p "vbparams"))
+  (is-true (bl:known-config-option-p "vbparams"))
+  ;; On regtest the option is applied; anywhere else it is refused rather than
+  ;; silently ignored, exactly as -testactivationheight is.
+  (is (null (%vbparams-init :regtest '("testdummy:1:2"))))
+  (is (equal "Version bits parameters malformed, expecting deployment:start:end[:min_activation_height]"
+             (%vbparams-init :regtest '("testdummy:1"))))
+  (dolist (network '(:mainnet :testnet3 :testnet4 :signet))
+    (is (equal "-vbparams is for regression testing (-regtest mode) only"
+               (%vbparams-init network '("testdummy:1:2")))))
+  ;; And a start with no -vbparams clears an override a previous start left.
+  (bl.val:apply-versionbits-parameters '("testdummy:1:2"))
+  (is (null (%vbparams-init :regtest nil)))
+  (is (= 0 (bl.val:vb-deployment-start-time
+            (find "testdummy" (bl.val:versionbits-deployments :regtest)
+                  :key #'bl.val:vb-deployment-name :test #'string=)))))
+
 (defun %peerblockfilters-init (blockfilterindex peer-block-filters prune)
   "The message %INIT-PARAMETERS refuses this -blockfilterindex /
 -peerblockfilters / -prune combination with, or NIL when it accepts it. Every
@@ -1069,12 +1121,9 @@ that gets through cannot leave a cache split or a prune target behind."
         (bl::*coins-cache-budget-bytes* bl::*coins-cache-budget-bytes*)
         (bl:*prune-target-mib* bl:*prune-target-mib*)
         (bl:*p2p-port-override* bl:*p2p-port-override*))
-    ;; network txindex blockfilterindex prune dbcache mocktime
-    ;; testactivationheight test-options coinstatsindex txospenderindex
-    ;; reindex-chainstate peerblockfilters port
-    (%config-refusal
-      (bl::%init-parameters :testnet4 nil blockfilterindex prune
-                            nil nil nil nil nil nil nil peer-block-filters nil))))
+    (%init-parameters-refusal :testnet4 nil blockfilterindex prune
+                              nil nil nil nil nil nil nil nil
+                              peer-block-filters nil)))
 
 (test peerblockfilters-without-blockfilterindex-is-refused-on-any-node
   "GA10 d2099b36. Core runs the check UNCONDITIONALLY and gates the service bit

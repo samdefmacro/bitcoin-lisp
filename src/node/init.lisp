@@ -200,7 +200,7 @@ value the node does not know."
       (setf bl.chain:*enforce-bip94-on-regtest* t)
       (log-info "BIP94 timewarp rules enforced (-test=bip94)"))))
 
-(defun %init-parameters (network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights test-options coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
+(defun %init-parameters (network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights vbparams test-options coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
   "The startup parameters applied before any database opens: test activation
 heights, -test, -mocktime, the -peerblockfilters/-blockfilterindex gate,
 -prune validation and -port (Core init.cpp Steps 3-4), the -dbcache split
@@ -219,6 +219,18 @@ heights, -test, -mocktime, the -peerblockfilters/-blockfilterindex gate,
       (config-error "-testactivationheight is for regression testing (-regtest mode) only"))
     (log-warn "Activation heights overridden by -testactivationheight: ~{~A~^ ~}"
               test-activation-heights))
+
+  ;; -vbparams=deployment:start:end[:min_activation_height] moves a BIP9
+  ;; deployment's window so a regtest chain can be driven through DEFINED ->
+  ;; STARTED -> LOCKED_IN -> ACTIVE (Core chainparams.cpp:68-106 into
+  ;; kernel/chainparams.cpp:628-632). Core parses it in ReadRegTestArgs and
+  ;; therefore ignores it everywhere else; we refuse it there instead, for the
+  ;; reason -testactivationheight above is refused -- a knob that silently does
+  ;; nothing is worse than one that says so.
+  (when vbparams
+    (unless (eq network :regtest)
+      (config-error "-vbparams is for regression testing (-regtest mode) only")))
+  (bl.val:apply-versionbits-parameters vbparams)
 
   ;; -mocktime: the startup form of setmocktime, for tests that need a fixed
   ;; clock before the first RPC can be made. Same regtest gate the RPC has.
@@ -1362,6 +1374,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (log-time-micros nil)
                         (log-thread-names nil)
                         (test-activation-heights nil)
+                        (vbparams nil)
                         (test-options nil)
                         (v2transport nil)
                         (coinstatsindex nil)
@@ -1467,7 +1480,7 @@ Returns the node instance."
   (%ensure-wallets-subdirectory data-directory network)
 
   (%init-logging data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-level-specs)
-  (%init-parameters network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights test-options coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
+  (%init-parameters network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights vbparams test-options coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
   (%init-datadir-layout data-directory network migrate-datadir)
   ;; Initialize node: the node struct and its databases; the chain itself is
   ;; loaded by %init-load-chain below.
