@@ -874,6 +874,46 @@ interpreter.cpp:1745-1826), so that the size comparison never picks it."
     (declare (ignore kind len verified))
     (is-true (stringp err) "signed without holding the key")))
 
+(test miniscript-older-reads-the-version-unsigned
+  "Core's CheckSequence gates on `txTo->version < 2\' where version is a
+`const uint32_t\' (interpreter.cpp:1789-1791, primitives/transaction.h:293),
+so EVERY version with bit 31 set is >= 2 there and BIP68 applies to it. Our
+slot is (signed-byte 32) -- correct, it is what the wire carries -- and the
+signed compare read 0x80000002 as negative, so the satisfier declined older()
+for a transaction whose relative locktime Core considers satisfied. The
+script engine already masked, so the branch the satisfier refused to build is
+one the engine would have accepted."
+  (flet ((older-met-p (version)
+           (bl.val:ms-check-older
+            (bl.ser:make-transaction
+             :version version
+             :inputs (vector (bl.ser:make-tx-in
+                              :previous-output
+                              (bl.ser:make-outpoint
+                               :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                    :initial-element 1)
+                               :index 0)
+                              :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                              :sequence 42))
+             :outputs (vector)
+             :lock-time 0)
+            0 42)))
+    ;; Controls: the ordinary versions, unchanged.
+    (is-true (older-met-p 2) "version 2 must satisfy older(42)")
+    (is-false (older-met-p 1) "version 1 is below BIP68")
+    ;; Bit 31 set: negative in our slot, >= 2 in Core's reading.
+    (is-true (older-met-p (- #x80000002 (expt 2 32)))
+             "version 0x80000002 is 2147483650 to Core, not -2147483646")
+    (is-true (older-met-p -1) "version 0xffffffff is 4294967295 to Core"))
+  ;; End to end: the signer builds the older() branch and the engine accepts
+  ;; the witness, on the same version.
+  (multiple-value-bind (kind len verified err)
+      (%ms-sign-p2wsh "and_v(v:pk(~a),older(42))"
+                      :version (- #x80000002 (expt 2 32)))
+    (declare (ignore kind len))
+    (is (null err) "signing failed: ~A" err)
+    (is-true verified "the script engine rejected the witness we produced")))
+
 (test miniscript-check-after-follows-cores-locktime-rules
   "after(N) is Core's CheckLockTime (interpreter.cpp:1745-1779): the tx
 nLockTime must be of the SAME kind (both heights or both timestamps), at least
