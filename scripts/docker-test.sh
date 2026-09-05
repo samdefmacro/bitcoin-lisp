@@ -72,4 +72,17 @@ if ! "$(dirname "$0")/check-undefined-variables.sh" "$TRANSCRIPT" "$(dirname "$0
   echo "ERROR: the load referenced variables that do not exist (see above)" >&2
   exit 1
 fi
+
+# The same blind spot one step over: a call that hands a function SBCL already
+# knows the wrong number of arguments is a STYLE-WARNING, so failure-p stays
+# NIL and the build passes. That call can only signal SIMPLE-PROGRAM-ERROR when
+# it runs -- or nothing at all inside an ignore-errors, which is how a test's
+# (bt:join-thread th :timeout 5) sat here never joining the thread it named.
+# The checker attributes each warning to the file being compiled (one from
+# refs/coalton is not ours to fix) and self-tests first.
+"$(dirname "$0")/check-wrong-arity-calls.sh" --self-test >&2 || exit 1
+if ! "$(dirname "$0")/check-wrong-arity-calls.sh" "$TRANSCRIPT" >&2; then
+  echo "ERROR: the build calls functions with the wrong argument count (see above)" >&2
+  exit 1
+fi
 exit "$rc"
