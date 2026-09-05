@@ -129,12 +129,32 @@ lifecycle the way run-script-test does for %sf-ok."
   (%sf-under-flags flags
                    (lambda () (bl.interop:verify-script script-sig script-pubkey))))
 
-(defun %sf-checksig (flags sig script-code)
-  "(verify-checksig SIG <pubkey> SCRIPT-CODE) under FLAGS, as a list."
+(defun %sf-checksig (flags sig script-code
+                     &optional (pubkey (%sf-script +sf-pubkey-hex+)))
+  "(verify-checksig SIG PUBKEY SCRIPT-CODE) under FLAGS, as a list. PUBKEY
+defaults to the well-formed compressed key, so a caller passing one is asking
+about the pubkey-encoding arms."
   (%sf-under-flags flags
                    (lambda ()
-                     (bl.interop:verify-checksig
-                      sig (%sf-script +sf-pubkey-hex+) script-code))))
+                     (bl.interop:verify-checksig sig pubkey script-code))))
+
+(defun %sf-p2wpkh (flags sig pubkey)
+  "(validate-p2wpkh (SIG PUBKEY)) against the program HASH160(PUBKEY) under
+FLAGS, as a list -- the witness-v0 CHECKSIG path, reached the way the
+interpreter reaches it."
+  (%sf-under-flags flags
+                   (lambda ()
+                     (bl.interop:validate-p2wpkh (list sig pubkey)
+                                                 (bl.crypto:hash160 pubkey)
+                                                 100000))))
+
+(defun %sf-der-sig (s hashtype)
+  "A well-formed 71-byte DER signature: r is 32 bytes of 0x01, S is the
+32-byte vector S, and HASHTYPE is the trailing byte Core's
+CheckSignatureEncoding reads last."
+  (%sf-cat #x30 #x44 #x02 #x20
+           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)
+           #x02 #x20 s hashtype))
 
 (defun %sf-p2sh-spend (redeem)
   "The (scriptSig scriptPubKey) list of a P2SH spend of REDEEM, the scriptSig
@@ -245,3 +265,70 @@ being the canonical single push Core requires."
     (is (equal '(nil :op-codeseparator) (%sf-verify (%sf-script "") unexecuted "CONST_SCRIPTCODE")))
     (is (equal '(t nil) (%sf-verify (%sf-script "") unexecuted "")))
     (is (equal '(t nil) (%sf-verify (%sf-script "") payload "CONST_SCRIPTCODE")))))
+
+;;;; --- CheckSignatureEncoding / CheckPubKeyEncoding order -----------------
+
+(test checksig-encoding-checks-run-in-cores-order
+  "EvalChecksigPreTapscript runs CheckSignatureEncoding and only then
+CheckPubKeyEncoding, in one `if' before CheckECDSASignature
+(interpreter.cpp:336-339). Each is itself ordered: the signature check is
+DER (SIG_DER), then LOW_S (SIG_HIGH_S), then the hashtype byte
+(SIG_HASHTYPE) (:202-216); the pubkey check is STRICTENC (PUBKEYTYPE), then
+WITNESS_PUBKEYTYPE (:218-227).
+
+Every vector here fails at least two of those arms, so the assertion is about
+which one answers. Both CHECKSIG paths had the low-S rejection AFTER the
+verify -- and so after the pubkey arms -- and the witness path ran
+WITNESS_PUBKEYTYPE before STRICTENC, the reverse of Core."
+  (let* ((low-s (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (high-s (let ((a (make-array 32 :element-type '(unsigned-byte 8)
+                                         :initial-element #xff)))
+                   (setf (aref a 0) #x7f)  ; above n/2, still a positive DER integer
+                   a))
+         (sig-low (%sf-der-sig low-s #x01))
+         (sig-high (%sf-der-sig high-s #x01))
+         (sig-high-bad-hashtype (%sf-der-sig high-s #x05))
+         (sig-low-bad-hashtype (%sf-der-sig low-s #x05))
+         (empty (make-array 0 :element-type '(unsigned-byte 8)))
+         ;; Ten bytes: neither a compressed nor an uncompressed encoding.
+         (bad-key (%sf-script "07070707070707070707"))
+         (uncompressed (%sf-cat #x04 (make-array 64 :element-type '(unsigned-byte 8)
+                                                    :initial-element 3)))
+         (compressed (%sf-script +sf-pubkey-hex+)))
+    ;; Legacy: LOW_S answers before the pubkey is looked at.
+    (is (equal '(nil :sig-high-s)
+               (%sf-checksig "DERSIG,STRICTENC,LOW_S" sig-high empty bad-key)))
+    ;; ... and before the hashtype byte, which is the arm after it.
+    (is (equal '(nil :sig-high-s)
+               (%sf-checksig "DERSIG,STRICTENC,LOW_S" sig-high-bad-hashtype empty
+                             compressed)))
+    ;; Controls: with a low S the later arms answer, in their own order.
+    (is (equal '(nil :sig-hashtype)
+               (%sf-checksig "DERSIG,STRICTENC,LOW_S" sig-low-bad-hashtype empty
+                             bad-key)))
+    (is (equal '(nil :pubkeytype)
+               (%sf-checksig "DERSIG,STRICTENC,LOW_S" sig-low empty bad-key)))
+    ;; And an empty signature still reaches the pubkey arms (CheckSignatureEncoding
+    ;; passes it, interpreter.cpp:186-188).
+    (is (equal '(nil :pubkeytype) (%sf-checksig "STRICTENC" empty empty bad-key)))
+    ;; Witness v0, through the P2WPKH program the interpreter builds: same
+    ;; order, and LOW_S again answers before the hashtype byte.
+    (is (equal '(nil :sig-high-s)
+               (%sf-p2wpkh "DERSIG,STRICTENC,LOW_S,WITNESS_PUBKEYTYPE"
+                           sig-high-bad-hashtype compressed)))
+    ;; Control: the same vector with a low S is SIG_HASHTYPE, so that arm is live.
+    (is (equal '(nil :sig-hashtype)
+               (%sf-p2wpkh "DERSIG,STRICTENC,LOW_S,WITNESS_PUBKEYTYPE"
+                           sig-low-bad-hashtype compressed)))
+    ;; Control: an uncompressed key is still refused for a witness v0 spend --
+    ;; the WITNESS_PUBKEYTYPE arm fires, now from inside the CHECKSIG.
+    (is (equal '(nil :witness-pubkeytype)
+               (%sf-p2wpkh "DERSIG,STRICTENC,WITNESS_PUBKEYTYPE" sig-low
+                           uncompressed)))
+    ;; The STRICTENC arm precedes the WITNESS_PUBKEYTYPE one: a key that is
+    ;; neither encoding is PUBKEYTYPE, not WITNESS_PUBKEYTYPE -- which is only
+    ;; visible now that the P2WPKH path decides the pubkey encoding inside the
+    ;; CHECKSIG, where Core decides it, instead of ahead of the program match.
+    (is (equal '(nil :pubkeytype)
+               (%sf-p2wpkh "DERSIG,STRICTENC,LOW_S,WITNESS_PUBKEYTYPE" sig-low
+                           bad-key)))))
