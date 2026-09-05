@@ -1,0 +1,91 @@
+{
+  "dimension": "descriptors",
+  "findings": [
+    {
+      "id": "232c293f",
+      "title": "parse-descriptor rejects every BIP389 multipath descriptor, so getdescriptorinfo/scantxoutset/descriptorprocesspsbt refuse what Core accepts",
+      "severity": "S2",
+      "our_ref": "src/rpc/descriptors.lisp:211",
+      "core_ref": "refs/bitcoin/src/script/descriptor.cpp:1789",
+      "core_does": "ParseKeyPath expands a `<a;b;...>` path element inside the key expression and Parse() returns a VECTOR of descriptors. getdescriptorinfo returns descs.at(0) plus a `multipath_expansion` array (rpc/output_script.cpp:207-213); deriveaddresses returns one address array per expansion (rpc/output_script.cpp:330-339); every other descriptor consumer parses the expansions normally.",
+      "we_do": "%parse-key-path signals `Multipath descriptors are not supported` for ANY `<...>` element, and parse-descriptor -- the entry point for getdescriptorinfo, scantxoutset (descriptor-scanobject-scripts), descriptorprocesspsbt, generatetodescriptor/generateblock (parse-output-descriptor) and the wallet's descriptor reload -- never calls the string-level expander. Only importdescriptors (src/wallet/wallet.lisp:2173) and deriveaddresses (src/rpc/descriptors.lisp:2098) go through expand-multipath-descriptor first. getdescriptorinfo therefore has no `multipath_expansion` field at all.",
+      "impact": "getdescriptorinfo -- Core's documented way to validate and canonicalise a descriptor before importing it -- answers RPC -5 `Multipath descriptors are not supported` for a descriptor that is valid, that Core accepts, and that our own deriveaddresses/importdescriptors accept. An operator or a wallet tool reading that answer concludes the descriptor is malformed. scantxoutset and descriptorprocesspsbt cannot be pointed at a BIP389 descriptor at all.",
+      "executed": "Ran all 30 multipath descriptor strings extracted from refs/bitcoin/src/test/descriptor_tests.cpp through (bitcoin-lisp.rpc::parse-descriptor s :mainnet): 30/30 rejected, every one with a `Multipath descriptors are not supported` message. Then through bl.rpc:dispatch-rpc-method on a make-test-node :mainnet: getdescriptorinfo on `wpkh(xpub661MyMwAqRbcFW31...duB/<0;1>/*)` returned `RPC Error -5: wpkh(): Multipath descriptors are not supported`, while deriveaddresses on the checksummed form of the SAME string returned #(#(\"bc1q7ypnz7ulpd6c5ckt8pujs8fruwcaawgdgg7luh\" \"bc1qa8yzpa070ejy9t8qgql39murz5vchd8zdwynde\") #(\"bc1qqsv3jr2zd0fe86j750adqn2ue5eknyqlp78tft\" \"bc1qh3hmem74gsc7zkhgv0d9ywc4a9tgfhx3z4k7z3\")).",
+      "confidence": "executed",
+      "note": "tests/wallet/descriptor-tests.lisp:223 (desc-core-multipath-rejected) asserts the current rejection as intended `P0 scope`; a fix has to change that test too."
+    },
+    {
+      "id": "c9da9f50",
+      "title": "expand-multipath-descriptor refuses a multipath specifier in more than one key expression, which Core supports",
+      "severity": "S2",
+      "our_ref": "src/rpc/descriptors.lisp:1023",
+      "core_ref": "refs/bitcoin/src/script/descriptor.cpp:2375",
+      "core_does": "The `Multiple multipath key path specifiers found` error is raised per KEY EXPRESSION (descriptor.cpp:1809, inside ParseKeyPath), not per descriptor. ParseScript collects one provider vector per key, takes max_providers_len, clones length-1 vectors, and only errors when two vectors have different non-1 lengths (`multi(): Multipath derivation paths have mismatched lengths`, descriptor.cpp:2382). descriptor_tests.cpp:748 checks `multi(2,xprv.../<1;2>/*,xprv.../<3;4>/0/*)` as VALID, and :803 checks a three-key sh(multi(...)) with two different specifiers.",
+      "we_do": "expand-multipath-descriptor works on the raw STRING: it takes the first `<...>` group and then signals `Multiple multipath key path specifiers found` if any further `<` appears anywhere in the body.",
+      "impact": "The n-of-m cosigner export -- `wsh(sortedmulti(2,[origin]xpubA/<0;1>/*,[origin]xpubB/<0;1>/*))`, which is what Sparrow, Core itself, BDK and Ledger Live write -- cannot be imported at all. importdescriptors and deriveaddresses reject it before any key is looked at.",
+      "executed": "Ran the same 30 Core multipath vectors through (expand-multipath-descriptor s) followed by parse-descriptor on each expansion: 18 OK, 12 rejected, every one of the 12 with `Multiple multipath key path specifiers found`. A hand-built `wsh(multi(2,xpubA/<0;1>/*,xpubB/<0;1>/*))` gave the same error, and deriveaddresses on its checksummed form returned `RPC Error -5: Multiple multipath key path specifiers found`.",
+      "confidence": "executed"
+    },
+    {
+      "id": "f29c6fe6",
+      "title": "%desc-key-pubkey-at-cached has no musig() branch: the wallet Expand path type-errors on every musig descriptor",
+      "severity": "S2",
+      "our_ref": "src/rpc/descriptors.lisp:1687",
+      "core_ref": "refs/bitcoin/src/script/descriptor.cpp:597",
+      "core_does": "MuSigPubkeyProvider is a PubkeyProvider like any other, so DescriptorImpl::Expand / ExpandFromCache derive through it with or without a cache; wallet/scriptpubkeyman.cpp handles musig SPKMs (m_musig2_secnonces) and test/functional/wallet_musig.py imports musig descriptors into a wallet.",
+      "we_do": "%desc-key-pubkey-at (the plain RPC path, descriptors.lisp:564) dispatches to %musig-key-pubkey-at when desc-key-musig-participants is set. %desc-key-pubkey-at-cached -- the wallet/DescriptorCache path used by out-desc-expand-from-cache and out-desc-expand-with-provider -- has no such branch, so a musig key falls into the BIP32 arm with a NIL extkey and reaches (ext-key-public-bytes NIL).",
+      "impact": "Every wallet consumer of a musig() descriptor fails: importdescriptors, the key-pool top-up (src/wallet/wallet.lisp:516-522), spkm-is-mine, and descriptorprocesspsbt (src/wallet/psbt.lisp:1574). The failure surfaces as `Cannot expand descriptor. Probably because of hardened derivations without private keys provided`, which names the wrong cause -- the descriptor has no hardened step and needs no private key.",
+      "executed": "(out-desc-expand desc 0) on `tr(musig(xpub...EL,xpub...m4Y))` returned the correct script 5120318261efd4aa8cdb4c35795bcdd10ce32324406b1675e828a4ad10bb9a52d00e, while (out-desc-expand-with-provider desc 0 nil (make-descriptor-cache)) on the same object signalled TYPE-ERROR \"The value NIL is not of type BITCOIN-LISP.CRYPTO:EXT-KEY\". End to end: rpc-importdescriptors of `tr(musig(tpub...ZX7efhZ,tpub...b7kMU4)/0/*)#tr3fj9gj` into a regtest wallet returned success=false, code -4, \"Cannot expand descriptor. Probably because of hardened derivations without private keys provided\".",
+      "confidence": "executed"
+    },
+    {
+      "id": "95cd2402",
+      "title": "compute-input-signatures has no TxoutType::PUBKEY case: bare P2PK coins are is-mine and sized but unsignable",
+      "severity": "S2",
+      "our_ref": "src/rpc/rawtransaction.lisp:599",
+      "core_ref": "refs/bitcoin/src/script/sign.cpp:643",
+      "core_does": "SignStep's first case is TxoutType::PUBKEY: CreateSig over vSolutions[0] and push the signature. Bare P2PK is signable by signrawtransactionwithkey, signrawtransactionwithwallet, the wallet spend path and the PSBT signer.",
+      "we_do": "compute-input-signatures dispatches on script-type-name and handles pubkeyhash, witness_v0_keyhash, witness_v1_taproot, scripthash, witness_v0_scripthash and bare multisig. \"pubkey\" is absent, so it reaches the final clause and fails with `unsupported scriptPubKey type pubkey`. Meanwhile %script-sat-weight (src/wallet/wallet-spend.lisp:505) DOES size a :pubkey input, and the combo() expansion (src/rpc/descriptors.lisp:1495) makes the P2PK script one of the SPKM's own scripts.",
+      "impact": "A wallet that imported combo(...) or pk(...) -- combo() is Core's standard legacy-wallet migration shape -- owns the bare-P2PK script, counts its coins in the balance and lets coin selection pick them, but can never produce a signature for them. The transaction comes back complete=false. signrawtransactionwithkey cannot sign a P2PK input even when handed the exact WIF.",
+      "executed": "signrawtransactionwithkey over a 1-input tx spending a bare P2PK output of the pubkey of L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1 returned complete=false with errors [{\"error\":\"Input 0: unsupported scriptPubKey type pubkey\"}]; the identical call against the P2PKH of the SAME key returned complete=true with a full scriptSig. Separately, rpc-importdescriptors of `combo(tprv8ZgxMBicQKsPebzMPGYA1uZ.../0/*)` into a regtest wallet succeeded and %wallet-owning-spkm answered non-NIL for all four expanded scripts, the :PUBKEY one included.",
+      "confidence": "executed"
+    },
+    {
+      "id": "bfcaa33f",
+      "title": "%match-multisig accepts only OP_1..OP_16 for m and n; Core's GetScriptNumber accepts a minimal push up to 20",
+      "severity": "S3",
+      "our_ref": "src/validation/solver.lisp:120",
+      "core_ref": "refs/bitcoin/src/script/solver.cpp:82",
+      "core_does": "MatchMultisig reads both numbers with GetScriptNumber(opcode, data, min, MAX_PUBKEYS_PER_MULTISIG), which accepts OP_1..OP_16 OR a minimally-encoded data push checked with CheckMinimalPush, so 17..20 (which have no OP_n) classify as TxoutType::MULTISIG. Solver returns MULTISIG, and AreInputsStandard (policy.cpp) only rejects NONSTANDARD and WITNESS_UNKNOWN prevout types.",
+      "we_do": "%match-multisig requires (<= #x51 (aref script 0) #x60) and the same for script[len-2], so any bare multisig whose m or n is 17..20 classifies as :nonstandard.",
+      "impact": "are-inputs-standard-p (src/validation/transaction.lisp:633) refuses to relay a transaction spending a bare 17..20-key multisig output that Core relays -- a policy divergence, not a consensus one, since such an output is non-standard to CREATE and can only reach the chain through a miner. decodescript / getblock verbosity 2 / gettxout also report type \"nonstandard\" where Core reports \"multisig\".",
+      "executed": "Built OP_1 <17 x 33-byte pubkey pushes> <push 0x11> OP_CHECKMULTISIG (582 bytes) and called (bl.val:classify-script s): returned :NONSTANDARD with script-type-name \"nonstandard\", i.e. exactly the pair are-inputs-standard-p rejects. Core's MatchMultisig accepts it by inspection of solver.cpp:82-102 (GetScriptNumber -> IsPushdataOp(0x01) + CheckMinimalPush({0x11},0x01) -> CScriptNum 17, in [1,20]); I did not run Core's binary.",
+      "confidence": "executed"
+    },
+    {
+      "id": "8f138c13",
+      "title": "scriptpubkey-desc never infers pk()/multi()/rawtr(); the RPC desc field says raw()/addr() where Core does not",
+      "severity": "S3",
+      "our_ref": "src/rpc/descriptors.lisp:2047",
+      "core_ref": "refs/bitcoin/src/script/descriptor.cpp:2691",
+      "core_does": "InferScript, called with DUMMY_SIGNING_PROVIDER from core_io.cpp:415 (ScriptPubKeyToUniv's `desc` field), returns pk(<hex>) for TxoutType::PUBKEY, multi(k,<hex>,...) for TxoutType::MULTISIG, and rawtr(<xonly>) for a WITNESS_V1_TAPROOT output with no spend data, and only falls back to addr()/raw() after all typed inferences fail. descriptor_tests.cpp:1157 pins `4104032540df...ac` -> `pk(04032540df...5220)`.",
+      "we_do": "scriptpubkey-desc asks script->address and emits addr(<address>) when there is one, raw(<hex>) otherwise -- so P2PK and bare multisig become raw(), and a taproot output becomes addr(bc1p...).",
+      "impact": "The `desc` field of gettxout, scantxoutset, getblock verbosity 2/3 and /rest/getutxos differs from Core for P2PK, bare multisig and every taproot output. A tool that round-trips that field into importdescriptors still gets a watch-only descriptor with the same script, so no funds effect -- but it loses the key/threshold Core reports.",
+      "executed": "(bl.rpc::scriptpubkey-desc s :mainnet) on Core's own vector script 4104032540df...ac returned \"raw(4104032540df...ac)#g847z7yx\" where descriptor_tests.cpp:1157 expects pk(04032540df...5220); on 5120a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c it returned \"addr(bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr)\" where Core returns rawtr(a60869f0...); on 5121...52ae it returned raw(...) where Core returns multi(1,...). The P2PKH control matched Core's addr(17P7ge56F2QcdHxxRBa2NyzmejFggPwBJ9) exactly (descriptor_tests.cpp:1151).",
+      "confidence": "executed"
+    },
+    {
+      "id": "42a8a239",
+      "title": "%collect-multisig-sig-pairs stops at the threshold, so a PSBT records at most m partial signatures",
+      "severity": "S3",
+      "our_ref": "src/rpc/rawtransaction.lisp:295",
+      "core_ref": "refs/bitcoin/src/script/sign.cpp:670",
+      "core_does": "SignStep's MULTISIG case calls CreateSig for EVERY key in vSolutions and caps only what it pushes onto the stack at required+1, with the comment 'We need to always call CreateSig in order to fill sigdata with all possible signatures that we can create. This will allow further PSBT processing to work as it needs all possible signature and pubkey pairs.'",
+      "we_do": "%collect-multisig-sig-pairs increments a counter and stops producing pairs once it has m of them, and the same function feeds both the in-place finalizer and the PSBT signer (src/wallet/psbt.lisp:1321).",
+      "impact": "walletprocesspsbt / descriptorprocesspsbt on an m-of-n input where the signer holds more than m keys writes only m PSBT_IN_PARTIAL_SIG records where Core writes one per held key. Finalization still succeeds, so this only bites a workflow that combines PSBTs and wants a specific cosigner's signature present, or that later drops one signature.",
+      "executed": "(%collect-multisig-sig-pairs sighash pubmap pubs m 1) with three held keys returned 1 pair for m=1 and 2 pairs for m=2, confirming the cap; Core's behaviour is read from sign.cpp:670-688, not run.",
+      "confidence": "executed"
+    }
+  ],
+  "coverage_note": "READ side by side: refs/bitcoin/src/script/descriptor.cpp (Parse/ParsePubkey/ParsePubkeyInner/ParseKeyPath/ParseDeriveType/ParseScript/BIP32PubkeyProvider::GetPubKey/MuSigPubkeyProvider/InferScript/InferPubkey/InferXOnlyPubkey), script/solver.cpp in full, script/sign.cpp SignStep + CreateSig + the taproot arm, rpc/util.cpp ParseRange/ParseDescriptorRange/EvalDescriptorStringOrObject, rpc/output_script.cpp getdescriptorinfo/deriveaddresses, core_io.cpp:415; ours: src/rpc/descriptors.lisp in full, src/validation/solver.lisp in full, src/crypto/address.lisp, src/crypto/bip32.lisp, src/rpc/rawtransaction.lisp:280-600 (compute-input-signatures and its helpers), src/wallet/wallet-spend.lisp:395-620 + 1719-1900, src/wallet/psbt.lisp outline + the signer half, src/wallet/wallet-coins.lisp:128-190, src/validation/transaction.lisp:620-730. RAN, in the project container (warm image, bitcoin-lisp + bitcoin-lisp/tests loaded): (1) all 94 CheckUnparsable descriptor strings from refs/bitcoin/src/test/descriptor_tests.cpp through parse-descriptor -- 94/94 correctly rejected, zero wrongly accepted; (2) a 234-string positive corpus of every descriptor-shaped literal in the same file -- the ONLY rejections were the 30 multipath vectors plus two extraction artifacts (a Core CheckUnparsable rawtr two-key case we reject with Core's own message, and a strprintf template containing %u); (3) a 51-string public-form round-trip (parse -> out-desc-string) -- every mismatch was an uncompressed-WIF input printing as its pubkey, which is Core's behaviour; (4) the 30 multipath vectors through expand-multipath-descriptor (18 ok / 12 rejected); (5) getdescriptorinfo and deriveaddresses through bl.rpc:dispatch-rpc-method; (6) importdescriptors of a musig() and of a combo() descriptor into a regtest wallet via with-wallet-chain-node; (7) signrawtransactionwithkey on a P2PK input with a P2PKH control; (8) classify-script on a 1-of-17 bare multisig; (9) scriptpubkey-desc on four scripts. NOT COVERED, and who inherits it: miniscript parsing, satisfaction and FromScript (dimension 2, miniscript) -- I only checked that a tr()/wsh() body falls through to it and that %check-miniscript-sane exists; the wallet's descriptor RECORDS, SPKM persistence and the 62 wallet RPCs beyond importdescriptors (dimension 5); PSBT record serialization, the combiner/finalizer/analyzer roles and the taproot PSBT fields (dimension 5 and the serialization dimension); core_io.cpp's other fields and rpc/util.cpp's other helpers (dimension 8); Core's Check() expected scriptPubKey hex vectors were NOT re-run as a differential -- tests/wallet/descriptor-tests.lisp already pins many of them and I relied on that rather than duplicating it; key_io.cpp is already covered by tests/crypto/bitcoin-core-key-io-tests.lisp against key_io_valid/invalid.json and I did not re-run it; TaprootBuilder/GetTaprootSpendData and the taproot script-path signing order were read but not differentially executed; no BIP32 test-vector run (the code was read and matches, incl. the depth-0 vector-5 rejections). One harness trap, not a code defect: a descriptor containing a non-ASCII byte passed literally on the scripts/dev.sh eval command line HARD-HANGS the eval client (rc 4); the same string built with (code-char 220) inside the form is rejected correctly with Core's `Invalid characters in payload`."
+}
