@@ -268,11 +268,16 @@ whatever the cadence is."
            ("addr_rate_limited" . ,(bl.net:peer-addr-rate-limited peer))
            ;; The -whitelist / -whitebind permissions this peer holds (Core
            ;; getpeerinfo "permissions", rpc/net.cpp). Was hardcoded empty.
+           ;; Core reports the stored m_permission_flags, so this must ask the
+           ;; same question the enforcement sites ask -- onion-ness included,
+           ;; or an inbound onion peer is REPORTED holding a loopback range's
+           ;; grant that nothing will honour.
            ("permissions"
             . ,(let ((names (bl.net:permission-flag-names
                              (bl.net:peer-permission-flags
                               (bl.net:peer-address peer)
-                              (bl.net:peer-inbound peer)))))
+                              (bl.net:peer-inbound peer)
+                              (bl.net:peer-inbound-onion peer)))))
                  (if names (coerce names 'vector) #())))
            ;; BIP133: the peer's advertised fee floor, sat/kvB -> BTC/kvB.
            ("minfeefilter" . ,(/ (bl.net:peer-feefilter-rate peer)
