@@ -886,17 +886,52 @@ txgraph.cpp:2783-2808). The graph must not be oversized."
 ;;;; candidate's parents' clusters (the candidate depends solely on its direct
 ;;;; parents) plus removal-split remnants.
 
-(defun %cluster-reduced-edges (cluster)
-  "The transitive-reduction parent edges of CLUSTER as a list of
-\(parent-handle . child-handle) conses. Re-adding these to a fresh graph
-reconstructs CLUSTER's exact dependency closure."
-  (let ((dg (%cluster-depgraph cluster))
-        (mapping (%cluster-mapping cluster))
-        (edges '()))
-    (do-bits (i (depgraph-positions dg))
-      (do-bits (p (depgraph-reduced-parents dg i))
-        (push (cons (aref mapping p) (aref mapping i)) edges)))
-    edges))
+(defun %stage-cluster-copy (graph cluster removed copy)
+  "Install a copy of CLUSTER in GRAPH leaving out the transactions in the
+REMOVED handle set, and record live-handle -> staged-handle in COPY.
+
+Core's Cluster::CopyToStaging (txgraph.cpp:1221-1237) assigns m_depgraph,
+m_mapping and m_linearization into a fresh cluster wholesale and calls Updated
+once; this is that copy fused with the removal Core then applies to it. The
+copied depgraph carries the ancestor/descendant CLOSURES across intact and
+DEPGRAPH-REMOVE-TRANSACTIONS only masks the removed positions out of them, so
+a survivor bridged by a removed transaction keeps its grandparents exactly as
+the live cluster had them. %SPLIT-CLUSTER then relinearizes the copy once - or
+once per component, when the removal disconnected it.
+
+Core also copies m_linearization because its staged Relinearize is budgeted
+and seeds from the previous order; ours takes no seed (see LINEARIZE's
+OLD-LINEARIZATION note) and runs to optimality, so copying it would be dead.
+Staged handles carry no payload: the scratch graph orders ties by handle id,
+which is the one fallback order that needs none - the candidate added on top
+has no payload to give."
+  (let* ((src-dg (%cluster-depgraph cluster))
+         (src-mapping (%cluster-mapping cluster))
+         (dg (%copy-depgraph src-dg))
+         (del 0))
+    (do-bits (i (depgraph-positions src-dg))
+      (when (gethash (aref src-mapping i) removed)
+        (setf del (logior del (ash 1 i)))))
+    (unless (zerop del)
+      (depgraph-remove-transactions dg del))
+    (let ((live (depgraph-positions dg)))
+      (unless (zerop live)
+        (let ((new (%graph-new-cluster graph))
+              (mapping (make-array (length src-mapping) :initial-element nil)))
+          (do-bits (i live)
+            (let ((h (%make-tx-handle graph (txgraph-next-id graph) nil)))
+              (incf (txgraph-next-id graph))
+              (incf (txgraph-tx-count graph))
+              (setf (tx-handle-cluster h) new
+                    (tx-handle-pos h) i
+                    (aref mapping i) h
+                    (gethash (aref src-mapping i) copy) h)))
+          (setf (%cluster-depgraph new) dg
+                (%cluster-mapping new) mapping)
+          ;; No transaction can be individually oversized here: the source
+          ;; graph is not oversized, and a copy only ever loses members.
+          (%split-cluster graph new)))))
+  (values))
 
 (defun %cluster-set-diagram (cluster-set)
   "The feerate diagram of a set of clusters (CLUSTER-SET is a %CLUSTER -> T
@@ -926,26 +961,12 @@ parents of the FIRST chain member."
                                :max-cluster-size (txgraph-max-cluster-size graph)))
         (copy (make-hash-table :test 'eq)))   ; live handle -> scratch handle
     (dolist (h removed-handles) (setf (gethash h removed) t))
-    ;; New diagram: rebuild the surviving transactions of the affected clusters
-    ;; plus the candidate in a scratch graph, preserving every dependency among
-    ;; survivors (all edges are intra-cluster) and wiring the candidate to its
-    ;; parents. Add all survivor nodes before any edges so both endpoints exist.
+    ;; New diagram: COPY each affected cluster into the scratch graph minus the
+    ;; evicted transactions - one relinearization per affected cluster, Core's
+    ;; PullIn + CopyToStaging (txgraph.cpp:1693-1706) - then wire the candidate
+    ;; chain to the staged copies of its in-graph parents.
     (loop for c being the hash-keys of affected
-          do (let ((dg (%cluster-depgraph c))
-                   (mapping (%cluster-mapping c)))
-               (do-bits (i (depgraph-positions dg))
-                 (let ((h (aref mapping i)))
-                   (unless (gethash h removed)
-                     (let ((ff (depgraph-tx-feerate dg i)))
-                       (setf (gethash h copy)
-                             (txgraph-add-transaction
-                              scratch (feefrac-fee ff) (feefrac-size ff)))))))))
-    (loop for c being the hash-keys of affected
-          do (dolist (edge (%cluster-reduced-edges c))
-               (let ((p (gethash (car edge) copy))
-                     (ch (gethash (cdr edge) copy)))
-                 (when (and p ch)
-                   (txgraph-add-dependency scratch p ch)))))
+          do (%stage-cluster-copy scratch c removed copy))
     (let ((prev nil))
       (dolist (spec new-chain)
         (let ((cand (txgraph-add-transaction scratch (car spec) (cdr spec))))
