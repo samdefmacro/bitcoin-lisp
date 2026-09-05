@@ -116,24 +116,25 @@ the reason."
                 out))))
     (nreverse out)))
 
-(defun %rename-path (from to)
+(defun rename-path (from to)
   "Move FROM to TO, file or directory, and VERIFY it arrived.
 
 rename(2) rather than CL's RENAME-FILE, which merges the target with the source
 pathname — a surprise that has already produced one silently successful no-op
 in this project (backupwallet reported success and wrote nothing). uiop's
-rename-file-overwriting-target refuses a directory outright, and half of what
-moves here is a directory.
+rename-file-overwriting-target refuses a directory outright, and both callers
+here move a directory (the datadir migration below, and the wallet database
+rewrite that swaps a rebuilt directory into place).
 
-The verification is not ceremony: a migration that reports success and moved
+The verification is not ceremony: a move that reports success and moved
 nothing is exactly the failure this comment is about."
   (ensure-directories-exist (uiop:pathname-parent-directory-pathname
                              (uiop:ensure-directory-pathname to)))
   (sb-posix:rename (%rename-namestring from) (%rename-namestring to))
   (unless (probe-file to)
-    (storage-error "datadir migration: ~A did not arrive at ~A" from to))
+    (storage-error "rename: ~A did not arrive at ~A" from to))
   (when (probe-file from)
-    (storage-error "datadir migration: ~A still exists after moving to ~A" from to))
+    (storage-error "rename: ~A still exists after moving to ~A" from to))
   to)
 
 (defun %rename-namestring (path)
@@ -162,7 +163,7 @@ handle, and the caller is responsible for that."
              (when (and (probe-file from) (not (probe-file to)))
                (push (list label from to) moves)
                (unless dry-run
-                 (%rename-path from to)))))
+                 (rename-path from to)))))
       ;; blocks/index/headerindex.dat
       (let ((legacy (merge-pathnames "headerindex.dat" data-dir)))
         (when (probe-file legacy)

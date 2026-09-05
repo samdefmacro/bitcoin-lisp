@@ -403,11 +403,22 @@ reopen (a reindex, a restart of the filter backfill) leaks its whole cache."
       (leveldb-destroy-options opts))))
 
 (defun leveldb-compact (db)
-  "Fully compact DB's entire keyspace: leveldb CompactRange(NULL, NULL), which
-merges every level and physically drops deleted/overwritten keys, reclaiming the
-disk that tombstones still pin after a large deletion churn (e.g. a
-reindex-chainstate wipe). Synchronous and potentially slow on a large database;
-does not signal (leveldb_compact_range has no error out-param)."
+  "Compact DB's keyspace: leveldb CompactRange(NULL, NULL), which merges the
+levels BELOW the topmost one that has files and physically drops the
+deleted/overwritten keys it rewrites, reclaiming the disk that tombstones still
+pin after a large deletion churn (e.g. a reindex-chainstate wipe). Synchronous
+and potentially slow on a large database; does not signal
+(leveldb_compact_range has no error out-param).
+
+⚠️ This is NOT an erasure primitive, whatever leveldb's own db.h:137-147 says.
+DBImpl::CompactRange reads max_level_with_files over levels >= 1 BEFORE it
+flushes the memtable, so on a database whose SSTs are all above that mark — a
+young one, where every record is still in the memtable — the flush is placed at
+kMaxMemCompactLevel by PickLevelForMemTableOutput and the loop then compacts
+only the empty levels beneath it. Measured on a fresh wallet: the plaintext a
+delete had tombstoned moved from the write-ahead log into a live .ldb and
+survived three more calls. Anything that must not remain on disk needs a
+rebuild into a new directory, not a compaction — see WALLET-DB-REWRITE."
   (%leveldb-compact-range db (cffi:null-pointer) 0 (cffi:null-pointer) 0))
 
 ;;;; Per-key operations. We create writeoptions/readoptions per call. A

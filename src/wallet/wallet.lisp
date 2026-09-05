@@ -338,6 +338,14 @@ directory.")
 (defun wallet-directory (manager name)
   (merge-pathnames (concatenate 'string name "/") (wallets-directory manager)))
 
+(defun wallet-path-for (manager name)
+  "WALLET-DIRECTORY of NAME, with any interrupted database rewrite finished
+first. Every path that asks whether NAME exists on disk goes through here: a
+WALLET-DB-REWRITE interrupted between its two renames leaves the wallet
+directory MISSING, so a caller reading the raw path would answer \"no such
+wallet\" -- or, worse, create an empty one over the rebuilt copy."
+  (wallet-recover-interrupted-rewrite (wallet-directory manager name)))
+
 (defun %valid-wallet-name-p (name)
   "Wallet names name a subdirectory of <datadir>/wallets/.
 
@@ -974,7 +982,7 @@ left LOCKED."
                                    "Wallet name cannot be empty"
                                    (format nil "Invalid wallet name ~S" name))))
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
-    (let ((path (wallet-directory manager name)))
+    (let ((path (wallet-path-for manager name)))
       (when (or (gethash name (wallet-manager-wallets manager))
                 (probe-file path))
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-already-exists+
@@ -1228,7 +1236,7 @@ RPC after registration, mirroring Core's LoadWallet -> AttachChain split."
     (unless (%valid-wallet-name-p name)
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-not-found+
                         :message (format nil "Wallet \"~A\" not found." name)))
-    (let ((path (wallet-directory manager name)))
+    (let ((path (wallet-path-for manager name)))
       (unless (wallet-db-exists-p path)
         (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-not-found+
                           :message (format nil "Wallet file verification failed. Failed to load database path '~A'. Path does not exist."
@@ -1291,7 +1299,11 @@ shutdown path — which flags the scan to abort and proceeds."
     (when (probe-file dir)
       (loop for sub in (uiop:subdirectories dir)
             for name = (first (last (pathname-directory sub)))
-            when (wallet-db-exists-p sub)
+            ;; A rewrite left half-done by a crash is scrap, not a wallet:
+            ;; offering it would let loadwallet open the copy that
+            ;; WALLET-RECOVER-INTERRUPTED-REWRITE is about to delete.
+            when (and (not (wallet-rewrite-directory-p name))
+                      (wallet-db-exists-p sub))
               collect name))))
 
 ;;; --- Persistent settings (Core settings.json) ---

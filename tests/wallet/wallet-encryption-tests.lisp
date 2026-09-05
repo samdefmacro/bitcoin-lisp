@@ -23,11 +23,19 @@
    node (list name nil nil passphrase))
   (gethash name (bl.wallet::wallet-manager-wallets (%node-manager node))))
 
+(defun %wenc-records (wallet)
+  "Every (key . value) pair in WALLET's open database."
+  (bl.wallet::wallet-db-records (bl.wallet::wallet-db wallet)))
+
+(defun %wenc-encrypt (node &optional (passphrase "hunter2"))
+  "encryptwallet through the shipped handler. Named once because every test in
+this file that needs an encrypted wallet goes through it."
+  (bl.wallet::rpc-encryptwallet node (list passphrase)))
+
 (defun %wenc-key-record-counts (wallet)
   "(values plaintext-key-records crypted-key-records mkey-records) on disk."
   (let ((plain 0) (crypted 0) (mkeys 0))
-    (dolist (record (bl.wallet::wallet-db-records
-                     (bl.wallet::wallet-db wallet)))
+    (dolist (record (%wenc-records wallet))
       (let ((type (bl.wallet::wdb-parse-key (car record))))
         (cond ((equal type bl.wallet::+wdb-key-walletdescriptorkey+)
                (incf plain))
@@ -45,6 +53,100 @@
              (incf crypted (hash-table-count
                             (bl.wallet::desc-spkm-crypted-keys spkm))))
     (values plain crypted)))
+
+;;; --- Byte-scanning the wallet directory (GA11 dd92141d) ---
+;;;
+;;; The record-level counters above cannot see this bug: a LevelDB delete is a
+;;; tombstone, so "no plaintext key record" and "no plaintext key bytes on
+;;; disk" are different claims, and only the second one is what Core's
+;;; database Rewrite buys. These read the FILES.
+
+(defun %wenc-wallet-files (wallet)
+  (uiop:directory-files
+   (uiop:ensure-directory-pathname (bl.wallet::wallet-path wallet))))
+
+(defun %wenc-file-bytes (path)
+  (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+    (let ((bytes (make-array (file-length in) :element-type '(unsigned-byte 8))))
+      (read-sequence bytes in)
+      bytes)))
+
+(defun %wenc-directory-hits (wallet needle)
+  "((file-name . offset) ...) for every file in WALLET's directory that
+contains NEEDLE. NIL means the bytes are nowhere in the wallet."
+  (loop for file in (%wenc-wallet-files wallet)
+        for at = (search needle (%wenc-file-bytes file))
+        when at collect (cons (file-namestring file) at)))
+
+(defun %wenc-file-types (wallet)
+  (mapcar #'pathname-type (%wenc-wallet-files wallet)))
+
+(defun %wenc-master-secret (wallet)
+  "The 32 plaintext private key bytes of the first walletdescriptorkey record.
+All eight of a fresh wallet's SPKMs store the SAME master key, so any one of
+them is the secret an attacker needs."
+  (dolist (record (%wenc-records wallet))
+    (multiple-value-bind (type fields) (bl.wallet::wdb-parse-key (car record))
+      (when (equal type bl.wallet::+wdb-key-walletdescriptorkey+)
+        (multiple-value-bind (id pubkey)
+            (bl.wallet::wdb-parse-descriptor-key-fields fields)
+          (declare (ignore id))
+          (return (bl.wallet::wdb-parse-descriptor-key-value
+                   (cdr record) pubkey)))))))
+
+(defun %wenc-latin1 (string)
+  (flexi-streams:string-to-octets string :external-format :latin-1))
+
+(defun %wenc-stored-descriptor-text (wallet)
+  "The descriptor string of the first walletdescriptor record -- text that
+BELONGS in the wallet directory, so a scan that cannot find it is broken."
+  (dolist (record (%wenc-records wallet))
+    (when (equal (bl.wallet::wdb-parse-key (car record))
+                 bl.wallet::+wdb-key-walletdescriptor+)
+      (return (%wenc-latin1
+               (bl.wallet::wdb-parse-descriptor-value (cdr record)))))))
+
+(defun %wenc-master-xprv-text (node)
+  "The base58 master xprv out of listdescriptors private=true. With the xpub
+the stored descriptor keeps, this is the whole spending key."
+  (let* ((reply (bl.wallet::rpc-listdescriptors node (list t)))
+         (desc (%aval "desc" (first (%aval "descriptors" reply))))
+         (at (search "prv" desc)))
+    (%wenc-latin1 (subseq desc (1- at) (position #\/ desc :start at)))))
+
+(defun %wenc-age-database (wallet records)
+  "Write RECORDS junk 2 KiB rows, which pushes the memtable out into real SST
+files. The finding's leak needs a database whose levels are still EMPTY, so
+this is the other side of that condition."
+  (dotimes (i records)
+    (bl.store:leveldb-put
+     (bl.wallet::wallet-db wallet)
+     (concatenate '(simple-array (unsigned-byte 8) (*))
+                  (vector 122 (ldb (byte 8 0) i) (ldb (byte 8 8) i))
+                  (make-array 29 :element-type '(unsigned-byte 8)
+                                 :initial-element 7))
+     (make-array 2048 :element-type '(unsigned-byte 8) :initial-element 9))))
+
+(defun %wenc-stage-interrupted-rewrite (path rewrite)
+  "Leave the wallet at PATH in WALLET-DB-REWRITE's crash window: REWRITE holds
+a complete rebuilt database plus the marker, PATH itself has been renamed into
+REWRITE/superseded/, and the second rename never happened. Built out of the
+same primitives the rewrite uses, since the point is the on-disk shape."
+  (let ((records (let ((db (bl.wallet::wallet-db-open path)))
+                   (unwind-protect (bl.wallet::wallet-db-records db)
+                     (bl.store:leveldb-close db)))))
+    (let ((db (bl.wallet::wallet-db-open rewrite :create t)))
+      (unwind-protect
+           (bl.store:with-leveldb-writebatch (batch)
+             (dolist (record records)
+               (bl.store:leveldb-writebatch-put batch (car record) (cdr record)))
+             (bl.store:leveldb-write db batch :sync t))
+        (bl.store:leveldb-close db)))
+    (with-open-file (out (bl.wallet::%wallet-rewrite-marker-path rewrite)
+                         :direction :output :if-exists :supersede
+                         :if-does-not-exist :create)
+      (write-line "bitcoin-lisp wallet database rewrite" out))
+    (bl.kv:rename-path path (bl.wallet::%wallet-superseded-path rewrite))))
 
 ;;; ============================================================
 ;;; Crypter primitives — Bitcoin Core known-answer vectors
@@ -284,7 +386,7 @@ carries hash256(pubkey||der))."
 moves every key from plaintext to ciphertext records on disk AND in memory,
 and generates a fresh HD seed."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
         (is (not (bl.wallet::wallet-has-encryption-keys-p wallet)))
         (is (not (bl.wallet::wallet-is-locked-p wallet)))
@@ -293,7 +395,7 @@ and generates a fresh HD seed."
           (is (zerop crypted))
           (is (zerop mkeys)))
         (let ((spkms-before (hash-table-count (bl.wallet::wallet-spkms wallet)))
-              (result (bl.wallet::rpc-encryptwallet node '("hunter2"))))
+              (result (%wenc-encrypt node)))
           (is (equal "wallet encrypted; The keypool has been flushed and a new HD seed was generated. You need to make a new backup with the backupwallet RPC."
                      result))
           (is (bl.wallet::wallet-has-encryption-keys-p wallet))
@@ -314,9 +416,9 @@ and generates a fresh HD seed."
   "unlock proves the passphrase cryptographically; a wrong one leaves the
 wallet locked and the key material absent."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         (is (null (bl.wallet::unlock-wallet wallet "wrong")))
         (is (bl.wallet::wallet-is-locked-p wallet))
         (is (null (bl.wallet::wallet-unlocked-key wallet)))
@@ -330,7 +432,7 @@ wallet locked and the key material absent."
   "walletpassphrase unlocks and arms the relock; walletlock relocks;
 getwalletinfo reports unlocked_until per Core's three states."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
         ;; Never encrypted: the field is absent entirely, not null and not 0.
         (is (null (assoc "unlocked_until"
@@ -345,7 +447,7 @@ getwalletinfo reports unlocked_until per Core's three states."
         (is (= -15 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-walletpassphrasechange
                                 node '("a" "b"))))))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         ;; Encrypted and locked.
         (is (eql 0 (%aval "unlocked_until"
                           (bl.wallet::rpc-getwalletinfo node '()))))
@@ -374,9 +476,9 @@ unlock had expired while the master key was still decrypted and usable. A
 wallet reporting the opposite of its own state is worse than either behaviour
 on its own, and worse the longer the rescan runs."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         (is (null (bl.wallet::rpc-walletpassphrase node '("hunter2" 600))))
         ;; Force the deadline into the past, as a long rescan would.
         (setf (bl.wallet::wallet-relock-time wallet)
@@ -420,9 +522,9 @@ master key is still decrypted" until)
 (test wenc-walletpassphrase-argument-validation
   "walletpassphrase's validation order and error codes (encrypt.cpp:53-70)."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (%wenc-fresh-wallet node "w")
-      (bl.wallet::rpc-encryptwallet node '("hunter2"))
+      (%wenc-encrypt node)
       (is (= -8 (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-walletpassphrase node '(42 60))))))
       (is (= -8 (rpc-error-code-of
@@ -435,16 +537,16 @@ master key is still decrypted" until)
                  (lambda () (bl.wallet::rpc-walletpassphrase node '("" 60))))))
       ;; encryptwallet on an already-encrypted wallet.
       (is (= -15 (rpc-error-code-of
-                  (lambda () (bl.wallet::rpc-encryptwallet node '("x")))))))))
+                  (lambda () (%wenc-encrypt node "x"))))))))
 
 (test wenc-timeout-clamped-and-zero-relocks
   "The timeout is silently clamped to MAX_SLEEP_TIME, and timeout 0 means the
 deadline has already passed — the lazy check relocks on the next key access
 without any sweeper involvement."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         (bl.wallet::rpc-walletpassphrase node '("hunter2" 999999999999))
         (is (<= (bl.wallet::wallet-relock-time wallet)
                 (+ (bl.ser:get-unix-time)
@@ -462,9 +564,9 @@ without any sweeper involvement."
 descriptor key: the old passphrase stops working, the new one works, and the
 wallet still derives the same addresses."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
-        (bl.wallet::rpc-encryptwallet node '("old-pass"))
+        (%wenc-encrypt node "old-pass")
         (bl.wallet::rpc-walletpassphrase node '("old-pass" 600))
         (let ((address-before (bl.wallet::rpc-getnewaddress node '()))
               (crypted-before
@@ -489,9 +591,9 @@ Core's Lock() leaves nRelockTime alone (only walletlock zeroes it), and
 dropping it here would silently turn a 60-second unlock into a permanent
 one while getwalletinfo reported the wallet as locked."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
-        (bl.wallet::rpc-encryptwallet node '("old-pass"))
+        (%wenc-encrypt node "old-pass")
         (bl.wallet::rpc-walletpassphrase node '("old-pass" 600))
         (let ((relock-time (bl.wallet::wallet-relock-time wallet))
               (relock-deadline (bl.wallet::wallet-relock-deadline wallet)))
@@ -516,11 +618,11 @@ one while getwalletinfo reported the wallet as locked."
   "An empty passphrase is refused everywhere it could produce an unopenable
 or trivially-opened wallet."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (%wenc-fresh-wallet node "w")
       (is (= -8 (rpc-error-code-of
-                 (lambda () (bl.wallet::rpc-encryptwallet node '(""))))))
-      (bl.wallet::rpc-encryptwallet node '("hunter2"))
+                 (lambda () (%wenc-encrypt node "")))))
+      (%wenc-encrypt node)
       (is (= -8 (rpc-error-code-of
                  (lambda () (bl.wallet::rpc-walletpassphrasechange
                              node '("hunter2" "")))))))))
@@ -528,11 +630,10 @@ or trivially-opened wallet."
 (test wenc-disable-private-keys-cannot-encrypt
   "A watch-only wallet has nothing to encrypt (encrypt.cpp:253)."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "wo"))
+    (with-rpc-wallet ("wo")
       (bl.wallet::rpc-createwallet node '("wo" t))
       (is (= -16 (rpc-error-code-of
-                  (lambda () (bl.wallet::rpc-encryptwallet
-                              node '("hunter2")))))))))
+                  (lambda () (%wenc-encrypt node))))))))
 
 ;;; ============================================================
 ;;; Persistence
@@ -544,10 +645,10 @@ key and ciphertext records survive, and the original passphrase still opens
 it. This is the path that used to hard-refuse with 'not supported until
 wallet P6'."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let (address)
         (let ((wallet (%wenc-fresh-wallet node "w")))
-          (bl.wallet::rpc-encryptwallet node '("hunter2"))
+          (%wenc-encrypt node)
           (bl.wallet::rpc-walletpassphrase node '("hunter2" 600))
           (setf address (bl.wallet::rpc-getnewaddress node '()))
           (bl.wallet::unload-wallet (%node-manager node) wallet))
@@ -575,7 +676,7 @@ never held a plaintext key record — the seed is generated only after the
 master key exists. A LevelDB delete is only a tombstone, so this is the one
 path that gives a real erasure guarantee."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "born"))
+    (with-rpc-wallet ("born")
       (let ((wallet (%wenc-fresh-wallet node "born" :passphrase "hunter2")))
         (is (bl.wallet::wallet-has-encryption-keys-p wallet))
         (is (bl.wallet::wallet-is-locked-p wallet))
@@ -592,6 +693,136 @@ path that gives a real erasure guarantee."
         ;; It is a working wallet: it hands out addresses and unlocks.
         (is (stringp (bl.wallet::rpc-getnewaddress node '())))
         (is (bl.wallet::unlock-wallet wallet "hunter2"))))))
+
+(test wenc-encryptwallet-leaves-no-plaintext-key-bytes-on-disk
+  "GA11 dd92141d. Core ends EncryptWallet with GetDatabase().Rewrite() because
+otherwise the database keeps bits of the unencrypted private key in slack
+space (wallet/wallet.cpp:872-876; for SQLite the rewrite is VACUUM,
+wallet/sqlite.cpp:336-341). We called leveldb-compact instead, and that is not
+an erasure: on a wallet young enough that its records are still in the
+memtable, CompactRange flushes them to the TOP level and then compacts only
+the empty levels beneath, so the 32 plaintext master bytes moved out of the
+write-ahead log into a live .ldb and stayed there through further compactions.
+Record counts cannot see that -- the tombstoned rows are already invisible to
+the iterator -- so the assertion has to read the FILES."
+  (with-wallet-test-node (node)
+    (with-rpc-wallet ("w")
+      (let* ((wallet (%wenc-fresh-wallet node "w"))
+             (secret (%wenc-master-secret wallet))
+             (descriptor (%wenc-stored-descriptor-text wallet))
+             (xprv (%wenc-master-xprv-text node)))
+        (is (= 32 (length secret)))
+        ;; Before: the scan works, and the secret is in the write-ahead log.
+        (is-true (%wenc-directory-hits wallet secret))
+        (is-true (member "log" (%wenc-file-types wallet) :test #'equal))
+        (%wenc-encrypt node)
+        ;; The finding, in one line: no file in the wallet holds the master
+        ;; secret any more -- not an .ldb, not the log.
+        (is-false (%wenc-directory-hits wallet secret))
+        ;; The same key in its base58 form, which the xpub that legitimately
+        ;; stays in the stored descriptor would complete into a spending key.
+        (is-false (%wenc-directory-hits wallet xprv))
+        ;; Positive controls, so neither absence above can be an empty scan:
+        ;; text that BELONGS on disk is still found, and a log file is still
+        ;; among the files the scan read.
+        (is-true (%wenc-directory-hits wallet descriptor))
+        (is-true (member "log" (%wenc-file-types wallet) :test #'equal))))))
+
+(test wenc-encryptwallet-erases-the-plaintext-of-a-populated-database
+  "The same erasure once the wallet has been written to enough that its records
+have reached real SST files. That is the state in which the OLD compaction
+happened to erase the secret -- by accident, because the flush it triggers then
+has something to merge into -- so this case passed before the fix and is here
+to keep the rewrite from ever being narrowed back to the young-wallet case."
+  (with-wallet-test-node (node)
+    (with-rpc-wallet ("w")
+      (let* ((wallet (%wenc-fresh-wallet node "w"))
+             (secret (%wenc-master-secret wallet)))
+        (%wenc-age-database wallet 2000)
+        ;; The condition that makes this case different: the secret has been
+        ;; flushed out of the memtable into a live .ldb.
+        (is-true (member "ldb"
+                         (mapcar (lambda (hit) (pathname-type (car hit)))
+                                 (%wenc-directory-hits wallet secret))
+                         :test #'equal))
+        (%wenc-encrypt node)
+        (is-false (%wenc-directory-hits wallet secret))
+        ;; And it is still a working encrypted wallet.
+        (is (bl.wallet::wallet-is-locked-p wallet))
+        (is (bl.wallet::unlock-wallet wallet "hunter2"))))))
+
+(test wenc-rewrite-interrupted-between-its-renames-is-finished-at-load
+  "The rewrite swaps directories, so it has a crash window: between renaming
+the wallet into <name>.rewrite/superseded/ and renaming <name>.rewrite into
+its place, <name> does not exist. That window always leaves a COMPLETE
+database at <name>.rewrite, and LOAD-WALLET finishes the swap before it opens
+anything -- otherwise encryptwallet would have traded a disclosure bug for a
+lost wallet. listwalletdir must not offer the scratch directory meanwhile."
+  (with-wallet-test-node (node)
+    (with-rpc-wallet ("w")
+      (let* ((wallet (%wenc-fresh-wallet node "w"))
+             (address (bl.wallet::rpc-getnewaddress node '()))
+             (path (uiop:ensure-directory-pathname (bl.wallet::wallet-path wallet)))
+             (rewrite (bl.wallet::%wallet-rewrite-path path)))
+        (%wenc-encrypt node)
+        (%crash-close-wallet node "w")
+        (%wenc-stage-interrupted-rewrite path rewrite)
+        ;; The crash state: no wallet directory at all.
+        (is-false (bl.wallet::wallet-db-exists-p path))
+        (is-false (bl.wallet::list-wallet-dir (%node-manager node)))
+        (multiple-value-bind (reloaded warnings)
+            (bl.wallet::load-wallet (%node-manager node) "w")
+          (is (null warnings))
+          (is (bl.wallet::wallet-is-locked-p reloaded))
+          (is (bl.wallet::wallet-is-mine
+               reloaded (%address-script address :testnet4)))
+          (is (bl.wallet::unlock-wallet reloaded "hunter2")))
+        ;; Recovery leaves nothing behind: no scratch sibling, no parked
+        ;; predecessor holding the records, no marker.
+        (is-false (uiop:directory-exists-p rewrite))
+        (is-false (uiop:directory-exists-p (bl.wallet::%wallet-superseded-path path)))
+        (is-false (probe-file (bl.wallet::%wallet-rewrite-marker-path path)))
+        (is (equal '("w") (bl.wallet::list-wallet-dir (%node-manager node))))))))
+
+(test wenc-rewrite-refuses-a-sibling-directory-that-is-not-its-own
+  "The scratch directory is <name>.rewrite, a name an operator may legitimately
+have given a wallet. The marker file tells the two apart, and without it a
+rewrite would delete somebody's wallet: an unmarked sibling is refused instead,
+and the recovery pass leaves it alone.
+
+encryptwallet asks for the name BEFORE it writes anything, because its rewrite
+runs after the encryption batch has committed -- refusing there would leave a
+wallet that is encrypted, still holds its plaintext, and reports an error."
+  (with-wallet-test-node (node)
+    (with-rpc-wallet ("w")
+      (let* ((wallet (%wenc-fresh-wallet node "w"))
+             (path (uiop:ensure-directory-pathname (bl.wallet::wallet-path wallet)))
+             (rewrite (bl.wallet::%wallet-rewrite-path path)))
+        (ensure-directories-exist rewrite)
+        (with-open-file (out (merge-pathnames "not-ours" rewrite)
+                             :direction :output :if-does-not-exist :create)
+          (write-line "someone else's data" out))
+        (signals error (bl.wallet::wallet-db-rewrite (bl.wallet::wallet-db wallet)
+                                                     path))
+        ;; Refused, not deleted -- and the wallet is still open and usable.
+        (is-true (probe-file (merge-pathnames "not-ours" rewrite)))
+        (bl.wallet::wallet-recover-interrupted-rewrite path)
+        (is-true (probe-file (merge-pathnames "not-ours" rewrite)))
+        (is (stringp (bl.wallet::rpc-getnewaddress node '())))
+        ;; And encryptwallet refuses up front, leaving the wallet UNENCRYPTED
+        ;; rather than encrypted-and-failed.
+        (signals error (%wenc-encrypt node))
+        (is-false (bl.wallet::wallet-has-encryption-keys-p wallet))
+        (multiple-value-bind (plain crypted) (%wenc-key-record-counts wallet)
+          (is (= 8 plain))
+          (is (zerop crypted)))
+        ;; With the obstruction gone it encrypts normally, erasure and all.
+        (uiop:delete-directory-tree rewrite :validate t)
+        (let ((secret (%wenc-master-secret wallet)))
+          (is-true (%wenc-directory-hits wallet secret))
+          (%wenc-encrypt node)
+          (is (bl.wallet::wallet-has-encryption-keys-p wallet))
+          (is-false (%wenc-directory-hits wallet secret)))))))
 
 (test wenc-createwallet-passphrase-validation
   "createwallet's passphrase argument: an empty string warns instead of
@@ -612,7 +843,7 @@ encrypting, and a passphrase with private keys disabled is refused."
   "createwallet blank=true with a passphrase yields an encrypted wallet with
 no descriptors: it unlocks, but has no addresses to give."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "blank"))
+    (with-rpc-wallet ("blank")
       (bl.wallet::rpc-createwallet node '("blank" nil t "hunter2"))
       (let ((wallet (gethash "blank" (bl.wallet::wallet-manager-wallets
                                       (%node-manager node)))))
@@ -633,9 +864,9 @@ no descriptors: it unlocks, but has no addresses to give."
 correctly is file corruption. With more than one key, where some decrypt and
 some do not, Core reports it distinctly rather than as a bad passphrase."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         ;; Damage exactly one SPKM's stored ciphertext, in memory.
         (let ((spkm (loop for s being the hash-values of
                                         (bl.wallet::wallet-spkms wallet)
@@ -658,9 +889,9 @@ some do not, Core reports it distinctly rather than as a bad passphrase."
   "Two master-key records with the same id is a corrupt file, not something
 to silently pick a winner from."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         (is (= 1 (hash-table-count (bl.wallet::wallet-master-keys wallet))))
         ;; encrypt-wallet refuses to add a second master key at all.
         (is (null (bl.wallet::encrypt-wallet wallet "another")))))))
@@ -674,9 +905,9 @@ to silently pick a winner from."
 with Core's exact message when the wallet is locked, and stops doing so once
 it is unlocked."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         (is (bl.wallet::wallet-is-locked-p wallet))
         ;; listdescriptors true must ERROR, not quietly emit the public form.
         (is (= -13 (rpc-error-code-of
@@ -701,9 +932,9 @@ it is unlocked."
 descriptor expansion runs off the xpub and needs no private key. Getting
 this wrong would make an encrypted wallet unable to receive."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         (is (bl.wallet::wallet-is-locked-p wallet))
         (let ((external (bl.wallet::rpc-getnewaddress node '()))
               (change (bl.wallet::rpc-getrawchangeaddress node '())))
@@ -723,11 +954,11 @@ this wrong would make an encrypted wallet unable to receive."
   "signmessage needs the private key; while locked it must be -13, and after
 unlocking it must produce a signature again."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (%wenc-fresh-wallet node "w")
       (let ((address (bl.wallet::rpc-getnewaddress node '("" "legacy"))))
         (is (stringp (bl.wallet::rpc-signmessage node (list address "hi"))))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         ;; The pre-encryption address is still ours, but unsignable while locked.
         (is (= -13 (rpc-error-code-of
                     (lambda () (bl.wallet::rpc-signmessage
@@ -740,11 +971,11 @@ unlocking it must produce a signature again."
   "A key read back through the decryption path signs identically to the same
 key held in plaintext — the encryption round trip is lossless."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (%wenc-fresh-wallet node "w")
       (let* ((address (bl.wallet::rpc-getnewaddress node '("" "legacy")))
              (before (bl.wallet::rpc-signmessage node (list address "msg"))))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         (bl.wallet::rpc-walletpassphrase node '("hunter2" 600))
         ;; RFC6979 makes ECDSA deterministic, so the same key over the same
         ;; message gives byte-identical output.
@@ -768,7 +999,7 @@ through and the coins encrypted before the seed rotation are still spendable."
              (raw-tx (concatenate 'string "01000000" "01" (make-string 64 :initial-element #\0)
                                   "00000000" "00" "ffffffff"
                                   "01" "0000000000000000" "00" "00000000")))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         (is (bl.wallet::wallet-is-locked-p wallet))
         ;; The balance is still visible — only signing is blocked.
         (is (plusp (bl.wallet::rpc-getbalance node '())))
@@ -802,7 +1033,7 @@ parsed private descriptor would keep signing after encryptwallet — bypassing
 the lock entirely, but only until the next reload rebuilt it from the public
 string. wallet-add-descriptor re-parses the public form to close that."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "imp"))
+    (with-rpc-wallet ("imp")
       (bl.wallet::rpc-createwallet node '("imp" nil t))   ; blank
       (let ((wallet (gethash "imp" (bl.wallet::wallet-manager-wallets
                                     (%node-manager node))))
@@ -832,7 +1063,7 @@ string. wallet-add-descriptor re-parses the public form to close that."
                                     (bl.wallet::desc-spkm-desc spkm)))
                             provider)))))
           ;; Encrypt, lock — now nothing can produce the key.
-          (bl.wallet::rpc-encryptwallet node '("hunter2"))
+          (%wenc-encrypt node)
           (is (bl.wallet::wallet-is-locked-p wallet))
           (let ((provider (bl.wallet::spkm-privkey-provider wallet spkm)))
             (is (null (bl.rpc:desc-key-root-xprv
@@ -875,7 +1106,7 @@ success while leaving nothing behind."
            (gethash "r1" (bl.wallet::wallet-manager-wallets
                           (%node-manager node)))
            (%address-script
-            (let ((bl.wallet::*rpc-wallet-name* "r1"))
+            (with-rpc-wallet ("r1")
               (bl.wallet::rpc-getnewaddress node '()))
             :testnet4))))))
 
@@ -887,10 +1118,10 @@ success while leaving nothing behind."
   "The sweeper relocks a wallet whose deadline passed with no RPC touching
 it, and close-wallet-manager joins the thread rather than leaking it."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w"))
             (manager (%node-manager node)))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         (bl.wallet::rpc-walletpassphrase node '("hunter2" 1))
         (is (bl.wallet::wallet-manager-relock-running manager))
         (let ((thread (bl.wallet::wallet-manager-relock-thread manager)))
@@ -912,9 +1143,9 @@ it, and close-wallet-manager joins the thread rather than leaking it."
 deadline must not fire — relocking mid-scan would silently break the keypool
 top-ups the scan depends on."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         (bl.wallet::rpc-walletpassphrase node '("hunter2" 0))
         (setf (bl.wallet::wallet-scanning-with-passphrase wallet) t)
         ;; The deadline has passed, but the scan flag holds the unlock open.
@@ -934,9 +1165,9 @@ top-ups the scan depends on."
   "Unloading a wallet drops its decrypted master key; a stale reference must
 not keep key material alive after the wallet is gone."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let ((wallet (%wenc-fresh-wallet node "w")))
-        (bl.wallet::rpc-encryptwallet node '("hunter2"))
+        (%wenc-encrypt node)
         (bl.wallet::rpc-walletpassphrase node '("hunter2" 600))
         (is (bl.wallet::wallet-encryption-key wallet))
         (bl.wallet::unload-wallet (%node-manager node) wallet)
@@ -959,7 +1190,7 @@ whose records are identical, record for record."
   (with-wallet-test-node (node)
     (let ((source-records nil)
           (path (%wenc-backup-path node "w")))
-      (let ((bl.wallet::*rpc-wallet-name* "w"))
+      (with-rpc-wallet ("w")
         (let ((wallet (%wenc-fresh-wallet node "w")))
           (bl.wallet::rpc-getnewaddress node '())
           (is (null (bl.wallet::rpc-backupwallet
@@ -1006,7 +1237,7 @@ whose records are identical, record for record."
 ciphertext — and the restored copy unlocks with the original passphrase."
   (with-wallet-test-node (node)
     (let ((path (%wenc-backup-path node "enc")))
-      (let ((bl.wallet::*rpc-wallet-name* "enc"))
+      (with-rpc-wallet ("enc")
         (let ((wallet (%wenc-fresh-wallet node "enc" :passphrase "hunter2")))
           (is (bl.wallet::wallet-is-locked-p wallet))
           (is (null (bl.wallet::rpc-backupwallet
@@ -1024,7 +1255,7 @@ ciphertext — and the restored copy unlocks with the original passphrase."
 restore must not leave a wallet directory behind."
   (with-wallet-test-node (node)
     (let ((path (%wenc-backup-path node "w")))
-      (let ((bl.wallet::*rpc-wallet-name* "w"))
+      (with-rpc-wallet ("w")
         (%wenc-fresh-wallet node "w")
         (bl.wallet::rpc-backupwallet node (list (namestring path))))
       (is (= -8 (rpc-error-code-of
@@ -1092,7 +1323,7 @@ stopped on an error. A backup built from a silently truncated scan is the
 worst possible failure: it looks like a successful backup and restores a
 wallet that is missing keys."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (let* ((wallet (%wenc-fresh-wallet node "w"))
              (full (length (bl.wallet::wallet-db-records
                             (bl.wallet::wallet-db wallet)))))
@@ -1116,7 +1347,7 @@ wallet that is missing keys."
 testnet node — Core gets this from the network magic in the SQLite header."
   (with-wallet-test-node (node)
     (let ((path (%wenc-backup-path node "w")))
-      (let ((bl.wallet::*rpc-wallet-name* "w"))
+      (with-rpc-wallet ("w")
         (%wenc-fresh-wallet node "w")
         (bl.wallet::rpc-backupwallet node (list (namestring path))))
       (let ((foreign (merge-pathnames "foreign.dump"
@@ -1141,7 +1372,7 @@ testnet node — Core gets this from the network magic in the SQLite header."
   "backupwallet maps every failure to Core's single error, and refuses to
 write into the wallets directory (where it would look like a wallet)."
   (with-wallet-test-node (node)
-    (let ((bl.wallet::*rpc-wallet-name* "w"))
+    (with-rpc-wallet ("w")
       (%wenc-fresh-wallet node "w")
       (let ((manager (%node-manager node)))
         ;; An existing directory as the destination.

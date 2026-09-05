@@ -338,6 +338,15 @@ consistent encrypted wallet that merely kept its old seed."
   (assert (wallet-flag-set-p wallet +wallet-flag-descriptors+))
   (when (wallet-has-encryption-keys-p wallet)
     (return-from encrypt-wallet nil))
+  ;; The rewrite that ends this function needs a sibling directory name, and
+  ;; it runs AFTER the encryption batch has committed. Refusing there would
+  ;; leave a wallet that is encrypted, has not had its plaintext erased, and
+  ;; reports an error; so the name is claimed here, where nothing has moved.
+  (let ((conflict (wallet-rewrite-name-conflict (wallet-path wallet))))
+    (when conflict
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                        :message (format nil "Error: ~A exists and is not a wallet database rewrite of this wallet. Move it aside: encrypting needs that name to rebuild the database."
+                                         (namestring conflict)))))
   (let* ((plain-master (ironclad:random-data
                         bl.crypto:+wallet-crypto-key-size+))
          (salt (ironclad:random-data
@@ -398,14 +407,18 @@ consistent encrypted wallet that merely kept its old seed."
                          (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
                (wallet-setup-descriptor-spkms wallet (generate-wallet-master-key
                                                       (wallet-network wallet)))))
-        (%wallet-clear-encryption-key wallet)))
-    ;; Best-effort analogue of Core's database Rewrite: a LevelDB delete is
-    ;; only a tombstone, so the plaintext DER bytes survive in the SST files
-    ;; until a compaction drops them. This is NOT an erasure guarantee,
-    ;; which is exactly why the RPC tells the user to take a fresh backup.
-    (handler-case (bl.store:leveldb-compact (wallet-db wallet))
-      (error (e)
-        (bl:log-warn "wallet compaction after encryption failed: ~A" e)))
+        (%wallet-clear-encryption-key wallet))
+      ;; Core's GetDatabase().Rewrite() (wallet.cpp:874-876): "the database
+      ;; might keep bits of the unencrypted private key in slack space".
+      ;; A LevelDB delete is only a tombstone, and the compaction this used
+      ;; to call is not the erasure it reads as -- on a wallet young enough
+      ;; that the plaintext is still in the memtable, CompactRange flushes it
+      ;; into a live .ldb and then compacts only the empty levels beneath it
+      ;; (LEVELDB-COMPACT's docstring has the mechanism). The rebuild is the
+      ;; analogue, and it runs under the wallet lock so nothing writes a
+      ;; record between the scan and the swap.
+      (setf (wallet-db wallet)
+            (wallet-db-rewrite (wallet-db wallet) (wallet-path wallet))))
     t))
 
 ;;; --- The relock sweeper (wallet P6) ---
@@ -830,7 +843,7 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
                  (probe-file (uiop:parse-native-namestring backup-file)))
       (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                         :message "Backup file does not exist"))
-    (let* ((path (wallet-directory manager name))
+    (let* ((path (wallet-path-for manager name))
            (existed (and (uiop:directory-exists-p path) t)))
       ;; Core checks only that the destination is free (RestoreWallet,
       ;; wallet.cpp:486-492); a loaded wallet's directory exists too, so

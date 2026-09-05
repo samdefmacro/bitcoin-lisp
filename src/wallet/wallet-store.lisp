@@ -443,3 +443,180 @@ backup — is wrong in a dangerous way if it silently sees a subset."
                (bl.store:leveldb-iter-next iter))
       (bl.store:leveldb-iter-check-error iter))
     (nreverse out)))
+
+;;; --- Rewriting the database (Core WalletDatabase::Rewrite) ---
+;;;
+;;; Core's EncryptWallet ends with GetDatabase().Rewrite(), commented "Need to
+;;; completely rewrite the wallet file; if we don't, the database might keep
+;;; bits of the unencrypted private key in slack space in the database file"
+;;; (refs/bitcoin/src/wallet/wallet.cpp:872-876). For SQLite that is VACUUM
+;;; (refs/bitcoin/src/wallet/sqlite.cpp:336-341): the file is rebuilt, so the
+;;; deleted rows sit in no live page.
+;;;
+;;; A LevelDB delete is a tombstone, and a compaction is NOT the analogue --
+;;; see LEVELDB-COMPACT's docstring for why CompactRange leaves a young
+;;; database's plaintext in a live .ldb. The analogue of a rebuild is a
+;;; rebuild: write the records the iterator still returns into a brand-new
+;;; directory and swap that in.
+;;;
+;;; The swap uses ONE reserved sibling name, <name>.rewrite, and parks the
+;;; wallet it replaces INSIDE it (<name>.rewrite/superseded/) rather than at a
+;;; second sibling -- one name to reason about, and one name that could
+;;; collide with a wallet an operator really did create. The marker file is
+;;; what settles that collision: a directory without it is never touched.
+
+(alexandria:define-constant +wallet-rewrite-suffix+ ".rewrite"
+  :test #'equal
+  :documentation "Appended to a wallet directory's name for the rebuilt copy.")
+
+(alexandria:define-constant +wallet-superseded-subdirectory+ "superseded"
+  :test #'equal
+  :documentation "Where the database being replaced is parked, inside the
+rebuilt directory, between the two renames.")
+
+(alexandria:define-constant +wallet-rewrite-marker+ "BITCOIN_LISP_REWRITE"
+  :test #'equal
+  :documentation "The file that says a <name>.rewrite directory is ours. It is
+written before anything else goes in, so it means \"this is scratch\" and not
+\"this is finished\" -- without it a wallet an operator really did name
+w.rewrite would be deleted as a leftover.")
+
+(defun wallet-rewrite-directory-p (name)
+  "T when NAME is the reserved name of a rewrite scratch directory rather than
+a wallet someone created. LIST-WALLET-DIR uses it so a leftover from an
+interrupted rewrite is never offered as a wallet to load."
+  (and (> (length name) (length +wallet-rewrite-suffix+))
+       (alexandria:ends-with-subseq +wallet-rewrite-suffix+ name)))
+
+(defun %wallet-rewrite-path (path)
+  "PATH's sibling directory with +WALLET-REWRITE-SUFFIX+ appended to its name."
+  (let* ((dir (uiop:ensure-directory-pathname path))
+         (components (pathname-directory dir)))
+    (make-pathname :directory (append (butlast components)
+                                      (list (concatenate 'string
+                                                         (car (last components))
+                                                         +wallet-rewrite-suffix+)))
+                   :name nil :type nil :defaults dir)))
+
+(defun %wallet-superseded-path (directory)
+  (merge-pathnames (concatenate 'string +wallet-superseded-subdirectory+ "/")
+                   (uiop:ensure-directory-pathname directory)))
+
+(defun %wallet-rewrite-marker-path (directory)
+  (merge-pathnames +wallet-rewrite-marker+
+                   (uiop:ensure-directory-pathname directory)))
+
+(defun %wallet-rewrite-scratch-p (directory)
+  "T when DIRECTORY exists and carries the rewrite marker."
+  (and (uiop:directory-exists-p directory)
+       (probe-file (%wallet-rewrite-marker-path directory))
+       t))
+
+(defun wallet-rewrite-name-conflict (path)
+  "The sibling directory a rewrite of the wallet at PATH needs, when something
+that is not ours already occupies it; NIL when the name is free.
+
+Asked BEFORE the work that will need it, not when the rewrite reaches the
+name: EncryptWallet's rewrite runs after the encryption batch has committed,
+so refusing there would leave a wallet that is encrypted, is missing the
+erasure the encryption promised, and reports an error."
+  (let ((rewrite (%wallet-rewrite-path path)))
+    (when (and (uiop:directory-exists-p rewrite)
+               (not (%wallet-rewrite-scratch-p rewrite)))
+      rewrite)))
+
+(defun %delete-wallet-directory (path)
+  (uiop:delete-directory-tree (uiop:ensure-directory-pathname path)
+                              :validate t :if-does-not-exist :ignore))
+
+(defun %fsync-wallet-directory (path)
+  "fsync every file in PATH and then PATH itself: the records AND the names
+they live under have to be on disk before the rename that publishes them."
+  (let ((dir (uiop:ensure-directory-pathname path)))
+    (dolist (file (uiop:directory-files dir))
+      (bl.kv:fsync-file file))
+    (bl.kv:fsync-directory dir)))
+
+(defun %wallet-drop-rewrite-remnants (path)
+  "Remove what a completed swap leaves inside the wallet directory: the parked
+predecessor and the marker that travelled with the rebuilt copy."
+  (%delete-wallet-directory (%wallet-superseded-path path))
+  (uiop:delete-file-if-exists (%wallet-rewrite-marker-path path)))
+
+(defun wallet-recover-interrupted-rewrite (path)
+  "Finish or discard a WALLET-DB-REWRITE of the wallet at PATH that did not
+run to completion, and return PATH. A no-op when no rewrite is outstanding.
+
+WALLET-DB-REWRITE has the rebuilt directory complete and fsynced before it
+touches PATH, so the only interruption that can leave PATH missing is the one
+between its two renames -- which is why the scratch directory may be promoted
+there without inspecting it, and why a half-built one (PATH still in place) is
+discarded unread instead."
+  (let* ((path (uiop:ensure-directory-pathname path))
+         (rewrite (%wallet-rewrite-path path))
+         (ours (%wallet-rewrite-scratch-p rewrite)))
+    (cond
+      ;; The wallet is where it belongs; anything beside or inside it is scrap.
+      ((wallet-db-exists-p path)
+       (when ours (%delete-wallet-directory rewrite))
+       (%wallet-drop-rewrite-remnants path))
+      ;; Interrupted between the two renames: the rebuilt database is complete
+      ;; and carries the wallet it replaced under superseded/.
+      ((and ours (wallet-db-exists-p rewrite))
+       (bl.kv:rename-path rewrite path)
+       (%wallet-drop-rewrite-remnants path)))
+    path))
+
+(defun wallet-db-rewrite (db path)
+  "Rebuild the wallet database at PATH and return a handle on the rebuilt
+copy; DB is closed. Our WalletDatabase::Rewrite -- the call EncryptWallet ends
+with so that the deleted plaintext keys stop living in the database's slack
+space (wallet/wallet.cpp:872-876, wallet/sqlite.cpp:336-341).
+
+Only the records the iterator still returns are written, so a tombstoned
+plaintext key is never copied, and the directory that held its bytes is
+removed. The caller holds the wallet lock: nothing may write to DB between the
+record scan and the swap.
+
+The order is the crash contract. The rebuilt directory is complete, marked and
+fsynced before anything moves, so every interruption leaves at least one
+complete database on disk and WALLET-RECOVER-INTERRUPTED-REWRITE -- which
+LOAD-WALLET runs before it opens anything -- puts it back at PATH. The swap
+itself must not signal: by then the old handle is closed, so an escaping error
+would hand the caller a dead pointer. It logs instead, and the recovery pass
+that follows decides which directory gets opened."
+  (let* ((path (uiop:ensure-directory-pathname path))
+         (rewrite (%wallet-rewrite-path path)))
+    (when (wallet-rewrite-name-conflict path)
+      (wallet-error "wallet rewrite: ~A already exists and is not ours" rewrite))
+    (%delete-wallet-directory rewrite)
+    ;; The marker first: from here the directory is identifiably scratch, so an
+    ;; interrupted build is cleaned up rather than blocking every later rewrite.
+    (ensure-directories-exist rewrite)
+    (with-open-file (out (%wallet-rewrite-marker-path rewrite)
+                         :direction :output :if-exists :supersede
+                         :if-does-not-exist :create)
+      (write-line "bitcoin-lisp wallet database rewrite" out))
+    (let ((records (wallet-db-records db))
+          (new-db (wallet-db-open rewrite :create t)))
+      (unwind-protect
+           (bl.store:with-leveldb-writebatch (batch)
+             (dolist (record records)
+               (bl.store:leveldb-writebatch-put batch (car record) (cdr record)))
+             (bl.store:leveldb-write new-db batch :sync t))
+        (bl.store:leveldb-close new-db)))
+    (%fsync-wallet-directory rewrite)
+    (handler-case
+        (progn
+          (bl.store:leveldb-close db)
+          (bl.kv:rename-path path (%wallet-superseded-path rewrite))
+          (bl.kv:rename-path rewrite path)
+          (bl.kv:fsync-directory (uiop:pathname-parent-directory-pathname path)))
+      (error (e)
+        ;; Loud, because this is the branch where the encryption is committed
+        ;; and the pre-encryption key bytes may still be on disk.
+        (bl:log-warn "wallet rewrite: swapping ~A into place failed (~A); the ~
+wallet is intact but the plaintext this rewrite exists to remove may remain"
+                     path e)))
+    (wallet-recover-interrupted-rewrite path)
+    (wallet-db-open path)))

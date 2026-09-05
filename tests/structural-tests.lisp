@@ -1422,12 +1422,20 @@ temp+fsync+rename hands FSYNC-PARENT-DIRECTORY the FILE's path, because
 FSYNC-DIRECTORY given a file path opens that file, fsyncs it and reports
 success: four writers (settings.json from the node and from the wallet,
 mempool.dat, the wallet backup) sat under a comment claiming the directory was
-synced while the rename itself stayed undurable, and nothing could see it."
+synced while the rename itself stayed undurable, and nothing could see it.
+
+The wallet database rewrite is the second file that qualifies, and for the
+same reason rather than as an exception: what it syncs is the rebuilt DIRECTORY
+it has just filled, and then the wallets DIRECTORY that the rename published a
+new name in. Neither has a file path to offer FSYNC-PARENT-DIRECTORY -- the
+second one in particular would sync the wallet itself, not its parent."
   (let ((sites (%fsync-directory-call-sites)))
-    (is (equal '("src/kv/flatfile.lisp")
-               (remove-duplicates (mapcar #'car sites) :test #'string=))
-        "fsync-directory is called from ~S; only the flat-file allocator has a ~
-directory to hand it -- every other site takes fsync-parent-directory" sites)))
+    (is (equal '("src/kv/flatfile.lisp" "src/wallet/wallet-store.lisp")
+               (sort (remove-duplicates (mapcar #'car sites) :test #'string=)
+                     #'string<))
+        "fsync-directory is called from ~S; only the flat-file allocator and the ~
+wallet database rewrite have a directory to hand it -- every other site takes ~
+fsync-parent-directory" sites)))
 
 (defun %equalp-hash-tables (&optional (corpus (%source-corpus)))
   "Every (file . line) in CORPUS that makes a hash table with the EQUALP test

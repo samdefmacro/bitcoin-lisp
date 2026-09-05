@@ -54,6 +54,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:make-package-fixture
    ;; wallet.lisp
    #:make-wallet-rng
+   #:with-rpc-wallet
    #:make-wallet-chain-node
    #:with-wallet-chain-node))
 

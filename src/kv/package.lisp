@@ -76,6 +76,7 @@ of its own (bitcoin-lisp/kv) below serialization. BITCOIN-LISP.STORAGE
    #:obfuscation-key-active-p
    #:parse-flat-record-header
    #:read-or-create-xor-key
+   #:rename-path
    #:undo-record-bytes
    #:undo-record-checksum
    #:with-flat-file
