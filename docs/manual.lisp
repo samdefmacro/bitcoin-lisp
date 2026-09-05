@@ -707,8 +707,13 @@
   consensus value comes from the chain, never from a constant: the BIP94
   timewarp rule is gated on `bl.chain:enforce-bip94-p' (testnet4, and
   regtest under -test=bip94) and fires at the chain's own retarget period,
-  144 on regtest and 2016 elsewhere. The versionbits state machine REPORTS
-  and tells the miner what to signal; it decides no activation."
+  144 on regtest and 2016 elsewhere. BOTH connect paths -- CONNECT-BLOCK
+  and the reorg's commit phase -- ask HISTORICAL-CHAINSTATE-P before they
+  touch the mempool or the tx-relay filters, because an assumeutxo
+  background chainstate reaches the reorg path whenever it fast-forwards
+  more than one block, and its blocks are ancient. The versionbits state
+  machine REPORTS and tells the miner what to signal; it decides no
+  activation."
   (bitcoin-lisp.validation package)
   (bitcoin-lisp.validation:validate-transaction-structure function)
   (bitcoin-lisp.validation:validate-transaction-contextual function)

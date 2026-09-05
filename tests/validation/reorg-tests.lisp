@@ -905,6 +905,74 @@ asserts the marker, which is the thing that was wrong."
          (uiop:delete-directory-tree txdir :validate t :if-does-not-exist :ignore)))
      (clrhash bl.val::*block-undo-data*))))
 
+(defun %reorg-relay-state (targeted suffix)
+  "Run a reorg on a chainstate that is targeted (the assumeutxo background
+chainstate) or not, and report what it did to the tx-relay structures.
+
+Seeded with a MARKER block through the exported NOTE-BLOCK-CONNECTED, so both
+structures start non-empty and the two outcomes are distinguishable in BOTH
+directions: an active chainstate must reset the recent-confirmed filter (the
+marker goes) and publish the fork tip (its coinbase arrives); a targeted one
+must do neither."
+  (with-network (:mainnet)
+    (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+        (make-activate-block-fixture suffix)
+      (build-and-connect chain-state block-store utxo-set genesis-hash
+                         (make-test-chain-hashes #xA0 2))
+      (let* ((old-tip (bl.store:get-block-index-entry
+                       chain-state (bl.store:best-block-hash chain-state)))
+             (fork-tip-hash (%stage-heavier-downloaded-fork
+                             chain-state block-store genesis-hash))
+             (fork-tip (bl.store:get-block-index-entry chain-state fork-tip-hash))
+             (fork-cb (bl.ser:transaction-hash
+                       (first (bl.ser:bitcoin-block-transactions
+                               (bl.store:get-block block-store fork-tip-hash)))))
+             (marker (make-reorg-test-block
+                      genesis-hash
+                      (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element #xEE)
+                      1))
+             (marker-cb (bl.ser:transaction-hash
+                         (first (bl.ser:bitcoin-block-transactions marker)))))
+        (bl.val:reset-recent-confirmed)
+        (bl.val:note-block-connected marker)
+        (when targeted
+          (bl.store:set-chainstate-target chain-state fork-tip))
+        (let ((reorged (bl.val:perform-reorg chain-state block-store utxo-set
+                                             old-tip fork-tip)))
+          (list :reorged (and reorged t)
+                :height (bl.store:current-height chain-state)
+                :filter-reset (not (bl.val:recently-confirmed-p marker-cb))
+                :fork-tip-confirmed (and (bl.val:recently-confirmed-p fork-cb) t)
+                :fork-tip-servable (and (bl.val:most-recent-block-tx fork-cb) t)))))))
+
+(test reorg-commit-carries-the-background-chainstate-guard
+  "%REORG-COMMIT's tx-relay side effects must ask the question CONNECT-BLOCK
+already asks. Core never lets a background (assumeutxo) chainstate reach them:
+it has no mempool at all (`assert(!curr_chainstate.m_mempool)',
+validation.cpp:6203) and its BlockConnected carries the ChainstateRole so
+net_processing drops it before the tx-download manager
+(`if (!role.historical && ...)', net_processing.cpp:2089), while UpdatedBlockTip
+is gated on `this == &m_chainman.ActiveChainstate()' (:3452).
+
+The reorg path IS reachable for such a chainstate: ACTIVATE-BLOCK's target
+filter keeps it on the target's ancestor path but not on the extend-tip case,
+so a block two above its tip whose parent body is already on disk fast-forwards
+through PERFORM-REORG. Its blocks are ancient, so recording them as the relay's
+most-recent block, or their txids as recently confirmed, suppresses the relay
+of live transactions."
+  ;; CONTROL: on an untargeted chainstate the reorg still resets the filter
+  ;; and publishes the fork tip -- a guard that merely disabled the code
+  ;; would fail this half.
+  (is (equal '(:reorged t :height 3
+               :filter-reset t :fork-tip-confirmed t :fork-tip-servable t)
+             (%reorg-relay-state nil "reorg-role-active")))
+  ;; THE assertion: the targeted chainstate reorgs to the same height and
+  ;; touches none of them.
+  (is (equal '(:reorged t :height 3
+               :filter-reset nil :fork-tip-confirmed nil :fork-tip-servable nil)
+             (%reorg-relay-state t "reorg-role-background"))))
+
 (test no-index-is-an-activation-argument
   "The structural guard that replaced \"every activation call passes
 :tx-index\". That guard existed because the index was an ARGUMENT, and an
