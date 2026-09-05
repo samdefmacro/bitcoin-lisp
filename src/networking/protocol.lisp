@@ -294,6 +294,13 @@ MAX_MONEY would otherwise silently suppress all relay to this peer."
   (or (= inv-type bl.ser:+inv-type-block+)
       (= inv-type bl.ser:+inv-type-witness-block+)))
 
+(defun tx-inv-type-p (inv-type)
+  "T if INV-TYPE is a transaction inventory type — Core CInv::IsGenTxMsg:
+MSG_TX and MSG_WITNESS_TX carry a txid, MSG_WTX (BIP339) a wtxid."
+  (or (= inv-type bl.ser:+inv-type-tx+)
+      (= inv-type bl.ser:+inv-type-witness-tx+)
+      (= inv-type bl.ser:+inv-type-wtx+)))
+
 ;;; --- Tx-request tracking (Core TxRequestTracker, simplified) ---
 ;;;
 ;;; handle-inv used to fire a getdata to the announcing peer with no in-flight
@@ -393,6 +400,12 @@ txdownloadman.h:32).")
 (defconstant +overloaded-peer-tx-delay-seconds+ 2
   "Extra delay for announcements from overloaded peers (Core
 OVERLOADED_PEER_TX_DELAY, txdownloadman.h:36).")
+(defconstant +max-blocks-in-transit-per-peer+ 16
+  "Core MAX_BLOCKS_IN_TRANSIT_PER_PEER (net_processing.cpp:130). Read here
+only for the notfound size guard: a peer cannot have more than its
+MAX_PEER_TX_ANNOUNCEMENTS plus this many requests outstanding, so a notfound
+that names more items than that is answering nothing we asked for
+(net_processing.cpp:5150-5164).")
 
 (defun reset-tx-requests ()
   "Clear all tx-request tracking (called at node start)."
@@ -681,8 +694,7 @@ never worked for segwit txs (a first-announcer-wins censorship primitive)."
   "Send getdatas for announcements whose delay has passed and that have no
 request outstanding — the scheduler half of Core's GetRequestsToSend
 (txdownloadman_impl.cpp:264-284), run ~1x/second from the sync loop. Each
-hash goes to its best ready candidate (preferred first). Returns the number
-of requests sent."
+hash goes to its best candidate. Returns the number of requests sent."
   (let ((now (get-internal-real-time))
         (to-send '()))                  ; (peer . list-of-invs)
     (bt:with-lock-held (*tx-request-lock*)
@@ -690,6 +702,25 @@ of requests sent."
                  (declare (ignore anns))
                  (setf to-send (%tx-request-schedule hash now to-send)))
                *tx-announcers*))
+    (%send-tx-getdatas to-send)))
+
+(defun process-tx-requests-for (hashes)
+  "The same pass restricted to HASHES — the prompt failover after a peer says
+notfound. Its cost is the message's own item count and nothing else.
+
+Re-running the WHOLE scheduler here instead made a 61-byte notfound buy a
+scan of every tracked announcement under the one lock the tx-relay path
+serialises on: about 1 ms per scan at the 5,000 hashes a single connection
+can reach by itself, 10 ms at 50,000, times the 32 messages the pump admits
+per peer per pass, unauthenticated and uncharged. Core does not re-issue from
+the NOTFOUND branch at all -- ReceivedNotFound is one indexed ReceivedResponse
+per item (txdownloadman_impl.cpp:288-294) and SendMessages re-issues from a
+per-peer index of CANDIDATE_BEST announcements (txrequest.cpp:595-624)."
+  (let ((now (get-internal-real-time))
+        (to-send '()))
+    (bt:with-lock-held (*tx-request-lock*)
+      (dolist (hash hashes)
+        (setf to-send (%tx-request-schedule hash now to-send))))
     (%send-tx-getdatas to-send)))
 
 (defun tx-fetch-inv-type (peer)
@@ -903,9 +934,7 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
           ;; Core peer — announce txs exclusively under MSG_WTX
           ;; (net_processing.cpp:6009,6065), so without this branch no tx
           ;; announcement from them was ever requested.
-          ((or (= inv-type bl.ser:+inv-type-tx+)
-               (= inv-type bl.ser:+inv-type-witness-tx+)
-               (= inv-type bl.ser:+inv-type-wtx+))
+          ((tx-inv-type-p inv-type)
            ;; Tx invs in violation of our advertised fRelay=0 (blocksonly
            ;; mainnet default, block-relay/feeler conns): disconnect (Core
            ;; net_processing.cpp:4168-4172).
@@ -966,7 +995,7 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
 
 ;;; Notfound handling
 
-(define-p2p-handler "notfound" (peer payload ctx)
+(define-p2p-handler ("notfound" :rate-bucket peer-rate-limit-serve) (peer payload ctx)
   "Handle a notfound message: the peer is telling us it lacks one or
 more items we requested via getdata. For tx items, complete the peer's
 announcement in the tx-request tracker so the request fails over to
@@ -976,22 +1005,32 @@ txdownloadman_impl.cpp:287-293). Block items are ignored, as Core's
 NOTFOUND arm ignores them (net_processing.cpp, tx invs only): no Core
 peer — and no bitcoin-lisp peer, see handle-getdata — ever sends a
 notfound for a block, and a peer that cannot serve one it announced is
-handled by the block-download timeout like any other stalled request."
+handled by the block-download timeout like any other stalled request.
+
+Two bounds on what an unsolicited notfound costs, both Core's. Its tx items
+are ignored outright when the message carries more than
+MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER of them
+(net_processing.cpp:5150-5164) — more than the peer could possibly be
+answering — rather than the 50,000 the inv parser allows. And the failover
+re-selects only the hashes this message named, so the work is the message's
+own item count; it used to re-run the whole scheduler, which walks every
+tracked announcement under the tx-relay lock. The handler also drains the
+serve bucket now: an unsolicited response message with no rate bucket at all
+was the only uncharged command on this path."
   (declare (ignore ctx))
-  (let ((tx-completed nil))
-    (dolist (inv (bl.ser:parse-inv-payload payload))
-      (let ((inv-type (bl.ser:inv-vector-type inv))
-            (hash (bl.ser:inv-vector-hash inv)))
-        (cond
-          ((or (= inv-type bl.ser:+inv-type-tx+)
-               (= inv-type bl.ser:+inv-type-witness-tx+)
-               (= inv-type bl.ser:+inv-type-wtx+))
-           (tx-request-received-response peer hash)
-           (setf tx-completed t)))))
-    ;; Fail over promptly: re-run the scheduler so another announcer's
+  (let ((invs (bl.ser:parse-inv-payload payload))
+        (hashes '()))
+    (when (<= (length invs)
+              (+ +max-peer-tx-announcements+ +max-blocks-in-transit-per-peer+))
+      (dolist (inv invs)
+        (when (tx-inv-type-p (bl.ser:inv-vector-type inv))
+          (let ((hash (bl.ser:inv-vector-hash inv)))
+            (tx-request-received-response peer hash)
+            (push hash hashes)))))
+    ;; Fail over promptly: re-select the named hashes so another announcer's
     ;; candidate is requested now rather than on the next 1s tick.
-    (when tx-completed
-      (process-tx-requests))))
+    (when hashes
+      (process-tx-requests-for hashes))))
 
 ;;; Headers handling
 
