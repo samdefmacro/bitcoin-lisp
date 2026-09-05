@@ -308,22 +308,29 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
 
 (defun connect-peer (host &optional (port *current-port*))
   "Connect to a peer at HOST:PORT.
-Returns a peer structure or NIL on failure.
-Returns NIL if the host is banned or discouraged (never dial either)."
+Returns (VALUES PEER PROXY-CONNECTION-FAILED-P): the peer, or NIL on failure.
+Returns NIL if the host is banned or discouraged (never dial either).
+
+PROXY-CONNECTION-FAILED-P is MAKE-TCP-CONNECTION's second value passed
+straight through — Core's `proxy_connection_failed', T only when the dial died
+at the SOCKS5 proxy and so says nothing about HOST. The dial's caller uses it
+to decide whether the address is charged an addrman attempt at all
+(net.cpp:494-497)."
   (when (or (peer-banned-p host) (peer-discouraged-p host))
     (return-from connect-peer nil))
-  (let ((conn (make-tcp-connection host port)))
-    (when conn
-      (let ((peer (make-peer :connection conn
-                             :state :connected
-                             :address host
-                             :connect-time (get-internal-real-time))))
-        (init-peer-rate-limiters peer)
-        ;; Core logs this on every CNode it constructs, outbound and inbound
-        ;; alike (net.cpp:4005-4007), and p2p_add_connections.py greps for it.
-        (bl:log-cat "net" "Added connection to ~A peer=~A"
-                              host (peer-id peer))
-        peer))))
+  (multiple-value-bind (conn proxy-failed) (make-tcp-connection host port)
+    (if conn
+        (let ((peer (make-peer :connection conn
+                               :state :connected
+                               :address host
+                               :connect-time (get-internal-real-time))))
+          (init-peer-rate-limiters peer)
+          ;; Core logs this on every CNode it constructs, outbound and inbound
+          ;; alike (net.cpp:4005-4007), and p2p_add_connections.py greps for it.
+          (bl:log-cat "net" "Added connection to ~A peer=~A"
+                                host (peer-id peer))
+          peer)
+        (values nil proxy-failed))))
 
 (defun peer-live-p (peer)
   "T while PEER is still a connection we could actually use — our stand-in for

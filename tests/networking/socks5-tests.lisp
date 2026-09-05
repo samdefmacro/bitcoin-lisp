@@ -277,6 +277,90 @@ contract (no condition escapes to the dial loop)."
         (setf bl.net:*proxy* old-proxy)))
     (bt:join-thread thread)))
 
+(defun %closed-loopback-port ()
+  "A loopback port with nothing listening on it: bound only to learn the
+number, then released. A dial to it is refused immediately and never leaves
+this machine."
+  (let* ((srv (usocket:socket-listen "127.0.0.1" 0
+                                     :element-type '(unsigned-byte 8)
+                                     :reuse-address t))
+         (port (usocket:get-local-port srv)))
+    (usocket:socket-close srv)
+    port))
+
+(defun %dial-verdict (host port)
+  "(VALUES CONNECTED-P PROXY-FAILED-P) for one MAKE-TCP-CONNECTION dial, with
+any socket closed again."
+  (multiple-value-bind (conn proxy-failed) (bl.net:make-tcp-connection host port)
+    (when conn (bl.net:close-connection conn))
+    (values (and conn t) proxy-failed)))
+
+(test make-tcp-connection-flags-only-an-unreachable-proxy
+  "MAKE-TCP-CONNECTION's second value is Core's `proxy_connection_failed', and
+Core raises it in exactly one place: ConnectThroughProxy sets it when
+`proxy.Connect()' returns nothing — the TCP connect to the proxy server — and
+leaves it false for every SOCKS5 failure after that, because past that point
+the proxy has answered and the verdict is about the TARGET
+(netbase.cpp:785-809). ConnectNode reads it to decide whether the address is
+charged an addrman attempt at all (net.cpp:494-497).
+
+We returned a bare NIL for all of them, so the dial had no verdict to hand up
+and a dead Tor daemon was charged to every onion address the selection tried.
+
+The three cases here are the ones that must not be confused: the proxy is
+down, the proxy answers and reports the target unreachable, and there is no
+proxy at all."
+  (let ((old-proxy bl.net:*proxy*))
+    (unwind-protect
+         (progn
+           ;; 1. The proxy itself is unreachable: T, and the target was never
+           ;; dialed.
+           (setf bl.net:*proxy*
+                 (bl.net:make-proxy :host "127.0.0.1"
+                                    :port (%closed-loopback-port)
+                                    :randomize-credentials nil))
+           (multiple-value-bind (connected proxy-failed)
+               (%dial-verdict "example.com" 8333)
+             (is-false connected)
+             (is-true proxy-failed
+                      "an unreachable proxy must not be charged to the target"))
+           ;; 2. The proxy answers and refuses the CONNECT with SOCKS5 reply
+           ;; 0x05 (\"connection refused\"), which is a verdict about the
+           ;; TARGET: Core counts the attempt.
+           (multiple-value-bind (port thread)
+               (%fake-socks5-server
+                `((:read 3) (:write #(#x05 #x00))
+                  (:read-connect)
+                  (:write #(#x05 #x05 #x00 #x01 0 0 0 0 0 0))))
+             (setf bl.net:*proxy*
+                   (bl.net:make-proxy :host "127.0.0.1" :port port
+                                      :randomize-credentials nil))
+             (multiple-value-bind (connected proxy-failed)
+                 (%dial-verdict "example.com" 8333)
+               (is-false connected)
+               (is-false proxy-failed
+                         "a proxy that ANSWERED reports on the target, not on itself"))
+             (bt:join-thread thread))
+           ;; 3. No proxy in the path at all — a loopback target is dialed
+           ;; directly whatever -proxy says (Core registers no proxy for
+           ;; NET_UNROUTABLE) — so an ordinary refused connect stays NIL.
+           (multiple-value-bind (connected proxy-failed)
+               (%dial-verdict "127.0.0.1" (%closed-loopback-port))
+             (is-false connected)
+             (is-false proxy-failed
+                       "a direct dial can never be a proxy failure"))
+           ;; 4. CONNECT-PEER carries the verdict up unchanged: it is what the
+           ;; dial sweeps call, and it is where the addrman recorder reads it.
+           (setf bl.net:*proxy*
+                 (bl.net:make-proxy :host "127.0.0.1"
+                                    :port (%closed-loopback-port)
+                                    :randomize-credentials nil))
+           (is (equal '(nil t)
+                      (multiple-value-list
+                       (bl.net:connect-peer "proxy-carveout.invalid" 8333)))
+               "connect-peer must pass the proxy verdict through"))
+      (setf bl.net:*proxy* old-proxy))))
+
 ;;; --- onion dialing (P2) ---------------------------------------------------------
 
 (defparameter +socks5-onion-target+

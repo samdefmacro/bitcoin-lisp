@@ -275,8 +275,8 @@ above 2 it is simply 2."
 
 (defun %record-dial-attempt (node host port count-failure)
   "Stamp an addrman dial attempt for HOST:PORT — Core CConnman::ConnectNode
-calls addrman.Attempt() on EVERY dial, immediately after the attempt and before
-the socket is examined (net.cpp:492-497).
+calls addrman.Attempt() after the connect has been made and failed, before the
+socket is examined (net.cpp:492-497).
 
 We recorded attempts from exactly one place, the failure branch of
 connect-to-peers, and that function runs only at startup and when the peer
@@ -303,12 +303,8 @@ COUNT-FAILURE gates. Hard-coding it true charged a real failure to every
 address a link-down node cycled through, and to manual targets that were
 merely switched off, which Core never does.
 
-Divergence: Core's Attempt() call is additionally guarded by
-`!proxyConnectionFailed', so a dead SOCKS5 proxy blames nothing. We stamp
-BEFORE the dial and make-tcp-connection reports a proxy failure and a target
-failure the same way (NIL), so we have no signal to carry that guard; a whole
-onion set behind a dead Tor proxy still accrues last_try stamps, and failures
-too once the gate below is open."
+Every caller reaches this through %DIAL-OUTBOUND-PEER, which owns Core's
+`!proxyConnectionFailed' guard."
   (let ((address-book (node-address-book node)))
     (when address-book
       (multiple-value-bind (net ip-bytes)
@@ -318,6 +314,42 @@ too once the gate below is open."
            (bl.net:address-book-attempt
             address-book ip-bytes port
             :count-failure count-failure :net net)))))))
+
+(defun %dial-outbound-peer (node host port count-failure)
+  "Dial HOST:PORT and record the addrman attempt Core's ConnectNode records.
+Returns the connected peer, or NIL.
+
+The ORDER is Core's and is the point: Attempt() runs after the connect
+returns, guarded by the connect's own verdict —
+
+    if (!proxyConnectionFailed) {
+        // If a connection to the node was attempted, and failure (if any) is
+        // not caused by a problem connecting to the proxy, mark this as an
+        // attempt.
+        addrman.get().Attempt(target_addr, fCountFailure);
+    }                                             (net.cpp:494-497)
+
+— so a dial that died at the SOCKS5 proxy blames the address for nothing. We
+stamped BEFORE the dial instead, and MAKE-TCP-CONNECTION reported an
+unreachable proxy and an unreachable target identically (NIL), so there was no
+verdict to consult: with the Tor daemon down, or -proxy pointed at a port
+nothing listens on, every onion address the selection offered took a last_try
+stamp and — once %COUNT-ADDRMAN-FAILURES-P is satisfied, which it is on any
+node with two outbound netgroups — a real addrman FAILURE too, for a dial that
+never left this machine. +ADDRMAN-RETRIES+ of those make an entry terrible:
+getaddr stops returning it, it becomes a preferred overwrite target and its
+GetChance collapses. A Tor outage would quietly consume the onion half of the
+address book.
+
+Only the PROXY carve-out is Core's. A proxy that answers and then reports the
+target unreachable is a verdict about the target, and Core counts it (its flag
+is raised solely by `proxy.Connect()' returning nothing, netbase.cpp:790-794).
+
+COUNT-FAILURE is Core's fCountFailure; see %RECORD-DIAL-ATTEMPT."
+  (multiple-value-bind (peer proxy-failed) (bl.net:connect-peer host port)
+    (unless proxy-failed
+      (%record-dial-attempt node host port count-failure))
+    peer))
 
 (defun %seed-address-book-from-dns (node)
   "Query the DNS seeds and put what they return into the address book, the way
@@ -783,12 +815,10 @@ Returns the number of new peers connected."
               (handler-case
                   (let* ((dial-port (or (cdr candidate)
                                         (network-port (node-network node))))
-                         (peer (progn
-                                 (%record-dial-attempt
-                                  node addr dial-port
-                                  (%count-addrman-failures-p used-groups
-                                                             privacy-peers))
-                                 (bl.net:connect-peer addr dial-port))))
+                         (peer (%dial-outbound-peer
+                                node addr dial-port
+                                (%count-addrman-failures-p used-groups
+                                                           privacy-peers))))
                     (when peer
                       (setf (bl.net:peer-address peer) addr)
                       (when (bl.net:perform-handshake peer :near-tip (bl.net:near-tip-p (node-chain-state node)))
@@ -917,8 +947,7 @@ addrman on its own initiative, i.e. the one that is ThreadOpenConnections, and
 it passes %COUNT-ADDRMAN-FAILURES-P."
   (when (node-network-active node)
     (handler-case
-        (let ((peer (progn (%record-dial-attempt node host port count-failure)
-                           (bl.net:connect-peer host port))))
+        (let ((peer (%dial-outbound-peer node host port count-failure)))
           (when peer
             (setf (bl.net:peer-address peer) host)
             (when manual (setf (bl.net:peer-manual peer) t))
@@ -1068,8 +1097,7 @@ COUNT-FAILURE is Core's fCountFailure: a feeler leaves ThreadOpenConnections
 through the same OpenNetworkConnection call as any other automatic dial
 (net.cpp:2891), so it is gated on the same online test and never hard-coded."
   (handler-case
-      (let ((peer (progn (%record-dial-attempt node host port count-failure)
-                         (bl.net:connect-peer host port))))
+      (let ((peer (%dial-outbound-peer node host port count-failure)))
         (when peer
           (setf (bl.net:peer-address peer) host)
           (when (bl.net:perform-handshake peer :conn-type :feeler)
