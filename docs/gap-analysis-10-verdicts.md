@@ -18,7 +18,86 @@ source, and a green cold battery; every fix cites its Core lines in the commit.
 The two structural-ratchet corrections these merges forced are in the same span of
 main: the `::` ratchet now counts the files the tests system declares (a glob had
 counted two git-ignored scratch files), and the compact-block tests reach their
-handler through one helper. The S2s below remain open.
+handler through one helper. 
+## Fixed on 2026-09-04 and 2026-09-05: every S2 and S3
+
+Eighteen batches of two to five findings each, grouped by file, landed the same
+way: one worktree and one agent per batch, a reproduction and a test that fails on
+the pre-fix source for every finding, the Core lines in each commit, and a green
+cold battery on the merged main before every push (35,080 checks at the first
+push, 35,760 at the last). Commit subjects, by finding:
+
+| finding | commit subject |
+|---|---|
+| `7f01522e`, `fdbe8a5e` | Storage: the blk scan enumerates its files, and the prune window starts at 0 |
+| `c831e584` | Storage: the block index reaches disk before the coins pointer that names it |
+| `d4f123e8` | Config: a negated repeatable option clears its span |
+| `105290bf` | Config: a dotted key in bitcoin.conf is a section setting |
+| `87801e86` | Config: network-only options do not leak out of the default section |
+| `refactor-3` | Config: option-name lookups follow Core's case-sensitive one |
+| `abae237b` | Net: the eviction reserve protects each network's longest-connected peers |
+| `ff51e9d5` | Net: -whitelist=noban survives our own ban list at accept time |
+| `2f0cf648`, `42dacfaf` | Net: only outbound peers decide an outbound dial, and its addrman failure |
+| `d9aadbc5` | Net: automatic outbound dials refuse Core's bad ports |
+| `56b53a04`, `a9ddbd92` | RPC: getnetworkhashps reads both of its arguments and divides as a double |
+| `3f90b8bc` | RPC: getmininginfo omits the last-template fields until one is assembled |
+| `7b813f60` | Mining: an exhausted try budget returns the blocks generate* already mined |
+| `a6afe2d6` | RPC: generateblock gates its coinbase witness on segwit activation |
+| `d2099b36` | Init: -peerblockfilters is refused without its index on any node |
+| `3911beba` | Config: -bind or -whitebind with -listen=0 is an init error |
+| `32758a48`, `631b90f9` | Config: Core's two -maxconnections / -forcednsseed refusals |
+| `801f2ad3` | Config: an option registered SENSITIVE logs **** instead of its value |
+| `508fedab` | Serialization: the PSBT parser applies Core's two global-map checks |
+| `34a807d1` | Wallet: an ECDSA satisfaction is 71 bytes unless Core says 72 |
+| `d8cffd5c` | Wallet: PSBT signing checks the sighash of the signatures already there |
+| `97855c61` | Wallet: walletprocesspsbt reports complete only when the scripts verify |
+| `83599047` | Mining: block templates signal the deployments the versionbits cache reports |
+| `57e206a8`, `81c98c4b` | Validation: the BIP94 timewarp rule follows the chain, and regtest can enable it |
+| `cc698623` | REST: every /rest/ endpoint answers 503 during warmup |
+| `2834e5b3` | RPC: a batch member takes the singleton's request path |
+| `e2db2089` | RPC: -rpcwhitelist restricts what each user may call |
+| `7db4b27f`, `b48227fc` | Script: one FindAndDelete pattern, and it is the signature's push |
+| `272e30f0` | Script: CONST_SCRIPTCODE reads every legacy script for a codeseparator |
+| `b219c779` | RPC: getrawtransaction's blockhash is a containment check |
+| `fac08286` | Serialization: the coinbase's wtxid is its own witness hash |
+| `0a061de4` | RPC: getrawmempool reads its mempool_sequence argument |
+| `f506ca73` | Wallet: a wallet from another chain is refused, not rescanned |
+| `feac3eb3` | REST: /rest/spenttxouts serves Core's REST format, not the rev-file codec |
+| `24e0c216` | REST: /rest/block/<hash>.json renders Core's verbosity 3 |
+| `0e7ec2f3` | REST: /rest/mempool/contents.json reads its verbose and sequence parameters |
+| `a7b67ad1` | Script: CLTV and CSV are plain NOPs when their own flag is off |
+| `d410b7bf` | Script: IsPushOnly counts OP_RESERVED, exactly as Core's does |
+| `f5b31fb7` | Script: CHECKMULTISIG charges its key count before it verifies |
+| (found in passing) | Script: an empty signature still checks the pubkey encoding |
+| `38bb5cc7` | Validation: MoneyRange bounds the input side too, not only outputs |
+| `6635e4c9` | Validation: a package's prevouts are added one transaction at a time |
+| `994f223b`, `54fdda5c` | Validation: relay finality decides before the pool and the coins do |
+| `0c63c99c` | Validation: CheckTxInputs decides before the input policy checks |
+| `5054e381` | Net: a feature negotiation after verack drops the peer |
+| `98069fe2` | Net: sendcmpct(0) demotes us again, as sendcmpct(1) promoted us |
+| `df63423d` | Net: a banned or discouraged address is not stored, nor gossiped on |
+| `ba446c02` | Validation: block connect reads the script-execution cache the mempool fills |
+| `ccac3137` | Validation: the intra-block coin overlay drops what AddCoin drops |
+| `9f54cae8` | Validation: the reorg's commit phase carries connect-block's role guard |
+| `88f3a071` | Mempool: a block conflict takes the conflicted tx's delta with it |
+| `d73be57b` | Mempool: the rolling minimum holds until a block, then decays piecewise |
+| `70502bf3` | Net: a full send buffer defers the peer's input, it does not drop ours |
+| `a4680ae1`, `0c05f5d0` | Net: gossiped addresses wait in a per-peer queue, not on the wire |
+| `8d88f6ac` | Crypto: base58 decoding stops at the bound Core's callers pass |
+| `refactor-1` | Storage: an atomic rename syncs the directory that carries the name |
+| `refactor-2` | fixed during GA10 itself (the util-layer export regression) |
+
+Two facts the round changed its mind about while fixing: the manual's claim that
+the script-execution cache must key on the spent scriptPubKey was wrong (Core keys
+on wtxid and flags and enforces soundness where it writes), and Core does not mark
+a BLOCK_MUTATED body failed, so neither does the pre-write gate. Divergences the
+agents found next to a finding and left for the next round are named in the
+commit messages: the getrawtransaction genesis-coinbase exception, the sigop-cost
+cap's position relative to the ephemeral-dust checks, getdata deferral for a
+send-paused peer, the RelayAddress rotation key, the many-to-one script error
+type behind the corpus (SE-VerifyFailed stands in for thirteen Core errors), and
+the corpus runner comparing only accept/reject. The cold lane also gained a gate
+for wrong-arity calls (SBCL reports them as a style warning only).
 
 | id | final | exec | finding |
 |---|---|---|---|
