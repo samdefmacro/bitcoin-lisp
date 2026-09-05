@@ -475,7 +475,12 @@
   not name a port on Core's IsBadPort deny-list, or a gossiped
   `victim:25' turns the node into someone else's SMTP client. Storage
   and relay are deliberately unfiltered, as in Core, and manual
-  connections bypass addrman entirely.
+  connections bypass addrman entirely. A failed dial says WHOSE fault it
+  was: MAKE-TCP-CONNECTION's second value is Core's
+  `proxy_connection_failed', raised only when the TCP connect to the
+  SOCKS5 proxy itself failed and never for a handshake the proxy
+  answered, and CONNECT-PEER passes it through so the addrman recorder
+  can charge the address nothing for an outage of ours.
 
   Trap: a test that drives two real connections without a pump hangs
   until its timeout, because nothing ever sends; drain the send queue."

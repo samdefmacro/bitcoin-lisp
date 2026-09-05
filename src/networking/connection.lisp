@@ -237,7 +237,9 @@ Bounded reading is RECEIVE-BYTES' own job, via DRAIN-AVAILABLE-BYTES."
 
 (defun make-tcp-connection (host port &key (timeout 10))
   "Create a TCP connection to HOST:PORT.
-Returns a connection structure or NIL on failure.
+Returns (VALUES CONNECTION PROXY-CONNECTION-FAILED-P): the connection, or NIL
+on failure, and T only when the failure was that the SOCKS5 PROXY itself could
+not be reached.
 
 The proxy is picked per target network (proxy-for-target, netaddress.lisp —
 a forward reference resolved at load time, like ibd-stop-requested-p in
@@ -252,43 +254,55 @@ username/password so Tor isolates it on its own circuit. Mirrors Bitcoin
 Core's ConnectNode proxy branch (net.cpp:439-497) + ConnectThroughProxy
 (netbase.cpp:786-810). The returned connection records the TARGET host/port,
 so callers (including the v1-fallback re-dial in peer.lisp) re-dial through
-the right proxy transparently."
+the right proxy transparently.
+
+The second value is Core's `proxy_connection_failed' out-parameter, and it is
+raised exactly where Core raises it: ConnectThroughProxy sets it when
+`proxy.Connect()' returns nothing — the TCP connect to the proxy server — and
+NOWHERE else (netbase.cpp:785-809). A SOCKS5 handshake that fails after that,
+including a CONNECT reply of \"host unreachable\" or \"connection refused\",
+leaves it false, because the proxy did answer and the verdict is about the
+TARGET. %RECORD-DIAL-ATTEMPT's caller reads it: a dial that never left the
+local machine must not be charged to the address (net.cpp:494-497)."
   (multiple-value-bind (proxy refusal) (proxy-for-target host)
     (when refusal
       (bl.log:log-debug "Not dialing ~A:~D: ~A" host port refusal)
       (return-from make-tcp-connection nil))
-    (handler-case
-      (let* ((socket (usocket:socket-connect (if proxy (proxy-host proxy) host)
-                                             (if proxy (proxy-port proxy) port)
-                                             :element-type '(unsigned-byte 8)
-                                             :timeout timeout)))
-        (set-tcp-nodelay socket)
+    (let ((socket (handler-case
+                      (usocket:socket-connect (if proxy (proxy-host proxy) host)
+                                              (if proxy (proxy-port proxy) port)
+                                              :element-type '(unsigned-byte 8)
+                                              :timeout timeout)
+                    ((or usocket:socket-error usocket:timeout-error) () nil))))
+      (unless socket
         (when proxy
-          (handler-case
-              (if (proxy-randomize-credentials proxy)
-                  (let ((credentials (next-proxy-credentials)))
-                    (socks5-connect socket host port
-                                    :username credentials :password credentials))
-                  (socks5-connect socket host port))
-            (error (e)
-              (bl.log:log-debug "SOCKS5 connect to ~A:~D via ~A:~D failed: ~A"
-                                      host port (proxy-host proxy) (proxy-port proxy) e)
-              (ignore-errors (usocket:socket-close socket))
-              (return-from make-tcp-connection nil))))
-        ;; Non-blocking AFTER the SOCKS5 handshake: socks5-connect speaks over
-        ;; the blocking stream and needs no change in semantics.
-        (set-socket-non-blocking socket)
-        (make-connection :socket socket
-                         :host host
-                         :port port
-                         :connected t
-                         :last-activity (bl.ser:get-node-time)))
-      (usocket:socket-error (e)
-        (declare (ignore e))
-        nil)
-      (usocket:timeout-error (e)
-        (declare (ignore e))
-        nil))))
+          (bl.log:log-debug "Proxy ~A:~D unreachable, ~A:~D was never dialed"
+                            (proxy-host proxy) (proxy-port proxy) host port))
+        (return-from make-tcp-connection (values nil (and proxy t))))
+      (handler-case
+          (progn
+            (set-tcp-nodelay socket)
+            (when proxy
+              (handler-case
+                  (if (proxy-randomize-credentials proxy)
+                      (let ((credentials (next-proxy-credentials)))
+                        (socks5-connect socket host port
+                                        :username credentials :password credentials))
+                      (socks5-connect socket host port))
+                (error (e)
+                  (bl.log:log-debug "SOCKS5 connect to ~A:~D via ~A:~D failed: ~A"
+                                    host port (proxy-host proxy) (proxy-port proxy) e)
+                  (ignore-errors (usocket:socket-close socket))
+                  (return-from make-tcp-connection nil))))
+            ;; Non-blocking AFTER the SOCKS5 handshake: socks5-connect speaks over
+            ;; the blocking stream and needs no change in semantics.
+            (set-socket-non-blocking socket)
+            (make-connection :socket socket
+                             :host host
+                             :port port
+                             :connected t
+                             :last-activity (bl.ser:get-node-time)))
+        ((or usocket:socket-error usocket:timeout-error) () nil)))))
 
 (defun open-listener (bind port &key (backlog 16))
   "Open a listening TCP server socket on BIND:PORT for inbound peers. Returns the

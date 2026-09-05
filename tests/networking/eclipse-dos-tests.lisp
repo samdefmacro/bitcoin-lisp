@@ -2116,11 +2116,15 @@ section."
 -connect, `addnode onetry', -seednode and the addconnection RPC all land here."
   (bl::establish-outbound-peer node host port :manual t))
 
-(defun %hosts-dialed-by (thunk)
+(defun %hosts-dialed-by (thunk &optional proxy-failed)
   "The hosts the code under test asked BL.NET:CONNECT-PEER for while THUNK ran.
 The stub returns NIL, so the dial fails the way an unreachable address does and
 nothing past the connect runs — which is what lets a unit test drive the real
-sweep instead of a re-implementation of it."
+sweep instead of a re-implementation of it.
+
+PROXY-FAILED makes it fail the OTHER way Core distinguishes: CONNECT-PEER's
+second value, Core's `proxy_connection_failed', is T when the dial died at the
+SOCKS5 proxy and so says nothing at all about the address it named."
   (let ((dialed '())
         (real (fdefinition 'bl.net:connect-peer)))
     (unwind-protect
@@ -2129,7 +2133,7 @@ sweep instead of a re-implementation of it."
                  (lambda (host &optional port &rest more)
                    (declare (ignore port more))
                    (push host dialed)
-                   nil))
+                   (values nil proxy-failed)))
            (funcall thunk))
       (setf (fdefinition 'bl.net:connect-peer) real))
     (nreverse dialed)))
@@ -2258,6 +2262,75 @@ addrman failure")))
                 "witness: ~A did reach the recorder" what)
             (is (= expected (bl.net:peer-address-n-attempts record))
                 "~A: ~A" what why)))))))
+
+(test a-proxy-failure-is-charged-to-no-address
+  "Core's Attempt() is guarded by the connect's own verdict:
+
+    if (!proxyConnectionFailed) {
+        // If a connection to the node was attempted, and failure (if any) is
+        // not caused by a problem connecting to the proxy, mark this as an
+        // attempt.
+        addrman.get().Attempt(target_addr, fCountFailure);
+    }                                                (net.cpp:494-497)
+
+so a dial that died at the SOCKS5 proxy costs the ADDRESS nothing. We stamped
+the attempt BEFORE the dial, from a path that could not tell an unreachable
+proxy from an unreachable peer, so with the Tor daemon down — or -proxy
+pointed at a port nothing listens on — every address the selection offered
+took a last_try stamp, and a real addrman FAILURE too on any node with two
+outbound netgroups. +ADDRMAN-RETRIES+ of those make an entry terrible: getaddr
+drops it, it becomes a preferred overwrite target and its GetChance collapses,
+so a proxy outage would quietly consume the half of the address book that
+needs the proxy.
+
+Both drivers are checked, because they read different halves of the record:
+the automatic refill is the only caller that may count a FAILURE, while a
+named destination can only ever move last_try — which makes last_try the
+witness that the recorder was reached at all."
+  (let ((candidates (list (cons *dial-candidate* 8333)))
+        (online (list (%outbound-peer "198.51.100.1")
+                      (%outbound-peer "192.0.2.1"))))
+    (flet ((refill (proxy-failed)
+             (let ((book (%candidate-book)))
+               (%hosts-dialed-by
+                (lambda ()
+                  (%refill-outbound (%dial-probe-node online candidates book)))
+                proxy-failed)
+               (%candidate-record book)))
+           (named (proxy-failed)
+             (let ((book (%candidate-book)))
+               (%hosts-dialed-by
+                (lambda ()
+                  (%dial-named-destination
+                   (%dial-probe-node online candidates book)
+                   *dial-candidate* 8333))
+                proxy-failed)
+               (%candidate-record book))))
+      (let ((target-failure (refill nil))
+            (proxy-failure (refill t))
+            (named-target (named nil))
+            (named-proxy (named t)))
+        (is-true target-failure)
+        (is-true proxy-failure)
+        (is-true named-target)
+        (is-true named-proxy)
+        (when (and target-failure proxy-failure named-target named-proxy)
+          ;; Controls: an ordinary unreachable TARGET must still be charged,
+          ;; or "nothing was recorded" would prove only that the sweep never
+          ;; reached the recorder.
+          (is (plusp (bl.net:peer-address-last-attempt target-failure))
+              "control: an unreachable target still stamps last_try")
+          (is (= 1 (bl.net:peer-address-n-attempts target-failure))
+              "control: and, on an online node, one addrman failure")
+          (is (plusp (bl.net:peer-address-last-attempt named-target))
+              "control: a named destination stamps last_try too")
+          ;; The carve-out.
+          (is (zerop (bl.net:peer-address-last-attempt proxy-failure))
+              "a dead proxy must not stamp last_try on the target")
+          (is (zerop (bl.net:peer-address-n-attempts proxy-failure))
+              "nor charge it an addrman failure")
+          (is (zerop (bl.net:peer-address-last-attempt named-proxy))
+              "and the same holds for a named destination"))))))
 
 (test ga9-s2-6-onion-inbounds-are-not-the-default-eviction-victim
   "All inbound onion peers arrive through the local Tor daemon, so ip-netgroup
