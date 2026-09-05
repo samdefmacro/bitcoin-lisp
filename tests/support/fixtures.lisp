@@ -163,6 +163,89 @@ Three test files ask this question, which is why it is a fixture rather than
 a reach into the handler from each of them."
   (bl.net::handle-getdata peer payload ctx))
 
+(defun deliver-tx (peer payload ctx)
+  "Drive one tx message PAYLOAD through the shipped handler (Core's TX branch
+of ProcessMessage): the IBD gate, the rejects and recently-confirmed checks,
+mempool validation, orphan intake and relay.
+
+Four test files ask this question, which is why it is a fixture rather than
+thirty-seven reaches into the handler."
+  (bl.net::handle-tx peer payload ctx))
+
+(defun deliver-inv (peer payload ctx)
+  "Drive one inv message PAYLOAD through the shipped handler (Core's INV
+branch: block availability, AddTxAnnouncement, and the getdata it triggers)."
+  (bl.net::handle-inv peer payload ctx))
+
+(defun deliver-notfound (peer payload ctx)
+  "Drive one notfound message PAYLOAD through the shipped handler (Core's
+NOTFOUND branch -> ReceivedNotFound)."
+  (bl.net::handle-notfound peer payload ctx))
+
+;;;; The tx-request tracker (Core TxRequestTracker)
+;;;
+;;; White-box readers for a structure with no public accessors: the state a
+;;; tx-relay test asserts on is the tracker's, and every one of these
+;;; questions was being asked from several test files at once.
+
+(defun tx-request-in-flight-peer (hash)
+  "The peer holding the outstanding getdata for HASH (Core's REQUESTED
+announcement), or NIL when nothing is in flight for it."
+  (car (gethash hash bl.net::*tx-in-flight*)))
+
+(defun tx-request-announcement-peers (hash &key completed)
+  "The peers with an announcement of HASH, newest first. By default only the
+LIVE ones (Core's non-COMPLETED states, what GetCandidatePeers returns); with
+COMPLETED true, every announcement the tracker still holds for the hash."
+  (loop for ann in (gethash hash bl.net::*tx-announcers*)
+        when (or completed (not (bl.net::tx-ann-completed ann)))
+          collect (bl.net::tx-ann-peer ann)))
+
+(defun tx-request-completed-p (hash peer)
+  "T when PEER's announcement of HASH exists and is COMPLETED -- Core's
+State::COMPLETED, the slot a failed peer keeps."
+  (let ((ann (find peer (gethash hash bl.net::*tx-announcers*)
+                   :key #'bl.net::tx-ann-peer :test #'eq)))
+    (and ann (bl.net::tx-ann-completed ann) t)))
+
+(defun tx-request-wtxid-entry-p (hash)
+  "T when HASH is tracked as a wtxid (MSG_WTX) announcement rather than a
+txid one -- what decides the inv type of its getdata."
+  (gethash hash bl.net::*tx-request-wtxid-p*))
+
+(defun backdate-tx-announcements (hash &optional (seconds 1))
+  "Make every announcement of HASH due, as if its NONPREF/TXID/OVERLOADED
+delay had elapsed SECONDS ago, so the next scheduler pass may grant it. Every
+announcement gets the SAME ready time, which is what lets a test ask which
+one the tracker picks without announcement time deciding it. Returns the
+number of announcements moved."
+  (let ((ready (- (get-internal-real-time)
+                  (max 1 (* seconds internal-time-units-per-second))))
+        (n 0))
+    (dolist (ann (gethash hash bl.net::*tx-announcers*) n)
+      (incf n)
+      (setf (bl.net::tx-ann-ready ann) ready))))
+
+(defun expire-tx-request (hash &optional (seconds 120))
+  "Backdate HASH's in-flight request SECONDS into the past, so the next
+RETRY-TIMED-OUT-TX-REQUESTS sees it past GETDATA_TX_INTERVAL. Returns the
+peer whose request was backdated, or NIL if nothing was in flight."
+  (let ((entry (gethash hash bl.net::*tx-in-flight*)))
+    (when entry
+      (setf (cdr entry) (- (get-internal-real-time)
+                           (* seconds internal-time-units-per-second)))
+      (car entry))))
+
+(defun (setf tx-request-peer-count) (n peer)
+  "Put PEER's tracked-announcement count at N (Core m_peerinfo[peer].m_total)
+so a cap test does not need N real announcements."
+  (setf (gethash peer bl.net::*tx-peer-announcements*) n))
+
+(defun (setf tx-request-peer-in-flight-count) (n peer)
+  "Put PEER's in-flight request count at N (Core CountInFlight), the input to
+the OVERLOADED_PEER_TX_DELAY."
+  (setf (gethash peer bl.net::*tx-peer-in-flight*) n))
+
 (defun drain-peer-once (peer node-ctx &optional ibd-ctx)
   "Run the shipped per-peer message pump over PEER exactly once (Core's
 per-peer ProcessMessages pass): serve whatever getdata the last pass left

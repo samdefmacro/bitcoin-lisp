@@ -488,11 +488,9 @@ request). After the tx is received, a later announce requests again."
     (bl.net:tx-request-wanted-p txid p2)
     ;; backdate the in-flight timestamp by >timeout to force a re-route
     ;; (internal-real-time is image-relative, so use a real elapsed delta)
-    (setf (gethash txid bl.net::*tx-in-flight*)
-          (cons p1 (- (get-internal-real-time)
-                      (* 120 internal-time-units-per-second))))
+    (is (eq p1 (expire-tx-request txid)))
     (is (= 1 (bl.net:retry-timed-out-tx-requests)))
-    (is (eq p2 (car (gethash txid bl.net::*tx-in-flight*))))
+    (is (eq p2 (tx-request-in-flight-peer txid)))
     (bl.net:reset-tx-requests)))
 
 (test tx-request-retry-drops-when-no-other-announcer
@@ -501,11 +499,9 @@ request). After the tx is received, a later announce requests again."
   (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
         (p1 (%make-peer-with-state :ready)))
     (bl.net:tx-request-wanted-p txid p1)
-    (setf (gethash txid bl.net::*tx-in-flight*)
-          (cons p1 (- (get-internal-real-time)
-                      (* 120 internal-time-units-per-second))))
+    (is (eq p1 (expire-tx-request txid)))
     (is (= 0 (bl.net:retry-timed-out-tx-requests)))
-    (is (null (gethash txid bl.net::*tx-in-flight*)))
+    (is (null (tx-request-in-flight-peer txid)))
     (bl.net:reset-tx-requests)))
 
 (test update-block-availability-known-hash
@@ -1304,7 +1300,7 @@ getdata is attempted (Core net_processing.cpp:4176-4180)."
     (bl.net:reset-tx-requests)
     ;; With the announcer's peer having no connection, a getdata attempt
     ;; would error — the gate must short-circuit before any of that.
-    (finishes (bl.net::handle-inv announcer payload (bl.ctx:make-node-context :chain-state state :mempool mempool)))
+    (finishes (deliver-inv announcer payload (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     ;; Nothing was recorded for the hash: a fresh request from another
     ;; peer is still "wanted" (no outstanding in-flight entry).
     (is-true (bl.net:tx-request-wanted-p tx-hash probe))
@@ -1344,12 +1340,12 @@ announcement from a wtxidrelay peer was silently dropped."
     ;; of handle-inv errors — but the tracker recording happens first, which
     ;; is the observable we assert on.
     (ignore-errors
-      (bl.net::handle-inv wtx-announcer (funcall inv-payload bl.ser:+inv-type-wtx+ wtxid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
+      (deliver-inv wtx-announcer (funcall inv-payload bl.ser:+inv-type-wtx+ wtxid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     ;; Recorded: a probe from another peer sees the request outstanding.
     (is-false (bl.net:tx-request-wanted-p wtxid probe))
     ;; MSG_TX (txid) announcements keep working alongside.
     (ignore-errors
-      (bl.net::handle-inv tx-announcer (funcall inv-payload bl.ser:+inv-type-tx+ txid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
+      (deliver-inv tx-announcer (funcall inv-payload bl.ser:+inv-type-tx+ txid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     (is-false (bl.net:tx-request-wanted-p txid probe))
     (bl.net:reset-tx-requests)))
 
@@ -1378,12 +1374,12 @@ net_processing.cpp:4145-4152)."
     (bl.net:reset-tx-requests)
     ;; MSG_TX from a wtxidrelay peer: ignored, nothing recorded.
     (finishes
-      (bl.net::handle-inv wtx-peer (funcall inv-payload bl.ser:+inv-type-tx+ h1) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
+      (deliver-inv wtx-peer (funcall inv-payload bl.ser:+inv-type-tx+ h1) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     (is-true (bl.net:tx-request-wanted-p h1 probe))
     ;; MSG_WTX from a non-wtxidrelay peer: ignored too.
     (bl.net:reset-tx-requests)
     (finishes
-      (bl.net::handle-inv legacy-peer (funcall inv-payload bl.ser:+inv-type-wtx+ h2) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
+      (deliver-inv legacy-peer (funcall inv-payload bl.ser:+inv-type-wtx+ h2) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     (is-true (bl.net:tx-request-wanted-p h2 probe))
     (bl.net:reset-tx-requests)))
 
@@ -1427,7 +1423,7 @@ since wtxid = txid there."
     ;; Sanity: this is a witness tx, ids differ.
     (is-false (equalp txid wtxid))
     (bl.net:reset-tx-requests)
-    (bl.net::handle-tx peer payload (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects))
+    (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects))
     (is-true (bl:recent-reject-p rejects wtxid))
     (is-false (bl:recent-reject-p rejects txid))))
 
@@ -1487,16 +1483,14 @@ wtxid hash got notfound and failover never worked for segwit txs."
     (is-true (bl.net:tx-request-wanted-p txid p1 nil))
     (is-false (bl.net:tx-request-wanted-p txid p2 nil))
     ;; Backdate both in-flight entries past the timeout to force failover.
-    (let ((stale (- (get-internal-real-time)
-                    (* 120 internal-time-units-per-second))))
-      (setf (gethash wtxid bl.net::*tx-in-flight*) (cons p1 stale))
-      (setf (gethash txid bl.net::*tx-in-flight*) (cons p1 stale)))
+    (is (eq p1 (expire-tx-request wtxid)))
+    (is (eq p1 (expire-tx-request txid)))
     (is (= 2 (bl.net:retry-timed-out-tx-requests)))
     ;; Both rerouted to p2 with the id type preserved.
-    (is (eq p2 (car (gethash wtxid bl.net::*tx-in-flight*))))
-    (is (eq p2 (car (gethash txid bl.net::*tx-in-flight*))))
-    (is-true (gethash wtxid bl.net::*tx-request-wtxid-p*))
-    (is-false (gethash txid bl.net::*tx-request-wtxid-p*))
+    (is (eq p2 (tx-request-in-flight-peer wtxid)))
+    (is (eq p2 (tx-request-in-flight-peer txid)))
+    (is-true (tx-request-wtxid-entry-p wtxid))
+    (is-false (tx-request-wtxid-entry-p txid))
     ;; The inv the failover getdata carries for each entry type:
     (is (= bl.ser:+inv-type-wtx+
            (bl.ser:inv-vector-type
@@ -1539,8 +1533,7 @@ with the parent's real txid, so the orphan could never resolve."
     ;; timeout failover applies to parent fetches too.
     (is-false (bl.net:tx-request-wanted-p
                (first parents) (%make-peer-with-state :ready)))
-    (is-false (gethash (first parents)
-                       bl.net::*tx-request-wtxid-p*))
+    (is-false (tx-request-wtxid-entry-p (first parents)))
     (bl.net:reset-tx-requests)))
 
 (test orphan-with-rejected-parent-rejected-under-both-ids
@@ -1563,14 +1556,15 @@ parents', txdownloadman_impl.cpp:422-436)."
     (is-false (equalp txid wtxid))
     ;; The missing parent was recently rejected.
     (bl:add-recent-reject rejects parent-txid)
-    (bl.net::handle-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+    (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
     ;; Rejected under both ids; never admitted to the orphan pool; the
     ;; parent was NOT re-requested.
     (is-true (bl:recent-reject-p rejects txid))
     (is-true (bl:recent-reject-p rejects wtxid))
     (is-false (bl.mp:orphan-tx
                (bl.mp:mempool-orphan-pool mempool) txid))
-    (is (zerop (hash-table-count bl.net::*tx-in-flight*)))
+    (is (null (tx-request-in-flight-peer txid)))
+    (is (null (tx-request-in-flight-peer parent-txid)))
     (bl.net:reset-tx-requests)))
 
 (test orphan-with-unrejected-parent-is-kept-and-parent-fetched
@@ -1588,7 +1582,7 @@ and the tx itself is not cached as a reject."
          (parent-txid (make-array 32 :element-type '(unsigned-byte 8)
                                      :initial-element #xB3))
          (payload (subseq (bl.ser:make-tx-message tx :witness t) 24)))
-    (bl.net::handle-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+    (deliver-tx peer payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
     ;; The orphanage is wtxid-keyed (Core TxOrphanage).
     (is-true (bl.mp:orphan-tx
               (bl.mp:mempool-orphan-pool mempool)
@@ -1635,8 +1629,8 @@ genuinely failing non-witness-program spend IS still cached (wtxid-keyed)."
      0 100000000 (%wave8-p2pkh-script) 0)
     ;; Sanity: wtxid == txid for both (no witness), the poisoning precondition.
     (is (equalp stripped-id (bl.ser:transaction-wtxid stripped)))
-    (bl.net::handle-tx peer (subseq (bl.ser:make-tx-message stripped) 24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
-    (bl.net::handle-tx peer (subseq (bl.ser:make-tx-message failing) 24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+    (deliver-tx peer (subseq (bl.ser:make-tx-message stripped) 24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
+    (deliver-tx peer (subseq (bl.ser:make-tx-message failing) 24) (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool :recent-rejects rejects))
     ;; The plain script failure IS cached (proves this fixture reaches the
     ;; reject-insert path)...
     (is-true (bl:recent-reject-p rejects failing-id))
@@ -2139,7 +2133,7 @@ RejectIncomingTxs in the TX handler, net_processing.cpp:4474-4479)."
   (let* ((bl:*network* :mainnet)
          (bl:*mainnet-relay-enabled* nil)
          (peer (bl.net:make-peer :state :ready)))
-    (bl.net::handle-tx peer #() (bl.ctx:make-node-context))
+    (deliver-tx peer #() (bl.ctx:make-node-context))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
 (test handle-inv-disconnects-tx-inv-when-relay-disabled
@@ -2155,7 +2149,7 @@ RejectIncomingTxs in the TX handler, net_processing.cpp:4474-4479)."
                                   :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                        :initial-element 92))))
                           24)))
-    (bl.net::handle-inv peer payload (bl.ctx:make-node-context :chain-state state))
+    (deliver-inv peer payload (bl.ctx:make-node-context :chain-state state))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
 (test blocksonly-rejects-incoming-txs-any-network
@@ -2169,7 +2163,7 @@ otherwise always on."
     ;; tx message in violation of our fRelay=0 -> disconnect
     ;; (Core net_processing.cpp:4474-4479).
     (let ((peer (bl.net:make-peer :state :ready)))
-      (bl.net::handle-tx peer #() (bl.ctx:make-node-context))
+      (deliver-tx peer #() (bl.ctx:make-node-context))
       (is (eq :disconnected (bl.net:peer-state peer))))
     ;; tx inv in violation -> disconnect (net_processing.cpp:4168-4172).
     (let ((state (bl.store:make-chain-state))
@@ -2180,7 +2174,7 @@ otherwise always on."
                                    :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                         :initial-element 94))))
                            24)))
-      (bl.net::handle-inv peer payload (bl.ctx:make-node-context :chain-state state))
+      (deliver-inv peer payload (bl.ctx:make-node-context :chain-state state))
       (is (eq :disconnected (bl.net:peer-state peer)))))
   ;; Default off: regtest relays normally.
   (let* ((bl:*network* :regtest)
@@ -2211,14 +2205,13 @@ it once the delay passes (Core txdownloadman_impl.cpp:216)."
         (inbound (bl.net:make-peer :state :ready :inbound t)))
     ;; Deferred: no immediate request, nothing in flight.
     (is-false (bl.net:tx-request-wanted-p txid inbound))
-    (is (null (gethash txid bl.net::*tx-in-flight*)))
+    (is (null (tx-request-in-flight-peer txid)))
     ;; Not due yet: the scheduler sends nothing.
     (is (= 0 (bl.net:process-tx-requests)))
     ;; Backdate the candidate's ready time; now the scheduler requests it.
-    (let ((ann (first (gethash txid bl.net::*tx-announcers*))))
-      (setf (cdr ann) (- (get-internal-real-time) 1)))
+    (is (= 1 (backdate-tx-announcements txid)))
     (is (= 1 (bl.net:process-tx-requests)))
-    (is (eq inbound (car (gethash txid bl.net::*tx-in-flight*))))
+    (is (eq inbound (tx-request-in-flight-peer txid)))
     (bl.net:reset-tx-requests)))
 
 (test tx-request-txid-relay-delay
@@ -2231,7 +2224,7 @@ txdownloadman_impl.cpp:217)."
         (outbound (bl.net:make-peer :state :ready)))
     ;; num-wtxid-peers = 1: txid announcement deferred...
     (is-false (bl.net:tx-request-wanted-p txid outbound nil 1))
-    (is (null (gethash txid bl.net::*tx-in-flight*)))
+    (is (null (tx-request-in-flight-peer txid)))
     ;; ...wtxid announcement immediate.
     (is-true (bl.net:tx-request-wanted-p wtxid outbound t 1))
     (bl.net:reset-tx-requests)))
@@ -2243,10 +2236,10 @@ txdownloadman_impl.cpp:218-219)."
   (bl.net:reset-tx-requests)
   (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 96))
         (outbound (bl.net:make-peer :state :ready)))
-    (setf (gethash outbound bl.net::*tx-peer-in-flight*)
+    (setf (tx-request-peer-in-flight-count outbound)
           bl.net::+max-peer-tx-request-in-flight+)
     (is-false (bl.net:tx-request-wanted-p txid outbound))
-    (is (null (gethash txid bl.net::*tx-in-flight*)))
+    (is (null (tx-request-in-flight-peer txid)))
     (bl.net:reset-tx-requests)))
 
 (test tx-request-per-peer-announcement-cap
@@ -2256,11 +2249,11 @@ outright — not recorded, not requested (Core txdownloadman_impl.cpp:204-207)."
   (let ((peer (bl.net:make-peer :state :ready))
         (over (make-array 32 :element-type '(unsigned-byte 8) :initial-element 97)))
     ;; Simulate a full announcement budget without 5000 inserts.
-    (setf (gethash peer bl.net::*tx-peer-announcements*)
+    (setf (tx-request-peer-count peer)
           bl.net::+max-peer-tx-announcements+)
     (is-false (bl.net:tx-request-wanted-p over peer))
-    (is (null (gethash over bl.net::*tx-announcers*)))
-    (is (null (gethash over bl.net::*tx-in-flight*)))
+    (is (null (tx-request-announcement-peers over :completed t)))
+    (is (null (tx-request-in-flight-peer over)))
     (bl.net:reset-tx-requests)))
 
 (test tx-request-disconnected-peer-cleanup-and-failover
@@ -2275,11 +2268,11 @@ request over to another announcer (Core TxRequestTracker::DisconnectedPeer)."
     (is-false (bl.net:tx-request-wanted-p txid p2))
     (bl.net:tx-request-disconnected-peer p1)
     ;; p1's request was released and its announcement forgotten.
-    (is (null (gethash txid bl.net::*tx-in-flight*)))
+    (is (null (tx-request-in-flight-peer txid)))
     (is (= 0 (bl.net:tx-request-count p1)))
     ;; The scheduler re-requests from the surviving announcer.
     (is (= 1 (bl.net:process-tx-requests)))
-    (is (eq p2 (car (gethash txid bl.net::*tx-in-flight*))))
+    (is (eq p2 (tx-request-in-flight-peer txid)))
     (bl.net:reset-tx-requests)))
 
 (test tx-request-disconnect-hook-registered
@@ -2293,7 +2286,7 @@ peer's entries."
     (is (= 1 (bl.net:tx-request-count peer)))
     (bl.net:disconnect-peer peer)
     (is (= 0 (bl.net:tx-request-count peer)))
-    (is (null (gethash txid bl.net::*tx-in-flight*)))
+    (is (null (tx-request-in-flight-peer txid)))
     (bl.net:reset-tx-requests)))
 
 (test tx-request-notfound-fails-over
@@ -2311,10 +2304,141 @@ ReceivedResponse; handle-notfound re-runs the scheduler)."
                           24)))
     (is-true (bl.net:tx-request-wanted-p txid p1))
     (is-false (bl.net:tx-request-wanted-p txid p2))
-    (bl.net::handle-notfound p1 payload nil)
-    ;; Failed over to p2; p1's announcement is gone.
-    (is (eq p2 (car (gethash txid bl.net::*tx-in-flight*))))
-    (is (= 0 (bl.net:tx-request-count p1)))
+    (deliver-notfound p1 payload nil)
+    ;; Failed over to p2. p1's announcement is COMPLETED, not deleted: the
+    ;; slot stays so p1 cannot re-announce its way back into the candidate
+    ;; set, and the budget its failure spent stays charged (Core
+    ;; MakeCompleted, txrequest.cpp:456-478).
+    (is (eq p2 (tx-request-in-flight-peer txid)))
+    (is-true (tx-request-completed-p txid p1))
+    (is (= 1 (bl.net:tx-request-count p1)))
+    (is (equal (list p2) (tx-request-announcement-peers txid)))
+    (bl.net:reset-tx-requests)))
+
+(defun %w9-hash (n)
+  "A distinct 32-byte hash for tracker test N."
+  (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (loop for i below 8 do (setf (aref h i) (ldb (byte 8 (* 8 i)) n)))
+    h))
+
+(defun %w9-notfound-payload (hashes)
+  "The `notfound' message payload announcing HASHES as MSG_TX items."
+  (subseq (bl.ser:make-notfound-message
+           (mapcar (lambda (h)
+                     (bl.ser:make-inv-vector
+                      :type bl.ser:+inv-type-witness-tx+ :hash h))
+                   hashes))
+          24))
+
+(test tx-request-notfound-does-not-re-open-the-candidate-slot
+  "A peer that answered notfound may not announce the same hash again while
+another announcer is alive. Core's MakeCompleted keeps the (peer, txhash)
+slot in the ByPeer index, so ReceivedInv's emplace fails and the
+re-announcement is a no-op (txrequest.cpp:456-478, :578-592) -- the invariant
+of txrequest.h:45-58, that giving a peer several chances to announce one
+transaction lets it bias requests in its favour."
+  (bl.net:reset-tx-requests)
+  (let* ((txid (%w9-hash 201))
+         (attacker (%make-peer-with-state :ready))
+         (honest (%make-peer-with-state :ready))
+         (stranger (%make-peer-with-state :ready))
+         (payload (%w9-notfound-payload (list txid))))
+    ;; The attacker announces first and is granted the request; the honest
+    ;; peer is recorded as a live candidate behind it.
+    (is-true (bl.net:tx-request-wanted-p txid attacker))
+    (is-false (bl.net:tx-request-wanted-p txid honest))
+    (deliver-notfound attacker payload nil)
+    ;; The attacker's slot survives as COMPLETED and its re-announcement
+    ;; changes nothing.
+    (is-true (tx-request-completed-p txid attacker))
+    (is-false (bl.net:tx-request-wanted-p txid attacker))
+    (is (equal (list honest) (tx-request-announcement-peers txid)))
+    (is (= 1 (bl.net:tx-request-count attacker)))
+    ;; Positive control: a peer with no announcement of this hash is still
+    ;; recorded, so the refusal above is the completed slot and not a
+    ;; tracker that stopped accepting announcements.
+    (is-false (bl.net:tx-request-wanted-p txid stranger))
+    (is (= 2 (length (tx-request-announcement-peers txid))))
+    (is (= 1 (bl.net:tx-request-count stranger)))
+    (bl.net:reset-tx-requests)))
+
+(test tx-request-last-failed-announcement-forgets-the-hash
+  "The other half of MakeCompleted, and NOT a divergence: when the completing
+announcement is the last non-COMPLETED one for a txhash, Core erases them all
+(IsOnlyNonCompleted, txrequest.cpp:463-470; 'If for a given txhash only
+already-failed announcements remain, they are all forgotten', txrequest.h:52)
+-- so a sole announcer that notfounds is free to re-announce."
+  (bl.net:reset-tx-requests)
+  (let* ((txid (%w9-hash 202))
+         (only (%make-peer-with-state :ready))
+         (payload (%w9-notfound-payload (list txid))))
+    (is-true (bl.net:tx-request-wanted-p txid only))
+    (deliver-notfound only payload nil)
+    (is (null (tx-request-announcement-peers txid :completed t)))
+    (is (= 0 (bl.net:tx-request-count only)))
+    ;; A fresh announcement of a forgotten hash is a fresh candidate.
+    (is-true (bl.net:tx-request-wanted-p txid only))
+    (bl.net:reset-tx-requests)))
+
+(test tx-request-failed-announcements-stay-charged-to-the-peer
+  "MAX_PEER_TX_ANNOUNCEMENTS bounds a peer's FAILURES too: Core counts
+COMPLETED announcements in m_peerinfo.m_total, which is what Count(peer)
+returns and what AddTxAnnouncement checks (txrequest.cpp:660-670,
+txdownloadman_impl.cpp:204-207). Announce-then-notfound rounds against a live
+honest co-announcer therefore climb to the cap and STOP; deleting the failed
+announcement instead refunded the budget, so the attacker's count peaked at 1
+however many rounds it ran and the cap never bound it at all."
+  (bl.net:reset-tx-requests)
+  (let* ((attacker (%make-peer-with-state :ready))
+         ;; A pool of honest announcers, so no single one hits the cap first
+         ;; and leaves the attacker as the only announcer.
+         (honest (loop repeat 6 collect (%make-peer-with-state :ready)))
+         (rounds (+ bl.net::+max-peer-tx-announcements+ 50))
+         (last-hash nil))
+    (dotimes (i rounds)
+      (let ((txid (%w9-hash (+ 300000 i))))
+        (setf last-hash txid)
+        ;; The honest peer announces first and holds the request, so its live
+        ;; announcement keeps the entry alive when the attacker's completes.
+        (bl.net:tx-request-wanted-p txid (nth (mod i 6) honest))
+        (bl.net:tx-request-wanted-p txid attacker)
+        (bl.net:tx-request-received-response attacker txid)))
+    (is (= bl.net::+max-peer-tx-announcements+
+           (bl.net:tx-request-count attacker))
+        "after ~D announce/notfound rounds the attacker is charged ~D of the ~
+~D cap" rounds (bl.net:tx-request-count attacker)
+        bl.net::+max-peer-tx-announcements+)
+    ;; Past the cap its announcements are dropped outright, so the last
+    ;; rounds recorded the honest announcer only.
+    (is (equal (list (nth (mod (1- rounds) 6) honest))
+               (tx-request-announcement-peers last-hash :completed t)))
+    (bl.net:reset-tx-requests)))
+
+(test tx-request-expiry-completes-the-timed-out-announcement
+  "A request that burns the whole GETDATA_TX_INTERVAL completes the
+announcement rather than deleting it (Core SetTimePoint -> MakeCompleted,
+txrequest.cpp:485-500), so the peer that let it expire cannot re-announce and
+take a SECOND window on the same transaction while an honest announcer is
+still waiting."
+  (bl.net:reset-tx-requests)
+  (let ((txid (%w9-hash 203))
+        (attacker (%make-peer-with-state :ready))
+        (honest (%make-peer-with-state :ready)))
+    (is-true (bl.net:tx-request-wanted-p txid attacker))
+    (is-false (bl.net:tx-request-wanted-p txid honest))
+    ;; Window 1 expires and fails over to the honest announcer.
+    (is (eq attacker (expire-tx-request txid)))
+    (is (= 1 (bl.net:retry-timed-out-tx-requests)))
+    (is (eq honest (tx-request-in-flight-peer txid)))
+    (is-true (tx-request-completed-p txid attacker))
+    ;; The attacker cannot buy window 3 by announcing again.
+    (is-false (bl.net:tx-request-wanted-p txid attacker))
+    (is (equal (list honest) (tx-request-announcement-peers txid)))
+    ;; When the last non-completed announcement expires, the whole entry
+    ;; goes (IsOnlyNonCompleted).
+    (is (eq honest (expire-tx-request txid)))
+    (is (= 0 (bl.net:retry-timed-out-tx-requests)))
+    (is (null (tx-request-announcement-peers txid :completed t)))
     (bl.net:reset-tx-requests)))
 
 ;;;; Recently-confirmed filter + most-recent-block tx set
@@ -2374,7 +2498,7 @@ AlreadyHaveTx's recent-confirmed check, txdownloadman_impl.cpp:144)."
         (progn
           (bl.net:reset-tx-requests)
           (bl.val:note-block-connected (%w9-block-with-tx tx))
-          (finishes (bl.net::handle-inv announcer payload (bl.ctx:make-node-context :chain-state state :mempool mempool)))
+          (finishes (deliver-inv announcer payload (bl.ctx:make-node-context :chain-state state :mempool mempool)))
           ;; Nothing recorded: a fresh probe still gets an immediate request.
           (is-true (bl.net:tx-request-wanted-p wtxid probe t)))
       (bl.net:reset-tx-requests)
@@ -2503,14 +2627,14 @@ AddTxAnnouncement's orphan branch + MaybeAddOrphanResolutionCandidate)."
     ;; Orphan stored from p1, parents never requested (direct pool add).
     (bl.mp:orphan-add pool orphan p1)
     (finishes
-      (bl.net::handle-inv p2 payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool)))
+      (deliver-inv p2 payload (bl.ctx:make-node-context :chain-state state :utxo-set utxo :mempool mempool)))
     ;; p2 became an announcer of the orphan...
     (is-true (bl.mp:orphan-have-from-peer pool owtxid p2))
     ;; ...and the missing parent is in flight to p2 (txid-based entry).
-    (is (eq p2 (car (gethash parent-txid bl.net::*tx-in-flight*))))
-    (is-false (gethash parent-txid bl.net::*tx-request-wtxid-p*))
+    (is (eq p2 (tx-request-in-flight-peer parent-txid)))
+    (is-false (tx-request-wtxid-entry-p parent-txid))
     ;; The orphan itself was NOT re-requested.
-    (is (null (gethash owtxid bl.net::*tx-in-flight*)))
+    (is (null (tx-request-in-flight-peer owtxid)))
     (bl.net:reset-tx-requests)))
 
 ;;;; Steady-state drain serves mempool txs end-to-end (loopback)

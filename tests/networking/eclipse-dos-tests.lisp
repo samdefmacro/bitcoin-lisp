@@ -1089,7 +1089,7 @@ turn a link they meant to keep block-only into a tx firehose."
     (flet ((dropped-p (address conn-type)
              (let ((p (%g718-peer :conn-type conn-type :inbound t)))
                (setf (bl.net:peer-address p) address)
-               (bl.net::handle-tx p (make-array 0 :element-type '(unsigned-byte 8)) (bl.ctx:make-node-context))
+               (deliver-tx p (make-array 0 :element-type '(unsigned-byte 8)) (bl.ctx:make-node-context))
                (eq :disconnected (bl.net:peer-state p)))))
       (%with-whitelist (:entries '("relay@10.0.0.0/8"))
         ;; Control: without the permission, -blocksonly drops the sender.
