@@ -1102,12 +1102,9 @@ decide (Core PreChecks, validation.cpp:950-970)."
           (values nil error nil)))
 
       ;; The policy checks that need the spent scriptPubKeys, in Core's order
-      ;; (validation.cpp:896-905): AreInputsStandard, then IsWitnessStandard,
-      ;; then the sigop cost. The computed cost is kept — it is returned to the
-      ;; caller and recorded on the mempool entry, exactly as Core's PreChecks
-      ;; computes nSigOpsCost once and stages it into the entry
-      ;; (validation.cpp:905,924), so the block assembler's sigop budget sees
-      ;; real numbers.
+      ;; (validation.cpp:896-905): AreInputsStandard, IsWitnessStandard, then
+      ;; nSigOpsCost — computed once and kept, as Core computes it once and
+      ;; stages it into the entry (:905,924) for the assembler's sigop budget.
       (let ((sigops-cost
               (flet ((spent-script (txid index)
                        (let ((u (or (bl.store:get-utxo utxo-set txid index)
@@ -1131,12 +1128,9 @@ decide (Core PreChecks, validation.cpp:950-970)."
                            (not (is-witness-standard-p tx #'spent-script)))
                   (return-from validate-transaction-for-mempool
                     (values nil :bad-witness-nonstandard nil)))
-                ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST.
-                (let ((cost (count-transaction-sigops-cost tx #'spent-script)))
-                  (when (> cost +max-standard-tx-sigops-cost+)
-                    (return-from validate-transaction-for-mempool
-                      (values nil :too-many-sigops nil)))
-                  cost))))
+                ;; nSigOpsCost (:905). Its CAP runs further down, where Core
+                ;; runs it: after PreCheckEphemeralTx (:933-939).
+                (count-transaction-sigops-cost tx #'spent-script))))
 
         ;; Convert typed fee to integer. Policy fee checks (floor, RBF) run on
         ;; the prioritisation-modified fee (Core's ws.m_modified_fees); the
@@ -1156,16 +1150,22 @@ decide (Core PreChecks, validation.cpp:950-970)."
                (replaced-set nil))
 
           ;; EPHEMERAL DUST, part 2 (Core PreCheckEphemeralTx,
-          ;; ephemeral_policy.cpp:23, called at validation.cpp:933 — right here,
-          ;; after the fees are known and before the fee-rate floor). A tx
-          ;; carrying dust must pay NOTHING, on base fee AND modified fee, so
-          ;; there is never an incentive to mine it on its own: the dust is only
-          ;; safe while it can travel and be swept as a package.
+          ;; ephemeral_policy.cpp:23, at validation.cpp:933 — after the fees
+          ;; are known and BEFORE the sigop cap). A tx carrying dust must pay
+          ;; NOTHING, base fee AND modified fee, so it is never worth mining
+          ;; alone: the dust is safe only while swept as part of a package.
           (when (and *require-standard*
                      (or (/= fee-value 0) (/= modified-fee-value 0))
                      (plusp (transaction-dust-output-count tx)))
             (return-from validate-transaction-for-mempool
               (values nil :dust nil)))
+
+          ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST
+          ;; (validation.cpp:937-939), after the dust check and not before it:
+          ;; both are TX_NOT_STANDARD, so only the reported reason differs.
+          (when (> sigops-cost +max-standard-tx-sigops-cost+)
+            (return-from validate-transaction-for-mempool
+              (values nil :too-many-sigops nil)))
 
           ;; EPHEMERAL DUST, part 3 (Core CheckEphemeralSpends at
           ;; validation.cpp:1372, with package={ptx}). Only MEMPOOL parents are
