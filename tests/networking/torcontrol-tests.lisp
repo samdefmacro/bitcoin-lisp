@@ -821,7 +821,8 @@ was never lifted, so our address could never have ridden the queue at all."
               "the first self-announcement is its own message")
           (is (= 0 (length (%addr-queue peer)))
               "and does not go through the gossip queue")
-          (is (plusp (%local-addr-deadline peer)) "the ~24h timer is armed")
+          (is (plusp (%local-addr-deadline peer))
+              "the 24-hour timer is armed")
           ;; Due again: the repeat is QUEUED, not sent.
           (setf (%local-addr-deadline peer) 1)
           (is (= 1 (bl.net:maybe-advertise-local-address (list peer) nil)))

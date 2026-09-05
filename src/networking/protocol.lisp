@@ -2728,7 +2728,7 @@ IsAddrCompatible test."
                             (peer-address-port pa)
                             (peer-address peer))
                 t))
-            (and (push-address peer pa) t))))))
+            (push-address peer pa))))))
 
 (defun maybe-advertise-local-address (peers chain-state)
   "Advertise our own best local address to each due addr-relay peer (Core
