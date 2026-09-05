@@ -560,26 +560,31 @@
   timeout for data we had already looked up, and the queue is what lets the
   deep-getblocktxn full-block fallback inherit the getdata path's
   backpressure and serving guards rather than carry a private copy of them.
-  A gossiped address this node
-  has banned or discouraged is dropped at ingest, before addrman and
-  before relay, so the node never re-propagates an address it has itself
-  judged hostile -- but the announcer is still marked as knowing it, which
-  is Core\'s order (AddAddressKnown before the ban test, ++num_proc after
+  A gossiped address this node has banned or discouraged is dropped at
+  ingest, before addrman and before relay, so the node never re-propagates
+  an address it has itself judged hostile -- but the announcer is still marked as knowing it, which
+  is Core's order (AddAddressKnown before the ban test, ++num_proc after
   it): a peer is never handed back an address it has just told us, and
-  `addr_processed` counts only what got past both filters. Relaying an address only QUEUES it on the chosen peers
-  (Core RelayAddress -> PushAddress); one addr/addrv2 per peer carries the
-  whole queue when that peer's own exponential 30s deadline passes, because
-  sending at receive time would tell an observer when and from whom we
-  learned each address. Those peers are the top one or two of a ranking
-  keyed by a PER-NODE secret (`*ADDRESS-RELAY-SALT*`, Core nSeed0/nSeed1) --
-  an unsalted ranking over public inputs lets an attacker compute the
-  destinations in advance and pick addresses to steer them -- and the
-  rotation epoch that fixes the ranking for a day carries the address\'s own
-  hash, so each address turns its destinations over at its own instant
-  rather than the whole topology rotating at 00:00 UTC. The relay stops at
-  those picks: a peer that already knows the address is simply not queued
-  to, never replaced by the next peer down the ranking, which is what keeps
-  a repeated address inside its two destinations for the period.
+  `addr_processed` counts only what got past both filters. Relaying an
+  address only QUEUES it on the chosen peers (Core RelayAddress ->
+  PushAddress); one addr/addrv2 per peer carries the whole queue when that
+  peer's own exponential 30s deadline passes, because sending at receive
+  time would tell an observer when and from whom we learned each address.
+  Our OWN address rides that same queue: Core sends only the first
+  self-announcement on a connection as its own message and pushes every
+  later one, resetting the peer's addr-known filter first so the flush
+  cannot drop the repeat, because a lone addr arriving by itself says
+  exactly when the 24h timer fired. The queue's destinations are the top one
+  or two of a ranking keyed by a PER-NODE secret (`*ADDRESS-RELAY-SALT*`,
+  Core nSeed0/nSeed1) -- an unsalted ranking over public inputs lets an
+  attacker compute the destinations in advance and pick addresses to steer
+  them -- and the rotation epoch that fixes that ranking for a day carries
+  the address's own hash, so each address turns its destinations over at its
+  own instant rather than the whole topology rotating at 00:00 UTC. The
+  relay stops at those picks: a peer that already knows the address is
+  simply not queued to, never replaced by the next peer down the ranking,
+  which is what keeps a repeated address inside its two destinations for
+  the period.
 
   Traps: `getheaders` must send the locator of the LAST header the peer
   gave us, never our own tip, or an ordinary lagging peer loops forever.
