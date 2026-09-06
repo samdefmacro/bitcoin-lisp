@@ -20,6 +20,13 @@ wallet test files do."
                                            (push (cons key value) out)))
     (nreverse out)))
 
+;;;; The wallet a manager currently holds loaded
+
+(defun loaded-wallet (manager name)
+  "The wallet MANAGER has loaded under NAME, or NIL. Named here because three
+wallet test files were reaching into the manager's table to say it."
+  (gethash name (bl.wallet::wallet-manager-wallets manager)))
+
 ;;;; Addressing one wallet through the RPC handlers
 
 (defmacro with-rpc-wallet ((name) &body body)
