@@ -235,6 +235,33 @@ Bounded reading is RECEIVE-BYTES' own job, via DRAIN-AVAILABLE-BYTES."
   #-sbcl
   (declare (ignore usocket-socket)))
 
+(defvar *name-lookup* t
+  "Core fNameLookup / -dns (DEFAULT_NAME_LOOKUP = true, netbase.h:23,28):
+whether this node may ask the LOCAL resolver to turn a name into an address.
+
+An operator sets -dns=0 to stop the machine emitting DNS queries that disclose
+which peers it is configured to reach. It does not stop the node dialing by
+name through a proxy, which is what DIAL-NAME-REFUSAL below is careful about.
+It does not gate the DNS SEEDS either: Core queries those with a hardcoded
+fAllowLookup and gates them on -dnsseed and on having no name proxy
+(net.cpp:2355-2371).")
+
+(defun dial-name-refusal (host)
+  "Why HOST must not be handed to the local resolver, or NIL -- Core's
+`fNameLookup && !HaveNameProxy()' (net.cpp:406), stated over the string a dial
+is ABOUT to give the resolver.
+
+Core's condition has two halves and both are here. The name-proxy half is
+structural: MAKE-TCP-CONNECTION gives a proxied target to the SOCKS5 CONNECT as
+ATYP DOMAINNAME and never to the resolver, so the only string that can reach it
+when a proxy applies is the PROXY's own host -- which is exactly what Core
+resolves under fNameLookup at init.cpp:1722. The -dns half is this flag. An
+address literal is never a lookup, in Core (Lookup parses it first) or here."
+  (when (and (not *name-lookup*)
+             (stringp host)
+             (not (string-to-ip-bytes host)))
+    "-dns=0 forbids resolving a name locally"))
+
 (defun make-tcp-connection (host port &key (timeout 10))
   "Create a TCP connection to HOST:PORT.
 Returns (VALUES CONNECTION PROXY-CONNECTION-FAILED-P): the connection, or NIL
@@ -268,8 +295,16 @@ local machine must not be charged to the address (net.cpp:494-497)."
     (when refusal
       (bl.log:log-debug "Not dialing ~A:~D: ~A" host port refusal)
       (return-from make-tcp-connection nil))
+    ;; The one string this dial can hand the local resolver: the proxy's host
+    ;; when one applies (the target then travels inside the SOCKS5 CONNECT),
+    ;; otherwise the target itself.
+    (let* ((dial-host (if proxy (proxy-host proxy) host))
+           (name-refusal (dial-name-refusal dial-host)))
+      (when name-refusal
+        (bl.log:log-debug "Not dialing ~A:~D: ~A" host port name-refusal)
+        (return-from make-tcp-connection nil))
     (let ((socket (handler-case
-                      (usocket:socket-connect (if proxy (proxy-host proxy) host)
+                      (usocket:socket-connect dial-host
                                               (if proxy (proxy-port proxy) port)
                                               :element-type '(unsigned-byte 8)
                                               :timeout timeout)
@@ -302,7 +337,7 @@ local machine must not be charged to the address (net.cpp:494-497)."
                              :port port
                              :connected t
                              :last-activity (bl.ser:get-node-time)))
-        ((or usocket:socket-error usocket:timeout-error) () nil)))))
+        ((or usocket:socket-error usocket:timeout-error) () nil))))))
 
 (defun open-listener (bind port &key (backlog 16))
   "Open a listening TCP server socket on BIND:PORT for inbound peers. Returns the

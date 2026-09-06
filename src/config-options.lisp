@@ -461,6 +461,13 @@
              ;; Core: -par=1 means no extra threads at all.
              (setf *parallel-block-validation* (> n 1)))))
 ;; -whitelistrelay / -whitelistforcerelay (Core net_permissions.h:20-22).
+;; -dns: whether a name may be handed to the LOCAL resolver (Core fNameLookup,
+;; DEFAULT_NAME_LOOKUP = true, netbase.h:23,28). Read at net.cpp:406 as
+;; `fNameLookup && !HaveNameProxy()' for a dial target, and at init.cpp:1722,
+;; 1778, 1804, 2234 and torcontrol.cpp:156 for the addresses the options
+;; themselves name. It does NOT gate the DNS seeds, which Core queries with a
+;; hardcoded fAllowLookup (net.cpp:2371) -- that is -dnsseed.
+(define-option "dns" :type :bool :global bl.net:*name-lookup*)
 (define-option "whitelistrelay" :type :bool :global bl.net:*whitelist-relay*)
 (define-option "whitelistforcerelay" :type :bool :global bl.net:*whitelist-force-relay*)
 ;; -stopatheight: shut down once the tip reaches this height (Core
@@ -494,7 +501,7 @@
   "checkaddrman" "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "dbbatchsize" "deprecatedrpc"
-  "discover" "dns"
+  "discover"
   "help" "i2pacceptincoming" "i2psam"
   "ipcbind" "limitancestorcount" "limitancestorsize"
   "limitdescendantcount" "limitdescendantsize" "logips"

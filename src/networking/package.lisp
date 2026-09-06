@@ -33,6 +33,7 @@ headerssync.cpp. src/networking/.")
    #:flush-send-buffer
    #:flush-peer-send-buffers
    #:*max-send-buffer-bytes*
+   #:*name-lookup*
    ;; BIP324 v2 transport
    #:*v2-transport-enabled*
    #:v2-available-p

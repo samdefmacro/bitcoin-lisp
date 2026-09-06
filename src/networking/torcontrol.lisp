@@ -614,7 +614,16 @@ Core never subscribes to events) until EOF or shutdown."
   (loop while (%tor-read-line ctl)))
 
 (defun %tor-connect (ctl)
-  "Open the control-port TCP connection. Returns T on success."
+  "Open the control-port TCP connection. Returns T on success.
+
+Core resolves the control centre under fNameLookup and refuses the connection
+when the lookup is not allowed (torcontrol.cpp:156-159), so -dns=0 stops a
+named -torcontrol from becoming a DNS query too."
+  (let ((refusal (dial-name-refusal (tor-controller-control-host ctl))))
+    (when refusal
+      (bl.log:log-cat "tor" "Failed to look up control center ~A: ~A"
+                            (tor-controller-control-host ctl) refusal)
+      (return-from %tor-connect nil)))
   (handler-case
       (progn
         (setf (tor-controller-socket ctl)

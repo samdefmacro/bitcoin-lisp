@@ -132,9 +132,9 @@ just level 0 answering for everything."
 table with Core's defaults (init.cpp:1388-1389, GetIntArg 6 and 3), so they
 reach start-node instead of being parsed and thrown away."
   (is (eq :start-node (bl.cfg:config-option-kind
-                       (bl.cfg::find-config-option "checkblocks"))))
+                       (bl.cfg:find-config-option "checkblocks"))))
   (is (eq :start-node (bl.cfg:config-option-kind
-                       (bl.cfg::find-config-option "checklevel"))))
+                       (bl.cfg:find-config-option "checklevel"))))
   (is (= 6 bl.val:+default-checkblocks+))
   (is (= 3 bl.val:+default-checklevel+))
   (let ((plist (start-node-plist '("-regtest" "-checkblocks=12" "-checklevel=4"))))
