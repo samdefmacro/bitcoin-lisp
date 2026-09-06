@@ -2477,55 +2477,61 @@ taproot) using this node's per-network activation heights."
           ;; the signalling count got nothing from us at all.
           ,@(%bip9-deployments chain-state at-entry network))))))
 
+(defun %bip9-signalling-string (bits)
+  "Core's per-block signalling string (rpc/blockchain.cpp:1341-1348): `#' for a
+block of the current period that set the deployment's bit, `-' for one that did
+not. BITS is indexed from the START of the period (BL.VAL:VERSIONBITS-INFO), so
+the first character is the period's first block and the last is the block being
+reported on."
+  (map 'string (lambda (bit) (if (zerop bit) #\- #\#)) bits))
+
+(defun %bip9-statistics (stats)
+  "The `statistics' object for STATS, a BL.VAL:VB-STATS (Core
+SoftForkDescPushBack, rpc/blockchain.cpp:1333-1341). Core omits `threshold' and
+`possible' together when the threshold is zero and the deployment can no longer
+fail."
+  `(("period" . ,(bl.val:vb-stats-period stats))
+    ("elapsed" . ,(bl.val:vb-stats-elapsed stats))
+    ("count" . ,(bl.val:vb-stats-count stats))
+    ,@(let ((threshold (bl.val:vb-stats-threshold stats))
+            (possible (bl.val:vb-stats-possible stats)))
+        (when (or (plusp threshold) possible)
+          `(("threshold" . ,threshold)
+            ("possible" . ,(json-bool possible)))))))
+
 (defun %bip9-deployment (chain-state entry deployment)
   "One BIP9 softfork object (Core SoftForkDescPushBack, rpc/blockchain.cpp:1307-1359).
 
-⚠️ The two states are for DIFFERENT blocks. Core's `status' is
-GetStateFor(blockindex->pprev) — the state OF this block — and `status_next' is
-GetStateFor(blockindex), the state of the NEXT one (versionbits.cpp:202-203).
-Reporting one value twice is the easy mistake here."
-  (let* ((prev (and entry (bl.store:block-index-entry-prev-entry entry)))
-         (height (if entry (bl.store:block-index-entry-height entry) 0))
-         (current (bl.val:versionbits-state chain-state prev deployment))
-         (next (bl.val:versionbits-state chain-state entry deployment))
-         (since (bl.val:versionbits-since-height chain-state prev deployment))
-         ;; Statistics exist only while the window is being counted
-         ;; (versionbits.cpp:210-212).
-         (counting (member current '(:started :locked-in)))
-         ;; ⚠️ Core has TWO ways a deployment is active-since
-         ;; (versionbits.cpp:219-223): the state IS active, or the NEXT block's
-         ;; state is. Dropping the second is the same off-by-one that
-         ;; %BURIED-DEPLOYMENT had — for the block one below the activation
-         ;; height Core emits a height and active:true where we emitted
-         ;; neither. Reachable on the live mainnet node, which holds the header
-         ;; at taproot's activation height minus one.
-         (active-since (cond ((eq current :active) since)
-                             ((eq next :active) (1+ height))))
-         (bip9
-           `(,@(when counting
-                 `(("bit" . ,(bl.val:vb-deployment-bit deployment))))
-             ("start_time" . ,(bl.val:vb-deployment-start-time deployment))
-             ("timeout" . ,(bl.val:vb-deployment-timeout deployment))
-             ("min_activation_height"
-              . ,(bl.val:vb-deployment-min-activation-height deployment))
-             ("status" . ,(bl.val:versionbits-state-name current))
-             ("since" . ,since)
-             ("status_next" . ,(bl.val:versionbits-state-name next))
-             ,@(when counting
-                 (multiple-value-bind (period threshold elapsed count possible)
-                     (bl.val:versionbits-statistics chain-state entry deployment)
-                   `(("statistics"
-                      . (("period" . ,period)
-                         ("elapsed" . ,elapsed)
-                         ("count" . ,count)
-                         ,@(when (or (plusp threshold) possible)
-                             `(("threshold" . ,threshold)
-                               ("possible" . ,(json-bool possible)))))))))))) 
-    `(,@(when active-since `(("height" . ,active-since)))
-      ;; Core: active_since <= blockindex->nHeight + 1 (blockchain.cpp:1355).
-      ("active" . ,(json-bool (and active-since (<= active-since (1+ height)))))
-      ("type" . "bip9")
-      ("bip9" . ,bip9))))
+Everything reported here comes out of BL.VAL:VERSIONBITS-INFO, Core's
+VersionBitsCache::Info: which states the two `status' fields describe, when the
+statistics apply and what they say are decided there, and this function only
+renders them."
+  (multiple-value-bind (current next since stats active-since)
+      (bl.val:versionbits-info chain-state entry deployment)
+    (let* ((height (if entry (bl.store:block-index-entry-height entry) 0))
+           (bip9
+             `(,@(when stats
+                   `(("bit" . ,(bl.val:vb-deployment-bit deployment))))
+               ("start_time" . ,(bl.val:vb-deployment-start-time deployment))
+               ("timeout" . ,(bl.val:vb-deployment-timeout deployment))
+               ("min_activation_height"
+                . ,(bl.val:vb-deployment-min-activation-height deployment))
+               ("status" . ,(bl.val:versionbits-state-name current))
+               ("since" . ,since)
+               ("status_next" . ,(bl.val:versionbits-state-name next))
+               ;; Core pushes the statistics and then the signalling string,
+               ;; both inside the one `info.stats.has_value()' guard
+               ;; (rpc/blockchain.cpp:1332-1349).
+               ,@(when stats
+                   `(("statistics" . ,(%bip9-statistics stats))
+                     ("signalling"
+                      . ,(%bip9-signalling-string
+                          (bl.val:vb-stats-signalling stats))))))))
+      `(,@(when active-since `(("height" . ,active-since)))
+        ;; Core: active_since <= blockindex->nHeight + 1 (blockchain.cpp:1355).
+        ("active" . ,(json-bool (and active-since (<= active-since (1+ height)))))
+        ("type" . "bip9")
+        ("bip9" . ,bip9)))))
 
 (defun %bip9-deployments (chain-state entry network)
   "Every BIP9 deployment defined for NETWORK, as (name . object) pairs.

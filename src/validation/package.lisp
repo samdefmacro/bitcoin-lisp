@@ -130,6 +130,14 @@ can. src/validation/.")
    #:versionbits-state-name
    #:versionbits-since-height
    #:versionbits-statistics
+   ;; Core BIP9Info / BIP9Stats, the shape getdeploymentinfo renders
+   #:versionbits-info
+   #:vb-stats-period
+   #:vb-stats-threshold
+   #:vb-stats-elapsed
+   #:vb-stats-count
+   #:vb-stats-possible
+   #:vb-stats-signalling
    #:vb-deployment-name
    #:vb-deployment-bit
    #:vb-deployment-start-time

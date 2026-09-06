@@ -464,3 +464,63 @@ override nothing reads is not an override."
                (is (= #x20000000 (bl.val:compute-block-version cs last :regtest)))
                (is (equal '(nil nil ("taproot" "testdummy")) (gbt-names))))
           (bl.val:apply-versionbits-parameters nil))))))
+
+(defun %testdummy-bip9 (chain-state)
+  "The testdummy `bip9' object getdeploymentinfo reports at CHAIN-STATE's tip."
+  (let ((node (make-test-node :network :regtest)))
+    (setf (bl:node-chain-state node) chain-state)
+    (let* ((reply (bl.rpc:dispatch-rpc-method node "getdeploymentinfo" nil))
+           (deployments (cdr (assoc "deployments" reply :test #'string=))))
+      (cdr (assoc "bip9" (cdr (assoc "testdummy" deployments :test #'string=))
+                  :test #'string=)))))
+
+(defun %bip9-value (bip9 key)
+  (cdr (assoc key bip9 :test #'string=)))
+
+(test getdeploymentinfo-emits-the-per-block-bip9-signalling-string
+  "GA11 bc10de29. Core threads a per-block record through the statistics walk:
+GetStateStatisticsFor sizes signalling_blocks to blocks_in_period = 1 +
+(nHeight %% period) and writes at the DECREASING index as it walks backwards
+from the reported block (versionbits.cpp:118-155); Info fills it whenever the
+current state is STARTED or LOCKED_IN (:207-217); and SoftForkDescPushBack
+renders it as `#' per signalling block and `-' per non-signalling one,
+immediately after the statistics object and inside the same guard
+(rpc/blockchain.cpp:1341-1349). We walked the same blocks and threw the record
+away, so `count' said how many of the period signalled but nothing said WHICH.
+
+Every third block signals here, so the ORDER is observable: the period's first
+block (144) signals and the block being reported on (208) does not. On an
+all-signalling chain a reversed record reads identically, which is why Core's
+own rpc_blockchain.py assertion (`#' * (height - 143) at height 207, the second
+case below) cannot catch that mistake."
+  (with-network (:regtest)
+    (let* ((cs (%versionbits-chain-with-tip
+                209 :signal-bit 28 :signal-when (lambda (h) (zerop (mod h 3)))))
+           (bip9 (%testdummy-bip9 cs))
+           (stats (%bip9-value bip9 "statistics"))
+           (signalling (%bip9-value bip9 "signalling"))
+           ;; heights 144..208: 21 whole "#--" groups (144..206), then 207
+           ;; signals and 208 does not.
+           (expected (concatenate
+                      'string
+                      (apply #'concatenate 'string (make-list 21 :initial-element "#--"))
+                      "#-")))
+      (is (string= "started" (%bip9-value bip9 "status")))
+      (is (= 65 (%bip9-value stats "elapsed")))
+      (is (= 22 (%bip9-value stats "count")))
+      (is-true (stringp signalling) "getdeploymentinfo emitted no signalling string")
+      (is-true (and (stringp signalling) (= 65 (length signalling)))
+               "the string is one character per elapsed block")
+      (is-true (and (stringp signalling) (string= expected signalling))
+               "the signalling string is not Core's")
+      ;; The two ends, named, because a reversed record is the mistake this
+      ;; chain exists to catch and STRING= alone does not say which end moved.
+      (is-true (and (stringp signalling) (char= #\# (char signalling 0)))
+               "the record starts at the period's FIRST block, which signals here")
+      (is-true (and (stringp signalling) (char= #\- (char signalling 64)))
+               "and ends at the block being reported on, which does not"))
+    ;; Core's own vector: an all-signalling regtest chain at height 207 reports
+    ;; '#' * (height - 143) (rpc_blockchain.py:240).
+    (let* ((bip9 (%testdummy-bip9 (%versionbits-chain-with-tip 208 :signal-bit 28)))
+           (signalling (%bip9-value bip9 "signalling")))
+      (is (string= (make-string 64 :initial-element #\#) signalling)))))
