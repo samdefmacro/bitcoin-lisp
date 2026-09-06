@@ -1156,8 +1156,8 @@ RECORD-P is true when EFFECTIVE is non-default and must be written to the input
 
 (defun %input-sig-witness-p (sig)
   "True when the input-sig SIG is a segwit (witness) signature — the kinds for
-which Core's ProduceSignature sets SignatureData.witness. Legacy kinds (:p2pkh,
-:multisig, :p2sh-multisig) are false."
+which Core's ProduceSignature sets SignatureData.witness. Legacy kinds (:p2pk,
+:p2pkh, :multisig, :p2sh-multisig) are false."
   (and (member (bl.rpc:input-sig-kind sig)
                '(:p2wpkh :p2tr :p2wsh :p2sh-p2wpkh :p2sh-p2wsh))
        t))

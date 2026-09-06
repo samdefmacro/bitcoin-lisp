@@ -1177,6 +1177,62 @@ enough, and a signer that shipped them would broadcast an unspendable input."
       (cannot "multi_a below threshold"
               (format nil "tr(~A,multi_a(2,~A,~A,~A))" i a b c) (list a)))))
 
+;;;; --- bare P2PK, the shape combo() owns -----------------------------------
+
+(test combo-bare-p2pk-coin-is-spendable-through-the-wallet-rpcs
+  "combo() -- what Core's legacy-wallet migration emits, and the shape a
+pre-2012 key is recovered in -- expands to a BARE P2PK script among its four.
+The wallet owned that coin, counted it and let coin selection pick it, while
+the node's only per-input signer had no TxoutType::PUBKEY case, so every path
+out of the wallet ended in complete=false (sendtoaddress raised -6 \"Signing
+transaction failed\").
+
+Everything below goes through the shipped RPCs, because that is the only place
+the finding is visible: an in-process call to the signer proves nothing about
+what an operator sees. The coinbase is mined straight to pk(<pubkey>) so the
+wallet's ONLY coin is the bare-P2PK one -- with a P2PKH coin alongside, the
+sweep still fails but for a coin that looks fine."
+  (with-wallet-chain-node (node "p2pk" :wallet "pk")
+    (labels ((rpc (method &rest params)
+               (with-rpc-wallet (nil)
+                 (bl.rpc:dispatch-rpc-method node method params)))
+             (aval (key alist) (cdr (assoc key alist :test #'string=))))
+      (let* ((priv (make-array 32 :element-type '(unsigned-byte 8) :initial-element 42))
+             (pub (bl.crypto:derive-public-key priv))
+             (combo (bl.rpc:descriptor-add-checksum
+                     (format nil "combo(~A)"
+                             (bl.crypto:private-key-to-wif priv :network :regtest))))
+             (request (let ((h (make-hash-table :test 'equal)))
+                        (setf (gethash "desc" h) combo
+                              (gethash "timestamp" h) "now")
+                        h))
+             (imported (first (rpc "importdescriptors" (list request)))))
+        (is (eq t (aval "success" imported)) "importdescriptors refused: ~S" imported)
+        ;; One coinbase to the bare P2PK script, then 100 blocks to mature it.
+        (rpc "generatetodescriptor" 1
+             (bl.rpc:descriptor-add-checksum
+              (format nil "pk(~A)" (bl.crypto:bytes-to-hex pub))))
+        (rpc "generatetoaddress" 100
+             (bl.crypto:encode-p2sh-address
+              (bl.crypto:hash160 +optrue-redeem+) :regtest))
+        (let ((coin (first (rpc "listunspent"))))
+          (is-true coin "the wallet does not even see the coin")
+          (is (eq t (aval "spendable" coin))
+              "the wallet reports the coin unspendable, so the finding is elsewhere")
+          (is (= 50.0d0 (aval "amount" coin)))
+          ;; The spend an operator asks for. Before the P2PK arm this raised
+          ;; RPC -6 "Signing transaction failed" and moved nothing.
+          (let ((txid (rpc "sendtoaddress"
+                           (bl.crypto:encode-p2sh-address
+                            (bl.crypto:hash160 +optrue-redeem+) :regtest)
+                           1.0d0 nil nil t nil nil nil nil 10)))
+            (is-true (stringp txid) "sendtoaddress answered ~S" txid)
+            ;; It is in the mempool, i.e. the node's own script verification
+            ;; accepted the scriptSig the wallet built.
+            (is-true (find txid (coerce (rpc "getrawmempool") 'list)
+                           :test #'string=)
+                     "the node did not accept the transaction the wallet signed")))))))
+
 (test script-num-serializes-like-cscriptnum
   "Core's CScript << int64_t (script.h:433) pushes CScriptNum::serialize, which
 appends a 0x00 sign byte whenever the top bit of the last byte is set.

@@ -5981,6 +5981,74 @@ verifies under the SAME sighash the validator computes (legacy + BIP143)."
              (sighash (bl.interop:compute-legacy-sighash tx2 1 p2pkh 1)))
         (is-true (bl.crypto:verify-signature sighash der pub))))))
 
+(test rpc-signrawtransactionwithkey-bare-p2pk
+  "signrawtransactionwithkey signs a BARE P2PK input (input 0) from the supplied
+WIF, with a P2PKH input of the SAME key (input 1) alongside as the control that
+would fail with it. Core answers TxoutType::PUBKEY as SignStep's first case
+(sign.cpp:643-647): the scriptPubKey already carries the key, so the scriptSig is
+the signature ALONE where P2PKH's is the signature and the key.
+
+The control is what stops a regression passing vacuously: before this arm
+existed the SAME call returned complete=false with \"unsupported scriptPubKey
+type pubkey\" for input 0 while input 1 signed, so the two halves disagreeing is
+the whole finding."
+  (let* ((node (make-test-node))
+         (k1 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 31) 1) k))
+         (wif (bl.crypto:private-key-to-wif k1 :network :mainnet :compressed t))
+         (pub (bl.crypto:derive-public-key k1))
+         (pkh (bl.crypto:hash160 pub))
+         (p2pk (concatenate '(vector (unsigned-byte 8))
+                            (vector (length pub)) pub (vector #xac)))
+         (p2pkh (concatenate '(vector (unsigned-byte 8))
+                             (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
+         (txid0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 20))
+         (txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 21))
+         (empty (make-array 0 :element-type '(unsigned-byte 8)))
+         (tx (bl.ser:make-transaction
+              :version 2
+              :inputs (vector (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint :hash txid0 :index 0)
+                               :script-sig empty :sequence #xffffffff)
+                              (bl.ser:make-tx-in
+                               :previous-output (bl.ser:make-outpoint :hash txid1 :index 0)
+                               :script-sig empty :sequence #xffffffff))
+              :outputs (vector (bl.ser:make-tx-out :value 90000 :script-pubkey p2pkh))
+              :lock-time 0))
+         (prevtxs (list (list (cons "txid" (bl.rpc:hash-to-hex txid0))
+                              (cons "vout" 0)
+                              (cons "scriptPubKey" (bl.crypto:bytes-to-hex p2pk)))
+                        (list (cons "txid" (bl.rpc:hash-to-hex txid1))
+                              (cons "vout" 0)
+                              (cons "scriptPubKey" (bl.crypto:bytes-to-hex p2pkh)))))
+         (result (bl.rpc:dispatch-rpc-method
+                  node "signrawtransactionwithkey"
+                  (list (bl.crypto:bytes-to-hex (bl.ser:serialize-transaction tx))
+                        (list wif) prevtxs))))
+    (is (eq t (cdr (assoc "complete" result :test #'string=)))
+        "signer reported ~S" (cdr (assoc "errors" result :test #'string=)))
+    (let* ((tx2 (bl.ser:parse-tx-payload
+                 (bl.crypto:hex-to-bytes (cdr (assoc "hex" result :test #'string=)))))
+           (ins (bl.ser:transaction-inputs tx2)))
+      ;; Input 0 (bare P2PK): scriptSig = push(sig), and NOTHING else.
+      (let* ((ss (bl.ser:tx-in-script-sig (aref ins 0)))
+             (siglen (aref ss 0))
+             (sig (subseq ss 1 (1+ siglen)))
+             (der (subseq sig 0 (1- (length sig))))
+             (sighash (bl.interop:compute-legacy-sighash tx2 0 p2pk 1)))
+        (is (= (length ss) (1+ siglen))
+            "P2PK scriptSig carries ~D bytes past the signature; Core pushes the ~
+signature alone" (- (length ss) 1 siglen))
+        (is-true (bl.crypto:verify-signature sighash der pub)))
+      ;; Input 1 (P2PKH control): scriptSig = push(sig) push(pubkey).
+      (let* ((ss (bl.ser:tx-in-script-sig (aref ins 1)))
+             (siglen (aref ss 0))
+             (sig (subseq ss 1 (1+ siglen)))
+             (der (subseq sig 0 (1- (length sig))))
+             (sighash (bl.interop:compute-legacy-sighash tx2 1 p2pkh 1)))
+        (is (equalp pub (subseq ss (+ 2 siglen))))
+        (is-true (bl.crypto:verify-signature sighash der pub))))))
+
 (test rpc-signrawtransactionwithkey-p2tr-keypath
   "signrawtransactionwithkey signs a P2TR key-path input; complete=t, the witness
 is a single 64-byte Schnorr signature, and it passes the consensus taproot
