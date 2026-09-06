@@ -1334,6 +1334,36 @@ through the cap-of-3 eviction could demote an honest HB peer at will."
           (is-true (bl.net:peer-compact-block-high-bandwidth-to
                     peer))))))))
 
+(test cmpctblock-nonce-is-not-drawn-from-the-shared-random-state
+  "GA11 4a05974e. The compact-block nonce is published in the cmpctblock
+message -- it keys the short IDs, so a peer must have it to reconstruct -- and
+both senders (protocol.lisp's HB announcement and validation/block.lisp's
+replay) take MAKE-CMPCTBLOCK-MESSAGE's default. That default used to be
+(random (expt 2 64)) off the process-global MT19937 stream shared with addrman
+selection and the relay timers, so every announced block leaked 64 bits of it.
+Core draws it from a FastRandomContext (blockencodings, net_processing).
+
+Replaying one *random-state* is two starts of one build; the nonces must still
+differ."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture "cb-nonce"))
+           (block (%g716-mine-on node (p2sh-optrue-script-pubkey))))
+      (flet ((default-nonce ()
+               (let ((*random-state* (sb-ext:seed-random-state 31337)))
+                 (bl.ser:compact-block-nonce
+                  (bl.ser:parse-cmpctblock-payload
+                   (subseq (bl.ser:make-cmpctblock-message block) 24))))))
+        (let ((a (default-nonce))
+              (b (default-nonce)))
+          (is (/= a b)
+              "two cmpctblock nonces under one replayed *random-state* were both ~D" a)
+          (is-true (and (typep a '(unsigned-byte 64)) (typep b '(unsigned-byte 64))))))
+      ;; Positive control: the draw this replaced does repeat under the same
+      ;; two bindings, so the assertion above is testing the source.
+      (let ((a (let ((*random-state* (sb-ext:seed-random-state 31337))) (random (expt 2 64))))
+            (b (let ((*random-state* (sb-ext:seed-random-state 31337))) (random (expt 2 64)))))
+        (is (= a b) "positive control: CL:RANDOM was expected to replay a re-seeded state")))))
+
 (test cmpctblock-message-round-trips-through-our-own-parser
   "make-cmpctblock-message emits a BIP152 HeaderAndShortIDs our own reader
 accepts: the header survives, the nonce is the one we chose, the coinbase is
