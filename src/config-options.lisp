@@ -460,6 +460,22 @@
              (setf bl.val:*parallel-validation-workers* n)
              ;; Core: -par=1 means no extra threads at all.
              (setf *parallel-block-validation* (> n 1)))))
+;; -privatebroadcast: Core reserves a pool of short-lived Tor/I2P connections
+;; for transactions submitted through sendrawtransaction and keeps them out of
+;; the mempool entirely (net.h:77,89, rpc/mempool.cpp:115-126). None of that
+;; exists here. Core REFUSES TO START when the option is set and neither Tor
+;; nor I2P is reachable (init.cpp:2257-2265), and for this node that condition
+;; can never be satisfied -- so its refusal is the honest answer, not a warning
+;; that the flag had no effect. The action the option exists to prevent is
+;; irreversible: a transaction announced to the ordinary peer set from this
+;; node's own address cannot be recalled.
+(define-option "privatebroadcast" :type :bool
+  :apply (lambda (on)
+           (when on
+             (config-error "Private broadcast of own transactions requested ~
+(-privatebroadcast), but this node does not implement private broadcast: the ~
+transaction would enter the mempool and be announced to every peer from this ~
+node's own address"))))
 ;; -whitelistrelay / -whitelistforcerelay (Core net_permissions.h:20-22).
 ;; -dns: whether a name may be handed to the LOCAL resolver (Core fNameLookup,
 ;; DEFAULT_NAME_LOOKUP = true, netbase.h:23,28). Read at net.cpp:406 as
@@ -508,7 +524,7 @@
   "loglevelalways" "logsourcelocations"
   "logtimestamps" "maxreceivebuffer"
   "natpmp" "peerbloomfilters" "printpriority"
-  "privatebroadcast" "rpcdoccheck"
+  "rpcdoccheck"
   "rpcworkqueue"
   "signer"
   "stopafterblockimport" "timeout"
