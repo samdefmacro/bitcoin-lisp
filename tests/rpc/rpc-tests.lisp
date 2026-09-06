@@ -4342,6 +4342,9 @@ array / could error."
     (is (eq 'yason:false (cdr (assoc "isvalid" result :test #'string=))))))
 
 ;;; decodescript tests
+;;;
+;;; The oracle is Bitcoin Core's own: test/functional/rpc_decodescript.py and
+;;; the object-for-object corpus in its data/rpc_decodescript.json.
 
 (defun %decodescript (script-hex &key (network :testnet3))
   "decodescript SCRIPT-HEX on a fresh minimal node of NETWORK; the result alist."
@@ -4350,48 +4353,240 @@ array / could error."
 (defun %decodescript-field (result key)
   (cdr (assoc key result :test #'string=)))
 
-(test rpc-decodescript-p2pkh
-  "Test decodescript with P2PKH script"
-  ;; P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-  (let ((result (%decodescript "76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac")))
-    (is (string= (%decodescript-field result "type") "pubkeyhash"))
-    (is (%decodescript-field result "asm"))
-    (is (%decodescript-field result "p2sh"))))
+(defun %decodescript-flat (result &optional (prefix ""))
+  "RESULT as a flat (\"key\" . \"value\") list, the nested segwit object under
+`segwit.\' keys, so a vector can pin the WHOLE object -- no field missing and
+none extra."
+  (loop for (key . value) in result
+        append (if (and (consp value) (consp (first value))
+                        (stringp (car (first value))))
+                   (%decodescript-flat value (concatenate 'string prefix key "."))
+                   (list (cons (concatenate 'string prefix key)
+                               (princ-to-string value))))))
 
-(test rpc-decodescript-p2sh
-  "Test decodescript with P2SH script"
-  ;; P2SH: OP_HASH160 <20 bytes> OP_EQUAL
-  (let ((result (%decodescript "a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba87")))
-    (is (string= (%decodescript-field result "type") "scripthash"))))
+(defparameter +core-decodescript-vectors+
+  '(
+    ("5120eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+     ("asm" . "1 eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+     ("address" . "bcrt1pamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhqz6nvlh")
+     ("desc" . "rawtr(eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee)#jk7c6kys")
+     ("type" . "witness_v1_taproot"))
+    ("5102eeee"
+     ("asm" . "1 -28398")
+     ("address" . "bcrt1pamhqk96edn")
+     ("desc" . "addr(bcrt1pamhqk96edn)#vkh8uj5a")
+     ("type" . "witness_unknown"))
+    ("0020eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+     ("asm" . "0 eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+     ("address" . "bcrt1qamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhqgdn98t")
+     ("desc" . "addr(bcrt1qamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhqgdn98t)#afaecevx")
+     ("type" . "witness_v0_scripthash")
+     ("p2sh" . "2MwGk8mw1GBP6U9D5X8gTvgvXpuknmAK3fo"))
+    ("a914eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee87"
+     ("asm" . "OP_HASH160 eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee OP_EQUAL")
+     ("address" . "2NF2b3KS8xXb9XHvbRMXdZh8s5g92rUZHtp")
+     ("desc" . "addr(2NF2b3KS8xXb9XHvbRMXdZh8s5g92rUZHtp)#ywfcpmh9")
+     ("type" . "scripthash"))
+    ("6a00"
+     ("asm" . "OP_RETURN 0")
+     ("desc" . "raw(6a00)#ncfmkl43")
+     ("type" . "nulldata"))
+    ("6aee"
+     ("asm" . "OP_RETURN OP_UNKNOWN")
+     ("desc" . "raw(6aee)#vsyzgqdt")
+     ("type" . "nonstandard"))
+    ("6a02ee"
+     ("asm" . "OP_RETURN [error]")
+     ("desc" . "raw(6a02ee)#gvdwnlzl")
+     ("type" . "nonstandard"))
+    ("02eeee"
+     ("asm" . "-28398")
+     ("desc" . "raw(02eeee)#5xzck7pr")
+     ("type" . "nonstandard")
+     ("p2sh" . "2N34iiGoUUkVSPiaaTFpJjB1FR9TXQu3PGM")
+     ("segwit.asm" . "0 96c2368fc30514a438a8bd909f93c49a1549d77198ccbdb792043b666cb24f42")
+     ("segwit.desc" . "addr(bcrt1qjmprdr7rq522gw9ghkgfly7yng25n4m3nrxtmdujqsakvm9jfapqk795l5)#5akkdska")
+     ("segwit.hex" . "002096c2368fc30514a438a8bd909f93c49a1549d77198ccbdb792043b666cb24f42")
+     ("segwit.address" . "bcrt1qjmprdr7rq522gw9ghkgfly7yng25n4m3nrxtmdujqsakvm9jfapqk795l5")
+     ("segwit.type" . "witness_v0_scripthash")
+     ("segwit.p2sh-segwit" . "2MtoejEictTQ6XtmHYzoYttt35Ec6krqFKN"))
+    ("ba"
+     ("asm" . "OP_CHECKSIGADD")
+     ("desc" . "raw(ba)#yy0eg44l")
+     ("type" . "nonstandard"))
+    ("50"
+     ("asm" . "OP_RESERVED")
+     ("desc" . "raw(50)#a7tu03xf")
+     ("type" . "nonstandard")))
+  "Bitcoin Core test/functional/data/rpc_decodescript.json verbatim, the nested
+segwit object flattened under `segwit.\' keys. Core drives these on a REGTEST
+node and compares the whole object, so this pins every field, its value and the
+ABSENCE of the ones Core does not emit.")
 
-(test rpc-decodescript-p2wpkh
-  "Test decodescript with P2WPKH script"
-  ;; P2WPKH: OP_0 <20 bytes>
-  (let ((result (%decodescript "001489abcdefabbaabbaabbaabbaabbaabbaabbaabba")))
-    (is (string= (%decodescript-field result "type") "witness_v0_keyhash"))
-    (is (%decodescript-field result "segwit"))))
+(test rpc-decodescript-matches-cores-object-corpus
+  "Every object in Core's data/rpc_decodescript.json, field for field.
+
+One documented divergence: the bare taproot output's `desc\'. Core's
+InferDescriptor answers rawtr(<x-only key>) for a P2TR output whose key it
+cannot resolve; SCRIPTPUBKEY-DESC answers addr(<bech32m>). That is
+InferDescriptor's content, not decodescript's shape, so the row's other three
+fields are asserted and the desc is asserted to be the addr() form we do emit
+-- change this line when InferDescriptor learns rawtr()."
+  (let ((taproot "5120eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"))
+    (loop for (hex . expected) in +core-decodescript-vectors+
+          for actual = (%decodescript-flat (%decodescript hex :network :regtest))
+          do (loop for (key . want) in expected
+                   for got = (assoc key actual :test #'string=)
+                   do (cond
+                        ((and (string= hex taproot) (string= key "desc"))
+                         (is (string= "addr(bcrt1pamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhwamhqz6nvlh)#v52jnujz"
+                                      (cdr got))
+                             "~A: known InferDescriptor divergence changed" hex))
+                        (t
+                         (is-true got "~A: no ~A field" hex key)
+                         (is (string= want (cdr got))
+                             "~A ~A: ~S, Core says ~S" hex key (cdr got) want))))
+             (loop for (key . value) in actual
+                   do (is-true (assoc key expected :test #'string=)
+                               "~A: extra field ~A = ~S that Core does not emit"
+                               hex key value)))))
+
+(test rpc-decodescript-wraps-only-what-core-wraps
+  "can_wrap (rpc/rawtransaction.cpp:496-526). The p2sh field used to be emitted
+UNCONDITIONALLY, so decodescript handed out a P2SH address wrapping an
+OP_RETURN (unspendable), one wrapping another P2SH and one wrapping a taproot
+output (spendable by anyone holding the redeem script). Core refuses all of
+them by type, and refuses any script that does not parse, is unspendable, or
+carries OP_CHECKSIGADD or an OP_SUCCESS."
+  (flet ((p2sh (hex) (%decodescript-field (%decodescript hex :network :regtest) "p2sh")))
+    ;; Refused by type.
+    (is-false (p2sh "6a0401020304") "P2SH wrapper for an OP_RETURN")
+    (is-false (p2sh "a914eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee87") "P2SH of a P2SH")
+    (is-false (p2sh "5120eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+              "P2SH of a taproot output")
+    (is-false (p2sh "5102eeee") "P2SH of an unknown witness version")
+    (is-false (p2sh "51024e73") "P2SH of the anchor output")
+    ;; Refused by the tail checks.
+    (is-false (p2sh "ba") "OP_CHECKSIGADD")
+    (is-false (p2sh "50") "OP_RESERVED is an OP_SUCCESS")
+    (is-false (p2sh "6aee") "an unparseable script")
+    ;; Allowed: the positive control, without which every assertion above
+    ;; would pass on a handler that emitted no p2sh at all.
+    (is-true (p2sh "02eeee") "a plain nonstandard script must still be wrapped")
+    (is-true (p2sh "0014eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+             "P2SH-P2WPKH must still be offered")
+    (is-true (p2sh "76a914eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee88ac")
+             "P2SH of a P2PKH must still be offered")))
+
+(test rpc-decodescript-segwit-object-follows-can-wrap-p2wsh
+  "can_wrap_P2WSH (rpc/rawtransaction.cpp:533-570) and the exact strings
+rpc_decodescript.py:66-160 asserts. The segwit object used to carry an address
+alone, and to appear for the witness programs (where Core suppresses it) while
+missing for P2PK, P2PKH and multisig (where Core produces it)."
+  (let* ((pubkey "03b0da749730dc9b4b1f4a14d6902877a92541f5368778853d9c4a0cb7802dcfb2")
+         (pkh "5dd1d3a048119c27b28293056724d9522f26d945")
+         (uncompressed "04b0da749730dc9b4b1f4a14d6902877a92541f5368778853d9c4a0cb7802dcfb25e01fc8fde47c96c98a4f3a8123e33a38a50cf9025cc8c4494a518f991792bb7")
+         (multisig (concatenate 'string "52" "21" pubkey "21" pubkey "21" pubkey "53ae")))
+    (flet ((segwit (hex key)
+             (%decodescript-field
+              (%decodescript-field (%decodescript hex :network :regtest) "segwit")
+              key)))
+      ;; P2PK is translated to P2WPKH over hash160 of the key (:70-72).
+      (is (string= (concatenate 'string "0 " pkh)
+                   (segwit (concatenate 'string "21" pubkey "ac") "asm")))
+      ;; P2PKH is translated to P2WPKH over the hash it already carries (:80-82).
+      (is (string= "witness_v0_keyhash"
+                   (segwit (concatenate 'string "76a914" pkh "88ac") "type")))
+      (is (string= (concatenate 'string "0 " pkh)
+                   (segwit (concatenate 'string "76a914" pkh "88ac") "asm")))
+      ;; Anything else is P2WSH over the script (:95-99).
+      (is (string= "witness_v0_scripthash" (segwit multisig "type")))
+      (is (string= (concatenate 'string "0 " (bl.crypto:bytes-to-hex
+                                              (bl.crypto:sha256
+                                               (bl.crypto:hex-to-bytes multisig))))
+                   (segwit multisig "asm")))
+      ;; The nested object is a full ScriptToUniv, not an address on its own.
+      (is-true (segwit multisig "hex"))
+      (is-true (segwit multisig "desc"))
+      (is-true (segwit multisig "address"))
+      (is-true (segwit multisig "p2sh-segwit")))
+    (flet ((has-segwit (hex)
+             (and (%decodescript-field (%decodescript hex :network :regtest) "segwit") t)))
+      ;; An uncompressed key can never be spent under BIP143 (:141-159).
+      (is-false (has-segwit (concatenate 'string "41" uncompressed "ac"))
+                "P2PK with an uncompressed key")
+      (is-false (has-segwit (concatenate 'string "52" "21" pubkey "41" uncompressed "52ae"))
+                "multisig with an uncompressed key")
+      ;; Segwit scripts do not nest (:104, :167-186).
+      (is-false (has-segwit "a914eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee87") "P2SH")
+      (is-false (has-segwit "0014eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee") "P2WPKH")
+      (is-false (has-segwit "0020eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+                "P2WSH")
+      (is-false (has-segwit "5120eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+                "P2TR")
+      ;; Positive control for the four above.
+      (is-true (has-segwit (concatenate 'string "21" pubkey "ac"))
+               "a compressed P2PK must still get a segwit object"))))
+
+(test rpc-decodescript-drops-the-pre-v22-fields
+  "reqSigs and the plural addresses were removed from Core in v22; every
+consumer written against a current Core reads the singular `address\' and
+`desc\'. Both were emitted here for multisig, pubkeyhash and scripthash, and
+neither desc nor the singular address ever was."
+  (let* ((pubkey "03b0da749730dc9b4b1f4a14d6902877a92541f5368778853d9c4a0cb7802dcfb2")
+         (multisig (concatenate 'string "52" "21" pubkey "21" pubkey "21" pubkey "53ae")))
+    (dolist (hex (list multisig
+                       "76a914eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee88ac"
+                       "a914eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee87"))
+      (let ((result (%decodescript hex :network :regtest)))
+        (is-false (%decodescript-field result "reqSigs") "~A still reports reqSigs" hex)
+        (is-false (%decodescript-field result "addresses")
+                  "~A still reports the plural addresses" hex)
+        (is-true (%decodescript-field result "desc") "~A reports no desc" hex)))
+    ;; The singular address, and NOT for a bare pubkey (Core's ScriptToUniv
+    ;; excludes PUBKEY by name, core_io.cpp:424).
+    (is (string= "mp52VuXfTKhzYpuR3jLvPEYYUCWt84J7D5"
+                 (%decodescript-field
+                  (%decodescript "76a9145dd1d3a048119c27b28293056724d9522f26d94588ac"
+                                 :network :regtest)
+                  "address")))
+    (is-false (%decodescript-field
+               (%decodescript (concatenate 'string "21" pubkey "ac") :network :regtest)
+               "address")
+              "a bare pubkey has no address")))
+
+(test rpc-decodescript-reports-the-anchor-address
+  "rpc_decodescript.py:189-198: the P2A output is `1 29518\' and its address is
+bcrt1pfeesnyr2tx. We reported neither -- no address at all, and a P2SH wrapper
+Core refuses to print."
+  (let ((result (%decodescript "51024e73" :network :regtest)))
+    (is (string= "anchor" (%decodescript-field result "type")))
+    (is (string= "1 29518" (%decodescript-field result "asm")))
+    (is (string= "bcrt1pfeesnyr2tx" (%decodescript-field result "address")))))
 
 (test rpc-decodescript-segwit-address-uses-chain-hrp
-  "The segwit address decodescript reports carries the CHAIN's bech32 HRP
-(Core chainparams bech32_hrp): bcrt on regtest, tb on the test chains. The
-first version hard-coded tb for testnet3 and bc for everything else, so a
-regtest node printed mainnet addresses."
-  (flet ((segwit-address (network)
+  "The bech32 addresses decodescript reports carry the CHAIN's HRP (Core
+chainparams bech32_hrp): bcrt on regtest, tb on the test chains. The first
+version hard-coded tb for testnet3 and bc for everything else, so a regtest
+node printed mainnet addresses."
+  (flet ((address (network)
            (%decodescript-field
-            (%decodescript-field
-             (%decodescript "001489abcdefabbaabbaabbaabbaabbaabbaabbaabba"
-                            :network network)
-             "segwit")
+            (%decodescript "001489abcdefabbaabbaabbaabbaabbaabbaabbaabba"
+                           :network network)
             "address")))
-    (is (uiop:string-prefix-p "bcrt1" (segwit-address :regtest)))
-    (is (uiop:string-prefix-p "tb1" (segwit-address :testnet4)))
-    (is (uiop:string-prefix-p "bc1" (segwit-address :mainnet)))))
+    (is (uiop:string-prefix-p "bcrt1" (address :regtest)))
+    (is (uiop:string-prefix-p "tb1" (address :testnet4)))
+    (is (uiop:string-prefix-p "bc1" (address :mainnet)))))
 
 (test rpc-decodescript-empty
-  "Test decodescript with empty script"
-  (let ((result (%decodescript "")))
+  "An empty script is valid and is not special-cased: it classifies as
+nonstandard, so Core wraps it like any other nonstandard script."
+  (let ((result (%decodescript "" :network :regtest)))
     (is (string= (%decodescript-field result "type") "nonstandard"))
-    (is (string= (%decodescript-field result "asm") ""))))
+    (is (string= (%decodescript-field result "asm") ""))
+    (is (string= "raw()#58lrscpx" (%decodescript-field result "desc")))
+    (is-true (%decodescript-field result "p2sh"))
+    (is-true (%decodescript-field result "segwit"))))
 
 (test rpc-decodescript-invalid-hex
   "Test decodescript with invalid hex returns error"
@@ -5650,24 +5845,22 @@ scripts) address — previously only hex."
       (is (assoc "asm" sp :test #'string=))
       (is (assoc "hex" sp :test #'string=)))))
 
-(test rpc-decodescript-multisig-addresses
-  "decodescript fills the addresses array for bare multisig — one P2PKH address
-per key (previously empty)."
-  (let* ((pk1 (bl.crypto:hex-to-bytes
-               "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
-         (pk2 (bl.crypto:hex-to-bytes
-               "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"))
-         ;; 2-of-2 bare multisig: OP_2 <33pk1> <33pk2> OP_2 OP_CHECKMULTISIG
-         (script (concatenate '(vector (unsigned-byte 8))
-                              (vector #x52 #x21) pk1 (vector #x21) pk2 (vector #x52 #xae)))
-         (r (%decodescript (bl.crypto:bytes-to-hex script)))
-         (addrs (cdr (assoc "addresses" r :test #'string=))))
-    (is (string= "multisig" (cdr (assoc "type" r :test #'string=))))
-    (is (= 2 (cdr (assoc "reqSigs" r :test #'string=))))
-    (is (= 2 (length addrs)))
-    (is (string= (bl.crypto:encode-p2pkh-address
-                  (bl.crypto:hash160 pk1) :testnet3)
-                 (first addrs)))))
+(test rpc-decodescript-bare-multisig
+  "Bare multisig, the whole object Core prints (rpc_decodescript.py:88-99):
+the asm with its m and n as DECIMALS, type multisig, no address (multisig has
+no destination), and the P2WSH translation. This test asserted the pre-v22
+reqSigs / addresses pair, which Core removed."
+  (let* ((pk1 "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+         (pk2 "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5")
+         (hex (concatenate 'string "52" "21" pk1 "21" pk2 "52ae"))
+         (r (%decodescript hex :network :regtest)))
+    (is (string= "multisig" (%decodescript-field r "type")))
+    (is (string= (format nil "2 ~A ~A 2 OP_CHECKMULTISIG" pk1 pk2)
+                 (%decodescript-field r "asm")))
+    (is-false (%decodescript-field r "address") "multisig has no destination")
+    (is (string= "witness_v0_scripthash"
+                 (%decodescript-field
+                  (%decodescript-field r "segwit") "type")))))
 
 (test rpc-getnetworkinfo-completeness
   "getnetworkinfo now reports localservices(+names), localrelay, relayfee,
