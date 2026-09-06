@@ -298,3 +298,80 @@ had already cancelled."
   ;; And with no negation at all, the whole list is validated as before.
   (let ((bl.log::*debug-categories* (make-hash-table :test 'equal)))
     (signals error (bl.log:apply-log-categories '("net" "abc") nil))))
+
+;;; --- -shrinkdebugfile (GA11 e9d39df8) ---------------------------------------
+
+(test shrinkdebugfile-is-a-real-option-with-cores-derived-default
+  "-shrinkdebugfile left the accept-and-drop list (GA11 e9d39df8). Its default
+is DERIVED from another option, which is why the start-node keyword has to tell
+`not given' from `=0': Core's DefaultShrinkDebugFile() is
+`m_categories == BCLog::NONE' (logging.cpp:167-170), read at
+init/common.cpp:108-113, so a node started with any -debug category does not
+scroll its log and -shrinkdebugfile=0 keeps it whole in every case."
+  (is (eq :start-node (bl.cfg:config-option-kind
+                       (bl.cfg:find-config-option "shrinkdebugfile"))))
+  (is-false (bl.cfg:core-only-option-p "shrinkdebugfile"))
+  ;; Given, it reaches the keyword; absent, the keyword is not there at all, so
+  ;; START-NODE's :UNSET default survives and the derivation below runs.
+  (let ((plist (start-node-plist '("-regtest" "-shrinkdebugfile=0"))))
+    (is-true (member :shrink-debug-file plist))
+    (is-false (getf plist :shrink-debug-file)))
+  (let ((plist (start-node-plist '("-regtest" "-shrinkdebugfile=1"))))
+    (is-true (getf plist :shrink-debug-file)))
+  (is-false (member :shrink-debug-file (start-node-plist '("-regtest"))))
+  ;; Core's derivation, answered over the RAW -debug / -debugexclude lists,
+  ;; because ours are applied only after the log file exists.
+  (is-true (bl.log:default-shrink-debug-file-p nil nil))
+  (is-false (bl.log:default-shrink-debug-file-p '("net") nil))
+  (is-true (bl.log:default-shrink-debug-file-p '("net") '("net"))
+           "a category excluded again leaves m_categories NONE, so Core scrolls")
+  (is-true (bl.log:default-shrink-debug-file-p '("none") nil))
+  ;; Asking must not INSTALL the categories: the real set comes back unchanged,
+  ;; and the unsupported name is reported later, by APPLY-LOG-CATEGORIES.
+  (let ((before (bl:log-category-enabled-p "net")))
+    (is-false (bl.log:default-shrink-debug-file-p '("nosuchcategory") nil))
+    (bl.log:default-shrink-debug-file-p '("net") nil)
+    (is (eq before (bl:log-category-enabled-p "net"))
+        "asking the question must not enable a category")))
+
+(test start-file-logging-scrolls-only-when-asked
+  "The gate itself. START-FILE-LOGGING scrolled the log unconditionally, so an
+operator reproducing a fault under -debug lost everything past the last 10 MB
+of the evidence on the restart that reproduces it — and -shrinkdebugfile=0 did
+not stop it either. The default (:SHRINK T) case is the positive control: a
+gate that never scrolls at all cannot pass this test."
+  (let* ((dir (ensure-directories-exist
+               (merge-pathnames "test-shrink-gate/" (uiop:temporary-directory))))
+         (path (merge-pathnames "debug.log" dir))
+         (saved-stream bl.log:*log-file-stream*)
+         (saved-path bl:*log-file-path*)
+         (big 12000000))
+    (setf bl.log:*log-file-stream* nil)
+    (unwind-protect
+         (flet ((write-log ()
+                  (with-open-file (s path :direction :output :if-exists :supersede
+                                          :if-does-not-exist :create
+                                          :element-type '(unsigned-byte 8))
+                    (write-sequence (make-array big :element-type '(unsigned-byte 8)
+                                                    :initial-element 65)
+                                    s)))
+                (open-size ()
+                  ;; Close first: the file is open for append at this point.
+                  (close bl.log:*log-file-stream*)
+                  (setf bl.log:*log-file-stream* nil)
+                  (with-open-file (s path :direction :input
+                                          :element-type '(unsigned-byte 8))
+                    (file-length s))))
+           (write-log)
+           (bl:start-file-logging path)
+           (is (< (open-size) big) "the unasked default must still scroll")
+           (write-log)
+           (bl:start-file-logging path :shrink nil)
+           (is (= big (open-size))
+               "-shrinkdebugfile=0 (or any -debug category) keeps the log whole"))
+      (progn
+        (when bl.log:*log-file-stream*
+          (ignore-errors (close bl.log:*log-file-stream*)))
+        (setf bl.log:*log-file-stream* saved-stream
+              bl:*log-file-path* saved-path)
+        (ignore-errors (delete-file path))))))

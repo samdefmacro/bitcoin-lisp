@@ -158,6 +158,7 @@ init.cpp, node/. src/node/.")
    #:log-cat
    #:log-category-enabled-p
    #:apply-log-categories
+   #:default-shrink-debug-file-p
    #:*log-time-micros*
    #:*log-thread-names*
    #:log-info

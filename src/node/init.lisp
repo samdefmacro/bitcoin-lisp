@@ -103,7 +103,7 @@ case ever exercised) has genesis for a root."
           :status :valid
           :tx-count 1)))))   ; genesis carries exactly its coinbase
 
-(defun %init-logging (data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-level-specs)
+(defun %init-logging (data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-level-specs shrink-debug-file)
   "Core AppInitMain Step 4a, application initialization: the log file and level,
 per-category thresholds, the deferred config lines, the operator hooks, the pid
 file and -debug / -debugexclude -- everything that must exist before the first
@@ -137,9 +137,19 @@ log line of the node itself."
       (unless (probe-file (make-pathname :name nil :type nil :defaults path))
         (init-error "Could not open debug log file ~A" (namestring path)))
       (ensure-directories-exist path)
-      (handler-case (start-file-logging path)
-        (error ()
-          (init-error "Could not open debug log file ~A" (namestring path))))))
+      ;; -shrinkdebugfile (Core StartLogging, init/common.cpp:108-113): when it
+      ;; was not given, its default is DefaultShrinkDebugFile() -- false as soon
+      ;; as any -debug category is enabled, so the restart that reproduces a
+      ;; fault does not discard the run that showed it. The categories are
+      ;; APPLIED further down, after the log file exists (the deferred config
+      ;; lines have nowhere to go until then), so the default is computed from
+      ;; the raw -debug / -debugexclude lists here instead.
+      (let ((shrink (if (eq shrink-debug-file :unset)
+                        (default-shrink-debug-file-p debug-categories debug-exclude)
+                        (and shrink-debug-file t))))
+        (handler-case (start-file-logging path :shrink shrink)
+          (error ()
+            (init-error "Could not open debug log file ~A" (namestring path)))))))
   ;; The level BEFORE the flush below, not 270 lines further down where it used
   ;; to be set: a deferred line is filtered when it is emitted, so flushing
   ;; first would judge every queued line against whatever level the image
@@ -1471,6 +1481,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (debug-exclude nil)
                         (log-time-micros nil)
                         (log-thread-names nil)
+                        (shrink-debug-file :unset)
                         (test-activation-heights nil)
                         (vbparams nil)
                         (test-options nil)
@@ -1597,7 +1608,7 @@ Returns the node instance."
   ;; the suite was running against it.
   (%ensure-wallets-subdirectory data-directory network)
 
-  (%init-logging data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-level-specs)
+  (%init-logging data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-level-specs shrink-debug-file)
   (%init-parameters network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights vbparams test-options coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
   (%init-datadir-layout data-directory network migrate-datadir)
   ;; Initialize node: the node struct and its databases; the chain itself is

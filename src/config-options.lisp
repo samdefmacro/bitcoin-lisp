@@ -184,6 +184,12 @@
 ;; -debug: categories; also raises the log level (see the plist assembly).
 (define-option "debug" :collect :debug-categories :repeatable t)
 (define-option "debugexclude" :collect :debug-exclude :repeatable t)
+;; -shrinkdebugfile: whether the log file is scrolled to its last 10 MB at
+;; startup (Core init/common.cpp:108-113). Its DEFAULT is derived from
+;; -debug -- DefaultShrinkDebugFile() is `m_categories == BCLog::NONE'
+;; (logging.cpp:167-170) -- so START-NODE has to tell "not given" from "=0";
+;; the keyword defaults to :UNSET and %INIT-LOGGING derives the rest.
+(define-option "shrinkdebugfile" :key :shrink-debug-file :type :bool)
 ;; Core reads both with GetArgs, so every occurrence runs (init.cpp:257-265
 ;; joins them all).
 (define-option "shutdownnotify" :collect :shutdown-notify :repeatable t)
@@ -480,7 +486,7 @@
   "logtimestamps" "maxreceivebuffer"
   "natpmp" "peerbloomfilters" "printpriority"
   "privatebroadcast" "rpcdoccheck"
-  "rpcworkqueue" "shrinkdebugfile"
+  "rpcworkqueue"
   "signer"
   "stopafterblockimport" "timeout"
   "unsafesqlitesync"
