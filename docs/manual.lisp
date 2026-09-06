@@ -805,11 +805,11 @@
   is Core's CVerifyDB over the last `-checkblocks` blocks at `-checklevel`
   (defaults 6 and 3, the level clamped to 0-4): it runs at startup over
   every chainstate whose coins view names a block, and a
-  :CORRUPTED-BLOCK-DB result refuses the start, as Core's "Corrupted block
-  database detected" does. Level 3 is the one that compares the two
-  databases -- it disconnects the tail into a scratch coins view over the
-  chainstate's own LevelDB, never flushed -- so it is what catches a UTXO
-  set that lost its coins under an unchanged tip.
+  :CORRUPTED-BLOCK-DB result refuses the start, the way Core's own
+  `Corrupted block database detected` does. Level 3 is the one that
+  compares the two databases -- it disconnects the tail into a scratch
+  coins view over the chainstate's own LevelDB, never flushed -- so it is
+  what catches a UTXO set that lost its coins under an unchanged tip.
 
   Traps: the P2SH-witness redeem script is the STACK TOP, not the last
   push (a consensus split when it was the latter). Block weight includes
