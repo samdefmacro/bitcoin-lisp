@@ -1056,7 +1056,12 @@
   background chainstate reaches the reorg path whenever it fast-forwards
   more than one block, and its blocks are ancient. The versionbits state
   machine REPORTS and tells the miner what to signal; it decides no
-  activation. Its regtest deployment windows are the one thing an option
+  activation. Everything getdeploymentinfo shows about a bip9 deployment
+  comes out of `versionbits-info', Core's VersionBitsCache::Info -- which
+  block each of the two status fields describes, whether the statistics
+  apply at all, and the per-block signalling record; the RPC only renders
+  it, so a rule about what to report belongs there and not in the handler.
+  Its regtest deployment windows are the one thing an option
   can move: -vbparams=deployment:start:end[:min_activation_height] rewrites
   them through APPLY-VERSIONBITS-PARAMETERS, on regtest only, exactly as
   Core's ReadRegTestArgs feeds RegTestOptions. Miniscript's 201-op limit is
@@ -1090,6 +1095,7 @@
   (bitcoin-lisp.validation:activate-best-chain function)
   (bitcoin-lisp.validation:perform-reorg function)
   (bitcoin-lisp.validation:versionbits-state function)
+  (bitcoin-lisp.validation:versionbits-info function)
   (bitcoin-lisp.validation:apply-versionbits-parameters function)
   (bitcoin-lisp.validation:compute-block-version function)
   (bitcoin-lisp.validation:versionbits-gbt-status function)

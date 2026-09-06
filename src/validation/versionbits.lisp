@@ -306,9 +306,17 @@ entered its current state (Core GetStateSinceHeightFor, versionbits.cpp:116)."
       since)))
 
 (defun versionbits-statistics (chain-state entry deployment)
-  "(values period threshold elapsed count possible) for the CURRENT period —
-Core BIP9Stats (versionbits.cpp:135-166). Meaningful only in the STARTED state,
-which is what getdeploymentinfo gates it on."
+  "(values period threshold elapsed count possible signalling) for the CURRENT
+period — Core BIP9Stats and the signalling_blocks vector it fills alongside
+(GetStateStatisticsFor, versionbits.cpp:118-155). Meaningful only in the
+STARTED and LOCKED_IN states, which is what getdeploymentinfo gates it on.
+
+SIGNALLING is a bit vector of length ELAPSED whose element I is 1 when the
+block I blocks after the START of the period satisfied the condition. Core
+sizes it to blocks_in_period and writes at the DECREASING index as it walks
+backwards from ENTRY (versionbits.cpp:130-147), so index 0 is the period's
+first block and the last element is ENTRY itself. Getting that order backwards
+is the easy mistake, and an all-signalling chain cannot catch it."
   (let* ((period (vb-deployment-period deployment))
          (threshold (vb-deployment-threshold deployment))
          (height (if entry (bl.store:block-index-entry-height entry) -1))
@@ -327,15 +335,68 @@ which is what getdeploymentinfo gates it on."
     ;; not guard, but `(mod -1 period)' is period-1 in CL, so without this the
     ;; formula above would walk a NIL entry a whole period of times.
     (when (null entry)
-      (return-from versionbits-statistics (values period threshold 0 0 nil)))
-    (dotimes (i elapsed)
-      (unless walker (return))
-      (when (%vb-condition-p walker deployment) (incf count))
-      (setf walker (bl.store:block-index-entry-prev-entry walker)))
-    (values period threshold elapsed count
-            ;; `possible' is false once the blocks remaining in the period can
-            ;; no longer reach the threshold (versionbits.cpp:161-163).
-            (>= (+ count (- period elapsed)) threshold))))
+      (return-from versionbits-statistics
+        (values period threshold 0 0 nil (make-array 0 :element-type 'bit))))
+    (let ((signalling (make-array elapsed :element-type 'bit :initial-element 0)))
+      (dotimes (i elapsed)
+        (unless walker (return))
+        (when (%vb-condition-p walker deployment)
+          (incf count)
+          (setf (sbit signalling (- elapsed 1 i)) 1))
+        (setf walker (bl.store:block-index-entry-prev-entry walker)))
+      (values period threshold elapsed count
+              ;; `possible' is false once the blocks remaining in the period can
+              ;; no longer reach the threshold (versionbits.cpp:161-163).
+              (>= (+ count (- period elapsed)) threshold)
+              signalling))))
+
+(defstruct (vb-stats (:constructor %make-vb-stats))
+  "What one deployment's CURRENT period looks like so far — Core BIP9Stats
+(versionbits.h:31-47) plus the per-block record BIP9Info carries beside it
+(signalling_blocks, versionbits.h:58-59). The two are filled by the same walk,
+Core gates both on the same `stats.has_value()' and renders them one after the
+other (rpc/blockchain.cpp:1332-1349), so they travel together here."
+  (period 1 :type (integer 1))
+  (threshold 0 :type (integer 0))
+  (elapsed 0 :type (integer 0))
+  (count 0 :type (integer 0))
+  (possible nil :type boolean)
+  ;; Indexed from the START of the period; see VERSIONBITS-STATISTICS.
+  (signalling #* :type simple-bit-vector))
+
+(defun versionbits-info (chain-state entry deployment)
+  "(values CURRENT NEXT SINCE STATS ACTIVE-SINCE) for DEPLOYMENT at ENTRY —
+Core VersionBitsCache::Info (versionbits.cpp:188-227), the shape
+getdeploymentinfo renders. STATS is a VB-STATS while signalling applies and
+NIL otherwise (Core's std::optional<BIP9Stats>), and ACTIVE-SINCE is a height
+or NIL (Core's std::optional<int> active_since).
+
+⚠️ CURRENT and NEXT are the states of DIFFERENT blocks. Core's `status' is
+GetStateFor(pindex->pprev), the state OF this block, and `status_next' is
+GetStateFor(pindex), the state of the NEXT one (versionbits.cpp:197-203).
+Reporting one value twice is the easy mistake here.
+
+⚠️ Core has TWO ways a deployment is active-since (versionbits.cpp:219-223):
+the state IS active, or the NEXT block's state is. Dropping the second is an
+off-by-one reachable on the live mainnet node, which holds the header at
+taproot's activation height minus one."
+  (let* ((prev (and entry (bl.store:block-index-entry-prev-entry entry)))
+         (height (if entry (bl.store:block-index-entry-height entry) 0))
+         (current (versionbits-state chain-state prev deployment))
+         (next (versionbits-state chain-state entry deployment))
+         (since (versionbits-since-height chain-state prev deployment))
+         (stats
+           ;; Core fills the statistics only in the two states where signalling
+           ;; is still being counted (versionbits.cpp:210-212).
+           (when (member current '(:started :locked-in))
+             (multiple-value-bind (period threshold elapsed count possible signalling)
+                 (versionbits-statistics chain-state entry deployment)
+               (%make-vb-stats :period period :threshold threshold
+                               :elapsed elapsed :count count
+                               :signalling signalling :possible possible)))))
+    (values current next since stats
+            (cond ((eq current :active) since)
+                  ((eq next :active) (1+ height))))))
 
 (defun versionbits-state-name (state)
   "Core's BIP9 status strings (rpc/blockchain.cpp's get_state_name)."

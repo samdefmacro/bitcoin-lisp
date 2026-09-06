@@ -10,16 +10,25 @@
                   (setf (aref h 1) i)
                   h)))
 
-(defun make-versionbits-chain (n &key (network :regtest) (signal-bit nil) (base-time 1000000))
+(defun make-versionbits-chain (n &key (network :regtest) (signal-bit nil) (base-time 1000000)
+                                      (signal-when (constantly t)))
   "(values chain-state last-entry) for a synthetic chain of N blocks.
 
 Every header carries the versionbits top bits, and SIGNAL-BIT additionally sets
-that deployment bit — which is what CONDITION counts."
+that deployment bit — which is what CONDITION counts.
+
+SIGNAL-WHEN is called with the block's height and decides which blocks set the
+bit; every block does by default. A chain where only some blocks signal is what
+makes the ORDER of the per-block signalling record observable — on an
+all-signalling chain the record reads the same forwards and backwards."
   (declare (ignore network))
   (let ((cs (bl.store:make-chain-state))
         (prev nil))
     (dotimes (i n)
-      (let* ((version (logior #x20000000 (if signal-bit (ash 1 signal-bit) 0)))
+      (let* ((version (logior #x20000000
+                              (if (and signal-bit (funcall signal-when i))
+                                  (ash 1 signal-bit)
+                                  0)))
              (header (bl.ser:make-block-header
                       :version version
                       :prev-block (make-array 32 :element-type '(unsigned-byte 8)
