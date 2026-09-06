@@ -714,6 +714,16 @@
   (ReceivedResponse), which is what stops an unsolicited witness-malleated
   twin from releasing every honest announcer of a txid.
 
+  Erlay's reconciliation sets are the one thing here with no Core to check
+  against (Core ships the sendtxrcncl handshake and nothing else; BIP-330 is
+  the specification), and their invariant is that a SUCCESSFUL round retires
+  the whole frozen snapshot on both sides, not just the symmetric
+  difference: the differing ids were just requested or announced, and the
+  ids that CANCELLED in the sketch cancelled precisely because both sides
+  hold them. Retiring only the difference left the cancelled ids in the set
+  for the life of the connection, so every later sketch was sized against
+  dead weight -- the bandwidth Erlay exists to save.
+
   Traps: `getheaders` must send the locator of the LAST header the peer
   gave us, never our own tip, or an ordinary lagging peer loops forever.
   The is-IBD answer is a one-way latch -- and both halves of Core's IBD gate

@@ -15,6 +15,19 @@
 (defun %rc-wtxid (n)
   (make-array 32 :element-type '(unsigned-byte 8) :initial-element n))
 
+(defun %rc-count (set)
+  "How many transactions SET is holding for reconciliation. This file's one
+reader for that, since almost every test here asserts on it."
+  (bl.net::recon-set-size set))
+
+(defun %rc-hold (peer wtxids &key (k0 11) (k1 22))
+  "Queue WTXIDS in PEER's reconciliation set — what RELAY-TRANSACTION does for
+a registered peer that did not draw the fanout slot — and return the set. The
+set is created on first use, exactly as the relay path creates it."
+  (let ((set (bl.net::%peer-recon-set peer)))
+    (dolist (w wtxids set)
+      (bl.net::recon-set-add set k0 k1 w))))
+
 (test short-ids-are-per-peer-and-never-zero
   "Salted per peer so an observer on one link cannot tell which transactions a
 node holds on another, and cannot grind IDs that collide for everybody. Zero is
@@ -39,17 +52,17 @@ returns; the wtxid rides along so the node can announce the real transaction
 once the difference is known."
   (let ((set (bl.net::make-recon-set))
         (wtxid (%rc-wtxid 11)))
-    (is (= 0 (bl.net::recon-set-size set)))
+    (is (= 0 (%rc-count set)))
     (let ((id (bl.net::recon-set-add set 1 2 wtxid)))
       (is-true id)
-      (is (= 1 (bl.net::recon-set-size set)))
+      (is (= 1 (%rc-count set)))
       (is (equalp wtxid (bl.net::recon-set-wtxid set id)))
       ;; Adding the same transaction again is a no-op, not a duplicate.
       (is-false (bl.net::recon-set-add set 1 2 wtxid))
-      (is (= 1 (bl.net::recon-set-size set)))
+      (is (= 1 (%rc-count set)))
       ;; Removal is by wtxid, resolved through the same salt.
       (bl.net::recon-set-remove set 1 2 wtxid)
-      (is (= 0 (bl.net::recon-set-size set))))))
+      (is (= 0 (%rc-count set))))))
 
 (test a-round-reconciles-a-frozen-snapshot
   "A round spans several messages while transactions keep arriving.
@@ -61,7 +74,7 @@ peer never saw, so the round works from a snapshot."
       (is (= 3 (length snap)))
       ;; More arrive mid-round; the snapshot does not move.
       (dotimes (i 3) (bl.net::recon-set-add set 1 2 (%rc-wtxid (+ 100 i))))
-      (is (= 6 (bl.net::recon-set-size set)))
+      (is (= 6 (%rc-count set)))
       (is (= 3 (length (bl.net::recon-set-snapshot set))))
       (bl.net::recon-set-clear-snapshot set)
       (is-false (bl.net::recon-set-snapshot set)))))
@@ -81,8 +94,8 @@ one side has and the other does not."
     (dolist (w (append shared only-theirs))
       (bl.net::recon-set-add theirs k0 k1 w))
     (let* ((capacity (bl.net::recon-estimate-capacity
-                      (bl.net::recon-set-size mine)
-                      (bl.net::recon-set-size theirs)
+                      (%rc-count mine)
+                      (%rc-count theirs)
                       0.5d0))
            (a (bl.net::recon-build-sketch
                (bl.net::recon-set-short-ids mine) capacity))
@@ -190,8 +203,8 @@ already has and announce nothing."
     (dolist (w (append shared only-theirs))
       (bl.net::recon-set-add theirs k0 k1 w))
     (let* ((capacity (bl.net::recon-estimate-capacity
-                      (bl.net::recon-set-size mine)
-                      (bl.net::recon-set-size theirs)
+                      (%rc-count mine)
+                      (%rc-count theirs)
                       0.5d0))
            (round (bl.net::make-recon-round
                    :local-ids (bl.net::recon-set-short-ids mine)))
@@ -317,8 +330,7 @@ what keeps the first announcement from revealing the origin."
       (is (> held announced)
           "holding is the common case; fanout is the minority (~D held, ~D fanned out)"
           held announced)
-      (is (= held (bl.net::recon-set-size
-                   (bl.net::%peer-recon-set peer)))
+      (is (= held (%rc-count (bl.net::%peer-recon-set peer)))
           "everything held is in the set, once each"))))
 
 (test a-lone-reconciling-peer-is-simply-announced-to
@@ -353,8 +365,7 @@ what the handshake recorded."
         (in (%rc-peer :registered t :we-initiate nil :inbound t))
         (now 100000))
     (dolist (p (list out in))
-      (bl.net::recon-set-add
-       (bl.net::%peer-recon-set p) 11 22 (%rc-wtxid 9)))
+      (%rc-hold p (list (%rc-wtxid 9))))
     (is-true (bl.net::recon-should-start-round-p out now))
     (is-false (bl.net::recon-should-start-round-p in now))))
 
@@ -364,8 +375,7 @@ that reconciled continuously would announce in a pattern that reveals how many
 peers it has."
   (let ((peer (%rc-peer :registered t))
         (now 100000))
-    (bl.net::recon-set-add
-     (bl.net::%peer-recon-set peer) 11 22 (%rc-wtxid 4))
+    (%rc-hold peer (list (%rc-wtxid 4)))
     (is-true (bl.net::recon-should-start-round-p peer now))
     (is-true (bl.net::recon-start-round peer now))
     ;; A round is in flight: not again.
@@ -388,13 +398,55 @@ overhead, and Erlay exists to remove overhead."
 never transactions — so everything in the frozen snapshot goes out the ordinary
 way and leaves the set."
   (let* ((peer (%rc-peer :registered t))
-         (set (bl.net::%peer-recon-set peer))
-         (wtxids (loop for i from 40 below 45 collect (%rc-wtxid i))))
-    (dolist (w wtxids) (bl.net::recon-set-add set 11 22 w))
+         (wtxids (loop for i from 40 below 45 collect (%rc-wtxid i)))
+         (set (%rc-hold peer wtxids)))
     (bl.net::recon-start-round peer 100000)
     (let ((flooded (bl.net::recon-abandon-round peer)))
       (is (= (length wtxids) (length flooded))
           "every held transaction must be announced after a failed round")
-      (is (= 0 (bl.net::recon-set-size set))
+      (is (= 0 (%rc-count set))
           "and leave the set, so it is not announced twice")
       (is-false (bl.net::peer-recon-round peer)))))
+
+(test a-successful-round-retires-the-whole-snapshot
+  "After a round DECODES, the peer holds every transaction the frozen snapshot
+described: the ones in the symmetric difference because they have just been
+requested from it or announced to it, and the ones that CANCELLED in the
+sketch because both sides already had them. Retiring only the difference kept
+every cancelled id for the life of the connection, so the set grew
+monotonically and RECON-ESTIMATE-CAPACITY sized each later sketch against dead
+weight -- the bandwidth Erlay exists to save. BIP-330 is the specification
+here; Core ships no reconciliation set to compare against."
+  (let* ((peer (%rc-peer :registered t))
+         (shared (loop for i from 0 below 20 collect (%rc-wtxid i)))
+         (ours-only (loop for i from 60 below 63 collect (%rc-wtxid i)))
+         (set (%rc-hold peer (append shared ours-only))))
+    (bl.net::recon-start-round peer 100000)
+    (is (= 23 (%rc-count set)))
+    ;; The peer held SHARED, so those cancel in the sketch and the decoded
+    ;; difference is OURS-ONLY alone.
+    (multiple-value-bind (ask announce)
+        (bl.net::recon-finish-round
+         peer (mapcar (lambda (w) (bl.net::recon-short-id 11 22 w)) ours-only))
+      (is (null ask) "nothing to request: the peer was missing nothing")
+      (is (= 3 (length announce))))
+    (is (= 0 (%rc-count set))
+        "the 20 that cancelled must leave the set too, or it never shrinks")))
+
+(test a-reconcildiff-retires-the-responders-whole-snapshot
+  "The responder half of the same rule. It froze a snapshot to answer
+reqrecon; a SUCCESS reconcildiff asks for the ids it was missing, and the rest
+of that snapshot is settled because cancelling in the sketch is exactly what
+both sides holding it looks like."
+  (let* ((peer (%rc-peer :registered t))
+         (wtxids (loop for i from 70 below 78 collect (%rc-wtxid i)))
+         (set (%rc-hold peer wtxids))
+         (asked (bl.net::recon-short-id 11 22 (first wtxids))))
+    ;; RECON-RESPOND-TO-REQUEST freezes the set like this before it sketches.
+    (bl.net::recon-set-take-snapshot set)
+    (bl.net::%handle-reconcildiff
+     peer (subseq (bl.ser:make-reconcildiff-message t (list asked)) 24))
+    (is (= 1 (length (bl.net:peer-tx-inv-queue peer)))
+        "only the asked-for transaction is announced")
+    (is (= 0 (%rc-count set))
+        "and the seven that cancelled leave the set with it")))

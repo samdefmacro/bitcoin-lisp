@@ -3384,19 +3384,23 @@ moved since the first sketch would describe something it never saw."
 (defun %handle-reconcildiff (peer payload)
   "The initiator finished. Announce what it asked for; on a failure, announce
 the whole snapshot — the flood fallback that keeps a failed round from losing
-transactions."
+transactions.
+
+A SUCCESS retires the responder's WHOLE snapshot, the same way
+RECON-FINISH-ROUND retires the initiator's: the ids the initiator asked for
+are settled because we are announcing them now, and the rest of the snapshot
+is settled because it cancelled in the sketch, which only happens when both
+sides already hold it. Retiring only the asked-for ids left the cancelled ones
+in the set for the life of the connection."
   (handler-case
       (multiple-value-bind (ok ask)
           (bl.ser:parse-reconcildiff-payload payload)
         (let ((set (peer-recon-set peer)))
           (if ok
-              (%announce-wtxids
-               peer
-               (loop for id in ask
-                     for wtxid = (and set (recon-set-wtxid set id))
-                     when wtxid
-                       collect wtxid
-                       and do (remhash id (recon-set-by-short-id set))))
+              (progn
+                (%announce-wtxids peer (recon-settle-ids set ask))
+                (when set
+                  (recon-settle-ids set (recon-set-snapshot set))))
               (%announce-wtxids peer (recon-abandon-round peer)))
           (when set (recon-set-clear-snapshot set))))
     (error (e)

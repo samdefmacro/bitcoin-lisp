@@ -241,26 +241,51 @@ and send it."
     (bl.ser:make-sketch-message
      (ms-sketch-serialize (recon-build-sketch ids capacity)))))
 
+(defun recon-settle-ids (set short-ids)
+  "Drop SHORT-IDS from SET and return the wtxids they were holding.
+
+An id passed here is SETTLED with this peer — announced to it, requested from
+it, or shown by the sketch to be held by both sides — so it must not still be
+in the set the next round reconciles. Returns NIL for a NIL SET, and skips an
+id the set no longer holds."
+  (when set
+    (loop for id in short-ids
+          for wtxid = (recon-set-wtxid set id)
+          when wtxid
+            collect wtxid
+            and do (remhash id (recon-set-by-short-id set)))))
+
 (defun recon-finish-round (peer decoded-ids)
-  "Split the decoded difference and clear the round.
+  "Split the decoded difference and retire the round's snapshot.
 
 Returns (values ids-to-request wtxids-to-announce). Nothing is sent here — the
 caller owns the socket — but the split has to happen while the round's frozen
-snapshot is still around."
+snapshot is still around.
+
+A SUCCESSFUL round retires the WHOLE snapshot, not only the symmetric
+difference. Every id in the snapshot is known to both sides once the round
+succeeds: the ones in the difference because they were just requested or
+announced, and the ones that CANCELLED in the sketch because both sides
+already held them. Removing only the difference — which is what this did —
+kept every cancelled id for the life of the connection, so the set grew
+monotonically and RECON-ESTIMATE-CAPACITY sized every later sketch against
+dead weight, which is exactly the bandwidth Erlay exists to save.
+RECON-ABANDON-ROUND already retires the same ids; this is that shape.
+
+BIP-330 is the specification for this: Core at d3056bc ships the sendtxrcncl
+handshake and no reconciliation set at all (see this file's header)."
   (let* ((round (peer-recon-round peer))
          (ask (recon-round-missing-ids round decoded-ids))
          (mine (recon-round-ours-to-announce round decoded-ids))
-         (set (peer-recon-set peer)))
+         (set (peer-recon-set peer))
+         ;; Ours are announced by wtxid, so they leave the set: the peer is
+         ;; about to hear about them the ordinary way.
+         (announce (recon-settle-ids set mine)))
     (setf (peer-recon-round peer) nil)
+    ;; The rest of the snapshot cancelled in the sketch: both sides hold it.
+    (recon-settle-ids set (recon-round-local-ids round))
     (when set (recon-set-clear-snapshot set))
-    (values ask
-            ;; Ours are announced by wtxid, so they leave the set: the peer is
-            ;; about to hear about them the ordinary way.
-            (loop for id in mine
-                  for wtxid = (and set (recon-set-wtxid set id))
-                  when wtxid
-                    collect wtxid
-                    and do (remhash id (recon-set-by-short-id set))))))
+    (values ask announce)))
 
 (defun recon-abandon-round (peer)
   "Give up on the round and fall back to announcing everything in the snapshot
@@ -268,14 +293,11 @@ snapshot is still around."
 transactions."
   (let* ((round (peer-recon-round peer))
          (set (peer-recon-set peer))
-         (ids (and round (recon-round-local-ids round))))
+         (ids (and round (recon-round-local-ids round)))
+         (announce (recon-settle-ids set ids)))
     (setf (peer-recon-round peer) nil)
     (when set (recon-set-clear-snapshot set))
-    (loop for id in (or ids '())
-          for wtxid = (and set (recon-set-wtxid set id))
-          when wtxid
-            collect wtxid
-            and do (remhash id (recon-set-by-short-id set)))))
+    announce))
 
 (defun maybe-start-reconciliation (peer now)
   "The timer entry point: open a round with PEER if it is due. Returns T when
