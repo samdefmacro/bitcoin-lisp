@@ -83,8 +83,10 @@ when the index is enabled; a disabled index keeps no handle."
 
 (defgeneric index-height (index chainstate)
   (:documentation "The highest height INDEX has indexed contiguously from
-genesis, or -1. CHAINSTATE lets an index whose marker is a hash only (the
-txindex, like Core's locator) resolve it against the active chain."))
+genesis, or -1. CHAINSTATE lets an index whose marker is a hash, or a
+(hash, height) pair whose height only means something while the hash is on
+the active chain, resolve it there -- the txindex, the spender index and the
+filter index all do, where Core reads a locator (BaseIndex::Init)."))
 
 (defgeneric index-best-block (index)
   (:documentation "(values block-hash height) of the highest indexed block,
