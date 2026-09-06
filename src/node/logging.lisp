@@ -138,12 +138,20 @@ external logrotate, and ours is the same."
       (format *error-output* "WARNING: could not shrink log file ~A: ~A~%" path e)
       nil)))
 
-(defun start-file-logging (path)
-  "Start logging to a file at PATH, scrolling it first if it has grown past
-Core's threshold."
+(defun start-file-logging (path &key (shrink t))
+  "Start logging to a file at PATH, scrolling it first when SHRINK is true and
+it has grown past Core's threshold.
+
+SHRINK is Core's -shrinkdebugfile gate, and it is an argument rather than a
+global because that is where Core reads it: StartLogging scrolls only when
+GetBoolArg(\"-shrinkdebugfile\", DefaultShrinkDebugFile()) is true
+(init/common.cpp:108-113), and that default is false whenever any -debug
+category is enabled -- an operator reproducing a fault under -debug must not
+lose the run before it on the restart that reproduces it."
   (when *log-file-stream*
     (close *log-file-stream*))
-  (shrink-log-file path)
+  (when shrink
+    (shrink-log-file path))
   (setf *log-file-path* path)
   (setf *log-file-stream* (open path :direction :output
                                      :if-exists :append

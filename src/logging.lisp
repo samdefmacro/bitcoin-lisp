@@ -26,6 +26,7 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
    #:+log-buffer-size+
    #:+log-categories+
    #:apply-log-categories
+   #:default-shrink-debug-file-p
    #:category-log-level
    #:clear-category-log-levels
    #:defer-log
@@ -444,6 +445,24 @@ an operator staring at a log that will never contain what they asked for.
     (unless (disable-log-category cat)
       (config-error "Unsupported logging category -debugexclude=~A." cat)))
   (remove-if-not #'log-category-enabled-p +log-categories+))
+
+(defun default-shrink-debug-file-p (include exclude)
+  "Core BCLog::Logger::DefaultShrinkDebugFile (logging.cpp:167-170): the
+startup scroll is on by default only when NO debug category ends up enabled --
+`m_categories == BCLog::NONE' AFTER -debug (INCLUDE) and -debugexclude
+(EXCLUDE) have both been applied, which is why -debug=net alone turns it off
+and -debug=net -debugexclude=net leaves it on.
+
+Answered on a SCRATCH category set, so asking the question neither installs
+the categories early nor reports an unsupported name here: APPLY-LOG-CATEGORIES
+does both, later, in Core's own order (Core runs SetLoggingCategories before
+StartLogging; we open the log file first, because the deferred config lines
+have nowhere to go until it exists). An unsupported name answers NIL -- the
+node is about to refuse to start over it, and not scrolling is the direction
+that keeps the evidence."
+  (let ((*debug-categories* (make-hash-table :test 'equal)))
+    (null (handler-case (apply-log-categories include exclude)
+            (error () (return-from default-shrink-debug-file-p nil))))))
 
 (defun node-log-category (category format-string &rest args)
   "Emit a :debug entry tagged with CATEGORY iff that category is enabled, or the
