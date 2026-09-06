@@ -1703,6 +1703,110 @@ who CALLS an exported function, and these were not functions at all."
         "~D exported symbol~:P name nothing -- either import the symbol the ~
 definition moved to, or drop it from the export list: ~S" (length dead) dead)))
 
+(defun %reader-error-in (text)
+  "NIL when TEXT reads through cleanly, else the type of the reader error.
+
+Reads under *READ-SUPPRESS*, which interns nothing and needs no package to
+exist, so this says only whether the SYNTAX is whole."
+  (handler-case
+      (with-input-from-string (in text)
+        (let ((*read-suppress* t) (*package* (find-package :cl-user)))
+          (loop for form = (read in nil :eof) until (eq form :eof)))
+        nil)
+    (error (e) (type-of e))))
+
+(defun %split-prose-strings (text &key (minimum 100))
+  "Every string literal in TEXT that is too short to be a manual section's
+prose, as (line-number . length).
+
+A DEFSECTION's prose is a DOCSTRING, so ONE unescaped double quote in it ends
+the docstring where it stands and the rest of the paragraph becomes code. When
+the quotes happen to pair up the form still READS -- that is how this last
+escaped -- but the one long prose string has become several short ones, and
+that is what this measures. Strings opened on a line that starts a DEFSECTION
+are the (:title ...) and are exempt; every other string in the manual is a
+section's prose, and the shortest real one is 237 characters."
+  (let ((hits '()) (line 1) (i 0) (n (length text))
+        ;; Split once: the title check below runs for every short string, and
+        ;; every title IS one.
+        (lines (coerce (uiop:split-string text :separator (string #\Newline))
+                       'vector)))
+    (loop while (< i n)
+          do (let ((c (char text i)))
+               (cond ((char= c #\Newline) (incf line) (incf i))
+                     ((char= c #\;)
+                      (loop while (and (< i n) (char/= (char text i) #\Newline))
+                            do (incf i)))
+                     ((and (char= c #\#) (< (1+ i) n) (char= (char text (1+ i)) #\\))
+                      (incf i 3))
+                     ((char= c #\")
+                      (let ((start-line line) (length 0))
+                        (incf i)
+                        (loop while (< i n)
+                              do (let ((d (char text i)))
+                                   (cond ((char= d #\\) (incf i 2) (incf length))
+                                         ((char= d #\") (incf i) (return))
+                                         (t (when (char= d #\Newline) (incf line))
+                                            (incf i) (incf length)))))
+                        (when (and (< length minimum)
+                                   (not (%line-starts-a-section-p lines start-line)))
+                          (push (cons start-line length) hits))))
+                     (t (incf i)))))
+    (nreverse hits)))
+
+(defun %line-starts-a-section-p (lines line-number)
+  "T when LINE-NUMBER of LINES (a vector of source lines) begins a DEFSECTION
+form, so the string opened there is the title and not the prose."
+  (let ((line (and (<= 1 line-number (length lines)) (aref lines (1- line-number)))))
+    (and line (%line-head line "(defsection ") t)))
+
+(test the-manual-reads
+  "docs/manual.lisp is Lisp, and a defsection's prose is a DOCSTRING: one
+unescaped double quote in it ends the docstring, and the prose after it becomes
+code. Nothing in the BUILD says so -- the manual is not an ASDF component -- so
+only `dev.sh docs-check` caught it, and that lane has to reach the network to
+quickload its documentation system before it can say anything. Both halves are
+checked here instead, from one read of the file and no network.
+
+Recorded three times in this tree: a scripted edit that lost the backslash in
+an escaped quote, a Core message quoted into a manual entry, and prose that
+quoted a log line's own text (GA11 559c86ad). The first two left an ODD number
+of quotes and the file stopped reading; the third paired up, still read, and
+split one paragraph into four fragments -- so a reader error alone is not
+enough to catch this."
+  ;; Positive controls first, so neither sweep can pass vacuously.
+  (is (null (%reader-error-in
+             "(defsection @x (:title \"t\") \"clean prose\" (foo function))"))
+      "a whole section must read")
+  (is-true (%reader-error-in
+            "(defsection @x (:title \"t\") \"prose with a \" quote in it\" (foo function))")
+           "an odd unescaped quote inside the prose must be reported")
+  ;; The shape that still READS: the quotes pair up, so the reader is happy and
+  ;; one paragraph has silently become two fragments.
+  (is (equal '((2 . 14) (2 . 9))
+             (%split-prose-strings
+              (format nil "(defsection @x (:title ~S)~%  ~Aprose so far: ~A ~
+                           peeraddr=<addr>~A and more~A (foo function))"
+                      "t" #\" #\" #\" #\")
+              :minimum 30))
+      "a paragraph split by a paired quote must be reported")
+  (is (null (%split-prose-strings
+             (format nil "(defsection @x (:title ~S)~%  ~S (foo function))"
+                     "t" "prose long enough to be a real section paragraph")
+             :minimum 30))
+      "a whole paragraph, and a title, must not be reported")
+  (let* ((path (merge-pathnames "docs/manual.lisp"
+                                (asdf:system-source-directory :bitcoin-lisp)))
+         (text (uiop:read-file-string path))
+         (bad (%reader-error-in text))
+         (split (%split-prose-strings text)))
+    (is (null bad) "docs/manual.lisp does not read: ~A" bad)
+    (is (null split)
+        "docs/manual.lisp has ~D prose string~:P under 100 characters, so a ~
+docstring ended early -- write the quoted text with backticks, or escape it: ~
+~{line ~{~D (~D chars)~}~^, ~}"
+        (length split) (mapcar (lambda (h) (list (car h) (cdr h))) split))))
+
 (test refactoring-ratchets-can-actually-fail
   "Positive controls: each scanner must find something on the real tree, and
 the measuring functions must measure a known shape correctly."
