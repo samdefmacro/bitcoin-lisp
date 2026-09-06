@@ -80,18 +80,65 @@ the only one that uses it) without letting the excluded peers consume slots."
          (protected (subseq sorted (- (length sorted) n))))
     (remove-if (lambda (p) (member p protected)) candidates)))
 
-(defun %evict-keyed-netgroup (peer)
-  "A per-node-secret keying of the peer's netgroup (Core nKeyedNetGroup). The
-SECRET is what makes the netgroup protection unpredictable: without it an
-attacker knows which groups sort first and can arrange to be outside them."
-  (let ((group (or (bl.net:ip-netgroup
-                    (bl.net:peer-address peer))
-                   "_")))
-    (sxhash (cons *eviction-netgroup-secret* group))))
+(defvar *eviction-netgroup-key* nil
+  "The two 64-bit words keying %EVICT-KEYED-NETGROUP, as a cons, or NIL until
+SEED-EVICTION-NETGROUP-KEY has drawn them. Core's CConnman nSeed0/nSeed1,
+drawn once per PROCESS from a default-constructed FastRandomContext at
+AppInitMain (init.cpp:1642-1648: `FastRandomContext rng; ...
+CConnman(rng.rand64(), rng.rand64(), ...)').
 
-(defvar *eviction-netgroup-secret* (random most-positive-fixnum)
-  "Per-process secret behind %EVICT-KEYED-NETGROUP; Core derives its equivalent
-from the node's own random key.")
+NIL rather than a load-time draw, and NIL is a hard error at the point of use
+rather than a fallback. This was `(defvar *eviction-netgroup-secret* (random
+most-positive-fixnum))', whose initform runs at ASDF LOAD time -- before
+INIT-NODE re-seeds *random-state*, so the draw came from SBCL's build-time
+sequence and was the same integer, 1193941380623146742, in every node of every
+operator (and in a bare `sbcl' anybody can run). The whole point of keying the
+netgroup is that an attacker cannot compute which groups the eviction pass
+protects, so a key computable without even the binary voided
++EVICT-PROTECT-NETGROUP+.")
+
+(defun seed-eviction-netgroup-key ()
+  "Draw *EVICTION-NETGROUP-KEY* from the OS CSPRNG; return it.
+
+Core's two rand64() calls at CConnman construction (init.cpp:1642-1648).
+Called from INIT-NODE, the one place a node is constructed, so every process
+gets its own key. BL.CRYPTO:RAND-U64 has no fallback: a node that cannot reach
+the system entropy source fails to start instead of running with a guessable
+protection set."
+  (setf *eviction-netgroup-key* (cons (bl.crypto:rand-u64) (bl.crypto:rand-u64))))
+
+(defconstant +randomizer-id-netgroup+ #x6c0edd8036ef4036
+  "Core RANDOMIZER_ID_NETGROUP (net.cpp:110), SHA256(\"netgroup\")[0:8]. The
+domain separator Core writes into the deterministic randomizer before the
+netgroup bytes (GetDeterministicRandomizer, net.cpp:4131-4141), so the same
+node key produces unrelated values for netgroups and for the other things Core
+keys with it.")
+
+(defun %evict-keyed-netgroup (peer)
+  "SipHash-2-4 of the peer's netgroup under the node's own key -- Core
+CConnman::CalculateKeyedNetGroup (net.cpp:4136-4141), which is
+GetDeterministicRandomizer(RANDOMIZER_ID_NETGROUP).Write(group).Finalize().
+
+The KEY is what makes the netgroup protection unpredictable: without it an
+attacker knows which groups sort first and can arrange to be outside them. The
+PRF matters too, and this used to be (sxhash (cons secret group)): SBCL's
+SXHASH over a string does not avalanche, so netgroups sharing a prefix hashed
+to adjacent values -- the top twelve of all 57,088 /16 groups were one
+contiguous block, 190.210 through 190.238 -- and an attacker who learned the
+key at all learned a whole neighbourhood of winners at once.
+
+Signals rather than defaulting when the key was never drawn: a silent fallback
+is how the load-time draw survived unnoticed in the first place."
+  (let ((key (or *eviction-netgroup-key*
+                 (internal-error "eviction netgroup key never drawn (SEED-EVICTION-NETGROUP-KEY runs in INIT-NODE)")))
+        ;; IP-NETGROUP renders every network as digits and dots, so CHAR-CODE
+        ;; is the group's byte sequence.
+        (group (or (bl.net:ip-netgroup (bl.net:peer-address peer)) "_")))
+    (bl.crypto:siphash-2-4
+     (car key) (cdr key)
+     (concatenate '(vector (unsigned-byte 8))
+                  (bl.crypto:uint64-to-bytes-le +randomizer-id-netgroup+)
+                  (map '(vector (unsigned-byte 8)) #'char-code group)))))
 
 (defun %evict-newest-first (a b)
   "Order two eviction candidates most-recently-connected FIRST — Core's

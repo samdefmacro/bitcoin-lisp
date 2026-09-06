@@ -27,15 +27,16 @@ a compile error, not a layering-test entry."
 
 (defsystem "bitcoin-lisp/crypto"
   :description "Hashes, ChaCha20, MuHash, the libsecp256k1 FFI, BIP324
-key exchange, addresses and BIP32 -- everything Bitcoin needs from
-cryptography and nothing that needs Bitcoin's chain state. Depends on the
-util layer for chain parameters (bech32 HRPs) only."
+key exchange, addresses, BIP32 and the OS randomness source -- everything
+Bitcoin needs from cryptography and nothing that needs Bitcoin's chain
+state. Depends on the util layer for chain parameters (bech32 HRPs) only."
   :depends-on ("bitcoin-lisp/util" "ironclad" "cffi" "nibbles" "flexi-streams" "alexandria")
   :pathname "src"
   :serial t
   :components ((:file "crypto/package")
                (:module "crypto"
-                :components ((:file "hash")
+                :components ((:file "random")
+                             (:file "hash")
                              (:file "crypter")
                              (:file "chacha20")
                              (:file "muhash")

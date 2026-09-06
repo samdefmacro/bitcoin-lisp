@@ -159,16 +159,20 @@
   ```")
 
 (defsection @crypto (:title "crypto: hashes and libsecp256k1")
-  "Core: `crypto/`, `hash.cpp`, `key.cpp`, `pubkey.cpp`, `bip324.cpp`, and
-  the libsecp256k1 library itself (ECDSA, Schnorr, ellswift, MuSig)
-  through CFFI. The library path is the `BL_SECP_LIB` seam; the project
-  container ships v0.7.1 with the musig module.
+  "Core: `crypto/`, `hash.cpp`, `key.cpp`, `pubkey.cpp`, `bip324.cpp`,
+  `random.cpp`, and the libsecp256k1 library itself (ECDSA, Schnorr,
+  ellswift, MuSig) through CFFI. The library path is the `BL_SECP_LIB`
+  seam; the project container ships v0.7.1 with the musig module.
 
   Invariants: every primitive has a known-answer vector in the test tree
   (Core's `crypto_tests`, BIP340, BIP324, BIP32); a replacement without
   one is not a speed-up, it is a consensus change. Signature verification
   goes through the signature cache, whose key must include everything
-  that decides validity.
+  that decides validity. Every value an adversary SEES (a ping or
+  compact-block nonce, a BIP330 salt) or must not PREDICT (the eviction
+  netgroup key) comes from RAND-U64, the OS source, and never from
+  CL:RANDOM -- SBCL's MT19937 is invertible from its own output and its
+  fresh-image state is fixed at SBCL build time.
 
   Traps: `reverse-bytes` exists because SBCL elides a `(coerce (reverse
   ...))` pair on the fast path -- use it. Heavy FFI calls cannot be
@@ -181,6 +185,7 @@
   (bitcoin-lisp.crypto:tagged-hash function)
   (bitcoin-lisp.crypto:hmac-sha256 function)
   (bitcoin-lisp.crypto:siphash-2-4 function)
+  (bitcoin-lisp.crypto:rand-u64 function)
   (bitcoin-lisp.crypto:bytes-to-hex function)
   (bitcoin-lisp.crypto:hex-to-bytes function)
   (bitcoin-lisp.crypto:reverse-bytes function)
@@ -1007,7 +1012,11 @@
   Traps: a changed DEFCONSTANT needs an image RESTART -- the warm image
   goes stale whichever way the continuable error is answered; a changed
   MACRO or defstruct needs a fresh FASL volume. Re-derive process state
-  from the machine, never from a notification."
+  from the machine, never from a notification. A DEFVAR initform runs at
+  ASDF LOAD time, before INIT-NODE seeds anything, so per-process
+  randomness belongs in the start-up path: SEED-EVICTION-NETGROUP-KEY is
+  drawn there, next to SEED-GLOBAL-RANDOM-STATE, as Core draws its
+  CConnman seeds at AppInitMain."
   (bitcoin-lisp package)
   (bitcoin-lisp:node class)
   (bitcoin-lisp:*node* variable)
@@ -1023,6 +1032,8 @@
   (bitcoin-lisp:node-shutdown-requested-p function)
   (bitcoin-lisp:run-node-watchdog function)
   (bitcoin-lisp:effective-prune-target-bytes function)
+  (bitcoin-lisp::seed-global-random-state function)
+  (bitcoin-lisp::seed-eviction-netgroup-key function)
   (bitcoin-lisp:*blocksonly* variable)
   (bitcoin-lisp:*p2p-port-override* variable)
   (bitcoin-lisp:*assumevalid-override* variable))

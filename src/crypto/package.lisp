@@ -39,6 +39,9 @@ hash.cpp. src/crypto/.")
    #:+wallet-crypto-key-size+
    #:+wallet-crypto-salt-size+
    #:+wallet-crypto-iv-size+
+   ;; OS randomness (Core random.h): every public nonce and every secret key
+   ;; the node draws at run time. src/crypto/random.lisp.
+   #:rand-u64
    ;; SipHash (BIP 152)
    #:siphash-2-4
    #:compute-siphash-key
