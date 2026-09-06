@@ -182,10 +182,23 @@ know or a peer that exceeded its rate limit (and was disconnected)."
     (reply-to-ping peer nonce)))
 
 (define-p2p-handler "pong" (peer payload ctx)
-  "Close the round trip our last ping opened."
+  "Close the round trip our last ping opened.
+
+Core hand-writes a forgiving branch for a pong that is too short to hold the
+nonce (net_processing.cpp:5030-5035): nAvail < sizeof(nonce) sets sProblem to
+`Short payload', cancels the outstanding ping (bPingFinished), logs at debug
+and returns - the peer is kept. It is the one message whose truncation Core
+names, because a short pong is most likely a bug in another implementation and
+costs us nothing. Reading the u64 unguarded here instead raised, and the
+dispatch turned that into a disconnect."
   (declare (ignore ctx))
-  (record-pong peer (bl.bytes:with-byte-reader (s payload)
-                      (bl.bytes:br-read-u64-le s))))
+  (if (< (length payload) 8)
+      (progn
+        (bl:log-cat "net" "pong peer=~A: Short payload, ~X expected, ~D bytes"
+                    (peer-id peer) (or (peer-ping-nonce peer) 0) (length payload))
+        (setf (peer-ping-nonce peer) nil))
+      (record-pong peer (bl.bytes:with-byte-reader (s payload)
+                          (bl.bytes:br-read-u64-le s)))))
 
 (define-p2p-handler "mempool" (peer payload ctx)
   "BIP35. Core honors this only when it advertises NODE_BLOOM or the peer

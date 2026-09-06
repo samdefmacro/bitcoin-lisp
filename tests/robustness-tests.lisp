@@ -134,40 +134,151 @@
     (is (= 400 done))
     (is (plusp errored))))
 
-;;;; End-to-end: a malformed message disconnects the peer, not the node
+;;;; End-to-end: which malformed messages cost the peer its connection
+;;;;
+;;;; Core's split, and ours since the dispatch was given Core's shape: a
+;;;; payload that simply fails to decode is caught by ProcessMessages, logged
+;;;; at debug and FORGIVEN (net_processing.cpp:5269-5287), while a protocol
+;;;; vector declaring more elements than the message may carry is a named rule
+;;;; inside the handler and calls Misbehaving (inv :4128, getdata :4219,
+;;;; headers, addr).
 
 (defun %fake-ready-peer ()
   "A peer object in the :ready state with a socket-less (but 'connected')
-connection — enough to drive dispatch + disconnect without a real socket."
+connection and its rate-limit buckets filled -- enough to drive dispatch +
+disconnect without a real socket.
+
+The buckets are not decoration. Without them the FIRST thing every dispatch
+touches is a NIL token bucket, so the handler TYPE-ERRORs before it reads a
+byte of the payload and any assertion about how the payload was judged is
+measuring the fixture."
   (let ((conn (bl.net::make-connection
-               :host "127.0.0.1" :port 48333 :connected t)))
-    (bl.net:make-peer
-     :connection conn :state :ready :address "127.0.0.1")))
+               :host "127.0.0.1" :port 48333 :connected t))
+        (peer nil))
+    (setf peer (bl.net:make-peer
+                :connection conn :state :ready :address "127.0.0.1"))
+    (bl.net::init-peer-rate-limiters peer)
+    peer))
 
-(test malformed-message-disconnects-peer
-  ;; Drive an oversized inv (count 50001 > MAX_INV_SZ) through the REAL per-peer
-  ;; dispatch isolation used by the drain loop (safely-dispatch-peer-message).
-  ;; The parse error must be caught and disconnect only this peer — never escape
-  ;; to the caller (which in production is the sync thread). Validates the per-peer isolation.
-  (let ((peer (%fake-ready-peer))
-        (ctx (bl.net::make-ibd)))
-    (let ((still-connected
-            (bl.net::safely-dispatch-peer-message peer "inv" (%bytes #xfe #x51 #xc3 0 0) (bl.ctx:make-node-context) ctx)))
-      (is (null still-connected))
-      (is (eq :disconnected (bl.net:peer-state peer)))
-      (is (null (bl.net:peer-connection peer))))))
+(defun %dispatch-to-fake-peer (command payload &optional (peer (%fake-ready-peer)))
+  "Drive COMMAND/PAYLOAD through the shipped per-peer dispatch isolation the
+drain loop uses. Returns (values still-connected peer)."
+  (values (bl.net::safely-dispatch-peer-message
+           peer command payload (bl.ctx:make-node-context) (bl.net::make-ibd))
+          peer))
 
-(test wellformed-message-keeps-peer-connected
-  ;; Control: a benign (unknown, ignored) message dispatches without error, so
-  ;; the peer stays connected — proving the isolation disconnects on FAILURE, not
-  ;; unconditionally.
-  (let ((peer (%fake-ready-peer))
-        (ctx (bl.net::make-ibd)))
-    (let ((still-connected
-            (bl.net::safely-dispatch-peer-message peer "xyzzy" (%bytes) (bl.ctx:make-node-context) ctx)))
+(test over-limit-protocol-vector-misbehaves
+  "An inv/getdata/headers count above the protocol maximum is Misbehaving, so
+the peer is disconnected -- Core checks the same limits in the handler itself."
+  ;; 50001 = MAX_INV_SZ + 1, written CANONICALLY (0xfd + 2 bytes). The
+  ;; non-canonical 4-byte form this test used to send never reached the count
+  ;; check at all: ReadCompactSize rejected the encoding first, so the test
+  ;; proved a different rejection than the one it named. Assert the condition,
+  ;; not just the outcome.
+  (let ((inv-50001 (%bytes #xfd #x51 #xc3))
+        (headers-2001 (%bytes #xfd #xd1 #x07)))
+    (signals bl.err:protocol-limit-error (bl.ser:parse-inv-payload inv-50001))
+    (signals bl.err:protocol-limit-error (bl.ser:parse-headers-payload headers-2001))
+    (dolist (case (list (cons "inv" inv-50001)
+                        (cons "getdata" inv-50001)
+                        (cons "headers" headers-2001)))
+      (multiple-value-bind (still-connected peer)
+          (%dispatch-to-fake-peer (car case) (cdr case))
+        (is (null still-connected) "~A: an over-limit count must cost the connection" (car case))
+        (is (eq :disconnected (bl.net:peer-state peer))
+            "~A: an over-limit count must disconnect the peer" (car case))))))
+
+(test undecodable-payload-keeps-the-peer
+  "A payload that merely fails to decode is caught and forgiven, the way Core's
+ProcessMessages catch does -- it logs and never sets fDisconnect."
+  ;; An inv promising two vectors and carrying none: a plain deserialization
+  ;; failure, NOT an over-limit vector. This is the control that says the
+  ;; over-limit test above measures the limit and not "any error at all".
+  (let* ((truncated (%bytes 2))
+         (raised (handler-case (progn (bl.ser:parse-inv-payload truncated) nil)
+                   (error (c) c))))
+    (is-true raised "the control payload must still fail to decode")
+    (is-false (typep raised 'bl.err:protocol-limit-error)
+              "the control payload must NOT be an over-limit vector, or this ~
+test would be measuring the same rule as the one above")
+    (multiple-value-bind (still-connected peer)
+        (%dispatch-to-fake-peer "inv" truncated)
       (is (eq t still-connected))
       (is (eq :ready (bl.net:peer-state peer)))
       (is-true (bl.net:peer-connection peer)))))
+
+(test short-fixed-width-payloads-keep-the-peer
+  "ping, pong, feefilter, sendcmpct and notfound all read a fixed-width field
+with no length check. Core forgives every one of them (:4970, :4990, :5123,
+:3907, :5150 deserialize unguarded and rely on the ProcessMessages catch);
+dropping the peer instead turned one implementation's framing quirk into an
+endless connect/disconnect cycle we caused."
+  (dolist (case (list (cons "ping" (%bytes))
+                      (cons "ping" (%bytes 1 2 3))
+                      (cons "pong" (%bytes))
+                      (cons "pong" (%bytes 0 0 0 0))
+                      (cons "feefilter" (%bytes 1 2 3))
+                      (cons "sendcmpct" (%bytes 1))
+                      (cons "notfound" (%bytes))))
+    (multiple-value-bind (still-connected peer)
+        (%dispatch-to-fake-peer (car case) (cdr case))
+      (is (eq t still-connected)
+          "~A/~D bytes must be forgiven" (car case) (length (cdr case)))
+      (is (eq :ready (bl.net:peer-state peer))
+          "~A/~D bytes must keep the peer" (car case) (length (cdr case))))))
+
+(test wellformed-message-keeps-peer-connected
+  "Control: a well-formed message dispatches without error, so the peer stays
+connected -- the isolation forgives on FAILURE, it does not simply never act."
+  ;; A benign unknown command, and a well-formed 8-byte pong that closes the
+  ;; outstanding ping. The pong is the load-bearing control for the short-pong
+  ;; case above: it proves the fixture can deliver a pong that IS processed.
+  (multiple-value-bind (still-connected peer) (%dispatch-to-fake-peer "xyzzy" (%bytes))
+    (is (eq t still-connected))
+    (is (eq :ready (bl.net:peer-state peer)))
+    (is-true (bl.net:peer-connection peer)))
+  (let ((peer (%fake-ready-peer)))
+    (setf (bl.net::peer-ping-nonce peer) #x3039
+          (bl.net::peer-last-ping-time peer) (get-internal-real-time))
+    (is (eq t (%dispatch-to-fake-peer "pong" (%bytes #x39 #x30 0 0 0 0 0 0) peer)))
+    (is (eq :ready (bl.net:peer-state peer)))
+    (is (null (bl.net::peer-ping-nonce peer))
+        "a well-formed pong closes the outstanding ping")))
+
+(test short-pong-cancels-the-outstanding-ping
+  "Core's PONG short-payload branch (net_processing.cpp:5030-5035): fewer than
+8 bytes cancels the outstanding ping, logs at debug, and keeps the peer."
+  (let ((peer (%fake-ready-peer)))
+    (setf (bl.net::peer-ping-nonce peer) #x3039
+          (bl.net::peer-last-ping-time peer) (get-internal-real-time))
+    (is (eq t (%dispatch-to-fake-peer "pong" (%bytes 0 0 0 0) peer)))
+    (is (eq :ready (bl.net:peer-state peer)))
+    (is (null (bl.net::peer-ping-nonce peer))
+        "a short pong cancels the ping instead of leaving it outstanding")))
+
+(test swallowed-handler-errors-are-counted
+  "Forgiving a handler error hides OUR bugs too, so each one is counted per
+command and the count rides the net debug line."
+  (let ((bl.net::*message-handler-errors* (make-hash-table :test 'equal)))
+    (%dispatch-to-fake-peer "feefilter" (%bytes 1 2 3))
+    (%dispatch-to-fake-peer "feefilter" (%bytes 1 2 3))
+    (%dispatch-to-fake-peer "notfound" (%bytes))
+    (is (= 2 (gethash "feefilter" bl.net::*message-handler-errors* 0)))
+    (is (= 1 (gethash "notfound" bl.net::*message-handler-errors* 0)))
+    ;; Positive control: a message that does NOT raise must not be counted.
+    (%dispatch-to-fake-peer "xyzzy" (%bytes))
+    (is (= 0 (gethash "xyzzy" bl.net::*message-handler-errors* 0)))))
+
+(test a-named-handler-rule-still-disconnects
+  "The dispatch is forgiving, not toothless: a rule written inside a handler
+still drops the peer. Core disconnects a peer that sends sendaddrv2 or
+wtxidrelay after verack (the BIP155/BIP339 negotiation window is over) and so
+do we -- and the payload is empty, so nothing about the bytes can be blamed."
+  (dolist (command (list "sendaddrv2" "wtxidrelay"))
+    (multiple-value-bind (still-connected peer) (%dispatch-to-fake-peer command (%bytes))
+      (is (null still-connected) "~A after verack must cost the connection" command)
+      (is (eq :disconnected (bl.net:peer-state peer))
+          "~A after verack must disconnect the peer" command))))
 
 (test fuzz-message-vector-parsers-terminate
   ;; Random payloads to the inv/headers parsers must terminate (the count caps +
