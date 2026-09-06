@@ -110,9 +110,11 @@ whose target package exists. Called after each file that defines packages."
 
 (defpackage #:bitcoin-lisp.bytes
   (:documentation "Index-based byte I/O: the byte-buf writer, the byte-reader,
-the positional buf-set-* primitives and CompactSize. Loads before every other
-package that does I/O (bitcoin-lisp.asd) so the hot paths that inline these
-compile against them. src/util/bytes.lisp.")
+the positional buf-set-* primitives and CompactSize, plus SANITIZE-STRING --
+the filter Core keeps beside its encodings in util/strencodings.cpp, applied
+wherever peer-supplied text becomes a log line or an RPC field. Loads before
+every other package that does I/O (bitcoin-lisp.asd) so the hot paths that
+inline these compile against them. src/util/bytes.lisp.")
   (:use #:cl #:bitcoin-lisp.conditions)
   (:export
    #:+max-compact-size+
@@ -160,7 +162,9 @@ compile against them. src/util/bytes.lisp.")
    #:octets=
    #:octets-hash
    #:make-octets-hash-table
-   #:with-byte-reader))
+   #:with-byte-reader
+   ;; Core SanitizeString (util/strencodings.cpp)
+   #:sanitize-string))
 
 (defpackage #:bitcoin-lisp.chainparams
   (:documentation "Per-chain parameters (Core CChainParams): one

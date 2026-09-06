@@ -385,3 +385,39 @@ The 76-byte case is the testnet4 genesis timestamp message."
     (is (equal '(#x4e #x00 #x00 #x01 #x00) (prefix (push-of 65536) 5)))
     (is (= (+ 3 300) (length (push-of 300))))
     (is (typep (push-of 10) '(simple-array (unsigned-byte 8) (*))))))
+
+(defun %version-with-user-agent (n)
+  "A VERSION payload whose user agent is N 'A's, read back; the user agent's
+length, or the error the read signalled."
+  (let ((payload (bl.ser:make-version-message-bytes
+                  :user-agent (make-string n :initial-element #\A) :nonce 7)))
+    (handler-case
+        (bl.bytes:with-byte-reader (s payload)
+          (length (bl.ser:version-message-user-agent
+                   (bl.ser:read-version-message s))))
+      (bl.err:serialization-error (e) e))))
+
+(test version-user-agent-is-limited-to-cores-256-bytes
+  "GA11 1052063f. Core reads the subversion through
+LIMITED_STRING(strSubVer, MAX_SUBVERSION_LENGTH) (net_processing.cpp:3640),
+which THROWS above 256 bytes -- the VERSION fails to deserialize and the peer
+is dropped on the bad message, rather than the string being truncated and kept.
+
+Ours read it as a plain CompactSize-prefixed string bounded only by
++max-message-payload+, so one peer could hand us ~4 MB of arbitrary bytes per
+connection, retained on the peer object and re-serialized into every
+getpeerinfo response (125 inbound slots = ~500 MB).
+
+The check is on the LENGTH PREFIX, before the bytes are read, so an oversized
+claim costs no allocation."
+  (is (= 255 (%version-with-user-agent 255)))
+  ;; The boundary itself parses -- without this the cap could be rejecting
+  ;; everything and the assertions below would still pass.
+  (is (= 256 (%version-with-user-agent 256))
+      "positive control: a 256-byte user agent is exactly Core's limit and must parse")
+  (dolist (n '(257 1000 200000))
+    (let ((result (%version-with-user-agent n)))
+      (is-true (typep result 'bl.err:serialization-error)
+               "a ~D-byte user agent parsed to ~S instead of failing the message" n result)
+      (is-true (search "exceeds maximum 256" (princ-to-string result))
+               "unexpected error text: ~A" result))))

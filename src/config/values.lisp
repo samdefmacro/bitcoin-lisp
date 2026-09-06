@@ -145,18 +145,16 @@ NIL for non-hex / over-long input."
         (bl.crypto:hex-to-bytes padded)))))
 
 ;;; -uacomment / BIP14 subversion (Core init.cpp:1676-1686)
-
-(defconstant +max-subversion-length+ 256
-  "Cap on the full formatted subversion string (Core MAX_SUBVERSION_LENGTH,
-net.h:67). Exceeding it is an init ERROR, not a truncation.")
+;;;
+;;; The 256-byte cap itself is BL.SER:+MAX-SUBVERSION-LENGTH+: it is Core's
+;;; net.h constant, and the P2P READER needs it too (LIMITED_STRING on the
+;;; incoming subversion), so it lives with the wire format rather than here.
 
 (defun ua-comment-safe-p (comment)
   "T when COMMENT survives Core's SanitizeString with SAFE_CHARS_UA_COMMENT
 unchanged (strencodings.cpp:25: alphanumerics plus \" .,;-_?@\"). An unsafe
 character makes -uacomment an init error, matching Core."
-  (every (lambda (c)
-           (or (alphanumericp c) (find c " .,;-_?@")))
-         comment))
+  (string= comment (bl.bytes:sanitize-string comment :ua-comment)))
 
 (defconstant +default-proxy-port+ 9050
   "Default SOCKS5 proxy port when -proxy/-onion gives no :port (Tor's SOCKS

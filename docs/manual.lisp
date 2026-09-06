@@ -92,6 +92,14 @@
   `install-package-nicknames`, because a warm-image reload of a defpackage
   drops that package's nicknames.
 
+  Invariant on peer text: a string that came from a peer is filtered by
+  SANITIZE-STRING (Core's SanitizeString) at the boundary, once, and the
+  filtered form is what is stored -- the log, getpeerinfo and everything
+  else then need no escaping of their own. The log's own escape pass
+  deliberately lets a newline through, exactly as Core's LogEscapeMessage
+  does, so the boundary filter is what stops a peer from writing lines of
+  its own.
+
   Traps: `*network*` is read at load time by anything that dispatches on
   the chain, so start-node sets it before the option globals are applied
   (a mainnet-only check once read it too early and saw the testnet
@@ -112,6 +120,7 @@
   (bitcoin-lisp.bytes:with-byte-buf macro)
   (bitcoin-lisp.bytes:byte-reader class)
   (bitcoin-lisp.bytes:+max-compact-size+ constant)
+  (bitcoin-lisp.bytes:sanitize-string function)
   (bitcoin-lisp.chainparams package)
   (bitcoin-lisp.chainparams:define-chain-params macro)
   (bitcoin-lisp.chainparams:find-chain-params function)
@@ -366,7 +375,10 @@
   Invariants: canonical bytes are a public contract -- the txid is the
   hash of the bytes this layer writes, and a round trip alone proves
   nothing. Deserializers bound every length and count before allocating,
-  and refuse non-canonical CompactSize encodings where Core does.
+  and refuse non-canonical CompactSize encodings where Core does. A
+  peer-supplied string field says its own bound -- `(:var-string :max N
+  :name ...)`, Core's LIMITED_STRING -- and an over-long one FAILS the
+  message rather than being truncated, which is how the peer gets dropped.
 
   Trap: block DESERIALIZATION, not signature checking, is the IBD
   bottleneck (profiled); the byte-reader family is the fast path and the
@@ -388,6 +400,7 @@
   (bitcoin-lisp.serialization:block-header class)
   (bitcoin-lisp.serialization:block-header-hash function)
   (bitcoin-lisp.serialization:serialize-message function)
+  (bitcoin-lisp.serialization:+max-subversion-length+ constant)
   (bitcoin-lisp.serialization:*network-magic* variable)
   (bitcoin-lisp.serialization:parse-psbt function)
   (bitcoin-lisp.serialization:serialize-psbt function)

@@ -54,7 +54,6 @@ common/args.cpp, common/config.cpp, common/settings.cpp). src/config/.")
    #:conf-parse-loglevel
    #:conf-parse-money
    #:conf-parse-user-hex
-   #:+max-subversion-length+
    #:ua-comment-safe-p
    #:+default-proxy-port+
    #:conf-parse-proxy

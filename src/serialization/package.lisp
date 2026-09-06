@@ -163,6 +163,7 @@ src/serialization/.")
    #:+client-version+
    #:client-version-string
    #:format-user-agent
+   #:+max-subversion-length+
    #:subversion-with-build-rev
    #:read-version-message
    #:version-message-version

@@ -192,6 +192,14 @@ reach."
 (defconstant +node-p2p-v2+ (ash 1 11))            ; BIP 324: v2 transport support
 (defconstant +node-compact-filters+ (ash 1 6))   ; BIP 157/158: serves cfilters
 
+(defconstant +max-subversion-length+ 256
+  "Cap on the subversion string, in bytes (Core MAX_SUBVERSION_LENGTH,
+net.h:67). Applies in both directions: an outbound subversion longer than this
+is an init error on -uacomment (config-options.lisp, Core init.cpp:1676-1686),
+and an inbound VERSION whose user agent exceeds it FAILS TO PARSE -- Core reads
+it through LIMITED_STRING (net_processing.cpp:3640), which throws rather than
+truncating, and the peer is dropped on the bad message.")
+
 (define-message version-message
     (:documentation "Version message payload (Core protocol.h / net_processing.cpp
 PushNodeVersion).")
@@ -201,7 +209,12 @@ PushNodeVersion).")
   (addr-recv (:struct net-addr) :default (make-net-addr))
   (addr-from (:struct net-addr) :default (make-net-addr))
   (nonce :u64)
-  (user-agent :var-string :default (format-user-agent nil))
+  ;; Core reads the subversion through LIMITED_STRING(strSubVer,
+  ;; MAX_SUBVERSION_LENGTH) (net_processing.cpp:3640). Without the cap a peer
+  ;; controlled up to +max-message-payload+ (4 MB) of user agent per
+  ;; connection, held on the peer and re-serialized into every getpeerinfo.
+  (user-agent (:var-string :max +max-subversion-length+ :name "user agent")
+              :default (format-user-agent nil))
   (start-height :i32)
   ;; relay flag may not be present in older versions (BIP 37): absent means T
   (relay :bool :default t
@@ -456,6 +469,20 @@ length shrank parsed happily and re-serialized shorter than its input."
       tx)))
 
 ;;;; Message parsing
+
+(defun br-read-limited-string (br max name)
+  "Core LIMITED_STRING(str, MAX) (serialize.h): read a CompactSize length and
+signal if it exceeds MAX -- BEFORE reading or allocating the bytes -- then the
+string itself. NAME labels the error.
+
+Core THROWS here rather than truncating, and the message the string belongs to
+fails to deserialize, so the peer is dropped by the bad-message path. That is
+the behaviour to copy: a truncated value would leave a misbehaving peer
+connected and would report a string the peer never sent."
+  (let ((len (br-read-compact-size br)))
+    (when (> len max)
+      (serialization-error "~A length ~D exceeds maximum ~D" name len max))
+    (map 'string #'code-char (br-read-bytes br len))))
 
 (defun br-read-bounded-count (br max name)
   "Read a CompactSize count from BR and signal an error if it exceeds MAX.

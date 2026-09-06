@@ -359,3 +359,41 @@ the OCTETS= test under SBCL, EQUALP elsewhere."
   (make-hash-table #+sbcl :test #+sbcl 'octets= #-sbcl :test #-sbcl 'equalp
                    :size size
                    #+sbcl :synchronized #+sbcl synchronized))
+
+;;;; String sanitizing (Core util/strencodings.cpp SanitizeString)
+;;;
+;;; Bytes that arrived from a peer become a log line, an RPC field or a file
+;;; name; Core filters them to a fixed safe set at the boundary rather than
+;;; escaping them at every use. LogEscapeMessage (our %LOG-ESCAPE-MESSAGE)
+;;; deliberately lets a newline through, so this filter is what stops a peer
+;;; from writing extra debug.log lines of its own.
+
+(defun %safe-chars-for (rule)
+  "The non-alphanumeric characters RULE admits (Core's SAFE_CHARS table,
+strencodings.cpp:22-27)."
+  (ecase rule
+    (:default " .,;-_/:?@()")
+    (:ua-comment " .,;-_?@")
+    (:filename ".-_")
+    (:uri "!*'();:@&=+$,/?#[]-_.~%")))
+
+(defun sanitize-string (string &optional (rule :default))
+  "STRING with every character outside RULE's safe set REMOVED -- Core
+SanitizeString(str, rule), which drops rather than escapes or replaces.
+
+RULE is :DEFAULT (Core SAFE_CHARS_DEFAULT, the peer subversion and every log
+line that prints a peer-supplied message type), :UA-COMMENT (-uacomment),
+:FILENAME or :URI.
+
+\"Alphanumeric\" is Core's CHARS_ALPHA_NUM, i.e. ASCII a-z A-Z 0-9 and nothing
+else. CL:ALPHANUMERICP is not that test -- it is true of every Unicode letter,
+so using it would admit characters Core drops."
+  (let ((extra (%safe-chars-for rule)))
+    (remove-if-not
+     (lambda (c)
+       (let ((code (char-code c)))
+         (or (<= 48 code 57)            ; 0-9
+             (<= 65 code 90)            ; A-Z
+             (<= 97 code 122)           ; a-z
+             (and (find c extra) t))))
+     string)))
