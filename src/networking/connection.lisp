@@ -48,6 +48,11 @@ peer from two directions.")
   (host "" :type string)
   (port 0 :type (unsigned-byte 16))
   (connected nil :type boolean)
+  ;; Why CONNECTED was cleared, as a keyword, or NIL while the connection is
+  ;; alive (and after a deliberate local close, which is not a failure).
+  ;; %CONNECTION-FAILED sets it; the pump's reap reports it, and for five of
+  ;; the seven failure paths that is the only record left of what happened.
+  (disconnect-reason nil :type symbol)
   (last-activity 0 :type integer)
   (bytes-sent 0 :type integer)
   (bytes-received 0 :type integer)
@@ -411,6 +416,37 @@ error. The timeout lets the accept loop poll a shutdown flag between waits."
         (connection-recv-filled conn) 0
         (connection-recv-framing conn) nil))
 
+(defun %connection-failed (conn reason)
+  "Declare CONN dead because of REASON, one of the keywords
+CONNECTION-DISCONNECT-REASON-TEXT knows. Every path that clears CONNECTED
+because something FAILED comes through here, so the pump's reap can say why:
+five of those paths log nothing of their own, and the reap line was the only
+record. Core carries the same information on its own reap lines, through
+CNode::DisconnectMsg (net.cpp:709-713, 2196-2215). CLOSE-CONNECTION is
+deliberately not one of them -- a local close is not a failure and leaves no
+peer behind to report on. Returns NIL, which is what every caller returns."
+  (setf (connection-disconnect-reason conn) reason
+        (connection-connected conn) nil)
+  nil)
+
+(defun connection-disconnect-reason-text (conn)
+  "Core's wording for why CONN died, for the reap line. The first three are
+Core's own strings for the same events (net.cpp:2185, 2200, 2211); the BIP324
+ones have no Core counterpart because Core's V2Transport reports its failures
+to the socket handler rather than logging them itself. NIL -- a connection
+cleared by something that did not come through %CONNECTION-FAILED -- keeps the
+old unspecific wording rather than claiming a cause."
+  (case (connection-disconnect-reason conn)
+    (:peer-closed "socket closed")
+    (:recv-error "socket recv error")
+    (:recv-incomplete "receiving message bytes failed")
+    (:send-error "socket send error")
+    (:framing-error "receive state mismatch")
+    (:v2-oversize-packet "V2 packet over the contents limit")
+    (:v2-body-read-failed "V2 packet body incomplete, cipher desynchronized")
+    (:v2-auth-failure "V2 packet authentication failure")
+    (t "connection dead")))
+
 (defun connection-stream (conn)
   "Get the stream for a connection."
   (when (connection-socket conn)
@@ -496,7 +532,7 @@ after a hard send failure (connection marked dead). Caller holds SEND-LOCK."
       (let ((n (%try-send-now conn chunk)))
         (cond
           ((eq n :error)
-           (setf (connection-connected conn) nil)
+           (%connection-failed conn :send-error)
            (return nil))
           ((zerop n) (return t))               ; would-block: retry later
           (t
@@ -577,16 +613,14 @@ the peer instead, which stops us reading its input."
            (let ((n (%try-send-now conn bytes)))
              (cond
                ((eq n :error)
-                (setf (connection-connected conn) nil)
-                nil)
+                (%connection-failed conn :send-error))
                (t
                 (when (plusp n) (%record-send-progress conn n))
                 (when (< n (length bytes))
                   (%enqueue-send-bytes conn (if (zerop n) bytes (subseq bytes n))))
                 (length bytes)))))))
     (error ()
-      (setf (connection-connected conn) nil)
-      nil)))
+      (%connection-failed conn :send-error))))
 
 (defun drain-available-bytes (stream buffer start end)
   "Copy every byte STREAM can supply right now into BUFFER[START..END), without
@@ -697,8 +731,8 @@ whether it survives (see %ABANDON-RECEIVE)."
         (connection-recv-framing conn) nil)
   nil)
 
-(defun %abandon-receive (conn)
-  "Drop the read in progress and the connection with it.
+(defun %abandon-receive (conn reason)
+  "Drop the read in progress and the connection with it, recording REASON.
 
 THE framing rule, stated once here: bytes already consumed are gone, so the
 stream can never be resynchronised — a later read would parse payload bytes as
@@ -706,8 +740,7 @@ a header, and every pass after that would eat 24 more bytes of garbage,
 forever. Any failure that has eaten part of a message, plus every EOF and I/O
 error (where the peer is gone anyway), must come here."
   (%end-receive conn)
-  (setf (connection-connected conn) nil)
-  nil)
+  (%connection-failed conn reason))
 
 (defun connection-receive-in-progress-p (conn)
   "T once part of a message has been CONSUMED and the rest has not arrived.
@@ -726,7 +759,7 @@ of the message was consumed (see %ABANDON-RECEIVE), otherwise just clear the
 state — timing out having taken NOTHING is the ordinary idle poll, and getting
 that backwards would disconnect every quiet peer."
   (if (connection-receive-in-progress-p conn)
-      (%abandon-receive conn)
+      (%abandon-receive conn :recv-incomplete)
       (%end-receive conn)))
 
 (defun connection-receive-expired-p (conn)
@@ -832,7 +865,8 @@ healthy peers whenever a pump cycle ran long."
             (bl.log:log-error
              "Receive state mismatch: ~D bytes in progress, asked for ~D — dropping connection"
              filled count)
-            (return-from receive-bytes-resumable (%abandon-receive conn)))
+            (return-from receive-bytes-resumable
+              (%abandon-receive conn :framing-error)))
           ;; Grow toward COUNT as the peer earns it.
           (when (and (= filled (length buffer)) (< filled count))
             (let ((bigger (make-array (min count
@@ -866,7 +900,8 @@ healthy peers whenever a pump cycle ran long."
                            (= (drain-available-bytes stream buffer filled
                                                      (length buffer))
                               filled))
-                  (return-from receive-bytes-resumable (%abandon-receive conn))))
+                  (return-from receive-bytes-resumable
+                    (%abandon-receive conn :peer-closed))))
               (when (> n filled)
                 (setf (connection-recv-last-progress conn) now))
               (setf filled n)))
@@ -893,7 +928,7 @@ healthy peers whenever a pump cycle ran long."
         (bl.log:log-warn
          "Receive failed on ~A:~D with a non-I/O error: ~A~@[~%Backtrace:~%~A~]"
          (connection-host conn) (connection-port conn) c backtrace))
-      (%abandon-receive conn)))))
+      (%abandon-receive conn :recv-error)))))
 
 (defun receive-bytes (conn count &key (timeout 30))
   "Receive exactly COUNT bytes, WAITING for them. Returns a byte vector, or NIL

@@ -214,7 +214,10 @@ oversize length descriptor."
             (%v2t-drain client)
             (bl.net::v2-receive-message-blocking server server-transport
                                                          :timeout 2)
-            (is-false (bl.net:connection-connected server)))))))
+            (is-false (bl.net:connection-connected server))
+            ;; And the death carries a reason, so the pump's reap can name it
+            ;; instead of logging an unspecific "connection dead" (GA11 4db38801).
+            (is-true (bl.net::connection-disconnect-reason server)))))))
 
 (test v2-transport-inbound-v1-detection
   "A v1 client's first 16 bytes (magic + padded \"version\") are recognized
