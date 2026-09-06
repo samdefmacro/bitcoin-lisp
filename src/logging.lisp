@@ -22,6 +22,8 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
    #:*log-stream*
    #:*log-suppressions-active*
    #:*log-thread-names*
+   #:*alert-notify-command*
+   #:*client-version-is-release*
    #:*log-time-micros*
    #:+log-buffer-size+
    #:+log-categories+
@@ -42,7 +44,12 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
    #:log-level-value
    #:log-warn
    #:node-log
+   #:reset-warnings
    #:run-notify-command
+   #:set-kernel-warning
+   #:set-warning
+   #:unset-warning
+   #:warnings-for-rpc
    #:set-category-log-level))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -526,15 +533,21 @@ rest raw; refusing outright is the same guarantee without the escaping."
                 (or (alphanumericp ch) (member ch '(#\. #\_ #\-))))
               value)))
 
-(defun %notify-substitute (command substitutions)
+(defun %notify-substitute (command substitutions &key (check t))
   "COMMAND with each (CHAR . VALUE) of SUBSTITUTIONS replacing %CHAR (Core
-ReplaceAll). Signals if any VALUE is not shell-safe.
+ReplaceAll). With CHECK (the default), signals if any VALUE is not shell-safe.
+
+CHECK NIL is for the ONE substitution whose value cannot be held to that set --
+Core's AlertNotify, which sanitizes a warning message and wraps it in single
+quotes instead (kernel_notifications.cpp:36-42). ALERT-NOTIFY is its only user
+and does exactly that; nothing else may pass NIL.
 
 Single pass, so a substituted value can never itself be rescanned for a
 placeholder: a block hash cannot smuggle in a %w."
-  (loop for (nil . value) in substitutions
-        unless (%notify-safe-value-p value)
-          do (internal-error "Refusing to substitute ~S into a notify command" value))
+  (when check
+    (loop for (nil . value) in substitutions
+          unless (%notify-safe-value-p value)
+            do (internal-error "Refusing to substitute ~S into a notify command" value)))
   (let ((out (make-string-output-stream))
         (i 0)
         (n (length command)))
@@ -583,19 +596,21 @@ many times we looked at it."
         (:info (log-info "~A" (second line)))
         (:warn (log-warn "~A" (second line)))))))
 
-(defun run-notify-command (command &key value substitutions (wait nil))
+(defun run-notify-command (command &key value substitutions (wait nil) (check t))
   "Run COMMAND through the shell. VALUE is shorthand for a single %s
 substitution; SUBSTITUTIONS is the general (CHAR . VALUE) form.
 
 WAIT NIL detaches, as Core does for -blocknotify and -walletnotify (\"thread
 runs free\", init.cpp:2017, wallet.cpp:1149) — a hook must never be able to
 stall block connection. WAIT T is for -shutdownnotify, which Core joins.
+CHECK NIL waives the shell-safe check on the substituted values; see
+%NOTIFY-SUBSTITUTE, and only ALERT-NOTIFY may use it.
 
 Never signals: a failing hook is the operator's problem to see in the log, not
 a reason to fail whatever triggered it."
   (handler-case
       (let* ((subs (append (when value (list (cons #\s value))) substitutions))
-             (full (if subs (%notify-substitute command subs) command)))
+             (full (if subs (%notify-substitute command subs :check check) command)))
         (if wait
             (uiop:run-program (list "/bin/sh" "-c" full)
                               :ignore-error-status t
@@ -606,3 +621,116 @@ a reason to fail whatever triggered it."
     (error (e)
       (log-warn "notify command failed: ~A" e)
       nil)))
+
+;;; --- The node's warnings, and -alertnotify (Core node/warnings.cpp) ---------
+;;;
+;;; Core keeps ONE map of active warnings and answers two channels from it: the
+;;; `warnings' array of getblockchaininfo / getnetworkinfo / getmininginfo
+;;; (GetWarningsForRpc, warnings.cpp:71-83), and the -alertnotify command, fired
+;;; from KernelNotifications::warningSet for the KERNEL warnings only
+;;; (kernel_notifications.cpp:79-85). Here rather than in src/node/ because the
+;;; other operator hooks are here and everything above this layer can reach it;
+;;; validation is one of the producers and knows nothing about the node.
+
+(defvar *client-version-is-release* t
+  "Core CLIENT_VERSION_IS_RELEASE (clientversion.cpp:42). When NIL the warnings
+map starts with Core's pre-release entry (warnings.cpp:20-27).
+
+Left T here on purpose: the `warnings' array is a monitoring channel, and a
+message that is present on every node at every moment is the one thing that
+teaches an operator to stop reading it -- which is the failure this whole
+registry exists to fix. A packager who ships a test build flips it.")
+
+(defparameter +warning-ids+
+  '(:unknown-new-rules-activated :large-work-invalid-chain
+    :clock-out-of-sync :pre-release-test-build :fatal-internal-error)
+  "Every warning id, in the order Core's std::map<warning_type, ...> yields
+them: the kernel::Warning variants first (kernel/warning.h:9-12), then the
+node::Warning ones (node/warnings.h:23-27). GetMessages is documented as
+`sorted by the warning_type id', so the RPC array's order is this list's.")
+
+(defvar *warnings* '()
+  "The active warnings as an alist (id . message) -- Core node::Warnings'
+m_warnings. Read through WARNING-MESSAGES, which imposes +WARNING-IDS+'s order.")
+
+(defvar *warnings-lock* (bt:make-lock "warnings")
+  "Core Warnings::m_mutex: the producers are validation threads and the readers
+are RPC threads.")
+
+(defun set-warning (id message)
+  "Record the warning ID with MESSAGE. Returns T only when the state CHANGED,
+i.e. when no warning with this id was already active -- Core Warnings::Set
+returns `inserted' and ignores the new message otherwise (warnings.cpp:28-33).
+
+That return value is what makes -alertnotify fire once per transition instead
+of once per block, so a caller that ignores it has broken the option."
+  (bt:with-lock-held (*warnings-lock*)
+    (unless (assoc id *warnings*)
+      (push (cons id message) *warnings*)
+      t)))
+
+(defun unset-warning (id)
+  "Clear the warning ID. Returns T only when one was active (Core
+Warnings::Unset, warnings.cpp:35-40)."
+  (bt:with-lock-held (*warnings-lock*)
+    (when (assoc id *warnings*)
+      (setf *warnings* (remove id *warnings* :key #'car))
+      t)))
+
+(defun warning-messages ()
+  "Every active warning's message, in Core's map order (Core
+Warnings::GetMessages, warnings.cpp:42-51)."
+  (let ((active (bt:with-lock-held (*warnings-lock*) (copy-alist *warnings*))))
+    (loop for id in +warning-ids+
+          for cell = (assoc id active)
+          when cell collect (cdr cell))))
+
+(defun warnings-for-rpc ()
+  "The `warnings' field of getblockchaininfo / getnetworkinfo / getmininginfo
+(Core GetWarningsForRpc, warnings.cpp:71-83) -- an ARRAY of messages, empty
+when the node has nothing to report."
+  (or (warning-messages) #()))
+
+(defun reset-warnings ()
+  "Start this run's warnings map -- Core's Warnings CONSTRUCTOR
+(warnings.cpp:20-27), which is empty but for the pre-release build entry.
+
+Called once per run so an in-image restart does not inherit the previous node's
+warnings; the whole point of the map is that a warning describes the node that
+is running now."
+  (bt:with-lock-held (*warnings-lock*) (setf *warnings* '()))
+  (unless *client-version-is-release*
+    (set-warning :pre-release-test-build
+                 "This is a pre-release test build - use at your own risk - do not use for mining or merchant applications"))
+  t)
+
+(defvar *alert-notify-command* nil
+  "Core -alertnotify: a shell command run when a KERNEL warning appears, with
+%s replaced by the message. NIL (Core's empty default) means no command.")
+
+(defun alert-notify (message)
+  "Core AlertNotify (node/kernel_notifications.cpp:30-47): run
+-alertnotify with %s replaced by MESSAGE, detached.
+
+MESSAGE is sanitized to Core's SAFE_CHARS_DEFAULT and then wrapped in single
+quotes, exactly as Core does -- and that order is what makes the quoting safe,
+since the safe set contains no quote of its own."
+  (let ((command *alert-notify-command*))
+    (when (and (stringp command) (plusp (length command)))
+      (run-notify-command command
+                          :value (format nil "'~A'"
+                                         (bl.bytes:sanitize-string message))
+                          :check nil))))
+
+(defun set-kernel-warning (id message)
+  "Core KernelNotifications::warningSet (kernel_notifications.cpp:79-85): record
+the warning and, ONLY when the state changed, fire -alertnotify. Returns what
+SET-WARNING returned.
+
+Kernel warnings are the two an operator is paged about --
+:LARGE-WORK-INVALID-CHAIN and :UNKNOWN-NEW-RULES-ACTIVATED (kernel/warning.h).
+The node:: ones reach the RPC array through SET-WARNING and never the pager, as
+in Core."
+  (when (set-warning id message)
+    (alert-notify message)
+    t))

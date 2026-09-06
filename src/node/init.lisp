@@ -531,6 +531,12 @@ broadcaster -- so an in-image restart never inherits a previous node's state."
   (setf *persist-mempool* (and persist-mempool t)
         bl.mp:*persist-mempool-v1* (and persist-mempool-v1 t)
         *mempool-load-tried* nil)
+  ;; The node's warnings map and the fork-warning state it is fed from (Core
+  ;; node::Warnings' constructor, warnings.cpp:20-27, and
+  ;; ChainstateManager::m_best_invalid): a warning describes the node that is
+  ;; running now, so neither may survive into the next run in this image.
+  (bl.log:reset-warnings)
+  (bl.val:reset-fork-warning-state)
   ;; -walletbroadcast (Core SetBroadcastTransactions, wallet.cpp:3068).
   (setf *wallet-broadcast* (and wallet-broadcast t))
   (unless *wallet-broadcast*
@@ -1587,25 +1593,11 @@ Returns the node instance."
     (log-warn "Node already running, stopping first")
     (stop-node))
 
-  ;; A NEW datadir gets a wallets/ subdirectory, whether or not the wallet is
-  ;; enabled (Core common/init.cpp:45-63, base path and network path both). Core
-  ;; makes it only at creation time, so an existing datadir's layout is never
-  ;; changed underneath its owner, and wallet code then USES the subdirectory
-  ;; only if it is already there.
-  ;;
-  ;; FIRST, before anything else in this function: the very next thing that
-  ;; happens is the log file being opened, and ENSURE-DIRECTORIES-EXIST on
-  ;; <datadir>/<network>/debug.log CREATES the network directory. Run after
-  ;; that, the "did this exist?" test is answered by our own side effect and is
-  ;; always false.
-  ;;
-  ;; Small, and it was blocking the whole functional-test corpus: the framework
-  ;; builds a shared 199-block cache datadir once and copies it per test, and
-  ;; its cleanup does `os.rmdir(cache/regtest/wallets)`. With no such directory
-  ;; that raises, the cache build FAILS, and every run then falls back on
-  ;; whatever cache was last built successfully — which here was one written in
-  ;; the pre-Core per-block format, months old. Every non-clean-chain test in
-  ;; the suite was running against it.
+  ;; A NEW datadir gets a wallets/ subdirectory (Core common/init.cpp:45-63).
+  ;; FIRST, before anything else here: %INIT-LOGGING creates the network
+  ;; directory on its way to opening debug.log, and after that this function's
+  ;; "did this path exist?" test answers its own side effect. Its docstring has
+  ;; the rest.
   (%ensure-wallets-subdirectory data-directory network)
 
   (%init-logging data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-level-specs shrink-debug-file)

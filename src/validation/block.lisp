@@ -2833,6 +2833,10 @@ Handles chain reorganizations when a competing chain has more work."
            ;; them, as Core's do by ChainstateRole.
            (bl.vi:notify-block-connected chain-state block hash new-height spent-utxos)
            (bl.vi:notify-updated-block-tip chain-state hash new-height)
+           ;; Core CheckForkWarningConditions after every activation step
+           ;; (validation.cpp:3302): the warning must CLEAR once our own chain
+           ;; has outgrown the invalid one again, not only be raised.
+           (%check-fork-warning-conditions chain-state)
            ;; Core resets the recent-rejects filter on EVERY active tip change,
            ;; not just reorgs: cached failures (non-final, too-low-fee, missing
            ;; inputs) can become valid at the next block (ActiveTipChange,
@@ -3164,15 +3168,73 @@ to the SAFE non-poisoning (recoverable) behavior."
        (member error *deterministic-invalid-block-errors*)
        t))
 
+(defvar *best-invalid-entry* nil
+  "The most-work block-index entry known to be INVALID — Core
+ChainstateManager::m_best_invalid (validation.cpp:1961-1968). A process global
+rather than a chain-state slot, like Core's, which lives on the chainstate
+MANAGER and not on either chainstate; RESET-FORK-WARNING-STATE clears it for
+each run.")
+
+(defun reset-fork-warning-state ()
+  "Forget the previous run's most-work invalid chain and its warning. Called
+once per run: the map describes the node that is running now."
+  (setf *best-invalid-entry* nil)
+  (bl.log:unset-warning :large-work-invalid-chain))
+
+(defun %check-fork-warning-conditions (chain-state)
+  "Core Chainstate::CheckForkWarningConditions (validation.cpp:1942-1958): raise
+LARGE_WORK_INVALID_CHAIN while a chain known to be invalid carries more than six
+blocks' worth of work beyond our tip, and clear it once that stops being true.
+
+Six blocks' worth is Core's `tip work + GetBlockProof(tip) * 6', measured with
+the TIP's difficulty, so the threshold follows the chain rather than a constant.
+The historical (assumeutxo background) chainstate is skipped, as Core skips it:
+it is re-deriving settled history and its tip means nothing to an operator."
+  (unless (historical-chainstate-p chain-state)
+    (let ((tip (bl.store:get-block-index-entry
+                chain-state (bl.store:best-block-hash chain-state))))
+      (if (and *best-invalid-entry* tip
+               (> (bl.store:block-index-entry-chain-work *best-invalid-entry*)
+                  (+ (bl.store:block-index-entry-chain-work tip)
+                     (* 6 (bl.store:calculate-chain-work
+                           (bl.ser:block-header-bits
+                            (bl.store:block-index-entry-header tip))
+                           0)))))
+          (let ((message "Warning: Found invalid chain more than 6 blocks longer than our best chain. This could be due to database corruption or consensus incompatibility with peers."))
+            (bl.log:log-warn "~A" message)
+            ;; A KERNEL warning, so -alertnotify fires -- once, on the
+            ;; transition (Core kernel_notifications.cpp:79-85).
+            (bl.log:set-kernel-warning :large-work-invalid-chain message))
+          (bl.log:unset-warning :large-work-invalid-chain)))))
+
 (defun %mark-block-subtree-invalid (chain-state entry)
   "Mark ENTRY and every block-index entry descending from it :invalid — Core
 BLOCK_FAILED_VALID on ENTRY plus BLOCK_FAILED_CHILD on the doomed subtree — so
 the per-peer download walk aborts above it (ibd find-blocks-to-download-for-peer),
 the deep-reorg candidate scan prunes it (%best-completable-reorg-target), and the
 best-header / best-valid-tip scans skip it. Idempotent. block-index-descendants
-includes ENTRY itself."
-  (dolist (e (block-index-descendants chain-state entry))
-    (setf (bl.store:block-index-entry-status e) :invalid)))
+includes ENTRY itself.
+
+Also Core's InvalidChainFound (validation.cpp:1961-1981), which is called from
+exactly the two places this is: a block found invalid during validation and the
+invalidateblock RPC. It remembers the most-work invalid entry and re-evaluates
+the fork warning, which is how an operator learns that a chain with more work
+than theirs was rejected -- a probable consensus split."
+  (let ((most-work entry))
+    (dolist (e (block-index-descendants chain-state entry))
+      (setf (bl.store:block-index-entry-status e) :invalid)
+      (when (> (bl.store:block-index-entry-chain-work e)
+               (bl.store:block-index-entry-chain-work most-work))
+        (setf most-work e)))
+    ;; Core passes InvalidChainFound the HIGHEST block it marked failed -- one
+    ;; block from InvalidBlockFound, `to_mark_failed' (the invalidated branch's
+    ;; tip) from InvalidateBlock (validation.cpp:3672, 3705) -- so the work the
+    ;; warning compares is the whole rejected branch's, not the fork point's.
+    (when (or (null *best-invalid-entry*)
+              (> (bl.store:block-index-entry-chain-work most-work)
+                 (bl.store:block-index-entry-chain-work *best-invalid-entry*)))
+      (setf *best-invalid-entry* most-work)))
+  (%check-fork-warning-conditions chain-state))
 
 ;;;; ---------------------------------------------------------------------------
 ;;;; ACCEPT-BLOCK-BODY: the gate every block-body write runs first
@@ -3656,6 +3718,13 @@ relay filters."
      mempool (loop for entry in (reorg-disconnected-block-txs r) append (car entry))
      utxo-set reached chain-state))
 
+  ;; Core CheckForkWarningConditions after every activation step
+  ;; (validation.cpp:3302). A reorg is the step that most often clears the
+  ;; warning -- our chain has just outgrown the invalid one -- and %REORG-CONNECT
+  ;; applies its blocks itself rather than through CONNECT-BLOCK, so without
+  ;; this the fork warning would be raised and never lowered.
+  (%check-fork-warning-conditions chain-state)
+
   (cond
     ((reorg-interrupted r)
      ;; Not a failure: the blocks that moved are committed above, the
@@ -4022,7 +4091,8 @@ backstop against a candidate that reorgs away and reappears."
                  (bl.vi:notify-updated-block-tip
                   chain-state
                   (bl.store:block-index-entry-hash new-tip)
-                  (bl.store:block-index-entry-height new-tip)))))
+                  (bl.store:block-index-entry-height new-tip))
+                 (%check-fork-warning-conditions chain-state))))
             (t
              ;; :interrupted means the node is stopping — not a refusal to
              ;; re-queue against.
@@ -4062,8 +4132,12 @@ chain back to BLOCK-HASH's parent if the active chain contained it. Returns
              (unless ok
                (return-from invalidate-block
                  (values nil (if (eq detail :interrupted) :interrupted :reorg-failed))))))
-         (dolist (e (block-index-descendants chain-state entry))
-           (setf (bl.store:block-index-entry-status e) :invalid))
+         ;; The same marking as everywhere else, and Core's order: the branch
+         ;; is marked failed AFTER the reorg away from it, and InvalidChainFound
+         ;; then runs against the rewound tip (validation.cpp:3690-3705). This
+         ;; was a second copy of the marking loop, which is how the fork warning
+         ;; would have been left out of the RPC path.
+         (%mark-block-subtree-invalid chain-state entry)
          (values t nil))))))
 
 (defun reconsider-block (chain-state block-store utxo-set block-hash

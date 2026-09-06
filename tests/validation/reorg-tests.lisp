@@ -3292,3 +3292,60 @@ it."
          (bl.store:close-tx-index txindex)
          (uiop:delete-directory-tree txdir :validate t :if-does-not-exist :ignore)))
      (clear-undo-cache))))
+
+;;;; The fork warning a rejected heavier chain raises (finding c053f780)
+
+(test large-work-invalid-chain-warning-reaches-the-rpc-array
+  "Core's CheckForkWarningConditions (validation.cpp:1942-1958) raises
+LARGE_WORK_INVALID_CHAIN while a chain known to be invalid carries more than six
+blocks' worth of work beyond our tip, and InvalidChainFound is what feeds it
+(:1961-1981). Neither existed here: the `warnings' array of getblockchaininfo /
+getnetworkinfo / getmininginfo was the constant #(), so a monitoring pipeline
+polling it read `this node reports no problems' while a probable consensus split
+was in progress, and there was nothing for -alertnotify to fire on either.
+
+The clean-chain read is the positive control: it must stay EMPTY, so an
+assertion that the array is non-empty cannot pass by the field being broken."
+  (with-network (:regtest)
+    (let* ((node (regtest-node-fixture
+                  (format nil "forkwarn~D" (get-internal-real-time))))
+           (bl:*node* node)
+           ;; Mining flips this process-wide one-way latch; bind it so the
+           ;; suites after this one see what they saw before it.
+           (bl.net:*cached-is-ibd* bl.net:*cached-is-ibd*))
+      (unwind-protect
+           (progn
+             (bl.log:reset-warnings)
+             (bl.val:reset-fork-warning-state)
+             (generate-regtest-blocks node 10)
+             (is (equalp #() (bl.log:warnings-for-rpc))
+                 "a healthy chain must report nothing")
+             (let* ((cs (bl:node-chain-state node))
+                    (height-1 (bl.store:block-index-entry-hash
+                               (bl.store:get-block-at-height cs 1))))
+               ;; Invalidating the block at height 1 rewinds the tip to genesis
+               ;; and leaves a ten-block branch marked invalid: nine more blocks
+               ;; of work than the six Core's threshold allows.
+               (bl.val:invalidate-block cs (bl:node-block-store node)
+                                        (bl:node-utxo-set node) height-1)
+               (is (= 0 (bl.store:current-height cs)))
+               (let ((warnings (bl.log:warnings-for-rpc)))
+                 (is (= 1 (length warnings)))
+                 (is-true (search "more than 6 blocks longer"
+                                  (first warnings))))
+               ;; And it is the field an operator actually polls.
+               (let ((reported (cdr (assoc "warnings"
+                                           (bl.rpc:dispatch-rpc-method
+                                            node "getblockchaininfo" '())
+                                           :test #'string=))))
+                 (is (= 1 (length reported))))
+               ;; Core clears it again once our own chain outgrows the invalid
+               ;; one (the `else' arm of CheckForkWarningConditions, re-run
+               ;; after every connected block).
+               (bl.val:reconsider-block cs (bl:node-block-store node)
+                                        (bl:node-utxo-set node) height-1)
+               (is (= 10 (bl.store:current-height cs)))
+               (is (equalp #() (bl.log:warnings-for-rpc))
+                   "the warning must clear when the chain catches up")))
+        (progn (bl.log:reset-warnings)
+               (bl.val:reset-fork-warning-state))))))

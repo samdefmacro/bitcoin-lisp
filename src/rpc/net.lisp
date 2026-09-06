@@ -356,7 +356,7 @@ whatever the cadence is."
       ;; We record no local addresses, so this is Core's empty VARR — [], not
       ;; null (a bare NIL encodes as null).
       ("localaddresses" . #())
-      ("warnings" . #()))))
+      ("warnings" . ,(bl.log:warnings-for-rpc)))))
 
 (define-rpc "getconnectioncount" (node params)
   "Return the number of connected peers."

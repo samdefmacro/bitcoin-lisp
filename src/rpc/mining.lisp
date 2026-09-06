@@ -545,7 +545,7 @@ cache above wraps exactly the expensive part and nothing else."
                    ("target" . ,(%bits-to-target-hex next-bits))))
         ,@(when challenge
             `(("signet_challenge" . ,(bl.crypto:bytes-to-hex challenge))))
-        ("warnings" . #())))))
+        ("warnings" . ,(bl.log:warnings-for-rpc))))))
 
 (defun activate-submitted-block (node block)
   "Validate+activate BLOCK through the consensus path, then ANNOUNCE it if it
