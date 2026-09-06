@@ -3311,9 +3311,26 @@ Core OUTBOUND_INVENTORY_BROADCAST_INTERVAL (net_processing.cpp:169).")
 the inbound interval (5s) — net_processing.cpp:172-174. Remainder stays
 queued for the next flush.")
 
-(defconstant +max-tx-inv-queue+ 5000
-  "Per-peer pending-announcement bound (Core MAX_PEER_TX_ANNOUNCEMENTS);
-oldest entries are dropped beyond it.")
+(defconstant +inv-broadcast-max+ 1000
+  "Ceiling on one flush's announcements however deep the backlog is —
+Core INVENTORY_BROADCAST_MAX (net_processing.cpp:177), whose static_assert
+ties it to MAX_PEER_TX_ANNOUNCEMENTS above and to
++inv-broadcast-target+ below.
+
+There is deliberately no bound on the QUEUE. Core does not truncate
+m_tx_inventory_to_send at all; the accelerating drain below is the whole
+pressure valve, so a backlog is worked off rather than silently discarded.")
+
+(defun %tx-inv-broadcast-max (queue-length)
+  "How many announcements one flush to a peer may send at this backlog:
+Core's broadcast_max = INVENTORY_BROADCAST_TARGET + (size/1000)*5, clamped to
+INVENTORY_BROADCAST_MAX (net_processing.cpp:6046-6047) — 70 at rest, 95 at a
+5,000-entry backlog, 1,000 at the ceiling. \"No reason to drain out at many
+times the network's capacity\" is Core's comment for the base rate; the growth
+term is what lets a peer that fell behind catch up instead of accumulating
+forever."
+  (min +inv-broadcast-max+
+       (+ +inv-broadcast-target+ (* 5 (floor queue-length 1000)))))
 
 (defvar *next-inbound-inv-flush* 0
   "internal-real-time deadline of the shared inbound inv rotation
@@ -3366,15 +3383,18 @@ reach here anyway — their senders are disconnected)."
             (recon-set-add (%peer-recon-set peer)
                            (peer-recon-k0 peer) (peer-recon-k1 peer)
                            (or wtxid txid))
-            (progn
-              (setf (peer-tx-inv-queue peer)
-                    (nconc (peer-tx-inv-queue peer)
-                           (list (list txid wtxid fee-rate-per-kb))))
-              ;; Bound the queue: drop oldest beyond the cap.
-              (let ((excess (- (length (peer-tx-inv-queue peer)) +max-tx-inv-queue+)))
-                (when (plusp excess)
-                  (setf (peer-tx-inv-queue peer)
-                        (nthcdr excess (peer-tx-inv-queue peer)))))))))))
+            ;; Core PushTxInventory is one insert into m_tx_inventory_to_send
+            ;; and nothing else (net_processing.cpp:2261-2263). Two things
+            ;; used to happen here that Core does not do: the entry was NCONCd
+            ;; onto the tail, walking the whole queue, and then a LENGTH walked
+            ;; it again to NTHCDR the excess past 5,000 off the FRONT --
+            ;; silently discarding the OLDEST announcements, which nothing
+            ;; ever re-queues, so those transactions were never announced to
+            ;; this peer at all. A PUSH is Core's O(1) insert; the flush
+            ;; restores announcement order and drains faster as the queue
+            ;; grows (%TX-INV-BROADCAST-MAX).
+            (push (list txid wtxid fee-rate-per-kb)
+                  (peer-tx-inv-queue peer)))))))
 
 (defun %handle-reqrecon (peer payload)
   "The peer wants to reconcile: size a sketch against what it says it holds and
@@ -3461,8 +3481,7 @@ in the set for the life of the connection."
   "Queue WTXIDS for ordinary announcement to PEER. Reconciliation decides WHAT
 to announce; the announcement itself is the same inv path everything else uses."
   (dolist (wtxid wtxids)
-    (setf (peer-tx-inv-queue peer)
-          (nconc (peer-tx-inv-queue peer) (list (list wtxid wtxid 0))))))
+    (push (list wtxid wtxid 0) (peer-tx-inv-queue peer))))
 
 (defun %peer-recon-set (peer)
   (or (peer-recon-set peer)
@@ -3487,19 +3506,92 @@ this peer."
              (count-if #'peer-recon-registered peers)
              (not (peer-inbound peer))))))
 
+;;; The two std:: heap operations Core's inventory drain is written in
+;;; (make_heap + pop_heap over a vector of candidates). They live here rather
+;;; than in a utility layer because the flush below is their only caller, and
+;;; the reason it wants a heap rather than a sort is Core's: only as many
+;;; entries as are actually sent need ordering.
+
+(defun %sift-down (vec root end predicate)
+  "Restore the max-heap property at ROOT over VEC[0,END) under PREDICATE
+(libstdc++ __sift_down): swap the root down past the larger of its children
+until neither is larger."
+  (loop for child = (+ (* 2 root) 1)
+        while (< child end)
+        do (when (and (< (1+ child) end)
+                      (funcall predicate (aref vec child) (aref vec (1+ child))))
+             (incf child))
+           (when (not (funcall predicate (aref vec root) (aref vec child)))
+             (return))
+           (rotatef (aref vec root) (aref vec child))
+           (setf root child)))
+
+(defun %make-heap (vec end predicate)
+  "std::make_heap over VEC[0,END) under PREDICATE. Linear in END, and orders
+no more than a heap needs to — which is the point of using one when only the
+first few elements are wanted."
+  (loop for i from (1- (floor end 2)) downto 0
+        do (%sift-down vec i end predicate)))
+
+(defun %pop-heap (vec end predicate)
+  "std::pop_heap: move the maximum of VEC[0,END) to VEC[END-1] and restore the
+heap over the rest. The caller then reads VEC[END-1] and shrinks END."
+  (rotatef (aref vec 0) (aref vec (1- end)))
+  (%sift-down vec 0 (1- end) predicate))
+
+(defun %tx-inv-announced-later-p (mempool a b)
+  "The max-heap predicate over two queued announcements: T when A should be
+announced LATER than B.
+
+Core CompareInvMempoolOrder (net_processing.cpp:5670-5684), reversed for the
+same stated reason — \"as std::make_heap produces a max-heap, we want the
+entries with the higher mining score to sort later\" — so the heap's maximum
+is the announcement Core would send first."
+  (minusp (bl.mp:mempool-compare-mining-order mempool (first b) (first a))))
+
 (defun %flush-peer-tx-invs (peer mempool)
-  "Drain up to +inv-broadcast-target+ queued announcements to PEER as one
-inv message. At flush time each entry is re-checked: still unannounced,
-still in the mempool, and above the peer's BIP133 feefilter (feefiltered
-entries are dropped, not deferred — Core skips them the same way).
-BIP339: wtxidrelay peers get MSG_WTX + wtxid, others MSG_TX + txid
-(net_processing.cpp:6009,6065)."
-  (let ((invs '())
-        (count 0))
-    (loop while (and (peer-tx-inv-queue peer)
-                     (< count +inv-broadcast-target+))
-          do (destructuring-bind (txid wtxid fee-rate-per-kb)
-                 (pop (peer-tx-inv-queue peer))
+  "Drain queued announcements to PEER as one inv message: as many as
+%TX-INV-BROADCAST-MAX allows at the current backlog, in the order the mempool
+would mine them. At flush time each entry is re-checked: still unknown to the
+peer, still in the mempool, and above the peer's BIP133 feefilter (feefiltered
+entries are dropped, not deferred — Core skips them the same way). BIP339:
+wtxidrelay peers get MSG_WTX + wtxid, others MSG_TX + txid
+(net_processing.cpp:6009,6065).
+
+The order is Core's, and Core says why: \"topologically and fee-rate sort the
+inventory we send for privacy and priority reasons\" (:6040-6041). Priority,
+because when the queue is longer than the budget the cut must keep the
+announcements worth the most, not the ones that happened to arrive first.
+Privacy, because arrival order is a signal about this node that mempool order
+is not. A HEAP rather than a sort, again as Core does: only as many entries as
+are actually sent get ordered.
+
+Without a mempool to ask — or with a graph too big to have a main order — the
+queue drains in the order it is stored, which is insertion order. That
+fallback matters: insertion order is topological (a parent is accepted, and so
+relayed, before its child), so it is the one order available here that cannot
+announce a child before its parent. (An ordered flush leaves its unsent
+remainder as a heap, so a node that loses its mempool mid-run keeps that
+guarantee only for what it queues afterwards.)
+
+The queue is held newest-first so an enqueue is O(1); taking from the BACK of
+the candidate vector is therefore oldest-first, and is also where %POP-HEAP
+puts the element it selects. An entry that is skipped (gone from the mempool,
+already known, feefiltered) leaves the queue without spending budget, which is
+Core's `continue` before nRelayedTransactions++."
+  (let* ((candidates (coerce (shiftf (peer-tx-inv-queue peer) '()) 'vector))
+         (end (length candidates))
+         (budget (%tx-inv-broadcast-max end))
+         (later-p (lambda (a b) (%tx-inv-announced-later-p mempool a b)))
+         (orderedp (and mempool
+                        (bl.mp:mempool-mining-order-available-p mempool)))
+         (invs '())
+         (count 0))
+    (when orderedp (%make-heap candidates end later-p))
+    (loop while (and (plusp end) (< count budget))
+          do (when orderedp (%pop-heap candidates end later-p))
+             (destructuring-bind (txid wtxid fee-rate-per-kb)
+                 (aref candidates (decf end))
                ;; Core builds the inv FIRST and uses ITS hash for both the
                ;; filter check and the filter insert (net_processing.cpp:
                ;; 6060-6083): the filter holds whichever id this peer's
@@ -3518,6 +3610,9 @@ BIP339: wtxidrelay peers get MSG_WTX + wtxid, others MSG_TX + txid
                    (bl:add-recent-reject (peer-announced-txs peer) known)
                    (incf count)
                    (push inv invs)))))
+    ;; Whatever the budget did not reach stays queued.
+    (setf (peer-tx-inv-queue peer)
+          (loop for i from 0 below end collect (aref candidates i)))
     (when invs
       ;; A dead socket raises from the write; the drain/health passes own
       ;; disconnecting — just stop announcing to it this round.

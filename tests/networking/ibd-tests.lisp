@@ -2001,6 +2001,71 @@ inv has to suppress a wtxid announcement."
       (is (= 1 (length (bl.net:peer-tx-inv-queue other)))
           "while a peer that said nothing still hears about it"))))
 
+(test the-announcement-queue-is-never-truncated-and-drains-faster-when-deep
+  "Core never truncates m_tx_inventory_to_send; its pressure valve is a drain
+that grows with the backlog -- broadcast_max = INVENTORY_BROADCAST_TARGET +
+(size/1000)*5, capped at INVENTORY_BROADCAST_MAX (net_processing.cpp:6046-
+6047). We used to NTHCDR everything past 5,000 off the FRONT of the queue,
+and nothing re-queues a dropped entry, so those transactions were never
+announced to that peer at all."
+  (let* ((bl:*network* :regtest)
+         (peer (bl.net:make-peer :state :ready))
+         (txids (loop for i from 0 below 5100 collect (%relay-txid i))))
+    (dolist (txid txids)
+      (bl.net:relay-transaction txid nil (list peer) :fee-rate 1))
+    (is (= 5100 (length (bl.net:peer-tx-inv-queue peer)))
+        "nothing may be discarded on the way in")
+    ;; 70 + 5 * floor(5100/1000) = 95, against the flat 70 of a queue at rest.
+    (flush-peer-invs peer)
+    (is (= (- 5100 95) (length (bl.net:peer-tx-inv-queue peer)))
+        "the drain accelerates with the backlog")
+    (loop repeat 200
+          while (bl.net:peer-tx-inv-queue peer)
+          do (flush-peer-invs peer))
+    (is (null (bl.net:peer-tx-inv-queue peer)))
+    (is-true (every (lambda (txid)
+                      (bl:recent-reject-p
+                       (bl.net:peer-announced-txs peer) txid))
+                    txids)
+             "and every queued transaction is eventually announced")))
+
+(test the-flush-announces-in-mempool-order-not-arrival-order
+  "Core heap-orders the pending inventory by mining score with topology and
+sends the top ones -- 'topologically and fee-rate sort the inventory we send
+for privacy and priority reasons' (net_processing.cpp:6040-6041). Draining
+FIFO instead delayed a high-feerate announcement queued behind cheap ones by
+whole flush intervals, exactly during the fee spike where propagation matters
+most, and made our inv order leak the order transactions reached us."
+  (let* ((bl:*network* :regtest)
+         (mempool (bl.mp:make-mempool))
+         (peer (bl.net:make-peer :state :ready))
+         (txs (loop for i from 1 to 75 collect (make-mempool-test-tx :input-id i)))
+         (txids (mapcar #'bl.ser:transaction-hash txs)))
+    ;; Strictly ascending feerate, queued in that same ascending order: a FIFO
+    ;; drain sends the 70 cheapest and defers the five dearest.
+    (loop for tx in txs
+          for i from 1
+          do (%add-tx mempool tx :fee (* 1000 i)))
+    (loop for txid in txids
+          for i from 1
+          do (bl.net:relay-transaction txid nil (list peer) :fee-rate i))
+    (is (= 75 (length (bl.net:peer-tx-inv-queue peer))))
+    (flush-peer-invs peer mempool)
+    (let ((left (mapcar #'first (bl.net:peer-tx-inv-queue peer))))
+      (is (= 5 (length left)) "budget 70 out of 75 queued")
+      (is-true (every (lambda (txid) (find txid left :test #'equalp))
+                      (subseq txids 0 5))
+               "the five deferred are the five CHEAPEST")
+      (is-true (notany (lambda (txid) (find txid left :test #'equalp))
+                       (subseq txids 5))
+               "everything dearer went out in this flush"))
+    (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer)
+                                 (car (last txids)))
+             "the dearest transaction is announced in the first flush")
+    (is-false (bl:recent-reject-p (bl.net:peer-announced-txs peer)
+                                  (first txids))
+              "and the cheapest is not")))
+
 ;;;; Initial broadcast of locally-submitted txs (unbroadcast set)
 
 (test getdata-serving-clears-unbroadcast

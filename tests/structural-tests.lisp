@@ -74,7 +74,6 @@
     "bitcoin-lisp.mempool:orphan-announcers"
     "bitcoin-lisp.mempool:orphan-usage-by-peer"
     "bitcoin-lisp.mempool:topological-subset-p"
-    "bitcoin-lisp.mempool:txgraph-compare-main-order"
     "bitcoin-lisp.mempool:txgraph-get-ancestors-union"
     "bitcoin-lisp.mempool:txgraph-get-descendants-union"
     "bitcoin-lisp.networking:ban-peer"

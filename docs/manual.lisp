@@ -725,6 +725,18 @@
   gate on purpose, so a peer that announced while we were still syncing is
   not told about the transaction afterwards.
 
+  The per-peer announcement queue is never truncated -- a dropped entry is an announcement nothing re-queues,
+  so that peer simply never hears of the transaction -- and the pressure
+  valve instead is a drain that ACCELERATES with the backlog
+  (INVENTORY_BROADCAST_TARGET + size/1000*5, capped at
+  INVENTORY_BROADCAST_MAX). What it drains is the top of a heap ordered by
+  the mempool's mining order with topology, not the front of a queue:
+  \"topologically and fee-rate sort the inventory we send for privacy and
+  priority reasons\", so the per-flush cut keeps the announcements worth the
+  most and the order leaks mempool state rather than arrival order. The
+  topology half is load-bearing -- a plain feerate sort would announce a
+  child before its parent, which insertion order never does.
+
   Erlay's reconciliation sets are the one thing here with no Core to check
   against (Core ships the sendtxrcncl handshake and nothing else; BIP-330 is
   the specification), and their invariant is that a SUCCESSFUL round retires

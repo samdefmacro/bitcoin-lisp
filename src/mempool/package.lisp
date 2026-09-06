@@ -211,6 +211,8 @@ src/mempool/.")
    #:mempool-has
    #:mempool-get
    #:mempool-get-by-wtxid
+   #:mempool-compare-mining-order
+   #:mempool-mining-order-available-p
    #:mempool-spending-tx
    #:mempool-add
    #:accept-validated-tx

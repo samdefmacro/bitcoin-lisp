@@ -151,9 +151,13 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; Pending tx announcements, flushed in batches on a Poisson schedule
   ;; instead of per-tx immediate invs (Core m_tx_inventory_to_send +
   ;; m_next_inv_send_time). Entries are (txid wtxid fee-rate-per-kb),
-  ;; oldest first. Guarded by the node lock: the P2P enqueue paths
-  ;; (handle-tx, orphan cascade) run under with-current-node-lock on the sync
-  ;; thread, the RPC broadcast path (sendrawtransaction/submitpackage)
+  ;; NEWEST FIRST: an enqueue is a PUSH, which is the O(1) insert Core gets
+  ;; from a std::set, and %FLUSH-PEER-TX-INVS restores announcement order
+  ;; when it drains. Nothing truncates it -- Core has no cap on
+  ;; m_tx_inventory_to_send either, and its pressure valve is the drain that
+  ;; accelerates with the backlog. Guarded by the node lock: the P2P enqueue
+  ;; paths (handle-tx, orphan cascade) run under with-current-node-lock on the
+  ;; sync thread, the RPC broadcast path (sendrawtransaction/submitpackage)
   ;; enqueues under the same lock from RPC threads, and the flush
   ;; (flush-tx-announcements) takes it too.
   (tx-inv-queue '() :type list)
