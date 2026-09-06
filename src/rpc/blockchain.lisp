@@ -497,13 +497,7 @@ verbosity-3 prevout object (core_io.cpp:478-488)."
                             ("height" . ,(bl.store:utxo-entry-height prevout))
                             ("value" . ,(/ (bl.store:utxo-entry-value prevout)
                                            100000000.0d0))
-                            ("scriptPubKey"
-                             . ,(let ((addr (and network (script->address spk network))))
-                                  (append
-                                   `(("asm" . ,(bl.val:disassemble-script spk))
-                                     ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                                     ("type" . ,(bl.val:script-type-name spk)))
-                                   (when addr `(("address" . ,addr)))))))))))))
+                            ("scriptPubKey" . ,(script-to-json spk :network network)))))))))
     (when (and witness-stack (plusp (length witness-stack)))
       (setf base (append base
                          `(("txinwitness"
@@ -511,19 +505,12 @@ verbosity-3 prevout object (core_io.cpp:478-488)."
     (append base `(("sequence" . ,(bl.ser:tx-in-sequence input))))))
 
 (defun output-to-json (output index &optional network)
-  "Convert transaction output to JSON, with scriptPubKey type and (when NETWORK
-is supplied and the script is addressable) address."
-  (let* ((spk (bl.ser:tx-out-script-pubkey output))
-         (addr (and network (script->address spk network)))
-         (spk-json `(("asm" . ,(bl.val:disassemble-script spk))
-                     ,@(when network `(("desc" . ,(scriptpubkey-desc spk network))))
-                     ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                     ("type" . ,(bl.val:script-type-name spk)))))
-    (when addr
-      (setf spk-json (append spk-json `(("address" . ,addr)))))
+  "Core TxToUniv's vout entry (core_io.cpp:495-510): value, n and the
+scriptPubKey object SCRIPT-TO-JSON builds."
+  (let ((spk (bl.ser:tx-out-script-pubkey output)))
     `(("value" . ,(/ (bl.ser:tx-out-value output) 100000000.0d0))
       ("n" . ,index)
-      ("scriptPubKey" . ,spk-json))))
+      ("scriptPubKey" . ,(script-to-json spk :network network)))))
 
 (define-rpc "getblockheader" (node (hash-str (verbose :bool-or t)))
   "Return block header data."
@@ -710,8 +697,7 @@ accepted but ignored."
                (height (bl.store:current-height chain-state))
                (utxo-height (bl.store:utxo-entry-height entry))
                (spk (bl.store:utxo-entry-script-pubkey entry))
-               (network (rpc-get-network node))
-               (addr (script->address spk network)))
+               (network (rpc-get-network node)))
           `(("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
             ;; Mempool coins report 0 confirmations (Core: nHeight ==
             ;; MEMPOOL_HEIGHT -> 0).
@@ -719,13 +705,9 @@ accepted but ignored."
                                     0
                                     (1+ (- height utxo-height))))
             ("value" . ,(/ (bl.store:utxo-entry-value entry) 100000000.0d0))
-            ;; Core's scriptPubKey shape: asm/hex/type plus address when the
-            ;; script encodes to one (previously only hex was returned).
-            ("scriptPubKey" . (("asm" . ,(bl.val:disassemble-script spk))
-                               ("desc" . ,(scriptpubkey-desc spk network))
-                               ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                               ("type" . ,(bl.val:script-type-name spk))
-                               ,@(when addr `(("address" . ,addr)))))
+            ;; Core ScriptToUniv with include_hex and include_address
+            ;; (blockchain.cpp:1253).
+            ("scriptPubKey" . ,(script-to-json spk :network network))
             ("coinbase" . ,(json-bool (bl.store:utxo-entry-coinbase entry)))))
         nil)))) ; Return null for spent/absent outputs
 

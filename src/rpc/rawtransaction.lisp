@@ -1004,52 +1004,115 @@ answer\" mean different things to whoever is reading this."
                    result))))))
         (or (nreverse result) (make-hash-table :test 'equal))))))
 
+(defun %script-rejects-wrapping-p (script)
+  "Core decodescript's tail scan (rpc/rawtransaction.cpp:521-526): T when
+SCRIPT contains OP_CHECKSIGADD or any OP_SUCCESS, either of which means it
+must not be offered as a redeem script -- under tapscript an OP_SUCCESS makes
+the whole script succeed, so wrapping it hands out an address anyone can spend.
+
+Only called after SCRIPT-HAS-VALID-OPS-P, which is where Core puts it
+(CHECK_NONFATAL on its own GetOp), so every push length here is in bounds."
+  (let ((len (length script))
+        (pos 0))
+    (loop while (< pos len)
+          do (let ((op (aref script pos)))
+               (incf pos)
+               (when (or (= op #xba)        ; OP_CHECKSIGADD
+                         (bl.interop:is-op-success-p op))
+                 (return-from %script-rejects-wrapping-p t))
+               (cond ((< op #x4c) (incf pos op))
+                     ((<= #x4c op #x4e)
+                      (let ((size-bytes (ecase op (#x4c 1) (#x4d 2) (#x4e 4)))
+                            (n 0))
+                        (dotimes (k size-bytes)
+                          (setf n (logior n (ash (aref script (+ pos k)) (* 8 k)))))
+                        (incf pos (+ size-bytes n)))))))
+    nil))
+
+(defun %script-can-wrap-p (script type)
+  "Core decodescript's can_wrap (rpc/rawtransaction.cpp:496-526): may SCRIPT be
+handed back as a P2SH redeem script?
+
+NULL_DATA, SCRIPTHASH, WITNESS_UNKNOWN, WITNESS_V1_TAPROOT and ANCHOR are
+refused by TYPE -- Core stopped printing exactly these, because a P2SH address
+wrapping an OP_RETURN is unspendable and one wrapping another P2SH or a
+taproot output is redeemable by anyone who knows the redeem script, the outer
+hash check being all that ever runs. The rest are refused when the script does
+not parse, is unspendable, or carries OP_CHECKSIGADD / an OP_SUCCESS."
+  (and (member type '(:multisig :nonstandard :pubkey :pubkeyhash
+                      :witness-v0-keyhash :witness-v0-scripthash))
+       (bl.store:script-has-valid-ops-p script)
+       (not (bl.store:script-unspendable-p script))
+       (not (%script-rejects-wrapping-p script))
+       t))
+
+(defun %script-can-wrap-p2wsh-p (type data)
+  "Core decodescript's can_wrap_P2WSH (rpc/rawtransaction.cpp:533-559): may the
+script be offered inside a witness program as well?
+
+Only NONSTANDARD, PUBKEYHASH, PUBKEY and MULTISIG -- a witness program and a
+P2SH cannot be nested -- and the two key-carrying types only when every key is
+COMPRESSED, since an uncompressed key can never be spent under BIP143 and the
+address would be a trap (rpc_decodescript.py:141-159). DATA is
+CLASSIFY-SCRIPT's plist, whose :pubkey / :pubkeys are Core's solutions_data
+entries; the classification already rejects any key of another size, so
+33 bytes IS compressed here."
+  (flet ((compressed-p (keys) (every (lambda (k) (= (length k) 33)) keys)))
+    (case type
+      ((:nonstandard :pubkeyhash) t)
+      (:pubkey (compressed-p (list (getf data :pubkey))))
+      (:multisig (compressed-p (getf data :pubkeys)))
+      (t nil))))
+
+(defun %decodescript-segwit-script (script type data)
+  "The witness program decodescript offers for SCRIPT
+(rpc/rawtransaction.cpp:560-570): P2WPKH over the key hash for PUBKEY and
+PUBKEYHASH, P2WSH over the script itself for everything else."
+  (case type
+    (:pubkey (%script-p2wpkh (getf data :pubkey)))
+    (:pubkeyhash (concatenate '(vector (unsigned-byte 8))
+                              #(#x00 #x14) (getf data :hash)))
+    (t (%script-p2wsh script))))
+
 (define-rpc "decodescript" (node (hex-str))
-  "Decode a hex-encoded script."
+  "Decode a hex-encoded script (Core decodescript, rpc/rawtransaction.cpp:
+450-580).
+
+The object is ScriptToUniv's -- asm, desc, address when the script has a
+well-defined destination, and type -- plus, only when Core's can_wrap allows
+it, the P2SH address for using this script as a redeem script, and only when
+can_wrap_P2WSH allows it, the segwit object with that witness program's own
+asm/desc/hex/address/type and its p2sh-segwit address.
+
+reqSigs and addresses (the plural, pre-v22 pair) are gone: Core removed them
+in v22 and rpc_decodescript.py asserts the modern shape field by field. An
+EMPTY script is valid and is not special-cased -- it classifies as
+nonstandard, and Core wraps it like any other nonstandard script."
   (let ((network (rpc-get-network node)))
     (unless (stringp hex-str)
       (error 'rpc-error :code +rpc-deserialization-error+
                         :message "Invalid script hex"))
-    ;; Handle empty script
-    (when (zerop (length hex-str))
-      (return-from rpc-decodescript
-        `(("asm" . "")
-          ("type" . "nonstandard"))))
     (handler-case
         (let ((script (bl.crypto:hex-to-bytes hex-str)))
-          (multiple-value-bind (type data)
-              (bl.val:classify-script script)
-            (let ((result `(("asm" . ,(bl.val:disassemble-script script))
-                            ("type" . ,(bl.val:script-type-to-string type)))))
-              ;; Add type-specific fields
-              (case type
-                (:multisig
-                 ;; Bare multisig: one P2PKH address per key (Core's classic
-                 ;; decodescript "addresses" array; classify-script gives :pubkeys).
-                 (setf result (append result
-                                      `(("reqSigs" . ,(getf data :m))
-                                        ("addresses"
-                                         . ,(mapcar
-                                             (lambda (pk)
-                                               (bl.crypto:encode-p2pkh-address
-                                                (bl.crypto:hash160 pk) network))
-                                             (getf data :pubkeys)))))))
-                ((:pubkeyhash :scripthash)
-                 (let* ((hash (getf data :hash))
-                        (addr (if (eq type :pubkeyhash)
-                                  (bl.crypto:encode-p2pkh-address hash network)
-                                  (bl.crypto:encode-p2sh-address hash network))))
-                   (setf result (append result `(("addresses" . (,addr)))))))
-                ((:witness-v0-keyhash :witness-v0-scripthash :witness-v1-taproot)
-                 (let* ((prog (getf data :witness-program))
-                        (ver (getf data :witness-version))
-                        (hrp (bl.crypto:segwit-hrp network))
-                        (addr (bl.crypto:segwit-address-encode hrp ver prog)))
-                   (setf result (append result `(("segwit" . (("address" . ,addr)))))))))
-              ;; Add p2sh address (script wrapped in P2SH)
-              (let* ((script-hash (bl.crypto:hash160 script))
-                     (p2sh-addr (bl.crypto:encode-p2sh-address script-hash network)))
-                (setf result (append result `(("p2sh" . ,p2sh-addr)))))
+          (multiple-value-bind (type data) (bl.val:classify-script script)
+            (let ((result (script-to-json script :include-hex nil
+                                                 :network network)))
+              (when (%script-can-wrap-p script type)
+                (setf result
+                      (append result
+                              `(("p2sh" . ,(bl.crypto:encode-p2sh-address
+                                            (bl.crypto:hash160 script) network)))))
+                (when (%script-can-wrap-p2wsh-p type data)
+                  (let ((segwit (%decodescript-segwit-script script type data)))
+                    (setf result
+                          (append result
+                                  `(("segwit"
+                                     . ,(append
+                                         (script-to-json segwit :network network)
+                                         `(("p2sh-segwit"
+                                            . ,(bl.crypto:encode-p2sh-address
+                                                (bl.crypto:hash160 segwit)
+                                                network)))))))))))
               result)))
       (error (e)
         (error 'rpc-error :code +rpc-deserialization-error+

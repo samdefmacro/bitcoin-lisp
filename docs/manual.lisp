@@ -1068,10 +1068,23 @@
   its single dispatch point (Core calls CheckWarmup at the head of every
   handler) and answers HTTP 503 until the node is ready.
 
+  Every scriptPubKey object the RPC and REST surfaces emit is
+  `script-to-json\', Core's ScriptToUniv, in Core's key order (asm, desc,
+  hex, address, type) -- there is no second copy to drift. `decodescript\'
+  is that object plus Core's can_wrap and can_wrap_P2WSH gates: a P2SH
+  wrapper is offered only for a script that may be wrapped, which is why
+  a NULL_DATA, a SCRIPTHASH, a taproot output, an ANCHOR, an unknown
+  witness version, an unparseable script and one carrying OP_CHECKSIGADD
+  or an OP_SUCCESS get none, and the segwit object only for the four
+  types that survive can_wrap_P2WSH with compressed keys. reqSigs and the
+  plural addresses are Core's pre-v22 shape and are gone.
+
   Trap: the recurring failure shape in this tree is correct code with
   the wrong or missing caller -- an index built but never maintained, a
   check present but never reached. Test the wire, not the function."
   (bitcoin-lisp.rpc:with-node-lock macro)
+  (bitcoin-lisp.rpc:script-to-json function)
+  (bitcoin-lisp.rpc:script->address function)
   (bitcoin-lisp.rpc:rpc-get-chain-state function)
   (bitcoin-lisp.rpc::*rpc-named-arg-names* variable)
   (bitcoin-lisp.rpc::*rpc-arg-conversions* variable)

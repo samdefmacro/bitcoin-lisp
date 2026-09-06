@@ -258,16 +258,6 @@ Mempool coins carry +mempool-coin-height+."
     (t (or (bl.store:get-utxo (rpc-get-utxo-set node) txid vout)
            (and mempool (%mempool-view-coin mempool txid vout))))))
 
-(defun %getutxos-spk-json (spk network)
-  "The scriptPubKey object of a getutxos JSON coin (Core ScriptToUniv with
-include_hex + include_address)."
-  (let ((addr (script->address spk network)))
-    `(("asm" . ,(bl.val:disassemble-script spk))
-      ("desc" . ,(scriptpubkey-desc spk network))
-      ("hex" . ,(bl.crypto:bytes-to-hex spk))
-      ("type" . ,(bl.val:script-type-name spk))
-      ,@(when addr `(("address" . ,addr))))))
-
 (defun %getutxos-binary (height tip-hash hits coins)
   "The BIP64 binary response body (Core rest.cpp:1034-1043): u32 LE chain
 height, 32-byte tip hash (internal order), CompactSize+bitmap (LSB-first
@@ -355,10 +345,12 @@ outpoints come from the URI."
                              `(("height" . ,(bl.store:utxo-entry-height coin))
                                ("value" . ,(/ (bl.store:utxo-entry-value coin)
                                               100000000.0d0))
+                               ;; Core ScriptToUniv with include_hex and
+                               ;; include_address (rest.cpp:1072).
                                ("scriptPubKey"
-                                . ,(%getutxos-spk-json
+                                . ,(script-to-json
                                     (bl.store:utxo-entry-script-pubkey coin)
-                                    network))))
+                                    :network network))))
                            coins))))))
         (t
          (%rest-hex-or-bin
@@ -604,16 +596,9 @@ before it."
             (let ((spk (bl.store:utxo-entry-script-pubkey entry)))
               `(("value" . ,(/ (bl.store:utxo-entry-value entry)
                                100000000.0d0))
-                ;; Core's ScriptToUniv with include_hex and
-                ;; include_address, which is the shape OUTPUT-TO-JSON already
-                ;; builds for a tx-out.
-                ("scriptPubKey"
-                 . ,(let ((addr (and network (script->address spk network))))
-                      (append
-                       `(("asm" . ,(bl.val:disassemble-script spk))
-                         ("hex" . ,(bl.crypto:bytes-to-hex spk))
-                         ("type" . ,(bl.val:script-type-name spk)))
-                       (when addr `(("address" . ,addr)))))))))
+                ;; Core's ScriptToUniv with include_hex and include_address
+                ;; (rest.cpp:303).
+                ("scriptPubKey" . ,(script-to-json spk :network network)))))
           tx-undo)))
       tx-undos))))
 

@@ -2232,16 +2232,51 @@ mapping each expanded script (byte vector) to its canonical descriptor
 ;;; --- Script -> address / inferred descriptor ---
 
 (defun script->address (script network)
-  "Address string for a standard scriptPubKey SCRIPT, or NIL if the script
-has no address representation (raw/pk/bare-multisig/anchor). Inverse of the
-encoders in crypto/address.lisp, keyed on CLASSIFY-SCRIPT."
+  "Address string for a standard scriptPubKey SCRIPT, or NIL if the script has
+no address representation. Inverse of the encoders in crypto/address.lisp,
+keyed on CLASSIFY-SCRIPT.
+
+This is Core's ExtractDestination + EncodeDestination pair
+(addresstype.cpp:49-105), so the types it answers NIL for are Core's:
+PUBKEY (ExtractDestination returns false for it even though it fills in a
+PubKeyDestination -- which is why ScriptToUniv also excludes it by name),
+MULTISIG, NULL_DATA and NONSTANDARD. ANCHOR and WITNESS_UNKNOWN DO have
+addresses: the P2A output prints as bcrt1pfeesnyr2tx and an unknown witness
+version as its own bech32m, which is what decodescript reports for them
+(rpc_decodescript.py:198, data/rpc_decodescript.json `5102eeee')."
   (multiple-value-bind (type data) (bl.val:classify-script script)
     (case type
       (:pubkeyhash (bl.crypto:encode-p2pkh-address (getf data :hash) network))
       (:scripthash (bl.crypto:encode-p2sh-address (getf data :hash) network))
       (:witness-v0-keyhash (bl.crypto:encode-p2wpkh-address (getf data :witness-program) network))
       (:witness-v0-scripthash (bl.crypto:encode-p2wsh-address (getf data :witness-program) network))
-      (:witness-v1-taproot (bl.crypto:encode-p2tr-address (getf data :witness-program) network)))))
+      (:witness-v1-taproot (bl.crypto:encode-p2tr-address (getf data :witness-program) network))
+      ((:anchor :witness-unknown)
+       (bl.crypto:segwit-address-encode (bl.crypto:segwit-hrp network)
+                                        (getf data :witness-version)
+                                        (getf data :witness-program))))))
+
+(defun script-to-json (script &key (include-hex t) network)
+  "Core ScriptToUniv (core_io.cpp:409-428): one script as the object every
+scriptPubKey field in the RPC and REST surfaces carries, in Core's key order
+-- asm, desc, hex, address, type.
+
+NETWORK is Core's include_address: with it the object also carries the
+inferred descriptor and, when the script has a well-defined destination, the
+address. INCLUDE-HEX is Core's include_hex, whose default is likewise true;
+decodescript is the one caller that passes false, because the caller supplied
+the hex.
+
+DIVERGENCE: the `desc' is SCRIPTPUBKEY-DESC, which has no signing provider,
+so a script Core could infer a richer descriptor for (a P2WSH whose inner
+script the provider knows) reads as addr()/raw() here."
+  (let ((type (bl.val:classify-script script))
+        (addr (and network (script->address script network))))
+    `(("asm" . ,(bl.val:disassemble-script script))
+      ,@(when network `(("desc" . ,(scriptpubkey-desc script network))))
+      ,@(when include-hex `(("hex" . ,(bl.crypto:bytes-to-hex script))))
+      ,@(when addr `(("address" . ,addr)))
+      ("type" . ,(bl.val:script-type-to-string type)))))
 
 (defun scriptpubkey-desc (script network)
   "Core InferDescriptor for a bare scriptPubKey (no key material available): an

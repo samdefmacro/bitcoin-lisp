@@ -158,19 +158,13 @@ PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
 
 ;;; --- decodepsbt helpers ---
 
-(defun %psbt-script-obj (script &key sighash-decode)
-  "The {asm, hex} pair decodepsbt prints for a redeem/witness script or a
-final scriptSig. SIGHASH-DECODE is Core's fAttemptSighashDecode, which
-decodepsbt passes for final_scriptSig alone (rpc/rawtransaction.cpp)."
-  `(("asm" . ,(bl.val:disassemble-script script :sighash-decode sighash-decode))
+(defun %psbt-final-scriptsig-obj (script)
+  "decodepsbt's final_scriptSig object (rpc/rawtransaction.cpp:1201-1205).
+The one place decodepsbt does NOT build its script object with ScriptToUniv:
+it spells the pair out so it can pass fAttemptSighashDecode, which no
+scriptPubKey, redeem script or witness script gets."
+  `(("asm" . ,(bl.val:disassemble-script script :sighash-decode t))
     ("hex" . ,(bl.crypto:bytes-to-hex script))))
-
-(defun %psbt-spk-obj (spk network)
-  (let ((o `(("asm" . ,(bl.val:disassemble-script spk))
-             ("hex" . ,(bl.crypto:bytes-to-hex spk))
-             ("type" . ,(bl.val:script-type-name spk))))
-        (addr (and network (bl.rpc:script->address spk network))))
-    (if addr (append o `(("address" . ,addr))) o)))
 
 (defun %psbt-keypath-json (pubkey value)
   "A bip32_derivs entry from a PUBKEY and a <fingerprint:4><path:4le*> VALUE."
@@ -412,8 +406,11 @@ fingerprint><path>."
                         (bl.ser:make-byte-reader-from wu))))
             (add "witness_utxo"
                  `(("amount" . ,(/ (bl.ser:tx-out-value txout) 100000000.0d0))
-                   ("scriptPubKey" . ,(%psbt-spk-obj (bl.ser:tx-out-script-pubkey txout)
-                                                     network)))))))
+                   ;; Core ScriptToUniv with include_hex and include_address
+                   ;; (rpc/rawtransaction.cpp:1130).
+                   ("scriptPubKey" . ,(bl.rpc:script-to-json
+                                       (bl.ser:tx-out-script-pubkey txout)
+                                       :network network)))))))
       (let ((sigs (bl.ser:psbt-map-collect
                    map bl.ser:+psbt-in-partial-sig+)))
         (when sigs
@@ -427,10 +424,10 @@ fingerprint><path>."
                                  (loop for j below 4 sum (ash (aref sh j) (* 8 j)))))))
       (let ((rs (bl.ser:psbt-map-find
                  map bl.ser:+psbt-in-redeem-script+)))
-        (when rs (add "redeem_script" (%psbt-script-obj rs))))
+        (when rs (add "redeem_script" (bl.rpc:script-to-json rs))))
       (let ((ws (bl.ser:psbt-map-find
                  map bl.ser:+psbt-in-witness-script+)))
-        (when ws (add "witness_script" (%psbt-script-obj ws))))
+        (when ws (add "witness_script" (bl.rpc:script-to-json ws))))
       (let ((keypaths (bl.ser:psbt-map-collect
                        map bl.ser:+psbt-in-bip32+)))
         (when keypaths
@@ -438,7 +435,7 @@ fingerprint><path>."
                (loop for (pk . v) in keypaths collect (%psbt-keypath-json pk v)))))
       (let ((fs (bl.ser:psbt-map-find
                  map bl.ser:+psbt-in-final-scriptsig+)))
-        (when fs (add "final_scriptSig" (%psbt-script-obj fs :sighash-decode t))))
+        (when fs (add "final_scriptSig" (%psbt-final-scriptsig-obj fs))))
       (let ((fw (bl.ser:psbt-map-find
                  map bl.ser:+psbt-in-final-scriptwitness+)))
         (when fw (add "final_scriptwitness" (%psbt-parse-witness-stack fw))))
@@ -450,10 +447,10 @@ fingerprint><path>."
     (flet ((add (k v) (push (cons k v) fields)))
       (let ((rs (bl.ser:psbt-map-find
                  map bl.ser:+psbt-out-redeem-script+)))
-        (when rs (add "redeem_script" (%psbt-script-obj rs))))
+        (when rs (add "redeem_script" (bl.rpc:script-to-json rs))))
       (let ((ws (bl.ser:psbt-map-find
                  map bl.ser:+psbt-out-witness-script+)))
-        (when ws (add "witness_script" (%psbt-script-obj ws))))
+        (when ws (add "witness_script" (bl.rpc:script-to-json ws))))
       (let ((keypaths (bl.ser:psbt-map-collect
                        map bl.ser:+psbt-out-bip32+)))
         (when keypaths
