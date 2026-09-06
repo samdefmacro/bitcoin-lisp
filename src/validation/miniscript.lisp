@@ -517,6 +517,14 @@ interpreter requires (Core's CScript::operator<<(int64_t))."
   "BIP342 OP_CHECKSIGADD. Only reachable in a tapscript context: under P2WSH it
 is OP_SUCCESS-adjacent and multi_a does not exist there at all.")
 
+;;; multi_a's closing comparison. Defined HERE, with the other opcodes script
+;;; generation needs, and not down in the decoder that also reads them: a
+;;; constant referenced by a function defined EARLIER in the same file is a
+;;; deferred `undefined variable' WARNING and compiles to an unfolded special
+;;; lookup rather than the constant.
+(defconstant +ms-op-numequal+ #x9c)
+(defconstant +ms-op-numequalverify+ #x9d)
+
 (defun %ms-key-bytes (key ctx)
   "How KEY serializes into a script in CTX.
 
@@ -2229,8 +2237,6 @@ it."
 (defconstant +ms-op-pushdata2+ 77)
 (defconstant +ms-op-pushdata4+ 78)
 (defconstant +ms-op-1negate+ 79)
-(defconstant +ms-op-numequal+ #x9c)
-(defconstant +ms-op-numequalverify+ #x9d)
 
 (defun ms-decompose-script (script)
   "Split SCRIPT into MS-OPs, REVERSED, or NIL if it is not decomposable.
