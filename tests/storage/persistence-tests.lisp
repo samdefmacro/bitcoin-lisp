@@ -1719,6 +1719,61 @@ BASE/chainstate<SUFFIX>/ (opened fresh, so only flushed state counts)."
               t)
       (bl.store:close-chainstate-coins-view cs))))
 
+(test periodic-flush-empties-the-coins-cache-only-on-the-size-trigger
+  "MAYBE-PERIODIC-FLUSH passes Core's empty_cache down, so which trigger fired
+decides whether the warm coins cache survives the write. Core computes
+empty_cache = FORCE_FLUSH || fCacheLarge || fCacheCritical
+(validation.cpp:2761-2766) and then picks
+`empty_cache ? CoinsTip().Flush() : CoinsTip().Sync()' (:2812); fPeriodicWrite
+-- the DATABASE_WRITE_INTERVAL timer, whose analogue here is the 600-second /
+25000-block pair -- is deliberately NOT in it, because a write driven by the
+clock has no reason to throw away entries that cost pull-through reads to
+rebuild.
+
+Both directions are asserted, so neither can pass vacuously: the
+time-triggered flush must leave the entry in the table AND commit it to the
+base view (a flush that did nothing would fail the second half), and the
+size-triggered flush must empty the table."
+  (let* ((base (ensure-directories-exist
+                (merge-pathnames (format nil "test-periodic-flush-~D/"
+                                         (get-universal-time))
+                                 (uiop:temporary-directory))))
+         (node (bl:make-node)))
+    (unwind-protect
+         (let ((cs (%shutdown-fixture-chainstate base "" 3))
+               (bl:*node* node))
+           (setf (bl:node-chainstates node) (list cs))
+           (let* ((view (bl.store:chain-state-coins-view cs))
+                  (entries (coins-cache-entries view))
+                  (key (bl.store:make-utxo-key
+                        (make-array 32 :element-type (quote (unsigned-byte 8))
+                                       :initial-element 3)
+                        0)))
+             (is (= 1 (hash-table-count entries))
+                 "the fixture starts with one cached coin")
+             ;; The CLOCK alone. The cache is nowhere near its budget, so this
+             ;; is Core's fPeriodicWrite with fCacheLarge false.
+             (let ((bl::*blocks-since-flush* 0)
+                   (bl::*last-flush-universal-time*
+                     (- (bl.ser:get-node-time) 1200)))
+               (bl:maybe-periodic-flush cs nil 3))
+             (is (= 1 (hash-table-count entries))
+                 "a time-triggered flush emptied the coins cache Core would have kept")
+             (is (not (null (bl.store:coins-view-db-get
+                             (bl.store:coins-view-cache-base view) key)))
+                 "the time-triggered flush left the coin uncommitted")
+             ;; The SIZE tier. A budget below the cache's own usage makes
+             ;; LARGE-COINS-CACHE-THRESHOLD fire, which is Core's fCacheLarge
+             ;; and the one trigger that IS empty_cache.
+             (let ((bl::*coins-cache-budget-bytes* 100))
+               (is (>= (bl.store:view-mem-bytes view)
+                       (bl:chainstate-coins-cache-budget cs))
+                   "the fixture did not reach the size trigger")
+               (bl:maybe-periodic-flush cs nil 3))
+             (is (zerop (hash-table-count entries))
+                 "a size-triggered flush kept the coins cache Core would have emptied")))
+      (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
+
 (test shutdown-flush-marker-window
   "%shutdown-flush-chainstates runs the shutdown flush through the 3-phase
 commit: DURING the coins-flush window the on-disk state file carries the
