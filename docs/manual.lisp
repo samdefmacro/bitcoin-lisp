@@ -584,7 +584,14 @@
   nPowTargetSpacing * (1 + 0.5 * other downloading peers) measured from
   its LAST DELIVERY, never from when we asked. Outbound eclipse resistance rotates the extra outbound
   slot on a stale tip (`*max-tip-age-seconds*` is Core's
-  nPowTargetSpacing * 3). Everything that decides an outbound dial reads
+  nPowTargetSpacing * 3). The outbound refill IS
+  ThreadOpenConnections: every try is a FRESH addrman draw, up to 100
+  per connection, skipping a candidate whose last_try is under ten
+  minutes old until 30 have been rejected -- a boot-time snapshot of
+  picks re-walked in fixed order could only ever fill the eight
+  full-relay slots from the addresses the node happened to know at
+  start-up, and re-dialled a dead one every thirty seconds forever.
+  Everything that decides an outbound dial reads
   OUTBOUND peers only -- the full-relay count, the /16 netgroup set a
   candidate is vetoed against, and the online test that says whether an
   addrman FAILURE may be charged -- because inbound connections are free

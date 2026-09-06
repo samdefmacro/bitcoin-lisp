@@ -2383,15 +2383,17 @@ every present and future onion peer, silently disabling onion reachability."
 documentation space. Its /16 is 203.0, which no fixture peer shares unless the
 test means it to.")
 
-(defun %dial-probe-node (peers candidates &optional book)
+(defun %dial-probe-node (peers &optional book)
   "A node wired for one automatic-dial sweep: networking on, PEERS as the peer
-list, CANDIDATES as the frozen dial-candidate list REPLACE-DISCONNECTED-PEERS
-walks, BOOK as the addrman. The three reaches into node internals in this
-section."
+list, BOOK as the addrman the refill draws its candidates from. The two reaches
+into node internals in this section.
+
+There is no separate candidate list any more: REPLACE-DISCONNECTED-PEERS draws
+every candidate from addrman on every try, the way Core's
+ThreadOpenConnections does."
   (let ((node (bl:make-node)))
     (setf (bl:node-network-active node) t
           (bl:node-peers node) peers
-          (bl::node-known-addresses node) candidates
           (bl::node-address-book node) book)
     node))
 
@@ -2426,15 +2428,16 @@ SOCKS5 proxy and so says nothing at all about the address it named."
       (setf (fdefinition 'bl.net:connect-peer) real))
     (nreverse dialed)))
 
-(defun %candidate-book ()
-  "An addrman holding *DIAL-CANDIDATE* at the P2P port, and nothing else."
+(defun %candidate-book (&rest extra-octets)
+  "An addrman holding *DIAL-CANDIDATE* at the P2P port, plus one 203.0.113.N
+record for each N in EXTRA-OCTETS."
   (let ((book (bl.net:make-address-book)))
-    (bl.net:address-book-add
-     book (bl.net:make-peer-address
-           :ip (bl.net:ipv4-to-mapped-ipv6 203 0 113 9)
-           :port 8333 :services 1
-           :last-seen (bl.ser:get-unix-time)))
-    book))
+    (dolist (octet (cons 9 extra-octets) book)
+      (bl.net:address-book-add
+       book (bl.net:make-peer-address
+             :ip (bl.net:ipv4-to-mapped-ipv6 203 0 113 octet)
+             :port 8333 :services 1
+             :last-seen (bl.ser:get-unix-time))))))
 
 (defun %candidate-record (book)
   "BOOK's entry for *DIAL-CANDIDATE*, whose last_try and nAttempts are what the
@@ -2447,6 +2450,155 @@ failure-counting test reads."
 netgroup in Core's diversity set."
   (bl.net:make-peer :address address :state :ready
                     :conn-type :outbound-full-relay))
+
+(test the-refill-draws-from-addrman-on-every-try
+  "Core ThreadOpenConnections re-samples addrman on every attempt
+(net.cpp:2804-2822). Ours walked a boot-time snapshot of picks parked on the
+node, in fixed order, with no cooldown -- the live nodes redialled the same
+four addresses every ~30 seconds, and an address learned from addr gossip
+after start-up could never fill an outbound slot however long the node ran,
+because the snapshot is rebuilt only when the peer count reaches ZERO and a
+surviving block-relay or inbound peer keeps it above that."
+  ;; Five sweeps against a book of 40 addresses in distinct /16 groups. Every
+  ;; dial fails, so nothing is ever connected and each sweep starts from the
+  ;; same state -- what changes is only which addresses addrman offers.
+  (let ((book (bl.net:make-address-book)))
+    (dotimes (i 40)
+      (bl.net:address-book-add
+       book (bl.net:make-peer-address
+             :ip (bl.net:ipv4-to-mapped-ipv6 198 (+ 10 i) 0 7)
+             :port 8333 :services 1
+             :last-seen (bl.ser:get-unix-time))))
+    (let ((dialed (%hosts-dialed-by
+                   (lambda ()
+                     (dotimes (i 5)
+                       (%refill-outbound (%dial-probe-node '() book)))))))
+      (is (plusp (length dialed))
+          "control: the refill must dial something at all")
+      (is (> (length (remove-duplicates dialed :test #'string=)) 1)
+          "five sweeps that only ever dial ONE address are walking a frozen ~
+list, not drawing from addrman (~S)" dialed))))
+
+(test an-address-learned-after-start-up-is-a-refill-candidate
+  "The half of the frozen list that could not be worked around: gossiped
+addresses land in addrman, and addrman was not what the refill read. A node
+whose boot candidates go stale kept dialling a dead set while the book held
+thousands of live entries."
+  (let ((book (bl.net:make-address-book)))
+    ;; Nothing at start-up.
+    (is (null (%hosts-dialed-by
+               (lambda () (%refill-outbound (%dial-probe-node '() book)))))
+        "control: an empty book offers the refill nothing to dial")
+    ;; A single address arrives later, the way addr gossip delivers one.
+    (bl.net:address-book-add
+     book (bl.net:make-peer-address
+           :ip (bl.net:ipv4-to-mapped-ipv6 203 0 113 9)
+           :port 8333 :services 1
+           :last-seen (bl.ser:get-unix-time)))
+    (is (equal (list *dial-candidate*)
+               (%hosts-dialed-by
+                (lambda () (%refill-outbound (%dial-probe-node '() book)))))
+        "an address added AFTER start-up must become a refill candidate")))
+
+(defmacro %with-scripted-draws ((&rest lambda-body) &body body)
+  "Run BODY with the refill's addrman draw replaced by (LAMBDA ,@LAMBDA-BODY),
+so the SELECTION rule can be judged on a scripted sequence instead of on what
+a sparse addrman happens to return. Restores the real function on unwind."
+  (let ((real (gensym "REAL")))
+    `(let ((,real (fdefinition 'bl::%addrman-pick-unconnected)))
+       (unwind-protect
+            (progn (setf (fdefinition 'bl::%addrman-pick-unconnected)
+                         (lambda ,@lambda-body))
+                   ,@body)
+         (setf (fdefinition 'bl::%addrman-pick-unconnected) ,real)))))
+
+(test a-failed-dial-is-not-repeated-inside-the-cooldown
+  "Core skips a candidate whose last_try is under 10 minutes old until 30
+candidates have been rejected (net.cpp:2839-2841), on top of addrman's own
+GetChance (0.01x within 10 minutes of the last attempt). The refill had no
+cooldown at all, and maintain-peers runs once per <=30s sync pass, so an
+address that keeps refusing us was re-dialled roughly every 30 seconds
+forever, in the same order.
+
+Judged on a scripted draw sequence rather than on a live addrman: our
+address-book-select falls back to a UNIFORM pick when its bucket scan comes up
+empty, which a sparse book makes common, so an end-to-end assertion about
+which of two addresses is preferred would be a coin flip."
+  (let ((node (%dial-probe-node '() (bl.net:make-address-book)))
+        (now (bl.ser:get-unix-time)))
+    ;; Every draw offers an address tried seconds ago, except the fifth.
+    (let ((draws 0))
+      (%with-scripted-draws ((n &key new-only)
+                             (declare (ignore n new-only))
+                             (incf draws)
+                             (if (= draws 5)
+                                 (values *dial-candidate* 8333 0)
+                                 (values (format nil "198.~D.0.7" (+ 10 draws))
+                                         8333 now)))
+        (is (equal (list *dial-candidate* 8333)
+                   (multiple-value-list
+                    (bl::%select-refill-candidate node '() '())))
+            "an address tried inside the last 10 minutes must be passed over ~
+while an untried one is on offer")))
+    ;; The cooldown is a PREFERENCE, not a ban: after 30 rejected candidates
+    ;; Core lets a recently-tried address through, so a node whose whole book
+    ;; is cooled down still dials rather than starving.
+    (let ((draws 0))
+      (%with-scripted-draws ((n &key new-only)
+                             (declare (ignore n new-only))
+                             (incf draws)
+                             (values (format nil "198.~D.0.7" draws) 8333 now))
+        (is (equal (list "198.30.0.7" 8333)
+                   (multiple-value-list
+                    (bl::%select-refill-candidate node '() '())))
+            "the 30th try must be allowed to take a recently-tried address")))
+    ;; And the selection gives up rather than spinning when the book is empty.
+    (%with-scripted-draws ((n &key new-only)
+                           (declare (ignore n new-only))
+                           nil)
+      (is (null (bl::%select-refill-candidate node '() '()))
+          "an empty address book must end the selection, not loop 100 times"))
+    ;; The other two skips, on the same scripted sequence: a /16 that already
+    ;; holds an outbound peer, and an address this pass has already dialed.
+    (let ((draws 0))
+      (%with-scripted-draws ((n &key new-only)
+                             (declare (ignore n new-only))
+                             (incf draws)
+                             (if (= draws 3)
+                                 (values *dial-candidate* 8333 0)
+                                 (values "198.51.0.7" 8333 0)))
+        (is (equal (list *dial-candidate* 8333)
+                   (multiple-value-list
+                    (bl::%select-refill-candidate node '("198.51") '())))
+            "a /16 already holding an outbound peer must be skipped")))
+    (let ((draws 0))
+      (%with-scripted-draws ((n &key new-only)
+                             (declare (ignore n new-only))
+                             (incf draws)
+                             (if (= draws 3)
+                                 (values *dial-candidate* 8333 0)
+                                 (values "198.51.0.7" 8333 0)))
+        (is (equal (list *dial-candidate* 8333)
+                   (multiple-value-list
+                    (bl::%select-refill-candidate node '() '("198.51.0.7"))))
+            "an address this pass has already dialed must be skipped")))))
+
+(test a-failed-dial-stamps-the-cooldowns-input
+  "The cooldown above is only real if something writes last_try. Core stamps
+addrman.Attempt() on every dial once the connect has RETURNED, whatever it
+returned (net.cpp:492-497), and the refill goes through %DIAL-OUTBOUND-PEER,
+which owns that."
+  (let* ((book (%candidate-book))
+         (node (%dial-probe-node '() book)))
+    (is (equal (list *dial-candidate*)
+               (%hosts-dialed-by (lambda () (%refill-outbound node))))
+        "control: an address with no last_try is dialed, once per pass")
+    (let ((record (%candidate-record book)))
+      (is-true record "the addrman record must still be there")
+      (when record
+        (is (plusp (bl.net:peer-address-last-attempt record))
+            "the failed dial must stamp last_try, or the cooldown reads 0 ~
+for every address forever")))))
 
 (test ga10-2f0cf648-inbound-peers-do-not-veto-a-replacement-dial
   "Core builds outbound_ipv46_peer_netgroups by switching on m_conn_type and
@@ -2466,12 +2618,12 @@ the netgroup set had not.
 An ADDR_FETCH peer is in the same position: -seednode peers reach node-peers
 through establish-outbound-peer, so a plain not-inbound test would still let a
 short-lived seed dial veto a full-relay slot."
-  (let ((candidates (list (cons *dial-candidate* 8333))))
+  (progn
     (flet ((dialed (peer)
              (%hosts-dialed-by
               (lambda ()
                 (%refill-outbound
-                 (%dial-probe-node (and peer (list peer)) candidates))))))
+                 (%dial-probe-node (and peer (list peer)) (%candidate-book)))))))
       (is (equal (list *dial-candidate*) (dialed nil))
           "control: with no peers at all the candidate is dialed")
       (is (equal (list *dial-candidate*)
@@ -2510,19 +2662,19 @@ GetChance collapses.
 last_try is the witness that the dial path really ran: Core stamps it either
 way, so an unchanged nAttempts cannot be confused with a sweep that never
 reached the recorder."
-  (let ((candidates (list (cons *dial-candidate* 8333))))
+  (progn
     (flet ((sweep (peers)
              (let ((book (%candidate-book)))
                (%hosts-dialed-by
                 (lambda ()
-                  (%refill-outbound (%dial-probe-node peers candidates book))))
+                  (%refill-outbound (%dial-probe-node peers book))))
                (%candidate-record book)))
            (named (peers)
              (let ((book (%candidate-book)))
                (%hosts-dialed-by
                 (lambda ()
                   (%dial-named-destination
-                   (%dial-probe-node peers candidates book)
+                   (%dial-probe-node peers book)
                    *dial-candidate* 8333)))
                (%candidate-record book))))
       (dolist (case (list (list "the offline refill" (sweep '()) 0
@@ -2575,14 +2727,13 @@ Both drivers are checked, because they read different halves of the record:
 the automatic refill is the only caller that may count a FAILURE, while a
 named destination can only ever move last_try — which makes last_try the
 witness that the recorder was reached at all."
-  (let ((candidates (list (cons *dial-candidate* 8333)))
-        (online (list (%outbound-peer "198.51.100.1")
+  (let ((online (list (%outbound-peer "198.51.100.1")
                       (%outbound-peer "192.0.2.1"))))
     (flet ((refill (proxy-failed)
              (let ((book (%candidate-book)))
                (%hosts-dialed-by
                 (lambda ()
-                  (%refill-outbound (%dial-probe-node online candidates book)))
+                  (%refill-outbound (%dial-probe-node online book)))
                 proxy-failed)
                (%candidate-record book)))
            (named (proxy-failed)
@@ -2590,7 +2741,7 @@ witness that the recorder was reached at all."
                (%hosts-dialed-by
                 (lambda ()
                   (%dial-named-destination
-                   (%dial-probe-node online candidates book)
+                   (%dial-probe-node online book)
                    *dial-candidate* 8333))
                 proxy-failed)
                (%candidate-record book))))
