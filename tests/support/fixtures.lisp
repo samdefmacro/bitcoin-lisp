@@ -163,6 +163,16 @@ One reach for the whole test tree; the mining, rawtransaction and dispatch
 suites all build their parameters here."
   (bl.rpc::%normalize-rpc-params (coerce values 'vector)))
 
+(defun bpe-add-tx (estimator txid height feerate &rest flags)
+  "Record one mempool arrival with the fee estimator (Core
+CBlockPolicyEstimator::processTransaction). FLAGS are Core's
+NewMempoolTransactionInfo keywords."
+  (apply #'bl.mp::bpe-process-transaction estimator txid height feerate flags))
+
+(defun bpe-add-block (estimator height txids)
+  "Confirm TXIDS at HEIGHT with the fee estimator (processBlock)."
+  (bl.mp::bpe-process-block estimator height txids))
+
 (defun btc-amount (value)
   "The BTC amount an RPC field holds, as an exact rational.
 

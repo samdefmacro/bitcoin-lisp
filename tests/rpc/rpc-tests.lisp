@@ -893,6 +893,12 @@ this test against either version of the source."
             "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))
   (is (not (bl.rpc:valid-hex-hash-p nil))))
 
+(defun %json-token (value)
+  "The JSON text VALUE encodes as -- the number token itself for an amount or
+a Core-spelled float, so a test can assert the spelling and not just the
+value."
+  (with-output-to-string (out) (yason:encode value out)))
+
 (defun %rpc-wire-error (node method params)
   "(code . message) of the rpc-error METHOD signals for PARAMS, or NIL when it
 returns. PARAMS goes through the request normalizer, so the top-level
@@ -3536,6 +3542,14 @@ rpc_help.py passing."
             "Core methods with typed arguments that this node does not serve ~
 grew to ~D: ~S" (length missing) (sort missing #'string<))))))
 
+(defun %erf (&rest params)
+  "estimaterawfee with PARAMS. One reach for the whole file."
+  (bl.rpc::rpc-estimaterawfee nil params))
+
+(defun %erf-horizon (name &rest params)
+  "One horizon object of the estimaterawfee answer for PARAMS."
+  (cdr (assoc name (apply #'%erf params) :test #'string=)))
+
 (test estimaterawfee-reports-the-evidence-not-just-a-number
   "Core estimaterawfee (rpc/fees.cpp:97-190). Unlike estimatesmartfee it asks
 ONE horizon at ONE success threshold and reports the pass/fail buckets behind
@@ -3549,29 +3563,107 @@ reading the output."
           (bl.mp:make-block-policy-estimator)))
     ;; A fresh estimator has no history, so every horizon that TRACKS the
     ;; target still answers — with a zero rate and Core's errors array.
-    (let ((r (bl.rpc::rpc-estimaterawfee nil '(2))))
+    (let ((r (%erf 2)))
       (is (consp r) "no horizon answered for a target every horizon tracks")
       (let ((short (cdr (assoc "short" r :test #'string=))))
         (is-true short "the short horizon did not answer for conf_target 2")
-        (is (assoc "feerate" short :test #'string=))
+        ;; No feerate key at all: CFeeRate(0) is the sentinel, not a fee.
+        ;; The full key set is ESTIMATERAWFEE-HORIZON-OBJECT-IS-CORES-TWO-BRANCHES.
+        (is-false (assoc "feerate" short :test #'string=))
         (is-true (assoc "errors" short :test #'string=)
                  "an estimator with no history must say so")))
     ;; A target only the long horizon tracks omits the shorter ones entirely.
     (let* ((long-max (bl.mp:horizon-max-confirms :long))
            (short-max (bl.mp:horizon-max-confirms :short))
-           (r (bl.rpc::rpc-estimaterawfee
-               nil (list (min long-max (1+ short-max))))))
+           (r (%erf (min long-max (1+ short-max)))))
       (is-false (assoc "short" r :test #'string=)
                 "the short horizon answered for a target it does not track"))
     ;; Range and type checks.
     (is (= bl.rpc:+rpc-invalid-parameter+
-           (rpc-error-code-of (lambda () (bl.rpc::rpc-estimaterawfee nil '(0))))))
+           (rpc-error-code-of (lambda () (%erf 0)))))
     (is (= bl.rpc:+rpc-invalid-parameter+
-           (rpc-error-code-of (lambda () (bl.rpc::rpc-estimaterawfee nil '(2 1.5))))))
+           (rpc-error-code-of (lambda () (%erf 2 1.5)))))
     (is (= bl.rpc:+rpc-invalid-parameter+
-           (rpc-error-code-of (lambda () (bl.rpc::rpc-estimaterawfee nil '(2 -0.1))))))
+           (rpc-error-code-of (lambda () (%erf 2 -0.1)))))
     (is (= bl.rpc:+rpc-type-error+
-           (rpc-error-code-of (lambda () (bl.rpc::rpc-estimaterawfee nil '("2"))))))))
+           (rpc-error-code-of (lambda () (%erf "2")))))))
+
+(defun %erf-txid (n)
+  "A distinct 32-byte txid for the estimator fixture."
+  (let ((bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (dotimes (i 4 bytes)
+      (setf (aref bytes i) (ldb (byte 8 (* 8 i)) n)))))
+
+(defun %erf-driven-estimator (&key (blocks 60) (per-block 40))
+  "An estimator with enough confirmed history for every horizon to answer:
+PER-BLOCK transactions at two feerates enter at each height and all confirm in
+the next block."
+  (let ((estimator (bl.mp:make-block-policy-estimator))
+        (n 0))
+    (loop for height from 1 to blocks
+          do (let ((txids '()))
+               (dotimes (i per-block)
+                 (let ((txid (%erf-txid (incf n))))
+                   (bpe-add-tx estimator txid height
+                               (if (evenp i) 10000d0 25000d0))
+                   (push txid txids)))
+               (bpe-add-block estimator (1+ height) (nreverse txids))))
+    estimator))
+
+(defun %erf-keys (horizon-object)
+  (mapcar #'car horizon-object))
+
+(test estimaterawfee-horizon-object-is-cores-two-branches
+  "GA11 63b42740. Core builds each horizon object in TWO branches keyed on
+CFeeRate(0), estimateRawFee's error sentinel (rpc/fees.cpp:196-211):
+
+  - an answer: feerate, decay, scale, pass, and fail only when the fail
+    bucket's start is not -1;
+  - no answer: decay, scale, fail, errors -- and NO feerate key.
+
+decay and scale are declared WITHOUT /*optional=*/true (fees.cpp:120-121) and
+Core re-checks the returned object against that declaration whenever
+-rpcdoccheck is set, which the functional framework sets in every node's
+config (test_framework/util.py:561) -- so both are in every horizon object a
+Core test ever sees. Both were missing here, from BOTH branches, while the
+no-answer branch reported (\"feerate\" 0.0) -- a fee of zero where Core says it
+has no estimate -- omitted the fail bucket, and shortened the errors sentence.
+
+The KEY SET is what is asserted, in order, because that is the whole finding."
+  (let ((bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator)))
+    (let ((short (%erf-horizon "short" 2)))
+      (is (equal '("decay" "scale" "fail" "errors") (%erf-keys short))
+          "no-answer horizon keys: ~S" (%erf-keys short))
+      (is (equalp #("Insufficient data or no feerate found which meets threshold")
+                  (cdr (assoc "errors" short :test #'string=))))
+      ;; Core materialises the DEFAULT EstimatorBucket here: -1/-1 and zeros.
+      (let ((fail (cdr (assoc "fail" short :test #'string=))))
+        (is (equal '("startrange" "endrange" "withintarget" "totalconfirmed"
+                     "inmempool" "leftmempool")
+                   (%erf-keys fail)))
+        (is (string= "-1" (%json-token (cdr (assoc "startrange" fail :test #'string=)))))
+        (is (string= "0" (%json-token (cdr (assoc "inmempool" fail :test #'string=))))))))
+  ;; The answering branch: feerate first, decay and scale next, pass, and no
+  ;; fail because every bucket passed.
+  (let ((bl.mp:*block-policy-estimator* (%erf-driven-estimator)))
+    (let ((short (%erf-horizon "short" 2)))
+      (is (equal '("feerate" "decay" "scale" "pass") (%erf-keys short))
+          "answering horizon keys: ~S" (%erf-keys short))
+      (is (plusp (btc-amount (cdr (assoc "feerate" short :test #'string=)))))))
+  ;; A recorded fail bucket IS reported alongside pass; the sentinel is a
+  ;; comparison against -1, not a null check.
+  (let ((with-fail (bl.rpc::%raw-fee-horizon-json
+                    10000 (list :pass (list :start 1 :end 2)
+                                :fail (list :start 3 :end 4)
+                                :decay 0.9d0 :scale 2))))
+    (is (equal '("feerate" "decay" "scale" "pass" "fail") (%erf-keys with-fail))))
+  ;; The INF_FEERATE bucket boundary is 1e99: Core's round() keeps a double
+  ;; and UniValue writes 1e+99, where CL's ROUND gives a 99-digit integer.
+  (let* ((object (bl.rpc::%raw-fee-horizon-json
+                  10000 (list :pass (list :start 0 :end 1d99)
+                              :decay 0.9d0 :scale 2)))
+         (pass (cdr (assoc "pass" object :test #'string=))))
+    (is (string= "1e+99" (%json-token (cdr (assoc "endrange" pass :test #'string=)))))))
 
 (test addconnection-opens-the-named-connection-type
   "addconnection (Core rpc/net.cpp). The functional framework uses it to attach
