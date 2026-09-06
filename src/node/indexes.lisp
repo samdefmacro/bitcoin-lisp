@@ -64,6 +64,11 @@ walk is interrupted. Stops, with a warning, at the first block whose body is
 unavailable."
   (declare (ignore undo-fn subsidy-fn progress))
   (let* ((tip (bl.store:current-height cs))
+         ;; The raw stored height, which INDEX-PREPARE-SYNC has just made
+         ;; trustworthy -- Core's Sync likewise walks from the
+         ;; m_best_block_index its Rewind moved (index/base.cpp:201-247). The
+         ;; chain-resolving INDEX-HEIGHT is what the CALLER's guard uses,
+         ;; before that repair has run.
          (from (1+ (bl.store:txospenderindex-height idx)))
          (done 0))
     (when (> from tip)

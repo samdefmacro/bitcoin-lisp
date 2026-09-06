@@ -268,11 +268,15 @@ the one that really spends this outpoint."
 (defun txospenderindex-set-best-block (index block-hash height)
   "Record how far the index has got: the block hash and its height.
 
-The HEIGHT is stored beside the hash purely so getindexinfo can report
-best_block_height without a chain-state lookup — Core's BaseIndex keeps a
-locator and reads the height off it. The layout is hash||height, the
-reverse of INDEX-META-ENCODE's height||hash (the other two indexes); it is
-on disk, so it stays."
+The HEIGHT is stored beside the hash so the marker can be read without a
+chain-state lookup: TXOSPENDERINDEX-HEIGHT reports it, and the backfill
+resumes from it once INDEX-PREPARE-SYNC has made it trustworthy. What must
+not be fooled by a marker on an abandoned branch — getindexinfo and the
+catch-up guard, both of which read it BEFORE that repair — asks INDEX-HEIGHT
+instead, which resolves the HASH against the active chain; Core's BaseIndex
+keeps a locator and reads its height off the chain for the same reason. The
+layout is hash||height, the reverse of INDEX-META-ENCODE's height||hash (the
+other two indexes); it is on disk, so it stays."
   (when (%txospender-index-live-p index)
     (let ((v (make-array 36 :element-type '(unsigned-byte 8))))
       (replace v block-hash)
