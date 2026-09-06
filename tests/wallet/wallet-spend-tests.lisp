@@ -1280,3 +1280,103 @@ doing unbounded validation in one housekeeping tick."
             (is (null remaining)))
           (is (not (null (%ws-mempool-tx node txid1))))
           (is (not (null (%ws-mempool-tx node txid2)))))))))
+
+;;;; -walletbroadcast (finding 8c442ee3)
+
+(defun %ws-broadcast-run (broadcast)
+  "One sendtoaddress under -walletbroadcast=BROADCAST, with a relay-capable
+peer attached. Returns (:txid :in-mempool :unbroadcast :queued), where QUEUED is
+the length of the peer's tx-inv queue -- the shipped announcement queue that
+flush-tx-announcements drains on a purely time-based schedule."
+  (with-wallet-chain-node (node "ws-wbcast")
+    (multiple-value-bind (wallet) (%ws-fund-wallet node)
+      (declare (ignore wallet))
+      (let* ((bl:*wallet-broadcast* broadcast)
+             (bl.wallet::*wallet-rng* (make-wallet-rng 77))
+             (peer (bl.net:make-peer :state :ready :wtxid-relay t))
+             (dest (%wc-optrue-address)))
+        (setf (bl:node-peers node) (list peer))
+        (let ((txid (bl.rpc:parse-hex-hash
+                     (%ws-sendtoaddress
+                      node (list dest 1 nil nil nil nil nil nil nil 10)))))
+          (list :txid txid
+                :in-mempool (and (%ws-mempool-tx node txid) t)
+                :unbroadcast (and (member txid
+                                          (bl.mp:mempool-unbroadcast-txids
+                                           (bl:node-mempool node))
+                                          :test #'equalp)
+                                  t)
+                :queued (length (bl.net:peer-tx-inv-queue peer))))))))
+
+(test walletbroadcast-off-keeps-the-transaction-off-the-wire
+  "Core -walletbroadcast=0 stops CommitTransaction BEFORE the local mempool
+(wallet.cpp:2341-2344), so the signed transaction is stored in the wallet and
+announced to nobody. Asserted on the shipped queue a relay-capable peer would
+be drained from, because that queue is what makes the txid public and it cannot
+be recalled.
+
+The default run is the positive control: with -walletbroadcast at Core's
+default the same call MUST reach the mempool and the peer's queue, so a fix
+that simply broke sending would fail here."
+  (let ((on (%ws-broadcast-run t))
+        (off (%ws-broadcast-run nil)))
+    ;; positive control
+    (is (eq t (getf on :in-mempool)))
+    (is (eq t (getf on :unbroadcast)))
+    (is (= 1 (getf on :queued)))
+    ;; the fix
+    (is (null (getf off :in-mempool))
+        "-walletbroadcast=0 must not even reach the LOCAL mempool")
+    (is (null (getf off :unbroadcast)))
+    (is (= 0 (getf off :queued))
+        "a wallet transaction was queued to a peer under -walletbroadcast=0")
+    ;; and the wallet still returned a txid, as Core's does
+    (is (not (null (getf off :txid))))))
+
+(test walletbroadcast-off-silences-the-resubmit-passes
+  "The other two sites Core reads fBroadcastTransactions at: ShouldResend
+(wallet.cpp:2062-2064) and ResubmitWalletTransactions, which returns even when
+FORCED (:2108-2110) -- the forced caller is the post-load resubmit, which would
+otherwise push a stored transaction into the mempool of a node configured never
+to broadcast it."
+  (with-wallet-chain-node (node "ws-wbcast-resend")
+    (multiple-value-bind (wallet) (%ws-fund-wallet node)
+      (let* ((bl.wallet::*wallet-rng* (make-wallet-rng 78))
+             (dest (%wc-optrue-address))
+             (txid (bl.rpc:parse-hex-hash
+                    (%ws-sendtoaddress
+                     node (list dest 1 nil nil nil nil nil nil nil 10)))))
+        (%wb-evict-tx node txid)
+        (is (null (%ws-mempool-tx node txid)))
+        ;; positive control: forced resubmit restores it at the default
+        (is (= 1 (bl.wallet::wallet-resubmit-transactions
+                  node wallet :relay nil :force t)))
+        (%wb-evict-tx node txid)
+        (let ((bl:*wallet-broadcast* nil))
+          (is (= 0 (bl.wallet::wallet-resubmit-transactions
+                    node wallet :relay nil :force t)))
+          (is (null (%ws-mempool-tx node txid)))
+          ;; and the housekeeping pass does nothing at all
+          (finishes (bl.wallet:wallets-maybe-resend node))
+          (is (null (%ws-mempool-tx node txid))))))))
+
+(test blocksonly-soft-sets-walletbroadcast-off
+  "Core wallet/init.cpp:95-97: -blocksonly=1 soft-sets -walletbroadcast=0, and
+logs it. An operator who asked the node to carry no transactions never supplies
+-walletbroadcast, so this interaction is the ONLY thing that stops their own
+wallet announcing -- and being a soft set, an explicit -walletbroadcast=1 wins."
+  (is (not (member :wallet-broadcast (start-node-plist '("-regtest"))))
+      "no option: START-NODE's own default must stand")
+  (let ((plist (start-node-plist '("-regtest" "-blocksonly=1"))))
+    (is (member :wallet-broadcast plist))
+    (is (null (getf plist :wallet-broadcast))))
+  (let ((plist (start-node-plist '("-regtest" "-blocksonly=1" "-walletbroadcast=1"))))
+    (is (eq t (getf plist :wallet-broadcast))
+        "an explicit -walletbroadcast=1 must beat the soft set"))
+  (let ((plist (start-node-plist '("-regtest" "-walletbroadcast=0"))))
+    (is (null (getf plist :wallet-broadcast))))
+  ;; and it is no longer reported as an option with no effect
+  (multiple-value-bind (plist merged)
+      (start-node-plist '("-regtest" "-walletbroadcast=0"))
+    (declare (ignore plist))
+    (is (null (bl.cfg:supplied-core-only-options merged)))))

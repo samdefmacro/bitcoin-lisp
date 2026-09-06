@@ -26,7 +26,8 @@ rather than (b). It has one blind spot, and it is where the (c) findings live: *
 derives from a DIFFERENT option is never supplied, so it is never named**. Two cases:
 
 - `-blocksonly=1` soft-sets `-walletbroadcast=0` (Core `wallet/init.cpp:95`) — our wallet keeps
-  broadcasting and nothing warns.
+  broadcasting and nothing warns. **Fixed** (finding `8c442ee3`): the soft set is applied in
+  `config-alist->start-node-plist` and logged with Core's own line.
 - any `-debug` category defaults `-shrinkdebugfile` to 0 (Core `logging.cpp:167-170`) — we scroll
   the log anyway and nothing warns.
 
@@ -94,7 +95,7 @@ on a node given that option.
 | `-timeout` | `GetIntArg(..., DEFAULT_CONNECT_TIMEOUT=5000)` ms → `nConnectTimeout`, clamped up if ≤ 0 (`init.cpp:1062`) | `make-tcp-connection` has a hardcoded `:timeout 10` seconds and no caller overrides it (`src/networking/connection.lisp:238`) | a | our fixed 10 s is twice Core's default — more patient, not less; the loss is only that a Tor/high-latency operator cannot raise it |
 | `-unsafesqlitesync` | `GetBoolArg` → SQLite `synchronous=OFF` (`wallet/db.cpp:156`) | we have no SQLite | a | names a database engine this tree does not use |
 | `-version` | `GetBoolArg("-version", false)` → print version, exit 0 (`bitcoind.cpp:138`) | handled at the entry point before anything starts (`src/node/init.lisp:1744-1748`) | a | actually implemented; listed only so the parser accepts it |
-| `-walletbroadcast` | `GetBoolArg(..., DEFAULT_WALLETBROADCAST=true)` → `fBroadcastTransactions`; false stops `CommitTransaction` before the mempool (`wallet/wallet.cpp:2341`) and the resend timer (`:2109`). Soft-set 0 by `-blocksonly` (`wallet/init.cpp:95`) | `%wallet-submit-tx` always accepts and announces; no `fBroadcastTransactions` analogue exists | c | a transaction the operator told the node to keep off the wire goes to every peer, irreversibly — finding `8c442ee3` |
+| `-walletbroadcast` | `GetBoolArg(..., DEFAULT_WALLETBROADCAST=true)` → `fBroadcastTransactions`; false stops `CommitTransaction` before the mempool (`wallet/wallet.cpp:2341`) and the resend timer (`:2109`). Soft-set 0 by `-blocksonly` (`wallet/init.cpp:95`) | **fixed**: `bl:*wallet-broadcast*` gates Core's three sites (commit, resubmit, the resend pass) and `-blocksonly=1` soft-sets it 0 | fixed | finding `8c442ee3` |
 
 ## The reverse defect: real options whose semantics differ from Core's reader
 

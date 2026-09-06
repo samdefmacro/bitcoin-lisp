@@ -65,6 +65,19 @@ resolved network. Honors -server (enable RPC on the default port when no
         (setf (getf plist :wallet-names) names)
         (when (or names (member "1" raw :test #'string=))
           (setf (getf plist :wallet) t)))
+      ;; -walletbroadcast under -blocksonly: Core soft-sets it to 0
+      ;; (wallet/init.cpp:95-97, "Parameter interaction: -blocksonly=1 ->
+      ;; setting -walletbroadcast=0"), because an operator who told the node to
+      ;; carry no transactions on the wire did not mean "except my own". Soft:
+      ;; the scalar scan above already took an explicit -walletbroadcast into
+      ;; the plist, and this only fills the absent case. Here rather than in
+      ;; APPLY-PARAMETER-INTERACTIONS because -walletbroadcast feeds a start-node
+      ;; KEYWORD (so that every run starts from Core's default), and this is
+      ;; where the other keyword soft-sets are decided.
+      (let ((b (lookup "blocksonly")))
+        (when (and b (conf-parse-bool (cdr b)) (not (lookup "walletbroadcast")))
+          (setf (getf plist :wallet-broadcast) nil)
+          (defer-log :info "Parameter interaction: -blocksonly=1 -> setting -walletbroadcast=0")))
       ;; -bind=<addr>[:<port>][=onion] (Core init.cpp; the functional framework
       ;; passes both forms, test_node.py:272-276). The scalar scan above already
       ;; took the last plain value into :listen-bind; re-derive it here so the

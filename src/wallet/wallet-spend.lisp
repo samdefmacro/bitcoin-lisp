@@ -2514,11 +2514,17 @@ hook context (see with-wallet-lock's lock-order contract)."
                (prog1 (wallet-add-to-wallet wallet tx '(:inactive)
                                             :map-value map-value)
                  (wallet-mark-inputs-dirty wallet tx)))))
-    (multiple-value-bind (ok error) (%wallet-submit-tx node tx :relay t)
-      (unless ok
-        (bl:log-warn
-         "CommitTransaction(): Transaction cannot be broadcast immediately, ~A"
-         error)))
+    ;; -walletbroadcast=0 stops here, BEFORE the local mempool -- Core's own
+    ;; comment at wallet.cpp:2341-2344 is "Don't submit tx to the mempool".
+    ;; Passing :relay NIL instead would still accept it locally, and the next
+    ;; resubmit pass would then announce the transaction the operator asked to
+    ;; keep off the wire.
+    (when bl:*wallet-broadcast*
+      (multiple-value-bind (ok error) (%wallet-submit-tx node tx :relay t)
+        (unless ok
+          (bl:log-warn
+           "CommitTransaction(): Transaction cannot be broadcast immediately, ~A"
+           error))))
     wtx))
 
 ;;; --- Rebroadcast machinery (wallet.cpp:2061-2148) ---
@@ -2549,7 +2555,15 @@ txs received within 5 minutes of the last block are skipped. LIMIT bounds
 the number of submissions attempted this pass. Takes the locks itself
 (node -> wallet per tx); call WITHOUT holding either. A failure on one tx
 is logged and never aborts the rest (nor the caller). Returns
-(values submitted remaining-p)."
+(values submitted remaining-p).
+
+Returns immediately under -walletbroadcast=0, FORCE included -- Core
+ResubmitWalletTransactions checks fBroadcastTransactions before anything else
+and its own comment says `even if forcing` (wallet.cpp:2108-2110). The forced
+caller is the post-load resubmit, which would otherwise put a wallet's stored
+transactions into the mempool of a node configured never to broadcast them."
+  (unless bl:*wallet-broadcast*
+    (return-from wallet-resubmit-transactions (values 0 nil)))
   (let ((candidates
           (with-wallet-lock (wallet)
             (loop for wtx across (wallet-tx-ordered wallet)
@@ -2600,7 +2614,9 @@ The inline work is acceptable because each pass is bounded
 node-lock hold) and this thread is idle between 1s housekeeping ticks."
   (handler-case
       (let ((manager (bl:node-wallet-manager node)))
-        (when (and manager (wallet-manager-has-wallets-p manager))
+        ;; Core CWallet::ShouldResend's first line: "Don't attempt to resubmit
+        ;; if the wallet is configured to not broadcast" (wallet.cpp:2062-2064).
+        (when (and bl:*wallet-broadcast* manager (wallet-manager-has-wallets-p manager))
           (let ((now (bl.ser:get-unix-time)))
             (when (>= (- now *last-resend-check*) +resend-check-interval+)
               (setf *last-resend-check* now)
