@@ -482,7 +482,6 @@
 (-privatebroadcast), but this node does not implement private broadcast: the ~
 transaction would enter the mempool and be announced to every peer from this ~
 node's own address"))))
-;; -whitelistrelay / -whitelistforcerelay (Core net_permissions.h:20-22).
 ;; -dns: whether a name may be handed to the LOCAL resolver (Core fNameLookup,
 ;; DEFAULT_NAME_LOOKUP = true, netbase.h:23,28). Read at net.cpp:406 as
 ;; `fNameLookup && !HaveNameProxy()' for a dial target, and at init.cpp:1722,
@@ -490,6 +489,7 @@ node's own address"))))
 ;; themselves name. It does NOT gate the DNS seeds, which Core queries with a
 ;; hardcoded fAllowLookup (net.cpp:2371) -- that is -dnsseed.
 (define-option "dns" :type :bool :global bl.net:*name-lookup*)
+;; -whitelistrelay / -whitelistforcerelay (Core net_permissions.h:20-22).
 (define-option "whitelistrelay" :type :bool :global bl.net:*whitelist-relay*)
 (define-option "whitelistforcerelay" :type :bool :global bl.net:*whitelist-force-relay*)
 ;; -stopatheight: shut down once the tip reaches this height (Core
