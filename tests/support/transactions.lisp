@@ -2,6 +2,16 @@
 
 ;;;; Synthetic transactions
 
+(defun test-pubkey (i)
+  "The compressed public key for the private key that is I in its last byte.
+Derived rather than listed, because a test that needs many DISTINCT keys --
+a 20-of-20 multisig, a miniscript at the script-size ceiling -- cannot write
+them out, and miniscript refuses a repeated key."
+  (bl.crypto:derive-public-key
+   (let ((v (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+     (setf (aref v 31) i)
+     v)))
+
 (defun make-mempool-test-tx (&key (input-id 1) (input-index 0) (value 50000000))
   "Create a test transaction for mempool tests.
 INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
