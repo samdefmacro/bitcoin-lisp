@@ -843,7 +843,18 @@
   The transaction version and the spent amount are SIGNED
   slots -- that is what the wire format reads back -- while Core streams
   them as raw words, so the BIP 143 and BIP 341 preimages write their bit
-  patterns: a version with bit 31 set is legal and arrives here negative."
+  patterns: a version with bit 31 set is legal and arrives here negative.
+
+  `disassemble-script' is Core's ScriptToAsmStr and produces every `asm'
+  field the node emits. It is Core's rendering, not a pretty-printer of
+  our own: a push of four bytes or fewer is its CScriptNum value in
+  DECIMAL (fRequireMinimal false), OP_0/OP_1NEGATE/OP_1..OP_16 spell
+  0/-1/1..16 because that is what GetOpName returns for them, an unnamed
+  opcode is OP_UNKNOWN, and a push running off the end ends the string
+  with [error]. `:sighash-decode' is fAttemptSighashDecode and belongs to
+  a scriptSig ALONE -- Core passes it from TxToUniv's scriptSig branch
+  and decodepsbt's final_scriptSig, and suppresses it for an unspendable
+  script so OP_RETURN data shaped like a signature is not read as one."
   (bitcoin-lisp.coalton.script package)
   (bitcoin-lisp.coalton.interop package)
   (bitcoin-lisp.coalton.script:script-error-name function)

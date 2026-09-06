@@ -480,8 +480,11 @@ verbosity-3 prevout object (core_io.cpp:478-488)."
               (let ((outpoint (bl.ser:tx-in-previous-output input)))
                 `(("txid" . ,(hash-to-hex (bl.ser:outpoint-hash outpoint)))
                   ("vout" . ,(bl.ser:outpoint-index outpoint))
+                  ;; Core passes fAttemptSighashDecode for a scriptSig and
+                  ;; for nothing else (core_io.cpp:460).
                   ("scriptSig" . (("asm" . ,(bl.val:disassemble-script
-                                             (bl.ser:tx-in-script-sig input)))
+                                             (bl.ser:tx-in-script-sig input)
+                                             :sighash-decode t))
                                   ("hex" . ,(bl.crypto:bytes-to-hex
                                              (bl.ser:tx-in-script-sig input))))))))))
     (when (and prevout (not (bl.ser:coinbase-input-p input)))

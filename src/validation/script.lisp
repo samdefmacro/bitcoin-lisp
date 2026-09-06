@@ -469,18 +469,23 @@ what MemPoolAccept puts in the parenthetical of
 
 (defparameter *opcode-names*
   (let ((table (make-hash-table)))
-    ;; Push values
-    (setf (gethash #x00 table) "OP_0")
+    ;; Push values. OP_0, OP_1NEGATE and OP_1..OP_16 spell their VALUE, not
+    ;; their opcode name: that is what Core's GetOpName returns for them.
+    (setf (gethash #x00 table) "0")
     (setf (gethash #x4c table) "OP_PUSHDATA1")
     (setf (gethash #x4d table) "OP_PUSHDATA2")
     (setf (gethash #x4e table) "OP_PUSHDATA4")
-    (setf (gethash #x4f table) "OP_1NEGATE")
+    (setf (gethash #x4f table) "-1")
+    (setf (gethash #x50 table) "OP_RESERVED")
     (loop for i from #x51 to #x60
-          do (setf (gethash i table) (format nil "OP_~D" (- i #x50))))
+          do (setf (gethash i table) (format nil "~D" (- i #x50))))
     ;; Flow control
     (setf (gethash #x61 table) "OP_NOP")
+    (setf (gethash #x62 table) "OP_VER")
     (setf (gethash #x63 table) "OP_IF")
     (setf (gethash #x64 table) "OP_NOTIF")
+    (setf (gethash #x65 table) "OP_VERIF")
+    (setf (gethash #x66 table) "OP_VERNOTIF")
     (setf (gethash #x67 table) "OP_ELSE")
     (setf (gethash #x68 table) "OP_ENDIF")
     (setf (gethash #x69 table) "OP_VERIFY")
@@ -518,6 +523,8 @@ what MemPoolAccept puts in the parenthetical of
     (setf (gethash #x86 table) "OP_XOR")
     (setf (gethash #x87 table) "OP_EQUAL")
     (setf (gethash #x88 table) "OP_EQUALVERIFY")
+    (setf (gethash #x89 table) "OP_RESERVED1")
+    (setf (gethash #x8a table) "OP_RESERVED2")
     ;; Arithmetic
     (setf (gethash #x8b table) "OP_1ADD")
     (setf (gethash #x8c table) "OP_1SUB")
@@ -570,64 +577,115 @@ what MemPoolAccept puts in the parenthetical of
     (setf (gethash #xb9 table) "OP_NOP10")
     ;; Taproot
     (setf (gethash #xba table) "OP_CHECKSIGADD")
+    (setf (gethash #xff table) "OP_INVALIDOPCODE")
     table)
-  "Mapping from opcode byte to name string.")
+  "Bitcoin Core GetOpName (script/script.cpp:20-160), byte -> name.
 
-(defun disassemble-script (script)
-  "Disassemble a script to human-readable ASM string.
-SCRIPT is a byte vector. Returns a string like 'OP_DUP OP_HASH160 <hex> OP_EQUALVERIFY OP_CHECKSIG'."
+Not every entry is an OP_ name: GetOpName spells OP_0 \"0\", OP_1NEGATE
+\"-1\" and OP_1..OP_16 \"1\"..\"16\", because that is what those opcodes
+PUSH, and Core's own decodescript test corpus asserts those spellings
+(test/functional/rpc_decodescript.py:53,93,166,187,197). A byte with no
+entry is \"OP_UNKNOWN\" -- GetOpName's default, and one that
+rpc_decodescript.json pins for `6aee'.")
+
+(defparameter *sighash-type-names*
+  '((#x01 . "ALL") (#x81 . "ALL|ANYONECANPAY")
+    (#x02 . "NONE") (#x82 . "NONE|ANYONECANPAY")
+    (#x03 . "SINGLE") (#x83 . "SINGLE|ANYONECANPAY"))
+  "Bitcoin Core mapSigHashTypes (core_io.cpp:330-341): the six sighash bytes
+IsDefinedHashtypeSignature accepts, and the name ScriptToAsmStr prints for
+each in brackets after the signature it stripped the byte from.")
+
+(defun %asm-sighash-suffix (push-data)
+  "The `[ALL]'-style suffix ScriptToAsmStr appends to PUSH-DATA when it is a
+signature, or NIL (core_io.cpp:376-390).
+
+Core's gate is CheckSignatureEncoding(vch, SCRIPT_VERIFY_STRICTENC, nullptr),
+which under that one flag is IsValidSignatureEncoding AND
+IsDefinedHashtypeSignature -- strict DER over the bytes WITHOUT the trailing
+hashtype byte, plus that byte being one of the six defined ones. The empty-
+signature arm cannot be reached here: the caller only asks about pushes over
+four bytes long."
+  (let ((len (length push-data)))
+    (when (plusp len)
+      (let ((hashtype (aref push-data (1- len))))
+        (when (and (bl.interop:check-der-signature-format
+                    (subseq push-data 0 (1- len)))
+                   (bl.interop:valid-sighash-type-p hashtype))
+          (let ((name (cdr (assoc hashtype *sighash-type-names*))))
+            (when name (format nil "[~A]" name))))))))
+
+(defun %asm-push-token (data sighash-decode unspendable)
+  "How ScriptToAsmStr renders one data push (core_io.cpp:370-395).
+
+A push of four bytes or fewer is its CScriptNum value in DECIMAL -- with
+fRequireMinimal false, so a non-minimal push still renders as its value, and
+an empty push (OP_0 reaches this arm) as 0. A longer push is hex, and only
+there does the scriptSig sighash decode apply; Core suppresses it for an
+UNSPENDABLE script so OP_RETURN data that happens to look like a signature is
+not decoded as one."
+  (cond
+    ((<= (length data) 4)
+     (format nil "~D" (bl.interop:script-number-to-int data)))
+    ((and sighash-decode (not unspendable))
+     (let ((suffix (%asm-sighash-suffix data)))
+       (if suffix
+           (concatenate 'string
+                        (bl.crypto:bytes-to-hex (subseq data 0 (1- (length data))))
+                        suffix)
+           (bl.crypto:bytes-to-hex data))))
+    (t (bl.crypto:bytes-to-hex data))))
+
+(defun disassemble-script (script &key sighash-decode)
+  "Bitcoin Core ScriptToAsmStr (core_io.cpp:357-401): SCRIPT's assembly
+string, tokens separated by single spaces.
+
+SIGHASH-DECODE is Core's fAttemptSighashDecode. Pass it only for a
+scriptSig, which is the one place Core passes it (TxToUniv's
+`ScriptToAsmStr(txin.scriptSig, true)', core_io.cpp:460, and decodepsbt's
+final_scriptSig); a scriptPubKey renders without it, or an OP_RETURN payload
+shaped like a signature would be printed as one.
+
+A push that runs off the end of the script (Core's GetOp returning false)
+ends the string with `[error]', exactly as Core does -- the tokens before it
+are kept."
   (when (zerop (length script))
     (return-from disassemble-script ""))
   (let ((parts '())
         (pos 0)
-        (len (length script)))
-    (loop while (< pos len)
-          do (let ((opcode (aref script pos)))
-               (incf pos)
-               (cond
-                 ;; Direct push (1-75 bytes)
-                 ((<= 1 opcode 75)
-                  (if (<= (+ pos opcode) len)
-                      (let ((data (subseq script pos (+ pos opcode))))
-                        (push (bl.crypto:bytes-to-hex data) parts)
-                        (incf pos opcode))
-                      (progn (push "[error]" parts) (setf pos len))))
-                 ;; OP_PUSHDATA1
-                 ((= opcode #x4c)
-                  (when (< pos len)
-                    (let ((n (aref script pos)))
-                      (incf pos)
-                      (if (<= (+ pos n) len)
-                          (let ((data (subseq script pos (+ pos n))))
-                            (push (bl.crypto:bytes-to-hex data) parts)
-                            (incf pos n))
-                          (progn (push "[error]" parts) (setf pos len))))))
-                 ;; OP_PUSHDATA2
-                 ((= opcode #x4d)
-                  (when (<= (+ pos 2) len)
-                    (let ((n (+ (aref script pos) (ash (aref script (1+ pos)) 8))))
-                      (incf pos 2)
-                      (if (<= (+ pos n) len)
-                          (let ((data (subseq script pos (+ pos n))))
-                            (push (bl.crypto:bytes-to-hex data) parts)
-                            (incf pos n))
-                          (progn (push "[error]" parts) (setf pos len))))))
-                 ;; OP_PUSHDATA4
-                 ((= opcode #x4e)
-                  (when (<= (+ pos 4) len)
-                    (let ((n (+ (aref script pos)
-                                (ash (aref script (+ pos 1)) 8)
-                                (ash (aref script (+ pos 2)) 16)
-                                (ash (aref script (+ pos 3)) 24))))
-                      (incf pos 4)
-                      (if (<= (+ pos n) len)
-                          (let ((data (subseq script pos (+ pos n))))
-                            (push (bl.crypto:bytes-to-hex data) parts)
-                            (incf pos n))
-                          (progn (push "[error]" parts) (setf pos len))))))
-                 ;; Named opcode
-                 (t
-                  (let ((name (gethash opcode *opcode-names*)))
-                    (push (or name (format nil "OP_UNKNOWN[~2,'0x]" opcode)) parts))))))
+        (len (length script))
+        (unspendable (bl.store:script-unspendable-p script)))
+    (labels ((fail ()
+               (push "[error]" parts)
+               (setf pos len))
+             (push-data (n)
+               ;; Core: `if (end - pc < 0 || (unsigned)(end - pc) < nSize) return false'.
+               (if (<= (+ pos n) len)
+                   (progn
+                     (push (%asm-push-token (subseq script pos (+ pos n))
+                                            sighash-decode unspendable)
+                           parts)
+                     (incf pos n))
+                   (fail)))
+             (read-le (n)
+               ;; The push length that follows OP_PUSHDATA1/2/4, or NIL when
+               ;; the script is too short to hold it (Core's GetOp fails).
+               (when (<= (+ pos n) len)
+                 (let ((v 0))
+                   (dotimes (k n) (setf v (logior v (ash (aref script (+ pos k)) (* 8 k)))))
+                   (incf pos n)
+                   v))))
+      (loop while (< pos len)
+            do (let ((opcode (aref script pos)))
+                 (incf pos)
+                 (cond
+                   ;; Direct push of OPCODE bytes; OP_0 is the empty one.
+                   ((<= opcode 75) (push-data opcode))
+                   ((<= #x4c opcode #x4e)
+                    (let ((n (read-le (ecase opcode (#x4c 1) (#x4d 2) (#x4e 4)))))
+                      (if n (push-data n) (fail))))
+                   (t
+                    (push (or (gethash opcode *opcode-names*) "OP_UNKNOWN")
+                          parts))))))
     (format nil "~{~A~^ ~}" (nreverse parts))))
 
