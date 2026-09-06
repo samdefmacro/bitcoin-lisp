@@ -7221,7 +7221,7 @@ either half still spends."
                           (list (list (cons "txid" (bl.rpc:hash-to-hex prev-txid))
                                       (cons "vout" 0)
                                       (cons "scriptPubKey" (bl.crypto:bytes-to-hex spk))
-                                      (cons "amount" (bl.rpc:satoshi->btc amount))
+                                      (cons "amount" (/ amount 1d8))
                                       (cons "witnessScript"
                                             (bl.crypto:bytes-to-hex witscript)))))))
            (errors (cdr (assoc "errors" result :test #'string=)))

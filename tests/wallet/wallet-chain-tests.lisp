@@ -420,12 +420,12 @@ these two is that they refuse a proof that does not hold up."
         (let* ((cb (bl.rpc:hash-to-hex (%wc-coinbase-txid node b1)))
                (rawtx (aval "hex" (rpc "w" "gettransaction" cb)))
                (proof (rpc nil "gettxoutproof" (list cb) b1))
-               (balance (rpc "w" "getbalance")))
+               (balance (btc-amount (rpc "w" "getbalance"))))
           (is (plusp balance))
           (is (= 101 (aval "confirmations" (rpc "w" "gettransaction" cb))))
           ;; --- removeprunedfunds ---
           (is (null (rpc "w" "removeprunedfunds" cb)))
-          (is (zerop (rpc "w" "getbalance")))
+          (is (zerop (btc-amount (rpc "w" "getbalance"))))
           (is (zerop (length (remove-if-not
                               (lambda (tx) (equal cb (aval "txid" tx)))
                               (rpc "w" "listtransactions")))))
@@ -449,7 +449,7 @@ these two is that they refuse a proof that does not hold up."
             (is (= 101 (aval "confirmations" gettx)))
             (is (equal b1 (aval "blockhash" gettx)))
             (is (= 0 (aval "blockindex" gettx))))
-          (is (= balance (rpc "w" "getbalance")))
+          (is (= balance (btc-amount (rpc "w" "getbalance"))))
           ;; And the re-import reached the file too.
           (rpc nil "unloadwallet" "w")
           (rpc nil "loadwallet" "w")

@@ -401,11 +401,14 @@ eval_form() {
 # The designator is spliced into the form, so a symbol-named suite given
 # bare (`ibd-tests`, `pkg::ibd-tests`) would be EVALUATED as a variable and
 # the runner would report a backtrace that reads as a red suite.  Quote it
-# unless it is already a keyword or already quoted.
+# unless it is already a keyword or already quoted; a bare name with no
+# package is read in the tests package, since a symbol read in CL-USER names
+# no suite there either.
 suite_designator() {
   case "$1" in
     :*|\'*) printf '%s' "$1" ;;
-    *) printf "'%s" "$1" ;;
+    *:*) printf "'%s" "$1" ;;
+    *) printf "'bitcoin-lisp.tests::%s" "$1" ;;
   esac
 }
 

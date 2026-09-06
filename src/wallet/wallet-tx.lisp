@@ -2333,10 +2333,7 @@ mined."
 wallet/rpc/backup.cpp:93-126). PARAMS: (txid). The companion to
 importprunedfunds; it affects wallet balances."
   (let ((wallet (wallet-for-request node))
-        ;; Core's ParseHashV. %WALLET-PARSE-TXID is this file's existing
-        ;; spelling of it and its -8 message is the tree's, not Core's two;
-        ;; the RPC-wide parse-hash-v conversion owns that difference.
-        (txid (%wallet-parse-txid (first params))))
+        (txid (bl.rpc:parse-hash-v (first params) "txid")))
     (with-wallet-lock (wallet)
       (multiple-value-bind (ok message)
           (wallet-remove-txs wallet (list txid))
