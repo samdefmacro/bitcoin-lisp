@@ -796,11 +796,10 @@ otherwise S is decoded as a raw transaction (Bitcoin Core generateblock)."
           (error 'rpc-error :code +rpc-invalid-address-or-key+
                             :message (format nil "Transaction ~A not in mempool." s)))
         (bl.mp:mempool-entry-transaction entry))
-      (handler-case
-          (bl.ser:parse-tx-payload (bl.crypto:hex-to-bytes s))
-        (error ()
-          (error 'rpc-error :code +rpc-deserialization-error+
-                            :message (format nil "Transaction decode failed for ~A" s))))))
+      (decode-hex-tx-or-error
+       s (format nil "Transaction decode failed for ~A. Make sure the tx has ~
+at least one input."
+                 (if (stringp s) s "")))))
 
 (defun %witness-commitment-script-for-txs (txs)
   "BIP141 witness-commitment scriptPubKey over a block whose coinbase wtxid is

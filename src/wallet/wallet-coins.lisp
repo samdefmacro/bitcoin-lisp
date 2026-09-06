@@ -1315,15 +1315,8 @@ which yields the same balance_change without touching the chain UTXO set."
             (new-utxos (make-hash-table :test 'equalp))  ; outpoint-key -> value
             (spent (make-hash-table :test 'equalp)))
         (dolist (raw rawtxs)
-          (unless (stringp raw)
-            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
-                              :message "Transaction hex string decoding failure."))
-          (let ((tx (handler-case
-                        (bl.ser:parse-tx-payload
-                         (bl.crypto:hex-to-bytes raw))
-                      (error ()
-                        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-deserialization-error+
-                                          :message "Transaction hex string decoding failure.")))))
+          (let ((tx (bl.rpc:decode-hex-tx-or-error
+                     raw "Transaction hex string decoding failure.")))
             ;; Debit: these inputs are spent when the tx is broadcast.
             (bl.ser:dovector
                 (input (bl.ser:transaction-inputs tx))

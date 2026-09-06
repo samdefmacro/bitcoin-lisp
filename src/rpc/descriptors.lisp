@@ -2256,39 +2256,6 @@ version as its own bech32m, which is what decodescript reports for them
                                         (getf data :witness-version)
                                         (getf data :witness-program))))))
 
-(defun script-to-json (script &key (include-hex t) network)
-  "Core ScriptToUniv (core_io.cpp:409-428): one script as the object every
-scriptPubKey field in the RPC and REST surfaces carries, in Core's key order
--- asm, desc, hex, address, type.
-
-NETWORK is Core's include_address: with it the object also carries the
-inferred descriptor and, when the script has a well-defined destination, the
-address. INCLUDE-HEX is Core's include_hex, whose default is likewise true;
-decodescript is the one caller that passes false, because the caller supplied
-the hex.
-
-DIVERGENCE: the `desc' is SCRIPTPUBKEY-DESC, which has no signing provider,
-so a script Core could infer a richer descriptor for (a P2WSH whose inner
-script the provider knows) reads as addr()/raw() here."
-  (let ((type (bl.val:classify-script script))
-        (addr (and network (script->address script network))))
-    `(("asm" . ,(bl.val:disassemble-script script))
-      ,@(when network `(("desc" . ,(scriptpubkey-desc script network))))
-      ,@(when include-hex `(("hex" . ,(bl.crypto:bytes-to-hex script))))
-      ,@(when addr `(("address" . ,addr)))
-      ("type" . ,(bl.val:script-type-to-string type)))))
-
-(defun scriptpubkey-desc (script network)
-  "Core InferDescriptor for a bare scriptPubKey (no key material available): an
-addressable script infers to addr(<address>), anything else to raw(<hex>), each
-with the appended descriptor checksum. This is the `desc` field on decoded
-outputs (gettxout, decoderawtransaction, getblock verbosity 2, decodescript)."
-  (let ((addr (script->address script network)))
-    (descriptor-add-checksum
-     (if addr
-         (format nil "addr(~A)" addr)
-         (format nil "raw(~A)" (bl.crypto:bytes-to-hex script))))))
-
 ;;; --- Descriptor RPCs (getdescriptorinfo / deriveaddresses) ---
 
 (define-rpc "getdescriptorinfo" (node (desc-str))

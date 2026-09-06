@@ -52,6 +52,7 @@ can. src/validation/.")
    #:classify-script
    #:script-type-to-string
    #:script-type-name
+   #:is-coinbase-tx
    ;; Block validation
    #:validate-block-header
    #:validate-block
