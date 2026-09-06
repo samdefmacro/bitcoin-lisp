@@ -328,6 +328,28 @@ MSG_TX and MSG_WITNESS_TX carry a txid, MSG_WTX (BIP339) a wtxid."
       (= inv-type bl.ser:+inv-type-witness-tx+)
       (= inv-type bl.ser:+inv-type-wtx+)))
 
+(defun %peer-inv-hash (peer txid wtxid)
+  "The id PEER's transaction inventory uses: the wtxid once it negotiated
+wtxidrelay, the txid otherwise (Core's `peer.m_wtxid_relay ? wtxid : txid`,
+net_processing.cpp:4491-4492). Falls back to the txid when no wtxid is known.
+
+This is also the key of PEER-ANNOUNCED-TXS at EVERY site. Core says so in a
+comment at net_processing.cpp:6060-6063 -- the filter \"contains either txids
+or wtxids depending on whether our peer supports wtxid-relay\", so a reader
+constructs the inv (or this hash) first and looks the filter up by it. A site
+that keys it by txid while the peer announces wtxids writes into a filter
+nobody reads."
+  (if (and (peer-wtxid-relay peer) wtxid) wtxid txid))
+
+(defun %peer-tx-inv (peer txid wtxid)
+  "The inv entry announcing this transaction to PEER: MSG_WTX carrying the
+wtxid for a wtxidrelay peer, MSG_TX carrying the txid otherwise (BIP339, Core
+net_processing.cpp:6064-6066). Its hash is %PEER-INV-HASH."
+  (let ((wtxp (and (peer-wtxid-relay peer) wtxid t)))
+    (bl.ser:make-inv-vector
+     :type (if wtxp bl.ser:+inv-type-wtx+ bl.ser:+inv-type-tx+)
+     :hash (%peer-inv-hash peer txid wtxid))))
+
 ;;; --- Tx-request tracking (Core TxRequestTracker, simplified) ---
 ;;;
 ;;; handle-inv used to fire a getdata to the announcing peer with no in-flight
@@ -1135,6 +1157,16 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
              (unless (if (peer-wtxid-relay peer)
                          (= inv-type bl.ser:+inv-type-tx+)
                          wtxidp)
+               ;; The peer knows this transaction: it just told us about it.
+               ;; Core AddKnownTx(peer, inv.hash), net_processing.cpp:4174 --
+               ;; placed OUTSIDE the IBD branch below on purpose, so a peer
+               ;; that announced during IBD is still not told about the
+               ;; transaction once we leave it. The mismatch test above has
+               ;; already established that INV-TYPE matches the peer's
+               ;; negotiation, so HASH is the id this peer's filter is keyed
+               ;; by. Without this we announce every transaction we accept
+               ;; straight back to the peers that announced it to us.
+               (bl:add-recent-reject (peer-announced-txs peer) hash)
                (when (and mempool
                           ;; Core requests announced txs only outside IBD —
                           ;; their inputs won't resolve against a stale UTXO
@@ -2175,6 +2207,15 @@ left GetCandidatePeers nothing to find."
          (wtxid (bl.ser:transaction-wtxid tx))
          (parents (%orphan-missing-parents tx mempool utxo-set recent-rejects))
          (num-wtxid-peers (count-wtxid-relay-peers peers)))
+    ;; The delivering peer knows the parents: it just sent us a child that
+    ;; spends them, so announcing them back to it is wasted egress (Core
+    ;; ProcessInvalidTx, net_processing.cpp:3141-3143, over exactly this
+    ;; already-filtered unique_parents list). Always by TXID on both sides --
+    ;; an orphan's parents are known only by txid, which is why Core writes
+    ;; parent_txid.ToUint256() into a filter that is otherwise wtxid-keyed for
+    ;; a wtxidrelay peer.
+    (dolist (ptxid parents)
+      (bl:add-recent-reject (peer-announced-txs peer) ptxid))
     (dolist (candidate (%orphan-resolution-candidates peer txid wtxid))
       (%add-orphan-resolution-candidate candidate tx parents mempool
                                         num-wtxid-peers))
@@ -2255,8 +2296,13 @@ CTX's recent-rejects, when present, caches recently rejected txs."
               (tx-request-received-response peer txid)
               (unless (equalp wtxid txid)
                 (tx-request-received-response peer wtxid))
-              ;; Mark as announced by this peer (bounded set)
-              (bl:add-recent-reject (peer-announced-txs peer) txid)
+              ;; The peer knows this transaction: it just sent it to us.
+              ;; Core AddKnownTx(peer, peer.m_wtxid_relay ? wtxid : txid),
+              ;; net_processing.cpp:4491-4492 -- the filter is keyed by the
+              ;; id THIS peer's inventory uses, which is what the relay path
+              ;; looks up.
+              (bl:add-recent-reject (peer-announced-txs peer)
+                                    (%peer-inv-hash peer txid wtxid))
               ;; Check recent rejects and recently-confirmed before expensive
               ;; validation (Core's AlreadyHaveTx at tx receipt). The rejects
               ;; filter is wtxid-keyed (Core m_lazy_recent_rejects); txid
@@ -3303,9 +3349,13 @@ reach here anyway — their senders are disconnected)."
                  ;; under `if (tx_relay != nullptr)`, and announcing to them
                  ;; gets us disconnected).
                  (peer-tx-relay-p peer)
-                 ;; Skip if already announced to this peer (Core checks the
-                 ;; known-filter at queue time too, PushTxInventory).
-                 (not (bl:recent-reject-p (peer-announced-txs peer) txid)))
+                 ;; Skip a transaction this peer already knows: one we have
+                 ;; announced to it, or one it announced or sent to US (Core
+                 ;; InitiateTxBroadcastToAll's known-filter test,
+                 ;; net_processing.cpp:2261-2263, over the same
+                 ;; `m_wtxid_relay ? wtxid : txid` key).
+                 (not (bl:recent-reject-p (peer-announced-txs peer)
+                                          (%peer-inv-hash peer txid wtxid))))
         ;; BIP-330: a peer we reconcile with gets the transaction held back in
         ;; its reconciliation set rather than announced — unless this
         ;; transaction is one of the few chosen for immediate fanout, which is
@@ -3450,24 +3500,24 @@ BIP339: wtxidrelay peers get MSG_WTX + wtxid, others MSG_TX + txid
                      (< count +inv-broadcast-target+))
           do (destructuring-bind (txid wtxid fee-rate-per-kb)
                  (pop (peer-tx-inv-queue peer))
-               (when (and (not (bl:recent-reject-p
-                                (peer-announced-txs peer) txid))
-                          ;; Evicted/confirmed since queueing => nothing to announce.
-                          (or (null mempool)
-                              (bl.mp:mempool-has mempool txid))
-                          ;; BIP 133 feefilter, evaluated at flush time.
-                          (or (zerop (peer-feefilter-rate peer))
-                              (>= fee-rate-per-kb (peer-feefilter-rate peer))))
-                 (bl:add-recent-reject (peer-announced-txs peer) txid)
-                 (incf count)
-                 (push (if (and (peer-wtxid-relay peer) wtxid)
-                           (bl.ser:make-inv-vector
-                            :type bl.ser:+inv-type-wtx+
-                            :hash wtxid)
-                           (bl.ser:make-inv-vector
-                            :type bl.ser:+inv-type-tx+
-                            :hash txid))
-                       invs))))
+               ;; Core builds the inv FIRST and uses ITS hash for both the
+               ;; filter check and the filter insert (net_processing.cpp:
+               ;; 6060-6083): the filter holds whichever id this peer's
+               ;; inventory uses, so a txid lookup on a wtxidrelay peer reads
+               ;; a filter nothing ever wrote.
+               (let* ((inv (%peer-tx-inv peer txid wtxid))
+                      (known (bl.ser:inv-vector-hash inv)))
+                 (when (and (not (bl:recent-reject-p
+                                  (peer-announced-txs peer) known))
+                            ;; Evicted/confirmed since queueing => nothing to announce.
+                            (or (null mempool)
+                                (bl.mp:mempool-has mempool txid))
+                            ;; BIP 133 feefilter, evaluated at flush time.
+                            (or (zerop (peer-feefilter-rate peer))
+                                (>= fee-rate-per-kb (peer-feefilter-rate peer))))
+                   (bl:add-recent-reject (peer-announced-txs peer) known)
+                   (incf count)
+                   (push inv invs)))))
     (when invs
       ;; A dead socket raises from the write; the drain/health passes own
       ;; disconnecting — just stop announcing to it this round.
@@ -3513,18 +3563,16 @@ that connected mid-flush would see it."
            (when (or (zerop (peer-feefilter-rate peer))
                      (>= fee-rate-per-kb (peer-feefilter-rate peer)))
              (incf count)
-             ;; Mark it announced, so the anti-probing gate in
-             ;; FindTxForGetData lets the peer fetch what we just offered.
-             (bl:add-recent-reject (peer-announced-txs peer) txid)
-             (let ((wtxid (bl.mp:mempool-entry-wtxid entry)))
-               (push (if (and (peer-wtxid-relay peer) wtxid)
-                         (bl.ser:make-inv-vector
-                          :type bl.ser:+inv-type-wtx+
-                          :hash wtxid)
-                         (bl.ser:make-inv-vector
-                          :type bl.ser:+inv-type-tx+
-                          :hash txid))
-                     invs)))))))
+             ;; Mark it known to the peer, under the id its inventory uses, so
+             ;; the ordinary relay path does not announce it a second time
+             ;; (Core inserts inv.hash on this same dump path,
+             ;; net_processing.cpp:6019). The getdata anti-probing gate is
+             ;; PEER-LAST-INV-SEQUENCE, snapshotted below, not this filter.
+             (let ((inv (%peer-tx-inv peer txid
+                                      (bl.mp:mempool-entry-wtxid entry))))
+               (bl:add-recent-reject (peer-announced-txs peer)
+                                     (bl.ser:inv-vector-hash inv))
+               (push inv invs)))))))
     (when invs
       (handler-case
           (send-message peer (bl.ser:make-inv-message

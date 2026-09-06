@@ -578,24 +578,17 @@ with the filter empty, which IS requested."
          (blocked (make-array 32 :element-type '(unsigned-byte 8)
                                  :initial-element 51))
          (fresh (make-array 32 :element-type '(unsigned-byte 8)
-                               :initial-element 52))
-         (inv-payload
-           (lambda (hash)
-             (subseq (bl.ser:make-inv-message
-                      (list (bl.ser:make-inv-vector
-                             :type bl.ser:+inv-type-wtx+
-                             :hash hash)))
-                     24))))
+                               :initial-element 52)))
     (%with-fresh-rejects (rejects)
       (bl.val:add-reconsiderable-reject blocked)
       (ignore-errors
-       (deliver-inv announcer (funcall inv-payload blocked) (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects)))
+       (deliver-inv announcer (tx-inv-payload bl.ser:+inv-type-wtx+ blocked) (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects)))
       ;; Nothing recorded: a probe from another peer still wants it.
       (is-true (bl.net:tx-request-wanted-p blocked probe t))
       (bl.net:reset-tx-requests)
       ;; Control: an unknown wtxid from the same announcer IS requested.
       (ignore-errors
-       (deliver-inv announcer (funcall inv-payload fresh) (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects)))
+       (deliver-inv announcer (tx-inv-payload bl.ser:+inv-type-wtx+ fresh) (bl.ctx:make-node-context :chain-state state :mempool mempool :recent-rejects rejects)))
       (is-false (bl.net:tx-request-wanted-p fresh probe t)))))
 
 ;;;; Tx-request tracking across a delivery: ReceivedResponse vs ForgetTxHash
@@ -785,11 +778,7 @@ waiting out the 60s expiry with no alternative."
            (child-id (bl.ser:transaction-hash child))
            (a (%pr-peer))
            (b (%pr-peer))
-           (inv (subseq (bl.ser:make-inv-message
-                         (list (bl.ser:make-inv-vector
-                                :type bl.ser:+inv-type-witness-tx+
-                                :hash child-id)))
-                        24)))
+           (inv (tx-inv-payload bl.ser:+inv-type-witness-tx+ child-id)))
       (%with-fresh-rejects (rejects)
         (let ((ctx (%pr-ctx state utxo mempool rejects)))
           ;; B announces the child before A delivers it -- exactly the live
@@ -839,6 +828,37 @@ one redundant full-transaction download per such parent."
           (is-true (bl.mp:orphan-tx pool child-id))
           (is (null (bl.net:tx-request-candidate-peers parent-id)))
           (is (null (tx-request-in-flight-peer parent-id))))))))
+
+(test orphan-intake-marks-its-parents-known-to-the-delivering-peer
+  "Core ProcessInvalidTx AddKnownTx's every unique parent of a rejected orphan
+to the peer that delivered it (net_processing.cpp:3141-3143, over exactly the
+already-filtered parent list): that peer has just told us about a child
+spending them, so announcing them back to it is wasted egress. Always by
+TXID on both sides -- an orphan's parents are known only by txid."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (declare (ignore funding))
+    (let* ((unknown (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element 61))
+           (parent (%pr-tx (list (cons unknown 0)) (- 100000000 50000)))
+           (parent-id (bl.ser:transaction-hash parent))
+           (child (%pr-tx (list (cons parent-id 0)) (- 100000000 100000)))
+           (a (%pr-peer))
+           (b (%pr-peer)))
+      (%with-fresh-rejects (rejects)
+        (let ((ctx (%pr-ctx state utxo mempool rejects)))
+          (deliver-tx a (%pr-payload child) ctx)
+          (is-true (%pr-orphan-p mempool child)
+                   "the child is held as an orphan, which is the branch under test")
+          (is-true (bl:recent-reject-p (bl.net:peer-announced-txs a) parent-id)
+                   "its parent is marked known to the peer that sent the child")
+          (is-false (bl:recent-reject-p (bl.net:peer-announced-txs b) parent-id)
+                    "and to nobody else")
+          ;; Which is what stops the parent being announced back to A when we
+          ;; do accept it.
+          (with-network (:regtest)
+            (bl.net:relay-transaction parent-id nil (list a b) :fee-rate 2))
+          (is (null (bl.net:peer-tx-inv-queue a)))
+          (is (= 1 (length (bl.net:peer-tx-inv-queue b)))))))))
 
 (test the-scheduler-drops-a-request-for-a-transaction-we-already-have
   "Core re-runs AlreadyHaveTx on every requestable announcement immediately

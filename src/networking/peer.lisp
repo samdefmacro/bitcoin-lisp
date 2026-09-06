@@ -118,10 +118,16 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; the remainder instead would make the peer wait out its own request
   ;; timeout for a block we had already read off disk.
   (getdata-queue '() :type list)
-  ;; Bounded set of txids announced to this peer. Was an unbounded hash-table --
-  ;; a per-peer memory leak on long-lived relay connections. Core bounds the
-  ;; equivalent m_tx_inventory_known_filter at CRollingBloomFilter{50000}; we use
-  ;; the same hash+FIFO-ring bounded set as the recent-rejects filter.
+  ;; Bounded set of transactions this peer already knows about: everything we
+  ;; have announced to it AND everything it has announced or sent to us (Core
+  ;; m_tx_inventory_known_filter, written by AddKnownTx). Keyed by the id this
+  ;; peer PREFERS -- wtxid once it negotiated wtxidrelay, txid otherwise, which
+  ;; is the id its own invs carry -- so every reader must build the inv first
+  ;; and look the filter up by that hash (net_processing.cpp:4491-4492,
+  ;; :6060-6069). Was an unbounded hash-table -- a per-peer memory leak on
+  ;; long-lived relay connections. Core bounds the equivalent at
+  ;; CRollingBloomFilter{50000}; we use the same hash+FIFO-ring bounded set as
+  ;; the recent-rejects filter.
   (announced-txs (bl:make-rejects-filter 50000)
                  :type bl:recent-rejects)
   ;; Bounded set of addresses (ip||port keys) this peer already knows -- either

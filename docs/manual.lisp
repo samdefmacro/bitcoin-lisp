@@ -714,6 +714,17 @@
   (ReceivedResponse), which is what stops an unsolicited witness-malleated
   twin from releasing every honest announcer of a txid.
 
+  What we announce BACK is the mirror of that. A peer's known-tx filter
+  (Core m_tx_inventory_known_filter) records every transaction it has told
+  us about as well as every one we have told it about -- the inv, the tx
+  message, and each parent of an orphan it delivered -- and it is keyed by
+  the id THAT peer's inventory uses, wtxid once it negotiated wtxidrelay and
+  txid otherwise, so a reader builds the inv first and looks the filter up by
+  its hash; a site that writes a txid into a filter the relay path reads by
+  wtxid is writing where nobody looks. The inv write sits OUTSIDE the IBD
+  gate on purpose, so a peer that announced while we were still syncing is
+  not told about the transaction afterwards.
+
   Erlay's reconciliation sets are the one thing here with no Core to check
   against (Core ships the sendtxrcncl handshake and nothing else; BIP-330 is
   the specification), and their invariant is that a SUCCESSFUL round retires
