@@ -225,19 +225,32 @@
   ```")
 
 (defsection @logging (:title "logging: categories, levels, rate limit")
-  "Core: `logging.cpp`, `logging/timer.h`. Category logging as Core has
-  it (`-debug=net`, `-loglevel=net:trace`), a per-location rate limiter,
-  and `-alertnotify`-style notify commands.
+  "Core: `logging.cpp`, `logging/timer.h`, `node/warnings.cpp`. Category
+  logging as Core has it (`-debug=net`, `-loglevel=net:trace`), a
+  per-location rate limiter, the `-*notify` shell hooks, and the node's
+  WARNINGS map -- which lives here, below every producer, because
+  validation raises warnings and knows nothing about a node.
 
   Invariants: `node-log` is the one sink; the `log-*` macros expand to it
   so a disabled level costs nothing. Nothing is ever written to stderr by
   the running node -- Core's functional framework reads a node's stderr
-  back at every stop and requires it empty.
+  back at every stop and requires it empty. `set-warning` and
+  `unset-warning` return whether the state CHANGED, and that return value
+  is the mechanism, not a convenience: `set-kernel-warning` fires
+  `-alertnotify` only on a change, so the pager rings once per transition
+  rather than once per block. `warnings-for-rpc` is the whole `warnings`
+  field of getblockchaininfo, getnetworkinfo and getmininginfo; only the
+  KERNEL warnings reach the pager, as in Core. `alert-notify` sanitizes
+  the message and THEN wraps it in single quotes, which is what makes the
+  quoting safe -- the safe character set holds no quote.
 
-  Trap: option parsing runs BEFORE debug.log exists. A line logged there
+  Traps: option parsing runs BEFORE debug.log exists. A line logged there
   goes to the console only and is invisible to any test that asserts on
   the log; use `defer-log`, and `flush-deferred-log-lines` replays the
-  lines once the file is open."
+  lines once the file is open. The startup scroll of debug.log is
+  `-shrinkdebugfile`, whose DEFAULT Core derives from another option --
+  false as soon as any `-debug` category is set -- so `start-file-logging`
+  takes it as an argument and `%init-logging` computes it."
   (bitcoin-lisp.logging package)
   (bitcoin-lisp.logging:log-info macro)
   (bitcoin-lisp.logging:log-warn macro)
@@ -250,7 +263,15 @@
   (bitcoin-lisp.logging:enable-log-category function)
   (bitcoin-lisp.logging:log-category-enabled-p function)
   (bitcoin-lisp.logging:*log-rate-limit* variable)
-  (bitcoin-lisp.logging:run-notify-command function))
+  (bitcoin-lisp.logging:run-notify-command function)
+  (bitcoin-lisp.logging:default-shrink-debug-file-p function)
+  (bitcoin-lisp.logging:set-warning function)
+  (bitcoin-lisp.logging:unset-warning function)
+  (bitcoin-lisp.logging:set-kernel-warning function)
+  (bitcoin-lisp.logging:warnings-for-rpc function)
+  (bitcoin-lisp.logging:reset-warnings function)
+  (bitcoin-lisp.logging:*alert-notify-command* variable)
+  (bitcoin-lisp.logging:*client-version-is-release* variable))
 
 (defsection @config (:title "config: the option registry and the parsers")
   "Core: `common/args.cpp` (ArgsManager), `common/config.cpp`,
@@ -566,6 +587,14 @@
   answered, and CONNECT-PEER passes it through so the addrman recorder
   can charge the address nothing for an outage of ours.
 
+  A name is handed to the LOCAL resolver only when `-dns` allows it:
+  `*name-lookup*` is Core's fNameLookup and DIAL-NAME-REFUSAL states its
+  whole condition, `fNameLookup && !HaveNameProxy()`, over the string a
+  dial is about to resolve. With a proxy the target travels inside the
+  SOCKS5 CONNECT and only the proxy's own host can reach the resolver. It
+  does NOT gate the DNS seeds; those are `-dnsseed`, which Core queries
+  with a hardcoded fAllowLookup.
+
   Trap: a test that drives two real connections without a pump hangs
   until its timeout, because nothing ever sends; drain the send queue."
   (bitcoin-lisp.networking package)
@@ -580,6 +609,7 @@
   (bitcoin-lisp.networking:accept-connection function)
   (bitcoin-lisp.networking:*proxy* variable)
   (bitcoin-lisp.networking:*onion-proxy* variable)
+  (bitcoin-lisp.networking:*name-lookup* variable)
   (bitcoin-lisp.networking:socks5-connect function)
   (bitcoin-lisp.networking:socks5-error condition)
   (bitcoin-lisp.networking:*v2-transport-enabled* variable)
@@ -943,7 +973,13 @@
   AddCoin drops (provably unspendable) is never staged and a same-block
   spend of one fails as a MISSING INPUT rather than in the script engine.
   Long loops poll `interrupt-requested-p`
-  between blocks so shutdown and the assumeutxo pause can cut in. VERIFY-DB
+  between blocks so shutdown and the assumeutxo pause can cut in. A chain
+  found INVALID that carries more than six blocks' worth of work beyond
+  our tip raises Core's LARGE_WORK_INVALID_CHAIN warning
+  (`%check-fork-warning-conditions`, re-evaluated after every activation
+  step so it is lowered again when our own chain catches up); that is what
+  the `warnings` RPC field and `-alertnotify` report, and it is why
+  %MARK-BLOCK-SUBTREE-INVALID is the ONE place a block is marked invalid. VERIFY-DB
   is Core's CVerifyDB over the last `-checkblocks` blocks at `-checklevel`
   (defaults 6 and 3, the level clamped to 0-4): it runs at startup over
   every chainstate whose coins view names a block, and a
@@ -1001,6 +1037,7 @@
   (bitcoin-lisp.validation:validate-block-header function)
   (bitcoin-lisp.validation:validate-block function)
   (bitcoin-lisp.validation:accept-block-body function)
+  (bitcoin-lisp.validation:reset-fork-warning-state function)
   (bitcoin-lisp.validation:verify-db function)
   (bitcoin-lisp.validation:test-block-validity function)
   (bitcoin-lisp.validation:connect-block function)
@@ -1187,7 +1224,14 @@
   of the database itself answers Core's `DatabaseStatus` pair -- the cheap
   format probe (`wallet-db-format-recognized-p`, Core's `IsSQLiteFile`)
   gives -18, anything past it gives -4, and a storage condition never
-  reaches a client as an internal error.
+  reaches a client as an internal error. The
+  options Core reads once into a wallet field are process specials here
+  (`-addresstype`, `-changetype`, `-avoidpartialspends`): Core stores them
+  per wallet but only ever writes them from the node's own arguments, so
+  every wallet in a process holds the same value.
+  `-avoidpartialspends` is the INITFORM of the coin control's slot, as it
+  is Core's CCoinControl constructor, so the two writers that remain --
+  the avoid_reuse argument and the -maxapsfee retry -- can only raise it.
 
   Traps: a locked wallet could once still sign because a parsed
   descriptor kept its embedded xprv; the key-provider is the only source
@@ -1206,6 +1250,10 @@
   (bitcoin-lisp.wallet:wallets-block-disconnected function)
   (bitcoin-lisp.wallet:wallets-mempool-tx-added function)
   (bitcoin-lisp.wallet:wallets-maybe-resend function)
+  (bitcoin-lisp.wallet:set-wallet-default-output-type function)
+  (bitcoin-lisp.wallet:*wallet-default-address-type* variable)
+  (bitcoin-lisp.wallet:*wallet-default-change-type* variable)
+  (bitcoin-lisp.wallet:*wallet-avoid-partial-spends* variable)
   (bitcoin-lisp.wallet::wallet-for-request function)
   (bitcoin-lisp.wallet::*rpc-wallet-name* variable))
 
