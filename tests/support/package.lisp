@@ -37,6 +37,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:deliver-getdata
    #:deliver-tx
    #:deliver-inv
+   #:tx-inv-payload
    #:deliver-notfound
    #:deliver-ibd-message
    #:with-tx-relay-out-of-ibd

@@ -1582,24 +1582,18 @@ announcement from a wtxidrelay peer was silently dropped."
          (wtxid (make-array 32 :element-type '(unsigned-byte 8)
                                :initial-element 11))
          (txid (make-array 32 :element-type '(unsigned-byte 8)
-                              :initial-element 12))
-         (inv-payload
-           (lambda (type hash)
-             (subseq (bl.ser:make-inv-message
-                      (list (bl.ser:make-inv-vector
-                             :type type :hash hash)))
-                     24))))
+                              :initial-element 12)))
     (bl.net:reset-tx-requests)
     ;; The announcer peer has no connection, so the getdata send at the end
     ;; of handle-inv errors — but the tracker recording happens first, which
     ;; is the observable we assert on.
     (ignore-errors
-      (deliver-inv wtx-announcer (funcall inv-payload bl.ser:+inv-type-wtx+ wtxid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
+      (deliver-inv wtx-announcer (tx-inv-payload bl.ser:+inv-type-wtx+ wtxid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     ;; Recorded: a probe from another peer sees the request outstanding.
     (is-false (bl.net:tx-request-wanted-p wtxid probe))
     ;; MSG_TX (txid) announcements keep working alongside.
     (ignore-errors
-      (deliver-inv tx-announcer (funcall inv-payload bl.ser:+inv-type-tx+ txid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
+      (deliver-inv tx-announcer (tx-inv-payload bl.ser:+inv-type-tx+ txid) (bl.ctx:make-node-context :chain-state state :mempool mempool)))
     (is-false (bl.net:tx-request-wanted-p txid probe))
     (bl.net:reset-tx-requests)))
 
@@ -1929,8 +1923,10 @@ until flush time."
 (test flush-tx-announcements-drains-on-schedule
   "First flush pass only arms an outbound peer's exponential timer (Core
 initializes m_next_inv_send_time the same way); once the deadline is
-due, the queue drains and the tx is marked announced. Send errors from
-the connectionless peer are swallowed."
+due, the queue drains and the tx is marked known to the peer under the id
+that peer's inventory uses — the WTXID here, since it negotiated wtxidrelay
+(Core keys m_tx_inventory_known_filter by `m_wtxid_relay ? wtxid : txid`).
+Send errors from the connectionless peer are swallowed."
   (let* ((bl:*network* :regtest)
          (peer (bl.net:make-peer :state :ready :wtxid-relay t))
          (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 23))
@@ -1946,7 +1942,10 @@ the connectionless peer are swallowed."
     (bl.net:flush-tx-announcements (list peer) nil)
     (is (null (bl.net:peer-tx-inv-queue peer)))
     (is-true (bl:recent-reject-p
-              (bl.net:peer-announced-txs peer) txid))))
+              (bl.net:peer-announced-txs peer) wtxid))
+    (is-false (bl:recent-reject-p
+               (bl.net:peer-announced-txs peer) txid)
+              "a wtxidrelay peer's filter is keyed by wtxid, not txid")))
 
 (test flush-drops-feefiltered-entries
   "A queued announcement below the peer's BIP133 feefilter is dropped at
@@ -1964,6 +1963,43 @@ m_tx_inventory_to_send the same way)."
     (is (null (bl.net:peer-tx-inv-queue peer)))
     (is-false (bl:recent-reject-p
                (bl.net:peer-announced-txs peer) txid))))
+
+(defun %relay-txid (n)
+  "A distinct 32-byte transaction id for the Nth queued announcement."
+  (let ((v (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref v 0) (ldb (byte 8 0) n)
+          (aref v 1) (ldb (byte 8 8) n)
+          (aref v 2) (ldb (byte 8 16) n))
+    v))
+
+(test an-inv-marks-the-transaction-known-to-the-peer-that-sent-it
+  "Core AddKnownTx(peer, inv.hash) on every gen-tx inv (net_processing.cpp:
+4174), placed OUTSIDE the IsInitialBlockDownload branch on purpose -- a peer
+that announced during IBD is still not told about the transaction once we
+leave it. Without that write we announced every transaction we accepted
+straight back to each peer that had already announced it to us. The filter is
+keyed by the id THAT peer's inventory uses, so a wtxidrelay peer's MSG_WTX
+inv has to suppress a wtxid announcement."
+  (multiple-value-bind (utxo mempool state funding) (make-package-fixture)
+    (declare (ignore utxo funding))
+    (let* ((bl:*network* :regtest)
+           ;; Left IN initial block download, which is where Core still does
+           ;; this write.
+           (bl.net:*cached-is-ibd* t)
+           (peer (bl.net:make-peer :state :ready :wtxid-relay t))
+           (other (bl.net:make-peer :state :ready :wtxid-relay t))
+           (txid (%relay-txid 41))
+           (wtxid (%relay-txid 42))
+           (ctx (bl.ctx:make-node-context :chain-state state :mempool mempool)))
+      (deliver-inv peer (tx-inv-payload bl.ser:+inv-type-wtx+ wtxid) ctx)
+      (is-true (bl:recent-reject-p (bl.net:peer-announced-txs peer) wtxid)
+               "the announced id enters the announcer's known-tx filter")
+      (bl.net:relay-transaction txid nil (list peer other)
+                                :fee-rate 2 :wtxid wtxid)
+      (is (null (bl.net:peer-tx-inv-queue peer))
+          "and the announcer is not told about its own announcement")
+      (is (= 1 (length (bl.net:peer-tx-inv-queue other)))
+          "while a peer that said nothing still hears about it"))))
 
 ;;;; Initial broadcast of locally-submitted txs (unbroadcast set)
 

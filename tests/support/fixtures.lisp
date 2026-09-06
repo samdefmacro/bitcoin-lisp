@@ -223,6 +223,14 @@ Four test files ask this question, which is why it is a fixture rather than
 thirty-seven reaches into the handler."
   (bl.net::handle-tx peer payload ctx))
 
+(defun tx-inv-payload (type hash)
+  "One transaction inv message's payload, header stripped, as HANDLE-INV sees
+it. TYPE is the inv type constant the announcing peer would use: MSG_WTX for
+a wtxidrelay peer, MSG_TX / MSG_WITNESS_TX otherwise."
+  (subseq (bl.ser:make-inv-message
+           (list (bl.ser:make-inv-vector :type type :hash hash)))
+          24))
+
 (defun deliver-inv (peer payload ctx)
   "Drive one inv message PAYLOAD through the shipped handler (Core's INV
 branch: block availability, AddTxAnnouncement, and the getdata it triggers)."
