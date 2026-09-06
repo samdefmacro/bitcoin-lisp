@@ -565,6 +565,17 @@ scheduler would issue no further request for it."
     (%tx-request-make-completed hash peer)))
 
 
+(defun tx-request-candidate-peers (hash)
+  "Every peer with a LIVE (non-COMPLETED) announcement of HASH — Core
+TxRequestTracker::GetCandidatePeers (txrequest.cpp:568-576). Orphan intake
+uses it to enrol every peer that announced the orphan as a resolution
+candidate, not only the one that delivered it: a peer announces a transaction
+ONCE, so an announcer we do not enrol here will not offer itself again."
+  (bt:with-lock-held (*tx-request-lock*)
+    (loop for ann in (gethash hash *tx-announcers*)
+          unless (tx-ann-completed ann)
+            collect (tx-ann-peer ann))))
+
 (defun tx-request-disconnected-peer (peer)
   "Forget every announcement PEER made and release its in-flight requests so
 other announcers take over (Core TxRequestTracker::DisconnectedPeer via
@@ -873,28 +884,54 @@ parent is exactly what the orphan may be able to fee-bump (:393-395)."
           (bl.mp:mempool-get-by-wtxid mempool hash)
           (bl.mp:mempool-has mempool hash))))
 
+(defun %add-orphan-resolution-candidate (peer otx parents mempool num-wtxid-peers)
+  "Core MaybeAddOrphanResolutionCandidate and the AddTx that follows it
+(txdownloadman_impl.cpp:226-262, :412-415): unless PEER is already an
+announcer of the orphan OTX, register its still-missing PARENTS with the
+tx-request tracker as txid-based announcements from PEER (with the usual
+delays; the bulk per-peer cap check lives in request-orphan-parents) and
+record PEER as an announcer of the orphan.
+
+The orphanage entry is made only when the registration SUCCEEDED. A peer
+already over MAX_PEER_TX_ANNOUNCEMENTS adds nothing, which is what stops a
+peer that floods us with invs and orphans from filling the orphanage
+(\"If there is no candidate for orphan resolution, AddTx will not be called\",
+:404-406). Returns T when PEER was enrolled."
+  (let ((pool (bl.mp:mempool-orphan-pool mempool))
+        (wtxid (bl.ser:transaction-wtxid otx)))
+    (when (and (not (bl.mp:orphan-have-from-peer pool wtxid peer))
+               (request-orphan-parents peer parents num-wtxid-peers))
+      (bl.mp:orphan-add pool otx peer)
+      t)))
+
+(defun %orphan-missing-parents (otx mempool utxo-set recent-rejects)
+  "OTX's parents that are worth requesting: the ones in neither the UTXO set
+nor the mempool, minus everything AlreadyHaveTx already covers -- the
+orphanage and the recently-confirmed filter above all (Core's
+std::erase_if(unique_parents, AlreadyHaveTx(...)),
+txdownloadman_impl.cpp:391-396). INCLUDE-RECONSIDERABLE stays false there and
+here: a parent rejected for too low a feerate is exactly the one this orphan
+may be able to fee-bump."
+  (remove-if (lambda (ptxid)
+               (%already-have-tx-p ptxid nil mempool recent-rejects))
+             (missing-parent-txids otx utxo-set mempool)))
+
 (defun %maybe-add-orphan-resolution-candidate (peer orphan-wtxid mempool utxo-set
                                                recent-rejects num-wtxid-peers)
   "A wtxid announcement matched a stored orphan: treat PEER as an orphan-
 resolution candidate instead of requesting the announced tx again (Core
-AddTxAnnouncement's orphan branch + MaybeAddOrphanResolutionCandidate,
-txdownloadman_impl.cpp:172-282): unless PEER already announced this orphan,
-register its still-missing parents with the tx-request tracker as txid-based
-announcements from PEER (with the usual delays; the per-parent cap check
-lives in request-orphan-parents) and record PEER as an additional announcer."
-  (let* ((pool (bl.mp:mempool-orphan-pool mempool))
-         (otx (bl.mp:orphan-tx pool orphan-wtxid)))
-    (when (and otx (not (bl.mp:orphan-have-from-peer
-                         pool orphan-wtxid peer)))
-      (let ((parents (remove-if
-                      (lambda (ptxid)
-                        (%already-have-tx-p ptxid nil mempool recent-rejects))
-                      (missing-parent-txids otx utxo-set mempool))))
+AddTxAnnouncement's orphan branch, txdownloadman_impl.cpp:172-190)."
+  (let ((otx (bl.mp:orphan-tx (bl.mp:mempool-orphan-pool mempool)
+                              orphan-wtxid)))
+    (when otx
+      (let ((parents (%orphan-missing-parents otx mempool utxo-set
+                                              recent-rejects)))
         ;; All parents accepted/rejected since the orphan was stored: nothing
-        ;; to resolve from this peer (the orphan awaits reprocessing).
+        ;; to resolve from this peer (the orphan awaits reprocessing), which
+        ;; is Core's early return at :182-185.
         (when parents
-          (when (request-orphan-parents peer parents num-wtxid-peers)
-            (bl.mp:orphan-add pool otx peer)))))))
+          (%add-orphan-resolution-candidate peer otx parents mempool
+                                            num-wtxid-peers))))))
 
 (define-p2p-handler ("inv" :rate-bucket peer-rate-limit-inv) (peer payload ctx)
   "Handle an inv message.
@@ -1960,6 +1997,43 @@ black-hole an honest CPFP child after a single lost package attempt."
                        (otherwise nil))))
           t)))))
 
+(defun %orphan-resolution-candidates (peer txid wtxid)
+  "The delivering PEER, then every OTHER peer with a live announcement of the
+orphan by txid or -- when it has a witness -- by wtxid. Core's
+orphan_resolution_candidates: it starts as {nodeid} and is extended by
+m_txrequest.GetCandidatePeers over both ids (txdownloadman_impl.cpp:406-410).
+
+Starting with the delivering peer alone left orphan resolution with ONE
+candidate: a peer announces a transaction once, so the peers that announced
+this orphan before it reached us never offer themselves again, and if the
+sole candidate stalls the parent request dies at the 60s expiry with no
+alternative announcer."
+  (let ((candidates (list peer)))
+    (dolist (hash (if (equalp wtxid txid) (list txid) (list txid wtxid)))
+      (dolist (p (tx-request-candidate-peers hash))
+        (pushnew p candidates :test #'eq)))
+    (nreverse candidates)))
+
+(defun %take-orphan-into-orphanage (peer tx mempool utxo-set recent-rejects peers)
+  "Core MempoolRejectedTx's orphan branch (txdownloadman_impl.cpp:391-420) in
+its order: filter the missing parents through AlreadyHaveTx, enrol EVERY
+announcer of the orphan as a resolution candidate rather than only the peer
+that delivered it, and only then ForgetTxHash the orphan under both ids --
+\"once added to the orphan pool, a tx is considered AlreadyHave, and we
+shouldn't request it anymore\" (:418-419). The order is what makes the
+enrolment possible at all: forgetting the hash at receipt, as this used to,
+left GetCandidatePeers nothing to find."
+  (let* ((txid (bl.ser:transaction-hash tx))
+         (wtxid (bl.ser:transaction-wtxid tx))
+         (parents (%orphan-missing-parents tx mempool utxo-set recent-rejects))
+         (num-wtxid-peers (count-wtxid-relay-peers peers)))
+    (dolist (candidate (%orphan-resolution-candidates peer txid wtxid))
+      (%add-orphan-resolution-candidate candidate tx parents mempool
+                                        num-wtxid-peers))
+    (tx-request-received txid)
+    (unless (equalp wtxid txid)
+      (tx-request-received wtxid))))
+
 (defun %orphan-parents-rejected-p (parent-txids recent-rejects)
   "Core's fRejectedParents scan (txdownloadman_impl.cpp:371-396): T when an
 orphan with these MISSING PARENT-TXIDS must not be kept at all.
@@ -2089,19 +2163,8 @@ CTX's recent-rejects, when present, caches recently rejected txs."
                              ;; :434-435, beside the two filter inserts.
                              (tx-request-received txid)
                              (tx-request-received wtxid))
-                           (progn
-                             (bl.mp:orphan-add
-                              (bl.mp:mempool-orphan-pool mempool) tx peer)
-                             (request-orphan-parents
-                              peer parents (count-wtxid-relay-peers peers))
-                             ;; "Once added to the orphan pool, a tx is
-                             ;; considered AlreadyHave, and we shouldn't
-                             ;; request it anymore" (:418-419) — ForgetTxHash
-                             ;; here rather than at receipt, after the
-                             ;; announcers have had their chance to be read.
-                             (tx-request-received txid)
-                             (unless (equalp wtxid txid)
-                               (tx-request-received wtxid))))))
+                           (%take-orphan-into-orphanage
+                            peer tx mempool utxo-set recent-rejects peers))))
                     (t
                      ;; Cache the failure so we don't re-request it (see
                      ;; %cache-tx-rejection for which filter and which ids).

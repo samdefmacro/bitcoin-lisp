@@ -71,6 +71,7 @@ headerssync.cpp. src/networking/.")
    #:tx-request-wanted-p
    #:tx-request-received
    #:tx-request-received-response
+   #:tx-request-candidate-peers
    #:tx-request-disconnected-peer
    #:tx-request-count
    #:process-tx-requests
