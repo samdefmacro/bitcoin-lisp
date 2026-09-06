@@ -1147,7 +1147,14 @@
   script construction change must invalidate it; a stored transaction
   record that will not load is Core's `NEED_RESCAN` -- the wallet still
   loads, and the catch-up rescans from height 0 instead of from the
-  stored locator, which no longer describes what is in memory.
+  stored locator, which no longer describes what is in memory; the record
+  scan is a DRIVER (`map-wallet-db-records`), so a load and a backup cost
+  one record of heap and not the wallet file, while a scan stopped by a bad
+  block still signals rather than returning a short set; and every failure
+  of the database itself answers Core's `DatabaseStatus` pair -- the cheap
+  format probe (`wallet-db-format-recognized-p`, Core's `IsSQLiteFile`)
+  gives -18, anything past it gives -4, and a storage condition never
+  reaches a client as an internal error.
 
   Traps: a locked wallet could once still sign because a parsed
   descriptor kept its embedded xprv; the key-provider is the only source
