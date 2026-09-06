@@ -29,6 +29,7 @@ src/mempool/.")
    #:feefrac-fee
    #:feefrac-size
    #:feefrac-empty-p
+   #:feefrac-per-vsize
    #:feefrac+
    #:feefrac-
    #:feefrac=
@@ -122,6 +123,9 @@ src/mempool/.")
    #:make-mempool-entry
    #:make-entry-from-tx
    #:sigop-adjusted-vsize
+   #:sigop-adjusted-weight
+   #:transaction-graph-weight
+   #:mempool-entry-graph-weight
    #:mempool-entry-transaction
    #:mempool-entry-fee
    #:mempool-entry-modified-fee

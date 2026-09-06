@@ -1099,6 +1099,15 @@
   checks run in Core's order with Core's limits; mempool.dat is written
   in Core's format so the two implementations can exchange one.
 
+  The txgraph measures SIGOP-ADJUSTED WEIGHT, as Core's does: entries are
+  staged with max(weight, sigops * 20) and the cluster cap is 404000 WU
+  (the configured 101 kvB times WITNESS_SCALE_FACTOR). The division to
+  virtual bytes happens only at the consumer boundary --
+  `feefrac-per-vsize', Core's ToFeePerVSize -- and only where Core applies
+  it: the rolling minimum fee bumped from an evicted chunk and the block
+  assembler's `-blockmintxfee' comparison. The chunk feerates the RPCs
+  report are Core's weight units, unconverted.
+
   Fee estimation reads the block policy estimator and NOTHING else: the
   absence of an estimate is reported as absence (Core's `Insufficient data
   or no feerate found'), never as a percentile of what miners took, which
@@ -1110,7 +1119,10 @@
   The last of those is why a CPFP child does not teach the estimator that
   its own low feerate confirmed in one block.
 
-  Traps: a rule that BOUNDS a later step's work has to RUN before it, and
+  Traps: dividing a size before comparing feerates is not a rounding
+  detail -- it decides chunk BOUNDARIES, so a per-transaction ceiling
+  applied first turns one CPFP chunk into two and flips a strict mining
+  order. A rule that BOUNDS a later step's work has to RUN before it, and
   a LET binding runs where it is bound rather than where it is read --
   rule 5's cluster cap is the bound on the RBF descendant expansion, so
   the expansion cannot be a sibling binding of the guard that limits it.
@@ -1170,8 +1182,11 @@
   three groups: signalling and locked-in in `vbavailable', active in
   `rules'.
 
-  Traps: the reserved weight exists because the header and the
-  transaction-count varint count toward the block weight. The BIP94
+  Traps: the chunk feerate the builder hands out is fee per sigop-adjusted
+  WEIGHT, so it converts through `bl.mp:feefrac-per-vsize' before meeting
+  `-blockmintxfee', which is a sat-per-1000-VBYTE rate (Core's
+  ToFeePerVSize at miner.cpp:294). The reserved weight exists because the
+  header and the transaction-count varint count toward the block weight. The BIP94
   mintime floor applies on EVERY network, whether or not the rule is
   consensus there, at the chain's own retarget period. MINE-BLOCK
   returns the number of FAILED nonces as a second value, because

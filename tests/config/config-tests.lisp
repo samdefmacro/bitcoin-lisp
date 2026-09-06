@@ -370,11 +370,14 @@ count is hard-capped at 64 like Core (mempool_args.cpp:110-112)."
      '(("limitclustercount" . "32") ("limitclustersize" . "50")))
     (is (= 32 bl.mp:*cluster-count-limit*))
     (is (= 50000 bl.mp:*cluster-size-limit*))    ; kvB -> vB
-    ;; A mempool created under these settings carries them in its graph.
+    ;; A mempool created under these settings carries them in its graph -- the
+    ;; count as configured, the size scaled to the graph's WEIGHT unit, as
+    ;; Core's MakeTxGraph takes cluster_size_vbytes * WITNESS_SCALE_FACTOR
+    ;; (txmempool.cpp:179-181).
     (let ((graph (bl.mp:mempool-graph
                   (bl.mp:make-mempool))))
       (is (= 32 (bl.mp::txgraph-max-cluster-count graph)))
-      (is (= 50000 (bl.mp::txgraph-max-cluster-size graph))))
+      (is (= 200000 (bl.mp::txgraph-max-cluster-size graph))))
     ;; Out-of-range values are init errors.
     (signals error (apply-config-globals
                     '(("limitclustercount" . "65"))))

@@ -944,6 +944,24 @@ rather than at either site."
             mtp
             csv-active)))
 
+(defun %replacement-checks (mempool tx modified-fee vsize sigops direct-conflicts)
+  "Core MemPoolAccept::ReplacementChecks (validation.cpp:981-1032), which is a
+method of its own there rather than a stretch of PreChecks: apply the
+cluster-mempool replacement rules to TX against DIRECT-CONFLICTS and return
+(values ok-p reason replaced-set).
+
+The candidate's size reaches those rules in BOTH of Core's units, and this is
+where the second one is derived, beside the rules that read it. VSIZE -- the
+sigop-adjusted VIRTUAL size, Core's ws.m_vsize -- prices rules 3 and 4; the
+sigop-adjusted WEIGHT is what the candidate is staged into the txgraph with
+(Core's ChangeSet::StageAddition builds FeePerWeight from
+GetSigOpsAdjustedWeight, txmempool.cpp:1017). Deriving the weight from the
+transaction and SIGOPS here rather than passing a second number down is what
+keeps the two from ever describing different transactions."
+  (bl.mp:check-rbf-rules mempool tx modified-fee vsize
+                         (bl.mp:transaction-graph-weight tx sigops)
+                         direct-conflicts))
+
 (defun validate-transaction-for-mempool (tx utxo-set mempool current-height
                                          &key package-coins skip-fee-check chain-state
                                               bypass-limits skip-rbf-check
@@ -1228,8 +1246,8 @@ decide (Core PreChecks, validation.cpp:950-970)."
           ;; RBF evaluation.
           (when (and direct-conflicts (not skip-rbf-check))
             (multiple-value-bind (ok reason rset)
-                (bl.mp:check-rbf-rules mempool tx modified-fee-value
-                                                      vsize direct-conflicts)
+                (%replacement-checks mempool tx modified-fee-value vsize
+                                     sigops-cost direct-conflicts)
               (unless ok
                 (return-from validate-transaction-for-mempool (values nil reason nil)))
               (setf replaced-set rset)))

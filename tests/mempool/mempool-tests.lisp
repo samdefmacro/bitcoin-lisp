@@ -1876,17 +1876,20 @@ minimum fee past its feerate, so an equal-feerate retry cannot loop."
          (orig (%rbf-tx 100 :sequence #xfffffffd))
          (orig-txid (bl.ser:transaction-hash orig))
          (repl (%rbf-tx 100 :sequence #xfffffffd :value 40000000))
-         (rvsize (bl.ser:transaction-vsize repl)))
+         (rvsize (bl.ser:transaction-vsize repl))
+         (rweight (bl.ser:transaction-weight repl)))
     (%add-tx mempool orig :fee 1000)
     ;; Rule 3/4 pass: a clearly higher fee.
     (multiple-value-bind (ok reason replaced)
-        (bl.mp:check-rbf-rules mempool repl 50000 rvsize (list orig-txid))
+        (bl.mp:check-rbf-rules mempool repl 50000 rvsize rweight
+                               (list orig-txid))
       (declare (ignore reason))
       (is-true ok)
       (is (not (null (gethash orig-txid replaced)))))
     ;; Rule 3 fail: fee below the original's.
     (multiple-value-bind (ok reason)
-        (bl.mp:check-rbf-rules mempool repl 500 rvsize (list orig-txid))
+        (bl.mp:check-rbf-rules mempool repl 500 rvsize rweight
+                               (list orig-txid))
       (is-false ok)
       (is (eq reason :insufficient-fee)))))
 
@@ -1898,13 +1901,15 @@ accept path never consults SignalsOptInRBF; IsRBFOptIn survives for RPC only)."
          (orig (%rbf-tx 101 :sequence #xffffffff))   ; non-signaling (final)
          (orig-txid (bl.ser:transaction-hash orig))
          (repl (%rbf-tx 101 :sequence #xffffffff :value 40000000))
-         (rvsize (bl.ser:transaction-vsize repl)))
+         (rvsize (bl.ser:transaction-vsize repl))
+         (rweight (bl.ser:transaction-weight repl)))
     (%add-tx mempool orig :fee 1000)
     ;; Replacing the non-signaling original succeeds on a strictly better fee,
     ;; with *mempool-full-rbf* NIL (the default).
     (is (null bl.mp:*mempool-full-rbf*))
     (multiple-value-bind (ok reason replaced)
-        (bl.mp:check-rbf-rules mempool repl 50000 rvsize (list orig-txid))
+        (bl.mp:check-rbf-rules mempool repl 50000 rvsize rweight
+                               (list orig-txid))
       (declare (ignore reason))
       (is-true ok)
       (is (not (null (gethash orig-txid replaced)))))))
@@ -1936,10 +1941,12 @@ accepted; the replaced set is the conflict."
          (orig (%rbf-tx 130))
          (orig-txid (bl.ser:transaction-hash orig))
          (repl (%rbf-tx 130 :value 40000000))
-         (rvsize (bl.ser:transaction-vsize repl)))
+         (rvsize (bl.ser:transaction-vsize repl))
+         (rweight (bl.ser:transaction-weight repl)))
     (%add-tx mempool orig :fee 1000)
     (multiple-value-bind (ok reason replaced)
-        (bl.mp:check-rbf-rules mempool repl 50000 rvsize (list orig-txid))
+        (bl.mp:check-rbf-rules mempool repl 50000 rvsize rweight
+                               (list orig-txid))
       (declare (ignore reason))
       (is-true ok)
       (is (not (null (gethash orig-txid replaced)))))))
@@ -1959,7 +1966,7 @@ failure, rbf.cpp:136-138)."
     ;; chunk's feerate far worse than the original's — the diagram is not
     ;; strictly better.
     (multiple-value-bind (ok reason)
-        (bl.mp:check-rbf-rules mempool repl 1100 1000 (list orig-txid))
+        (bl.mp:check-rbf-rules mempool repl 1100 1000 4000 (list orig-txid))
       (is-false ok)
       (is (eq reason :replacement-failed)))))
 
@@ -1970,17 +1977,20 @@ incremental relay fee) still reject before the diagram is consulted."
          (orig (%rbf-tx 132))
          (orig-txid (bl.ser:transaction-hash orig))
          (repl (%rbf-tx 132 :value 40000000))
-         (rvsize (bl.ser:transaction-vsize repl)))
+         (rvsize (bl.ser:transaction-vsize repl))
+         (rweight (bl.ser:transaction-weight repl)))
     (%add-tx mempool orig :fee 10000)
     ;; Rule 3: fee below the replaced fee.
     (multiple-value-bind (ok reason)
-        (bl.mp:check-rbf-rules mempool repl 9000 rvsize (list orig-txid))
+        (bl.mp:check-rbf-rules mempool repl 9000 rvsize rweight
+                               (list orig-txid))
       (is-false ok)
       (is (eq reason :insufficient-fee)))
     ;; Rule 4: fee above the replaced fee but not by enough to cover the
     ;; replacement's own bandwidth (needs at least ceil(rvsize*100/1000) extra).
     (multiple-value-bind (ok reason)
-        (bl.mp:check-rbf-rules mempool repl (1+ 10000) rvsize (list orig-txid))
+        (bl.mp:check-rbf-rules mempool repl (1+ 10000) rvsize rweight
+                               (list orig-txid))
       (is-false ok)
       (is (eq reason :insufficient-fee)))))
 
@@ -2001,7 +2011,7 @@ CANDIDATES, rbf.cpp:69-74). 100 distinct clusters is allowed."
       (multiple-value-bind (ok reason)
           (bl.mp:check-rbf-rules
            mempool cand 100000000 (bl.ser:transaction-vsize cand)
-           conflicts)
+           (bl.ser:transaction-weight cand) conflicts)
         (is-false ok)
         (is (eq reason :too-many-clusters)))
       ;; Dropping one leaves exactly 100 => the cluster cap is satisfied (and,
@@ -2009,7 +2019,7 @@ CANDIDATES, rbf.cpp:69-74). 100 distinct clusters is allowed."
       (multiple-value-bind (ok reason)
           (bl.mp:check-rbf-rules
            mempool cand 100000000 (bl.ser:transaction-vsize cand)
-           (rest conflicts))
+           (bl.ser:transaction-weight cand) (rest conflicts))
         (declare (ignore reason))
         (is-true ok)))))
 
@@ -2043,7 +2053,9 @@ single-transaction and the package entry point are checked."
            ;; 101 clusters: rule 5 rejects, and nothing was expanded.
            (multiple-value-bind (ok reason)
                (bl.mp:check-rbf-rules mempool cand 100000000
-                                      (bl.ser:transaction-vsize cand) conflicts)
+                                      (bl.ser:transaction-vsize cand)
+                                      (bl.ser:transaction-weight cand)
+                                      conflicts)
              (is-false ok)
              (is (eq reason :too-many-clusters)))
            (is (zerop walks)
@@ -2054,6 +2066,7 @@ single-transaction and the package entry point are checked."
            (multiple-value-bind (ok reason)
                (bl.mp:check-rbf-rules mempool cand 100000000
                                       (bl.ser:transaction-vsize cand)
+                                      (bl.ser:transaction-weight cand)
                                       (rest conflicts))
              (declare (ignore reason))
              (is-true ok))
@@ -2062,15 +2075,15 @@ single-transaction and the package entry point are checked."
            ;; The package path has the same arrangement.
            (setf walks 0)
            (multiple-value-bind (ok reason)
-               (bl.mp:check-package-rbf-rules mempool 1000 100 100000000 100
-                                              conflicts)
+               (bl.mp:check-package-rbf-rules mempool 1000 100 400
+                                              100000000 100 400 conflicts)
              (is-false ok)
              (is (eq reason :too-many-clusters)))
            (is (zerop walks)
                "package rule 5 rejected after ~D descendant walks had already run"
                walks)
-           (bl.mp:check-package-rbf-rules mempool 1000 100 100000000 100
-                                          (rest conflicts))
+           (bl.mp:check-package-rbf-rules mempool 1000 100 400
+                                          100000000 100 400 (rest conflicts))
            (is (= 100 walks)
                "the package that cleared the cap expanded ~D of its 100 conflicts"
                walks))
@@ -2090,7 +2103,7 @@ decided by the economics, not a transaction-count bound."
     (multiple-value-bind (ok reason replaced)
         (bl.mp:check-rbf-rules
          mempool cand 100000000 (bl.ser:transaction-vsize cand)
-         (list root-txid))
+         (bl.ser:transaction-weight cand) (list root-txid))
       (declare (ignore reason))
       (is-true ok)
       ;; The whole 5-tx chain (root + descendants) is the replaced set.
@@ -2105,10 +2118,12 @@ CheckMemPoolPolicyLimits failing before ImprovesFeerateDiagram)."
          (orig-txid (bl.ser:transaction-hash orig))
          (repl (%rbf-tx 160 :value 40000000)))
     (%add-tx mempool orig :fee 1000)
-    ;; Rules 3/4 pass (huge fee), but a 200000-vbyte candidate exceeds the
-    ;; 101000-vB cluster size limit, so the diagram is uncalculable.
+    ;; Rules 3/4 pass (huge fee), but a 200000-vbyte candidate is 800000 WU
+    ;; against the 404000-WU cluster size limit, so the diagram is
+    ;; uncalculable.
     (multiple-value-bind (ok reason)
-        (bl.mp:check-rbf-rules mempool repl 200000 200000 (list orig-txid))
+        (bl.mp:check-rbf-rules mempool repl 200000 200000 800000
+                               (list orig-txid))
       (is-false ok)
       (is (eq reason :too-large-cluster)))))
 
@@ -2672,7 +2687,7 @@ and a strict diagram improvement."
     (%add-tx mempool orig :fee 1000)
     (multiple-value-bind (ok reason replaced)
         (bl.mp:check-package-rbf-rules
-         mempool 10 100 5000 100 (list orig-txid))
+         mempool 10 100 400 5000 100 400 (list orig-txid))
       (declare (ignore reason))
       (is-true ok)
       (is (not (null (gethash orig-txid replaced)))))))
@@ -2687,14 +2702,14 @@ cover the replaced fees (plus its own bandwidth) is rejected."
     ;; Rule 3: 10 + 5000 < 10000.
     (multiple-value-bind (ok reason)
         (bl.mp:check-package-rbf-rules
-         mempool 10 100 5000 100 (list orig-txid))
+         mempool 10 100 400 5000 100 400 (list orig-txid))
       (is-false ok)
       (is (eq reason :insufficient-fee)))
     ;; Rule 4: totals exceed the replaced fee but not by the pair's own
     ;; bandwidth at 100 sat/kvB (needs ceil(200*100/1000) = 20 extra).
     (multiple-value-bind (ok reason)
         (bl.mp:check-package-rbf-rules
-         mempool 10 100 10009 100 (list orig-txid))
+         mempool 10 100 400 10009 100 400 (list orig-txid))
       (is-false ok)
       (is (eq reason :insufficient-fee)))))
 
@@ -2709,13 +2724,13 @@ pair must be a chunk on its own, not a child merely paying anti-DoS fees
     ;; Parent 50 sat/vB, child 0 -> package 25 sat/vB < parent.
     (multiple-value-bind (ok reason)
         (bl.mp:check-package-rbf-rules
-         mempool 5000 100 0 100 (list orig-txid))
+         mempool 5000 100 400 0 100 400 (list orig-txid))
       (is-false ok)
       (is (eq reason :package-feerate-not-above-parent)))
     ;; Equal feerates (parent 10, child 10 sat/vB) -> still rejected.
     (multiple-value-bind (ok reason)
         (bl.mp:check-package-rbf-rules
-         mempool 1000 100 1000 100 (list orig-txid))
+         mempool 1000 100 400 1000 100 400 (list orig-txid))
       (is-false ok)
       (is (eq reason :package-feerate-not-above-parent)))))
 
@@ -2733,7 +2748,7 @@ diagram does NOT strictly improve — rejected :replacement-failed."
     ;; 200 (1200 > 1000) -> :unordered, not a strict improvement.
     (multiple-value-bind (ok reason)
         (bl.mp:check-package-rbf-rules
-         mempool 500 100 700 100 (list orig-txid))
+         mempool 500 100 400 700 100 400 (list orig-txid))
       (is-false ok)
       (is (eq reason :replacement-failed)))))
 
@@ -2747,7 +2762,7 @@ diagram does NOT strictly improve — rejected :replacement-failed."
              (push (bl.ser:transaction-hash tx) conflicts))
     (multiple-value-bind (ok reason)
         (bl.mp:check-package-rbf-rules
-         mempool 1000 100 100000000 100 conflicts)
+         mempool 1000 100 400 100000000 100 400 conflicts)
       (is-false ok)
       (is (eq reason :too-many-clusters)))))
 
@@ -2760,12 +2775,216 @@ diagram does NOT strictly improve — rejected :replacement-failed."
     (%add-tx mempool orig :fee 1000)
     (multiple-value-bind (ok reason)
         (bl.mp:check-package-rbf-rules
-         mempool 1000 100 100000000 200000 (list orig-txid))
+         mempool 1000 100 400 100000000 200000 800000 (list orig-txid))
       (is-false ok)
       (is (eq reason :too-large-cluster)))))
 
 ;;;; Wave 7: sigop-adjusted virtual size (Core GetVirtualTransactionSize,
 ;;;; policy.cpp:376-384; CTxMemPoolEntry::GetTxSize)
+
+(defun %unit-tx (prev-hash witness-len)
+  "A one-input, one-output segwit transaction spending PREV-HASH:0 whose
+WITNESS-LEN witness bytes move its weight by ONE unit each. Weight is
+3*base + total (BIP141), so a witness byte is the only way a transaction's
+weight stops being a multiple of four -- which is the whole window in which
+sigop-adjusted vbytes and sigop-adjusted weight can disagree."
+  (bl.ser:make-transaction
+   :version 2
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint :hash prev-hash :index 0)
+                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                    :sequence #xFFFFFFFD))
+   :outputs (vector (bl.ser:make-tx-out
+                     :value 1000
+                     :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                   :initial-element #x51)))
+   :witness (vector (list (make-array witness-len :element-type '(unsigned-byte 8)
+                                                  :initial-element 1)))
+   :lock-time 0))
+
+(defun %graph-size-of (mempool txid)
+  "The size the txgraph holds for the mempool entry TXID, in the graph's own
+unit."
+  (bl.mp:feefrac-size
+   (bl.mp:txgraph-get-individual-feerate
+    (bl.mp:mempool-graph mempool)
+    (bl.mp:mempool-entry-graph-handle (bl.mp:mempool-get mempool txid)))))
+
+(test sigop-adjusted-weight-matches-core
+  "max(weight, sigops * DEFAULT_BYTES_PER_SIGOP) with NO division -- Core
+GetSigOpsAdjustedWeight (policy.cpp:376-379) and CTxMemPoolEntry's
+GetAdjustedWeight (kernel/mempool_entry.h:114). The vsize beside it is this
+value divided by four, rounding up, which is why the division must not happen
+first."
+  (is (= 400 (bl.mp:sigop-adjusted-weight 400 0)))
+  (is (= 401 (bl.mp:sigop-adjusted-weight 401 0)))
+  (is (= 403 (bl.mp:sigop-adjusted-weight 403 0)))
+  ;; The sigop branch: 30 sigops * 20 = 600 dominates a weight of 400.
+  (is (= 600 (bl.mp:sigop-adjusted-weight 400 30)))
+  (is (= 400 (bl.mp:sigop-adjusted-weight 400 20)))
+  ;; And the vsize is exactly this rounded up, never the other way round.
+  (dolist (pair '((400 0) (401 0) (403 0) (400 30) (400 20)))
+    (destructuring-bind (w sigops) pair
+      (is (= (bl.mp:sigop-adjusted-vsize w sigops)
+             (ceiling (bl.mp:sigop-adjusted-weight w sigops) 4))))))
+
+(test mempool-stages-sigop-adjusted-weight-into-the-txgraph
+  "GA11 ed2f2295. Core's TxGraph works in WEIGHT throughout: StageAddition
+builds FeePerWeight(fee, GetSigOpsAdjustedWeight(...)) (txmempool.cpp:1017)
+and MakeTxGraph is handed cluster_size_vbytes * WITNESS_SCALE_FACTOR
+(:179-181), with the division to virtual bytes happening only at the consumer
+boundary (ToFeePerVSize, policy/policy.h:196). Feeding the graph vbytes
+instead applies the per-transaction ceiling BEFORE the cross-multiplied
+feerate comparisons.
+
+Both the weight-dominated and the sigop-dominated entry are checked, and each
+asserts the staged size is NOT the vsize as well as that it IS the weight, so
+a unit that happened to coincide cannot pass this."
+  (let* ((mempool (bl.mp:make-mempool))
+         (plain (%unit-tx (make-array 32 :element-type '(unsigned-byte 8)
+                                         :initial-element 11)
+                          1))
+         (plain-txid (bl.ser:transaction-hash plain)))
+    (bl.mp:mempool-add mempool plain-txid
+                       (bl.mp:make-entry-from-tx plain 1000 0))
+    (let ((entry (bl.mp:mempool-get mempool plain-txid)))
+      (is (= (bl.ser:transaction-weight plain)
+             (bl.mp:mempool-entry-graph-weight entry)))
+      (is (= (bl.mp:mempool-entry-graph-weight entry)
+             (%graph-size-of mempool plain-txid)))
+      (is (/= (bl.mp:mempool-entry-vsize entry)
+              (%graph-size-of mempool plain-txid))
+          "the txgraph was fed the entry's virtual size, not its weight"))
+    ;; A sigop-dominated entry takes the max() branch: 40 sigops * 20 = 800
+    ;; weight units, well past this transaction's own weight.
+    (let* ((dense (%unit-tx (make-array 32 :element-type '(unsigned-byte 8)
+                                           :initial-element 12)
+                            1))
+           (dense-txid (bl.ser:transaction-hash dense)))
+      (bl.mp:mempool-add mempool dense-txid
+                         (bl.mp:make-entry-from-tx dense 1000 0 :sigops 40))
+      (let ((entry (bl.mp:mempool-get mempool dense-txid)))
+        (is (= 800 (bl.mp:mempool-entry-graph-weight entry)))
+        (is (= 800 (%graph-size-of mempool dense-txid)))
+        (is (= 200 (bl.mp:mempool-entry-vsize entry)))))))
+
+(test mempool-chunks-a-cpfp-pair-core-does-not-split
+  "GA11 ed2f2295, executed case 1: a chunk BOUNDARY, not merely a tie order.
+
+Parent and child pay the same fee and round to the same sigop-adjusted VSIZE,
+but the child's weight is strictly smaller, so in Core's unit its feerate is
+strictly higher and the pair chunks together; in virtual bytes the two
+feerates are equal, the merge is not a strict improvement, and the cluster
+stays two chunks. The eviction set follows: TXGRAPH-GET-WORST-MAIN-CHUNK
+hands the trimmer the child ALONE where Core evicts the parent-and-child
+pair, and the rolling minimum fee is computed from whichever it returns.
+
+The premise is asserted first, so a change to the fixture that lost the
+equal-vsize/different-weight shape would fail here rather than silently make
+the rest vacuous."
+  (let* ((mempool (bl.mp:make-mempool))
+         (parent (%unit-tx (make-array 32 :element-type '(unsigned-byte 8)
+                                          :initial-element 21)
+                           3))
+         (parent-txid (bl.ser:transaction-hash parent))
+         (child (%unit-tx parent-txid 1))
+         (child-txid (bl.ser:transaction-hash child)))
+    ;; Premise: same vsize, child strictly lighter.
+    (is (= (bl.mp:sigop-adjusted-vsize (bl.ser:transaction-weight parent) 0)
+           (bl.mp:sigop-adjusted-vsize (bl.ser:transaction-weight child) 0))
+        "the fixture pair no longer shares a virtual size")
+    (is (< (bl.ser:transaction-weight child) (bl.ser:transaction-weight parent))
+        "the fixture child is no longer the lighter of the two")
+    (bl.mp:mempool-add mempool parent-txid
+                       (bl.mp:make-entry-from-tx parent 100 0))
+    (bl.mp:mempool-add mempool child-txid
+                       (bl.mp:make-entry-from-tx child 100 0))
+    (let ((chunks (bl.mp:txgraph-get-cluster-chunks
+                   (bl.mp:mempool-graph mempool)
+                   (bl.mp:mempool-entry-graph-handle
+                    (bl.mp:mempool-get mempool parent-txid)))))
+      (is (= 1 (length chunks))
+          "the CPFP pair was split into ~D chunks; Core forms one"
+          (length chunks)))
+    (multiple-value-bind (handles feerate)
+        (bl.mp:txgraph-get-worst-main-chunk (bl.mp:mempool-graph mempool))
+      (is (= 2 (length handles))
+          "eviction would drop ~D of the pair; Core evicts both together"
+          (length handles))
+      (is (= 200 (bl.mp:feefrac-fee feerate)))
+      (is (= (+ (bl.ser:transaction-weight parent)
+                (bl.ser:transaction-weight child))
+             (bl.mp:feefrac-size feerate))))))
+
+(test mempool-mining-order-follows-fee-per-weight
+  "GA11 ed2f2295, executed case 2: a strict mining-order FLIP, not a tie
+broken by the fallback.
+
+X pays 1005 over 345 weight units and Y 1000 over 344. In Core's unit X's
+feerate is the higher and X mines first; rounded to virtual bytes (87 and 86)
+Y's is, and the two orders are both strict, so this is not the txid fallback
+deciding a tie."
+  (let* ((mempool (bl.mp:make-mempool))
+         (x (%unit-tx (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element 31)
+                      1))
+         (y (%unit-tx (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element 32)
+                      0))
+         (x-txid (bl.ser:transaction-hash x))
+         (y-txid (bl.ser:transaction-hash y)))
+    (is (= 1 (- (bl.ser:transaction-weight x) (bl.ser:transaction-weight y)))
+        "the fixture pair no longer differs by exactly one weight unit")
+    (bl.mp:mempool-add mempool x-txid (bl.mp:make-entry-from-tx x 1005 0))
+    (bl.mp:mempool-add mempool y-txid (bl.mp:make-entry-from-tx y 1000 0))
+    (let ((graph (bl.mp:mempool-graph mempool)))
+      ;; Negative means X sorts EARLIER in mining order.
+      (is (= -1 (bl.mp:txgraph-compare-main-order
+                 graph
+                 (bl.mp:mempool-entry-graph-handle
+                  (bl.mp:mempool-get mempool x-txid))
+                 (bl.mp:mempool-entry-graph-handle
+                  (bl.mp:mempool-get mempool y-txid))))
+          "Y mines before X, which is the fee-per-vbyte order, not Core's")
+      ;; The worst chunk is the other one, which is the same statement from
+      ;; the eviction end.
+      (multiple-value-bind (handles) (bl.mp:txgraph-get-worst-main-chunk graph)
+        (is (equalp y-txid (bl.mp:tx-handle-data (first handles))))))))
+
+(test txgraph-cluster-cap-is-core-weight-units
+  "GA11 ed2f2295, executed case 3: the cluster size limit was strictly
+STRICTER than Core's, because each transaction's vsize was rounded up
+individually before the sum. A 64-transaction cluster of total weight 403812
+WU is well inside Core's 404000 (cluster_size_vbytes * WITNESS_SCALE_FACTOR,
+txmempool.cpp:179-181), and its per-transaction vbytes summed to 101001
+against a 101000 cap -- an admission Core accepts, rejected as
+:too-large-cluster. The window is up to 3 WU per transaction, so at 64
+transactions the old cap was up to 192 WU tight.
+
+The chain at exactly the cap, and the one unit past it, are the two controls:
+without them a graph that is never oversized would pass the first assertion."
+  (flet ((chain (total-weight)
+           ;; 64 transactions in one cluster, total weight TOTAL-WEIGHT, each
+           ;; weight congruent to 1 mod 4 as the survey's fixture was.
+           (let* ((mempool (bl.mp:make-mempool))
+                  (graph (bl.mp:mempool-graph mempool))
+                  (each (- (floor total-weight 64) (mod (floor total-weight 64) 4) -1))
+                  (last (- total-weight (* 63 each)))
+                  (prev nil))
+             (dotimes (i 64)
+               (let ((h (bl.mp:txgraph-add-transaction
+                         graph 1000 (if (= i 63) last each)
+                         ;; The graph's fallback order reads this payload as a
+                         ;; txid, so it must be one.
+                         (make-array 32 :element-type '(unsigned-byte 8)
+                                        :initial-element i))))
+                 (when prev (bl.mp:txgraph-add-dependency graph prev h))
+                 (setf prev h)))
+             (bl.mp:txgraph-oversized-p graph))))
+    (is-false (chain 403812)
+              "a 403812-WU cluster is inside Core's 404000 cap and must be accepted")
+    (is-false (chain 404000) "the cap itself must be accepted")
+    (is-true (chain 404004) "one transaction past the cap must be oversized")))
 
 (test sigop-adjusted-vsize-matches-core
   "ceil(max(weight, sigops * DEFAULT_BYTES_PER_SIGOP) / 4), hand-checked

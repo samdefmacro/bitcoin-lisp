@@ -204,8 +204,13 @@ in block (topological) order, WEIGHT/SIGOPS including the coinbase reserve."
                (bl.mp:block-builder-current-chunk builder)
              (when (null handles) (return))
              ;; blockMinFeeRate early-out (miner.cpp:299-303): everything
-             ;; else the builder would offer has a lower feerate.
-             (when (bl.mp:feefrac<< feerate min-feerate)
+             ;; else the builder would offer has a lower feerate. The chunk
+             ;; feerate is fee per sigop-adjusted WEIGHT and the floor is a
+             ;; sat-per-1000-VBYTE rate, so the chunk converts first -- Core's
+             ;; `chunk_feerate_vsize = ToFeePerVSize(chunk_feerate)' compared
+             ;; against blockMinFeeRate.GetFeePerVSize() (miner.cpp:294-299).
+             (when (bl.mp:feefrac<< (bl.mp:feefrac-per-vsize feerate)
+                                    min-feerate)
                (return))
              (let ((entries (mapcar (lambda (h)
                                       (bl.mp:mempool-get
@@ -222,8 +227,8 @@ in block (topological) order, WEIGHT/SIGOPS including the coinbase reserve."
                (cond
                  ;; Core rejects on >= for both budgets (miner.cpp:244-253);
                  ;; its weight test uses the graph's sigops-adjusted weight
-                 ;; where ours uses the exact transaction weight (see
-                 ;; assemble-block-template).
+                 ;; where ours uses the exact transaction weight and a
+                 ;; separate sigop budget (see assemble-block-template).
                  ((and (< (+ weight chunk-weight)
                           *block-max-weight*)
                        (< (+ sigops chunk-sigops)
@@ -255,15 +260,15 @@ it from MEMPOOL by walking txgraph chunks in descending chunk-feerate order
 (cluster mempool; CPFP-aware, since a fee-bumping child shares its parent's
 chunk). BLOCK-TIME defaults to now.
 
-Deliberate divergence from Core's fit test: Core sizes graph entries in
+Deliberate divergence from Core's fit test: Core tests the graph's
 sigops-adjusted weight (max(weight, sigops * 20), txmempool.cpp:1017-1018)
-and tests that against the weight budget, a conservative overestimate; our
-graph is in sigops-adjusted VSIZE (the same value /4, ceilinged — see
-sigop-adjusted-vsize), and the chunk's exact weight and exact sigops are
-each tested against their own consensus budget instead - equally safe,
-marginally less conservative for sigops-dense chunks. Chunk feerates order
-by fee/adjusted-vsize, matching Core's fee/adjusted-weight ordering up to
-the per-tx ceiling."
+against the weight budget, a conservative overestimate; we measure the
+chunk's exact weight and exact sigops and test each against its own
+consensus budget - equally safe, marginally less conservative for
+sigops-dense chunks. The ORDER is Core's exactly: the graph holds
+sigop-adjusted weight, so chunk feerates are fee per adjusted weight, and
+the conversion to virtual bytes happens only where Core's ToFeePerVSize
+does - at the blockMinFeeRate comparison."
   (let* ((tip (bl.store:get-block-index-entry
                chain-state (bl.store:best-block-hash chain-state)))
          (prev-hash (bl.store:best-block-hash chain-state))
