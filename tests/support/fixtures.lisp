@@ -139,6 +139,18 @@ bare form is (signals bl.rpc:rpc-error ...)"))
   (handler-case (progn (funcall thunk) nil)
     (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-code e))))
 
+(defun capture-log-lines (thunk)
+  "The log lines THUNK emits, read out of a ring buffer private to this call.
+Named here because two wallet test files assert on what a code path logged --
+Core routinely puts the detail in the log and the short sentence in the reply,
+so the log line is part of the behaviour under test."
+  (let ((bl.log:*log-buffer* (make-array bl.log:+log-buffer-size+
+                                         :initial-element nil))
+        (bl.log:*log-buffer-index* 0)
+        (bl.log:*log-buffer-count* 0))
+    (funcall thunk)
+    (remove nil (coerce bl.log:*log-buffer* 'list))))
+
 ;;;; Coins-view-cache white-box readers
 
 ;;; The cache's DIRTY/FRESH bookkeeping is internal to BL.STORE, and both

@@ -1044,11 +1044,57 @@ left LOCKED."
 
 ;;; --- Wallet loading (Core CWallet::LoadExisting + walletdb LoadWallet) ---
 
-(defun %load-wallet-descriptor-records (wallet warnings)
+(defun %unrecognized-descriptor-error (wallet last-client condition)
+  "Signal Core's DBErrors::UNKNOWN_DESCRIPTOR for a walletdescriptor record
+this build cannot read, having first logged the detail CONDITION carries.
+
+Core funnels every failure of that record through one classifier.
+WalletDescriptor's SERIALIZE_METHODS runs the descriptor parser inside the
+deserializer and throws ios_base::failure for ANY parse failure
+(walletutil.h:41-64), so a bit flip, a byte outside the descriptor charset, an
+unknown function and a truncated record are one class, not four.
+LoadDescriptorWalletRecords catches it, LOGS the detailed sentence -- whose
+middle clause is the one thing last_client picks (walletdb.cpp:782-783) -- and
+returns UNKNOWN_DESCRIPTOR, on which LoadWallet returns early so no later
+record can produce a second, more confusing message (walletdb.cpp:764-784,
+1141-1147). wallet.cpp:2400-2404 then words the operator's message, which does
+NOT vary with last_client, LoadWalletInternal prefixes \"Wallet loading
+failed. \" (wallet.cpp:286-291), and HandleWalletError's default branch answers
+RPC_WALLET_ERROR."
+  (bl:log-warn "Error: Unrecognized descriptor found in wallet ~A. ~A~
+Please try running the latest software version~%Details: ~A"
+               (wallet-name wallet)
+               (if (> last-client +wallet-client-version+)
+                   "The wallet might have been created on a newer version. "
+                   "The database might be corrupted or the software version is not compatible with one of your wallet descriptors. ")
+               condition)
+  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                    :message (format nil "Wallet loading failed. Unrecognized descriptor found. Loading wallet ~A~%~%The wallet might have been created on a newer version.~%Please try running the latest software version.~%"
+                                     (namestring (wallet-path wallet)))))
+
+(defun %wallet-descriptor-from-record (wallet value network last-client)
+  "The WalletDescriptor stored in VALUE, as (values descriptor creation-time
+next-index range-start range-end), or Core's UNKNOWN_DESCRIPTOR error.
+
+The decode and the parse are guarded together because Core guards them
+together -- they are one deserializer there. The id check that follows is
+NOT inside this: Core does it after the deserialize succeeds and classes a
+mismatch as CORRUPT, a different answer to a different question."
+  (handler-case
+      (multiple-value-bind (desc-str creation-time next-index range-start range-end)
+          (wdb-parse-descriptor-value value)
+        (values (bl.rpc:parse-descriptor desc-str network :require-checksum t)
+                creation-time next-index range-start range-end))
+    (error (e)
+      (%unrecognized-descriptor-error wallet last-client e))))
+
+(defun %load-wallet-descriptor-records (wallet warnings last-client)
   "Pass 1 over WALLET's database: the wallet flags, the master keys, the
 singletons, the address book, and the descriptor records that pass 2's keys
 and caches attach to (LevelDB iteration order does not guarantee
-descriptor-before-key). Returns (values warnings locator)."
+descriptor-before-key). LAST-CLIENT is the version record's value, which
+words the log line for a descriptor record that will not read. Returns
+(values warnings locator)."
   (let ((network (wallet-network wallet))
         (locator-main '())
         (locator-nomerkle '()))
@@ -1065,12 +1111,11 @@ descriptor-before-key). Returns (values warnings locator)."
                                  :message "Unknown wallet flags"))
              (setf (wallet-flags wallet) flags)))
           ((equal type +wdb-key-walletdescriptor+)
-           (multiple-value-bind (desc-str creation-time next-index range-start range-end)
-               (wdb-parse-descriptor-value value)
-             (let* ((desc (bl.rpc:parse-descriptor desc-str network :require-checksum t))
-                    (spkm (%make-spkm-from-descriptor desc creation-time
-                                                      range-start range-end
-                                                      next-index)))
+           (multiple-value-bind (desc creation-time next-index range-start range-end)
+               (%wallet-descriptor-from-record wallet value network last-client)
+             (let ((spkm (%make-spkm-from-descriptor desc creation-time
+                                                     range-start range-end
+                                                     next-index)))
                ;; The stored id must round-trip; guard against corruption.
                (unless (equalp (desc-spkm-id spkm) (wdb-parse-descriptor-fields fields))
                  (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
@@ -1251,7 +1296,7 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
     (multiple-value-bind (last-client has-version-record)
         (%wallet-last-client-version wallet)
       (multiple-value-setq (warnings locator)
-        (%load-wallet-descriptor-records wallet warnings))
+        (%load-wallet-descriptor-records wallet warnings last-client))
       (multiple-value-setq (warnings caches actives)
         (%load-wallet-key-records wallet warnings))
       (when locator

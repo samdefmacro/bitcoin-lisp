@@ -507,15 +507,6 @@ wallet is left UNLOADED, so each caller can bring it back its own way."
 (defun %wc-mentions-p (needle lines)
   (find-if (lambda (line) (search needle line)) lines))
 
-(defun %wc-capture-log (thunk)
-  "The log lines THUNK emits, read out of a ring buffer private to this call."
-  (let ((bl.log:*log-buffer* (make-array bl.log:+log-buffer-size+
-                                         :initial-element nil))
-        (bl.log:*log-buffer-index* 0)
-        (bl.log:*log-buffer-count* 0))
-    (funcall thunk)
-    (remove nil (coerce bl.log:*log-buffer* 'list))))
-
 (test wallet-corrupt-tx-record-rescans-from-height-zero
   "GA11 4e92ca22. Core's LoadTxRecords turns a tx row that will not
 deserialize, or whose hash is not the key it was stored under, into
@@ -560,7 +551,7 @@ an operator actually takes -- a restart -- the divergence above left no trace
 at all. Core joins them into one initWarning (load.cpp:149)."
   (with-wallet-chain-node (node "startup-warn")
     (%wc-fund-and-damage node :flip)
-    (let ((lines (%wc-capture-log
+    (let ((lines (capture-log-lines
                   (lambda ()
                     (bl.wallet:load-wallets-on-startup node '("w"))))))
       (is-true (%wc-mentions-p "hash mismatch" lines))
@@ -574,7 +565,7 @@ at all. Core joins them into one initWarning (load.cpp:149)."
   ;; from the damage and not from every startup load.
   (with-wallet-chain-node (node "startup-clean")
     (%wc-fund-and-damage node :none)
-    (let ((lines (%wc-capture-log
+    (let ((lines (capture-log-lines
                   (lambda ()
                     (bl.wallet:load-wallets-on-startup node '("w"))))))
       (is-true (%wc-mentions-p "Loaded wallet" lines))
