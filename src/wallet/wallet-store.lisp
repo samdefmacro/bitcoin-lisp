@@ -426,6 +426,28 @@ compiles first — can SETF its slots."
                                     (uiop:ensure-directory-pathname path)))
        t))
 
+(defun wallet-db-format-recognized-p (path)
+  "T when PATH holds something this build recognizes as a wallet database:
+a CURRENT file naming a MANIFEST that is actually there.
+
+Core's counterpart is IsSQLiteFile, which reads the header magic before
+MakeDatabase will hand the path to SQLite; a path that fails it is
+FAILED_BAD_FORMAT -- \"Data is not in recognized format.\", answered -18 --
+and never an error out of the storage engine (walletdb.cpp:1329-1382,
+rpc/util.cpp:127-157). A LevelDB's CURRENT is the same kind of cheap total
+probe: one line naming the manifest, checked here for the MANIFEST- prefix so
+a hostile or truncated file is a format answer rather than a path lookup."
+  (let* ((dir (uiop:ensure-directory-pathname path))
+         (current (merge-pathnames "CURRENT" dir))
+         (named (and (probe-file current)
+                     (ignore-errors
+                      (with-open-file (in current :external-format :latin-1)
+                        (read-line in nil nil))))))
+    (and named
+         (alexandria:starts-with-subseq "MANIFEST-" named)
+         (probe-file (merge-pathnames named dir))
+         t)))
+
 (defun map-wallet-db-records (db function)
   "Call FUNCTION with the key and the value of every record in DB, in key
 order. Both are fresh byte vectors, so the callback may keep either one.

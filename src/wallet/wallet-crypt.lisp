@@ -917,6 +917,13 @@ restorewallet). PARAMS: (wallet_name backup_file [load_on_startup])."
                         batch (car record) (cdr record)))
                      (bl.store:leveldb-write db batch :sync t))
                 (bl.store:leveldb-close db)))
+          ;; The same classification the load path uses: a storage condition
+          ;; from opening or writing the new database is Core's FAILED_LOAD
+          ;; behind the verification sentence, at RPC_WALLET_ERROR, never an
+          ;; internal error.
+          (bl.err:storage-error (e)
+            (%restore-cleanup path existed)
+            (%wallet-database-open-error path e))
           (error (e)
             (%restore-cleanup path existed)
             (bl:log-warn "restorewallet: writing ~A failed: ~A" name e)
