@@ -41,7 +41,7 @@ tip-first."
     (when (and manager
                (not (bl.store:chain-state-target-blockhash chainstate)))
       (handler-case
-          (bl.wallet:wallets-block-disconnected manager block height)
+          (bl.wallet:wallets-block-disconnected manager chainstate block height)
         (error (e)
           (log-error "Wallet processing of disconnected block at height ~D FAILED: ~A"
                      height e))))))

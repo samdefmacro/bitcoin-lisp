@@ -29,6 +29,11 @@
   (bl.crypto:encode-p2sh-address
    (bl.crypto:hash160 +optrue-redeem+) :regtest))
 
+(defun %wc-newaddress (node &optional params)
+  "getnewaddress through the exported dispatcher -- eleven call sites in this
+file reached the handler symbol directly."
+  (bl.rpc:dispatch-rpc-method node "getnewaddress" params))
+
 (defun %wc-mine (node n address)
   "Mine N regtest blocks to ADDRESS; returns the block hash hex list."
   (bl.rpc::rpc-generatetoaddress node (list n address)))
@@ -169,7 +174,7 @@ TxStateInterpretSerialized vectors map to the right states."
 categories follow Core's maturity rules (immature until depth 101, the
 COINBASE_MATURITY+1 rule)."
   (with-wallet-chain-node (node "maturity" :wallet "w")
-    (let* ((addr (bl.wallet::rpc-getnewaddress node nil))
+    (let* ((addr (%wc-newaddress node nil))
            (hashes (%wc-mine node 1 addr))
            (cb-txid (%wc-coinbase-txid node (first hashes)))
            (wallet (%wc-wallet node "w")))
@@ -214,7 +219,7 @@ and a from-genesis rescan (rescanblockchain AND a fresh importdescriptors
 wallet) reproduces exactly the live-tracked state."
   (with-wallet-chain-node (node "receive" :wallet "w")
     (let* ((wallet (%wc-wallet node "w"))
-           (addr (bl.wallet::rpc-getnewaddress node nil))
+           (addr (%wc-newaddress node nil))
            (spk (%address-script addr :regtest))
            (fund-hashes (%wc-mine node 1 (%wc-optrue-address))))
       (%wc-mine node 100 (%wc-optrue-address))   ; tip 101, coinbase@1 mature
@@ -315,7 +320,7 @@ wallet) reproduces exactly the live-tracked state."
   "Disconnecting the wallet's coinbase block marks it inactive+abandoned
 (orphan category); reconsidering the block reconfirms it."
   (with-wallet-chain-node (node "cbreorg" :wallet "w")
-    (let* ((addr (bl.wallet::rpc-getnewaddress node nil))
+    (let* ((addr (%wc-newaddress node nil))
            (b1 (first (%wc-mine node 1 addr)))
            (cb-txid (%wc-coinbase-txid node b1))
            (wallet (%wc-wallet node "w")))
@@ -339,6 +344,41 @@ wallet) reproduces exactly the live-tracked state."
       (is (= 2 (%aval "confirmations" (%wc-gettx node cb-txid))))
       (is (= 2 (bl.wallet::wallet-last-block-height wallet))))))
 
+(test wallet-disconnect-writes-the-rolled-back-best-block
+  "GA11 652d565b. Core's CWallet::blockDisconnected ends in
+SetLastBlockProcessed (wallet.cpp:1598), and SetLastBlockProcessed is the
+in-memory pair FOLLOWED BY WriteBestBlock (:681-687) -- so EVERY disconnect
+syncs the rolled-back locator to the wallet file. The connect side
+deliberately does not: it persists only when a wallet tx changed or every 144
+blocks (:1550-1552). Ours mirrored the connect side on both, so between a
+reorg and the next qualifying connect the on-disk bestblock_nomerkle record
+named a block on the ABANDONED branch while memory held the correct
+rolled-back one, and a crash in that window loaded a wallet whose locator
+pointed the wrong way.
+
+Both blocks are mined to a wallet address, so each connect updates a wallet
+tx and forces the locator to disk -- which is what makes the divergence
+visible at all. The pre-disconnect row is the control: it proves the file was
+following the tip before the reorg, so a fix that simply stopped writing on
+connect would not pass."
+  (with-wallet-chain-node (node "bestblock" :wallet "w")
+    (let* ((wallet (%wc-wallet node "w"))
+           (addr (%wc-newaddress node nil))
+           (b1 (first (%wc-mine node 1 addr)))
+           (b2 (first (%wc-mine node 1 addr))))
+      (is (equal b2 (bl.rpc:hash-to-hex (first (wallet-best-block-locator wallet)))))
+      (bl.rpc:dispatch-rpc-method node "invalidateblock" (list b2))
+      ;; Memory rolled back to the parent, as it always did.
+      (is (= 1 (bl.wallet::wallet-last-block-height wallet)))
+      (is (equal b1 (bl.rpc:hash-to-hex (bl.wallet::wallet-last-block-hash wallet))))
+      ;; And so did the file. This is the assertion the fix adds.
+      (let ((locator (wallet-best-block-locator wallet)))
+        (is (equal b1 (bl.rpc:hash-to-hex (first locator))))
+        ;; Core's WriteBestBlock stores chain().findBlock(...).locator(loc),
+        ;; the exponential step-back form terminating at genesis -- not the
+        ;; single-hash fallback, which would cost a full rescan on load.
+        (is (= 2 (length locator)))))))
+
 ;;; --- Reorg across the funding tx + double-spend conflicts ---
 
 (test wallet-funding-reorg-and-conflicts
@@ -349,7 +389,7 @@ reverts it to inactive with the double-spend as a mempool conflict; re-mining
 the double-spend re-conflicts it and clears the mempool conflict."
   (with-wallet-chain-node (node "conflicts" :wallet "w")
     (let* ((wallet (%wc-wallet node "w"))
-           (addr (bl.wallet::rpc-getnewaddress node nil))
+           (addr (%wc-newaddress node nil))
            (spk (%address-script addr :regtest))
            (fund1 (first (%wc-mine node 1 (%wc-optrue-address))))   ; h1
            (fund2 (first (%wc-mine node 1 (%wc-optrue-address)))))  ; h2
@@ -426,7 +466,7 @@ were mined catches up from its stored locator on load."
     (let ((bl.wallet::*rpc-wallet-name* nil)
           (issued '()))
       (bl.wallet::rpc-createwallet node '("w"))
-      (let* ((addr (bl.wallet::rpc-getnewaddress node nil))
+      (let* ((addr (%wc-newaddress node nil))
              (spk (%address-script addr :regtest))
              (cb-hash (first (%wc-mine node 1 addr)))        ; wallet coinbase h1
              (cb-txid (%wc-coinbase-txid node cb-hash))
@@ -437,8 +477,8 @@ were mined catches up from its stored locator on load."
                                   (- +wc-subsidy+ 10000) spk))
                (txid1 (%wc-send node tx1)))
           (%wc-mine node 1 (%wc-optrue-address))              ; tip 103
-          (push (bl.wallet::rpc-getnewaddress node nil) issued)
-          (push (bl.wallet::rpc-getnewaddress node '("" "bech32m")) issued)
+          (push (%wc-newaddress node nil) issued)
+          (push (%wc-newaddress node '("" "bech32m")) issued)
           (let* ((wallet (%wc-wallet node "w"))
                  (before (%wc-state-snapshot wallet)))
             (is (= 2 (length before)))          ; coinbase + tx1
@@ -456,9 +496,8 @@ were mined catches up from its stored locator on load."
               (is (= 2 (%aval "txcount"
                               (bl.wallet::rpc-getwalletinfo node nil))))
               ;; Keypool: no previously issued address is reissued.
-              (let ((fresh (list (bl.wallet::rpc-getnewaddress node nil)
-                                 (bl.wallet::rpc-getnewaddress
-                                  node '("" "bech32m")))))
+              (let ((fresh (list (%wc-newaddress node nil)
+                                 (%wc-newaddress node '("" "bech32m")))))
                 (is (null (intersection issued fresh :test #'string=)))))
             ;; Unload; mine 3 more to the wallet address while unloaded;
             ;; reload catches up from the stored locator.
@@ -507,7 +546,7 @@ unload it, and apply ACTION (:flip, :delete or :none) to its tx record. The
 wallet is left UNLOADED, so each caller can bring it back its own way."
   (with-rpc-wallet (nil)
     (bl.wallet::rpc-createwallet node '("w"))
-    (let* ((address (bl.wallet::rpc-getnewaddress node '("" "bech32")))
+    (let* ((address (%wc-newaddress node '("" "bech32")))
            (path (bl.wallet::wallet-path (%wc-wallet node "w"))))
       (%wc-mine node 1 address)
       (%wc-mine node 101 (%wc-optrue-address))
@@ -734,7 +773,7 @@ range-end and NOT next-index."
                ;; keypool tops up and max-cached-index grows. A top-up that
                ;; does not grow max-cached-index would make this vacuous.
                (let ((before (%wc-total-end-range wallet)))
-                 (dotimes (i 8) (bl.wallet::rpc-getnewaddress node '()))
+                 (dotimes (i 8) (%wc-newaddress node '()))
                  (is (> (%wc-total-end-range wallet) before)
                      "precondition: handing out addresses must grow max-cached-index"))
                (bl.wallet::%rescan-filter-update-if-needed wallet rf)

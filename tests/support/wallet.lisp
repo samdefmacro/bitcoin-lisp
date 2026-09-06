@@ -27,6 +27,20 @@ wallet test files do."
 wallet test files were reaching into the manager's table to say it."
   (gethash name (bl.wallet::wallet-manager-wallets manager)))
 
+;;;; The best-block record a wallet has on disk
+
+(defun wallet-best-block-locator (wallet)
+  "The block hashes in WALLET's on-disk bestblock_nomerkle record, tip first
+(Core WalletBatch::WriteBestBlock's CBlockLocator), or NIL when the record is
+absent. Named here so a test can ask what the WALLET FILE says rather than
+what memory says -- the two are what a crash after a reorg compares."
+  (let ((bytes (bl.store:leveldb-get
+                (bl.wallet::wallet-db wallet)
+                (bl.wallet::wdb-key-simple
+                 bl.wallet::+wdb-key-bestblock-nomerkle+))))
+    (when bytes
+      (bl.wallet::wdb-parse-block-locator-value bytes))))
+
 ;;;; Addressing one wallet through the RPC handlers
 
 (defmacro with-rpc-wallet ((name) &body body)
