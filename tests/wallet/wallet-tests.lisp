@@ -2016,3 +2016,53 @@ that simply moved the hardcoded type would fail here."
   (let ((bl.wallet:*wallet-default-address-type* :bech32))
     (bl.wallet:set-wallet-default-output-type :address "")
     (is (eq :bech32 bl.wallet:*wallet-default-address-type*))))
+
+(defun %utf8-label-classes ()
+  "One label per class the wallet's label field spans: ASCII, Latin-1, CJK and
+an astral-plane emoji. Built with CODE-CHAR so this source file stays ASCII."
+  (list "plain"
+        (string (code-char #xE9))                              ; U+00E9
+        (coerce (list (code-char #x4E2D) (code-char #x6587)) 'string) ; U+4E2D U+6587
+        (string (code-char #x1F600))))                         ; U+1F600
+
+(test wallet-label-survives-the-wallet-file-in-cores-utf-8-bytes
+  "GA11 2cae91f5. The wallet's `name' record holds the label through the same
+:var-string codec row DEFINE-MESSAGE uses, and that row was Latin-1: a label
+with any character above U+00FF made the leveldb write a raw TYPE-ERROR, which
+escaped the wallet store and reached the client as -32603 `Internal error: The
+value 20013 is not of type (UNSIGNED-BYTE 8)' -- setlabel and getnewaddress
+with a label were simply unavailable for CJK, Cyrillic and emoji. A Latin-1
+label did survive our own round trip, but went to disk as ONE byte where Core
+writes the two UTF-8 bytes, so the record diverged from Core's walletdb
+encoding for every accented character.
+
+What this asserts is the wallet SURFACE: that the label reaches the file and
+parses back, so writer and reader agree on the new encoding. It cannot see
+whether those bytes are Core's -- our own Latin-1 write and Latin-1 read were
+self-consistent, which is exactly why the divergence went unnoticed -- so the
+bytes themselves are pinned in the serialization suite
+(VAR-STRING-FIELDS-ARE-UTF-8-BYTES-NOT-ONE-BYTE-PER-CODE-POINT). The ASCII
+label is the control: identical under either encoding."
+  (with-wallet-chain-node (node "utf8label" :wallet "u8")
+    (let* ((labels (%utf8-label-classes))
+           (addresses (mapcar (lambda (label)
+                                (bl.rpc:dispatch-rpc-method
+                                 node "getnewaddress" (list label)))
+                              labels)))
+      (flet ((address-for (label)
+               (mapcar #'car (bl.rpc:dispatch-rpc-method
+                              node "getaddressesbylabel" (list label)))))
+        (loop for label in labels
+              for address in addresses
+              do (is (equal (list address) (address-for label))
+                     "label class ~D was not stored" (char-code (char label 0))))
+        ;; Close the wallet and read it back from the file: the labels now
+        ;; come from the bytes on disk, not from the address book in memory.
+        (with-rpc-wallet (nil)
+          (bl.rpc:dispatch-rpc-method node "unloadwallet" '("u8"))
+          (bl.rpc:dispatch-rpc-method node "loadwallet" '("u8")))
+        (loop for label in labels
+              for address in addresses
+              do (is (equal (list address) (address-for label))
+                     "label class ~D did not survive the wallet file"
+                     (char-code (char label 0))))))))

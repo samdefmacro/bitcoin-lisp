@@ -161,6 +161,9 @@ inline these compile against them. src/util/bytes.lisp.")
    #:br-read-bytes
    #:br-read-compact-size
    #:br-read-var-bytes
+   ;; the character boundary of a serialized string (Core std::string)
+   #:utf8-string-to-bytes
+   #:bytes-to-utf8-string
    #:octets=
    #:octets-hash
    #:make-octets-hash-table

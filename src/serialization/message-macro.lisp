@@ -88,7 +88,7 @@ behind DEFINE-MESSAGE and the wallet's DEFINE-WDB-KEY / DEFINE-WDB-VALUE."
            (internal-error "define-message: a bounded :var-string needs :max and :name"))
          (values 'string
                  `(br-read-limited-string ,br ,max ,name)
-                 `(bb-write-var-bytes ,bb (map '(vector (unsigned-byte 8)) #'char-code ,value))
+                 `(bb-write-var-bytes ,bb (utf8-string-to-bytes ,value))
                  "")))
       ((eq (first type) :list)
        (destructuring-bind (element &key max name) (rest type)
@@ -130,9 +130,14 @@ writes VALUE to the byte-buf BB."
   (br-read-bytes br 32) (bb-write-hash256 bb value))
 (define-message-field-type :var-bytes (simple-array (unsigned-byte 8) (*))
   (br-read-var-bytes br) (bb-write-var-bytes bb value))
+;; Core's std::string is its BYTES (serialize.h:780-793), so the length prefix
+;; and the bytes are BR-READ-VAR-BYTES / BB-WRITE-VAR-BYTES and the character
+;; conversion is explicitly UTF-8 -- never one byte per code point, which put a
+;; different record on disk than Core's for every character above U+007F and
+;; made a write above U+00FF a raw TYPE-ERROR.
 (define-message-field-type :var-string string
-  (map 'string #'code-char (br-read-var-bytes br))
-  (bb-write-var-bytes bb (map '(vector (unsigned-byte 8)) #'char-code value)))
+  (bytes-to-utf8-string (br-read-var-bytes br))
+  (bb-write-var-bytes bb (utf8-string-to-bytes value)))
 (define-message-field-type :block-header t
   (br-read-block-header br) (bb-write-block-header bb value))
 (define-message-field-type :transaction t

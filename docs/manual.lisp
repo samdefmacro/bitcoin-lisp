@@ -427,7 +427,12 @@
   A wire boolean is read the way Core reads one: the byte is assigned to
   the bool (`serialize.h:277`), so EVERY nonzero byte is true and
   `br-read-bool` is the only place that rule is written down -- a field
-  that tests the byte against 1 rejects what Core accepts.
+  that tests the byte against 1 rejects what Core accepts. A serialized
+  string is BYTES the same way (`serialize.h:780-793`): the codec converts
+  characters at exactly one boundary, `bl.bytes:utf8-string-to-bytes` and
+  `bl.bytes:bytes-to-utf8-string`, so a label reaches disk as the bytes
+  Core writes; the decode replaces an invalid sequence rather than
+  signalling, because Core accepts any bytes there.
 
   A transaction is read by Core's UnserializeTransaction, whose shape is
   not `look at the marker byte\': an EMPTY vin is the dummy, the flag byte

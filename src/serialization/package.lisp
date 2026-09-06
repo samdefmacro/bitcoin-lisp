@@ -27,7 +27,8 @@ src/serialization/.")
                 #:br-read-u8 #:br-read-bool
                 #:br-read-u16-le #:br-read-u32-le #:br-read-u64-le
                 #:br-read-i32-le #:br-read-i64-le #:br-read-bytes
-                #:br-read-compact-size #:br-read-var-bytes #:with-byte-reader)
+                #:br-read-compact-size #:br-read-var-bytes #:with-byte-reader
+                #:utf8-string-to-bytes #:bytes-to-utf8-string)
   (:export
    ;; Binary primitives
    #:read-uint8
@@ -87,6 +88,8 @@ src/serialization/.")
    #:br-read-bytes
    #:br-read-compact-size
    #:br-read-var-bytes
+   #:utf8-string-to-bytes
+   #:bytes-to-utf8-string
    #:br-read-transaction
    #:br-read-witness-stack
    ;; Types
