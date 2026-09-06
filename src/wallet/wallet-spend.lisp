@@ -93,6 +93,20 @@ gates the unlimited-ancestors eligibility filter.")
 avoid-partial-spends grouping when it costs no more than this many extra
 satoshis (-1 disables the APS retry).")
 
+(defvar *wallet-avoid-partial-spends* nil
+  "Core -avoidpartialspends, DEFAULT_AVOIDPARTIALSPENDS = false
+(wallet/coincontrol.h:28): sweep every output of an address together rather
+than selecting per output, whatever the extra fee.
+
+Core reads it in the CCoinControl CONSTRUCTOR (wallet/coincontrol.cpp:9-13), so
+it is the STARTING value of every coin control the wallet builds, which is why
+it is the initform of the WCC slot below and not a patch on the call sites. The
+two things that also raise the flag can then only ever raise it: the avoid_reuse
+argument's OR (rpc/spend.cpp:313) and the -maxapsfee retry, which is guarded by
+`(not (wcc-avoid-partial-spends cc))' and so correctly stops running the
+ungrouped attempt once the option is on -- grouping regardless of the extra fee
+is exactly what the operator asked for.")
+
 (defconstant +change-lower+ 50000 "coinselection.h CHANGE_LOWER.")
 (defconstant +change-upper+ 1000000 "coinselection.h CHANGE_UPPER.")
 (defconstant +bnb-total-tries+ 100000 "coinselection.cpp TOTAL_TRIES.")
@@ -269,7 +283,9 @@ decimal string with at most 3 fraction digits, to integer sat/kvB."
   confirm-target
   (fee-mode :unset)          ; :unset / :economical / :conservative
   (signal-bip125-rbf :unset) ; :unset / T / NIL
-  avoid-partial-spends
+  ;; Core reads -avoidpartialspends in every CCoinControl constructor
+  ;; (coincontrol.cpp:9-13), so the option is where a coin control STARTS.
+  (avoid-partial-spends *wallet-avoid-partial-spends*)
   avoid-address-reuse        ; Core default false
   (min-depth 0)
   (max-depth 9999999)

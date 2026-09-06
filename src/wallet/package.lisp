@@ -22,6 +22,7 @@ through the lower packages; the node reaches it only through these exports.")
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export
    #:*wallet-confirm-target*
+   #:*wallet-avoid-partial-spends*
    #:*wallet-consolidate-feerate*
    #:*wallet-cross-chain*
    #:*wallet-directory*

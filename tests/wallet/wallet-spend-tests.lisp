@@ -1380,3 +1380,40 @@ wallet announcing -- and being a soft set, an explicit -walletbroadcast=1 wins."
       (start-node-plist '("-regtest" "-walletbroadcast=0"))
     (declare (ignore plist))
     (is (null (bl.cfg:supplied-core-only-options merged)))))
+
+;;;; -avoidpartialspends (finding feecc533)
+
+(defun %ws-aps-inputs (option)
+  "How many inputs one sendtoaddress selects from a wallet holding three
+matured coinbases at ONE address, with -avoidpartialspends set to OPTION.
+Three at one address is the shape the option exists for: ungrouped selection
+takes one and leaves the other two behind, to be linked to the next spend
+through the shared scriptPubKey."
+  (with-wallet-chain-node (node "ws-aps")
+    (%ws-fund-wallet node :blocks 3)
+    (let* ((bl.wallet:*wallet-avoid-partial-spends* option)
+           (dest (%wc-optrue-address))
+           (txid (bl.rpc:parse-hex-hash
+                  (%ws-sendtoaddress
+                   node (list dest 1 nil nil nil nil nil nil nil 10)))))
+      (length (bl.ser:transaction-inputs (%ws-mempool-tx node txid))))))
+
+(test avoidpartialspends-sweeps-the-address-whatever-the-fee
+  "Core reads -avoidpartialspends in every CCoinControl constructor
+(wallet/coincontrol.cpp:9-13), so it is the starting value of every spend the
+wallet builds. Ours was a dropped option and the slot started NIL, so an
+operator who configured grouping on still got per-output selection
+(GA11 feecc533).
+
+Both directions are asserted and each controls the other: with the option at
+Core's default the SAME call must take one output -- a fix that grouped
+unconditionally fails there -- and with it on, all three. -maxapsfee is at its
+default 0, which is what makes the second assertion the option's own meaning
+rather than the opportunistic retry's: the retry only accepts grouping that
+costs no extra fee, and grouping three inputs instead of one does."
+  (is (= 0 bl.wallet:*wallet-max-aps-fee*)
+      "the -maxapsfee retry must be at Core's default for this to mean anything")
+  (is (= 1 (%ws-aps-inputs nil))
+      "at Core's default the wallet selects per output")
+  (is (= 3 (%ws-aps-inputs t))
+      "-avoidpartialspends=1 must sweep every output of the address"))
