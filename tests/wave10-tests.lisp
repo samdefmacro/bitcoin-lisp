@@ -175,7 +175,7 @@ explicit -maxmempool still wins."
   (let ((bl.mp:*max-mempool-bytes*
           bl.mp:+default-max-mempool-bytes+))
     ;; Explicit value, in megabytes.
-    (bl::apply-config-globals '(("maxmempool" . "50")))
+    (apply-config-globals '(("maxmempool" . "50")))
     (is (= (* 50 1000 1000) bl.mp:*max-mempool-bytes*))
     ;; The mempool built AFTER the wire uses the new cap.
     (is (= (* 50 1000 1000)
@@ -184,21 +184,21 @@ explicit -maxmempool still wins."
     ;; -blocksonly alone shrinks the default.
     (setf bl.mp:*max-mempool-bytes*
           bl.mp:+default-max-mempool-bytes+)
-    (bl::apply-config-globals '(("blocksonly" . "1")))
+    (apply-config-globals '(("blocksonly" . "1")))
     (is (= (* 5 1000 1000) bl.mp:*max-mempool-bytes*))
     ;; ...but an explicit -maxmempool beats it, which is what "soft" means.
     (setf bl.mp:*max-mempool-bytes*
           bl.mp:+default-max-mempool-bytes+)
-    (bl::apply-config-globals '(("blocksonly" . "1")
+    (apply-config-globals '(("blocksonly" . "1")
                                           ("maxmempool" . "100")))
     (is (= (* 100 1000 1000) bl.mp:*max-mempool-bytes*))
     ;; -blocksonly=0 is not the interaction.
     (setf bl.mp:*max-mempool-bytes*
           bl.mp:+default-max-mempool-bytes+)
-    (bl::apply-config-globals '(("blocksonly" . "0")))
+    (apply-config-globals '(("blocksonly" . "0")))
     (is (= bl.mp:+default-max-mempool-bytes+
            bl.mp:*max-mempool-bytes*))
-    (signals error (bl::apply-config-globals '(("maxmempool" . "junk"))))))
+    (signals error (apply-config-globals '(("maxmempool" . "junk"))))))
 
 (test wave10-block-weight-options-wire-and-validate
   "-blockmaxweight/-blockreservedweight are template SELECTION budgets with
@@ -208,28 +208,28 @@ maximum, and the reserve may not fall below MINIMUM_BLOCK_RESERVED_WEIGHT."
           bl.val:+max-block-weight+)
         (bl.mining:*block-reserved-weight*
           bl.mining:+block-reserved-weight+))
-    (bl::apply-config-globals '(("blockmaxweight" . "3000000")))
+    (apply-config-globals '(("blockmaxweight" . "3000000")))
     (is (= 3000000 bl.mining:*block-max-weight*))
-    (bl::apply-config-globals '(("blockreservedweight" . "4000")))
+    (apply-config-globals '(("blockreservedweight" . "4000")))
     (is (= 4000 bl.mining:*block-reserved-weight*))
     ;; A fresh template starts at the configured reserve.
     (is (= 4000 (bl.mining:block-template-total-weight
                  (bl.mining::make-block-template))))
     ;; Above consensus: refused, both options.
     (signals error
-      (bl::apply-config-globals
+      (apply-config-globals
        (list (cons "blockmaxweight"
                    (format nil "~D" (1+ bl.val:+max-block-weight+))))))
     (signals error
-      (bl::apply-config-globals
+      (apply-config-globals
        (list (cons "blockreservedweight"
                    (format nil "~D" (1+ bl.val:+max-block-weight+))))))
     ;; Below the safety floor: refused. Exactly at it: accepted.
     (signals error
-      (bl::apply-config-globals
+      (apply-config-globals
        (list (cons "blockreservedweight"
                    (format nil "~D" (1- bl.mining:+minimum-block-reserved-weight+))))))
-    (bl::apply-config-globals
+    (apply-config-globals
      (list (cons "blockreservedweight"
                  (format nil "~D" bl.mining:+minimum-block-reserved-weight+))))
     (is (= bl.mining:+minimum-block-reserved-weight+
@@ -594,45 +594,45 @@ hex digits, left-padded; junk/overlong -> NIL."
         (bl.net:*onion-proxy* nil)
         (bl.net:*onion-proxy-explicit* nil))
     ;; -assumevalid=<hash>: stored in WIRE order (display reversed)
-    (bl::apply-config-globals '(("assumevalid" . "0xabcd")))
+    (apply-config-globals '(("assumevalid" . "0xabcd")))
     (is (= #xcd (aref bl:*assumevalid-override* 0)))
     (is (= #xab (aref bl:*assumevalid-override* 1)))
     ;; -assumevalid=0 disables
-    (bl::apply-config-globals '(("assumevalid" . "0")))
+    (apply-config-globals '(("assumevalid" . "0")))
     (is (null bl:*assumevalid-override*))
-    (signals error (bl::apply-config-globals '(("assumevalid" . "nothex"))))
+    (signals error (apply-config-globals '(("assumevalid" . "nothex"))))
     ;; -minimumchainwork
-    (bl::apply-config-globals '(("minimumchainwork" . "0x1234")))
+    (apply-config-globals '(("minimumchainwork" . "0x1234")))
     (is (= #x1234 bl:*minimum-chain-work-override*))
-    (signals error (bl::apply-config-globals '(("minimumchainwork" . "junk"))))
+    (signals error (apply-config-globals '(("minimumchainwork" . "junk"))))
     ;; -mempoolexpiry / -minrelaytxfee / -blockmintxfee / -bantime
-    (bl::apply-config-globals '(("mempoolexpiry" . "24")))
+    (apply-config-globals '(("mempoolexpiry" . "24")))
     (is (= 24 bl.mp:*mempool-expiry-hours*))
-    (bl::apply-config-globals '(("minrelaytxfee" . "0.00002")))
+    (apply-config-globals '(("minrelaytxfee" . "0.00002")))
     (is (= 2000 bl.mp:*min-relay-fee-rate*))
     ;; the mempool built AFTER the wire uses the new floor
     (is (= 2000 (bl.mp:mempool-min-fee-rate
                  (bl.mp:make-mempool))))
-    (signals error (bl::apply-config-globals '(("minrelaytxfee" . "junk"))))
-    (bl::apply-config-globals '(("blockmintxfee" . "0.00005")))
+    (signals error (apply-config-globals '(("minrelaytxfee" . "junk"))))
+    (apply-config-globals '(("blockmintxfee" . "0.00005")))
     (is (= 5000 bl.mining:*block-min-tx-fee-rate*))
-    (bl::apply-config-globals '(("bantime" . "3600")))
+    (apply-config-globals '(("bantime" . "3600")))
     (is (= 3600 bl.net:*default-ban-time-seconds*))
     ;; -dnsseed=0 / -fixedseeds=0 / -stopatheight
-    (bl::apply-config-globals '(("dnsseed" . "0") ("fixedseeds" . "0")
+    (apply-config-globals '(("dnsseed" . "0") ("fixedseeds" . "0")
                                           ("stopatheight" . "12345")))
     (is (null bl:*dns-seed-enabled*))
     (is (null bl:*fixed-seeds-enabled*))
     (is (= 12345 bl:*stop-at-height*))
     ;; -uacomment (repeatable, BIP14)
-    (bl::apply-config-globals '(("uacomment" . "alpha") ("uacomment" . "beta")))
+    (apply-config-globals '(("uacomment" . "alpha") ("uacomment" . "beta")))
     (is (string= "/bitcoin-lisp:0.1.0(alpha; beta)/"
                  bl.ser:*user-agent*))
-    (signals error (bl::apply-config-globals '(("uacomment" . "bad(char)"))))
-    (signals error (bl::apply-config-globals
+    (signals error (apply-config-globals '(("uacomment" . "bad(char)"))))
+    (signals error (apply-config-globals
                     (list (cons "uacomment" (make-string 300 :initial-element #\a)))))
     ;; -externalip collected raw
-    (bl::apply-config-globals '(("externalip" . "203.0.113.5")
+    (apply-config-globals '(("externalip" . "203.0.113.5")
                                           ("externalip" . "198.51.100.6")))
     (is (= 2 (length bl.net:*external-ips*)))))
 

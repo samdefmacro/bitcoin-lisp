@@ -235,10 +235,10 @@ very machine the operator asked to leave headroom on."
         (saved-p bl:*parallel-block-validation*))
     (unwind-protect
          (progn
-           (bl::apply-config-globals '(("par" . "3")))
+           (apply-config-globals '(("par" . "3")))
            (is (= 3 bl.val:*parallel-validation-workers*))
            (is-true bl:*parallel-block-validation*)
-           (bl::apply-config-globals '(("par" . "1")))
+           (apply-config-globals '(("par" . "1")))
            (is-false bl:*parallel-block-validation*
                      "-par=1 must disable the extra threads, as Core's does"))
       (setf bl.val:*parallel-validation-workers* saved-n

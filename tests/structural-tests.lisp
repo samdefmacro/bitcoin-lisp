@@ -1528,6 +1528,92 @@ system (strings and comments blanked)."
                            while pos do (incf count)))))))
     count))
 
+(defun %self-delegating-definitions (lines)
+  "The names of the toplevel DEFUN / DEFMACRO forms in LINES (a vector of source
+lines) whose BODY names the definition itself with no package prefix -- a
+wrapper that calls itself.
+
+The failure this catches has happened twice: a scripted consolidation inserts a
+fixture that delegates to the internal it wraps, then rewrites every occurrence
+of that internal's qualified name to the new short name -- including the one
+inside the wrapper it just wrote. The file still compiles, SBCL turns the
+self-call into a tail loop rather than a stack overflow, and the first test that
+runs the fixture hangs instead of failing.
+
+Strings and comments are blanked first (%CODE-ONLY), so a docstring naming the
+function does not count, and a match must be a whole symbol: a name that is only
+the SUFFIX of another symbol (start-node-plist inside args->start-node-plist) is
+not a self-reference. A genuinely recursive fixture would be reported here too;
+there is none, and one would be written with LABELS."
+  (let ((hits '()) (in-string nil) (name nil) (body '()))
+    (labels ((whole-symbol-p (needle text)
+               (loop with n = (length needle)
+                     with start = 0
+                     for pos = (search needle text :start2 start)
+                     while pos
+                     do (let ((before (and (plusp pos) (char text (1- pos))))
+                              (after (and (< (+ pos n) (length text))
+                                          (char text (+ pos n)))))
+                          (when (and (or (null before)
+                                         (and (not (%symbol-char-p before))
+                                              (char/= before #\:)))
+                                     (or (null after) (not (%symbol-char-p after))))
+                            (return t))
+                          (setf start (+ pos n)))
+                     finally (return nil)))
+             (finish ()
+               (when (and name body
+                          (whole-symbol-p name (format nil "~{~A~^~%~}" (reverse body))))
+                 (push name hits))
+               (setf name nil body '()))
+             (definition-name (code)
+               (let ((head (or (%line-head code "(defun ") (%line-head code "(defmacro "))))
+                 (when head
+                   (let ((end (position-if-not #'%symbol-char-p code :start head)))
+                     (when (> (or end (length code)) head)
+                       (subseq code head (or end (length code)))))))))
+      (loop for raw across lines
+            do (multiple-value-bind (code next) (%code-only raw in-string)
+                 (setf in-string next)
+                 (cond ((and (plusp (length code)) (char= (char code 0) #\())
+                        (finish)
+                        (let ((found (definition-name code)))
+                          (when found (setf name found body nil))))
+                       (name (push code body)))))
+      (finish))
+    (nreverse hits)))
+
+(defun %line-head (code prefix)
+  "The index just past PREFIX in CODE when CODE starts with it, else NIL."
+  (let ((n (length prefix)))
+    (and (>= (length code) n) (string= prefix code :end2 n) n)))
+
+(defun %support-fixture-files ()
+  "The tests/support/ files of the tests system, as ASDF declares them."
+  (remove-if-not (lambda (path)
+                   (member "support" (pathname-directory path) :test #'equal))
+                 (%test-system-files)))
+
+(test support-fixtures-do-not-delegate-to-themselves
+  "A fixture in tests/support/ must not be a call to ITSELF. See
+%SELF-DELEGATING-DEFINITIONS: the alias rewrite that folds N reaches into one
+helper rewrites the helper's own body too, and the result compiles, loops
+forever and looks like a slow suite rather than a bug."
+  ;; Positive controls first, so the sweep below cannot pass vacuously.
+  (is (equal '("wrapper")
+             (%self-delegating-definitions
+              (coerce (list "(defun wrapper (x)" "  (wrapper x))") 'vector))))
+  (is (null (%self-delegating-definitions
+             (coerce (list "(defun wrapper (x)" "  (bl::wrapper x))") 'vector))))
+  (is (null (%self-delegating-definitions
+             (coerce (list "(defun plist (x)" "  (bl::args->plist x))") 'vector)))
+      "a name that is only the suffix of another symbol is not a self-call")
+  (dolist (file (%support-fixture-files))
+    (let ((hits (%self-delegating-definitions
+                  (coerce (uiop:read-file-lines file :external-format :utf-8) 'vector))))
+      (is (null hits)
+          "~A: ~{~A~^, ~} call only themselves" (file-namestring file) hits))))
+
 (test test-internal-references-do-not-grow
   "The :: count over tests/ may only fall; see +TEST-INTERNAL-REFERENCE-CEILING+."
   (let ((now (%test-internal-references)))

@@ -615,12 +615,12 @@ rules the operator never asked about."
          (progn
            (let ((bl:*network* :mainnet))
              (signals error
-               (bl::apply-config-globals '(("acceptnonstdtxn" . "1"))))
+               (apply-config-globals '(("acceptnonstdtxn" . "1"))))
              ;; =0 on mainnet is fine — it asks for the default.
-             (bl::apply-config-globals '(("acceptnonstdtxn" . "0")))
+             (apply-config-globals '(("acceptnonstdtxn" . "0")))
              (is-true bl.val:*require-standard*))
            (let ((bl:*network* :regtest))
-             (bl::apply-config-globals '(("acceptnonstdtxn" . "1")))
+             (apply-config-globals '(("acceptnonstdtxn" . "1")))
              (is-false bl.val:*require-standard*)))
       (setf bl.val:*require-standard* saved)))
   (is-true (bl:known-config-option-p "acceptnonstdtxn"))

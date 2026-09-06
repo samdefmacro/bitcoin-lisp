@@ -552,31 +552,31 @@ any Tor route errors, but is allowed when -listenonion will deliver one
       (unwind-protect
            (progn
              ;; No -onion: not explicit.
-             (bl::apply-config-globals '())
+             (apply-config-globals '())
              (is-false bl.net:*onion-proxy-explicit*)
              (is (null bl.net:*onlynet-networks*))
              ;; -onion given: explicit, proxy set.
-             (bl::apply-config-globals '(("onion" . "127.0.0.1:9050")))
+             (apply-config-globals '(("onion" . "127.0.0.1:9050")))
              (is-true bl.net:*onion-proxy-explicit*)
              (is-true bl.net:*onion-proxy*)
              ;; -onion=0: explicit, proxy cleared.
              (setf bl.net:*onion-proxy* nil)
-             (bl::apply-config-globals '(("onion" . "0")))
+             (apply-config-globals '(("onion" . "0")))
              (is-true bl.net:*onion-proxy-explicit*)
              (is (null bl.net:*onion-proxy*))
              ;; -onlynet=onion with no proxy and listenonion off -> error.
              (setf bl.net:*onion-proxy* nil)
              (signals error
-               (bl::apply-config-globals
+               (apply-config-globals
                 '(("onlynet" . "onion") ("listenonion" . "0"))))
              ;; -onlynet=onion + -onion=0 -> error even with listenonion.
              (signals error
-               (bl::apply-config-globals
+               (apply-config-globals
                 '(("onlynet" . "onion") ("onion" . "0"))))
              ;; -onlynet=onion with default listenonion -> allowed; :torv3
              ;; stays out of the reachable set until torcontrol delivers the
              ;; proxy (Core get_socks_cb re-adds it).
-             (bl::apply-config-globals '(("onlynet" . "onion")))
+             (apply-config-globals '(("onlynet" . "onion")))
              (is (equal '(:torv3) bl.net:*onlynet-networks*))
              (is (not (member :torv3 bl.net:*reachable-networks*))))
         (setf bl:*accept-datacarrier* old-datacarrier)))))

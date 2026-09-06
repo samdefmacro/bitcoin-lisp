@@ -331,10 +331,10 @@ executed it."
   "apply-config-globals must record what -zmqpub* asked for, or start-node has
 nothing to bind and the option is silently inert."
   (let ((bl::*zmq-publisher-specs* '()))
-    (bl::apply-config-globals '())
+    (apply-config-globals '())
     (is (null bl::*zmq-publisher-specs*)
         "no -zmqpub option means no publishers, and libzmq stays unloaded")
-    (bl::apply-config-globals
+    (apply-config-globals
      '(("zmqpubhashblock" . "tcp://127.0.0.1:28332") ("zmqpubhashblockhwm" . "7")))
     (is (equal '(("hashblock" "tcp://127.0.0.1:28332" 7))
                bl::*zmq-publisher-specs*))))

@@ -182,6 +182,15 @@ Five test files ask this question, which is why it is a fixture rather than
 fifty-four reaches into the same internal."
   (bl::args->start-node-plist args conf-text settings-rows))
 
+(defun apply-config-globals (merged)
+  "Apply the process-global config specials of the merged config alist MERGED,
+the way START-NODE-FROM-ARGS does: every :GLOBAL / :APPLY row of the option
+table, then the parameter interactions.
+
+Three test files ask this, thirty times between them; the specials it writes
+are process-wide, so a caller rebinds the ones it asserts on."
+  (bl::apply-config-globals merged))
+
 ;;;; P2P message handlers
 
 (defun deliver-getdata (peer payload ctx)
