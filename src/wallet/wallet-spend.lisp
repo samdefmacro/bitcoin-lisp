@@ -2856,23 +2856,26 @@ walletcreatefundedpsbt (rpc/spend.cpp:470-687). Returns
         (multiple-value-bind (descriptors d-present) (%opt solving "descriptors")
           (when d-present
             (dolist (desc-str descriptors)
-              (let ((desc (handler-case
-                              (bl.rpc:parse-descriptor desc-str (wallet-network wallet))
-                            (error (e)
-                              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                                                :message (format nil "Unable to parse descriptor '~A': ~A"
-                                                                 desc-str e))))))
-                (multiple-value-bind (scripts pubkeys)
-                    (handler-case
-                        (bl.rpc:out-desc-expand-with-provider
-                         desc 0 (constantly nil) (bl.rpc:make-descriptor-cache))
-                      (bl.rpc:descriptor-derivation-error () (values nil nil)))
-                  (dolist (script scripts)
-                    (%wcc-add-external-script cc script))
-                  (dolist (pubkey pubkeys)
-                    (setf (gethash (bl.crypto:hash160 pubkey)
-                                   (wcc-external-pubkeys cc))
-                          pubkey)))))))))
+              ;; Every descriptor the string denotes, which for a BIP389
+              ;; multipath one is more than one (Core spend.cpp:631-633).
+              (let ((parsed (handler-case
+                                (bl.rpc:parse-descriptors desc-str (wallet-network wallet))
+                              (error (e)
+                                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                                                  :message (format nil "Unable to parse descriptor '~A': ~A"
+                                                                   desc-str e))))))
+                (dolist (desc parsed)
+                  (multiple-value-bind (scripts pubkeys)
+                      (handler-case
+                          (bl.rpc:out-desc-expand-with-provider
+                           desc 0 (constantly nil) (bl.rpc:make-descriptor-cache))
+                        (bl.rpc:descriptor-derivation-error () (values nil nil)))
+                    (dolist (script scripts)
+                      (%wcc-add-external-script cc script))
+                    (dolist (pubkey pubkeys)
+                      (setf (gethash (bl.crypto:hash160 pubkey)
+                                     (wcc-external-pubkeys cc))
+                            pubkey))))))))))
     ;; input_weights: explicit per-input weight bounds.
     (multiple-value-bind (weights present) (%opt options "input_weights")
       (when present

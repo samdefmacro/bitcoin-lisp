@@ -429,6 +429,46 @@ under the consensus script verifier. Runs WITHOUT vendored vectors."
                (bl.interop:*current-spent-utxos* spent))
           (is-true (bl.val:validate-input-script tx2 0 (aref spent 0))))))))
 
+(test descriptorprocesspsbt-signs-a-multipath-branch
+  "descriptorprocesspsbt reaches EVERY descriptor a BIP389 string denotes, as
+Core's EvalDescriptorStringOrObject does (rpc/util.cpp:1352-1362). The PSBT here
+spends the SECOND branch's output, so a signer that only ever saw descs.at(0)
+cannot complete it -- and before the parser owned multipath, the string was
+refused outright with -5 `Multipath descriptors are not supported', which is the
+offline-signer half of the finding.
+
+The descriptor is unranged on both branches (a fixed final index), so the whole
+answer is the branch choice."
+  (let* ((node (bl:make-node :network :regtest))
+         (seed (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
+         (root (bl.crypto:bip32-master-key seed :network :regtest))
+         (tprv (bl.crypto:bip32-serialize root))
+         (multi (format nil "wpkh(~A/<0;1>/0)" tprv))
+         (branch-1 (format nil "wpkh(~A/1/0)" tprv))
+         (spk (first (bl.rpc::out-desc-expand
+                      (bl.rpc:parse-descriptor branch-1 :regtest) 0)))
+         (value 100000))
+    ;; The two branches are different scripts, or the test would prove nothing.
+    (is-false (equalp spk (first (bl.rpc::out-desc-expand
+                                  (bl.rpc:parse-descriptor
+                                   (format nil "wpkh(~A/0/0)" tprv) :regtest)
+                                  0))))
+    (let* ((result (%psbt-process-with-descriptors
+                    node (%psbt-spending spk value) (list multi)))
+           (hex (cdr (assoc "hex" result :test #'equal))))
+      (is (eq t (cdr (assoc "complete" result :test #'equal)))
+          "descriptorprocesspsbt did not complete the second branch's input")
+      (is (stringp hex))
+      ;; And the witness it built verifies under the consensus verifier.
+      (let* ((tx2 (bl.ser:parse-tx-payload (bl.crypto:hex-to-bytes hex)))
+             (utxo (bl.store:make-utxo-entry :value value :script-pubkey spk))
+             (spent (vector utxo))
+             (bl.interop:*script-flags* bl.val:+standard-script-verify-flags+)
+             (bl.interop:*precomputed-sighash*
+               (bl.interop:init-precomputed-sighash tx2 spent))
+             (bl.interop:*current-spent-utxos* spent))
+        (is-true (bl.val:validate-input-script tx2 0 (aref spent 0)))))))
+
 (defun %psbt-add-partial-sig (psbt pubkey sighash-byte)
   "Put a foreign 71-byte ECDSA partial signature ending in SIGHASH-BYTE on the
 PSBT's first input, keyed by PUBKEY -- a co-signer's contribution, from our

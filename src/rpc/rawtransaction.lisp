@@ -423,6 +423,44 @@ carries no key at all, the satisfier's sign-fn is called with NIL, and a policy
 this node holds every private key for is reported unsignable."
   (lambda (hash) (cdr (gethash hash keymap))))
 
+(defun %bip143-sig (script-code amount key sighash-byte)
+  "A BIP143 (segwit v0) signature over SCRIPT-CODE and AMOUNT, DER || the
+sighash byte. *current-tx*, *current-input-index* and the precomputed sighash
+must be bound by the caller."
+  (concatenate '(vector (unsigned-byte 8))
+               (bl.crypto:sign-ecdsa
+                key (bl.interop:compute-bip143-sighash
+                     script-code amount sighash-byte))
+               (vector sighash-byte)))
+
+(defun %wsh-miniscript-stack (witness-script tx i amount keymap pubmap sighash-byte)
+  "The witness stack for a P2WSH input whose witnessScript is a miniscript
+policy, or NIL. Core's P2WSH miniscript arm (sign.cpp:772-777): reached only
+after the legacy solver has failed, inferring the policy back out of the
+witnessScript with FromScript and demanding a COMPLETE satisfaction
+(Availability::YES). A partial one is not a smaller witness, it is an
+unspendable one.
+
+A malleable satisfaction is refused outright. MS-SATISFY's second value says a
+third party could rewrite the witness into another equally valid one, which
+changes the txid of a transaction already in flight."
+  (let ((node (bl.val:ms-from-script
+               witness-script :pkh-resolver (%wsh-pkh-resolver keymap))))
+    (when node
+      (multiple-value-bind (stack malleable)
+          (bl.val:ms-satisfy
+           node
+           (bl.val:make-ms-satisfier
+            :sign-fn
+            (lambda (pubkey)
+              (let ((sk (gethash pubkey pubmap)))
+                (when sk (%bip143-sig witness-script amount sk sighash-byte))))
+            ;; No preimage source exists on this path; a hash branch is simply
+            ;; unavailable rather than faked.
+            :check-older-fn (lambda (v) (bl.val:ms-check-older tx i v))
+            :check-after-fn (lambda (v) (bl.val:ms-check-after tx i v))))
+        (and stack (not malleable) stack)))))
+
 (defun compute-input-signatures (tx i prev keymap pubmap tr-keymap sighash-byte
                                   precomp spent-utxos &optional (tap-sighash-type #x00)
                                                                 tr-scripts)
@@ -450,14 +488,26 @@ must be bound by the caller."
                                     tx i subscript sighash-byte))
                               (vector sighash-byte)))
                (bip143-sig (script-code key)
-                 (concatenate '(vector (unsigned-byte 8))
-                              (bl.crypto:sign-ecdsa
-                               key (bl.interop:compute-bip143-sighash
-                                    script-code amount sighash-byte))
-                              (vector sighash-byte)))
-               (p2wpkh-scriptcode (pkh)
-                 (concatenate '(vector (unsigned-byte 8))
-                              (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
+                 (%bip143-sig script-code amount key sighash-byte))
+               (p2wpkh-input (pkh wrapped)
+                 ;; Core's SignStep WITNESS_V0_KEYHASH case (sign.cpp:691-693),
+                 ;; reached natively and, for a P2SH-wrapped one, by recursing
+                 ;; on the redeemScript -- which is WRAPPED here, and NIL for
+                 ;; the native form. The scriptCode is the implied P2PKH.
+                 (let ((entry (gethash pkh keymap))
+                       (label (if wrapped "P2SH-P2WPKH" "P2WPKH"))
+                       (script-code (concatenate '(vector (unsigned-byte 8))
+                                                 (vector #x76 #xa9 #x14) pkh
+                                                 (vector #x88 #xac))))
+                   (cond
+                     ((null entry) (fail (format nil "no key for ~A" label)))
+                     ((null amount) (fail (format nil "~A requires amount" label)))
+                     (t (values (%make-input-sig
+                                 :kind (if wrapped :p2sh-p2wpkh :p2wpkh)
+                                 :needed 1 :redeem wrapped
+                                 :ecdsa (list (cons (cdr entry)
+                                                    (bip143-sig script-code
+                                                                (car entry))))))))))
                (legacy-multisig (subscript)
                  (multiple-value-bind (m nn pubkeys) (parse-multisig subscript)
                    (declare (ignore nn))
@@ -475,35 +525,40 @@ must be bound by the caller."
                             pubmap pubkeys m sighash-byte)
                            m)))
                (miniscript-stack (witscript)
-                 ;; Core's P2WSH miniscript arm (sign.cpp:772-777): only after
-                 ;; the legacy solver has failed, inferring the policy back out
-                 ;; of the witnessScript with FromScript and demanding a
-                 ;; COMPLETE satisfaction (Availability::YES). A partial one is
-                 ;; not a smaller witness, it is an unspendable one.
-                 ;;
-                 ;; A malleable satisfaction is refused outright. MS-SATISFY's
-                 ;; second value says a third party could rewrite the witness
-                 ;; into another equally valid one, which changes the txid of a
-                 ;; transaction already in flight.
-                 (let ((node (bl.val:ms-from-script
-                              witscript
-                              :pkh-resolver (%wsh-pkh-resolver keymap))))
-                   (when node
-                     (multiple-value-bind (stack malleable)
-                         (bl.val:ms-satisfy
-                          node
-                          (bl.val:make-ms-satisfier
-                           :sign-fn
-                           (lambda (pubkey)
-                             (let ((sk (gethash pubkey pubmap)))
-                               (when sk (bip143-sig witscript sk))))
-                           ;; No preimage source exists on this path; a hash
-                           ;; branch is simply unavailable rather than faked.
-                           :check-older-fn
-                           (lambda (v) (bl.val:ms-check-older tx i v))
-                           :check-after-fn
-                           (lambda (v) (bl.val:ms-check-after tx i v))))
-                       (and stack (not malleable) stack))))))
+                 (%wsh-miniscript-stack witscript tx i amount
+                                        keymap pubmap sighash-byte))
+               (p2wsh-input (program wrapped)
+                 ;; Core's SignStep WITNESS_V0_SCRIPTHASH case
+                 ;; (sign.cpp:695-702). A P2SH-WRAPPED P2WSH reaches the SAME
+                 ;; case there, because ProduceSignature recurses on the
+                 ;; redeemScript (sign.cpp:743-752), so the two differ only in
+                 ;; the 32-byte PROGRAM the witnessScript is hashed against and
+                 ;; in the redeemScript WRAPPED reveals (NIL for the native
+                 ;; form). One function with those two parameters, because an
+                 ;; inlined copy per call site drifts -- and here the copies
+                 ;; already ordered the amount check differently in their two
+                 ;; halves.
+                 (cond
+                   ((null witness-script)
+                    (fail (format nil "~:[P2WSH~;P2SH-P2WSH~] requires witnessScript" wrapped)))
+                   ((not (equalp (bl.crypto:sha256 witness-script) program))
+                    (fail (if wrapped
+                              "witnessScript hash mismatch (P2SH-P2WSH)"
+                              "witnessScript hash mismatch")))
+                   ((null amount) (fail "P2WSH requires amount"))
+                   ;; Not multisig: Core's fallback is miniscript, not a refusal.
+                   ((not (parse-multisig witness-script))
+                    (let ((stack (miniscript-stack witness-script)))
+                      (unless stack (fail "witnessScript is not multisig"))
+                      (values (%make-input-sig
+                               :kind (if wrapped :p2sh-p2wsh-miniscript :p2wsh-miniscript)
+                               :redeem wrapped :witness-script witness-script
+                               :stack stack))))
+                   (t (multiple-value-bind (pairs m) (bip143-multisig witness-script)
+                        (values (%make-input-sig
+                                 :kind (if wrapped :p2sh-p2wsh :p2wsh)
+                                 :needed m :redeem wrapped
+                                 :witness-script witness-script :ecdsa pairs)))))))
         (cond
           ;; Bare P2PK, Core's FIRST SignStep case (sign.cpp:643-647): the
           ;; scriptPubKey already carries the key, so the key is looked up by
@@ -525,15 +580,7 @@ must be bound by the caller."
                       :kind :p2pkh :needed 1
                       :ecdsa (list (cons (cdr entry) (legacy-sig spk (car entry))))))))
           ((string= type "witness_v0_keyhash")
-           (let ((entry (gethash (subseq spk 2 22) keymap)))
-             (cond
-               ((null entry) (fail "no key for P2WPKH"))
-               ((null amount) (fail "P2WPKH requires amount"))
-               (t (values (%make-input-sig
-                           :kind :p2wpkh :needed 1
-                           :ecdsa (list (cons (cdr entry)
-                                              (bip143-sig (p2wpkh-scriptcode (subseq spk 2 22))
-                                                          (car entry))))))))))
+           (p2wpkh-input (subseq spk 2 22) nil))
           ((string= type "witness_v1_taproot")
            (let* ((output-key (subseq spk 2 34))
                   (sk (gethash output-key tr-keymap))
@@ -573,35 +620,10 @@ must be bound by the caller."
               (fail "redeemScript hash mismatch"))
              ;; P2SH-P2WPKH (nested segwit single-key)
              ((and (= (length redeem) 22) (= (aref redeem 0) #x00) (= (aref redeem 1) #x14))
-              (let ((entry (gethash (subseq redeem 2 22) keymap)))
-                (cond
-                  ((null entry) (fail "no key for P2SH-P2WPKH"))
-                  ((null amount) (fail "P2SH-P2WPKH requires amount"))
-                  (t (values (%make-input-sig
-                              :kind :p2sh-p2wpkh :needed 1 :redeem redeem
-                              :ecdsa (list (cons (cdr entry)
-                                                 (bip143-sig (p2wpkh-scriptcode (subseq redeem 2 22))
-                                                             (car entry))))))))))
-             ;; P2SH-P2WSH (nested segwit multisig; witnessScript = real script)
+              (p2wpkh-input (subseq redeem 2 22) redeem))
+             ;; P2SH-P2WSH (nested segwit; witnessScript = the real script)
              ((and (= (length redeem) 34) (= (aref redeem 0) #x00) (= (aref redeem 1) #x20))
-              (cond
-                ((null witness-script) (fail "P2SH-P2WSH requires witnessScript"))
-                ((not (equalp (bl.crypto:sha256 witness-script) (subseq redeem 2 34)))
-                 (fail "witnessScript hash mismatch (P2SH-P2WSH)"))
-                ;; Not multisig: Core's fallback is miniscript, not a refusal.
-                ((not (parse-multisig witness-script))
-                 (cond
-                   ((null amount) (fail "P2WSH requires amount"))
-                   (t (let ((stack (miniscript-stack witness-script)))
-                        (if stack
-                            (values (%make-input-sig
-                                     :kind :p2sh-p2wsh-miniscript :redeem redeem
-                                     :witness-script witness-script :stack stack))
-                            (fail "witnessScript is not multisig"))))))
-                ((null amount) (fail "P2WSH requires amount"))
-                (t (multiple-value-bind (pairs m) (bip143-multisig witness-script)
-                     (values (%make-input-sig :kind :p2sh-p2wsh :needed m :redeem redeem
-                                              :witness-script witness-script :ecdsa pairs))))))
+              (p2wsh-input (subseq redeem 2 34) redeem))
              ;; P2SH-multisig (legacy)
              ((parse-multisig redeem)
               (multiple-value-bind (pairs m) (legacy-multisig redeem)
@@ -609,24 +631,7 @@ must be bound by the caller."
                                          :ecdsa pairs))))
              (t (fail "unsupported redeemScript type"))))
           ((string= type "witness_v0_scripthash")   ; native P2WSH
-           (cond
-             ((null witness-script) (fail "P2WSH requires witnessScript"))
-             ((not (equalp (bl.crypto:sha256 witness-script) (subseq spk 2 34)))
-              (fail "witnessScript hash mismatch"))
-             ;; Not multisig: Core's fallback is miniscript, not a refusal.
-             ((not (parse-multisig witness-script))
-              (cond
-                ((null amount) (fail "P2WSH requires amount"))
-                (t (let ((stack (miniscript-stack witness-script)))
-                     (if stack
-                         (values (%make-input-sig
-                                  :kind :p2wsh-miniscript
-                                  :witness-script witness-script :stack stack))
-                         (fail "witnessScript is not multisig"))))))
-             ((null amount) (fail "P2WSH requires amount"))
-             (t (multiple-value-bind (pairs m) (bip143-multisig witness-script)
-                  (values (%make-input-sig :kind :p2wsh :needed m
-                                           :witness-script witness-script :ecdsa pairs))))))
+           (p2wsh-input (subseq spk 2 34) nil))
           ((parse-multisig spk)   ; bare multisig
            (multiple-value-bind (pairs m) (legacy-multisig spk)
              (values (%make-input-sig :kind :multisig :needed m :ecdsa pairs))))

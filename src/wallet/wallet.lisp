@@ -2197,22 +2197,21 @@ backup.cpp:141-300). Returns the per-request result alist; rpc-errors are
 caught into {success: false, error: {...}}.
 
 A MULTIPATH descriptor (BIP389, `<0;1>`) is ONE request that imports N
-descriptors. Core's rules, all of them load-bearing for a real wallet export:
+descriptors and answers with ONE result, because Core returns one result per
+REQUEST. Its rules, all of them load-bearing for a real wallet export:
 
-  - with exactly two expansions, the SECOND is the internal (change) chain
-    regardless of what `internal` said — `desc_internal = j == 1`
-    (backup.cpp:230-231). This is what makes a single Sparrow/BDK export set up
-    both chains in one call.
-  - with more than two, `internal` must not be set (:232-234).
-  - a multipath descriptor may not carry a label (:203-206)."
-  (let ((expansions (handler-case
-                        (and (hash-table-p data)
-                             (stringp (gethash "desc" data))
-                             (bl.rpc:expand-multipath-descriptor (gethash "desc" data)))
-                      (bl.rpc:rpc-error () nil))))
-    (when (and expansions (rest expansions))
-      (return-from %process-descriptor-import
-        (%process-multipath-import wallet data timestamp expansions))))
+  - with exactly two branches, the SECOND is the internal (change) chain --
+    `desc_internal = j == 1` (backup.cpp:230-231). This is what makes a single
+    Sparrow/BDK/Core export set up both chains in one call.
+  - `internal` may not be given at all alongside a multipath descriptor
+    (:162-166); the branches decide it.
+  - a multipath descriptor may not carry a label (:203-206).
+
+The branches come from the PARSER, which is where Core has them: a string
+rewriter in front of it cannot tell `<0;1>' in a key path (valid, two
+descriptors) from one in an origin (invalid), and refuses a second key
+expression carrying its own specifier, which is exactly what an n-of-m cosigner
+export looks like."
   (let ((warnings '()))
     (handler-case
         (progn
@@ -2226,16 +2225,26 @@ descriptors. Core's rules, all of them load-bearing for a real wallet export:
             (unless (stringp desc-str)
               (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-type-error+
                                 :message "desc must be a string"))
-            (let* ((active (and (gethash "active" data) t))
+            (let* ((descs (bl.rpc:parse-descriptors desc-str (wallet-network wallet)
+                                                    :require-checksum t))
+                   ;; Every flag below is read off descs.at(0), as Core reads
+                   ;; them: the branches of one string differ only in a path
+                   ;; element, so they are ranged, solvable and single-type
+                   ;; together.
+                   (desc (first descs))
+                   (multipath (and (rest descs) t))
+                   (active (and (gethash "active" data) t))
                    (label-present (nth-value 1 (gethash "label" data)))
                    (label (%label-from-value (gethash "label" data)))
+                   (internal-present (nth-value 1 (gethash "internal" data)))
                    (internal (and (gethash "internal" data) t))
-                   (desc (bl.rpc:parse-descriptor desc-str (wallet-network wallet)
-                                           :require-checksum t))
                    (ranged (bl.rpc:out-desc-ranged-p desc))
                    (range-start 0)
                    (range-end 1)
                    (next-index 0))
+              (when (and multipath internal-present)
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                                  :message "Cannot have multipath descriptor while also specifying 'internal'"))
               (multiple-value-bind (range range-present) (gethash "range" data)
                 (cond
                   ((and (not ranged) range-present)
@@ -2260,6 +2269,9 @@ descriptors. Core's rules, all of them load-bearing for a real wallet export:
               (when (and active (not ranged))
                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                   :message "Active descriptors must be ranged"))
+              (when (and multipath label-present)
+                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                                  :message "Multipath descriptors should not have a label"))
               (when (and ranged label-present)
                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                   :message "Ranged descriptors should not have a label"))
@@ -2269,24 +2281,16 @@ descriptors. Core's rules, all of them load-bearing for a real wallet export:
               (when (and active (not (out-desc-single-type-p desc)))
                 (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                   :message "Combo descriptors cannot be set to active"))
-              (let ((keys (%out-desc-embedded-keys desc))
+              ;; One key provider for the whole request, as Core has: Parse
+              ;; fills a single FlatSigningProvider over every branch.
+              (let ((keys (remove-duplicates
+                           (loop for one in descs append (%out-desc-embedded-keys one))
+                           :key #'first :test #'equalp))
                     (priv-disabled (wallet-flag-set-p
                                     wallet +wallet-flag-disable-private-keys+)))
                 (when (and priv-disabled keys)
                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                     :message "Cannot import private keys to a wallet with private keys disabled"))
-                ;; Expansion check at position 0 (Core Expand(0, keys, ...)).
-                (handler-case
-                    (bl.rpc:out-desc-expand-with-provider
-                     desc range-start
-                     (lambda (keyid)
-                       (loop for (pubkey priv) in keys
-                             when (equalp keyid (bl.crypto:hash160 pubkey))
-                               do (return priv)))
-                     (bl.rpc:make-descriptor-cache))
-                  (bl.rpc:descriptor-derivation-error ()
-                    (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
-                                      :message "Cannot expand descriptor. Probably because of hardened derivations without private keys provided")))
                 (unless priv-disabled
                   (when (null keys)
                     (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
@@ -2295,24 +2299,15 @@ descriptors. Core's rules, all of them load-bearing for a real wallet export:
                                  (bl.rpc:out-desc-ordered-keys desc))
                     (push "Not all private keys provided. Some wallet functionality may return unexpected errors"
                           warnings)))
-                (let ((spkm (handler-case
-                                (wallet-add-descriptor wallet desc timestamp
-                                                       range-start range-end
-                                                       next-index keys label
-                                                       internal)
-                              (bl.rpc:rpc-error (e)
-                                (error 'bl.rpc:rpc-error
-                                       :code (bl.rpc:rpc-error-code e)
-                                       :message (format nil "Could not add descriptor '~A': ~A"
-                                                        desc-str (bl.rpc:rpc-error-message e))))))
-                      (output-type (out-desc-output-type desc)))
-                  (if active
-                      (if output-type
-                          (wallet-add-active-spkm wallet spkm output-type internal)
-                          (push "Unknown output type, cannot set descriptor to active."
-                                warnings))
-                      (when output-type
-                        (wallet-deactivate-spkm wallet spkm output-type internal)))))
+                (loop for one in descs
+                      for j from 0
+                      ;; Two branches: the second IS the change chain, whatever
+                      ;; the request said (backup.cpp:230-231).
+                      for one-internal = (if (= (length descs) 2) (= j 1) internal)
+                      do (%import-one-descriptor wallet one desc-str timestamp
+                                                 range-start range-end next-index
+                                                 keys label one-internal active
+                                                 (lambda (w) (push w warnings)))))
               (%push-warnings (nreverse warnings) `(("success" . t))))))
       (bl.rpc:rpc-error (e)
         (%push-warnings (nreverse warnings)
@@ -2320,38 +2315,42 @@ descriptors. Core's rules, all of them load-bearing for a real wallet export:
                           ("error" . (("code" . ,(bl.rpc:rpc-error-code e))
                                       ("message" . ,(bl.rpc:rpc-error-message e))))))))))
 
-(defun %process-multipath-import (wallet data timestamp expansions)
-  "Import the EXPANSIONS of one multipath request and return a single result,
-as Core returns one result per REQUEST rather than per expansion."
+(defun %import-one-descriptor (wallet desc desc-str timestamp
+                               range-start range-end next-index
+                               keys label internal active warn)
+  "Add ONE parsed descriptor to WALLET (the body of Core's per-descriptor loop,
+backup.cpp:236-300). DESC-STR is the request's original string, which is what
+Core names in its `Could not add descriptor' message even for a multipath
+branch. WARN is called with any warning text."
+  ;; Expansion check at position 0 (Core Expand(0, keys, ...)).
   (handler-case
-      (progn
-        (when (nth-value 1 (gethash "label" data))
-          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                            :message "Multipath descriptors should not have a label"))
-        (when (and (> (length expansions) 2)
-                   (gethash "internal" data))
-          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
-                            :message "Cannot have multipath descriptor with more than two paths and internal"))
-        (loop for expansion in expansions
-              for index from 0
-              do (let ((sub (make-hash-table :test 'equal)))
-                   (maphash (lambda (k v) (setf (gethash k sub) v)) data)
-                   ;; The checksum covered the multipath form, not this
-                   ;; expansion, so a fresh one is computed for each.
-                   (setf (gethash "desc" sub)
-                         (bl.rpc:descriptor-add-checksum expansion))
-                   ;; Two expansions: the second IS the change chain, whatever
-                   ;; the request said (Core backup.cpp:230-231).
-                   (when (= (length expansions) 2)
-                     (setf (gethash "internal" sub) (= index 1)))
-                   (let ((result (%process-descriptor-import wallet sub timestamp)))
-                     (unless (eq t (cdr (assoc "success" result :test #'string=)))
-                       (return-from %process-multipath-import result)))))
-        `(("success" . t)))
-    (bl.rpc:rpc-error (e)
-      `(("success" . nil)
-        ("error" . (("code" . ,(bl.rpc:rpc-error-code e))
-                    ("message" . ,(bl.rpc:rpc-error-message e))))))))
+      (bl.rpc:out-desc-expand-with-provider
+       desc range-start
+       (lambda (keyid)
+         (loop for (pubkey priv) in keys
+               when (equalp keyid (bl.crypto:hash160 pubkey))
+                 do (return priv)))
+       (bl.rpc:make-descriptor-cache))
+    (bl.rpc:descriptor-derivation-error ()
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                        :message "Cannot expand descriptor. Probably because of hardened derivations without private keys provided")))
+  (let ((spkm (handler-case
+                  (wallet-add-descriptor wallet desc timestamp
+                                         range-start range-end
+                                         next-index keys label
+                                         internal)
+                (bl.rpc:rpc-error (e)
+                  (error 'bl.rpc:rpc-error
+                         :code (bl.rpc:rpc-error-code e)
+                         :message (format nil "Could not add descriptor '~A': ~A"
+                                          desc-str (bl.rpc:rpc-error-message e))))))
+        (output-type (out-desc-output-type desc)))
+    (if active
+        (if output-type
+            (wallet-add-active-spkm wallet spkm output-type internal)
+            (funcall warn "Unknown output type, cannot set descriptor to active."))
+        (when output-type
+          (wallet-deactivate-spkm wallet spkm output-type internal)))))
 
 (bl.rpc:define-rpc "importdescriptors" (node params)
   "Import descriptors into the wallet (Bitcoin Core importdescriptors), then

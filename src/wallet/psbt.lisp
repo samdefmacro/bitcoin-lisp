@@ -1562,23 +1562,29 @@ the input to %sign-map-add-key! and the derivations."
         (unless (stringp desc-str)
           (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                             :message "Descriptor needs to be provided in the object"))
-        (let ((desc (bl.rpc:parse-descriptor desc-str network)))
+        ;; A BIP389 multipath string denotes several descriptors and Core
+        ;; expands every one of them (rpc/util.cpp:1352-1362), which is what
+        ;; lets an offline signer be handed one cosigner export and reach both
+        ;; the receive and the change chain.
+        (let* ((parsed (bl.rpc:parse-descriptors desc-str network))
+               (ranged (bl.rpc:out-desc-ranged-p (first parsed))))
           (multiple-value-bind (low high)
-              (cond ((not (bl.rpc:out-desc-ranged-p desc)) (values 0 0))
+              (cond ((not ranged) (values 0 0))
                     (range (bl.rpc:parse-descriptor-range range))
                     (t (values 0 1000)))
             (loop for pos from low to high
-                  do (let ((cache (bl.rpc:make-descriptor-cache)))
-                       (multiple-value-bind (scripts pubkeys)
-                           (handler-case
-                               (bl.rpc:out-desc-expand-with-provider desc pos nil cache)
-                             (error () (values nil nil)))
-                         (when scripts
-                           (let ((pairs (mapcar #'cons (bl.rpc:out-desc-ordered-keys desc)
-                                                pubkeys)))
-                             (dolist (s scripts)
-                               (unless (gethash s table)
-                                 (setf (gethash s table) (list desc pos pairs)))))))))))))))
+                  do (dolist (desc parsed)
+                       (let ((cache (bl.rpc:make-descriptor-cache)))
+                         (multiple-value-bind (scripts pubkeys)
+                             (handler-case
+                                 (bl.rpc:out-desc-expand-with-provider desc pos nil cache)
+                               (error () (values nil nil)))
+                           (when scripts
+                             (let ((pairs (mapcar #'cons (bl.rpc:out-desc-ordered-keys desc)
+                                                  pubkeys)))
+                               (dolist (s scripts)
+                                 (unless (gethash s table)
+                                   (setf (gethash s table) (list desc pos pairs))))))))))))))))
 
 (defun %descriptor-sign-maps (expansions tx coins)
   "(values keymap pubmap tr-keymap) for the inputs of TX whose spent script is in

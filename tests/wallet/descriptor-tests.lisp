@@ -220,16 +220,13 @@ must be exactly MESSAGE."
                      "pkh(xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/+1)"
                      "pkh(): Key path value '+1' is not a valid uint32"))
 
-(test desc-core-multipath-rejected
-  "Multipath specifiers: rejected (P0 scope) with a clear error in key paths;
-Core's own error where multipath is never allowed (origins)."
-  (%check-unparsable "pkh(xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U/<0;1>)"
-                     "pkh(xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/<0;1>)"
-                     "pkh(): Multipath descriptors are not supported")
-  (%check-unparsable "pkh([deadbeef/<0;1>]xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U/0)"
-                     "pkh([deadbeef/<0;1>]xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/0)"
-                     "pkh(): Key path value '<0;1>' specifies multipath in a section where multipath is not allowed")
-  ;; A malformed multipath (no closing '>') is an invalid uint32, like Core.
+(test desc-core-multipath-malformed-paths
+  "A `<' that does not open a well-formed multipath element is an ordinary
+invalid path value, exactly as in Core: the specifier is recognised only when
+the element BEGINS with `<' and ENDS with `>' (descriptor.cpp:1802). The
+multipath vectors proper -- what a well-formed one parses INTO, and Core's own
+rejections -- are DESC-CORE-MULTIPATH-VECTORS and
+DESC-CORE-MULTIPATH-REJECTIONS below."
   (%check-unparsable "wpkh(xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U/<0/*)"
                      "wpkh(xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/<0/*)"
                      "wpkh(): Key path value '<0' is not a valid uint32")
@@ -657,106 +654,322 @@ Core's 'Ranged descriptor not accepted' behavior."
     (is (= 1 (length pairs)))
     (is (= 22 (length (car (first pairs)))))))
 
-;;;; Multipath descriptors (BIP389)
+;;;; Multipath descriptors, BIP389 (Core CheckMultipath, descriptor_tests.cpp)
 
-(defun %mp-expand (s)
-  (handler-case (bl.rpc:expand-multipath-descriptor s)
-    (bl.rpc:rpc-error (e)
-      (list :error (bl.rpc:rpc-error-message e)))))
+(defun %check-multipath (prv pub expanded-pubs scripts)
+  "Port of Core's CheckMultipath(): PRV and PUB are the multipath strings, and
+each must parse into exactly (length EXPANDED-PUBS) descriptors whose canonical
+public forms are EXPANDED-PUBS in order. SCRIPTS holds, per branch, the expected
+scriptPubKey hex per range index.
 
-(test multipath-descriptors-expand-into-one-descriptor-each
-  "`wpkh(xpub/<0;1>/*)` is ONE string meaning TWO descriptors — the receive
-chain and the change chain — and it is how Sparrow, Ledger Live, BlueWallet,
-BDK and modern Core exports write a wallet. A node that cannot read it cannot
-import from any of them.
+Core takes each expansion apart as a standalone descriptor -- it deallocates all
+but one and keeps using that one -- so the branches must not share mutable
+structure. Expanding every branch at every index here exercises the same thing."
+  (dolist (form (list prv pub))
+    (let ((descs (bl.rpc:parse-descriptors form :mainnet)))
+      (is (= (length expanded-pubs) (length descs))
+          "~A parsed into ~D descriptors, wanted ~D"
+          form (length descs) (length expanded-pubs))
+      (loop for desc in descs
+            for want in expanded-pubs
+            for branch in scripts
+            do (is (string= want (bl.rpc:out-desc-string desc))
+                   "branch prints as ~A, wanted ~A"
+                   (bl.rpc:out-desc-string desc) want)
+               (loop for expected in branch
+                     for i from 0
+                     do (is (equal expected
+                                   (mapcar #'bl.crypto:bytes-to-hex
+                                           (bl.rpc::out-desc-expand desc i)))
+                            "~A branch ~A at ~D expands to ~S, wanted ~S"
+                            form want i
+                            (mapcar #'bl.crypto:bytes-to-hex
+                                    (bl.rpc::out-desc-expand desc i))
+                            expected)))))
+  ;; The checksum covers the multipath string as written; each branch gets its
+  ;; own when one is needed.
+  (is (stringp (nth-value 1 (bl.rpc:parse-descriptors
+                             (bl.rpc:descriptor-add-checksum pub) :mainnet
+                             :require-checksum t)))))
 
-Core expands the string and parses each result normally (Parse returns a
-vector, descriptor.cpp:1802-1851); expanding at the string level is what keeps
-derivation, signing, printing and checksums working on descriptors they already
-understand."
-  (is (equal '("wpkh(xpub661MyMwAqRbcF/0/*)")
-             (%mp-expand "wpkh(xpub661MyMwAqRbcF/0/*)"))
-      "a descriptor with no multipath must come back unchanged")
-  (is (equal '("wpkh([deadbeef/84h/1h/0h]xpub/0/*)"
-               "wpkh([deadbeef/84h/1h/0h]xpub/1/*)")
-             (%mp-expand "wpkh([deadbeef/84h/1h/0h]xpub/<0;1>/*)")))
-  (is (equal '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)" "wpkh(xpub/2/*)")
-             (%mp-expand "wpkh(xpub/<0;1;2>/*)")))
-  ;; The substituted text is the ORIGINAL spelling, so a hardened marker
-  ;; survives as written rather than being re-rendered.
-  (is (equal '("wpkh(xpub/0h/*)" "wpkh(xpub/1h/*)")
-             (%mp-expand "wpkh(xpub/<0h;1h>/*)")))
-  ;; The input checksum covered the multipath form, not the expansions, so it
-  ;; is dropped; each expansion gets its own when one is needed.
-  (is (equal '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)")
-             (%mp-expand "wpkh(xpub/<0;1>/*)#abcdefgh"))))
+(test desc-core-multipath-vectors
+  "Core's own CheckMultipath vectors. One string, several descriptors -- and
+every place Core clones a length-1 expansion up to the longest is here: a
+multi() with two specifiers of DIFFERENT values (the shape an n-of-m cosigner
+export has, and the one the old string-level expander refused outright), an
+sh(multi()) mixing multipath and plain keys, a tr() whose internal key and whose
+leaves are multipath together and separately, and a wsh(miniscript)."
+  ;; descriptor_tests.cpp:748
+  (%check-multipath
+   "multi(2,xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc/<1;2>/*,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/<3;4>/0/*)"
+   "multi(2,xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/<1;2>/*,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/<3;4>/0/*)"
+   '("multi(2,xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/1/*,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/3/0/*)"
+     "multi(2,xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/2/*,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/4/0/*)")
+   '((("522103095e95d8c50ae3f3fea93fa8e983f710489f60ff681a658c06eba64622c824b121020443e9e729b42628913f1a69b46b7d43ff87c46e86140e12ee420d7e2e8caf8c52ae")
+       ("5221027512d6bd74e24eeb1ad752d5be800adc5886ded11c5293a9a701db83658b526a2102371e912dea5fefa56158908fe4c9f66bc925a8939b10f3821e8f8be797b9ca8252ae")
+       ("522102cc9fd211dc0a1c8bb7a106ff831be0e253bc992f21d08fb8a6fd43fae51b9b892103e43eddc68afc9746c9d09ce0bf8067b4f2416287abbc422ed1ac300673b1104952ae"))
+     (("5221031c0517fff3d483f06ca769bd2326bf30aca1c4de278e676e6ef760c3301244c6210316e171ff4f82dc62ad3f0d84c97865034fc5041eaa508b48c1d7af77f301c8bd52ae")
+       ("52210240f010ccff4202ade2ef87756f6b9af57bbf5ebcb0393b949e6e5d45d30bff36210229057a7e03510b8cb66727fab3f47a52a02ea94eae03e7c2e81b72a26781bfde52ae")
+       ("5221034052522058a07b647bd08fa1a9eaedae0222eac76ddd122ff8096ec969398de721038cb8180dd4c956848bcf191e45aaf297146207559fb8737881156aadaf13704152ae"))))
 
-(test multipath-rejects-what-core-rejects
-  "All three messages are Core's own (descriptor.cpp:1809-1831)."
-  (is (equal '(:error "Multipath key path specifiers must have at least two items")
-             (%mp-expand "wpkh(xpub/<0>/*)")))
-  (is (equal '(:error "Duplicated key path value 0 in multipath specifier")
-             (%mp-expand "wpkh(xpub/<0;0>/*)")))
-  (is (equal '(:error "Multiple multipath key path specifiers found")
-             (%mp-expand "wsh(multi(2,xpub1/<0;1>/*,xpub2/<0;1>/*))")))
-  ;; A non-numeric path value is still a path-value error.
-  (is (eq :error (first (%mp-expand "wpkh(xpub/<0;x>/*)")))))
+  ;; descriptor_tests.cpp:803
+  (%check-multipath
+   "sh(multi(2,xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc/<1;2;3>/0/*,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0/*,xprv9s21ZrQH143K3jUwNHoqQNrtzJnJmx4Yup8NkNLdVQCymYbPbJXnPhwkfTfxZfptcs3rLAPUXS39oDLgrNKQGwbGsEmJJ8BU3RzQuvShEG4/0/0/<3;4;5>/*))"
+   "sh(multi(2,xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/<1;2;3>/0/*,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0/*,xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/<3;4;5>/*))"
+   '("sh(multi(2,xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/1/0/*,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0/*,xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/3/*))"
+     "sh(multi(2,xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/2/0/*,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0/*,xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/4/*))"
+     "sh(multi(2,xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/3/0/*,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0/*,xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/5/*))")
+   '((("a914689cdf7de5836ec04fb971d128cc84858f73e11487")
+       ("a9142ea7dbaf0a77ee19f080cdacb3e13560e3cd9cf587")
+       ("a9143da854021f58f5e2d3ff6bb4fcd0ced877deb34987"))
+     (("a9143dd613d162e89b83369bbf08e5f1977cfdc9b02787")
+       ("a91449eef5d3df5c465b20a630c66058fe689082d8e187")
+       ("a91492be56babf54ea2109c577f799ba6d73948e8c3287"))
+     (("a9140093ca92097bdf557fbb0570bb77e1efd2e7529c87")
+       ("a914e4d0419d3d2ce8f921a800796811ff5462bb151887")
+       ("a914997bf69841ac444190dc02f5e6031dd6f8feab4587"))))
 
-(test multipath-import-makes-the-second-path-the-change-chain
-  "With exactly two expansions Core sets desc_internal = (j == 1) — the second
-IS the change chain, whatever the request said (backup.cpp:230-231). That is
-what makes a single wallet export configure both chains in one call, and it is
-the reason a multipath import cannot carry a label (:203-206)."
-  (let* ((seen '())
-         (wallet :fake))
-    ;; Drive the multipath path directly, recording what each expansion was
-    ;; imported as. %PROCESS-DESCRIPTOR-IMPORT is stubbed: the assertion is
-    ;; about which descriptor/internal pairs it is CALLED with.
-    (flet ((fake-import (w data ts)
-             (declare (ignore w ts))
-             (push (cons (gethash "desc" data) (gethash "internal" data)) seen)
-             '(("success" . t))))
-      (let ((original (symbol-function 'bl.wallet::%process-descriptor-import)))
-        (unwind-protect
-             (progn
-               (setf (symbol-function 'bl.wallet::%process-descriptor-import)
-                     #'fake-import)
-               (let ((data (make-hash-table :test 'equal)))
-                 (setf (gethash "desc" data) "wpkh(xpub/<0;1>/*)")
-                 (let ((result (bl.wallet::%process-multipath-import
-                                wallet data 1
-                                '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)"))))
-                   (is (eq t (cdr (assoc "success" result :test #'string=)))))))
-          (setf (symbol-function 'bl.wallet::%process-descriptor-import)
-                original))))
-    (setf seen (nreverse seen))
-    (is (= 2 (length seen)))
-    (is-false (cdr (first seen)) "the first expansion must be the receive chain")
-    (is-true (cdr (second seen)) "the second expansion must be the CHANGE chain")
-    ;; Each expansion carries its own checksum, since the input's covered the
-    ;; multipath form.
-    (is-true (find #\# (car (first seen))) "expansion was imported unchecksummed")
-    (is-true (find #\# (car (second seen))))))
+  ;; descriptor_tests.cpp:833
+  (%check-multipath
+   "tr(xprv9s21ZrQH143K2Zu2kTVKcQi9nKhfgJUkYqG73wXsHuhATm1wkt6kcSZeTYEw2PL7krZtJopEYDvBdYWdAai3n3TWUTCVfHvPHqTYJv7smYe/<6;7;8>/*,{pk(xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc/<1;2;3>/0/*),pk(xprv9s21ZrQH143K3jUwNHoqQNrtzJnJmx4Yup8NkNLdVQCymYbPbJXnPhwkfTfxZfptcs3rLAPUXS39oDLgrNKQGwbGsEmJJ8BU3RzQuvShEG4/0/0/<3;4;5>/*)})"
+   "tr(xpub661MyMwAqRbcF3yVrV2KyYetLMYA5mCbv4BhrKwUrFE9LZM6JRR1AEt8Jq4V4C8LwtTke6YEEdCZqgXp85YRk2j74EfJKhe3QybQ9kcUjs4/<6;7;8>/*,{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/<1;2;3>/0/*),pk(xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/<3;4;5>/*)})"
+   '("tr(xpub661MyMwAqRbcF3yVrV2KyYetLMYA5mCbv4BhrKwUrFE9LZM6JRR1AEt8Jq4V4C8LwtTke6YEEdCZqgXp85YRk2j74EfJKhe3QybQ9kcUjs4/6/*,{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/1/0/*),pk(xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/3/*)})"
+     "tr(xpub661MyMwAqRbcF3yVrV2KyYetLMYA5mCbv4BhrKwUrFE9LZM6JRR1AEt8Jq4V4C8LwtTke6YEEdCZqgXp85YRk2j74EfJKhe3QybQ9kcUjs4/7/*,{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/2/0/*),pk(xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/4/*)})"
+     "tr(xpub661MyMwAqRbcF3yVrV2KyYetLMYA5mCbv4BhrKwUrFE9LZM6JRR1AEt8Jq4V4C8LwtTke6YEEdCZqgXp85YRk2j74EfJKhe3QybQ9kcUjs4/8/*,{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/3/0/*),pk(xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/5/*)})")
+   '((("5120993e5b1d71d14cbb0a90c57ea0fed1d5bf77d5804cee206c3dbd7e4d2c67d869")
+       ("51207b8f629f6d406b92ffa6284f5545085eafb837c469018b715755f619b587163b")
+       ("512061f52925826e51e4615007557ddbea55b22c817909d7ebcfd3c454c634643ece"))
+     (("5120633808b2156d0a6597e8b07f59c387bb4c2d5c02c4cb98f1802748e64c6abf5f")
+       ("5120fc5f06ded29328c170bf7e49e71c9cc8699befa2bf0a2a80802a1f32ab72d291")
+       ("5120fd05e2227e0dac972dff9941e332db8461bedc320c2a74def44e469ddbad9d21"))
+     (("51205d19538c7c0901520eb712d079ae6eebed4f691021da466dc24e9575d9815ad0")
+       ("5120b9fc348ede2b7b9fb1f84c21741bb36bb3fa0905d0bc9417e07145d3142673f7")
+       ("51203a655bc5181b12efac82a5a5d1d0969b2ceb92c6fc37f505fdf00ee8afa09b33"))))
 
-(test multipath-import-refuses-a-label
-  "Core: \"Multipath descriptors should not have a label\" (backup.cpp:203-206)."
-  (let ((data (make-hash-table :test 'equal)))
-    (setf (gethash "desc" data) "wpkh(xpub/<0;1>/*)"
-          (gethash "label" data) "mine")
-    (let ((result (bl.wallet::%process-multipath-import
-                   :fake data 1 '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)"))))
-      (is-false (cdr (assoc "success" result :test #'string=)))
-      (is (string= "Multipath descriptors should not have a label"
-                   (cdr (assoc "message"
-                               (cdr (assoc "error" result :test #'string=))
-                               :test #'string=))))))
-  ;; More than two paths plus `internal` is Core's other refusal (:232-234).
-  (let ((data (make-hash-table :test 'equal)))
-    (setf (gethash "desc" data) "wpkh(xpub/<0;1;2>/*)"
-          (gethash "internal" data) t)
-    (let ((result (bl.wallet::%process-multipath-import
-                   :fake data 1 '("a" "b" "c"))))
-      (is-false (cdr (assoc "success" result :test #'string=))))))
+  ;; descriptor_tests.cpp:863
+  (%check-multipath
+   "tr(xprv9s21ZrQH143K2Zu2kTVKcQi9nKhfgJUkYqG73wXsHuhATm1wkt6kcSZeTYEw2PL7krZtJopEYDvBdYWdAai3n3TWUTCVfHvPHqTYJv7smYe/6/*,{pk(xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc/<1;2;3>/0/*),pk(xprv9s21ZrQH143K3jUwNHoqQNrtzJnJmx4Yup8NkNLdVQCymYbPbJXnPhwkfTfxZfptcs3rLAPUXS39oDLgrNKQGwbGsEmJJ8BU3RzQuvShEG4/0/0/<3;4;5>/*)})"
+   "tr(xpub661MyMwAqRbcF3yVrV2KyYetLMYA5mCbv4BhrKwUrFE9LZM6JRR1AEt8Jq4V4C8LwtTke6YEEdCZqgXp85YRk2j74EfJKhe3QybQ9kcUjs4/6/*,{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/<1;2;3>/0/*),pk(xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/<3;4;5>/*)})"
+   '("tr(xpub661MyMwAqRbcF3yVrV2KyYetLMYA5mCbv4BhrKwUrFE9LZM6JRR1AEt8Jq4V4C8LwtTke6YEEdCZqgXp85YRk2j74EfJKhe3QybQ9kcUjs4/6/*,{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/1/0/*),pk(xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/3/*)})"
+     "tr(xpub661MyMwAqRbcF3yVrV2KyYetLMYA5mCbv4BhrKwUrFE9LZM6JRR1AEt8Jq4V4C8LwtTke6YEEdCZqgXp85YRk2j74EfJKhe3QybQ9kcUjs4/6/*,{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/2/0/*),pk(xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/4/*)})"
+     "tr(xpub661MyMwAqRbcF3yVrV2KyYetLMYA5mCbv4BhrKwUrFE9LZM6JRR1AEt8Jq4V4C8LwtTke6YEEdCZqgXp85YRk2j74EfJKhe3QybQ9kcUjs4/6/*,{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/3/0/*),pk(xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/5/*)})")
+   '((("5120993e5b1d71d14cbb0a90c57ea0fed1d5bf77d5804cee206c3dbd7e4d2c67d869")
+       ("51207b8f629f6d406b92ffa6284f5545085eafb837c469018b715755f619b587163b")
+       ("512061f52925826e51e4615007557ddbea55b22c817909d7ebcfd3c454c634643ece"))
+     (("5120c481a8ada38d1070094f62af526d4f8aae2eb1e44d1fd961be6a25198b4da77b")
+       ("512034a2d31c091905e62def62b575b88beff41723d83acb02dfada2e73d9c529b40")
+       ("5120e0ecc278655b092962ded92a5781bd8e86e8408055de05f121e107fa211e5dfb"))
+     (("51206052cff5efc848e4b38a947803943eb1eb0076523eec1041969851ebcd265555")
+       ("512009ed83d758c0bdd36e225c961810761c7a360533434a41a17bba709e331e6cd1")
+       ("5120fcd77851ebaac37564b87e9b351c54492a8fbb1d6afdf7f3a9317703a002b22b"))))
+
+  ;; descriptor_tests.cpp:893
+  (%check-multipath
+   "wsh(or_d(pk([2557c640/48h/1h/0h/2h]xprv9ws7hGFQPbDga6QrETbFM7Gqc7m15UNoJ7KF5kkDhyZCBcANAqRMUCytQ4JM1nLSYvGyFjg6TvBEfNrN3znaFdb67jQoQ7z9kFnd4BUUJiE/<0;1>/*),and_v(v:pkh([00aabb22/48h/1h/0h/2h]xprv9ws7hGFQPbDgbCvNcYVfGeGK8UTSFmAho4iAXZf13yQVJmHuKHN9oMXCv7zsJn8Dcqvqy2iugFWAhDdUUX6r5VLNWkRTpxVoQJ6DbzY9eYa/<0;1>/*),older(2))))"
+   "wsh(or_d(pk([2557c640/48h/1h/0h/2h]xpub6ArU6mnJDxmynaVKLV8FiFDaA9bVUw6efLEqt99qGK6B4QVWiNjc21JNFKkXNjgT8NCUmpFpSSBrYFtWEAqGirbqT4J1bRFpWyAnYdzmZUm/<0;1>/*),and_v(v:pkh([00aabb22/48h/1h/0h/2h]xpub6ArU6mnJDxmyogzqia2fdnD3gWHvfDtZAHdmKx4ccJwUBZd3rpgQM9qgmPAn1mqT2yh81uvGGohMkg3fNLoXZzn7sRo4a1X3KnCAVot2yuS/<0;1>/*),older(2))))"
+   '("wsh(or_d(pk([2557c640/48h/1h/0h/2h]xpub6ArU6mnJDxmynaVKLV8FiFDaA9bVUw6efLEqt99qGK6B4QVWiNjc21JNFKkXNjgT8NCUmpFpSSBrYFtWEAqGirbqT4J1bRFpWyAnYdzmZUm/0/*),and_v(v:pkh([00aabb22/48h/1h/0h/2h]xpub6ArU6mnJDxmyogzqia2fdnD3gWHvfDtZAHdmKx4ccJwUBZd3rpgQM9qgmPAn1mqT2yh81uvGGohMkg3fNLoXZzn7sRo4a1X3KnCAVot2yuS/0/*),older(2))))"
+     "wsh(or_d(pk([2557c640/48h/1h/0h/2h]xpub6ArU6mnJDxmynaVKLV8FiFDaA9bVUw6efLEqt99qGK6B4QVWiNjc21JNFKkXNjgT8NCUmpFpSSBrYFtWEAqGirbqT4J1bRFpWyAnYdzmZUm/1/*),and_v(v:pkh([00aabb22/48h/1h/0h/2h]xpub6ArU6mnJDxmyogzqia2fdnD3gWHvfDtZAHdmKx4ccJwUBZd3rpgQM9qgmPAn1mqT2yh81uvGGohMkg3fNLoXZzn7sRo4a1X3KnCAVot2yuS/1/*),older(2))))")
+   '((("0020538436a60f2a638ea9e1e1342e9b93374aa7ec559ff0a805b3a185d4ba855d7f")
+       ("00203a588d107d604b6913201c7c1e1722f07a0f8fb3a382744f17b9ae5f6ccfcdd7")
+       ("0020d30fb375f7c491a208e77c7b5d0996ca14cf4a770c2ab5981f915c0e4565c74a"))
+     (("002072b5fc3a691c48fdbaf485f27e787b4094055d4b434c90c81ed1090f3d48733b")
+       ("0020a9ccdf4496e5d60db4704b27494d9d74f54a16c180ff954a43ce5e3aa465113a")
+       ("0020d17e21820a0069ca87049513eca763f08a74b586724441e7d76fc5142bcc327c"))))
+
+  ;; descriptor_tests.cpp:943
+  (%check-multipath
+   "tr(xprv9yYge4PS54XkYT9KiLfCRwc8Jeuz8DucxQGtuEecJZYhKNiqbPxYHTPzXtskmzWBqdqkRAGsghNmZzNsfU2wstaB3XjDQFPv567aQSSuPyo/<2;3>,l:pk(xprvA1ADjaN8H3HGnZSmt4VF7YdWoV9oNq8jhqhurxsrYycBAFK555cECoaY22KWt6BTRNLuvobW5VQTF89PN3iA485LAg7epazevPyjCa4xTzd))"
+   "tr(xpub6CY33ZvKuS63kwDnpNCCo5YrrgkUXgdUKdCVhd4Dru5gCB3z8wGnqFiUP98Za5pYSYF5KmvBHTY3Ra8FAJGggzBjuHS69WzN8gscPupuZwK/<2;3>,l:pk(xpub6E9a95u27Qqa13XEz62FUgaFMWzHnHrb54dWfMHU7K9A33eDccvUkbu1sHYoByHAgJdR326rWqn9pGZgZHz1afDprW5gGwS4gUX8Ri6aGPZ))"
+   '("tr(xpub6CY33ZvKuS63kwDnpNCCo5YrrgkUXgdUKdCVhd4Dru5gCB3z8wGnqFiUP98Za5pYSYF5KmvBHTY3Ra8FAJGggzBjuHS69WzN8gscPupuZwK/2,l:pk(xpub6E9a95u27Qqa13XEz62FUgaFMWzHnHrb54dWfMHU7K9A33eDccvUkbu1sHYoByHAgJdR326rWqn9pGZgZHz1afDprW5gGwS4gUX8Ri6aGPZ))"
+     "tr(xpub6CY33ZvKuS63kwDnpNCCo5YrrgkUXgdUKdCVhd4Dru5gCB3z8wGnqFiUP98Za5pYSYF5KmvBHTY3Ra8FAJGggzBjuHS69WzN8gscPupuZwK/3,l:pk(xpub6E9a95u27Qqa13XEz62FUgaFMWzHnHrb54dWfMHU7K9A33eDccvUkbu1sHYoByHAgJdR326rWqn9pGZgZHz1afDprW5gGwS4gUX8Ri6aGPZ))")
+   '((("51200e3c14456bfa30f9f0bed6e55f35e1e9ca17c835e9f71b25bac0dfaab38ff2cd"))
+     (("51202bdda29337ecaf8fcd5aa395febac6f99b8a866a0e8fb3f7bde2e24b1a7df2ba")))))
+
+(test desc-core-multipath-rejections
+  "Core's own CheckUnparsable multipath cases, which are exactly the ones a
+string-level expander cannot get right: a SECOND specifier in the SAME key
+expression is refused while one per key expression is fine, an origin refuses a
+specifier outright (the old expander substituted it and produced two descriptors
+with fabricated distinct origins over IDENTICAL scriptPubKeys), and each
+function reports its own mismatched-length message."
+  ;; descriptor_tests.cpp:968
+  (%check-unparsable
+   "pkh(xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U/<0;1>/<2;3>)"
+   "pkh(xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/<0;1>/<2;3>)"
+   "pkh(): Multiple multipath key path specifiers found")
+  ;; descriptor_tests.cpp:969
+  (%check-unparsable
+   "pkh([deadbeef/<0;1>]xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U/0)"
+   "pkh([deadbeef/<0;1>]xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/0)"
+   "pkh(): Key path value '<0;1>' specifies multipath in a section where multipath is not allowed")
+  ;; descriptor_tests.cpp:970
+  (%check-unparsable
+   "tr(xprv9s21ZrQH143K2Zu2kTVKcQi9nKhfgJUkYqG73wXsHuhATm1wkt6kcSZeTYEw2PL7krZtJopEYDvBdYWdAai3n3TWUTCVfHvPHqTYJv7smYe/6/*,{pk(xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc/<1;2;3>/0/*),pk(xprv9s21ZrQH143K3jUwNHoqQNrtzJnJmx4Yup8NkNLdVQCymYbPbJXnPhwkfTfxZfptcs3rLAPUXS39oDLgrNKQGwbGsEmJJ8BU3RzQuvShEG4/0/0/<3;4>/*)})"
+   "tr(xpub6B4sSbNr8XFYXqqKB7PeUemqgEaVtCLjgd5Lf2VYtezSHozC7ffCvVNCyu9TCgHntRQdimjV3tHbxmNfocxtuh6saNtZEw91gjXLRhQ3Yar/6/*,{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/<1;2;3>/0/*),pk(xpub6AhFhZJJGt9YB8i85RfrJ8jT3T2FF5EejDCXqXfm1DAczFEXkk8HD3CXTg2TmKM8wTbSnSw3wPg5JuyLitUrpRmkjn2BQXyZnqJx16AGy94/0/0/<3;4>/*)})"
+   "tr(): Multipath subscripts have mismatched lengths")
+  ;; descriptor_tests.cpp:971
+  (%check-unparsable
+   "tr(xprv9s21ZrQH143K2Zu2kTVKcQi9nKhfgJUkYqG73wXsHuhATm1wkt6kcSZeTYEw2PL7krZtJopEYDvBdYWdAai3n3TWUTCVfHvPHqTYJv7smYe/<6;7;8;9>/*,{pk(xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc/<1;2;3>/0/*),pk(xprv9s21ZrQH143K3jUwNHoqQNrtzJnJmx4Yup8NkNLdVQCymYbPbJXnPhwkfTfxZfptcs3rLAPUXS39oDLgrNKQGwbGsEmJJ8BU3RzQuvShEG4/0/0/<3;4;5>/*)})"
+   "tr(xpub661MyMwAqRbcF3yVrV2KyYetLMYA5mCbv4BhrKwUrFE9LZM6JRR1AEt8Jq4V4C8LwtTke6YEEdCZqgXp85YRk2j74EfJKhe3QybQ9kcUjs4/<6;7;8;9>/*,{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/<1;2;3>/0/*),pk(xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/<3;4;5>/*)})"
+   "tr(): Multipath subscripts have mismatched lengths")
+  ;; descriptor_tests.cpp:972
+  (%check-unparsable
+   "tr(xprv9s21ZrQH143K2Zu2kTVKcQi9nKhfgJUkYqG73wXsHuhATm1wkt6kcSZeTYEw2PL7krZtJopEYDvBdYWdAai3n3TWUTCVfHvPHqTYJv7smYe/<6;7>/*,{pk(xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc/<1;2;3>/0/*),pk(xprv9s21ZrQH143K3jUwNHoqQNrtzJnJmx4Yup8NkNLdVQCymYbPbJXnPhwkfTfxZfptcs3rLAPUXS39oDLgrNKQGwbGsEmJJ8BU3RzQuvShEG4/0/0/<3;4;5>/*)})"
+   "tr(xpub661MyMwAqRbcF3yVrV2KyYetLMYA5mCbv4BhrKwUrFE9LZM6JRR1AEt8Jq4V4C8LwtTke6YEEdCZqgXp85YRk2j74EfJKhe3QybQ9kcUjs4/<6;7>/*,{pk(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/<1;2;3>/0/*),pk(xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/<3;4;5>/*)})"
+   "tr(): Multipath internal key mismatches multipath subscripts lengths")
+  ;; descriptor_tests.cpp:973
+  (%check-unparsable
+   "sh(multi(2,xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc/<1;2;3>/0/*,xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L/0/*,xprv9s21ZrQH143K3jUwNHoqQNrtzJnJmx4Yup8NkNLdVQCymYbPbJXnPhwkfTfxZfptcs3rLAPUXS39oDLgrNKQGwbGsEmJJ8BU3RzQuvShEG4/0/0/<3;4>/*))"
+   "sh(multi(2,xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/<1;2;3>/0/*,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0/*,xpub661MyMwAqRbcGDZQUKLqmWodYLcoBQnQH33yYkkF3jjxeLvY8qr2wWGEWkiKFaaQfJCoi3HeEq3Dc5DptfbCyjD38fNhSqtKc1UHaP4ba3t/0/0/<3;4>/*))"
+   "multi(): Multipath derivation paths have mismatched lengths")
+  ;; descriptor_tests.cpp:974
+  (%check-unparsable
+   "wpkh(xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U/<0>/*)"
+   "wpkh(xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/<0>/*)"
+   "wpkh(): Multipath key path specifiers must have at least two items")
+  ;; descriptor_tests.cpp:975
+  (%check-unparsable
+   "wsh(andor(pk(xprv9xGFvhWa1Koc8dmeEG5JXVfMaNBkioYscFGmn7yx8YnhFQYeydFfudxdKRzR5p7v1kip85ohB6eUQbPpAee9cFZu9M85G9X4ovPP4xw4xbM/0'/<0;1;2;3>/*),older(10000),pk(xprv9x9bas78RYwopceXTStT8vDuTiu6g1u91L6sG3DhHfDDXKPrYdcHcDuDw4Hv1kjZBWKoZnobUHrdoFxBPUMBTMruUs8HwzL8GxGA95MmZ7v/8/<0;1;2>/*)))"
+   "wsh(andor(pk(xpub6BFcLD3TqhMuM7r7LHcJtdc68Q2F8GGiyUCNaWPZgtKg8CsoXAZvTSH7AhaCPnuuewjwzA2gbAm1y6uaDNNxa7JqTiL76cdioT5rxjgxWXF/0'/<0;1;2;3>/*),older(10000),pk(xpub6B8wzNe2FvW736izZURTW4Ae1kjb5UczNZ2U4RdJqzkCQ7j16AvYA2DhnL8Kb5FeWAZJ43NnGPdjpeSKvAeM8YGaqhCzpD743Uv6S87hfAt/8/<0;1;2>/*)))"
+   "Miniscript: Multipath derivation paths have mismatched lengths")
+  ;; descriptor_tests.cpp:976
+  (%check-unparsable
+   "wpkh(xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U/<>/*)"
+   "wpkh(xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/<>/*)"
+   "wpkh(): Multipath key path specifiers must have at least two items")
+  ;; descriptor_tests.cpp:982
+  (%check-unparsable
+   "wpkh(xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U/<1;1>/*)"
+   "wpkh(xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/<1;1>/*)"
+   "wpkh(): Duplicated key path value 1 in multipath specifier")
+  ;; descriptor_tests.cpp:1273
+  (%check-unparsable
+   "tr(musig(xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc/<0;1>,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/<2;3>)/<3;4>)"
+   "tr(musig(xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/<0;1>,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/<2;3>)/<3;4>)"
+   "tr(): musig(): Cannot have multipath participant keys if musig() is also multipath"))
+
+(defparameter +multipath-tpub+
+  "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B"
+  "One testnet xpub, so the multipath RPC tests read as one wallet export.")
+
+(test multipath-reaches-every-descriptor-rpc
+  "The consequence half of the finding. Only importdescriptors and
+deriveaddresses ever expanded a multipath string, through a rewriter in front of
+the parser; every other consumer reached %PARSE-KEY-PATH first and answered -5
+`Multipath descriptors are not supported' for a descriptor Core accepts and our
+own importdescriptors imported in the same session. getdescriptorinfo is Core's
+documented way to VALIDATE an export before importing it, so that answer told an
+operator a valid backup was malformed.
+
+Every call below goes through the shipped dispatcher."
+  (let* ((node (make-test-node))
+         (multi (bl.rpc:descriptor-add-checksum
+                 (format nil "wpkh(~A/<0;1>/*)" +multipath-tpub+)))
+         (branch-0 (format nil "wpkh(~A/0/*)" +multipath-tpub+))
+         (branch-1 (format nil "wpkh(~A/1/*)" +multipath-tpub+)))
+    (flet ((rpc (method &rest params)
+             (bl.rpc:dispatch-rpc-method node method params))
+           (aval (key alist) (cdr (assoc key alist :test #'string=))))
+      ;; getdescriptorinfo: descs.at(0) plus Core's multipath_expansion array
+      ;; (rpc/output_script.cpp:206-213).
+      (let ((info (rpc "getdescriptorinfo" multi)))
+        (is (string= (bl.rpc:descriptor-add-checksum branch-0)
+                     (aval "descriptor" info)))
+        (is (equal (list (bl.rpc:descriptor-add-checksum branch-0)
+                         (bl.rpc:descriptor-add-checksum branch-1))
+                   (coerce (aval "multipath_expansion" info) 'list)))
+        (is (eq t (aval "isrange" info)))
+        (is (eq t (aval "issolvable" info))))
+      ;; And an ordinary descriptor still carries NO such field.
+      (is-false (assoc "multipath_expansion"
+                       (rpc "getdescriptorinfo"
+                            (bl.rpc:descriptor-add-checksum branch-0))
+                       :test #'string=))
+      ;; deriveaddresses: one address array per branch, and the branches are the
+      ;; two chains, so their addresses differ.
+      (let ((addresses (rpc "deriveaddresses" multi 1)))
+        (is (= 2 (length addresses)))
+        (is (= 2 (length (aref addresses 0))))
+        ;; A single descriptor answers with ONE array, so the two are compared
+        ;; as sequences rather than by type.
+        (is (equalp (coerce (rpc "deriveaddresses"
+                                 (bl.rpc:descriptor-add-checksum branch-0) 1)
+                            'vector)
+                    (aref addresses 0)))
+        (is (equalp (coerce (rpc "deriveaddresses"
+                                 (bl.rpc:descriptor-add-checksum branch-1) 1)
+                            'vector)
+                    (aref addresses 1))))
+      ;; scantxoutset: BOTH branches contribute scripts to the needle set.
+      (let ((utxo (bl:node-utxo-set node))
+            (txid-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
+            (txid-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 4)))
+        (bl.store:add-utxo utxo txid-a 0 100000000
+                           (bl.crypto:hex-to-bytes
+                            (first (%desc-scripts branch-0 :testnet3 7)))
+                           0)
+        (bl.store:add-utxo utxo txid-b 0 200000000
+                           (bl.crypto:hex-to-bytes
+                            (first (%desc-scripts branch-1 :testnet3 9)))
+                           0)
+        (let ((unspents (aval "unspents" (rpc "scantxoutset" "start" (list multi)))))
+          (is (= 2 (length unspents))
+              "scantxoutset found ~D of the two branches' outputs" (length unspents))))
+      ;; generatetodescriptor refuses it, as Core does: a coinbase pays one
+      ;; scriptPubKey (rpc/mining.cpp:188-190).
+      (signals-rpc-error (:exact-message "Multipath descriptor not accepted")
+        (rpc "generatetodescriptor" 1 multi)))))
+
+(test multipath-import-configures-both-chains
+  "Core's importdescriptors rules for a multipath request, which is what makes a
+single Sparrow/BDK/Core export set up a wallet in one call: with exactly two
+branches the SECOND is the change chain (backup.cpp:230-231), `internal' may not
+be given at all (:162-166), and a label is refused (:203-206).
+
+The last case is the mirror-image half of the finding: the string rewriter
+substituted a specifier sitting in an ORIGIN, which Core refuses outright, and
+imported two descriptors with FABRICATED distinct origins whose scriptPubKeys
+are identical -- so the wallet's change chain reused its receive addresses."
+  (with-wallet-chain-node (node "multipath")
+    (labels ((rpc (method &rest params)
+               (with-rpc-wallet (nil)
+                 (bl.rpc:dispatch-rpc-method node method params)))
+             (aval (key alist) (cdr (assoc key alist :test #'string=)))
+             (request (desc &rest extra)
+               (let ((h (make-hash-table :test 'equal)))
+                 (setf (gethash "desc" h) (bl.rpc:descriptor-add-checksum desc)
+                       (gethash "timestamp" h) "now"
+                       (gethash "active" h) t
+                       (gethash "range" h) 2)
+                 (loop for (k v) on extra by #'cddr do (setf (gethash k h) v))
+                 (first (rpc "importdescriptors" (list h))))))
+      (rpc "createwallet" "watch" t)
+      (let ((tpub (%regtest-tpub 21)))
+        (is (eq t (aval "success" (request (format nil "wpkh(~A/<0;1>/*)" tpub)))))
+        ;; Both chains exist and are active, and the SECOND is the internal one.
+        (let ((listed (aval "descriptors" (rpc "listdescriptors"))))
+          (is (= 2 (length listed)))
+          (let ((receive (find-if-not (lambda (d) (eq t (aval "internal" d))) listed))
+                (change (find-if (lambda (d) (eq t (aval "internal" d))) listed)))
+            (is-true receive "no receive chain was created")
+            (is-true change "the second branch was not made the CHANGE chain")
+            (is (search "/0/*" (aval "desc" receive)))
+            (is (search "/1/*" (aval "desc" change)))))
+        ;; `internal' alongside multipath is refused (any number of branches).
+        (let ((result (request (format nil "wpkh(~A/<2;3>/*)" tpub) "internal" t)))
+          (is-false (eq t (aval "success" result)))
+          (is (string= "Cannot have multipath descriptor while also specifying 'internal'"
+                       (aval "message" (aval "error" result)))))
+        ;; So is a label.
+        (let ((result (request (format nil "wpkh(~A/<4;5>/*)" tpub) "label" "mine")))
+          (is-false (eq t (aval "success" result)))
+          (is (string= "Multipath descriptors should not have a label"
+                       (aval "message" (aval "error" result)))))
+        ;; A specifier inside an ORIGIN is refused, not substituted.
+        (let ((result (request (format nil "wpkh([deadbeef/<0;1>]~A/0/*)" tpub))))
+          (is-false (eq t (aval "success" result)))
+          (is (string= "wpkh(): Key path value '<0;1>' specifies multipath in a section where multipath is not allowed"
+                       (aval "message" (aval "error" result)))))))))
 
 ;;;; --- Key expression order, and inference of wsh(<miniscript>) ------------
 
