@@ -158,8 +158,11 @@ PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
 
 ;;; --- decodepsbt helpers ---
 
-(defun %psbt-script-obj (script)
-  `(("asm" . ,(bl.val:disassemble-script script))
+(defun %psbt-script-obj (script &key sighash-decode)
+  "The {asm, hex} pair decodepsbt prints for a redeem/witness script or a
+final scriptSig. SIGHASH-DECODE is Core's fAttemptSighashDecode, which
+decodepsbt passes for final_scriptSig alone (rpc/rawtransaction.cpp)."
+  `(("asm" . ,(bl.val:disassemble-script script :sighash-decode sighash-decode))
     ("hex" . ,(bl.crypto:bytes-to-hex script))))
 
 (defun %psbt-spk-obj (spk network)
@@ -435,7 +438,7 @@ fingerprint><path>."
                (loop for (pk . v) in keypaths collect (%psbt-keypath-json pk v)))))
       (let ((fs (bl.ser:psbt-map-find
                  map bl.ser:+psbt-in-final-scriptsig+)))
-        (when fs (add "final_scriptSig" (%psbt-script-obj fs))))
+        (when fs (add "final_scriptSig" (%psbt-script-obj fs :sighash-decode t))))
       (let ((fw (bl.ser:psbt-map-find
                  map bl.ser:+psbt-in-final-scriptwitness+)))
         (when fw (add "final_scriptwitness" (%psbt-parse-witness-stack fw))))

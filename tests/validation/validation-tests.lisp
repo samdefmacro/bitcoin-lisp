@@ -2381,3 +2381,94 @@ reached instead from the relay and submitblock sides. It must now refuse."
                 "positive control: an honest weaker-chain body must be stored")
             (is-true (bl.store:block-exists-p store honest-h)
                      "positive control: the honest body did not reach disk")))))))
+
+;;;; Script disassembly (Core core_io.cpp ScriptToAsmStr + script.cpp GetOpName)
+;;;;
+;;;; The vectors are Bitcoin Core's own: the strings its
+;;;; test/functional/rpc_decodescript.py and data/rpc_decodescript.json assert
+;;;; for these exact scripts. Every asm field the node emits -- decodescript,
+;;;; decoderawtransaction, getrawtransaction, getblock verbosity 2/3, gettxout,
+;;;; scantxoutset, the REST surfaces, the PSBT decoders and the web UI --
+;;;; renders through DISASSEMBLE-SCRIPT.
+
+(defun %asm (hex &key sighash-decode)
+  "DISASSEMBLE-SCRIPT over the script HEX spells. The scriptPubKey case calls
+the one-argument form, which is how every scriptPubKey site calls it."
+  (let ((script (bl.crypto:hex-to-bytes hex)))
+    (if sighash-decode
+        (bl.val:disassemble-script script :sighash-decode t)
+        (bl.val:disassemble-script script))))
+
+(test disassemble-script-renders-small-pushes-as-decimal
+  "A push of four bytes or fewer is its CScriptNum value in decimal, not hex
+(core_io.cpp:371-373), with fRequireMinimal false so a NON-minimal push still
+renders as its value. Every one of these was hex here."
+  (is (string= "100" (%asm "0164")))
+  (is (string= "100" (%asm "026400")) "non-minimal 2-byte push")
+  (is (string= "500000" (%asm "0320a107")) "rpc_decodescript.py CLTV height")
+  (is (string= "67305985" (%asm "0401020304")))
+  (is (string= "-28398" (%asm "02eeee")) "rpc_decodescript.json 02eeee")
+  ;; The five-byte push is the control: over the four-byte limit it is hex,
+  ;; which is what the pre-fix renderer did for ALL of them.
+  (is (string= "0102030405" (%asm "050102030405"))))
+
+(test disassemble-script-spells-the-small-number-opcodes
+  "GetOpName returns 0, -1 and 1..16 for OP_0, OP_1NEGATE and OP_1..OP_16
+(script.cpp:23-44), and rpc_decodescript.py asserts those spellings at :53,
+:93, :166, :187 and :197."
+  (is (string= "0" (%asm "00")))
+  (is (string= "-1" (%asm "4f")))
+  (is (string= "1 0" (%asm "5100")) "rpc_decodescript.py:53")
+  (is (string= "2 3 OP_CHECKMULTISIG" (%asm "5253ae")) "rpc_decodescript.py:93")
+  (is (string= "16" (%asm "60")))
+  (is (string= "OP_RETURN 0" (%asm "6a00")) "rpc_decodescript.json 6a00")
+  ;; The anchor output: a v1 program of two bytes, shown as one decimal
+  ;; (rpc_decodescript.py:194-197).
+  (is (string= "1 29518" (%asm "51024e73"))))
+
+(test disassemble-script-names-unknown-and-truncated-the-way-core-does
+  "An opcode with no name is OP_UNKNOWN, not OP_UNKNOWN[xx]; a push that runs
+off the end ends the string with [error] (rpc_decodescript.json 6aee / 6a02ee).
+OP_RESERVED, OP_VER and OP_INVALIDOPCODE have names in Core's table and had
+none here."
+  (is (string= "OP_RETURN OP_UNKNOWN" (%asm "6aee")))
+  (is (string= "OP_RETURN [error]" (%asm "6a02ee")))
+  (is (string= "OP_RESERVED" (%asm "50")))
+  (is (string= "OP_VER" (%asm "62")))
+  (is (string= "OP_INVALIDOPCODE" (%asm "ff")))
+  ;; A truncated OP_PUSHDATA2 length is Core's GetOp failing too.
+  (is (string= "[error]" (%asm "4d01"))))
+
+(test disassemble-script-decodes-a-scriptsig-sighash-byte
+  "fAttemptSighashDecode (core_io.cpp:376-390): in a scriptSig a push that
+passes CheckSignatureEncoding under SCRIPT_VERIFY_STRICTENC loses its sighash
+byte to a [ALL]-style suffix. TxToUniv passes it for scriptSig and for nothing
+else, so the same bytes in a scriptPubKey keep the byte."
+  (let* ((der "304402207174775824bec6c2700023309a168231ec80b82c6069282f5133e6f11cbb04460220570edc55c7c5da2ca687ebd0372d3546ebc3f810516a002350cac72dfe192dfb")
+         (all (concatenate 'string "47" der "01"))
+         (none-acp (concatenate 'string "47" der "82")))
+    (is (string= (concatenate 'string der "[ALL]")
+                 (%asm all :sighash-decode t)))
+    (is (string= (concatenate 'string der "[NONE|ANYONECANPAY]")
+                 (%asm none-acp :sighash-decode t)))
+    ;; Without the flag the byte stays: this is the scriptPubKey rendering.
+    (is (string= (concatenate 'string der "01") (%asm all)))
+    ;; An OP_RETURN payload shaped like a signature is NOT decoded, because
+    ;; Core suppresses the decode for an unspendable script
+    ;; (rpc_decodescript.py's "signature_imposter").
+    (let ((imposter (concatenate 'string "6a47" der "01")))
+      (is (string= (concatenate 'string "OP_RETURN " der "01")
+                   (%asm imposter :sighash-decode t))))
+    ;; A push that is not a signature keeps every byte (a 33-byte pubkey).
+    (is (string= "03b0da749730dc9b4b1f4a14d6902877a92541f5368778853d9c4a0cb7802dcfb2"
+                 (%asm "2103b0da749730dc9b4b1f4a14d6902877a92541f5368778853d9c4a0cb7802dcfb2"
+                       :sighash-decode t)))))
+
+(test disassemble-script-renders-cores-cltv-redeem-script
+  "The whole rpc_decodescript.py CLTV vector (:136), which is the one that
+shows a lock height as a block number rather than as little-endian hex."
+  (let* ((pk "03b0da749730dc9b4b1f4a14d6902877a92541f5368778853d9c4a0cb7802dcfb2")
+         (script (concatenate 'string "63" "21" pk "ad670320a107b17568" "21" pk "ac")))
+    (is (string= (format nil "OP_IF ~A OP_CHECKSIGVERIFY OP_ELSE 500000 ~
+OP_CHECKLOCKTIMEVERIFY OP_DROP OP_ENDIF ~A OP_CHECKSIG" pk pk)
+                 (%asm script)))))

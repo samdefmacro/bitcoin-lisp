@@ -125,7 +125,15 @@
    #:is-op-success-p
    #:scan-for-op-success
    #:run-tapscript
-   #:increment-script-number)
+   #:increment-script-number
+   ;; Core's CScriptNum decode and the two halves of CheckSignatureEncoding
+   ;; under SCRIPT_VERIFY_STRICTENC. The script renderer (ScriptToAsmStr)
+   ;; needs the same three the interpreter does: a push of four bytes or
+   ;; fewer prints as its CScriptNum value, and a longer one prints its
+   ;; sighash type only when it passes the interpreter's own encoding test.
+   #:script-number-to-int
+   #:check-der-signature-format
+   #:valid-sighash-type-p)
   ;; Reached from another package with :: before the second-round review
   ;; (docs/refactoring-review-2026-09-02.md, wave B): API by use, so exported.
   (:export
