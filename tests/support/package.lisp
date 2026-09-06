@@ -54,6 +54,10 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    #:send-buffer-bytes
    ;; transactions.lisp
    #:make-mempool-test-tx
+   #:make-spending-test-tx
+   #:bpe-test-id
+   #:bpe-simulate
+   #:bpe-populated-estimator
    #:make-witness-test-tx-bytes
    ;; chain.lisp
    #:make-test-chain-hashes

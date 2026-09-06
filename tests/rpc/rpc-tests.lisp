@@ -4277,28 +4277,21 @@ Core refuses re-serialized here as the other."
                                                  (returned-target nil)
                                                  (mode-out nil))
                                       &body body)
-  "Run BODY with NODE's fee estimator answering RATE sat/vB (or ERROR-MSG),
-and with MODE-OUT -- a symbol naming a place -- receiving the mode the RPC
-passed. A test node has no estimator, and the RPC's first gate is its
-presence -- without one the stubs below are never reached and every
-assertion silently measures the no-estimate path instead. The slot is set,
-not the accessor stubbed: the node struct loads before the RPC code now, so
-its accessors inline there and a redefinition would not be seen."
-  `(let ((real-ready (fdefinition 'bl.mp:fee-estimator-ready-p))
-         (real-est (fdefinition 'bl.mp:estimate-fee-rate)))
-     (setf (bl:node-fee-estimator ,node) :stub-estimator)
+  "Run BODY with ESTIMATE-FEE-RATE answering RATE sat/vB (or ERROR-MSG), and
+with MODE-OUT -- a symbol naming a place -- receiving the mode the RPC passed.
+NODE is bound so callers keep reading as before; the RPC no longer consults
+the node's fee estimator at all, because Core's estimatesmartfee consults the
+policy estimator and nothing else."
+  (declare (ignorable node))
+  `(let ((real-est (fdefinition 'bl.mp:estimate-fee-rate)))
      (unwind-protect
           (progn
-            (setf (fdefinition 'bl.mp:fee-estimator-ready-p)
-                  (lambda (&rest args) (declare (ignore args)) t))
             (setf (fdefinition 'bl.mp:estimate-fee-rate)
-                  (lambda (estimator conf-target &key mode)
-                    (declare (ignore estimator))
+                  (lambda (conf-target &key mode)
                     ,@(when mode-out `((setf ,mode-out mode)))
                     (values ,rate ,error-msg (or ,returned-target conf-target))))
             ,@body)
-       (setf (fdefinition 'bl.mp:fee-estimator-ready-p) real-ready
-             (fdefinition 'bl.mp:estimate-fee-rate) real-est))))
+       (setf (fdefinition 'bl.mp:estimate-fee-rate) real-est))))
 
 (test estimatesmartfee-omits-feerate-when-there-is-no-estimate
   "Core returns ONLY errors and blocks when the estimator has nothing
@@ -4314,6 +4307,36 @@ would not confirm."
               "a fabricated feerate is reported where Core reports none")
     (is-true (assoc "errors" result :test #'string=))
     (is (= 6 (cdr (assoc "blocks" result :test #'string=))))))
+
+(test estimatesmartfee-reports-no-estimate-over-a-block-percentile
+  "The survey's exact scenario: an EMPTY policy estimator and twelve blocks of
+percentile history at a median of 7 sat/vB. estimatesmartfee returned
+{feerate: 7.0e-5, blocks: 2} -- a number derived from what miners happened to
+include, indistinguishable from a real estimate, so a wallet reading it never
+falls back to its own -fallbackfee. Core answers the errors array
+(feature_fee_estimation.py:332,413)."
+  (let* ((node (make-test-node))
+         (bl::*syncing* nil)
+         (bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
+         (legacy (bl.mp:make-fee-estimator)))
+    (dotimes (i 12)
+      (bl.mp:fee-estimator-add-stats
+       legacy (bl.mp:make-block-fee-stats
+               :height (+ 100 i) :median-rate 7 :low-rate 3
+               :high-rate 20 :tx-count 100)))
+    (setf (bl:node-fee-estimator node) legacy)
+    (is (= 12 (bl.mp:fee-estimator-entry-count legacy))
+        "positive control: the percentile history the fallback read is there")
+    (is (= 0 (bl.mp:bpe-estimate-smart-fee bl.mp:*block-policy-estimator* 2))
+        "positive control: the policy estimator has no answer")
+    (dolist (target '(2 6))
+      (let ((result (bl.rpc:dispatch-rpc-method node "estimatesmartfee"
+                                                (list target))))
+        (is-false (assoc "feerate" result :test #'string=)
+                  "target ~D reported a block-percentile feerate" target)
+        (is (= target (cdr (assoc "blocks" result :test #'string=))))
+        (is (equalp #("Insufficient data or no feerate found")
+                    (cdr (assoc "errors" result :test #'string=))))))))
 
 (test estimatesmartfee-defaults-to-economical-as-core-does
   "Core's estimate_mode default is \"economical\" (RPCArg::Default, fees.cpp:42).
@@ -5396,9 +5419,9 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
   (let* ((node (make-test-node))
          (mempool (bl:node-mempool node))
          (funding (%txid-array 99))
-         (parent (%mp-spending-tx funding :vout 0 :value 50000000))
+         (parent (make-spending-test-tx funding :vout 0 :value 50000000))
          (pid (bl.ser:transaction-hash parent))
-         (child (%mp-spending-tx pid :vout 0 :value 40000000))
+         (child (make-spending-test-tx pid :vout 0 :value 40000000))
          (cid (bl.ser:transaction-hash child))
          (pid-hex (bl.rpc:hash-to-hex pid))
          (cid-hex (bl.rpc:hash-to-hex cid)))
@@ -7033,10 +7056,10 @@ diagram, over a CPFP pair that shares one chunk. Sizes are in vB (our
 txgraph unit; Core uses sigops-adjusted weight)."
   (let* ((node (make-test-node))
          (mempool (bl:node-mempool node))
-         (parent (%mp-spending-tx (%txid-array 210) :vout 0 :value 50000000))
+         (parent (make-spending-test-tx (%txid-array 210) :vout 0 :value 50000000))
          (pid (bl.ser:transaction-hash parent))
          (pid-hex (bl.rpc:hash-to-hex pid))
-         (child (%mp-spending-tx pid :vout 0 :value 40000000))
+         (child (make-spending-test-tx pid :vout 0 :value 40000000))
          (cid (bl.ser:transaction-hash child))
          (cid-hex (bl.rpc:hash-to-hex cid))
          (pvsize (bl.ser:transaction-vsize parent))
@@ -7085,10 +7108,10 @@ txgraph unit; Core uses sigops-adjusted weight)."
 mining order (parent's first)."
   (let* ((node (make-test-node))
          (mempool (bl:node-mempool node))
-         (parent (%mp-spending-tx (%txid-array 213) :vout 0 :value 50000000))
+         (parent (make-spending-test-tx (%txid-array 213) :vout 0 :value 50000000))
          (pid (bl.ser:transaction-hash parent))
          (pid-hex (bl.rpc:hash-to-hex pid))
-         (child (%mp-spending-tx pid :vout 0 :value 40000000))
+         (child (make-spending-test-tx pid :vout 0 :value 40000000))
          (cid-hex (bl.rpc:hash-to-hex
                    (bl.ser:transaction-hash child))))
     (%add-tx mempool parent :fee 20000)

@@ -336,6 +336,11 @@ every transaction currently in the mempool that counts toward estimates."
   (buckets #() :type simple-vector)
   (short nil) (med nil) (long nil)
   (tracked (make-hash-table :test 'equalp) :type hash-table)
+  ;; Core trackedTxs / untrackedTxs (block_policy_estimator.h:249-252): how
+  ;; many transactions since the last block were recorded and how many were
+  ;; dropped by validForFeeEstimation. Reported and reset by processBlock.
+  (tracked-txs 0 :type (integer 0))
+  (untracked-txs 0 :type (integer 0))
   (best-height 0 :type (integer 0))
   (first-recorded-height 0 :type (integer 0))
   (historical-first 0 :type (integer 0))
@@ -349,16 +354,52 @@ every transaction currently in the mempool that counts toward estimates."
      :med (make-tx-confirm-stats buckets +med-block-periods+ +med-decay+ +med-scale+)
      :long (make-tx-confirm-stats buckets +long-block-periods+ +long-decay+ +long-scale+))))
 
-(defun bpe-process-transaction (est txid height feerate)
+(defun bpe-process-transaction (est txid height feerate
+                                &key bypass-limits package-submission
+                                     (chainstate-current t)
+                                     (has-no-mempool-parents t))
   "A transaction entered the mempool at HEIGHT paying FEERATE sat/kvB (Core
-processTransaction). Tracked in all three horizons until it confirms or leaves."
+processTransaction, block_policy_estimator.cpp:595-637). Returns T when it was
+recorded in all three horizons, NIL when a gate dropped it.
+
+TWO gates, and both are Core's, because an estimator that learns from the wrong
+transactions is worse than one with no data:
+
+  - HEIGHT must equal the estimator's own best seen height. Core: `Ignore side
+    chains and re-orgs; ... Ignore txs if BlockPolicyEstimator is not in sync
+    with ActiveChain().Tip()'. This alone drops every transaction replayed
+    from mempool.dat at start-up, when the estimator's best height is still 0.
+  - validForFeeEstimation, which is the AND of the four flags Core carries in
+    NewMempoolTransactionInfo (kernel/mempool_entry.h:173-199) and fills in at
+    the ATMP call site (validation.cpp:1304-1307, 1408-1411): not re-added
+    during a reorg with the mempool limits bypassed, not submitted as part of
+    a package, the chainstate current, and no unconfirmed parents.
+
+The last one is the expensive one to get wrong: a CPFP child teaches the
+estimator that its own low feerate confirmed in one block, which is exactly
+the inference the parent paid for. Measured on a 400-block synthetic replay,
+tracking the children answered 1000 sat/kvB where Core's gate answers 20000.
+
+The defaults are the ordinary single-transaction acceptance, so a caller that
+names nothing gets Core's normal path; the two exclusions that must be
+declared are declared by the two callers Core declares them at."
   (let ((tracked (block-policy-estimator-tracked est)))
-    (unless (gethash txid tracked)
-      (setf (gethash txid tracked)
-            (list height feerate
-                  (tx-confirm-stats-new-tx (block-policy-estimator-short est) height feerate)
-                  (tx-confirm-stats-new-tx (block-policy-estimator-med est) height feerate)
-                  (tx-confirm-stats-new-tx (block-policy-estimator-long est) height feerate))))
+    (when (gethash txid tracked)
+      (return-from bpe-process-transaction nil))
+    (unless (= height (block-policy-estimator-best-height est))
+      (return-from bpe-process-transaction nil))
+    (unless (and (not bypass-limits)
+                 (not package-submission)
+                 chainstate-current
+                 has-no-mempool-parents)
+      (incf (block-policy-estimator-untracked-txs est))
+      (return-from bpe-process-transaction nil))
+    (incf (block-policy-estimator-tracked-txs est))
+    (setf (gethash txid tracked)
+          (list height feerate
+                (tx-confirm-stats-new-tx (block-policy-estimator-short est) height feerate)
+                (tx-confirm-stats-new-tx (block-policy-estimator-med est) height feerate)
+                (tx-confirm-stats-new-tx (block-policy-estimator-long est) height feerate)))
     t))
 
 (defun bpe-remove-tx (est txid in-block)
@@ -421,6 +462,19 @@ against the number of blocks it waited."
     (when (and (zerop (block-policy-estimator-first-recorded-height est))
                (plusp counted))
       (setf (block-policy-estimator-first-recorded-height est) height))
+    ;; Core reports and RESETS the per-block counters here (:704-712), which is
+    ;; what makes the validForFeeEstimation gate observable rather than a
+    ;; silent drop.
+    (bl:log-cat "estimatefee"
+                "Fee estimates updated by ~D of ~D block txs, since last ~
+block ~D of ~D tracked, mempool map size ~D"
+                counted (length confirmed)
+                (block-policy-estimator-tracked-txs est)
+                (+ (block-policy-estimator-tracked-txs est)
+                   (block-policy-estimator-untracked-txs est))
+                (hash-table-count (block-policy-estimator-tracked est)))
+    (setf (block-policy-estimator-tracked-txs est) 0
+          (block-policy-estimator-untracked-txs est) 0)
     counted))
 
 (defun %bpe-block-span (est)
@@ -551,13 +605,25 @@ single quiet stretch from collapsing it."
   "The node's CBlockPolicyEstimator, installed at startup. NIL disables
 collection entirely.")
 
-(defun bpe-note-entry (txid fee vsize height)
-  "A transaction entered the mempool. FEE in satoshis, VSIZE in vbytes — the
-same pair Core's CFeeRate(fee, size) takes, converted to satoshis per kvB."
+(defun bpe-note-entry (txid fee vsize height
+                       &key bypass-limits package-submission
+                            (chainstate-current t)
+                            (has-no-mempool-parents t))
+  "A transaction entered the mempool. FEE in satoshis, VSIZE in vbytes -- the
+same pair Core's CFeeRate(fee, size) takes, converted to satoshis per kvB.
+
+The four keywords are Core's NewMempoolTransactionInfo flags, carried here
+rather than decided at the call site so a future acceptance path cannot opt
+out of the gate by forgetting to apply it; BPE-PROCESS-TRANSACTION is where
+they are read."
   (let ((est *block-policy-estimator*))
     (when (and est (plusp vsize))
       (bpe-process-transaction est txid height
-                               (/ (* (float fee 1d0) 1000d0) (float vsize 1d0))))))
+                               (/ (* (float fee 1d0) 1000d0) (float vsize 1d0))
+                               :bypass-limits bypass-limits
+                               :package-submission package-submission
+                               :chainstate-current chainstate-current
+                               :has-no-mempool-parents has-no-mempool-parents))))
 
 (defun bpe-note-removal (txid &key in-block)
   "A transaction left the mempool. IN-BLOCK means it confirmed; anything else

@@ -215,9 +215,11 @@ all of them silently:
     conservative. Defaulting to conservative returns a higher number, so every
     caller that did not name a mode was quietly told to overpay.
   - On no estimate Core omits \"feerate\" ENTIRELY and returns only the error.
-    We returned a fabricated 0.00001 BTC/kvB (1 sat/vB) fallback, so a wallet
-    reading \"feerate\" got a made-up number rather than noticing there was no
-    estimate — and built a transaction that would not confirm.
+    Two fabrications stood here in turn: a flat 0.00001 BTC/kvB (1 sat/vB),
+    and then a percentile of the median feerates of recent blocks, returned
+    with NO error message so it read as a real estimate. Neither can say that
+    a feerate FAILED to confirm, which is the whole content of Core's answer,
+    and a wallet handed one never falls back to its own -fallbackfee.
   - Core CLAMPS the answer up to the node's own floors:
     max(estimate, mempool rolling minimum, min relay fee). Unclamped, a node
     whose mempool minimum has risen recommends a fee BELOW its own acceptance
@@ -246,14 +248,9 @@ all of them silently:
       (return-from rpc-estimatesmartfee
         `(("blocks" . ,conf-target)
           ("errors" . #("Insufficient data (node still syncing)")))))
-    (let ((fee-estimator (bl:node-fee-estimator node))
-          (mempool (rpc-get-mempool node)))
+    (let ((mempool (rpc-get-mempool node)))
       (multiple-value-bind (rate-sat-vb error-msg returned-target)
-          (if (and fee-estimator
-                   (bl.mp:fee-estimator-ready-p fee-estimator))
-              (bl.mp:estimate-fee-rate fee-estimator conf-target
-                                                      :mode mode)
-              (values 0 "Insufficient data or no feerate found" conf-target))
+          (bl.mp:estimate-fee-rate conf-target :mode mode)
         (let ((blocks (or returned-target conf-target)))
           (if (or error-msg (null rate-sat-vb) (zerop rate-sat-vb))
               ;; Core's failure branch: errors, blocks, and NO feerate.

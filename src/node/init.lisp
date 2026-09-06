@@ -848,6 +848,31 @@ given explicitly, Core's require_full_verification (init.cpp:1390)."
                (init-error "Corrupted block database detected in ~A"
                            (node-data-directory *node*))))))))))
 
+(defun %init-fee-estimation (data-directory)
+  "Bring up the fee estimator and load fee_estimates.dat from DATA-DIRECTORY.
+
+⚠️ ORDER. The persisted file carries the block-percentile history AND, since
+v2, the Core policy estimator's own state, and LOAD-FEE-STATS installs the
+second into *BLOCK-POLICY-ESTIMATOR*. Creating that estimator AFTER the load
+-- which is what this did -- meant the special was still NIL when the file was
+read, so the policy-estimator section was discarded with a warning on every
+single start and the node began each run with an empty Core estimator. The
+seam test stayed green throughout because it bound the special to a fresh
+estimator before calling LOAD-FEE-STATS, which is exactly what production did
+not do.
+
+Extracted from %INIT-SERVICES so a test can drive the real sequence rather
+than a hand-built one."
+  (log-info "Initializing fee estimator...")
+  ;; Core's CBlockPolicyEstimator, which learns from how long each feerate
+  ;; actually waited rather than from a percentile of what miners took. The
+  ;; mempool and connect-block report into it through this one binding, and
+  ;; LOAD-FEE-STATS restores its saved state into it -- so it exists FIRST.
+  (setf bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator))
+  (setf (node-fee-estimator *node*)
+        (bl.mp:make-fee-estimator :data-directory data-directory))
+  (bl.mp:load-fee-stats (node-fee-estimator *node*)))
+
 (defun %init-services (network txindex blockfilterindex rpc-port rpc-bind rpc-bind-supplied-p rpc-user rpc-password rpc-auth rpc-allow-ip rpc-whitelist rpc-whitelist-default coinstatsindex txospenderindex reindex-chainstate force-compact-db webui webui-supplied-p webui-path webui-open rest-enabled check-blocks check-level require-full-verification)
   "The RPC server, up early (Core Step 4a AppInitServers, answering
 RPC_IN_WARMUP while the rest loads); the recent-rejects filter, the fee
@@ -861,19 +886,7 @@ it; the indexes (Step 8) and -forcecompactdb."
   (log-info "Initializing mempool...")
   (setf (node-mempool *node*) (bl.mp:make-mempool))
 
-  ;; Initialize fee estimator
-  (log-info "Initializing fee estimator...")
-  (setf (node-fee-estimator *node*)
-        (bl.mp:make-fee-estimator
-         :data-directory (node-data-directory *node*)))
-  ;; Load persisted fee stats
-  (bl.mp:load-fee-stats (node-fee-estimator *node*))
-
-  ;; Core's CBlockPolicyEstimator, which learns from how long each feerate
-  ;; actually waited rather than from a percentile of what miners took. The
-  ;; mempool and connect-block report into it through this one binding.
-  (setf bl.mp:*block-policy-estimator*
-        (bl.mp:make-block-policy-estimator))
+  (%init-fee-estimation (node-data-directory *node*))
 
   ;; The RPC server comes up HERE — before the mempool replay and the index
   ;; catch-ups below, which is Core's order: AppInitServers (which starts the

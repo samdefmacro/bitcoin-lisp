@@ -992,9 +992,21 @@
   checks run in Core's order with Core's limits; mempool.dat is written
   in Core's format so the two implementations can exchange one.
 
+  Fee estimation reads the block policy estimator and NOTHING else: the
+  absence of an estimate is reported as absence (Core's `Insufficient data
+  or no feerate found'), never as a percentile of what miners took, which
+  is the one thing that cannot say a feerate FAILED to confirm. What the
+  estimator is fed is gated as Core gates it -- a transaction is recorded
+  only at the estimator's own best seen height, and only when it was not
+  re-added by a reorg with the limits bypassed, not submitted in a
+  package, the chainstate is current, and it has no unconfirmed parents.
+  The last of those is why a CPFP child does not teach the estimator that
+  its own low feerate confirmed in one block.
+
   Traps: an 83 MB mempool.dat turns a restart into a long silent replay
-  -- load in batches and log progress. Fee estimation reads the block
-  policy estimator, not the pool's current fee rates. The mining index
+  -- load in batches and log progress. The policy estimator must EXIST
+  before fee_estimates.dat is loaded, or the file's estimator section is
+  discarded on every start. The mining index
   finds a chunk by its mining key, so a cluster's chunks must leave the
   index before anything changes that key -- a relinearization, a depgraph
   edit, or a re-pointing of its handles; that is also why a handle's
@@ -1022,6 +1034,8 @@
   (bitcoin-lisp.mempool:make-orphan-pool function)
   (bitcoin-lisp.mempool:fee-estimator class)
   (bitcoin-lisp.mempool:estimate-fee-rate function)
+  (bitcoin-lisp.mempool:make-block-policy-estimator function)
+  (bitcoin-lisp.mempool:*block-policy-estimator* variable)
   (bitcoin-lisp.mempool:save-mempool-file function)
   (bitcoin-lisp.mempool:*persist-mempool-v1* variable))
 
