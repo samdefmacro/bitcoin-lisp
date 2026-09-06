@@ -1,3 +1,14 @@
+;;;; Bitcoin Core tx_valid.json / tx_invalid.json
+;;;;
+;;;; These two corpora carry NO expected error name, so unlike
+;;;; script_tests.json they can only be compared on the accept/reject verdict.
+;;;; Every row is exactly three fields -- [[prevout, ...], serialized tx,
+;;;; verifyFlags] -- and Core's own runner asserts only
+;;;; CheckTransaction/VerifyScript's boolean (test/transaction_tests.cpp).
+;;;; tx_invalid.json's "BADTX" is a value of the FLAGS column, saying the
+;;;; vector is expected to fail CheckTransaction, not a SCRIPT_ERR_* name.
+;;;; The error-name comparison therefore lives in the script corpus alone.
+
 (in-package #:bitcoin-lisp.tests)
 
 (def-suite :bitcoin-core-tx-tests
