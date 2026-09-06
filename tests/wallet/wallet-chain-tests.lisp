@@ -379,6 +379,142 @@ connect would not pass."
         ;; single-hash fallback, which would cost a full rescan on load.
         (is (= 2 (length locator)))))))
 
+(defun %wc-mutate-proof (proof-hex offset byte)
+  "PROOF-HEX with the header byte at OFFSET (0-based, within the 80-byte
+header) replaced by BYTE. The merkle root sits at 36..67 and nTime at 68..71,
+which is how the functional test wallet_importprunedfunds.py builds its two
+bad proofs: a mutated root breaks ExtractMatches, a mutated nTime changes the
+block HASH while leaving the proof internally consistent."
+  (let ((bytes (bl.crypto:hex-to-bytes proof-hex)))
+    (setf (aref bytes offset) byte)
+    (bl.crypto:bytes-to-hex bytes)))
+
+(test pruned-funds-import-and-remove
+  "GA11 71d5aa9f. importprunedfunds and removeprunedfunds were not registered
+at all -- a pruned node, a configuration we support, could not add a known
+transaction to a wallet whose blocks are no longer on disk, and no wallet
+could delete a transaction record. Core implements the pair in
+wallet/rpc/backup.cpp:39-127 over CWallet::RemoveTxs (wallet.cpp:2419-2470),
+and test/functional/wallet_importprunedfunds.py is the oracle this follows.
+
+The round trip is the shape of the feature: remove the record, and the
+transaction is gone from listtransactions, from the balance and from the
+wallet FILE (asserted by unloading and reloading); import it back with its
+gettxoutproof, and it returns confirmed at the height and index the proof
+gives. Every error Core raises is checked with it, because the whole value of
+these two is that they refuse a proof that does not hold up."
+  (with-wallet-chain-node (node "prunedfunds" :wallet "w")
+    (labels ((rpc (wallet method &rest params)
+               (with-rpc-wallet (wallet)
+                 (bl.rpc:dispatch-rpc-method node method params)))
+             (aval (key alist) (cdr (assoc key alist :test #'string=)))
+             (import-code (wallet raw proof)
+               (rpc-error-code-of
+                (lambda () (rpc wallet "importprunedfunds" raw proof))))
+             (import-message (wallet raw proof)
+               (handler-case (progn (rpc wallet "importprunedfunds" raw proof) "")
+                 (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-message e)))))
+      (let* ((addr (%wc-newaddress node nil))
+             (b1 (first (%wc-mine node 1 addr))))
+        (%wc-mine node 100 (%wc-optrue-address))   ; b1's coinbase matures
+        (let* ((cb (bl.rpc:hash-to-hex (%wc-coinbase-txid node b1)))
+               (rawtx (aval "hex" (rpc "w" "gettransaction" cb)))
+               (proof (rpc nil "gettxoutproof" (list cb) b1))
+               (balance (rpc "w" "getbalance")))
+          (is (plusp balance))
+          (is (= 101 (aval "confirmations" (rpc "w" "gettransaction" cb))))
+          ;; --- removeprunedfunds ---
+          (is (null (rpc "w" "removeprunedfunds" cb)))
+          (is (zerop (rpc "w" "getbalance")))
+          (is (zerop (length (remove-if-not
+                              (lambda (tx) (equal cb (aval "txid" tx)))
+                              (rpc "w" "listtransactions")))))
+          (is (= -5 (rpc-error-code-of
+                     (lambda () (rpc "w" "gettransaction" cb)))))
+          ;; The record left the FILE, not just memory.
+          (rpc nil "unloadwallet" "w")
+          (rpc nil "loadwallet" "w")
+          (is (= -5 (rpc-error-code-of
+                     (lambda () (rpc "w" "gettransaction" cb)))))
+          ;; Removing what the wallet does not hold is Core's -4, and says so.
+          (is (= -4 (rpc-error-code-of
+                     (lambda () (rpc "w" "removeprunedfunds" cb)))))
+          (is (string= (format nil "Transaction ~A does not belong to this wallet" cb)
+                       (handler-case
+                           (progn (rpc "w" "removeprunedfunds" cb) "")
+                         (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-message e)))))
+          ;; --- importprunedfunds ---
+          (is (null (rpc "w" "importprunedfunds" rawtx proof)))
+          (let ((gettx (rpc "w" "gettransaction" cb)))
+            (is (= 101 (aval "confirmations" gettx)))
+            (is (equal b1 (aval "blockhash" gettx)))
+            (is (= 0 (aval "blockindex" gettx))))
+          (is (= balance (rpc "w" "getbalance")))
+          ;; And the re-import reached the file too.
+          (rpc nil "unloadwallet" "w")
+          (rpc nil "loadwallet" "w")
+          (is (= 101 (aval "confirmations" (rpc "w" "gettransaction" cb))))
+          ;; --- the errors, in Core's own words ---
+          ;; -22, the message the spending paths use.
+          (is (= -22 (import-code "w" "696e76616c6964207478" proof)))
+          (is (string= "TX decode failed. Make sure the tx has at least one input."
+                       (import-message "w" "696e76616c6964207478" proof)))
+          ;; A proof whose header no longer commits to the tree it carries.
+          (is (string= "Something wrong with merkleblock"
+                       (import-message "w" rawtx (%wc-mutate-proof proof 36 #xEF))))
+          ;; A header nothing in the block index knows: nTime moved, so the
+          ;; proof is still internally consistent but names another block.
+          (is (string= "Block not found in chain"
+                       (import-message "w" rawtx (%wc-mutate-proof proof 68 #x00))))
+          ;; A proof for a block that IS ours, of a transaction that is not in it.
+          (let* ((b2 (first (%wc-mine node 1 (%wc-optrue-address))))
+                 (other-proof (rpc nil "gettxoutproof"
+                                   (list (bl.rpc:hash-to-hex
+                                          (%wc-coinbase-txid node b2)))
+                                   b2)))
+            (is (string= "Transaction given doesn't exist in proof"
+                         (import-message "w" rawtx other-proof))))
+          ;; A wallet none of whose addresses the transaction pays.
+          (rpc nil "createwallet" "other")
+          (is (= -5 (import-code "other" rawtx proof)))
+          (is (string= "No addresses in wallet correspond to included transaction"
+                       (import-message "other" rawtx proof))))))))
+
+(test pruned-funds-removal-keeps-a-conflicting-spend
+  "wallet_importprunedfunds.py:133-154. Core's RemoveTxs unwinds mapTxSpends by
+erasing only the removed transaction's OWN entry for each outpoint
+(wallet.cpp:2456-2463), so an outpoint some surviving conflicting transaction
+also spends stays spent. Removing a REPLACED transaction must not hand its
+input back to coin selection while the replacement is still in flight.
+
+Removing the replacement too is the positive control: with no spender left the
+same output is offered again, so the first assertion cannot be passing because
+the wallet simply lost track of the coin."
+  (with-wallet-chain-node (node "prunedconflict" :wallet "w")
+    (labels ((rpc (wallet method &rest params)
+               (with-rpc-wallet (wallet)
+                 (bl.rpc:dispatch-rpc-method node method params)))
+             (aval (key alist) (cdr (assoc key alist :test #'string=)))
+             (coinbase-unspent-p (cb)
+               (plusp (count-if (lambda (u) (equal cb (aval "txid" u)))
+                                (rpc "w" "listunspent" 0)))))
+      (let* ((addr (%wc-newaddress node nil))
+             (b1 (first (%wc-mine node 1 addr))))
+        (%wc-mine node 100 (%wc-optrue-address))
+        (let ((cb (bl.rpc:hash-to-hex (%wc-coinbase-txid node b1)))
+              (dest (%wc-newaddress node nil)))
+          (is-true (coinbase-unspent-p cb))
+          (let* ((tx1 (rpc "w" "sendtoaddress" dest 1 nil nil nil nil nil nil nil 10))
+                 (tx2 (aval "txid" (rpc "w" "bumpfee" tx1))))
+            (is-false (equal tx1 tx2))
+            (is-false (coinbase-unspent-p cb))
+            ;; The replaced transaction goes; the replacement still spends it.
+            (rpc "w" "removeprunedfunds" tx1)
+            (is-false (coinbase-unspent-p cb))
+            ;; With the replacement gone too, the output comes back.
+            (rpc "w" "removeprunedfunds" tx2)
+            (is-true (coinbase-unspent-p cb))))))))
+
 ;;; --- Reorg across the funding tx + double-spend conflicts ---
 
 (test wallet-funding-reorg-and-conflicts

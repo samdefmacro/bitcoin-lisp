@@ -1345,6 +1345,14 @@
   is Core's CCoinControl constructor, so the two writers that remain --
   the avoid_reuse argument and the -maxapsfee retry -- can only raise it.
 
+  A pruned node's pair is here: `importprunedfunds' adds a transaction the
+  wallet already has an address for on the strength of a `gettxoutproof',
+  and `removeprunedfunds' deletes a record again. The removal is Core's
+  `RemoveTxs' -- existence checked and every erase staged in ONE db
+  transaction, the in-memory maps touched only once the write landed, and
+  mapTxSpends unwound per transaction so an outpoint a surviving
+  conflicting spend also names stays spent.
+
   Traps: a locked wallet could once still sign because a parsed
   descriptor kept its embedded xprv; the key-provider is the only source
   now. RENAME-FILE merges a target pathname with the source, so a backup

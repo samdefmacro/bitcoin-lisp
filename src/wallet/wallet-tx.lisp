@@ -2178,3 +2178,169 @@ whether an abort was triggered."
         bl.rpc:+json-false+
         (progn (setf (wallet-abort-rescan wallet) t)
                t))))
+
+;;; --- importprunedfunds / removeprunedfunds (Core wallet/rpc/backup.cpp:39-127) ---
+;;;
+;;; The pair a pruned node needs: a wallet cannot rescan blocks the node no
+;;; longer has on disk, so the operator hands the transaction and a
+;;; gettxoutproof for it straight to the wallet, and deletes the record again
+;;; when it is no longer wanted. Both are descriptor-wallet RPCs -- Core at
+;;; d3056bc cannot create a legacy wallet at all -- and both are exercised by
+;;; test/functional/wallet_importprunedfunds.py.
+
+(defun wallet-remove-txs (wallet txids)
+  "Core CWallet::RemoveTxs (wallet.cpp:2419-2470): erase TXIDS' records from
+the wallet database and unwind the in-memory maps. Returns T, or (values NIL
+error-string) naming the first txid the wallet does not hold.
+
+Core's shape, and it is load-bearing: existence is checked and every erase
+staged inside ONE db transaction, and the in-memory maps are touched only from
+the transaction's on_commit listener -- so a txid that is not ours leaves both
+halves exactly as they were rather than half-removing the ones before it.
+Caller holds the wallet lock."
+  (let ((wtxs (mapcar (lambda (txid)
+                        (or (wallet-get-wallet-tx wallet txid)
+                            (return-from wallet-remove-txs
+                              (values nil (format nil "Transaction ~A does not belong to this wallet"
+                                                  (bl.rpc:hash-to-hex txid))))))
+                      txids)))
+    (bl.store:with-leveldb-writebatch (batch)
+      (dolist (wtx wtxs)
+        (bl.store:leveldb-writebatch-delete
+         batch (wdb-key-tx (wallet-tx-txid wtx))))
+      (bl.store:leveldb-write (wallet-db wallet) batch :sync t))
+    ;; Past this point the write has landed: Core's on_commit listener.
+    (dolist (wtx wtxs)
+      (let ((txid (wallet-tx-txid wtx))
+            (tx (wallet-tx-tx wtx)))
+        (setf (wallet-tx-ordered wallet)
+              (delete wtx (wallet-tx-ordered wallet)))
+        (bl.ser:dovector (input (bl.ser:transaction-inputs tx))
+          (let* ((prevout (bl.ser:tx-in-previous-output input))
+                 (key (%wtx-outpoint-key (bl.ser:outpoint-hash prevout)
+                                         (bl.ser:outpoint-index prevout)))
+                 (remaining (remove txid (gethash key (wallet-tx-spends wallet))
+                                    :test #'equalp)))
+            (if remaining
+                (setf (gethash key (wallet-tx-spends wallet)) remaining)
+                (remhash key (wallet-tx-spends wallet)))))
+        (dotimes (n (length (bl.ser:transaction-outputs tx)))
+          (remhash (%wtx-outpoint-key txid n) (wallet-txos wallet)))
+        (remhash txid (wallet-map-wallet wallet))))
+    ;; Core's MarkDirty(): every cached amount in the wallet, not just the
+    ;; removed transaction's -- a balance computed over a spend chain the
+    ;; removal broke is no longer answerable from the cache.
+    (loop for wtx being the hash-values of (wallet-map-wallet wallet)
+          do (wtx-mark-dirty wtx))
+    t))
+
+(defun %pruned-funds-proof (proof-hex)
+  "(values header-hash matched-txids matched-indices) for the gettxoutproof
+string PROOF-HEX, with importprunedfunds' two checks: Core's ParseHexV (-8,
+and IsHex refuses the empty string too) and
+`merkleBlock.txn.ExtractMatches(...) != merkleBlock.header.hashMerkleRoot'
+(-5 \"Something wrong with merkleblock\", backup.cpp:64-67)."
+  (let ((bytes (and (stringp proof-hex)
+                    (plusp (length proof-hex))
+                    (handler-case (bl.crypto:hex-to-bytes proof-hex)
+                      (error () nil)))))
+    (unless bytes
+      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
+                        :message (format nil "proof must be hexadecimal string (not '~A')"
+                                         (if (stringp proof-hex) proof-hex ""))))
+    (multiple-value-bind (header ntx hashes bits)
+        ;; A proof too short to BE a CMerkleBlock is reported here as the
+        ;; same -5. Core lets the stream's own exception escape and its RPC
+        ;; server answers -1 with the deserializer's text, which is not
+        ;; reproducible from this side; -5 is at least the right shape and
+        ;; the right sentence for "that proof is not usable".
+        (handler-case (bl.rpc:parse-merkle-block bytes)
+          (error ()
+            (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                              :message "Something wrong with merkleblock")))
+      (multiple-value-bind (root matched indices)
+          (bl.rpc:extract-partial-merkle-tree ntx bits hashes)
+        ;; A malformed tree recomputes NO root, which is the same failure as
+        ;; recomputing the wrong one: Core compares ExtractMatches' return
+        ;; value, and a failed extraction returns uint256{}.
+        (unless (and root (equalp root (subseq header 36 68)))
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                            :message "Something wrong with merkleblock"))
+        (values (bl.crypto:hash256 header) matched indices)))))
+
+(defun %pruned-funds-block-height (chain-state wallet header-hash)
+  "The height of HEADER-HASH when it is an ancestor of WALLET's last processed
+block, else NIL -- Core's chain().findAncestorByHash(GetLastBlockHash(),
+merkleBlock.header.GetHash(), FoundBlock().height(height))
+(node/interfaces.cpp:609-616). Reproduced exactly, including its edge: the
+ancestor must be in the block index, but a wallet whose own last block is NOT
+in the index still passes, because Core's guard needs both to fire."
+  (let* ((entry (and chain-state
+                     (bl.store:get-block-index-entry chain-state header-hash)))
+         (last-hash (wallet-last-block-hash wallet))
+         (last-entry (and chain-state last-hash
+                          (bl.store:get-block-index-entry chain-state last-hash))))
+    (and entry
+         (or (null last-entry)
+             (eq entry (bl.store:entry-ancestor-at-height
+                        last-entry
+                        (bl.store:block-index-entry-height entry))))
+         (bl.store:block-index-entry-height entry))))
+
+(bl.rpc:define-rpc "importprunedfunds" (node params)
+  "Add a transaction to the wallet without a rescan, proving its confirmation
+with a gettxoutproof (Bitcoin Core importprunedfunds, wallet/rpc/backup.cpp:
+39-92). PARAMS: (rawtransaction txoutproof).
+
+For pruned wallets: the node no longer has the block on disk, so the operator
+supplies the transaction and its merkle proof directly. The corresponding
+address or script must already be in the wallet -- nothing here imports a
+descriptor -- and the end user remains responsible for importing whatever
+later spends the outputs, or rescanning past the point the transaction was
+mined."
+  (let* ((wallet (wallet-for-request node))
+         (tx (bl.rpc:decode-hex-tx-or-error
+              (first params)
+              "TX decode failed. Make sure the tx has at least one input."))
+         (txid (bl.ser:transaction-hash tx)))
+    (multiple-value-bind (header-hash matched indices)
+        (%pruned-funds-proof (second params))
+      (let ((chain-state (bl.rpc:with-node-lock (node)
+                           (bl:node-current-chainstate node))))
+        (with-wallet-lock (wallet)
+          (let ((height (%pruned-funds-block-height chain-state wallet header-hash))
+                (proof-index (position txid matched :test #'equalp)))
+            (unless height
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                                :message "Block not found in chain"))
+            (unless proof-index
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                                :message "Transaction given doesn't exist in proof"))
+            ;; Core calls AddToWallet directly rather than
+            ;; AddToWalletIfInvolvingMe, gating on IsMine itself so that a
+            ;; transaction nothing in the wallet owns is an ERROR and not a
+            ;; silent no-op (backup.cpp:83-89).
+            (unless (%wallet-tx-any-output-mine-p wallet tx)
+              (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-address-or-key+
+                                :message "No addresses in wallet correspond to included transaction"))
+            (wallet-add-to-wallet wallet tx
+                                  (list :confirmed header-hash height
+                                        (nth proof-index indices)))
+            nil))))))
+
+(bl.rpc:define-rpc "removeprunedfunds" (node params)
+  "Delete a transaction from the wallet (Bitcoin Core removeprunedfunds,
+wallet/rpc/backup.cpp:93-126). PARAMS: (txid). The companion to
+importprunedfunds; it affects wallet balances."
+  (let ((wallet (wallet-for-request node))
+        ;; Core's ParseHashV. %WALLET-PARSE-TXID is this file's existing
+        ;; spelling of it and its -8 message is the tree's, not Core's two;
+        ;; the RPC-wide parse-hash-v conversion owns that difference.
+        (txid (%wallet-parse-txid (first params))))
+    (with-wallet-lock (wallet)
+      (multiple-value-bind (ok message)
+          (wallet-remove-txs wallet (list txid))
+        (unless ok
+          (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                            :message message))
+        nil))))

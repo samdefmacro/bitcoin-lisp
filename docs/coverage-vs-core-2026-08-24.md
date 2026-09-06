@@ -32,12 +32,18 @@ The biggest shortfall is not missing functionality but behavioral-consistency ve
 | Reason | Method |
 |---|---|
 | External signer / HWI (we don't support it) | `enumeratesigners`, `walletdisplayaddress` |
-| Legacy BDB wallet (excluded by design) | `migratewallet`, `importprunedfunds`, `removeprunedfunds` |
+| Legacy BDB wallet (excluded by design) | `migratewallet` |
 | Multiprocess IPC | `echoipc` |
 | Private broadcast (a new Core feature) | `abortprivatebroadcast`, `getprivatebroadcastinfo` |
 | Hidden / test-only | `echo`, `generate`, `mockscheduler`, `getrawaddrman` |
 
 Of these, only private broadcast and `importprunedfunds`/`removeprunedfunds` are "genuinely missing"; the rest are out of scope by design.
+
+**Correction (2026-09-07, GA11 71d5aa9f):** `importprunedfunds` and
+`removeprunedfunds` were filed above under the legacy BDB wallet, which was
+wrong -- Core implements them in `wallet/rpc/backup.cpp` over `CWallet::RemoveTxs`
+and touches no legacy code, and at d3056bc a legacy wallet cannot be created at
+all. Both are now implemented; the row above keeps only `migratewallet`.
 
 ---
 

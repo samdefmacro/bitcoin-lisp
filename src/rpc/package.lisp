@@ -118,6 +118,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:descriptor-cache-parent-xpubs
    #:descriptor-derivation-error
    #:descriptor-id
+   #:extract-partial-merkle-tree
    #:feerate-fee
    #:format-key-path
    #:format-money
@@ -155,6 +156,7 @@ UI. Core rpc/server.cpp, httprpc.cpp, httpserver.cpp, rest.cpp. src/rpc/.")
    #:parse-hash-v
    #:parse-hex-hash
    #:parse-hex-v
+   #:parse-merkle-block
    #:parse-multisig
    #:parse-multisig-pubkey
    #:parse-outputs
