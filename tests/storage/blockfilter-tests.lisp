@@ -618,3 +618,135 @@ warning."
                       bfi cs)))
          (is (= 4 (bl.store:blockfilterindex-height bfi)))
          (bl.store:close-blockfilterindex bfi))))))
+
+;;;; Start-up rewind (Core BaseIndex::Sync -> Rewind, index/base.cpp:239/290)
+
+(defun %bfi-extend (cs store prev-entry hash)
+  "Store one coinbase-only block extending PREV-ENTRY, identified by HASH, and
+enter it in CS's block index. Returns (values entry block).
+
+MAKE-REORG-TEST-BLOCK reads four bytes of HASH into the coinbase script-sig, so
+two siblings at one height serialize -- and therefore filter -- differently. It
+builds a block with no spends, which is what lets the backfill run here without
+undo data."
+  (let* ((height (1+ (bl.store:block-index-entry-height prev-entry)))
+         (block (make-reorg-test-block
+                 (bl.store:block-index-entry-hash prev-entry) hash height))
+         (entry (bl.store:make-block-index-entry
+                 :hash hash :height height :chain-work height :status :valid
+                 :header (bl.ser:bitcoin-block-header block)
+                 :prev-entry prev-entry)))
+    (bl.store:store-block store block :height height)
+    (bl.store:add-block-index-entry cs entry)
+    (values entry block)))
+
+(defun %bfi-hash (byte)
+  (make-array 32 :element-type '(unsigned-byte 8) :initial-element byte))
+
+(test blockfilterindex-rewinds-a-marker-left-on-an-abandoned-branch
+  "A branch switch that happens while the process is DOWN leaves the filter
+index's marker on a block the active chain no longer holds, and the online
+:block-disconnected hook cannot have fired for it. Core repairs that at
+start-up: BaseIndex::Sync notices the stored best block is not the parent of
+the next block to index and calls Rewind (index/base.cpp:239), which walks back
+to the fork point and moves the marker there (:290-326).
+
+Rewinding a FILTER index reads nothing off disk -- BlockFilterIndex's
+CustomOptions asks for connect_undo_data only (index/blockfilterindex.cpp:92-97)
+-- and it ERASES nothing: CustomRemove copies each abandoned record from the
+height index to the HASH index so that `filter data for any block that becomes
+part of the active chain can always be retrieved' (:41-42). Our records are
+only ever keyed by hash, so that half is already true and the abandoned
+branch's filters must still be there afterwards; what has to move is the
+marker, and what has to follow is the ACTIVE branch's filter headers, chained
+off the fork point's.
+
+Before this, prepare-sync repaired a marker only when it stood ABOVE the tip.
+At the same heights nothing was rewound, and the (< index-height tip) guard --
+reading the RAW stored height -- ran no backfill either, so the index served
+the abandoned branch's filters and never indexed the active chain past the
+fork. Even with the backfill forced, the first active block above the fork has
+no parent filter header, which BLOCKFILTERINDEX-ADD-BLOCK refuses as
+:noncontiguous."
+  (with-network (:regtest)
+    (with-temp-directory (dir "bfi-rewind")
+      (let ((cs (bl.store:init-chain-state dir))
+            (store (bl.store:init-block-store dir))
+            (bfi (bl.store:init-blockfilterindex dir :enabled t))
+            (node (bl:make-node)))
+        (unwind-protect
+             (let* ((gblock (bl.store:make-genesis-block :regtest))
+                    (ghash (bl.store:network-genesis-hash :regtest))
+                    (genesis (bl.store:make-block-index-entry
+                              :hash ghash :height 0 :chain-work 0 :status :valid
+                              :header (bl.ser:bitcoin-block-header gblock))))
+               (is (equalp ghash (bl.store:best-block-hash cs))
+                   "the fixture's chain state does not start at the regtest genesis")
+               (bl.store:add-block-index-entry cs genesis)
+               ;; The BIP157 anchor, then branch A, indexed while it was the
+               ;; active chain -- exactly what a running node leaves behind.
+               (is-true (bl.store:blockfilterindex-add-block bfi gblock ghash 0 nil))
+               (multiple-value-bind (a1 a1-block)
+                   (%bfi-extend cs store genesis (%bfi-hash #x1A))
+                 (multiple-value-bind (a2 a2-block)
+                     (%bfi-extend cs store a1 (%bfi-hash #x2A))
+                   (bl.store:update-chain-tip
+                    cs (bl.store:block-index-entry-hash a2) 2)
+                   (is-true (bl.store:blockfilterindex-add-block
+                             bfi a1-block (bl.store:block-index-entry-hash a1) 1 nil))
+                   (is-true (bl.store:blockfilterindex-add-block
+                             bfi a2-block (bl.store:block-index-entry-hash a2) 2 nil))))
+               ;; Branch B wins while the index is stopped: SAME heights, so the
+               ;; marker is not above the tip and a height comparison alone can
+               ;; see nothing wrong with it.
+               (let ((b1 (%bfi-extend cs store genesis (%bfi-hash #x1B))))
+                 (%bfi-extend cs store b1 (%bfi-hash #x2B)))
+               (bl.store:update-chain-tip cs (%bfi-hash #x2B) 2)
+               (is (= 2 (bl.store:blockfilterindex-height bfi))
+                   "the fixture did not leave the marker on branch A")
+               (is-false (bl.store:blockfilterindex-has-block-p bfi (%bfi-hash #x1B))
+                         "the fixture indexed branch B before the restart")
+               ;; The marker names an abandoned block, so how much of the ACTIVE
+               ;; chain is indexed is the FORK height, not the stored one.
+               (is (= 0 (bl.store:index-height bfi cs))
+                   "an off-chain marker still reports its own height as progress")
+               ;; The restart.
+               (setf (bl:node-chainstates node) (list cs)
+                     (bl:node-block-store node) store)
+               (bl:catch-up-index node bfi)
+               ;; The ACTIVE branch is indexed, and its header chain links to
+               ;; the fork point's header -- the direction that served nothing
+               ;; but the abandoned branch before.
+               (let* ((gheader (bl.store:blockfilterindex-get-header bfi ghash))
+                      (b1-hash (%bfi-hash #x1B))
+                      (b2-hash (%bfi-hash #x2B)))
+                 (dolist (h (list b1-hash b2-hash))
+                   (is-true (bl.store:blockfilterindex-has-block-p bfi h)
+                            "the active branch's block ~A is still unindexed"
+                            (bl.crypto:bytes-to-hex h)))
+                 (let ((b1-header (bl.store:blockfilterindex-get-header bfi b1-hash))
+                       (b1-filter (bl.store:blockfilterindex-get-filter bfi b1-hash)))
+                   (is (equalp b1-header
+                               (bl.store:compute-block-filter-header b1-filter gheader))
+                       "the active branch's first header does not chain off the fork header"))
+                 (let ((b2-header (bl.store:blockfilterindex-get-header bfi b2-hash))
+                       (b2-filter (bl.store:blockfilterindex-get-filter bfi b2-hash))
+                       (b1-header (bl.store:blockfilterindex-get-header bfi b1-hash)))
+                   (is (equalp b2-header
+                               (bl.store:compute-block-filter-header b2-filter b1-header))))
+                 ;; The abandoned branch's filters survive, as Core's hash index
+                 ;; keeps them, and still chain off the fork header.
+                 (let ((a1-header (bl.store:blockfilterindex-get-header bfi (%bfi-hash #x1A)))
+                       (a1-filter (bl.store:blockfilterindex-get-filter bfi (%bfi-hash #x1A))))
+                   (is-true a1-filter "the rewind deleted an orphaned filter Core keeps")
+                   (is (equalp a1-header
+                               (bl.store:compute-block-filter-header a1-filter gheader))))
+                 (is-true (bl.store:blockfilterindex-has-block-p bfi (%bfi-hash #x2A))
+                          "the rewind deleted an orphaned filter Core keeps"))
+               ;; And the marker names the new tip, so a second start is a
+               ;; no-op rather than a second rewind.
+               (multiple-value-bind (height hash) (bl.store:blockfilterindex-best bfi)
+                 (is (= 2 height))
+                 (is (equalp (%bfi-hash #x2B) hash)))
+               (is (= 2 (bl.store:index-height bfi cs))))
+          (bl.store:close-blockfilterindex bfi))))))

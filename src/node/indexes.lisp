@@ -20,29 +20,15 @@ before giving up and rebuilding from genesis. Far deeper than any plausible
 reorg; the cheap header-index walk is tried first and has no such bound.")
 
 (defmethod bl.store:index-prepare-sync ((bfi bl.store:blockfilterindex) cs store)
-  "BIP157 genesis-anchor migration, then repair a best marker left above the
-tip (e.g. after invalidateblock): an index built before genesis indexing
-existed seeded its header chain at the first STORED block, so every absolute
-cfheaders/cfcheckpt/getblockfilter header it serves diverges from Core and
-BIP157 light clients ban us. Detect and wipe it here; the backfill then
-rebuilds from height 0 (the genesis filter is computed from chain
-parameters). No-op on fresh and healthy indexes; on a pruned node a bad
-index is kept (rebuild impossible) with a warning."
+  "BIP157 genesis-anchor migration (see BLOCKFILTERINDEX-ENSURE-GENESIS-ANCHOR:
+an index built before genesis indexing existed seeded its header chain at the
+first STORED block, so every absolute cfheaders/cfcheckpt/getblockfilter header
+it served diverged from Core), then rewind a best marker that is not on the
+active chain -- see %REWIND-BLOCKFILTERINDEX."
   (declare (ignore store))
-  (let ((tip (bl.store:current-height cs)))
-    (when (eq :rebuilt (bl.store:blockfilterindex-ensure-genesis-anchor bfi cs))
-      (log-info "Block filter index wiped; rebuilding from genesis"))
-    (when (> (bl.store:blockfilterindex-height bfi) tip)
-      (log-warn "Block filter index best above tip (~D > ~D); repairing"
-                (bl.store:blockfilterindex-height bfi) tip)
-      (loop for h from tip downto 0
-            for e = (bl.store:get-block-at-height cs h)
-            when (and e (bl.store:blockfilterindex-has-block-p
-                         bfi (bl.store:block-index-entry-hash e)))
-              do (bl.store:blockfilterindex-set-best
-                  bfi h (bl.store:block-index-entry-hash e))
-                 (return)
-            finally (bl.store:blockfilterindex-clear-best bfi)))))
+  (when (eq :rebuilt (bl.store:blockfilterindex-ensure-genesis-anchor bfi cs))
+    (log-info "Block filter index wiped; rebuilding from genesis"))
+  (%rewind-blockfilterindex bfi cs))
 
 (defmethod bl.store:index-prepare-sync ((csi bl.store:coinstatsindex) cs store)
   "Rewind a best marker that is not on the active chain (including one left
@@ -224,8 +210,8 @@ above the tip) before backfilling on top of it -- see
 %REWIND-TXOSPENDERINDEX."
   (%rewind-txospenderindex idx cs store))
 
-(defmethod bl.store:index-height ((idx bl.store:txospender-index) chainstate)
-  "How far the spender index has got ON THE ACTIVE CHAIN.
+(defun %index-active-chain-height (chainstate hash)
+  "How far an index whose best marker names HASH has got ON THE ACTIVE CHAIN.
 
 The stored marker is a (hash, height) pair, and the height is only meaningful
 while the hash is still the active chain's block at it: a marker left on an
@@ -239,18 +225,124 @@ an outpoint a confirmed transaction spends. Core cannot say this: its height
 comes off a locator resolved against the chain (BaseIndex::Init,
 index/base.cpp:120-131).
 
-Off-chain answers the FORK height, and an unplaceable marker -1 -- both
-strictly below the tip, so the backfill runs whatever prepare-sync did.
-This method lives here rather than in storage because the fork walk needs
-the validation layer, like the coinstats index-write-block below."
-  (let ((hash (bl.store:txospenderindex-best-block idx)))
-    (if (null hash)
-        -1
-        (let ((entry (bl.store:get-block-index-entry chainstate hash)))
-          (if (and entry (bl.store:entry-on-active-chain-p chainstate entry))
-              (bl.store:block-index-entry-height entry)
-              (let ((fork (%index-fork-entry chainstate hash)))
-                (if fork (bl.store:block-index-entry-height fork) -1)))))))
+Off-chain answers the FORK height, and an unplaceable marker (or an empty
+index) -1 -- both strictly below the tip, so the backfill runs whatever
+prepare-sync did. Shared by the spender and filter indexes, and it lives here
+rather than in storage because the fork walk needs the validation layer, like
+the coinstats index-write-block below."
+  (if (null hash)
+      -1
+      (let ((entry (bl.store:get-block-index-entry chainstate hash)))
+        (if (and entry (bl.store:entry-on-active-chain-p chainstate entry))
+            (bl.store:block-index-entry-height entry)
+            (let ((fork (%index-fork-entry chainstate hash)))
+              (if fork (bl.store:block-index-entry-height fork) -1))))))
+
+(defmethod bl.store:index-height ((idx bl.store:txospender-index) chainstate)
+  "How far the spender index has got on the active chain; see
+%INDEX-ACTIVE-CHAIN-HEIGHT, whose narrative is this index's."
+  (%index-active-chain-height chainstate (bl.store:txospenderindex-best-block idx)))
+
+(defmethod bl.store:index-height ((bfi bl.store:blockfilterindex) chainstate)
+  "How far the filter index has got on the active chain; see
+%INDEX-ACTIVE-CHAIN-HEIGHT. BLOCKFILTERINDEX-HEIGHT stays the RAW stored
+height, because that is what the backfill resumes from once
+INDEX-PREPARE-SYNC has made the marker trustworthy."
+  (%index-active-chain-height chainstate
+                              (nth-value 1 (bl.store:blockfilterindex-best bfi))))
+
+(defun %bfi-anchor-entry (bfi cs height)
+  "The highest block at or below HEIGHT on CS's ACTIVE chain whose filter is
+stored, as a block-index entry, or NIL.
+
+This is where a rewind may leave the best marker: BLOCKFILTERINDEX-ADD-BLOCK
+chains each filter header off the PARENT's stored one and refuses a block whose
+parent has none, so the marker must name a block the next write can chain from.
+Core states the same requirement as an assertion -- the last line of
+BlockFilterIndex::CustomRemove reads the parent's header back and dereferences
+it (index/blockfilterindex.cpp:296).
+
+Ordinarily the fork point itself is the answer and the loop stops on its first
+probe. It walks down only for an index seeded mid-chain, which is a pruned
+node's (Core refuses -blockfilterindex with pruning outright)."
+  (loop for h from (min height (bl.store:current-height cs)) downto 0
+        for e = (bl.store:get-block-at-height cs h)
+        when (and e (bl.store:blockfilterindex-has-block-p
+                     bfi (bl.store:block-index-entry-hash e)))
+          return e))
+
+(defun %rewind-blockfilterindex (bfi cs)
+  "Make the filter index's best marker name a block on the ACTIVE chain before
+anything backfills on top of it (Core BaseIndex::Rewind, index/base.cpp:290-326,
+driven from Sync at :239 once NextSyncBlock has answered the block after the
+fork point).
+
+Core's per-block work for THIS index is BlockFilterIndex::CustomRemove
+(index/blockfilterindex.cpp:277-297), and every step of it is already true here
+or has nothing to undo. It copies the abandoned block's record from the height
+index to the HASH index -- our records are only ever keyed by hash, so an
+orphaned filter stays queryable exactly as Core keeps it, deliberately (\"filter
+data for any block that becomes part of the active chain can always be
+retrieved\", :41-42). It rewrites the filter-file position, which we do not
+have. And it resets the cached m_last_header to the parent's, which we do not
+cache: every write reads the parent's stored header. Its CustomOptions asks for
+connect_undo_data ONLY (:92-97), so Core reads neither block bodies nor undo
+data while rewinding a filter index -- the new branch's headers are re-derived
+by the forward re-index, chained off the fork point's stored header. What is
+left is Core's last line, SetBestBlockIndex(new_tip): move the marker back to
+the fork point.
+
+Until this existed the marker was only repaired when it stood ABOVE the tip. A
+branch switch at the SAME heights -- a reorg while the index was off, or a deep
+reorg across a restart -- left it naming an abandoned block, and the backfill
+then started at its height + 1 on the ACTIVE chain, where the parent filter
+header does not exist and BLOCKFILTERINDEX-ADD-BLOCK refuses the write as
+:noncontiguous. So the index stopped at the fork for good: it went on serving
+the abandoned branch's filters and never indexed the active chain past it.
+
+Returns NIL when the marker was already on the active chain -- the common case,
+and it costs one lookup. Otherwise the height rewound to, or -1 when no stored
+filter could be tied to the active chain and the index must be rebuilt."
+  (multiple-value-bind (best-height best-hash) (bl.store:blockfilterindex-best bfi)
+    (when (minusp best-height)
+      (return-from %rewind-blockfilterindex nil))
+    ;; The marker is asked about at its own HEIGHT rather than through
+    ;; ENTRY-ON-ACTIVE-CHAIN-P, because the raw stored height is what
+    ;; BUILD-BLOCKFILTERINDEX resumes from: a hash that is on the active chain
+    ;; at some OTHER height would restart the backfill in the wrong place.
+    (let* ((tip (bl.store:current-height cs))
+           (active (and (<= best-height tip)
+                        (bl.store:get-block-at-height cs best-height))))
+      (when (and active best-hash
+                 (equalp (bl.store:block-index-entry-hash active) best-hash))
+        (return-from %rewind-blockfilterindex nil))
+      (log-warn "Block filter index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
+                best-height
+                (if best-hash (bl.crypto:bytes-to-hex best-hash) "no hash")
+                tip)
+      ;; The fork point is Core's new_tip. When the header index cannot place
+      ;; the marker's branch at all -- headers are only persisted at flush time,
+      ;; so the crash that strands a marker can also lose the branch it names --
+      ;; Core refuses to start ("best block of %s not found. Please rebuild the
+      ;; index.", index/base.cpp:129-131). Falling back to the tip asks
+      ;; %BFI-ANCHOR-ENTRY the same question the marker-above-the-tip repair
+      ;; this replaces asked, and costs no rebuild.
+      (let* ((fork (and best-hash (%index-fork-entry cs best-hash)))
+             (entry (%bfi-anchor-entry
+                     bfi cs (if fork (bl.store:block-index-entry-height fork) tip))))
+        (cond
+          (entry
+           (let ((height (bl.store:block-index-entry-height entry)))
+             (log-warn "Block filter index rewound from height ~D to ~D (the abandoned branch's filters stay queryable by hash, as Core's hash index keeps them)"
+                       best-height height)
+             (bl.store:blockfilterindex-set-best
+              bfi height (bl.store:block-index-entry-hash entry))
+             height))
+          (t
+           (log-warn "Block filter index: no stored filter at or below height ~D is on the active chain; rebuilding from genesis"
+                     (min best-height tip))
+           (bl.store:blockfilterindex-clear-best bfi)
+           -1))))))
 
 (defun %rewind-txospenderindex (idx cs store)
   "Make the spender index's best marker name a block on the ACTIVE chain before

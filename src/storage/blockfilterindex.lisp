@@ -27,9 +27,9 @@
   "Block filter index state.")
 
 (defmethod index-name ((index blockfilterindex)) "basic block filter index")
-(defmethod index-height ((index blockfilterindex) chainstate)
-  (declare (ignore chainstate))
-  (blockfilterindex-height index))
+;; INDEX-HEIGHT is a method in src/node/indexes.lisp, not here: resolving the
+;; marker against the active chain needs the fork walk, and that needs the
+;; validation layer.
 (defmethod index-write-block ((index blockfilterindex) chainstate block block-hash height spent-utxos)
   (declare (ignore chainstate))
   (blockfilterindex-add-block index block block-hash height spent-utxos))

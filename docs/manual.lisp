@@ -497,7 +497,9 @@
   while it names a block on the ACTIVE chain -- INDEX-HEIGHT resolves it
   against the chainstate and INDEX-PREPARE-SYNC rewinds one that has
   fallen off, undoing the abandoned branch for an index whose records a
-  reconnect does not overwrite; pruning keeps
+  reconnect does not overwrite and leaving the filter index's marker on a
+  block whose filter header the next write can chain off (an orphaned
+  filter is KEPT, as Core keeps one in its hash index); pruning keeps
   `+min-blocks-to-keep+` and never touches a block under a prune lock
   (assumeutxo, rescans); a coins-cache entry that survives a sync carries
   neither DIRTY nor FRESH, since FRESH claims the base view has no such
