@@ -1044,28 +1044,19 @@ left LOCKED."
 
 ;;; --- Wallet loading (Core CWallet::LoadExisting + walletdb LoadWallet) ---
 
-(defun %load-wallet-records (wallet warnings &key chain-state)
-  "Populate WALLET from its database records. Two-pass: descriptors first,
-then keys/caches/active mappings (LevelDB iteration order does not guarantee
-descriptor-before-key). Transaction records load last — RefreshTXOs needs
-the IsMine script maps the cache install builds. CHAIN-STATE (when given)
-resolves stored confirmed/conflicted block heights (CWalletTx::updateState).
-
-Returns (values warnings rescan-required); the second value is Core's
-DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
-  (let ((records (wallet-db-records (wallet-db wallet)))
-        (network (wallet-network wallet))
-        (caches (make-hash-table :test 'equalp))   ; id -> descriptor-cache
-        (actives '())
-        (tx-records '())
+(defun %load-wallet-descriptor-records (wallet warnings)
+  "Pass 1 over WALLET's database: the wallet flags, the master keys, the
+singletons, the address book, and the descriptor records that pass 2's keys
+and caches attach to (LevelDB iteration order does not guarantee
+descriptor-before-key). Returns (values warnings locator)."
+  (let ((network (wallet-network wallet))
         (locator-main '())
         (locator-nomerkle '()))
-    ;; Pass 1: singletons + descriptors.
-    (dolist (rec records)
-      (multiple-value-bind (type fields) (wdb-parse-key (car rec))
+    (with-wallet-db-records (record-key value (wallet-db wallet))
+      (multiple-value-bind (type fields) (wdb-parse-key record-key)
         (cond
           ((equal type +wdb-key-flags+)
-           (let ((flags (wdb-parse-uint64-value (cdr rec))))
+           (let ((flags (wdb-parse-uint64-value value)))
              ;; Unknown flags in the mandatory (upper) region refuse to load
              ;; (Core LoadWalletFlags, wallet.cpp:1767).
              (when (plusp (logxor (ash (logand flags +known-wallet-flags+) -32)
@@ -1075,7 +1066,7 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
              (setf (wallet-flags wallet) flags)))
           ((equal type +wdb-key-walletdescriptor+)
            (multiple-value-bind (desc-str creation-time next-index range-start range-end)
-               (wdb-parse-descriptor-value (cdr rec))
+               (wdb-parse-descriptor-value value)
              (let* ((desc (bl.rpc:parse-descriptor desc-str network :require-checksum t))
                     (spkm (%make-spkm-from-descriptor desc creation-time
                                                       range-start range-end
@@ -1091,7 +1082,7 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
                (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                  :message (format nil "Error reading wallet database: duplicate CMasterKey id ~D" id)))
              (multiple-value-bind (crypted salt method iterations other)
-                 (wdb-parse-mkey-value (cdr rec))
+                 (wdb-parse-mkey-value value)
                (setf (gethash id (wallet-master-keys wallet))
                      (make-wallet-master-key :crypted-key crypted :salt salt
                                              :derivation-method method
@@ -1100,26 +1091,24 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
                (setf (wallet-master-key-max-id wallet)
                      (max (wallet-master-key-max-id wallet) id)))))
           ((equal type +wdb-key-orderposnext+)
-           (setf (wallet-orderposnext wallet) (wdb-parse-int64-value (cdr rec))))
+           (setf (wallet-orderposnext wallet) (wdb-parse-int64-value value)))
           ((equal type +wdb-key-bestblock-nomerkle+)
-           (setf locator-nomerkle (wdb-parse-block-locator-value (cdr rec))))
+           (setf locator-nomerkle (wdb-parse-block-locator-value value)))
           ((equal type +wdb-key-bestblock+)
-           (setf locator-main (wdb-parse-block-locator-value (cdr rec))))
+           (setf locator-main (wdb-parse-block-locator-value value)))
           ((equal type +wdb-key-lockedutxo+)
            ;; Records on disk are the persistent locks (lockunspent
            ;; persistent=true); memory-only locks never reach the DB.
            (multiple-value-bind (txid n) (wdb-parse-lockedutxo-fields fields)
              (push (list txid n t) (wallet-locked-utxos wallet))))
-          ((equal type +wdb-key-tx+)
-           (push (cons (wdb-parse-tx-fields fields) (cdr rec)) tx-records))
           ((equal type +wdb-key-name+)
            (setf (addr-book-entry-label
                   (%wallet-book-entry wallet (wdb-parse-address-string-fields fields)))
-                 (wdb-parse-string-value (cdr rec))))
+                 (wdb-parse-string-value value)))
           ((equal type +wdb-key-purpose+)
            (setf (addr-book-entry-purpose
                   (%wallet-book-entry wallet (wdb-parse-address-string-fields fields)))
-                 (wdb-parse-string-value (cdr rec))))
+                 (wdb-parse-string-value value)))
           ((equal type +wdb-key-destdata+)
            ;; Core LoadRecords DESTDATA: "used" -> previously-spent marker;
            ;; "rr<id>" receive requests are GUI-only and skipped.
@@ -1132,15 +1121,25 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
                    ((and (>= (length data-key) 2)
                          (string= "rr" data-key :end2 2)))
                    (t (push "Found unknown address data record" warnings))))))))
-    ;; Pass 2: keys, caches, active mappings.
-    (dolist (rec records)
-      (multiple-value-bind (type fields) (wdb-parse-key (car rec))
+    ;; bestblock preferred when non-empty, else bestblock_nomerkle (Core
+    ;; ReadBestBlock; WriteBestBlock deliberately leaves bestblock empty).
+    (values warnings (or locator-main locator-nomerkle))))
+
+(defun %load-wallet-key-records (wallet warnings)
+  "Pass 2 over WALLET's database: the descriptor keys, the descriptor caches
+and the active-SPKM mappings, all of which name a descriptor pass 1 installed.
+Returns (values warnings caches actives)."
+  (let ((network (wallet-network wallet))
+        (caches (make-hash-table :test 'equalp))   ; id -> descriptor-cache
+        (actives '()))
+    (with-wallet-db-records (record-key value (wallet-db wallet))
+      (multiple-value-bind (type fields) (wdb-parse-key record-key)
         (cond
           ((equal type +wdb-key-walletdescriptorkey+)
            (multiple-value-bind (id pubkey) (wdb-parse-descriptor-key-fields fields)
             (let* ((spkm (gethash id (wallet-spkms wallet))))
              (if spkm
-                 (let ((priv (wdb-parse-descriptor-key-value (cdr rec) pubkey)))
+                 (let ((priv (wdb-parse-descriptor-key-value value pubkey)))
                    (unless priv
                      (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                                        :message "Error reading wallet database: descriptor private key checksum mismatch"))
@@ -1164,12 +1163,12 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
                (t
                 (setf (gethash (bl.crypto:hash160 pubkey)
                                (desc-spkm-crypted-keys spkm))
-                      (cons pubkey (wdb-parse-vector-value (cdr rec)))))))))
+                      (cons pubkey (wdb-parse-vector-value value))))))))
           ((equal type +wdb-key-walletdescriptorcache+)
            (let* ((id (subseq fields 0 32))
                   (cache (or (gethash id caches)
                              (setf (gethash id caches) (bl.rpc:make-descriptor-cache))))
-                  (xpub (wdb-parse-xpub-value (cdr rec) network)))
+                  (xpub (wdb-parse-xpub-value value network)))
              ;; One type string, two record shapes, told apart by length:
              ;; id + keyexp (36) is a parent, id + keyexp + derindex (40)
              ;; a derived key.
@@ -1186,7 +1185,7 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
            (let* ((id (subseq fields 0 32))
                   (cache (or (gethash id caches)
                              (setf (gethash id caches) (bl.rpc:make-descriptor-cache))))
-                  (xpub (wdb-parse-xpub-value (cdr rec) network)))
+                  (xpub (wdb-parse-xpub-value value network)))
              (multiple-value-bind (id key-exp)
                  (wdb-parse-descriptor-parent-cache-fields fields)
                (declare (ignore id))
@@ -1195,14 +1194,30 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
                (equal type +wdb-key-activeinternalspk+))
            (push (list (equal type +wdb-key-activeinternalspk+)
                        (aref fields 0)
-                       (cdr rec))
+                       value)
                  actives)))))
-    ;; bestblock preferred when non-empty, else bestblock_nomerkle (Core
-    ;; ReadBestBlock; WriteBestBlock deliberately leaves bestblock empty).
-    (let ((locator (or locator-main locator-nomerkle)))
-      (when locator
-        (setf (wallet-loaded-locator wallet) locator)
-        (setf (wallet-last-block-hash wallet) (first locator))))
+    (values warnings caches actives)))
+
+(defun %load-wallet-records (wallet warnings &key chain-state)
+  "Populate WALLET from its database records. Three scans, each streamed
+straight off the database the way Core's per-type record cursors are
+(walletdb.cpp LoadRecords): descriptors first, then keys/caches/active
+mappings, then the transaction records — RefreshTXOs needs the IsMine script
+maps the cache install builds. CHAIN-STATE (when given) resolves stored
+confirmed/conflicted block heights (CWalletTx::updateState).
+
+Returns (values warnings rescan-required); the second value is Core's
+DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
+  (let ((locator nil)
+        (caches nil)
+        (actives nil))
+    (multiple-value-setq (warnings locator)
+      (%load-wallet-descriptor-records wallet warnings))
+    (multiple-value-setq (warnings caches actives)
+      (%load-wallet-key-records wallet warnings))
+    (when locator
+      (setf (wallet-loaded-locator wallet) locator)
+      (setf (wallet-last-block-hash wallet) (first locator)))
     ;; Install caches (rebuilds script/pubkey maps), then active mappings.
     (loop for spkm being the hash-values of (wallet-spkms wallet)
           do (spkm-set-cache wallet spkm
@@ -1223,7 +1238,7 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
     ;; Transaction records last: RefreshTXOs consults the IsMine maps built
     ;; by the cache installs above (Core LoadTxRecords runs after descriptor
     ;; records too).
-    (wallet-load-tx-records wallet (nreverse tx-records) chain-state warnings)))
+    (wallet-load-tx-records wallet chain-state warnings)))
 
 (defun load-wallet (manager name &key chain-state)
   "Load an existing wallet from <wallets>/<name>/ and register it. Returns

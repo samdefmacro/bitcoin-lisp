@@ -8,6 +8,18 @@
 here because two wallet test files draw from it."
   (bl.wallet::make-wrng seed))
 
+;;;; The wallet database's whole record set
+
+(defun wallet-db-record-list (db)
+  "Every (key . value) byte pair in the open wallet database DB, in key
+order. The wallet itself streams its records one at a time, so a test that
+wants to compare or count whole record sets collects them here -- three
+wallet test files do."
+  (let ((out '()))
+    (bl.wallet::map-wallet-db-records db (lambda (key value)
+                                           (push (cons key value) out)))
+    (nreverse out)))
+
 ;;;; Addressing one wallet through the RPC handlers
 
 (defmacro with-rpc-wallet ((name) &body body)

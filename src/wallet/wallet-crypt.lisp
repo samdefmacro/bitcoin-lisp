@@ -637,19 +637,53 @@ PARAMS: (oldpassphrase newpassphrase). Returns null."
 (defun %hex-encode (bytes)
   (string-downcase (bl.crypto:bytes-to-hex bytes)))
 
-(defun %wallet-dump-lines (wallet)
-  "The dump's header and record lines, in LevelDB key order."
-  (list* (format nil "~A,~D" +wallet-dump-magic+ +wallet-dump-version+)
-         (format nil "network,~(~A~)" (wallet-network wallet))
-         "format,leveldb"
-         (mapcar (lambda (record)
-                   (format nil "~A,~A"
-                           (%hex-encode (car record))
-                           (%hex-encode (cdr record))))
-                 (wallet-db-records (wallet-db wallet)))))
+(defun %wallet-dump-header-lines (wallet)
+  "The dump's three header lines, ahead of the record lines."
+  (list (format nil "~A,~D" +wallet-dump-magic+ +wallet-dump-version+)
+        (format nil "network,~(~A~)" (wallet-network wallet))
+        "format,leveldb"))
+
+(alexandria:define-constant +wallet-dump-newline+
+    (coerce (vector 10) '(simple-array (unsigned-byte 8) (*)))
+  :test #'equalp
+  :documentation "The line terminator the dump's checksum covers, as bytes.")
+
+(alexandria:define-constant +wallet-dump-comma+
+    (coerce (vector 44) '(simple-array (unsigned-byte 8) (*)))
+  :test #'equalp
+  :documentation "The separator between a record line's two hex fields.")
+
+(defun %dump-line-octets (line)
+  "LINE plus its terminator, as the bytes the dump file holds. The dump is
+ASCII, so latin-1 encoding is the identity on it."
+  (concatenate '(simple-array (unsigned-byte 8) (*))
+               (flexi-streams:string-to-octets line :external-format :latin-1)
+               +wallet-dump-newline+))
+
+(defun %dump-hex-octets (bytes)
+  "BYTES as lower-case ASCII hex, already as bytes.
+
+Deliberately not (%HEX-ENCODE BYTES): a Lisp string costs four bytes per
+character on SBCL, and the hex of a wallet's records is twice the wallet."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
+  (let ((out (make-array (* 2 (length bytes)) :element-type '(unsigned-byte 8))))
+    (flet ((digit (nibble) (if (< nibble 10) (+ 48 nibble) (+ 87 nibble))))
+      (loop for b of-type (unsigned-byte 8) across bytes
+            for i of-type fixnum from 0 by 2
+            do (setf (aref out i) (digit (ldb (byte 4 4) b))
+                     (aref out (1+ i)) (digit (ldb (byte 4 0) b)))))
+    out))
 
 (defun %write-wallet-dump (wallet path)
   "Write WALLET's dump to PATH atomically. Caller holds the wallet lock.
+
+Every line is written and hashed as it is produced, so the dump costs one
+record of heap rather than the whole file several times over — the record
+list, the list of hex lines, and the single body string that carried them
+into the checksum. Core's backup is a page copy inside SQLite with no
+application-side buffer at all (sqlite.cpp:344-360). The file is opened as
+bytes for the same reason: the dump is ASCII, so this writes exactly what the
+character stream did, without a character buffer to hold it in.
 
 The temp file differs from PATH in its NAME, never its TYPE. RENAME-FILE
 merges the target with the source pathname (CLHS), so a temp that differs
@@ -660,38 +694,48 @@ user asked for."
                                                 (or (pathname-name path) "wallet")
                                                 ".tmp")
                              :defaults path))
-        (body (with-output-to-string (s)
-                (dolist (line (%wallet-dump-lines wallet))
-                  (write-string line s)
-                  (write-char #\Newline s)))))
-    (let ((checksum (bl.crypto:hash256
-                     (flexi-streams:string-to-octets body
-                                                     :external-format :latin-1))))
-      (unwind-protect
-           (progn
-             (with-open-file (out temp :direction :output
-                                       :element-type 'character
-                                       :external-format :latin-1
-                                       :if-exists :supersede
-                                       :if-does-not-exist :create)
-               (write-string body out)
-               (format out "checksum,~A~%" (%hex-encode checksum))
-               (finish-output out)
-               ;; A backup that is only in the page cache is not a backup:
-               ;; the rename can reach the disk before the contents do, so a
-               ;; crash would leave a correctly-named, empty or torn file.
-               (ignore-errors
-                (sb-posix:fsync (sb-sys:fd-stream-fd out))))
-             (rename-file temp path)
-             ;; POSIX does not make the rename itself durable until the
-             ;; containing directory is synced (storage/utxo.lisp does the
-             ;; same for the same reason).
-             (bl.kv:fsync-parent-directory path)
-             (setf temp nil))
-        ;; A failed dump must not leave a partial file that looks like a
-        ;; backup (Core dump.cpp:104-106 removes its temp the same way).
-        (when (and temp (probe-file temp))
-          (ignore-errors (delete-file temp)))))
+        (digest (ironclad:make-digest :sha256)))
+    (unwind-protect
+         (progn
+           (with-open-file (out temp :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede
+                                     :if-does-not-exist :create)
+             (flet ((emit (octets)
+                      (write-sequence octets out)
+                      (ironclad:update-digest digest octets)))
+               (dolist (line (%wallet-dump-header-lines wallet))
+                 (emit (%dump-line-octets line)))
+               (with-wallet-db-records (record-key value (wallet-db wallet))
+                 (emit (%dump-hex-octets record-key))
+                 (emit +wallet-dump-comma+)
+                 (emit (%dump-hex-octets value))
+                 (emit +wallet-dump-newline+)))
+             ;; The checksum line is outside the digest, exactly as it was
+             ;; when the body was hashed whole: hash256 over every line up
+             ;; to but not including it.
+             (write-sequence
+              (%dump-line-octets
+               (format nil "checksum,~A"
+                       (%hex-encode (bl.crypto:sha256
+                                     (ironclad:produce-digest digest)))))
+              out)
+             (finish-output out)
+             ;; A backup that is only in the page cache is not a backup:
+             ;; the rename can reach the disk before the contents do, so a
+             ;; crash would leave a correctly-named, empty or torn file.
+             (ignore-errors
+              (sb-posix:fsync (sb-sys:fd-stream-fd out))))
+           (rename-file temp path)
+           ;; POSIX does not make the rename itself durable until the
+           ;; containing directory is synced (storage/utxo.lisp does the
+           ;; same for the same reason).
+           (bl.kv:fsync-parent-directory path)
+           (setf temp nil))
+      ;; A failed dump must not leave a partial file that looks like a
+      ;; backup (Core dump.cpp:104-106 removes its temp the same way).
+      (when (and temp (probe-file temp))
+        (ignore-errors (delete-file temp))))
     t))
 
 (defconstant +wallet-dump-max-lines+ 4000000

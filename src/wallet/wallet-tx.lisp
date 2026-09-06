@@ -1219,9 +1219,11 @@ away while the wallet was closed."
                 (bl.store:block-index-entry-height entry))
           (%wtx-apply-state wtx :inactive)))))
 
-(defun wallet-load-tx-records (wallet tx-records chain-state warnings)
-  "Replay the stored CWalletTx records into mapWallet (Core LoadTxRecords +
-LoadToWallet). TX-RECORDS is (txid . value-bytes) pairs. Returns
+(defun wallet-load-tx-records (wallet chain-state warnings)
+  "Replay WALLET's stored CWalletTx records into mapWallet (Core LoadTxRecords
++ LoadToWallet). The records are streamed off the database here rather than
+handed in as a list, which is what Core's own DBKeys::TX cursor does and what
+keeps a large transaction history out of the heap twice over. Returns
 (values warnings rescan-required).
 
 RESCAN-REQUIRED is Core's DBErrors::NEED_RESCAN and it is set on exactly
@@ -1232,49 +1234,51 @@ from height 0 instead of from the stored locator, which is the only thing
 that can rebuild the lost record."
   (let ((any-unordered nil)
         (rescan-required nil))
-    (dolist (rec tx-records)
-      (destructuring-bind (txid . value) rec
-        (multiple-value-bind (wtx state-warning)
-            (handler-case (parse-wallet-tx-record value)
-              (error (e)
-                (push (format nil "Error reading wallet tx record: ~A" e)
-                      warnings)
-                (setf rescan-required t)
-                nil))
-          (when state-warning (push state-warning warnings))
-          (when wtx
-            (cond
-              ((not (equalp (wallet-tx-txid wtx) txid))
-               (push "Wallet tx record hash mismatch; record skipped (rescan to recover)"
-                     warnings)
-               (setf rescan-required t))
-              ((wallet-get-wallet-tx wallet txid)
-               (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
-                                 :message "Error: Corrupt transaction found. This can be fixed by removing transactions from wallet and rescanning."))
-              (t
-               (when chain-state
-                 (%wtx-update-state-from-chain wtx chain-state))
-               (setf (gethash txid (wallet-map-wallet wallet)) wtx)
-               (when (= (wallet-tx-order-pos wtx) -1)
-                 (setf any-unordered t))
-               (wallet-add-to-spends wallet wtx)
-               ;; A parent already loaded as block-conflicted conflicts its
-               ;; spenders too (LoadToWallet, wallet.cpp:1172-1180; no-op
-               ;; until a chain height is known, like Core pre-AttachChain).
-               (bl.ser:dovector
-                   (input (bl.ser:transaction-inputs
-                           (wallet-tx-tx wtx)))
-                 (let ((prev (wallet-get-wallet-tx
-                              wallet
-                              (bl.ser:outpoint-hash
-                               (bl.ser:tx-in-previous-output input)))))
-                   (when (and prev (eq (wallet-tx-state prev) :block-conflicted))
-                     (wallet-mark-conflicted wallet
-                                             (wallet-tx-block-hash prev)
-                                             (wallet-tx-block-height prev)
-                                             txid))))
-               (wallet-maybe-update-birth-time wallet (wallet-tx-get-time wtx))
-               (wallet-refresh-txos wallet wtx)))))))
+    (with-wallet-db-records (record-key value (wallet-db wallet))
+      (multiple-value-bind (type fields) (wdb-parse-key record-key)
+        (when (equal type +wdb-key-tx+)
+          (let ((txid (wdb-parse-tx-fields fields)))
+            (multiple-value-bind (wtx state-warning)
+                (handler-case (parse-wallet-tx-record value)
+                  (error (e)
+                    (push (format nil "Error reading wallet tx record: ~A" e)
+                          warnings)
+                    (setf rescan-required t)
+                    nil))
+              (when state-warning (push state-warning warnings))
+              (when wtx
+                (cond
+                  ((not (equalp (wallet-tx-txid wtx) txid))
+                   (push "Wallet tx record hash mismatch; record skipped (rescan to recover)"
+                         warnings)
+                   (setf rescan-required t))
+                  ((wallet-get-wallet-tx wallet txid)
+                   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
+                                     :message "Error: Corrupt transaction found. This can be fixed by removing transactions from wallet and rescanning."))
+                  (t
+                   (when chain-state
+                     (%wtx-update-state-from-chain wtx chain-state))
+                   (setf (gethash txid (wallet-map-wallet wallet)) wtx)
+                   (when (= (wallet-tx-order-pos wtx) -1)
+                     (setf any-unordered t))
+                   (wallet-add-to-spends wallet wtx)
+                   ;; A parent already loaded as block-conflicted conflicts its
+                   ;; spenders too (LoadToWallet, wallet.cpp:1172-1180; no-op
+                   ;; until a chain height is known, like Core pre-AttachChain).
+                   (bl.ser:dovector
+                       (input (bl.ser:transaction-inputs
+                               (wallet-tx-tx wtx)))
+                     (let ((prev (wallet-get-wallet-tx
+                                  wallet
+                                  (bl.ser:outpoint-hash
+                                   (bl.ser:tx-in-previous-output input)))))
+                       (when (and prev (eq (wallet-tx-state prev) :block-conflicted))
+                         (wallet-mark-conflicted wallet
+                                                 (wallet-tx-block-hash prev)
+                                                 (wallet-tx-block-height prev)
+                                                 txid))))
+                   (wallet-maybe-update-birth-time wallet (wallet-tx-get-time wtx))
+                   (wallet-refresh-txos wallet wtx)))))))))
     ;; Rebuild wtxOrdered: ascending nOrderPos, unordered records (foreign
     ;; wallets only — we always persist an order pos) appended and assigned
     ;; fresh positions (a simplification of Core's ReorderTransactions).

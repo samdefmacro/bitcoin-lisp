@@ -470,7 +470,7 @@ XORs #xFF into a middle byte, which is what a torn write or a bad block looks
 like on load; :DELETE removes the record outright."
   (let ((db (bl.wallet::wallet-db-open path)))
     (unwind-protect
-         (dolist (record (bl.wallet::wallet-db-records db))
+         (dolist (record (wallet-db-record-list db))
            (when (equal (bl.wallet::wdb-parse-key (car record))
                         bl.wallet::+wdb-key-tx+)
              (return
