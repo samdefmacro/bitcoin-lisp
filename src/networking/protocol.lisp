@@ -147,9 +147,12 @@ know or a peer that exceeded its rate limit (and was disconnected)."
     ;;
     ;; The BYTE COUNT is the payload's, not the framed message's, matching
     ;; vRecv.size() at that point.
-    ;; SANITIZED: the 12-byte command field is peer-controlled bytes, newline
-    ;; included. Core wraps every log line that prints a message type in
-    ;; SanitizeString (net_processing.cpp:3582 and the others).
+    ;; SANITIZED FOR THE LOG ONLY: the 12-byte command field is peer-controlled
+    ;; bytes, newline included, and Core wraps every log line that prints a
+    ;; message type in SanitizeString (net_processing.cpp:3582 and the others).
+    ;; DISPATCH below must keep using the RAW command -- sanitizing drops
+    ;; characters rather than escaping them, so "bl<LF>ock" would sanitize to
+    ;; "block" and a forged command name would reach a real handler.
     (bl:log-cat "net" "received: ~A (~D bytes) peer=~A"
                 (bl.bytes:sanitize-string command) (length payload) (peer-id peer))
     (let ((handler (p2p-handler-for command)))

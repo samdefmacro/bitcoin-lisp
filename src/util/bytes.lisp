@@ -387,13 +387,21 @@ line that prints a peer-supplied message type), :UA-COMMENT (-uacomment),
 
 \"Alphanumeric\" is Core's CHARS_ALPHA_NUM, i.e. ASCII a-z A-Z 0-9 and nothing
 else. CL:ALPHANUMERICP is not that test -- it is true of every Unicode letter,
-so using it would admit characters Core drops."
+so using it would admit characters Core drops.
+
+Returns STRING ITSELF when nothing would be dropped, which is nearly always:
+this runs on every inbound P2P message (the \"received: ~A\" line sanitizes the
+peer-controlled command field), and LOG-CAT is a macro over a function call, so
+the argument is evaluated whether or not the category is enabled. One pass and
+no allocation for a clean string; the copy is made only when there is something
+to remove."
   (let ((extra (%safe-chars-for rule)))
-    (remove-if-not
-     (lambda (c)
-       (let ((code (char-code c)))
-         (or (<= 48 code 57)            ; 0-9
-             (<= 65 code 90)            ; A-Z
-             (<= 97 code 122)           ; a-z
-             (and (find c extra) t))))
-     string)))
+    (flet ((safep (c)
+             (let ((code (char-code c)))
+               (or (<= 48 code 57)      ; 0-9
+                   (<= 65 code 90)      ; A-Z
+                   (<= 97 code 122)     ; a-z
+                   (and (find c extra) t)))))
+      (if (every #'safep string)
+          string
+          (remove-if-not #'safep string)))))
