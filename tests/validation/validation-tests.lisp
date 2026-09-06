@@ -2472,3 +2472,69 @@ shows a lock height as a block number rather than as little-endian hex."
     (is (string= (format nil "OP_IF ~A OP_CHECKSIGVERIFY OP_ELSE 500000 ~
 OP_CHECKLOCKTIMEVERIFY OP_DROP OP_ENDIF ~A OP_CHECKSIG" pk pk)
                  (%asm script)))))
+
+(defun %bare-multisig-script (m n &key (m-minimal t) (n-minimal t))
+  "<m> <N distinct 33-byte key pushes> <n> OP_CHECKMULTISIG. A count is written
+the way Core writes it -- OP_1..OP_16 where one exists, otherwise the minimal
+one-byte push, which is the ONLY spelling 17..20 have. With :M-MINIMAL or
+:N-MINIMAL NIL that count is written as a one-byte push even where an OP_n
+exists, which is the non-minimal spelling Core refuses."
+  (flet ((count-bytes (k minimal)
+           (if (and minimal (<= 1 k 16)) (list (+ #x50 k)) (list 1 k))))
+    (coerce (append (count-bytes m m-minimal)
+                    (loop for i from 2 below (+ 2 n)
+                          append (cons 33 (coerce (test-pubkey i) 'list)))
+                    (count-bytes n n-minimal)
+                    (list #xae))
+            '(simple-array (unsigned-byte 8) (*)))))
+
+(test bare-multisig-counts-are-read-through-cores-getscriptnumber
+  "Core MatchMultisig (solver.cpp:84-105) reads BOTH counts through
+GetScriptNumber (:66-83), which takes an OP_1..OP_16 opcode OR a minimally
+encoded push and then range-checks against [min, MAX_PUBKEYS_PER_MULTISIG].
+Reading the opcode range alone caps the classifier at 16.
+
+17 through 20 have no OP_n opcode, so they reach Core only through the push
+arm. Calling them :nonstandard made this node refuse to RELAY a transaction
+spending a bare 17..20-key multisig output that Core relays
+(AreInputsStandard rejects only NONSTANDARD and WITNESS_UNKNOWN), and made
+every RPC that reports a script type say \"nonstandard\" where Core says
+\"multisig\"."
+  ;; Core script_standard_tests.cpp:65-89: the two shapes Core pins as
+  ;; MULTISIG, with their solutions.
+  (dolist (mn '((1 2) (2 3)))
+    (destructuring-bind (m n) mn
+      (let ((script (%bare-multisig-script m n)))
+        (multiple-value-bind (type data) (bl.val:classify-script script)
+          (is (eq :multisig type))
+          (is (eql m (getf data :m)))
+          (is (eql n (getf data :n)))
+          (is (eql n (length (getf data :pubkeys))))))))
+  ;; The range Core reaches only through the push arm.
+  (dolist (mn '((1 17) (1 20) (17 20) (20 20)))
+    (destructuring-bind (m n) mn
+      (let ((script (%bare-multisig-script m n)))
+        (is (string= "multisig" (bl.val:script-type-name script))
+            "~D-of-~D must classify as Core does" m n)
+        (is (eql n (getf (nth-value 1 (bl.val:classify-script script)) :n))
+            "~D-of-~D solved the wrong way" m n))))
+  ;; Controls, all cases where we already AGREED with Core -- without them a
+  ;; simply widened opcode range would pass.
+  (is (string= "nonstandard" (bl.val:script-type-name (%bare-multisig-script 1 21)))
+      "21 keys is over MAX_PUBKEYS_PER_MULTISIG")
+  (is (string= "nonstandard"
+               (bl.val:script-type-name (%bare-multisig-script 1 3 :n-minimal nil)))
+      "a one-byte push of 3 is not the minimal encoding of 3")
+  (is (string= "nonstandard"
+               (bl.val:script-type-name (%bare-multisig-script 1 2 :m-minimal nil)))
+      "a one-byte push of 1 is not the minimal encoding of 1")
+  ;; Core script_standard_tests.cpp:176-194: the degenerate shapes.
+  (let ((key (bl.crypto:bytes-to-hex (test-pubkey 2))))
+    (dolist (row (list (list (format nil "0021~Aae" key) "0-of-2")
+                       (list (format nil "5221~A51ae" key) "2-of-1")
+                       (list (format nil "5121~A52ae" key) "n=2 with 1 key")
+                       (list "5151ae" "n=1 with 0 keys")))
+      (destructuring-bind (hex what) row
+        (is (string= "nonstandard"
+                     (bl.val:script-type-name (bl.crypto:hex-to-bytes hex)))
+            "~A must not classify as multisig" what)))))

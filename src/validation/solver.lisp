@@ -117,36 +117,64 @@ NIL (Core MatchPayToPubkey, solver.cpp:36-47)."
          (= (aref script (1- len)) #xac)                  ; OP_CHECKSIG
          (eql (%valid-pubkey-push-p script 0) (- len 2)))))
 
-(defun %match-multisig (script)
-  "(values m n pubkeys) when SCRIPT is bare multisig -- OP_m <key>.. OP_n
-OP_CHECKMULTISIG with 1<=m<=n<=16 and every key a push of valid pubkey size
--- else NIL.
+(defun %script-number-at (script pos min max)
+  "Core GetScriptNumber (solver.cpp:66-83): the count SCRIPT carries at POS,
+range-checked to [MIN,MAX], as (values count next-pos); NIL when POS is not a
+count.
 
-This is Core MatchMultisig: the SHAPE only. The n<=3 cap is an IsStandard
-rule for OUTPUTS, not part of the classification, and an input SPENDING a
-larger bare multisig is still standard (AreInputsStandard only rejects
-NONSTANDARD/WITNESS_UNKNOWN)."
+Two spellings, both Core's: an OP_1..OP_16 opcode, or a data push that is
+minimally encoded (CheckMinimalPush) and decodes as a minimal CScriptNum. The
+push arm is not decoration -- 17 through 20 have NO OP_n opcode, so a
+17-of-20 multisig reaches its counts only that way, and reading the opcode
+range alone caps the classifier at 16 where Core caps it at
+MAX_PUBKEYS_PER_MULTISIG."
   (let ((len (length script)))
-    (when (and (>= len 4)
-               (= (aref script (1- len)) #xae)          ; OP_CHECKMULTISIG
-               (<= #x51 (aref script 0) #x60)           ; OP_m (1..16)
-               (<= #x51 (aref script (- len 2)) #x60))  ; OP_n (1..16)
-      (let ((m (- (aref script 0) #x50))
-            (n (- (aref script (- len 2)) #x50))
-            (pos 1)
-            (keys '()))
-        (when (<= 1 m n 16)
-          ;; Walk the n key pushes between OP_m and OP_n.
-          (loop while (< pos (- len 2))
-                do (let ((plen (%valid-pubkey-push-p script pos)))
-                     (unless (and plen (<= (+ pos 1 plen) (- len 2)))
-                       (return-from %match-multisig nil))
-                     (push (subseq script (1+ pos) (+ pos 1 plen)) keys)
-                     (incf pos (1+ plen))
-                     (when (> (length keys) n)
-                       (return-from %match-multisig nil))))
-          (when (and (= pos (- len 2)) (= (length keys) n))
-            (values m n (nreverse keys))))))))
+    (when (< pos len)
+      (let ((op (aref script pos)))
+        (multiple-value-bind (count next)
+            (cond
+              ;; IsSmallInteger + DecodeOP_N.
+              ((<= +op-1+ op +op-16+)
+               (values (1+ (- op +op-1+)) (1+ pos)))
+              ;; IsPushdataOp, of which only a direct push can ever be a
+              ;; count: OP_0 is excluded by Core's `opcode > OP_FALSE', and
+              ;; a PUSHDATA1/2/4 spelling cannot satisfy CheckMinimalPush
+              ;; and the four-byte CScriptNum bound at the same time.
+              ((<= 1 op 75)
+               (when (<= (+ pos 1 op) len)
+                 (let ((data (subseq script (1+ pos) (+ pos 1 op))))
+                   (when (and (bl.interop:minimal-push-encoding-p op data)
+                              (<= (length data) 4)
+                              (bl.interop:minimal-number-encoding-p data))
+                     (values (bl.interop:script-number-to-int data)
+                             (+ pos 1 op)))))))
+          (when (and count (<= min count max))
+            (values count next)))))))
+
+(defun %match-multisig (script)
+  "(values m n pubkeys) when SCRIPT is bare multisig -- <m> <key>.. <n>
+OP_CHECKMULTISIG with 1<=m<=n<=MAX_PUBKEYS_PER_MULTISIG and every key a push
+of valid pubkey size -- else NIL (Core MatchMultisig, solver.cpp:84-105).
+
+The SHAPE only. The n<=3 cap is an IsStandard rule for OUTPUTS, not part of
+the classification, and an input SPENDING a larger bare multisig is still
+standard (AreInputsStandard only rejects NONSTANDARD/WITNESS_UNKNOWN)."
+  (let ((len (length script)))
+    (when (and (>= len 4) (= (aref script (1- len)) #xae))   ; OP_CHECKMULTISIG
+      (multiple-value-bind (m pos)
+          (%script-number-at script 0 1 +max-pubkeys-per-multisig+)
+        (when m
+          ;; Core's `while (GetOp(..) && ValidSize(data))': walk the key
+          ;; pushes, stopping at the first op that is not one.
+          (let ((keys '()))
+            (loop for plen = (%valid-pubkey-push-p script pos)
+                  while (and plen (<= (+ pos 1 plen) len))
+                  do (push (subseq script (1+ pos) (+ pos 1 plen)) keys)
+                     (incf pos (1+ plen)))
+            (multiple-value-bind (n next)
+                (%script-number-at script pos m +max-pubkeys-per-multisig+)
+              (when (and n (= (length keys) n) (eql next (1- len)))
+                (values m n (nreverse keys))))))))))
 
 ;;; --- Solver ---
 

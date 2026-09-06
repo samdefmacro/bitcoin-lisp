@@ -350,13 +350,7 @@ point of miniscript is to know so in advance."
 ceiling only shows up on an expression too large to write out by hand, and
 miniscript refuses a repeated key (CheckDuplicateKey), so they have to differ."
   (loop for i from 2 below (+ 2 count)
-        collect (string-downcase
-                 (bl.crypto:bytes-to-hex
-                  (bl.crypto:derive-public-key
-                   (let ((v (make-array 32 :element-type '(unsigned-byte 8)
-                                           :initial-element 0)))
-                     (setf (aref v 31) i)
-                     v))))))
+        collect (string-downcase (bl.crypto:bytes-to-hex (test-pubkey i)))))
 
 (defun %ms-sized-policy (n-multis)
   "A miniscript body of N-MULTIS 1-of-20 multi() fragments chained with and_v.

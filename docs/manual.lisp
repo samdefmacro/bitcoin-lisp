@@ -958,10 +958,13 @@
   script so OP_RETURN data shaped like a signature is not read as one.
 
   CheckMinimalPush is ONE helper, `bl.interop:minimal-push-encoding-p',
-  with no second copy: the interpreter applies it under the MINIMALDATA
-  flag, while miniscript's DecomposeScript applies it UNCONDITIONALLY,
-  because its mapping from a script to an expression has to be one to
-  one."
+  with three callers and no second copy: the interpreter applies it under
+  the MINIMALDATA flag, while the solver's GetScriptNumber and
+  miniscript's DecomposeScript apply it UNCONDITIONALLY, because both
+  need the mapping from bytes to meaning to be one to one. That is also
+  why `classify-script' reads the bare-multisig counts through
+  GetScriptNumber rather than through the OP_1..OP_16 range: 17 through
+  20 have no OP_n opcode and reach Core only as a minimal push."
   (bitcoin-lisp.coalton.script package)
   (bitcoin-lisp.coalton.interop package)
   (bitcoin-lisp.coalton.script:script-error-name function)
