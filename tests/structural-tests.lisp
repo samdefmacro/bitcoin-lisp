@@ -936,10 +936,15 @@ whitespace and followed by ) or whitespace -- i.e. with no caller."
     (remove-if #'token-p names)))
 
 (defparameter +wdb-write-only-values+
-  '("wdb-parse-int32-value")
-  "Generated readers with no reader by design: the int32 value carries the
-'version' record, which Core writes (CLIENT_VERSION) and never reads back
-(walletdb.cpp: no LoadWallet branch for DBKeys::VERSION), and so do we.")
+  '()
+  "Generated readers a record type is written without, by design. Empty, and
+the entry it lost is the point: WDB-PARSE-INT32-VALUE sat here claiming Core
+writes DBKeys::VERSION and never reads it back, which is exactly backwards --
+LoadWallet reads it into last_client first thing, logs it, words the
+unrecognized-descriptor failure from it, and rewrites it after a clean load
+(walletdb.cpp:1122-1125, 782-783, 1177-1178). The three uses are ours now, so
+the reader has callers. Anything added here needs Core's own code to say the
+record is write-only, not our not having gotten to it (GA11 b314f13a).")
 
 (test wdb-schema-functions-are-called
   "Every function a DEFINE-WDB-KEY / DEFINE-WDB-VALUE row generates has a
