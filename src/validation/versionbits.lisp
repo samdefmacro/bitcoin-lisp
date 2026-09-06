@@ -379,7 +379,11 @@ Reporting one value twice is the easy mistake here.
 ⚠️ Core has TWO ways a deployment is active-since (versionbits.cpp:219-223):
 the state IS active, or the NEXT block's state is. Dropping the second is an
 off-by-one reachable on the live mainnet node, which holds the header at
-taproot's activation height minus one."
+taproot's activation height minus one.
+
+⚠️ The LOCKED_IN override below is Info's, not the counting walk's:
+VERSIONBITS-STATISTICS stays state-blind, exactly as GetStateStatisticsFor is,
+so a caller that wants the raw counting result still gets it."
   (let* ((prev (and entry (bl.store:block-index-entry-prev-entry entry)))
          (height (if entry (bl.store:block-index-entry-height entry) 0))
          (current (versionbits-state chain-state prev deployment))
@@ -391,6 +395,13 @@ taproot's activation height minus one."
            (when (member current '(:started :locked-in))
              (multiple-value-bind (period threshold elapsed count possible signalling)
                  (versionbits-statistics chain-state entry deployment)
+               ;; Lock-in is already decided, so there is no threshold left to
+               ;; meet and nothing left that could fail: Core zeroes the
+               ;; threshold and clears `possible' (versionbits.cpp:214-217),
+               ;; which is what makes SoftForkDescPushBack's
+               ;; `threshold > 0 || possible' guard drop both keys.
+               (when (eq current :locked-in)
+                 (setf threshold 0 possible nil))
                (%make-vb-stats :period period :threshold threshold
                                :elapsed elapsed :count count
                                :signalling signalling :possible possible)))))

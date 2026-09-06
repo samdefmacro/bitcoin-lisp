@@ -524,3 +524,58 @@ case below) cannot catch that mistake."
     (let* ((bip9 (%testdummy-bip9 (%versionbits-chain-with-tip 208 :signal-bit 28)))
            (signalling (%bip9-value bip9 "signalling")))
       (is (string= (make-string 64 :initial-element #\#) signalling)))))
+
+(test getdeploymentinfo-drops-threshold-and-possible-once-locked-in
+  "GA11 ef28c178. Core computes the statistics and then overrides two of them:
+VersionBitsCache::Info sets threshold to 0 and possible to false when the
+current state is LOCKED_IN (versionbits.cpp:210-217) -- lock-in is decided, so
+there is no threshold left to meet and nothing left that could fail -- and
+SoftForkDescPushBack emits the pair only under `threshold > 0 || possible'
+(rpc/blockchain.cpp:1337-1340), so in LOCKED_IN the statistics object holds
+period, elapsed and count only.
+
+We had the guard but not the override, and every deployment in the table has a
+positive threshold, so the guard could never fire: a settled window reported
+threshold 108 against count 12 with possible true, which reads as a period
+still in progress that could still fail. The override belongs in
+VERSIONBITS-INFO and not in the RPC, because GetStateStatisticsFor is
+state-blind in Core and other callers read its raw counting result -- the last
+assertion is what pins that split.
+
+Three states on the same deployment: STARTED (both keys, and the values Core's
+rpc_blockchain.py expects at height 207), LOCKED_IN (neither key, signalling
+string still there), ACTIVE (no statistics object at all)."
+  (with-network (:regtest)
+    (flet ((shape (blocks)
+             (let* ((bip9 (%testdummy-bip9
+                           (%versionbits-chain-with-tip blocks :signal-bit 28)))
+                    (stats (%bip9-value bip9 "statistics")))
+               (list (%bip9-value bip9 "status")
+                     (mapcar #'car stats)
+                     (and (assoc "signalling" bip9 :test #'string=) t)))))
+      (is (equal '("started" ("period" "elapsed" "count" "threshold" "possible") t)
+                 (shape 208)))
+      (is (equal '("locked_in" ("period" "elapsed" "count") t)
+                 (shape 300)))
+      (is (equal '("active" nil nil) (shape 433))))
+    ;; The STARTED values themselves are unchanged.
+    (let ((stats (%bip9-value (%testdummy-bip9
+                               (%versionbits-chain-with-tip 208 :signal-bit 28))
+                              "statistics")))
+      (is (= 108 (%bip9-value stats "threshold")))
+      (is (eq t (%bip9-value stats "possible"))))
+    ;; The override is Info's, not the counting walk's: at the same LOCKED_IN
+    ;; block VERSIONBITS-STATISTICS still reports the deployment's threshold
+    ;; and the raw arithmetic, as Core's GetStateStatisticsFor does.
+    (multiple-value-bind (cs last) (%versionbits-chain-with-tip 300 :signal-bit 28)
+      (let ((dep (%dep "testdummy" :regtest)))
+        (multiple-value-bind (period threshold elapsed count possible)
+            (bl.val:versionbits-statistics cs last dep)
+          (is (equal '(144 108 12 12 t)
+                     (list period threshold elapsed count (and possible t)))))
+        (multiple-value-bind (current next since stats)
+            (bl.val:versionbits-info cs last dep)
+          (declare (ignore next since))
+          (is (eq :locked-in current))
+          (is (= 0 (bl.val:vb-stats-threshold stats)))
+          (is (null (bl.val:vb-stats-possible stats))))))))

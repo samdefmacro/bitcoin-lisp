@@ -2489,7 +2489,7 @@ reported on."
   "The `statistics' object for STATS, a BL.VAL:VB-STATS (Core
 SoftForkDescPushBack, rpc/blockchain.cpp:1333-1341). Core omits `threshold' and
 `possible' together when the threshold is zero and the deployment can no longer
-fail."
+fail, which is exactly the LOCKED_IN case VERSIONBITS-INFO overrides them for."
   `(("period" . ,(bl.val:vb-stats-period stats))
     ("elapsed" . ,(bl.val:vb-stats-elapsed stats))
     ("count" . ,(bl.val:vb-stats-count stats))
