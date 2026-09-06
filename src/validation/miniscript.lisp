@@ -1081,21 +1081,6 @@ but a node whose type is zero."))
 (defun %ms-fail (fmt &rest args)
   (error 'miniscript-parse-error :message (apply #'format nil fmt args)))
 
-(defun %ms-split-args (string)
-  "Split a comma-separated argument list at top level, respecting nesting."
-  (let ((args '()) (depth 0) (start 0))
-    (loop for i from 0 below (length string)
-          for ch = (char string i)
-          do (case ch
-               (#\( (incf depth))
-               (#\) (decf depth)
-               )
-               (#\, (when (zerop depth)
-                      (push (subseq string start i) args)
-                      (setf start (1+ i))))))
-    (push (subseq string start) args)
-    (nreverse args)))
-
 (defun %ms-parse-hex (string expected-bytes what)
   (unless (and (= (length string) (* 2 expected-bytes))
                (every (lambda (c) (digit-char-p c 16)) string))
@@ -1120,138 +1105,428 @@ EXPRESSIONS -- xpubs with origins and ranges -- instead.")
       (funcall *ms-key-parser* string)
       (%ms-parse-hex string 33 "public key")))
 
-(defun %ms-apply-wrappers (wrappers node)
-  "Apply WRAPPERS right to left: `vc:X' is v(c(X)), not c(v(X))."
-  (dolist (w (reverse wrappers) node)
-    (setf node
-          (case w
-            (#\a (make-ms-node :wrap-a :subs (list node)))
-            (#\s (make-ms-node :wrap-s :subs (list node)))
-            (#\c (make-ms-node :wrap-c :subs (list node)))
-            (#\d (make-ms-node :wrap-d :subs (list node)))
-            (#\v (make-ms-node :wrap-v :subs (list node)))
-            (#\j (make-ms-node :wrap-j :subs (list node)))
-            (#\n (make-ms-node :wrap-n :subs (list node)))
-            ;; Sugar: t: is and_v(X,1), l: is or_i(0,X), u: is or_i(X,0).
-            (#\t (make-ms-node :and-v :subs (list node (make-ms-node :just-1))))
-            (#\l (make-ms-node :or-i :subs (list (make-ms-node :just-0) node)))
-            (#\u (make-ms-node :or-i :subs (list node (make-ms-node :just-0))))
-            (t (%ms-fail "unknown miniscript wrapper ~S" w))))))
+;;;; The parser is Core's: one cursor over the input, an explicit stack of
+;;;; pending parser states, and a stack of constructed nodes (miniscript.h
+;;;; internal::Parse, :1850-2206). Three properties come from that shape and
+;;;; not from any single check, which is why the recursive-descent version it
+;;;; replaces could not have them bolted on:
+;;;;
+;;;; - ARITY. Each combinator pushes exactly as many WRAPPED_EXPR states as it
+;;;;   takes, separated by :COMMA and closed by :CLOSE-BRACKET. A surplus
+;;;;   argument meets :CLOSE-BRACKET at a ',' and a missing one meets :COMMA at
+;;;;   a ')'; both fail. Splitting the argument list on commas and handing the
+;;;;   whole list over instead accepted `and_v(v:pk(A),older(10),pk(B))' as the
+;;;;   two-argument form -- the same scriptPubKey as the policy without B, so
+;;;;   the operator's third key was gone from the ADDRESS (GA11 780c1251) --
+;;;;   and turned a missing argument into a raw TYPE-ERROR.
+;;;;
+;;;; - A SIZE CEILING. SCRIPT-SIZE accumulates Core's per-fragment constants as
+;;;;   the parse goes and is tested at the top of the loop, so an expression
+;;;;   over the context's MaxScriptSize fails where Core fails it.
+;;;;
+;;;; - A COST BOUND. The cursor only moves forward and nothing is re-scanned,
+;;;;   so the work is linear in the prefix actually consumed -- and the size
+;;;;   ceiling caps that prefix. The old parser re-copied the remaining string
+;;;;   at every level and re-serialized every subtree to size it, which made a
+;;;;   10,000-character expression take 98 seconds (GA11 d722b087).
+
+(defstruct (ms-parser (:constructor %make-ms-parser (string end ctx max-size)))
+  "One run of MS-PARSE: Core's `in', `script_size', `to_parse' and
+`constructed' (miniscript.h:1863-1873), carried in a struct because the states
+are handled by separate functions rather than by one long switch."
+  (string "" :type simple-string)
+  (pos 0 :type fixnum)
+  (end 0 :type fixnum)
+  (ctx :p2wsh :type (member :p2wsh :tapscript))
+  (max-size 0 :type fixnum)
+  ;; Core seeds script_size at 1 and has every leaf BORROW one byte from its
+  ;; parent, so that every fragment increments it by at least one and
+  ;; MS-MAX-SCRIPT-SIZE is therefore reached in bounded time
+  ;; (miniscript.h:1855-1864). The invariant Core asserts at the end of every
+  ;; parse (:2203) is that this total equals the finished node's ScriptSize,
+  ;; which is MS-COMPUTE-SCRIPT-LEN's answer.
+  (script-size 1 :type fixnum)
+  (to-parse '() :type list)
+  (constructed '() :type list))
+
+;;; --- cursor -----------------------------------------------------------
+
+(defun %msp-peek (p)
+  "The character at the cursor, or NIL at the end of the input."
+  (and (< (ms-parser-pos p) (ms-parser-end p))
+       (char (ms-parser-string p) (ms-parser-pos p))))
+
+(defun %msp-at (p prefix)
+  "Core script::Const with skip=false (parsing.cpp:15): PREFIX is at the cursor,
+which does not move."
+  (let ((pos (ms-parser-pos p)))
+    (and (<= (+ pos (length prefix)) (ms-parser-end p))
+         (string= prefix (ms-parser-string p) :start2 pos
+                                              :end2 (+ pos (length prefix))))))
+
+(defun %msp-const (p prefix)
+  "Core script::Const with skip=true: PREFIX is at the cursor, which advances
+past it."
+  (when (%msp-at p prefix)
+    (incf (ms-parser-pos p) (length prefix))
+    t))
+
+(defun %msp-rest (p)
+  "As much of the unconsumed input as an error message should carry. Bounded,
+because the input is attacker-supplied and may be megabytes long."
+  (let ((pos (ms-parser-pos p)))
+    (subseq (ms-parser-string p) pos (min (ms-parser-end p) (+ pos 32)))))
+
+(defun %msp-expr (p)
+  "Core script::Expr (parsing.cpp:33): the span up to the ',' or ')' that
+closes the current argument, nesting-aware. Returns its bounds and consumes it."
+  (let ((s (ms-parser-string p))
+        (start (ms-parser-pos p))
+        (level 0)
+        (i (ms-parser-pos p)))
+    (loop while (< i (ms-parser-end p))
+          do (let ((ch (char s i)))
+               (cond ((or (char= ch #\() (char= ch #\{)) (incf level))
+                     ((and (plusp level) (or (char= ch #\)) (char= ch #\})))
+                      (decf level))
+                     ((and (zerop level)
+                           (or (char= ch #\)) (char= ch #\}) (char= ch #\,)))
+                      (return))))
+             (incf i))
+    (setf (ms-parser-pos p) i)
+    (values start i)))
+
+(defun %msp-arg (p name)
+  "Core's ParseKey/ParseHexStr preamble (miniscript.h:1815-1830): Expr(in) then
+Func(NAME, expr), giving the text between NAME's parentheses."
+  (multiple-value-bind (start end) (%msp-expr p)
+    (let ((s (ms-parser-string p))
+          (n (length name)))
+      (unless (and (>= (- end start) (+ n 2))
+                   (char= (char s (+ start n)) #\()
+                   (char= (char s (1- end)) #\))
+                   (string= name s :start2 start :end2 (+ start n)))
+        (%ms-fail "malformed ~A() in the miniscript expression" name))
+      (subseq s (+ start n 1) (1- end)))))
+
+(defun %msp-find-next (p ch)
+  "Core internal::FindNextChar (miniscript.cpp:421): the offset of CH from the
+cursor, or -1. The search never leaves the current parentheses."
+  (loop with base = (ms-parser-pos p)
+        for i from base below (ms-parser-end p)
+        for c = (char (ms-parser-string p) i)
+        do (cond ((char= c ch) (return (- i base)))
+                 ((char= c #\)) (return -1)))
+        finally (return -1)))
+
+(defun %msp-number-to-comma (p what)
+  "The number from the cursor up to the next comma, which is consumed too.
+Core's `FindNextChar(in, ',')' + ToIntegral pair, used by multi, multi_a and
+thresh for their threshold (miniscript.h:1881-1885, :2040-2045)."
+  (let ((comma (%msp-find-next p #\,)))
+    (when (< comma 1) (%ms-fail "~A needs a threshold" what))
+    (let* ((base (ms-parser-pos p))
+           (v (%ms-parse-number
+               (subseq (ms-parser-string p) base (+ base comma)) what)))
+      (setf (ms-parser-pos p) (+ base comma 1))
+      v)))
+
+;;; --- the two stacks ---------------------------------------------------
+
+(defun %msp-want (p state &optional (n -1) (k -1))
+  (push (list state n k) (ms-parser-to-parse p)))
+
+(defun %msp-emit (p node)
+  (push node (ms-parser-constructed p)))
+
+(defun %msp-pop (p)
+  (or (pop (ms-parser-constructed p))
+      (%ms-fail "malformed miniscript expression")))
+
+(defun %msp-rewrite-top (p fn)
+  "Core's `constructed.back() = Node{..., std::move(constructed.back())}': the
+node on top becomes (FN top)."
+  (let ((top (or (first (ms-parser-constructed p))
+                 (%ms-fail "malformed miniscript expression"))))
+    (setf (first (ms-parser-constructed p)) (funcall fn top))))
+
+(defun %msp-wrap (p fragment)
+  (%msp-rewrite-top p (lambda (top) (make-ms-node fragment :subs (list top)))))
+
+(defun %msp-build-back (p fragment)
+  "Core internal::BuildBack (miniscript.h:1833): the node below the top is the
+FIRST sub and the top is the second, because they were constructed in order."
+  (let ((child (%msp-pop p)))
+    (%msp-rewrite-top p (lambda (top) (make-ms-node fragment :subs (list top child))))))
+
+(defun %msp-add (p n)
+  (incf (ms-parser-script-size p) n))
+
+(defun %msp-check-size (p)
+  "Core's `if (script_size > max_size) return {}' (miniscript.h:1912, repeated
+per wrapper character at :1931). Failing HERE, mid-parse, is what makes the
+ceiling a bound on WORK and not merely a verdict: the remaining input is never
+read."
+  (when (> (ms-parser-script-size p) (ms-parser-max-size p))
+    (%ms-fail "miniscript is over the ~D-byte script size limit for this context"
+              (ms-parser-max-size p))))
+
+(defun %msp-expect (p ch what)
+  "Core Parse's COMMA and CLOSE_BRACKET states (miniscript.h:2187-2196)."
+  (unless (eql (%msp-peek p) ch)
+    (%ms-fail "expected ~A after a miniscript subexpression, got ~S" what (%msp-rest p)))
+  (incf (ms-parser-pos p)))
+
+;;; --- fragments --------------------------------------------------------
+
+(defun %msp-key-fragment (p name fragment wrap-c increment)
+  "One of the four key fragments. pk(K) and pkh(K) are sugar for c:pk_k(K) and
+c:pk_h(K) -- Core builds the expansion here rather than giving the tree
+fragments of its own, so everything walking it sees only the canonical forms."
+  (let ((node (make-ms-node fragment :keys (list (%ms-parse-key (%msp-arg p name))))))
+    (%msp-emit p (if wrap-c (make-ms-node :wrap-c :subs (list node)) node))
+    (%msp-add p increment)))
+
+(defun %msp-hash-fragment (p fragment name hash-bytes increment)
+  "One of the four hash-preimage fragments (miniscript.h:1999-2019)."
+  (%msp-emit p (make-ms-node fragment :data (%ms-parse-hex (%msp-arg p name)
+                                                           hash-bytes name)))
+  (%msp-add p increment))
+
+(defun %msp-locktime-fragment (p fragment name)
+  "Core's AFTER/OLDER arms (miniscript.h:2020-2032). Out of range is a PARSE
+failure there (`return {}'), so it is one here too rather than a node with a
+zero type."
+  (let ((v (%ms-parse-number (%msp-arg p name) name)))
+    (unless (and (>= v 1) (< v #x80000000))
+      (%ms-fail "~A(~D) is out of range" name v))
+    (%msp-emit p (make-ms-node fragment :k v))
+    ;; Core writes this as 1 + (v>16) + (v>0x7f) + (v>0x7fff) + (v>0x7fffff),
+    ;; which is the length of the minimal push of V.
+    (%msp-add p (length (%ms-push-number v)))))
+
+(defun %msp-multi-fragment (p multi-a-p)
+  "Core Parse's parse_multi_exp lambda (miniscript.h:1875-1910).
+
+multi is P2WSH-only and multi_a tapscript-only: BIP342 removed CHECKMULTISIG
+and introduced CHECKSIGADD in its place, and Core refuses the wrong one at
+PARSE time rather than typing it and calling the result invalid."
+  (let ((name (if multi-a-p "multi_a" "multi"))
+        (max-keys (if multi-a-p +ms-max-pubkeys-per-multi-a+
+                      +ms-max-pubkeys-per-multisig+)))
+    (unless (eq (ms-tapscript-p (ms-parser-ctx p)) (and multi-a-p t))
+      (%ms-fail "~A is not a fragment in this miniscript context" name))
+    (let ((k (%msp-number-to-comma p name))
+          (keys '()))
+      ;; Core reads keys until one is followed by ')' rather than ','.
+      (loop (let* ((comma (%msp-find-next p #\,))
+                   (len (if (minusp comma) (%msp-find-next p #\)) comma)))
+              (when (< len 1) (%ms-fail "~A: malformed key list" name))
+              (let ((base (ms-parser-pos p)))
+                (push (%ms-parse-key
+                       (subseq (ms-parser-string p) base (+ base len)))
+                      keys)
+                (setf (ms-parser-pos p) (+ base len 1)))
+              (when (minusp comma) (return))))
+      (setf keys (nreverse keys))
+      (unless (<= 1 (length keys) max-keys)
+        (%ms-fail "~A takes 1 to ~D keys, got ~D" name max-keys (length keys)))
+      (unless (<= 1 k (length keys))
+        (%ms-fail "~A threshold ~D is not between 1 and ~D" name k (length keys)))
+      (if multi-a-p
+          ;; (push + xonly-key + CHECKSIG[ADD]) * n + k, minus the borrowed byte.
+          (progn (%msp-add p (+ (* (+ 1 32 1) (length keys))
+                                (length (%ms-push-number k))))
+                 (%msp-emit p (make-ms-node :multi-a :k k :keys keys)))
+          (progn (%msp-add p (+ 2 (if (> (length keys) 16) 1 0)
+                                (if (> k 16) 1 0) (* 34 (length keys))))
+                 (%msp-emit p (make-ms-node :multi :k k :keys keys)))))))
+
+(defun %msp-binary-fragment (p)
+  "Core Parse's two-subexpression combinators (miniscript.h:2059-2085). They
+share one schedule -- CLOSE_BRACKET, WRAPPED_EXPR, COMMA, WRAPPED_EXPR, popped
+in reverse -- so only the fragment and its size cost differ."
+  (let ((state (cond ((%msp-const p "and_n(") (%msp-add p 5) :and-n)
+                     ((%msp-const p "and_b(") (%msp-add p 2) :and-b)
+                     ((%msp-const p "and_v(") (%msp-add p 1) :and-v)
+                     ((%msp-const p "or_b(") (%msp-add p 2) :or-b)
+                     ((%msp-const p "or_c(") (%msp-add p 3) :or-c)
+                     ((%msp-const p "or_d(") (%msp-add p 4) :or-d)
+                     ((%msp-const p "or_i(") (%msp-add p 4) :or-i)
+                     (t (%ms-fail "unknown miniscript fragment at ~S" (%msp-rest p))))))
+    (%msp-want p state)
+    (%msp-want p :close-bracket)
+    (%msp-want p :wrapped-expr)
+    (%msp-want p :comma)
+    (%msp-want p :wrapped-expr)))
+
+(defun %msp-expr-state (p)
+  "Core Parse's EXPR context (miniscript.h:1974-2085): one fragment name, its
+arguments, and the schedule of parser states its ARITY demands."
+  (let ((ctx (ms-parser-ctx p)))
+    (cond
+      ((%msp-const p "0") (%msp-emit p (make-ms-node :just-0)))
+      ((%msp-const p "1") (%msp-emit p (make-ms-node :just-1)))
+      ;; A key serializes x-only under tapscript, so it costs one byte less
+      ;; there; a key HASH is 20 bytes either way.
+      ((%msp-at p "pk(") (%msp-key-fragment p "pk" :pk-k t (if (ms-tapscript-p ctx) 33 34)))
+      ((%msp-at p "pkh(") (%msp-key-fragment p "pkh" :pk-h t 24))
+      ((%msp-at p "pk_k(") (%msp-key-fragment p "pk_k" :pk-k nil (if (ms-tapscript-p ctx) 32 33)))
+      ((%msp-at p "pk_h(") (%msp-key-fragment p "pk_h" :pk-h nil 23))
+      ((%msp-at p "sha256(") (%msp-hash-fragment p :sha256 "sha256" 32 38))
+      ((%msp-at p "ripemd160(") (%msp-hash-fragment p :ripemd160 "ripemd160" 20 26))
+      ((%msp-at p "hash256(") (%msp-hash-fragment p :hash256 "hash256" 32 38))
+      ((%msp-at p "hash160(") (%msp-hash-fragment p :hash160 "hash160" 20 26))
+      ((%msp-at p "after(") (%msp-locktime-fragment p :after "after"))
+      ((%msp-at p "older(") (%msp-locktime-fragment p :older "older"))
+      ((%msp-const p "multi(") (%msp-multi-fragment p nil))
+      ((%msp-const p "multi_a(") (%msp-multi-fragment p t))
+      ((%msp-const p "thresh(")
+       ;; n starts at 1: the first subexpression is read before :THRESH runs.
+       (let ((k (%msp-number-to-comma p "thresh")))
+         (unless (>= k 1) (%ms-fail "thresh threshold must be at least 1"))
+         (%msp-want p :thresh 1 k)
+         (%msp-want p :wrapped-expr)
+         (%msp-add p (+ 1 (length (%ms-push-number k))))))
+      ((%msp-const p "andor(")
+       (%msp-want p :andor)
+       (%msp-want p :close-bracket)
+       (%msp-want p :wrapped-expr)
+       (%msp-want p :comma)
+       (%msp-want p :wrapped-expr)
+       (%msp-want p :comma)
+       (%msp-want p :wrapped-expr)
+       (%msp-add p 5))
+      (t (%msp-binary-fragment p)))))
+
+(defun %msp-wrapped-expr-state (p)
+  "Core Parse's WRAPPED_EXPR context (miniscript.h:1917-1973): the run of
+single-letter wrappers before the colon, then the expression itself.
+
+The wrappers are pushed left to right onto a LIFO stack, so they are applied
+right to left: `vc:X' is v(c(X)). Three of them are sugar with no fragment of
+their own -- t:X is and_v(X,1), u:X is or_i(X,0), l:X is or_i(0,X)."
+  (let* ((s (ms-parser-string p))
+         (start (ms-parser-pos p))
+         (colon (loop for i from (1+ start) below (ms-parser-end p)
+                      do (let ((ch (char s i)))
+                           (cond ((char= ch #\:) (return i))
+                                 ((not (char<= #\a ch #\z)) (return nil))))
+                      finally (return nil)))
+         (last-was-v nil))
+    (loop for j from start below (or colon start)
+          do (%msp-check-size p)
+             (let ((w (char s j)))
+               (case w
+                 (#\a (%msp-add p 2) (%msp-want p :alt))
+                 (#\s (%msp-add p 1) (%msp-want p :swap))
+                 (#\c (%msp-add p 1) (%msp-want p :check))
+                 (#\d (%msp-add p 3) (%msp-want p :dup-if))
+                 (#\j (%msp-add p 4) (%msp-want p :non-zero))
+                 (#\n (%msp-add p 1) (%msp-want p :zero-notequal))
+                 ;; `vv:' is refused outright rather than left to the type
+                 ;; calculus: v: is the one wrapper that can add nothing to
+                 ;; script_size, so a run of them would never reach the
+                 ;; ceiling (Core's own reason, miniscript.h:1949).
+                 (#\v (when last-was-v (%ms-fail "`vv:' is not a miniscript wrapper"))
+                      (%msp-want p :verify))
+                 (#\u (%msp-add p 4) (%msp-want p :wrap-u))
+                 (#\t (%msp-add p 1) (%msp-want p :wrap-t))
+                 (#\l (%msp-add p 4)
+                      (%msp-emit p (make-ms-node :just-0))
+                      (%msp-want p :or-i))
+                 (t (%ms-fail "unknown miniscript wrapper ~S" w)))
+               (setf last-was-v (char= w #\v))))
+    (%msp-want p :expr)
+    (when colon (setf (ms-parser-pos p) (1+ colon)))))
+
+(defun %msp-thresh-state (p n k)
+  "Core Parse's THRESH context (miniscript.h:2163-2186): another ',' means
+another subexpression, ')' closes the list and is where k is checked against
+the count."
+  (let ((ch (%msp-peek p)))
+    (cond ((eql ch #\,)
+           (incf (ms-parser-pos p))
+           (%msp-want p :thresh (1+ n) k)
+           (%msp-want p :wrapped-expr)
+           (%msp-add p 2))
+          ((eql ch #\))
+           (when (> k n)
+             (%ms-fail "thresh threshold ~D exceeds its ~D subexpressions" k n))
+           (incf (ms-parser-pos p))
+           ;; Constructed in order, so popping gives them back reversed.
+           (%msp-emit p (make-ms-node
+                         :thresh :k k
+                         :subs (nreverse (loop repeat n collect (%msp-pop p))))))
+          (t (%ms-fail "thresh expects ',' or ')', got ~S" (%msp-rest p))))))
+
+(defun %msp-step (p state n k)
+  "One iteration of Core Parse's state machine (miniscript.h:1914-2201)."
+  (ecase state
+    (:wrapped-expr (%msp-wrapped-expr-state p))
+    (:expr (%msp-expr-state p))
+    (:alt (%msp-wrap p :wrap-a))
+    (:swap (%msp-wrap p :wrap-s))
+    (:check (%msp-wrap p :wrap-c))
+    (:dup-if (%msp-wrap p :wrap-d))
+    (:non-zero (%msp-wrap p :wrap-j))
+    (:zero-notequal (%msp-wrap p :wrap-n))
+    ;; v: costs a byte only when its sub cannot switch its last opcode to a
+    ;; -VERIFY form, which is exactly the 'x' property.
+    (:verify (%msp-rewrite-top
+              p (lambda (top)
+                  (%msp-add p (if (mst-subset-p (ms-node-node-type top) (mst "x")) 1 0))
+                  (make-ms-node :wrap-v :subs (list top)))))
+    (:wrap-u (%msp-rewrite-top
+              p (lambda (top) (make-ms-node :or-i :subs (list top (make-ms-node :just-0))))))
+    (:wrap-t (%msp-rewrite-top
+              p (lambda (top) (make-ms-node :and-v :subs (list top (make-ms-node :just-1))))))
+    (:and-b (%msp-build-back p :and-b))
+    (:and-v (%msp-build-back p :and-v))
+    (:or-b (%msp-build-back p :or-b))
+    (:or-c (%msp-build-back p :or-c))
+    (:or-d (%msp-build-back p :or-d))
+    (:or-i (%msp-build-back p :or-i))
+    ;; Sugar: and_n(X,Y) is andor(X,Y,0).
+    (:and-n (let ((mid (%msp-pop p)))
+              (%msp-rewrite-top
+               p (lambda (top) (make-ms-node :andor :subs (list top mid
+                                                                (make-ms-node :just-0)))))))
+    (:andor (let* ((z (%msp-pop p)) (y (%msp-pop p)))
+              (%msp-rewrite-top
+               p (lambda (top) (make-ms-node :andor :subs (list top y z))))))
+    (:thresh (%msp-thresh-state p n k))
+    (:comma (%msp-expect p #\, "','"))
+    (:close-bracket (%msp-expect p #\) "')'"))))
 
 (defun ms-parse (string &key (ctx *ms-context*))
-  "Parse a miniscript expression. Returns an MS-NODE, whose type is zero when
-the expression is well-formed but does not satisfy the type rules. Signals
-MINISCRIPT-PARSE-ERROR when it is not well-formed at all.
+  "Parse a miniscript expression (Core internal::Parse, miniscript.h:1850).
+Returns an MS-NODE, whose type is zero when the expression is well-formed but
+does not satisfy the type rules. Signals MINISCRIPT-PARSE-ERROR when it is not
+well-formed at all — which, as in Core, includes an argument count no fragment
+takes, a threshold or locktime out of range, and an expression whose script
+would exceed the context's MaxScriptSize.
 
 CTX is :P2WSH (the default, and what wsh() asks for) or :TAPSCRIPT (what a tr()
-leaf asks for). It is bound for the whole recursive parse, so every node of one
+leaf asks for). It is bound for the whole parse, so every node of one
 expression shares it."
-  (let ((*ms-context* ctx)
-        (wrappers '()) (i 0))
-    ;; Leading wrappers, up to the colon. A colon can only appear here, so the
-    ;; search is unambiguous: find it before the first '(' if there is one.
-    (let ((colon (position #\: string))
-          (paren (position #\( string)))
-      (when (and colon (or (null paren) (< colon paren)))
-        (setf wrappers (coerce (subseq string 0 colon) 'list)
-              i (1+ colon))
-        (when (null wrappers) (%ms-fail "empty wrapper before ':' in ~S" string))
-        ;; The remainder may carry wrappers of its own — `t:v:1' is t(v(1)) —
-        ;; so it is parsed as a whole expression rather than as a fragment
-        ;; name. Core's parser reaches the same shape by pushing a wrapper and
-        ;; continuing on the rest.
-        (return-from ms-parse
-          (%ms-apply-wrappers wrappers (ms-parse (subseq string i))))))
-    (let* ((body (subseq string i))
-           (open (position #\( body))
-           (name (if open (subseq body 0 open) body))
-           (args (if open
-                     (progn
-                       (unless (char= (char body (1- (length body))) #\))
-                         (%ms-fail "unbalanced parentheses in ~S" body))
-                       (%ms-split-args (subseq body (1+ open) (1- (length body)))))
-                     nil))
-           (node
-             (cond
-               ((and (string= name "0") (null open)) (make-ms-node :just-0))
-               ((and (string= name "1") (null open)) (make-ms-node :just-1))
-               ((string= name "pk_k") (make-ms-node :pk-k :keys (list (%ms-parse-key (first args)))))
-               ((string= name "pk_h") (make-ms-node :pk-h :keys (list (%ms-parse-key (first args)))))
-               ;; Sugar: pk(K) is c:pk_k(K), pkh(K) is c:pk_h(K).
-               ((string= name "pk")
-                (make-ms-node :wrap-c
-                              :subs (list (make-ms-node :pk-k
-                                                        :keys (list (%ms-parse-key (first args)))))))
-               ((string= name "pkh")
-                (make-ms-node :wrap-c
-                              :subs (list (make-ms-node :pk-h
-                                                        :keys (list (%ms-parse-key (first args)))))))
-               ((string= name "older")
-                (let ((k (%ms-parse-number (first args) "older")))
-                  (if (and (>= k 1) (< k #x80000000))
-                      (make-ms-node :older :k k)
-                      ;; Out of range is INVALID, not unparseable: Core's
-                      ;; fixed_tests spell older(0) and older(2^31) as invalid
-                      ;; expressions rather than as parse failures.
-                      (%make-ms-node :fragment :older :k 0 :node-type 0))))
-               ((string= name "after")
-                (let ((k (%ms-parse-number (first args) "after")))
-                  (if (and (>= k 1) (< k #x80000000))
-                      (make-ms-node :after :k k)
-                      (%make-ms-node :fragment :after :k 0 :node-type 0))))
-               ((string= name "sha256")
-                (make-ms-node :sha256 :data (%ms-parse-hex (first args) 32 "sha256")))
-               ((string= name "hash256")
-                (make-ms-node :hash256 :data (%ms-parse-hex (first args) 32 "hash256")))
-               ((string= name "ripemd160")
-                (make-ms-node :ripemd160 :data (%ms-parse-hex (first args) 20 "ripemd160")))
-               ((string= name "hash160")
-                (make-ms-node :hash160 :data (%ms-parse-hex (first args) 20 "hash160")))
-               ((string= name "and_v") (make-ms-node :and-v :subs (mapcar #'ms-parse args)))
-               ((string= name "and_b") (make-ms-node :and-b :subs (mapcar #'ms-parse args)))
-               ((string= name "or_b") (make-ms-node :or-b :subs (mapcar #'ms-parse args)))
-               ((string= name "or_c") (make-ms-node :or-c :subs (mapcar #'ms-parse args)))
-               ((string= name "or_d") (make-ms-node :or-d :subs (mapcar #'ms-parse args)))
-               ((string= name "or_i") (make-ms-node :or-i :subs (mapcar #'ms-parse args)))
-               ((string= name "andor") (make-ms-node :andor :subs (mapcar #'ms-parse args)))
-               ;; Sugar: and_n(X,Y) is andor(X,Y,0).
-               ((string= name "and_n")
-                (unless (= 2 (length args)) (%ms-fail "and_n takes two arguments"))
-                (make-ms-node :andor :subs (list (ms-parse (first args))
-                                                 (ms-parse (second args))
-                                                 (make-ms-node :just-0))))
-               ((string= name "thresh")
-                (unless (>= (length args) 2) (%ms-fail "thresh needs a threshold and subs"))
-                (let ((k (%ms-parse-number (first args) "thresh"))
-                      (subs (mapcar #'ms-parse (rest args))))
-                  (if (and (>= k 1) (<= k (length subs)))
-                      (make-ms-node :thresh :k k :subs subs)
-                      (%make-ms-node :fragment :thresh :k 0 :node-type 0))))
-               ;; multi is P2WSH-only and multi_a tapscript-only: BIP342
-               ;; removed CHECKMULTISIG and introduced CHECKSIGADD in its place
-               ;; (miniscript.cpp, Fragment::MULTI / MULTI_A). A fragment used
-               ;; in the wrong context is INVALID rather than unknown, so it
-               ;; reports a zero type like every other rule violation.
-               ((string= name "multi")
-                (unless (>= (length args) 2) (%ms-fail "multi needs a threshold and keys"))
-                (let ((k (%ms-parse-number (first args) "multi"))
-                      (keys (mapcar #'%ms-parse-key (rest args))))
-                  (if (and (not (ms-tapscript-p *ms-context*))
-                           (>= k 1) (<= k (length keys))
-                           (<= (length keys) +ms-max-pubkeys-per-multisig+))
-                      (make-ms-node :multi :k k :keys keys)
-                      (%make-ms-node :fragment :multi :k 0 :node-type 0))))
-               ((string= name "multi_a")
-                (unless (>= (length args) 2) (%ms-fail "multi_a needs a threshold and keys"))
-                (let ((k (%ms-parse-number (first args) "multi_a"))
-                      (keys (mapcar #'%ms-parse-key (rest args))))
-                  (if (and (ms-tapscript-p *ms-context*)
-                           (>= k 1) (<= k (length keys))
-                           (<= (length keys) +ms-max-pubkeys-per-multi-a+))
-                      (make-ms-node :multi-a :k k :keys keys)
-                      (%make-ms-node :fragment :multi-a :k 0 :node-type 0))))
-               (t (%ms-fail "unknown miniscript fragment ~S" name)))))
-      (%ms-apply-wrappers wrappers node))))
+  (let* ((*ms-context* ctx)
+         (text (coerce string 'simple-string))
+         (p (%make-ms-parser text (length text) ctx (ms-max-script-size ctx))))
+    (%msp-want p :wrapped-expr)
+    (loop while (ms-parser-to-parse p)
+          do (%msp-check-size p)
+             (destructuring-bind (state n k) (pop (ms-parser-to-parse p))
+               (%msp-step p state n k)))
+    ;; Core's `if (in.size() > 0) return {}' (miniscript.h:2205): a fragment
+    ;; that stopped short of the end is not a parse of the whole string.
+    (unless (= (ms-parser-pos p) (ms-parser-end p))
+      (%ms-fail "trailing characters after the miniscript expression: ~S"
+                (%msp-rest p)))
+    (let ((constructed (ms-parser-constructed p)))
+      (unless (and constructed (null (rest constructed)))
+        (%ms-fail "malformed miniscript expression"))
+      (first constructed))))
 
 ;;;; --- Rendering (miniscript.h:890-995) ------------------------------------
 
