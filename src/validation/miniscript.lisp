@@ -491,7 +491,12 @@ VERIFY is Core's flag for the -VERIFY conversion: `v:' on a sub-expression
 whose type lacks the 'x' property is free, because the sub's final opcode has a
 -VERIFY form to switch to rather than needing an OP_VERIFY appended. The flag
 has to travel INTO the sub for that, which is why it is a parameter here and
-not something applied afterwards."
+not something applied afterwards.
+
+It travels FURTHER than the sub of `v:', which is what Core's downfn says
+(miniscript.h:797-806): the sub of `s:' and the SECOND sub of and_v inherit
+their parent's flag, because those two fragments append nothing of their own
+after the sub whose last opcode the -VERIFY form would replace."
   (let ((subs (ms-node-subs node)))
     (flet ((sub (i &optional v) (ms-node-script (nth i subs) v key-fn))
            ;; Core's ToPKBytes is context-aware: a tapscript node serializes
@@ -522,15 +527,20 @@ not something applied afterwards."
                   (%ms-push-data (ms-node-data node))
                   (if verify +op-equalverify+ +op-equal+)))
         (:wrap-a (%ms-cat +op-toaltstack+ (sub 0) +op-fromaltstack+))
-        (:wrap-s (%ms-cat +op-swap+ (sub 0)))
+        (:wrap-s (%ms-cat +op-swap+ (sub 0 verify)))
         (:wrap-c (%ms-cat (sub 0) (if verify +op-checksigverify+ +op-checksig+)))
         (:wrap-d (%ms-cat +op-dup+ +op-if+ (sub 0) +op-endif+))
+        ;; The sub is built WITH the flag either way (Core's downfn returns
+        ;; true for every child of WRAP_V, :798): when the sub is 'x' it has no
+        ;; -VERIFY form of its own to switch to, so the flag changes nothing
+        ;; there and the OP_VERIFY is appended -- but it still reaches a
+        ;; deeper and_v/`s:' sub that does have one.
         (:wrap-v (if (mst-subset-p (ms-node-node-type (first subs)) (mst "x"))
-                     (%ms-cat (sub 0) +op-verify+)
+                     (%ms-cat (sub 0 t) +op-verify+)
                      (sub 0 t)))
         (:wrap-j (%ms-cat +ms-op-size+ +op-0notequal+ +op-if+ (sub 0) +op-endif+))
         (:wrap-n (%ms-cat (sub 0) +op-0notequal+))
-        (:and-v (%ms-cat (sub 0) (sub 1)))
+        (:and-v (%ms-cat (sub 0) (sub 1 verify)))
         (:and-b (%ms-cat (sub 0) (sub 1) +op-booland+))
         (:or-b (%ms-cat (sub 0) (sub 1) +op-boolor+))
         (:or-d (%ms-cat (sub 0) +op-ifdup+ +op-notif+ (sub 1) +op-endif+))
