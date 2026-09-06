@@ -220,8 +220,10 @@ being the canonical single push Core requires."
     ;; Consensus flags: the empty signature makes the multisig false in both
     ;; implementations whatever the scriptCode says.
     (is (equal '(nil :eval-false) (%sf-verify script-sig script-pubkey "")))
-    ;; Policy flags: Core answers SCRIPT_ERR_SIG_FINDANDDELETE.
-    (is (equal '(nil :error) (%sf-verify script-sig script-pubkey "CONST_SCRIPTCODE")))
+    ;; Policy flags: Core answers SCRIPT_ERR_SIG_FINDANDDELETE, and so do we
+    ;; now that the engine's error reaches the caller by name.
+    (is (equal '(nil :sig-findanddelete)
+               (%sf-verify script-sig script-pubkey "CONST_SCRIPTCODE")))
     (is-true (bl.interop:last-checkmultisig-had-error-p))))
 
 (test const-scriptcode-empty-signature-p2sh-spend-is-non-standard
@@ -232,7 +234,8 @@ being the canonical single push Core requires."
   (destructuring-bind (script-sig script-pubkey)
       (%sf-p2sh-spend (%sf-script "00" "21" +sf-pubkey-hex+ "ac" "91"))
     (is (equal '(t nil) (%sf-verify script-sig script-pubkey "P2SH")))
-    (is (equal '(nil :error) (%sf-verify script-sig script-pubkey "P2SH,CONST_SCRIPTCODE")))))
+    (is (equal '(nil :sig-findanddelete)
+               (%sf-verify script-sig script-pubkey "P2SH,CONST_SCRIPTCODE")))))
 
 (test const-scriptcode-rejects-a-codeseparator-in-every-legacy-script
   ;; Core's OP_CODESEPARATOR check sits in EvalScript's opcode loop ABOVE the

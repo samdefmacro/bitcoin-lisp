@@ -173,20 +173,40 @@
    #:make-script-num
    #:script-num-value
    #:ScriptError
+   #:script-error-name
    #:SE-StackUnderflow
    #:SE-StackOverflow
    #:SE-InvalidNumber
+   #:SE-NumberOverflow
    #:SE-VerifyFailed
+   #:SE-EvalFalse
+   #:SE-EqualVerify
+   #:SE-NumEqualVerify
+   #:SE-CheckSigVerify
+   #:SE-CheckMultisigVerify
    #:SE-OpReturn
    #:SE-DisabledOpcode
    #:SE-UnknownOpcode
+   #:SE-InvalidPushData
+   #:SE-MinimalData
+   #:SE-PushSize
    #:SE-ScriptTooLarge
    #:SE-TooManyOps
    #:SE-InvalidStackOperation
+   #:SE-InvalidAltstackOperation
    #:SE-UnbalancedConditional
    #:SE-NegativeLocktime
    #:SE-UnsatisfiedLocktime
    #:SE-DiscourageUpgradableNops
+   #:SE-SigCount
+   #:SE-PubkeyCount
+   #:SE-SigDer
+   #:SE-SigHighS
+   #:SE-SigHashtype
+   #:SE-SigNullFail
+   #:SE-SigNullDummy
+   #:SE-SigFindAndDelete
+   #:SE-PubkeyType
    #:ScriptResult
    #:script-ok
    #:script-err
@@ -277,9 +297,11 @@
    #:SE-TaprootMerkleMismatch
    #:SE-TapscriptInvalidOpcode
    #:SE-SchnorrSignatureSize
+   #:SE-SchnorrSigHashtype
    #:SE-TapscriptMinimalIf
    #:SE-TapscriptCheckmultisig
    #:SE-TapscriptInvalidSig
+   #:SE-TapscriptEmptyPubkey
    #:SE-TapscriptValidationWeight
    #:SE-MinimalIf
    #:SE-DiscourageUpgradablePubkeyType

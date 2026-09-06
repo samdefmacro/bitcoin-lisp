@@ -49,6 +49,14 @@
    #:run-scripts-with-p2sh
    #:is-p2sh-script-p
    #:stack-top-truthy-p
+   ;; Script errors in Core's vocabulary
+   #:+script-errors+
+   #:script-error-keyword
+   #:script-error-for-keyword
+   #:script-error-name
+   #:script-error-message
+   #:last-checksig-script-error
+   #:last-checkmultisig-script-error
    ;; Script flags
    #:*script-flags*
    #:set-script-flags
@@ -670,6 +678,112 @@ attackable by collision or eviction ordering."
             #xFFFFFFFF))
       #xFFFFFFFF))
 
+;;; ============================================================
+;;; Script errors in Bitcoin Core's vocabulary
+;;; ============================================================
+;;;
+;;; A failing script gets ONE keyword, and that keyword names exactly one of
+;;; Core's SCRIPT_ERR_* values. The table below is the whole correspondence:
+;;; the name is the one Core's script_tests.json uses (the script_errors[]
+;;; table in test/script_tests.cpp) and the message is the one
+;;; ScriptErrorString returns (script/script_error.cpp), which is what Core
+;;; puts in the parenthetical of "mempool-script-verify-flag-failed (%s)"
+;;; (validation.cpp:2117-2119). Core's script_errors[] table stops short of
+;;; the Taproot-era values, which no script_tests.json vector names; those
+;;; carry their enum name without the SCRIPT_ERR_ prefix, which is the same
+;;; rule every other row follows.
+;;;
+;;; Errors the Coalton engine raises carry a ScriptError value instead; it is
+;;; converted here through BL.SCRIPT:SCRIPT-ERROR-NAME, which states the same
+;;; correspondence for the engine's own variants. Neither list may map one of
+;;; ours onto two of Core's: that is what makes the script_tests.json corpus
+;;; comparable on the error NAME and not only on accept/reject.
+
+(alexandria:define-constant +script-errors+
+    '((:eval-false "EVAL_FALSE" "Script evaluated without error but finished with a false/empty top stack element")
+      (:op-return "OP_RETURN" "OP_RETURN was encountered")
+      (:scriptnum "SCRIPTNUM" "Script number overflowed or is non-minimally encoded")
+      (:script-size "SCRIPT_SIZE" "Script is too big")
+      (:push-size "PUSH_SIZE" "Push value size limit exceeded")
+      (:op-count "OP_COUNT" "Operation limit exceeded")
+      (:stack-size "STACK_SIZE" "Stack size limit exceeded")
+      (:sig-count "SIG_COUNT" "Signature count negative or greater than pubkey count")
+      (:pubkey-count "PUBKEY_COUNT" "Pubkey count negative or limit exceeded")
+      (:verify "VERIFY" "Script failed an OP_VERIFY operation")
+      (:equalverify "EQUALVERIFY" "Script failed an OP_EQUALVERIFY operation")
+      (:checkmultisigverify "CHECKMULTISIGVERIFY" "Script failed an OP_CHECKMULTISIGVERIFY operation")
+      (:checksigverify "CHECKSIGVERIFY" "Script failed an OP_CHECKSIGVERIFY operation")
+      (:numequalverify "NUMEQUALVERIFY" "Script failed an OP_NUMEQUALVERIFY operation")
+      (:bad-opcode "BAD_OPCODE" "Opcode missing or not understood")
+      (:disabled-opcode "DISABLED_OPCODE" "Attempted to use a disabled opcode")
+      (:invalid-stack-operation "INVALID_STACK_OPERATION" "Operation not valid with the current stack size")
+      (:invalid-altstack-operation "INVALID_ALTSTACK_OPERATION" "Operation not valid with the current altstack size")
+      (:unbalanced-conditional "UNBALANCED_CONDITIONAL" "Invalid OP_IF construction")
+      (:negative-locktime "NEGATIVE_LOCKTIME" "Negative locktime")
+      (:unsatisfied-locktime "UNSATISFIED_LOCKTIME" "Locktime requirement not satisfied")
+      (:sig-hashtype "SIG_HASHTYPE" "Signature hash type missing or not understood")
+      (:sig-der "SIG_DER" "Non-canonical DER signature")
+      (:minimaldata "MINIMALDATA" "Data push larger than necessary")
+      (:sig-pushonly "SIG_PUSHONLY" "Only push operators allowed in signatures")
+      (:sig-high-s "SIG_HIGH_S" "Non-canonical signature: S value is unnecessarily high")
+      (:sig-nulldummy "SIG_NULLDUMMY" "Dummy CHECKMULTISIG argument must be zero")
+      (:pubkeytype "PUBKEYTYPE" "Public key is neither compressed or uncompressed")
+      (:cleanstack "CLEANSTACK" "Stack size must be exactly one after execution")
+      (:minimalif "MINIMALIF" "OP_IF/NOTIF argument must be minimal")
+      (:nullfail "NULLFAIL" "Signature must be zero for failed CHECK(MULTI)SIG operation")
+      (:discourage-upgradable-nops "DISCOURAGE_UPGRADABLE_NOPS" "NOPx reserved for soft-fork upgrades")
+      (:discourage-upgradable-witness-program "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" "Witness version reserved for soft-fork upgrades")
+      (:discourage-upgradable-taproot-version "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" "Taproot version reserved for soft-fork upgrades")
+      (:discourage-op-success "DISCOURAGE_OP_SUCCESS" "OP_SUCCESSx reserved for soft-fork upgrades")
+      (:discourage-upgradable-pubkeytype "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" "Public key version reserved for soft-fork upgrades")
+      (:witness-program-wrong-length "WITNESS_PROGRAM_WRONG_LENGTH" "Witness program has incorrect length")
+      (:witness-program-witness-empty "WITNESS_PROGRAM_WITNESS_EMPTY" "Witness program was passed an empty witness")
+      (:witness-program-mismatch "WITNESS_PROGRAM_MISMATCH" "Witness program hash mismatch")
+      (:witness-malleated "WITNESS_MALLEATED" "Witness requires empty scriptSig")
+      (:witness-malleated-p2sh "WITNESS_MALLEATED_P2SH" "Witness requires only-redeemscript scriptSig")
+      (:witness-unexpected "WITNESS_UNEXPECTED" "Witness provided for non-witness script")
+      (:witness-pubkeytype "WITNESS_PUBKEYTYPE" "Using non-compressed keys in segwit")
+      (:schnorr-sig-size "SCHNORR_SIG_SIZE" "Invalid Schnorr signature size")
+      (:schnorr-sig-hashtype "SCHNORR_SIG_HASHTYPE" "Invalid Schnorr signature hash type")
+      (:schnorr-sig "SCHNORR_SIG" "Invalid Schnorr signature")
+      (:taproot-wrong-control-size "TAPROOT_WRONG_CONTROL_SIZE" "Invalid Taproot control block size")
+      (:tapscript-validation-weight "TAPSCRIPT_VALIDATION_WEIGHT" "Too much signature validation relative to witness weight")
+      (:tapscript-checkmultisig "TAPSCRIPT_CHECKMULTISIG" "OP_CHECKMULTISIG(VERIFY) is not available in tapscript")
+      (:tapscript-minimalif "TAPSCRIPT_MINIMALIF" "OP_IF/NOTIF argument must be minimal in tapscript")
+      (:tapscript-empty-pubkey "TAPSCRIPT_EMPTY_PUBKEY" "Empty public key in tapscript")
+      (:op-codeseparator "OP_CODESEPARATOR" "Using OP_CODESEPARATOR in non-witness script")
+      (:sig-findanddelete "SIG_FINDANDDELETE" "Signature is found in scriptCode"))
+  :test #'equal
+  :documentation "Our script-error keywords as (KEYWORD JSON-NAME CORE-MESSAGE).")
+
+(defun script-error-entry (error)
+  "The +SCRIPT-ERRORS+ row for ERROR, a keyword or a Coalton ScriptError.
+Anything else -- NIL, or a CL condition a caller trapped -- has no row, and
+the readers below answer Core's own UNKNOWN_ERROR for it."
+  (cond ((null error) nil)
+        ((keywordp error) (assoc error +script-errors+))
+        (t (let ((name (ignore-errors (bl.script:script-error-name error))))
+             (and name
+                  (find name +script-errors+ :key #'second :test #'string=))))))
+
+(defun script-error-keyword (error)
+  "ERROR as one of our script-error keywords.
+A Coalton ScriptError is converted through the Core error NAME it stands for,
+so the engine and the CL layers cannot end up with two keywords for one Core
+error. An error with no row answers :UNKNOWN-ERROR, which is Core's own name
+for the same situation and is caught by SCRIPT-ERRORS-COVER-THE-ENGINE."
+  (cond ((null error) nil)
+        ((keywordp error) error)
+        (t (or (first (script-error-entry error)) :unknown-error))))
+
+(defun script-error-name (error)
+  "ERROR as Core's script_tests.json error name, or \"UNKNOWN_ERROR\"."
+  (or (second (script-error-entry error)) "UNKNOWN_ERROR"))
+
+(defun script-error-message (error)
+  "ERROR as ScriptErrorString spells it (script/script_error.cpp)."
+  (or (third (script-error-entry error)) "unknown error"))
+
 (defun run-scripts-with-p2sh (script-sig script-pubkey p2sh-enabled)
   "Execute scriptSig then scriptPubKey with optional P2SH.
    Extracts transaction context from *current-tx* and *current-input-index*.
@@ -695,7 +809,11 @@ attackable by collision or eviction ordering."
         (values t (bl.script:get-ok-stack result))
         (let ((err (bl.script:script-result-error result)))
           (bl:log-warn "run-scripts-with-p2sh ScriptErr: ~A" err)
-          (values nil :error)))))
+          ;; The engine's ScriptError names one Core SCRIPT_ERR_* value; hand
+          ;; that on rather than a single :ERROR for all of them, which made
+          ;; every engine-level rejection indistinguishable to the caller and
+          ;; to Core's script_tests.json corpus.
+          (values nil (script-error-keyword err))))))
 
 (defun p2sh-redeem-script (script-sig)
   "The redeem script of a P2SH spend: the element SCRIPT-SIG leaves on TOP OF
@@ -1023,7 +1141,7 @@ the table's own structure.")
     ;; only to 32-byte pubkeys — an upgradable pubkey type never inspects the
     ;; signature at all.
     (unless (or (= sig-len 64) (= sig-len 65))
-      (return-from check-schnorr-signature (values :invalid-sig nil)))
+      (return-from check-schnorr-signature (values :schnorr-sig-size nil)))
 
     (let ((sighash-type (if (= sig-len 65) (aref sig-bytes 64) #x00))  ; SIGHASH_DEFAULT
           (sig64 (if (= sig-len 64) sig-bytes (subseq sig-bytes 0 64))))
@@ -1061,9 +1179,9 @@ the table's own structure.")
    SIG-BYTES: signature (empty, or 64/65 bytes for a 32-byte pubkey)
    PUBKEY-BYTES: 32-byte x-only public key, or an upgradable pubkey type
    Returns (values status result) where:
-     status: :ok, :empty-sig, :invalid-sig, :empty-pubkey, :bad-sighash-type,
-             :upgradable-pubkey, :discourage-upgradable-pubkeytype,
-             :validation-weight-exceeded
+     status: :ok, :empty-sig, :invalid-sig, :schnorr-sig-size, :empty-pubkey,
+             :bad-sighash-type, :upgradable-pubkey,
+             :discourage-upgradable-pubkeytype, :validation-weight-exceeded
      result: T if the signature check succeeded, NIL otherwise
 
    The ordering below is CONSENSUS CRITICAL and mirrors EvalChecksigTapscript
@@ -1216,20 +1334,20 @@ the table's own structure.")
       (if (bl.script:script-result-ok-p result)
           (let ((final-stack (bl.script:get-ok-stack result)))
             (cond
-              ;; Top of stack must be truthy.
-              ((not (stack-top-truthy-p final-stack))
-               (values nil :script-eval-false))
               ;; CLEANSTACK: witness-script execution requires EXACTLY one
               ;; element left on the stack — unconditionally, not gated on
-              ;; the (policy) CLEANSTACK flag. Mirrors ExecuteWitnessScript
-              ;; (interpreter.cpp:1867). The P2WSH path enforces the same.
-              ((and (consp final-stack) (consp (cdr final-stack)))
+              ;; the (policy) CLEANSTACK flag — and Core asks it BEFORE the
+              ;; element's truth (ExecuteWitnessScript, interpreter.cpp:
+              ;; 1867-1868). The P2WSH path enforces the same.
+              ((/= (length final-stack) 1)
                (values nil :cleanstack))
+              ((not (stack-top-truthy-p final-stack))
+               (values nil :eval-false))
               (t (values t nil))))
           (let ((err (bl.script:script-result-error result)))
             (when *debug-bip341-sighash*
               (bl:log-warn "run-tapscript ScriptErr: ~A" err))
-            (values nil :script-error))))))
+            (values nil (script-error-keyword err)))))))
 
 ;;; ============================================================
 ;;; SIGPUSHONLY Validation
@@ -1715,29 +1833,35 @@ encoded it separately and disagreed above 75 bytes."
 (defvar *witness-input-amount* 0
   "Amount (in satoshis) of the input being spent. Required for BIP 143 sighash.")
 
-(defun compute-hash-prevouts ()
-  "Compute hashPrevouts for BIP 143: double SHA256 of all input outpoints.
-   For test transactions with single input spending the credit tx."
-  ;; For Bitcoin Core test format: single input spending credit tx output 0
-  ;; First we need to compute the credit txid
-  (let* ((credit-script (or *original-script-pubkey*
-                            (make-array 0 :element-type '(unsigned-byte 8))))
-         (credit-tx-data
-           (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-             (write-u32-le 1 s)               ; version
-             (write-varint 1 s)               ; input count
-             (loop repeat 32 do (write-byte 0 s))  ; null txid
-             (write-u32-le #xffffffff s)      ; null vout
-             (write-varint 2 s)               ; scriptSig length
-             (write-byte 0 s) (write-byte 0 s) ; OP_0 OP_0
-             (write-u32-le #xffffffff s)      ; sequence
-             (write-varint 1 s)               ; output count
-             (write-u64-le 0 s)               ; value
-             (write-varint (length credit-script) s)
-             (loop for b across credit-script do (write-byte b s))
-             (write-u32-le 0 s)))             ; locktime
-         (credit-txid (bl.crypto:hash256 credit-tx-data)))
-    ;; hashPrevouts = hash256(outpoint)
+(defun %test-credit-txid (amount)
+  "The txid of Core's BuildCreditingTransaction (test/util/transaction_utils.cpp:10-24)
+for the scriptPubKey under test and a spent value of AMOUNT satoshis.
+
+AMOUNT is part of the transaction, so it is part of the txid, and the txid is
+the outpoint every BIP 143 preimage commits to. Building this with a hardcoded
+zero made every witness signature vector with a non-zero value -- 86 of the
+corpus's 113 -- sign a different transaction than Core did."
+  (let ((credit-script (or *original-script-pubkey*
+                           (make-array 0 :element-type '(unsigned-byte 8)))))
+    (bl.crypto:hash256
+     (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+       (write-u32-le 1 s)                    ; version
+       (write-varint 1 s)                    ; input count
+       (loop repeat 32 do (write-byte 0 s))  ; null txid
+       (write-u32-le #xffffffff s)           ; null vout
+       (write-varint 2 s)                    ; scriptSig length
+       (write-byte 0 s) (write-byte 0 s)     ; CScriptNum(0) CScriptNum(0)
+       (write-u32-le #xffffffff s)           ; sequence
+       (write-varint 1 s)                    ; output count
+       (write-u64-le amount s)               ; value
+       (write-varint (length credit-script) s)
+       (loop for b across credit-script do (write-byte b s))
+       (write-u32-le 0 s)))))                ; locktime
+
+(defun compute-hash-prevouts (amount)
+  "hashPrevouts for BIP 143 over Core's synthetic spending transaction:
+one input, spending output 0 of the crediting transaction for AMOUNT."
+  (let ((credit-txid (%test-credit-txid amount)))
     (bl.crypto:hash256
      (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
        (loop for b across credit-txid do (write-byte b s))
@@ -1750,12 +1874,13 @@ encoded it separately and disagreed above 75 bytes."
    (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
      (write-u32-le #xffffffff s))))
 
-(defun compute-hash-outputs ()
-  "Compute hashOutputs for BIP 143: double SHA256 of all outputs."
-  ;; For test transactions: single output with value 0 and empty scriptPubKey
+(defun compute-hash-outputs (amount)
+  "hashOutputs for BIP 143 over Core's synthetic spending transaction: one
+output carrying the credited AMOUNT forward, with an empty scriptPubKey
+(BuildSpendingTransaction, test/util/transaction_utils.cpp:26-42)."
   (bl.crypto:hash256
    (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-     (write-u64-le 0 s)       ; value = 0
+     (write-u64-le amount s)
      (write-varint 0 s))))    ; empty scriptPubKey
 
 (defun make-p2pkh-script-code (keyhash)
@@ -1859,27 +1984,10 @@ encoded it separately and disagreed above 75 bytes."
   "Compute BIP 143 sighash using synthetic credit transaction (script_tests.json format)."
   (let* ((base-type (logand sighash-type #x1f))
          (anyonecanpay (plusp (logand sighash-type #x80)))
-         ;; Compute credit txid for outpoint
-         (credit-script (or *original-script-pubkey*
-                            (make-array 0 :element-type '(unsigned-byte 8))))
-         (credit-tx-data
-           (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-             (write-u32-le 1 s)
-             (write-varint 1 s)
-             (loop repeat 32 do (write-byte 0 s))
-             (write-u32-le #xffffffff s)
-             (write-varint 2 s)
-             (write-byte 0 s) (write-byte 0 s)
-             (write-u32-le #xffffffff s)
-             (write-varint 1 s)
-             (write-u64-le 0 s)
-             (write-varint (length credit-script) s)
-             (loop for b across credit-script do (write-byte b s))
-             (write-u32-le 0 s)))
-         (credit-txid (bl.crypto:hash256 credit-tx-data))
+         (credit-txid (%test-credit-txid amount))
          (hash-prevouts (if anyonecanpay
                             (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
-                            (compute-hash-prevouts)))
+                            (compute-hash-prevouts amount)))
          (hash-sequence (if (or anyonecanpay (= base-type 2) (= base-type 3))
                             (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                             (compute-hash-sequence)))
@@ -1887,8 +1995,8 @@ encoded it separately and disagreed above 75 bytes."
                          ((= base-type 2)
                           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
                          ((= base-type 3)
-                          (compute-hash-outputs))
-                         (t (compute-hash-outputs)))))
+                          (compute-hash-outputs amount))
+                         (t (compute-hash-outputs amount)))))
     (let ((preimage
             (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
               (write-u32-le 1 s)
@@ -2093,7 +2201,13 @@ encoded it separately and disagreed above 75 bytes."
                       ;; the first IBD run on exactly this. Core: interpreter.cpp
                       ;; FindAndDelete/codesep-skip are SigVersion::BASE only;
                       ;; WITNESS_V0 serializes scriptCode as-is (BIP143).
-                      ((and *witness-v0-mode* *current-tx*)
+                      ;; No *CURRENT-TX* guard: COMPUTE-BIP143-SIGHASH picks
+                      ;; the synthetic script_tests.json transaction itself
+                      ;; when there is none, and requiring one here sent every
+                      ;; P2WSH corpus vector down the LEGACY test sighash over
+                      ;; the outer scriptPubKey instead -- so none of them
+                      ;; could verify.
+                      (*witness-v0-mode*
                        (setf subscript-for-hash subscript-raw)
                        (compute-bip143-sighash subscript-for-hash
                                                *witness-input-amount*
@@ -2236,7 +2350,7 @@ the signature-cache key free of script flags."
 (defun verify-checkmultisig (sigs pubkeys script-pubkey)
   "Verify m-of-n multisig. SIGS and PUBKEYS are lists of byte arrays.
    Returns (values success error-type).
-   Error-type is nil on success, or :sig-hashtype, :pubkeytype, :nulldummy, :nullfail on failure.
+   Error-type is nil on success, or :sig-hashtype, :pubkeytype, :sig-nulldummy, :nullfail on failure.
 
    Bitcoin's multisig algorithm:
    - For each signature (in order), find a matching pubkey
@@ -2312,7 +2426,7 @@ the signature-cache key free of script flags."
       (values success nil))))
 
 (defvar *last-checkmultisig-error* nil
-  "Error from last CHECKMULTISIG: :sig-hashtype, :pubkeytype, :nulldummy, or nil.")
+  "Error from last CHECKMULTISIG: :sig-hashtype, :pubkeytype, :sig-nulldummy, or nil.")
 
 (defun verify-checkmultisig-for-script (sigs pubkeys script-pubkey dummy)
   "Wrapper for CHECKMULTISIG that validates dummy element and tracks errors.
@@ -2323,7 +2437,7 @@ the signature-cache key free of script flags."
   ;; NULLDUMMY: dummy element must be empty
   (when (and (flag-enabled-p "NULLDUMMY")
              (plusp (length dummy)))
-    (setf *last-checkmultisig-error* :nulldummy)
+    (setf *last-checkmultisig-error* :sig-nulldummy)
     (return-from verify-checkmultisig-for-script nil))
 
   (let ((*in-checkmultisig* t))
@@ -2341,6 +2455,40 @@ the signature-cache key free of script flags."
 (defun last-checkmultisig-had-error-p ()
   "Returns T if the last CHECKMULTISIG had a validation error."
   (and *last-checkmultisig-error* t))
+
+
+;;; The CHECK(MULTI)SIG wrappers record WHICH encoding rule rejected, in a
+;;; keyword; the Coalton engine needs it back as a ScriptError so the opcode
+;;; can report Core's error rather than one verify failure standing for all of
+;;; them.
+(defun script-error-for-keyword (keyword)
+  "The Coalton ScriptError our CHECK(MULTI)SIG error KEYWORD stands for.
+
+This is the only place the mapping has to be spelled out in this direction:
+everything else goes ScriptError -> Core name -> keyword through
++SCRIPT-ERRORS+. An unmapped keyword answers SE-VerifyFailed, which is what
+all of these used to report; CHECKSIG-ERROR-KEYWORDS-ARE-ALL-MAPPED scans this
+file for the keywords the two wrappers can actually record, so a new one
+cannot reach that fallback unnoticed."
+  (case keyword
+    (:sig-der bl.script:se-sigder)
+    (:sig-high-s bl.script:se-sighighs)
+    (:sig-hashtype bl.script:se-sighashtype)
+    (:sig-findanddelete bl.script:se-sigfindanddelete)
+    (:nullfail bl.script:se-signullfail)
+    (:sig-nulldummy bl.script:se-signulldummy)
+    (:pubkeytype bl.script:se-pubkeytype)
+    (:witness-pubkeytype bl.script:se-witnesspubkeytype)
+    (:scriptnum bl.script:se-invalidnumber)
+    (t bl.script:se-verifyfailed)))
+
+(defun last-checksig-script-error ()
+  "The ScriptError for the encoding rule VERIFY-CHECKSIG-FOR-SCRIPT last hit."
+  (script-error-for-keyword *last-checksig-error*))
+
+(defun last-checkmultisig-script-error ()
+  "The ScriptError for the rule DO-CHECKMULTISIG-STACK-OP last hit."
+  (script-error-for-keyword *last-checkmultisig-error*))
 
 (defun script-number-to-int (bytes)
   "Convert script number bytes to integer. Empty = 0."
@@ -2416,7 +2564,7 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
     (multiple-value-bind (n valid)
         (script-number-to-int-validated n-bytes)
       (unless valid
-        (setf *last-checkmultisig-error* :minimaldata)
+        (setf *last-checkmultisig-error* :scriptnum)
         (return-from do-checkmultisig-stack-op (values :error nil 0)))
 
       ;; Validate n: must be 0-20
@@ -2452,7 +2600,7 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
           (multiple-value-bind (m valid)
               (script-number-to-int-validated m-bytes)
             (unless valid
-              (setf *last-checkmultisig-error* :minimaldata)
+              (setf *last-checkmultisig-error* :scriptnum)
               (return-from do-checkmultisig-stack-op (values :error nil n)))
 
             ;; Validate m: must be 0-n
@@ -2704,14 +2852,25 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
     ;; ran before both and answered WITNESS_PUBKEYTYPE for keys Core calls
     ;; PUBKEYTYPE.
 
-    ;; Verify HASH160(pubkey) == program
+    ;; Verify HASH160(pubkey) == program. Core does not compare here at all:
+    ;; it builds `OP_DUP OP_HASH160 <program> OP_EQUALVERIFY OP_CHECKSIG' and
+    ;; runs it (interpreter.cpp:1942-1943), so a pubkey that hashes to
+    ;; something else fails that script's OP_EQUALVERIFY --
+    ;; SCRIPT_ERR_EQUALVERIFY, not WITNESS_PROGRAM_MISMATCH, which Core
+    ;; reserves for a witness stack that is not exactly two items (:1940).
     (let ((pubkey-hash (bl.crypto:hash160 pubkey)))
       (unless (equalp pubkey-hash program)
-        (return-from validate-p2wpkh (values nil :witness-program-mismatch))))
+        (return-from validate-p2wpkh (values nil :equalverify))))
 
     ;; Build script code: OP_DUP OP_HASH160 <keyhash> OP_EQUALVERIFY OP_CHECKSIG
     (let ((script-code (make-p2pkh-script-code program)))
-      (verify-checksig-witness sig pubkey script-code amount))))
+      (multiple-value-bind (ok err)
+          (verify-checksig-witness sig pubkey script-code amount)
+        (cond (ok (values t nil))
+              (err (values nil err))
+              ;; The implied script's OP_CHECKSIG pushed false and nothing
+              ;; else: one element, and it is false (interpreter.cpp:1868).
+              (t (values nil :eval-false)))))))
 
 (defun validate-p2wsh (witness program amount)
   "Validate P2WSH spend.
@@ -2763,14 +2922,18 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
       (if (bl.script:script-result-ok-p result)
           (let ((final-stack (bl.script:get-ok-stack result)))
             (cond
-              ;; Must have truthy top
-              ((not (stack-top-truthy-p final-stack))
-               (values nil :script-eval-false))
-              ;; CLEANSTACK: P2WSH always requires exactly 1 stack element
-              ((and (consp final-stack) (consp (cdr final-stack)))
+              ;; CLEANSTACK first: P2WSH always requires EXACTLY one stack
+              ;; element, and Core asks that before it asks whether the element
+              ;; is true (ExecuteWitnessScript, interpreter.cpp:1867-1868), so
+              ;; a script leaving a false element under a second one is
+              ;; CLEANSTACK, not EVAL_FALSE.
+              ((/= (length final-stack) 1)
                (values nil :cleanstack))
+              ((not (stack-top-truthy-p final-stack))
+               (values nil :eval-false))
               (t (values t nil))))
-          (values nil :script-error)))))
+          (values nil (script-error-keyword
+                       (bl.script:script-result-error result)))))))
 
 (defun validate-witness-program (script-pubkey witness amount &optional script-sig is-p2sh)
   "Validate a witness program, mirroring Bitcoin Core's VerifyWitnessProgram
@@ -2921,13 +3084,13 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
          (sig-len (length sig)))
     ;; Signature must be 64 bytes (default sighash) or 65 bytes (explicit sighash)
     (unless (or (= sig-len 64) (= sig-len 65))
-      (return-from validate-taproot-key-path (values nil :schnorr-signature-size)))
+      (return-from validate-taproot-key-path (values nil :schnorr-sig-size)))
 
     ;; A 65-byte sig carries an EXPLICIT sighash byte that must not be
     ;; SIGHASH_DEFAULT (0x00) — that form must use the 64-byte encoding.
     ;; Mirrors CheckSchnorrSignature (interpreter.cpp:1731-1734).
     (when (and (= sig-len 65) (zerop (aref sig 64)))
-      (return-from validate-taproot-key-path (values nil :sig-hashtype)))
+      (return-from validate-taproot-key-path (values nil :schnorr-sig-hashtype)))
 
     (let* ((sighash-type (if (= sig-len 65)
                              (aref sig 64)
@@ -2936,18 +3099,18 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
 
       ;; Validate sighash type for Taproot
       (unless (valid-taproot-sighash-type-p sighash-type)
-        (return-from validate-taproot-key-path (values nil :sig-hashtype)))
+        (return-from validate-taproot-key-path (values nil :schnorr-sig-hashtype)))
 
       ;; Compute BIP 341 sighash. NIL means SignatureHashSchnorr returned false
       ;; (SIGHASH_SINGLE with no output at this input index) — hard failure
       ;; before verification, same as an out-of-set hash_type.
       (let ((sighash (compute-bip341-sighash amount sighash-type nil nil)))
         (when (null sighash)
-          (return-from validate-taproot-key-path (values nil :sig-hashtype)))
+          (return-from validate-taproot-key-path (values nil :schnorr-sig-hashtype)))
         ;; Verify Schnorr signature
         (if (cached-verify-schnorr sighash sig64 output-pubkey32)
             (values t nil)
-            (values nil :taproot-invalid-signature))))))
+            (values nil :schnorr-sig))))))
 
 (defun validate-taproot-script-path (witness output-pubkey32 amount
                                      &optional (full-witness witness))
@@ -2974,7 +3137,7 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
     (multiple-value-bind (leaf-version output-parity internal-pubkey merkle-path)
         (parse-control-block control-block)
       (unless leaf-version
-        (return-from validate-taproot-script-path (values nil :taproot-invalid-control-block)))
+        (return-from validate-taproot-script-path (values nil :taproot-wrong-control-size)))
 
       ;; Compute leaf hash
       (let ((leaf-hash (bl.crypto:tap-leaf-hash leaf-version script)))
@@ -2983,8 +3146,11 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
                                (compute-merkle-root-from-path leaf-hash merkle-path)
                                leaf-hash)))
           ;; Verify the tweaked pubkey matches the output
+          ;; Core reports a failed Taproot commitment as
+          ;; SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH (interpreter.cpp:1974-1976),
+          ;; not as an error of its own.
           (unless (verify-taproot-tweak output-pubkey32 output-parity internal-pubkey merkle-root)
-            (return-from validate-taproot-script-path (values nil :taproot-merkle-mismatch)))
+            (return-from validate-taproot-script-path (values nil :witness-program-mismatch)))
 
           ;; Execute the script in Tapscript mode
           (if (= leaf-version #xc0)
@@ -3037,9 +3203,13 @@ single byte OP_0 (see FIND-AND-DELETE-SIG)."
                            +validation-weight-offset+)))
                   ;; 4. Execute the Tapscript with witness inputs as stack
                   (run-tapscript script script-inputs leaf-hash amount internal-pubkey)))
-              ;; Unknown leaf version - anyone can spend if DISCOURAGE flag not set
+              ;; Unknown leaf version - anyone can spend if DISCOURAGE flag
+              ;; not set. Core's error here is
+              ;; SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
+              ;; (interpreter.cpp:1985-1987), which is a different value from
+              ;; the unknown-witness-VERSION one.
               (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION")
-                  (values nil :discourage-upgradable-witness-program)
+                  (values nil :discourage-upgradable-taproot-version)
                   (values t nil))))))))
 
 (defun validate-taproot (witness output-pubkey32 amount)
