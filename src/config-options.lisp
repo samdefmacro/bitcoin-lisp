@@ -49,6 +49,10 @@
 ;;; --- Scalar start-node options (Core GetArg: last occurrence wins) --------
 
 (define-option "datadir" :key :data-directory :type :string)
+;; -blocksdir: the volume the blk/rev/xor bulk goes on (Core
+;; ArgsManager::GetBlocksDirPath, common/args.cpp:286-309). The block INDEX
+;; stays in the datadir, as Core's does (init.cpp:1140).
+(define-option "blocksdir" :key :blocks-directory :type :string)
 (define-option "txindex" :key :txindex :type :bool)
 (define-option "blockfilterindex" :key :blockfilterindex :type :bool)
 (define-option "coinstatsindex" :key :coinstatsindex :type :bool)
@@ -464,7 +468,7 @@
 (define-core-only-options
   "addresstype" "alertnotify"
   "avoidpartialspends" "blockreconstructionextratxn"
-  "blocksdir" "capturemessages"
+  "capturemessages"
   "changetype" "checkaddrman" "checkblockindex"
   "checkmempool" "checkpoints" "daemon"
   "daemonwait" "dbbatchsize" "deprecatedrpc"

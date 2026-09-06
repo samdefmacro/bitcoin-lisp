@@ -92,6 +92,25 @@ fine; that is the default path, and creating THAT is the intended behaviour."
                  :message (format nil "specified data directory \"~A\" does not exist"
                                   datadir)))))))
 
+(defun blocks-dir-path (blocks-directory data-directory network)
+  "Where the blk/rev/xor files go -- Core ArgsManager::GetBlocksDirPath
+(common/args.cpp:286-309): <-blocksdir>/<chain subdirectory>/blocks when
+-blocksdir is set, and <datadir>/<chain subdirectory>/blocks otherwise.
+
+A -blocksdir that is not an existing DIRECTORY makes Core return an empty path,
+which init.cpp:967-970 turns into \"Specified blocks directory ... does not
+exist.\" -- so this signals instead of creating it. That refusal is the whole
+point of the option: an unmounted volume otherwise presents as a node quietly
+writing hundreds of GB to the mount point's underlying disk."
+  (if (and blocks-directory (plusp (length blocks-directory)))
+      (let ((root (uiop:ensure-directory-pathname blocks-directory)))
+        (unless (uiop:directory-exists-p root)
+          (init-error "Specified blocks directory \"~A\" does not exist."
+                      blocks-directory))
+        (merge-pathnames "blocks/"
+                         (network-data-path (truename root) network)))
+      (merge-pathnames "blocks/" (uiop:ensure-directory-pathname data-directory))))
+
 (alexandria:define-constant +bitcoin-conf-filename+ "bitcoin.conf"
   :test #'equal
   :documentation "Core BITCOIN_CONF_FILENAME (common/args.h).")

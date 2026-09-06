@@ -2463,3 +2463,85 @@ name."
                                "/no-such-directory-for-the-fsync-test/probe.dat")))
     (is-true (search "fsync" complaint)
              "a file that cannot be opened logged ~S" complaint)))
+
+;;;; -blocksdir: the block bulk on a second volume (finding ebb73768)
+
+(test blocks-dir-path-follows-cores-getblocksdirpath
+  "Core ArgsManager::GetBlocksDirPath (common/args.cpp:286-309): with
+-blocksdir the path is <blocksdir>/<chain subdirectory>/blocks, and without it
+the datadir's own blocks/. A -blocksdir that is not an existing directory makes
+Core return an empty path, which init.cpp:967-970 turns into a startup error
+rather than a directory created on the wrong volume."
+  (with-temp-directory (datadir)
+    (with-temp-directory (blocksdir)
+      ;; positive control: no option, the datadir's own blocks/
+      (is (equal (namestring (merge-pathnames "blocks/" datadir))
+                 (namestring (bl::blocks-dir-path nil datadir :regtest))))
+      (is (equal (namestring (merge-pathnames "blocks/" datadir))
+                 (namestring (bl::blocks-dir-path "" datadir :regtest))))
+      ;; -blocksdir: the chain subdirectory is appended, as Core appends
+      ;; BaseParams().DataDir()
+      (is (equal (namestring (merge-pathnames "regtest/blocks/" (truename blocksdir)))
+                 (namestring (bl::blocks-dir-path (namestring blocksdir)
+                                                  datadir :regtest))))
+      (is (equal (namestring (merge-pathnames "blocks/" (truename blocksdir)))
+                 (namestring (bl::blocks-dir-path (namestring blocksdir)
+                                                  datadir :mainnet)))
+          "mainnet's chain subdirectory is empty in Core too")
+      ;; a target that does not exist is fatal, with Core's wording
+      (let* ((missing (namestring (merge-pathnames "not-mounted/" blocksdir)))
+             (refusal (handler-case
+                          (progn (bl::blocks-dir-path missing datadir :regtest) nil)
+                        (bl.err:init-error (e) (princ-to-string e)))))
+        (is (search "Specified blocks directory" refusal))
+        (is (search "does not exist" refusal))
+        (is (null (probe-file missing))
+            "the missing directory must NOT have been created")))))
+
+(test blocksdir-moves-the-block-bulk-and-leaves-the-index
+  "The whole point of the option: blk/rev/xor go to the second volume and the
+datadir keeps only the index. Core moves exactly this much -- its block-index
+LevelDB stays under GetDataDirNet()/blocks/index (init.cpp:1140), so a datadir
+written with -blocksdir is still a Core datadir."
+  (with-temp-directory (datadir)
+    (with-temp-directory (blocksdir)
+      (let* ((blocks-path (merge-pathnames "blocks/" blocksdir))
+             (store (bl.store:init-block-store datadir :blocks-path blocks-path))
+             (blk (bl.store:make-genesis-block :regtest)))
+        (with-network (:regtest)
+          (bl.store:store-block store blk)
+          (is (equal (namestring blocks-path)
+                     (namestring (bl.store:store-blocks-path store))))
+          ;; the bulk is on the second volume
+          (is-true (probe-file (merge-pathnames "xor.dat" blocks-path)))
+          (is-true (or (probe-file (merge-pathnames "blk00000.dat" blocks-path))
+                       (plusp (length (directory (merge-pathnames "*.blk" blocks-path)))))
+                   "no block data landed under -blocksdir")
+          ;; and NOT under the datadir
+          (is (null (probe-file (merge-pathnames "blocks/xor.dat" datadir)))
+              "xor.dat was still written to the datadir")
+          (is (null (probe-file (merge-pathnames "blocks/blk00000.dat" datadir))))
+          ;; the index does stay in the datadir
+          (is-true (probe-file (bl.kv:datadir-block-index-path datadir)))
+          ;; the block reads back from where it was written
+          (is (not (null (bl.store:get-block
+                          store (bl.ser:block-header-hash
+                                 (bl.ser:bitcoin-block-header blk)))))))))
+    ;; POSITIVE CONTROL: with no blocks-path the same store writes under the
+    ;; datadir, so the assertions above are about the option and not about an
+    ;; empty store.
+    (with-temp-directory (plain)
+      (let ((store (bl.store:init-block-store plain))
+            (blk (bl.store:make-genesis-block :regtest)))
+        (with-network (:regtest)
+          (bl.store:store-block store blk))
+        (is-true (probe-file (merge-pathnames "blocks/xor.dat" plain)))))))
+
+(test blocksdir-is-a-real-option-now
+  "It fed no start-node keyword at all, so every byte went to the datadir while
+the operator was told only that the option has no effect."
+  (multiple-value-bind (plist merged)
+      (start-node-plist '("-regtest" "-blocksdir=/mnt/big"))
+    (is (equal "/mnt/big" (getf plist :blocks-directory)))
+    (is (null (bl.cfg:supplied-core-only-options merged))))
+  (is (not (member :blocks-directory (start-node-plist '("-regtest"))))))
