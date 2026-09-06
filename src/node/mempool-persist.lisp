@@ -1,5 +1,66 @@
 (in-package #:bitcoin-lisp)
 
+;;;; Mempool persistence (Core node/mempool_persist.cpp + mempool_persist_args.cpp)
+
+(defvar *persist-mempool* t
+  "Core -persistmempool / DEFAULT_PERSIST_MEMPOOL = true, read once by
+ShouldPersistMempool (node/mempool_persist_args.cpp:13-16). It gates BOTH drive
+sites, with Core's asymmetry between them: at startup LoadMempool is still
+called but with an EMPTY path, which returns immediately (init.cpp:2047,
+mempool_persist.cpp:45), and at shutdown DumpMempool is skipped outright
+(init.cpp:338-340). Set once per run by START-NODE.
+
+It is the switch an operator reaches for after a restart spent replaying a
+large mempool.dat, and the only way to stop the shutdown write of a file that
+holds this node's own unbroadcast transactions in recoverable form.")
+
+(defvar *mempool-load-tried* nil
+  "Core CTxMemPool::m_load_tried, set by SetLoadTried once the startup load has
+been attempted (init.cpp:2048) and read by GetLoadTried before the shutdown dump
+(init.cpp:338). Without it a node that is stopped BEFORE the replay finishes
+dumps its half-filled mempool over the good file it was still reading.
+
+A special rather than a mempool slot: there is one mempool per process, and a
+per-run latch on the struct would survive an in-image restart in exactly the
+way START-NODE re-arms every other latch against.")
+
+(defun should-persist-mempool-p ()
+  "Core ShouldPersistMempool (node/mempool_persist_args.cpp:13-16)."
+  (and *persist-mempool* t))
+
+(defun mempool-load-path (node)
+  "The path the startup LoadMempool is given: NODE's mempool.dat, or NIL when
+-persistmempool is off.
+
+Core passes `fs::path{}` rather than skipping the call (init.cpp:2047), and
+LoadMempool returns immediately on an empty path (mempool_persist.cpp:45) --
+which is what leaves SetLoadTried reached on both branches."
+  (and (should-persist-mempool-p)
+       (bl.mp:mempool-dat-path (node-data-directory node))))
+
+(defun save-mempool-at-shutdown (node)
+  "Core's shutdown DumpMempool with the whole gate it carries (init.cpp:338-340):
+`node.mempool && node.mempool->GetLoadTried() && ShouldPersistMempool(*node.args)`.
+
+Returns the number of entries written, or NIL when nothing was written. Skipping
+under -persistmempool=0 is the operator's request; skipping when the startup
+replay did not finish is Core's protection of a good dump against a node that
+only ever read part of it."
+  (let ((path (bl.mp:mempool-dat-path (node-data-directory node))))
+    (cond
+      ((not (and path (node-mempool node))) nil)
+      ((not (should-persist-mempool-p))
+       (log-info "Not saving mempool: -persistmempool=0")
+       nil)
+      ((not *mempool-load-tried*)
+       (log-info "Not saving mempool: the startup replay never finished, so the ~
+existing ~A is the better copy" (file-namestring path))
+       nil)
+      (t
+       (let ((count (bl.mp:save-mempool-file (node-mempool node) path)))
+         (log-info "Saving mempool (~D entries)..." count)
+         count)))))
+
 (defun broadcast-transaction-to-peers (node txid)
   "Queue announcements of the in-mempool TXID to every connected
 relay-capable peer — the broadcast tail of Core's BroadcastTransaction

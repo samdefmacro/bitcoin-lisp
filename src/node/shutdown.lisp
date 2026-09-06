@@ -494,11 +494,9 @@ thread; see the shutdown-coordination section above."
     (log-info "Saving fee statistics...")
     (bl.mp:save-fee-stats (node-fee-estimator *node*)))
 
-  ;; Save mempool (Core DumpMempool)
-  (let ((path (bl.mp:mempool-dat-path (node-data-directory *node*))))
-    (when (and path (node-mempool *node*))
-      (log-info "Saving mempool (~D entries)..."
-                (bl.mp:save-mempool-file (node-mempool *node*) path))))
+  ;; Save mempool (Core DumpMempool), under the full gate it carries in Core:
+  ;; -persistmempool and the startup replay having finished (init.cpp:338-340).
+  (save-mempool-at-shutdown *node*)
 
   ;; Save peer address book
   (when (node-address-book *node*)

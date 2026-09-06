@@ -473,11 +473,11 @@ to move them (the node must be stopped)."
         (log-info "-addnode peers are dialed alongside -connect")))))
 
 
-(defun %init-shutdown-latches (log-rate-limit flat-block-files)
+(defun %init-shutdown-latches (log-rate-limit flat-block-files persist-mempool persist-mempool-v1)
   "Re-arm every once-per-run latch for this run -- -stopatheight, the shutdown
 coordination, the signal handler, the peers.dat dump clock, the log rate
-limiter, the block-file format -- so an in-image restart never inherits a
-previous node's state."
+limiter, the block-file format, the mempool persistence flags -- so an in-image
+restart never inherits a previous node's state."
   ;; -stopatheight: re-arm the once-only shutdown trigger for this run.
   (setf *stop-at-height-triggered* nil
         *disk-space-abort-triggered* nil)
@@ -513,7 +513,13 @@ previous node's state."
   ;; changes it. A literal NIL default here would have pinned every real node to
   ;; the per-block format no matter what the variable said, since this SETF runs
   ;; unconditionally on every start.
-  (setf bl.store:*flat-block-files* (and flat-block-files t)))
+  (setf bl.store:*flat-block-files* (and flat-block-files t))
+  ;; -persistmempool / -persistmempoolv1, and the load-tried latch they are read
+  ;; with. Assigned unconditionally so a second start in the same image gets the
+  ;; defaults back rather than the previous run's answer.
+  (setf *persist-mempool* (and persist-mempool t)
+        bl.mp:*persist-mempool-v1* (and persist-mempool-v1 t)
+        *mempool-load-tried* nil))
 
 
 (defun %init-lock-and-banner (network)
@@ -874,9 +880,15 @@ it; the indexes (Step 8) and -forcecompactdb."
                       rest-enabled network webui webui-supplied-p
                       webui-path webui-open))
 
-  ;; Reload the persisted mempool through normal acceptance (Core LoadMempool)
+  ;; Reload the persisted mempool through normal acceptance (Core LoadMempool).
+  ;; -persistmempool=0 leaves the PATH empty rather than skipping the call, so
+  ;; the load-tried latch below is set either way -- Core's exact shape at
+  ;; init.cpp:2046-2049.
   (bl.rpc:set-rpc-warmup-status "Replaying mempool...")
-  (load-mempool-from-disk *node*)
+  (load-mempool-from-disk *node* (mempool-load-path *node*))
+  ;; Core pool->SetLoadTried(!chainman.m_interrupt): a run that was interrupted
+  ;; mid-replay must not overwrite the dump it was still reading.
+  (setf *mempool-load-tried* (not (interrupt-requested-p)))
 
   ;; Initialize peer address book
   (log-info "Loading peer address book...")
@@ -1455,7 +1467,9 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (network-active t)
                         ((:rest rest-enabled) nil)
                         (addnode nil)
-                        (blocksonly nil))
+                        (blocksonly nil)
+                        (persist-mempool t)
+                        (persist-mempool-v1 nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -1515,6 +1529,9 @@ REST: If T, serve the Core-style REST interface under /rest/ on the RPC port
   (Core -rest; default OFF, DEFAULT_REST_ENABLE = false, init.cpp:153).
 ADDNODE: List of \"host[:port]\" strings to keep connected as manually-added
   peers (Core -addnode as a config option; same list addnode RPC manages).
+PERSIST-MEMPOOL: If T (default), replay mempool.dat at startup and write it at
+  shutdown (Core -persistmempool). PERSIST-MEMPOOL-V1 writes the older
+  version-1 dump format (Core -persistmempoolv1)
 BLOCKSONLY: If T, reject transactions from network peers (Core -blocksonly,
   default false): fRelay=0 in our version messages, tx announcements/txs
   from peers disconnect them, no feefilter. Local submissions still relay;
@@ -1554,7 +1571,7 @@ Returns the node instance."
   (setf *node* (init-node data-directory :network network :log-level log-level))
   (setf (node-max-peers *node*) max-peers)
   (%init-connection-options data-directory network max-peers max-connections accept-stale-fee-estimates connect-nodes connect-nodes-supplied-p seednode asmap whitelist whitebind network-active addnode blocksonly)
-  (%init-shutdown-latches log-rate-limit flat-block-files)
+  (%init-shutdown-latches log-rate-limit flat-block-files persist-mempool persist-mempool-v1)
   (%init-lock-and-banner network)
   (%init-load-chain network reindex)
   (%init-recover-chain reindex-chainstate)
