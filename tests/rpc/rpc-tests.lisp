@@ -3885,6 +3885,69 @@ verbosity-2 caller prevout objects Core does not send."
         (is (= (/ (- 5000 out-total) 100000000.0d0)
                (cdr (assoc "fee" j :test #'string=))))))))
 
+(defun %spk-object-keys (object)
+  (mapcar #'car object))
+
+(defun %tx-spending-and-paying-to (spk)
+  "A one-input, one-output transaction whose OUTPUT script is SPK, so the
+prevout object and the vout object are built from the same bytes."
+  (bl.ser:make-transaction
+   :version 1
+   :inputs (vector (bl.ser:make-tx-in
+                    :previous-output (bl.ser:make-outpoint
+                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element 9)
+                                      :index 0)
+                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                    :sequence #xFFFFFFFF))
+   :outputs (vector (bl.ser:make-tx-out :value 4000 :script-pubkey spk))
+   :lock-time 0))
+
+(test prevout-and-vout-render-the-same-scriptpubkey-object
+  "Core renders every scriptPubKey through ONE helper: TxToUniv calls
+ScriptToUniv identically for the verbosity-3 prevout (core_io.cpp:480) and for
+every vout (:506), both with include_hex and include_address, so the two
+objects carry the same keys in the same order. Two hand-written copies had
+drifted -- the prevout's had lost `desc', which Core's ScriptPubKeyDoc
+(rpc/util.cpp:1390-1398) documents as always present, so a client reading the
+field uniformly got a key error on the prevout half only.
+
+The asymmetry, not the presence of one key, is what this asserts. Plus the one
+asymmetry Core DOES have inside the helper: the address is suppressed for
+TxoutType::PUBKEY (core_io.cpp:423) even though ExtractDestination succeeds."
+  (flet ((objects (spk)
+           (let* ((tx (%tx-spending-and-paying-to spk))
+                  (coins (list (bl.store:make-utxo-entry
+                                :value 5000 :script-pubkey spk
+                                :height 7 :coinbase nil)))
+                  (j (bl.rpc:tx-to-json tx :regtest :spent-coins coins
+                                                    :prevouts t))
+                  (vin0 (first (cdr (assoc "vin" j :test #'string=))))
+                  (vout0 (first (cdr (assoc "vout" j :test #'string=)))))
+             (values (cdr (assoc "scriptPubKey"
+                                 (cdr (assoc "prevout" vin0 :test #'string=))
+                                 :test #'string=))
+                     (cdr (assoc "scriptPubKey" vout0 :test #'string=))))))
+    (let ((p2wpkh (bl.crypto:hex-to-bytes
+                   "0014aae5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5")))
+      (multiple-value-bind (prevout vout) (objects p2wpkh)
+        (is (equal (%spk-object-keys vout) (%spk-object-keys prevout))
+            "prevout keys ~S, vout keys ~S"
+            (%spk-object-keys prevout) (%spk-object-keys vout))
+        (is (equal '("asm" "desc" "hex" "address" "type")
+                   (%spk-object-keys vout))
+            "ScriptToUniv's key order")
+        (is (string= (cdr (assoc "desc" vout :test #'string=))
+                     (cdr (assoc "desc" prevout :test #'string=))))))
+    ;; The bare-pubkey control: no address on either side, and a desc on both.
+    (let ((p2pk (bl.crypto:hex-to-bytes
+                 "2103a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bdac")))
+      (multiple-value-bind (prevout vout) (objects p2pk)
+        (is (equal (%spk-object-keys vout) (%spk-object-keys prevout)))
+        (is (equal '("asm" "desc" "hex" "type") (%spk-object-keys vout))
+            "Core suppresses the address for TxoutType::PUBKEY")
+        (is-true (assoc "desc" prevout :test #'string=))))))
+
 (test coinbase-inputs-never-get-a-prevout
   "A coinbase spends nothing, so Core's loop skips it (`if (have_undo)` sits
 inside the non-coinbase branch's sibling and vprevout has one entry per

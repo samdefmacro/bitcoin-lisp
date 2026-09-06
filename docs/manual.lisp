@@ -1214,7 +1214,8 @@
 
   Every scriptPubKey object the RPC and REST surfaces emit is
   `script-to-json\', Core's ScriptToUniv, in Core's key order (asm, desc,
-  hex, address, type) -- there is no second copy to drift. Its `desc'
+  hex, address, type) -- there is no second copy to drift, and the
+  verbosity-3 prevout object is the same helper as the vout. Its `desc'
   is Core's InferScript with no signing provider, so the TYPED arms come
   first -- pk() for a bare pubkey, multi() for a bare multisig, rawtr()
   for a taproot output whose program is a valid x-only key -- and only
