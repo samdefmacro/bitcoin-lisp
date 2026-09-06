@@ -81,6 +81,7 @@ a funded mempool fixture, a wallet-bearing regtest node. tests/support/.")
    ;; wallet.lisp
    #:make-wallet-rng
    #:wallet-db-record-list
+   #:loaded-wallet
    #:with-rpc-wallet
    #:make-wallet-chain-node
    #:with-wallet-chain-node

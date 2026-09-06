@@ -21,7 +21,7 @@
   "Create NAME through the RPC layer and return the wallet struct."
   (bl.wallet::rpc-createwallet
    node (list name nil nil passphrase))
-  (gethash name (bl.wallet::wallet-manager-wallets (%node-manager node))))
+  (loaded-wallet (%node-manager node) name))
 
 (defun %wenc-records (wallet)
   "Every (key . value) pair in WALLET's open database."
@@ -442,7 +442,7 @@ both answered -13."
     (with-rpc-wallet ("wo")
       (bl.wallet::rpc-createwallet node (list "wo" t))
       (let* ((manager (%node-manager node))
-             (wallet (gethash "wo" (bl.wallet::wallet-manager-wallets manager))))
+             (wallet (loaded-wallet manager "wo")))
         (is-false (bl.wallet::wallet-has-encryption-keys-p wallet))
         (%wenc-plant-mkey wallet 1)
         (is (eql 1 (nth-value 2 (%wenc-key-record-counts wallet))))
@@ -452,8 +452,7 @@ both answered -13."
           (is-true (find-if (lambda (line)
                               (search "Detected extraneous encryption keys" line))
                             lines)))
-        (let ((reloaded (gethash "wo" (bl.wallet::wallet-manager-wallets
-                                       manager))))
+        (let ((reloaded (loaded-wallet manager "wo")))
           (is-false (bl.wallet::wallet-has-encryption-keys-p reloaded))
           (is-false (bl.wallet::wallet-is-locked-p reloaded))
           ;; Gone from the file, not merely from memory.
@@ -907,8 +906,7 @@ encrypting, and a passphrase with private keys disabled is refused."
                   (coerce (%aval "warnings" result) 'list)
                   :test #'equal))
       (is (not (bl.wallet::wallet-has-encryption-keys-p
-                (gethash "w-empty" (bl.wallet::wallet-manager-wallets
-                                    (%node-manager node)))))))
+                (loaded-wallet (%node-manager node) "w-empty")))))
     (is (= -4 (rpc-error-code-of
                (lambda () (bl.wallet::rpc-createwallet
                            node '("w-bad" t nil "hunter2"))))))))
@@ -919,8 +917,7 @@ no descriptors: it unlocks, but has no addresses to give."
   (with-wallet-test-node (node)
     (with-rpc-wallet ("blank")
       (bl.wallet::rpc-createwallet node '("blank" nil t "hunter2"))
-      (let ((wallet (gethash "blank" (bl.wallet::wallet-manager-wallets
-                                      (%node-manager node)))))
+      (let ((wallet (loaded-wallet (%node-manager node) "blank")))
         (is (bl.wallet::wallet-has-encryption-keys-p wallet))
         (is (zerop (hash-table-count (bl.wallet::wallet-spkms wallet))))
         ;; Even with no keys to check, a wrong passphrase must fail: the
@@ -1109,8 +1106,7 @@ string. wallet-add-descriptor re-parses the public form to close that."
   (with-wallet-test-node (node)
     (with-rpc-wallet ("imp")
       (bl.wallet::rpc-createwallet node '("imp" nil t))   ; blank
-      (let ((wallet (gethash "imp" (bl.wallet::wallet-manager-wallets
-                                    (%node-manager node))))
+      (let ((wallet (loaded-wallet (%node-manager node) "imp"))
             (private-desc
               (bl.rpc:descriptor-add-checksum
                "wpkh(tprv8ZgxMBicQKsPeZRHk4rTG6orPS2CRNFX3njhUXx5vj9qGog5ZMH4uGReDWN5kCkY3jmWEtWause41CDvBRXD1shKknAMKxT99o9qUTRVC6m/0h/0h/*)")))
@@ -1177,8 +1173,7 @@ success while leaving nothing behind."
       (bl.wallet::rpc-restorewallet
        node (list "r1" (namestring no-extension)))
       (is (bl.wallet::wallet-is-mine
-           (gethash "r1" (bl.wallet::wallet-manager-wallets
-                          (%node-manager node)))
+           (loaded-wallet (%node-manager node) "r1")
            (%address-script
             (with-rpc-wallet ("r1")
               (bl.wallet::rpc-getnewaddress node '()))
@@ -1278,9 +1273,7 @@ whose records are identical, record for record."
       (let ((result (bl.wallet::rpc-restorewallet
                      node (list "restored" (namestring path)))))
         (is (equal "restored" (%aval "name" result))))
-      (let* ((restored (gethash "restored"
-                                (bl.wallet::wallet-manager-wallets
-                                 (%node-manager node))))
+      (let* ((restored (loaded-wallet (%node-manager node) "restored"))
              (restored-records (wallet-db-record-list
                                 (bl.wallet::wallet-db restored))))
         (is (= (length source-records) (length restored-records)))
@@ -1317,8 +1310,7 @@ ciphertext — and the restored copy unlocks with the original passphrase."
           (is (null (bl.wallet::rpc-backupwallet
                      node (list (namestring path)))))))
       (bl.wallet::rpc-restorewallet node (list "enc2" (namestring path)))
-      (let ((restored (gethash "enc2" (bl.wallet::wallet-manager-wallets
-                                       (%node-manager node)))))
+      (let ((restored (loaded-wallet (%node-manager node) "enc2")))
         (is (bl.wallet::wallet-has-encryption-keys-p restored))
         (is (bl.wallet::wallet-is-locked-p restored))
         (is (null (bl.wallet::unlock-wallet restored "wrong")))

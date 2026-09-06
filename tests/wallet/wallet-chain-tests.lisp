@@ -22,8 +22,7 @@
 ;;; --- Fixture ---
 
 (defun %wc-wallet (node name)
-  (gethash name (bl.wallet::wallet-manager-wallets
-                 (bl:node-wallet-manager node))))
+  (loaded-wallet (bl:node-wallet-manager node) name))
 
 (defun %wc-optrue-address ()
   "P2SH(OP_TRUE) address for regtest — the throwaway coinbase target."

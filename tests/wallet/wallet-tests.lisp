@@ -47,7 +47,7 @@ datadir; the directory is deleted on unwind."
   "Simulate a crash: close the wallet DB with no graceful unload bookkeeping
 (no best-block write) and drop it from the manager."
   (let* ((manager (%node-manager node))
-         (wallet (gethash name (bl.wallet::wallet-manager-wallets manager))))
+         (wallet (loaded-wallet manager name)))
     (bl.store:leveldb-close (bl.wallet::wallet-db wallet))
     (remhash name (bl.wallet::wallet-manager-wallets manager))
     (setf (bl.wallet::wallet-manager-wallet-order manager)
@@ -322,8 +322,7 @@ hands out Core's script at index 0."
                                              "range" '(0 2)))))))
         (is (= 1 (length results)))
         (is (eq t (%aval "success" (first results)))))
-      (let* ((wallet (gethash "corevec"
-                              (bl.wallet::wallet-manager-wallets manager)))
+      (let* ((wallet (loaded-wallet manager "corevec"))
              (spkm (gethash :bech32
                             (bl.wallet::wallet-external-spkms wallet))))
         (is (not (null spkm)))
@@ -411,8 +410,7 @@ close/reopen (record schema round-trip at the wallet level)."
     (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("persist")))
     (let* ((manager (%node-manager node))
-           (wallet (gethash "persist" (bl.wallet::wallet-manager-wallets
-                                       manager)))
+           (wallet (loaded-wallet manager "persist"))
            (addr1 (with-rpc-wallet (nil)
                     (bl.wallet::rpc-getnewaddress node '("" "bech32"))))
            ;; range_end is legitimately extended by the reload-time TopUp
@@ -429,8 +427,7 @@ close/reopen (record schema round-trip at the wallet level)."
       (with-rpc-wallet (nil)
         (bl.wallet::rpc-unloadwallet node '("persist"))
         (bl.wallet::rpc-loadwallet node '("persist")))
-      (let* ((wallet2 (gethash "persist" (bl.wallet::wallet-manager-wallets
-                                          manager)))
+      (let* ((wallet2 (loaded-wallet manager "persist"))
              (descs-after (funcall spkm-state wallet2)))
         (is (equal (mapcar (lambda (d) (list (first d) (second d))) descs-before)
                    (mapcar (lambda (d) (list (first d) (second d))) descs-after)))
@@ -485,8 +482,7 @@ Core's condition, so both are here."
     (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("ver")))
     (let ((path (bl.wallet::wallet-path
-                 (gethash "ver" (bl.wallet::wallet-manager-wallets
-                                 (%node-manager node))))))
+                 (loaded-wallet (%node-manager node) "ver"))))
       (with-rpc-wallet (nil)
         ;; Creation writes this build's version (CWallet::CreateNew).
         (bl.wallet::rpc-unloadwallet node '("ver"))
@@ -604,8 +600,7 @@ the load itself is expected to signal."
   (with-rpc-wallet (nil)
     (bl.wallet::rpc-createwallet node '("wd"))
     (let ((path (bl.wallet::wallet-path
-                 (gethash "wd" (bl.wallet::wallet-manager-wallets
-                                (%node-manager node))))))
+                 (loaded-wallet (%node-manager node) "wd"))))
       (bl.wallet::rpc-unloadwallet node '("wd"))
       (%damage-descriptor-record path shape)
       (when version (%set-stored-client-version path version))
@@ -629,8 +624,7 @@ SBCL array-index report, because the value codec was unguarded."
         (with-rpc-wallet (nil)
           (bl.wallet::rpc-createwallet node '("wd"))
           (let ((path (bl.wallet::wallet-path
-                       (gethash "wd" (bl.wallet::wallet-manager-wallets
-                                      (%node-manager node))))))
+                       (loaded-wallet (%node-manager node) "wd"))))
             (bl.wallet::rpc-unloadwallet node '("wd"))
             (%damage-descriptor-record path shape)
             (bl.wallet::rpc-loadwallet node '("wd"))))))))
@@ -678,8 +672,7 @@ reloads to Core's exact scripts (descriptor_tests.cpp sh(wpkh(...)) vector)."
       (with-rpc-wallet (nil)
         (bl.wallet::rpc-unloadwallet node '("hardened"))
         (bl.wallet::rpc-loadwallet node '("hardened")))
-      (let* ((wallet (gethash "hardened" (bl.wallet::wallet-manager-wallets
-                                          manager)))
+      (let* ((wallet (loaded-wallet manager "hardened"))
              (spkm (gethash :p2sh-segwit
                             (bl.wallet::wallet-external-spkms wallet))))
         (is (not (null spkm)))
@@ -745,8 +738,7 @@ behave like Core, including the exact error codes."
                  (lambda () (bl.wallet::rpc-createwallet
                              node '("enc0" nil nil "hunter2"))))))
       (is (bl.wallet::wallet-has-encryption-keys-p
-           (gethash "enc0" (bl.wallet::wallet-manager-wallets
-                            (%node-manager node)))))
+           (loaded-wallet (%node-manager node) "enc0")))
       (is (= bl.rpc:+rpc-wallet-error+
              (rpc-error-code-of
               (lambda () (bl.wallet::rpc-createwallet
@@ -854,9 +846,7 @@ right form for all four address types (testnet4 prefixes), default bech32."
   (with-wallet-test-node (node :keypool 4)
     (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("types"))
-      (let ((wallet (gethash "types"
-                             (bl.wallet::wallet-manager-wallets
-                              (%node-manager node)))))
+      (let ((wallet (loaded-wallet (%node-manager node) "types")))
         ;; default type is bech32 (Core DEFAULT_ADDRESS_TYPE)
         (let ((address (bl.wallet::rpc-getnewaddress node nil)))
           (is (string= "tb1q" (subseq address 0 4))))
@@ -1110,7 +1100,7 @@ silently resuming address reuse."
       (bl.wallet::rpc-createwallet node '("flags")))
     (let* ((bl.wallet::*rpc-wallet-name* "flags")
            (manager (%node-manager node))
-           (wallet (gethash "flags" (bl.wallet::wallet-manager-wallets manager))))
+           (wallet (loaded-wallet manager "flags")))
       ;; Setting it on: Core's exact result shape, including the caveat.
       (let ((r (bl.wallet::rpc-setwalletflag node '("avoid_reuse"))))
         (is (equal "avoid_reuse" (cdr (assoc "flag_name" r :test #'string=))))
@@ -1165,7 +1155,7 @@ derivation paths cannot drift between the two."
       (bl.wallet::rpc-createwallet node '("cwd")))
     (let* ((bl.wallet::*rpc-wallet-name* "cwd")
            (manager (%node-manager node))
-           (wallet (gethash "cwd" (bl.wallet::wallet-manager-wallets manager))))
+           (wallet (loaded-wallet manager "cwd")))
       ;; Everything already exists on a freshly created wallet.
       (is (= bl.rpc:+rpc-wallet-error+
              (rpc-error-code-of
@@ -1255,9 +1245,7 @@ hook wired inside the branch."
              (with-rpc-wallet (nil)
                (bl.wallet::rpc-createwallet node '("notif")))
              (let* ((manager (%node-manager node))
-                    (wallet (gethash "notif"
-                                     (bl.wallet::wallet-manager-wallets
-                                      manager)))
+                    (wallet (loaded-wallet manager "notif"))
                     (bl.wallet::*rpc-wallet-name* "notif")
                     (bl.wallet:*wallet-notify-command*
                       ;; %w and %h prove the placeholders beyond %s reach the
@@ -1311,8 +1299,7 @@ outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label
     (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("recv")))
     (let* ((manager (%node-manager node))
-           (wallet (gethash "recv"
-                            (bl.wallet::wallet-manager-wallets manager)))
+           (wallet (loaded-wallet manager "recv"))
            (bl.wallet::*rpc-wallet-name* "recv"))
       (setf (bl.wallet::wallet-last-block-height wallet) 100)
       (let* ((addr (bl.wallet::rpc-getnewaddress node '("" "legacy")))
@@ -1369,8 +1356,7 @@ outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label
     (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("kp")))
     (let* ((manager (%node-manager node))
-           (wallet (gethash "kp"
-                            (bl.wallet::wallet-manager-wallets manager)))
+           (wallet (loaded-wallet manager "kp"))
            (bl.wallet::*rpc-wallet-name* "kp")
            (spkm (gethash :bech32
                           (bl.wallet::wallet-external-spkms wallet))))
@@ -1391,8 +1377,7 @@ rejects a double-spend across the array."
     (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("sim")))
     (let* ((manager (%node-manager node))
-           (wallet (gethash "sim"
-                            (bl.wallet::wallet-manager-wallets manager)))
+           (wallet (loaded-wallet manager "sim"))
            (bl.wallet::*rpc-wallet-name* "sim"))
       (setf (bl.wallet::wallet-last-block-height wallet) 100)
       (let* ((addr (bl.wallet::rpc-getnewaddress node '("" "bech32")))
@@ -1435,8 +1420,7 @@ keeps an unrelated lone address in its own group."
     (with-rpc-wallet (nil)
       (bl.wallet::rpc-createwallet node '("grp")))
     (let* ((manager (%node-manager node))
-           (wallet (gethash "grp"
-                            (bl.wallet::wallet-manager-wallets manager)))
+           (wallet (loaded-wallet manager "grp"))
            (bl.wallet::*rpc-wallet-name* "grp"))
       (setf (bl.wallet::wallet-last-block-height wallet) 100)
       (let* ((addr1 (bl.wallet::rpc-getnewaddress node '("" "legacy")))
@@ -1523,8 +1507,7 @@ bound so the wallet chain hooks fire."
   "createwallet \"w\", mine BLOCKS coinbases to a fresh bech32 (P2WPKH) address,
 mature them. Returns the wallet."
   (bl.wallet::rpc-createwallet node '("w"))
-  (let* ((wallet (gethash "w" (bl.wallet::wallet-manager-wallets
-                               (bl:node-wallet-manager node))))
+  (let* ((wallet (loaded-wallet (bl:node-wallet-manager node) "w"))
          (address (bl.wallet::rpc-getnewaddress node '("" "bech32"))))
     (dotimes (i blocks) (%pp-mine node 1 address))
     (%pp-mine node 101 (%pp-optrue-address))
@@ -1950,7 +1933,7 @@ path is unavailable by construction and only a script path can spend."
               "import failed: ~A"
               (let ((err (%aval "error" (first results))))
                 (if err (%aval "message" err) (first results))))))
-      (let* ((wallet (gethash "trtree" (bl.wallet::wallet-manager-wallets manager)))
+      (let* ((wallet (loaded-wallet manager "trtree"))
              (desc (bl.rpc:parse-descriptor
                     (format nil "tr(~A,pk(~A))" internal leaf-wif) :mainnet))
              (spk (first (bl.rpc::out-desc-expand desc 0)))
