@@ -464,6 +464,17 @@ getwalletinfo reports unlocked_until per Core's three states."
         (is (eql 0 (%aval "unlocked_until"
                           (bl.wallet::rpc-getwalletinfo node '()))))))))
 
+(defun %wenc-elapsed-deadline ()
+  "A relock deadline that has already passed, whatever the image's age.
+
+Not (- (get-internal-real-time) 60-seconds): SBCL counts internal real time
+from the first call, so inside the first minute of an image that subtraction
+is NEGATIVE -- and a negative deadline reads as UNSET (wallet-crypt.lisp:440
+and wallet.lisp:272 both guard with PLUSP, since 0 is the no-deadline value),
+so the elapsed-deadline branch this test exists to exercise never runs. 1 is
+in the past at every image age above zero."
+  (max 1 (- (get-internal-real-time) (* 60 internal-time-units-per-second))))
+
 (test wenc-unlocked-until-never-claims-expiry-while-the-key-is-live
   "A rescan holding the passphrase SUSPENDS the relock (relocking mid-rescan
 silently fails the keypool top-ups the scan depends on). Core does not suspend
@@ -484,8 +495,7 @@ on its own, and worse the longer the rescan runs."
         (setf (bl.wallet::wallet-relock-time wallet)
               (- (bl.ser:get-unix-time) 60)
               (bl.wallet::wallet-relock-deadline wallet)
-              (- (get-internal-real-time)
-                 (* 60 internal-time-units-per-second)))
+              (%wenc-elapsed-deadline))
         ;; Control: with NO scan holding it, the elapsed deadline relocks the
         ;; wallet and the report folds to 0. This is the arm that already
         ;; worked, and it must keep working.
@@ -499,8 +509,7 @@ on its own, and worse the longer the rescan runs."
               (bl.wallet::wallet-relock-time wallet)
               (- (bl.ser:get-unix-time) 60)
               (bl.wallet::wallet-relock-deadline wallet)
-              (- (get-internal-real-time)
-                 (* 60 internal-time-units-per-second)))
+              (%wenc-elapsed-deadline))
         ;; The key really is still live — that is the premise, and without it
         ;; this test asserts nothing.
         (is-false (bl.wallet::wallet-is-locked-p wallet)
