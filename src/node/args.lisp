@@ -149,11 +149,30 @@ start-node-from-args."
 \"parameter interactions\" and the proxy / reachability block of Step 6),
 applied after APPLY-OPTION-GLOBALS so each present-case row has already
 run and only the soft-set and consistency halves remain, in this order:
+the signet chain instantiated from -signetchallenge / -signetseednode,
 the ZMQ publisher list, -maxmempool under -blocksonly, -dnsseed under
 -connect / -maxconnections, -proxy / -onion / -proxyrandomize,
 -cjdnsreachable, -onlynet with its clearnet privacy check, and last
 -forcednsseed against the -dnsseed every one of those may have turned off."
   (flet ((lk (k) (let ((c (assoc k merged :test #'string=))) (and c (cdr c)))))
+    ;; -signetchallenge / -signetseednode INSTANTIATE the signet chain (Core
+    ;; ReadSigNetArgs -> SigNetParams(SigNetOptions), chainparams.cpp:26-40).
+    ;; First, because everything below it reads a chain: the derived message
+    ;; start, the seed list and the zeroed chain-work floor have to be in place
+    ;; before init-node copies them into *network-magic* and *dns-seeds*.
+    ;; Always assigned, NIL included, so a second start in the same image does
+    ;; not inherit the first one's signet.
+    (let ((challenge (and (lk "signetchallenge") bl.val:*signet-challenge*))
+          (seeds (loop for (k . v) in merged
+                       when (string= k "signetseednode") collect v)))
+      (setf (bl.chain:chain-params-override :signet)
+            (when (or challenge seeds)
+              (signet-chain-params :challenge challenge :seeds seeds)))
+      (when challenge
+        ;; Core LogInfo("Signet with challenge %s", HexStr(bin)),
+        ;; kernel/chainparams.cpp:467. Deferred: debug.log does not exist yet.
+        (defer-log :info "Signet with challenge ~A"
+                   (bl.crypto:bytes-to-hex challenge))))
     ;; -zmqpub<topic>=<address> [+ -zmqpub<topic>hwm]: recorded now, bound by
     ;; start-node. Nothing is loaded or opened here, so a node with no ZMQ
     ;; options never touches libzmq at all.

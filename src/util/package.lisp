@@ -183,6 +183,10 @@ FIND-CHAIN-PARAMS and the CHAIN-PARAMS-* accessors.")
    #:chain-params
    #:define-chain-params
    #:find-chain-params
+   #:chain-params-template
+   #:chain-params-override
+   #:*chain-params-overrides*
+   #:copy-chain-params
    #:chain-names
    #:chain-params-p
    #:chain-params-name
