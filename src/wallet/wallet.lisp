@@ -1344,16 +1344,15 @@ in ours, with a log line that keeps the path beside it."
   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                     :message (format nil "Wallet file verification failed. ~A" condition)))
 
-(defun %wallet-corrupt-error (path &optional condition)
+(defun %wallet-corrupt-error (path condition)
   "Signal Core's DBErrors::CORRUPT as the client sees it: `Error loading %s:
 Wallet corrupted` (wallet.cpp:2388-2390) behind LoadWalletInternal's `Wallet
 loading failed. ` prefix (:286-291), which HandleWalletError's default branch
-answers with RPC_WALLET_ERROR (rpc/util.cpp:127-157). CONDITION, when the
-corruption came with one, is logged rather than shipped -- Core logs what the
-record loader knows and puts only this sentence in the reply."
-  (when condition
-    (bl:log-warn "wallet database at ~A could not be read: ~A"
-                 (namestring path) condition))
+answers with RPC_WALLET_ERROR (rpc/util.cpp:127-157). CONDITION is logged
+rather than shipped -- Core logs what the record loader knows and puts only
+this sentence in the reply."
+  (bl:log-warn "wallet database at ~A could not be read: ~A"
+               (namestring path) condition)
   (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-wallet-error+
                     :message (format nil "Wallet loading failed. Error loading ~A: Wallet corrupted"
                                      (namestring path))))
