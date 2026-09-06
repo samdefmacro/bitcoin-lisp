@@ -446,6 +446,65 @@ close/reopen (record schema round-trip at the wallet level)."
           (is (< index (bl.wallet::desc-spkm-next-index spkm)))
           (is (bl.wallet::wallet-is-mine wallet2 script)))))))
 
+;;; --- The `version` record (GA11 b314f13a) ---
+
+(defun %version-record-key ()
+  (bl.wallet::wdb-key-simple bl.wallet::+wdb-key-version+))
+
+(defun %stored-client-version (path)
+  "The `version` record of the CLOSED wallet at PATH, or NIL when there is
+none. Read on the file rather than through the wallet, because absent and
+present-with-this-build's-value are the two cases that have to be told apart."
+  (let ((db (bl.wallet::wallet-db-open path)))
+    (unwind-protect
+         (let ((value (bl.store:leveldb-get db (%version-record-key))))
+           (and value (bl.wallet::wdb-parse-int32-value value)))
+      (bl.store:leveldb-close db))))
+
+(defun %set-stored-client-version (path version)
+  "Overwrite the closed wallet's `version` record with VERSION, or remove the
+record when VERSION is NIL."
+  (let ((db (bl.wallet::wallet-db-open path)))
+    (unwind-protect
+         (if version
+             (bl.store:leveldb-put db (%version-record-key)
+                                   (bl.wallet::wdb-int32-value version) :sync t)
+             (bl.store:leveldb-delete db (%version-record-key) :sync t))
+      (bl.store:leveldb-close db))))
+
+(test wallet-load-stamps-the-client-version-record
+  "GA11 b314f13a. Core reads DBKeys::VERSION into last_client at the top of
+WalletBatch::LoadWallet, logs it, and after a clean load rewrites it whenever
+it was absent or named a different version -- `if (!has_last_client ||
+last_client != CLIENT_VERSION) WriteVersion(CLIENT_VERSION)`
+(walletdb.cpp:1122-1125, 1177-1178). We wrote the record once at creation and
+never read or refreshed it, so a wallet stamped 999999 stayed 999999 forever
+and a wallet with no stamp never got one. The two are separate branches of
+Core's condition, so both are here."
+  (with-wallet-test-node (node)
+    (with-rpc-wallet (nil)
+      (bl.wallet::rpc-createwallet node '("ver")))
+    (let ((path (bl.wallet::wallet-path
+                 (gethash "ver" (bl.wallet::wallet-manager-wallets
+                                 (%node-manager node))))))
+      (with-rpc-wallet (nil)
+        ;; Creation writes this build's version (CWallet::CreateNew).
+        (bl.wallet::rpc-unloadwallet node '("ver"))
+        (is (eql bl.wallet::+wallet-client-version+ (%stored-client-version path)))
+        ;; Stale: a file from another build is restamped on load.
+        (%set-stored-client-version path 999999)
+        (bl.wallet::rpc-loadwallet node '("ver"))
+        (bl.wallet::rpc-unloadwallet node '("ver"))
+        (is (eql bl.wallet::+wallet-client-version+ (%stored-client-version path)))
+        ;; Absent: !has_last_client is the other half of Core's condition, and
+        ;; the pre-fix code failed it identically -- no record went in.
+        (%set-stored-client-version path nil)
+        (is (null (%stored-client-version path)))
+        (bl.wallet::rpc-loadwallet node '("ver"))
+        (bl.wallet::rpc-unloadwallet node '("ver"))
+        (is (eql bl.wallet::+wallet-client-version+
+                 (%stored-client-version path)))))))
+
 (test wallet-hardened-ranged-cache-reload
   "A hardened-ranged descriptor (/*') persists derived-xpub cache records and
 reloads to Core's exact scripts (descriptor_tests.cpp sh(wpkh(...)) vector)."

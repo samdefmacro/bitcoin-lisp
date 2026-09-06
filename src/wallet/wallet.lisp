@@ -1198,6 +1198,43 @@ Returns (values warnings caches actives)."
                  actives)))))
     (values warnings caches actives)))
 
+(defun %wallet-last-client-version (wallet)
+  "(values last-client has-record) from WALLET's `version` record.
+
+Core reads it first thing in WalletBatch::LoadWallet -- `int last_client =
+CLIENT_VERSION; bool has_last_client = m_batch->Read(DBKeys::VERSION,
+last_client); if (has_last_client) WalletLogPrintf(\"Last client version =
+%d\\n\", ...)` (walletdb.cpp:1122-1125). Absent, the default is this build's
+own version, which is what makes the two post-load branches differ: a wallet
+with no record and a wallet written by this build both read
++WALLET-CLIENT-VERSION+, and only HAS-RECORD tells them apart.
+
+DBKeys::MINVERSION is deliberately untouched: at d3056bc it is declared and
+defined in Core and read or written nowhere, so our unused constant mirrors
+Core's unused constant."
+  (let ((stored (bl.store:leveldb-get (wallet-db wallet)
+                                      (wdb-key-simple +wdb-key-version+))))
+    (if stored
+        (let ((last-client (wdb-parse-int32-value stored)))
+          (bl:log-info "[~A] Last client version = ~D"
+                       (wallet-name wallet) last-client)
+          (values last-client t))
+        (values +wallet-client-version+ nil))))
+
+(defun %wallet-update-client-version (wallet last-client has-record)
+  "Stamp WALLET's `version` record with this build's version when it was
+absent or names a different one: Core's `if (!has_last_client || last_client
+!= CLIENT_VERSION) WriteVersion(CLIENT_VERSION)` (walletdb.cpp:1177-1178).
+
+Only ever called after a load that produced no error. Core is explicit about
+why -- \"Any wallet corruption at all: skip any rewriting or upgrading, we
+don't want to make it worse\" (walletdb.cpp:1174-1176) -- and it returns
+before this point for every result other than LOAD_OK, NEED_RESCAN included."
+  (when (or (not has-record) (/= last-client +wallet-client-version+))
+    (bl.store:leveldb-put (wallet-db wallet)
+                          (wdb-key-simple +wdb-key-version+)
+                          (wdb-int32-value +wallet-client-version+))))
+
 (defun %load-wallet-records (wallet warnings &key chain-state)
   "Populate WALLET from its database records. Three scans, each streamed
 straight off the database the way Core's per-type record cursors are
@@ -1211,34 +1248,40 @@ DBErrors::NEED_RESCAN, raised by the tx-record replay alone."
   (let ((locator nil)
         (caches nil)
         (actives nil))
-    (multiple-value-setq (warnings locator)
-      (%load-wallet-descriptor-records wallet warnings))
-    (multiple-value-setq (warnings caches actives)
-      (%load-wallet-key-records wallet warnings))
-    (when locator
-      (setf (wallet-loaded-locator wallet) locator)
-      (setf (wallet-last-block-hash wallet) (first locator)))
-    ;; Install caches (rebuilds script/pubkey maps), then active mappings.
-    (loop for spkm being the hash-values of (wallet-spkms wallet)
-          do (spkm-set-cache wallet spkm
-                             (or (gethash (desc-spkm-id spkm) caches)
-                                 (bl.rpc:make-descriptor-cache)))
-             ;; Core wires NotifyFirstKeyTimeChanged -> MaybeUpdateBirthTime
-             ;; per SPKM (wallet.cpp:3556).
-             (wallet-maybe-update-birth-time wallet
-                                             (desc-spkm-creation-time spkm)))
-    (dolist (active actives)
-      (destructuring-bind (internal type-code id) active
-        (let ((spkm (gethash id (wallet-spkms wallet)))
-              (type (%output-type-from-code type-code)))
-          (if (and spkm type)
-              (wallet-add-active-spkm wallet spkm type internal :persist nil)
-              (push "Wallet file references an unknown active ScriptPubKeyMan"
-                    warnings)))))
-    ;; Transaction records last: RefreshTXOs consults the IsMine maps built
-    ;; by the cache installs above (Core LoadTxRecords runs after descriptor
-    ;; records too).
-    (wallet-load-tx-records wallet chain-state warnings)))
+    (multiple-value-bind (last-client has-version-record)
+        (%wallet-last-client-version wallet)
+      (multiple-value-setq (warnings locator)
+        (%load-wallet-descriptor-records wallet warnings))
+      (multiple-value-setq (warnings caches actives)
+        (%load-wallet-key-records wallet warnings))
+      (when locator
+        (setf (wallet-loaded-locator wallet) locator)
+        (setf (wallet-last-block-hash wallet) (first locator)))
+      ;; Install caches (rebuilds script/pubkey maps), then active mappings.
+      (loop for spkm being the hash-values of (wallet-spkms wallet)
+            do (spkm-set-cache wallet spkm
+                               (or (gethash (desc-spkm-id spkm) caches)
+                                   (bl.rpc:make-descriptor-cache)))
+               ;; Core wires NotifyFirstKeyTimeChanged -> MaybeUpdateBirthTime
+               ;; per SPKM (wallet.cpp:3556).
+               (wallet-maybe-update-birth-time wallet
+                                               (desc-spkm-creation-time spkm)))
+      (dolist (active actives)
+        (destructuring-bind (internal type-code id) active
+          (let ((spkm (gethash id (wallet-spkms wallet)))
+                (type (%output-type-from-code type-code)))
+            (if (and spkm type)
+                (wallet-add-active-spkm wallet spkm type internal :persist nil)
+                (push "Wallet file references an unknown active ScriptPubKeyMan"
+                      warnings)))))
+      ;; Transaction records last: RefreshTXOs consults the IsMine maps built
+      ;; by the cache installs above (Core LoadTxRecords runs after descriptor
+      ;; records too).
+      (multiple-value-bind (final-warnings rescan-required)
+          (wallet-load-tx-records wallet chain-state warnings)
+        (unless rescan-required
+          (%wallet-update-client-version wallet last-client has-version-record))
+        (values final-warnings rescan-required)))))
 
 (defun load-wallet (manager name &key chain-state)
   "Load an existing wallet from <wallets>/<name>/ and register it. Returns
