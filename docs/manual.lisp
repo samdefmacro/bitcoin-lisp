@@ -567,7 +567,13 @@
   dispatch that passed two of eight once disabled tx relay, addr gossip
   and compact blocks outside unit tests). A peer's traffic is metered by
   the token bucket per message class, then discouraged, then
-  disconnected. An error raised by a message HANDLER is caught, counted
+  disconnected -- unless it is a NoBan peer or a MANUAL one, two
+  independent exemptions Core applies before punishing anyone. Every
+  retirement path ends in DISCONNECT-PEER, which is Core's single
+  FinalizeNode: the tx-request tracker's announcements, the orphanage
+  entries and the headers-sync buffer are released there and nowhere
+  else, so a path that open-codes its own teardown leaks per-peer state
+  keyed by the peer OBJECT. An error raised by a message HANDLER is caught, counted
   per command and forgiven with the connection kept, which is Core's
   ProcessMessages catch: the failure is per-peer but the trigger is per
   message TYPE, so a blanket disconnect drops every peer that sends the

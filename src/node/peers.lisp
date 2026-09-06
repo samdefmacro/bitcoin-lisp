@@ -808,10 +808,13 @@ SELECT-DIALABLE-ADDRESS, and the already-connected test inside
 Returns the number of new peers connected."
   ;; Reap disconnected peers first — this also cleans up peers that
   ;; setnetworkactive dropped, even while networking stays disabled.
+  ;; :banned as well as :disconnected -- BAN-PEER retires the connection and
+  ;; then marks the peer, and a state this reap does not know about keeps the
+  ;; peer in NODE-PEERS forever.
   (bt:with-recursive-lock-held ((node-lock node))
     (setf (node-peers node)
           (remove-if (lambda (p)
-                       (eq (bl.net:peer-state p) :disconnected))
+                       (member (bl.net:peer-state p) '(:disconnected :banned)))
                      (node-peers node))))
   ;; setnetworkactive off: don't dial replacements.
   (unless (node-network-active node)
