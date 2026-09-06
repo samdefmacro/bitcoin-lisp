@@ -1,5 +1,6 @@
-"""Extract each RPC method's top-level argument NAMES from Core's RPCHelpMan
-declarations, in declaration order.
+"""Extract each RPC method's top-level argument NAMES -- and, with --types,
+their RPCArg::Type -- from Core's RPCHelpMan declarations, in declaration
+order.
 
 The names are what transformNamedArguments matches a JSON-RPC named parameter
 against (rpc/server.cpp), so they are the table a server needs to accept named
@@ -53,45 +54,75 @@ def scan_to_top_comma(s, i, stop):
         i += 1
     return min(i, stop)
 
-def arg_names_from_vector(s, i):
-    """Parse a brace-literal vector of RPCArg entries at s[i]=='{'."""
-    names, depth, expect = [], 0, False
+def arg_entries_from_vector(s, i):
+    """Parse a brace-literal vector of RPCArg entries at s[i]=='{'.
+
+    Returns [(name, type)], the type being the RPCArg::Type token of the entry
+    or None when the entry carries skip_type_check (Core then runs no gate on
+    it at all -- getblock's verbosity, which accepts a bool as well as a
+    number). A nested inner argument's skip_type_check disarms its OUTER entry
+    too; that errs toward NOT checking, which is the safe direction."""
+    entries, depth, expect = [], 0, False
+    name = None
+    type_ = None
+    start = None
     while i < len(s):
         c = s[i]
         if c == '"':
             j = skip_string(s, i)
             if depth == 2 and expect:
-                names.append(s[i+1:j-1]); expect = False
+                name = s[i+1:j-1]; expect = False
             i = j; continue
         if s.startswith('//', i) or s.startswith('/*', i):
             i = skip_trivia(s, i); continue
         if c == '{':
             depth += 1
-            if depth == 2: expect = True
+            if depth == 2:
+                expect = True; name = None; type_ = None; start = i
             i += 1; continue
         if c == '}':
             depth -= 1
-            if depth == 0: return names
+            if depth == 1 and name is not None:
+                if 'skip_type_check' in s[start:i]:
+                    type_ = None
+                entries.append((name, type_))
+                name = None
+            if depth == 0: return entries
             i += 1; continue
+        if depth == 2 and (c.isalpha() or c == '_'):
+            j = i
+            while j < len(s) and (s[j].isalnum() or s[j] == '_' or s[j] == ':'): j += 1
+            ident = s[i:j]
+            m = re.fullmatch(r'RPCArg::Type::(\w+)', ident)
+            if m and type_ is None: type_ = m.group(1)
+            i = j; continue
         if depth == 1 and (c.isalpha() or c == '_'):
             j = i
             while j < len(s) and (s[j].isalnum() or s[j] == '_'): j += 1
             ident = s[i:j]
-            if ident in ARG_CONSTS: names.append(ARG_CONSTS[ident])
+            if ident in ARG_CONSTS: entries.append(ARG_CONSTS[ident])
             elif ident not in ('RPCArg', 'Type', 'Optional', 'Fallback'):
                 UNRESOLVED.add(ident)
             i = j; continue
         i += 1
-    return names
+    return entries
+
+
+def arg_names_from_vector(s, i):
+    return [e[0] for e in arg_entries_from_vector(s, i)]
 
 # Shared RPCArg constants, both spellings Core uses.
 ARG_CONSTS = {}
 for path in ALL:
     txt = open(path, encoding='utf-8', errors='replace').read()
+    for m in re.finditer(r'RPCArg\s+(\w+)\s*\{\s*"([^"]+)"\s*,\s*RPCArg::Type::(\w+)', txt):
+        ARG_CONSTS[m.group(1)] = (m.group(2), m.group(3))
     for m in re.finditer(r'RPCArg\s+(\w+)\s*\{\s*"([^"]+)"', txt):
-        ARG_CONSTS[m.group(1)] = m.group(2)
+        ARG_CONSTS.setdefault(m.group(1), (m.group(2), None))
+    for m in re.finditer(r'\b(\w+)\s*=\s*RPCArg\{\s*\n?\s*"([^"]+)"\s*,\s*RPCArg::Type::(\w+)', txt):
+        ARG_CONSTS[m.group(1)] = (m.group(2), m.group(3))
     for m in re.finditer(r'\b(\w+)\s*=\s*RPCArg\{\s*\n?\s*"([^"]+)"', txt):
-        ARG_CONSTS[m.group(1)] = m.group(2)
+        ARG_CONSTS.setdefault(m.group(1), (m.group(2), None))
 
 UNRESOLVED = set()
 
@@ -107,7 +138,7 @@ for path in ALL:
         if k < 0: continue
         k = skip_trivia(txt, k + len('return'))
         if k < len(txt) and txt[k] == '{':
-            HELPERS[m.group(1)] = arg_names_from_vector(txt, k)
+            HELPERS[m.group(1)] = arg_entries_from_vector(txt, k)
 
 results, unresolved_methods = {}, {}
 for path in FILES:
@@ -134,7 +165,7 @@ for path in FILES:
         end_desc = scan_to_top_comma(src, j + 1, len(src))    # end of name..desc
         args_start = skip_trivia(src, end_desc + 1)
         if args_start < len(src) and src[args_start] == '{':
-            results[name] = arg_names_from_vector(src, args_start)
+            results[name] = arg_entries_from_vector(src, args_start)
         else:
             k = args_start
             while k < len(src) and (src[k].isalnum() or src[k] == '_'): k += 1
@@ -158,8 +189,12 @@ for path in ALL:
         if helper in results:
             results[method] = results[helper]
 
+WANT_TYPES = '--types' in sys.argv
 for n in sorted(results):
-    print(n, results[n])
+    if WANT_TYPES:
+        print(n, [(a, t) for (a, t) in results[n]])
+    else:
+        print(n, [a for (a, t) in results[n]])
 print('TOTAL', len(results), file=sys.stderr)
 if unresolved_methods:
     print('UNRESOLVED METHODS', unresolved_methods, file=sys.stderr)

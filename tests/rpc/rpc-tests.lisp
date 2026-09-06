@@ -981,10 +981,11 @@ regression in either direction shows up."
               (list "createrawtransaction"
                     (list (list) (list (cons "data" "Hello World")))
                     -8 "Data must be hexadecimal string (not 'Hello World')")
-              ;; A non-string is get_str()'s RPC_TYPE_ERROR, not -8
-              ;; (rpc/server.cpp:512-513).
+              ;; A non-string never reaches ParseHashV: the declared-type
+              ;; gate refuses it first, exactly as Core's does.
               (list "getblockheader" (list 5) -3
-                    "JSON value of type number is not of expected type string")
+                    (format nil "Wrong type passed:~%{~%    \"Position 1 (blockhash)\": ~
+\"JSON value of type number is not of expected type string\"~%}"))
               ;; Controls: a well-formed unknown hash is still -5.
               (list "getblockheader" (list zeros) -5 "Block not found")
               (list "getchaintxstats" (list 10 zeros) -5 "Block not found")))
@@ -1127,6 +1128,69 @@ as Decimal, which is exactly why they could not see it."
                        (yason:encode (/ 100000000 100000000.0d0) out))))
     (is (string/= "1.00000000" double-json)
         "the float path already spells amounts Core's way, so this test is vacuous")))
+
+(test rpc-arguments-run-cores-declared-type-gate
+  "GA11 be96017b. Core checks every DECLARED argument type once, before the
+handler body, and reports ALL the mismatches at once: RPCHelpMan::HandleRequest
+walks m_args calling RPCArg::MatchesType, collects each failure under
+\"Position N (name)\" and throws one RPC_TYPE_ERROR whose message is
+\"Wrong type passed:\\n\" plus that object at indent 4 (rpc/util.cpp:647-657,
+:899-910).
+
+There was no gate here at all. A handler read its arguments and whatever went
+wrong first was the answer, so getblockhash(\"foo\") was -8 \"Invalid height
+parameter\" and getchaintxstats('') reached the block index -- a different
+sentence per handler for the one thing Core says the same way everywhere --
+while the two handlers that DID answer -3 reported only the FIRST offending
+position.
+
+The first row is rpc_blockchain.py:496-506 byte for byte."
+  (let ((node (make-test-node)))
+    (is (equal (cons -3 (format nil "Wrong type passed:~%{~%    ~
+\"Position 1 (nblocks)\": \"JSON value of type string is not of expected type number\",~%    ~
+\"Position 2 (height)\": \"JSON value of type array is not of expected type number\"~%}"))
+               (%rpc-wire-error node "getnetworkhashps" (list "a" (vector))))
+        "the two-position getnetworkhashps text is not Core's")
+    ;; One position, and the inner sentence rpc_blockchain.py:311 matches on.
+    (let ((answer (%rpc-wire-error node "getchaintxstats" (list ""))))
+      (is (= -3 (car answer)))
+      (is (search "JSON value of type string is not of expected type number"
+                  (cdr answer))))
+    ;; The sentinels: an explicit false is a bool and a top-level [] an array,
+    ;; not the truthy atoms they are in Lisp.
+    (is (search "JSON value of type bool is not of expected type number"
+                (cdr (%rpc-wire-error node "getblockhash"
+                                      (list bl.rpc:+json-false+)))))
+    (is (search "JSON value of type array is not of expected type string"
+                (cdr (%rpc-wire-error node "getblockheader" (list (vector))))))
+    ;; A null argument passes, as Core's MatchesType does for an optional one.
+    (is (null (%rpc-wire-error node "getblockcount" (list nil))))
+    ;; skip_type_check positions are not gated: getblock takes a BOOL
+    ;; verbosity (blockchain.cpp:771-772), so this reaches the handler and
+    ;; fails its lookup instead.
+    (is (equal (cons -5 "Block not found")
+               (%rpc-wire-error node "getblock"
+                                (list (make-string 64 :initial-element #\0) t))))
+    ;; Positive controls: correctly typed calls are not refused by the gate.
+    (is (null (%rpc-wire-error node "getnetworkhashps" (list 120 -1))))
+    (is (null (%rpc-wire-error node "help" (list "getblockcount"))))))
+
+(test rpc-arg-types-table-agrees-with-the-names-table
+  "Both generated tables come from the same RPCHelpMan declarations
+(scripts/gen-rpc-arg-names.py), so a method's type row can never be longer
+than its name row -- if it were, the gate would report \"Position N (argN)\"
+for an argument Core has a name for."
+  (let ((rows 0))
+    (dolist (row bl.rpc::*rpc-arg-types*)
+      (let ((names (cdr (assoc (first row) bl.rpc::*rpc-named-arg-names*
+                               :test #'string=))))
+        (incf rows)
+        (is (<= (length (rest row)) (length names))
+            "~A declares ~D types and ~D names"
+            (first row) (length (rest row)) (length names))))
+    ;; The table is data generated from Core; a build that lost it would make
+    ;; the gate silently vacuous, so the count itself is asserted.
+    (is (<= 130 rows) "only ~D methods carry declared argument types" rows)))
 
 ;;; --- Method Registry Tests ---
 

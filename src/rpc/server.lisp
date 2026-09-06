@@ -65,6 +65,88 @@ whichever came first and leave the other listed forever."
             collect (cons method
                           (round (* (- now started) 1000000) per-second))))))
 
+(defun %rpc-expected-json-type (type)
+  "Core ExpectedType (rpc/util.cpp:865-895): the UniValue type name an
+RPCArg::Type demands, or NIL when Core runs no gate on it -- AMOUNT is a
+number OR a string and is checked inside AmountFromValue, RANGE a number OR
+an array checked inside ParseRange."
+  (case type
+    ((:str :str-hex) "string")
+    (:num "number")
+    (:bool "bool")
+    ((:obj :obj-named-params :obj-user-keys) "object")
+    (:arr "array")
+    (t nil)))
+
+(defun %escape-json-string (text)
+  "TEXT with the two characters a JSON string body cannot carry raw."
+  (with-output-to-string (out)
+    (loop for character across text
+          do (when (or (char= character #\") (char= character #\\))
+               (write-char #\\ out))
+             (write-char character out))))
+
+(defun %univalue-object-text (pairs)
+  "PAIRS ((key . string-value) ...) as UniValue::write(4) writes an object
+(univalue_write.cpp:88-110): one entry per line indented four spaces, a
+`\": \"' between key and value, a comma after all but the last, and the closing
+brace back at column 0."
+  (with-output-to-string (out)
+    (format out "{~%")
+    (loop for (key . value) in pairs
+          for rest on pairs
+          do (format out "    \"~A\": \"~A\"~:[~;,~]~%"
+                     (%escape-json-string key) (%escape-json-string value)
+                     (cdr rest)))
+    (format out "}")))
+
+(defun %rpc-arg-name (method position)
+  "Core's RPCArg name for METHOD's POSITION (1-based), from the generated
+*RPC-NAMED-ARG-NAMES* table -- the same declarations the types come from, so
+the two are always in step."
+  (let ((names (cdr (assoc method *rpc-named-arg-names* :test #'string=))))
+    (or (nth (1- position) names) (format nil "arg~D" position))))
+
+(defun check-rpc-arg-types (method params)
+  "Core's RPCHelpMan argument type gate (rpc/util.cpp:647-657), run once
+before the handler body.
+
+Core walks EVERY declared position, collects each mismatch into an object
+keyed \"Position N (name)\" and throws ONE RPC_TYPE_ERROR whose message is
+\"Wrong type passed:\" plus that object written at indent 4 -- the text
+rpc_blockchain.py:496-506 asserts byte for byte, and whose inner sentence is
+what rpc_blockchain.py:311 and mining_prioritisetransaction.py:206-214 match
+on. Nothing here checked types at all: a handler read its arguments and
+whatever went wrong first was the answer, so getblockhash(\"foo\") was -8
+\"Invalid height parameter\" and getchaintxstats(\"\") reached the block index
+-- a different sentence per handler for the one thing Core says the same way
+everywhere -- while the two handlers that DID answer -3 reported only the
+FIRST offending position.
+
+A NULL parameter passes, as Core's MatchesType does for an optional argument
+that is null; an argument a caller omitted is null here. The types come from
+*RPC-ARG-TYPES*, generated from Core, so a position Core does not gate --
+AMOUNT, RANGE, skip_type_check -- is not gated here either."
+  (let ((mismatches '()))
+    (loop for type in (cdr (assoc method *rpc-arg-types* :test #'string=))
+          for position from 1
+          for tail = params then (cdr tail)
+          for value = (car tail)
+          for expected = (%rpc-expected-json-type type)
+          do (when (and expected value)
+               (let ((actual (%json-type-name value)))
+                 (unless (string= expected actual)
+                   (push (cons (format nil "Position ~D (~A)" position
+                                       (%rpc-arg-name method position))
+                               (format nil "JSON value of type ~A is not of expected type ~A"
+                                       actual expected))
+                         mismatches)))))
+    (when mismatches
+      (error 'rpc-error :code +rpc-type-error+
+                        :message (format nil "Wrong type passed:~%~A"
+                                         (%univalue-object-text
+                                          (nreverse mismatches)))))))
+
 (defun dispatch-rpc-method (node method params)
   "Dispatch to the appropriate method handler.
 
@@ -81,6 +163,9 @@ than \"no such method\" for a method that does exist."
       ;; Core's exact message (server.cpp:499) — no method-name suffix.
       (error 'rpc-error :code +rpc-method-not-found+
                         :message "Method not found"))
+    ;; Core checks the declared argument types once, here, before the handler
+    ;; body runs (RPCHelpMan::HandleRequest, rpc/util.cpp:647-657).
+    (check-rpc-arg-types method params)
     ;; In-flight for as long as the handler runs, so getrpcinfo can report it.
     (with-active-rpc-command (method)
       (funcall handler node params))))

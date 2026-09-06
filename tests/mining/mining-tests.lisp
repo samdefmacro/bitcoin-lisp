@@ -903,8 +903,10 @@ with a count of zero."
         (is (equalp #() (bl.rpc:dispatch-rpc-method
                          node "generatetodescriptor" (list count "raw(51)"))))
         (is (= 0 (bl.store:current-height cs))))
-      ;; A count that is not an integer at all is still refused.
-      (signals-rpc-error (:code -8)
+      ;; A count that is not an integer at all is still refused -- by the
+      ;; declared-type gate now, which is where Core refuses it (nblocks is
+      ;; RPCArg::Type::NUM), so the code is -3 and not the handler's -8.
+      (signals-rpc-error (:code -3)
         (bl.rpc:dispatch-rpc-method node "generatetoaddress" (list "1" addr)))
       (signals-rpc-error (:code -8)
         (bl.rpc:dispatch-rpc-method node "generatetodescriptor" (list nil "raw(51)")))
