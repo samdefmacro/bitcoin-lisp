@@ -412,6 +412,71 @@ and generates a fresh HD seed."
           (is (zerop plain))
           (is (= 16 crypted)))))))
 
+;;; --- Extraneous mkey rows on a watch-only wallet (GA11 2ea896f4) ---
+
+(defun %wenc-plant-mkey (wallet id)
+  "Plant an mkey row under ID in WALLET's open database -- the row a wallet
+that was once \"encrypted\" with private keys disabled is left carrying. The
+values are shaped but meaningless: nothing decrypts with them, which is
+exactly the state that makes the wallet unopenable."
+  (bl.store:leveldb-put
+   (bl.wallet::wallet-db wallet)
+   (bl.wallet::wdb-key-mkey id)
+   (bl.wallet::wdb-mkey-value
+    (make-array 48 :element-type '(unsigned-byte 8) :initial-element 3)
+    (make-array 8 :element-type '(unsigned-byte 8) :initial-element 4)
+    0 25000 (make-array 0 :element-type '(unsigned-byte 8)))
+   :sync t))
+
+(test wenc-extraneous-master-keys-leave-on-load
+  "GA11 2ea896f4. Core's LoadWallet ends with a cleanup for the wallet that
+should not exist -- private keys disabled, an encryption key present, no
+crypted key -- logging \"Detected extraneous encryption keys...\", erasing
+every mkey row and clearing mapMasterKeys (walletdb.cpp:1191-1203). We loaded
+those rows unconditionally and never erased one, and since HasEncryptionKeys
+is nothing but \"a master key record exists\", such a wallet came up encrypted
+and LOCKED with no passphrase that could unlock it: importdescriptors and
+rescanblockchain, the two operations a watch-only wallet exists to perform,
+both answered -13."
+  (with-wallet-test-node (node)
+    (with-rpc-wallet ("wo")
+      (bl.wallet::rpc-createwallet node (list "wo" t))
+      (let* ((manager (%node-manager node))
+             (wallet (gethash "wo" (bl.wallet::wallet-manager-wallets manager))))
+        (is-false (bl.wallet::wallet-has-encryption-keys-p wallet))
+        (%wenc-plant-mkey wallet 1)
+        (is (eql 1 (nth-value 2 (%wenc-key-record-counts wallet))))
+        (bl.wallet::rpc-unloadwallet node '("wo"))
+        (let ((lines (capture-log-lines
+                      (lambda () (bl.wallet::rpc-loadwallet node '("wo"))))))
+          (is-true (find-if (lambda (line)
+                              (search "Detected extraneous encryption keys" line))
+                            lines)))
+        (let ((reloaded (gethash "wo" (bl.wallet::wallet-manager-wallets
+                                       manager))))
+          (is-false (bl.wallet::wallet-has-encryption-keys-p reloaded))
+          (is-false (bl.wallet::wallet-is-locked-p reloaded))
+          ;; Gone from the file, not merely from memory.
+          (is (eql 0 (nth-value 2 (%wenc-key-record-counts reloaded))))
+          ;; The consequence the finding is about: the wallet can be used.
+          (let ((results (bl.wallet::rpc-importdescriptors
+                          node (list (list (%ht "desc" (bl.rpc:descriptor-add-checksum
+                                                        "wpkh(tpubD6NzVbkrYhZ4WdqKEVfQNXhJQx1DLEA4JPiDLGMCVXAeH321nPQLyGqfMGTHBmpNBVWJ3nZssvtJ2pX4Pnh2wrCwk551QHV3BHqk9L9CE1E/0/*)")
+                                           "timestamp" "now"
+                                           "range" '(0 2)))))))
+            (is (eq t (%aval "success" (first results))))))))))
+
+(test wenc-create-wallet-refuses-a-passphrase-without-private-keys
+  "Core keeps this guard in CreateWallet, the function (wallet.cpp:408-413),
+not in the RPC handler. Ours was in the handler only, so CREATE-WALLET would
+happily build the wallet the cleanup above exists to repair the moment a
+second caller appeared."
+  (with-wallet-test-node (node)
+    (signals-rpc-error (:code -4 :message "Passphrase provided but private keys are disabled")
+      (bl.wallet::create-wallet (%node-manager node) "wo"
+                                :disable-private-keys t
+                                :passphrase "hunter2"))))
+
 (test wenc-unlock-lock-cycle
   "unlock proves the passphrase cryptographically; a wrong one leaves the
 wallet locked and the key material absent."
