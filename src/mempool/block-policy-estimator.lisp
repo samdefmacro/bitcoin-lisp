@@ -646,7 +646,11 @@ one success THRESHOLD, plus the pass/fail buckets that produced it.
 Returns (values sat-per-kvb result), or (values nil nil) when the horizon does
 not track CONF-TARGET. Unlike estimateSmartFee this asks ONE horizon at ONE
 threshold and reports the raw answer, which is exactly what makes it a
-debugging tool: it shows the evidence rather than the max of three estimates."
+debugging tool: it shows the evidence rather than the max of three estimates.
+
+The rate is an INTEGER: Core returns CFeeRate(llround(median)), and 0 is its
+no-answer sentinel, so a caller compares against 0 instead of testing the
+median's sign for itself."
   (let ((est *block-policy-estimator*))
     (when est
       (let* ((stats (ecase horizon
@@ -662,7 +666,9 @@ debugging tool: it shows the evidence rather than the max of three estimates."
               (tx-confirm-stats-estimate-median
                stats conf-target sufficient threshold
                (block-policy-estimator-best-height est))
-            (values (if (minusp median) 0 median) result)))))))
+            ;; CFeeRate(llround(median)): halves away from zero, and a
+            ;; negative median (no answer) becomes CFeeRate(0).
+            (values (if (minusp median) 0 (floor (+ median 1/2))) result)))))))
 
 (defun horizon-max-confirms (horizon)
   "The furthest target HORIZON tracks (Core HighestTargetTracked)."
