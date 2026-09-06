@@ -236,6 +236,14 @@ a wtxidrelay peer, MSG_TX / MSG_WITNESS_TX otherwise."
 branch: block availability, AddTxAnnouncement, and the getdata it triggers)."
   (bl.net::handle-inv peer payload ctx))
 
+(defun flush-peer-invs (peer &optional mempool)
+  "Drain one peer's queued tx announcements now, the way its trickle deadline
+would (Core's SendMessages tx-inventory section). The scheduled entry point
+is FLUSH-TX-ANNOUNCEMENTS; a test that wants several flushes in a row, or one
+that is about the drain itself rather than the Poisson schedule, would
+otherwise have to reach past the peer's exponential deadline each time."
+  (bl.net::%flush-peer-tx-invs peer mempool))
+
 (defun deliver-notfound (peer payload ctx)
   "Drive one notfound message PAYLOAD through the shipped handler (Core's
 NOTFOUND branch -> ReceivedNotFound)."

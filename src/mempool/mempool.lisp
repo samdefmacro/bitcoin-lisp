@@ -701,6 +701,41 @@ NIL. Used to serve MSG_WTX getdata, where the requested hash is a wtxid."
   (let ((txid (gethash wtxid (mempool-by-wtxid mempool))))
     (when txid (gethash txid (mempool-entries mempool)))))
 
+(defun mempool-mining-order-available-p (mempool)
+  "T when MEMPOOL can order two transactions by mining order at all. The
+txgraph's main order is undefined while the graph is oversized, which is the
+one state MEMPOOL-COMPARE-MINING-ORDER cannot answer for; a caller that needs
+a real ordering (rather than a comparator that merely never signals) asks this
+first and falls back to an order of its own."
+  (not (txgraph-oversized-p (mempool-graph mempool))))
+
+(defun mempool-compare-mining-order (mempool txid-a txid-b)
+  "Order two transactions the way the pool would mine them: -1 when A comes
+first, +1 when B does, 0 when neither is preferred.
+
+Core CTxMemPool::CompareMiningScoreWithTopology (txmempool.cpp:556-570),
+whose boolean answer is (MINUSP (MEMPOOL-COMPARE-MINING-ORDER ...)): a
+transaction NOT in the pool sorts before one that is, two absent ones tie,
+and two present ones are ordered by the txgraph's main order — chunk feerate
+with topology preserved, so a parent always precedes its child. That topology
+is why this, and not a plain feerate, is the comparator for announcement
+order: sorting by feerate alone would announce a child before its parent.
+
+Answers 0 rather than signalling when there is no main order to consult (see
+MEMPOOL-MINING-ORDER-AVAILABLE-P), so it is total wherever it is used."
+  (let ((a (mempool-get mempool txid-a))
+        (b (mempool-get mempool txid-b)))
+    (cond ((null b) (if a 1 0))
+          ((null a) -1)
+          ((not (and (mempool-mining-order-available-p mempool)
+                     (mempool-entry-graph-handle a)
+                     (mempool-entry-graph-handle b)))
+           0)
+          (t (txgraph-compare-main-order
+              (mempool-graph mempool)
+              (mempool-entry-graph-handle a)
+              (mempool-entry-graph-handle b))))))
+
 (defun mempool-count (mempool)
   "Return the number of transactions in the mempool."
   (hash-table-count (mempool-entries mempool)))
