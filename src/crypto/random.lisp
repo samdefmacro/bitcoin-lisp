@@ -32,7 +32,4 @@ IRONCLAD:*PRNG* is the OS PRNG: getrandom(2), falling back to /dev/urandom.
 Deliberately has NO fallback of its own -- a node that cannot reach the
 system entropy source must fail loudly rather than quietly hand out nonces
 and keys from a weaker source."
-  (let ((bytes (ironclad:random-data 8)))
-    (loop for i from 0 below 8
-          for shift from 0 by 8
-          sum (ash (aref bytes i) shift))))
+  (bytes-to-uint64-le (ironclad:random-data 8)))

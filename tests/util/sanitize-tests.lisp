@@ -51,6 +51,21 @@ parentheses, FILENAME keeps only \".-_\", URI is the widest."
   (dolist (rule '(:default :ua-comment :filename :uri))
     (is (string= "abcXYZ019" (bl.bytes:sanitize-string "abcXYZ019" rule)))))
 
+(test sanitize-string-drops-rather-than-escapes
+  "The filter REMOVES unsafe characters (Core's SanitizeString does the same),
+which is why it may never run before a dispatch decision: a forged P2P command
+would sanitize into a real one. Pinned here because the \"received:\" log line
+sanitizes the command field while the handler lookup uses the raw one."
+  (is (string= "block"
+               (bl.bytes:sanitize-string
+                (concatenate 'string "bl" (string #\Newline) "ock"))))
+  ;; A clean string comes back as the same object: this runs on every inbound
+  ;; message, and LOG-CAT evaluates its arguments whether or not the category
+  ;; is on.
+  (let ((clean "block"))
+    (is-true (eq clean (bl.bytes:sanitize-string clean))
+             "a string with nothing to drop must not be copied")))
+
 (test sanitize-string-alphanumeric-means-ascii
   "Core's CHARS_ALPHA_NUM is a literal ASCII string, so a Latin-1 or CJK letter
 is NOT alphanumeric and gets dropped. CL:ALPHANUMERICP is true of every Unicode

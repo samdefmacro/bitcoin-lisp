@@ -35,8 +35,10 @@ state. Depends on the util layer for chain parameters (bech32 HRPs) only."
   :serial t
   :components ((:file "crypto/package")
                (:module "crypto"
-                :components ((:file "random")
-                             (:file "hash")
+                :components ((:file "hash")
+                             ;; after hash: RAND-U64 assembles its bytes with
+                             ;; BYTES-TO-UINT64-LE
+                             (:file "random")
                              (:file "crypter")
                              (:file "chacha20")
                              (:file "muhash")
