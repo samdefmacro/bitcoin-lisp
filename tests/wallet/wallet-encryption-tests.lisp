@@ -1038,6 +1038,41 @@ unlocking it must produce a signature again."
         (is (stringp (bl.wallet::rpc-signmessage
                       node (list address "hi"))))))))
 
+(test wenc-signmessage-demands-the-passphrase-before-the-address
+  "GA11 7aea0d09. Core's signmessage takes cs_wallet and calls
+EnsureWalletIsUnlocked FIRST (wallet/rpc/signmessage.cpp:42-44), and only then
+decodes the address (:46-58), so a LOCKED wallet answers -13 for every address
+shape -- garbage, a valid non-P2PKH one, and an owned P2PKH one alike. A client
+that branches on -13 to prompt for the passphrase must not be handed an
+argument error instead.
+
+The unlocked rows are the positive control: they prove the -5 and -3 checks
+still fire and that a real signature still comes out, so a reordering cannot
+pass by deleting the address validation."
+  (with-wallet-test-node (node)
+    (with-rpc-wallet ("w")
+      (%wenc-fresh-wallet node "w")
+      (flet ((rpc (method &rest params)
+               (bl.rpc:dispatch-rpc-method node method params))
+             (sign-code (address)
+               (rpc-error-code-of
+                (lambda ()
+                  (bl.rpc:dispatch-rpc-method
+                   node "signmessage" (list address "hi"))))))
+        (let ((p2pkh (rpc "getnewaddress" "" "legacy"))
+              (bech32 (rpc "getnewaddress" "" "bech32"))
+              (garbage "not-an-address"))
+          (%wenc-encrypt node)
+          ;; Locked: Core answers -13 to all three.
+          (is (= -13 (sign-code garbage)))
+          (is (= -13 (sign-code bech32)))
+          (is (= -13 (sign-code p2pkh)))
+          (rpc "walletpassphrase" "hunter2" 600)
+          ;; Unlocked: the address checks are exactly where they were.
+          (is (= -5 (sign-code garbage)))
+          (is (= -3 (sign-code bech32)))
+          (is (stringp (rpc "signmessage" p2pkh "hi"))))))))
+
 (test wenc-unlocked-signing-matches-plaintext-signing
   "A key read back through the decryption path signs identically to the same
 key held in plaintext — the encryption round trip is lossless."
