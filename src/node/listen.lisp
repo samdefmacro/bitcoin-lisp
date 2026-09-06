@@ -28,9 +28,9 @@ network is :torv3, Core CNode::m_inbound_onion)."
                         node (bl.net:connection-host conn) onion)
                      (if (not allowed)
                          (progn
-                           (log-info "Inbound connection from ~A dropped (~(~A~))"
-                                     (bl.net:connection-host conn)
-                                     reason)
+                           (log-cat "net" "connection from ~A dropped (~(~A~))"
+                                    (bl.net:connection-host conn)
+                                    reason)
                            (bl.net:close-connection conn))
                          (let ((peer (bl.net:make-inbound-peer
                                       conn (bl.net:connection-host conn)
@@ -41,10 +41,11 @@ network is :torv3, Core CNode::m_inbound_onion)."
                                  (bl.net:send-compact-block-negotiation peer)
                                  (bt:with-recursive-lock-held ((node-lock node))
                                    (push peer (node-pending-inbound-peers node)))
-                                 (log-info "Inbound~:[~; onion~] peer ~A (~A) handshake complete"
-                                           onion
-                                           (bl.net:peer-address peer)
-                                           (bl.net:peer-user-agent peer)))
+                                 (log-cat "net"
+                                          "New inbound~:[~; onion~] peer connected: ~A, ~A"
+                                          onion
+                                          (bl.net:peer-user-agent peer)
+                                          (bl.net:peer-log-name peer)))
                                (bl.net:disconnect-peer peer))))))))
              (error (c)
                (log-debug "Inbound accept/handshake error: ~A" c)))))

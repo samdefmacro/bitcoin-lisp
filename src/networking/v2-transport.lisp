@@ -309,8 +309,8 @@ appears within the 4095+16 byte bound (or the DEADLINE passes)."
           (when (not (mismatch terminator buf :start2 (- n term-len)))
             (return (subseq buf 0 (- n term-len))))
           (when (>= n (+ +v2-max-garbage-len+ term-len))
-            (bl.log:log-warn "V2 transport: missing garbage terminator from ~A"
-                                   (connection-host conn))
+            (bl.log:log-cat "net" "V2 transport: missing garbage terminator~A"
+                            (bl.log:log-ip (connection-host conn)))
             (return nil))
           (let ((next (%v2-read conn 1 deadline)))
             (unless next (return nil))
@@ -379,8 +379,8 @@ peer, or NIL (dead peer, wrong-network v1 peer, or failed v2 handshake)."
       ;; command but the magic doesn't (else the branch above hit). Not a v2
       ;; key; log and drop (Core does the same for the logging value).
       ((not (mismatch first16 v1-prefix :start1 4 :start2 4))
-       (bl.log:log-warn "V2 transport: v1 peer with wrong network magic from ~A"
-                              (connection-host conn))
+       (bl.log:log-cat "net" "V2 transport: v1 peer with wrong network magic~A"
+                       (bl.log:log-ip (connection-host conn)))
        nil)
       (t
        ;; v2: FIRST16 is the start of the peer's 64-byte ellswift key.

@@ -621,8 +621,7 @@ Also checks compact block reconstruction timeouts (BIP 152)."
                 (push peer to-disconnect))))
         (error () (push peer to-disconnect))))
     (dolist (peer to-disconnect)
-      (log-warn "Disconnecting unresponsive peer ~A"
-                (bl.net:peer-address peer))
+      (log-cat "net" "unresponsive, ~A" (bl.net:disconnect-msg peer))
       (handler-case
           (bl.net:disconnect-peer peer)
         (error (c) (declare (ignore c))))
@@ -1246,8 +1245,8 @@ whole-set extra-outbound eviction."
                 ;; LOGGED, not swallowed. A silent error here exempts that peer
                 ;; from eviction forever, which is indistinguishable from the
                 ;; eclipse this code exists to prevent.
-                (log-warn "Chain-sync eviction failed for peer ~A: ~A"
-                          (bl.net:peer-address peer) e))))))
+                (log-warn "Chain-sync eviction failed for ~A: ~A"
+                          (bl.net:peer-log-name peer) e))))))
       ;; Core runs EvictExtraOutboundPeers from this same tick (:5466), and
       ;; BEFORE the stale-tip check rather than after: the peer we are about to
       ;; decide we need is not one we should have dropped on the way in.

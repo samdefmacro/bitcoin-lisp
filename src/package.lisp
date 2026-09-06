@@ -161,6 +161,8 @@ init.cpp, node/. src/node/.")
    #:default-shrink-debug-file-p
    #:*log-time-micros*
    #:*log-thread-names*
+   #:*log-ips*
+   #:log-ip
    #:log-info
    #:log-warn
    #:log-error

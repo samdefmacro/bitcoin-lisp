@@ -72,6 +72,14 @@
 ;; logging layer, next to the other operator hooks.
 (define-option "alertnotify" :global bl.log:*alert-notify-command*)
 (define-option "logthreadnames" :key :log-thread-names :type :bool)
+;; -logips: Core reads it with GetBoolArg and DEFAULT_LOGIPS is FALSE
+;; (init/common.cpp:57, logging.h:28), so the default node log names every peer
+;; by its numeric id and never by its address. A :KEY row rather than a :GLOBAL
+;; one because a :GLOBAL row is assigned only when the option is PRESENT, and
+;; this flag must return to its default on every start -- a node restarted
+;; without -logips in an image that had it would otherwise keep logging
+;; addresses.
+(define-option "logips" :key :log-ips :type :bool)
 (define-option "maxconnections" :key :max-connections :type :int)
 (define-option "rpcport" :key :rpc-port :type :int :network-only t)
 (define-option "rpcbind" :key :rpc-bind :type :string :network-only t)
@@ -525,7 +533,7 @@ node's own address"))))
   "discover"
   "help" "i2pacceptincoming" "i2psam"
   "ipcbind" "limitancestorcount" "limitancestorsize"
-  "limitdescendantcount" "limitdescendantsize" "logips"
+  "limitdescendantcount" "limitdescendantsize"
   "loglevelalways" "logsourcelocations"
   "logtimestamps" "maxreceivebuffer"
   "natpmp" "peerbloomfilters" "printpriority"

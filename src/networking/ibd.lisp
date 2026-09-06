@@ -1020,7 +1020,7 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
       ;; see a heavier chain and does not fetch it starts from nothing.
       (bl:log-debug
        "no-download ~A: ~A (best-known ~:[none~;h=~:*~D~], tip h=~D)"
-       (peer-address peer)
+       (peer-log-name peer)
        (cond ((null best-known) "peer availability unknown")
              ((<= (bl.store:block-index-entry-chain-work best-known) tip-work)
               "peer chain not heavier than our tip")
@@ -1047,7 +1047,7 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
                     (bl.store:block-index-entry-hash best-known))
         (bl:log-debug
          "no-download ~A: cursor is already at the peer's best block (h=~D)"
-         (peer-address peer)
+         (peer-log-name peer)
          (bl.store:block-index-entry-height best-known))
         (return-from find-blocks-to-download-for-peer nil))
       (let* ((lc-hash (bl.store:block-index-entry-hash last-common))
@@ -1632,7 +1632,8 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
                          (zerop (count-peer-in-flight peer))
                          (zerop (peer-stalling-since staller)))
                 (setf (peer-stalling-since staller) (get-internal-real-time))
-                (bl:log-debug "Stall started peer=~A" (peer-address staller)))))))
+                (bl:log-debug "Stall started ~A"
+                              (peer-log-name staller)))))))
       (when (zerop requests-made)
         (return-from request-blocks-from-peers 0))
 
@@ -1926,11 +1927,11 @@ Returns the running total for COMMAND."
     ;; ProcessMessages(<command>, <n> bytes): Exception ... caught.
     (bl:log-cat "net"
                 "ProcessMessages(~A, ~D bytes) from ~A: ~A caught (~D so far): ~A"
-                command (length payload) (peer-address peer)
+                command (length payload) (peer-log-name peer)
                 (type-of condition) count condition)
     (when (%power-of-ten-p count)
       (bl:log-warn "The ~A message handler has raised ~D time~:P (last from ~A: ~A)"
-                   command count (peer-address peer) condition))
+                   command count (peer-log-name peer) condition))
     count))
 
 (defun safely-dispatch-peer-message (peer command payload node-ctx ctx)
@@ -2029,8 +2030,8 @@ paused peer's input is not read, so nothing can add to it until it drains."
               (peer-getdata-queue peer))
      (handler-case (process-peer-getdata peer node-ctx)
        (error (c)
-         (bl:log-warn "Peer ~A: error serving a deferred getdata: ~A"
-                      (peer-address peer) c))))
+         (bl:log-warn "Error serving a deferred getdata for ~A: ~A"
+                      (peer-log-name peer) c))))
    (when (and (eq (peer-state peer) :ready)
               conn
               ;; Only drain a connection still believed live. If a previous
@@ -2080,18 +2081,16 @@ paused peer's input is not read, so nothing can add to it until it drains."
               ;; below remains the backstop for I/O errors from receive-message.
               do (safely-dispatch-peer-message peer command payload node-ctx ctx)))
       ((or stream-error usocket:socket-condition end-of-file) (c)
-        (bl:log-warn
-         "Peer ~A I/O error during message drain — disconnecting: ~A"
-         (peer-address peer) c)
+        (bl:log-cat "net" "I/O error during message drain, ~A: ~A"
+                    (disconnect-msg peer) c)
         (handler-case (disconnect-peer peer) (error () nil)))
       ;; A malformed/oversized message (bad count, truncated payload, decode
       ;; failure) raises a non-I/O error. Treat the peer as misbehaving and
       ;; disconnect only it — Bitcoin Core's posture — rather than letting the
       ;; error escape and tear down the whole sync thread.
       (error (c)
-        (bl:log-warn
-         "Peer ~A sent a malformed message during drain — disconnecting: ~A"
-         (peer-address peer) c)
+        (bl:log-cat "net" "malformed message during drain, ~A: ~A"
+                    (disconnect-msg peer) c)
         (handler-case (disconnect-peer peer) (error () nil))))
     ;; Reap a message the peer began and then abandoned. The reader no longer
     ;; waits for the rest of one, so a peer that sends a header and goes silent
@@ -2107,9 +2106,9 @@ paused peer's input is not read, so nothing can add to it until it drains."
     ;; consults inactivity (SocketHandlerConnected).
     (when (and (peer-connection peer)
                (connection-receive-expired-p (peer-connection peer)))
-      (bl:log-warn
-       "Peer ~A began a message and delivered nothing for ~Ds — disconnecting"
-       (peer-address peer) +receive-stall-timeout-seconds+)
+      (bl:log-cat "net"
+                  "socket receive timeout: a message began and nothing followed for ~Ds, ~A"
+                  +receive-stall-timeout-seconds+ (disconnect-msg peer))
       (handler-case (disconnect-peer peer) (error () nil))))
   (handle-peer-fin peer)))
 
@@ -2646,8 +2645,7 @@ chain is useless to us, not malicious."
               (> now (peer-chain-sync-timeout peer)))
          (cond
            ((peer-chain-sync-sent-getheaders peer)
-            (bl:log-info "Peer ~A: outbound peer has old chain, disconnecting"
-                                   (peer-address peer))
+            (bl:log-info "Outbound peer has old chain, ~A" (disconnect-msg peer))
             (disconnect-peer peer)
             :disconnected)
            (t
@@ -2821,11 +2819,12 @@ after this file."
                        peers))
            (try (victim test label)
              (when (and victim (%extra-eviction-releasable-p victim now test))
-               (bl:log-info
-                "Disconnecting extra ~A peer ~A (last announcement ~D, connected ~Ds)"
-                label (peer-address victim)
-                (peer-last-block-announcement victim)
-                (- now (peer-connected-at victim)))
+               (bl:log-cat "net"
+                           "disconnecting extra ~A ~A (last announcement ~D, ~
+                            connected ~Ds)"
+                           label (peer-log-name victim)
+                           (peer-last-block-announcement victim)
+                           (- now (peer-connected-at victim)))
                (disconnect-peer victim)
                (push victim evicted))))
       (when (> (live-count :block-relay) block-relay-target)
@@ -2870,8 +2869,8 @@ peer was dropped."
            (work (and entry (bl.store:block-index-entry-chain-work entry)))
            (floor-work (bl:minimum-chain-work bl:*network*)))
       (when (and work (< work floor-work))
-        (bl:log-info "Peer ~A: headers chain has insufficient work (~A < ~A), disconnecting outbound peer"
-                               (peer-address peer) work floor-work)
+        (bl:log-info "outbound peer headers chain has insufficient work (~A < ~A), ~A"
+                     work floor-work (disconnect-msg peer))
         (disconnect-peer peer)
         t))))
 
@@ -3112,8 +3111,9 @@ NIL the sync is over (complete or aborted) and the slot is cleared."
           (cond ((and ok request-more) t)
                 (t
                  (bl:log-info "Low-work headers sync ~A with ~A (presync height ~D)"
-                                        (if ok "complete" "aborted")
-                                        (peer-address peer) (hss-current-height hss))
+                              (if ok "complete" "aborted")
+                              (peer-log-name peer)
+                              (hss-current-height hss))
                  (%clear-peer-headers-sync peer)
                  nil)))
         ;; PoW-invalid batch from a peer we're presyncing — abort the sync.
@@ -3137,7 +3137,7 @@ NIL the sync is over (complete or aborted) and the slot is cleared."
       ((and start peer)
        (bl:log-info
         "Low-work chain from ~A: presyncing before storing (anti-DoS work gate)"
-        (peer-address peer))
+        (peer-log-name peer))
        ;; Feed this first batch immediately (already PoW-checked in
        ;; maybe-start-presync); presync never releases headers to store.
        (multiple-value-bind (ok request-more ready)
@@ -3152,8 +3152,9 @@ NIL the sync is over (complete or aborted) and the slot is cleared."
        ;; Core ignores such batches entirely — storing them would let an
        ;; attacker grow the index with arbitrarily many cheap sub-2000-header
        ;; forks (net_processing.cpp:2802-2804).
-       (bl:log-cat "net" "Ignoring low-work chain (~D headers) from peer ~A"
-                             (length headers) (and peer (peer-address peer)))
+       (bl:log-cat "net" "Ignoring low-work chain (~D headers) from ~A"
+                   (length headers)
+                   (if peer (peer-log-name peer) "an unnamed peer"))
        :ignore)
       (t :store))))
 
@@ -3448,7 +3449,8 @@ keeping. Core has no header-sync loop at all for the same reason."
       ;; delivered during the pass — informational only; the caller reads the
       ;; stall flag.
       (bl:log-info "Header sync kicked ~A: ~D headers ingested~:[~; (no answer)~]"
-                             (peer-address peer) received never-answered)
+                   (peer-log-name peer)
+                   received never-answered)
       (values received never-answered))))
 
 (defun sync-headers-with-failover (peers chain-state ctx

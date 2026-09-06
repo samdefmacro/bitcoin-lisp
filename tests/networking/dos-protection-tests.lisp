@@ -1969,3 +1969,132 @@ for a function that always returns T."
              (usocket:socket-close server)
              (usocket:socket-close listener)))
       (mapc #'close hogs))))
+
+;;;; ============================================================
+;;;; -logips: the peer's address is not in the default log
+;;;; ============================================================
+;;;;
+;;;; GA11 559c86ad. Core keeps a peer's address out of routine logging in two
+;;;; independent ways, and we had neither: fLogIPs (logging.h:28,35,
+;;;; logging.cpp:47) defaults FALSE, so CNode::LogIP returns "" and
+;;;; CNode::DisconnectMsg is just "disconnecting peer=<id>" (net.cpp:704-716);
+;;;; and every routine per-peer line that calls them is LogDebug(BCLog::NET),
+;;;; so it is not in the default log at all.
+
+(defun %logged-net-lines (thunk &key log-ips (level :debug))
+  "Run THUNK with the log file redirected to a string and return what it wrote.
+
+LEVEL :debug admits the category lines Core routes to LogDebug(BCLog::NET);
+LEVEL :info is the node's own default, where those lines must not appear. The
+rate limiter is off so a long line cannot be suppressed instead of emitted.
+
+The \"net\" category is enabled through a process-global table that no test
+restores, so \"the default log\" has to be SET here rather than read as it
+stands -- an earlier test in the same image had left the category on, and the
+level assertion below then measured that instead of the default."
+  (let ((out (make-string-output-stream))
+        (net-enabled (bl.log:log-category-enabled-p "net")))
+    (unwind-protect
+         (progn
+           (bl.log:disable-log-category "net")
+           (let ((bl.log:*log-file-stream* out)
+                 (bl.log:*log-stream* nil)
+                 (bl.log:*log-rate-limit* nil)
+                 (bl.log:*current-log-level* level)
+                 (bl.log:*log-ips* log-ips))
+             (funcall thunk)))
+      (when net-enabled (bl.log:enable-log-category "net")))
+    (get-output-stream-string out)))
+
+(defun %timed-out-handshake-peer ()
+  "A peer whose handshake has outlived -peertimeout, at a routable address.
+
+CONNECT-TIME is on GET-INTERNAL-REAL-TIME, which SBCL counts from the first
+call, so 1 means \"one unit into this process\" and the peer's age is the
+PROCESS's age. Callers therefore bind -peertimeout to 0 rather than rely on the
+image being older than its default 60 s: the warm image always is, a
+freshly-started battery is not, and the cold lane failed on exactly that."
+  (bl.net:make-peer :state :handshaking
+                    :address "203.0.113.77:8333"
+                    :connect-time 1))
+
+(test a-peer-line-names-the-id-and-hides-the-address
+  "Core's per-peer lines are \"...peer=<id>\" plus CNode::LogIP, which is
+\" peeraddr=<addr>\" only when -logips is on (net.cpp:704-716). Ours printed
+the address unconditionally, so the default debug.log of a listening node
+became a dated record of every address that connected to it.
+
+The -logips=1 arm is the positive control: it is what proves the line is still
+emitted, so the default arm cannot pass because the line went away."
+  (let* ((bl:*handshake-timeout-seconds* 0) ; the gate, not the process's age
+         (peer (%timed-out-handshake-peer))
+         (id (bl.net:peer-id peer))
+         (default (%logged-net-lines
+                   (lambda () (bl.net:check-handshake-timeout peer))))
+         (with-ips (%logged-net-lines
+                    (lambda () (bl.net:check-handshake-timeout peer))
+                    :log-ips t)))
+    ;; The verdict itself is unchanged by any of this.
+    (is (eq :disconnect (bl.net:check-handshake-timeout peer)))
+    ;; Default: the line is there, it names the peer, and it names it by id.
+    (is-true (search "version handshake timeout" default)
+             "the timeout line must still be emitted: ~S" default)
+    (is-true (search (format nil "disconnecting peer=~D" id) default)
+             "the line must name the peer by its numeric id: ~S" default)
+    (is-false (search "203.0.113.77" default)
+              "the peer's address must not reach the default log: ~S" default)
+    (is-false (search "peeraddr" default)
+              "no peeraddr field without -logips: ~S" default)
+    ;; -logips=1: Core's own spelling, a leading space and the whole address.
+    (is-true (search " peeraddr=203.0.113.77:8333" with-ips)
+             "-logips must put Core's peeraddr field back: ~S" with-ips)
+    (is-true (search (format nil "disconnecting peer=~D" id) with-ips)
+             "the id stays when the address is added: ~S" with-ips)))
+
+(test a-routine-peer-line-is-absent-from-the-default-level
+  "Core's second protection: the handshake-timeout line is
+LogDebug(BCLog::NET) (net.cpp:2051-2053), so raising -loglevel is what shows
+it, not the default. Ours was a WARN, which the default level admits."
+  (let ((bl:*handshake-timeout-seconds* 0)  ; the gate, not the process's age
+        (peer (%timed-out-handshake-peer)))
+    (is (string= "" (%logged-net-lines
+                     (lambda () (bl.net:check-handshake-timeout peer))
+                     :level :info))
+        "nothing about a peer's handshake timeout belongs in the default log")
+    ;; Control: at debug level the same call does write the line, so the
+    ;; assertion above cannot pass because the code path stopped running.
+    (is-true (search "version handshake timeout"
+                     (%logged-net-lines
+                      (lambda () (bl.net:check-handshake-timeout peer))))
+             "control: the line must exist at debug level")))
+
+(test misbehaviour-and-eviction-lines-carry-no-address
+  "The other two routine per-peer lines an attacker can drive at will: Core's
+Misbehaving is \"Misbehaving: peer=%d%s\" (net_processing.cpp:1901) and names
+no address at all, and an accepted inbound connection is announced as
+\"Added connection peer=%d\" unless -logips (net.cpp:4004-4009)."
+  (let* ((peer (bl.net:make-peer :state :ready :address "198.51.100.9:8333"))
+         (misbehaved (%logged-net-lines
+                      (lambda () (bl.net:record-misbehavior peer "bogus header"))))
+         (misbehaved-ips (%logged-net-lines
+                          (lambda ()
+                            (bl.net:record-misbehavior
+                             (bl.net:make-peer :state :ready
+                                               :address "198.51.100.9:8333")
+                             "bogus header"))
+                          :log-ips t)))
+    (is-true (search "Misbehaving: peer=" misbehaved)
+             "the misbehaviour line must still name the peer: ~S" misbehaved)
+    (is-true (search "bogus header" misbehaved))
+    (is-false (search "198.51.100.9" misbehaved)
+              "a misbehaving peer's address must not reach the log: ~S" misbehaved)
+    (is-true (search " peeraddr=198.51.100.9:8333" misbehaved-ips)
+             "control: -logips puts it back: ~S" misbehaved-ips))
+  ;; An accepted inbound connection: Core's else-branch, no address.
+  (let ((accepted (%logged-net-lines
+                   (lambda ()
+                     (bl.net:make-inbound-peer nil "192.0.2.44:8333")))))
+    (is-true (search "Added connection peer=" accepted)
+             "the accept line must still be emitted: ~S" accepted)
+    (is-false (search "192.0.2.44" accepted)
+              "an inbound peer's address must not reach the log: ~S" accepted)))

@@ -103,7 +103,7 @@ case ever exercised) has genesis for a root."
           :status :valid
           :tx-count 1)))))   ; genesis carries exactly its coinbase
 
-(defun %init-logging (data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-level-specs shrink-debug-file)
+(defun %init-logging (data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-ips log-level-specs shrink-debug-file)
   "Core AppInitMain Step 4a, application initialization: the log file and level,
 per-category thresholds, the deferred config lines, the operator hooks, the pid
 file and -debug / -debugexclude -- everything that must exist before the first
@@ -184,7 +184,11 @@ log line of the node itself."
   ;; dropped -debug=nett is an operator staring at a log that will never
   ;; contain what they asked for.
   (setf *log-time-micros* (and log-time-micros t)
-        *log-thread-names* (and log-thread-names t))
+        *log-thread-names* (and log-thread-names t)
+        ;; Core fLogIPs (init/common.cpp:57). Assigned on every start, not only
+        ;; when -logips was given: a restart in the same image must return to
+        ;; the default rather than inherit the previous node's answer.
+        *log-ips* (and log-ips t))
   (let ((enabled (apply-log-categories debug-categories debug-exclude)))
     (when enabled
       (log-info "Debug logging categories: ~{~A~^ ~}" enabled))))
@@ -1488,6 +1492,7 @@ per-process sync state and the at-tip liveness signal reset for this run."
                         (debug-exclude nil)
                         (log-time-micros nil)
                         (log-thread-names nil)
+                        (log-ips nil)
                         (shrink-debug-file :unset)
                         (test-activation-heights nil)
                         (vbparams nil)
@@ -1601,7 +1606,7 @@ Returns the node instance."
   ;; the rest.
   (%ensure-wallets-subdirectory data-directory network)
 
-  (%init-logging data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-level-specs shrink-debug-file)
+  (%init-logging data-directory network log-level log-file console-log pid-file block-notify shutdown-notify debug-categories debug-exclude log-time-micros log-thread-names log-ips log-level-specs shrink-debug-file)
   (%init-parameters network txindex blockfilterindex prune dbcache-mib mocktime test-activation-heights vbparams test-options coinstatsindex txospenderindex reindex-chainstate peer-block-filters port)
   (%init-datadir-layout data-directory network migrate-datadir)
   ;; Initialize node: the node struct and its databases; the chain itself is
