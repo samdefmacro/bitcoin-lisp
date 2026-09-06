@@ -854,7 +854,17 @@
   registers the whitelist inside HTTPReq_JSONRPC, not around `/rest/`),
   keyed by the user name CHECK-AUTH returns, and a batch is refused as a
   unit when any member is off the list. A method is registered by its
-  DEFINE-RPC form -- there is no list to forget it in. The REST interface and the web UI register their
+  DEFINE-RPC form -- there is no list to forget it in. Every call passes
+  Core's declared-argument TYPE GATE before any handler body runs
+  (`check-rpc-arg-types\', RPCHelpMan::HandleRequest): every declared
+  position is checked, all the mismatches are reported at once as
+  `Wrong type passed:\' plus a `Position N (name)\' object, and the types
+  are DATA generated from Core alongside the argument names, so a position
+  Core does not gate -- AMOUNT, RANGE, skip_type_check -- is not gated
+  here. Core's ARITY check (-1 with the help text for a count outside
+  [required, declared]) is NOT ported: it needs each argument's
+  required/optional fallback and the method's help text, which is the rest
+  of RPCHelpMan. The REST interface and the web UI register their
   HTTP surfaces with REGISTER-HTTP-SURFACE at the end of their files;
   the server never names them.
 
@@ -877,6 +887,8 @@
   (bitcoin-lisp.rpc:define-rpc macro)
   (bitcoin-lisp.rpc:register-rpc-method function)
   (bitcoin-lisp.rpc:dispatch-rpc-method function)
+  (bitcoin-lisp.rpc::check-rpc-arg-types function)
+  (bitcoin-lisp.rpc::*rpc-arg-types* variable)
   (bitcoin-lisp.rpc:set-rpc-warmup-status function)
   (bitcoin-lisp.rpc:finish-rpc-warmup function)
   (bitcoin-lisp.rpc::parse-json-rpc-request function)
@@ -1245,8 +1257,8 @@
 
   Every hash- or hex-valued ARGUMENT goes through `parse-hash-v\' /
   `parse-hex-v\', Core's ParseHashV/ParseHexV, carrying the argument name
-  Core's own call site uses ("hash" for getblockheader, "blockhash" for
-  getblock, "txid" for gettxout, "parameter 3" for getrawtransaction's
+  Core's own call site uses (`hash\' for getblockheader, `blockhash\' for
+  getblock, `txid\' for gettxout, `parameter 3\' for getrawtransaction's
   third): Core has exactly two sentences for a malformed hash and both echo
   the offending text, and every one of the eleven per-call-site spellings this
   tree used to carry was unmatched by any Core test. A -8 means MALFORMED; a
