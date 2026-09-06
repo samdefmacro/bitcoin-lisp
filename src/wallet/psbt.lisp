@@ -33,14 +33,6 @@
 
 ;;; --- createpsbt ---
 
-(defun %psbt-default-sequence (replaceable locktime)
-  "Default nSequence for a createpsbt input, matching Core: replaceable (default
-true) -> 0xfffffffd; explicit non-replaceable enforces the locktime -> 0xfffffffe
-when locktime>0, else 0xffffffff."
-  (cond (replaceable #xfffffffd)
-        ((> locktime 0) #xfffffffe)
-        (t #xffffffff)))
-
 (defun %psbt-build-unsigned-tx (inputs outputs locktime replaceable network)
   "Build an unsigned transaction from RPC INPUTS/OUTPUTS (Core createpsbt shape)."
   (unless (listp inputs)
@@ -54,7 +46,7 @@ when locktime>0, else 0xffffffff."
                   for txid = (bl.rpc:obj-get inp "txid")
                   for vout = (bl.rpc:obj-get inp "vout")
                   for seq = (or (bl.rpc:obj-get inp "sequence")
-                                (%psbt-default-sequence replaceable locktime))
+                                (bl.rpc:default-input-sequence replaceable locktime))
                   do (unless (bl.rpc:valid-hex-hash-p txid)
                        (error 'bl.rpc:rpc-error :code bl.rpc:+rpc-invalid-parameter+
                                          :message "Invalid input txid"))

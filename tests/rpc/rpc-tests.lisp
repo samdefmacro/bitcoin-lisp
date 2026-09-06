@@ -4246,13 +4246,10 @@ Core refuses re-serialized here as the other."
 
 (test rpc-decoderawtransaction-invalid-hex
   "Test decoderawtransaction with invalid hex returns error"
-  (let ((node (make-test-node)))
-    ;; Empty string
-    (signals bl.rpc:rpc-error
-      (bl.rpc::rpc-decoderawtransaction node '("")))
-    ;; Invalid hex characters
-    (signals bl.rpc:rpc-error
-      (bl.rpc::rpc-decoderawtransaction node '("zzzz")))))
+  ;; Empty string
+  (signals bl.rpc:rpc-error (decode-raw-tx ""))
+  ;; Invalid hex characters
+  (signals bl.rpc:rpc-error (decode-raw-tx "zzzz")))
 
 ;;; getrawtransaction tests
 
@@ -4448,8 +4445,10 @@ array / could error."
 ;;; the object-for-object corpus in its data/rpc_decodescript.json.
 
 (defun %decodescript (script-hex &key (network :testnet3))
-  "decodescript SCRIPT-HEX on a fresh minimal node of NETWORK; the result alist."
-  (bl.rpc::rpc-decodescript (make-test-node :network network) (list script-hex)))
+  "decodescript SCRIPT-HEX on a fresh minimal node of NETWORK, through the
+exported dispatcher; the result alist."
+  (bl.rpc:dispatch-rpc-method (make-test-node :network network)
+                              "decodescript" (list script-hex)))
 
 (defun %decodescript-field (result key)
   (cdr (assoc key result :test #'string=)))
@@ -4733,6 +4732,142 @@ nonstandard, so Core wraps it like any other nonstandard script."
         '(((("txid" . "0000000000000000000000000000000000000000000000000000000000000001")
             ("vout" . 0)))
           (("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" . -0.01)))))))
+
+(defparameter +crt-txid+
+  "0000000000000000000000000000000000000000000000000000000000000001"
+  "A syntactically valid outpoint hash for the createrawtransaction vectors.")
+
+(defun create-raw-tx (&rest params)
+  "createrawtransaction over the wire: PARAMS positionally, through the
+dispatcher and the request normalizer, so an empty array arrives as the
+sentinel and an explicit false as the false one."
+  (bl.rpc:dispatch-rpc-method
+   (make-test-node :network :regtest) "createrawtransaction"
+   (bl.rpc::%normalize-rpc-params (coerce params 'vector))))
+
+(defun crt-one-input (&key (sequence nil sequence-p))
+  (list (append (list (cons "txid" +crt-txid+) (cons "vout" 0))
+                (when sequence-p (list (cons "sequence" sequence))))))
+
+(defparameter +crt-data-output+ (list (cons "data" "00010203")))
+
+(defun crt-sequences (hex)
+  "The nSequence of every input of the transaction HEX encodes."
+  (map 'list #'bl.ser:tx-in-sequence
+       (bl.ser:transaction-inputs (bl.rpc:decode-hex-tx hex))))
+
+(defun crt-version (hex)
+  (bl.ser:transaction-version (bl.rpc:decode-hex-tx hex)))
+
+(test rpc-createrawtransaction-replaceable-defaults-to-true
+  "AddInputs computes nSequence as MAX_BIP125_RBF_SEQUENCE whenever
+`rbf.value_or(true)' (rpc/rawtransaction_util.cpp:47-56), and
+createrawtransaction leaves rbf as std::nullopt when the argument is absent --
+so 0xfffffffd is the DEFAULT. Only an explicit false falls through to
+0xfffffffe when a locktime is set, else 0xffffffff.
+
+Every one of these was 0xffffffff, which is the sharp end: an all-final
+transaction makes its own nLockTime unenforceable, so a caller who asked for a
+timelocked transaction got one that can be mined immediately -- with the
+locktime present in the serialization, which is what made it convincing."
+  (is (equal '(#xfffffffd) (crt-sequences
+                            (create-raw-tx (crt-one-input) +crt-data-output+))))
+  (is (equal '(#xfffffffd) (crt-sequences
+                            (create-raw-tx (crt-one-input) +crt-data-output+ 500))))
+  (is (equal '(#xfffffffd) (crt-sequences
+                            (create-raw-tx (crt-one-input) +crt-data-output+ 0 t))))
+  ;; Explicit false, no locktime: final.
+  (is (equal '(#xffffffff)
+             (crt-sequences (create-raw-tx (crt-one-input) +crt-data-output+ 0
+                                           bl.rpc:+json-false+))))
+  ;; Explicit false WITH a locktime: non-final, so the locktime still bites.
+  (let ((hex (create-raw-tx (crt-one-input) +crt-data-output+ 500
+                            bl.rpc:+json-false+)))
+    (is (equal '(#xfffffffe) (crt-sequences hex)))
+    (is (= 500 (bl.ser:transaction-lock-time (bl.rpc:decode-hex-tx hex)))))
+  ;; A sequence named in the input object still wins (Core :57-66).
+  (is (equal '(#x12345678)
+             (crt-sequences (create-raw-tx (crt-one-input :sequence #x12345678)
+                                           +crt-data-output+))))
+  (signals bl.rpc:rpc-error
+    (create-raw-tx (crt-one-input :sequence #x100000000) +crt-data-output+)))
+
+(test rpc-createrawtransaction-takes-a-version
+  "ConstructTransaction takes a version, defaulting to DEFAULT_RAWTX_VERSION =
+2 and refused outside TX_MIN_STANDARD_VERSION..TX_MAX_STANDARD_VERSION = 1..3
+(rawtransaction_util.cpp:157-161, policy.h:151-152). The argument was
+discarded, so a caller asking for version 3 (TRUC, with materially different
+relay policy) was handed a v2 transaction and told nothing."
+  (is (= 2 (crt-version (create-raw-tx (crt-one-input) +crt-data-output+))))
+  (is (= 1 (crt-version (create-raw-tx (crt-one-input) +crt-data-output+ 0 nil 1))))
+  (is (= 3 (crt-version (create-raw-tx (crt-one-input) +crt-data-output+ 0 nil 3))))
+  (dolist (bad '(0 4 99 -1))
+    (let ((e (handler-case
+                 (progn (create-raw-tx (crt-one-input) +crt-data-output+ 0 nil bad) nil)
+               (bl.rpc:rpc-error (e) e))))
+      (is-true e "version ~D accepted" bad)
+      (when e
+        (is (= -8 (bl.rpc:rpc-error-code e)))
+        (is (string= "Invalid parameter, version out of range(1~3)"
+                     (bl.rpc:rpc-error-message e))
+            "version ~D: wrong message" bad)))))
+
+(test rpc-createrawtransaction-refuses-contradicting-sequences
+  "ConstructTransaction's last check (:167-169): an EXPLICIT replaceable=true
+whose supplied sequences do not signal opt-in is a contradiction, not a silent
+override. This is the reason Core keeps rbf as an optional rather than a bool."
+  (let ((e (handler-case
+               (progn (create-raw-tx (crt-one-input :sequence #xffffffff)
+                                     +crt-data-output+ 0 t)
+                      nil)
+             (bl.rpc:rpc-error (e) e))))
+    (is-true e "a final sequence with replaceable=true was accepted")
+    (when e
+      (is (= -8 (bl.rpc:rpc-error-code e)))
+      (is (string= "Invalid parameter combination: Sequence number(s) contradict replaceable option"
+                   (bl.rpc:rpc-error-message e)))))
+  ;; Not an error when replaceable was merely OMITTED, which is the whole
+  ;; point of the optional -- and not an error for a signalling sequence.
+  (is (equal '(#xffffffff)
+             (crt-sequences (create-raw-tx (crt-one-input :sequence #xffffffff)
+                                           +crt-data-output+))))
+  (is (equal '(#xfffffffd)
+             (crt-sequences (create-raw-tx (crt-one-input :sequence #xfffffffd)
+                                           +crt-data-output+ 0 t)))))
+
+(test rpc-createrawtransaction-accepts-zero-inputs
+  "AddInputs treats a null or empty inputs array as zero inputs and loops zero
+times (rawtransaction_util.cpp:25-33); ConstructTransaction imposes no minimum.
+createrawtransaction([], {...}) is the standard way to build an unsigned
+funding template and appears at 33 call sites across Core's functional tests.
+The handler opened with a length check, so BOTH spellings were a hard -8
+`Invalid inputs' -- and because the check ran before the outputs were parsed,
+every outputs diagnostic rpc_rawtransaction.py:293-302 drives through an empty
+inputs array answered that same wrong message."
+  (dolist (empty (list #() nil))
+    (let ((hex (create-raw-tx empty +crt-data-output+)))
+      (is (= 0 (length (bl.ser:transaction-inputs (bl.rpc:decode-hex-tx hex)))))
+      (is (= 1 (length (bl.ser:transaction-outputs (bl.rpc:decode-hex-tx hex)))))))
+  ;; Anything that is not an array is Core's -3 type error.
+  (dolist (bad (list "nope" 7))
+    (let ((e (handler-case (progn (create-raw-tx bad +crt-data-output+) nil)
+               (bl.rpc:rpc-error (e) e))))
+      (is-true e "~S accepted as an inputs array" bad)
+      (when e (is (= -3 (bl.rpc:rpc-error-code e))))))
+  ;; The outputs diagnostics, now reachable (rpc_rawtransaction.py:293-302).
+  (flet ((outputs-error (outputs)
+           (handler-case (progn (create-raw-tx #() outputs) nil)
+             (bl.rpc:rpc-error (e) (bl.rpc:rpc-error-message e)))))
+    (is (string= "Data must be hexadecimal string"
+                 (outputs-error (list (cons "data" "zz")))))
+    (is (string= "Invalid Bitcoin address: nosuchaddress"
+                 (outputs-error (list (cons "nosuchaddress" 1)))))
+    (is (string= "Amount out of range"
+                 (outputs-error (list (cons "mp52VuXfTKhzYpuR3jLvPEYYUCWt84J7D5" -1)))))
+    (is (string= "Invalid parameter, duplicated address: mp52VuXfTKhzYpuR3jLvPEYYUCWt84J7D5"
+                 (outputs-error
+                  (list (list (cons "mp52VuXfTKhzYpuR3jLvPEYYUCWt84J7D5" 1))
+                        (list (cons "mp52VuXfTKhzYpuR3jLvPEYYUCWt84J7D5" 1))))))))
 
 ;;; --- gettxoutsetinfo Tests ---
 
