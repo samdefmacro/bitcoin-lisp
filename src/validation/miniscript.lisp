@@ -1293,8 +1293,20 @@ but a node whose type is zero."))
   (bl.crypto:hex-to-bytes string))
 
 (defun %ms-parse-number (string what)
-  (let ((n (handler-case (parse-integer string) (error () nil))))
-    (unless (and n (<= 0 n #xFFFFFFFF))
+  "The text of a numeric argument as a number.
+
+Core reads every miniscript number with ToIntegral<int64_t> over the exact
+argument span (miniscript.h:1882, :2023, :2030, :2041), and ToIntegral
+(util/strencodings.h:180-189) is std::from_chars plus a full-consumption
+check: ASCII digits and nothing else -- no sign, no whitespace, no partial
+parse. CL's PARSE-INTEGER accepts a leading `+' and surrounding whitespace,
+so after(+1) and after( 1 ) used to parse here and be refused by Core, and
+after(-1) was rejected only incidentally, by the range test below."
+  (unless (and (plusp (length string))
+               (every (lambda (c) (char<= #\0 c #\9)) string))
+    (%ms-fail "~A must be a number, got ~S" what string))
+  (let ((n (parse-integer string)))
+    (unless (<= 0 n #xFFFFFFFF)
       (%ms-fail "~A must be a number, got ~S" what string))
     n))
 
