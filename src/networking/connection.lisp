@@ -923,6 +923,11 @@ healthy peers whenever a pump cycle ran long."
     ;; but a wide net also swallows OUR bugs as "the peer went away". A type
     ;; error in this function once looked exactly like every peer hanging up at
     ;; once; say so instead of hiding it.
+    ;;
+    ;; The address stays ungated here: this fires only for a fault of OURS (a
+    ;; non-I/O condition out of our own decoder, reported with a backtrace),
+    ;; not for routine peer activity, and Core keeps the address on its own
+    ;; exceptional paths too (net.cpp:388, :1787).
     (error (c)
       (when (%recv-error-diagnosable-p c)
         (bl.log:log-warn

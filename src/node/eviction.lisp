@@ -31,8 +31,9 @@ by the sync thread, so PEERS stays single-writer."
           ((evict-least-valuable-inbound node)
            (push peer (node-peers node)))
           (t
-           (log-info "Inbound peer cap reached; dropping ~A"
-                     (bl.net:peer-address peer))
+           (log-cat "net"
+                    "failed to find an eviction candidate - connection dropped (full), ~A"
+                    (bl.net:disconnect-msg peer))
            (bl.net:disconnect-peer peer)))))))
 
 (defun evict-discouraged-inbound (node)
@@ -45,8 +46,8 @@ new inbound connection can take its slot. NIL if none are discouraged."
                                    (bl.net:peer-address p))))
                            (node-peers node))))
       (when victim
-        (log-info "Evicting discouraged inbound peer ~A to admit a new connection"
-                  (bl.net:peer-address victim))
+        (log-cat "net" "selected discouraged inbound connection for eviction, ~A"
+                 (bl.net:disconnect-msg victim))
         (setf (node-peers node) (remove victim (node-peers node)))
         (bl.net:disconnect-peer victim)
         t))))
@@ -338,8 +339,8 @@ AttemptToEvictConnection pass for pass."
       (when (cdr inbound)               ; need >1 so something stays protected
         (let ((victim (select-inbound-peer-to-evict inbound)))
           (when victim
-            (log-info "Evicting least-valuable inbound peer ~A to admit a new connection"
-                      (bl.net:peer-address victim))
+            (log-cat "net" "selected inbound connection for eviction, ~A"
+                     (bl.net:disconnect-msg victim))
             (setf (node-peers node) (remove victim (node-peers node)))
             (bl.net:disconnect-peer victim)
             t))))))

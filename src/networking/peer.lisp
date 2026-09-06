@@ -304,6 +304,23 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;;     whose blocks no connected peer serves.
   (last-common-block-hash nil))
 
+(defun peer-log-name (peer)
+  "How a log line names PEER: Core's `peer=%d%s' of GetId() and
+CNode::LogIP(fLogIPs) -- the numeric id always, the address only under -logips.
+
+The id is what getpeerinfo, getblockfrompeer and every other line about the
+same peer use, so it is the join key an operator already has; the address is
+one flag away and out of the default log, which is Core's privacy model
+(logging.h:28, net.cpp:704-707). Written once here rather than as an id and a
+LOG-IP argument at each of the thirty-odd call sites."
+  (format nil "peer=~D~A" (peer-id peer) (bl:log-ip (peer-address peer))))
+
+(defun disconnect-msg (peer)
+  "Core CNode::DisconnectMsg (net.cpp:709-714): \"disconnecting \" plus
+PEER-LOG-NAME. A caller with a reason of its own writes it as Core does,
+\"<reason>, ~A\"."
+  (format nil "disconnecting ~A" (peer-log-name peer)))
+
 ;;; Pending compact block reconstruction state
 (defstruct pending-compact-block
   "State for in-progress compact block reconstruction."
@@ -356,8 +373,9 @@ to decide whether the address is charged an addrman attempt at all
           (init-peer-rate-limiters peer)
           ;; Core logs this on every CNode it constructs, outbound and inbound
           ;; alike (net.cpp:4005-4007), and p2p_add_connections.py greps for it.
-          (bl:log-cat "net" "Added connection to ~A peer=~A"
-                                host (peer-id peer))
+          (if bl:*log-ips*
+              (bl:log-cat "net" "Added connection to ~A peer=~D" host (peer-id peer))
+              (bl:log-cat "net" "Added connection peer=~D" (peer-id peer)))
           peer)
         (values nil proxy-failed))))
 
@@ -466,7 +484,8 @@ slot was actually returned."
       (if (plusp *protected-outbound-count*)
           (decf *protected-outbound-count*)
           (bl:log-warn
-           "Outbound protection counter underflow releasing peer ~A" (peer-address peer)))
+           "Outbound protection counter underflow releasing ~A"
+           (peer-log-name peer)))
       t)))
 
 (defvar *peer-disconnect-hook* nil
@@ -637,16 +656,16 @@ RECEIVE-MESSAGE-BLOCKING instead."
             ;; the connection (see %abandon-receive for why).
             (unless (equalp (bl.ser:message-header-magic header)
                             bl.ser:*network-magic*)
-              (bl:log-warn "Bad message magic from peer ~A, disconnecting"
-                                     (peer-address peer))
+              (bl:log-cat "net" "Bad message magic from ~A, disconnecting"
+                          (peer-log-name peer))
               (disconnect-peer peer)
               (return-from receive-message nil))
             (when (> (bl.ser:message-header-payload-length header)
                      bl:+max-message-payload+)
-              (bl:log-warn "Oversized message from peer ~A: ~D bytes (max ~D), disconnecting"
-                                     (peer-address peer)
-                                     (bl.ser:message-header-payload-length header)
-                                     bl:+max-message-payload+)
+              (bl:log-cat "net" "Oversized message from ~A: ~D bytes (max ~D), disconnecting"
+                          (peer-log-name peer)
+                          (bl.ser:message-header-payload-length header)
+                          bl:+max-message-payload+)
               (disconnect-peer peer)
               (return-from receive-message nil))
             ;; Park it: the payload read below may span several more passes and
@@ -671,9 +690,9 @@ RECEIVE-MESSAGE-BLOCKING instead."
                     ;; caller's timeout is enough — but the connection is
                     ;; unusable either way, so drop it and let peer maintenance
                     ;; dial a replacement.
-                    (bl:log-warn "Incomplete ~A message from peer ~A, disconnecting"
-                                           (bl.ser:message-header-command header)
-                                           (peer-address peer))
+                    (bl:log-cat "net" "Incomplete ~A message from ~A, disconnecting"
+                                (bl.ser:message-header-command header)
+                                (peer-log-name peer))
                     (disconnect-peer peer)
                     (return-from receive-message nil))
                   ;; Verify checksum
@@ -692,9 +711,9 @@ RECEIVE-MESSAGE-BLOCKING instead."
                       ;; our own payload handling into node-wide peer churn.
                       ;; Bad MAGIC is the opposite case and does disconnect
                       ;; above, matching net.cpp:752-755.
-                      (bl:log-warn "Bad checksum on ~A from peer ~A, dropping message"
-                                             (bl.ser:message-header-command header)
-                                             (peer-address peer))
+                      (bl:log-cat "net" "Bad checksum on ~A from ~A, dropping message"
+                                  (bl.ser:message-header-command header)
+                                  (peer-log-name peer))
                       (return-from receive-message nil))
                     (let ((command (bl.ser:message-header-command header)))
                       (%account-message (peer-recv-per-msg peer) nil
@@ -890,8 +909,7 @@ txreconciliation.cpp:97-126 RegisterPeer). Disconnects PEER and returns NIL
 on a protocol violation; returns T otherwise (registered, or benignly
 ignored)."
   (flet ((violation (reason)
-           (bl:log-cat "net" "sendtxrcncl ~A — disconnecting peer ~A"
-                                 reason (peer-address peer))
+           (bl:log-cat "net" "sendtxrcncl ~A, ~A" reason (disconnect-msg peer))
            (disconnect-peer peer)
            nil))
     (cond
@@ -1154,13 +1172,16 @@ desirable set to limited peers, as in Core."
           ;; already spells out (manual and feeler peers exempt).
           (cond ((and (peer-outbound-or-block-relay-p peer)
                       (not (has-all-desirable-service-flags-p services near-tip)))
-                 (bl:log-info
-                  "Peer ~A does not offer the expected services (~8,'0x offered, ~8,'0x expected), disconnecting"
-                  (peer-address peer) services (desirable-service-flags services near-tip))
+                 (bl:log-cat "net"
+                             "peer does not offer the expected services ~
+                              (~8,'0x offered, ~8,'0x expected), ~A"
+                             services
+                             (desirable-service-flags services near-tip)
+                             (disconnect-msg peer))
                  nil)
                 ((< proto +min-peer-proto-version+)
-                 (bl:log-info "Peer ~A using obsolete version ~D, disconnecting"
-                                        (peer-address peer) proto)
+                 (bl:log-cat "net" "peer using obsolete version ~D, ~A"
+                             proto (disconnect-msg peer))
                  nil)
                 (t t)))))))
 
@@ -1215,8 +1236,8 @@ version handshake may proceed (over whichever transport), NIL to give up."
     (cond
       ((v2-transport-p result)
        (setf (connection-transport conn) result)
-       (bl:log-info "Peer ~A: v2 transport established (outbound)"
-                              (peer-address peer))
+       (bl:log-info "v2 transport established (outbound), ~A"
+                    (peer-log-name peer))
        t)
       ((eq result :fallback-v1)
        (let ((fresh (make-tcp-connection (connection-host conn)
@@ -1224,8 +1245,8 @@ version handshake may proceed (over whichever transport), NIL to give up."
          (when fresh
            (close-connection conn)
            (setf (peer-connection peer) fresh)
-           (bl:log-info "Peer ~A: no v2 response, reconnected as v1"
-                                  (peer-address peer))
+           (bl:log-info "no v2 response, reconnected as v1, ~A"
+                        (peer-log-name peer))
            t))))))
 
 (defun perform-handshake (peer &key (try-v2 (v2-available-p))
@@ -1271,8 +1292,8 @@ stall. Returns T on success."
     (let ((detected (v2-detect-inbound (peer-connection peer) :timeout timeout)))
       (cond ((v2-transport-p detected)
              (setf (connection-transport (peer-connection peer)) detected)
-             (bl:log-info "Peer ~A: v2 transport established (inbound)"
-                                    (peer-address peer)))
+             (bl:log-cat "net" "v2 transport established (inbound), ~A"
+                         (peer-log-name peer)))
             ((eq detected :v1))         ; sniffed bytes pushed back; proceed v1
             (t (return-from perform-inbound-handshake nil)))))
   (setf (peer-local-nonce peer) (%fresh-local-nonce))
@@ -1284,6 +1305,11 @@ stall. Returns T on success."
        ;; PushNodeVersion (:3664). The disconnect is SILENT: no ban, no
        ;; discouragement, no misbehaviour score. Scoring it would be actively
        ;; harmful, since the address being punished is our own.
+       ;;
+       ;; This is one of the two places Core prints an address with no -logips
+       ;; gate: LogInfo("connected to self at %s, disconnecting",
+       ;; net_processing.cpp:3651), like net.cpp:388 and :1787. Exceptional
+       ;; paths, and the address here is OURS. Matched, not special-cased.
        (cond ((%detected-self-connection-p peer)
               (bl:log-info "Peer ~A: connected to self, disconnecting"
                                      (peer-address peer))
@@ -1311,7 +1337,7 @@ on the local onion-service listener (Tor forwarding), whose true network is
                          :connect-time (get-internal-real-time))))
     (init-peer-rate-limiters peer)
     ;; Core's inbound branch has no address in the line (net.cpp:4009).
-    (bl:log-cat "net" "Added connection peer=~A" (peer-id peer))
+    (bl:log-cat "net" "Added connection peer=~D" (peer-id peer))
     peer))
 
 ;;; --- BIP133 feefilter (Core MaybeSendFeefilter + FeeFilterRounder) ---
@@ -1569,10 +1595,10 @@ SHOULD-RUN-INACTIVITY-CHECKS-P rather than recomputing the same arithmetic."
   (if (and (member (peer-state peer) '(:connected :connecting :handshaking))
            (should-run-inactivity-checks-p peer))
       (progn
-        (bl:log-warn "Handshake timeout for peer ~A (~,1Fs elapsed)"
-                     (peer-address peer)
-                     (/ (float (- (get-internal-real-time) (peer-connect-time peer)))
-                        (float internal-time-units-per-second)))
+        (bl:log-cat "net" "version handshake timeout: ~,1Fs elapsed, ~A"
+                    (/ (float (- (get-internal-real-time) (peer-connect-time peer)))
+                       (float internal-time-units-per-second))
+                    (disconnect-msg peer))
         :disconnect)
       :ok))
 
@@ -1646,9 +1672,9 @@ then MaybeSendPing (MAYBE-SEND-PING)."
         ;; window (Core InactivityCheck "socket sending timeout", narrowed by
         ;; the pending-data test to the backpressure case).
         (when (connection-send-stalled-p conn)
-          (bl:log-warn "Peer ~A socket sending timeout (~D unsent bytes)"
-                       (peer-address peer)
-                       (connection-send-queue-bytes conn))
+          (bl:log-cat "net" "socket sending timeout: ~D unsent bytes, ~A"
+                      (connection-send-queue-bytes conn)
+                      (disconnect-msg peer))
           (return-from check-peer-health :disconnect))
         (let ((reason (inactivity-check-reason conn)))
           (when reason
@@ -1776,8 +1802,8 @@ logged. Returns T, or NIL when PEER was left alone -- because it holds the
 noban permission, or because it is a MANUAL connection; Core exempts both,
 independently."
   (when reason
-    (bl:log-cat "net" "Misbehaving peer ~A: ~A"
-                          (peer-address peer) reason))
+    (bl:log-cat "net" "Misbehaving: ~A: ~A"
+                (peer-log-name peer) reason))
   ;; NoBan: neither discouraged NOR disconnected (Core
   ;; MaybeDiscourageAndDisconnect, net_processing.cpp — a noban peer's
   ;; m_should_discourage is cleared and the connection kept). The whole point
@@ -1785,8 +1811,8 @@ independently."
   ;; opinion of its behaviour, so stopping at "not discouraged" while still
   ;; dropping the connection would not deliver the option.
   (when (peer-has-permission-p peer +perm-noban+)
-    (bl:log-cat "net" "Not punishing whitelisted peer ~A"
-                          (peer-address peer))
+    (bl:log-cat "net" "Not punishing whitelisted ~A"
+                (peer-log-name peer))
     (return-from record-misbehavior nil))
   ;; Core's SECOND exemption, and it is INDEPENDENT of the first
   ;; (net_processing.cpp:5187-5190): "We never disconnect or discourage manual
@@ -1813,8 +1839,8 @@ independently."
   ;; inbound admission and eviction, and granting a manual peer NoBan would
   ;; exempt it from those too, which Core does not do.
   (when (peer-manual peer)
-    (bl:log-warn "Not punishing manually connected peer ~A"
-                 (peer-address peer))
+    (bl:log-warn "Not punishing manually connected ~A"
+                 (peer-log-name peer))
     (return-from record-misbehavior nil))
   ;; Core MaybeDiscourageAndDisconnect (net_processing.cpp:5194-5201):
   ;; disconnect a local peer for bad behaviour but do NOT discourage it,

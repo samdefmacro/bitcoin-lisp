@@ -166,8 +166,8 @@ know or a peer that exceeded its rate limit (and was disconnected)."
     (let ((handler (p2p-handler-for command)))
       ;; Check per-peer rate limit before processing
       (unless (check-peer-rate-limit peer command handler)
-        (bl:log-warn "Rate limit exceeded for peer ~A on ~A messages"
-                     (peer-address peer) command)
+        (bl:log-warn "Rate limit exceeded on ~A messages, ~A"
+                     command (disconnect-msg peer))
         (disconnect-peer peer)
         (return-from handle-message nil))
       (cond ((null handler) nil)          ; Unknown message
@@ -186,7 +186,8 @@ know or a peer that exceeded its rate limit (and was disconnected)."
   (let ((nonce (bl.bytes:with-byte-reader (s payload)
                  (bl.bytes:br-read-u64-le s))))
     (bl:log-debug "ping from ~A: ~D payload bytes, nonce ~D"
-                  (peer-address peer) (length payload) nonce)
+                  (peer-log-name peer)
+                  (length payload) nonce)
     (reply-to-ping peer nonce)))
 
 (define-p2p-handler "pong" (peer payload ctx)
@@ -218,14 +219,12 @@ Core also refuses a permitted request once -maxuploadtarget is spent
 (:4953), and does not disconnect a noban peer for it either."
   (cond
     ((not (peer-has-permission-p peer +perm-mempool+))
-     (bl:log-cat
-      "net" "mempool request with bloom filters disabled — disconnecting peer ~A"
-      (peer-address peer))
+     (bl:log-cat "net" "mempool request with bloom filters disabled, ~A"
+                 (disconnect-msg peer))
      (disconnect-peer peer))
     ((outbound-target-reached-p nil)
-     (bl:log-cat
-      "net" "mempool request with bandwidth limit reached from ~A"
-      (peer-address peer))
+     (bl:log-cat "net" "mempool request with bandwidth limit reached, ~A"
+                 (disconnect-msg peer))
      (unless (peer-has-permission-p peer +perm-noban+)
        (disconnect-peer peer)))
     (t (handle-mempool-request peer payload ctx))))
@@ -1146,8 +1145,8 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
            ;; mainnet default, block-relay/feeler conns): disconnect (Core
            ;; net_processing.cpp:4168-4172).
            (when reject-tx-invs
-             (bl:log-cat "net" "transaction inv sent in violation of protocol — disconnecting peer ~A"
-                                   (peer-address peer))
+             (bl:log-cat "net" "transaction inv sent in violation of protocol, ~A"
+                         (disconnect-msg peer))
              (disconnect-peer peer)
              (return-from handle-inv))
            ;; Ignore invs that don't match the wtxidrelay negotiation: a
@@ -1201,9 +1200,9 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
                     ;; (net_processing.cpp:6207).
                     (push (tx-request-inv hash wtxidp peer) wanted))))))))))
     (when unknown-block-hash
-      (bl:log-cat "net" "inv: unknown block ~A from peer ~A — sending getheaders"
-                              (bl.crypto:bytes-to-hex unknown-block-hash)
-                              (peer-address peer))
+      (bl:log-cat "net" "inv: unknown block ~A from ~A — sending getheaders"
+                  (bl.crypto:bytes-to-hex unknown-block-hash)
+                  (peer-log-name peer))
       (request-headers-for-ibd peer chain-state))
     (when wanted
       (send-message peer
@@ -1789,8 +1788,9 @@ the number stored."
         (incf (peer-addr-processed peer) num-proc)
         (incf (peer-addr-rate-limited peer) num-rate-limit)
         (when (plusp num-rate-limit)
-          (bl:log-cat "net" "addr from peer ~A: ~D processed, ~D rate-limited"
-                                (peer-address peer) num-proc num-rate-limit))
+          (bl:log-cat "net" "addr: ~D processed, ~D rate-limited, ~A"
+                      num-proc num-rate-limit
+                      (peer-log-name peer)))
         ;; A non-full message answers our getaddr (Core: "if (vAddr.size() <
         ;; 1000) peer.m_getaddr_sent = false", net_processing.cpp:4116).
         (when (< announced-count bl.ser:+max-addr-count+)
@@ -1801,8 +1801,8 @@ the number stored."
         ;; so a peer that merely self-announces does not end the fetch.
         (when (and (eq (peer-conn-type peer) :addr-fetch)
                    (> announced-count 1))
-          (bl:log-cat "net" "addrfetch connection completed, disconnecting ~A"
-                                (peer-address peer))
+          (bl:log-cat "net" "addrfetch connection completed, ~A"
+                      (disconnect-msg peer))
           (disconnect-peer peer)))
       (when (and peers unsolicited (<= announced-count 10))
         (loop for (pa . reachable) in relay-candidates
@@ -1820,8 +1820,8 @@ net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
 (net_processing.cpp:4046-4050)."
   (bl.ctx:with-node-context (address-book peers) ctx
   (when (and peer (eq (peer-conn-type peer) :block-relay))
-    (bl:log-cat "net" "ignoring addr message from block-relay-only peer ~A"
-                          (peer-address peer))
+    (bl:log-cat "net" "ignoring addr message from block-relay-only ~A"
+                (peer-log-name peer))
     (return-from handle-addr 0))
   ;; First addr-related message from an inbound peer enables address relay
   ;; (Core SetupAddressRelay; getpeerinfo addr_relay_enabled).
@@ -1859,8 +1859,8 @@ Misbehaving path — the caller disconnects). Ignored entirely from a
 block-relay-only peer (Core SetupAddressRelay)."
   (bl.ctx:with-node-context (address-book peers) ctx
   (when (and peer (eq (peer-conn-type peer) :block-relay))
-    (bl:log-cat "net" "ignoring addrv2 message from block-relay-only peer ~A"
-                          (peer-address peer))
+    (bl:log-cat "net" "ignoring addrv2 message from block-relay-only ~A"
+                (peer-log-name peer))
     (return-from handle-addrv2 0))
   ;; First addr-related message from an inbound peer enables address relay
   ;; (Core SetupAddressRelay; getpeerinfo addr_relay_enabled).
@@ -2257,8 +2257,8 @@ CTX's recent-rejects, when present, caches recently rejected txs."
   (when (or (and (ignore-incoming-txs-p)
                  (not (peer-has-permission-p peer +perm-relay+)))
             (not (peer-relays-txs-p peer)))
-    (bl:log-cat "net" "transaction sent in violation of protocol — disconnecting peer ~A"
-                          (peer-address peer))
+    (bl:log-cat "net" "transaction sent in violation of protocol, ~A"
+                (disconnect-msg peer))
     (disconnect-peer peer)
     (return-from handle-tx nil))
   ;; "Stop processing the transaction early if we are still in IBD since we
@@ -2657,9 +2657,9 @@ from DRAIN-AND-REAP-PEER before it decides whether to read that peer at all."
                  ((and entry (not (%block-request-allowed-p chain-state entry
                                                             (best-header))))
                   (bl:log-cat
-                   "net" "getdata: ignoring request from ~A for an old block ~
-                          that is not on the main chain"
-                   (peer-address peer)))
+                   "net" "getdata: ignoring request from ~A for an old ~
+                          block that is not on the main chain"
+                   (peer-log-name peer)))
                  ;; -maxuploadtarget: stop serving HISTORICAL blocks once the
                  ;; 24h budget (less a buffer big enough to still relay every
                  ;; new block) is spent, and disconnect the asker — Core
@@ -2678,9 +2678,8 @@ from DRAIN-AND-REAP-PEER before it decides whether to read that peer at all."
                                  (et (btime entry)))
                              (and bt et
                                   (> (- bt et) +historical-block-age-seconds+))))))
-                  (bl:log-cat
-                   "net" "historical block serving limit reached, disconnecting ~A"
-                   (peer-address peer))
+                  (bl:log-cat "net" "historical block serving limit reached, ~A"
+                              (disconnect-msg peer))
                   (disconnect-peer peer)
                   (return))
                  ;; Prune-height leak: refuse AND disconnect, as Core does —
@@ -2688,9 +2687,9 @@ from DRAIN-AND-REAP-PEER before it decides whether to read that peer at all."
                  ;; instead of re-routing the request.
                  ((and entry (%below-network-limited-threshold-p chain-state entry))
                   (bl:log-cat
-                   "net" "getdata: block request below the NODE_NETWORK_LIMITED ~
-                          threshold from ~A; disconnecting"
-                   (peer-address peer))
+                   "net" "Ignore block request below NODE_NETWORK_LIMITED ~
+                          threshold, ~A"
+                   (disconnect-msg peer))
                   (disconnect-peer peer)
                   (return))
                  (t
@@ -3178,10 +3177,10 @@ IsAddrCompatible test."
         (if firstp
             (let ((msg (build-addr-response peer (list pa))))
               (when (and msg (send-message peer msg))
-                (bl:log-cat "net" "Advertising address ~A:~D to peer ~A"
+                (bl:log-cat "net" "Advertising address ~A:~D to ~A"
                             (peer-address-string pa)
                             (peer-address-port pa)
-                            (peer-address peer))
+                            (peer-log-name peer))
                 t))
             (push-address peer pa))))))
 
@@ -3405,7 +3404,7 @@ send it back."
         (send-message peer (recon-respond-to-request peer their-size q)))
     (error (e)
       (bl:log-cat "txreconciliation" "reqrecon from ~A failed: ~A"
-                            (peer-address peer) e))))
+                  (peer-log-name peer) e))))
 
 (defun %handle-sketch (peer payload)
   "The responder's sketch arrived. Merge it with ours and either announce the
@@ -3436,7 +3435,7 @@ answer or ask for an extension."
                (%announce-wtxids peer (recon-abandon-round peer))))))
       (error (e)
         (bl:log-cat "txreconciliation" "sketch from ~A failed: ~A"
-                              (peer-address peer) e)
+                    (peer-log-name peer) e)
         (%announce-wtxids peer (recon-abandon-round peer))))))
 
 (defun %handle-reqsketchext (peer)
@@ -3475,7 +3474,7 @@ in the set for the life of the connection."
           (when set (recon-set-clear-snapshot set))))
     (error (e)
       (bl:log-cat "txreconciliation" "reconcildiff from ~A failed: ~A"
-                            (peer-address peer) e))))
+                  (peer-log-name peer) e))))
 
 (defun %announce-wtxids (peer wtxids)
   "Queue WTXIDS for ordinary announcement to PEER. Reconciliation decides WHAT
@@ -4013,8 +4012,9 @@ getpeerinfo's bip152_hb_from stuck at T for the life of such a connection."
     (when (= version +compact-blocks-version+)
       (setf (peer-compact-block-version peer) version)
       (setf (peer-compact-block-high-bandwidth peer) high-bandwidth))
-    (bl:log-debug "Peer ~A sendcmpct v~D (high-bw: ~A)"
-                            (peer-address peer) version high-bandwidth)))
+    (bl:log-debug "sendcmpct v~D (high-bw: ~A) ~A"
+                  version high-bandwidth
+                  (peer-log-name peer))))
 
 ;;; Short ID map building
 
@@ -4426,7 +4426,8 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
          ;; punishment.
          (bl:log-cat
           "net" "cmpctblock ~A from ~A: already known and no better than our tip"
-          (bl.crypto:bytes-to-hex block-hash) (peer-address peer))
+          (bl.crypto:bytes-to-hex block-hash)
+          (peer-log-name peer))
          (return-from handle-cmpctblock nil))
         (:low-work
          ;; Core "Ignoring low-work compact block from peer %d" (:4581):
@@ -4434,14 +4435,15 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
          ;; chain is far behind ours relays such blocks in good faith.
          (bl:log-cat
           "net" "cmpctblock ~A from ~A: ignoring low-work compact block"
-          (bl.crypto:bytes-to-hex block-hash) (peer-address peer))
+          (bl.crypto:bytes-to-hex block-hash)
+          (peer-log-name peer))
          (return-from handle-cmpctblock nil))
         (:no-parent
          (bl:log-cat "net"
-                               "cmpctblock ~A: parent ~A not in index — getheaders to ~A"
-                               (bl.crypto:bytes-to-hex block-hash)
-                               (bl.crypto:bytes-to-hex prev-hash)
-                               (peer-address peer))
+                     "cmpctblock ~A: parent ~A not in index — getheaders to ~A"
+                     (bl.crypto:bytes-to-hex block-hash)
+                     (bl.crypto:bytes-to-hex prev-hash)
+                     (peer-log-name peer))
          ;; Core gates the getheaders on !IsInitialBlockDownload(): during IBD
          ;; the header sync owns the locator and an extra request is noise.
          (unless (initial-block-download-p chain-state)
@@ -4468,7 +4470,8 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
           ((equalp (pending-compact-block-block-hash pending) block-hash)
            (bl:log-cat
             "net" "cmpctblock ~A from ~A: already syncing this compact block"
-            (bl.crypto:bytes-to-hex block-hash) (peer-address peer))
+            (bl.crypto:bytes-to-hex block-hash)
+            (peer-log-name peer))
            (return-from handle-cmpctblock nil))
           (t (setf (peer-pending-compact-block peer) nil)))))
 

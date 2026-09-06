@@ -244,6 +244,23 @@
   the message and THEN wraps it in single quotes, which is what makes the
   quoting safe -- the safe character set holds no quote.
 
+  A PEER'S ADDRESS is not in the default log. `*log-ips*` is Core's
+  fLogIPs, off unless `-logips` says otherwise, and `log-ip` is
+  CNode::LogIP: a leading space and then `peeraddr=<addr>` when it is on,
+  and the empty string when it is not. Every routine per-peer line names
+  the peer through `peer-log-name`, Core's `peer=%d%s` of GetId() and
+  LogIP -- the id getpeerinfo and getblockfrompeer use, and the address
+  only under the flag -- so debug.log, the file an operator attaches to a
+  bug report, is not a dated record of who connected. `disconnect-msg`
+  (net.cpp:709-714) is the string every disconnect line is written from:
+  the word `disconnecting`, a space, and `peer-log-name`; a caller with a
+  reason of its own puts that reason and a comma in front of it. The
+  second half of Core's protection is the LEVEL: the routine lines are
+  LogDebug(BCLog::NET), so they belong in `log-cat` under the `net`
+  category and not at :info or :warn. Core's two deliberate exceptions --
+  an address printed unconditionally on an exceptional path (net.cpp:388,
+  :1787) -- are matched, not special-cased.
+
   Traps: option parsing runs BEFORE debug.log exists. A line logged there
   goes to the console only and is invisible to any test that asserts on
   the log; use `defer-log`, and `flush-deferred-log-lines` replays the
@@ -257,6 +274,8 @@
   (bitcoin-lisp.logging:log-error macro)
   (bitcoin-lisp.logging:log-debug macro)
   (bitcoin-lisp.logging:log-cat macro)
+  (bitcoin-lisp.logging:log-ip function)
+  (bitcoin-lisp.logging:*log-ips* variable)
   (bitcoin-lisp.logging:node-log function)
   (bitcoin-lisp.logging:defer-log function)
   (bitcoin-lisp.logging:flush-deferred-log-lines function)
@@ -826,6 +845,8 @@
   (bitcoin-lisp.networking:peer class)
   (bitcoin-lisp.networking:connect-peer function)
   (bitcoin-lisp.networking:disconnect-peer function)
+  (bitcoin-lisp.networking:disconnect-msg function)
+  (bitcoin-lisp.networking:peer-log-name function)
   (bitcoin-lisp.networking:handle-message function)
   (bitcoin-lisp.networking:define-p2p-handler macro)
   (bitcoin-lisp.networking:p2p-handler-for function)

@@ -1296,6 +1296,37 @@ than on the flags, since the flag existing is not the feature."
         named-warn)
     (is-true (search "[warning] hello" named-warn))))
 
+(test logips-is-a-real-option-now
+  "GA11 559c86ad. `logips' was a DEFINE-CORE-ONLY-OPTIONS row: accepted, named
+once in the startup warning, never read -- so -logips=0 could not turn off
+what -logips=1 could not turn on, and the addresses were in the log either way.
+Core reads it with GetBoolArg and DEFAULT_LOGIPS is false (logging.h:28,
+init/common.cpp:57), which is the DEFAULT the node has to reproduce.
+
+A :KEY row rather than a :GLOBAL one: a :GLOBAL row is assigned only when the
+option is present, and this flag must return to its default on every start."
+  (multiple-value-bind (plist merged) (start-node-plist '("-regtest" "-logips=1"))
+    ;; It reaches START-NODE, and it is no longer reported as merely accepted.
+    (is (eq t (getf plist :log-ips)))
+    (is (null (bl.cfg:supplied-core-only-options merged))))
+  ;; -logips=0 is now a real off switch rather than an ignored string.
+  (is (eq nil (getf (start-node-plist '("-regtest" "-logips=0")) :log-ips)))
+  ;; And the default is off, which is the whole privacy model.
+  (is (eq nil (getf (start-node-plist '("-regtest")) :log-ips))))
+
+(test log-ip-is-cores-peeraddr-field
+  "Core CNode::LogIP (net.cpp:704-707) is \" peeraddr=<addr>\" or \"\", with the
+leading space, so a caller appends it to a line already ending in peer=<id> and
+gets Core's spacing either way. NIL -- a peer reaped before its address was
+recorded -- is the empty string too, never \" peeraddr=NIL\"."
+  (let ((bl.log:*log-ips* nil))
+    (is (string= "" (bl.log:log-ip "203.0.113.77:8333")))
+    (is (string= "" (bl.log:log-ip nil))))
+  (let ((bl.log:*log-ips* t))
+    (is (string= " peeraddr=203.0.113.77:8333"
+                 (bl.log:log-ip "203.0.113.77:8333")))
+    (is (string= "" (bl.log:log-ip nil)))))
+
 (test relay-policy-knobs-take-effect
   "-dustrelayfee, -incrementalrelayfee and -bytespersigop are relay POLICY, not
 consensus, and Core exposes all three. Ours were compiled-in constants, so a

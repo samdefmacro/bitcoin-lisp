@@ -125,6 +125,8 @@ headerssync.cpp. src/networking/.")
    #:peer-last-inv-sequence
    #:peer-getaddr-sent
    #:connect-peer
+   #:disconnect-msg
+   #:peer-log-name
    #:disconnect-peer
    #:make-inbound-peer
    #:send-message

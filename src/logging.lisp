@@ -21,6 +21,7 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
    #:*log-rate-window-start*
    #:*log-stream*
    #:*log-suppressions-active*
+   #:*log-ips*
    #:*log-thread-names*
    #:*alert-notify-command*
    #:*client-version-is-release*
@@ -41,6 +42,7 @@ caller keeps writing log-info (or the bl-prefixed spelling) unchanged.")
    #:log-debug
    #:log-error
    #:log-info
+   #:log-ip
    #:log-level-value
    #:log-warn
    #:node-log
@@ -420,6 +422,29 @@ success, NIL if CATEGORY is unknown (Bitcoin Core DisableCategory)."
 (defvar *log-thread-names* nil
   "Prefix each log line with the writing thread's name (Core -logthreadnames).
 Core prints it as [threadname] after the timestamp.")
+
+(defvar *log-ips* nil
+  "Include peer addresses in log output (Core fLogIPs, logging.h:35 and
+logging.cpp:47, set from -logips with DEFAULT_LOGIPS false, logging.h:28 and
+init/common.cpp:34,57).
+
+Default OFF, and that default is the privacy model: debug.log is the file an
+operator attaches to a bug report, hands to support and keeps in backups, so
+Core made the record of who connected to the node opt-in. Every routine
+per-peer line names the peer by its numeric id and reaches its address only
+through LOG-IP.")
+
+(defun log-ip (address)
+  "Core CNode::LogIP (net.cpp:704-707): \" peeraddr=<address>\" when *LOG-IPS*
+is on, and the empty string otherwise -- the leading space included, so a caller
+appends it to a line that already ends in peer=<id> and gets Core's spacing
+either way.
+
+ADDRESS may be NIL (a peer reaped before its address was recorded); that is the
+empty string too, not \" peeraddr=NIL\"."
+  (if (and *log-ips* address)
+      (format nil " peeraddr=~A" address)
+      ""))
 
 (defun apply-log-categories (include exclude)
   "Enable the categories in INCLUDE and then disable those in EXCLUDE, the order
