@@ -7,6 +7,18 @@
 
 ;;;; Checkpoint Tests
 
+(defun %ibd-ctx ()
+  "A fresh IBD context, the way START-IBD builds one."
+  (bl.net::make-ibd-context))
+
+(defun %ibd ()
+  "A fresh IBD context with the start time stamped (BL.NET's own MAKE-IBD)."
+  (bl.net::make-ibd))
+
+(defun %sendtxrcncl (peer payload)
+  "Drive the shipped BIP330 sendtxrcncl branch of the handshake window."
+  (bl.net::%handle-handshake-sendtxrcncl peer payload))
+
 (test checkpoint-data-exists
   "Test that testnet checkpoint data is defined."
   (is (not (null (bl.net:network-checkpoints :testnet3))))
@@ -72,7 +84,7 @@
 
 (test ibd-context-creation
   "Test creating an IBD context."
-  (let ((ctx (bl.net::make-ibd)))
+  (let ((ctx (%ibd)))
     (is (not (null ctx)))
     (is (eq :idle (bl.net::ibd-context-state ctx)))
     (is (= 0 (bl.net:ibd-context-headers-received ctx)))
@@ -159,7 +171,7 @@
 (test note-block-wire-size-ema
   "note-block-wire-size folds sizes in as a 0.9/0.1 integer EMA and
 ignores zero (unknown) sizes."
-  (let ((ctx (bl.net::make-ibd)))
+  (let ((ctx (%ibd)))
     (is (= (* 1024 1024)
            (bl.net::ibd-context-avg-block-wire-bytes ctx)))
     (bl.net::note-block-wire-size ctx (* 2 1024 1024))
@@ -179,7 +191,7 @@ ignores zero (unknown) sizes."
 (test stuck-tip-fires-when-queue-near-cap
   "When queue >= 90% of cap and tip hasn't advanced in
 +stuck-tip-halt-seconds+, check-stuck-tip returns T."
-  (let* ((ctx (bl.net::make-ibd))
+  (let* ((ctx (%ibd))
          (bl.net:*ibd-context* ctx)
          (cap bl.net::+max-block-queue-size+)
          (threshold (floor (* cap 9/10))))
@@ -200,7 +212,7 @@ if tip has been stalled past +stuck-tip-halt-seconds+. Test-bitcoin-
 server 2026-05-21 06:46–07:07 hit this 3 times in 21 min before a
 13-block reorg completed; the OOM backstop fired and forced peer
 rotation each cycle, slowing recovery."
-  (let* ((ctx (bl.net::make-ibd))
+  (let* ((ctx (%ibd))
          (bl.net:*ibd-context* ctx))
     ;; Plant 14 fork blocks (well below cap of 1024)
     (let ((q (bl.net:ibd-context-block-queue ctx)))
@@ -216,7 +228,7 @@ rotation each cycle, slowing recovery."
 pins the queue count at ~170 modern blocks, far below 90% of the 1024
 count cap, so a count-only near-cap check never fired. The halt must
 also trigger when queue BYTES are near +max-block-queue-bytes+."
-  (let* ((ctx (bl.net::make-ibd))
+  (let* ((ctx (%ibd))
          (bl.net:*ibd-context* ctx))
     ;; Small count (150 entries), bytes at the cap
     (let ((q (bl.net:ibd-context-block-queue ctx)))
@@ -232,7 +244,7 @@ also trigger when queue BYTES are near +max-block-queue-bytes+."
 (test stuck-tip-does-not-fire-when-tip-fresh
   "If tip advanced recently, check-stuck-tip never fires regardless of
 queue size."
-  (let* ((ctx (bl.net::make-ibd))
+  (let* ((ctx (%ibd))
          (bl.net:*ibd-context* ctx)
          (cap bl.net::+max-block-queue-size+))
     ;; Plant queue at cap
@@ -256,7 +268,7 @@ queue size."
 (test handle-peer-fin-disconnects-on-dead-connection
   "When connection-connected is NIL, handle-peer-fin disconnects the
 peer and returns T."
-  (let* ((conn (bl.net::make-connection
+  (let* ((conn (make-test-connection
                 :host "10.0.0.1" :port 48333 :connected nil))
          (peer (bl.net:make-peer
                 :connection conn :state :ready :address "10.0.0.1")))
@@ -267,7 +279,7 @@ peer and returns T."
 (test handle-peer-fin-noop-on-healthy-connection
   "When connection-connected is T (no FIN seen), handle-peer-fin leaves
 the peer untouched and returns NIL."
-  (let* ((conn (bl.net::make-connection
+  (let* ((conn (make-test-connection
                 :host "10.0.0.2" :port 48333 :connected t))
          (peer (bl.net:make-peer
                 :connection conn :state :ready :address "10.0.0.2")))
@@ -295,8 +307,8 @@ crash, return NIL."
   "A :ready peer whose connection-connected is already NIL is reaped —
 the drain loop is skipped (no socket I/O on a dead connection) and
 handle-peer-fin disconnects it so replace-disconnected-peers can refill."
-  (let* ((ctx (bl.net::make-ibd))
-         (conn (bl.net::make-connection
+  (let* ((ctx (%ibd))
+         (conn (make-test-connection
                 :host "10.0.0.4" :port 48333 :connected nil :socket nil))
          (peer (bl.net:make-peer
                 :connection conn :state :ready :address "10.0.0.4")))
@@ -306,7 +318,7 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
 
 (test drain-and-reap-peer-noop-when-no-connection
   "A peer with peer-connection NIL is a no-op — no crash, state untouched."
-  (let* ((ctx (bl.net::make-ibd))
+  (let* ((ctx (%ibd))
          (peer (bl.net:make-peer
                 :connection nil :state :disconnected :address "10.0.0.5")))
     (drain-peer-once peer (bl.ctx:make-node-context) ctx)
@@ -435,6 +447,16 @@ won't serve would keep IBD's main loop spinning forever."
           (aref h 2) (ldb (byte 8 16) n))
     h))
 
+(defun %bd-check (peers &optional (now *bd-epoch*))
+  "Run Core's two per-peer block-download disconnects over PEERS at NOW --
+the pass SendMessages makes. Returns how many peers were dropped."
+  (bl.net::check-block-download-timeouts peers now))
+
+(defun %bd-stalling-timeout ()
+  "The current stalling timeout, which doubles toward Core's 64s ceiling every
+time a peer is dropped for stalling."
+  bl.net::*block-stalling-timeout*)
+
 (defun %bd-peer (&optional (address "203.0.113.1"))
   (bl.net:make-peer :address address :state :ready))
 
@@ -506,7 +528,7 @@ our own saturated downlink cannot evict a fleet of honest peers."
     ;; :disconnected after a single retry pass.
     (let ((peer (%bd-peer)))
       (%bd-fill-window peer 16 126)
-      (is (= 0 (bl.net::check-block-download-timeouts (list peer) *bd-epoch*))
+      (is (= 0 (%bd-check (list peer)))
           "126s of silence on a full window is nowhere near Core's floor")
       (is (eq :ready (bl.net:peer-state peer)))))
   (with-ibd-context
@@ -514,7 +536,7 @@ our own saturated downlink cannot evict a fleet of honest peers."
     ;; assertion above is about the threshold and not about a dead code path.
     (let ((peer (%bd-peer)))
       (%bd-fill-window peer 16 601)
-      (is (= 1 (bl.net::check-block-download-timeouts (list peer) *bd-epoch*))
+      (is (= 1 (%bd-check (list peer)))
           "silence past 600s with one downloading peer must disconnect")
       (is (eq :disconnected (bl.net:peer-state peer)))))
   (with-ibd-context
@@ -523,7 +545,7 @@ our own saturated downlink cannot evict a fleet of honest peers."
     (let ((peer (%bd-peer)))
       (setf (bl.net:peer-downloading-since peer)
             (- *bd-epoch* (* 5000 internal-time-units-per-second)))
-      (is (= 0 (bl.net::check-block-download-timeouts (list peer) *bd-epoch*)))
+      (is (= 0 (%bd-check (list peer))))
       (is (eq :ready (bl.net:peer-state peer))))))
 
 (test a-front-block-delivery-restamps-the-download-clock
@@ -568,26 +590,26 @@ so our own insufficient bandwidth cannot evict several peers in a row."
       ;; Control: a peer with no stalling stamp is never dropped by this rule,
       ;; however long it has been connected.
       (let ((quiet (%bd-peer "203.0.113.9")))
-        (is (= 0 (bl.net::check-block-download-timeouts (list quiet) *bd-epoch*)))
+        (is (= 0 (%bd-check (list quiet))))
         (is (eq :ready (bl.net:peer-state quiet))))
       (let ((expected bl.net::+block-stalling-timeout-default+))
         (dolist (address '("203.0.113.1" "203.0.113.2" "203.0.113.3"
                            "203.0.113.4" "203.0.113.5" "203.0.113.6"
                            "203.0.113.7"))
           (let ((peer (%bd-peer address)))
-            (is (= expected bl.net::*block-stalling-timeout*)
+            (is (= expected (%bd-stalling-timeout))
                 "the stalling timeout must be ~Ds before dropping ~A"
                 expected address)
             (setf (bl.net:peer-stalling-since peer)
                   (- *bd-epoch* (* (1+ expected) internal-time-units-per-second)))
-            (is (= 1 (bl.net::check-block-download-timeouts (list peer) *bd-epoch*))
+            (is (= 1 (%bd-check (list peer)))
                 "~A stalled past ~Ds and must be dropped" address expected)
             (is (eq :disconnected (bl.net:peer-state peer)))
             (setf expected (min (* 2 expected)
                                 bl.net::+block-stalling-timeout-max+))))
         (is (= bl.net::+block-stalling-timeout-max+ expected)
             "the doubling must reach and stop at Core's 64s ceiling")
-        (is (= bl.net::+block-stalling-timeout-max+ bl.net::*block-stalling-timeout*))))))
+        (is (= bl.net::+block-stalling-timeout-max+ (%bd-stalling-timeout)))))))
 
 (test the-window-staller-is-the-peer-holding-its-first-missing-block
   "Core FindNextBlocks (net_processing.cpp:1514-1531): when the walk reaches
@@ -1271,7 +1293,7 @@ of them needed the same fix."
 (test header-sync-failover-rotates-past-stalled-peers
   "sync-headers-with-failover tries ready peers in descending start-height
 order and rotates past any that STALL, stopping at the first that answers."
-  (let* ((ctx (bl.net::make-ibd-context))
+  (let* ((ctx (%ibd-ctx))
          ;; Three ready peers; the two highest-start-height ones stall.
          (p-hi  (bl.net:make-peer :state :ready :start-height 900))
          (p-mid (bl.net:make-peer :state :ready :start-height 800))
@@ -1293,7 +1315,7 @@ order and rotates past any that STALL, stopping at the first that answers."
 
 (test header-sync-failover-first-peer-answers
   "When the highest-start-height peer answers, no rotation happens."
-  (let* ((ctx (bl.net::make-ibd-context))
+  (let* ((ctx (%ibd-ctx))
          (p-hi (bl.net:make-peer :state :ready :start-height 900))
          (p-lo (bl.net:make-peer :state :ready :start-height 700))
          (calls 0)
@@ -1306,7 +1328,7 @@ order and rotates past any that STALL, stopping at the first that answers."
 
 (test header-sync-failover-all-stalled-and-skips-nonready
   "All-stalled returns NIL; non-:ready peers are skipped entirely."
-  (let* ((ctx (bl.net::make-ibd-context))
+  (let* ((ctx (%ibd-ctx))
          (ready (bl.net:make-peer :state :ready :start-height 500))
          (dead  (bl.net:make-peer :state :disconnected :start-height 999))
          (tried '())
@@ -1331,7 +1353,7 @@ order and rotates past any that STALL, stopping at the first that answers."
 
 (test header-sync-failover-honors-stop-request
   "With a stop requested, the rotation exits before trying any peer."
-  (let* ((ctx (bl.net::make-ibd-context))
+  (let* ((ctx (%ibd-ctx))
          (ready (bl.net:make-peer :state :ready :start-height 500))
          (calls 0)
          (sync-fn (lambda (peer chain-state &key recent-rejects &allow-other-keys)
@@ -1373,7 +1395,7 @@ exceed the bound)."
          (let* ((port (usocket:get-local-port server))
                 (client (usocket:socket-connect "127.0.0.1" port
                                                 :element-type '(unsigned-byte 8)))
-                (conn (bl.net::make-connection
+                (conn (make-test-connection
                        :socket client :host "127.0.0.1" :port port
                        :connected t :last-activity (get-universal-time))))
            (unwind-protect
@@ -2115,7 +2137,7 @@ compute-recon-salt (salts 1,2 — same vector as above), negotiated version 1,
 we-initiate on an outbound connection (Core RegisterPeer SUCCESS)."
   (let ((bl:*tx-reconciliation* t)
         (peer (%recon-test-peer :local-salt 1)))
-    (is-true (bl.net::%handle-handshake-sendtxrcncl
+    (is-true (%sendtxrcncl
               peer (%sendtxrcncl-payload 1 2)))
     (is-true (bl.net::peer-recon-registered peer))
     (is (= 1 (bl.net::peer-recon-version peer)))
@@ -2129,9 +2151,9 @@ we-initiate on an outbound connection (Core RegisterPeer SUCCESS)."
 (Core RegisterPeer ALREADY_REGISTERED => disconnect)."
   (let ((bl:*tx-reconciliation* t)
         (peer (%recon-test-peer)))
-    (is-true (bl.net::%handle-handshake-sendtxrcncl
+    (is-true (%sendtxrcncl
               peer (%sendtxrcncl-payload 1 2)))
-    (is-false (bl.net::%handle-handshake-sendtxrcncl
+    (is-false (%sendtxrcncl
                peer (%sendtxrcncl-payload 1 3)))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
@@ -2140,7 +2162,7 @@ we-initiate on an outbound connection (Core RegisterPeer SUCCESS)."
 (net_processing.cpp:3982-3990)."
   (let ((bl:*tx-reconciliation* t)
         (peer (%recon-test-peer :relay nil)))
-    (is-false (bl.net::%handle-handshake-sendtxrcncl
+    (is-false (%sendtxrcncl
                peer (%sendtxrcncl-payload 1 2)))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
@@ -2149,7 +2171,7 @@ we-initiate on an outbound connection (Core RegisterPeer SUCCESS)."
 disconnects (Core RejectIncomingTxs, net_processing.cpp:3976-3980)."
   (let ((bl:*tx-reconciliation* t)
         (peer (%recon-test-peer :conn-type :block-relay :local-salt nil)))
-    (is-false (bl.net::%handle-handshake-sendtxrcncl
+    (is-false (%sendtxrcncl
                peer (%sendtxrcncl-payload 1 2)))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
@@ -2158,7 +2180,7 @@ disconnects (Core RejectIncomingTxs, net_processing.cpp:3976-3980)."
 (txreconciliation.cpp:117-119)."
   (let ((bl:*tx-reconciliation* t)
         (peer (%recon-test-peer)))
-    (is-false (bl.net::%handle-handshake-sendtxrcncl
+    (is-false (%sendtxrcncl
                peer (%sendtxrcncl-payload 0 2)))
     (is (eq :disconnected (bl.net:peer-state peer)))))
 
@@ -2167,7 +2189,7 @@ disconnects (Core RejectIncomingTxs, net_processing.cpp:3976-3980)."
 (txreconciliation.cpp:112-116)."
   (let ((bl:*tx-reconciliation* t)
         (peer (%recon-test-peer)))
-    (is-true (bl.net::%handle-handshake-sendtxrcncl
+    (is-true (%sendtxrcncl
               peer (%sendtxrcncl-payload 2 2)))
     (is-true (bl.net::peer-recon-registered peer))
     (is (= 1 (bl.net::peer-recon-version peer)))))
@@ -2177,7 +2199,7 @@ disconnects (Core RejectIncomingTxs, net_processing.cpp:3976-3980)."
 registration, no disconnect (Core RegisterPeer NOT_FOUND)."
   (let ((bl:*tx-reconciliation* t)
         (peer (%recon-test-peer :local-salt nil)))
-    (is-true (bl.net::%handle-handshake-sendtxrcncl
+    (is-true (%sendtxrcncl
               peer (%sendtxrcncl-payload 1 2)))
     (is-false (bl.net::peer-recon-registered peer))
     (is (not (eq :disconnected (bl.net:peer-state peer))))))
@@ -2188,7 +2210,7 @@ its reconciliation state forgotten (net_processing.cpp:3879-3886); with
 wtxidrelay negotiated the state survives."
   (let ((bl:*tx-reconciliation* t))
     (let ((peer (%recon-test-peer)))
-      (bl.net::%handle-handshake-sendtxrcncl
+      (%sendtxrcncl
        peer (%sendtxrcncl-payload 1 2))
       (is-true (bl.net::peer-recon-registered peer))
       ;; wtxidrelay never arrived => forget everything
@@ -2203,7 +2225,7 @@ wtxidrelay negotiated the state survives."
       (is-false (bl.net::peer-recon-local-salt peer)))
     (let ((peer (%recon-test-peer)))
       (setf (bl.net:peer-wtxid-relay peer) t)
-      (bl.net::%handle-handshake-sendtxrcncl
+      (%sendtxrcncl
        peer (%sendtxrcncl-payload 1 2))
       (bl.net::%verack-finalize-recon peer)
       (is-true (bl.net::peer-recon-registered peer)))))
@@ -2243,7 +2265,7 @@ PeerNoVerack sends it, and after VERACK -- so both say it."
     (let ((peer (%recon-test-peer :local-salt nil)))
       (multiple-value-bind (ok log)
           (%net-log-of (lambda ()
-                         (bl.net::%handle-handshake-sendtxrcncl
+                         (%sendtxrcncl
                           peer (%sendtxrcncl-payload 1 2))))
         (is-true ok "the message is ignored, not treated as a violation")
         (is (not (eq :disconnected (bl.net:peer-state peer))))
@@ -3121,7 +3143,7 @@ shape. Positive control: the slot is NIL before and the pump's list after."
          (peers (list p1 p2))
          (node-ctx (bl.ctx:make-node-context :chain-state (bl.store:make-chain-state))))
     (is (null (bl.ctx:node-context-peers node-ctx)))
-    (bl.net:pump-peer-messages peers node-ctx (bl.net::make-ibd))
+    (bl.net:pump-peer-messages peers node-ctx (%ibd))
     (is (eq peers (bl.ctx:node-context-peers node-ctx)))))
 
 (test pump-peer-messages-serves-getdata-loopback
@@ -3465,9 +3487,9 @@ messages and check the drain leaves some behind for the next pass."
                                                :element-type '(unsigned-byte 8)))
                 (peer (bl.net:make-peer
                        :state :ready
-                       :connection (bl.net::make-connection
+                       :connection (make-test-connection
                                     :socket server :connected t)))
-                (ctx (bl.net::make-ibd-context))
+                (ctx (%ibd-ctx))
                 ;; "ping" carries an 8-byte nonce: 32 bytes on the wire, so a
                 ;; few thousand comfortably exceed the 64 KB budget.
                 (msg (bl.ser:make-ping-message 7))
@@ -3511,13 +3533,13 @@ second peer sends a headers message; that second peer must still be served."
                                                       :element-type '(unsigned-byte 8)))
                 (quiet (bl.net:make-peer
                         :state :ready
-                        :connection (bl.net::make-connection
+                        :connection (make-test-connection
                                      :socket quiet-server :connected t)))
                 (talker (bl.net:make-peer
                          :state :ready
-                         :connection (bl.net::make-connection
+                         :connection (make-test-connection
                                       :socket talker-server :connected t)))
-                (ctx (bl.net::make-ibd-context)))
+                (ctx (%ibd-ctx)))
            (setf (bl.net::ibd-context-peers ctx) (list quiet talker))
            ;; The talker answers with an empty headers message — the smallest
            ;; well-formed one, and exactly what a peer at our tip sends.
@@ -3704,7 +3726,7 @@ block it is waiting for — \"so that if the block arrives in the future we can
 try adding to setBlockIndexCandidates again\" (validation.cpp:3184-3190). The
 retry is not the problem; the retry with no event to wait for is."
   (let ((bl.net:*ibd-context*
-          (bl.net::make-ibd-context)))
+          (%ibd-ctx)))
     (let ((candidate (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
           (missing (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
           (set (bl.net::ibd-context-reorg-candidates
@@ -3732,7 +3754,7 @@ retry is not the problem; the retry with no event to wait for is."
 costs nothing; if it does, the branch must come back — otherwise this trades an
 unbounded retry for a reorg that never happens, which is strictly worse."
   (let ((bl.net:*ibd-context*
-          (bl.net::make-ibd-context)))
+          (%ibd-ctx)))
     (multiple-value-bind (cs tip) (%gd-chain-state 10)
       ;; A candidate entry with MORE work than the tip, so note-reorg-candidate
       ;; will accept it back.
@@ -3773,7 +3795,7 @@ directly, so a branch that went stale or was rejected while it waited does not
 come back. Putting it back unconditionally would resurrect exactly the
 candidates the rejected set exists to keep out."
   (let ((bl.net:*ibd-context*
-          (bl.net::make-ibd-context)))
+          (%ibd-ctx)))
     (multiple-value-bind (cs tip) (%gd-chain-state 10)
       (let* ((stale (%gd-entry :height 11
                                ;; LESS work than the tip: no longer a reorg target.
@@ -3808,7 +3830,7 @@ than the bug this fixes."
                                (uiop:temporary-directory)))))
     (unwind-protect
          (let* ((bl.net:*ibd-context*
-                  (bl.net::make-ibd-context))
+                  (%ibd-ctx))
                 (store (bl.store:init-block-store dir))
                 (cand (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
                 (blk (make-reorg-test-block
@@ -3830,7 +3852,7 @@ than the bug this fixes."
   "A pathological header topology must not be able to grow this without limit —
 the same reason the candidate and rejected sets are capped."
   (let ((bl.net:*ibd-context*
-          (bl.net::make-ibd-context)))
+          (%ibd-ctx)))
     (let ((parked (bl.net::ibd-context-unlinked-reorg-candidates
                    bl.net:*ibd-context*)))
       (loop for i from 0 below (+ bl.net::+reorg-candidates-cap+ 50)

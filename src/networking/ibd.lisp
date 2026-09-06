@@ -1419,7 +1419,7 @@ internal-time units -- Core's
 nPowTargetSpacing * (BLOCK_DOWNLOAD_TIMEOUT_BASE +
                      BLOCK_DOWNLOAD_TIMEOUT_PER_PEER * other_downloading_peers)
 (net_processing.cpp:6118). 600s with one downloading peer, 2700s with eight."
-  (round (* bl:+pow-target-spacing-seconds+
+  (round (* (block-interval-seconds)
             (+ +block-download-timeout-base+
                (* +block-download-timeout-per-peer+
                   (max 0 (1- downloading-peers))))
@@ -1883,7 +1883,11 @@ handler. Shared by the block-download drain and the at-tip reap pass."
     ;; passed, so those paths never ran outside unit tests and RPC).
     (t (handle-message peer command payload node-ctx)))))
 
-(defvar *message-handler-errors* (make-hash-table :test 'equal)
+(defvar *message-handler-errors*
+  ;; Synchronized: the drain runs on the sync thread and the pump thread, and a
+  ;; lost INCF under contention would under-count exactly the burst this
+  ;; counter exists to make visible.
+  (make-hash-table :test 'equal #+sbcl :synchronized #+sbcl t)
   "Command name -> how many times a handler for it raised and the error was
 swallowed by SAFELY-DISPATCH-PEER-MESSAGE.
 

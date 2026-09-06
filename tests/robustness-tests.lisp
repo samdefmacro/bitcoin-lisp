@@ -152,7 +152,7 @@ The buckets are not decoration. Without them the FIRST thing every dispatch
 touches is a NIL token bucket, so the handler TYPE-ERRORs before it reads a
 byte of the payload and any assertion about how the payload was judged is
 measuring the fixture."
-  (let ((conn (bl.net::make-connection
+  (let ((conn (make-test-connection
                :host "127.0.0.1" :port 48333 :connected t))
         (peer nil))
     (setf peer (bl.net:make-peer
@@ -166,6 +166,22 @@ drain loop uses. Returns (values still-connected peer)."
   (values (bl.net::safely-dispatch-peer-message
            peer command payload (bl.ctx:make-node-context) (bl.net::make-ibd))
           peer))
+
+(defun %arm-ping (peer nonce)
+  "Give PEER an outstanding ping carrying NONCE, the way SEND-PING leaves it:
+the nonce AND the send time, without which RECORD-PONG has no clock to
+subtract and raises for a reason that has nothing to do with the payload."
+  (setf (bl.net::peer-ping-nonce peer) nonce
+        (bl.net::peer-last-ping-time peer) (get-internal-real-time))
+  peer)
+
+(defun %outstanding-ping (peer)
+  "PEER's unanswered ping nonce, or NIL once the round trip is closed."
+  (bl.net::peer-ping-nonce peer))
+
+(defun %handler-error-count (command)
+  "How many handler errors for COMMAND the dispatch has swallowed."
+  (gethash command bl.net::*message-handler-errors* 0))
 
 (test over-limit-protocol-vector-misbehaves
   "An inv/getdata/headers count above the protocol maximum is Misbehaving, so
@@ -238,22 +254,20 @@ connected -- the isolation forgives on FAILURE, it does not simply never act."
     (is (eq :ready (bl.net:peer-state peer)))
     (is-true (bl.net:peer-connection peer)))
   (let ((peer (%fake-ready-peer)))
-    (setf (bl.net::peer-ping-nonce peer) #x3039
-          (bl.net::peer-last-ping-time peer) (get-internal-real-time))
+    (%arm-ping peer #x3039)
     (is (eq t (%dispatch-to-fake-peer "pong" (%bytes #x39 #x30 0 0 0 0 0 0) peer)))
     (is (eq :ready (bl.net:peer-state peer)))
-    (is (null (bl.net::peer-ping-nonce peer))
+    (is (null (%outstanding-ping peer))
         "a well-formed pong closes the outstanding ping")))
 
 (test short-pong-cancels-the-outstanding-ping
   "Core's PONG short-payload branch (net_processing.cpp:5030-5035): fewer than
 8 bytes cancels the outstanding ping, logs at debug, and keeps the peer."
   (let ((peer (%fake-ready-peer)))
-    (setf (bl.net::peer-ping-nonce peer) #x3039
-          (bl.net::peer-last-ping-time peer) (get-internal-real-time))
+    (%arm-ping peer #x3039)
     (is (eq t (%dispatch-to-fake-peer "pong" (%bytes 0 0 0 0) peer)))
     (is (eq :ready (bl.net:peer-state peer)))
-    (is (null (bl.net::peer-ping-nonce peer))
+    (is (null (%outstanding-ping peer))
         "a short pong cancels the ping instead of leaving it outstanding")))
 
 (test swallowed-handler-errors-are-counted
@@ -263,11 +277,11 @@ command and the count rides the net debug line."
     (%dispatch-to-fake-peer "feefilter" (%bytes 1 2 3))
     (%dispatch-to-fake-peer "feefilter" (%bytes 1 2 3))
     (%dispatch-to-fake-peer "notfound" (%bytes))
-    (is (= 2 (gethash "feefilter" bl.net::*message-handler-errors* 0)))
-    (is (= 1 (gethash "notfound" bl.net::*message-handler-errors* 0)))
+    (is (= 2 (%handler-error-count "feefilter")))
+    (is (= 1 (%handler-error-count "notfound")))
     ;; Positive control: a message that does NOT raise must not be counted.
     (%dispatch-to-fake-peer "xyzzy" (%bytes))
-    (is (= 0 (gethash "xyzzy" bl.net::*message-handler-errors* 0)))))
+    (is (= 0 (%handler-error-count "xyzzy")))))
 
 (test a-named-handler-rule-still-disconnects
   "The dispatch is forgiving, not toothless: a rule written inside a handler
