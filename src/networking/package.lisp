@@ -158,6 +158,7 @@ headerssync.cpp. src/networking/.")
    #:peer-announced-txs
    #:peer-known-addrs
    #:initial-block-download-p
+   #:current-for-fee-estimation-p
    #:near-tip-p
    ;; Compact block relay (BIP 152)
    #:send-compact-block-negotiation

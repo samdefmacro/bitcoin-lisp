@@ -26,3 +26,46 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
     (bl.store:add-utxo utxo-set funding-txid 0 fund-value
                                    (p2sh-optrue-script-pubkey) fund-height :coinbase nil)
     (values utxo-set mempool chain-state funding-txid)))
+
+;;;; The block policy estimator: synthetic ids and a populated estimator
+;;;; (Core CBlockPolicyEstimator). Shared by the estimator suite and the
+;;;; fee-estimation tests in the mempool suite.
+
+(defun bpe-test-id (a b c)
+  "A distinct 32-byte txid from three small integers."
+  (let ((v (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref v 0) a
+          (aref v 1) (ldb (byte 8 0) b)
+          (aref v 2) (ldb (byte 8 8) b)
+          (aref v 3) (ldb (byte 8 0) c))
+    v))
+
+(defun bpe-simulate (&key (blocks 60) (per-block 40)
+                        (fast-feerate 20000d0) (slow-feerate 800d0)
+                        confirm-slow)
+  "Run BLOCKS blocks. Each block, PER-BLOCK transactions at FAST-FEERATE enter
+and confirm in the next block, and PER-BLOCK at SLOW-FEERATE enter. CONFIRM-SLOW
+decides whether the cheap ones also confirm or sit unconfirmed forever."
+  (let ((e (bl.mp:make-block-policy-estimator)))
+    ;; The estimator only records a transaction whose entry height is its own
+    ;; best seen height (Core's `Ignore txs if BlockPolicyEstimator is not in
+    ;; sync with ActiveChain().Tip()'), so the fixture starts it AT the tip
+    ;; the first pass enters transactions against. A live node is in that
+    ;; state by construction; a synthetic one has to say so.
+    (setf (bl.mp::block-policy-estimator-best-height e) 1)
+    (loop for h from 1 to blocks
+          do (let ((confirmed '()))
+               (dotimes (i per-block)
+                 (let ((txid (bpe-test-id 1 h i)))
+                   (bl.mp::bpe-process-transaction e txid h fast-feerate)
+                   (push txid confirmed)))
+               (dotimes (i per-block)
+                 (let ((txid (bpe-test-id 2 h i)))
+                   (bl.mp::bpe-process-transaction e txid h slow-feerate)
+                   (when confirm-slow
+                     (push txid confirmed))))
+               (bl.mp::bpe-process-block e (1+ h) confirmed)))
+    e))
+
+(defun bpe-populated-estimator (&key (blocks 40))
+  (bpe-simulate :blocks blocks))

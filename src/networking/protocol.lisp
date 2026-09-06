@@ -968,6 +968,36 @@ within *max-tip-age-seconds* of now — Core UpdateIBDStatus
           nil)
         t)))
 
+(defconstant +max-fee-estimation-tip-age+ (* 3 60 60)
+  "Core MAX_FEE_ESTIMATION_TIP_AGE (validation.cpp:99): three hours.")
+
+(defun current-for-fee-estimation-p (chain-state)
+  "Core IsCurrentForFeeEstimation (validation.cpp:280-292): may what the
+mempool accepts right now teach the fee estimator anything?
+
+Not during initial block download, and not while the tip is older than
+MAX_FEE_ESTIMATION_TIP_AGE -- in either state the node is catching up, so the
+number of blocks a transaction waits says nothing about the fee market.
+
+It lives here, beside INITIAL-BLOCK-DOWNLOAD-P, because that latch does; Core
+keeps it in validation.cpp next to the ATMP call sites that read it.
+
+DIVERGENCE: Core has a third arm, `m_chain.Height() < m_best_header->nHeight
+- 1', which needs a cached most-work HEADER. Ours is BEST-HEADER-ENTRY, an
+O(index) scan, and this predicate runs once per accepted transaction. The two
+arms above cover the same state for every case the estimator can observe -- a
+node whose headers run ahead of its blocks is either in IBD or has a stale
+tip -- and erring towards `current' only ever admits data, never invents it."
+  (and (not (initial-block-download-p chain-state))
+       (let* ((tip-hash (bl.store:best-block-hash chain-state))
+              (tip (and tip-hash
+                        (bl.store:get-block-index-entry chain-state tip-hash))))
+         (and tip
+              (>= (bl.ser:block-header-timestamp
+                   (bl.store:block-index-entry-header tip))
+                  (- (bl.ser:get-unix-time) +max-fee-estimation-tip-age+))
+              t))))
+
 (defun count-wtxid-relay-peers (peers)
   "Number of connected peers that negotiated BIP339 wtxid relay (Core
 m_num_wtxid_peers, txdownloadman_impl.cpp ConnectedPeer/DisconnectedPeer).
@@ -1913,7 +1943,9 @@ by TXID, so the cascade work list carries txids."
                      (multiple-value-bind (result entry)
                          (bl.mp:accept-validated-tx
                           mempool otxid otx fee current-height
-                          :sigops sigops :replaced replaced)
+                          :sigops sigops :replaced replaced
+                          :chainstate-current
+                          (current-for-fee-estimation-p chain-state))
                        (when (eq :ok result)
                          (bl.mp:orphan-remove pool owtxid)
                          (when peers
@@ -2297,7 +2329,9 @@ CTX's recent-rejects, when present, caches recently rejected txs."
                 (when valid
                   (let ((result (bl.mp:accept-validated-tx
                                  mempool txid tx fee current-height
-                                 :sigops sigops :replaced replaced)))
+                                 :sigops sigops :replaced replaced
+                                 :chainstate-current
+                                 (current-for-fee-estimation-p chain-state))))
                     (cond
                       ((eq result :ok)
                        ;; getpeerinfo "last_transaction" (Core m_last_tx_time,

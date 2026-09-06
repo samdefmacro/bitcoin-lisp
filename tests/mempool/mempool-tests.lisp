@@ -113,7 +113,7 @@ per-entry deltas, and residual deltas; corrupt files read as not-ok."
   (let* ((mempool (bl.mp:make-mempool))
          (parent (make-mempool-test-tx :input-id 60))
          (parent-txid (bl.ser:transaction-hash parent))
-         (child (%mp-spending-tx parent-txid))
+         (child (make-spending-test-tx parent-txid))
          (child-txid (bl.ser:transaction-hash child))
          (absent-txid (make-array 32 :element-type '(unsigned-byte 8)
                                      :initial-element 99))
@@ -794,8 +794,7 @@ non-standard under *permit-bare-multisig* nil (1<=m<=n<=3, 33/65-byte keys)."
 (test fee-estimator-creation
   "Fee estimator is created with correct defaults."
   (let ((estimator (bl.mp:make-fee-estimator)))
-    (is (= 0 (bl.mp:fee-estimator-entry-count estimator)))
-    (is (not (bl.mp:fee-estimator-ready-p estimator)))))
+    (is (= 0 (bl.mp:fee-estimator-entry-count estimator)))))
 
 (test fee-estimator-add-stats
   "Adding fee statistics increments the entry count."
@@ -809,96 +808,37 @@ non-standard under *permit-bare-multisig* nil (1<=m<=n<=3, 33/65-byte keys)."
     (bl.mp:fee-estimator-add-stats estimator stats)
     (is (= 1 (bl.mp:fee-estimator-entry-count estimator)))))
 
-(test fee-estimator-ready-after-min-blocks
-  "Fee estimator becomes ready after minimum blocks are added."
-  (let ((estimator (bl.mp:make-fee-estimator)))
-    ;; Add enough blocks to meet the threshold (6 by default)
-    (dotimes (i 6)
-      (let ((stats (bl.mp:make-block-fee-stats
-                    :height (+ 100 i)
-                    :median-rate (+ 10 i)
-                    :low-rate 5
-                    :high-rate 50
-                    :tx-count 100)))
-        (bl.mp:fee-estimator-add-stats estimator stats)))
-    (is (bl.mp:fee-estimator-ready-p estimator))))
+(test fee-estimation-answers-only-from-the-policy-estimator
+  "ESTIMATE-FEE-RATE is Core's estimateSmartFee and nothing else. It used to
+fall through to a percentile of the median feerates of the last N blocks when
+the policy estimator had no answer, and returned it with NO error message --
+so the RPC reported it as a real feerate and a wallet reading it never fell
+back to its own -fallbackfee. A percentile of what miners TOOK cannot express
+that a feerate FAILED to confirm, which is the whole content of an estimate.
 
-(test fee-estimation-basic
-  "Fee estimation returns reasonable values."
-  (let ((estimator (bl.mp:make-fee-estimator)))
-    ;; Add test data with varying fee rates
-    (dotimes (i 10)
-      (let ((stats (bl.mp:make-block-fee-stats
-                    :height (+ 100 i)
-                    :median-rate (+ 10 (* i 5))  ; 10, 15, 20, ...55
-                    :low-rate 5
-                    :high-rate 100
-                    :tx-count 200)))
-        (bl.mp:fee-estimator-add-stats estimator stats)))
-    ;; Test estimation
-    (multiple-value-bind (rate error)
-        (bl.mp:estimate-fee-rate estimator 6)
-      (declare (ignore error))
-      (is (> rate 0))
-      (is (<= rate 100)))))
-
-(test fee-estimation-conservative-vs-economical
-  "Conservative mode returns higher fee than economical."
-  (let ((estimator (bl.mp:make-fee-estimator)))
-    ;; Add test data
-    (dotimes (i 15)
-      (let ((stats (bl.mp:make-block-fee-stats
-                    :height (+ 100 i)
-                    :median-rate (+ 10 (* i 3))
-                    :low-rate 5
-                    :high-rate 100
-                    :tx-count 200)))
-        (bl.mp:fee-estimator-add-stats estimator stats)))
-    (multiple-value-bind (conservative-rate c-error)
-        (bl.mp:estimate-fee-rate estimator 6 :mode :conservative)
-      (declare (ignore c-error))
-      (multiple-value-bind (economical-rate e-error)
-          (bl.mp:estimate-fee-rate estimator 6 :mode :economical)
-        (declare (ignore e-error))
-        (is (>= conservative-rate economical-rate))))))
-
-(test fee-estimation-longer-target-lower-fee
-  "Longer confirmation targets tend to have lower fee estimates."
-  (let ((estimator (bl.mp:make-fee-estimator)))
-    ;; Add test data
+The block statistics below are exactly the history that fallback read: twenty
+blocks at a median of 10 to 48 sat/vB, plenty for the old path, and the answer
+must still be the absence of an estimate."
+  (let ((estimator (bl.mp:make-fee-estimator))
+        (bl.mp:*block-policy-estimator* (bl.mp:make-block-policy-estimator)))
     (dotimes (i 20)
-      (let ((stats (bl.mp:make-block-fee-stats
-                    :height (+ 100 i)
-                    :median-rate (+ 10 (* i 2))
-                    :low-rate 5
-                    :high-rate 100
-                    :tx-count 200)))
-        (bl.mp:fee-estimator-add-stats estimator stats)))
-    (multiple-value-bind (short-rate s-error)
-        (bl.mp:estimate-fee-rate estimator 2)
-      (declare (ignore s-error))
-      (multiple-value-bind (long-rate l-error)
-          (bl.mp:estimate-fee-rate estimator 25)
-        (declare (ignore l-error))
-        ;; Short target should have higher or equal fee
-        (is (>= short-rate long-rate))))))
-
-(test fee-estimation-insufficient-data
-  "Fee estimation returns error when data is insufficient."
-  (let ((estimator (bl.mp:make-fee-estimator)))
-    ;; Only add 2 blocks (less than minimum of 6)
-    (dotimes (i 2)
-      (let ((stats (bl.mp:make-block-fee-stats
-                    :height (+ 100 i)
-                    :median-rate 20
-                    :low-rate 10
-                    :high-rate 50
-                    :tx-count 100)))
-        (bl.mp:fee-estimator-add-stats estimator stats)))
-    (multiple-value-bind (rate error)
-        (bl.mp:estimate-fee-rate estimator 6)
-      (is (= rate 1))  ; Fallback minimum
-      (is (not (null error))))))
+      (bl.mp:fee-estimator-add-stats
+       estimator (bl.mp:make-block-fee-stats
+                  :height (+ 100 i) :median-rate (+ 10 (* i 2))
+                  :low-rate 5 :high-rate 100 :tx-count 200)))
+    (is (= 20 (bl.mp:fee-estimator-entry-count estimator))
+        "positive control: the percentile history is populated")
+    (dolist (target '(2 6 25 1008))
+      (multiple-value-bind (rate error returned) (bl.mp:estimate-fee-rate target)
+        (is (null rate) "target ~D answered ~S from the block history" target rate)
+        (is (string= "Insufficient data or no feerate found" error))
+        (is (= target returned))))
+    ;; Positive control the other way: with a POLICY estimator that has an
+    ;; answer, the same call returns it.
+    (let ((bl.mp:*block-policy-estimator* (bpe-populated-estimator)))
+      (multiple-value-bind (rate error) (bl.mp:estimate-fee-rate 6)
+        (is (null error))
+        (is (plusp rate))))))
 
 ;;;; PR1 foundation: entry enrichment, wtxid index, vsize fee-rate
 
@@ -1724,23 +1664,6 @@ consensus-valid but violates MINIMALDATA: rejected by the policy pass."
 
 ;;;; PR3 ancestor/descendant tracking + chained spends
 
-(defun %mp-spending-tx (parent-txid &key (vout 0) (value 40000000))
-  "A tx spending PARENT-TXID's output VOUT, paying a standard P2PKH output."
-  (bl.ser:make-transaction
-   :version 1
-   :inputs (vector (bl.ser:make-tx-in
-                  :previous-output (bl.ser:make-outpoint
-                                    :hash parent-txid :index vout)
-                  :script-sig (make-array 10 :element-type '(unsigned-byte 8) :initial-element 0)
-                  :sequence #xFFFFFFFF))
-   :outputs (vector (bl.ser:make-tx-out
-                   :value value
-                   :script-pubkey (let ((s (make-array 25 :element-type '(unsigned-byte 8)
-                                                       :initial-element 0)))
-                                    (setf (aref s 0) #x76 (aref s 1) #xa9 (aref s 2) #x14
-                                          (aref s 23) #x88 (aref s 24) #xac) s)))
-   :lock-time 0))
-
 (defun %add-tx (mempool tx &key (fee 10000) (height 0))
   "Insert TX directly into MEMPOOL as an already-accepted entry (bypassing
 validation). The shared direct-add helper of the whole test package."
@@ -1754,9 +1677,9 @@ validation). The shared direct-add helper of the whole test package."
   (let* ((mempool (bl.mp:make-mempool))
          (a (make-mempool-test-tx :input-id 90))
          (atxid (bl.ser:transaction-hash a))
-         (b (%mp-spending-tx atxid))
+         (b (make-spending-test-tx atxid))
          (btxid (bl.ser:transaction-hash b))
-         (c (%mp-spending-tx btxid))
+         (c (make-spending-test-tx btxid))
          (ctxid (bl.ser:transaction-hash c)))
     (is (eq :ok (%add-tx mempool a)))
     (is (eq :ok (%add-tx mempool b)))
@@ -1779,7 +1702,7 @@ rolled back)."
          (accepted 1))
     (loop for i from 2 to 65
           while (eq last-result :ok)
-          do (let ((child (%mp-spending-tx prev-txid)))
+          do (let ((child (make-spending-test-tx prev-txid)))
                (setf last-result (%add-tx mempool child))
                (when (eq last-result :ok)
                  (incf accepted)
@@ -1799,9 +1722,9 @@ bound low here; the graph's limits are fixed at make-mempool time.)"
                     (bl.mp:make-mempool)))
          (a (make-mempool-test-tx :input-id 97))
          (atxid (bl.ser:transaction-hash a))
-         (b (%mp-spending-tx atxid))
+         (b (make-spending-test-tx atxid))
          (btxid (bl.ser:transaction-hash b))
-         (c (%mp-spending-tx btxid)))
+         (c (make-spending-test-tx btxid)))
     ;; Each test tx is 95 vB: A (95) and B (190 total) fit under 200,
     ;; C (285 total) does not.
     (is (eq :ok (%add-tx mempool a)))
@@ -1822,9 +1745,9 @@ bound low here; the graph's limits are fixed at make-mempool time.)"
   (let* ((mempool (bl.mp:make-mempool))
          (a (make-mempool-test-tx :input-id 92))
          (atxid (bl.ser:transaction-hash a))
-         (b (%mp-spending-tx atxid))
+         (b (make-spending-test-tx atxid))
          (btxid (bl.ser:transaction-hash b))
-         (c (%mp-spending-tx btxid)))
+         (c (make-spending-test-tx btxid)))
     (%add-tx mempool a) (%add-tx mempool b) (%add-tx mempool c)
     (is (= 3 (bl.mp:mempool-count mempool)))
     (is (= 3 (bl.mp:mempool-remove-recursive mempool atxid)))
@@ -1838,7 +1761,7 @@ as confirming in the next block for BIP68 (validation.cpp:185-192)."
          (utxo (bl.store:make-utxo-set))
          (a (make-mempool-test-tx :input-id 93))
          (atxid (bl.ser:transaction-hash a))
-         (b (%mp-spending-tx atxid)))
+         (b (make-spending-test-tx atxid)))
     (%add-tx mempool a)
     (multiple-value-bind (coins ok)
         (bl.val::mempool-extra-coins b utxo mempool 201)
@@ -1853,7 +1776,7 @@ the CPFP pair shares one chunk, evicted as a unit."
   (let* ((mempool (bl.mp:make-mempool :max-size 1500)) ; 2 txs = 1392 usage, 3 = 2080
          (a (make-mempool-test-tx :input-id 95))
          (atxid (bl.ser:transaction-hash a))
-         (b (%mp-spending-tx atxid))
+         (b (make-spending-test-tx atxid))
          (btxid (bl.ser:transaction-hash b))
          (c (make-mempool-test-tx :input-id 96))
          (ctxid (bl.ser:transaction-hash c)))
@@ -1876,7 +1799,7 @@ the evicted chunk's feerate plus the incremental relay fee (Core TrimToSize
   (let* ((mempool (bl.mp:make-mempool :max-size 1500)) ; 2 txs = 1392 usage, 3 = 2080
          (p (make-mempool-test-tx :input-id 101))
          (ptxid (bl.ser:transaction-hash p))
-         (c (%mp-spending-tx ptxid))
+         (c (make-spending-test-tx ptxid))
          (ctxid (bl.ser:transaction-hash c))
          (m (make-mempool-test-tx :input-id 102))
          (mtxid (bl.ser:transaction-hash m))
@@ -2000,7 +1923,7 @@ accept path never consults SignalsOptInRBF; IsRBFOptIn survives for RPC only)."
          (prev-txid root-txid))
     (%add-tx mempool root :fee fee)
     (loop repeat (1- length)
-          for child = (%mp-spending-tx prev-txid)
+          for child = (make-spending-test-tx prev-txid)
           for child-txid = (bl.ser:transaction-hash child)
           do (%add-tx mempool child :fee fee)
              (setf prev-txid child-txid))
@@ -2136,7 +2059,7 @@ low-fee parent, so a cheaper standalone tx is evicted first."
          (stxid (bl.ser:transaction-hash s))
          (p (make-mempool-test-tx :input-id 111))        ; parent, low fee
          (ptxid (bl.ser:transaction-hash p))
-         (c (%mp-spending-tx ptxid))                     ; child, high fee (CPFP)
+         (c (make-spending-test-tx ptxid))                     ; child, high fee (CPFP)
          (ctxid (bl.ser:transaction-hash c))
          (n (make-mempool-test-tx :input-id 112))        ; incoming, medium fee
          (ntxid (bl.ser:transaction-hash n)))
@@ -2212,7 +2135,7 @@ index. The pool is wtxid-keyed (Core TxOrphanage) — for this witnessless tx
 wtxid == txid."
   (let* ((pool (bl.mp:make-orphan-pool))
          (parent (%txid-array 50))
-         (o (%mp-spending-tx parent))
+         (o (make-spending-test-tx parent))
          (owtxid (bl.ser:transaction-wtxid o)))
     (is-true (bl.mp:orphan-add pool o nil))
     (is (= 1 (bl.mp:orphan-pool-count pool)))
@@ -2230,7 +2153,7 @@ LAST announcer (Core EraseForPeer)."
   (let* ((pool (bl.mp:make-orphan-pool))
          (peer-a (list :a))
          (peer-b (list :b))
-         (o (%mp-spending-tx (%txid-array 52)))
+         (o (make-spending-test-tx (%txid-array 52)))
          (owtxid (bl.ser:transaction-wtxid o)))
     ;; First announcement stores the orphan; the second only adds an announcer.
     (is-true (bl.mp:orphan-add pool o peer-a))
@@ -2283,7 +2206,7 @@ the flooder lost announcements."
         (victim (list :victim))
         (attacker (list :attacker)))
     ;; The victim announces one modest orphan.
-    (let ((vic-tx (%mp-spending-tx (%txid-array 200))))
+    (let ((vic-tx (make-spending-test-tx (%txid-array 200))))
       (is-true (bl.mp:orphan-add pool vic-tx victim))
       ;; The attacker floods well past every per-peer allowance. Announcement
       ;; latency score is 1 each (single-input txs), so the global latency
@@ -2291,7 +2214,7 @@ the flooder lost announcements."
       (dotimes (i 3500)
         (bl.mp:orphan-add
          pool
-         (%mp-spending-tx (%txid-array (mod i 250)) :vout i)
+         (make-spending-test-tx (%txid-array (mod i 250)) :vout i)
          attacker))
       ;; Global limits are enforced...
       (is (<= (bl.mp:orphan-total-latency-score pool)
@@ -2313,9 +2236,9 @@ EXACT spent outpoint (Core EraseForBlock): an orphan spending a different
 output of the same parent tx survives."
   (let* ((pool (bl.mp:make-orphan-pool))
          (parent (%txid-array 70))
-         (conflicted (%mp-spending-tx parent :vout 0))
-         (unrelated (%mp-spending-tx parent :vout 1))
-         (block-tx (%mp-spending-tx parent :vout 0 :value 123456))
+         (conflicted (make-spending-test-tx parent :vout 0))
+         (unrelated (make-spending-test-tx parent :vout 1))
+         (block-tx (make-spending-test-tx parent :vout 0 :value 123456))
          (block (%mp-block (list block-tx))))
     (bl.mp:orphan-add pool conflicted (list :p))
     (bl.mp:orphan-add pool unrelated (list :p))
@@ -2332,8 +2255,8 @@ output of the same parent tx survives."
   (let ((pool (bl.mp:make-orphan-pool))
         (peer-a (list :a))
         (peer-b (list :b)))
-    (bl.mp:orphan-add pool (%mp-spending-tx (%txid-array 60)) peer-a)
-    (bl.mp:orphan-add pool (%mp-spending-tx (%txid-array 61)) peer-b)
+    (bl.mp:orphan-add pool (make-spending-test-tx (%txid-array 60)) peer-a)
+    (bl.mp:orphan-add pool (make-spending-test-tx (%txid-array 61)) peer-b)
     (is (= 2 (bl.mp:orphan-pool-count pool)))
     (is (= 1 (bl.mp:orphan-erase-for-peer pool peer-a)))
     (is (= 1 (bl.mp:orphan-pool-count pool)))))
@@ -2345,7 +2268,7 @@ output of the same parent tx survives."
   (let* ((mempool (bl.mp:make-mempool))
          (a (make-mempool-test-tx :input-id 120))
          (atxid (bl.ser:transaction-hash a))
-         (b (%mp-spending-tx atxid)))
+         (b (make-spending-test-tx atxid)))
     (%add-tx mempool a)
     (%add-tx mempool b)
     (is (= 2 (bl.mp:mempool-count mempool)))
@@ -2536,7 +2459,7 @@ and unbroadcast. A parent's spentby lists a child that spends it."
          (parent (make-mempool-test-tx :input-id 200))
          (ptxid (bl.ser:transaction-hash parent)))
     (%add-tx mempool parent)
-    (let* ((child (%mp-spending-tx ptxid))
+    (let* ((child (make-spending-test-tx ptxid))
            (ctxid (bl.ser:transaction-hash child)))
       (%add-tx mempool child)
       (let ((f (bl.rpc::%mempool-entry-fields
@@ -2579,7 +2502,7 @@ irregular version-0 programs stay nonstandard."
 
 (defun %truc-tx (parent-txid &key (version 3) (vout 0) (value 40000000))
   "A v-VERSION tx spending PARENT-TXID:VOUT (make-outpoint hash is 32 bytes)."
-  (let ((tx (%mp-spending-tx parent-txid :vout vout :value value)))
+  (let ((tx (make-spending-test-tx parent-txid :vout vout :value value)))
     (setf (bl.ser:transaction-version tx) version)
     tx))
 
@@ -3438,7 +3361,7 @@ be resubmitted once its parent is."
   (let* ((mempool (bl.mp:make-mempool))
          (parent (make-mempool-test-tx :input-id 206))
          (parent-txid (bl.ser:transaction-hash parent))
-         (child (%mp-spending-tx parent-txid))
+         (child (make-spending-test-tx parent-txid))
          (child-txid (bl.ser:transaction-hash child))
          (block-tx (make-mempool-test-tx :input-id 206 :value 30000000)))
     (is (eq :ok (%add-tx mempool parent)))

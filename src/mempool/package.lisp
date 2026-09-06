@@ -20,7 +20,6 @@ src/mempool/.")
    #:*max-mempool-bytes*
    #:+default-min-relay-fee-rate+
    #:+fee-history-size+
-   #:+min-blocks-for-estimate+
    #:+fee-stats-flush-interval+
    ;; FeeFrac (Core util/feefrac.{h,cpp})
    #:feefrac
@@ -244,7 +243,6 @@ src/mempool/.")
    #:fee-estimator-data-directory
    #:fee-estimator-blocks-since-flush
    #:fee-estimator-add-stats
-   #:fee-estimator-ready-p
    #:fee-estimator-get-history
    #:calculate-tx-fee-rate
    #:compute-block-fee-stats

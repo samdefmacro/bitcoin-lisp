@@ -236,7 +236,7 @@ cluster limit imposes.)"
     (multiple-value-bind (cs mp) (%mining-fixture)
       (let* ((p (make-mempool-test-tx :input-id 35))
              (ptxid (bl.ser:transaction-hash p))
-             (c (%mp-spending-tx ptxid))
+             (c (make-spending-test-tx ptxid))
              (fillers (list (make-mempool-test-tx :input-id 36)
                             (make-mempool-test-tx :input-id 37)
                             (make-mempool-test-tx :input-id 38))))

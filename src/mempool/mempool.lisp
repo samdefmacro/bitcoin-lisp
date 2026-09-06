@@ -924,7 +924,9 @@ to-be-replaced conflict and re-run the RBF economics, instead of rejecting."
 (defun accept-validated-tx (mempool txid tx fee height
                             &key (entry-time
                                   (bl.ser:get-unix-time))
-                                 (sigops 0) replaced defer-trim)
+                                 (sigops 0) replaced defer-trim
+                                 bypass-limits package-submission
+                                 (chainstate-current t))
   "The shared tail of every mempool acceptance path (peer tx handler,
 orphan cascade, sendrawtransaction, mempool.dat reload, reorg re-add,
 submitpackage): evict the BIP125 REPLACED txids, build the entry for TX,
@@ -933,7 +935,14 @@ the weighted SIGOPS cost it computed (Core threads the same value from
 PreChecks into the entry, validation.cpp:924) — without it the block
 assembler's sigop budget is vacuous. Returns (values result entry) where
 RESULT is mempool-add's keyword. DEFER-TRIM is threaded to MEMPOOL-ADD
-(reorg re-add, package submission)."
+(reorg re-add, package submission).
+
+BYPASS-LIMITS, PACKAGE-SUBMISSION and CHAINSTATE-CURRENT are three of Core's
+four NewMempoolTransactionInfo flags and go to the fee estimator, not to the
+acceptance itself; the fourth (no unconfirmed parents) is read off the entry.
+CHAINSTATE-CURRENT defaults to TRUE, which is the answer for a synced node:
+compute it with BL.NET:CURRENT-FOR-FEE-ESTIMATION-P wherever a chain state is
+at hand."
   (let ((*mempool-removal-reason* :replaced))
     (dolist (rt replaced)
       (mempool-remove-recursive mempool rt)))
@@ -944,9 +953,23 @@ RESULT is mempool-add's keyword. DEFER-TRIM is threaded to MEMPOOL-ADD
       ;; later say how long that feerate waited (Core's validation interface
       ;; delivers TransactionAddedToMempool for the same purpose). Only a tx
       ;; that actually entered counts.
+      ;;
+      ;; The four flags are Core's NewMempoolTransactionInfo
+      ;; (validation.cpp:1304-1307): the two exclusions this path knows about
+      ;; are declared by the reorg re-add and the package submitter, the
+      ;; chainstate-current predicate is IsCurrentForFeeEstimation (computed
+      ;; by the caller, which has the chain state), and whether the
+      ;; transaction has unconfirmed parents the ENTRY already knows --
+      ;; MEMPOOL-ADD populated its parent links, and that is Core's
+      ;; HasNoInputsOf.
       (when (eq result :ok)
         (bpe-note-entry txid (mempool-entry-fee entry)
-                        (mempool-entry-vsize entry) height))
+                        (mempool-entry-vsize entry) height
+                        :bypass-limits bypass-limits
+                        :package-submission package-submission
+                        :chainstate-current chainstate-current
+                        :has-no-mempool-parents
+                        (zerop (hash-table-count (mempool-entry-parents entry)))))
       (values result entry))))
 
 (defvar *mempool-removal-reason* nil

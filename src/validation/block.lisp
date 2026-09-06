@@ -3023,9 +3023,15 @@ disconnected blocks."
                                                     :chain-state chain-state)
                 (declare (ignore error))
                 (when valid
+                  ;; Core's reorg re-add passes bypass_limits, which is one
+                  ;; of the four flags that make a transaction invalid for fee
+                  ;; estimation (validation.cpp:1304-1307): it did not compete
+                  ;; for its place in the pool, so how long it waits says
+                  ;; nothing about the fee market.
                   (bl.mp:accept-validated-tx
                    mempool txid tx fee height
-                   :sigops sigops :replaced replaced :defer-trim t)))
+                   :sigops sigops :replaced replaced :defer-trim t
+                   :bypass-limits t)))
             (error () nil))
           ;; Presence decides the outcome (Core: else if m_mempool->exists,
           ;; validation.cpp:322): a tx that is in the pool now — re-accepted,

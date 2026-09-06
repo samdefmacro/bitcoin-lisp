@@ -706,7 +706,10 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                                   :message "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"))
               (let ((add-result (bl.mp:accept-validated-tx
                                  mempool txid tx fee current-height
-                                 :sigops sigops :replaced replaced)))
+                                 :sigops sigops :replaced replaced
+                                 :chainstate-current
+                                 (bl.net:current-for-fee-estimation-p
+                                  chain-state))))
                 (unless (eq add-result :ok)
                   (error 'rpc-error :code +rpc-transaction-rejected+
                                     :message (format nil "Mempool rejection: ~A" add-result)))

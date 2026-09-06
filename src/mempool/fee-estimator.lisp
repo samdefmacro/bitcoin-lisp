@@ -10,9 +10,6 @@
 (defconstant +fee-history-size+ 1008
   "Number of blocks to keep in fee history (~1 week).")
 
-(defconstant +min-blocks-for-estimate+ 6
-  "Minimum blocks required before providing computed estimates.")
-
 (defconstant +fee-stats-flush-interval+ 10
   "Flush fee stats to disk every N blocks.")
 
@@ -36,8 +33,6 @@
   (write-index 0 :type (unsigned-byte 16))
   ;; Number of entries currently stored
   (entry-count 0 :type (unsigned-byte 16))
-  ;; Minimum blocks needed for estimation
-  (min-blocks +min-blocks-for-estimate+ :type (unsigned-byte 8))
   ;; Data directory for persistence
   (data-directory nil :type (or null pathname))
   ;; Blocks since last flush
@@ -115,11 +110,6 @@ Returns a block-fee-stats struct, or NIL if block has no fee-paying transactions
         (incf (fee-estimator-entry-count estimator)))
       ;; Track blocks since flush for periodic persistence
       (incf (fee-estimator-blocks-since-flush estimator)))))
-
-(defun fee-estimator-ready-p (estimator)
-  "Check if the estimator has enough data to provide estimates."
-  (>= (fee-estimator-entry-count estimator)
-      (fee-estimator-min-blocks estimator)))
 
 (defun fee-estimator-get-history (estimator &optional (max-blocks nil))
   "Get fee statistics from history, most recent first.
@@ -288,83 +278,28 @@ Returns T on success, NIL if file doesn't exist or is corrupt."
 
 ;;;; Fee Rate Estimation
 
-(defun fee-rate-percentile (rates percentile)
-  "Calculate the Nth percentile of a list of fee rates using linear interpolation.
-RATES should be a sorted list of numbers. PERCENTILE is 0-100.
-Returns an integer fee rate (rounded up for safety)."
-  (when (null rates)
-    (return-from fee-rate-percentile nil))
-  (let* ((n (length rates)))
-    (if (= n 1)
-        (first rates)
-        ;; Linear interpolation between adjacent values
-        (let* ((pos (* (1- n) (/ percentile 100.0)))
-               (lower-idx (floor pos))
-               (upper-idx (min (1- n) (ceiling pos)))
-               (lower-val (nth lower-idx rates))
-               (upper-val (nth upper-idx rates))
-               (fraction (- pos lower-idx)))
-          ;; Interpolate and round up for conservative estimate
-          (ceiling (+ lower-val (* fraction (- upper-val lower-val))))))))
+(defun estimate-fee-rate (conf-target &key (mode :conservative))
+  "Core estimateSmartFee (rpc/fees.cpp:62-92, CBlockPolicyEstimator::
+estimateSmartFee): the feerate in sat/vB that CONF-TARGET blocks of observed
+history justify, or NO answer.
 
-(defun get-percentile-for-target (conf-target mode)
-  "Get the percentile to use based on confirmation target and mode.
-MODE is :conservative (default) or :economical.
-Conservative mode uses higher percentiles for more reliable confirmation."
-  (let ((base-percentile
-          (cond
-            ((<= conf-target 2) 90)
-            ((<= conf-target 6) 85)
-            ((<= conf-target 12) 75)
-            ((<= conf-target 25) 65)
-            ((<= conf-target 144) 50)
-            (t 25))))
-    ;; Economical mode: subtract 15 from percentile (min 10)
-    (if (eq mode :economical)
-        (max 10 (- base-percentile 15))
-        base-percentile)))
+Returns (values fee-rate error-message returned-target). RETURNED-TARGET is
+Core's feeCalc.returnedTarget, the target the answer is actually for -- the
+estimator substitutes 2 for a 1-block target and clamps to what its history
+can support -- and on failure the answer is NIL with Core's own message, never
+a number.
 
-(defun get-blocks-to-analyze (conf-target)
-  "Get the number of blocks to analyze based on confirmation target."
-  (cond
-    ((<= conf-target 2) 12)
-    ((<= conf-target 6) 36)
-    ((<= conf-target 12) 72)
-    ((<= conf-target 25) 144)
-    ((<= conf-target 144) 288)
-    (t 1008)))
-
-(defun estimate-fee-rate (estimator conf-target &key (mode :conservative))
-  "Estimate the fee rate needed for confirmation within CONF-TARGET blocks.
-MODE is :conservative (default) or :economical.
-Returns (values fee-rate-estimate error-message returned-target).
-Fee rate is in sat/vB; RETURNED-TARGET is the target the answer is actually for
-(Core feeCalc.returnedTarget), which the estimator may have raised or lowered."
-  ;; Core's CBlockPolicyEstimator answers first when it has the history for
-  ;; this target: it knows which feerates FAILED to confirm, which a percentile
-  ;; of what miners took cannot express. The percentile heuristic below remains
-  ;; as the fallback for a node whose estimator has not accumulated enough
-  ;; observations yet -- Core has no such fallback because it has always had
-  ;; the real estimator.
-  (multiple-value-bind (core-estimate returned-target)
+⚠️ There used to be a second estimator behind this one: when the policy
+estimator had no answer, a percentile of the median feerates of the last N
+blocks was returned WITHOUT an error message, so the RPC reported it as a real
+feerate and a wallet could not tell it apart from one. Core has no such
+fallback, and the reason is the whole content of a fee estimate: a percentile
+of what miners TOOK cannot express that a feerate FAILED to confirm, which is
+the only thing that makes an estimate worth acting on. feature_fee_estimation.py
+asserts the errors array twice, and the block statistics this node still
+collects have no estimator reading them."
+  (multiple-value-bind (rate returned-target)
       (bpe-smart-fee-sat-per-vb conf-target :conservative (eq mode :conservative))
-    (when (and core-estimate (plusp core-estimate))
-      (return-from estimate-fee-rate
-        (values core-estimate nil (or returned-target conf-target)))))
-
-  (unless (fee-estimator-ready-p estimator)
-    (return-from estimate-fee-rate
-      (values 1 "Insufficient data for fee estimation" conf-target)))
-
-  (let* ((blocks-to-analyze (get-blocks-to-analyze conf-target))
-         (history (fee-estimator-get-history estimator blocks-to-analyze))
-         (percentile (get-percentile-for-target conf-target mode)))
-
-    (when (< (length history) (fee-estimator-min-blocks estimator))
-      (return-from estimate-fee-rate
-        (values 1 "Insufficient data for fee estimation" conf-target)))
-
-    ;; Collect all median rates from history
-    (let* ((rates (sort (mapcar #'block-fee-stats-median-rate history) #'<))
-           (estimate (fee-rate-percentile rates percentile)))
-      (values (or estimate 1) nil conf-target))))
+    (if (and rate (plusp rate))
+        (values rate nil (or returned-target conf-target))
+        (values nil "Insufficient data or no feerate found" conf-target))))

@@ -234,7 +234,11 @@ AcceptPackage (validation.cpp:1728)."
     (setf (gethash rt replaced) t))
   (values (bl.mp:accept-validated-tx
            mempool txid tx fee height :entry-time now :sigops sigops
-           :replaced rset :defer-trim t)))
+           :replaced rset :defer-trim t
+           ;; Core's m_package_submission: a package member is priced as part
+           ;; of its package, not on its own, so it teaches the fee estimator
+           ;; nothing (validation.cpp:1304-1307).
+           :package-submission t)))
 
 (defun %finalize-package-results (package results reason)
   "The per-tx result list for an aborted package: whatever RESULTS already

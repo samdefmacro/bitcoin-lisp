@@ -66,3 +66,20 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
      ;; Locktime: 500000
      (bl.bytes:bb-write-u32-le s 500000))
    '(simple-array (unsigned-byte 8) (*))))
+
+(defun make-spending-test-tx (parent-txid &key (vout 0) (value 40000000))
+  "A tx spending PARENT-TXID's output VOUT, paying a standard P2PKH output."
+  (bl.ser:make-transaction
+   :version 1
+   :inputs (vector (bl.ser:make-tx-in
+                  :previous-output (bl.ser:make-outpoint
+                                    :hash parent-txid :index vout)
+                  :script-sig (make-array 10 :element-type '(unsigned-byte 8) :initial-element 0)
+                  :sequence #xFFFFFFFF))
+   :outputs (vector (bl.ser:make-tx-out
+                   :value value
+                   :script-pubkey (let ((s (make-array 25 :element-type '(unsigned-byte 8)
+                                                       :initial-element 0)))
+                                    (setf (aref s 0) #x76 (aref s 1) #xa9 (aref s 2) #x14
+                                          (aref s 23) #x88 (aref s 24) #xac) s)))
+   :lock-time 0))

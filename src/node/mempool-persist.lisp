@@ -172,7 +172,10 @@ missing or corrupt."
                      (if (eq :ok (bl.mp:accept-validated-tx
                                   mempool txid tx fee height
                                   :entry-time entry-time :sigops sigops
-                                  :replaced replaced))
+                                  :replaced replaced
+                                  :chainstate-current
+                                  (bl.net:current-for-fee-estimation-p
+                                   chain-state)))
                          (incf accepted)
                          (incf failed)))
                     (t (incf failed)))))))

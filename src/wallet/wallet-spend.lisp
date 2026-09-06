@@ -320,20 +320,15 @@ coin is not one of ours and we cannot assume our own signer will sign it."
   "GetRequiredFeeRate: max(-mintxfee, min relay feerate), sat/kvB."
   (max *wallet-min-tx-fee* bl.mp:*min-relay-fee-rate*))
 
-(defun %estimate-smart-fee-sat-kvb (node target conservative)
-  "estimateSmartFee via the node's fee estimator, as integer sat/kvB;
-0 when no reliable estimate exists (Core CFeeRate(0)). The estimator's
-sat/vB value (possibly non-integral) is converted to integer sat/kvB HERE,
-at the estimate boundary — all downstream fee math is integer."
-  (let ((estimator (bl:node-fee-estimator node)))
-    (if (and estimator
-             (bl.mp:fee-estimator-ready-p estimator))
-        (multiple-value-bind (rate error)
-            (bl.mp:estimate-fee-rate
-             estimator (max 1 (min target 1008))
-             :mode (if conservative :conservative :economical))
-          (if error 0 (max 0 (round (* (rational rate) 1000)))))
-        0)))
+(defun %estimate-smart-fee-sat-kvb (target conservative)
+  "estimateSmartFee, as integer sat/kvB; 0 when no reliable estimate exists
+(Core CFeeRate(0)), which is what sends GetMinimumFeeRate to -fallbackfee. The
+estimator's sat/vB value (possibly non-integral) is converted to integer
+sat/kvB HERE, at the estimate boundary — all downstream fee math is integer."
+  (multiple-value-bind (rate error)
+      (bl.mp:estimate-fee-rate (max 1 (min target 1008))
+                               :mode (if conservative :conservative :economical))
+    (if error 0 (max 0 (round (* (rational rate) 1000))))))
 
 (defun %wallet-minimum-fee-rate (node cc)
   "Core GetMinimumFeeRate. Returns (values rate-sat-kvb reason), REASON one
@@ -352,7 +347,7 @@ node lock (fee estimator + mempool reads)."
                               (:conservative t)
                               (:economical nil)
                               (t (not (%wcc-signal-rbf cc))))))
-         (setf rate (%estimate-smart-fee-sat-kvb node target conservative))
+         (setf rate (%estimate-smart-fee-sat-kvb target conservative))
          (when (zerop rate)
            (setf rate bl:*wallet-fallback-fee*
                  reason :fallback)
@@ -375,7 +370,7 @@ node lock (fee estimator + mempool reads)."
 (defun %wallet-discard-rate (node)
   "Core GetDiscardRate: economical estimate at the longest horizon, capped
 by -discardfee, floored at the dust relay feerate."
-  (let* ((estimate (%estimate-smart-fee-sat-kvb node 1008 nil))
+  (let* ((estimate (%estimate-smart-fee-sat-kvb 1008 nil))
          (rate (if (zerop estimate)
                    *wallet-discard-rate*
                    (min estimate *wallet-discard-rate*))))
@@ -2492,7 +2487,9 @@ node lock. Returns (values ok error-string)."
         (t
          (let ((result (bl.mp:accept-validated-tx
                         mempool txid tx fee current-height
-                        :sigops sigops :replaced replaced)))
+                        :sigops sigops :replaced replaced
+                        :chainstate-current
+                        (bl.net:current-for-fee-estimation-p chain-state))))
            (if (eq result :ok)
                (progn
                  (when relay
